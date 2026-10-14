@@ -91,7 +91,6 @@
 
 1	apps/web/src/policy/policyView.ts
 
-1	apps/web/src/products/ProductsList.svelte
 
 2	apps/web/src/products/types.ts
 
@@ -117,7 +116,6 @@
 
 4	apps/web/src/steps/ShipmentSurface.svelte
 
-1	apps/web/src/views/ViewsPage.svelte
 
 1	apps/web/src/warehouse/WarehousePage.svelte
 

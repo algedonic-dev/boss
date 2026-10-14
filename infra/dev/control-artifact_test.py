@@ -112,6 +112,41 @@ class ArtifactContract(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(marker.read_text(), "published")
 
+    def test_published_bootstrap_hands_a_follow_main_pass_its_store_and_no_config(self):
+        # Design a68fc42a D6: the hourly installer re-activates through
+        # the NEW generation's own bootstrap, which validates that
+        # generation's archive first, exactly as an explicit activation.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / "cli"
+            generation = store / ("a" * 40)
+            generation.mkdir(parents=True)
+            seen = root / "argv.json"
+            code = ("import json,sys\n"
+                    "open(" + repr(str(seen)) + ",'w').write(json.dumps(sys.argv[1:]))\n").encode()
+            members = {"infra/dev/activate-control.py": code, "infra/dev/control-artifact.py": Path(__file__).with_name("control-artifact.py").read_bytes()}
+            record = {"commit": "a" * 40, "files": {n: {"sha256": hashlib.sha256(v).hexdigest(), "mode": 0o644} for n, v in members.items()}}
+            with tarfile.open(generation / "dev-control.tar", "w") as archive:
+                for name, raw in [("artifact.json", json.dumps(record).encode()), *members.items()]:
+                    item = tarfile.TarInfo(name)
+                    item.mode = 0o644
+                    item.size = len(raw)
+                    archive.addfile(item, io.BytesIO(raw))
+            control = root / "dev-control"
+            for verb, flags, mode in [("activate", ["--reactivate"], "--reactivate"),
+                                       ("deactivate", [], "--deactivate")]:
+                result = subprocess.run([sys.executable, "-I", str(Path(__file__).with_name("control-artifact.py")), verb, "a" * 40, "--cli-store", str(store), "--store", str(control), *flags], capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                argv = json.loads(seen.read_text())
+                self.assertEqual(argv[0], "a" * 40)
+                self.assertEqual(argv[argv.index("--store") + 1], str(control))
+                self.assertIn(mode, argv)
+                self.assertNotIn("--config", argv)
+                if mode == "--reactivate":
+                    self.assertEqual(argv[argv.index("--prepared-config") + 1], str(generation / "config.json"))
+            result = subprocess.run([sys.executable, "-I", str(Path(__file__).with_name("control-artifact.py")), "activate", "a" * 40, "--cli-store", str(store)], capture_output=True)
+            self.assertNotEqual(result.returncode, 0, "an activation names its config or follows main; never neither")
+
     def test_bootstrap_rejects_a_linked_installed_archive_without_running_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

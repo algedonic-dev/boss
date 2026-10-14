@@ -45,6 +45,9 @@ const detailRoute = (sku: string) => new RegExp(`/api/products/${sku}$`);
 // Four products in an arrival order that is NOT the page's sku order,
 // one of them retired (active=false), one with no metadata at all (so
 // the MSRP and Style cells take their empty branch).
+// The retired row is adversarial: the owning list API defaults to
+// active-only, and this page does not request include_inactive. It pins
+// truthful rendering of an inactive row if one is already returned.
 
 const product = (
   sku: string, name: string, product_kind: string, package_unit: string,
@@ -73,7 +76,7 @@ const detail = (p: (typeof PRODUCTS)[number]) => ({
 /// SKU · Name · Kind · Package · Total on hand · MSRP · Style.
 const ROWS: ReadonlyArray<ReadonlyArray<string>> = [
   ['CAN-LAGER-6PK', 'Pils', 'beer', '6-pack 12oz cans', '240', '$12.99', 'Pilsner'],
-  ['CAN-STOUT-4PK', 'Oatmeal stout', 'beer', '4-pack 16oz cans', '7', '$15.99', 'Stout'],
+  ['CAN-STOUT-4PK', 'Oatmeal stout Retired', 'beer', '4-pack 16oz cans', '7', '$15.99', 'Stout'],
   ['KEG-IPA-HALF', 'Hazy IPA', 'beer', 'half-barrel keg', '12', '$185.00', 'New England IPA'],
   ['MERCH-TEE-L', 'Brewery tee (L)', 'apparel', 'each', '30', '', ''],
 ];
@@ -82,8 +85,7 @@ const HEADINGS = ['SKU', 'Name', 'Kind', 'Package', 'Total on hand', 'MSRP', 'St
 const READS_AT_MOUNT = 1 + PRODUCTS.length;
 
 const SUBTITLE = 'Finished-product catalog with on-hand inventory across all locations.';
-const EMPTY_LINE =
-  "No products yet. The brewery's finished-product catalog is seeded via examples/brewery/seeds/products.toml.";
+const EMPTY_LINE = 'No products yet.';
 
 /// The shell (installSmokeMocks: MODULES_ON, so parts is on) with the
 /// list read and every detail read answered from the fixtures above; a
@@ -288,9 +290,9 @@ test.describe('/ux/products — State B, the module on: the list', () => {
     expect(seen.writes.map((r) => `${r.method()} ${r.url()}`)).toEqual([]);
   });
 
-  // Gap 7 (f57c2f3b): a retired product is dimmed and nothing else — no
-  // word, no filter, no count says it is retired.
-  test('a retired product is only dimmed: no text on the page says retired', async ({ page }) => {
+  // f57c2f3b: opacity alone did not say what the existing active=false
+  // fact meant. Label it without changing which products are fetched.
+  test('an already-returned retired product says Retired as well as being dimmed', async ({ page }) => {
     await installProducts(page);
     await mountProducts(page);
 
@@ -299,7 +301,24 @@ test.describe('/ux/products — State B, the module on: the list', () => {
     await expect(retired).toHaveClass(/\bretired\b/);
     await expect(retired).toHaveCSS('opacity', '0.5');
     await expect(list(page).locator('tbody tr.retired')).toHaveCount(1);
-    await expect(list(page).getByText(/retired|inactive/i)).toHaveCount(0);
+    await expect(retired.getByText('Retired', { exact: true })).toBeVisible();
+    await expect(list(page).getByText('Retired', { exact: true })).toHaveCount(1);
+    await expect(list(page).locator('tbody tr:not(.retired)').getByText('Retired', { exact: true })).toHaveCount(0);
+  });
+
+  test('the native active-only list contract fetches no inactive rows or query flag', async ({ page }) => {
+    const urls: string[] = [];
+    await installProducts(page);
+    page.on('request', (r) => {
+      const url = new URL(r.url());
+      if (url.pathname === '/api/products') urls.push(url.search);
+    });
+    await page.route(LIST, (r) => json(r, PRODUCTS.filter((p) => p.active)));
+    await mountPage(page, PATH);
+    await expect(list(page).locator('tbody tr')).toHaveCount(PRODUCTS.length - 1);
+    await expect(list(page).locator('tbody tr.retired')).toHaveCount(0);
+    await expect(list(page).getByText('Retired', { exact: true })).toHaveCount(0);
+    expect(urls).toEqual(['']);
   });
 });
 
@@ -394,8 +413,8 @@ test.describe('/ux/products — State B: the SKU link, and back', () => {
 });
 
 test.describe('/ux/products — State B: empty, loading, and a failed read', () => {
-  // Gap 6 (f8807354): "nothing here" names one tenant's seed file, on
-  // every tenant.
+  // f8807354: an empty list says only what the read established;
+  // one tenant's seed file cannot explain another tenant's catalog.
   test('an empty backend paints the empty sentence, not a failure', async ({ page }) => {
     const seen = watch(page);
     await installProducts(page);
@@ -403,7 +422,8 @@ test.describe('/ux/products — State B: empty, loading, and a failed read', () 
     await mountPage(page, PATH);
 
     await expect(status(page)).toHaveText(EMPTY_LINE);
-    await expect(status(page).locator('code')).toHaveText('examples/brewery/seeds/products.toml');
+    await expect(status(page).locator('code')).toHaveCount(0);
+    await expect(status(page)).not.toContainText(/brewery|seed|examples\//i);
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
     await expect(list(page).locator('table')).toHaveCount(0);
     expect(await settledReads(page, () => seen.reads.length, 1)).toBe(1);

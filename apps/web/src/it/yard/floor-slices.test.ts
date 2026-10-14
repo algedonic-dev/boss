@@ -366,21 +366,7 @@ describe('the region map retired with its page', () => {
   });
 });
 
-// A STATION THAT CANNOT BE DRAWN SAYS SO (backlog 846ab934). On
-// 2026-09-24 the shop floor threw each_key_duplicate on live data and
-// the page sat on "Reading the regions…" for good: nothing caught the
-// render failure, so it looked like a read still coming. The net was
-// around the region map; since car N3 what a station holds is drawn in
-// its panel on the Department Map, so the net is around that — a board
-// that throws turns into the failure line, and the map above it stands.
-describe("a station's contents are mounted inside an error boundary", () => {
-  const mapPage = readFileSync(join(import.meta.dir, 'MapPage.svelte'), 'utf8');
-  const strip = (s: string) => s.replace(/<!--[\s\S]*?-->/g, '');
-
-  it('turns a render failure into the failure line, never the loading line', () => {
-    const bounded = strip(mapPage).match(/<svelte:boundary>([\s\S]*?)<\/svelte:boundary>/);
-    expect(bounded).not.toBeNull();
-    expect(bounded![1]).toContain('{@render contents(');
-    expect(bounded![1]).toMatch(/\{#snippet failed\(error\)\}[\s\S]*?class="yard-empty load-failed"[\s\S]*?\{\/snippet\}/);
-  });
-});
+// The station failure contract (846ab934) is exercised with an actual
+// render fault in it-department-map-stations.mocked.spec.ts. Its failure
+// line, absence of a loading line and next-read recovery are behavior;
+// the boundary's source placement is not that contract.

@@ -1,17 +1,3 @@
-<script lang="ts" module>
-  /** The window the map is PINNED in (design e765b3fc, car N3): wider
-   *  than a phone's 720px and at least 900px tall. The map stands about
-   *  430px (transit) to 470px (world) at a desktop width, under the 44px
-   *  perspective bar, so 900px of window leaves the panel under it about
-   *  400px — room for a board's card whole. Measured at 1280×800 with
-   *  the map pinned: the panel kept 286px, and a feedback card's Route
-   *  button could be scrolled to nowhere visible (Playwright: "element is
-   *  outside of the viewport"), so a shorter window scrolls the map with
-   *  the page, as a phone does. The one number to move if the maps grow
-   *  or shrink. */
-  export const PIN_QUERY = '(min-width: 721px) and (min-height: 900px)';
-</script>
-
 <script lang="ts">
   // THE DEPARTMENT MAP — the /it landing (design e765b3fc; David,
   // 2026-09-25: "the operating map sits at the top always and clicking
@@ -22,13 +8,8 @@
   // A selection is a query on this one route, so the map is mounted once
   // and a click never tears it down.
   //
-  // THE MAP IS PINNED (car N3). "Pinned at the top, always visible": the
-  // map holds under the perspective bar while the panel scrolls beneath
-  // it, so the thing selected and the detail it opened are on the screen
-  // together. Where a pinned map would leave the panel no room — a
-  // phone, or a window too short (PIN_QUERY) — it scrolls with the page
-  // instead, and the panel is brought into view on a selection either
-  // way.
+  // The map and panel use ordinary document scrolling (7bc8002d).
+  // A selection brings the panel into view without retaining the map.
   //
   // WHAT A PAGE WAS IS A PANEL NOW (car N3). A region's floor was its own
   // page at /it/yard/<region>, with a second map of its own (design
@@ -69,6 +50,7 @@
   import { flightOn } from '@boss/web-kit/session/flights.svelte';
   import PlantStrip from './PlantStrip.svelte';
   import FloorDeck from './FloorDeck.svelte';
+  import StationBoundary from './StationBoundary.svelte';
   import YardStatusPanel from './YardStatusPanel.svelte';
   import ConductorFeed from '../monitoring/ConductorFeed.svelte';
   import CrewBoardPage from '../crew/CrewBoardPage.svelte';
@@ -95,7 +77,6 @@
    *  mounted, never both hidden by CSS — a hidden world would still be
    *  read, counted and crawled as if it were on the screen. */
   const phone = new MediaQuery(PHONE_QUERY);
-  const pinnable = new MediaQuery(PIN_QUERY);
   /** THE TRANSIT MONITOR (design 16091dfb, Q2 decided 2026-09-25):
    *  behind its flight, on for David first. Off — and for every viewer
    *  the flight does not list — the world map is the map; the phone
@@ -120,6 +101,7 @@
    *  "last good HH:MMZ" when a later read fails (design 00774ca8
    *  decision 5). Its VALUES are never drawn once a newer read failed. */
   let lastGood = $state<LastGood | null>(null);
+  let successfulReads = $state(0);
   /** The top board's NEEDS YOU row (design ea906603 Q2): the viewer's
    *  own queue, their aliases and roles resolved by the server. A read of
    *  its own, because the regions read is the same for every viewer. */
@@ -143,7 +125,10 @@
       needs = n;
       readAt = Date.now();
       if (b.kind === 'ready') bordersAt = readAt;
-      if (r.kind === 'ready') lastGood = { at: readAt };
+      if (r.kind === 'ready') {
+        lastGood = { at: readAt };
+        successfulReads += 1;
+      }
     }
     void tick();
     const t = setInterval(tick, 10_000);
@@ -189,51 +174,16 @@
         : [],
   );
 
-  /** Whether the map is pinned in this window, and how tall it stands. */
-  const pinned = $derived(pinnable.current && !phone.current);
-  let pin = $state<HTMLElement | null>(null);
-  let pinHeight = $state(0);
-  /** The perspective bar the shell fixes above every page
-   *  (PerspectiveTabs.svelte: 44px), which the pinned map sits under. */
-  const BAR = 44;
-
-  /** WHAT THE PINNED MAP COVERS IS NOT "IN VIEW". While the map is
-   *  pinned, the document's scroll padding is the bar and the map, so
-   *  whatever brings a control of the panel into view — a keyboard focus
-   *  moving down a board, a link to an anchor — lands it under the map
-   *  rather than behind it, where it would be focused and hidden. Given
-   *  back when the map stops being pinned, or the page goes. It sets a
-   *  style and moves nothing, so it may follow the map's height. */
-  $effect(() => {
-    if (!pinned) return;
-    const root = document.documentElement;
-    root.style.scrollPaddingTop = `${BAR + pinHeight}px`;
-    return () => {
-      root.style.scrollPaddingTop = '';
-    };
-  });
-
-  /** The panel sits under the map, so a click could open it below the
-   *  fold — or, with the page scrolled, behind the pinned map — and look
-   *  like it did nothing. Brought into view when the SELECTION changes —
-   *  keyed on `at`, not on the 10 s poll, which must never move the
-   *  page. Under a pinned map the panel's head goes right under the map:
-   *  the map's height is MEASURED here, when the panel opens, because the
-   *  bound height is still 0 on the first paint of a linked selection. */
+  // The map scrolls with the document (7bc8002d). Bring a selected
+  // panel into view once; the ten-second reads must not move the page.
   let panel = $state<HTMLElement | null>(null);
   $effect(() => {
     const selection = { at, detail };
     const el = panel;
-    const map = pinned ? pin : null;
     if (selection.at === undefined || el === null) return;
     untrack(() => {
       if (overview) el.focus({ preventScroll: true });
-      if (map === null) {
-        el.scrollIntoView({ block: 'nearest' });
-        return;
-      }
-      const under = BAR + map.getBoundingClientRect().height;
-      window.scrollTo({ top: window.scrollY + el.getBoundingClientRect().top - under });
+      el.scrollIntoView({ block: 'nearest' });
     });
   });
 
@@ -317,8 +267,8 @@
       </section>
     {/if}
   {:else}
-    <!-- THE MAP, pinned (car N3) where the window has room for it. -->
-    <div class="map-pin" class:pinned data-map-pin={pinned ? 'pinned' : 'scrolls'} bind:this={pin} bind:clientHeight={pinHeight}>
+    <!-- The map scrolls off with the page, leaving room for the floor. -->
+    <div class="map-pin" data-map-pin="scrolls">
       {#if phone.current}
         <PhoneStrip
           regions={regions.data}
@@ -438,14 +388,9 @@
      map above it stands. -->
 {#snippet station(name: string)}
   <div class="panel-contents" data-contents={name}>
-    <svelte:boundary>
+    <StationBoundary {name} generation={successfulReads}>
       {@render contents(name)}
-      {#snippet failed(error)}
-        <div class="yard-empty load-failed" data-region={name}>
-          The {name} station cannot be drawn — {error instanceof Error ? error.message : String(error)}
-        </div>
-      {/snippet}
-    </svelte:boundary>
+    </StationBoundary>
   </div>
 {/snippet}
 
@@ -468,7 +413,7 @@
       {:else if region === 'shop-floor'}
         <CrewBoardPage embedded />
       {:else}
-        <MarshallingYardPage embedded />
+        <MarshallingYardPage embedded regionRead={regions} />
       {/if}
     {:else if region === 'sensors'}
       <SensorsPanel />
@@ -508,12 +453,6 @@
   .yard-flow { font-family: var(--font-mono); font-size: 11px;
     letter-spacing: var(--ls-nav); color: var(--map-muted);
     border-top: 1px solid var(--map-rule); margin-top: 28px; padding-top: 12px; }
-  /* THE PIN (car N3): the map holds under the 44px perspective bar, on
-     the page's own ground so the panel scrolling beneath it does not
-     show through, above the panel's boards and below the shell's
-     sidebar (20) and bar (60). */
-  .map-pin.pinned { position: sticky; top: 44px; z-index: 10; background: var(--map-bg);
-    padding-bottom: var(--s2); border-bottom: 1px solid var(--map-rule); }
   /* The selection's panel — a departure-board plate under the map, in the
      crossing panel's grammar (WorldMap.svelte): a hairline frame, a mono
      uppercase head with the state's lamp, the figure large beneath. */

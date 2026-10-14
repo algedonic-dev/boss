@@ -88,6 +88,80 @@ describe('OUTRANKS REGULAR ORDER — the server’s `outranks`, oldest first as 
     for (const l of board.lines) expect(l.title).not.toMatch(/^[0-9a-f]{8}-/);
   });
 
+  it('a claimed step says whether anyone is on it — the stalled ones say so (backlog 8e9d3723)', () => {
+    const claimed = (id: string, run: unknown) =>
+      outrank({ id, at: { slug: 'build', title: 'Build', status: 'active', assignee_id: 'agent-claude', run } });
+    const board = outranksBoard(
+      ready({
+        outranks: [
+          claimed('a', { state: 'building', run: '086d9793-92d8-402f' }),
+          claimed('b', { state: 'never-started', run: 'f58a081d-4ce8', age_minutes: 37 * 60 }),
+          claimed('c', { state: 'no-run' }),
+          claimed('d', { state: 'unread' }),
+          claimed('e', undefined),
+        ],
+      }),
+    );
+    if (board.kind !== 'rows') throw new Error(board.kind);
+    expect(board.lines.map((l) => l.at)).toEqual([
+      'build · run 086d9793',
+      'build · STALLED: run f58a081d briefed 37h ago, never started',
+      'build · STALLED: claimed, no open run',
+      'build · run unread',
+      'build',
+    ]);
+  });
+
+  it('a run inside its worker’s start bound reads starting, not stalled (backlog 57326714)', () => {
+    const board = outranksBoard(
+      ready({
+        outranks: [
+          outrank({
+            id: 'f',
+            at: {
+              slug: 'build', title: 'Build', status: 'active', assignee_id: 'agent-claude',
+              run: { state: 'starting', run: '0ccf6dab-4bd0', age_minutes: 5, expect_minutes: 15 },
+            },
+          }),
+          outrank({
+            id: 'g',
+            at: {
+              slug: 'build', title: 'Build', status: 'active', assignee_id: 'agent-claude',
+              run: { state: 'starting', run: '1a2b3c4d-5e6f', age_minutes: 0, expect_minutes: 15 },
+            },
+          }),
+        ],
+      }),
+    );
+    if (board.kind !== 'rows') throw new Error(board.kind);
+    expect(board.lines.map((l) => l.at)).toEqual([
+      'build · run 0ccf6dab starting: briefed 5m ago, 15m allowed',
+      'build · run 1a2b3c4d starting: briefed just now, 15m allowed',
+    ]);
+  });
+
+  it('a ready step nothing can dispatch is named undispatchable, with its row (backlog e2519eca)', () => {
+    const readyStep = (id: string, slug: string, dispatch: unknown) =>
+      outrank({ id, at: { slug, title: 'Step', status: 'ready', assignee_id: 'agent-claude', run: null, dispatch } });
+    const board = outranksBoard(
+      ready({
+        outranks: [
+          readyStep('a', 'prove-delivery', { state: 'undispatchable', kind: 'backlog-item', version: 15 }),
+          readyStep('b', 'triage', { state: 'unread' }),
+          readyStep('c', 'build', null),
+          readyStep('d', 'build', undefined),
+        ],
+      }),
+    );
+    if (board.kind !== 'rows') throw new Error(board.kind);
+    expect(board.lines.map((l) => l.at)).toEqual([
+      'prove-delivery · UNDISPATCHABLE: backlog-item v15 declares no agent block on prove-delivery and no person holds it',
+      'triage · dispatch unread',
+      'build',
+      'build',
+    ]);
+  });
+
   it('caps the list and counts the rest, rather than dropping it', () => {
     const many = Array.from({ length: 8 }, (_, i) => outrank({ id: `id-${i}`, title: `item ${i}` }));
     const board = outranksBoard(ready({ outranks: many }));

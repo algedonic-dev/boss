@@ -13,11 +13,11 @@
 //! will not do.
 //!
 //! THE LOOK IS THE ARTIFACT. A strike clears only against a written
-//! diagnosis that names, by full id, at least one RED train gate-run
+//! diagnosis that names, by full id, at least one failed train's gate-run
 //! the car actually rode — verified here, not trusted: the id reads
 //! back as a `gate-run` packet, it is a train's gate (`train_gate::
-//! packet_marks` stamps `train`), its verdict is `failed`
-//! (`train_gate::standing`, the same reader the conductor judges by),
+//! packet_marks` stamps `train`), its recorded combined verdict is failing
+//! (RED gate, or checked GREEN gate plus completed failing Forge CI),
 //! and that train's `boarded_jobs` names this car. `boarded_jobs` is the
 //! right list for "rode": a release clears the CAR's `train` marker but
 //! leaves the train's list naming it forever (`releasable_cars`), which
@@ -32,10 +32,11 @@
 //! earlier release stays on the car. Then the car is read back, because
 //! a 204 is a claim.
 //!
-//! ONLY A TRAIN GATE COUNTS. A train can go red on forge CI alone with
-//! its gate green; such a strike has no red gate-run to name and this
-//! verb refuses it. That is deliberate for now — the gate's receipt is
-//! the artifact the diagnosis can be checked against.
+//! A GREEN gate also counts when the recorded completed Forge CI verdict
+//! failed, the checked gate receipt and both gate-to-train edges agree,
+//! and the immutable boarding list names the car (approved design
+//! 921c62af, backlog602fd374). Unknown, pending, aborted or successful
+//! evidence never clears a strike. This does not clear strikes automatically.
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -94,7 +95,7 @@ pub(crate) fn train_of(gate_run: &Value) -> Option<&str> {
 }
 
 /// Does this gate-run count as a strike the car earned? `Ok` when it is
-/// a red train gate whose train carried `car_id`; otherwise the reason
+/// a failed train whose gate and boarding evidence names `car_id`; otherwise the reason
 /// it does not, in words the refusal prints beside the id. `train` is
 /// the train [`train_of`] names, read by the caller (`None` when it
 /// could not be read).
@@ -108,17 +109,29 @@ pub(crate) fn judge(gate_run: &Value, train: Option<&Value>, car_id: &str) -> Re
             "gates no train (a car's own gate is not a strike — only a train's red is)".into(),
         );
     };
+    let Some(train) = train else {
+        return Err(format!("names train {tid}, which could not be read"));
+    };
+    if train.get("kind").and_then(Value::as_str) != Some("pr-train")
+        || train.get("id").and_then(Value::as_str) != Some(tid)
+    {
+        return Err(format!(
+            "names train {tid}, but the record is not that pr-train"
+        ));
+    }
     match crate::train_gate::standing(gate_run) {
         crate::train_gate::Standing::Failed => {}
+        crate::train_gate::Standing::Green => {
+            checked_combined_failure(gate_run, train).map_err(|why| {
+                format!("is not red — GREEN gate lacks checked combined failure: {why}")
+            })?;
+        }
         other => {
             return Err(format!(
                 "is not red — its verdict reads {other:?}, and a strike is a train that went red"
             ));
         }
     }
-    let Some(train) = train else {
-        return Err(format!("names train {tid}, which could not be read"));
-    };
     let rode = train
         .pointer("/metadata/boarded_jobs")
         .and_then(Value::as_array)
@@ -128,6 +141,86 @@ pub(crate) fn judge(gate_run: &Value, train: Option<&Value>, car_id: &str) -> Re
             "gates train {}, which did not carry this car (its boarded_jobs does not name it)",
             crate::train::id8(tid)
         ));
+    }
+    Ok(())
+}
+
+/// The additional approved evidence for a GREEN gate. The existing
+/// RED-gate path remains usable for historical records predating the
+/// combined CI fields; the new path requires both recorded halves.
+fn checked_combined_failure(gate: &Value, train: &Value) -> Result<(), String> {
+    let id = gate
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("gate has no id")?;
+    let ci = train
+        .get("steps")
+        .and_then(Value::as_array)
+        .and_then(|steps| steps.iter().find(|step| step["spec_slug"] == "ci"))
+        .ok_or("train has no recorded CI step")?;
+    if train
+        .pointer("/metadata/train_gate_run")
+        .and_then(Value::as_str)
+        != Some(id)
+        || ci
+            .pointer("/metadata/train_gate_run")
+            .and_then(Value::as_str)
+            != Some(id)
+    {
+        return Err("train and completed CI step must name this exact gate-run".into());
+    }
+    let verdict_step = gate
+        .get("steps")
+        .and_then(Value::as_array)
+        .and_then(|steps| {
+            steps
+                .iter()
+                .find(|step| step["spec_slug"] == "record-verdict")
+        })
+        .ok_or("gate has no recorded verdict step")?;
+    if gate["status"] != "closed"
+        || verdict_step["status"] != "completed"
+        || ci["status"] != "completed"
+    {
+        return Err("gate and CI verdicts must be completed".into());
+    }
+    let receipt = crate::train_gate::receipt(gate).ok_or("gate receipt missing or malformed")?;
+    let head = gate
+        .pointer("/metadata/sha")
+        .and_then(Value::as_str)
+        .ok_or("gate has no frozen head")?;
+    if head.len() != 40
+        || !head.bytes().all(|c| c.is_ascii_hexdigit())
+        || receipt["head"] != head
+        || receipt["verdict"] != "green"
+    {
+        return Err("GREEN receipt must describe the exact frozen gate head".into());
+    }
+    let checks = receipt
+        .get("checks")
+        .and_then(Value::as_array)
+        .ok_or("GREEN receipt has no checks")?;
+    if checks.is_empty()
+        || !checks.iter().all(|check| {
+            check["result"] == "pass"
+                && check
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| !name.trim().is_empty())
+        })
+    {
+        return Err("GREEN receipt must carry nonempty passing named checks".into());
+    }
+    if ci.pointer("/metadata/forge_result").and_then(Value::as_str) != Some("failing")
+        || ci.pointer("/metadata/result").and_then(Value::as_str) != Some("failing")
+        || crate::train_gate::combined_verdict(
+            "failing",
+            Some(&crate::train_gate::standing(gate)),
+            0,
+            true,
+        ) != "failing"
+    {
+        return Err("recorded Forge and combined verdicts must both be failing".into());
     }
     Ok(())
 }
@@ -196,7 +289,8 @@ pub(crate) async fn release_struck(wire: &Wire, given: &str, diagnosis: &str) ->
     if ids.is_empty() {
         bail!(
             "boss release: the diagnosis names no gate-run — it must name, by FULL id, at least \
-             one red train gate-run {label} rode (a train's gate-run id is its \
+             one failed train's gate-run {label} rode (RED gate or checked GREEN gate with \
+             completed failing Forge CI; a train's gate-run id is its \
              `train_gate_run` metadata). Nothing was written."
         );
     }
@@ -222,7 +316,8 @@ pub(crate) async fn release_struck(wire: &Wire, given: &str, diagnosis: &str) ->
     }
     if verified.is_empty() {
         bail!(
-            "boss release: the diagnosis names no red train gate-run {label} rode — nothing was \
+            "boss release: the diagnosis names no red train gate-run or checked GREEN gate of a \
+             completed failing Forge CI train {label} rode — nothing was \
              written. What each id it names is:\n{}",
             refused.join("\n")
         );

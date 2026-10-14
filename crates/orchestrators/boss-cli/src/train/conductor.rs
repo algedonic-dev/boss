@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 pub(super) struct Conductor {
     pub(super) cfg: Config,
-    http: boss_core::machine_token::Client,
+    pub(super) http: boss_core::machine_token::Client,
     forge: Box<dyn Forge>,
     /// Who the conductor's packets are filed to — the platform owner,
     /// read from the people registry through the port and cached for
@@ -20,7 +20,7 @@ pub(super) struct Conductor {
     /// registry, and threaded to every decision point below. Nothing in
     /// this file reaches for a policy constant any more; if a threshold
     /// appears in a decision here, it arrived on this field.
-    policy: DeliveryPolicy,
+    pub(super) policy: DeliveryPolicy,
     /// The cluster's gate Jobs and their pod logs, as a port: `kubectl`
     /// in production, a fake under test — a field rather than a call to
     /// `Kubectl` at the site, so the tests drive the SAME lines reconcile
@@ -41,8 +41,13 @@ impl crate::car_retire::Door for Conductor {
 
 #[async_trait]
 impl crate::review_verdict::ExecutorRecordReader for Conductor {
-    async fn executor_read(&self, path: &str) -> Result<Option<Value>> {
-        self.api(Method::GET, path, None).await
+    async fn protocol_version(&self, kind: &str, version: i64) -> Result<Option<Value>> {
+        self.api(
+            Method::GET,
+            &format!("/api/workflows/{kind}/versions/{version}"),
+            None,
+        )
+        .await
     }
     async fn executor_original(
         &self,
@@ -145,6 +150,60 @@ impl GateLaunchFailed {
     fn unfiled(cause: anyhow::Error) -> Self {
         GateLaunchFailed { filed: None, cause }
     }
+}
+
+/// PURE: why a conductor launch waits at the gate bound. For a train it
+/// is written to both `train_gate_wait_reason` (what the yard shows) and
+/// `train_gate_bound_wait` (the train's place in the gate line, design
+/// 1e787fc2; backlog 82071657) — so a train's line SAYS it holds the
+/// first place and takes the next bay, rather than reading like a fault;
+/// a car's re-gate names the waiting train it yields to.
+pub(super) fn gate_bound_refusal(
+    live: &[String],
+    trains_ahead: &[String],
+    max: usize,
+    who: crate::gate::Requester,
+) -> String {
+    let running = format!(
+        "the cluster is at its gate bound ({} running of {max}: {})",
+        live.len(),
+        live.join(", ")
+    );
+    match who {
+        crate::gate::Requester::Train => format!(
+            "{running} — the train holds the first place in the gate line and takes the next \
+             bay that frees (design 1e787fc2)"
+        ),
+        crate::gate::Requester::Car if trains_ahead.is_empty() => running,
+        crate::gate::Requester::Car => format!(
+            "{running}, and {} waiting for the next bay goes first (design 1e787fc2)",
+            trains_ahead.join(", ")
+        ),
+    }
+}
+
+/// A launch refused at the gate bound: the ONE launch error that is a
+/// place in the gate line rather than a fault (backlog 82071657). Typed,
+/// so the train's claim on a bay (`train_gate::KEY_BOUND_WAIT`) is set by
+/// this refusal and by no other — no kubectl, RBAC, a manifest that does
+/// not render each left a train holding a bay it could not use.
+#[derive(Debug)]
+pub(super) struct AtGateBound(pub(super) String);
+
+impl std::fmt::Display for AtGateBound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AtGateBound {}
+
+/// PURE: whether a launch error is the bound refusal, through the
+/// `GateLaunchFailed` the launch wraps it in.
+pub(super) fn at_gate_bound(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<AtGateBound>().is_some()
+        || e.downcast_ref::<GateLaunchFailed>()
+            .is_some_and(|f| f.cause.downcast_ref::<AtGateBound>().is_some())
 }
 
 /// The cause verbatim, and the run it filed when it filed one. No
@@ -256,6 +315,10 @@ fn refresh_line(pass: &DockPass) -> String {
 }
 
 impl Conductor {
+    #[cfg(test)]
+    pub(super) fn diagnostic_fixture(clone: &std::path::Path) -> Self {
+        tests::dock_conductor(clone)
+    }
     pub(super) fn new(cfg: Config, forge: Box<dyn Forge>) -> Result<Self> {
         // The machine token is stamped per request from the process's one
         // watched source, so a conductor that outlives a rotation sends
@@ -263,7 +326,7 @@ impl Conductor {
         // headers until car 2's CLI slice (design 6805c764, review S1).
         // The machine client follows no redirect. The forge is reached
         // through `forge`, on its own plain client — never this one.
-        let http = crate::gate::machine_client_with(
+        let http = crate::sor_client::machine_client_with(
             reqwest::Client::builder().timeout(Duration::from_secs(30)),
         )?;
         // Built on the compiled fallback so the conductor can make the
@@ -361,7 +424,7 @@ impl Conductor {
 
     /// Every jobs-API call the conductor makes, under the blip guard:
     /// a rolling system of record must not fail a whole verb.
-    async fn api(
+    pub(super) async fn api(
         &self,
         method: Method,
         path: &str,
@@ -425,7 +488,7 @@ impl Conductor {
             })
     }
 
-    async fn get_job(&self, id: &str) -> Result<Value> {
+    pub(super) async fn get_job(&self, id: &str) -> Result<Value> {
         self.api(Method::GET, &format!("/api/jobs/{id}"), None)
             .await?
             .ok_or_else(|| anyhow!("job {id} came back empty"))
@@ -489,7 +552,7 @@ impl Conductor {
     /// step's stored keys are not read and not re-sent — the merge door
     /// keeps them, and a key another writer added since this pass read
     /// the train is kept too, rather than refused.
-    async fn complete_step(
+    pub(super) async fn complete_step(
         &self,
         job: &Value,
         step: Option<&Value>,
@@ -524,7 +587,7 @@ impl Conductor {
         // report's timings derive from these.
         md.insert(
             "completed_at".to_string(),
-            json!(crate::gate::stamp(Utc::now())),
+            json!(crate::sor_client::stamp(Utc::now())),
         );
         for (method, path, body) in step_completion_writes(jid, sid, md) {
             self.api(method, &path, Some(body)).await?;
@@ -1320,6 +1383,30 @@ impl Conductor {
                     continue;
                 }
             };
+            // A RECORDED VERDICT WHOSE PACKET NEVER SETTLED (backlog
+            // f4f5c271): re-send the status alone, which the jobs API
+            // answers by running the readiness pass and the close the
+            // recording write missed (17bf6f3e). Writes nothing to the
+            // step; a refused re-send is said and tried next pass.
+            if let Some(sid) = unsettled_verdict_step(&run, now) {
+                log(format!(
+                    "reconcile: gate-run {} has its verdict recorded but is still open — \
+                     re-sending the completion so its outcome readies and it closes",
+                    id8(&rid)
+                ));
+                if !self.cfg.dry {
+                    for (method, path, body) in step_completion_writes(&rid, sid, Map::new()) {
+                        if let Err(e) = self.api(method, &path, Some(body)).await {
+                            log(format!(
+                                "reconcile: gate-run {} — the settling re-send was refused \
+                                 (retries next pass): {e:#}",
+                                id8(&rid)
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
             let Some(hours) = dead_gate_run_hours(&run, now) else {
                 // One refused settle must not cost the rest of the pass
                 // (the clock settles below still owe their runs).
@@ -1854,8 +1941,12 @@ impl Conductor {
         // The outage as the latch holds it; a latch that could not be
         // written still names this pass's failure.
         let blocked = failure.as_deref().map(|why| {
-            carried_verdict::outage(&latch)
-                .unwrap_or_else(|| (crate::gate::stamp(now), carried_verdict::cause_of(why)))
+            carried_verdict::outage(&latch).unwrap_or_else(|| {
+                (
+                    crate::sor_client::stamp(now),
+                    carried_verdict::cause_of(why),
+                )
+            })
         });
         if (blocked.is_some() || recovered)
             && let Err(e) = self.note_recorder_blocked(blocked.as_ref(), now).await
@@ -1980,6 +2071,46 @@ impl Conductor {
         }
     }
 
+    /// Withdraw the train's place in the gate line once its ci step is
+    /// judged (review e536d148 of car edb0556f, backlog 82071657). Only
+    /// `train_gate` sets or clears the place, and it runs only while that
+    /// step is open — so a place set in the pass that judges the step
+    /// (owed a relaunch while forge CI read failing) stood until the
+    /// stall rule closed the train six hours later, holding a bay from
+    /// every builder for a gate nothing would launch. A closed train needs
+    /// no write: the place is read only off OPEN trains. Writes only when
+    /// a place is held; a write that fails is retried by the next pass,
+    /// which takes this arm again.
+    async fn release_gate_place_once_judged(&self, t: &Value, tid: &str, judged: bool) {
+        use crate::train_gate as tg;
+        let held = t
+            .pointer(&format!("/metadata/{}", tg::KEY_BOUND_WAIT))
+            .is_some_and(|v| !v.is_null());
+        if !judged || !held {
+            return;
+        }
+        if self.cfg.dry {
+            log(format!(
+                "DRY: would withdraw judged train {}'s place in the gate line",
+                id8(tid)
+            ));
+            return;
+        }
+        match self
+            .merge_job_metadata(tid, vec![(tg::KEY_BOUND_WAIT, Value::Null)])
+            .await
+        {
+            Ok(()) => log(format!(
+                "train {}: judged — its place in the gate line is withdrawn",
+                id8(tid)
+            )),
+            Err(e) => log(format!(
+                "train {}: could not withdraw its place in the gate line ({e}) — retrying next pass",
+                id8(tid)
+            )),
+        }
+    }
+
     /// THE TRAIN GATE, read or filed (design 128b5496). Returns the
     /// gate's standing (None when no gate-run is on the train yet) and
     /// the relaunch count, for `train_gate::combined_verdict`. Every
@@ -2046,6 +2177,20 @@ impl Conductor {
                                 (tg::KEY_RUN, Value::Null),
                                 (tg::KEY_RELAUNCHES, json!(relaunches + 1)),
                                 (tg::KEY_REFUSALS, json!(refusals)),
+                                // Owed a relaunch, the train keeps its
+                                // first place in the gate line until the
+                                // next pass files it or meets a fault —
+                                // a bay that frees in between is its
+                                // (backlog 82071657 finding 3).
+                                (
+                                    tg::KEY_BOUND_WAIT,
+                                    json!(format!(
+                                        "gate-run {} ended without a usable verdict ({why}); \
+                                         the train holds the first place in the gate line for \
+                                         its relaunch",
+                                        id8(&run_id)
+                                    )),
+                                ),
                             ],
                         )
                         .await
@@ -2070,7 +2215,25 @@ impl Conductor {
             log(format!("DRY: would file a train gate for {}", id8(tid)));
             return (None, relaunches);
         }
-        match self.launch_train_gate(t, tid).await {
+        let launched = self.launch_train_gate(t, tid).await;
+        self.record_train_gate_launch(t, tid, now, launched, relaunches)
+            .await
+    }
+
+    /// What one launch attempt of the train's gate leaves on the train:
+    /// the run it filed, its place at the gate bound, or a counted fault.
+    /// Its own method so the three arms are driven by a test without a
+    /// cluster to refuse at (backlog 82071657).
+    async fn record_train_gate_launch(
+        &self,
+        t: &mut Value,
+        tid: &str,
+        now: DateTime<Utc>,
+        launched: Result<String>,
+        relaunches: u32,
+    ) -> (Option<crate::train_gate::Standing>, u32) {
+        use crate::train_gate::{self as tg, Standing};
+        match launched {
             Ok(run_id) => {
                 log(format!(
                     "train {}: train gate filed — gate-run {} on {}",
@@ -2086,6 +2249,7 @@ impl Conductor {
                             (tg::KEY_LAUNCHED_AT, json!(now.to_rfc3339())),
                             // Filed: the train no longer waits for a reason.
                             (tg::KEY_WAIT_REASON, Value::Null),
+                            (tg::KEY_BOUND_WAIT, Value::Null),
                         ],
                     )
                     .await
@@ -2101,6 +2265,38 @@ impl Conductor {
                     *t = fresh;
                 }
                 (Some(Standing::Pending), relaunches)
+            }
+            Err(e) if at_gate_bound(&e) => {
+                // A PLACE, NOT A FAULT (backlog 82071657 findings 2 and
+                // 4): the bound sets the train's claim on the next bay
+                // and spends none of the launch failures that read the
+                // gate unavailable — a train waiting behind full bays is
+                // never judged by CI alone for having waited. Written
+                // only when the line changes, so a long wait is not an
+                // audit event per pass.
+                let why = format!("{e:#}");
+                log(format!("train {}: {why}", id8(tid)));
+                let said = |k: &str| {
+                    t.pointer(&format!("/metadata/{k}"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s == why)
+                };
+                let unchanged = said(tg::KEY_BOUND_WAIT) && said(tg::KEY_WAIT_REASON);
+                if !self.cfg.dry && !unchanged {
+                    let kv = vec![
+                        (tg::KEY_WAIT_REASON, json!(why)),
+                        (tg::KEY_BOUND_WAIT, json!(why)),
+                    ];
+                    if let Err(e2) = self.merge_job_metadata(tid, kv).await {
+                        log(format!(
+                            "train {}: could not record its place at the gate bound ({e2})",
+                            id8(tid)
+                        ));
+                    } else if let Ok(fresh) = self.get_job(tid).await {
+                        *t = fresh;
+                    }
+                }
+                (None, relaunches)
             }
             Err(e) => {
                 let failures = t
@@ -2118,9 +2314,12 @@ impl Conductor {
                 // The count AND the reason: a troubled packet must look
                 // troubled, and a count alone drew a healthy train at CI
                 // for two hours (48f7aba1).
+                // A fault is no claim on a bay: the train cannot use one,
+                // so it holds none from the builders (82071657).
                 let mut kv = vec![
                     (tg::KEY_LAUNCH_FAILURES, json!(failures)),
                     (tg::KEY_WAIT_REASON, json!(why)),
+                    (tg::KEY_BOUND_WAIT, Value::Null),
                 ];
                 if unavailable && !self.cfg.gate_required {
                     kv.push((
@@ -2346,10 +2545,8 @@ impl Conductor {
                     continue;
                 }
             };
-            if let Some(already) = review
-                .get("metadata")
-                .and_then(boss_jobs::stranded::hold_reason)
-            {
+            let review_md = review.get("metadata").unwrap_or(&Value::Null);
+            if let Some(already) = boss_jobs::stranded::hold_reason(review_md) {
                 log(format!("car {}: already held ({already})", id8(&cid)));
                 continue;
             }
@@ -2369,7 +2566,11 @@ impl Conductor {
                 .api(
                     Method::PATCH,
                     &format!("/api/jobs/{cid}/steps/{sid}/metadata"),
-                    Some(crate::steps::hold_patch(&reason)),
+                    // A released car keeps its `hold_sha`; the body
+                    // deletes it, so this red-train hold is not read as
+                    // a review hold judged at that head (backlog
+                    // 6c463c66, review 4822764d).
+                    Some(crate::steps::hold_patch(review_md, &reason)),
                 )
                 .await
             {
@@ -2464,6 +2665,27 @@ impl Conductor {
     /// its Job — the train's gate, and since backlog 969a1092 the dock's
     /// re-gate of a car main moved under. One launch path, so the two
     /// cannot differ in how a gate is admitted, filed or run.
+    /// The edit-level door's answer, read by the holder of the token for a
+    /// pod that runs branch code and holds none (design c395e62c): a
+    /// train's gate Job (backlog 934ccad1) and the consist worker (backlog
+    /// 37742794). NEVER FATAL and never a guess: unreadable, it logs why
+    /// for `what`, nothing is handed, and the lint in that pod says so.
+    async fn edit_level_to_hand(&self, what: &str) -> Option<Value> {
+        match self
+            .api(Method::GET, crate::dispatch::EDIT_LEVEL_PATH, None)
+            .await
+        {
+            Ok(answer) => answer,
+            Err(e) => {
+                log(format!(
+                    "{what}: the instance's edit level could not be read to hand down ({e:#}) \
+                     — none is handed"
+                ));
+                None
+            }
+        }
+    }
+
     async fn launch_gate(
         &self,
         branch: &str,
@@ -2483,14 +2705,23 @@ impl Conductor {
             let ns = self.cfg.gate_namespace.as_str();
             let max = crate::gate::max_concurrent(&self.http).await?;
             let live = crate::gate::running_gates(ns)?;
-            // The train is admitted AT the bound (48f7aba1), a car's re-gate
-            // below it: the one predicate `boss gate` also consults.
-            if !crate::gate::admits(live.len(), max, who) {
-                bail!(
-                    "the cluster is at its gate bound ({} running of {max}: {})",
-                    live.len(),
-                    live.join(", ")
-                );
+            // The bound counts every gate, the train's too (design
+            // 1e787fc2): the train takes the next free bay with nothing
+            // ahead of it, and a car's re-gate yields to a waiting train —
+            // the one predicate `boss gate` also consults.
+            let ahead = match who {
+                crate::gate::Requester::Train => Vec::new(),
+                crate::gate::Requester::Car => {
+                    crate::gate::trains_waiting_now(&self.http, Utc::now())
+                        .await
+                        .unwrap_or_else(|why| {
+                            log(format!("gate launch for {branch}: {why}"));
+                            Vec::new()
+                        })
+                }
+            };
+            if !crate::gate::admits(live.len(), ahead.len(), max, who) {
+                return Err(AtGateBound(gate_bound_refusal(&live, &ahead, max, who)).into());
             }
             Ok(manifest_text)
         }
@@ -2499,21 +2730,10 @@ impl Conductor {
         let ns = self.cfg.gate_namespace.clone();
         // The instance's edit level, read here by the holder of the token
         // and handed to the Job (backlog 934ccad1): the pod that runs the
-        // train's tree makes no request for it. Unreadable, none is
-        // handed and the gate's own lint says so — never fatal to a launch.
-        let edit_level = match self
-            .api(Method::GET, crate::dispatch::EDIT_LEVEL_PATH, None)
-            .await
-        {
-            Ok(answer) => answer,
-            Err(e) => {
-                log(format!(
-                    "gate launch for {branch}: the instance's edit level could not be read to \
-                     hand to the gate ({e:#}) — none is handed"
-                ));
-                None
-            }
-        };
+        // train's tree makes no request for it.
+        let edit_level = self
+            .edit_level_to_hand(&format!("gate launch for {branch}"))
+            .await;
         let start = |run_id: &str| -> Result<()> {
             let job = crate::gate::render_job(&manifest_text, branch, run_id, "--auto")?;
             let job = crate::gate::hand_edit_level(&job, edit_level.as_ref());
@@ -2754,6 +2974,13 @@ impl Conductor {
             // (assembly died, push hung) would slip past the
             // pr-step early-continues below and stall invisibly.
             self.note_stall(&t, now, &policy).await?;
+            // A train the pass that opened it never finished — opened,
+            // then the conductor restarted (d1a8b140, 2026-10-09) — is
+            // cancelled here rather than returned from below, which held
+            // the track behind it for as long as nobody looked (238d70c3).
+            if self.release_orphan_before_pr(&t, &tid, now).await? {
+                return Ok(());
+            }
             let pr_step = find_step(&t, "pr", "Open the batched PR");
             if !step_done(pr_step) {
                 return Ok(()); // this window's board phase, or a stalled assembly
@@ -2801,7 +3028,8 @@ impl Conductor {
                     self.cfg.gate_required,
                 )
             };
-            if !step_done(ci_step) && verdict != "pending" {
+            let judges_now = !step_done(ci_step) && verdict != "pending";
+            if judges_now {
                 let checks = ci_check_summary(info.get("statusCheckRollup"));
                 // WHY, not just WHICH: the tail of each failing job's log,
                 // resolved through /actions/runs/{run}/jobs (empty on green
@@ -2863,6 +3091,10 @@ impl Conductor {
                     }
                 }
             }
+            // A judged train launches no gate, so it holds no place in
+            // the gate line — withdrawn in the pass that judges it.
+            self.release_gate_place_once_judged(&t, &tid, ci_judged || judges_now)
+                .await;
 
             // Asked and unanswered. Stamped once, like the stall
             // sentinel, so a hung runner produces one line rather than
@@ -2959,11 +3191,20 @@ impl Conductor {
                     .filter_map(|e| fails_entry_path(e))
                     .collect();
                 let (consist, present) = self.consist_evidence(head, &failing);
+                // Every path the failure TEXT names, not only the
+                // panic's own file (backlog 4a56c797): a scanner's
+                // message naming a car's file keeps the red the consist's.
+                let named = verdict_located_files(
+                    &gate_fails,
+                    &gate_excerpt,
+                    info.get("statusCheckRollup"),
+                );
                 red_outside_consist(
                     &gate_fails,
                     info.get("statusCheckRollup"),
                     &consist,
                     &present,
+                    &named,
                 )
             });
             // ONCE PER CAR: the cars aboard are read only when the red is
@@ -3719,6 +3960,46 @@ impl Conductor {
             _ => {}
         }
         Ok(())
+    }
+
+    /// A train ORPHANED BEFORE ITS PR is cancelled by the conductor
+    /// itself, with the reason on its `cancelled` terminal (backlog
+    /// 238d70c3; the module comment of `orphan.rs` says why cancel and
+    /// not resume). Returns whether the orphan claimed this train's pass
+    /// — true whether it was cancelled, is dry, or auto-cancel is off and
+    /// it was only named: in each case there is nothing further a pass
+    /// can do for a train with no PR.
+    ///
+    /// Unstruck and releasing nothing in practice: boarding stamps a car
+    /// with its train only after the PR, so a train before its PR has no
+    /// car aboard. `cancel_train` releases any that say otherwise all the
+    /// same, and deletes the train's own branch.
+    async fn release_orphan_before_pr(
+        &self,
+        t: &Value,
+        tid: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let Some(age) = orphaned_before_pr(t, now, PRE_PR_ORPHAN_MINUTES) else {
+            return Ok(false);
+        };
+        let reason = orphaned_before_pr_reason(age, PRE_PR_ORPHAN_MINUTES);
+        if !self.cfg.auto_cancel {
+            log(format!(
+                "train {}: {reason} — NOT cancelling: auto-cancel is off \
+                 (BOSS_TRAIN_AUTO_CANCEL=0); it holds the track until `boss train cancel {}`",
+                id8(tid),
+                id8(tid)
+            ));
+            return Ok(true);
+        }
+        log(format!("train {} auto-cancelling: {reason}", id8(tid)));
+        if self.cfg.dry {
+            log(format!("DRY: would cancel {} ({reason})", id8(tid)));
+        } else {
+            self.cancel_train(tid, &reason, false, false).await?;
+        }
+        Ok(true)
     }
 
     /// Reconcile's arrival sweep: delete landed cars' branches from
@@ -4854,12 +5135,32 @@ impl Conductor {
             Ok((crate::gate::running_gates(ns)?.len(), max))
         }
         .await;
+        // A waiting train goes before the dock (design 1e787fc2); a read
+        // that fails counts none and says so, as `boss gate` does.
+        let trains = match &slot {
+            Ok(_) => crate::gate::trains_waiting_now(&self.http, Utc::now())
+                .await
+                .unwrap_or_else(|why| {
+                    log(format!("{}: {why}", id8(jid)));
+                    Vec::new()
+                }),
+            Err(_) => Vec::new(),
+        };
         match slot {
-            Ok((live, max)) if crate::gate::admits(live, max, crate::gate::Requester::Car) => {}
+            Ok((live, max))
+                if crate::gate::admits(live, trains.len(), max, crate::gate::Requester::Car) => {}
             // No bay: claim the next one, ahead of every builder place
-            // (design 42279fb2 D3). The refresh re-asks within two minutes.
+            // (design 42279fb2 D3), behind a waiting train (design
+            // 1e787fc2). The refresh re-asks within two minutes.
             Ok((live, max)) => {
-                let why = format!("{live} gate(s) running of {max}");
+                let why = if trains.is_empty() {
+                    format!("{live} gate(s) running of {max}")
+                } else {
+                    format!(
+                        "{live} gate(s) running of {max}, and {} waiting for the next bay goes first",
+                        trains.join(", ")
+                    )
+                };
                 return Some(DockHold {
                     waiting: Some(reading.main.clone()),
                     ..DockHold::plain(dock_regate::busy_reason(&why, reading, touched))
@@ -5058,6 +5359,11 @@ impl Conductor {
         self.ensure_clone()?;
         let pass = self.candidates().await?;
         log(refresh_line(&pass));
+        if let Err(error) = super::diagnostic_adapter::drain(self).await {
+            log(format!(
+                "diagnostic station UNKNOWN (ordinary dock refresh completed): {error:#}; request remains pending, no diagnostic pass recorded"
+            ));
+        }
         Ok(())
     }
 
@@ -5787,9 +6093,17 @@ impl Conductor {
         // refuses it (2026-09-06). Best-effort: a failed fetch logs
         // and the lints use the ref as it stands, exactly as before.
         freshen_trunk(clone);
-        let verdict =
-            super::consist_job::isolated_consist_check(clone, &self.cfg.fork_url, &self.policy)
-                .await;
+        // The worker runs the assembled tree and holds no token, so the
+        // edit level its lint judges is read here and handed down
+        // (backlog 37742794) — the consist pod sends nothing for it.
+        let edit_level = self.edit_level_to_hand("consist check").await;
+        let verdict = super::consist_job::isolated_consist_check(
+            clone,
+            &self.cfg.fork_url,
+            &self.policy,
+            edit_level,
+        )
+        .await;
         for w in verdict.warnings() {
             log(format!(
                 "consist check: {w} — skipping it, a broken check must not hold a train"
@@ -5874,7 +6188,10 @@ impl Conductor {
         // exists only for a train that is actually departing (4860aff8).
         // AFTER the push on purpose: a push that fails leaves one stale
         // `train/*` branch, while a packet opened for a train that never
-        // pushed HOLDS THE TRACK until a human cancels it.
+        // pushed HOLDS THE TRACK until a human cancels it. A pass that
+        // dies AFTER this line and before the PR step leaves the same
+        // orphan; reconcile cancels that one itself once it is
+        // `PRE_PR_ORPHAN_MINUTES` old (238d70c3).
         let Some(train) = self.open_train_job(&train_branch, &window).await? else {
             // `None` is the dry-run answer and a dry run returned long
             // before the clone was touched. Say it, rather than running
@@ -6481,6 +6798,54 @@ mod tests {
     use super::*;
     use crate::train::test_support::*;
 
+    /// Design 1e787fc2: the train waits at the bound like every gate, and
+    /// what it records as its wait says it holds the first place; a car's
+    /// re-gate names the train it yields to, and with none waiting reads
+    /// as it always did.
+    #[test]
+    fn a_train_at_the_bound_says_it_holds_the_first_place() {
+        let live: Vec<String> = vec!["gate-a".into(), "gate-b".into(), "gate-c".into()];
+        let train = gate_bound_refusal(&live, &[], 3, crate::gate::Requester::Train);
+        assert!(
+            train.contains("3 running of 3") && train.contains("gate-a"),
+            "{train}"
+        );
+        assert!(
+            train.contains("first place") && train.contains("next bay"),
+            "{train}"
+        );
+        let waiting = vec!["PR train 2026-10-10 07:09".to_string()];
+        let car = gate_bound_refusal(&live, &waiting, 3, crate::gate::Requester::Car);
+        assert!(
+            car.contains("PR train 2026-10-10 07:09") && car.contains("goes first"),
+            "{car}"
+        );
+        assert_eq!(
+            gate_bound_refusal(&live, &[], 3, crate::gate::Requester::Car),
+            "the cluster is at its gate bound (3 running of 3: gate-a, gate-b, gate-c)"
+        );
+    }
+
+    /// Backlog 82071657 finding 2: only the BOUND refusal is a place in
+    /// the gate line. It is told apart from every other launch error by
+    /// type — through the `GateLaunchFailed` the launch wraps it in and
+    /// the anyhow the train's launch converts that to — never by its
+    /// text, which names gates and changes every pass.
+    #[test]
+    fn only_the_bound_refusal_is_a_place_in_the_gate_line() {
+        let bound = || AtGateBound("the cluster is at its gate bound (3 running of 3)".into());
+        let wrapped = anyhow::Error::from(GateLaunchFailed::unfiled(bound().into()));
+        assert!(at_gate_bound(&wrapped));
+        assert!(at_gate_bound(&anyhow::Error::from(bound())));
+        let fault = anyhow::Error::from(GateLaunchFailed::unfiled(anyhow!(
+            "reading the gate runner manifest /x: No such file or directory"
+        )));
+        assert!(!at_gate_bound(&fault), "a fault is no claim on a bay");
+        assert!(!at_gate_bound(&anyhow!(
+            "the cluster is at its gate bound (3 running of 3)"
+        )));
+    }
+
     // -- a held car is written when its hold CHANGES -----------------------
 
     /// D1 of design 42279fb2 walks the dock every two minutes as well as
@@ -6545,6 +6910,62 @@ mod tests {
             "steps": [{"id": format!("{id}-rev"), "spec_slug": "review",
                        "title": "Open for review", "status": "ready", "metadata": {}}]
         })
+    }
+
+    #[tokio::test]
+    async fn refresh_reads_registered_diagnostics_without_releasing_held_cars() {
+        use axum::{Json, Router, extract::RawQuery, routing::get};
+        use std::sync::{Arc, Mutex};
+        let (_guard, clone) = clone_fixture("diagnostic-queue-route");
+        let queries: Arc<Mutex<Vec<String>>> = Arc::default();
+        let captured = queries.clone();
+        let app = Router::new().route(
+            "/api/jobs",
+            get(move |RawQuery(q): RawQuery| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(q.unwrap_or_default());
+                    Json(json!({"data": [], "total": 0}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut conductor = dock_conductor(&clone);
+        conductor.cfg.jobs = format!("http://{address}");
+        conductor.refresh().await.unwrap();
+        let queries = queries.lock().unwrap();
+        assert!(
+            queries.iter().any(|q| q.contains("diagnostic_executor")),
+            "the proper actor never reads its registered diagnostic station: {queries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_diagnostic_station_preserves_healthy_dock_refresh() {
+        use axum::{Json, Router, extract::RawQuery, response::IntoResponse, routing::get};
+        let (_guard, clone) = clone_fixture("diagnostic-refusal-route");
+        let app = Router::new().route(
+            "/api/jobs",
+            get(move |RawQuery(q): RawQuery| async move {
+                if q.unwrap_or_default().contains("diagnostic_executor") {
+                    (
+                        axum::http::StatusCode::FORBIDDEN,
+                        "diagnostic station refusal retained",
+                    )
+                        .into_response()
+                } else {
+                    Json(json!({"data": [], "total": 0})).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut conductor = dock_conductor(&clone);
+        conductor.cfg.jobs = format!("http://{address}");
+        conductor.refresh().await.unwrap();
     }
 
     /// Walk the dock once over `cars` (and `others`, readable by id but
@@ -6864,6 +7285,7 @@ mod tests {
                 fork_url: "https://github.com/example/boss-fork.git".into(),
                 upstream_url: "https://github.com/example/boss.git".into(),
                 home: home.display().to_string(),
+                diagnostics_home: home.join("diagnostics").display().to_string(),
                 clone: home.join("repo").display().to_string(),
                 forge_kind: forge_kind.into(),
                 auto_merge: false,
@@ -6879,7 +7301,7 @@ mod tests {
                 gate_required: false,
                 dry: false,
             },
-            http: crate::gate::machine_client().unwrap(),
+            http: crate::sor_client::machine_client().unwrap(),
             forge,
             owner: crate::owner::resolver("http://jobs.invalid"),
             policy: policy(),
@@ -7092,6 +7514,142 @@ mod tests {
         );
     }
 
+    // -- a train orphaned before its PR is cancelled by the conductor ---
+    //
+    // Backlog 238d70c3, 2026-10-09: pr-train d1a8b140 was opened inside
+    // a conductor restart and stood at `collect` with no car, no list and
+    // no PR, holding the track for 28 minutes until a person cancelled
+    // it — and nothing would ever have cleared it, because reconcile
+    // returned at the pr-step check for a train without a PR.
+
+    /// Every write a pass sends, as `METHOD path body`, and every branch
+    /// the forge was asked to delete — from an in-process jobs server
+    /// holding exactly `train`.
+    async fn orphan_pass(
+        train: Value,
+        now: DateTime<Utc>,
+        auto_cancel: bool,
+    ) -> (bool, Vec<(String, String, Value)>, Vec<String>) {
+        use axum::extract::Path;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let writes: Arc<Mutex<Vec<(String, String, Value)>>> = Arc::default();
+        let rec = writes.clone();
+        let (listed, one) = (train.clone(), train.clone());
+        let app = Router::new()
+            .route(
+                "/api/jobs",
+                get(move || {
+                    let t = listed.clone();
+                    async move { Json(json!({"data": [t], "total": 1})) }
+                }),
+            )
+            .route(
+                "/api/jobs/{id}",
+                get(move |Path(_id): Path<String>| {
+                    let t = one.clone();
+                    async move { Json(t) }
+                }),
+            )
+            .fallback(
+                move |method: axum::http::Method, uri: axum::http::Uri, body: String| {
+                    let rec = rec.clone();
+                    async move {
+                        let b = serde_json::from_str(&body).unwrap_or(Value::Null);
+                        rec.lock()
+                            .unwrap()
+                            .push((method.to_string(), uri.path().to_string(), b));
+                        Json(json!({}))
+                    }
+                },
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let mut c = cleanup_conductor(
+            "forgejo",
+            Box::new(FakeForge {
+                deleted: deleted.clone(),
+                fail_deletes: false,
+            }),
+        );
+        c.cfg.jobs = format!("http://{addr}");
+        c.cfg.auto_cancel = auto_cancel;
+        let tid = job_id(&train).unwrap().to_string();
+        let claimed = c
+            .release_orphan_before_pr(&train, &tid, now)
+            .await
+            .expect("the pass completes");
+        let w = writes.lock().unwrap().clone();
+        let d = deleted.lock().unwrap().clone();
+        (claimed, w, d)
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// THE REPRODUCTION: the d1a8b140 shape, read by a fresh conductor
+    /// pass 28 minutes after it opened. The pass cancels it itself —
+    /// `collect` closed honestly as boarding nothing, the `cancelled`
+    /// terminal carrying the recorded reason, the train's own empty
+    /// branch deleted — so the track is clear for the next board.
+    #[tokio::test]
+    async fn a_fresh_pass_cancels_a_train_orphaned_at_collect_with_its_reason() {
+        let (claimed, writes, deleted) =
+            orphan_pass(orphan_at_collect(), at("2026-10-09T09:49:00Z"), true).await;
+        assert!(claimed, "the orphan claims this train's pass");
+        let tid = "d1a8b140-57e2-4cec-ada0-3c8dcba8fc08";
+        let wrote = |m: &str, p: String| writes.iter().find(|(wm, wp, _)| wm == m && *wp == p);
+        let collect = wrote("PATCH", format!("/api/jobs/{tid}/steps/s-collect/metadata"))
+            .unwrap_or_else(|| panic!("collect is closed on the record: {writes:?}"));
+        assert!(
+            collect.2["boarded"]
+                .as_str()
+                .is_some_and(|b| b.starts_with("nothing")),
+            "{collect:?}"
+        );
+        assert!(wrote("PUT", format!("/api/jobs/{tid}/steps/s-collect")).is_some());
+        let cancelled = wrote(
+            "PATCH",
+            format!("/api/jobs/{tid}/steps/s-cancelled/metadata"),
+        )
+        .expect("the cancelled terminal carries the reason");
+        let reason = cancelled.2["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.starts_with("orphaned before its PR: opened 27m ago"),
+            "{reason}"
+        );
+        assert!(wrote("PUT", format!("/api/jobs/{tid}/steps/s-cancelled")).is_some());
+        assert_eq!(deleted, vec!["train/20261009-0919".to_string()]);
+    }
+
+    /// A train a live board is still opening is left alone: inside the
+    /// bound nothing is written and the pass goes on.
+    #[tokio::test]
+    async fn a_train_inside_the_orphan_bound_is_left_to_the_board_opening_it() {
+        let (claimed, writes, deleted) =
+            orphan_pass(orphan_at_collect(), at("2026-10-09T09:25:00Z"), true).await;
+        assert!(!claimed);
+        assert!(writes.is_empty(), "{writes:?}");
+        assert!(deleted.is_empty());
+    }
+
+    /// With auto-cancel switched off the conductor says what it would do
+    /// and writes nothing — the switch keeps meaning what it says.
+    #[tokio::test]
+    async fn an_orphan_under_auto_cancel_off_is_named_and_not_cancelled() {
+        let (claimed, writes, deleted) =
+            orphan_pass(orphan_at_collect(), at("2026-10-09T09:49:00Z"), false).await;
+        assert!(claimed);
+        assert!(writes.is_empty(), "{writes:?}");
+        assert!(deleted.is_empty());
+    }
+
     /// 48f7aba1: a train whose gate could not be filed carried only
     /// `train_gate_launch_failures=5` — a count with no reason — and
     /// the yard drew a healthy train at CI for two hours. This drives
@@ -7108,7 +7666,11 @@ mod tests {
 
         let train = json!({
             "id": "t1", "kind": "pr-train", "status": "open",
-            "metadata": { "boarded_jobs": ["c1"], "train_ref": "train/x@abcdef1" },
+            "metadata": {
+                "boarded_jobs": ["c1"], "train_ref": "train/x@abcdef1",
+                // A place the bound gave it on an earlier pass.
+                "train_gate_bound_wait": "the cluster is at its gate bound (3 running of 3)"
+            },
             "steps": [
                 {"id":"s-assemble","spec_slug":"assemble","title":"Assemble the train branch","status":"completed","metadata":{"train_ref":"train/x@abcdef1"}},
                 {"id":"s-pr","spec_slug":"pr","title":"Open the batched PR","status":"completed","metadata":{"pr_url":"https://forge.example/david/boss/pulls/9"}},
@@ -7170,11 +7732,263 @@ mod tests {
             why.contains("gate runner manifest"),
             "the reason is the launch error, verbatim: {why}"
         );
+        // A fault is no claim on a bay (backlog 82071657 finding 2): the
+        // place the bound gave it earlier is withdrawn in the same merge,
+        // so builders are not held a bay the train cannot use.
+        assert_eq!(
+            recorded.get(crate::train_gate::KEY_BOUND_WAIT),
+            Some(&Value::Null),
+            "the launch fault clears the train's place in the gate line: {recorded}"
+        );
         assert!(
             recorded
                 .get("train_gate_fallback")
                 .is_none_or(Value::is_null),
             "a REQUIRED gate never falls back to CI alone"
+        );
+    }
+
+    /// An in-process jobs API that HOLDS its jobs: a GET answers the row
+    /// as it stands and the metadata merge door merges (a `null` deletes
+    /// the key), so a test reads the train the way the next pass would.
+    /// Returns the base URL, the rows, and every merge body sent.
+    async fn holding_jobs_api(
+        jobs: Vec<Value>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Value>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    ) {
+        use axum::extract::Path;
+        use axum::routing::{get, patch};
+        use axum::{Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let rows: Arc<Mutex<std::collections::HashMap<String, Value>>> = Arc::new(Mutex::new(
+            jobs.into_iter()
+                .map(|j| (j["id"].as_str().unwrap().to_string(), j))
+                .collect(),
+        ));
+        let merges: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let (read, write, sent) = (rows.clone(), rows.clone(), merges.clone());
+        let app = Router::new()
+            .route(
+                "/api/jobs/{id}",
+                get(move |Path(id): Path<String>| {
+                    let row = read.lock().unwrap().get(&id).cloned();
+                    async move {
+                        match row {
+                            Some(r) => Ok(Json(r)),
+                            None => Err(axum::http::StatusCode::NOT_FOUND),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/jobs/{id}/metadata",
+                patch(move |Path(id): Path<String>, Json(b): Json<Value>| {
+                    sent.lock().unwrap().push(b.clone());
+                    let mut rows = write.lock().unwrap();
+                    if let (Some(row), Some(kv)) = (rows.get_mut(&id), b.as_object()) {
+                        let md = row["metadata"].as_object_mut().unwrap();
+                        for (k, v) in kv {
+                            if v.is_null() {
+                                md.remove(k);
+                            } else {
+                                md.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    async { axum::http::StatusCode::NO_CONTENT }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), rows, merges)
+    }
+
+    fn gate_place_conductor(jobs: String) -> Conductor {
+        use std::sync::{Arc, Mutex};
+        let mut c = cleanup_conductor(
+            "forgejo",
+            Box::new(FakeForge {
+                deleted: Arc::new(Mutex::new(Vec::new())),
+                fail_deletes: false,
+            }),
+        );
+        c.cfg.jobs = jobs;
+        c.cfg.gate_required = true;
+        c
+    }
+
+    fn train_with_open_ci(metadata: Value) -> Value {
+        json!({
+            "id": "t1", "kind": "pr-train", "status": "open", "title": "PR train 12:00",
+            "metadata": metadata,
+            "steps": [
+                {"id":"s-assemble","spec_slug":"assemble","title":"Assemble the train branch","status":"completed","metadata":{"train_ref":"train/x@abcdef1"}},
+                {"id":"s-pr","spec_slug":"pr","title":"Open the batched PR","status":"completed","metadata":{"pr_url":"https://forge.example/david/boss/pulls/9"}},
+                {"id":"s-ci","spec_slug":"ci","title":"CI verdict","status":"ready","metadata":{}}
+            ]
+        })
+    }
+
+    /// Review e536d148 of car edb0556f, BLOCKER: the relaunch arm gives a
+    /// train owed a relaunch its place in the gate line, and in the SAME
+    /// pass forge CI reads failing — the ci step is judged, `train_gate`
+    /// never runs for this train again, and the place stood until the
+    /// stall rule six hours later, a bay held from every builder for a
+    /// gate nothing would launch. One pass, driven in order: the refused
+    /// gate-run is read and its relaunch takes the place, the verdict is
+    /// failing, and the pass that judges the step withdraws the place.
+    #[tokio::test]
+    async fn a_train_judged_in_the_pass_its_relaunch_took_a_place_gives_the_place_up() {
+        use crate::train_gate::{self as tg, Standing};
+        let gate_run = json!({
+            "id": "g1", "kind": "gate-run", "status": "closed", "metadata": {},
+            "steps": [{"spec_slug": "record-verdict", "status": "completed", "metadata": {
+                "verdict": "refused",
+                "receipt": "{\"verdict\": \"refused\", \"refused_because\": \"disk floor\"}"
+            }}]
+        });
+        let train = train_with_open_ci(json!({
+            "boarded_jobs": ["c1"], "train_ref": "train/x@abcdef1", "train_gate_run": "g1"
+        }));
+        let (jobs, rows, _) = holding_jobs_api(vec![train.clone(), gate_run]).await;
+        let c = gate_place_conductor(jobs);
+        let row = || rows.lock().unwrap()["t1"].clone();
+
+        let mut t = train;
+        let (gate, relaunches) = c.train_gate(&mut t, "t1", Utc::now()).await;
+        assert!(matches!(gate, Some(Standing::Refused(_))), "{gate:?}");
+        assert_eq!(relaunches, 1);
+        let held = row();
+        assert!(
+            held["metadata"][tg::KEY_BOUND_WAIT]
+                .as_str()
+                .is_some_and(|s| s.contains("for its relaunch")),
+            "the relaunch arm keeps the train's place in the gate line: {held}"
+        );
+        assert_eq!(
+            crate::gate::trains_claiming(std::slice::from_ref(&held)),
+            vec!["PR train 12:00".to_string()]
+        );
+
+        let verdict = tg::combined_verdict("failing", gate.as_ref(), relaunches, true);
+        assert_eq!(verdict, "failing", "CI red settles the train this pass");
+
+        // Control: an unjudged train keeps its place.
+        c.release_gate_place_once_judged(&t, "t1", false).await;
+        assert!(row()["metadata"].get(tg::KEY_BOUND_WAIT).is_some());
+
+        c.release_gate_place_once_judged(&t, "t1", true).await;
+        let after = row();
+        assert!(
+            after["metadata"].get(tg::KEY_BOUND_WAIT).is_none(),
+            "a judged train holds no place in the gate line: {after}"
+        );
+        assert!(crate::gate::trains_claiming(&[after]).is_empty());
+    }
+
+    /// `reconcile` has no test of its own, so the line that runs the
+    /// withdrawal above is pinned in its source: once, on the judged flag
+    /// of BOTH a step judged before this pass and one judged in it, and
+    /// after the ci step is recorded.
+    #[test]
+    fn reconcile_withdraws_a_judged_trains_place_in_the_pass_that_judges_it() {
+        let src = include_str!("conductor.rs");
+        let body = &src[src
+            .find("pub(super) async fn reconcile(&self, now: DateTime<Utc>) -> Result<()> {")
+            .expect("reconcile")..];
+        let body = &body[..body.find("\n    }\n").expect("the end of reconcile")];
+        let call = "self.release_gate_place_once_judged(&t, &tid, ci_judged || judges_now)";
+        assert_eq!(body.matches(call).count(), 1, "called once per train");
+        let recorded = body
+            .find("(\"train_gate_run\", gate_run),")
+            .expect("the ci step's recording");
+        assert!(
+            body.find(call).unwrap() > recorded,
+            "withdrawn after the ci step is judged"
+        );
+    }
+
+    /// Backlog 82071657 findings 2 and 4, through the arm itself: a launch
+    /// refused at the gate bound takes the train's place in the gate line,
+    /// spends NONE of the launch failures that read the gate unavailable,
+    /// and is written only when the line changes — a long wait is not an
+    /// audit event per pass.
+    #[tokio::test]
+    async fn a_wait_at_the_gate_bound_is_a_place_written_once_and_no_launch_failure() {
+        use crate::train_gate as tg;
+        let train = train_with_open_ci(json!({
+            "boarded_jobs": ["c1"], "train_ref": "train/x@abcdef1",
+            "train_gate_launch_failures": 1
+        }));
+        let (jobs, rows, merges) = holding_jobs_api(vec![train.clone()]).await;
+        let c = gate_place_conductor(jobs);
+        let at_bound = |running: &str| -> Result<String> {
+            Err(GateLaunchFailed::unfiled(
+                AtGateBound(format!(
+                    "the cluster is at its gate bound ({running}) — the train holds the first \
+                     place in the gate line and takes the next bay that frees"
+                ))
+                .into(),
+            )
+            .into())
+        };
+        let row = || rows.lock().unwrap()["t1"].clone();
+
+        let mut t = train;
+        let first = c
+            .record_train_gate_launch(
+                &mut t,
+                "t1",
+                Utc::now(),
+                at_bound("3 running of 3: a, b, c"),
+                0,
+            )
+            .await;
+        assert_eq!(first, (None, 0), "a wait is no standing and no relaunch");
+        let md = row()["metadata"].clone();
+        let place = md[tg::KEY_BOUND_WAIT].as_str().expect("the place is taken");
+        assert!(place.contains("3 running of 3: a, b, c"), "{place}");
+        assert_eq!(md[tg::KEY_WAIT_REASON].as_str(), Some(place));
+        assert_eq!(md[tg::KEY_LAUNCH_FAILURES], json!(1), "no failure spent");
+        assert!(md.get(tg::KEY_FALLBACK).is_none());
+        assert_eq!(merges.lock().unwrap().len(), 1);
+
+        // The same line on the next pass writes nothing.
+        c.record_train_gate_launch(
+            &mut t,
+            "t1",
+            Utc::now(),
+            at_bound("3 running of 3: a, b, c"),
+            0,
+        )
+        .await;
+        assert_eq!(
+            merges.lock().unwrap().len(),
+            1,
+            "an unchanged wait is not re-written"
+        );
+
+        // A changed line is.
+        c.record_train_gate_launch(
+            &mut t,
+            "t1",
+            Utc::now(),
+            at_bound("3 running of 3: a, b, d"),
+            0,
+        )
+        .await;
+        assert_eq!(merges.lock().unwrap().len(), 2);
+        let md = row()["metadata"].clone();
+        assert!(md[tg::KEY_BOUND_WAIT].as_str().unwrap().contains("a, b, d"));
+        assert_eq!(
+            md[tg::KEY_LAUNCH_FAILURES],
+            json!(1),
+            "still no failure spent"
         );
     }
 
@@ -7339,7 +8153,7 @@ mod tests {
         json!({
             "id": "orph", "kind": "gate-run", "status": "open",
             "metadata": { "branch": "fix/orphan",
-                          "opened_at": crate::gate::stamp(now - chrono::Duration::minutes(idle_min)) },
+                          "opened_at": crate::sor_client::stamp(now - chrono::Duration::minutes(idle_min)) },
             "steps": [{"id": "s-v", "spec_slug": "record-verdict",
                        "title": "Record the gate verdict", "status": "ready", "metadata": {}}]
         })
@@ -7496,6 +8310,74 @@ mod tests {
         c
     }
 
+    /// An OPEN gate-run whose `record-verdict` step completed
+    /// `completed_min` minutes before `now` — the shape gate-run 21ad0189
+    /// stood in from 2026-10-09T01:40:46Z (backlog f4f5c271).
+    fn recorded_open_gate_run(now: DateTime<Utc>, completed_min: i64) -> Value {
+        json!({
+            "id": "stuck", "kind": "gate-run", "status": "open",
+            "metadata": { "branch": "fix/stuck",
+                          "opened_at": crate::sor_client::stamp(now - chrono::Duration::minutes(60)) },
+            "steps": [{"id": "s-v", "spec_slug": "record-verdict",
+                       "title": "Record the gate verdict", "status": "completed",
+                       "completed_at": crate::sor_client::stamp(now - chrono::Duration::minutes(completed_min)),
+                       "metadata": {"verdict": "green", "receipt": "{}"}},
+                      {"id": "s-g", "spec_slug": "green", "title": "Gate green",
+                       "status": "pending", "metadata": {}}]
+        })
+    }
+
+    /// A RECORDED VERDICT WHOSE PACKET NEVER SETTLED IS RE-SENT, NOT LEFT
+    /// (backlog f4f5c271). Gate-run 21ad0189's `record-verdict` completed
+    /// green at 2026-10-09T01:40:46Z and its readiness pass never ran, so
+    /// `green` stayed pending and the packet read as a running gate for a
+    /// day and a half. The jobs API now answers such a write 500 and runs
+    /// the missed pass on a re-send of the completed step (17bf6f3e) — but
+    /// the recorder never re-sends: every reader here skips a run whose
+    /// verdict step is done. The reap pass, which reads every open
+    /// gate-run, is where the re-send belongs: the status alone, never
+    /// the metadata, so the step itself is not written again.
+    #[tokio::test]
+    async fn an_open_gate_run_whose_verdict_is_recorded_is_settled_by_a_resend() {
+        let now = Utc::now();
+        let run = recorded_open_gate_run(now, 30);
+        let (jobs, writes) =
+            settle_api_with_cars(run.clone(), false, Some(vec![run.clone()]), false).await;
+        settle_conductor(jobs)
+            .reap_dead_gate_runs(now)
+            .await
+            .expect("the reap pass is not refused");
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![(
+                "PUT".to_string(),
+                "/api/jobs/stuck/steps/s-v".to_string(),
+                json!({"status": "completed"}),
+            )],
+            "exactly one write: the status-only re-send of the recorded verdict"
+        );
+    }
+
+    /// The write that recorded the verdict settles its own packet within
+    /// the same request, so a pass that reads it a moment later re-sends
+    /// nothing: only a verdict older than the grace is owed a settle.
+    #[tokio::test]
+    async fn a_verdict_recorded_moments_ago_is_left_to_its_own_settle() {
+        let now = Utc::now();
+        let run = recorded_open_gate_run(now, 0);
+        let (jobs, writes) =
+            settle_api_with_cars(run.clone(), false, Some(vec![run.clone()]), false).await;
+        settle_conductor(jobs)
+            .reap_dead_gate_runs(now)
+            .await
+            .expect("the reap pass is not refused");
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "nothing written: {:?}",
+            writes.lock().unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn a_gate_run_a_job_carries_is_not_settled() {
         let now = Utc::now();
@@ -7548,7 +8430,7 @@ mod tests {
         // the packet alive at launch.
         let mut reread = run.clone();
         reread["metadata"][crate::gate::LAUNCHING_AT] =
-            json!(crate::gate::stamp(now - chrono::Duration::minutes(1)));
+            json!(crate::sor_client::stamp(now - chrono::Duration::minutes(1)));
         let (jobs, writes) = settle_api(reread, false).await;
         let cluster = |_: &str, _: &str| -> Result<Vec<String>> { Ok(vec![]) };
         settle_conductor(jobs)
@@ -8185,7 +9067,8 @@ mod tests {
     /// A gate-run old enough for the three-hour clock to call it dead.
     fn stale_owing_run(now: DateTime<Utc>) -> Value {
         let mut run = owing_gate_run();
-        run["metadata"]["opened_at"] = json!(crate::gate::stamp(now - chrono::Duration::hours(4)));
+        run["metadata"]["opened_at"] =
+            json!(crate::sor_client::stamp(now - chrono::Duration::hours(4)));
         run
     }
 
@@ -8283,8 +9166,9 @@ mod tests {
         let aged = |id: &str, minutes: i64| {
             let mut run = owing_gate_run();
             run["id"] = json!(id);
-            run["metadata"]["opened_at"] =
-                json!(crate::gate::stamp(now - chrono::Duration::minutes(minutes)));
+            run["metadata"]["opened_at"] = json!(crate::sor_client::stamp(
+                now - chrono::Duration::minutes(minutes)
+            ));
             run
         };
         let (jobs, held) = stateful_runs_api(vec![aged("quiet", 40), aged("fresh", 3)]).await;
@@ -8357,8 +9241,9 @@ mod tests {
         const HEAD: &str = "1c82e857aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let mut run = idle_gate_run(now, 40);
         run["metadata"]["sha"] = json!(HEAD);
-        run["metadata"]["queued_at"] =
-            json!(crate::gate::stamp(now - chrono::Duration::minutes(40)));
+        run["metadata"]["queued_at"] = json!(crate::sor_client::stamp(
+            now - chrono::Duration::minutes(40)
+        ));
         let receipt =
             format!("{{\"verdict\": \"green\", \"head\": \"{HEAD}\", \"mode\": \"auto\"}}");
         let car = json!({
@@ -9984,7 +10869,7 @@ mod tests {
         dock_regate::owed_stamp("t-red", &[], &[], Utc::now())
     }
 
-    fn dock_conductor(clone: &std::path::Path) -> Conductor {
+    pub(super) fn dock_conductor(clone: &std::path::Path) -> Conductor {
         let mut c = cleanup_conductor(
             "forgejo",
             Box::new(FakeForge {
@@ -10102,7 +10987,7 @@ mod tests {
     #[test]
     fn a_car_held_by_a_judged_red_never_reaches_the_dock_regate() {
         let reason = judged_red_hold_reason("t1", &["svelte-check".into()], &[]);
-        let review_md = crate::steps::hold_patch(&reason);
+        let review_md = crate::steps::hold_patch(&Value::Null, &reason);
         let car = json!({
             "id": "c-g", "kind": "ship-a-change", "status": "open",
             "metadata": {"branch": "feat/g"},
@@ -10908,9 +11793,12 @@ mod tests {
         let first = c.candidates().await.expect("the refresh walks the dock");
         assert!(first.boardable.is_empty());
         assert_eq!(
-            crate::cadence::probe_dock_depth(&crate::gate::machine_client().unwrap(), &c.cfg.jobs)
-                .await
-                .expect("the probe reads the dock"),
+            crate::cadence::probe_dock_depth(
+                &crate::sor_client::machine_client().unwrap(),
+                &c.cfg.jobs
+            )
+            .await
+            .expect("the probe reads the dock"),
             1,
             "the garaged car fires the board; the red still retrying does not"
         );

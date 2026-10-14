@@ -49,9 +49,9 @@ test('the map draws exactly the routes served — one drawn element per route, n
   await mocks(page);
   await page.goto('/it');
   await expect(page.locator(MAP)).toBeVisible();
-  await expect(drawn(page)).toHaveCount(ROUTES.length);
+  await expect(drawn(page)).toHaveCount(ROUTES.filter((r) => r.to !== null).length);
   const keys = await drawn(page).evaluateAll((els) => els.map((e) => e.getAttribute('data-section') ?? ''));
-  expect([...keys].sort()).toEqual(ROUTES.map(key).sort());
+  expect([...keys].sort()).toEqual(ROUTES.filter((r) => r.to !== null).map(key).sort());
 });
 
 test('a route added to the answer arrives on the map, and one taken away leaves it', async ({ page }) => {
@@ -64,12 +64,12 @@ test('a route added to the answer arrives on the map, and one taken away leaves 
   await mocks(page, [...ROUTES, added]);
   await page.goto('/it');
   await expect(page.locator(`${MAP} path.section[data-section="track→garage"]`)).toHaveCount(1);
-  await expect(drawn(page)).toHaveCount(ROUTES.length + 1);
+  await expect(drawn(page)).toHaveCount(ROUTES.filter((r) => r.to !== null).length + 1);
 
   await page.unroute(YARD_ROUTES);
   await page.route(YARD_ROUTES, (r) => json(r, routesPayload(ROUTES.filter((x) => key(x) !== 'gates→track'))));
   await page.reload();
-  await expect(drawn(page)).toHaveCount(ROUTES.length - 1);
+  await expect(drawn(page)).toHaveCount(ROUTES.filter((r) => r.to !== null).length - 1);
   await expect(page.locator(`${MAP} [data-section="gates→track"]`)).toHaveCount(0);
   await expect(page.locator(`${MAP} [data-section="track→garage"]`)).toHaveCount(0);
 });
@@ -88,13 +88,10 @@ test('the train\'s own line: made up at the dock, back to the gates, over to the
   await expect(train).toHaveAttribute('data-to', 'track');
 });
 
-test('every packet leaves the map by a drawn exit that names its terminals', async ({ page }) => {
+test('exits remain in the records but are not drawn as ramps; entries remain visible', async ({ page }) => {
   await mocks(page);
   await page.goto('/it');
-  const exits = ROUTES.filter((r) => r.to === null);
-  await expect(page.locator(`${MAP} [data-ramp="exit"]`)).toHaveCount(exits.length);
-  const dock = page.locator(`${MAP} [data-ramp="exit"][data-section="dock→"]`);
-  await expect(dock.locator(':scope > title')).toHaveText('leaves the map from dock: 0 by cancelled, settled');
+  await expect(page.locator(`${MAP} [data-ramp="exit"]`)).toHaveCount(0);
   const entries = ROUTES.filter((r) => r.from === null);
   await expect(page.locator(`${MAP} [data-ramp="entry"]`)).toHaveCount(entries.length);
   await expect(page.locator(`${MAP} [data-ramp="entry"][data-section="→receiving"] title`)).toHaveText('enters the map at receiving: filed');
@@ -104,35 +101,17 @@ test('every packet leaves the map by a drawn exit that names its terminals', asy
 // 2026-09-26): every station's exits drop into ONE band under the line —
 // a stub, a branch per terminal in name order, a buffer stop on the one
 // rail with its count, the fan headed by its station and total.
-test('the exits drop into one band: the fixture station fans into three branches, each with its count', async ({ page }) => {
+test('exit terminals do not enlarge the map; station conservation counts remain', async ({ page }) => {
   await mocks(page);
   await page.goto('/it');
-  await expect(page.locator(`${MAP} [data-exits-band]`)).toHaveCount(1);
-  const fan = page.locator(`${MAP} [data-ramp="exit"][data-section="marshalling→"]`);
-  const branches = fan.locator('[data-terminal]');
-  await expect(branches).toHaveCount(3);
-  const read = await branches.evaluateAll((els) =>
-    els.map((e) => [e.getAttribute('data-terminal'), e.getAttribute('data-count'), e.getAttribute('data-declared')]),
-  );
-  expect(read).toEqual([
-    ['closed', '42', 'true'],
-    ['declined', '0', 'true'],
-    ['duplicate', '3', 'true'],
-  ]);
-  await expect(fan.locator('[data-terminal="closed"] text.blabel')).toHaveText('42 closed');
-  await expect(fan.locator('[data-fan-head]')).toHaveText('marshalling · off 45');
-  // Every buffer stop, in every fan, stands on one rail.
-  const rails = await page
-    .locator(`${MAP} [data-buffer]`)
-    .evaluateAll((els) => [...new Set(els.map((e) => (e as SVGGraphicsElement).getBBox().y))]);
-  expect(rails).toHaveLength(1);
+  await expect(page.locator(`${MAP} [data-exits-band], ${MAP} [data-terminal]`)).toHaveCount(0);
   // The station's words stand off its lines, with its in · on · off.
   await expect(page.locator(`${MAP} [data-ledger="marshalling"]`)).toHaveText('in 20 · on 24 · off 45');
   // Still one drawn element per route: a branch is part of its exit.
-  await expect(drawn(page)).toHaveCount(ROUTES.length);
+  await expect(drawn(page)).toHaveCount(ROUTES.filter((r) => r.to !== null).length);
 });
 
-test('a terminal packets left by that nothing declares for their kind is its own branch, dashed red', async ({ page }) => {
+test('observed exit terminals do not restore exit ramps', async ({ page }) => {
   const withFinding = ROUTES.map((r) =>
     r.from === 'marshalling' && r.to === null
       ? { ...r, sources: [...r.sources, { source: 'observed' as const, moves: 19, last_at: '', kind: 'agent-run', terminal: 'landed' }] }
@@ -140,13 +119,11 @@ test('a terminal packets left by that nothing declares for their kind is its own
   );
   await mocks(page, withFinding);
   await page.goto('/it');
-  const landed = page.locator(`${MAP} [data-section="marshalling→"] [data-terminal="landed"]`);
-  await expect(landed).toHaveAttribute('data-declared', 'false');
-  await expect(landed.locator('path.branch')).toHaveClass(/undeclared/);
-  await expect(page.locator(`${MAP} [data-section="marshalling→"] [data-terminal]`)).toHaveCount(4);
+  await expect(page.locator(`${MAP} [data-ramp="exit"], ${MAP} [data-terminal]`)).toHaveCount(0);
+  await expect(page.locator(`${MAP} [data-ledger="marshalling"]`)).toHaveText('in 20 · on 24 · off 64');
 });
 
-test('a wide fan pushes the next station\'s fan aside — its feeder jogs inside the band', async ({ page }) => {
+test('many long exit terminal names do not add a fan or widen the map', async ({ page }) => {
   const many = Array.from({ length: 14 }, (_, i) => `a-rather-long-terminal-name-${String(i).padStart(2, '0')}`);
   const wide = ROUTES.map((r) =>
     r.from === 'marshalling' && r.to === null
@@ -155,9 +132,12 @@ test('a wide fan pushes the next station\'s fan aside — its feeder jogs inside
   );
   await mocks(page, wide);
   await page.goto('/it');
-  await expect(page.locator(`${MAP} [data-section="marshalling→"] [data-terminal]`)).toHaveCount(14);
-  await expect(page.locator(`${MAP} [data-ramp="exit"][data-section="shop-floor→"]`)).toHaveAttribute('data-jog', 'true');
-  await expect(page.locator(`${MAP} [data-ramp="exit"][data-section="receiving→"]`)).not.toHaveAttribute('data-jog', /.*/);
+  await expect(page.locator(`${MAP} [data-ramp="exit"], ${MAP} [data-exits-band]`)).toHaveCount(0);
+  const wideView = await page.locator(`${MAP} svg[viewBox]`).first().getAttribute('viewBox');
+  await page.unroute(YARD_ROUTES);
+  await page.route(YARD_ROUTES, (r) => json(r, routesPayload(ROUTES)));
+  await page.reload();
+  await expect(page.locator(`${MAP} svg[viewBox]`).first()).toHaveAttribute('viewBox', wideView!);
 });
 
 test('a route only the moves record supports is drawn dashed red, and the key says what that means', async ({ page }) => {

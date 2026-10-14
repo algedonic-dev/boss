@@ -147,6 +147,21 @@ impl Session {
         self.employee_id.as_deref().unwrap_or(&self.username)
     }
 
+    /// The downstream `x-boss-user` shape, shared by proxy headers and
+    /// presence reads (cebf1588). Scope stays as captured at login;
+    /// identity, role and tier use the Session's existing resolution.
+    pub fn user_json(&self) -> String {
+        serde_json::json!({
+            "id": self.policy_id(),
+            "role": self.effective_role(),
+            "access_tier": self.access_tier(),
+            "territory_account_ids": self.territory_account_ids,
+            "direct_report_ids": self.direct_report_ids,
+            "department": self.department,
+        })
+        .to_string()
+    }
+
     /// The tier every reader forwards: "operator" ONLY for a session
     /// that was elevated — the stored tier AND the elevation's instant —
     /// and "user" for everything else, whatever a cookie's `t` says. The
@@ -225,6 +240,34 @@ mod tests {
     use super::*;
 
     const KEY: &[u8; 32] = b"test-key-0123456789abcdef0123456";
+
+    #[test]
+    fn downstream_user_json_preserves_the_session_fields_and_escaping() {
+        let mut session = Session::new("guest\"@example.com", 600);
+        let guest: serde_json::Value = serde_json::from_str(&session.user_json()).unwrap();
+        assert_eq!(
+            guest,
+            serde_json::json!({
+                "id": "guest\"@example.com", "role": boss_core::roles::VISITOR_ROLE,
+                "access_tier": "user", "department": null,
+                "territory_account_ids": [], "direct_report_ids": []
+            })
+        );
+        session.employee_id = Some("employee-fixture".into());
+        session.role = Some("fixture-role".into());
+        session.department = Some("fixture-department".into());
+        session.territory_account_ids = vec!["account-a".into(), "account-b".into()];
+        session.direct_report_ids = vec!["employee-a".into()];
+        let user: serde_json::Value = serde_json::from_str(&session.user_json()).unwrap();
+        assert_eq!(
+            user,
+            serde_json::json!({
+                "id": "employee-fixture", "role": "fixture-role", "access_tier": "user",
+                "department": "fixture-department", "territory_account_ids": ["account-a", "account-b"],
+                "direct_report_ids": ["employee-a"]
+            })
+        );
+    }
 
     #[test]
     fn shared_verified_wire_preserves_every_gateway_claim_and_private_elevation() {

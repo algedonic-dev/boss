@@ -24,7 +24,7 @@
 //! it to the other two on every row, so a credential of another name
 //! cannot come to be judged by a second copy of the rule.
 
-use boss_testing::{create_dir, repo_root, scratch_dir, write_file};
+use boss_testing::{create_dir, repo_root, scratch_dir, without_proxy, write_file};
 use std::process::Command;
 
 const LIB: &str = "infra/lib/secret-header.sh";
@@ -32,7 +32,8 @@ const MOUNTED: &str = "fakeMOUNTfakeMOUNTfakeMOUNTfakeMOUNTfake904";
 const HELD: &str = "fakeVALUEfakeVALUEfakeVALUEfakeVALUEfake905";
 
 /// The reviewer's rows: thirteen ways the list can be given, by twenty-two
-/// addresses, and the six scheme-less shapes of review 927f8602 (F1).
+/// addresses, and the six scheme-less shapes of review 927f8602 (F1);
+/// then the same addresses under two proxy variables (F4).
 /// POSIX sh, because the lib is.
 const TABLE: &str = r#"
 set -u
@@ -68,6 +69,12 @@ export BOSS_MACHINE_TOKEN_HOSTS="10.20.0.34 evil.example"; row "env, whitespace 
 export BOSS_MACHINE_TOKEN_HOSTS=".example,10.20.0.34";     row "env, suffix entry"
 export BOSS_MACHINE_TOKEN_HOSTS="*";                       row "env, a star"
 export BOSS_MACHINE_TOKEN_HOSTS=".";                       row "env, a bare dot"
+# A proxy curl would send the request through (backlog 50708d76, F4):
+# the same list, and every reader withholds what the proxy would carry.
+export BOSS_MACHINE_TOKEN_HOSTS="10.20.0.34";
+export http_proxy="http://127.0.0.1:9";                    row "http_proxy set"
+unset http_proxy; export https_proxy="http://127.0.0.1:9"; row "https_proxy set"
+unset https_proxy
 # What each wrote, for one host both serve: the mount's token and the
 # caller's value, never the other way round.
 unset BOSS_MACHINE_TOKEN_HOSTS; export BOSS_SOR_ENV="$D/sor.env"
@@ -104,15 +111,17 @@ fn rows(shell: &str) -> Vec<Vec<String>> {
     );
     write_file(&d.join("emptyline.env"), "BOSS_MACHINE_TOKEN_HOSTS=\n");
     write_file(&d.join("noline.env"), "# nothing\n");
-    let out = Command::new(shell)
-        .args(["-c", TABLE])
+    let mut cmd = Command::new(shell);
+    cmd.args(["-c", TABLE])
         .env("D", &d)
         .env("LIB", repo_root().join(LIB))
         .env("VALUE", HELD)
         .env_remove("BOSS_MACHINE_TOKEN_HOSTS")
-        .env_remove("BOSS_SOR_ENV")
-        .output()
-        .unwrap_or_else(|e| panic!("{shell}: {e}"));
+        .env_remove("BOSS_SOR_ENV");
+    // No proxy but the table's own: the rule withholds what curl would
+    // send through one (backlog 50708d76, F4).
+    without_proxy(&mut cmd);
+    let out = cmd.output().unwrap_or_else(|e| panic!("{shell}: {e}"));
     assert!(
         out.status.success(),
         "[{shell}] the table ran: {}",
@@ -134,7 +143,7 @@ fn both_header_writers_decide_the_same_hosts() {
             .iter()
             .filter(|r| r[0] != "wrote" && r[0] != "edge")
             .collect();
-        assert_eq!(table.len(), 13 * 28, "[{shell}] every row ran");
+        assert_eq!(table.len(), 15 * 28, "[{shell}] every row ran");
         let differing: Vec<String> = table
             .iter()
             .filter(|r| r[2] != r[3] || r[3] != r[4])
@@ -187,6 +196,19 @@ fn both_header_writers_decide_the_same_hosts() {
             "withheld",
             "[{shell}] an unreadable list names no host"
         );
+        // A PROXY CARRIES NOTHING (backlog 50708d76, F4 of review
+        // 927f8602): a listed host is withheld by all three readers when
+        // curl would send the request through a proxy, and still stamped
+        // when curl reads no proxy for that scheme.
+        for (label, url, want) in [
+            ("http_proxy set", "http://10.20.0.34:7900", "withheld"),
+            ("http_proxy set", "http://127.0.0.1:7900", "withheld"),
+            ("http_proxy set", "https://10.20.0.34:443", "stamped"),
+            ("https_proxy set", "https://10.20.0.34:443", "withheld"),
+            ("https_proxy set", "http://10.20.0.34:7900", "stamped"),
+        ] {
+            assert_eq!(said(label, url), want, "[{shell}] {label}: {url}");
+        }
         // NO LEADING SCHEME, NO HOST (backlog 50708d76, F1 of review
         // 927f8602). The six rows the reviewer measured against curl —
         // each read ADMIT by the host after a later `://` while curl
@@ -210,7 +232,7 @@ fn both_header_writers_decide_the_same_hosts() {
                 .collect();
             assert_eq!(
                 table.iter().filter(|r| r[1] == url).count(),
-                13,
+                15,
                 "[{shell}] {url} ran under every list"
             );
             assert!(

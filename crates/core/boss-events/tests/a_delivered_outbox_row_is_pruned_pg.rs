@@ -212,13 +212,12 @@ async fn a_delivered_row_inside_the_age_survives() {
 }
 
 /// Review afdc2d5d, finding N1, machine-run by the reviewer as probe (c).
-/// The relay's audit insert is `WHERE NOT EXISTS (… event_id = $1)`, so
-/// a second, DIFFERENT event staged under an id audit_log already holds
-/// is skipped without a word and then stamped delivered. While the
+/// Before ee2176c6, the relay skipped a second, DIFFERENT event under
+/// an audited id and stamped it delivered. While the
 /// outbox kept every row, its UNIQUE(event_id) refused that second
 /// staging; once retention has pruned the first copy it no longer can.
-/// Unreachable today — every live id is a fresh v4 — but the deletion
-/// must not depend on that: it deletes a copy only when audit_log holds
+/// Retention must still preserve a historical wrongly-delivered row:
+/// it deletes a copy only when audit_log holds
 /// the same FACT, not merely the same id.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delivered_row_whose_id_audit_log_holds_under_another_fact_survives() {
@@ -241,10 +240,22 @@ async fn a_delivered_row_whose_id_audit_log_holds_under_another_fact_survives() 
             .await
             .unwrap();
         let bus = RecordingEventBus::new();
-        let stats = drain_outbox_once(&db.pool, &(bus as Arc<dyn EventBus>), 1000)
-            .await
-            .expect("drain");
-        (id, stats.audit_inserted)
+        let result = drain_outbox_once(&db.pool, &(bus.clone() as Arc<dyn EventBus>), 1000).await;
+        let inserted = if n == 1 {
+            result.expect("first fact drains").audit_inserted
+        } else {
+            assert!(result.unwrap_err().contains("immutable identity conflict"));
+            assert_eq!(bus.event_count(), 0, "the repaired relay refuses B");
+            // Reconstruct the pre-repair receipt to keep testing the
+            // retention boundary against already-recorded bad state.
+            sqlx::query("UPDATE event_outbox SET delivered_at = NOW() WHERE id=$1")
+                .bind(id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            0
+        };
+        (id, inserted)
     };
 
     // Fact A under the id: relayed, aged out, pruned.
@@ -255,28 +266,28 @@ async fn a_delivered_row_whose_id_audit_log_holds_under_another_fact_survives() 
         .await
         .expect("prune");
     assert_eq!(first.deleted, 1, "A's copy is in audit_log, so it goes");
+    let bus = RecordingEventBus::new();
+    drain_outbox_once(&db.pool, &(bus as Arc<dyn EventBus>), 1000)
+        .await
+        .expect("deliver the retention fact before the conflicting batch");
 
     // Fact B under the SAME id: the outbox accepts it (A's row is gone),
-    // and the relay's NOT EXISTS skips its audit insert.
-    // (The drain also relays the pass's own pruned fact, so its insert
-    // count is not B's; read the log for B instead.)
+    // and the repaired relay refuses it. Reconstruct the old delivery
+    // stamp explicitly: retention still owes that historical row care.
     let (b, _) = stage("outbox.test.second-fact", 2).await;
     let b_in_log: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE kind = 'outbox.test.second-fact'")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-    assert_eq!(
-        b_in_log, 0,
-        "the relay skipped B's audit insert — the hazard"
-    );
+    assert_eq!(b_in_log, 0, "B has no audit fact");
     let b_delivered: bool =
         sqlx::query_scalar("SELECT delivered_at IS NOT NULL FROM event_outbox WHERE id = $1")
             .bind(b)
             .fetch_one(&db.pool)
             .await
             .unwrap();
-    assert!(b_delivered, "and stamped B delivered anyway");
+    assert!(b_delivered, "historical wrongly-delivered fixture");
     // Age every row, the first pass's own pruned fact included: a young
     // row staged before B would bound the walk below B and shelter it
     // for the wrong reason.

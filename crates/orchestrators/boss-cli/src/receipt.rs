@@ -136,13 +136,13 @@ pub async fn run(branch: &str, clone: Option<String>, remote: Option<String>) ->
     // Going through gate.rs's client also inherits the rule that
     // BOSS_JOBS_URL has no default: a wrong instance does not error
     // here, it answers, which is worse.
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     // Read EVERY open car, not just page one. A limit is not a filter
     // (a-limit-is-not-a-filter): with more than a page of open cars, the
     // one we want can sit past the cap, and reading only page one called
-    // an existing car's receipt absent. `gate::all_open_cars` pages on
+    // an existing car's receipt absent. `crate::sor_client::all_open_cars` pages on
     // `total`.
-    let cars = crate::gate::all_open_cars(&http).await?;
+    let cars = crate::sor_client::all_open_cars(&http).await?;
     let facts = facts_from(&cars, branch, &clone, &remote);
 
     println!("boss receipt: {branch}");
@@ -174,7 +174,7 @@ pub async fn run(branch: &str, clone: Option<String>, remote: Option<String>) ->
 }
 
 /// Split out so the JSON walk is testable without a live API. Takes the
-/// FULLY-GATHERED open cars (see `gate::all_open_cars`), not one page, so
+/// FULLY-GATHERED open cars (see `crate::sor_client::all_open_cars`), not one page, so
 /// a car past the first page is not silently missed.
 fn facts_from(cars: &[serde_json::Value], branch: &str, clone: &str, remote: &str) -> ReceiptFacts {
     let ls = sh(&[

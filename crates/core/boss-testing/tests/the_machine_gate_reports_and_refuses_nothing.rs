@@ -560,7 +560,9 @@ fn the_dev_pods_copy_is_named_only_to_the_doors() {
         "boss-dev.yaml must not name the directory in the pod's environment: every process \
          on the pod would inherit it, builders' tests included"
     );
-    for door in ["infra/dev/boss", "infra/dev/boss-api"] {
+    // wt-cargo names it to its scratch-floor pass alone, never to cargo
+    // (backlog ffd309c1; wt_cargo_sh.rs holds that half).
+    for door in ["infra/dev/boss", "infra/dev/boss-api", "infra/dev/wt-cargo"] {
         let text = std::fs::read_to_string(repo_root().join(door)).expect("a door");
         assert!(
             text.contains("machine-token-dir"),

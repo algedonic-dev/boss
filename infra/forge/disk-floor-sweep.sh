@@ -80,8 +80,16 @@
 # branch without this car depending on it.
 #
 # Install (forge host): disk-floor-sweep is in install.sh's UNITS
-# list, so the standing idiom covers it —
-#   ssh <forge> 'cd /home/david/boss && git pull && sudo infra/forge/install.sh'
+# list, which forge-converge runs from root's tree on every tick.
+#
+# ONE DAEMON, ROOT'S (backlog 683d7fe9, car 2). Until that car this host
+# had two daemons to keep: david's rootless one, where the cluster
+# converge built and which passes (a)-(c) pruned, and the SYSTEM one the
+# CI jobs run in, which pass (0) and the first half of (a) reached
+# through `sudo -n docker`. The converge builds on the system daemon now
+# and this sweep runs as root, so every pass below prunes that one
+# daemon, directly. The rootless daemon is pruned by nothing any more:
+# what it still holds is the operator's (infra/forge/OPERATIONS.md).
 #
 # Usage: disk-floor-sweep.sh [floor_gb]
 #   floor_gb overrides BOSS_DISK_FLOOR_GB (default 70, = CI's floor). The optional
@@ -93,7 +101,8 @@ set -euo pipefail
 # /etc/boss/sor.env (BOSS_FORGE_REGISTRY / BOSS_CI_IMAGE_REPO override).
 . "$(dirname "$0")/forge-defaults.sh"
 forge_need REGISTRY CI_IMAGE_REPO
-export DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/1000/docker.sock}"
+# The system daemon, whatever DOCKER_HOST the environment carried.
+unset DOCKER_HOST
 
 # 40 (70 until 2026-09-16), not 25, and it MUST match locomotive.sh's
 # BOSS_CI_MIN_FREE_GB (§9a — one number wearing two names). The sweep's
@@ -165,14 +174,15 @@ CI_IMAGE_KEEP_NEWEST="${BOSS_CI_IMAGE_KEEP_NEWEST:-3}"
 CI_TRAIN_LOOKBACK="${BOSS_CI_TRAIN_LOOKBACK:-120}"
 # The reader, overridable so the pass is testable without a network.
 SWEEP_CURL_CMD="${BOSS_SWEEP_CURL_CMD:-curl}"
-# WHICH DAEMON, EXPLICITLY, BOTH HALVES. `sudo -n docker` is root's
-# docker — the SYSTEM daemon the Actions jobs run in — and sudo's
-# env_reset is what keeps the DOCKER_HOST exported above from following
-# it there. That is load-bearing enough to state twice: the expected
-# data-root goes with it and the library refuses when the daemon it
-# reached does not match, because a prune aimed at the rootless daemon
-# reports success and frees nothing.
-SYSTEM_DOCKER="${BOSS_CI_IMAGE_DOCKER:-sudo -n docker}"
+# WHICH DAEMON, EXPLICITLY, BOTH HALVES. `docker` as root with no
+# DOCKER_HOST (unset above) is the SYSTEM daemon — the one the Actions
+# jobs run in and, since backlog 683d7fe9, the one the cluster converge
+# builds in. It was `sudo -n docker` while this ran as david. That is
+# load-bearing enough to state twice: the expected data-root goes with
+# it and the library refuses when the daemon it reached does not match,
+# because a prune aimed at another daemon reports success and frees
+# nothing.
+SYSTEM_DOCKER="${BOSS_CI_IMAGE_DOCKER:-docker}"
 SYSTEM_DOCKER_ROOT="${BOSS_CI_IMAGE_DAEMON_ROOT:-/var/lib/docker}"
 case "$FLOOR_GB" in
     ''|*[!0-9]*)
@@ -305,10 +315,11 @@ done_at() { # step-name
 # <24h, sweep freed nothing — it took a hand `docker builder prune -af`).
 # `|| true`: a docker hiccup here must not stop the remaining
 # remediations — the unmet floor at the end is what fails loudly.
-# THE DAEMON CI RUNS IN, FIRST. This host has two docker daemons
-# (reap-dead-ci-jobs header): david's rootless one, where the converge
-# builds and which every step below prunes, and the SYSTEM one that
-# Forgejo Actions jobs run in. Every train's build-image job leaves a
+# UNUSED IMAGES, FIRST. Until backlog 683d7fe9 this host kept two
+# docker daemons (reap-dead-ci-jobs header): david's rootless one, where
+# the converge built and which every step below pruned, and the SYSTEM
+# one that Forgejo Actions jobs run in — the one daemon now, where the
+# converge builds too. Every train's build-image job leaves a
 # 10.20.0.15:3000/david/boss-ci:<sha> tag in the system daemon and
 # nothing ever removed one: measured 2026-09-05 03:19 (disk-report),
 # 68 images, 85.88GB, 83.28GB reclaimable (96%) — the bulk of a 228GB
@@ -321,10 +332,10 @@ done_at() { # step-name
 # day defeats: on 2026-09-05 eight trains left eight per-train images
 # (~40GB) under the age filter, the forge slid 109 → 71GB free between
 # builds, and this sweep at 17:10 reported FLOOR UNMET at 98GB with
-# nothing left it was allowed to remove. `sudo -n`
-# because the system socket is root's — the same sudo the converge
-# runner uses for `docker run`; refused means the step is skipped and
-# says so, never a silent zero.
+# nothing left it was allowed to remove. The converge's own boss:<sha>
+# images are in this daemon now, pushed before anything prunes them, so
+# an unused one is a LAN re-pull away like the CI's. A daemon that
+# refuses means the step is skipped and says so, never a silent zero.
 # THE FILTER AND ITS LABEL ARE ONE FACT (§9a). This logged "older than
 # 24h" for an `until=4h` filter for days — a record describing work
 # nobody did, in the journal an operator reads during a disk incident.
@@ -375,10 +386,11 @@ fi
 
 # (c) Old boss tags, keep-N-newest, verified in the registry before
 # rmi — the one shared definition (see the lib header for why the
-# verification is load-bearing).
+# verification is load-bearing). The registry is asked with the push
+# login, as the converge asks it (forge-defaults.sh REGISTRY_PUSH_DIR).
 # shellcheck source=infra/forge/prune-registry-tags.lib.sh
 . "$(dirname "$0")/prune-registry-tags.lib.sh"
-prune_registry_verified_tags "$REGISTRY" "${BOSS_RUNNER_KEEP_IMAGES:-5}" disk-floor-sweep
+DOCKER_CONFIG="$REGISTRY_PUSH_DIR" prune_registry_verified_tags "$REGISTRY" "${BOSS_RUNNER_KEEP_IMAGES:-5}" disk-floor-sweep
 if floor_met_after "registry-verified old-tag removal"; then
     done_at "registry-verified old-tag removal"
 fi

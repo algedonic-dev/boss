@@ -44,7 +44,8 @@
 //!    interpreter at `argv[0]` (`["bash", "infra/forge/x.sh"]`) does not
 //!    hide the script behind it.
 //! 3. the transitive closure: any file under [`CANDIDATES`] whose path
-//!    or basename appears in the text of a covered SCRIPT (20 of ~24
+//!    or basename appears, as a whole name ([`names_file`]: not inside
+//!    a longer one, backlog 76b846cd), in the text of a covered SCRIPT (20 of ~24
 //!    MUTATING scripts source or exec a helper — `commission-a-disk.
 //!    judge.sh`, `node-roles.sh`, `infra/lib/jq.sh`, …). Comments are
 //!    read too: a name is a name. `examples/` is a candidate beside
@@ -132,28 +133,69 @@
 //! because two of the four spellings on main say `boss` only where the
 //! variable is set — and a subcommand that is a module of the crate
 //! (`car-retire` is `car_retire`) covers [`CLI_SRC`]`<sub>.rs`,
-//! `<sub>/`, and the in-crate modules those name ONE level down
-//! (`crate::m`, `super::m`, `m::`). The module names are the listing's,
-//! never a list typed here. Comment lines are not read for this: a
-//! comment runs nothing, and the prose in them took the set from 31 of
-//! 88 CLI files to 59; reading ANY expansion as the binary took it to
-//! 47, every addition a false match (`"$DOCKER" inspect`, `$CAR_KIND
-//! car`). Measured on the tree of 2026-09-28; 181 of 599 commits in 30
-//! days touch the 31 (the triage's estimate for the four named
-//! subcommands alone was 115; `boss dispatch`, `job`, `queue`, `ops`,
-//! `events` and `estate` in covered scripts are the rest).
+//! `<sub>/`, and every in-crate module those name (`crate::m`,
+//! `super::m`, `m::`), followed to a FIXED POINT (backlog 76b846cd F4:
+//! one level left `git_auth`, which scopes the forge token, unheld two
+//! levels below `prove --unattended`). The module names are the
+//! listing's, never a list typed here. Only CODE is read for them —
+//! no comment line and no `#[cfg(test)]` module ([`code_of`]): a
+//! comment or a test runs nothing in the verb, and the prose in
+//! comments took the one-level set from 31 of 88 CLI files to 59;
+//! reading ANY expansion as the binary took it to 47, every addition a
+//! false match (`"$DOCKER" inspect`, `$CAR_KIND car`). The hold's own
+//! modules ([`HOLD_OWN`]) are roots too, whatever runs them (F6). A
+//! subcommand also reaches every module its ARMS in the crate root name
+//! ([`arms`], review 754a492b B1): the dev hook runs `boss dispatch
+//! --from-hook`, which main.rs routes to `dispatch_hook::run` — the code
+//! that rewrites the prompt, model and isolation of every hooked Agent
+//! call — and no line of dispatch.rs's code names it, so reading code
+//! only had dropped it. A grouped import, `use crate::{a, b as c}`,
+//! names each module in it (N2).
 //!
-//! NOT COVERED. The hubs in [`CLI_HUBS`], by any rule — `gate` and
-//! `train` are the CLI's shared plumbing, and following them took the
-//! share of 30 days' commits held from ~19% to 37%+ (the triage of
-//! b089661d, measured on origin/main b34427e0). The crate root
+//! THE BOUND (decided 2026-10-09 on the item, after review 754a492b):
+//! the share of 30 days' commits that touch a CLI file the judge holds,
+//! read against a recorded window (`mutating_verb/window.txt`: origin/
+//! main afbe286d, 686 commits, each a train) — the cost the bound guards
+//! is cars waiting for a review, and the old count of files was not it:
+//! B1's one file took that count past half while costing 11 commits.
+//! Measured on that window: main (before backlog 76b846cd) held 43 CLI
+//! files and 214 commits (31.2%); the car's first head 54 files, 229
+//! (33.4%); this head 61 files of 111, 237 (34.5%) — the arms added
+//! `dispatch_hook` (11 commits), `ops_request` (10), `car_retire`,
+//! `disprove`, `dock_preview` and `source_backfill`. 328 commits (47.8%)
+//! touch a CLI file at all. The bound is 40% (the test's
+//! `BOUND_PERCENT`), so a judge holding every CLI file fails it. The
+//! hunk rules (main.rs, the hubs) are not in that count: on the same
+//! window the hub rules hold 9 commits, 6 of them by module names alone.
+//! Everything the judge holds, `infra/` included, was 495 of 685 (72.3%)
+//! at the first head, measured by its builder — most of it `infra/`.
+//!
+//! NOT COVERED. The hubs in [`CLI_HUBS`] wholesale — `gate` and `train`
+//! are the CLI's shared plumbing, and following them took the share of
+//! 30 days' commits held from ~19% to 37%+ (the triage of b089661d,
+//! measured on origin/main b34427e0). A hub file is held only where its
+//! hunks (three lines of context) name a [`HOLD_OWN`] module (the gate's
+//! call to the judge, the conductor's re-judge, F6) or the hold's wiring
+//! ([`HOLD_WIRING`]: a name the hub gives the hold, or a change inside
+//! `review_hold` or `hold_guard`; review 754a492b N1). So an edit to the
+//! hold in a hub that names none of those, more than three lines from
+//! one and outside those two functions, judges Clear — the local the
+//! gate binds the given `--hold` to is spelled `hold`, and holding that
+//! word held 29 commits of the window against 9. And a change to
+//! what `train` does for a verb — `send_through_a_roll`'s retry,
+//! `list_all_pages`'s paging, both of which the system-of-record client
+//! calls — or to the gate's other helpers a reached module still names
+//! (`gate::replay_refused`, freshness) judges Clear. The crate root
 //! (`main.rs`) wholesale: it holds the clap arms and flag switches that
 //! route to every module, so it is held only when the diff's hunks
 //! (three lines of context) name a reached module or its
 //! `Commands::<Sub>` arm or its `mod <sub>` line, or carry any
-//! `#[path` ([`CLI_MAIN`]). Three main.rs shapes judge Clear here:
-//! an edit routing a reached subcommand to a new module more than three
-//! lines from any line that names it; an early return added to
+//! `#[path` ([`CLI_MAIN`]). An arm re-routed to a new module holds that
+//! module too, because the arms are read ([`arms`]) — but only an edit
+//! INSIDE the arm, as rustfmt lays one out. Three main.rs shapes judge
+//! Clear here: a route to a new module outside the arm (a helper the
+//! arm calls by a name that is no module), more than three lines from
+//! any line that names a reached one; an early return added to
 //! `async fn main` ahead of the dispatch, far from every arm; and a
 //! change to a reached subcommand's FLAGS, which live in main.rs's clap
 //! definitions (the `Prove` variant, `WorkflowAction`) far from any
@@ -161,11 +203,13 @@
 //! `unattended` losing its `requires` / `conflicts_with`. Moving each
 //! covered subcommand's clap Args and dispatch into its own module (as
 //! `tenant::dispatch` is) is the structural fix, a follow-up of the
-//! re-review of 9fe4f350 (R2, R3). A module
-//! two levels down, and every crate OUTSIDE boss-cli that a covered
-//! module calls (`tenant.rs` reads boss_classes, boss_jobs,
-//! boss_policy, …; `workflow.rs` boss_jobs): a car changing those
-//! judges Clear here. A binary the script is handed under a name it
+//! re-review of 9fe4f350 (R2, R3). Every crate OUTSIDE boss-cli that a
+//! covered module calls (`tenant.rs` reads boss_classes, boss_jobs,
+//! boss_policy, …; `workflow.rs` boss_jobs) but the one in [`ALWAYS`]
+//! — the probe rules prove applies before the forge runs a probe
+//! unattended (F5): a car changing the others judges Clear here. A
+//! module named only from a hub, a comment or a test module. A binary
+//! the script is handed under a name it
 //! never ties to boss (`B=$1; "$B" tenant check`). A CLI path in the
 //! reason's MUTATING list: the closure is not traced per verb, so it
 //! names only the verb files and their scripts.
@@ -195,14 +239,35 @@ pub(crate) const CANDIDATES: [&str; 2] = ["infra/", "examples/"];
 /// never by the basename closure.
 pub(crate) const CLI_SRC: &str = "crates/orchestrators/boss-cli/src/";
 
-/// The CLI's shared plumbing, covered by no rule: nearly every module
-/// names one of them, so following them holds nearly every CLI car —
-/// 37%+ of 30 days' commits against ~19% without (b089661d).
+/// The CLI's shared plumbing, covered wholesale by no rule: nearly every
+/// module names one of them, so following them holds nearly every CLI
+/// car — 37%+ of 30 days' commits against ~19% without (b089661d). A
+/// hub file is held only by its hunks, where they name the hold's own
+/// code ([`HOLD_OWN`]). What a verb needed from `gate` — the system of
+/// record's client — moved out to `sor_client`, which the closure
+/// follows (backlog 76b846cd F3).
 pub(crate) const CLI_HUBS: [&str; 2] = ["gate", "train"];
 
-/// Covered whatever names them: the packet protocol the runner answers,
-/// which it names by kind (`ops-request`), never by file.
-pub(crate) const ALWAYS: [&str; 1] = ["infra/platform/workflows/ops-request.toml"];
+/// THE HOLD'S OWN CODE (backlog 76b846cd F6): the judge, the item-mark
+/// refusal, and the two CLI doors that hold or refuse a car on it. A car
+/// changing one could weaken the hold for every LATER car unreviewed
+/// (never its own: main's binary judges it). Each is reached whatever
+/// runs it, so the closure also holds what they call (`steps`'s hold
+/// write, `review_verdict`'s release check); and a hub file — the gate's
+/// call to the judge, the conductor's re-judge — is held when its hunks
+/// name one ([`judge`]).
+pub(crate) const HOLD_OWN: [&str; 4] = ["mutating_verb", "trust_boundary", "park", "rerail"];
+
+/// Covered whatever names them. The packet protocol the runner answers,
+/// which it names by kind (`ops-request`), never by file. And the probe
+/// rules `boss prove --unattended` applies before the forge runs a
+/// recorded probe (backlog 76b846cd F5): prove calls `boss_jobs::probe`,
+/// another crate the closure does not read, so the file is named here
+/// and a real-tree test fails if prove stops calling it.
+pub(crate) const ALWAYS: [&str; 2] = [
+    "infra/platform/workflows/ops-request.toml",
+    "crates/core/boss-jobs/src/probe.rs",
+];
 
 /// Covered whatever names them, by DIRECTORY: every file under one, on
 /// either side of the change, so a file added or deleted there holds too.
@@ -213,6 +278,133 @@ pub(crate) const ALWAYS: [&str; 1] = ["infra/platform/workflows/ops-request.toml
 /// names it by path: the launcher reads the directory. A car changing
 /// only such a file judged Clear and would have boarded on its green.
 pub(crate) const ALWAYS_DIRS: [&str; 1] = ["infra/platform/harnesses/"];
+
+/// THE HOLD'S WIRING INSIDE THE HUBS (review 754a492b N1): the names a
+/// hub's code gives the hold where it carries it — the judgement's
+/// reason and finding, the bound and the stamp in `boss gate`, the
+/// gate's `--hold` guard, the conductor's re-judge and the check that a
+/// release's review vouches for the head. A hub hunk whose CODE (three
+/// lines of context, no comment line) names one, or whose changed line
+/// sits in a function of one of these names, holds ([`wires_the_hold`]).
+/// Measured on the 686 commits of the bound's window: 115 touched a hub, 6
+/// were held by the hold's module names alone, 9 with these. `hold`
+/// alone was 29, every local a hub binds a hold to — so a hub edit to
+/// the hold that names none of these, more than three lines from one
+/// and outside these functions, judges Clear (NOT COVERED). A real-tree
+/// test fails when a hub stops spelling one.
+pub(crate) const HOLD_WIRING: [&str; 7] = [
+    "hold_reason",
+    "is_finding",
+    "hold_bound",
+    "hold_stamp",
+    "hold_guard",
+    "review_hold",
+    "vouches_with_executor",
+];
+
+/// Does `code` name one of `names` as a whole identifier?
+fn names_wiring(code: &str, names: &[&str]) -> bool {
+    names.iter().any(|n| {
+        code.match_indices(n).any(|(i, _)| {
+            !code[..i].chars().next_back().is_some_and(is_ident)
+                && !code[i + n.len()..].starts_with(is_ident)
+        })
+    })
+}
+
+/// The function a line of Rust declares, if it declares one.
+fn fn_name(line: &str) -> Option<&str> {
+    let rest = ["pub(crate) ", "pub(super) ", "pub "]
+        .iter()
+        .fold(line.trim_start(), |r, p| r.strip_prefix(p).unwrap_or(r));
+    let rest = ["const ", "async ", "unsafe "]
+        .iter()
+        .fold(rest, |r, p| r.strip_prefix(p).unwrap_or(r));
+    let name = rest.strip_prefix("fn ")?;
+    let end = name.find(|c: char| !is_ident(c)).unwrap_or(name.len());
+    (end > 0).then(|| &name[..end])
+}
+
+/// The function line `at` (1-based) of `text` sits in: the nearest line
+/// at or above it that declares one. Over-approximated where it cannot
+/// tell — a line after a function's end reads as inside it.
+fn enclosing_fn(text: &str, at: usize) -> Option<&str> {
+    text.lines().take(at).filter_map(fn_name).last()
+}
+
+/// PURE: does a hub file's diff (`hunks`, three lines of context) touch
+/// the hold's wiring ([`HOLD_WIRING`]) — a code line of a hunk naming
+/// one, or a changed line inside a function named one, read on the side
+/// the line belongs to (`old` for a removed line, `new` for an added
+/// one)?
+fn wires_the_hold(hunks: &str, old: &str, new: &str) -> bool {
+    let (mut o, mut n, mut in_hunk) = (0usize, 0usize, false);
+    for line in hunks.lines() {
+        if let Some(header) = line.strip_prefix("@@ -") {
+            let start = |s: &str| {
+                s.split(',')
+                    .next()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0)
+            };
+            let mut parts = header.split(' ');
+            o = parts.next().map(start).unwrap_or(0);
+            n = parts
+                .next()
+                .and_then(|p| p.strip_prefix('+'))
+                .map(start)
+                .unwrap_or(0);
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        let mut chars = line.chars();
+        let mark = chars.next();
+        let text = chars.as_str();
+        if !text.trim_start().starts_with("//") && names_wiring(text, &HOLD_WIRING) {
+            return true;
+        }
+        let within = match mark {
+            Some(' ') => {
+                o += 1;
+                n += 1;
+                None
+            }
+            Some('-') => {
+                o += 1;
+                enclosing_fn(old, o - 1)
+            }
+            Some('+') => {
+                n += 1;
+                enclosing_fn(new, n - 1)
+            }
+            _ => None,
+        };
+        if within.is_some_and(|f| HOLD_WIRING.contains(&f)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `boss gate`'s stamp of the hold onto its gate-run: `(reason, the
+/// metadata merge)`, or `None` when it holds nothing or the run is dry.
+/// Here, beside the judge, and not inline in the gate's hub: un-stamping
+/// it in gate.rs judged Clear (review 754a492b N1, D2), and a change here
+/// is a change to the hold's own code.
+pub(crate) fn hold_stamp(hold: Option<&str>, bound: bool, dry: bool) -> Option<(String, Value)> {
+    let reason = hold.filter(|_| !dry)?;
+    Some((
+        reason.to_string(),
+        serde_json::json!({
+            "hold": reason,
+            // Null deletes a stale mark on a reused packet.
+            boss_jobs::car::HOLD_UNBOUND: (!bound).then_some(true),
+        }),
+    ))
+}
 
 /// The item that asked for this, named in every reason the doors print.
 const ITEM: &str = "backlog fdbb447e";
@@ -289,15 +481,12 @@ fn is_script(path: &str, text: &str) -> bool {
 /// the boss CLI modules a verb or a covered script runs.
 pub(crate) fn covered(side: &Side) -> BTreeSet<String> {
     let mut covered = closure(side);
-    let mut reached = reached(side, &covered);
+    let reached = reached(side, &covered);
     let Claimed {
-        claimants,
-        renderers,
-        prose,
+        claimants, prose, ..
     } = claimed(side);
     covered.extend(claimants);
     covered.extend(prose);
-    reached.extend(renderers);
     covered.extend(
         side.keys()
             .filter(|p| module_of(p).is_some_and(|m| reached.contains(m)))
@@ -432,7 +621,7 @@ fn closure(side: &Side) -> BTreeSet<String> {
             .filter(|c| {
                 CANDIDATES.iter().any(|d| c.starts_with(d))
                     && !covered.contains(*c)
-                    && text.contains(basename(c))
+                    && names_file(text, basename(c))
             })
             .cloned()
             .collect();
@@ -444,10 +633,234 @@ fn closure(side: &Side) -> BTreeSet<String> {
     covered
 }
 
+/// A character a file name is spelled with — one that, beside a name,
+/// makes it part of a LONGER name.
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
+/// Does `text` name the file `name` as a whole name — not as the tail
+/// or head of a longer one? `cluster-deploy-lib.sh` names no `lib.sh`:
+/// the substring rule read it as naming `infra/dev/hooks/lib.sh`, whose
+/// text runs `boss dispatch` and `boss job`, and so held every car
+/// touching those two modules by a coincidence of spelling (review of
+/// 5cf58144, the over-matching third; backlog 76b846cd). A name after
+/// `/`, a quote, a space or `=` is still a name, so a script that
+/// sources `"$HERE/lib.sh"` still covers every `lib.sh` — the closure
+/// stays over-approximated where a name really is ambiguous.
+fn names_file(text: &str, name: &str) -> bool {
+    !name.is_empty()
+        && text.match_indices(name).any(|(i, _)| {
+            !text[..i].chars().next_back().is_some_and(is_name_char)
+                && !text[i + name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+}
+
 /// PURE: the CLI modules a verb's argv or a script in `closure` runs,
-/// and those they name one level down — never a hub.
+/// the renderer a claimant names, and the hold's own code
+/// ([`HOLD_OWN`]) — and every module their CODE names, followed to a
+/// fixed point, never into a hub (backlog 76b846cd F4: one level left
+/// `git_auth`, the forge token's scoping, unheld two levels below
+/// `prove --unattended`). A module named only in a comment or only by
+/// a test module is not followed ([`code_of`]): it runs nothing in the
+/// verb, and reading prose took the one-level set from 31 files to 59.
 fn reached(side: &Side, closure: &BTreeSet<String>) -> BTreeSet<String> {
     let modules = cli_modules(side);
+    let roots: Vec<String> = runs(side, closure, &modules)
+        .into_iter()
+        .chain(claimed(side).renderers)
+        .chain(HOLD_OWN.iter().map(|m| m.to_string()))
+        .collect();
+    // What each root's arms in the crate root route to is run by it too
+    // (review 754a492b B1): `--from-hook` is `dispatch_hook`.
+    let main = side.get(CLI_MAIN).map(|t| code_of(t)).unwrap_or_default();
+    let routed: Vec<String> = roots
+        .iter()
+        .flat_map(|m| {
+            named_modules(&arms(&main, m))
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut reached: BTreeSet<String> = roots
+        .into_iter()
+        .chain(routed)
+        .filter(|m| modules.contains(m.as_str()) && !CLI_HUBS.contains(&m.as_str()))
+        .collect();
+    let mut queue: Vec<String> = reached.iter().cloned().collect();
+    while let Some(m) = queue.pop() {
+        let code: String = side
+            .iter()
+            .filter(|(p, _)| module_of(p) == Some(m.as_str()))
+            .map(|(_, t)| code_of(t))
+            .collect();
+        let found: Vec<String> = named_modules(&code)
+            .into_iter()
+            .filter(|n| modules.contains(n) && !CLI_HUBS.contains(n) && !reached.contains(*n))
+            .map(str::to_string)
+            .collect();
+        for n in found {
+            reached.insert(n.clone());
+            queue.push(n);
+        }
+    }
+    reached
+}
+
+/// The code of a Rust source, as the closure reads it for module names:
+/// every line but a comment (`//`, `///`, `//!`), and no top-level
+/// `#[cfg(test)]` module — from its `mod` line to the `}` that closes it
+/// at column 0, as rustfmt writes it. Everything after that block is
+/// read again. Over-approximated where it cannot tell: a string literal
+/// is code, and a `}` at column 0 inside the test module ends the cut
+/// early, reading more, never less.
+fn code_of(text: &str) -> String {
+    let mut code = String::new();
+    let mut cfg_test = false;
+    let mut in_test = false;
+    for line in text.lines() {
+        if in_test {
+            in_test = line != "}";
+            continue;
+        }
+        let item = line
+            .trim_start_matches("pub(crate) ")
+            .trim_start_matches("pub ");
+        if cfg_test && item.starts_with("mod ") && line.ends_with('{') {
+            in_test = true;
+            cfg_test = false;
+            continue;
+        }
+        cfg_test = line == "#[cfg(test)]";
+        if !line.trim_start().starts_with("//") {
+            code.push_str(line);
+            code.push('\n');
+        }
+    }
+    code
+}
+
+/// Every module `text` names — `crate::m`, `super::m`, or a bare `m::`
+/// that no path or identifier runs into — in one pass over its `::`s.
+fn named_modules(text: &str) -> BTreeSet<&str> {
+    let mut named = BTreeSet::new();
+    for (i, _) in text.match_indices("::") {
+        let before = &text[..i];
+        let start = before
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| is_ident(*c))
+            .last()
+            .map_or(i, |(j, _)| j);
+        let ident = &text[start..i];
+        if ident.is_empty() {
+            continue;
+        }
+        if ident == "crate" || ident == "super" {
+            let after = &text[i + 2..];
+            let end = after.find(|c: char| !is_ident(c)).unwrap_or(after.len());
+            if end > 0 {
+                named.insert(&after[..end]);
+            }
+            // `use crate::{a, b as c, d::{e}}` names a, b and d (review
+            // 754a492b N2: a grouped alias hid its module from the walk).
+            if let Some(group) = after.strip_prefix('{') {
+                named.extend(grouped(group));
+            }
+        }
+        if !text[..start].ends_with(|c: char| is_ident(c) || c == ':') {
+            named.insert(ident);
+        }
+    }
+    named
+}
+
+/// The first identifier of each item of a `{…}` group — `group` is the
+/// text after its opening brace — up to the brace that closes it: the
+/// modules a grouped `use crate::{…}` imports, never the names inside a
+/// nested group or after an `as`.
+fn grouped(group: &str) -> Vec<&str> {
+    fn lead(item: &str) -> &str {
+        let item = item.trim_start();
+        let end = item.find(|c: char| !is_ident(c)).unwrap_or(item.len());
+        &item[..end]
+    }
+    let (mut items, mut depth, mut start) = (Vec::new(), 0usize, 0usize);
+    for (k, c) in group.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' if depth == 0 => {
+                items.push(lead(&group[start..k]));
+                return items.into_iter().filter(|i| !i.is_empty()).collect();
+            }
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                items.push(lead(&group[start..k]));
+                start = k + 1;
+            }
+            _ => {}
+        }
+    }
+    // Unclosed: read what is there, reading more, never less.
+    items.push(lead(&group[start..]));
+    items.into_iter().filter(|i| !i.is_empty()).collect()
+}
+
+/// PURE: the code of every arm of the crate root's dispatch that matches
+/// the subcommand of module `m` — `Commands::Dispatch` for `dispatch` —
+/// from the line that opens the arm to the next line at its indentation
+/// that is not a closing brace, as rustfmt writes a `match`. It is what
+/// the subcommand runs: `boss dispatch --from-hook` is routed by its arm
+/// to `dispatch_hook::run`, which dispatch.rs never names (review
+/// 754a492b B1).
+fn arms(main: &str, m: &str) -> String {
+    let opener = format!("Commands::{}", arm_of(m));
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let mut code = String::new();
+    let mut within: Option<usize> = None;
+    for line in main.lines() {
+        let t = line.trim_start();
+        if let Some(at) = within {
+            let continues = t.is_empty()
+                || indent(line) > at
+                || (indent(line) == at && (t.starts_with('}') || t.starts_with(')')));
+            if continues {
+                code.push_str(line);
+                code.push('\n');
+                continue;
+            }
+            within = None;
+        }
+        if t.strip_prefix(opener.as_str())
+            .is_some_and(|rest| !rest.starts_with(is_ident))
+        {
+            within = Some(indent(line));
+            code.push_str(line);
+            code.push('\n');
+        }
+    }
+    code
+}
+
+/// A module's clap arm: `car_retire` is `CarRetire`.
+fn arm_of(m: &str) -> String {
+    m.split('_')
+        .map(|w| {
+            let mut c = w.chars();
+            c.next()
+                .map(|f| f.to_ascii_uppercase().to_string() + c.as_str())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// PURE: the CLI subcommands a verb's argv or a script in `closure`
+/// runs — the roots the closure walks from.
+fn runs(side: &Side, closure: &BTreeSet<String>, modules: &BTreeSet<&str>) -> BTreeSet<String> {
     let argvs = verbs(side).into_iter().filter_map(|v| {
         v.spec
             .as_ref()
@@ -463,27 +876,9 @@ fn reached(side: &Side, closure: &BTreeSet<String>) -> BTreeSet<String> {
     let scripts = closure
         .iter()
         .filter_map(|p| side.get(p).filter(|t| is_script(p, t)).cloned());
-    let run: BTreeSet<String> = argvs
+    argvs
         .chain(scripts)
-        .flat_map(|text| subcommands(&text, &modules))
-        .collect();
-    run.iter()
-        .flat_map(|sub| {
-            let text: String = side
-                .iter()
-                .filter(|(p, _)| module_of(p) == Some(sub.as_str()))
-                .map(|(_, t)| t.as_str())
-                .collect();
-            let mut named: Vec<&str> = modules
-                .iter()
-                .copied()
-                .filter(|m| names_module(&text, m))
-                .collect();
-            named.push(sub.as_str());
-            named
-        })
-        .filter(|m| !CLI_HUBS.contains(m))
-        .map(str::to_string)
+        .flat_map(|text| subcommands(&text, modules))
         .collect()
 }
 
@@ -496,9 +891,10 @@ fn reached(side: &Side, closure: &BTreeSet<String>) -> BTreeSet<String> {
 /// a covered module file they also touched (measured 2026-09-29).
 pub(crate) const CLI_MAIN: &str = "crates/orchestrators/boss-cli/src/main.rs";
 
-/// Lines of context around each change in [`CLI_MAIN`] read by
-/// [`main_routes_to`]: a line added beside an arm (`return evil::run()`
-/// just above `prove::run_unattended`) names nothing reached itself.
+/// Lines of context around each change in a CLI file left to its hunks
+/// ([`hunk_judged`]), read by [`main_routes_to`]: a line added beside an
+/// arm (`return evil::run()` just above `prove::run_unattended`) names
+/// nothing reached itself.
 const MAIN_CONTEXT: &str = "-U3";
 
 /// PURE: do the hunks of a diff of [`CLI_MAIN`] — changed lines and
@@ -531,53 +927,77 @@ fn main_routes_to(hunks: &str, reached: &BTreeSet<String>) -> bool {
                 && !body[i + needle.len()..].starts_with(is_ident)
         })
     };
+    let named = named_modules(&body);
     reached.iter().any(|m| {
-        let arm: String = m
-            .split('_')
-            .map(|w| {
-                let mut c = w.chars();
-                c.next()
-                    .map(|f| f.to_ascii_uppercase().to_string() + c.as_str())
-                    .unwrap_or_default()
-            })
-            .collect();
-        names_module(&body, m) || whole(&format!("mod {m}")) || whole(&format!("Commands::{arm}"))
+        named.contains(m.as_str())
+            || whole(&format!("mod {m}"))
+            || whole(&format!("Commands::{}", arm_of(m)))
     })
 }
 
-/// PURE: `judged`, with [`CLI_MAIN`] added to what it touches when the
-/// car changes it and `main_hunks` route to a module a verb reaches on
-/// either side.
-fn with_main(
-    judged: Judgement,
-    changed: &[String],
-    sides: &[&Side],
-    main_hunks: &str,
-) -> Judgement {
-    if !changed.iter().any(|p| p == CLI_MAIN) {
+/// The CLI files `judged` leaves for their hunks to decide: every
+/// changed file under [`CLI_SRC`] it did not hold — the crate root, a
+/// hub file, and any module nothing reaches. An unread judgement holds
+/// already and asks for none.
+fn hunk_judged(judged: &Judgement, changed: &[String]) -> Vec<String> {
+    let held: &[String] = match judged {
+        Judgement::Touches { paths, .. } => paths,
+        Judgement::Clear => &[],
+        Judgement::Unread(_) => return Vec::new(),
+    };
+    changed
+        .iter()
+        .filter(|p| p.starts_with(CLI_SRC) && !held.contains(p))
+        .cloned()
+        .collect()
+}
+
+/// PURE: `judged`, with each file of `hunks` — `(path, its -U3 diff)`,
+/// for the files [`hunk_judged`] names — added to what it touches when
+/// its hunks name what it must not move unreviewed: for [`CLI_MAIN`], a
+/// module the closure reaches on either side (it routes to them); for
+/// any other file — a hub, an unreached module — the hold's own code
+/// ([`HOLD_OWN`]), so the gate's call to the judge and the conductor's
+/// re-judge hold without holding either hub wholesale (backlog 76b846cd
+/// F6); and for a hub, the hold's wiring there too ([`wires_the_hold`],
+/// review 754a492b N1). `sides` is `[base, tip]`, as [`judge`] reads them.
+fn with_hunks(judged: Judgement, sides: &[&Side], hunks: &[(String, String)]) -> Judgement {
+    if hunks.is_empty() {
         return judged;
     }
-    let reached: BTreeSet<String> = sides
+    let reached: BTreeSet<String> = sides.iter().flat_map(|s| reached(s, &closure(s))).collect();
+    let own: BTreeSet<String> = HOLD_OWN.iter().map(|m| m.to_string()).collect();
+    fn text<'a>(side: Option<&&'a Side>, path: &str) -> &'a str {
+        side.and_then(|s| s.get(path))
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+    let held: Vec<String> = hunks
         .iter()
-        .flat_map(|s| {
-            let mut r = reached(s, &closure(s));
-            r.extend(claimed(s).renderers);
-            r
+        .filter(|(path, diff)| {
+            if path == CLI_MAIN {
+                return main_routes_to(diff, &reached);
+            }
+            let hub = module_of(path).is_some_and(|m| CLI_HUBS.contains(&m));
+            main_routes_to(diff, &own)
+                || (hub
+                    && wires_the_hold(diff, text(sides.first(), path), text(sides.last(), path)))
         })
+        .map(|(path, _)| path.clone())
         .collect();
-    if !main_routes_to(main_hunks, &reached) {
+    if held.is_empty() {
         return judged;
     }
     match judged {
         Judgement::Clear => Judgement::Touches {
-            paths: vec![CLI_MAIN.to_string()],
+            paths: held,
             mutating: Vec::new(),
         },
         Judgement::Touches {
             mut paths,
             mutating,
         } => {
-            paths.push(CLI_MAIN.to_string());
+            paths.extend(held);
             paths.sort();
             paths.dedup();
             Judgement::Touches { paths, mutating }
@@ -657,24 +1077,6 @@ fn names_the_binary(text: &str, word: &str) -> bool {
     })
 }
 
-/// Does a module's source name module `m` — `crate::m`, `super::m`, or
-/// `m::` where no path or identifier runs into it?
-fn names_module(text: &str, m: &str) -> bool {
-    let qualified = ["crate::", "super::"].iter().any(|q| {
-        let needle = format!("{q}{m}");
-        text.match_indices(&needle)
-            .any(|(i, _)| !text[i + needle.len()..].starts_with(is_ident))
-    });
-    let bare = format!("{m}::");
-    qualified
-        || text.match_indices(&bare).any(|(i, _)| {
-            !text[..i]
-                .chars()
-                .next_back()
-                .is_some_and(|c| is_ident(c) || c == ':')
-        })
-}
-
 /// What a car's diff says about the ops verbs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Judgement {
@@ -748,9 +1150,9 @@ impl Judgement {
         match self {
             Judgement::Clear => None,
             Judgement::Touches { paths, mutating } => Some(format!(
-                "touches an ops verb, what a verb runs, the runner, a harness file, or a \
-                 file that claims a review, its renderer, or a file it prints prose from \
-                 ({}){}: waits for its \
+                "touches an ops verb, what a verb runs, the runner, a harness file, the \
+                 code of the hold itself, or a file that claims a review, its renderer, or a \
+                 file it prints prose from ({}){}: waits for its \
                  adversarial review; boss release records the RELEASE verdict ({ITEM})",
                 paths.join(", "),
                 if mutating.is_empty() {
@@ -884,23 +1286,17 @@ pub(crate) fn judge(repo: &Path, base: &str, tip: &str) -> Judgement {
         }
         let (old, new) = (side_at(repo, base)?, side_at(repo, tip)?);
         let judged = touched(&changed, &[&old, &new]);
-        let main_hunks = if changed.iter().any(|p| p == CLI_MAIN) {
-            git(
-                repo,
-                &[
-                    "diff",
-                    "--no-renames",
-                    MAIN_CONTEXT,
-                    base,
-                    tip,
-                    "--",
-                    CLI_MAIN,
-                ],
-            )?
-        } else {
-            String::new()
-        };
-        Ok(with_main(judged, &changed, &[&old, &new], &main_hunks))
+        let hunks = hunk_judged(&judged, &changed)
+            .into_iter()
+            .map(|path| {
+                let diff = git(
+                    repo,
+                    &["diff", "--no-renames", MAIN_CONTEXT, base, tip, "--", &path],
+                )?;
+                Ok((path, diff))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(with_hunks(judged, &[&old, &new], &hunks))
     };
     read().unwrap_or_else(Judgement::Unread)
 }
@@ -930,7 +1326,8 @@ pub(crate) fn gate_hold(
 /// that cannot hold the car must not make it boardable.
 pub(crate) fn car_hold_write(car: &Value, reason: &str) -> Result<Option<(String, Value)>, String> {
     let review = crate::steps::holdable(car)?;
-    if boss_jobs::stranded::hold_reason(review.get("metadata").unwrap_or(&Value::Null)).is_some() {
+    let review_md = review.get("metadata").unwrap_or(&Value::Null);
+    if boss_jobs::stranded::hold_reason(review_md).is_some() {
         return Ok(None);
     }
     let car_id = car.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -940,7 +1337,7 @@ pub(crate) fn car_hold_write(car: &Value, reason: &str) -> Result<Option<(String
     }
     Ok(Some((
         format!("/api/jobs/{car_id}/steps/{step_id}/metadata"),
-        crate::steps::hold_patch(reason),
+        crate::steps::hold_patch(review_md, reason),
     )))
 }
 
@@ -1400,6 +1797,140 @@ mod tests {
         ));
     }
 
+    // ONLY THE TWO RULES HOLD A CAR (backlog bd331d38, David 2026-10-09,
+    // option A). Measured on W40's gate-runs: 137 parked with a --hold no
+    // rule asked for and the judge cleared, 86 more whose judge would have
+    // held them alone — prose from the coordinator rules' "fresh formal
+    // verdict after GREEN". The three pins below are the decision: an
+    // unmarked car the judge clears parks unheld and boards; a marked
+    // item's car and a judged diff are held exactly as before.
+
+    const ITEM: &str = "bd331d38-1827-4baf-92d0-70eaad626334";
+
+    fn marked() -> Vec<(&'static str, String, crate::trust_boundary::Mark)> {
+        vec![(
+            "--park-backlog-item",
+            ITEM.to_string(),
+            crate::trust_boundary::Mark {
+                area: Some("policy".into()),
+                reason: Some("changes which cars wait for review".into()),
+            },
+        )]
+    }
+
+    /// An unmarked item, a diff the judge clears: the gate files it with
+    /// no hold, the dock boards it — and a --hold given anyway is refused
+    /// at the gate, naming the two rules and the review it gets instead.
+    #[test]
+    fn an_unmarked_car_the_judge_clears_parks_unheld_and_boards() {
+        let clear = Judgement::Clear;
+        assert_eq!(
+            crate::trust_boundary::gate_refusal(None, &[]),
+            None,
+            "nothing marked asks for a hold"
+        );
+        assert_eq!(
+            crate::trust_boundary::unrequired_hold_refusal(None, true, &[], &clear),
+            None,
+            "a gate with no --hold is not refused"
+        );
+        assert_eq!(gate_hold(None, true, &clear), None, "filed UNHELD");
+        assert_eq!(
+            dock(
+                &car(review("ready", json!({}))),
+                H1,
+                || Judgement::Clear,
+                unasked
+            ),
+            Dock::Board,
+            "and it boards on its green"
+        );
+
+        let why = crate::trust_boundary::unrequired_hold_refusal(
+            Some("Await distinct FORMAL review and operator release"),
+            true,
+            &[],
+            &clear,
+        )
+        .expect("a --hold no rule requires is refused");
+        for needle in ["bd331d38", "trust_boundary", "boss mark", "landed-review"] {
+            assert!(why.contains(needle), "names {needle}: {why}");
+        }
+        // An unread diff is the judge's own unbound hold, judged again once
+        // cleared; a --hold would bind it into a review hold no rule asked for.
+        let unread = crate::trust_boundary::unrequired_hold_refusal(
+            Some("x"),
+            true,
+            &[],
+            &Judgement::Unread("git diff: bad revision".into()),
+        )
+        .expect("a --hold beside an unread diff is refused");
+        // ...and the refusal says the diff was NOT READ, with git's cause,
+        // rather than claim the judge found nothing in it (backlog
+        // c851ed24, review fe7b1b1e F3).
+        assert!(
+            unread.contains("could not be read") && unread.contains("git diff: bad revision"),
+            "names the unread cause: {unread}"
+        );
+        assert!(
+            !unread.contains("is no finding"),
+            "an unread diff was never judged: {unread}"
+        );
+        assert!(
+            why.contains("is no finding"),
+            "a judged-clear diff says so: {why}"
+        );
+        // No park intent files no car, so there is no car to hold.
+        assert_eq!(
+            crate::trust_boundary::unrequired_hold_refusal(Some("x"), false, &[], &clear),
+            None
+        );
+    }
+
+    /// A trust_boundary mark on the item still holds its car: unheld it is
+    /// refused, held it passes, and the hold is the one it gave.
+    #[test]
+    fn a_marked_items_car_is_still_held() {
+        let clear = Judgement::Clear;
+        assert!(crate::trust_boundary::gate_refusal(None, &marked()).is_some());
+        let given = "trust-boundary car (area policy, item bd331d38): waits for its review";
+        assert_eq!(
+            crate::trust_boundary::unrequired_hold_refusal(Some(given), true, &marked(), &clear),
+            None,
+            "the mark requires the hold"
+        );
+        assert_eq!(
+            gate_hold(Some(given.to_string()), true, &clear).as_deref(),
+            Some(given)
+        );
+    }
+
+    /// A diff the judge holds is held with or without a --hold and with
+    /// or without a mark; a --hold beside it is allowed and keeps its words.
+    #[test]
+    fn a_judged_diff_is_still_held() {
+        let ops = touches(&["infra/forge/x.sh"], &["infra/forge/x.sh"]);
+        assert_eq!(
+            crate::trust_boundary::unrequired_hold_refusal(None, true, &[], &ops),
+            None
+        );
+        assert_eq!(
+            crate::trust_boundary::unrequired_hold_refusal(Some("x"), true, &[], &ops),
+            None,
+            "the judge requires a hold, so one given is not discretionary"
+        );
+        let filed = gate_hold(None, true, &ops).expect("filed HELD by the judge");
+        assert!(filed.contains("infra/forge/x.sh"), "{filed}");
+        let (reason, bind) = hold(dock(
+            &car(review("ready", json!({}))),
+            H1,
+            || touches(&["infra/forge/x.sh"], &[]),
+            unasked,
+        ));
+        assert!(reason.contains("infra/forge/x.sh"), "{reason}");
+        assert!(bind, "and the dock holds it for its review");
+    }
+
     /// AN UNREAD DIFF HOLDS, BUT IT IS NOT A FINDING (review F1). Its hold
     /// is written with no `hold_sha`, so a bare release sends the car back
     /// to the judge — which reads it this time and boards a docs car —
@@ -1695,10 +2226,11 @@ mod tests {
     /// `"$CLI" tenant check` inside a command substitution; the converge's
     /// cluster-deploy-lib.sh runs `"$cli" tenant check` inside another.
     /// What each reaches is covered — `src/<sub>.rs`, `src/<sub>/`, and
-    /// the in-crate modules those name one level down — and nothing past
-    /// that level, no hub, and no module nothing runs.
+    /// every in-crate module those name, to a fixed point (backlog
+    /// 76b846cd F4: `far.rs` is two levels down, as git_auth is from
+    /// prove) — and no hub, and no module nothing runs.
     #[test]
-    fn a_boss_subcommand_a_verb_or_its_script_runs_covers_its_module_one_level_down() {
+    fn a_boss_subcommand_a_verb_or_its_script_runs_covers_every_module_it_reaches() {
         let tree = side(&[
             (
                 "infra/ops/verbs/reach.json",
@@ -1776,6 +2308,7 @@ mod tests {
         assert_eq!(
             held,
             paths(&[
+                &cli("far.rs"),
                 &cli("freshness.rs"),
                 &cli("identity.rs"),
                 &cli("prove.rs"),
@@ -1785,7 +2318,8 @@ mod tests {
                 &cli("workflow.rs"),
                 &cli("workflow/lint.rs"),
             ]),
-            "far.rs is two levels down, gate and train are hubs, job and main nothing runs"
+            "far.rs is two levels down and held; gate and train are hubs, job and main \
+             nothing runs"
         );
         // Each shape alone: the one script that names the sub is what
         // reaches it, so a matcher keyed on boss or $BOSS_BIN only would
@@ -1874,6 +2408,458 @@ mod tests {
             !c.contains(&cli("gate.rs")) && !c.contains(&cli("train/mod.rs")),
             "{c:?}"
         );
+    }
+
+    /// THE CLOSURE FOLLOWS CODE, TO A FIXED POINT, AND NEVER INTO A HUB
+    /// (backlog 76b846cd F3, F4). prove reaches the system of record
+    /// through `sor_client` — one level down, held — and the forge token
+    /// scoping through freshness → git_auth, two levels down, held too.
+    /// A module named only in a comment, or only by the test module, runs
+    /// nothing in the verb and is not followed; a hub stops the walk even
+    /// when what lies behind it is named.
+    #[test]
+    fn the_closure_follows_what_the_code_calls_to_a_fixed_point_and_stops_at_a_hub() {
+        let tree = side(&[
+            (
+                "infra/ops/verbs/run-car-probe.json",
+                &verb(
+                    "runs a car's probe",
+                    &["boss", "prove", "{1}", "--unattended"],
+                ),
+            ),
+            (
+                &cli("prove.rs"),
+                "//! Shares nothing with `crate::job` but prose.\n\
+                 /// Like `queue::run`, read in a doc comment.\n\
+                 fn p() { crate::sor_client::api(); crate::freshness::f(); gate::api(); }\n\
+                 #[cfg(test)]\nmod tests {\n    fn t() { crate::census::read(); }\n}\n\
+                 fn after_the_tests() { crate::reach::run(); }\n",
+            ),
+            (
+                &cli("sor_client.rs"),
+                "fn api() { identity::header(); crate::train::send_through_a_roll(); }\n",
+            ),
+            (&cli("identity.rs"), "pub fn header() {}\n"),
+            (
+                &cli("freshness.rs"),
+                "fn f() { crate::git_auth::command(); }\n",
+            ),
+            (
+                &cli("git_auth.rs"),
+                "pub fn command() { super::far::x(); }\n",
+            ),
+            (&cli("far.rs"), "pub fn x() {}\n"),
+            (&cli("reach.rs"), "pub fn run() {}\n"),
+            (
+                &cli("gate.rs"),
+                "pub fn api() { crate::behind_gate::x(); }\n",
+            ),
+            (&cli("behind_gate.rs"), "pub fn x() {}\n"),
+            (&cli("train/mod.rs"), "pub fn send_through_a_roll() {}\n"),
+            (&cli("job.rs"), "pub fn file() {}\n"),
+            (&cli("queue.rs"), "pub fn run() {}\n"),
+            (&cli("census.rs"), "pub fn read() {}\n"),
+        ]);
+        let c = covered(&tree);
+        for held in [
+            "prove.rs",
+            "sor_client.rs",
+            "identity.rs",
+            "freshness.rs",
+            "git_auth.rs",
+            "far.rs",
+            "reach.rs",
+        ] {
+            assert!(c.contains(&cli(held)), "{held} is reached: {c:?}");
+        }
+        for clear in [
+            "gate.rs",
+            "behind_gate.rs",
+            "train/mod.rs",
+            "job.rs",
+            "queue.rs",
+            "census.rs",
+        ] {
+            assert!(!c.contains(&cli(clear)), "{clear} is not reached: {c:?}");
+        }
+    }
+
+    /// The code the closure reads: comment lines and a top-level
+    /// `#[cfg(test)]` module dropped, everything after that module kept.
+    #[test]
+    fn the_code_of_a_source_drops_comments_and_the_test_module_only() {
+        let src = "//! a::\nuse crate::b;\n    // c::d\n#[cfg(test)]\npub(crate) mod stub {\n    \
+                   fn s() { e::f(); }\n}\nfn g() { h::i(); }\n#[cfg(test)]\nfn one() { j::k(); }\n";
+        let code = code_of(src);
+        let named = named_modules(&code);
+        for want in ["b", "h", "j"] {
+            assert!(named.contains(want), "{want} in {named:?}");
+        }
+        for not in ["a", "c", "e"] {
+            assert!(!named.contains(not), "{not} in {named:?}");
+        }
+        // `crate::m`, `super::m` and a bare `m::` name m; a path's inner
+        // segment and an identifier that runs into `::` do not.
+        let named = named_modules("crate::x::y::z(); super::super::w; v::u; t_v::s;");
+        for want in ["x", "w", "v", "t_v"] {
+            assert!(named.contains(want), "{want} in {named:?}");
+        }
+        for not in ["y", "z", "u", "s"] {
+            assert!(!named.contains(not), "{not} in {named:?}");
+        }
+        assert!(named_modules("fn f() { crate::park::run() }").contains("park"));
+        assert!(!named_modules("fn f() { crate::parked::run() }").contains("park"));
+    }
+
+    /// A FILE NAME IS A WHOLE NAME (backlog 76b846cd; review of 5cf58144,
+    /// the over-matching third). `cluster-deploy-lib.sh` names no
+    /// `lib.sh`, and `watch-check-x.toml` names no `check-x.toml`; a
+    /// name after a slash, a quote, a space or `=` still names the file.
+    #[test]
+    fn a_file_is_named_only_as_a_whole_name() {
+        assert!(!names_file(". \"$HERE/cluster-deploy-lib.sh\"", "lib.sh"));
+        assert!(!names_file("# (rules/watch-check-x.toml)", "check-x.toml"));
+        assert!(!names_file("see lib.shx", "lib.sh"));
+        for (text, name) in [
+            (". \"$HERE/lib.sh\"", "lib.sh"),
+            ("source=lib.sh", "lib.sh"),
+            ("see lib.sh.", "lib.sh"),
+            ("lib.sh", "lib.sh"),
+            ("(rules/check-x.toml)", "check-x.toml"),
+        ] {
+            assert!(names_file(text, name), "{text} names {name}");
+        }
+        // And the closure reads names that way: the converge's helper
+        // sourced by its whole name holds; a hook library that only
+        // shares its tail does not.
+        let tree = side(&[
+            (
+                "infra/ops/verbs/converge.json",
+                &verb("MUTATING — converges", &["infra/forge/converge-now.sh"]),
+            ),
+            (
+                "infra/forge/converge-now.sh",
+                "#!/usr/bin/env bash\n. \"$(dirname \"$0\")/cluster-deploy-lib.sh\"\n",
+            ),
+            ("infra/forge/cluster-deploy-lib.sh", "true\n"),
+            ("infra/dev/hooks/lib.sh", "boss job file\n"),
+        ]);
+        let c = covered(&tree);
+        assert!(c.contains("infra/forge/cluster-deploy-lib.sh"), "{c:?}");
+        assert!(!c.contains("infra/dev/hooks/lib.sh"), "{c:?}");
+    }
+
+    /// THE HOLD'S OWN CODE IS HELD (backlog 76b846cd F6): a car changing
+    /// the judge, the item-mark refusal, or a CLI door that holds or
+    /// refuses a car must not weaken the hold for every later car
+    /// unreviewed. They are reached whatever runs them, and so is what
+    /// they call (a hub never).
+    #[test]
+    fn the_holds_own_modules_and_what_they_call_are_held() {
+        assert_eq!(
+            HOLD_OWN,
+            ["mutating_verb", "trust_boundary", "park", "rerail"]
+        );
+        let tree = side(&[
+            ("infra/ops/verbs/df.json", &verb("READ-ONLY", &["df"])),
+            (
+                &cli("mutating_verb.rs"),
+                "fn j() { crate::steps::hold_patch(); }\n",
+            ),
+            (&cli("trust_boundary.rs"), "fn r() {}\n"),
+            (&cli("park.rs"), "fn p() { crate::gate::api(); }\n"),
+            (&cli("rerail.rs"), "fn f() {}\n"),
+            (&cli("steps.rs"), "pub fn hold_patch() {}\n"),
+            (&cli("gate.rs"), "pub fn api() {}\n"),
+            (&cli("job.rs"), "pub fn file() {}\n"),
+        ]);
+        let c = covered(&tree);
+        for held in [
+            "mutating_verb.rs",
+            "trust_boundary.rs",
+            "park.rs",
+            "rerail.rs",
+            "steps.rs",
+        ] {
+            assert!(c.contains(&cli(held)), "{held}: {c:?}");
+        }
+        assert!(!c.contains(&cli("gate.rs")) && !c.contains(&cli("job.rs")));
+    }
+
+    /// A SUBCOMMAND IS WHAT ITS ARMS IN THE CRATE ROOT RUN (review
+    /// 754a492b B1). The dev hook runs `boss dispatch … --from-hook`, and
+    /// main.rs routes that flag to `dispatch_hook::run`, which no line of
+    /// dispatch.rs's code names — so reading only the module named by the
+    /// word left the code that rewrites every hooked Agent call unheld.
+    /// Every module an arm for the subcommand names is reached; an arm of
+    /// a subcommand nothing runs lends nothing.
+    #[test]
+    fn a_subcommand_reaches_every_module_its_arms_in_the_crate_root_route_to() {
+        let main = "mod dispatch;\nmod dispatch_hook;\nmod orient;\nfn main() {\n    \
+                    match cmd {\n        Commands::Orient { all } => orient::run(all),\n        \
+                    Commands::Dispatch {\n            from_hook: true,\n            packet,\n            \
+                    ..\n        } => dispatch_hook::run(packet),\n        \
+                    Commands::Dispatch { packet, .. } => {\n            dispatch::run(packet)\n        \
+                    }\n    }\n}\nfn after() { crate::orient::run(true) }\n";
+        let tree = side(&[
+            (
+                "infra/ops/verbs/hook.json",
+                &verb("runs the hook", &["infra/dev/hooks/agent-start.sh"]),
+            ),
+            (
+                "infra/dev/hooks/agent-start.sh",
+                "#!/usr/bin/env bash\nanswer=$(printf x | boss dispatch \"${packet:--}\" --from-hook)\n",
+            ),
+            (&cli("main.rs"), main),
+            (&cli("dispatch.rs"), "pub fn run() {}\n"),
+            (&cli("dispatch_hook.rs"), "pub fn run() {}\n"),
+            (&cli("orient.rs"), "pub fn run() {}\n"),
+        ]);
+        let c = covered(&tree);
+        for held in ["dispatch.rs", "dispatch_hook.rs"] {
+            assert!(c.contains(&cli(held)), "{held}: {c:?}");
+        }
+        for clear in ["orient.rs", "main.rs"] {
+            assert!(!c.contains(&cli(clear)), "{clear}: {c:?}");
+        }
+    }
+
+    /// A GROUPED IMPORT NAMES EVERY MODULE IN IT (review 754a492b N2):
+    /// `use crate::{zz_newmod as zn};` in a reached module reaches
+    /// zz_newmod, as the plain `use crate::zz_newmod as zn;` does.
+    #[test]
+    fn a_grouped_use_names_each_module_it_imports() {
+        let named = named_modules(
+            "use crate::{mutating_verb as mv, park, train::{a, b}};\nuse super::{ x };\n",
+        );
+        for want in ["mutating_verb", "park", "train", "x"] {
+            assert!(named.contains(want), "{want} in {named:?}");
+        }
+        for not in ["mv", "a", "b"] {
+            assert!(!named.contains(not), "{not} in {named:?}");
+        }
+        let tree = side(&[
+            (
+                "infra/ops/verbs/run-car-probe.json",
+                &verb("runs a car's probe", &["boss", "prove", "{1}"]),
+            ),
+            (
+                &cli("prove.rs"),
+                "use crate::{zz_newmod as zn};\nfn zz() { zn::run(); }\n",
+            ),
+            (&cli("zz_newmod.rs"), "pub fn run() {}\n"),
+        ]);
+        assert!(covered(&tree).contains(&cli("zz_newmod.rs")));
+    }
+
+    /// The gate's stamp of the hold onto its gate-run lives beside the
+    /// judge (review 754a492b N1): no hold or a dry run stamps nothing,
+    /// and a hold not bound to the head it judged says so.
+    #[test]
+    fn the_gate_stamps_the_hold_and_whether_it_is_bound() {
+        assert_eq!(hold_stamp(None, true, false), None);
+        assert_eq!(hold_stamp(Some("waits"), true, true), None);
+        assert_eq!(
+            hold_stamp(Some("waits"), true, false),
+            Some((
+                "waits".to_string(),
+                json!({"hold": "waits", boss_jobs::car::HOLD_UNBOUND: null})
+            ))
+        );
+        assert_eq!(
+            hold_stamp(Some("waits"), false, false),
+            Some((
+                "waits".to_string(),
+                json!({"hold": "waits", boss_jobs::car::HOLD_UNBOUND: true})
+            ))
+        );
+    }
+
+    /// THE HOLD'S WIRING INSIDE A HUB IS HELD BY ITS HUNKS (backlog
+    /// 76b846cd F6). gate.rs and the conductor are hubs, so neither is
+    /// held wholesale — but an edit within three lines of a line naming
+    /// a [`HOLD_OWN`] module (the gate's `mutating_verb::judge`, the
+    /// conductor's re-judge) holds, as main.rs's arms do; an edit far
+    /// from one stays clear.
+    #[test]
+    fn judge_holds_a_hub_edit_beside_the_holds_own_wiring() {
+        let (root, g, w) = repo("mutating-verb-judge-hub-wiring");
+        g(&["init", "-q", "-b", "main"]);
+        w(
+            "infra/ops/verbs/df.json",
+            r#"{"about":"READ-ONLY","hosts":["forge"],"argv":["df"]}"#,
+        );
+        w(&cli("mutating_verb.rs"), "pub fn judge() {}\n");
+        let gate = "pub async fn run() {\n    let judged = crate::mutating_verb::judge();\n    \
+                    // 1\n    // 2\n    // 3\n    // 4\n    // 5\n    // 6\n    let far = 1;\n}\n";
+        w(&cli("gate.rs"), gate);
+        w(
+            &cli("train/conductor.rs"),
+            "fn candidates() {\n    self.review_hold();\n}\nfn review_hold() {\n    \
+             crate::mutating_verb::dock();\n}\n",
+        );
+        g(&["add", "."]);
+        g(&["commit", "-qm", "base"]);
+        let base = g(&["rev-parse", "HEAD"]);
+        let branch = |name: &str| g(&["checkout", "-q", "-b", name, &base]);
+
+        branch("unjudged");
+        w(
+            &cli("gate.rs"),
+            &gate.replace("crate::mutating_verb::judge()", "Judgement::Clear"),
+        );
+        g(&["commit", "-qam", "unjudged"]);
+        assert_eq!(
+            judge(&root, &base, "unjudged"),
+            touches(&[&cli("gate.rs")], &[]),
+            "the removed line names the judge"
+        );
+
+        branch("rejudge");
+        w(
+            &cli("train/conductor.rs"),
+            "fn candidates() {\n    self.review_hold();\n}\nfn review_hold() {\n    \
+             return;\n    crate::mutating_verb::dock();\n}\n",
+        );
+        g(&["commit", "-qam", "rejudge"]);
+        assert_eq!(
+            judge(&root, &base, "rejudge"),
+            touches(&[&cli("train/conductor.rs")], &[]),
+            "an early return beside the conductor's re-judge"
+        );
+
+        branch("far");
+        w(
+            &cli("gate.rs"),
+            &gate.replace("let far = 1;", "let far = 2;"),
+        );
+        g(&["commit", "-qam", "far"]);
+        assert_eq!(
+            judge(&root, &base, "far"),
+            Judgement::Clear,
+            "a hub edit far from the hold's wiring"
+        );
+    }
+
+    /// THE HOLD'S WIRING IN THE REAL HUBS (review 754a492b N1). The edits
+    /// the review measured judging Clear under the module rule alone, made
+    /// to the real gate.rs and conductor.rs: un-binding the hold from the
+    /// head it judged (D1), not stamping it (D2, two ways, now through
+    /// `hold_stamp`), ignoring the conductor's re-judge (D3), and boarding
+    /// a release whose review does not vouch for the head (D4) — and the
+    /// judge call itself (C1). Each judges HELD; an edit to a sentence far
+    /// from all of them stays clear. A string no longer in the hub exactly
+    /// once fails here, rather than the dodge quietly testing nothing.
+    #[test]
+    fn on_the_real_tree_an_edit_to_the_holds_wiring_in_a_hub_is_held() {
+        let src = boss_testing::repo_root().join(CLI_SRC);
+        let read = |rel: &str| std::fs::read_to_string(src.join(rel)).expect(rel);
+        let (gate, conductor) = (read("gate.rs"), read("train/conductor.rs"));
+        let (root, g, w) = repo("mutating-verb-judge-real-hubs");
+        g(&["init", "-q", "-b", "main"]);
+        w(
+            "infra/ops/verbs/df.json",
+            r#"{"about":"READ-ONLY","hosts":["forge"],"argv":["df"]}"#,
+        );
+        w(&cli("mutating_verb.rs"), "pub fn judge() {}\n");
+        w(&cli("gate.rs"), &gate);
+        w(&cli("train/conductor.rs"), &conductor);
+        g(&["add", "."]);
+        g(&["commit", "-qm", "base"]);
+        let base = g(&["rev-parse", "HEAD"]);
+        let dodges = [
+            (
+                "c1",
+                "gate.rs",
+                "crate::mutating_verb::judge(Path::new(\".\"), &base_obs.base, &sha)",
+                "crate::mutating_verb::Judgement::Clear",
+            ),
+            (
+                "d1",
+                "gate.rs",
+                "let bound = hold.is_some() || judged.is_finding();",
+                "let bound = hold.is_some();",
+            ),
+            ("d2", "gate.rs", "Some(hold_stamp),", "None,"),
+            (
+                "d2b",
+                "gate.rs",
+                "hold_stamp(hold.as_deref(), hold_bound, dry)",
+                "hold_stamp(hold.as_deref(), hold_bound, true)",
+            ),
+            (
+                "d3",
+                "train/conductor.rs",
+                "if let Some(reason) = self.review_hold(&j, &jid, boards.as_deref()).await {",
+                "if let Some(reason) = None::<String> {",
+            ),
+            (
+                "d4",
+                "train/conductor.rs",
+                "Err(why) => (named(why), true),",
+                "Err(_) => return None,",
+            ),
+            (
+                "far",
+                "gate.rs",
+                "nothing left to decide;",
+                "nothing more to decide;",
+            ),
+        ];
+        for (name, rel, from, to) in dodges {
+            let text = if rel == "gate.rs" { &gate } else { &conductor };
+            assert_eq!(
+                text.matches(from).count(),
+                1,
+                "{name}: {from:?} is not in {rel} exactly once"
+            );
+            g(&["checkout", "-q", "-b", name, &base]);
+            w(&cli(rel), &text.replacen(from, to, 1));
+            g(&["commit", "-qam", name]);
+            let judged = judge(&root, &base, name);
+            if name == "far" {
+                assert_eq!(judged, Judgement::Clear, "{name}");
+            } else {
+                assert_eq!(judged, touches(&[&cli(rel)], &[]), "{name}");
+            }
+        }
+    }
+
+    /// Every name in [`HOLD_WIRING`] is still spelled in a hub's code on
+    /// the real tree: a rename that strands one fails here, rather than
+    /// the rule silently watching a word nothing says any more.
+    #[test]
+    fn on_the_real_tree_every_name_of_the_holds_wiring_is_in_a_hub() {
+        let tree = real_tree();
+        let hubs: String = tree
+            .iter()
+            .filter(|(p, _)| module_of(p).is_some_and(|m| CLI_HUBS.contains(&m)))
+            .map(|(_, t)| code_of(t))
+            .collect();
+        for name in HOLD_WIRING {
+            assert!(names_wiring(&hubs, &[name]), "{name} is in no hub's code");
+        }
+    }
+
+    /// THE PROBE RULES THE FORGE RUNS UNATTENDED ARE HELD (backlog
+    /// 76b846cd F5). `boss_jobs::probe` decides which recorded probes
+    /// `boss prove --unattended` runs on the forge host, and it lives in
+    /// another crate the closure does not read — so it is named in
+    /// [`ALWAYS`], and this pin fails if prove stops calling it or the
+    /// file moves, rather than the entry going stale in silence.
+    #[test]
+    fn on_the_real_tree_the_probe_rules_prove_runs_are_held() {
+        const PROBE: &str = "crates/core/boss-jobs/src/probe.rs";
+        assert!(ALWAYS.contains(&PROBE));
+        let root = boss_testing::repo_root();
+        assert!(root.join(PROBE).is_file(), "{PROBE} moved");
+        let prove = std::fs::read_to_string(root.join(CLI_SRC).join("prove.rs")).expect("prove");
+        assert!(
+            code_of(&prove).contains("boss_jobs::probe::"),
+            "prove.rs no longer calls boss_jobs::probe — drop it from ALWAYS"
+        );
+        let tree = real_tree();
+        assert_eq!(touched(&paths(&[PROBE]), &[&tree]), touches(&[PROBE], &[]));
     }
 
     /// A FILE THAT SAYS IT IS HELD IS HELD (backlog 275d75af): the
@@ -2183,21 +3169,88 @@ mod tests {
         for want in ["workflow.rs", "tenant.rs", "prove.rs", "reach.rs"] {
             assert!(c.contains(&cli(want)), "{want} is run by a verb");
         }
+        // Backlog 76b846cd: the system-of-record client prove and
+        // workflow publish reach (F3), the forge token scoping prove
+        // reaches through freshness (F4), and the hold's own code (F6).
+        // And `dispatch_hook`, which the dev hook runs through main.rs's
+        // `--from-hook` arm and which rewrites every hooked Agent call
+        // (review 754a492b B1).
+        for want in [
+            "sor_client.rs",
+            "git_auth.rs",
+            "mutating_verb.rs",
+            "trust_boundary.rs",
+            "park.rs",
+            "rerail.rs",
+            "dispatch_hook.rs",
+        ] {
+            assert!(c.contains(&cli(want)), "{want} is not held");
+        }
         for not in ["gate.rs", "train/mod.rs", "main.rs"] {
             assert!(!c.contains(&cli(not)), "{not} is not covered");
         }
-        // THE BOUND: 31 of 88 files on 2026-09-28. Reading any `$X` as
-        // the binary took it to 47 (`"$DOCKER" inspect`, `$CAR_KIND
-        // car`), and comments to 59; past half the crate, every CLI car
-        // waits, and a check that holds everything holds nothing.
-        let all: Vec<&String> = tree.keys().filter(|p| p.starts_with(CLI_SRC)).collect();
-        let held: Vec<&String> = c.iter().filter(|p| p.starts_with(CLI_SRC)).collect();
+    }
+
+    /// THE BOUND (backlog 76b846cd, decided 2026-10-09 after review
+    /// 754a492b): of the commits in the recorded 30-day [`WINDOW`], the
+    /// share whose CLI files the judge holds stays under
+    /// [`BOUND_PERCENT`]. That is the cost the bound guards — cars waiting
+    /// for a review — where a count of files was not: one file joining
+    /// the reach moved the old count past half, while the commits it
+    /// costs were a handful. And the window still means something: holding
+    /// EVERY CLI file must fail this, so the bound sits under the share of
+    /// commits that touch the CLI at all.
+    #[test]
+    fn on_the_real_tree_the_cli_commits_the_judge_holds_stay_under_the_bound() {
+        let (total, commits) = window();
         assert!(
-            held.len() * 2 < all.len(),
-            "{} of {} CLI files covered: {held:?}",
-            held.len(),
-            all.len()
+            total > 0 && !commits.is_empty(),
+            "the window holds no commits"
         );
+        let c = covered(&real_tree());
+        let held = commits
+            .iter()
+            .filter(|paths| paths.iter().any(|p| c.contains(&cli(p))))
+            .count();
+        assert!(
+            held * 100 < total * BOUND_PERCENT,
+            "{held} of {total} commits in the window touch a CLI file the judge holds — past \
+             {BOUND_PERCENT}%: every CLI car waits, and a check that holds everything holds \
+             nothing. Narrow the reach, or re-measure and re-set the bound"
+        );
+        assert!(
+            commits.len() * 100 >= total * BOUND_PERCENT,
+            "{} of {total} commits touch the CLI at all: a bound of {BOUND_PERCENT}% no longer \
+             refuses a judge that holds every CLI file",
+            commits.len()
+        );
+    }
+
+    /// The recorded 30-day window the bound is measured against — a
+    /// sample, because the gate clones 50 commits deep and a month of
+    /// main is ~690. Its header names the command that re-measures it.
+    const WINDOW: &str = include_str!("mutating_verb/window.txt");
+
+    /// THE BOUND, set from the measurement in the module doc (THE BOUND,
+    /// 2026-10-09) with headroom: 237 of 686 commits held (34.5%), so 40
+    /// leaves ~37 commits for modules that legitimately join the reach,
+    /// and sits under the 328 (47.8%) that touch the CLI at all — a judge
+    /// holding every CLI file holds 322 of the window and fails here.
+    const BOUND_PERCENT: usize = 40;
+
+    /// The window, parsed: its commit count and, for each commit that
+    /// touched the CLI, those paths relative to [`CLI_SRC`].
+    fn window() -> (usize, Vec<Vec<&'static str>>) {
+        let mut total = 0;
+        let mut commits = Vec::new();
+        for line in WINDOW.lines().filter(|l| !l.starts_with('#')) {
+            if let Some(n) = line.strip_prefix("commits ") {
+                total = n.trim().parse().expect("the window's commit count");
+            } else if !line.trim().is_empty() {
+                commits.push(line.split_whitespace().skip(1).collect());
+            }
+        }
+        (total, commits)
     }
 
     #[test]
@@ -2328,7 +3381,7 @@ mod tests {
             "pub async fn run(",
             "crate::mutating_verb::judge(Path::new(\".\"), &base_obs.base, &sha)",
             &[
-                "boss_jobs::car::HOLD_UNBOUND: (!hold_bound).then_some(true)",
+                "crate::mutating_verb::hold_stamp(hold.as_deref(), hold_bound, dry)",
                 "reqwest::Method::POST, \"/api/jobs\", Some(body)",
             ],
         );
@@ -2672,8 +3725,9 @@ mod tests {
         g(&["commit", "-qm", "rerouted"]);
         assert_eq!(
             judge(&root, &base, "rerouted"),
-            touches(&[&cli("main.rs")], &[]),
-            "the removed line names prove"
+            touches(&[&cli("evil.rs"), &cli("main.rs")], &[]),
+            "the removed line names prove; and prove's arm now routes to evil, so evil is \
+             what the verb runs (review 754a492b B1)"
         );
 
         branch("beside");

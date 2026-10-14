@@ -38,6 +38,23 @@ pub enum FirstRecordResult {
 }
 
 impl FirstRecord {
+    /// The complete immutable fact, shared by repositories and callers
+    /// choosing whether an original must ride as an attachment. Its
+    /// canonical byte array and scalar spelling are part of its encoded
+    /// size; measuring the original JSON alone misses those copies.
+    pub fn event(
+        &self,
+        step: &boss_core::job::Step,
+        stamp: &EventStamp,
+    ) -> boss_core::event::Event {
+        let mut event = stamp.event(
+            crate::events::STEP_FIRST_RECORDED,
+            serde_json::json!({"step":step,"record":self}),
+        );
+        event.id = self.event_id;
+        event
+    }
+
     pub fn new(
         job_id: JobId,
         step_id: StepId,

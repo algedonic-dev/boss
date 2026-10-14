@@ -28,6 +28,7 @@ use futures::StreamExt;
 use tracing::warn;
 
 use crate::AppState;
+use boss_core::machine_token;
 use boss_gateway::session::{self, Session, find_cookie};
 
 /// The named refusal a read-only session's write gets at the edge —
@@ -247,6 +248,15 @@ async fn forward_to_upstream(
         Some(q) => format!("{upstream}{path}?{q}"),
         None => format!("{upstream}{path}"),
     };
+    // The estate token is decided against THIS upstream, which the
+    // inbound stamp could not know (backlog 6162aff2).
+    let mut req = req;
+    crate::role_headers::restamp_for_upstream(
+        req.headers_mut(),
+        &state.machine_token,
+        &machine_token::hosts(),
+        &upstream_url,
+    );
 
     match forward(req, &upstream_url, &state.proxy_client).await {
         Ok(resp) => resp,

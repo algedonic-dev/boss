@@ -20,7 +20,7 @@
 //! image — the name the manifest runs is held equal to the name the
 //! Dockerfile copies instead.
 
-use boss_testing::{create_dir, repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{create_dir, repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
@@ -97,7 +97,7 @@ impl Recv {
     /// Run the receiver with `args`, `stdin` on its stdin.
     fn run(&self, args: &[&str], stdin: &[u8]) -> (i32, String) {
         create_dir(self.dir.parent().unwrap());
-        let mut child = Command::new("bash")
+        let mut child = without_proxy(&mut Command::new("bash"))
             .arg(repo_root().join(RECV))
             .args(args)
             .env("BOSS_RECV_TOKEN_DIR", &self.dir)
@@ -365,7 +365,7 @@ fn the_installer_grants_two_exact_purposes_and_widens_neither() {
         create_dir(&root.join(d));
     }
     write_exec(&root.join("visudo"), "#!/bin/sh\nexit 0\n");
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(repo_root().join(INSTALLER))
         .env("INSTALL_RECV_LIBEXEC", root.join("libexec"))
         .env("INSTALL_RECV_SUDOERS_DIR", root.join("sudoers"))
@@ -504,6 +504,7 @@ impl Push {
             std::env::var("PATH").unwrap_or_default()
         );
         let mut c = Command::new("bash");
+        without_proxy(&mut c);
         c.arg(repo_root().join(PUSH))
             .env("PATH", path)
             .env("TMPDIR", self.root.join("work"))
@@ -807,26 +808,36 @@ fn a_key_that_reaches_a_shell_is_named_and_handed_no_token_byte() {
     }
 }
 
-/// THE RECEIVER SPEAKS FIRST, AND AN OLDER ONE THAT DOES NOT IS `not
-/// yet`, NOT A SHELL. The sender and boss-gcp's receiver land by two
-/// different converges, so for a while the new sender may face the
-/// receiver that reads its whole stdin before it says anything. Silence
-/// is answered by closing the stream with nothing written: that
-/// receiver then refuses an empty deposit in its own words, which is
-/// proof of WHAT is behind the key, so the pass closes not-yet naming
-/// the converge that is owed — and still sends no byte.
+/// THE RECEIVER SPEAKS FIRST, AND ONE THAT DOES NOT IS A RED LINE — NOT
+/// A SHELL, AND NO LONGER `not yet`. Silence is answered by closing the
+/// stream with nothing written: a receiver from before the greeting then
+/// refuses an empty deposit in its own words, which is proof of WHAT is
+/// behind the key, so it is the push's own route and never the
+/// unconfined one — and still no byte is sent. It closed not-yet while
+/// the two halves landed apart; that window closed on 2026-10-08 at
+/// 23:30Z (two not-yet ticks, then every push greeted — the item's
+/// first_live_pushes_20261008), and a quiet answer kept after it had no
+/// bound: a receiver install that failed on boss-gcp would have read
+/// not-yet every ten minutes and filed nothing (review N2 of car
+/// c1cdb202).
 #[test]
-fn a_receiver_that_does_not_greet_yet_is_not_yet_and_is_sent_nothing() {
+fn a_receiver_that_does_not_greet_is_red_and_is_sent_nothing() {
     let p = Push::new("old-recv");
     p.key();
     p.token(&[("current", LIVE)]);
     let (rc, text) = p.run("old-recv", &[("BOSS_PUSH_GREETING_TIMEOUT_S", "1")]);
-    assert_eq!(rc, 75, "{text}");
+    assert_eq!(rc, 1, "{text}");
     assert_eq!(p.far_stdin(), Some(0), "{text}");
+    let reds: Vec<&str> = text.lines().filter(|l| l.starts_with("RED ")).collect();
+    assert_eq!(reds.len(), 1, "one RED line: {text}");
     assert!(
-        text.contains("MISSING: boss-gcp's converge") && !text.contains("RED "),
+        reds[0].starts_with("RED machine-token-push refused: ")
+            && reds[0].contains("does not speak first")
+            && reds[0].contains("converge")
+            && reds[0].contains("nothing was sent"),
         "{text}"
     );
+    assert!(!text.contains("not yet"), "never quiet: {text}");
 
     // The greeting is ONE literal in the two scripts.
     for file in [PUSH, RECV] {
@@ -848,7 +859,7 @@ fn a_receiver_that_does_not_greet_yet_is_not_yet_and_is_sent_nothing() {
     // its stdin is held open and unwritten while the line is read.
     let r = Recv::new("greets-first");
     create_dir(r.dir.parent().unwrap());
-    let mut child = Command::new("bash")
+    let mut child = without_proxy(&mut Command::new("bash"))
         .arg(repo_root().join(RECV))
         .arg("machine-token")
         .env("BOSS_RECV_TOKEN_DIR", &r.dir)
@@ -930,7 +941,7 @@ fn gate(slots: Vec<(String, String)>) -> (u16, Arc<Mutex<Vec<(String, bool)>>>) 
 fn effect(root: &Path, url: &str, extra: &[(&str, &str)]) -> (i32, String, String) {
     create_dir(&root.join("run"));
     create_dir(&root.join("tmp"));
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(repo_root().join(EFFECT))
         .env("BOSS_MACHINE_TOKEN_DIR", root.join("token"))
         .env("BOSS_JOBS_URL", url)

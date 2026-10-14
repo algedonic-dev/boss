@@ -1,7 +1,7 @@
 # cluster-node-lib.sh — the ONE reading of which cluster node a node
 # verb acts on, and whether it may (backlog f0aaa72f; design 8457c07b,
 # the w-1 second-NVMe window). Sourced by cordon-node.sh, shutdown-node.sh,
-# talos-get.sh, node-status.sh and node-converge.sh, so the verbs cannot disagree about
+# talos-get.sh, node-status.sh, node-disk-usage.sh and node-converge.sh, so the verbs cannot disagree about
 # what a worker is, which pods a drain evicts, or which budgets hold it
 # (CLAUDE.md §9a).
 #

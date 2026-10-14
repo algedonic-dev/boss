@@ -23,6 +23,7 @@ import {
   moduleForRoute,
   sectionForRoute,
   withRoster,
+  withManifest,
 } from './sections';
 import { ROUTE_CATALOG, appForSection } from './nav-catalog';
 import type { Route } from '../router';
@@ -176,6 +177,29 @@ describe('sections resolve in the nav catalog', () => {
 });
 
 describe('the module gate a route answers to', () => {
+  test('only declared module absence hides Vendors, preserving financial details', () => {
+    const off = { kind: 'ready' as const, modules: { warehouse: false }, labels: {} };
+    const on = { ...off, modules: { warehouse: true } };
+    const vendors: Route = { kind: 'vendors' };
+    expect(withManifest(vendors, '/ux/vendors', off)).toEqual({ kind: 'notFound', path: '/ux/vendors' });
+    expect(withManifest({ kind: 'vendor', vendorLookup: 'v' }, '/ux/vendors/v', off)).toEqual({ kind: 'notFound', path: '/ux/vendors/v' });
+    expect(withManifest(vendors, '/ux/vendors', on)).toEqual(vendors);
+    for (const route of [{ kind: 'po', poId: 'p' }, { kind: 'vendorInvoice', vendorInvoiceId: 'b' }] as const) {
+      expect(appForRoute(route)).toBe('finance');
+      expect(moduleForRoute(route)).toBeNull();
+      expect(withManifest(route, '/financial-detail', off)).toEqual(route);
+    }
+    expect(withManifest({ kind: 'support' }, '/ux/support', off)).toEqual({ kind: 'support' });
+  });
+
+  test('manifest loading and failure never normalize a known route to absent', () => {
+    for (const manifest of [{ kind: 'loading' }, { kind: 'error' }] as const) {
+      expect(withManifest({ kind: 'vendors' }, '/ux/vendors', manifest)).toEqual({ kind: 'vendors' });
+    }
+    const absent: Route = { kind: 'notFound', path: '/missing' };
+    expect(withManifest(absent, '/missing', { kind: 'ready', modules: {}, labels: {} })).toEqual(absent);
+  });
+
   // Backlog f9b43965: App.svelte carried a hand-written
   // `routeRequiredModule` switch beside the catalog's own `module`
   // field — one surface, two module ids. It named /ux/support's module

@@ -56,13 +56,15 @@ fn the_bundle_is_one_file_per_station() {
         [
             "design-decided",
             "design-review",
+            "landed-review",
             "loading-dock",
             "my-watchlist",
             "q.platform-admin.task",
             "repair",
         ],
         "the five platform stations the migrations seeded, plus `design-decided` \
-         (declared here only, 2026-09-24, backlog 08372fdb), and no other"
+         (declared here only, 2026-09-24, backlog 08372fdb) and `landed-review` \
+         (2026-10-09, backlog bd331d38), and no other"
     );
 }
 

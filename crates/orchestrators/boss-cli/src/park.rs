@@ -254,7 +254,7 @@ pub(crate) async fn route_linked_item(
     // and shares this write rather than copying it (CLAUDE.md §9a).
     verb: &str,
 ) {
-    let item = match crate::gate::api(
+    let item = match crate::sor_client::api(
         http,
         reqwest::Method::GET,
         &format!("/api/jobs/{item_id}"),
@@ -283,7 +283,7 @@ pub(crate) async fn route_linked_item(
     // the old read-then-PUT dropped anything written between the two
     // (backlog e39a9d2a). Merge first: the step's required-at-done fields
     // are validated on the flip.
-    let routed = match crate::gate::api(
+    let routed = match crate::sor_client::api(
         http,
         reqwest::Method::PATCH,
         &write.merge_path(item_id),
@@ -292,7 +292,7 @@ pub(crate) async fn route_linked_item(
     .await
     {
         Ok(_) => {
-            crate::gate::api(
+            crate::sor_client::api(
                 http,
                 reqwest::Method::PUT,
                 &write.status_path(item_id),
@@ -348,12 +348,12 @@ pub(crate) async fn run(
     // The operator's now, taken once at the CLI entry point.
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
 
     // The receipt first: refuse before anything is created, so a red
     // gate costs a line of output rather than a half-filled packet.
     let open = crate::train::rows(
-        crate::gate::api(
+        crate::sor_client::api(
             &http,
             reqwest::Method::GET,
             "/api/jobs?kind=gate-run&limit=100&full=true",
@@ -405,7 +405,7 @@ pub(crate) async fn run(
             let mut all = Vec::new();
             for kind in ["backlog-item", "user-feedback"] {
                 all.extend(crate::train::rows(
-                    crate::gate::api(
+                    crate::sor_client::api(
                         &http,
                         reqwest::Method::GET,
                         &format!("/api/jobs?kind={kind}&limit=200"),
@@ -450,12 +450,12 @@ pub(crate) async fn run(
     // (backlog 6790175e). The auto-park handler had the identical defect
     // and was fixed the same way (car 235157a5): page all the open cars
     // and let the shared `boss_jobs::car` predicates decide on
-    // `metadata.branch`. `gate::all_open_cars` is that read — ONE
+    // `metadata.branch`. `crate::sor_client::all_open_cars` is that read — ONE
     // definition, the one `rerail::find_car`, `boss receipt` and
     // `boss channels` already use — and it pages on `total`, so a car
     // past page one is found too (a-limit-is-not-a-filter: 832
     // ship-a-change packets exist as of 2026-09-09).
-    let parked = crate::gate::all_open_cars(&http).await?;
+    let parked = crate::sor_client::all_open_cars(&http).await?;
     if let Some(car) = parked_car_for(&parked, branch) {
         let id = car
             .get("id")
@@ -490,7 +490,7 @@ pub(crate) async fn run(
             // beside the channel for the same reason the channel is.
             m.extend(crate::channels::tier_stamps_for(branch));
         }
-        crate::gate::api(
+        crate::sor_client::api(
             &http,
             reqwest::Method::PATCH,
             &format!("/api/jobs/{id}/metadata"),
@@ -549,8 +549,9 @@ pub(crate) async fn run(
             .ok_or_else(|| anyhow::anyhow!("the building car for {branch} has no id"))?
             .to_string(),
         None => {
-            let owner = crate::owner::for_filing_at(&crate::gate::resolve_jobs_base(None)?).await;
-            let created = crate::gate::api(
+            let owner =
+                crate::owner::for_filing_at(&crate::sor_client::resolve_jobs_base(None)?).await;
+            let created = crate::sor_client::api(
                 &http,
                 reqwest::Method::POST,
                 "/api/jobs",
@@ -572,7 +573,7 @@ pub(crate) async fn run(
         }
     };
 
-    let job = crate::gate::api(
+    let job = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         &format!("/api/jobs/{car}"),
@@ -590,14 +591,14 @@ pub(crate) async fn run(
     for w in finish_writes(&job, summary, excludes, test, verified, &receipt, now)
         .map_err(anyhow::Error::msg)?
     {
-        crate::gate::api(
+        crate::sor_client::api(
             &http,
             reqwest::Method::PATCH,
             &w.merge_path(&car),
             Some(w.metadata.clone()),
         )
         .await?;
-        crate::gate::api(
+        crate::sor_client::api(
             &http,
             reqwest::Method::PUT,
             &w.status_path(&car),
@@ -999,7 +1000,7 @@ mod tests {
         );
     }
 
-    /// And the read reaches past page one: `gate::all_open_cars` pages on
+    /// And the read reaches past page one: `crate::sor_client::all_open_cars` pages on
     /// `total`, so a car opened days ago but re-gated today — sorted to
     /// the tail of `opened_on DESC` — is found rather than twinned. 832
     /// ship-a-change packets exist as of 2026-09-09, so this is not
@@ -1042,7 +1043,7 @@ mod tests {
     /// never reached the predicate. That is a property of the request,
     /// which has no return value to assert on — so it is pinned at the
     /// source: this module must gather its cars through
-    /// `gate::all_open_cars` and must never narrow a car read by
+    /// `crate::sor_client::all_open_cars` and must never narrow a car read by
     /// `subject_id`. Red on the pre-fix source, which read
     /// a car list narrowed to the subject the car was filed under.
     #[test]
@@ -1060,7 +1061,7 @@ mod tests {
         );
         assert!(
             src.contains("all_open_cars"),
-            "the open cars come from gate::all_open_cars — the one definition rerail, \
+            "the open cars come from crate::sor_client::all_open_cars — the one definition rerail, \
              receipt and channels already read, which pages on total"
         );
     }

@@ -23,6 +23,7 @@
   import type { Deck } from '../yard/world-interior';
   import { actors } from '../yard/shop-floor';
   import RuntimeRoster from './RuntimeRoster.svelte';
+  import Workstations from './Workstations.svelte';
   import {
     actorCards,
     CAR_WINDOW,
@@ -167,12 +168,21 @@
   {#if !embedded}
     <PageHeader
       eyebrow="IT · Delivery"
-      title="The Crew Board"
+      title="The Shop Floor"
       subtitle="Who is building what, right now — the interval between work waiting and work landed"
     />
   {/if}
 
+  {#if crew?.agentRuns.kind === 'ready'}
+    <Workstations runs={crew.agentRuns.data} now={loadedAt} gates={crew.gateRuns} />
+  {:else if crew?.agentRuns.kind === 'failed'}
+    <p class="crew-fail" role="alert">Workstations unavailable: {crew.agentRuns.error}. Current work unknown.</p>
+  {:else}
+    <p class="crew-quiet">Reading recorded workstations…</p>
+  {/if}
   <RuntimeRoster />
+  <details class="crew-details">
+    <summary>Pipeline, crews and historical records</summary>
 
   {#if !crew}
     <p class="crew-quiet">Reading the pipeline…</p>
@@ -574,12 +584,14 @@
       </p>
     {/if}
   {/if}
+  </details>
 </div>
 
 <style>
   .crew-root {
     padding: 0 1.25rem 3rem;
   }
+  .crew-details > summary { cursor: pointer; padding: .75rem 0; color: var(--static); }
   .crew-quiet {
     color: var(--static);
     font-size: 0.85rem;

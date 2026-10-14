@@ -77,6 +77,10 @@ const HEADER_READERS: &[(&str, &str)] = &[
         "crates/core/boss-gateway/src/proxy.rs",
         "strips the header from every public request",
     ),
+    (
+        "crates/modules/boss-people/tests/the_operator_hire_post_carries_its_identity.rs",
+        "test-only wire receiver proves the founding hire sends no simulation header (2ada0d86)",
+    ),
 ];
 
 /// Built in halves so this file's own text is not an instance.

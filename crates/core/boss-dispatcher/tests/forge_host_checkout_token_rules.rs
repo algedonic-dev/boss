@@ -30,6 +30,9 @@ use boss_testing::{dispatcher_rules_dir, repo_root};
 const ROTATE: &str = "broker-rotates-the-forge-host-checkout-token";
 const DELIVERED: &str = "broker-revokes-the-forge-host-checkout-token-on-delivery";
 const HANDLER: &str = "credential.rotate.forgejo";
+/// Every handler that mints a token of a forge user: instances of each
+/// one's credentials are in the ledger a forgejo revoke reads.
+const FORGEJO_HANDLERS: [&str; 2] = [HANDLER, "credential.rotate.forgejo-registry"];
 const CREDENTIAL: &str = "forge-host-checkout-token";
 
 fn rules() -> RawRegistry {
@@ -124,7 +127,10 @@ fn the_spared_tokens_are_every_other_declared_holder() {
         let Some(step) = r.do_steps.first() else {
             continue;
         };
-        if step.handler != HANDLER {
+        // Both forgejo kinds mint into the one ledger this rotation
+        // revokes from (backlog 683d7fe9: the registry push token is a
+        // token of the same forge user under its own handler name).
+        if !FORGEJO_HANDLERS.contains(&step.handler.as_str()) {
             continue;
         }
         let secret = literal(r, "secret_name");

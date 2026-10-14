@@ -84,8 +84,8 @@ export function employmentTone(status: EmploymentStatus | null): 'ok' | 'warn' |
 
 export type EmploymentType = 'full-time' | 'part-time' | 'contractor';
 /// Location id (FK to the Locations registry, e.g. `loc-hq`,
-/// `loc-remote-default`). Pretty-name lookup against the locations
-/// service is a follow-up; today the SPA renders the id directly.
+/// `loc-remote-default`). The roster resolves its recorded name through
+/// the locations registry; detail records retain the identity.
 export type LocationId = string;
 
 export type Certification = {

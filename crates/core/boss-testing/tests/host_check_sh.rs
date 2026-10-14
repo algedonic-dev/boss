@@ -735,6 +735,7 @@ impl Reviewer {
             "forge/credential-deposit.sh",
             "forge/machine-token-deposit.sh",
             "forge/probe-reader-deposit.sh",
+            "forge/registry-token-deposit.sh",
             "forge/root-tree.sh",
             "forge/install.sh",
             "forge/protect-main.sh",
@@ -816,6 +817,62 @@ fn the_launcher_started_in_a_fixture_on_another_machine_installs_nothing() {
         .filter(|n| n.starts_with("forge-converge."))
         .collect();
     assert!(left.is_empty(), "{left:?}");
+}
+
+/// A REFUSED CONVERGE LEAVES THE LINE THE JUDGE FILES FROM (an unfiled
+/// follow-up recorded on car ad35743a; backlog 62b09c57). A forge that no
+/// longer holds the declared address refuses every tick and fetches
+/// nothing, so the fix cannot arrive by merge: a red that stands until a
+/// person acts, which is what file-backlog-items-on-forge-converge-red
+/// files an item for — but only off a `RED <route> <kind>:` line in the
+/// run's `output`, and the refusal left none.
+#[test]
+fn a_refused_converge_leaves_a_red_line_for_the_judge() {
+    let r = Reviewer::new("red-line");
+    let summary = r.dir.join("summary.json");
+    let o = r
+        .launch()
+        .env("BOSS_RUN_SUMMARY_FILE", &summary)
+        .output()
+        .unwrap();
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(78), "{out}");
+    assert_eq!(read(&r.ran), "", "{out}");
+    let s: serde_json::Value = serde_json::from_str(&read(&summary)).expect("the summary is JSON");
+    let line = s["output"].as_str().unwrap_or("");
+    assert!(
+        line.starts_with(
+            "RED forge-converge/host-check refused: this machine is not the estate's forge"
+        ),
+        "{s}"
+    );
+    assert_eq!(line.lines().count(), 1, "{s}");
+    assert!(
+        s["host_check"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with(REFUSED_FORGE),
+        "{s}"
+    );
+
+    // The control: the same converge on the declared host leaves no
+    // host-check line.
+    let r = Reviewer::new("red-line-host");
+    let summary = r.dir.join("summary.json");
+    let own = held().first().cloned().expect("an address to declare");
+    let estate = estate_with(&r.dir, "forge", &own);
+    let o = r
+        .launch()
+        .env("BOSS_HOST_CHECK_ESTATE", &estate)
+        .env("BOSS_RUN_SUMMARY_FILE", &summary)
+        .output()
+        .unwrap();
+    let out = text(&o);
+    assert!(
+        !read(&summary).contains("forge-converge/host-check"),
+        "{out}\n{}",
+        read(&summary)
+    );
 }
 
 #[test]
@@ -1028,6 +1085,12 @@ fn the_two_deposits_refuse_the_hosts_own_destination() {
             "/etc/boss/probe-reader.credential",
             vec!["--ports", "/nonexistent/sor-ports.env"],
         ),
+        (
+            "forge/registry-token-deposit.sh",
+            "dispatcher/rules/broker-rotates-the-forge-registry-push-token.toml",
+            "/etc/boss/registry-push",
+            vec![],
+        ),
     ] {
         let (dir, _sweep) = swept("host-check-deposit");
         let kubectl = dir.join("kubectl");
@@ -1196,36 +1259,47 @@ fn boss_gcps_installers_refuse_with_one_seam_forgotten() {
         assert_eq!(o.status.code(), Some(0), "{mode}: {}", text(&o));
     }
 
-    // The credential receiver's installer.
-    for seam in ["INSTALL_RECV_SUDOERS_DIR", "INSTALL_RECV_LIBEXEC"] {
+    // The credential receivers' installers: the kubeconfig's, and the
+    // ops runner credential's (backlog 1e50e66b), which read the same
+    // seams and ask the same question.
+    for (installer, seam) in [
+        "gcp/install-ops-credential-receiver.sh",
+        "gcp/install-runner-credential-receiver.sh",
+    ]
+    .into_iter()
+    .flat_map(|i| {
+        ["INSTALL_RECV_SUDOERS_DIR", "INSTALL_RECV_LIBEXEC"]
+            .into_iter()
+            .map(move |s| (i, s))
+    }) {
         let (dir, _sweep) = swept("host-check-gcp-receiver");
         create_dir(&dir.join("sudoers.d"));
         let before = system_state();
-        let o = harmless(
-            &dir,
-            &infra().join("gcp/install-ops-credential-receiver.sh"),
-            &[],
-        )
-        .env("INSTALL_RECV_LIBEXEC", dir.join("libexec"))
-        .env("INSTALL_RECV_SUDOERS_DIR", dir.join("sudoers.d"))
-        .env("INSTALL_RECV_USER", "deposit")
-        .env("INSTALL_RECV_OWNER", "")
-        .env("INSTALL_VISUDO", "true")
-        .env_remove("BOSS_FIRST_INSTALL_AS")
-        .env_remove("BOSS_HOST_CHECK_ESTATE")
-        .env_remove(seam)
-        .output()
-        .unwrap();
+        let o = harmless(&dir, &infra().join(installer), &[])
+            .env("INSTALL_RECV_LIBEXEC", dir.join("libexec"))
+            .env("INSTALL_RECV_SUDOERS_DIR", dir.join("sudoers.d"))
+            .env("INSTALL_RECV_USER", "deposit")
+            .env("INSTALL_RECV_OWNER", "")
+            .env("INSTALL_VISUDO", "true")
+            .env_remove("BOSS_FIRST_INSTALL_AS")
+            .env_remove("BOSS_HOST_CHECK_ESTATE")
+            .env_remove(seam)
+            .output()
+            .unwrap();
         let out = text(&o);
-        assert_eq!(o.status.code(), Some(78), "{seam} forgotten: {out}");
-        assert!(out.contains(REFUSED_GCP), "{out}");
-        assert!(!dir.join("libexec").exists(), "{seam}: {out}");
+        assert_eq!(
+            o.status.code(),
+            Some(78),
+            "{installer}: {seam} forgotten: {out}"
+        );
+        assert!(out.contains(REFUSED_GCP), "{installer}: {out}");
+        assert!(!dir.join("libexec").exists(), "{installer}: {seam}: {out}");
         assert_eq!(
             std::fs::read_dir(dir.join("sudoers.d")).unwrap().count(),
             0,
-            "{out}"
+            "{installer}: {out}"
         );
-        assert_eq!(system_state(), before, "{seam}");
+        assert_eq!(system_state(), before, "{installer}: {seam}");
     }
 }
 
@@ -1303,9 +1377,11 @@ const GATED: &[(&str, &str)] = &[
     ("forge/probe-account.sh", "forge"),
     ("forge/machine-token-deposit.sh", "forge"),
     ("forge/probe-reader-deposit.sh", "forge"),
+    ("forge/registry-token-deposit.sh", "forge"),
     ("gcp/boss-gcp-converge.sh", "boss-gcp"),
     ("gcp/install-units.sh", "boss-gcp"),
     ("gcp/install-ops-credential-receiver.sh", "boss-gcp"),
+    ("gcp/install-runner-credential-receiver.sh", "boss-gcp"),
     // Shared by both hosts, and told which one: it asks about its argument.
     ("ops/install-ops-runner.sh", "\"$HOST\""),
 ];
@@ -1377,7 +1453,15 @@ fn every_install_seam_of_a_gated_installer_is_judged_or_named_a_read() {
         ),
         (
             "INSTALL_OPS_RUNNER_REPO",
-            "the checkout the runner's ExecStart names, written into INSTALL_ETC",
+            "the tree the runner's ExecStart names, written into INSTALL_ETC",
+        ),
+        (
+            "INSTALL_OPS_RUNNER_CHECKOUT",
+            "the checkout the verbs' git works on, written as a value into INSTALL_ETC",
+        ),
+        (
+            "INSTALL_OPS_RUNNER_TREE_HELPER",
+            "the executable entrypoint written into the already judged INSTALL_ETC unit; it is not a write destination",
         ),
         ("INSTALL_RECV_USER", "the account the sudoers rule names"),
         (

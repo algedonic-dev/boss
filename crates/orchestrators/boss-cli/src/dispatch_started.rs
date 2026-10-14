@@ -5,7 +5,9 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-pub(crate) const EXPECTATION_KEY: &str = "worker_start_expectation";
+/// The top board reads the same key (backlog 57326714), so it is spelled
+/// once, beside the run kind.
+pub(crate) const EXPECTATION_KEY: &str = boss_jobs::agent_budget::WORKER_START_EXPECTATION;
 pub(crate) const RECEIPT_KEY: &str = "worker_started";
 
 pub(crate) fn expectation(job: &Value) -> Option<&Value> {
@@ -78,7 +80,7 @@ pub(crate) async fn started_at(
     actor: &str,
     owned: Option<&str>,
 ) -> Result<()> {
-    let registry = crate::gate::api_at_signed(
+    let registry = crate::sor_client::api_at_signed(
         http,
         base,
         reqwest::Method::GET,
@@ -113,7 +115,7 @@ pub(crate) async fn started_at(
         } else {
             format!("/api/jobs/{run}")
         };
-        crate::gate::api_at_signed(
+        crate::sor_client::api_at_signed(
             http,
             base,
             method,
@@ -146,7 +148,7 @@ pub(crate) async fn started_at(
         if expectation(before.get("data").unwrap_or(&before)).is_none() {
             bail!("this legacy or unmarked run declares no worker receipt");
         }
-        crate::gate::api_at_signed(
+        crate::sor_client::api_at_signed(
             http,
             base,
             reqwest::Method::POST,
@@ -194,8 +196,8 @@ pub(crate) async fn started(run: String) -> Result<()> {
     let actor = crate::identity::sign(&reqwest::Method::PATCH, "/api/jobs")?;
     let owned = std::env::var("BOSS_AGENT_RUN").ok();
     started_at(
-        &crate::gate::machine_client()?,
-        &crate::gate::resolve_jobs_base(None)?,
+        &crate::sor_client::machine_client()?,
+        &crate::sor_client::resolve_jobs_base(None)?,
         &run,
         &actor,
         owned.as_deref(),
@@ -321,7 +323,7 @@ mod tests {
     #[tokio::test]
     async fn the_supported_door_merges_only_its_receipt_and_retries_without_a_second_write() {
         let (base, state) = stub(false, false).await;
-        let client = crate::gate::machine_client().unwrap();
+        let client = crate::sor_client::machine_client().unwrap();
         for _ in 0..2 {
             started_at(
                 &client,
@@ -345,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lost_receipt_or_concurrent_close_is_never_reported_as_acknowledged() {
-        let client = crate::gate::machine_client().unwrap();
+        let client = crate::sor_client::machine_client().unwrap();
         for (drop, close) in [(true, false), (false, true)] {
             let (base, state) = stub(drop, close).await;
             assert!(
@@ -389,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_ambiguous_or_unavailable_principal_never_writes_a_receipt() {
-        let client = crate::gate::machine_client().unwrap();
+        let client = crate::sor_client::machine_client().unwrap();
         for registry in [
             json!({"data":[],"total":0}),
             json!({"data":[{"aliases":["codex@algedonic.dev"]}],"total":1}),
@@ -429,7 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_registry_id_cannot_become_a_recorded_worker_actor() {
-        let client = crate::gate::machine_client().unwrap();
+        let client = crate::sor_client::machine_client().unwrap();
         for id in [json!(""), json!("   "), json!(null), json!(17)] {
             let registry = json!({"data":[{"id":id,"aliases":["codex@algedonic.dev"]}],"total":1});
             let (base, state) = stub_registry(false, false, registry).await;
@@ -535,7 +537,7 @@ mod tests {
     #[tokio::test]
     async fn started_claims_its_own_ready_nomination_before_the_receipt() {
         let (base, state) = stub_with_claim("agent-codex").await;
-        let client = crate::gate::machine_client().unwrap();
+        let client = crate::sor_client::machine_client().unwrap();
         started_at(
             &client,
             &base,
@@ -564,7 +566,7 @@ mod tests {
     async fn a_run_that_declares_no_worker_receipt_is_refused_before_any_claim() {
         let (base, state) = stub_with_claim("agent-codex").await;
         state.lock().unwrap().0["steps"][0]["metadata"] = json!({});
-        let client = crate::gate::machine_client().unwrap();
+        let client = crate::sor_client::machine_client().unwrap();
         let refused = started_at(
             &client,
             &base,
@@ -588,7 +590,7 @@ mod tests {
     /// run is the identity slip this verb exists to refuse.
     #[tokio::test]
     async fn started_never_claims_a_building_step_nominated_to_someone_else_or_to_nobody() {
-        let client = crate::gate::machine_client().unwrap();
+        let client = crate::sor_client::machine_client().unwrap();
         for holder in [json!("agent-claude"), Value::Null] {
             let (base, state) = stub_with_claim("agent-claude").await;
             state.lock().unwrap().0["steps"][0]["assignee_id"] = holder;

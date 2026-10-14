@@ -427,6 +427,61 @@ pub(crate) fn gate_refusal(hold: Option<&str>, marked: &[(&str, String, Mark)]) 
     ))
 }
 
+/// `boss gate`'s OTHER refusal: a `--hold` that neither rule requires —
+/// option A (backlog bd331d38; David, 2026-10-09: "Go with option A for
+/// the review hold").
+///
+/// A parked car waits for an independent review before it boards ONLY
+/// when its item carries a mark (this module) or its diff is a finding
+/// of `mutating_verb::judge`. Every other car boards on its green and
+/// owes its review AFTER it lands, on ship-a-change's `landed-review`
+/// step. The gate binds every `--hold` it is given as a review hold
+/// (`hold_sha`, which only `boss release --review` clears), and nothing
+/// asked whether a rule wanted it: on W40's gate-runs 137 carried a
+/// `--hold` the judge cleared on an item with no mark, and 86 more a
+/// `--hold` beside a judge that would have held the car alone — prose
+/// from the coordinator rules' "fresh formal verdict after GREEN" — and
+/// review holds came to cover 85% of the week's dock-minutes while 200
+/// of 200 releases read release.
+///
+/// So with park intent, no mark on any item the gate read, and a diff
+/// that is not a finding, a `--hold` is refused. An UNREAD diff is no
+/// finding: the judge already holds it unbound and judges it again once
+/// cleared, and a `--hold` would bind that blip into a review hold. With
+/// no park intent no car is filed, so there is no car to hold.
+pub(crate) fn unrequired_hold_refusal(
+    hold: Option<&str>,
+    park_intent: bool,
+    marked: &[(&str, String, Mark)],
+    judged: &crate::mutating_verb::Judgement,
+) -> Option<String> {
+    let given = hold?;
+    if !park_intent || !marked.is_empty() || judged.is_finding() {
+        return None;
+    }
+    // WHAT THE JUDGE SAID, in its own terms (backlog c851ed24, review
+    // fe7b1b1e F3): an UNREAD diff was never judged, and saying "no
+    // finding" of it claims a judgement git could not make.
+    let diff = match judged {
+        crate::mutating_verb::Judgement::Unread(why) => format!(
+            "the diff could not be read ({why}) — without --hold the car is filed under the \
+             judge's own unbound hold for that, and the dock judges it again — so"
+        ),
+        _ => "the diff is no finding of mutating_verb::judge, so".to_string(),
+    };
+    Some(format!(
+        "boss gate: REFUSED — --hold ({given}) on a car no rule holds (backlog bd331d38, \
+         option A, David 2026-10-09). No item this gate names carries metadata.{KEY}, and \
+         {diff} the car boards on its green and \
+         is reviewed AFTER it lands, on ship-a-change's landed-review step. Drop --hold. If \
+         the change does cross a trust boundary, mark its item first — `boss mark <item> \
+         --trust-boundary <area> --trust-reason '<why>'`, an area {REGISTRY} lists — and gate \
+         again; the brief and this gate then hold the car. A hold that is not a review (a \
+         rollout, a dependency) is `--park-after <car>`, or `boss hold` on the parked car, \
+         which a plain `boss release` lifts."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -51,7 +51,6 @@ boss-ports = { path = "../../core/boss-ports" }
 boss-core = { path = "../../core/boss-core", features = ["blocking"] }
 boss-classes-client = { path = "../../core/boss-classes-client" }
 boss-locations-client = { path = "../../core/boss-locations-client" }
-boss-subject-kinds-client = { path = "../../core/boss-subject-kinds-client" }
 boss-calendar-client = { path = "../../core/boss-calendar-client" }
 boss-events = { path = "../../core/boss-events" }
 boss-assets-client = { path = "../boss-assets-client" }

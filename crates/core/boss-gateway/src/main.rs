@@ -148,9 +148,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    let proxy_client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
+    // Every forwarded request carries the estate token (role_headers.rs),
+    // so this client is finished the machine clients' way: no redirect,
+    // no proxy (backlog 1ff6cabe).
+    let proxy_client = boss_gateway::machine_client::finish(reqwest::Client::builder())
         .context("building reverse-proxy http client")?;
 
     // Auth provider — local-auth (file-backed credentials)

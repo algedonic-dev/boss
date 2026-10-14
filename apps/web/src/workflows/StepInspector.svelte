@@ -309,10 +309,6 @@
   .jk-field input,
   .jk-field select,
   .jk-field textarea {
-    padding: 5px 7px;
-    font-size: 13px;
-    border: 1px solid var(--hairline);
-    border-radius: 5px;
     width: 100%;
     box-sizing: border-box;
   }

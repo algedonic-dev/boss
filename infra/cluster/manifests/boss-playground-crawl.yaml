@@ -74,6 +74,8 @@
 # then bounds again, as it bounds every check's output, and hands to jq
 # as one argument. `result` is mounted read-only here and `go` read-only
 # there, so each container can write exactly one thing the other reads.
+# And the two share nothing else: no process namespace, no host PID
+# space, no envFrom, and not a uid (`record` runs as 1500, see there).
 # Held by every_in_cluster_sender_holds_the_machine_token_or_is_named.rs
 # (the pod's shape, parsed) and
 # the_playground_crawl_record_takes_its_result_as_data.rs (the script
@@ -211,6 +213,19 @@ spec:
               securityContext:
                 allowPrivilegeEscalation: false
                 capabilities: {drop: ["ALL"]}
+                # NOT the crawl's uid (review fb78c7b0 of car 099f8a9f,
+                # F1; backlog ffd309c1). Under one uid the only thing
+                # between the browser and this container's token mount
+                # is that the pod shares no process namespace — one
+                # line, `shareProcessNamespace: true`, and the crawl
+                # reads it through /proc/<this pid>/root. Across two
+                # uids the kernel's ptrace check refuses that path, and
+                # the crawl holds no capability that crosses it. 1500 is
+                # the boss image's own `USER boss`. Every volume it
+                # reads or writes is the pod's fsGroup 1500's, which
+                # both containers keep: the token 0440, and `result`,
+                # `go` and the header directory group-owned emptyDirs.
+                runAsUser: 1500
               command: ["/bin/bash", "-c"]
               args:
                 - |

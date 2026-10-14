@@ -96,6 +96,9 @@ async fn begin(router: &Router, body: Value) -> (StatusCode, String) {
     let mut sess = Session::new("presence-read", 600);
     sess.employee_id = Some(EMPLOYEE.to_string());
     sess.role = Some("brewmaster".to_string());
+    sess.department = Some("production".to_string());
+    sess.territory_account_ids = vec!["account-fixture".to_string()];
+    sess.direct_report_ids = vec!["employee-fixture".to_string()];
     let req = Request::post("/api/auth/passkey/assert/begin")
         .header("content-type", "application/json")
         .header("cookie", format!("{COOKIE_NAME}={}", sess.encode(KEY)))
@@ -165,4 +168,16 @@ async fn the_step_read_carries_exactly_one_identity_and_it_is_the_sessions() {
     let user: Value = serde_json::from_str(&identities[0]).unwrap();
     assert_eq!(user["id"], EMPLOYEE, "the session's identity: {user}");
     assert_eq!(user["role"], "brewmaster", "the session's role: {user}");
+    assert_eq!(
+        user,
+        json!({
+            "id": EMPLOYEE,
+            "role": "brewmaster",
+            "access_tier": "user",
+            "department": "production",
+            "territory_account_ids": ["account-fixture"],
+            "direct_report_ids": ["employee-fixture"],
+        }),
+        "the existing downstream identity preserves every scope field"
+    );
 }

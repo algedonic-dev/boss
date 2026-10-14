@@ -13,7 +13,7 @@ use crate::types::{
 };
 
 pub struct PgContent {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
     audience_observer: Option<std::sync::Arc<dyn crate::port::AudienceObserver>>,
 }
 

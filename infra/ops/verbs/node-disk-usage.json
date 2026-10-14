@@ -1,0 +1,17 @@
+{
+  "about": "READ-ONLY: what occupies one cluster node's disk, named (infra/forge/node-disk-usage.sh <node>; backlog ebcddea5 — two disk_tight:w-2 alarms answered by moving a replica without knowing the grower, because no door named what fills a node's disk). Through the forge's ops_kubectl door, kubectl get only: the kubelet's own /stats/summary for the node (get --raw of its proxy path, a GET with the admin kubeconfig the forge already holds — no grant to any in-cluster token): nodefs, imagefs and containerfs capacity, used and available; every pod on the node by ephemeral storage, largest first, split into container writable layers, logs and local volumes (a claim is not counted); the ten largest images the Node lists; every Longhorn replica whose spec.nodeID is the node, largest actual first, with its volume, claim, the volume's size and actualSize, disk and health; and the node's Longhorn disks with maximum, reserved, scheduled and available. The node must be one the estate registry declares, not retired, with a talos-* role (a control plane may be read). Nothing is written. A section that could not be read prints CANNOT ANSWER and the run exits 1: no evidence is not a pass. Timeout 300: the registry read (15 s), five kubectl reads bounded at 20-30 s each (130 s together at worst) and, the first time, the door image's pull bounded at 120 s.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/node-disk-usage.sh",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    }
+  ],
+  "timeout": 300
+}

@@ -5,7 +5,8 @@
 # recorded a `proof_probe` at park time (host=forge, verb=run-car-probe,
 # args=[car]); the root ops-runner runs the tree's own CLI, `boss prove
 # <car> --from-car --unattended` (backlog 9f00a805 retired the shell twin),
-# which runs the probe as david and completes `proven` with `boss
+# which runs the probe as boss-probe (infra/forge/probe-account.sh;
+# never root, never david) and completes `proven` with `boss
 # prove`'s proof record, or stamps `proof_attempt` and leaves `proven`
 # ready. Routed on the closed marker's always-present `kind`/`outcome`
 # (outcome null on a catch-all close reads false, never PredicateFailed).

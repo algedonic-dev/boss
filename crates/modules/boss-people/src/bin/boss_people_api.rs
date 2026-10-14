@@ -247,23 +247,10 @@ async fn main() -> Result<()> {
         },
     ));
 
-    // Optional SubjectKind registry — opt-in validator for
-    // tenant-extensible Subject discriminators (see
-    // http.rs::check_custom_subject). Wires off the same
-    // subject_kinds_api_url already used by boss-jobs.
-    let subject_kinds: Option<Arc<dyn boss_subject_kinds_client::SubjectKindsClient>> =
-        cfg.subject_kinds_api_url.as_deref().map(|url| {
-            info!(subject_kinds_api_url = %url, "SubjectKind registry validation enabled");
-            Arc::new(boss_subject_kinds_client::ReqwestSubjectKindsClient::new(
-                url,
-            )) as Arc<dyn boss_subject_kinds_client::SubjectKindsClient>
-        });
-
     let state = PeopleApiState {
         people,
         publisher,
         policy: Some(policy),
-        subject_kinds,
         clock,
     };
     app = app.merge(router(state));

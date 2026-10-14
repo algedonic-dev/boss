@@ -166,6 +166,57 @@ impl InMemoryAgents {
 
 #[async_trait]
 impl AgentsRegistry for InMemoryAgents {
+    fn try_lock_selection_rows(
+        &self,
+    ) -> Result<Option<Box<dyn super::port::AgentSelectionRows + '_>>, AgentsError> {
+        let rows = match self.rows.try_lock() {
+            Ok(rows) => rows,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(AgentsError::Storage(
+                    "agent selection owner unavailable".into(),
+                ));
+            }
+        };
+        let automations = match self.automations.try_lock() {
+            Ok(rows) => rows,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(AgentsError::Storage(
+                    "automation selection owner unavailable".into(),
+                ));
+            }
+        };
+        let observed_automations = automations.values().cloned().collect();
+        let observed = rows.agents.values().map(|agent| rows.row(agent)).collect();
+        Ok(Some(Box::new(LockedSelectionRows {
+            _guard: rows,
+            observed,
+            _automations: automations,
+            observed_automations,
+        })))
+    }
+    fn lock_selection_rows(
+        &self,
+    ) -> Result<Box<dyn super::port::AgentSelectionRows + '_>, AgentsError> {
+        let rows = self
+            .rows
+            .lock()
+            .map_err(|_| AgentsError::Storage("agent selection owner unavailable".into()))?;
+        let observed: Vec<_> = rows.agents.values().map(|agent| rows.row(agent)).collect();
+        let automations = self
+            .automations
+            .lock()
+            .map_err(|_| AgentsError::Storage("automation selection owner unavailable".into()))?;
+        let observed_automations = automations.values().cloned().collect();
+        Ok(Box::new(LockedSelectionRows {
+            _guard: rows,
+            observed,
+            _automations: automations,
+            observed_automations,
+        }))
+    }
+
     async fn resolve_login(&self, login: &str) -> Result<Option<String>, AgentsError> {
         Ok(self
             .rows
@@ -286,5 +337,21 @@ impl AgentsRegistry for InMemoryAgents {
             events.push(automation_declared_event(stamp, d)?);
         }
         Ok(outcome)
+    }
+}
+
+struct LockedSelectionRows<'a> {
+    _guard: std::sync::MutexGuard<'a, Rows>,
+    observed: Vec<AgentRow>,
+    _automations: std::sync::MutexGuard<'a, BTreeMap<String, AutomationActor>>,
+    observed_automations: Vec<AutomationActor>,
+}
+
+impl super::port::AgentSelectionRows for LockedSelectionRows<'_> {
+    fn rows(&self) -> &[AgentRow] {
+        &self.observed
+    }
+    fn automations(&self) -> &[AutomationActor] {
+        &self.observed_automations
     }
 }

@@ -1,0 +1,37 @@
+# w-2 (utility worker, boss.dev/purpose=utility; 110 GB, the smallest
+# Talos disk in the estate) — the non-secret Talos machine-config
+# entries the pipeline depends on (README.md beside this file says how
+# they are applied: the forge's plan-a-node-converge / node-converge).
+#
+# WHY IT EXISTS (backlog 666e0570). Read 2026-10-09 by node-disk-usage
+# (ops-request 33c7653e), the remedy step of estate alarm ebcddea5
+# (disk_tight:w-2, its second occurrence): imagefs used 73.0 of 81.7 GiB
+# used on a 109.6 GiB disk, 27.9 GiB available. The ten largest of the
+# node's 50 images were old boss-ci builds by digest, ~0.9 GiB each; no
+# pod running on w-2 used one (the read listed 15 pods, all longhorn,
+# cilium, coredns and enroll), and Longhorn replicas held 6.1 GiB. 27.9
+# GiB available is Longhorn's 25% minimum, so Longhorn stops scheduling
+# replicas to w-2 — while the kubelet's default image-GC line, 85% used,
+# lies past that floor, so the kubelet had never collected.
+#
+# THE PAIR is cp-1 and cp-3's (50/40; cp-2 runs 40/30, and which pair is
+# intended estate-wide is still the open question on 08430090). At 50%
+# used — ~55 GiB still available, twice Longhorn's ~27 GiB floor — the
+# kubelet removes images no container uses, least recently used first,
+# down to 40%. It never removes an image a running container uses, so a
+# pod's image is kept by construction; the cost is a re-pull from the
+# forge on the LAN.
+#
+# NOT DECLARED HERE: the forge registry mirror the other four
+# declarations carry, which is live on w-2 — every boss-ci image on it
+# came through that mirror.
+# node-converge refuses a non-idempotent patch when any entry it
+# declares is already live, and whether Talos's merge appends mirror
+# endpoints has not been measured; two scalars under extraConfig are
+# idempotent by construction. The live mirror therefore reads
+# UNDECLARED, which check-declared.sh reports and does not fail.
+machine:
+  kubelet:
+    extraConfig:
+      imageGCHighThresholdPercent: 50
+      imageGCLowThresholdPercent: 40

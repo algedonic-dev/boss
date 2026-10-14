@@ -1,0 +1,68 @@
+# ---------------------------------------------------------------------
+# The credential broker mints and rotates the READ-ONLY forge token root
+# on boss-gcp fetches its own tree with (design-doc db018094, question
+# q1, David 2026-10-10T03:23Z: option (i); backlog ca356c79). THIS RULE
+# IS THE CREDENTIAL'S DECLARATION, the convention of
+# `broker-rotates-the-forge-host-checkout-token`: Subject id
+# `boss-gcp-root-tree-token`, Secret boss/boss-gcp-root-tree-token key
+# `token`, issuer user david, scope read:repository and nothing wider,
+# proven by reading david/boss — the one thing it exists to do.
+#
+# WHY IT EXISTS. Decision (a) on design fe6d1124 moves boss-gcp's four
+# tokenless senders (codebase-metrics, protocol-drift, surface-usage, the
+# ML inference batch) to User=root on a ROOT-OWNED tree, and design
+# c98c79aa says root there executes only from such a tree. The forge's
+# root tree (infra/forge/root-tree.sh) needs no credential: it fetches
+# Forgejo's repository from its own disk. boss-gcp has no such
+# repository, and /opt/boss fetches as david through david's helper, so
+# root had nothing of its own to fetch with. Option (ii), fetching from
+# /opt/boss, was declined: root would parse objects a non-root account
+# wrote.
+#
+# OFF-HOST DELIVERY. boss-gcp reads no Secret, so `delivery = "off-host"`
+# stops THIS firing after verify, and the revoke runs on the second rule,
+# `broker-revokes-the-boss-gcp-root-tree-token-on-delivery`, once the
+# host has recorded delivery of the new value — the same declaration,
+# pinned equal by crates/core/boss-dispatcher/tests/
+# boss_gcp_root_tree_token_rules.rs. WHERE ROOT READS IT is the
+# registry row the tree carries for the operator to publish,
+# infra/gcp/root-tree-token-declaration.toml: /etc/boss/root-tree/
+# forge.token on boss-gcp, root:root 0600 in a 0700 directory.
+#
+# THE TRANSPORT IS NOT THIS CAR. Nothing yet carries the value to
+# boss-gcp (its credentials arrive by push over a forced-command deposit
+# key, one key per purpose — the machine token's and the ops runner's
+# each refuse any other name), and nothing on boss-gcp reads the file.
+# Until a delivery exists, a scoped rotation mints, installs and proves
+# the token, then waits at `delivered`; it revokes nothing.
+#
+# THE OLD TOKEN. The first rotation names none: the credential is new.
+# Later rotations name this credential's previous instance by its last
+# eight. `spare` is every token another consumer is DECLARED to hold —
+# the inventory's attributed rows and every other forgejo broker
+# credential's instances — pinned by the same test, which also holds
+# every other off-host forgejo rotation to sparing this one's.
+#
+# The Secret is created EMPTY by the cluster converge from this file's
+# secret_namespace/secret_name (cluster-deploy-lib.sh
+# ensure_declared_secrets); the broker's name-scoped grant on it is
+# `credential-broker-boss-gcp-root-tree-token` in
+# infra/cluster/manifests/boss-credential-broker.yaml.
+[[rule]]
+name = "broker-rotates-the-boss-gcp-root-tree-token"
+why = """
+EXTERNAL GLUE, the census class for reactions whose effect lives
+outside the system: the broker speaks to the FORGE's admin API and the
+k8s Secret store, neither of which a Workflow definition can address.
+The rotate-a-credential protocol row declares the ORDER (issue ->
+install -> verify -> delivered -> revoke); this rule is the machine
+executor for ONE credential, root's tree token on boss-gcp, and its args
+are that credential's declaration. It adds no routing: it advances the
+very packet that fired it and spawns nothing. Design db018094
+(2026-10-10).
+"""
+on_event = "step.done.credential-rotation"
+when = 'subject_id = "boss-gcp-root-tree-token"'
+[[rule.do]]
+handler = "credential.rotate.forgejo"
+args = { forge_user = "\"david\"", secret_namespace = "\"boss\"", secret_name = "\"boss-gcp-root-tree-token\"", secret_key = "\"token\"", scopes = "\"read:repository\"", verify_repo = "\"david/boss\"", delivery = "\"off-host\"", spare = "\"boss-gcp,boss-dev-forge-token-*,forge-host-checkout-token-*,forge-registry-push-token-*\"" }

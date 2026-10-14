@@ -120,7 +120,12 @@
 
   /** The served routes, laid out — and any this layout has no station
    *  for, said at the foot rather than dropped. */
-  const laid = $derived(routes === null ? { sections: [], unplaced: [], band: null } : sectionsOf(routes));
+  // Exit terminals remain in the record and station ledger; the map
+  // draws connections and entries, without an exit-ramp band (c2efc19b).
+  const laid = $derived(routes === null ? { sections: [], unplaced: [], band: null } : sectionsOf({
+    ...routes,
+    routes: routes.routes.filter((route) => route.to !== null),
+  }));
   /** The drawing's size: the stations, and the exits band under them
    *  when any exit is served (design f0313eda E2). */
   const view = $derived(mapView(laid.sections.flatMap((s) => (s.fan === null ? [] : [s.fan])), laid.band));
@@ -132,7 +137,6 @@
     return l === null ? null : `in ${l.in} · on ${l.on} · off ${l.off}`;
   };
   const lines = $derived(linesOf(laid.sections));
-  const anyExit = $derived(laid.sections.some((s) => s.kind === 'exit'));
   const anyUndeclared = $derived(laid.sections.some((s) => !s.declared));
 
   /** A station's name, its one number and its state — what the map
@@ -249,11 +253,7 @@
     {/each}
     <span class="key-item"><svg class="swatch" viewBox="0 0 20 4" aria-hidden="true"><line x1="0" y1="2" x2="20" y2="2" class="held" /></svg>a held section: the server judges nothing is crossing</span>
     <span class="key-item" data-key-unconfirmed><svg class="swatch tube" viewBox="0 0 20 6" aria-hidden="true"><line x1="0" y1="3" x2="20" y2="3" class="line-siding" /><line x1="0" y1="3" x2="20" y2="3" class="tube-core" /></svg>hollow: no reading yet, so the server cannot say whether it flows</span>
-    {#if anyExit}
-      <span class="key-item" data-key-exit><svg class="swatch tall" viewBox="0 0 20 12" aria-hidden="true"><path d="M10 0 V4 L4 10 M10 4 V10 M10 4 L16 10" class="line-delivery" /><line x1="1" y1="11" x2="19" y2="11" class="line-delivery" /></svg>an exit: one stub, a branch per terminal, a buffer stop and its count</span>
-      <span class="key-item"><svg class="swatch" viewBox="0 0 20 4" aria-hidden="true"><line x1="0" y1="2" x2="20" y2="2" class="line-delivery idle" /></svg>faded: a declared terminal nothing left by in the window</span>
-      <span class="key-item" data-key-ledger>in · on · off: moves into a station, on to another, off the map</span>
-    {/if}
+    <span class="key-item" data-key-ledger>in · on · off: moves into a station, on to another, off the map</span>
     {#if routes?.observed_withheld}
       <!-- The moves counts withheld from this caller (bd506215): said in
            the key, neutral, so a map with no counts never reads as a
@@ -367,8 +367,6 @@
   .key-item { display: inline-flex; align-items: center; gap: 6px; }
   .swatch { width: 20px; height: 4px; }
   .swatch line { stroke-width: 4; }
-  .swatch.tall { height: 12px; }
-  .swatch.tall path, .swatch.tall line { fill: none; stroke-width: 2; }
   .swatch line.idle { stroke-width: 1.5; opacity: 0.45; }
   /* The key's swatch for a section with no reading — drawn as RouteLayer
      draws the section itself: a casing with a pale core (b9c88c61). */

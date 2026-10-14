@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::gate::api;
+use crate::sor_client::api;
 
 /// One open question, in the shape the tracker reads.
 fn question(anchor: &str, title: &str, proposal: &str) -> Value {
@@ -714,7 +714,7 @@ pub async fn run(
     {
         bail!("{msg}");
     }
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
 
     // `--answers`: the feedback (or backlog item) this design decides.
     // Read BEFORE filing — the edge needs the full id, and the packet
@@ -739,7 +739,7 @@ pub async fn run(
         None => None,
     };
 
-    let owner = crate::owner::for_filing_at(&crate::gate::resolve_jobs_base(None)?).await;
+    let owner = crate::owner::for_filing_at(&crate::sor_client::resolve_jobs_base(None)?).await;
     let body = design_job_body(
         &title,
         &markdown,
@@ -853,7 +853,7 @@ pub async fn run(
     // land in one write the merge door judges together.
     let exhibits = if exhibits.iter().any(|e| matches!(e, Exhibit::Attach { .. })) {
         let content = crate::tenant_publish::service_on_door(
-            &crate::gate::resolve_jobs_base(None)?,
+            &crate::sor_client::resolve_jobs_base(None)?,
             "content",
         )?;
         let target = crate::attach::Target {
@@ -1465,7 +1465,7 @@ mod tests {
             label: "the review step".into(),
         };
         let carried = carry_exhibits(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &target,
             &[small.clone(), big_exhibit],
@@ -1488,7 +1488,7 @@ mod tests {
         assert_eq!(e2["size_bytes"], json!(big.len()));
         let file = e2["file_ref"].as_str().expect("a file id");
 
-        let listed: Value = crate::gate::machine_client()
+        let listed: Value = crate::sor_client::machine_client()
             .unwrap()
             .get(format!(
                 "{base}/api/files?target_kind=step&target_id={}",
@@ -1504,7 +1504,7 @@ mod tests {
 
         // An unnamed attach is refused before the socket, naming why.
         let err = carry_exhibits(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &target,
             &[Exhibit::Attach {

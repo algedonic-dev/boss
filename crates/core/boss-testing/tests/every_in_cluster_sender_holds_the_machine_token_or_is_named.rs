@@ -43,7 +43,10 @@
 //!   * the playground crawl: the container that runs bun and Playwright
 //!     has no token, no reader, no helper and no address of a gated
 //!     port; it shares two directories with the `record` container and
-//!     can write only one of them.
+//!     can write only one of them — and nothing else: no process
+//!     namespace, no host PID space, no `envFrom`, and not a uid, with
+//!     no capability to cross the difference (review fb78c7b0 F1,
+//!     backlog ffd309c1).
 //!
 //! tree-wide pin — it reads every manifest under infra/cluster/manifests,
 //! which no changed-file map attributes to this crate, so every scoped
@@ -813,6 +816,86 @@ fn crawl_findings(crawl_yaml: &str) -> Vec<String> {
             ));
         }
     }
+    out.extend(crawl_process_findings(crawl, record));
+    out
+}
+
+/// THE TWO CONTAINERS DO NOT SEE EACH OTHER'S PROCESSES, AND RUN AS TWO
+/// USERS (review fb78c7b0 of car 099f8a9f, finding F1; backlog ffd309c1,
+/// 2026-10-08). Every check above reads volumes, and a volume is not the
+/// only way into a container: with `shareProcessNamespace: true` on this
+/// pod — which left all four of that car's pins green, run by the
+/// reviewer — the crawl could open /proc/<record's pid>/root and read
+/// the token through the record container's own mount, the mechanism the
+/// dev pod's sidecar shows today. `hostPID` is the same door to every
+/// process on the node, and `envFrom` hands a container a whole
+/// ConfigMap or Secret whose keys no pin here reads (the conductor takes
+/// its address exactly that way). So all three are refused on this pod,
+/// and the record container runs as a uid the crawl's is not: across
+/// two uids the kernel's ptrace check refuses /proc/<pid>/root and
+/// environ, so a namespace shared by a later edit is still not a path —
+/// unless the crawl holds CAP_SYS_PTRACE, which is why its capability
+/// set is held here too.
+fn crawl_process_findings(crawl: &Container, record: &Container) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["shareProcessNamespace", "hostPID"] {
+        if crawl
+            .pod
+            .get(key)
+            .is_some_and(|v| yaml_bool(v) != Some(false))
+        {
+            out.push(format!(
+                "the pod sets {key} — the crawl container could reach the record container's \
+                 processes, and through /proc/<pid>/root the token it mounts"
+            ));
+        }
+    }
+    for c in [crawl, record] {
+        if c.node.get("envFrom").is_some() {
+            out.push(format!(
+                "the {} container takes envFrom — a whole ConfigMap or Secret in its \
+                 environment, whose keys no check here reads",
+                c.name
+            ));
+        }
+    }
+    let uid = |c: &Container| {
+        c.node
+            .path(&["securityContext", "runAsUser"])
+            .or_else(|| c.pod.path(&["securityContext", "runAsUser"]))
+            .and_then(Node::str)
+            .map(str::to_string)
+    };
+    match (uid(crawl), uid(record)) {
+        (Some(a), Some(b)) if a != b => {}
+        (a, b) => out.push(format!(
+            "the crawl container runs as uid {a:?} and the record container as {b:?} — each \
+             must declare one and the two must differ, so the crawl cannot open the record \
+             container's /proc/<pid>/root even in a shared process namespace"
+        )),
+    }
+    let caps = crawl.node.path(&["securityContext", "capabilities"]);
+    let drops_all = caps
+        .map(|c| items(c, "drop"))
+        .unwrap_or_default()
+        .iter()
+        .any(|d| d.str() == Some("ALL"));
+    let adds = caps.is_some_and(|c| !items(c, "add").is_empty());
+    if !drops_all || adds {
+        out.push(
+            "the crawl container does not drop ALL capabilities and add none — CAP_SYS_PTRACE \
+             crosses the uid wall"
+                .to_string(),
+        );
+    }
+    if crawl
+        .node
+        .path(&["securityContext", "allowPrivilegeEscalation"])
+        .and_then(yaml_bool)
+        != Some(false)
+    {
+        out.push("the crawl container may escalate privilege".to_string());
+    }
     out
 }
 
@@ -883,5 +966,63 @@ fn a_crawl_container_given_the_token_or_the_address_is_refused() {
             .iter()
             .any(|f| f.contains("does not mount `result` read-only")),
         "{found:#?}"
+    );
+}
+
+/// The reviewer's mutant first: `shareProcessNamespace: true` on this
+/// pod passed every check of the car it reviewed (F1, backlog ffd309c1).
+#[test]
+fn a_crawl_pod_that_shares_processes_or_one_uid_is_refused() {
+    let crawl = manifests()[CRAWL].clone();
+    let restart = "          restartPolicy: Never\n";
+    // The FIRST capabilities line of the file is the crawl container's:
+    // it is the pod's first container.
+    let caps = "                capabilities: {drop: [\"ALL\"]}\n";
+    let record_uid = "                runAsUser: 1500\n";
+    for needle in [restart, caps, record_uid] {
+        assert!(
+            crawl.contains(needle),
+            "{CRAWL} no longer holds `{needle}` — the mutants below would test nothing"
+        );
+    }
+    let case = |m: String, needle: &str| {
+        let found = crawl_findings(&m);
+        assert!(
+            found.iter().any(|f| f.contains(needle)),
+            "expected a finding holding `{needle}`, got: {found:#?}"
+        );
+    };
+    for key in ["shareProcessNamespace", "hostPID"] {
+        case(
+            crawl.replacen(restart, &format!("{restart}          {key}: true\n"), 1),
+            &format!("the pod sets {key}"),
+        );
+    }
+    // Each container's envFrom, placed beside its name.
+    for name in ["crawl", "record"] {
+        let line = format!("            - name: {name}\n");
+        case(
+            crawl.replacen(
+                &line,
+                &format!("{line}              envFrom:\n                - configMapRef: {{name: boss-sor}}\n"),
+                1,
+            ),
+            &format!("the {name} container takes envFrom"),
+        );
+    }
+    // The record container back on the pod's uid: one user for both.
+    case(crawl.replacen(record_uid, "", 1), "the two must differ");
+    case(
+        crawl.replacen(record_uid, "                runAsUser: 65534\n", 1),
+        "the two must differ",
+    );
+    // The crawl given the capability that crosses a uid wall.
+    case(
+        crawl.replacen(
+            caps,
+            "                capabilities: {drop: [\"ALL\"], add: [\"SYS_PTRACE\"]}\n",
+            1,
+        ),
+        "CAP_SYS_PTRACE crosses the uid wall",
     );
 }

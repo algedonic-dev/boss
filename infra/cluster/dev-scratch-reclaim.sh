@@ -49,8 +49,11 @@
 # refused and left standing; and committed work lives in the repo's
 # object store regardless of the worktree, so removing a checkout only
 # ever costs a `git worktree add` to recover. It never removes a
-# LOCKED worktree, the main worktree, or the worktree this run is
-# executing from. It never touches the build cache while a build is
+# worktree under a LIVE lock — one whose owner is alive, or whose text
+# names a person or purpose — the main worktree, or the worktree this
+# run is executing from. A lock whose owner is gone, or that names no
+# owner at all, is judged like no lock (`lock_stale_why`,
+# OWNERLESS_LOCK). It never touches the build cache while a build is
 # running (checked through the pod's shared PID namespace), and even
 # then it removes only `incremental/` dirs, which cargo regenerates.
 # It touches no path outside the two workspaces. If a floor stays
@@ -181,6 +184,7 @@ STALE_TARGET_H="${BOSS_STALE_TARGET_H:-12}"
 # this script's own checkout, so the sidecar reads the floor of the tree
 # it is running.
 BUILD_FLOOR_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)/build-floor.env"
+. "${BUILD_FLOOR_FILE%/*}/lib/jq.sh"
 build_floor() {
     awk -F= -v k="$1" '$1 == k {v = $2} END {print v}' "$BUILD_FLOOR_FILE" 2>/dev/null
 }
@@ -210,6 +214,34 @@ WORKTREE_GRACE_H="${BOSS_WORKTREE_GRACE_H:-12}"
 WORKTREE_IDLE_H="${BOSS_WORKTREE_IDLE_H:-168}"
 
 REPO_DIR="${REPO_DIR:-/work/boss}"
+RECLAIM_GIT_OBSERVER="$(dirname "$(readlink -f "$0")")/dev-reclaim-git.sh"
+# Independent, bounded per-pass failure signal: work/PVC storage can refuse a
+# phase write while the existing Git operation must retain its original policy.
+# Its native pass metadata records UNKNOWN, never validity of older rows as PASS.
+GIT_PHASE_ATTEMPT_FILE=$(mktemp "${TMPDIR:-/tmp}/dev-reclaim-git-attempt.XXXXXX") || GIT_PHASE_ATTEMPT_FILE=""
+if [ -n "$GIT_PHASE_ATTEMPT_FILE" ] && exec 9<> "$GIT_PHASE_ATTEMPT_FILE"; then
+    trap 'rm -f -- "$GIT_PHASE_ATTEMPT_FILE"' EXIT
+else
+    GIT_PHASE_ATTEMPT_FILE=""
+    exec 9>&2
+fi
+# Value-free child evidence precedes Git execution; the observer forwards the
+# original arguments, streams and exit status, never broadening cleanup policy.
+git() {
+    local diagnostic_fd=2
+    [ ! -e /proc/self/fd/9 ] || diagnostic_fd=9
+    if [ ! -r "$RECLAIM_GIT_OBSERVER" ] || [ ! -r "${RECLAIM_GIT_OBSERVER%.sh}.py" ] || ! command -v python3 >/dev/null 2>&1; then
+        if [ -n "${GIT_PHASE_ATTEMPT_FILE:-}" ]; then
+            printf '%s\n' unknown > "$GIT_PHASE_ATTEMPT_FILE"
+        else
+            printf '%s\n' 'reclaim-git-observer: unknown observer unavailable' >&"$diagnostic_fd"
+        fi
+        command git "$@"
+        return $?
+    fi
+    BOSS_RECLAIM_GIT_DIR="${BOSS_RECLAIM_GIT_DIR:-${WORK_MOUNT:-/work}/telemetry/dev-reclaim-git}" \
+        bash "$RECLAIM_GIT_OBSERVER" --run "${FUNCNAME[1]:-reclaim}" -- "$@" 3>&"$diagnostic_fd"
+}
 WORKTREES_DIR="${WORKTREES_DIR:-$REPO_DIR/.claude/worktrees}"
 TARGET_DIR="${CARGO_TARGET_DIR:-/scratch/target}"
 SCRATCH_MOUNT="${SCRATCH_MOUNT:-/scratch}"
@@ -266,6 +298,79 @@ size_kb() {
 
 problems=0
 
+# A PROBLEM IS COUNTED AND NAMED IN ONE ACT (backlog 5e5d4be8). Until
+# 2026-10-09 every site below bumped the count itself, beside a log
+# line, so the packet carried a count and the sidecar's stdout —
+# which nobody reads — carried what it counted. Read 2026-10-08 23:58Z:
+# packet 0777f3f6 closed `failed` with `problems=2` and no key among its
+# 52 saying which two, and every hourly pass that day closed the same
+# way (CLAUDE.md §Diagnosis: a verdict must name what failed).
+#
+# `problem <slug> <sentence>` is the only place the count moves (pinned:
+# every_problem_the_pass_counts_is_named_on_the_packet), and it writes
+# the line the packet carries as `output`, one per problem, in the shape
+# the chore judge already reads: `RED <route> <kind>: <error>`
+# (maintenance.chore.file_reds). So the rule
+# file-backlog-items-on-dev-scratch-reclaim-red files ONE backlog-item
+# per slug while one is open — a floor unmet every hour is one item, not
+# twenty-four `failed` packets that reach nobody. The slug is the dedup
+# key, so it names the KIND of problem and never the tree or the number.
+#
+# Flattened and cut to 400 characters at this last step before storage,
+# as FF_DETAIL is: the caller has already logged the whole sentence.
+PROBLEM_LINES=""
+problem() {
+    local why
+    problems=$((problems + 1))
+    why=$(printf '%s' "$2" | tr '[:cntrl:]' ' ' | tr -s ' ' | cut -c1-400)
+    PROBLEM_LINES="${PROBLEM_LINES:+$PROBLEM_LINES
+}RED dev-scratch-reclaim/$1 problem: $why"
+}
+
+# REMOVE A TREE, AS ITS OWNER WHEN THIS PROCESS IS REFUSED (backlog
+# cb1cdc61, 5e5d4be8). Measured 2026-10-07 and again 2026-10-08:
+# /scratch/target-repo, uid 65534 gid 1500 mode 2755 — the target
+# wt-cargo names for a checkout called `repo`, which is what
+# infra/dev/as-gate-uid.sh calls the workspace the gate's uid creates.
+# The dev container's root holds CAP_SETUID and CAP_SETGID and no
+# CAP_DAC_OVERRIDE (as-gate-uid.sh has the measurement), so `rm -rf` was
+# refused on every file: about 11,025 stderr lines per build from
+# wt-cargo's floor pass, nothing reclaimed, the floor never restored, and
+# so the same pass again on the next build.
+#
+# The capability this process does have is the one that removes it: rm
+# runs again as the tree's own uid and gid — the door as-gate-uid.sh
+# uses on its own workspace — and then once more as this process, for a
+# top directory whose PARENT only this process can write. A container
+# with no CAP_SETUID, or no setpriv, fails that retry quietly and the
+# refusal stands. It widens nothing: the tree is one a pass had already
+# selected and already tried to remove.
+#
+# SAID ONCE. rm's stderr is captured, never streamed: a refusal the
+# retry repaired prints nothing, and one that stands leaves REMOVE_WHY —
+# the owner, how many paths refused and the FIRST of them — for the
+# caller's one log line and its `problem`. The other lines are that
+# line with another filename, and printing them is what buried a
+# builder's real output.
+REMOVE_WHY=""
+remove_tree() {
+    local t="$1" out uid="" gid="" mode="" n
+    REMOVE_WHY=""
+    out=$(rm -rf -- "$t" 2>&1) && return 0
+    read -r uid gid mode < <(stat -c '%u %g %a' "$t" 2>/dev/null) || true
+    if [ -n "$uid" ] && command -v setpriv >/dev/null 2>&1; then
+        setpriv --reuid="$uid" --regid="$gid" --clear-groups rm -rf -- "$t" >/dev/null 2>&1 || true
+        rm -rf -- "$t" >/dev/null 2>&1 || true
+        if [ ! -e "$t" ]; then
+            log "  removed $t as its owner, uid $uid (this process was refused)"
+            return 0
+        fi
+    fi
+    n=$(printf '%s\n' "$out" | grep -c . || true)
+    REMOVE_WHY="owned by uid ${uid:-unread} gid ${gid:-unread} mode ${mode:-unread}; rm refused ${n:-0} path(s), the first: $(printf '%s\n' "$out" | sed -n '1p')"
+    return 1
+}
+
 # Totals every pass leaves for the record at the end.
 WT_PASS=skipped; WT_PASS_REASON=""
 WT_MAIN_SHA=""; WT_MAIN_TS=""
@@ -275,6 +380,7 @@ WT_KEPT_DIRTY=0; WT_KEPT_DIRTY_NAMES=""
 WT_KEPT_UNREFERENCED=0; WT_KEPT_UNREFERENCED_NAMES=""
 WT_KEPT_LIVE=0; WT_KEPT_RECENT=0; WT_KEPT_LOCKED=0; WT_KEPT_REFUSED=0
 WT_STALE_LOCKS=0; WT_STALE_LOCK_NAMES=""
+WT_OWNERLESS_LOCKS=0; WT_OWNERLESS_LOCK_NAMES=""
 WT_PRUNED=0
 WT_KEPT_UNSEEN=0; WT_KEPT_UNSEEN_NAMES=""
 WT_TARGETS_REMOVED=0; WT_TARGETS_MIB=0
@@ -426,7 +532,7 @@ fast_forward_checkout() {
         # log above — never the only copy.
         FF_DETAIL=$(printf '%s' "$out" | tr -d '"\\' | tr '[:cntrl:]' ' ' | tr -s ' ' | cut -c1-400)
         FF_RESULT="failed: exit $rc"
-        problems=$((problems + 1))
+        problem fast-forward-refused "git exit $rc taking $REPO_DIR from ${head:0:8} to ${main:0:8}: $FF_DETAIL"
         return 0
     fi
     FF_RESULT=ok
@@ -504,6 +610,9 @@ fast_forward_checkout() {
 # process table (`lock_stale_why`): a harness lock whose pid is gone,
 # or started at another time than it recorded, is STALE, and the tree
 # is judged like any other — (1) to (3) all still apply — and named.
+# A lock reading only git's `added with --lock` names no owner at all
+# and is judged the same way, behind at least the unpushed window
+# (OWNERLESS_LOCK, backlog f66227aa).
 # Only a tree about to be removed is unlocked, and it is re-locked if
 # git then refuses, so a stale lock the pass keeps stays as it was.
 # `git worktree remove` still runs without --force, a second lock on
@@ -607,6 +716,24 @@ lock_stale_why() {
     [ "$now_start" = "$start" ] && return 1
     echo "pid $pid started at $now_start, not the $start the lock recorded"
 }
+
+# A LOCK THAT NAMES NO OWNER (backlog f66227aa). `git worktree add --lock`
+# with no `--reason` writes git's own sentence and nothing else — no pid,
+# no person, no run (builtin/worktree.c). Measured 2026-10-09 20:14Z: 139
+# of 315 worktrees carried exactly this text, 75 of them under /work/wt,
+# every one idle 98h to 185h and 73 clean, while /work stood at 11 GB
+# free against its 18 GB floor; the pass kept them all as a human's lock,
+# removed nothing, and gate.sh's 12 GB floor refused every builder's
+# pre-flight. (The Claude harness's own lock is the pid shape above; all
+# 47 of those were live that day.) There is no owner to ask, so the tree
+# answers instead: it is judged like an unlocked one — every guard still
+# runs — but never sooner than WORKTREE_MAX_AGE_H, whatever the branch or
+# the floor says, because the floor's live window is minutes and an owner
+# the lock does not name may sit that long in a clean tree. The process
+# table is not read. Any OTHER text, an empty one included (`git worktree
+# lock` with no reason is an act someone took after the add), is still
+# somebody's lock and is never judged.
+OWNERLESS_LOCK="added with --lock"
 
 # The first ref that holds a commit — the one question the detached-HEAD
 # guard asks, in whichever pass is about to remove a checkout (backlog
@@ -825,13 +952,13 @@ remove_worktree_target() {
         [ -d "$t" ] || continue
         [ "$t" = "$TARGET_DIR" ] && continue
         kb=$(du -sk "$t" 2>/dev/null | awk '{print $1}')
-        if rm -rf "$t"; then
+        if remove_tree "$t"; then
             log "  removed target $t ($((${kb:-0} / 1024))MiB, its worktree is gone)"
             WT_TARGETS_REMOVED=$((WT_TARGETS_REMOVED + 1))
             WT_TARGETS_MIB=$((WT_TARGETS_MIB + ${kb:-0} / 1024))
         else
-            log "could not remove target $t" >&2
-            problems=$((problems + 1))
+            log "could not remove target $t — $REMOVE_WHY" >&2
+            problem target-not-removed "$t (its worktree is gone): $REMOVE_WHY"
         fi
     done
 }
@@ -862,7 +989,7 @@ prune_gone_worktrees() {
     local -a roots=()
     if ! common=$(git -C "$REPO_DIR" rev-parse --git-common-dir 2>&1) || [ -z "$common" ]; then
         log "could not read $REPO_DIR's git directory (${common:-empty answer}) — no worktree entry pruned" >&2
-        problems=$((problems + 1))
+        problem git-dir-unread "$REPO_DIR's git directory could not be read (${common:-empty answer}); no worktree entry pruned"
         return 0
     fi
     case "$common" in /*) ;; *) common="$REPO_DIR/$common" ;; esac
@@ -902,7 +1029,7 @@ prune_gone_worktrees() {
             pruned=$((pruned + 1))
         else
             log "could not remove the admin entry worktrees/$name" >&2
-            problems=$((problems + 1))
+            problem worktree-entry-not-pruned "the admin entry worktrees/$name, whose worktree $wt is gone, could not be removed"
         fi
     done
     WT_PRUNED=$((WT_PRUNED + pruned))
@@ -926,13 +1053,13 @@ reclaim_gone_worktrees() {
     if ! main_sha=$(git -C "$REPO_DIR" rev-parse --verify -q refs/remotes/origin/main 2>&1) || [ -z "$main_sha" ]; then
         WT_PASS_REASON="$REPO_DIR has no refs/remotes/origin/main (git fetch origin in the dev container; ${main_sha:-empty answer})"
         log "worktree pass skipped: $WT_PASS_REASON" >&2
-        problems=$((problems + 1))
+        problem worktree-pass-skipped "$WT_PASS_REASON"
         return 0
     fi
     if ! main_ts=$(git -C "$REPO_DIR" log -1 --format=%ct "$main_sha" 2>&1) || [ -z "$main_ts" ]; then
         WT_PASS_REASON="git could not read refs/remotes/origin/main at $main_sha (${main_ts:-empty answer})"
         log "worktree pass skipped: $WT_PASS_REASON" >&2
-        problems=$((problems + 1))
+        problem worktree-pass-skipped "$WT_PASS_REASON"
         return 0
     fi
     WT_MAIN_SHA="$main_sha"; WT_MAIN_TS="$main_ts"
@@ -965,7 +1092,7 @@ reclaim_gone_worktrees() {
     fi
     if ! proc_view_is_pods; then
         judge_locks=0
-        log "worktree pass: locks not judged — $PROC_ROOT/1 is not the pod's pause, so this process table cannot say a harness pid is gone; every locked tree is kept"
+        log "worktree pass: pid locks not judged — $PROC_ROOT/1 is not the pod's pause, so this process table cannot say a harness pid is gone; every tree under one is kept"
     fi
 
     # `path<TAB>branch<TAB>locked<TAB>reason` per worktree, `detached`
@@ -973,6 +1100,7 @@ reclaim_gone_worktrees() {
     # worktree.
     local first=1 path branch locked reason stale window_s why last idle_s idle_h dirty kb head held
     local landed_window_s floor_note unpushed how by_content by_record rc
+    local tree_landed_s tree_note ownerless
     landed_window_s=$((WORKTREE_GRACE_H * 3600)); floor_note=""
     if [ "$under_floor" = 1 ]; then
         landed_window_s=$((LIVE_TARGET_MIN * 60)); floor_note=", under the /work floor"
@@ -983,8 +1111,18 @@ reclaim_gone_worktrees() {
         [ "$path" = "$REPO_DIR" ] && continue
         case "$self" in "$path"|"$path"/*) continue ;; esac
         [ -d "$path" ] || continue
-        stale=""
-        if [ "$locked" = 1 ]; then
+        stale=""; ownerless=0
+        tree_landed_s=$landed_window_s; tree_note=$floor_note
+        if [ "$locked" = 1 ] && [ "$reason" = "$OWNERLESS_LOCK" ]; then
+            # `stale` set is what unlocks it at the removal and locks it
+            # back, with the same text, if git then refuses.
+            stale="its lock names no owner"; ownerless=1
+            if [ "$tree_landed_s" -lt $((WORKTREE_MAX_AGE_H * 3600)) ]; then
+                tree_landed_s=$((WORKTREE_MAX_AGE_H * 3600)); tree_note=""
+            fi
+            WT_OWNERLESS_LOCKS=$((WT_OWNERLESS_LOCKS + 1))
+            WT_OWNERLESS_LOCK_NAMES="${WT_OWNERLESS_LOCK_NAMES:+$WT_OWNERLESS_LOCK_NAMES, }$(basename "$path")"
+        elif [ "$locked" = 1 ]; then
             if [ "$judge_locks" = 0 ] || ! stale=$(lock_stale_why "$reason"); then
                 WT_KEPT_LOCKED=$((WT_KEPT_LOCKED + 1))
                 continue
@@ -1005,7 +1143,7 @@ reclaim_gone_worktrees() {
                     continue
                 fi
                 if git -C "$REPO_DIR" merge-base --is-ancestor "refs/heads/$branch" "$main_sha" 2>/dev/null; then
-                    window_s=$landed_window_s; why="branch $branch has no origin/ ref and its head is on origin/main (landed)$floor_note"
+                    window_s=$tree_landed_s; why="branch $branch has no origin/ ref and its head is on origin/main (landed)$tree_note"
                 else
                     unpushed=1
                     window_s=$((WORKTREE_MAX_AGE_H * 3600)); why="branch $branch has no origin/ ref and is not on origin/main (unpushed)"
@@ -1021,11 +1159,11 @@ reclaim_gone_worktrees() {
         # 4a738ca5, `landed_by_content`). Asked only where the answer
         # can change the outcome: idle past the landed window but inside
         # the unpushed one, which is where the 286 kept trees stood.
-        if [ "$unpushed" = 1 ] && [ "$idle_s" -ge "$landed_window_s" ] && [ "$idle_s" -lt "$window_s" ] &&
+        if [ "$unpushed" = 1 ] && [ "$idle_s" -ge "$tree_landed_s" ] && [ "$idle_s" -lt "$window_s" ] &&
             how=$(landed_by_content "refs/heads/$branch" "$main_sha"); then
             by_content=1
-            window_s=$landed_window_s
-            why="branch $branch has no origin/ ref and its work is on origin/main by $how (landed — rebased or squashed under other shas)$floor_note"
+            window_s=$tree_landed_s
+            why="branch $branch has no origin/ ref and its work is on origin/main by $how (landed — rebased or squashed under other shas)$tree_note"
         fi
         # ...and where git cannot see it at all, the system of record
         # may (backlog 9a044141, `landed_on_record`): asked in the same
@@ -1034,14 +1172,14 @@ reclaim_gone_worktrees() {
         # the packet says why each unpushed tree stays.
         by_record=0
         if [ "$unpushed" = 1 ] && [ "$by_content" = 0 ] &&
-            [ "$idle_s" -ge "$landed_window_s" ] && [ "$idle_s" -lt "$window_s" ]; then
+            [ "$idle_s" -ge "$tree_landed_s" ] && [ "$idle_s" -lt "$window_s" ]; then
             rc=0
             landed_on_record "$path" "$branch" || rc=$?
             case "$rc" in
                 0)
                     by_record=1
-                    window_s=$landed_window_s
-                    why="branch $branch has no origin/ ref and is not on origin/main, and the system of record says $REC_HOW (landed on record)$floor_note"
+                    window_s=$tree_landed_s
+                    why="branch $branch has no origin/ ref and is not on origin/main, and the system of record says $REC_HOW (landed on record)$tree_note"
                     ;;
                 1)
                     log "  kept $path (unpushed, no landing on record: no merged car for $branch and no finished run that gated from it; idle ${idle_h}h of ${WORKTREE_MAX_AGE_H}h)"
@@ -1053,6 +1191,9 @@ reclaim_gone_worktrees() {
                     continue
                     ;;
             esac
+        fi
+        if [ "$ownerless" = 1 ]; then
+            why="$why; its lock names no owner, so it waits at least ${WORKTREE_MAX_AGE_H}h"
         fi
         if [ "$idle_s" -lt "$window_s" ]; then
             WT_KEPT_RECENT=$((WT_KEPT_RECENT + 1))
@@ -1100,7 +1241,7 @@ reclaim_gone_worktrees() {
         if ! git -C "$REPO_DIR" worktree remove "$path" 2>/dev/null; then
             if [ -n "$stale" ] && ! git -C "$REPO_DIR" worktree lock --reason "$reason" "$path" 2>/dev/null; then
                 log "  could not put $path's lock back ($reason)" >&2
-                problems=$((problems + 1))
+                problem worktree-lock-not-restored "$path was unlocked for a removal git then refused, and its lock ($reason) could not be put back"
             fi
             log "  kept $path (git refused to remove it without --force; $why, idle ${idle_h}h)"
             WT_KEPT_REFUSED=$((WT_KEPT_REFUSED + 1))
@@ -1121,7 +1262,7 @@ reclaim_gone_worktrees() {
         '
     )
 
-    log "worktree pass: removed $WT_REMOVED worktree(s) (${WT_REMOVED_MIB}MiB; $WT_REMOVED_BY_CONTENT of them landed by content, not by sha, and $WT_REMOVED_BY_RECORD landed on record) and $WT_TARGETS_REMOVED target(s) (${WT_TARGETS_MIB}MiB); kept $WT_KEPT_LIVE with an origin/ ref still in the checkout, $WT_KEPT_RECENT with git activity inside the window, $WT_KEPT_NO_LANDING unpushed with no landing on record, $WT_KEPT_SOR_UNREAD unpushed because the record could not be read, $WT_KEPT_DIRTY dirty, $WT_KEPT_UNREFERENCED with a head no ref holds, $WT_KEPT_LOCKED locked, $WT_KEPT_REFUSED refused by git; pruned $WT_PRUNED entries whose directory was gone; kept $WT_KEPT_UNSEEN entries outside the mounts this pass can see${WT_KEPT_UNSEEN_NAMES:+ ($WT_KEPT_UNSEEN_NAMES)}; judged $WT_STALE_LOCKS with a stale lock"
+    log "worktree pass: removed $WT_REMOVED worktree(s) (${WT_REMOVED_MIB}MiB; $WT_REMOVED_BY_CONTENT of them landed by content, not by sha, and $WT_REMOVED_BY_RECORD landed on record) and $WT_TARGETS_REMOVED target(s) (${WT_TARGETS_MIB}MiB); kept $WT_KEPT_LIVE with an origin/ ref still in the checkout, $WT_KEPT_RECENT with git activity inside the window, $WT_KEPT_NO_LANDING unpushed with no landing on record, $WT_KEPT_SOR_UNREAD unpushed because the record could not be read, $WT_KEPT_DIRTY dirty, $WT_KEPT_UNREFERENCED with a head no ref holds, $WT_KEPT_LOCKED locked, $WT_KEPT_REFUSED refused by git; pruned $WT_PRUNED entries whose directory was gone; kept $WT_KEPT_UNSEEN entries outside the mounts this pass can see${WT_KEPT_UNSEEN_NAMES:+ ($WT_KEPT_UNSEEN_NAMES)}; judged $WT_STALE_LOCKS with a stale lock and $WT_OWNERLESS_LOCKS with a lock naming no owner"
 }
 
 # ---------------------------------------------------------------------
@@ -1221,7 +1362,7 @@ reclaim_work() {
     if [ "$gb" -lt "$WORK_FLOOR_GB" ]; then
         log "WORK FLOOR UNMET — ${gb}GB free < ${WORK_FLOOR_GB}GB after pruning every eligible worktree." >&2
         log "  Remaining use is the clone, locked worktrees, worktrees with uncommitted work, or detached heads no ref holds${FLOOR_WORKTREES_KEPT_UNREFERENCED_NAMES:+ ($FLOOR_WORKTREES_KEPT_UNREFERENCED_NAMES)}. A human decides next." >&2
-        problems=$((problems + 1))
+        problem work-floor-unmet "$WORK_MOUNT ${gb}GB free < ${WORK_FLOOR_GB}GB after pruning every eligible worktree (removed $removed, kept $skipped); what remains is the clone, locked worktrees, worktrees with uncommitted work, or detached heads no ref holds${FLOOR_WORKTREES_KEPT_UNREFERENCED_NAMES:+ ($FLOOR_WORKTREES_KEPT_UNREFERENCED_NAMES)}"
     fi
 }
 
@@ -1267,7 +1408,7 @@ reclaim_scratch() {
     if build_running; then
         log "a build is running (cargo/rustc live) — skipping build-cache trim this pass" >&2
         log "build-cache reclaim deferred: ${gb}GB < ${SCRATCH_FLOOR_GB}GB floor, retried next pass." >&2
-        problems=$((problems + 1))
+        problem build-cache-trim-deferred "$SCRATCH_MOUNT ${gb}GB free < ${SCRATCH_FLOOR_GB}GB floor (${SCRATCH_FLOOR_PCT}%) after the sibling targets, and the incremental trim was deferred because a build is running (cargo/rustc live); retried next pass"
         return 0
     fi
 
@@ -1288,7 +1429,7 @@ reclaim_scratch() {
         log "SCRATCH FLOOR UNMET — ${gb}GB free < ${SCRATCH_FLOOR_GB}GB after dropping every incremental cache." >&2
         log "  The remainder is linked artifacts under $TARGET_DIR/*/deps. Reclaiming those is a" >&2
         log "  full rebuild's worth of cost — run \`cargo clean\` deliberately, or an operator decides." >&2
-        problems=$((problems + 1))
+        problem scratch-floor-unmet "$SCRATCH_MOUNT ${gb}GB free < ${SCRATCH_FLOOR_GB}GB floor (${SCRATCH_FLOOR_PCT}%) after every idle sibling target and $n incremental cache dir(s); the remainder is linked artifacts under $TARGET_DIR or space this pod does not hold"
     fi
 }
 
@@ -1308,13 +1449,13 @@ reclaim_targets_to_floor() {
             continue
         fi
         kb=$(du -sk "$d" 2>/dev/null | awk '{print $1}')
-        if rm -rf "$d"; then
+        if remove_tree "$d"; then
             n=$((n + 1))
             mib=$((mib + ${kb:-0} / 1024))
             log "floor target reclaimed: $d ($((${kb:-0} / 1024))MiB, least recently used; ${gb}GB free < ${floor}GB floor)"
         else
-            log "could not remove target $d" >&2
-            problems=$((problems + 1))
+            log "could not remove target $d — $REMOVE_WHY" >&2
+            problem target-not-removed "$d (idle, under the scratch floor): $REMOVE_WHY"
         fi
     done < <(
         for d in "$SCRATCH_MOUNT"/*/; do
@@ -1368,12 +1509,12 @@ reclaim_stale_targets() {
             continue
         fi
         kb=$(du -sk "$d" 2>/dev/null | awk '{print $1}')
-        if rm -rf "$d"; then
+        if remove_tree "$d"; then
             n=$((n + 1))
             log "stale target reclaimed: $d ($((${kb:-0} / 1024))MiB, untouched for more than ${STALE_TARGET_H}h)"
         else
-            log "could not remove stale target $d" >&2
-            problems=$((problems + 1))
+            log "could not remove stale target $d — $REMOVE_WHY" >&2
+            problem target-not-removed "$d (untouched for more than ${STALE_TARGET_H}h): $REMOVE_WHY"
         fi
     done
     log "stale-target pass: $n stale target dir(s) reclaimed under $SCRATCH_MOUNT (age > ${STALE_TARGET_H}h, $TARGET_DIR exempt)"
@@ -1423,6 +1564,11 @@ reclaim_stale_targets() {
 # §Diagnosis).
 CLI_STORE="${BOSS_CLI_STORE:-$WORK_MOUNT/tools/image-cli}"
 CLI_LINK="${BOSS_CLI_LINK:-$WORK_MOUNT/tools/bin/boss-image}"
+# Dev isolation's store and selector (b3071bf4; design a68fc42a D6): on
+# the work volume, where the installer this pass runs keeps the selector
+# following main. The doors and the CLI spell /work/tools/dev-control.
+DEV_CONTROL_STORE="${BOSS_DEV_CONTROL_STORE:-$WORK_MOUNT/tools/dev-control}"
+DEV_CONTROL_STATE=""
 CLI_SHA=""
 CLI_RESULT=skipped
 install_tree_cli() {
@@ -1453,13 +1599,14 @@ install_tree_cli() {
     if ! mkdir -p "$CLI_STORE" || ! bash "$render" --to "$CLI_STORE/sor.env" >/dev/null; then
         log "CLI install FAILED: could not render $CLI_STORE/sor.env from infra/estate/estate.toml" >&2
         CLI_RESULT="failed: no sor.env"
-        problems=$((problems + 1))
+        problem cli-install-failed "could not render $CLI_STORE/sor.env from infra/estate/estate.toml"
         return 0
     fi
     log "CLI: installing the tree's boss at ${sha:0:8} (origin/main) from the cluster image into $CLI_STORE"
     log=$(mktemp "${TMPDIR:-/tmp}/dev-scratch-reclaim-cli.XXXXXX")
     rc=0
     BOSS_SOR_ENV="$CLI_STORE/sor.env" BOSS_CLI_STORE="$CLI_STORE" BOSS_CLI_LINK="$CLI_LINK" \
+        BOSS_DEV_CONTROL_STORE="$DEV_CONTROL_STORE" \
         bash "$installer" "$sha" >"$log" 2>&1 || rc=$?
     sed 's/^/dev-scratch-reclaim:   cli: /' "$log"
     rm -f "$log"
@@ -1470,8 +1617,66 @@ install_tree_cli() {
             log "CLI: not yet — the image for ${sha:0:8} is not in the registry (the deploy runner builds it a few minutes after each train); the next pass retries, and the store stays at $(readlink "$CLI_STORE/current" 2>/dev/null || echo none)" ;;
         *)  CLI_RESULT="failed: exit $rc"
             log "CLI install FAILED (exit $rc) at ${sha:0:8} — the installer's complete output is above; the store stays at $(readlink "$CLI_STORE/current" 2>/dev/null || echo none)" >&2
-            problems=$((problems + 1)) ;;
+            problem cli-install-failed "the installer exited $rc at ${sha:0:8}; the store stays at $(readlink "$CLI_STORE/current" 2>/dev/null || echo none), and the sidecar's log holds the installer's whole output" ;;
     esac
+}
+
+# ---------------------------------------------------------------------
+# DEV ISOLATION IS NEVER SILENT (design a68fc42a D1, David 2026-10-10).
+# ---------------------------------------------------------------------
+# Read AFTER the installer, which re-activates (or refuses) the selector.
+# No store means isolation was never activated on this pod — the held
+# state (b3071bf4 held_by_david_20261009), inert and not a problem. Once
+# the store exists, every pass that finds the selector refused, missing
+# (the doors are running candidate code beside the token again), or
+# naming a generation the installed CLI has moved past (the doors froze)
+# files a problem on this pass's packet, every hour until it is fixed.
+check_dev_control() {
+    local selector target current gen why off_mode
+    selector="$DEV_CONTROL_STORE/enabled"
+    if [ ! -d "$DEV_CONTROL_STORE" ] && [ ! -L "$DEV_CONTROL_STORE" ]; then
+        DEV_CONTROL_STATE="inert: never activated"
+        log "dev isolation: inert — no store at $DEV_CONTROL_STORE (never activated on this pod)"
+        return 0
+    fi
+    why="read $DEV_CONTROL_STORE/activation.log"
+    if [ ! -L "$selector" ] && [ ! -e "$selector" ]; then
+        # Judge the same off record as activate-control's load_record
+        # and the installer: a public file or a stream ending in off is
+        # not the supported rollback (review cd351532, car 3f64de32).
+        off_mode=$(stat -c %a "$DEV_CONTROL_STORE/off.json" 2>/dev/null || true)
+        if [ -f "$DEV_CONTROL_STORE/off.json" ] && [ ! -L "$DEV_CONTROL_STORE/off.json" ] &&
+           [ "$(stat -c %u "$DEV_CONTROL_STORE/off.json" 2>/dev/null)" = "$(id -u)" ] &&
+           [ "${off_mode: -2}" = 00 ] &&
+           jq_doc_file "$DEV_CONTROL_STORE/off.json" &&
+           jq -e -s 'length == 1 and .[0] == {state:"off"}' "$DEV_CONTROL_STORE/off.json" >/dev/null 2>&1; then
+            DEV_CONTROL_STATE="off: supported rollback"
+            log "dev isolation: off — supported rollback recorded at $DEV_CONTROL_STORE/off.json"
+            return 0
+        fi
+        DEV_CONTROL_STATE="selector missing"
+        log "PROBLEM: dev isolation's selector $selector is MISSING while its store exists — the doors run candidate code beside this pod's credentials; $why" >&2
+        problem dev-control-selector-missing "the selector $selector is missing while the store exists, so the doors run candidate code beside the token; re-activate, or use the published dev-control deactivate door to record isolation off; $why"
+        return 0
+    fi
+    target="$(readlink "$selector" 2>/dev/null || true)"
+    gen="${target#"$DEV_CONTROL_STORE"/generations/}"
+    case "$gen" in *[!0-9a-f]*) gen="" ;; esac
+    if [ "$gen" = "$target" ] || [ "${#gen}" -ne 40 ]; then
+        DEV_CONTROL_STATE="refused: ${target:-not a link}"
+        log "PROBLEM: dev isolation is REFUSED — $selector names '${target:-not a link}', so wt-cargo, wt-web, boss --built and the CLI's children refuse with 75; $why" >&2
+        problem dev-control-refused "the selector $selector names '${target:-not a link}', not an activated generation, so candidate execution is refused; $why"
+        return 0
+    fi
+    current="$(readlink "$CLI_STORE/current" 2>/dev/null || true)"
+    if [ -n "$current" ] && [ "$current" != "$gen" ]; then
+        DEV_CONTROL_STATE="behind: on ${gen:0:8}, CLI at ${current:0:8}"
+        log "PROBLEM: dev isolation runs generation ${gen:0:8} while the installed CLI is ${current:0:8} — the selector did not follow main; $why" >&2
+        problem dev-control-behind "the selector runs generation ${gen:0:8} while the installed CLI is ${current:0:8}, so the doors did not follow main; $why"
+        return 0
+    fi
+    DEV_CONTROL_STATE="on at $gen"
+    log "dev isolation: on at ${gen:0:8} ($selector)"
 }
 
 # ---------------------------------------------------------------------
@@ -1503,6 +1708,9 @@ RECLAIM_KIND=maintenance-dev-scratch-reclaim
 MEMORY_WATCH="${BOSS_DEV_MEMORY_WATCH:-on}"
 MEMORY_WATCH_SCRIPT="$(dirname "$(readlink -f "$0")")/dev-memory-watch.sh"
 WATCH_STARTED=0
+WATCH_ACKED=0
+WATCH_ACKS=""
+PASS_RECORDED=0
 WATCH_STATE=()
 read_watch_state() {
     WATCH_STATE=()
@@ -1520,11 +1728,27 @@ watch_field() {
     done
 }
 
+git_phase_state() {
+    local result coverage=unknown
+    result=$(BOSS_RECLAIM_GIT_DIR="${BOSS_RECLAIM_GIT_DIR:-${WORK_MOUNT:-/work}/telemetry/dev-reclaim-git}" \
+        bash "$RECLAIM_GIT_OBSERVER" --state 2>/dev/null) || result=""
+    [ -n "$result" ] || result='{"state":"unknown","reason":"phase reader unavailable"}'
+    if [ -n "${GIT_PHASE_ATTEMPT_FILE:-}" ] && [ -r "$GIT_PHASE_ATTEMPT_FILE" ] && [ ! -s "$GIT_PHASE_ATTEMPT_FILE" ]; then
+        coverage=no_observed_recording_failure
+    else
+        printf '%s\n' 'reclaim-git-observer: unknown attempt coverage; a phase refusal or unavailable independent signal remains' >&2
+    fi
+    printf '%s' "$result" | jq -c --arg coverage "$coverage" \
+        '. + {attempt_coverage: $coverage} | if $coverage == "unknown" then .state = "unknown" else . end' \
+        || printf '%s\n' '{"state":"unknown","attempt_coverage":"unknown","reason":"phase state unavailable"}'
+}
+
 record_pass() {
-    local acted
+    local acted git_phase_state
+    git_phase_state=$(git_phase_state)
     # The floor mode reaches here without the hourly pass's read.
     [ "${#WATCH_STATE[@]}" -gt 0 ] || read_watch_state
-    acted=$((WT_REMOVED + WT_TARGETS_REMOVED + WT_PRUNED + FLOOR_WORKTREES_REMOVED + STALE_TARGETS_RECLAIMED + FLOOR_TARGETS_RECLAIMED + INCREMENTAL_DROPPED + WATCH_STARTED))
+    acted=$((WT_REMOVED + WT_TARGETS_REMOVED + WT_PRUNED + FLOOR_WORKTREES_REMOVED + STALE_TARGETS_RECLAIMED + FLOOR_TARGETS_RECLAIMED + INCREMENTAL_DROPPED + WATCH_STARTED + WATCH_ACKED))
     if [ "$acted" -eq 0 ] && [ "$problems" -eq 0 ]; then
         log "nothing reclaimed and no floor unmet — a pass that only looked files no packet"
         return 0
@@ -1550,7 +1774,7 @@ record_pass() {
     fi
     BOSS_JOBS_URL="$url" BOSS_STEP_ACTOR=automation:dev-scratch-reclaim \
         bash "$step" "$RECLAIM_KIND" run \
-            "result=$result" "problems=$problems" \
+            "result=$result" "problems=$problems" "output=$PROBLEM_LINES" \
             "worktree_pass=$WT_PASS" "worktree_pass_reason=$WT_PASS_REASON" \
             "ff_result=$FF_RESULT" "ff_to=$FF_TO" "ff_detail=$FF_DETAIL" \
             "origin_main_sha=$WT_MAIN_SHA" "origin_main_ref_ts=$WT_MAIN_TS" \
@@ -1564,6 +1788,7 @@ record_pass() {
             "worktrees_kept_live=$WT_KEPT_LIVE" "worktrees_kept_recent=$WT_KEPT_RECENT" \
             "worktrees_kept_locked=$WT_KEPT_LOCKED" "worktrees_kept_refused=$WT_KEPT_REFUSED" \
             "worktrees_stale_locks=$WT_STALE_LOCKS" "worktrees_stale_lock_names=$WT_STALE_LOCK_NAMES" \
+            "worktrees_ownerless_locks=$WT_OWNERLESS_LOCKS" "worktrees_ownerless_lock_names=$WT_OWNERLESS_LOCK_NAMES" \
             "worktrees_pruned=$WT_PRUNED" \
             "worktrees_kept_unseen=$WT_KEPT_UNSEEN" "worktrees_kept_unseen_names=$WT_KEPT_UNSEEN_NAMES" \
             "targets_removed=$WT_TARGETS_REMOVED" "targets_removed_mib=$WT_TARGETS_MIB" \
@@ -1571,8 +1796,10 @@ record_pass() {
             "stale_targets_reclaimed=$STALE_TARGETS_RECLAIMED" \
             "floor_targets_reclaimed=$FLOOR_TARGETS_RECLAIMED" "floor_targets_mib=$FLOOR_TARGETS_MIB" \
             "incremental_dirs_dropped=$INCREMENTAL_DROPPED" \
-            "cli_sha=$CLI_SHA" "cli_result=$CLI_RESULT" \
+            "cli_sha=$CLI_SHA" "cli_result=$CLI_RESULT" "dev_control=$DEV_CONTROL_STATE" \
+            "git_phase_ledger=$git_phase_state" \
             "${WATCH_STATE[@]}" \
+        && PASS_RECORDED=1 \
         || log "could not complete the $RECLAIM_KIND run step — its packet stays open for the next acting pass to complete" >&2
 }
 
@@ -1662,7 +1889,7 @@ if [ "$MEMORY_WATCH" != off ]; then
     case "$(watch_field memory_watch_ensure)" in started*) WATCH_STARTED=1 ;; esac
     if [ "$(watch_field memory_watch)" != sampling ]; then
         log "PROBLEM: the dev memory watch is $(watch_field memory_watch) — ensure said: $(watch_field memory_watch_ensure)" >&2
-        problems=$((problems + 1))
+        problem memory-watch-not-sampling "the dev memory watch is $(watch_field memory_watch); ensure said: $(watch_field memory_watch_ensure)"
     fi
     # AN ALERT THAT DID NOT LEAVE IS A PROBLEM TOO (delta review, N2).
     # The counts ride the packet, but a packet is filed only for a pass
@@ -1676,10 +1903,37 @@ if [ "$MEMORY_WATCH" != off ]; then
     watch_dropped="$(watch_field memory_watch_alerts_dropped)"
     case "${watch_refused:-0}${watch_dropped:-0}" in
         *[!0]*)
-            log "PROBLEM: the dev memory watch holds alerts that never reached the system of record — ${watch_refused:-0} refused and moved aside, ${watch_dropped:-0} dropped from a full spool" >&2
-            problems=$((problems + 1))
+            log "PROBLEM: the dev memory watch holds alerts that never reached the system of record — ${watch_refused:-0} refused and moved aside, ${watch_dropped:-0} dropped from a full spool; once read, acknowledge them with $MEMORY_WATCH_SCRIPT --acknowledge" >&2
+            problem memory-watch-alerts-unsent "the dev memory watch holds alerts that never reached the system of record: ${watch_refused:-0} refused and moved aside, ${watch_dropped:-0} dropped from a full spool; once read, acknowledge them with $MEMORY_WATCH_SCRIPT --acknowledge"
             ;;
     esac
+    # AN ALERT HELD WITHOUT BEING COUNTED IS A PROBLEM TOO (review
+    # fb97dd5d of car 1fe37401, finding F1). An answer that judges the
+    # caller or the API — a 403 to the watch's signer while this pass's
+    # own kind still files, a 5xx one body provokes — counts nothing
+    # against the alert, so the counts above stay 0 and the alert waits
+    # in the spool with no end but its bound of 48. The watch names how
+    # long its oldest kept alert has waited and the bound past which no
+    # refusal of the body explains it; this only compares the two.
+    watch_held_age="$(watch_field memory_watch_alerts_oldest_kept_age_s)"
+    watch_held_after="$(watch_field memory_watch_alerts_held_after_s)"
+    case "${watch_held_age:-empty}${watch_held_after:-empty}" in
+        *[!0-9]*) ;;
+        *)
+            if [ "$watch_held_age" -gt "$watch_held_after" ]; then
+                log "PROBLEM: the dev memory watch has held a kill alert unsent for ${watch_held_age} s, past its ${watch_held_after} s bound, with nothing counted against it — the jobs API keeps answering something that is not a refusal of the body (no answer, a 5xx, or a refusal of automation:dev-scratch-reclaim); its answers are in $(watch_field memory_watch_dir)/watch.log" >&2
+                problem memory-watch-alerts-held "the dev memory watch has held a kill alert unsent for ${watch_held_age} s, past its ${watch_held_after} s bound, with nothing counted against it: the jobs API keeps answering something that is not a refusal of the body (no answer, a 5xx, or a refusal of automation:dev-scratch-reclaim); its answers are in $(watch_field memory_watch_dir)/watch.log"
+            fi
+            ;;
+    esac
+    # AN ACKNOWLEDGEMENT IS ON THE RECORD (the same call). Clearing the
+    # problem above is a person's act, so the pass after it files a
+    # packet even when nothing else happened, the acknowledgement rides
+    # it (memory_watch_acknowledged), and only once that packet's run
+    # step is written does the watch hear it was carried — a dark system
+    # of record leaves it to ride the next one.
+    WATCH_ACKS="$(watch_field memory_watch_acknowledgements)"
+    [ -z "$WATCH_ACKS" ] || WATCH_ACKED=1
 fi
 
 # THE MACHINE TOKEN, ONCE, HERE — PRESENTED AND NEVER REQUIRED (backlog
@@ -1697,8 +1951,11 @@ fi
 # AFTER the two modes above, on purpose: `--cli` and `--scratch-floor`
 # run in the dev container, before a write verb and before every build,
 # where no token is mounted at that directory and none is wanted; they
-# source nothing. HERE and not inside sor_read, because that runs in
-# `$( )` and the reader chains its cleanup onto THIS shell's EXIT.
+# source nothing. (The floor mode's packet is still stamped: its wrap
+# and step read the doors' directory, which infra/dev/wt-cargo names to
+# this one child — backlog ffd309c1.) HERE and not inside sor_read,
+# because that runs in `$( )` and the reader chains its cleanup onto
+# THIS shell's EXIT.
 #
 # Every way this can go wrong leaves MT_HDR empty and the pass exactly
 # as it was: no system of record named, no reader beside this checkout,
@@ -1729,11 +1986,19 @@ fi
 
 fast_forward_checkout
 install_tree_cli
+check_dev_control
 reclaim_gone_worktrees
 reclaim_work
 reclaim_stale_targets
 reclaim_scratch
 record_pass
+# The acknowledgements this pass's packet carried (read above, BEFORE the
+# packet, so one made since is not marked by a packet that never saw it).
+# shellcheck disable=SC2086 # names, word-split on purpose; --recorded skips any that is not one
+if [ "$PASS_RECORDED" = 1 ] && [ -n "$WATCH_ACKS" ]; then
+    bash "$MEMORY_WATCH_SCRIPT" --recorded $WATCH_ACKS \
+        || log "could not mark the memory watch's acknowledgements recorded — the next packet carries them again" >&2
+fi
 
 if [ "$problems" -gt 0 ]; then
     exit 1

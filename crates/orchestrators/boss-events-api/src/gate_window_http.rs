@@ -150,9 +150,12 @@ impl LiveTallies for LocalTallies {
         let all = self.required_services(gate);
         // A service the launcher did not start mounts no machine gate
         // and no actor-role report: the record excuses it from either
-        // window on the same checks. The generation rule is the machine
-        // gate's alone (`join_selected`): only its starts state a
-        // roster stamp, so an actor-role window names no generation.
+        // window on the same checks, and under the same generation rule
+        // (`join_selected`; backlog b13bd730): both gates' starts state
+        // the roster stamp, so either window's excuses hold only for
+        // hours watched under the selection that makes them. A gate
+        // added to this pattern is judged the same way, and reads
+        // never-clean until its starts state the stamp too.
         let (Gate::MachineGate | Gate::ActorRole, Some(record)) = (gate, &self.launch_record)
         else {
             return LaunchRoster::all_required(all);

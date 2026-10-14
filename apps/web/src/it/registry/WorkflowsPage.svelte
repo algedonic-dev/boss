@@ -234,10 +234,6 @@
   .wf-search {
     flex: 1 1 auto;
     max-width: 520px;
-    padding: 8px 10px;
-    font-size: 14px;
-    border: 1px solid var(--hairline);
-    border-radius: 6px;
   }
   .catalog :global(a.wf-new) {
     flex: 0 0 auto;

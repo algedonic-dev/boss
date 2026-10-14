@@ -100,6 +100,7 @@ type HandOnReserve = (Arc<InMemoryJobs>, StepId, &'static str);
 #[derive(Default)]
 struct HeldCalendar {
     held: Mutex<Vec<Reservation>>,
+    cancellations: Mutex<Vec<String>>,
     move_on_reserve: Mutex<Option<MoveOnReserve>>,
     claim_on_reserve: Mutex<Option<ClaimOnReserve>>,
     hand_on_reserve: Mutex<Option<HandOnReserve>>,
@@ -214,6 +215,10 @@ impl CalendarClient for HeldCalendar {
         reason_ref_id: &str,
         _actor: &str,
     ) -> Result<usize, CalendarClientError> {
+        self.cancellations
+            .lock()
+            .unwrap()
+            .push(reason_ref_id.into());
         let mut n = 0;
         for r in self.held.lock().unwrap().iter_mut().filter(|r| {
             r.cancelled_at.is_none()
@@ -309,6 +314,13 @@ fn build_app() -> (Router, Arc<InMemoryJobs>, Arc<HeldCalendar>) {
 fn build_app_with_agents(
     agents: Arc<dyn AgentsRegistry>,
 ) -> (Router, Arc<InMemoryJobs>, Arc<HeldCalendar>) {
+    build_app_with_spec(agents, spec())
+}
+
+fn build_app_with_spec(
+    agents: Arc<dyn AgentsRegistry>,
+    workflow: WorkflowSpec,
+) -> (Router, Arc<InMemoryJobs>, Arc<HeldCalendar>) {
     let jobs = Arc::new(InMemoryJobs::new());
     let calendar = Arc::new(HeldCalendar::default());
     let bus = RecordingEventBus::new();
@@ -318,11 +330,21 @@ fn build_app_with_agents(
             .allow("technician", Action::Update, Resource::step(), Scope::All)
             .allow("lead", Action::Update, Resource::step(), Scope::All)
             .allow("lead", Action::Update, Resource::step_assign(), Scope::All)
+            .allow("lead", Action::Close, Resource::job(), Scope::All)
+            .allow("lead", Action::Update, Resource::job(), Scope::All)
+            .allow("annotator", Action::Update, Resource::job(), Scope::All)
+            .allow("scoped-closer", Action::Update, Resource::job(), Scope::All)
+            .allow(
+                "scoped-closer",
+                Action::Close,
+                Resource::job(),
+                Scope::Self_,
+            )
             .allow("system", Action::Update, Resource::step(), Scope::All)
             .build(),
     );
     let kinds = Arc::new(InMemoryWorkflows::for_fixture());
-    kinds.seed(spec()).expect("seed the kind");
+    kinds.seed(workflow).expect("seed the kind");
     let state = JobsApiState {
         calendar: Some(calendar.clone() as Arc<dyn CalendarClient>),
         kind_registry: Some(kinds as Arc<dyn WorkflowRegistry>),
@@ -417,6 +439,137 @@ async fn claim(
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn a_protocol_withdrawal_terminal_releases_its_active_hold() {
+    let mut workflow = spec();
+    workflow.steps.push(StepSpec {
+        title: "withdrawn".into(),
+        kind: "outcome".into(),
+        ready_when: "job.metadata.withdrawn = \"true\"".into(),
+        terminal: Some(boss_jobs::registry::Terminal {
+            outcome: "withdrawn".into(),
+        }),
+        ..Default::default()
+    });
+    let (app, jobs, calendar) = build_app_with_spec(Arc::new(InMemoryAgents::new()), workflow);
+    let (mut job, step) = scheduled(&jobs, None, serde_json::json!({})).await;
+    let mut terminal = Step::new(job.id, "outcome", "Withdrawn", 2);
+    terminal.spec_slug = Some("withdrawn".into());
+    jobs.add_step(&terminal).await.unwrap();
+    let (status, body) = claim(&app, &job, &step, &user(TECH, "technician"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(calendar.live_for(&step.id.to_string()).len(), 1);
+    job.metadata = serde_json::json!({"withdrawn":"true"});
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/jobs/{}", job.id))
+                .header("content-type", "application/json")
+                .header(
+                    "x-boss-user",
+                    serde_json::to_string(&user(LEAD, "lead")).unwrap(),
+                )
+                .body(Body::from(serde_json::to_string(&job).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/jobs/{}/steps/{}", job.id, terminal.id))
+                .header("content-type", "application/json")
+                .header(
+                    "x-boss-user",
+                    serde_json::to_string(&user(LEAD, "lead")).unwrap(),
+                )
+                .body(Body::from("{\"status\":\"completed\"}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(status.is_success(), "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        jobs.get_job(&job.id).await.unwrap().unwrap().status,
+        JobStatus::Closed
+    );
+    assert!(calendar.live_for(&step.id.to_string()).is_empty());
+    assert_eq!(
+        jobs.get_step(&step.id).await.unwrap().unwrap().status,
+        StepStatus::Skipped
+    );
+}
+
+#[tokio::test]
+async fn withdrawing_a_packet_cancels_its_active_scheduling_hold() {
+    let (app, jobs, calendar) = build_app();
+    let (job, step) = scheduled(&jobs, None, serde_json::json!({})).await;
+    let (status, body) = claim(&app, &job, &step, &user(TECH, "technician"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(calendar.live_for(&step.id.to_string()).len(), 1);
+
+    // Completed work in the same packet keeps its actual reservation as
+    // history when the remaining scheduled work is abandoned.
+    let mut completed = step.clone();
+    completed.id = StepId::from_uuid(Uuid::new_v4());
+    completed.status = StepStatus::Completed;
+    completed.metadata = serde_json::json!({"evidence":"completed-before-withdrawal"});
+    jobs.add_step(&completed).await.unwrap();
+    let mut history = calendar.live_for(&step.id.to_string())[0].clone();
+    history.id = ReservationId::from_uuid(Uuid::new_v4());
+    history.reason_ref_id = completed.id.to_string();
+    calendar.held.lock().unwrap().push(history);
+
+    let mut withdrawn = job.clone();
+    withdrawn.status = JobStatus::Closed;
+    withdrawn.metadata = serde_json::json!({"outcome":"withdrawn"});
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/jobs/{}", job.id))
+                .header("content-type", "application/json")
+                .header(
+                    "x-boss-user",
+                    serde_json::to_string(&user("emp-lead", "lead")).unwrap(),
+                )
+                .body(Body::from(serde_json::to_string(&withdrawn).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        calendar.live_for(&step.id.to_string()).is_empty(),
+        "a withdrawn milestone must not keep its abandoned date held"
+    );
+    assert_eq!(calendar.live_for(&completed.id.to_string()).len(), 1);
+    assert_eq!(
+        jobs.get_step(&completed.id).await.unwrap().unwrap(),
+        completed
+    );
+    assert_eq!(
+        jobs.get_step(&step.id).await.unwrap().unwrap().status,
+        StepStatus::Skipped
+    );
 }
 
 #[tokio::test]
@@ -1209,6 +1362,10 @@ fn every_individual_executor_in_the_platform_bundle_is_an_automation() {
 #[test]
 fn only_the_claim_door_starts_a_step_and_reserves() {
     let src = include_str!("../src/http/steps.rs");
+    assert_claim_reservation_contract(src);
+}
+
+fn assert_claim_reservation_contract(src: &str) {
     let body_of = |name: &str| -> &str {
         let head = format!("async fn {name}<");
         let start = src.find(&head).unwrap_or_else(|| panic!("no fn {name}"));
@@ -1221,8 +1378,27 @@ fn only_the_claim_door_starts_a_step_and_reserves() {
         &rest[..end]
     };
     let claim = body_of("claim_step");
-    for call in ["start_hold(", "settle_start_hold("] {
-        assert!(claim.contains(call), "claim_step must call {call}");
+    assert!(
+        claim.contains("claim_step_with_selection("),
+        "the public claim door must delegate to the shared claim handler"
+    );
+    let claim = body_of("claim_step_with_selection");
+    for call in ["match start_hold(", "settle_start_hold("] {
+        assert!(
+            claim.contains(call),
+            "shared claim handler must call {call}"
+        );
+    }
+    for call in [
+        "context.native_authority.is_some()",
+        "if native_join {",
+        "if !native_join {",
+        ".claim_station_head_at(",
+    ] {
+        assert!(
+            claim.contains(call),
+            "shared claim handler must retain native owner dispatch: {call}"
+        );
     }
     let put = body_of("update_step");
     assert!(
@@ -1251,4 +1427,198 @@ fn only_the_claim_door_starts_a_step_and_reserves() {
         1,
         "the reservation is made in one place, the shared start"
     );
+}
+
+/// An active scheduling step and a distinct completed step with historical
+/// time: closing the packet abandons only the first (ec304ffe).
+async fn close_fixture() -> (
+    Router,
+    Arc<InMemoryJobs>,
+    Arc<HeldCalendar>,
+    Job,
+    Step,
+    Step,
+) {
+    let (app, jobs, calendar) = build_app();
+    let (job, step) = scheduled(&jobs, None, serde_json::json!({})).await;
+    let (status, body) = claim(&app, &job, &step, &user(TECH, "technician"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(calendar.live_for(&step.id.to_string()).len(), 1);
+    let mut completed = step.clone();
+    completed.id = StepId::from_uuid(Uuid::new_v4());
+    completed.status = StepStatus::Completed;
+    completed.metadata = serde_json::json!({"evidence":"completed-before-withdrawal"});
+    jobs.add_step(&completed).await.unwrap();
+    let mut history = calendar.live_for(&step.id.to_string())[0].clone();
+    history.id = ReservationId::from_uuid(Uuid::new_v4());
+    history.reason_ref_id = completed.id.to_string();
+    calendar.held.lock().unwrap().push(history);
+    (app, jobs, calendar, job, step, completed)
+}
+
+async fn put_job(app: &Router, job: &Job, actor: &User) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/jobs/{}", job.id))
+                .header("content-type", "application/json")
+                .header("x-boss-user", serde_json::to_string(actor).unwrap())
+                .body(Body::from(serde_json::to_string(job).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn assert_history(jobs: &InMemoryJobs, calendar: &HeldCalendar, completed: &Step) {
+    assert_eq!(calendar.live_for(&completed.id.to_string()).len(), 1);
+    assert_eq!(
+        &jobs.get_step(&completed.id).await.unwrap().unwrap(),
+        completed
+    );
+}
+
+fn skip_count(jobs: &InMemoryJobs, step: &Step) -> usize {
+    jobs.recorded_events()
+        .into_iter()
+        .filter(|e| {
+            e.kind == boss_jobs::events::STEP_UPDATED
+                && e.payload["step_id"] == step.id.to_string()
+                && e.payload["status"] == "skipped"
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn a_cancelled_packet_releases_its_active_hold() {
+    let (app, jobs, calendar, mut job, step, completed) = close_fixture().await;
+    job.status = JobStatus::Cancelled;
+    assert_eq!(
+        put_job(&app, &job, &user(LEAD, "lead")).await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(calendar.live_for(&step.id.to_string()).is_empty());
+    assert_history(&jobs, &calendar, &completed).await;
+    assert_eq!(
+        jobs.get_step(&step.id).await.unwrap().unwrap().status,
+        StepStatus::Skipped
+    );
+}
+
+#[tokio::test]
+async fn a_completion_winning_the_close_skip_keeps_its_hold() {
+    let (app, jobs, calendar, mut job, step, completed) = close_fixture().await;
+    job.status = JobStatus::Closed;
+    jobs.change_before_next_judged_write(&step.id, |row| {
+        row.status = StepStatus::Completed;
+        row.metadata["proof"] = serde_json::json!("racing-completion");
+    });
+    assert_eq!(
+        put_job(&app, &job, &user(LEAD, "lead")).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(calendar.live_for(&step.id.to_string()).len(), 1);
+    assert_history(&jobs, &calendar, &completed).await;
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(stored.status, StepStatus::Completed);
+    assert_eq!(stored.metadata["proof"], "racing-completion");
+    assert_eq!(skip_count(&jobs, &step), 0);
+    assert!(calendar.cancellations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_close_retry_after_a_transient_steps_read_finishes_cleanup() {
+    for status in [JobStatus::Closed, JobStatus::Cancelled] {
+        let (app, jobs, calendar, mut job, step, completed) = close_fixture().await;
+        job.status = status;
+        jobs.fail_steps_read(&job.id);
+        assert_eq!(
+            put_job(&app, &job, &user(LEAD, "lead")).await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(jobs.get_job(&job.id).await.unwrap().unwrap().status, status);
+        assert_eq!(
+            jobs.get_step(&step.id).await.unwrap().unwrap().status,
+            StepStatus::Active
+        );
+        assert_eq!(calendar.live_for(&step.id.to_string()).len(), 1);
+        jobs.restore_steps_read(&job.id);
+        assert_eq!(
+            put_job(&app, &job, &user(LEAD, "lead")).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(calendar.live_for(&step.id.to_string()).is_empty());
+        assert_eq!(
+            jobs.get_step(&step.id).await.unwrap().unwrap().status,
+            StepStatus::Skipped
+        );
+        assert_history(&jobs, &calendar, &completed).await;
+        assert_eq!(skip_count(&jobs, &step), 1);
+        assert_eq!(
+            put_job(&app, &job, &user(LEAD, "lead")).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(skip_count(&jobs, &step), 1);
+        assert_eq!(
+            calendar.cancellations.lock().unwrap().as_slice(),
+            &[step.id.to_string()]
+        );
+    }
+}
+
+async fn terminal_annotation_does_not_abandon(role: &str) {
+    let (app, jobs, calendar, mut job, step, completed) = close_fixture().await;
+    job.status = JobStatus::Closed;
+    jobs.fail_steps_read(&job.id);
+    assert_eq!(
+        put_job(&app, &job, &user(LEAD, "lead")).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    jobs.restore_steps_read(&job.id);
+    job.metadata["annotation"] = serde_json::json!("ordinary note");
+    assert_eq!(
+        put_job(&app, &job, &user("emp-annotator", role)).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        jobs.get_job(&job.id).await.unwrap().unwrap().metadata["annotation"],
+        "ordinary note"
+    );
+    assert_eq!(
+        jobs.get_step(&step.id).await.unwrap().unwrap().status,
+        StepStatus::Active
+    );
+    assert_eq!(calendar.live_for(&step.id.to_string()).len(), 1);
+    assert_eq!(skip_count(&jobs, &step), 0);
+    assert!(calendar.cancellations.lock().unwrap().is_empty());
+    assert_history(&jobs, &calendar, &completed).await;
+}
+
+#[tokio::test]
+async fn an_update_only_terminal_annotation_does_not_abandon_open_work() {
+    terminal_annotation_does_not_abandon("annotator").await;
+}
+
+#[tokio::test]
+async fn a_close_grant_outside_the_packet_scope_does_not_abandon_open_work() {
+    terminal_annotation_does_not_abandon("scoped-closer").await;
+}
+#[test]
+fn the_claim_reservation_pin_refuses_missing_delegation_hold_settlement_or_native_dispatch() {
+    let src = include_str!("../src/http/steps.rs");
+    for needle in [
+        "claim_step_with_selection(",
+        "match start_hold(",
+        "settle_start_hold(",
+        "context.native_authority.is_some()",
+        ".claim_station_head_at(",
+    ] {
+        let broken = src.replace(needle, "removed_claim_contract(");
+        assert!(
+            std::panic::catch_unwind(|| assert_claim_reservation_contract(&broken)).is_err(),
+            "the claim contract must notice removal of {needle}"
+        );
+    }
 }

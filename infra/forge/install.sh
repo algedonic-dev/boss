@@ -307,11 +307,43 @@ sor_require BOSS_JOBS_URL BOSS_FORGE_JOURNAL_URL
 # cannot (forge-converge-launch.sh says how). Renamed into place, so the
 # unit never starts half a file. BEFORE the gate below, which looks for
 # it; a copy that could not be made holds the units.
+#
+# REPLACED ONLY FROM A GENERATION THAT HAS MARKED ITSELF GOOD (review
+# 5f3736a2, F5; backlog 62b09c57). This copy was replaced from whichever
+# generation this file ran from — on the tick a train's generation was
+# FIRST fetched, before its converge had run once. The launcher is the
+# one piece of the converge with no fallback, because it is what picks
+# the fallback: one that does not run holds this host on itself, and the
+# fix on main never arrives. So the installed copy stays until the
+# generation offering a new one is the tree's `good` — its own converge,
+# started by the launcher already installed, completed a refresh — and a
+# copy that does not even parse is never installed, which reds the run.
+# With no launcher installed (the bootstrap, a rebuilt host) there is
+# nothing to keep, and the gate below holds the units if none was made.
+launcher_rc=0
 if [ "$tree_managed" -eq 1 ]; then
-    install -d -m 0755 -- "$TREE_LIBEXEC" \
+    launcher_at="$TREE_LIBEXEC/forge-converge-launch"
+    # No `good` that resolves is "none", by name, and keeps the installed
+    # launcher: an unreadable answer is never taken for this generation.
+    no_good=""
+    here_gen="$(cd "${HERE}/../.." && pwd -P)" || here_gen="${HERE}"
+    good_gen="$(cd "$TREE_ROOT/good" 2>/dev/null && pwd -P)" || no_good=1
+    [ -z "$no_good" ] || good_gen="none"
+    if ! parse_err="$(bash -n "${HERE}/forge-converge-launch.sh" 2>&1)"; then
+        launcher_rc=1
+        echo "install.sh: ${HERE}/forge-converge-launch.sh does not parse — NOT installed; $launcher_at stays as it is: $(printf '%s' "$parse_err" | tr '\n' ' ' | cut -c1-300)" >&2
+        run_summary_field launcher "REFUSED: ${here_gen##*/}'s launcher does not parse; the installed one stays"
+    elif [ -x "$launcher_at" ] && { [ -n "$no_good" ] || [ "$here_gen" != "$good_gen" ]; }; then
+        echo "install.sh: the launcher at $launcher_at stays — this generation (${here_gen##*/}) has not marked itself good yet, and the launcher is replaced only from one that has"
+        run_summary_field launcher "kept: ${here_gen##*/} has not marked itself good yet"
+    elif install -d -m 0755 -- "$TREE_LIBEXEC" \
         && install -m 0755 -- "${HERE}/forge-converge-launch.sh" "$TREE_LIBEXEC/.forge-converge-launch.new" \
-        && mv -f -- "$TREE_LIBEXEC/.forge-converge-launch.new" "$TREE_LIBEXEC/forge-converge-launch" \
-        || echo "install.sh: could not install $TREE_LIBEXEC/forge-converge-launch" >&2
+        && mv -f -- "$TREE_LIBEXEC/.forge-converge-launch.new" "$launcher_at"; then
+        run_summary_field launcher "installed from ${here_gen##*/}"
+    else
+        echo "install.sh: could not install $launcher_at" >&2
+        run_summary_field launcher "FAILED: could not install $launcher_at"
+    fi
 fi
 
 # NO UNIT IS INSTALLED WHOSE COMMAND IS NOT THERE (backlog a604a35b).
@@ -325,26 +357,45 @@ fi
 # point; this run goes red at its end and says which command was missing,
 # and the next tick asks again. The two roots are read through their
 # seams, so a test never looks in /var/lib or /usr/local.
+#
+# EVERY WORD, NOT THE FIRST (a follow-up of delta review aa901496,
+# recorded on car ad35743a; backlog 62b09c57). Only the command was read,
+# so `ExecStart=/bin/bash /var/lib/boss/tree/current/<script>` named
+# /bin/bash and passed with the script absent. A later word under one of
+# the roots below is judged too: it must be a FILE — an interpreter only
+# reads it, and a data file handed to one is not a command — while the
+# command itself must be an executable file, as before. Each line the
+# awk prints is `x <command>` or `f <later word>`.
 units_held=""
 if [ "$tree_managed" -eq 1 ]; then
     for u in "${UNITS[@]}"; do
         [ -f "${HERE}/${u}.service" ] || continue
-        while IFS= read -r cmd; do
+        while read -r need cmd; do
             case "$cmd" in
                 /var/lib/boss/tree/*) at="$TREE_ROOT/${cmd#/var/lib/boss/tree/}" ;;
                 /usr/local/libexec/boss/*) at="$TREE_LIBEXEC/${cmd#/usr/local/libexec/boss/}" ;;
-                # The two units still on the checkout (the cluster
-                # converge and the disk sweep; no_unattended_unit_
-                # runs_from_a_home.rs carries the roster and why).
-                /home/david/boss/*) at="${BOSS_FORGE_REPO_DIR:-/home/david/boss}/${cmd#/home/david/boss/}" ;;
                 /*) at="$cmd" ;;
                 *) continue ;;
             esac
-            [ -f "$at" ] && [ -x "$at" ] || units_held="$units_held ${u}.service:$cmd"
-        done < <(sed -n -E 's/^Exec(StartPre|Start|StartPost|Stop|StopPost)=[-@:+!]*([^[:space:]]+).*/\2/p' "${HERE}/${u}.service")
+            if [ "$need" = x ]; then
+                [ -f "$at" ] && [ -x "$at" ] || units_held="$units_held ${u}.service:$cmd"
+            else
+                [ -f "$at" ] || units_held="$units_held ${u}.service:$cmd"
+            fi
+        done < <(awk -v sq="'" '
+            match($0, /^Exec(StartPre|Start|StartPost|Stop|StopPost)=/) {
+                n = split(substr($0, RLENGTH + 1), w, /[ \t]+/)
+                first = 1
+                for (i = 1; i <= n; i++) {
+                    if (w[i] == "") continue
+                    if (first) { sub(/^[-@:+!]+/, "", w[i]); print "x " w[i]; first = 0; continue }
+                    gsub("^[\"" sq "]+|[\"" sq ";]+$", "", w[i])
+                    if (w[i] ~ /^\/(var\/lib\/boss\/tree|usr\/local\/libexec\/boss|home\/david\/boss)\//) print "f " w[i]
+                }
+            }' "${HERE}/${u}.service")
     done
     if [ -n "$units_held" ]; then
-        echo "install.sh: UNITS HELD — no unit file is replaced on this run, because a command a unit names is not an executable file:$units_held. Every unit keeps running as it is installed." >&2
+        echo "install.sh: UNITS HELD — no unit file is replaced on this run, because a command a unit names is not an executable file, or a tree file it hands one is not there:$units_held. Every unit keeps running as it is installed." >&2
         run_summary_field units_held "$(printf '%s' "$units_held" | cut -c1-900)"
     fi
 fi
@@ -554,19 +605,38 @@ done
 # red unit and a packet on the `failed` terminal, but not at the price of
 # leaving every timer below installed-and-not-enabled.
 #
-# THE RUNNER STILL EXECUTES THE CHECKOUT, AND THAT IS SAID HERE BECAUSE IT
-# IS THE ROAD THIS CAR LEAVES OPEN (backlog a604a35b, stage 2 of design
-# c98c79aa). The installer points the runner's ExecStart at the tree it
-# is itself run from, and run from root's tree that would move every verb
-# script there at once — while the publish, merge and tag verbs still
-# take "the repository I am in" to be a git checkout with a forge remote.
-# Separating where a verb's code runs from the checkout it works on is
-# that stage's car. Until it lands the runner is installed from the tree
-# (its unit pair) and pointed at the checkout (its ExecStart), by name.
+# FROM ROOT'S TREE, THE RUNNER EXECUTES ROOT'S TREE (backlog a604a35b,
+# stage 2 of design c98c79aa). Until this stage it executed the checkout,
+# /home/david/boss, every minute with every verb script — a tree its
+# owner can rewrite between one minute and the next, run as root on the
+# host holding the admin kubeconfig, the forge's tokens and the estate
+# machine token. Its ExecStart names root's tree by the `current` link,
+# the name every other unit here starts through: never this generation's
+# own directory, which a later refresh prunes once two newer ones stand.
+#
+# WHERE A VERB'S CODE RUNS IS NOT WHERE ITS GIT WORKS. Root's tree is an
+# export with no .git and no forge remote, and the verbs that tag, sweep
+# branches, or read the converged history take "the repository I am in"
+# to be a checkout. So the checkout is handed to them as a VALUE,
+# BOSS_OPS_CHECKOUT in the runner's drop-in, and each runs git there AS
+# THE CHECKOUT'S OWNER (its own as_owner), so root executes nothing from
+# it. no_unattended_unit_runs_from_a_home.rs holds every forge verb that
+# runs git in its tree to that variable. The publish and merge verbs
+# already named the checkout explicitly (publish-github-pr.sh's
+# BOSS_FORGE_CHECKOUT, read only for its remote's URL).
+#
+# Not from root's tree — a scratch run, or a host with no tree yet, whose
+# units are HELD — the runner runs from the tree this file is in, as
+# before, and the verbs work on it.
 ops_runner_rc=0
 ops_runner_repo=""
-[ "$in_tree" -eq 0 ] || ops_runner_repo="${BOSS_FORGE_REPO_DIR:-/home/david/boss}"
+ops_runner_checkout=""
+if [ "$in_tree" -eq 1 ]; then
+    ops_runner_repo="$TREE_ROOT/current"
+    ops_runner_checkout="${BOSS_FORGE_REPO_DIR:-/home/david/boss}"
+fi
 INSTALL_ETC="$ETC" INSTALL_SYSTEMCTL="$SYSTEMCTL" INSTALL_OPS_RUNNER_REPO="$ops_runner_repo" \
+    INSTALL_OPS_RUNNER_CHECKOUT="$ops_runner_checkout" \
     bash "${HERE}/../ops/install-ops-runner.sh" forge || ops_runner_rc=$?
 installed=$((installed + 1))
 
@@ -692,6 +762,12 @@ if [ -n "$units_held" ]; then
     echo "install.sh: the units were HELD (a command one names is not there:$units_held) — every unit runs as it was" >&2
     echo "    installed; everything else converged. The next tick asks again." >&2
     exit 1
+fi
+# The launcher, the same way: named above and on the packet (`launcher`).
+if [ "$launcher_rc" -ne 0 ]; then
+    echo "install.sh: the converge's launcher was NOT replaced — this generation's copy does not parse (above)." >&2
+    echo "    Every unit converged; the launcher already installed keeps choosing, and main carries the fix." >&2
+    exit "$launcher_rc"
 fi
 # The hold's prepare, the same way: its refusal is above, in its own words.
 if [ "$kit_reader_rc" -ne 0 ]; then

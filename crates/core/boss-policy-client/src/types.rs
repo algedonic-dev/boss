@@ -491,7 +491,7 @@ impl UserOverride {
 // User context passed into every policy check.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct User {
     pub id: String,
     pub role: String,

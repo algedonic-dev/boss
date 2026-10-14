@@ -986,6 +986,23 @@ impl InventoryRepository for PgInventory {
             .begin()
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        // Lock the header before reading the order's lines: an upsert
+        // also takes this row lock. The placement refusal and its events
+        // then share one transaction, rather than racing an HTTP read.
+        let previous: Option<String> =
+            sqlx::query_scalar("SELECT status FROM purchase_orders WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        let previous = previous.ok_or_else(|| InventoryError::NotFound(id.to_string()))?;
+        if !PoStatus::new(previous).is_placed() && PoStatus::new(status).is_placed() {
+            let po = Self::fetch_po_in_tx(&mut tx, id)
+                .await?
+                .ok_or_else(|| InventoryError::NotFound(id.to_string()))?;
+            po.validate_ordinary_costs()
+                .map_err(InventoryError::Invalid)?;
+        }
         let result = sqlx::query("UPDATE purchase_orders SET status = $1 WHERE id = $2")
             .bind(status)
             .bind(id)

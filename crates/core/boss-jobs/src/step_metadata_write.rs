@@ -102,11 +102,23 @@ pub fn is_step_race(body: &Value) -> bool {
 /// believes ([`crate::written_by`], backlog aa816dd4). A writer that
 /// could delete it could then write the record it guards, so it is
 /// frozen as the protocol materialised it.
+///
+/// `records_before_claim` lists the records a step's starter writes
+/// before anyone holds it ([`crate::records_before_claim`], backlog
+/// e6b05dd6). A writer that could delete it could then write such a
+/// record after the claim, so it is frozen the same way. Its companion
+/// `records_before_claim_closed_at` is written by the claim CAS alone,
+/// the first time the step is claimed: a writer that could delete it
+/// could reopen the step to those records after a release (re-review
+/// 211cbae4 B1), and one that could add it could close them on a step
+/// nobody claimed.
 pub const PROTOCOL_KEYS: &[&str] = &[
     "outcome_kind",
     "audience",
     crate::written_by::KEY,
     crate::credential_executor::KEY,
+    crate::records_before_claim::KEY,
+    crate::records_before_claim::CLAIMED_KEY,
 ];
 
 /// The hint a refused protocol key carries, on both doors.

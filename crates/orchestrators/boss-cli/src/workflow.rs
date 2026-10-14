@@ -5,6 +5,10 @@
 //! platform bundle itself (`infra/platform/workflows`): the `kind` row
 //! is read with the platform seed's own loader, so the row a fresh
 //! database seeds and the row a live one publishes are one definition.
+//! The owning team is the tenant's when a `tenant.toml` around the
+//! bundle names one, else the one the kind's row declares (every
+//! platform kind file says `platform`), else the live row's (backlog
+//! 6645addc; review 679220b5).
 //!
 //! WHY THIS IS A VERB. Publishing was a hand-assembled sequence, done
 //! three times in one day for ship-a-change v20/v21/v22 and again for
@@ -133,7 +137,7 @@ fn carry_forward(spec: &mut Value, active: Option<&Value>) {
         obj.insert("version".into(), Value::from(1));
     }
     if let Some(a) = active {
-        for k in ["created_at", "authoring_job_id"] {
+        for k in ["created_at", "authoring_job_id", "owning_team"] {
             if !obj.contains_key(k)
                 && let Some(v) = a.get(k)
             {
@@ -141,6 +145,10 @@ fn carry_forward(spec: &mut Value, active: Option<&Value>) {
             }
         }
     }
+    // A new kind with no team named anywhere is the platform's, as
+    // `WorkflowSpec::platform_seed` says.
+    obj.entry("owning_team")
+        .or_insert_with(|| Value::String("platform".into()));
 }
 
 fn titles(spec: &Value) -> Vec<String> {
@@ -157,8 +165,8 @@ fn titles(spec: &Value) -> Vec<String> {
 /// Discard a draft version, then confirm it is GONE by reading the
 /// version list back — a 204 is a claim; the read-back is the fact.
 pub async fn discard(kind: &str, version: i32) -> Result<()> {
-    let http = crate::gate::machine_client()?;
-    crate::gate::api(
+    let http = crate::sor_client::machine_client()?;
+    crate::sor_client::api(
         &http,
         reqwest::Method::DELETE,
         &format!("/api/workflows/{kind}/versions/{version}"),
@@ -166,7 +174,7 @@ pub async fn discard(kind: &str, version: i32) -> Result<()> {
     )
     .await?;
     let versions = crate::train::rows(
-        crate::gate::api(
+        crate::sor_client::api(
             &http,
             reqwest::Method::GET,
             &format!("/api/workflows/{kind}/versions"),
@@ -216,15 +224,124 @@ pub(crate) fn spec_from_bundle(
 /// (CLAUDE.md §9a). The platform bundle is a directory of kind files,
 /// so `infra/platform/workflows` and
 /// `infra/platform/workflows/<kind>.toml` both name the same row.
+///
+/// Two of the loader's columns are its own stamps, not the file's
+/// claims, and are dropped so the live row's values carry forward:
+/// `authoring_job_id`, which a bundle never holds, and `owning_team`
+/// when neither a tenant manifest around the bundle nor the kind's own
+/// row names one (backlog 6645addc — both rode a tenant row as
+/// `platform`/null on 2026-10-09). A platform kind file's
+/// `owning_team = "platform"` is a claim, and it is sent (review
+/// 679220b5 F1): the loader refuses any other value there, so what the
+/// row says is what the stamp said.
 fn load_spec(kind: &str, path: &std::path::Path) -> Result<Value> {
     if path.is_dir() || path.extension().and_then(|e| e.to_str()) == Some("toml") {
-        let specs = boss_jobs::seed_loader::load_workflows(path)
-            .with_context(|| format!("reading the bundle {}", path.display()))?;
-        return spec_from_bundle(kind, &specs);
+        let owner = bundle_owner(path)?;
+        let specs = boss_jobs::seed_loader::load_workflows_with_owning_team(
+            path,
+            owner.as_deref().unwrap_or("platform"),
+        )
+        .with_context(|| format!("reading the bundle {}", path.display()))?;
+        let mut spec = spec_from_bundle(kind, &specs)?;
+        let declared = owner.is_some() || declares_owning_team(kind, path)?;
+        if let Some(obj) = spec.as_object_mut() {
+            obj.remove("authoring_job_id");
+            if !declared {
+                obj.remove("owning_team");
+            }
+        }
+        return Ok(spec);
     }
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading the spec {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("{} is not JSON", path.display()))
+}
+
+/// The team that owns a bundle's rows, read off the tenant around it:
+/// the nearest ancestor of `path` carrying a `tenant.toml` (or
+/// `seeds/tenant.toml`), whose `[meta] tenant_id` is what `boss tenant
+/// check` stamps a tenant's workflows with. `None` for the platform
+/// bundle, and for a slice cut out of its tenant into a scratch file,
+/// which then takes the live row's owner (`carry_forward`). A manifest
+/// that names no tenant refuses: read as "none", a new tenant kind went
+/// out as the platform's with nothing said (review 679220b5 F2).
+fn bundle_owner(path: &std::path::Path) -> Result<Option<String>> {
+    let Ok(full) = path.canonicalize() else {
+        return Ok(None);
+    };
+    let Some((dir, manifest)) = full
+        .ancestors()
+        .find_map(|d| crate::tenant::manifest_of(d).map(|m| (d.to_path_buf(), m)))
+    else {
+        return Ok(None);
+    };
+    crate::tenant::declared_tenant_id(&dir)
+        .map(Some)
+        .with_context(|| {
+            format!(
+                "{} is the tenant manifest around this bundle and names no `[meta] tenant_id` \
+                 (unreadable, not TOML, or empty) — the bundle's owning team cannot be read, so \
+                 nothing was published. Fix the manifest, or publish a JSON spec that names \
+                 `owning_team`.",
+                manifest.display()
+            )
+        })
+}
+
+/// Does `kind`'s own row in the bundle at `path` say `owning_team`?
+/// Read off the file, because the loader's column is stamped either
+/// way: the platform bundle's kind files say it, a tenant's rows do not.
+/// A directory's row is `<dir>/<kind>.toml`, the loader's own rule.
+fn declares_owning_team(kind: &str, path: &std::path::Path) -> Result<bool> {
+    let file = if path.is_dir() {
+        path.join(format!("{kind}.toml"))
+    } else {
+        path.to_path_buf()
+    };
+    let raw = std::fs::read_to_string(&file)
+        .with_context(|| format!("reading {} for its owning_team", file.display()))?;
+    let doc: toml::Value =
+        toml::from_str(&raw).with_context(|| format!("{} is not TOML", file.display()))?;
+    Ok(doc
+        .get("workflow")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|w| w.get("kind").and_then(toml::Value::as_str) == Some(kind))
+        .any(|w| w.get("owning_team").is_some()))
+}
+
+/// The live row `publish` builds on, out of the read of
+/// `GET /api/workflows/{kind}`. A 404 is a new kind and answers `None`;
+/// any other failure REFUSES (review 679220b5 F3). Read as "new kind",
+/// a failed read sent the bundle's owner and no authoring job — the
+/// live row is where both come from, so guessing it absent is the
+/// 2026-10-09 mis-owning again by another road.
+pub(crate) fn active_row(kind: &str, read: Result<Option<Value>>) -> Result<Option<Value>> {
+    let what = format!("GET /api/workflows/{kind}");
+    match read {
+        Ok(body) => workflow_row(body.unwrap_or(Value::Null), &what).map(Some),
+        Err(e) if format!("{e:#}").contains("-> 404 Not Found") => Ok(None),
+        Err(e) => Err(e.context(format!(
+            "{what} failed, so whether {kind} has a live row — the owner and authoring job a \
+             publish carries forward — is unknown; nothing was published"
+        ))),
+    }
+}
+
+/// A publish that sends a different owning team than the live row
+/// carries MOVES the kind between teams, which the drift lint reads as
+/// a different author. Said, not refused: publishing from JSON naming
+/// the team is how a mis-owned row is repaired (v3 of close-a-period).
+pub(crate) fn owner_move_line(kind: &str, spec: &Value, active: Option<&Value>) -> Option<String> {
+    let live = active?.get("owning_team")?.as_str()?;
+    let sent = spec.get("owning_team")?.as_str()?;
+    (live != sent).then(|| {
+        format!(
+            "boss workflow: {kind} CHANGES OWNER — the live row's owning_team is `{live}`, this \
+             publish sends `{sent}`"
+        )
+    })
 }
 
 /// What the tree says about holding `kind` out of the unattended drift
@@ -365,25 +482,27 @@ pub(crate) fn drift_hold_lines(kind: &str, hold: Option<&DriftHold>) -> Vec<Stri
 }
 
 pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let mut spec = load_spec(kind, path)?;
     let hold = read_drift_hold(kind, path);
 
     // The active row, for the fields a draft needs and for the
-    // before/after comparison. A failed read is still "no active row"
-    // (a new kind answers 404), but a 200 that is not a row refuses.
-    let active = crate::gate::api(
-        &http,
-        reqwest::Method::GET,
-        &format!("/api/workflows/{kind}"),
-        None,
-    )
-    .await
-    .ok()
-    .flatten()
-    .map(|v| workflow_row(v, &format!("GET /api/workflows/{kind}")))
-    .transpose()?;
+    // before/after comparison. A new kind answers 404; any other failed
+    // read, and a 200 that is not a row, refuses (`active_row`).
+    let active = active_row(
+        kind,
+        crate::sor_client::api(
+            &http,
+            reqwest::Method::GET,
+            &format!("/api/workflows/{kind}"),
+            None,
+        )
+        .await,
+    )?;
     carry_forward(&mut spec, active.as_ref());
+    if let Some(line) = owner_move_line(kind, &spec, active.as_ref()) {
+        println!("{line}");
+    }
     let want_titles = titles(&spec);
     if want_titles.is_empty() {
         bail!("that spec declares no steps — refusing to publish a protocol with no work in it");
@@ -391,7 +510,7 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
 
     // REFUSE INTO A DIRTY REGISTRY, before writing anything.
     let versions = crate::train::rows(
-        crate::gate::api(
+        crate::sor_client::api(
             &http,
             reqwest::Method::GET,
             &format!("/api/workflows/{kind}/versions"),
@@ -410,7 +529,7 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
     }
 
     // Lint before persisting — the same check the publish path enforces.
-    let verdict = crate::gate::api(
+    let verdict = crate::sor_client::api(
         &http,
         reqwest::Method::POST,
         "/api/workflows/_validate",
@@ -441,7 +560,7 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
 
     // Create the draft, and CHECK IT LANDED. A failed create leaves the
     // publish armed against something else, which is the whole defect.
-    let created = crate::gate::api(
+    let created = crate::sor_client::api(
         &http,
         reqwest::Method::PUT,
         &format!("/api/workflows/{kind}"),
@@ -458,7 +577,7 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
         as i32;
     println!("boss workflow: draft v{draft_version} created — verified, not assumed");
 
-    crate::gate::api(
+    crate::sor_client::api(
         &http,
         reqwest::Method::POST,
         &format!("/api/workflows/{kind}/publish"),
@@ -467,7 +586,7 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
     .await?;
 
     // Read back what actually went live.
-    let now_active = crate::gate::api(
+    let now_active = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         &format!("/api/workflows/{kind}"),
@@ -806,6 +925,241 @@ terminal = {{ outcome = "completed" }}
             e.contains("liar.toml") && e.contains("expected kind `liar`"),
             "a file named for a kind it does not hold is refused by name: {e}"
         );
+    }
+
+    /// Backlog 6645addc, measured 2026-10-09T17:16Z: `boss workflow
+    /// publish close-a-period <a slice of the tenant's workflows.toml>`
+    /// put v2 live with owning_team `platform` (the live row said
+    /// `algedonic`) and authoring_job_id null (the live row named
+    /// aed7f81b), because the loader stamps `platform` on every row it
+    /// reads and renders a null authoring job, and `carry_forward` fills
+    /// only keys that are ABSENT. The pre-flight lint
+    /// the-live-protocols-are-the-authored-protocols read red for 82 s
+    /// until v3 went up from JSON. The body the draft PUT sends is
+    /// checked here for both facets, in the two shapes a tenant row is
+    /// published from: its tenant's checkout, and a slice cut out of it.
+    #[test]
+    fn a_tenant_bundle_publishes_under_its_owner_and_keeps_its_authoring_job() {
+        let row = r#"[[workflow]]
+kind = "close-a-period"
+label = "Close a period"
+category = "finance"
+subject_kinds = ["custom"]
+[[workflow.step]]
+title = "opened"
+kind = "trigger"
+ready_when = "true"
+[[workflow.step]]
+title = "done"
+kind = "outcome"
+ready_when = "steps.opened.done"
+terminal = { outcome = "completed" }
+"#;
+        let root = boss_testing::scratch_dir("workflow-publish-tenant-owner");
+        let tenant = root.join("acme");
+        std::fs::create_dir_all(tenant.join("seeds")).unwrap();
+        std::fs::create_dir_all(root.join("slice")).unwrap();
+        boss_testing::write_file(
+            &tenant.join("tenant.toml"),
+            "[meta]\ntenant_id = \"acme\"\n",
+        );
+        let in_checkout = tenant.join("seeds/workflows.toml");
+        let slice = root.join("slice/close-a-period.toml");
+        boss_testing::write_file(&in_checkout, row);
+        boss_testing::write_file(&slice, row);
+
+        let authored = "aed7f81b-4022-4e6e-83ad-051f5648a220";
+        let active = json!({
+            "kind": "close-a-period", "version": 1, "status": "active",
+            "owning_team": "acme", "authoring_job_id": authored,
+            "created_at": "2026-10-01T00:00:00Z",
+        });
+        // The body the draft PUT sends, built as `publish` builds it.
+        let draft_body = |path: &std::path::Path, active: Option<&Value>| {
+            let mut spec = load_spec("close-a-period", path).unwrap();
+            carry_forward(&mut spec, active);
+            spec
+        };
+        for path in [&in_checkout, &slice] {
+            let body = draft_body(path, Some(&active));
+            assert_eq!(
+                owner_move_line("close-a-period", &body, Some(&active)),
+                None
+            );
+            let sent: boss_jobs::registry::WorkflowSpec = serde_json::from_value(body)
+                .expect("the draft body is a WorkflowSpec, as the PUT reads it");
+            assert_eq!(sent.owning_team, "acme", "{}", path.display());
+            assert_eq!(
+                sent.authoring_job_id.map(|u| u.to_string()).as_deref(),
+                Some(authored),
+                "{}",
+                path.display()
+            );
+        }
+
+        // A NEW kind has no live row to carry: its tenant's checkout
+        // names the owner, and a bare slice is the platform's.
+        let new_kind = |path: &std::path::Path| {
+            serde_json::from_value::<boss_jobs::registry::WorkflowSpec>(draft_body(path, None))
+                .unwrap()
+        };
+        let fresh = new_kind(&in_checkout);
+        assert_eq!(
+            (fresh.owning_team.as_str(), fresh.authoring_job_id),
+            ("acme", None)
+        );
+        let fresh = new_kind(&slice);
+        assert_eq!(
+            (fresh.owning_team.as_str(), fresh.authoring_job_id),
+            ("platform", None)
+        );
+
+        // A checkout that names a DIFFERENT team than the live row moves
+        // the kind, and the verb says so rather than doing it quietly.
+        let other = json!({"kind": "close-a-period", "version": 1, "owning_team": "platform"});
+        let body = draft_body(&in_checkout, Some(&other));
+        let said = owner_move_line("close-a-period", &body, Some(&other)).expect("a move is said");
+        assert!(
+            said.contains("`platform`") && said.contains("`acme`"),
+            "{said}"
+        );
+    }
+
+    /// Review 679220b5, F1. The platform bundle's kind files each SAY
+    /// `owning_team = "platform"` (all 69 on 2026-10-10), and that line
+    /// is the tree's claim about who authors the kind. Dropping the
+    /// loader's column whenever no tenant manifest is around threw that
+    /// claim away with the stamp, so a platform kind mis-owned by a JSON
+    /// publish stayed mis-owned through every bundle publish (the drift
+    /// publish included), and nothing said so, because sent equalled
+    /// live. A kind file that declares its owner sends it, and a move
+    /// away from the live row's owner is said.
+    #[test]
+    fn a_platform_kind_file_sends_the_owner_it_declares_over_a_mis_owned_live_row() {
+        let root = boss_testing::scratch_dir("workflow-publish-platform-owner");
+        let bundle = root.join("infra/platform/workflows");
+        std::fs::create_dir_all(&bundle).unwrap();
+        boss_testing::write_file(
+            &bundle.join("backlog-item.toml"),
+            r#"[[workflow]]
+kind = "backlog-item"
+label = "Backlog item"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+[[workflow.step]]
+title = "opened"
+kind = "trigger"
+ready_when = "true"
+[[workflow.step]]
+title = "done"
+kind = "outcome"
+ready_when = "steps.opened.done"
+terminal = { outcome = "completed" }
+"#,
+        );
+        let mis_owned = json!({
+            "kind": "backlog-item", "version": 4, "status": "active",
+            "owning_team": "acme", "authoring_job_id": "aed7f81b-4022-4e6e-83ad-051f5648a220",
+        });
+        for path in [bundle.clone(), bundle.join("backlog-item.toml")] {
+            let mut body = load_spec("backlog-item", &path).unwrap();
+            carry_forward(&mut body, Some(&mis_owned));
+            assert_eq!(body["owning_team"], json!("platform"), "{}", path.display());
+            let said = owner_move_line("backlog-item", &body, Some(&mis_owned))
+                .unwrap_or_else(|| panic!("the move back to platform is said: {}", path.display()));
+            assert!(
+                said.contains("`acme`") && said.contains("`platform`"),
+                "{said}"
+            );
+            // The authoring job is still the live row's: the file never names one.
+            assert_eq!(
+                body["authoring_job_id"],
+                json!("aed7f81b-4022-4e6e-83ad-051f5648a220")
+            );
+        }
+        // And the tree's own bundle, as publish-drift sends it.
+        let real = boss_testing::repo_root().join("infra/platform/workflows");
+        let mut body = load_spec("backlog-item", &real).unwrap();
+        carry_forward(&mut body, Some(&mis_owned));
+        assert_eq!(body["owning_team"], json!("platform"));
+    }
+
+    /// Review 679220b5, F3. The live row is where the owner and the
+    /// authoring job come from, so only a 404 reads as "a new kind": a
+    /// refused, dark or garbled read refuses the publish rather than
+    /// sending the bundle's guess with no authoring job.
+    #[test]
+    fn only_a_404_reads_as_a_new_kind() {
+        let row = json!({"kind": "close-a-period", "version": 2, "owning_team": "acme"});
+        assert_eq!(
+            active_row("close-a-period", Ok(Some(row.clone()))).unwrap(),
+            Some(row)
+        );
+        let absent = anyhow::anyhow!(
+            "jobs api GET /api/workflows/close-a-period -> 404 Not Found: no such workflow kind"
+        );
+        assert_eq!(active_row("close-a-period", Err(absent)).unwrap(), None);
+        for failed in [
+            "jobs api GET /api/workflows/close-a-period -> 403 Forbidden: denied",
+            "jobs api GET /api/workflows/close-a-period -> 503 Service Unavailable: registry",
+            "jobs api GET /api/workflows/close-a-period: connection refused",
+        ] {
+            let e = format!(
+                "{:#}",
+                active_row("close-a-period", Err(anyhow::anyhow!(failed)))
+                    .expect_err("a failed read is not a new kind")
+            );
+            assert!(
+                e.contains("nothing was published") && e.contains(failed),
+                "the refusal keeps what the read said: {e}"
+            );
+        }
+        // A 2xx with no body, or a body that is no row, is no row.
+        assert!(active_row("close-a-period", Ok(None)).is_err());
+        assert!(active_row("close-a-period", Ok(Some(json!({"error": "x"})))).is_err());
+    }
+
+    /// Review 679220b5, F2. A tenant manifest around the bundle that
+    /// names no readable `[meta] tenant_id` is a broken tenant, not the
+    /// absence of one: read as "no tenant", a NEW tenant kind went out
+    /// stamped `platform` with nothing said. It refuses, naming the file.
+    #[test]
+    fn a_tenant_manifest_that_names_no_tenant_refuses_the_publish() {
+        let root = boss_testing::scratch_dir("workflow-publish-broken-tenant");
+        let tenant = root.join("acme");
+        std::fs::create_dir_all(tenant.join("seeds")).unwrap();
+        let rows = tenant.join("seeds/workflows.toml");
+        boss_testing::write_file(
+            &rows,
+            r#"[[workflow]]
+kind = "close-a-period"
+label = "Close a period"
+category = "finance"
+subject_kinds = ["custom"]
+[[workflow.step]]
+title = "opened"
+kind = "trigger"
+ready_when = "true"
+[[workflow.step]]
+title = "done"
+kind = "outcome"
+ready_when = "steps.opened.done"
+terminal = { outcome = "completed" }
+"#,
+        );
+        for manifest in ["", "[meta]\n", "[meta]\ntenant_id = \"  \"\n", "not toml ["] {
+            boss_testing::write_file(&tenant.join("tenant.toml"), manifest);
+            let e = format!(
+                "{:#}",
+                load_spec("close-a-period", &rows)
+                    .expect_err(&format!("a manifest reading {manifest:?} names no tenant"))
+            );
+            assert!(
+                e.contains("tenant.toml") && e.contains("tenant_id"),
+                "the refusal names the manifest and what it lacks: {e}"
+            );
+        }
     }
 
     /// CONFIRMATION COMPARES THE STEPS, NOT JUST THE NUMBER. v16 was a

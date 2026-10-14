@@ -105,14 +105,16 @@ async fn main() -> Result<()> {
         std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people")),
         boss_policy_client::User::service("content"),
     )?);
-    let wiring = content_role_wiring(
-        policy,
+    let authoritative: Arc<dyn boss_policy_client::PolicyClient> =
         Arc::new(boss_policy_client::ReqwestPolicyClient::new(
             "content",
             cfg.policy_api_url.clone().unwrap_or_else(|| {
                 std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy"))
             }),
-        )),
+        ));
+    let wiring = content_role_wiring(
+        policy,
+        authoritative.clone(),
         roles.clone(),
         mode.clone(),
         boss_events::role_tally::durable("content", mode.clone(), Some(&pool)),
@@ -129,7 +131,15 @@ async fn main() -> Result<()> {
         publisher: publisher.clone(),
         clock: clock.clone(),
     };
-    let mut app = content_router(state).merge(wiring.inventory);
+    let mut app = content_router(state).merge(wiring.inventory).merge(
+        boss_content::manual_baseline_http::router(
+            boss_content::manual_baseline_http::BaselineApiState {
+                repo: Arc::new(PgContent::new(pool.clone())),
+                policy: authoritative,
+                publisher: publisher.clone(),
+            },
+        ),
+    );
 
     // File-references surface — mounted only when the config wires
     // a bucket. Keeps the binary boot path simple for deployments

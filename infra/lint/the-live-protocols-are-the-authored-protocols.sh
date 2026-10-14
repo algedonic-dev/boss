@@ -1142,9 +1142,11 @@ PY
     #    834ddb7c (lib/sor-read.sh), so this child — which runs on every
     #    invocation, the gate's included — asks for no wait at all:
     #    without the zero it would sit a full window on a port that is
-    #    refused by design.
+    #    refused by design. And it is handed no read: a launcher's
+    #    hand-over (lib/sor-read.sh, backlog 44b2087e) is for the parent's
+    #    URL, and this child must meet the refused connect itself.
     if [ -z "${BOSS_LINT_SELFTEST_CHILD:-}" ]; then
-        out=$(BOSS_LINT_SELFTEST_CHILD=1 BOSS_SOR_WAIT_SECONDS=0 BOSS_JOBS_URL="http://[::1]:9" bash "$0" --require-live 2>&1); rc=$?
+        out=$(BOSS_LINT_SELFTEST_CHILD=1 BOSS_SOR_WAIT_SECONDS=0 BOSS_LINT_SOR_HANDED_URL= BOSS_JOBS_URL="http://[::1]:9" bash "$0" --require-live 2>&1); rc=$?
         [ "$rc" -eq 75 ] || { echo "self-test FAILED: --require-live against an unreachable registry exited $rc, expected 75: $out" >&2; rm -rf "$t"; return 1; }
         grep -qF "SKIPPED the live comparison" <<< "$out" \
             || { echo "self-test FAILED: the skip is not loud: $out" >&2; rm -rf "$t"; return 1; }

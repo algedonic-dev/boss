@@ -21,6 +21,14 @@ ignore = [
     # over a JWT it authors itself — no attacker-chosen input), about a
     # hundred times a day, on the dispatcher's clock and on rotation
     # packets, off any request path an outsider can drive or time.
+    # boss-jobs uses it too, and THAT use is on a request path: the
+    # broker-stage door (design 6e28ed42, on since backlog 25fff647)
+    # VERIFIES an RS256 token the caller presents, on any jobs API
+    # request carrying x-boss-broker-stage-token (review F7 corrected
+    # the line that said "off any request path"). Why the advisory
+    # still does not reach it: verification is a PUBLIC-key operation
+    # over the cluster issuer's published key; there is no private key
+    # in that process for a timing side channel to recover.
     # Revisit when: RustCrypto `rsa` ships a release with constant-time
     # private-key operations (the 0.10 line; the advisory's own fix
     # note) — then take it and drop this ignore — or the moment any

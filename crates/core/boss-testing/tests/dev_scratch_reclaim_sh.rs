@@ -14,7 +14,7 @@
 //! is an AGE problem, so the pass below runs on age regardless of free
 //! space. Driven as a real script against a fixture scratch mount.
 
-use boss_testing::repo_root;
+use boss_testing::{repo_root, without_proxy};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -167,7 +167,7 @@ fn stub_git(root: &Path) -> PathBuf {
     let bin = root.join("bin");
     boss_testing::create_dir(&bin);
     let real = String::from_utf8(
-        Command::new("bash")
+        without_proxy(&mut Command::new("bash"))
             .args(["-c", "command -v git"])
             .output()
             .expect("locate git")
@@ -212,6 +212,7 @@ fn run_with(scratch: &Path, args: &[&str], extra: &[(&str, &str)]) -> Output {
     stub_df(&bin);
     let installer = stub_installer(scratch);
     let mut cmd = Command::new("bash");
+    without_proxy(&mut cmd);
     cmd.arg(repo_root().join("infra/cluster/dev-scratch-reclaim.sh"))
         .args(args)
         // The CLI leg goes to the stub installer below, never to the
@@ -1187,6 +1188,135 @@ fn a_process_table_that_is_not_the_pods_judges_no_lock() {
     );
 }
 
+/// A LOCK THAT NAMES NO OWNER (backlog f66227aa). `git worktree add
+/// --lock` with no `--reason` writes git's own sentence, `added with
+/// --lock`, and nothing else: no process, no person, no run. Measured
+/// 2026-10-09 20:14Z on the pod: 139 of 315 worktrees carried exactly
+/// that lock — 75 under /work/wt, every one idle 98h to 185h, 73 clean —
+/// while /work sat at 11 GB free against its 18 GB floor and the pass
+/// kept every one of them as "a human's" lock, so it removed nothing and
+/// the gate's pre-flight refused every builder. A lock with no owner
+/// cannot be judged by an owner, so it is judged by the tree: every guard
+/// an unlocked tree passes — an origin/ ref keeps it, a dirty tree keeps
+/// it, `git worktree remove` without --force — and NEVER sooner than the
+/// 48h unpushed window, whatever the branch or the floor says, because
+/// the live window under the floor is 30 minutes and a live owner may sit
+/// that long in a clean tree. It reads no process table, so a view that
+/// is not the pod's changes nothing. A lock with ANY other text,
+/// including an empty one (`git worktree lock` with no reason, an act
+/// someone took after the add), is still somebody's, and kept.
+#[test]
+fn a_lock_that_names_no_owner_is_judged_by_the_tree_behind_the_unpushed_window() {
+    let root = boss_testing::scratch_dir("boss-dsr-ownerless-lock");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+
+    // git's own text, read from git rather than typed: a tree added with
+    // --lock and no reason, minutes old — which also stands as the FRESH
+    // case, inside every window.
+    let fresh = root.join("work").join("wt").join("agent-ownerless-fresh");
+    git(
+        &yard.repo,
+        0,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--lock",
+            "--detach",
+            fresh.to_str().expect("utf8"),
+            "main",
+        ],
+    );
+    let listed = git(&yard.repo, 0, &["worktree", "list", "--porcelain"]);
+    let git_text = listed
+        .split("\n\n")
+        .find(|b| b.contains(fresh.to_str().expect("utf8")))
+        .and_then(|b| b.lines().find_map(|l| l.strip_prefix("locked ")))
+        .unwrap_or_else(|| panic!("git names a reason for an add --lock\n{listed}"))
+        .to_string();
+
+    // Unpushed and idle 60h against the 48h window: with no lock it goes,
+    // and its lock names nobody, so it goes.
+    let old = yard.worktree("agent-ownerless-old", Some("feat/ownerless-old"), 60);
+    harness_lock(&yard, &old, &git_text);
+    // LANDED and idle 2h, under the floor: unlocked, the 30-minute live
+    // window would take it (under_the_work_floor_a_landed_worktree_waits_
+    // only_the_live_window); a lock with no owner waits the 48h.
+    let landed = yard.worktree("agent-ownerless-landed", Some("feat/ownerless-landed"), 2);
+    yard.land("feat/ownerless-landed");
+    harness_lock(&yard, &landed, &git_text);
+    // Due, but dirty: kept, and keeps its lock.
+    let dirty_tree = yard.worktree("agent-ownerless-dirty", Some("feat/ownerless-dirty"), 60);
+    dirty(&dirty_tree, 60);
+    harness_lock(&yard, &dirty_tree, &git_text);
+    // An EMPTY reason is a lock someone placed after the add: kept.
+    let quiet = yard.worktree("agent-empty-reason", Some("feat/empty-reason"), 60);
+    git(
+        &yard.repo,
+        0,
+        &["worktree", "lock", quiet.to_str().expect("utf8")],
+    );
+    // Not the pod's process table: pid locks go unjudged, and this
+    // judgement never asked it.
+    let proc_root = fake_proc(&root, "sh", &[]);
+
+    let out = run(
+        &root,
+        &[
+            ("STUB_DF_WORK_GB", &under_the_work_floor()),
+            ("PROC_ROOT", proc_root.to_str().expect("utf8")),
+        ],
+    );
+    let text = say(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !old.exists(),
+        "a lock reading only {git_text:?} names no owner: the clean, unpushed tree idle 60h is judged and goes\n{text}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("agent-ownerless-old") && l.contains("names no owner")),
+        "the removal says it was a lock with no owner that was judged\n{text}"
+    );
+    assert!(
+        landed.exists(),
+        "a lock with no owner waits the 48h window even landed and under the floor\n{text}"
+    );
+    assert!(
+        dirty_tree.exists(),
+        "a lock with no owner only opens the judgement: a dirty tree is still kept\n{text}"
+    );
+    assert!(
+        quiet.exists(),
+        "an empty reason is not git's add --lock sentence: somebody's lock, kept\n{text}"
+    );
+    assert!(fresh.exists(), "a tree added minutes ago is kept\n{text}");
+    let after = git(&yard.repo, 0, &["worktree", "list", "--porcelain"]);
+    for kept in [&landed, &dirty_tree, &fresh] {
+        let block = after
+            .split("\n\n")
+            .find(|b| b.contains(kept.to_str().expect("utf8")))
+            .unwrap_or_default();
+        assert!(
+            block.contains(&format!("locked {git_text}")),
+            "a tree the pass keeps keeps its lock, word for word\n{block}\n{text}"
+        );
+    }
+    assert!(
+        stdout.contains("4 with a lock naming no owner"),
+        "the totals count the ownerless locks it judged\n{text}"
+    );
+    let put = run_step_put(&root, &text);
+    assert!(
+        put.contains("\"worktrees_ownerless_locks\":\"4\"")
+            && put.contains("\"worktrees_ownerless_lock_names\":\"")
+            && put.contains("agent-ownerless-old"),
+        "the packet counts and names every ownerless lock it judged\n{put}\n{text}"
+    );
+}
+
 /// The index is not an activity signal. Measured 2026-09-23 (backlog
 /// e14a741c): five worktrees' index files were written 2026-09-21
 /// 17:11, days after their last commit — a `git status` refreshes the
@@ -1236,7 +1366,7 @@ fn stub_installer(root: &Path) -> PathBuf {
         &path,
         concat!(
             "#!/usr/bin/env bash\n",
-            "printf 'sha=%s store=%s link=%s sor_env=%s\\n' \"$1\" \"${BOSS_CLI_STORE:-}\" \"${BOSS_CLI_LINK:-}\" \"${BOSS_SOR_ENV:-}\" >> \"$STUB_INSTALL_LOG\"\n",
+            "printf 'sha=%s store=%s link=%s sor_env=%s dev_control=%s\\n' \"$1\" \"${BOSS_CLI_STORE:-}\" \"${BOSS_CLI_LINK:-}\" \"${BOSS_SOR_ENV:-}\" \"${BOSS_DEV_CONTROL_STORE:-}\" >> \"$STUB_INSTALL_LOG\"\n",
             "case \"${STUB_INSTALLER_RC:-0}\" in\n",
             "    0) echo \"install-cli-from-image: CONFIRMED — stub at $1\" ;;\n",
             "    75) echo \"install-cli-from-image: NOT YET — no image for $1 (stub)\" >&2 ;;\n",
@@ -1286,10 +1416,11 @@ fn each_pass_installs_the_trees_cli_from_the_image_through_the_estate_installer(
     assert!(out.status.success(), "{text}");
     let log = install_log(&root);
     let want = format!(
-        "sha={main} store={} link={} sor_env={}",
+        "sha={main} store={} link={} sor_env={} dev_control={}",
         store.display(),
         link.display(),
-        store.join("sor.env").display()
+        store.join("sor.env").display(),
+        root.join("work/tools/dev-control").display()
     );
     assert_eq!(log.trim(), want, "the handoff to the installer\n{text}");
     let rendered = std::fs::read_to_string(store.join("sor.env")).expect("the rendered sor.env");
@@ -1348,7 +1479,7 @@ fn each_pass_installs_the_trees_cli_from_the_image_through_the_estate_installer(
     // `--cli` runs the CLI leg alone — what the shim's refusal names as
     // the ten-second fix — and none of the reclaim passes.
     std::fs::remove_file(root.join("install-log.txt")).expect("reset the install log");
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(repo_root().join("infra/cluster/dev-scratch-reclaim.sh"))
         .arg("--cli")
         .env("BOSS_CLI_INSTALLER", stub_installer(&root))
@@ -1375,7 +1506,7 @@ fn each_pass_installs_the_trees_cli_from_the_image_through_the_estate_installer(
     // must tell "installed, proceed" from "not built yet, wait" without
     // parsing the log. Not yet exits 75 — the installer's own code —
     // while the hourly pass above still counts it as a wait, exit 0.
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(repo_root().join("infra/cluster/dev-scratch-reclaim.sh"))
         .arg("--cli")
         .env("BOSS_CLI_INSTALLER", stub_installer(&root))
@@ -1397,6 +1528,178 @@ fn each_pass_installs_the_trees_cli_from_the_image_through_the_estate_installer(
         String::from_utf8_lossy(&out.stdout).contains("not yet"),
         "and still says so\n{text}"
     );
+}
+
+/// DEV ISOLATION IS NEVER SILENT (design a68fc42a D1, David 2026-10-10;
+/// backlog b3071bf4). Once the store exists — isolation was activated —
+/// every hourly pass reads its selector: refused, missing, or naming a
+/// generation the installed CLI has moved past is a problem on the
+/// pass's packet. A pod that was never activated (no store) is inert,
+/// and the held state files nothing.
+#[test]
+fn a_refused_missing_or_behind_dev_isolation_selector_is_a_problem_every_pass() {
+    use std::os::unix::fs::symlink;
+    let root = boss_testing::scratch_dir("boss-dsr-dev-control");
+    let _guard = Scratch(root.clone());
+    let _yard = Yard::new(&root);
+    let store = root.join("work/tools/dev-control");
+    let cli = root.join("work/tools/image-cli");
+    let (x, y) = ("a".repeat(40), "b".repeat(40));
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert!(
+        out.status.success(),
+        "never activated is not a problem\n{text}"
+    );
+    assert!(text.contains("dev isolation: inert"), "{text}");
+    assert!(!curl_log(&root).contains("dev-control"), "{text}");
+
+    boss_testing::create_dir(&store);
+    boss_testing::create_dir(&cli);
+    symlink(&x, cli.join("current")).unwrap();
+    symlink(store.join("generations").join(&x), store.join("enabled")).unwrap();
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert!(
+        out.status.success(),
+        "a current selector is healthy\n{text}"
+    );
+    assert!(
+        text.contains(&format!("dev isolation: on at {}", &x[..8])),
+        "{text}"
+    );
+
+    let cases: [(&str, Box<dyn Fn()>); 3] = [
+        (
+            "dev-control-refused",
+            Box::new(|| {
+                std::fs::remove_file(store.join("enabled")).unwrap();
+                symlink("refused", store.join("enabled")).unwrap();
+            }),
+        ),
+        (
+            "dev-control-selector-missing",
+            Box::new(|| std::fs::remove_file(store.join("enabled")).unwrap()),
+        ),
+        (
+            "dev-control-behind",
+            Box::new(|| {
+                symlink(store.join("generations").join(&x), store.join("enabled")).unwrap();
+                std::fs::remove_file(cli.join("current")).unwrap();
+                symlink(&y, cli.join("current")).unwrap();
+            }),
+        ),
+    ];
+    for (slug, plant) in cases {
+        plant();
+        let _ = std::fs::remove_file(root.join("curl-log.txt"));
+        let out = run(&root, &[]);
+        let text = say(&out);
+        assert_eq!(out.status.code(), Some(1), "{slug} reds the pass\n{text}");
+        let log = curl_log(&root);
+        let put = log
+            .lines()
+            .find(|l| is_run_step_merge(l))
+            .unwrap_or_else(|| panic!("{slug}: the run step is completed\n{log}\n{text}"));
+        assert!(
+            put.contains(&format!("dev-scratch-reclaim/{slug} problem")),
+            "{slug} rides the packet by name\n{put}"
+        );
+        assert!(
+            put.contains("activation.log"),
+            "{slug} names the log\n{put}"
+        );
+    }
+    std::fs::remove_file(store.join("enabled")).unwrap();
+    std::fs::write(store.join("off.json"), "{\"state\":\"off\"}").unwrap();
+    // mode-bits-ok: a controller record, never exec'd
+    std::fs::set_permissions(
+        store.join("off.json"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert!(
+        out.status.success(),
+        "an explicit supported rollback is not a missing-selector alarm\n{text}"
+    );
+    assert!(text.contains("dev isolation: off"), "{text}");
+}
+
+#[test]
+fn silence_is_not_a_supported_dev_control_rollback() {
+    let root = boss_testing::scratch_dir("boss-dsr-dev-off-document");
+    let _guard = Scratch(root.clone());
+    let _yard = Yard::new(&root);
+    let store = root.join("work/tools/dev-control");
+    boss_testing::create_dir(&store);
+    for body in [
+        "",
+        " \n\t\n",
+        "not json",
+        "null",
+        "{}",
+        "{\"state\":\"on\"}",
+        "{\"state\":\"off\",\"extra\":true}",
+        "{\"state\":\"on\"} {\"state\":\"off\"}",
+    ] {
+        std::fs::write(store.join("off.json"), body).unwrap();
+        // mode-bits-ok: a controller record, never exec'd
+        std::fs::set_permissions(
+            store.join("off.json"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(root.join("curl-log.txt"));
+        let out = run(&root, &[]);
+        let text = say(&out);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{body:?} is no rollback\n{text}"
+        );
+        assert!(
+            text.contains("selector"),
+            "the missing selector is named\n{text}"
+        );
+        assert!(
+            !text.contains("off — supported rollback"),
+            "silence cannot suppress the alarm\n{text}"
+        );
+        assert!(
+            curl_log(&root).contains("dev-control-selector-missing"),
+            "the refusal reaches the record\n{text}"
+        );
+    }
+    std::fs::write(store.join("off.json"), "{\"state\":\"off\"}").unwrap();
+    // mode-bits-ok: deliberately unsafe fixture record, never exec'd
+    std::fs::set_permissions(
+        store.join("off.json"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+    let out = run(&root, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a public off record cannot silence the alarm\n{}",
+        say(&out)
+    );
+    // mode-bits-ok: a controller record, never exec'd
+    std::fs::set_permissions(
+        store.join("off.json"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    let out = run(&root, &[]);
+    assert!(
+        out.status.success(),
+        "a real rollback document is accepted\n{}",
+        say(&out)
+    );
+    assert!(say(&out).contains("off — supported rollback"));
 }
 
 /// A checkout with no origin/main — never fetched — names no sha to
@@ -2023,6 +2326,58 @@ fn the_hourly_pass_ensures_the_memory_watch_and_the_floor_mode_does_not() {
         put.contains("\"memory_watch_alerts_refused\":\"1\"") && put.contains("\"problems\":\"2\""),
         "and counted as a problem of its own\n{put}\n{text}"
     );
+    // The operator call recorded on 9ecd12ea at car 7849553a's release:
+    // the problem stays every hour until a person acts, so it names the
+    // act — a verb that keeps the bodies — and where the watch keeps them.
+    let watch = repo_root().join("infra/cluster/dev-memory-watch.sh");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("dev-memory-watch.sh --acknowledge")
+            && put.contains("dev-memory-watch.sh --acknowledge"),
+        "the problem names the verb that clears it, aloud and on the packet\n{put}\n{text}"
+    );
+    assert!(
+        put.contains(&format!(
+            "\"memory_watch_dir\":\"{}\"",
+            aside.parent().expect("the watch dir").display()
+        )),
+        "and the packet names the watch's directory\n{put}"
+    );
+
+    // Acknowledged, the next pass's packet carries who and when, and the
+    // problem is gone; the pass after that no longer carries it.
+    let ack = Command::new("bash")
+        .arg(&watch)
+        .arg("--acknowledge")
+        .env("WORK_MOUNT", root.join("work"))
+        .env("BOSS_ACTOR", "operator:test")
+        .output()
+        .expect("run --acknowledge");
+    assert!(ack.status.success(), "{}", say(&ack));
+    let out = run(&root, &on);
+    let text = say(&out);
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .rfind(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the pass records itself\n{log}\n{text}"));
+    assert!(
+        put.contains("\"memory_watch_alerts_refused\":\"0\"")
+            && put.contains("\"problems\":\"1\"")
+            && put.contains("\"memory_watch_acknowledged\":\"")
+            && put.contains("by operator:test: 1 refused"),
+        "the acknowledgement rides the next packet\n{put}\n{text}"
+    );
+    let out = run(&root, &on);
+    let text = say(&out);
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .rfind(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the pass records itself\n{log}\n{text}"));
+    assert!(
+        put.contains("\"memory_watch_acknowledged\":\"\""),
+        "and only that one: a packet that carried it marks it recorded\n{put}\n{text}"
+    );
 
     let out = run_with(&root, &["--scratch-floor"], &on);
     let text = say(&out);
@@ -2030,6 +2385,76 @@ fn the_hourly_pass_ensures_the_memory_watch_and_the_floor_mode_does_not() {
         !String::from_utf8_lossy(&out.stdout).contains("dev-memory-watch"),
         "the floor mode runs before every build, inside the dev container\n{text}"
     );
+}
+
+/// Review fb97dd5d of car 1fe37401, finding F1. An answer that judges
+/// the caller or the API (a 401 or 403 to the watch's signer, a 5xx)
+/// counts nothing against a kept alert, so refused stays 0 and the
+/// problem above never fires: a kill alert held that way was silent
+/// until the spool's bound of 48. The watch now says how long its oldest
+/// kept alert has waited and past what no refusal of the body explains
+/// it (dev_memory_watch_sh.rs holds a 403 on one and reads both off
+/// `--state`); held past that bound, it is a problem of its own here,
+/// and inside it, it is not — a body the API refuses is still backing
+/// off and will be moved aside and counted by the problem above.
+#[test]
+fn a_kill_alert_the_watch_holds_past_its_bound_is_a_problem_of_the_hourly_pass() {
+    let root = boss_testing::scratch_dir("boss-dsr-memory-held");
+    let _guard = Scratch(root.clone());
+    boss_testing::create_dir(&root.join("work").join("wt"));
+    boss_testing::create_dir(&root.join("work").join("repo"));
+    target_dir(&root, "target", 0);
+    let on = [("BOSS_DEV_MEMORY_WATCH", "on")];
+    let spool = root
+        .join("work")
+        .join("telemetry")
+        .join("dev-memory")
+        .join("alert-spool");
+    boss_testing::create_dir(&spool);
+    let body = r#"{"kind":"backlog-item","title":"a held kill alert","owner_id":""}"#;
+
+    // Kept ten minutes ago: inside any back-off, not yet a problem. The
+    // fixture's unsampled watch is its one problem.
+    let young = spool.join(format!("{}-1-1.json", unix_now() - 600));
+    boss_testing::write_file(&young, body);
+    let out = run(&root, &on);
+    let text = say(&out);
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .rfind(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the pass records itself\n{log}\n{text}"));
+    assert!(
+        put.contains("\"problems\":\"1\"") && !put.contains("memory-watch-alerts-held"),
+        "an alert kept ten minutes is not held past the bound\n{put}\n{text}"
+    );
+    assert!(
+        put.contains("\"memory_watch_alerts_held_after_s\":\"3600\""),
+        "the bound rides the packet beside the age\n{put}"
+    );
+
+    // Kept two hours ago and still in the spool: held.
+    std::fs::remove_file(&young).expect("remove the young alert");
+    boss_testing::write_file(&spool.join(format!("{}-1-1.json", unix_now() - 7200)), body);
+    let out = run(&root, &on);
+    let text = say(&out);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("held a kill alert unsent"),
+        "a held alert is said aloud\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .rfind(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the pass records itself\n{log}\n{text}"));
+    assert!(
+        put.contains("\"problems\":\"2\"")
+            && put.contains("dev-scratch-reclaim/memory-watch-alerts-held problem")
+            && put.contains("\"memory_watch_alerts_refused\":\"0\"")
+            && put.contains("\"memory_watch_alerts_oldest_kept_age_s\":\"72"),
+        "held past the bound with nothing counted, it is a problem of its own\n{put}\n{text}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{text}");
 }
 
 // ---------------------------------------------------------------------
@@ -2821,4 +3246,314 @@ fn without_a_token_or_for_another_host_the_pass_sends_the_same_requests_bare() {
             "{name}: the token is a header, not a behaviour — the same requests go out"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// A failed pass names what failed (backlog 5e5d4be8).
+// ---------------------------------------------------------------------
+
+/// The `output` key of a run-step merge: the pass's `RED` lines.
+fn recorded_output(put: &str) -> String {
+    let body = put
+        .split_once("/metadata ")
+        .map(|(_, b)| b)
+        .unwrap_or_default();
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("output").and_then(|o| o.as_str()).map(str::to_string))
+        .unwrap_or_else(|| panic!("the run step carries an `output` string\n{put}"))
+}
+
+#[test]
+fn an_acting_pass_records_value_free_git_observer_state_without_changing_cleanup() {
+    let root = boss_testing::scratch_dir("boss-dsr-git-observer");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let kept = yard.worktree("agent-unanswered", Some("feat/unanswered"), 200);
+    git(
+        &yard.repo,
+        0,
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
+    let out = run(&root, &[]);
+    assert!(
+        kept.exists(),
+        "unknown landing still conserves the tree: {}",
+        say(&out)
+    );
+    let calls = curl_log(&root);
+    let merge = calls
+        .lines()
+        .find(|line| line.contains("/steps/step-run/metadata "))
+        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(merge.split_once("/metadata ").unwrap().1).unwrap();
+    let state: serde_json::Value = serde_json::from_str(
+        body["git_phase_ledger"]
+            .as_str()
+            .expect("phase state is recorded"),
+    )
+    .unwrap();
+    assert_eq!(state["state"], "observed");
+    assert!(state["records"].as_u64().unwrap() > 0);
+    assert!(!ls_remote_calls(&root).contains("ls-remote"));
+}
+
+/// An `rm` that refuses ONE tree the way the pod's root does a tree the
+/// gate's uid made — fifty `Permission denied` lines, one per file — and
+/// a `setpriv` that stands in for becoming its owner: it logs its
+/// arguments and runs the rest with the refusal lifted, or refuses
+/// itself under `STUB_SETPRIV_REFUSES` (a container with no CAP_SETUID).
+/// Every other `rm` goes to the real one.
+fn stub_owner_only_tree(root: &Path) {
+    let bin = root.join("bin");
+    boss_testing::create_dir(&bin);
+    let real = String::from_utf8(
+        without_proxy(&mut Command::new("bash"))
+            .args(["-c", "command -v rm"])
+            .output()
+            .expect("locate rm")
+            .stdout,
+    )
+    .expect("utf8");
+    let real = real.trim();
+    assert!(!real.is_empty(), "a real rm on PATH");
+    boss_testing::write_exec(
+        &bin.join("rm"),
+        &format!(
+            concat!(
+                "#!/usr/bin/env bash\n",
+                "last=\"${{@: -1}}\"\n",
+                "if [ \"$last\" = \"${{STUB_RM_REFUSES:-}}\" ] && [ -z \"${{STUB_AS_OWNER:-}}\" ]; then\n",
+                "    for i in $(seq 1 50); do\n",
+                "        echo \"rm: cannot remove '$last/debug/deps/f$i': Permission denied\" >&2\n",
+                "    done\n",
+                "    exit 1\n",
+                "fi\n",
+                "exec {real} \"$@\"\n",
+            ),
+            real = real
+        ),
+    );
+    boss_testing::write_exec(
+        &bin.join("setpriv"),
+        concat!(
+            "#!/usr/bin/env bash\n",
+            "printf '%s\\n' \"$*\" >> \"$STUB_SETPRIV_LOG\"\n",
+            "if [ -n \"${STUB_SETPRIV_REFUSES:-}\" ]; then\n",
+            "    echo 'setpriv: setresuid failed: Operation not permitted' >&2\n",
+            "    exit 1\n",
+            "fi\n",
+            "while [ $# -gt 0 ]; do case \"$1\" in --*) shift ;; *) break ;; esac; done\n",
+            "STUB_AS_OWNER=1 exec \"$@\"\n",
+        ),
+    );
+}
+
+/// The uid that owns a path, as `stat` prints it.
+fn owner_uid(path: &Path) -> String {
+    let out = Command::new("stat")
+        .args(["-c", "%u"])
+        .arg(path)
+        .output()
+        .expect("stat");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Measured 2026-10-07 and 2026-10-08 (backlog cb1cdc61, 5e5d4be8):
+/// /scratch/target-repo, made by the gate's uid 65534, mode 2755. The
+/// pod's root holds CAP_SETUID and no CAP_DAC_OVERRIDE, so its `rm -rf`
+/// was refused on every file — about 11,025 stderr lines per build from
+/// wt-cargo's floor pass, nothing reclaimed, and a packet that said
+/// `problems=1` and not which. The pass removes such a tree AS ITS
+/// OWNER, the way infra/dev/as-gate-uid.sh removes its own workspace.
+#[test]
+fn a_tree_another_uid_owns_is_removed_as_its_owner() {
+    let root = boss_testing::scratch_dir("boss-dsr-owner-removes");
+    let _guard = Scratch(root.clone());
+    boss_testing::create_dir(&root.join("work").join("wt"));
+    boss_testing::create_dir(&root.join("work").join("repo"));
+    stub_owner_only_tree(&root);
+    let tree = target_dir(&root, "target-repo", 30);
+    let uid = owner_uid(&tree);
+    let setpriv_log = root.join("setpriv-log.txt");
+
+    let out = run(
+        &root,
+        &[
+            ("STUB_RM_REFUSES", tree.to_str().expect("utf-8 path")),
+            (
+                "STUB_SETPRIV_LOG",
+                setpriv_log.to_str().expect("utf-8 path"),
+            ),
+        ],
+    );
+    let text = say(&out);
+    assert!(!tree.exists(), "the owner's rm removes the tree\n{text}");
+    let asked = std::fs::read_to_string(&setpriv_log).unwrap_or_default();
+    assert!(
+        asked.contains(&format!("--reuid={uid}")) && asked.contains("rm -rf"),
+        "the retry runs rm as the uid that owns the tree ({uid})\n{asked}\n{text}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("Permission denied").count(),
+        0,
+        "a refusal the retry repaired is not printed per file\n{text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("as its owner"),
+        "the pass says how the tree went\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .find(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("an acting pass records itself\n{log}\n{text}"));
+    assert!(
+        put.contains("\"stale_targets_reclaimed\":\"1\"")
+            && put.contains("\"problems\":\"0\"")
+            && put.contains("\"result\":\"ok\""),
+        "a tree removed as its owner is a reclaim, not a problem\n{put}\n{text}"
+    );
+    assert_eq!(recorded_output(put), "", "and no RED line\n{put}");
+}
+
+/// ...and where nothing can remove it, the refusal is said ONCE — never
+/// per file — and the packet NAMES the problem: which tree, whose it is,
+/// how many paths refused and the first of them. The three newest
+/// packets read 2026-10-08 23:58Z closed `failed` with `problems=2` and
+/// no key saying which two (backlog 5e5d4be8; CLAUDE.md §Diagnosis, a
+/// verdict must name what failed). The line is the chore judge's shape,
+/// `RED <route> <kind>: <error>`, on the key it reads, so the rule
+/// file-backlog-items-on-dev-scratch-reclaim-red can file it.
+#[test]
+fn a_tree_nothing_can_remove_is_said_once_and_named_on_the_packet() {
+    let root = boss_testing::scratch_dir("boss-dsr-nobody-removes");
+    let _guard = Scratch(root.clone());
+    boss_testing::create_dir(&root.join("work").join("wt"));
+    boss_testing::create_dir(&root.join("work").join("repo"));
+    stub_owner_only_tree(&root);
+    let tree = target_dir(&root, "target-repo", 30);
+    let uid = owner_uid(&tree);
+    let setpriv_log = root.join("setpriv-log.txt");
+
+    let out = run(
+        &root,
+        &[
+            ("STUB_RM_REFUSES", tree.to_str().expect("utf-8 path")),
+            ("STUB_SETPRIV_REFUSES", "1"),
+            (
+                "STUB_SETPRIV_LOG",
+                setpriv_log.to_str().expect("utf-8 path"),
+            ),
+        ],
+    );
+    let text = say(&out);
+    assert!(
+        tree.exists(),
+        "the fixture's tree cannot be removed\n{text}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unremoved tree is loud\n{text}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("Permission denied").count(),
+        1,
+        "fifty refusals are said once, with their count, not fifty times\n{text}"
+    );
+    assert!(
+        stderr.contains("50 path(s)") && stderr.contains(&format!("uid {uid}")),
+        "the one line carries the count and the owner\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .find(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("a pass with a problem records itself\n{log}\n{text}"));
+    assert!(
+        put.contains("\"problems\":\"1\"") && put.contains("\"result\":\"incomplete\""),
+        "the unremoved tree is the pass's one problem\n{put}\n{text}"
+    );
+    let output = recorded_output(put);
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), 1, "one problem, one line\n{output}");
+    assert!(
+        lines[0].starts_with("RED dev-scratch-reclaim/target-not-removed problem: ")
+            && lines[0].contains(tree.to_str().expect("utf-8 path"))
+            && lines[0].contains(&format!("uid {uid}"))
+            && lines[0].contains("50 path(s)")
+            && lines[0].contains("Permission denied"),
+        "the packet names the tree, its owner, the count and the first refusal\n{output}"
+    );
+}
+
+/// EVERY problem is named, not only that one: the count and the names
+/// are written by one function, so a problem cannot be counted without
+/// its line. A skipped worktree pass — the packet's oldest named
+/// problem, `worktree_pass_reason` — is the behavioural case; the
+/// script's own text is the rest.
+#[test]
+fn every_problem_the_pass_counts_is_named_on_the_packet() {
+    let script = std::fs::read_to_string(repo_root().join("infra/cluster/dev-scratch-reclaim.sh"))
+        .expect("read the script");
+    let bumps: Vec<&str> = script
+        .lines()
+        .filter(|l| l.contains("problems=$((problems + 1))"))
+        .collect();
+    assert_eq!(
+        bumps.len(),
+        1,
+        "the problem count moves in ONE place, `problem`, which also writes the name — a \
+         second site is a problem the packet cannot name:\n{bumps:#?}"
+    );
+
+    let root = boss_testing::scratch_dir("boss-dsr-named-problems");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    yard.worktree("agent-gone", Some("feat/gone"), 200);
+    git(
+        &yard.repo,
+        0,
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
+    let out = run(&root, &[]);
+    let text = say(&out);
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .find(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
+    let output = recorded_output(put);
+    let problems = serde_json::from_str::<serde_json::Value>(
+        put.split_once("/metadata ").map(|(_, b)| b).unwrap_or("{}"),
+    )
+    .ok()
+    .and_then(|v| {
+        v.get("problems")
+            .and_then(|p| p.as_str())
+            .map(str::to_string)
+    })
+    .unwrap_or_default();
+    assert_eq!(
+        output.lines().count().to_string(),
+        problems,
+        "one RED line per counted problem\n{output}\n{put}"
+    );
+    assert!(
+        output.lines().any(|l| l
+            .starts_with("RED dev-scratch-reclaim/worktree-pass-skipped problem: ")
+            && l.contains("origin/main")),
+        "the skipped worktree pass is named with its reason\n{output}"
+    );
+    assert!(
+        output
+            .lines()
+            .all(|l| l.starts_with("RED dev-scratch-reclaim/")
+                && l.split_whitespace().nth(2) == Some("problem:")),
+        "every line is the chore judge's shape, `RED <route> <kind>: <error>`\n{output}"
+    );
 }

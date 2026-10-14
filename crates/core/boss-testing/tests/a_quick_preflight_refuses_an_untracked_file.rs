@@ -92,7 +92,13 @@ impl Tree {
     fn untracked(&self, rel: &str) -> &Tree {
         let path = self.tree.join(rel);
         boss_testing::create_dir(path.parent().expect("a relative path has a parent"));
-        boss_testing::write_file(&path, "registry: 10.20.0.34:7900\n");
+        boss_testing::write_file(
+            &path,
+            &format!(
+                "registry: {}:7900\n",
+                boss_testing::test_values::test_net_1(34)
+            ),
+        );
         self
     }
 
@@ -145,6 +151,22 @@ const REFUSAL: &str = "untracked";
 /// The poll before the first check: reaching it means the tree was
 /// certified as far as the untracked-file question goes.
 const REACHED_FMT: &str = "Refusing to continue before 'fmt'";
+
+#[test]
+fn the_untracked_manifest_uses_the_shared_reserved_address() {
+    let tree = Tree::new("reserved-address");
+    let rel = "infra/estate/instances/new-manifest.yaml";
+    tree.untracked(rel);
+    let actual = std::fs::read_to_string(tree.tree.join(rel)).unwrap();
+    assert_eq!(
+        actual,
+        format!(
+            "registry: {}:7900\n",
+            boss_testing::test_values::test_net_1(34)
+        ),
+        "the actual synthetic manifest must use the shared reserved fixture address"
+    );
+}
 
 /// The tree was certified (as far as this question goes) and the run
 /// went on to the first check.

@@ -1,0 +1,43 @@
+# The registry row of the READ-ONLY forge token root on boss-gcp fetches
+# its own tree with (design-doc db018094, question q1, David
+# 2026-10-10T03:23Z: option (i); backlog ca356c79). A registry row is
+# INSTANCE DATA: nothing in this tree publishes it, and the converge does
+# not read this file. It is here so the row the broker's rotation door
+# will demand is written once, reviewed with the car that declares the
+# credential, and held equal to the rule by a test
+# (crates/core/boss-dispatcher/tests/boss_gcp_root_tree_token_rules.rs).
+# The rule itself is infra/dispatcher/rules/
+# broker-rotates-the-boss-gcp-root-tree-token.toml (and its delivery twin).
+#
+# WHERE ROOT ON boss-gcp READS IT: /etc/boss/root-tree/forge.token,
+# root:root 0600 in a root:root 0700 directory — beside the machine token
+# (/etc/boss/machine-token) and the ops runner credential
+# (/etc/boss/ops-runner.credential), the host's other root-only
+# credentials. No other account on boss-gcp reads it: that is the whole
+# reason the credential exists (david's helper is what /opt/boss fetches
+# with, and root must not run bytes david's account can write; design
+# c98c79aa).
+#
+# AFTER THE TRANSPORT CAR LANDS, by the operator: publish the row — add the
+# [[credential]] block below, unchanged, to the instance repository's
+# seeds/credentials.toml and run `boss tenant publish` there (the
+# registry's one door, POST /api/credentials/batch; a row already present
+# is kept). Then a rotate-a-credential packet on Subject
+# boss-gcp-root-tree-token can be filed; its `scope` step is David's.
+# Do not publish the row or start its first scope until that transport
+# exists: this declaration alone delivers nothing, and a rotation now
+# would mint a live credential with no reader and wait at `delivered`.
+#
+# No value is ever a field here: the registry holds locations.
+[[credential]]
+id = "boss-gcp-root-tree-token"
+kind = "forgejo-access-token"
+issuer = "forgejo (the forge host), minted by the credential broker (credential.rotate.forgejo)"
+principal = "user david"
+scopes = ["read:repository"]
+storage_location = "k8s Secret boss/boss-gcp-root-tree-token key token; pending off-cluster delivery to boss-gcp at /etc/boss/root-tree/forge.token (root:root 0600, directory 0700)"
+consumers = [
+  { kind = "file", location = "planned boss-gcp: /etc/boss/root-tree/forge.token, to be read only by root's own tree fetch from the forge (the root-owned tree of design c98c79aa's boss-gcp stage), through a git credential helper scoped to the forge URL; the four units of backlog ca356c79 will run from that tree after the later cars land" },
+]
+rotation_policy = "on-demand"
+notes = "pending: no transport delivers it and nothing reads it until the later cars of db018094; publish this row and begin its first rotation only after the transport car lands. Read-only by design (db018094 q1): root on the public edge may fetch the tree and nothing else. Rotated by the credential broker: dispatcher rule broker-rotates-the-boss-gcp-root-tree-token fires credential.rotate.forgejo off the scope step of a rotate-a-credential packet, mints a forgejo token for user david with scope read:repository, proves it by reading david/boss, stores it in Secret boss/boss-gcp-root-tree-token; the revoke of the old instance waits for boss-gcp's delivered record (broker-revokes-the-boss-gcp-root-tree-token-on-delivery). spare: boss-gcp, boss-dev-forge-token-*, forge-host-checkout-token-*, forge-registry-push-token-*. The scope names no old token for the first issuance. A token of user david reads every repository david can read; read:repository is the narrowest scope Forgejo offers per token."

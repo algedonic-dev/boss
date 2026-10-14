@@ -3,6 +3,7 @@ import type { CarRow, TrainRow, YardState } from './yard';
 import { scene, type Feeds } from './yard-floor';
 import type { YardStatus } from './yard-status';
 import { OPS_RUNNER_STUCK_MINUTES, yardAlerts } from './yard-alerts';
+import { testNet1 } from '../../../tests/fixtures/test-values';
 
 // The alerts strip is derived from the floor the page already holds —
 // no new endpoint. Every alert is a button to its subject, so each one
@@ -83,7 +84,7 @@ const car = (id: string, branch: string): CarRow => ({
 const trainRow = (id: string, over: Partial<TrainRow> = {}): TrainRow => ({
   id,
   title: 'PR train 2026-09-08 02:02',
-  prUrl: 'http://10.20.0.15:3000/david/boss/pulls/262',
+  prUrl: `http://${testNet1(15)}:3000/example/boss/pulls/262`,
   status: 'DEPARTED',
   lamp: 'green',
   mergeRef: null,
@@ -117,6 +118,15 @@ const alertsOf = (yard: YardState, status: YardStatus | null, feeds: Feeds = qui
   yardAlerts(scene(yard, status, NOW, feeds), status, NOW);
 
 describe('yardAlerts — what is wrong right now, each a button to its subject', () => {
+  test('the synthetic train URL uses the reserved fixture network and preserves its PR label', () => {
+    const row = trainRow('fixture');
+    expect(new URL(row.prUrl!).hostname).toBe(testNet1(15));
+    const alerts = alertsOf(yardOf({ inFlight: [trainRow('fixture', {
+      status: 'BOARDED', lamp: 'failing', trouble: { kind: 'ci-red' },
+    })] }), statusOf());
+    expect(alerts[0]?.text).toContain('#262');
+  });
+
   test('a quiet floor has no alerts — every machine working or idle by design', () => {
     expect(alertsOf(yardOf(), statusOf())).toEqual([]);
     // Before any reading at all there is nothing to say either: unknown

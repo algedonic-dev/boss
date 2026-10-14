@@ -233,13 +233,32 @@ impl ForgejoForge {
             .with_context(|| format!("reading {token_file}"))?
             .trim()
             .to_string();
+        Self::finish(
+            base,
+            repo,
+            token,
+            reqwest::Client::builder().timeout(Duration::from_secs(30)),
+        )
+    }
+
+    /// The adapter on `builder`, finished with every proxy off — the
+    /// environment's and any the builder named (backlog 6162aff2, review
+    /// bad26eb2). Every request carries the train's forge WRITE token, and
+    /// the forge is the estate's own host over PLAIN HTTP, so reqwest's
+    /// default of honouring `HTTP_PROXY`/`ALL_PROXY` would hand that token,
+    /// in cleartext, to whatever proxy the conductor's environment named.
+    /// A forge request goes where its URL says or not at all.
+    fn finish(
+        base: String,
+        repo: String,
+        token: String,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self> {
         Ok(ForgejoForge {
             base,
             repo,
             token,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()?,
+            http: builder.no_proxy().build()?,
         })
     }
 
@@ -834,5 +853,104 @@ mod tests {
     fn an_absent_rollup_summarises_to_nothing() {
         assert_eq!(ci_check_summary(None), "");
         assert_eq!(ci_check_summary(Some(&json!([]))), "");
+    }
+
+    // ---- the forge token goes direct ------------------------------
+
+    /// Accept one connection on `listener`, send its request head
+    /// (lowercased) down the channel, answer 200 with an empty JSON list.
+    fn answer_once(listener: std::net::TcpListener) -> std::sync::mpsc::Receiver<String> {
+        use std::io::{Read, Write};
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&head).to_lowercase());
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n[]");
+        });
+        rx
+    }
+
+    /// What the forge and a proxy each saw of one request, `send` given
+    /// the forge's base URL and the proxy's. The proxy is `127.0.0.2`, a
+    /// different host from the forge's `127.0.0.1`.
+    async fn proxied<F, Fut>(send: F) -> (Option<String>, Option<String>)
+    where
+        F: FnOnce(String, String) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let forge = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let forge_at = forge.local_addr().unwrap();
+        let forge_saw = answer_once(forge);
+        let proxy = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
+        let proxy_at = proxy.local_addr().unwrap();
+        let proxy_saw = answer_once(proxy);
+        send(format!("http://{forge_at}"), format!("http://{proxy_at}")).await;
+        let wait = std::time::Duration::from_millis(500);
+        (
+            forge_saw.recv_timeout(wait).ok(),
+            proxy_saw.recv_timeout(wait).ok(),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_forge_adapter_sends_its_token_through_no_proxy() {
+        // Backlog 6162aff2 (review bad26eb2): the train's forge WRITE token
+        // rides plain HTTP to the estate forge, and reqwest honours
+        // HTTP_PROXY / ALL_PROXY by default. `finish` clears every proxy —
+        // the environment's and any the builder named. A builder naming a
+        // proxy stands in for the environment here, because a unit test may
+        // not write the process's variables under its siblings
+        // (boss-dispatcher-handlers' an_estate_credential_follows_no_ambient
+        // _proxy.rs sets them, alone in its process).
+        const TOKEN: &str = "forge-write-token-value";
+        let with_proxy =
+            |proxy: &str| reqwest::Client::builder().proxy(reqwest::Proxy::all(proxy).unwrap());
+
+        // The control: that builder, finished plainly, goes to the proxy
+        // with the header, so the fixture sees a leak when there is one.
+        let (forge, proxy) = proxied(|base, proxy| async move {
+            with_proxy(&proxy)
+                .build()
+                .unwrap()
+                .get(format!("{base}/api/v1/repos/david/boss"))
+                .header("Authorization", format!("token {TOKEN}"))
+                .send()
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(forge, None, "the control went direct: {forge:?}");
+        assert!(
+            proxy.as_deref().is_some_and(|h| h.contains(TOKEN)),
+            "the control's proxy saw no token, so this fixture cannot catch a leak"
+        );
+
+        // The adapter, on the same builder.
+        let (forge, proxy) = proxied(|base, proxy| async move {
+            let adapter =
+                ForgejoForge::finish(base, "david/boss".into(), TOKEN.into(), with_proxy(&proxy))
+                    .unwrap();
+            adapter
+                .api(Method::GET, "/repos/david/boss", None)
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(proxy, None, "the forge adapter sent its token to the proxy");
+        assert!(
+            forge.as_deref().is_some_and(|h| h.contains(TOKEN)),
+            "the forge did not receive the adapter's request directly: {forge:?}"
+        );
     }
 }

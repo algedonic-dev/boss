@@ -868,6 +868,144 @@ fn compatible_samples_retain_monotonic_deltas_and_failed_collection() {
     );
 }
 
+/// Write one cgroup state and take one sample of it through the real collector.
+fn sample_pressure(
+    cg: &std::path::Path,
+    record: &std::path::Path,
+    label: &str,
+    files: &[(&str, &str)],
+) {
+    for (name, body) in files {
+        std::fs::write(cg.join(name), body).unwrap();
+    }
+    let out = Command::new("python3")
+        .arg(repo_root().join("infra/gate-runner/runtime-evidence.py"))
+        .args(["sample", record.to_str().unwrap(), label])
+        .env("BOSS_RUNTIME_CGROUP_ROOT", cg)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn psi(some: u64, full: u64) -> String {
+    format!(
+        "some avg10=0.00 avg60=0.00 avg300=0.00 total={some}\n\
+         full avg10=0.00 avg60=0.00 avg300=0.00 total={full}\n"
+    )
+}
+
+/// WHY (backlog 17f6170c, 2026-10-09). Whether a gate check waited on the
+/// disk was the whole question of that item, and no receipt could answer
+/// it: the collector read io.pressure, cpu.pressure and memory.pressure at
+/// every check boundary, the interval kept only cpu.stat deltas, and the
+/// receipt's byte bound dropped the samples (220 of 220 on gate-run
+/// 5ea13e7d). The answer was recovered by decoding the raw journal out of
+/// 66 gate pod logs, which the cluster keeps for about a day: the test
+/// check waited on IO 43 percent of its wall on 2026-10-07 before the trim
+/// and a median 9.3 percent after it. Each interval now carries the stall
+/// microseconds of all three, so the next reader takes them off the record.
+#[test]
+fn an_interval_carries_how_long_the_check_waited_on_io_cpu_and_memory() {
+    let dir = scratch_dir("runtime-pressure");
+    let cg = dir.join("cgroup");
+    std::fs::create_dir_all(&cg).unwrap();
+    let record = dir.join("samples.jsonl");
+    // memory.pressure is never written: absent evidence must not read as a zero.
+    sample_pressure(
+        &cg,
+        &record,
+        "check-start:test",
+        &[
+            ("cpu.stat", "usage_usec 1000\nthrottled_usec 0\n"),
+            ("io.pressure", &psi(5_000, 4_000)),
+            ("cpu.pressure", &psi(70, 0)),
+        ],
+    );
+    sample_pressure(
+        &cg,
+        &record,
+        "check-finish:test",
+        &[
+            ("cpu.stat", "usage_usec 9000\nthrottled_usec 0\n"),
+            ("io.pressure", &psi(405_000, 304_000)),
+            ("cpu.pressure", &psi(100, 0)),
+        ],
+    );
+    let out = Command::new("python3")
+        .arg(repo_root().join("infra/gate-runner/runtime-evidence.py"))
+        .args(["report", record.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let interval = &value["intervals"][0];
+    assert_eq!(interval["state"], "measured", "{interval}");
+    assert_eq!(interval["cpu_usage_usec"], 8000);
+    let stall = &interval["stall_usec"];
+    assert_eq!(stall["io.some"], 400_000, "{interval}");
+    assert_eq!(stall["io.full"], 300_000, "{interval}");
+    assert_eq!(stall["cpu.some"], 30, "{interval}");
+    assert_eq!(stall["cpu.full"], 0, "a measured zero stays a zero");
+    assert!(
+        stall.get("memory.some").is_none(),
+        "an unread file was reported as a stall: {interval}"
+    );
+    assert!(
+        interval["stall_unavailable"]["memory"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "an unread pressure file must say why it has no stall: {interval}"
+    );
+}
+
+/// A pressure total that went DOWN is a reset, not a negative stall; the
+/// CPU delta beside it is still good evidence and stays measured.
+#[test]
+fn a_pressure_reset_names_itself_and_keeps_the_cpu_delta() {
+    let dir = scratch_dir("runtime-pressure-reset");
+    let cg = dir.join("cgroup");
+    std::fs::create_dir_all(&cg).unwrap();
+    let record = dir.join("samples.jsonl");
+    for (label, usage, io) in [("start", 100, 9_000), ("finish", 150, 10)] {
+        sample_pressure(
+            &cg,
+            &record,
+            label,
+            &[
+                ("cpu.stat", &format!("usage_usec {usage}\n")),
+                ("io.pressure", &psi(io, io)),
+                ("cpu.pressure", &psi(1, 1)),
+                ("memory.pressure", &psi(2, 2)),
+            ],
+        );
+    }
+    let out = Command::new("python3")
+        .arg(repo_root().join("infra/gate-runner/runtime-evidence.py"))
+        .args(["report", record.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let interval = &value["intervals"][0];
+    assert_eq!(interval["state"], "measured", "{interval}");
+    assert_eq!(interval["cpu_usage_usec"], 50);
+    assert!(
+        interval["stall_usec"].get("io.some").is_none(),
+        "{interval}"
+    );
+    assert!(
+        interval["stall_unavailable"]["io"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("reset")),
+        "{interval}"
+    );
+    assert_eq!(interval["stall_usec"]["memory.some"], 0);
+}
+
 #[test]
 fn malformed_journal_diagnostics_are_bounded_not_healthy() {
     let dir = scratch_dir("runtime-malformed");

@@ -501,15 +501,20 @@ describe('jobs list subject filter from the query string', () => {
   });
 });
 
-describe('personal Views route', () => {
-  test('/views resolves to the Home Views surface', () => {
-    expect(parseRoute('/ux/views').kind).toBe('views');
-  });
-
-  test('the bare alias resolves too', () => {
-    // Every /ux/* surface is reachable without the prefix; the router
-    // strips it before matching, and Views should be no exception.
-    expect(parseRoute('/views').kind).toBe('views');
+describe('standalone Views retirement', () => {
+  for (const path of ['/ux/views', '/views']) {
+    test(`${path} has no page and retains the requested address`, () => {
+      // Bare one-segment addresses are resolved against the department
+      // registry by withRoster; this parser must no longer select Views.
+      if (path.startsWith('/ux/')) expect(parseRoute(path)).toEqual({ kind: 'notFound', path });
+      else expect(parseRoute(path)).toEqual({ kind: 'department', code: 'views' });
+    });
+  }
+  test('remaining Home routes keep their meanings', () => {
+    expect(parseRoute('/').kind).toBe('me');
+    expect(parseRoute('/ux/inbox').kind).toBe('inbox');
+    expect(parseRoute('/ux/jobs').kind).toBe('jobs');
+    expect(parseRoute('/ux/service/schedule').kind).toBe('schedule');
   });
 });
 

@@ -382,8 +382,38 @@ pub(crate) fn window_column(spec: &StationSpec) -> Result<Option<i32>, StationEr
 // Port
 // ---------------------------------------------------------------------------
 
+pub trait StationSelectionRows {
+    fn rows(&self) -> &[StationSpec];
+}
+
+struct LockedStationSelectionRows<'a> {
+    _guard: std::sync::MutexGuard<'a, HashMap<(String, i32), StationSpec>>,
+    active: Vec<StationSpec>,
+}
+
+impl StationSelectionRows for LockedStationSelectionRows<'_> {
+    fn rows(&self) -> &[StationSpec] {
+        &self.active
+    }
+}
+
 #[async_trait]
 pub trait StationRegistry: Send + Sync {
+    fn try_lock_active_selection_rows(
+        &self,
+    ) -> Result<Option<Box<dyn StationSelectionRows + '_>>, crate::port::JobsError> {
+        Err(crate::port::JobsError::Storage(
+            "station adapter has no nonblocking selection fence".into(),
+        ))
+    }
+    /// Acquire the actual local writer guard before any selection effects.
+    fn lock_active_selection_rows(
+        &self,
+    ) -> Result<Box<dyn StationSelectionRows + '_>, crate::port::JobsError> {
+        Err(crate::port::JobsError::Storage(
+            "station adapter has no local selection fence".into(),
+        ))
+    }
     /// Currently-active spec for `name`.
     async fn get_active(&self, name: &str) -> Result<StationSpec, StationError>;
 
@@ -528,6 +558,46 @@ impl InMemoryStations {
 
 #[async_trait]
 impl StationRegistry for InMemoryStations {
+    fn try_lock_active_selection_rows(
+        &self,
+    ) -> Result<Option<Box<dyn StationSelectionRows + '_>>, crate::port::JobsError> {
+        let guard = match self.rows.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(crate::port::JobsError::Storage(
+                    "station selection lock poisoned".into(),
+                ));
+            }
+        };
+        let mut active: Vec<_> = guard
+            .values()
+            .filter(|row| row.status == WorkflowStatus::Active)
+            .cloned()
+            .collect();
+        active.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(Some(Box::new(LockedStationSelectionRows {
+            _guard: guard,
+            active,
+        })))
+    }
+    fn lock_active_selection_rows(
+        &self,
+    ) -> Result<Box<dyn StationSelectionRows + '_>, crate::port::JobsError> {
+        let guard = self.rows.lock().map_err(|_| {
+            crate::port::JobsError::Storage("station selection lock poisoned".into())
+        })?;
+        let mut active: Vec<_> = guard
+            .values()
+            .filter(|row| row.status == WorkflowStatus::Active)
+            .cloned()
+            .collect();
+        active.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(Box::new(LockedStationSelectionRows {
+            _guard: guard,
+            active,
+        }))
+    }
     async fn get_active(&self, name: &str) -> Result<StationSpec, StationError> {
         self.snapshot()
             .into_iter()
@@ -714,6 +784,26 @@ mod pg {
         pool: PgPool,
     }
 
+    pub(crate) async fn active_rows_in<'e, E>(exec: E) -> Result<Vec<StationSpec>, StationError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        // BYTE order, `COLLATE "C"`: the port promises "name-ordered",
+        // and a bare `ORDER BY name` sorts by the database's locale,
+        // which ignores `-` at first level — `suite-ab` listed before
+        // `suite-a-z` here and after it in the double. Byte order is
+        // the one both adapters can hold (backlog be459ab9, found by
+        // the adapters-agree suite; the Workflow and credentials
+        // registries were fixed the same way).
+        let rows: Vec<Row> = sqlx::query_as(&format!(
+            "{SELECT} WHERE status = 'active' ORDER BY name COLLATE \"C\""
+        ))
+        .fetch_all(exec)
+        .await
+        .map_err(|e| StationError::Storage(e.to_string()))?;
+        rows.into_iter().map(row_to_spec).collect()
+    }
+
     impl PgStations {
         pub fn new(pool: PgPool) -> Self {
             Self { pool }
@@ -820,20 +910,7 @@ mod pg {
         }
 
         async fn list_active(&self) -> Result<Vec<StationSpec>, StationError> {
-            // BYTE order, `COLLATE "C"`: the port promises "name-ordered",
-            // and a bare `ORDER BY name` sorts by the database's locale,
-            // which ignores `-` at first level — `suite-ab` listed before
-            // `suite-a-z` here and after it in the double. Byte order is
-            // the one both adapters can hold (backlog be459ab9, found by
-            // the adapters-agree suite; the Workflow and credentials
-            // registries were fixed the same way).
-            let rows: Vec<Row> = sqlx::query_as(&format!(
-                "{SELECT} WHERE status = 'active' ORDER BY name COLLATE \"C\""
-            ))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| StationError::Storage(e.to_string()))?;
-            rows.into_iter().map(row_to_spec).collect()
+            active_rows_in(&self.pool).await
         }
 
         async fn list_versions(&self, name: &str) -> Result<Vec<StationSpec>, StationError> {
@@ -1148,6 +1225,8 @@ mod pg {
 
 #[cfg(feature = "postgres")]
 pub use pg::PgStations;
+#[cfg(feature = "postgres")]
+pub(crate) use pg::active_rows_in as active_station_rows_in;
 
 // ---------------------------------------------------------------------------
 // Tests

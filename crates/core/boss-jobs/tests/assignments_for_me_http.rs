@@ -110,6 +110,9 @@ fn app_with_reporter(
         FakePolicyClient::builder()
             .allow("platform-admin", Action::Read, Resource::job(), Scope::All)
             .allow("guest", Action::Read, Resource::job(), Scope::All)
+            // A NARROWED scope — its own packets only (backlog e2519eca
+            // item 2): it cannot read the runs whole.
+            .allow("sales", Action::Read, Resource::job(), Scope::Self_)
             .build(),
     );
     let bus = RecordingEventBus::new();
@@ -322,6 +325,121 @@ async fn a_dark_registry_is_a_503_not_the_viewer_read_alone() {
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
     assert!(v.to_string().contains("agents registry"), "{v}");
+}
+
+/// A CLAIM IN MY QUEUE SAYS WHETHER ANYONE IS ON IT (backlog e2519eca
+/// item 2). The top board's OUTRANKS row names an active claim's run or
+/// says it is STALLED (8e9d3723), but NEEDS YOU and MY WORK are this
+/// read, which carried no run at all — so the same claim read as in
+/// hand one section down. Each ACTIVE row an agent holds now carries
+/// the reading the board computes, from the one predicate
+/// (`boss_jobs::outranks::claim_run`): the run building it, or
+/// `no-run`. A ready row carries none (nothing has claimed it), and a
+/// caller who cannot read every packet is told `unread`, never `no-run`.
+#[tokio::test]
+async fn an_active_claim_in_my_queue_names_its_run_or_says_it_has_none() {
+    let (app, jobs) = app(registry());
+    let item = |title: &str| Job {
+        id: JobId::new(),
+        status: JobStatus::Open,
+        metadata: json!({}),
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "s"),
+            title,
+            "emp-david",
+            Priority::Urgent,
+            NaiveDate::from_ymd_opt(2026, 10, 9).unwrap(),
+        )
+    };
+    let worked = item("worked");
+    let stalled = item("stalled");
+    let waiting = item("waiting");
+    for (job, status) in [
+        (&worked, StepStatus::Active),
+        (&stalled, StepStatus::Active),
+        (&waiting, StepStatus::Ready),
+    ] {
+        jobs.create_job_at(job, t("2026-10-09T00:00:00Z"), &[])
+            .await
+            .unwrap();
+        let mut build = Step::new(job.id, "task", "Build", 0);
+        build.id = StepId::new();
+        build.spec_slug = Some("build".into());
+        build.assignee_id = Some(AGENT.into());
+        build.status = status;
+        jobs.add_step_at(&build, t("2026-10-09T00:00:00Z"), &[])
+            .await
+            .unwrap();
+    }
+    let run = Job {
+        id: JobId::new(),
+        status: JobStatus::Open,
+        metadata: json!({ "packet": worked.id.to_string(), "step": "build" }),
+        ..Job::new(
+            "agent-run",
+            Subject::new("custom", "r"),
+            "builder run: worked",
+            AGENT,
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 10, 9).unwrap(),
+        )
+    };
+    jobs.create_job_at(&run, t("2026-10-09T00:00:00Z"), &[])
+        .await
+        .unwrap();
+    let mut building = Step::new(run.id, "task", "Building", 0);
+    building.id = StepId::new();
+    building.spec_slug = Some("building".into());
+    building.status = StepStatus::Active;
+    jobs.add_step_at(&building, t("2026-10-09T00:00:00Z"), &[])
+        .await
+        .unwrap();
+
+    let run_of = |v: &Value, title: &str| {
+        v["data"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no data in {v}"))
+            .iter()
+            .find(|r| r["job_title"] == title)
+            .unwrap_or_else(|| panic!("{title} in the queue: {v}"))
+            .get("run")
+            .cloned()
+    };
+    let (status, v) = get(
+        &app,
+        "/api/jobs/assignments?for=me",
+        Some(user_header(AGENT, "platform-admin")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        run_of(&v, "worked"),
+        Some(json!({ "state": "building", "run": run.id.to_string() })),
+        "{v}"
+    );
+    assert_eq!(
+        run_of(&v, "stalled"),
+        Some(json!({ "state": "no-run" })),
+        "{v}"
+    );
+    assert_eq!(run_of(&v, "waiting"), None, "a ready row has no claim: {v}");
+
+    // A caller who reads only its own packets would not see the run
+    // another actor owns, so judging it would be a confident wrong
+    // "no-run". It is told the runs were not read.
+    let (status, v) = get(
+        &app,
+        "/api/jobs/assignments?for=me",
+        Some(user_header(AGENT, "sales")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        run_of(&v, "stalled"),
+        Some(json!({ "state": "unread" })),
+        "{v}"
+    );
 }
 
 #[tokio::test]

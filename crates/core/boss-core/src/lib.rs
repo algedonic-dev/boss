@@ -10,6 +10,7 @@ pub mod gate_evidence;
 pub mod gate_window;
 pub mod http_client;
 pub mod id;
+pub mod integration;
 pub mod job;
 pub mod knowledge;
 pub mod machine_gate;

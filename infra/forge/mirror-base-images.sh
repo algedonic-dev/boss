@@ -18,22 +18,28 @@
 # infra/forge/boss-ci/Dockerfile's `FROM`s point at — one source of
 # truth, pinned by infra/lint/the-build-pulls-only-mirrored-bases.sh.
 #
-# AUTH. The one proven registry-push path on the forge host is david's
-# rootless docker with its ambient registry login (see
-# cluster-deploy-runner.sh). This script runs under the ops-runner as
-# ROOT, so it points the docker CLI at david's socket AND david's
-# docker config explicitly — otherwise root's own (unauthenticated)
-# config is read and the push 401s. Both are overridable; failure is
-# LOUD (a non-zero exit naming the image and step), never silent, so the
-# ops-request records exactly what broke.
+# AUTH. This runs as ROOT — under the ops-runner, and from the cluster
+# converge, which is root too since backlog 683d7fe9 — on the SYSTEM
+# docker daemon, and it pushes with the registry push login the forge
+# converge deposits from the credential broker's token
+# (forge-defaults.sh REGISTRY_PUSH_DIR; registry-token-deposit.sh). It
+# used david's rootless socket AND david's docker config, the converge's
+# login then; root's own config is unauthenticated and the push would
+# 401. Both are overridable; failure is LOUD (a non-zero exit naming the
+# image and step), never silent, so the ops-request records exactly what
+# broke.
 set -euo pipefail
 
 # The owner's namespace on the forge registry, from forge-defaults.sh
 # off /etc/boss/sor.env (BOSS_FORGE_REGISTRY_BASE overrides).
 . "$(dirname "$0")/forge-defaults.sh"
 forge_need REGISTRY_BASE
-export DOCKER_HOST="${BOSS_MIRROR_DOCKER_HOST:-unix:///run/user/1000/docker.sock}"
-export DOCKER_CONFIG="${BOSS_MIRROR_DOCKER_CONFIG:-/home/david/.docker}"
+if [ -n "${BOSS_MIRROR_DOCKER_HOST:-}" ]; then
+    export DOCKER_HOST="$BOSS_MIRROR_DOCKER_HOST"
+else
+    unset DOCKER_HOST
+fi
+export DOCKER_CONFIG="${BOSS_MIRROR_DOCKER_CONFIG:-$REGISTRY_PUSH_DIR}"
 
 # external source ref  |  forge repo:tag (under $REGISTRY_BASE)
 # Keep in lockstep with ci.yml (the kaniko executor the job runs in) and

@@ -14,7 +14,7 @@
 //!
 //! What each case pins, by RUNNING the lib's `tenant_check` and the
 //! runner's own `converge_tenant` (its text lifted from the runner,
-//! with a stub `boss`, a stub `sudo` standing in for the docker'd
+//! with a stub `boss`, a stub `docker` standing in for the docker'd
 //! kubectl, and the real run-summary.sh and alert-lib.sh):
 //!
 //!   * a checkout with one bad line: `boss tenant check` refuses, the
@@ -95,15 +95,15 @@ echo "2 ok, 0 missing, 0 invalid, 0 unknown — PASS"
     );
 }
 
-/// The stub `sudo`: the runner's kubectl is `sudo docker run … kubectl
+/// The stub `docker`: the runner's kubectl is `docker run … kubectl
 /// …`; every call is logged whole and stdin drained (the apply reads a
 /// dry-run document off a pipe), and a `create configmap` dry run
 /// prints a document for the apply to read.
-fn stub_sudo(bin: &Path) {
+fn stub_docker(bin: &Path) {
     write_exec(
-        &bin.join("sudo"),
+        &bin.join("docker"),
         r#"#!/usr/bin/env bash
-echo "sudo $*" >> "$STUB_LOG"
+echo "docker $*" >> "$STUB_LOG"
 cat > /dev/null
 case "$*" in
   *"create configmap "*) echo "apiVersion: v1"; echo "kind: ConfigMap" ;;
@@ -169,7 +169,7 @@ fn converge(name: &str, bad: bool, env: &[(&str, &str)], with_boss: bool) -> Run
     if with_boss {
         stub_boss(&bin);
     }
-    stub_sudo(&bin);
+    stub_docker(&bin);
     stub_curl(&bin);
     let src = checkout(&dir, bad);
     let tenants = dir.join("tenants");
@@ -179,8 +179,8 @@ fn converge(name: &str, bad: bool, env: &[(&str, &str)], with_boss: bool) -> Run
     let script = format!(
         "set -euo pipefail\n. '{summary}'\n. '{lib}'\n\
          REPO='{repo}'\nTENANTS_DIR='{tenants}'\nKUBECONFIG_PATH='{kc}'\n\
-         KAPPLY='sudo docker run --rm -i kubectl'\nSITE_SOURCE=''\n\
-         tenant_checkout() {{ rm -rf \"$4\"; cp -R '{src}' \"$4\"; }}\n\
+         KAPPLY='docker run --rm -i kubectl'\nSITE_SOURCE=''\n\
+         tenant_checkout() {{ rm -rf \"$3\"; cp -R '{src}' \"$3\"; }}\n\
          {fun}\nconverge_tenant boss-x boss-x david/tenant-x main\n",
         summary = repo_root().join(RUN_SUMMARY).display(),
         lib = repo_root().join(LIB).display(),
@@ -225,7 +225,7 @@ fn converge(name: &str, bad: bool, env: &[(&str, &str)], with_boss: bool) -> Run
 fn applied_boss_tenant(calls: &str) -> bool {
     calls
         .lines()
-        .any(|l| l.starts_with("sudo ") && l.contains("create configmap boss-tenant "))
+        .any(|l| l.starts_with("docker ") && l.contains("create configmap boss-tenant "))
 }
 
 fn tenant_check_field(run: &Run) -> String {

@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# restore-shared <path>... — put a file a builder just dirtied in the
+# shared checkout back to HEAD, keeping the change it discards.
+#
+# WHY (backlog 10d1567b, 2026-10-10). Builder run 63c60863's `cd
+# <worktree> && sed -i …` lost its cd to the harness and edited two files
+# in /work/boss. Claude Code's worktree-isolation guard then REFUSED the
+# builder's own `git -C /work/boss checkout -- <file>` — it refuses any
+# git aimed at the shared checkout — so the stray edit stood until the
+# coordinator restored it by hand ~40 minutes later. The guard on the
+# damage is infra/dev/hooks/shared-checkout-guard.py; this is the repair
+# for whatever slips past it, and it carries no git in its command line,
+# so an isolated builder can run it by absolute path:
+#
+#     /work/boss/infra/dev/restore-shared crates/…/judged_red.rs
+#
+# It restores ONLY what it can believe a builder just did: a TRACKED
+# REGULAR FILE under the shared checkout (not in .claude/worktrees/), that
+# differs from HEAD, last modified within BOSS_RESTORE_WINDOW seconds
+# (default 3600). An older change is the operator's, and is refused by
+# name. A directory, a symlink, a missing file and a pathspec are refused
+# too (review 0dc61dd6, finding 1): a stray write INSIDE a directory
+# freshens the directory's mtime, so a directory passed the window and
+# `git checkout HEAD -- <dir>` reverted every tracked change under it —
+# an operator's two-hour-old edit included, measured. The window is a
+# file's, so the argument is one file. Before it touches anything it
+# saves `git diff --binary HEAD -- <file>` under BOSS_RESTORE_SAVE
+# (default ~/.local/state/boss/restored); `git -C <shared> apply <patch>`
+# puts the change back, a binary file's included (finding 2: without
+# --binary a binary change was saved as one "Binary files differ" line
+# and destroyed by the checkout).
+#
+# THE SHARED CHECKOUT is the main checkout this script's own tree hangs
+# off (git's common dir), or BOSS_SHARED_CHECKOUT when set (the tests).
+# Exit 0 all restored, 1 any refused (each named on stderr), 2 usage.
+# Pinned by crates/core/boss-testing/tests/shared_checkout_guard.rs.
+set -u
+
+# This file's own age (backlog 0b36dd65): it runs from the main checkout,
+# which may trail origin/main. It warns and repairs, as wt-cargo builds —
+# a repair stopped by a stale door leaves the damage standing.
+here=$(dirname "$(readlink -f "$0")")
+if [ -r "$here/door-freshness.sh" ]; then
+  # shellcheck source=door-freshness.sh
+  . "$here/door-freshness.sh"
+  if stale=$(door_is_stale "$0"); then
+    echo "restore-shared: WARNING — $stale" >&2
+  fi
+fi
+
+[ "$#" -gt 0 ] || { echo "usage: restore-shared <path>..." >&2; exit 2; }
+
+shared="${BOSS_SHARED_CHECKOUT:-}"
+if [ -z "$shared" ]; then
+  common=$(git -C "$here" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    || { echo "restore-shared: cannot find the checkout this script lives in" >&2; exit 2; }
+  shared=$(dirname "$common")
+fi
+shared=$(cd "$shared" 2>/dev/null && pwd -P) || { echo "restore-shared: no checkout at ${BOSS_SHARED_CHECKOUT:-}" >&2; exit 2; }
+window="${BOSS_RESTORE_WINDOW:-3600}"
+# Every argument is a path, never a pattern: `src/*` or `:(glob)…` is
+# one file's name here, not every file it would match.
+export GIT_LITERAL_PATHSPECS=1
+save="${BOSS_RESTORE_SAVE:-${XDG_STATE_HOME:-$HOME/.local/state}/boss/restored}"
+now=$(date -u +%s)
+status=0
+
+for arg in "$@"; do
+  case "$arg" in
+    /*) full="$arg" ;;
+    *) full="$shared/$arg" ;;
+  esac
+  full=$(realpath -m -- "$full")
+  case "$full" in
+    "$shared"/*) rel="${full#"$shared"/}" ;;
+    *) echo "restore-shared: $arg is outside the shared checkout $shared — refused" >&2; status=1; continue ;;
+  esac
+  case "$rel" in
+    .claude/worktrees/*) echo "restore-shared: $rel is in a worktree, not the shared checkout — use git -C on that worktree" >&2; status=1; continue ;;
+  esac
+  if [ ! -f "$full" ] || [ -L "$full" ]; then
+    echo "restore-shared: $rel is not a regular file (a directory, a symlink, a pattern or a missing file) — name each changed file; refused, nothing touched" >&2; status=1; continue
+  fi
+  if ! git -C "$shared" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+    echo "restore-shared: $rel is not tracked — there is no HEAD to put back; delete it by hand if it is yours" >&2; status=1; continue
+  fi
+  if git -C "$shared" diff --quiet HEAD -- "$rel"; then
+    echo "restore-shared: $rel has no change from HEAD — nothing to restore" >&2; status=1; continue
+  fi
+  mtime=$(stat -c %Y -- "$full" 2>/dev/null || echo 0)
+  if [ $((now - mtime)) -gt "$window" ]; then
+    echo "restore-shared: $rel changed $((now - mtime))s ago, older than the ${window}s window — that change is not a builder's stray write; refused" >&2
+    status=1; continue
+  fi
+  mkdir -p "$save" || { echo "restore-shared: cannot create $save — refused, nothing touched" >&2; status=1; continue; }
+  patch="$save/$(date -u +%Y%m%dT%H%M%SZ)-$$-$(printf '%s' "$rel" | tr '/' '_').patch"
+  git -C "$shared" diff --binary HEAD -- "$rel" > "$patch" && [ -s "$patch" ] \
+    || { echo "restore-shared: could not save the change to $patch — refused, nothing touched" >&2; status=1; continue; }
+  if git -C "$shared" checkout HEAD -- "$rel"; then
+    echo "restored $rel to HEAD in $shared; the discarded change is saved at $patch (git -C $shared apply $patch puts it back):"
+    cat "$patch"
+  else
+    echo "restore-shared: git checkout of $rel failed; the change is saved at $patch" >&2; status=1
+  fi
+done
+exit "$status"

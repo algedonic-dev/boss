@@ -451,7 +451,7 @@ async fn first_record_cannot_be_replaced<R: JobsRepository>(repo: &R) {
             .is_err(),
         "ordinary merge cannot erase a first record"
     );
-    let mut rewrite = repo.get_step(&step.id).await.unwrap().unwrap();
+    let (mut rewrite, read) = repo.get_step_versioned(&step.id).await.unwrap().unwrap();
     rewrite.metadata = serde_json::json!({});
     assert!(
         repo.update_step(&rewrite).await.is_err(),
@@ -464,6 +464,8 @@ async fn first_record_cannot_be_replaced<R: JobsRepository>(repo: &R) {
             changed: vec!["evidence".into()],
             kept: vec![],
             unskipped: false,
+            // The row's true version, so the first record is what refuses.
+            read: Some(read),
         }],
         inserted: vec![],
     };

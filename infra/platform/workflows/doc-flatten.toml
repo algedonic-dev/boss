@@ -53,7 +53,7 @@ title_template = "Find what has settled but not folded"
 # four work steps declare a block; `review` stays a person's sign-off.
 # `survey` reads the corpus and records what it found, no car: the
 # analyst setting.
-agent = { profile = "analyst", model = "opus-5[1m]", budget_usd = 2, effort = "medium" }
+agent = { profile = "analyst", model = "opus-5-5", budget_usd = 2, effort = "medium" }
 fields = [
   { name = "resolved_found", field_type = "string", required = true },
   { name = "source_docs", field_type = "string", required = true },
@@ -67,7 +67,7 @@ ready_when = "steps.survey.done"
 title_template = "Fold the settled decisions into the current-truth record"
 # A car writing settled paragraphs into docs/architecture-decisions.md —
 # the same work, and so the same setting, as design-doc's `fold`.
-agent = { profile = "builder", model = "opus-5[1m]", budget_usd = 5, effort = "high" }
+agent = { profile = "builder", model = "opus-5-5", budget_usd = 5, effort = "high" }
 fields = [
   { name = "decisions_folded", field_type = "string", required = true },
   { name = "target_sections", field_type = "string", required = true },
@@ -81,7 +81,7 @@ title_template = "Retire what is now superseded; say what is kept and why"
 # A car too, but a smaller one: deleting what the fold superseded and
 # saying what stays, after the judgement of what settled was made at
 # `survey` and `fold`.
-agent = { profile = "builder", model = "opus-5[1m]", budget_usd = 3, effort = "medium" }
+agent = { profile = "builder", model = "opus-5-5", budget_usd = 3, effort = "medium" }
 fields = [
   { name = "retired", field_type = "string", required = true },
   { name = "kept", field_type = "string", required = true },
@@ -94,7 +94,7 @@ ready_when = "steps.curate.done"
 title_template = "Prove the corpus still resolves"
 # Runs the lints and follows the references on the landed tree and
 # records the result, no car: the analyst setting.
-agent = { profile = "analyst", model = "opus-5[1m]", budget_usd = 2, effort = "medium" }
+agent = { profile = "analyst", model = "opus-5-5", budget_usd = 2, effort = "medium" }
 fields = [
   { name = "lint", field_type = "string", required = true },
   { name = "references", field_type = "string", required = true },

@@ -24,13 +24,14 @@
 //!     converge checks out beside the product and delivers as the
 //!     `boss-tenant` ConfigMap, mounted at /opt/boss/tenant/seeds — the
 //!     step-plugins ConfigMap's mechanism);
-//!   * the converge MEASURES whether its own credential can read the
-//!     tenant repo (`git ls-remote`, the URL derived from the checkout's
-//!     `forgejo` remote — never a token or URL of its own) and, if not,
-//!     skips that instance whole, naming `tenant_source: unreadable` on
-//!     the packet, the instance-secrets skip shape — so the first converge
-//!     answers whether the runner's token needs a scope from David (a root
-//!     ceremony) instead of a person guessing.
+//!   * the converge MEASURES whether it can read the tenant repo (`git
+//!     ls-remote`) and, if not, skips that instance whole, naming
+//!     `tenant_source: unreadable` on the packet, the instance-secrets
+//!     skip shape — so the first converge answers instead of a person
+//!     guessing. Since backlog 683d7fe9 (the converge runs as root) it
+//!     reads the forge's OWN repository on disk, served as that
+//!     repository's owner, with no credential at all — it was the
+//!     checkout's `forgejo` remote and its owner's token until then.
 //!
 //! Prod stays on examples/brewery in this car; the flip is David's
 //! decision moment and the file's comment names the lines it changes.
@@ -38,8 +39,9 @@
 //! What each case pins: the tree's instance list and boss.yaml carry the
 //! new shape and not the old; a repo-sourced instance renders the
 //! delivered mount and each malformed source is refused by name; the
-//! tenant URL is derived from the checkout's own remote and readability
-//! is measured, never assumed, with the URL redacted from every message;
+//! tenant is read from the forge's own repository, derived from the
+//! compose file that declares it, and readability is measured, never
+//! assumed;
 //! the tenant directory is staged flat for ONE ConfigMap; the runner
 //! measures before it provisions and delivers before it applies, and the
 //! no-op tick's skipped set counts an undelivered tenant; and the launcher
@@ -313,12 +315,16 @@ fn a_repo_sourced_instance_renders_the_delivered_mount_and_a_bad_source_is_refus
     }
 }
 
-/// A fixture forge: bare repos under `forge/david/`, a checkout of the
-/// product with a `forgejo` remote pointing at its bare repo — the
-/// shape the converge's clone on the forge host has.
+/// A fixture forge: bare repos under `forge/david/`, found the way the
+/// forge host finds its own — a compose file mounting a data directory
+/// at the container's /data, whose `git/repositories` holds them
+/// (forge-repo-path.sh) — and a checkout of the product with a `forgejo`
+/// remote pointing at its bare repo, the shape the merge verb's
+/// credential derivation reads.
 struct Forge {
     root: PathBuf,
     checkout: PathBuf,
+    compose: PathBuf,
 }
 
 impl Forge {
@@ -402,7 +408,25 @@ impl Forge {
                 "boss",
             ],
         );
-        Self { root, checkout }
+        // The compose file the forge host's path is derived from: its
+        // /data is fdata/, and fdata/git/repositories is the forge dir.
+        std::fs::create_dir_all(root.join("fdata/git")).unwrap();
+        std::os::unix::fs::symlink(root.join("forge"), root.join("fdata/git/repositories"))
+            .unwrap();
+        let compose = root.join("forgejo/docker-compose.yml");
+        std::fs::create_dir_all(compose.parent().unwrap()).unwrap();
+        write_file(
+            &compose,
+            &format!(
+                "services:\n  forgejo:\n    volumes:\n      - {}:/data\n",
+                root.join("fdata").display()
+            ),
+        );
+        Self {
+            root,
+            checkout,
+            compose,
+        }
     }
 
     fn tenant_sha(&self) -> String {
@@ -421,6 +445,13 @@ impl Forge {
         cmd.arg("-c")
             .arg(&script)
             .env("REPO", &self.checkout)
+            .env("BOSS_FORGE_COMPOSE", &self.compose)
+            // The product's own path override, which a tenant read must
+            // NOT take for its own (it names one repository).
+            .env(
+                "BOSS_FORGE_REPO_PATH",
+                self.root.join("forge/david/boss.git"),
+            )
             .env("GIT_TERMINAL_PROMPT", "0")
             .current_dir(&self.root);
         for (k, v) in env {
@@ -435,12 +466,137 @@ impl Forge {
     }
 }
 
+/// THE CONVERGE READS THE TENANT FROM THE FORGE'S OWN REPOSITORY (backlog
+/// 683d7fe9, car 2): the path derived from the compose file the forge
+/// host's repository path is (forge-repo-path.sh), never the product's
+/// override, and no credential — root holds none for the forge, and a
+/// local path needs none.
 #[test]
-fn the_converge_derives_the_tenant_url_from_its_own_remote_and_measures_readability() {
+fn the_converge_reads_the_tenant_from_the_forges_own_repository_and_measures_readability() {
+    let f = Forge::new("measure");
+    let (rc, out, err) = f.run(r#"tenant_repo_path david/tenant-fixture"#, &[]);
+    assert_eq!(rc, 0, "{err}");
+    assert_eq!(
+        out.trim(),
+        f.root
+            .join("fdata/git/repositories/david/tenant-fixture.git")
+            .to_str()
+            .unwrap(),
+        "the tenant's path is derived from the compose file, under the forge's repository \
+         root — and the product's BOSS_FORGE_REPO_PATH is not taken for it"
+    );
+    for bad in [
+        "tenant-fixture",
+        "../etc/passwd",
+        "david/../x",
+        "david/",
+        "/david/x",
+    ] {
+        let (rc, out, _) = f.run(&format!("tenant_repo_path '{bad}'"), &[]);
+        assert_eq!(rc, 2, "`{bad}` is not an owner/name: CANNOT DERIVE");
+        assert!(out.trim().is_empty(), "`{bad}`: nothing printed");
+    }
+    // The repository is this process's own here, so the serving side runs
+    // as this process: no runuser, no setpriv.
+    let (rc, out, err) = f.run(
+        &format!(
+            "tenant_repo_runas '{}'",
+            f.root.join("forge/david/tenant-fixture.git").display()
+        ),
+        &[],
+    );
+    assert_eq!(rc, 0, "{err}");
+    assert_eq!(out, "", "the owner is this process: the words are empty");
+
+    // Readability is MEASURED: ls-remote answers the ref's sha.
+    let (rc, out, err) = f.run(r#"tenant_source_check david/tenant-fixture main"#, &[]);
+    assert_eq!(rc, 0, "{err}");
+    assert_eq!(
+        out.trim(),
+        f.tenant_sha(),
+        "the sha the ref resolves to, read not typed"
+    );
+    // A repo the forge does not hold is unreadable — rc 1, the reason
+    // (naming the path looked at) on stderr.
+    let (rc, out, err) = f.run(r#"tenant_source_check david/private main"#, &[]);
+    assert_eq!(rc, 1, "an unreadable repo is rc 1: {err}");
+    assert!(out.trim().is_empty(), "no sha for an unreadable source");
+    assert!(
+        err.contains("david/private.git"),
+        "the reason is said: {err}"
+    );
+    // A ref the repo does not have is the same verdict.
+    let (rc, _, err) = f.run(
+        r#"tenant_source_check david/tenant-fixture no-such-branch"#,
+        &[],
+    );
+    assert_eq!(rc, 1, "a missing ref is unreadable: {err}");
+    // Not an owner/name: rc 2, never a guess.
+    let (rc, _, _) = f.run(r#"tenant_source_check private main"#, &[]);
+    assert_eq!(rc, 2);
+    // And the checkout: a shallow clone of the ref, fresh each time.
+    let dir = f.root.join("tenants/playground");
+    let (rc, _, err) = f.run(
+        &format!(
+            r#"tenant_checkout david/tenant-fixture main '{}'"#,
+            dir.display()
+        ),
+        &[],
+    );
+    assert_eq!(rc, 0, "{err}");
+    assert!(dir.join("tenant.toml").is_file() && dir.join("seeds/workflows.toml").is_file());
+    write_file(&dir.join("stale-file"), "from a previous converge\n");
+    let (rc, _, err) = f.run(
+        &format!(
+            r#"tenant_checkout david/tenant-fixture main '{}'"#,
+            dir.display()
+        ),
+        &[],
+    );
+    assert_eq!(rc, 0, "{err}");
+    assert!(
+        !dir.join("stale-file").exists(),
+        "the checkout is replaced, not layered: a stale file answering for a moved ref is the wrong-target class"
+    );
+    let (rc, _, err) = f.run(
+        &format!(r#"tenant_checkout david/private main '{}'"#, dir.display()),
+        &[],
+    );
+    assert_eq!(rc, 1, "an unreadable checkout is rc 1: {err}");
+    assert!(
+        !dir.exists(),
+        "a failed checkout leaves no directory behind"
+    );
+
+    // The read names no credential and no remote: neither function asks
+    // a checkout for a URL, and both take the served, checked shape.
+    let lib = std::fs::read_to_string(repo_root().join(LIB)).unwrap();
+    for f in ["tenant_source_check() {", "tenant_checkout() {"] {
+        let start = lib.find(f).unwrap();
+        let end = lib[start..].find("\n}\n").unwrap();
+        let body = &lib[start..start + end];
+        assert!(
+            !body.contains("tenant_repo_url") && !body.contains("remote get-url"),
+            "{f} reads through a checkout's remote again — a credential root does not hold"
+        );
+        for want in [
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "git -c core.hooksPath=/dev/null",
+            "--upload-pack=\"${TENANT_RUNAS:+$TENANT_RUNAS }git upload-pack\" -- \"file://$TENANT_PATH\"",
+        ] {
+            assert!(body.contains(want), "{f} lost `{want}`");
+        }
+    }
+}
+
+/// The URL derivation the MERGE verb pushes a tenant through
+/// (merge-tenant-main.sh): the checkout's forgejo remote with the repo
+/// path replaced — same host, same scheme, same credential. A writer
+/// needs a credential; the converge's read does not use this any more.
+#[test]
+fn the_merge_verb_derives_the_tenant_url_from_its_checkouts_remote() {
     let f = Forge::new("readable");
     let bare = f.root.join("forge/david");
-    // The URL: the checkout's forgejo remote with the repo path replaced
-    // — same host, same scheme, same credential.
     let (rc, out, err) = f.run(r#"tenant_repo_url "$REPO" david/tenant-fixture"#, &[]);
     assert_eq!(rc, 0, "{err}");
     assert_eq!(
@@ -483,65 +639,9 @@ fn the_converge_derives_the_tenant_url_from_its_own_remote_and_measures_readabil
     assert_eq!(rc, 2, "no forgejo remote is CANNOT DERIVE");
     assert!(out.trim().is_empty());
 
-    // Readability is MEASURED: ls-remote answers the ref's sha.
-    let f = Forge::new("measure");
-    let (rc, out, err) = f.run(
-        r#"tenant_source_check "$REPO" david/tenant-fixture main"#,
-        &[],
-    );
-    assert_eq!(rc, 0, "{err}");
-    assert_eq!(
-        out.trim(),
-        f.tenant_sha(),
-        "the sha the ref resolves to, read not typed"
-    );
-    // A repo the credential cannot read (here: one that does not exist)
-    // is unreadable — rc 1, the reason on stderr.
-    let (rc, out, err) = f.run(r#"tenant_source_check "$REPO" david/private main"#, &[]);
-    assert_eq!(rc, 1, "an unreadable repo is rc 1: {err}");
-    assert!(out.trim().is_empty(), "no sha for an unreadable source");
-    assert!(!err.trim().is_empty(), "the reason is said");
-    // A ref the repo does not have is the same verdict.
-    let (rc, _, err) = f.run(
-        r#"tenant_source_check "$REPO" david/tenant-fixture no-such-branch"#,
-        &[],
-    );
-    assert_eq!(rc, 1, "a missing ref is unreadable: {err}");
-    // And the checkout: a shallow clone of the ref, fresh each time.
-    let dir = f.root.join("tenants/playground");
-    let (rc, _, err) = f.run(
-        &format!(
-            r#"tenant_checkout "$REPO" david/tenant-fixture main '{}'"#,
-            dir.display()
-        ),
-        &[],
-    );
-    assert_eq!(rc, 0, "{err}");
-    assert!(dir.join("tenant.toml").is_file() && dir.join("seeds/workflows.toml").is_file());
-    write_file(&dir.join("stale-file"), "from a previous converge\n");
-    let (rc, _, err) = f.run(
-        &format!(
-            r#"tenant_checkout "$REPO" david/tenant-fixture main '{}'"#,
-            dir.display()
-        ),
-        &[],
-    );
-    assert_eq!(rc, 0, "{err}");
-    assert!(
-        !dir.join("stale-file").exists(),
-        "the checkout is replaced, not layered: a stale file answering for a moved ref is the wrong-target class"
-    );
-    let (rc, _, err) = f.run(
-        &format!(
-            r#"tenant_checkout "$REPO" david/private main '{}'"#,
-            dir.display()
-        ),
-        &[],
-    );
-    assert_eq!(rc, 1, "an unreadable checkout is rc 1: {err}");
-
-    // A URL with a credential never reaches a journal: every message
-    // goes through the redaction, and the redaction hides the userinfo.
+    // A URL with a credential never reaches a journal: the merge verb's
+    // messages go through the redaction, and the redaction hides the
+    // userinfo.
     let (rc, out, _) = f.run(
         r#"printf '%s\n' "fatal: repository 'http://abc123:x-oauth@10.20.0.15:3000/david/private.git/' not found" | redact_url"#,
         &[],
@@ -550,19 +650,6 @@ fn the_converge_derives_the_tenant_url_from_its_own_remote_and_measures_readabil
     assert_eq!(
         out.trim(),
         "fatal: repository 'http://<redacted>@10.20.0.15:3000/david/private.git/' not found"
-    );
-    let lib = std::fs::read_to_string(repo_root().join(LIB)).unwrap();
-    let start = lib.find("tenant_source_check() {").unwrap();
-    let end = lib[start..].find("\n}\n").unwrap();
-    assert!(
-        lib[start..start + end].contains("redact_url"),
-        "the check's stderr goes through the redaction"
-    );
-    let start = lib.find("tenant_checkout() {").unwrap();
-    let end = lib[start..].find("\n}\n").unwrap();
-    assert!(
-        lib[start..start + end].contains("redact_url"),
-        "the checkout's stderr goes through the redaction"
     );
 }
 

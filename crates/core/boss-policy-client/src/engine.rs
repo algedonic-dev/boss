@@ -5,7 +5,74 @@ use std::sync::Arc;
 
 use crate::port::{PolicyError, PolicyRepository};
 use crate::predicates::scope_to_predicate;
-use crate::types::{Action, Decision, Predicate, Resource, Scope, User};
+use crate::types::{Action, Decision, PolicyRule, Predicate, Resource, Scope, User, UserOverride};
+
+/// Evaluate the exact ordered owner inputs at an explicit expiry instant.
+/// This function supplies no snapshot or locking authority by itself.
+pub fn evaluate_snapshot(
+    user: &User,
+    action: Action,
+    resource: &Resource,
+    overrides: &[UserOverride],
+    rule: Option<&PolicyRule>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Decision, Option<chrono::DateTime<chrono::Utc>>) {
+    if let Some(decision) = override_decision(user, action, resource, overrides, now) {
+        return decision;
+    }
+    let decision = match rule {
+        Some(rule) if rule.active => match &rule.scope {
+            Scope::None => Decision::Deny {
+                reason: format!(
+                    "role {} is denied {} on {}",
+                    user.role,
+                    action.as_str(),
+                    resource.as_str()
+                ),
+            },
+            scope => Decision::Allow {
+                scope: scope.clone(),
+            },
+        },
+        _ => Decision::Deny {
+            reason: format!(
+                "no active rule for role {} on {}:{}",
+                user.role,
+                resource.as_str(),
+                action.as_str()
+            ),
+        },
+    };
+    (decision, None)
+}
+
+fn override_decision(
+    user: &User,
+    action: Action,
+    resource: &Resource,
+    overrides: &[UserOverride],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(Decision, Option<chrono::DateTime<chrono::Utc>>)> {
+    overrides
+        .iter()
+        .find(|ov| {
+            ov.user_id == user.id
+                && &ov.resource == resource
+                && ov.action == action
+                && ov.is_active_at(now)
+        })
+        .map(|ov| {
+            let decision = match &ov.scope {
+                Scope::None => Decision::Deny {
+                    reason: format!("user override: {}", ov.reason),
+                },
+                scope => Decision::Allow {
+                    scope: scope.clone(),
+                },
+            };
+            (decision, ov.expires_at)
+        })
+}
 
 pub struct PolicyEngine<R: PolicyRepository> {
     repo: Arc<R>,
@@ -39,6 +106,17 @@ pub fn expiry_now() -> chrono::DateTime<chrono::Utc> {
 }
 
 impl<R: PolicyRepository> PolicyEngine<R> {
+    pub fn try_lock_selection_rows(
+        &self,
+    ) -> Result<Option<Box<dyn crate::port::PolicySelectionRows + '_>>, PolicyError> {
+        self.repo.try_lock_selection_rows()
+    }
+    pub fn lock_selection_rows(
+        &self,
+    ) -> Result<Box<dyn crate::port::PolicySelectionRows + '_>, PolicyError> {
+        self.repo.lock_selection_rows()
+    }
+
     pub fn new(repo: Arc<R>) -> Self {
         Self {
             repo,
@@ -113,46 +191,22 @@ impl<R: PolicyRepository> PolicyEngine<R> {
     ) -> Result<(Decision, Option<chrono::DateTime<chrono::Utc>>), PolicyError> {
         // 1. User overrides first.
         let overrides = self.repo.list_user_overrides(&user.id).await?;
-        for ov in &overrides {
-            if ov.resource == resource && ov.action == action && ov.is_active_at(now) {
-                let decision = match &ov.scope {
-                    Scope::None => Decision::Deny {
-                        reason: format!("user override: {}", ov.reason),
-                    },
-                    other => Decision::Allow {
-                        scope: other.clone(),
-                    },
-                };
-                return Ok((decision, ov.expires_at));
-            }
+        if let Some(decision) = override_decision(user, action, &resource, &overrides, now) {
+            return Ok(decision);
         }
 
         // 2. Role rule.
         let rule_id = crate::types::rule_id(&user.role, &resource, action);
         let rule = self.repo.rule_for(&rule_id).await?;
 
-        let decision = match rule {
-            Some(r) if r.active => match r.scope {
-                Scope::None => Decision::Deny {
-                    reason: format!(
-                        "role {} is denied {} on {}",
-                        user.role,
-                        action.as_str(),
-                        resource.as_str()
-                    ),
-                },
-                other => Decision::Allow { scope: other },
-            },
-            _ => Decision::Deny {
-                reason: format!(
-                    "no active rule for role {} on {}:{}",
-                    user.role,
-                    resource.as_str(),
-                    action.as_str(),
-                ),
-            },
-        };
-        Ok((decision, None))
+        Ok(evaluate_snapshot(
+            user,
+            action,
+            &resource,
+            &overrides,
+            rule.as_ref(),
+            now,
+        ))
     }
 
     /// The Predicate a list endpoint should apply to filter rows to
@@ -175,6 +229,104 @@ mod tests {
     use super::*;
     use crate::in_memory::InMemoryPolicy;
     use crate::types::{AccessTier, PolicyRule, UserOverride};
+
+    #[test]
+    fn native_snapshot_preserves_ordered_override_expiry_and_deny_text() {
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let u = user("sales-rep", "emp-7");
+        let expired = UserOverride {
+            id: "expired-first".into(),
+            user_id: u.id.clone(),
+            resource: Resource::job(),
+            action: Action::Read,
+            scope: Scope::All,
+            reason: "expired".into(),
+            expires_at: Some(now),
+        };
+        let live = UserOverride {
+            id: "live-second".into(),
+            scope: Scope::None,
+            reason: "explicit refusal".into(),
+            expires_at: Some(now + chrono::Duration::seconds(1)),
+            ..expired.clone()
+        };
+        let role = PolicyRule::new("sales-rep", Resource::job(), Action::Read, Scope::Territory);
+        assert_eq!(
+            evaluate_snapshot(
+                &u,
+                Action::Read,
+                &Resource::job(),
+                &[expired.clone(), live.clone()],
+                Some(&role),
+                now
+            ),
+            (
+                Decision::Deny {
+                    reason: "user override: explicit refusal".into()
+                },
+                live.expires_at
+            )
+        );
+        assert_eq!(
+            evaluate_snapshot(
+                &u,
+                Action::Read,
+                &Resource::job(),
+                &[expired, live],
+                Some(&role),
+                now + chrono::Duration::seconds(1)
+            ),
+            (
+                Decision::Allow {
+                    scope: Scope::Territory
+                },
+                None
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn native_snapshot_and_existing_engine_use_the_same_rule_and_override_semantics() {
+        let u = user("sales-rep", "emp-7");
+        let rule = PolicyRule::new("sales-rep", Resource::job(), Action::Read, Scope::None);
+        let repo = Arc::new(InMemoryPolicy::with_rules([rule.clone()]));
+        let engine = PolicyEngine::new(repo.clone());
+        let now = expiry_now();
+        assert_eq!(
+            evaluate_snapshot(&u, Action::Read, &Resource::job(), &[], Some(&rule), now),
+            engine
+                .check_at(&u, Action::Read, Resource::job(), now)
+                .await
+                .unwrap()
+        );
+        let ov = UserOverride {
+            id: "live".into(),
+            user_id: u.id.clone(),
+            resource: Resource::job(),
+            action: Action::Read,
+            scope: Scope::Territory,
+            reason: "delegated".into(),
+            expires_at: None,
+        };
+        repo.upsert_user_override(&ov, "fixture").await.unwrap();
+        assert_eq!(
+            evaluate_snapshot(&u, Action::Read, &Resource::job(), &[ov], Some(&rule), now),
+            engine
+                .check_at(&u, Action::Read, Resource::job(), now)
+                .await
+                .unwrap()
+        );
+        let other = user("another-role", "emp-7");
+        assert_eq!(
+            evaluate_snapshot(&other, Action::Read, &Resource::job(), &[], None, now),
+            (
+                Decision::Deny {
+                    reason: "no active rule for role another-role on job:read".into()
+                },
+                None
+            )
+        );
+    }
 
     fn user(role: &str, id: &str) -> User {
         User {

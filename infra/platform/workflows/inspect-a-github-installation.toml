@@ -39,3 +39,19 @@ ready_when = "steps.observe.done"
 title_template = "Public installation observation recorded"
 terminal = { outcome = "observed" }
 metadata_defaults = { outcome_kind = "completed" }
+
+[[workflow.step]]
+title = "withdrawn"
+kind = "outcome"
+# A request replaced by a correctly targeted one (df452c4d by 87b68bf3), or
+# one whose question another request already answered (87b68bf3 by
+# c78bd9d5), had no ending but `observed` and stood urgent for days
+# (backlog ce9b9207). The marker's value is the reason, set through
+# PATCH /api/jobs/{id}/metadata. It is absent at admission, and `> ""` reads
+# false over an absent key, so this cannot close a packet on create (lint
+# phase 6). It follows the signed scope because a terminal must be reachable
+# from the root step, and both stranded requests were signed.
+ready_when = "steps.scope.done AND job.metadata.withdrawn > \"\""
+title_template = "Withdrawn — replaced or no longer needed, nothing observed"
+terminal = { outcome = "withdrawn" }
+metadata_defaults = { outcome_kind = "withdrawn" }

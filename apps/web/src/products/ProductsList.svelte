@@ -135,8 +135,7 @@
       {#if query}
         No products match <strong>{query}</strong>.
       {:else}
-        No products yet. The brewery's finished-product catalog is seeded via
-        <code>examples/brewery/seeds/products.toml</code>.
+        No products yet.
       {/if}
     </p>
   {:else}
@@ -162,7 +161,7 @@
           {@const t = totals[p.sku]}
           <tr class:retired={!p.active}>
             <td><Link to={entityHref('product', p.sku)} className="sku">{p.sku}</Link></td>
-            <td>{p.name}</td>
+            <td>{p.name}{#if !p.active} <span>Retired</span>{/if}</td>
             <td>{p.product_kind}</td>
             <td>{p.package_unit}</td>
             {#if t?.ok}

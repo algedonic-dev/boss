@@ -21,6 +21,7 @@
 
 import { notFoundBack, parseRoute, type Route } from '../router';
 import type { Department } from '@boss/web-kit/nav';
+import { moduleOn, type ManifestState } from '@boss/web-kit/session/manifest-inline';
 import { ROUTE_CATALOG, appForSection, type AppId, type NavItem } from './nav-catalog';
 
 /// Sections that deliberately resolve to the Home app instead of a
@@ -117,6 +118,17 @@ export function moduleForRoute(route: Route): { id: string; label: string } | nu
   return { id: entry.module, label: entry.label };
 }
 
+/// Clean absence is catalog data, not a tenant or route-name branch.
+/// An unread manifest decides nothing; App keeps its loading/error gate.
+export function withManifest(route: Route, pathname: string, manifest: ManifestState): Route {
+  if (manifest.kind !== 'ready' || route.kind === 'notFound') return route;
+  const entry = (ROUTE_CATALOG as Record<string, NavItem | undefined>)[sectionForRoute(route)];
+  if (entry?.whenDisabled === 'absent' && entry.module && !moduleOn(manifest, entry.module)) {
+    return { kind: 'notFound', path: pathname };
+  }
+  return route;
+}
+
 /// Which sidebar row a route lights — the ONE answer, and the only
 /// one this module exports. Most rows are named by the route's kind
 /// (SECTION_FOR_KIND); a row that depends on a route PARAMETER, which
@@ -176,10 +188,10 @@ const SECTION_FOR_KIND: Readonly<Record<Route['kind'], string>> = {
   watchlist: 'accounts',
   vendors: 'vendors',
   vendor: 'vendors',
-  // A purchase order and a vendor invoice are both about a vendor;
-  // neither has a sidebar row of its own.
-  po: 'vendors',
-  vendorInvoice: 'vendors',
+  // Financial detail availability is separate from the vendor register;
+  // neither has a sidebar row of its own (design45fad3bb).
+  po: 'purchase-order',
+  vendorInvoice: 'vendor-invoice',
   people: 'people',
   employee: 'people',
   parts: 'parts',
@@ -216,7 +228,6 @@ const SECTION_FOR_KIND: Readonly<Record<Route['kind'], string>> = {
   product: 'products',
   shop: 'shop',
   shopProduct: 'shop',
-  views: 'views',
 
   // Operate-family kinds highlight the Operate row (2026-08-31
   // consolidation); registry- and design-family kinds highlight

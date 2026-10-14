@@ -15,7 +15,7 @@
 //! `a_secret_header_rides_in_a_file.rs` pins the lint that keeps the argv
 //! shape out.
 
-use boss_testing::{create_dir, repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{create_dir, repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -98,6 +98,10 @@ impl Fixture {
             .env_remove("BOSS_MACHINE_TOKEN_HOSTS")
             .env("BOSS_SOR_ENV", self.root.join("no-sor.env"))
             .env_remove("BOSS_MACHINE_TOKEN");
+        // Nor a proxy: the rule withholds a request curl would send
+        // through one (backlog 50708d76, F4), so a suite run from a
+        // proxied shell would read every stamped row as withheld.
+        without_proxy(&mut cmd);
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -762,6 +766,240 @@ fn a_url_with_no_leading_http_scheme_is_withheld_whatever_it_holds_later() {
     }
 }
 
+/// A PROXY IS A HOST THE RULE NEVER SAW (backlog 50708d76, F4 of review
+/// 927f8602). The rule judges the URL; with a proxy variable set curl
+/// connects to the proxy instead and hands it the whole request, header
+/// file and all — the reviewer's stub proxy received the line on every
+/// admitted row. So a URL the list admits is withheld by every reader of
+/// the rule when curl would send it through a proxy, and the line names
+/// the VARIABLE, never its value (a proxy URL may carry a login).
+///
+/// The third column is where curl 7.88.1 actually went, measured
+/// 2026-10-09 with the proxy on a closed port and the target on another:
+/// http reads `http_proxy` and never `HTTP_PROXY`; https reads both
+/// spellings of `https_proxy`; both read `all_proxy` and `ALL_PROXY`;
+/// loopback is proxied like any host. Where curl goes direct the rule
+/// still stamps — the fix withholds from the proxy, not from the record.
+#[test]
+fn a_request_curl_would_send_through_a_proxy_carries_no_machine_token() {
+    const PATH: &str = "/api/jobs?state=q-secret";
+    // The login is formatted in so the no-secrets lint reads it as the
+    // planted fixture it is, not a literal password.
+    let proxy = format!("http://proxyuser:{}@127.0.0.1:9", "proxy-pass-9e2");
+    let cases = [
+        ("http_proxy", "http://127.0.0.1:7900", true),
+        ("HTTP_PROXY", "http://127.0.0.1:7900", false),
+        ("https_proxy", "http://127.0.0.1:7900", false),
+        ("HTTPS_PROXY", "http://127.0.0.1:7900", false),
+        ("all_proxy", "http://127.0.0.1:7900", true),
+        ("ALL_PROXY", "http://127.0.0.1:7900", true),
+        ("http_proxy", "https://127.0.0.1:7900", false),
+        ("HTTP_PROXY", "https://127.0.0.1:7900", false),
+        ("https_proxy", "https://127.0.0.1:7900", true),
+        ("HTTPS_PROXY", "https://127.0.0.1:7900", true),
+        ("all_proxy", "https://127.0.0.1:7900", true),
+        ("ALL_PROXY", "https://127.0.0.1:7900", true),
+        ("http_proxy", "http://Record.Test:7900", true),
+    ];
+    let body = "set -eu\n\
+                machine_token_header MT_HDR \"$URL\"\n\
+                machine_gate_value_header GV_HDR \"$URL\" fake-held-value 2>/dev/null\n\
+                rc=0; machine_token_admits \"$URL\" || rc=$?\n\
+                printf '%s [%s] [%s]\\n' \"$rc\" \"$(machine_token_proxy \"$URL\")\" \"${GV_HDR:+gv}\" > \"$STUB_DIR/judged.txt\"\n\
+                curl ${MT_HDR:+-H \"$MT_HDR\"} \"$URL\"\n";
+    for shell in SHELLS {
+        let f = Fixture::new(&format!("mt-proxy-{shell}"));
+        let dir = token_dir(&f, SECRET);
+        let judge = |var: &str, value: &str, url: &str, listed: &str| {
+            let _ = std::fs::remove_file(f.root.join("headers.txt"));
+            let _ = std::fs::remove_file(f.root.join("judged.txt"));
+            let r = f.run(
+                shell,
+                body,
+                &[
+                    ("BOSS_MACHINE_TOKEN_DIR", dir.to_str().unwrap()),
+                    ("BOSS_MACHINE_TOKEN_HOSTS", listed),
+                    ("URL", url),
+                    (var, value),
+                ],
+            );
+            assert_eq!(r.code, 0, "{shell} {var} {url}: {}", r.stderr);
+            (
+                f.read("headers.txt").contains(SECRET),
+                f.read("judged.txt"),
+                r.stderr,
+            )
+        };
+        for (var, base, proxied) in cases {
+            let url = format!("{base}{PATH}");
+            let (stamped, judged, stderr) = judge(var, &proxy, &url, "record.test");
+            if proxied {
+                assert!(
+                    !stamped,
+                    "{shell} {var} {base}: curl sends this through the proxy, and it was stamped"
+                );
+                assert_eq!(
+                    judged,
+                    format!("2 [{var}] []\n"),
+                    "{shell} {var} {base}: the judgement alone says proxy (2), names the \
+                     variable, and the value door writes nothing"
+                );
+                assert!(
+                    stderr.contains("machine token withheld")
+                        && stderr.contains(&format!("${var}"))
+                        && stderr.contains("proxy"),
+                    "{shell} {var} {base}: withheld says why, naming the variable: {stderr}"
+                );
+                for never in ["proxyuser", "proxy-pass-9e2", "q-secret", SECRET] {
+                    assert!(
+                        !stderr.contains(never),
+                        "{shell} {var} {base}: never {never}: {stderr}"
+                    );
+                }
+            } else {
+                assert!(
+                    stamped,
+                    "{shell} {var} {base}: curl does not read {var} for this scheme, so the \
+                     request goes direct and the rule still stamps: {stderr}"
+                );
+                assert_eq!(judged, "0 [] [gv]\n", "{shell} {var} {base}");
+                assert_eq!(stderr, "", "{shell} {var} {base}: stamped says nothing");
+            }
+            // An EMPTY variable is no proxy: curl connected direct.
+            let (stamped, judged, _) = judge(var, "", &url, "record.test");
+            assert!(stamped, "{shell} {var}= (empty) {base}: no proxy, stamped");
+            assert_eq!(judged, "0 [] [gv]\n", "{shell} {var}= (empty) {base}");
+        }
+        // A host the list does not admit is refused for THAT first (1),
+        // whatever proxy is set: the line names the host rule.
+        let (stamped, judged, stderr) = judge(
+            "http_proxy",
+            &proxy,
+            "http://evil.example:1/x",
+            "record.test",
+        );
+        assert!(!stamped, "{shell}: an unlisted host under a proxy");
+        assert_eq!(
+            judged, "1 [http_proxy] []\n",
+            "{shell}: the host rule refuses first"
+        );
+        assert!(
+            stderr.contains("not loopback and not in BOSS_MACHINE_TOKEN_HOSTS"),
+            "{shell}: {stderr}"
+        );
+    }
+}
+
+/// THE SAME, BY EFFECT: real curl, and a stub proxy on loopback that
+/// records the request it is handed and answers 200. The control on the
+/// same connection — a plain `secret_header` line, which judges no host —
+/// arrives at the stub, so the stub can see a leak; the rule's own header,
+/// sent the same way, does not, while the stub still receives the
+/// request (curl did go through it).
+#[test]
+fn a_stub_proxy_receives_the_request_and_never_the_machine_token() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    /// Run `body` with http_proxy aimed at a fresh stub; what it was handed.
+    fn through_stub(f: &Fixture, shell: &str, dir: &Path, body: &str) -> (i32, String, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stub = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        s.set_nonblocking(false).unwrap();
+                        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let mut got = Vec::new();
+                        let mut buf = [0u8; 4096];
+                        while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match s.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => got.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        let _ = s.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        return String::from_utf8_lossy(&got).into_owned();
+                    }
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20))
+                    }
+                    Err(_) => return String::new(),
+                }
+            }
+        });
+        let mut cmd = Command::new(shell);
+        cmd.arg("-c")
+            .arg(format!(". \"{}\"\n{body}", repo_root().join(LIB).display()))
+            .current_dir(&f.root)
+            .env("TMPDIR", &f.tmp)
+            .env("SECRET", SECRET)
+            .env("BOSS_MACHINE_TOKEN_DIR", dir)
+            .env("BOSS_MACHINE_TOKEN_HOSTS", "")
+            .env("BOSS_SOR_ENV", f.root.join("no-sor.env"))
+            .env("URL", "http://127.0.0.1:1/api/jobs")
+            .env_remove("RUNTIME_DIRECTORY")
+            .env_remove("BOSS_MACHINE_TOKEN");
+        without_proxy(&mut cmd);
+        let out = cmd
+            .env("http_proxy", format!("http://127.0.0.1:{port}"))
+            .output()
+            .unwrap_or_else(|e| panic!("{shell}: {e}"));
+        let seen = stub.join().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            seen,
+        )
+    }
+
+    for shell in SHELLS {
+        let f = Fixture::new(&format!("mt-proxy-effect-{shell}"));
+        let dir = token_dir(&f, SECRET);
+        let (code, stderr, control) = through_stub(
+            &f,
+            shell,
+            &dir,
+            "set -eu\n\
+             secret_header H \"x-boss-machine-token: $SECRET\"\n\
+             curl -sS -m 10 -o /dev/null -H \"$H\" \"$URL\"\n",
+        );
+        assert_eq!(code, 0, "{shell} control: {stderr}");
+        assert!(
+            control.contains("/api/jobs") && control.contains(SECRET),
+            "{shell} control: a header no rule judged reaches the proxy, so the stub can see \
+             a leak — it was handed: {control:?}"
+        );
+        let (code, stderr, seen) = through_stub(
+            &f,
+            shell,
+            &dir,
+            "set -eu\n\
+             machine_token_header MT_HDR \"$URL\"\n\
+             curl -sS -m 10 -o /dev/null ${MT_HDR:+-H \"$MT_HDR\"} \"$URL\"\n",
+        );
+        assert_eq!(code, 0, "{shell}: {stderr}");
+        assert!(
+            seen.contains("/api/jobs"),
+            "{shell}: curl went through the proxy (the stub was handed the request): {seen:?}"
+        );
+        assert!(
+            !seen.contains(SECRET) && !seen.to_ascii_lowercase().contains("x-boss-machine-token"),
+            "{shell}: the proxy was handed the machine token: {seen:?}"
+        );
+        assert!(
+            stderr.contains("machine token withheld") && stderr.contains("$http_proxy"),
+            "{shell}: withheld says so: {stderr}"
+        );
+    }
+}
+
 /// UNSET, the list is the rendered sor.env's `BOSS_MACHINE_TOKEN_HOSTS=`
 /// line — what boss-core's `Hosts::from_env` falls back to, for a script
 /// run by hand that inherits no unit's `EnvironmentFile=` — unless the
@@ -883,4 +1121,59 @@ fn the_host_a_decision_reads_is_one_function() {
             "{shell}"
         );
     }
+}
+
+/// THE CURL THIS RULE AGREES WITH IS READABLE WHERE IT SENDS (backlog
+/// 50708d76, a low of review 927f8602). Every row this file pins was
+/// measured against the dev pod's curl 7.88.1, and the rule is only as
+/// right as its agreement with the curl that sends: how a URL without a
+/// scheme is guessed, which proxy variable an http URL reads. The shell
+/// senders of the machine token and the runner credential run on the
+/// ops-runner hosts, whose curl nobody had read; the `curl-version` verb
+/// is the door that reads it. Its hosts are every node the estate gives
+/// the ops-runner role, read from infra/estate/estate.toml, so a runner
+/// host added there without this read is a red here. Its first reads
+/// (2026-10-10) answered curl 8.5.0 on both hosts, and the URL and proxy
+/// rows were re-measured against an 8.5.0 build that day and held — the
+/// record is beside `machine_token_proxy` in infra/lib/secret-header.sh.
+#[test]
+fn the_curl_this_rule_was_measured_against_is_readable_on_every_runner_host() {
+    let estate: toml::Value = toml::from_str(
+        &std::fs::read_to_string(repo_root().join("infra/estate/estate.toml")).unwrap(),
+    )
+    .unwrap();
+    let mut runners: Vec<String> = estate["node"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| {
+            n.get("roles")
+                .and_then(|r| r.as_array())
+                .is_some_and(|r| r.iter().any(|x| x.as_str() == Some("ops-runner")))
+        })
+        .map(|n| n["id"].as_str().unwrap().to_string())
+        .collect();
+    runners.sort();
+    assert!(!runners.is_empty(), "no estate node declares ops-runner");
+
+    let path = repo_root().join("infra/ops/verbs/curl-version.json");
+    let verb: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+    )
+    .unwrap();
+    assert_eq!(verb["argv"], serde_json::json!(["curl", "--version"]));
+    assert_eq!(verb["params"], serde_json::json!([]));
+    let mut hosts: Vec<String> = verb["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h.as_str().unwrap().to_string())
+        .collect();
+    hosts.sort();
+    assert_eq!(hosts, runners, "curl-version serves every ops-runner host");
+    assert!(
+        verb["about"].as_str().unwrap().starts_with("READ-ONLY"),
+        "{}",
+        verb["about"]
+    );
 }

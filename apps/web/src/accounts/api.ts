@@ -32,6 +32,8 @@ import {
 } from './schemas';
 import { fetchPagedValidated, fetchValidated, type ParseResult } from '../data/parseResponse';
 import { appNow } from '@boss/web-kit/sim-clock';
+import { fetchRemote, type Remote } from '../data/remote';
+import { z } from '../data/parseResponse';
 
 /// Thrown by loadAccountBundle (and the helpers it calls) when an
 /// API response is reachable + 200 but doesn't match the expected
@@ -64,6 +66,15 @@ const DEVICE_CAP = 500;
 const INVOICE_CAP = 500;
 const JOB_CAP = 500;
 const SHIPMENT_CAP = 200;
+
+// The asset service returns typed custody, not an account_id alias.
+// Refuse an unreadable row rather than interpreting it as no equipment.
+export async function fetchAccountAssetsPage(): Promise<PagedResult<Asset>> {
+  const result = await fetchPagedValidated('/api/assets?limit=1000', AssetSchema);
+  return result.kind === 'ok'
+    ? { kind: 'ready', page: result.data }
+    : { kind: 'failed', error: result.reason };
+}
 
 export async function loadAccountBundle(
   accountId: string,
@@ -219,13 +230,16 @@ export async function loadTimeline(
 
 export async function loadContracts(
   accountId: string,
-): Promise<ReadonlyArray<{ id: string; end_date: string }>> {
-  const body = await fetchJson<{ data?: Array<{ id: string; end_date: string }> } | Array<{ id: string; end_date: string }>>(
-    `/api/commerce/agreements?account_id=${q(accountId)}&limit=10`,
-  );
-  if (!body) return [];
-  if (Array.isArray(body)) return body;
-  return body.data ?? [];
+): Promise<Exclude<Remote<ReadonlyArray<{ id: string; end_date: string }>>, { kind: 'loading' }>> {
+  const url = `/api/commerce/agreements?account_id=${q(accountId)}&limit=10`;
+  const rows = z.array(z.object({ id: z.string(), end_date: z.string() }));
+  const result = await fetchRemote(url, (raw) => {
+    const body = z.union([rows, z.object({ data: rows })]).parse(raw);
+    return Array.isArray(body) ? body : body.data;
+  });
+  return result.kind === 'failed'
+    ? { kind: 'failed', error: `${url}: ${result.error}` }
+    : result;
 }
 
 export async function assignAccountTeamMember(input: {
@@ -320,16 +334,6 @@ async function fetchAccount(id: string): Promise<Account | null> {
   const url = `/api/people/accounts/${q(id)}`;
   const result = await fetchValidated(url, AccountSchema);
   return unwrap(url, result);
-}
-
-async function fetchJson<T>(url: string): Promise<T | null> {
-  try {
-    const resp = await fetch(url);
-    if (!resp.ok) return null;
-    return (await resp.json()) as T;
-  } catch {
-    return null;
-  }
 }
 
 function q(s: string): string {

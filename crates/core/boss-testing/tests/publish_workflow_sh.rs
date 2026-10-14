@@ -551,8 +551,11 @@ fn a_live_row_the_tree_never_said_is_refused_and_the_drift_named() {
             "REFUSED",
             "v7",
             "never said",
-            "steps[1].fields",
-            "steps[1].metadata_defaults",
+            // Named by the step's title and the field's name, with the
+            // added field in the finding: a reader learns WHICH field.
+            "steps[run].fields.names",
+            "live=result,proof",
+            "steps[run].metadata_defaults",
             "--force-tree",
         ],
         "the operator-edit refusal",
@@ -755,35 +758,51 @@ fn a_row_declaring_a_writer_is_refused_by_default_and_published_once_released() 
         &format!("{KIND}.toml"),
         "drift_publish = \"released\"\nwhy = 'Published by hand and the positive control passed; later edits may ride the machine roads.'\n",
     );
+    // What the stub registry holds after the publish. Left as the plain
+    // rev2 row — no writer — the read-back is NOT CONFIRMED (7): the
+    // version moved and the refusal did not go live. Until backlog
+    // aa28f921 that row read "confirmed (equal)", and this test passed
+    // over exactly the publish it should have refused to vouch for.
+    let (rc, out) = c.run(&[KIND]);
+    assert_eq!(rc, 7, "{out}");
+    contains_all(
+        &out,
+        &[
+            "NOT CONFIRMED",
+            "steps[run].fields[result].writer",
+            "tree=signer",
+            "live=<absent>",
+        ],
+        "a publish whose writer did not go live is not confirmed",
+    );
+    // And with the writer live, it is.
+    write_file(&c.live, &live_row(1, REV1_DESC, REV1_STEPS));
+    let with_writer_live = REV2_STEPS.replacen(
+        r#"{"name":"result","field_type":"string","required":true}"#,
+        r#"{"name":"result","field_type":"string","required":true,"writer":"signer"}"#,
+        1,
+    );
+    assert_ne!(with_writer_live, REV2_STEPS);
+    write_file(&c.live_after, &live_row(2, REV2_DESC, &with_writer_live));
+    std::fs::remove_file(&c.boss_log).unwrap();
     let (rc, out) = c.run(&[KIND]);
     assert_eq!(rc, 0, "{out}");
     contains_all(&out, &["v1 -> v2", "confirmed"], "the released row");
     assert_eq!(c.publishes().len(), 1, "{:?}", c.boss_calls());
 }
 
-/// THE SHIPPED SIGNER ROW (design 09618594, question `signer`; backlog
-/// 6c9183de; review 7cee49b9, condition R1). `publish-workflow
-/// ops-request` is the road the review found that needs no approval: any
-/// actor who may file an ops-request could ask for it, so while the row
-/// waited for David's publish this test pinned it REFUSED (9).
-///
-/// The hold is lifted (2026-10-07: v10 published by hand, the positive
-/// control ef9e591c held), and what the one-kind verb does now is pinned
-/// instead, over the SHIPPED row and the SHIPPED release, with a live row
-/// that says what the tree says — the state the release was made in. The
-/// verb's own comparator reads them equal: nothing to publish (5), in
-/// real mode and under --check, no HELD line, and the CLI is never
-/// reached. That equality is why releasing the row publishes nothing.
+/// The earned shipped release reaches the one-kind road too. Restoring
+/// an explicit hold refuses both ordinary and force-tree modes before
+/// any publish: a rollback must rehold before its deliberate publication.
 #[test]
-fn the_shipped_signer_row_is_released_and_equal_to_live_is_nothing_to_publish() {
+fn the_shipped_row_is_released_to_the_one_kind_verb_and_an_explicit_rehold_refuses_it() {
     if !ready() {
         return;
     }
-    let c = Case::new("released-shipped-signer");
+    let c = Case::new("held-shipped-signer");
     let shipped = |rel: &str| std::fs::read_to_string(repo_root().join(rel));
-    let row_path = c.repo.join("infra/platform/workflows/ops-request.toml");
     write_file(
-        &row_path,
+        &c.repo.join("infra/platform/workflows/ops-request.toml"),
         &shipped("infra/platform/workflows/ops-request.toml").expect("the shipped ops-request row"),
     );
     hold_file(
@@ -792,38 +811,41 @@ fn the_shipped_signer_row_is_released_and_equal_to_live_is_nothing_to_publish() 
         &shipped("infra/platform/workflow-holds/ops-request.toml")
             .expect("the shipped tree declares what it says about ops-request"),
     );
-    // The live row as the registry hands it back for the shipped file:
-    // the same row under `steps`, with a version. Rendered from the file
-    // so this test moves with the row instead of pinning a copy of it.
-    let render = Command::new("python3")
-        .args([
-            "-c",
-            "import json, sys, tomllib\nrow = [w for w in tomllib.load(open(sys.argv[1], 'rb'))['workflow'] if w['kind'] == 'ops-request'][0]\nrow['steps'] = row.pop('step')\nrow['version'] = 10\nrow['status'] = 'active'\njson.dump(row, open(sys.argv[2], 'w'))\n",
-        ])
-        .arg(&row_path)
-        .arg(&c.live)
-        .output()
-        .expect("python3 runs");
+    // The stub registry carries the unrelated synthetic maintenance row.
+    // Check-only must reach the comparison's drift refusal, rather than
+    // bypass it merely because the shipped publication hold was released.
+    let (rc, out) = c.run(&["ops-request", "--check"]);
+    assert_eq!(rc, 6, "{out}");
     assert!(
-        render.status.success(),
-        "{}",
-        String::from_utf8_lossy(&render.stderr)
+        !out.contains("'ops-request' is HELD"),
+        "the earned shipped release must not retain the publication hold: {out}"
     );
-    for mode in [&["ops-request"][..], &["ops-request", "--check"][..]] {
+    contains_all(
+        &out,
+        &["carries what the tree never said"],
+        "the release preserves the independent drift refusal",
+    );
+    assert!(c.publishes().is_empty(), "check-only never publishes");
+
+    hold_file(&c, "ops-request.toml", HOLD);
+    for mode in [&["ops-request"][..], &["ops-request", "--force-tree"][..]] {
         let (rc, out) = c.run(mode);
-        assert_eq!(rc, 5, "{mode:?}: {out}");
+        assert_eq!(rc, 9, "{mode:?}: {out}");
         contains_all(
             &out,
-            &["nothing to publish", "ops-request v10", "already says what"],
+            &[
+                "REFUSED",
+                "'ops-request' is HELD out of every unattended publish",
+                "declared in infra/platform/workflow-holds/ops-request.toml",
+                "6c9183de",
+                "boss workflow publish ops-request infra/platform/workflows/ops-request.toml",
+                "nothing published",
+            ],
             &format!("{mode:?}"),
         );
         assert!(
-            !out.contains("HELD"),
-            "{mode:?}: the released signer row still reads held: {out}"
-        );
-        assert!(
             c.boss_calls().is_empty(),
-            "{mode:?}: an equal row reached the CLI: {:?}",
+            "{mode:?}: the signer row reached the CLI: {:?}",
             c.boss_calls()
         );
     }
@@ -875,7 +897,7 @@ fn force_tree_publishes_over_an_operator_edit_and_says_so() {
         &[
             "FORCED",
             "never said",
-            "steps[1].fields",
+            "steps[run].fields.names",
             "v7 -> v8",
             "confirmed",
         ],
@@ -1043,6 +1065,215 @@ fn a_step_that_gains_an_agent_block_is_the_tree_ahead_and_an_equal_block_is_equa
     let (rc, out) = c.run(&[KIND, "--check"]);
     assert_eq!(rc, 5, "the same block on both sides is equal:\n{out}");
     contains_all(&out, &["nothing to publish"], "the equal verdict");
+}
+
+// ---------------------------------------------------------------------------
+// The comparison covers what decides WHO MAY WRITE (backlog aa28f921).
+// ---------------------------------------------------------------------------
+
+/// The fixture row with a refusal on its `run` step: a field `writer`, a
+/// step `executor`, a raised `assurance_required` and a sign-off.
+fn refusal_row_file() -> String {
+    let out = REV2_KIND_FILE.replacen(
+        "fields = [{ name = \"result\", field_type = \"string\", required = true }]",
+        "executor = \"agent\"\nassurance_required = \"presence\"\nsign_offs_required = [\"platform-admin\"]\nfields = [{ name = \"result\", field_type = \"string\", required = true, writer = \"signer\" }]",
+        1,
+    );
+    assert_ne!(out, REV2_KIND_FILE, "the fixture row gained its refusals");
+    out
+}
+
+/// The same row as the registry hands it back, each refusal a separate
+/// fragment so a case can drop exactly one.
+fn refusal_row_live(writer: &str, executor: &str, assurance: &str, sign_offs: &str) -> String {
+    let run = format!(
+        r#"{{"title":"run","kind":"task","ready_when":"steps.scheduled.done","title_template":"Sweep the widgets","sign_offs_required":[{sign_offs}],"fields":[{{"name":"result","field_type":"string","required":true,"filled_by":"executor"{writer}}}],"authority_role":"platform-admin","metadata_defaults":null{executor}{assurance}}}"#
+    );
+    let plain_run = r#"{"title":"run","kind":"task","ready_when":"steps.scheduled.done","title_template":"Sweep the widgets","sign_offs_required":[],"fields":[{"name":"result","field_type":"string","required":true}],"authority_role":"platform-admin","metadata_defaults":null}"#;
+    let steps = REV2_STEPS.replacen(plain_run, &run, 1);
+    assert_ne!(
+        steps, REV2_STEPS,
+        "the live fixture's run step was replaced"
+    );
+    live_row(2, REV2_DESC, &steps)
+}
+
+const LIVE_WRITER: &str = r#","writer":"signer""#;
+const LIVE_EXECUTOR: &str = r#","executor":"agent""#;
+const LIVE_ASSURANCE: &str = r#","assurance_required":"presence""#;
+const LIVE_SIGN_OFFS: &str = r#""platform-admin""#;
+
+/// THE FINDING (backlog aa28f921; review 4746c046, F1). The comparator
+/// read a field as (name, type, required) and a step as nine named keys,
+/// so a live row that kept its fields and lost only its `writer` read
+/// EQUAL — "nothing to publish", forever — and the same for a step's
+/// `executor`, `assurance_required` and `sign_offs_required`. Those are
+/// the keys that decide who may write a field, who may run a step and
+/// what stamp it takes, so the one drift nothing could see was the drift
+/// of a refusal. Each is its own case: the tree declares all four, the
+/// live row lacks exactly one, and the verb must read DRIFT and name the
+/// step and the key. A live row the tree never said is refused (6), and
+/// the refusal is where the names are read.
+#[test]
+fn a_live_row_that_lost_a_writer_an_executor_an_assurance_or_a_sign_off_reads_as_drift() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("lost-refusal");
+    write_file(
+        &c.repo.join(format!("infra/platform/workflows/{KIND}.toml")),
+        &refusal_row_file(),
+    );
+    // A row declaring a writer or an executor is held by default; this
+    // case is about the comparison, so the kind is released.
+    hold_file(
+        &c,
+        &format!("{KIND}.toml"),
+        "drift_publish = \"released\"\nwhy = 'Published by hand; the comparison is what is under test.'\n",
+    );
+
+    // Control: the live row carrying all four is the tree's row.
+    write_file(
+        &c.live,
+        &refusal_row_live(LIVE_WRITER, LIVE_EXECUTOR, LIVE_ASSURANCE, LIVE_SIGN_OFFS),
+    );
+    let (rc, out) = c.run(&[KIND, "--check"]);
+    assert_eq!(rc, 5, "the row with every refusal equals its file:\n{out}");
+
+    for (what, live, path, tree_says) in [
+        (
+            "writer",
+            refusal_row_live("", LIVE_EXECUTOR, LIVE_ASSURANCE, LIVE_SIGN_OFFS),
+            "steps[run].fields[result].writer",
+            "tree=signer",
+        ),
+        (
+            "executor",
+            refusal_row_live(LIVE_WRITER, "", LIVE_ASSURANCE, LIVE_SIGN_OFFS),
+            "steps[run].executor",
+            "tree=agent",
+        ),
+        (
+            "assurance_required",
+            refusal_row_live(LIVE_WRITER, LIVE_EXECUTOR, "", LIVE_SIGN_OFFS),
+            "steps[run].assurance_required",
+            "tree=presence",
+        ),
+        (
+            "sign_offs_required",
+            refusal_row_live(LIVE_WRITER, LIVE_EXECUTOR, LIVE_ASSURANCE, ""),
+            "steps[run].sign_offs_required",
+            "tree=[\"platform-admin\"]",
+        ),
+    ] {
+        write_file(&c.live, &live);
+        let (rc, out) = c.run(&[KIND, "--check"]);
+        assert_eq!(
+            rc, 6,
+            "a live row that lost its {what} is a row the tree never said, not an equal one:\n{out}"
+        );
+        contains_all(
+            &out,
+            &["differs from", path, tree_says, "live=<absent>"],
+            &format!("the lost {what} is named by step and key"),
+        );
+        // Exactly that key: one lost refusal is one finding.
+        assert_eq!(
+            out.matches("live=").count(),
+            1,
+            "the lost {what} is the only finding:\n{out}"
+        );
+    }
+    assert!(c.publishes().is_empty(), "--check published");
+}
+
+/// The other two shapes the review measured: a writer whose VALUE
+/// changed, and a key the LIVE row states that the file does not. The old
+/// comparison walked only the tree's keys, so a live-only key was never
+/// named even where the rows compared unequal — on 2026-10-08 ten live
+/// kinds were REFUSED on every publish-drift check with an EMPTY list of
+/// fields (ops-request cd348af1), over an agent block's defaulted
+/// `executor_provenance` that only the registry side spelled.
+#[test]
+fn a_changed_writer_and_a_key_only_the_live_row_states_are_both_named() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("changed-writer");
+    write_file(
+        &c.repo.join(format!("infra/platform/workflows/{KIND}.toml")),
+        &refusal_row_file(),
+    );
+    hold_file(
+        &c,
+        &format!("{KIND}.toml"),
+        "drift_publish = \"released\"\nwhy = 'Published by hand; the comparison is what is under test.'\n",
+    );
+    write_file(
+        &c.live,
+        &refusal_row_live(
+            r#","writer":"runner:ops""#,
+            r#","executor":"agent","labor_hours":2.0"#,
+            LIVE_ASSURANCE,
+            LIVE_SIGN_OFFS,
+        ),
+    );
+    let (rc, out) = c.run(&[KIND, "--check"]);
+    assert_eq!(rc, 6, "{out}");
+    contains_all(
+        &out,
+        &[
+            "steps[run].fields[result].writer",
+            "tree=signer",
+            "live=runner:ops",
+            "steps[run].labor_hours",
+            "tree=<absent>",
+            "live=2.0",
+        ],
+        "a changed writer and a live-only key",
+    );
+}
+
+/// NO LIST TO EXTEND. The keys compared are whatever either side states,
+/// so a key nobody has thought of yet is compared the day it is written:
+/// one on the workflow, one on a step and one on a field, each present on
+/// the live row alone, are each named. (What the loader's own defaults do
+/// to that rule is pinned over the real bundle and the real loader in
+/// workflow_row_compare_py.rs.)
+#[test]
+fn a_key_nobody_listed_is_compared_the_day_it_is_written() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("unlisted-key");
+    let steps = REV2_STEPS
+        .replacen(
+            r#""title":"run","#,
+            r#""title":"run","a_step_key_of_tomorrow":"x","#,
+            1,
+        )
+        .replacen(
+            r#""name":"result","#,
+            r#""name":"result","a_field_key_of_tomorrow":"y","#,
+            1,
+        );
+    let live = live_row(2, REV2_DESC, &steps).replacen(
+        r#""status":"active","#,
+        r#""status":"active","a_row_key_of_tomorrow":"z","#,
+        1,
+    );
+    write_file(&c.live, &live);
+    let (rc, out) = c.run(&[KIND, "--check"]);
+    assert_eq!(rc, 6, "{out}");
+    contains_all(
+        &out,
+        &[
+            "a_row_key_of_tomorrow",
+            "steps[run].a_step_key_of_tomorrow",
+            "steps[run].fields[result].a_field_key_of_tomorrow",
+        ],
+        "each unlisted key is named",
+    );
 }
 
 // ---------------------------------------------------------------------------

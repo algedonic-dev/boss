@@ -61,6 +61,11 @@
 # test declares an address its own machine holds, to drive the
 # this-host arm). There is no seam on what the machine holds.
 #
+# HOST_CHECK_RED_ROUTE, set by a caller whose run a judge files items
+# from (forge-converge.sh), makes a refusal also leave
+# `RED <route> refused: <why>` as the run's `output` — the line
+# maintenance.chore.file_reds reads.
+#
 # Pinned by crates/core/boss-testing/tests/host_check_sh.rs.
 
 _host_check_infra="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -165,6 +170,15 @@ host_check() {
     fi
     HOST_CHECK_VERDICT="REFUSED: this machine is not the estate's $node — it holds [${held:-no address}] and $estate declares [${declared:-nothing}] for $node"
     echo "$me: $HOST_CHECK_VERDICT; nothing was written. It would have written this machine's own system through: $real. A test redirects every one of those; a first install on a new $node sets BOSS_FIRST_INSTALL_AS=$node on purpose." >&2
-    if declare -F run_summary_field >/dev/null; then run_summary_field host_check "$HOST_CHECK_VERDICT"; fi
+    if declare -F run_summary_field >/dev/null; then
+        run_summary_field host_check "$HOST_CHECK_VERDICT"
+        # A caller whose packet a judge files from names its route, and
+        # the refusal leaves the one line that judge reads (backlog
+        # 62b09c57): on the host itself a refusal stands every tick until
+        # a person acts, because a refused run fetches no fix.
+        if [ -n "${HOST_CHECK_RED_ROUTE:-}" ]; then
+            run_summary_field output "RED $HOST_CHECK_RED_ROUTE refused: ${HOST_CHECK_VERDICT#REFUSED: }"
+        fi
+    fi
     exit 78
 }

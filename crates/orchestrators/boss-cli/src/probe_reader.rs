@@ -172,7 +172,7 @@ pub(crate) fn open(config: &Config, user: Option<&str>) -> Result<Option<Guard>>
     // Asked of the name itself, without following it: a link whose
     // target is gone is a deposit that broke, not a host without one.
     match std::fs::symlink_metadata(&config.credential) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if no_deposit(&error) => return Ok(None),
         Err(error) => bail!(
             "cannot tell whether the reader credential at {} exists ({error}); refusing \
              rather than reading without the door it may be there to open",
@@ -193,6 +193,23 @@ pub(crate) fn open(config: &Config, user: Option<&str>) -> Result<Option<Guard>>
     // shared-tmp-ok: the root is only LISTED, and an entry is removed only when owner-checked and proven dead
     sweep_dead_doors(&std::env::temp_dir(), DEAD_DOOR_AFTER);
     Guard::start(config, user, Duration::from_secs(MAX_LIFETIME_SECS)).map(Some)
+}
+
+/// The one reading of "this host holds no reader credential": the name
+/// is not there at all. Shared by [`open`], which then opens no door, and
+/// by the hand doors, which refuse a probe that would read the record
+/// without one (`prove::refuse_a_record_read_without_a_reader`, design
+/// 00227628) — so the two can never disagree about which host that is.
+fn no_deposit(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+}
+
+/// Does this host hold NO reader credential where `config` names it?
+/// Asked exactly as [`open`] asks it, of the name without following it:
+/// a dangling link is a deposit that broke, which `open` refuses as the
+/// environment's, so it is not "none" here.
+pub(crate) fn holds_no_credential(config: &Config) -> bool {
+    std::fs::symlink_metadata(&config.credential).is_err_and(|error| no_deposit(&error))
 }
 
 /// The name every door's directory starts with, in the temp directory.
@@ -637,7 +654,7 @@ struct Forwarder {
     base_port: u16,
     ports: BTreeSet<u16>,
     credential: http::HeaderValue,
-    client: reqwest::Client,
+    client: boss_core::machine_token::Client,
     /// What each port's accepts route said of this credential, asked
     /// once per port for the door's life: `Ok` where it named a reader
     /// slot, the reason where it did not.
@@ -676,12 +693,15 @@ impl Forwarder {
             }
             ports.insert(port);
         }
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .build()?;
+        // The machine clients' constructor: no redirect, no proxy
+        // (backlog 1ff6cabe). Unstamped, because the one credential this
+        // door sends is the parent-held reader value it adds per request,
+        // never the estate token.
+        let client = boss_core::machine_token::Client::unstamped(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60)),
+        )?;
         Ok(Self {
             base,
             base_port,

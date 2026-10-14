@@ -22,7 +22,7 @@
 //! machine without them does not manufacture a red.
 
 use boss_testing::announce::{await_announced_port, with_announce};
-use boss_testing::repo_root;
+use boss_testing::{repo_root, without_proxy};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -272,7 +272,7 @@ fn start_stub(tag: &str, mode: &str, delay_secs: f32) -> Stub {
     let started = dir.join("started");
     let bound = dir.join("bound");
     std::fs::write(&script, with_announce(STUB)).expect("write stub");
-    let child = Command::new("python3")
+    let child = without_proxy(&mut Command::new("python3"))
         .arg(&script)
         .arg(dir.join("puts.log"))
         .arg(mode)
@@ -339,7 +339,7 @@ fn run_report(stub: &Stub, backoff: &str, verdict: &str) -> (Vec<String>, bool) 
     );
     let path = stub.dir.join("harness.sh");
     std::fs::write(&path, harness).expect("write harness");
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(&path)
         .arg(verdict)
         .arg("{\"verdict\":\"green\",\"head\":\"abc\"}")

@@ -290,6 +290,10 @@ export type Constraint =
       readonly depth: number;
       readonly drainHours: number | null;
       readonly because: string;
+      /** What the name was NOT judged against: the queues holding work
+       *  whose rate is not counted, deepest first. `null` when every
+       *  queue holding work was counted (backlog ba1fcc6d). */
+      readonly unjudged: string | null;
     };
 
 /**
@@ -335,7 +339,42 @@ export function constraintOf(
       : `${worst.depth} waiting against ${served} served in the last ${windowHours}h: ` +
         `${hours.toFixed(0)}h to clear at the rate it is actually being worked, ` +
         `longer than any other counted queue.`;
-  return { kind: 'station', station: worst.station, depth: worst.depth, drainHours: hours, because };
+  return {
+    kind: 'station',
+    station: worst.station,
+    depth: worst.depth,
+    drainHours: hours,
+    because,
+    unjudged: unjudgedLine(countable, holding),
+  };
+}
+
+/**
+ * The sentence that keeps a named constraint from reading as the whole
+ * answer. On 2026-09-23 the box named a 6-deep counted queue while 510
+ * standings sat at two queues whose rate is not counted, and nothing in
+ * the box said so (backlog ba1fcc6d, page-audit 7c228914 gap 1). The
+ * blind queues stay ineligible — naming one would assert a rate nobody
+ * counted — but what the name was judged WITHOUT is stated beside it.
+ * "Standings", not packets: a packet stands at every station whose
+ * predicate it matches (140a2222), so these depths overlap.
+ */
+function unjudgedLine(
+  countable: ReadonlyArray<Siding>,
+  holding: ReadonlyArray<Siding>,
+): string | null {
+  const blind = holding
+    .filter((s) => s.flow.kind !== 'counted')
+    .sort((a, b) => b.depth - a.depth || a.station.localeCompare(b.station));
+  if (blind.length === 0) return null;
+  const sum = (xs: ReadonlyArray<Siding>) => xs.reduce((acc, s) => acc + s.depth, 0);
+  const counted = sum(countable);
+  const unseen = sum(blind);
+  return (
+    `Named from the counted queues only, which hold ${counted} of ${counted + unseen} standings. ` +
+    `${unseen} stand where no rate is counted — ${blind.map((s) => `${s.station} ${s.depth}`).join(', ')} — ` +
+    `so this board cannot say whether the constraint is among them.`
+  );
 }
 
 /** Sort key only. Not draining beats any finite clear time; ties break

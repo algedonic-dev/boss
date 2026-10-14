@@ -286,10 +286,12 @@ ops_image_ready() {
 # pull. `false` fails the read, and ops_image's refusal on stderr is
 # the reason the caller records. `sudo -n`: a unit has no tty, so a
 # password prompt already failed — now it fails saying so, as the disk
-# sweep's does.
+# sweep's does. `--log-driver=none`: a Secret this line reads (the
+# offsite key, a database URL) reaches the caller through the attach and
+# never the docker daemon's log (backlog aa700921).
 ops_kubectl() {
     _ok_img="$(ops_image)" || { echo false; return 0; }
-    printf 'sudo -n docker run --rm --network host --mount type=bind,src=%s,dst=/kc,readonly %s kubectl --kubeconfig=/kc\n' "$(ops_kubeconfig)" "$_ok_img"
+    printf 'sudo -n docker run --rm --log-driver=none --network host --mount type=bind,src=%s,dst=/kc,readonly %s kubectl --kubeconfig=/kc\n' "$(ops_kubeconfig)" "$_ok_img"
 }
 
 ops_boss_image() {
@@ -317,6 +319,6 @@ ops_boss_image() {
 #   /usr/local/bin/talosctl), a knob only so a test never reads /usr.
 ops_talosctl() {
     _ot_img="$(ops_image)" || { echo false; return 0; }
-    printf 'sudo -n docker run --rm --network host --mount type=bind,src=%s,dst=/tc,readonly --mount type=bind,src=%s,dst=/talosctl,readonly %s timeout %s /talosctl --talosconfig=/tc\n' \
+    printf 'sudo -n docker run --rm --log-driver=none --network host --mount type=bind,src=%s,dst=/tc,readonly --mount type=bind,src=%s,dst=/talosctl,readonly %s timeout %s /talosctl --talosconfig=/tc\n' \
         "${BOSS_OPS_DIR:-/etc/boss-ops}/talosconfig" "${BOSS_TALOSCTL:-/usr/local/bin/talosctl}" "$_ot_img" "${BOSS_TALOS_TIMEOUT_S:-20}"
 }

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
+import { testNet1 } from '../../../tests/fixtures/test-values';
 import {
   comparisonVerdict,
   parseDevDoor,
@@ -74,7 +75,7 @@ afterEach(() => {
 
 function node(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    id: 'w-1', label: 'Worker 1', address: '10.20.0.14', role: 'talos-worker',
+    id: 'w-1', label: 'Worker 1', address: testNet1(14), role: 'talos-worker',
     cpu: 32, memory_gb: 63, disk_gb: 929, notes: 'the build node', retired: false,
     ...over,
   };
@@ -85,6 +86,12 @@ function obsEvent(scope: string, observed_at: string, nodes: unknown[] = [{ id: 
 }
 
 describe('parseNodes', () => {
+  test('the synthetic node uses a reserved address and the parser preserves it', () => {
+    const raw = node();
+    expect(raw.address).toBe(testNet1(14));
+    expect(parseNodes([raw])[0]?.address).toBe(testNet1(14));
+  });
+
   test('accepts both bare arrays and {data: []} envelopes, and carries declared capacity through', () => {
     const rows = parseNodes({ data: [node()] });
     expect(rows).toHaveLength(1);

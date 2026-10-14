@@ -44,20 +44,29 @@ const DAVID: &str = "emp-david";
 const PUBLIC: &str = "ssh-ed25519 public-test-only";
 const EVIL: &str = "ssh-ed25519 AAAAattacker";
 
+const MACHINE_TOKEN_RULE: &str = "broker-prepares-the-machine-token-deposit-key";
+const RUNNER_RULE: &str = "broker-prepares-the-runner-deposit-key";
+
 /// Every machine identity review 76249509 measured rewriting the
 /// proposal (204 each, before `written_by` was declared on `enroll`):
 /// another automation, the OTHER broker rule, an agent by its id and by
-/// its login (the door resolves it), and the dispatcher itself.
-const OTHER_MACHINES: [&str; 5] = [
-    "automation:other",
-    "rule:broker-prepares-the-runner-deposit-key",
-    "agent-claude",
-    "claude@algedonic.dev",
-    "system:dispatcher",
-];
-
-const MACHINE_TOKEN_RULE: &str = "broker-prepares-the-machine-token-deposit-key";
-const RUNNER_RULE: &str = "broker-prepares-the-runner-deposit-key";
+/// its login (the door resolves it), and the dispatcher itself. Which
+/// rule is the other one depends on whose road is running: each key's
+/// protocol names its own rule and refuses the sibling's (3dc0b247).
+fn other_machines(rule: &Rule) -> [String; 5] {
+    let other = if rule.name == RUNNER_RULE {
+        MACHINE_TOKEN_RULE
+    } else {
+        RUNNER_RULE
+    };
+    [
+        "automation:other".into(),
+        format!("rule:{other}"),
+        "agent-claude".into(),
+        "claude@algedonic.dev".into(),
+        "system:dispatcher".into(),
+    ]
+}
 
 #[derive(Default)]
 struct Memory {
@@ -479,8 +488,28 @@ async fn scope(api: &Api, id: &str, rule: &Rule) -> String {
 /// hand-written receipt anywhere on the road.
 #[tokio::test]
 async fn the_machine_token_keys_enrollment_runs_from_scope_to_prepared_through_the_real_router() {
+    enrollment_runs_from_scope_to_prepared(MACHINE_TOKEN_RULE).await;
+}
+
+/// THE RUNNER KEY'S ROAD, SAME HANDLER, ITS OWN PROTOCOL, to the same
+/// end (1e50e66b; item 3dc0b247). Until prepare-a-deposit-key took the
+/// machine token kind's repair, this road minted the pair and then
+/// stopped at `enroll`, 403: the three proposal fields were
+/// executor-filled on a human-only step, so the broker's own proposal
+/// was refused, `issue` stayed ready, and the person's step never
+/// opened. The leg that recorded that stop is gone with it.
+#[tokio::test]
+async fn the_runner_keys_enrollment_runs_from_scope_to_prepared_through_the_real_router() {
+    let rule = Rule::read(RUNNER_RULE);
+    assert_eq!(rule.arg("protocol_kind"), "prepare-a-deposit-key");
+    enrollment_runs_from_scope_to_prepared(RUNNER_RULE).await;
+}
+
+/// One key's road from the human scope to the `prepared` terminal,
+/// driven by the real handler with its rule row's own args and actor.
+async fn enrollment_runs_from_scope_to_prepared(rule_name: &str) {
     let api = serve().await;
-    let broker = Broker::new(MACHINE_TOKEN_RULE);
+    let broker = Broker::new(rule_name);
     let rule = &broker.rule;
     let actor = rule.actor();
     let credential = rule.arg("credential_id").to_string();
@@ -560,7 +589,8 @@ async fn the_machine_token_keys_enrollment_runs_from_scope_to_prepared_through_t
     // -- B2: THE PROPOSAL IS THE BROKER'S RULE'S ALONE (question 2 of
     //    review 76249509). Each of these was a 204 before `enroll`
     //    declared `written_by`; each is now refused, naming the writer.
-    for who in OTHER_MACHINES {
+    for who in other_machines(rule) {
+        let who = who.as_str();
         for (what, body) in [
             // The line alone: a bare `public_key` is no longer a field of
             // this step, so a body carrying one is refused a step earlier,
@@ -743,90 +773,39 @@ async fn the_machine_token_keys_enrollment_runs_from_scope_to_prepared_through_t
 /// minted, and the attacker's line stayed on the step a person would
 /// later open. With `written_by` on `enroll` the plant is refused, for
 /// every machine identity that is not the broker's rule, and the road
-/// then runs as if nobody had tried.
+/// then runs as if nobody had tried. Both keys' protocols, because the
+/// runner's took the same declaration (3dc0b247).
 #[tokio::test]
 async fn no_other_machine_plants_a_proposal_before_the_broker_writes() {
-    let api = serve().await;
-    let broker = Broker::new(MACHINE_TOKEN_RULE);
-    let id = file(&api, &broker.rule).await;
-    let enroll = step_path(&api.job(&id).await, "enroll");
-    for who in OTHER_MACHINES {
-        let (s, v) = api
-            .patch(
-                &enroll,
-                who,
-                json!({"authorized_keys_line": EVIL,
-                       "receiver_host": "boss-gcp", "purpose": "estate machine token deposit"}),
-            )
-            .await;
-        assert_eq!(s, 403, "{who} planted a proposal before scope: {v}");
-        assert_eq!(v["written_by"], broker.rule.actor(), "{who}: {v}");
-    }
-    let scope_id = scope(&api, &id, &broker.rule).await;
-    assert_eq!(broker.invoke(&api, &id, &scope_id).await, Ok(()));
-    let job = api.job(&id).await;
-    assert_eq!(step(&job, "enroll")["status"], "ready");
-    assert_eq!(
-        step(&job, "enroll")["metadata"]["authorized_keys_line"],
-        authorized_keys_line(broker.rule.arg("forced_command"), PUBLIC)
-    );
-    assert_eq!(broker.mints(), 1);
-}
-
-/// THE RUNNER KEY'S ROAD, SAME HANDLER, GENERIC PROTOCOL — how far it
-/// gets (1e50e66b). The subject read (B1) stopped it at its first read
-/// exactly as it stopped the machine token's key; with that repaired it
-/// now reaches its OWN known defect, item 3dc0b247: prepare-a-deposit-key
-/// declares the three proposal fields executor-filled on the human-only
-/// `enroll`, so the broker's proposal is refused there. NOT repaired
-/// here — it is a new version of a row the runner's delivery owns. When
-/// it is, this leg turns: delete it, and extend the leg above to the
-/// runner's rule.
-///
-/// What it leaves, on the record: the pair IS minted into the Secret
-/// before the refusal, no receipt is written, `issue` stays ready, and a
-/// replay finds the same pair and mints nothing more.
-#[tokio::test]
-async fn the_runner_keys_road_now_reaches_the_generic_protocols_enroll_refusal() {
-    let api = serve().await;
-    let broker = Broker::new(RUNNER_RULE);
-    let rule = &broker.rule;
-    assert_eq!(rule.arg("protocol_kind"), "prepare-a-deposit-key");
-    let id = file(&api, rule).await;
-    let scope_id = scope(&api, &id, rule).await;
-    let scoped = api.job(&id).await;
-    assert!(
-        authorize_preparation(
-            &scoped,
-            &id,
-            &scope_id,
-            rule.arg("protocol_kind"),
-            rule.arg("credential_id")
-        )
-        .is_ok(),
-        "the runner rule's first read"
-    );
-    for attempt in 1..=2 {
-        let outcome = broker.invoke(&api, &id, &scope_id).await;
-        let why = outcome.expect_err(
-            "prepare-a-deposit-key's enroll now takes the broker's proposal — 3dc0b247 is \
-             repaired: delete this leg and say so on 1e50e66b",
-        );
-        assert!(
-            why.contains("403") && !why.contains("malformed consumed field"),
-            "attempt {attempt}: the stop is the enroll refusal, not the read: {why}"
-        );
-        let now = api.job(&id).await;
+    for rule_name in [MACHINE_TOKEN_RULE, RUNNER_RULE] {
+        let api = serve().await;
+        let broker = Broker::new(rule_name);
+        let id = file(&api, &broker.rule).await;
+        let enroll = step_path(&api.job(&id).await, "enroll");
+        for who in other_machines(&broker.rule) {
+            let (s, v) = api
+                .patch(
+                    &enroll,
+                    &who,
+                    json!({"authorized_keys_line": EVIL, "receiver_host": "boss-gcp",
+                           "purpose": broker.rule.arg("purpose")}),
+                )
+                .await;
+            assert_eq!(
+                s, 403,
+                "{rule_name}: {who} planted a proposal before scope: {v}"
+            );
+            assert_eq!(v["written_by"], broker.rule.actor(), "{who}: {v}");
+        }
+        let scope_id = scope(&api, &id, &broker.rule).await;
+        assert_eq!(broker.invoke(&api, &id, &scope_id).await, Ok(()));
+        let job = api.job(&id).await;
+        assert_eq!(step(&job, "enroll")["status"], "ready", "{rule_name}");
         assert_eq!(
-            statuses(&now),
-            "scope=completed issue=ready install=pending enroll=pending verify=pending \
-             revoke=pending prepared=pending abandoned=pending",
-            "attempt {attempt}"
+            step(&job, "enroll")["metadata"]["authorized_keys_line"],
+            authorized_keys_line(broker.rule.arg("forced_command"), PUBLIC),
+            "{rule_name}"
         );
-        assert!(
-            step(&now, "enroll")["metadata"].get("public_key").is_none(),
-            "attempt {attempt}"
-        );
-        assert_eq!(broker.mints(), 1, "attempt {attempt}: one pair, never two");
+        assert_eq!(broker.mints(), 1, "{rule_name}");
     }
 }

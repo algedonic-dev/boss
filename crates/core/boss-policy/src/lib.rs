@@ -2,7 +2,8 @@
 //!
 //! The contract types + the in-memory engine live in
 //! `boss-policy-client`; this crate contains just the HTTP server,
-//! the Postgres adapter, and the seeder binaries. Domain services
+//! the seeder binaries, and a compatibility re-export of the shared
+//! optional Postgres adapter. Domain services
 //! depend on `boss-policy-client` so they don't transitively pull
 //! this crate's sqlx + axum service dep tree.
 //!

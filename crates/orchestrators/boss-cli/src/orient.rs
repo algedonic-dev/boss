@@ -11,7 +11,7 @@
 //! census cross-ref, not a second definition), the dock, and the task
 //! queue, with the startup checklist's load-bearing lines at the end.
 //!
-//! Read-only. Inherits `gate::api`'s no-default `BOSS_JOBS_URL` rule —
+//! Read-only. Inherits `crate::sor_client::api`'s no-default `BOSS_JOBS_URL` rule —
 //! fitting, since orienting against the wrong instance is the exact
 //! defect class the rule exists for (aa783636).
 
@@ -19,7 +19,8 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::gate::{AbandonedPlace, abandoned_places, api, queue_order};
+use crate::gate::{AbandonedPlace, abandoned_places, queue_order};
+use crate::sor_client::api;
 // The one rows helper: a read that is not a list refuses rather than
 // printing an empty yard (backlog 7b7e0529).
 use crate::train::rows;
@@ -124,6 +125,36 @@ fn in_transit_line(t: &Value) -> String {
         })
         .unwrap_or_else(|| "—".to_string());
     format!("    {title}  at: {at}")
+}
+
+/// One BEFORE THE TRACK line: the `in_transit_line`, and for a train
+/// stuck before its PR past the conductor's orphan bound, TROUBLED with
+/// the recovery (backlog 238d70c3). pr-train d1a8b140 stood at `collect`
+/// for 28 minutes on 2026-10-09, orphaned by a conductor restart, and
+/// read here exactly like a board in progress. The predicate is the
+/// conductor's own (`train::orphaned_before_pr`), so this line and the
+/// reconcile that cancels the orphan cannot disagree about which train
+/// is stuck; the cancel verb is named for the case where auto-cancel is
+/// off or the cancel keeps failing.
+fn before_the_track_line(t: &Value, now: chrono::DateTime<chrono::Utc>) -> String {
+    let line = in_transit_line(t);
+    let bound = crate::train::PRE_PR_ORPHAN_MINUTES;
+    match crate::train::orphaned_before_pr(t, now, bound) {
+        Some(age) => {
+            let id8: String = t
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .chars()
+                .take(8)
+                .collect();
+            format!(
+                "{line} — TROUBLED: stuck before its PR for {age}m (bound {bound}m); the \
+                 conductor's reconcile cancels it — if it stands, boss train cancel {id8}"
+            )
+        }
+        None => line,
+    }
 }
 
 /// One GATING line for a running gate-run. A car's run is its branch. A
@@ -245,6 +276,12 @@ fn queued_for(run: &Value, now: chrono::DateTime<chrono::Utc>) -> String {
 /// (acedf981; [[a-left-behind-car-may-be-a-landed-twin]]). Each pair is
 /// (branch, current-step title). A missing/empty branch is not residue:
 /// a car that never pushed has nothing gone.
+///
+/// The landed review is the second such state since option A (backlog
+/// bd331d38, c851ed24): a car proven but still owing its review stands
+/// at `Reviewed after landing`, its branch swept like any landed car's,
+/// and reading it as residue would send an operator to close the one
+/// packet holding its review owed.
 fn residue_cars<'a>(
     open_cars: &'a [(String, String)],
     forge_heads: &std::collections::BTreeSet<String>,
@@ -252,7 +289,10 @@ fn residue_cars<'a>(
     open_cars
         .iter()
         .filter(|(branch, step)| {
-            !branch.is_empty() && !forge_heads.contains(branch) && step != "Proven in prod"
+            !branch.is_empty()
+                && !forge_heads.contains(branch)
+                && step != "Proven in prod"
+                && step != boss_jobs::car::LANDED_REVIEW
         })
         .map(|(branch, _)| branch.as_str())
         .collect()
@@ -962,6 +1002,11 @@ fn bases_behind(checks: &[(String, Option<i32>)]) -> Vec<&str> {
 /// set, and the tail line names the flag that shows the rest.
 pub(crate) const ORPHANS_SHOWN: usize = 12;
 
+/// How many owed landed reviews the default listing shows, oldest first
+/// — the same bound-not-filter shape: the heading counts the whole
+/// station, and the tail names `--all` (backlog c851ed24).
+pub(crate) const LANDED_REVIEWS_SHOWN: usize = 12;
+
 /// Where a landed, unproven car stands — `boss_jobs::regions::ShedPlace`,
 /// the ONE classification the yard's regions read and this verb share
 /// (design 0524fc95). Until 2026-09-19 it lived here alone; the read
@@ -1019,6 +1064,151 @@ pub(crate) fn shed_lines(cars: &[Value]) -> Vec<String> {
             format!("    {holds}: {}", shed_text(c))
         })
         .collect()
+}
+
+/// The car's `landed-review` step when it is OWED — ready or active —
+/// else `None` (backlog c851ed24). By slug, with the title as the
+/// fallback `find_step` keeps for every car step.
+fn owed_landed_review(car: &Value) -> Option<&Value> {
+    use boss_jobs::car::{LANDED_REVIEW, LANDED_REVIEW_SLUG, find_step};
+    find_step(car, LANDED_REVIEW_SLUG, LANDED_REVIEW).filter(|s| {
+        matches!(
+            s.get("status").and_then(Value::as_str),
+            Some("ready") | Some("active")
+        )
+    })
+}
+
+/// The command that dispatches a car's owed review — the packet-
+/// addressed form, because the step is nominated to the agent the
+/// moment it is ready, and `boss dispatch --next` takes only steps
+/// nobody holds (`dispatch::waiting_step`).
+fn landed_review_dispatch(id8: &str) -> String {
+    format!(
+        "boss dispatch {id8} --step {}",
+        boss_jobs::car::LANDED_REVIEW_SLUG
+    )
+}
+
+/// Whole hours since the car BOARDED — its `review` step's completion,
+/// which the conductor stamps at boarding. A car lands after it boards,
+/// so this reads the owed review's age high, never low; the line says
+/// "boarded" because the record holds no landing instant.
+fn boarded_hours(car: &Value, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+    use boss_jobs::car::{REVIEW, REVIEW_SLUG, find_step};
+    let at = find_step(car, REVIEW_SLUG, REVIEW)?
+        .get("completed_at")
+        .and_then(Value::as_str)?;
+    let at = chrono::DateTime::parse_from_rfc3339(at).ok()?;
+    Some((now - at.with_timezone(&chrono::Utc)).num_hours())
+}
+
+/// THE LANDED-REVIEW DEBT, read (backlog c851ed24). Since option A
+/// (bd331d38, David 2026-10-09) a car no rule held boards on its green
+/// and owes an independent review AFTER it lands, and `merged` waits
+/// for it — so every item such a car carries stays open until a
+/// reviewer reads the change. On W40 most of 383 parked cars would owe
+/// one. The `landed-review` station counted them and nothing read the
+/// station: the 8e9d3723 stall shape, items silently open behind
+/// unread reviews.
+///
+/// MEMBERSHIP IS THE STATION'S, the age is the car's: the queue body
+/// (`GET /api/stations/landed-review/queue`) says WHICH cars owe one —
+/// its predicate is the one definition of "owed" — and the cars orient
+/// already read say how long each has stood. Oldest first, bounded to
+/// `shown` unless `all`, and a page shorter than the station's `total`
+/// is SAID to be one (a limit is not a filter). A step a dispatched
+/// reviewer holds names that run instead of inviting a second one.
+pub(crate) fn landed_review_lines(
+    queue: &Value,
+    cars: &[Value],
+    now: chrono::DateTime<chrono::Utc>,
+    shown: usize,
+    all: bool,
+) -> Vec<String> {
+    let ids: Vec<&str> = queue
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.get("id").and_then(Value::as_str))
+        .collect();
+    let total = queue
+        .get("total")
+        .and_then(Value::as_u64)
+        .unwrap_or(ids.len() as u64);
+    if total == 0 && ids.is_empty() {
+        return vec![
+            "  LANDED REVIEWS — none owed: every landed car's review is on the record".to_string(),
+        ];
+    }
+    let mut rows: Vec<(Option<i64>, String)> = ids
+        .iter()
+        .map(|id| {
+            let id8 = &id[..id.len().min(8)];
+            let car = cars
+                .iter()
+                .find(|c| c.get("id").and_then(Value::as_str) == Some(*id));
+            let Some(car) = car else {
+                return (
+                    None,
+                    format!(
+                        "    {id8} — not among the cars read ({})",
+                        landed_review_dispatch(id8)
+                    ),
+                );
+            };
+            let branch = md_str(car, "branch");
+            let holds = match md_str(car, boss_jobs::car::BACKLOG_ITEM) {
+                "" => String::new(),
+                item => format!(" (holds {})", &item[..item.len().min(8)]),
+            };
+            let age = boarded_hours(car, now);
+            let boarded = age.map_or("boarded ?".to_string(), |h| format!("boarded {h}h ago"));
+            let reviewer = owed_landed_review(car)
+                .filter(|s| s.get("status").and_then(Value::as_str) == Some("active"))
+                .map(|s| md_str(s, crate::gate::AGENT_RUN_KEY))
+                .filter(|run| !run.is_empty());
+            let next = match reviewer {
+                Some(run) => format!("under review by run {}", &run[..run.len().min(8)]),
+                None => landed_review_dispatch(id8),
+            };
+            (
+                age,
+                format!("    {id8} {branch}{holds} — {boarded} — {next}"),
+            )
+        })
+        .collect();
+    // Oldest first; an age the record does not hold sorts last.
+    rows.sort_by_key(|(age, _)| (age.is_none(), std::cmp::Reverse(*age)));
+    let oldest = rows
+        .iter()
+        .filter_map(|(age, _)| *age)
+        .max()
+        .map_or("oldest age unread".to_string(), |h| {
+            format!("oldest boarded {h}h ago")
+        });
+    let mut out = vec![format!(
+        "  LANDED REVIEWS — {total} landed car(s) owe an independent review; each holds its \
+         item open until a reviewer reads it ({oldest}). Dispatch oldest first, one reviewer \
+         run each, never the car's builder: boss dispatch <car> --step {}",
+        boss_jobs::car::LANDED_REVIEW_SLUG
+    )];
+    let cap = if all { rows.len() } else { shown };
+    out.extend(rows.iter().take(cap).map(|(_, line)| line.clone()));
+    if rows.len() > cap {
+        out.push(format!(
+            "    …and {} more — `boss orient --all` lists every one",
+            rows.len() - cap
+        ));
+    }
+    if (ids.len() as u64) < total {
+        out.push(format!(
+            "    (read {} of {total} on the station's page — the rest are owed and not listed)",
+            ids.len()
+        ));
+    }
+    out
 }
 
 /// What a landed car's proof is waiting on, in one clause — the shed's
@@ -1126,10 +1316,28 @@ pub(crate) fn carried_items(cars: &[Value]) -> std::collections::BTreeMap<String
         }
         let branch = md_str(c, "branch");
         let step = at_step(c);
+        // The item closes only once the car's landed review completes
+        // too (option A, bd331d38), so a car that owes one says so and
+        // names the dispatch (backlog c851ed24).
+        let owed = owed_landed_review(c).map(|_| {
+            let id = c.get("id").and_then(Value::as_str).unwrap_or("?");
+            landed_review_dispatch(&id[..id.len().min(8)])
+        });
         if step == "Proven in prod" {
+            let review = owed
+                .map(|d| format!(" — and its landed review ({d})"))
+                .unwrap_or_default();
             out.insert(
                 item.to_string(),
-                format!("LANDED (car {branch}), awaiting proof: {}", shed_text(c)),
+                format!(
+                    "LANDED (car {branch}), awaiting proof: {}{review}",
+                    shed_text(c)
+                ),
+            );
+        } else if let Some(d) = owed {
+            out.insert(
+                item.to_string(),
+                format!("LANDED (car {branch}), proven, awaiting its landed review ({d})"),
             );
         } else {
             out.entry(item.to_string())
@@ -1273,6 +1481,14 @@ fn my_work_hint(workflow: &str, slug: &str) -> Option<String> {
         ("ship-a-change", "proven") => {
             "a probe to run: the forge runs it via run-car-probe (boss prove --recheck re-runs it)"
         }
+        // Option A's owed review (bd331d38, c851ed24): the car's item
+        // stays open until it completes, and only a dispatched reviewer
+        // may complete it (`steps::landed_review_refusal`).
+        ("ship-a-change", "landed-review") => {
+            "a review owed since the car landed unheld: dispatch a reviewer, \
+             boss dispatch <car> --step landed-review — never the car's builder; \
+             the item the car carries closes only once it completes"
+        }
         ("maintenance-sweep", "inspect") => {
             "a measurement to record: findings + measured on the step, action_needed on the job"
         }
@@ -1327,9 +1543,12 @@ pub(crate) fn my_work_lines(
         .collect();
     // Unknown ages sort last: an older server's row is still listed,
     // never mistaken for today's.
+    // A stalled claim leads (backlog e2519eca item 2): the queue says it
+    // is in hand and nobody is on it, which is the first thing to move.
     keyed.sort_by_key(|(opened, r)| {
         (
             carried_by(r).is_some(),
+            !crate::top_board::stalled(r),
             opened.is_none(),
             *opened,
             r.get("job_id")
@@ -1402,9 +1621,12 @@ pub(crate) fn my_work_lines(
             if !slugs.contains(&slug) {
                 slugs.push(slug);
             }
+            // Whether anyone is on a claim, in OUTRANKS' words (backlog
+            // e2519eca item 2) — the server's one predicate, one formatter.
             out.push(format!(
-                "      {id8} {kind} {slug} {} ({age})",
-                title.trim_end()
+                "      {id8} {kind} {slug} {} {}",
+                title.trim_end(),
+                crate::top_board::with_run(&age, r)
             ));
         }
         let mut hints: Vec<String> = slugs.iter().filter_map(|s| my_work_hint(kind, s)).collect();
@@ -1547,10 +1769,27 @@ pub(crate) fn my_work_section(
         .filter_map(|r| r.pointer("/step/id").and_then(Value::as_str))
         .collect::<BTreeSet<_>>()
         .len();
-    let tail = match held {
-        0 => String::new(),
-        n => format!("; {n} already carried by a car, listed last"),
-    };
+    // Stalled claims, by step id and outside the carried rows: a carried
+    // row prints its car, which is who is on it (backlog e2519eca item 2).
+    let stalled = rows
+        .iter()
+        .filter(|r| crate::top_board::stalled(r))
+        .filter(|r| {
+            !r.get("job_id")
+                .and_then(Value::as_str)
+                .is_some_and(|j| carried.contains_key(j))
+        })
+        .filter_map(|r| r.pointer("/step/id").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let tail = [
+        (stalled, "STALLED: claimed, nobody on it, listed first"),
+        (held, "already carried by a car, listed last"),
+    ]
+    .iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("; {n} {what}"))
+    .collect::<String>();
     let mut out = vec![format!(
         "  MY WORK — {count} ready/active step(s) for {who} — yours to move, oldest first{tail}"
     )];
@@ -1925,7 +2164,7 @@ fn machine_text(m: &Value) -> String {
 }
 
 pub async fn run(all: bool) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
 
     println!("boss orient — the approach, before you build");
     println!(
@@ -1970,7 +2209,7 @@ pub async fn run(all: bool) -> Result<()> {
     // 55d001b0: both doors dark ~36h and a person found it). Beside
     // REPORTING TO because it, too, is about the session's own ground:
     // the door into the pod this verb usually runs in.
-    let door = crate::gate::api(&http, reqwest::Method::GET, crate::door::READ, None)
+    let door = crate::sor_client::api(&http, reqwest::Method::GET, crate::door::READ, None)
         .await
         .and_then(rows)
         .map(|r| r.into_iter().next())
@@ -2092,7 +2331,7 @@ pub async fn run(all: bool) -> Result<()> {
             before.len()
         );
         for t in before {
-            println!("{}", in_transit_line(t));
+            println!("{}", before_the_track_line(t, board_now));
         }
     }
 
@@ -2188,7 +2427,7 @@ pub async fn run(all: bool) -> Result<()> {
     // head a car already carries green is withdrawn rather than recovered
     // — the twin-car guard's own question, asked through its own function
     // (backlog b1c82a82).
-    let cars = crate::gate::all_cars(&http).await?;
+    let cars = crate::sor_client::all_cars(&http).await?;
     let vouched: BTreeMap<String, crate::gate::Vouch> = abandoned
         .iter()
         .filter_map(|p| {
@@ -2685,6 +2924,35 @@ pub async fn run(all: bool) -> Result<()> {
         }
     }
 
+    // THE LANDED REVIEWS — option A's debt, read (backlog c851ed24):
+    // landed cars that owe an independent review, each holding its item
+    // open until one completes. After the shed, because the shed's cars
+    // are the same landed cars at their proof. The station's own read,
+    // refused rather than printed as "none owed" when it is not a list.
+    match api(
+        &http,
+        reqwest::Method::GET,
+        &format!(
+            "/api/stations/{}/queue",
+            boss_jobs::car::LANDED_REVIEW_STATION
+        ),
+        None,
+    )
+    .await
+    {
+        Ok(Some(queue)) if queue.get("data").is_some_and(Value::is_array) => {
+            println!();
+            for line in landed_review_lines(&queue, &cars, now, LANDED_REVIEWS_SHOWN, all) {
+                println!("{line}");
+            }
+        }
+        Ok(_) => println!(
+            "\n  LANDED REVIEWS — unread: the {} station answered no list",
+            boss_jobs::car::LANDED_REVIEW_STATION
+        ),
+        Err(e) => println!("\n  LANDED REVIEWS — unread: {e:#}"),
+    }
+
     // The task queue, as a number.
     let tasks = api(
         &http,
@@ -2740,6 +3008,46 @@ mod tests {
         );
         let nowhere = json!({"title": "PR train x", "steps": []});
         assert_eq!(super::in_transit_line(&nowhere), "    PR train x  at: —");
+    }
+
+    /// A TRAIN STUCK BEFORE ITS PR LOOKS TROUBLED (backlog 238d70c3).
+    /// pr-train d1a8b140 stood at `collect` 28 minutes on 2026-10-09,
+    /// orphaned by a conductor restart, and this list drew it exactly
+    /// like a board still in progress. Past the conductor's orphan bound
+    /// — the same predicate its reconcile cancels by — the line says
+    /// TROUBLED and names the recovery; inside it, the line is unchanged.
+    #[test]
+    fn a_train_stuck_before_its_pr_past_the_orphan_bound_reads_troubled() {
+        use serde_json::json;
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let train = json!({
+            "id": "d1a8b140-57e2-4cec-ada0-3c8dcba8fc08",
+            "title": "PR train 2026-10-09 09:19",
+            "opened_at": "2026-10-09T09:21:24.472813Z",
+            "steps": [
+                {"spec_slug": "collect", "title": "Collect what is ready to board", "status": "ready"},
+                {"spec_slug": "pr", "title": "Open the batched PR", "status": "pending"},
+            ],
+        });
+        let line = super::before_the_track_line(&train, at("2026-10-09T09:49:00Z"));
+        assert!(
+            line.starts_with(&super::in_transit_line(&train)),
+            "the troubled line extends the plain one: {line}"
+        );
+        assert!(
+            line.contains("TROUBLED: stuck before its PR for 27m (bound 10m)"),
+            "{line}"
+        );
+        assert!(line.contains("boss train cancel d1a8b140"), "{line}");
+        assert_eq!(
+            super::before_the_track_line(&train, at("2026-10-09T09:22:00Z")),
+            super::in_transit_line(&train),
+            "a train a board is still opening reads as it always did"
+        );
     }
 
     /// IN TRANSIT and the map's track ask ONE question of a train —
@@ -4592,6 +4900,90 @@ mod tests {
         assert!(l.contains("--answers"), "{l}");
     }
 
+    /// MY WORK SAYS WHETHER ANYONE IS ON A CLAIM (backlog e2519eca item
+    /// 2), in the words OUTRANKS uses — one formatter, over the `run` the
+    /// server computed with the board's one predicate. A stalled claim
+    /// leads its group and the heading counts it; a claim with a run
+    /// names it; an unread run says so. A row whose item a car carries
+    /// prints the car, which already names a car HELD at the dock, and
+    /// is not counted stalled: the car is who is on it.
+    #[test]
+    fn my_work_names_a_claims_run_and_leads_each_group_with_the_stalled() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let claimed = |job: &str, title: &str, opened: &str, run: Value| {
+            let mut row = asg(job, "backlog-item", "build", title, opened, job);
+            row["step"]["status"] = json!("active");
+            row["run"] = run;
+            row
+        };
+        let rows = vec![
+            claimed(
+                "11111111-0000-4000-8000-000000000000",
+                "worked",
+                "2026-10-01",
+                json!({"state": "building", "run": "086d9793-92d8-402f"}),
+            ),
+            claimed(
+                "22222222-0000-4000-8000-000000000000",
+                "gone",
+                "2026-10-05",
+                json!({"state": "no-run"}),
+            ),
+            claimed(
+                "33333333-0000-4000-8000-000000000000",
+                "dark",
+                "2026-10-06",
+                json!({"state": "unread"}),
+            ),
+            claimed(
+                "44444444-0000-4000-8000-000000000000",
+                "parked",
+                "2026-09-30",
+                json!({"state": "no-run"}),
+            ),
+        ];
+        let cars = vec![json!({
+            "id": "2c628718-0000",
+            "status": "open",
+            "metadata": {
+                "backlog_item": "44444444-0000-4000-8000-000000000000",
+                "branch": "fix/parked",
+            },
+            "steps": [{"title": "Ready to board", "status": "ready", "sort_order": 1}],
+        })];
+        let ids = vec!["agent-claude".to_string()];
+        let section = my_work_section(Some(&ids), &rows, &cars, &[], now);
+        assert_eq!(
+            section[0],
+            "  MY WORK — 4 ready/active step(s) for agent-claude — yours to move, oldest first; \
+             1 STALLED: claimed, nobody on it, listed first; 1 already carried by a car, listed last"
+        );
+        assert_eq!(
+            section[1],
+            "    backlog-item — 4 (1 already carried by a car)"
+        );
+        assert_eq!(
+            section[2],
+            "      22222222 backlog-item build gone (5d) STALLED: claimed, no open run"
+        );
+        assert_eq!(
+            section[3],
+            "      11111111 backlog-item build worked (9d, run 086d9793)"
+        );
+        assert_eq!(
+            section[4],
+            "      33333333 backlog-item build dark (4d, run unread)"
+        );
+        assert!(
+            section[5].starts_with(
+                "      44444444 backlog-item build parked — IN FLIGHT (car fix/parked"
+            ),
+            "{section:#?}"
+        );
+    }
+
     /// A car's proof waiting on the caller's own act prints the act's
     /// words in place of the probe hint (backlog fb286c15): the server
     /// hands the owner that row with `owned_wait` on it, and "the forge
@@ -4874,6 +5266,8 @@ mod tests {
                 Region {
                     name: name.into(),
                     count,
+                    waiting: None,
+                    judged: None,
                     bound,
                     bound_kind: bound.map(|_| BoundKind::Capacity),
                     unit: "things".into(),
@@ -5350,6 +5744,210 @@ mod tests {
         assert!(
             !older.contains("flow") && !older.contains("STILL") && !older.contains("[machine"),
             "{older}"
+        );
+    }
+
+    // ---- THE LANDED-REVIEW DEBT (backlog c851ed24) ---------------------
+
+    /// A car that LANDED unheld (option A, bd331d38): boarded at
+    /// `boarded`, its proof in `proven`, and its owed `landed-review` in
+    /// `owed`, carrying `review_md` (a dispatched reviewer's `agent_run`).
+    fn owing(
+        id: &str,
+        branch: &str,
+        boarded: &str,
+        proven: &str,
+        owed: &str,
+        review_md: Value,
+    ) -> Value {
+        json!({
+            "id": id,
+            "kind": "ship-a-change",
+            "status": "open",
+            "title": branch,
+            "metadata": { "branch": branch, "merged": "true", "agent_run": "builder-run" },
+            "steps": [
+                { "spec_slug": "review", "title": "Open for review", "status": "completed",
+                  "completed_at": boarded },
+                { "spec_slug": "proven", "title": "Proven in prod", "status": proven },
+                { "spec_slug": "landed-review", "title": "Reviewed after landing",
+                  "status": owed, "metadata": review_md },
+            ],
+        })
+    }
+
+    fn station(ids: &[&str], total: u64) -> Value {
+        json!({
+            "station": "landed-review",
+            "total": total,
+            "data": ids.iter().map(|id| json!({ "id": id })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// THE ORIENT SECTION: depth, oldest age, and the dispatch line. The
+    /// station is the membership (its predicate is the one definition of
+    /// "owed"), the car record is the age — hours since the car BOARDED,
+    /// which is before it landed, so the age can only read high, and the
+    /// line says boarded rather than claim a landing time the record
+    /// does not hold. Oldest first, because the oldest has held its item
+    /// open longest; a step a dispatched reviewer already holds names
+    /// the run rather than inviting a second dispatch.
+    #[test]
+    fn the_landed_review_section_reads_depth_oldest_age_and_how_to_dispatch() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-09T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut old = owing(
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            "fix/old",
+            "2026-10-08T06:00:00Z",
+            "completed",
+            "ready",
+            json!({}),
+        );
+        old["metadata"]["backlog_item"] = json!("c851ed24-494e-45a8-ba78-d5417ec18e8f");
+        let fresh = owing(
+            "bbbbbbbb-0000-4000-8000-000000000002",
+            "fix/fresh",
+            "2026-10-09T09:00:00Z",
+            "ready",
+            "ready",
+            json!({}),
+        );
+        let taken = owing(
+            "cccccccc-0000-4000-8000-000000000003",
+            "fix/taken",
+            "2026-10-09T01:00:00Z",
+            "ready",
+            "active",
+            json!({ "agent_run": "90105d3e-d978-4948-9b8b-d8c4087ee0da" }),
+        );
+        let cars = vec![fresh.clone(), taken.clone(), old.clone()];
+        let ids: Vec<&str> = cars.iter().map(|c| c["id"].as_str().unwrap()).collect();
+        let lines = landed_review_lines(&station(&ids, 3), &cars, now, 10, false);
+        assert!(
+            lines[0].starts_with("  LANDED REVIEWS — 3 landed car(s) owe an independent review")
+                && lines[0].contains("oldest boarded 30h ago"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("boss dispatch <car> --step landed-review"),
+            "the dispatch line rides the heading: {}",
+            lines[0]
+        );
+        assert_eq!(
+            lines[1],
+            "    aaaaaaaa fix/old (holds c851ed24) — boarded 30h ago — \
+             boss dispatch aaaaaaaa --step landed-review"
+        );
+        assert_eq!(
+            lines[2],
+            "    cccccccc fix/taken — boarded 11h ago — under review by run 90105d3e"
+        );
+        assert_eq!(
+            lines[3],
+            "    bbbbbbbb fix/fresh — boarded 3h ago — \
+             boss dispatch bbbbbbbb --step landed-review"
+        );
+        assert_eq!(lines.len(), 4, "{lines:?}");
+
+        // Nothing owed is SAID, never an absent section.
+        let none = landed_review_lines(&station(&[], 0), &[], now, 10, false);
+        assert_eq!(
+            none,
+            vec![
+                "  LANDED REVIEWS — none owed: every landed car's review is on the record"
+                    .to_string()
+            ]
+        );
+
+        // A long list is bounded, and the tail says how to read the rest;
+        // a page shorter than the station's total says it is a floor.
+        let short = landed_review_lines(&station(&ids, 5), &cars, now, 2, false);
+        assert!(
+            short
+                .iter()
+                .any(|l| l.contains("…and 1 more — `boss orient --all`")),
+            "{short:?}"
+        );
+        assert!(short.iter().any(|l| l.contains("read 3 of 5")), "{short:?}");
+        // A member the car read did not return is still listed by id.
+        let lost = landed_review_lines(
+            &station(&["dddddddd-0000-4000-8000-000000000004"], 1),
+            &[],
+            now,
+            10,
+            false,
+        );
+        assert_eq!(
+            lost[1],
+            "    dddddddd — not among the cars read (boss dispatch dddddddd --step landed-review)"
+        );
+    }
+
+    /// A LANDED CAR AT ITS REVIEW IS NOT RESIDUE. The train sweeps a
+    /// landed car's branch; until option A the only open state with a
+    /// swept branch was `Proven in prod`. A car proven but still owing
+    /// its landed review stands at `Reviewed after landing` with no
+    /// branch either, and RESIDUE would have called every one of them
+    /// "landed via a twin or abandoned".
+    #[test]
+    fn a_landed_car_owing_its_review_is_not_residue() {
+        let open = vec![(
+            "fix/reviewing".to_string(),
+            boss_jobs::car::LANDED_REVIEW.to_string(),
+        )];
+        assert!(residue_cars(&open, &heads(&[])).is_empty());
+    }
+
+    /// MY WORK: an item whose car landed and owes its review says so,
+    /// and names the dispatch — the item closes only once that review
+    /// completes, so "awaiting proof" alone would be half the reason it
+    /// is still open. And the car's own `landed-review` row carries a
+    /// hint saying what it is.
+    #[test]
+    fn my_work_names_the_owed_landed_review_holding_an_item_open() {
+        let item = "c851ed24-494e-45a8-ba78-d5417ec18e8f";
+        let mut proven = owing(
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            "fix/proven",
+            "2026-10-08T06:00:00Z",
+            "completed",
+            "ready",
+            json!({}),
+        );
+        proven["metadata"]["backlog_item"] = json!(item);
+        let carried = carried_items(&[proven]);
+        assert_eq!(
+            carried[item],
+            "LANDED (car fix/proven), proven, awaiting its landed review \
+             (boss dispatch aaaaaaaa --step landed-review)"
+        );
+        let mut both = owing(
+            "bbbbbbbb-0000-4000-8000-000000000002",
+            "fix/both",
+            "2026-10-08T06:00:00Z",
+            "ready",
+            "ready",
+            json!({}),
+        );
+        both["metadata"]["backlog_item"] = json!(item);
+        both["metadata"]["proof_probe"] = json!("bash x.sh");
+        let carried = carried_items(&[both]);
+        assert!(
+            carried[item].starts_with("LANDED (car fix/both), awaiting proof: probe pending")
+                && carried[item].ends_with(
+                    "— and its landed review (boss dispatch bbbbbbbb --step landed-review)"
+                ),
+            "{}",
+            carried[item]
+        );
+        let hint = my_work_hint("ship-a-change", "landed-review").unwrap();
+        assert!(
+            hint.starts_with("landed-review = ")
+                && hint.contains("boss dispatch <car> --step landed-review"),
+            "{hint}"
         );
     }
 }

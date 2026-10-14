@@ -21,8 +21,10 @@
   // failure, never as an empty yard.
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import StationQueuePanel from './StationQueuePanel.svelte';
   import { href, navigate } from '../../router';
   import type { Remote } from '../../data/remote';
+  import type { Regions } from '../yard/regions';
   import {
     answeredHours,
     constraintOf,
@@ -54,8 +56,9 @@
   // this page already makes — one read of a region, never two.
   let {
     embedded = false,
+    regionRead,
     ondeck = (_deck: Deck) => {},
-  }: Readonly<{ embedded?: boolean; ondeck?: (deck: Deck) => void }> = $props();
+  }: Readonly<{ embedded?: boolean; regionRead: Remote<Regions>; ondeck?: (deck: Deck) => void }> = $props();
 
   // Offered windows. A day is the default: the shortest span in which
   // every queue on this network has had a chance to be worked once, so
@@ -66,6 +69,7 @@
   const WAIT_ROWS = 12;
 
   let windowHours = $state<number>(24);
+  let selectedQueue = $state<string | null>(null);
   let load = $state<Remote<StationLoadEnvelope>>({ kind: 'loading' });
   let flow = $state<Remote<StationFlowEnvelope>>({ kind: 'loading' });
   let waits = $state<Remote<ReturnType<typeof parseQueueAge>>>({ kind: 'loading' });
@@ -104,11 +108,31 @@
     void refresh();
   }
 
+  // The server evaluates the station registry for each region. The load
+  // envelope covers every station, so it cannot define this board's membership.
+  const region = $derived(regionRead.kind === 'ready'
+    ? regionRead.data.regions.find((r) => r.name === 'marshalling') : undefined);
+  const stations = $derived(new Set(region?.places.map((p) => p.name) ?? []));
+  const membershipProblem = $derived.by<string | null>(() => {
+    if (regionRead.kind === 'failed') return regionRead.error;
+    if (regionRead.kind === 'loading') return null;
+    if (region === undefined || region.count === null) return 'the server gave no region membership reading';
+    if (region.count > 0 && stations.size === 0) return 'the server gave no station membership for the occupied region';
+    if (load.kind === 'ready') {
+      const loaded = new Set(load.data.rows.map((r) => r.station));
+      const missing = [...stations].filter((s) => !loaded.has(s));
+      if (missing.length > 0) return `${missing.join(', ')} has no load reading`;
+    }
+    return null;
+  });
   const sidings = $derived.by<ReadonlyArray<Siding>>(() =>
-    load.kind === 'ready' && flow.kind === 'ready'
-      ? joinSidings(load.data.rows, flow.data)
+    load.kind === 'ready' && flow.kind === 'ready' && region !== undefined && membershipProblem === null
+      ? joinSidings(load.data.rows.filter((r) => stations.has(r.station)), flow.data)
       : [],
   );
+  $effect(() => {
+    if (selectedQueue !== null && !sidings.some((s) => s.station === selectedQueue)) selectedQueue = null;
+  });
   // Stations overlap, so the depth column does not add up to the work;
   // this says by how much, from the server's own counts (140a2222).
   const overlap = $derived(load.kind === 'ready' ? overlapLine(load.data) : null);
@@ -151,11 +175,13 @@
   // honest reason there is none. A failed read is a FAILURE up there
   // too — a region drawn empty would read as a quiet one.
   const deck = $derived<Deck>(
-    load.kind === 'failed'
+    membershipProblem !== null
+      ? { kind: 'unavailable', why: membershipProblem }
+      : load.kind === 'failed'
       ? { kind: 'unavailable', why: load.error }
       : flow.kind === 'failed'
         ? { kind: 'unavailable', why: flow.error }
-        : load.kind === 'loading' || flow.kind === 'loading'
+        : load.kind === 'loading' || flow.kind === 'loading' || regionRead.kind === 'loading'
           ? { kind: 'reading' }
           : { kind: 'ready', region: 'marshalling', platforms: marshallingPlatforms(sidings, judgedHours) },
   );
@@ -190,7 +216,9 @@
     {/if}
   </div>
 
-  {#if load.kind === 'failed'}
+  {#if membershipProblem !== null}
+    <p class="my-fail load-failed">The marshalling station membership is unknown: {membershipProblem}. The board cannot be judged.</p>
+  {:else if load.kind === 'failed'}
     <p class="my-fail load-failed">
       The station load did not answer: {load.error}. An unreachable read is not an
       empty yard, so this page shows nothing rather than a clear one.
@@ -200,19 +228,29 @@
       The station flow did not answer: {flow.error}. Depth without a rate cannot say
       whether anything is forming, so the constraint is not named.
     </p>
-  {:else if load.kind === 'loading' || flow.kind === 'loading'}
+  {:else if load.kind === 'loading' || flow.kind === 'loading' || regionRead.kind === 'loading'}
     <p class="my-quiet">Reading the network…</p>
   {:else}
     <!-- 00 — THE CONSTRAINT. One queue always is; this names it. -->
     <div class="my-section">00 — THE CONSTRAINT</div>
     <div class="my-constraint" class:named={constraint.kind === 'station'}>
       {#if constraint.kind === 'station'}
-        <div class="my-constraint-name">{constraint.station}</div>
+        <button type="button" class="my-constraint-name my-queue" onclick={() => selectedQueue = constraint.kind === 'station' ? constraint.station : null}>{constraint.station}</button>
       {:else}
         <div class="my-constraint-name muted">No queue can be named</div>
       {/if}
       <div class="my-constraint-why">{constraint.because}</div>
+      {#if constraint.kind === 'station' && constraint.unjudged !== null}
+        <!-- What the name was judged WITHOUT (ba1fcc6d). -->
+        <div class="my-constraint-unjudged">{constraint.unjudged}</div>
+      {/if}
     </div>
+
+    {#if selectedQueue !== null}
+      {#key selectedQueue}
+        <StationQueuePanel station={selectedQueue} onclose={() => selectedQueue = null} />
+      {/key}
+    {/if}
 
     <!-- 01 — SIDINGS. Depth, then the rate, then why it is not moving. -->
     <div class="my-section">01 — SIDINGS HOLDING WORK</div>
@@ -236,7 +274,7 @@
           {#each holding as s (s.station)}
             <tr class:constraint={constraint.kind === 'station' && constraint.station === s.station}>
               <td class="mono">
-                <span class="my-station">{s.station}</span>
+                <button type="button" class="my-station my-queue" onclick={() => selectedQueue = s.station}>{s.station}</button>
                 <!-- The per-kind drill-down, where the station's predicate
                      names one Workflow kind (c7c5c1de): which step of
                      that kind the pile stands at, and whether it drains.
@@ -270,7 +308,7 @@
       </table>
     {/if}
     {#if overlap !== null}
-      <p class="my-overlap">{overlap}</p>
+      <p class="my-overlap">Across all station loads: {overlap}</p>
     {/if}
 
     <!-- 02 — THE WAITS. Step-level, wall clock, click opens the packet. -->
@@ -325,7 +363,7 @@
       <ul class="my-blind">
         {#each blind as s (s.station)}
           <li>
-            <span class="mono">{s.station}</span>
+            <button type="button" class="mono my-queue" onclick={() => selectedQueue = s.station}>{s.station}</button>
             <span class="dim">
               — {s.flow.kind === 'unavailable' ? s.flow.reason : ''}</span
             >
@@ -336,7 +374,7 @@
 
     {#if clear.length > 0}
       <div class="my-section">04 — CLEAR</div>
-      <p class="my-clear">{clear.map((s) => s.station).join(' · ')}</p>
+      <p class="my-clear">{#each clear as s (s.station)}<button type="button" class="my-queue" onclick={() => selectedQueue = s.station}>{s.station}</button> {/each}</p>
     {/if}
 
     <p class="my-footnote">
@@ -396,7 +434,9 @@
     font-family: var(--font-mono); font-weight: 600; font-size: 15px;
   }
   .my-constraint-name.muted { color: var(--static); font-weight: 400; }
+  .my-queue { font: inherit; color: inherit; background: transparent; border: 0; padding: 0; text-align: left; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
   .my-constraint-why { color: var(--static); font-size: 13px; }
+  .my-constraint-unjudged { color: var(--warn); font-size: 13px; margin-top: 4px; }
   .my-table { width: 100%; border-collapse: collapse; font-size: 13px; }
   .my-table th {
     text-align: left; font-family: var(--font-mono);

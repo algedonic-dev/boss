@@ -158,7 +158,7 @@ pub fn run(clone: Option<String>, remote: Option<String>, jobs_url: Option<Strin
     // is right on one host and silently wrong on another is the defect
     // `resolve_jobs_base` exists to refuse (aa783636) — so `running`
     // resolves the way every other read verb does: flag, env, refuse.
-    let jobs_url = crate::gate::resolve_jobs_base(jobs_url.as_deref())?;
+    let jobs_url = crate::sor_client::resolve_jobs_base(jobs_url.as_deref())?;
     let jobs_url = jobs_url.trim_end_matches('/');
 
     let g = Generations {

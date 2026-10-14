@@ -116,7 +116,9 @@
 #                                   (default: /var/backups/boss/instance-db)
 #   BOSS_SWITCH_MIN_SNAPSHOT_BYTES  the floor (default: 1048576)
 #   BOSS_SWITCH_TREE                the checkout whose fetched main ref is
-#                                   read (default: the one this script is in)
+#                                   read (default: the runner's
+#                                   BOSS_OPS_CHECKOUT, else the one this
+#                                   script is in; backlog a604a35b)
 #   BOSS_SWITCH_MAIN_REF            the ref the release will build
 #                                   (default: forgejo/main)
 #   BOSS_KUBECTL / KUBECONFIG       see undeclared-objects.sh; resolved once
@@ -138,7 +140,7 @@ RESOLVE="$REPO/infra/cluster/undeclared-objects.sh"
 . "$SELF_DIR/forge-defaults.sh"
 BACKUP_DIR="${BOSS_SWITCH_BACKUP_DIR:-/var/backups/boss/instance-db}"
 MIN_BYTES="${BOSS_SWITCH_MIN_SNAPSHOT_BYTES:-1048576}"
-TREE="${BOSS_SWITCH_TREE:-$REPO}"
+TREE="${BOSS_SWITCH_TREE:-${BOSS_OPS_CHECKOUT:-$REPO}}"
 MAIN_REF="${BOSS_SWITCH_MAIN_REF:-forgejo/main}"
 
 # The targets, as infra/cluster/manifests/boss.yaml declares them: the

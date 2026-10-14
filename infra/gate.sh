@@ -130,6 +130,16 @@ export CARGO_INCREMENTAL=0
 }
 wt_isolate_target_dir
 
+# AND IT MUST NOT RUN WIDER THAN THE WORKTREE'S BUILDS (backlog
+# 9ecd12ea, ask 3). In a linked worktree — a builder's on the dev pod —
+# `--lint`'s workspace clippy ran at cargo's default, one job per NODE
+# CPU (32 there) against a 32Gi container that every builder shares; the
+# memory watch saw it hold ten clippy-drivers at once, where wt-cargo
+# allows four. The helper bounds it to wt-cargo's width and says so; a
+# main checkout (the gate runner, CI) keeps its full width. A missing
+# bound is refused, as wt-cargo refuses one.
+wt_bound_build_jobs || exit $?
+
 # THE GATE'S GIT READS MUST WORK FOR WHATEVER UID THE GATE RUNS AS.
 #
 # Since #310 (2026-09-11) the gate runs as uid 65534 / gid 1500, and
@@ -729,7 +739,7 @@ db_checks_passed() {
     for entry in ${RAN+"${RAN[@]}"}; do
         name="$(ran_name "$entry")"; result="$(ran_result "$entry")"
         case "$name" in
-            fixture|test) seen=1; [ "$result" = "pass" ] || return 1 ;;
+            fixture|test|"test build") seen=1; [ "$result" = "pass" ] || return 1 ;;
         esac
     done
     [ "$seen" -eq 1 ]
@@ -799,6 +809,31 @@ crates_from_paths() {
 #   subject to the existence test, so `dir.join("seeds/x.toml")` on a
 #   scratch base maps to nothing because no such file sits at the root.
 #
+#   A PATH NAMED BY A CONST is the same read one step removed. boss-cli's
+#   recovery.rs holds its sheet as `pub const SOURCE: &str = "infra/
+#   recovery/re-entry.toml"` and joins the CONST, so the literal sits
+#   beside no `.join(` and an edit to the sheet scoped boss-cli out
+#   (backlog 6ac90873). A const or static whose whole value is the
+#   literal is a name given to a path, never a sentence, so it counts in
+#   src/ too. Measured at 21d83290 it adds thirteen pairs. Twelve are
+#   files their crate reads: the recovery sheet and five of its inputs,
+#   boss-ports' launcher and service map, the brief's instance table and
+#   dev-pod manifest, the
+#   trust areas, the break-glass manifest the gateway checks against.
+#   The thirteenth, conductor.rs's PHONE_STRIP, names a real web test as
+#   a fixture path in a scratch repo, so editing that one test also
+#   compiles boss-cli — over-scoping, the safe direction. Absolute literals (`/var/run/secrets/…`) are the host's, not the
+#   tree's, and are dropped before the existence test can pass them.
+#
+#   A FILE A DATA FILE NAMES is read by that data file's readers.
+#   `data_file_refs` below takes one hop out of the index: every
+#   `file = "…"` a TOML in it names is an input of the TOML's crates.
+#   The recovery sheet names ~27 files that way and boss-cli's
+#   `the_roads_the_runbooks_held_are_on_the_sheet` reads each one through
+#   it, so car 594df586 edited the backup manifest, derived boss-testing
+#   alone, gated green, and that test was red on its head (review
+#   298f7808).
+#
 # RESOLVED AGAINST TWO BASES because the two idioms differ:
 # `include_str!` is relative to the source FILE, while
 # `env!("CARGO_MANIFEST_DIR").join("../../../x")` is relative to the
@@ -867,14 +902,18 @@ file_input_index() {
             while (match(rest, /"[^"]*"/)) {
                 spec = substr(rest, RSTART + 1, RLENGTH - 2)
                 joined = (substr(rest, 1, RSTART - 1) ~ /\.join\($/)
+                named = (substr(rest, 1, RSTART - 1) ~ /^[[:space:]]*(pub(\([a-z]+\))? )?(const|static) [A-Z0-9_]+: &[^=]*str = $/)
                 rest = substr(rest, RSTART + RLENGTH)
                 if (spec !~ /\//) continue
                 # A literal with whitespace in it is a sentence that
                 # mentions a path, not a path.
                 if (spec ~ /[[:space:]]/) continue
-                # Outside tests/, only an ESCAPING literal counts —
-                # or one being `.join`ed onto a base (backlog 1b52c278).
-                if (!intests && !joined && spec !~ /^\.\.\//) continue
+                # Absolute paths are the host, never the tree.
+                if (spec ~ /^\//) continue
+                # Outside tests/, only an ESCAPING literal counts — or
+                # one being `.join`ed onto a base (backlog 1b52c278), or
+                # one that IS a const/static (backlog 6ac90873).
+                if (!intests && !joined && !named && spec !~ /^\.\.\//) continue
                 print resolve(dir, spec) " " crate
                 print resolve(root, spec) " " crate
             }
@@ -887,10 +926,38 @@ file_input_index() {
     done
 }
 
+# One hop out of the index (backlog 6ac90873): for each `<toml> <crate>`
+# row on stdin, every `file = "…"` the TOML names is an input of that
+# crate too. Keyed on the TOML key rather than on any path-shaped string,
+# because a key called `file` is a reference by construction, while a
+# path in a TOML's prose or pattern is not. Paths under crates/ are kept
+# on purpose, unlike the index's own scan: the recovery sheet names
+# boss-gateway's main.rs and boss-policy's check_mode.rs by `file =`,
+# and boss-cli's recovery tests read them, so a car editing either can
+# redden boss-cli — that is the read this hop exists to count. One hop
+# is the whole answer today: only infra/recovery/re-entry.toml carries
+# the key, and nothing it names carries it in turn.
+data_file_refs() {
+    local path crate ref
+    while read -r path crate; do
+        case "$path" in *.toml) ;; *) continue ;; esac
+        [ -n "$crate" ] && [ -f "$path" ] || continue
+        grep -oE "(^|[{ ,])file = (\"[^\"]*\"|'[^']*')" "$path" \
+            | sed -E "s/^.*file = [\"']//; s/[\"']\$//" | sort -u \
+            | while read -r ref; do
+                case "$ref" in /*) continue ;; esac
+                if [ -f "$ref" ]; then printf '%s %s\n' "$ref" "$crate"; fi
+            done
+    done
+}
+
 # Computed ONCE and read by `path_map` out of the environment: path_map
 # runs inside a command substitution on every call, and the self-test
 # calls it a few dozen times.
 GATE_FILE_INPUTS="$(file_input_index)"
+GATE_FILE_INPUTS="$({ printf '%s\n' "${GATE_FILE_INPUTS}"
+                      printf '%s\n' "${GATE_FILE_INPUTS}" | data_file_refs; } \
+                    | sed '/^$/d' | sort -u)"
 
 # ---------------------------------------------------------------------
 # Crates that READ THE SCHEMA: derived from the tree, never listed here
@@ -1113,21 +1180,27 @@ path_shapes() {
 # `a_tree_walk_declares_itself_tree_wide.rs` refuses a test that walks a
 # top-level tree and says neither this nor why not (backlog bc978312).
 #
+# THE MARKER IS THE WHOLE LINE, OR THE MARKER AND AN EM DASH (backlog
+# 18e58c96): `//! tree-wide pin` / `// tree-wide pin`, alone or followed
+# by ` — <why>`. Any following word used to do, so a wrapped prose
+# comment in boss-cli's judged_red.rs that began "// tree-wide pin no
+# car changed" declared a pure string test a gate pin by accident.
+#
 # Prints `<crate> <selector> <name>` per line: `test:<file>` for a whole
 # tests/ file (the name is the file), `lib` or `bin:<name>` for one test.
 tree_wide_pins() {
     local f crate dir rel sel
     {
-        grep -l '^//! tree-wide pin' crates/*/*/tests/*.rs 2>/dev/null \
+        grep -lE '^//! tree-wide pin( —|$)' crates/*/*/tests/*.rs 2>/dev/null \
             | sed -n 's|^crates/[^/]*/\([^/]*\)/tests/\([^/]*\)\.rs$|\1 test:\2 \2|p'
-        grep -rlE --include='*.rs' '^[[:space:]]*// tree-wide pin( |$)' crates/*/*/src 2>/dev/null \
+        grep -rlE --include='*.rs' '^[[:space:]]*// tree-wide pin( —|$)' crates/*/*/src 2>/dev/null \
             | while read -r f; do
                 crate=$(printf '%s\n' "$f" | cut -d/ -f3)
                 dir=$(printf '%s\n' "$f" | cut -d/ -f1-3)
                 rel=${f#"$dir"/src/}
                 sel=$(tree_wide_target "$dir" "$rel")
                 awk -v pre="${crate} ${sel} " '
-                    /^[[:space:]]*\/\/ tree-wide pin( |$)/ { want = 1; next }
+                    /^[[:space:]]*\/\/ tree-wide pin( —|$)/ { want = 1; next }
                     want && $0 !~ /^[[:space:]]*\/\// && match($0, /fn [A-Za-z0-9_]+/) {
                         print pre substr($0, RSTART + 3, RLENGTH - 3)
                         want = 0
@@ -1145,10 +1218,29 @@ tree_wide_target() { # <crate dir> <path under src/>
     top=${top%.rs}
     if [ "$rel" = "main.rs" ] || { [ -f "$dir/src/main.rs" ] \
         && grep -qE "^[[:space:]]*(pub(\([a-z]+\))? )?mod ${top};" "$dir/src/main.rs"; }; then
-        printf 'bin:%s\n' "${dir##*/}"
+        printf 'bin:%s\n' "$(tree_wide_bin_name "$dir")"
     else
         printf 'lib\n'
     fi
+}
+
+# The name cargo knows `<crate dir>/src/main.rs` by, read from the
+# crate's own Cargo.toml: the `[[bin]]` whose path is src/main.rs, else
+# the package name. NOT the directory name — boss-cli's binary is
+# `boss`, so `--bin boss-cli` was "no bin target named `boss-cli`" and
+# gate-run 3faa181f went red with no test failing (backlog 43587b6f).
+tree_wide_bin_name() { # <crate dir>
+    local dir="$1" name=""
+    [ -f "$dir/Cargo.toml" ] && name=$(awk '
+        function q(s) { return match(s, /"[^"]*"/) ? substr(s, RSTART + 1, RLENGTH - 2) : "" }
+        function flush() { if (inbin && path == "src/main.rs" && bin != "") found = bin; bin = ""; path = "" }
+        /^[[:space:]]*\[/ { flush(); inbin = ($0 ~ /^\[\[bin\]\]/); inpkg = ($0 ~ /^\[package\]/); next }
+        inbin && /^name[[:space:]]*=/ { bin = q($0) }
+        inbin && /^path[[:space:]]*=/ { path = q($0) }
+        inpkg && /^name[[:space:]]*=/ && pkg == "" { pkg = q($0) }
+        END { flush(); print (found != "" ? found : pkg) }
+    ' "$dir/Cargo.toml")
+    printf '%s\n' "${name:-${dir##*/}}"
 }
 
 # The names on the command line that `<log>` does not show passing — a
@@ -1212,6 +1304,43 @@ tree_wide_self_test() {
     rm -f "$tmp"
     if [ "$got" != "failing_pin absent_pin " ]; then
         echo "gate.sh tree-wide self-test FAIL: wanted [failing_pin absent_pin ] unreported, got [${got}] — a filtered pin run that matched nothing would read as green (backlog cb2157f9)" >&2
+        exit 2
+    fi
+    # A pin in a bin crate's module runs under the binary's cargo name,
+    # not its directory's: boss-cli's shape (a second [[bin]] listed
+    # first, then `boss` at src/main.rs), and a crate with no [[bin]] at
+    # all, which cargo names after its package (backlog 43587b6f).
+    local crates
+    crates="$(mktemp -d)" || { echo "gate.sh: the tree-wide self-test cannot make a temp dir" >&2; exit 2; }
+    mkdir -p "$crates/boss-cli/src" "$crates/plain-dir/src"
+    printf '[package]\nname = "boss-cli"\n\n[[bin]]\nname = "boss-aux"\npath = "src/bin/aux.rs"\n\n[[bin]]\nname = "boss"\npath = "src/main.rs"\n\n[dependencies]\nname = "not-a-bin"\n' > "$crates/boss-cli/Cargo.toml"
+    printf 'mod train;\n' > "$crates/boss-cli/src/main.rs"
+    printf '[package]\nname = "plain-pkg"\nversion = "0.1.0"\n' > "$crates/plain-dir/Cargo.toml"
+    printf 'mod walk;\n' > "$crates/plain-dir/src/main.rs"
+    got="$(tree_wide_target "$crates/boss-cli" train/judged_red.rs) $(tree_wide_target "$crates/plain-dir" walk.rs)"
+    rm -rf "$crates"
+    if [ "$got" != "bin:boss bin:plain-pkg" ]; then
+        echo "gate.sh tree-wide self-test FAIL: wanted [bin:boss bin:plain-pkg], got [${got}] — a bin pin named by its directory asks cargo for a --bin that does not exist, which cargo refuses (backlog 43587b6f)" >&2
+        exit 2
+    fi
+    # The marker is the whole line or the marker and an em dash, never a
+    # sentence that happens to start with its words: a wrapped comment in
+    # boss-cli's judged_red.rs began "// tree-wide pin no car changed"
+    # and made a pure string test a gate pin (backlog 18e58c96).
+    crates="$(mktemp -d)" || { echo "gate.sh: the tree-wide self-test cannot make a temp dir" >&2; exit 2; }
+    mkdir -p "$crates/crates/core/fixture/src" "$crates/crates/core/fixture/tests"
+    printf '[package]\nname = "fixture"\n' > "$crates/crates/core/fixture/Cargo.toml"
+    printf '%s\n' \
+        '    // tree-wide pin — it reads a tree no map attributes' '    #[test]' '    fn dashed_pin() {}' \
+        '    // tree-wide pin' '    #[test]' '    fn bare_pin() {}' \
+        '    // tree-wide pin no car changed, and its panic message named' '    // the two files the car had added' '    #[test]' '    fn prose_is_not_a_pin() {}' \
+        > "$crates/crates/core/fixture/src/lib.rs"
+    printf '//! tree-wide pin — it scans a tree\n#[test]\nfn t() {}\n' > "$crates/crates/core/fixture/tests/whole.rs"
+    printf '//! tree-wide pinning is what the other file does\n#[test]\nfn t() {}\n' > "$crates/crates/core/fixture/tests/prose.rs"
+    got=$(cd "$crates" && tree_wide_pins | tr '\n' ',')
+    rm -rf "$crates"
+    if [ "$got" != "fixture lib bare_pin,fixture lib dashed_pin,fixture test:whole whole," ]; then
+        echo "gate.sh tree-wide self-test FAIL: wanted [fixture lib bare_pin,fixture lib dashed_pin,fixture test:whole whole,], got [${got}] — a prose comment that begins with the marker's words declares a pin nobody meant (backlog 18e58c96)" >&2
         exit 2
     fi
 }
@@ -1387,7 +1516,13 @@ scope_self_test() {
     # fb444bbb, car 1): the_watchdog_reads_the_admin_kubeconfig_david_placed.rs
     # runs it to hold it to the one admin kubeconfig.
     _case "a script a pin reads implies that pin's crate" "boss-testing" \
-        "infra/forge/cluster-watchdog.sh" "infra/forge/rollback-to.sh"
+        "infra/forge/cluster-watchdog.sh"
+    # rollback-to.sh left the case above on 2026-10-09 because the answer
+    # for it CHANGED, correctly (backlog 6ac90873): the recovery sheet
+    # names it by `file =`, and boss-cli's recovery tests resolve every
+    # such reference, so editing it can redden boss-cli as well.
+    _case "a script the recovery sheet names implies the sheet's reader too" \
+        "boss-cli boss-testing" "infra/forge/rollback-to.sh"
     # THE RE-PIN (backlog 294bb7c9). Until that car, the case above also
     # asserted `infra/deploy-services.sh` implies no crate — and that
     # answer was WRONG, not merely incomplete: boss-ports `include_str!`d
@@ -1444,6 +1579,18 @@ scope_self_test() {
     # table to CONTRACT. The `.join(` prefix is what counts it now.
     _case "a doc a crate's own test module reads by repo path implies that crate" \
         "boss-cli" "docs/tenant-contract.md"
+    # THE FIFTH RE-PIN (backlog 6ac90873). recovery.rs names the sheet in
+    # `pub const SOURCE` and joins the const, so the sheet derived
+    # boss-testing alone and a sheet-only car never ran boss-cli's
+    # recovery tests. The const idiom counts it now. And the file car
+    # 594df586 edited — named only by the sheet's `file =` — derived
+    # boss-testing alone, so that car gated green with boss-cli's
+    # `the_roads_the_runbooks_held_are_on_the_sheet` red on its head
+    # (review 298f7808). The hop in `data_file_refs` counts it now.
+    _case "a data file a crate names in a const implies that crate" \
+        "boss-cli boss-testing" "infra/recovery/re-entry.toml"
+    _case "a file a data file names by file = implies the data file's readers" \
+        "boss-cli boss-testing" "infra/cluster/manifests/boss-backup.yaml"
     _case "the web app implies no crate" "" "apps/web/src/me/MePage.svelte"
     # THE SECOND RE-PIN (backlog 4711828d). Until this car the line here
     # asserted "a migration implies no crate", with a note that mapping
@@ -2056,6 +2203,49 @@ web_timings_json() {
 }
 # --- web timings (end) ---
 
+# The test check, in two halves (backlog 2d234222).
+#
+# Measured 2026-10-09 by run c4a8df09 over every gate-run: the `test`
+# check took a median 2041 s at the fixed scope boss-testing on 2.25 of
+# the container's 20 cores, IO wait 9% — cargo runs test binaries one at
+# a time, 2 threads each, and boss-testing had tripled (905 -> 3063
+# tests). One check timed the compile and the run together, so how much
+# of that was compiling could not be read off any receipt.
+#
+# Now `test build` is `cargo test … --no-run` and `test` runs the list
+# it produced through infra/cargo-test-wide.sh, several binaries at a
+# time (the width, and why four, are in that file's header). Each half
+# is a check with its own seconds, and `test_binaries` on the receipt is
+# the run's own account: width, binaries, wall seconds, and the sum of
+# every binary's own seconds — what one at a time would have cost — so
+# the gain is read from one receipt. `null` means no test run happened.
+# The state lives under the target dir, which no git-based lint reads.
+TEST_WIDE_STATE="${CARGO_TARGET_DIR:-target}/cargo-test-wide"
+case "$TEST_WIDE_STATE" in /*) ;; *) TEST_WIDE_STATE="$PWD/$TEST_WIDE_STATE" ;; esac
+# One JSON object or `null`, never an empty value: slurped, so a file
+# holding no document (or two) answers null rather than breaking the
+# receipt it is spliced into.
+#
+# Read ONLY when this gate's `test` check ran, and never deleted here
+# (review 465e723f F4, backlog c0259ecc). This file used to `rm -f` the
+# summary at top level, in every invocation — `--self-test` and
+# `--quick` included — so a gate.sh run by a test INSIDE a gate,
+# inheriting that gate's CARGO_TARGET_DIR, deleted the outer gate's
+# summary (reproduced with a plain clone, which is how the runner checks
+# out). The runner's own `build` half clears it before a run, and a
+# summary lying in the target dir of a gate that ran no test is someone
+# else's, so it is not read rather than removed.
+test_binaries_json() {
+    local s="$TEST_WIDE_STATE/summary.json" out="" entry ran=0
+    for entry in ${RAN+"${RAN[@]}"}; do
+        [ "$(ran_name "$entry")" != "test" ] || ran=1
+    done
+    if [ "$ran" -eq 1 ] && [ -s "$s" ]; then
+        out="$(jq -c -s 'if length == 1 and (.[0] | type == "object") then .[0] else null end' "$s" 2>/dev/null)" || out=""
+    fi
+    printf '%s' "${out:-null}"
+}
+
 runtime_evidence_sample() {
     python3 infra/gate-runner/runtime-evidence.py sample "$BOSS_GATE_RUNTIME_EVIDENCE" "$1" \
         || { printf 'gate-runtime-evidence: collector failed at %s\n' "$1" >&2; printf '%s\n' "$1" >> "${BOSS_GATE_RUNTIME_EVIDENCE}.failed"; }
@@ -2151,6 +2341,7 @@ write_receipt() {
   "ci": ${in_ci},
   "free_gb": $(gate_avail_gb),
   "web_timings": $(web_timings_json),
+  "test_binaries": $(test_binaries_json),
   "runtime_evidence": $(runtime_evidence_report),
   "unverifiable": [${unver}],
   "schema_change": {"paths": [${schema_json}], "readers": "${GATE_SCHEMA_READERS}"},
@@ -2812,7 +3003,8 @@ if [ "$SELFTEST" -eq 1 ]; then
     echo "gate.sh: roster self-test ok — a check that reads stdin cannot truncate the roster, \
 every check is handed an empty stdin (inside the roster loop and out), a truncation by any \
 other route is refused by count, a child's git reads survive a foreign-owned checkout, and \
-a tree-wide pin that reports no result is refused"
+a tree-wide pin that reports no result is refused, and a bin pin runs under the binary's cargo name, \
+and a prose line declares no pin"
     exit 0
 fi
 
@@ -2830,6 +3022,65 @@ fi
 GATE_EDIT_LEVEL_HANDED="${BOSS_EDIT_LEVEL_ANSWER:-}"
 unset BOSS_EDIT_LEVEL_ANSWER
 # --- handed edit level (end) ---
+
+# A PRE-FLIGHT HAS NO LAUNCHER, SO IT ASKS THE DOOR (backlog 37742794,
+# R2). With nothing handed, a-car-stays-under-the-edit-level read
+# GET /api/tenant/edit-level itself, with no machine token, from the
+# dev container: 15 would-refuse facts in the 24 h to
+# 2026-10-09T05:30Z and 7 more from the dev pod between 06:00Z and
+# 13:48Z. Each keeps the machine gate's clean window dirty, so the
+# enforce flip cannot read clean, and under enforce each is refused.
+# That container already holds the token for its doors
+# (infra/dev/machine-token-dir), so the pre-flight asks the door —
+# `boss-api`, which stamps it — ONCE, and hands the answer the way a
+# launcher does. Only when every one of these holds:
+#   - a pre-flight mode (--quick, --lint). The gate proper runs a car's
+#     branch and is handed its level by its launcher, never a door;
+#   - nothing was handed already;
+#   - the roster carries the lint that reads the level;
+#   - BOSS_JOBS_URL and BOSS_ESTATE are both unset. A run that names
+#     its own instance (a stub, a test, another host) or declares its
+#     estate state is answered by the lint as before: the door stamps
+#     loopback, and a pre-flight never sends the token to an address a
+#     caller chose;
+#   - a `boss-api` is on PATH.
+# The door waits out a roll for the lint's own sixty seconds unless the
+# operator set BOSS_SOR_WAIT_SECONDS. A door that refuses, or answers
+# anything but the edit-level object (gate.rs `handable_edit_level`'s
+# shape), hands NOTHING, says so, and the lint reads the level itself
+# as it always did — so this can save a request and never pass a car:
+# a handed answer is judged exactly as a read one.
+# Pinned by a_preflight_reads_the_edit_level_through_the_door.rs.
+DOOR_EDIT_LEVEL=""
+edit_level_through_the_door() {
+    local roster=$1 err answer status
+    DOOR_EDIT_LEVEL=""
+    { [ "$QUICK" -eq 1 ] || [ "$LINT" -eq 1 ]; } || return 1
+    [ -z "$GATE_EDIT_LEVEL_HANDED" ] || return 1
+    case "$roster" in *" infra/lint/a-car-stays-under-the-edit-level.sh"*) ;; *) return 1 ;; esac
+    [ -z "${BOSS_JOBS_URL:-}" ] && [ -z "${BOSS_ESTATE:-}" ] || return 1
+    command -v boss-api >/dev/null 2>&1 || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    err=$(mktemp) || return 1
+    answer=$(BOSS_SOR_WAIT_SECONDS="${BOSS_SOR_WAIT_SECONDS:-60}" boss-api GET /api/tenant/edit-level 2>"$err" </dev/null)
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "pre-flight: the door (boss-api) could not read the instance's edit level (exit ${status}); the lint reads it itself, without a token:"
+        sed 's/^/  /' "$err"
+        rm -f "$err"
+        return 1
+    fi
+    rm -f "$err"
+    # The answer jq PRINTS, not its exit code: over an empty body jq-1.6
+    # exits 0 (backlog d96e38ab), and silence prints nothing here. Two
+    # documents print two lines, which is not one `true` either.
+    if [ "$(printf '%s' "$answer" | jq -c 'type == "object" and has("edit_level")' 2>/dev/null)" != true ]; then
+        echo "pre-flight: the door (boss-api) answered something that is not the edit-level object; handing nothing, and the lint reads it itself, without a token"
+        return 1
+    fi
+    DOOR_EDIT_LEVEL=$answer
+    echo "pre-flight: the instance's edit level was read through the door (boss-api, which presents this container's machine token) and is handed to a-car-stays-under-the-edit-level, which sends no request of its own"
+}
 
 run_preflight() {
     if [ -n "$GATE_EDIT_LEVEL_HANDED" ]; then local -x BOSS_EDIT_LEVEL_ANSWER="$GATE_EDIT_LEVEL_HANDED"; fi
@@ -2860,6 +3111,8 @@ run_preflight() {
     # pool: every lint in it starts before the first one is replayed, so
     # this is the last reading taken before they run.
     require_headroom "to continue before the lint roster"
+    # The door's answer, for a pre-flight that was handed none (above).
+    if edit_level_through_the_door "$roster"; then local -x BOSS_EDIT_LEVEL_ANSWER="$DOOR_EDIT_LEVEL"; fi
     # A truncated roster is a FAILED check, not a quiet shortfall: the
     # receipt has to carry the fact that the gate did not ask everything
     # it claims to ask. `check_lint`, not `check`: a lint's exit 3 is a
@@ -3136,7 +3389,12 @@ elif [ "${#SCOPE[@]}" -eq 0 ]; then
     # and `fails_excerpt` in infra/gate-runner/run.sh, which parses the
     # whole check so an early failure is not lost under later passes).
     # Pinned by gate_sh.rs `every_cargo_test_the_gate_runs_carries_no_fail_fast`.
-    check "test"    cargo test --all-features --no-fail-fast
+    #
+    # TWO CHECKS, AND THE SECOND RUNS WIDE (backlog 2d234222): `test build`
+    # compiles every test target, `test` runs them several binaries at a
+    # time. See "The test check, in two halves" for why and how wide.
+    check "test build" infra/cargo-test-wide.sh build "$TEST_WIDE_STATE" cargo test --all-features --no-fail-fast
+    check "test"       infra/cargo-test-wide.sh run   "$TEST_WIDE_STATE" cargo test --all-features --no-fail-fast
     # Kept out of the pre-flight because it reads the built
     # boss-ports-list; the build above just produced it. This line was
     # missing from 2026-08-31 to 2026-09-12: the exclusion said "CI
@@ -3146,7 +3404,8 @@ elif [ "${#SCOPE[@]}" -eq 0 ]; then
 else
     check "clippy"  cargo clippy --workspace --all-features --all-targets -- -D warnings
     check "build (default features)" cargo build "${SCOPE[@]}"
-    check "test"    cargo test "${SCOPE[@]}" --all-features --no-fail-fast
+    check "test build" infra/cargo-test-wide.sh build "$TEST_WIDE_STATE" cargo test "${SCOPE[@]}" --all-features --no-fail-fast
+    check "test"       infra/cargo-test-wide.sh run   "$TEST_WIDE_STATE" cargo test "${SCOPE[@]}" --all-features --no-fail-fast
     # A scoped car pays for the binary only when it could have moved
     # the answer: the registry crate, or a generated copy of it.
     if changed_paths | grep -qE '^(crates/core/boss-ports/|apps/(web|simulator)/src/_generated/ports\.ts$)'; then

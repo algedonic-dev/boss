@@ -27,19 +27,46 @@ cycle; it grants no authority and supplies no timer, daemon or wake path.
    independent review, own-run reporting, authorized operator release,
    observed merge/convergence, required registry publication and recorded
    machine-run proof through their existing doors. A reviewer records a
-   verdict; the authorized operator releases the car. Preserve complete
+   verdict; the authorized operator releases the car. A LANDED car's
+   owed review is completed work too, and the item its car carries stays
+   open until it completes: each cycle, read `boss orient`'s LANDED
+   REVIEWS section (the `landed-review` station, oldest first) and, as
+   reviewer slots free and before refilling builders, dispatch a distinct
+   reviewer onto the oldest car no run is reviewing yet — `boss dispatch
+   <car> --step landed-review`, never the car's builder run. The step is
+   nominated to the agent the moment it is ready, so `--next` does not
+   take it. One the agent has held past the hourly rule's declared bound
+   is an OVERDUE alarm at the head of MY WORK; resolve it, or record its
+   plan, before new work (backlog c851ed24). Preserve complete
    receipts and failure diagnostics rather than storing an excerpt as
    their replacement. A source GREEN is not convergence or runtime proof.
    When a registry change needs publication after convergence, retain its
    owner and actual active-row readback obligation until the probe passes.
 
-3. **Arrange distinct review promptly.** An early-review request is
-   coordinator work: assign a distinct available reviewer while the
-   builder's focused feedback is available, or record why it waits and
-   what next observation would free it. Early review does not replace a
-   fresh formal verdict after GREEN. Reuse an executor after its previous
-   registered run closes; admit a fresh run for new registered work and
-   never borrow a closed run marker or let a builder formally self-review.
+3. **Arrange distinct review promptly — before boarding only where a
+   rule requires it.** A car waits at the dock for an independent
+   review ONLY when its item carries a `trust_boundary` mark or
+   `mutating_verb::judge` finds its diff; then its brief carries the
+   `--hold` and the gate holds it, and that car needs a fresh formal
+   verdict at its gated head before release. Every other car boards on
+   its green and owes its review AFTER it lands, on ship-a-change's
+   `landed-review` step (the `landed-review` station counts them):
+   never brief a builder to `--hold` it, and `boss gate` refuses a
+   `--hold` no rule requires (backlog bd331d38, option A, David
+   2026-10-09 — on W40 such holds covered 85% of dock-minutes and 200
+   of 200 releases read release). A change you judge needs a pre-
+   boarding review is a trust boundary: mark its item (`boss mark`)
+   rather than hold its car. A car pinned to a ship-a-change version
+   with no `landed-review` step owes none: one parked unheld after
+   option A but before that version published is moved onto it with
+   `boss job convert <car>` (`--dry-run` first), so its review is owed
+   on the record rather than skipped (review fe7b1b1e F2). An
+   early-review request is coordinator
+   work: assign a distinct available reviewer, or record why it waits
+   and what next observation would free it. Reuse an executor after its
+   previous registered run closes; admit a fresh run for new registered
+   work and never borrow a closed run marker or let a builder formally
+   self-review.
 
 4. **Refill actual available slots by urgency then age.** First verify
    each packet's current source or live premise and existing branches,
@@ -54,8 +81,9 @@ cycle; it grants no authority and supplies no timer, daemon or wake path.
 
 5. **Keep gate submissions ready.** Builders retain useful targeted
    TDD and mandatory preflight; comprehensive validation belongs in the
-   gates. Require a coherent frozen source checkpoint and distinct early
-   review before publishing/gating. Preserve the actual failing check,
+   gates. Require a coherent frozen source checkpoint before
+   publishing/gating; an early review before the gate is for a held car
+   (rule 3), never a precondition of every gate. Preserve the actual failing check,
    full log and receipt, distinguishing branch defects from infrastructure
    refusal. Repair the measured cause and improve the relevant protocol
    or testing infrastructure. Bay occupancy alone does not justify an

@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { EXAMPLE_DOMAIN, EXAMPLE_EMAIL, EXAMPLE_HOST, testNet1, testNet2 } from '../../../tests/fixtures/test-values';
 import {
   ARRIVALS_DRAWN,
   NO_FEEDS,
@@ -110,7 +111,7 @@ const proofOf = (over: Partial<CarProof> = {}): CarProof => ({
 const trainRow = (id: string, status: TrainRow['status'], over: Partial<TrainRow> = {}): TrainRow => ({
   id,
   title: 'PR train 2026-09-07 23:37',
-  prUrl: 'http://10.20.0.15:3000/david/boss/pulls/259',
+  prUrl: `http://${testNet1(15)}:3000/example/boss/pulls/259`,
   status,
   lamp: 'pending',
   mergeRef: null,
@@ -254,8 +255,32 @@ describe('uniqueTags — one nameplate per branch on the floor', () => {
 });
 
 describe('prNumber + boardedAtFromTitle', () => {
+  test('both shared networks stay reserved for every possible octet', () => {
+    for (let octet = 0; octet <= 255; octet += 1) {
+      expect(new URL(`http://${testNet1(octet)}`).hostname).toBe(`192.0.2.${octet}`);
+      expect(new URL(`http://${testNet2(octet)}`).hostname).toBe(`198.51.100.${octet}`);
+      expect(testNet1(octet)).not.toBe(testNet2(octet));
+    }
+    for (const invalid of [-1, 256, 0.5, NaN, Infinity]) {
+      expect(() => testNet1(invalid)).toThrow(RangeError);
+      expect(() => testNet2(invalid)).toThrow(RangeError);
+    }
+  });
+
+  test('shared names use reserved domains without copying the email domain', () => {
+    expect(EXAMPLE_DOMAIN).toBe('example.com');
+    expect(EXAMPLE_HOST.endsWith('.test')).toBe(true);
+    expect(EXAMPLE_EMAIL.split('@')).toEqual(['person', EXAMPLE_DOMAIN]);
+  });
+
+  test('the synthetic train uses a reserved address without changing its PR number', () => {
+    const row = trainRow('fixture', 'BOARDED');
+    expect(new URL(row.prUrl!).hostname).toMatch(/^192\.0\.2\./);
+    expect(prNumber(row.prUrl)).toBe(259);
+  });
+
   test('reads the PR number off the forge URL, either spelling', () => {
-    expect(prNumber('http://10.20.0.15:3000/david/boss/pulls/259')).toBe(259);
+    expect(prNumber(trainRow('fixture', 'BOARDED').prUrl)).toBe(259);
     expect(prNumber('https://github.com/x/y/pull/12')).toBe(12);
     expect(prNumber(null)).toBeNull();
     expect(prNumber('http://forge/no-number')).toBeNull();
@@ -460,6 +485,55 @@ describe('the gate QUEUE lane — runs waiting for a bay', () => {
     expect(scene(yardOf(), two, NOW).machines.queue).toMatchObject({ count: 2 });
     expect(scene(yardOf(), two, NOW).machines.queue.label).toBe('2 waiting · next ~5m');
     expect(scene(yardOf(), statusOf(), NOW).machines.queue.label).toBe('clear');
+  });
+
+  // Backlog 19227ca8 (design 1e787fc2): a train whose gate the bound
+  // refused holds the FIRST place in the gate line and takes the next bay
+  // that frees. It has no gate-run yet, so the server's queue does not
+  // carry it; the floor draws it at the head of the line, and the queued
+  // runs stand behind it.
+  test('a train waiting for a bay stands at the head of the gate line', () => {
+    const waitGate = {
+      run: null,
+      line: null,
+      forge: null,
+      fallback: null,
+      wait_reason: 'the cluster is at its gate bound (1 running of 1: g1) — the train holds the first place',
+      wait_since: '2026-09-07T23:17:00Z',
+      relaunches: 0,
+    };
+    const waiting = trainRow('t1', 'DEPARTED', { gate: waitGate });
+    const s = scene(
+      yardOf({ inFlight: [waiting] }),
+      statusOf({
+        gates: {
+          capacity: 1,
+          active: [gate('feat/gating', 'g1')],
+          queued: [queued('feat/first', 'q1', 1)],
+          typical_seconds: 900,
+        },
+      }),
+      NOW,
+    );
+    expect(wagon(s, 't1')).toMatchObject({
+      station: 'gate-queue',
+      slot: 0,
+      kind: 'train-gate',
+      tag: 'train gate',
+      trainId: 't1',
+      tone: 'static',
+      since: '2026-09-07T23:17:00Z',
+    });
+    expect(wagon(s, 't1').status).toContain('first in line');
+    expect(wagon(s, 'q1').slot).toBe(1);
+    expect(s.machines.queue).toMatchObject({ count: 2 });
+    expect(s.machines.queue.label).toBe('train first · 2 waiting');
+    // A train whose gate is already filed, or judged by CI alone, is not
+    // waiting in line.
+    const filed = trainRow('t2', 'DEPARTED', { gate: { ...waitGate, run: 'abcdef0123', wait_reason: null } });
+    const s2 = scene(yardOf({ inFlight: [filed] }), statusOf(), NOW);
+    expect(s2.wagons.find(w => w.id === 't2')).toBeUndefined();
+    expect(s2.machines.queue.label).toBe('clear');
   });
 
   test('the departure board places a queued car before the bays', () => {

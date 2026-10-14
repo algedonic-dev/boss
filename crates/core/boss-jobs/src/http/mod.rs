@@ -38,6 +38,7 @@ mod presence;
 mod queue_age;
 mod refusals;
 mod regions;
+mod release;
 mod routes;
 mod rule_firings;
 mod sensor_regions;
@@ -59,6 +60,7 @@ use plugins::*;
 use queue_age::*;
 use refusals::*;
 use regions::*;
+use release::*;
 use routes::*;
 use rule_firings::*;
 use sim_clock::*;
@@ -67,7 +69,7 @@ use steps::*;
 use terminal_report::*;
 use yard::*;
 
-pub use jobs::FAILED_VERB_KEYS;
+pub use jobs::{ESTATE_PAGE_CEILING, ESTATE_PAGE_DEFAULT, FAILED_VERB_KEYS};
 pub use moves::{MOVER_ACTOR, run_mover};
 pub use presence::PresenceKey;
 
@@ -371,6 +373,10 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
             "/api/jobs/{id}/convert",
             get(preview_convert_job::<R, B>).post(convert_job::<R, B>),
         )
+        // Release a car held for its review, on that review's verdict —
+        // the one door `boss release --review` and the yard's Release
+        // control share (backlog ed8e5c85, `car_release`).
+        .route("/api/jobs/{id}/release", post(release_car::<R, B>))
         .route("/api/estate/nodes", get(list_estate_nodes::<R, B>))
         // The instance's hosting edit level, off the tenant manifest
         // (a479faf7): the word the dispatch door and the gate's
@@ -424,6 +430,10 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         // publish path enforces.
         .route("/api/stations/_validate", post(validate_station::<R, B>))
         .route("/api/stations/{name}/queue", get(station_queue::<R, B>))
+        .route(
+            "/api/stations/{name}/claim-next",
+            post(claim_next_at_station::<R, B>),
+        )
         .route(
             "/api/stations/{name}/versions",
             get(list_station_versions::<R, B>),
@@ -740,22 +750,7 @@ pub(super) fn step_is_callers(
     packet_open: bool,
     step: &Step,
 ) -> bool {
-    let Some(me) = self_id(user) else {
-        return false;
-    };
-    if step.assignee_id.as_deref() == Some(me) {
-        return true;
-    }
-    let workable = matches!(step.status, StepStatus::Ready | StepStatus::Active);
-    let claimable = step.assignee_id.is_none() || step.status == StepStatus::Active;
-    packet_open
-        && workable
-        && claimable
-        && step
-            .metadata
-            .get("authority_role")
-            .and_then(serde_json::Value::as_str)
-            == Some(user.role.as_str())
+    crate::policy_glue::step_is_callers(user, packet_open, step)
 }
 
 /// Whether `user` may read this packet: it is inside `scope`, or one of

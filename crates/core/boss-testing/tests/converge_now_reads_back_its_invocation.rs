@@ -42,7 +42,6 @@ impl Case {
         let root = scratch_dir(&format!("converge-now-{name}"));
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::create_dir_all(root.join("repo/.git")).unwrap();
         let log = root.join("calls");
         let state = root.join("unit-state");
         write_file(
@@ -95,7 +94,7 @@ esac
             .env("STUB_LOG", &self.log)
             .env("STUB_STATE", &self.state)
             .env("STUB_NEW_ID", NEW)
-            .env("BOSS_FORGE_REPO_DIR", self.root.join("repo"))
+            .env("BOSS_FORGE_CONVERGE_STATE", self.root.join("converge"))
             .env("OPS_REQUEST_ID", "19df6925-0000-4000-8000-000000000000")
             // A run already in progress never produces a new invocation;
             // the case need not wait out the real bound to see that.

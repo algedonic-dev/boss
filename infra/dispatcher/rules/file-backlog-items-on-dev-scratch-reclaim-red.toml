@@ -1,0 +1,47 @@
+# The dev pod's scratch reclaim is judged by its own record (backlog
+# 5e5d4be8). The pass (infra/cluster/dev-scratch-reclaim.sh, kind
+# maintenance-dev-scratch-reclaim) files a packet only when it acted or
+# had a problem, and since that item it names each problem on its `run`
+# step as one line of `output`:
+# `RED dev-scratch-reclaim/<slug> problem: <what, with its numbers>` —
+# a floor unmet, a tree it could not remove, a fast-forward git refused,
+# a CLI install that failed, a memory watch that is not sampling. This
+# rule fires when such a packet closes `failed` and hands it to the
+# chore judge the playground crawl, the recovery sheet and the machine
+# token push use (maintenance.chore.file_reds): ONE backlog-item per
+# slug, deduped by it while one is open, so a /work floor unmet at every
+# hourly pass is one loud item rather than twenty-four `failed` packets
+# nobody reads — and a closed item files again, because a recurrence
+# after a fix is a new fact.
+#
+# `design` IS THE ITEM, NOT A DESIGN-DOC. The judge stamps the arg on
+# every item it files as `metadata.design`, the thread the queue reads
+# them as; this rule has no design-doc behind it, so the thread is the
+# backlog item that asked for it.
+#
+# NO FALLBACK ROUTE, as on the machine token push: `no_red_failure_route`
+# is the break-glass deposit's alone (backlog e4a9a9b3). A pass that
+# closes `failed` with no RED line is one running a script from before
+# 5e5d4be8, and the judge notes that on the packet and files nothing.
+[[rule]]
+name = "file-backlog-items-on-dev-scratch-reclaim-red"
+why = """
+A CROSS-PROTOCOL REACTOR: maintenance-dev-scratch-reclaim ->
+backlog-item, which no single Workflow consequence can express — the
+pass's protocol records its own failure but cannot open another kind's
+packet. Measured 2026-10-08 (backlog 5e5d4be8): every reclaim packet
+read that day closed `failed` — eight between 20:33Z and 23:33Z alone —
+with /scratch at 26 percent free on a 25 percent floor and /work under
+its own, and none of it reached anyone: the cadence-silence sweep
+watches ARRIVAL only, a failing pass arrives on time, and orient named
+none. No authority widened: the handler is the crawl's judge
+(maintenance.chore.file_reds), its only writes are standard
+backlog-items owned by the platform owner and one `judged` note on the
+pass's own packet, and the dedup key is the problem's slug, so a
+problem repeated every hour is ONE item until someone closes it.
+"""
+on_event = "jobs.job.closed"
+when = 'kind = "maintenance-dev-scratch-reclaim" AND outcome = "failed"'
+[[rule.do]]
+handler = "maintenance.chore.file_reds"
+args = { step = "\"run\"", design = "\"5e5d4be8\"", area = "\"infra/cluster\"" }

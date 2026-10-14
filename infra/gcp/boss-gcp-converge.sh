@@ -72,6 +72,7 @@
 set -euo pipefail
 
 REPO="${BOSS_GCP_REPO_DIR:-/opt/boss}"
+ROOT_MODE=0
 
 # --resolve-remote: print the remote this loop would converge from and
 # stop. No git writes, so it runs before the snapshot-exec below — it is
@@ -79,9 +80,27 @@ REPO="${BOSS_GCP_REPO_DIR:-/opt/boss}"
 RESOLVE_ONLY=0
 case "${1:-}" in
     --resolve-remote) RESOLVE_ONLY=1 ;;
+    --root-generation) ROOT_MODE=1 ;;
     "") ;;
     *) echo "usage: $(basename "$0") [--resolve-remote]" >&2; exit 2 ;;
 esac
+
+if [ "$ROOT_MODE" = 1 ]; then
+    PREP="${BOSS_GCP_PREPARED_DIR:-/var/lib/boss/gcp-root-prepared}"
+    TREE="${BOSS_GCP_ROOT_TREE:-/var/lib/boss/gcp-tree}"
+    accepted=$(BOSS_GCP_ROOT_TREE="$TREE" bash "$PREP/bootstrap/infra/gcp/root-tree.sh" path) \
+        || { echo 'boss-gcp-converge: REFUSED — no accepted root generation' >&2; exit 78; }
+    own_infra=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+    [ "$own_infra" = "$accepted/infra" ] \
+        || { echo 'boss-gcp-converge: REFUSED — script is outside the accepted generation' >&2; exit 78; }
+    REPO="$accepted"
+    BOSS_GCP_CONVERGE_INFRA="$own_infra"
+    export BOSS_GCP_CONVERGE_INFRA BOSS_GCP_PREPARED_DIR="$PREP" BOSS_GCP_ROOT_TREE="$TREE"
+    deposit_user=${BOSS_GCP_DEPOSIT_USER:-}
+    [[ "$deposit_user" =~ ^[a-z_][a-z0-9_-]*$ ]] && [ "$deposit_user" != root ] \
+        || { echo 'boss-gcp-converge: REFUSED — no bound deposit account' >&2; exit 78; }
+    export INSTALL_RECV_USER="$deposit_user"
+fi
 
 [ -d "$REPO/.git" ] || { echo "boss-gcp-converge: $REPO is not a git checkout" >&2; exit 1; }
 
@@ -172,7 +191,7 @@ fi
 # offset, so it resumes mid-token in the new contents. A silent,
 # unrepeatable failure. exec into a copy first, so the bytes bash
 # executes are unreachable from the repo git is about to move.
-if [ -z "${BOSS_GCP_CONVERGE_SNAPSHOT:-}" ]; then
+if [ "$ROOT_MODE" = 0 ] && [ -z "${BOSS_GCP_CONVERGE_SNAPSHOT:-}" ]; then
     snap="$(mktemp -t boss-gcp-converge.XXXXXX)"
     cat "$0" > "$snap"
     # WHERE THIS SCRIPT'S OWN LIBRARY LIVES, captured while $0 still
@@ -183,7 +202,7 @@ if [ -z "${BOSS_GCP_CONVERGE_SNAPSHOT:-}" ]; then
     BOSS_GCP_CONVERGE_INFRA="${BOSS_GCP_CONVERGE_INFRA:-$(cd "$(dirname "$0")/.." && pwd)}" \
         BOSS_GCP_CONVERGE_SNAPSHOT="$snap" exec bash "$snap" "$@"
 fi
-trap 'rm -f "$BOSS_GCP_CONVERGE_SNAPSHOT"' EXIT
+if [ "$ROOT_MODE" = 0 ]; then trap 'rm -f "$BOSS_GCP_CONVERGE_SNAPSHOT"' EXIT; fi
 
 INSTALLER="${BOSS_GCP_CONVERGE_INSTALLER:-$REPO/infra/gcp/install-units.sh}"
 # Read from $REPO AFTER the fast-forward below, like the installer: the
@@ -255,6 +274,7 @@ host_check boss-gcp boss-gcp-converge
 # which the forge loop can afford on a machine nobody edits, would throw
 # that work away. boss-gcp is hand-operated, so the refusal stands and
 # systemd records a failed unit, which is the alarm.
+if [ "$ROOT_MODE" = 0 ]; then
 dirty=$(as_owner "git -C '$REPO' status --porcelain")
 branch=$(as_owner "git -C '$REPO' rev-parse --abbrev-ref HEAD")
 if [ -n "$dirty" ] || [ "$branch" != "main" ]; then
@@ -283,6 +303,25 @@ target=$(as_owner "git -C '$REPO' rev-parse FETCH_HEAD")
 # instead of growing a merge commit nobody authored.
 as_owner "git -C '$REPO' merge --ff-only '$target'"
 after=$(as_owner "git -C '$REPO' rev-parse HEAD")
+
+# The first old tick hands over once, before any installer. Bootstrap fetches
+# its bytes using the already-proven root receiver's own helper. Thereafter
+# the installed launcher has no way back to executing /opt/boss.
+if { [ -z "${BOSS_GCP_CONVERGE_INSTALLER:-}" ] && [ "${INSTALL_ETC:-/etc/systemd/system}" = /etc/systemd/system ]; } \
+    || [ -n "${BOSS_GCP_TRUSTED_CREDENTIAL_HELPER:-}" ]; then
+    bash "$REPO/infra/gcp/adopt-root-tree.sh" bootstrap "$OWNER"
+    rm -f -- "$BOSS_GCP_CONVERGE_SNAPSHOT"
+    unset BOSS_GCP_CONVERGE_SNAPSHOT BOSS_GCP_CONVERGE_INFRA
+    exec bash "${BOSS_GCP_PREPARED_DIR:-/var/lib/boss/gcp-root-prepared}/bootstrap/infra/gcp/gcp-root-launch.sh" converge
+fi
+else
+    REMOTE=protected-root
+    before=$(basename -- "$REPO"); after=$before
+    # Refresh the recovery closure only FROM this authenticated generation.
+    BOSS_GCP_PREP_SOURCE="$REPO/infra" bash "$REPO/infra/gcp/adopt-root-tree.sh" bootstrap "$deposit_user"
+    bash "$PREP/bootstrap/infra/gcp/prepare-root-tree.sh" units "$after"
+    export BOSS_GCP_ACCEPTED_SHA="$after" BOSS_REPO_ROOT="$REPO"
+fi
 
 if [ "$before" = "$after" ]; then
     echo "boss-gcp-converge: $REMOTE/main unchanged at ${after:0:8} — converging units anyway"
@@ -370,6 +409,152 @@ if has_role cluster-operator; then
         run_summary_field ops_credential_receiver "failed (exit $rrc) — see this tick's journal"
     fi
 fi
+
+# THE DOOR THE OPS RUNNER'S OWN CREDENTIAL ARRIVES THROUGH (backlog
+# 1e50e66b, R-b of its 2026-10-09 ledger). The runner deposit key's
+# forced command runs a root-owned copy of runner-credential-recv.sh;
+# this installs that copy and its one sudoers rule, on a host the
+# ops-runner role names — strictly: a dark roles read never widens a
+# root door. The enroll step of prepare-a-deposit-key tells David to
+# sign only once a converge summary records the receiver installed, in
+# exactly these words (runner_credential_recv_sh.rs holds the two
+# equal; review c59facbf N1). Recorded, never fatal: nothing below
+# depends on it, and an absent receiver leaves the credential
+# undelivered, which the rotation packet's delivered step shows.
+if has_role ops-runner; then
+    rlog="$(mktemp -t boss-gcp-converge-runner-recv.XXXXXX)"
+    rrc=0
+    bash "${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")/..}/gcp/install-runner-credential-receiver.sh" >"$rlog" 2>&1 || rrc=$?
+    sed 's/^/  runner receiver: /' "$rlog"
+    rm -f "$rlog"
+    if [ "$rrc" -eq 0 ]; then
+        run_summary_field runner_credential_receiver "installed"
+    else
+        run_summary_field runner_credential_receiver "failed (exit $rrc) — see this tick's journal"
+    fi
+else
+    run_summary_field runner_credential_receiver "not installed: this host's roles do not name ops-runner"
+fi
+
+# Root's read-only Forgejo token uses a separate fixed-purpose receiver.
+# Installation alone authorizes no key and delivers no credential.
+if has_role ops-runner; then
+    root_recv_log="$(mktemp -t boss-gcp-root-tree-recv.XXXXXX)"
+    root_recv_rc=0
+    bash "${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")/..}/gcp/install-root-tree-token-receiver.sh" > "$root_recv_log" 2>&1 || root_recv_rc=$?
+    cat "$root_recv_log"
+    rm -f "$root_recv_log"
+    if [ "$root_recv_rc" -eq 0 ]; then
+        run_summary_field root_tree_token_receiver "installed"
+    else
+        run_summary_field root_tree_token_receiver "failed (exit $root_recv_rc); full installer result in this tick's journal"
+    fi
+fi
+
+# WHAT THE DEPOSIT ACCOUNT'S authorized_keys GRANTS, READ (backlog
+# dea2236f; N5 of car c1cdb202's review). Both receivers above are root
+# doors reached by a deposit key's forced command, and the line that
+# forces it is David's to place, by hand, in this account's file. On the
+# first live enrolment (packet 96a0f7bb, 2026-10-07) he placed the bare
+# key, and it opened the account's shell. The senders now wait for the
+# receiver's greeting, which refuses a bare key ALONE; a line forcing the
+# receiver without `restrict`, or the key ALSO on a bare line, is
+# greeted all the same, and only a read of the file shows it
+# (infra/gcp/audit-deposit-keys.sh says why each matters).
+#
+# The account is the checkout's owner, which is the account both
+# installers write the sudoers rules for; its files are sshd's default
+# pair. BOSS_GCP_CONVERGE_AUTHORIZED_KEYS names other files, so a test
+# never reads the home of whoever runs it. Every role reads it: a
+# deposit line is a root door whether or not this tick installed one.
+#
+# A FINDING IS ALARMED FROM THE PACKET; THE TICK STILL CONVERGES. A
+# finding is the account's file, not this loop's work, so it never reds
+# the tick: review 1fa0d093 (B2) measured that a red tick reads
+# result=exit-code on the run step, which landing.rs reads as "not
+# converged" for every infra-channel car and the publish-drift rule
+# reads as "did not move" — the moved tick's drift check lost for good.
+# The packet carries `deposit_key_audit` (the verdict line),
+# `deposit_key_verdict` (clean | unconfined | unverified, the one word a
+# rule's `when` can compare), each finding under anomalies, and one
+# `RED boss-gcp-converge/deposit-key-unconfined refused: …` line per
+# finding in `output`; the rule
+# file-backlog-items-on-boss-gcp-deposit-key-unconfined hands that to the
+# chore judge, which files ONE backlog-item while it is open. An audit
+# that could not read the file is UNVERIFIED on the packet, never clean,
+# and files nothing: no evidence is not a pass, and it is not a finding
+# either.
+#
+# RUN AS THE ACCOUNT, BOUNDED (review 1fa0d093, N2 and N3). sshd reads
+# this file as its owner, so the audit does too: a symlink in the
+# owner's ~/.ssh then reads only what the owner can read, and a file
+# root alone can read is UNVERIFIED — sshd could not read it either.
+# `runuser -u`, not as_owner's `-l`: a login shell's rc would print into
+# the verdict. The bound is the effect check's shape below: a home that
+# stalls costs this tick 60 s, not the installer and the CLI step behind
+# it.
+#
+# THE BOUND RUNS INSIDE runuser (review dd8f18e0, N8). `timeout` kills
+# its own process group, and runuser starts its command in a session of
+# its own, so a bound outside runuser killed runuser and left the
+# audit's children running: measured on the dev pod 2026-10-10, a
+# `sleep` under `timeout -k 1 2 runuser -u nobody -- bash -c …` was alive
+# after the bound in both shapes tried, and none was under the inner
+# shape below. The inner bound kills the audit's whole group; the outer
+# one, ten seconds longer, bounds runuser itself.
+audit_bound="${BOSS_GCP_DEPOSIT_AUDIT_BOUND_S:-60}"
+DEPOSIT_ACCOUNT="${BOSS_GCP_DEPOSIT_USER:-$OWNER}"
+case "$audit_bound" in '' | *[!0-9]*) audit_bound=60 ;; esac
+ak_files=()
+if [ -n "${BOSS_GCP_CONVERGE_AUTHORIZED_KEYS:-}" ]; then
+    read -r -a ak_files <<< "$BOSS_GCP_CONVERGE_AUTHORIZED_KEYS"
+else
+ak_home="$(getent passwd "$DEPOSIT_ACCOUNT" | cut -d: -f6 || true)"
+    [ -z "$ak_home" ] || ak_files=("$ak_home/.ssh/authorized_keys" "$ak_home/.ssh/authorized_keys2")
+fi
+alog="$(mktemp -t boss-gcp-converge-keys.XXXXXX)"
+arc=0
+audit_script="${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")/..}/gcp/audit-deposit-keys.sh"
+if [ "${#ak_files[@]}" -eq 0 ]; then
+    echo "deposit-key-audit: UNVERIFIED — the home of $OWNER, the deposit account, could not be read" >"$alog"
+    arc=2
+elif [ "$(id -un)" = "$DEPOSIT_ACCOUNT" ]; then
+    timeout -k 5 "$audit_bound" bash "$audit_script" "${ak_files[@]}" >"$alog" 2>&1 || arc=$?
+else
+    timeout -k 5 "$((audit_bound + 10))" runuser -u "$DEPOSIT_ACCOUNT" -- \
+        timeout -k 5 "$audit_bound" bash "$audit_script" "${ak_files[@]}" >"$alog" 2>&1 || arc=$?
+fi
+sed 's/^/  deposit keys: /' "$alog"
+averdict="$(tail -n 1 "$alog")"
+# A finding is exit 1 AND the audit's own finding verdict, so a runuser
+# or timeout that fails with status 1 reads as UNVERIFIED, never as a
+# finding with someone else's last line on it.
+case "$arc:$averdict" in
+    "0:deposit-key-audit: clean"*)
+        run_summary_field deposit_key_audit "$averdict"
+        run_summary_field deposit_key_verdict clean
+        ;;
+    "1:deposit-key-audit: "[0-9]*" finding(s) in"*)
+        run_summary_field deposit_key_audit "UNCONFINED: $averdict"
+        run_summary_field deposit_key_verdict unconfined
+        areds=""
+        while IFS= read -r aline; do
+            case "$aline" in
+                *" UNCONFINED "*)
+                    run_summary_note "$aline"
+                    areds+="${areds:+$'\n'}RED boss-gcp-converge/deposit-key-unconfined refused: $(printf '%s' "$aline" | cut -c1-600)"
+                    ;;
+            esac
+        done < "$alog"
+        run_summary_field output "$areds"
+        echo "boss-gcp-converge: a deposit key on this host reaches more than its receiver (above); the tick still converges, and the packet carries the finding for the rule that files it." >&2
+        ;;
+    *)
+        run_summary_field deposit_key_audit "UNVERIFIED: the audit did not reach a verdict (status $arc): $averdict"
+        run_summary_field deposit_key_verdict unverified
+        ;;
+esac
+rm -f "$alog"
 
 # IS THIS HOST'S STAMPED CALL ADMITTED? (design-doc bdc60b65, question
 # gcp-push; backlog 88379df3). The estate machine token is pushed here

@@ -584,6 +584,11 @@ impl InventoryRepository for InMemoryInventory {
             .purchase_orders
             .get_mut(id)
             .ok_or_else(|| InventoryError::NotFound(id.to_string()))?;
+        if !order.status.is_placed() && PoStatus::new(status).is_placed() {
+            order
+                .validate_ordinary_costs()
+                .map_err(InventoryError::Invalid)?;
+        }
         order.status = PoStatus::new(status);
         let flipped = order.clone();
         state.record(

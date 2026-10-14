@@ -423,7 +423,16 @@ fn an_executor_no_door_resolves_is_refused_at_publish() {
         registry::{StepSpec, WorkflowSpec},
         step_registry::StepRegistry,
     };
-    for principal in ["runner:ops", "runner:osp", "", " "] {
+    // `runner:ops` was refused here too until row E (2026-10-10) made it
+    // resolvable once both runner hosts held a delivered credential; it
+    // is now the one principal admitted, and a typo or a blank still is
+    // not.
+    for (principal, refused) in [
+        ("runner:ops", false),
+        ("runner:osp", true),
+        ("", true),
+        (" ", true),
+    ] {
         let step: StepSpec = serde_json::from_value(
             json!({"title":"execute","kind":"task","ready_when":"true","executor":principal}),
         )
@@ -436,8 +445,9 @@ fn an_executor_no_door_resolves_is_refused_at_publish() {
             vec![step],
         );
         let errors = boss_jobs::workflow_lint::validate_workflow(&spec, &StepRegistry::v1());
-        assert!(
+        assert_eq!(
             errors.iter().any(|e| e.reason.contains("executor")),
+            refused,
             "{principal:?}: {errors:?}"
         );
     }

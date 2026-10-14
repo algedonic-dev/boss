@@ -150,10 +150,10 @@ gap fn crates/core/boss-dispatcher/src/rules/seed.rs::insert_active -- the boot 
 gap fn crates/core/boss-jobs/src/delivery/postgres.rs::PgDeliveryPolicy::publish_declared -- a delivery policy is published, retiring the prior version, with no event
 gap fn crates/core/boss-jobs/src/sensors/postgres.rs::PgSensors::publish -- a sensor registry row is published with no event
 # The privilege model: policy_rule_audit is a sibling table, not the log.
-gap fn crates/core/boss-policy/src/postgres.rs::PgPolicy::upsert_rule_judged -- a policy rule is created or changed with no event (only a policy_rule_audit row)
-gap fn crates/core/boss-policy/src/postgres.rs::PgPolicy::deactivate_rule_judged -- a policy rule is deactivated with no event (only a policy_rule_audit row); judged since car 3 of design 1c4e42e1, the same write under its new name
-gap fn crates/core/boss-policy/src/postgres.rs::PgPolicy::upsert_user_override_judged -- a user policy override is created or changed with no event (only a policy_rule_audit row)
-gap fn crates/core/boss-policy/src/postgres.rs::PgPolicy::deactivate_user_override_judged -- a user policy override is deactivated with no event (only a policy_rule_audit row)
+gap fn crates/core/boss-policy-client/src/postgres.rs::PgPolicy::upsert_rule_judged -- a policy rule is created or changed with no event (only a policy_rule_audit row)
+gap fn crates/core/boss-policy-client/src/postgres.rs::PgPolicy::deactivate_rule_judged -- a policy rule is deactivated with no event (only a policy_rule_audit row); judged since car 3 of design 1c4e42e1, the same write under its new name
+gap fn crates/core/boss-policy-client/src/postgres.rs::PgPolicy::upsert_user_override_judged -- a user policy override is created or changed with no event (only a policy_rule_audit row)
+gap fn crates/core/boss-policy-client/src/postgres.rs::PgPolicy::deactivate_user_override_judged -- a user policy override is deactivated with no event (only a policy_rule_audit row)
 # Domain writes with no fact:
 gap fn crates/core/boss-jobs/src/scheduling/postgres.rs::PgScheduling::materialize_shift_patterns -- availability materialized from shift patterns stages no event, so a rebuild from the log cannot reproduce it
 gap fn crates/core/boss-views/src/postgres.rs::PgViewsRepo::create -- an operator's saved View is created with no event

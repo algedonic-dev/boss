@@ -248,7 +248,11 @@ fn every_call_is_a_bounded_read_through_the_admin_kubeconfig() {
     assert!(!calls.is_empty(), "no call reached the stub");
     for l in calls.lines() {
         assert!(
-            l.starts_with("-n docker run --rm --network host --mount type=bind,src="),
+            // --log-driver=none: what kubectl prints is never the docker
+            // daemon's to keep (backlog aa700921).
+            l.starts_with(
+                "-n docker run --rm --log-driver=none --network host --mount type=bind,src="
+            ),
             "{l}"
         );
         assert!(

@@ -689,13 +689,6 @@
     margin: 1.5rem 0 0.75rem;
     font-size: 0.95rem;
   }
-  .picker-row select {
-    padding: 0.35rem 0.5rem;
-    border: 1px solid var(--busy);
-    border-radius: 4px;
-    background: var(--warn-wash);
-    font: inherit;
-  }
   .kind-meta {
     color: var(--static);
     font-size: 0.85rem;

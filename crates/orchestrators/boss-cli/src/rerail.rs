@@ -68,8 +68,8 @@ pub(crate) async fn find_car(
     // Read EVERY open car, not just page one: a rerail target opened
     // days ago sorts to the tail of `opened_on DESC`, and a bare
     // `limit=` read left it off page one and reported it "not found"
-    // (a-limit-is-not-a-filter). `gate::all_open_cars` pages on `total`.
-    let cars = gate::all_open_cars(http).await?;
+    // (a-limit-is-not-a-filter). `crate::sor_client::all_open_cars` pages on `total`.
+    let cars = crate::sor_client::all_open_cars(http).await?;
     select_car(&cars, given)
 }
 
@@ -267,7 +267,7 @@ async fn repoint(
     if let Some(origins) = origins {
         patch["rerail_origins"] = json!(origins);
     }
-    gate::api(
+    crate::sor_client::api(
         http,
         reqwest::Method::PATCH,
         &format!("/api/jobs/{car_id}/metadata"),
@@ -493,17 +493,20 @@ enum Picked {
     Landed {
         dropped: Vec<crate::freshness::Dropped>,
     },
-    /// A real hunk — the one human stop. The files, and git's words.
+    /// A real hunk — the one human stop. The files, git's words, and —
+    /// when main took the stopped commit's patch once — its twin, named
+    /// for the human who decides ([`twin_note`]).
     Conflict {
         files: String,
         said: String,
         dropped: Vec<crate::freshness::Dropped>,
+        twin: Option<String>,
     },
     /// git stopped with no conflict to read and no empty commit to skip.
     Failed { said: String },
 }
 
-/// Cherry-pick `range` onto the checkout at `wt`, skipping and naming
+/// Cherry-pick `base..tip` onto the checkout at `wt`, skipping and naming
 /// every commit that replays EMPTY.
 ///
 /// WHY AN EMPTY PICK IS NOT A CONFLICT (backlog b3c2bfb6, 2026-09-24).
@@ -518,7 +521,24 @@ enum Picked {
 /// Empty is told apart by what git left: no unmerged path, an index
 /// equal to HEAD, AND a readable `CHERRY_PICK_HEAD` — a pick refused
 /// before it applied anything leaves the first two and not the third.
-fn pick_onto(wt: &str, range: &str) -> Result<Picked> {
+///
+/// A CONFLICT NAMES ITS TWIN AND DROPS NOTHING (backlog ec05a62f,
+/// 2026-10-10). Car dd64f4ad carried e624ebcd, a stale copy of a change
+/// that had landed alone as train b147c26c; a later train had rewritten
+/// those lines, so the replay CONFLICTED rather than replaying empty, and
+/// the car sat 87 windows on the stop (car 9ac6cbaf, 101) while nothing
+/// told its reader main had taken that patch once. So the stop now looks
+/// for main's twin of the stopped commit — the same change, blob for blob
+/// (review 0a5496cb) — and names it, with
+/// the command that shows what main did to those files since. It never
+/// drops the commit: three adversarial reviews of car fd13ddf2 (runs
+/// 9b231beb, 3f14cf26, 1c7dd9c7) each found a commit main no longer held
+/// dropped by a twin — reverted, reverted in a squash beside another edit,
+/// reverted by hand through an editor that rewrote whitespace, or a twin
+/// at another position in the file — and on dd64f4ad's own history a drop
+/// would have fired at two trains and not after. A wrong drop boards a car
+/// silently without its change; a named twin costs a human seconds.
+fn pick_onto(wt: &str, base: &str, tip: &str) -> Result<Picked> {
     use crate::freshness::Dropped;
     // The committer is this verb, set explicitly as `boss gate --rebase`
     // sets it: a gate runner's or a test's environment has no identity.
@@ -532,31 +552,37 @@ fn pick_onto(wt: &str, range: &str) -> Result<Picked> {
             .output()
             .with_context(|| format!("running git {args:?} in {wt}"))
     };
-    let count: usize = git(wt, &["rev-list", "--count", range])?
+    let range = format!("{base}..{tip}");
+    let count: usize = git(wt, &["rev-list", "--count", &range])?
         .parse()
         .context("counting the car's commits")?;
     // Nothing past main at all: the branch head is main's ancestor.
     if count == 0 {
         return Ok(Picked::Landed { dropped: vec![] });
     }
-    let mut out = run(&["cherry-pick", range])?;
+    // The main the car is replayed onto, read before the first pick
+    // moves HEAD: a twin is looked for there, never among the car's own
+    // replayed commits.
+    let onto = git(wt, &["rev-parse", "HEAD"])?;
+    let mut out = run(&["cherry-pick", &range])?;
     let mut dropped: Vec<Dropped> = Vec::new();
     while !out.status.success() {
         let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let files = git(wt, &["diff", "--name-only", "--diff-filter=U"])
             .unwrap_or_default()
             .replace('\n', ", ");
+        let picking = git(wt, &["rev-parse", "--verify", "-q", "CHERRY_PICK_HEAD"]).ok();
         if !files.is_empty() {
             return Ok(Picked::Conflict {
                 files,
                 said,
                 dropped,
+                twin: picking.and_then(|sha| twin_note(wt, &onto, tip, &sha)),
             });
         }
         let index_is_head = run(&["diff", "--cached", "--quiet", "HEAD"])
             .map(|o| o.status.success())
             .unwrap_or(false);
-        let picking = git(wt, &["rev-parse", "--verify", "-q", "CHERRY_PICK_HEAD"]).ok();
         // Bounded by the commit count: a skip that does not advance is
         // a stop this function does not understand, not a loop.
         let (true, Some(sha), true) = (index_is_head, picking, dropped.len() < count) else {
@@ -571,6 +597,253 @@ fn pick_onto(wt: &str, range: &str) -> Result<Picked> {
     } else {
         Picked::Clean { dropped }
     })
+}
+
+/// What main holds that matches a stopped commit's patch text.
+#[derive(Debug, PartialEq, Eq)]
+enum TwinFound {
+    /// The same change: equal `git diff-tree --raw` — every path, mode,
+    /// old blob and new blob — so main took THIS change once.
+    Same,
+    /// Only the same patch TEXT (`patch-id --verbatim` equal, raw
+    /// diff-tree not): patch-id drops the @@ line numbers, so the hunk
+    /// may sit elsewhere in the file — a repeated stanza in a TOML
+    /// registry, a YAML manifest, a test (review 0a5496cb, finding 1).
+    Elsewhere,
+}
+
+/// Single-quote `s` for a shell, so a printed command pastes as printed
+/// whatever the path holds (review 0a5496cb, finding 6).
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// What a conflict stop on `sha` says about main's twin of it, or `None`
+/// when main never took its patch text. A twin proves main took the
+/// change ONCE, never that it holds it now — so this names the twin and
+/// the read that shows what main did since, and the decision stays with
+/// the human. Only an identical change is offered `--skip`: a twin of the
+/// text alone is named as such, and the stop is the ordinary one. A
+/// lookup that fails says so: the stop is the one that was always there.
+fn twin_note(wt: &str, onto: &str, tip: &str, sha: &str) -> Option<String> {
+    let short = |s: &str| s[..12.min(s.len())].to_string();
+    let (found, twin, subject, files) = match twin_on_main(wt, onto, tip, sha) {
+        Ok(found) => found?,
+        Err(e) => {
+            return Some(format!(
+                "  Whether main holds a twin of {} could not be read: {e:#}",
+                short(sha)
+            ));
+        }
+    };
+    let title = git(wt, &["log", "-1", "--format=%s", sha]).unwrap_or_default();
+    if found == TwinFound::Elsewhere {
+        return Some(format!(
+            "  Main's {} \"{subject}\" carries the same patch text as the stopped commit {} \
+             \"{title}\", but not the same change: its files end differently, so the text \
+             may sit at another place in them. It is not this commit's twin — resolve the \
+             conflict as usual, and read it first if it bears on how:\n    \
+             git -C {wt} show {}",
+            short(&twin),
+            short(sha),
+            short(&twin),
+        ));
+    }
+    // Whether a skip leaves the car empty (review 0a5496cb, finding 3):
+    // the stop is on the car's last commit and nothing before it was
+    // replayed, so HEAD after the skip is main itself.
+    let last = git(wt, &["rev-list", "--count", &format!("{sha}..{tip}")]).is_ok_and(|n| n == "0");
+    let nothing_replayed = git(wt, &["rev-parse", "HEAD"]).is_ok_and(|h| h == onto);
+    let branch = tip.strip_prefix("origin/").unwrap_or(tip);
+    let skip = if last && nothing_replayed {
+        format!(
+            "  If main holds it, this is the only change the car still carries, so the car \
+             carries nothing main lacks:\n    \
+             git -C {wt} cherry-pick --skip\n  \
+             ends the replay with HEAD at main. Then push nothing and gate nothing — none of \
+             the steps below apply; confirm with `boss merged {branch}` and close the car as \
+             landed."
+        )
+    } else {
+        format!(
+            "  If main holds it, leave the commit out:\n    \
+             git -C {wt} cherry-pick --skip\n  \
+             and go on with the steps below, leaving out `cherry-pick --continue` if git \
+             says no cherry-pick is in progress (the skipped commit was the last)."
+        )
+    };
+    Some(format!(
+        "  The stopped commit {} \"{title}\" is main's {} \"{subject}\" byte for byte — the \
+         same paths, modes and blobs (git diff-tree --raw): main took this change once. \
+         Whether main STILL holds it is yours to decide — read what main did to its files \
+         since:\n    \
+         git -C {wt} log -p {}..{} -- {}\n\
+         {skip}\n  \
+         Otherwise resolve the conflict as usual.",
+        short(sha),
+        short(&twin),
+        short(&twin),
+        short(onto),
+        files
+            .iter()
+            .map(|f| sh_quote(f))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ))
+}
+
+/// `git diff-tree --raw` of one commit, its lines sorted: every path,
+/// mode, old blob and new blob, which two commits share only when they
+/// make the same change.
+fn raw_change(wt: &str, sha: &str) -> Result<Vec<String>> {
+    let raw = git(
+        wt,
+        &[
+            "diff-tree",
+            "-r",
+            "--no-commit-id",
+            "--raw",
+            "--no-abbrev",
+            "--no-renames",
+            sha,
+        ],
+    )?;
+    let mut lines: Vec<String> = raw.lines().map(String::from).collect();
+    lines.sort();
+    Ok(lines)
+}
+
+/// Main's newest commit (`onto`, since it parted from `tip`) whose patch
+/// text is `sha`'s byte for byte — preferring one that makes the SAME
+/// change ([`TwinFound::Same`]) over one that only shares the text — as
+/// (which, twin, its subject, `sha`'s files).
+///
+/// `--verbatim`, NOT `git cherry` (review 9b231beb, finding 2): `git
+/// cherry` and `--stable` strip ALL whitespace, so a key a car nests
+/// under `a:` and one main adds at the top level of the same YAML file
+/// would be named as a twin. `--full-diff`: the path limit picks main's
+/// commits, never trims their patches — a train that carried this change
+/// AND another is not this commit's twin.
+fn twin_on_main(
+    wt: &str,
+    onto: &str,
+    tip: &str,
+    sha: &str,
+) -> Result<Option<(TwinFound, String, String, Vec<String>)>> {
+    // An empty or merge commit has no patch to match.
+    let Some((forward, _)) = verbatim_ids(wt, &["-1", sha])?.into_iter().next() else {
+        return Ok(None);
+    };
+    let names = git(
+        wt,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            sha,
+        ],
+    )?;
+    let files: Vec<String> = names
+        .split('\0')
+        .filter(|f| !f.is_empty())
+        .map(String::from)
+        .collect();
+    let not_car = format!("^{tip}");
+    let mut args = vec!["--no-merges", "--full-diff", onto, not_car.as_str(), "--"];
+    let literal: Vec<String> = files.iter().map(|f| format!(":(literal){f}")).collect();
+    args.extend(literal.iter().map(String::as_str));
+    let texts: Vec<String> = verbatim_ids(wt, &args)?
+        .into_iter()
+        .filter(|(id, _)| *id == forward)
+        .map(|(_, commit)| commit)
+        .collect();
+    let Some(newest) = texts.first() else {
+        return Ok(None);
+    };
+    let change = raw_change(wt, sha)?;
+    let mut same = None;
+    for c in &texts {
+        if raw_change(wt, c)? == change {
+            same = Some(c.clone());
+            break;
+        }
+    }
+    let (found, twin) = match same {
+        Some(c) => (TwinFound::Same, c),
+        None => (TwinFound::Elsewhere, newest.clone()),
+    };
+    let subject = git(wt, &["log", "-1", "--format=%s", &twin]).unwrap_or_default();
+    Ok(Some((found, twin, subject, files)))
+}
+
+/// `git patch-id --verbatim` of each commit `git log -p <log_args>`
+/// prints, in log order, as (patch-id, commit). Both sides of a match
+/// are read through this one command, so a diff setting reaches both.
+fn verbatim_ids(wt: &str, log_args: &[&str]) -> Result<Vec<(String, String)>> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let log = crate::git_auth::command()
+        .arg("-C")
+        .arg(wt)
+        .args([
+            "log",
+            "-p",
+            "--no-color",
+            "--no-ext-diff",
+            // A diff driver's textconv would compare converted text while
+            // the note says byte for byte (review 0a5496cb, finding 5).
+            "--no-textconv",
+            "--format=commit %H",
+        ])
+        .args(log_args)
+        .output()
+        .with_context(|| format!("running git log -p {log_args:?} in {wt}"))?;
+    if !log.status.success() {
+        bail!(
+            "git log -p {log_args:?} failed: {}",
+            String::from_utf8_lossy(&log.stderr).trim()
+        );
+    }
+    let mut child = crate::git_auth::command()
+        .arg("-C")
+        .arg(wt)
+        .args(["patch-id", "--verbatim"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running git patch-id --verbatim")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("git patch-id has no stdin"))?;
+    // Written from a thread: patch-id answers as it reads, and a long
+    // main would fill its stdout pipe while this side still writes.
+    let patch = log.stdout;
+    let writer = std::thread::spawn(move || stdin.write_all(&patch));
+    let out = child
+        .wait_with_output()
+        .context("reading git patch-id --verbatim")?;
+    let wrote = writer
+        .join()
+        .map_err(|_| anyhow!("writing to git patch-id panicked"))?;
+    // patch-id's own word first (review 3f14cf26, finding 5): when it
+    // dies early the write fails with a broken pipe, which names the
+    // symptom and loses the cause.
+    if !out.status.success() {
+        bail!(
+            "git patch-id --verbatim failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    wrote.context("writing to git patch-id")?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(id, commit)| (id.to_string(), commit.trim().to_string()))
+        .collect())
 }
 
 /// Main's newest commit touching the files `branch` changed since
@@ -640,7 +913,7 @@ async fn car_still_at_the_dock(
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("car has no id"))?;
-    let now = gate::api(http, reqwest::Method::GET, &format!("/api/jobs/{id}"), None)
+    let now = crate::sor_client::api(http, reqwest::Method::GET, &format!("/api/jobs/{id}"), None)
         .await?
         .ok_or_else(|| anyhow!("re-reading car {id} answered with no body"))?;
     if let Some(why) = standing_refusal(&now) {
@@ -669,7 +942,7 @@ async fn finish(
         .ok_or_else(|| anyhow!("car has no id"))?;
     let head = gate::resolve_sha(new_branch);
     let gate_runs = crate::train::rows(
-        gate::api(
+        crate::sor_client::api(
             http,
             reqwest::Method::GET,
             "/api/jobs?kind=gate-run&limit=100&full=true",
@@ -718,7 +991,7 @@ async fn finish(
                 "boss rerail: {new_branch} {reason} — the car is held already; that hold stands"
             ),
             Some((path, body)) => {
-                gate::api(http, reqwest::Method::PATCH, &path, Some(body))
+                crate::sor_client::api(http, reqwest::Method::PATCH, &path, Some(body))
                     .await
                     .context("holding the car for its review before repointing it")?;
                 println!(
@@ -749,7 +1022,7 @@ async fn finish(
     // repoint: the car is already correct, and a missed stamp costs one
     // false amber row, not a car.
     for (packet, patch) in rerail_stamps(&gate_runs, old_branch, new_branch) {
-        if let Err(e) = gate::api(
+        if let Err(e) = crate::sor_client::api(
             http,
             reqwest::Method::PATCH,
             &format!("/api/jobs/{packet}/metadata"),
@@ -850,7 +1123,7 @@ pub async fn run(
     dry: bool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let (car, old_branch) = find_car(&http, given).await?;
     let new_branch = format!("{old_branch}-rerail");
     // Before anything is cut, fetched or finished (b3c2bfb6): a car a
@@ -987,7 +1260,7 @@ pub async fn run(
         }
     };
     let wt = ws.path().to_string();
-    let dropped = match pick_onto(&wt, &range)? {
+    let dropped = match pick_onto(&wt, &base, &format!("origin/{old_branch}"))? {
         Picked::Clean { dropped } => dropped,
         Picked::Landed { dropped } => {
             // THE CAR IS ALREADY ON MAIN (b3c2bfb6). Nothing to cut,
@@ -1024,15 +1297,18 @@ pub async fn run(
             files,
             said,
             dropped,
+            twin,
         } => {
             for d in &dropped {
                 println!("boss rerail: {}", d.line());
             }
             // THE one human stop: a real conflict hunk. Everything after
             // resolution is the same finishing half the happy path uses.
+            // A twin on main is named first, so the reader starts there.
             println!(
-                "boss rerail: CONFLICT rebasing {old_branch} onto current main, in: {files}.\n{}\n  \
+                "boss rerail: CONFLICT rebasing {old_branch} onto current main, in: {files}.\n{}{}\n  \
                  ({said})",
+                twin.map(|t| format!("{t}\n")).unwrap_or_default(),
                 conflict_steps(&ws, &new_branch, given, return_to.as_deref())
             );
             bail!("conflict needs a human — the worktree and next steps are above");
@@ -1596,7 +1872,7 @@ mod tests {
         let base = git(&r, &["merge-base", "main", "fix/x"]).expect("base");
         git(&r, &["checkout", "-q", "--detach", "main"]).expect("detach");
 
-        let picked = pick_onto(&r, &format!("{base}..fix/x")).expect("pick");
+        let picked = pick_onto(&r, &base, "fix/x").expect("pick");
         match &picked {
             Picked::Landed { dropped } => {
                 assert_eq!(dropped.len(), 1, "{picked:?}");
@@ -1628,7 +1904,7 @@ mod tests {
         let base = git(&r, &["merge-base", "main", "fix/y"]).expect("base");
         git(&r, &["checkout", "-q", "--detach", "main"]).expect("detach");
 
-        match pick_onto(&r, &format!("{base}..fix/y")).expect("pick") {
+        match pick_onto(&r, &base, "fix/y").expect("pick") {
             Picked::Clean { dropped } => {
                 assert_eq!(dropped.len(), 1);
                 assert_eq!(dropped[0].title, "first car: first.txt");
@@ -1652,10 +1928,386 @@ mod tests {
         let base = git(&r, &["merge-base", "main", "fix/z"]).expect("base");
         git(&r, &["checkout", "-q", "--detach", "main"]).expect("detach");
 
-        match pick_onto(&r, &format!("{base}..fix/z")).expect("pick") {
-            Picked::Conflict { files, .. } => assert_eq!(files, "base.txt"),
+        match pick_onto(&r, &base, "fix/z").expect("pick") {
+            Picked::Conflict { files, twin, .. } => {
+                assert_eq!(files, "base.txt");
+                assert_eq!(twin, None, "main never took this patch");
+            }
             other => panic!("expected a conflict, got {other:?}"),
         }
+    }
+
+    const FIVE: &str = "l1\nl2\nl3\nl4\nl5\n";
+    const FEATURE: &str = "l1\nl2\nFEATURE\nl4\nl5\n";
+
+    /// One fixture commit: the files it writes, and its subject.
+    type Step<'a> = (&'a [(&'a str, &'a str)], &'a str);
+
+    /// A repo: `start` on main, the car's commits on `fix/c`, then main's
+    /// own; HEAD detached at main. Returns (repo, base, main's shas).
+    fn shaped(
+        name: &str,
+        start: &[Step],
+        car: &[Step],
+        main: &[Step],
+    ) -> (String, String, Vec<String>) {
+        let r = fixture_repo(name);
+        let commit = |(files, msg): &Step| -> String {
+            for (f, body) in files.iter() {
+                std::fs::write(Path::new(&r).join(f), body).expect("write");
+                git(&r, &["add", f]).expect("add");
+            }
+            let id = ["-c", "user.email=t@t", "-c", "user.name=t"];
+            git(&r, &[&id[..], &["commit", "-q", "-m", msg]].concat()).expect("commit");
+            git(&r, &["rev-parse", "HEAD"]).expect("sha")
+        };
+        start.iter().for_each(|s| {
+            commit(s);
+        });
+        git(&r, &["checkout", "-q", "-b", "fix/c"]).expect("branch");
+        car.iter().for_each(|s| {
+            commit(s);
+        });
+        git(&r, &["checkout", "-q", "main"]).expect("main");
+        let shas = main.iter().map(commit).collect();
+        let base = git(&r, &["merge-base", "main", "fix/c"]).expect("base");
+        git(&r, &["checkout", "-q", "--detach", "main"]).expect("detach");
+        (r, base, shas)
+    }
+
+    /// RERAIL NEVER DROPS A COMMIT BY ITS TWIN (backlog ec05a62f). Every
+    /// shape three adversarial reviews of car fd13ddf2 built against an
+    /// automatic drop (runs 9b231beb, 3f14cf26, 1c7dd9c7) — and car
+    /// dd64f4ad's own, which a drop was for — now STOPS as a conflict with
+    /// nothing dropped and the commit still being picked, and the stop
+    /// names main's byte-for-byte twin when there is one. Main took the
+    /// patch once in each; in most it has taken it back out since, which
+    /// no diff rule these reviews tried could tell from an amendment.
+    #[test]
+    fn every_reviewed_shape_stops_keeping_its_commit_and_names_any_twin() {
+        // Consts, so the fixture slices below are promoted to 'static.
+        const NINE: &str = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n";
+        const NINE_F: &str = "l1\nl2\nl3\nl4\nFEATURE\nl6\nl7\nl8\nl9\n";
+        const ADD: &str = "l1\nl2\nl3\nFEATURE\nl4\nl5\n";
+        const CRLF: &str = "l1\r\nl2\r\nl3\r\nl4\r\nl5\r\n";
+        const CRLF_F: &str = "l1\r\nl2\r\nFEATURE\r\nl4\r\nl5\r\n";
+        // Two identical blocks; FEATURE goes into one or the other.
+        const BLOCKS: &str = "head\nk1\nk2\nk3\nk4\nk5\nk6\nmid\nk1\nk2\nk3\nk4\nk5\nk6\ntail\n";
+        const IN_ONE: &str =
+            "head\nk1\nk2\nk3\nFEATURE\nk4\nk5\nk6\nmid\nk1\nk2\nk3\nk4\nk5\nk6\ntail\n";
+        const IN_TWO: &str =
+            "head\nk1\nk2\nk3\nk4\nk5\nk6\nmid\nk1\nk2\nk3\nFEATURE\nk4\nk5\nk6\ntail\n";
+        const K3X: &str =
+            "head\nk1\nk2\nK3X\nk4\nk5\nk6\nmid\nk1\nk2\nk3\nFEATURE\nk4\nk5\nk6\ntail\n";
+        let five: Step = (&[("base.txt", FIVE)], "five");
+        let feat: Step = (&[("base.txt", FEATURE)], "car: feature");
+        let landed: Step = (&[("base.txt", FEATURE)], "train: feature (#1)");
+        let w: Step = (&[("w.txt", "w\n")], "car: w.txt");
+        // (fixture, start, car, main, index of main's commit named as twin)
+        let shapes: Vec<(&str, Vec<Step>, Vec<Step>, Vec<Step>, Option<usize>)> = vec![
+            // dd64f4ad: a stale copy of a landed change whose lines a
+            // later train amended.
+            (
+                "dd64f4ad",
+                vec![five],
+                vec![feat, w],
+                vec![
+                    landed,
+                    (
+                        &[("base.txt", "l1\nl2\nFEATURE, amended\nl4\nl5\n")],
+                        "train: amend (#2)",
+                    ),
+                ],
+                Some(0),
+            ),
+            (
+                "dd64f4ad-pure-add",
+                vec![five],
+                vec![(&[("base.txt", ADD)], "car: add"), w],
+                vec![
+                    (&[("base.txt", ADD)], "train: add (#1)"),
+                    (
+                        &[("base.txt", "l1\nl2\nl3\nFEATURE2\nl4\nl5\n")],
+                        "train: amend (#2)",
+                    ),
+                ],
+                Some(0),
+            ),
+            // 9b231beb: a twin differing only in whitespace is no twin.
+            (
+                "whitespace-twin",
+                vec![(&[("c.yaml", "a:\n  b: 1\n")], "yaml")],
+                vec![(&[("c.yaml", "a:\n  b: 1\n  c: 2\n")], "car: nest c")],
+                vec![(
+                    &[("c.yaml", "a:\n  b: 1\nc: 2\n")],
+                    "train: top-level c (#1)",
+                )],
+                None,
+            ),
+            (
+                "reverted-then-rewritten",
+                vec![five],
+                vec![feat],
+                vec![
+                    landed,
+                    (&[("base.txt", FIVE)], "train: revert (#2)"),
+                    (
+                        &[("base.txt", "l1\nl2\nOTHER\nl4\nl5\n")],
+                        "train: other (#3)",
+                    ),
+                ],
+                Some(0),
+            ),
+            (
+                "relanded-then-amended",
+                vec![five],
+                vec![feat],
+                vec![
+                    landed,
+                    (&[("base.txt", FIVE)], "train: revert (#2)"),
+                    (&[("base.txt", FEATURE)], "train: again (#3)"),
+                    (
+                        &[("base.txt", "l1\nl2\nFEATURE, amended\nl4\nl5\n")],
+                        "train: amend (#4)",
+                    ),
+                ],
+                Some(2),
+            ),
+            // 3f14cf26: reverts no reverse patch shows.
+            (
+                "revert-after-context-moved",
+                vec![(&[("base.txt", NINE)], "nine")],
+                vec![(&[("base.txt", NINE_F)], "car: feature")],
+                vec![
+                    (&[("base.txt", NINE_F)], "train: feature (#1)"),
+                    (
+                        &[("base.txt", "l1\nl2\nL3X\nl4\nFEATURE\nl6\nl7\nl8\nl9\n")],
+                        "train: l3 (#2)",
+                    ),
+                    (
+                        &[("base.txt", "l1\nl2\nL3X\nl4\nl5\nl6\nl7\nl8\nl9\n")],
+                        "train: revert #1 (#3)",
+                    ),
+                    (
+                        &[("base.txt", "l1\nl2\nL3X\nl4\nl5\nL6X\nl7\nl8\nl9\n")],
+                        "train: l6 (#4)",
+                    ),
+                ],
+                Some(0),
+            ),
+            (
+                "revert-in-a-multi-car-train",
+                vec![five],
+                vec![feat],
+                vec![
+                    landed,
+                    (
+                        &[("base.txt", FIVE), ("other.txt", "other car\n")],
+                        "train: (2 changes) (#2)",
+                    ),
+                    (&[("base.txt", "l1\nl2\nl3\nL4X\nl5\n")], "train: l4 (#3)"),
+                ],
+                Some(0),
+            ),
+            (
+                "partly-reverted",
+                vec![(&[("f1", "p1\np2\np3\n"), ("f2", "q1\nq2\nq3\n")], "f1 f2")],
+                vec![(
+                    &[("f1", "p1\nP2\np3\n"), ("f2", "q1\nQ2\nq3\n")],
+                    "car: P2 and Q2",
+                )],
+                vec![
+                    (
+                        &[("f1", "p1\nP2\np3\n"), ("f2", "q1\nQ2\nq3\n")],
+                        "train: P2 and Q2 (#1)",
+                    ),
+                    (&[("f1", "p1\np2\np3\n")], "train: P2 out (#2)"),
+                    (&[("f2", "q1\nQ2 amended\nq3\n")], "train: amend Q2 (#3)"),
+                ],
+                Some(0),
+            ),
+            (
+                "added-line-deleted",
+                vec![five],
+                vec![feat],
+                vec![
+                    landed,
+                    (
+                        &[("base.txt", "l1\nl2\nl4\nl5\n")],
+                        "train: drop the line (#2)",
+                    ),
+                ],
+                Some(0),
+            ),
+            // 1c7dd9c7: a squashed revert beside an adjacent edit, a hand
+            // revert that rewrote whitespace, a twin elsewhere in the file.
+            (
+                "revert-squashed-with-adjacent-edit",
+                vec![five],
+                vec![feat],
+                vec![
+                    landed,
+                    (
+                        &[("base.txt", "l1\nl2\nL4X\nl5\n")],
+                        "train: (2 changes) (#2)",
+                    ),
+                ],
+                Some(0),
+            ),
+            (
+                "pure-add-reverted-beside-an-edit",
+                vec![five],
+                vec![(&[("base.txt", ADD)], "car: add")],
+                vec![
+                    (&[("base.txt", ADD)], "train: add (#1)"),
+                    (
+                        &[("base.txt", "l1\nl2\nL3X\nl4\nl5\n")],
+                        "train: (2 changes) (#2)",
+                    ),
+                ],
+                Some(0),
+            ),
+            (
+                "revert-plus-same-line-edit",
+                vec![five],
+                vec![feat],
+                vec![
+                    landed,
+                    (
+                        &[("base.txt", "l1\nl2\nL3Y\nl4\nl5\n")],
+                        "train: (2 changes) (#2)",
+                    ),
+                ],
+                Some(0),
+            ),
+            (
+                "crlf-revert-by-hand",
+                vec![(&[("base.txt", CRLF)], "crlf")],
+                vec![(&[("base.txt", CRLF_F)], "car: feature")],
+                vec![
+                    (&[("base.txt", CRLF_F)], "train: feature (#1)"),
+                    (
+                        &[("base.txt", "l1\r\nl2\r\nl3\nl4\r\nl5\r\n")],
+                        "train: out by hand (#2)",
+                    ),
+                ],
+                Some(0),
+            ),
+            (
+                "trailing-space-revert-by-hand",
+                vec![(&[("base.txt", "l1\nl2\nl3 \nl4\nl5\n")], "five")],
+                vec![feat],
+                vec![landed, (&[("base.txt", FIVE)], "train: out by hand (#2)")],
+                Some(0),
+            ),
+            (
+                "twin-in-another-block",
+                vec![(&[("f.txt", BLOCKS)], "blocks")],
+                vec![(&[("f.txt", IN_ONE)], "car: block one")],
+                vec![
+                    (&[("f.txt", IN_TWO)], "train: block two (#1)"),
+                    (&[("f.txt", K3X)], "train: k3 (#2)"),
+                ],
+                // Review 0a5496cb, finding 1: the same patch TEXT in the
+                // other block is not this change — its blobs differ — so
+                // no twin is named and no skip offered (checked below).
+                None,
+            ),
+        ];
+        for (name, start, car, main, want) in shapes {
+            let (r, base, shas) = shaped(&format!("rerail-twin-{name}"), &start, &car, &main);
+            let picked = pick_onto(&r, &base, "fix/c").expect("pick");
+            let Picked::Conflict { dropped, twin, .. } = &picked else {
+                panic!("{name}: a twin must never drop or land the commit, got {picked:?}");
+            };
+            assert!(dropped.is_empty(), "{name}: {dropped:?}");
+            // The commit is kept: the stop is ON it, for the human.
+            let stopped = git(&r, &["rev-parse", "CHERRY_PICK_HEAD"]).expect("picking");
+            let car_shas = git(&r, &["rev-list", &format!("{base}..fix/c")]).expect("car");
+            assert!(car_shas.lines().any(|s| s == stopped), "{name}: {stopped}");
+            match (want, twin) {
+                (None, None) => {}
+                // A twin of the text alone is said as such: never "byte
+                // for byte", never a skip, and the stop is the ordinary one.
+                (None, Some(note)) if name == "twin-in-another-block" => {
+                    assert!(note.contains(&shas[0][..12]), "{name}: {note}");
+                    assert!(note.contains("not this commit's twin"), "{name}: {note}");
+                    assert!(!note.contains("byte for byte"), "{name}: {note}");
+                    assert!(!note.contains("--skip"), "{name}: {note}");
+                }
+                (Some(i), Some(note)) => {
+                    assert!(
+                        note.contains(&shas[i][..12]),
+                        "{name} names its twin: {note}"
+                    );
+                    assert!(note.contains("yours to decide"), "{name}: {note}");
+                    assert!(note.contains("byte for byte"), "{name}: {note}");
+                    // dd64f4ad stops on the first of two commits: a skip
+                    // goes on to the next, so the steps below still apply.
+                    if name == "dd64f4ad" {
+                        assert!(note.contains("leave the commit out"), "{note}");
+                        assert!(!note.contains("nothing main lacks"), "{note}");
+                    }
+                }
+                (want, got) => panic!("{name}: twin {want:?} expected, the stop said {got:?}"),
+            }
+        }
+    }
+
+    /// The note a stop prints for dd64f4ad's shape names the stopped
+    /// commit, the twin and its train subject, the read that shows what
+    /// main did since, and the way to leave the commit out.
+    #[test]
+    fn a_conflict_stop_names_the_twin_and_how_to_read_and_skip_it() {
+        let five: Step = (&[("base.txt", FIVE)], "five");
+        let (r, base, shas) = shaped(
+            "rerail-twin-note",
+            &[five],
+            &[(&[("base.txt", FEATURE)], "stale copy: feature")],
+            &[
+                (
+                    &[("base.txt", FEATURE)],
+                    "train: 2026-10-09 (1 changes) (#1015)",
+                ),
+                (
+                    &[("base.txt", "l1\nl2\nFEATURE2\nl4\nl5\n")],
+                    "train: amend (#1016)",
+                ),
+            ],
+        );
+        let Picked::Conflict {
+            twin: Some(note), ..
+        } = pick_onto(&r, &base, "fix/c").expect("pick")
+        else {
+            panic!("expected a conflict naming its twin");
+        };
+        // Twelve-character shas and quoted paths (review 0a5496cb,
+        // finding 6), so the read pastes as printed.
+        let onto = &shas[1][..12];
+        let twin = &shas[0][..12];
+        for want in [
+            "\"stale copy: feature\"",
+            "\"train: 2026-10-09 (1 changes) (#1015)\"",
+            &format!("git -C {r} log -p {twin}..{onto} -- 'base.txt'"),
+            &format!("git -C {r} cherry-pick --skip"),
+            "Whether main STILL holds it is yours to decide",
+            // The car's only commit: a skip leaves HEAD at main, so the
+            // note says the car is empty rather than send the human to
+            // `--continue` and a gate (review 0a5496cb, finding 3).
+            "the car carries nothing main lacks",
+            "push nothing and gate nothing",
+            "`boss merged fix/c`",
+        ] {
+            assert!(note.contains(want), "missing {want:?} in: {note}");
+        }
+        assert!(!note.contains("leave the commit out"), "{note}");
+    }
+
+    /// A path with a space or a quote is quoted in the printed read.
+    #[test]
+    fn a_printed_path_is_shell_quoted() {
+        assert_eq!(sh_quote("a b.txt"), "'a b.txt'");
+        assert_eq!(sh_quote("it's"), r"'it'\''s'");
     }
 
     /// A CLOSED OR BOARDED CAR IS NOT REROUTED (b3c2bfb6, second and

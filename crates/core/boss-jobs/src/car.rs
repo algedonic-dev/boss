@@ -199,6 +199,17 @@ pub fn step_fields(
 /// cancelled train can release the car by clearing the stamp).
 pub const REVIEW: &str = "Open for review";
 
+/// The review a car no rule held owes AFTER it lands (backlog bd331d38,
+/// option A): ship-a-change's `landed-review` step, its title, and the
+/// station of the same name that counts every open car whose step is
+/// ready or active. One spelling for the readers that surface and
+/// dispatch that debt — `boss orient`, MY WORK, `boss dispatch`, `boss
+/// step complete` (backlog c851ed24) — pinned to the protocol row and
+/// the station file by `a_car_no_rule_held_owes_its_review_after_landing`.
+pub const LANDED_REVIEW_SLUG: &str = "landed-review";
+pub const LANDED_REVIEW: &str = "Reviewed after landing";
+pub const LANDED_REVIEW_STATION: &str = "landed-review";
+
 /// The review-step key a REVIEW hold records its judged car head under,
 /// beside `hold` (design 7cedfa29 D2, backlog b7b02024). Written by the
 /// doors that hold a car for its adversarial review — the gate's
@@ -219,6 +230,44 @@ pub const HOLD_UNBOUND: &str = "hold_unbound";
 /// verdict, by, at, main_sha}` (design 7cedfa29 D3), written by `boss
 /// release --review`.
 pub const RELEASE: &str = "release";
+
+/// The merge-door body that puts a hold NOT bound to a head on a car's
+/// review step, whose metadata is `review_md` as it stands: an
+/// operator's `boss hold`, the conductor's red-train hold, an unread
+/// diff, a retirement putting its brake back. A review hold adds
+/// [`HOLD_SHA`] to this body itself.
+///
+/// It also deletes a [`HOLD_SHA`] that a release has already lifted
+/// (backlog 6c463c66, from review 4822764d). Once a car is released, its
+/// review step keeps `release`, `hold_sha` and `agent_run`, and no
+/// writer removes them. Before this, a hold written afterwards wrote
+/// `hold` alone and left the old `hold_sha` beside it, so every reader
+/// that reads `hold_sha` as "this hold was judged at that head" was
+/// fooled by it. The release door judged the yard's head-less request
+/// at that head, and a release CARRIED over the dock's replay (`release.
+/// sha` H2, the old `hold_sha` still H1) then read releasable and was
+/// lifted again on its old review. `boss release` told the operator
+/// that a red-train hold was a review hold that the conductor would
+/// re-hold, when the release already boards the car.
+///
+/// It deletes the key only when the step records a `release` and no
+/// hold is on: the review hold that `hold_sha` names was lifted, and
+/// the new one was judged at no head. A live review hold keeps its
+/// head, so a hand hold over it is still a review hold. A review hold
+/// cleared bare, with no release, keeps it too, because the conductor
+/// re-holds such a car for its review. Deleting it costs the dock
+/// nothing: it reads a `release` before it reads `hold_sha`, and no
+/// writer removes a `release`.
+pub fn hold_body(review_md: &Value, reason: &str) -> Value {
+    let mut body = json!({ "hold": reason.trim() });
+    let lifted = review_md.get(RELEASE).is_some_and(Value::is_object)
+        && crate::stranded::hold_reason(review_md).is_none()
+        && review_md.get(HOLD_SHA).is_some_and(|h| !h.is_null());
+    if lifted {
+        body[HOLD_SHA] = Value::Null;
+    }
+    body
+}
 
 /// One step completion a car's filer owes: which step, the evidence to
 /// MERGE onto it, and the status-only body that then completes it.
@@ -813,8 +862,11 @@ pub fn owned_wait(md: &Value) -> Option<OwnedWait> {
 /// `proof_owed = "true"` is the one marker — a string, because a
 /// protocol predicate compares strings (`job.metadata.proof_owed =
 /// "true"`, the idiom every `abandoned` terminal uses) — and the
-/// obligation reads it through [`owes_proof`]. Paying the proof removes
-/// it; the car's closing outcome keeps the history.
+/// obligation reads it through [`owes_proof`]. Paying the proof turns it
+/// to `"paid"` — kept, not removed, so the obligation's
+/// `metadata_has=proof_owed` reader still finds a car that owed and was
+/// paid — beside the proof itself under `owed_proof` (the forge door,
+/// `boss prove --from-car --unattended`); `owes_proof` is false for it.
 pub const PROOF_OWED: &str = "proof_owed";
 
 /// Does this car owe its proof? Only under the one marker.
@@ -1759,6 +1811,42 @@ mod tests {
 
     fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::parse_from_rfc3339(s).unwrap().into()
+    }
+
+    /// A HOLD WRITTEN AFTER A RELEASE DELETES THE HEAD THAT RELEASE LIFTED
+    /// (backlog 6c463c66). The review step of a released car keeps
+    /// `release`, `hold_sha` and `agent_run`. The red-train hold and a
+    /// hand `boss hold` used to write `hold` alone, so the old `hold_sha`
+    /// read as the head the new hold was judged at.
+    #[test]
+    fn a_hold_after_a_release_deletes_the_head_the_release_lifted() {
+        let h1 = "1111111111111111111111111111111111111111";
+        let released = json!({ HOLD_SHA: h1, "agent_run": "run-r",
+                               RELEASE: {"sha": h1, "review": "run-r"} });
+        let body = hold_body(
+            &released,
+            " held by the conductor: train t1 was judged red ",
+        );
+        assert_eq!(
+            body,
+            json!({ "hold": "held by the conductor: train t1 was judged red", HOLD_SHA: null }),
+            "the hold, and the lifted head deleted at the merge door; the release and the \
+             reviewer run stay, as the record of what was released"
+        );
+
+        // KEPT: a live review hold keeps its head. A hand hold over the
+        // conductor's re-hold at H2 is still that review hold.
+        let live = json!({ "hold": "conductor re-judge at 222222222222", HOLD_SHA: "22",
+                           RELEASE: {"sha": h1} });
+        assert_eq!(hold_body(&live, "x"), json!({ "hold": "x" }));
+        // KEPT: a review hold cleared bare, with no release: the conductor
+        // holds that car again for its review, and needs the head to.
+        let bare = json!({ HOLD_SHA: h1, "hold": null });
+        assert_eq!(hold_body(&bare, "x"), json!({ "hold": "x" }));
+        // A step with no head to delete gets the one key, as before.
+        let none = json!({ RELEASE: {"sha": h1} });
+        assert_eq!(hold_body(&none, "x"), json!({ "hold": "x" }));
+        assert_eq!(hold_body(&Value::Null, "x"), json!({ "hold": "x" }));
     }
 
     /// The proof keys are written only when stated, so a car with no

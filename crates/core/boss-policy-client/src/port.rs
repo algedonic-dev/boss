@@ -19,6 +19,14 @@ pub enum PolicyError {
     Refused(String),
 }
 
+/// Exact native policy rows protected by the actual policy writer boundary.
+/// Holding this guard supplies storage exclusion only; the consumer must still
+/// evaluate at the owner's current expiry instant and prove caller/mode scope.
+pub trait PolicySelectionRows {
+    fn rules(&self) -> &[PolicyRule];
+    fn overrides(&self) -> &[UserOverride];
+}
+
 /// A decision on a write, taken by the adapter INSIDE the write's
 /// transaction on the row the write would change — locked, and read
 /// live or not (an inactive rule, an expired override) — or on `None`
@@ -62,6 +70,22 @@ pub fn unjudged<T>(_: Option<&T>) -> Result<(), String> {
 
 #[async_trait]
 pub trait PolicyRepository: Send + Sync {
+    fn try_lock_selection_rows(
+        &self,
+    ) -> Result<Option<Box<dyn PolicySelectionRows + '_>>, PolicyError> {
+        Err(PolicyError::Storage(
+            "nonblocking native policy owner unavailable".into(),
+        ))
+    }
+    /// Native selection is unsupported unless this adapter can hold its actual
+    /// authoritative writer boundary. A remote read or matching row hash does
+    /// not implement this contract.
+    fn lock_selection_rows(&self) -> Result<Box<dyn PolicySelectionRows + '_>, PolicyError> {
+        Err(PolicyError::Storage(
+            "native policy selection owner unavailable".into(),
+        ))
+    }
+
     /// Every active rule in the store.
     async fn list_rules(&self) -> Result<Vec<PolicyRule>, PolicyError>;
 

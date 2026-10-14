@@ -12,6 +12,24 @@
 // mounts.
 
 import type { Page, Route } from '@playwright/test';
+import type { Product, ProductDetail, ProductInventory } from '../../src/products/types';
+import { CRAWL_VENDOR } from '../fixtures/vendor';
+
+// 50ab513c: shared crawls need rows, not only the dedicated Products
+// spec's private fixtures. Synthetic catalog and coherent multi-location
+// stock, shaped by boss-products' list/detail serializers.
+const CRAWL_PRODUCTS: ReadonlyArray<Product & { total_on_hand: number }> = [
+  { sku: 'CRAWL-ACTIVE', name: 'Crawl output', product_kind: 'finished-good', package_unit: 'each', description: null, metadata: {}, active: true, total_on_hand: 23 },
+  { sku: 'CRAWL-RETIRED', name: 'Retired crawl output', product_kind: 'finished-good', package_unit: 'each', description: null, metadata: {}, active: false, total_on_hand: 7 },
+];
+
+function crawlProductDetail(product: (typeof CRAWL_PRODUCTS)[number]): ProductDetail {
+  const stock = (location_id: string, on_hand: number): ProductInventory & {
+    value_cents: number; production_cost_cents: number;
+  } => ({ product_sku: product.sku, location_id, on_hand, reserved: 0,
+    value_cents: 0, production_cost_cents: 0, updated_at: null });
+  return { ...product, inventory: [stock('crawl-store', product.total_on_hand - 2), stock('crawl-dock', 2)] };
+}
 // The world's own layout, so the empty leg below cannot list a region
 // the map does not draw (backlog 94c6ffd0: the list was typed out here
 // and went stale the day a ninth region landed). world.ts is pinned to
@@ -698,6 +716,20 @@ export async function installSmokeMocks(page: Page): Promise<void> {
   // do not name still resolves, so the page mounts. Routes registered
   // later take precedence.
   await installApiFloor(page);
+
+  await page.route(/\/api\/inventory\/vendors(\?|$)/, (r) =>
+    r.request().method() === 'GET' ? json(r, [CRAWL_VENDOR]) : r.fallback());
+
+  // Include an inactive row as an adversarial catalog response, just
+  // as the dedicated spec does; this does not enable or retire anything.
+  await page.route(/\/api\/products(\?|$)/, (r) =>
+    r.request().method() === 'GET' ? json(r, CRAWL_PRODUCTS) : r.fallback());
+  await page.route(/\/api\/products\/[^/?]+(\?|$)/, (r) => {
+    if (r.request().method() !== 'GET') return r.fallback();
+    const sku = decodeURIComponent(new URL(r.request().url()).pathname.split('/').pop()!);
+    const product = CRAWL_PRODUCTS.find((p) => p.sku === sku);
+    return product ? json(r, crawlProductDetail(product)) : json(r, 'product not found', 404);
+  });
 
   // Identity / session: a persona, so `/api/auth/me` is someone.
   await page.route(/\/api\/people$/, (r) => json(r, [EMP]));

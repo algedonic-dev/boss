@@ -28,6 +28,21 @@
 # 2026-09-24; an alarm per build would be the flat list again, shouted.
 # The shipped-rule test refuses a `backlog-item` declaration by name.
 #
+# ONE PLATFORM STEP, NARROWED (version 2, backlog c851ed24): `hours.
+# ship-a-change.landed-review`, 24h. Since option A (bd331d38, David
+# 2026-10-09) a car no rule held boards on its green and owes its
+# independent review AFTER it lands, and `merged` waits for it — so the
+# backlog item the car carries stays open until a reviewer reads the
+# change. W40 parked 383 cars, most of which would owe one; a review
+# nobody dispatched is an item silently held open, the 8e9d3723 stall.
+# The declaration names the STEP, never the workflow: the same car's
+# `proven` sits on the agent for days honestly waiting on the world, and
+# a whole-ship-a-change bound would alarm on every one of them. A day,
+# because the coordinator dispatches reviewers every cycle (its rule 4)
+# and a car's review older than that has fallen out of the cycle.
+# Measured from the car's last movement (its boarding, or its proof
+# landing later), so the alarm can be late and is never early.
+#
 # HOURLY, NOT DAILY: the tightest bound is four hours, and a daily read
 # would let a late payout sit up to a day past it — the handler refuses
 # a firing with no `_at` for that reason.
@@ -42,9 +57,13 @@ Measured 2026-09-23: a receive-a-payout post waited 63.6h on the agent
 inside a flat list of ~180 ready steps (backlog 078ddcb0). It adds no
 routing and refuses nothing: one firing files ONE urgent alarm per late
 step (never twice for a step), withdraws it once the step no longer
-waits, and never touches the late step itself.
+waits, and never touches the late step itself. Version 2 (backlog
+c851ed24) adds one narrowed declaration: a landed car's owed
+`landed-review`, past a day — the item it carries is held open until
+it completes, and nothing else ages that debt into a packet.
 """
+version = 2
 schedule = { cadence = "hourly", anchor_date = "2026-09-24" }
 [[rule.do]]
 handler = "jobs.agent_step_overdue"
-args = { "hours.receive-a-payout" = "4", "hours.receive-a-sponsorship" = "24", "hours.receive-an-inquiry" = "24", "hours.close-a-period" = "72" }
+args = { "hours.receive-a-payout" = "4", "hours.receive-a-sponsorship" = "24", "hours.receive-an-inquiry" = "24", "hours.close-a-period" = "72", "hours.ship-a-change.landed-review" = "24" }

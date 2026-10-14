@@ -1,7 +1,7 @@
 //! Run the mounted recorder and idle reader through their actual shell/HTTP
 //! ports. A native completed backup is evidence; du, a simulated packet or
 //! an older successful attempt cannot substitute for a mounted statfs.
-use boss_testing::{create_dir, repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{create_dir, repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -177,6 +177,7 @@ exit "${STAT_STATUS:-0}"
     }
     fn run(&self, script: &str, args: &[&str], url: &str, env: &[(&str, &str)]) -> Output {
         let mut c = Command::new("bash");
+        without_proxy(&mut c);
         c.arg(repo_root().join(script))
             .args(args)
             .env(

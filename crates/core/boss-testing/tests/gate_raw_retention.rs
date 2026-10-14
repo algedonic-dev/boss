@@ -91,7 +91,8 @@ for layout in ('reports', 'pod-log'):
     if mode == 'lost': shell += next(line for line in source.splitlines() if line.startswith("trap 'fail_lost")) + '\nfalse\n'
     env = dict(inherited, BOSS_GATE_RUNTIME_EVIDENCE=str(journal), RECEIPT=str(receipt),
                BOSS_RUNTIME_HELPER=str(tree / 'infra/gate-runner/runtime-evidence.py'),
-               GATE_TERMINATION_LOG=str(message), NATIVE_JOB_NAME='gate-retention-00000')
+               GATE_TERMINATION_LOG=str(message), NATIVE_JOB_NAME='gate-retention-00000',
+               POD_NAME='gate-fix-report-missing-d-fixture')
     if layout == 'pod-log': env['GATE_VERDICT_CARRIER'] = 'pod-log'
     result = subprocess.run(['bash', '-c', shell], env=env, capture_output=True)
     out = result.stdout
@@ -102,14 +103,17 @@ for layout in ('reports', 'pod-log'):
     # The delivery, by layout: the stub report when the runner reports,
     # the receipt frame - and NO report, and a termination message -
     # when it leaves its verdict.
-    delivered = b'report' if layout == 'reports' else b'gate-runner: receipt '
+    # A retained Pod identity may contain "report"; only the stub's
+    # whole output line proves an invocation, never that substring.
+    delivered = b'\nreport\n' if layout == 'reports' else b'gate-runner: receipt '
     if mode != 'exit':
         assert delivered in out, (tag, 'the verdict was not delivered by this layout', out)
         assert out.index(b'gate-runtime-raw:') < out.index(delivered), (tag, 'delivered before retaining', out)
     if layout == 'pod-log':
-        assert b'report' not in out, (tag, 'a carrier runner reported', out)
+        assert b'report' not in out.splitlines(), (tag, 'a carrier runner reported', out)
         assert message.exists() == (mode != 'exit'), (tag, 'termination message')
     else:
+        assert out.splitlines().count(b'report') == (0 if mode == 'exit' else 1), (tag, 'report invocation count', out)
         assert not message.exists(), (tag, 'a reporting runner wrote a termination message')
     assert not journal.exists(), tag
 "#;

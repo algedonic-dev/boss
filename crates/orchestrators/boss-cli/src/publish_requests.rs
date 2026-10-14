@@ -34,7 +34,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Method;
 use serde_json::{Map, Value, json};
 
-use crate::gate::{api, stamp};
+use crate::sor_client::{api, stamp};
 use crate::train::rows;
 use crate::train::{find_step, id8, step_completion_writes, step_done};
 
@@ -506,7 +506,7 @@ async fn drain_one(
 }
 
 /// Drain every open publish-request packet. The jobs API base comes
-/// from `gate::api`, which REFUSES when `BOSS_JOBS_URL` is unset — a
+/// from `crate::sor_client::api`, which REFUSES when `BOSS_JOBS_URL` is unset — a
 /// drain against the wrong deployment would answer instead of erroring,
 /// which is worse.
 ///
@@ -514,7 +514,7 @@ async fn drain_one(
 /// conductor's run), never from a wallclock read here — the one stamp
 /// this verb writes derives from it.
 pub(crate) async fn run(clone: &str, remote: &str, dry: bool, now: DateTime<Utc>) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let open = rows(
         api(
             &http,

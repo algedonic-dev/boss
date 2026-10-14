@@ -256,13 +256,13 @@ fn hold_write(car: &Value, inputs: &AutoParkInputs) -> Result<Option<(String, Va
         return Ok(None);
     };
     let car_id = car.get("id").and_then(Value::as_str).unwrap_or_default();
-    let review = car::find_step(car, car::REVIEW_SLUG, car::REVIEW)
-        .filter(|s| {
-            !matches!(
-                s.get("status").and_then(Value::as_str),
-                Some("completed" | "skipped")
-            )
-        })
+    let open = car::find_step(car, car::REVIEW_SLUG, car::REVIEW).filter(|s| {
+        !matches!(
+            s.get("status").and_then(Value::as_str),
+            Some("completed" | "skipped")
+        )
+    });
+    let review = open
         .and_then(|s| s.get("id").and_then(Value::as_str))
         .filter(|_| !car_id.is_empty());
     let Some(step_id) = review else {
@@ -276,7 +276,11 @@ fn hold_write(car: &Value, inputs: &AutoParkInputs) -> Result<Option<(String, Va
     // head the gate's hold was stamped on. The conductor then boards
     // this car only on a release recorded at its current head, so a
     // release given before a repair is no release of the repair.
-    let mut body = json!({ "hold": reason });
+    // An unbound hold over a released car deletes the `hold_sha` that
+    // release lifted, so it is not read as judged there (backlog
+    // 6c463c66, `car::hold_body`).
+    let review_md = open.and_then(|s| s.get("metadata")).unwrap_or(&Value::Null);
+    let mut body = car::hold_body(review_md, reason);
     if inputs.hold_bound && !inputs.receipt.head.trim().is_empty() {
         body[car::HOLD_SHA] = json!(inputs.receipt.head.trim());
     }
@@ -365,6 +369,10 @@ fn refresh_patch(car: &Value, inputs: &AutoParkInputs, note: &str) -> Value {
             &inputs.verified,
         ));
         m.extend(inputs.item_provenance.clone());
+        // The latest explicit answer also governs a parked car: retaining
+        // its old closing edge would bury the remaining work (d8a73b73).
+        m.extend(clear_stale_item_answer(car, inputs));
+        m.extend(supersede(car, inputs));
     }
     patch
 }
@@ -894,7 +902,7 @@ const CARS_PAGE: usize = 200;
 /// So the query asks the wide question and the shared
 /// `metadata.branch` predicates in `boss_jobs::car` decide — the same
 /// way `boss gate`'s own launch guard already reads the dock
-/// (`gate::all_open_cars`). One question, one answer, no field that
+/// (`sor_client::all_open_cars`). One question, one answer, no field that
 /// can drift out from under it (CLAUDE.md §9a).
 fn open_cars_url(base: &str, offset: usize) -> String {
     format!("{base}/api/jobs?kind=ship-a-change&status=open&limit={CARS_PAGE}&offset={offset}")
@@ -1368,6 +1376,62 @@ impl Handler for JobsAutoPark {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_reconciles_a_later_partial_answer_without_losing_the_receipt() {
+        let parent = "46c18d11-4edf-4dfb-99ad-1d4e3a77336a";
+        let car = json!({"metadata": {"backlog_item": parent}});
+        let inputs = auto_park_inputs(
+            &gate_run(json!({
+                "park_summary": "partial repair", "park_partial_item": parent,
+                "park_probe": "echo source", "park_expect": "source", "hold": "review",
+            })),
+            &green_step_meta(),
+        )
+        .unwrap();
+        let patch = refresh_patch(&car, &inputs, "refreshed");
+        assert_eq!(
+            patch.get(car::BACKLOG_ITEM),
+            Some(&Value::Null),
+            "the metadata merge must delete the old closing edge"
+        );
+        assert_eq!(patch[car::PARTIAL_ITEM], parent);
+        assert!(
+            patch["item_answer_superseded"]
+                .as_str()
+                .unwrap()
+                .contains("46c18d11")
+        );
+        assert_eq!(patch["regate_receipt"], inputs.receipt.raw);
+        assert_eq!(patch[car::PROOF_PROBE], "echo source");
+    }
+
+    #[test]
+    fn refresh_reconciles_only_an_explicit_changed_answer() {
+        let car = json!({"metadata": {"backlog_item": "old-parent"}});
+        for intent in [
+            json!({}),
+            json!({"park_backlog_item": "old-parent"}),
+            json!({"park_also_answers": ["other"]}),
+        ] {
+            let mut gr = gate_run(intent);
+            gr["metadata"]["park_summary"] = json!("repair");
+            let inputs = auto_park_inputs(&gr, &green_step_meta()).unwrap();
+            let patch = refresh_patch(&car, &inputs, "n");
+            assert!(patch.get(car::BACKLOG_ITEM).is_none());
+            assert!(patch.get("item_answer_superseded").is_none());
+        }
+        let inputs = auto_park_inputs(
+            &gate_run(json!({
+                "park_summary": "repair", "park_no_item": "no closing answer",
+            })),
+            &green_step_meta(),
+        )
+        .unwrap();
+        let patch = refresh_patch(&car, &inputs, "n");
+        assert_eq!(patch.get(car::BACKLOG_ITEM), Some(&Value::Null));
+        assert_eq!(patch[car::PARTIAL_ITEM], "old-parent");
+    }
 
     fn gate_run(extra_md: Value) -> Value {
         let mut md = json!({ "branch": "fix/x", "sha": "abc" });
@@ -3249,6 +3313,15 @@ mod held_park_tests {
         assert!(!inputs.hold_bound);
         let (_, body) = hold_write(&fresh_car(), &inputs).unwrap().unwrap();
         assert_eq!(body, json!({ "hold": REASON }));
+        // Over a car already released at the dock, it deletes the head
+        // that release lifted rather than leave it to read as this
+        // hold's (backlog 6c463c66).
+        let mut released = fresh_car();
+        released["steps"][3]["status"] = json!("ready");
+        released["steps"][3]["metadata"] =
+            json!({ car::HOLD_SHA: "1111", car::RELEASE: {"sha": "1111"} });
+        let (_, body) = hold_write(&released, &inputs).unwrap().unwrap();
+        assert_eq!(body, json!({ "hold": REASON, car::HOLD_SHA: null }));
         // The mark absent, or false: a review hold, bound.
         gr["metadata"][car::HOLD_UNBOUND] = json!(false);
         assert!(auto_park_inputs(&gr, &green_meta()).unwrap().hold_bound);

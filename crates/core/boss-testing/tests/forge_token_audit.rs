@@ -11,7 +11,7 @@
 //! `no_credential_material_reaches_the_output` pins that neither ever reaches
 //! stdout. That property is the reason this script is allowed to exist.
 
-use boss_testing::repo_root;
+use boss_testing::{PROXY_VARS, repo_root, without_proxy};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -135,7 +135,13 @@ fn run_env(
     extra: &[&std::ffi::OsStr],
     env: &[(&str, &std::ffi::OsStr)],
 ) -> (i32, String, String) {
-    let out = Command::new("python3")
+    // A run strips every proxy variable before it sets its own, so a
+    // developer shell with a proxy exported cannot turn a cell red for a
+    // reason the script did not cause (backlog 50708d76, F-b of review
+    // 0a666c59) — through the one list, boss_testing::PROXY_VARS.
+    let mut cmd = Command::new("python3");
+    without_proxy(&mut cmd);
+    let out = cmd
         .arg(script())
         .arg("--db")
         .arg(db)
@@ -725,6 +731,62 @@ fn a_redirect_is_not_followed_with_the_token() {
         "{out}\n{err}"
     );
     assert!(left.is_empty(), "{left:?}");
+}
+
+/// NOT THROUGH A PROXY, WHATEVER THE ENVIRONMENT NAMES (backlog 50708d76,
+/// F-a of review 0a666c59). The reader withholds the token from a request
+/// CURL would proxy — but this script sends with urllib, whose default
+/// opener takes a proxy from the environment by its own rules: uppercase
+/// `HTTP_PROXY` for an http URL, which curl ignores and so the reader
+/// admits. The reviewer measured the token delivered to an `HTTP_PROXY`
+/// stub; on main before that review both `http_proxy` and `HTTP_PROXY`
+/// carried it. The opener now takes no proxy from anywhere, so the one
+/// host the reader judged is the one host the request can reach. Each
+/// variable names a listening stub; the registry is a loopback port
+/// nothing listens on, which the rule admits, so the token is made and a
+/// direct read fails fast — honestly partial, and the stub never reached.
+#[test]
+fn the_registry_read_goes_through_no_proxy_whatever_the_environment_names() {
+    let mut proxied = Vec::new();
+    for (i, var) in PROXY_VARS[..6].iter().enumerate() {
+        let dir = scratch(&format!("proxy-{i}"));
+        let db = forge_db(&dir, &[("boss-gcp", "write:repository", NOW - 3600)]);
+        let decl = declaration(&dir, &[("boss-gcp", "the conductor", "write:repository")]);
+        let (mount, tmp) = (dir.join("mount"), dir.join("tmp"));
+        boss_testing::create_dir(&mount);
+        boss_testing::create_dir(&tmp);
+        boss_testing::write_file(&mount.join("current"), MACHINE_TOKEN);
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        proxy.set_nonblocking(true).unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        let (code, out, err) = run_env(
+            &db,
+            &decl,
+            NOW,
+            &["--registry-url".as_ref(), "http://127.0.0.1:1".as_ref()],
+            &[
+                ("BOSS_MACHINE_TOKEN_DIR", mount.as_os_str()),
+                ("BOSS_MACHINE_TOKEN_HOSTS", "".as_ref()),
+                ("TMPDIR", tmp.as_os_str()),
+                (*var, proxy_url.as_ref()),
+            ],
+        );
+        if proxy.accept().is_ok() {
+            // Every row is run before the verdict, so a red names them all.
+            proxied.push(*var);
+            continue;
+        }
+        assert_eq!(code, 1, "{var}: partial, not clean:\n{out}\n{err}");
+        assert!(out.contains("LIMIT"), "{var}: {out}");
+        assert!(
+            !out.contains(MACHINE_TOKEN) && !err.contains(MACHINE_TOKEN),
+            "{var}: {out}\n{err}"
+        );
+    }
+    assert!(
+        proxied.is_empty(),
+        "the registry read went to the proxy each of these names: {proxied:?}"
+    );
 }
 
 /// An off-list host is the reader's own decision, and it is the reader

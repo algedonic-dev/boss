@@ -1379,12 +1379,12 @@ async fn open_packet(kind: &str, rule: &str, now: DateTime<Utc>) -> Result<i32> 
         );
     }
 
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     // A HARD read: an answer that is not a list refuses rather than
     // reading as "none open", which would file a second packet beside
     // the open one (backlog 7b7e0529).
     let open = crate::train::rows(
-        crate::gate::api(
+        crate::sor_client::api(
             &http,
             reqwest::Method::GET,
             &format!("/api/jobs?kind={kind}&status=open&limit=2"),
@@ -1400,7 +1400,7 @@ async fn open_packet(kind: &str, rule: &str, now: DateTime<Utc>) -> Result<i32> 
         return Ok(0);
     }
 
-    crate::gate::api(
+    crate::sor_client::api(
         &http,
         reqwest::Method::POST,
         "/api/jobs",
@@ -1733,7 +1733,7 @@ pub async fn run(once: bool, dry: bool) -> Result<()> {
     let base = jobs_base()?;
     // Stamps the machine token per request, so a loop that runs for
     // weeks follows a rotation (design 6805c764 car 2, the CLI slice).
-    let http = crate::gate::machine_client_with(
+    let http = crate::sor_client::machine_client_with(
         reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)),
     )?;
     let clock_url = train::env_or("BOSS_CLOCK_URL", &boss_ports::url("clock"));
@@ -3029,7 +3029,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let http = crate::gate::machine_client().unwrap();
+        let http = crate::sor_client::machine_client().unwrap();
 
         let rule = depth_rule(1, 30);
         let cut_off = fired_rc(&rule, utc(2026, 10, 7, 23, 5, 0), None);
@@ -3671,7 +3671,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let depth = probe_dock_depth(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &format!("http://{addr}"),
         )
         .await
@@ -3859,7 +3859,7 @@ mod db_tests {
     async fn seeded_rules_load_and_parse() {
         let db = boss_testing::TestDb::new().await;
         let base = serve_cadence_api(db.pool.clone()).await;
-        let http = crate::gate::machine_client().unwrap();
+        let http = crate::sor_client::machine_client().unwrap();
         let rules = load_rules(&http, &base).await.unwrap();
         let by_name = |n: &str| {
             rules
@@ -3973,7 +3973,7 @@ mod db_tests {
     async fn a_window_claims_exactly_once() {
         let db = boss_testing::TestDb::new().await;
         let base = serve_cadence_api(db.pool.clone()).await;
-        let http = crate::gate::machine_client().unwrap();
+        let http = crate::sor_client::machine_client().unwrap();
         let rule = CadenceRule {
             name: "train-window".into(),
             verb: "run".into(),
@@ -4150,7 +4150,7 @@ mod db_tests {
         // The system of record: the database behind /api/cadence/*.
         let sor = boss_testing::TestDb::new().await;
         let base = serve_cadence_api(sor.pool.clone()).await;
-        let http = crate::gate::machine_client().unwrap();
+        let http = crate::sor_client::machine_client().unwrap();
 
         // The loop fires a wall rule on schedule and records the
         // firing THE WAY THE LOOP RECORDS IT.
@@ -4205,7 +4205,7 @@ mod db_tests {
     async fn a_rule_that_never_fired_stays_null() {
         let sor = boss_testing::TestDb::new().await;
         let base = serve_cadence_api(sor.pool.clone()).await;
-        let body = crate::gate::machine_client()
+        let body = crate::sor_client::machine_client()
             .unwrap()
             .get(format!("{base}/api/cadence/rules/train-window/last-firing"))
             .header("x-boss-user", train::boss_user())

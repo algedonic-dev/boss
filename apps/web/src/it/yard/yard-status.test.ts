@@ -17,6 +17,10 @@ import {
   phaseLabel,
   queueLabel,
   redsCell,
+  releasableHeld,
+  releaseBody,
+  safeSaysNo,
+  shortSha,
   etaDetail,
   etaReading,
   trainTone,
@@ -163,9 +167,66 @@ describe('parseYardStatus', () => {
         // A hold written with no text still says so rather than reading
         // blank — the same words the held-green lane uses.
         reason: 'no reason recorded',
+        // An older server states no release decision: none, not "no".
+        release: null,
       },
     ]);
     expect(parseYardStatus({}).held_cars).toEqual([]);
+  });
+
+  // WHAT A HELD CAR'S RELEASE RESTS ON (backlog ed8e5c85). The server
+  // states the decision, judged by the release door's own rule; the
+  // page reads it and judges nothing. Only an explicit `releasable:
+  // true` offers the button, and the "release every reviewed car" list
+  // is exactly the rows the server says it would release.
+  test('a held row carries the server’s release decision, and only true offers release', () => {
+    const row = { id: 'c', title: 'T', branch: 'fix/x', parked_since: '2026-10-09', reason: 'trust' };
+    const ready = {
+      review: '5eed5eed-0000-4000-8000-000000000001',
+      verdict: 'release',
+      reviewed_sha: '1111111111111111111111111111111111111111',
+      head: '1111111111111111111111111111111111111111',
+      head_matches: true,
+      safe_line: 'SAFE TO RELEASE WITHOUT DAVID: yes. Narrow.',
+      reviewer_model: { says: 'declared opus-5[1m], observed opus-5-5 — they DIFFER', matches: false },
+      releasable: true,
+      refusal: null,
+    };
+    const s = parseYardStatus({
+      held_cars: [
+        { ...row, id: 'a', release: ready },
+        { ...row, id: 'b', release: { ...ready, releasable: false, head_matches: false, refusal: 'boss release: REFUSED — another head' } },
+        { ...row, id: 'c', release: { ...ready, releasable: 'yes' } },
+        { ...row, id: 'd' },
+      ],
+    });
+    const a = s.held_cars[0]!.release!;
+    expect(a.releasable).toBe(true);
+    expect(a.head_matches).toBe(true);
+    expect(a.safe_line).toBe('SAFE TO RELEASE WITHOUT DAVID: yes. Narrow.');
+    expect(a.model).toBe('declared opus-5[1m], observed opus-5-5 — they DIFFER');
+    expect(a.model_differs).toBe(true);
+    expect(s.held_cars[1]!.release!.refusal).toBe('boss release: REFUSED — another head');
+    expect(s.held_cars[2]!.release!.releasable).toBe(false);
+    expect(s.held_cars[3]!.release).toBeNull();
+    expect(releasableHeld(s.held_cars).map(h => h.id)).toEqual(['a']);
+    // The body names the review and nothing else: no head, no actor.
+    expect(releaseBody(a)).toEqual({ review: '5eed5eed-0000-4000-8000-000000000001' });
+    expect(releaseBody({ ...a, review: null })).toBeNull();
+    expect(shortSha(a.reviewed_sha)).toBe('11111111');
+    expect(shortSha(null)).toBe('—');
+  });
+
+  // Review 4822764d N1: the Release-all confirmation lists every car's
+  // SAFE line, and a car whose reviewer answered "no" is marked there.
+  // The line is the reviewer's own words, shown and never judged by the
+  // door, so the page only reads the answer after the colon.
+  test('a SAFE line that answers no is told apart from yes and from none', () => {
+    expect(safeSaysNo('SAFE TO RELEASE WITHOUT DAVID: no — Release-all lifts a red-train hold.')).toBe(true);
+    expect(safeSaysNo('SAFE TO RELEASE WITHOUT DAVID: No.')).toBe(true);
+    expect(safeSaysNo('SAFE TO RELEASE WITHOUT DAVID: yes. Narrow.')).toBe(false);
+    expect(safeSaysNo('SAFE TO RELEASE WITHOUT DAVID: not without a second look')).toBe(false);
+    expect(safeSaysNo(null)).toBe(false);
   });
 
   // The strike count rides the dock row (the Rust `DockCar`, which the

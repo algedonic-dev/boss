@@ -17,13 +17,14 @@ use std::{net::SocketAddr, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use boss_core::machine_gate::VerifiedEstate;
 use boss_policy_client::{CurrentUser, request_context_middleware};
 use reqwest::Client;
 use tower_http::{
@@ -33,8 +34,11 @@ use tower_http::{
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod relay_client;
+use relay_client::RelayClient;
+
 struct AppState {
-    http: Client,
+    http: RelayClient,
     role_guards: Arc<boss_policy_client::role_guard::RoleGuardReporter>,
     jobs_url: String,
     clock_url: String,
@@ -42,6 +46,12 @@ struct AppState {
     /// (boss-ports `sim-control`). Read endpoints (telemetry, config GET)
     /// are open; config writes are operator-gated + forwarded here.
     sim_control_url: String,
+}
+
+fn forwarding_client() -> Result<RelayClient> {
+    // A relay carries a verified credential: never let a redirect or
+    // ambient proxy choose another recipient (2710c8fc R5).
+    RelayClient::build(Client::builder()).context("building simulator forwarding client")
 }
 
 const STUB_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\">\
@@ -97,13 +107,17 @@ fn operator_guard_with_reports(
 /// Forward an operator-gated POST to an upstream control endpoint,
 /// re-attaching the caller's `x-boss-user` so the upstream's own operator
 /// gate (jobs-api) also passes, and relaying the upstream status + body.
+/// Only a credential verified by the inbound gate is relayed. Report
+/// mode may admit an assertion; it never grants that assertion our token
+/// (backlog 2710c8fc, R5).
 async fn forward_post(
     state: &AppState,
     url: String,
     headers: &HeaderMap,
+    verified: Option<&VerifiedEstate>,
     body: Option<Bytes>,
 ) -> Response {
-    let mut req = state.http.post(&url);
+    let mut req = state.http.post(&url, verified);
     if let Some(u) = headers.get("x-boss-user") {
         req = req.header("x-boss-user", u);
     }
@@ -181,6 +195,7 @@ async fn get_config(State(s): State<Arc<AppState>>) -> Response {
 async fn post_config(
     State(s): State<Arc<AppState>>,
     user: CurrentUser,
+    verified: Option<Extension<VerifiedEstate>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -191,6 +206,7 @@ async fn post_config(
         &s,
         format!("{}/config", s.sim_control_url),
         &headers,
+        verified.as_ref().map(|proof| &proof.0),
         Some(body),
     )
     .await
@@ -199,6 +215,7 @@ async fn post_config(
 async fn control_pause(
     State(s): State<Arc<AppState>>,
     user: CurrentUser,
+    verified: Option<Extension<VerifiedEstate>>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(r) = operator_guard_with_reports(&user, Some(&s.role_guards)) {
@@ -208,6 +225,7 @@ async fn control_pause(
         &s,
         format!("{}/api/jobs/sim-clock/pause", s.jobs_url),
         &headers,
+        verified.as_ref().map(|proof| &proof.0),
         None,
     )
     .await
@@ -216,6 +234,7 @@ async fn control_pause(
 async fn control_resume(
     State(s): State<Arc<AppState>>,
     user: CurrentUser,
+    verified: Option<Extension<VerifiedEstate>>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(r) = operator_guard_with_reports(&user, Some(&s.role_guards)) {
@@ -225,6 +244,7 @@ async fn control_resume(
         &s,
         format!("{}/api/jobs/sim-clock/resume", s.jobs_url),
         &headers,
+        verified.as_ref().map(|proof| &proof.0),
         None,
     )
     .await
@@ -233,6 +253,7 @@ async fn control_resume(
 async fn control_restart_epoch(
     State(s): State<Arc<AppState>>,
     user: CurrentUser,
+    verified: Option<Extension<VerifiedEstate>>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(r) = operator_guard_with_reports(&user, Some(&s.role_guards)) {
@@ -242,6 +263,7 @@ async fn control_restart_epoch(
         &s,
         format!("{}/api/jobs/sim-clock/restart-epoch", s.jobs_url),
         &headers,
+        verified.as_ref().map(|proof| &proof.0),
         None,
     )
     .await
@@ -250,6 +272,7 @@ async fn control_restart_epoch(
 async fn control_configure(
     State(s): State<Arc<AppState>>,
     user: CurrentUser,
+    verified: Option<Extension<VerifiedEstate>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -262,6 +285,7 @@ async fn control_configure(
         &s,
         format!("{}/api/clock/configure", s.clock_url),
         &headers,
+        verified.as_ref().map(|proof| &proof.0),
         Some(body),
     )
     .await
@@ -324,7 +348,7 @@ async fn main() -> Result<()> {
     );
 
     let state = Arc::new(AppState {
-        http: Client::new(),
+        http: forwarding_client()?,
         role_guards: wiring.guards,
         jobs_url,
         clock_url: std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock")),
@@ -389,6 +413,138 @@ mod tests {
     use super::*;
     use boss_policy_client::{AccessTier, User};
 
+    #[tokio::test]
+    async fn simulator_relays_only_the_machine_credential_the_inbound_gate_verified() {
+        use boss_core::machine_gate::{MachineGate, Mode, Reading, Slots, gated};
+        use boss_policy_client::role_guard::RoleGuardReporter;
+        use boss_policy_client::role_reader::{MonotonicRoleSnapshotClock, SnapshotRoleReader};
+        use boss_policy_client::role_reporting::{ReportMode, ReportTally};
+        let upstream = Router::new().route("/{*path}", post(|headers: HeaderMap| async move {
+            Json(serde_json::json!({
+                "token": headers.get(boss_core::machine_token::HEADER).and_then(|v| v.to_str().ok()),
+                "user": headers.get("x-boss-user").and_then(|v| v.to_str().ok()),
+            }))
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let identity = serde_json::to_string(&as_role("platform-admin").0).unwrap();
+        for (mode, configured) in [
+            (Mode::Off, true),
+            (Mode::Report, true),
+            (Mode::Enforce, true),
+            (Mode::Enforce, false),
+        ] {
+            let state = Arc::new(AppState {
+                http: forwarding_client().unwrap(),
+                role_guards: Arc::new(RoleGuardReporter::new(
+                    Arc::new(SnapshotRoleReader::new(
+                        std::time::Duration::from_secs(30),
+                        Arc::new(MonotonicRoleSnapshotClock),
+                    )),
+                    Arc::new(ReportTally::new(8)),
+                    Arc::new(ReportMode::Report),
+                )),
+                jobs_url: upstream_url.clone(),
+                clock_url: upstream_url.clone(),
+                sim_control_url: upstream_url.clone(),
+            });
+            let api = Router::new()
+                .route("/api/config", post(post_config))
+                .route("/api/control/pause", post(control_pause))
+                .route("/api/control/resume", post(control_resume))
+                .route("/api/control/restart-epoch", post(control_restart_epoch))
+                .route("/api/control/configure", post(control_configure))
+                .with_state(state);
+            let gate = Arc::new(MachineGate::new(
+                "simulator",
+                &[],
+                Reading::new(
+                    mode,
+                    if configured {
+                        Slots::new(
+                            Some("fixture-current".into()),
+                            Some("fixture-next".into()),
+                            Some("fixture-previous".into()),
+                        )
+                    } else {
+                        Slots::new(None, None, None)
+                    },
+                )
+                .with_reader(Slots::new(Some("fixture-reader".into()), None, None)),
+            ));
+            let app = gated(simulator_http_router(api, Router::new()), gate);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            for route in [
+                "config",
+                "control/pause",
+                "control/resume",
+                "control/restart-epoch",
+                "control/configure",
+            ] {
+                for (tokens, expected, refused) in [
+                    (
+                        vec!["fixture-current"],
+                        configured.then_some("fixture-current"),
+                        false,
+                    ),
+                    (
+                        vec!["fixture-next"],
+                        configured.then_some("fixture-next"),
+                        false,
+                    ),
+                    (
+                        vec!["fixture-previous"],
+                        configured.then_some("fixture-previous"),
+                        false,
+                    ),
+                    (vec![], None, mode == Mode::Enforce && configured),
+                    (vec!["wrong"], None, mode == Mode::Enforce && configured),
+                    (
+                        vec!["fixture-current", "wrong"],
+                        None,
+                        mode == Mode::Enforce && configured,
+                    ),
+                    (
+                        vec!["fixture-current", "fixture-next"],
+                        None,
+                        mode == Mode::Enforce && configured,
+                    ),
+                    (vec!["fixture-reader"], None, true),
+                ] {
+                    let mut request = Client::new()
+                        .post(format!("{base}/simulator/api/{route}"))
+                        .header("x-boss-user", &identity)
+                        .body("{}");
+                    for token in tokens {
+                        request = request.header(boss_core::machine_token::HEADER, token);
+                    }
+                    let response = request.send().await.unwrap();
+                    if refused {
+                        assert!(response.status().is_client_error());
+                        continue;
+                    }
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let observed: serde_json::Value = response.json().await.unwrap();
+                    assert_eq!(
+                        observed["token"],
+                        serde_json::json!(expected),
+                        "{mode:?} {route}"
+                    );
+                    assert_eq!(observed["user"], identity);
+                }
+            }
+            server.abort();
+        }
+        upstream_server.abort();
+    }
+
     fn as_role(role: &str) -> CurrentUser {
         CurrentUser(User {
             id: "x".into(),
@@ -398,6 +554,56 @@ mod tests {
             direct_report_ids: Vec::new(),
             department: None,
         })
+    }
+
+    #[tokio::test]
+    async fn the_forwarding_client_never_follows_an_upstream_redirect() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let received = Arc::new(AtomicUsize::new(0));
+        let count = received.clone();
+        let destination = Router::new().route(
+            "/",
+            get(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    "unexpected"
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/", listener.local_addr().unwrap());
+        let destination_server = tokio::spawn(async move {
+            axum::serve(listener, destination).await.unwrap();
+        });
+        let redirect = Router::new().route(
+            "/",
+            post(move || {
+                let target = target.clone();
+                async move {
+                    (
+                        StatusCode::SEE_OTHER,
+                        [(axum::http::header::LOCATION, target)],
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let from = format!("http://{}/", listener.local_addr().unwrap());
+        let redirect_server = tokio::spawn(async move {
+            axum::serve(listener, redirect).await.unwrap();
+        });
+        let response = forwarding_client()
+            .unwrap()
+            .post(&from, None)
+            .header(boss_core::machine_token::HEADER, "fixture-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(received.load(Ordering::SeqCst), 0);
+        redirect_server.abort();
+        destination_server.abort();
     }
 
     /// Design 2830b6b7: the same floor as jobs-api's guard. The OSS
@@ -527,7 +733,7 @@ mod tests {
                 axum::serve(listener, upstream).await.unwrap();
             });
             let state = Arc::new(AppState {
-                http: Client::new(),
+                http: forwarding_client().unwrap(),
                 role_guards: reporter,
                 jobs_url: base.clone(),
                 clock_url: base.clone(),
@@ -539,11 +745,17 @@ mod tests {
                 let user = as_role(asserted);
                 let body = Bytes::from_static(b"{\"warp\":2}");
                 let response = match control {
-                    0 => post_config(State(state.clone()), user, headers.clone(), body).await,
-                    1 => control_pause(State(state.clone()), user, headers.clone()).await,
-                    2 => control_resume(State(state.clone()), user, headers.clone()).await,
-                    3 => control_restart_epoch(State(state.clone()), user, headers.clone()).await,
-                    _ => control_configure(State(state.clone()), user, headers.clone(), body).await,
+                    0 => post_config(State(state.clone()), user, None, headers.clone(), body).await,
+                    1 => control_pause(State(state.clone()), user, None, headers.clone()).await,
+                    2 => control_resume(State(state.clone()), user, None, headers.clone()).await,
+                    3 => {
+                        control_restart_epoch(State(state.clone()), user, None, headers.clone())
+                            .await
+                    }
+                    _ => {
+                        control_configure(State(state.clone()), user, None, headers.clone(), body)
+                            .await
+                    }
                 };
                 assert_eq!(
                     response.status(),

@@ -1422,9 +1422,12 @@ mod lane_pin {
         // service grant read off the policy check's tally, stamped
         // `Telemetry` like the coverage backstop beside it; twenty since
         // the registry-declared failed chore without RED lines (e4a9a9b3)
-        // reaches its owner, stamped `PipelineFailure` by the fallback.
+        // reaches its owner, stamped `PipelineFailure` by the fallback;
+        // twenty-one since `machine.gate.asked.alarm` (backlog d653e090),
+        // an ask from a caller nobody expects read off the machine gate's
+        // durable window, stamped `Telemetry` like the two beside it.
         assert_eq!(
-            filings, 20,
+            filings, 21,
             "the number of machine filing sites changed. That is fine — but check the new \
              one stamps a lane, then update this count, which exists so a filing that \
              DISAPPEARS from the scan (a renamed key, a reshaped body) cannot read as \

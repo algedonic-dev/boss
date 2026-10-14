@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { JobLite, StepLite } from './yard';
 import { SIGNALS_SHOWN, yardSignals } from './yard-signals';
+import { testNet1 } from '../../../tests/fixtures/test-values';
 
 // The signals panel: what fired what, newest first, read off the
 // packets' own completed steps. Who is derived from the packet kind
@@ -32,7 +33,7 @@ const train = (id: string, over: Partial<JobLite> = {}): JobLite => ({
   steps: [
     step('scheduled', 'completed', {}, 'trigger'),
     step('collect', 'completed', { boarded: 'feat/a (2fc7e385), fix/b (04cdfbd0)', completed_at: '2026-09-08T02:03:05Z' }),
-    step('pr', 'completed', { pr_url: 'http://10.20.0.15:3000/david/boss/pulls/262', completed_at: '2026-09-08T02:03:05Z' }),
+    step('pr', 'completed', { pr_url: `http://${testNet1(15)}:3000/example/boss/pulls/262`, completed_at: '2026-09-08T02:03:05Z' }),
     step('ci', 'completed', { result: 'green', completed_at: '2026-09-08T02:20:55Z' }),
     step('merged', 'completed', { merge_ref: '0d8c37dd9cf9', completed_at: '2026-09-08T02:20:56Z' }),
     step('converged', 'completed', {
@@ -88,6 +89,15 @@ const opsRequest = (id: string, over: Partial<JobLite> = {}): JobLite => ({
 });
 
 describe("yardSignals — what fired what, in the packets' own stamps", () => {
+  test('the synthetic train PR uses the reserved fixture network and keeps the original stamps', () => {
+    const row = train('fixture');
+    const pr = row.steps?.find(s => s.spec_slug === 'pr');
+    expect(new URL(String(pr?.metadata?.pr_url)).hostname).toBe(testNet1(15));
+    expect(yardSignals([row], [], [])[0]).toMatchObject({
+      at: '2026-09-08T02:30:25.263+00:00', what: '#262 arrived',
+    });
+  });
+
   test("a train's stamped steps are the conductor's signals, newest first; the arrival takes the packet's close", () => {
     const s = yardSignals([train('t1')], [], []);
     expect(s.map(x => [x.at, x.who, x.what])).toEqual([
@@ -107,7 +117,7 @@ describe("yardSignals — what fired what, in the packets' own stamps", () => {
     const t = train('t2', {
       title: 'PR train 2026-09-07 21:41',
       steps: [
-        step('pr', 'completed', { pr_url: 'http://10.20.0.15:3000/david/boss/pulls/257', completed_at: '2026-09-07T21:41:30Z' }),
+        step('pr', 'completed', { pr_url: `http://${testNet1(15)}:3000/example/boss/pulls/257`, completed_at: '2026-09-07T21:41:30Z' }),
         step('converged', 'completed', {
           cluster_commit: '77152b8 (rolled back; 1994077 quarantined at boot)',
           completed_by_hand: true,
@@ -117,6 +127,7 @@ describe("yardSignals — what fired what, in the packets' own stamps", () => {
       ],
     });
     const s = yardSignals([t], [], []);
+    expect(new URL(String(t.steps?.[0]?.metadata?.pr_url)).hostname).toBe(testNet1(15));
     expect(s[0]).toMatchObject({
       who: 'conductor',
       hand: true,
@@ -129,7 +140,7 @@ describe("yardSignals — what fired what, in the packets' own stamps", () => {
     const t = train('t3', {
       metadata: { closed_at: '2026-09-08T01:46:42Z', outcome: 'cancelled' },
       steps: [
-        step('pr', 'completed', { pr_url: 'http://10.20.0.15:3000/david/boss/pulls/261', completed_at: '2026-09-08T01:17:59Z' }),
+        step('pr', 'completed', { pr_url: `http://${testNet1(15)}:3000/example/boss/pulls/261`, completed_at: '2026-09-08T01:17:59Z' }),
         step('ci', 'completed', {
           result: 'failing',
           checks: 'CI / test (pull_request):FAILURE',
@@ -139,6 +150,7 @@ describe("yardSignals — what fired what, in the packets' own stamps", () => {
       ],
     });
     const s = yardSignals([t], [], []);
+    expect(new URL(String(t.steps?.[0]?.metadata?.pr_url)).hostname).toBe(testNet1(15));
     expect(s.map(x => [x.sev, x.what])).toEqual([
       ['warn', '#261 cancelled — Twin car: already landed in #259'],
       ['err', '#261 CI failing · CI / test (pull_request):FAILURE'],

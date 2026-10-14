@@ -658,8 +658,8 @@ skipped_entry() {
 }
 # skipped_tenant_entry NS WHY REPO REF — the same spelling for an
 #   instance skipped over its TENANT SOURCE (backlog f4f5c387): WHY is
-#   `unreadable` (the deploying tick measured that its credential cannot
-#   read REPO@REF) or `not delivered` (the no-op tick found no
+#   `unreadable` (the deploying tick measured that it cannot read
+#   REPO@REF) or `not delivered` (the no-op tick found no
 #   boss-tenant ConfigMap in NS — the instance was never applied). The
 #   parser reads the reason as `tenant source unreadable` / `tenant not
 #   delivered`; the repo and ref are the detail.
@@ -680,25 +680,78 @@ skipped_tenant_entry() {
 # ninth). The functions below are the repo half, written so a fixture
 # forge can exercise every verdict.
 #
-# ONE CREDENTIAL: the checkout's own. The runner fetches forge main
-# through its `forgejo` remote, and the tenant is read with exactly
-# that URL's scheme and host — the repo path replaced, nothing else —
-# so the first converge MEASURES whether the checkout's token can read
-# the tenant repo, and an unreadable one names itself on the packet
-# instead of a person guessing at scopes. The token is not IN that URL
-# any more (design 1c90d183, backlog c4cbc6b5): it is a 0600 file of
-# the owner's behind a git credential helper in the owner's GLOBAL
-# config, scoped to the forge's URL, and forge-converge's deposit
-# (credential-deposit.sh) strips the remote's userinfo once that helper
-# authenticates. The runner runs as that owner (User= in its unit), so
-# a derived URL for any repo on the forge authenticates through the same
-# file. The URL is derived as the remote holds it rather than stripped
-# here: the runner's first tick after the change lands precedes the
-# deposit's first pass, and a URL stripped before the helper exists
-# would record a false "tenant source unreadable". No URL ever reaches
-# the journal regardless — a remote the deposit has not converted still
-# carries its token in the userinfo — and every git message is redacted
-# before it is printed.
+# THE CONVERGE READS A TENANT WITH NO CREDENTIAL (backlog 683d7fe9, car
+# 2). It read it over HTTP as the checkout's owner, with his forge token
+# behind a credential helper in his global git config; it runs as root
+# now, and root holds neither — and needs neither, because the tenant is
+# a repository of the forge on this very host. So it is read the way
+# root's own tree is (root-tree.sh): from the forge's repository on
+# disk, at the path forge-repo-path.sh derives from the compose file that
+# declares it (owner/name.git under the forge's repository root), with
+# the SERVING side run as that repository's owner (`--upload-pack
+# '<runas> git upload-pack'`) — so root's git never opens a repository
+# another account owns, neither that repository's config nor its hooks
+# are in play, and what root parses is a pack, checked
+# (fetch.fsckObjects). The settings that make that safe are root-tree.sh's
+# and are held equal to it by root_tree_sh.rs (CLAUDE.md §9a: like the
+# probe view's fetch, this one cannot source root-tree.sh, which is a
+# verb and not a library).
+#
+# tenant_repo_url, _tenant_url_from_remote and redact_url below are not
+# the converge's any more: merge-tenant-main.sh, which PUSHES to a tenant
+# and so needs a credential, derives its URL with them.
+
+# tenant_repo_path TENANT_REPO — where TENANT_REPO's bare repository is
+#   on this host, printed; rc 2 (nothing printed) when TENANT_REPO is not
+#   an owner/name. Whether it is THERE is the read's question, not this.
+tenant_repo_path() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 2
+    (
+        unset BOSS_FORGE_REPO_PATH
+        BOSS_FORGE_REPO_SLUG="$1"
+        # shellcheck source=infra/forge/forge-repo-path.sh
+        . "$(dirname "${BASH_SOURCE[0]}")/forge-repo-path.sh"
+        printf '%s\n' "$FORGE_REPO"
+    )
+}
+# tenant_repo_runas PATH — the words that run a command as PATH's owner,
+#   root-tree.sh's source_runas rule: empty when this process IS the
+#   owner, `runuser -u <name> --` when the uid has a name, `setpriv` by
+#   number when it does not (a container's uid with no host account).
+#   rc 1 when the owner cannot be read.
+tenant_repo_runas() {
+    local uid gid name nameless=""
+    uid="$(stat -c %u -- "$1" 2>/dev/null)" || return 1
+    gid="$(stat -c %g -- "$1" 2>/dev/null)" || return 1
+    [[ "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]] || return 1
+    if [ "$uid" = "$(id -u)" ]; then
+        printf ''
+        return 0
+    fi
+    # A uid with no passwd entry is the setpriv case, by number; the
+    # failed lookup is said as that, never taken for an empty name.
+    name="$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)" || nameless=1
+    if [ -z "$nameless" ] && [[ "$name" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        printf 'runuser -u %s --' "$name"
+    else
+        printf 'setpriv --reuid=%s --regid=%s --clear-groups --' "$uid" "$gid"
+    fi
+}
+# _tenant_source TENANT_REPO REF — sets TENANT_PATH and TENANT_RUNAS for
+#   a read; rc 2 when no path can be derived, 1 (the reason on stderr)
+#   when there is no repository there or its owner cannot be read.
+_tenant_source() {
+    TENANT_PATH="" TENANT_RUNAS=""
+    TENANT_PATH=$(tenant_repo_path "$1") || return 2
+    if [ ! -d "$TENANT_PATH" ]; then
+        printf 'tenant %s@%s is not readable: there is no repository at %s on this host\n' "$1" "$2" "$TENANT_PATH" >&2
+        return 1
+    fi
+    if ! TENANT_RUNAS=$(tenant_repo_runas "$TENANT_PATH"); then
+        printf 'tenant %s@%s is not readable: who owns %s cannot be read\n' "$1" "$2" "$TENANT_PATH" >&2
+        return 1
+    fi
+}
 
 # _tenant_url_from_remote URL TENANT_REPO — pure string work: the
 #   remote's URL with its trailing owner/name[.git] replaced by
@@ -716,41 +769,56 @@ tenant_repo_url() {
     _tenant_url_from_remote "$url" "$2"
 }
 # redact_url — a filter: the userinfo of every URL on stdin replaced by
-#   <redacted>. Every git message about a tenant goes through it.
+#   <redacted>. Every git message about a tenant a writer pushes to goes
+#   through it.
 redact_url() {
     sed -E 's#://[^/@[:space:]]+@#://<redacted>@#g'
 }
-# tenant_source_check REPO TENANT_REPO REF — MEASURES readability:
-#   `git ls-remote` for REF (a branch or a tag) with the derived URL.
-#   Prints the sha REF resolves to and returns 0; returns 1 when the
-#   repo cannot be read or has no such ref (the reason on stderr,
-#   redacted); 2 when no URL can be derived. GIT_TERMINAL_PROMPT=0: a
-#   unit has no terminal, and a prompt would hang, not fail.
+# tenant_source_check TENANT_REPO REF — MEASURES readability: `git
+#   ls-remote` for REF (a branch or a tag) against the forge's own
+#   repository, served as its owner. Prints the sha REF resolves to and
+#   returns 0; returns 1 when there is no such repository or ref (the
+#   reason on stderr); 2 when TENANT_REPO is not an owner/name.
+#   GIT_TERMINAL_PROMPT=0 and a bound: a unit has no terminal, and a read
+#   that hangs must end.
 tenant_source_check() {
-    local repo="$1" tenant="$2" ref="$3" url out rc=0
-    url=$(tenant_repo_url "$repo" "$tenant") || return 2
-    out=$(GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code "$url" "refs/heads/$ref" "refs/tags/$ref" 2>&1) || rc=$?
+    local tenant="$1" ref="$2" out rc=0
+    _tenant_source "$tenant" "$ref" || return $?
+    out=$(timeout -k 5 "${BOSS_TENANT_READ_TIMEOUT:-120}" env GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+        git -c core.hooksPath=/dev/null ls-remote --exit-code \
+        --upload-pack="${TENANT_RUNAS:+$TENANT_RUNAS }git upload-pack" -- "file://$TENANT_PATH" \
+        "refs/heads/$ref" "refs/tags/$ref" 2>&1) || rc=$?
     if [ "$rc" -ne 0 ]; then
-        printf 'tenant %s@%s is not readable with the converge'"'"'s credential (rc %s): %s\n' \
-            "$tenant" "$ref" "$rc" "$out" | redact_url >&2
+        printf 'tenant %s@%s is not readable from %s (rc %s): %s\n' "$tenant" "$ref" "$TENANT_PATH" "$rc" "$out" >&2
         return 1
     fi
     # A here-string, not a pipe: `head` exits at its first line and a
     # producer still writing is SIGPIPE under pipefail.
     head -n1 <<< "$out" | cut -f1
 }
-# tenant_checkout REPO TENANT_REPO REF DIR — a fresh shallow clone of
-#   REF into DIR, replacing whatever DIR held: a stale checkout answering
-#   for a moved ref is the wrong-target class. rc 1 with the reason
-#   (redacted) when the clone fails; 2 when no URL can be derived.
+# tenant_checkout TENANT_REPO REF DIR — a fresh shallow clone of REF into
+#   DIR, replacing whatever DIR held: a stale checkout answering for a
+#   moved ref is the wrong-target class. `file://`, because a plain path
+#   makes git clone by copying the repository's files itself — the very
+#   read of another account's repository the served pack exists to
+#   avoid. rc 1 with the reason when the clone fails; 2 when TENANT_REPO
+#   is not an owner/name.
 tenant_checkout() {
-    local url out rc=0
-    url=$(tenant_repo_url "$1" "$2") || return 2
-    rm -rf "$4"
-    out=$(GIT_TERMINAL_PROMPT=0 git clone -q --depth 1 --branch "$3" "$url" "$4" 2>&1) || rc=$?
+    local out rc=0
+    _tenant_source "$1" "$2" || rc=$?
+    case "$rc" in
+        0) ;;
+        2) return 2 ;;
+        # Nothing to clone from: what DIR held answers for nothing now.
+        *) rm -rf "$3"; return "$rc" ;;
+    esac
+    rm -rf "$3"
+    out=$(timeout -k 5 "${BOSS_TENANT_READ_TIMEOUT:-120}" env GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+        git -c core.hooksPath=/dev/null -c fetch.fsckObjects=true clone -q --depth 1 --branch "$2" \
+        --upload-pack="${TENANT_RUNAS:+$TENANT_RUNAS }git upload-pack" -- "file://$TENANT_PATH" "$3" 2>&1) || rc=$?
     if [ "$rc" -ne 0 ]; then
-        printf 'tenant %s@%s could not be checked out (rc %s): %s\n' "$2" "$3" "$rc" "$out" | redact_url >&2
-        rm -rf "$4"
+        printf 'tenant %s@%s could not be checked out from %s (rc %s): %s\n' "$1" "$2" "$TENANT_PATH" "$rc" "$out" >&2
+        rm -rf "$3"
         return 1
     fi
 }
@@ -1298,7 +1366,8 @@ ensure_declared_secrets() {
 # and return 0; no hold, return 1. The runner asks before it builds.
 #
 # ANYTHING STANDING AT THE PATH HOLDS (backlog d94d287e). The runner
-# reads as david what root wrote; a hold that stands and cannot be read
+# read as david what root wrote (it is root too since 683d7fe9, and the
+# rule stays: it costs nothing); a hold that stands and cannot be read
 # used to fail `cat` and pass as "no hold", so the roll went ahead
 # against a human's stop. Unreadable is held, and says why.
 #
@@ -1335,6 +1404,95 @@ converge_held() {
     return 1
 }
 
+# converge_hold_report HOLD_FILE REASON MAIN_SHA CLUSTER_AT — what a
+# HELD tick owes the record: the runner calls it between
+# `converge_held` and its exit 0. Three things, each of which was
+# missing (delta review aa901496 of car 14142ab6, N1 and the ALARM
+# note; backlog 62b09c57).
+#
+# 1. WHAT THE HOLD KEEPS BACK, SAID AT THE POINT OF REFUSAL: the build
+#    and the roll. The cluster stays on CLUSTER_AT (the converge's stamp)
+#    and main is at MAIN_SHA. Until backlog 683d7fe9 the converge
+#    checked out a clone of its own, and a held tick exited before that
+#    checkout — so the rollback runbook (OPERATIONS.md, failure mode 9)
+#    had its reader wait for a checkout that a hold never moved. The
+#    converge runs from root's tree now, which follows main hold or no
+#    hold; there is no checkout a hold keeps back.
+#
+# 2. THE HOLD ON THE TICK'S OWN PACKET. A held tick the TIMER started
+#    answers no ops-request, and its maintenance-cluster-converge packet
+#    closed `result: ok` carrying nothing: a held converge and a healthy
+#    one read the same off the host. converge_held, held_since,
+#    held_for_s, cluster_at and main_at ride the run step now. The age
+#    is the hold file's own mtime — `hold` writes the file whole, so
+#    placing it again restarts the clock — read without following a link.
+#
+# 3. A HOLD THAT OUTLIVES ITS PURPOSE REACHES SOMEONE, ONCE. A hold is a
+#    decision, not a failure: the tick exits 0 and stays that way, so no
+#    `failed` close exists for a rule to judge. Past
+#    BOSS_FORGE_HOLD_ALARM_S (six hours: longer than the data move and
+#    the database switch that place a hold around their own work, short
+#    enough that a forgotten one costs an afternoon of unrolled trains
+#    and not a week) this raises ONE alert through the converge's own
+#    door (tenant_check_alert: filed when the record answers, kept and
+#    replayed when it does not). One per HOLD, not per tick: the marker
+#    names the hold it was raised for by mtime and inode, in the
+#    converge's state directory. It is reached only
+#    on a tick where main has MOVED and the hold stopped the roll, which
+#    is when a forgotten hold starts to cost something.
+#
+# It cannot fail a tick: every read that can fail has a named answer
+# (`unknown`, `unreadable`), and it returns 0.
+converge_hold_report() {
+    local f="$1" reason="$2" main="$3" at="$4"
+    local bound="${BOSS_FORGE_HOLD_ALARM_S:-21600}"
+    local marker="${BOSS_FORGE_HOLD_ALERTED:-$CONVERGE_STATE/hold-alarm-raised}"
+    local mtime now age since key where alarm hours no_mtime=""
+    # Each read that can fail has its own name; none is ever taken for
+    # an empty answer or a zero. The stamp is `none` before a first
+    # converge and is said as that.
+    [[ "$at" =~ ^[0-9a-f]{7}$ ]] || at="none"
+    now="$(date +%s)"
+    mtime="$(stat -c %Y -- "$f" 2>/dev/null)" || no_mtime=1
+    age="unknown" since="unknown" key=""
+    if [ -z "$no_mtime" ] && [[ "$mtime" =~ ^[0-9]+$ ]]; then
+        age=$(( now > mtime ? now - mtime : 0 ))
+        since="$(date -u -d "@$mtime" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || since="unknown"
+        key="$mtime:$(stat -c %i -- "$f" 2>/dev/null)" || key=""
+    fi
+
+    echo "cluster-deploy-runner: converge HELD — $reason — main at ${main:0:7} not built or rolled (release-converge lifts it)" >&2
+    where="the cluster stays on build $at while the hold stands; root's tree is at main (${main:0:12}), which a hold does not keep back — only the build and the roll wait on it"
+    echo "cluster-deploy-runner: held since $since ($age s); $where" >&2
+    run_summary_field converge_held "$(printf '%s' "$reason" | cut -c1-600)"
+    run_summary_field held_since "$since"
+    run_summary_field held_for_s "$age"
+    run_summary_field cluster_at "$at"
+    run_summary_field main_at "$main"
+
+    if ! [[ "$bound" =~ ^[0-9]+$ ]]; then
+        alarm="never: BOSS_FORGE_HOLD_ALARM_S ('$bound') is not a number of seconds"
+    elif [ "$age" = "unknown" ] || [ -z "$key" ]; then
+        alarm="not judged: the hold at $f could not be aged"
+    elif [ "$age" -lt "$bound" ]; then
+        alarm="not due: $age s of $bound s"
+    elif [ "$(cat -- "$marker" 2>/dev/null)" = "$key" ]; then
+        alarm="already raised for this hold ($marker)"
+    else
+        hours=$(( age / 3600 ))
+        tenant_check_alert "cluster converge HELD for $hours h: main at ${main:0:7} is not rolled" \
+            "The cluster converge on the forge has been held since $since ($age s, past the $bound s after which a standing hold is reported). Reason, as the hold file gives it: $(printf '%s' "$reason" | cut -c1-300). Forge main is at $main and is not built or rolled onto the cluster while the hold stands; the cluster is on build $at. If the hold has done its work: boss ops forge release-converge. If it still stands for a reason, close this item saying so — it is raised once per hold, and every held tick's maintenance-cluster-converge packet carries converge_held and held_for_s."
+        if printf '%s\n' "$key" > "$marker" 2>/dev/null; then
+            alarm="raised at $age s (bound $bound s)"
+        else
+            alarm="raised at $age s (bound $bound s); $marker could not be written, so the next held tick raises it again"
+        fi
+    fi
+    echo "cluster-deploy-runner: hold alarm — $alarm" >&2
+    run_summary_field hold_alarm "$alarm"
+    return 0
+}
+
 # THE RUN ANSWERS THE PACKET THAT ASKED FOR IT (backlog d66f92b2).
 #
 # The `converge` ops verb (converge-now.sh) starts this unit with
@@ -1342,28 +1500,30 @@ converge_held() {
 # accepts the job — so the ops-request closed `answered` on 2026-09-07
 # 22:01 while the run it started died a second later on a git lock.
 # The verb now leaves the requesting packet's id in an inbox in the
-# checkout; the runner takes the inbox when it starts and, when it
-# ends, PATCHes each request with the outcome. Best-effort, never
-# fatal: visibility must not block the executor (the-executor-never-
-# waits-on-its-visibility), and the maintenance packet's ExecStopPost
-# verdict is the record either way.
+# converge's state directory (CONVERGE_STATE/requests, forge-defaults.sh;
+# it was the checkout owner's .git until backlog 683d7fe9 moved the
+# converge to root); the runner takes the inbox when it starts and,
+# when it ends, PATCHes each request with the outcome. Best-effort,
+# never fatal: visibility must not block the executor (the-executor-
+# never-waits-on-its-visibility), and the maintenance packet's
+# ExecStopPost verdict is the record either way.
 
-# take_converge_requests REPO — move every id in the inbox into this
-# run's file. Idempotent (the stage-2 re-exec runs it again and finds
-# the inbox already taken).
+# take_converge_requests STATE — move every id in STATE's inbox into
+# this run's file. Idempotent (the run that the first one hands over to
+# runs it again and finds the inbox already taken).
 take_converge_requests() {
-    local inbox="$1/.git/boss-converge-requests" mine="$1/.git/boss-converge-requests.run"
+    local inbox="$1/requests" mine="$1/requests.run"
     [ -f "$inbox" ] || return 0
     cat "$inbox" >> "$mine" && rm -f "$inbox"
 }
 
-# answer_converge_requests REPO KEY VALUE — PATCH {KEY: VALUE} onto the
+# answer_converge_requests STATE KEY VALUE — PATCH {KEY: VALUE} onto the
 # metadata of every ops-request this run was started for, then forget
 # them. Only well-formed job ids are sent (a malformed line is logged
 # and dropped); a missing BOSS_JOBS_URL or an unreachable API is one
 # loud line, and the run's exit status is untouched.
 answer_converge_requests() {
-    local repo="$1" key="$2" value="$3" mine="$1/.git/boss-converge-requests.run" id body code
+    local key="$2" value="$3" mine="$1/requests.run" id body code
     [ -f "$mine" ] || return 0
     if [ -z "${BOSS_JOBS_URL:-}" ]; then
         echo "cluster-deploy-runner: BOSS_JOBS_URL unset — cannot annotate the request(s) that started this run ($key: $value)" >&2
@@ -1403,4 +1563,56 @@ answer_converge_requests() {
     done < "$mine"
     if declare -F secret_header_close >/dev/null; then secret_header_close; fi
     rm -f "$mine"
+}
+
+# carry_converge_state — the converge's stamps, carried ONCE from the
+# home of the account it ran as until backlog 683d7fe9 (david) into
+# CONVERGE_STATE, root's (forge-defaults.sh).
+#
+# WHY IT MATTERS. The stamp is what the apply pins the boss image to: with
+# none, manifests_with_image leaves the manifest's PLACEHOLDER tag in the
+# applied copy, and the apply rolls the cluster onto an image that does
+# not boot — the 2026-09-05 shape. It is also the build the watchdog and
+# rollback-to roll to by name. A converge that moved and lost it would
+# take the cluster down on its first deploy.
+#
+# WHY THE FIRST ROOT RUN AND NOT THE INSTALLER, which carried the
+# watchdog's state. The run already under way when forge-converge swaps
+# this unit's file is still the old account's, and it may write its stamp
+# AFTER any carry the installer made; systemd starts no second run of a
+# oneshot while one is active, so the first root run is the first moment
+# the old stamps are final.
+#
+# READ AS DATA FROM ANOTHER ACCOUNT, as install.sh reads the watchdog's:
+# a regular file of its own, bounded, one line, carried only when it is
+# exactly a build name (seven hex) and never printed otherwise. That
+# account could plant a name here; it is the account that ran this
+# converge, and so wrote this stamp, until this run. ONCE: the marker
+# records that the carry ran, and nothing reads that home again. Not
+# carried: a per-instance quarantine (`last-failed.<ns>`) — lost, the
+# instance's next roll is retried, which is what removing it by hand did
+# — a request a `converge` left in the old inbox, and the old alert spool
+# (the converge's unit names a new one; the journal has every alert).
+carry_converge_state() {
+    local old="${BOSS_FORGE_LEGACY_STATE_HOME:-/home/david}" name file val unread carried=""
+    [ ! -e "$CONVERGE_STATE/.carried" ] || return 0
+    install -d -m 0700 -- "$CONVERGE_STATE" || return 0
+    while IFS=: read -r name file; do
+        [ ! -e "$CONVERGE_STATE/$name" ] || continue
+        { [ -f "$old/$file" ] && [ ! -L "$old/$file" ]; } || continue
+        unread=""
+        val="$(timeout 5 head -c 64 -- "$old/$file" 2>/dev/null | awk 'NR == 1')" || unread=1
+        if [ -z "$unread" ] && [[ "$val" =~ ^[0-9a-f]{7}$ ]]; then
+            printf '%s\n' "$val" > "$CONVERGE_STATE/$name" && carried="$carried $name"
+        else
+            echo "cluster-deploy-runner: $old/$file does not hold a build name — not carried (and not printed)" >&2
+        fi
+    done <<'CARRY'
+last-built:.boss-last-built
+last-failed:.boss-last-failed
+last-build-failed:.boss-last-build-failed
+CARRY
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$CONVERGE_STATE/.carried"
+    echo "cluster-deploy-runner: the converge's state moved to $CONVERGE_STATE; carried from $old:${carried:- nothing (no stamp stood there)}"
+    run_summary_field converge_state "moved to $CONVERGE_STATE; carried:${carried:- nothing}"
 }

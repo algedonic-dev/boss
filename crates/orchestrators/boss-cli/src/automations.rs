@@ -134,11 +134,11 @@ pub async fn dispatch(cmd: Cmd, end: DateTime<Utc>) -> Result<()> {
     if hours == 0 {
         bail!("--hours 0 reads no window; name at least one hour");
     }
-    let jobs = crate::gate::resolve_jobs_base(None)?;
+    let jobs = crate::sor_client::resolve_jobs_base(None)?;
     let jobs = jobs.trim_end_matches('/').to_string();
     let events =
         crate::events::events_base_from(std::env::var(crate::events::EVENTS_ENV).ok(), &jobs);
-    let client = crate::gate::machine_client()?;
+    let client = crate::sor_client::machine_client()?;
     let user = crate::identity::header(&crate::identity::reader());
 
     let url = format!("{jobs}/api/agents/automations");

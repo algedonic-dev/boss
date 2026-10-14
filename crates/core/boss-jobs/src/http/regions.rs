@@ -148,8 +148,19 @@ pub(super) struct MapRows {
     /// exists to show, and it outlives every window. `None` on a failed
     /// read — a troubled region, never a mirror that reads as current.
     publish_packets: Option<Vec<(Job, Vec<Step>)>>,
+    /// Whether `agent_runs` holds every OPEN run rather than a page cut
+    /// at [`MAX_LIMIT`]: the top board reads a missing open run as a
+    /// claim with no run, so it judges only a whole read (backlog
+    /// 8e9d3723). The closed tail beside them is read apart and does
+    /// not cut them (backlog e2519eca).
+    agent_runs_whole: bool,
     /// The bound those runs are read against, from the agents registry.
     run_capacity: Option<usize>,
+    /// Every id an agent acts as — the agents registry's ids and their
+    /// aliases (backlog 8e9d3723): the top board judges a claimed
+    /// step's run only where an agent holds it. `None` when the registry
+    /// is unwired or unread.
+    agent_ids: Option<std::collections::BTreeSet<String>>,
     /// THE DOCK'S ORDERING EDGES (backlog 4142d821): each predecessor a
     /// parked car declares, read by id the way the conductor reads it —
     /// found, absent, or unreadable, one reading per id.
@@ -180,15 +191,38 @@ pub(super) struct MapRows {
 
 impl MapRows {
     /// The top board's first row, over this pass's own rows: the
-    /// outranking packets, and the stations the marshalling region was
-    /// judged on for where each stands.
+    /// outranking packets, the stations the marshalling region was
+    /// judged on for where each stands, and the shop floor's open runs
+    /// for whether a claimed step is being worked (backlog 8e9d3723).
+    ///
+    /// The runs are handed over only when they were read whole AND by a
+    /// caller who reads every packet: a run outside a narrowed scope, or
+    /// past a cut page, would read as a claim with no run — a confident
+    /// wrong "stalled". Otherwise every active step says the runs were
+    /// unread. The agents registry is not scoped by packet, so it rides
+    /// whenever it was read: it is what says whether a ready step with
+    /// no agent block is held by a person (backlog e2519eca).
     pub(super) fn outranks(
         &self,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Option<Vec<crate::outranks::Outrank>> {
-        self.outranking
-            .as_deref()
-            .map(|packets| crate::outranks::outranks(packets, self.stations.as_deref(), now))
+        // The closed runs the floor's trend reads ride along; the board
+        // reads only the open ones.
+        let runs = match self.agent_runs.as_deref() {
+            Some(open) if self.agent_runs_whole && self.reads_every_packet => {
+                Some(crate::outranks::Runs { open })
+            }
+            _ => None,
+        };
+        self.outranking.as_deref().map(|packets| {
+            crate::outranks::outranks(
+                packets,
+                self.stations.as_deref(),
+                runs,
+                self.agent_ids.as_ref(),
+                now,
+            )
+        })
     }
 
     /// The rows as the pure aggregations take them.
@@ -253,9 +287,11 @@ pub(super) async fn read_map<R: JobsRepository + 'static, B: EventBus + 'static>
             ops_requests: Some(Vec::new()),
             runner_hosts: Some(Vec::new()),
             agent_runs: Some(Vec::new()),
+            agent_runs_whole: true,
             sessions: Some(Vec::new()),
             publish_packets: Some(Vec::new()),
             run_capacity: None,
+            agent_ids: None,
             predecessors: Vec::new(),
             outranking: Some(Vec::new()),
             reads_no_packets: true,
@@ -537,7 +573,10 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
     // and the bound the agents registry declares. Each read answers
     // `None` on failure — the region then says it could not be read,
     // rather than drawing a shop with nobody in it.
-    let agent_runs = read_agent_runs(state, scope.clone(), reach).await;
+    let (agent_runs, agent_runs_whole) = match read_agent_runs(state, scope.clone(), reach).await {
+        Some((rows, whole)) => (Some(rows), whole),
+        None => (None, false),
+    };
     let sessions = state
         .jobs
         .list_jobs(
@@ -555,16 +594,18 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
         .map(|(rows, _)| rows);
     // A registry that could not be read and one that declares no cap
     // are the same drawing — no bound on the card — and neither is a
-    // number the map would have to invent.
-    let run_capacity = match state.agent_budget.as_ref() {
-        Some(door) => door
-            .agents
-            .list()
-            .await
-            .ok()
-            .and_then(|rows| regions::run_capacity(&rows)),
+    // number the map would have to invent. The same rows say which
+    // holders are agents, for the top board (backlog 8e9d3723).
+    let agent_rows = match state.agent_budget.as_ref() {
+        Some(door) => door.agents.list().await.ok(),
         None => None,
     };
+    let run_capacity = agent_rows.as_deref().and_then(regions::run_capacity);
+    let agent_ids = agent_rows.map(|rows| {
+        rows.into_iter()
+            .flat_map(|r| std::iter::once(r.id).chain(r.aliases))
+            .collect::<std::collections::BTreeSet<String>>()
+    });
 
     // THE PUBLISH REGION (design cb38d806): the newest publish packets,
     // with steps. No `closed_since` — a pull request nobody merged is
@@ -575,7 +616,7 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
 
     // WHAT OUTRANKS REGULAR ORDER (backlog 74569e94): narrowed in the
     // query, one priority at a time, every page of each.
-    let outranking = read_outranking(state, scope.clone(), open_packets.as_deref()).await;
+    let outranking = read_outranking(state, scope.clone(), open_packets.as_deref(), &active).await;
 
     Ok(MapRows {
         read,
@@ -587,9 +628,11 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
         ops_requests,
         runner_hosts,
         agent_runs,
+        agent_runs_whole,
         sessions,
         publish_packets,
         run_capacity,
+        agent_ids,
         predecessors,
         outranking,
         reads_no_packets: matches!(scope, crate::port::JobScope::None),
@@ -607,12 +650,15 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
 /// would be a floor that does not say it is one. Real partition only: a
 /// simulated emergency is the sim's work, not the operator's. The steps
 /// come from `open`, the pass's resolved open packets, where that page
-/// carried the packet; a packet past it is read on its own. `None` on
-/// any failed read.
+/// carried the packet; a packet past it is read on its own and resolved
+/// against `active` the way that pass resolves its own, so whether a
+/// ready step carries an agent block (backlog e2519eca) is one answer
+/// whichever read carried it. `None` on any failed read.
 async fn read_outranking<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
     scope: crate::port::JobScope,
     open: Option<&[(Job, Vec<Step>)]>,
+    active: &std::collections::BTreeMap<String, crate::registry::WorkflowSpec>,
 ) -> Option<Vec<(Job, Vec<Step>)>> {
     let steps_of: std::collections::HashMap<String, &Vec<Step>> = open
         .into_iter()
@@ -631,7 +677,10 @@ async fn read_outranking<R: JobsRepository + 'static, B: EventBus + 'static>(
         for job in list_every(state, &filter).await.ok()? {
             let steps = match steps_of.get(&job.id.to_string()) {
                 Some(steps) => (*steps).clone(),
-                None => state.jobs.list_steps(&job.id).await.ok()?,
+                None => crate::agent_spec::resolved_steps(
+                    &state.jobs.list_steps(&job.id).await.ok()?,
+                    active.get(&job.kind),
+                ),
             };
             out.push((job, steps));
         }
@@ -834,30 +883,60 @@ async fn read_inbound<R: JobsRepository + 'static, B: EventBus + 'static>(
 /// finished without reporting is a `building` done over a `reported`
 /// still open), plus the ones that closed within reach as rows — the
 /// trend reads its two instants off the metadata. `None` on any failed
-/// read: an unread floor is troubled, never empty.
+/// read: an unread floor is troubled, never empty. Beside the rows,
+/// whether the OPEN runs are every one the filter matched — the top
+/// board must not read a run past a cut page as no run at all (backlog
+/// 8e9d3723).
+///
+/// TWO READS, EACH WITH ITS OWN TOTAL (backlog e2519eca item 4). The
+/// open runs and the departed ones were one page of [`TAIL_WINDOW`],
+/// so two busy days of FINISHED runs cut the page and every claim on
+/// the board read unread — measured 2026-10-10 05:10Z at 9 open and 288
+/// closed within reach, 297 of the 400. The open runs are bounded by
+/// the agents registry's cap, so a page of [`MAX_LIMIT`] holds them;
+/// the departed tail, which only the trend reads, keeps its window.
 async fn read_agent_runs<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
     scope: crate::port::JobScope,
     reach: chrono::NaiveDate,
-) -> Option<Vec<(Job, Vec<Step>)>> {
-    let filter = JobFilter {
+) -> Option<(Vec<(Job, Vec<Step>)>, bool)> {
+    let (mut out, whole) = read_open_runs(state, scope.clone()).await?;
+    let departed = JobFilter {
+        kind: Some(crate::agent_budget::RUN_KIND.to_string()),
+        scope,
+        terminal: Some(true),
+        closed_since: Some(reach),
+        ..Default::default()
+    };
+    let (closed, _) = state.jobs.list_jobs(&departed, TAIL_WINDOW, 0).await.ok()?;
+    out.extend(closed.into_iter().map(|job| (job, Vec::new())));
+    Some((out, whole))
+}
+
+/// The OPEN `agent-run` packets with their steps, and whether the page
+/// held every one the filter matched — the half of the shop floor a
+/// claim's run is judged on ([`crate::outranks::claim_run`]). The top
+/// board reads it here and the caller's own queue (`assignments?for=me`,
+/// backlog e2519eca item 2) reads it through the same function, so both
+/// judge a claim over one read. `None` on any failed read.
+pub(super) async fn read_open_runs<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &JobsApiState<R, B>,
+    scope: crate::port::JobScope,
+) -> Option<(Vec<(Job, Vec<Step>)>, bool)> {
+    let open = JobFilter {
         kind: Some(crate::agent_budget::RUN_KIND.to_string()),
         status: Some(JobStatus::Open),
-        closed_since: Some(reach),
         scope,
         ..Default::default()
     };
-    let (rows, _) = state.jobs.list_jobs(&filter, TAIL_WINDOW, 0).await.ok()?;
+    let (rows, total) = state.jobs.list_jobs(&open, MAX_LIMIT, 0).await.ok()?;
+    let whole = usize::try_from(total).is_ok_and(|t| t <= rows.len());
     let mut out = Vec::with_capacity(rows.len());
     for job in rows {
-        let steps = if job.status == JobStatus::Open {
-            state.jobs.list_steps(&job.id).await.ok()?
-        } else {
-            Vec::new()
-        };
+        let steps = state.jobs.list_steps(&job.id).await.ok()?;
         out.push((job, steps));
     }
-    Some(out)
+    Some((out, whole))
 }
 
 /// The empty pass: every read answered, nothing in it.

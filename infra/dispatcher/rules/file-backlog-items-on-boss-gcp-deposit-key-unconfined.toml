@@ -1,0 +1,55 @@
+# A deposit key on boss-gcp that reaches more than its receiver is
+# judged off the converge's own record (backlog dea2236f; review
+# 1fa0d093 of car 3cd92f7a, B2).
+#
+# boss-gcp-converge.service runs infra/gcp/audit-deposit-keys.sh over
+# the deposit account's authorized_keys every half hour. A finding — a
+# receiver line without `restrict`, one that re-opens what `restrict`
+# closed, a forced command that names a root door but runs more than it,
+# or the deposit key ALSO on a bare line (the first live enrolment's
+# shape, packet 96a0f7bb) — is the account's file, not the converge's
+# work, so the tick still exits 0 and its `run` step records
+# `deposit_key_verdict = "unconfined"` and one line per finding in
+# `output`:
+#   RED boss-gcp-converge/deposit-key-unconfined refused: <the finding,
+#   naming the file:line to remove>
+# The tick used to red instead, and review 1fa0d093 measured what that
+# cost: result=exit-code on the run step reads as "not converged" to
+# landing.rs for every infra-channel car, and as "did not move" to
+# check-publish-drift-on-boss-gcp-converge-moved, so a finding standing
+# in David's file stalled the yard and dropped a drift check.
+#
+# ON THE STEP, NOT THE CLOSE. `jobs.job.closed` carries no step
+# metadata, so a rule there could not tell a finding tick from the 47
+# clean ones a day and would judge every one; `step.done.task` carries
+# the run step's metadata, so this fires only on a tick that found
+# something. The chore judge reads the packet from `job_id` when the
+# marker is a step's (chore_file_reds.rs).
+#
+# ONE ITEM WHILE IT IS OPEN. The judge dedups by route, so a finding
+# that stands for days is one backlog-item, and a closed item files
+# again, because a recurrence after a fix is a new fact. An UNVERIFIED
+# audit (a file it could not read, a NUL byte, the 60 s bound) files
+# nothing: it reads `unverified` on the packet, never `unconfined`.
+[[rule]]
+name = "file-backlog-items-on-boss-gcp-deposit-key-unconfined"
+why = """
+A CROSS-PROTOCOL REACTOR: maintenance-boss-gcp-converge -> backlog-item,
+which no single Workflow consequence can express — the converge's
+protocol records its own run but cannot open another kind's packet.
+Measured by review 1fa0d093 of car 3cd92f7a (B2): the alternative, a
+tick that exits non-zero on a finding, made landing.rs read every
+infra-channel car as still converging and starved the publish-drift
+rule of the moved tick it fires on, for as long as the finding stood. No
+authority widened: the handler is the chore judge
+(maintenance.chore.file_reds) the forge converge and the machine token
+push already use, its only writes are standard backlog-items owned by
+the platform owner and one `judged` note on the converge's own packet,
+and the dedup key is the route the converge prints. Nothing on the host
+is touched: removing a line from authorized_keys stays David's hand act.
+"""
+on_event = "step.done.task"
+when = 'workflow_kind = "maintenance-boss-gcp-converge" AND spec_slug = "run" AND metadata.deposit_key_verdict = "unconfined"'
+[[rule.do]]
+handler = "maintenance.chore.file_reds"
+args = { step = "\"run\"", design = "\"bdc60b65\"", area = "\"credentials\"" }

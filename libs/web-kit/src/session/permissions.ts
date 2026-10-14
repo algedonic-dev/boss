@@ -30,7 +30,7 @@ export type Role = string;
 export type RouteName =
   | 'shop' | 'exec' | 'catalog' | 'accounts' | 'assets' | 'sales' | 'service'
   | 'parts' | 'products' | 'finance' | 'people' | 'qa' | 'warehouse' | 'support'
-  | 'system-monitoring' | 'inbox' | 'shipping' | 'views'
+  | 'system-monitoring' | 'inbox' | 'shipping'
   | 'vendors' | 'marketing-assets' | 'schedule' | 'jobs'
   // Platform-administration surfaces. Same `permKey: 'it'` gate
   // as the legacy ADMIN footer; these route names exist so a role's
@@ -98,10 +98,6 @@ export function declaredSurfaces(row: RoleRow | undefined): ReadonlyArray<string
 export function canSeeRoute(role: Role, route: RouteName, row?: RoleRow): boolean {
   void role;
   if (route === 'shop' || route === 'inbox' || route === 'workflows' || route === 'system-experiments') return true;
-  // Views are personal by construction — everyone has their own, so
-  // there is nothing to gate. What a View can READ is still policed
-  // by the endpoints it reads through.
-  if (route === 'views') return true;
   // 'system-feedback' was an always-on route here until car N3 of
   // design e765b3fc (2026-09-25): the feedback board is the receiving
   // station's panel on the Department Map now, which `system-yard` gates.

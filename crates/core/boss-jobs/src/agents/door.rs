@@ -35,7 +35,10 @@
 //! they are, the session that coordinates the estate cannot read a
 //! packet. The rows are the operator's to change, and they change
 //! FIRST; then the word. Its way back is the word, over the LAN kube
-//! road, which needs neither a train nor the jobs API.
+//! road, which needs neither a train nor the jobs API. They did, in that
+//! order: David set both rows to `platform-admin` on 2026-10-09 (read
+//! back at 03:28Z), and the manifest's `boss-machine-gate` ConfigMap has
+//! said `agent-role: enforce` since that day's car.
 //!
 //! WHAT THIS DOES NOT CLOSE. The id is still asserted: a caller that
 //! signs `emp-david` or `automation:dispatcher` is not an agent here

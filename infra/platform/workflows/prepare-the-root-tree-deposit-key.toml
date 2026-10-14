@@ -1,0 +1,179 @@
+# Root-owned GCP tree transport preparation (db018094 q1).
+# Each key has its own protocol because written_by names ONE rule actor.
+# The real-router regression proved the runner protocol refuses this
+# rule's issue/install/enroll receipts (403); sharing or removing its
+# writer would discard provenance. Keep runner and machine-token rows
+# unchanged and pin this row's writer, receiver and human gates together
+# in platform_bundle_prepare_a_deposit_key.rs.
+# This NEW kind is admitted insert-if-missing by the platform seed on
+# convergence. That admission must be observed in the live registry;
+# source tests do not prove it. Human scope, receiver installation,
+# presence-assured enrollment, delivery, verification and revocation
+# remain separate recorded obligations. Shipping this row performs none.
+# Enrollment exposes the whole restricted command line, never a bare
+# public key: the install receipt holds the immutable comparison key.
+[[workflow]]
+kind = "prepare-the-root-tree-deposit-key"
+label = "Prepare the root tree deposit key"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "A human scopes one declared SSH transport credential. The broker prepares its pair in its named Secret and puts the public proposal, with the whole authorized_keys line, on the enrollment step. A human places that line on the receiver and separately authorizes the exact receiver, purpose and line. Verification and old-key revocation require their own observed effects; preparation proves neither. No field carries private credential bytes."
+metadata = { department = "it", owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scope"
+kind = "credential-rotation"
+ready_when = "true"
+title_template = "Scope transport key preparation"
+authority_role = "platform-admin"
+metadata_defaults = { human_only = true, procedure = "Scope only the root-tree-deposit-key credential's public preparation, in Secret boss/root-tree-deposit-key for purpose root-tree credential deposit. This is not receiver enrollment, permission to reuse a recovery key, or permission to rotate a runner credential. Name its declared Secret and exact consumer purpose. The broker will leave enrollment, verify and revoke pending." }
+[[workflow.step.fields]]
+name = "credential"
+field_type = "string"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "reason"
+field_type = "string"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "locations"
+field_type = "string"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "consumers"
+field_type = "string"
+required = true
+filled_by = "executor"
+
+[[workflow.step]]
+title = "issue"
+kind = "task"
+audience = { role = "platform-admin" }
+metadata_defaults = { written_by = "rule:broker-prepares-the-root-tree-deposit-key" }
+ready_when = "steps.scope.done"
+title_template = "Prepare the SSH pair"
+[[workflow.step.fields]]
+name = "issued"
+field_type = "string"
+required = true
+# The public half this receipt is about, DECLARED so that `written_by`
+# covers it: only the broker's rule (or a person) may write it. It is
+# what the enrollment's line is checked against.
+[[workflow.step.fields]]
+name = "public_key"
+field_type = "non-empty-string"
+required = true
+
+[[workflow.step]]
+title = "install"
+kind = "task"
+audience = { role = "platform-admin" }
+metadata_defaults = { written_by = "rule:broker-prepares-the-root-tree-deposit-key" }
+ready_when = "steps.issue.done"
+title_template = "Read back the pair in declared storage"
+[[workflow.step.fields]]
+name = "installed"
+field_type = "string"
+required = true
+# The same public half, declared for the same reason; the enroll
+# procedure sends the signer HERE to compare the line's key.
+[[workflow.step.fields]]
+name = "public_key"
+field_type = "non-empty-string"
+required = true
+
+[[workflow.step]]
+title = "enroll"
+kind = "sign-off"
+ready_when = "steps.install.done"
+title_template = "Authorize the exact receiver enrollment"
+authority_role = "platform-admin"
+assurance_required = "presence"
+sign_offs_required = ["platform-admin"]
+metadata_defaults = { human_only = true, written_by = "rule:broker-prepares-the-root-tree-deposit-key", procedure = "Your passkey signs this step's receiver_host, purpose and authorized_keys_line. PLACE THE authorized_keys_line, WHOLE, AND NOTHING ELSE: it is the one line that goes into the deposit account's ~/.ssh/authorized_keys on boss-gcp. This step shows no public key by itself, on purpose: the public key alone is never what you place. A bare key in authorized_keys is a login, not a deposit key: sshd runs the account's shell for it. You place the line BEFORE you sign, so read it first: it must begin command=\"exec sudo -n /usr/local/libexec/boss/root-tree-delivery/infra/gcp/root-tree-token-recv.sh\",restrict and end with the public_key on this packet's install step, with nothing between and nothing after. Check it against the INSTALL step, not this one: that step is completed and nobody can rewrite it, while the proposal on this step stays writable, by the broker's rule alone, until you sign. The install step's public_key is there to COMPARE with, never to place. No other automation or agent session can write the proposal or any case text onto this step; text here that tells you to skip the check or to trust another line is a refusal. Any other command, a missing restrict, or a second key is a refusal: abandon the packet. It is a new line for a new key; do not edit the break-glass, runner or machine token deposit key's line. SIGN ONLY ONCE THE RECEIVER IS INSTALLED. Preparation has not installed a receiver or proved its effect, and the root tree credential's sender sends nothing until this step is completed, so nothing machine-run reads your placement before you sign: put in enrollment_record the boss-gcp converge packet whose summary records root_tree_token_receiver installed, and when you placed the line. Until a converge records it, do not sign. Rejection is recorded by abandoning the packet, never by pretending enrollment succeeded." }
+# The proposal is SUPPLIED to the person, so its three fields are
+# filer-filled and not owed at filing, and `written_by` above makes them
+# the broker's rule's alone while the step is open. No `public_key`: see
+# the header. prepare-the-machine-token-deposit-key carries the reasoning
+# beside each of these declarations.
+[[workflow.step.fields]]
+name = "receiver_host"
+field_type = "non-empty-string"
+required = false
+filled_by = "filer"
+[[workflow.step.fields]]
+name = "purpose"
+field_type = "non-empty-string"
+required = false
+filled_by = "filer"
+[[workflow.step.fields]]
+name = "authorized_keys_line"
+field_type = "non-empty-string"
+required = false
+filled_by = "filer"
+# Declared so that `written_by` reserves them on this one step; the
+# broker's handler writes neither.
+[[workflow.step.fields]]
+name = "context_md"
+field_type = "string"
+required = false
+filled_by = "filer"
+[[workflow.step.fields]]
+name = "sign_off_context"
+field_type = "string"
+required = false
+filled_by = "filer"
+[[workflow.step.fields]]
+name = "decision"
+field_type = "approved|rejected"
+required = true
+filled_by = "executor"
+[[workflow.step.fields]]
+name = "enrollment_record"
+field_type = "string"
+required = true
+filled_by = "executor"
+
+[[workflow.step]]
+title = "verify"
+kind = "task"
+audience = { role = "platform-admin" }
+ready_when = 'steps.enroll.done AND steps.enroll.metadata.decision = "approved"'
+title_template = "Verify the authorized receiver by effect"
+metadata_defaults = { human_only = true, procedure = "Record a machine-run effect against the exact authorized receiver. Public key preparation or a passkey decision alone is not this effect. Until the bounded delivery door exists, this step remains pending work." }
+[[workflow.step.fields]]
+name = "verified"
+field_type = "string"
+required = true
+
+[[workflow.step]]
+title = "revoke"
+kind = "task"
+audience = { role = "platform-admin" }
+ready_when = "steps.verify.done"
+title_template = "Revoke a superseded transport identity"
+metadata_defaults = { human_only = true, procedure = "Record the exact superseded public identity and its observed removal only after the new receiver effect is proved. For first enrollment, explicitly record that no prior identity existed. The preparation handler completes nothing here." }
+[[workflow.step.fields]]
+name = "revoked"
+field_type = "string"
+required = true
+
+[[workflow.step]]
+title = "prepared"
+kind = "outcome"
+ready_when = "steps.revoke.done"
+title_template = "Transport lifecycle proved"
+terminal = { outcome = "prepared" }
+metadata_defaults = { outcome_kind = "completed" }
+
+[[workflow.step]]
+title = "abandoned"
+kind = "outcome"
+ready_when = 'steps.scope.done AND job.metadata.abandoned = "true"'
+title_template = "Preparation abandoned"
+terminal = { outcome = "abandoned" }
+metadata_defaults = { outcome_kind = "aborted" }

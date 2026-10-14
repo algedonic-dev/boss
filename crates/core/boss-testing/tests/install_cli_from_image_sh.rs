@@ -84,6 +84,385 @@ const SHA_C: &str = "cccccccc3333333333333333333333333333cccc";
 /// A sha the registry has no tag for.
 const SHA_D: &str = "dddddddd4444444444444444444444444444dddd";
 
+#[test]
+fn selected_manifest_descriptor_size_must_match_before_installing() {
+    let case = Case::with_image(
+        "selected-manifest-size",
+        Image {
+            control_config: true,
+            ..Image::default()
+        },
+    );
+    let path = case.fix.join("index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    index["manifests"][0]["size"] = 1.into();
+    std::fs::write(&path, index.to_string()).unwrap();
+    let (exit, output) = case.run(SHA_A, &[]);
+    assert_ne!(
+        exit, 0,
+        "digest-correct contradictory size must refuse: {output}"
+    );
+    assert!(output.contains("manifest size mismatch"), "{output}");
+    assert!(!case.store.join("current").exists());
+    assert!(!case.store.join(SHA_A).join("config.json").exists());
+    assert!(!case.dev_control().exists());
+}
+
+#[test]
+fn invalid_selected_manifest_sizes_preserve_a_warm_generation() {
+    for size in [
+        serde_json::Value::Null,
+        1.into(),
+        0.into(),
+        (-1).into(),
+        serde_json::json!(1.5),
+        serde_json::json!("100"),
+        1_048_577.into(),
+    ] {
+        let case = Case::with_image(
+            "invalid-manifest-size",
+            Image {
+                control_config: true,
+                ..Image::default()
+            },
+        );
+        assert_eq!(case.run(SHA_A, &[]).0, 0);
+        let generation = case.store.join(SHA_A);
+        std::fs::remove_file(generation.join("config.json")).unwrap();
+        std::fs::remove_file(generation.join("config-source.json")).unwrap();
+        let path = case.fix.join("index.json");
+        let original = std::fs::read_to_string(&path).unwrap();
+        let mut index: serde_json::Value = serde_json::from_str(&original).unwrap();
+        if size.is_null() {
+            index["manifests"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("size");
+        } else {
+            index["manifests"][0]["size"] = size.clone();
+        }
+        let failed_index = index.to_string();
+        std::fs::write(&path, &failed_index).unwrap();
+        case.clear_requests();
+        let (exit, output) = case.run(SHA_A, &[]);
+        assert_ne!(exit, 0, "invalid size {size} must refuse: {output}");
+        let contradiction = size == serde_json::json!(1);
+        let cause = if contradiction {
+            "manifest size mismatch"
+        } else {
+            "manifest descriptor invalid"
+        };
+        assert!(output.contains(cause), "{output}");
+        assert_eq!(
+            case.requests()
+                .iter()
+                .any(|url| url.contains("/manifests/sha256:")),
+            contradiction
+        );
+        assert!(!generation.join("config.json").exists());
+        assert_eq!(case.current().as_deref(), Some(SHA_A));
+        assert!(!case.dev_control().exists());
+        let retained = std::fs::read_dir(generation.join("control-manifests"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("worker_image/tag.json"))
+            .find(|path| std::fs::read_to_string(path).ok().as_deref() == Some(&failed_index))
+            .expect("failed index retained in its original attempt");
+        let manifest_path = retained.with_file_name("manifest.json");
+        let failed_manifest = std::fs::read(&manifest_path).ok();
+        assert_eq!(failed_manifest.is_some(), contradiction);
+        std::fs::write(&path, original).unwrap();
+        let (exit, output) = case.run(SHA_A, &[]);
+        assert_eq!(exit, 0, "valid descriptor recovery: {output}");
+        assert!(generation.join("config.json").exists());
+        assert_eq!(std::fs::read_to_string(retained).unwrap(), failed_index);
+        assert_eq!(std::fs::read(manifest_path).ok(), failed_manifest);
+    }
+}
+
+#[test]
+fn multiple_platform_documents_cannot_prepare_worker_images() {
+    let case = Case::with_image(
+        "multiple-platform-documents",
+        Image {
+            control_config: true,
+            multiple_platform_documents: true,
+            ..Image::default()
+        },
+    );
+    let (exit, output) = case.run(SHA_A, &[]);
+    assert_ne!(exit, 0, "conflicting platform stream must refuse: {output}");
+    assert!(output.contains("exactly one JSON object"), "{output}");
+    assert!(!case.store.join("current").exists());
+    assert!(!case.store.join(SHA_A).join("config.json").exists());
+    assert!(!case.dev_control().exists());
+}
+
+#[test]
+fn multiple_oci_documents_cannot_prepare_a_warm_generation() {
+    for boundary in ["manifest", "tag"] {
+        let case = Case::with_image(
+            boundary,
+            Image {
+                control_config: true,
+                ..Image::default()
+            },
+        );
+        assert_eq!(case.run(SHA_A, &[]).0, 0);
+        let generation = case.store.join(SHA_A);
+        std::fs::remove_file(generation.join("config.json")).unwrap();
+        std::fs::remove_file(generation.join("config-source.json")).unwrap();
+        let index_path = case.fix.join("index.json");
+        let original = std::fs::read_to_string(&index_path).unwrap();
+        if boundary == "tag" {
+            std::fs::write(&index_path, format!("{{}}\n{original}")).unwrap();
+        } else {
+            let mut index: serde_json::Value = serde_json::from_str(&original).unwrap();
+            let digest = index["manifests"][0]["digest"].as_str().unwrap();
+            let manifest =
+                std::fs::read_to_string(case.fix.join("manifests").join(digest)).unwrap();
+            let staged = case.root.join("multiple-manifest.json");
+            std::fs::write(&staged, format!("{{}}\n{manifest}")).unwrap();
+            let digest = sha256_of(&staged);
+            std::fs::copy(&staged, case.fix.join("manifests").join(&digest)).unwrap();
+            index["manifests"][0]["digest"] = digest.into();
+            index["manifests"][0]["size"] = std::fs::metadata(staged).unwrap().len().into();
+            std::fs::write(index_path, index.to_string()).unwrap();
+        }
+        let (exit, output) = case.run(SHA_A, &[]);
+        assert_ne!(
+            exit, 0,
+            "multiple {boundary} documents must refuse before preparing: {output}"
+        );
+        assert!(output.contains("exactly one JSON object"), "{output}");
+        assert!(!generation.join("config.json").exists());
+        assert_eq!(case.current().as_deref(), Some(SHA_A));
+        assert!(!case.dev_control().exists());
+    }
+}
+
+#[test]
+fn a_digest_verified_image_config_without_a_document_cannot_prepare_worker_images() {
+    let case = Case::with_image(
+        "empty-platform-config",
+        Image {
+            control_config: true,
+            empty_platform_document: true,
+            ..Image::default()
+        },
+    );
+    let (exit, output) = case.run(SHA_A, &[]);
+    assert_ne!(
+        exit, 0,
+        "digest/size verification does not prove a platform document exists: {output}"
+    );
+    assert!(!case.store.join("current").exists());
+    assert!(!case.store.join(SHA_A).join("config.json").exists());
+    assert!(!case.dev_control().exists());
+}
+
+#[test]
+fn group_readable_generation_configuration_is_refused_without_a_rewrite() {
+    use std::os::unix::fs::PermissionsExt;
+    let case = Case::with_image(
+        "unsafe-generation-config",
+        Image {
+            control_config: true,
+            ..Image::default()
+        },
+    );
+    assert_eq!(case.run(SHA_A, &[]).0, 0);
+    let path = case.store.join(SHA_A).join("config.json");
+    let original = std::fs::read(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    case.clear_requests();
+    let (exit, output) = case.run(SHA_A, &[]);
+    assert_ne!(exit, 0, "unsafe config must refuse: {output}");
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(case.requests().is_empty());
+    assert!(!case.dev_control().exists());
+}
+
+#[test]
+fn contradictory_blob_size_refuses_before_extraction_or_current_change() {
+    assert!(tools());
+    let case = Case::with_image(
+        "blob-size-contradiction",
+        Image {
+            wrong_blob_size: true,
+            ..Image::default()
+        },
+    );
+    let (exit, output) = case.run(SHA_A, &[]);
+    assert_ne!(
+        exit, 0,
+        "descriptor size disagreement must refuse before extraction: {output}"
+    );
+    assert!(!case.store.join("current").exists());
+    assert!(!case.store.join(SHA_A).exists());
+}
+
+#[test]
+fn installed_control_config_is_resolved_from_its_published_inputs_without_activation() {
+    assert!(tools(), "required installer fixture tools missing");
+    let case = Case::with_image(
+        "published-control-config",
+        Image {
+            control_config: true,
+            ..Image::default()
+        },
+    );
+    let (exit, output) = case.run(SHA_A, &[]);
+    assert_eq!(exit, 0, "{output}");
+    let path = case.store.join(SHA_A).join("config.json");
+    assert!(
+        path.is_file(),
+        "published generation must carry resolved config; {output}"
+    );
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        config["forge_url"],
+        "http://forge.invalid:3000/david/boss.git"
+    );
+    for field in ["worker_image", "postgres_image"] {
+        assert!(
+            config[field].as_str().unwrap().contains("@sha256:"),
+            "{field} must bind published immutable bytes"
+        );
+    }
+    assert!(
+        !case.dev_control().exists(),
+        "config preparation cannot activate global routing"
+    );
+    assert!(
+        case.requests()
+            .iter()
+            .any(|url| url.contains("david/boss-ci/manifests/rust1.96"))
+    );
+    assert!(
+        case.requests()
+            .iter()
+            .any(|url| url.contains("david/postgres/manifests/16"))
+    );
+}
+
+#[test]
+fn resolved_control_configuration_is_immutable_and_a_warm_missing_config_is_prepared() {
+    assert!(tools());
+    let case = Case::with_image(
+        "control-config-repeat",
+        Image {
+            control_config: true,
+            ..Image::default()
+        },
+    );
+    assert_eq!(case.run(SHA_A, &[]).0, 0);
+    let path = case.store.join(SHA_A).join("config.json");
+    let original = std::fs::read(&path).unwrap();
+    case.clear_requests();
+    assert_eq!(
+        case.run(SHA_A, &[("STUB_BAD_WORKER_MANIFEST", "1".into())])
+            .0,
+        0,
+        "retained config must not follow a moved tag"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(
+        case.requests().is_empty(),
+        "same generation verifies its immutable binding without network"
+    );
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_file(case.store.join(SHA_A).join("config-source.json")).unwrap();
+    assert_eq!(
+        case.run(SHA_A, &[]).0,
+        0,
+        "confirmed CLI is not proof that config was prepared"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(
+        case.requests()
+            .iter()
+            .any(|url| url.contains("david/boss-ci/manifests/rust1.96"))
+    );
+    std::fs::write(&path, b"{\"forge_url\":\"http://wrong.invalid/repo.git\"}").unwrap();
+    let (exit, text) = case.run(SHA_A, &[]);
+    assert_ne!(exit, 0);
+    assert!(text.contains("immutable controller configuration binding changed"));
+    assert_eq!(
+        std::fs::read_link(case.store.join("current")).unwrap(),
+        PathBuf::from(SHA_A)
+    );
+    assert!(!case.dev_control().exists());
+}
+
+#[test]
+fn a_failed_control_image_resolution_keeps_previous_current_and_full_originals() {
+    assert!(tools());
+    let previous = Case::new("control-config-previous");
+    assert_eq!(previous.run(SHA_B, &[]).0, 0);
+    let case = Case::with_image(
+        "control-config-refusal",
+        Image {
+            control_config: true,
+            ..Image::default()
+        },
+    );
+    let extra = [
+        (
+            "BOSS_CLI_STORE",
+            previous.store.to_string_lossy().into_owned(),
+        ),
+        (
+            "BOSS_CLI_LINK",
+            previous.link.to_string_lossy().into_owned(),
+        ),
+        (
+            "BOSS_DEV_CONTROL_STORE",
+            previous.dev_control().to_string_lossy().into_owned(),
+        ),
+        ("STUB_BAD_WORKER_MANIFEST", "1".into()),
+    ];
+    let (exit, output) = case.run(SHA_A, &extra);
+    assert_ne!(
+        exit, 0,
+        "corrupt worker manifest cannot prepare a generation"
+    );
+    assert!(output.contains("manifest digest mismatch"), "{output}");
+    assert_eq!(
+        std::fs::read_link(previous.store.join("current")).unwrap(),
+        PathBuf::from(SHA_B)
+    );
+    assert!(!previous.store.join(SHA_A).join("config.json").exists());
+    assert!(!previous.dev_control().exists());
+    let retained = previous
+        .store
+        .join(SHA_A)
+        .join("control-manifests/worker_image/manifest.json");
+    let retained = if retained.exists() {
+        retained
+    } else {
+        std::fs::read_dir(previous.store.join(SHA_A).join("control-manifests"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("worker_image/manifest.json")
+    };
+    let original = std::fs::read(&retained).unwrap();
+    assert!(
+        String::from_utf8_lossy(&original).ends_with("DISTINCTIVE-WORKER-MANIFEST-CORRUPTION\n")
+    );
+    let retry = &extra[..3];
+    let (exit, output) = case.run(SHA_A, retry);
+    assert_eq!(exit, 0, "{output}");
+    assert_eq!(
+        std::fs::read(&retained).unwrap(),
+        original,
+        "successful retry must conserve the failed native response"
+    );
+}
+
 fn has(tool: &str) -> bool {
     Command::new("sh")
         .args(["-c", &format!("command -v {tool} >/dev/null 2>&1")])
@@ -122,6 +501,10 @@ struct Image {
     bootstrap_link: bool,
     bootstrap_duplicate: bool,
     bootstrap_whiteout: bool,
+    control_config: bool,
+    wrong_blob_size: bool,
+    empty_platform_document: bool,
+    multiple_platform_documents: bool,
 }
 
 /// One fixture: a stub `curl` on PATH serving an OCI image from files,
@@ -176,10 +559,12 @@ impl Case {
             "published control artifact bytes",
         );
         base_members.push("opt/boss/dev-control.tar");
+        // The bootstrap records the argv it was run with and answers
+        // STUB_BOOTSTRAP_RC, so a re-activation case can read both.
         write_exec(
             &base.join("opt/boss/dev-control"),
             &format!(
-                "#!/bin/sh\ntouch '{}'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho 'stub bootstrap said DISTINCTIVE-BOOTSTRAP-OUTPUT'\nexit \"${{STUB_BOOTSTRAP_RC:-0}}\"\n",
                 root.join("bootstrap-executed").display()
             ),
         );
@@ -198,6 +583,48 @@ impl Case {
                 "#!/bin/sh\necho stub-boss-leaked-policy\n",
             );
             base_members.push("usr/local/bin/boss-leaked-policy");
+        }
+        if image.control_config {
+            let source = root.join("control-source");
+            create_dir(&source.join("infra/dev"));
+            create_dir(&source.join("infra/estate"));
+            write_file(
+                &source.join("infra/dev/control-files.txt"),
+                "infra/dev/control-artifact.py\ninfra/dev/control-images.json\ninfra/estate/estate.toml\n",
+            );
+            std::fs::copy(
+                repo_root().join("infra/dev/control-artifact.py"),
+                source.join("infra/dev/control-artifact.py"),
+            )
+            .unwrap();
+            write_file(
+                &source.join("infra/dev/control-images.json"),
+                r#"{"worker_image":{"repository":"david/boss-ci","tag":"rust1.96"},"postgres_image":{"repository":"david/postgres","tag":"16"},"forge_repository":"david/boss"}"#,
+            );
+            write_file(
+                &source.join("infra/estate/estate.toml"),
+                "forge_registry = \"registry.invalid:3000\"\nforge_url = \"http://forge.invalid:3000\"\n",
+            );
+            write_exec(&base.join("usr/local/bin/kubectl"), "#!/bin/sh\nexit 99\n");
+            let packed = Command::new("python3")
+                .arg(repo_root().join("infra/dev/control-artifact.py"))
+                .arg("pack")
+                .arg(&source)
+                .arg(base.join("usr/local/bin"))
+                .arg(base.join("opt/boss/dev-control.tar"))
+                .arg(SHA_A)
+                .output()
+                .unwrap();
+            assert!(
+                packed.status.success(),
+                "published fixture archive: {}",
+                text(&packed)
+            );
+            std::fs::copy(
+                repo_root().join("infra/dev/control-artifact.py"),
+                base.join("opt/boss/dev-control"),
+            )
+            .unwrap();
         }
         let base_blob = tar_gz(&base, &base_members, &fix);
         // Layer 1 (top): unrelated, or the whiteout that deletes the
@@ -220,12 +647,31 @@ impl Case {
         } else {
             GZIP
         };
+        let config_descriptor = if image.control_config {
+            let path = root.join("image-config.json");
+            write_file(
+                &path,
+                if image.empty_platform_document {
+                    " \n\t"
+                } else if image.multiple_platform_documents {
+                    "{\"architecture\":\"arm64\",\"os\":\"linux\"}\n{\"architecture\":\"amd64\",\"os\":\"linux\"}"
+                } else {
+                    r#"{"architecture":"amd64","os":"linux"}"#
+                },
+            );
+            let digest = sha256_of(&path);
+            let size = std::fs::metadata(&path).unwrap().len();
+            std::fs::copy(&path, fix.join("blobs").join(&digest)).unwrap();
+            serde_json::json!({"mediaType":"application/vnd.oci.image.config.v1+json","digest":digest,"size":size})
+        } else {
+            serde_json::json!({"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":2})
+        };
         let manifest = serde_json::json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "size": 2},
+            "config": config_descriptor,
             "layers": [
-                {"mediaType": GZIP, "digest": base_blob.0, "size": base_blob.1},
+                {"mediaType": GZIP, "digest": base_blob.0, "size": base_blob.1 + u64::from(image.wrong_blob_size)},
                 {"mediaType": top_type, "digest": top_blob.0, "size": top_blob.1},
             ]
         });
@@ -302,16 +748,20 @@ if [ "$auth" != "Authorization: Bearer stub-anonymous-pull-token" ]; then
   printf '{"errors":[{"code":"UNAUTHORIZED","message":"no bearer token (stub)"}]}' > "$out"; printf 401; exit 0
 fi
 case "$path" in
-  v2/david/boss/manifests/sha256:*)
+  v2/david/boss/manifests/sha256:*|v2/david/boss-ci/manifests/sha256:*|v2/david/postgres/manifests/sha256:*)
     d="${path##*/}"
-    if [ -f "$STUB_REGISTRY/manifests/$d" ]; then cp "$STUB_REGISTRY/manifests/$d" "$out"; printf 200; exit 0; fi ;;
-  v2/david/boss/manifests/*)
+    if [ -f "$STUB_REGISTRY/manifests/$d" ]; then
+      cp "$STUB_REGISTRY/manifests/$d" "$out"
+      if [ -n "${STUB_BAD_WORKER_MANIFEST:-}" ] && [[ "$path" = v2/david/boss-ci/* ]]; then echo DISTINCTIVE-WORKER-MANIFEST-CORRUPTION >> "$out"; fi
+      printf 200; exit 0
+    fi ;;
+  v2/david/boss/manifests/*|v2/david/boss-ci/manifests/*|v2/david/postgres/manifests/*)
     tag="${path##*/}"
-    if grep -qx -- "$tag" "$STUB_REGISTRY/tags"; then
+    if grep -qx -- "$tag" "$STUB_REGISTRY/tags" || [ "$tag" = rust1.96 ] || [ "$tag" = 16 ]; then
       printf 'HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\n\r\n' > "$hdr"
       cp "$STUB_REGISTRY/index.json" "$out"; printf 200; exit 0
     fi ;;
-  v2/david/boss/blobs/sha256:*)
+  v2/david/boss/blobs/sha256:*|v2/david/boss-ci/blobs/sha256:*|v2/david/postgres/blobs/sha256:*)
     d="${path##*/}"
     if [ -f "$STUB_REGISTRY/blobs/$d" ]; then
       [ -n "${STUB_BLOB_DELAY:-}" ] && sleep "$STUB_BLOB_DELAY"
@@ -360,10 +810,38 @@ printf 404; exit 0
             .env("BOSS_CLI_PLATFORM", "amd64/linux")
             .env("BOSS_CLI_STORE", &self.store)
             .env("BOSS_CLI_LINK", &self.link)
+            // Never the pod's real dev isolation store: a fixture
+            // bootstrap must not re-activate (or refuse) a live selector.
+            .env("BOSS_DEV_CONTROL_STORE", self.dev_control())
             .env("BOSS_RUN_SUMMARY_FILE", &self.summary);
         for (k, v) in extra {
             cmd.env(k, v);
         }
+    }
+
+    /// This fixture's dev isolation store (the pod's is /work/tools/dev-control).
+    fn dev_control(&self) -> PathBuf {
+        self.root.join("dev-control")
+    }
+
+    /// An activated store: the 0700 directory and a selector naming a
+    /// generation, the shape `dev-control activate` leaves.
+    fn activated(&self, sha: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let store = self.dev_control();
+        std::fs::create_dir_all(&store).unwrap();
+        // mode-bits-ok: a directory, never exec'd
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(store.join(".activation.lock"), "").unwrap();
+        // mode-bits-ok: activation lock, never exec'd
+        std::fs::set_permissions(
+            store.join(".activation.lock"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let selector = store.join("enabled");
+        std::os::unix::fs::symlink(store.join("generations").join(sha), &selector).unwrap();
+        selector
     }
 
     /// Every URL the stub curl was asked for, in order.
@@ -717,6 +1195,262 @@ fn malformed_or_deleted_control_bootstrap_is_never_installed_or_executed() {
             "{name}: {out}"
         );
         assert!(!c.root.join("bootstrap-executed").exists(), "{name}: {out}");
+    }
+}
+
+// ---------------------------------------------------------------------
+// DEV ISOLATION FOLLOWS MAIN (design a68fc42a D6 and D1, David
+// 2026-10-10; backlog b3071bf4). The store and selector live on the
+// /work PVC, and each verified install re-activates through the NEW
+// generation's own bootstrap — but ONLY where a selector already
+// exists: activating is the operator's act. A re-activation that fails
+// leaves a REFUSED selector, so the doors refuse candidate execution
+// rather than run it beside the token.
+// ---------------------------------------------------------------------
+
+#[test]
+fn with_no_selector_an_install_never_runs_the_bootstrap() {
+    assert!(tools(), "dev isolation controls require fixture tools");
+    let c = Case::new("dev-control-inert");
+    std::fs::create_dir_all(c.dev_control()).unwrap();
+    let (rc, out) = c.run(SHA_A, &[]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        !c.root.join("bootstrap-executed").exists(),
+        "no selector, no activation: {out}"
+    );
+    assert!(
+        !c.dev_control().join("enabled").exists()
+            && std::fs::symlink_metadata(c.dev_control().join("enabled")).is_err(),
+        "an install never creates a selector: {out}"
+    );
+    assert!(
+        c.summary("cli_dev_control_activation").starts_with("inert"),
+        "{}",
+        c.summary("cli_dev_control_activation")
+    );
+}
+
+#[test]
+fn a_selector_makes_each_verified_install_re_activate_through_the_new_bootstrap() {
+    assert!(tools(), "dev isolation controls require fixture tools");
+    let c = Case::new("dev-control-follow");
+    let selector = c.activated(SHA_A);
+    let (rc, out) = c.run(SHA_B, &[]);
+    assert_eq!(rc, 0, "{out}");
+    let argv = std::fs::read_to_string(c.root.join("bootstrap-executed"))
+        .unwrap_or_else(|_| panic!("the new generation's bootstrap ran: {out}"));
+    let argv: Vec<&str> = argv.lines().collect();
+    assert_eq!(
+        argv,
+        [
+            "activate",
+            SHA_B,
+            "--cli-store",
+            &c.store.display().to_string(),
+            "--store",
+            &c.dev_control().display().to_string(),
+            "--reactivate"
+        ],
+        "{out}"
+    );
+    assert_eq!(
+        c.summary("cli_dev_control_activation"),
+        format!("re-activated at {SHA_B}"),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read_link(&selector).unwrap(),
+        c.dev_control().join("generations").join(SHA_A),
+        "the installer itself never writes a generation into the selector"
+    );
+    let log = std::fs::read_to_string(c.dev_control().join("activation.log")).unwrap();
+    assert!(
+        log.contains(SHA_B) && log.contains("DISTINCTIVE-BOOTSTRAP-OUTPUT"),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_failed_re_activation_refuses_the_selector_and_still_installs_the_cli() {
+    assert!(tools(), "dev isolation controls require fixture tools");
+    for (name, image, extra) in [
+        (
+            "dev-control-refused",
+            Image::default(),
+            vec![("STUB_BOOTSTRAP_RC", "3".to_string())],
+        ),
+        (
+            "dev-control-no-bootstrap",
+            Image {
+                bootstrap_whiteout: true,
+                ..Default::default()
+            },
+            vec![],
+        ),
+    ] {
+        let c = Case::with_image(name, image);
+        let selector = c.activated(SHA_A);
+        let (rc, out) = c.run(SHA_B, &extra);
+        assert_eq!(rc, 0, "{name}: the CLI is still the tree's: {out}");
+        assert_eq!(c.current().as_deref(), Some(SHA_B), "{name}: {out}");
+        assert_eq!(
+            std::fs::read_link(&selector).unwrap(),
+            Path::new("refused"),
+            "{name}: a selector that could not be re-established is REFUSED, never left exposed: {out}"
+        );
+        let verdict = c.summary("cli_dev_control_activation");
+        assert!(verdict.starts_with("REFUSED"), "{name}: {verdict}");
+        let log = std::fs::read_to_string(c.dev_control().join("activation.log")).unwrap();
+        assert!(
+            log.contains("REFUSED") && log.contains(SHA_B),
+            "{name}: {log}"
+        );
+        assert!(
+            out.contains("REFUSED") && out.contains("activation.log"),
+            "{name}: the refusal is loud where the pass is read: {out}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_installer_waits_for_rollback_and_never_recreates_its_selector() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let c = Case::new("dev-control-rollback-race");
+    let selector = c.activated(SHA_A);
+    let mut lock = Command::new("flock")
+        .arg(c.dev_control().join(".activation.lock"))
+        .args(["sh", "-c", "printf locked; read release"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut locked = [0; 6];
+    std::io::Read::read_exact(lock.stdout.as_mut().unwrap(), &mut locked).unwrap();
+    assert_eq!(&locked, b"locked");
+    let mut command = Command::new("bash");
+    command.arg(repo_root().join(SCRIPT)).arg(SHA_B);
+    c.env(&mut command, &[("STUB_BOOTSTRAP_RC", "3".to_string())]);
+    let mut install = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The complete suite pulls many fixture images concurrently; this
+    // is a setup bound, not the barrier or an ordering assumption.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !c.root.join("bootstrap-executed").exists() {
+        assert!(Instant::now() < deadline, "fixture bootstrap did not run");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let still_waiting = install.try_wait().unwrap().is_none();
+    // The operator's completed off transition, under the SAME lock.
+    std::fs::write(c.dev_control().join("off.json"), "{\"state\":\"off\"}").unwrap();
+    // mode-bits-ok: a controller record, never exec'd
+    std::fs::set_permissions(
+        c.dev_control().join("off.json"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    std::fs::remove_file(&selector).unwrap();
+    boss_testing::feed_stdin(&mut lock, b"release\n");
+    assert!(lock.wait().unwrap().success());
+    let out = install.wait_with_output().unwrap();
+    assert!(
+        still_waiting,
+        "installer wrote refusal without the activation lock: {}",
+        text(&out)
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        std::fs::symlink_metadata(&selector).is_err(),
+        "failed installer undid rollback: {}",
+        text(&out)
+    );
+    assert!(
+        c.summary("cli_dev_control_activation").starts_with("off:"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn invalid_off_documents_never_bypass_installer_refusal() {
+    assert!(tools());
+    for bootstrap_rc in ["0", "3"] {
+        for (name, raw) in [
+            ("empty", ""),
+            ("whitespace", " \n\t"),
+            ("malformed", "{"),
+            ("null", "null"),
+            ("wrong-state", "{\"state\":\"on\"}"),
+            ("extra-field", "{\"state\":\"off\",\"extra\":true}"),
+            ("multiple", "{\"state\":\"on\"} {\"state\":\"off\"}"),
+            ("linked", "{\"state\":\"off\"}"),
+            ("unsafe-mode", "{\"state\":\"off\"}"),
+        ] {
+            let c = Case::new(&format!("invalid-off-{name}"));
+            let selector = c.activated(SHA_A);
+            let off = c.dev_control().join("off.json");
+            if name == "linked" {
+                let target = c.root.join("linked-off.json");
+                std::fs::write(&target, raw).unwrap();
+                std::os::unix::fs::symlink(target, &off).unwrap();
+            } else {
+                std::fs::write(&off, raw).unwrap();
+                // mode-bits-ok: a controller record, never exec'd
+                std::fs::set_permissions(
+                    &off,
+                    std::os::unix::fs::PermissionsExt::from_mode(if name == "unsafe-mode" {
+                        0o644
+                    } else {
+                        0o600
+                    }),
+                )
+                .unwrap();
+            }
+            let (rc, out) = c.run(SHA_B, &[("STUB_BOOTSTRAP_RC", bootstrap_rc.to_string())]);
+            assert_eq!(rc, 0, "the CLI itself is confirmed: {out}");
+            assert_eq!(
+                std::fs::read_link(&selector).unwrap(),
+                Path::new("refused"),
+                "{name}: {out}"
+            );
+            assert!(
+                c.summary("cli_dev_control_activation")
+                    .starts_with("REFUSED"),
+                "{name}: {out}"
+            );
+            assert!(!out.contains("off: rollback completed"), "{name}: {out}");
+        }
+    }
+}
+
+#[test]
+fn an_interrupted_valid_off_finishes_removing_the_installer_selector() {
+    assert!(tools());
+    for bootstrap_rc in ["0", "3"] {
+        let c = Case::new("interrupted-off");
+        let selector = c.activated(SHA_A);
+        std::fs::write(c.dev_control().join("off.json"), "{\"state\":\"off\"}").unwrap();
+        // mode-bits-ok: a controller record, never exec'd
+        std::fs::set_permissions(
+            c.dev_control().join("off.json"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let (rc, out) = c.run(SHA_B, &[("STUB_BOOTSTRAP_RC", bootstrap_rc.to_string())]);
+        assert_eq!(rc, 0, "{out}");
+        assert!(
+            std::fs::symlink_metadata(selector).is_err(),
+            "off was acknowledged while a selector remained: {out}"
+        );
+        assert!(
+            c.summary("cli_dev_control_activation").starts_with("off:"),
+            "{out}"
+        );
     }
 }
 

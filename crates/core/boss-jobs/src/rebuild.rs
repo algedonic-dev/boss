@@ -33,7 +33,7 @@
 
 use boss_core::job::{Job, SignOffStamp, Step};
 use boss_core::partition::Partition;
-use boss_events::replay::{Applied, replay_projection};
+use boss_events::replay::{Applied, replay_projection_checked};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::warn;
@@ -179,13 +179,63 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
     // Steps cascade on jobs deletion (FK ON DELETE CASCADE), but we
     // delete steps first to make the order explicit and to make the
     // rebuild work even if the cascade is ever loosened.
-    let stats = replay_projection(
+    let conserved = std::sync::Mutex::new(std::collections::HashMap::new());
+    let stats = replay_projection_checked(
         pool,
         REBUILD_LOCK_KEY,
-        &["DELETE FROM steps", "DELETE FROM jobs"],
-        "kind LIKE 'jobs.job.%' OR kind LIKE 'jobs.step.%'",
+        &["DELETE FROM station_claim_receipts", "DELETE FROM steps", "DELETE FROM jobs"],
+        "kind LIKE 'jobs.job.%' OR kind LIKE 'jobs.step.%' OR kind IN ('jobs.station.claimed', 'jobs.station.selection_evidence')",
+        async |_, events| {
+            let artifacts = crate::selection_evidence::reconstruct(events).map_err(|error| error.to_string())?;
+            *conserved.lock().map_err(|_| "selection evidence unavailable")? = artifacts.into_iter()
+                .filter(|event| event.payload.get("receipt_manifest").is_some())
+                .map(|event| event.payload["receipt_json"].as_str()
+                    .map(|text|(event.event_id,text.to_owned())).ok_or_else(||"reconstructed selection artifact missing".to_owned()))
+                .collect::<Result<std::collections::HashMap<_, _>,String>>()?;
+            Ok(())
+        },
         async |conn, ev| {
             match ev.kind.as_str() {
+                crate::events::STATION_CLAIMED => {
+                    let receipt_json = if ev.payload.get("receipt_manifest").is_some() {
+                        conserved.lock().map_err(|_| "selection evidence unavailable")?.get(&ev.event_id).cloned()
+                    } else { ev.payload.get("receipt_json").and_then(serde_json::Value::as_str).map(str::to_owned) }
+                        .ok_or("station claim lacks its exact server JSON")?;
+                    let parsed = crate::station_claim::SelectionReceipt::from_json(receipt_json.clone()).map_err(|error| error.to_string())?;
+                    // Historical events carried a redundant parsed copy. Check
+                    // it when present; new events conserve only the exact text.
+                    if ev.payload.get("receipt").is_some_and(|receipt| parsed.value() != receipt) {
+                        return Err("station selection receipt disagrees with its immutable event JSON".into());
+                    }
+                    let receipt = parsed.value();
+                    let request_id: uuid::Uuid = serde_json::from_value(receipt.get("request_id").cloned().ok_or("station claim lacks request identity")?).map_err(|error| error.to_string())?;
+                    let mut step: Step = serde_json::from_value(receipt.get("claimed_step").cloned().ok_or("station claim lacks claimed state")?).map_err(|error| error.to_string())?;
+                    let selected_at: chrono::DateTime<chrono::Utc> = serde_json::from_value(receipt.get("selected_at").cloned().ok_or("station claim lacks server timestamp")?).map_err(|error| error.to_string())?;
+                    use sha2::Digest;
+                    let station = receipt.get("station").ok_or("station claim lacks its definition")?;
+                    let station_hash = hex::encode(sha2::Sha256::digest(boss_core::job::canonical_json_bytes(station)));
+                    if !matches!(receipt.get("version").and_then(serde_json::Value::as_u64), Some(1 | 2))
+                        || receipt.get("event_id") != Some(&serde_json::json!(ev.event_id))
+                        || receipt.get("event_actor") != ev.payload.get("_actor")
+                        || receipt.get("station_hash").and_then(serde_json::Value::as_str) != Some(station_hash.as_str())
+                        || selected_at.timestamp_micros() != ev.ts.timestamp_micros()
+                        || receipt.pointer("/selected/step_id") != Some(&serde_json::json!(step.id))
+                        || receipt.pointer("/selected/job_id") != Some(&serde_json::json!(step.job_id))
+                        || step.status != boss_core::job::StepStatus::Active
+                        || step.assignee_id.as_deref() != receipt.get("actor").and_then(serde_json::Value::as_str)
+                    {
+                        return Err("station selection receipt disagrees with its immutable event or owned step".into());
+                    }
+                    let stored: Option<String> = sqlx::query_scalar("SELECT receipt FROM station_claim_receipts WHERE request_id = $1").bind(request_id).fetch_optional(&mut *conn).await.map_err(|error| error.to_string())?;
+                    if stored.as_ref().is_some_and(|stored| stored != &receipt_json) {
+                        return Err("audit replay attempts to replace a station selection receipt".into());
+                    }
+                    keep_the_voids(&mut *conn, &mut step).await.map_err(|error| error.to_string())?;
+                    let inserted = upsert_step(&mut *conn, &step, ev.ts).await.map_err(|error| error.to_string())?;
+                    sqlx::query("INSERT INTO station_claim_receipts (request_id, receipt) VALUES ($1, $2) ON CONFLICT (request_id) DO NOTHING").bind(request_id).bind(receipt_json).execute(&mut *conn).await.map_err(|error| error.to_string())?;
+                    if inserted { report.steps_inserted += 1; } else { report.steps_updated += 1; }
+                    Ok(Applied::Yes)
+                }
                 crate::events::STEP_FIRST_RECORDED => {
                     let mut step: Step = serde_json::from_value(ev.payload.get("step").cloned().ok_or("first record lacks step state")?)
                         .map_err(|_| "first record step state is invalid".to_string())?;

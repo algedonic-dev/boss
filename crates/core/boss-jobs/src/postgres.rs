@@ -13,6 +13,7 @@ use crate::port::{
 
 pub struct PgJobs {
     pool: PgPool,
+    native_selection: Option<crate::native_selection_store::NativeSelectionStore>,
     /// Connection URL retained alongside the pool so subprocess
     /// helpers (`boss-rebuild-all` for the demo-loop reset) can
     /// reuse it without parsing config or guessing.
@@ -50,6 +51,20 @@ impl PgJobs {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
+            native_selection: None,
+            db_url: None,
+            nats_url: None,
+        }
+    }
+
+    /// The selector owns this constructor's actual pool/transaction; a second
+    /// supplied pool or connection-string equality cannot stand in for it.
+    pub fn for_native_selection(
+        store: crate::native_selection_store::NativeSelectionStore,
+    ) -> Self {
+        Self {
+            pool: store.pool(),
+            native_selection: Some(store),
             db_url: None,
             nats_url: None,
         }
@@ -256,6 +271,7 @@ impl PgJobs {
     pub fn with_urls(pool: PgPool, db_url: String, nats_url: String) -> Self {
         Self {
             pool,
+            native_selection: None,
             db_url: Some(db_url),
             nats_url: Some(nats_url),
         }
@@ -421,6 +437,46 @@ struct AssignmentRowSql {
 // ---------------------------------------------------------------------------
 // Conversion
 // ---------------------------------------------------------------------------
+
+pub(crate) async fn get_job_on<'a>(
+    executor: impl sqlx::Executor<'a, Database = sqlx::Postgres>,
+    id: &JobId,
+) -> Result<Option<Job>, JobsError> {
+    // One spelling of the by-id read (merge of #964 into this car,
+    // 2026-10-06): the signer's `FOR SHARE` scope read (`signer_job_in`)
+    // and every reader through this function take the same columns.
+    let row = sqlx::query_as::<_, JobRow>(JOB_BY_ID_QUERY)
+        .bind(*id.inner().as_uuid())
+        .fetch_optional(executor)
+        .await
+        .map_err(|error| JobsError::Storage(error.to_string()))?;
+    Ok(row.map(row_to_job))
+}
+
+async fn station_claim_receipt_on<'a>(
+    executor: impl sqlx::Executor<'a, Database = sqlx::Postgres>,
+    request_id: uuid::Uuid,
+) -> Result<Option<crate::station_claim::SelectionReceipt>, JobsError> {
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT receipt FROM station_claim_receipts WHERE request_id = $1")
+            .bind(request_id)
+            .fetch_optional(executor)
+            .await
+            .map_err(|error| JobsError::Storage(error.to_string()))?;
+    stored
+        .map(crate::station_claim::SelectionReceipt::from_json)
+        .transpose()
+}
+
+pub(crate) async fn open_population_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<Vec<Job>, JobsError> {
+    let rows = sqlx::query_as::<_, JobRow>("SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition FROM jobs WHERE status = 'open' ORDER BY id")
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|error| JobsError::Storage(error.to_string()))?;
+    Ok(rows.into_iter().map(row_to_job).collect())
+}
 
 fn row_to_job(r: JobRow) -> Job {
     Job {
@@ -936,12 +992,7 @@ impl JobsRepository for PgJobs {
     }
 
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError> {
-        let row = sqlx::query_as::<_, JobRow>(JOB_BY_ID_QUERY)
-            .bind(*id.inner().as_uuid())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| JobsError::Storage(e.to_string()))?;
-        Ok(row.map(row_to_job))
+        get_job_on(&self.pool, id).await
     }
 
     /// One query for the set, not one per packet: the scope cut of a
@@ -1621,6 +1672,24 @@ impl JobsRepository for PgJobs {
         // must carry.
         for r in &plan.reprojected {
             let s = &r.step;
+            // ONLY THE ROW THE PLAN WAS READ FROM (third review 85c11887
+            // B1, [`crate::repin::Reprojected::read`]): its `xmin`, under
+            // the row's lock, against the version the plan carries — as
+            // `write_step` judges. A claim, a release or any write since
+            // the read refuses the whole move; returning drops `tx`, so
+            // the job UPDATE above rolls back with it.
+            let row_version: Option<i64> =
+                sqlx::query_scalar("SELECT xmin::text::bigint FROM steps WHERE id = $1 FOR UPDATE")
+                    .bind(*s.id.inner().as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| JobsError::Storage(e.to_string()))?;
+            let Some(row_version) = row_version else {
+                return Err(JobsError::StepNotFound(s.id));
+            };
+            if r.read != Some(StepVersion::new(row_version)) {
+                return Err(JobsError::StepChanged { id: s.id });
+            }
             // The re-projection moves an open step's text, so it moves
             // its shape; the stamps it leaves behind die as at any edit
             // (design 87329a13), or a move to another version and back
@@ -2178,14 +2247,8 @@ impl JobsRepository for PgJobs {
         metadata.insert(key.into(), value.clone());
         step.metadata = serde_json::Value::Object(metadata);
         let invalidated = crate::events::void_stamps_if_moved(stamp, &before, &mut step);
-        let mut event = stamp.event(crate::events::STEP_FIRST_RECORDED, serde_json::Value::Null);
-        let record = FirstRecord::new(step.job_id, *id, key, value, stamp, event.id);
-        event.payload = stamp
-            .event(
-                crate::events::STEP_FIRST_RECORDED,
-                serde_json::json!({"step":step,"record":record}),
-            )
-            .payload;
+        let record = FirstRecord::new(step.job_id, *id, key, value, stamp, uuid::Uuid::new_v4());
+        let event = record.event(&step, stamp);
         let state_event = stamp.event(
             crate::events::STEP_UPDATED,
             crate::events::step_state_payload(&step),
@@ -2379,6 +2442,239 @@ impl JobsRepository for PgJobs {
         Ok(step)
     }
 
+    async fn station_claim_receipt(
+        &self,
+        request_id: uuid::Uuid,
+    ) -> Result<Option<crate::station_claim::SelectionReceipt>, JobsError> {
+        station_claim_receipt_on(&self.pool, request_id).await
+    }
+
+    fn native_selection_requires_ingress(&self) -> bool {
+        self.native_selection.is_some()
+    }
+
+    async fn native_selection_read(
+        &self,
+        ingress: &crate::station_claim::AuthenticatedSelectionIngress,
+        request_id: uuid::Uuid,
+        station: &str,
+    ) -> Result<Option<crate::station_claim::NativeSelectionRead>, JobsError> {
+        match &self.native_selection {
+            Some(store) => store
+                .read_selection(ingress, request_id, station)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn prepare_native_selection(
+        &self,
+        ingress: crate::station_claim::AuthenticatedSelectionIngress,
+        request_id: uuid::Uuid,
+        station: &str,
+    ) -> Result<Option<crate::station_claim::NativeAuthorityObservation>, JobsError> {
+        match &self.native_selection {
+            Some(store) => store
+                .observe_authority(ingress, request_id, station)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn claim_station_head_at(
+        &self,
+        context: &crate::station_claim::SelectionContext,
+        actor: &str,
+        displaceable: &[String],
+        stamp: &boss_core::publisher::EventStamp,
+        events: &[boss_core::event::Event],
+    ) -> Result<crate::station_claim::SelectionResult, JobsError> {
+        let store = self.native_selection.as_ref().ok_or_else(|| {
+            JobsError::SelectionConflict("native selection store is not configured".into())
+        })?;
+        let observation = context.native_authority.as_ref().ok_or_else(|| {
+            JobsError::SelectionConflict("native selection authority owners unavailable".into())
+        })?;
+        if !store.observes(observation)
+            || context.request_id != observation.request_id
+            || context.station.name != observation.station_name
+            || actor != observation.ingress.actor_id()
+            || Some(stamp.actor()) != observation.user.ambient_actor().as_ref()
+        {
+            return Err(JobsError::SelectionConflict(
+                "native selection authority belongs to another constructor".into(),
+            ));
+        }
+        let deadline =
+            crate::native_selection_store::SelectionDeadline::from_ingress(&observation.ingress);
+        // Original replay precedes fresh mutation owners, but never current
+        // authenticated Read/scope or constructor identity. Direct port callers
+        // receive the same owner contract as the HTTP door.
+        let read = store
+            .read_selection(
+                &observation.ingress,
+                context.request_id,
+                &context.station.name,
+            )
+            .await?;
+        if let Some(original) = read.original {
+            return Ok(crate::station_claim::SelectionResult::Replayed(original));
+        }
+        if read.user != observation.user
+            || read.scope != observation.scope
+            || context.scope != read.scope
+        {
+            return Err(JobsError::SelectionConflict(
+                "native current read identity or scope changed".into(),
+            ));
+        }
+        let tx = match store
+            .acquire_selection_before(
+                store,
+                context.request_id,
+                actor,
+                &context.station.name,
+                deadline,
+            )
+            .await?
+        {
+            crate::native_selection_store::NativeSelectionAcquisition::Replayed(receipt) => {
+                let current = store
+                    .read_selection(
+                        &observation.ingress,
+                        context.request_id,
+                        &context.station.name,
+                    )
+                    .await?;
+                let original = current.original.ok_or_else(|| {
+                    JobsError::Storage("competing original receipt disappeared".into())
+                })?;
+                if original != receipt {
+                    return Err(JobsError::Storage(
+                        "competing original receipt changed".into(),
+                    ));
+                }
+                return Ok(crate::station_claim::SelectionResult::Replayed(original));
+            }
+            crate::native_selection_store::NativeSelectionAcquisition::Fresh(tx) => tx,
+        };
+        let (tx, step, receipt) = deadline.before_dispatch(async move {
+        let mut tx = tx;
+        let mut consumption = store.consume_authority_in(&mut tx, observation, context, actor, stamp).await?;
+        deadline.constrain_sql(&mut tx).await?;
+        let workflow_rows: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(w) FROM workflows w WHERE status = 'active' ORDER BY kind",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| JobsError::Storage(error.to_string()))?;
+        let workflows: Vec<crate::registry::WorkflowSpec> = workflow_rows
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<Result<_, _>>()
+            .map_err(|error| JobsError::Storage(error.to_string()))?;
+        deadline.constrain_sql(&mut tx).await?;
+        let station_rows: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(s) FROM stations s WHERE status = 'active' ORDER BY name",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| JobsError::Storage(error.to_string()))?;
+        let stations: Vec<crate::stations::StationSpec> = station_rows
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<Result<_, _>>()
+            .map_err(|error| JobsError::Storage(error.to_string()))?;
+        crate::station_claim::validate_definitions(
+            context,
+            &workflows,
+            &stations,
+            actor,
+            stamp.timestamp,
+        )?;
+        deadline.constrain_sql(&mut tx).await?;
+        let population = open_population_in(&mut tx).await?;
+        consumption["concurrency"] = store.consume_concurrency(observation, context, &population)?;
+        let mut packets = Vec::new();
+        for job in population {
+            if !context.scope.admits(&job) {
+                continue;
+            }
+            deadline.constrain_sql(&mut tx).await?;
+            let steps = sqlx::query_as::<_, StepRow>("SELECT id, job_id, kind, title, spec_slug, assignee_id, status, sort_order, blocked_by, sign_offs_required, assurance_required, sign_offs, fields, completed_on, metadata, notes, step_plugin_version, embedded_job, completed_by, completed_at FROM steps WHERE job_id = $1 ORDER BY sort_order, id")
+                .bind(*job.id.inner().as_uuid()).fetch_all(&mut *tx).await
+                .map_err(|error| JobsError::Storage(error.to_string()))?
+                .into_iter().map(row_to_step).collect::<Result<Vec<_>, _>>()?;
+            packets.push((job, steps));
+        }
+        context.revalidate(&packets)?;
+        consumption["definitions"] = serde_json::json!({
+            "workflows": workflows,
+            "stations": stations,
+        });
+        consumption["open_population"] = serde_json::json!(packets);
+        let step = claim_step_in_transaction(
+            &mut tx,
+            &context.validated_step.id,
+            actor,
+            displaceable,
+            stamp,
+            events,
+            Some(deadline.sql_budget()),
+        )
+        .await?;
+        consumption["calendar"] = store.consume_calendar_in(&mut tx, observation, &step, stamp).await?;
+        let (receipt, event) = context.record_consumed(actor, stamp, &step, consumption)?;
+        deadline.constrain_sql(&mut tx).await?;
+        sqlx::query("INSERT INTO station_claim_receipts (request_id, receipt) VALUES ($1, $2)")
+            .bind(context.request_id)
+            .bind(receipt.json())
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| JobsError::Storage(error.to_string()))?;
+        for fact in &event {
+            deadline.constrain_sql(&mut tx).await?;
+            boss_events::outbox::record_event_with_budget_in_tx(&mut tx, fact, Some(deadline.sql_budget()))
+                .await.map_err(JobsError::Storage)?;
+        }
+        deadline.verify_before_commit_dispatch()?;
+        Ok((tx, step, receipt))
+        }).await?;
+        store.verify_policy_at_dispatch(observation, context, &step)?;
+        // COMMIT is outside the cancelable preparation. Losing its reply says
+        // nothing about whether it committed; the original receipt decides.
+        if let Err(error) = tx.commit().await {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.station_claim_receipt(context.request_id),
+            )
+            .await
+            {
+                Ok(Ok(Some(original))) => {
+                    crate::station_claim::replay(
+                        &original,
+                        actor,
+                        &context.station.name,
+                        context.request_id,
+                    )?;
+                    return Ok(crate::station_claim::SelectionResult::Replayed(original));
+                }
+                _ => {
+                    return Err(JobsError::Storage(format!(
+                        "native selection commit outcome uncertain; retry original request {}: {error}",
+                        context.request_id
+                    )));
+                }
+            }
+        }
+        Ok(crate::station_claim::SelectionResult::Claimed {
+            step: Box::new(step),
+            receipt,
+        })
+    }
+
     async fn claim_step_displacing_at(
         &self,
         step_id: &StepId,
@@ -2392,140 +2688,13 @@ impl JobsRepository for PgJobs {
             .begin()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
-        // The shape the stamps were attesting, under the lock the CAS
-        // below then writes through: dropping the run edge moves it, and
-        // the stamps it moved off die in this transaction (backlog
-        // 4174c4a9). A missing row reads None and is named below.
-        let shape_before = shape_under_lock(&mut tx, step_id).await?;
-        // The compare half of the CAS lives in the WHERE clause, so
-        // two racing claims serialize on the row lock and exactly one
-        // sees a matching predicate. Idempotent re-claim by the
-        // holder matches too (ready or already active).
-        //
-        // THE HOLDER IN EITHER SPELLING (backlog d7fef617). The login
-        // door (design 6fda05ae) signs an agent's claim by its
-        // registered id, but a step nominated with the agent's LOGIN —
-        // every executor-lane nomination before 2026-09-19, and 142
-        // open-step assignments measured on 2026-09-11 — holds the
-        // alias. Comparing the two answered 409 to the holder itself.
-        // So `me` is the claimant plus every alias the registry maps to
-        // it, read inside the same transaction, and the SET rewrites
-        // the holder to the registered id: one spelling from here on.
-        // Directional on purpose — an alias claiming a step the
-        // registered id holds is not `me`, because nothing signs as
-        // the alias any more.
-        //
-        // AND A NEW HOLDER DOES NOT INHERIT THE PREVIOUS RUN'S EDGE
-        // (backlog 9562f6df). When the stored holder is not `me` —
-        // which the WHERE below admits only as NULL — the claim hands
-        // the step to a different executor, so the `agent_run` edge
-        // ($4) the last run left is dropped in the same statement. The
-        // SET reads the OLD `assignee_id`, and a holder in `me` (the
-        // claimant, or its alias being respelled) keeps the edge: a
-        // re-claim is idempotent. Same rule as
-        // `agent_runs::claim_changes_holder`, which the route uses for
-        // the event it records.
-        //
-        // AND A READY STEP HELD BY A DISPLACEABLE HOLDER IS FREE TO THIS
-        // CLAIM (backlog 5d1c0b7a): $5 is the list the route authorised
-        // — the step's declared executor and the caller of a claim made
-        // for someone else — compared by exact spelling, as in the
-        // in-memory adapter. Such a holder is not `me`, so the CASE
-        // above drops its run edge. Never an active step.
-        let row = sqlx::query_as::<_, StepRow>(
-            r#"
-            WITH me AS (
-                SELECT $2::text AS id
-                UNION
-                SELECT alias FROM actor_aliases WHERE actor_id = $2
-            )
-            UPDATE steps SET
-                assignee_id = $2,
-                status = 'active',
-                updated_at = $3,
-                metadata = CASE
-                    WHEN assignee_id IS NULL OR assignee_id NOT IN (SELECT id FROM me)
-                    THEN metadata - $4::text
-                    ELSE metadata
-                END
-            WHERE id = $1
-              AND (
-                    (status = 'ready' AND (assignee_id IS NULL
-                                           OR assignee_id IN (SELECT id FROM me)
-                                           OR assignee_id = ANY($5::text[])))
-                 OR (status = 'active' AND assignee_id IN (SELECT id FROM me))
-              )
-            RETURNING id, job_id, kind, title, spec_slug, assignee_id, status, sort_order,
-                      blocked_by, sign_offs_required, assurance_required, sign_offs, fields,
-                      completed_on, metadata, notes, step_plugin_version, embedded_job,
-                      completed_by, completed_at
-            "#,
-        )
-        .bind(*step_id.inner().as_uuid())
-        .bind(actor)
-        .bind(stamp.timestamp)
-        .bind(crate::agent_runs::EDGE_KEY)
-        .bind(displaceable)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| JobsError::Storage(e.to_string()))?;
-
-        let Some(row) = row else {
-            // Lost the race (or the step was never claimable). Read
-            // the row in the same tx so the conflict names the truth
-            // the claimant collided with.
-            let cur: Option<(Option<String>, String)> =
-                sqlx::query_as("SELECT assignee_id, status FROM steps WHERE id = $1")
-                    .bind(*step_id.inner().as_uuid())
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| JobsError::Storage(e.to_string()))?;
-            return match cur {
-                None => Err(JobsError::StepNotFound(*step_id)),
-                Some((holder, status)) => Err(JobsError::ClaimConflict { holder, status }),
-            };
-        };
-        // A STAMP DIES WHEN THE SHAPE IT SIGNED LEAVES THE STEP (design
-        // 87329a13), and the run edge is inside the shape: a claim that
-        // dropped it voids every live stamp here, and the invalidation
-        // records after the caller's events, as the merge door's does
-        // after its STEP_UPDATED (backlog 4174c4a9). A re-claim by the
-        // holder moves nothing and voids nothing.
-        let mut claimed = row_to_step(row)?;
-        preserve_first_records(&mut tx, step_id, &claimed.metadata).await?;
-        for event in events
-            .iter()
-            .filter(|event| event.kind == crate::events::STEP_UPDATED)
-        {
-            preserve_first_records(
-                &mut tx,
-                step_id,
-                event
-                    .payload
-                    .get("metadata")
-                    .unwrap_or(&serde_json::Value::Null),
-            )
-            .await?;
-        }
-        let invalidated = match &shape_before {
-            Some(before) => crate::events::void_stamps_if_moved(stamp, before, &mut claimed),
-            None => None,
-        };
-        if invalidated.is_some() {
-            write_sign_offs(&mut tx, &claimed).await?;
-        }
-
-        for event in events.iter().chain(invalidated.as_ref()) {
-            boss_events::outbox::record_event_in_tx(&mut tx, event)
-                .await
-                .map_err(JobsError::Storage)?;
-        }
+        let claimed =
+            claim_step_in_transaction(&mut tx, step_id, actor, displaceable, stamp, events, None)
+                .await?;
         tx.commit()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
-        self.get_step(step_id)
-            .await?
-            .ok_or(JobsError::StepNotFound(*step_id))
+        Ok(claimed)
     }
 
     async fn append_sign_off(
@@ -3794,6 +3963,175 @@ pub async fn clear_epoch_payroll_state(pool: &PgPool) -> Result<(), JobsError> {
 // ---------------------------------------------------------------------------
 // Unit tests — parse_subject / subject_parts only (no DB required)
 // ---------------------------------------------------------------------------
+
+async fn claim_step_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    step_id: &StepId,
+    actor: &str,
+    displaceable: &[String],
+    stamp: &boss_core::publisher::EventStamp,
+    events: &[boss_core::event::Event],
+    budget: Option<boss_events::statement_budget::StatementBudget>,
+) -> Result<Step, JobsError> {
+    // The shape the stamps were attesting, under the lock the CAS
+    // below then writes through: dropping the run edge moves it, and
+    // the stamps it moved off die in this transaction (backlog
+    // 4174c4a9). A missing row reads None and is named below.
+    boss_events::statement_budget::refresh(tx, budget)
+        .await
+        .map_err(JobsError::Storage)?;
+    let shape_before = shape_under_lock(tx, step_id).await?;
+    // The compare half of the CAS lives in the WHERE clause, so
+    // two racing claims serialize on the row lock and exactly one
+    // sees a matching predicate. Idempotent re-claim by the
+    // holder matches too (ready or already active).
+    //
+    // THE HOLDER IN EITHER SPELLING (backlog d7fef617). The login
+    // door (design 6fda05ae) signs an agent's claim by its
+    // registered id, but a step nominated with the agent's LOGIN —
+    // every executor-lane nomination before 2026-09-19, and 142
+    // open-step assignments measured on 2026-09-11 — holds the
+    // alias. Comparing the two answered 409 to the holder itself.
+    // So `me` is the claimant plus every alias the registry maps to
+    // it, read inside the same transaction, and the SET rewrites
+    // the holder to the registered id: one spelling from here on.
+    // Directional on purpose — an alias claiming a step the
+    // registered id holds is not `me`, because nothing signs as
+    // the alias any more.
+    //
+    // AND A NEW HOLDER DOES NOT INHERIT THE PREVIOUS RUN'S EDGE
+    // (backlog 9562f6df). When the stored holder is not `me` —
+    // which the WHERE below admits only as NULL — the claim hands
+    // the step to a different executor, so the `agent_run` edge
+    // ($4) the last run left is dropped in the same statement. The
+    // SET reads the OLD `assignee_id`, and a holder in `me` (the
+    // claimant, or its alias being respelled) keeps the edge: a
+    // re-claim is idempotent. Same rule as
+    // `agent_runs::claim_changes_holder`, which the route uses for
+    // the event it records.
+    //
+    // AND A READY STEP HELD BY A DISPLACEABLE HOLDER IS FREE TO THIS
+    // CLAIM (backlog 5d1c0b7a): $5 is the list the route authorised
+    // — the step's declared executor and the caller of a claim made
+    // for someone else — compared by exact spelling, as in the
+    // in-memory adapter. Such a holder is not `me`, so the CASE
+    // above drops its run edge. Never an active step.
+    boss_events::statement_budget::refresh(tx, budget)
+        .await
+        .map_err(JobsError::Storage)?;
+    let row = sqlx::query_as::<_, StepRow>(
+        r#"
+            WITH me AS (
+                SELECT $2::text AS id
+                UNION
+                SELECT alias FROM actor_aliases WHERE actor_id = $2
+            )
+            UPDATE steps SET
+                assignee_id = $2,
+                status = 'active',
+                updated_at = $3,
+                metadata = CASE
+                    WHEN jsonb_typeof(metadata) = 'object'
+                         AND metadata ? $6::text
+                         AND NOT metadata ? $7::text
+                    THEN (CASE
+                        WHEN assignee_id IS NULL OR assignee_id NOT IN (SELECT id FROM me)
+                        THEN metadata - $4::text
+                        ELSE metadata
+                    END) || jsonb_build_object($7::text, $8::jsonb)
+                    WHEN assignee_id IS NULL OR assignee_id NOT IN (SELECT id FROM me)
+                    THEN metadata - $4::text
+                    ELSE metadata
+                END
+            WHERE id = $1
+              AND (
+                    (status = 'ready' AND (assignee_id IS NULL
+                                           OR assignee_id IN (SELECT id FROM me)
+                                           OR assignee_id = ANY($5::text[])))
+                 OR (status = 'active' AND assignee_id IN (SELECT id FROM me))
+              )
+            RETURNING id, job_id, kind, title, spec_slug, assignee_id, status, sort_order,
+                      blocked_by, sign_offs_required, assurance_required, sign_offs, fields,
+                      completed_on, metadata, notes, step_plugin_version, embedded_job,
+                      completed_by, completed_at
+            "#,
+    )
+    .bind(*step_id.inner().as_uuid())
+    .bind(actor)
+    .bind(stamp.timestamp)
+    .bind(crate::agent_runs::EDGE_KEY)
+    .bind(displaceable)
+    .bind(crate::records_before_claim::KEY)
+    .bind(crate::records_before_claim::CLAIMED_KEY)
+    .bind(serde_json::to_value(stamp.timestamp).unwrap_or_default())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| JobsError::Storage(e.to_string()))?;
+
+    let Some(row) = row else {
+        // Lost the race (or the step was never claimable). Read
+        // the row in the same tx so the conflict names the truth
+        // the claimant collided with.
+        boss_events::statement_budget::refresh(tx, budget)
+            .await
+            .map_err(JobsError::Storage)?;
+        let cur: Option<(Option<String>, String)> =
+            sqlx::query_as("SELECT assignee_id, status FROM steps WHERE id = $1")
+                .bind(*step_id.inner().as_uuid())
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| JobsError::Storage(e.to_string()))?;
+        return match cur {
+            None => Err(JobsError::StepNotFound(*step_id)),
+            Some((holder, status)) => Err(JobsError::ClaimConflict { holder, status }),
+        };
+    };
+    // A STAMP DIES WHEN THE SHAPE IT SIGNED LEAVES THE STEP (design
+    // 87329a13), and the run edge is inside the shape: a claim that
+    // dropped it voids every live stamp here, and the invalidation
+    // records after the caller's events, as the merge door's does
+    // after its STEP_UPDATED (backlog 4174c4a9). A re-claim by the
+    // holder moves nothing and voids nothing.
+    let mut claimed = row_to_step(row)?;
+    boss_events::statement_budget::refresh(tx, budget)
+        .await
+        .map_err(JobsError::Storage)?;
+    preserve_first_records(tx, step_id, &claimed.metadata).await?;
+    for event in events
+        .iter()
+        .filter(|event| event.kind == crate::events::STEP_UPDATED)
+    {
+        boss_events::statement_budget::refresh(tx, budget)
+            .await
+            .map_err(JobsError::Storage)?;
+        preserve_first_records(
+            tx,
+            step_id,
+            event
+                .payload
+                .get("metadata")
+                .unwrap_or(&serde_json::Value::Null),
+        )
+        .await?;
+    }
+    let invalidated = match &shape_before {
+        Some(before) => crate::events::void_stamps_if_moved(stamp, before, &mut claimed),
+        None => None,
+    };
+    if invalidated.is_some() {
+        boss_events::statement_budget::refresh(tx, budget)
+            .await
+            .map_err(JobsError::Storage)?;
+        write_sign_offs(tx, &claimed).await?;
+    }
+
+    for event in events.iter().chain(invalidated.as_ref()) {
+        boss_events::outbox::record_event_with_budget_in_tx(tx, event, budget)
+            .await
+            .map_err(JobsError::Storage)?;
+    }
+    Ok(claimed)
+}
 
 #[cfg(test)]
 mod tests {

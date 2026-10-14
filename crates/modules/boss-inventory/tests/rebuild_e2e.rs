@@ -17,6 +17,76 @@ use boss_testing::{RecordingEventBus, TestDb, TestRequest};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
+/// Command admission must not be retroactive: this historical negative
+/// Draft was placed before decision0a8e95f1. Replay uses full row facts,
+/// not the ordinary status command or its new admission rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn historical_negative_draft_placement_rebuilds_without_new_events() {
+    use boss_inventory::port::InventoryRepository;
+    use boss_inventory::types::{PoStatus, PurchaseOrder, PurchaseOrderLine};
+    let db = TestDb::new().await;
+    let repo = PgInventory::new(db.pool.clone());
+    let stamp = boss_core::publisher::EventStamp::new(
+        "inventory",
+        boss_core::actor::ActorId::Automation("historical-fixture".into()),
+    );
+    let draft = PurchaseOrder {
+        id: "PO-HISTORICAL-NEGATIVE".into(),
+        vendor: None,
+        status: PoStatus::new(PoStatus::DRAFT),
+        placed_on: None,
+        expected_on: None,
+        received_on: None,
+        lines: vec![PurchaseOrderLine {
+            part_sku: "HISTORICAL-PART".into(),
+            qty: 1,
+            unit_cost_cents: -300,
+            currency: "USD".into(),
+        }],
+    };
+    repo.create_purchase_order_at(&draft, stamp.timestamp, &stamp)
+        .await
+        .unwrap();
+    let placed = PurchaseOrder {
+        status: PoStatus::new(PoStatus::SUBMITTED),
+        ..draft
+    };
+    repo.create_purchase_order_at(&placed, stamp.timestamp, &stamp)
+        .await
+        .unwrap();
+    assert_eq!(drain(&db.pool).await, 2);
+    let before = (
+        snapshot_pos(&db.pool).await,
+        snapshot_po_lines(&db.pool).await,
+    );
+    assert_eq!(before.1[0].unit_cost_cents, -300);
+    for _ in 0..2 {
+        sqlx::query("DELETE FROM purchase_order_lines")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM purchase_orders")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let report = rebuild_inventory(&db.pool).await.unwrap();
+        assert_eq!(report.purchase_orders_upserted, 2);
+        assert_eq!(
+            (
+                snapshot_pos(&db.pool).await,
+                snapshot_po_lines(&db.pool).await
+            ),
+            before
+        );
+        let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(audits, 2, "rebuild must not emit facts");
+        assert_eq!(drain(&db.pool).await, 0, "rebuild must not enqueue facts");
+    }
+}
+
 // Not Eq: `behavior` is JSONB (serde_json::Value is PartialEq only).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 struct VendorRow {

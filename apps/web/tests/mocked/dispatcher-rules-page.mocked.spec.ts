@@ -66,7 +66,7 @@ import { sectionForRoute } from '../../src/shell/sections';
 import { routePattern } from '../../src/shell/surface-opens';
 
 const PAGE = '/it/registry/rules';
-const TITLE = 'Dispatcher rules';
+const TITLE = 'Rule authoring';
 const NEW_RULE = '/it/registry/rules/new';
 /// The editor's catalog path: a pattern, spelled the way surface-opens
 /// records every open of it (routePattern), so the usage read and the
@@ -227,6 +227,17 @@ async function backHere(page: Page, rows: number): Promise<void> {
 }
 
 test.describe('/it/registry/rules — the rows', () => {
+  test('authoring has its own heading and catalog name, distinct from the cascade', async ({ page }) => {
+    await install(page);
+    await mountPage(page, PAGE);
+    await expect(page.getByRole('heading', { level: 1, name: 'Rule authoring', exact: true })).toBeVisible();
+    expect(ROUTE_CATALOG['system-dispatcher-rules'].label).toBe('Rule authoring');
+    expect(ROUTE_CATALOG['system-dispatcher'].label).toBe('Dispatcher rules');
+    await page.locator('.catalog a.breadcrumb').click();
+    await expect(page).toHaveURL((u) => u.pathname === CASCADE);
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('Dispatcher rules — reactive cascade');
+  });
+
   test('header, guidance line, and one row per rule sorted by name with seven columns', async ({ page }) => {
     await install(page);
     await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });

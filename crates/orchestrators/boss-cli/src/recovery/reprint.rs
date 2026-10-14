@@ -615,7 +615,7 @@ async fn attach_and_write(
     };
     let signature = identity::Signature::As(wire.signer(&reqwest::Method::POST, "/api/files")?);
     let attached = attach_at(
-        &crate::gate::machine_client()?,
+        &crate::sor_client::machine_client()?,
         content_base,
         &target,
         &path,

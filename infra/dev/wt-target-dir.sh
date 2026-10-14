@@ -1,5 +1,6 @@
 # wt-target-dir.sh — the ONE name for a worktree's own cargo target
-# dir, and the ONE decision about when a build must leave a shared one.
+# dir, the ONE decision about when a build must leave a shared one, and
+# (since backlog 9ecd12ea) the ONE width a worktree's cargo runs at.
 # Sourced by infra/dev/wt-cargo (which seeds the dir) and by
 # infra/gate.sh (which must not check into a dir another checkout
 # owns). Not executable; it runs nothing by itself.
@@ -111,4 +112,77 @@ reads as fresh here and reds a clean tree." >&2
 wt-cargo reflink-seeds it from the shared dir in seconds." >&2
     fi
     export CARGO_TARGET_DIR="$mine"
+}
+
+# wt_build_jobs <repo-root> <pod-bound>
+#
+# The cargo width for a build in <repo-root>, decided once. A BUILDER
+# worktree (basename agent-*) builds 4 wide: the pod is one cgroup
+# shared by every builder and the operator's interactive session
+# (measured 2026-09-14: two builders and the operator throttled it ~10
+# min). Every other tree takes the pod's bound, which the caller reads
+# from pod-build.env and hands in. WT_JOBS wins over either. wt-cargo
+# builds at this width and gate.sh's pre-flight checks at it, so the
+# number has one home (backlog 9ecd12ea).
+wt_build_jobs() {
+    case "$(basename "$1")" in
+        agent-*) printf '%s\n' "${WT_JOBS:-4}" ;;
+        *) printf '%s\n' "${WT_JOBS:-$2}" ;;
+    esac
+}
+
+# wt_bound_build_jobs [repo-root]
+#
+# Bounds an UNBOUNDED cargo in a linked worktree to wt_build_jobs'
+# width, and says so on stderr. Inert when the caller already chose a
+# width (wt-cargo exports its own; a human may) and in a main checkout.
+#
+# WHY (backlog 9ecd12ea, ask 3). The dev container was OOM-killed at its
+# 32Gi limit on 2026-10-08, and the memory watch that car 7849553a
+# installed has since shown what the unbounded consumer is: `gate.sh
+# --lint`, the door every builder runs before gating, ran `cargo clippy
+# --workspace` at cargo's default width, one job per CPU — and on this
+# pod `nproc` reads the NODE (32), not the container's cgroup (16 CPU /
+# 32Gi). Measured 2026-10-10 in the ring at 07:48:04Z: one such check
+# (`cargo check --workspace --all-features --all-targets`, the cargo a
+# clippy run drives) held ten clippy-drivers at once, 3.6 GB summed and
+# the two largest 1.10 GB (boss_dispatcher_handlers) and 1.05 GB
+# (boss_jobs) — wider than the four wt-cargo ever lets a builder build;
+# 32 drivers at the larger figure is more than the container holds.
+# Every wt-cargo build was already bounded; this was the cargo that was
+# not. It is the widest consumer the watch has seen, not a proven cause
+# of the 10-08 kill, which predates the watch and left no samples.
+#
+# A MAIN checkout is left alone for the reason wt_isolate_target_dir
+# leaves it: it is the gate runner's per-run clone or forge CI, each on
+# a machine sized for one build, and slowing the judge to suit the dev
+# pod is the trade pod-build.env refuses for `.cargo/config.toml`. A
+# missing bound is refused rather than defaulted, as wt-cargo refuses.
+wt_bound_build_jobs() {
+    [ -z "${CARGO_BUILD_JOBS:-}" ] || return 0
+
+    local root gitdir common env_file bound
+    root=${1:-}
+    if [ -z "$root" ]; then
+        root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+    fi
+    [ -n "$root" ] || return 0
+    gitdir=$(git -C "$root" rev-parse --git-dir 2>/dev/null) || return 0
+    common=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || return 0
+    [ "$gitdir" != "$common" ] || return 0
+
+    env_file=$(dirname "${BASH_SOURCE[0]}")/pod-build.env
+    bound=$(
+        CARGO_BUILD_JOBS=
+        # shellcheck source=pod-build.env
+        . "$env_file" 2>/dev/null && printf '%s' "${CARGO_BUILD_JOBS:-}"
+    ) || bound=
+    if [ -z "$bound" ]; then
+        printf '%s\n' "gate: $env_file sets no CARGO_BUILD_JOBS — this linked worktree's cargo has no bound to read, and an unbounded one here is one job per NODE CPU against the dev container's memory (backlog 9ecd12ea). Refusing." >&2
+        return 2
+    fi
+
+    CARGO_BUILD_JOBS=$(wt_build_jobs "$root" "$bound")
+    export CARGO_BUILD_JOBS
+    printf '%s\n' "gate: this is a linked worktree — cargo runs $CARGO_BUILD_JOBS jobs wide, the width wt-cargo builds it at, not one per node CPU (backlog 9ecd12ea: an unbounded workspace clippy was the widest cargo the dev container's memory watch saw)." >&2
 }

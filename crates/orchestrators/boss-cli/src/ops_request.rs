@@ -64,6 +64,12 @@ pub(crate) struct Validated {
     /// the runner appends the SIGNED plan's hash itself (backlog
     /// fd7090cc, design 17835005).
     pub requires_approval: bool,
+    /// The verb also declares `requires_review` (backlog 84e7c3e4,
+    /// design 9de0cd1c): the packet is filed with `requires_review:
+    /// true`, which makes ops-request's `review` step ready, and the
+    /// runner opens the approval only over a closed independent release
+    /// of the plan it renders there.
+    pub requires_review: bool,
 }
 
 /// Apply the allowlist's rules to a call, exactly as `ops-runner.sh`
@@ -173,6 +179,23 @@ pub(crate) fn validate(
         }
         params.pop();
     }
+    // A REVIEW GATES AN APPROVAL, OR NOTHING (backlog 84e7c3e4). Read the
+    // way `requires_approval` is read — anything but absent or a literal
+    // `false` is REQUIRED — and refused on a verb with no approval: the
+    // review step only ever opens an approve step, so on such a verb it
+    // would hold nothing and say it held something.
+    let requires_review = !matches!(
+        spec.get("requires_review"),
+        None | Some(Value::Null) | Some(Value::Bool(false))
+    );
+    if requires_review && !requires_approval {
+        bail!(
+            "boss ops: REFUSED — `{verb}` declares requires_review and not requires_approval. A \
+             review opens a passkey approval of the plan it released (design 9de0cd1c); a verb \
+             with no approval has nothing the review could gate, so this packet would wait on a \
+             review that decides nothing."
+        );
+    }
     if args.len() > params.len() {
         bail!(
             "boss ops: REFUSED — `{verb}` takes {} arg(s) ({}), got {}: {:?}",
@@ -244,6 +267,7 @@ pub(crate) fn validate(
         title,
         mutating,
         requires_approval,
+        requires_review,
     })
 }
 
@@ -256,6 +280,9 @@ pub(crate) fn request_metadata(v: &Validated) -> Value {
     let mut md = json!({"host": v.host, "verb": v.verb, "args": v.args});
     if v.requires_approval {
         md["requires_approval"] = json!(true);
+    }
+    if v.requires_review {
+        md["requires_review"] = json!(true);
     }
     md
 }
@@ -313,9 +340,35 @@ pub(crate) fn answer_of(job: &Value) -> Option<Answer> {
             effect_unread: None,
         })
     };
+    // And one its independent review sent back (backlog 84e7c3e4, review
+    // N4 of car e1f4fc2a): a refusal, closed on `not-released`. The engine
+    // readies that terminal as the review completes, so the dispatcher
+    // may close it before the runner does, with no reason on it; the
+    // reviewer's findings on the review step are then the why.
+    let not_released = || {
+        closed_terminal("not-released", "refused", "reason").or_else(|| {
+            step_of("not-released")
+                .filter(|s| s.get("status").and_then(Value::as_str) == Some("completed"))?;
+            Some(Answer {
+                disposition: "refused".to_string(),
+                exit_code: None,
+                output: step_of("review")
+                    .and_then(|s| s.get("metadata"))
+                    .and_then(|m| m.get("findings"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("its independent review asked for changes")
+                    .to_string(),
+                runner_host: String::new(),
+                effect: None,
+                effect_unproven: None,
+                effect_unread: None,
+            })
+        })
+    };
     let closed_refused = || {
         closed_terminal("refused", "refused", "reason")
             .or_else(|| closed_terminal("nothing-to-do", "nothing-to-do", "plan"))
+            .or_else(not_released)
     };
     // Only a COMPLETED execute answers (the review of car 24eb9471). The
     // runner lands its keys through the merge door BEFORE the status
@@ -431,6 +484,14 @@ pub async fn run(
             v.verb, v.host
         );
     }
+    if v.requires_review {
+        eprintln!(
+            "boss ops: `{}` requires an independent review first — the runner renders the plan \
+             onto the packet's review step for a tenant-reviewer run, and puts it in front of a \
+             passkey only once that review releases those exact bytes.",
+            v.verb
+        );
+    }
     let metadata = request_metadata(&v);
     if dry_run {
         println!(
@@ -439,7 +500,7 @@ pub async fn run(
         );
         return Ok(());
     }
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let owner = crate::identity::sign(&reqwest::Method::POST, "/api/jobs")?;
     let body = crate::job::envelope(
         "ops-request",
@@ -449,7 +510,7 @@ pub async fn run(
         &owner,
         Some(metadata),
     );
-    let created = crate::gate::api(&http, reqwest::Method::POST, "/api/jobs", Some(body))
+    let created = crate::sor_client::api(&http, reqwest::Method::POST, "/api/jobs", Some(body))
         .await?
         .context("the create returned no body")?;
     let id = created
@@ -472,7 +533,7 @@ pub async fn run(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        let job = crate::gate::api(
+        let job = crate::sor_client::api(
             &http,
             reqwest::Method::GET,
             &format!("/api/jobs/{id}"),
@@ -770,6 +831,47 @@ mod tests {
         );
     }
 
+    /// A REVIEW VERB IS FILED WITH BOTH FLAGS (backlog 84e7c3e4, design
+    /// 9de0cd1c): `requires_review` is what makes ops-request's review
+    /// step ready, and a request filed without it would leave the review
+    /// waiting on a flag nobody sets — the runner refuses that shape, so
+    /// the flag is set here from the verb file, never typed. Only the
+    /// tenant merge declares it (option A, bd331d38); every other
+    /// approval verb files exactly as before. A verb that declares a
+    /// review and no approval is refused: the review exists to open an
+    /// approval, and with none there is nothing it could gate.
+    #[test]
+    fn a_review_verb_files_the_review_flag_beside_the_approval_flag() {
+        let v = shipped_allowlist().expect("the verb files parse");
+        let ok = validate(
+            &v,
+            "forge",
+            "merge-tenant-main",
+            &["playground".into(), "tenant/merge-1".into()],
+        )
+        .unwrap();
+        assert!(ok.requires_approval && ok.requires_review);
+        assert_eq!(
+            request_metadata(&ok),
+            json!({"host": "forge", "verb": "merge-tenant-main",
+                   "args": ["playground", "tenant/merge-1"],
+                   "requires_approval": true, "requires_review": true})
+        );
+        let ok = validate(&v, "forge", "reap-terminated-pods", &[]).unwrap();
+        assert!(ok.requires_approval && !ok.requires_review);
+        assert!(request_metadata(&ok).get("requires_review").is_none());
+
+        let mut bare = v.clone();
+        bare["verbs"]["uptime"]["requires_review"] = json!(true);
+        let e = validate(&bare, "forge", "uptime", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("requires_review") && e.contains("requires_approval"),
+            "{e}"
+        );
+    }
+
     /// AN APPROVAL VERB NAMES WHO MAY APPROVE IT (design 03451237 q2:
     /// named employee ids, not a role). The runner closes refused a verb
     /// that names nobody, so filing one is refused here first, the way a
@@ -824,6 +926,46 @@ mod tests {
             {"spec_slug": "refused", "status": "pending", "metadata": {"outcome_kind": "aborted"}}
         ]});
         assert!(answer_of(&open).is_none());
+    }
+
+    /// A request its independent review sent back closes on
+    /// `not-released` (backlog 84e7c3e4, review N4 of car e1f4fc2a) and
+    /// answers there as a refusal: with the runner's reason when the
+    /// runner closed it, else — the engine readies the terminal the moment
+    /// the review completes, so the dispatcher may close it first, with no
+    /// reason — with the reviewer's own findings.
+    #[test]
+    fn a_request_its_review_sent_back_answers_refused_with_why() {
+        let v = validate(&fixture(), "forge", "uptime", &[]).unwrap();
+        let review = json!({"spec_slug": "review", "status": "completed",
+            "metadata": {"verdict": "changes", "findings": "the branch drops a ledger row"}});
+        let job = json!({"steps": [
+            review.clone(),
+            {"spec_slug": "execute", "status": "skipped", "metadata": {}},
+            {"spec_slug": "refused", "status": "skipped", "metadata": {"outcome_kind": "aborted"}},
+            {"spec_slug": "not-released", "status": "completed",
+             "metadata": {"outcome_kind": "aborted"}}
+        ]});
+        let a = answer_of(&job).expect("the not-released terminal is an answer");
+        assert_eq!(a.disposition, "refused");
+        assert!(a.output.contains("drops a ledger row"), "{a:?}");
+        let (line, ok) = verdict_line("abcd1234", &v, &a);
+        assert!(!ok && line.starts_with("boss ops: refused"), "{line}");
+        let mut by_runner = job.clone();
+        by_runner["steps"][3]["metadata"]["reason"] =
+            json!("its review step records verdict \"changes\"");
+        by_runner["steps"][3]["metadata"]["runner_host"] = json!("forge");
+        let a = answer_of(&by_runner).unwrap();
+        assert!(a.output.contains("verdict \"changes\""), "{a:?}");
+        assert_eq!(a.runner_host, "forge");
+        let open = json!({"steps": [
+            review,
+            {"spec_slug": "not-released", "status": "ready", "metadata": {}}
+        ]});
+        assert!(
+            answer_of(&open).is_none(),
+            "a terminal not yet completed is no answer"
+        );
     }
 
     /// A request the runner closed through its `nothing-to-do` terminal

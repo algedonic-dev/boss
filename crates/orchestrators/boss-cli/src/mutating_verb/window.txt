@@ -1,0 +1,338 @@
+# THE WINDOW the review hold's bound is measured against (backlog
+# 76b846cd): every commit on main in 30 days, and for each one that
+# touched the boss CLI's sources, those paths (relative to
+# crates/orchestrators/boss-cli/src/). A recorded sample, not a live
+# read: the gate clones 50 commits deep and a month is ~690.
+# Measured on origin/main afbe286d (2026-10-09) with
+#   git log afbe286d --since=2026-09-09T09:16:54Z --format='@%H %s' --name-only
+# (since = that commit's time less 30 days). Re-measure the same way
+# when the bound is re-set, and write the new numbers into the doc.
+commits 686
+5cb4e4cf gate.rs train/conductor.rs train/consist_job.rs train/consist_worker.py
+d37f0e86 job.rs review_verdict.rs
+b147c26c gate.rs main.rs mutating_verb.rs trust_boundary.rs
+70739bf2 dispatch_launch.rs gate.rs main.rs train/jobs_api.rs
+c734dbdf gate.rs prove.rs
+d8dcc808 dispatch.rs dispatch_report_orders.rs main.rs
+83005621 gate.rs main.rs prove.rs
+d8bdc465 dispatch_launch.rs harness.rs
+abb050bc tenant_stamp.rs
+2ee41ffe gate.rs train/carried_verdict.rs train/conductor.rs train/jobs_api.rs
+b03041fe train/jobs_api.rs
+e746e847 gate.rs train/carried_verdict.rs train/conductor.rs train/stranded.rs
+10d780b3 cadence.rs
+087378b4 dispatch.rs dispatch_launch.rs dispatch_started.rs gate.rs harness.rs main.rs mutating_verb.rs transcript_usage.rs
+c3a95be1 mutating_verb.rs
+3464fa1b mutating_verb.rs
+f2b98222 probe_reader.rs prove.rs
+d4b48c95 prove.rs
+3ad15805 main.rs own_temp.rs probe_door_check.rs probe_reader.rs prove.rs
+5eb85f97 train/carried_verdict.rs train/conductor.rs train/mod.rs
+e847d8a8 dispatch.rs workflow.rs
+113bbc06 prove.rs recovery.rs
+ad03e932 delivery_policy.rs gate.rs
+53c15163 main.rs probe_reader.rs prove.rs
+549cbe07 workflow.rs
+b44de29e cadence.rs train/entry.rs
+3fcc03f5 dispatch.rs steps.rs
+00271632 dispatch.rs dispatch_started.rs main.rs
+896e5417 dispatch.rs dispatch_hook.rs review_verdict.rs steps.rs train/conductor.rs
+93c99169 train/consist_clone.sh
+f47efe0e train/consist_job.rs
+74e6c7cb car_unland.rs job.rs recovery/reprint/tests.rs
+e0eb0bb4 door_env.rs main.rs
+578869ef train/consist_job.rs
+ed5504fd train/conductor.rs train/consist.rs train/consist_clone.sh train/consist_job.rs train/consist_worker.py train/mod.rs
+22eed2f2 gemini_execution.rs launch.rs main.rs
+48e9ece4 mutating_verb.rs recovery.rs
+0fdfac05 tenant_export.rs
+8a0853b3 main.rs
+b09b7527 roster.rs
+0b7dd4ed freshness.rs prove.rs
+71233067 rerail.rs
+41656f98 main.rs roster.rs
+3c346634 census.rs gate.rs queue.rs
+0d08d170 dispatch.rs launch.rs main.rs
+b3954628 transcript_usage.rs
+2d39e7c4 main.rs
+f628efee mutating_verb.rs
+03a72d39 automations.rs identity.rs main.rs prove.rs recovery.rs
+cd8f4fff freshness.rs
+33f2ae35 tenant_stamp.rs
+93b6db8f brief.rs dispatch.rs disprove.rs mutating_verb.rs prove.rs recovery.rs
+4418bdd8 recovery.rs
+170ac473 mutating_verb.rs orient.rs
+21dd4b9d brief.rs door_env.rs mutating_verb.rs prove.rs train/consist.rs
+d82ef845 ops_request.rs
+ee9a78a5 delivery_policy.rs
+3f1e63c0 orient.rs train/forge.rs train/mod.rs
+061e28d7 delivery_policy.rs gate.rs train/consist.rs
+ffeaa0c3 dispatch.rs scratch_target.rs
+8ab516ac brief.rs door_env.rs main.rs prove.rs train/consist.rs
+c21d6abf gate.rs
+2b1ef95d dispatch.rs documents.rs review_verdict.rs tenant_publish.rs
+e32170e7 recovery.rs
+89934601 estate.rs gate.rs tenant.rs tenant_export.rs tenant_publish.rs tenant_stamp.rs
+ea19da1f job.rs review_verdict.rs steps.rs
+f69b67b6 documents.rs steps.rs train/jobs_api.rs
+6659b151 delivery_policy.rs gate.rs
+06a660e3 dispatch.rs gate.rs tenant_publish.rs
+410e125f recovery.rs
+a71c7e70 steps.rs trust_boundary.rs
+7ba76443 attach.rs brief.rs bundle_lineage.rs cadence.rs car.rs car_retire.rs car_unland.rs census.rs channels.rs correct.rs credential.rs design.rs dispatch.rs dispatch_hook.rs disprove.rs doctor.rs estate.rs events.rs gate.rs job.rs ledger.rs ops_request.rs orient.rs park.rs prove.rs publish_requests.rs queue.rs receipt.rs recovery/reprint.rs recovery/reprint/tests.rs reporting_to.rs rerail.rs source_backfill.rs steps.rs tenant_export.rs tenant_publish.rs tenant_stamp.rs train/conductor.rs workflow.rs
+219e2ed6 cadence.rs
+eaa2f5ce main.rs recovery.rs recovery/pdf.rs recovery/reprint.rs recovery/reprint/tests.rs
+6ff03ca4 ops_request.rs
+144a1343 recovery.rs recovery/pdf.rs
+ecfbf34c main.rs recovery.rs
+e2198586 gate.rs job.rs main.rs mutating_verb.rs rerail.rs review_verdict.rs steps.rs train/cars.rs train/conductor.rs train/dock_regate.rs train/mod.rs
+1764c7d8 mutating_verb.rs
+10bddfaf gate.rs kept_probe.rs main.rs mutating_verb.rs rerail.rs
+c25f0e50 dispatch.rs mutating_verb.rs train/conductor.rs train/mod.rs
+b34427e0 train/conductor.rs
+e6d28821 gate.rs main.rs mutating_verb.rs park.rs rerail.rs
+26e3e322 orient.rs train/boarding.rs train/cars.rs train/conductor.rs
+68e65d3e dispatch.rs transcript_usage.rs
+a8f6ed98 brief.rs main.rs rerail.rs train/boarding.rs
+3c5e7d1d dispatch.rs transcript_usage.rs
+571daf00 gate.rs
+a1f56c79 ledger.rs main.rs
+27cd20cf tenant_publish.rs
+07977fe7 events.rs gate.rs main.rs orient.rs train/conductor.rs
+eeee2fb6 train/conductor.rs
+288f3294 cadence.rs gate.rs main.rs orient.rs tenant.rs train/conductor.rs train/dock_regate.rs
+195f9f94 steps.rs trust_boundary.rs
+4f9a588a brief.rs cadence.rs delivery_policy.rs dispatch.rs dock_preview.rs gate.rs main.rs orient.rs steps.rs tenant.rs train/boarding.rs train/conductor.rs train/dock_regate.rs trust_boundary.rs
+2923cad0 orient.rs train/boarding.rs train/conductor.rs train/dock_regate.rs train/jobs_api.rs
+7b46f277 orient.rs
+4c250f91 cadence.rs orient.rs train/boarding.rs train/conductor.rs train/dock_regate.rs workflow.rs
+e174f9c5 cadence.rs census.rs dispatch.rs main.rs ops_request.rs
+62bbe15d brief.rs memory_index.rs prove.rs steps.rs
+892c1644 gate.rs item_source.rs job.rs park.rs scratch_target.rs steps.rs
+adb08d48 census.rs channels.rs gate.rs orient.rs park.rs queue.rs rerail.rs train/conductor.rs
+36bdf970 main.rs orient.rs top_board.rs
+94c6bfd9 orient.rs
+c15baf64 item_source.rs main.rs source_backfill.rs
+e6210140 documents.rs item_source.rs job.rs main.rs ops_request.rs tenant.rs tenant_stamp.rs
+3c246104 prove.rs
+6d14407c freshness.rs own_temp.rs upgrade.rs
+0c6c6bb7 orient.rs tenant.rs
+0139c378 train/boarding.rs train/conductor.rs train/dock_regate.rs
+4be6ea69 channels.rs dispatch.rs gate.rs main.rs train/conductor.rs train/jobs_api.rs
+e3ae9edd train/consist.rs
+564d044c gate.rs train/jobs_api.rs
+864a697a dispatch.rs main.rs transcript_profile.rs transcript_usage.rs
+df826a48 car_retire.rs main.rs orient.rs tenant.rs
+ca828eeb cadence.rs gate.rs train/conductor.rs train/jobs_api.rs
+0303e481 dispatch.rs train/conductor.rs train/jobs_api.rs
+53c7c626 car_unland.rs git_auth.rs
+87cc7e12 cadence.rs freshness.rs gate.rs train/conductor.rs train/dock_regate.rs train/jobs_api.rs
+a5b72e25 car_retire.rs car_unland.rs main.rs train/conductor.rs train/forge.rs train/merge_lost.rs train/mod.rs train/verdicts.rs
+0dc6742f publish.rs
+24ea4303 gate.rs train/conductor.rs train/dock_regate.rs
+77bf499e cadence.rs main.rs train/boarding.rs train/conductor.rs train/dock_regate.rs train/entry.rs
+22c1a876 cadence.rs correct.rs tenant.rs
+9388258b freshness.rs steps.rs
+f78c0c44 tenant.rs tenant_publish.rs
+25676ac0 dispatch.rs dispatch_hook.rs
+ebbbc3b0 gate.rs main.rs orient.rs publish_requests.rs repair.rs train/conductor.rs train/jobs_api.rs train/stranded.rs
+f6df919a main.rs steps.rs strike_release.rs
+149553f6 ops_request.rs
+ac70dc3e transcript_usage.rs
+507d2308 brief.rs dispatch.rs main.rs prior_work.rs
+faf5c47b dispatch.rs steps.rs transcript_usage.rs
+fe50e04b train/conductor.rs
+6ba92406 job.rs main.rs
+9fda648a brief.rs dispatch.rs documents.rs main.rs tenant.rs
+afb2c016 car_retire.rs dispatch.rs disprove.rs documents.rs main.rs prove.rs
+fa930de4 door.rs main.rs orient.rs train/conductor.rs train/dock_regate.rs train/mod.rs
+80e1c060 car_retire.rs main.rs
+45dfb3a1 orient.rs train/conductor.rs train/judged_red.rs train/mod.rs
+95508ad6 orient.rs reach.rs
+d013ec41 attach.rs brief.rs design.rs main.rs orient.rs tenant.rs
+a9028721 brief.rs design.rs main.rs orient.rs
+e5a2c05c tenant.rs
+62e16d70 orient.rs
+1c0aed24 census.rs
+3a20fe5c steps.rs
+cf523695 job.rs main.rs
+ede0cdcd steps.rs
+85f4730f bundle_lineage.rs
+73c72e27 park.rs
+d5566ef8 design.rs orient.rs
+34e7bdff orient.rs
+441f2d40 brief.rs correct.rs dispatch.rs dispatch_hook.rs gate.rs main.rs scratch_target.rs
+39f311b5 gate.rs orient.rs
+d54b0930 bundle_lineage.rs gate.rs main.rs orient.rs reporting_to.rs
+9342cfde dispatch.rs main.rs scratch_target.rs
+cfdcf74f design.rs main.rs
+df0dfbcc gate.rs main.rs
+19b52890 prove.rs
+fcdc6fb7 train/boarding.rs
+199db9fe dispatch.rs main.rs transcript_usage.rs
+6604d104 doctor.rs tenant.rs
+b815d216 gate.rs
+c49ed647 dispatch.rs rerail.rs
+29d2d74f core_changes.rs dispatch_hook.rs main.rs
+ee36fe72 tenant.rs
+618f660a bundle_lineage.rs gate.rs orient.rs
+87c2e366 car.rs inspect.rs park.rs
+a3f1fd43 brief.rs car.rs gate.rs main.rs orient.rs prose.rs steps.rs tenant.rs tenant_publish.rs train/cars.rs train/conductor.rs
+642c0171 doctor.rs
+c43c7d03 bundle_lineage.rs dispatch.rs dispatch_hook.rs main.rs orient.rs train/conductor.rs train/verdicts.rs train_gate.rs
+1d917084 orient.rs
+0e719be3 brief.rs census.rs dispatch.rs doctor.rs documents.rs gate.rs main.rs running.rs tenant_export.rs train/jobs_api.rs
+2ab74aa9 car.rs main.rs orient.rs prove.rs rerail.rs
+a7324e4f doctor.rs gate.rs job.rs orient.rs prove.rs tenant_export.rs train/jobs_api.rs
+3a0e4b1c attach.rs orient.rs prove.rs
+fec652a7 brief.rs cadence.rs car.rs census.rs channels.rs dispatch.rs doctor.rs documents.rs gate.rs job.rs orient.rs park.rs prove.rs publish_requests.rs queue.rs rerail.rs tenant.rs train/jobs_api.rs workflow.rs
+6ad8ae3b census.rs credential.rs dispatch.rs gate.rs queue.rs train/jobs_api.rs
+769c428e attach.rs main.rs tenant_publish.rs
+36699512 channels.rs freshness.rs gate.rs main.rs own_temp.rs prove.rs publish_requests.rs train/cars.rs train/consist.rs
+509f165f brief.rs inspect.rs main.rs prose.rs
+266d3aa2 tenant.rs
+9df4296a dispatch.rs dispatch_hook.rs
+b33049f3 main.rs memory_index.rs orient.rs
+ecc818d6 brief.rs car.rs documents.rs freshness.rs prove.rs
+81a31735 orient.rs train/boarding.rs train/conductor.rs train/stranded.rs
+f2864e6c brief.rs design.rs dispatch.rs documents.rs freshness.rs gate.rs main.rs prove.rs steps.rs
+952671e4 orient.rs train/consist.rs
+11f80b67 tenant.rs tenant_export.rs tenant_publish.rs
+88e449b4 dispatch.rs main.rs reach.rs
+9bb2e813 gate.rs train_gate.rs
+22c552ca tenant.rs
+07be39c1 steps.rs
+5fba3f5b steps.rs
+de960a2a brief.rs dispatch.rs
+df7e522c main.rs prove.rs
+729948bc gate.rs steps.rs
+7b9a0142 train/boarding.rs train/conductor.rs train/stranded.rs
+1a0a3b43 orient.rs
+4f6e8b7e rerail.rs
+892d6acf gate.rs
+f1c0110e delivery_policy.rs dock_preview.rs main.rs orient.rs tenant.rs tenant_stamp.rs train/consist.rs
+2f3863b2 steps.rs
+f2eba817 channels.rs
+8410b718 census.rs
+8682851f design.rs
+fda77452 main.rs prose.rs prove.rs
+42e19958 prove.rs
+44e6b3bf steps.rs
+467da6d4 gate.rs
+550a0020 dispatch.rs main.rs
+db8218ec gate.rs prove.rs
+177df5eb brief.rs dispatch.rs freshness.rs gate.rs train/verdicts.rs
+0c4a0fce brief.rs documents.rs
+6cff49a6 brief.rs channels.rs dispatch.rs documents.rs job.rs main.rs train/verdicts.rs
+331828f1 dispatch.rs
+aef0f7e5 orient.rs
+5c9216f3 orient.rs
+4193413f dispatch.rs
+ec9fae49 dispatch.rs dispatch_hook.rs main.rs orient.rs
+4cb3d3a7 gate.rs
+0aeb0f81 brief.rs dispatch.rs documents.rs main.rs
+60b06458 tenant.rs tenant_export.rs
+88d73f6d dispatch.rs
+fa45a86d brief.rs dispatch.rs documents.rs steps.rs
+a242c904 main.rs prose.rs steps.rs
+48dd3365 gate.rs
+95c70890 dispatch.rs dispatch_hook.rs main.rs
+6a7075c1 brief.rs gate.rs prove.rs
+d0a307d8 dispatch.rs dispatch_hook.rs documents.rs
+28937f2d dispatch.rs
+f3ebffd5 dispatch.rs orient.rs tenant.rs train/conductor.rs train/forge.rs train/verdicts.rs
+b453d668 gate.rs identity.rs prove.rs
+e7f36cd6 documents.rs
+edbc8020 built_from.rs orient.rs
+642bbb83 channels.rs gate.rs main.rs orient.rs park.rs rerail.rs train/conductor.rs train_gate.rs
+60d95aad tenant.rs
+d284168b train/red_verdict.rs upgrade.rs
+fe2fbe7b gate.rs
+821ec948 tenant_stamp.rs train/conductor.rs train/consist.rs
+64f9373b dispatch.rs dispatch_hook.rs main.rs
+aa19a2d9 dispatch.rs gate.rs main.rs tenant.rs tenant_export.rs tenant_publish.rs
+91e3d219 design.rs tenant.rs
+e969094b design.rs gate.rs main.rs tenant_publish.rs train/conductor.rs train_gate.rs
+11e3541c brief.rs delivery_policy.rs dispatch.rs documents.rs gate.rs main.rs prove.rs tenant.rs tenant_publish.rs
+84ec5c40 brief.rs gate.rs main.rs prove.rs tenant.rs tenant_publish.rs tenant_stamp.rs
+478231fb tenant.rs tenant_publish.rs
+ead63bba cadence.rs main.rs steps.rs
+c979f2e0 gate.rs job.rs orient.rs prove.rs
+07daca42 main.rs steps.rs train.rs train/boarding.rs train/cars.rs train/conductor.rs train/consist.rs train/entry.rs train/forge.rs train/jobs_api.rs train/mod.rs train/preflight.rs train/red_verdict.rs train/stranded.rs train/sweep.rs train/verdicts.rs
+61baa3f8 deploy.rs doctor.rs main.rs ops.rs train.rs
+afd5756c delivery_policy.rs train.rs
+7e971d15 design.rs identity.rs orient.rs
+1a09f660 estate.rs main.rs tenant.rs tenant_publish.rs
+94a7b191 owner.rs
+8b7f01d9 inspect.rs main.rs ops.rs prove.rs queue.rs
+f650c632 car.rs design.rs gate.rs main.rs owner.rs park.rs tenant.rs train.rs
+a9a8c27c train.rs
+b6a64314 tenant.rs
+3465acbb tenant.rs tenant_publish.rs
+ca86132f tenant.rs tenant_publish.rs
+3c4bf66b tenant.rs
+f99842a1 tenant.rs
+bcab84d3 tenant.rs tenant_publish.rs
+32112989 tenant.rs
+e276842f tenant.rs tenant_publish.rs
+5065458c tenant.rs tenant_publish.rs
+1202630f orient.rs
+79e074bc freshness.rs gate.rs tenant.rs tenant_publish.rs
+be8cec4a tenant.rs tenant_publish.rs
+564411b2 tenant.rs tenant_publish.rs
+72c7fa95 tenant_publish.rs
+d89d51fe delivery_policy.rs
+1e75ff14 main.rs tenant.rs tenant_publish.rs
+8428b2c9 park.rs
+34698347 cadence.rs
+b4d7a0fd main.rs tenant.rs train.rs
+dce2330a design.rs main.rs train.rs
+5c6ca038 job.rs main.rs ops_request.rs
+eed209f5 main.rs train.rs
+6c13191b orient.rs
+b8f3bebb channels.rs train.rs
+8c57c717 design.rs main.rs
+1780f20d ops.rs
+3f6414cb job.rs park.rs train.rs train_gate.rs
+b6ae5d04 prove.rs
+640033d3 job.rs
+af3d1177 job.rs
+75720fba job.rs main.rs
+f4255741 orient.rs prove.rs
+566355da prove.rs
+2661dec3 channels.rs gate.rs orient.rs
+a225ff01 prove.rs train.rs train_gate.rs
+6d393b38 gate.rs prove.rs train.rs train_gate.rs
+89342a36 gate.rs
+aea32aef train.rs
+c0a0cf95 gate.rs main.rs train.rs train_gate.rs
+57980cca main.rs ops_request.rs orient.rs
+845f44ad built_from.rs main.rs orient.rs
+a7c3bf4f ops_request.rs orient.rs
+16c3ebb0 freshness.rs gate.rs main.rs ops_request.rs rerail.rs train.rs
+47a31701 train.rs
+5e11fbba gate.rs
+3a9a7971 train.rs
+2c7d3abc orient.rs train.rs
+30be690b cadence.rs gate.rs job.rs prove.rs
+0e65b018 built_from.rs main.rs orient.rs
+78ae6fbf main.rs orient.rs
+131a783f brief.rs job.rs main.rs
+c8a493d3 freshness.rs gate.rs main.rs orient.rs publish_requests.rs rerail.rs train.rs
+06e0c0f1 gate.rs main.rs prove.rs train.rs
+e749aa47 envelope.rs job.rs main.rs
+e8b1e969 train.rs
+30f84415 gate.rs orient.rs
+e6f3f7fd gate.rs main.rs prove.rs
+e06defcc car.rs main.rs
+c90a5506 gate.rs
+4cacf618 prove.rs train.rs
+e9647bb4 car.rs main.rs park.rs prove.rs
+5faf5f3a train.rs
+d884b0ec orient.rs
+3eedd517 gate.rs main.rs
+98b5fe2a rerail.rs train.rs
+d124f814 prove.rs
+0c86bdfd cadence.rs deploy.rs docs.rs main.rs train.rs
+01240ef2 docs.rs docs_flush.rs gate.rs main.rs
+59425103 park.rs

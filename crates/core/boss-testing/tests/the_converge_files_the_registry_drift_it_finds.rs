@@ -28,7 +28,7 @@
 //! the next converge would.
 
 use boss_testing::announce::{await_announced_port, with_announce};
-use boss_testing::repo_root;
+use boss_testing::{repo_root, without_proxy};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -74,8 +74,10 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_GET(self):
+        # Whether the machine token came with it (backlog 44b2087e).
+        tok = b" token=yes" if self.headers.get("x-boss-machine-token") else b" token=no"
         with open(log, "ab") as f:
-            f.write(b"GET " + self.path.encode() + b"\n")
+            f.write(b"GET " + self.path.encode() + tok + b"\n")
         if self.path.startswith("/api/workflows"):
             if mode == "registries-down":
                 self._reply(503, b'{"error":"upstream unavailable"}')
@@ -544,7 +546,7 @@ fn start_stub(case: &str, p: &Plants, mode: &str) -> Stub {
     std::fs::write(&registry, registry_fixture(p)).unwrap();
     std::fs::write(&rules, rules_fixture(p)).unwrap();
     boss_testing::write_exec(&script, &with_announce(STUB));
-    let mut child = Command::new("python3")
+    let mut child = without_proxy(&mut Command::new("python3"))
         .arg(&script)
         .args([&log, &started, &registry, &rules])
         .arg(mode)
@@ -558,7 +560,18 @@ fn start_stub(case: &str, p: &Plants, mode: &str) -> Stub {
 
 /// One converge's last phase: (exit, stdout, stderr).
 fn run(repo: &Path, jobs_url: &str, dispatcher_url: Option<&str>) -> (Option<i32>, String, String) {
+    run_with(repo, jobs_url, dispatcher_url, &[])
+}
+
+/// The same, with `env` set last.
+fn run_with(
+    repo: &Path,
+    jobs_url: &str,
+    dispatcher_url: Option<&str>,
+    env: &[(&str, &str)],
+) -> (Option<i32>, String, String) {
     let mut cmd = Command::new("bash");
+    without_proxy(&mut cmd);
     cmd.arg(script())
         .arg("--repo")
         .arg(repo)
@@ -572,6 +585,9 @@ fn run(repo: &Path, jobs_url: &str, dispatcher_url: Option<&str>) -> (Option<i32
         .env_remove("BOSS_ESTATE");
     if let Some(url) = dispatcher_url {
         cmd.env("BOSS_DISPATCHER_URL", url);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     let out = cmd.output().expect("bash");
     (
@@ -742,6 +758,65 @@ fn a_disagreement_files_one_item_and_the_next_converge_files_none() {
     assert!(
         last_line(&out).contains("filed 0, already open 6"),
         "and says each is already open: {out}"
+    );
+}
+
+/// EVERY READ OF THE PHASE CARRIES THE MACHINE TOKEN, THE LINTS' TOO
+/// (backlog 44b2087e, 2026-10-09). The script stamped its own reads and
+/// writes, and the two lints it runs read the registries themselves —
+/// with no token, because a lint holds none by rule. Measured on the
+/// machine-gate window: one tokenless `GET /api/workflows` and one
+/// `GET /api/dispatcher/rules` per converge, signed
+/// `automation:gate-runner` from the forge. Now the script reads both
+/// registries itself, stamped, and hands each lint its read: so with a
+/// token on the host, every request the stub RECEIVES carries it, the
+/// rules are read once, and the comparison is the same six items.
+#[test]
+fn every_read_of_the_phase_carries_the_machine_token_and_the_lints_send_none() {
+    if !has_tools() {
+        eprintln!("skipping: needs python3, git and curl");
+        return;
+    }
+    let p = plants();
+    let repo = fixture_repo("token", &p);
+    let stub = start_stub("token", &p, "serve");
+    let base = format!("http://127.0.0.1:{}", stub.port);
+    let tokens = boss_testing::scratch_dir("registry-drift-machine-token");
+    std::fs::write(tokens.join("current"), "stub-machine-token-44b2087e\n").unwrap();
+    let (rc, out, err) = run_with(
+        &repo,
+        &base,
+        Some(&base),
+        &[("BOSS_MACHINE_TOKEN_DIR", &tokens.display().to_string())],
+    );
+    assert_eq!(rc, Some(0), "{out}\n{err}");
+    let log = stub.log();
+    let gets: Vec<&str> = log.lines().filter(|l| l.starts_with("GET ")).collect();
+    let rules = gets
+        .iter()
+        .filter(|l| l.starts_with("GET /api/dispatcher/rules "))
+        .count();
+    assert_eq!(
+        rules, 1,
+        "the rules are read once, by the script, and handed to the lint:\n{log}"
+    );
+    assert!(
+        gets.iter().any(|l| l.starts_with("GET /api/workflows ")),
+        "the workflows were never read:\n{log}"
+    );
+    let bare: Vec<&&str> = gets.iter().filter(|l| !l.ends_with(" token=yes")).collect();
+    assert!(
+        bare.is_empty(),
+        "these reads reached the registries without the machine token while the host holds \
+         one — each a caller its gate would refuse:\n{bare:#?}\nall:\n{log}\n{err}"
+    );
+    assert!(
+        last_line(&out).contains("filed 6, already open 0"),
+        "handed their reads, the lints compare exactly as they did reading for themselves:\n{out}\n{err}"
+    );
+    assert!(
+        !format!("{out}{err}").contains("stub-machine-token-44b2087e"),
+        "the token is in the phase's output:\n{out}\n{err}"
     );
 }
 
@@ -1522,6 +1597,49 @@ fn a_shallow_checkout_does_not_advise_resurrecting_a_retired_kind() {
     }
 }
 
+/// A tree git cannot read at all is not a shallow one (review 1ba2873d,
+/// B1). Since backlog 683d7fe9 the converge runs from a VIEW of root's
+/// tree, an export with no `.git`: HEAD read `unknown`, the shallow probe
+/// answered nothing and so "shallow", and every kind the phase could not
+/// place was filed "side not measured … SHALLOW" while every file date
+/// read as unreadable — items about the checkout, not the registries. A
+/// tree whose HEAD git cannot resolve files NOTHING and says so on the
+/// summary line, which the converge records on its packet.
+#[test]
+fn a_tree_whose_history_git_cannot_read_files_nothing() {
+    if !has_tools() {
+        eprintln!("skipping: needs python3, git and curl");
+        return;
+    }
+    let p = plants();
+    let repo = fixture_repo("no-history", &p);
+    std::fs::remove_dir_all(repo.join(".git")).unwrap();
+    let stub = start_stub("no-history", &p, "serve");
+    let base = format!("http://127.0.0.1:{}", stub.port);
+    let ceiling = repo.parent().unwrap().display().to_string();
+    let (rc, out, err) = run_with(
+        &repo,
+        &base,
+        Some(&base),
+        &[("GIT_CEILING_DIRECTORIES", &ceiling)],
+    );
+    assert_eq!(
+        rc,
+        Some(0),
+        "the phase never fails the converge:\n{out}\n{err}"
+    );
+    assert!(
+        stub.posts().is_empty(),
+        "nothing is filed from a tree whose history cannot be read:\n{out}\n{err}\n{}",
+        stub.log()
+    );
+    let last = last_line(&out);
+    assert!(
+        last.contains("CANNOT ANSWER") && last.contains("nothing filed"),
+        "the summary says why nothing was filed: {last}"
+    );
+}
+
 /// The converge runs the phase LAST — after every roll, so every seed has
 /// run — records its summary on the packet, and cannot be failed by it.
 #[test]
@@ -1571,7 +1689,7 @@ fn the_converge_runs_the_comparison_last_and_cannot_fail_on_it() {
             dir.display(),
             fields.display()
         );
-        let out = Command::new("bash")
+        let out = without_proxy(&mut Command::new("bash"))
             .arg("-c")
             .arg(&harness)
             .output()

@@ -5,8 +5,9 @@
 //! by ONE account. Until backlog a604a35b that was the checkout owner's
 //! for all of them (`User=david`); since it the watchdog runs as root
 //! and keeps its three under its own root-only state directory, and the
-//! cluster converge — still that owner's — keeps an alert spool of its
-//! own and replays it itself. No account replays a file another wrote:
+//! cluster converge keeps an alert spool of its own and replays it itself
+//! — root's too, under ITS state directory, since backlog 683d7fe9. No
+//! unit replays a file another wrote:
 //!
 //! | spool | written by | read (replayed) by |
 //! |---|---|---|

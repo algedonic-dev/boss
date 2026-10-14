@@ -176,9 +176,11 @@ if [ -n "${BOSS_DEPOSIT_KUBECTL:-}" ]; then
 else
     # The forge's admin kubeconfig through the kubectl container every
     # forge script uses (kubectl is not on the host). ABSENT is not ready
-    # (root material David places, backlog 714bc71f), never a red.
+    # (root material David places, backlog 714bc71f), never a red. No
+    # container log: the credential kubectl prints reaches this script
+    # and never the docker daemon's log driver (backlog aa700921).
     KC="${BOSS_OPS_DIR:-/etc/boss-ops}/kubeconfig"
-    KUBECTL=(docker run --rm --network host -v "$KC:/kc:ro" alpine/k8s:1.33.3 kubectl --kubeconfig=/kc)
+    KUBECTL=(docker run --rm --log-driver=none --network host -v "$KC:/kc:ro" alpine/k8s:1.33.3 kubectl --kubeconfig=/kc)
     if [ ! -e "$KC" ] && [ ! -L "$KC" ]; then
         KC_STATE="not ready: $KC absent — root material, placed by David (design 835c0c9c)"
     elif [ ! -r "$KC" ]; then
@@ -269,8 +271,16 @@ machine_token_header MT_HDR "${BOSS_JOBS_URL:-}" \
 # the door car 025640e3 gave the ops runner. Withheld is RED, not a
 # retry: nothing can be proved until the URL or the list is repaired. The
 # sentence names the rule and nothing of the URL.
+# The rule also withholds a request curl would send through a proxy
+# (backlog 50708d76, F4), and the sentence says which of the two refused.
 RC_WITHHELD=""
-if [ -n "${BOSS_JOBS_URL:-}" ] && ! machine_token_admits "$BOSS_JOBS_URL"; then
+RC_RULE=0
+if [ -n "${BOSS_JOBS_URL:-}" ]; then
+    machine_token_admits "$BOSS_JOBS_URL" || RC_RULE=$?
+fi
+if [ "$RC_RULE" -eq 2 ]; then
+    RC_WITHHELD="the runner credential is NOT presented — curl would send it through the proxy in \$$(machine_token_proxy "$BOSS_JOBS_URL"), which would read it; unset that variable for this run"
+elif [ "$RC_RULE" -ne 0 ]; then
     RC_WITHHELD="the runner credential is NOT presented — the host of BOSS_JOBS_URL is not loopback and not in BOSS_MACHINE_TOKEN_HOSTS (/etc/boss/sor.env)"
 fi
 NO_DOOR="the jobs API at ${BOSS_JOBS_URL:-(unset)} has no credential door (GET /api/jobs/runner-credential answered 404) — a build without it; no value can be proved until it is back"

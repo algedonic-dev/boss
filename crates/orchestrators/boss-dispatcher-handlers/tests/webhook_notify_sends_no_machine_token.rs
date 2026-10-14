@@ -68,7 +68,7 @@ async fn the_webhook_post_carries_no_machine_token() {
         "control: api_client() sent no token, so the leg below proves nothing:\n{control}"
     );
 
-    let handler = WebhookNotify::new(Some(url.clone()));
+    let handler = WebhookNotify::new(Some(url.clone())).unwrap();
     let ctx = InvocationContext {
         event_timestamp: None,
         rule_name: "forward-invoice-created".into(),

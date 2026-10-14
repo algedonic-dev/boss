@@ -28,6 +28,17 @@
 //! Nothing here touches a live system of record: every app is an
 //! in-memory router, and the registry publishes go through the same
 //! HTTP routes `boss workflow publish` calls.
+//!
+//! THE SIGNER HALF ALONE (row E, 2026-10-10). The tree's row now also
+//! carries the runner half — `runner:ops` on every key the runner
+//! renders and as `execute`'s executor — which is rehearsed in
+//! tests/the_ops_runner_is_the_only_writer_of_the_plan_a_human_signs.rs.
+//! These tests drive the row with that half taken off (the one
+//! definition of it, tests/ops_request_rows), so the runner here still
+//! renders its plan with no credential, exactly as it did under the
+//! signer row, and what they hold is the signer's half and nothing else.
+
+mod ops_request_rows;
 
 use std::sync::Arc;
 
@@ -38,7 +49,7 @@ use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
 use boss_jobs::http::{JobsApiState, PresenceKey, router};
 use boss_jobs::owner_resolution::RosterLookup;
-use boss_jobs::registry::{WorkflowSpec, seedable_platform_workflows};
+use boss_jobs::registry::WorkflowSpec;
 use boss_jobs::{InMemoryJobs, InMemoryWorkflows, WorkflowRegistry};
 use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
 use boss_testing::RecordingEventBus;
@@ -55,17 +66,15 @@ const RUNNER_KEYS: [&str; 5] = ["plan", "verb", "host", "args", "rendered_plan_s
 // The two rows
 // ---------------------------------------------------------------------
 
-/// The tree's row: `infra/platform/workflows/ops-request.toml`, read by
-/// the loader the seed and `boss workflow publish` both use.
+/// The signer row: `infra/platform/workflows/ops-request.toml`, read by
+/// the loader the seed and `boss workflow publish` both use, with the
+/// runner half of row E taken off — the row live as v12, before row E.
 fn declared_row() -> WorkflowSpec {
-    seedable_platform_workflows()
-        .into_iter()
-        .find(|w| w.kind == "ops-request")
-        .expect("the ops-request protocol is in the platform bundle")
+    ops_request_rows::without_the_runner_half()
 }
 
-/// The row as it stood before this car: the same file without the two
-/// signer fields. `the_car_adds_two_signer_fields_and_nothing_else`
+/// The row as it stood before the signer car: the signer row without
+/// its two signer fields. `the_car_adds_two_signer_fields_and_nothing_else`
 /// holds that this is the WHOLE difference, so publishing this is
 /// publishing the row that was live.
 fn no_writer_row() -> WorkflowSpec {
@@ -468,10 +477,12 @@ fn approve_writers(row: &Value) -> Vec<(String, Option<String>)> {
 // ---------------------------------------------------------------------
 
 /// THE CAR IS TWO FIELDS. The signer's keys are declared, to the signer;
-/// the runner's five are exactly as they were — no writer, until the car
-/// that delivers the runner credential — and nothing else in the row
-/// declares a writer or an executor. And the row lints: a `signer`
-/// writer needs no enrolled principal, only a required sign-off role.
+/// in the signer row the runner's five are exactly as they were — no
+/// writer; row E declares `runner:ops` on them, and its test holds that
+/// taking that half off is the whole difference — and nothing else in
+/// the row declares a writer or an executor. And the row lints: a
+/// `signer` writer needs no enrolled principal, only a required
+/// sign-off role.
 #[test]
 fn the_car_adds_two_signer_fields_and_nothing_else() {
     let row = declared_row();
@@ -508,7 +519,7 @@ fn the_car_adds_two_signer_fields_and_nothing_else() {
             .unwrap_or_else(|| panic!("`{key}` is still a declared field"));
         assert_eq!(
             field.writer, None,
-            "`{key}` declares no writer in this car: `runner:ops` waits for the runner credential"
+            "`{key}` declares no writer in the signer row: `runner:ops` is row E's half"
         );
     }
     assert!(

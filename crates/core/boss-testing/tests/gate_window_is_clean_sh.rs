@@ -315,6 +315,101 @@ fn clean_machine() -> Value {
     doc
 }
 
+/// The shell must ask the native gate's question, not whether it counted
+/// any traffic. Accepted probe-reader and rotation observations are
+/// counted too (01d841a3); pin the second representation to the first.
+#[test]
+fn machine_rows_follow_the_native_enforcement_verdict() {
+    use boss_core::machine_gate::Presented;
+
+    for presented in [
+        Presented::None,
+        Presented::Mismatch,
+        Presented::Previous,
+        Presented::ReaderCurrent,
+        Presented::ReaderNext,
+        Presented::ReaderPrevious,
+        Presented::Asked,
+    ] {
+        let mut doc = clean_machine();
+        doc["live"][0]["snapshot"]["rows"] = json!([{
+            "peer": "192.0.2.15", "user": "automation:run-car-probe-reader",
+            "method": "GET", "route": "/api/machine-gate/accepts",
+            "presented": presented, "count": 3,
+            "first_seen": "2026-10-06T16:50:00Z", "last_seen": "2026-10-06T17:00:00Z"
+        }]);
+        let (code, out, err) = judge(&["machine-gate"], &doc.to_string());
+        assert_eq!(
+            code,
+            i32::from(presented.enforce_refuses()),
+            "{presented:?}: {out}{err}"
+        );
+    }
+    for presented in [Value::Null, json!("unknown-slot"), json!(true), json!(3)] {
+        let mut doc = clean_machine();
+        doc["live"][0]["snapshot"]["rows"] = json!([{"peer": "192.0.2.15", "user": "probe-reader",
+            "method": "GET", "route": "/api/jobs", "presented": presented, "count": 3}]);
+        assert_eq!(judge(&["machine-gate"], &doc.to_string()).0, 1);
+    }
+    for count in [Value::Null, json!(0), json!(-1), json!(1.5), json!("3")] {
+        let mut doc = clean_machine();
+        doc["live"][0]["snapshot"]["rows"] = json!([{"peer": "192.0.2.15", "user": "probe-reader",
+                "method": "GET", "route": "/api/jobs", "presented": "reader.current", "count": count}]);
+        assert_ne!(judge(&["machine-gate"], &doc.to_string()).0, 0);
+    }
+    for key in ["peer", "user", "method", "route"] {
+        let mut doc = clean_machine();
+        let mut row = json!({"peer": "192.0.2.15", "user": "probe-reader",
+            "method": "GET", "route": "/api/jobs", "presented": "reader.current", "count": 3});
+        row.as_object_mut().unwrap().remove(key);
+        doc["live"][0]["snapshot"]["rows"] = json!([row]);
+        assert_ne!(
+            judge(&["machine-gate"], &doc.to_string()).0,
+            0,
+            "missing {key}"
+        );
+    }
+    let mut mixed = clean_machine();
+    mixed["live"][0]["snapshot"]["rows"] = json!([
+        {"peer": "192.0.2.15", "user": "probe-reader", "method": "GET", "route": "/api/jobs", "presented": "reader.current", "count": 3},
+        {"peer": "192.0.2.15", "user": "unsigned", "method": "GET", "route": "/api/jobs", "presented": "none", "count": 1}
+    ]);
+    assert_eq!(judge(&["machine-gate"], &mixed.to_string()).0, 1);
+}
+
+/// An array can match jq's index as a subarray (review ad438bc8).
+/// Only the native presentation's string spelling can certify a row.
+#[test]
+fn malformed_machine_presentations_never_certify_a_clean_window() {
+    use boss_core::machine_gate::Presented;
+
+    for presented in [
+        Value::Null,
+        json!({}),
+        json!(true),
+        json!(3),
+        json!([]),
+        json!(["previous"]),
+        json!(["reader.current"]),
+        json!(["previous", "reader.current"]),
+    ] {
+        assert!(
+            serde_json::from_value::<Presented>(presented.clone()).is_err(),
+            "the native type refuses this malformed presentation: {presented}"
+        );
+        let mut doc = clean_machine();
+        doc["live"][0]["snapshot"]["rows"] = json!([{
+            "peer": "192.0.2.15", "user": "probe-reader",
+            "method": "GET", "route": "/fixture", "presented": presented,
+            "count": 3, "first_seen": "2026-10-06T16:50:00Z",
+            "last_seen": "2026-10-06T17:00:00Z"
+        }]);
+        let (code, out, err) = judge(&["machine-gate"], &doc.to_string());
+        assert_ne!(code, 0, "malformed {presented} certified clean: {out}{err}");
+        assert!(!out.contains("GATE-WINDOW-CLEAN"), "{out}");
+    }
+}
+
 /// Row C's window is judged under ONE launch roster generation, and the
 /// judge reads that from the answer itself: the join already refuses a
 /// spanning window in `not_clean`, and an answer that names no
@@ -365,6 +460,133 @@ fn the_machine_window_names_the_one_generation_it_was_judged_under() {
     let (code, out, err) = judge(&["policy-check"], &clean().to_string());
     assert_eq!(code, 0, "{out}{err}");
     assert!(!out.contains("roster_generation"), "{out}");
+}
+
+/// A clean answer for the actor-role window (row H): the live half is a
+/// service's `actor-role-reports` answer, whose tally is its `report`
+/// member, and whose rows also count every MATCHING request — so a clean
+/// tally is not an empty one, it is one with no row `enforce` would
+/// answer differently.
+fn clean_actor_role() -> Value {
+    let mut doc = clean_machine();
+    doc["gate"] = json!("actor-role");
+    doc["log"]["gate"] = json!("actor-role");
+    doc["required_services"] = json!(["jobs"]);
+    doc["log"]["coverage"][0]["service"] = json!("jobs");
+    doc["roster_generations"][0]["service"] = json!("jobs");
+    doc["live"] = json!([{
+        "service": "jobs",
+        "snapshot": {
+            "service": "jobs",
+            "mode": "report",
+            "snapshot": {"state": "ready"},
+            "report": {
+                "mode": "report",
+                "recording_since": "2026-10-06T16:44:44.220804918Z",
+                "rows": [{"observation": {"actor": "emp-david"}, "count": 41,
+                          "first_seen": "2026-10-06T16:45:00Z",
+                          "last_seen": "2026-10-06T17:39:00Z", "would_refuse": null}],
+                "overflow": 0,
+                "not_clean": [],
+                "evidence": {"recorder": true, "instance": "i", "lost": 0, "unstated": 0,
+                             "retrying": false, "last_error": null}
+            }
+        },
+        "error": null,
+        "not_clean": []
+    }]);
+    doc
+}
+
+/// Row H's window has a machine reader too (backlog b13bd730): until
+/// this car the judge refused `actor-role` as "not a gate", so the
+/// 72-hour answer that flip is earned on had only a person to read it.
+/// It is held to every line the other gates are, to the ONE launch
+/// roster generation its excuses are bound to, and to its own tally's
+/// shape.
+#[test]
+fn the_actor_role_window_is_judged_and_names_its_one_generation() {
+    let (code, out, err) = judge(&["actor-role"], &clean_actor_role().to_string());
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        out.contains("GATE-WINDOW-CLEAN gate=actor-role hours=72")
+            && out.contains("services=jobs")
+            && out.contains("modes=jobs:report")
+            && out.contains("roster_generation=sha256:0f0e0d"),
+        "{out}"
+    );
+    let set = |pointer: &str, value: Value| {
+        let mut doc = clean_actor_role();
+        *doc.pointer_mut(pointer)
+            .unwrap_or_else(|| panic!("{pointer} is in the clean answer")) = value;
+        doc
+    };
+    let mut absent = clean_actor_role();
+    absent.as_object_mut().unwrap().remove("roster_generations");
+    let mut unjudged = clean_actor_role();
+    unjudged["live"][0]["snapshot"]["report"]["rows"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("would_refuse");
+    for (what, doc, names) in [
+        (
+            "an answer from a build that binds no excuse",
+            absent,
+            "roster_generations",
+        ),
+        (
+            "no generation on the log",
+            set("/roster_generations", json!([])),
+            "roster_generations",
+        ),
+        (
+            "a start that stated no stamp",
+            set(
+                "/roster_generations/0",
+                json!({"generation": null, "since": "2026-10-01T02:00:00Z",
+                       "unstated": "the process start carries no roster stamp"}),
+            ),
+            "no roster stamp",
+        ),
+        (
+            "a shape enforce would answer differently",
+            set(
+                "/live/0/snapshot/report/rows/0/would_refuse",
+                json!("would-deny"),
+            ),
+            "enforce",
+        ),
+        ("a row the producer did not judge", unjudged, "enforce"),
+        (
+            "the tally overflowed",
+            set("/live/0/snapshot/report/overflow", json!(2)),
+            "overflow",
+        ),
+        (
+            "the report is off",
+            set("/live/0/snapshot/report/mode", json!("off")),
+            "off",
+        ),
+        (
+            "the tally names a lost fact",
+            set("/live/0/snapshot/report/not_clean", json!(["1 fact lost"])),
+            "1 fact lost",
+        ),
+        (
+            "the answer carries no report",
+            set("/live/0/snapshot/report", Value::Null),
+            "report",
+        ),
+    ] {
+        let (code, out, err) = judge(&["actor-role"], &doc.to_string());
+        assert_eq!(code, 1, "{what}: {out}{err}");
+        assert!(!out.contains("GATE-WINDOW-CLEAN"), "{what}: {out}");
+        assert!(err.contains(names), "{what} names `{names}`: {err}");
+    }
+    // The machine gate's answer is not this gate's, whatever it holds.
+    let (code, _, err) = judge(&["actor-role"], &clean_machine().to_string());
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("machine-gate"), "{err}");
 }
 
 /// Every required service is judged, not the first: a second service

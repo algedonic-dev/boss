@@ -94,6 +94,7 @@ test('every failed statement read paints the failure marker, as an alert', async
 
   // Overview: the commerce summary read.
   await expect(failures(page).filter({ hasText: 'Finance summary unavailable.' })).toBeVisible();
+  await expect(failures(page).filter({ hasText: 'Finance summary unavailable.' })).toContainText('/api/commerce/summary: HTTP 500');
 
   await openTab(page, 'Income statement');
   await expect(failures(page).filter({ hasText: 'Ledger unavailable.' })).toBeVisible();

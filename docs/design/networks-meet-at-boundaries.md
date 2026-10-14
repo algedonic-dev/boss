@@ -1,6 +1,14 @@
 # Design: networks meet at boundaries — retiring the second tenant
 
-**Status**: in-review — the direction is decided; the questions are about scope and order.
+**Status**: settled — David's 2026-09-24 retirement decision is recorded
+on packet `a8991c86`. The repository ships Algedonic Ales as its one
+example and harvests modules used by Ales or Algedonic, LLC. The engine,
+bundle and tenant-only projections were removed by that packet's cars;
+the generic modules and the platform's tenant-neutral guards remain.
+
+The August measurement and questions below are historical context,
+not a pending review or a description of files still shipped. The
+decision is summarized in [the architecture decision record](../architecture-decisions.md).
 
 **Origin**: David, 2026-08-23, on `/ux/refurb`: *"Refurb should be
 removed. We aren't supporting multi-tenancy anymore. It isn't really
@@ -96,9 +104,14 @@ Steps 2–4 are separately reviewable cars. Nothing here needs the
 boundary protocol to exist first — that is the next design, not a
 prerequisite.
 
-## Open questions
+## Historical scope questions
 
 ### Q1: Does anything about the device-shop domain deserve to survive as a platform example?
+
+**Settled:** retain the generic modules Ales or Algedonic, LLC uses;
+the brewery is the single shipped example. The equipment catalog,
+including fields the brewery still populates, is harvested rather than
+deleted merely because a field's vocabulary arose in the device shop.
 
 The Equipment KB (`boss-catalog`, `boss-assets`) was built with
 device refurb in mind and is genuinely generic — the brewery uses it
@@ -109,6 +122,11 @@ brewery becomes the only worked example?
 
 ### Q2: What replaces the second tenant as the guard against Tier-1 leakage?
 
+**Settled:** the existing tenant-neutral bundle guard survives the
+example that motivated it. Its current source and invariant declaration
+define the roster; a historical tenant's continued presence is not a
+prerequisite for checking core boundaries.
+
 Today the answer is a denylist of two tenants' nouns plus a count
 assertion. With one tenant, the denylist half keeps working but the
 "a second tenant would break" argument disappears. Options: keep the
@@ -117,6 +135,10 @@ denylist on its own merits, add a shape rule (no proper nouns in
 job — the FORM fix the invariant's own note already points at.
 
 ### Q3: Is the used-device-shop worth keeping as a *separate network* rather than deleting?
+
+**Settled:** retire this example now. A separate network or boundary
+demonstration is outside the retirement packet and is not promised by
+the product's one-example release.
 
 The doctrine says organizations run their own networks and meet at
 boundaries. A device shop is exactly the kind of counterparty a

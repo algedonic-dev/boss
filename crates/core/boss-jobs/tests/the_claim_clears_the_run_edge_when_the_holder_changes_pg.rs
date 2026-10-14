@@ -129,3 +129,63 @@ async fn a_claim_that_only_respells_the_holder_keeps_its_run_edge() {
     assert_eq!(won.assignee_id.as_deref(), Some(AGENT));
     assert_eq!(won.metadata[EDGE_KEY], OLD_RUN);
 }
+
+/// THE FIRST CLAIM ALSO CLOSES A STEP'S BEFORE-CLAIM RECORDS (backlog
+/// e6b05dd6, re-review 211cbae4 B1), in the same statement as the edge.
+/// A step declaring `records_before_claim` is marked with the claim's
+/// instant; a release (a plain step write back to Ready, no holder) keeps
+/// the mark; a re-claim keeps the FIRST instant; and a step that declares
+/// nothing is not marked at all. Spelled in SQL here and in Rust in the
+/// in-memory adapter, so the two are held to one rule by this test and
+/// `records_before_claim`'s own.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_claim_marks_a_step_declaring_before_claim_records() {
+    use boss_jobs::records_before_claim::{CLAIMED_KEY, KEY};
+    let db = TestDb::new().await;
+    let repo = boss_jobs::PgJobs::new(db.pool.clone());
+    let stamp = || {
+        boss_core::publisher::EventStamp::new("jobs", boss_core::actor::ActorId::automation("test"))
+    };
+
+    let step_id = seeded_step(&repo, StepStatus::Ready, None).await;
+    let mut step = repo.get_step(&step_id).await.unwrap().unwrap();
+    step.metadata = serde_json::json!({ KEY: ["launch.model"], "notes": "kept" });
+    repo.update_step(&step).await.unwrap();
+
+    let first = stamp();
+    let won = repo
+        .claim_step_at(&step_id, AGENT, &first, &[])
+        .await
+        .expect("an unassigned ready step is claimable");
+    let at = serde_json::to_value(first.timestamp).unwrap();
+    assert_eq!(won.metadata[CLAIMED_KEY], at, "{}", won.metadata);
+    assert_eq!(won.metadata["notes"], "kept");
+    assert_eq!(
+        won.metadata,
+        boss_jobs::records_before_claim::closed_by_claim(&step.metadata, &at),
+        "the SQL and the Rust rule leave the same row"
+    );
+
+    // Released: the mark stays.
+    let mut released = won.clone();
+    released.status = StepStatus::Ready;
+    released.assignee_id = None;
+    repo.update_step(&released).await.unwrap();
+    let row = repo.get_step(&step_id).await.unwrap().unwrap();
+    assert_eq!(row.metadata[CLAIMED_KEY], at, "{}", row.metadata);
+
+    // Re-claimed: the first claim's instant stands.
+    let again = repo
+        .claim_step_at(&step_id, AGENT, &stamp(), &[])
+        .await
+        .expect("re-claim after a release");
+    assert_eq!(again.metadata[CLAIMED_KEY], at, "{}", again.metadata);
+
+    // A step that declares nothing is not marked.
+    let plain = seeded_step(&repo, StepStatus::Ready, None).await;
+    let won = repo
+        .claim_step_at(&plain, AGENT, &stamp(), &[])
+        .await
+        .expect("claimable");
+    assert!(won.metadata.get(CLAIMED_KEY).is_none(), "{}", won.metadata);
+}

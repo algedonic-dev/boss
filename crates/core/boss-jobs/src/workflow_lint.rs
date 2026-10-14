@@ -186,7 +186,7 @@ fn check_agent_block_is_runnable(
                 "declares `human_only = false` — an agent may run this step — and no `agent` \
                  block, so nothing says which model, at what effort, under what spend, and \
                  `boss dispatch` refuses it; add `agent = { profile = \"builder\", model = \
-                 \"opus-5[1m]\", budget_usd = 5, effort = \"high\" }` to the step, or drop the \
+                 \"opus-5-5\", budget_usd = 5, effort = \"high\" }` to the step, or drop the \
                  `human_only = false` default if a person does this one",
             ));
         }
@@ -1945,9 +1945,10 @@ mod tests {
             }];
             spec
         };
-        // Today no door resolves any principal, so even the design's own
-        // `runner:ops` is refused until the car that mounts its door.
-        for writer in ["runner:ops", "runner:osp", "", "  "] {
+        // Until row E (2026-10-10) no door resolved any principal, so the
+        // design's own `runner:ops` was refused too; it is resolvable now
+        // and passes, while a typo, an empty string or a blank never do.
+        for writer in ["runner:osp", "", "  "] {
             let errs = validate_workflow(&spec_with(writer), &reg);
             assert!(
                 errs.iter().any(|e| e.step == "finish"
@@ -1957,6 +1958,10 @@ mod tests {
             );
             assert!(gate_active(&spec_with(writer)).is_err(), "{writer:?}");
         }
+        assert!(
+            validate_workflow(&spec_with("runner:ops"), &reg).is_empty(),
+            "the resolvable principal passes the live list"
+        );
         // The rule reads the list it is handed, so the day a door
         // resolves `runner:ops` the same declaration passes, and a typo
         // of it still does not.

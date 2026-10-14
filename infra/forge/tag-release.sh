@@ -80,9 +80,14 @@
 # ENV (test seams — the ops-runner passes no packet-supplied
 # environment, only an argv built from the allowlist, so a packet
 # cannot set these)
-#   BOSS_TAG_RELEASE_TREE       the converged checkout (default: the one
+#   BOSS_TAG_RELEASE_TREE       the converged checkout (default: the
+#                               runner's BOSS_OPS_CHECKOUT, else the one
 #                               this script is in); HEAD is the
 #                               converged main
+#   BOSS_OPS_CHECKOUT           NOT a test seam: the checkout the forge's
+#                               ops-runner drop-in hands every verb,
+#                               because the runner executes root's tree,
+#                               which has no .git (backlog a604a35b)
 #   BOSS_TAG_RELEASE_REMOTE     the forge, as a remote NAME in the tree
 #                               (default forgejo, the converge's) or a
 #                               URL / path
@@ -106,7 +111,7 @@ fail() { say "FAILED — $*"; exit 1; }
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/../.." && pwd)"
-TREE="${BOSS_TAG_RELEASE_TREE:-$REPO}"
+TREE="${BOSS_TAG_RELEASE_TREE:-${BOSS_OPS_CHECKOUT:-$REPO}}"
 REMOTE="${BOSS_TAG_RELEASE_REMOTE:-forgejo}"
 SOR_READ="${BOSS_TAG_RELEASE_SOR_READ:-$REPO/infra/forge/probe-bin/boss-sor-read}"
 TAGGER_NAME="${BOSS_TAG_RELEASE_TAGGER_NAME:-BOSS tag-release}"

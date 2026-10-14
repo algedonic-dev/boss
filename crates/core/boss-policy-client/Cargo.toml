@@ -4,6 +4,10 @@ description = "HTTP client + in-process fake for boss-policy"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+postgres = ["dep:sqlx"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -18,13 +22,14 @@ toml = { workspace = true }
 futures = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
 
 [dev-dependencies]
 # For `assert_roster_floor!`. `default_rules()` is a derived roster four
 # tests range over, and a per-item assertion over it is vacuous the moment
 # it thins (backlog 024c0db2). boss-testing dev-depends on THIS crate in
 # turn; both edges are dev-only, so the library graph stays acyclic.
-boss-testing = { path = "../boss-testing" }
+boss-testing = { path = "../boss-testing", features = ["postgres"] }
 
 [lints]
 workspace = true

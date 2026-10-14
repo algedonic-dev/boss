@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
 /// One `audit_log` row handed to a projection's apply step.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReplayEvent {
     /// `audit_log.id` — the monotonic sequence the replay walks in
     /// order. Carried so the apply step can log which event it skipped.
@@ -112,10 +113,40 @@ pub async fn replay_projection_checked<P, F>(
     wipe: &[&str],
     kind_filter: &str,
     mut validate: P,
-    mut apply: F,
+    apply: F,
 ) -> Result<ReplayStats, String>
 where
     P: AsyncFnMut(&mut PgConnection, &[ReplayEvent]) -> Result<(), String>,
+    F: AsyncFnMut(&mut PgConnection, ReplayEvent) -> Result<Applied, String>,
+{
+    replay_projection_planned(
+        pool,
+        lock_key,
+        wipe,
+        kind_filter,
+        async |conn, events| {
+            validate(conn, events).await?;
+            Ok(events.to_vec())
+        },
+        apply,
+    )
+    .await
+}
+
+/// Validate and prepare a deterministic replay order under the SAME
+/// protected transaction before a wipe. Checkpoint projections may begin
+/// with an observed baseline even when relay delivery put a later fact
+/// ahead of its audit row. Existing callers retain the identity plan.
+pub async fn replay_projection_planned<P, F>(
+    pool: &PgPool,
+    lock_key: i64,
+    wipe: &[&str],
+    kind_filter: &str,
+    mut prepare: P,
+    mut apply: F,
+) -> Result<ReplayStats, String>
+where
+    P: AsyncFnMut(&mut PgConnection, &[ReplayEvent]) -> Result<Vec<ReplayEvent>, String>,
     F: AsyncFnMut(&mut PgConnection, ReplayEvent) -> Result<Applied, String>,
 {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
@@ -158,7 +189,9 @@ where
             payload,
         })
         .collect();
-    validate(&mut tx, &events).await?;
+    let planned = prepare(&mut tx, &events).await?;
+    conserve_plan(&events, &planned)?;
+    let events = planned;
     for stmt in wipe {
         sqlx::query(stmt)
             .execute(&mut *tx)
@@ -176,6 +209,24 @@ where
 
     tx.commit().await.map_err(|e| e.to_string())?;
     Ok(stats)
+}
+
+fn conserve_plan(source: &[ReplayEvent], planned: &[ReplayEvent]) -> Result<(), String> {
+    let rows = |events: &[ReplayEvent]| {
+        events
+            .iter()
+            .map(|e| (e.audit_id, e.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let original = rows(source);
+    let chosen = rows(planned);
+    if original.len() != source.len() || chosen.len() != planned.len() || original != chosen {
+        return Err(
+            "replay plan must conserve every original event row exactly once without mutation"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// The tables a wipe statement clears, read off the statement itself so
@@ -211,6 +262,27 @@ fn wiped_tables(stmt: &str) -> Result<Vec<&str>, String> {
 #[cfg(test)]
 mod tests {
     use super::wiped_tables;
+
+    #[test]
+    fn a_plan_conserves_every_original_row_once_without_mutation() {
+        let row = super::ReplayEvent {
+            audit_id: 1,
+            event_id: uuid::Uuid::nil(),
+            kind: "test".into(),
+            ts: chrono::Utc::now(),
+            payload: serde_json::json!({"fact":1}),
+        };
+        assert!(
+            super::conserve_plan(std::slice::from_ref(&row), std::slice::from_ref(&row)).is_ok()
+        );
+        assert!(super::conserve_plan(std::slice::from_ref(&row), &[]).is_err());
+        assert!(
+            super::conserve_plan(std::slice::from_ref(&row), &[row.clone(), row.clone()]).is_err()
+        );
+        let mut changed = row.clone();
+        changed.payload = serde_json::json!({"fact":2});
+        assert!(super::conserve_plan(&[row], &[changed]).is_err());
+    }
 
     /// Every shape a rebuilder passes today, read to the tables it clears.
     #[test]

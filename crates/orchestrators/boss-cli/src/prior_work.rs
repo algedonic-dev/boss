@@ -1,5 +1,5 @@
 //! WHAT IS ALREADY NAMED (backlog 7562d7a0, and 65a753b7) — what
-//! origin/main and the landed cars already say about a backlog item,
+//! origin/main and the landed or parked cars already say about a backlog item,
 //! read before its step is claimed and printed at the top of its brief.
 //!
 //! The landed-work door (a7837d81) refuses a packet a merged car names
@@ -26,7 +26,7 @@
 //! names the packets that MEASURED it as often as the ones it closes,
 //! and a partial car is by definition not the whole. A refusal on either
 //! would stop a quarter of the queue on a guess and teach `--force`; so
-//! this prints the EVIDENCE — each cited line, each landed part — where
+//! this prints the EVIDENCE — each cited line, each existing car — where
 //! the one about to spend the run reads it first, and the judgement is
 //! theirs (builder rule 15), made in the minute it takes to read the
 //! lines rather than in the run it takes to rediscover them.
@@ -84,14 +84,85 @@ pub(crate) fn partial_cars_query(item_id: &str) -> String {
     )
 }
 
-/// The landed ones among them, re-read off each row rather than trusted
+/// Read all existing car-to-item edges before describing prior work (17bcc877).
+/// A dark, truncated or changing read is evidence we could not gather the set.
+pub(crate) async fn read_cars<F, Fut>(item: &str, fetch: F) -> anyhow::Result<Option<Value>>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Option<Value>>>,
+{
+    let mut out = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for query in [
+        partial_cars_query(item),
+        crate::dispatch::cars_for_item_query(item),
+        // Containment accepts only flat strings (9afea697). Read every
+        // array-bearing car through the native key-presence door, then
+        // let landed_parts judge membership off each complete row.
+        format!(
+            "/api/jobs?kind=ship-a-change&metadata_has={}&limit=50",
+            boss_jobs::car::ALSO_ANSWERS
+        ),
+    ] {
+        let mut offset = 0;
+        let mut expected = None;
+        let mut page_ids = std::collections::BTreeSet::new();
+        loop {
+            let body = fetch(format!("{query}&full=true&offset={offset}"))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("car evidence read returned no body"))?;
+            let total = crate::train::list_total(&body)?;
+            if expected.is_some_and(|previous| previous != total) {
+                anyhow::bail!("car evidence total changed during the read");
+            }
+            expected = Some(total);
+            let page = crate::train::rows(Some(body))?;
+            if page.is_empty() && offset < total {
+                anyhow::bail!("car evidence read answered {offset} of {total} rows: unread tail");
+            }
+            offset += page.len();
+            if offset > total {
+                anyhow::bail!("car evidence carries more rows than its total");
+            }
+            for car in page {
+                let id = car
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("car evidence row has no id"))?
+                    .to_owned();
+                if !page_ids.insert(id.clone()) {
+                    anyhow::bail!("car evidence repeats id {id} across pages");
+                }
+                if ids.insert(id) {
+                    out.push(car);
+                }
+            }
+            if offset == total {
+                break;
+            }
+        }
+    }
+    Ok(Some(json!({"total": out.len(), "data": out})))
+}
+
+/// The landed and still-open cars, re-read off each row rather than trusted
 /// from the query: a server that ignored `metadata=` answers the
 /// unfiltered page, and that must name nothing.
 pub(crate) fn landed_parts(item_id: &str, cars: &[Value]) -> Vec<Value> {
     cars.iter()
         .filter(|c| {
-            c.pointer("/metadata/partial_item").and_then(Value::as_str) == Some(item_id)
-                && boss_jobs::car::is_landed(c)
+            ([boss_jobs::car::PARTIAL_ITEM, boss_jobs::car::BACKLOG_ITEM]
+                .iter()
+                .any(|key| {
+                    c.pointer(&format!("/metadata/{key}"))
+                        .and_then(Value::as_str)
+                        == Some(item_id)
+                })
+                || c.pointer(&format!("/metadata/{}", boss_jobs::car::ALSO_ANSWERS))
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| items.iter().any(|v| v.as_str() == Some(item_id))))
+                && (boss_jobs::car::is_landed(c)
+                    || c.get("status").and_then(Value::as_str) == Some("open"))
         })
         .cloned()
         .collect()
@@ -158,7 +229,7 @@ pub(crate) fn tree_citations(repo: &Path, short: &str) -> Result<Citations, Stri
     }
 }
 
-/// Both halves for `item_id`: the partial-car read the caller made with
+/// Both halves for `item_id`: the existing-car read the caller made with
 /// its own signer, and origin/main in `repo`.
 pub(crate) fn assemble(
     repo: &Path,
@@ -221,11 +292,11 @@ pub(crate) fn section(prior: &PriorWork) -> Option<String> {
     }
     match &prior.parts {
         Ok(p) if p.is_empty() => {
-            out.push_str("No landed car carried part of it (`partial_item`).\n\n")
+            out.push_str("No landed or parked car names this item on either car edge.\n\n")
         }
         Ok(p) => {
             out.push_str(&format!(
-                "Landed cars that carried PART of it (`partial_item`), {}:\n",
+                "Cars already landed or parked for this item (partial or closing), {}:\n",
                 p.len()
             ));
             for car in p {
@@ -237,15 +308,28 @@ pub(crate) fn section(prior: &PriorWork) -> Option<String> {
                 };
                 let summary: String = md("summary").chars().take(LINE_CHARS * 2).collect();
                 out.push_str(&format!(
-                    "  {} {} — merged at {}\n    {summary}\n",
+                    "  {} {} — {} at {}; train {}; recorded {}\n    {summary}\n",
                     short(id),
                     md("branch"),
-                    md("merge_ref")
+                    if boss_jobs::car::is_landed(car) {
+                        "landed"
+                    } else {
+                        "parked / in flight"
+                    },
+                    if boss_jobs::car::is_landed(car) {
+                        md("merge_ref")
+                    } else {
+                        "not merged"
+                    },
+                    md("train"),
+                    car.get("opened_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Unknown")
                 ));
             }
             out.push('\n');
         }
-        Err(why) => out.push_str(&format!("The landed partial cars were NOT read: {why}\n\n")),
+        Err(why) => out.push_str(&format!("The prior cars were NOT read: {why}\n\n")),
     }
     out.push_str(&format!(
         "A citation is not a fix: code names the packets that measured it as often as the \
@@ -275,9 +359,7 @@ pub(crate) fn warning(prior: &PriorWork) -> Option<String> {
         Err(why) => said.push(format!("origin/main was not searched ({why})")),
     }
     match &prior.parts {
-        Ok(p) if !p.is_empty() => {
-            said.push(format!("{} landed car(s) carried part of it", p.len()))
-        }
+        Ok(p) if !p.is_empty() => said.push(format!("{} landed or parked car(s) name it", p.len())),
         Ok(_) => {}
         Err(why) => said.push(format!("the partial cars were not read ({why})")),
     }
@@ -336,6 +418,211 @@ mod tests {
 
     /// Only a backlog-item is searched: it is the only packet whose fix
     /// can already be on main.
+    #[test]
+    fn parked_partial_work_is_named_before_another_builder_starts() {
+        let parked = car(
+            "27073bd0-0000-4000-8000-000000000002",
+            "partial_item",
+            ITEM,
+            false,
+        );
+        let parts = landed_parts(ITEM, &[parked]);
+        assert_eq!(
+            parts.len(),
+            1,
+            "parked partial work must not disappear from the brief"
+        );
+    }
+
+    #[test]
+    fn a_car_also_answering_this_item_is_not_hidden() {
+        let mut related = car(
+            "27073bd0-0000-4000-8000-000000000002",
+            "backlog_item",
+            "another-item",
+            false,
+        );
+        related["metadata"][boss_jobs::car::ALSO_ANSWERS] = json!([ITEM]);
+        assert_eq!(landed_parts(ITEM, &[related]).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn native_metadata_contract_keeps_all_three_edges_across_pages() {
+        let closing = car(
+            "aaaaaaaa-0000-4000-8000-000000000003",
+            "backlog_item",
+            ITEM,
+            true,
+        );
+        let partial = car(
+            "27073bd0-0000-4000-8000-000000000002",
+            "partial_item",
+            ITEM,
+            false,
+        );
+        let mut related = car(
+            "bbbbbbbb-0000-4000-8000-000000000004",
+            "backlog_item",
+            "other",
+            false,
+        );
+        related["metadata"][boss_jobs::car::ALSO_ANSWERS] = json!(["other", ITEM]);
+        let mut foreign = car(
+            "cccccccc-0000-4000-8000-000000000005",
+            "backlog_item",
+            "other",
+            true,
+        );
+        foreign["metadata"][boss_jobs::car::ALSO_ANSWERS] = json!(["other"]);
+        let mut overlap = closing.clone();
+        overlap["metadata"][boss_jobs::car::ALSO_ANSWERS] = json!([ITEM]);
+        let rows = vec![overlap, partial, foreign, related];
+        let body = read_cars(ITEM, |path| {
+            let rows = rows.clone();
+            async move {
+                let params = path.split_once('?').unwrap().1.split('&')
+                    .map(|p| p.split_once('=').unwrap()).collect::<std::collections::BTreeMap<_, _>>();
+                // This is the server's actual shared wire parser, not a stub
+                // accepting a query the native API refuses (9afea697).
+                let contains = params.get("metadata").map(|text| {
+                    let decoded = percent_encoding::percent_decode_str(text).decode_utf8().unwrap();
+                    boss_jobs::metadata_containment::parse(&decoded).map_err(anyhow::Error::msg)
+                }).transpose()?;
+                let selected = rows.into_iter().filter(|row| {
+                    contains.as_ref().is_none_or(|doc| doc.iter().all(|(key, value)| row["metadata"].get(key) == Some(value)))
+                        && params.get("metadata_has").is_none_or(|key| row["metadata"].get(*key).is_some())
+                }).collect::<Vec<_>>();
+                let offset = params["offset"].parse::<usize>().unwrap();
+                let total = selected.len();
+                Ok(Some(json!({"total": total, "data": selected.into_iter().skip(offset).take(1).collect::<Vec<_>>() })))
+            }
+        }).await.expect("the native contract must accept every query");
+        let rows = crate::train::rows(body).unwrap();
+        assert_eq!(rows.len(), 4, "cross-query overlap is deduplicated");
+        let related = landed_parts(ITEM, &rows);
+        assert_eq!(
+            related.len(),
+            3,
+            "foreign array edges must be filtered locally"
+        );
+        assert!(
+            related
+                .iter()
+                .any(|row| row["id"] == "bbbbbbbb-0000-4000-8000-000000000004"),
+            "the array-only edge on the last page must remain visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn array_edge_read_failures_never_publish_a_partial_success() {
+        for (fault, expected) in [
+            ("failed", "native read failed"),
+            ("body", "no body"),
+            ("total", "total"),
+            ("changed", "total changed"),
+            ("duplicate", "repeats id"),
+            ("tail", "unread tail"),
+            ("id", "no id"),
+        ] {
+            let answer = read_cars(ITEM, |path| async move {
+                let row = car(
+                    "aaaaaaaa-0000-4000-8000-000000000003",
+                    "backlog_item",
+                    ITEM,
+                    true,
+                );
+                // First two edges succeeded: failure of the broader array
+                // read must still make the entire approach unknown.
+                if !path.contains("metadata_has=") {
+                    return Ok(Some(json!({"total": 1, "data": [row]})));
+                }
+                if path.contains("offset=0") {
+                    return Ok(Some(json!({"total": 2, "data": [row]})));
+                }
+                match fault {
+                    "failed" => anyhow::bail!("native read failed"),
+                    "body" => Ok(None),
+                    "total" => Ok(Some(json!({"data": [row]}))),
+                    "changed" => Ok(Some(json!({"total": 3, "data": [row]}))),
+                    "duplicate" => Ok(Some(json!({"total": 2, "data": [row]}))),
+                    "tail" => Ok(Some(json!({"total": 2, "data": []}))),
+                    "id" => Ok(Some(
+                        json!({"total": 2, "data": [{"metadata": {"also_answers": [ITEM]}}]}),
+                    )),
+                    _ => unreachable!(),
+                }
+            })
+            .await
+            .expect_err("a failed tail must not become complete evidence");
+            assert!(answer.to_string().contains(expected), "{fault}: {answer:#}");
+            let prior = PriorWork {
+                item: ITEM.into(),
+                citations: Ok(Citations {
+                    at: "control".into(),
+                    lines: vec![],
+                }),
+                parts: Err(answer.to_string()),
+            };
+            assert!(
+                section(&prior)
+                    .unwrap()
+                    .contains("The prior cars were NOT read")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_closing_and_partial_edges_and_refuses_an_unread_tail() {
+        let body = read_cars(ITEM, |path| async move {
+            let closing = percent_encoding::percent_decode_str(&path).decode_utf8().unwrap().contains("backlog_item");
+            Ok(Some(json!({ "total": 1, "data": [car(
+                if closing { "aaaaaaaa-0000-4000-8000-000000000003" } else { "27073bd0-0000-4000-8000-000000000002" },
+                if closing { "backlog_item" } else { "partial_item" }, ITEM, closing)] })))
+        }).await.expect("both native edges read");
+        assert_eq!(crate::train::rows(body).unwrap().len(), 2);
+        let incomplete = read_cars(ITEM, |path| async move {
+            Ok(Some(if path.contains("offset=0") {
+                json!({ "total": 2, "data": [car("27073bd0-0000-4000-8000-000000000002", "partial_item", ITEM, false)] })
+            } else { json!({ "total": 2, "data": [] }) }))
+        }).await;
+        assert!(
+            incomplete.is_err(),
+            "an unread tail must be said, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn a_closing_car_is_named_with_its_train_and_recorded_date() {
+        let mut closing = car(
+            "0d9163d3-0000-4000-8000-000000000001",
+            "backlog_item",
+            ITEM,
+            true,
+        );
+        closing["metadata"]["train"] = json!("7a1b2c3d-0000-4000-8000-000000000001");
+        closing["opened_at"] = json!("2026-09-24T00:58:39Z");
+        let parts = landed_parts(ITEM, &[closing]);
+        assert_eq!(
+            parts.len(),
+            1,
+            "closing work must remain visible on a forced brief"
+        );
+        let prior = PriorWork {
+            item: ITEM.into(),
+            citations: Ok(Citations {
+                at: "03285637".into(),
+                lines: vec![],
+            }),
+            parts: Ok(parts),
+        };
+        let section = section(&prior).expect("already performed work");
+        assert!(
+            section.contains("7a1b2c3d-0000-4000-8000-000000000001"),
+            "{section}"
+        );
+        assert!(section.contains("2026-09-24T00:58:39Z"), "{section}");
+    }
+
     #[test]
     fn only_a_backlog_item_is_searched() {
         assert_eq!(
@@ -401,7 +688,7 @@ mod tests {
             ),
         ];
         let parts = landed_parts(ITEM, &rows);
-        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts.len(), 3, "{parts:?}");
         assert_eq!(parts[0]["id"], "0d9163d3-0000-4000-8000-000000000001");
     }
 
@@ -484,7 +771,7 @@ mod tests {
         );
         assert!(s.contains("registry.rs:1823"), "{s}");
         assert!(
-            s.contains("0d9163d3 fix/0d9163d3 — merged at fcdc6fb764ae"),
+            s.contains("0d9163d3 fix/0d9163d3 — landed at fcdc6fb764ae"),
             "{s}"
         );
         assert!(s.contains("refuses a re-pin"), "the part's summary: {s}");
@@ -493,7 +780,7 @@ mod tests {
 
         let w = warning(&prior).expect("warned");
         assert!(w.contains("cites it on 2 line(s)"), "{w}");
-        assert!(w.contains("1 landed car(s) carried part of it"), "{w}");
+        assert!(w.contains("1 landed or parked car(s) name it"), "{w}");
     }
 
     /// Past SHOWN lines the section names the command that lists them

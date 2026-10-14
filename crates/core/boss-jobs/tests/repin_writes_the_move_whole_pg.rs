@@ -6,8 +6,9 @@
 //! terminal-row freeze in SQL `CASE`s. Two implementations of one rule,
 //! so the rule is pinned against the real SQL: the pin moves, the
 //! `repins` record is appended, a pending row reads the target's text,
-//! an inserted step gets a row, a row that finished after the plan was
-//! read keeps what it ran under — and every event rides the outbox.
+//! an inserted step gets a row, a row written after the plan was read
+//! refuses the move whole, a completed row keeps what it ran under — and
+//! every event rides the outbox.
 
 use boss_core::actor::ActorId;
 use boss_core::job::{Job, JobId, JobStatus, Priority, StepId, StepStatus, Subject};
@@ -99,6 +100,8 @@ async fn a_repin_unskips_only_the_rows_the_plan_re_derived() {
         }
         repo.add_step(s).await.unwrap();
     }
+    let versions = repo.list_steps_versioned(&j.id).await.unwrap();
+    let read_of = |id| versions.iter().find(|(s, _)| s.id == id).map(|(_, v)| *v);
     let row = |slug: &str| {
         rows.iter()
             .find(|s| s.spec_slug.as_deref() == Some(slug))
@@ -114,10 +117,11 @@ async fn a_repin_unskips_only_the_rows_the_plan_re_derived() {
         };
         step.metadata["procedure"] = serde_json::json!("the target's text");
         boss_jobs::repin::Reprojected {
-            step,
             changed: vec!["`procedure`".into()],
             kept: vec![],
             unskipped,
+            read: read_of(step.id),
+            step,
         }
     };
     let plan = boss_jobs::repin::RepinPlan {
@@ -187,12 +191,18 @@ async fn a_repin_that_opens_rows_refuses_a_packet_closed_since_it_was_judged() {
         .expect("build row")
         .clone();
     build.status = StepStatus::Pending;
+    let (_, read) = repo
+        .get_step_versioned(&build.id)
+        .await
+        .unwrap()
+        .expect("build");
     let plan = boss_jobs::repin::RepinPlan {
         reprojected: vec![boss_jobs::repin::Reprojected {
             step: build,
             changed: vec!["status".into()],
             kept: vec![],
             unskipped: true,
+            read: Some(read),
         }],
         inserted: vec![],
     };
@@ -225,6 +235,101 @@ async fn a_repin_that_opens_rows_refuses_a_packet_closed_since_it_was_judged() {
             .iter()
             .any(|s| s.spec_slug.as_deref() == Some("build") && s.status == StepStatus::Skipped),
         "nothing un-skipped: {steps:?}"
+    );
+    assert!(outbox(&db, "jobs.job.repinned").await.is_empty());
+}
+
+/// A RE-PIN WRITES ONLY THE ROW IT READ (backlog e6b05dd6, third review
+/// 85c11887 B1). The convert door plans from a read and writes later; a
+/// first claim landing in between marked the row, and the UPDATE wrote
+/// the read's metadata over it with no compare — mark gone, the step
+/// Active with no holder — so a release and a launch record after the
+/// claim stood as the launch. The plan carries each row's version from
+/// its read, and the statement refuses a row whose `xmin` moved since,
+/// under the row's lock, refusing the whole move.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repin_planned_before_the_first_claim_cannot_erase_its_mark() {
+    use boss_jobs::records_before_claim::{CLAIMED_KEY, KEY};
+    let db = TestDb::new().await;
+    let repo = boss_jobs::PgJobs::new(db.pool.clone());
+
+    let from = spec();
+    let j = job(&from);
+    repo.create_job(&j).await.unwrap();
+    let mut rows = materialize_steps_at(
+        &from,
+        &j.subject,
+        j.id,
+        &j.metadata,
+        StepId::new,
+        Some(j.opened_on),
+        None,
+    );
+    for s in rows.iter_mut() {
+        if s.spec_slug.as_deref() == Some("build") {
+            s.status = StepStatus::Ready;
+            s.assignee_id = None;
+            s.metadata[KEY] = serde_json::json!(["launch.model"]);
+        }
+        repo.add_step(s).await.unwrap();
+    }
+    let build_id = rows
+        .iter()
+        .find(|s| s.spec_slug.as_deref() == Some("build"))
+        .expect("build row")
+        .id;
+
+    // The convert's read: Ready, unmarked; its plan moves the text.
+    let (mut next, read) = repo
+        .get_step_versioned(&build_id)
+        .await
+        .unwrap()
+        .expect("build");
+    next.title = "Build it (v2 text)".into();
+    let plan = boss_jobs::repin::RepinPlan {
+        reprojected: vec![boss_jobs::repin::Reprojected {
+            step: next,
+            changed: vec!["title".into()],
+            kept: vec![],
+            unskipped: false,
+            read: Some(read),
+        }],
+        inserted: vec![],
+    };
+
+    // The FIRST claim lands between the read and the write.
+    let claimed = repo
+        .claim_step_at(
+            &build_id,
+            "agent-claude",
+            &EventStamp::new("jobs", ActorId::automation("test")),
+            &[],
+        )
+        .await
+        .expect("an unassigned ready step is claimable");
+    assert!(
+        claimed.metadata.get(CLAIMED_KEY).is_some(),
+        "{}",
+        claimed.metadata
+    );
+
+    let stamp = EventStamp::new("jobs", ActorId::Human("emp-bootstrap-admin".into()));
+    let record = boss_jobs::repin::record(&plan, 1, 2, "emp-bootstrap-admin", stamp.timestamp);
+    let refused = repo
+        .repin_workflow_version_at(&j.id, 2, &plan, &record, &stamp)
+        .await;
+    assert!(
+        matches!(refused, Err(boss_jobs::JobsError::StepChanged { id }) if id == build_id),
+        "{refused:?}"
+    );
+    let row = repo.get_step(&build_id).await.unwrap().expect("build");
+    assert_eq!(row, claimed, "the claimed row stands as the claim left it");
+    let stored = repo.get_job(&j.id).await.unwrap().expect("packet");
+    assert_eq!(stored.workflow_version, from.version, "the pin stays");
+    assert!(
+        stored.metadata.get("repins").is_none(),
+        "{}",
+        stored.metadata
     );
     assert!(outbox(&db, "jobs.job.repinned").await.is_empty());
 }
@@ -262,10 +367,12 @@ async fn a_repin_writes_the_whole_move_in_one_transaction() {
     for s in &rows {
         repo.add_step(s).await.unwrap();
     }
-    let plan = boss_jobs::repin::plan(&from, &to, &j, &rows).expect("planned");
+    let read = repo.list_steps_versioned(&j.id).await.unwrap();
+    let stale = boss_jobs::repin::plan_read(&from, &to, &j, &read).expect("planned");
 
-    // THE RACE: `merged` finishes after the plan was read. Its row
-    // must keep the text it ran under; only the plan's other rows move.
+    // THE RACE: `merged` finishes after the plan was read. The plan no
+    // longer describes that row, so the move is refused whole (third
+    // review 85c11887 B1) — the pin, the record and every row stay.
     let mut merged = rows
         .iter()
         .find(|s| s.spec_slug.as_deref() == Some("merged"))
@@ -276,15 +383,38 @@ async fn a_repin_writes_the_whole_move_in_one_transaction() {
     repo.update_step(&merged).await.unwrap();
 
     let stamp = EventStamp::new("jobs", ActorId::Human("emp-bootstrap-admin".into()));
-    let record = boss_jobs::repin::record(
-        &plan,
-        from.version,
-        to.version,
-        "emp-bootstrap-admin",
-        stamp.timestamp,
+    let record_of = |plan: &boss_jobs::repin::RepinPlan| {
+        boss_jobs::repin::record(
+            plan,
+            from.version,
+            to.version,
+            "emp-bootstrap-admin",
+            stamp.timestamp,
+        )
+    };
+    let refused = repo
+        .repin_workflow_version_at(&j.id, to.version, &stale, &record_of(&stale), &stamp)
+        .await;
+    assert!(
+        matches!(refused, Err(boss_jobs::JobsError::StepChanged { id }) if id == merged.id),
+        "{refused:?}"
     );
+    assert_eq!(
+        repo.get_job(&j.id)
+            .await
+            .unwrap()
+            .expect("packet")
+            .workflow_version,
+        from.version
+    );
+    assert!(outbox(&db, "jobs.job.repinned").await.is_empty());
+
+    // Planned again from the rows as they stand, the move lands, and the
+    // row that finished keeps the text it ran under.
+    let read = repo.list_steps_versioned(&j.id).await.unwrap();
+    let plan = boss_jobs::repin::plan_read(&from, &to, &j, &read).expect("planned");
     let moved = repo
-        .repin_workflow_version_at(&j.id, to.version, &plan, &record, &stamp)
+        .repin_workflow_version_at(&j.id, to.version, &plan, &record_of(&plan), &stamp)
         .await
         .unwrap();
 

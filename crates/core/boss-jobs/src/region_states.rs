@@ -243,7 +243,10 @@ pub const TRACK_GATE_FALLBACK: Band = band(
 /// The conductor has not filed a train's gate yet (the bound was full on
 /// its last launch). It retries every pass, a minute apart, and clears
 /// the marker the pass it files — so a wait of a few passes is the bound
-/// working, and ten minutes of it is worth a look.
+/// working, and ten minutes of it is worth a look. The wait is dated
+/// from the record (`regions::train_gate_wait_since`), so this hold is
+/// applied, and it is THE one threshold the yard's trouble style reads
+/// too (`regions::TRAIN_GATE_WAIT_MINUTES`, backlog 19227ca8).
 pub const TRACK_GATE_WAITING: Band = band(
     "track-gate-waiting",
     "*",

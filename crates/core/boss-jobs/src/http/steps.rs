@@ -1733,7 +1733,51 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
         // merges only the keys a close owns into a row still open, and
         // the job PUT's hand close lands only on a row still in the
         // status it read — the rest of 29a7ea09.)
+        //
+        // BUT A PACKET STILL OPEN IS SETTLED (backlog 17bf6f3e). Writing
+        // nothing to the STEP stays the rule; running nothing at all
+        // made the re-send useless as a retry. The write it repeats may
+        // have landed and its packet never been settled — the step
+        // commits in its own transaction and the readiness pass and the
+        // close follow it — and on 2026-10-09 four ops-requests were
+        // left open that way, each needing exactly the pass a retry
+        // would have run. So a re-send of a COMPLETED step on an OPEN
+        // packet runs the settle again: readiness from the rows as they
+        // stand, and the declared-terminal close if a terminal already
+        // completed. Both are idempotent — the pass promotes only what
+        // the stored rows entail and the close lands only on a row still
+        // open, through the owned-keys door, naming the one outcome every
+        // closer derives — so the 6b23d135 race above now ends with the
+        // outcome recorded by whichever closer lands first. A closed
+        // packet's re-send still writes and records nothing.
         if step == old {
+            if old.status == StepStatus::Completed
+                && let Some(job) = parent_job.as_ref().filter(|j| j.status == JobStatus::Open)
+            {
+                let actor = match executor {
+                    Some(c) => match c.actor_id.parse() {
+                        Ok(actor) => actor,
+                        Err(never) => match never {},
+                    },
+                    None => user.ambient_actor().unwrap_or_else(|| {
+                        boss_core::actor::ActorId::Automation("platform".into())
+                    }),
+                };
+                let now = boss_clock_client::now_from(&state.clock).await;
+                if let Err(refused) = settle_after_step_write(
+                    &state,
+                    &job_id,
+                    Some(job),
+                    Settling::Resent,
+                    old.completed_on,
+                    &actor,
+                    now,
+                )
+                .await
+                {
+                    return refused;
+                }
+            }
             return StatusCode::NO_CONTENT.into_response();
         }
     }
@@ -2766,6 +2810,74 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 
+    let settling = Settling::Wrote {
+        sort_order: old.sort_order,
+        completed: old.status != StepStatus::Completed && step.status == StepStatus::Completed,
+    };
+    if let Err(refused) = settle_after_step_write(
+        &state,
+        &job_id,
+        parent_job.as_ref(),
+        settling,
+        step.completed_on,
+        &actor,
+        now,
+    )
+    .await
+    {
+        return refused;
+    }
+
+    if let Some(receipt) = completion_receipt {
+        Json(CompletionOutcome::Completed { receipt }).into_response()
+    } else {
+        StatusCode::NO_CONTENT.into_response()
+    }
+}
+
+/// Which step write a packet is being settled after.
+#[derive(Debug, Clone, Copy)]
+enum Settling {
+    /// A write that moved the step. `completed` when it is the flip to
+    /// completed: a declared terminal's flip closes the packet with its
+    /// outcome. The STORED `sort_order`, never the body's (b433bdf3).
+    Wrote { sort_order: i32, completed: bool },
+    /// An unchanged re-send of a COMPLETED step on a packet still open:
+    /// nothing about the step moves, but the packet may never have been
+    /// settled after the write it repeats (backlog 17bf6f3e) — so the
+    /// readiness pass runs again, and any declared terminal already
+    /// completed closes the packet with its outcome.
+    Resent,
+}
+
+/// What a step write owes its packet once the row has landed: the
+/// readiness pass, the declared-terminal close, and the all-steps-terminal
+/// catch-all. `Err` is the answer to send instead of success — the step
+/// row is already written, so every such answer says so.
+///
+/// ONE DEFINITION, TWO CALLERS (backlog 17bf6f3e). This ran only at the
+/// foot of a write that moved the step, once, after the step's own
+/// transaction had committed. When it did not finish, nothing ever ran
+/// it again: four ops-requests stayed open on 2026-10-09, two with
+/// `execute` completed and no readiness pass after it (e8dd5479,
+/// b8873c2f), two with `answered` completed, the terminal close's skips
+/// written and no close after them (4a5ac945, 85cd57f1) — and the probe
+/// recheck read each as a request still being asked, so its car was
+/// never probed again. The retry that would have finished the job — the
+/// runner re-sends a write it got no answer to, the dispatcher retries a
+/// 5xx — was a no-op by design since 29a7ea09: an unchanged re-send
+/// answered 204 and ran none of this. It now runs it ([`Settling::Resent`])
+/// while writing nothing to the step itself.
+#[allow(clippy::too_many_arguments)]
+async fn settle_after_step_write<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    job_id: &boss_core::job::JobId,
+    parent_job: Option<&Job>,
+    settling: Settling,
+    closing_date: Option<chrono::NaiveDate>,
+    actor: &boss_core::actor::ActorId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Response> {
     // Re-evaluate readiness: the just-updated step's status change may
     // make a downstream step's `ready_when` predicate flip (Pending →
     // Ready) or rule a branch out (Pending → Skipped). The re-evaluator
@@ -2774,22 +2886,45 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
     if let Some(reg) = &state.kind_registry
         && let Some(job) = parent_job
     {
-        reevaluate_and_persist(&state, &job, &actor).await;
+        if let Err(e) = reevaluate_reported(state, job, actor).await {
+            return Err(readiness_not_run(job_id, &e));
+        }
 
         // If the step we just completed is a declared terminal,
         // close the Job with that outcome and skip every
         // still-non-terminal step. Pair the live Step back to its
         // StepSpec by index (== sort_order, the materializer's
-        // contract) — the STORED index, never the body's (b433bdf3).
-        // Resolve the pinned version — same rule as the re-evaluator.
-        let just_completed =
-            old.status != StepStatus::Completed && step.status == StepStatus::Completed;
-        if just_completed
-            && let Ok(spec) = reg.get_version(&job.kind, job.workflow_version).await
-            && let Some(outcome) = spec.terminal_outcome_at(old.sort_order)
-            && let Err(e) = close_job_on_terminal(&state, &job_id, outcome, &actor, now).await
-        {
-            return close_not_written(&job_id, &e);
+        // contract). Resolve the pinned version — same rule as the
+        // re-evaluator. On a re-send, the terminal is whichever
+        // declared terminal the packet has already completed — the one
+        // rule every closer derives it by (`completed_terminal_outcome`).
+        if let Ok(spec) = reg.get_version(&job.kind, job.workflow_version).await {
+            let resent_steps = match settling {
+                Settling::Resent => Some(state.jobs.list_steps(job_id).await.map_err(|e| {
+                    readiness_not_run(job_id, &format!("reading the steps failed: {e}"))
+                })?),
+                Settling::Wrote { .. } => None,
+            };
+            let outcome = match (settling, &resent_steps) {
+                (
+                    Settling::Wrote {
+                        sort_order,
+                        completed: true,
+                    },
+                    _,
+                ) => spec.terminal_outcome_at(sort_order),
+                (Settling::Resent, Some(steps)) => spec.completed_terminal_outcome(
+                    steps
+                        .iter()
+                        .map(|s| (s.sort_order, s.status == StepStatus::Completed)),
+                ),
+                _ => None,
+            };
+            if let Some(outcome) = outcome
+                && let Err(e) = close_job_on_terminal(state, job_id, outcome, actor, now).await
+            {
+                return Err(close_not_written(job_id, &e));
+            }
         }
     }
 
@@ -2798,9 +2933,9 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
     // state (Completed / Skipped) closes here even when no *declared*
     // terminal step fired (the declared-terminal close above already
     // handled that case and left the Job Closed, so this no-ops then).
-    if let Ok(steps) = state.jobs.list_steps(&job_id).await {
+    if let Ok(steps) = state.jobs.list_steps(job_id).await {
         let new_status = compute_job_status(&steps);
-        if let Ok(Some(mut job)) = state.jobs.get_job(&job_id).await
+        if let Ok(Some(mut job)) = state.jobs.get_job(job_id).await
             && job.status != new_status
             && job.status != JobStatus::Cancelled
             && job.status != JobStatus::Draft
@@ -2819,7 +2954,7 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
                 // closed_on too. Falls through to the authoritative
                 // clock's date only if the step somehow lacks one.
                 let job_now = boss_clock_client::now_from(&state.clock).await;
-                job.closed_on = step.completed_on.or(Some(job_now.date_naive()));
+                job.closed_on = closing_date.or(Some(job_now.date_naive()));
                 stamp_close_instant(&mut job, &job_now);
                 // A catch-all close that FOLLOWS a completed declared
                 // terminal names that terminal's outcome. Two completers
@@ -2932,7 +3067,7 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
             if let Err(e) = state
                 .jobs
                 .close_job_at(
-                    &job_id,
+                    job_id,
                     closed_on,
                     &close_owned_fields(&job),
                     &close_stamp,
@@ -2940,16 +3075,28 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
                 )
                 .await
             {
-                return close_not_written(&job_id, &e);
+                return Err(close_not_written(job_id, &e));
             }
         }
     }
+    Ok(())
+}
 
-    if let Some(receipt) = completion_receipt {
-        Json(CompletionOutcome::Completed { receipt }).into_response()
-    } else {
-        StatusCode::NO_CONTENT.into_response()
-    }
+/// The answer to a step write whose packet's readiness pass did not
+/// complete: a 500 naming the packet, saying the step itself was
+/// written, and naming the repair — the same request again, which is a
+/// re-send that runs the pass ([`Settling::Resent`]; backlog 17bf6f3e).
+/// It used to be a 204 over a packet whose next step never opened.
+fn readiness_not_run(job_id: &boss_core::job::JobId, why: &str) -> Response {
+    tracing::error!(job_id = %job_id, error = %why, "step written, but its packet's readiness pass did not complete");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!(
+            "the step was written, but the readiness pass over job {job_id} did not complete \
+             ({why}); send the same request again — a re-send re-runs it"
+        ),
+    )
+        .into_response()
 }
 
 /// The answer to a step write whose close did not land: a 500 NAMING
@@ -3113,6 +3260,28 @@ async fn metadata_patch_refusal<R: JobsRepository + 'static, B: EventBus + 'stat
                     "step_id": step_id.to_string(),
                     "refused_keys": protocol_keys,
                     "hint": crate::step_metadata_write::PROTOCOL_KEYS_HINT,
+                })),
+            )
+                .into_response(),
+        );
+    }
+    // A RECORD OF HOW THE WORK WAS STARTED (backlog e6b05dd6, review
+    // fd7f1030 F2): a key the step declares `records_before_claim` is the
+    // first-record door's alone. A merge could otherwise stand a value in
+    // for the record, or squat on the key so the launcher's real record is
+    // refused as a conflict. An unchanged re-send is not a change.
+    let started = crate::records_before_claim::changed(&old.metadata, &merged_view);
+    if !started.is_empty() && !matches!(old.status, StepStatus::Completed | StepStatus::Skipped) {
+        return Some(
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "metadata patch writes a record of how the step's work was started",
+                    "step_id": step_id.to_string(),
+                    "refused_keys": started,
+                    "hint": "these keys are written once, through POST \
+                             /api/jobs/{id}/steps/{step_id}/metadata/records, before the step \
+                             is claimed (records_before_claim)",
                 })),
             )
                 .into_response(),
@@ -3318,6 +3487,27 @@ pub(super) async fn record_step_metadata<R: JobsRepository + 'static, B: EventBu
         Ok(_) => return step_not_found(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    // A RECORD OF HOW THE WORK WAS STARTED (backlog e6b05dd6, review
+    // fd7f1030 F1): a key the step declares `records_before_claim` is
+    // written only while no one holds the step, because the launcher and
+    // the run it started sign as the same agent and WHEN is the one thing
+    // that tells them apart. Judged here, on the server, so the honest
+    // launcher's own check is no longer the only one. A replay of the
+    // stored record changes nothing and goes on to be answered as one;
+    // the version guard below refuses a claim that lands in between.
+    if changed
+        && let Some(why) = crate::records_before_claim::refusal(&old.metadata, old.status, key)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": why,
+                "step_id": step_id.to_string(),
+                "refused_key": key,
+            })),
+        )
+            .into_response();
+    }
     let caller = match signer.as_ref() {
         Some(signer) => match signer.caller(&state, &old, &job).await {
             Ok(caller) => Some(axum::Extension(caller)),
@@ -3896,12 +4086,35 @@ pub(super) struct ClaimQuery {
     claimed_for: Option<String>,
 }
 
+impl ClaimQuery {
+    pub(super) fn from_station(station: String) -> Self {
+        Self {
+            station: Some(station),
+            claimed_for: None,
+        }
+    }
+}
+
 pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: State<Arc<JobsApiState<R, B>>>,
+    path: Path<(String, String)>,
+    user: CurrentUser,
+    caller: Option<axum::Extension<crate::field_writer::CredentialedCaller>>,
+    query: axum::extract::Query<ClaimQuery>,
+) -> Response {
+    claim_step_with_selection(state, path, user, caller, query, None).await
+}
+
+pub(super) async fn claim_step_with_selection<
+    R: JobsRepository + 'static,
+    B: EventBus + 'static,
+>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     Path((id, step_id_str)): Path<(String, String)>,
     CurrentUser(user): CurrentUser,
     caller: Option<axum::Extension<crate::field_writer::CredentialedCaller>>,
     axum::extract::Query(q): axum::extract::Query<ClaimQuery>,
+    mut selection: Option<crate::station_claim::SelectionContext>,
 ) -> Response {
     let job_id = match parse_job_id(&id) {
         Some(id) => id,
@@ -3911,7 +4124,22 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         Some(id) => id,
         None => return (StatusCode::BAD_REQUEST, "invalid step id").into_response(),
     };
-    let scope = match state.policy.ask(&user, controls::UPDATE_STEP).await {
+    let mut native = selection
+        .as_ref()
+        .and_then(|context| context.native_authority.clone());
+    let admitted_ingress = native
+        .as_ref()
+        .map(|observation| observation.ingress.clone());
+    let preparation = admitted_ingress.as_ref();
+    use super::stations::prepare_selection;
+    let update = match native.as_ref() {
+        Some(observation) => Ok(observation.policy_decision(
+            controls::UPDATE_STEP.action(),
+            &controls::UPDATE_STEP.resource(),
+        )),
+        None => state.policy.ask(&user, controls::UPDATE_STEP).await,
+    };
+    let scope = match update {
         Ok(Decision::Deny { reason }) => {
             return (StatusCode::FORBIDDEN, reason).into_response();
         }
@@ -3920,7 +4148,39 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
             return e.into_response();
         }
     };
-    let old = match state.jobs.get_step(&step_id).await {
+    if let Some(context) = selection.as_mut()
+        && context.native_authority.is_none()
+        && let (Some(workflows), Some(stations)) = (&state.kind_registry, &state.stations)
+    {
+        context.definition_fence = Some(std::sync::Arc::new(
+            crate::station_claim::RegistrySelectionFence {
+                workflows: workflows.clone(),
+                stations: stations.clone(),
+                policy: match context.prepared_policy.as_ref() {
+                    Some(observation)
+                        if observation.matches_preflight(
+                            &state.policy,
+                            &user,
+                            &Decision::Allow {
+                                scope: scope.clone(),
+                            },
+                            context.request_id,
+                        ) =>
+                    {
+                        observation.clone()
+                    }
+                    _ => {
+                        return (
+                            StatusCode::CONFLICT,
+                            "prepared native policy owner or decision unavailable",
+                        )
+                            .into_response();
+                    }
+                },
+            },
+        ));
+    }
+    let old = match prepare_selection!(preparation, state.jobs.get_step(&step_id)) {
         Ok(Some(s)) => s,
         Ok(None) => return (StatusCode::NOT_FOUND, "step not found").into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -3950,7 +4210,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // and a step that is the caller's opens its packet, so without this a
     // `self`-scoped caller read any packet whose ids it knew. So a read
     // that fails is refused (5186c5e1), no longer read as "no packet".
-    let parent_job = match state.jobs.get_job(&job_id).await {
+    let parent_job = match prepare_selection!(preparation, state.jobs.get_job(&job_id)) {
         Ok(job) => job,
         Err(e) => {
             return (
@@ -4018,7 +4278,10 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // the rule has admitted the caller, so a caller the rule refuses is
     // told 403 and learns nothing about who the registries know.
     let resolved = match crate::active_holder::nominee(q.claimed_for.as_deref(), &user.id) {
-        Some(named) => Some((named, resolve_nominee(&state, named).await)),
+        Some(named) => Some((
+            named,
+            prepare_selection!(preparation, resolve_nominee(&state, named)),
+        )),
         None => None,
     };
     if let Some((named, resolved)) =
@@ -4045,7 +4308,11 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         // declares no one, and the rule falls to `step-assign` — no
         // evidence is not a pass.
         let pinned = match (&state.kind_registry, &parent_job) {
-            (Some(reg), Some(job)) => reg.get_version(&job.kind, job.workflow_version).await.ok(),
+            (Some(reg), Some(job)) => prepare_selection!(
+                preparation,
+                reg.get_version(&job.kind, job.workflow_version)
+            )
+            .ok(),
             _ => None,
         };
         let declared = pinned
@@ -4092,7 +4359,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         // alone — the claim is then judged as it was before this line,
         // never wider.
         let caller_logins = match state.agent_budget.as_ref() {
-            Some(door) => match door.agent_row(&user.id).await {
+            Some(door) => match prepare_selection!(preparation, door.agent_row(&user.id)) {
                 Ok(row) => row.map(|r| r.aliases).unwrap_or_default(),
                 Err(e) => {
                     tracing::warn!(
@@ -4129,7 +4396,10 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // the one it is claimed for. Before the station gate and the CAS: a
     // claim that is not allowed must not enter the race.
     if crate::human_only::declared(&old.metadata)
-        && let Err(why) = crate::human_only::person_check(state.roster.as_deref(), &holder).await
+        && let Err(why) = prepare_selection!(
+            preparation,
+            crate::human_only::person_check(state.roster.as_deref(), &holder)
+        )
     {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -4158,7 +4428,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // what the CAS writes back, and the resolution is never written.
     let active_row = match (&state.kind_registry, &parent_job) {
         (Some(reg), Some(job)) if crate::agent_spec::projected(&old.metadata).is_none() => {
-            reg.get_active(&job.kind).await.ok()
+            prepare_selection!(preparation, reg.get_active(&job.kind)).ok()
         }
         _ => None,
     };
@@ -4171,19 +4441,45 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // a person or an unregistered login — neither gate applies — and a
     // registry that cannot answer is a 500, not a silent pass (no
     // evidence is not a pass).
-    let agent_row = match state.agent_budget.as_ref() {
-        Some(door) => match door.agent_row(&holder).await {
-            Ok(row) => row,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("agents registry could not answer for {holder}: {e}"),
-                )
-                    .into_response();
-            }
-        },
-        None => None,
+    let agent_row = if let Some(observation) = &native {
+        observation
+            .agents
+            .iter()
+            .find(|row| row.id == holder || row.aliases.iter().any(|alias| alias == &holder))
+            .cloned()
+    } else {
+        match state.agent_budget.as_ref() {
+            Some(door) => match prepare_selection!(preparation, door.agent_row(&holder)) {
+                Ok(row) => row,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("agents registry could not answer for {holder}: {e}"),
+                    )
+                        .into_response();
+                }
+            },
+            None => None,
+        }
     };
+
+    if let (Some(context), Some(door)) = (selection.as_mut(), state.agent_budget.as_ref()) {
+        context.actor_observation = Some(crate::station_claim::ActorSelectionObservation {
+            owner: door.agents.clone(),
+            holder: holder.clone(),
+            row: agent_row.clone(),
+            requested_user: match serde_json::to_value(&user) {
+                Ok(value) => value,
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "selection actor observation serialization failed",
+                    )
+                        .into_response();
+                }
+            },
+        });
+    }
 
     // Station capability gate (stations.md Q3): when the claim names
     // the station it pulls from, the packet must actually be a
@@ -4203,7 +4499,10 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         // the queue read uses (923b6571). A derived station was 404
         // here and a queue there, so every `(role, model)` agent inbox
         // rendered and could not be claimed from.
-        let row = match super::stations::station_by_name(&state, reg, station_name).await {
+        let row = match prepare_selection!(
+            preparation,
+            super::stations::station_by_name(&state, reg, station_name)
+        ) {
             Ok(s) => s,
             Err(r) => return r,
         };
@@ -4212,6 +4511,17 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         // unbindable placeholder means the claimant has no queue here
         // — so the packet is not at it.
         let bound = row.bind_self(self_id(&user));
+        if selection.as_ref().is_some_and(|context| {
+            !bound.as_ref().is_some_and(|station| {
+                crate::station_claim::same_definition(station, &context.station)
+            })
+        }) {
+            return (
+                StatusCode::CONFLICT,
+                "station changed during claim validation",
+            )
+                .into_response();
+        }
         let Some(job) = &parent_job else {
             return (StatusCode::NOT_FOUND, "job not found").into_response();
         };
@@ -4221,7 +4531,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         // refused 409 "packet is not at this station" — a confident
         // wrong answer to a question the door never read (f6c97006).
         let steps = if needs_steps {
-            let steps = match state.jobs.list_steps(&job_id).await {
+            let steps = match prepare_selection!(preparation, state.jobs.list_steps(&job_id)) {
                 Ok(steps) => steps,
                 Err(e) => return steps_unreadable(&job_id, &e),
             };
@@ -4326,8 +4636,16 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // claim naming a station is told what that station's capability
     // says first — the more specific of the two refusals.
     if nominee.is_none()
-        && let Err(refused) =
-            claimant_holds_authority(&state, &user, agent_row.as_ref(), &old).await
+        && let Err(refused) = prepare_selection!(
+            preparation,
+            claimant_holds_authority_with_native(
+                &state,
+                &user,
+                agent_row.as_ref(),
+                &old,
+                native.as_deref()
+            )
+        )
     {
         return refused;
     }
@@ -4360,17 +4678,33 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
             .get(crate::agent_spec::BUDGET_KEY)
             .and_then(|v| v.as_f64()),
     ) {
-        let now = boss_clock_client::now_from(&state.clock).await;
-        match door.reserve(row, budget_usd, now).await {
-            Ok(reservation) if reservation.decision.is_allowed() => {}
-            Ok(reservation) => over_budget = Some(reservation.reading_body()),
-            Err(e) => {
-                tracing::warn!(
-                    actor = %row.id,
-                    "budget reading could not measure the actor's hour, claim admitted: {e}"
-                );
+        let now = prepare_selection!(preparation, boss_clock_client::now_from(&state.clock));
+        let measured =
+            prepare_selection!(preparation, door.reserve_with_inputs(row, budget_usd, now));
+        let observation = match measured {
+            Ok((reading, inputs)) => {
+                if !reading.decision.is_allowed() {
+                    over_budget = Some(reading.reading_body());
+                }
+                serde_json::json!({"status": "measured", "observed_at": now,
+                    "query": {"actor_id": row.id, "since": crate::agent_runs::ADMISSION_WINDOW.cutoff(now)},
+                    "actor_inputs": row, "inputs": inputs, "reading": reading,
+                    "qualification": "historical advisory priced-subset reading; unpriced inputs remain unpriced; not transactional authorization"})
             }
+            Err(error) => {
+                tracing::warn!(actor = %row.id, "budget reading unavailable, claim admitted: {error}");
+                serde_json::json!({"status": "unknown", "observed_at": now,
+                    "query": {"actor_id": row.id, "since": crate::agent_runs::ADMISSION_WINDOW.cutoff(now)},
+                    "actor_inputs": row, "inputs": null, "error": error.to_string(),
+                    "qualification": "advisory query unavailable; unknown is not zero and does not grant authority"})
+            }
+        };
+        if let Some(native) = native.as_mut() {
+            std::sync::Arc::make_mut(native).budget_hour = Some(observation);
         }
+    }
+    if let (Some(context), Some(native)) = (selection.as_mut(), native.as_ref()) {
+        context.native_authority = Some(native.clone());
     }
 
     // THE CONCURRENCY GATE (backlog 57c108c2, 2026-09-20). The
@@ -4415,7 +4749,10 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
             status: Some(JobStatus::Open),
             ..Default::default()
         };
-        let open_runs = match state.jobs.list_jobs(&filter, IN_FLIGHT_SCAN_LIMIT, 0).await {
+        let open_runs = match prepare_selection!(
+            preparation,
+            state.jobs.list_jobs(&filter, IN_FLIGHT_SCAN_LIMIT, 0)
+        ) {
             Ok((rows, _)) => rows,
             Err(e) => {
                 return (
@@ -4435,7 +4772,15 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         }
     }
 
-    let mut stamp = state.publisher.stamp_with_actor(actor).await;
+    if selection.is_some() && state.agent_budget.is_none() {
+        return (
+            StatusCode::CONFLICT,
+            "fresh station selection requires a native agent owner fence",
+        )
+            .into_response();
+    }
+
+    let mut stamp = prepare_selection!(preparation, state.publisher.stamp_with_actor(actor));
     if let Some(j) = &parent_job {
         stamp = stamp.with_partition(j.partition);
     }
@@ -4457,6 +4802,13 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     if crate::agent_runs::claim_changes_holder(old.assignee_id.as_deref(), &holder, aliases) {
         claimed.metadata = crate::agent_runs::without_edge(&claimed.metadata);
     }
+    // A step declaring before-claim records is closed to them from its
+    // first claim on (re-review 211cbae4 B1): both adapters write the
+    // same mark in the CAS, and the event carries it so the log does.
+    claimed.metadata = crate::records_before_claim::closed_by_claim(
+        &claimed.metadata,
+        &serde_json::to_value(stamp.timestamp).unwrap_or_default(),
+    );
 
     let mut claim_events = vec![stamp.event(
         events::STEP_UPDATED,
@@ -4525,15 +4877,63 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // Start here does not silently stop holding the holder's time. A
     // calendar conflict refuses the claim with nothing stored; a claim
     // the CAS then refuses hands its reservation back.
-    let hold = match start_hold(&state, &old, &claimed, &user.id).await {
-        Ok(hold) => hold,
-        Err(refused) => return refused,
+    if selection.as_ref().is_some_and(|context| {
+        context.validated_step != old || parent_job.as_ref() != Some(&context.validated_job)
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            "selection candidate changed during claim validation",
+        )
+            .into_response();
+    }
+    let native_join = selection
+        .as_ref()
+        .is_some_and(|context| context.native_authority.is_some());
+    let hold = if native_join {
+        StartHold::default()
+    } else {
+        match start_hold(&state, &old, &claimed, &user.id).await {
+            Ok(hold) => hold,
+            Err(refused) => return refused,
+        }
     };
 
     // The CAS judges status and holder, not the row: a schedule merged
     // since `old` was read lands under it, so the calendar settles on
     // the row as STORED, not the one the hold was computed from (the
     // review of car 611fbffd).
+    if let Some(context) = selection {
+        use crate::station_claim::SelectionResult;
+        let selected = state
+            .jobs
+            .claim_station_head_at(&context, &holder, &displaceable, &stamp, &claim_events)
+            .await;
+        let stored = match &selected {
+            Ok(SelectionResult::Claimed { step, .. }) => Some(step.as_ref()),
+            _ => None,
+        };
+        if !native_join {
+            settle_start_hold(&state, &stamp, hold, &old, &claimed, stored, &user.id).await;
+        }
+        return match selected {
+            Ok(SelectionResult::Claimed { receipt, .. })
+            | Ok(SelectionResult::Replayed(receipt)) => {
+                super::stations::selection_receipt_response(receipt)
+            }
+            Err(crate::port::JobsError::SelectionConflict(reason)) => {
+                (StatusCode::CONFLICT, reason).into_response()
+            }
+            Err(crate::port::JobsError::SelectionCalendarConflict { existing }) => {
+                (StatusCode::CONFLICT, Json(serde_json::json!({"error": "calendar conflict", "step_id": step_id.to_string(), "existing": existing}))).into_response()
+            }
+            Err(crate::port::JobsError::ClaimConflict { holder, status }) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"holder":holder,"status":status})),
+            )
+                .into_response(),
+            Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        };
+    }
     let claimed_row = state
         .jobs
         .claim_step_displacing_at(&step_id, &holder, &displaceable, &stamp, &claim_events)
@@ -4594,11 +4994,12 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     clippy::result_large_err,
     reason = "idiomatic axum Response error; crate-wide Box<Response> cleanup tracked separately"
 )]
-async fn claimant_holds_authority<R: JobsRepository + 'static, B: EventBus + 'static>(
+async fn claimant_holds_authority_with_native<R: JobsRepository, B: EventBus>(
     state: &JobsApiState<R, B>,
-    user: &boss_policy_client::User,
+    user: &User,
     agent_row: Option<&crate::agents::AgentRow>,
     step: &Step,
+    native: Option<&crate::station_claim::NativeAuthorityObservation>,
 ) -> Result<(), Response> {
     let Some(authority) = step
         .metadata
@@ -4646,7 +5047,11 @@ async fn claimant_holds_authority<R: JobsRepository + 'static, B: EventBus + 'st
         ),
         (assign.action(), assign.resource()),
     ] {
-        match state.policy.check(user, action, resource).await {
+        let decision = match native {
+            Some(observation) => Ok(observation.policy_decision(action, &resource)),
+            None => state.policy.check(user, action, resource).await,
+        };
+        match decision {
             Ok(Decision::Allow { .. }) => return Ok(()),
             Ok(Decision::Deny { .. }) => {}
             Err(e) => return Err(e.into_response()),
@@ -4854,7 +5259,7 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
 /// used to answer Ok over it while its `skipped` event was recorded
 /// for a row that stayed completed. Bounded: a row that keeps moving
 /// is left open and logged, which the catch-all close sees next pass.
-async fn skip_open_step<R: JobsRepository + 'static, B: EventBus + 'static>(
+pub(super) async fn skip_open_step<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
     job_id: &boss_core::job::JobId,
     read: (Step, crate::port::StepVersion),
@@ -4869,6 +5274,7 @@ async fn skip_open_step<R: JobsRepository + 'static, B: EventBus + 'static>(
         ) {
             return;
         }
+        let old = s.clone();
         s.status = StepStatus::Skipped;
         // OUTBOX (phase 2): the skip's state event records in the SAME
         // transaction as the row.
@@ -4878,7 +5284,19 @@ async fn skip_open_step<R: JobsRepository + 'static, B: EventBus + 'static>(
             .update_step_if_unchanged_at(&s, version, terminal_stamp.timestamp, &[skip_event])
             .await
         {
-            Ok(()) => return,
+            Ok(()) => {
+                // A terminal skip is the same landed transition as a step-door
+                // skip: hand its abandoned time back only after the CAS wins
+                // (design e1dba350). Completed history never enters this arm.
+                crate::calendar_hook::after_step_written(
+                    state.calendar.as_ref(),
+                    &old,
+                    &s,
+                    &terminal_stamp.actor().to_string(),
+                )
+                .await;
+                return;
+            }
             Err(crate::port::JobsError::StepChanged { .. }) => {
                 match state.jobs.get_step_versioned(&s.id).await {
                     Ok(Some(fresh)) => (s, version) = fresh,
@@ -5288,8 +5706,32 @@ pub(super) async fn reevaluate_and_persist<R: JobsRepository + 'static, B: Event
     job: &Job,
     actor: &boss_core::actor::ActorId,
 ) {
+    if let Err(e) = reevaluate_reported(state, job, actor).await {
+        tracing::warn!(job_id = %job.id, error = %e, "re-eval: the readiness pass did not complete");
+    }
+}
+
+/// [`reevaluate_and_persist`], answering whether the pass COMPLETED.
+///
+/// An `Err` is a pass that could not read what it judges (the pinned
+/// version, the steps) or could not persist a promotion it computed. A
+/// pass still raced at its bound is `Ok`: another writer is moving the
+/// packet, and that writer's own pass judges it next.
+///
+/// The step PUT answers an `Err` as a 500 rather than the 204 it used to
+/// give (backlog 17bf6f3e). A failed steps read here was a bare `return
+/// false` — no log line at all — so a completion whose packet was never
+/// re-evaluated was reported landed whole, the writer had no reason to
+/// send it again, and the packet stayed open with its next step pending
+/// forever: ops-request e8dd5479, 2026-10-09T04:01:20Z, whose log ends
+/// at its `execute` completion.
+pub(super) async fn reevaluate_reported<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    job: &Job,
+    actor: &boss_core::actor::ActorId,
+) -> Result<(), String> {
     let Some(reg) = &state.kind_registry else {
-        return;
+        return Ok(());
     };
     match reg.get_version(&job.kind, job.workflow_version).await {
         Ok(spec) => {
@@ -5309,23 +5751,26 @@ pub(super) async fn reevaluate_and_persist<R: JobsRepository + 'static, B: Event
             // at the bound is logged.
             const PASSES: usize = 3;
             for _ in 0..PASSES {
-                if !reevaluate_pass(state, job, actor, &spec, &stamp).await {
-                    return;
+                if !reevaluate_pass(state, job, actor, &spec, &stamp).await? {
+                    return Ok(());
                 }
             }
             tracing::warn!(
                 job_id = %job.id,
                 "re-eval: steps kept changing under the promotion — left for the next pass",
             );
+            Ok(())
         }
         Err(crate::registry::WorkflowError::NotFound(_)) => {
             // No active spec (ad-hoc / registry-less kind): nothing to
             // re-evaluate. The compute_job_status auto-close still
             // handles the all-steps-terminal case.
+            Ok(())
         }
-        Err(e) => {
-            tracing::warn!(error = %e, job_id = %job.id, version = job.workflow_version, "re-eval: pinned Workflow version not resolvable");
-        }
+        Err(e) => Err(format!(
+            "pinned Workflow {} v{} not resolvable: {e}",
+            job.kind, job.workflow_version
+        )),
     }
 }
 
@@ -5334,17 +5779,22 @@ pub(super) async fn reevaluate_and_persist<R: JobsRepository + 'static, B: Event
 /// whether a promotion was REFUSED because its row moved since the read
 /// ([`crate::port::JobsError::StepChanged`]) — the caller's cue to run
 /// another pass over the rows as they now stand (backlog 6ec22d71).
-/// Every other failure is logged and not retried, as before.
+/// Every other failure is not retried here: it is the `Err` — the steps
+/// read, or the first promotion that could not be persisted (the rest
+/// are still attempted) — so the caller can say the pass did not
+/// complete instead of answering as if it had (backlog 17bf6f3e).
 async fn reevaluate_pass<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
     job: &Job,
     actor: &boss_core::actor::ActorId,
     spec: &crate::registry::WorkflowSpec,
     stamp: &boss_core::publisher::EventStamp,
-) -> bool {
-    let Ok(read) = state.jobs.list_steps_versioned(&job.id).await else {
-        return false;
-    };
+) -> Result<bool, String> {
+    let read = state
+        .jobs
+        .list_steps_versioned(&job.id)
+        .await
+        .map_err(|e| format!("reading the steps failed: {e}"))?;
     let (mut steps, versions): (Vec<Step>, Vec<crate::port::StepVersion>) =
         read.into_iter().unzip();
     // `reevaluate` requires steps in spec order (sort_order == index);
@@ -5368,6 +5818,7 @@ async fn reevaluate_pass<R: JobsRepository + 'static, B: EventBus + 'static>(
     }
     let changed = crate::registry::reevaluate(spec, &mut steps, &job.subject, &job.metadata);
     let mut refused = false;
+    let mut failed: Option<String> = None;
     for idx in changed {
         let changed_step = &steps[idx];
         // OUTBOX (phase 2): the promoted step's state event + D6 ready
@@ -5405,10 +5856,19 @@ async fn reevaluate_pass<R: JobsRepository + 'static, B: EventBus + 'static>(
                     error = %e,
                     "re-eval: failed to persist promoted step",
                 );
+                failed.get_or_insert_with(|| {
+                    format!(
+                        "persisting the promotion of step {} failed: {e}",
+                        changed_step.id
+                    )
+                });
             }
         }
     }
-    refused
+    match failed {
+        Some(why) => Err(why),
+        None => Ok(refused),
+    }
 }
 
 /// What the packet's PINNED protocol says about `step`, read against the

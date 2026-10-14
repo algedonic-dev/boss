@@ -15,7 +15,7 @@
 //! values are fake; every case also checks that none of them reaches the
 //! output, the run summary, or a request line or body.
 
-use boss_testing::{repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -360,7 +360,15 @@ impl Case {
     /// The pass with `BOSS_JOBS_URL` spelled as the case gives it, and no
     /// host list anywhere: loopback is the only host the rule admits.
     fn run_at(&self, node: &str, jobs_url: &str) -> (i32, String) {
-        let out = Command::new("bash")
+        self.run_at_with(node, jobs_url, &[])
+    }
+
+    /// `run_at`, with `extra` set last. Every proxy variable is removed
+    /// first, so a case sets only the one it names (backlog 50708d76, F4).
+    fn run_at_with(&self, node: &str, jobs_url: &str, extra: &[(&str, &str)]) -> (i32, String) {
+        let mut cmd = Command::new("bash");
+        without_proxy(&mut cmd);
+        let out = cmd
             .arg(repo_root().join(SCRIPT))
             .args(["--rule", &repo_root().join(RULE).display().to_string()])
             .args(["--dest", &self.dest.display().to_string()])
@@ -382,12 +390,14 @@ impl Case {
                     std::env::var("PATH").unwrap()
                 ),
             )
+            // The stub is loopback: a case that sets a proxy still has its
+            // unstamped reads reach it, which is that case's control. The
+            // host rule reads no NO_PROXY, so the stamped ones stay home.
             .env("NO_PROXY", "127.0.0.1")
             .env("no_proxy", "127.0.0.1")
-            .env_remove("http_proxy")
-            .env_remove("HTTP_PROXY")
             .env_remove("RUNTIME_DIRECTORY")
             .env_remove("BOSS_MACHINE_TOKEN")
+            .envs(extra.iter().copied())
             .output()
             .expect("run runner-credential-deposit.sh");
         let text = format!(
@@ -916,6 +926,60 @@ fn the_credential_is_never_presented_to_a_host_the_machine_token_rule_does_not_a
         );
         assert!(c.api.writes().is_empty(), "[{tag}]");
     }
+}
+
+/// NOR THROUGH A PROXY (backlog 50708d76, F4 of review 927f8602). With a
+/// proxy variable curl reads for the URL's scheme, curl hands the whole
+/// request — header file included — to the proxy, so the rule withholds
+/// an admitted host too and the summary names the VARIABLE, never its
+/// value. `all_proxy` is set beside the fixture's `NO_PROXY=127.0.0.1`,
+/// under which curl itself goes direct: the rule does not read NO_PROXY
+/// (a second copy of curl's matching could admit where curl proxies), so
+/// it withholds there too — the named difference, the safe way round —
+/// and the packet read, which carries no credential, still reaches the
+/// stub as this case's control.
+#[test]
+fn the_credential_is_never_presented_through_a_proxy() {
+    let c = Case::new("proxied-install");
+    c.staged_for(JOB);
+    c.held(OLD);
+    c.api.resolves(OLD, "forge", "current");
+    c.api.resolves(NEW, "forge", "next");
+    c.api.awaiting(JOB, 3600);
+    let url = format!("http://127.0.0.1:{}", c.api.port);
+    let (rc, out) = c.run_at_with(
+        "forge",
+        &url,
+        // The login is formatted in so the no-secrets lint reads it as
+        // the planted fixture it is, not a literal password.
+        &[(
+            "all_proxy",
+            format!("http://proxyuser:{}@127.0.0.1:9", "proxy-pass-9e2").as_str(),
+        )],
+    );
+    let requests = c.api.state.lock().unwrap().requests.clone();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.path == format!("/api/jobs/{JOB}")),
+        "the control: the packet read reaches the stub: {requests:?}\n{out}"
+    );
+    assert!(
+        c.api.whoamis() == 0 && requests.iter().all(|r| !r.runner_credential_presented),
+        "the runner credential was presented with a proxy set: {requests:?}\n{out}"
+    );
+    assert_eq!(rc, 1, "a value that cannot be proved is red: {out}");
+    assert_eq!(c.file().as_deref(), Some(OLD), "the held file is kept");
+    let action = c.summary("runner_credential_action");
+    assert!(
+        action.contains("NOT presented") && action.contains("proxy in $all_proxy"),
+        "the summary names the proxy variable: {action}"
+    );
+    for never in ["proxyuser", "proxy-pass-9e2"] {
+        assert!(!out.contains(never), "never {never}: {out}");
+        assert!(!action.contains(never), "never {never}: {action}");
+    }
+    assert!(c.api.writes().is_empty());
 }
 
 #[test]

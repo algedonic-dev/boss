@@ -514,20 +514,44 @@ fn the_rule_names_what_enforce_would_answer_differently() {
     );
 }
 
-/// Backlog 14fe115c (design 3cc6152a) put the launch roster's generation
-/// on every `machine_gate.recording_began`, and judges the machine
-/// gate's window under it. An actor-role start states no roster stamp:
-/// the report's recorder is mounted apart from the machine gate's and
-/// nothing hands it the record. This gate's production roster is read
-/// from that same record (`gate_window_http`, `roster`), so a generation
-/// rule keyed only on "the roster was read from a record" would judge
-/// every actor-role start as unstamped, and the window could never read
-/// clean. The rule is the machine gate's: the actor-role window is
-/// judged as it was and names no generation, and its excuses are still
-/// held to the port, the read and the log.
+/// A process start that states the launch roster it was started under,
+/// as `boss_events::role_tally::durable` has every recording tally state.
+fn began_under(service: &str, instance: &str, when: DateTime<Utc>, generation: &str) -> Event {
+    let mut start = began(service, instance, when, "report");
+    start.payload[boss_core::gate_window::ROSTER_FIELD] =
+        json!({"generation": generation, "commit": "fixture"});
+    start
+}
+
+/// AN EXCUSE IS BOUND TO THE SELECTION THAT MADE IT (backlog b13bd730,
+/// from delta review 72bd1c05 of car 35baf5b0).
+///
+/// Until this car the actor-role window took its excuses from the launch
+/// record and judged them on three checks only — the port refuses, the
+/// tally read fails, no fact inside the window — because an actor-role
+/// start stated no roster stamp and the generation rule was the machine
+/// gate's alone. So a service the OLD selection ran, whose last process
+/// started before the window opened and stated nothing inside it, and
+/// which the NEW selection skips, was excused with its unread tally, its
+/// lost facts and its overflow inherited as clean: under a row H enforce
+/// that licenses the flip while that service's callers were never
+/// observed. The first case below is that input, and it read clean.
+///
+/// Now every recording tally states the stamp with its start, and this
+/// window is judged by `judged_generations` exactly as the machine
+/// gate's is.
 #[test]
-fn a_roster_read_from_the_launch_record_does_not_hold_this_window_to_a_stamp_it_never_states() {
-    use boss_core::gate_window::{PortProbe, join_launched_window, launch_roster};
+fn an_excuse_holds_only_for_hours_watched_under_the_selection_that_made_it() {
+    use boss_core::gate_window::{
+        PortProbe, join_launched_window, launch_roster, roster_generation,
+    };
+    let old = roster_generation(
+        "boss-launch-record v1\n\
+         start boss-jobs-api\n\
+         start boss-assets-api\n\
+         end 2\n",
+    )
+    .unwrap();
     let record = "boss-launch-record v1\n\
         start boss-jobs-api\n\
         skip boss-assets-api module equipment is not on in the tenant manifest\n\
@@ -540,7 +564,8 @@ fn a_roster_read_from_the_launch_record_does_not_hold_this_window_to_a_stamp_it_
         Ok(record),
     );
     assert_eq!(roster.required, vec!["jobs".to_string()]);
-    assert!(roster.generation.is_some(), "{roster:?}");
+    let new = roster.generation.clone().expect("a whole record digests");
+    assert_ne!(old, new);
     let probes = [PortProbe {
         service: "assets".into(),
         listening: Ok(false),
@@ -554,25 +579,99 @@ fn a_roster_read_from_the_launch_record_does_not_hold_this_window_to_a_stamp_it_
             },
         ]
     };
-    let v = join_launched_window(
-        GATE,
-        &roster,
-        &probes,
-        at(3),
-        at(75),
-        Ok(restarted("jobs")),
-        reads(),
+    let judge = |facts: Vec<Event>| {
+        join_launched_window(GATE, &roster, &probes, at(3), at(75), Ok(facts), reads())
+    };
+
+    // The item's own input. The old selection ran both; assets' last
+    // process started at hour 0, before the window opened at hour 3, and
+    // stated nothing after; the relaunch at hour 74 skips it.
+    let v = judge(vec![
+        began_under("jobs", "old", at(0), &old),
+        began_under("assets", "gone", at(0), &old),
+        ended("jobs", "old", at(74)),
+        began_under("jobs", "current", minutes(74, 1), &new),
+    ]);
+    refuses(
+        &v,
+        "launch roster: the window spans a change of launch roster",
     );
+    let named: Vec<Option<&str>> = v
+        .roster_generations
+        .iter()
+        .map(|g| g.generation.as_deref())
+        .collect();
+    assert_eq!(named, [Some(old.as_str()), Some(new.as_str())], "{v:#?}");
+
+    // Starts that state no stamp — every start a build before this car
+    // wrote — are not hours watched under this selection either: the
+    // mechanism's first boot does not backdate itself.
+    let v = judge(restarted("jobs"));
+    refuses(&v, "launch roster:");
+
+    // Every hour under the selection that makes the excuse: clean, and
+    // the answer names that one generation.
+    let under_new = || {
+        vec![
+            began_under("jobs", "old", at(0), &new),
+            ended("jobs", "old", at(74)),
+            began_under("jobs", "current", minutes(74, 1), &new),
+        ]
+    };
+    let v = judge(under_new());
+    assert_eq!(v.not_clean, Vec::<String>::new(), "{v:#?}");
     assert!(v.covers_requested_window, "{v:#?}");
-    assert_eq!(v.not_clean, Vec::<String>::new());
-    assert!(
-        v.roster_generations.is_empty(),
-        "an actor-role window is judged under no generation and names none: {v:#?}"
-    );
+    let named: Vec<Option<&str>> = v
+        .roster_generations
+        .iter()
+        .map(|g| g.generation.as_deref())
+        .collect();
+    assert_eq!(named, [Some(new.as_str())], "{v:#?}");
+
     // The excuse is still a claim this window checks: an excused
     // service that left an actor-role fact inside the window is refused.
-    let mut facts = restarted("jobs");
-    facts.push(began("assets", "stray", at(10), "report"));
-    let v = join_launched_window(GATE, &roster, &probes, at(3), at(75), Ok(facts), reads());
-    refuses(&v, "assets");
+    let mut facts = under_new();
+    facts.push(began_under("assets", "stray", at(10), &new));
+    refuses(&judge(facts), "assets");
+}
+
+/// Review 72bd1c05, F1. The generation rule's match ended in a wildcard
+/// that was OPEN for every gate but the machine gate: a policy-check
+/// window handed a roster read from a record — excuses and all — was
+/// judged under no generation and said nothing. Unreachable in
+/// production (`LocalTallies::roster` consults no record for that gate),
+/// and exactly the pattern the next gate added there would inherit. No
+/// gate is excepted now: a roster with a generation is judged, and a
+/// gate whose starts state no stamp reads never-clean and says why.
+#[test]
+fn a_roster_with_a_generation_is_judged_whatever_the_gate() {
+    use boss_core::gate_window::{LaunchRoster, NotLaunched, join_launched_window};
+    let roster = LaunchRoster {
+        required: vec!["policy".into()],
+        not_launched: vec![NotLaunched {
+            service: "assets".into(),
+            binary: "boss-assets-api".into(),
+            reason: "module equipment is not on in the tenant manifest".into(),
+        }],
+        errors: Vec::new(),
+        generation: Some("sha256:fixture".into()),
+    };
+    for gate in Gate::ALL {
+        let v = join_launched_window(
+            gate,
+            &roster,
+            &[],
+            at(3),
+            at(75),
+            Ok(Vec::new()),
+            Vec::new(),
+        );
+        assert!(
+            v.not_clean
+                .iter()
+                .any(|why| why.starts_with("launch roster:")),
+            "{gate:?} was handed a roster generation and no reason names the launch roster: {:#?}",
+            v.not_clean
+        );
+    }
 }

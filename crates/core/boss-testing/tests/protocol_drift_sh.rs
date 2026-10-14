@@ -22,7 +22,7 @@
 //! finds would be a fact about the fixture, not about the script.
 
 use boss_testing::announce::{await_announced_port, with_announce};
-use boss_testing::repo_root;
+use boss_testing::{repo_root, without_proxy};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -50,8 +50,10 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_GET(self):
+        # Whether the machine token came with it (backlog 44b2087e).
+        tok = b" token=yes" if self.headers.get("x-boss-machine-token") else b" token=no"
         with open(log, "ab") as f:
-            f.write(b"GET " + self.path.encode() + b"\n")
+            f.write(b"GET " + self.path.encode() + tok + b"\n")
         if self.path.startswith("/api/workflows"):
             if mode == "registry-down":
                 self._reply(503, b'{"error":"upstream unavailable"}')
@@ -243,7 +245,7 @@ fn start_stub(case: &str, mode: &str) -> Stub {
     let _ = std::fs::remove_file(&started);
     std::fs::write(&registry, registry_fixture().0).unwrap();
     boss_testing::write_exec(&script, &with_announce(STUB));
-    let mut child = Command::new("python3")
+    let mut child = without_proxy(&mut Command::new("python3"))
         .arg(&script)
         .arg(&log)
         .arg(&started)
@@ -258,13 +260,19 @@ fn start_stub(case: &str, mode: &str) -> Stub {
 }
 
 fn run(stub: &Stub, cmd: &str) -> (Option<i32>, String, String) {
-    let out = Command::new("bash")
+    run_with(stub, cmd, &[])
+}
+
+/// The same, with `env` set last.
+fn run_with(stub: &Stub, cmd: &str, env: &[(&str, &str)]) -> (Option<i32>, String, String) {
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(script())
         .arg(cmd)
         .arg("--repo")
         .arg(repo_root())
         .env("BOSS_JOBS_URL", format!("http://127.0.0.1:{}", stub.port))
         .env("BOSS_API_RETRY_DEADLINE", "5")
+        .envs(env.iter().copied())
         .output()
         .expect("bash");
     (
@@ -276,6 +284,53 @@ fn run(stub: &Stub, cmd: &str) -> (Option<i32>, String, String) {
 
 fn has_python3() -> bool {
     Command::new("python3").arg("--version").output().is_ok()
+}
+
+/// EVERY REQUEST OF A RUN CARRIES THE MACHINE TOKEN, THE LINT'S READ TOO
+/// (backlog 44b2087e, 2026-10-09). The script stamped its own reads and
+/// its PATCH, and the lint it runs read `/api/workflows` itself with no
+/// token, because a lint holds none by rule. Now the script reads the
+/// registry, stamped, and hands the lint its read: with a token on the
+/// host, every request the stub RECEIVES carries it, the registry is read
+/// once, and the row is the same.
+#[test]
+fn every_request_of_a_run_carries_the_machine_token_and_the_lint_sends_none() {
+    if !has_python3() {
+        eprintln!("skipping: no python3");
+        return;
+    }
+    let stub = start_stub("token", "serve");
+    let tokens = boss_testing::scratch_dir("protocol-drift-machine-token");
+    std::fs::write(tokens.join("current"), "stub-machine-token-44b2087e\n").unwrap();
+    let (rc, out, err) = run_with(
+        &stub,
+        "file",
+        &[("BOSS_MACHINE_TOKEN_DIR", &tokens.display().to_string())],
+    );
+    assert_eq!(rc, Some(0), "file did not exit 0:\n{out}\n{err}");
+    let log = stub.log();
+    let gets: Vec<&str> = log.lines().filter(|l| l.starts_with("GET ")).collect();
+    assert_eq!(
+        gets.iter()
+            .filter(|l| l.starts_with("GET /api/workflows "))
+            .count(),
+        1,
+        "the registry is read once, by the script, and handed to the lint:\n{log}"
+    );
+    let bare: Vec<&&str> = gets.iter().filter(|l| !l.ends_with(" token=yes")).collect();
+    assert!(
+        bare.is_empty(),
+        "these reads reached the jobs API without the machine token while the host holds one — \
+         each a caller its gate would refuse:\n{bare:#?}\nall:\n{log}\n{err}"
+    );
+    let patches = stub.patches();
+    assert_eq!(patches.len(), 1, "{log}");
+    assert_eq!(
+        patches[0].1["measured"]["fields_compared"].as_u64(),
+        Some(registry_fixture().1 as u64),
+        "handed its read, the lint compares exactly as it did reading for itself: {}",
+        patches[0].1
+    );
 }
 
 /// `file` measures the registry against this tree's bundle and PATCHes

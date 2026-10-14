@@ -95,6 +95,65 @@ fn the_script_configmap_has_one_name_everywhere() {
     );
 }
 
+/// The keys `--from-file=<key>=…` declares on the gate-runner-script
+/// ConfigMap in one script. In the converge only the arguments sourced
+/// from the `/gate` mount count: the step-plugins ConfigMap is built a
+/// few lines above with the same flag.
+fn configmap_keys(text: &str, only_from: Option<&str>) -> std::collections::BTreeSet<String> {
+    text.split("--from-file=")
+        .skip(1)
+        .filter_map(|rest| {
+            let arg = rest.split_whitespace().next()?.trim_matches('"');
+            let (key, source) = arg.split_once('=')?;
+            match only_from {
+                Some(prefix) if !source.starts_with(prefix) => None,
+                _ => Some(key.to_string()),
+            }
+        })
+        .collect()
+}
+
+/// THE KEY NAMES LIVE THREE TIMES, so they get an equality test (§9a;
+/// design 1d7a1669 pin 3). The converge that writes the ConfigMap on every
+/// train, the hand verb that checks it for drift, and the manifest's
+/// command that execs one of its keys must agree — a manifest naming a
+/// key the live ConfigMap lacks starts a pod that cannot even report.
+#[test]
+fn the_converge_and_the_hand_verb_build_the_same_script_keys() {
+    let converge = configmap_keys(
+        &read("infra/forge/cluster-deploy-runner.sh"),
+        Some("/gate/"),
+    );
+    let apply = configmap_keys(&read(APPLY), None);
+    let want: std::collections::BTreeSet<String> = ["bootstrap.sh", "run.sh"]
+        .iter()
+        .map(|k| k.to_string())
+        .collect();
+    assert_eq!(
+        converge, want,
+        "the converge must write both the bootstrap and main's run.sh into {CONFIGMAP}"
+    );
+    assert_eq!(
+        apply, converge,
+        "{APPLY} and the converge build {CONFIGMAP} with different keys — its --check would \
+         answer for an object the converge never writes"
+    );
+    let manifest = read(SHARED);
+    let execs = manifest
+        .split("/repo-script/")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the manifest's command runs a script from /repo-script");
+    assert!(
+        converge.contains(execs),
+        "{SHARED} execs /repo-script/{execs}, a key the converge does not write ({converge:?})"
+    );
+    assert!(
+        read("infra/gate-runner/bootstrap.sh").contains("/run.sh"),
+        "the bootstrap's fallback is the ConfigMap's run.sh key"
+    );
+}
+
 /// The mechanism has to be runnable, not merely present. A regeneration
 /// step that is documented and not executable is the comment we already
 /// had.

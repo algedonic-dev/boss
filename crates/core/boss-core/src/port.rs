@@ -25,7 +25,9 @@ pub trait EventStream: Send + Sync {
 /// Port: persist and retrieve events.
 #[async_trait]
 pub trait EventStore: Send + Sync {
-    /// Append an event to the store
+    /// Append an immutable fact. Redelivery of the same id and whole
+    /// fact is a no-op; a different fact under that id is refused and
+    /// the original is preserved.
     async fn append(&self, event: &Event) -> Result<(), EventStoreError>;
 
     /// Retrieve events by kind, ordered by timestamp

@@ -51,9 +51,6 @@ export type Route =
   /// Home is the cross-app surface — the chrome dropdown is scoped to
   /// the app you are in, this is the unscoped view it escalates to.
   | { kind: 'search'; q: string }
-  /// Personal Views — the Home-app surface for composing your own
-  /// reads over the information layer.
-  | { kind: 'views' }
   /// The codebase trend — the daily metrics packets, rendered.
   | { kind: 'systemCodebase' }
   /// Full-page step surface. A step whose UX is a plugin gets the
@@ -331,7 +328,6 @@ export function parseRoute(pathname: string, search = ''): Route {
   if (p === '/') return { kind: 'me' };
   if (p === '/me') return { kind: 'me' };
   if (p === '/inbox') return { kind: 'inbox' };
-  if (p === '/views') return { kind: 'views' };
   // The landing page's own door. The catch-all was its ONLY way in until
   // design ee3a3a2f (Q5) — `/` and `/ux` are My Day — so turning the
   // catch-all into a not-found would have orphaned a real page.

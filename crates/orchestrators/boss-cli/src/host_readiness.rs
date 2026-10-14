@@ -137,6 +137,7 @@ pub(crate) fn host_readiness(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boss_testing::test_values::test_net_1;
     use serde_json::json;
 
     fn now() -> DateTime<Utc> {
@@ -160,7 +161,7 @@ mod tests {
                 "observer": "boss-estate-observe-host",
                 "scope": "host",
                 "nodes": [{
-                    "id": host_id, "address": "10.20.0.15", "cpu": 8,
+                    "id": host_id, "address": test_net_1(15).to_string(), "cpu": 8,
                     "memory_gb": 16, "disk_gb": 226, "disk_free_gb": free_gb,
                     "uptime_s": 12345, "ready": true
                 }]
@@ -174,6 +175,20 @@ mod tests {
 
     fn verdict(rows: Vec<Value>, floor_gb: i64) -> Readiness {
         host_readiness(&body(rows), "forge-host", floor_gb, max_age(), now())
+    }
+
+    #[test]
+    fn synthetic_estate_host_address_is_reserved_and_capacity_still_decides() {
+        let sufficient = envelope("forge-host", "2026-09-03T01:55:00Z", 120);
+        assert_eq!(
+            sufficient["payload"]["nodes"][0]["address"],
+            test_net_1(15).to_string()
+        );
+        assert_eq!(verdict(vec![sufficient], 90), Readiness::Proceed);
+        assert!(matches!(
+            verdict(vec![envelope("forge-host", "2026-09-03T01:55:00Z", 20)], 90),
+            Readiness::Refuse { .. }
+        ));
     }
 
     // -- the four dispositions -----------------------------------------

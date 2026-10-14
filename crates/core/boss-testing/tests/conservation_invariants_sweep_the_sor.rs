@@ -43,7 +43,7 @@
 //!   * the bare-metal units are gone and roles.toml no longer names a
 //!     unit no host installs.
 
-use boss_testing::{repo_root, scratch_dir, write_exec};
+use boss_testing::{repo_root, scratch_dir, without_proxy, write_exec};
 use std::path::Path;
 use std::process::Command;
 
@@ -125,6 +125,7 @@ fn run_sweep(script: &str, bin: &Path, env: &[(&str, &str)]) -> (i32, String, St
         std::env::var("PATH").unwrap_or_default()
     );
     let mut cmd = Command::new("bash");
+    without_proxy(&mut cmd);
     cmd.arg(repo_root().join(script))
         .env_remove("DATABASE_URL")
         .env_remove("PGHOST")
@@ -562,7 +563,7 @@ fn the_cronjob_is_the_audit_integrity_chores_shape_on_every_instance() {
     // And the playground's render points the tenant sweep at the
     // brewery directory the image ships — the renderer's tenant
     // substitution, landing on this manifest's BOSS_TENANT_DIR.
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(repo_root().join("infra/cluster/render-instance.sh"))
         .args([
             "boss-playground",

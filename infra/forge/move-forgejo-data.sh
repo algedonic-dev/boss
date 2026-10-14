@@ -235,7 +235,7 @@ fail() { say "FAILED — $*"; exit 1; }
 
 # shellcheck source=infra/lib/jq.sh
 . "$REPO/infra/lib/jq.sh"
-# HOLD_FILE, LAST_BUILT_NAME, forge_need: one definition for every verb.
+# HOLD_FILE, STAMP_FILE, REGISTRY_PUSH_DIR, forge_need: one definition for every verb.
 # shellcheck source=infra/forge/forge-defaults.sh
 . "$HERE/forge-defaults.sh"
 # shellcheck source=infra/forge/registry-login.lib.sh
@@ -439,11 +439,10 @@ case "$MODE" in
         REG_OWNER="${reg_rest%%/*}"
         REG_NAME="${reg_rest#*/}"
         [ "$REG_HOST/$REG_OWNER/$REG_NAME" = "$REGISTRY" ] || refuse "the registry '$REGISTRY' is not of the shape host[:port]/owner/name"
-        if [ -z "${BOSS_MOVE_DOCKER_CONFIG:-}" ] || [ -z "${BOSS_FORGE_LAST_BUILT:-}" ]; then
-            OWNER_HOME="$(checkout_owner_home "$REPO")" || refuse "cannot resolve the owner of $REPO, so the converge's docker login and stamp have no path; the registry proof could not be read"
-        fi
-        DOCKER_CONFIG_FILE="${BOSS_MOVE_DOCKER_CONFIG:-$OWNER_HOME/.docker/config.json}"
-        STAMP_FILE="${BOSS_FORGE_LAST_BUILT:-$OWNER_HOME/$LAST_BUILT_NAME}"
+        # The converge's push login and stamp, both root's since it
+        # moved to root (backlog 683d7fe9): forge-defaults.sh's
+        # REGISTRY_PUSH_DIR and STAMP_FILE.
+        DOCKER_CONFIG_FILE="${BOSS_MOVE_DOCKER_CONFIG:-$REGISTRY_PUSH_DIR/config.json}"
         registry_login_read "$DOCKER_CONFIG_FILE" "$REG_HOST" || refuse "$REGISTRY_LOGIN_WHY"
         ( umask 077; printf 'header = "Authorization: Basic %s"\n' "$AUTH_B64" > "$WORK/basic.cfg" ) ;;
 esac

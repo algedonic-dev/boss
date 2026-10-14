@@ -163,7 +163,11 @@ pub struct LaunchRoster {
     /// whole. `None` beside `errors` is a record that could not be read;
     /// `None` with no error is a roster that consulted no record, and
     /// such a window is judged under no generation rule at all (every
-    /// service is required, so there is no excuse to inherit).
+    /// service is required, so there is no excuse to inherit). `Some`
+    /// is judged for EVERY gate (`join_selected`, backlog b13bd730): the
+    /// machine gate's window and the actor-role window both take their
+    /// roster from the record and both bind their excuses to it; no gate
+    /// handed a generation is left out of the rule.
     pub generation: Option<String>,
 }
 
@@ -374,7 +378,8 @@ pub fn read_launch_record_file(path: &std::path::Path) -> Result<String, String>
 }
 
 /// What a process states about its launch roster on every
-/// `machine_gate.recording_began` (`Evidence::state_roster`): the
+/// `machine_gate.recording_began` and every `actor_role.recording_began`
+/// (`Evidence::state_roster`): the
 /// generation of the record it was started under and the commit of its
 /// image, or why it can name no generation. A process that cannot read
 /// its record still starts and still states its start — the window then
@@ -384,6 +389,26 @@ pub fn roster_stamp(record: Result<&str, String>, commit: Option<&str>) -> Value
         Ok(generation) => serde_json::json!({"generation": generation, "commit": commit}),
         Err(error) => serde_json::json!({"error": error, "commit": commit}),
     }
+}
+
+/// Have `evidence` state the launch roster this process was started
+/// under on every start it states from here on: the record at
+/// `launch_record` (the launcher's `BOSS_LAUNCH_RECORD`) read through the
+/// one bounded reader, digested, and set as the stamp. The whole of what
+/// a recorder that is not the machine gate's does with the record, so
+/// the stamp cannot be read or digested a second way (backlog b13bd730).
+/// Call it before the first `recording_began`; like the machine gate's
+/// mount it never refuses — an unreadable record is an error stamp, and
+/// the window then cannot read clean.
+pub fn state_launch_roster(
+    evidence: &crate::gate_evidence::Evidence,
+    launch_record: Option<String>,
+) {
+    let record = read_launch_record(launch_record);
+    evidence.state_roster(roster_stamp(
+        record.as_deref().map_err(Clone::clone),
+        crate::startup::build_commit(),
+    ));
 }
 
 /// The key a `recording_began` carries its roster stamp under.
@@ -764,6 +789,20 @@ fn live_reasons(
                 .any(|r| r.count == 0 || (!previous && r.presented.enforce_refuses()))
             {
                 why.push("machine tally has invalid or enforce-refused source overflow".into());
+            }
+            // An asker past its share ends a clean window (design
+            // e3d19d1a q1), judged here from the spill itself: a process
+            // built before that decision answers it under an empty
+            // `not_clean`, and during a roll it still answers (review
+            // 42836ede of car 10ea15f6, N1; backlog aba44bac). A drain
+            // waits out `previous` alone, which an ask is not.
+            if !previous
+                && misses
+                    .source_overflow
+                    .iter()
+                    .any(|r| r.presented == Presented::Asked)
+            {
+                why.push("machine tally holds a source past its share of asks".into());
             }
             if previous {
                 if misses.source_overflow.iter().any(|row| {
@@ -1191,12 +1230,10 @@ fn join_selected(
     // Keep the projection unchanged and name each relevant unbound
     // input's immutable record and payload.
     let began = gate.kind(Fact::RecordingBegan);
-    // The actor-role window is held to both of the rules below under its
+    // The actor-role window is held to the first rule below under its
     // enforce reading as well: each of its facts is bound to the process
-    // start that stated it, and a shape first seen before the window by
-    // a process that ended inside it is never read as unused (backlog
-    // e0bdba74). The machine gate's and the policy check's enforce
-    // windows are judged as they were.
+    // start that stated it (backlog e0bdba74). The machine gate's and the
+    // policy check's enforce windows do not bind a fact to its start.
     let bound_to_a_process = purpose != Purpose::Enforce || gate == Gate::ActorRole;
     if bound_to_a_process {
         for event in facts.iter().filter(|event| {
@@ -1261,46 +1298,55 @@ fn join_selected(
     // First-sighting facts do not state a retired epoch's final use.
     // A drained recorder proves delivery, not that use stopped at the
     // first sighting. Keep the uncertainty until retirement ages out.
-    if bound_to_a_process {
-        for event in facts.iter().filter(|event| event.timestamp < from) {
-            let relevant = match purpose {
-                // The one definition the log's window reads too
-                // (`gate_evidence::drain_window`).
-                Purpose::Previous(slot) => slot.dirtied_by(gate, event),
-                Purpose::PolicyWatch => match gate.fact_of(&event.kind) {
-                    Some(Fact::WouldRefuse | Fact::Refused) => {
-                        event
-                            .payload
-                            .get("key")
-                            .and_then(|key| key.get("arm"))
-                            .and_then(Value::as_str)
-                            != Some("unsigned")
-                    }
-                    Some(Fact::TallyOverflowed | Fact::FactsLost) => true,
-                    _ => false,
-                },
-                Purpose::Enforce => gate.fact_of(&event.kind).is_some_and(Fact::dirties),
-            };
-            if !relevant {
-                continue;
-            }
-            let retired = facts
-                .iter()
-                .filter(|boundary| {
-                    boundary.source == event.source
-                        && boundary.timestamp >= event.timestamp
-                        && ((gate.fact_of(&boundary.kind) == Some(Fact::RecordingEnded)
-                            && boundary.payload.get("instance") == event.payload.get("instance"))
-                            || (boundary.kind == began && boundary.timestamp > event.timestamp))
-                })
-                .min_by_key(|boundary| (boundary.timestamp, boundary.id));
-            if retired.is_some_and(|boundary| boundary.timestamp >= from) {
-                why.push(format!(
-                    "log fact {} has unknown final usage before epoch retirement {}",
-                    event.id,
-                    retired.map(|boundary| boundary.timestamp).unwrap_or(now)
-                ));
-            }
+    //
+    // EVERY window, of every gate and purpose (backlog ebc09e5b; review
+    // 828fae07 of car 49549a8d, finding 1). This rule rode the binding
+    // rule's guard above, so the machine gate's and the policy check's
+    // ENFORCE windows never ran it: a process that stated a spill, an
+    // overflow or a would-refuse before the window and retired inside it
+    // — a roll, its successor the clean live read — read
+    // `covers=true, not_clean=[]`. A tally keeps counting without
+    // stating, so its first statement says nothing of its last use.
+    for event in facts.iter().filter(|event| event.timestamp < from) {
+        let relevant = match purpose {
+            // The one definition the log's window reads too
+            // (`gate_evidence::drain_window`).
+            Purpose::Previous(slot) => slot.dirtied_by(gate, event),
+            Purpose::PolicyWatch => match gate.fact_of(&event.kind) {
+                Some(Fact::WouldRefuse | Fact::Refused) => {
+                    event
+                        .payload
+                        .get("key")
+                        .and_then(|key| key.get("arm"))
+                        .and_then(Value::as_str)
+                        != Some("unsigned")
+                }
+                Some(Fact::TallyOverflowed | Fact::FactsLost) => true,
+                _ => false,
+            },
+            // The one definition the log's window reads too
+            // (`Gate::dirtied_by`).
+            Purpose::Enforce => gate.dirtied_by(event),
+        };
+        if !relevant {
+            continue;
+        }
+        let retired = facts
+            .iter()
+            .filter(|boundary| {
+                boundary.source == event.source
+                    && boundary.timestamp >= event.timestamp
+                    && ((gate.fact_of(&boundary.kind) == Some(Fact::RecordingEnded)
+                        && boundary.payload.get("instance") == event.payload.get("instance"))
+                        || (boundary.kind == began && boundary.timestamp > event.timestamp))
+            })
+            .min_by_key(|boundary| (boundary.timestamp, boundary.id));
+        if retired.is_some_and(|boundary| boundary.timestamp >= from) {
+            why.push(format!(
+                "log fact {} has unknown final usage before epoch retirement {}",
+                event.id,
+                retired.map(|boundary| boundary.timestamp).unwrap_or(now)
+            ));
         }
     }
     for event in facts.iter().filter(|event| event.kind == began) {
@@ -1358,23 +1404,32 @@ fn join_selected(
     // input error: the inputs are whole, and the watch under this
     // selection began too recently — the same class as a young process.
     //
-    // THE MACHINE GATE'S RULE ONLY. The stamp it reads rides
-    // `machine_gate.recording_began` and no other gate's start
-    // (`machine_gate::mount_launched` is its one writer). The actor-role
-    // window takes its roster from the same record (backlog e0bdba74)
-    // and its starts state no stamp, so judged here it would name every
-    // start unstamped and never read clean. Its excuses are held to the
-    // port, the read and the log, as they were; that an actor-role
-    // excuse is NOT yet bound to the selection that made it is a gap
-    // this line leaves named, not closed.
+    //
+    // NO GATE IS EXCEPTED (backlog b13bd730; review 72bd1c05, F1). The
+    // rule is keyed on the roster alone: one read from a record is
+    // judged, whatever the gate. Until this car a guard held it to the
+    // machine gate and a wildcard took everything else, so the
+    // actor-role window — whose roster is read from the same record
+    // (backlog e0bdba74) — kept its excuses on the port, the read and
+    // the log only, and a service the old selection ran was inherited as
+    // clean by the new one that skips it. Its starts state the stamp now
+    // (`state_launch_roster`, called by `boss_events::role_tally`). The
+    // policy check consults no record and arrives with `None`; were it,
+    // or a gate added later, ever handed a generation while its starts
+    // state none, it reads never-clean and names each unstamped start,
+    // which is loud. There is no arm here for a new gate to fall into
+    // unjudged.
     let roster_generations = match excused.generation {
-        Some(declared) if gate == Gate::MachineGate => {
+        Some(declared) => {
             let (stretches, gaps) =
                 judged_generations(gate, &facts, &required_services, from, declared);
             why.extend(gaps.into_iter().map(|gap| format!("launch roster: {gap}")));
             stretches
         }
-        _ => Vec::new(),
+        // No record consulted, or one that could not be read: every
+        // service is required (`LaunchRoster::generation`), so there is
+        // no excuse to bind.
+        None => Vec::new(),
     };
     let mut live = Vec::new();
     for service in &required_services {
@@ -2132,6 +2187,134 @@ mod tests {
                 "route":"/fixture","presented":presented,"count":2,"first_seen":at(74),"last_seen":at(75)}]);
             assert!(judge(gate, facts(gate), body).covers_requested_window);
         }
+    }
+
+    /// Backlog aba44bac (review 42836ede of car 10ea15f6, N1). An asker
+    /// past its source's share ends a clean window (design e3d19d1a q1),
+    /// and a process built before that decision says otherwise twice: its
+    /// live tally holds the spill under an EMPTY `not_clean`, and its log
+    /// states the spill as a keyless `asked` of scope `source` rather than
+    /// a `tally_overflowed`. During a roll such a process still answers,
+    /// so the reader judges the spill itself, on both halves — what the
+    /// tally and the fact ARE, never what the producer says of them.
+    #[test]
+    fn an_older_builds_asked_spill_ends_the_enforce_window_on_both_halves() {
+        let gate = Gate::MachineGate;
+        let spill = |presented: &str| {
+            let mut body = snapshot(gate);
+            body["source_overflow"] = json!([{"source":"10.20.0.66","presented":presented,
+                "count":3,"first_seen":at(74),"last_seen":at(75)}]);
+            body
+        };
+        // Controls: a probe reader past its share dirties nothing, and the
+        // fixture is clean without the spill.
+        assert!(judge(gate, facts(gate), snapshot(gate)).covers_requested_window);
+        assert!(judge(gate, facts(gate), spill("reader.current")).covers_requested_window);
+        let live = judge(gate, facts(gate), spill("asked"));
+        refuses(&live);
+        assert!(
+            live.live[0]
+                .not_clean
+                .iter()
+                .any(|why| why.contains("past its share of asks")),
+            "the reader names the asked spill itself: {:?}",
+            live.live[0].not_clean
+        );
+
+        // The log half: a keyed ask is the question the route exists
+        // for and stays clean; the keyless spill an older build stated
+        // names no asker and ends the window where it stands.
+        let ask = |payload: Value| {
+            let mut log = facts(gate);
+            log.push(event(gate, Fact::Asked, 20, payload));
+            judge(gate, log, snapshot(gate))
+        };
+        let keyed = ask(
+            json!({"service":"policy","mode":"report","recording_since":at(0),
+            "key":{"peer":"10.20.0.66","user":"someone","method":"GET",
+                "route":"/api/machine-gate/accepts","presented":"asked"}}),
+        );
+        assert!(keyed.covers_requested_window, "{keyed:?}");
+        for payload in [
+            json!({"service":"policy","mode":"report","recording_since":at(0),
+                "scope":"source","source":"10.20.0.66","presented":"asked"}),
+            // Neither a key nor a scope: an ask nobody can place is no
+            // evidence that it named its asker.
+            json!({"service":"policy","mode":"report","recording_since":at(0)}),
+        ] {
+            let v = ask(payload);
+            assert!(!v.covers_requested_window, "{v:?}");
+            assert_eq!(v.clean_since, Some(at(20) + Duration::microseconds(1)));
+        }
+    }
+
+    /// Backlog ebc09e5b (review 828fae07 of car 49549a8d, finding 1). A
+    /// process that stated a dirtying fact BEFORE an enforce window opened
+    /// and retired inside it — a roll — has no recorded final use: its
+    /// tally kept spilling and stated nothing more, and the live read is
+    /// its clean successor. The retired-epoch rule ran only for drains,
+    /// the policy watch and actor-role, so the machine gate's and the
+    /// policy check's enforce windows read such an epoch clean
+    /// (`covers=true, not_clean=[]`). Each fact here is the reviewer's
+    /// measured shape: hour 1, window from hour 3, retirement at hour 74.
+    #[test]
+    fn an_enforce_window_holds_a_pre_window_fact_of_an_epoch_that_retired_inside_it() {
+        let gate = Gate::MachineGate;
+        let opening = |fact: Fact, payload: Value| {
+            let mut log = facts(gate);
+            log.push(event(gate, fact, 1, payload));
+            judge(gate, log, snapshot(gate))
+        };
+        // Control: a keyed ask is the question the route exists for, and
+        // dirties nothing wherever it stands.
+        let keyed = opening(
+            Fact::Asked,
+            json!({"service":"policy","instance":"old","mode":"report","recording_since":at(0),
+                "key":{"peer":"10.20.0.66","user":"someone","method":"GET",
+                    "route":"/api/machine-gate/accepts","presented":"asked"}}),
+        );
+        assert!(keyed.covers_requested_window, "{keyed:?}");
+        for (fact, payload) in [
+            // An older build's keyless spill of asks past a source's share.
+            (
+                Fact::Asked,
+                json!({"service":"policy","instance":"old","mode":"report","recording_since":at(0),
+                    "scope":"source","source":"10.20.0.66","presented":"asked"}),
+            ),
+            // A newer build's statement of the same spill.
+            (
+                Fact::TallyOverflowed,
+                json!({"service":"policy","instance":"old","mode":"report","recording_since":at(0),
+                    "scope":"source","source":"10.20.0.66","presented":"asked"}),
+            ),
+            // A caller enforce would refuse.
+            (
+                Fact::WouldRefuse,
+                json!({"service":"policy","instance":"old","mode":"report","recording_since":at(0),
+                    "key":{"peer":"10.20.0.66","user":"someone","method":"GET",
+                        "route":"/api/jobs","presented":"none"}}),
+            ),
+        ] {
+            let v = opening(fact, payload);
+            refuses(&v);
+            assert!(
+                v.input_errors
+                    .iter()
+                    .any(|why| why.contains("unknown final usage before epoch retirement")),
+                "the answer names the retired epoch it cannot clear: {v:?}"
+            );
+        }
+        // The policy check's enforce window has the same gap and the same
+        // rule.
+        let mut log = facts(Gate::PolicyCheck);
+        log.push(event(
+            Gate::PolicyCheck,
+            Fact::WouldRefuse,
+            1,
+            json!({"service":"policy","instance":"old","mode":"report","recording_since":at(0),
+                "key":{"caller":"old-caller"}}),
+        ));
+        refuses(&judge(Gate::PolicyCheck, log, snapshot(Gate::PolicyCheck)));
     }
 
     // ---- The probe-reader credential's drain (design b35c22b4) ----

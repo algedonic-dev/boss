@@ -24,7 +24,6 @@ fn build_app(pool: PgPool) -> Router {
         people: Arc::new(PgPeople::new(pool)),
         publisher: None,
         policy: None,
-        subject_kinds: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
     })
 }

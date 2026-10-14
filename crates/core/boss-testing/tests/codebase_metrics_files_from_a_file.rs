@@ -15,7 +15,7 @@
 //! carries enough landings that the row is well past 128 KiB.
 
 use boss_testing::announce::{await_announced_port, with_announce};
-use boss_testing::repo_root;
+use boss_testing::{repo_root, without_proxy};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -117,7 +117,7 @@ fn start_stub(case: &str) -> Stub {
     let _ = std::fs::remove_file(&log);
     let _ = std::fs::remove_file(&started);
     boss_testing::write_exec(&script, &with_announce(STUB));
-    let mut child = Command::new("python3")
+    let mut child = without_proxy(&mut Command::new("python3"))
         .arg(&script)
         .arg(&log)
         .arg(&started)
@@ -137,7 +137,7 @@ fn a_row_past_the_argv_cap_is_filed_whole_from_a_file() {
     }
     let repo = big_repo("e2big");
     let stub = start_stub("e2big");
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(repo_root().join("infra/codebase-metrics.sh"))
         .args(["file", "--repo"])
         .arg(&repo)

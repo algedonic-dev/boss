@@ -6,16 +6,37 @@ door does not fetch an image, accept worker artifacts or create grants.
 """
 import argparse
 import base64
+from contextlib import contextmanager
 import fcntl
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import stat
 import sys
 import tempfile
 import uuid
+
+
+# THE DURABLE HOME (design a68fc42a D6, David 2026-10-10). The store and
+# its one selector lived on the dev container's root filesystem
+# (under /opt and /etc), so every pod
+# roll erased them and all four doors silently went back to running
+# candidate code beside the token (gap (a)). On the /work PVC they
+# survive a roll, and the reclaim sidecar, which runs the hourly
+# installer and cannot write the dev container's root fs, can keep
+# them current. Workers never mount /work. The doors (infra/dev/boss,
+# boss-api, wt-cargo, wt-web) and the CLI's child forwarding
+# (door_env.rs) spell this path; control-tools_test.py holds them equal.
+STORE = Path("/work/tools/dev-control")
+SELECTOR = STORE / "enabled"
+# Generations kept while following main: the active one, the one it
+# replaced (a door may still be running from it), and three more. Each
+# is ~95 MB, and main moves ~25 times a day on a 40Gi volume.
+KEEP = 5
 
 
 def published_module(name):
@@ -52,7 +73,8 @@ def run_contract(argv, env):
     return subprocess.run(argv, env=env, capture_output=True, timeout=30, check=False)
 
 
-def activate(archive, store, enabled, commit, config, runner=run_contract):
+@contextmanager
+def transition_lock(store):
     store.mkdir(mode=0o700, parents=True, exist_ok=True)
     if store.is_symlink() or store.stat().st_uid != os.getuid() or store.stat().st_mode & 0o077:
         raise ValueError("unsafe controller generation store")
@@ -62,7 +84,73 @@ def activate(archive, store, enabled, commit, config, runner=run_contract):
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise ValueError("unsafe controller activation lock")
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        return activate_locked(archive, store, enabled, commit, config, runner)
+        yield
+
+
+def deactivate(store, enabled):
+    """Supported rollback: serialize with activation and installer refusal.
+
+    A bare unlink takes no advisory lock and can be undone by a pass
+    already running (review 2c4be21d, car 3f64de32). Keep the store and
+    lock, record off before unlinking, then acknowledge only after both.
+    The intent also stops a follow-main pass after an interrupted off.
+    """
+    with transition_lock(store):
+        atomic_file(store / "off.json", json.dumps({"state": "off"}).encode())
+        enabled.unlink(missing_ok=True)
+        fd = os.open(store, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return "off"
+
+
+def activate(archive, store, enabled, commit, config, runner=run_contract, follow=False, prepared_config=None):
+    with transition_lock(store):
+        if follow:
+            # The supported deactivate door takes this same lock; never
+            # recommend bare rm as a rollback of an advisory-lock protocol.
+            if (store / "off.json").exists() or (store / "off.json").is_symlink():
+                record = published_module("dev-build").load_record(store / "off.json")
+                if record != {"state": "off"}:
+                    raise ValueError("invalid controller off intent")
+                enabled.unlink(missing_ok=True)
+                return "inert"
+            if not (enabled.is_symlink() or enabled.exists()):
+                return "inert"
+            config = published_module("dev-build").load_record(prepared_config or archive.parent / "config.json")
+        activate_locked(archive, store, enabled, commit, config, runner)
+        # Only explicit activation may revoke an off intent. If this
+        # unlink is interrupted the next follow-main pass stays off.
+        if not follow:
+            (store / "off.json").unlink(missing_ok=True)
+        return "activated " + commit
+
+
+def reactivate(archive, store, enabled, commit, runner=run_contract, prepared_config=None):
+    """Follow main with this published generation's prepared configuration,
+    ONLY where a selector already exists.
+
+    No selector is inert, never an activation: turning isolation on is
+    the operator's act (b3071bf4, held_by_david_20261009). A refused
+    selector is re-tried, so a bad hour heals on the next good one. A
+    failure raises and changes no authority; the installer then refuses
+    the selector (design a68fc42a D1), because a selector it could not
+    re-establish must not leave candidate code running beside the token.
+    Missing or unsafe generation configuration refuses; the previous
+    generation's binding never substitutes for unprepared published data.
+    """
+    return activate(archive, store, enabled, commit, None, runner, follow=True, prepared_config=prepared_config)
+
+
+def prune(store, keep, active):
+    generations = store / "generations"
+    found = [p for p in generations.iterdir() if re.fullmatch(r"[0-9a-f]{40}", p.name) and p.is_dir() and not p.is_symlink()]
+    found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in found[keep:]:
+        if old.name not in active:
+            shutil.rmtree(old)
 
 
 def activate_locked(archive, store, enabled, commit, config, runner):
@@ -128,17 +216,37 @@ def activate_locked(archive, store, enabled, commit, config, runner):
     # omit these records without leaving split active generations.
     atomic_link(store, "current", "generations/" + commit)
     atomic_file(store / "activation-observed.json", json.dumps({"commit": commit, "current": os.readlink(store / "current"), "enabled": os.readlink(enabled)}).encode())
+    # Only after the new authority and its observation are complete.
+    prune(store, KEEP, {commit})
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("commit")
     parser.add_argument("--cli-store", type=Path, default=Path("/work/tools/image-cli"))
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--store", type=Path, default=STORE)
+    parser.add_argument("--prepared-config", type=Path)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--config", type=Path)
+    mode.add_argument("--reactivate", action="store_true",
+                      help="follow main: re-activate through an EXISTING selector only (inert without one)")
+    mode.add_argument("--deactivate", action="store_true", help="supported rollback under the activation lock")
     args = parser.parse_args()
-    config = published_module("dev-build").load_record(args.config)
-    activate(args.cli_store / args.commit / "dev-control.tar", Path("/opt/boss-dev-control"),
-             Path("/etc/boss-dev-control/enabled"), args.commit, config)
+    archive = args.cli_store / args.commit / "dev-control.tar"
+    enabled = args.store / SELECTOR.name
+    if args.deactivate:
+        outcome = deactivate(args.store, enabled)
+    elif args.reactivate:
+        outcome = reactivate(archive, args.store, enabled, args.commit, prepared_config=args.prepared_config)
+    else:
+        config = published_module("dev-build").load_record(args.config)
+        outcome = activate(archive, args.store, enabled, args.commit, config)
+    if outcome == "off":
+        print("dev-control: off — supported rollback recorded at " + str(args.store / "off.json"))
+    elif outcome == "inert":
+        print("dev-control: inert — no selector at " + str(enabled) + "; nothing was activated (activating is the operator's act)")
+    else:
+        print("dev-control: " + outcome + " — " + str(enabled) + " -> " + os.readlink(enabled))
 
 
 if __name__ == "__main__":

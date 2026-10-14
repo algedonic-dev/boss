@@ -43,6 +43,12 @@ use boss_policy_client::controls::CONTROLS;
 /// resource tokens beside them, so an ask changed in place fails too.
 const RAW_ASKS: &[RawAsk] = &[
     RawAsk {
+        file: "crates/core/boss-jobs/src/station_claim.rs",
+        mentions: 1,
+        digest: "cc18f4fa336a20f4",
+        why: "native claim sign-off on step-signoff:<authority_role>, a role named by the workflow; static job Read and step Update use their declared controls",
+    },
+    RawAsk {
         file: "crates/core/boss-jobs/src/http/signer.rs",
         mentions: 1,
         digest: "db53570313edd2cf",

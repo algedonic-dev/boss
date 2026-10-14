@@ -33,7 +33,10 @@
 //!
 //! ## What it does
 //!
-//! On `jobs.job.closed`:
+//! On `jobs.job.closed` — or on a step's `step.done.<kind>`, whose
+//! marker names the packet as `job_id` (the boss-gcp deposit key rule,
+//! backlog dea2236f, fires there because only the step's marker carries
+//! the metadata that tells a finding from a clean tick):
 //!
 //! 1. Read the closed chore. A packet already carrying
 //!    `metadata.judged` was judged by an earlier delivery (JetStream is
@@ -522,9 +525,16 @@ impl Handler for ChoreFileReds {
         };
         let rule = ctx.rule_name.as_str();
 
-        // The close marker names the packet. A malformed marker is not
-        // something a redelivery can fix, so it is a no-op, not an error.
-        let Some(chore_id) = ctx.event_payload.get("id").and_then(|v| v.as_str()) else {
+        // The close marker names the packet as `id`; a step's marker
+        // (`step.done.<kind>`) names it as `job_id`, which is how the
+        // boss-gcp deposit key rule reaches this judge from an ok run
+        // (review 1fa0d093 of car 3cd92f7a, B2). A malformed marker is
+        // not something a redelivery can fix, so it is a no-op, not an
+        // error.
+        let Some(chore_id) = ["id", "job_id"]
+            .iter()
+            .find_map(|k| ctx.event_payload.get(*k).and_then(|v| v.as_str()))
+        else {
             return Ok(());
         };
 
@@ -980,6 +990,80 @@ mod tests {
         );
         assert_eq!(filed[0]["owner_id"], "emp-owner");
         assert_eq!(w.len(), 3);
+    }
+
+    /// The boss-gcp deposit key rule fires on the converge's `run` step,
+    /// not its close (review 1fa0d093 of car 3cd92f7a, B2): a finding
+    /// rides an ok tick, and only `step.done.task` carries the step
+    /// metadata that tells a finding tick from a clean one. That marker
+    /// names the packet as `job_id`; the judge read only `id`, the close
+    /// marker's key, and so filed nothing for it.
+    #[tokio::test]
+    async fn the_authored_deposit_key_rule_files_one_item_from_the_run_step_marker() {
+        use boss_dispatcher::rules::{
+            expr::NoHelpers,
+            handler::{HandlerRegistry, dispatch},
+            registry::{Registry, match_event},
+        };
+        const RULE_FILE: &str = "file-backlog-items-on-boss-gcp-deposit-key-unconfined";
+        const TICK2: &str = "33333333-3333-3333-3333-333333333334";
+        let rule = std::fs::read_to_string(
+            boss_testing::repo_root().join(format!("infra/dispatcher/rules/{RULE_FILE}.toml")),
+        )
+        .unwrap();
+        let registry = Registry::from_toml(&rule).unwrap();
+        let red = "RED boss-gcp-converge/deposit-key-unconfined refused: deposit-key-audit: \
+                   UNCONFINED /home/david/.ssh/authorized_keys:1 — the key ssh-ed25519 \
+                   ...Q8OBmag8/TG5 is also on this line with NO forced command";
+        let tick = |id: &str| {
+            let mut job = crawl(red);
+            job["id"] = json!(id);
+            job["kind"] = json!("maintenance-boss-gcp-converge");
+            job["title"] = json!("boss-gcp adopts its own units");
+            job["steps"][1]["metadata"] = json!({
+                "result": "ok", "deposit_key_verdict": "unconfined", "output": red,
+            });
+            job
+        };
+        let (base, writes) = mock_jobs(vec![tick(CRAWL), tick(TICK2)]).await;
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(handler(base));
+        for id in [CRAWL, CRAWL, TICK2] {
+            let payload = json!({
+                "job_id": id, "step_id": "c-run", "kind": "task",
+                "subject_kind": "custom", "subject_id": "infra/maintenance-boss-gcp-converge",
+                "workflow_kind": "maintenance-boss-gcp-converge",
+                "completed_on": "2026-10-10", "notify_on_done": false, "spec_slug": "run",
+                "metadata": {"result": "ok", "deposit_key_verdict": "unconfined", "output": red},
+            });
+            let matched = match_event(&registry, "step.done.task", &payload, &NoHelpers).matched;
+            assert_eq!(matched.len(), 1);
+            let result = dispatch(
+                &matched,
+                &handlers,
+                "event-step",
+                "step.done.task",
+                &payload,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(result[0].outcome.is_ok(), "{result:?}");
+        }
+        let w = writes.lock().unwrap().clone();
+        let filed = posts(&w);
+        assert_eq!(
+            filed.len(),
+            1,
+            "two finding ticks and a redelivery are one open item: {w:?}"
+        );
+        assert_eq!(
+            filed[0]["metadata"][RED_ROUTE],
+            "boss-gcp-converge/deposit-key-unconfined"
+        );
+        assert_eq!(filed[0]["metadata"]["area"], "credentials");
+        assert_eq!(filed[0]["metadata"]["source"], source_of_chore(CRAWL));
+        assert_eq!(filed[0]["owner_id"], "emp-owner");
     }
 
     #[tokio::test]

@@ -128,7 +128,7 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
             },
     } = cmd;
     let act = act_from(resolve, reason, reason_file.as_deref())?;
-    let jobs = crate::gate::resolve_jobs_base(None)?;
+    let jobs = crate::sor_client::resolve_jobs_base(None)?;
     let base = events_base_from(std::env::var(EVENTS_ENV).ok(), &jobs);
     let wire = Wire::at(base, crate::identity::caller())?;
     println!("{}", perform(&wire, outbox_id, &act).await?);

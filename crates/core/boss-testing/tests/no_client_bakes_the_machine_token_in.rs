@@ -1,6 +1,6 @@
-//! No client bakes the machine token into its default headers, except
-//! the callers named below, and that list only shrinks (design 6805c764,
-//! car 2; backlog 2710c8fc).
+//! No client bakes the machine token into its default headers (design
+//! 6805c764, car 2; backlog 2710c8fc). The former caller list is empty
+//! and the pin refuses adding a row.
 //!
 //! WHAT WAS MEASURED (adversarial review of car 2 slice 1, 22378668,
 //! 2026-09-26, finding S1). Seven clients read the token ONCE, at build,
@@ -16,11 +16,10 @@
 //!
 //! THE FIX, AND WHAT THIS HOLDS. `boss_core::machine_token::Client`
 //! stamps the process's one watched `Source` on every request it builds.
-//! `machine_token::attach` — the read-once door — survives only for the
-//! callers in [`BAKED`], each with why it has not moved yet. A new call
-//! is refused, naming its file; a row whose file no longer calls it is
-//! refused as stale, so converting a caller forces the row's deletion
-//! and the exemption cannot outlive its reason.
+//! `machine_token::BlockingClient` does the same for blocking callers.
+//! `machine_token::attach` — the read-once door — was deleted with its
+//! last callers on 2026-09-29. [`BAKED`] is empty and must stay empty;
+//! the scan refuses any restored call, naming its file.
 //!
 //! EVERY SPELLING (review of 6fbc7fc7, 2026-09-28, follow-up 2). The
 //! first version matched `machine_token::attach(` only, so a file that
@@ -32,11 +31,25 @@
 //! constant under any name, or as the literal — outside [`SPELLERS`],
 //! the few places whose job is the header itself.
 //!
+//! AND HOW EACH ONE'S REQUEST LEAVES (backlog 1ff6cabe, 2026-10-10).
+//! reqwest honours `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` by default,
+//! loopback included, and only the probe reader opted out — so a proxy
+//! exported where a service or a test ran received every request the
+//! estate token rode on (measured: the policy coverage read went to a
+//! dark proxy port instead of the jobs router beside it). Each
+//! [`SPELLERS`] row now says how its request leaves ([`Leaves`]): a
+//! constructor's finishing function must clear every proxy and every
+//! redirect, and a sender must build its client through one of them,
+//! so a token-bearing client is built no other way. Collapsed into this
+//! list rather than kept beside it: a second table of senders would be
+//! the §9a shape (CLAUDE.md), and this one already fails when a new
+//! file starts putting the header on a request.
+//!
 //! tree-wide pin — it scans a tree no changed-file map can attribute
 //! to this crate, so every scoped gate runs it whatever its scope
 //! (`tree_wide_pins` in infra/gate.sh; backlog c87ad472).
 
-use boss_testing::production_source::production_text;
+use boss_testing::production_source::{production_text, without_comments};
 use boss_testing::repo_root;
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -57,33 +70,76 @@ use std::path::{Path, PathBuf};
 /// the pin asserts, so a row can no longer be added at all.
 const BAKED: &[(&str, &str)] = &[];
 
-/// Production files whose job is the header itself, and why. Everything
-/// else reaches it through a stamping client — `machine_token::Client`
-/// (and `http_client::base`), or the gateway's `MachineClient` — which
-/// carries the token on every request and follows no redirect.
-const SPELLERS: &[(&str, &str)] = &[
+/// How a [`SPELLERS`] file's request carrying the header leaves.
+enum Leaves {
+    /// It reads the header off an inbound request and sends nothing.
+    Nowhere,
+    /// It IS a constructor: every function of this name in it finishes a
+    /// reqwest builder with `.no_proxy()` and `redirect::Policy::none()`,
+    /// whatever the caller's builder set.
+    Finishes(&'static str),
+    /// Its token-bearing client is the one `let <binding> =` in `file`,
+    /// whose right-hand side STARTS with `call` — one of the
+    /// [`Leaves::Finishes`] constructors. Tied to the binding, not to the
+    /// file: the review of 387dc5c1 (bad26eb2, finding 1) built
+    /// main.rs's `proxy_client` raw beside a comment naming `finish(`,
+    /// and a file-level `contains` passed it.
+    Through {
+        file: &'static str,
+        binding: &'static str,
+        call: &'static str,
+    },
+}
+
+/// Production files whose job is the header itself, why, and how the
+/// request leaves. Everything else reaches the header through a stamping
+/// client — `machine_token::Client` (and `http_client::base`), or the
+/// gateway's `MachineClient` — which carries the token on every request,
+/// follows no redirect and uses no proxy.
+const SPELLERS: &[(&str, &str, Leaves)] = &[
+    (
+        "crates/orchestrators/boss-simulator/src/bin/relay_client/mod.rs",
+        "the reqwest-0.13 relay carries only its inbound gate's private-constructor \
+         VerifiedEstate proof, within the estate host bound, with no process token source. \
+         Its private HTTP field is built only through this proxy/redirect-disabled finish.",
+        Leaves::Finishes("finish"),
+    ),
     (
         "crates/orchestrators/boss-cli/src/probe_reader.rs",
-        "the per-probe private Unix socket stamps its parent-held scoped reader credential; \
-         its client follows no redirects, uses no proxy, and forwards only pinned GET/HEAD.",
+        "the per-probe private Unix socket stamps its parent-held scoped reader credential, \
+         on a client that never stamps the estate token itself, and forwards only pinned \
+         GET/HEAD.",
+        Leaves::Through {
+            file: "crates/orchestrators/boss-cli/src/probe_reader.rs",
+            binding: "client",
+            call: "machine_token::Client::unstamped(",
+        },
     ),
     (
         "crates/core/boss-core/src/machine_token.rs",
         "the definition, and the stamp every machine client applies.",
+        Leaves::Finishes("build_scoped"),
     ),
     (
         "crates/core/boss-core/src/machine_gate.rs",
         "the gate READS the header off an inbound request; it sends nothing.",
+        Leaves::Nowhere,
     ),
     (
         "crates/core/boss-gateway/src/machine_client.rs",
         "the gateway's reqwest-0.13 twin of machine_token::Client — the stamp, with \
-         redirects off.",
+         redirects and proxies off.",
+        Leaves::Finishes("finish"),
     ),
     (
         "crates/core/boss-gateway/src/role_headers.rs",
         "the gateway's forward stamp: an INBOUND request gains the token after the edge \
-         strip, and the reverse-proxy client that sends it on has redirects off (main.rs).",
+         strip, and the reverse-proxy client main() builds sends it on.",
+        Leaves::Through {
+            file: "crates/core/boss-gateway/src/main.rs",
+            binding: "proxy_client",
+            call: "machine_client::finish(",
+        },
     ),
 ];
 
@@ -394,7 +450,7 @@ fn a_baked_file_holds_one_client_and_it_refuses_redirects() {
 fn only_the_stamping_doors_spell_the_header() {
     let root = repo_root();
     let found = spellers(&root);
-    let named: Vec<&str> = SPELLERS.iter().map(|(f, _)| *f).collect();
+    let named: Vec<&str> = SPELLERS.iter().map(|(f, _, _)| *f).collect();
 
     let new: Vec<String> = found
         .iter()
@@ -421,6 +477,245 @@ fn only_the_stamping_doors_spell_the_header() {
         stale.is_empty(),
         "SPELLERS names files that no longer spell the header — delete their rows:\n  {}",
         stale.join("\n  ")
+    );
+}
+
+/// The body of every `fn <name>(` in `src`, braces included: from the
+/// first `{` after the name to its match. A signature holds no brace.
+fn fn_bodies(src: &str, name: &str) -> Vec<String> {
+    let opener = Regex::new(&format!(r"\bfn\s+{name}\s*[(<]")).unwrap();
+    opener
+        .find_iter(src)
+        .filter_map(|m| {
+            let start = m.end() + src[m.end()..].find('{')?;
+            let mut depth = 0usize;
+            for (i, c) in src[start..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(src[start..=start + i].to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+/// Why a constructor file's production text is refused for `name`, or
+/// `None`: each finishing function must clear every proxy — the
+/// environment's and any the caller's builder named — and every
+/// redirect, before it builds. Read with its comments blanked: a
+/// `// .no_proxy()` is a clear removed (review bad26eb2, finding 1).
+fn finishing_refusal(prod: &str, name: &str) -> Option<String> {
+    let bodies = fn_bodies(&without_comments(prod), name);
+    if bodies.is_empty() {
+        return Some(format!(
+            "has no `fn {name}` — the constructor moved; point its SPELLERS row at it"
+        ));
+    }
+    let missing: Vec<&str> = [".no_proxy()", "redirect::Policy::none()"]
+        .into_iter()
+        .filter(|need| !bodies.iter().all(|b| b.contains(need)))
+        .collect();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "a `fn {name}` finishes a token-bearing builder without {} — reqwest then follows \
+             HTTP_PROXY/HTTPS_PROXY (loopback included) or a 3xx, and the token rides to \
+             whoever answers there (backlog 1ff6cabe; review of 6fbc7fc7, finding 1)",
+            missing.join(" and ")
+        )
+    })
+}
+
+/// Why the production text `prod` of a [`Leaves::Through`] file is
+/// refused, or `None`. Read with its comments blanked, like the sibling
+/// sender pins (`without_comments`, review of 39949355 M7), and asked of
+/// the BINDING the row names, not of the file (review bad26eb2, finding
+/// 1): exactly one `let <binding> =`, its right-hand side starting with a
+/// path that ends in `call`, and no struct field of that name filled
+/// with a raw `Client::new(`/`Client::builder(` in its place.
+fn through_refusal(prod: &str, binding: &str, call: &str) -> Option<String> {
+    let code = without_comments(prod);
+    let lets = Regex::new(&format!(r"\blet\s+(?:mut\s+)?{binding}\b")).unwrap();
+    let n = lets.find_iter(&code).count();
+    if n != 1 {
+        return Some(format!(
+            "{n} `let {binding}` bindings — the row vouches for ONE client built by `{call}`; \
+             a second binding of the name can shadow it with a client built some other way"
+        ));
+    }
+    let finished = Regex::new(&format!(
+        r"\blet\s+(?:mut\s+)?{binding}\s*(?::[^=]*)?=\s*[\w:]*{}",
+        regex::escape(call)
+    ))
+    .unwrap();
+    if !finished.is_match(&code) {
+        return Some(format!(
+            "`let {binding}` is not built by `{call}` — build that client through the \
+             constructor, which clears proxies and redirects, or correct the row"
+        ));
+    }
+    let raw_field = Regex::new(&format!(
+        r"\b{binding}\s*:\s*[\w:]*Client::(?:new|builder)\s*\("
+    ))
+    .unwrap();
+    raw_field.is_match(&code).then(|| {
+        format!(
+            "a `{binding}:` field is filled with a raw reqwest client, so the constructor's \
+             `let {binding}` is not the client that sends"
+        )
+    })
+}
+
+#[test]
+fn every_token_bearing_client_is_finished_with_no_proxy_and_no_redirect() {
+    let root = repo_root();
+    let read = |file: &str| {
+        let src = std::fs::read_to_string(root.join(file))
+            .unwrap_or_else(|e| panic!("{file}: {e} — its SPELLERS row names a missing file"));
+        production_text(&src).unwrap_or_else(|e| panic!("{file} does not parse as Rust: {e}"))
+    };
+    let refused: Vec<String> = SPELLERS
+        .iter()
+        .filter_map(|(file, _, leaves)| match leaves {
+            Leaves::Nowhere => None,
+            Leaves::Finishes(name) => {
+                finishing_refusal(&read(file), name).map(|why| format!("{file}: {why}"))
+            }
+            // `call` is a Finishes constructor or a door over one:
+            // `machine_token::Client`'s fields are private, so its
+            // `unstamped` reaches `build_scoped` by type.
+            Leaves::Through {
+                file: at,
+                binding,
+                call,
+            } => through_refusal(&read(at), binding, call)
+                .map(|why| format!("{file}: its token-bearing client, in {at}: {why}")),
+        })
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "a client that carries the machine-token header is built some other way than the \
+         constructors (backlog 1ff6cabe):\n  {}",
+        refused.join("\n  ")
+    );
+}
+
+#[test]
+fn the_finishing_check_refuses_a_proxy_or_a_redirect_left_on() {
+    let compliant = "impl Client {\n\
+         \x20   fn build_scoped(builder: reqwest::ClientBuilder) -> reqwest::Result<Self> {\n\
+         \x20       let http = builder\n\
+         \x20           .redirect(reqwest::redirect::Policy::none())\n\
+         \x20           .no_proxy()\n\
+         \x20           .build()?;\n\
+         \x20       Ok(Client { http })\n\
+         \x20   }\n\
+         }\n";
+    assert_eq!(
+        finishing_refusal(compliant, "build_scoped"),
+        None,
+        "the control"
+    );
+
+    let proxied = compliant.replace("            .no_proxy()\n", "");
+    let why = finishing_refusal(&proxied, "build_scoped").expect("a proxy left on is refused");
+    assert!(why.contains(".no_proxy()"), "{why}");
+
+    let following = compliant.replace(
+        "            .redirect(reqwest::redirect::Policy::none())\n",
+        "",
+    );
+    let why = finishing_refusal(&following, "build_scoped").expect("a redirect left on is refused");
+    assert!(why.contains("Policy::none()"), "{why}");
+
+    // The review's mutation (bad26eb2, finding 1): the call commented
+    // out is a call removed, however the comment spells it.
+    for commented in [
+        "            // .no_proxy()\n",
+        "            /* .no_proxy() */\n",
+    ] {
+        let quiet = compliant.replace("            .no_proxy()\n", commented);
+        let why = finishing_refusal(&quiet, "build_scoped")
+            .unwrap_or_else(|| panic!("a commented-out proxy clear is refused: {commented}"));
+        assert!(why.contains(".no_proxy()"), "{why}");
+    }
+
+    // The blocking twin shares the name; ONE of two without the proxy
+    // clear is a refusal, not a pass on the other's strength.
+    let twin = format!("{compliant}{proxied}");
+    assert!(
+        finishing_refusal(&twin, "build_scoped").is_some(),
+        "half the twins"
+    );
+
+    assert!(
+        finishing_refusal(compliant, "finish").is_some(),
+        "a constructor that moved is named, not passed"
+    );
+}
+
+#[test]
+fn the_through_check_vouches_for_the_binding_not_the_file() {
+    let call = "machine_client::finish(";
+    let compliant = "async fn main() -> Result<()> {\n\
+         \x20   let proxy_client = boss_gateway::machine_client::finish(reqwest::Client::builder())\n\
+         \x20       .context(\"building reverse-proxy http client\")?;\n\
+         \x20   let other = reqwest::Client::builder().build()?;\n\
+         \x20   let state = AppState { proxy_client, other };\n\
+         }\n";
+    assert_eq!(
+        through_refusal(compliant, "proxy_client", call),
+        None,
+        "the control: an unrelated raw client beside it is not this row's"
+    );
+
+    // The review's mutation (bad26eb2, finding 1): the call survives
+    // only in a comment, and the binding is built raw.
+    let commented = compliant.replace(
+        "    let proxy_client = boss_gateway::machine_client::finish(reqwest::Client::builder())\n",
+        "    // was boss_gateway::machine_client::finish(reqwest::Client::builder())\n\
+         \x20   let proxy_client = reqwest::Client::builder()\n",
+    );
+    let why = through_refusal(&commented, "proxy_client", call)
+        .expect("a raw binding beside a commented call is refused");
+    assert!(why.contains("is not built by"), "{why}");
+
+    // A trailing comment naming the call does not vouch either.
+    let trailing = compliant.replace(
+        "boss_gateway::machine_client::finish(reqwest::Client::builder())",
+        "reqwest::Client::builder() // machine_client::finish(",
+    );
+    assert!(
+        through_refusal(&trailing, "proxy_client", call).is_some(),
+        "a trailing comment naming the call"
+    );
+
+    // A second raw client in the file, next to a real call: shadowing
+    // the binding, or filling the field in its place.
+    let shadowed = compliant.replace(
+        "    let other =",
+        "    let proxy_client = reqwest::Client::new();\n    let other =",
+    );
+    let why = through_refusal(&shadowed, "proxy_client", call).expect("a shadowing raw client");
+    assert!(why.starts_with("2 `let proxy_client`"), "{why}");
+
+    let field = compliant.replace(
+        "AppState { proxy_client, other }",
+        "AppState { proxy_client: reqwest::Client::new(), other }",
+    );
+    let why = through_refusal(&field, "proxy_client", call).expect("a raw field in its place");
+    assert!(why.contains("field"), "{why}");
+
+    let gone = compliant.replace("let proxy_client", "let proxy");
+    assert!(
+        through_refusal(&gone, "proxy_client", call).is_some(),
+        "a binding that moved is named, not passed"
     );
 }
 

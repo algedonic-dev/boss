@@ -22,6 +22,7 @@
   import { formatRelative } from '@boss/web-kit/ui/date';
   import type { Remote } from '../../data/remote';
   import {
+    RELEASE_ROLE,
     blockLabel,
     etaDetail,
     etaReading,
@@ -29,10 +30,16 @@
     journeyText,
     phaseLabel,
     redsCell,
+    releasableHeld,
+    releaseBody,
+    safeSaysNo,
+    shortSha,
     trainTone,
+    type HeldCar,
     type YardStatus,
   } from './yard-status';
   import { safeLinkHref } from '@boss/web-kit/links';
+  import { session } from '@boss/web-kit/session/session.svelte';
 
   let { part }: Readonly<{ part: 'track' | 'dock' | 'garage' }> = $props();
 
@@ -56,6 +63,55 @@
 
   const outcomeTone = (o: string): 'ok' | 'warn' | 'muted' =>
     o === 'arrived' ? 'ok' : o === 'cancelled' ? 'warn' : 'muted';
+
+  // RELEASE, FROM THE ROW (backlog ed8e5c85, David 2026-10-09: "Copy
+  // and pasting a whole bunch of releases is inefficient"). Each held
+  // car shows what its release rests on, and a Release control calls
+  // the ONE door `boss release --review` also calls:
+  // POST /api/jobs/{car}/release. The page judges nothing. It offers the
+  // button where the SERVER's decision says releasable, and it shows the
+  // door's own words when the door refuses. The control is offered to a
+  // platform-admin session (affordance, not the gate). The record names
+  // that session's actor, and the stamp is the approval (design
+  // 1ce67f7e), so there is no second prompt.
+  const privileged = $derived(
+    session.value.kind === 'ready' && session.value.user.role === RELEASE_ROLE,
+  );
+  /** Which confirmation is open: one car's id, `all`, or none. */
+  let confirming = $state<string | null>(null);
+  let releasing = $state(false);
+  let released = $state<Readonly<Record<string, Readonly<{ ok: boolean; text: string }>>>>({});
+
+  async function postRelease(h: HeldCar): Promise<Readonly<{ ok: boolean; text: string }>> {
+    const body = h.release ? releaseBody(h.release) : null;
+    if (body === null) return { ok: false, text: 'no review run to release on' };
+    try {
+      const r = await fetch(`/api/jobs/${encodeURIComponent(h.id)}/release`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const text = (await r.text()).trim();
+      return r.ok
+        ? { ok: true, text: 'released — it boards at the next tick' }
+        : { ok: false, text: `HTTP ${r.status}${text ? ` — ${text}` : ''}` };
+    } catch (e) {
+      return { ok: false, text: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  /** One at a time, in the order listed, so each answer is recorded
+   *  against its car before the next is asked. */
+  async function releaseCars(cars: readonly HeldCar[]): Promise<void> {
+    releasing = true;
+    for (const h of cars) {
+      const answer = await postRelease(h);
+      released = { ...released, [h.id]: answer };
+    }
+    releasing = false;
+    confirming = null;
+    await refresh();
+  }
 </script>
 
 <div class="ys-root" data-yard-status={part}>
@@ -167,24 +223,91 @@
          state an operator must act on — showed on the yard map alone
          (b6522ff9). Always drawn, empty state included: this lane going
          quiet is exactly how it went unread. -->
-    <div class="ys-section">HELD CARS</div>
+    <div class="ys-section" id="held-cars">HELD CARS</div>
     {#if s.held_cars.length === 0}
       <p class="ys-quiet">none held</p>
     {:else}
+      {@const ready = releasableHeld(s.held_cars)}
       <p class="ys-quiet">
-        Parked, gated green, and held out — released by clearing the hold, not by another gate.
+        Parked, gated green, and held out — released on a review that says release at the
+        head the hold was placed at.
       </p>
+      <!-- RELEASE EVERY REVIEWED CAR: the rows the server says it would
+           release, listed, then one confirmation. Each line carries the
+           hold's reason and the reviewer's SAFE line, and a reviewer's
+           "no" is marked (review 4822764d N1). -->
+      {#if privileged && ready.length > 0}
+        <div class="ys-release-all">
+          {#if confirming === 'all'}
+            <p>Release these {ready.length} car{ready.length === 1 ? '' : 's'}, each on its review:</p>
+            <ul class="ys-release-list">
+              {#each ready as h (h.id)}
+                {@const safe = h.release?.safe_line ?? null}
+                <li class:ys-safe-no={safeSaysNo(safe)}>
+                  <span class="ys-mono">{h.branch ?? h.id} — review {shortSha(h.release?.review ?? null)} at {shortSha(h.release?.head ?? null)}</span>
+                  <div class="ys-dim">held: {h.reason}</div>
+                  {#if safeSaysNo(safe)}<div class="ys-mismatch">the reviewer said NOT safe without David</div>{/if}
+                  <div class="ys-safe">{safe ?? 'the reviewer wrote no SAFE line'}</div>
+                </li>
+              {/each}
+            </ul>
+            <button type="button" class="ys-btn ys-btn-go" disabled={releasing} onclick={() => void releaseCars(ready)}>
+              {releasing ? 'Releasing…' : `Release ${ready.length}`}
+            </button>
+            <button type="button" class="ys-btn" disabled={releasing} onclick={() => (confirming = null)}>Cancel</button>
+          {:else}
+            <button type="button" class="ys-btn ys-btn-go" onclick={() => (confirming = 'all')}>
+              Release every reviewed car ({ready.length})
+            </button>
+          {/if}
+        </div>
+      {/if}
       <table class="ys-table">
         <thead>
-          <tr><th>branch</th><th>reason</th><th>reds</th><th>since</th></tr>
+          <tr><th>branch</th><th>reason</th><th>review</th><th>reds</th><th>since</th><th></th></tr>
         </thead>
         <tbody>
           {#each s.held_cars as h (h.id)}
+            {@const d = h.release ?? null}
+            {@const answer = released[h.id]}
             <tr>
               <td class="ys-mono">{h.branch ?? '—'}</td>
               <td>{h.reason}</td>
+              <td class="ys-review">
+                {#if d === null}
+                  <span class="ys-dim">no release decision stated</span>
+                {:else}
+                  <div>
+                    <span class="ys-mono">{d.verdict ?? 'no verdict'}</span>
+                    · reviewed <span class="ys-mono">{shortSha(d.reviewed_sha)}</span>
+                    · held at <span class="ys-mono">{shortSha(d.head)}</span>
+                    {#if d.head_matches === true}
+                      <span class="ys-match">same head</span>
+                    {:else if d.head_matches === false}
+                      <span class="ys-mismatch">another head</span>
+                    {/if}
+                  </div>
+                  {#if d.safe_line}<div class="ys-safe">{d.safe_line}</div>{/if}
+                  {#if d.model}<div class="ys-dim" class:ys-reds={d.model_differs}>model: {d.model}</div>{/if}
+                  {#if !d.releasable && d.refusal}<div class="ys-dim">not releasable: {d.refusal}</div>{/if}
+                {/if}
+              </td>
               <td class="ys-mono ys-reds">{redsCell(h.red_trains)}</td>
               <td class="ys-mono ys-dim">{h.parked_since}</td>
+              <td class="ys-act">
+                {#if answer}
+                  <span class={answer.ok ? 'ys-match' : 'ys-mismatch'}>{answer.text}</span>
+                {:else if privileged && d?.releasable}
+                  {#if confirming === h.id}
+                    <button type="button" class="ys-btn ys-btn-go" disabled={releasing} onclick={() => void releaseCars([h])}>
+                      {releasing ? 'Releasing…' : 'Confirm'}
+                    </button>
+                    <button type="button" class="ys-btn" disabled={releasing} onclick={() => (confirming = null)}>Cancel</button>
+                  {:else}
+                    <button type="button" class="ys-btn ys-btn-go" onclick={() => (confirming = h.id)}>Release</button>
+                  {/if}
+                {/if}
+              </td>
             </tr>
           {/each}
         </tbody>
@@ -335,4 +458,21 @@
   .ys-held { list-style: none; padding: 0; margin: 6px 0; display: flex; flex-direction: column; gap: 4px; }
   .ys-held li { color: var(--static); font-size: 13px; }
   .ys-footnote { color: var(--static); font-size: 12px; margin-top: 24px; max-width: 70ch; }
+  .ys-review { font-size: 12px; max-width: 48ch; }
+  .ys-safe { color: var(--fog); margin-top: 2px; }
+  .ys-match { color: var(--ok); font-size: 12px; }
+  .ys-mismatch { color: var(--warn); font-size: 12px; }
+  .ys-act { white-space: nowrap; }
+  .ys-release-all { margin: 8px 0 12px; font-size: 13px; }
+  .ys-release-list { margin: 4px 0 8px; padding-left: 18px; }
+  .ys-release-list li { margin-bottom: 6px; }
+  .ys-release-list li.ys-safe-no { border-left: 3px solid var(--warn); padding-left: 6px; }
+  .ys-btn {
+    font-family: var(--font-mono); font-size: 12px;
+    background: none; color: var(--fog);
+    border: 1px solid var(--hairline); padding: 3px 10px; cursor: pointer;
+    margin-right: 6px;
+  }
+  .ys-btn-go { color: var(--signal); border-color: var(--signal); }
+  .ys-btn:disabled { opacity: 0.5; cursor: default; }
 </style>

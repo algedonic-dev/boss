@@ -120,12 +120,6 @@
     font-size: 12px;
     color: var(--static);
   }
-  .mcp-label input {
-    padding: 4px 6px;
-    border: 1px solid var(--hairline);
-    border-radius: 4px;
-    background: var(--ink);
-  }
   .mcp-note {
     margin: 10px 0 0;
     font-size: 12px;

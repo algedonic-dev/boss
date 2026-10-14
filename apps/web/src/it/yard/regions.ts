@@ -218,7 +218,21 @@ export type Outrank = Readonly<{
    *  every reader, not each clock its own. */
   age_minutes: number | null;
   /** Its first ready-or-active step, or null when none is workable. */
-  at: Readonly<{ slug: string | null; title: string; status: string; assignee_id: string | null }> | null;
+  at: Readonly<{
+    slug: string | null;
+    title: string;
+    status: string;
+    assignee_id: string | null;
+    /** Whether anyone is on a claimed step (backlog 8e9d3723) —
+     *  `boss_jobs::outranks::StepRun`; null for a ready step, a human's
+     *  claim, or a server that does not send it. */
+    run: StepRun | null;
+    /** Whether anything can dispatch a ready step (backlog e2519eca) —
+     *  `boss_jobs::outranks::Dispatch`; null for an active step, one
+     *  that carries an agent block, one a person holds, or a server
+     *  that does not send it. */
+    dispatch: Dispatch | null;
+  }> | null;
   /** The stations it stands at; null when they could not be read —
    *  never "stands nowhere". */
   stations: ReadonlyArray<string> | null;
@@ -426,7 +440,56 @@ function parseMachineSummary(raw: unknown): MachineSummary | null {
   };
 }
 
+/** The open run on a claimed step, as the server judged it. */
+export type StepRun =
+  | Readonly<{ state: 'building'; run: string }>
+  /** Briefed, inside the start bound its protocol declares (backlog 57326714). */
+  | Readonly<{ state: 'starting'; run: string; age_minutes: number | null; expect_minutes: number | null }>
+  | Readonly<{ state: 'never-started'; run: string; age_minutes: number | null }>
+  | Readonly<{ state: 'no-run' }>
+  | Readonly<{ state: 'unread' }>;
+
 const stringOrNull = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+
+/** A state this client does not know reads as unread — never as a
+ *  claim that someone is, or is not, on the step. */
+function parseStepRun(raw: unknown): StepRun | null {
+  if (raw === null || raw === undefined) return null;
+  const r = asObject(raw, 'outrank run');
+  switch (r.state) {
+    case 'building':
+      return { state: 'building', run: String(r.run ?? '') };
+    case 'starting':
+      return {
+        state: 'starting',
+        run: String(r.run ?? ''),
+        age_minutes: numberOrNull(r.age_minutes),
+        expect_minutes: numberOrNull(r.expect_minutes),
+      };
+    case 'never-started':
+      return { state: 'never-started', run: String(r.run ?? ''), age_minutes: numberOrNull(r.age_minutes) };
+    case 'no-run':
+      return { state: 'no-run' };
+    default:
+      return { state: 'unread' };
+  }
+}
+
+/** A ready step nothing can dispatch, as the server judged it: no agent
+ *  block, and no person holds it — with the row the packet runs. */
+export type Dispatch =
+  | Readonly<{ state: 'undispatchable'; kind: string; version: number | null }>
+  | Readonly<{ state: 'unread' }>;
+
+/** A state this client does not know reads as unread — never as a
+ *  claim that the step can, or cannot, be dispatched. */
+function parseDispatch(raw: unknown): Dispatch | null {
+  if (raw === null || raw === undefined) return null;
+  const d = asObject(raw, 'outrank dispatch');
+  return d.state === 'undispatchable'
+    ? { state: 'undispatchable', kind: String(d.kind ?? ''), version: numberOrNull(d.version) }
+    : { state: 'unread' };
+}
 
 function parseOutrank(raw: unknown): Outrank {
   const o = asObject(raw, 'outrank');
@@ -449,6 +512,8 @@ function parseOutrank(raw: unknown): Outrank {
             title: String(at.title ?? ''),
             status: String(at.status ?? ''),
             assignee_id: stringOrNull(at.assignee_id),
+            run: parseStepRun(at.run),
+            dispatch: parseDispatch(at.dispatch),
           },
     stations: Array.isArray(o.stations) ? o.stations.map(String) : null,
   };

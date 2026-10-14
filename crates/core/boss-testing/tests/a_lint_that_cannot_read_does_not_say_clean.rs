@@ -1064,6 +1064,32 @@ fn a_new_style_has_a_caller_reads_the_tree_or_says_it_could_not() {
     assert_refusal(lint, code, &out, "git rev-parse", OWNER_SAID);
 }
 
+#[test]
+fn a_new_style_has_a_caller_ignores_css_comments_but_keeps_real_selectors() {
+    let fx = Fixture::new("style-comment-selectors");
+    let lint = "a-new-style-has-a-caller";
+    // The reported shape is a real CSS comment, not a shell comment or
+    // an invented selector. Domains and dotted prose can span lines.
+    fx.write(
+        "apps/web/src/styles.css",
+        ".alpha { color: red }\n/* Fonts from fonts.googleapis.com\n   and .comment-only words. */\n.beta { color: blue }\n",
+    );
+    fx.commit("a stylesheet comment naming the font host");
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(code, 0, "comment prose is not a new class:\n{out}");
+
+    // A comment opener inside a CSS string is not a comment. Stripping
+    // it through the later real comment would hide the orphan selector.
+    fx.write(
+        "apps/web/src/styles.css",
+        ".alpha { content: \"/*\"; }\n.beta { color: blue }\n.orphan { color: green }\n/* explanatory comment */\n",
+    );
+    fx.commit("a real unreferenced selector after a quoted opener");
+    let (code, out) = fx.run(lint, "", false);
+    assert_eq!(code, 1, "a real selector must still be refused:\n{out}");
+    assert!(out.contains(".orphan"), "name the actual selector:\n{out}");
+}
+
 // ---------------------------------------------------------------------
 // no-secrets: the one that already refused, and still said nothing
 // ---------------------------------------------------------------------

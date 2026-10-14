@@ -94,7 +94,10 @@ pub(super) async fn create_order<R: InventoryRepository + 'static>(
             })
             .collect(),
     };
-    if let Err(reason) = po.validate_placement() {
+    if let Err(reason) = po
+        .validate_ordinary_costs()
+        .and_then(|()| po.validate_placement())
+    {
         return (StatusCode::BAD_REQUEST, reason).into_response();
     }
     // Outbox phase 2: PO_UPSERTED records inside the repository
@@ -135,7 +138,10 @@ pub(super) async fn batch_create_orders<R: InventoryRepository + 'static>(
         // Required-at-place: a placed PO (status past Draft — the
         // auto-restock posts Submitted POs here) must carry vendor,
         // lines, and placed_on. A bare Draft passes.
-        if let Err(reason) = po.validate_placement() {
+        if let Err(reason) = po
+            .validate_ordinary_costs()
+            .and_then(|()| po.validate_placement())
+        {
             return (StatusCode::BAD_REQUEST, reason).into_response();
         }
         if let Err(e) = state

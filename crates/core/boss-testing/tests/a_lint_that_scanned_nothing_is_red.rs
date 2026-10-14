@@ -43,7 +43,7 @@
 //! path below, against an unreachable registry, so their self-test and
 //! tree half keep running in this suite.
 
-use boss_testing::repo_root;
+use boss_testing::{repo_root, without_proxy};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -178,7 +178,7 @@ const NOT_SCANNERS: &[(&str, &str)] = &[
 
 /// `<name> <path>` per line, as gate.sh prints it.
 fn preflight_roster(root: &Path) -> BTreeMap<String, String> {
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(root.join("infra/gate.sh"))
         .arg("--roster")
         .current_dir(root)
@@ -210,7 +210,7 @@ fn scanned_count(out: &str) -> Option<u64> {
 }
 
 fn run_lint(root: &Path, rel: &str) -> (i32, String, String) {
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(root.join(rel))
         .current_dir(root)
         .stdin(Stdio::null())
@@ -520,7 +520,7 @@ fn a_live_reading_lint_that_cannot_reach_its_registry_exits_3_and_scans_nothing(
             "BOSS_JOBS_URL",
         ),
     ] {
-        let out = Command::new("bash")
+        let out = without_proxy(&mut Command::new("bash"))
             .arg(root.join(rel))
             .current_dir(&root)
             .stdin(Stdio::null())
@@ -674,7 +674,7 @@ fn a_lint_whose_helper_is_missing_exits_cannot_answer_not_clean() {
             &tree.join(&rel),
             &std::fs::read_to_string(root.join(&rel)).expect("read the lint"),
         );
-        let out = Command::new("bash")
+        let out = without_proxy(&mut Command::new("bash"))
             .arg(tree.join(&rel))
             .current_dir(&tree)
             .stdin(Stdio::null())
@@ -715,7 +715,7 @@ fn the_scanned_helper_refuses_a_zero_and_a_non_number() {
                 lib.display()
             ),
         );
-        let out = Command::new("bash")
+        let out = without_proxy(&mut Command::new("bash"))
             .arg(&script)
             .output()
             .expect("run the probe");
@@ -770,7 +770,7 @@ fn the_allowlist_helper_refuses_a_missing_path_and_an_unused_entry() {
                 lib.display()
             ),
         );
-        let out = Command::new("bash")
+        let out = without_proxy(&mut Command::new("bash"))
             .arg(&script)
             .output()
             .expect("run the probe");

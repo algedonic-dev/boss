@@ -365,6 +365,231 @@ async fn stage(db: &TestDb, e: &Event) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn identity_conflicts_never_publish_or_discard_the_queued_fact() {
+    use boss_core::audit::AuditWriter;
+    let db = TestDb::new().await;
+    let original = event("events.outbox.pruned");
+    boss_events::PgAuditWriter::new(db.pool.clone())
+        .write(&original)
+        .await
+        .unwrap();
+    for field in ["kind", "source", "payload", "actor", "timestamp"] {
+        let mut conflicting = original.clone();
+        match field {
+            "kind" => conflicting.kind = "events.outbox.dead_lettered".into(),
+            "source" => conflicting.source = "other".into(),
+            "payload" => conflicting.payload["n"] = serde_json::json!(2),
+            "actor" => conflicting.payload["_actor"] = serde_json::json!("emp-other"),
+            "timestamp" => conflicting.timestamp += chrono::Duration::microseconds(1),
+            _ => unreachable!(),
+        }
+        stage(&db, &conflicting).await;
+        let bus = RecordingEventBus::new();
+        for _ in 0..2 {
+            let error = drain_outbox_once(&db.pool, &(bus.clone() as Arc<dyn EventBus>), 100)
+                .await
+                .expect_err("a UUID cannot vouch for a different fact");
+            assert!(error.contains(&original.id.to_string()), "{error}");
+            assert!(
+                error.contains(field),
+                "names changed field {field}: {error}"
+            );
+            assert_eq!(bus.event_count(), 0);
+            assert_eq!(pending_count(&db.pool).await.unwrap(), 1);
+            assert_eq!(
+                undrained(&db.pool).await.unwrap().count,
+                1,
+                "an audited id is not proof that the log holds the queued fact"
+            );
+        }
+        let queued: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM event_outbox WHERE event_id=$1")
+                .bind(original.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(queued, conflicting.payload);
+        let audited: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM audit_log WHERE event_id=$1")
+                .bind(original.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(audited, original.payload);
+        sqlx::query("DELETE FROM event_outbox WHERE event_id=$1")
+            .bind(original.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn identity_exact_retry_respects_persisted_timestamp_precision() {
+    use boss_core::audit::AuditWriter;
+    let db = TestDb::new().await;
+    let mut original = event("events.outbox.pruned");
+    original.timestamp = Utc::now();
+    boss_events::PgAuditWriter::new(db.pool.clone())
+        .write(&original)
+        .await
+        .unwrap();
+    stage(&db, &original).await;
+    let bus = RecordingEventBus::new();
+    let stats = drain_outbox_once(&db.pool, &(bus.clone() as Arc<dyn EventBus>), 100)
+        .await
+        .unwrap();
+    assert_eq!((stats.delivered, stats.audit_inserted), (1, 0));
+    assert_eq!(bus.event_count(), 1);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event_id=$1")
+        .bind(original.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+struct UncertainBus(Arc<RecordingEventBus>);
+#[async_trait::async_trait]
+impl EventBus for UncertainBus {
+    async fn publish(&self, fact: Event) -> Result<(), EventBusError> {
+        self.0.publish(fact).await?;
+        Err(EventBusError::ConnectionLost(
+            "acknowledgment lost after publish".into(),
+        ))
+    }
+    async fn subscribe(&self, _: &str) -> Result<Box<dyn EventStream>, EventBusError> {
+        Err(EventBusError::SubscribeFailed("test publisher".into()))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn identity_uncertain_publish_retries_the_same_fact_without_a_second_audit_row() {
+    let db = TestDb::new().await;
+    let fact = event("events.outbox.pruned");
+    stage(&db, &fact).await;
+    let recording = RecordingEventBus::new();
+    let uncertain = Arc::new(UncertainBus(recording.clone())) as Arc<dyn EventBus>;
+    assert_eq!(
+        drain_outbox_once(&db.pool, &uncertain, 100)
+            .await
+            .unwrap()
+            .delivered,
+        0
+    );
+    assert_eq!(pending_count(&db.pool).await.unwrap(), 1);
+    let stats = drain_outbox_once(&db.pool, &(recording.clone() as Arc<dyn EventBus>), 100)
+        .await
+        .unwrap();
+    assert_eq!((stats.delivered, stats.audit_inserted), (1, 0));
+    let copies = recording.events();
+    assert_eq!(
+        copies.len(),
+        2,
+        "at-least-once publication after an uncertain outcome"
+    );
+    assert_eq!(
+        serde_json::to_value(&copies[0]).unwrap(),
+        serde_json::to_value(&copies[1]).unwrap()
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event_id=$1")
+        .bind(fact.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn identity_conflict_rolls_back_the_whole_audit_batch_before_any_publish() {
+    use boss_core::audit::AuditWriter;
+    let db = TestDb::new().await;
+    let fresh = event("events.outbox.pruned");
+    let original = event("events.outbox.dead_lettered");
+    boss_events::PgAuditWriter::new(db.pool.clone())
+        .write(&original)
+        .await
+        .unwrap();
+    stage(&db, &fresh).await;
+    let mut conflict = original.clone();
+    conflict.source = "collision".into();
+    stage(&db, &conflict).await;
+    let bus = RecordingEventBus::new();
+    assert!(
+        drain_outbox_once(&db.pool, &(bus.clone() as Arc<dyn EventBus>), 100)
+            .await
+            .is_err()
+    );
+    assert_eq!(bus.event_count(), 0);
+    assert_eq!(pending_count(&db.pool).await.unwrap(), 2);
+    let facts: Vec<Uuid> = sqlx::query_scalar("SELECT event_id FROM audit_log ORDER BY id")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(facts, vec![original.id]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn identity_concurrent_audit_writer_cannot_authorize_a_different_bus_fact() {
+    for identical in [true, false] {
+        let db = TestDb::new().await;
+        let queued = event("events.outbox.pruned");
+        stage(&db, &queued).await;
+        let mut original = queued.clone();
+        if !identical {
+            original.payload["_actor"] = serde_json::json!("emp-different");
+        }
+        let mut writer = db.pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO audit_log (event_id,timestamp,source,kind,payload) VALUES ($1,$2,$3,$4,$5)")
+            .bind(original.id).bind(original.timestamp).bind(&original.source).bind(&original.kind).bind(&original.payload)
+            .execute(&mut *writer).await.unwrap();
+        let recording = RecordingEventBus::new();
+        let pool = db.pool.clone();
+        let bus = recording.clone() as Arc<dyn EventBus>;
+        let mut drain = tokio::spawn(async move { drain_outbox_once(&pool, &bus, 100).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut drain)
+                .await
+                .is_err(),
+            "the competing uncommitted audit insert holds the chain lock"
+        );
+        writer.commit().await.unwrap();
+        // A unique-constraint race may refuse this first attempt. A
+        // retry must then judge the committed whole fact, never the id.
+        let first = drain.await.unwrap();
+        if identical {
+            if first.is_err() {
+                assert_eq!(recording.event_count(), 0);
+                assert_eq!(
+                    drain_outbox_once(&db.pool, &(recording.clone() as Arc<dyn EventBus>), 100)
+                        .await
+                        .unwrap()
+                        .delivered,
+                    1
+                );
+            }
+            assert_eq!(recording.event_count(), 1);
+            assert_eq!(pending_count(&db.pool).await.unwrap(), 0);
+        } else {
+            assert!(first.is_err());
+            let error = drain_outbox_once(&db.pool, &(recording.clone() as Arc<dyn EventBus>), 100)
+                .await
+                .unwrap_err();
+            assert!(error.contains("actor"), "{error}");
+            assert_eq!(recording.event_count(), 0);
+            assert_eq!(pending_count(&db.pool).await.unwrap(), 1);
+        }
+        let audited: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM audit_log WHERE event_id=$1")
+                .bind(original.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(audited, original.payload);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_refused_row_is_dead_lettered_and_the_rows_behind_it_are_delivered() {
     // The poison-pill shape (backlog e4019cbc): one row the bus refuses
     // deterministically, then an ordinary row behind it. Before the

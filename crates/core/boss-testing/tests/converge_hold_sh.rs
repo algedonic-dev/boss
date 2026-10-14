@@ -508,6 +508,265 @@ fn prepare_finishes_a_carry_a_failed_tick_left_staged() {
     assert!(state.join(".converge-hold.carried").exists());
 }
 
+/// What one held tick leaves: stderr, the run summary, the alerts raised
+/// (one `title|detail` line each, through a stand-in for the converge's
+/// alert door — the real one posts to the system of record).
+struct HeldTick {
+    code: i32,
+    err: String,
+    summary: serde_json::Value,
+    alerts: Vec<String>,
+}
+
+/// `converge_hold_report` as the runner calls it — under `set -euo
+/// pipefail`, after run-summary.sh and the lib — for a hold at `hold`,
+/// the cluster on build `at` (the converge's stamp), forge main at
+/// `head`, and an alarm bound of `bound` seconds. `dir` is the converge's
+/// state directory here: it keeps the summary, the marker and the alerts.
+fn held_tick(dir: &Path, hold: &Path, at: &str, head: &str, bound: &str) -> HeldTick {
+    let root = repo_root();
+    let summary = dir.join("summary.json");
+    let alerts = dir.join("alerts.log");
+    let script = format!(
+        "set -euo pipefail\n. '{rs}'\n. '{lib}'\n\
+         tenant_check_alert() {{ printf '%s|%s\\n' \"$1\" \"$2\" >> \"$ALERTS\"; }}\n\
+         run_summary_reset\n\
+         converge_hold_report \"$H\" 'forgejo-data-move-abc' '{head}' '{at}'\n\
+         echo REPORTED\n",
+        rs = root.join("infra/run-summary.sh").display(),
+        lib = root.join("infra/forge/cluster-deploy-lib.sh").display(),
+    );
+    let o = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env("H", hold)
+        .env("ALERTS", &alerts)
+        .env("CONVERGE_STATE", dir)
+        .env("BOSS_RUN_SUMMARY_FILE", &summary)
+        .env("BOSS_FORGE_HOLD_ALARM_S", bound)
+        .env_remove("BOSS_FORGE_HOLD_ALERTED")
+        .output()
+        .expect("run the held tick");
+    let out = String::from_utf8_lossy(&o.stdout);
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(
+        out.contains("REPORTED"),
+        "the report ended the run it is only visibility for:\n{out}{err}"
+    );
+    HeldTick {
+        code: o.status.code().unwrap_or(-1),
+        err,
+        summary: serde_json::from_str(&std::fs::read_to_string(&summary).unwrap_or_default())
+            .unwrap_or(serde_json::Value::Null),
+        alerts: std::fs::read_to_string(&alerts)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect(),
+    }
+}
+
+fn aged(p: &Path, secs: u64) {
+    let at = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+    std::fs::File::options()
+        .write(true)
+        .open(p)
+        .and_then(|f| f.set_modified(at))
+        .unwrap_or_else(|e| panic!("set mtime {}: {e}", p.display()));
+}
+
+/// A HELD TICK SAYS WHAT THE HOLD KEEPS BACK, AT THE POINT OF REFUSAL
+/// (delta review aa901496, N1; backlog 62b09c57): the build and the
+/// roll — the cluster stays on the build it is on, named, and main is
+/// named beside it, on stderr and on its packet, with how long the hold
+/// has stood. Since backlog 683d7fe9 the converge runs from root's tree,
+/// which follows main hold or no hold, so there is no checkout a hold
+/// keeps back and the tick no longer names one.
+#[test]
+fn a_held_tick_says_what_it_keeps_back_and_how_long_the_hold_has_stood() {
+    let dir = scratch_dir("converge-hold-report");
+    let state = private_dir(&dir.join("state"));
+    let hold = state.join("converge-hold");
+    write_file(&hold, "forgejo-data-move-abc\n");
+    let head = "89abcdef0123456789abcdef0123456789abcdef";
+
+    let t = held_tick(&dir, &hold, "abc1234", head, "21600");
+    assert_eq!(t.code, 0, "{}", t.err);
+    assert!(
+        t.err
+            .contains("converge HELD — forgejo-data-move-abc — main at 89abcde not built or rolled (release-converge lifts it)"),
+        "{}",
+        t.err
+    );
+    assert!(
+        t.err
+            .contains("the cluster stays on build abc1234 while the hold stands"),
+        "{}",
+        t.err
+    );
+    assert!(
+        t.err
+            .contains(&format!("root's tree is at main ({})", &head[..12])),
+        "{}",
+        t.err
+    );
+    assert_eq!(t.summary["converge_held"], "forgejo-data-move-abc");
+    assert_eq!(t.summary["cluster_at"], "abc1234");
+    assert_eq!(t.summary["main_at"], head);
+    assert!(
+        t.summary.get("checkout_at").is_none(),
+        "there is no checkout a hold keeps back: {}",
+        t.summary
+    );
+    let age: u64 = t.summary["held_for_s"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("held_for_s is not seconds: {}", t.summary));
+    assert!(age < 600, "a hold just written read as {age} s old");
+    assert!(
+        t.summary["held_since"]
+            .as_str()
+            .is_some_and(|s| s.ends_with('Z')),
+        "{}",
+        t.summary
+    );
+    assert!(t.alerts.is_empty(), "a fresh hold alarmed: {:?}", t.alerts);
+    assert!(
+        t.summary["hold_alarm"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("not due"),
+        "{}",
+        t.summary
+    );
+
+    // A stamp that is not a build name (none before a first converge)
+    // and a hold that cannot be aged are each said by name; neither is
+    // a number, and neither alarms.
+    let t = held_tick(&dir, &state.join("absent"), "garbage", head, "0");
+    assert_eq!(t.code, 0, "{}", t.err);
+    assert_eq!(t.summary["held_for_s"], "unknown");
+    assert_eq!(t.summary["cluster_at"], "none");
+    assert!(t.alerts.is_empty(), "{:?}", t.alerts);
+}
+
+/// A HOLD THAT OUTLIVES ITS PURPOSE REACHES SOMEONE, ONCE (delta review
+/// aa901496, the ALARM note; backlog 62b09c57). A held tick exits 0 —
+/// a hold is a decision, not a failure — so a hold nobody released was a
+/// line in a journal every ten minutes and nothing else. Past the bound
+/// the tick raises ONE alert through the converge's own door, naming the
+/// reason, the age and both commits; the same hold never raises a
+/// second, and a hold placed again is a new hold.
+#[test]
+fn a_hold_past_its_bound_is_alarmed_once_per_hold() {
+    let dir = scratch_dir("converge-hold-alarm");
+    let state = private_dir(&dir.join("state"));
+    let hold = state.join("converge-hold");
+    write_file(&hold, "forgejo-data-move-abc\n");
+    aged(&hold, 7 * 3600 + 120);
+    let at = "abc1234".to_string();
+    let head = "89abcdef0123456789abcdef0123456789abcdef";
+
+    let t = held_tick(&dir, &hold, &at, head, "21600");
+    assert_eq!(t.code, 0, "{}", t.err);
+    assert_eq!(t.alerts.len(), 1, "{:?}", t.alerts);
+    let alert = &t.alerts[0];
+    assert!(alert.contains("HELD for 7 h"), "{alert}");
+    for fact in [
+        "forgejo-data-move-abc",
+        head,
+        at.as_str(),
+        "release-converge",
+    ] {
+        assert!(
+            alert.contains(fact),
+            "the alert does not carry {fact}: {alert}"
+        );
+    }
+    assert!(
+        t.summary["hold_alarm"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("raised"),
+        "{}",
+        t.summary
+    );
+
+    // The next tick of the same hold: on the packet, not a second alert.
+    let t = held_tick(&dir, &hold, &at, head, "21600");
+    assert_eq!(
+        t.alerts.len(),
+        1,
+        "the same hold alarmed twice: {:?}",
+        t.alerts
+    );
+    assert!(
+        t.summary["hold_alarm"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("already raised"),
+        "{}",
+        t.summary
+    );
+
+    // Released and placed again, and again left standing: a new hold.
+    std::fs::remove_file(&hold).unwrap();
+    write_file(&hold, "forgejo-data-move-abc\n");
+    aged(&hold, 9 * 3600);
+    let t = held_tick(&dir, &hold, &at, head, "21600");
+    assert_eq!(t.alerts.len(), 2, "{:?}", t.alerts);
+
+    // A bound that is not a number alarms nothing and says so.
+    let t = held_tick(&dir, &hold, &at, head, "soon");
+    assert_eq!(t.alerts.len(), 2, "{:?}", t.alerts);
+    assert!(
+        t.summary["hold_alarm"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not a number of seconds"),
+        "{}",
+        t.summary
+    );
+}
+
+/// The runner's held branch is that report, and the runbook's rollback
+/// holds LAST (delta review aa901496, N1): its step that needs the
+/// checkout at the revert comes before the step that holds the converge
+/// which would have put it there, and the read it gives answers as the
+/// checkout's owner — a root login shell gets git's `dubious ownership`.
+#[test]
+fn the_runner_reports_a_held_tick_and_the_rollback_runbook_holds_last() {
+    let root = repo_root();
+    let runner = read(&root.join(RUNNER));
+    assert!(
+        code_lines(&runner).any(|(_, l)| l
+            .contains("converge_hold_report \"$HOLD_FILE\" \"$reason\" \"$HEAD_FULL\" \"$LAST\"")),
+        "{RUNNER} does not report a held tick through converge_hold_report"
+    );
+    let runbook = read(&root.join("infra/forge/OPERATIONS.md"));
+    let section = runbook
+        .split("### 9. Root's tree does not move")
+        .nth(1)
+        .and_then(|s| s.split("\n### ").next())
+        .expect("OPERATIONS.md has failure mode 9");
+    let read_at = section
+        .find("sudo -u david git -C /home/david/boss rev-parse HEAD")
+        .expect("failure mode 9 gives the checkout read as the checkout's owner");
+    let hold_at = section
+        .find("boss ops forge hold-converge <reason>")
+        .expect("failure mode 9 names the hold verb");
+    assert!(
+        read_at < hold_at,
+        "failure mode 9 holds the cluster converge before the checkout is read at the revert — the held converge never checks it out"
+    );
+    assert!(
+        !section.contains(
+            "with the\n   checkout AT THE REVERT — `git -C /home/david/boss rev-parse HEAD`"
+        ),
+        "failure mode 9 still gives the read that fails in a root login shell"
+    );
+}
+
 #[test]
 fn prepare_refuses_a_directory_it_cannot_own() {
     let dir = scratch_dir("converge-hold-dir-link");

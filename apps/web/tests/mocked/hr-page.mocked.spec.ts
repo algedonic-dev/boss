@@ -105,7 +105,7 @@ const header = (page: Page) => page.locator('header.exec-header');
 const tab = (page: Page, name: string) => page.getByRole('tab', { name, exact: true });
 
 test.describe('/hr — page audit b959394e', () => {
-  for (const site of ['urgent', 'workflow', 'certifications'] as const) {
+  for (const site of ['workflow'] as const) {
     test(`${site} employee link opens the catalogued employee surface and Back returns to HR`, async ({ page }) => {
       await page.clock.install({ time: new Date('2026-10-03T12:00:00Z') });
       const certified = {
@@ -114,8 +114,7 @@ test.describe('/hr — page audit b959394e', () => {
       };
       await openHr(page, (r) => json(r, [certified]));
       await page.route(/\/api\/people\/emp-david$/, (r) => json(r, certified));
-      if (site === 'workflow') await tab(page, 'Workflows').click();
-      if (site === 'certifications') await tab(page, 'Certifications').click();
+      await tab(page, 'Workflows').click();
       const link = page.getByRole('link', { name: 'Dee Owner', exact: true }).first();
       await expect(link).toHaveAttribute('href', '/ux/people/emp-david');
       await link.click();
@@ -124,15 +123,15 @@ test.describe('/hr — page audit b959394e', () => {
       await page.goBack();
       await expect(page).toHaveURL(/\/hr$/);
       await expect(tab(page, 'Overview')).toHaveAttribute('aria-selected', 'true');
-      await expect(page.getByRole('link', { name: 'Dee Owner', exact: true })).toBeVisible();
+      await tab(page, 'Workflows').click();
+      await expect(page.getByRole('link', { name: 'Dee Owner', exact: true }).first()).toBeVisible();
     });
   }
 
-  test('all four tabs select their own panel and returning to Overview restores its data', async ({ page }) => {
+  test('all three tabs select their own panel and returning to Overview restores its data', async ({ page }) => {
     await openHr(page, (r) => json(r, [OWNER]));
     for (const [name, heading] of [
       ['Workflows', 'Start Workflow'],
-      ['Certifications', 'Expiring in 90 days (0)'],
       ['Headcount', 'Headcount by department'],
       ['Overview', 'At a glance'],
     ] as const) {
@@ -141,41 +140,18 @@ test.describe('/hr — page audit b959394e', () => {
       await expect(page.getByRole('heading', { name: heading, exact: true })).toBeVisible();
       await expect(page.getByRole('tab', { selected: true })).toHaveCount(1);
     }
-    await expect(page.getByText('Nothing urgent today.')).toBeVisible();
+    await expect(page.getByText('Nothing urgent today.')).toHaveCount(0);
   });
 
-  test('urgent shows at most five links while Certifications shows the complete ninety-day population', async ({ page }) => {
-    await page.clock.install({ time: new Date('2026-10-03T12:00:00Z') });
-    const rows = Array.from({ length: 6 }, (_, n) => ({
-      ...emp(`emp-${n}`, `Employee ${n}`, 'platform-admin'),
-      certifications: [{ name: `Training ${n}`, issuing_body: 'Training Authority', expires_on: '2026-10-15' }],
-    }));
-    const later = {
-      ...emp('emp-later', 'Later Employee', 'platform-admin'),
-      certifications: [{ name: 'Later training', issuing_body: 'Later Authority', expires_on: '2026-12-01' }],
-    };
-    await openHr(page, (r) => json(r, [...rows, later]));
-    await expect(header(page)).toContainText('7 certifications expiring in 90 days');
-    await expect(page.getByRole('heading', { name: '6 certs expiring in 30 days', exact: true })).toBeVisible();
-    await expect(page.locator('.tab-panel').getByRole('link')).toHaveCount(5);
-    await tab(page, 'Certifications').click();
-    await expect(page.getByRole('heading', { name: 'Expiring in 90 days (7)', exact: true })).toBeVisible();
-    await expect(page.locator('table tbody tr')).toHaveCount(7);
-    await expect(page.locator('tr').filter({ hasText: 'Later Employee' })).toContainText('Later Authority');
-    await expect(page.locator('tr').filter({ hasText: 'Later Employee' })).toContainText('2026-12-01');
-  });
-
-  test('empty successful reads keep the roster, workflow and certification empty states distinct', async ({ page }) => {
+  test('empty successful reads keep the roster and workflow empty states distinct', async ({ page }) => {
     await openHr(page, (r) => json(r, []));
     await page.route(/\/api\/workflows$/, (r) => json(r, []));
     await expect(title(page)).toHaveText('0 active employees');
-    await expect(page.getByText('Nothing urgent today.')).toBeVisible();
+    await expect(page.getByText('Nothing urgent today.')).toHaveCount(0);
     await tab(page, 'Workflows').click();
     await expect(page.getByText('No HR workflows are published in this deployment.', { exact: false })).toBeVisible();
     await expect(page.getByText('No active workflows.', { exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: /^Start / })).toHaveCount(0);
-    await tab(page, 'Certifications').click();
-    await expect(page.getByText('No certifications expiring in the next 90 days.')).toBeVisible();
     await expect(page.locator('.load-failed')).toHaveCount(0);
   });
 
@@ -198,7 +174,7 @@ test.describe('/hr — page audit b959394e', () => {
     await expect(tab(page, 'Overview')).toHaveAttribute('aria-selected', 'true');
   });
 
-  for (const name of ['Overview', 'Certifications', 'Headcount']) {
+  for (const name of ['Overview', 'Headcount']) {
     test(`${name} renders the roster refusal instead of derived empty data`, async ({ page }) => {
       await openHr(page, (r) => json(r, 'roster unavailable', 503));
       await tab(page, name).click();
@@ -343,7 +319,7 @@ test.describe('/hr — page audit b959394e', () => {
     release();
 
     await expect(title(page)).toHaveText('1 active employee');
-    await expect(header(page)).toContainText('0 certifications expiring in 90 days');
+    await expect(header(page)).not.toContainText(/certifications expiring/);
   });
 
   test('the System Audit Account is in no count on the page (ad2da739)', async ({ page }) => {
@@ -370,7 +346,7 @@ test.describe('/hr — page audit b959394e', () => {
 
     await expect(title(page)).toHaveText('1 active employee');
     await expect(tab(page, 'Requisitions')).toHaveCount(0);
-    await expect(page.getByRole('tab')).toHaveText(['Overview', 'Workflows', 'Certifications', 'Headcount']);
+    await expect(page.getByRole('tab')).toHaveText(['Overview', 'Workflows', 'Headcount']);
     const hr = page.locator('.catalog.theme-exec');
     await expect(hr.getByText('Total headcount')).toBeVisible();
     await expect(hr).not.toContainText(/requisition|open reqs/i);

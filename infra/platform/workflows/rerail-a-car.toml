@@ -69,7 +69,7 @@ authority_role = "platform-admin"
 # bounded car. One hour gives the silence rule a two-hour bound, over the
 # 30-40 minutes each repair took by hand on 2026-09-28.
 duration_hours = 1.0
-agent = { profile = "builder", model = "opus-5[1m]", budget_usd = 3, effort = "medium" }
+agent = { profile = "builder", model = "opus-5-5", budget_usd = 3, effort = "medium" }
 fields = [
   { name = "result", field_type = "rerailed|refused|overtaken", required = true },
   { name = "evidence", field_type = "string", required = true },

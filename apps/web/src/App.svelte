@@ -19,7 +19,7 @@
   import AppShell from './shell/AppShell.svelte';
   import UpdateBar from './shell/UpdateBar.svelte';
   import { appsFor, APP_SUBJECT_KINDS, ROUTE_CATALOG, type AppId } from './shell/nav-catalog';
-  import { appForRoute, moduleForRoute, sectionForRoute, withRoster } from './shell/sections';
+  import { appForRoute, moduleForRoute, sectionForRoute, withManifest, withRoster } from './shell/sections';
   import { makeSurfaceOpenRecorder, postSurfaceOpen, routePattern } from './shell/surface-opens';
   import StepFocusPage from './steps/StepFocusPage.svelte';
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
@@ -90,7 +90,6 @@
   import ShopProductPage from './shop/ShopProductPage.svelte';
   import LandingPage from './landing/LandingPage.svelte';
   import SearchResultsPage from './search/SearchResultsPage.svelte';
-  import ViewsPage from './views/ViewsPage.svelte';
   import CodebaseTrendPage from './it/metrics/CodebaseTrendPage.svelte';
   import ProtocolDriftPage from './it/registry/ProtocolDriftPage.svelte';
   import AgentsPage from './it/agents/AgentsPage.svelte';
@@ -112,7 +111,11 @@
   // the page — so a department that is not here has no tab, no sidebar
   // and no page. The pathname is read when `parsed` changes, which is
   // when the location already holds the new path.
-  let route = $derived(withRoster(parsed, window.location.pathname, departmentRoster()));
+  let route = $derived(withManifest(
+    withRoster(parsed, window.location.pathname, departmentRoster()),
+    window.location.pathname,
+    manifest.value,
+  ));
 
   // Which surfaces get opened (backlog 628f182b): one POST per
   // client-side navigation, the route PATTERN and the time, the actor
@@ -310,8 +313,6 @@
       </div>
     {:else if route.kind === 'search'}
       <SearchResultsPage q={route.q} />
-    {:else if route.kind === 'views'}
-      <ViewsPage />
     {:else if route.kind === 'systemCodebase'}
       <!-- No ItTabs: the Codebase is its own sidebar row since feedback
            9827c699 (David, 2026-09-14), not a tab on Design. -->

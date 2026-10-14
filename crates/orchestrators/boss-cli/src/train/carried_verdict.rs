@@ -704,7 +704,7 @@ pub(crate) fn judge(
     namespace: &str,
     now: DateTime<Utc>,
 ) -> Carried {
-    let observed_at = crate::gate::stamp(now);
+    let observed_at = crate::sor_client::stamp(now);
     let lost = |found: String| match lost_floor(job, pod, now) {
         Err(why) => Carried::Wait(why),
         Ok(()) => Carried::Lost {
@@ -1142,7 +1142,7 @@ pub(crate) fn cluster_read_line(
             latch,
             format!(
                 "since={since} said={}\ncause={}\n{why}\n",
-                crate::gate::stamp(now),
+                crate::sor_client::stamp(now),
                 cause_of(why)
             ),
         );
@@ -1154,7 +1154,7 @@ pub(crate) fn cluster_read_line(
     );
     match (failure, held) {
         (Some(why), None) => {
-            write(&crate::gate::stamp(now), why);
+            write(&crate::sor_client::stamp(now), why);
             Some(format!(
                 "reconcile: the gate Jobs could not be read, so no verdict is recorded from a \
                  pod log this pass ({tail}): {why}"
@@ -1236,7 +1236,7 @@ pub(crate) fn blocked_note(
         serde_json::json!({
             "since": since,
             "cause": cause,
-            "noted_at": crate::gate::stamp(now),
+            "noted_at": crate::sor_client::stamp(now),
             "says": "The conductor cannot read the gate Jobs, so a verdict a gate runner left \
                      in its pod log is NOT being recorded. This run's verdict may be waiting \
                      there (kubectl logs job/<its gate Job> -c gate keeps it for a day). \
@@ -1935,7 +1935,7 @@ mod tests {
             by["sha256"],
             hex::encode(Sha256::digest(payload.as_bytes()))
         );
-        assert_eq!(by["observed_at"], crate::gate::stamp(at()));
+        assert_eq!(by["observed_at"], crate::sor_client::stamp(at()));
         // RECEIPT COPIED, NOT RETYPED: the record says where from, and
         // keeps the kubelet's account of the end beside the runner's word.
         assert!(
@@ -2819,7 +2819,7 @@ mod tests {
             boss_testing::scratch_dir("carried-verdict-latch").join("gate-jobs-read.failing");
         let _ = std::fs::remove_file(&latch);
         let after = |minutes: i64| at() + chrono::Duration::minutes(minutes);
-        let first_seen = crate::gate::stamp(at());
+        let first_seen = crate::sor_client::stamp(at());
         assert_eq!(
             cluster_read_line(&latch, None, at()),
             None,
@@ -2910,13 +2910,13 @@ mod tests {
             changed.contains("the cause CHANGED")
                 && changed.contains("connection refused")
                 && changed.contains("Forbidden")
-                && changed.contains(&format!("failing since {}", crate::gate::stamp(at()))),
+                && changed.contains(&format!("failing since {}", crate::sor_client::stamp(at()))),
             "{changed}"
         );
         assert_eq!(cluster_read_line(&latch, Some(forbidden), after(6)), None);
         assert_eq!(
             outage(&latch),
-            Some((crate::gate::stamp(at()), cause_of(forbidden))),
+            Some((crate::sor_client::stamp(at()), cause_of(forbidden))),
             "the latch keeps the first-seen time through a changed cause"
         );
         let _ = std::fs::remove_file(&latch);
@@ -2974,7 +2974,7 @@ mod tests {
         let note = blocked_note(&open_run(), blocked, quiet, at()).expect("an owing run is told");
         assert_eq!(note["since"], "2026-10-07T08:56:24Z");
         assert_eq!(note["cause"], "connection refused");
-        assert_eq!(note["noted_at"], crate::gate::stamp(at()));
+        assert_eq!(note["noted_at"], crate::sor_client::stamp(at()));
         assert!(
             note["says"]
                 .as_str()

@@ -212,8 +212,11 @@
 # ENV (test seams — the ops-runner passes no packet-supplied environment,
 # only an argv built from the allowlist, so a packet cannot set these)
 #   BOSS_SWEEP_TREE            the checkout whose `forgejo` remote is
-#                              the forge (default: the one this script
-#                              is in)
+#                              the forge (default: the runner's
+#                              BOSS_OPS_CHECKOUT, else the one this
+#                              script is in — the forge's runner
+#                              executes root's tree, which has no .git;
+#                              backlog a604a35b)
 #   BOSS_SWEEP_SOR_READ        the live-record reader (default: this
 #                              checkout's infra/forge/probe-bin/
 #                              boss-sor-read, which needs BOSS_JOBS_URL
@@ -237,7 +240,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/../.." && pwd)"
 RESOLVE="$REPO/infra/cluster/undeclared-objects.sh"
 LOCK_LIB="$REPO/infra/forge/checkout-lock.sh"
-TREE="${BOSS_SWEEP_TREE:-$REPO}"
+TREE="${BOSS_SWEEP_TREE:-${BOSS_OPS_CHECKOUT:-$REPO}}"
 REMOTE="forgejo"
 # This verb's own ref namespace in the checkout: the forge's heads and
 # pull heads land here, never in refs/remotes (the converge's) or the

@@ -65,9 +65,11 @@ set -euo pipefail
 
 ME=merge-tenant-main
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# The checkout whose `forgejo` remote the tenant URL derives from — this
-# one; a test names a fixture's.
-REMOTE_OF="${BOSS_TENANT_REMOTE_OF:-$(cd "$HERE/../.." && pwd)}"
+# The checkout whose `forgejo` remote the tenant URL derives from — the
+# one the ops runner hands its verbs (BOSS_OPS_CHECKOUT: on the forge the
+# runner executes root's tree, which has no remote; backlog a604a35b),
+# else this one; a test names a fixture's.
+REMOTE_OF="${BOSS_TENANT_REMOTE_OF:-${BOSS_OPS_CHECKOUT:-$(cd "$HERE/../.." && pwd)}}"
 CLI="${BOSS_CLI:-boss}"
 export GIT_TERMINAL_PROMPT=0
 

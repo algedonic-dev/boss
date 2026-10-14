@@ -51,6 +51,9 @@ export type NavItem = Readonly<{
   /// `equipment` and `shipping`), the entry is hidden. Items
   /// without a module field are always-on (e.g. /jobs).
   module?: string;
+  /// A disabled module normally has a notice. A surface declared absent
+  /// instead resolves to NotFound, only after the manifest answers.
+  whenDisabled?: 'absent';
   /// Who owns this surface: `home`, or a department's registry code.
   /// Required on every catalog entry — an unowned surface is how a page
   /// ends up rendering under the wrong tab. Plain rows declared inline
@@ -107,6 +110,8 @@ export type NavGroup = Readonly<{ label: string; items: ReadonlyArray<NavItem> }
 export type UngatedSurfaceId =
   | 'company-map'
   | 'system-incidents'
+  | 'system-performance'
+  | 'system-atlas'
   // 'system-codebase' (the Codebase row): the department's own numbers,
   // readable by any operator — permKey-less like the Operate row above,
   // because a permKey would widen the RouteName vocabulary in
@@ -131,6 +136,8 @@ export type UngatedSurfaceId =
   | 'system-fleet'
   | 'hr'
   | 'watchlist'
+  | 'purchase-order'
+  | 'vendor-invoice'
   | 'manual';
 
 export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavItem>> = {
@@ -148,12 +155,16 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/ux/parts',  permKey: 'parts',     module: 'parts',   owner: 'warehouse' },
   products:  { id: 'products',  label: 'Products',         path: '/ux/products',  permKey: 'parts',     module: 'parts',   owner: 'production' },
   accounts:  { id: 'accounts',  label: 'Accounts',         path: '/ux/accounts',  permKey: 'accounts',  owner: 'sales' },
-  vendors:   { id: 'vendors',   label: 'Vendors',          path: '/ux/vendors',   permKey: 'vendors',   owner: 'finance' },
+  vendors:   { id: 'vendors',   label: 'Vendors',          path: '/ux/vendors',   permKey: 'vendors',   owner: 'finance', module: 'warehouse', whenDisabled: 'absent' },
+  // Design45fad3bb preserves financial details when the vendor register
+  // is absent. Separate unlisted declarations keep their existing gate
+  // and Finance ownership without adding sidebar rows (6d6f88bd).
+  'purchase-order': { id: 'purchase-order', label: 'Purchase order', path: '/ux/purchase-orders/:poId', permKey: 'vendors', owner: 'finance', unlisted: true },
+  'vendor-invoice': { id: 'vendor-invoice', label: 'Vendor invoice', path: '/ux/vendor-invoices/:vendorInvoiceId', permKey: 'vendors', owner: 'finance', unlisted: true },
   people:    { id: 'people',    label: 'Employees',        path: '/ux/people',    permKey: 'people',    owner: 'people' },
   assets:    { id: 'assets',    label: 'Assets',           path: '/ux/assets',    permKey: 'assets',    module: 'equipment', owner: 'maintenance' },
   shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop',      module: 'shop',    owner: 'sales' },
   inbox:     { id: 'inbox',     label: 'Inbox',            path: '/ux/inbox',     permKey: 'inbox',     owner: 'home' },
-  views:     { id: 'views',     label: 'Views',            path: '/ux/views',     permKey: 'views',     owner: 'home' },
   'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/ux/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets', owner: 'marketing' },
   hr:        { id: 'hr',        label: 'HR',               path: '/hr',           permKey: 'people',    owner: 'people', unlisted: true },
   watchlist: { id: 'watchlist', label: 'Churn watchlist',  path: '/watchlist',    permKey: 'accounts',  owner: 'sales', unlisted: true },
@@ -178,7 +189,11 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   // leads with — readable by any operator; the tabs behind it keep
   // their own gates.
   'system-incidents':        { id: 'system-incidents',        label: 'Operate',             path: '/it/operate',      owner: 'it' },
-  'system-monitoring':       { id: 'system-monitoring',       label: 'Monitoring',          path: '/it/operate/audit', permKey: 'system-monitoring',      owner: 'it', unlisted: true },
+  'system-monitoring':       { id: 'system-monitoring',       label: 'Audit Log',          path: '/it/operate/audit', permKey: 'system-monitoring',      owner: 'it', unlisted: true },
+  // These served Operate tabs must reach the page-audit march too
+  // (e52e3017). Catalog membership adds no permission or sidebar row.
+  'system-performance':     { id: 'system-performance',      label: 'Performance',         path: '/it/operate/perf', owner: 'it', unlisted: true },
+  'system-atlas':           { id: 'system-atlas',            label: 'Atlas',               path: '/it/operate/atlas', owner: 'it', unlisted: true },
   'system-fleet':            { id: 'system-fleet',            label: 'Bottlenecks',         path: '/it/operate/bottlenecks', permKey: 'system-monitoring', owner: 'it', unlisted: true },
   workflows:                 { id: 'workflows',               label: 'Registry',            path: '/it/registry',     permKey: 'workflows',               owner: 'it' },
   policy:                    { id: 'policy',                  label: 'Policy',              path: '/it/registry/policy', permKey: 'policy',               owner: 'it', unlisted: true },
@@ -193,7 +208,7 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavIte
   // packets, never a value on the page (David 2026-09-27, design
   // 76155676 step 3; backlog 851259b9).
   'system-credentials':      { id: 'system-credentials',      label: 'Credentials',         path: '/it/registry/credentials', permKey: 'workflows',       owner: 'it', unlisted: true },
-  'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/it/registry/rules', permKey: 'system-dispatcher-rules', owner: 'it', unlisted: true },
+  'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Rule authoring', path: '/it/registry/rules', permKey: 'system-dispatcher-rules', owner: 'it', unlisted: true },
   // The editor's path is a PATTERN, spelled the way surface-opens records
   // every open of it (routePattern). It shared the list's path until
   // backlog 3071e235 (2026-09-24), so the page march — one audit per

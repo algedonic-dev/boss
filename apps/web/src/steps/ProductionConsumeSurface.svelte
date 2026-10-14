@@ -234,12 +234,8 @@
   .step-line-items input[type="number"] {
     width: 100%;
     box-sizing: border-box;
-    padding: 3px 5px;
-    font-size: 13px;
     text-align: right;
     font-variant-numeric: tabular-nums;
-    border: 1px solid var(--border);
-    border-radius: 3px;
   }
   .step-empty {
     padding: 8px 12px;

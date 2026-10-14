@@ -13,48 +13,54 @@
 # converges on forge main exactly like code does; hand-applied
 # changes are drift (see infra/cluster/manifests/README.md).
 #
-# Install (forge host):
-#   sudo cp infra/forge/cluster-deploy-runner.{service,timer} /etc/systemd/system/
-#   sudo systemctl daemon-reload && sudo systemctl enable --now cluster-deploy-runner.timer
+# Install (forge host): install.sh's UNITS list, which forge-converge
+# runs from root's tree on every tick.
 #
-# Expects: a clone at $REPO with a `forgejo` remote; rootless docker
-# (lingering enabled) logged into the registry; a kubeconfig at
-# $KUBECONFIG_PATH; kubectl via the alpine/k8s container.
+# Expects: root, started from root's tree (/var/lib/boss/tree/current;
+# infra/forge/root-tree.sh); the SYSTEM docker daemon; the registry push
+# login the forge converge deposits (REGISTRY_PUSH_DIR, forge-defaults.sh);
+# the admin kubeconfig David places (ops_kubeconfig,
+# infra/estate/ops-credentials.sh); kubectl via the alpine/k8s container.
 set -euo pipefail
 
-# Run from a SNAPSHOT, never from the file this script is about to
-# rewrite.
+# ROOT, FROM ROOT'S TREE, ON THE SYSTEM DAEMON (backlog 683d7fe9, car 2;
+# decided by David 2026-10-07 on design-doc c8502e17, question
+# image-build, and as position B of the forge sudo decision). Until this
+# car the converge ran as david: it fetched and checked out his clone,
+# built and pushed on his ROOTLESS docker daemon with the registry login
+# he once typed into his ~/.docker/config.json, read his ~/kc.yaml, kept
+# its stamps in his home — and reached root anyway through a passwordless
+# `sudo docker` for every kubectl it ran. So the loop that builds the
+# image every pod runs was one edit of a file his account owns away from
+# running anything, and its calls went out without the machine token,
+# which only root can read. Now:
+#   - it runs as root, and executes and BUILDS root's own tree: a
+#     generation root fetched from the forge's repository and verified
+#     (root-tree.sh carries why that, and not a checkout);
+#   - it builds and pushes on the system daemon, the one the CI jobs
+#     already run in, with the token the credential broker mints and the
+#     forge converge deposits root-only (registry-token-deposit.sh);
+#   - its kubectl reads the admin kubeconfig David placed, and its state
+#     lives under CONVERGE_STATE (forge-defaults.sh), root's.
+# The operator's rootless daemon is used by no unattended code after it.
+# Its images and build cache stay where they are until he removes them
+# (infra/forge/OPERATIONS.md says how much and the one command), and the
+# FIRST build on the system daemon is cold — the compiler's cache mounts
+# live in the daemon that built them — inside the unit's 90 minutes.
 #
-# This script lives inside $REPO, and a few lines below it runs
-# `git checkout "$HEAD"` on that same repo. Bash does not read a script
-# into memory; it reads incrementally and remembers a BYTE OFFSET. So
-# when git replaces the file underneath a running invocation, bash
-# carries on reading the new contents from the old offset — resuming
-# mid-token, skipping a command, or executing a fragment of a line that
-# happens to be syntactically valid. The failure is silent, unrepeatable
-# and shaped by how much the diff moved the bytes, which makes it close
-# to undiagnosable from the outcome alone.
-#
-# It has not bitten yet only because the file changed rarely and the
-# offsets happened to survive. That is luck, not a property.
-#
-# `exec` into a copy makes the executing file structurally incapable of
-# being rewritten: git can do whatever it likes to $REPO afterwards,
-# because the bytes bash is reading are no longer reachable from there.
-# The env var is the recursion guard and also carries the path so the
-# snapshot can clean itself up on the way out — the trap belongs in the
-# snapshot's own process, since `exec` replaces this one and would never
-# run a trap set here.
-if [ -z "${BOSS_RUNNER_SNAPSHOT:-}" ]; then
-    snap="$(mktemp -t cluster-deploy-runner.XXXXXX)"
-    cat "$0" > "$snap"
-    BOSS_RUNNER_SNAPSHOT="$snap" exec bash "$snap" "$@"
+# A RUN THAT IS NOT ROOT IS THE UNIT BEFORE THIS CAR. On the train that
+# carries this file the installed unit is still david's: it checks out
+# the new commit and hands over to this copy as david, which can neither
+# refresh root's tree nor read the push login. That run refuses, saying
+# so, and forge-converge installs the root unit on its next tick; the
+# run after that builds. Pointed at a tree of its caller's choosing
+# (BOSS_ROOT_TREE) this is a test, and is not asked.
+ROOT_TREE="${BOSS_ROOT_TREE:-/var/lib/boss/tree}"
+if [ -z "${BOSS_ROOT_TREE:-}" ] && [ "$(id -u)" -ne 0 ]; then
+    echo "cluster-deploy-runner: REFUSED — this converge runs as root from root's tree since backlog 683d7fe9, and this run is $(id -un 2>/dev/null || id -u): the unit installed on this host predates that car. forge-converge installs the root unit on its next tick, and the run after it builds; nothing was built or rolled" >&2
+    exit 1
 fi
-
-REPO="${BOSS_FORGE_REPO_DIR:-$HOME/boss}"
-# Where a repo-sourced instance's tenant is checked out — beside the
-# product, one directory per instance name (backlog f4f5c387).
-TENANTS_DIR="${BOSS_FORGE_TENANTS_DIR:-$(dirname "$REPO")/tenants}"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
 # THE RUN ENDS BY SAYING HOW IT ENDED — to the ops-request that started
 # it, when one did (cluster-deploy-lib.sh answer_converge_requests;
@@ -62,11 +68,31 @@ TENANTS_DIR="${BOSS_FORGE_TENANTS_DIR:-$(dirname "$REPO")/tenants}"
 # below reads `converge_failed: <stage> (exit N)` on the packet that
 # asked, instead of the clean `answered` that `systemctl start
 # --no-block` returned before the unit had done anything. OUTCOME is set
-# by the exits that are not failures (unchanged, held, converged). The
-# trap also cleans both snapshots: exec replaces the process, so only
-# the stage that actually exits runs it.
+# by the exits that are not failures (unchanged, held, converged). exec
+# replaces the process, so the request is answered by the run that
+# actually exits.
 STAGE="start"
 OUTCOME=""
+# The image repo this converge pushes (REGISTRY), its stamp (STAMP_FILE
+# — the last build rolled and verified), the quarantine stamp for a head
+# whose BOOT failed (FAILED_FILE — "proven unbootable; do not re-roll
+# it"), the directory all of them live in (CONVERGE_STATE) and the
+# registry push login (REGISTRY_PUSH_DIR) are forge-defaults.sh's: one
+# definition for this runner, the watchdog, the rollback and the sweeps,
+# off the registry host in /etc/boss/sor.env (backlog 5222163e). Before
+# the trap, which answers requests out of CONVERGE_STATE.
+. "$REPO/infra/forge/forge-defaults.sh"
+# THE ALERT SPOOL IS THIS CONVERGE'S OWN, HOWEVER IT WAS STARTED (review
+# 1ba2873d, B2). Every tick replays what the spool holds to the jobs API
+# as root, with the machine token (replay_kept_alerts, below). Only the
+# unit used to name it, so a run started without the unit's environment
+# replayed alert-lib.sh's fallback, /var/tmp/boss-alert-spool — sticky and
+# world-writable: any account on the forge could plant a body there for
+# root to file as platform-admin. The default is under CONVERGE_STATE,
+# root's and 0700; the unit names the same path (forge-defaults.sh says
+# why there are two spellings and which test holds them equal).
+ALERT_SPOOL="${ALERT_SPOOL:-$CONVERGE_ALERT_SPOOL}"
+
 # WHERE THE MINUTES WENT, on the packet. Every converge closed its
 # maintenance packet `result=ok` and nothing else; how long the image
 # build took — the second-longest stage of a car's life, 10–20 min
@@ -75,8 +101,6 @@ OUTCOME=""
 # unit leaves facts for its own ExecStopPost (the unit declares
 # BOSS_RUN_SUMMARY_FILE); each stage below stamps its seconds as soon as
 # it knows them, and a run that dies keeps what it had recorded.
-# From $REPO like the other libs: this script runs from a snapshot in
-# /tmp (BOSS_RUNNER_SNAPSHOT), so `dirname "$0"` is not the tree.
 . "$REPO/infra/run-summary.sh"
 run_summary_reset
 _stage_started=$(date +%s)
@@ -87,11 +111,10 @@ _stage_done() { # <field>  — seconds since the previous stage boundary
 }
 _finish() {
     local rc=$?
-    rm -f "$BOSS_RUNNER_SNAPSHOT" ${BOSS_RUNNER_SNAPSHOT2:+"$BOSS_RUNNER_SNAPSHOT2"}
     if [ -n "$OUTCOME" ]; then
-        answer_converge_requests "$REPO" "${OUTCOME%%=*}" "${OUTCOME#*=}" || true
+        answer_converge_requests "$CONVERGE_STATE" "${OUTCOME%%=*}" "${OUTCOME#*=}" || true
     elif [ "$rc" -ne 0 ]; then
-        answer_converge_requests "$REPO" converge_failed "$STAGE (exit $rc)" || true
+        answer_converge_requests "$CONVERGE_STATE" converge_failed "$STAGE (exit $rc)" || true
     fi
     # THE MAINTENANCE PACKET NAMES THE STAGE TOO (backlog 07d7549c,
     # 2026-09-16). The ops-request above has read `converge_failed:
@@ -105,54 +128,150 @@ _finish() {
     exit "$rc"
 }
 trap _finish EXIT
-# Sourced from the PRE-checkout copy here, and again from HEAD after
-# the stage-2 exec; both copies must carry the functions the trap
-# uses, which is why they live in the lib and not in this file.
+# Sourced from the generation this run started in, and again from the
+# view it hands over to below; both carry the functions the trap uses,
+# which is why they live in the lib and not in this file.
 . "$REPO/infra/forge/cluster-deploy-lib.sh"
-take_converge_requests "$REPO" || true
+take_converge_requests "$CONVERGE_STATE" || true
 # What an earlier tick's alert door kept, filed now (the lib says why
 # this is the converge's own job since backlog a604a35b).
 replay_kept_alerts || true
-# The image repo this converge pushes (REGISTRY), its stamp (STAMP_FILE
-# — the last build rolled and verified) and the quarantine stamp for a
-# head whose BOOT failed (FAILED_FILE — "proven unbootable; do not
-# re-roll it") are forge-defaults.sh's: one definition for this runner,
-# the watchdog, the rollback and the sweeps, off the registry host in
-# /etc/boss/sor.env (backlog 5222163e).
-. "$REPO/infra/forge/forge-defaults.sh"
 forge_need REGISTRY
-KUBECONFIG_PATH="${BOSS_FORGE_KUBECONFIG:-$HOME/kc.yaml}"
-export DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/1000/docker.sock}"
-# kubectl, through the alpine/k8s container with the admin kubeconfig.
-# Defined before the unchanged check below because the no-op tick
-# READS the cluster too (0b7804f3); kubectl_seeing DIR is the same
-# kubectl with a rendered directory mounted read-only at /manifests —
-# the apply directory on a deploy, a throwaway render on a no-op tick.
-K="sudo docker run --rm --network host -v $KUBECONFIG_PATH:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
-kubectl_seeing() { # DIR
-    echo "sudo docker run --rm --network host -v $KUBECONFIG_PATH:/kc:ro -v $1:/manifests:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
-}
 
+# FORGE MAIN, AS ROOT'S TREE HOLDS IT (backlog 683d7fe9). The converge no
+# longer fetches a checkout: root-tree.sh refresh brings the forge's own
+# main into a new verified generation and moves `current` — a
+# fast-forward of what root last accepted, or a refusal, never a rewound
+# main. forge-converge refreshes on its own tick too; one lock serialises
+# the two. A refresh that FAILED or was REFUSED fails this run here, as
+# the fetch did, and `current` stays what it was.
+#
+# ONCE PER TICK (review 1ba2873d, N3): by the stage that hands over to
+# the view below. The view's own stage runs the generation the refresh
+# just named, so asking again only took the lock a second time.
+if [ -z "${BOSS_RUNNER_VIEW:-}" ]; then
+    STAGE="fetch"
+    tree_rc=0
+    tree_line="$(BOSS_ROOT_TREE="$ROOT_TREE" bash "$REPO/infra/forge/root-tree.sh" refresh 2>&1)" || tree_rc=$?
+    printf 'cluster-deploy-runner: %s\n' "$tree_line"
+    if [ "$tree_rc" -ne 0 ]; then
+        echo "cluster-deploy-runner: root's tree could not be brought to the forge's main (root-tree.sh refresh exited $tree_rc, the line above says why) — nothing built or rolled" >&2
+        exit 1
+    fi
+fi
+
+# RUN FROM A VIEW OF THE GENERATION THAT IS MAIN, AND ONLY FROM THAT.
+# Two things, in one hop. The script that runs is HEAD's own (David
+# accepted (a) on d0b5efd4): this process may have started from an older
+# generation — the unit's `current` moved under it, or the refresh above
+# just moved it — and a change to this script must run on its own train's
+# converge, not the next one's. And it runs from a VIEW: a converge is up
+# to ninety minutes, root-tree.sh keeps only the generations `current`,
+# `previous` and `good` name, and two merges in one cold build would
+# delete the tree this run reads its manifests, renderers and checks
+# from after the build. The view is the generation hard-linked under
+# CONVERGE_STATE — the same files, which nothing writes, so it costs no
+# space and no copy — and it outlives any prune. BOSS_RUNNER_VIEW is the
+# guard against a second hop.
+#
+# EACH RUN'S VIEW IS ITS OWN (review 1ba2873d, N2): `run-tree.<pid>`.
+# One fixed `run-tree` let a run started by hand and a timer's run each
+# remove the tree the other was executing from. A run removes only the
+# views of runs that are no longer alive (no /proc entry for the pid; exec
+# keeps the pid, so the view's stage is the same process), and never its
+# own.
+#
+# AND IT CARRIES THE GENERATION'S HISTORY (review 1ba2873d, B1). A
+# generation is an export with no .git, and two stages below read git in
+# the tree they run from: the orphan check walks every manifest the
+# history deleted, and registry-drift reads which side is ahead off the
+# history and HEAD. In a bare export the first walked nothing and
+# recorded `orphans_check: ok`, and the second filed every kind it could
+# not place as "side not measured" on a "shallow" checkout. So the view
+# gets a .git of its own — beside the hard links, never in the generation
+# or the store: its objects are root's store (repo.git, a full fetch, by
+# alternates — no copy), its HEAD is the generation's sha, its index is
+# that commit's tree. Root made every part of it.
+if [ -z "${BOSS_RUNNER_VIEW:-}" ]; then
+    STAGE="tree view"
+    gen="$(BOSS_ROOT_TREE="$ROOT_TREE" bash "$REPO/infra/forge/root-tree.sh" path)"
+    gen_sha="$(cat -- "$gen/.boss-tree-sha")"
+    [[ "$gen_sha" =~ ^[0-9a-f]{40,64}$ ]] || { echo "cluster-deploy-runner: $gen/.boss-tree-sha does not name a commit — not a generation of root's tree; nothing built or rolled" >&2; exit 1; }
+    install -d -m 0700 -- "$CONVERGE_STATE"
+    for old in "$CONVERGE_STATE"/run-tree.*; do
+        [ -e "$old" ] || continue
+        pid="${old##*/run-tree.}"
+        pid="${pid%.new}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        [ "$pid" != "$$" ] && [ ! -d "/proc/$pid" ] && rm -rf -- "$old"
+    done
+    view="$CONVERGE_STATE/run-tree.$$"
+    rm -rf -- "$view.new" "$view"
+    cp -al -- "$gen" "$view.new"
+    view_git() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c core.hooksPath=/dev/null -C "$view.new" "$@"; }
+    view_git init -q --template= \
+        && install -d -m 0755 -- "$view.new/.git/objects/info" \
+        && printf '%s\n' "$ROOT_TREE/repo.git/objects" > "$view.new/.git/objects/info/alternates" \
+        && view_git update-ref --no-deref HEAD "$gen_sha" \
+        && view_git read-tree HEAD \
+        || { echo "cluster-deploy-runner: the view of ${gen_sha:0:12} could not be given its history from $ROOT_TREE/repo.git — the orphan check and the drift phase would read git in a tree with none; nothing built or rolled" >&2; exit 1; }
+    view_git update-index -q --refresh >/dev/null 2>&1 || true
+    mv -T -- "$view.new" "$view"
+    BOSS_RUNNER_VIEW="$view" exec bash "$view/infra/forge/cluster-deploy-runner.sh" "$@"
+fi
 cd "$REPO"
-# ONE LOCK for every git user of this checkout (checkout-lock.sh):
-# forge-converge fetches on the same tick and the merge-triggered
-# `converge` starts this unit a second after any merge. On 2026-09-07
-# the fetch below died on `cannot lock ref` and the retry ten minutes
-# later on a stale index.lock — two converge cycles lost to the same
-# checkout being shared without a lock (backlog d66f92b2).
-. "$REPO/infra/forge/checkout-lock.sh"
-STAGE="fetch"
-checkout_git "$REPO" fetch -q forgejo main
 # The image tag is a NAME, seven characters of the full sha — not
 # `git rev-parse --short`, whose length git picks from the object count
 # (core.abbrev auto) and which grew to eight on this history on
 # 2026-09-17: the cluster ran boss:3b73d515 while the CLI installer on
 # boss-gcp pulled boss:3b73d51 (${SHA:0:7}, install-cli-from-image.sh)
 # and every converge there failed its CLI step (backlog 7f4a5a3c). A
-# tag has no ambiguity to resolve; a test pins the two expressions.
-HEAD_FULL=$(git rev-parse forgejo/main)
+# tag has no ambiguity to resolve; a test pins the two expressions. The
+# full sha is the one the generation says it is (root-tree.sh writes
+# .boss-tree-sha into every generation before it is named).
+STAGE="read head"
+HEAD_FULL=$(cat .boss-tree-sha)
+[[ "$HEAD_FULL" =~ ^[0-9a-f]{40,64}$ ]] || { echo "cluster-deploy-runner: $REPO/.boss-tree-sha does not name a commit — not a generation of root's tree; nothing built or rolled" >&2; exit 1; }
 HEAD=${HEAD_FULL:0:7}
+# WHAT THIS RUN EXECUTED, AND AS WHOM, on every tick's packet: the
+# generation of root's tree and the account (forge-converge records its
+# own `runs_from` the same way). A reader off the host tells a root run
+# from the tree apart from the unit before this car by this line alone.
+run_summary_field runs_from "root's tree $HEAD_FULL as $(id -un 2>/dev/null || id -u)"
+# The converge's own stamps came from david's home until this car; its
+# first run as root carries them across, once (the lib says why it is
+# this run and not the installer).
+carry_converge_state
 LAST=$(cat "$STAMP_FILE" 2>/dev/null || echo none)
+
+# THE ADMIN KUBECONFIG DAVID PLACED (backlog fb444bbb; ops-credentials.sh
+# ops_kubeconfig), not ~/kc.yaml, a second copy nothing checked. Root can
+# ask whether it is there, so it asks before the first `-v` would mount
+# it: docker makes an absent `-v` source into a root-owned DIRECTORY,
+# which would stand in the way of the file David places next.
+. "$REPO/infra/estate/ops-credentials.sh"
+KUBECONFIG_PATH="${BOSS_FORGE_KUBECONFIG:-$(ops_kubeconfig)}"
+if [ ! -f "$KUBECONFIG_PATH" ] || [ -L "$KUBECONFIG_PATH" ]; then
+    STAGE="kubeconfig"
+    echo "cluster-deploy-runner: the admin kubeconfig $KUBECONFIG_PATH is not a file of its own (root material, placed by David; design 835c0c9c) — the cluster cannot be read or written; nothing built or rolled" >&2
+    exit 1
+fi
+# THE SYSTEM DAEMON, EXPLICITLY: whatever DOCKER_HOST the environment
+# carried, every docker below is root's own daemon.
+unset DOCKER_HOST
+# kubectl, through the alpine/k8s container with the admin kubeconfig.
+# Defined before the unchanged check below because the no-op tick
+# READS the cluster too (0b7804f3); kubectl_seeing DIR is the same
+# kubectl with a rendered directory mounted read-only at /manifests —
+# the apply directory on a deploy, a throwaway render on a no-op tick.
+# Every kubectl container here runs with `--log-driver=none`: a Secret
+# it reads (the shared-Secret copy in cluster-deploy-lib.sh) reaches this
+# script through the attach and never the docker daemon's log (backlog
+# aa700921, a_kubectl_container_keeps_no_log.rs).
+K="docker run --rm --log-driver=none --network host -v $KUBECONFIG_PATH:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
+kubectl_seeing() { # DIR
+    echo "docker run --rm --log-driver=none --network host -v $KUBECONFIG_PATH:/kc:ro -v $1:/manifests:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
+}
 
 if [ "$HEAD" = "$LAST" ]; then
     echo "cluster-deploy-runner: forge main unchanged ($HEAD)"
@@ -167,9 +286,9 @@ if [ "$HEAD" = "$LAST" ]; then
     # every tick. The same lib function records the same fields
     # (cluster-deploy-lib.sh observe_connector), from the same inputs
     # the deploying tick has: the tree rendered to a throwaway
-    # directory (the tree here IS the converged one — the checkout
-    # below is what put it there), and the skipped set the secret gate
-    # decides now, read-only.
+    # directory (the tree here IS the converged one — the generation
+    # the stamp names), and the skipped set the secret gate decides
+    # now, read-only.
     # An observation tick writes nothing to the cluster: no apply, no
     # roll, no declared-secrets create, no ConfigMap patch — kubectl
     # reads only (get, a client dry run, rollout status), and a test
@@ -219,33 +338,36 @@ fi
 # HOLD_FILE is forge-defaults.sh's, sourced above: this line respelled
 # the default until backlog d94d287e, so moving the hold would have left
 # the runner reading the old path while the verb wrote the new one.
+#
+# WHAT A HOLD STOPS, SAID ON THE TICK (delta review aa901496, N1;
+# backlog 62b09c57): the build and the roll — the cluster stays on the
+# build it is on. Root's tree follows main whatever the hold says (the
+# refresh above, and forge-converge's), so the tree is never what a hold
+# keeps back. converge_hold_report (the lib) prints the HELD line, names
+# the build the cluster stays on and the main it was not rolled to, puts
+# the hold and its age on this tick's packet, and raises one alert for a
+# hold left standing past its bound.
 if reason=$(converge_held "$HOLD_FILE"); then
-    echo "cluster-deploy-runner: converge HELD — $reason — main at $HEAD not built or rolled (release-converge lifts it)" >&2
+    converge_hold_report "$HOLD_FILE" "$reason" "$HEAD_FULL" "$LAST"
     OUTCOME="converge_held=$reason"
     exit 0
 fi
 echo "cluster-deploy-runner: forge main moved $LAST -> $HEAD; building"
-STAGE="checkout"
-checkout_git "$REPO" checkout -q "$HEAD" 2>/dev/null || checkout_git "$REPO" checkout -qf "$HEAD"
 
-# STAGE 2: converge on HEAD's OWN driver (David accepted (a) on
-# d0b5efd4, through the v11 decision surface). The stage-0 snapshot is
-# necessarily the PRE-checkout copy — so without this hop, a change to
-# this script merged on train N only executes at train N+1's converge.
-# Measured cost of that property, 2026-08-19: the chore-CronJob image
-# pin sat out its own train's converge and seven CronJobs pulled a
-# stale :latest for a full cycle.
-#
-# So after checkout, snapshot the checked-out copy and exec THAT. The
-# re-executed prefix (env, cd, fetch, stamp check, checkout) is
-# idempotent — same HEAD, stamp not yet written — and the second guard
-# var is what stops a third hop. Both snapshots are cleaned by the
-# stage that actually exits (exec replaces the process, so an exec'ing
-# stage's trap never fires — the trap above cleans BOTH paths).
-if [ -z "${BOSS_RUNNER_SNAPSHOT2:-}" ]; then
-    snap2="$(mktemp -t cluster-deploy-runner-head.XXXXXX)"
-    cat infra/forge/cluster-deploy-runner.sh > "$snap2"
-    BOSS_RUNNER_SNAPSHOT2="$snap2" exec bash "$snap2" "$@"
+# THE PUSH LOGIN IS THE BROKER'S, AND IT IS THERE BEFORE ANYTHING IS
+# BUILT (backlog 683d7fe9). The forge converge deposits it root-only from
+# Secret boss/forge-registry-push-token and proves it by a login the
+# registry accepts on every pass (registry-token-deposit.sh; its packet
+# reads registry_token_effect). Absent, the push would fail an hour into
+# a cold build; so the run stops here and says which file and who fills
+# it. It rides only the commands that talk to the registry — the mirror,
+# the push, the tag verification — as DOCKER_CONFIG, never the whole
+# run: a build's buildx state does not belong in the deposit's directory.
+STAGE="registry login"
+REGISTRY_LOGIN="$REGISTRY_PUSH_DIR/config.json"
+if [ ! -f "$REGISTRY_LOGIN" ] || [ -L "$REGISTRY_LOGIN" ]; then
+    echo "cluster-deploy-runner: no registry push login at $REGISTRY_LOGIN — the forge converge deposits it from the broker's Secret boss/forge-registry-push-token (registry-token-deposit.sh; a rotate-a-credential packet of forge-registry-push-token mints it), so $HEAD is not built or rolled until that has happened" >&2
+    exit 1
 fi
 # The FULL commit rides into the image's environment (the runtime
 # stage's ENV; Capabilities.commit reads it at process start) so the
@@ -292,7 +414,7 @@ if [ -x infra/forge/mirror-base-images.sh ]; then
         echo "cluster-deploy-runner: mirror --missing did not complete — building anyway; a base the registry lacks will name itself in the build log"
     fi
 fi
-BUILD_FAILED_FILE="${BOSS_FORGE_LAST_BUILD_FAILED:-$HOME/.boss-last-build-failed}"
+BUILD_FAILED_FILE="${BOSS_FORGE_LAST_BUILD_FAILED:-$CONVERGE_STATE/last-build-failed}"
 BUILD_ATTEMPT="first attempt"
 if [ "$HEAD" = "$(cat "$BUILD_FAILED_FILE" 2>/dev/null || echo none)" ]; then
     BUILD_ATTEMPT="RETRY — this head already failed to build at least once"
@@ -301,7 +423,7 @@ BUILD_LOG="$(mktemp -t boss-converge-build.XXXXXX)"
 echo "cluster-deploy-runner: building $HEAD ($BUILD_ATTEMPT)"
 _build_started=$(date +%s)
 if docker build -f infra/oss-quickstart/Dockerfile \
-    --build-arg BOSS_BUILD_COMMIT="$(git rev-parse HEAD)" \
+    --build-arg BOSS_BUILD_COMMIT="$HEAD_FULL" \
     -t "$REGISTRY:$HEAD" . > "$BUILD_LOG" 2>&1; then
     rm -f "$BUILD_FAILED_FILE" "$BUILD_LOG"
     # Stamped here, in the block the build-log test lifts verbatim, with
@@ -339,7 +461,7 @@ else
     exit "$build_rc"
 fi
 STAGE="push $HEAD"
-docker push "$REGISTRY:$HEAD"
+DOCKER_CONFIG="$REGISTRY_PUSH_DIR" docker push "$REGISTRY:$HEAD"
 _stage_done push_s
 
 # The image proves it can boot before it goes anywhere near the cluster
@@ -372,15 +494,16 @@ fi
 # The deletion loop itself — keep the N newest, VERIFY a candidate is
 # present in the registry before rmi, never touch `latest` — is the
 # SHARED definition in prune-registry-tags.lib.sh, sourced from the
-# checked-out HEAD (we cd'd to $REPO above). disk-floor-sweep.sh runs
+# generation this run builds (we cd'd to $REPO above). disk-floor-sweep.sh runs
 # the identical loop below the disk floor; two copies of a loop that
 # deletes images is the drifting pair §9a bans, so the rationale for
 # why verification is load-bearing lives in the lib's header now.
 # Checked while extracting this: all 42 resident tags were in the
 # registry, so this is hygiene rather than recovery from a divergence.
+# The verification asks the registry with the push login, as the push did.
 . "$REPO/infra/forge/prune-registry-tags.lib.sh"
 STAGE="prune images"
-prune_registry_verified_tags "$REGISTRY" "${BOSS_RUNNER_KEEP_IMAGES:-5}" cluster-deploy-runner
+DOCKER_CONFIG="$REGISTRY_PUSH_DIR" prune_registry_verified_tags "$REGISTRY" "${BOSS_RUNNER_KEEP_IMAGES:-5}" cluster-deploy-runner
 
 # Build cache is regenerable by definition, so the only cost of being
 # wrong here is a slower next build. Age-filtered rather than emptied:
@@ -443,7 +566,7 @@ KM=$(kubectl_seeing "$APPLY_DIR")
 # Secret values are read, and this is not an API create. Both config
 # writes then use explicit UID/resourceVersion tests. Ordinary apply
 # receives neither document after success; a conflict stops beforehand.
-KAPPLY="sudo docker run --rm -i --network host -v $KUBECONFIG_PATH:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
+KAPPLY="docker run --rm --log-driver=none -i --network host -v $KUBECONFIG_PATH:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
 $KM create --dry-run=client --validate=false -f "/manifests/$SOURCE_NS/boss-break-glass-deposit.yaml" -o json > "$APPLY_DIR/deposit-template-documents.json"
 deposit_config_source "$APPLY_DIR/$SOURCE_NS/boss-break-glass-deposit.yaml" \
     "$APPLY_DIR/deposit-template-documents.json" "$APPLY_DIR/deposit-template.json"
@@ -501,34 +624,35 @@ converge_dev_door() {
 # THE TENANT SOURCE PER INSTANCE (backlog f4f5c387, car 2 of fcc1d57b;
 # David 2026-09-16 'Let's do it'). An instance's tenant is a directory
 # the image ships (`tenant_dir`) or a repository on the forge
-# (`tenant_repo` + `tenant_ref`) that this converge checks out beside
-# the product and delivers as the `boss-tenant` ConfigMap in the
+# (`tenant_repo` + `tenant_ref`) that this converge checks out under
+# TENANTS_DIR and delivers as the `boss-tenant` ConfigMap in the
 # instance's namespace, mounted at /opt/boss/tenant/seeds — the
 # step-plugins mechanism, a generated object, never a committed
-# manifest (§9a). The runner's credential for the tenant repo is the
-# checkout's own forgejo remote with the repo path replaced
-# (cluster-deploy-lib.sh tenant_repo_url): nothing here names a token
-# or a URL, and every git message is redacted before it is printed.
+# manifest (§9a). The tenant is read the way root's tree is: from the
+# forge's own repository on this host's disk, served by that
+# repository's owner, with no credential at all (cluster-deploy-lib.sh
+# tenant_repo_path; backlog 683d7fe9 — it was read with the checkout
+# owner's forge token, which root does not hold).
 #
 # tenant_source_verdict NAME NS TDIR TREPO TREF — MEASURES the source
 # and prints the packet's `tenant_source` entry for one instance:
 #   <ns>: image (<dir>)                   an image-sourced instance
 #   <ns>: readable (<repo>@<ref> <sha>)   ls-remote answered the ref
 #   <ns>: unreadable (<repo>@<ref>)       it did not — rc 1
-# so the first converge after a flip answers whether the runner's
-# token needs a scope from David (a root ceremony) instead of a
-# person guessing. rc 2 when the checkout has no forgejo remote.
+# so the first converge after a flip answers whether the repository and
+# its ref are there instead of a person guessing. rc 2 when TREPO is not
+# an owner/name the forge could hold.
 tenant_source_verdict() {
     local iname="$1" ns="$2" tdir="$3" trepo="$4" tref="$5" sha rc=0
     if [ -z "$trepo" ]; then
         printf '%s: image (%s)' "$ns" "$tdir"
         return 0
     fi
-    sha=$(tenant_source_check "$REPO" "$trepo" "$tref") || rc=$?
+    sha=$(tenant_source_check "$trepo" "$tref") || rc=$?
     case "$rc" in
         0) printf '%s: readable (%s@%s %s)' "$ns" "$trepo" "$tref" "${sha:0:8}" ;;
         1) printf '%s: unreadable (%s@%s)' "$ns" "$trepo" "$tref"; return 1 ;;
-        *) echo "cluster-deploy-runner: cannot derive a URL for $trepo — $REPO has no forgejo remote" >&2; return 2 ;;
+        *) echo "cluster-deploy-runner: cannot derive where $trepo lives on this host — it is not an owner/name" >&2; return 2 ;;
     esac
 }
 # converge_tenant NAME NS TREPO TREF SITE — a repo-sourced instance's
@@ -567,7 +691,7 @@ converge_tenant() {
     dir="$TENANTS_DIR/$iname"
     stage="$TENANTS_DIR/$iname.configmap"
     mkdir -p "$TENANTS_DIR"
-    tenant_checkout "$REPO" "$trepo" "$tref" "$dir"
+    tenant_checkout "$trepo" "$tref" "$dir"
     where=$(tenant_check "$dir" "$TENANTS_DIR/$iname.check") || check_rc=$?
     case "$check_rc" in
         0)
@@ -589,7 +713,7 @@ converge_tenant() {
     if [ "$deliver" = 1 ]; then
         rm -rf "$stage"
         tenant_stage "$dir" "$stage"
-        kt="sudo docker run --rm --network host -v $KUBECONFIG_PATH:/kc:ro -v $stage:/tenant:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
+        kt="docker run --rm --log-driver=none --network host -v $KUBECONFIG_PATH:/kc:ro -v $stage:/tenant:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
         echo "cluster-deploy-runner: converging the boss-tenant ConfigMap in $ns from $trepo@$tref ($(ls "$stage" | wc -l) files)"
         $kt create configmap boss-tenant -n "$ns" --from-file=/tenant \
             --dry-run=client -o yaml | $KAPPLY apply -f -
@@ -602,7 +726,7 @@ converge_tenant() {
     # for a tenant with no site/ yet.
     from=""
     if [ "$n" -gt 0 ]; then from="--from-file=/site"; fi
-    kt="sudo docker run --rm --network host -v $KUBECONFIG_PATH:/kc:ro -v $sstage:/site:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
+    kt="docker run --rm --log-driver=none --network host -v $KUBECONFIG_PATH:/kc:ro -v $sstage:/site:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
     echo "cluster-deploy-runner: converging the boss-site ConfigMap in $ns for $site from $trepo@$tref/site ($n files)"
     # shellcheck disable=SC2086
     $kt create configmap boss-site -n "$ns" $from \
@@ -660,6 +784,10 @@ echo "cluster-deploy-runner: apply is additive — NO --prune. An object whose m
 # is still converged on every run, from the same render, by the one
 # stage that knows the skipped set.
 TUNNEL_CONFIG_FILE=cloudflared-config.yaml
+python3 "$REPO/infra/cluster/render-dev-build-policy.py" \
+    "$REPO/infra/cluster/manifests/boss-dev-build-egress.yaml" \
+    "$REPO/infra/estate/estate.toml" "$APPLY_DIR/$SOURCE_NS/boss-dev-build-egress.yaml" \
+    || { echo 'cluster-deploy-runner: REFUSED — worker egress fence was not rendered; nothing applied' >&2; exit 1; }
 rm -f "$APPLY_DIR/$SOURCE_NS/$TUNNEL_CONFIG_FILE"
 apply_namespaces "$SOURCE_NS"
 converge_dev_door "$SOURCE_NS"
@@ -682,7 +810,7 @@ apply_instance "$SOURCE_NS"
 # not a bundle. Deliberately NOT committed as a manifest: it is a
 # derived artifact whose sources are already in tree, and a committed
 # copy would be the second definition that drifts (§9a).
-KP="sudo docker run --rm --network host -v $KUBECONFIG_PATH:/kc:ro -v $REPO/infra/step-plugins:/plugins:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
+KP="docker run --rm --log-driver=none --network host -v $KUBECONFIG_PATH:/kc:ro -v $REPO/infra/step-plugins:/plugins:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
 # The generated ConfigMap is piped into $KAPPLY — the `-i` kubectl
 # defined above the prod apply, where its comment records the bug.
 STAGE="configmaps"
@@ -723,14 +851,23 @@ converge_step_plugins "$SOURCE_NS"
 # Same cure as step-plugins, and deliberately NOT a committed manifest:
 # it is a derived artifact whose source is already in tree, and a
 # committed copy would be the second definition that drifts (§9a).
-KG="sudo docker run --rm --network host -v $KUBECONFIG_PATH:/kc:ro -v $REPO/infra/gate-runner:/gate:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
-if [ -f "$REPO/infra/gate-runner/run.sh" ]; then
+#
+# TWO KEYS SINCE e3100bc8 (design 1d7a1669). `bootstrap.sh` is the fixed
+# part a gate pod starts: it fetches the run.sh of the sha being gated and
+# execs it, so a run.sh car is gated by its OWN script; `run.sh` is main's
+# copy, which the bootstrap falls back to (named on the receipt) and which
+# a manifest still naming /repo-script/run.sh runs directly. The key set
+# is pinned equal to apply-script-configmap.sh's and to the manifest's
+# command by gate_runner_manifests.rs.
+KG="docker run --rm --log-driver=none --network host -v $KUBECONFIG_PATH:/kc:ro -v $REPO/infra/gate-runner:/gate:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
+if [ -f "$REPO/infra/gate-runner/run.sh" ] && [ -f "$REPO/infra/gate-runner/bootstrap.sh" ]; then
     echo "cluster-deploy-runner: converging the gate-runner-script ConfigMap"
     $KG create configmap gate-runner-script -n boss-dev \
         --from-file=run.sh=/gate/run.sh \
+        --from-file=bootstrap.sh=/gate/bootstrap.sh \
         --dry-run=client -o yaml | $KAPPLY apply -f -
 else
-    echo "cluster-deploy-runner: infra/gate-runner/run.sh missing — leaving the ConfigMap alone" >&2
+    echo "cluster-deploy-runner: infra/gate-runner/run.sh or bootstrap.sh missing — leaving the ConfigMap alone" >&2
 fi
 
 # ONE patch, ONE revision. This used to be `set image` (main container)
@@ -757,14 +894,11 @@ $K set image -n "$SOURCE_NS" cronjobs -l boss-chore=true "chore=$REGISTRY:$HEAD"
 # (boss-conductor.yaml) commits a :latest placeholder and this is where
 # the real :$HEAD replaces it. It is a Deployment in boss-dev, so the
 # `boss -n boss` patch and the CronJob selector both miss it; it gets its
-# own one-line patch. No `rollout status` follows: the conductor SHIPS
-# DORMANT (replicas 0) and stays there until an operator's explicit
-# cutover, so there is no rollout to wait on and a Ready-check would hang
-# on a deployment with no pods. `|| true`: a cluster where this manifest
-# has not applied yet (or a scaled-to-0 conductor) must not fail the
-# converge. When an operator scales it to 1, it is already pinned to the
-# HEAD this converge built.
-$K set image -n boss-dev deploy/boss-conductor "conductor=$REGISTRY:$HEAD" || true
+# own patch. Preparation shares its source image, so both advance in one
+# revision. `|| true`: a cluster where this manifest has not applied yet
+# must not fail the converge; a patch refusal remains visible in its log.
+# The journal preparation and executor must run the same source revision.
+$K set image -n boss-dev deploy/boss-conductor "conductor=$REGISTRY:$HEAD" "prepare-diagnostics=$REGISTRY:$HEAD" || true
 
 echo "$HEAD" > "$STAMP_FILE"
 rm -f "$FAILED_FILE"
@@ -848,11 +982,11 @@ echo "cluster-deploy-runner: secrets declared: $SECRETS_DECLARED"
 #
 # AND THE TENANT SOURCE IS MEASURED FIRST (backlog f4f5c387). Before
 # the quiet read, before anything is minted for it, a repo-sourced
-# instance's tenant is asked for with the converge's own credential
-# (tenant_source_verdict above); one the credential cannot read is
+# instance's tenant is asked for in the forge's own repositories
+# (tenant_source_verdict above); one that cannot be read is
 # SKIPPED whole — `<ns> (tenant source unreadable: <repo>@<ref>)` in
 # `instances_skipped`, `<ns>: unreadable (…)` in `tenant_source` — so
-# the first converge after a flip names the missing scope. The tenant
+# the first converge after a flip names what is missing. The tenant
 # is DELIVERED after the loud gate and before the apply: the ConfigMap
 # must exist when the pod first starts, or the launcher refuses the
 # empty directory and the pod crash-loops until it arrives.
@@ -870,7 +1004,7 @@ while IFS="$IFS_ROW" read -r iname ins_ns tdir _s _h share_ns trepo tref site; d
     echo "cluster-deploy-runner: tenant source: $verdict"
     if [ "$verdict_rc" -ne 0 ]; then
         INSTANCES_SKIPPED="${INSTANCES_SKIPPED:+$INSTANCES_SKIPPED; }$(skipped_tenant_entry "$ins_ns" unreadable "$trepo" "$tref")"
-        echo "cluster-deploy-runner: instance $iname ($ins_ns) SKIPPED — its tenant $trepo@$tref is not readable with the converge's credential (the forge token needs read access to it: a root ceremony, David's)" >&2
+        echo "cluster-deploy-runner: instance $iname ($ins_ns) SKIPPED — its tenant $trepo@$tref cannot be read from the forge's repositories on this host (the reason is above: no such repository, or no such branch or tag)" >&2
         continue
     fi
     STAGE="apply $ins_ns"

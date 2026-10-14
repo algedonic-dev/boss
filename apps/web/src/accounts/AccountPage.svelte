@@ -29,6 +29,8 @@
   import type { AccountBundle, NextAction } from './types';
   import { shortId } from '../data/ids';
   import { href } from '../router';
+  import type { Remote } from '../data/remote';
+  import { countLabel, readStateOfLoad } from '../data/readState';
 
   let { accountId } = $props<{ accountId: string }>();
 
@@ -98,18 +100,17 @@
   // Contracts — small side fetch for the summary panel.
   // -----------------------------------------------------------
 
-  let contracts = $state<ReadonlyArray<{ id: string; end_date: string }>>([]);
-  let contractsLoaded = $state(false);
+  let contracts = $state<Remote<ReadonlyArray<{ id: string; end_date: string }>>>({ kind: 'loading' });
+  const contractsRead = $derived(readStateOfLoad(contracts.kind === 'loading', contracts.kind === 'failed' ? contracts.error : null));
 
   $effect(() => {
     const pid = accountId;
     let cancelled = false;
-    contractsLoaded = false;
+    contracts = { kind: 'loading' };
     (async () => {
       const rows = await loadContracts(pid);
       if (!cancelled) {
         contracts = rows;
-        contractsLoaded = true;
       }
     })();
     return () => {
@@ -183,7 +184,7 @@
   {@const pastDueCents = invoices.filter((i) => i.status === 'past-due').reduce((s, i) => s + i.amount_cents, 0)}
   {@const openJobs = jobs.filter((j) => j.status !== 'closed' && j.status !== 'cancelled').length}
   {@const bySku = (() => {
-    const m = new Map<string, number>();
+    const m = new Map<string | null, number>();
     for (const d of devices) {
       if (d.phase === 'decommissioned') continue;
       m.set(d.sku, (m.get(d.sku) ?? 0) + 1);
@@ -297,9 +298,13 @@
                 <ul class="pp-sku-list">
                   {#each bySku.slice(0, 6) as [sku, count] (sku)}
                     <li>
-                      <Link to={href(`/ux/catalog/${sku}`)} className="mono">
-                        {sku}
-                      </Link>
+                      {#if sku === null}
+                        <span>Not identified</span>
+                      {:else}
+                        <Link to={href(`/ux/catalog/${sku}`)} className="mono">
+                          {sku}
+                        </Link>
+                      {/if}
                       <span class="pp-sku-count">{count}</span>
                     </li>
                   {/each}
@@ -309,14 +314,16 @@
         {/if}
 
         <!-- Contracts summary -->
-        <Section title={`Active contracts (${contracts.length})`}>
-            {#if !contractsLoaded}
+        <Section title={countLabel('Active contracts', contractsRead, contracts.kind === 'ready' ? contracts.data.length : 0)}>
+            {#if contracts.kind === 'loading'}
               <p class="empty">Loading…</p>
-            {:else if contracts.length === 0}
+            {:else if contracts.kind === 'failed'}
+              <p class="empty" role="alert">Couldn't load active contracts — {contracts.error}. Active contract count unknown.</p>
+            {:else if contracts.data.length === 0}
               <p class="empty">No active agreements.</p>
             {:else}
               <ul class="pp-contract-list">
-                {#each contracts.slice(0, 5) as c (c.id)}
+                {#each contracts.data.slice(0, 5) as c (c.id)}
                   <li>
                     <!-- Plain id, not a link: there is no agreement
                          detail page, and the 'agreement' entity kind
@@ -411,7 +418,7 @@
                         {d.asset_id}
                       </Link>
                     </td>
-                    <td class="mono">{d.sku}</td>
+                    <td class="mono">{d.sku ?? '—'}</td>
                     <td>{d.phase}</td>
                     <td>{d.warranty_through ?? '—'}</td>
                     <td>{d.first_seen}</td>

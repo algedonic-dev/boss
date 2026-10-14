@@ -70,9 +70,48 @@ LINT_SOR_WAIT_SECONDS=60
 . "$(dirname "${BASH_SOURCE[0]}")/../../lib/sor-reader.sh" || exit 3
 LINT_SOR_READER=$(sor_reader_header automation:gate-runner)
 
+# A READ HANDED IN (backlog 44b2087e, 2026-10-09). A lint holds no
+# machine token by rule, so a script that DOES hold one and runs a lint
+# — the converge's infra/forge/registry-drift.sh, the daily
+# infra/protocol-drift.sh — sent the lint's read with none: one tokenless
+# GET /api/workflows and GET /api/dispatcher/rules per converge on the
+# machine-gate window, signed automation:gate-runner from the forge. Such
+# a script reads the URL itself, stamped, and hands the read in on the
+# command that runs the lint:
+#
+#   BOSS_LINT_SOR_HANDED_URL   the URL the lint asks, exactly
+#   BOSS_LINT_SOR_HANDED_CODE  the HTTP code it got (000: no answer)
+#   BOSS_LINT_SOR_HANDED_BODY  a file holding the body
+#
+# and the lint answers from that, sending nothing. A read of ANOTHER URL,
+# or a 200 whose body cannot be read, answers 000 — never a request in its
+# place, which would be the tokenless read the hand-over exists to remove.
+# Empty or unset, the lint reads for itself as it always did. Every
+# stamping script that runs such a lint hands it in on that same command
+# (every_shell_identity_sender_presents_the_machine_token.rs).
+lint_sor_handed() { # WHO URL BODY_FILE — prints the HTTP code
+    local who=$1 url=$2 body=$3 code=${BOSS_LINT_SOR_HANDED_CODE:-000}
+    if [ "$BOSS_LINT_SOR_HANDED_URL" != "$url" ]; then
+        echo "$who: this run's launcher handed in its read of $BOSS_LINT_SOR_HANDED_URL and this lint asks $url — no request is sent in its place, because the launcher holds the machine token and a lint does not" >&2
+        printf '000'
+        return 0
+    fi
+    case "$code" in [0-9][0-9][0-9]) ;; *) code=000 ;; esac
+    if ! cp -- "${BOSS_LINT_SOR_HANDED_BODY:-}" "$body" 2>/dev/null && [ "$code" = "200" ]; then
+        echo "$who: GET $url was handed in as HTTP 200 with no readable body (${BOSS_LINT_SOR_HANDED_BODY:-unset}) — read as no answer, and no request is sent in its place" >&2
+        code=000
+    fi
+    echo "$who: GET $url was read by this run's launcher and handed in (HTTP $code) — no request from this lint" >&2
+    printf '%s' "$code"
+}
+
 # lint_sor_read WHO SERVICE URL BODY_FILE — prints the HTTP code.
 lint_sor_read() {
     local who=$1 service=$2 url=$3 body=$4 code
+    if [ -n "${BOSS_LINT_SOR_HANDED_URL:-}" ]; then
+        lint_sor_handed "$who" "$url" "$body"
+        return 0
+    fi
     local window=${BOSS_SOR_WAIT_SECONDS:-$LINT_SOR_WAIT_SECONDS}
     case "$window" in
         *[!0-9]*)

@@ -989,6 +989,13 @@ fn the_runner_credential_rides_beside_the_machine_token_in_a_header_file() {
 /// gets neither header and the pass still answers (DR rule 62dac114); the
 /// rendered sor.env admits a host exactly as the env var does; and the
 /// credential does not depend on the machine token being on the host.
+///
+/// AND THE REQUEST IT ANSWERED SAYS SO (backlog 50708d76, F5 of review
+/// 927f8602). The withheld line went to stderr, the unit's journal, and
+/// nothing read it. The execute step the pass writes carries the same
+/// verdict as `runner_credential` — `presented`, or `NOT presented
+/// (<why>)` — so a reader of the packet sees which identity the answer
+/// was written under without a journal read.
 #[test]
 fn the_runner_credential_is_presented_only_to_a_host_the_machine_token_rule_admits() {
     needs_jq!();
@@ -999,7 +1006,7 @@ fn the_runner_credential_is_presented_only_to_a_host_the_machine_token_rule_admi
                 env_hosts: Option<&str>,
                 sor_hosts: Option<&str>,
                 with_token: bool|
-     -> (String, String) {
+     -> (String, String, serde_json::Value) {
         let root = scratch(case);
         stub_sor(&root);
         let verbs = real_verbs(&root);
@@ -1027,9 +1034,14 @@ fn the_runner_credential_is_presented_only_to_a_host_the_machine_token_rule_admi
         let md = payload.unwrap_or_else(|| panic!("[{case}] no step completed: {out}"));
         assert_eq!(md["disposition"], "answered", "[{case}] {md} / {out}");
         assert!(!out.contains(credential), "[{case}] on the log: {out}");
+        assert!(
+            !md.to_string().contains(credential),
+            "[{case}] on the record: {md}"
+        );
         (
             out,
             std::fs::read_to_string(&header_log).unwrap_or_default(),
+            md,
         )
     };
     let sent = |headers: &str, name: &str| {
@@ -1048,7 +1060,14 @@ fn the_runner_credential_is_presented_only_to_a_host_the_machine_token_rule_admi
         ("rc-off-no-list", None, None),
         ("rc-off-sor-env", None, Some("elsewhere.invalid")),
     ] {
-        let (out, headers) = pass(case, env_hosts, sor_hosts, true);
+        let (out, headers, md) = pass(case, env_hosts, sor_hosts, true);
+        let recorded = md["runner_credential"].as_str().unwrap_or_default();
+        assert!(
+            recorded.starts_with("NOT presented (")
+                && recorded.contains("sor.invalid")
+                && recorded.contains("BOSS_MACHINE_TOKEN_HOSTS"),
+            "[{case}] the answered request records why the credential was withheld: {md}"
+        );
         assert_eq!(
             sent(&headers, "x-boss-runner-credential"),
             0,
@@ -1071,7 +1090,7 @@ fn the_runner_credential_is_presented_only_to_a_host_the_machine_token_rule_admi
     }
 
     // On the list, by the rendered sor.env alone: both ride, in step.
-    let (out, headers) = pass("rc-on-sor-env", None, Some("sor.invalid"), true);
+    let (out, headers, md) = pass("rc-on-sor-env", None, Some("sor.invalid"), true);
     let n = sent(&headers, "x-boss-runner-credential");
     assert!(
         n > 0,
@@ -1079,16 +1098,77 @@ fn the_runner_credential_is_presented_only_to_a_host_the_machine_token_rule_admi
     );
     assert_eq!(n, sent(&headers, "x-boss-machine-token"), "{headers}");
     assert!(!out.contains("NOT presented"), "{out}");
+    assert_eq!(md["runner_credential"], "presented", "{md}");
 
     // On the list with no machine token on the host: the credential is
     // judged by the host, not by whether a token happens to be mounted.
-    let (out, headers) = pass("rc-on-no-token", Some("sor.invalid"), None, false);
+    let (out, headers, _) = pass("rc-on-no-token", Some("sor.invalid"), None, false);
     assert_eq!(
         sent(&headers, "x-boss-runner-credential"),
         n,
         "{headers}\n{out}"
     );
     assert_eq!(sent(&headers, "x-boss-machine-token"), 0, "{headers}");
+}
+
+/// NOR THROUGH A PROXY (backlog 50708d76, F4 of review 927f8602). On the
+/// list, with `http_proxy` set, curl would hand the whole request to the
+/// proxy, header files included: neither secret rides, the pass still
+/// answers, and the log says the PROXY refused it — naming the variable,
+/// never its value — not a host rule the record satisfies.
+#[test]
+fn the_runner_credential_is_not_presented_through_a_proxy() {
+    needs_jq!();
+    let token = "stub-machine-token-50708d76";
+    let credential = "stub-runner-credential-50708d76-boss-gcp";
+    let root = scratch("rc-proxied");
+    stub_sor(&root);
+    let verbs = real_verbs(&root);
+    packet_for(&root, "boss-gcp", "df", "[]");
+    let header_log = root.join("curl-headers.log");
+    let file = root.join("runner.credential");
+    std::fs::write(&file, format!("{credential}\n")).unwrap();
+    let env = vec![
+        ("HOST_ID", "boss-gcp".to_string()),
+        ("BOSS_RUNNER_CREDENTIAL_FILE", file.display().to_string()),
+        ("STUB_HEADER_LOG", header_log.display().to_string()),
+        ("BOSS_MACHINE_TOKEN_DIR", token_dir(&root, token)),
+        ("BOSS_MACHINE_TOKEN_HOSTS", "sor.invalid".to_string()),
+        (
+            "http_proxy",
+            // Formatted in, so the no-secrets lint reads the planted login
+            // as the fixture it is, not a literal password.
+            format!("http://proxyuser:{}@127.0.0.1:9", "proxy-pass-9e2"),
+        ),
+    ];
+    let (out, payload) = run(&root, &verbs, &env);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    let headers = std::fs::read_to_string(&header_log).unwrap_or_default();
+    for name in ["x-boss-runner-credential", "x-boss-machine-token"] {
+        assert!(
+            !headers.contains(&format!("{name}: ")),
+            "{name} was sent with a proxy set:\n{headers}\n{out}"
+        );
+    }
+    assert!(
+        out.contains("runner credential")
+            && out.contains("NOT presented")
+            && out.contains("proxy in $http_proxy"),
+        "the withheld credential is said on the log, naming the proxy variable: {out}"
+    );
+    let recorded = md["runner_credential"].as_str().unwrap_or_default();
+    assert!(
+        recorded.starts_with("NOT presented (") && recorded.contains("proxy in $http_proxy"),
+        "the answered request records the proxy that withheld it: {md}"
+    );
+    for never in [credential, token, "proxyuser", "proxy-pass-9e2"] {
+        assert!(!out.contains(never), "never {never} on the log: {out}");
+        assert!(
+            !md.to_string().contains(never),
+            "never {never} on the record: {md}"
+        );
+    }
 }
 
 /// `disk-report` answers on boss-gcp too (backlog d3c7eada, 2026-09-26):
@@ -2458,6 +2538,9 @@ fn a_completion_sends_its_keys_through_the_merge_door_and_the_status_alone() {
         "effect",
         "effect_unproven",
         "effect_unread",
+        // No credential file on this host: nothing presented and nothing
+        // withheld, so no verdict an earlier pass left may stand.
+        "runner_credential",
     ] {
         assert_eq!(
             md.get(cleared),

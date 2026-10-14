@@ -740,16 +740,18 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dark = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
+        // Held, not bound and released (review 465e723f F3).
+        let dark = boss_testing::dark_port();
         let app = router(ViewsApiState {
             repo: Arc::new(crate::in_memory::InMemoryViewsRepo::new(
                 chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             )),
             resolver: Arc::new(PgViewResolver::new(
                 PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").unwrap(),
-                Arc::new(boss_policy_client::ReqwestPolicyClient::new("views", dark)),
+                Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+                    "views",
+                    dark.base.clone(),
+                )),
             )),
             os_map: None,
             flow: None,

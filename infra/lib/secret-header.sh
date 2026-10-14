@@ -59,8 +59,11 @@
 # POSIX sh, because infra/ops/ops-runner.sh is `#!/bin/sh` (dash on the
 # hosts) and the other callers are bash: nothing here may be a bashism
 # (infra/lint/a-sh-script-parses-under-sh.sh). Every name it sets begins
-# `_secret_header_`, except the VAR you name and the four machine-token
-# functions at the end of this file.
+# `_secret_header_`, except the VAR you name and its seven public
+# functions: secret_header and secret_header_close, then the five
+# machine-token functions at the end of this file — machine_token_header,
+# machine_gate_value_header, machine_token_admits, machine_token_host and
+# machine_token_proxy (review a92c0b94, F6: this line once said two).
 #
 # THE MACHINE TOKEN (design 6805c764 car 4; backlog 1876bbdb INFO-6 and
 # INFO-7). Every shell sender of the estate machine token takes it here:
@@ -176,7 +179,8 @@ _secret_header_born() {
 #     container on one volume), no record (a reader older than the
 #     record, or a run killed before it was written), a record that is
 #     not three plain fields, a host with no /proc: its pids mean nothing
-#     here, so only AGE judges it, and only past a day.
+#     here, so only AGE judges it, and only past a day — the age of the
+#     NEWEST thing in it, the directory included.
 # Never a refusal and never a reason to stop: a caller that cannot sweep
 # sends exactly as it would have.
 _secret_header_sweep() {
@@ -206,6 +210,15 @@ _secret_header_sweep() {
             [ "$(_secret_header_born "$_secret_header_sw_pid")" != "$_secret_header_sw_born" ] || continue
         else
             [ -n "$(find "$_secret_header_sw_d" -maxdepth 0 -mmin +1440 2>/dev/null)" ] || continue
+            # BY THE NEWEST THING IN IT, not the directory's own mtime
+            # (backlog df38075a, N3 of review 675414dc). A sender rewrites
+            # its header file IN PLACE on every call, which moves the
+            # file's mtime and never the directory's: a live sender whose
+            # run began over a day ago had an old directory and a header
+            # written a second earlier, and was removed. Anything in it
+            # touched inside the day — or a listing that fails — leaves it.
+            _secret_header_sw_young=$(find "$_secret_header_sw_d" -mmin -1440 2>/dev/null) || continue
+            [ -z "$_secret_header_sw_young" ] || continue
         fi
         rm -rf "$_secret_header_sw_d" 2>/dev/null || continue
         _secret_header_sw_n=$((_secret_header_sw_n + 1))
@@ -330,6 +343,12 @@ secret_header() {
 # BOSS_JOBS_URL pointed at the public edge sent it there (INFO-7, the
 # shell half of 2ee29275 F1).
 #
+# AND NOT THROUGH A PROXY. A host the list admits is still withheld when
+# curl would send the request through a proxy, because the proxy is the
+# host that reads it: machine_token_proxy, below (backlog 50708d76, F4).
+# boss-core's Hosts judges the URL alone, so this is a NAMED difference
+# from it, the safe way round.
+#
 # NEVER A REFUSAL. No mount, an empty mount, or a blank slot is no token:
 # VAR is empty and nothing is said — every host is in that state until
 # the broker's first mint. A slot boss-core would refuse (the directory
@@ -410,6 +429,14 @@ machine_token_header() {
         _secret_header_mt_tok=""
         return 0
     fi
+    _secret_header_mt_proxy=$(machine_token_proxy "${2:-}")
+    if [ -n "$_secret_header_mt_proxy" ]; then
+        # The variable's NAME, never its value: a proxy URL may carry a
+        # login of its own.
+        echo "$_secret_header_mt_me: machine token withheld from ${2%%://*}://$_secret_header_mt_host — curl would send this request through the proxy in \$$_secret_header_mt_proxy, which would read it; this request goes out without it (unset $_secret_header_mt_proxy to send it)" >&2
+        _secret_header_mt_tok=""
+        return 0
+    fi
     secret_header "$1" "x-boss-machine-token: $_secret_header_mt_tok"
     _secret_header_mt_rc=$?
     _secret_header_mt_tok=""
@@ -462,6 +489,11 @@ machine_gate_value_header() {
         echo "${0##*/}: a machine-gate value was withheld from host '$_secret_header_gv_host' — not loopback and not in BOSS_MACHINE_TOKEN_HOSTS, so nothing is sent" >&2
         return 0
     fi
+    _secret_header_gv_proxy=$(machine_token_proxy "${2:-}")
+    if [ -n "$_secret_header_gv_proxy" ]; then
+        echo "${0##*/}: a machine-gate value was withheld from host '$_secret_header_gv_host' — curl would send it through the proxy in \$$_secret_header_gv_proxy, so nothing is sent" >&2
+        return 0
+    fi
     secret_header "$1" "x-boss-machine-token: $3"
 }
 
@@ -481,9 +513,84 @@ machine_gate_value_header() {
 # not by a second copy of the rule: it is the two calls the header
 # writers above make, on the same list, and
 # machine_gate_value_header_sh.rs holds all three equal row for row.
+#
+# 1 for a host the rule does not admit; 2 for a host it admits that curl
+# would reach through a proxy (machine_token_proxy names the variable),
+# so a caller can say which, as a verdict must. Both are a refusal.
 machine_token_admits() {
     _secret_header_mt_hosts
-    _secret_header_mt_allowed "$(machine_token_host "${1:-}")" "$_secret_header_mt_list"
+    _secret_header_mt_allowed "$(machine_token_host "${1:-}")" "$_secret_header_mt_list" || return 1
+    [ -z "$(machine_token_proxy "${1:-}")" ] || return 2
+}
+
+# machine_token_proxy URL — the NAME of the environment variable whose
+# proxy curl would send a request to URL through, printed without a
+# newline; nothing when curl would connect to URL's own host.
+#
+# WHY (backlog 50708d76, F4 of review 927f8602). The host rule judges the
+# URL, and with a proxy variable set curl does not connect to the URL's
+# host at all: it hands the whole request, headers included, to the
+# proxy. The reviewer's loopback stub proxy received the header file's
+# line on every admitted row, and no sender here passes --noproxy. One
+# judgement here covers every CURL sender of both secrets, where a
+# --noproxy on every curl line of the thirty-odd files that send one
+# would be a promise each new sender has to remember. A sender that is
+# not curl reads proxies by its own rules, which this function does not
+# copy, so it must take none: infra/maintenance/forge-token-audit.py
+# opens with an empty ProxyHandler, because urllib read HTTP_PROXY for an
+# http URL where curl does not, and the token went to it (backlog
+# 50708d76, F-a of review 0a666c59). The Rust senders on reqwest are not
+# judged here at all.
+#
+# WHICH VARIABLES, measured against curl 7.88.1 on 2026-10-09 (a proxy
+# on a closed port, a target on another; the port in curl's error is
+# where it went): an http:// URL goes through http_proxy, all_proxy or
+# ALL_PROXY — never HTTP_PROXY, which curl does not read for http — and
+# an https:// URL through https_proxy, HTTPS_PROXY, all_proxy or
+# ALL_PROXY. Loopback INCLUDED: curl proxied http://127.0.0.1 and
+# http://localhost alike. An empty variable is none (curl connected
+# direct); a blank one is a proxy here and a refusal in curl (exit 5,
+# nothing sent), so it is withheld either way.
+#
+# AND AGAINST curl 8.5.0, the curl the senders actually run: the forge
+# and boss-gcp both answered `curl-version` with 8.5.0 (Ubuntu
+# 8.5.0-2ubuntu10.15) on 2026-10-10, not the dev pod's 7.88.1 these rows
+# were first read on. Re-measured that day by agent-run 71ba06b3 with
+# upstream 8.5.0 built against libidn2 2.3.3: 216 proxy rows (each of the
+# six variables, empty and blank spellings, NO_PROXY and no_proxy, over
+# http, https and both upper-case schemes, to loopback, localhost and a
+# listed name) went where 7.88.1 sent them, row for row, and none that
+# this rule admits went through a proxy. The 146 URL rows below
+# (machine_token_host) agreed too; the only difference was how 8.5.0
+# re-spells an IPv6 zone id, on two rows the rule withholds.
+#
+# A `proxy =` line in a ~/.curlrc is not judged either: no shell
+# function can see what curl reads from its own config file.
+#
+# NO_PROXY IS NOT READ: matching it as curl does would be a second copy
+# of curl's rule, and a copy that admits where curl proxies sends the
+# secret. So a host NO_PROXY exempts is withheld too — every difference
+# the safe way round — and the line says which variable to unset. For an
+# https:// URL the proxy sees a CONNECT and not the header; it is
+# withheld all the same, for the same reason. None of these is set by
+# any unit or by the rendered sor.env: this is a hand run's exposure.
+machine_token_proxy() {
+    case "${1:-}" in
+        [Hh][Tt][Tt][Pp]://*)
+            if [ -n "${http_proxy:-}" ]; then printf 'http_proxy'; return 0; fi
+            ;;
+        [Hh][Tt][Tt][Pp][Ss]://*)
+            if [ -n "${https_proxy:-}" ]; then printf 'https_proxy'; return 0; fi
+            if [ -n "${HTTPS_PROXY:-}" ]; then printf 'HTTPS_PROXY'; return 0; fi
+            ;;
+        *) return 0 ;;
+    esac
+    if [ -n "${all_proxy:-}" ]; then
+        printf 'all_proxy'
+    elif [ -n "${ALL_PROXY:-}" ]; then
+        printf 'ALL_PROXY'
+    fi
+    return 0
 }
 
 # _secret_header_mt_hosts [LIST] — the hosts list of the rule above into

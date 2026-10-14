@@ -14,18 +14,52 @@ pub const TRAIN_GATE_WAIT_REASON: &str = "train_gate_wait_reason";
 /// loudly on the train. Same three readers.
 pub const TRAIN_GATE_FALLBACK: &str = "train_gate_fallback";
 
+/// When the conductor last filed the train's gate (RFC3339). The
+/// conductor writes it (`boss-cli/src/train_gate.rs::KEY_LAUNCHED_AT`
+/// names this constant), and a relaunched train's wait is dated from it.
+pub const TRAIN_GATE_LAUNCHED_AT: &str = "train_gate_launched_at";
+
+/// HOW LONG A TRAIN MAY WAIT FOR A BAY BEFORE THE WAIT IS TROUBLE — ONE
+/// number, the waiting band's own hold (backlog 19227ca8). Since design
+/// 1e787fc2 (0f4224bc, train #1051) a train at a full bound holds the
+/// first place in the gate line and takes the next bay that frees: a
+/// short wait is the normal path, and drawing it as trouble from its
+/// first minute made the floor red every time the bays were busy.
+/// `yard.ts::TRAIN_GATE_WAIT_MINUTES` is held equal to this by a test
+/// below, because the TypeScript cannot import it.
+pub const TRAIN_GATE_WAIT_MINUTES: i64 = bands::TRACK_GATE_WAITING.hold_minutes;
+
+/// WHEN A TRAIN BEGAN WAITING FOR ITS GATE, from what the record holds:
+/// the later of its PR opening (the `pr` step, when the conductor first
+/// asks for a gate) and its last gate launch (a relaunch after a lost or
+/// refused run waits again). The marker itself carries no stamp, so this
+/// is a LOWER bound on the true onset — it can only say a wait began
+/// earlier than it did, never hide one. `None` when neither is recorded.
+/// `yard.ts::readTrainGate`'s `wait_since` reads the same two facts.
+pub fn train_gate_wait_since(md: &Value, steps: &[Step]) -> Option<chrono::DateTime<chrono::Utc>> {
+    let pr = step_done_at(find_step(steps, "pr", "Open the batched PR"));
+    let launched = meta_instant(md, TRAIN_GATE_LAUNCHED_AT);
+    pr.max(launched)
+}
+
 /// `yard.ts::trainGateTroubled`, ported: a train whose gate could not
-/// be filed (fallback) or is still waiting at the bound (wait reason)
-/// wears the yard's trouble style. A blank string is no marker, as
-/// `readTrainGate`'s `text()` reads it.
-pub fn train_gate_troubled(md: &Value) -> bool {
-    [TRAIN_GATE_FALLBACK, TRAIN_GATE_WAIT_REASON]
-        .iter()
-        .any(|k| {
-            md.get(k)
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty())
-        })
+/// be filed (fallback) wears the yard's trouble style at once; one
+/// still waiting for a bay (wait reason) wears it only once the wait
+/// has held [`TRAIN_GATE_WAIT_MINUTES`] — and at once when the record
+/// holds no onset, as `settle` states a condition with none. A blank
+/// string is no marker, as `readTrainGate`'s `text()` reads it.
+pub fn train_gate_troubled(
+    md: &Value,
+    waiting_since: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if !md_str(md, TRAIN_GATE_FALLBACK).is_empty() {
+        return true;
+    }
+    if md_str(md, TRAIN_GATE_WAIT_REASON).is_empty() {
+        return false;
+    }
+    waiting_since.is_none_or(|s| (now - s).num_minutes() >= TRAIN_GATE_WAIT_MINUTES)
 }
 
 /// WHAT A TRAIN'S OWN TROUBLE SAYS, judged in the region the train
@@ -52,10 +86,17 @@ pub(super) fn train_findings(
         .filter(|t| t.block.is_some())
         .map(|t| t.title.as_str())
         .collect();
-    let gate_waits: Vec<&str> = trains
+    // Every train still waiting for a bay, with when its wait began: the
+    // finding carries the OLDEST onset, so `settle` holds it for the
+    // band's period — the same [`TRAIN_GATE_WAIT_MINUTES`] the one-train
+    // predicate [`train_gate_troubled`] judges by — and a wait inside it
+    // is said as `settling`, not drawn (backlog 19227ca8). One train
+    // whose onset the record does not hold makes the onset unknown,
+    // stated at once rather than guessed.
+    let gate_waits: Vec<(&str, Option<Instant>)> = trains
         .iter()
-        .filter(|(j, _)| train_gate_troubled(&j.metadata))
-        .map(|(j, _)| j.title.as_str())
+        .filter(|(j, _)| !md_str(&j.metadata, TRAIN_GATE_WAIT_REASON).is_empty())
+        .map(|(j, s)| (j.title.as_str(), train_gate_wait_since(&j.metadata, s)))
         .collect();
     let mut findings = Vec::new();
     if !blocked.is_empty() {
@@ -97,17 +138,22 @@ pub(super) fn train_findings(
             ),
         ));
     }
-    let waiting: Vec<&str> = gate_waits
-        .iter()
-        .copied()
-        .filter(|t| !fallback.contains(t))
+    let waiting: Vec<(&str, Option<Instant>)> = gate_waits
+        .into_iter()
+        .filter(|(t, _)| !fallback.contains(t))
         .collect();
     if !waiting.is_empty() {
+        let since = waiting
+            .iter()
+            .map(|(_, s)| *s)
+            .collect::<Option<Vec<Instant>>>()
+            .and_then(|s| s.into_iter().min());
+        let titles: Vec<&str> = waiting.iter().map(|(t, _)| *t).collect();
         findings.push(Finding::new(
             bands::TRACK_GATE_WAITING,
-            None,
+            since,
             String::new(),
-            format!("gate not filed yet: {}", waiting.join(", ")),
+            format!("gate not filed yet: {}", titles.join(", ")),
         ));
     }
     findings
@@ -292,7 +338,14 @@ mod tests {
             &[],
         );
         let gates = by_name(&out, "gates");
-        assert_eq!(gates.count, Some(1), "the train under test");
+        // The train under test, whose gate has already judged it red: it
+        // needs no bay and waits in no line, so it stands as the gates'
+        // third figure, `judged` — never in the line (backlog bce67f09).
+        assert_eq!(
+            (gates.count, gates.waiting, gates.judged),
+            (Some(0), None, Some(1)),
+            "the judged train"
+        );
         assert_eq!(gates.state, RegionState::Troubled, "{}", gates.why);
         assert!(gates.why.contains("blocked: train #470"), "{}", gates.why);
         let track = by_name(&out, "track");
@@ -312,8 +365,9 @@ mod tests {
         let out = read(std::slice::from_ref(&waiting), &[]);
         let gates = by_name(&out, "gates");
         // The conductor retrying against a full bound is a wait to
-        // watch, not trouble (design 62de32ae, decision 1); the marker
-        // carries no stamp, so it is stated at once with no duration.
+        // watch, not trouble (design 62de32ae, decision 1). The marker
+        // carries no stamp; the wait is dated from the PR's opening
+        // (11:01), so at 12:00 it has held 59 minutes (19227ca8).
         assert_eq!(gates.state, RegionState::Attention, "{}", gates.why);
         assert!(
             gates.why.contains("gate not filed yet: train #471"),
@@ -322,7 +376,7 @@ mod tests {
         );
         let band = gates.band.as_ref().unwrap();
         assert_eq!(band.id, "track-gate-waiting");
-        assert_eq!(band.held_minutes, None);
+        assert_eq!(band.held_minutes, Some(59));
 
         // CI alone judged the train — the gate could not be filed at
         // all, a degraded verdict that is ours: trouble.
@@ -333,10 +387,68 @@ mod tests {
         assert_eq!(gates.state, RegionState::Troubled, "{}", gates.why);
         assert!(gates.why.contains("judged by CI alone"), "{}", gates.why);
         // A blank marker is no marker (yard.ts `text()`).
-        assert!(!train_gate_troubled(&json!({ TRAIN_GATE_WAIT_REASON: "" })));
-        assert!(train_gate_troubled(
-            &json!({ TRAIN_GATE_FALLBACK: "CI alone" })
+        assert!(!train_gate_troubled(
+            &json!({ TRAIN_GATE_WAIT_REASON: "" }),
+            None,
+            t(NOW)
         ));
+        assert!(train_gate_troubled(
+            &json!({ TRAIN_GATE_FALLBACK: "CI alone" }),
+            Some(t(NOW)),
+            t(NOW)
+        ));
+    }
+
+    /// A TRAIN BRIEFLY WAITING FOR A BAY IS NOT TROUBLE (backlog
+    /// 19227ca8). Since design 1e787fc2 a train at a full bound holds
+    /// the first place in the gate line and takes the next bay: a wait of
+    /// a few minutes is the normal path. The region and the one-train
+    /// predicate judge it by ONE number, [`TRAIN_GATE_WAIT_MINUTES`] —
+    /// the waiting band's own hold — so a wait inside it is `settling`
+    /// and clear, and one past it is attention; the yard's TypeScript is
+    /// held to the same number.
+    #[test]
+    fn a_train_briefly_waiting_for_a_bay_is_settling_not_trouble() {
+        let why = "the cluster is at its gate bound (3 running of 3: a, b, c) — the train \
+                   holds the first place in the gate line and takes the next bay that frees";
+        let md = json!({ TRAIN_GATE_WAIT_REASON: why });
+        // The PR opened 11:01; at 11:05 the wait has held 4 minutes.
+        let mut short = under_test("train #475", md.clone(), StepStatus::Ready);
+        let now = t("2026-09-19T11:05:00Z");
+        let since = train_gate_wait_since(&short.0.metadata, &short.1);
+        assert_eq!(since, Some(t("2026-09-19T11:01:00Z")));
+        assert!(!train_gate_troubled(&md, since, now));
+        assert!(train_gate_troubled(&md, since, t("2026-09-19T11:11:00Z")));
+        // A relaunch waits again: dated from the last launch, the later.
+        short.0.metadata = json!({
+            TRAIN_GATE_WAIT_REASON: why,
+            TRAIN_GATE_LAUNCHED_AT: "2026-09-19T11:56:00Z",
+        });
+        let out = read(std::slice::from_ref(&short), &[]);
+        let gates = by_name(&out, "gates");
+        assert_eq!(gates.state, RegionState::Clear, "{}", gates.why);
+        assert!(
+            gates
+                .why
+                .contains("settling: gate not filed yet: train #475 — held 4m of the 10m"),
+            "{}",
+            gates.why
+        );
+        assert_eq!(TRAIN_GATE_WAIT_MINUTES, 10);
+        // The yard's TypeScript judges by the same number.
+        let yard =
+            std::fs::read_to_string(boss_testing::repo_root().join("apps/web/src/it/yard/yard.ts"))
+                .expect("yard.ts is in the tree");
+        assert!(
+            yard.contains(&format!(
+                "export const TRAIN_GATE_WAIT_MINUTES = {TRAIN_GATE_WAIT_MINUTES};"
+            )),
+            "yard.ts::TRAIN_GATE_WAIT_MINUTES drifted from track.rs::TRAIN_GATE_WAIT_MINUTES"
+        );
+        assert!(
+            yard.contains(&format!("md.{TRAIN_GATE_LAUNCHED_AT}")),
+            "yard.ts no longer dates a wait from {TRAIN_GATE_LAUNCHED_AT}"
+        );
     }
 
     /// THE TRACK HOLDS MERGED TRAINS IN TRANSIT, and carries no capacity
@@ -389,7 +501,12 @@ mod tests {
             "no train on the track; PR train 2026-10-01 02:41 is under test at the gates"
         );
         assert_eq!(track.kpi[0].text, track.why);
-        assert_eq!(by_name(&out, "gates").count, Some(1), "counted once, there");
+        let gates = by_name(&out, "gates");
+        assert_eq!(
+            (gates.count, gates.waiting),
+            (Some(0), Some(1)),
+            "counted once, there — in the line, its gate holding no bay"
+        );
 
         let merged = in_transit("train #472", "2026-09-19T11:00:00Z");
         assert!(crate::yard::in_transit(&merged.1));

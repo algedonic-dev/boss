@@ -451,6 +451,8 @@ fn defaults(body: &str, env: &[(&str, &str)], unset: &[&str]) -> Run {
         "BOSS_FORGE_REGISTRY_HOST",
         "BOSS_CONVERGE_HOLD",
         "BOSS_FORGE_LAST_BUILT",
+        "BOSS_FORGE_CONVERGE_STATE",
+        "BOSS_REGISTRY_PUSH_DIR",
     ];
     all_unset.extend_from_slice(unset);
     bash(&["-c", &script], env, &all_unset, None)
@@ -463,7 +465,7 @@ fn forge_defaults_derive_every_image_repo_from_the_files_registry_host() {
     let f = file.to_str().unwrap();
     let reg = source_key("forge_registry");
     let r = defaults(
-        "forge_need REGISTRY CI_IMAGE_REPO REGISTRY_BASE; echo \"$REGISTRY|$BOSS_FORGE_REGISTRY|$CI_IMAGE_REPO|$REGISTRY_BASE|$HOLD_FILE|$PG_WORKLOAD|$PG_CONTAINER|$PG_USER|$LAST_BUILT_NAME\"",
+        "forge_need REGISTRY CI_IMAGE_REPO REGISTRY_BASE; echo \"$REGISTRY|$BOSS_FORGE_REGISTRY|$CI_IMAGE_REPO|$REGISTRY_BASE|$HOLD_FILE|$PG_WORKLOAD|$PG_CONTAINER|$PG_USER|$STAMP_FILE|$REGISTRY_PUSH_DIR\"",
         &[("BOSS_SOR_ENV", f)],
         &[],
     );
@@ -471,7 +473,7 @@ fn forge_defaults_derive_every_image_repo_from_the_files_registry_host() {
     assert_eq!(
         r.out.trim(),
         format!(
-            "{reg}/david/boss|{reg}/david/boss|{reg}/david/boss-ci|{reg}/david|/var/lib/boss/converge-hold|sts/postgres|postgres|boss|.boss-last-built"
+            "{reg}/david/boss|{reg}/david/boss|{reg}/david/boss-ci|{reg}/david|/var/lib/boss/converge-hold|sts/postgres|postgres|boss|/var/lib/boss/converge/last-built|/etc/boss/registry-push"
         )
     );
     // Every override the verbs used to read still wins, under both
@@ -590,9 +592,7 @@ fn every_unit_that_speaks_to_the_record_reads_the_file() {
         "ops-runner.sh",
         "observe-host.sh",
         "observe-units.sh",
-        "observe-codebase.sh",
         "cluster-watchdog.sh",
-        "install-smoke-nightly.sh",
         "boss train cadence",
     ];
     let optional_ok = [

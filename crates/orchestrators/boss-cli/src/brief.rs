@@ -60,7 +60,7 @@
 //! rendering as its prompt, through the one `render`.
 //!
 //! Read-only, and it writes nothing. The packet read goes through
-//! `gate::api`, so it inherits the no-default `BOSS_JOBS_URL` rule and
+//! `crate::sor_client::api`, so it inherits the no-default `BOSS_JOBS_URL` rule and
 //! is signed as the caller.
 
 use anyhow::{Context, Result, bail};
@@ -345,6 +345,17 @@ pub(crate) fn test_db_admin_url(test_db_rs: &str) -> Option<String> {
         .find(|l| l.starts_with("const DEFAULT_ADMIN_URL"))
         .and_then(|l| l.split('"').nth(1))
         .map(str::to_string)
+}
+
+/// The published controller path follows the same store the child door uses.
+fn published_worker_door(door_env: &str) -> Option<String> {
+    door_env
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("const DEV_CONTROL_STORE: &str = "))
+        .and_then(|line| line.split('"').nth(1))
+        .filter(|store| store.starts_with('/') && !store.contains(char::is_whitespace))
+        .map(|store| format!("{store}/dev-build"))
 }
 
 /// The phases a full gate runs, in the order their `check` calls appear
@@ -735,6 +746,39 @@ pub(crate) fn invariants(repo: &Path) -> Result<Vec<Invariant>> {
     let doors = "CLAUDE.md";
     let door = preflight_door(&read(repo, doors)?)
         .with_context(|| format!("{doors} §Doors does not carry a `Before pushing` door"))?;
+    let child_door = "crates/orchestrators/boss-cli/src/door_env.rs";
+    let worker = published_worker_door(&read(repo, child_door)?)
+        .with_context(|| format!("{child_door} does not declare the dev control store"))?;
+    let controller = "infra/dev/control-tools.py";
+    let controller_source = read(repo, controller)?;
+    if !controller_source.contains("if tool == \"dev-build\":")
+        || !controller_source.contains("\"exec-auto\"")
+    {
+        bail!("{controller} does not carry the published worker execution door");
+    }
+    out.push(Invariant {
+        name: "worker execution",
+        authority: controller.to_string(),
+        lines: vec![
+            format!("{worker} exec-auto -- <worker argv>"),
+            "Use only after separately authorized activation and a controller-owned worker binding.".into(),
+            "This source preparation grants no activation; activation remains held until its owner lifts it.".into(),
+            "Run candidate pre-flight and direct interpreters through this published controller;".into(),
+            "the controller maps the worktree cwd to the worker and refuses a missing or changed binding.".into(),
+            "Never run the candidate infra/dev/dev-build.py in the credential-bearing container.".into(),
+            "Transfer changed files and rehearsals through the published put/get doors; host scratch paths".into(),
+            "are not worker paths. Preserve returned output and exit status in the trusted run record.".into(),
+            "Pure source probes run in the worker; probes reading the system of record stay on the".into(),
+            "forge probe account under the approved network fence, never a worker credential or proxy.".into(),
+            "The first dispatched builder's actual worker receipt and the full runtime READ/USE matrix".into(),
+            "remain owed. Printed commands and source GREEN do not establish either.".into(),
+        ],
+        lanes: vec![LANE_CAR],
+        grounding: Grounding::Derived(vec![
+            Reading::read(child_door, worker.trim_end_matches("/dev-build")),
+            Reading::read(controller, "exec-auto"),
+        ]),
+    });
     out.push(Invariant {
         name: "pre-flight",
         authority: doors.to_string(),
@@ -743,7 +787,9 @@ pub(crate) fn invariants(repo: &Path) -> Result<Vec<Invariant>> {
             // made the line a list, which a worktree-isolated builder's
             // harness refuses to run; the exit code it echoed is the
             // command's own, and the harness reports that.
-            format!("bash {door} > <your scratch dir>/preflight.log 2>&1"),
+            format!("{worker} exec-auto -- /bin/bash {door} > <your scratch dir>/preflight.log 2>&1"),
+            "After authorized activation, this routes every candidate lint and clippy into the worker.".into(),
+            "While activation is held, existing local checks are source preparation only, never isolation proof.".into(),
             "Its exit status is the verdict — the tool reports it; in a shell, run".into(),
             "echo $? as the NEXT command, never chained to this one on the same line.".into(),
             "The `Before pushing` door of CLAUDE.md §Doors, read out of that entry:".into(),
@@ -1361,7 +1407,7 @@ pub(crate) async fn active_row(
     job: &Value,
 ) -> Option<Value> {
     let kind = job.get("kind").and_then(Value::as_str)?;
-    crate::gate::api(
+    crate::sor_client::api(
         http,
         reqwest::Method::GET,
         &format!("/api/workflows/{kind}"),
@@ -1440,12 +1486,12 @@ pub(crate) fn render_with(
 
 pub async fn run(packet_ref: Option<String>, profile_override: Option<String>) -> Result<()> {
     let repo = repo_root()?;
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let job = match packet_ref {
         Some(r) => {
             let id = crate::job::fetch_and_resolve(&http, &r).await?;
             Some(
-                crate::gate::api(
+                crate::sor_client::api(
                     &http,
                     reqwest::Method::GET,
                     &format!("/api/jobs/{id}"),
@@ -1491,8 +1537,11 @@ pub async fn run(packet_ref: Option<String>, profile_override: Option<String>) -
     // agent will.
     let prior = match job.as_ref().and_then(crate::prior_work::item_of) {
         Some(item) => {
-            let query = crate::prior_work::partial_cars_query(item);
-            let cars = crate::gate::api(&http, reqwest::Method::GET, &query, None).await;
+            let cars = crate::prior_work::read_cars(item, |path| {
+                let http = &http;
+                async move { crate::sor_client::api(http, reqwest::Method::GET, &path, None).await }
+            })
+            .await;
             Some(crate::prior_work::assemble(&repo, item, cars))
         }
         None => None,
@@ -2819,6 +2868,43 @@ tenant_repo = \"acme/no-ref\"
     /// That is the same shape as c94ddc6f one level out: a document
     /// vouching for a tree it did not read.
     #[test]
+    fn a_builder_brief_routes_candidate_checks_through_the_published_worker() {
+        let rendered = render(&repo(), None, "builder", None, None).expect("renders");
+        assert!(
+            rendered.contains(
+                "/work/tools/dev-control/dev-build exec-auto -- /bin/bash infra/gate.sh --lint"
+            ),
+            "the pre-flight must name the published controller, not run candidate lints beside credentials: {rendered}"
+        );
+        for required in [
+            "direct interpreters",
+            "Never run the candidate infra/dev/dev-build.py",
+            "activation remains held",
+            "first dispatched builder",
+        ] {
+            assert!(
+                rendered.contains(required),
+                "missing {required}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_published_worker_door_is_derived_and_an_unread_store_is_refused() {
+        assert_eq!(
+            published_worker_door("const DEV_CONTROL_STORE: &str = \"/owned-control\";"),
+            Some("/owned-control/dev-build".into())
+        );
+        for source in [
+            "",
+            "// const DEV_CONTROL_STORE: &str = \"/wrong\";",
+            "const DEV_CONTROL_STORE: &str = \"relative\";",
+        ] {
+            assert_eq!(published_worker_door(source), None, "{source}");
+        }
+    }
+
+    #[test]
     fn the_preflight_door_is_read_out_of_the_doors_list() {
         let claude = std::fs::read_to_string(repo().join("CLAUDE.md")).expect("CLAUDE.md");
         let door = preflight_door(&claude)
@@ -2877,8 +2963,10 @@ tenant_repo = \"acme/no-ref\"
                  builder rule 4 is the one order, and it checks first: {line:?}"
             );
         }
+        // `git -C <your worktree> push …` since backlog 916fe290: the
+        // needle is the command's tail, which names the push either way.
         let push = out
-            .find("git push origin HEAD:")
+            .find("push origin HEAD:")
             .expect("the builder rules name the push command");
         assert!(
             at < push,

@@ -587,6 +587,60 @@ fn every_control_plane_declaration_matches_its_live_values() {
     }
 }
 
+/// w-2's disk is old CI images (backlog 666e0570, measured 2026-10-09 by
+/// node-disk-usage, ops-request 33c7653e): imagefs 73.0 of 81.7 GiB used
+/// on a 109.6 GiB disk, 27.9 GiB available — at Longhorn's 25% minimum,
+/// so Longhorn stops scheduling replicas there, while the kubelet's
+/// default image-GC line (85% used) lies past that floor and had not
+/// fired. The declaration is cp-1/cp-3's pair, and the check reads it the
+/// way node-converge will: ABSENT before the apply, MATCH after, and the
+/// live mirror UNDECLARED both times (MIRROR_NOT_DECLARED says why).
+#[test]
+fn w2_declares_an_image_gc_pair_that_fires_before_longhorns_floor() {
+    let body = std::fs::read_to_string(patches_dir().join("w-2.yaml")).unwrap();
+    let pct = |key: &str| -> u32 {
+        let prefix = format!("{key}: ");
+        body.lines()
+            .find_map(|l| l.trim().strip_prefix(prefix.as_str()))
+            .unwrap_or_else(|| panic!("w-2.yaml declares {key}:\n{body}"))
+            .parse()
+            .unwrap()
+    };
+    let (high, low) = (
+        pct("imageGCHighThresholdPercent"),
+        pct("imageGCLowThresholdPercent"),
+    );
+    // Longhorn refuses new replicas below 25% available, i.e. above 75%
+    // used: the kubelet must start collecting before that, and collect
+    // down past where it started.
+    assert!(high < 75, "GC starts at {high}% used, past Longhorn's 75%");
+    assert!(low < high, "GC frees to {low}%, below its {high}% start");
+    assert_eq!((high, low), (50, 40), "cp-1 and cp-3's pair");
+
+    let before = Live {
+        hostname: Some("w-2"),
+        mirror: true,
+        ..Live::default()
+    };
+    let out = run(&["w-2"], &live_yaml("10.20.0.16", &before), None, None);
+    let t = text(&out);
+    assert_eq!(code(&out), 1, "not applied yet: {t}");
+    assert_eq!(lines_with(&out, "ABSENT").len(), 2, "both GC keys:\n{t}");
+    let after = Live {
+        image_gc: Some((50, 40)),
+        ..before
+    };
+    let out = run(&["w-2"], &live_yaml("10.20.0.16", &after), None, None);
+    let t = text(&out);
+    assert_eq!(code(&out), 0, "applied: {t}");
+    assert_eq!(lines_with(&out, "MATCH").len(), 2, "both GC keys:\n{t}");
+    let undeclared = lines_with(&out, "UNDECLARED");
+    assert!(
+        undeclared.len() == 1 && undeclared[0].contains("10.20.0.15:3000"),
+        "the live mirror is reported, never failed:\n{t}"
+    );
+}
+
 #[test]
 fn cp2_live_40_30_against_a_declaration_of_50_40_is_drift_naming_both() {
     let dir = scratch("drift");
@@ -978,8 +1032,8 @@ fn a_line_break_this_reader_does_not_split_on_is_refused_before_any_parse() {
     .unwrap();
     let out = run(&["--only-read-classes", "c-lead"], "", Some(&dir), None);
     assert_eq!(code(&out), 0, "{}", text(&out));
-    for node in ["cp-1", "cp-2", "cp-3", "w-1"] {
-        let out = run(&["--only-read-classes", node], "", None, None);
+    for node in talos_nodes() {
+        let out = run(&["--only-read-classes", &node], "", None, None);
         assert_eq!(code(&out), 0, "the shipped {node}.yaml: {}", text(&out));
     }
 }
@@ -1087,9 +1141,9 @@ fn a_declaration_must_be_in_canonical_form() {
     .unwrap();
     let out = run(&["--only-read-classes", "k-ok"], "", Some(&dir), None);
     assert_eq!(code(&out), 0, "{}", text(&out));
-    // The four shipped declarations are canonical.
-    for node in ["cp-1", "cp-2", "cp-3", "w-1"] {
-        let out = run(&["--only-read-classes", node], "", None, None);
+    // Every shipped declaration is canonical.
+    for node in talos_nodes() {
+        let out = run(&["--only-read-classes", &node], "", None, None);
         assert_eq!(code(&out), 0, "the shipped {node}.yaml: {}", text(&out));
     }
 }
@@ -1197,11 +1251,47 @@ fn without_python3_it_refuses_with_78_not_a_verdict() {
     assert!(t.contains("python3"), "{t}");
 }
 
+/// Every node the estate declares with a Talos role, read out of
+/// infra/estate/estate.toml — the one tree spelling of the estate, which
+/// the registry is seeded from. This list was four literals until
+/// 2026-10-09 (backlog 666e0570): the test said "every Talos node in the
+/// registry" while w-2, a talos-worker since 2026-08-25, had no
+/// declaration, so node-converge had nothing to apply when w-2's disk
+/// filled with unused CI images. Read, not copied (CLAUDE.md §9a).
+fn talos_nodes() -> Vec<String> {
+    let path = repo_root().join("infra/estate/estate.toml");
+    let estate: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let nodes: Vec<String> = estate["node"]
+        .as_array()
+        .expect("estate.toml declares [[node]] tables")
+        .iter()
+        .filter(|n| n["role"].as_str().is_some_and(|r| r.starts_with("talos-")))
+        .map(|n| n["id"].as_str().expect("a node id").to_string())
+        .collect();
+    // Control: a reader that found nothing would pass every loop below.
+    assert!(
+        nodes.iter().any(|n| n == "w-1") && nodes.iter().any(|n| n == "cp-1"),
+        "the estate's Talos nodes include cp-1 and w-1: {nodes:?}"
+    );
+    nodes
+}
+
+/// Declarations that do not (yet) carry the forge registry mirror the node
+/// pulls through. w-2's was written for its image-GC pair alone (backlog
+/// 666e0570): the mirror is live there — every boss-ci image on the node
+/// came through 10.20.0.15:3000 — and node-converge refuses a patch that
+/// is not idempotent when ANY entry it declares is already live, and
+/// whether Talos's merge appends mirror endpoints is unmeasured (README
+/// §The door). A GC-only declaration is idempotent by construction (a map
+/// of two scalars), so the plan can apply it; the live mirror reads
+/// UNDECLARED, which does not fail the check.
+const MIRROR_NOT_DECLARED: &[&str] = &["w-2"];
+
 #[test]
 fn the_tree_declares_every_node_the_registry_names_as_a_talos_machine() {
-    // The patches directory is the declaration; every Talos node in the
-    // estate registry's seed (infra/postgres/schema) has a file there.
-    for node in ["cp-1", "cp-2", "cp-3", "w-1"] {
+    // The patches directory is the declaration; every Talos node the
+    // estate declares has a file there.
+    for node in talos_nodes() {
         let f = patches_dir().join(format!("{node}.yaml"));
         assert!(f.is_file(), "no declaration at {}", f.display());
         let body = std::fs::read_to_string(&f).unwrap();
@@ -1209,9 +1299,11 @@ fn the_tree_declares_every_node_the_registry_names_as_a_talos_machine() {
             body.starts_with("machine:") || body.contains("\nmachine:\n"),
             "{node}: a patch is a machine-config fragment"
         );
-        assert!(
+        assert_eq!(
             body.contains("10.20.0.15:3000"),
-            "{node}: every node pulls through the forge registry mirror"
+            !MIRROR_NOT_DECLARED.contains(&node.as_str()),
+            "{node}: every node pulls through the forge registry mirror, \
+             declared everywhere but MIRROR_NOT_DECLARED"
         );
         assert!(
             !body.contains("token:") && !body.contains("crt:") && !body.contains("key:"),

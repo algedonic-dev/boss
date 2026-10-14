@@ -45,10 +45,12 @@
 #      nor the no asked for — a TLS error, a timeout, a NotFound — is
 #      UNMEASURED, and unmeasured refuses exactly like a wrong answer:
 #      no evidence is not a pass.
-#   4. SHIP: the kubeconfig on ssh's stdin to the forced-command receiver
+#   4. SHIP, IN TWO STEPS: connect to the forced-command receiver
 #      (infra/gcp/ops-credential-recv.sh), host key pinned from
-#      $BOSS_DEPOSIT_KNOWN_HOSTS, and the receiver's byte count READ BACK
-#      against the bytes sent.
+#      $BOSS_DEPOSIT_KNOWN_HOSTS, and READ ITS FIRST LINE; only when that
+#      line is the receiver's own is the kubeconfig written to ssh's
+#      stdin (backlog dea2236f, below), and the receiver's byte count is
+#      READ BACK against the bytes sent.
 #
 # NON-ROOT, AND WHY THAT WORKS WITH A MOUNTED KEY (design b08725c2 Q3,
 # David 2026-09-29). OpenSSH refuses a private key whose mode admits
@@ -84,7 +86,9 @@
 # prints ONE `RED break-glass-deposit refused: <why>` line, and a key
 # boss-gcp does not hold yet prints `RED break-glass-deposit/
 # authorize-key authorize: …` with the authorized_keys line and the
-# pinned host key's fingerprint to check first. boss-chore.sh keeps
+# pinned host key's fingerprint to check first, and a key that reaches
+# anything but the receiver prints `RED break-glass-deposit/
+# key-unconfined refused: …` naming the line to remove. boss-chore.sh keeps
 # every RED line whole, and file-backlog-items-on-break-glass-deposit-
 # red files each route as a backlog-item owned by the platform owner.
 #
@@ -113,12 +117,25 @@ ROUTE=break-glass-deposit
 # The one receiver path, spelled as the installer spells it — the test
 # holds this line and install-ops-credential-receiver.sh's equal.
 FORCED='command="exec sudo -n /usr/local/libexec/boss/ops-credential-recv kubeconfig",restrict'
+# The receiver's first line, word for word (infra/gcp/ops-credential-recv.sh
+# prints it; break_glass_deposit_sh.rs holds the two equal), how long this
+# pass waits for it — connect, sudo, and one echo — and the bound on the
+# whole transfer, inside the Job's own activeDeadlineSeconds.
+GREETING='ops-credential-recv: kubeconfig: ready for one kubeconfig'
+GREETING_TIMEOUT_S="${BOSS_DEPOSIT_GREETING_TIMEOUT_S:-30}"
+SHIP_TIMEOUT_S=60
+# A KEY THAT IS NOT CONFINED TO THE RECEIVER IS ITS OWN ROUTE: the red
+# rule files one item per route and nothing for a route whose item is
+# open, so under the deposit's one route an item already open for, say,
+# a widened grant would have swallowed "this key opens a shell".
+KEY_ROUTE="$ROUTE/key-unconfined"
 
 # red ROUTE KIND TEXT — the one line shape boss-chore.sh keeps whole and
 # maintenance.chore.file_reds files from: `RED <route> <kind>: <text>`.
 red() { echo "RED $1 $2: $3" >&2; }
 usage() { red "$ROUTE" misconfigured "$*"; exit 78; }
 refuse() { red "$ROUTE" refused "$*"; exit 1; }
+unconfined() { red "$KEY_ROUTE" refused "$*"; exit 1; }
 say() { echo "$ME: $*"; }
 # stop TEXT — not deposited, and the reason is already on a RED line
 # (the key to authorize), so this adds no second item beside it.
@@ -128,6 +145,8 @@ stop() { echo "$ME: not deposited — $*" >&2; exit 1; }
     || usage "BOSS_DEPOSIT_API_SERVER='$SERVER' is not the https:// address boss-gcp dials (the manifest sets it)"
 [[ $TARGET =~ ^[a-z_][a-z0-9_-]*@[A-Za-z0-9.:-]+$ ]] \
     || usage "BOSS_DEPOSIT_TARGET='$TARGET' is not <account>@<host> (the manifest sets it)"
+[[ $GREETING_TIMEOUT_S =~ ^[1-9][0-9]*$ ]] \
+    || usage "BOSS_DEPOSIT_GREETING_TIMEOUT_S='$GREETING_TIMEOUT_S' is not a number of seconds"
 
 umask 077
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/deposit.XXXXXX")"
@@ -375,12 +394,102 @@ SSH_OPTS=(-F /dev/null -T -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes
     -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS" -o GlobalKnownHostsFile=/dev/null
     -o ConnectTimeout=20 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
 src=0
-ssh "${SSH_OPTS[@]}" "$TARGET" < "$KC" > "$WORK/recv.out" 2>"$ERR" || src=$?
+# TWO STEPS, AND THE FAR SIDE TAKES THE FIRST (backlog dea2236f). The
+# machine token's first live enrolment (packet 96a0f7bb, 2026-10-07)
+# placed its deposit key as the bare public key; sshd ran the account's
+# SHELL, and a sender that wrote before it read put the token on that
+# shell's stdin. This Job wrote the kubeconfig the same way, and its key
+# is placed by the same hand from a line on a RED. So ssh's stdin and
+# stdout are two fifos in this pod's scratch, the far side's first line
+# is read while nothing has been written to it, and what it says decides
+# everything — the machine token push's shape, beside this file:
+#   - the receiver's line: the kubeconfig is sent;
+#   - any other text — a login banner above all — or nothing and then a
+#     clean end on an empty stream: `this key reaches a shell`, RED on a
+#     route of its own, naming the line to remove;
+#   - nothing, then the OLDER receiver's refusal of an empty deposit:
+#     RED on the deposit's route, naming boss-gcp's converge. Not quiet:
+#     the halves land thirty minutes apart at most and this runs once a
+#     day, so the same words on any later day are a receiver install that
+#     failed, which must reach a reader.
+# In every case but the first, no byte of the kubeconfig leaves this pod.
+# WHAT THIS DOES NOT SEE: a line that forces the receiver and lacks
+# `restrict` — confined to the command, and still able to forward a
+# port; only reading authorized_keys on boss-gcp shows that.
+mkfifo "$WORK/to" "$WORK/from" 2>"$ERR" \
+    || refuse "this pod's scratch could not hold the transfer's two pipes: $(why); nothing was sent"
+timeout -k 5 "$SHIP_TIMEOUT_S" ssh "${SSH_OPTS[@]}" "$TARGET" < "$WORK/to" > "$WORK/from" 2>"$ERR" &
+SSH_PID=$!
+# After the fork, so ssh keeps its own handling: a far side that closes
+# early is an exit status read below, never this shell killed by a write
+# to a closed pipe with the kubeconfig half out.
+trap '' PIPE
+exec {TO}> "$WORK/to" {FROM}< "$WORK/from"
+# One line, at most 256 bytes of it: a far side that streams without a
+# newline is not read without end.
+FIRST="" heard=0
+IFS= read -r -t "$GREETING_TIMEOUT_S" -n 256 -u "$FROM" FIRST || heard=$?
+GREETED=0
+if [ "$heard" -eq 0 ] && [ "$FIRST" = "$GREETING" ]; then
+    GREETED=1
+    say "$TARGET answered first as the receiver; sending the kubeconfig"
+    # A write the far side did not take shows as a count that disagrees.
+    cat -- "$KC" >&"$TO" 2>/dev/null || true
+fi
+# Closing the stream with nothing written is itself the question put to
+# a far side that said nothing: an older receiver answers an empty
+# deposit in its own words, a shell ends without a word.
+exec {TO}>&-
+cat <&"$FROM" > "$WORK/recv.out" || true
+exec {FROM}<&-
+wait "$SSH_PID" || src=$?
 sed "s/^/  $TARGET: /" "$WORK/recv.out"
-if [ "$src" -ne 0 ]; then
-    if grep -q 'Permission denied' "$ERR" && [ -s "$PUB" ]; then
+if [ "$GREETED" -eq 0 ]; then
+    # NOTHING WAS SENT. What follows only names why, strongest first.
+    HOST="${TARGET#*@}"
+    FIX="The deposit key's line in ~${TARGET%@*}/.ssh/authorized_keys on $HOST was placed without its command= prefix (the bare public key, or a line that forces something else), so this key opens that account where it may run one receiver command. REMOVE THAT LINE NOW, then place it whole: $FORCED <the deposit key's public half>. No kubeconfig byte was sent."
+    # Text that is not the greeting is not the receiver: it prints nothing
+    # before that line, and sshd shows no login message under a forced
+    # command. Quoted for the record — printable bytes, a bounded length.
+    if [ -n "$FIRST" ]; then
+        SAID="$(printf '%s' "$FIRST" | LC_ALL=C tr -c '[:print:]' '?' | cut -c1-120)"
+        unconfined "this key reaches a shell on $HOST: the far side accepted the key and answered with its own text ('$SAID') where the receiver's first line was expected. $FIX"
+    fi
+    # ONE late line that is the greeting is a slow host, not a finding.
+    LATE=""
+    IFS= read -r LATE < "$WORK/recv.out" || true
+    if [ "$LATE" = "$GREETING" ]; then
+        refuse "boss-gcp's receiver said it was ready only after the $GREETING_TIMEOUT_S seconds this pass waits for that line (sudo or the host is slow); nothing was sent"
+    fi
+    if [ -s "$WORK/recv.out" ]; then
+        unconfined "this key reaches a shell on $HOST: the far side accepted the key, said nothing for the $GREETING_TIMEOUT_S seconds the receiver's first line is waited for, and then answered with its own text (above). $FIX"
+    fi
+    # NOT AUTHORIZED is ssh's OWN failure (255) with sshd's own refusal of
+    # the key on its `<account>@<host>:` line — not the words anywhere in
+    # stderr, which a receiver failing AFTER the key was accepted can
+    # carry too (the push's review ecd9263a, F3).
+    if [ "$src" -eq 255 ] && grep -Eq '^[^ ]+@[^ ]+: Permission denied \(publickey' "$ERR" && [ -s "$PUB" ]; then
         authorize "$PUB"
         stop "boss-gcp does not accept this deposit key yet (ssh exit $src): $(why)"
+    fi
+    if [ "$src" -eq 124 ] || [ "$src" -eq 137 ]; then
+        refuse "the deposit to $TARGET did not finish inside $SHIP_TIMEOUT_S seconds and was stopped before the far side had said anything; nothing was sent"
+    fi
+    if [ "$src" -eq 65 ] && grep -Fq 'ops-credential-recv: REFUSED — an empty deposit' "$ERR"; then
+        refuse "boss-gcp's receiver does not speak first, so nothing was sent to it: its converge has not installed this tree's ops-credential-recv (infra/gcp/install-ops-credential-receiver.sh) — owed on its next thirty-minute tick, or failed if this is not the day this Job and that receiver landed; boss-gcp holds the kubeconfig it held"
+    fi
+    # Accepted, silent, and a clean end on an empty stream: the receiver
+    # never ends cleanly on one. A shell does.
+    if [ "$src" -eq 0 ]; then
+        unconfined "this key reaches a shell on $HOST: the far side accepted the key, said nothing for the $GREETING_TIMEOUT_S seconds the receiver's first line is waited for, and ended cleanly when the stream closed with nothing in it, which the receiver never does. $FIX"
+    fi
+    refuse "the deposit to $TARGET failed (ssh exit $src) before the receiver said it was ready: $(why); nothing was sent"
+fi
+if [ "$src" -ne 0 ]; then
+    # The receiver was ready, was sent the kubeconfig, and did not end
+    # cleanly: its own refusal, or the transfer's bound.
+    if [ "$src" -eq 124 ] || [ "$src" -eq 137 ]; then
+        refuse "the deposit to $TARGET did not finish inside $SHIP_TIMEOUT_S seconds and was stopped; boss-gcp holds whatever it held"
     fi
     refuse "the deposit to $TARGET failed (ssh exit $src): $(why)"
 fi

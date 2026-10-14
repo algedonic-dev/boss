@@ -35,11 +35,10 @@
 //!   counted and named in the time section rather than silently folded
 //!   into the orphan number, because their invisibility has a different
 //!   cause and a different fix.
-//! - **Steps.** The handler fetches steps only when
-//!   `predicate.needs_steps()` and passes an empty slice otherwise;
-//!   `matches` ignores `steps` unless its `step` clause is set, so
-//!   always passing the real steps (which `/api/jobs` already embeds)
-//!   is observationally identical.
+//! - **Steps.** Like the station reader, resolve the embedded steps'
+//!   agent blocks against the active Workflow rows in memory. The
+//!   shared resolver preserves pinned evidence and audience contracts;
+//!   raw steps would miss packets admitted before their agent block.
 //!
 //! One honest difference: the queue handler scopes packets to the
 //! CALLER's policy predicate. The census reads as an operator, so it
@@ -553,7 +552,7 @@ struct Api {
 impl Api {
     fn new(base: String) -> Result<Self> {
         Ok(Self {
-            client: crate::gate::machine_client()?,
+            client: crate::sor_client::machine_client()?,
             base,
             calls: 0,
         })
@@ -571,7 +570,7 @@ impl Api {
 }
 
 /// One GET, uncounted — [`Api`] counts around it, and a paged read that
-/// borrows the client (the car list, via `gate::all_cars_via`) counts
+/// borrows the client (the car list, via `crate::sor_client::all_cars_via`) counts
 /// its own pages and adds them to [`Api::calls`].
 async fn get_raw_at(
     client: &boss_core::machine_token::Client,
@@ -663,8 +662,8 @@ async fn collect(opts: Options, now: DateTime<Utc>) -> Result<Census> {
     // rather than silently reading boss-gcp's second, older stack at
     // 127.0.0.1 and reporting conservation/orphan findings about the
     // wrong deployment (packet aa783636). Shared with every read verb
-    // via gate::resolve_jobs_base.
-    let base = crate::gate::resolve_jobs_base(opts.jobs_url.as_deref())?;
+    // via crate::sor_client::resolve_jobs_base.
+    let base = crate::sor_client::resolve_jobs_base(opts.jobs_url.as_deref())?;
     let base = base.trim_end_matches('/').to_string();
     let mut api = Api::new(base.clone())?;
     let mut notes: Vec<String> = Vec::new();
@@ -762,12 +761,29 @@ async fn collect(opts: Options, now: DateTime<Utc>) -> Result<Census> {
     }
 
     // --- conservation over space ----------------------------------
+    let workflows_body = api.get("/api/workflows").await?;
+    let active: BTreeMap<String, boss_jobs::registry::WorkflowSpec> =
+        rows(&workflows_body, "GET /api/workflows")?
+            .into_iter()
+            .map(|row| {
+                serde_json::from_value::<boss_jobs::registry::WorkflowSpec>(row)
+                    .context("GET /api/workflows answered an unreadable Workflow row")
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|row| row.status == WorkflowStatus::Active)
+            .map(|row| (row.kind.clone(), row))
+            .collect();
     let mut matches: BTreeMap<usize, usize> = BTreeMap::new();
     let mut depth: BTreeMap<&str, usize> =
         stations.iter().map(|s| (s.name.as_str(), 0usize)).collect();
     let mut orphans: Vec<OrphanRow> = Vec::new();
     for p in &packets {
-        let hits = matching_stations(p, &stations);
+        let resolved = Packet {
+            job: p.job.clone(),
+            steps: boss_jobs::agent_spec::resolved_steps(&p.steps, active.get(&p.job.kind)),
+        };
+        let hits = matching_stations(&resolved, &stations);
         *matches.entry(hits.len()).or_insert(0) += 1;
         for name in &hits {
             *depth.entry(name).or_insert(0) += 1;
@@ -917,7 +933,7 @@ async fn collect(opts: Options, now: DateTime<Utc>) -> Result<Census> {
     let pages = std::sync::atomic::AtomicUsize::new(0);
     let car_read = {
         let (client, base, pages) = (&api.client, api.base.as_str(), &pages);
-        crate::gate::all_cars_via(|path| async move {
+        crate::sor_client::all_cars_via(|path| async move {
             pages.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             get_at(client, base, &path).await.map(Some)
         })
@@ -2425,13 +2441,13 @@ mod tests {
     /// set it read the SECOND, older stack and reported conservation and
     /// orphan findings about the wrong deployment — then exited 0
     /// (packet aa783636). It now resolves through
-    /// `gate::resolve_jobs_base(opts.jobs_url)`, which refuses when
+    /// `crate::sor_client::resolve_jobs_base(opts.jobs_url)`, which refuses when
     /// neither the flag nor the env names an instance and points at the
     /// system of record. `a_full_census_...` covers the flag path
     /// end-to-end; this pins the refusal the census wires in.
     #[test]
     fn without_an_instance_the_census_refuses_and_names_the_record() {
-        let m = crate::gate::resolve_jobs_base_from(None, None)
+        let m = crate::sor_client::resolve_jobs_base_from(None, None)
             .expect_err("no --jobs-url and no BOSS_JOBS_URL must refuse, not default")
             .to_string();
         assert!(
@@ -2452,6 +2468,126 @@ mod tests {
             max_scan: 20000,
             jobs_url: Some(base.to_string()),
         }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_active_registry_refuses_the_census() {
+        for (code, workflows) in [
+            (403, json!({"error":"denied"})),
+            (503, json!({"error":"unavailable"})),
+            (200, json!({"data":[{"kind":"backlog-item"}]})),
+            (200, json!({"error":"not a registry"})),
+        ] {
+            let handler: Handler = Arc::new(move |target| {
+                if target == "/api/workflows" {
+                    (code, workflows.clone())
+                } else if target.starts_with("/api/jobs/summary") {
+                    (200, json!({"counts":{},"total":0}))
+                } else {
+                    (200, envelope(vec![]))
+                }
+            });
+            let (base, _) = spawn_stub(handler).await;
+            let error = match collect(opts(&base), at(13, 18)).await {
+                Err(error) => error,
+                Ok(_) => panic!("an unreadable registry must refuse the census"),
+            };
+            assert!(error.to_string().contains("/api/workflows"), "{error:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_census_counts_a_packet_pinned_before_its_agent_block() {
+        use boss_jobs::agent_spec::{AgentSpec, Effort};
+        use boss_jobs::registry::{StepSpec, WorkflowSpec};
+        let active = WorkflowSpec::platform_seed(
+            "backlog-item",
+            "Backlog",
+            "it",
+            vec!["custom".into()],
+            vec![StepSpec {
+                title: "build".into(),
+                kind: "task".into(),
+                ready_when: "true".into(),
+                authority_role: Some("platform-admin".into()),
+                agent: Some(AgentSpec {
+                    executor_provenance: Default::default(),
+                    profile: "builder".into(),
+                    model: "opus-5[1m]".into(),
+                    budget_usd: 5.0,
+                    effort: Effort::High,
+                }),
+                ..Default::default()
+            }],
+        );
+        let queue = station(
+            "builders",
+            StationPredicate {
+                kind: Some("backlog-item".into()),
+                step: Some(StepMatch {
+                    slug: Some("build".into()),
+                    status_in: vec![StepStatus::Ready],
+                    metadata_equals: BTreeMap::from([
+                        ("agent_model".into(), "opus-5[1m]".into()),
+                        ("authority_role".into(), "platform-admin".into()),
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let mut old = step("build", StepStatus::Ready);
+        old.metadata = json!({"authority_role":"platform-admin"});
+        assert!(old.metadata.get("agent_model").is_none());
+        let source = job("backlog-item", 1);
+        let mut mismatch = old.clone();
+        mismatch.fields = serde_json::from_value(json!([
+            {"name":"new-evidence","field_type":"text","required":true}
+        ]))
+        .unwrap();
+        let explicit = boss_jobs::agent_spec::resolved(&old, Some(&active));
+        let mut done = old.clone();
+        done.status = StepStatus::Completed;
+        let open = envelope(vec![
+            row(&source, vec![old.clone()]),
+            row(&job("backlog-item", 2), vec![mismatch]),
+            row(&job("backlog-item", 3), vec![explicit]),
+            row(&job("backlog-item", 4), vec![done]),
+        ]);
+        let stations = envelope(vec![serde_json::to_value(queue).unwrap()]);
+        let workflows = serde_json::to_value(vec![active]).unwrap();
+        let handler: Handler = Arc::new(move |target| {
+            let body = if target == "/api/stations" {
+                stations.clone()
+            } else if target == "/api/workflows" {
+                workflows.clone()
+            } else if target.starts_with("/api/jobs/summary") {
+                if target.contains("status=open") {
+                    json!({"counts":{"backlog-item":4},"total":4})
+                } else {
+                    json!({"counts":{},"total":0})
+                }
+            } else if target == "/api/jobs/job-edges" {
+                json!([])
+            } else if target.starts_with("/api/jobs?") {
+                open.clone()
+            } else {
+                return (404, json!({"error":"not found"}));
+            };
+            (200, body)
+        });
+        let (base, _) = spawn_stub(handler).await;
+        let census = collect(opts(&base), at(13, 18)).await.unwrap();
+        assert_eq!(census.conservation_over_space.station_depth[0].packets, 2);
+        assert_eq!(
+            census.conservation_over_space.orphans.len(),
+            2,
+            "a different contract and completed work remain outside the ready queue"
+        );
+        assert!(
+            old.metadata.get("agent_model").is_none(),
+            "resolution writes nothing"
+        );
     }
 
     #[tokio::test]
@@ -2492,6 +2628,8 @@ mod tests {
         let handler: Handler = Arc::new(move |target: &str| {
             let body = if target == "/api/stations" {
                 stations_body.clone()
+            } else if target == "/api/workflows" {
+                json!([])
             } else if target.starts_with("/api/jobs/summary") {
                 if target.contains("status=open") {
                     json!({"counts": {"ship-a-change": 2, "user-feedback": 1}, "total": 3})
@@ -2579,6 +2717,8 @@ mod tests {
         let handler: Handler = Arc::new(move |target: &str| {
             if target == "/api/stations" {
                 (200, envelope(vec![]))
+            } else if target == "/api/workflows" {
+                (200, json!([]))
             } else if target.starts_with("/api/jobs/summary") {
                 (200, json!({"counts": {}, "total": 0}))
             } else if target == "/api/jobs/job-edges" {
@@ -2625,6 +2765,8 @@ mod tests {
         let handler: Handler = Arc::new(move |target: &str| {
             if target == "/api/stations" {
                 (200, envelope(vec![]))
+            } else if target == "/api/workflows" {
+                (200, json!([]))
             } else if target.starts_with("/api/jobs/summary") {
                 (200, json!({"counts": {}, "total": 0}))
             } else if target == "/api/jobs/job-edges" {

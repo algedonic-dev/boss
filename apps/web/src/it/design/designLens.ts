@@ -47,6 +47,8 @@ export type QueuePacket = Readonly<{
   id: string;
   title: string;
   status: string;
+  /** Native job priority. Missing or malformed evidence stays unknown. */
+  priority?: string | null;
   opened_on: string;
   /** Set on a closed packet — the settled rows' date. */
   closed_on?: string | null;
@@ -109,6 +111,7 @@ export type ReviewProgress =
  *  went with it. What a row's review has got to is `progress`. */
 export type ReviewPacket = Readonly<{
   id: string;
+  priority: string | null;
   opened_on: string;
   title: string;
   progress: ReviewProgress;
@@ -226,6 +229,7 @@ export function queueRows(
     const step = reviewStepOf(steps?.[p.id]);
     return {
       id: p.id,
+      priority: text(p.priority),
       opened_on: p.opened_on,
       title: p.title,
       progress: reviewProgress(step),

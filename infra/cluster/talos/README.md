@@ -20,7 +20,10 @@ only in `~/talos-homelab/v2` on a laptop, applied by hand with
   directory (`infra/cluster/manifests/gate-seed-local.yaml`); without
   the bind a pod mounting it sat nine hours at ContainerCreating
   (`d42d4967`). A rebuilt or re-imaged w-1 without these entries hangs
-  every gate, and nothing would have said why.
+  every gate, and nothing would have said why. (The gate left that
+  seed for the gate volume below on 2026-09-30, and the PV was retired
+  on 2026-10-10, `1f13b894`; the directory stays as the daily trim
+  pod's handle on EPHEMERAL.)
 - **w-1, since 2026-09-30** — a second document, a `UserVolumeConfig`
   named `gate`: w-1's second NVMe as one xfs volume Talos mounts at
   `/var/mnt/gate`, chosen by the selector `!system_disk &&
@@ -42,8 +45,17 @@ only in `~/talos-homelab/v2` on a laptop, applied by hand with
 - **cp-1, cp-2, cp-3** — `machine.kubelet.extraConfig` image-GC
   thresholds, one of the levers behind the 2026-09-11 outage of the
   system of record (design `16115a17`).
-- **every node** — `machine.registries.mirrors` for `10.20.0.15:3000`,
-  the forge's registry every image in the cluster is pulled through.
+- **w-2, since 2026-10-09** — the same image-GC pair, 50/40, and nothing
+  else (backlog `666e0570`). Declared to be APPLIED, not as found: w-2
+  had no declaration, and its disk filled with old boss-ci images to
+  Longhorn's 25% floor while the kubelet's default 85% line had never
+  fired. The forge mirror is live there and left undeclared on purpose
+  (it reads `UNDECLARED`): a patch carrying a live entry is refused
+  unless it is idempotent, and whether Talos appends mirror endpoints is
+  unmeasured. The file's own header has the measurement.
+- **every node but w-2** — `machine.registries.mirrors` for
+  `10.20.0.15:3000`, the forge's registry every image in the cluster is
+  pulled through.
 
 The values are each node's live config as David read it on 2026-09-15
 (`talosctl -n <ip> get machineconfig -o yaml`), declared **as found,
@@ -222,8 +234,9 @@ it does and refuses, in order:
   this reader and Talos's YAML read different structure from one text
   (reviews `be5ba8f7`, `5ed37182`, `a7fa61ec`); canonical form closes
   the class, since anything the reader might misread is refused unless
-  it appears in the form it provably parsed. The four declarations here
-  are canonical. In the live config, which Talos emits, content on a
+  it appears in the form it provably parsed. Every declaration here is
+  canonical, and a test holds each node `infra/estate/estate.toml`
+  names with a Talos role to having one. In the live config, which Talos emits, content on a
   `---` line, a non-empty flow collection and lines left after a
   document's root are refused;
 - the check reads a line where Talos does: a declaration or live config

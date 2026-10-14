@@ -188,6 +188,8 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # it sets default to the retired prod store and are not used here.
 # shellcheck source=infra/generation.sh
 . "$SELF_DIR/../generation.sh"
+# shellcheck source=infra/lib/jq.sh
+. "$SELF_DIR/../lib/jq.sh"
 
 SHA="${1:-}"
 case "$SHA" in
@@ -332,6 +334,8 @@ TOKEN=""
 TOKEN_HDR=""
 # shellcheck source=infra/lib/secret-header.sh
 . "$SELF_DIR/../lib/secret-header.sh"
+# shellcheck source=infra/estate/registry-manifest.sh
+. "$SELF_DIR/registry-manifest.sh"
 http_get() { # <url> <out-file> <headers-file> <accept|""> -> prints the http code; 0 iff curl ran
     local url="$1" out="$2" hdrs="$3" accept="${4:-}"
     local left=$((DEADLINE - SECONDS))
@@ -423,75 +427,8 @@ else
     DEADLINE=$((SECONDS + PULL_TIMEOUT))
     say "pulling $MEMBER out of $IMAGE for $SHA (platform $PLATFORM, timeout ${PULL_TIMEOUT}s)"
 
-    # 1. The token. The registry answers /v2/ with the realm and service
-    #    of its token endpoint; asking that endpoint for a pull scope
-    #    with NO credentials returns a token for a public package.
-    url="$REGISTRY_URL/v2/"
-    code="$(http_get "$url" "$pull/ping.body" "$pull/ping.hdr")"; rc=$?
-    case "$rc:$code" in
-        0:200) say "$url answered 200 without a token; pulling anonymously" ;;
-        0:401)
-            # Drained whole, first line taken in the shell (an early-
-            # exiting reader under pipefail is the SIGPIPE coin-flip).
-            auth="$(tr -d '\r' <"$pull/ping.hdr" | sed -n 's/^[Ww][Ww][Ww]-[Aa]uthenticate: *//p')"
-            auth="${auth%%$'\n'*}"
-            realm="$(printf '%s' "$auth" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')"
-            service="$(printf '%s' "$auth" | sed -n 's/.*service="\([^"]*\)".*/\1/p')"
-            [ -n "$realm" ] || refuse_http "the registry's 401 names no token realm" "$url" "$code" 0 "$pull/ping.body" "Www-Authenticate was '$auth'"
-            turl="$realm?service=$service&scope=repository:$REPO_PATH:pull"
-            code="$(http_get "$turl" "$pull/token.json" "$pull/token.hdr")"; rc=$?
-            [ "$rc" -eq 0 ] && [ "$code" = 200 ] \
-                || refuse_http "the anonymous pull token for $IMAGE_REPO could not be fetched" "$turl" "$code" "$rc" "$pull/token.json" "the forge package $REPO_PATH is public and its token endpoint hands out a pull token with no credentials (verified from the pod 2026-09-16); a non-200 here is the forge or the LAN, not this host. Nothing was installed; $LINK is whatever the previous converge confirmed."
-            TOKEN="$(jq -r '.token // .access_token // empty' "$pull/token.json")"
-            [ -n "$TOKEN" ] || refuse_http "the token endpoint answered 200 without a token" "$turl" "$code" 0 "$pull/token.json" "expected {\"token\": …}"
-            secret_header TOKEN_HDR "Authorization: Bearer $TOKEN" \
-                || refuse "failed: the pull token's header file could not be written" "infra/lib/secret-header.sh could not make its private directory; the token is never sent in curl's command line"
-            ;;
-        *) refuse_http "the registry did not answer" "$url" "$code" "$rc" "$pull/ping.body" "the forge registry at $REGISTRY_URL is unreachable from this host, or answered something other than 200/401. Nothing was installed; $LINK is whatever the previous converge confirmed." ;;
-    esac
-
-    # 2. The tag's manifest — an index (one manifest per platform, plus
-    #    buildx's attestation) or, for a single-platform push, the
-    #    manifest itself.
-    accept='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json'
-    murl="$REGISTRY_URL/v2/$REPO_PATH/manifests/$TAG"
-    code="$(http_get "$murl" "$pull/tag.json" "$pull/tag.hdr" "$accept")"; rc=$?
-    if [ "$rc" -eq 0 ] && [ "$code" = 404 ]; then
-        # The registry answered, and has no such tag: the deploy runner
-        # has not built the image for this commit yet. The body is
-        # printed whole like any other answer; the verdict is a wait.
-        echo "$NAME: no image $IMAGE yet — $murl answered HTTP 404; the body in full:" >&2
-        sed 's/^/    body: /' "$pull/tag.json" >&2
-        refuse "not yet: no image $IMAGE — HTTP 404 from $murl" "the tag is the deploy runner's short sha of the train that landed (cluster-deploy-runner.sh), and it builds the image a few minutes after each train; the next converge tick retries. Nothing was installed; $LINK is whatever the previous converge confirmed."
-    fi
-    if [ "$rc" -ne 0 ] || [ "$code" != 200 ]; then
-        hint="the tag is the deploy runner's short sha of the train that landed (cluster-deploy-runner.sh); a 404 is answered above as not yet, so this is the forge or the LAN. Nothing was installed; $LINK is whatever the previous converge confirmed."
-        refuse_http "no image $IMAGE" "$murl" "$code" "$rc" "$pull/tag.json" "$hint"
-    fi
-    kind="$(jq -r '.mediaType // empty' "$pull/tag.json")"
-    if [ -z "$kind" ]; then
-        kind="$(tr -d '\r' <"$pull/tag.hdr" | sed -n 's/^[Cc]ontent-[Tt]ype: *//p')"
-        kind="${kind%%$'\n'*}"
-    fi
-    case "$kind" in
-        application/vnd.oci.image.index.v1+json|application/vnd.docker.distribution.manifest.list.v2+json)
-            arch="${PLATFORM%%/*}"; os="${PLATFORM#*/}"
-            mdigest="$(jq -r --arg a "$arch" --arg o "$os" '[.manifests[] | select(.platform.architecture == $a and .platform.os == $o)] | .[0].digest // empty' "$pull/tag.json")"
-            [ -n "$mdigest" ] || { echo "$NAME: the index at $murl lists no $PLATFORM manifest; the index in full:" >&2; sed 's/^/    index: /' "$pull/tag.json" >&2; refuse "refused: $IMAGE has no $PLATFORM manifest" "the platforms it lists are: $(jq -r '[.manifests[].platform | "\(.architecture)/\(.os)"] | join(", ")' "$pull/tag.json")"; }
-            durl="$REGISTRY_URL/v2/$REPO_PATH/manifests/$mdigest"
-            code="$(http_get "$durl" "$pull/manifest.json" "$pull/manifest.hdr" 'application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json')"; rc=$?
-            [ "$rc" -eq 0 ] && [ "$code" = 200 ] \
-                || refuse_http "the $PLATFORM manifest of $IMAGE could not be fetched" "$durl" "$code" "$rc" "$pull/manifest.json" "the index at $murl named it"
-            got="$(digest_of "$pull/manifest.json")" \
-                || refuse "not yet: the $PLATFORM manifest of $IMAGE arrived with no bytes" "$durl answered HTTP $code and left nothing to hash, so this is not a digest mismatch — no bytes arrived. The condition is usually transient; retry before investigating the registry."
-            [ "$got" = "$mdigest" ] \
-                || refuse "refused: manifest digest mismatch for $IMAGE" "the index at $murl names $mdigest for the $PLATFORM manifest and the bytes fetched from $durl hash to $got; nothing from this image is trusted."
-            ;;
-        application/vnd.oci.image.manifest.v1+json|application/vnd.docker.distribution.manifest.v2+json)
-            mv -f "$pull/tag.json" "$pull/manifest.json"
-            ;;
-        *) refuse_http "the manifest of $IMAGE has an unknown media type '$kind'" "$murl" "$code" 0 "$pull/tag.json" "this script reads OCI indexes/manifests and docker v2 manifests/lists" ;;
-    esac
+    registry_manifest "$IMAGE_REPO" "$TAG" "$pull" no
+    TOKEN_HDR="$(cat "$pull/header-path")"
     nlayers="$(jq -r '.layers | length' "$pull/manifest.json" 2>/dev/null)"
     case "${nlayers:-empty}" in empty|0|*[!0-9]*) refuse "refused: the manifest of $IMAGE lists no layers" "manifest at $pull/manifest.json: $(head -c 400 "$pull/manifest.json")" ;; esac
 
@@ -511,13 +448,7 @@ else
         esac
         burl="$REGISTRY_URL/v2/$REPO_PATH/blobs/$ldigest"
         blob="$pull/layer.blob"
-        code="$(http_get "$burl" "$blob" "$pull/layer.hdr")"; rc=$?
-        [ "$rc" -eq 0 ] && [ "$code" = 200 ] \
-            || refuse_http "layer $i of $IMAGE ($lsize bytes) could not be fetched" "$burl" "$code" "$rc" "$blob" "the manifest names it; nothing was installed."
-        got="$(digest_of "$blob")" \
-            || refuse "not yet: layer $i of $IMAGE arrived with no bytes" "$burl answered HTTP $code for a layer the manifest says is $lsize bytes, and left nothing to hash, so this is not a digest mismatch — no bytes arrived. The condition is usually transient; retry before investigating the registry."
-        [ "$got" = "$ldigest" ] \
-            || refuse "refused: blob digest mismatch on layer $i of $IMAGE" "the manifest names $ldigest ($lsize bytes) and the $(stat -c %s "$blob" 2>/dev/null || wc -c <"$blob") bytes fetched from $burl hash to $got; nothing from this image is trusted and nothing was installed."
+        registry_blob "$IMAGE_REPO" "$ldigest" "$lsize" "$blob" "$TOKEN_HDR"
         # The member list, whole, then read in the shell: an early-exiting
         # grep on a 230 MB tar listing is the SIGPIPE coin-flip.
         if ! tar -tzf "$blob" >"$pull/layer.list" 2>"$pull/layer.err"; then
@@ -527,7 +458,9 @@ else
         # BEFORE the CLI's check below, which ends the walk and removes
         # the pull. A problem with it is recorded, never refused.
         # The optional controller is DATA beside this exact CLI image.
-        # It is never unpacked, executed or activated by this installer.
+        # It is never unpacked or activated by this installer; only a
+        # selector the operator already created makes the end of this
+        # script run the bootstrap (dev isolation follows main, below).
         # Topmost mention wins, including directory whiteouts.
         if [ -z "$bootstrap" ]; then
             if grep -qx -- "$BOOTSTRAP_MEMBER" "$pull/layer.list"; then
@@ -635,6 +568,72 @@ else
     action="installed"
 fi
 
+# D3 inputs are DATA from the same validated published archive, not
+# caller environment or the currently running Pod. A legacy image may
+# install its CLI without this preparation; it cannot supply D3 proof.
+# Every new generation resolves once. Later ticks validate the retained
+# binding without consulting mutable tags or rewriting its config.
+control_config() {
+    local generation="$STORE/$SHA" inputs worker postgres field ref repo tag digest temporary observations record
+    local listing="$generation/control-members.txt"
+    if ! tar -tf "$generation/dev-control.tar" > "$listing" 2>/dev/null || ! grep -Fxq 'infra/dev/control-images.json' "$listing"; then
+        say 'dev-control config: unavailable — this generation has no published image inputs'
+        run_summary_field cli_dev_control_config 'unavailable: generation has no published image inputs'
+        return 0
+    fi
+    inputs="$generation/control-inputs.json"
+    temporary="$(mktemp "$generation/.inputs.XXXXXX")" || refuse 'failed: cannot retain control inputs' "$generation"
+    "$generation/dev-control" config-inputs "$SHA" --cli-store "$STORE" > "$temporary" || refuse 'refused: published control inputs failed validation' "$generation"
+    jq_doc_file "$temporary" &&
+    jq -e --arg sha "$SHA" '.commit == $sha and (.source_sha256 | type == "object") and (.worker_image | type == "string") and (.postgres_image | type == "string") and (.forge_url | type == "string")' "$temporary" >/dev/null || refuse 'refused: malformed published control inputs' "$generation"
+    if [ -e "$generation/config.json" ] || [ -L "$generation/config.json" ]; then
+        for record in "$generation/config.json" "$generation/config-source.json"; do
+            [ -f "$record" ] && [ ! -L "$record" ] &&
+            [ "$(stat -c %u "$record")" = "$(id -u)" ] &&
+            [ "$(stat -c %a "$record")" = 600 ] &&
+            [ "$(stat -c %s "$record")" -le 65536 ] \
+                || refuse 'refused: unsafe immutable controller configuration' "$record must be private, owned, regular and bounded"
+        done
+        [ -f "$generation/config.json" ] && [ ! -L "$generation/config.json" ] &&
+        [ -f "$generation/config-source.json" ] && [ ! -L "$generation/config-source.json" ] &&
+        jq_doc_file "$generation/config.json" && jq_doc_file "$generation/config-source.json" && jq_doc_file "$temporary" &&
+        jq -e -s --slurpfile inputs "$temporary" --arg p "$PLATFORM" '
+          length == 2 and .[1].inputs == $inputs[0] and .[1].platform == $p and
+          .[0] == (.[1].resolved + {forge_url:$inputs[0].forge_url}) and
+          (.[0] | keys == ["forge_url","postgres_image","worker_image"])
+        ' "$generation/config.json" "$generation/config-source.json" >/dev/null || refuse 'refused: immutable controller configuration binding changed' "$generation"
+        rm -f "$temporary"
+        run_summary_field cli_dev_control_config 'verified: immutable generation configuration'
+        return 0
+    fi
+    if [ -e "$generation/config-source.json" ] || [ -L "$generation/config-source.json" ]; then
+        refuse 'refused: incomplete immutable controller configuration' 'a retained binding without its config cannot be resolved again from mutable tags'
+    fi
+    mkdir -p "$generation/control-manifests" || refuse 'failed: cannot retain image observations' "$generation"
+    observations="$(mktemp -d "$generation/control-manifests/attempt.XXXXXX")" || refuse 'failed: cannot retain image attempt' "$generation"
+    mv -T "$temporary" "$observations/inputs.json" || refuse 'failed: cannot retain published control inputs' "$generation"
+    inputs="$observations/inputs.json"
+    [ "$DEADLINE" -ne 0 ] || DEADLINE=$((SECONDS + PULL_TIMEOUT))
+    for field in worker_image postgres_image; do
+        ref="$(jq -r --arg f "$field" '.[$f]' "$inputs")"
+        repo="${ref%:*}"; tag="${ref##*:}"
+        registry_manifest "$repo" "$tag" "$observations/$field" yes
+        digest="$(cat "$observations/$field/digest")"
+        if [ "$field" = worker_image ]; then worker="$repo@$digest"; else postgres="$repo@$digest"; fi
+    done
+    temporary="$(mktemp "$generation/.config-source.XXXXXX")" || refuse 'failed: cannot stage configuration binding' "$generation"
+    jq -n --slurpfile inputs "$inputs" --arg p "$PLATFORM" --arg w "$worker" --arg d "$postgres" --arg observations "${observations#"$generation/"}" '{inputs:$inputs[0],platform:$p,observations:$observations,resolved:{worker_image:$w,postgres_image:$d}}' > "$temporary" || refuse 'failed: cannot write configuration binding' "$generation"
+    mv -T "$temporary" "$generation/config-source.json" || refuse 'failed: cannot publish configuration binding' "$generation"
+    temporary="$(mktemp "$generation/.config.XXXXXX")" || refuse 'failed: cannot stage configuration' "$generation"
+    jq '.resolved + {forge_url:.inputs.forge_url}' "$generation/config-source.json" > "$temporary" || refuse 'failed: cannot write configuration' "$generation"
+    mv -T "$temporary" "$generation/config.json" || refuse 'failed: cannot publish configuration' "$generation"
+    say "dev-control config: resolved $PLATFORM images for immutable generation $SHA"
+    run_summary_field cli_dev_control_config 'resolved: immutable generation configuration'
+}
+if [ -f "$STORE/$SHA/dev-control.tar" ] && [ ! -L "$STORE/$SHA/dev-control.tar" ]; then
+    control_config
+fi
+
 # --- flip, link, and confirm through the host's own path --------------------
 if [ "$prev" != "$SHA" ]; then
     gen_atomic_link "$SHA" "$STORE/current"
@@ -681,6 +680,109 @@ else
     control="${control:-absent: this verified image generation carries no controller artifact}"
 fi
 run_summary_field cli_dev_control "$control"
+
+# --- dev isolation follows main (design a68fc42a D6 and D1) -----------------
+# David's answers, 2026-10-10 (backlog b3071bf4). The dev isolation store
+# and its one selector live on the /work PVC, so a pod roll keeps them,
+# and THIS pass keeps them current: where a selector already exists, the
+# generation just confirmed re-activates through its OWN bootstrap,
+# which validates its archive before running a byte of it. Without a
+# selector nothing runs — activating is the operator's act, and every
+# host but the dev pod has no store at all.
+#
+# A re-activation that fails leaves the selector REFUSED (D1): the doors
+# and the CLI's child forwarding then refuse candidate execution with
+# exit 75, naming the log below, while boss-api and the published CLI
+# keep answering. Failing open would run candidate code beside the token
+# until somebody noticed; the reclaim pass alarms on a refused selector
+# every hour, so the refusal is never silent. The CLI install itself is
+# still confirmed — this verdict rides beside it, not instead of it.
+DEV_CONTROL="${BOSS_DEV_CONTROL_STORE:-/work/tools/dev-control}"
+if [ -L "$DEV_CONTROL/enabled" ] || [ -e "$DEV_CONTROL/enabled" ]; then
+    activation_out="$(mktemp "${TMPDIR:-/tmp}/install-cli-dev-control.XXXXXX")"
+    activation_rc=0
+    if [ -f "$STORE/$SHA/dev-control" ] && [ ! -L "$STORE/$SHA/dev-control" ]; then
+        "$STORE/$SHA/dev-control" activate "$SHA" --cli-store "$STORE" --store "$DEV_CONTROL" --reactivate \
+            >"$activation_out" 2>&1 || activation_rc=$?
+    else
+        echo "the generation $STORE/$SHA carries no dev-control bootstrap ($control), so nothing can re-establish the selector from it" >"$activation_out"
+        activation_rc="no bootstrap"
+    fi
+    refusing="$DEV_CONTROL/.enabled-refusing.$$"
+    # Rollback is the published deactivate door, never bare rm. It
+    # holds the same lock as activation. Re-judge AFTER taking it:
+    # a result observed earlier cannot resurrect a completed off or
+    # report re-activation after follow-main returned inert.
+    control_lock="$DEV_CONTROL/.activation.lock"
+    if [ -f "$control_lock" ] && [ ! -L "$control_lock" ] &&
+       exec 8<"$control_lock" && flock -w "$LOCK_WAIT" 8; then
+        # Presence alone is not off intent (review cd351532): an
+        # empty record left the old selector live while this pass
+        # claimed it was absent. Match the published reader's owned,
+        # private regular document and exact state. Finish an off
+        # interrupted between recording intent and removing enabled,
+        # under this same lock, before observing its completion.
+        off_present=0
+        off_valid=0
+        if [ -e "$DEV_CONTROL/off.json" ] || [ -L "$DEV_CONTROL/off.json" ]; then
+            off_present=1
+            off_mode=$(stat -c %a "$DEV_CONTROL/off.json" 2>/dev/null || true)
+            if [ -f "$DEV_CONTROL/off.json" ] && [ ! -L "$DEV_CONTROL/off.json" ] &&
+               [ "$(stat -c %u "$DEV_CONTROL/off.json" 2>/dev/null)" = "$(id -u)" ] &&
+               [ "${off_mode: -2}" = 00 ] &&
+               jq_doc_file "$DEV_CONTROL/off.json" &&
+               jq -e -s 'length == 1 and .[0] == {state:"off"}' "$DEV_CONTROL/off.json" >/dev/null 2>&1; then
+                off_valid=1
+            fi
+            if [ "$off_valid" = 0 ]; then
+                echo "invalid controller off intent at $DEV_CONTROL/off.json: expected an owned private regular document containing only state=off" >>"$activation_out"
+            fi
+        fi
+        off_completed=0
+        if [ "$off_valid" = 1 ]; then
+            if rm -f -- "$DEV_CONTROL/enabled" &&
+               [ ! -e "$DEV_CONTROL/enabled" ] && [ ! -L "$DEV_CONTROL/enabled" ]; then
+                off_completed=1
+            fi
+        elif [ "$off_present" = 0 ] &&
+             [ ! -e "$DEV_CONTROL/enabled" ] && [ ! -L "$DEV_CONTROL/enabled" ]; then
+            off_completed=1
+        fi
+        if [ "$off_completed" = 1 ]; then
+            if [ "$off_valid" = 1 ]; then
+                activation="off: rollback completed after bootstrap (exit $activation_rc); selector observed absent"
+            else
+                activation="inert: selector observed absent after bootstrap (exit $activation_rc); no off intent recorded"
+            fi
+        elif [ "$activation_rc" = 0 ] && [ "$off_present" = 0 ]; then
+            activation="re-activated at $SHA"
+        elif ln -sfn refused "$refusing" && mv -Tf "$refusing" "$DEV_CONTROL/enabled"; then
+            activation="REFUSED: re-activation at ${SHA:0:8} could not establish valid on/off state (bootstrap exit $activation_rc), so $DEV_CONTROL/enabled now refuses candidate execution; the bootstrap's whole output is in $DEV_CONTROL/activation.log"
+        else
+            rm -f "$refusing"
+            activation="REFUSED BUT NOT WRITTEN: re-activation at ${SHA:0:8} could not establish valid on/off state (bootstrap exit $activation_rc) and the refused selector could not be written over $DEV_CONTROL/enabled; see $DEV_CONTROL/activation.log"
+        fi
+        flock -u 8
+        exec 8<&-
+    else
+        activation="REFUSED BUT NOT WRITTEN: re-activation is unproven (bootstrap exit $activation_rc), because its transition lock could not be acquired; selector unchanged; see $DEV_CONTROL/activation.log"
+    fi
+    # The log keeps every pass's whole output (CLAUDE.md §Diagnosis: no
+    # tail, no digest); one previous file is kept when it passes 1 MiB.
+    if [ "$(stat -c %s "$DEV_CONTROL/activation.log" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+        mv -f "$DEV_CONTROL/activation.log" "$DEV_CONTROL/activation.log.1"
+    fi
+    {
+        printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SHA" "$activation"
+        sed 's/^/    /' "$activation_out"
+    } >> "$DEV_CONTROL/activation.log"
+    say "dev-control: $activation"
+    sed 's/^/    dev-control: /' "$activation_out"
+    rm -f "$activation_out"
+else
+    activation="inert: no selector at $DEV_CONTROL/enabled — dev isolation was never activated here, and an install never activates it"
+fi
+run_summary_field cli_dev_control_activation "$activation"
 run_summary_field cli_result ok
 run_summary_field cli_action "$action"
 say "CONFIRMED — $LINK is the tree's CLI at ${SHA:0:8} ($action, image $IMAGE): $line"

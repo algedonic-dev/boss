@@ -21,9 +21,10 @@ export type Account = {
 
 export type Asset = {
   asset_id: string;
-  sku: string;
+  sku: string | null;
   phase: string;
-  account_id: string | null;
+  holder_kind: string | null;
+  holder_id: string | null;
   warranty_through: string | null;
   open_ticket_count: number;
   first_seen: string;

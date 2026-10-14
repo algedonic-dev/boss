@@ -150,7 +150,7 @@ const ALSO_BROKEN: ReadonlyMap<string, ReadonlyArray<RegExp>> = new Map([
 /// stand in for the page's — measured: with the marker class stripped
 /// from MePage, InboxPage and MyCalendarPage, the first test names
 /// exactly these four routes and no other.
-const SIGNED_IN: ReadonlySet<string> = new Set(['/ux/views', '/', '/ux/me', '/ux/inbox', '/ux/calendar/me']);
+const SIGNED_IN: ReadonlySet<string> = new Set([ '/', '/ux/me', '/ux/inbox', '/ux/calendar/me']);
 const SIGNED_IN_PROBE = { username: 'ceo', employee_id: 'emp-001', role: 'ceo' };
 
 /// How late a route's OWN read is issued — the manual-page fix's figure

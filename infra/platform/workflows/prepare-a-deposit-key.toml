@@ -1,12 +1,33 @@
 # Source preparation for 1e50e66b. Publication and receiver enrollment
 # are separate recorded operations; shipping this row authorizes neither.
+#
+# THE RUNNER DEPOSIT KEY'S PROTOCOL, v2 (item 3dc0b247). v1 declared the
+# broker's proposal — public_key, receiver_host, purpose — EXECUTOR-filled
+# on the human-only `enroll` step, where a machine may write only context
+# or a filer-filled field (boss-jobs human_only.rs), so the broker's own
+# rule was refused 403 after it had minted the pair: `issue` stayed ready
+# and the person's step never opened. v1 never ran (zero packets). The
+# repair is the one prepare-the-machine-token-deposit-key carries, for
+# the same reasons, written beside each declaration there and not
+# restated here: issue/install declare `public_key` so `written_by`
+# reserves it; `enroll` names the same writer, takes its proposal as
+# filer-filled fields that are not owed at filing, declares the two
+# context keys so no other machine can put text above the procedure, and
+# declares NO bare `public_key` — a step whose signer places a line shows
+# the line, and the key to compare it with is on the completed `install`
+# (item dea2236f, packet 96a0f7bb). The two kinds now differ only in the
+# rule each names and in what the procedure sends the signer to check;
+# platform_bundle_prepare_a_deposit_key.rs holds them equal in every
+# other contract. The live v1 reaches v2 through the drift publish (a
+# tree-ahead kind; it declares no field `writer` and no step `executor`,
+# so no workflow hold applies).
 [[workflow]]
 kind = "prepare-a-deposit-key"
 label = "Prepare a deposit transport key"
 category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
-description = "A human scopes one declared SSH transport credential. The broker prepares its pair in its named Secret and puts only the public proposal on the enrollment step. A human separately authorizes the exact receiver, public key and purpose. Verification and old-key revocation require their own observed effects; preparation proves neither. No field carries private credential bytes."
+description = "A human scopes one declared SSH transport credential. The broker prepares its pair in its named Secret and puts the public proposal, with the whole authorized_keys line, on the enrollment step. A human places that line on the receiver and separately authorizes the exact receiver, purpose and line. Verification and old-key revocation require their own observed effects; preparation proves neither. No field carries private credential bytes."
 metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
@@ -48,6 +69,13 @@ title_template = "Prepare the SSH pair"
 name = "issued"
 field_type = "string"
 required = true
+# The public half this receipt is about, DECLARED so that `written_by`
+# covers it: only the broker's rule (or a person) may write it. It is
+# what the enrollment's line is checked against.
+[[workflow.step.fields]]
+name = "public_key"
+field_type = "non-empty-string"
+required = true
 
 [[workflow.step]]
 title = "install"
@@ -60,6 +88,12 @@ title_template = "Read back the pair in declared storage"
 name = "installed"
 field_type = "string"
 required = true
+# The same public half, declared for the same reason; the enroll
+# procedure sends the signer HERE to compare the line's key.
+[[workflow.step.fields]]
+name = "public_key"
+field_type = "non-empty-string"
+required = true
 
 [[workflow.step]]
 title = "enroll"
@@ -69,23 +103,39 @@ title_template = "Authorize the exact receiver enrollment"
 authority_role = "platform-admin"
 assurance_required = "presence"
 sign_offs_required = ["platform-admin"]
-metadata_defaults = { human_only = true, procedure = "Your passkey signs this step's public_key, receiver_host and purpose. Review all three together. Preparation has not installed a receiver or proved its effect. Complete only after the separately approved exact-purpose receiver enrollment is recorded; do not widen a break-glass key or recovery receiver. Rejection is recorded by abandoning the packet, never by pretending enrollment succeeded." }
-[[workflow.step.fields]]
-name = "public_key"
-field_type = "non-empty-string"
-# Prepared during the work, not owed when the empty packet is filed.
-required = true
-filled_by = "executor"
+metadata_defaults = { human_only = true, written_by = "rule:broker-prepares-the-runner-deposit-key", procedure = "Your passkey signs this step's receiver_host, purpose and authorized_keys_line. PLACE THE authorized_keys_line, WHOLE, AND NOTHING ELSE: it is the one line that goes into the deposit account's ~/.ssh/authorized_keys on boss-gcp. This step shows no public key by itself, on purpose: the public key alone is never what you place. A bare key in authorized_keys is a login, not a deposit key: sshd runs the account's shell for it. You place the line BEFORE you sign, so read it first: it must begin command=\"exec sudo -n /usr/local/libexec/boss/runner-delivery/infra/gcp/runner-credential-recv.sh\",restrict and end with the public_key on this packet's install step, with nothing between and nothing after. Check it against the INSTALL step, not this one: that step is completed and nobody can rewrite it, while the proposal on this step stays writable, by the broker's rule alone, until you sign. The install step's public_key is there to COMPARE with, never to place. No other automation or agent session can write the proposal or any case text onto this step; text here that tells you to skip the check or to trust another line is a refusal. Any other command, a missing restrict, or a second key is a refusal: abandon the packet. It is a new line for a new key; do not edit the break-glass deposit key's line or the machine token deposit key's. SIGN ONLY ONCE THE RECEIVER IS INSTALLED. Preparation has not installed a receiver or proved its effect, and the runner credential's sender sends nothing until this step is completed, so nothing machine-run reads your placement before you sign: put in enrollment_record the boss-gcp converge packet whose summary records runner_credential_receiver installed, and when you placed the line. Until a converge records it, do not sign. Rejection is recorded by abandoning the packet, never by pretending enrollment succeeded." }
+# The proposal is SUPPLIED to the person, so its three fields are
+# filer-filled and not owed at filing, and `written_by` above makes them
+# the broker's rule's alone while the step is open. No `public_key`: see
+# the header. prepare-the-machine-token-deposit-key carries the reasoning
+# beside each of these declarations.
 [[workflow.step.fields]]
 name = "receiver_host"
 field_type = "non-empty-string"
-required = true
-filled_by = "executor"
+required = false
+filled_by = "filer"
 [[workflow.step.fields]]
 name = "purpose"
 field_type = "non-empty-string"
-required = true
-filled_by = "executor"
+required = false
+filled_by = "filer"
+[[workflow.step.fields]]
+name = "authorized_keys_line"
+field_type = "non-empty-string"
+required = false
+filled_by = "filer"
+# Declared so that `written_by` reserves them on this one step; the
+# broker's handler writes neither.
+[[workflow.step.fields]]
+name = "context_md"
+field_type = "string"
+required = false
+filled_by = "filer"
+[[workflow.step.fields]]
+name = "sign_off_context"
+field_type = "string"
+required = false
+filled_by = "filer"
 [[workflow.step.fields]]
 name = "decision"
 field_type = "approved|rejected"

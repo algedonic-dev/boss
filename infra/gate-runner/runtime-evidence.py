@@ -178,6 +178,53 @@ def counters(row):
     return result
 
 
+# HOW LONG A CHECK WAITED, NOT ONLY HOW MUCH CPU IT USED (backlog 17f6170c,
+# 2026-10-09). Every sample reads the three pressure files, and until this
+# no interval kept them: the receipt said a test check took 2300 s at 2.2
+# cores and could not say whether the rest was the disk. Answering it took
+# decoding the raw journal out of 66 gate pod logs, which live about a day
+# (43 percent of the test check stalled on IO before the 2026-10-07 trim, a
+# median 9.3 after it). The kernel's "total=" is cumulative microseconds in
+# which some (or all) of the cgroup's tasks were stalled on that resource,
+# so the difference across a check is that check's stall.
+PRESSURE = ("io", "cpu", "memory")
+
+
+def pressure_totals(source):
+    if source.get("state") != "measured":
+        raise ValueError(source.get("reason") or "pressure file " + source.get("state", "unread"))
+    result = {}
+    for line in source["raw"].splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        totals = [part[len("total="):] for part in parts[1:] if part.startswith("total=")]
+        if parts[0] not in ("some", "full") or len(totals) != 1 or not totals[0].isdigit() or parts[0] in result:
+            raise ValueError("malformed pressure line")
+        result[parts[0]] = int(totals[0])
+    if "some" not in result:
+        raise ValueError("no some line in pressure file")
+    return result
+
+
+def stalls(before, after):
+    """Stall microseconds per resource; an unreadable one says why, never 0."""
+    measured, unavailable = {}, {}
+    for resource in PRESSURE:
+        name = resource + ".pressure"
+        try:
+            left = pressure_totals(before["files"][name])
+            right = pressure_totals(after["files"][name])
+            if left.keys() != right.keys():
+                raise ValueError("pressure lines changed between samples")
+            if any(right[kind] < left[kind] for kind in left):
+                raise ValueError("pressure counter reset")
+            measured.update({resource + "." + kind: right[kind] - left[kind] for kind in sorted(left)})
+        except (KeyError, TypeError, ValueError) as error:
+            unavailable[resource] = str(error)[:200] or "unreadable"
+    return measured, unavailable
+
+
 def known_lifetime(row):
     lifetime = row["lifetime"]
     return (lifetime is not None and lifetime[2]["state"] == "measured"
@@ -201,6 +248,10 @@ def interval(before, after):
         result.update(state="measured", elapsed_ns=elapsed,
                       cpu_usage_usec=right["usage_usec"] - left["usage_usec"],
                       counter_deltas={key: right[key] - left[key] for key in left})
+        stall, unavailable = stalls(before, after)
+        result["stall_usec"] = stall
+        if unavailable:
+            result["stall_unavailable"] = unavailable
     except (KeyError, TypeError, ValueError) as error:
         result["reason"] = str(error)
     return result

@@ -303,6 +303,26 @@ only when the step's `decision` — saved before the stamp, so inside the
 signed shape — is exactly `approved`; ops-request routes any other
 decision to `refused` (adversarial re-review of fd7090cc, 2026-09-25).
 
+## Review verbs — an independent release before the passkey
+
+An approval verb may also declare `"requires_review": true` (backlog
+84e7c3e4, design 9de0cd1c, Q1 answered by David 2026-10-04). `boss ops`
+then files the request with `requires_review`, which makes ops-request's
+`review` step ready; the runner renders the plan onto THAT step first,
+for a reviewer dispatched under the `tenant-reviewer` profile
+(infra/platform/documents/tenant-reviewer-rules.md), and renders the
+approval's plan only over a `release` of exactly those bytes, by a
+landed review run that is not the source run whose tenant receipt the
+plan lands. The run is held to the runner's own fixed `REVIEW_PROFILE`,
+never to the profile the step's metadata names, and a `changes` verdict
+closes the request on its `not-released` terminal (review bd3091d2, N1
+and N4) — as does a review run that ended refused and recorded no
+verdict, with its report as the reason (backlog 112d2f92). The approve step carries the review run, so the passkey
+signs it, and the runner checks the review again before the claim. A
+verb that declares a review and no approval is refused by `boss ops`:
+the review exists to open an approval. Only `merge-tenant-main` declares
+it — a hold only where a rule requires one (David's option A, bd331d38).
+
 ## Nothing to do — a plan with no change in it asks nobody
 
 A plan verb may declare the regex (jq's engine, the runner's) its WHOLE

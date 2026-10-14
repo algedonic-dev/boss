@@ -91,7 +91,7 @@ pub(crate) fn ledger_base(jobs_base: &str) -> Result<String> {
 
 pub async fn dispatch(cmd: Cmd) -> Result<()> {
     let Cmd::Ledger { action } = cmd;
-    let jobs = crate::gate::resolve_jobs_base(None)?;
+    let jobs = crate::sor_client::resolve_jobs_base(None)?;
     let wire = Wire::at(ledger_base(&jobs)?, crate::identity::caller())?;
     let out = match action {
         Action::Periods { json } => periods(&wire, json).await?,

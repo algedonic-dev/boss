@@ -93,7 +93,7 @@ test.describe('/ux/people counts only a roster it has read', () => {
     release();
 
     await expect(title(page)).toHaveText('1 active employee');
-    await expect(header(page)).toContainText('0 certifications expiring in 90 days');
+    await expect(header(page)).not.toContainText(/certifications expiring/);
     for (const name of ['Active (1)', 'On Leave (1)', 'Terminated (0)', 'All (2)']) {
       await expect(filters(page).getByRole('button', { name, exact: true })).toBeVisible();
     }

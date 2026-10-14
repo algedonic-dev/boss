@@ -32,14 +32,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 /// A full job id as the API expects it: 36 chars, dashed. Anything
-/// else goes through list-and-match resolution.
-pub(crate) fn looks_like_uuid(s: &str) -> bool {
-    s.len() == 36
-        && s.chars().enumerate().all(|(i, c)| match i {
-            8 | 13 | 18 | 23 => c == '-',
-            _ => c.is_ascii_hexdigit(),
-        })
-}
+/// else goes through list-and-match resolution. One definition, in core,
+/// which the release door also asks (backlog ed8e5c85).
+pub(crate) use boss_jobs::car_release::looks_like_uuid;
 
 /// Resolve a job reference against fetched rows, in `boss job`'s own
 /// vocabulary. The matching semantics live in `prove::matching_jobs`
@@ -430,7 +425,7 @@ pub(crate) async fn fetch_and_resolve(
     }
     let page = |status: &'static str, offset: usize| async move {
         let path = format!("/api/jobs?status={status}&limit={RESOLVE_PAGE}&offset={offset}");
-        crate::gate::api(http, reqwest::Method::GET, &path, None).await
+        crate::sor_client::api(http, reqwest::Method::GET, &path, None).await
     };
     resolve_through(page, job_ref).await
 }
@@ -484,9 +479,9 @@ where
 }
 
 pub async fn get(job_ref: &str, raw: bool) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let id = fetch_and_resolve(&http, job_ref).await?;
-    let job = crate::gate::api(
+    let job = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         &format!("/api/jobs/{id}"),
@@ -509,8 +504,8 @@ pub async fn get(job_ref: &str, raw: bool) -> Result<()> {
 /// reading a station wants one spelling for the packet's id, and the
 /// raw body is one `boss-api` call away if it wants the envelope.
 pub async fn station(name: &str, raw: bool) -> Result<()> {
-    let http = crate::gate::machine_client()?;
-    let body = crate::gate::api(
+    let http = crate::sor_client::machine_client()?;
+    let body = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         &format!("/api/stations/{name}/queue"),
@@ -676,8 +671,8 @@ pub async fn list(
     has: Vec<String>,
 ) -> Result<()> {
     let path = list_query(kind.as_deref(), &status, limit, &wheres, &has)?;
-    let http = crate::gate::machine_client()?;
-    let body = crate::gate::api(&http, reqwest::Method::GET, &path, None).await?;
+    let http = crate::sor_client::machine_client()?;
+    let body = crate::sor_client::api(&http, reqwest::Method::GET, &path, None).await?;
     let total = body
         .as_ref()
         .and_then(|b| b.get("total"))
@@ -905,7 +900,7 @@ pub(crate) async fn file_on(
 }
 
 pub async fn patch(job_ref: &str, path: &std::path::Path) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let sent: Value = serde_json::from_str(
         &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
     )
@@ -914,7 +909,7 @@ pub async fn patch(job_ref: &str, path: &std::path::Path) -> Result<()> {
         bail!("a metadata patch must be a JSON object of key -> value (null removes)");
     }
     let id = fetch_and_resolve(&http, job_ref).await?;
-    crate::gate::api(
+    crate::sor_client::api(
         &http,
         reqwest::Method::PATCH,
         &format!("/api/jobs/{id}/metadata"),
@@ -923,7 +918,7 @@ pub async fn patch(job_ref: &str, path: &std::path::Path) -> Result<()> {
     .await?;
 
     // The status code said yes; the packet is the authority.
-    let job = crate::gate::api(
+    let job = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         &format!("/api/jobs/{id}"),
@@ -1018,10 +1013,10 @@ pub(crate) fn render_move(body: &Value) -> String {
 /// `repins` record grew by one.
 pub async fn convert(job_ref: &str, to: Option<&str>, dry_run: bool) -> Result<()> {
     let to = to.map(parse_version).transpose()?;
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let id = fetch_and_resolve(&http, job_ref).await?;
     let query = to.map(|v| format!("?to_version={v}")).unwrap_or_default();
-    let preview = crate::gate::api(
+    let preview = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         &format!("/api/jobs/{id}/convert{query}"),
@@ -1057,7 +1052,7 @@ pub async fn convert(job_ref: &str, to: Option<&str>, dry_run: bool) -> Result<(
         );
     }
 
-    let before = crate::gate::api(
+    let before = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         &format!("/api/jobs/{id}"),
@@ -1069,7 +1064,7 @@ pub async fn convert(job_ref: &str, to: Option<&str>, dry_run: bool) -> Result<(
         Some(v) => json!({ "to_version": v }),
         None => json!({}),
     };
-    crate::gate::api(
+    crate::sor_client::api(
         &http,
         reqwest::Method::POST,
         &format!("/api/jobs/{id}/convert"),
@@ -1078,7 +1073,7 @@ pub async fn convert(job_ref: &str, to: Option<&str>, dry_run: bool) -> Result<(
     .await?;
 
     // The status code said yes; the packet is the authority.
-    let after = crate::gate::api(
+    let after = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         &format!("/api/jobs/{id}"),
@@ -1167,9 +1162,9 @@ pub(crate) fn owed_outcome(
 /// door for a packet closed before it did — not a hand PATCH of a value
 /// someone read off the steps. Confirmed by reading the packet back.
 pub async fn outcome(job_ref: &str, dry_run: bool) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let id = fetch_and_resolve(&http, job_ref).await?;
-    let job = crate::gate::api(
+    let job = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         &format!("/api/jobs/{id}"),
@@ -1186,7 +1181,7 @@ pub async fn outcome(job_ref: &str, dry_run: bool) -> Result<()> {
         .and_then(Value::as_i64)
         .ok_or_else(|| anyhow!("packet {id} is pinned to no version"))?;
     let spec: boss_jobs::WorkflowSpec = serde_json::from_value(
-        crate::gate::api(
+        crate::sor_client::api(
             &http,
             reqwest::Method::GET,
             &format!("/api/workflows/{kind}/versions/{version}"),
@@ -1209,14 +1204,14 @@ pub async fn outcome(job_ref: &str, dry_run: bool) -> Result<()> {
         return Ok(());
     }
     let sent = json!({ "outcome": owed });
-    crate::gate::api(
+    crate::sor_client::api(
         &http,
         reqwest::Method::PATCH,
         &format!("/api/jobs/{id}/metadata"),
         Some(sent.clone()),
     )
     .await?;
-    let after = crate::gate::api(
+    let after = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         &format!("/api/jobs/{id}"),
@@ -2049,6 +2044,73 @@ mod tests {
                 crate::review_verdict::vouches(&run_packet, &after, HEAD),
                 Ok(()),
                 "the dock's check passes a run a human opened: {run_packet}"
+            );
+        }
+
+        /// WHICH MODEL REVIEWED IT RIDES THE RELEASE (backlog ad82090a).
+        /// A review run whose report observed a model other than the one
+        /// it declared — every Claude review on 2026-10-09 — is released
+        /// as before, and the release record on the car says every model
+        /// it knows, so the dock, the yard and an audit read it off the
+        /// record instead of off a stderr line at report time. Whether
+        /// they match is the launcher's record's to say (backlog
+        /// e6b05dd6), and this run has none.
+        /// Recorded, not refused: refusing on it is a trust change that
+        /// is David's to make (the item's finish ledger, D1).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_release_records_the_reviewers_declared_and_observed_model() {
+            const BUILDER: &str = "b0b0b0b0-0000-4000-8000-000000000000";
+            let (base, jobs) = serve().await;
+            a_held_car_at_the_dock(&jobs, BUILDER).await;
+            let wire = crate::steps::Wire::at(
+                base,
+                Some(crate::identity::Caller {
+                    id: HUMAN.into(),
+                    source: crate::identity::Source::Env,
+                }),
+            )
+            .unwrap();
+            let run = a_review_run_filed_by(&wire).await;
+            wire.patch_job_metadata(
+                &run,
+                serde_json::json!({"model": "opus-5[1m]", "model_observed": {
+                    "declared": "opus-5[1m]", "observed": "opus-5-5"}}),
+            )
+            .await
+            .expect("the run's report, as --report writes it");
+            crate::review_verdict::record(&wire, "feat/held", "release", "", Some(&run), forge)
+                .await
+                .expect("the verdict");
+            crate::review_verdict::release(
+                &wire,
+                "feat/held",
+                &run,
+                &crate::review_verdict::Releaser::default(),
+                forge,
+            )
+            .await
+            .expect("a model that differs is recorded, not refused");
+
+            let after = wire.packet(CAR).await.expect("the car");
+            assert!(crate::train::parked_ready(&after), "unheld: {after}");
+            let rec = crate::review_verdict::release_on(&after)
+                .expect("a release")
+                .record;
+            // Only a launcher's record decides the match (backlog
+            // e6b05dd6); this run has none, so the release says so and
+            // keeps the run's own observation beside it.
+            assert_eq!(rec["reviewer_model"]["declared"], "opus-5[1m]", "{rec}");
+            assert_eq!(rec["reviewer_model"]["observed"], "opus-5-5", "{rec}");
+            assert_eq!(
+                rec["reviewer_model"]["matches"],
+                serde_json::Value::Null,
+                "{rec}"
+            );
+            let says = rec["reviewer_model"]["says"].as_str().unwrap_or_default();
+            assert!(
+                says.starts_with("declared opus-5[1m], launched unknown (")
+                    && says.ends_with("; observed opus-5-5"),
+                "{rec}"
             );
         }
 

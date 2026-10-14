@@ -326,6 +326,46 @@ describe('constraintOf', () => {
     expect(c.kind).toBe('none');
     expect(c.because).toContain('loading-dock');
   });
+
+  // Backlog ba1fcc6d (page-audit 7c228914 gap 1): on 2026-09-23 the box
+  // named a 6-deep counted queue while 510 standings sat at two queues
+  // whose rate is not counted, and nothing in the box said so. The
+  // named queue stays the counted one; the box now says what it was
+  // NOT judged against, deepest first, with the standings each holds.
+  test('a named constraint says which queues holding work it was not judged against', () => {
+    const c = constraintOf(sidings(), 24);
+    expect(c.kind).toBe('station');
+    expect(c.kind === 'station' && c.unjudged).toBe(
+      'Named from the counted queues only, which hold 47 of 50 standings. ' +
+        '3 stand where no rate is counted — loading-dock 3 — so this board cannot say ' +
+        'whether the constraint is among them.',
+    );
+  });
+
+  test('blind queues are listed deepest first, and empty blind queues are not listed', () => {
+    const blindTask = sidings().map((s) =>
+      s.station === 'q.platform-admin.task'
+        ? { ...s, depth: 297, flow: { kind: 'unavailable' as const, reason: 'job-level clause' } }
+        : s,
+    );
+    const withEmptyBlind = [
+      ...blindTask,
+      { ...blindTask[0]!, station: 'a.blind.empty', depth: 0, flow: { kind: 'unavailable' as const, reason: 'x' } },
+    ];
+    const c = constraintOf(withEmptyBlind, 24);
+    expect(c.kind === 'station' && c.station).toBe('q.bookkeeper.bill-approval');
+    expect(c.kind === 'station' && c.unjudged).toContain(
+      '300 stand where no rate is counted — q.platform-admin.task 297, loading-dock 3 —',
+    );
+    expect(c.kind === 'station' && c.unjudged).not.toContain('a.blind.empty');
+  });
+
+  test('when every queue holding work is counted, there is nothing unjudged to say', () => {
+    const counted = sidings().filter((s) => s.flow.kind === 'counted');
+    const c = constraintOf(counted, 24);
+    expect(c.kind).toBe('station');
+    expect(c.kind === 'station' && c.unjudged).toBeNull();
+  });
 });
 
 describe('whyNotMoving', () => {

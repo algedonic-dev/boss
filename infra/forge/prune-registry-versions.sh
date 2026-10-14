@@ -48,10 +48,9 @@
 #      own read. No deploy/boss image = refuse.
 #   2. THE ROLLBACK TARGET. The last-converged stamp the deploy runner
 #      writes and the watchdog rolls to BY NAME
-#      (`$BOSS_FORGE_LAST_BUILT`, default the checkout owner's
-#      ~/.boss-last-built — the runner runs as that user; this verb
-#      runs as root under the ops runner with no HOME). Absent or not
-#      a sha = refuse: "roll back" is a target, not a verb.
+#      (`$BOSS_FORGE_LAST_BUILT`, default forge-defaults.sh's
+#      STAMP_FILE, in the converge's root-only state directory). Absent
+#      or not a sha = refuse: "roll back" is a target, not a verb.
 #   3. THE TRAINS. landed-train-shas.lib.sh, the one reader the disk
 #      sweep already trusts, over the newest 2N pr-train packets
 #      (N = keep_trains, default 10; 2N so that at least N landed
@@ -110,11 +109,12 @@
 # `gone` (404) stay two numbers in the record; the verdict's count is
 # the planned versions the re-list no longer holds.
 #
-# THE CREDENTIAL. The converge pushes with david's rootless docker and
-# its ambient registry login (cluster-deploy-runner.sh; mirror-base-
-# images.sh points root at the same config). That login is
-# `auths."<registry host>".auth` in the checkout owner's
-# ~/.docker/config.json — base64 of user:token — and it is the one
+# THE CREDENTIAL. The converge pushes with the registry push login the
+# forge converge deposits from the credential broker's token
+# (registry-token-deposit.sh; backlog 683d7fe9 — it was the checkout
+# owner's own hand-typed login until then). That login is
+# `auths."<registry host>".auth` in REGISTRY_PUSH_DIR/config.json
+# (forge-defaults.sh) — base64 of user:token — and it is the one
 # credential this verb uses, for the packages API (Basic, the token as
 # the password) and for the /v2 manifest reads (a bearer minted from it
 # at /v2/token, docker's own flow). IT IS NEVER PRINTED: it rides in a
@@ -169,9 +169,10 @@
 #   BOSS_PRUNE_FORGE_URL       the forge's HTTP base (default: http://<host>,
 #                              the registry is plain HTTP on the LAN)
 #   BOSS_PRUNE_DOCKER_CONFIG   the docker config holding the login
-#                              (default: <checkout owner>/.docker/config.json)
+#                              (default: forge-defaults.sh's
+#                              REGISTRY_PUSH_DIR/config.json)
 #   BOSS_FORGE_LAST_BUILT      the converge's stamp file
-#                              (default: <checkout owner>/.boss-last-built)
+#                              (default: forge-defaults.sh's STAMP_FILE)
 #   BOSS_PRUNE_KEEP_HOURS      the freshness window (default: 24)
 #   BOSS_PRUNE_DF_PATH         the directory df measures (default:
 #                              /opt/forgejo/data; unmeasured if absent);
@@ -267,20 +268,18 @@ esac
 PACKAGES="$IMAGE_NAME ${IMAGE_NAME}-ci"
 FORGE_URL="${BOSS_PRUNE_FORGE_URL:-http://$REG_HOST}"
 
-# --- the checkout owner: whose docker login and stamp these are -----------
-# The ops runner is root with no HOME; the converge runs as the
-# checkout's owner and its login and stamp live in that user's home.
-# Read off the directory, never hardcoded (delete-orphan-object.sh's
-# as_owner; ops-request c9877f75). Only consulted for a default. The
-# owner and the login are read by registry-login.lib.sh, which the
-# forge data move reads them through too (backlog 016aeea3).
+# --- the converge's docker login and stamp --------------------------------
+# Both root's since the converge moved to root (backlog 683d7fe9): the
+# registry push login the forge converge deposits from the credential
+# broker's token, and the stamp in the converge's state directory —
+# forge-defaults.sh's REGISTRY_PUSH_DIR and STAMP_FILE, one definition
+# for every reader. Until then both lived in the checkout owner's home,
+# derived from who owned the checkout this ran from. The login is read
+# by registry-login.lib.sh, which the forge data move reads it through
+# too (backlog 016aeea3).
 # shellcheck source=infra/forge/registry-login.lib.sh
 . "$SELF_DIR/registry-login.lib.sh"
-if [ -z "${BOSS_PRUNE_DOCKER_CONFIG:-}" ] || [ -z "${BOSS_FORGE_LAST_BUILT:-}" ]; then
-    OWNER_HOME="$(checkout_owner_home "$REPO")" || refuse "cannot resolve the owner of $REPO, so neither the docker login nor the converge's stamp has a default path; set BOSS_PRUNE_DOCKER_CONFIG and BOSS_FORGE_LAST_BUILT"
-fi
-DOCKER_CONFIG_FILE="${BOSS_PRUNE_DOCKER_CONFIG:-$OWNER_HOME/.docker/config.json}"
-STAMP_FILE="${BOSS_FORGE_LAST_BUILT:-$OWNER_HOME/$LAST_BUILT_NAME}"
+DOCKER_CONFIG_FILE="${BOSS_PRUNE_DOCKER_CONFIG:-$REGISTRY_PUSH_DIR/config.json}"
 DF_PATH="${BOSS_PRUNE_DF_PATH:-/opt/forgejo/data}"
 LIST_DIR="${BOSS_PRUNE_LIST_DIR:-/var/backups/boss/registry-prune}"
 
@@ -457,7 +456,7 @@ if ! list_versions "$TMP/versions.raw"; then
             scope=$(scope_of "$TMP/page.json" read:package)
             say "REFUSED — the registry listing answered 403: the docker login for $REG_HOST (user $CRED_USER) lacks $scope; the forge said:"
             jq -r '.message // empty' "$TMP/page.json" 2>/dev/null | scrub | sed 's/^/    /' >&2
-            say "  Minting a token with $scope (and write:package for the delete) is a root ceremony, David's; then docker login $REG_HOST with it as the checkout owner."
+            say "  The login is the broker's forge-registry-push-token: its scope is the scopes arg of infra/dispatcher/rules/broker-rotates-the-forge-registry-push-token.toml, and a rotate-a-credential packet of it, whose scope step is David's, mints a token with $scope (and write:package for the delete) — never a hand login."
             say "  Nothing was deleted."
             exit 2 ;;
         '')
@@ -835,7 +834,7 @@ if [ "$DRY" = 0 ]; then
                 REFUSED_SCOPE=$(scope_of "$TMP/delete.json" write:package)
                 say "REFUSED — DELETE $name:$ver answered 403: the docker login for $REG_HOST (user $CRED_USER) lacks $REFUSED_SCOPE; the forge said:"
                 jq -r '.message // empty' "$TMP/delete.json" 2>/dev/null | scrub | sed 's/^/    /' >&2
-                say "  Minting a token with read:package and $REFUSED_SCOPE is a root ceremony, David's; then docker login $REG_HOST with it as the checkout owner. No further DELETE was attempted."
+                say "  The login is the broker's forge-registry-push-token: its scope is the scopes arg of infra/dispatcher/rules/broker-rotates-the-forge-registry-push-token.toml, and a rotate-a-credential packet of it, whose scope step is David's, mints a token with read:package and $REFUSED_SCOPE — never a hand login. No further DELETE was attempted."
                 break ;;
             *)
                 FAIL_CODE="$code"

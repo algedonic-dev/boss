@@ -467,6 +467,8 @@ pub trait InventoryRepository: Send + Sync {
     /// OUTBOX (phase 2): header + lines + subject identity +
     /// `inventory.purchase_order.upserted` (the caller-intended PO
     /// state) commit or abort in ONE transaction.
+    /// Stores signed historical facts unchanged. Ordinary HTTP commands
+    /// validate their prospective cost rule before this projection write.
     async fn create_purchase_order_at(
         &self,
         po: &PurchaseOrder,
@@ -476,6 +478,10 @@ pub trait InventoryRepository: Send + Sync {
     /// Records `inventory.purchase_order.upserted` (post-update row
     /// state, read back in-tx) + the `inventory.po.status_changed`
     /// marker in the same transaction as the flip — outbox phase 2.
+    /// This is an ordinary status command: a first Draft-to-placed flip
+    /// refuses negative line costs atomically, without changing rows or
+    /// recording events. Already placed historical amounts are preserved.
+    /// The rebuilder replays full row facts, never this command.
     async fn update_po_status(
         &self,
         id: &str,

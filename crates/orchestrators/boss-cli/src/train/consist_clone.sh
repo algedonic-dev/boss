@@ -4,6 +4,7 @@ set -euo pipefail
 umask 077
 export GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
 export HOME=/tmp/clone-home
+prepare_consist_tmp /consist-tmp "$6"
 mkdir -p "$HOME" /work/repo
 git init -q /work/repo
 cd /work/repo

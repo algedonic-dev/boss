@@ -989,3 +989,48 @@ fn the_seed_is_copied_by_reflink_from_a_local_volume_on_the_build_node() {
         "the PV binds only on the build node"
     );
 }
+
+/// The YAML a manifest declares, comment lines dropped — a retired
+/// object's history stays legal prose; only a declaration is refused.
+fn declared(rel: &str) -> String {
+    read(rel)
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// THE SUPERSEDED GATE VOLUMES ARE RETIRED (backlog 1f13b894). The gate
+/// moved onto w-1's second NVMe on 2026-09-30 (52ea56ac) and the pin
+/// above holds that the Job mounts neither old claim — yet both claims
+/// and the EPHEMERAL seed's PV stayed declared, and so stayed bound, ten
+/// days on: on 2026-10-10 the Longhorn claim `gate-runner-disk` alone
+/// held 197.7 GiB of w-1's install disk (node-disk-usage, ops-request
+/// e66b045d) while the estate alarm read disk_tight:w-1 at 182-191 GiB
+/// free against a 200 floor. A declaration nothing mounts is not
+/// harmless: while it stands, deleting the live object is undone or
+/// refused. The `gate` claim, its PV and the class they share stay.
+#[test]
+fn the_superseded_gate_volumes_are_no_longer_declared() {
+    let runner = declared("infra/gate-runner/gate-runner.yaml");
+    assert!(
+        !runner.contains("kind: PersistentVolumeClaim"),
+        "gate-runner.yaml declares the Job only; `boss gate` applies nothing else, \
+         and the gate's claim is converged beside its PV:\n{runner}"
+    );
+    for gone in ["name: gate-runner-disk", "name: gate-seed\n"] {
+        assert!(
+            !format!("{runner}\n").contains(gone),
+            "gate-runner.yaml still declares `{gone}`"
+        );
+    }
+    let local = declared("infra/cluster/manifests/gate-seed-local.yaml");
+    assert!(
+        !local.contains("name: gate-seed-w-1") && !local.contains("path: /var/local/gate-seed"),
+        "the EPHEMERAL seed's PV is retired:\n{local}"
+    );
+    // What stays: the class, the gate PV and its claim.
+    assert!(local.contains("name: gate-seed-local"));
+    assert!(local.contains("name: gate-w-1"));
+    assert!(local.contains("volumeName: gate-w-1"));
+}

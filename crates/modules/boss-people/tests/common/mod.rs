@@ -46,7 +46,6 @@ impl PeopleTestApp {
             people: people.clone(),
             publisher: None,
             policy: Some(Arc::new(PermissivePolicyClient) as Arc<dyn PolicyClient>),
-            subject_kinds: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
         };
         let router = router(state);

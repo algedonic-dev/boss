@@ -41,10 +41,13 @@ Three rows hold LESS than their script asserts: `disk-floor-sweep`,
 `platform-admin` in their header and make one read each. Their rows hold
 `audit-readonly`, each file says why, and nothing decides on a row until
 the resolver enforces — until then the tally shows `would_deny` for any
-request the narrower role would have refused. Three writers
-(`cluster-watchdog`, `install-smoke`, `observe-codebase`) hold
-`platform-admin` because no narrower role is granted a write today; that
-is the role they sign, not a default.
+request the narrower role would have refused. One writer,
+`cluster-watchdog`, holds `platform-admin` because no narrower role is
+granted a write today; that is the role it signs, not a default. Two more
+did until 2026-10-10 — `install-smoke` and `observe-codebase`, whose
+scripts ran only as copies installed by hand on no host, and were deleted
+with their rows (backlog 44b2087e). A deployment that already holds those
+rows keeps them (insert-if-absent); nothing signs as either.
 
 **The roster is held to the tree** by
 `every_script_sender_signs_as_a_registered_automation` (boss-testing): a
@@ -76,6 +79,20 @@ signs_for = "automation:rule:"    # optional: the prefix of ids it signs one per
 the `dispatcher_rules` registry (tenant rules included) into this one and
 drift from it the day a rule is authored, so the signer's row declares the
 prefix in `signs_for` and answers for every member.
+
+**A member has a shape, and that is not enough to trust it** (review
+ed9181b4, 2026-10-07). Since 2026-10-10 both readers hold a family to
+`boss_core::role_of_record::is_family_member`: the prefix must be
+`automation:<slug>:` and the tail `:`-separated `[A-Za-z0-9-]` segments,
+so `rule: `, `rule:../../x` or a name carrying U+202E is unregistered
+rather than the dispatcher at `platform-admin`. But a well-formed member
+is still a name the CALLER typed, and the estate machine token lets its
+holder assert any `x-boss-user`. **Before the resolver enforces (car 4,
+row H), a row — exact or family — must be trusted only for a caller whose
+identity a credential bound**, as the probe reader's slot already is: the
+authenticated service identity equals the resolver's
+`RoleRecord.actor_id`. Without that, an agent narrowed to its own role
+regains `platform-admin` by signing as `rule:x`.
 
 ## Adding one
 

@@ -1,0 +1,18 @@
+# Dormant replacement: ca356c79 / fe6d1124. Not installed by any caller.
+# Activate only after the root fetch credential and tree handover are proven.
+[Unit]
+Description=BOSS daily surface usage reading
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/boss/sor.env
+WorkingDirectory=/var/lib/boss/gcp-tree/current
+RuntimeDirectory=boss-surface-usage
+RuntimeDirectoryMode=0700
+TimeoutStartSec=10min
+ExecStartPre=-/var/lib/boss/gcp-tree/current/infra/gcp/root-tree.sh run infra/boss-maintenance-wrap.sh maintenance-surface-usage "Surface usage"
+ExecStart=/var/lib/boss/gcp-tree/current/infra/gcp/root-tree.sh run infra/surface-usage.sh file --repo .
+ExecStopPost=-/var/lib/boss/gcp-tree/current/infra/gcp/root-tree.sh run infra/boss-step.sh maintenance-surface-usage run

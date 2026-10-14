@@ -136,7 +136,6 @@ stack.
 | Understand the architecture | [docs/architecture-diagram.md](docs/architecture-diagram.md) — four diagrams, conceptual to concrete |
 | Read the BOSS core domain | [CLAUDE.md §Primitives + §Supporting concepts](CLAUDE.md#primitives) |
 | See the public demo tenant | [examples/brewery/DOMAIN.md](examples/brewery/DOMAIN.md) — Algedonic Ales |
-| See the second worked tenant | [examples/used-device-shop/DOMAIN.md](examples/used-device-shop/DOMAIN.md) |
 | Read the design pattern docs | [docs/design/](docs/design/) — load-bearing patterns referenced from CLAUDE.md and the decision record |
 | Run BOSS locally | [Quick start](#quick-start) below |
 | Set up a toolchain to work on BOSS itself | [docs/runbooks/dev-environment-bootstrap.md](docs/runbooks/dev-environment-bootstrap.md) |
@@ -166,23 +165,15 @@ The workspace splits into four tiers (see CLAUDE.md):
     demo tenant. Data-first seeds at `examples/brewery/` (TOML +
     JSON) plus the brewery-specific Workflows. Industrial-scale
     brewer modeled across 5 beer styles.
-  - **Used-device-shop** (`boss-used-device-shop-engine`) — sells,
-    services, and resells used physical devices needing
-    sophisticated diagnostics + repair. Data lives at
-    `examples/used-device-shop/`; run the same container image with
-    its manifest path pointed at that directory
-    (`examples/used-device-shop/DOMAIN.md` §Install — same service
-    stack as the brewery, no sim daemon; after
-    `boss-used-device-shop-engine prepare` seeds the model, work is
-    driven by human and agent actors).
 
 A tenant is seed data — Workflows, policy grants, Class rows, a
 roster — published through shared bootstrap doors
 (`boss_jobs::bootstrap`, `boss_policy::bootstrap`, the classes batch
-API). The only tenant-specific Rust a third tenant needs is a thin
-`prepare` shell naming its seed files (see
-`crates/tenants/boss-used-device-shop-engine/src/prepare.rs`); no new
-core code, no new web code.
+API). Algedonic Ales is the one shipped example. A company's own model
+belongs in its tenant repository; [the tenant contract](docs/tenant-contract.md)
+describes the scaffold, validation and publication doors. The company
+modules remain available to other organizations, with tenant-specific
+meaning supplied by their registry data.
 
 The full crate-by-crate map and service topology live in
 [docs/architecture-diagram.md](docs/architecture-diagram.md).

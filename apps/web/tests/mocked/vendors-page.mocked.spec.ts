@@ -16,11 +16,9 @@ import { isPageWrite } from './_smokeMocks';
 // which the launcher starts only for module `warehouse`.
 //
 // Two renders, because the live instance and the fixtures disagree:
-//   The served instance — the manifest the gateway served on 2026-09-23
-//             lists warehouse = false, and the catalog entry has no
-//             `module` key, so the page mounts anyway and its three
-//             reads meet the gateway's no-upstream answer (proxy.rs:
-//             502, "inventory upstream unavailable").
+//   The served instance — the manifest the gateway served on2026-09-23
+//             lists warehouse=false. Approved6d6f88bd removes the list
+//             and detail cleanly, before any inventory reader mounts.
 //   Fixtures — vendors, POs and vendor invoices, so every column, count,
 //             filter and the link can be read.
 //
@@ -32,11 +30,12 @@ import { isPageWrite } from './_smokeMocks';
 //                   zeros — ANSWERED: each now paints `.load-failed`
 //   gap 2 c3e4edcc  the one failure line is not `.load-failed` —
 //                   ANSWERED: it is, and the header says unknown
-//   gap 3 003f4db2  the route is not gated by the warehouse module
+//   gap 3 003f4db2  ANSWERED: approved6d6f88bd clean absence when warehouse is off
 //   gap 4 35aeb30d  the empty line blames filters when there are none —
 //                   ANSWERED: an empty source says "No vendors yet."
-//   gap 5 d18b68cf  a null payment_terms paints a blank cell
-//   gap 6 e9c8e28d  the vendor link lands on an uncatalogued route
+//   gap 5 d18b68cf  a null payment_terms paints a blank cell —
+//                   ANSWERED: the successful read says absent with `—`
+//   gap 6 e9c8e28d  shared crawls now seed a native vendor detail
 //   gap 7 8d564435  the open/unpaid predicates and the NAME join are
 //                   client copies nothing else pins
 
@@ -64,10 +63,8 @@ const MANIFEST_2026_09_23: Readonly<Record<string, boolean>> = {
   shipping: false, shop: false, sim: false, support: true, warehouse: false,
 };
 
-/// The gateway's answer for a proxied route whose upstream does not
-/// answer (crates/core/boss-gateway/src/proxy.rs `handle`): 502, plain
-/// text naming the service. With warehouse off nothing serves
-/// /api/inventory/*, so this is what each of the page's reads gets.
+/// A failing inventory response also serves the Warehouse-on outage
+/// controls. Warehouse-off absence must not reach this response at all.
 const noUpstream = (r: Route): Promise<void> =>
   r.fulfill({ status: 502, contentType: 'text/plain', body: 'inventory upstream unavailable' });
 
@@ -190,34 +187,37 @@ const UNKNOWN_SUBTITLE = 'Vendor count unknown — the read failed';
 /// The page's own search box — the shell's bar carries a second one.
 const searchbox = (page: Page) => page.locator('aside.catalog-filters').getByRole('searchbox');
 
+test('nullable Terms says absent while an explicit empty string and recorded terms keep their supplied text', async ({ page }) => {
+  await install(page, { vendors: [
+    vendor('null-terms', 'No recorded terms', null, null, null, 7, null, null),
+    vendor('empty-terms', 'Explicit empty terms', null, null, null, 7, '', null),
+    vendor('set-terms', 'Recorded terms', null, null, null, 7, 'Net 30', null),
+  ], orders: [], invoices: [] });
+  await mountPage(page, PATH, { titleMatch: /3 vendors/ });
+  const terms = bodyRows(page).locator('td:nth-child(4)');
+  await expect(terms.nth(1)).toHaveText('');
+  await expect(terms.nth(2)).toHaveText('Net 30');
+  await expect(terms.nth(0)).toHaveText('—');
+});
+
 test.describe('/ux/vendors — the served instance (warehouse off, no inventory upstream)', () => {
-  test('the page mounts ungated and paints its one failure line, on the shared marker', async ({ page }) => {
+  test('the page is cleanly absent when warehouse is off, without inventory reads', async ({ page }) => {
     const seen = watch(page);
     await install(page, { vendors: noUpstream, orders: noUpstream, invoices: noUpstream }, MANIFEST_2026_09_23);
     await mountPage(page, PATH);
 
-    // Gap 3 (003f4db2): the catalog entry declares no module, so the
-    // route gate never fires — no ModuleDisabled notice, whatever the
-    // manifest says about the service the page reads.
+    //6d6f88bd removes only the register;45fad3bb preserves financial details.
     expect(ROUTE_CATALOG.vendors.path).toBe(PATH);
     expect(ROUTE_CATALOG.vendors.owner).toBe('finance');
-    expect(ROUTE_CATALOG.vendors.module).toBeUndefined();
+    expect(ROUTE_CATALOG.vendors.module).toBe('warehouse');
     expect(ROUTE_CATALOG.warehouse.module).toBe('warehouse');
     await expect(page.locator('.module-disabled')).toHaveCount(0);
 
-    await expect(empty(page)).toHaveText("Couldn't load vendors — /api/inventory/vendors: HTTP 502");
-    // Gap 2 (c3e4edcc), answered: the line is the FAILURE_MARKER the
-    // outage crawl reads, and the header above it no longer states
-    // zeros as fact.
-    await expect(page.locator(`${FAILURE_MARKER}[role=alert]`)).toHaveText(
-      "Couldn't load vendors — /api/inventory/vendors: HTTP 502",
-    );
-    await expectHeader(page, 'Vendors', UNKNOWN_SUBTITLE);
-    await expect(button(page, 'All (0)')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'No page at this address', exact: true })).toBeVisible();
+    await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
     await expect(page.locator('table.data-table')).toHaveCount(0);
 
-    expect(await settledReads(page, () => seen.reads.length, 3)).toBe(3);
-    expect([...seen.reads].sort()).toEqual([...READ_PATHS].sort());
+    expect(seen.reads).toEqual([]);
     expect(seen.writes).toHaveLength(0);
   });
 });
@@ -243,9 +243,9 @@ test.describe('/ux/vendors — fixtures', () => {
     expect(await table(page)).toEqual([
       ['Cascade Hop Farm', 'hop supplier', 'Yakima, WA', 'Net 30', '14d', '2/ 3', '1', '$1,250'],
       ['Prairie Maltings', 'grain supplier', 'Great Falls, MT', 'Net 45', '21d', '0', '1', '$45.50'],
-      // Gap 5 (d18b68cf): every other null column says `—`; a null
-      // payment_terms paints an empty Terms cell.
-      ['Anchor Glassworks', '—', '—, —', '', '7d', '0', '0', '—'],
+      // Gap 5 (d18b68cf), answered: null Terms now says absent with
+      // `—`, as the other nullable columns do.
+      ['Anchor Glassworks', '—', '—, —', '—', '7d', '0', '0', '—'],
       // A null name: the label falls back to the id, and the NAME join
       // matches the PO whose vendor is null (see ORDER_ROWS).
       ['vnd-bare-004', 'hop supplier', 'Spokane, WA', 'Net 15', '10d', '1/ 1', '0', '—'],
@@ -355,8 +355,8 @@ test.describe('/ux/vendors — fixtures', () => {
     await expect(bodyRows(page).nth(3).getByRole('link')).toHaveText('vnd-bare-004');
     await expect(bodyRows(page).nth(3).getByRole('link')).toHaveAttribute('href', '/ux/vendors/vnd-bare-004');
 
-    // Gap 6 (e9c8e28d): the router serves the detail path, but the
-    // catalog lists only the list route, so no crawl visits it.
+    // Gap 6 (e9c8e28d): the catalog lists the primary list surface;
+    // shared crawls now separately seed a native detail representative.
     expect(parseRoute('/ux/vendors/vnd-hops-001')).toMatchObject({ kind: 'vendor' });
     const catalogued = Object.values(ROUTE_CATALOG).map((entry) => entry.path);
     expect(catalogued).toContain(PATH);

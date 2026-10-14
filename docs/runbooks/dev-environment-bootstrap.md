@@ -131,9 +131,8 @@ docker compose up --build       # builds boss:latest from your tree
 Open `http://localhost:4443`. Timings, log checkpoints, the guest
 button and troubleshooting are in
 [`infra/oss-quickstart/README.md`](../../infra/oss-quickstart/README.md);
-seeding a different tenant is
-[`examples/used-device-shop/DOMAIN.md`](../../examples/used-device-shop/DOMAIN.md)
-§Install. The brewery tenant seeds itself through the public API on
+preparing a different tenant follows the
+[tenant contract](../tenant-contract.md). The brewery tenant seeds itself through the public API on
 first start and the sim builds the demo live from an empty
 `audit_log`.
 

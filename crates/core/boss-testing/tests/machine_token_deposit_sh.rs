@@ -14,8 +14,9 @@
 //! reaches the output, the run summary or a request line.
 //!
 //! WHAT THE ISOLATION LEG PROVES, AND WHAT IT DOES NOT. A car's recorded
-//! probe runs on the forge as `BOSS_PROBE_USER` (default `david`,
-//! boss-cli prove.rs). `a_non_root_account_cannot_read_the_token_path`
+//! probe runs on the forge as `BOSS_PROBE_USER` (`boss-probe`, named by
+//! infra/forge/probe-account.sh's drop-in; a host naming none runs no
+//! probe — boss-cli prove.rs). `a_non_root_account_cannot_read_the_token_path`
 //! deposits as root and then reads as another uid — a plain read, a
 //! directory listing and the shared reader itself — and every one comes
 //! back empty-handed. It needs root to make a root-owned tree, so under
@@ -24,8 +25,8 @@
 //! pod for the car's receipt.
 //!
 //! WHAT NO TEST HERE CAN HOLD — two roads, both older than this deposit,
-//! by which a probe running as david reaches the root-only token on the
-//! real host today: (1) david holds `sudo -n docker` there
+//! by which a shell as david reaches the root-only token on the real host
+//! today (a probe no longer runs as david; backlog dda26693): (1) david holds `sudo -n docker` there
 //! (infra/estate/ops-credentials.sh reads /etc/boss-ops through it),
 //! which reaches any root file; (2) forge-converge.service runs
 //! /home/david/boss/infra/forge/forge-converge.sh AS ROOT out of david's
@@ -33,10 +34,10 @@
 //! from there before the converge's checkout -f, so any shell as david
 //! can edit what root runs within ten minutes. The modes this file
 //! holds keep the token from a direct read and from an accident; what
-//! closes both roads is a probe account of its own (design-doc bdc60b65,
-//! question probe-user), a separate car.
+//! took probe text off both roads is a probe account of its own
+//! (design-doc bdc60b65, question probe-user; car 1386dd64).
 
-use boss_testing::{create_dir, repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{create_dir, repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -227,6 +228,7 @@ impl Case {
 
     fn cmd(&self) -> Command {
         let mut c = Command::new("bash");
+        without_proxy(&mut c);
         c.arg(repo_root().join(SCRIPT))
             .args(["--rule", &repo_root().join(RULE).display().to_string()])
             .args(["--dest", &self.dest.display().to_string()])
@@ -790,7 +792,7 @@ fn an_inherited_xtrace_prints_no_value() {
 fn a_wrong_rule_or_invocation_is_refused() {
     let c = Case::new("refused");
     c.secret(&[("current", LIVE)]);
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(repo_root().join(SCRIPT))
         .args([
             "--rule",
@@ -805,7 +807,7 @@ fn a_wrong_rule_or_invocation_is_refused() {
         .unwrap();
     assert_eq!(out.status.code(), Some(78));
     assert!(!c.dest.exists());
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(repo_root().join(SCRIPT))
         .args(["--rule", &repo_root().join(RULE).display().to_string()])
         .args(["--dest", "relative/path"])
@@ -912,7 +914,7 @@ fn a_non_root_account_cannot_read_the_token_path() {
         String::from_utf8_lossy(&out.stderr)
     );
     // And root still reads it: the tree is not merely unreadable.
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .args(["-c", ". \"$LIB\"; trap : EXIT; BOSS_MACHINE_TOKEN_DIR=\"$DIR\" machine_token_header H http://127.0.0.1:7900; [ -n \"$H\" ] && echo stamped"])
         .env("DIR", &c.dest)
         .env("LIB", &reader_copy)
@@ -996,32 +998,26 @@ fn the_converge_deposits_first_and_owes_it_nothing() {
     }
 }
 
-/// The account a car's recorded probe runs as on the forge when nothing
-/// overrides it — boss-cli prove.rs `Shell::unattended`.
-const PROBE_USER: &str = "david";
+/// The forge checkout's owner. A car's recorded probe ran as this account
+/// until it got one of its own (`boss-probe`, infra/forge/probe-account.sh,
+/// backlog 703358ce), and boss-cli prove.rs's fallback to it was retired
+/// on 2026-10-09; the units below still run as it.
+const CHECKOUT_OWNER: &str = "david";
 
-/// THE FORGE UNITS THAT STILL RUN AS THE PROBE'S ACCOUNT, each with what
+/// THE FORGE UNITS THAT STILL RUN AS THE CHECKOUT'S OWNER, each with what
 /// it needs of that account. They cannot read a root-only token, so
-/// their calls go out UNSTAMPED: a known miss, listed, rather than a
-/// token handed to the uid a probe shares. A group the probe user does
-/// not hold would not change that — the unit's header file would still
-/// be written as this uid (secret-header.sh), where a probe running
-/// beside it reads it.
-const UNSTAMPED: &[(&str, &str)] = &[
-    (
-        "cluster-deploy-runner",
-        "fetches and checks out the owner's clone, builds with the owner's rootless docker \
-         daemon and keeps its stamps under $HOME; it is the loop that deploys every fix",
-    ),
-    // cluster-watchdog left this roster with backlog a604a35b: it runs as
-    // root from root's tree, keeps its state under /var/lib/boss/watchdog,
-    // reads the deploy runner's stamp as data, and is stamped.
-    (
-        "disk-floor-sweep",
-        "prunes the owner's rootless docker daemon; as root a cache-deleting sweep would hold \
-         root's reach for the sake of two stamped calls an hour",
-    ),
-];
+/// their calls go out UNSTAMPED: a known miss, listed. Each leaves this
+/// roster by moving to root from root's tree (the forge sudo decision,
+/// position B), not by a group: the unit's header file would still be
+/// written as this uid (secret-header.sh).
+///
+/// Empty since backlog 683d7fe9's second car. cluster-watchdog left with
+/// backlog a604a35b; cluster-deploy-runner and disk-floor-sweep — the
+/// last forge senders arriving tokenless, with maintenance-timer,
+/// boss-step and registry-drift's two lints riding inside them — run as
+/// root from root's tree on the system docker daemon, with the broker's
+/// registry push token.
+const UNSTAMPED: &[(&str, &str)] = &[];
 
 fn forge_unit_users() -> Vec<(String, String)> {
     let dir = repo_root().join("infra/forge");
@@ -1043,37 +1039,48 @@ fn forge_unit_users() -> Vec<(String, String)> {
     out
 }
 
-/// WHO ON THE FORGE CAN READ THE TOKEN, held to the tree: the probe's
-/// account is not root, the host observer moved to root with a spool
-/// only root writes, and the units that still run as the probe's account
-/// are exactly the roster above — a unit that joins or leaves it is a
-/// decision someone makes here, with its reason.
+/// WHO ON THE FORGE CAN READ THE TOKEN, held to the tree: neither the
+/// probe's account nor the checkout's owner is root, a probe no longer
+/// runs as the owner (the drop-in names another account, and prove.rs
+/// falls back to none), the host observer moved to root with a spool only
+/// root writes, and the units that still run as the owner are exactly the
+/// roster above — a unit that joins or leaves it is a decision someone
+/// makes here, with its reason.
 #[test]
-fn the_units_that_share_the_probes_account_are_the_unstamped_roster() {
+fn the_units_that_run_as_the_checkouts_owner_are_the_unstamped_roster() {
     let prove =
         std::fs::read_to_string(repo_root().join("crates/orchestrators/boss-cli/src/prove.rs"))
             .unwrap();
-    let line = prove
-        .lines()
-        .find(|l| l.contains("var(\"BOSS_PROBE_USER\")"))
-        .expect("prove.rs reads BOSS_PROBE_USER");
     assert!(
-        line.contains(&format!("\"{PROBE_USER}\"")),
-        "the probe's default account moved ({line}); the roster below is about the account a \
-         probe runs as, so re-derive it"
+        !prove.contains(&format!("|| \"{CHECKOUT_OWNER}\"")),
+        "prove.rs falls back to the checkout's owner for a probe again (decision c98c79aa, \
+         question fallback, refused that)"
     );
-    assert_ne!(PROBE_USER, "root");
+    let script = std::fs::read_to_string(repo_root().join("infra/forge/probe-account.sh")).unwrap();
+    let account = script
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("ACCOUNT=\"${BOSS_PROBE_ACCOUNT:-")?
+                .strip_suffix("}\"")
+        })
+        .expect("probe-account.sh names the probe's account");
+    assert_ne!(
+        account, CHECKOUT_OWNER,
+        "a probe must not share these units' account"
+    );
+    assert_ne!(account, "root");
+    assert_ne!(CHECKOUT_OWNER, "root");
 
     let users = forge_unit_users();
     let shared: Vec<&str> = users
         .iter()
-        .filter(|(_, u)| u == PROBE_USER)
+        .filter(|(_, u)| u == CHECKOUT_OWNER)
         .map(|(n, _)| n.as_str())
         .collect();
     let want: Vec<&str> = UNSTAMPED.iter().map(|(n, _)| *n).collect();
     assert_eq!(
         shared, want,
-        "the forge units running as `{PROBE_USER}` (a car probe's account) must be exactly the \
+        "the forge units running as `{CHECKOUT_OWNER}` (the checkout's owner) must be exactly the \
          UNSTAMPED roster: each cannot read the root-only machine token, and each needs a reason"
     );
     for (name, why) in UNSTAMPED {
@@ -1081,7 +1088,7 @@ fn the_units_that_share_the_probes_account_are_the_unstamped_roster() {
     }
     for (name, user) in &users {
         assert!(
-            user == "root" || user == PROBE_USER,
+            user == "root" || user == CHECKOUT_OWNER,
             "{name}.service runs as `{user}`: decide whether that account may read the machine \
              token before adding a third kind of reader"
         );

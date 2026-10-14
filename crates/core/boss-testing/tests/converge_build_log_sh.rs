@@ -62,15 +62,16 @@ fn run(dir: &PathBuf, docker_rc: i32, docker_out: &str) -> (i32, String, String)
         &bin.join("docker"),
         &format!("#!/bin/sh\ncat <<'OUT'\n{docker_out}\nOUT\nexit {docker_rc}\n"),
     );
-    // `git rev-parse HEAD` runs inside the block; a stub keeps the test
-    // off any real repository.
-    boss_testing::write_exec(&bin.join("git"), "#!/bin/sh\necho deadbeefdeadbeef\n");
-
+    // The block runs no git: the full sha it attests the build with is
+    // the one the generation names (HEAD_FULL, read off .boss-tree-sha
+    // before it), and its stamp lives in the converge's state directory
+    // (CONVERGE_STATE, forge-defaults.sh) since backlog 683d7fe9.
+    //
     // The block records its timing through run-summary.sh, the one
     // definition every unit's summary goes through; the file is where
     // ExecStopPost reads it from.
     let script = format!(
-        "set -euo pipefail\nHOME={home}\nHEAD=abc1234\nREGISTRY=reg/boss\n. {lib}\n{block}",
+        "set -euo pipefail\nCONVERGE_STATE={home}\nHEAD=abc1234\nHEAD_FULL=abc1234deadbeefdeadbeefdeadbeefdeadbeef\nREGISTRY=reg/boss\n. {lib}\n{block}",
         home = dir.display(),
         lib = repo_root().join("infra/run-summary.sh").display(),
         block = build_block()
@@ -162,7 +163,7 @@ fn a_failed_build_stamps_the_head_so_a_repeat_is_legible() {
         err1.contains("first attempt"),
         "the first failure says so: {err1}"
     );
-    let stamp = s.0.join(".boss-last-build-failed");
+    let stamp = s.0.join("last-build-failed");
     assert_eq!(
         std::fs::read_to_string(&stamp).unwrap().trim(),
         "abc1234",
@@ -180,7 +181,7 @@ fn a_successful_build_says_nothing_and_clears_the_stamp() {
     let s = scratch("ok");
     let (_rc, _o, _e) = run(&s.0, 2, "boom");
     assert!(
-        s.0.join(".boss-last-build-failed").exists(),
+        s.0.join("last-build-failed").exists(),
         "stamped by the failure"
     );
 
@@ -195,7 +196,7 @@ fn a_successful_build_says_nothing_and_clears_the_stamp() {
         "a quiet journal is preserved — the build log is NOT printed on success: {out}{err}"
     );
     assert!(
-        !s.0.join(".boss-last-build-failed").exists(),
+        !s.0.join("last-build-failed").exists(),
         "a build that succeeds clears the stamp, so the next failure reads as a first attempt"
     );
 }

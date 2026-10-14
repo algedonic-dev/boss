@@ -135,6 +135,19 @@ fn the_steps_agents_execute_today_declare_their_agent_block() {
         // verdict on a trust-boundary car, no car of its own: the
         // reviewer setting, at the effort trust-boundary work runs at.
         "ship-a-change/review reviewer $3.00 high",
+        // The independent review of a tenant merge (backlog 84e7c3e4,
+        // design 9de0cd1c — David answered Q1 2026-10-04): ops-request's
+        // `review` step, ready only where the verb declares
+        // `requires_review` (merge-tenant-main). A read and a verdict
+        // over the exact plan a passkey will sign, no car: its own
+        // profile because `boss review` resolves only ship-a-change
+        // cars, at the effort trust-boundary work runs at.
+        "ops-request/review tenant-reviewer $5.00 high",
+        // The review a car no rule held owes AFTER it lands (backlog
+        // bd331d38, option A, David 2026-10-09): the same reviewer
+        // setting, at medium — the cars that need a high-effort read
+        // before boarding are exactly the ones still held for one.
+        "ship-a-change/landed-review reviewer $3.00 medium",
     ]
     .into_iter()
     .map(str::to_string)
@@ -144,7 +157,8 @@ fn the_steps_agents_execute_today_declare_their_agent_block() {
 
 /// What the profile still fixes, now that it no longer fixes the
 /// effort: the rules document the run is briefed with, and so the
-/// names a claim door knows (three since `reviewer`, bc9ef34f). Plus the one priced model on every block
+/// names a claim door knows (three since `reviewer`, bc9ef34f; four
+/// since `tenant-reviewer`, 84e7c3e4). Plus the one priced model on every block
 /// — a step naming a model `agent_rate_card` cannot price would run
 /// unpriced — and a budget inside the cap a builder's car carries, so
 /// a typo'd `50` is a red test rather than an hour of the agent's
@@ -155,9 +169,12 @@ fn every_block_names_a_known_profile_a_priced_model_and_a_bounded_budget() {
         for s in &w.steps {
             let Some(a) = &s.agent else { continue };
             let at = format!("{}/{}", w.kind, s.title);
-            assert_eq!(a.model, "opus-5[1m]", "{at}");
+            assert_eq!(a.model, "opus-5-5", "{at}");
             assert!(
-                matches!(a.profile.as_str(), "builder" | "analyst" | "reviewer"),
+                matches!(
+                    a.profile.as_str(),
+                    "builder" | "analyst" | "reviewer" | "tenant-reviewer"
+                ),
                 "{at}: unexpected profile {}",
                 a.profile
             );

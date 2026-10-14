@@ -1,5 +1,6 @@
 """Fixed image-side harness; branch stdout is data, never a receipt."""
 import json
+import base64
 import os
 import pathlib
 import signal
@@ -7,11 +8,16 @@ import subprocess
 import sys
 import time
 
-head, baseline, budget, identity, checkout = sys.argv[1:]
+head, baseline, budget, identity, checkout, edit_level = sys.argv[1:]
 root = pathlib.Path(checkout)
 env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp/consist-home",
        "BOSS_MACHINE_TOKEN_DIR": "/tmp/consist-home/no-token",
        "BOSS_SOR_ENV": "/tmp/consist-home/no-sor.env", "GIT_CONFIG_NOSYSTEM": "1"}
+# The conductor's read of the edit-level door, handed down because this
+# pod holds no token (backlog 37742794): the edit-level lint judges it and
+# sends nothing. Empty is none handed, and the lint says so.
+if edit_level:
+    env["BOSS_EDIT_LEVEL_ANSWER"] = edit_level
 pathlib.Path(env["BOSS_MACHINE_TOKEN_DIR"]).mkdir(parents=True, exist_ok=True)
 deadline = time.monotonic() + float(budget)
 
@@ -22,12 +28,16 @@ def run(args):
     try:
         stdout, stderr = process.communicate(timeout=max(0.001, deadline-time.monotonic()))
         return {"exit": process.returncode, "stdout": stdout.decode("utf-8", "replace"),
-                "stderr": stderr.decode("utf-8", "replace")}
+                "stderr": stderr.decode("utf-8", "replace"),
+                "stdout_b64": base64.b64encode(stdout).decode("ascii"),
+                "stderr_b64": base64.b64encode(stderr).decode("ascii")}
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         stdout, stderr = process.communicate()
         return {"exit": None, "stdout": stdout.decode("utf-8", "replace"),
-                "stderr": stderr.decode("utf-8", "replace"), "unavailable": "consist budget spent"}
+                "stderr": stderr.decode("utf-8", "replace"), "unavailable": "consist budget spent",
+                "stdout_b64": base64.b64encode(stdout).decode("ascii"),
+                "stderr_b64": base64.b64encode(stderr).decode("ascii")}
 
 
 def checked_tree():

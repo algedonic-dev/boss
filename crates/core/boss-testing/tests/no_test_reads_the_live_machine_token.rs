@@ -5,11 +5,11 @@
 //!
 //! WHAT WAS MEASURED (review of car d36d3478, run d356afce, 2026-09-29).
 //! 63 test sites in boss-cli built their client with
-//! `gate::machine_client()`, which read `machine_token::shared()` — the
+//! `sor_client::machine_client()`, which read `machine_token::shared()` — the
 //! process-wide watched source over the mounted Secret. A failing test
 //! prints the request head it captured, so the day design 6805c764 car 4
 //! mounts the Secret where a gate runs, the estate token would be in the
-//! gate's log. The fix sits inside `gate::machine_client` itself (under
+//! gate's log. The fix sits inside `sor_client::machine_client` itself (under
 //! `cfg(test)` it holds `Source::fixed(None)`), so none of the 63 needed
 //! an edit; this pin holds the opposite line — a test that reaches for
 //! the shared source BY NAME is refused, naming its file and line.

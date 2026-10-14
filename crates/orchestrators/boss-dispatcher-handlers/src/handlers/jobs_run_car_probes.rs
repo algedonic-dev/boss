@@ -32,15 +32,17 @@
 //! records `unrunnable` with the tool named rather than a bare exit
 //! code. This rule does not restate every gate-side refusal; it applies
 //! the ones nothing downstream can (the unidentified read, the offset
-//! git date) — see [`ship_refusal`], which is where that call is argued
-//! rather than described (23b2dffa, 71ec5a58).
+//! git date, a caller cleared from the gate log alone) — see
+//! [`ship_refusal`], which is where that call is argued rather than
+//! described (23b2dffa, 71ec5a58, ce72aea9).
 //! The forge already answers
 //! ops-request packets through a reviewed verb allowlist
 //! (`infra/ops/verbs/run-car-probe.json`), so the run goes through that door:
 //! `boss prove <car> --from-car --unattended` (the tree's CLI on the
 //! forge, backlog 9f00a805) re-reads the car, refuses unless it
-//! has merged and recorded a probe, runs the probe as `david` (never
-//! root) with a timeout, judges it by the two rules `boss prove`
+//! has merged and recorded a probe, runs the probe as `boss-probe`
+//! (never root, never the checkout's owner; infra/forge/probe-account.sh)
+//! with a timeout, judges it by the two rules `boss prove`
 //! applies, and writes the verdict on the car — `proven` completed
 //! with the recorded proof shape on green, `proof_attempt` on the car
 //! and `proven` left ready otherwise.
@@ -50,7 +52,9 @@
 //! hand-proven; a car already proven is not re-proven; a car that
 //! already has an open run-car-probe request is not asked twice
 //! (JetStream is at-least-once and the close marker is emitted from
-//! three sites, so this WILL run more than once per arrival).
+//! three sites, so this WILL run more than once per arrival) — unless
+//! that request's `execute` has completed: it was answered and is only
+//! waiting to be settled, which the hourly firing does (17bf6f3e).
 
 use std::sync::Arc;
 
@@ -185,18 +189,52 @@ pub(crate) struct Arrival {
 /// that succeeded. The gate and `boss prove` refuse the token; a probe
 /// PATCHed onto a car met neither, so this door refuses it too, under
 /// the rule id both of them record.
-fn ship_refusal(probe: &str, expect: Option<&str>) -> Option<Value> {
-    let (rule, why) = if let Some(client) = boss_jobs::probe::reads_the_sor_unidentified(probe) {
+///
+/// THE GATE-LOG-ALONE CLEARANCE IS REFUSED HERE, though `boss prove`
+/// only WARNS of it (backlog ce72aea9; the gate refuses it at park since
+/// 5605c2b5, so this arm now meets only older cars). It warns because the
+/// text cannot tell an absence assertion, which the gap turns green, from
+/// a presence assertion, which it does not — and a person is standing
+/// there to read which one they wrote. This door has nobody to warn, so
+/// its choice is refuse or record, and recording is what went wrong:
+/// after the warning landed, this rule recorded car 033c5c2f PROVEN at
+/// 2026-10-08T23:00Z and car 099f8a9f at 2026-10-10T02:01Z on log-only
+/// probes. A presence probe refused here is not lost — the refusal sits
+/// on the car and `boss prove` runs it by hand, warning and all.
+///
+/// WHAT THE REFUSAL TELLS ITS READER TO DO (review 4ce5ca85 N3). Every
+/// car this door sees has LANDED (`merged=true`, `proven` open), so it
+/// cannot be re-parked, and a bare `boss prove <car> --from-car` would
+/// run this same recorded text. The one act that moves the car is a
+/// hand proof with a replacement probe, so each arm names its fix and
+/// the closing sentence names that verb on this car.
+fn ship_refusal(car_id: &str, probe: &str, expect: Option<&str>) -> Option<Value> {
+    let (rule, why, fix) = if let Some(client) = boss_jobs::probe::reads_the_sor_unidentified(probe)
+    {
         (
             boss_jobs::probe::UNIDENTIFIED_RULE,
             format!(
                 "THE PROBE WAS NOT RUN: it reads the system of record with `{client}` and no \
                  identity, so it would read as operator:unidentified and be answered with a \
-                 NARROWER WORLD, silently. {evidence} Re-park the car with a probe that reads \
-                 as a named reader ({reader} /api/...), or prove it by hand.",
+                 NARROWER WORLD, silently. {evidence}",
                 evidence = boss_jobs::probe::UNIDENTIFIED_READ_EVIDENCE,
+            ),
+            format!(
+                "a probe that reads as a named reader ({reader} /api/...)",
                 reader = boss_jobs::probe::SOR_READER,
             ),
+        )
+    } else if let Some(kind) = boss_jobs::probe::clears_a_caller_from_the_gate_log_alone(probe) {
+        (
+            boss_jobs::probe::GATE_LOG_ALONE_RULE,
+            format!(
+                "THE PROBE WAS NOT RUN: it clears a caller by counting `{kind}` facts in the \
+                 machine gate's log and never reads the live tally's `snapshot.rows`, so a \
+                 caller the running process had already tallied passes whatever it sent. \
+                 {evidence}",
+                evidence = boss_jobs::probe::GATE_LOG_ALONE_EVIDENCE,
+            ),
+            "a probe that also reads the live rows (the jq above)".to_string(),
         )
     } else {
         let token = boss_jobs::probe::reads_git_time_with_an_offset(probe)?;
@@ -205,13 +243,19 @@ fn ship_refusal(probe: &str, expect: Option<&str>) -> Option<Value> {
             format!(
                 "THE PROBE WAS NOT RUN: it reads a git date with `{token}`, which carries the \
                  committer's UTC offset, and a probe that compares that string against the \
-                 system of record's UTC timestamps lies in BOTH directions. {evidence} \
-                 Re-park the car with a probe that compares epochs (git log -1 --format=%ct \
-                 against date -u -d \"$ts\" +%s, the empty guard first), or prove it by hand.",
+                 system of record's UTC timestamps lies in BOTH directions. {evidence}",
                 evidence = boss_jobs::probe::GIT_TIME_STRING_EVIDENCE,
             ),
+            "a probe that compares epochs (git log -1 --format=%ct against date -u -d \"$ts\" \
+             +%s, the empty guard first)"
+                .to_string(),
         )
     };
+    let why = format!(
+        "{why}\nThe car has landed, so it is not re-parked, and `--from-car` would run this \
+         same text. Prove it by hand with {fix}: {by_hand}.",
+        by_hand = boss_jobs::probe::hand_proof_command(car_id),
+    );
     // No `at`: this rule holds no clock (the dispatcher's time comes
     // from the clock port, which this handler does not carry), and the
     // PATCH that records the attempt is itself an audit-log event with
@@ -314,6 +358,36 @@ fn proven_is_completed(car: &Value) -> bool {
         == Some("completed")
 }
 
+/// PURE: the id of this request's `execute` step when that step has
+/// completed — the request has been ANSWERED, whether or not its packet
+/// has closed yet.
+fn completed_execute(request: &Value) -> Option<&str> {
+    request
+        .get("steps")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some("execute"))
+        .filter(|s| s.get("status").and_then(Value::as_str) == Some("completed"))
+        .and_then(|s| s.get("id"))
+        .and_then(Value::as_str)
+}
+
+/// PURE: every open ops-request whose `execute` completed, as `(request
+/// id, execute step id)` — a request answered and never settled, which
+/// the hourly recheck settles by re-sending that completion (backlog
+/// 17bf6f3e). Whatever the verb: this rule is the one hourly reader of
+/// the open request board, and the re-send writes nothing where nothing
+/// is owed, so naming a request of another verb costs one 204.
+pub(crate) fn unsettled_requests(open_requests: &[Value]) -> Vec<(String, String)> {
+    open_requests
+        .iter()
+        .filter_map(|r| {
+            let id = r.get("id").and_then(Value::as_str)?;
+            Some((id.to_string(), completed_execute(r)?.to_string()))
+        })
+        .collect()
+}
+
 pub(crate) fn probe_requests(
     scope: Scope<'_>,
     cars: &[Value],
@@ -322,10 +396,17 @@ pub(crate) fn probe_requests(
     event_id: &str,
     topic: &str,
 ) -> Arrival {
+    // A request whose `execute` completed has been ANSWERED: it holds
+    // its car only while the forge has not yet run it. Read as "still
+    // asking" whatever its steps said, one request left open after its
+    // run retired its car's hourly recheck for good — car 176d5c9d, on
+    // request e8dd5479 from 2026-10-09T04:00Z (backlog 17bf6f3e).
     let already_asked = |car_id: &str| {
-        open_requests
-            .iter()
-            .any(|r| md(r, "verb") == Some(VERB) && md(r, "car") == Some(car_id))
+        open_requests.iter().any(|r| {
+            md(r, "verb") == Some(VERB)
+                && md(r, "car") == Some(car_id)
+                && completed_execute(r).is_none()
+        })
     };
     let mut refusals: Vec<(String, Value)> = Vec::new();
     let requests = cars
@@ -339,7 +420,7 @@ pub(crate) fn probe_requests(
                 return None;
             }
             if let Some(probe) = md(c, PROOF_PROBE)
-                && let Some(attempt) = ship_refusal(probe, md(c, car::PROOF_EXPECT))
+                && let Some(attempt) = ship_refusal(id, probe, md(c, car::PROOF_EXPECT))
             {
                 refusals.push((id.to_string(), attempt));
                 return None;
@@ -455,6 +536,30 @@ impl Handler for JobsRunCarProbes {
                 &ctx.rule_name,
             )
             .await?;
+        }
+        // AN ANSWERED REQUEST LEFT OPEN IS SETTLED, NOT JUST STEPPED
+        // AROUND (backlog 17bf6f3e). Ignoring it above lets its car be
+        // asked again; this closes it. The hourly firing only — the
+        // arrival and owed scopes run on every train and every close, and
+        // an hour is soon enough for a packet that sat open a day. The
+        // status alone, re-sent to the completed `execute`: the step PUT
+        // writes nothing to a completed step, and on an open packet runs
+        // the readiness pass and the declared-terminal close it missed.
+        // A re-send that cannot settle answers 5xx, and this firing
+        // retries and then dead-letters under its rule's name — a
+        // request that cannot close is loud here, never a quiet hold on
+        // its car.
+        if matches!(scope, Scope::Failing) {
+            for (request, execute) in unsettled_requests(&open_requests) {
+                write_json(
+                    &self.client,
+                    reqwest::Method::PUT,
+                    &format!("{}/api/jobs/{request}/steps/{execute}", self.base()),
+                    &json!({"status": "completed"}),
+                    &ctx.rule_name,
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -674,6 +779,13 @@ mod tests {
                 .contains("unidentified"),
             "the attempt must say what was wrong: {attempt}"
         );
+        assert!(
+            attempt["why"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("boss prove c1 --probe '"),
+            "the attempt must name the hand proof that can be followed: {attempt}"
+        );
         assert_eq!(
             attempt["probe"],
             "curl -fsS $BOSS_JOBS_URL/api/jobs?kind=gate-run | grep -q c0ffee"
@@ -719,6 +831,102 @@ mod tests {
             why.contains("%cI") && why.contains("%ct"),
             "the attempt must name the token and the epoch rewrite: {attempt}"
         );
+        assert!(
+            why.contains("boss prove c1 --probe '"),
+            "the attempt must name the hand proof that can be followed: {attempt}"
+        );
+    }
+
+    /// A THIRD RULE WITH NO BACKSTOP DOWNSTREAM (backlog ce72aea9). The
+    /// machine gate writes one would-refuse fact per caller key per
+    /// PROCESS, so a probe that clears a caller by counting post-cut facts
+    /// in the window's `log.dirty`, and never reads the live tally's
+    /// `snapshot.rows`, passes for a caller the running process had
+    /// already tallied — whatever it sends. `boss gate` and `boss prove`
+    /// say so to the person standing there; this door has nobody to say
+    /// it to, and the forge runner sees only a count of zero. Measured
+    /// live 2026-10-10: car 033c5c2f was recorded PROVEN by this door at
+    /// 2026-10-08T23:00Z and car 099f8a9f at 2026-10-10T02:01Z, each on
+    /// a log-only probe of this shape, after the warning had landed. The
+    /// fixture is the shape both carried; the second car is the same
+    /// probe that ALSO reads the live rows, and it is still shipped.
+    #[test]
+    fn a_car_whose_probe_clears_a_caller_from_the_gate_log_alone_is_refused_not_shipped() {
+        let log_only = "n=$(boss-sor-read \"/api/events/gate-window?gate=machine-gate&hours=$hours\" \
+                        | jq -r --arg from \"$jf\" '[.log.dirty[] | select(.kind == \
+                        \"machine_gate.would_refuse\" and .payload.key.user == \
+                        \"automation:gate-runner\" and .at > $from)] | length')\n\
+                        case ${n:-empty} in empty|*[!0-9]*) echo 'not yet'; exit 75;; esac\n\
+                        [ \"$n\" -eq 0 ] && echo cleared";
+        let with_live = format!(
+            "{log_only}\nlive=$(boss-sor-read \"/api/events/gate-window?gate=machine-gate&hours=$hours\" \
+             | jq -r --arg from \"$jf\" '[.live[] | select(.snapshot.mode != \"off\" and .snapshot.overflow == 0 \
+             and .snapshot.recording_since <= $from) | .snapshot.rows[] | select(.presented == \"none\")] | length')"
+        );
+        // The same count with NO kind named, verbatim from car 59e0d3dd's
+        // recorded probe (review 4ce5ca85 B2): `log.dirty` holds only the
+        // once-per-key kinds, so naming none of them is the same claim.
+        let no_kind = "w=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=168')\n\
+                       n=$(printf '%s' \"$w\" | jq --argjson s \"$since\" '[.log.dirty[] | \
+                       select(.payload.key.user == \"automation:probe-admission-source-access\") \
+                       | select((.at | sub(\"\\\\.[0-9]+Z$\"; \"Z\") | fromdate) > ($s + 1800))] \
+                       | length')\n\
+                       [ \"$n\" -eq 0 ] || { echo \"FAILED: $n tokenless reads\"; exit 1; }";
+        let cars = [
+            car(
+                "log-only",
+                "t1",
+                json!({"proof_probe": log_only, "proof_expect": "cleared"}),
+                "ready",
+            ),
+            car(
+                "reads-live",
+                "t1",
+                json!({"proof_probe": with_live, "proof_expect": "cleared"}),
+                "ready",
+            ),
+            car(
+                "no-kind",
+                "t1",
+                json!({"proof_probe": no_kind, "proof_expect": "cleared"}),
+                "ready",
+            ),
+        ];
+        let got = probe_requests(Scope::Train("t1"), &cars, &[], "r", "ev", "jobs.job.closed");
+        let shipped: Vec<&str> = got
+            .requests
+            .iter()
+            .map(|r| r["metadata"]["car"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            shipped,
+            vec!["reads-live"],
+            "only the probe that also reads the live tally may reach the forge"
+        );
+        let refused: Vec<&str> = got.refusals.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(refused, vec!["log-only", "no-kind"]);
+        for (id, attempt) in &got.refusals {
+            assert_eq!(attempt["refused"], boss_jobs::probe::GATE_LOG_ALONE_RULE);
+            assert_eq!(attempt["unrunnable"], false);
+            let why = attempt["why"].as_str().unwrap_or_default();
+            assert!(
+                why.contains("machine_gate.would_refuse") && why.contains("snapshot.rows"),
+                "the attempt must name the fact kind and the live rows to read: {attempt}"
+            );
+            // N3 of review 4ce5ca85: every car this door sees has LANDED,
+            // so "re-park" names an act nobody can take. The refusal
+            // names the one that can be: the hand door, on this car, with
+            // a replacement probe.
+            // And it names it WHOLE (review 446039a0 F1): `--verified` is
+            // required by the hand door whenever `--probe` is given, and
+            // the command this refusal used to print left it out.
+            assert!(
+                why.contains(&boss_jobs::probe::hand_proof_command(id))
+                    && why.contains("--verified '"),
+                "the attempt must name the hand proof that can be followed: {attempt}"
+            );
+        }
+        assert_eq!(got.refusals[0].1["probe"], log_only);
     }
 
     /// And the absent-tool rule is deliberately NOT re-checked here: the
@@ -870,6 +1078,82 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with(REQUEST_TITLE)
+        );
+    }
+
+    /// An open ops-request as the board lists it: its `execute` step in
+    /// `execute_status`.
+    fn request(id: &str, verb: &str, car_id: &str, execute_status: &str) -> Value {
+        json!({
+            "id": id, "kind": "ops-request", "status": "open",
+            "metadata": {"host": "forge", "verb": verb, "car": car_id},
+            "steps": [
+                {"id": format!("{id}-filed"), "spec_slug": "filed", "status": "completed"},
+                {"id": format!("{id}-execute"), "spec_slug": "execute", "status": execute_status},
+                {"id": format!("{id}-answered"), "spec_slug": "answered", "status": "pending"},
+            ]
+        })
+    }
+
+    /// BACKLOG 17bf6f3e. Car 176d5c9d was last probed at
+    /// 2026-10-09T04:00:42Z while every other failing car was rechecked
+    /// hourly: its request e8dd5479 had RUN — `execute` completed at
+    /// 04:01:20Z — and stayed open because its packet was never settled,
+    /// and this guard read any open request as one still being asked. A
+    /// request whose execute completed has been answered; it asks nothing.
+    #[test]
+    fn a_request_whose_execute_completed_is_not_still_asking() {
+        let mut attempt = probed();
+        attempt["proof_attempt"] = json!({"exit": "75", "why": "not yet"});
+        let cars = [
+            car("ran", "t1", attempt.clone(), "ready"),
+            car("waiting", "t1", attempt, "ready"),
+        ];
+        let open = [
+            request("r-ran", VERB, "ran", "completed"),
+            request("r-waiting", VERB, "waiting", "ready"),
+        ];
+        let got = probe_requests(
+            Scope::Failing,
+            &cars,
+            &open,
+            "recheck-failing-probes-hourly",
+            "ev",
+            "clock.tick",
+        );
+        let asked: Vec<&str> = got
+            .requests
+            .iter()
+            .map(|r| r["metadata"]["car"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            asked,
+            vec!["ran"],
+            "the answered request no longer holds its car; the waiting one still does"
+        );
+    }
+
+    /// The other half: the answered-but-open request is not merely
+    /// ignored, it is settled. Every open ops-request whose `execute`
+    /// completed, whatever its verb (85cd57f1 was a disk-report), gets
+    /// its execute completion re-sent — the step PUT's re-send settles
+    /// an open packet (readiness, then the declared-terminal close), and
+    /// writes nothing to a step or packet that needs nothing. A request
+    /// still waiting on its execute is left to the runner.
+    #[test]
+    fn every_open_request_whose_execute_completed_is_named_for_its_resend() {
+        let open = [
+            request("r1", VERB, "c1", "completed"),
+            request("r2", "disk-report", "", "completed"),
+            request("r3", VERB, "c3", "ready"),
+            json!({"id": "r4", "kind": "ops-request", "status": "open", "metadata": {}}),
+        ];
+        assert_eq!(
+            unsettled_requests(&open),
+            vec![
+                ("r1".to_string(), "r1-execute".to_string()),
+                ("r2".to_string(), "r2-execute".to_string()),
+            ]
         );
     }
 }

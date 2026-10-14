@@ -511,7 +511,15 @@ pub(crate) fn fails_entry_path(entry: &str) -> Option<String> {
 /// - every located file exists in the tree the gate judged (`present`)
 ///   — a path that is not a repo file says nothing about the diff;
 /// - the consist's diff was read (`consist` non-empty — nothing read is
-///   not "disjoint") and names none of them.
+///   not "disjoint") and names none of them;
+/// - no path the failure TEXT names (`named`: [`verdict_located_files`]
+///   over the receipt's `fails` and `fails_excerpt`) is a consist file.
+///   A whole-tree scanner panics in its own file, which no car changed,
+///   and lists a car's lines in its message: train 22789ff1's
+///   the_sim_bypass_has_one_door named the two files car 9acb27f1 added,
+///   was read as outside, released every car unstruck, and the next
+///   train boarded the same car (backlog 4a56c797). Such a red is the
+///   consist's, and the judged-red path holds the car it names.
 ///
 /// THE FILE IS THE UNIT, deliberately and with a known limit: 578a0ee9's
 /// consist touched boss-testing, so a crate-level rule would have kept
@@ -528,8 +536,15 @@ pub(crate) fn red_outside_consist(
     rollup: Option<&Value>,
     consist: &[String],
     present: &[String],
+    named: &[String],
 ) -> Option<Vec<String>> {
     if gate_fails.is_empty() || consist.is_empty() || !failing_checks(rollup).is_empty() {
+        return None;
+    }
+    if named
+        .iter()
+        .any(|n| consist.iter().any(|f| names_file(n, f)))
+    {
         return None;
     }
     let mut files: Vec<String> = gate_fails
@@ -1719,7 +1734,13 @@ mod tests {
         ]);
         let present = strs(&[LIVE_578_PATH]);
         assert_eq!(
-            red_outside_consist(&strs(&[LIVE_578]), None, &consist, &present),
+            red_outside_consist(
+                &strs(&[LIVE_578]),
+                None,
+                &consist,
+                &present,
+                &strs(&[LIVE_578_PATH])
+            ),
             Some(strs(&[LIVE_578_PATH]))
         );
     }
@@ -1728,7 +1749,13 @@ mod tests {
     fn a_red_in_a_file_a_car_touched_is_the_consists() {
         let consist = strs(&[LIVE_578_PATH, "infra/dev/boss-api"]);
         assert_eq!(
-            red_outside_consist(&strs(&[LIVE_578]), None, &consist, &strs(&[LIVE_578_PATH])),
+            red_outside_consist(
+                &strs(&[LIVE_578]),
+                None,
+                &consist,
+                &strs(&[LIVE_578_PATH]),
+                &[]
+            ),
             None
         );
     }
@@ -1740,23 +1767,61 @@ mod tests {
         let unlocated = "test: y - FAILED, with no panic line for it in this check's output";
         // One failure the record cannot place: nothing is proven.
         assert_eq!(
-            red_outside_consist(&strs(&[LIVE_578, unlocated]), None, &consist, &present),
+            red_outside_consist(&strs(&[LIVE_578, unlocated]), None, &consist, &present, &[]),
             None
         );
         // No failures on the receipt at all: nothing is proven.
-        assert_eq!(red_outside_consist(&[], None, &consist, &present), None);
+        assert_eq!(
+            red_outside_consist(&[], None, &consist, &present, &[]),
+            None
+        );
         // The consist's diff could not be read: nothing read is not
         // "disjoint".
         assert_eq!(
-            red_outside_consist(&strs(&[LIVE_578]), None, &[], &present),
+            red_outside_consist(&strs(&[LIVE_578]), None, &[], &present, &[]),
             None
         );
         // The located file is not in the tree the gate judged — the
         // location is not a repo file, so it proves nothing about one.
         assert_eq!(
-            red_outside_consist(&strs(&[LIVE_578]), None, &consist, &[]),
+            red_outside_consist(&strs(&[LIVE_578]), None, &consist, &[], &[]),
             None
         );
+    }
+
+    /// Train 22789ff1 (2026-09-26): the panic sat in a tree-wide pin no
+    /// car changed, but its message named two files car 9acb27f1 added.
+    /// That red is the consist's — released unstruck, the same car
+    /// boarded the next train (backlog 4a56c797).
+    #[test]
+    fn a_red_whose_message_names_a_consist_file_is_the_consists() {
+        const FAILS: &str = "test: the_bypass_is_built_only_from_the_deployments_switch - \
+             panicked at crates/core/boss-testing/tests/the_sim_bypass_has_one_door.rs:147:5: \
+             the sim bypass is installed here without the deployment's switch";
+        const DOOR: &str = "crates/core/boss-testing/tests/the_sim_bypass_has_one_door.rs";
+        const PIN: &str = "crates/modules/boss-commerce/tests/the_commerce_api_wires_policy.rs";
+        let consist = strs(&[PIN, "crates/modules/boss-commerce/src/main.rs"]);
+        let present = strs(&[DOOR]);
+        // The panic alone, as before: outside.
+        assert_eq!(
+            red_outside_consist(&strs(&[FAILS]), None, &consist, &present, &strs(&[DOOR])),
+            Some(strs(&[DOOR]))
+        );
+        // The message names the car's file — repo-relative, or as the
+        // gate's absolute checkout path: the consist's.
+        for named in [PIN.to_string(), format!("/gate-target/repo/{PIN}")] {
+            assert_eq!(
+                red_outside_consist(
+                    &strs(&[FAILS]),
+                    None,
+                    &consist,
+                    &present,
+                    &[DOOR.to_string(), named.clone()]
+                ),
+                None,
+                "{named}"
+            );
+        }
     }
 
     #[test]
@@ -1769,7 +1834,8 @@ mod tests {
                 &strs(&[LIVE_578]),
                 Some(&rollup),
                 &strs(&["crates/orchestrators/boss-cli/src/gate.rs"]),
-                &strs(&[LIVE_578_PATH])
+                &strs(&[LIVE_578_PATH]),
+                &[]
             ),
             None
         );

@@ -59,6 +59,44 @@ fn execution_id(run: &str) -> String {
     uuid::Uuid::from_bytes(bytes).to_string()
 }
 
+#[cfg(test)]
+mod brief_reference_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_changed_attachment_reference_is_refused_by_the_existing_pre_spawn_fence() {
+        let reference = json!({"kind":"attachment","file_id":"39d0b528-ff69-4cb8-ba82-408b641da66c","sha256":"a".repeat(64),"size_bytes":100,"encoding":"utf-8"});
+        let registered = json!({"id":"39d0b528-ff69-4cb8-ba82-408b641da66c","kind":"agent-run","partition":"real","owner_id":"agent-test","status":"open","metadata":{"agent":"agent-test","brief":reference}});
+        let mut changed = registered.clone();
+        changed["metadata"]["brief"]["sha256"] = json!("b".repeat(64));
+        let router = axum::Router::new().route(
+            "/api/jobs/{id}",
+            axum::routing::get(move || {
+                let changed = changed.clone();
+                async move { axum::Json(changed) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let err = revalidate_start(
+            &crate::sor_client::machine_client().unwrap(),
+            &format!("http://{address}"),
+            "agent-test",
+            "39d0b528-ff69-4cb8-ba82-408b641da66c",
+            &registered,
+            &json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("registered run or submitted controls changed"),
+            "{err:#}"
+        );
+    }
+}
+
 async fn api(
     http: &boss_core::machine_token::Client,
     base: &str,
@@ -67,7 +105,7 @@ async fn api(
     path: &str,
     body: Option<Value>,
 ) -> Result<Option<Value>> {
-    crate::gate::api_at_signed(
+    crate::sor_client::api_at_signed(
         http,
         base,
         method,
@@ -422,10 +460,10 @@ impl Native {
 async fn run_at(run: &str, scratch: &Path, harness: &str) -> Result<()> {
     uuid::Uuid::parse_str(run).context("launch requires the full registered agent-run UUID")?;
     let actor = crate::identity::sign(&reqwest::Method::POST, "/api/jobs")?;
-    let base = crate::gate::resolve_jobs_base(None)?;
+    let base = crate::sor_client::resolve_jobs_base(None)?;
     // Bound each connection and response body, not the healthy executor's
     // lifetime. A silent observation request must unblock paired native IO.
-    let http = crate::gate::machine_client_with(
+    let http = crate::sor_client::machine_client_with(
         reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)),
     )?;
     let job = get(&http, &base, &actor, run).await?;
@@ -455,7 +493,8 @@ async fn run_at(run: &str, scratch: &Path, harness: &str) -> Result<()> {
     if !matches!(effort, "low" | "medium" | "high" | "xhigh") {
         bail!("the requested effort is unsupported by this native adapter");
     }
-    let brief = text(md, "brief")?;
+    let content = crate::tenant_publish::service_on_door(&base, "content")?;
+    let brief = crate::dispatch_brief::read_at(&http, &content, &actor, &md["brief"]).await?;
     let packet_id = text(md, "packet")?;
     let slug = text(md, "step")?;
     let packet = get(&http, &base, &actor, packet_id).await?;

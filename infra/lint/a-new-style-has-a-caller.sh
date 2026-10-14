@@ -70,8 +70,15 @@ MB=$(resolve_merge_base "$LINT" "$BASE" HEAD) || exit $?
 selectors() {
     python3 -c '
 import re, sys
+# CSS comments are prose, not selectors (81057ce6). Keep quoted
+# strings intact: a quoted /* must not hide a real selector after it.
+css = re.sub(
+    r"\"(?:\\.|[^\"\\])*\"|\x27(?:\\.|[^\x27\\])*\x27|/\*.*?\*/",
+    lambda m: " " if m.group(0).startswith("/*") else m.group(0),
+    sys.stdin.read(), flags=re.S,
+)
 print("\n".join(sorted(set(
-    re.findall(r"\.([a-zA-Z_][\w-]*)\s*(?=[,{:.\s>+~\[])", sys.stdin.read())
+    re.findall(r"\.([a-zA-Z_][\w-]*)\s*(?=[,{:.\s>+~\[])", css)
 )))) '
 }
 

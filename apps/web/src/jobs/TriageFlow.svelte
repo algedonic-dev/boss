@@ -196,9 +196,9 @@
 {#if loading}
   <p class="tf-msg">Reading the queue…</p>
 {:else if error && !dag}
-  <p class="tf-msg tf-err">{error}</p>
+  <p class="tf-msg tf-err load-failed">{error}</p>
 {:else if dag}
-  {#if error}<p class="tf-msg tf-err">{error}</p>{/if}
+  {#if error}<p class="tf-msg tf-err load-failed">{error}</p>{/if}
   <StepDag
     nodes={dag.nodes}
     edges={dag.edges}

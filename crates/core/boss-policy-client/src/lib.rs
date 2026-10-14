@@ -30,6 +30,8 @@ pub mod defaults;
 pub mod engine;
 pub mod in_memory;
 pub mod port;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod predicates;
 pub mod role_guard;
 pub mod role_inventory;
@@ -192,6 +194,23 @@ impl axum::response::IntoResponse for PolicyClientError {
 
 #[async_trait]
 pub trait PolicyClient: Send + Sync {
+    fn try_lock_selection_rows(
+        &self,
+    ) -> Result<Option<Box<dyn crate::port::PolicySelectionRows + '_>>, crate::port::PolicyError>
+    {
+        Err(crate::port::PolicyError::Storage(
+            "nonblocking native policy owner unavailable".into(),
+        ))
+    }
+    /// Native writer exclusion only; remote clients cannot promise it.
+    fn lock_selection_rows(
+        &self,
+    ) -> Result<Box<dyn crate::port::PolicySelectionRows + '_>, crate::port::PolicyError> {
+        Err(crate::port::PolicyError::Storage(
+            "native policy owner unavailable".into(),
+        ))
+    }
+
     async fn check(
         &self,
         user: &User,
@@ -685,6 +704,13 @@ pub struct FakePolicyClient {
 }
 
 impl FakePolicyClient {
+    /// Bind the same actual in-process repository its writers use. This is
+    /// a dependency constructor, not a cached decision or privilege grant.
+    pub fn from_repository(repo: Arc<crate::InMemoryPolicy>) -> Self {
+        Self {
+            engine: Arc::new(PolicyEngine::new(repo)),
+        }
+    }
     pub fn builder() -> FakePolicyClientBuilder {
         FakePolicyClientBuilder::default()
     }
@@ -754,6 +780,18 @@ impl FakePolicyClientBuilder {
 
 #[async_trait]
 impl PolicyClient for FakePolicyClient {
+    fn try_lock_selection_rows(
+        &self,
+    ) -> Result<Option<Box<dyn crate::port::PolicySelectionRows + '_>>, crate::port::PolicyError>
+    {
+        self.engine.try_lock_selection_rows()
+    }
+    fn lock_selection_rows(
+        &self,
+    ) -> Result<Box<dyn crate::port::PolicySelectionRows + '_>, crate::port::PolicyError> {
+        self.engine.lock_selection_rows()
+    }
+
     async fn check(
         &self,
         user: &User,
@@ -998,14 +1036,6 @@ mod tests {
         ReqwestPolicyClient::with_timeout("test", url, std::time::Duration::from_secs(60))
     }
 
-    /// A base URL nothing listens on: bound, read, and released.
-    async fn dark_policy_url() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        format!("http://{addr}")
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn a_policy_5xx_is_an_outage_and_the_next_check_asks_again() {
         let (url, seen) = policy_stub(1, axum::http::StatusCode::SERVICE_UNAVAILABLE).await;
@@ -1045,7 +1075,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_dark_policy_service_is_an_error_on_check_and_on_scope() {
-        let c = ReqwestPolicyClient::new("test", dark_policy_url().await);
+        // Held, not bound and released (review 465e723f F3).
+        let dark = boss_testing::dark_port();
+        let c = ReqwestPolicyClient::new("test", dark.base.clone());
         let check = c.check(&user(), Action::Read, Resource::job()).await;
         assert!(
             matches!(check, Err(PolicyClientError::Unreachable(_))),
@@ -1348,7 +1380,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_real_outage_answers_without_the_policy_services_address() {
         use axum::response::IntoResponse;
-        let url = dark_policy_url().await;
+        // Held, not bound and released (review 465e723f F3).
+        let dark = boss_testing::dark_port();
+        let url = dark.base.clone();
         let c = ReqwestPolicyClient::new("test", url.clone());
         let err = c
             .check(&user(), Action::Read, Resource::job())

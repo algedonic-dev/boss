@@ -16,7 +16,7 @@
 
 use boss_core::actor::ActorId;
 use boss_jobs::events::{
-    STATION_DRAFT_SAVED, STATION_PUBLISHED, STATION_QUARANTINED, STATION_RETIRED,
+    STATION_CLAIMED, STATION_DRAFT_SAVED, STATION_PUBLISHED, STATION_QUARANTINED, STATION_RETIRED,
 };
 use boss_jobs::registry::WorkflowStatus;
 use boss_jobs::station_queue::{StationPredicate, StepMatch};
@@ -546,19 +546,22 @@ async fn station_event_kinds_are_registered() {
     assert_eq!(
         kinds,
         // Alphabetical, because the query is ORDER BY kind_pattern —
-        // `quarantined` sorts between `published` and `retired`.
+        // `claimed` sorts before `draft_saved`; `quarantined` sorts
+        // between `published` and `retired`.
         //
         // This list is the second home of a fact that lives in the
-        // event_kinds INSERTs of migrations 116 and 120 (§9a's equality
+        // event_kinds INSERTs of the station migrations (§9a's equality
         // test), and it did exactly its job: adding
         // `jobs.station.quarantined` in 120 reddened here, which is how
         // an unregistered marker gets caught before it reaches
         // production rather than after.
         vec![
+            STATION_CLAIMED.to_string(),
             STATION_DRAFT_SAVED.to_string(),
             STATION_PUBLISHED.to_string(),
             STATION_QUARANTINED.to_string(),
             STATION_RETIRED.to_string(),
+            boss_jobs::events::STATION_SELECTION_EVIDENCE.to_string(),
         ]
     );
 }

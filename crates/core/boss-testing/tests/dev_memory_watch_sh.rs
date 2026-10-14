@@ -13,7 +13,7 @@
 //! carrying the last sample from BEFORE the kill, and a loop that only
 //! starts where it will outlive the container it watches.
 
-use boss_testing::repo_root;
+use boss_testing::{repo_root, without_proxy};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -89,7 +89,8 @@ fn pod(dev_restarts: u32, killed: Option<(&str, i32, &str)>) -> String {
 /// and `$STUB_SOR` says what the system of record does with it: `down`
 /// answers nothing (exit 7, curl's own `000`); `refuse` answers 422 to
 /// every body and `refuse:<needle>` only to a body containing the
-/// needle; anything else appends the body to `$STUB_POSTED` as one line
+/// needle; `answer:<code>` answers that code to every body; anything
+/// else appends the body to `$STUB_POSTED` as one line
 /// and answers 201. Any other read (the owner lookup) is an empty
 /// roster.
 fn stub_curl(root: &Path) -> PathBuf {
@@ -130,6 +131,8 @@ fn stub_curl(root: &Path) -> PathBuf {
             "        down) printf 000; exit 7 ;;\n",
             "        refuse) refused=1 ;;\n",
             "        refuse:*) case \"$body\" in *\"${sor#refuse:}\"*) refused=1 ;; esac ;;\n",
+            // An answer that judges the CALLER or the API, not the body.
+            "        answer:*) echo '{\"error\":\"not this body\"}' > \"$out\"; printf '%s' \"${sor#answer:}\"; exit 0 ;;\n",
             "    esac\n",
             "    if [ -n \"${refused:-}\" ]; then\n",
             "        echo '{\"error\":\"unprocessable\"}' > \"$out\"; printf 422; exit 0\n",
@@ -176,6 +179,7 @@ impl Fixture {
 
     fn run(&self, mode: &str, extra: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new("bash");
+        without_proxy(&mut cmd);
         cmd.arg(repo_root().join("infra/cluster/dev-memory-watch.sh"))
             .arg(mode)
             .env("WORK_MOUNT", self.root.join("work"))
@@ -321,6 +325,501 @@ fn busy_pod(fx: &Fixture) {
     );
     process(&fx.proc, 200, PG_ID, 30_000, 20_000, &["postgres"]);
     process(&fx.proc, 300, "", 700, 600, &["bash", "watch"]);
+}
+
+fn running_sampler_pod(extra_missing: bool) -> String {
+    let mut p: serde_json::Value = serde_json::from_str(&pod(0, None)).expect("fixture pod");
+    for status in p["status"]["containerStatuses"]
+        .as_array_mut()
+        .expect("statuses")
+    {
+        status["state"] = serde_json::json!({"running": {"startedAt": "2026-10-12T00:00:00Z"}});
+    }
+    for (name, id) in [
+        (
+            "reclaim",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        (
+            "unobserved",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+    ] {
+        if name == "unobserved" && !extra_missing {
+            continue;
+        }
+        p["spec"]["containers"]
+            .as_array_mut()
+            .expect("spec")
+            .push(serde_json::json!({"name": name}));
+        p["status"]["containerStatuses"]
+            .as_array_mut()
+            .expect("statuses")
+            .push(serde_json::json!({
+                "name": name, "containerID": format!("containerd://{id}"), "restartCount": 0,
+                "state": {"running": {"startedAt": "2026-10-12T00:00:00Z"}}
+            }));
+    }
+    p.to_string()
+}
+
+#[test]
+fn sandbox_attestation_refuses_unrelated_malformed_and_ambiguous_groups() {
+    let sandbox = "4191072d995a45c2998d8b7d994892ddce53c55fbf9309b9836d322fbc2a53b0";
+    let valid = format!(
+        "42 1 0:12 /lib/containerd/io.containerd.grpc.v1.cri/sandboxes/{sandbox}/hostname /etc/hostname rw - xfs fixture rw\n"
+    );
+    let cases = [
+        ("missing", String::new(), false),
+        ("wrong-id", valid.replace(sandbox, &"c".repeat(64)), false),
+        ("short-id", valid.replace(sandbox, "4191072d995a"), false),
+        (
+            "uppercase",
+            valid.replace(sandbox, &sandbox.to_uppercase()),
+            false,
+        ),
+        (
+            "wrong-point",
+            valid.replace(" /etc/hostname ", " /etc/other "),
+            false,
+        ),
+        (
+            "wrong-root",
+            valid.replace("/lib/containerd/", "/unrelated/containerd/"),
+            false,
+        ),
+        (
+            "runtime-lookalike",
+            valid.replace("io.containerd.grpc.v1.cri", "ioXcontainerdXgrpcXv1Xcri"),
+            false,
+        ),
+        (
+            "root-suffix",
+            valid.replace("/hostname /etc", "/hostname/extra /etc"),
+            false,
+        ),
+        (
+            "root-prefix",
+            valid.replace("/lib/containerd/", "/extra/lib/containerd/"),
+            false,
+        ),
+        ("duplicate", format!("{valid}{valid}"), false),
+        ("truncated", valid.replace(" - xfs fixture rw", ""), false),
+        ("regular-collision", valid.replace(sandbox, DEV_ID), false),
+        ("extra-group", valid.clone(), true),
+    ];
+    for (name, mountinfo, extra) in cases {
+        let root = boss_testing::scratch_dir(&format!("boss-dmw-sandbox-{name}"));
+        let _guard = Scratch(root.clone());
+        let fx = Fixture::new(&root);
+        busy_pod(&fx);
+        fx.set_pod(&running_sampler_pod(false));
+        process(&fx.proc, 400, sandbox, 56, 46, &["pause"]);
+        if extra {
+            process(&fx.proc, 401, &"d".repeat(64), 1, 0, &["unknown"]);
+        }
+        boss_testing::create_dir(&fx.proc.join("self"));
+        boss_testing::write_file(&fx.proc.join("self/mountinfo"), &mountinfo);
+        let out = fx.run("--tick", &[]);
+        assert!(out.status.success(), "{name}: {}", say(&out));
+        let sample = std::fs::read_to_string(fx.ring().last().expect("sample")).expect("text");
+        assert!(
+            sample.contains("own-binding\tself\tunknown"),
+            "{name}: {sample}"
+        );
+        assert!(
+            sample.contains("container\t4191072d995a\tprocs=1\trss_kib=224"),
+            "{name}: {sample}"
+        );
+        assert!(
+            sample.contains("container\tself\tprocs=1\trss_kib=2800"),
+            "{name}: {sample}"
+        );
+    }
+}
+
+#[test]
+fn sandbox_attestation_accepts_containerd_state_root_with_optional_mount_fields() {
+    let root = boss_testing::scratch_dir("boss-dmw-sandbox-var-lib");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    busy_pod(&fx);
+    fx.set_pod(&running_sampler_pod(false));
+    let sandbox = "4191072d995a45c2998d8b7d994892ddce53c55fbf9309b9836d322fbc2a53b0";
+    process(&fx.proc, 400, sandbox, 56, 46, &["pause"]);
+    boss_testing::create_dir(&fx.proc.join("self"));
+    boss_testing::write_file(
+        &fx.proc.join("self/mountinfo"),
+        &format!(
+            "41 1 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n42 1 0:12 /var/lib/containerd/io.containerd.grpc.v1.cri/sandboxes/{sandbox}/hostname /etc/hostname rw shared:12 - xfs fixture rw\n"
+        ),
+    );
+    let out = fx.run("--tick", &[]);
+    assert!(out.status.success(), "{}", say(&out));
+    let sample = std::fs::read_to_string(fx.ring().last().expect("sample")).expect("text");
+    assert!(
+        sample.contains("own-binding\treclaim\tmethod=unique-running-minus-external"),
+        "{sample}"
+    );
+    assert!(sample.contains("pod_uid=pod-uid-1"), "{sample}");
+    assert!(
+        sample.contains("container\t4191072d995a\tprocs=1\trss_kib=224"),
+        "{sample}"
+    );
+}
+
+#[test]
+fn sandbox_attestation_cannot_exempt_a_regular_container_id() {
+    let root = boss_testing::scratch_dir("boss-dmw-sandbox-regular-id");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    busy_pod(&fx);
+    fx.set_pod(&running_sampler_pod(false));
+    boss_testing::create_dir(&fx.proc.join("self"));
+    boss_testing::write_file(
+        &fx.proc.join("self/mountinfo"),
+        &format!(
+            "42 1 0:12 /lib/containerd/io.containerd.grpc.v1.cri/sandboxes/{DEV_ID}/hostname /etc/hostname rw - xfs fixture rw\n"
+        ),
+    );
+    let out = fx.run("--tick", &[]);
+    assert!(out.status.success(), "{}", say(&out));
+    let sample = std::fs::read_to_string(fx.ring().last().expect("sample")).expect("text");
+    assert!(sample.contains("own-binding\tself\tunknown"), "{sample}");
+    assert!(sample.contains("container\tdev\tprocs=2"), "{sample}");
+}
+
+#[test]
+fn independently_attested_sandbox_preserves_sampler_binding_and_population() {
+    let root = boss_testing::scratch_dir("boss-dmw-attested-sandbox");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    busy_pod(&fx);
+    fx.set_pod(&running_sampler_pod(false));
+    let sandbox = "4191072d995a45c2998d8b7d994892ddce53c55fbf9309b9836d322fbc2a53b0";
+    process(&fx.proc, 400, sandbox, 56, 46, &["pause"]);
+    boss_testing::create_dir(&fx.proc.join("self"));
+    boss_testing::write_file(
+        &fx.proc.join("self/mountinfo"),
+        &format!(
+            "42 1 0:12 /lib/containerd/io.containerd.grpc.v1.cri/sandboxes/{sandbox}/hostname /etc/hostname rw - xfs fixture rw\n"
+        ),
+    );
+    let out = fx.run("--tick", &[]);
+    assert!(out.status.success(), "{}", say(&out));
+    let sample = std::fs::read_to_string(fx.ring().last().expect("sample")).expect("sample text");
+    assert!(
+        sample.contains("own-binding\treclaim\tmethod=unique-running-minus-external"),
+        "{sample}"
+    );
+    assert!(
+        sample.contains(&format!("sandbox_id={sandbox}")),
+        "{sample}"
+    );
+    assert!(
+        sample.contains("sandbox_source=own-hostname-mount"),
+        "{sample}"
+    );
+    let mut regular_external = [DEV_ID, PG_ID];
+    regular_external.sort();
+    assert!(
+        sample.contains(&format!(
+            "external_ids={}\tsandbox_id={sandbox}",
+            regular_external.join(",")
+        )),
+        "sandbox provenance must be separate from regular IDs: {sample}"
+    );
+    assert!(
+        sample.contains("container\t4191072d995a\tprocs=1\trss_kib=224"),
+        "{sample}"
+    );
+}
+
+#[test]
+fn sampler_identity_requires_unique_native_running_container_and_keeps_numeric_categories() {
+    let root = boss_testing::scratch_dir("boss-dmw-own-binding");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    busy_pod(&fx);
+    let own = fx.proc.join("300/root/sys/fs/cgroup");
+    boss_testing::create_dir(&own);
+    boss_testing::write_file(&own.join("memory.current"), "268210176\n");
+    boss_testing::write_file(
+        &own.join("memory.stat"),
+        "anon 169148416\nfile 90000000\nshmem 12000000\nkernel 8000000\nslab 4000000\nunknown_field PRIVATE_MARKER\n",
+    );
+    fx.set_pod(&running_sampler_pod(false));
+    let out = fx.run("--tick", &[]);
+    assert!(out.status.success(), "{}", say(&out));
+    let sample = std::fs::read_to_string(fx.ring().last().expect("sample")).expect("sample text");
+    for expected in [
+        "container\treclaim\tprocs=1",
+        "cgroup\treclaim\tcurrent=268210176",
+        "own-binding\treclaim\tmethod=unique-running-minus-external",
+        "memory-stat\treclaim\tanon=169148416",
+        "file=90000000",
+        "shmem=12000000",
+        "kernel=8000000",
+        "slab=4000000",
+    ] {
+        assert!(sample.contains(expected), "missing {expected}:\n{sample}");
+    }
+    assert!(
+        !sample.contains("PRIVATE_MARKER"),
+        "non-numeric stat data is not telemetry"
+    );
+}
+
+#[test]
+fn ambiguous_sampler_identity_keeps_unassigned_own_numeric_evidence() {
+    let root = boss_testing::scratch_dir("boss-dmw-own-ambiguous");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    busy_pod(&fx);
+    fx.set_pod(&running_sampler_pod(true));
+    let out = fx.run("--tick", &[]);
+    assert!(out.status.success(), "{}", say(&out));
+    let sample = std::fs::read_to_string(fx.ring().last().expect("sample")).expect("sample text");
+    assert!(
+        sample.contains("container\tself\tprocs=1"),
+        "ambiguous evidence stays unassigned: {sample}"
+    );
+    assert!(
+        sample.contains("own-binding\tself\tunknown"),
+        "ambiguity is explicit: {sample}"
+    );
+    assert!(!sample.contains("container\treclaim\t"));
+}
+
+#[test]
+fn historical_unbound_sampler_is_not_reassigned_or_reported_as_no_processes() {
+    let root = boss_testing::scratch_dir("boss-dmw-historical-own");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    busy_pod(&fx);
+    let own = fx.proc.join("300/root/sys/fs/cgroup");
+    boss_testing::create_dir(&own);
+    boss_testing::write_file(&own.join("memory.current"), "268210176\n");
+    boss_testing::write_file(
+        &own.join("memory.stat"),
+        "anon 169148416\nfile 90000000\nshmem 12000000\n",
+    );
+    fx.set_pod(&pod(0, None));
+    let out = fx.run("--tick", &[]);
+    assert!(out.status.success(), "{}", say(&out));
+    // A v1 sample had no own-binding record. Its original self label
+    // still must not acquire today's native identity on replay.
+    let old_sample = fx.ring().last().expect("sample").clone();
+    let text = std::fs::read_to_string(&old_sample).expect("fixture sample");
+    let v1: String = text
+        .lines()
+        .filter(|line| !line.starts_with("own-binding\t"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    boss_testing::write_file(&old_sample, &v1);
+    let (_, finished) = date_the_sample_before_a_kill(&fx, 10);
+    let mut p: serde_json::Value = serde_json::from_str(&running_sampler_pod(false)).expect("pod");
+    p["status"]["containerStatuses"][2]["restartCount"] = serde_json::json!(1);
+    p["status"]["containerStatuses"][2]["lastState"] = serde_json::json!({"terminated": {
+        "reason": "OOMKilled", "exitCode": 137, "finishedAt": finished}});
+    fx.set_pod(&p.to_string());
+    let out = fx.run("--tick", &[]);
+    assert!(out.status.success(), "{}", say(&out));
+    let posted = fx.posted();
+    assert_eq!(posted.len(), 1);
+    let detail = posted[0]["metadata"]["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains("binding unknown")
+            && detail.contains("unassigned sampler")
+            && detail.contains("current=268210176"),
+        "unknown evidence remains visible: {detail}"
+    );
+    assert!(
+        !detail.contains("none of its processes"),
+        "absence of binding is not absence: {detail}"
+    );
+    assert!(
+        !detail.contains("bash[300]"),
+        "unassigned processes must not become reclaim processes: {detail}"
+    );
+    assert!(
+        detail.contains("unassigned memory.stat") && detail.contains("shmem=12000000"),
+        "safe unknown-binding categories stay visible: {detail}"
+    );
+}
+
+#[test]
+fn incomplete_native_status_cannot_manufacture_unique_sampler_identity() {
+    let root = boss_testing::scratch_dir("boss-dmw-incomplete-native");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    busy_pod(&fx);
+    let mut p: serde_json::Value = serde_json::from_str(&running_sampler_pod(true)).expect("pod");
+    p["status"]["containerStatuses"]
+        .as_array_mut()
+        .expect("statuses")
+        .pop();
+    // Its spec still names the fourth container. Dropping its status
+    // must not turn two possible owners into one.
+    fx.set_pod(&p.to_string());
+    let out = fx.run("--tick", &[]);
+    assert!(out.status.success(), "{}", say(&out));
+    let sample = std::fs::read_to_string(fx.ring().last().expect("sample")).expect("text");
+    assert!(
+        sample.contains("own-binding\tself\tunknown"),
+        "incomplete native status is not a unique binding: {sample}"
+    );
+    assert!(!sample.contains("container\treclaim\t"));
+}
+
+#[test]
+fn duplicate_or_malformed_memory_stat_values_are_unknown() {
+    let root = boss_testing::scratch_dir("boss-dmw-stat-unknown");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    busy_pod(&fx);
+    let own = fx.proc.join("300/root/sys/fs/cgroup");
+    boss_testing::create_dir(&own);
+    boss_testing::write_file(
+        &own.join("memory.stat"),
+        "anon 42\nanon MALFORMED EXTRA\nfile nonnumeric\nshmem 17\n",
+    );
+    fx.set_pod(&running_sampler_pod(false));
+    let out = fx.run("--tick", &[]);
+    assert!(out.status.success(), "{}", say(&out));
+    let sample = std::fs::read_to_string(fx.ring().last().expect("sample")).expect("text");
+    let stats = sample
+        .lines()
+        .find(|line| line.starts_with("memory-stat\treclaim\t"))
+        .expect("reclaim categories");
+    for expected in [
+        "\tanon=unknown\t",
+        "\tfile=unknown\t",
+        "\tshmem=17\t",
+        "\tkernel=unknown\t",
+    ] {
+        assert!(stats.contains(expected), "missing {expected}: {sample}");
+    }
+    assert!(!sample.contains("MALFORMED") && !sample.contains("nonnumeric"));
+}
+
+#[test]
+fn sampler_binding_refuses_dark_wrong_pod_unread_and_duplicate_native_ids() {
+    for mode in [
+        "dark",
+        "empty-document",
+        "wrong-pod",
+        "unread-cgroup",
+        "duplicate-id",
+        "malformed-id",
+    ] {
+        let root = boss_testing::scratch_dir(&format!("boss-dmw-own-{mode}"));
+        let _guard = Scratch(root.clone());
+        let fx = Fixture::new(&root);
+        busy_pod(&fx);
+        let mut p: serde_json::Value =
+            serde_json::from_str(&running_sampler_pod(false)).expect("pod");
+        match mode {
+            "wrong-pod" => p["metadata"]["name"] = serde_json::json!("another-pod"),
+            "duplicate-id" => {
+                p["status"]["containerStatuses"][2]["containerID"] =
+                    serde_json::json!(format!("containerd://{PG_ID}"))
+            }
+            "malformed-id" => {
+                p["status"]["containerStatuses"][2]["containerID"] =
+                    serde_json::json!("containerd://unknown")
+            }
+            "unread-cgroup" => {
+                std::fs::remove_file(fx.proc.join("200/cgroup")).expect("remove fixture cgroup");
+            }
+            _ => {}
+        }
+        if mode == "empty-document" {
+            fx.set_pod("");
+        } else if mode != "dark" {
+            fx.set_pod(&p.to_string());
+        }
+        let out = fx.run("--tick", &[]);
+        assert!(out.status.success(), "{mode}: {}", say(&out));
+        let sample = std::fs::read_to_string(fx.ring().last().expect("sample")).expect("text");
+        assert!(
+            sample.contains("own-binding\tself\tunknown")
+                && sample.contains("container\tself\tprocs=1"),
+            "{mode} must retain unassigned evidence: {sample}"
+        );
+        assert!(!sample.contains("container\treclaim\t"), "{mode}: {sample}");
+        let stats = sample
+            .lines()
+            .find(|line| line.starts_with("memory-stat\tself\t"))
+            .expect("own unknown stats");
+        assert!(
+            stats.contains("\tanon=unknown\t"),
+            "missing counters are unknown: {stats}"
+        );
+    }
+}
+
+#[test]
+fn zero_resident_external_process_still_establishes_its_native_cgroup_identity() {
+    let root = boss_testing::scratch_dir("boss-dmw-zero-resident-external");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    busy_pod(&fx);
+    process(&fx.proc, 200, PG_ID, 0, 0, &["postgres"]);
+    fx.set_pod(&running_sampler_pod(false));
+    let out = fx.run("--tick", &[]);
+    assert!(out.status.success(), "{}", say(&out));
+    let sample = std::fs::read_to_string(fx.ring().last().expect("sample")).expect("text");
+    let binding = sample
+        .lines()
+        .find(|line| line.starts_with("own-binding\treclaim\t"))
+        .expect("unique own binding");
+    for want in [
+        "method=unique-running-minus-external",
+        "pod_uid=pod-uid-1",
+        DEV_ID,
+        PG_ID,
+        "id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        assert!(binding.contains(want), "binding lacks {want}: {binding}");
+    }
+    assert!(sample.contains("container\treclaim\tprocs=1"));
+    assert!(
+        !sample.contains("container\tpostgres\t"),
+        "zero-resident process contributes identity, not RSS: {sample}"
+    );
+}
+
+#[test]
+fn sampler_binding_requires_native_running_state_objects() {
+    for (tag, running) in [
+        ("false", serde_json::json!(false)),
+        ("null", serde_json::Value::Null),
+        ("string", serde_json::json!("running")),
+        ("number", serde_json::json!(1)),
+        ("array", serde_json::json!([])),
+        ("empty-object", serde_json::json!({})),
+    ] {
+        let root = boss_testing::scratch_dir(&format!("boss-dmw-running-{tag}"));
+        let _guard = Scratch(root.clone());
+        let fx = Fixture::new(&root);
+        busy_pod(&fx);
+        let mut p: serde_json::Value =
+            serde_json::from_str(&running_sampler_pod(false)).expect("pod");
+        p["status"]["containerStatuses"][2]["state"]["running"] = running;
+        fx.set_pod(&p.to_string());
+        let out = fx.run("--tick", &[]);
+        assert!(out.status.success(), "{tag}: {}", say(&out));
+        let sample = std::fs::read_to_string(fx.ring().last().expect("sample")).expect("text");
+        assert!(
+            sample.contains("own-binding\tself\tunknown"),
+            "{tag} is not native running-state evidence: {sample}"
+        );
+        assert!(
+            !sample.contains("container\treclaim\t"),
+            "{tag} must not manufacture a native owner: {sample}"
+        );
+    }
 }
 
 #[test]
@@ -489,6 +988,138 @@ fn a_restart_raises_one_alert_carrying_the_last_sample_before_the_kill() {
         "the same restart is raised once: {}",
         say(&out)
     );
+}
+
+/// The pod status of the pod that REPLACED the fixture's: another uid,
+/// so nothing the watch kept for the old pod's containers applies.
+fn replaced_pod(dev_restarts: u32, killed: Option<(&str, i32, &str)>) -> String {
+    pod(dev_restarts, killed).replace("pod-uid-1", "pod-uid-2")
+}
+
+/// Backlog 36b1aa00 (B), from delta review d617cf4e. The ring is on the
+/// PVC and survives a pod roll, and the watch in a new pod starts only
+/// with the sidecar's first pass, minutes in. A kill of the NEW pod's
+/// dev container before that first sample was filed urgent with `Last
+/// sample, N s before the kill` describing the PREVIOUS pod's
+/// container: a sample was never asked which pod it was taken in. It
+/// stays urgent — it is a new kill nobody recorded — and it says that
+/// no sample of this pod precedes it, naming the pod the ring's samples
+/// came from.
+#[test]
+fn a_new_pods_first_kill_is_never_described_with_the_old_pods_sample() {
+    let root = boss_testing::scratch_dir("boss-dmw-roll");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    busy_pod(&fx);
+    fx.set_pod(&pod(0, None));
+    // The old pod's loop samples its busy dev container.
+    let out = fx.run("--tick", &[]);
+    assert!(out.status.success(), "{}", say(&out));
+    let (before, finished) = date_the_sample_before_a_kill(&fx, 10);
+
+    // The pod rolls. The new pod's dev container is killed before the
+    // watch has sampled it, and the watch's first tick there finds it.
+    fx.set_pod(&replaced_pod(1, Some(("OOMKilled", 137, &finished))));
+    let new_pod = [("BOSS_POD_NAME", "boss-dev-rolled")];
+    let out = fx.run("--tick", &new_pod);
+    assert!(out.status.success(), "{}", say(&out));
+    let posted = fx.posted();
+    assert_eq!(posted.len(), 1, "one restart, one alert: {}", say(&out));
+    let alert = &posted[0];
+    assert_eq!(
+        alert["priority"], "urgent",
+        "a kill in a pod the watch had not sampled yet is still a new kill"
+    );
+    let title = alert["title"].as_str().expect("title");
+    assert!(
+        !title.contains("predates"),
+        "the ring proves the watch ran before this pod, so the kill does not predate it: {title}"
+    );
+    let detail = alert["metadata"]["detail"].as_str().expect("detail");
+    for stale in ["Last sample", "rustc[100]", "resident 7.8 GiB"] {
+        assert!(
+            !detail.contains(stale),
+            "`{stale}` is the PREVIOUS pod's dev container, not the one killed:\n{detail}"
+        );
+    }
+    for want in [
+        "Container dev of pod boss-dev-rolled restarted",
+        "No sample of this pod precedes this kill",
+        "1 sample(s)",
+        "pod boss-dev-test",
+    ] {
+        assert!(detail.contains(want), "the alert lacks `{want}`:\n{detail}");
+    }
+    // The other pod's samples are still kept, whole, where the alert says.
+    let frozen = fx
+        .dir
+        .join("kills")
+        .join(format!("dev-{}", finished.replace(':', "")));
+    assert!(
+        detail.contains(&frozen.display().to_string())
+            && frozen.join(format!("{before}.tsv")).is_file(),
+        "the ring as it stood is kept at {}:\n{detail}",
+        frozen.display()
+    );
+}
+
+/// The same question asked of a ring holding BOTH pods' samples: the
+/// last sample and the largest are chosen among this pod's alone, and
+/// the alert says how many of the ring's samples it left out.
+#[test]
+fn the_last_and_the_largest_sample_are_chosen_among_this_pods_alone() {
+    let root = boss_testing::scratch_dir("boss-dmw-roll-mixed");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    busy_pod(&fx);
+    fx.set_pod(&replaced_pod(0, None));
+    let new_pod = [("BOSS_POD_NAME", "boss-dev-rolled")];
+    let out = fx.run("--tick", &new_pod);
+    assert!(out.status.success(), "{}", say(&out));
+    let (before, finished) = date_the_sample_before_a_kill(&fx, 10);
+    // An OLDER sample from the previous pod, whose dev container was
+    // larger than this one's ever was.
+    let ours = std::fs::read_to_string(fx.dir.join("ring").join(format!("{before}.tsv")))
+        .expect("this pod's sample");
+    let page_kib = 4;
+    let theirs = ours
+        .replace("\tboss-dev-rolled\t", "\tboss-dev-test\t")
+        .replace(
+            &format!("rss_kib={}", 2_050_000 * page_kib),
+            &format!("rss_kib={}", 7_000_000 * page_kib),
+        )
+        .replace("\trustc\t", "\toldrustc\t");
+    assert_ne!(ours, theirs, "the fixture did not rewrite the sample");
+    assert!(
+        theirs.contains("\tboss-dev-test\t") && theirs.contains("\toldrustc\t"),
+        "the previous pod's sample is not the shape this test means:\n{theirs}"
+    );
+    boss_testing::write_file(
+        &fx.dir.join("ring").join(format!("{}.tsv", before - 300)),
+        &theirs,
+    );
+
+    fx.set_pod(&replaced_pod(1, Some(("OOMKilled", 137, &finished))));
+    let out = fx.run("--tick", &new_pod);
+    assert!(out.status.success(), "{}", say(&out));
+    let posted = fx.posted();
+    assert_eq!(posted.len(), 1, "one restart, one alert: {}", say(&out));
+    let detail = posted[0]["metadata"]["detail"].as_str().expect("detail");
+    for want in [
+        "Last sample, 10 s before the kill",
+        "resident 7.8 GiB",
+        "MiB rustc[100]",
+        "(1 samples, one every 15 s)",
+        "1 more sample(s) in that ring were taken in another pod",
+    ] {
+        assert!(detail.contains(want), "the alert lacks `{want}`:\n{detail}");
+    }
+    for stale in ["oldrustc", "Largest sample in the ring", "26.7 GiB"] {
+        assert!(
+            !detail.contains(stale),
+            "`{stale}` is the PREVIOUS pod's dev container:\n{detail}"
+        );
+    }
 }
 
 /// Short on purpose: a fixture, and no-secrets.sh reads 32+ characters
@@ -937,6 +1568,286 @@ fn a_refused_alert_backs_off_lets_the_next_pass_and_is_moved_aside() {
             && state.contains("memory_watch_alerts_kept=0\n"),
         "and it is counted where the reclaim's packet reads it:\n{state}"
     );
+}
+
+/// Residue of backlog 9ecd12ea, named in the excludes of car 97edf615:
+/// the watch counted EVERY answer but 201 and no answer against the body,
+/// so a 5xx, the machine gate refusing a stale or revoked token (401,
+/// 403), a proxy or a timeout (407, 408) or a rate limit (429) moved a
+/// kill alert aside after its fifth, about half an hour in, and it was
+/// never filed though nothing was wrong with it. Those answers judge the
+/// API or the caller, and every alert here is the same signer and kind,
+/// so the one behind would get the same: the replay stops, counts
+/// nothing, and the next tick tries again — alert-lib.sh's own predicate,
+/// `alert_answer_judges_the_body`, decides which answers those are.
+#[test]
+fn an_answer_that_judges_the_caller_stops_the_send_and_counts_nothing_against_the_alert() {
+    let root = boss_testing::scratch_dir("boss-dmw-caller");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    busy_pod(&fx);
+    fx.set_pod(&pod(1, Some(("OOMKilled", 137, "2026-10-08T10:31:52Z"))));
+    boss_testing::write_file(&root.join("sor-state"), "down");
+    assert!(fx.run("--tick", &[]).status.success());
+    let kept = fx.alerts_in("alert-spool");
+    assert_eq!(kept.len(), 1, "the kill alert is kept");
+    // Its fourth refusal is already counted and due, so one more counted
+    // answer would move it aside: the strongest place to be wrong.
+    let tries = PathBuf::from(format!("{}.tries", kept[0].display()));
+    boss_testing::write_file(&tries, "4 0\n");
+    // A second alert behind it: the replay stops at the first.
+    boss_testing::write_file(
+        &fx.dir.join("alert-spool").join("9999999999-1-1.json"),
+        r#"{"kind":"backlog-item","title":"the alert behind","owner_id":""}"#,
+    );
+    let posts = || {
+        std::fs::read_to_string(root.join("posted.txt.headers"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(" POST "))
+            .count()
+    };
+
+    for code in ["401", "403", "407", "408", "429", "500", "503"] {
+        boss_testing::write_file(&root.join("sor-state"), &format!("answer:{code}"));
+        let before = posts();
+        let out = fx.run("--tick", &[]);
+        assert!(out.status.success(), "{code}: {}", say(&out));
+        assert_eq!(
+            fx.spooled(),
+            2,
+            "answer {code} judges the caller or the API: both alerts stay kept: {}",
+            say(&out)
+        );
+        assert!(
+            fx.alerts_in("alert-refused").is_empty(),
+            "answer {code} moved nothing aside: {}",
+            say(&out)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tries).expect("tries"),
+            "4 0\n",
+            "answer {code} counted nothing against the body: {}",
+            say(&out)
+        );
+        assert_eq!(
+            posts() - before,
+            1,
+            "answer {code} stops the send at the first alert: {}",
+            say(&out)
+        );
+        let said = say(&out);
+        assert!(
+            said.contains(&format!("answer {code}")) && said.contains("not this alert"),
+            "and says why it stopped: {said}"
+        );
+    }
+
+    // The first tick the API takes them, both are filed.
+    boss_testing::write_file(&root.join("sor-state"), "up");
+    let out = fx.run("--tick", &[]);
+    assert!(out.status.success(), "{}", say(&out));
+    assert_eq!(fx.posted().len(), 2, "{}", say(&out));
+    assert_eq!(fx.spooled(), 0, "{}", say(&out));
+    assert!(fx.alerts_in("alert-refused").is_empty());
+}
+
+/// One `key=value` line of `--state`, as the reclaim pass's
+/// `watch_field` reads it: absent and empty are the same answer.
+fn state_field(state: &str, key: &str) -> String {
+    state
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}=")))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Review fb97dd5d of car 1fe37401, finding F1: counting nothing
+/// against a body the API did not judge also means nothing ever ENDS the
+/// hold — a persistent 403 to the watch's signer (while the reclaim's own
+/// kind still files) or a 5xx one body causes kept the kill alert in the
+/// spool with refused at 0, so no problem was raised and only the
+/// spool's bound of 48 ever ended the silence. The hold is now measured
+/// instead of counted: `--state` names the oldest kept alert's age and
+/// the bound past which no refusal of its body explains it (twice the
+/// back-offs a refused body can wait out before it is moved aside), and
+/// the reclaim pass raises it — pinned in dev_scratch_reclaim_sh.rs.
+#[test]
+fn an_alert_held_by_answers_that_count_nothing_says_how_long_on_state() {
+    let root = boss_testing::scratch_dir("boss-dmw-held");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    busy_pod(&fx);
+    fx.set_pod(&pod(0, None));
+
+    let state = fx.state();
+    assert_eq!(
+        state_field(&state, "memory_watch_alerts_oldest_kept_age_s"),
+        "",
+        "nothing kept, no age: {state}"
+    );
+    // The bound is the watch's own fact, derived from its back-off: a
+    // body refused four times waits 2 + 4 + 8 + 16 minutes, then goes
+    // aside at the fifth; twice that is an hour.
+    assert_eq!(
+        state_field(&state, "memory_watch_alerts_held_after_s"),
+        "3600",
+        "{state}"
+    );
+
+    // A kill alert kept two hours ago, and the API answering 403 to it
+    // on every tick since.
+    let kept_at = unix_now() - 7200;
+    boss_testing::create_dir(&fx.dir.join("alert-spool"));
+    boss_testing::write_file(
+        &fx.dir
+            .join("alert-spool")
+            .join(format!("{kept_at}-1-1.json")),
+        r#"{"kind":"backlog-item","title":"the held kill alert","owner_id":""}"#,
+    );
+    boss_testing::write_file(&root.join("sor-state"), "answer:403");
+    for _ in 0..3 {
+        let out = fx.run("--tick", &[]);
+        assert!(out.status.success(), "{}", say(&out));
+        assert_eq!(fx.spooled(), 1, "a 403 keeps it: {}", say(&out));
+        assert!(fx.alerts_in("alert-refused").is_empty(), "{}", say(&out));
+    }
+    let state = fx.state();
+    assert!(
+        state.contains("memory_watch_alerts_refused=0\n")
+            && state.contains("memory_watch_alerts_kept=1\n"),
+        "still nothing is counted against the body: {state}"
+    );
+    let age: u64 = state_field(&state, "memory_watch_alerts_oldest_kept_age_s")
+        .parse()
+        .unwrap_or_else(|_| panic!("the oldest kept alert's age is a whole number: {state}"));
+    assert!(
+        (7200..7200 + 120).contains(&age),
+        "the age is read from when the alert was kept, not from its last try: {age}\n{state}"
+    );
+
+    // The tick the API takes it, the hold is over and the age is gone.
+    boss_testing::write_file(&root.join("sor-state"), "up");
+    let out = fx.run("--tick", &[]);
+    assert!(out.status.success(), "{}", say(&out));
+    assert_eq!(fx.posted().len(), 1, "{}", say(&out));
+    let state = fx.state();
+    assert_eq!(
+        state_field(&state, "memory_watch_alerts_oldest_kept_age_s"),
+        "",
+        "{state}"
+    );
+}
+
+/// The operator call recorded on backlog 9ecd12ea when car 7849553a was
+/// released: refused and dropped counts do not clear themselves, so once
+/// above zero every hourly pass files a failed packet until someone
+/// empties `alert-refused/` and removes `alerts-dropped` BY HAND — an
+/// act nothing records, which also throws away the refused bodies. The
+/// acknowledgement is a verb: it keeps the bodies, zeroes the count,
+/// says who and when, and stays named on the state the reclaim's packet
+/// reads until that packet has carried it. The count is never aged out.
+#[test]
+fn refused_and_dropped_alerts_are_acknowledged_by_a_verb_that_keeps_the_bodies() {
+    let root = boss_testing::scratch_dir("boss-dmw-ack");
+    let _guard = Scratch(root.clone());
+    let fx = Fixture::new(&root);
+    let aside = fx.dir.join("alert-refused");
+    boss_testing::create_dir(&aside);
+    boss_testing::write_file(&aside.join("1-1-1.json"), r#"{"title":"a refused kill"}"#);
+    boss_testing::write_file(
+        &aside.join("1-1-1.json.why"),
+        "refused 5 times, last answer 422:\n",
+    );
+    boss_testing::write_file(&fx.dir.join("alerts-dropped"), "3\n");
+
+    let state = fx.state();
+    assert!(
+        state.contains("memory_watch_alerts_refused=1\n")
+            && state.contains("memory_watch_alerts_dropped=3\n"),
+        "{state}"
+    );
+    assert!(
+        state.contains(&format!("memory_watch_dir={}\n", fx.dir.display())),
+        "the packet names where the watch keeps what it holds:\n{state}"
+    );
+
+    let out = fx.run("--acknowledge", &[("BOSS_ACTOR", "operator:test")]);
+    assert!(out.status.success(), "{}", say(&out));
+    let state = fx.state();
+    assert!(
+        state.contains("memory_watch_alerts_refused=0\n")
+            && state.contains("memory_watch_alerts_dropped=0\n"),
+        "the counts are zeroed by the act, not by time:\n{state}\n{}",
+        say(&out)
+    );
+    let stamp = state
+        .lines()
+        .find_map(|l| l.strip_prefix("memory_watch_acknowledgements="))
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !stamp.is_empty() && !stamp.contains(' '),
+        "one acknowledgement waits for a packet:\n{state}"
+    );
+    let said = state
+        .lines()
+        .find_map(|l| l.strip_prefix("memory_watch_acknowledged="))
+        .unwrap_or_default();
+    assert!(
+        said.contains("operator:test")
+            && said.contains("1 refused")
+            && said.contains("3 dropped")
+            && said.contains(&stamp),
+        "and says who acknowledged what:\n{state}"
+    );
+    let kept = fx.dir.join("acknowledged").join(&stamp);
+    assert!(
+        kept.join("1-1-1.json").is_file() && kept.join("1-1-1.json.why").is_file(),
+        "the refused body and its answer are kept, not deleted: {}",
+        kept.display()
+    );
+
+    // Once the reclaim's packet has carried it, the pass says so and the
+    // acknowledgement stops riding every later packet.
+    let out = fx.run("--recorded", &[]);
+    assert!(
+        !out.status.success(),
+        "--recorded with no acknowledgement named is refused: {}",
+        say(&out)
+    );
+    // A name that is not an acknowledgement's (a path out of the
+    // directory) is skipped, never followed.
+    let out = Command::new("bash")
+        .arg(repo_root().join("infra/cluster/dev-memory-watch.sh"))
+        .args(["--recorded", &stamp, "../../etc"])
+        .env("WORK_MOUNT", root.join("work"))
+        .output()
+        .expect("run --recorded");
+    assert!(out.status.success(), "{}", say(&out));
+    let state = fx.state();
+    assert!(
+        state.contains("memory_watch_acknowledgements=\n")
+            && state.contains("memory_watch_acknowledged=\n"),
+        "{state}"
+    );
+    assert!(
+        kept.join("1-1-1.json").is_file(),
+        "recording keeps the body"
+    );
+
+    // Nothing to acknowledge is said, and makes no record.
+    let out = fx.run("--acknowledge", &[("BOSS_ACTOR", "operator:test")]);
+    assert!(out.status.success(), "{}", say(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("nothing to acknowledge"),
+        "{}",
+        say(&out)
+    );
+    let acks = std::fs::read_dir(fx.dir.join("acknowledged"))
+        .expect("acknowledged/")
+        .count();
+    assert_eq!(acks, 1, "an empty acknowledgement records nothing");
 }
 
 /// Delta review, N5: a send waits on the system of record — the owner

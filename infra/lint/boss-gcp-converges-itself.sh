@@ -640,7 +640,20 @@ cat >"$nodes_json" <<'JSON'
 {"data":[{"id":"boss-gcp","role":"bastion","roles":["ml-batch-host","off-cluster-observer","wireguard-bastion"]},
          {"id":"w-1","role":"talos-worker","roles":[]}]}
 JSON
+# The deposit account's authorized_keys, as a fixture: the converge
+# reads the home of whoever owns the checkout otherwise, which here is
+# whoever runs this lint (backlog dea2236f). One confined receiver line,
+# the shape the installers print, over a real key: the audit reads every
+# key with ssh-keygen, sshd's own parser, so a stand-in blob is a line
+# it reads no key from (review ee6589a9).
+command -v ssh-keygen >/dev/null || fail "ssh-keygen is required: the deposit key audit reads every key with it"
+ssh-keygen -q -t ed25519 -N '' -C machine-token-deposit-key -f "$tmp/deposit-key" \
+    || fail "ssh-keygen could not make the fixture deposit key"
+deposit_pub="$(cut -d' ' -f1-2 "$tmp/deposit-key.pub")"
+printf '%s\n' "command=\"exec sudo -n /usr/local/libexec/boss/ops-credential-recv machine-token\",restrict $deposit_pub machine-token-deposit-key" \
+    >"$tmp/authorized_keys"
 run_converge() { # <dir> <installer> -> output; returns the script's status
+    BOSS_GCP_CONVERGE_AUTHORIZED_KEYS="${CONVERGE_AUTHORIZED_KEYS:-$tmp/authorized_keys}" \
     BOSS_GCP_REPO_DIR="$1" BOSS_GCP_CONVERGE_INSTALLER="$2" \
         BOSS_GCP_CONVERGE_SOR_ENV="$tmp/sor.env.converge" \
         BOSS_JOURNALD_CONF_DIR="$tmp/journald.conf.d" BOSS_JOURNALD_SYSTEMCTL="$tmp/bin/systemctl" \
@@ -806,6 +819,7 @@ $out"
 # ---------------------------------------------------------------------
 sum_conv="$tmp/summary-converge.json"
 run_converge_sum() { # <dir> <installer>
+    BOSS_GCP_CONVERGE_AUTHORIZED_KEYS="${CONVERGE_AUTHORIZED_KEYS:-$tmp/authorized_keys}" \
     BOSS_GCP_REPO_DIR="$1" BOSS_GCP_CONVERGE_INSTALLER="$2" \
         BOSS_GCP_CONVERGE_SOR_ENV="$tmp/sor.env.converge" \
         BOSS_JOURNALD_CONF_DIR="$tmp/journald.conf.d" BOSS_JOURNALD_SYSTEMCTL="$tmp/bin/systemctl" \
@@ -840,6 +854,64 @@ $out"
     || conv_fail "the summary does not carry the sha converged on ($want)"
 [ "$(jq -r '.converge_remote // ""' "$sum_conv")" = "forge" ] \
     || conv_fail "the summary does not name the remote it converged from"
+case "$(jq -r '.deposit_key_audit // ""' "$sum_conv")" in
+    "deposit-key-audit: clean — 1 line(s)"*) ;;
+    *) conv_fail "the summary does not carry the deposit key audit's clean verdict over one confined receiver line (backlog dea2236f)" ;;
+esac
+[ "$(jq -r '.deposit_key_verdict // ""' "$sum_conv")" = clean ] \
+    || conv_fail "the summary does not carry deposit_key_verdict=clean, the word the alarm rule reads (backlog dea2236f)"
+[ -z "$(jq -r '.output // ""' "$sum_conv")" ] \
+    || conv_fail "a clean audit left a RED line in output, which the chore judge would file"
+
+# 10d'. A DEPOSIT KEY THAT REACHES MORE THAN ITS RECEIVER IS ALARMED FROM
+# THE PACKET, AND THE TICK STILL CONVERGES (backlog dea2236f; packet
+# 96a0f7bb's shape: the same key also placed bare). Review 1fa0d093 (B2)
+# measured what a red tick cost: the run step records result=exit-code,
+# landing.rs counts a boss-gcp converge only on result=ok, so every
+# infra-channel car read "Converging" while the finding stood, and the
+# publish-drift rule fires only on an ok run that moved, so the moved
+# tick's drift check was lost for good. A finding in David's file is not
+# this loop's work failing: the tick exits 0, and the finding rides the
+# packet as deposit_key_verdict=unconfined plus one RED line per finding
+# in `output`, which the rule
+# file-backlog-items-on-boss-gcp-deposit-key-unconfined hands to the
+# chore judge — one backlog-item, deduped while it is open.
+cp "$tmp/authorized_keys" "$tmp/authorized_keys.bare"
+printf '%s\n' "$deposit_pub machine-token-deposit-key" >>"$tmp/authorized_keys.bare"
+: >"$tmp/calls.log"
+rm -f "$sum_conv"
+out=$(CONVERGE_AUTHORIZED_KEYS="$tmp/authorized_keys.bare" run_converge_sum "$clean" "$tmp/bin/installer-ok") \
+    || conv_fail "the converge exited non-zero over a deposit key finding — its packet then reads result=exit-code, and landing and the drift rule both read that as not converged (review 1fa0d093, B2):
+$out"
+grep -q "sha=$want" "$tmp/calls.log" \
+    || conv_fail "a deposit key finding stopped the CLI step (calls: $(cat "$tmp/calls.log"))"
+case "$(jq -r '.deposit_key_audit // ""' "$sum_conv")" in
+    UNCONFINED:*) ;;
+    *) conv_fail "the summary does not mark the deposit key audit UNCONFINED" ;;
+esac
+[ "$(jq -r '.deposit_key_verdict // ""' "$sum_conv")" = unconfined ] \
+    || conv_fail "the summary does not carry deposit_key_verdict=unconfined, the word the alarm rule reads"
+grep -qF "UNCONFINED $tmp/authorized_keys.bare:2" <<<"$(jq -r '.anomalies // ""' "$sum_conv")" \
+    || conv_fail "the summary's anomalies do not name the line to remove ($tmp/authorized_keys.bare:2)"
+grep -qF "RED boss-gcp-converge/deposit-key-unconfined refused: deposit-key-audit: UNCONFINED $tmp/authorized_keys.bare:2" <<<"$(jq -r '.output // ""' "$sum_conv")" \
+    || conv_fail "the summary's output carries no RED line naming the line to remove, in the shape the chore judge files from"
+
+# 10d''. AN AUDIT THAT COULD NOT READ IS UNVERIFIED, NOT CLEAN, AND FILES
+# NOTHING: no evidence is not a pass, and it is not a finding either.
+mkdir -p "$tmp/authorized_keys.dir"
+: >"$tmp/calls.log"
+rm -f "$sum_conv"
+out=$(CONVERGE_AUTHORIZED_KEYS="$tmp/authorized_keys.dir" run_converge_sum "$clean" "$tmp/bin/installer-ok") \
+    || conv_fail "an unreadable authorized_keys failed the tick:
+$out"
+[ "$(jq -r '.deposit_key_verdict // ""' "$sum_conv")" = unverified ] \
+    || conv_fail "an unreadable authorized_keys did not read deposit_key_verdict=unverified"
+case "$(jq -r '.deposit_key_audit // ""' "$sum_conv")" in
+    UNVERIFIED:*) ;;
+    *) conv_fail "an unreadable authorized_keys did not read UNVERIFIED on deposit_key_audit" ;;
+esac
+[ -z "$(jq -r '.output // ""' "$sum_conv")" ] \
+    || conv_fail "an UNVERIFIED audit left a RED line in output"
 
 # 10e. A FAILED INSTALL SAYS SO ON THE PACKET, not only in the journal
 # the host may be unreadable from. Check 7 proves the journal keeps every

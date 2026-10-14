@@ -1275,14 +1275,21 @@ fn tenant_id_of(dir: &Path) -> String {
 /// The `[meta] tenant_id` the directory declares, or `None` — what
 /// `export` needs before it can ask an instance whose rows to read.
 pub fn declared_tenant_id(dir: &Path) -> Option<String> {
-    ["tenant.toml", "seeds/tenant.toml"]
-        .iter()
-        .map(|p| dir.join(p))
-        .find(|p| p.is_file())
+    manifest_of(dir)
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|t| TenantToml::parse(&t).ok())
         .and_then(|t| t.meta.tenant_id)
         .filter(|s| !s.trim().is_empty())
+}
+
+/// The tenant manifest `dir` carries, at either spelling, whether or
+/// not it reads — so a reader can tell a broken manifest from none
+/// (`boss workflow publish` refuses the first, review 679220b5 F2).
+pub fn manifest_of(dir: &Path) -> Option<std::path::PathBuf> {
+    ["tenant.toml", "seeds/tenant.toml"]
+        .iter()
+        .map(|p| dir.join(p))
+        .find(|p| p.is_file())
 }
 
 /// Validate `dir` against [`CONTRACT`]. Pure over the filesystem: it

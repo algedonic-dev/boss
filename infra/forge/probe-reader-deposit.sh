@@ -354,7 +354,9 @@ else
     # forge script uses. ABSENT is not ready (root material David places,
     # design 835c0c9c), never a red.
     KC="${BOSS_OPS_DIR:-/etc/boss-ops}/kubeconfig"
-    KUBECTL=(docker run --rm --network host -v "$KC:/kc:ro" alpine/k8s:1.33.3 kubectl --kubeconfig=/kc "--request-timeout=${REQUEST_TIMEOUT_S}s")
+    # No container log: the Secret kubectl prints is this script's alone
+    # (backlog aa700921).
+    KUBECTL=(docker run --rm --log-driver=none --network host -v "$KC:/kc:ro" alpine/k8s:1.33.3 kubectl --kubeconfig=/kc "--request-timeout=${REQUEST_TIMEOUT_S}s")
     if [ ! -e "$KC" ] && [ ! -L "$KC" ]; then
         KC_STATE="not ready: $KC absent — root material, placed by David (design 835c0c9c)"
     elif [ ! -r "$KC" ]; then

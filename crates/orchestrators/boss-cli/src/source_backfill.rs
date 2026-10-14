@@ -337,7 +337,7 @@ async fn open_items(http: &boss_core::machine_token::Client) -> Result<Vec<Value
             "/api/jobs?kind=backlog-item&status=open&limit={PAGE}&offset={}",
             rows.len()
         );
-        let body = crate::gate::api(http, reqwest::Method::GET, &path, None).await?;
+        let body = crate::sor_client::api(http, reqwest::Method::GET, &path, None).await?;
         let total = body
             .as_ref()
             .and_then(|b| b.get("total"))
@@ -365,11 +365,11 @@ fn short(id: &str) -> &str {
 }
 
 pub async fn run(apply: bool) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let items = open_items(&http).await?;
     let get = |path: String| {
         let http = &http;
-        async move { crate::gate::api(http, reqwest::Method::GET, &path, None).await }
+        async move { crate::sor_client::api(http, reqwest::Method::GET, &path, None).await }
     };
     let plans = plan(get, &items).await?;
     let recorded = items
@@ -425,7 +425,7 @@ pub async fn run(apply: bool) -> Result<()> {
         let Plan::Map { patch, .. } = p else {
             continue;
         };
-        let wrote = crate::gate::api(
+        let wrote = crate::sor_client::api(
             &http,
             reqwest::Method::PATCH,
             &format!("/api/jobs/{id}/metadata"),
@@ -433,7 +433,7 @@ pub async fn run(apply: bool) -> Result<()> {
         )
         .await;
         let confirmed = match wrote {
-            Ok(_) => crate::gate::api(
+            Ok(_) => crate::sor_client::api(
                 &http,
                 reqwest::Method::GET,
                 &format!("/api/jobs/{id}"),

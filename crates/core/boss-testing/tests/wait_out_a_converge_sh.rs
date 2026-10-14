@@ -23,7 +23,7 @@
 //! serves one fixture per call and a stub `sleep` that records the wait
 //! and returns at once, so the bounded wait is read without being spent.
 
-use boss_testing::{create_dir, repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{create_dir, repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -98,6 +98,11 @@ struct Run {
 /// last answer repeats); an answer of `None` is a door that exits 7, the
 /// jobs API dark through a roll.
 fn run_guard(tag: &str, answers: &[Option<String>], env: &[(&str, &str)]) -> Run {
+    run_guard_at(&repo_root().join(GUARD), tag, answers, env)
+}
+
+/// The same, for a copy of the guard that stands somewhere else.
+fn run_guard_at(script: &Path, tag: &str, answers: &[Option<String>], env: &[(&str, &str)]) -> Run {
     let root = scratch_dir(&format!("wait-out-a-converge-{tag}"));
     let bin = root.join("bin");
     create_dir(&bin);
@@ -140,7 +145,8 @@ fn run_guard(tag: &str, answers: &[Option<String>], env: &[(&str, &str)]) -> Run
         std::env::var("PATH").unwrap_or_default()
     );
     let mut cmd = Command::new("bash");
-    cmd.arg(repo_root().join(GUARD))
+    without_proxy(&mut cmd);
+    cmd.arg(script)
         .env("PATH", path)
         .env("BOSS_JOBS_URL", "http://jobs.test:7900")
         .env("BOSS_API_CURL", &door)
@@ -182,6 +188,176 @@ fn quiet_night() -> String {
     ])
 }
 
+const TOKEN: &str = "synthetic-machine-fixture";
+
+/// Run `script` (the guard, or a copy of it) once against a quiet night,
+/// with a machine-token mount holding `slot` and a door that records the
+/// header FILE it was handed. `tmpdir` is where the reader may make its
+/// header directory; `None` is a fresh, writable one. Returns the run,
+/// what the header file held, the door's argv, and what was left in a
+/// writable `tmpdir` afterwards.
+fn token_run(
+    tag: &str,
+    script: &Path,
+    slot: Option<&str>,
+    hosts: &str,
+    tmpdir: Option<&Path>,
+) -> (Run, String, String, Vec<String>) {
+    let root = scratch_dir(&format!("wait-out-a-converge-token-{tag}"));
+    let mount = root.join("mount");
+    create_dir(&mount);
+    if let Some(value) = slot {
+        write_file(&mount.join("current"), value);
+    }
+    let tmp: PathBuf = match tmpdir {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let t = root.join("tmp");
+            create_dir(&t);
+            t
+        }
+    };
+    let headers = root.join("headers.txt");
+    let argv = root.join("argv.txt");
+    write_file(&root.join("answer.json"), &quiet_night());
+    let door = root.join("header-door.sh");
+    write_exec(
+        &door,
+        &format!(
+            "#!/usr/bin/env bash\n\
+             echo \"$*\" >> '{argv}'\n\
+             prev=\n\
+             for a in \"$@\"; do\n\
+             if [ \"$prev\" = -H ]; then case \"$a\" in @*) {{ stat -c 'mode=%a' \"${{a#@}}\"; cat \"${{a#@}}\"; }} >> '{headers}' ;; esac; fi\n\
+             prev=\"$a\"\n\
+             done\n\
+             cat '{root}/answer.json'\n",
+            argv = argv.display(),
+            headers = headers.display(),
+            root = root.display(),
+        ),
+    );
+    let (mount_s, tmp_s, door_s, no_env) = (
+        mount.display().to_string(),
+        tmp.display().to_string(),
+        door.display().to_string(),
+        root.join("no-sor.env").display().to_string(),
+    );
+    let r = run_guard_at(
+        script,
+        &format!("token-{tag}"),
+        &[Some(quiet_night())],
+        &[
+            ("BOSS_API_CURL", door_s.as_str()),
+            ("BOSS_MACHINE_TOKEN_DIR", mount_s.as_str()),
+            ("BOSS_MACHINE_TOKEN_HOSTS", hosts),
+            ("BOSS_SOR_ENV", no_env.as_str()),
+            ("TMPDIR", tmp_s.as_str()),
+        ],
+    );
+    let left = std::fs::read_dir(&tmp)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    (
+        r,
+        std::fs::read_to_string(&headers).unwrap_or_default(),
+        std::fs::read_to_string(&argv).unwrap_or_default(),
+        left,
+    )
+}
+
+/// THE TWO TOLERATED FAILURES, HELD BY EFFECT (backlog 7369b078, F4 of
+/// review 9c484ca8). The guard's header says a reader "that could not
+/// write its file" and "a copy of this script with no lib/ beside it"
+/// each send exactly the read sent before the token existed — and no
+/// test ran either. Measured by the review: `machine_token_header MT_HDR
+/// "$BOSS_JOBS_URL" || exit 78` in place of `|| MT_HDR=""` left this
+/// whole file green, so the one line that keeps a full disk from
+/// stopping the nightly crawl was held by nothing. Both cases carry a
+/// token the host rule ADMITS, so the reader is asked to write (or would
+/// have been) and the request is the one that would have been stamped.
+///
+/// The unwritable directory is a TMPDIR that is a regular FILE, not a
+/// mode: `mktemp -d` under it fails for every uid, where a 0500
+/// directory stops nobody on the dev pod (root) and would make this a
+/// root-only blind test.
+#[test]
+fn a_reader_that_cannot_write_and_a_copy_with_no_lib_send_the_read_they_always_sent() {
+    let fixture = format!("{TOKEN}\n");
+    let guard = repo_root().join(GUARD);
+    let (baseline, _, _, _) = token_run("f4-baseline", &guard, None, "jobs.test", None);
+    assert_eq!(baseline.rc, 0, "{}\n{}", baseline.stdout, baseline.stderr);
+
+    // 1. The header directory cannot be made.
+    let blocked = scratch_dir("wait-out-a-converge-f4-blocked");
+    let not_a_dir = blocked.join("tmpdir-is-a-file");
+    write_file(&not_a_dir, "");
+    let (r, headers, argv, _) = token_run(
+        "f4-unwritable",
+        &guard,
+        Some(&fixture),
+        "jobs.test",
+        Some(&not_a_dir),
+    );
+    assert_eq!(
+        r.rc, 0,
+        "unwritable: the guard exits 0 on every path\n{}\n{}",
+        r.stdout, r.stderr
+    );
+    assert_eq!(
+        r.stdout, baseline.stdout,
+        "unwritable: the verdict is the one a host with no token reads"
+    );
+    assert_eq!(
+        argv.lines().count(),
+        1,
+        "unwritable: the read still goes out, once: {argv}"
+    );
+    assert_eq!(headers, "", "unwritable: no header file was handed over");
+    assert!(
+        r.stderr.contains("cannot make a private directory"),
+        "unwritable: the reader says what it could not do, so this case is the one it names: {}",
+        r.stderr
+    );
+    assert!(
+        !argv.contains(TOKEN) && !r.stdout.contains(TOKEN) && !r.stderr.contains(TOKEN),
+        "unwritable: the token is in argv or on the guard's output:\n{argv}\n{}\n{}",
+        r.stdout,
+        r.stderr
+    );
+
+    // 2. A copy with no lib/ beside it (a hand install outside a checkout).
+    let alone = scratch_dir("wait-out-a-converge-f4-alone");
+    let copy = alone.join("wait-out-a-converge.sh");
+    write_exec(&copy, &std::fs::read_to_string(&guard).unwrap());
+    assert!(!alone.join("lib").exists());
+    let (r, headers, argv, left) = token_run("f4-no-lib", &copy, Some(&fixture), "jobs.test", None);
+    assert_eq!(
+        r.rc, 0,
+        "no lib: the guard exits 0 on every path\n{}\n{}",
+        r.stdout, r.stderr
+    );
+    assert_eq!(
+        r.stdout, baseline.stdout,
+        "no lib: the verdict is the one a host with no token reads"
+    );
+    assert_eq!(
+        argv.lines().count(),
+        1,
+        "no lib: the read still goes out, once: {argv}"
+    );
+    assert_eq!(headers, "", "no lib: no header file was handed over");
+    assert_eq!(
+        r.stderr, "",
+        "no lib: the absent reader is not sourced and not called, so nothing is said"
+    );
+    assert!(left.is_empty(), "no lib: something was written: {left:?}");
+}
+
 /// THE CONVERGE READ PRESENTS THE MACHINE TOKEN, AND IS NEVER STOPPED BY
 /// IT (design 6805c764; backlog 44b2087e). The read went out with
 /// `x-boss-user` alone. The guard now asks the one shell reader for a
@@ -198,66 +374,9 @@ fn quiet_night() -> String {
 /// door logs argv, and the token must never be in argv).
 #[test]
 fn the_converge_read_presents_the_machine_token_and_is_never_stopped_by_it() {
-    const TOKEN: &str = "synthetic-machine-fixture";
-    let go = |tag: &str, slot: Option<&str>, hosts: &str| -> (Run, String, String, Vec<String>) {
-        let root = scratch_dir(&format!("wait-out-a-converge-token-{tag}"));
-        let mount = root.join("mount");
-        create_dir(&mount);
-        if let Some(value) = slot {
-            write_file(&mount.join("current"), value);
-        }
-        let tmp = root.join("tmp");
-        create_dir(&tmp);
-        let headers = root.join("headers.txt");
-        let argv = root.join("argv.txt");
-        write_file(&root.join("answer.json"), &quiet_night());
-        let door = root.join("header-door.sh");
-        write_exec(
-            &door,
-            &format!(
-                "#!/usr/bin/env bash\n\
-                 echo \"$*\" >> '{argv}'\n\
-                 prev=\n\
-                 for a in \"$@\"; do\n\
-                 if [ \"$prev\" = -H ]; then case \"$a\" in @*) {{ stat -c 'mode=%a' \"${{a#@}}\"; cat \"${{a#@}}\"; }} >> '{headers}' ;; esac; fi\n\
-                 prev=\"$a\"\n\
-                 done\n\
-                 cat '{root}/answer.json'\n",
-                argv = argv.display(),
-                headers = headers.display(),
-                root = root.display(),
-            ),
-        );
-        let (mount_s, tmp_s, door_s, no_env) = (
-            mount.display().to_string(),
-            tmp.display().to_string(),
-            door.display().to_string(),
-            root.join("no-sor.env").display().to_string(),
-        );
-        let r = run_guard(
-            &format!("token-{tag}"),
-            &[Some(quiet_night())],
-            &[
-                ("BOSS_API_CURL", door_s.as_str()),
-                ("BOSS_MACHINE_TOKEN_DIR", mount_s.as_str()),
-                ("BOSS_MACHINE_TOKEN_HOSTS", hosts),
-                ("BOSS_SOR_ENV", no_env.as_str()),
-                ("TMPDIR", tmp_s.as_str()),
-            ],
-        );
-        let left = std::fs::read_dir(&tmp)
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        (
-            r,
-            std::fs::read_to_string(&headers).unwrap_or_default(),
-            std::fs::read_to_string(&argv).unwrap_or_default(),
-            left,
-        )
+    let go = |tag: &str, slot: Option<&str>, hosts: &str| {
+        token_run(tag, &repo_root().join(GUARD), slot, hosts, None)
     };
-
     let (absent, absent_headers, absent_argv, _) = go("absent", None, "jobs.test");
     assert_eq!(absent.rc, 0, "{}\n{}", absent.stdout, absent.stderr);
     assert!(absent.stdout.contains("clear"), "{}", absent.stdout);

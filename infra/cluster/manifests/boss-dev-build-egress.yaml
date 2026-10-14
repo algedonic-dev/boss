@@ -1,0 +1,46 @@
+# a68 D4: only separate dev workers; existing control/gate/consist Pods
+# keep their routes. Converge renders estate addresses before applying.
+# Explicit Cilium denies win over other allow policies. CIDR rules alone
+# do not cover managed endpoints or nodes; those have separate denies.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: boss-dev-build-egress
+  namespace: boss-dev
+spec:
+  endpointSelector:
+    matchLabels:
+      boss.dev/purpose: isolated-build
+  egressDeny:
+    - toEndpoints:
+        - matchExpressions:
+            - key: k8s:io.kubernetes.pod.namespace
+              operator: Exists
+            - key: k8s:io.kubernetes.pod.namespace
+              operator: NotIn
+              values: [kube-system]
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+          matchExpressions:
+            - key: k8s:k8s-app
+              operator: NotIn
+              values: [kube-dns]
+    - toEntities: [host, remote-node, kube-apiserver, ingress]
+    - toCIDRSet: __PRIVATE_DENY_CIDRS__
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - {port: "53", protocol: UDP}
+            - {port: "53", protocol: TCP}
+    - toCIDR: ["__FORGE_CIDR__"]
+      toPorts:
+        - ports:
+            - {port: "__FORGE_PORT__", protocol: TCP}
+    - toCIDRSet: __PUBLIC_ALLOW_CIDRS__
+      toPorts:
+        - ports:
+            - {port: "443", protocol: TCP}

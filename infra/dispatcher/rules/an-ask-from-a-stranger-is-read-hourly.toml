@@ -1,0 +1,70 @@
+# The watch on the machine gate's `asked` rows (backlog d653e090, the
+# builder's note on review 02e21a45 of car 176d5c9d).
+#
+# THE GAP IT NAMES. A GET of /api/machine-gate/accepts presenting one
+# value that matches no slot is an ASK: tallied and stated on the log as
+# `asked`, naming peer and asserted user, and on purpose no caller shape
+# `enforce` refuses — a rotation asks every gate about its staged value.
+# So it dirties no window, holds no revoke and is said at INFO, and
+# nothing read it: a peer trying a stale host file, or a value out of a
+# transcript, was on the record and reached no one.
+#
+# WHY A CLOCK AND NOT on_event. The gate's facts go to the gate-evidence
+# log, not onto the bus. Routing `machine_gate.asked` to a rule would add
+# a subject to the NATS stream, and a stream change is one a rollback can
+# be refused on at every service start (car 1dff2293's note on this
+# item). A timer reading the protected durable window changes no stream.
+#
+# WHY THE DURABLE WINDOW AND NOT /api/machine-gate/misses. That tally is
+# in memory and every train restarts the pod (the jobs tally read
+# 2026-10-09T00:56Z had begun at 00:20Z), so an hourly reader of the live
+# rows alone would arrive after most asks were gone. The fact is not.
+#
+# `depositors` IS THE LIST, AND IT IS DATA. Beside the dispatcher itself
+# (its own id, from loopback — the handler knows that one), an asker is
+# expected only if this arg names it. Each id named here must be a row
+# under infra/platform/automations/ — the pin
+# the_asked_alarm_excuses_only_registered_depositors refuses one that is
+# not — and adding a depositor is an edit to this line and a version
+# bump, never a code change. The two named are the scripts that ask the
+# jobs gate which slot a deposited token matches:
+# infra/forge/machine-token-deposit.sh and
+# infra/estate/machine-token-effect.sh.
+#
+# NOT NAMED, ON PURPOSE: the probe-reader deposit
+# (infra/forge/probe-reader-deposit.sh) asks with NO asserted id, by
+# design, so excusing it would excuse every caller that sends none —
+# which is the shape of a hand-typed curl. It asks about a value no gate
+# holds only in the minute between a reader rotation's stage and the
+# Secret's projection; an alarm then says so in its own text.
+#
+# NO DEDUP GUARD ON THE RULE, ON PURPOSE — the coverage backstop's shape.
+# The handler dedups on its finding key against the OPEN alarms, so an
+# hour with no stranger writes nothing.
+[[rule]]
+name = "an-ask-from-a-stranger-is-read-hourly"
+why = """
+A TIMER over a record no event carries, the standing exemption: the
+machine gate states `asked` on the gate-evidence log, which is not the
+bus, and putting it there would change the NATS stream. Measured
+2026-10-09 on origin/main c734dbdf (backlog d653e090): nothing in the
+tree reads an asked row or fact except the rotation's own drain, which
+ignores it by design, so a caller trying a stale or leaked value is
+recorded and pages no one. It adds no routing and refuses nothing: one
+firing reads GET /api/events/gate-window?gate=machine-gate&hours=2 and
+files ONE standard backlog-item when an ask inside those two hours came
+from a caller that is neither automation:dispatcher on loopback nor a
+depositor named in `depositors`, deduped on the finding; a later
+stranger is added to the open item. The machine never withdraws it — an
+ask that stopped is not an ask explained — so an item closed while its
+ask is still inside the two hours is filed again, at most twice. A
+window it cannot judge keeps ONE unreadable alarm naming the error,
+withdrawn by the next whole read. What it cannot vouch for is said in
+the alarm: ids are asserted, and every caller from outside the pod
+network arrives as one address, so this names the caller who does not
+know the estate's ids and is not a boundary.
+"""
+schedule = { cadence = "hourly", anchor_date = "2026-10-09" }
+[[rule.do]]
+handler = "machine.gate.asked.alarm"
+args = { depositors = "\"automation:machine-token-deposit,automation:machine-token-effect\"" }

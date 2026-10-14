@@ -1,0 +1,5 @@
+# Source preparation for3869107c. This row does not activate isolation,
+# publish an image or invent the issuer-owned login (question85c991d1).
+schema = 1
+enabled = false
+required_binary_version = "codex-cli 0.159.3"

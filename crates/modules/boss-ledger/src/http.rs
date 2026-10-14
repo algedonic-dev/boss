@@ -480,14 +480,16 @@ mod tests {
     /// pool is lazy and never reached, because the gate refuses first.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_read_gate_answers_a_policy_outage_as_503_with_retry_after() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dark = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
+        // Held, not bound and released (review 465e723f F3).
+        let dark = boss_testing::dark_port();
         let app = router(LedgerApiState {
             pool: PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").unwrap(),
             publisher: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
-            policy: Arc::new(boss_policy_client::ReqwestPolicyClient::new("ledger", dark)),
+            policy: Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+                "ledger",
+                dark.base.clone(),
+            )),
         });
         let resp = app
             .oneshot(

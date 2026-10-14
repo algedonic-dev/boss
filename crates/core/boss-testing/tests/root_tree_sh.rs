@@ -544,24 +544,32 @@ fn the_status_verb_does_not_claim_more_than_the_tree_closes() {
         !about.contains("nothing unattended runs the checkout's copy again"),
         "root-tree-status.json still says nothing unattended runs the checkout's copy"
     );
-    assert!(
-        !about.contains("which every unit's ExecStart goes through"),
-        "two units still start from the checkout"
-    );
     assert!(about.contains("the forge CONVERGE never runs the checkout's copy again"));
-    // And the two it names as still on the checkout are the two the unit
-    // files say.
+    // The two units that were the exception start from the tree since
+    // backlog 683d7fe9's second car, and the verb says so — and still
+    // says the ops runner's verbs run from the checkout.
     for (unit, named) in [
         ("cluster-deploy-runner", "the cluster converge"),
         ("disk-floor-sweep", "the disk sweep"),
     ] {
         let body = read(&repo_root().join(format!("infra/forge/{unit}.service")));
         assert!(
-            body.contains("\nExecStart=/home/david/boss/"),
-            "{unit}.service no longer starts from the checkout — root-tree-status.json says it does"
+            body.contains("\nExecStart=/var/lib/boss/tree/current/")
+                && !body.contains("/home/david/boss/"),
+            "{unit}.service starts from the checkout again — root-tree-status.json says it does not"
         );
         assert!(about.contains(named), "{named}");
     }
+    assert!(
+        !about.contains("still run there as its owner"),
+        "root-tree-status.json still says units run from the checkout as its owner"
+    );
+    assert!(
+        about.contains(
+            "root's ops runner still executes every verb, this one included, from the checkout"
+        ),
+        "the ops runner is the road the tree does not close; the verb must keep saying so"
+    );
 }
 
 /// ROOT'S STORE REMEMBERS WHAT IT ACCEPTED (review 5f3736a2, F4). It
@@ -904,15 +912,29 @@ fn started_from_the_checkout_the_installer_brings_the_tree_and_hands_over() {
         "root's copy of the launcher is this file"
     );
 
-    // The ops runner's unit pair comes from the tree; its ExecStart
-    // still names the checkout, by name (stage 2 is not this car).
+    // The ops runner's unit pair comes from the tree, and so does what
+    // it executes: its ExecStart names root's tree through `current`,
+    // never the checkout (stage 2 of design c98c79aa, backlog a604a35b).
+    // The checkout is handed to the verbs that work on git as a VALUE,
+    // which they use only through git run as the checkout's owner.
     let dropin = read(&i.etc.join("boss-ops-runner.service.d/forge.conf"));
     assert!(
-        dropin.contains(&format!(
-            "ExecStart={}/infra/ops/ops-runner.sh",
-            i.checkout.display()
-        )),
-        "{dropin}"
+        dropin.lines().any(|l| l
+            == format!(
+                "ExecStart={}/current/infra/ops/ops-runner.sh",
+                i.tree.display()
+            )),
+        "the runner executes root's tree: {dropin}"
+    );
+    assert!(
+        !dropin.contains(&format!("ExecStart={}", i.checkout.display())),
+        "the runner executes nothing in the checkout: {dropin}"
+    );
+    assert!(
+        dropin
+            .lines()
+            .any(|l| l == format!("Environment=BOSS_OPS_CHECKOUT={}", i.checkout.display())),
+        "the verbs are handed the checkout they work on: {dropin}"
     );
 
     // The count is carried; the thing that was not a timestamp is not,
@@ -992,6 +1014,184 @@ fn with_no_tree_no_unit_file_is_replaced_and_the_run_is_red() {
     let (rc, out) = i.run();
     assert_eq!(rc, 0, "{out}");
     assert!(read(&i.etc.join("cluster-watchdog.service")).contains("\nUser=root\n"));
+}
+
+impl Install {
+    /// A commit on the fixture's forge main (the checkout doubles as the
+    /// forge's repository), so the next run's refresh fetches it.
+    fn land(&self, rel: &str, body: &str) {
+        let p = self.checkout.join(rel);
+        let mode = std::fs::metadata(&p).map(|m| m.permissions());
+        write_file(&p, body);
+        if let Ok(mode) = mode {
+            std::fs::set_permissions(&p, mode).unwrap();
+        }
+        git(&self.checkout, &["add", "-A"]);
+        git(&self.checkout, &["commit", "-q", "-m", rel]);
+    }
+
+    /// What the converge does after a refresh that returned 0: mark the
+    /// generation `current` names good.
+    fn mark_current_good(&self) {
+        let o = Command::new("bash")
+            .arg(script())
+            .arg("mark-good")
+            .arg(self.tree.join("current"))
+            .env("BOSS_ROOT_TREE", &self.tree)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", text(&o));
+    }
+
+    fn launcher_installed(&self) -> String {
+        read(&self.dir.join("libexec/forge-converge-launch"))
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        serde_json::from_str(&read(&self.dir.join("summary.json"))).expect("the summary is JSON")
+    }
+}
+
+/// THE LAUNCHER IS REPLACED ONLY FROM A GENERATION THAT HAS MARKED ITSELF
+/// GOOD (review 5f3736a2, F5; backlog 62b09c57). The launcher is the one
+/// piece of the converge with no fallback — it is what picks the fallback
+/// — and install.sh replaced it from whichever generation it ran from, on
+/// the tick a train's generation was first fetched, before that
+/// generation's converge had run once.
+#[test]
+fn the_launcher_is_replaced_only_from_a_generation_that_has_marked_itself_good() {
+    let i = Install::new("launcher-good");
+    // The bootstrap: no launcher stands, so there is nothing to keep.
+    let (rc, out) = i.run();
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(i.launcher_installed(), read(&launcher()), "{out}");
+
+    // A launcher already installed, and a generation that has not yet
+    // shown it can refresh: the installed one stays, and the run says so.
+    let before = "#!/bin/sh\n# the launcher installed before this generation\n";
+    write_exec(&i.dir.join("libexec/forge-converge-launch"), before);
+    let (rc, out) = i.run();
+    assert_eq!(
+        rc, 0,
+        "a kept launcher is the normal tick, not a red: {out}"
+    );
+    assert_eq!(
+        i.launcher_installed(),
+        before,
+        "a generation that has not marked itself good replaced the launcher: {out}"
+    );
+    assert!(out.contains("has not marked itself good"), "{out}");
+    assert!(
+        i.summary()["launcher"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("kept"),
+        "{}",
+        i.summary()
+    );
+
+    // Its converge completes a refresh and marks it good: the next run
+    // installs its launcher.
+    i.mark_current_good();
+    let (rc, out) = i.run();
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(i.launcher_installed(), read(&launcher()), "{out}");
+    assert!(
+        i.summary()["launcher"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("installed"),
+        "{}",
+        i.summary()
+    );
+}
+
+/// A LAUNCHER THAT DOES NOT PARSE IS NEVER INSTALLED, good generation or
+/// not: it would hold the converge with nothing left to bring in its fix.
+/// The installed one keeps choosing, every unit still converges, and the
+/// run is red and says why.
+#[test]
+fn a_launcher_that_does_not_parse_is_never_installed_and_the_run_is_red() {
+    let i = Install::new("launcher-parse");
+    let (rc, out) = i.run();
+    assert_eq!(rc, 0, "{out}");
+    i.mark_current_good();
+    let working = i.launcher_installed();
+    assert_eq!(working, read(&launcher()), "{out}");
+
+    i.land(
+        "infra/forge/forge-converge-launch.sh",
+        "#!/usr/bin/env bash\nif then fi\n",
+    );
+    let (rc, out) = i.run();
+    assert_eq!(rc, 1, "a launcher that does not parse reds the run: {out}");
+    i.mark_current_good();
+    let (rc, out) = i.run();
+    assert_eq!(rc, 1, "and still, from a good generation: {out}");
+    assert_eq!(
+        i.launcher_installed(),
+        working,
+        "a launcher that does not parse replaced the working one: {out}"
+    );
+    assert!(out.contains("does not parse"), "{out}");
+    assert!(
+        i.summary()["launcher"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("REFUSED"),
+        "{}",
+        i.summary()
+    );
+    assert_ne!(
+        i.summary()["units_installed"],
+        "0",
+        "the units converged: {}",
+        i.summary()
+    );
+    assert!(i.etc.join("forge-converge.service").is_file(), "{out}");
+}
+
+/// THE UNIT GATE READS EVERY WORD, NOT THE FIRST (delta review aa901496's
+/// follow-ups, recorded on car ad35743a; backlog 62b09c57). A unit that
+/// hands a tree script to an interpreter (`ExecStart=/bin/bash
+/// /var/lib/boss/tree/current/…`) named /bin/bash as its only command, so
+/// a generation that lacked the script passed the gate and its unit was
+/// installed to fail. A later word under the tree or the launcher's
+/// directory must be a file; only the command itself must be executable,
+/// so a data file handed to an interpreter holds nothing.
+#[test]
+fn a_script_a_unit_hands_to_an_interpreter_is_judged_too() {
+    let i = Install::new("held-word");
+    let unit = "infra/forge/reap-dead-ci-jobs.service";
+    let start = "\nExecStart=/var/lib/boss/tree/current/infra/forge/reap-dead-ci-jobs.sh\n";
+    let body = read(&i.checkout.join(unit));
+    assert!(body.contains(start), "the fixture's anchor moved: {body}");
+    i.land(
+        unit,
+        &body.replace(
+            start,
+            &format!(
+                "{start}ExecStartPost=/bin/bash /var/lib/boss/tree/current/infra/forge/no-such-script.sh '/var/lib/boss/tree/current/infra/estate/estate.toml'\n"
+            ),
+        ),
+    );
+    let (rc, out) = i.run();
+    assert_eq!(rc, 1, "{out}");
+    assert!(out.contains("UNITS HELD"), "{out}");
+    assert!(
+        out.contains(
+            "reap-dead-ci-jobs.service:/var/lib/boss/tree/current/infra/forge/no-such-script.sh"
+        ),
+        "{out}"
+    );
+    assert!(
+        !out.contains("service:/var/lib/boss/tree/current/infra/estate/estate.toml"),
+        "a data file the tree carries, handed to an interpreter, held the units: {out}"
+    );
+    assert!(
+        !i.etc.join("reap-dead-ci-jobs.service").exists(),
+        "no unit file was written"
+    );
 }
 
 // ── the kit reader's grantee ─────────────────────────────────────────
@@ -1145,5 +1345,32 @@ fn the_trees_fetch_is_the_probe_views_fetch() {
     ] {
         assert!(view.contains(same), "probe-account.sh lost `{same}`");
         assert!(tree.contains(same), "root-tree.sh lost `{same}`");
+    }
+}
+
+/// The cluster converge reads a TENANT the way this tree is fetched
+/// (backlog 683d7fe9, car 2): from the forge's own repository on disk,
+/// served as that repository's owner, no hooks and no account's config,
+/// the pack checked. cluster-deploy-lib.sh cannot source this file — it
+/// is a verb, not a library — so the settings and the rule that picks the
+/// serving account are held equal here (CLAUDE.md §9a).
+#[test]
+fn the_converges_tenant_read_is_the_trees_fetch() {
+    let lib = read(&repo_root().join("infra/forge/cluster-deploy-lib.sh"));
+    let tree = read(&script());
+    for same in [
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "git -c core.hooksPath=/dev/null",
+        "fetch.fsckObjects=true",
+        "printf 'runuser -u %s --' \"$name\"",
+        "printf 'setpriv --reuid=%s --regid=%s --clear-groups --' \"$uid\" \"$gid\"",
+        "[[ \"$name\" =~ ^[a-z_][a-z0-9_-]*$ ]]; then",
+        "uid=\"$(stat -c %u -- \"$1\" 2>/dev/null)\" || return 1",
+    ] {
+        assert!(tree.contains(same), "root-tree.sh lost `{same}`");
+        assert!(
+            lib.contains(same),
+            "cluster-deploy-lib.sh's tenant read lost `{same}`"
+        );
     }
 }

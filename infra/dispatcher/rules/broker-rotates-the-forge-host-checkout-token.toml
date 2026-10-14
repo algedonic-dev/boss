@@ -49,8 +49,17 @@ executor for ONE credential, and its args are that credential's
 declaration. It adds no routing: it advances the very packet that
 fired it and spawns nothing. Design 1c90d183 (2026-09-26).
 """
+# v2 (backlog 683d7fe9, 2026-10-09): `spare` learns
+# `forge-registry-push-token-*`, the registry push token's instances —
+# a token of the same forge user, minted by the broker under its own
+# handler, which this rotation must never revoke. A content edit is a
+# version bump (backlog 732c3cf9): the seed keeps the row it holds.
+# v3 (design db018094, backlog ca356c79, 2026-10-10): `spare` learns
+# `boss-gcp-root-tree-token-*`, the read-only token root on boss-gcp
+# fetches its tree with — another token of the same forge user.
+version = 3
 on_event = "step.done.credential-rotation"
 when = 'subject_id = "forge-host-checkout-token"'
 [[rule.do]]
 handler = "credential.rotate.forgejo"
-args = { forge_user = "\"david\"", secret_namespace = "\"boss\"", secret_name = "\"forge-host-checkout-token\"", secret_key = "\"token\"", scopes = "\"write:repository\"", verify_repo = "\"david/boss\"", delivery = "\"off-host\"", spare = "\"boss-gcp,boss-dev-forge-token-*\"" }
+args = { forge_user = "\"david\"", secret_namespace = "\"boss\"", secret_name = "\"forge-host-checkout-token\"", secret_key = "\"token\"", scopes = "\"write:repository\"", verify_repo = "\"david/boss\"", delivery = "\"off-host\"", spare = "\"boss-gcp,boss-gcp-root-tree-token-*,boss-dev-forge-token-*,forge-registry-push-token-*\"" }

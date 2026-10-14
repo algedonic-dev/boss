@@ -311,6 +311,36 @@ data:
   policy-check: enforce
   # abf9eeae precursor, classes only. No enforcement or 72h readiness.
   actor-role: report
+  # THE AGENT-ROLE WORD (backlog 4e51bf23; boss_jobs::agents::door).
+  # Under `enforce` the jobs API's login door judges a REGISTERED AGENT,
+  # meaning an alias the agents registry maps or an `agent-*` id, by its
+  # registry row. The role and tier it writes with are the row's, and the
+  # x-boss-user role it asserted is dropped. A null row, or no row, writes
+  # as `guest`. Operator tier goes with a platform-admin row only. If the
+  # registry cannot answer, an agent's request is a 503, not a pass.
+  # Persons (emp-*) and automations (automation:*, rule:*) are not judged
+  # here; they keep the role they assert until row H of design abf9eeae
+  # (review ed9181b4 F1).
+  #
+  # SET 2026-10-09, once the rows said what the operator decided. David
+  # set both rows to platform-admin at ~02:42Z, and they were read back at
+  # 03:28Z (GET /api/agents, total 2: agent-claude and agent-codex, both
+  # platform-admin). Under this word every agent request the jobs tally
+  # saw is judged exactly as it was asserted. The word becomes a lockout
+  # only if a row narrows. engineering-agent holds no policy rule, so a
+  # row at that role cannot read a packet. Narrow a row only with a grant
+  # for its role, and keep the tenant's seeds/agents.toml saying the same,
+  # because `boss tenant publish --take agents` applies it.
+  #
+  # THE ROLLBACK ROAD is the same as the policy check's, above. Using
+  # David's admin kubeconfig over the LAN kube road:
+  #   kubectl -n boss patch configmap boss-machine-gate --type merge -p '{"data":{"agent-role":"report"}}'
+  # The jobs pod re-reads the word within kubelet's refresh plus five
+  # seconds, with no roll. The next converge re-applies this line, so
+  # land the revert car, which edits crates/core/boss-testing/tests/
+  # the_agent_role_word_is_not_enforce_until_the_rows_are_read_back.rs
+  # in the same commit.
+  agent-role: enforce
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -597,6 +627,25 @@ spec:
         # admits everything — never a pod that cannot start.
         - name: machine-gate
           configMap: {name: boss-machine-gate, optional: true}
+        # THE BROKER-STAGE TOKEN (design 6e28ed42; activation, backlog
+        # 25fff647): this pod's ServiceAccount token, projected a SECOND
+        # time for ONE audience that is not the cluster's own and for ten
+        # minutes — David's bound, and the shortest the API server
+        # issues. The dispatcher presents it on a runner credential's
+        # stage phases and the jobs API's broker-stage door verifies it;
+        # both run in this container, so the token crosses loopback only.
+        # The kubelet rewrites it before it expires, so it is read afresh
+        # on every command, never cached. No new grant: a pod may always
+        # project its own ServiceAccount's token. 0440 + the pod fsGroup,
+        # as machine-token above: the boss uid reads.
+        #
+        # Held to the door's own terms in every instance by
+        # crates/core/boss-testing/tests/the_broker_stage_door_turns_on_whole.rs.
+        - name: broker-stage-token
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken: {audience: boss-credential-broker-stage, expirationSeconds: 600, path: token}
       initContainers:
         # Converges the schema (infra/postgres/migrate.sh, manifest order)
         # on EVERY start — an existing database gets the migrations it is
@@ -832,6 +881,39 @@ spec:
               valueFrom: {secretKeyRef: {name: boss-credential-broker-root, key: github-app.installation-id, optional: true}}
             - name: BOSS_BROKER_GITHUB_APP_PRIVATE_KEY
               valueFrom: {secretKeyRef: {name: boss-credential-broker-root, key: github-app.private-key.pem, optional: true}}
+            # THE BROKER-STAGE DOOR, ON (design 6e28ed42; activation,
+            # backlog 25fff647). The jobs API reads the five; the
+            # dispatcher reads the sixth and presents the broker-stage-
+            # token volume's file on every runner credential stage. ON IS
+            # A NEW REFUSAL: from this roll a runner credential's phase
+            # that arrives with no verified token is refused 403, so the
+            # door and its one caller turn on together, here, in one
+            # container. Land this only while NO rotate-a-credential
+            # packet on a runner credential is open: a phase recorded
+            # before it keeps its typed actor, and the verified
+            # workload's replay of it is a conflict, never a rewrite.
+            #
+            # ISSUER: the cluster's, as its own discovery document says
+            # (GET /.well-known/openid-configuration, read 2026-10-09).
+            # AUDIENCE: distinct from the issuer — the API server's
+            # default audience, so a token the API server would take is
+            # one the door refuses, and this one is useless to the API.
+            # NAMESPACE and SERVICE_ACCOUNT: through the downward API, so
+            # each instance's door expects ITS OWN workload (the render
+            # substitutes `namespace:` lines, never env values).
+            # KEY_SET: fetched by the jobs API itself from the API server
+            # with this pod's own token, over TLS trusting only the
+            # cluster CA (design 20058482, stage-keys); the discovery
+            # endpoints answer every ServiceAccount (measured from the dev
+            # session 2026-10-09: the stock issuer-discovery grant, held
+            # through the system:serviceaccounts group, which the boss
+            # ServiceAccount is in too).
+            - {name: BOSS_BROKER_STAGE_ISSUER, value: "https://10.20.0.10:6443"}
+            - {name: BOSS_BROKER_STAGE_AUDIENCE, value: boss-credential-broker-stage}
+            - {name: BOSS_BROKER_STAGE_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: BOSS_BROKER_STAGE_SERVICE_ACCOUNT, valueFrom: {fieldRef: {fieldPath: spec.serviceAccountName}}}
+            - {name: BOSS_BROKER_STAGE_KEY_SET, value: "https://kubernetes.default.svc/openid/v1/jwks"}
+            - {name: BOSS_BROKER_STAGE_TOKEN_FILE, value: /etc/boss/broker-stage/token}
             # Bind all interfaces so the Service can reach the gateway;
             # the default 127.0.0.1 is right for systemd+Caddy, wrong here.
             - {name: BOSS_LISTEN, value: "0.0.0.0:4443"}
@@ -965,6 +1047,11 @@ spec:
             # one directory every service's gate in this container reads,
             # so no env var names a second path.
             - {name: probe-reader, mountPath: /etc/boss/probe-reader, readOnly: true}
+            # The broker-stage token (the volume above), at the file
+            # BOSS_BROKER_STAGE_TOKEN_FILE names. Whole and read-only:
+            # a subPath is never refreshed, and this file is rewritten
+            # every few minutes.
+            - {name: broker-stage-token, mountPath: /etc/boss/broker-stage, readOnly: true}
 ---
 apiVersion: v1
 kind: Service

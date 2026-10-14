@@ -30,6 +30,35 @@ describe('the yard status panel draws the held-cars lane', () => {
     }
   });
 
+  // Backlog ed8e5c85 (David 2026-10-09): a held car is released FROM
+  // its row, through the one door `boss release --review` calls, and the
+  // row shows what that release rests on. The button is offered on the
+  // server's own `releasable`, never on a rule of the page's.
+  it('offers Release on the server’s decision, through the one release door', () => {
+    expect(src).toContain('/release`');
+    expect(src).toContain("method: 'POST'");
+    const lane = markup.slice(markup.indexOf('{#each s.held_cars as'));
+    for (const cell of ['d.verdict', 'd.reviewed_sha', 'd.head', 'd.safe_line', 'd.model', 'd.refusal']) {
+      expect(lane, `the held-cars row shows ${cell}`).toContain(cell);
+    }
+    expect(lane).toContain('d?.releasable');
+    expect(markup).toContain('Release every reviewed car');
+    expect(markup).toContain('releasableHeld(s.held_cars)');
+  });
+
+  // Review 4822764d N1: the one confirmation Release-all asks lists, for
+  // each car, the hold's reason and the reviewer's SAFE line, and marks a
+  // car whose reviewer wrote "no" — it showed only branch, review and
+  // head, so a "no" rode the list with nothing to say so.
+  it('lists each car’s hold reason and SAFE line in the Release-all confirmation', () => {
+    const start = markup.indexOf('<ul class="ys-release-list">');
+    const list = markup.slice(start, markup.indexOf('</ul>', start));
+    for (const cell of ['h.reason', 'h.release?.safe_line', 'safeSaysNo(']) {
+      expect(list, `the Release-all list shows ${cell}`).toContain(cell);
+    }
+    expect(list).toContain('ys-safe-no');
+  });
+
   it('draws the lane beside the dock, and says none held when it is empty', () => {
     const dock = markup.indexOf('THE DOCK</div>');
     const held = markup.indexOf('HELD CARS</div>');

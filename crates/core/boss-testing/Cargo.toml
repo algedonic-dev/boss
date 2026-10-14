@@ -43,6 +43,9 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 toml = { workspace = true }
 
 [dev-dependencies]
+# The reader mount pin must count YAML data, including inline lists,
+# block lists and aliases, rather than a second incomplete line grammar.
+yaml_serde = "0.10"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Test-only, for `the_machine_door_carries_every_read_surface.rs`: the
 # ports the LAN machine door (boss-jobs-internal.yaml) exposes, the table

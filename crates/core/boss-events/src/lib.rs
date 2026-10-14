@@ -33,3 +33,6 @@ pub use integrity::{
 pub use messages_events_pg::PgMessagesEventWriter;
 #[cfg(feature = "postgres")]
 pub use tail_http::audit_tail_router;
+
+#[cfg(feature = "postgres")]
+pub mod statement_budget;

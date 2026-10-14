@@ -182,6 +182,8 @@ controls! {
     /// territory or department — so only scope `all` reads or writes one
     /// (`boss-policy` `authority::may`).
     READ_POLICY_RULE: Read "policy-rule", all;
+    READ_MANUAL_INVENTORY: Read "manual-inventory", all;
+    CREATE_MANUAL_BASELINE: Create "manual-baseline", all;
     CREATE_POLICY_RULE: Create "policy-rule", all;
     UPDATE_POLICY_RULE: Update "policy-rule", all;
     DELETE_POLICY_RULE: Delete "policy-rule", all;
@@ -249,7 +251,15 @@ mod tests {
     /// a control read as held.
     #[test]
     fn the_scope_all_doors_are_declared_scope_all() {
-        let doors: [(Pair, &str); 34] = [
+        let doors: [(Pair, &str); 36] = [
+            (
+                READ_MANUAL_INVENTORY,
+                "boss-content manual_baseline_http inventory",
+            ),
+            (
+                CREATE_MANUAL_BASELINE,
+                "boss-content manual_baseline_http observe",
+            ),
             (READ_ESTATE, "boss-jobs estate_read_refusal"),
             (READ_JOB, "boss-jobs the moves record (moves.rs refused)"),
             (READ_POLICY_RULE, "boss-policy authority::may"),

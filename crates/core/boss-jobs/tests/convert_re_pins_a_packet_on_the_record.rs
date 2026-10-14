@@ -822,8 +822,9 @@ async fn a_packet_that_closed_after_the_move_was_judged_is_not_written() {
     let id = backlog_item_routed(&app, "verify").await;
     let job_id = boss_core::job::JobId::from_uuid(uuid::Uuid::parse_str(&id).expect("job id"));
     let job = app.jobs.get_job(&job_id).await.unwrap().expect("packet");
-    let rows = app.jobs.list_steps(&job_id).await.unwrap();
-    let plan = boss_jobs::repin::plan(&backlog_v2(), &backlog_v14(), &job, &rows).expect("planned");
+    let rows = app.jobs.list_steps_versioned(&job_id).await.unwrap();
+    let plan =
+        boss_jobs::repin::plan_read(&backlog_v2(), &backlog_v14(), &job, &rows).expect("planned");
     assert!(!plan.unskipped().is_empty(), "the plan un-skips: {plan:?}");
 
     let closed = boss_core::job::Job {

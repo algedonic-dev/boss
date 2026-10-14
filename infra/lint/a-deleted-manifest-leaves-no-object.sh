@@ -101,7 +101,7 @@
 # in-cluster gate Job runs with `automountServiceAccountToken: false`
 # against a CI image whose tool manifest
 # (infra/forge/boss-ci/required-tools.txt) carries no kubectl, and a
-# probe run on the forge host as david finds none either
+# probe run on the forge host as boss-probe finds none either
 # (infra/forge/host-absent-tools.txt, measured 2026-09-09). A lint that
 # reddened there would red every car.
 #
@@ -205,10 +205,10 @@ shopt -s nullglob
 # Counted here only, as the static half's own floor — it runs with no
 # cluster, which is where most runs of this check stop. WHICH files make
 # up the declared set is the derivation's question, and it is asked once,
-# below. (Its answer also spans infra/gate-runner/*.yaml: the gate runner
-# applies its own PVC and Job, so an object they declare is DECLARED,
-# just not converged — which is what keeps `gate-runner-disk` from
-# reading as an orphan.)
+# below. (Its answer also spans infra/gate-runner/*.yaml: `boss gate`
+# creates the gate Job from there, so an object they declare is
+# DECLARED, just not converged — which is what kept `gate-runner-disk`
+# from reading as an orphan until it was retired, backlog 1f13b894.)
 MANIFESTS=("$DIR"/*.yaml)
 shopt -u nullglob
 
@@ -421,6 +421,26 @@ unreadable_names=()
 # committed. `-m --first-parent` so a deletion that landed inside a
 # merge is still seen; trains squash today, but a check that depends on
 # that is a check that breaks the day they stop.
+#
+# HISTORY THAT CANNOT BE READ IS NOT HISTORY WITH NO DELETIONS (review
+# 1ba2873d, B1). Every git read below sends its errors to /dev/null, so
+# in a tree git cannot read — an export with no .git, which is what the
+# converge ran this from for a while (backlog 683d7fe9) — the list came
+# back empty and the converge's packet read `orphans_check: ok` having
+# walked nothing; the same commit as a checkout names three deleted
+# manifests. So the history is asked for first, and a refusal is CANNOT
+# ANSWER, like the derivation's.
+cannot_read_history() { # <what failed>
+    fail "CANNOT ANSWER — $1 in $(pwd), so which manifests this tree's history deleted cannot be read"
+    echo "  Property A needs the tree's git history. Nothing is claimed about the cluster." >&2
+    findings+=("CANNOT ANSWER: $1 — no history to read deleted manifests from")
+    record_orphans_check ""
+    exit 1
+}
+git rev-parse --verify -q 'HEAD^{commit}' >/dev/null 2>&1 \
+    || cannot_read_history "git rev-parse HEAD failed"
+deleted_shas=$(git log -m --first-parent --diff-filter=D --format=%H -- "$DIR" 2>/dev/null) \
+    || cannot_read_history "git log of $DIR failed"
 deleted_paths=$(
     {
         while IFS= read -r sha; do
@@ -428,7 +448,7 @@ deleted_paths=$(
             git show -m --first-parent --diff-filter=D --name-only --format= \
                 "$sha" -- "$DIR" 2>/dev/null
         done <<EOF
-$(git log -m --first-parent --diff-filter=D --format=%H -- "$DIR" 2>/dev/null)
+$deleted_shas
 EOF
         git diff --diff-filter=D --name-only HEAD -- "$DIR" 2>/dev/null
         git diff --cached --diff-filter=D --name-only -- "$DIR" 2>/dev/null

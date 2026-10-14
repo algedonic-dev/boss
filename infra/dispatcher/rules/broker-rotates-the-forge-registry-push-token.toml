@@ -1,0 +1,80 @@
+# ---------------------------------------------------------------------
+# The credential broker mints and rotates the forge's REGISTRY PUSH
+# token (design c8502e17, question image-build, David 2026-10-07;
+# backlog 683d7fe9, the first of its two cars). The cluster image is
+# pushed to the forge's own container registry with whatever `docker
+# login` the operator once ran by hand on the forge host: a token in
+# ~david/.docker/config.json that no registry row names, no rotation
+# reaches and nothing can attribute (infra/platform/forge-tokens.toml
+# lists four write:package tokens, every one `consumer = "UNKNOWN"`).
+# THIS RULE IS THE NEW CREDENTIAL'S DECLARATION, the same convention as
+# `broker-rotates-the-forge-host-checkout-token`: Subject id
+# `forge-registry-push-token`, Secret boss/forge-registry-push-token key
+# `token`, issuer user david, scope write:package.
+#
+# ITS OWN HANDLER, FOR ITS OWN PROOF. `credential.rotate.forgejo-registry`
+# is the forgejo rotation with one thing changed: a package token cannot
+# read a repository, so "proven working" is a push the registry accepts —
+# an upload session opened for `verify_image` as `forge_user` with the
+# new token, then cancelled, so nothing is stored. The proof belongs to
+# the handler name and not to an arg, so no rule can pick a proof its
+# token passes for the wrong reason (credential_rotate_forgejo.rs,
+# `Proof`). `verify_image` is the image the converge pushes: the estate's
+# registry host, then david/boss (infra/forge/forge-defaults.sh).
+#
+# OFF-HOST DELIVERY. The consumer is not a mount: forge-converge's
+# infra/forge/registry-token-deposit.sh reads this Secret through the
+# forge's admin kubeconfig, proves the value by a login the registry
+# accepts, writes it ROOT-ONLY as a docker config under
+# /etc/boss/registry-push (root:root, 0700 and 0600), and completes the
+# rotation packet's `delivered` step with the last eight it installed.
+# `delivery = "off-host"` stops THIS firing after verify; the revoke runs
+# on `broker-revokes-the-forge-registry-push-token-on-delivery`, which
+# hands the handler this same declaration (pinned equal by
+# crates/core/boss-dispatcher/tests/forge_registry_push_token_rules.rs).
+#
+# NOTHING USES THE DEPOSITED FILE YET, and that is this car's whole
+# shape: the deploy runner and the disk-floor sweep still build and push
+# as the operator's account with his own login. They move to root, to
+# the system docker daemon and to this file in the item's second car,
+# which must not land before a rotation of this credential has minted,
+# been delivered and been proven on the host — a unit pointed at a file
+# no rotation has filled cannot push the image every pod runs.
+#
+# THE OLD TOKEN. The first rotation names none: this credential is new,
+# and which of the inventory's unattributed write:package tokens sits in
+# the operator's docker login is not known to the tree. Pruning those is
+# administration, David's, once the second car has moved the build off
+# them (forge-tokens.toml says why the audit never deletes). Later
+# rotations name this credential's own previous instance by its last
+# eight, which the deposit records on every converge packet
+# (`registry_token_last_eight`). `spare` is every token another consumer
+# is DECLARED to hold, pinned by forge_host_checkout_token_rules.rs.
+#
+# The Secret is created EMPTY by the cluster converge from this file's
+# secret_namespace/secret_name (cluster-deploy-lib.sh
+# ensure_declared_secrets); the broker's name-scoped grant on it is
+# `credential-broker-forge-registry-push-token` in
+# infra/cluster/manifests/boss-credential-broker.yaml.
+[[rule]]
+name = "broker-rotates-the-forge-registry-push-token"
+why = """
+EXTERNAL GLUE, the census class for reactions whose effect lives
+outside the system: the broker speaks to the FORGE's admin API, its
+container registry and the k8s Secret store, none of which a Workflow
+definition can address. The rotate-a-credential protocol row declares
+the ORDER (issue -> install -> verify -> delivered -> revoke); this
+rule is the machine executor for ONE credential, and its args are that
+credential's declaration. It adds no routing: it advances the very
+packet that fired it and spawns nothing. Design c8502e17 (2026-10-07).
+"""
+# v2 (design db018094, backlog ca356c79, 2026-10-10): `spare` learns
+# `boss-gcp-root-tree-token-*`, the read-only token root on boss-gcp
+# fetches its tree with — another token of the same forge user. A
+# content edit is a version bump (backlog 732c3cf9).
+version = 2
+on_event = "step.done.credential-rotation"
+when = 'subject_id = "forge-registry-push-token"'
+[[rule.do]]
+handler = "credential.rotate.forgejo-registry"
+args = { forge_user = "\"david\"", secret_namespace = "\"boss\"", secret_name = "\"forge-registry-push-token\"", secret_key = "\"token\"", scopes = "\"write:package\"", verify_image = "\"david/boss\"", delivery = "\"off-host\"", spare = "\"boss-gcp,boss-gcp-root-tree-token-*,boss-dev-forge-token-*,forge-host-checkout-token-*\"" }

@@ -50,7 +50,7 @@ fn the_rerail_step_is_a_builders_at_the_decided_setting() {
         .as_ref()
         .expect("the rerail step declares its agent");
     assert_eq!(agent.profile, "builder", "it ships a car");
-    assert_eq!(agent.model, "opus-5[1m]");
+    assert_eq!(agent.model, "opus-5-5");
     assert_eq!(agent.budget_usd, 3.0);
     assert_eq!(agent.effort.as_str(), "medium");
     assert_eq!(rerail.duration_hours, Some(1.0));

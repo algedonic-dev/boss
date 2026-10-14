@@ -22,10 +22,11 @@
 #
 # ROOT-ONLY, AND WHAT THAT DOES AND DOES NOT ISOLATE. The directory is
 # root:root 0700 and each slot 0600, held on every pass. A car's recorded
-# probe runs on this host as BOSS_PROBE_USER (default david, `boss prove
-# --unattended`), so a david-readable token would be readable by any
-# car's probe text — which the 2026-10-05 token-holder isolation decision
-# rules out. Root-only means the units that run as root are stamped and
+# probe runs on this host as BOSS_PROBE_USER (`boss prove --unattended`;
+# boss-probe since car 1386dd64, infra/forge/probe-account.sh, and until
+# then david), so a token readable by that account would be readable by
+# any car's probe text — which the 2026-10-05 token-holder isolation
+# decision rules out. Root-only means the units that run as root are stamped and
 # the units that run as that same account are NOT: to a non-root caller
 # the directory cannot be searched, `machine_token_header` finds no slot
 # and sends without one, silently, as it did before this file. A group
@@ -36,7 +37,9 @@
 # the same uid reads it. A shared uid is not a boundary a group can make.
 #
 # WHAT ROOT-ONLY DOES NOT CLOSE TODAY — two roads, both older than this
-# file, by which a probe running as david still reaches this token:
+# file, by which a shell as david still reaches this token (a probe no
+# longer runs as david — boss-probe reaches neither road, as the
+# probe-account-controls verb measures on the host; backlog dda26693):
 #   1. david holds `sudo -n docker` on this host (infra/estate/
 #      ops-credentials.sh reads /etc/boss-ops through it; the grant is
 #      host residue, no fragment for it is in this tree), which reaches
@@ -47,10 +50,11 @@
 #      checkout before the converge's checkout -f. Any shell as david
 #      can edit what root runs within ten minutes.
 # So on this host today the modes below keep the token from a direct
-# read and from an accident; they isolate it from no account that a
-# probe can already become. What closes both is a probe account of its
-# own (design-doc bdc60b65, question probe-user, David 2026-10-06) — a
-# separate car. machine_token_deposit_sh.rs says the same.
+# read and from an accident; they isolate it from no shell as david. What
+# took probe text off both roads is a probe account of its own (design-doc
+# bdc60b65, question probe-user, David 2026-10-06; car 1386dd64); the
+# roads themselves are a604a35b's and 683d7fe9's.
+# machine_token_deposit_sh.rs says the same.
 #
 # ONE PASS:
 #   1. Read the rule's declaration — secret_namespace, secret_name; the
@@ -245,7 +249,9 @@ else
     KC="${BOSS_OPS_DIR:-/etc/boss-ops}/kubeconfig"
     # --request-timeout: the read ends itself INSIDE the container, which
     # a kill of the client outside would leave running (see the header).
-    KUBECTL=(docker run --rm --network host -v "$KC:/kc:ro" alpine/k8s:1.33.3 kubectl --kubeconfig=/kc "--request-timeout=${REQUEST_TIMEOUT_S}s")
+    # No container log: the Secret kubectl prints is this script's alone
+    # (backlog aa700921).
+    KUBECTL=(docker run --rm --log-driver=none --network host -v "$KC:/kc:ro" alpine/k8s:1.33.3 kubectl --kubeconfig=/kc "--request-timeout=${REQUEST_TIMEOUT_S}s")
     if [ ! -e "$KC" ] && [ ! -L "$KC" ]; then
         KC_STATE="not ready: $KC absent — root material, placed by David (design 835c0c9c)"
     elif [ ! -r "$KC" ]; then

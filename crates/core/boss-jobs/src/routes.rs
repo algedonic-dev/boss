@@ -1302,32 +1302,29 @@ mod tests {
         }
     }
 
-    /// A BUILDER'S GATE THAT DIES IN LINE REACHES THE GARAGE FROM THE SHOP
-    /// FLOOR (backlog b43042cf). Measured 2026-09-28: gate-run 40385690
-    /// (feat/three-bounded-github-verbs) was filed by run 8403148a at
-    /// 06:11:48, waited for a bay, its waiter's last queue beat at 06:29:33,
-    /// and the conductor's reconcile settled it `lost` at 06:50:30. A
-    /// queued gate-run occupies no bay, so it stands on no region
-    /// (`yard::gates`); it first appears in the garage's limbo, and the
-    /// mover draws it handed off from the run that filed it, still
-    /// `building` on the shop floor. That was the one undeclared route on
-    /// the live map, and it troubled the garage for an ordinary death.
+    /// A GATE THAT DIES IN LINE LEAVES THE GATES FOR THE GARAGE (backlog
+    /// 357fe1da, design 85c3f793 decision 5). Measured 2026-09-28:
+    /// gate-run 40385690 was filed at 06:11:48, waited for a bay, and was
+    /// settled `lost` at 06:50:30 while it stood on no region, so it was
+    /// first seen in the garage, handed off from the run that filed it —
+    /// and b43042cf declared that shop-floor -> garage route. A run in
+    /// line now stands AT the gates from its filing, so its death crosses
+    /// gates -> garage, which the gate-run's own protocol declares; the
+    /// shop-floor row described a route no packet takes any more, and an
+    /// allowance that excuses nothing is a hole shaped like a route.
     #[test]
-    fn a_gate_that_dies_waiting_for_a_bay_reaches_the_garage_from_its_run() {
+    fn a_gate_that_dies_waiting_for_a_bay_leaves_the_gates_for_the_garage() {
         let map = tree_routes();
-        let r = route(&map, Some("shop-floor"), Some("garage"))
-            .expect("shop-floor -> garage is a route");
+        let r = route(&map, Some("gates"), Some("garage")).expect("gates -> garage is a route");
         assert!(r.declared, "{r:#?}");
         assert!(
-            r.sources.iter().any(|s| matches!(
-                s,
-                Source::HandOff { by, from, to, terminal, .. }
-                    if by == "cadence:train-reconcile"
-                        && from.as_deref() == Some("agent-run@building")
-                        && to.as_deref() == Some("gate-run@lost")
-                        && terminal.is_none()
-            )),
-            "declared by the reconcile that settles the orphan: {r:#?}"
+            by_workflow(r, "gate-run").contains(&"lost".to_string()),
+            "the gate-run's own protocol carries a run settled lost to the garage: {r:#?}"
+        );
+        assert!(
+            !map.declares(Some("shop-floor"), Some("garage")),
+            "no packet crosses shop-floor -> garage: {:#?}",
+            route(&map, Some("shop-floor"), Some("garage"))
         );
     }
 

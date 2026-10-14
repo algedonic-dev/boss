@@ -109,7 +109,6 @@ async fn serve(pool: PgPool) -> String {
         people,
         publisher: None,
         policy: Some(policy),
-        subject_kinds: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
     });
     // The locations door (backlog 1ec8312a): the real router over the

@@ -33,22 +33,14 @@ The concrete use case this repo ships is **managing a company**:
 Jobs encode work-in-flight, Subjects identify what the work is
 about (an account, an asset, an employee), Steps gate transitions
 behind explicit ownership and sign-off, the event log gives
-operators a complete audit trail. Two worked-example tenants:
+operators a complete audit trail. One worked-example tenant ships:
 
 - **BOSS Brewery** — public OSS demo tenant; an industrial-scale
   brewer. Data-first seeds under `examples/brewery/`.
-- **Used-device-shop** — second worked example, a business that
-  sells, services, and resells used physical devices needing
-  sophisticated diagnostics and repair. Tenant-specific flows live
-  in the `boss-commerce`, `boss-inventory`, and `boss-shipping`
-  crates; this tenant builds on top of the platform-supplied
-  Equipment KB (`boss-catalog`, `boss-assets`) and people domain
-  (`boss-people`).
 
-Both tenants are instantiations of the company-management use case
-running on the underlying state-machine abstraction. BOSS itself
-is neither a brewery product nor a device-refurb product. Treat
-the example tenants as plugins built on top of the core, and the
+The brewery instantiates the company-management use case on the
+underlying state-machine abstraction. BOSS itself is a generic toolkit.
+Treat the example tenant as a plugin built on top of the core, and the
 core itself as a generic state-machine modeling toolkit that
 happens to be tuned for human + agent executors.
 
@@ -165,7 +157,7 @@ the seed-side corollary ("if you're writing `INSERT INTO invoices` in
 a seed file, the answer is to fix the Workflow, not the seed") is at
 [docs/design/seed-vs-emergent-state.md](docs/design/seed-vs-emergent-state.md).
 
-For the example domain, see [examples/used-device-shop/DOMAIN.md](examples/used-device-shop/DOMAIN.md).
+For the example domain, see [examples/brewery/DOMAIN.md](examples/brewery/DOMAIN.md).
 For architecture and the full service map, see [README.md](README.md).
 
 **Stack:** Rust (backend/CLI/agents) · TypeScript/Svelte 5 (frontend)
@@ -280,8 +272,7 @@ plus matching `*-client` crates). Company-modeling adds the
 `crates/modules/` tier (`boss-people`, `boss-messages`,
 `boss-ledger`, `boss-commerce`, `boss-inventory`, etc.). The
 `crates/tenants/` tier is where each tenant binary lives — today
-the brewery (`boss-brewery-engine`) and used-device-shop
-(`boss-used-device-shop-engine`). Don't push tenant-specific
+the brewery (`boss-brewery-engine`). Don't push tenant-specific
 assumptions (device refurb, service-account specifics, regulator
 quirks) into the core; if a
 feature only makes sense for the example tenant, it lives in those
@@ -395,7 +386,7 @@ the tier it touches.**
 
 - **`crates/tenants/` — Tier 3: Tenants**. Tenant-specific
   binaries. Crates: `boss-brewery-engine` (Algedonic Ales public
-  demo) and `boss-used-device-shop-engine` (used-device-shop).
+  demo).
   Data-side seeds + Workflows for the brewery tenant live under
   `examples/brewery/`.
 
@@ -910,7 +901,15 @@ a door that stops being true is a defect worth a car.
   in all ten (`cc9ddc5d`).
 
 - **Gating a branch — `boss gate <branch> [--wait]`.** Files or reuses
-  the packet, renders the runner, creates the Job. `--wait` polls to a
+  the packet, renders the runner MANIFEST from the launcher's tree,
+  creates the Job. The runner SCRIPT is not rendered: the pod runs
+  `infra/gate-runner/run.sh` from ConfigMap `gate-runner-script`, which
+  the forge converge writes from main after each train, so **a car that
+  changes run.sh is gated by main's old one**, and its change is live
+  only after the converge that follows its merge (backlog e3100bc8). The
+  receipt says which ran, as `runner_source` and `runner_sha256`; car 2
+  of design 1d7a1669 points the pod at the bootstrap that fetches the
+  gated sha's own run.sh. `--wait` polls to a
   verdict; hand-rolled pollers have been written three times and two
   were broken. Two ways to spend a gate for nothing, each paid for
   once (2026-08-28) and neither discoverable from the code: **a gated
@@ -1056,4 +1055,4 @@ know.
 - No blocking I/O in async contexts
 - No bespoke workflow code paths — new work types are **Workflow rows**, not `match` branches in core code
 - No bespoke step UX in `apps/web` core — new surfaces ship as **StepPlugin rows + a JS bundle**
-- No tenant-specific assumptions in BOSS core — keep used-device-shop logic in the example crates
+- No tenant-specific assumptions in BOSS core — keep example-specific logic in the tenant crates

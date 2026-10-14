@@ -54,6 +54,16 @@
 //! nothing is filed. The alarm carries the verb, the trouble in words,
 //! the line the run said, and the head of its output.
 //!
+//! A request closes `refused` for two kinds of reason, and only one is
+//! the runner's (backlog 8828d47d). ops-request's `refused` terminal
+//! also readies when the APPROVER declines the plan, and the watch filed
+//! David's own rejection of an empty reap plan as "REFUSED by the ops
+//! runner … recorded no reason". So a refusal reads the runner's reason
+//! first (off execute or the closing terminal), and an alarm follows;
+//! without one, an approver's signed `rejected` / `changes-requested` is
+//! written onto the request as `judged` and nothing is filed; and a
+//! refusal neither explains is an alarm that says exactly that.
+//!
 //! ## What it does
 //!
 //! On `jobs.job.closed` for an `ops-request` that closed `answered`:
@@ -366,6 +376,10 @@ pub(crate) enum Trouble {
     Failed(VerbFailure),
     /// The ops runner refused to run it; the runner's reason, verbatim.
     RunnerRefused(String),
+    /// It closed `refused` and no step says why: no runner reason, and
+    /// no declining decision on `approve` (backlog 8828d47d — this used
+    /// to be worded as a runner refusal that "recorded no reason").
+    RefusedUnexplained,
     /// Exit 0, and no line of the output matches `verdict_pattern`.
     NoVerdict,
     /// The verdict was found, and `when` is false over it.
@@ -388,6 +402,9 @@ impl Trouble {
         match self {
             Self::Failed(f) => f.line.clone(),
             Self::RunnerRefused(reason) => reason.clone(),
+            Self::RefusedUnexplained => "it closed refused and no step records why: no runner \
+                 reason on execute or the closing step, and no declining decision on approve"
+                .into(),
             Self::NoVerdict => String::new(),
             Self::VerdictFalse { verdict, .. } => verdict.clone(),
         }
@@ -397,6 +414,7 @@ impl Trouble {
         match self {
             Self::Failed(f) => format!("{verb} FAILED (exit {})", f.exit),
             Self::RunnerRefused(_) => format!("{verb} was REFUSED by the ops runner"),
+            Self::RefusedUnexplained => format!("{verb} closed REFUSED with no reason recorded"),
             Self::NoVerdict => format!("{verb} answered with no verdict"),
             Self::VerdictFalse { .. } => format!("{verb}'s verdict fails `{when_src}`"),
         }
@@ -408,6 +426,7 @@ impl Trouble {
             Self::RunnerRefused(reason) => {
                 format!("the ops runner REFUSED to run it, so nothing ran: {reason}")
             }
+            Self::RefusedUnexplained => format!("nothing ran: {}", self.line()),
             Self::NoVerdict => format!(
                 "it exited 0 with no verdict — no line of its output matches {pattern:?} — and \
                  no evidence is not a pass"
@@ -426,6 +445,67 @@ fn execute_output(job: &serde_json::Value) -> &str {
         .and_then(|m| m.get("output"))
         .and_then(|o| o.as_str())
         .unwrap_or("")
+}
+
+/// The steps the ops runner writes a refusal's `reason` onto: `execute`
+/// when it refuses the verb itself, and the closing terminal when it
+/// refuses a request whose execute is still pending behind `approve`
+/// (ops-runner.sh `abort_request`: `refused`, or `not-released` for a
+/// review that did not release). Until backlog 8828d47d only `execute`
+/// was read, so an aborted request's reason read as "none recorded".
+const RUNNER_REASON_STEPS: [&str; 3] = [REPORT_STEP, "refused", "not-released"];
+
+/// PURE: the runner's own words for a refusal, off the first step that
+/// carries them — every step of each slug, since a request can hold a
+/// skipped terminal of the same slug beside the one that closed it.
+fn runner_reason(job: &serde_json::Value) -> Option<String> {
+    let steps = job.get("steps")?.as_array()?;
+    RUNNER_REASON_STEPS.iter().find_map(|slug| {
+        steps
+            .iter()
+            .filter(|s| s.get("spec_slug").and_then(|v| v.as_str()) == Some(slug))
+            .find_map(|s| meta_str(s, "reason"))
+            .map(str::to_string)
+    })
+}
+
+/// An approver's signed "no" on the plan (backlog 8828d47d).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ApproverDecline {
+    pub by: String,
+    pub decision: String,
+    pub comment: Option<String>,
+}
+
+/// The decisions on `approve` that DECLINE the plan. ops-request.toml's
+/// `refused` also readies on an approve completed with no decision, or
+/// with `pending` — nobody chose those, so they are not a decision and
+/// stay an alarm.
+const DECLINING_DECISIONS: [&str; 2] = ["rejected", "changes-requested"];
+
+/// PURE: the decline, when `approve` was COMPLETED by a named actor that
+/// is not an automation, with a declining `decision`. Both keys are the
+/// signer's (ops-request.toml: `writer = "signer"` on `decision` and
+/// `comment`, and the step completes only under a presence stamp), so
+/// this reads a person's act and nothing a machine can write in its
+/// place. Every doubt — no actor, an automation, no decision — is None,
+/// and None is an alarm: this can only quiet the case it names.
+fn approver_decline(job: &serde_json::Value) -> Option<ApproverDecline> {
+    let approve = step_by_slug(job, "approve")?;
+    if approve.get("status").and_then(|v| v.as_str()) != Some("completed") {
+        return None;
+    }
+    let by = approve
+        .get("completed_by")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|b| !b.is_empty() && !b.starts_with("automation:"))?;
+    let decision = meta_str(approve, "decision").filter(|d| DECLINING_DECISIONS.contains(d))?;
+    Some(ApproverDecline {
+        by: by.to_string(),
+        decision: decision.to_string(),
+        comment: meta_str(approve, "comment").map(str::to_string),
+    })
 }
 
 /// How much of a watched run's output an alarm carries: its HEAD, where
@@ -721,6 +801,48 @@ impl OpsJudge {
         Ok(())
     }
 
+    /// The approver said no (backlog 8828d47d). Nothing ran because a
+    /// person decided it should not, with a presence-stamped sign-off on
+    /// the plan — the one reader an alarm would reach is the one who
+    /// made the decision. The request is annotated so a reader of it
+    /// sees why it closed, and nothing is filed.
+    async fn record_decline(
+        &self,
+        j: &Judgement,
+        judged_id: &str,
+        decline: &ApproverDecline,
+        ctx: &InvocationContext,
+    ) -> Result<(), HandlerError> {
+        let rule = ctx.rule_name.as_str();
+        let comment = match &decline.comment {
+            Some(c) => format!(" — their comment: {c}"),
+            None => " — no comment".into(),
+        };
+        self.annotate(
+            judged_id,
+            json!({
+                JUDGED: format!(
+                    "{rule}: no alarm — {} was not run because its approver, {}, signed `{}` on \
+                     the approve step{comment}. A person's decision on the plan, not a runner \
+                     refusal.",
+                    j.verb, decline.by, decline.decision
+                ),
+                "approver_decision": decline.decision,
+            }),
+            rule,
+        )
+        .await?;
+        tracing::info!(
+            rule = %rule,
+            judged = %judged_id,
+            "watched {}: declined by {} ({}); recorded, nothing filed",
+            j.verb,
+            decline.by,
+            decline.decision
+        );
+        Ok(())
+    }
+
     async fn annotate(
         &self,
         judged_id: &str,
@@ -777,23 +899,28 @@ impl Handler for OpsJudge {
             return Ok(());
         }
 
-        // 2b. A RUNNER refusal ran nothing and closed the request
-        //     `refused`. A chain has nothing to read in it; a watch's
-        //     daily bound did not hold, so it is an alarm.
+        // 2b. A request closed `refused` ran nothing. A chain has nothing
+        //     to read in it. For a watch, WHO refused decides (backlog
+        //     8828d47d): the runner's words are read first, wherever it
+        //     wrote them, and are an alarm; an approver's signed decline
+        //     is a person's decision, recorded and not alarmed; anything
+        //     else is a refusal nobody explained, and an alarm.
         let refused = meta_str(&judged, "outcome") == Some("refused")
             || ctx.event_payload.get("outcome").and_then(|v| v.as_str()) == Some("refused");
         if refused {
             if j.then.is_some() {
                 return Ok(());
             }
-            let reason = step_by_slug(&judged, REPORT_STEP)
-                .and_then(|s| s.get("metadata"))
-                .and_then(|m| m.get("reason"))
-                .and_then(|r| r.as_str())
-                .unwrap_or("the ops runner refused it and recorded no reason")
-                .to_string();
+            if let Some(reason) = runner_reason(&judged) {
+                return self
+                    .raise(&j, judged_id, &judged, &Trouble::RunnerRefused(reason), ctx)
+                    .await;
+            }
+            if let Some(decline) = approver_decline(&judged) {
+                return self.record_decline(&j, judged_id, &decline, ctx).await;
+            }
             return self
-                .raise(&j, judged_id, &judged, &Trouble::RunnerRefused(reason), ctx)
+                .raise(&j, judged_id, &judged, &Trouble::RefusedUnexplained, ctx)
                 .await;
         }
 
@@ -1677,6 +1804,156 @@ mod tests {
         c.event_payload["outcome"] = json!("refused");
         judge(base).invoke(&args(), &c).await.unwrap();
         assert!(writes.lock().unwrap().is_empty());
+    }
+
+    /// A refused request in the shape ops-request d2a031b4 closed in
+    /// (backlog 8828d47d, 2026-10-09): the runner rendered the plan onto
+    /// `approve`, the approver signed a decision on it, the engine
+    /// readied `refused` off that decision and the complete-marker rule
+    /// closed it. Execute was skipped; no step carries a `reason`.
+    fn declined(decision: &str) -> serde_json::Value {
+        json!({
+            "id": CHECK,
+            "kind": "ops-request",
+            "status": "closed",
+            "metadata": { "host": "forge", "verb": WATCHED, "outcome": "refused",
+                          "requires_approval": true },
+            "steps": [
+                { "id": "r-filed", "spec_slug": "filed", "status": "completed", "metadata": {} },
+                { "id": "r-approve", "spec_slug": "approve", "status": "completed",
+                  "completed_by": "emp-david",
+                  "metadata": { "decision": decision, "decided_at": "2026-10-09T15:12:59.738Z",
+                                "comment": "an empty plan is not worth a passkey",
+                                "plan": "== pods to reap (0) ==\nnone — nothing to reap\n" } },
+                { "id": "r-execute", "spec_slug": "execute", "status": "skipped",
+                  "metadata": { "authority_role": "platform-admin", "claimable": true } },
+                { "id": "r-refused", "spec_slug": "refused", "status": "completed",
+                  "completed_by": "automation:rule:complete-marker-on-step-ready",
+                  "metadata": { "outcome_kind": "aborted" } },
+            ],
+        })
+    }
+
+    fn refused_ctx() -> InvocationContext {
+        let mut c = ctx();
+        c.event_payload["outcome"] = json!("refused");
+        c
+    }
+
+    /// AN APPROVER'S NO IS A DECISION, NOT A RUNNER REFUSAL (backlog
+    /// 8828d47d). The watch filed an URGENT alarm saying "the ops runner
+    /// refused it and recorded no reason" for a plan David had rejected
+    /// with his own passkey: the runner refused nothing, and the reason
+    /// sat on the approve step the judge never read. A decline the
+    /// approver signed is already read by the one person who made it, so
+    /// it is written onto the request as `judged` and nothing is filed.
+    #[tokio::test]
+    async fn an_approver_who_declines_the_plan_is_recorded_and_not_alarmed() {
+        for decision in ["rejected", "changes-requested"] {
+            let (base, writes) = mock_jobs(vec![declined(decision)]).await;
+            judge(base)
+                .invoke(&watch_args(), &refused_ctx())
+                .await
+                .unwrap();
+            let w = writes.lock().unwrap().clone();
+            assert!(
+                posts(&w).is_empty(),
+                "{decision}: a person's decision files no alarm: {w:?}"
+            );
+            let note = note_on(&w, CHECK);
+            let judged = note[JUDGED].as_str().unwrap();
+            assert!(
+                judged.contains("emp-david") && judged.contains(decision),
+                "{decision}: the note names who decided and what: {judged}"
+            );
+            assert!(
+                judged.contains("an empty plan is not worth a passkey"),
+                "{decision}: and the approver's own comment: {judged}"
+            );
+            assert!(
+                !judged.contains("ops runner REFUSED"),
+                "{decision}: the runner refused nothing: {judged}"
+            );
+            assert_eq!(note["approver_decision"], decision, "{note}");
+        }
+    }
+
+    /// ONLY AN EXPLICIT DECLINE IS A DECISION. An approve completed with
+    /// no decision (or a `pending` one) still closes the request
+    /// `refused`, and nobody chose that — so it is an alarm, as before,
+    /// and its words no longer claim the RUNNER recorded nothing.
+    #[tokio::test]
+    async fn an_approve_closed_without_a_declining_decision_is_still_an_alarm() {
+        for decision in ["", "pending"] {
+            let mut job = declined(decision);
+            if decision.is_empty() {
+                job["steps"][1]["metadata"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("decision");
+            }
+            let (base, writes) = mock_jobs(vec![job]).await;
+            judge(base)
+                .invoke(&watch_args(), &refused_ctx())
+                .await
+                .unwrap();
+            let w = writes.lock().unwrap().clone();
+            let filed = alarms(&w);
+            assert_eq!(filed.len(), 1, "{decision:?}: {w:?}");
+            let failed = filed[0]["metadata"]["failed"].as_str().unwrap();
+            assert!(
+                !failed.contains("the ops runner refused it and recorded no reason"),
+                "{decision:?}: {failed}"
+            );
+            assert!(
+                failed.contains("no step records why"),
+                "{decision:?}: {failed}"
+            );
+        }
+    }
+
+    /// THE RUNNER'S REASON IS QUOTED WHEREVER THE RUNNER WROTE IT. A
+    /// request whose execute is still pending behind `approve` is refused
+    /// through ops-runner.sh's `abort_request`, which writes `reason` onto
+    /// the CLOSING terminal (`refused`, or `not-released`) — never onto
+    /// execute, the only place this judge read. Such a refusal read as
+    /// "recorded no reason" while its reason sat one step down. And a
+    /// runner reason is an alarm even beside a declined approve: the
+    /// runner's words are read first, so a decline can never quiet one.
+    #[tokio::test]
+    async fn a_runner_reason_on_the_closing_terminal_is_quoted_in_the_alarm() {
+        for (slug, decision) in [
+            ("refused", "approved"),
+            ("not-released", "approved"),
+            ("refused", "rejected"),
+        ] {
+            let mut job = declined(decision);
+            let steps = job["steps"].as_array_mut().unwrap();
+            steps[3]["status"] = json!("skipped");
+            steps.push(json!({
+                "id": "r-close", "spec_slug": slug, "status": "completed",
+                "metadata": { "outcome_kind": "aborted", "runner_host": "forge",
+                              "reason": "the signed plan no longer hashes to what was approved" } }));
+            if slug == "not-released" {
+                steps.retain(|s| s["spec_slug"] != "refused" || s["id"] == "r-close");
+            }
+            let (base, writes) = mock_jobs(vec![job]).await;
+            judge(base)
+                .invoke(&watch_args(), &refused_ctx())
+                .await
+                .unwrap();
+            let w = writes.lock().unwrap().clone();
+            let filed = alarms(&w);
+            assert_eq!(filed.len(), 1, "{slug}/{decision}: {w:?}");
+            assert!(
+                filed[0]["metadata"]["failed"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no longer hashes to what was approved"),
+                "{slug}/{decision}: the runner's reason, verbatim: {}",
+                filed[0]
+            );
+        }
     }
 
     #[test]

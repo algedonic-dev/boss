@@ -122,7 +122,7 @@ mod tests {
 
     impl Stack {
         async fn api(&self, method: Method, path: &str, body: Option<Value>) -> Option<Value> {
-            crate::gate::api_at_signed(
+            crate::sor_client::api_at_signed(
                 &self.http,
                 &self.base,
                 method.clone(),

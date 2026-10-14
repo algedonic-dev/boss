@@ -74,59 +74,23 @@
 # alphanumeric-with-dashes.) Register the gate-run packet FIRST (kind
 # gate-run, due_on a few hours out); the packet is the record, the Job
 # is just the muscle.
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: gate-seed
-  namespace: boss-dev
-  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: build}
-spec:
-  # THE WARM SEED, on w-1's own xfs so a gate's copy is a reflink (see
-  # infra/cluster/manifests/gate-seed-local.yaml for the measurement and
-  # the migration). Bound by name to the one local PV; the class has no
-  # provisioner, so a typo here binds nothing and the Job stays Pending
-  # rather than gating on the wrong disk.
-  # SUPERSEDED 2026-09-30 (backlog 52ea56ac): the Job below mounts the
-  # gate claim on w-1's second NVMe instead (declared and converged in
-  # gate-seed-local.yaml). This claim stays declared while a gate from an
-  # older checkout can still render the manifest that mounts it, then a
-  # car retires it with its PV, as gate-runner-disk below is retired.
-  accessModes: [ReadWriteOnce]
-  storageClassName: gate-seed-local
-  volumeName: gate-seed-w-1
-  resources:
-    requests:
-      storage: 200Gi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: gate-runner-disk
-  namespace: boss-dev
-spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: longhorn-dev-disposable
-  resources:
-    requests:
-      # No longer the workspace — the WARM SEED (target/ snapshot,
-      # ~74G measured cold; a warm one is comparable) + CARGO_HOME's
-      # registry cache (a few G) + the refresh's staging copy is
-      # rm-first so peak stays near one target's worth. The claim
-      # KEEPS ITS OLD NAME on purpose: the volume already holds the
-      # warm target and crate cache from the serial era, and renaming
-      # the claim would orphan that warmth and make the first
-      # parallel gates cold for no reason.
-      #
-      # RWO is now a placement rule, not a serialization rule: every
-      # concurrent gate co-mounts this volume, which Kubernetes allows
-      # only on ONE node — so all gates land together on the build
-      # node (the affinity below already prefers it). A gate scheduled
-      # to a different node waits on attach (Multi-Attach error in
-      # `kubectl describe pod`) rather than corrupting anything; if
-      # the build node is cordoned, gating degrades toward serial on
-      # whichever node takes the volume, honestly and visibly.
-      storage: 120Gi
+#
+# THIS FILE DECLARES THE JOB AND NOTHING ELSE (backlog 1f13b894,
+# 2026-10-10). It carried two claims the Job no longer mounts, both
+# superseded on 2026-09-30 when the gate moved onto w-1's second NVMe
+# (backlog 52ea56ac; the `gate` claim is converged beside its PV in
+# infra/cluster/manifests/gate-seed-local.yaml):
+#   - `gate-runner-disk`, 120Gi longhorn-dev-disposable — the serial
+#     era's workspace, then the Longhorn warm seed. Its one replica held
+#     197.7 GiB of w-1's install disk on 2026-10-10 (ops-request
+#     e66b045d) while the estate read disk_tight:w-1.
+#   - `gate-seed`, bound by name to the local PV gate-seed-w-1 — the
+#     EPHEMERAL warm seed of 5b3dabb5.
+# Nothing ever applied this file's claims (`boss gate` creates only the
+# Job), so deleting the lines deletes no object. The live claims are
+# deleted by hand — a PVC is bytes, outside the delete-orphan-object
+# verb's kind floor — in the order gate-seed-local.yaml's RETIRED
+# paragraph gives, because one of them must be emptied first.
 ---
 apiVersion: batch/v1
 kind: Job
@@ -199,9 +163,9 @@ spec:
       # w-1 was cordoned for an NVMe thermal fault, a hard pin would
       # have left this with no schedulable node and stopped gating
       # entirely. Preferred affinity degrades to a slower build on a
-      # control plane instead of no build at all. (The seed PVC's RWO
-      # attach is what actually herds concurrent gates onto one node —
-      # see the claim's comment.)
+      # control plane instead of no build at all. (The gate claim's
+      # local PV, bound to w-1 by nodeAffinity, is what actually herds
+      # concurrent gates onto one node — see gate-seed-local.yaml.)
       affinity:
         nodeAffinity:
           # A BUILD NEVER SHARES A NODE WITH ETCD (incident a398c4d3,
@@ -419,8 +383,9 @@ spec:
             # disk, which has no sizeLimit but is not the node's disk
             # either.) This must be an env var, not a mkdir in
             # run.sh: the script reaches the pod through a ConfigMap
-            # applied separately, so a manifest that depended on a
-            # run.sh change would be live before the change was.
+            # the forge converge writes from main AFTER a merge (the
+            # run-script volume below), so a manifest that depended on
+            # a run.sh change would be live before the change was.
             - {name: HOME, value: /gate-target}
             # THE WORKSPACE'S NAME: this pod's own, so /gate-target
             # (subPathExpr runs/$(POD_NAME) below) is a directory no
@@ -694,15 +659,15 @@ spec:
         # 160 itself is still an estimate, not a measured peak; 943f1065
         # records the peak on the receipt so both can be set from it.
         #
-        # …and the warm seed + crate cache was the claim `gate-seed`
-        # (see that PVC's comment), mounted read-write because run.sh's
-        # post-verdict refresh writes the next snapshot there; reads and
-        # writes coordinate through flock on the volume, never by luck.
-        # It sat on the build node's OWN filesystem (a `local` PV
-        # declared in infra/cluster/manifests/gate-seed-local.yaml), so
+        # …and the warm seed + crate cache was the claim `gate-seed`,
+        # mounted read-write because run.sh's post-verdict refresh
+        # writes the next snapshot there; reads and writes coordinate
+        # through flock on the volume, never by luck. It sat on the
+        # build node's OWN filesystem (a `local` PV on EPHEMERAL), so
         # run.sh's `cp --reflink=auto` shares extents instead of
-        # rewriting tens of GB per gate. The Longhorn claim above stays
-        # until this seed is warm, then a car retires it.
+        # rewriting tens of GB per gate. It replaced the Longhorn claim
+        # `gate-runner-disk`; both are retired (backlog 1f13b894, see
+        # the head of this file).
         #
         # SINCE 2026-09-30 (backlog 52ea56ac, design 8457c07b) both are
         # ONE claim, `gate`, on w-1's second NVMe — a Talos user volume
@@ -818,12 +783,22 @@ spec:
           emptyDir: {medium: Memory, sizeLimit: 1Gi}
         # run.sh ships in the repo and reaches the pod through this
         # ConfigMap, because run.sh is what performs the clone and so
-        # cannot come FROM the clone. Regenerate it from the tree with
-        #   ./infra/gate-runner/apply-script-configmap.sh
-        # and ask whether it has drifted with --check. This used to be
-        # a kubectl command in a comment; on 2026-08-26 the live copy
-        # turned out to hold an unlanded branch is script, and ten gates
-        # issued receipts from a gate that is not in this repository.
+        # cannot come FROM the clone. The FORGE CONVERGE writes it from
+        # MAIN on every train (infra/forge/cluster-deploy-runner.sh,
+        # since 2b69220a), so the command below runs MAIN's run.sh as of
+        # the last converge — never a car's own: a run.sh car is gated by
+        # the old script, and its change is live only after the converge
+        # that follows its merge (backlog e3100bc8, measured on 646c0ade).
+        # Since e3100bc8 the ConfigMap also holds bootstrap.sh, which
+        # fetches and execs the run.sh of the sha being gated (main's
+        # copy as its named fallback) and records which on the receipt as
+        # runner_source; pointing the command at it is car 2 of design
+        # 1d7a1669. Ask whether the live copy has drifted with
+        #   ./infra/gate-runner/apply-script-configmap.sh --check
+        # (without --check it repairs by hand). This used to be a kubectl
+        # command in a comment; on 2026-08-26 the live copy turned out to
+        # hold an unlanded branch is script, and ten gates issued
+        # receipts from a gate that is not in this repository.
         - name: run-script
           configMap: {name: gate-runner-script, defaultMode: 0755}
         # Read-only forge credential. NOT optional: without it the clone

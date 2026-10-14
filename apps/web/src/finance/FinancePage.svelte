@@ -26,7 +26,7 @@
     type CommerceSummary,
   } from './api';
   import type { PagedResult } from '../data/paginated';
-  import { loadingRead, readStateOf } from '../data/readState';
+  import { loadingRead, readStateOf, type ReadState } from '../data/readState';
   import { href } from '../router';
   import { session } from '@boss/web-kit/session/session.svelte';
   import { financeOffersWrite } from './readOnly';
@@ -84,6 +84,7 @@
   let invoicesResult = $state<PagedResult<Invoice> | null>(null);
   let summary = $state<CommerceSummary | null>(null);
   let summaryLoading = $state(true);
+  let summaryRead = $state<ReadState>(loadingRead);
 
   let invoices = $derived(
     invoicesResult?.kind === 'ready' ? invoicesResult.page.data : [],
@@ -108,7 +109,8 @@
       const [inv, s] = await Promise.all([loadInvoices(), loadCommerceSummary()]);
       if (!cancelled) {
         invoicesResult = inv;
-        summary = s;
+        summary = s.kind === 'ready' ? s.data : null;
+        summaryRead = readStateOf(s);
         summaryLoading = false;
       }
     };
@@ -182,7 +184,7 @@
 
   <div class="tab-panel">
     {#if tab === 'overview'}
-      <OverviewTab {summary} loading={summaryLoading} />
+      <OverviewTab {summary} {summaryRead} loading={summaryLoading} />
     {:else if tab === 'invoices'}
       <InvoicesTab
         {invoices}
@@ -220,4 +222,3 @@
     </section>
   {/if}
 </div>
-

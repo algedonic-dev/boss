@@ -344,11 +344,39 @@ async fn merged_outcome_survives_review_and_closes_on_the_marker() {
     let (status, body) = complete_step(&app, &job_id, &proven_id, proven_md).await;
     assert!(status.is_success(), "proving failed: {status} {body}");
 
+    // THE REVIEW A CAR NO RULE HELD OWES AFTER LANDING (backlog
+    // bd331d38, option A, David 2026-10-09). This car boarded with no
+    // release naming a review, so its review is owed now, and the proof
+    // alone no longer closes it: the terminal waits for the review too.
+    let proved = get_job(&app, &job_id).await;
+    assert_eq!(
+        step(&proved, "Merged")["status"],
+        "pending",
+        "a car whose review is owed does not close on its proof alone: {proved:#}"
+    );
+    let review_id = step(&proved, "Reviewed after landing")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(step(&proved, "Reviewed after landing")["status"], "ready");
+    let mut review_md = serde_json::Map::new();
+    review_md.insert("verdict".into(), "clean".into());
+    review_md.insert(
+        "findings".into(),
+        "read the change as it landed; nothing blocks".into(),
+    );
+    review_md.insert(
+        "reviewed".into(),
+        "1111111111111111111111111111111111111111".into(),
+    );
+    let (status, body) = complete_step(&app, &job_id, &review_id, review_md).await;
+    assert!(status.is_success(), "reviewing failed: {status} {body}");
+
     let proven = get_job(&app, &job_id).await;
     assert_eq!(
         step(&proven, "Merged")["status"],
         "ready",
-        "the prod proof must promote the Merged outcome: {proven:#}"
+        "the prod proof and the landed review promote the Merged outcome: {proven:#}"
     );
 
     // Completing the outcome (what the dispatcher's marker handler

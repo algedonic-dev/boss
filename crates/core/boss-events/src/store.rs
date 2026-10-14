@@ -27,7 +27,21 @@ impl Default for InMemoryEventStore {
 #[async_trait]
 impl EventStore for InMemoryEventStore {
     async fn append(&self, event: &Event) -> Result<(), EventStoreError> {
-        self.events.write().await.push(event.clone());
+        let mut events = self.events.write().await;
+        if let Some(existing) = events.iter().find(|existing| existing.id == event.id) {
+            if existing.timestamp == event.timestamp
+                && existing.source == event.source
+                && existing.kind == event.kind
+                && existing.payload == event.payload
+            {
+                return Ok(());
+            }
+            return Err(EventStoreError::AppendFailed(format!(
+                "event {}: immutable identity conflict; original fact preserved",
+                event.id
+            )));
+        }
+        events.push(event.clone());
         Ok(())
     }
 
@@ -51,6 +65,62 @@ impl EventStore for InMemoryEventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn one_identity_is_idempotent_only_for_the_same_fact() {
+        let store = InMemoryEventStore::new();
+        let original = Event::new(
+            "test",
+            "events.outbox.pruned",
+            serde_json::json!({"_actor":"emp-first"}),
+            chrono::Utc::now(),
+        );
+        store.append(&original).await.unwrap();
+        store.append(&original).await.unwrap();
+        assert_eq!(store.query_by_source("test").await.unwrap().len(), 1);
+        for field in ["source", "kind", "timestamp", "payload"] {
+            let mut conflicting = original.clone();
+            match field {
+                "source" => conflicting.source = "other".into(),
+                "kind" => conflicting.kind = "events.outbox.dead_lettered".into(),
+                "timestamp" => conflicting.timestamp += chrono::Duration::nanoseconds(1),
+                "payload" => conflicting.payload["_actor"] = serde_json::json!("emp-second"),
+                _ => unreachable!(),
+            }
+            assert!(store.append(&conflicting).await.is_err());
+        }
+        assert_eq!(
+            store.query_by_source("test").await.unwrap()[0].payload,
+            original.payload
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_append_cannot_split_one_identity() {
+        let store = Arc::new(InMemoryEventStore::new());
+        let first = Event::new(
+            "test",
+            "events.outbox.pruned",
+            serde_json::json!({"_actor":"emp-first"}),
+            chrono::Utc::now(),
+        );
+        let mut second = first.clone();
+        second.payload["_actor"] = serde_json::json!("emp-second");
+        let (a, b) = tokio::join!(store.append(&first), store.append(&second));
+        assert_ne!(a.is_ok(), b.is_ok());
+        let stored = store.query_by_source("test").await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].payload,
+            if a.is_ok() {
+                first.payload
+            } else {
+                second.payload
+            }
+        );
+        store.append(&stored[0]).await.unwrap();
+        assert_eq!(store.query_by_source("test").await.unwrap().len(), 1);
+    }
 
     #[tokio::test]
     async fn append_and_query() {

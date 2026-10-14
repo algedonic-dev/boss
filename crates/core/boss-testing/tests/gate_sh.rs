@@ -1100,10 +1100,15 @@ fn auto_scope_of(label: &str, touch: &[&str]) -> (String, serde_json::Value) {
         ],
         &tree,
     );
+    // An existing file is EDITED, not blanked: a real car keeps what the
+    // file says, and the scope can depend on it — the recovery sheet's
+    // `file =` references are part of the map (backlog 6ac90873), so a
+    // sheet emptied here would derive a map no car could produce.
     for rel in touch {
         let path = tree.join(rel);
         boss_testing::create_dir(path.parent().expect("a scratch path has a parent"));
-        boss_testing::write_file(&path, "-- scratch\n");
+        let kept = std::fs::read_to_string(&path).unwrap_or_default();
+        boss_testing::write_file(&path, &format!("{kept}-- scratch\n"));
     }
 
     let counter = dir.join("calls");
@@ -1432,6 +1437,79 @@ fn a_doc_a_test_module_reads_by_repo_path_scopes_the_crate_that_pins_it() {
     );
 }
 
+/// The recovery sheet's source and the manifest the incident edited,
+/// both read off the tree rather than restated here — a repo-path
+/// literal in this file would make this crate a reader the index counts,
+/// and a sheet that moves must fail this test by name rather than let it
+/// pass about a file nobody reads.
+fn the_sheet_and_the_backup_manifest() -> (String, String) {
+    let reader = read("crates/orchestrators/boss-cli/src/recovery.rs");
+    let sheet = reader
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("pub const SOURCE: &str = \""))
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| {
+            panic!(
+                "boss-cli's recovery.rs no longer names its sheet in `pub const SOURCE` — \
+                 move this test to wherever the recovery sheet is read now"
+            )
+        })
+        .to_string();
+    let manifest = read(&sheet)
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("file = \""))
+        .filter_map(|rest| rest.split('"').next())
+        .find(|p| p.ends_with("boss-backup.yaml"))
+        .unwrap_or_else(|| {
+            panic!(
+                "{sheet} no longer names the backup manifest by `file =` — pick another of \
+                 its `file =` references for this test"
+            )
+        })
+        .to_string();
+    (sheet, manifest)
+}
+
+/// THE CAR THAT EARNED THIS (backlog 6ac90873, review 298f7808). Car
+/// 594df586 edited only the backup manifest. boss-cli reads that file —
+/// not by naming it, but because the recovery sheet names it as a
+/// `file =` and recovery.rs's `the_roads_the_runbooks_held_are_on_the_sheet`
+/// resolves every such reference against the tree. The index counted the
+/// sheet's own readers and stopped there, so `--auto` derived boss-testing
+/// alone, the car went green, and the test was red on its head. A file a
+/// data file names by `file =` is read by every crate that reads that
+/// data file.
+#[test]
+fn a_file_the_recovery_sheet_names_scopes_the_crate_that_reads_the_sheet() {
+    let (_, manifest) = the_sheet_and_the_backup_manifest();
+    let (stdout, receipt) = auto_scope_of("gate-scope-file-ref-hop", &[&manifest]);
+    let scope = scope_of(&receipt);
+    assert!(
+        scope.iter().any(|c| c == "boss-cli"),
+        "a car that only edits {manifest} must scope boss-cli — the recovery sheet names it \
+         by `file =` and boss-cli's recovery tests read it through the sheet, which is how \
+         car 594df586 gated green with that test red on its head.\n\
+         scope: {scope:?}\nstdout: {stdout}"
+    );
+}
+
+/// …and the sheet itself. recovery.rs names it in `pub const SOURCE` and
+/// joins the CONST, not the literal, so neither the `.join(` idiom nor the
+/// tests/ rule counted it: an edit to the sheet alone scoped boss-cli out
+/// too, and the triage of 6ac90873 asked for exactly this check.
+#[test]
+fn the_recovery_sheet_scopes_the_crate_that_names_it_in_a_const() {
+    let (sheet, _) = the_sheet_and_the_backup_manifest();
+    let (stdout, receipt) = auto_scope_of("gate-scope-const-path", &[&sheet]);
+    let scope = scope_of(&receipt);
+    assert!(
+        scope.iter().any(|c| c == "boss-cli"),
+        "a car that only edits {sheet} must scope boss-cli, whose recovery.rs holds its path \
+         in a `const` and renders and tests the sheet from it.\n\
+         scope: {scope:?}\nstdout: {stdout}"
+    );
+}
+
 /// The line `--auto` prints naming the tree-wide pins it will run, if
 /// it printed one.
 fn tree_wide_line(stdout: &str) -> Option<String> {
@@ -1728,6 +1806,49 @@ fn a_tree_wide_pin_that_reports_no_result_is_refused() {
             && stdout.contains("a tree-wide pin that reports no result is refused"),
         "gate.sh --self-test must prove that a named tree-wide pin with no `ok` line \
          fails the check.\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// THE PACKET (backlog 43587b6f). Gate-run 3faa181f went red on "no bin
+/// target named `boss-cli` in `boss-cli` package" with no test failing:
+/// the classifier named a bin pin's test binary after its crate's
+/// DIRECTORY, and boss-cli's binary is `boss`. The name now comes from
+/// the crate's Cargo.toml; `gate.sh --self-test` classifies a pin in a
+/// boss-cli-shaped crate and refuses anything but `bin:boss`, and this
+/// holds that the self-test still asks.
+#[test]
+fn a_bin_pin_runs_under_the_binarys_cargo_name() {
+    let out = gate_cmd(&["--self-test"])
+        .output()
+        .expect("run gate.sh --self-test");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("a bin pin runs under the binary's cargo name"),
+        "gate.sh --self-test must prove a tree-wide pin in a bin crate's module is run as \
+         `cargo test --bin <the [[bin]] name>`, not the crate directory's name.\n\
+         stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// THE PACKET (backlog 18e58c96). A wrapped prose comment in boss-cli's
+/// `train/judged_red.rs` began "// tree-wide pin no car changed", and the
+/// declaration regex took any following word, so a pure string test
+/// became a gate pin by accident. The marker is now the whole line or
+/// the marker and an em dash; `gate.sh --self-test` runs the declaration
+/// scan over a fixture holding both shapes and both prose shapes, and
+/// this holds that the self-test still asks.
+#[test]
+fn a_prose_line_declares_no_tree_wide_pin() {
+    let out = gate_cmd(&["--self-test"])
+        .output()
+        .expect("run gate.sh --self-test");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("and a prose line declares no pin"),
+        "gate.sh --self-test must prove a comment that merely begins with the words \
+         `tree-wide pin` declares nothing.\nstdout: {stdout}\nstderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -2320,6 +2441,20 @@ impl RosterTree {
                 "#!/usr/bin/env bash\n# consist: skip — a stub the gate proper runs by path\nexit 0\n",
             );
         }
+        // The test runner the gate's two cargo test checks call by path
+        // (backlog 2d234222): stubbed like cargo below, since what this
+        // tree tests is the roster, not a test run — but keeping the
+        // runner's contract with the receipt: `build` clears the state
+        // dir's summary and `run` writes one, so a receipt read here says
+        // whose summary it carries (review 465e723f F4, backlog c0259ecc).
+        boss_testing::write_exec(
+            &tree.join("infra/cargo-test-wide.sh"),
+            "#!/usr/bin/env bash\n\
+             case $1 in\n\
+             build) mkdir -p \"$2\" && rm -f \"$2/summary.json\" ;;\n\
+             run) printf '%s\\n' '{\"width\":1,\"stub\":\"this gate\"}' > \"$2/summary.json\" ;;\n\
+             esac\n",
+        );
         for (name, body) in lints {
             boss_testing::write_exec(&tree.join("infra/lint").join(name), body);
         }
@@ -2374,20 +2509,36 @@ impl RosterTree {
     /// gate runner captures `gate.log` — so a `::group::` block and the
     /// lint's stderr can be read in the order a reader of that log sees.
     fn run(&self, args: &[&str]) -> (Option<i32>, String) {
+        self.run_with(args, &[])
+    }
+
+    /// `run`, with `env` set last so it overrides the fixture's own.
+    ///
+    /// CARGO_TARGET_DIR is the fixture's own, always. Inherited, it is
+    /// the OUTER gate's target dir — /gate-target/target when this suite
+    /// runs inside a gate — and this nested gate, a plain repository
+    /// that `wt_isolate_target_dir` leaves alone, would read and write
+    /// that gate's test-runner state (review 465e723f F4).
+    fn run_with(&self, args: &[&str], env: &[(&str, &str)]) -> (Option<i32>, String) {
         let log = self.dir.join("gate.log");
         let file = std::fs::File::create(&log).expect("create gate.log");
         let path = std::env::var("PATH").unwrap_or_default();
-        let status = std::process::Command::new("bash")
-            .arg(self.tree.join("infra/gate.sh"))
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(self.tree.join("infra/gate.sh"))
             .args(args)
             .current_dir(&self.tree)
             .env("PATH", format!("{}:{path}", self.dir.join("bin").display()))
+            .env("CARGO_TARGET_DIR", self.dir.join("target"))
             .env("BOSS_GATE_DF_CMD", self.dir.join("df"))
             .env("BOSS_GATE_MIN_FREE_GB", "12")
             .env("BOSS_GATE_RECEIPT", self.receipt_path())
             .env("BOSS_GATE_TRUNK", "HEAD")
             .env("GIT_CEILING_DIRECTORIES", "")
-            .env("ROSTER_TEST_DIR", self.dir.join("shared"))
+            .env("ROSTER_TEST_DIR", self.dir.join("shared"));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let status = cmd
             .stdin(std::process::Stdio::null())
             .stdout(file.try_clone().expect("clone gate.log"))
             .stderr(file)
@@ -2512,6 +2663,91 @@ fn a_failing_lint_is_still_named_and_still_fails_the_run() {
         slow >= 2,
         "a-slow-pass slept two seconds and the receipt says {slow} — the duration must be \
          the lint's own, not the time it took to replay its record: {raw}"
+    );
+}
+
+/// A NESTED GATE LEAVES THE OUTER GATE'S TEST SUMMARY ALONE, AND A GATE
+/// CLAIMS ONLY A TEST RUN IT RAN (review 465e723f F4, backlog c0259ecc).
+///
+/// gate.sh removed `<target>/cargo-test-wide/summary.json` at top level,
+/// in every invocation past `--roster`, `--self-test` included — so a
+/// gate.sh run by a test inside a gate, inheriting that gate's
+/// CARGO_TARGET_DIR, deleted the outer gate's summary and nulled the
+/// receipt's `test_binaries`. Reproduced by the reviewer with a plain
+/// clone and `--self-test`; a plain repository is what this fixture is.
+/// The summary is cleared by the runner's own `build` half now, and the
+/// receipt reads it only when this gate's `test` check ran, so `null`
+/// still means "no test run happened HERE" without deleting anyone's.
+#[test]
+fn a_nested_gate_leaves_the_outer_test_summary_and_claims_only_its_own_run() {
+    let tree = RosterTree::new("test-summary", &[]);
+    let state = tree.dir.join("target/cargo-test-wide");
+    boss_testing::create_dir(&state);
+    let summary = state.join("summary.json");
+    let outer = "{\"width\":4,\"marker\":\"the outer gate\"}\n";
+    boss_testing::write_file(&summary, outer);
+
+    let (code, log) = tree.run(&["--self-test"]);
+    assert_eq!(code, Some(0), "gate.sh --self-test:\n{log}");
+    assert_eq!(
+        std::fs::read_to_string(&summary).ok().as_deref(),
+        Some(outer),
+        "a nested gate.sh --self-test deleted or changed the outer gate's test summary:\n{log}"
+    );
+
+    let receipt = |log: &str| -> serde_json::Value {
+        let raw = std::fs::read_to_string(tree.receipt_path())
+            .unwrap_or_else(|e| panic!("the gate writes a receipt ({e}):\n{log}"));
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("the receipt is JSON ({e}): {raw}"))
+    };
+
+    // A gate that writes a receipt and runs no test: the disk floor lets
+    // it start (the first df answers plenty) and refuses it at its first
+    // check (every later one answers 1 MB). The summary lying in its
+    // target dir is not its own, so it carries none and deletes none.
+    let calls = tree.dir.join("df-calls");
+    let shrinking = tree.dir.join("df-shrinking");
+    boss_testing::write_exec(
+        &shrinking,
+        &format!(
+            "#!/usr/bin/env bash\n\
+             n=$(cat '{calls}' 2>/dev/null || echo 0)\n\
+             echo $((n + 1)) > '{calls}'\n\
+             avail=943718400\n\
+             [ \"$n\" -eq 0 ] || avail=1024\n\
+             echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
+             echo \"/dev/fake 1 1 $avail 1% /\"\n",
+            calls = calls.display()
+        ),
+    );
+    let (_, log) = tree.run_with(
+        &[],
+        &[("BOSS_GATE_DF_CMD", shrinking.to_str().expect("utf8"))],
+    );
+    let r = receipt(&log);
+    assert_eq!(r["verdict"], "refused", "{r}\n{log}");
+    assert!(
+        !log.contains("::group::gate: test"),
+        "the refused leg ran no test:\n{log}"
+    );
+    assert_eq!(
+        r["test_binaries"],
+        serde_json::Value::Null,
+        "a gate that ran no test claimed a summary it did not write: {r}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&summary).ok().as_deref(),
+        Some(outer),
+        "a gate that ran no test deleted a summary it did not write:\n{log}"
+    );
+    std::fs::remove_file(tree.receipt_path()).expect("remove the refused receipt");
+
+    // The gate proper runs both halves and carries the summary ITS run wrote.
+    let (_, log) = tree.run(&[]);
+    let r = receipt(&log);
+    assert_eq!(
+        r["test_binaries"]["stub"], "this gate",
+        "the receipt carries this gate's own test run: {r}\n{log}"
     );
 }
 

@@ -62,9 +62,14 @@ one word per concept, enforced by rename passes and lints).
 release is a fresh rooted commit cut from the working tree. The
 working tree is the canonical record; docs are self-contained; no
 "see commit X" references survive into the public repo. Public
-demo tenants are **Algedonic Ales** (the brewery) and the
-**used-device-shop**, both instantiations of company-management on
-the same state-machine abstraction.
+example tenant is **Algedonic Ales** (the brewery), an instantiation of
+company-management on the same state-machine abstraction. David decided
+on 2026-09-24 to retire the used-device-shop example and retain modules
+used by Ales or Algedonic, LLC. Its engine, seed bundle, refurb lifecycle,
+service-history and launch-calendar projections have left the product.
+The generic company modules remain; retired example reference rows stay
+available to the bounded eviction reader, and applied migrations and
+recorded history keep their provenance.
 
 ### The Viable System Model, mapped — which BOSS concept plays which
 
@@ -360,6 +365,33 @@ leaves the employee table for wherever agents and system accounts are
 held — an actor being a CPU in the same machine does not make it a
 person on the org chart. Not built: the audit account is still seeded
 as an employee.
+
+**People and HR summaries need a supported producer** (design
+`93789cf4`, recorded without open questions on 2026-10-11; answers
+backlog `9a0e18d5`). The company frame and the item's existing fix
+shape settle this: remove the certification quantities from their
+shared header, Skills and Tenure numeric columns from People, and
+average tenure and unsupported certification summary/urgent panels
+from HR. Do not invent a workflow, metric or value to fill them.
+Employee records and their detail data remain; existing role-based
+headcount and department registry labels keep their settled meaning.
+Resolve an employee's location through the locations registry's
+`name`: distinguish unspecified, an unresolved recorded id, and a
+failed registry read rather than guessing a label or painting failure
+as absence. Both pages' tests must preserve those distinctions and
+prevent removed quantities returning as zeros during loading or
+failure. New certification, skills or tenure summaries require a
+separately evidenced producer contract. Implementation remains open.
+
+The design packet retains the measurement and decision provenance:
+origin/main `920c8eeb` still rendered these summaries and raw location
+ids; the roster read had two rows and no skills or certifications.
+Hire dates existed and the operator baseline writes them, so the
+historical claim that no field has any writer is not adopted. A
+baseline date does not establish an employment-start protocol, and a
+missing date converted to numeric zero is not measured tenure. This
+fold records the display contract; it changes no UI, stored data,
+policy, live service or credential.
 
 The system is laid out on a **three-axis information
 architecture**: *Knowledge Bases* (durable queryable state),
@@ -1714,6 +1746,120 @@ edit *is* a network configuration change, and a protocol the log
 cannot witness is not yet data. The build plan is
 `docs/design/protocol-policy-publish.md`.
 
+### Durable source-relative guarded admission
+
+**Delayed admission is a durable packet, anchored to its source fact**
+(design `f1d66249-4746-4e20-b58d-d5321cd9e308`, technical decisions recorded
+2026-10-12; answers `84a010cb`). This is the implementation contract,
+**not yet implemented or activated**. The approved first Sales loop
+(`3613f0af`, Departments `86f32b7d`) needs follow-up work seven days after
+an unanswered inquiry; its tenant companion `aecd8740` remains open.
+Current rule parsing stores `delay` but matching drops it before effects.
+Accepting the syntax is not scheduling. No in-memory sleep, immediate or
+manual reminder, source-age reset, or Sales-specific core branch satisfies
+this contract.
+
+Pending work is a generic `delayed-admission` Job running a versioned
+platform protocol: immutable intent, due/execution step, admitted,
+suppressed or cancelled terminals, and nonterminal held attempts. Rules
+declare the child and guard; stations hold the work. Advisory dispatcher
+firings and periodic cursors are neither the queue nor its authority.
+The envelope retains the complete committed source event, original
+timestamp and source Job, whole rule bytes/name/version, handler ordinal,
+checked duration and fixed due instant, complete child request with pinned
+published workflow version and partition, guard and actor provenance.
+Large evidence is retained by immutable verified file reference, never
+truncated. Ordinary Job/step writes must not change these bindings.
+
+Intent identity is a domain-separated UUIDv5 of instance/partition,
+source event, rule name/version and handler ordinal; child identity is a
+separate UUIDv5 of that intent. Retry after child closure still names the
+same child and creates no second graph. Conflicting bytes under an identity
+are refused. Terminal identity and original evidence survive firing
+retention; no purge is authorized. Replay folds recorded intents and
+attempts, not today's active rules over historical events. A captured
+intent keeps its original rule and child specification through retirement
+or publication of a new version; recovery cannot invent a missing binding.
+
+The first supported declaration is one event-driven `jobs.spawn` with a
+positive fixed elapsed delay and a typed Jobs-local source guard. Seven
+days means exactly 604800 seconds from the recorded source fact, independent
+of daylight saving and later triage or heartbeat. Unsupported handlers,
+multiple delayed effects, periodic/source-delay combinations, malformed
+durations, overflow, missing provenance and unbound guards are refused by
+one validator shared by native rule authoring and tenant checks. Immediate
+rules and existing periodic semantics stay unchanged.
+
+Only committed intent evidence permits delayed delivery ACK or log-tail
+advance. Capture failure retains the full source and pinned plan as a
+durable recovery obligation before dead-letter/Term or cursor advance;
+best-effort firing records cannot substitute. If that record cannot be
+written, advancement is refused and the independent liveness surface says
+so. Startup and clock ticks drain authoritative due packets with stable
+ordering and complete pagination. Missed ticks or restart cannot lose an
+overdue intent. Execution compares `now >= due_at`; lateness is recorded,
+never used to move the anchor. Real/sim clock and partition boundaries are
+preserved; rewind does not reopen a terminal intent.
+
+A typed Jobs `GuardedAdmission` port, with agreeing in-memory/Postgres
+adapters, uses the ordinary admission edge. It rechecks existing kind-scoped
+Create and scoped source/intent Read for the registered dispatcher actor;
+policy denial or outage produces no effect and grants no new authority.
+For **authoritative state wholly in Jobs**, one transaction fences the
+intent, source and named guard steps against their real writers, evaluates
+the current guard at the due boundary, and commits the complete child
+graph, its outbox facts and the intent's terminal/evidence together, or
+none of them. A second independently committing create call or GET/POST
+with before/after comparisons is not that transaction. Concurrency tests
+must prove the actual answer/close writers share the fences. Cross-service
+message state cannot be locked by this Jobs transaction: unsupported or
+unbound reply evidence stays held, never guessed to mean no answer.
+
+Initial guarded admission requires an OPEN source Job of the pinned
+expected source kind, as well as each named guard step's explicit
+allowed nonterminal status. A closed or wrong-kind source suppresses
+admission without a child; unavailable source facts stay held.
+
+False guards suppress with the exact observed state and reason; unavailable,
+missing, duplicate, malformed or ambiguous source/step evidence keeps the
+intent open with full attempt diagnostics. A named step must exist under
+its source and have an explicit allowed status; absence is not a negative
+fact. The Sales consumer must establish its actual received-event anchor
+and authoritative answer signal from every supported inquiry reply path.
+A proven `sent` completion may establish answered; no invented field or
+missing step establishes unanswered. Unfenced reply paths are a consumer
+readiness hold. Successful retries reconcile an exact existing child,
+including CLOSED, rather than admitting another.
+
+Every attempt preserves source/rule/intent/child identity, original anchor,
+due and evaluated time, actor, full authoritative observations/versions,
+result and errors. Pending, due, held and oldest-overdue reads show honest
+policy withholding and complete counts. Event-log rebuild reproduces the
+envelope and state; current guard/time creates a new recorded attempt,
+never changes the original evidence. These are provenance, conservation,
+closure, idempotence and determinism applied to admission over time.
+
+Implementation remains a coherent source obligation: declaration and
+validation, provenance, immutable envelope/write fences, durable capture
+and settlement, due drain, atomic graph admission, events/rebuild and honest
+native/read surfaces. Any intermediate car fails closed for unsupported
+timing. Owning TDD must reproduce the current immediate-effect defect and
+cover before/exact/after bounds, late replies and writer races, unchanged
+anchor after unrelated work, unreadable guards, crashes at both commits,
+missed ticks/restart, redelivery after child closure, concurrent workers,
+rule versions, conflicting IDs, mutation attempts, clock/partition bounds,
+policy refusal and the unread queue tail, with immediate/periodic positive
+controls. New write fences require independent adversarial review.
+
+Source GREEN proves the frozen source only. After arrival/convergence,
+installed-contract and actual due-admission receipts must separately prove
+runtime scheduling. The tenant Sales source then follows its existing
+check, distinct plan review, human publication and first-real-packet proof.
+Core admission does not authorize outbound contact. Parent `84a010cb`,
+Sales `aecd8740` and Departments `86f32b7d` retain their original source,
+runtime and remaining obligations; this documentation fold closes none
+of them and activates no rule, credential, grant or tenant publication.
+
 ## Correctness protocol & the audit log
 
 The five-property protocol — **provenance, conservation, closure,
@@ -1953,6 +2099,18 @@ rebuild, so it stays a pure function of the log. Money is an inline
 TEXT currency column on every money-bearing row; `Currency` lives
 in `boss-core::money`; column prefixes (`amount_`, `price_`,
 `cost_`) distinguish kind, not currency.
+
+**Ordinary purchase costs admit zero and refuse negatives.** (Design
+`0a8e95f1`, David 2026-10-11; source car `b58e8c36`.) Zero-cost Draft
+lines are valid. Ordinary create and batch commands reject a negative
+unit cost with a visible reason; the first Draft-to-placed transition
+checks the same rule under the order's lock or database transaction,
+before changing its status or emitting facts. Batch admission keeps its
+existing per-order transactions. Historical fact replay restores the
+recorded full rows, including signed costs, without invoking ordinary
+command validation or rewriting those facts. A credit-specific signed
+cost needs an explicit money-policy decision. The physical Warehouse's
+activation is a separate decision.
 
 **The chart of accounts is tenant data; the starter chart is the
 brewery's.** (Backlog `41af5195`; design `18cf4272`, David 2026-09-17;
@@ -2870,6 +3028,69 @@ forge to sweep its disk after each run is deleted rather than left as a
 request whose designed answer is a refusal; the hourly host sweep is the
 reclaim, and its own packet carries what it did.
 
+**Who holds the forge registry push credential** (design-doc
+`c8502e17`, question image-build, David 2026-10-07; backlog `683d7fe9`,
+two cars). The cluster image is built on the forge by the SYSTEM docker
+daemon as root and pushed with a token the credential broker mints —
+never the operator's rootless daemon and hand-run `docker login`. The
+first car makes the credential exist: Subject
+`forge-registry-push-token`, a `write:package` token of the forge user,
+rotated by the handler `credential.rotate.forgejo-registry` — the
+forgejo rotation with its proof changed, because a package token cannot
+read a repository: "proven working" is a push the registry accepts (an
+upload session opened and cancelled), and the proof belongs to the
+handler NAME so no rule can choose one its token passes for the wrong
+reason. Delivery is off-host: `infra/forge/registry-token-deposit.sh`
+proves the value by a login before it writes it, as a docker config in
+`/etc/boss/registry-push` (root:root, 0700 and 0600), and records
+delivery so the old instance is revoked only once the host holds the
+new one. **The order is the rule**: the units that build
+(cluster-deploy-runner, disk-floor-sweep) move to root, the root-owned
+tree and that directory only AFTER a rotation has been minted,
+delivered and read `accepted` on the forge's converge packet
+(`registry_token_effect`) — a unit pointed at a file no rotation has
+filled cannot push the image every pod runs. The second car is that
+move, held for its review and David's release until the token reads
+accepted: both units run as root from `/var/lib/boss/tree/current`,
+and the converge builds the generation root's tree holds (refreshed by
+the converge itself, run from a hard-linked view so no prune can take it
+mid-build), not a checkout; it refuses to build while the deposited
+login is absent rather than failing an hour into a cold build; its
+kubectl reads the kubeconfig David places (`/etc/boss-ops/kubeconfig`);
+its stamps, request inbox and tenant checkouts live under
+`/var/lib/boss/converge` (root, 0700), carried once from the old home by
+its first root run; it reads a tenant from the forge's own repository on
+disk, served as that repository's owner, with no credential; and the
+operator's rootless daemon — 43 GB of images and 33 GB of build cache on
+2026-10-07 — is used by nothing unattended and is his to free.
+
+**Where root on boss-gcp fetches its own tree from** (design-doc
+`db018094`, question q1, David 2026-10-10; backlog `ca356c79`). Root on
+boss-gcp executes only from a root-owned tree (design `c98c79aa`), and
+boss-gcp's tokenless senders move to root on that tree (design
+`fe6d1124`, decision (a)). The forge's root tree needs no credential,
+because Forgejo's repository is on its own disk; boss-gcp has none, and
+its one checkout fetches as the operator. So root there fetches forge
+main directly with a **read-only forge token the credential broker mints
+and only root holds**: Subject `boss-gcp-root-tree-token`, a
+`read:repository` token of the forge user, rotated by
+`credential.rotate.forgejo` and proven by reading the repository —
+the same shape as every other broker credential. Every other forge-token
+rotation protects its instances in `spare`, including the dev pod's
+mount-delivered rotation; a rule with no `spare` fails the declaration
+test rather than being skipped. Delivery is
+off-host, to `/etc/boss/root-tree/forge.token` (root:root, 0700 and
+0600), and the old instance is revoked only once boss-gcp records the
+new one. Declined: fetching from the operator's checkout and accepting
+only a commit matching forge main read independently — no new
+credential, but root would parse objects a non-root account wrote. The
+first car declares the credential (its rules, its Secret grant, the
+registry row the tree carries for the operator to publish); the
+transport to boss-gcp, the tree that reads the file, and the four units'
+move are later cars, in that order. The registry row says that its
+consumer is pending; publishing the row and starting its first rotation
+wait for the transport car, so no credential is minted without a reader.
+
 ## Calendar
 
 Reservations store **UTC**; `strength` defaults `hard` for
@@ -2975,6 +3196,67 @@ domain's KB documents hang off the `Document` type; the Equipment
 KB keeps typed columns for stable queried fields and a
 schema-validated `extras` blob for tenant-specific evolution; the
 event stream remains the source of truth for asset state.
+
+Legacy manual state may enter the log through one explicitly named
+**present observed baseline**, not fabricated historical creation
+events (design 2ec0c3e4, decisions by emp-david, 2026-10-03).
+The observation preserves complete raw sections and history, including
+serial identities, stored timestamps, editors, reasons, audiences,
+publication state, hierarchy and sequence state. These historical
+fields remain stored claims; the observation's own actor and time
+describe the present act. A privileged complete inventory read and
+observer write require explicit scope-all policy authority. Admission
+compares a canonical inventory hash under the existing table/outbox
+completeness locks and atomically records an idempotent observation.
+Protected replay begins with that baseline, accounts for covered
+genuine facts, and applies later genuine facts, conserving every
+selected event row exactly once. Incomplete or changed evidence
+refuses before a wipe. Source preparation and release neither execute
+nor prove a live legacy migration; capture and its separate effect
+evidence remain an operator-authorized bounded migration.
+
+Manual authority is **named human authority**, not a role-wide default
+(design bb3cc8d8, decisions by emp-david, 2026-10-11). The approved
+continuing grants are exactly two user overrides for emp-david:
+`read/manual-inventory/all` and `create/manual-baseline/all`, each with
+`expires_at = null`. Only David's genuine authenticated platform-admin
+session may activate them through the guarded policy door. Agents may
+prepare exact requests; they receive no grant or authority to apply
+them. Approval is not activation: a successful write must be followed
+by exact override, coverage and audit readback. Partial success is
+partial authority, and drift in an existing override requires a
+separate explicit decision rather than silently replacing its scope,
+denying intent or expiry. Neither this decision nor its documentation
+clears an orphan-control alarm; fresh live coverage must name the real
+holder.
+
+Retirement uses the actual override id and remains subject to the
+native last-real-holder guard. It may refuse removal of the sole
+holder. A separately approved eligible real successor must actually
+hold the exact scope-all control, confirmed by coverage, before that
+authority can transfer. Without such a successor, retain the grant
+and bring the refusal to the human decision. Direct database writes,
+fabricated grants, expiry tricks, role or passkey changes are not a
+revocation route.
+
+The same decision permits the named human to obtain the complete
+inventory only after both approved grants and current human identity
+standing are evidenced, then prepare one bounded operation packet.
+That packet binds the raw inventory, canonical hash, immutable
+admission identity, observer and deployed artifact. David must
+separately sign off that exact payload before any baseline POST; this
+is no authorization for an unknown future hash, an agent observation
+or a rebuild. The producer derives the present observer from the
+authenticated identity; a caller nonce is not an event UUID. Preserve
+the native response, producer fact and admission identities and
+before/after evidence; an uncertain outcome is recovered with the
+same witness, never by manufacturing another observation. Changed or
+incomplete evidence refuses under the existing locks. Actual inventory
+conservation, canonical hashes and native event/outbox/audit coverage
+must be read back through supported readers. A missing reader holds
+the operation at that boundary. Source presence and grant coverage
+alone do not prove legacy event coverage, and no rebuild or wipe is
+authorized by this decision.
 
 ## Search
 
@@ -3686,7 +3968,7 @@ clients, ML plugins). A non-company tenant deploys Tier 1 alone.
 **Orchestrators** (`crates/orchestrators/`: `boss-rebuild`,
 `boss-cli`, `boss-sim`, `boss-ml-api`, `boss-simulator`) fan out
 across tiers by design; **tenants** (`crates/tenants/`: brewery
-engine, used-device-shop engine) carry tenant binaries.
+engine) carry tenant binaries.
 `infra/lint/tier-import-audit.sh` enforces
 Tier-1-never-imports-Tier-2 for libraries. Seeds never write
 emergent state — if a seed wants to `INSERT INTO invoices`, the
@@ -4151,7 +4433,19 @@ halves read together**, off the system of record and never posted back
 to the forge (the forge stays a one-way peer): a green CI does not merge
 a train whose gate has not spoken; a red gate strikes the cars like a
 red CI; a refused or lost gate is filed again up to three times and then
-the train reads *aborted*, cars released unstruck. While CI still ran
+the train reads *aborted*, cars released unstruck. Diagnosed strike recovery
+reads those same two halves: `boss release --diagnosis-file` accepts a
+RED train gate, or a checked GREEN gate when the train's completed CI step
+records both Forge and combined results as failing. The latter requires
+the exact gate-run on both the train and CI step, the gate's reciprocal
+train identity, a completed verdict and receipt for its frozen head with
+passing named checks, and the car in immutable `boarded_jobs`. Missing,
+malformed, unrelated, pending, aborted or successful evidence refuses.
+The diagnosis names a full gate-run UUID; the supported merge door clears
+the strikes and appends who looked, when, the verified gate and verbatim
+diagnosis, keeping earlier releases. This is an operator action with
+independent held review, not automated clearing or runtime activation
+(David approved design `921c62af`, 2026-10-11; backlog `602fd374`). While CI still ran
 the Rust checks, a gate the conductor could not *file* fell back to CI
 alone after three passes, stamped `train_gate_fallback`; car 3 sets
 `BOSS_TRAIN_GATE_REQUIRED=1` in the same change that drops CI's `fast`
@@ -5127,33 +5421,58 @@ and a stage token is not consulted by the delivery door.
 
 **Off until configured.** The door is on only when all five
 `BOSS_BROKER_STAGE_*` variables are set (issuer, audience, namespace,
-ServiceAccount, key-set file); the dispatcher presents a token only when
-`BOSS_BROKER_STAGE_TOKEN_FILE` names one. No manifest sets any of them
-and none projects the token. Unconfigured, a runner row's phases are
-recorded under the typed label as before — the gap this decision closes
-stays open until an activation. Partly configured refuses runner stages
-by name; a token presented to an unconfigured door is refused, never
-ignored; a dispatcher told to present a token it cannot read mints
-nothing.
+ServiceAccount, key set); the dispatcher presents a token only when
+`BOSS_BROKER_STAGE_TOKEN_FILE` names one. Unconfigured, a runner row's
+phases are recorded under the typed label as before. Partly configured
+refuses runner stages by name; a token presented to an unconfigured door
+is refused, never ignored; a dispatcher told to present a token it
+cannot read mints nothing.
+
+**Activated** by backlog `25fff647`: `infra/cluster/manifests/boss.yaml`
+sets all six in the one `boss` container and projects the token there
+(audience `boss-credential-broker-stage`, `expirationSeconds: 600`, at
+`/etc/boss/broker-stage/token`). The namespace and ServiceAccount come
+through the downward API, so each rendered instance expects its own
+workload. From that roll a runner credential's phase with no verified
+token is **refused** — a new refusal, and the one this decision exists
+for. The pin `the_broker_stage_door_turns_on_whole.rs` holds the
+projection, the variables and the door's terms equal in every instance.
 
 **In flight.** A phase recorded before activation keeps its original
 actor, event and instant. The verified workload's replay of it is a
 conflict, never a rewrite, so an activation requires that no runner
 rotation packet is open. None had ever been filed when this was
-written (three rotation packets in the record, none for a runner).
+written (three rotation packets in the record, none for a runner). The
+first, for the forge's runner credential, completed with the door off
+at 2026-10-09 03:25Z and keeps its typed actors; none was open when the
+activation was built.
 
-**What remains, and is not decided here.** The trusted key set arrives
-through a port whose one adapter reads a key-set file on every
-verification. Who fills that file is open: the cluster's issuer
-discovery and key set answer 401 to an anonymous read and 200 to a
-ServiceAccount (measured from the dev pod, 2026-10-06: the issuer is
-the cluster API endpoint and publishes one RS256 key), so a retrieval inside the
-jobs API would present the pod's own ServiceAccount token to the API
-server, and a file needs a filler that proves the cluster's TLS trust.
-That choice, the projected volume, the actual audience, the ordered
-rollout and the registered actor row belong to the independently
-reviewed activation packet the design requires before any live
-configuration.
+**Where the keys come from** (David on design `20058482`, `stage-keys`).
+The jobs API fetches the issuer's key set itself, on every verification,
+from `https://kubernetes.default.svc/openid/v1/jwks`, presenting its own
+pod ServiceAccount token — the discovery endpoints answer 401 to an
+anonymous read and 200 to any ServiceAccount (the stock issuer-discovery
+grant, held through `system:serviceaccounts`). The connection trusts
+only the cluster CA the kubelet mounts; built-in roots, plain HTTP and
+redirects are refused, so the pod's token reaches nothing the cluster CA
+did not certify. A `BOSS_BROKER_STAGE_KEY_SET` that is a path still
+reads a key-set file. The registered actor is the automations row
+`automation:credential-broker-stage`, at the `platform-admin` the stage
+command carries.
+
+**What the activation read and did not change** (review F1, F2, F4,
+recorded on the car). Who can mint a token that verifies: anyone able to
+run code as the `boss` ServiceAccount or to request its token — in the
+tree no Role grants `serviceaccounts/token` or `pods/exec` in `boss`,
+so it is cluster-admin, the control plane, and whoever sets the boss
+pod's image or template (the converge; the break-glass operator within
+its image-only bound). The audience is not the API server's (its default
+audience is the issuer, which the door refuses as an audience). The
+token is a bearer value sent over plain HTTP to the jobs API on
+loopback inside the pod; a reader of that hop is a process in the pod,
+which already holds the same ServiceAccount — the shared-workload limit
+this decision accepted. Still to decide: whether an UNCONFIGURED door
+should refuse runner rows by default rather than record the typed label.
 
 ## Open findings — where two live decisions disagree
 
@@ -5187,3 +5506,40 @@ does today, because that is what this record is obliged to state.
   but until it lands, two sections of this document describe
   different futures for the same predicate, and that should be
   closed by a decision rather than by drift.
+
+## Registered conductor diagnostics — technical plan f7e3aba0 (2026-10-12)
+
+A held source car can need an actual assembled-candidate diagnostic before
+an operator can judge its hold. That work is a diagnostic-request packet,
+with its operation version, required checks, actor and capacity declared
+in the pinned Workflow row. The existing conductor consumes that station
+under its existing lock and Kubernetes identity. Packet data supplies
+identities and evidence; it supplies no command or privileged bootstrap.
+
+The first operation uses the existing isolated-consist controller. Its
+request names the held car, full candidate and baseline SHAs, and the
+complete source receipt hash. The conductor copies the original signed
+creation fact, pinned protocol, current car, authoritative policy and
+edit-level before execution. It refuses changed bindings or unavailable
+authority. Normal assembly uses a separate tree and a private immutable
+ref; it moves neither the source branch nor the conductor's main checkout.
+
+One admitted request has one durable attempt identity. Immutable first
+records hold intent, acknowledged native incarnation and complete receipt;
+large originals use verified content attachments. A private ordered journal
+retains command inputs, exact stdout/stderr bytes and exits before parsing.
+An acknowledged create can be recovered from those originals. An unknown
+create acknowledgement never causes another launch. Native Job/Pod UIDs,
+tree, baseline and actual exits bind the result; missing checks, init
+failure and observation refusal are distinct outcomes. Completing a
+diagnostic changes no hold, review, boarding, PR or departure.
+
+Compute capacity counts nonterminal diagnostic workers. Terminal Jobs and
+private refs remain retained when existing authority cannot clean them up;
+this grants no patch or delete permission. A private UID-owned journal with
+nonreplaceable ancestry is a runtime prerequisite, never inferred from a
+PVC declaration. Source checks establish neither that prerequisite nor an
+actual candidate result. Publication, arrival and the real diagnostic
+receipt remain separately observed obligations. Urgent ddcdf6eb still
+requires an observed successful departure. The next operator admission
+surface and presentation are separate implementation work under this plan.

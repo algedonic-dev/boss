@@ -12,6 +12,9 @@
 //! - `git_config_isolated`, the one way a test closes every channel git
 //!   reads `safe.directory` from, so a host's `[safe] directory = *`
 //!   cannot switch off an ownership refusal the test depends on
+//! - `without_proxy`, the one way a test keeps the proxy variables of
+//!   the shell that ran the suite off a child, so the machine-token host
+//!   rule's proxy withholding cannot turn a stamped row red (50708d76)
 //! - `announce`, the one definition of a stub server stating its port
 //!   to the test that spawned it, written whole or not at all
 //! - `leaked_policy`, the AST pass behind `boss-leaked-policy`: it counts
@@ -35,18 +38,21 @@ pub mod leaked_policy;
 pub mod ops_runner_stub;
 pub mod passkey;
 pub mod production_source;
+pub mod proxy;
 pub mod rbac;
 pub mod recording_bus;
 pub mod request;
 pub mod scratch;
 #[cfg(feature = "postgres")]
 pub mod test_db;
+pub mod test_values;
 pub mod tree;
 
 pub use assertions::*;
 pub use dark_port::{DarkPort, dark_port};
 pub use feed::feed_stdin;
 pub use git::git_config_isolated;
+pub use proxy::{PROXY_VARS, without_proxy};
 pub use recording_bus::RecordingEventBus;
 pub use request::{TestRequest, TestResponse};
 pub use scratch::{copy_exec, create_dir, scratch_dir, scratch_path, write_exec, write_file};

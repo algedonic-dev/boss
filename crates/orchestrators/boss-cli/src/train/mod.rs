@@ -90,12 +90,18 @@ mod cars;
 mod conductor;
 mod consist;
 mod consist_job;
+mod diagnostic_adapter;
+mod diagnostic_journal;
+mod diagnostics;
+#[cfg(test)]
+mod diagnostics_tests;
 pub(crate) mod dock_regate;
 mod entry;
 mod forge;
 mod jobs_api;
 mod judged_red;
 mod merge_lost;
+mod orphan;
 mod preflight;
 mod red_verdict;
 mod stranded;
@@ -112,6 +118,7 @@ pub(crate) use forge::*;
 pub(crate) use jobs_api::*;
 pub(crate) use judged_red::*;
 pub(crate) use merge_lost::*;
+pub(crate) use orphan::*;
 pub(crate) use preflight::*;
 pub(crate) use red_verdict::*;
 pub(crate) use stranded::*;
@@ -202,6 +209,7 @@ struct Config {
     fork_url: String,
     upstream_url: String,
     home: String,
+    diagnostics_home: String,
     clone: String,
     /// Which forge adapter is active (BOSS_TRAIN_FORGE: `github` or
     /// `forgejo`). Stored on the config so decisions that hinge on
@@ -326,6 +334,10 @@ impl Config {
                 &format!("{forge_base}/{forge_repo}.git"),
             ),
             clone: format!("{home}/repo"),
+            diagnostics_home: env_or(
+                "BOSS_TRAIN_DIAGNOSTICS_HOME",
+                &format!("{home}/diagnostics"),
+            ),
             forge_kind: env_or("BOSS_TRAIN_FORGE", "forgejo"),
             auto_merge: std::env::var("BOSS_TRAIN_AUTO_MERGE").as_deref() == Ok("1"),
             allow_local_jobs: std::env::var("BOSS_TRAIN_ALLOW_LOCAL_JOBS").as_deref() == Ok("1"),
@@ -525,6 +537,40 @@ mod test_support {
                  "status": "completed",
                  "metadata": {"completed_at": "2026-08-13T06:20:00Z"}},
             ],
+        })
+    }
+
+    /// The shape of pr-train d1a8b140 as the system of record held it at
+    /// 09:49Z on 2026-10-09 (backlog 238d70c3): `scheduled` completed
+    /// with no `completed_at`, `collect` ready, nothing after it done, no
+    /// `boarded_jobs`, no PR — the train a restart orphaned at collect.
+    pub(super) fn orphan_at_collect() -> Value {
+        json!({
+            "id": "d1a8b140-57e2-4cec-ada0-3c8dcba8fc08",
+            "kind": "pr-train",
+            "status": "open",
+            "title": "PR train 2026-10-09 09:19",
+            "subject": {"subject_kind": "custom", "id": "train/20261009-0919"},
+            "opened_at": "2026-10-09T09:21:24.472813Z",
+            "metadata": {
+                "actor": "automation:train-conductor",
+                "delivery_policy_version": 7,
+                "opened_at": "2026-10-09T09:21:24.472813429+00:00"
+            },
+            "steps": [
+                {"id": "s-sched", "spec_slug": "scheduled", "title": "Train window opened",
+                 "status": "completed", "metadata": {"trigger_kind": "periodic"}},
+                {"id": "s-collect", "spec_slug": "collect", "title": "Collect what is ready to board",
+                 "status": "ready", "metadata": {}},
+                {"id": "s-assemble", "spec_slug": "assemble", "title": "Assemble the train branch",
+                 "status": "pending", "metadata": {}},
+                {"id": "s-pr", "spec_slug": "pr", "title": "Open the batched PR",
+                 "status": "pending", "metadata": {}},
+                {"id": "s-merged", "spec_slug": "merged", "title": "DEPARTED — merged into main",
+                 "status": "pending", "metadata": {}},
+                {"id": "s-cancelled", "spec_slug": "cancelled", "title": "Cancelled — nothing to board",
+                 "status": "pending", "metadata": {"outcome_kind": "aborted"}}
+            ]
         })
     }
 

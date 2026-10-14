@@ -256,7 +256,7 @@ env -i PATH="$PATH" BOSS_CONVERGE_HOLD="$tmp/hold" bash "$repo/infra/forge/conve
 env -i PATH="$PATH" bash -n "$repo/infra/forge/rollback-to.sh" || fail "rollback-to.sh does not parse"
 # The node verbs (backlog f0aaa72f) run as root with no HOME too; their
 # behaviour is boss-testing/tests/node_maintenance_verbs_sh.rs.
-for s in cluster-node-lib.sh cordon-node.sh shutdown-node.sh talos-get.sh node-status.sh node-converge.sh; do
+for s in cluster-node-lib.sh cordon-node.sh shutdown-node.sh talos-get.sh node-status.sh node-disk-usage.sh node-converge.sh; do
     env -i PATH="$PATH" bash -n "$repo/infra/forge/$s" || fail "$s does not parse"
     grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$repo/infra/forge/$s")" && fail "$s reads \$HOME (the ops runner has none)"
 done

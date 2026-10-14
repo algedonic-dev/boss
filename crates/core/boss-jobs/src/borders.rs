@@ -2974,6 +2974,7 @@ mod tests {
             car: braked,
             reason: "held for the restart".to_string(),
             kind: crate::yard::CarHoldKind::Operator,
+            release: None,
         });
         status.gates.queued.push(crate::yard::QueuedGate {
             branch: "fix/in-line".to_string(),

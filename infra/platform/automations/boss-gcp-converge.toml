@@ -8,4 +8,4 @@
 [[automation]]
 id = "automation:boss-gcp-converge"
 role = "audit-readonly"
-description = 'The boss-gcp host converge reading which roles the estate registry gives its node (infra/gcp/boss-gcp-converge.sh, through infra/estate/node-roles.sh). Reads only.'
+description = 'The boss-gcp host converge reading its estate roles and the completed transport/token lifecycles before protected root adoption (infra/gcp/boss-gcp-converge.sh, through node-roles.sh and adopt-root-tree.sh). Reads only.'

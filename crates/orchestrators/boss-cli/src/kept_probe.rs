@@ -513,10 +513,35 @@ pub(crate) fn kept_probe_report(
             short(new_head)
         )
     } else {
+        // Of how many (backlog ec05a62f): "1 still on" read the same for
+        // one of one and for one of three the verb could not answer for.
+        // And "still on" means ON (review 0a5496cb, finding 2): with no
+        // lost string, a judged string the new head lacks is one the old
+        // head lacked too — an absence the probe asserts, counted apart.
+        let unread = checked.len() - judged;
+        let on = checked
+            .iter()
+            .filter(|(_, _, now)| *now == Some(true))
+            .count();
+        let neither = judged - on;
+        let notes: Vec<String> = [
+            (neither, "on neither head, as a probe asserting absence"),
+            (unread, "could not be checked there"),
+        ]
+        .iter()
+        .filter(|(k, _)| *k > 0)
+        .map(|(k, what)| format!("{k} {what}"))
+        .collect();
         format!(
-            "boss rerail: car {car} keeps its probe ({for_head}); {judged} string(s) it greps \
-             are still on {}",
-            short(new_head)
+            "boss rerail: car {car} keeps its probe ({for_head}); {on} of {} string(s) it \
+             greps are still on {}{}",
+            checked.len(),
+            short(new_head),
+            if notes.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", notes.join("; "))
+            }
         )
     })
 }
@@ -693,7 +718,59 @@ mod tests {
         )
         .expect("reported");
         assert!(!ok.contains("WARNING"), "{ok}");
-        assert!(ok.contains("1 string(s) it greps are still on"), "{ok}");
+        assert!(
+            ok.contains("1 of 1 string(s) it greps are still on"),
+            "{ok}"
+        );
+
+        // The count says how many were CHECKED (backlog ec05a62f: run
+        // 5f471f4a read "1 string(s) still on" and could not tell one of
+        // one from one of three): a string neither head could answer for
+        // is counted in the denominator and named as unanswered.
+        let partly = kept_probe_report(
+            "bfb219b4",
+            Some(probe),
+            Some(&first),
+            &first,
+            &[
+                (
+                    n("^keep$", &["-G"], &["infra/forge/converge.sh"]),
+                    Some(true),
+                    Some(true),
+                ),
+                (n("gone-file", &["-G"], &["no/such"]), None, None),
+            ],
+        )
+        .expect("reported");
+        assert!(
+            partly.contains("1 of 2 string(s) it greps are still on"),
+            "{partly}"
+        );
+        assert!(partly.contains("1 could not be checked"), "{partly}");
+
+        // A string on NEITHER head (a probe's `grep -q 'old' && exit 1`)
+        // is not "still on" the new head (review 0a5496cb, finding 2:
+        // "2 of 2 still on" for one present and one absent string). It
+        // is counted apart, as the absence the probe asserts.
+        let absent = kept_probe_report(
+            "bfb219b4",
+            Some(probe),
+            Some(&first),
+            &first,
+            &[
+                (n("new", &["-G"], &["f"]), Some(true), Some(true)),
+                (n("old", &["-G"], &["f"]), Some(false), Some(false)),
+            ],
+        )
+        .expect("reported");
+        assert!(
+            absent.contains("1 of 2 string(s) it greps are still on"),
+            "{absent}"
+        );
+        assert!(
+            absent.contains("(1 on neither head, as a probe asserting absence)"),
+            "{absent}"
+        );
 
         // A car with no probe has nothing to keep.
         assert_eq!(kept_probe_report("x", None, None, &folded, &[]), None);

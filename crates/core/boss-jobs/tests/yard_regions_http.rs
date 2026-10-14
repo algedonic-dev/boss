@@ -124,6 +124,14 @@ fn task_station_row() -> boss_jobs::StationSpec {
 /// The app with the platform protocols in its workflow registry — so the
 /// inbound kinds can be named — and the task station beside the dock.
 fn app_with_intake() -> (axum::Router, Arc<InMemoryJobs>) {
+    app_with_intake_and(None)
+}
+
+/// [`app_with_intake`] with the agents registry wired (backlog
+/// 8e9d3723): the top board reads which holders are agents off it.
+fn app_with_intake_and(
+    agent_budget: Option<Arc<boss_jobs::agent_budget::BudgetDoor>>,
+) -> (axum::Router, Arc<InMemoryJobs>) {
     let jobs = Arc::new(InMemoryJobs::new());
     let kinds = Arc::new(boss_jobs::InMemoryWorkflows::for_fixture());
     for spec in boss_jobs::registry::seedable_platform_workflows() {
@@ -132,6 +140,8 @@ fn app_with_intake() -> (axum::Router, Arc<InMemoryJobs>) {
     let policy_client: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
             .allow("operator", Action::Read, Resource::job(), Scope::All)
+            // A NARROWED scope — its own packets only (backlog 57326714).
+            .allow("sales", Action::Read, Resource::job(), Scope::Self_)
             .build(),
     );
     let bus = RecordingEventBus::new();
@@ -146,6 +156,7 @@ fn app_with_intake() -> (axum::Router, Arc<InMemoryJobs>) {
     let state = JobsApiState {
         stations: Some(stations),
         kind_registry: Some(kinds as Arc<dyn boss_jobs::WorkflowRegistry>),
+        agent_budget,
         ..JobsApiState::minimal(
             jobs.clone(),
             bus,
@@ -543,8 +554,13 @@ async fn the_read_answers_every_region_each_with_count_state_and_trend() {
     // at the GATES (design e765b3fc §2a, car R1), and the yard's own
     // block reading troubles the gates, where it is drawn. The track,
     // which holds merged trains, is empty.
+    // Its gate has already judged it, so it needs no bay and waits in no
+    // line: it stands as the third figure, `judged` (backlog bce67f09) —
+    // not in the bays, and not in the line (357fe1da).
     let gates = region(&v, "gates");
-    assert_eq!(gates["count"], 1, "{gates}");
+    assert_eq!(gates["count"], 0, "{gates}");
+    assert!(gates.get("waiting").is_none(), "{gates}");
+    assert_eq!(gates["judged"], 1, "{gates}");
     assert_eq!(gates["state"], "troubled");
     assert!(
         gates["why"].as_str().unwrap().contains("train #470"),
@@ -687,6 +703,287 @@ async fn the_read_carries_what_outranks_regular_order_oldest_first() {
     assert_eq!(board[0]["stations"], json!(["q.platform-admin.task"]));
     assert_eq!(board[1]["priority"], "emergency");
     assert_eq!(board[1]["at"]["slug"], "triage");
+}
+
+/// A CLAIM SAYS WHETHER ANYONE IS ON IT, END TO END (backlog 8e9d3723).
+/// Two urgent items at `build` ACTIVE, both held by agent-claude: one
+/// with an open agent-run building it, one whose run is gone — the shape
+/// five urgent items sat in for days, printed identically. Through the
+/// real router, with the agents registry wired, the first names its run
+/// and the second says it has none; without the registry nobody can say
+/// the holder is an agent, and the claim reads unread, never "no run".
+#[tokio::test]
+async fn an_agents_active_claim_names_its_open_run_or_says_it_has_none() {
+    let agents: Arc<dyn boss_jobs::agents::AgentsRegistry> = Arc::new(
+        boss_jobs::agents::InMemoryAgents::new()
+            .with_agent("agent-claude", ["claude@algedonic.dev"]),
+    );
+    let door = Arc::new(boss_jobs::agent_budget::BudgetDoor {
+        agents,
+        runs: Arc::new(boss_jobs::agent_runs::InMemoryAgentRuns::new(vec![])),
+    });
+    let (app, jobs) = app_with_intake_and(Some(door));
+    let (bare, bare_jobs) = app_with_intake();
+    let claimed = |n: u128, title: &str| {
+        let id = Uuid::from_u128(0xC1A1_0000_0000_0000_0000_0000_0000_0000 + n).to_string();
+        Job {
+            priority: Priority::Urgent,
+            opened_at: Some(t("2026-09-18T09:00:00Z")),
+            ..job("backlog-item", &id, title, JobStatus::Open, json!({}))
+        }
+    };
+    let worked = claimed(1, "worked");
+    let stalled = claimed(2, "stalled");
+    let run = job(
+        "agent-run",
+        "c1a10000-0000-0000-0000-0000000000a1",
+        "builder run: worked",
+        JobStatus::Open,
+        json!({ "packet": worked.id.to_string(), "step": "build" }),
+    );
+    for store in [&jobs, &bare_jobs] {
+        for item in [&worked, &stalled] {
+            store.create_job_at(item, t(NOW), &[]).await.unwrap();
+            let mut build = step(&item.id, "build", "Build", StepStatus::Active, json!({}));
+            build.assignee_id = Some("agent-claude".into());
+            store.add_step_at(&build, t(NOW), &[]).await.unwrap();
+        }
+        store.create_job_at(&run, t(NOW), &[]).await.unwrap();
+        let building = step(
+            &run.id,
+            "building",
+            "Building",
+            StepStatus::Active,
+            json!({}),
+        );
+        store.add_step_at(&building, t(NOW), &[]).await.unwrap();
+    }
+
+    let (status, v) = get(&app, "operator", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let board = v["outranks"].as_array().expect("an answered board");
+    let at = |title: &str| {
+        board
+            .iter()
+            .find(|o| o["title"] == title)
+            .unwrap_or_else(|| panic!("{title} on the board: {v}"))["at"]
+            .clone()
+    };
+    assert_eq!(
+        at("worked")["run"],
+        json!({ "state": "building", "run": run.id.to_string() }),
+        "{v}"
+    );
+    assert_eq!(at("stalled")["run"], json!({ "state": "no-run" }), "{v}");
+
+    let (status, v) = get(&bare, "operator", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let board = v["outranks"].as_array().expect("an answered board");
+    for o in board {
+        assert_eq!(o["at"]["run"], json!({ "state": "unread" }), "{v}");
+    }
+}
+
+/// The agents-registry-wired app, with one urgent item at `build`
+/// ACTIVE held by agent-claude, and an open run building it owned by
+/// `run_owner`. Answers the app, its store, and the run's id.
+async fn a_claim_with_its_run(run_owner: &str) -> (axum::Router, Arc<InMemoryJobs>, String) {
+    let agents: Arc<dyn boss_jobs::agents::AgentsRegistry> = Arc::new(
+        boss_jobs::agents::InMemoryAgents::new()
+            .with_agent("agent-claude", ["claude@algedonic.dev"]),
+    );
+    let door = Arc::new(boss_jobs::agent_budget::BudgetDoor {
+        agents,
+        runs: Arc::new(boss_jobs::agent_runs::InMemoryAgentRuns::new(vec![])),
+    });
+    let (app, jobs) = app_with_intake_and(Some(door));
+    let item = Job {
+        priority: Priority::Urgent,
+        opened_at: Some(t("2026-09-18T09:00:00Z")),
+        ..job(
+            "backlog-item",
+            "c1a20000-0000-0000-0000-000000000001",
+            "worked",
+            JobStatus::Open,
+            json!({}),
+        )
+    };
+    jobs.create_job_at(&item, t(NOW), &[]).await.unwrap();
+    let mut build = step(&item.id, "build", "Build", StepStatus::Active, json!({}));
+    build.assignee_id = Some("agent-claude".into());
+    jobs.add_step_at(&build, t(NOW), &[]).await.unwrap();
+    let run = Job {
+        owner_id: run_owner.to_string(),
+        ..job(
+            "agent-run",
+            "c1a20000-0000-0000-0000-0000000000a1",
+            "builder run: worked",
+            JobStatus::Open,
+            json!({ "packet": item.id.to_string(), "step": "build" }),
+        )
+    };
+    jobs.create_job_at(&run, t(NOW), &[]).await.unwrap();
+    let building = step(
+        &run.id,
+        "building",
+        "Building",
+        StepStatus::Active,
+        json!({}),
+    );
+    jobs.add_step_at(&building, t(NOW), &[]).await.unwrap();
+    (app, jobs, run.id.to_string())
+}
+
+/// The run the board read for the one claimed item, as `role` reads it.
+async fn claimed_run(app: &axum::Router, role: &str) -> Value {
+    let (status, v) = get(app, role, "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let board = v["outranks"].as_array().expect("an answered board");
+    assert_eq!(board.len(), 1, "the claimed item is on {role}'s board: {v}");
+    board[0]["at"]["run"].clone()
+}
+
+/// A NARROWED CALLER IS NEVER TOLD A CLAIM HAS NO RUN (backlog 57326714,
+/// review c58e1892 F2). A caller who reads only its own packets sees the
+/// item it owns and not the run another actor owns, so judging the runs
+/// it was handed would say `no-run` — a confident wrong "stalled". The
+/// board judges runs only for a caller who reads every packet
+/// (`reads_every_packet` in `MapRows::outranks`), and this holds it:
+/// with that guard gone, the narrowed answer is `no-run`. The control is
+/// the operator on the same store, who reads the run building it.
+#[tokio::test]
+async fn a_narrowed_caller_reads_a_claims_run_as_unread_never_as_no_run() {
+    let (app, _jobs, run) = a_claim_with_its_run("agent-claude").await;
+    assert_eq!(
+        claimed_run(&app, "operator").await,
+        json!({ "state": "building", "run": run })
+    );
+    assert_eq!(
+        claimed_run(&app, "sales").await,
+        json!({ "state": "unread" })
+    );
+}
+
+/// THE CLOSED RUNS CANNOT CUT THE OPEN ONES (backlog e2519eca item 4).
+/// The board judges only the OPEN runs, but they were read on one page
+/// of `TAIL_WINDOW` (400) beside every run that closed within reach, so
+/// a busy two days of finished runs cut the page and every claim on the
+/// board read `unread` — measured 2026-10-10 05:10Z at 9 open and 288
+/// closed within reach, 297 of the 400. The open runs are their own
+/// read now: 400 closed runs beside the one building the item leave the
+/// claim judged. Before, the page held 400 of 401 and the claim read
+/// unread.
+#[tokio::test]
+async fn closed_runs_within_reach_do_not_cut_a_claims_open_run() {
+    let (app, jobs, run) = a_claim_with_its_run("emp-david").await;
+    for n in 0..400u128 {
+        let closed = job(
+            "agent-run",
+            &Uuid::from_u128(0xC1A4_0000_0000_0000_0000_0000_0000_0000 + n).to_string(),
+            "a finished run",
+            JobStatus::Closed,
+            json!({}),
+        );
+        jobs.create_job_at(&closed, t(NOW), &[]).await.unwrap();
+    }
+    assert_eq!(
+        claimed_run(&app, "operator").await,
+        json!({ "state": "building", "run": run })
+    );
+}
+
+/// A CUT PAGE OF OPEN RUNS IS NEVER JUDGED (backlog 57326714, review
+/// c58e1892 F2). The open runs are read one page of the API's
+/// `MAX_LIMIT` (1000) deep; past it, the run working a claim may be the
+/// one the page left out, and judging the page would say `no-run`. The
+/// board judges runs only when the page held every open run
+/// (`agent_runs_whole`), and this holds it: 1000 other open runs beside
+/// the one building the item make the page cut, and the claim reads
+/// unread. With that guard gone the answer is a judged run — building
+/// or no-run, whichever side of the cut the run landed — never unread.
+#[tokio::test]
+async fn a_cut_page_of_runs_reads_a_claims_run_as_unread() {
+    let (app, jobs, _run) = a_claim_with_its_run("emp-david").await;
+    for n in 0..1000u128 {
+        let other = job(
+            "agent-run",
+            &Uuid::from_u128(0xC1A3_0000_0000_0000_0000_0000_0000_0000 + n).to_string(),
+            "another run",
+            JobStatus::Open,
+            json!({}),
+        );
+        jobs.create_job_at(&other, t(NOW), &[]).await.unwrap();
+    }
+    assert_eq!(
+        claimed_run(&app, "operator").await,
+        json!({ "state": "unread" })
+    );
+}
+
+/// A READY STEP NOTHING CAN DISPATCH, END TO END (backlog e2519eca).
+/// ff309ce6's shape: backlog-item's `prove-delivery` READY, held by
+/// agent-claude, declaring no agent block — `boss dispatch` refuses it
+/// and no person holds it. Through the real router: that step names its
+/// row; the same step held by a person does not; and a ready `build`
+/// whose packet carries no block of its own resolves the ACTIVE row's,
+/// as the station queue and the claim door do, so it is dispatchable.
+#[tokio::test]
+async fn a_ready_step_nothing_can_dispatch_names_its_row() {
+    let agents: Arc<dyn boss_jobs::agents::AgentsRegistry> = Arc::new(
+        boss_jobs::agents::InMemoryAgents::new()
+            .with_agent("agent-claude", ["claude@algedonic.dev"]),
+    );
+    let door = Arc::new(boss_jobs::agent_budget::BudgetDoor {
+        agents,
+        runs: Arc::new(boss_jobs::agent_runs::InMemoryAgentRuns::new(vec![])),
+    });
+    let (app, jobs) = app_with_intake_and(Some(door));
+    let build_fields = boss_jobs::registry::seedable_platform_workflows()
+        .into_iter()
+        .find(|s| s.kind == "backlog-item")
+        .and_then(|s| s.steps.into_iter().find(|st| st.title == "build"))
+        .expect("backlog-item declares build")
+        .fields;
+    let item = |n: u128, title: &str| {
+        let id = Uuid::from_u128(0xD15C_0000_0000_0000_0000_0000_0000_0000 + n).to_string();
+        Job {
+            priority: Priority::Urgent,
+            opened_at: Some(t("2026-09-18T09:00:00Z")),
+            ..job("backlog-item", &id, title, JobStatus::Open, json!({}))
+        }
+    };
+    for (n, title, slug, who) in [
+        (1, "unfunded", "prove-delivery", "agent-claude"),
+        (2, "a person's", "prove-delivery", "emp-david"),
+        (3, "funded by the row", "build", "agent-claude"),
+    ] {
+        let packet = item(n, title);
+        jobs.create_job_at(&packet, t(NOW), &[]).await.unwrap();
+        let mut s = step(&packet.id, slug, slug, StepStatus::Ready, json!({}));
+        s.assignee_id = Some(who.into());
+        if slug == "build" {
+            s.fields = build_fields.clone();
+        }
+        jobs.add_step_at(&s, t(NOW), &[]).await.unwrap();
+    }
+
+    let (status, v) = get(&app, "operator", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let board = v["outranks"].as_array().expect("an answered board");
+    let dispatch = |title: &str| {
+        board
+            .iter()
+            .find(|o| o["title"] == title)
+            .unwrap_or_else(|| panic!("{title} on the board: {v}"))["at"]["dispatch"]
+            .clone()
+    };
+    assert_eq!(
+        dispatch("unfunded"),
+        json!({ "state": "undispatchable", "kind": "backlog-item", "version": 16 }),
+        "{v}"
+    );
+    assert_eq!(dispatch("a person's"), Value::Null, "{v}");
+    assert_eq!(dispatch("funded by the row"), Value::Null, "{v}");
 }
 
 /// THE HOST THAT ANSWERED NOTHING IS STILL DRAWN (backlog 49ed87b4).

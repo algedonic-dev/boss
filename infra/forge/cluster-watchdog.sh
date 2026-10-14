@@ -80,12 +80,14 @@ case "$image_ready" in
         unpinned="$image_ready"
         echo "watchdog: the kubectl image is not pinned — the disk sweep's next prune can take it, and a pull then needs the forge registry: $image_ready" >&2 ;;
 esac
-# THE STAMP IS ANOTHER ACCOUNT'S FILE, READ AS DATA (backlog a604a35b).
-# This loop runs as root; the stamp is written by the cluster converge,
-# which runs as the checkout's owner. So the path is one that account
-# can repoint — at the machine token, at the admin kubeconfig — and
-# whatever is read here goes into a kubectl patch, this journal and an
-# alert's body. A build name is seven hex characters (the converge's
+# THE STAMP IS READ AS DATA (backlog a604a35b). This loop runs as root;
+# the stamp was written by the cluster converge as the checkout's owner
+# until backlog 683d7fe9 moved the converge to root and the stamp into
+# its root-only state directory. While it was another account's file the
+# path was one that account could repoint — at the machine token, at the
+# admin kubeconfig — and whatever is read here goes into a kubectl patch,
+# this journal and an alert's body. The checks below stay: they cost
+# nothing. A build name is seven hex characters (the converge's
 # ${HEAD_FULL:0:7}); anything else is `none`, which rolls nothing, and
 # is said WITHOUT the bytes that were found. Bounded, so a name swapped
 # for something that never ends cannot hold the tick.
@@ -161,6 +163,23 @@ case "$decision" in
     ok)
         echo "cluster ok: api answers on $live_commit, deployment serves $image, last converged $stamp"
         alert_replay || true
+        # An alert the API refused ALERT_REFUSALS_MAX times is moved
+        # aside rather than holding every later one (alert-lib.sh
+        # alert_replay; backlog 9ecd12ea). It rides this run's packet
+        # every tick while it stands there, so a kept alert nobody
+        # received is on the record, not only in the journal. Not a
+        # failed run: that would stop the door observer behind it. And
+        # the same sentence goes to the journal every tick it stands
+        # (review 4d18be3a, finding 2): the run packet needs the API,
+        # the journal is read over gatewayd with the API dark or
+        # refusing, and one line at the moment of the move is a line
+        # nobody reads.
+        refused=$(alert_refused_count)
+        if [ "${refused:-0}" -gt 0 ]; then
+            refused_line="$refused alert(s) the jobs API refused $ALERT_REFUSALS_MAX times, kept with each answer under $ALERT_SPOOL/refused"
+            run_summary_field alerts_refused "$refused_line"
+            echo "watchdog: $refused_line" >&2
+        fi
         ;;
     wait)
         echo "cluster DARK ($dark of $LIMIT checks): api silent, deployment serves $image, last converged $stamp — waiting one more check before acting" >&2

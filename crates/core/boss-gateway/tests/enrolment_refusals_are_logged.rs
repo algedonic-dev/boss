@@ -119,14 +119,6 @@ async fn people() -> String {
     format!("http://{addr}")
 }
 
-/// An address nothing listens on: bound, then released.
-async fn dark() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    format!("http://{addr}")
-}
-
 /// The ceremony's routes, as the gateway's `main.rs` mounts them —
 /// `passkey_router` carries the removal since backlog 3bddce66.
 fn router(people_base: String) -> Router {
@@ -190,7 +182,10 @@ async fn a_refused_enrolment_logs_its_reason_and_the_browser_reads_no_internal_d
         .expect("this binary holds one test, so nothing else has claimed the subscriber");
 
     let live = router(people().await);
-    let dark_base = dark().await;
+    // An address nothing listens on, HELD for the whole test rather than
+    // bound and released (review 465e723f F3).
+    let held = boss_testing::dark_port();
+    let dark_base = held.base.clone();
     let dark = router(dark_base.clone());
     let begin = "/api/auth/passkey/register/begin";
     let finish = "/api/auth/passkey/register/finish";

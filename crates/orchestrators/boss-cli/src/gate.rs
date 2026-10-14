@@ -105,6 +105,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::identity;
+use crate::sor_client::{all_open_cars, api, api_at, jobs_base, stamp};
 // The ONE rows helper (backlog 7b7e0529): a body that is not a list
 // refuses rather than reading as an empty yard. See `train::rows`.
 use crate::train::rows;
@@ -384,25 +385,206 @@ pub(crate) enum Requester {
 
 /// THE ONE DEFINITION OF ADMISSION AT THE GATE BOUND. `live` is the
 /// count of running gate Jobs, whoever filed them; `max` is the
-/// delivery policy's `gate_max_concurrent` (or the env override).
+/// delivery policy's `gate_max_concurrent` (or the env override), and
+/// it is the TOTAL — trains included, nothing ever admitted at it
+/// (design 1e787fc2, backlog 0f4224bc). `ahead` is the claims standing
+/// in front of a car: waiting trains ([`trains_waiting`]), then the
+/// dock's re-gates ([`dock_waiting`]), then the builder places before
+/// it in line.
 ///
-/// A car is admitted BELOW the bound. A train is admitted AT it — it
-/// may be the bound+1th running Job. Measured 2026-09-18 on train
-/// ccd8b08e (backlog 48f7aba1): with the train held to the same line
-/// as the cars, the conductor logged "the cluster is at its gate bound
-/// (3 running of 3)" five passes running while operator and builder
-/// car gates refilled the three slots between passes, and the train sat
-/// two hours at CI. A busy dock starved the train — the more cars were
-/// gated, the less could land, the inverse of what a bound is for.
-/// Admitting the train at the bound is one branch here and never
-/// delays a car; the alternative (reserving a slot for trains) would
-/// hold a car slot empty on every quiet hour. One slot of overage,
-/// never two: a train asking with the bound+1th already running waits.
-pub(crate) const fn admits(live: usize, max: usize, who: Requester) -> bool {
+/// Until 2026-10-10 a train was admitted AT the bound, the bound+1th
+/// Job, because a train held to the cars' test starved: on 2026-09-18
+/// (backlog 48f7aba1) car gates refilled the bays between conductor
+/// passes and train ccd8b08e sat two hours at CI. Composed with the
+/// bound rising to four, that overage put a fifth runner on the
+/// measured I/O cliff (65% pressure, a ~35-minute gate taking ~93,
+/// 2026-08-26) twice on 2026-09-28, and a 7-minute train gate took 24+.
+/// The starvation was never the shared bound — it was the train having
+/// no PLACE. So the train is first in line instead: nothing stands
+/// ahead of it, and every car counts a waiting train ahead of itself,
+/// so the bay that frees while a train waits stays free for it (for
+/// at most one conductor pass, about a minute). No reserved train bay:
+/// it would idle about three quarters of the time.
+pub(crate) const fn admits(live: usize, ahead: usize, max: usize, who: Requester) -> bool {
     match who {
-        Requester::Car => live < max,
-        Requester::Train => live <= max,
+        Requester::Car => live + ahead < max,
+        Requester::Train => live < max,
     }
+}
+
+/// PURE: the open trains CLAIMING a gate bay, by title, alive or not —
+/// each claims the FIRST place in the gate line (design 1e787fc2). The
+/// claim is read off the system of record, never the conductor's
+/// memory: a train the conductor found at the gate bound — or whose gate
+/// ended without a usable verdict and is owed a relaunch, which keeps the
+/// place it had — carries `train_gate_bound_wait` and no `train_gate_run`.
+/// The conductor clears it the pass the gate is filed, the pass a launch
+/// fails for any other reason, and the pass the train's ci step is judged
+/// (a judged train launches no gate; review e536d148). A blank claim is
+/// no claim.
+///
+/// ONLY THE BOUND SETS IT (backlog 82071657). The claim was read off
+/// `train_gate_wait_reason` until 2026-10-10, which the conductor writes
+/// on EVERY launch error — no kubectl, RBAC, a manifest that does not
+/// render — so a train that could not use a bay held one from every
+/// builder, under a message blaming a waiting train for the real fault.
+pub(crate) fn trains_claiming(trains: &[Value]) -> Vec<String> {
+    trains
+        .iter()
+        .filter_map(|t| {
+            let md = t.get("metadata")?;
+            let text = |k: &str| {
+                md.get(k)
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty())
+            };
+            if !text(crate::train_gate::KEY_BOUND_WAIT) || text(crate::train_gate::KEY_RUN) {
+                return None;
+            }
+            let title = t.get("title").and_then(Value::as_str).unwrap_or_default();
+            let id = t.get("id").and_then(Value::as_str).unwrap_or_default();
+            Some(if title.is_empty() {
+                format!("train {}", &id[..8.min(id.len())])
+            } else {
+                title.to_string()
+            })
+        })
+        .collect()
+}
+
+/// The cadence rule whose pass retries a waiting train's gate — the one
+/// process that will ever launch it, so the one whose last firing says
+/// whether a train's claim is still held.
+pub(crate) const TRAIN_RECONCILE_RULE: &str = "train-reconcile";
+
+/// PURE: the trains whose claim stands ahead of every car, given the
+/// reconcile rule's last firing — the dock's liveness ([`dock_waiting`]),
+/// for the claim ahead of it. `Err` names why the claims are NOT counted.
+///
+/// A CLAIM LIVES WITH ITS CONDUCTOR (backlog 82071657). Until 2026-10-10
+/// a train's claim counted for as long as the row did: a conductor
+/// stopped while a train waited left every builder one bay short for
+/// good, and at a bound of one, or with two such trains, no builder gate
+/// launched at all — while the refusal said the train went first though
+/// nothing would ever launch it. A stopped conductor stops firing, so its
+/// trains' claims stop counting within the same TTL as the dock's.
+///
+/// The liveness is coarser than the conductor, and a LAPSE IS NOT A
+/// STOPPED CONDUCTOR: a pass that gives up on the reconcile lock exits
+/// non-zero, and one still in flight past the TTL reads as aged, so a
+/// live conductor's claims can go uncounted for about one two-minute
+/// window. Bounded and self-correcting — the next rc 0 firing restores
+/// them, and the train's own admission never reads this.
+pub(crate) fn trains_waiting(
+    trains: &[Value],
+    reconcile: Option<&boss_jobs::cadence::LastFiring>,
+    now: chrono::DateTime<chrono::Utc>,
+    ttl_secs: i64,
+) -> std::result::Result<Vec<String>, String> {
+    let claiming = trains_claiming(trains);
+    if claiming.is_empty() {
+        return Ok(claiming);
+    }
+    let not_counted = format!("{} train claim(s) not counted", claiming.len());
+    rule_keeps_claims(
+        TRAIN_RECONCILE_RULE,
+        "the trains' claims",
+        reconcile,
+        now,
+        ttl_secs,
+        &not_counted,
+    )
+    .map(|()| claiming)
+}
+
+/// PURE: whether `rule`'s last firing keeps the claims it owns alive —
+/// fired inside `ttl_secs` with rc 0, or still in flight (rc none, the
+/// cadence door's own reading, `LastFiring::rc`). `Err` says why not.
+fn rule_keeps_claims(
+    rule: &str,
+    whose: &str,
+    last: Option<&boss_jobs::cadence::LastFiring>,
+    now: chrono::DateTime<chrono::Utc>,
+    ttl_secs: i64,
+    not_counted: &str,
+) -> std::result::Result<(), String> {
+    let Some(last) = last else {
+        return Err(format!(
+            "{rule} has no recorded firing, so nothing keeps {whose} current — {not_counted}"
+        ));
+    };
+    let age = (now - last.fired_at).num_seconds();
+    if age > ttl_secs {
+        return Err(format!(
+            "{rule} last fired {age}s ago, past the {ttl_secs}s a claim lives without it — \
+             {not_counted}"
+        ));
+    }
+    match last.rc {
+        None | Some(0) => Ok(()),
+        Some(rc) => Err(format!(
+            "{rule}'s last firing ({}) exited {rc}, so it kept no claim current — {not_counted}",
+            last.firing_id
+        )),
+    }
+}
+
+/// `rule`'s last firing, read now; `Ok(None)` when it has never fired.
+async fn last_firing_now(
+    http: &boss_core::machine_token::Client,
+    rule: &str,
+) -> Result<Option<boss_jobs::cadence::LastFiring>> {
+    let path = format!("/api/cadence/rules/{rule}/last-firing");
+    api(http, reqwest::Method::GET, &path, None)
+        .await
+        .and_then(|v| match v {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => serde_json::from_value::<boss_jobs::cadence::LastFiring>(v)
+                .map(Some)
+                .context("parsing the last firing"),
+        })
+}
+
+/// The waiting trains, read now. BEST-EFFORT, LOUDLY, exactly as the
+/// dock's claims are ([`dock_waiting_now`]): a read that fails counts no
+/// train ahead — a failed read never blocks a car forever — and the
+/// `Err` says why for the caller to print. The reconcile rule's firing
+/// is read only when some train claims a bay.
+pub(crate) async fn trains_waiting_now(
+    http: &boss_core::machine_token::Client,
+    now: chrono::DateTime<chrono::Utc>,
+) -> std::result::Result<Vec<String>, String> {
+    let trains = api(
+        http,
+        reqwest::Method::GET,
+        "/api/jobs?kind=pr-train&status=open&limit=100",
+        None,
+    )
+    .await
+    .and_then(rows)
+    .map_err(|e| format!("could not read the open trains ({e:#}) — counting no train ahead"))?;
+    let claiming = trains_claiming(&trains).len();
+    if claiming == 0 {
+        return Ok(Vec::new());
+    }
+    let reconcile = last_firing_now(http, TRAIN_RECONCILE_RULE)
+        .await
+        .map_err(|e| {
+            format!(
+                "could not read {TRAIN_RECONCILE_RULE}'s last firing ({e:#}) — {claiming} train \
+                 claim(s) not counted"
+            )
+        })?;
+    trains_waiting(&trains, reconcile.as_ref(), now, QUEUE_PLACE_TTL_SECS)
+}
+
+/// The waiting trains for an admission, with the reason printed when
+/// none could be read.
+fn trains_or_say(read: std::result::Result<Vec<String>, String>) -> Vec<String> {
+    read.unwrap_or_else(|why| {
+        eprintln!("boss gate: {why}");
+        Vec::new()
+    })
 }
 
 /// The polite refusal at the concurrency bound, or None below it.
@@ -411,12 +593,27 @@ pub(crate) const fn admits(live: usize, max: usize, who: Requester) -> bool {
 /// to wait for or watch one of them, and a bound that says only "3
 /// running" sends them off to run the kubectl this verb already ran.
 ///
-/// `dock_waiting` is the dock's claims on a bay ([`dock_waiting`]): a
-/// slot one of them is waiting for is not free to a builder.
-pub(crate) fn crowd_refusal(live: &[String], dock_waiting: usize, max: usize) -> Option<String> {
-    if admits(live.len() + dock_waiting, max, Requester::Car) {
+/// `trains` are the trains waiting for a bay ([`trains_waiting`]) and
+/// `dock_waiting` the dock's claims on one ([`dock_waiting`]): a slot
+/// either is waiting for is not free to a builder, and a train goes
+/// before the dock (design 1e787fc2).
+pub(crate) fn crowd_refusal(
+    live: &[String],
+    trains: &[String],
+    dock_waiting: usize,
+    max: usize,
+) -> Option<String> {
+    if admits(live.len(), trains.len() + dock_waiting, max, Requester::Car) {
         return None;
     }
+    let train = if trains.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", and {} waiting for the next bay and goes first (design 1e787fc2)",
+            trains.join(", ")
+        )
+    };
     let dock = if dock_waiting == 0 {
         String::new()
     } else {
@@ -426,7 +623,7 @@ pub(crate) fn crowd_refusal(live: &[String], dock_waiting: usize, max: usize) ->
         )
     };
     Some(format!(
-        "{n} gate(s) already running ({names}){dock} — at the concurrency bound of {max}.\n  \
+        "{n} gate(s) already running ({names}){train}{dock} — at the concurrency bound of {max}.\n  \
          Every workspace is per-run so the verdicts stay independent, but the gates \
          share one build node and one seed disk: at five concurrent, I/O pressure hit \
          65% and a ~35-minute gate took ~93 (measured 2026-08-26). Wait for one to \
@@ -511,7 +708,8 @@ pub(crate) enum Admission {
 
 /// Launch, queue, or refuse — decided before a packet exists.
 /// `dock_waiting` counts the dock's claims ahead of every builder
-/// ([`dock_waiting`]).
+/// ([`dock_waiting`]); `trains` the waiting trains ahead of those
+/// ([`trains_waiting`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn admission(
     live: &[String],
@@ -522,6 +720,7 @@ pub(crate) fn admission(
     queue_depth: usize,
     queue_cap: usize,
     dock_waiting: usize,
+    trains: &[String],
 ) -> Admission {
     // LEGACY-MANIFEST GUARD, and it never queues. If the runner's
     // /gate-target is still a PVC (a stale checkout, or `--manifest` at
@@ -542,7 +741,7 @@ pub(crate) fn admission(
             names = live.join(", "),
         ));
     }
-    let Some(crowd) = crowd_refusal(live, dock_waiting, max) else {
+    let Some(crowd) = crowd_refusal(live, trains, dock_waiting, max) else {
         return Admission::Launch;
     };
     // WITHOUT `--wait` THERE IS NO LAUNCHER. A queued packet is started
@@ -633,14 +832,10 @@ pub(crate) fn places_ahead(order: &[String], reuse: Option<&str>) -> usize {
 /// Oldest first, and only into a slot that is actually free: second in
 /// line waits for the second slot, so two waiters released by one
 /// finishing gate do not both launch onto a node with room for one. And
-/// the dock's claims ([`dock_waiting`]) stand ahead of the whole line.
-pub(crate) const fn may_launch(
-    live: usize,
-    dock_waiting: usize,
-    max: usize,
-    position: usize,
-) -> bool {
-    admits(live + dock_waiting + position, max, Requester::Car)
+/// `claims` — the waiting trains ([`trains_waiting`]) and the dock's
+/// re-gates ([`dock_waiting`]) — stand ahead of the whole line.
+pub(crate) const fn may_launch(live: usize, claims: usize, max: usize, position: usize) -> bool {
+    admits(live, claims + position, max, Requester::Car)
 }
 
 /// THE DOCK'S PLACE AHEAD OF THE LINE (design 42279fb2 D3, backlog
@@ -731,27 +926,15 @@ pub(crate) fn dock_waiting(
         return Ok(0);
     }
     let not_counted = format!("{claims} dock claim(s) not counted");
-    let Some(last) = refresh else {
-        return Err(format!(
-            "{DOCK_REFRESH_RULE} has no recorded firing, so nothing keeps the dock's claims \
-             current — {not_counted}"
-        ));
-    };
-    let age = (now - last.fired_at).num_seconds();
-    if age > ttl_secs {
-        return Err(format!(
-            "{DOCK_REFRESH_RULE} last fired {age}s ago, past the {ttl_secs}s a claim lives \
-             without it — {not_counted}"
-        ));
-    }
-    match last.rc {
-        None | Some(0) => Ok(claims),
-        Some(rc) => Err(format!(
-            "{DOCK_REFRESH_RULE}'s last firing ({}) exited {rc}, so it kept no claim current \
-             — {not_counted}",
-            last.firing_id
-        )),
-    }
+    rule_keeps_claims(
+        DOCK_REFRESH_RULE,
+        "the dock's claims",
+        refresh,
+        now,
+        ttl_secs,
+        &not_counted,
+    )
+    .map(|()| claims)
 }
 
 /// The dock's claims, read now. BEST-EFFORT, LOUDLY: a builder must owe
@@ -775,15 +958,8 @@ async fn dock_waiting_now(
     if dock_claims(&cars) == 0 {
         return Ok(0);
     }
-    let path = format!("/api/cadence/rules/{DOCK_REFRESH_RULE}/last-firing");
-    let refresh = api(http, reqwest::Method::GET, &path, None)
+    let refresh = last_firing_now(http, DOCK_REFRESH_RULE)
         .await
-        .and_then(|v| match v {
-            None | Some(Value::Null) => Ok(None),
-            Some(v) => serde_json::from_value::<boss_jobs::cadence::LastFiring>(v)
-                .map(Some)
-                .context("parsing the last firing"),
-        })
         .map_err(|e| {
             format!(
                 "could not read {DOCK_REFRESH_RULE}'s last firing ({e:#}) — {} dock claim(s) \
@@ -849,6 +1025,23 @@ pub(crate) fn queue_place_patch(now: chrono::DateTime<chrono::Utc>) -> Value {
 /// `queued_at` first, so a beat with no marker is in neither.
 pub(crate) fn queue_clear_patch() -> Value {
     json!({ QUEUED_AT: Value::Null })
+}
+
+/// The release a launch writes before its Job is created, if it owes one.
+///
+/// A QUEUED launch releases the place it held. A REUSED one releases too,
+/// even when this process never queued (backlog 33e49b7d): the packet was
+/// filed by an earlier run, and if that run's waiter died in line its
+/// marker is still on the packet. Measured 2026-10-09: three packets
+/// reused at 01:25Z into a free bay launched with their dead waiters'
+/// `queued_at` intact, and `boss orient` listed three RUNNING gates as
+/// abandoned, with a re-gate line that would have raced a second Job onto
+/// each. Unconditional on a reused packet rather than read off the
+/// snapshot this verb took at its start, because a live waiter can retake
+/// a place on the same packet after that read. A packet this verb just
+/// filed and did not queue carries no marker, so it pays no round-trip.
+pub(crate) fn launch_queue_release(queued: bool, reused: bool) -> Option<Value> {
+    (queued || reused).then(queue_clear_patch)
 }
 
 /// The instant this process began launching a REUSED gate-run — a sign
@@ -981,7 +1174,10 @@ pub(crate) struct AbandonedPlace {
 /// READS THE SYSTEM OF RECORD ONLY — no cluster access needed, which is
 /// what lets `boss orient` (and anything else that can read the jobs
 /// API) report it. A run that LAUNCHES has its queue keys cleared before
-/// its Job is created, so "still marked queued" is already "has no Job",
+/// its Job is created ([`launch_queue_release`] — on a reused packet too,
+/// whose marker may be a dead waiter's: until 33e49b7d that path kept it
+/// and three running gates read as abandoned here), so "still marked
+/// queued" is already "has no Job",
 /// and the narrow window between the clear and the create leaves a
 /// packet with no marker at all — a different residue class, not this
 /// one.
@@ -1177,12 +1373,12 @@ const CARRIER_ENV_LINE: &str = "- {name: GATE_VERDICT_CARRIER, value: pod-log}";
 /// (a tier name, or null for "declares none"). Anything else is not
 /// handed, and the lint then says so and reads the door itself.
 pub(crate) fn hand_edit_level(job: &str, answer: Option<&Value>) -> String {
-    let Some(answer) = answer.filter(|a| a.is_object() && a.get("edit_level").is_some()) else {
+    let Some(answer) = handable_edit_level(answer) else {
         return job.to_string();
     };
     // A YAML single-quoted scalar: everything is literal but the quote,
     // which is doubled. Compact JSON has no line break to fold.
-    let value = answer.to_string().replace('\'', "''");
+    let value = answer.replace('\'', "''");
     let mut handed = false;
     let mut out = String::with_capacity(job.len() + value.len() + 80);
     for line in job.split_inclusive('\n') {
@@ -1199,6 +1395,19 @@ pub(crate) fn hand_edit_level(job: &str, answer: Option<&Value>) -> String {
         }
     }
     out
+}
+
+/// PURE: the edit-level door's answer as the one string a launcher
+/// hands down — the door's own object, compact — or `None` when there is
+/// nothing of the door's shape to hand. ONE predicate for every launcher
+/// that hands it: the gate Job's env line ([`hand_edit_level`]) and the
+/// consist worker's argument (`train::consist_job`, backlog 37742794),
+/// so the lint is handed the same answer, or the same nothing, whichever
+/// pod runs it.
+pub(crate) fn handable_edit_level(answer: Option<&Value>) -> Option<String> {
+    answer
+        .filter(|a| a.is_object() && a.get("edit_level").is_some())
+        .map(Value::to_string)
 }
 
 /// The edit-level door's answer, for [`hand_edit_level`]. NEVER FATAL
@@ -1421,7 +1630,9 @@ impl ParkIntent {
     /// share their shape. Their wording says so, since that is what a
     /// reader decides on. A seventh joined them on that same footing
     /// (ce72aea9): a caller cleared by counting the machine gate's logged
-    /// facts alone, which this door admitted nine times in three days.
+    /// facts alone, which this door admitted nine times in three days —
+    /// and which [`Self::require_complete`] now REFUSES before this list
+    /// is read (5605c2b5), so it is never said here.
     pub fn probe_warnings(&self) -> Vec<String> {
         match &self.probe {
             None => Vec::new(),
@@ -1608,6 +1819,53 @@ impl ParkIntent {
                  The rule is boss_jobs::probe::reads_git_time_with_an_offset, and `boss prove` \
                  refuses the same text.",
                 boss_jobs::probe::GIT_TIME_STRING_EVIDENCE,
+            );
+        }
+        // THE GATE-LOG-ALONE CLEARANCE, REFUSED HERE (backlog 5605c2b5).
+        // It was a warning at this door (ce72aea9), on the argument that a
+        // presence claim shares the absence claim's text. Measured: all
+        // ten false proofs were parked past that warning, and the
+        // unattended door now refuses the shape (d3312446) — so a car
+        // parked with it can never be proven by the machine, and this is
+        // the last moment re-parking is free. The predicate and rule id
+        // are the unattended door's own (§9a).
+        if let Some(probe) = &self.probe
+            && let Some(kind) = boss_jobs::probe::clears_a_caller_from_the_gate_log_alone(probe)
+        {
+            anyhow::bail!(
+                "--park-probe CLEARS A CALLER FROM THE GATE LOG ALONE — it counts `{kind}` \
+                 facts in the gate window's `.log.dirty` and never reads the live tally's \
+                 `.live[].snapshot.rows`, so a caller the running service had already \
+                 tallied passes whatever it sends.\n\n\
+                 {evidence}\n\n\
+                 The unattended door refuses this text under the rule `{rule}`, so a car \
+                 parked with it would never be proven by the machine; this refusal says so \
+                 while re-parking is still free. Add the live reading above and gate again.\n\n\
+                 If the claim is a PRESENCE — the gate DID state this caller, which the log \
+                 answers correctly — park the car with --park-proof-event '<the fact that \
+                 proves it>' instead, and once it lands prove it by hand: \
+                 {by_hand}",
+                evidence = boss_jobs::probe::GATE_LOG_ALONE_EVIDENCE,
+                rule = boss_jobs::probe::GATE_LOG_ALONE_RULE,
+                by_hand = boss_jobs::probe::hand_proof_command("<car>"),
+            );
+        }
+        // A PROBE THAT PINS BYTES (backlog 2770eba8): a blob id or digest
+        // compared to a literal answers FAILING on correct code after any
+        // squash that meets another car's edit to the file. It fails in
+        // the false-RED direction and the car can only be re-parked here.
+        if let Some(probe) = &self.probe
+            && let Some(tool) = boss_jobs::probe::pins_file_bytes(probe)
+        {
+            anyhow::bail!(
+                "--park-probe PINS A FILE'S BYTES — it reads a content id with `{tool}` and \
+                 compares it to a literal, so it proves which bytes were checked out, not \
+                 that the change works, and any later edit to that file — a rebase, the \
+                 train's squash, the next car — turns it red on correct code.\n\n\
+                 {evidence}\n\n\
+                 The rule is boss_jobs::probe::pins_file_bytes (`{rule}`).",
+                evidence = boss_jobs::probe::PINNED_BYTES_EVIDENCE,
+                rule = boss_jobs::probe::PINNED_BYTES_RULE,
             );
         }
         let missing: Vec<&str> = [
@@ -1978,7 +2236,7 @@ pub fn item_a_design_answers(given: &str, packet: &Value) -> Result<String> {
 
 /// The env var a dispatched builder exports so the gate it launches
 /// names the run that launched it (`boss dispatch` prints the id).
-pub(crate) const AGENT_RUN_ENV: &str = "BOSS_AGENT_RUN";
+pub(crate) const AGENT_RUN_ENV: &str = boss_jobs::car_release::AGENT_RUN_ENV;
 
 /// The key the run's id rides under on the gate-run — the `link` the
 /// landing rule's `jobs.complete_linked_step` follows. Defined ONCE,
@@ -3057,418 +3315,6 @@ pub(crate) fn reusable_packet(open: &[Value], branch: &str, sha: &str) -> Option
         .map(str::to_string)
 }
 
-/// The message a caller gets when `BOSS_JOBS_URL` is unset. Kept apart
-/// from the lookup so a test can assert what it teaches without
-/// touching process environment.
-pub(crate) fn no_instance_message() -> String {
-    "BOSS_JOBS_URL is not set, and this verb has no default on purpose.\n\
-     Read this deployment's system-of-record URL from infra/dev/sor-url.\n\
-     Set BOSS_JOBS_URL to that declared URL before running this verb.\n\
-     A wrong deployment can answer with an empty queue instead of an error;\n\
-     verify a known packet on the same connection before accepting absence."
-        .to_string()
-}
-
-/// The jobs API this verb talks to. **NO DEFAULT, deliberately.**
-///
-/// It used to fall back to `http://127.0.0.1:7900`. On boss-gcp that
-/// reached a second, older, complete BOSS stack (since retired), not
-/// the system of record. A wrong instance does not fail, it answers. On
-/// 2026-08-27 a `?kind=gate-run` read returned `total: 0` from the local
-/// stack while the cluster held 51 packets; a `gate-run v1` spec was
-/// then authored against that zero, which would have regressed the live
-/// v2 to a worse 3-step v1 on the next bundle reconcile. It was caught
-/// by noticing two packet counts disagreed — luck, not process.
-///
-/// The fix is not a better default. A default that is right on one host
-/// and silently wrong on another IS the defect (packet aa783636), so a
-/// verb that cannot reach the right instance now reaches none.
-fn jobs_base() -> Result<String> {
-    resolve_jobs_base(None)
-}
-
-/// Resolve the jobs-api base from an explicit `--jobs-url` flag, falling
-/// back to `BOSS_JOBS_URL`, and REFUSING (never defaulting) when neither
-/// is set. Every read verb — `gate`, `packet census`, `queue`, `prove` —
-/// resolves through here so not one of them can quietly re-grow the
-/// `http://127.0.0.1:7900` default that read boss-gcp's second, older
-/// stack (packet aa783636). A default that is right on one host and
-/// silently wrong on another IS the defect; a verb that cannot reach the
-/// right instance now reaches none.
-pub(crate) fn resolve_jobs_base(flag: Option<&str>) -> Result<String> {
-    resolve_jobs_base_from(flag, std::env::var("BOSS_JOBS_URL").ok())
-}
-
-/// The pure core of [`resolve_jobs_base`]: flag wins, then env, then
-/// refuse. Split out so a test can pin the precedence and the refusal
-/// without mutating process environment — env writes are `unsafe` under
-/// edition 2024, and racy across the parallel test runner.
-pub(crate) fn resolve_jobs_base_from(flag: Option<&str>, env: Option<String>) -> Result<String> {
-    flag.map(str::to_string)
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| env.filter(|v| !v.trim().is_empty()))
-        .ok_or_else(|| anyhow!("{}", no_instance_message()))
-}
-
-/// The client every boss verb's BOSS-service calls go through: a
-/// `machine_token::Client`, which stamps the estate machine token on each
-/// request from the process's one watched source and follows no redirect
-/// (design 6805c764 car 2, the CLI slice, 2026-09-29). Until then each
-/// verb built a plain `reqwest::Client` and sent `x-boss-user` alone, so
-/// every verb would have been a 401 the minute its port's gate enforced.
-/// A third party — the forge, GitHub — is never reached through one: it
-/// has its own plain client behind its port (`train::forge`), and so do
-/// the install checks `boss doctor` makes of NATS and the local gateway's
-/// health, which assert no identity.
-pub(crate) fn machine_client() -> Result<boss_core::machine_token::Client> {
-    machine_client_with(reqwest::Client::builder())
-}
-
-/// [`machine_client`] from a builder carrying the caller's own settings
-/// (a timeout); the redirect policy is the machine client's, whatever
-/// the builder asked for.
-///
-/// UNDER `cfg(test)` IT HOLDS NO TOKEN (backlog 2ee29275, F2). 63 test
-/// sites build their client here, and a failing test prints the request
-/// head it captured — so a test client reading the process's shared
-/// source would put a mounted Secret into the gate's log. The switch is
-/// here, not at the 63 sites, so no test can forget it; the pin
-/// `no_test_reads_the_live_machine_token` refuses a test that names the
-/// shared source itself.
-pub(crate) fn machine_client_with(
-    builder: reqwest::ClientBuilder,
-) -> Result<boss_core::machine_token::Client> {
-    #[cfg(not(test))]
-    let client = boss_core::machine_token::Client::build(builder);
-    #[cfg(test)]
-    let client = boss_core::machine_token::Client::build_with_source(
-        builder,
-        std::sync::Arc::new(boss_core::machine_token::Source::fixed(None)),
-    );
-    client.context("building the machine client")
-}
-
-pub(crate) async fn api(
-    http: &boss_core::machine_token::Client,
-    method: reqwest::Method,
-    path: &str,
-    payload: Option<Value>,
-) -> Result<Option<Value>> {
-    api_at(http, &jobs_base()?, method, path, payload).await
-}
-
-/// Like [`api`], but against an explicit base rather than the resolved
-/// one. The seam a paginating reader tests through: a stub socket can
-/// answer without a `BOSS_JOBS_URL` anywhere in the environment.
-///
-/// EVERY operator verb — `gate`, `prove`, `park`, `job`, `orient`,
-/// `rerail`, `docs` — writes through here, which is why this is where
-/// the caller gets signed. A write carries the actor RUNNING the
-/// command or is refused; a read carries them if known and says so
-/// once if not. Neither is ever signed as the conductor: that is
-/// backlog 5083d6f5, measured on the step a `boss prove` completed.
-pub(crate) async fn api_at(
-    http: &boss_core::machine_token::Client,
-    base: &str,
-    method: reqwest::Method,
-    path: &str,
-    payload: Option<Value>,
-) -> Result<Option<Value>> {
-    let signature = identity::signature_for(&method, path, identity::caller());
-    api_at_signed(http, base, method, path, payload, signature).await
-}
-
-/// What a signed door's errors call the service `base` reaches (backlog
-/// 25a4f7f9, 2026-09-28): `<name> api` for a port the one port table
-/// (`boss_ports`) holds, marked `(scratch)` on a scratch port, and the
-/// base itself for any other — a gateway hostname, a test's stub — so
-/// no error names a service it cannot show it reached. Until then every
-/// error said `jobs api`, including an events-service refusal to `boss
-/// events redeliver` and a ledger one to `boss ledger lock`, which is a
-/// diagnosis sent to the wrong service.
-pub(crate) fn service_at(base: &str) -> String {
-    let base = base.trim_end_matches('/');
-    let rest = base.split_once("://").map_or(base, |(_, r)| r);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    // After the last `:` — which, in a bare `[::1]`, is inside the
-    // brackets and does not parse as a port.
-    let port = authority
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse::<u16>().ok());
-    let named = port.and_then(|p| {
-        boss_ports::all().find_map(|s| {
-            if s.prod == p {
-                Some(format!("{} api", s.name))
-            } else if s.scratch == Some(p) {
-                Some(format!("{} api (scratch)", s.name))
-            } else {
-                None
-            }
-        })
-    });
-    named.unwrap_or_else(|| format!("the service at {base}"))
-}
-
-/// [`api_at`] with the signing decision already made. The seam the
-/// wire tests go through: WHO signs is a pure function of the
-/// environment (`identity::signature_for`), and this is the half that
-/// puts it on the socket — so a test can prove the header carries the
-/// caller, and that a refused write never reaches the network, without
-/// mutating the process's environment.
-pub(crate) async fn api_at_signed(
-    http: &boss_core::machine_token::Client,
-    base: &str,
-    method: reqwest::Method,
-    path: &str,
-    payload: Option<Value>,
-    signature: identity::Signature,
-) -> Result<Option<Value>> {
-    let signer = identity::apply(signature)?;
-    let user = identity::header(&signer);
-    let url = format!("{base}{path}");
-    let service = service_at(base);
-    // A refused connect is waited out — the stack rolls with Recreate
-    // and is dark for about a minute per converge (backlog 034002b3);
-    // anything past the connect is surfaced as it always was.
-    let resp = crate::train::send_through_a_roll(&format!("{service} {method} {path}"), || {
-        let req = http
-            .request(method.clone(), &url)
-            .header("x-boss-user", user.as_str())
-            .header("content-type", "application/json");
-        match &payload {
-            Some(p) => req.json(p),
-            None => req,
-        }
-    })
-    .await?;
-    let status = resp.status();
-    if status.is_redirection() {
-        // The client follows no redirect, so a 3xx lands here (backlog
-        // 2ee29275, F4). Name where it pointed by scheme and host only:
-        // a login redirect carries its state in the query, and the page
-        // body echoes the whole target, so neither is quoted.
-        let location = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok());
-        let target = redirect_target(location)
-            .unwrap_or_else(|| "a target it did not name as an absolute URL".into());
-        bail!(
-            "{service} {method} {path} -> {status}: refused to follow a redirect to {target} \
-             (the machine client follows none; is the base pointed at an edge or another \
-             instance?)"
-        );
-    }
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!(
-            "{service} {method} {path} -> {status}: {}{}",
-            body.trim(),
-            ways_out(&body)
-        );
-    }
-    success_answer(&service, &method, path, status, &body)
-}
-
-/// The ways out a refusal names, one to a line under the body.
-///
-/// A refusal that lists `ways_out` is one the reader can only act on by
-/// reading them — the jobs API's answer to a `human_only` step completed
-/// without a passkey, which is what `boss step complete` meets on such a
-/// step since 2026-10-07 (item 570c66e9): no CLI carries a passkey. They
-/// sat inside one line of JSON, after the detail; they are printed again
-/// where a person at a terminal will see them. Empty for every other
-/// body, so no other refusal reads differently.
-fn ways_out(body: &str) -> String {
-    let Ok(parsed) = serde_json::from_str::<Value>(body) else {
-        return String::new();
-    };
-    let ways: Vec<&str> = parsed
-        .get("ways_out")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    if ways.is_empty() {
-        return String::new();
-    }
-    let head = if parsed.get("human_only") == Some(&Value::Bool(true)) {
-        "this step is human_only: it completes only on a passkey, which no CLI carries"
-    } else {
-        "the refusal names its ways out"
-    };
-    let mut text = format!("\n\n{head}. Ways out:");
-    for (i, way) in ways.iter().enumerate() {
-        text.push_str(&format!("\n  {}. {way}", i + 1));
-    }
-    text
-}
-
-/// A redirect's target as a refusal may name it: `scheme://host[:port]`,
-/// never its path, query or fragment. `None` for a relative or
-/// unparseable `Location`, which is then not echoed at all.
-pub(crate) fn redirect_target(location: Option<&str>) -> Option<String> {
-    let url = reqwest::Url::parse(location?.trim()).ok()?;
-    let host = url.host_str()?;
-    Some(match url.port() {
-        Some(port) => format!("{}://{host}:{port}", url.scheme()),
-        None => format!("{}://{host}", url.scheme()),
-    })
-}
-
-/// What a 2xx body answers — pure, so each rule is pinned without a
-/// socket.
-///
-/// A READ keeps its old contract: a body that is not JSON is `None`,
-/// and the reader decides — `train::rows` refuses it for a list, and a
-/// single-object read's `context` names it (backlog 7b7e0529).
-///
-/// A WRITE's success is its parsed answer, not its status (backlog
-/// 10776b6c). It used to get the same `None`, and a `None` is also what
-/// a 204 gives, so a write that met a proxy's login page — or anything
-/// else answering 200 in front of the jobs API — read as done while
-/// the write may never have reached the API: a silent false success,
-/// the worst shape this class takes. Which empty answers are real was
-/// MEASURED, not assumed: every jobs-API write handler answers either
-/// JSON or `204 No Content` (the job PUT, both metadata PATCHes, the
-/// step PUT, the registry DELETEs and the scheduling/sensor/station
-/// writes), so on every write method a 204 is a success and nothing
-/// else empty is. HEAD is a read. `service` is what the refusal calls
-/// the door it reached ([`service_at`], backlog 25a4f7f9).
-pub(crate) fn success_answer(
-    service: &str,
-    method: &reqwest::Method,
-    path: &str,
-    status: reqwest::StatusCode,
-    body: &str,
-) -> Result<Option<Value>> {
-    let write = !matches!(*method, reqwest::Method::GET | reqwest::Method::HEAD);
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        if !write || status == reqwest::StatusCode::NO_CONTENT {
-            return Ok(None);
-        }
-        bail!(
-            "{service} {method} {path} -> {status} with an empty body: a write's success is \
-             its answer, and only a 204 answers with nothing — the write may never have \
-             reached {service}"
-        );
-    }
-    match serde_json::from_str(trimmed) {
-        Ok(v) => Ok(Some(v)),
-        Err(_) if !write => Ok(None),
-        Err(_) => {
-            let cut: String = trimmed
-                .chars()
-                .take(crate::train::ROWS_REFUSAL_QUOTE)
-                .collect();
-            let more = if cut.len() < trimmed.len() { "…" } else { "" };
-            bail!(
-                "{service} {method} {path} -> {status}, but the body is not JSON, so the write \
-                 may never have reached {service} (a proxy's login page answers this way); \
-                 it answered: {cut}{more}"
-            )
-        }
-    }
-}
-
-/// Every open `ship-a-change` car, across ALL pages — the operator-verb
-/// counterpart to the conductor's `train::list_all_pages`, built on the
-/// `gate::api` client the CLI verbs speak through (a different client
-/// from the conductor's, which is why the boarding-pagination car could
-/// not fold these call sites into that helper directly).
-///
-/// A limit is not a filter (memory: a-limit-is-not-a-filter). Open cars
-/// build past a page — in-flight + parked + landed-but-unclosed residue —
-/// and the list is `ORDER BY opened_on DESC`, so a car opened days ago
-/// but touched today sorts to the tail. Read with a bare `limit=`, that
-/// car falls off page one and `boss receipt`/`rerail`/`channels` reported
-/// a car that exists as "not found" — a false negative that grows as
-/// closed cars accumulate. This pages on the response `total` via
-/// [`train::list_all_pages`] (whose page-two behaviour is pinned there)
-/// until every matching row is read.
-///
-/// `full=true`: its readers take the gate step's `receipt` and the
-/// review step's `hold` off these rows (`receipt::select_receipt`,
-/// `car_retire`), and the list's default is going slim — step metadata
-/// only when asked (backlog 9b473d4a).
-pub(crate) async fn all_open_cars(http: &boss_core::machine_token::Client) -> Result<Vec<Value>> {
-    crate::train::list_all_pages(|offset| async move {
-        api(
-            http,
-            reqwest::Method::GET,
-            &format!(
-                "/api/jobs?kind=ship-a-change&status=open&full=true&limit={}&offset={offset}",
-                crate::train::PAGE_LIMIT
-            ),
-            None,
-        )
-        .await
-    })
-    .await
-}
-
-/// EVERY `ship-a-change` car, open and closed, across all pages — for
-/// the readers that must see landed cars too: `boss prove` (its
-/// `--recheck` proves a CLOSED car) and `boss orient` (the shed is
-/// landed cars not yet proven; the stranded cross-ref needs every car's
-/// branch).
-///
-/// Paged on `total` through [`train::list_all_pages`], which REFUSES a
-/// page without one (backlog 10776b6c). Before this, `boss prove` read
-/// a missing total as 0 — one page then "covered" the whole population
-/// — and `boss orient` read one bare `limit=800` page and never compared
-/// it to `total`, so past 800 cars the oldest landed ones would have
-/// dropped out of the shed silently (417 cars on 2026-09-23). A page is
-/// 500 so today's population is still one call — the query and the
-/// page are [`all_cars_via`]'s, the one car read every verb shares.
-pub(crate) async fn all_cars_at(
-    http: &boss_core::machine_token::Client,
-    base: &str,
-) -> Result<Vec<Value>> {
-    all_cars_via(|path| async move { api_at(http, base, reqwest::Method::GET, &path, None).await })
-        .await
-}
-
-/// The one car query, paged on `total`, over whatever transport the
-/// caller reads through: `fetch` is handed each page's path and returns
-/// its body. [`all_cars_at`] hands it the signed jobs-API read; the
-/// census hands it its own client, which counts every call it reports
-/// as its cost — and until backlog 6cf47547 read one bare `limit=800`
-/// page it never compared to `total`. `full=true`: `boss prove` reads
-/// the proven step's `proof` and `fields`, and orient the review step's
-/// `hold`, off these rows (backlog 9b473d4a).
-pub(crate) async fn all_cars_via<F, Fut>(fetch: F) -> Result<Vec<Value>>
-where
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = Result<Option<Value>>>,
-{
-    const PAGE: usize = 500;
-    crate::train::list_all_pages(|offset| {
-        fetch(format!(
-            "/api/jobs?kind=ship-a-change&full=true&limit={PAGE}&offset={offset}"
-        ))
-    })
-    .await
-}
-
-/// [`all_cars_at`] against the resolved system of record.
-pub(crate) async fn all_cars(http: &boss_core::machine_token::Client) -> Result<Vec<Value>> {
-    all_cars_at(http, &jobs_base()?).await
-}
-
-/// The instant a step completed, in the one format every verb writes.
-///
-/// RFC3339, whole seconds, `Z`. Several verbs stamp `completed_at` — the
-/// conductor on the steps it completes, `boss park` on scope/build/gate,
-/// `boss prove` on proven, and now the dispatcher's auto-park handler —
-/// and cycle time is the difference between stamps written by
-/// *different* verbs. A format that varied by writer would still look
-/// right in every packet and only be wrong in the arithmetic, so it is
-/// defined ONCE, in `boss_jobs::car`, and everyone delegates here.
-pub(crate) fn stamp(now: chrono::DateTime<chrono::Utc>) -> String {
-    boss_jobs::car::stamp(now)
-}
-
 /// `git ls-remote` the branch so the packet records a real head.
 ///
 /// Falls back to the symbolic `origin/<branch>` rather than failing:
@@ -3600,7 +3446,7 @@ pub async fn withdraw(
     namespace: &str,
     dry: bool,
 ) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let packet = crate::job::fetch_and_resolve(&http, packet_ref).await?;
     let short = &packet[..8.min(packet.len())];
     let job = api(
@@ -3768,11 +3614,30 @@ pub async fn run(
     // With the worktree it is launched from, read once, here, before
     // anything moves (a3355e14).
     let toplevel = agent_run.is_some().then(launch_toplevel).flatten();
+    // A RUN NEVER GATES FROM THE SHARED CHECKOUT (backlog 916fe290):
+    // the harness drops a builder's leading `cd <worktree> &&`, so the
+    // gate would read this tree's manifest and stamp it as the run's
+    // worktree — the tree every door runs from. Refused before any
+    // packet, read only when a run is named (a hand gate pays nothing).
+    if agent_run.is_some() {
+        let here = std::env::current_dir().ok();
+        let checkout = here.as_deref().and_then(crate::shared_checkout::read);
+        if let Some(why) = crate::shared_checkout::refusal(
+            "boss gate",
+            std::env::var(AGENT_RUN_ENV).ok().as_deref(),
+            checkout.as_ref(),
+        ) {
+            bail!(why);
+        }
+    }
     let agent_run = with_worktree(agent_run, toplevel);
     if let Some(w) = no_run_warning(!park.is_empty(), agent_run.as_ref()) {
         eprintln!("{w}");
     }
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
+    // The trust marks on the items the park intent names, once read
+    // (never on a dry run, which reads no packet).
+    let mut trust_marks: Option<Vec<(&'static str, String, crate::trust_boundary::Mark)>> = None;
     // EVERY PACKET THE PARK INTENT NAMES MUST EXIST, checked here at the
     // terminal. The auto-park handler writes these as job edges on
     // green, and the edge guard refuses an unresolvable id — an hour
@@ -3893,6 +3758,10 @@ pub async fn run(
         if let Some(why) = crate::trust_boundary::gate_refusal(hold.as_deref(), &marks) {
             bail!("{why}");
         }
+        // Kept for the other half of option A, judged below once the
+        // diff is read: a --hold that neither the mark nor the judge
+        // requires (backlog bd331d38).
+        trust_marks = Some(marks);
     }
     // The concurrency bound: env override > delivery policy > compiled.
     // Fetched here, before the packet, so a bad env override refuses
@@ -4128,6 +3997,20 @@ pub async fn run(
     // and carries this reason after them.
     let (hold, hold_bound) = {
         let judged = crate::mutating_verb::judge(Path::new("."), &base_obs.base, &sha);
+        // ONLY THE TWO RULES HOLD A CAR (backlog bd331d38, option A): a
+        // --hold on a park whose item carries no mark and whose diff is
+        // no finding is refused here, before any packet is filed. A dry
+        // run read no item, so it has no marks to judge against.
+        if let Some(why) = trust_marks.as_deref().and_then(|marks| {
+            crate::trust_boundary::unrequired_hold_refusal(
+                hold.as_deref(),
+                !park.is_empty(),
+                marks,
+                &judged,
+            )
+        }) {
+            bail!("{why}");
+        }
         // A review hold — a --hold given, or a diff read and found — binds
         // to the head it judged; a hold that is only an unread diff does
         // not (backlog b7b02024, review F1).
@@ -4210,6 +4093,7 @@ pub async fn run(
         ahead,
         QUEUE_CAP,
         dock_count_or_say(dock_waiting_now(&http, now).await),
+        &trains_or_say(trains_waiting_now(&http, now).await),
     ) {
         Admission::Refuse(why) => bail!("{why}"),
         Admission::Queue => true,
@@ -4372,17 +4256,16 @@ pub async fn run(
     }
     // Stamp the hold the same way, for the same reasons: a PATCH that
     // merges onto a created or reused packet, closing what we created
-    // if the round-trip fails.
-    if let Some(reason) = hold.as_deref().filter(|_| !dry) {
+    // if the round-trip fails. What is stamped is the hold's own code
+    // (`mutating_verb::hold_stamp`, review 754a492b N1).
+    if let Some((reason, hold_stamp)) =
+        crate::mutating_verb::hold_stamp(hold.as_deref(), hold_bound, dry)
+    {
         if let Err(e) = api(
             &http,
             reqwest::Method::PATCH,
             &format!("/api/jobs/{packet}/metadata"),
-            Some(json!({
-                "hold": reason,
-                // Null deletes a stale mark on a reused packet.
-                boss_jobs::car::HOLD_UNBOUND: (!hold_bound).then_some(true),
-            })),
+            Some(hold_stamp),
         )
         .await
         .context("stamping the hold onto the gate-run")
@@ -4445,16 +4328,19 @@ pub async fn run(
             println!("boss gate: packet {packet} was launched as {name} while it waited");
             return wait_for_verdict(&http, &packet, namespace, &name, now).await;
         }
-        // The place is spent the moment a Job exists, and a run still
-        // marked queued would be missing from the yard's gate bays.
-        // Cleared BEFORE the Job is created: a failure here costs
-        // nothing (the place is still held, the packet still reusable),
-        // where a failure after it would hide a running gate.
+    }
+    // The place is spent the moment a Job exists, and a run still
+    // marked queued would be missing from the yard's gate bays and
+    // listed by orient as abandoned. Cleared BEFORE the Job is created:
+    // a failure here costs nothing (the place is still held, the packet
+    // still reusable), where a failure after it would hide a running
+    // gate. Owed by a reused packet too, whoever queued it (33e49b7d).
+    if let Some(release) = launch_queue_release(queued, reused).filter(|_| !dry) {
         api(
             &http,
             reqwest::Method::PATCH,
             &format!("/api/jobs/{packet}/metadata"),
-            Some(queue_clear_patch()),
+            Some(release),
         )
         .await
         .context("releasing the queue place before launching")?;
@@ -4595,19 +4481,41 @@ pub async fn run(
 /// path the kubelet cannot see retries every two minutes forever.
 pub(crate) const START_TOLERANCE: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How far apart two unstarted reads of the SAME pod must be before the
+/// wait refuses. One read is one answer from the API server, and on
+/// 2026-10-09 one answer refused a gate whose containers had been
+/// running for fourteen minutes (gate-run 124ee920, backlog 986843d1).
+/// The poll is 30 s, so a refusal now costs two or three reads.
+pub(crate) const START_CONFIRM: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// What the kubelet has to say about a gate pod that has a node but no
 /// running containers — read off the pod, not the events (the session
 /// could not read events until 27eacc14; conditions it always could).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct PodStart {
+    /// The pod this was read off (`metadata.name`), so a refusal names
+    /// it — a Job can list more than one.
+    pub pod: Option<String>,
     /// `PodScheduled=True` since this instant (RFC 3339), if at all.
     pub scheduled_at: Option<String>,
-    /// `PodReadyToStartContainers=True`, i.e. the sandbox and every
-    /// volume are up and the containers can start.
-    pub ready_to_start: bool,
+    /// The pod has started: any container (the postgres sidecar is an
+    /// init container) is running, has terminated, or says
+    /// `started: true`; or the phase is past Pending; or
+    /// `PodReadyToStartContainers=True`. ANY ONE is enough. Until
+    /// 986843d1 only the condition counted, so a read carrying running
+    /// containers and no such condition read as never started.
+    pub started: bool,
+    /// The `PodReadyToStartContainers` status as read, or `absent` —
+    /// the refusal says which, rather than asserting `False`.
+    pub ready_condition: String,
     /// Each container's `state.waiting.reason` (ContainerCreating,
     /// ErrImagePull, …) and message, for the record.
     pub waiting: Vec<String>,
+    /// What was judged, verbatim off the read: the pod's name, phase,
+    /// conditions and both container-status lists. A refusal stores it,
+    /// because the pod is deleted with the Job and 124ee920's refusal
+    /// kept only its prose.
+    pub judged: Value,
 }
 
 /// Has this pod been scheduled for longer than the tolerance without
@@ -4616,7 +4524,7 @@ pub(crate) fn unstarted_too_long(
     start: &PodStart,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<i64> {
-    if start.ready_to_start {
+    if start.started {
         return None;
     }
     let since = start
@@ -4627,6 +4535,61 @@ pub(crate) fn unstarted_too_long(
     (waited.num_seconds() >= START_TOLERANCE.as_secs() as i64).then(|| waited.num_minutes())
 }
 
+/// One unstarted read past the tolerance, held until a second confirms it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnstartedRead {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub start: PodStart,
+}
+
+/// What the wait does with this read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartJudgement {
+    /// Started, not yet scheduled, or within the tolerance: nothing held.
+    Clear,
+    /// Unstarted past the tolerance, not yet confirmed: hold this read.
+    Held(UnstartedRead),
+    /// Two reads of the same pod, `START_CONFIRM` apart, both unstarted
+    /// past the tolerance: refuse, carrying both.
+    Refuse {
+        minutes: i64,
+        first: UnstartedRead,
+        last: UnstartedRead,
+    },
+}
+
+/// Judge one read against the one held from before. Pure: the caller
+/// supplies "now". A started read clears what was held; a read of a
+/// DIFFERENT pod starts the count again, because the two reads did not
+/// look at the same thing.
+pub(crate) fn judge_start(
+    held: Option<UnstartedRead>,
+    start: &PodStart,
+    now: chrono::DateTime<chrono::Utc>,
+) -> StartJudgement {
+    let Some(minutes) = unstarted_too_long(start, now) else {
+        return StartJudgement::Clear;
+    };
+    let this = UnstartedRead {
+        at: now,
+        start: start.clone(),
+    };
+    match held {
+        Some(first) if first.start.pod == start.pod => {
+            if now.signed_duration_since(first.at).num_seconds() >= START_CONFIRM.as_secs() as i64 {
+                StartJudgement::Refuse {
+                    minutes,
+                    first,
+                    last: this,
+                }
+            } else {
+                StartJudgement::Held(first)
+            }
+        }
+        _ => StartJudgement::Held(this),
+    }
+}
+
 /// The receipt an unstarted gate records: a REFUSAL, the runner's own
 /// shape for "declined before any check ran" (`verdict: refused`,
 /// `refused_because`), so every reader that already spares the cars on a
@@ -4635,11 +4598,33 @@ pub(crate) fn unstarted_too_long(
 /// sat silent until `activeDeadlineSeconds` (three hours) failed the
 /// Job, and the wait then read that as a red (1661dd1e: the 9-hour
 /// gate-seed mount, d42d4967, was found by a human looking at a pod).
-pub(crate) fn unstarted_receipt(minutes: i64, start: &PodStart) -> Value {
-    let waiting = if start.waiting.is_empty() {
-        "no container state reported".to_string()
-    } else {
+pub(crate) fn unstarted_receipt(
+    minutes: i64,
+    first: &UnstartedRead,
+    last: &UnstartedRead,
+) -> Value {
+    let start = &last.start;
+    // NO STATE IS NOT A STATE. "no container state reported" read as
+    // the kubelet's account when it was only what one read carried
+    // (124ee920): say which it was.
+    let waiting = if !start.waiting.is_empty() {
         start.waiting.join("; ")
+    } else if start
+        .judged
+        .get("containerStatuses")
+        .is_some_and(|v| !v.is_null())
+    {
+        "container statuses were read, none of them waiting, running or terminated".to_string()
+    } else {
+        "the read carried no container statuses".to_string()
+    };
+    let pod = start.pod.as_deref().unwrap_or("(unnamed)");
+    let apart = last.at.signed_duration_since(first.at).num_seconds();
+    let read = |r: &UnstartedRead| {
+        json!({
+            "read_at": r.at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "pod": r.start.judged,
+        })
     };
     json!({
         "verdict": "refused",
@@ -4647,26 +4632,18 @@ pub(crate) fn unstarted_receipt(minutes: i64, start: &PodStart) -> Value {
         "mode": "",
         "fails": [],
         "refused_because": format!(
-            "the gate pod was scheduled {minutes} min ago and its containers never started \
-             (PodReadyToStartContainers=False) — a mount, image or sandbox the node could not \
-             provide, not a verdict on the branch. Container state: {waiting}. \
-             `kubectl -n boss-dev describe pod -l job-name=<job>` carries the kubelet's reason."
+            "the gate pod {pod} was scheduled {minutes} min ago and two reads {apart} s apart found \
+             no container running or terminated (PodReadyToStartContainers={cond}) — a mount, \
+             image or sandbox the node could not provide, not a verdict on the branch. \
+             Container state: {waiting}. The pod as read rides this receipt under `pod_reads`.",
+            cond = start.ready_condition,
         ),
+        "pod_reads": [read(first), read(last)],
     })
 }
 
-/// Parse `kubectl get pods -l job-name=<job> -o json` into the pod's
-/// start state. Absent pods (none created yet) read as default:
-/// unscheduled, so never "too long" — a pod that is not even scheduled
-/// is the queue's business, not this guard's.
-pub(crate) fn pod_start_from_json(pods: &Value) -> PodStart {
-    let Some(pod) = pods
-        .get("items")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-    else {
-        return PodStart::default();
-    };
+/// One pod's start state, off one item of a pod list.
+fn one_pod_start(pod: &Value) -> PodStart {
     let conds = pod
         .pointer("/status/conditions")
         .and_then(Value::as_array)
@@ -4682,13 +4659,33 @@ pub(crate) fn pod_start_from_json(pods: &Value) -> PodStart {
         .and_then(|c| c.get("lastTransitionTime"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let ready_to_start = cond("PodReadyToStartContainers")
-        .is_some_and(|c| c.get("status").and_then(Value::as_str) == Some("True"));
-    let waiting = pod
-        .pointer("/status/containerStatuses")
-        .and_then(Value::as_array)
-        .into_iter()
+    let ready_condition = cond("PodReadyToStartContainers")
+        .and_then(|c| c.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("absent")
+        .to_string();
+    // The postgres sidecar is a native sidecar, so its status rides
+    // initContainerStatuses; 124ee920's events show it Started first.
+    let containers: Vec<&Value> = ["/status/initContainerStatuses", "/status/containerStatuses"]
+        .iter()
+        .filter_map(|p| pod.pointer(p).and_then(Value::as_array))
         .flatten()
+        .collect();
+    let container_started = |c: &&Value| {
+        c.pointer("/state/running").is_some()
+            || c.pointer("/state/terminated").is_some()
+            || c.pointer("/lastState/terminated").is_some()
+            || c.get("started").and_then(Value::as_bool) == Some(true)
+    };
+    let phase = pod
+        .pointer("/status/phase")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let started = ready_condition == "True"
+        || matches!(phase, "Running" | "Succeeded" | "Failed")
+        || containers.iter().any(container_started);
+    let waiting = containers
+        .iter()
         .filter_map(|c| {
             let name = c.get("name").and_then(Value::as_str).unwrap_or("?");
             let w = c.pointer("/state/waiting")?;
@@ -4701,11 +4698,55 @@ pub(crate) fn pod_start_from_json(pods: &Value) -> PodStart {
             })
         })
         .collect();
+    let name = pod
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let field = |p: &str| pod.pointer(p).cloned().unwrap_or(Value::Null);
     PodStart {
+        judged: json!({
+            "name": name,
+            "phase": field("/status/phase"),
+            "conditions": field("/status/conditions"),
+            "initContainerStatuses": field("/status/initContainerStatuses"),
+            "containerStatuses": field("/status/containerStatuses"),
+        }),
+        pod: name,
         scheduled_at,
-        ready_to_start,
+        started,
+        ready_condition,
         waiting,
     }
+}
+
+/// Parse `kubectl get pods -l job-name=<job> -o json` into the Job's
+/// start state. Absent pods (none created yet) read as default:
+/// unscheduled, so never "too long" — a pod that is not even scheduled
+/// is the queue's business, not this guard's.
+///
+/// EVERY POD THE JOB LISTS, NOT THE FIRST. This read only `items[0]`
+/// until 986843d1, so a list with a stale or replacement pod first
+/// judged the wrong one. Any started pod makes the Job started; failing
+/// that, the most recently scheduled pod is judged, because it has
+/// waited least.
+pub(crate) fn pod_start_from_json(pods: &Value) -> PodStart {
+    let all: Vec<PodStart> = pods
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(one_pod_start)
+        .collect();
+    let scheduled = |s: &PodStart| {
+        s.scheduled_at
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+    };
+    all.iter()
+        .find(|s| s.started)
+        .or_else(|| all.iter().max_by_key(|s| scheduled(s)))
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub(crate) fn silent_packet_verdict(job_finished: bool, job_failed: bool) -> Option<String> {
@@ -5012,6 +5053,9 @@ async fn wait_for_verdict(
     // The conductor's note that it cannot read the gate Jobs, as last
     // printed here (backlog 06ae925a): said when it appears or changes.
     let mut recorder_blocked: Option<String> = None;
+    // The first unstarted read past the tolerance, waiting for a second
+    // to confirm it (986843d1).
+    let mut unstarted_held: Option<UnstartedRead> = None;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         let fetched = match api(
@@ -5123,9 +5167,23 @@ async fn wait_for_verdict(
         // human reading a pod (1661dd1e, d42d4967). Past the tolerance
         // the wait records the runner's own refusal shape on the packet,
         // frees the slot, and says what it is.
+        //
+        // ONE READ IS NOT A REFUSAL. On 2026-10-09 one read refused a
+        // gate whose containers had run for fourteen minutes and deleted
+        // it (124ee920, backlog 986843d1); a refusal now takes two
+        // unstarted reads of the same pod START_CONFIRM apart, and
+        // carries both.
         let start = pod_start(namespace, job_name);
-        if let Some(minutes) = unstarted_too_long(&start, wall_now()) {
-            let receipt = unstarted_receipt(minutes, &start);
+        let judged = judge_start(unstarted_held.take(), &start, wall_now());
+        if let StartJudgement::Held(read) = judged {
+            unstarted_held = Some(read);
+        } else if let StartJudgement::Refuse {
+            minutes,
+            first,
+            last,
+        } = judged
+        {
+            let receipt = unstarted_receipt(minutes, &first, &last);
             let why = receipt["refused_because"]
                 .as_str()
                 .unwrap_or_default()
@@ -5243,6 +5301,8 @@ async fn wait_for_slot(
     let mut reported: Option<usize> = None;
     let mut dock_reported = 0;
     let mut dock_uncounted = false;
+    let mut trains_reported: Vec<String> = Vec::new();
+    let mut trains_uncounted = false;
     loop {
         tokio::time::sleep(QUEUE_POLL).await;
         // `now` is minted once at the CLI boundary (the no-wallclock
@@ -5336,8 +5396,32 @@ async fn wait_for_slot(
             }
             dock_reported = dock;
         }
+        // A waiting train goes before the dock and the whole line
+        // (design 1e787fc2), said and counted the same way.
+        let trains = match trains_waiting_now(http, at).await {
+            Ok(t) => {
+                trains_uncounted = false;
+                t
+            }
+            Err(why) => {
+                if !trains_uncounted {
+                    eprintln!("boss gate: {why}");
+                }
+                trains_uncounted = true;
+                Vec::new()
+            }
+        };
+        if trains != trains_reported {
+            if !trains.is_empty() {
+                println!(
+                    "boss gate: {} waiting for the next bay — a train goes first (design 1e787fc2)",
+                    trains.join(", ")
+                );
+            }
+            trains_reported = trains.clone();
+        }
         match order.iter().position(|id| id == packet) {
-            Some(pos) if may_launch(live.len(), dock, max, pos) => {
+            Some(pos) if may_launch(live.len(), trains.len() + dock, max, pos) => {
                 println!(
                     "boss gate: a slot freed after {}m — launching {branch} (packet {})",
                     started.elapsed().as_secs() / 60,
@@ -5552,31 +5636,6 @@ fn job_names(table: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// What the operator meets first on a human-only step: the jobs
-    /// API's refusal, with its two ways out printed one to a line.
-    #[test]
-    fn a_human_only_refusal_prints_its_ways_out_under_the_body() {
-        let body = json!({
-            "error": "step requires stronger assurance than this request carries",
-            "required": "presence",
-            "human_only": true,
-            "ways_out": ["complete it from a surface", "give the step a sign-off role"],
-        })
-        .to_string();
-        let said = ways_out(&body);
-        assert!(said.contains("human_only"), "{said}");
-        assert!(said.contains("passkey"), "{said}");
-        assert!(said.contains("\n  1. complete it from a surface"), "{said}");
-        assert!(
-            said.contains("\n  2. give the step a sign-off role"),
-            "{said}"
-        );
-        // Every other refusal reads exactly as it did.
-        assert_eq!(ways_out(r#"{"error":"sign-offs incomplete"}"#), "");
-        assert_eq!(ways_out("step not found"), "");
-        assert_eq!(ways_out(r#"{"ways_out":[]}"#), "");
-    }
-
     /// Backlog b24e29cb item 1. The conductor settles an orphan with no
     /// atomic claim on the packet, so a reused packet can be closed
     /// `lost` in the gap between this verb's `launching_at` stamp and its
@@ -5731,6 +5790,15 @@ mod tests {
         let filing = at("all_open_cars(&http)");
         assert!(read < design && design < refusal, "reads, then the refusal");
         assert!(refusal < filing, "the refusal precedes the filing");
+        // Option A's half (backlog bd331d38): a --hold no rule requires is
+        // judged once the diff is, and still before the packet is filed.
+        let judge = at("crate::mutating_verb::judge(Path::new(\".\"), &base_obs.base, &sha)");
+        let unrequired = at("crate::trust_boundary::unrequired_hold_refusal(");
+        let packet = at("let packet = match reuse");
+        assert!(
+            refusal < judge && judge < unrequired && unrequired < packet,
+            "marks read, diff judged, then the refusal, then the packet"
+        );
     }
 
     /// A pod scheduled but never started is an infrastructure refusal
@@ -5748,8 +5816,8 @@ mod tests {
         };
         let stuck = PodStart {
             scheduled_at: at(600),
-            ready_to_start: false,
             waiting: vec!["gate: ContainerCreating".into()],
+            ..PodStart::default()
         };
         assert_eq!(
             unstarted_too_long(&stuck, now),
@@ -5766,7 +5834,7 @@ mod tests {
             "90 s is a normal mount"
         );
         let started = PodStart {
-            ready_to_start: true,
+            started: true,
             ..stuck.clone()
         };
         assert_eq!(
@@ -5786,24 +5854,161 @@ mod tests {
     /// that spares the cars on `refused` spares these too.
     #[test]
     fn an_unstarted_gate_records_a_refusal_not_a_red() {
-        let start = PodStart {
-            scheduled_at: None,
-            ready_to_start: false,
-            waiting: vec!["gate: ContainerCreating".into()],
+        let pods = json!({"items": [{
+            "metadata": {"name": "gate-x-abcde"},
+            "status": {
+                "phase": "Pending",
+                "conditions": [
+                    {"type": "PodReadyToStartContainers", "status": "False"},
+                    {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-09-12T04:21:30Z"}
+                ],
+                "containerStatuses": [
+                    {"name": "gate", "state": {"waiting": {"reason": "ContainerCreating"}}}
+                ]
+            }
+        }]});
+        let start = pod_start_from_json(&pods);
+        let t0 = chrono::Utc::now();
+        let first = UnstartedRead {
+            at: t0,
+            start: start.clone(),
         };
-        let r = unstarted_receipt(12, &start);
+        let last = UnstartedRead {
+            at: t0 + chrono::Duration::seconds(60),
+            start,
+        };
+        let r = unstarted_receipt(12, &first, &last);
         assert_eq!(r["verdict"], "refused");
         assert_eq!(r["fails"], json!([]), "a refusal fails no check");
         let why = r["refused_because"].as_str().unwrap();
         assert!(
-            why.contains("12 min") && why.contains("never started"),
+            why.contains("12 min") && why.contains("two reads 60 s apart"),
             "{why}"
+        );
+        assert!(why.contains("gate-x-abcde"), "it names the pod: {why}");
+        assert!(
+            why.contains("PodReadyToStartContainers=False"),
+            "the condition as read: {why}"
         );
         assert!(
             why.contains("gate: ContainerCreating"),
             "the container state rides the record: {why}"
         );
         assert!(why.contains("not a verdict on the branch"), "{why}");
+        // THE POD AS JUDGED RIDES THE RECEIPT (986843d1): the pod dies
+        // with the Job, so the receipt is the only copy of what was read.
+        let reads = r["pod_reads"].as_array().expect("pod_reads");
+        assert_eq!(reads.len(), 2, "both reads: {r}");
+        assert_eq!(reads[1]["pod"]["name"], "gate-x-abcde");
+        assert_eq!(
+            reads[1]["pod"]["containerStatuses"][0]["state"]["waiting"]["reason"],
+            "ContainerCreating"
+        );
+        assert_eq!(
+            reads[0]["pod"]["conditions"][0]["type"],
+            "PodReadyToStartContainers"
+        );
+    }
+
+    /// A read that carried no container statuses says THAT — never "no
+    /// container state reported", which read as the kubelet's account
+    /// on 124ee920 when it was only what one read held — and an absent
+    /// condition is named absent, not False.
+    #[test]
+    fn a_refusal_says_what_the_read_carried_not_what_it_lacked() {
+        let pods = json!({"items": [{
+            "metadata": {"name": "gate-y-fghij"},
+            "status": {"conditions": [
+                {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-09-12T04:21:30Z"}
+            ]}
+        }]});
+        let start = pod_start_from_json(&pods);
+        assert!(!start.started, "{start:?}");
+        let read = UnstartedRead {
+            at: chrono::Utc::now(),
+            start,
+        };
+        let why = unstarted_receipt(9, &read, &read)["refused_because"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!why.contains("no container state reported"), "{why}");
+        assert!(
+            why.contains("the read carried no container statuses"),
+            "{why}"
+        );
+        assert!(why.contains("PodReadyToStartContainers=absent"), "{why}");
+    }
+
+    /// ONE READ IS NOT A REFUSAL. A first unstarted read past the
+    /// tolerance is held; a second read of the SAME pod START_CONFIRM
+    /// later refuses; a started read in between clears the hold; a read
+    /// of a different pod starts the count again (986843d1).
+    #[test]
+    fn an_unstarted_refusal_takes_two_reads_a_minute_apart() {
+        let t0 = chrono::Utc::now();
+        let stuck = |pod: &str| PodStart {
+            pod: Some(pod.into()),
+            scheduled_at: Some(
+                (t0 - chrono::Duration::minutes(14))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ),
+            ..PodStart::default()
+        };
+        let secs = chrono::Duration::seconds;
+        let StartJudgement::Held(first) = judge_start(None, &stuck("a"), t0) else {
+            panic!("the first unstarted read is held, not refused");
+        };
+        assert_eq!(first.at, t0);
+        assert_eq!(
+            judge_start(Some(first.clone()), &stuck("a"), t0 + secs(30)),
+            StartJudgement::Held(first.clone()),
+            "30 s later is not yet a confirmation, and the first read is kept"
+        );
+        let StartJudgement::Refuse {
+            minutes,
+            first: f,
+            last,
+        } = judge_start(Some(first.clone()), &stuck("a"), t0 + secs(60))
+        else {
+            panic!("a second read a minute later refuses");
+        };
+        assert_eq!((minutes, f.at, last.at), (15, t0, t0 + secs(60)));
+        let running = PodStart {
+            started: true,
+            ..stuck("a")
+        };
+        assert_eq!(
+            judge_start(Some(first.clone()), &running, t0 + secs(60)),
+            StartJudgement::Clear,
+            "a started read clears the hold"
+        );
+        let StartJudgement::Held(other) =
+            judge_start(Some(first.clone()), &stuck("b"), t0 + secs(90))
+        else {
+            panic!("a different pod is a new first read");
+        };
+        assert_eq!(
+            (other.at, other.start.pod.as_deref()),
+            (t0 + secs(90), Some("b"))
+        );
+    }
+
+    /// The wait refuses only through `judge_start`: no bare
+    /// `unstarted_too_long` call may decide a refusal on one read again.
+    #[test]
+    fn the_wait_refuses_an_unstarted_pod_only_through_the_confirmation() {
+        let src = include_str!("gate.rs");
+        let start = src
+            .find("\nasync fn wait_for_verdict(")
+            .expect("fn wait_for_verdict");
+        let end = start + src[start..].find("\nfn pod_start(").expect("fn after");
+        let body = &src[start..end];
+        assert!(body.contains("judge_start(unstarted_held.take()"), "{body}");
+        assert!(
+            !body.contains("unstarted_too_long("),
+            "one read decides nothing"
+        );
     }
 
     /// The kubelet's account is read off the pod's conditions and
@@ -5824,7 +6029,8 @@ mod tests {
         }]});
         let s = pod_start_from_json(&pods);
         assert_eq!(s.scheduled_at.as_deref(), Some("2026-09-12T04:21:30Z"));
-        assert!(!s.ready_to_start);
+        assert!(!s.started);
+        assert_eq!(s.ready_condition, "False");
         assert_eq!(
             s.waiting,
             vec!["gate: ContainerCreating", "pg: ContainerCreating"]
@@ -5837,7 +6043,105 @@ mod tests {
             {"type": "PodReadyToStartContainers", "status": "True"},
             {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-09-12T04:21:30Z"}
         ]}}]});
-        assert!(pod_start_from_json(&running).ready_to_start);
+        assert!(pod_start_from_json(&running).started);
+    }
+
+    /// ANY ONE SIGN IS THE START. A terminated container, a container
+    /// saying `started: true` with no state yet, or a phase past Pending
+    /// each mean the containers came up, with or without the condition.
+    #[test]
+    fn any_container_that_ran_is_the_start() {
+        let pod = |status: Value| {
+            json!({"items": [{"status": status.as_object().cloned().map(|mut m| {
+                m.insert("conditions".into(), json!([
+                    {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-09-12T04:21:30Z"}
+                ]));
+                Value::Object(m)
+            })}]})
+        };
+        let terminated = pod(json!({"containerStatuses": [
+            {"name": "gate", "state": {"terminated": {"exitCode": 0}}}
+        ]}));
+        assert!(pod_start_from_json(&terminated).started, "terminated");
+        let flagged = pod(json!({"containerStatuses": [
+            {"name": "gate", "started": true, "state": {}}
+        ]}));
+        assert!(pod_start_from_json(&flagged).started, "started: true");
+        let sidecar = pod(json!({"initContainerStatuses": [
+            {"name": "postgres", "state": {"running": {"startedAt": "2026-10-09T00:12:54Z"}}}
+        ]}));
+        assert!(pod_start_from_json(&sidecar).started, "the sidecar ran");
+        let phase = pod(json!({"phase": "Running"}));
+        assert!(pod_start_from_json(&phase).started, "phase Running");
+        let pending = pod(json!({"phase": "Pending", "containerStatuses": [
+            {"name": "gate", "state": {"waiting": {"reason": "ContainerCreating"}}}
+        ]}));
+        assert!(!pod_start_from_json(&pending).started, "control: pending");
+    }
+
+    /// EVERY POD, NOT THE FIRST. A Job listing an unstarted pod first and
+    /// a running one second is started, and the refusal names the pod it
+    /// judged (986843d1: this read `items[0]` only).
+    #[test]
+    fn a_two_pod_job_is_judged_on_every_pod() {
+        let sched =
+            |t: &str| json!([{"type": "PodScheduled", "status": "True", "lastTransitionTime": t}]);
+        let stuck = |name: &str, t: &str| json!({"metadata": {"name": name}, "status": {"phase": "Pending", "conditions": sched(t)}});
+        let running = json!({"metadata": {"name": "gate-b"}, "status": {
+            "conditions": sched("2026-10-09T00:12:50Z"),
+            "containerStatuses": [{"name": "gate", "state": {"running": {}}}]
+        }});
+        let s = pod_start_from_json(&json!({"items": [
+            stuck("gate-a", "2026-10-09T00:00:00Z"), running
+        ]}));
+        assert!(s.started, "{s:?}");
+        assert_eq!(s.pod.as_deref(), Some("gate-b"));
+        // Neither started: the most recently scheduled pod is judged,
+        // because it has waited least.
+        let s = pod_start_from_json(&json!({"items": [
+            stuck("gate-new", "2026-10-09T00:20:00Z"), stuck("gate-old", "2026-10-09T00:00:00Z")
+        ]}));
+        assert_eq!(s.pod.as_deref(), Some("gate-new"));
+        assert_eq!(s.judged["name"], "gate-new");
+    }
+
+    /// Gate-run 124ee920 (backlog 986843d1, 2026-10-09): the pod's own
+    /// events said postgres Started 00:12:54Z and the gate container
+    /// 00:13:00Z, and at 00:27Z the wait refused it as never started and
+    /// deleted the Job — fourteen minutes of a running gate thrown away.
+    /// The read it judged is lost; this is the shape that refuses it on
+    /// origin/main: scheduled fourteen minutes ago, no
+    /// PodReadyToStartContainers condition at all, both containers
+    /// running. A running container is the start, whatever the
+    /// conditions say.
+    #[test]
+    fn a_pod_whose_containers_run_is_started_without_the_condition() {
+        let now = chrono::Utc::now();
+        let scheduled = (now - chrono::Duration::minutes(14))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let pods = json!({"items": [{
+            "metadata": {"name": "gate-fix-a-launched-harne-xvr9f-4lsld"},
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    {"type": "PodScheduled", "status": "True", "lastTransitionTime": scheduled}
+                ],
+                "initContainerStatuses": [
+                    {"name": "postgres", "started": true,
+                     "state": {"running": {"startedAt": "2026-10-09T00:12:54Z"}}}
+                ],
+                "containerStatuses": [
+                    {"name": "gate", "started": true,
+                     "state": {"running": {"startedAt": "2026-10-09T00:13:00Z"}}}
+                ]
+            }
+        }]});
+        let s = pod_start_from_json(&pods);
+        assert_eq!(
+            unstarted_too_long(&s, now),
+            None,
+            "a pod with running containers is never refused as unstarted: {s:?}"
+        );
     }
 
     fn park_full() -> ParkIntent {
@@ -6692,12 +6996,15 @@ mod tests {
         p.require_complete().expect("epochs compare");
     }
 
-    /// ONE FACT PER CALLER PER PROCESS, SAID WHERE THE PROBE IS TYPED
-    /// (backlog ce72aea9). Unlike the shape below it this one fails OPEN,
-    /// and it is still a warning: the text of an absence claim and of a
-    /// presence claim over the same facts is the same text.
+    /// ONE FACT PER CALLER PER PROCESS, REFUSED WHERE THE PROBE IS TYPED
+    /// (backlog 5605c2b5). It was a warning here (ce72aea9) because the
+    /// text of an absence claim and of a presence claim is the same text;
+    /// all ten false proofs measured were parked past that warning, and
+    /// the unattended door now refuses the shape outright (d3312446), so
+    /// a car parked with it could never be proven by the machine anyway.
+    /// Re-parking is free; a landed car is not.
     #[test]
-    fn a_park_probe_that_clears_a_caller_from_the_gate_log_alone_is_warned_about() {
+    fn a_park_probe_that_clears_a_caller_from_the_gate_log_alone_is_refused() {
         // Car f636c71b's first window read, as gate-run 6715ffbd admitted
         // it at this door without a word (backlog ce72aea9).
         let log = r#"bad=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --argjson cut "$cut" '
@@ -6713,18 +7020,27 @@ if [ "$bad" -gt 0 ]; then echo "FAILED: $bad would-refuse fact(s)"; exit 1; fi
         let mut p = park_full();
         p.probe = Some(log.into());
         p.expect = Some("claim:ok".into());
+        let e = p.require_complete().unwrap_err().to_string();
         assert!(
-            p.require_complete().is_ok(),
-            "a warning must not become a refusal: {:?}",
-            p.require_complete()
+            e.starts_with("--park-probe CLEARS A CALLER FROM THE GATE LOG ALONE"),
+            "{e}"
         );
-        let said = p.probe_warnings();
         assert!(
-            said.iter().any(|w| w.starts_with(
-                "boss gate: --park-probe THIS PROBE CLEARS A CALLER FROM THE GATE LOG ALONE"
-            )),
-            "{said:?}"
+            e.contains("machine_gate.would_refuse"),
+            "names the kind: {e}"
         );
+        assert!(
+            e.contains(boss_jobs::probe::GATE_LOG_ALONE_EVIDENCE),
+            "quotes the one evidence text, which carries the live reading: {e}"
+        );
+        // A PRESENCE claim has a way through, and it is named whole.
+        assert!(e.contains("--park-proof-event"), "{e}");
+        assert!(
+            e.contains(&boss_jobs::probe::hand_proof_command("<car>")),
+            "{e}"
+        );
+        // The rule the predicate is the unattended door's own.
+        assert!(e.contains(boss_jobs::probe::GATE_LOG_ALONE_RULE), "{e}");
         // The probe the same-head re-gate (ac6706d3) carried — the live
         // tally's rows read under the log — is admitted in silence.
         let mut fixed = park_full();
@@ -6733,7 +7049,7 @@ if [ "$bad" -gt 0 ]; then echo "FAILED: $bad would-refuse fact(s)"; exit 1; fi
             r#"live=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --argjson cut "$cut" '
   def epoch: sub("\\.[0-9]+"; "") | fromdateiso8601;
   ([ .live[]? | select(.service == "jobs") ] | first) as $j
-  | if $j == null or $j.error != null or (($j.snapshot.rows | type) != "array") or (($j.snapshot.overflow // 0) != 0) then "unreadable"
+  | if $j == null or $j.error != null or (($j.snapshot.rows | type) != "array") or $j.snapshot.overflow != 0 or $j.snapshot.mode == "off" or ($j.snapshot.recording_since | epoch) > $cut then "unreadable"
     else ([ $j.snapshot.rows[] | select(.user == "automation:discover-admission-source" and .presented == "none") | select((.last_seen | epoch) > $cut) ] | length | tostring) end')
 case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally could not be read whole'; exit 75;; esac
 if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
@@ -6741,10 +7057,44 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
         ));
         fixed.expect = Some("claim:ok".into());
         assert!(
+            fixed.require_complete().is_ok(),
+            "{:?}",
+            fixed.require_complete()
+        );
+        assert!(
             fixed.probe_warnings().is_empty(),
             "{:?}",
             fixed.probe_warnings()
         );
+    }
+
+    /// A PROBE THAT PINS BYTES IS REFUSED AT PARK (backlog 2770eba8):
+    /// car 1ef711ce pinned 55 blob ids, answered not-yet at its own
+    /// rerailed head, and would answer FAILING on correct code after the
+    /// squash. The behavioural probe beside it is admitted.
+    #[test]
+    fn a_park_probe_that_pins_a_blob_id_is_refused() {
+        let mut p = park_full();
+        p.probe = Some(
+            "b=$(git rev-parse 'HEAD:Cargo.lock') || exit 75; \
+             [ \"$b\" = 1383df753778f96d04a1bde6fec53f1abbb01455 ] && echo pinned"
+                .into(),
+        );
+        p.expect = Some("pinned".into());
+        let e = p.require_complete().unwrap_err().to_string();
+        assert!(e.starts_with("--park-probe PINS A FILE'S BYTES"), "{e}");
+        assert!(
+            e.contains("git rev-parse <ref>:<path>"),
+            "names the read: {e}"
+        );
+        assert!(e.contains(boss_jobs::probe::PINNED_BYTES_EVIDENCE), "{e}");
+        assert!(e.contains(boss_jobs::probe::PINNED_BYTES_RULE), "{e}");
+        p.probe = Some(
+            "n=$(git show HEAD:crates/core/boss-jobs/src/probe.rs | grep -c '^pub fn pins_file_bytes(') \
+             ; [ \"$n\" = 1 ] && echo pinned"
+                .into(),
+        );
+        assert!(p.require_complete().is_ok(), "{:?}", p.require_complete());
     }
 
     /// THE SHAPE THAT COULD NOT PASS, NAMED AT THE DOOR THAT ADMITTED IT
@@ -7703,7 +8053,8 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
                 true,
                 0,
                 QUEUE_CAP,
-                0
+                0,
+                &[]
             ),
             Admission::Launch
         ));
@@ -7716,7 +8067,7 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
         let live = vec!["gate-a".to_string(), "gate-b".into(), "gate-c".into()];
         assert!(
             matches!(
-                admission(&live, 3, false, "m.yaml", true, 0, QUEUE_CAP, 0),
+                admission(&live, 3, false, "m.yaml", true, 0, QUEUE_CAP, 0, &[]),
                 Admission::Queue
             ),
             "at the bound with --wait the gate takes a place in line"
@@ -7730,7 +8081,8 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
     #[test]
     fn the_bound_refuses_a_caller_that_cannot_hold_its_place() {
         let live = vec!["gate-a".to_string(), "gate-b".into(), "gate-c".into()];
-        let Admission::Refuse(why) = admission(&live, 3, false, "m.yaml", false, 0, QUEUE_CAP, 0)
+        let Admission::Refuse(why) =
+            admission(&live, 3, false, "m.yaml", false, 0, QUEUE_CAP, 0, &[])
         else {
             panic!("without --wait there is no process to launch the queued run")
         };
@@ -7748,9 +8100,17 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
     #[test]
     fn a_full_queue_refuses_rather_than_growing_without_bound() {
         let live = vec!["gate-a".to_string(), "gate-b".into(), "gate-c".into()];
-        let Admission::Refuse(why) =
-            admission(&live, 3, false, "m.yaml", true, QUEUE_CAP, QUEUE_CAP, 0)
-        else {
+        let Admission::Refuse(why) = admission(
+            &live,
+            3,
+            false,
+            "m.yaml",
+            true,
+            QUEUE_CAP,
+            QUEUE_CAP,
+            0,
+            &[],
+        ) else {
             panic!("a full queue refuses")
         };
         assert!(why.contains(&QUEUE_CAP.to_string()), "name the cap: {why}");
@@ -7760,7 +8120,17 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
         );
         // One below the cap still queues.
         assert!(matches!(
-            admission(&live, 3, false, "m.yaml", true, QUEUE_CAP - 1, QUEUE_CAP, 0),
+            admission(
+                &live,
+                3,
+                false,
+                "m.yaml",
+                true,
+                QUEUE_CAP - 1,
+                QUEUE_CAP,
+                0,
+                &[]
+            ),
             Admission::Queue
         ));
     }
@@ -7779,6 +8149,7 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
             0,
             QUEUE_CAP,
             0,
+            &[],
         ) else {
             panic!("a shared workspace beside a live gate refuses")
         };
@@ -7786,7 +8157,7 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
         assert!(why.contains("2026-08-24"), "{why}");
         // Alone, the legacy shape still gates.
         assert!(matches!(
-            admission(&[], 3, true, "old-runner.yaml", true, 0, QUEUE_CAP, 0),
+            admission(&[], 3, true, "old-runner.yaml", true, 0, QUEUE_CAP, 0, &[]),
             Admission::Launch
         ));
     }
@@ -7863,6 +8234,62 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
             "metadata": { "branch": "feat/x", QUEUE_HEARTBEAT_AT: "2026-09-08T19:59:40Z" } });
         assert!(queue_order(std::slice::from_ref(&released), now, QUEUE_PLACE_TTL_SECS).is_empty());
         assert!(abandoned_places(&[released], now, QUEUE_PLACE_TTL_SECS).is_empty());
+    }
+
+    /// A REUSED PACKET LAUNCHED AT ONCE RELEASES THE DEAD WAITER'S PLACE
+    /// (backlog 33e49b7d). Measured 2026-10-09 01:54Z: gate-run 32b92f9b
+    /// was queued by a waiter whose session ended ~01:20Z; at 01:25Z a
+    /// drain session re-ran the same `boss gate`, reused the packet,
+    /// found a free bay and launched it. The release was written only on
+    /// the path where THIS process queued, so the dead waiter's marker
+    /// survived the launch, and orient listed a RUNNING gate under
+    /// ABANDONED with a re-gate line that would have raced a second Job
+    /// onto it. The fixture is that packet's shape, stamps verbatim.
+    #[test]
+    fn a_reused_packet_launched_at_once_releases_the_dead_waiters_place() {
+        let mut packet = json!({ "id": "32b92f9b",
+            "metadata": {
+                "branch": "fix/an-actor-role-excuse-is-bound-to-the-launch-roster-that-made-it",
+                "sha": "0448698f",
+                QUEUED_AT: "2026-10-09T01:09:42Z",
+                QUEUE_HEARTBEAT_AT: "2026-10-09T01:20:30Z",
+                LAUNCHING_AT: "2026-10-09T01:25:09Z",
+            } });
+        let now = at("2026-10-09T01:54:00Z");
+        // The defect's shape, as orient read it: abandoned, while running.
+        assert_eq!(
+            abandoned_places(std::slice::from_ref(&packet), now, QUEUE_PLACE_TTL_SECS).len(),
+            1,
+            "the fixture must be the shape orient misread"
+        );
+        // This process did not queue — the bay was free — but the packet
+        // was reused, so it may carry a marker it did not write.
+        let release = launch_queue_release(false, true)
+            .expect("a reused packet's launch releases any place it carries");
+        assert_eq!(release, queue_clear_patch());
+        // Merge it the way the metadata PATCH does: null deletes a key.
+        let md = packet["metadata"]
+            .as_object_mut()
+            .expect("fixture metadata");
+        for (k, v) in release.as_object().expect("a patch is an object") {
+            if v.is_null() {
+                md.remove(k);
+            } else {
+                md.insert(k.clone(), v.clone());
+            }
+        }
+        md.insert(LAUNCHED_AT.to_string(), json!("2026-10-09T01:25:13Z"));
+        assert!(
+            abandoned_places(std::slice::from_ref(&packet), now, QUEUE_PLACE_TTL_SECS).is_empty(),
+            "a launched run is not an abandoned place: {packet}"
+        );
+        assert!(queue_order(std::slice::from_ref(&packet), now, QUEUE_PLACE_TTL_SECS).is_empty());
+        // The paths that already held: a queued launch releases its own
+        // place, and a fresh packet launched at once carries none to
+        // release, so it pays no extra round-trip.
+        assert_eq!(launch_queue_release(true, false), Some(queue_clear_patch()));
+        assert_eq!(launch_queue_release(true, true), Some(queue_clear_patch()));
+        assert_eq!(launch_queue_release(false, false), None);
     }
 
     /// A PLACE HELD BY A DEAD SESSION EXPIRES. This is the orphan the
@@ -8130,22 +8557,33 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
         let live = vec!["gate-a".to_string(), "gate-b".into()];
         assert!(
             matches!(
-                admission(&live, 3, false, "m.yaml", true, 0, QUEUE_CAP, 1),
+                admission(&live, 3, false, "m.yaml", true, 0, QUEUE_CAP, 1, &[]),
                 Admission::Queue
             ),
             "the free slot is the dock's: a waiting builder queues"
         );
-        let Admission::Refuse(why) = admission(&live, 3, false, "m.yaml", false, 0, QUEUE_CAP, 1)
+        let Admission::Refuse(why) =
+            admission(&live, 3, false, "m.yaml", false, 0, QUEUE_CAP, 1, &[])
         else {
             panic!("without --wait there is no process to hold the place")
         };
         assert!(why.contains("dock"), "the refusal names the dock: {why}");
         assert!(
             matches!(
-                admission(&live, 3, false, "m.yaml", true, 0, QUEUE_CAP, 0),
+                admission(&live, 3, false, "m.yaml", true, 0, QUEUE_CAP, 0, &[]),
                 Admission::Launch
             ),
             "no dock waiting launches exactly as before"
+        );
+        // A waiting train is the same claim, and goes first (design
+        // 1e787fc2): the free slot is the train's.
+        let train = vec!["PR train 2026-10-10 07:09".to_string()];
+        assert!(
+            matches!(
+                admission(&live, 3, false, "m.yaml", true, 0, QUEUE_CAP, 0, &train),
+                Admission::Queue
+            ),
+            "the free slot is the waiting train's: a waiting builder queues"
         );
     }
 
@@ -8307,12 +8745,12 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
     fn the_crowd_refusal_fires_at_the_bound_and_names_the_gates() {
         let live: Vec<String> = vec!["gate-feat-x-ab1".into(), "gate-fix-y-ef3".into()];
         assert_eq!(
-            crowd_refusal(&live, 0, 3),
+            crowd_refusal(&live, &[], 0, 3),
             None,
             "below the bound is silence"
         );
 
-        let msg = crowd_refusal(&live, 0, 2).expect("at the bound refuses");
+        let msg = crowd_refusal(&live, &[], 0, 2).expect("at the bound refuses");
         assert!(msg.contains("gate-feat-x-ab1"), "{msg}");
         assert!(msg.contains("gate-fix-y-ef3"), "{msg}");
         assert!(
@@ -8320,48 +8758,137 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
             "the refusal must name the override, or the bound reads as a wall: {msg}"
         );
         assert!(
-            crowd_refusal(&live, 0, 1).is_some(),
+            crowd_refusal(&live, &[], 0, 1).is_some(),
             "past the bound refuses too (gates launched before a lower bound was set)"
         );
     }
 
     #[test]
     fn an_idle_cluster_admits_even_at_bound_one() {
-        assert_eq!(crowd_refusal(&[], 0, 1), None);
+        assert_eq!(crowd_refusal(&[], &[], 0, 1), None);
     }
 
-    /// 48f7aba1: THE ONE DEFINITION OF ADMISSION, both callers. Three
-    /// PR-car gates running of a bound of three, and a train asks: the
-    /// train is admitted (the bound+1th Job); a car asking the same
-    /// question is refused exactly as before; and a train asking with
-    /// the bound+1th already running is refused — the overage is one
-    /// slot, never a second.
+    /// THE ONE DEFINITION OF ADMISSION, both callers (design 1e787fc2,
+    /// backlog 0f4224bc). The bound is the TOTAL of running gate Jobs:
+    /// a train is refused at it like a car — on 2026-09-28 and again on
+    /// 2026-10-10 a train launched as the bound+1th Job five times in
+    /// ten hours — and its priority is a place, not overage: a waiting
+    /// train stands ahead of every car, so the bay that frees is its.
     #[test]
-    fn a_train_gate_is_admitted_at_the_bound_and_a_car_is_not() {
+    fn a_train_is_refused_at_the_bound_and_a_waiting_train_goes_first() {
         assert!(
-            admits(3, 3, Requester::Train),
-            "a train at the bound is admitted"
+            !admits(3, 0, 3, Requester::Train),
+            "a train at the bound waits: the bound counts every gate"
         );
         assert!(
-            !admits(3, 3, Requester::Car),
-            "a car at the bound waits, as today"
+            !admits(3, 0, 3, Requester::Car),
+            "a car at the bound waits, as before"
         );
         assert!(
-            !admits(4, 3, Requester::Train),
-            "one slot of overage, not two"
+            admits(2, 0, 3, Requester::Train),
+            "a train is admitted when a bay is free"
         );
         assert!(
-            admits(2, 3, Requester::Car),
-            "below the bound a car is admitted"
+            admits(2, 5, 3, Requester::Train),
+            "nothing stands ahead of a train: a free bay is its, whatever the line"
         );
-        assert!(admits(2, 3, Requester::Train));
-        // And the two car-side readers of the bound are that predicate:
-        // `crowd_refusal` at the bound refuses, `may_launch` counts a
-        // waiter's place against the same line.
+        assert!(
+            admits(2, 0, 3, Requester::Car),
+            "below the bound with nothing ahead a car is admitted"
+        );
+        assert!(
+            !admits(2, 1, 3, Requester::Car),
+            "one bay free and a train waiting: the bay is the train's"
+        );
+        // The car-side readers of the bound are that predicate:
+        // `crowd_refusal` refuses at the bound and when a waiting train
+        // claims the last free bay, naming the train; `may_launch` counts
+        // the claims ahead of a waiter's place against the same line.
         let live: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
-        assert!(crowd_refusal(&live, 0, 3).is_some());
+        assert!(crowd_refusal(&live, &[], 0, 3).is_some());
+        let two: Vec<String> = vec!["a".into(), "b".into()];
+        assert_eq!(crowd_refusal(&two, &[], 0, 3), None);
+        let train = vec!["PR train 2026-10-10 07:09".to_string()];
+        let why = crowd_refusal(&two, &train, 0, 3).expect("the train's bay is not a car's");
+        assert!(
+            why.contains("PR train 2026-10-10 07:09") && why.contains("goes first"),
+            "the refusal names the waiting train: {why}"
+        );
         assert!(!may_launch(3, 0, 3, 0));
         assert!(may_launch(2, 0, 3, 0) && !may_launch(2, 0, 3, 1));
+        assert!(!may_launch(2, 1, 3, 0), "a waiting train is a claim ahead");
+    }
+
+    /// The claim a waiting train holds is read off the system of record:
+    /// an open train carrying `train_gate_bound_wait` and no recorded
+    /// gate-run. A train whose gate is filed, or one with a blank claim,
+    /// holds no place — and neither does a train whose wait REASON is a
+    /// launch fault, not the bound (backlog 82071657 finding 2): it
+    /// cannot use a bay, so it may not hold one from every builder.
+    #[test]
+    fn a_train_claims_a_bay_only_while_the_bound_holds_its_gate_unfiled() {
+        let train = |title: &str, md: Value| json!({ "title": title, "metadata": md });
+        let trains = vec![
+            train(
+                "waiting",
+                json!({
+                    "train_gate_wait_reason": "the cluster is at its gate bound",
+                    "train_gate_bound_wait": "the cluster is at its gate bound",
+                }),
+            ),
+            train(
+                "filed",
+                json!({ "train_gate_bound_wait": "stale", "train_gate_run": "f650c04f" }),
+            ),
+            train("blank", json!({ "train_gate_bound_wait": "  " })),
+            train(
+                "faulted",
+                json!({ "train_gate_wait_reason": "reading the gate runner manifest /x: No such file" }),
+            ),
+            train("quiet", json!({})),
+        ];
+        assert_eq!(trains_claiming(&trains), vec!["waiting".to_string()]);
+    }
+
+    /// A train's claim lives with its conductor (backlog 82071657 finding
+    /// 1), read the way the dock's is: off `train-reconcile`'s last
+    /// firing. A stopped conductor (a stale firing), none at all, or a
+    /// failed pass counts no train ahead, and says why — so a bound of
+    /// one does not refuse every builder forever behind a ghost train.
+    #[test]
+    fn a_train_claim_counts_only_while_the_reconcile_rule_is_firing() {
+        let now = at("2026-10-10T12:00:00Z");
+        let trains = vec![json!({
+            "title": "PR train 2026-10-10 11:07",
+            "metadata": { "train_gate_bound_wait": "the cluster is at its gate bound" },
+        })];
+        let fresh = firing("2026-10-10T11:58:30Z", Some(0));
+        assert_eq!(
+            trains_waiting(&trains, Some(&fresh), now, QUEUE_PLACE_TTL_SECS),
+            Ok(vec!["PR train 2026-10-10 11:07".to_string()]),
+            "a live conductor keeps the claim, however old"
+        );
+        let running = firing("2026-10-10T11:59:50Z", None);
+        assert!(trains_waiting(&trains, Some(&running), now, QUEUE_PLACE_TTL_SECS).is_ok());
+        let stale = firing("2026-10-10T09:00:00Z", Some(0));
+        let why = trains_waiting(&trains, Some(&stale), now, QUEUE_PLACE_TTL_SECS)
+            .expect_err("a stopped conductor's train holds no bay");
+        assert!(
+            why.contains("train-reconcile")
+                && why.contains("10800s ago")
+                && why.contains("1 train"),
+            "names the rule, the age and what it did not count: {why}"
+        );
+        let why = trains_waiting(&trains, None, now, QUEUE_PLACE_TTL_SECS)
+            .expect_err("no firing counts none");
+        assert!(why.contains("no recorded firing"), "{why}");
+        let failed = firing("2026-10-10T11:59:00Z", Some(1));
+        assert!(trains_waiting(&trains, Some(&failed), now, QUEUE_PLACE_TTL_SECS).is_err());
+        assert_eq!(
+            trains_waiting(&[], None, now, QUEUE_PLACE_TTL_SECS),
+            Ok(Vec::new()),
+            "no claims: nothing to judge, nothing to say"
+        );
     }
 
     /// The env override: absent means the FALLBACK (the delivery
@@ -8429,129 +8956,6 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
             );
             assert!(!hint.starts_with('-') && !hint.ends_with('-'), "{hint}");
-        }
-    }
-
-    /// THE DEFAULT THAT WAS RIGHT ON ONE HOST AND SILENTLY WRONG ON THE
-    /// OTHER (packet aa783636).
-    ///
-    /// A refusal is only useful if it says WHICH instance to reach. The
-    /// old fallback pointed at boss-gcp's second, older stack, and a read
-    /// against it does not fail — it answers `total: 0` while the system
-    /// of record holds 51 packets. So this pins the two things the
-    /// message has to carry: the declaration of the system of record,
-    /// and the same-connection control that makes an empty answer usable.
-    /// The second stack has since retired; an adopter's address is not
-    /// this instance's (26f5080a, approved design c6f08b60 D3).
-    #[test]
-    fn refusing_without_an_instance_names_the_system_of_record() {
-        let m = no_instance_message();
-        assert!(
-            m.contains("infra/dev/sor-url"),
-            "the refusal must name the system of record, not just complain: {m}"
-        );
-        assert!(
-            !m.contains("http://"),
-            "the refusal must not prescribe an instance address: {m}"
-        );
-        assert!(
-            m.contains("BOSS_JOBS_URL"),
-            "it must name the variable to set: {m}"
-        );
-        assert!(
-            m.contains("known packet") && m.contains("same connection"),
-            "the refusal must explain how to verify an empty answer: {m}"
-        );
-    }
-
-    /// An empty or whitespace value is not a configured instance. Left
-    /// unguarded it would build request URLs like `/api/jobs`, which
-    /// reqwest rejects as relative — a confusing failure a long way from
-    /// the cause.
-    #[test]
-    fn an_empty_instance_is_treated_as_unset() {
-        // `jobs_base` reads process env, so assert the filter directly on
-        // the same predicate rather than mutating a global under test.
-        for v in ["", "   ", "\t"] {
-            assert!(
-                Some(v.to_string())
-                    .filter(|s| !s.trim().is_empty())
-                    .is_none(),
-                "{v:?} must not count as a configured instance"
-            );
-        }
-    }
-
-    /// The census read the car list as one bare `limit=800` page and
-    /// never compared it to `total` (backlog 6cf47547), so past 800 cars
-    /// its stranded-green note would have named a car's green gate-run
-    /// stranded because the car sat on the unread tail. `all_cars_via`
-    /// is the one car query, paged on `total`, handed to whatever
-    /// transport the caller counts its calls through.
-    #[tokio::test]
-    async fn all_cars_via_reads_the_car_past_one_page() {
-        let asked = std::sync::Mutex::new(Vec::<String>::new());
-        let cars = all_cars_via(|path: String| {
-            asked.lock().unwrap().push(path.clone());
-            async move {
-                let row = if path.contains("offset=0") {
-                    "car-1"
-                } else {
-                    "car-2"
-                };
-                anyhow::Ok(Some(json!({"data": [{"id": row}], "total": 2})))
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(cars.len(), 2, "the car on page two is read");
-        let asked = asked.into_inner().unwrap();
-        assert_eq!(asked.len(), 2, "{asked:?}");
-        assert!(
-            asked
-                .iter()
-                .all(|p| p.starts_with("/api/jobs?kind=ship-a-change&")),
-            "{asked:?}"
-        );
-        assert!(asked[1].ends_with("offset=1"), "{asked:?}");
-    }
-
-    /// EVERY read verb resolves its instance through this one function,
-    /// so the `127.0.0.1` trap cannot re-grow in any single verb. Pin
-    /// the precedence (flag over env) and the refusal on the pure form,
-    /// so no test has to mutate process env (unsafe under edition 2024,
-    /// racy in parallel). `packet census` and `queue` mirror this from
-    /// their own modules to document that they wire it in.
-    #[test]
-    fn resolve_jobs_base_prefers_flag_then_env_then_refuses() {
-        assert_eq!(
-            resolve_jobs_base_from(Some("http://flag:7900"), Some("http://env:7900".into()))
-                .unwrap(),
-            "http://flag:7900",
-            "an explicit flag beats the env"
-        );
-        assert_eq!(
-            resolve_jobs_base_from(None, Some("http://env:7900".into())).unwrap(),
-            "http://env:7900",
-            "the env is used when there is no flag"
-        );
-        for (flag, env) in [
-            (None, None),
-            (Some("   "), None),
-            (None, Some(String::new())),
-            (Some(""), Some("\t".to_string())),
-        ] {
-            let m = resolve_jobs_base_from(flag, env)
-                .expect_err("neither a real flag nor a real env must refuse")
-                .to_string();
-            assert!(
-                m.contains("infra/dev/sor-url"),
-                "refusal must name the record: {m}"
-            );
-            assert!(
-                !m.contains("SECOND") && !m.contains("http://"),
-                "refusal must not prescribe a retired or private deployment: {m}"
-            );
         }
     }
 
@@ -9042,8 +9446,12 @@ kind: Job\n\
     /// of the situation (§9a: the fact lives once, on the receipt).
     #[test]
     fn the_step_takes_the_refusal_word_off_the_receipt() {
+        let read = UnstartedRead {
+            at: chrono::Utc::now(),
+            start: PodStart::default(),
+        };
         assert_eq!(
-            step_verdict(&unstarted_receipt(9, &PodStart::default())),
+            step_verdict(&unstarted_receipt(9, &read, &read)),
             "refused",
             "the pod-never-started receipt says refused; the step beside it must agree"
         );
@@ -9234,9 +9642,12 @@ kind: Job\n\
         assert_eq!(hand_edit_level(&old, Some(&none)), old);
     }
 
-    /// Both launchers hand it, on the Job they are about to create — held
+    /// Every launcher hands it, on the Job it is about to create — held
     /// in the source, because each call sits between a packet filed on a
-    /// live API and a `kubectl create`.
+    /// live API and a `kubectl create`. Three: `boss gate`, the
+    /// conductor's gate launch, and the conductor's consist worker
+    /// (backlog 37742794), whose rendering is held by
+    /// `train::consist_job`'s own test.
     #[test]
     fn both_launchers_hand_the_edit_level_to_the_job_they_create() {
         let gate = include_str!("gate.rs");
@@ -9254,7 +9665,7 @@ kind: Job\n\
             .expect("the conductor's launch")..];
         let launch = &launch[..launch.find("\n    }\n").expect("its end")];
         let read = launch
-            .find(".api(Method::GET, crate::dispatch::EDIT_LEVEL_PATH, None)")
+            .find("self\n            .edit_level_to_hand(")
             .expect("the conductor reads the edit-level door");
         let handed = launch
             .find("let job = crate::gate::hand_edit_level(&job, edit_level.as_ref());")
@@ -9263,6 +9674,27 @@ kind: Job\n\
             .find(".args([\"create\", \"-f\", \"-\"])")
             .expect("the conductor creates its Job");
         assert!(read < handed && handed < create);
+        // The read itself is the door, by the conductor's token.
+        let reader = &conductor[conductor
+            .find("async fn edit_level_to_hand(")
+            .expect("the conductor's read")..];
+        let reader = &reader[..reader.find("\n    }\n").expect("its end")];
+        assert!(reader.contains(".api(Method::GET, crate::dispatch::EDIT_LEVEL_PATH, None)"));
+        // The consist worker is handed the same read, before its Job.
+        let read = conductor
+            .find("let edit_level = self.edit_level_to_hand(\"consist check\").await;")
+            .expect("the conductor reads the level for the consist worker");
+        let consist = conductor
+            .find("super::consist_job::isolated_consist_check(")
+            .expect("the conductor's consist check");
+        assert!(read < consist);
+        assert!(
+            conductor[consist..].starts_with(
+                "super::consist_job::isolated_consist_check(\n            clone,\n            \
+                 &self.cfg.fork_url,\n            &self.policy,\n            edit_level,\n"
+            ),
+            "the consist check is handed the level the conductor read"
+        );
     }
 
     /// THE CONDUCTOR'S TURN IS NOT A LOST REPORT (backlog 934ccad1). A
@@ -9814,6 +10246,24 @@ mod agent_run_tests {
 
     const RUN: &str = "5b1d2c3e-0000-4000-8000-000000000001";
 
+    /// A run's gate from the shared checkout is refused BEFORE anything
+    /// is filed or stamped (backlog 916fe290): the refusal is read off
+    /// `run` itself and must precede the first SoR client and the
+    /// worktree stamp, or the run's record names `/work/boss`.
+    #[test]
+    fn the_shared_checkout_refusal_precedes_every_write() {
+        let src = include_str!("gate.rs");
+        let start = src.find("pub async fn run(").expect("fn run");
+        let body = &src[start..];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} is not in fn run"))
+        };
+        let refused = at("crate::shared_checkout::refusal(");
+        assert!(refused < at("let agent_run = with_worktree("));
+        assert!(refused < at("crate::sor_client::machine_client()"));
+    }
+
     /// A run's gate stamps the worktree it was launched from beside
     /// the run's edge (backlog a3355e14) — the one party that knows
     /// where the run was built. A hand gate names no run and stamps no
@@ -9877,663 +10327,10 @@ mod agent_run_tests {
     }
 }
 
-/// A one-shot HTTP stub that hands back the request head it read —
-/// the seam the wire tests go through, shared by the signing tests
-/// (the head is where `x-boss-user` lives) and the re-gate read (the
-/// head is where the query lives).
-#[cfg(test)]
-pub(crate) mod stub {
-    pub(crate) async fn one_request(
-        body: &'static str,
-    ) -> (String, tokio::task::JoinHandle<Option<String>>) {
-        one_response("200 OK", body).await
-    }
-
-    /// [`one_request`] with the status line chosen — a write's 204, or
-    /// a 200 that is not the jobs API's answer (backlog 10776b6c).
-    pub(crate) async fn one_response(
-        status: &'static str,
-        body: &'static str,
-    ) -> (String, tokio::task::JoinHandle<Option<String>>) {
-        use tokio::io::AsyncWriteExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.ok()?;
-            let request = read_request(&mut sock).await;
-            let resp = format!(
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
-                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-            let _ = sock.shutdown().await;
-            Some(request)
-        });
-        (format!("http://{addr}"), handle)
-    }
-
-    /// A one-shot `302` to `location`, its body echoing the whole target
-    /// the way an HTML redirect page does — the shape Cloudflare Access
-    /// answers `boss.algedonic.dev` with (backlog 2ee29275, F4).
-    pub(crate) async fn one_redirect(
-        location: &'static str,
-    ) -> (String, tokio::task::JoinHandle<Option<String>>) {
-        use tokio::io::AsyncWriteExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.ok()?;
-            let request = read_request(&mut sock).await;
-            let body = format!("<a href=\"{location}\">Found</a>");
-            let resp = format!(
-                "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-type: text/html\r\n\
-                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-            let _ = sock.shutdown().await;
-            Some(request)
-        });
-        (format!("http://{addr}"), handle)
-    }
-
-    /// Read one whole request: the head up to its blank line, then as
-    /// many body bytes as its `content-length` names. Answering before
-    /// the body is drained closes a socket the client is still writing
-    /// to, which it sees as Broken pipe once the body outgrows a socket
-    /// buffer (backlog 1fe351e8, the race the builder of cef615f6
-    /// measured at 1 in 16 under load). A closed socket ends it with
-    /// what arrived, so the caller's assertion names the gap.
-    pub(crate) async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
-        use tokio::io::AsyncReadExt;
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 8192];
-        let mut want: Option<usize> = None;
-        loop {
-            if want.is_none() {
-                want = buf
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                    .map(|end| end + 4 + content_length(&buf[..end]));
-            }
-            if want.is_some_and(|total| buf.len() >= total) {
-                break;
-            }
-            match sock.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            }
-        }
-        String::from_utf8_lossy(&buf).into_owned()
-    }
-
-    /// The `content-length` a request head declares — zero when it
-    /// declares none, which is every body-less read.
-    fn content_length(head: &[u8]) -> usize {
-        String::from_utf8_lossy(head)
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, value)| value.trim().parse().ok())
-            .unwrap_or(0)
-    }
-}
-
-#[cfg(test)]
-mod signing_tests {
-    use super::stub::{one_redirect, one_request, one_response};
-    use super::*;
-    use crate::identity::Signature;
-
-    /// Backlog 2ee29275, F2: a test's client holds NO token, whatever
-    /// the process's token dir holds. A failing test prints the request
-    /// head it captured, so a client reading the process's shared
-    /// source would put a mounted Secret into the gate's log. Proven
-    /// through a wrapper, because the token dir is read from the
-    /// environment and a test must not mutate its own: this test's
-    /// binary re-run with `BOSS_MACHINE_TOKEN_DIR` naming a dir that
-    /// holds a live-looking token sends through both CLI constructors
-    /// and prints whether the header left.
-    #[tokio::test]
-    async fn a_test_client_never_sends_the_process_token() {
-        const LIVE: &str = "live-estate-token-must-never-leave-a-test";
-        if std::env::var("BOSS_CLI_TOKEN_LEAK_INNER").is_ok() {
-            let clients = [
-                ("machine_client", crate::gate::machine_client().unwrap()),
-                (
-                    "machine_client_with",
-                    crate::gate::machine_client_with(reqwest::Client::builder()).unwrap(),
-                ),
-            ];
-            for (name, http) in clients {
-                let (base, stub) = one_request("{}").await;
-                api_at_signed(
-                    &http,
-                    &base,
-                    reqwest::Method::GET,
-                    "/api/jobs",
-                    None,
-                    Signature::As("claude@algedonic.dev".into()),
-                )
-                .await
-                .expect("the stub answers 200");
-                let head = stub.await.unwrap().expect("the stub read a request");
-                let sent = head
-                    .to_ascii_lowercase()
-                    .contains(boss_core::machine_token::HEADER)
-                    || head.contains(LIVE);
-                println!("TOKEN-SENT {name}={sent}");
-            }
-            return;
-        }
-        let dir = boss_testing::scratch_dir("cli-test-token-leak");
-        std::fs::write(dir.join(boss_core::machine_token::CURRENT), LIVE).unwrap();
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "gate::signing_tests::a_test_client_never_sends_the_process_token",
-                "--nocapture",
-            ])
-            .env(boss_core::machine_token::TOKEN_DIR_ENV, &dir)
-            .env("BOSS_CLI_TOKEN_LEAK_INNER", "1")
-            .output()
-            .unwrap();
-        let printed = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success(),
-            "{printed}\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        for name in ["machine_client", "machine_client_with"] {
-            assert!(
-                printed.contains(&format!("TOKEN-SENT {name}=false")),
-                "a test's {name} must send no machine token, whatever the token dir holds: \
-                 {printed}"
-            );
-        }
-    }
-
-    /// Backlog 2ee29275, F4: the client follows no redirect, so a 3xx
-    /// comes back here — and the refusal names WHERE it was sent, by
-    /// scheme and host, so an operator pointed at the Access edge reads
-    /// that at once. Never the path's query or the body: a login
-    /// redirect carries its state in the query, and the page echoes it.
-    #[tokio::test]
-    async fn a_refused_redirect_names_its_scheme_and_host_never_its_query() {
-        let (base, stub) = one_redirect(
-            "https://edge.example.com:8443/cdn-cgi/access/login?kid=QUERYSECRET&redirect_url=%2Fapi",
-        )
-        .await;
-        let http = crate::gate::machine_client().unwrap();
-        let err = api_at_signed(
-            &http,
-            &base,
-            reqwest::Method::GET,
-            "/api/jobs",
-            None,
-            Signature::As("claude@algedonic.dev".into()),
-        )
-        .await
-        .expect_err("a 302 is not an answer");
-        stub.await.unwrap().expect("the stub read a request");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("302"), "{msg}");
-        assert!(
-            msg.contains("https://edge.example.com:8443"),
-            "the refusal must name the redirect's scheme and host: {msg}"
-        );
-        assert!(
-            !msg.contains("QUERYSECRET") && !msg.contains("kid=") && !msg.contains("/cdn-cgi"),
-            "the refusal must not carry the target's path, query or the page echoing it: {msg}"
-        );
-    }
-
-    /// Backlog 2ee29275, F3: no verb panics building its client. A
-    /// production `machine_client().unwrap()` turns a TLS-backend or
-    /// resolver failure into a panic with no verb named; `?` carries
-    /// `building the machine client` to the operator. Test code is
-    /// blanked first, where `.unwrap()` is the house style.
-    #[test]
-    fn no_verb_unwraps_its_machine_client() {
-        // This crate's own sources only, so a scoped gate that runs
-        // boss-cli runs every file this reads.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        let mut dirs = vec![src.clone()];
-        while let Some(d) = dirs.pop() {
-            for e in std::fs::read_dir(&d).unwrap().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    dirs.push(p);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    files.push(p);
-                }
-            }
-        }
-        let unwrap =
-            regex::Regex::new(r"machine_client(_with)?\([^;]*?\)\s*\.(unwrap|expect)\(").unwrap();
-        let mut found: Vec<String> = files
-            .iter()
-            .flat_map(|p| {
-                let text = std::fs::read_to_string(p).unwrap();
-                let prod = boss_testing::production_source::production_text(
-                    &boss_testing::production_source::without_comments(&text),
-                )
-                .unwrap();
-                let rel = p.strip_prefix(&src).unwrap().display().to_string();
-                prod.lines()
-                    .enumerate()
-                    .filter(|(_, l)| unwrap.is_match(l))
-                    .map(|(i, _)| format!("{rel}:{}", i + 1))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        found.sort();
-        assert!(
-            found.is_empty(),
-            "a verb unwraps its machine client — use `?`: {found:?}"
-        );
-    }
-
-    /// The target as the refusal names it: scheme and authority only.
-    #[test]
-    fn a_redirect_target_is_named_by_scheme_and_host() {
-        let named = |l: &str| redirect_target(Some(l));
-        assert_eq!(
-            named("https://boss.algedonic.dev/cdn-cgi/access/login?x=1#f").as_deref(),
-            Some("https://boss.algedonic.dev")
-        );
-        assert_eq!(
-            named("http://10.20.0.34:7900/api?t=s").as_deref(),
-            Some("http://10.20.0.34:7900")
-        );
-        // Userinfo is never echoed, a password in it least of all
-        // (backlog 2ee29275, car B's review 83fc0bdf). The literal is
-        // split so the pre-flight's secret scan sees no URL password.
-        let with_userinfo = concat!(
-            "https://operator:",
-            "not-a-secret",
-            "@elsewhere.example/x?q=1"
-        );
-        assert_eq!(
-            named(with_userinfo).as_deref(),
-            Some("https://elsewhere.example")
-        );
-        assert_eq!(
-            named("http://operator@elsewhere.example:8443/").as_deref(),
-            Some("http://elsewhere.example:8443")
-        );
-        // A relative Location names no other host; an unparseable one
-        // is not echoed at all.
-        assert_eq!(named("/login?next=x").as_deref(), None);
-        assert_eq!(named("::not a url::").as_deref(), None);
-        assert_eq!(redirect_target(None), None);
-    }
-
-    /// Backlog 5083d6f5, at the wire: the step PUT a `boss prove`
-    /// makes must arrive carrying the operator who ran it.
-    #[tokio::test]
-    async fn a_write_arrives_signed_as_its_caller() {
-        let (base, stub) = one_request("{}").await;
-        let http = crate::gate::machine_client().unwrap();
-        api_at_signed(
-            &http,
-            &base,
-            reqwest::Method::PUT,
-            "/api/jobs/x/steps/y",
-            Some(json!({"status": "completed"})),
-            Signature::As("claude@algedonic.dev".into()),
-        )
-        .await
-        .expect("the stub answers 200");
-        let head = stub.await.unwrap().expect("the stub read a request");
-        assert!(
-            head.contains(r#""id":"claude@algedonic.dev""#),
-            "the write must name its caller; head was:\n{head}"
-        );
-        assert!(
-            !head.contains(crate::identity::CONDUCTOR),
-            "an operator's write must not be signed as the train automation; head was:\n{head}"
-        );
-    }
-
-    /// Backlog 1fe351e8: the stub answered after the request HEAD and
-    /// never read the body, so a body larger than one socket buffer met
-    /// a closed socket mid-write — Broken pipe instead of the answer.
-    /// Small JSON bodies ride in with the head, which is why nothing
-    /// failed yet; this body cannot.
-    #[tokio::test]
-    async fn a_write_larger_than_a_socket_buffer_reaches_the_stub_whole() {
-        let (base, stub) = one_request("{}").await;
-        let big = "x".repeat(4 << 20);
-        let http = crate::gate::machine_client().unwrap();
-        api_at_signed(
-            &http,
-            &base,
-            reqwest::Method::PUT,
-            "/api/jobs/x/steps/y",
-            Some(json!({"filler": big, "status": "completed"})),
-            Signature::As("claude@algedonic.dev".into()),
-        )
-        .await
-        .expect("the stub reads the whole write before it answers");
-        let request = stub.await.unwrap().expect("the stub read a request");
-        assert!(
-            request.ends_with(r#""status":"completed"}"#),
-            "the stub must drain the body it was sent; it read {} bytes",
-            request.len()
-        );
-    }
-
-    /// Backlog 034002b3, at the wire: a write sent while the jobs API is
-    /// mid-roll (nothing listening, so the connect is refused) is not a
-    /// failed verb — it is sent again once the API comes back, and it
-    /// arrives once. Until this, `boss gate` and `boss design` exited 1
-    /// at once and the operator relaunched by hand.
-    #[tokio::test]
-    async fn a_write_sent_during_a_roll_arrives_once_the_api_is_back() {
-        // A port nothing serves yet, HELD across the roll: bound but not
-        // listening, so a connect is refused exactly as a dark API's is,
-        // and no other process can take the port in the gap — freeing it
-        // and rebinding 300 ms later let one (backlog 1fe351e8).
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let base = format!("http://{}", socket.local_addr().unwrap());
-        let back = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let listener = socket.listen(16).unwrap();
-            let (mut sock, _) = listener.accept().await.unwrap();
-            use tokio::io::AsyncWriteExt;
-            let head = super::stub::read_request(&mut sock).await;
-            let _ = sock
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
-                      content-length: 2\r\nconnection: close\r\n\r\n{}",
-                )
-                .await;
-            head
-        });
-        let http = crate::gate::machine_client().unwrap();
-        api_at_signed(
-            &http,
-            &base,
-            reqwest::Method::POST,
-            "/api/jobs",
-            Some(json!({"kind": "backlog-item"})),
-            Signature::As("claude@algedonic.dev".into()),
-        )
-        .await
-        .expect("a refused connect is waited out, not surfaced");
-        let head = back.await.unwrap();
-        assert!(
-            head.starts_with("POST /api/jobs"),
-            "the write reached the API once it was back; head was:\n{head}"
-        );
-    }
-
-    /// The loud case. A write nobody named does not go out at all —
-    /// and in particular does not go out as automation, which is the
-    /// whole defect.
-    #[tokio::test]
-    async fn an_unnamed_write_never_reaches_the_network() {
-        let (base, stub) = one_request("{}").await;
-        let http = crate::gate::machine_client().unwrap();
-        let refusal = crate::identity::refusal("POST", "/api/jobs");
-        let err = api_at_signed(
-            &http,
-            &base,
-            reqwest::Method::POST,
-            "/api/jobs",
-            Some(json!({"kind": "backlog-item"})),
-            Signature::Refused(refusal.clone()),
-        )
-        .await
-        .expect_err("an unnamed write is refused");
-        assert_eq!(err.to_string(), refusal);
-        assert!(
-            err.to_string().contains(crate::identity::ACTOR_ENV),
-            "{err}"
-        );
-        // The stub finishes only once it has ACCEPTED a connection, so
-        // an unfinished stub is proof nothing was sent.
-        assert!(
-            !stub.is_finished(),
-            "a refused write must not reach the socket"
-        );
-        stub.abort();
-    }
-
-    /// A DARK DOOR IS NOT AN EMPTY YARD (backlog 7b7e0529). `api_at`
-    /// answers `Ok(None)` for a 200 whose body is not JSON — a proxy's
-    /// login page, say — and the rows helper every operator verb read
-    /// through turned that into an empty list, so `boss orient` printed
-    /// "0 train(s)" for a yard it had never seen and `boss cadence`
-    /// would have filed a second packet beside an open one. The one rows
-    /// helper refuses it instead.
-    #[tokio::test]
-    async fn a_login_page_on_a_list_read_is_refused_not_read_as_empty() {
-        let (base, stub) = one_request("<html><body>Sign in to continue</body></html>").await;
-        let http = crate::gate::machine_client().unwrap();
-        let body = api_at_signed(
-            &http,
-            &base,
-            reqwest::Method::GET,
-            "/api/jobs?kind=pr-train&status=open&limit=10",
-            None,
-            Signature::Unidentified,
-        )
-        .await
-        .expect("a 200 is an answer, not a transport failure");
-        stub.abort();
-        let why = rows(body)
-            .expect_err("a page that is not JSON is no list, and must not read as zero rows")
-            .to_string();
-        assert!(why.contains("cannot be read as zero"), "{why}");
-    }
-
-    /// THE WRITE SIDE of the same defect (backlog 10776b6c). A write
-    /// that meets a proxy's login page answered `Ok(None)` — the shape
-    /// of a 204 — so `boss gate`, `boss prove` and `boss park` reported
-    /// success for a write that may never have reached the jobs API. A
-    /// write's success is its parsed answer, not its status, and the
-    /// refusal names the method, the path and what came back instead.
-    #[tokio::test]
-    async fn a_login_page_on_a_write_is_refused_naming_what_answered() {
-        let (base, stub) = one_request("<html><body>Sign in to continue</body></html>").await;
-        let http = crate::gate::machine_client().unwrap();
-        let why = api_at_signed(
-            &http,
-            &base,
-            reqwest::Method::PUT,
-            "/api/jobs/x/steps/y",
-            Some(json!({"status": "completed"})),
-            Signature::As("claude@algedonic.dev".into()),
-        )
-        .await
-        .expect_err("a 200 that is not JSON is no answer to a write")
-        .to_string();
-        stub.abort();
-        assert!(why.contains("PUT /api/jobs/x/steps/y"), "{why}");
-        assert!(why.contains("Sign in to continue"), "{why}");
-        assert!(why.contains("may never have reached"), "{why}");
-    }
-
-    /// The jobs API answers several writes — the job PUT, both metadata
-    /// PATCHes, the step PUT, a registry DELETE — with an empty 204.
-    /// That IS the answer: the refusal must not touch it.
-    #[tokio::test]
-    async fn an_empty_204_is_a_writes_success() {
-        for method in [
-            reqwest::Method::PUT,
-            reqwest::Method::PATCH,
-            reqwest::Method::DELETE,
-            reqwest::Method::POST,
-        ] {
-            let (base, stub) = one_response("204 No Content", "").await;
-            let http = crate::gate::machine_client().unwrap();
-            let answer = api_at_signed(
-                &http,
-                &base,
-                method.clone(),
-                "/api/jobs/x/metadata",
-                Some(json!({"k": "v"})),
-                Signature::As("claude@algedonic.dev".into()),
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{method}: a 204 is a write's success: {e:#}"));
-            stub.abort();
-            assert_eq!(answer, None, "{method}");
-        }
-    }
-
-    /// An EMPTY 200 is not what the jobs API sends to a write — every
-    /// write handler answers JSON or 204 — so it is refused the same way.
-    #[tokio::test]
-    async fn an_empty_200_on_a_write_is_refused() {
-        let (base, stub) = one_request("").await;
-        let http = crate::gate::machine_client().unwrap();
-        let why = api_at_signed(
-            &http,
-            &base,
-            reqwest::Method::POST,
-            "/api/jobs",
-            Some(json!({"kind": "backlog-item"})),
-            Signature::As("claude@algedonic.dev".into()),
-        )
-        .await
-        .expect_err("an empty 200 is no answer to a write")
-        .to_string();
-        stub.abort();
-        assert!(why.contains("POST /api/jobs"), "{why}");
-        assert!(why.contains("204"), "{why}");
-    }
-
-    /// The quote is cut, because a login page is kilobytes.
-    #[test]
-    fn a_refused_write_quotes_at_most_the_first_200_chars() {
-        let page = format!("<html>{}</html>", "x".repeat(5_000));
-        let why = success_answer(
-            "jobs api",
-            &reqwest::Method::POST,
-            "/api/jobs",
-            reqwest::StatusCode::OK,
-            &page,
-        )
-        .expect_err("refused")
-        .to_string();
-        assert!(why.contains(&page[..200]), "{why}");
-        assert!(!why.contains(&page[..201]), "{why}");
-    }
-
-    /// A read keeps its answer: `rows` and each caller's `context`
-    /// already refuse a missing body, so this car changes writes only.
-    #[test]
-    fn a_read_that_is_not_json_still_answers_none() {
-        let answer = success_answer(
-            "jobs api",
-            &reqwest::Method::GET,
-            "/api/jobs",
-            reqwest::StatusCode::OK,
-            "<html>Sign in</html>",
-        )
-        .expect("a read is judged by its reader");
-        assert_eq!(answer, None);
-    }
-
-    /// A read attributes nothing, so it proceeds — but marked, never
-    /// as an automation slug the server would read as a process.
-    #[tokio::test]
-    async fn an_unnamed_read_arrives_marked() {
-        let (base, stub) = one_request(r#"{"data":[]}"#).await;
-        let http = crate::gate::machine_client().unwrap();
-        api_at_signed(
-            &http,
-            &base,
-            reqwest::Method::GET,
-            "/api/jobs",
-            None,
-            Signature::Unidentified,
-        )
-        .await
-        .expect("a read still works");
-        let head = stub.await.unwrap().expect("the stub read a request");
-        assert!(
-            head.contains(crate::identity::UNIDENTIFIED),
-            "an unnamed read must say so; head was:\n{head}"
-        );
-        assert!(!head.contains(crate::identity::CONDUCTOR), "{head}");
-        // Backlog d843abf2: and it arrives under the platform's own
-        // READ role, not the operator's — the header a stray shell or
-        // a forge probe reads with must not be a whole-world one.
-        assert!(
-            head.contains(&format!(r#""role":"{}""#, crate::identity::READER_ROLE)),
-            "an unnamed read must carry {}; head was:\n{head}",
-            crate::identity::READER_ROLE
-        );
-        assert!(
-            !head.contains("platform-admin"),
-            "an unnamed read must not carry the operator's role; head was:\n{head}"
-        );
-    }
-
-    /// Backlog 25a4f7f9: every signed door — the jobs API, and the
-    /// events and ledger services the redeliver and ledger verbs reach
-    /// through the same `Wire` — said `jobs api` in its errors, so an
-    /// events-service refusal sent a diagnosis to the wrong service. The
-    /// name comes from the port the base names, read out of the one port
-    /// table; a port the table does not hold is named by the base itself,
-    /// never guessed.
-    #[test]
-    fn a_signed_door_names_the_service_its_base_reaches() {
-        let at = |svc: &str| format!("http://10.20.0.34:{}", boss_ports::prod(svc));
-        assert_eq!(service_at(&at("jobs")), "jobs api");
-        assert_eq!(service_at(&at("ledger")), "ledger api");
-        assert_eq!(service_at(&at("events")), "events api");
-        assert_eq!(service_at(&format!("{}/", at("ledger"))), "ledger api");
-        let scratch = boss_ports::scratch("jobs").expect("jobs has a scratch port");
-        assert_eq!(
-            service_at(&format!("http://127.0.0.1:{scratch}")),
-            "jobs api (scratch)"
-        );
-        for unknown in [
-            "http://127.0.0.1:1",
-            "https://boss.example.test",
-            "http://[::1]",
-        ] {
-            assert_eq!(service_at(unknown), format!("the service at {unknown}"));
-        }
-    }
-
-    /// At the wire: a refusal from a base that is not the jobs port does
-    /// not claim the jobs API refused it, and names what it reached.
-    #[tokio::test]
-    async fn a_refusal_names_the_service_that_refused() {
-        let (base, stub) = one_response("403 Forbidden", "not your period").await;
-        let http = crate::gate::machine_client().unwrap();
-        let why = api_at_signed(
-            &http,
-            &base,
-            reqwest::Method::POST,
-            "/api/ledger/periods/x/lock",
-            Some(json!({})),
-            Signature::As("claude@algedonic.dev".into()),
-        )
-        .await
-        .expect_err("a 403 is a refusal")
-        .to_string();
-        stub.abort();
-        assert!(!why.contains("jobs api"), "{why}");
-        assert!(why.contains(&format!("the service at {base}")), "{why}");
-        assert!(why.contains("POST /api/ledger/periods/x/lock"), "{why}");
-        assert!(why.contains("not your period"), "{why}");
-    }
-}
-
 #[cfg(test)]
 mod regate_tests {
-    use super::stub::one_request;
     use super::*;
+    use crate::sor_client::stub::one_request;
 
     fn red_run(id: &str, branch: &str, sha: &str) -> String {
         json!({
@@ -10589,7 +10386,7 @@ mod regate_tests {
     #[tokio::test]
     async fn a_prior_red_at_the_same_head_is_read_off_the_record() {
         let (base, stub) = one_request(page(red_run("aaaa1111-0000", "fix/x", "abc123"))).await;
-        let http = crate::gate::machine_client().unwrap();
+        let http = crate::sor_client::machine_client().unwrap();
         let Some(boss_jobs::flake::Prior::Red(prior)) =
             observe_prior(&http, &base, "fix/x", "abc123").await
         else {
@@ -10618,7 +10415,7 @@ mod regate_tests {
     async fn a_prior_that_refused_is_read_as_a_refusal_and_stamps_nothing() {
         let (base, _stub) =
             one_request(page(refused_run("bbbb2222-0000", "fix/x", "abc123"))).await;
-        let http = crate::gate::machine_client().unwrap();
+        let http = crate::sor_client::machine_client().unwrap();
         let Some(boss_jobs::flake::Prior::Refused { id, why }) =
             observe_prior(&http, &base, "fix/x", "abc123").await
         else {
@@ -10634,7 +10431,7 @@ mod regate_tests {
     #[tokio::test]
     async fn a_red_at_another_head_is_not_a_regate_even_when_the_server_sends_it() {
         let (base, _stub) = one_request(page(red_run("aaaa1111-0000", "fix/x", "def456"))).await;
-        let http = crate::gate::machine_client().unwrap();
+        let http = crate::sor_client::machine_client().unwrap();
         assert!(
             observe_prior(&http, &base, "fix/x", "abc123")
                 .await
@@ -10649,7 +10446,7 @@ mod regate_tests {
     /// paused clock: still None, and no real two minutes spent.
     #[tokio::test(start_paused = true)]
     async fn an_unreachable_record_stamps_nothing_and_refuses_nothing() {
-        let http = crate::gate::machine_client().unwrap();
+        let http = crate::sor_client::machine_client().unwrap();
         let started = tokio::time::Instant::now();
         assert!(
             observe_prior(&http, "http://127.0.0.1:9", "fix/x", "abc123")

@@ -22,12 +22,26 @@ def binding(token, value):
         return re.fullmatch(r"[0-9a-f]{40}", value) is not None
     if token == "$BUDGET":
         return re.fullmatch(r"[0-9]{1,20}", value) is not None and int(value) <= 2**64 - 1
+    if token == "$TMP_SUBPATH":
+        return re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) is not None
     if token in ("$CLONE", "$WORKER"):
         return 0 < len(value.encode()) <= 65536 and "\0" not in value
     if token == "$IMAGE":
         return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,1023}", value) is not None
     if token == "$REFERENCE":
         return re.fullmatch(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,1023}", value) is not None
+    if token == "$EDIT_LEVEL":
+        # The edit-level door's answer the conductor handed down (backlog
+        # 37742794): empty, or the door's own object, compact.
+        if value == "":
+            return True
+        if len(value.encode()) > 4096 or "\0" in value:
+            return False
+        try:
+            answer = json.loads(value)
+        except (ValueError, RecursionError):
+            return False
+        return isinstance(answer, dict) and "edit_level" in answer
     if token == "$URL":
         parsed = urlsplit(value)
         return (len(value) <= 4096 and parsed.scheme in ("http", "https")
@@ -103,7 +117,46 @@ def normalized(job):
     return job
 
 
-def recognized(template, job):
+def generations(template):
+    """The owning template, then the one shape it retains from before.
+
+    Backlog 37742794 (2026-10-09) appended `$EDIT_LEVEL` to the worker's
+    argv. A Job is kept a day after it finishes (ttlSecondsAfterFinished),
+    so for that day the cluster still holds workers stamped by the
+    conductor that ran before it, without the argument; unrecognised,
+    each is an "orphan" that reds every dev pre-flight's
+    a-deleted-manifest-leaves-no-object (measured on the car's own first
+    pre-flight). The older shape is exactly the template less that one
+    trailing argument, so nothing else is admitted; delete this once no
+    retained worker predates the conductor that hands the level (a day
+    after that converge).
+    """
+    yield template
+    previous = copy.deepcopy(template)
+    command = previous["spec"]["template"]["spec"]["containers"][0]["command"]
+    if command[-1:] == ["$EDIT_LEVEL"]:
+        command.pop()
+        yield previous
+    # Retained Jobs predate private scratch (ddcdf6eb). Recognize only
+    # the exact old mounts/argv, preserving every isolation field and
+    # the independent EDIT_LEVEL generation; never normalize hybrids.
+    legacy = copy.deepcopy(template)
+    pod = legacy["spec"]["template"]["spec"]
+    clone = pod["initContainers"][0]
+    worker = pod["containers"][0]
+    if (clone["command"][-1:] == ["$TMP_SUBPATH"]
+            and clone["volumeMounts"][-1] == {"name": "worker-tmp", "mountPath": "/consist-tmp"}
+            and worker["volumeMounts"][1].get("subPath") == "$TMP_SUBPATH"):
+        clone["command"].pop()
+        clone["volumeMounts"].pop()
+        del worker["volumeMounts"][1]["subPath"]
+        yield copy.deepcopy(legacy)
+        if worker["command"][-1:] == ["$EDIT_LEVEL"]:
+            worker["command"].pop()
+            yield legacy
+
+
+def recognized_as(template, job):
     try:
         candidate = normalized(job)
         bound = {}
@@ -111,6 +164,14 @@ def recognized(template, job):
                 and bound["$DEADLINE"] == min(int(bound["$BUDGET"]) + 180, 2**64 - 1))
     except (KeyError, TypeError, ValueError, AttributeError):
         return False
+
+
+def recognized(template, job):
+    try:
+        shapes = list(generations(template))
+    except (KeyError, TypeError, IndexError):
+        return False
+    return any(recognized_as(shape, job) for shape in shapes)
 
 
 def validate_template(template):
@@ -153,7 +214,8 @@ def validate_template(template):
                "$IMAGE": "example.invalid/worker:fixed", "$CLONE": "historical clone",
                "$WORKER": "historical worker", "$URL": "https://example.invalid/repo.git",
                "$REFERENCE": "refs/heads/test", "$HEAD": "1" * 40,
-               "$BASELINE": "2" * 40, "$BUDGET": "120", "$DEADLINE": 300}
+               "$BASELINE": "2" * 40, "$BUDGET": "120", "$DEADLINE": 300,
+               "$EDIT_LEVEL": "", "$TMP_SUBPATH": "scratch-sample"}
     used = set()
 
     def filled(value):

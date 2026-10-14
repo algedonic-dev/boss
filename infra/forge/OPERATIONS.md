@@ -27,22 +27,28 @@ the only filesystem that matters, and every consumer below shares it.
 |---|---|---|---|
 | Forgejo | docker container named `forgejo` on the **system** docker daemon, managed by the compose file at `/opt/forgejo/docker-compose.yml` | the repository (`david/boss`), the web UI and API on `:3000`, the OCI package registry, and the Actions dispatcher that turns a push into workflow runs | `/opt/forgejo/data` (33 GB) — repositories, packages, Actions logs and artifacts |
 | CI runner | `forgejo-runner.service` (act runner) | polls Forgejo for tasks and runs each CI job as a container on the **system** docker daemon; its journal names each task (`task 1746 repo is david/boss`) and each job's network cleanup | job containers and the per-train `boss-ci:<sha>` images, under the system daemon's store (`/var/lib/containerd`, 81 GB on 2026-09-05 before the sweep learned to prune it) |
-| system docker daemon | `docker.service` + `containerd.service` | the daemon CI jobs and Forgejo run on | `/var/lib/containerd` |
-| rootless docker daemon | David's user daemon (data-root `/home/david/.local/share/docker`) | the daemon `cluster-deploy-runner` builds the cluster image on | its own image and build cache |
+| system docker daemon | `docker.service` + `containerd.service` | the daemon CI jobs and Forgejo run on, and since backlog 683d7fe9 the one `cluster-deploy-runner` builds the cluster image on and `disk-floor-sweep` keeps | `/var/lib/containerd`, on the root volume. `/srv/boss-data` (916 GB, 2% used, measured 2026-10-07) is the larger home for its data-root; moving it is a host change no car has made |
+| rootless docker daemon | David's user daemon (data-root `/home/david/.local/share/docker`) | **nothing unattended, since backlog 683d7fe9**: it was the daemon the cluster converge built on until then | what the converge left: 43 GB of images and 33 GB of build cache (ops `disk-report`, 2026-10-07), on the root volume. Nothing prunes it any more; it is David's to keep or to free (`docker system prune -af` and `docker builder prune -af`, as david), and freeing it gives the root volume back about 76 GB |
 | WireGuard | `wg-quick@wg0.service` | the tunnel to boss-gcp and the hub; the pod reaches this host over the LAN, not the tunnel | — |
 | journal gateway | `systemd-journal-gatewayd.socket` on `:19531`, enabled by `install.sh` | the read door: any unit's journal over HTTP from the pod, plus anything a script logs with `\| systemd-cat -t <tag>`. **Read it through `infra/forge/journal-read.sh`, never raw curl** — see below | the distro's units (`systemd-journal-remote`); converged since 2026-09-10 |
 | the `boss` CLI | `/usr/local/bin/boss`, a link to the wrapper in `/opt/boss-cli`, installed by `install.sh` for the `cluster-operator` role from the cluster image built for the converged commit (`infra/estate/install-cli-from-image.sh`, since 2026-09-18) | the tree's own CLI on this host — `boss --version` names the converged commit; the packet records `cli_sha` beside `converge_sha`. The first converge tick after a train usually finds no image yet (`cli_result: not yet`) and installs it on the next | one directory per generation under `/opt/boss-cli`, newest 3 kept; nothing else on the host shells to it yet (the forge's shell twins of CLI verbs retire onto it one car at a time, backlog 9f00a805) |
 
 ## The BOSS units
 
-All BOSS units run from the host's checkout at `/home/david/boss` (a
-detached checkout of forge `main`, never `git pull`), and every one is
-installed by `infra/forge/install.sh`. **Every git user of that
-checkout takes one lock first** — `.git/boss-converge.lock`, via
+Every BOSS unit runs as root from root's tree,
+`/var/lib/boss/tree/current` — a tree root fetched from the forge's own
+repository (`infra/forge/root-tree.sh`; failure mode 9) — and every one
+is installed by `infra/forge/install.sh`. The cluster converge and the
+disk sweep were the last two to move (backlog 683d7fe9): until then they
+ran as david out of his checkout and on his rootless docker daemon. The
+host's checkout at `/home/david/boss` (a detached checkout of forge
+`main`, never `git pull`) is still what `forge-converge` fetches as its
+owner and what the ops runner's verbs run from. **Every git user of
+that checkout takes one lock first** — `.git/boss-converge.lock`, via
 `infra/forge/checkout-lock.sh` (`checkout_git`), which also sweeps a
 stale `index.lock` nobody holds and retries the two git lock errors
-with a short backoff (5 tries, 6 s apart). Two units fetch the same
-checkout on the same tick, and the merge-triggered `converge` starts
+with a short backoff (5 tries, 6 s apart). Two units fetched the same
+checkout on the same tick, and the merge-triggered `converge` started
 one of them a second after any merge; without the lock they collided
 on 2026-09-07 22:01 (failure mode 8 below). A hand-run git in the
 checkout should take the same lock:
@@ -54,8 +60,8 @@ closed for everything in the installer's `UNITS` list.
 | unit | cadence | does | fails loudly how |
 |---|---|---|---|
 | `forge-converge` | 10 min (boot +4) | fetch forge main and check it out under the checkout lock (as the owner), run `install.sh` — the host adopts its own units — then `protect-main.sh`: forge main's branch protection made what `main-protection.json` declares (direct push, force push and deletion refused; a PR merge still passes) and read back, with the checkout's own forge credential. It cannot stop Forgejo's push-mirror sync, which writes main locally as `Gitea <gitea@fake.local> update by push` and never passes the hook protection lives in; the conductor's ancestry arm is the guard for that writer (backlog f9256445) | journal; a broken install leaves the previous units running; `main_protection` on the packet says created / edited / already as declared, or `FAILED:` with the forge's HTTP status (the run is red) |
-| `cluster-deploy-runner` | 10 min (boot +3), and on every merge via the `converge` ops verb | fetch and check out forge main under the checkout lock, build the cluster image on the rootless daemon, push it to the registry, roll the cluster, then verify every manifest under `infra/cluster/manifests` is applied and not drifted | exit 1 on drift or an unreadable manifest; the conductor's converge step reads the result; a run started by a `converge` ops-request PATCHes that packet with `converged: <sha>`, `converge_held: <reason>` or `converge_failed: <stage> (exit N)` when it ends |
-| `disk-floor-sweep` | hourly (boot +5) | two passes. **Every** run prunes the **system** daemon's per-train `boss-ci:<sha>` images older than `BOSS_CI_IMAGE_AGE_HOURS` (6h), keeping the newest 3 — only sha-shaped tags, so `rust1.96` and `latest` are never candidates. **Below** `BOSS_DISK_FLOOR_GB` (100 in the service) it goes on to the emergency remediations: all unused system-daemon images over 4h, the whole rootless builder cache, dangling images, registry-verified old tags — in that fixed order, stopping at the floor; regenerable caches only, never volumes | exits non-zero with `FLOOR UNMET — a human decides next` rather than deleting harder, and non-zero when the age pass could not reach the system daemon (a prune of the wrong daemon would report success and free nothing) |
+| `cluster-deploy-runner` | 10 min (boot +3), and on every merge via the `converge` ops verb | as root: bring root's tree to forge main (`root-tree.sh refresh`) and run from a view of that generation; build the cluster image on the **system** daemon, push it with the registry push login the forge converge deposits from the credential broker's token (`/etc/boss/registry-push`; it builds nothing while that is absent), prove the image boots, roll the cluster with the kubeconfig David placed (`/etc/boss-ops/kubeconfig`), then verify every manifest under `infra/cluster/manifests` is applied and not drifted. Its stamps, request inbox and tenant checkouts live under `/var/lib/boss/converge` (root, 0700) | exit 1 on drift or an unreadable manifest; the conductor's converge step reads the result; a run started by a `converge` ops-request PATCHes that packet with `converged: <sha>`, `converge_held: <reason>` or `converge_failed: <stage> (exit N)` when it ends |
+| `disk-floor-sweep` | hourly (boot +5) | as root, on the **system** daemon — the one daemon that builds since backlog 683d7fe9 — two passes. **Every** run prunes the per-train `boss-ci:<sha>` images older than `BOSS_CI_IMAGE_AGE_HOURS` (6h), keeping the newest 3 — only sha-shaped tags, so `rust1.96` and `latest` are never candidates. **Below** `BOSS_DISK_FLOOR_GB` (100 in the service) it goes on to the emergency remediations: all unused images over 4h, the builder cache but the compiler's cache mounts (those too below half the floor), dangling images, registry-verified old tags — in that fixed order, stopping at the floor; regenerable caches only, never volumes | exits non-zero with `FLOOR UNMET — a human decides next` rather than deleting harder, and non-zero when the age pass could not reach the system daemon (a prune of the wrong daemon would report success and free nothing) |
 | `reap-dead-ci-jobs` | daily (boot +15) | remove the containers and volumes of crashed CI jobs | journal |
 | `estate-observe-host` | 15 min (boot +3) | record this host's disk, load and units into the estate as observations; the conductor's boarding refuses on a positive "host is short" reading | journal; a stale series reads as unverifiable, and boarding proceeds with one loud line |
 | `estate-observe-units` | 5 min (boot +2) (since 2026-09-26, backlog c98dcf38) | record what this host's units are doing — every pair `install.sh` installs (its `rows` mode is the roster) plus the ops runner — as a `host-units` observation on node `forge`; estate compare turns an unhealthy one into `unit_unhealthy:forge/<unit>` and estate.alarm files it after three comparisons. Runs as root for `journalctl -u`; owes forge-converge nothing | exits 1 naming each unhealthy unit, with its last 20 journal lines on the observation; the packet wrap is best-effort, so a dark API still leaves a failed observer here |
@@ -174,11 +180,15 @@ No ssh from the pod. Three doors, all read-only:
   every runner tick — with this host's tools: no kubectl, no kubeconfig,
   the cluster only over HTTP. `boss-probe` has no sudo, no docker and no
   group but its own; `infra/forge/probe-account.sh` makes it on every
-  converge and verifies it again ahead of every runner tick. **If it
-  does not verify, no probe runs on this host** — never as david — and
-  each car records did-not-run with the cause, retried hourly; the
-  converge packet says why under `probe_account` (`STOPPED: …`) and the
-  next converge repairs what it can (decision c98c79aa). `boss ops
+  converge and verifies it again — what it can reach of david's home,
+  either docker socket and the token paths included — ahead of every
+  runner tick. **If it does not verify, no probe runs on this host** —
+  never as david — and each car records did-not-run with that tick's own
+  reason, retried hourly; the converge packet says what the converge
+  found under `probe_account` (`STOPPED: …` when the account does not
+  verify, `NOT REPAIRED: …` when a repair failed but it does) and the
+  next converge repairs what it can (decision c98c79aa; backlog
+  dda26693). `boss ops
   forge probe-account-controls` runs the controls that prove the
   account on this host (backlog 703358ce). `boss ops forge
   probe-door-check` checks, as root and by what it then finds on disk,
@@ -356,8 +366,10 @@ The recurring one (2026-08-17, 08-22, 09-02, 09-03, 09-05). Symptoms:
 
 Consumers, largest first, as measured: the system daemon's per-train
 CI images (81 GB on 2026-09-05 — since 2026-09-10 pruned by AGE on
-every hourly pass, not only below the floor), the rootless daemon's converge
-build cache, `/opt/forgejo/data` (33 GB, grows with packages and
+every hourly pass, not only below the floor), the converge's build
+cache (on the system daemon since backlog 683d7fe9; the rootless
+daemon still holds what it left there, 76 GB on 2026-10-07, until David
+frees it), `/opt/forgejo/data` (33 GB, grows with packages and
 Actions logs), and each cold `target/` (about 40 GB since lean builds
 landed 2026-09-04). Read with `disk-report`; reclaim with
 `reclaim-disk`; beyond the sweep's bound — `docker image prune -a` on
@@ -415,7 +427,8 @@ things went wrong at once, and each now has its own guard:
   literal image tag (`b2814ef`, a 2026-08-10 build that cannot boot
   against today's registry). Now (`cluster-deploy-lib.sh`) it rolls back
   to the last CONVERGED build by image name — the sha in
-  `~/.boss-last-built` — verifies it Ready, and applies manifests with
+  `/var/lib/boss/converge/last-built` (david's `~/.boss-last-built`
+  until backlog 683d7fe9) — verifies it Ready, and applies manifests with
   that same image so no placeholder revision exists.
 - **Nothing proved the image could boot.** Now the converge runs the
   image's own `boss-launch --check` before anything is applied; a head
@@ -434,16 +447,24 @@ things went wrong at once, and each now has its own guard:
   the kind's next packet as `unrecorded_runs`.
 
 The lever, by name, if it is ever needed by hand again:
-`rollback-to <sha>` as an ops verb, or on this host
-`sudo docker run --rm --network host -v /home/david/kc.yaml:/kc:ro
+`rollback-to <sha>` as an ops verb, or on this host, as root,
+`docker run --rm --network host -v /etc/boss-ops/kubeconfig:/kc:ro
 alpine/k8s:1.33.3 kubectl --kubeconfig=/kc -n boss rollout undo
 deployment/boss --to-revision=<revision whose image is the last converged
 sha>`; read the revision from `rollout history --revision=N`. And the
-converge by hand, bypassing its packet step (the runner takes the
-checkout lock itself; only the git you run by hand needs the `flock`):
-`cd /home/david/boss && flock .git/boss-converge.lock git fetch -q
-forgejo main && flock .git/boss-converge.lock git checkout -qf
-forgejo/main && infra/forge/cluster-deploy-runner.sh`.
+converge by hand, as root, is its UNIT, never its script:
+`systemctl start cluster-deploy-runner.service` (add `--no-block` to
+return at once; `journalctl -u cluster-deploy-runner -f` follows it). The
+unit's packet step no longer stands in the way — its wrap carries `-` and
+exits 0 on a dark or failing API (above) — and the unit is what gives the
+run its environment: the 0700 runtime directory the machine token's header
+file lives in, and the alert spool the run replays as root. systemd also
+never runs two at once; a second `start` while one is active joins it. The
+script run bare by root is the shape review 1ba2873d refused (B2): it used
+to replay `/var/tmp/boss-alert-spool`, which every account can write, with
+the machine token. The runner now defaults to its own spool whoever starts
+it, and each run executes from a view of its own, but the unit stays the
+door.
 
 ### 6. The cluster is dark and nobody is awake
 
@@ -501,8 +522,12 @@ Now: every git user of the checkout goes through
 `.git/boss-converge.lock`, a stale-`index.lock` sweep that removes the
 file only when `/proc` shows no live `git` in the checkout (and logs
 the removal), and a 5 × 6 s retry on the two lock errors; any other git
-error is a verdict and is not retried. The symptom to read in
-`journal-tail cluster-deploy-runner` is a `checkout-lock:` line — `hit
+error is a verdict and is not retried. (Since backlog 683d7fe9 the
+cluster converge touches no checkout at all — it runs from root's tree,
+whose refresh has a lock of its own — so the collision above cannot
+recur between those two; the lock still serialises `forge-converge`
+and a hand-run git.) The symptom to read in
+`journal-tail forge-converge` is a `checkout-lock:` line — `hit
 a git lock (try N of 5)`, `removed stale …/index.lock`, or `could not
 take … within 600s`, the last meaning something outside the protocol
 holds the checkout (a hand-run git; `unit-status forge-converge` and
@@ -518,9 +543,15 @@ Since backlog a604a35b root runs the forge converge, the backup, the CI
 reaper, both observers and the cluster watchdog from
 `/var/lib/boss/tree/current` — a tree root fetched from the forge's own
 repository (`infra/forge/root-tree.sh`) — and not from
-`/home/david/boss`. The cluster converge, the disk sweep and the ops
-runner's verbs still run from the checkout; each is a row of
-`no_unattended_unit_runs_from_a_home.rs` or said in `install.sh`.
+`/home/david/boss`; since backlog 683d7fe9 the cluster converge and the
+disk sweep do too, and the cluster converge refreshes the tree itself
+before it builds. Since stage 2 of design c98c79aa the ops runner and
+every verb script it runs do too: `unit-cat boss-ops-runner` shows the
+drop-in's `ExecStart=/var/lib/boss/tree/current/infra/ops/ops-runner.sh`
+and `Environment=BOSS_OPS_CHECKOUT=/home/david/boss` — the checkout
+handed to the verbs that tag, sweep branches or read the converged
+history, whose git runs there as its owner. Root executes nothing from
+it.
 
 What to read, all through existing doors:
 
@@ -538,7 +569,14 @@ What to read, all through existing doors:
   or `FAILED:` / `REFUSED:` with `current stays at …`), `runs_from` is
   the generation the rest of that run executed from, `units_held` names
   a command a unit needed that was not there (and `summary` then starts
-  `HELD`).
+  `HELD`). A `REFUSED:` tree, held units and a refused host check also
+  leave `output` on that packet — one `RED forge-converge/root-tree …`,
+  `RED forge-converge/units-held …` or `RED forge-converge/host-check …`
+  line each — from which the rule
+  `file-backlog-items-on-forge-converge-red` files ONE backlog-item per
+  route while it is open (`red_route` on the item, `judged` on the
+  packet). A converge red for any other reason files nothing and is
+  read here.
 - `boss ops forge journal-tail forge-converge` — every run from the new
   unit starts with one `forge-converge-launch:` line. `running current
   (…) — it is the good generation` is the steady state. **Root is still
@@ -569,6 +607,14 @@ The three ways it shows:
   the fix once main carries it. So the repair is a car, as for any other
   defect. `current … has run N time(s) without marking itself good` in
   the journal is the symptom.
+- **The launcher itself** (`/usr/local/libexec/boss/forge-converge-launch`)
+  has no fallback — it is what picks the fallback — so `install.sh`
+  replaces it only from a generation that has marked itself `good`, one
+  tick after that generation first arrives, and never with a copy that
+  does not parse (`bash -n`). `launcher` on the packet reads `kept: …`
+  on the tick a train arrives, `installed from …` on the next, and
+  `REFUSED: … does not parse` — a red run, the installed launcher still
+  choosing — when main carries a broken one.
 
 **Going back, in this order.** The target is always a NAMED commit:
 the revert of the car on forge main. Write its full sha down first
@@ -590,22 +636,44 @@ checked against it.
    tick that lands in them runs from the export once.
 2. **Only if the tree's converge cannot run at all** (no
    `forge-converge-launch:` line reaches `install.sh`, tick after tick,
-   with the revert already on main): as root on the host, with the
-   checkout AT THE REVERT — `git -C /home/david/boss rev-parse HEAD`
-   prints the sha you wrote down; the cluster converge checks it out a
-   minute or two after the merge — run
-   `/home/david/boss/infra/forge/install.sh`. **Without the revert on
-   main a hand install is undone at the next tick**: the unit it
-   reinstalls runs the checkout's converge, which fetches main, checks
-   it out, and runs the car's installer — which brings the tree and
-   cuts over again. A hand install from an older checkout is not a
-   rollback; it is ten minutes.
-3. **What to hold meanwhile.** `boss ops forge hold-converge <reason>` holds the
-   CLUSTER converge: main is not built or rolled while the host's own
-   repair loop is in question, and `release-converge` lifts it. It does
-   not stop `forge-converge`, which has no hold; for the hand path
-   alone, stop its timer first (`systemctl stop forge-converge.timer`,
-   as root) and start it again after the install.
+   with the revert already on main), the hand path, in this order —
+   the order is the point (delta review aa901496, N1: it used to hold
+   first, and then nothing could do the next line):
+   1. **The checkout reaches the revert.** With the tree's converge
+      down, nothing unattended moves `/home/david/boss` any more — the
+      cluster converge did until backlog 683d7fe9, and runs from root's
+      tree now — so move it as the checkout's owner, under the checkout
+      lock: `sudo -u david flock /home/david/boss/.git/boss-converge.lock
+      git -C /home/david/boss fetch -q forgejo main`, then the same with
+      `checkout -qf <the sha you wrote down>`. Read it as the owner,
+      `sudo -u david git -C /home/david/boss rev-parse HEAD`, until it
+      prints that sha. (A plain `git -C` in a root login shell answers
+      `detected dubious ownership` and no sha.) A standing hold does not
+      stop this read; it stops only the build and the roll.
+   2. **Then hold.** `boss ops forge hold-converge <reason>` holds the
+      CLUSTER converge: main is not built or rolled while the host's own
+      repair loop is in question. It does not stop `forge-converge`,
+      which has no hold; stop its timer as root
+      (`systemctl stop forge-converge.timer`).
+   3. **Then install**, as root: `/home/david/boss/infra/forge/install.sh`.
+   4. **Then let go**: start the timer again
+      (`systemctl start forge-converge.timer`) and
+      `boss ops forge release-converge`.
+
+   **Without the revert on main a hand install is undone at the next
+   tick**: the unit it reinstalls runs the checkout's converge, which
+   fetches main, checks it out, and runs the car's installer — which
+   brings the tree and cuts over again. A hand install from an older
+   checkout is not a rollback; it is ten minutes.
+3. **A hold is not part of step 1.** The merged revert rolls the host
+   back by itself, and the cluster converge is how the cluster follows
+   main; holding it there only stops that. A hold
+   left standing says so: every held tick's `maintenance-cluster-converge`
+   packet carries `converge_held`, `held_since`, `held_for_s`,
+   `cluster_at` (the build the cluster stays on) and `main_at`, and one
+   that has stood six hours with
+   main moved past it raises ONE urgent item for the platform owner
+   (`hold_alarm` on the packet says when, or why not).
 4. **Reading that it worked.** `unit-status forge-converge`: `Loaded:`
    and the `Process:` line name `/home/david/boss/infra/forge/forge-converge.sh`.
    `journal-tail forge-converge`: the newest run has no
@@ -646,7 +714,10 @@ and then:
   estate's <node> — it holds [...] and … declares [...] for <node>`.
   Both lists are in that line: the fault is whichever one is wrong.
   Nothing was fetched, installed or deposited on that tick, and the
-  units already installed keep running as they were.
+  units already installed keep running as they were. On the forge the
+  refusal also leaves `RED forge-converge/host-check refused: …` as the
+  packet's `output`, so `file-backlog-items-on-forge-converge-red` files
+  ONE backlog-item for it while one is open.
 - **Why a merge does not fix it by itself.** A refused converge fetches
   nothing, so a corrected `estate.toml` on main does not reach the host
   on its own. The loop stays stopped until one run is let through.

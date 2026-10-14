@@ -46,7 +46,6 @@ async fn serve(roster: Vec<Employee>) -> (String, Arc<InMemoryPeople>) {
         people: people.clone(),
         publisher: None,
         policy: Some(Arc::new(PermissivePolicyClient) as Arc<dyn PolicyClient>),
-        subject_kinds: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

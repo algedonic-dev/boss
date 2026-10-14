@@ -87,6 +87,21 @@ pub struct Reprojected {
     /// place a terminal row's status moves, and only through this flag:
     /// both adapters otherwise freeze a skipped row as a completed one.
     pub unskipped: bool,
+    /// The version of the row this plan was computed from, carried from
+    /// its read ([`plan_read`], `list_steps_versioned`). Both adapters
+    /// refuse the whole move with [`crate::port::JobsError::StepChanged`]
+    /// when the row stands at any other version under its lock — or when
+    /// this is `None`, since a plan holding no read cannot say which row
+    /// it was computed from (backlog e6b05dd6, third review 85c11887 B1).
+    ///
+    /// WHY. The convert door plans from a read and writes later, and the
+    /// write was the row as planned with no compare. A first claim
+    /// landing in between was erased — its holder and its
+    /// `records_before_claim_closed_at` mark — so a release, a launch
+    /// record and a re-claim forged a launch the run wrote itself. Every
+    /// judged step write already compares; the re-pin was the one that
+    /// did not. A refused move is run again from a fresh read.
+    pub read: Option<crate::port::StepVersion>,
 }
 
 /// Everything one re-pin writes to the step rows.
@@ -266,11 +281,32 @@ pub fn plan(
                 changed,
                 kept,
                 unskipped,
+                read: None,
             });
         }
     }
     if !refused.is_empty() {
         return Err(Unplannable(refused.join("; ")));
+    }
+    Ok(out)
+}
+
+/// [`plan`] from a VERSIONED read — the one a move is written from. Each
+/// re-projected row carries the version its row was read at
+/// ([`Reprojected::read`]), so the adapter writes it only if nothing
+/// wrote the row since (third review 85c11887 B1).
+pub fn plan_read(
+    from: &WorkflowSpec,
+    to: &WorkflowSpec,
+    job: &Job,
+    rows: &[(Step, crate::port::StepVersion)],
+) -> Result<RepinPlan, Unplannable> {
+    let steps: Vec<Step> = rows.iter().map(|(s, _)| s.clone()).collect();
+    let versions: HashMap<StepId, crate::port::StepVersion> =
+        rows.iter().map(|(s, v)| (s.id, *v)).collect();
+    let mut out = plan(from, to, job, &steps)?;
+    for r in &mut out.reprojected {
+        r.read = versions.get(&r.step.id).copied();
     }
     Ok(out)
 }
@@ -1042,5 +1078,56 @@ mod tests {
         let approve = named(&p, "approve");
         assert_eq!(approve.step.metadata["procedure"], "Read all of it.");
         assert_eq!(approve.step.metadata["plan"], "PLAN a");
+    }
+
+    /// A MOVE CARRIES THE VERSION OF EACH ROW IT WAS PLANNED FROM (third
+    /// review 85c11887 B1): `plan_read` stamps every re-projected row
+    /// with its own row's version, and the pure `plan` with none — which
+    /// both adapters refuse to write, so no plan writes a row it did not
+    /// read.
+    #[test]
+    fn a_plan_read_carries_each_rows_version() {
+        let j = job();
+        let mut moved = step("building");
+        moved.metadata_defaults = json!({ "procedure": "v2 text" });
+        let v1 = wf(1, vec![step("building"), step("after")]);
+        let v2 = wf(2, vec![moved, step("after")]);
+        let rows = admitted(&v1, &j, &[]);
+        let versioned: Vec<(Step, crate::port::StepVersion)> = rows
+            .iter()
+            .enumerate()
+            .map(|(n, s)| (s.clone(), crate::port::StepVersion::new(40 + n as i64)))
+            .collect();
+        let read = plan_read(&v1, &v2, &j, &versioned).expect("planned");
+        assert!(!read.reprojected.is_empty(), "{read:?}");
+        for r in &read.reprojected {
+            let (_, v) = versioned.iter().find(|(s, _)| s.id == r.step.id).unwrap();
+            assert_eq!(r.read, Some(*v), "{r:?}");
+        }
+        let bare = plan(&v1, &v2, &j, &rows).expect("planned");
+        assert!(bare.reprojected.iter().all(|r| r.read.is_none()));
+    }
+
+    /// A LIVE STEP'S BEFORE-CLAIM DECLARATION DOES NOT MOVE (backlog
+    /// e6b05dd6, re-review 211cbae4 N1). Up-pinned onto a Building whose
+    /// run claimed it under a version declaring nothing, the declaration
+    /// would make a record the run wrote itself read as its launch; a
+    /// down-pin that drops it, then an up-pin, reopens the same hole. A
+    /// completed step keeps what it ran under and is not judged.
+    #[test]
+    fn a_live_steps_before_claim_declaration_does_not_move() {
+        let j = job();
+        let plain = step("building");
+        let mut declaring = step("building");
+        declaring.metadata_defaults = json!({ "records_before_claim": ["launch.model"] });
+        for (from, to) in [(&plain, &declaring), (&declaring, &plain)] {
+            let v1 = wf(1, vec![from.clone()]);
+            let rows = admitted(&v1, &j, &[]);
+            let why = plan(&v1, &wf(2, vec![to.clone()]), &j, &rows).expect_err("refused");
+            assert!(why.0.contains("records_before_claim"), "{why:?}");
+            // Finished: nothing to refuse.
+            let done = admitted(&v1, &j, &["building"]);
+            plan(&v1, &wf(2, vec![to.clone()]), &j, &done).expect("a completed step is kept");
+        }
     }
 }

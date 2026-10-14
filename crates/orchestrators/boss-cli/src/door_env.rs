@@ -55,9 +55,86 @@ pub(crate) const DEV_CONTROL_CONTRACT: &str = include_str!(concat!(
     "/../../../infra/dev/control-contract.txt"
 ));
 
-/// Only the published dev control container carries this marker. Other
-/// hosts retain their existing execution door; workers have neither
-/// the marker nor the credential-bearing controller filesystem.
+/// The dev isolation store and its one selector, `<store>/enabled` (b3071bf4).
+/// On the /work PVC since design a68fc42a D6 (David, 2026-10-10): on the
+/// container's root fs a pod roll erased it, and every child of this CLI
+/// silently ran locally again. Spelled the same in the four pod doors and
+/// infra/dev/activate-control.py; infra/dev/control-tools_test.py holds
+/// them equal. Other hosts have no store; workers never mount /work.
+const DEV_CONTROL_STORE: &str = "/work/tools/dev-control";
+
+/// Where a child of this CLI runs, read off the selector.
+#[derive(Debug)]
+enum DevChild {
+    /// No selector: isolation was never turned on here (the held state).
+    Local,
+    /// An activated generation: through this published launcher.
+    Forward(std::path::PathBuf),
+    /// Anything else — a refused selector, a regular file, a link outside
+    /// the store's generations, an unreadable one (design a68fc42a D1).
+    Refuse(String),
+}
+
+fn dev_child_route(store: &Path) -> DevChild {
+    let selector = store.join("enabled");
+    match std::fs::symlink_metadata(&selector) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DevChild::Local,
+        Err(e) => DevChild::Refuse(format!(
+            "its selector {} could not be read ({e})",
+            selector.display()
+        )),
+        Ok(_) => match std::fs::read_link(&selector) {
+            Ok(target) if is_generation(store, &target) => {
+                DevChild::Forward(store.join("dev-build"))
+            }
+            Ok(target) => DevChild::Refuse(format!(
+                "its selector {} names {}, not an activated generation",
+                selector.display(),
+                target.display()
+            )),
+            Err(_) => DevChild::Refuse(format!(
+                "its selector {} is not a generation link",
+                selector.display()
+            )),
+        },
+    }
+}
+
+/// `<store>/generations/<40 lowercase hex>`, exactly what activation writes.
+fn is_generation(store: &Path, target: &Path) -> bool {
+    target.parent() == Some(store.join("generations").as_path())
+        && target
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| {
+                name.len() == 40 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+}
+
+/// The child becomes a refusal: it exits 75 naming the activation log and
+/// never runs the original program here (design a68fc42a D1).
+fn refuse_dev_child(cmd: &mut Command, store: &Path, why: &str) {
+    let message = format!(
+        "boss: REFUSED — dev isolation is on and {why}, so this child does not run beside this \
+         container's credentials (design a68fc42a D1). Why: {}. boss-api and boss without \
+         --built still run.",
+        store.join("activation.log").display()
+    );
+    let mut refused = Command::new("/bin/sh");
+    refused
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .arg("-c")
+        .arg("printf '%s\\n' \"$1\" >&2; exit 75")
+        .arg("boss-dev-control-refused")
+        .arg(message);
+    *cmd = refused;
+}
+
+/// Only a pod whose dev isolation is activated carries a selector naming
+/// a generation. Other hosts retain their existing execution door;
+/// workers have neither the selector nor the credential-bearing
+/// controller filesystem.
 fn forward_dev_child(cmd: &mut Command, launcher: &Path) {
     let program = cmd.get_program().to_os_string();
     let args: Vec<_> = cmd.get_args().map(std::ffi::OsStr::to_os_string).collect();
@@ -162,8 +239,11 @@ impl NoTokenInReach {
             cmd.env_remove(name);
         }
         cmd.env(boss_core::machine_token::TOKEN_DIR_ENV, self.dir());
-        if std::fs::symlink_metadata("/etc/boss-dev-control/enabled").is_ok() {
-            forward_dev_child(cmd, Path::new("/opt/boss-dev-control/dev-build"));
+        let store = Path::new(DEV_CONTROL_STORE);
+        match dev_child_route(store) {
+            DevChild::Local => {}
+            DevChild::Forward(launcher) => forward_dev_child(cmd, &launcher),
+            DevChild::Refuse(why) => refuse_dev_child(cmd, store, &why),
         }
         cmd
     }
@@ -353,6 +433,70 @@ mod tests {
             output.contains("literal; touch /control"),
             "argv remains data: {output}"
         );
+    }
+
+    /// Design a68fc42a D1/D6 (David, 2026-10-10): the selector lives on
+    /// the /work PVC, and every shape of it but a link to an activated
+    /// generation REFUSES — absent alone keeps the local door, because
+    /// absent is the never-activated (held) state, not a failure.
+    #[test]
+    fn the_dev_child_route_reads_the_one_selector_and_fails_closed() {
+        use std::os::unix::fs::symlink;
+        let root = boss_testing::scratch_dir("dev-control-route");
+        let store = root.join("dev-control");
+        std::fs::create_dir_all(&store).expect("mkdir the store");
+        let selector = store.join("enabled");
+        assert!(matches!(super::dev_child_route(&store), DevChild::Local));
+        let generation = store.join("generations").join("a".repeat(40));
+        symlink(&generation, &selector).expect("select a generation");
+        match super::dev_child_route(&store) {
+            DevChild::Forward(launcher) => assert_eq!(launcher, store.join("dev-build")),
+            _ => panic!("an activated generation forwards"),
+        }
+        let foreign = Path::new("/elsewhere/generations").join("a".repeat(40));
+        let short = store.join("generations/aaaa");
+        for shape in [
+            "refused",
+            "regular file",
+            "foreign generation",
+            "short name",
+        ] {
+            std::fs::remove_file(&selector).expect("reset the selector");
+            match shape {
+                "refused" => symlink("refused", &selector).unwrap(),
+                "regular file" => std::fs::write(&selector, "a generation").unwrap(),
+                "foreign generation" => symlink(&foreign, &selector).unwrap(),
+                _ => symlink(&short, &selector).unwrap(),
+            }
+            assert!(
+                matches!(super::dev_child_route(&store), DevChild::Refuse(_)),
+                "{shape} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_dev_child_exits_75_naming_the_log_and_never_runs_locally() {
+        let root = boss_testing::scratch_dir("dev-control-refused-child");
+        let marker = root.join("local-candidate-ran");
+        let candidate = root.join("candidate");
+        boss_testing::write_exec(
+            &candidate,
+            &format!("#!/bin/sh\nprintf read > '{}'\n", marker.display()),
+        );
+        let store = root.join("dev-control");
+        let mut command = Command::new(&candidate);
+        command.arg("literal; touch /control");
+        super::refuse_dev_child(&mut command, &store, "its selector names refused");
+        let result = command.output().expect("the refusal runs");
+        assert_eq!(result.status.code(), Some(75));
+        assert!(!marker.exists(), "a refused child never runs locally");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(&store.join("activation.log").display().to_string()),
+            "{stderr}"
+        );
+        assert!(stderr.contains("its selector names refused"), "{stderr}");
     }
 
     #[test]

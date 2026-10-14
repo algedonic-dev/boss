@@ -155,10 +155,10 @@ pub async fn run(want: &str) -> Result<()> {
     // `BOSS_JOBS_URL` unset this refuses and names the system of record
     // rather than defaulting to 127.0.0.1, which on boss-gcp is a
     // second, older stack holding different data (packet aa783636).
-    // Shared with the other read verbs via gate::resolve_jobs_base.
-    let base = crate::gate::resolve_jobs_base(None)?;
+    // Shared with the other read verbs via crate::sor_client::resolve_jobs_base.
+    let base = crate::sor_client::resolve_jobs_base(None)?;
     let url = format!("{base}/api/jobs?kind=user-feedback&limit=200&full=true");
-    let client = crate::gate::machine_client()?;
+    let client = crate::sor_client::machine_client()?;
     // Waits out a jobs-API roll (backlog 034002b3), like every verb.
     let user = crate::identity::header(&crate::identity::reader());
     let resp = crate::train::send_through_a_roll(&format!("GET {url}"), || {
@@ -248,13 +248,13 @@ mod tests {
     /// `http://127.0.0.1:7900`, so run on boss-gcp without an instance
     /// set it read the SECOND, older stack — a confident answer about
     /// the wrong deployment (packet aa783636). It now resolves through
-    /// `gate::resolve_jobs_base(None)`, which refuses when the env names
+    /// `crate::sor_client::resolve_jobs_base(None)`, which refuses when the env names
     /// no instance and points at the system of record. `queue` has no
     /// `--jobs-url` flag, so `None` is the whole input; this pins the
     /// refusal it now wires in.
     #[test]
     fn without_an_instance_the_queue_refuses_and_names_the_record() {
-        let m = crate::gate::resolve_jobs_base_from(None, None)
+        let m = crate::sor_client::resolve_jobs_base_from(None, None)
             .expect_err("no BOSS_JOBS_URL must refuse, not default to 127.0.0.1")
             .to_string();
         assert!(
@@ -270,7 +270,8 @@ mod tests {
     #[test]
     fn an_instance_env_gives_the_queue_its_base() {
         assert_eq!(
-            crate::gate::resolve_jobs_base_from(None, Some("http://sor:7900".into())).unwrap(),
+            crate::sor_client::resolve_jobs_base_from(None, Some("http://sor:7900".into()))
+                .unwrap(),
             "http://sor:7900",
             "BOSS_JOBS_URL, when set, is used verbatim"
         );

@@ -89,6 +89,12 @@ pub fn forge_absent_tools() -> Vec<&'static str> {
 /// a command. The cost of that is a refusal the builder can reword; the
 /// cost of the alternative is a shell parser to maintain.
 pub fn commands_invoked(probe: &str) -> Vec<&str> {
+    invoked_commands(probe)
+        .map(|(program, _)| program)
+        .collect()
+}
+
+fn invoked_commands(probe: &str) -> impl Iterator<Item = (&str, Vec<&str>)> {
     const NOT_THE_PROGRAM: [&str; 17] = [
         "if", "then", "elif", "else", "fi", "while", "until", "for", "do", "done", "case", "esac",
         "!", "time", "sudo", "env", "command",
@@ -96,19 +102,41 @@ pub fn commands_invoked(probe: &str) -> Vec<&str> {
     probe
         .split(['|', '&', ';', '\n', '(', ')', '`', '{', '}'])
         .filter_map(|segment| {
-            segment
+            let mut words = segment
                 .split_whitespace()
-                .map(|w| w.trim_matches(['"', '\'', '$', '\\']))
-                .find(|w| {
-                    !w.is_empty()
-                        && !w.contains('=')
-                        && !w.starts_with('-')
-                        && !NOT_THE_PROGRAM.contains(w)
-                })
-                .map(|w| w.rsplit('/').next().unwrap_or(w))
+                .map(|w| w.trim_matches(['"', '\'', '$', '\\']));
+            let program = words.find(|w| {
+                !w.is_empty()
+                    && !w.contains('=')
+                    && !w.starts_with('-')
+                    && !NOT_THE_PROGRAM.contains(w)
+            })?;
+            let program = program.rsplit('/').next().unwrap_or(program);
+            (!program.is_empty()).then(|| (program, words.collect()))
         })
-        .filter(|w| !w.is_empty())
-        .collect()
+}
+
+fn record_command<'a>(program: &'a str, arguments: &'a [&'a str]) -> (&'a str, &'a [&'a str]) {
+    if matches!(program, "bash" | "sh") {
+        // A known door run through its interpreter is still that door. Only
+        // the first script/command is inspected; an argument mentioning a
+        // reader does not turn an unrelated script into a known client.
+        match arguments
+            .iter()
+            .position(|w| !w.is_empty() && !w.starts_with('-'))
+        {
+            Some(index) => (
+                arguments[index]
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(arguments[index]),
+                &arguments[index + 1..],
+            ),
+            None => (program, arguments),
+        }
+    } else {
+        (program, arguments)
+    }
 }
 
 /// The tool the forge does not have that this probe would need, if any.
@@ -329,7 +357,14 @@ fn holds_a_gateway_session(probe: &str) -> bool {
 /// Commands that can perform the read. `python`/`python3` are here
 /// because the first measured instance was `urllib.request.urlopen`,
 /// not a curl.
-const HTTP_CLIENTS: [&str; 4] = ["curl", "wget", "python", "python3"];
+const HTTP_CLIENTS: [&str; 6] = [
+    "curl",
+    "wget",
+    "python",
+    "python3",
+    "boss-api-curl",
+    "boss-api-curl.sh",
+];
 
 /// The facilities a `python` would have to name to reach the network at
 /// all. A `python3` on the right of a pipe reads STDIN; it cannot open a
@@ -366,6 +401,56 @@ fn python_performs_the_read(probe: &str) -> bool {
     PYTHON_CAN_READ.iter().any(|f| probe.contains(f))
 }
 
+fn http_record_client(probe: &str) -> Option<&'static str> {
+    if !DIRECT_SOR_SPELLINGS.iter().any(|s| probe.contains(s)) && !probe.contains(SOR_PATH_SPELLING)
+    {
+        return None;
+    }
+    invoked_commands(probe).find_map(|(program, arguments)| {
+        let (c, _) = record_command(program, &arguments);
+        let client = HTTP_CLIENTS.iter().find(|h| **h == c).copied()?;
+        if matches!(client, "python" | "python3") && !python_performs_the_read(probe) {
+            return None;
+        }
+        Some(client)
+    })
+}
+
+/// Which known client consumes record data, regardless of its stated identity.
+/// The manual proof door asks this before execution when no reader credential
+/// exists (00227628, omitted-client defect 0b4705f8). Identity alone cannot
+/// supply that credential. Reuse the HTTP target/parser distinction below;
+/// a door-fed parser is not itself another client. `boss-gateway-read` is
+/// deliberately different: its published door discards the body and prints
+/// only the status for a public denial check. Mixing it with a record client
+/// still returns that client. This remains a bounded command scan, not a
+/// classifier for arbitrary programs hidden behind shell text.
+pub fn record_read_client(probe: &str) -> Option<&'static str> {
+    const RECORD_DOORS: [&str; 2] = [SOR_READER, "boss-api"];
+    invoked_commands(probe)
+        .find_map(|(program, arguments)| {
+            let (program, arguments) = record_command(program, &arguments);
+            if program == "boss" {
+                // The CLI can read the record without spelling a URL. Its
+                // published help and these read-free commands cannot:
+                // main dispatches them before any API adapter is called.
+                // Other CLI commands conservatively require the reader.
+                let help = arguments
+                    .iter()
+                    .any(|a| matches!(*a, "--help" | "-h" | "--version" | "-V"));
+                let read_free = arguments.first().is_none_or(|a| {
+                    matches!(
+                        *a,
+                        "help" | "reach" | "probe-door-check" | "dev-control-contract"
+                    )
+                });
+                return (!help && !read_free).then_some("boss");
+            }
+            RECORD_DOORS.iter().find(|door| **door == program).copied()
+        })
+        .or_else(|| http_record_client(probe))
+}
+
 /// Does this probe read the system of record WITHOUT saying who it is?
 /// Returns the client it would read with.
 ///
@@ -394,23 +479,13 @@ fn python_performs_the_read(probe: &str) -> bool {
 /// that routine is read by nobody (CLAUDE.md §Diagnosis).
 pub fn reads_the_sor_unidentified(probe: &str) -> Option<&'static str> {
     let direct = DIRECT_SOR_SPELLINGS.iter().any(|s| probe.contains(s));
-    if !direct && !probe.contains(SOR_PATH_SPELLING) {
-        return None;
-    }
     if probe.contains(SOR_USER_VAR) {
         return None;
     }
     if !direct && holds_a_gateway_session(probe) {
         return None;
     }
-    commands_invoked(probe).into_iter().find_map(|c| {
-        let client = HTTP_CLIENTS.iter().find(|h| **h == c).copied()?;
-        // A python handed a pipe is a parser, not a reader.
-        if matches!(client, "python" | "python3") && !python_performs_the_read(probe) {
-            return None;
-        }
-        Some(client)
-    })
+    http_record_client(probe)
 }
 
 /// WHY AN UNIDENTIFIED READ IS REFUSED RATHER THAN DOCUMENTED — the
@@ -1150,20 +1225,51 @@ writes no new fact after it unless the service restarted, and 'no fact after the
 then true of a caller that presented nothing. Eight recorded car probes held that shape \
 on the day it was measured, five of them on cars already recorded PROVEN.\n\
 Read the same window's LIVE tally as well, for the service the caller calls, and answer \
-not-yet when it cannot be read whole — an overflowed tally names no caller:\n  \
+not-yet when it cannot be read whole — an overflowed tally names no caller.\n\
+And the live rows clear a caller only for the stretch the tally RECORDED (backlog a3b383c5, \
+review aa1a9c75 of car 59e0d3dd): the tally lives in memory, so every jobs restart — every \
+train — empties it, and a gate in `off` records nothing. An empty tally that began after \
+the cut is silence about a stretch it never watched, and on an hourly recheck it usually \
+did. So the reading is a not-yet, never a pass, unless its recording_since is at or before \
+the cut, its mode is report or enforce, and both overflows are empty:\n  \
 live=$(boss-sor-read \"/api/events/gate-window?gate=machine-gate&hours=$hours\" | jq -r --argjson cut \"$cut\" '\n    \
 def epoch: sub(\"\\\\.[0-9]+\"; \"\") | fromdateiso8601;\n    \
 ([ .live[]? | select(.service == \"jobs\") ] | first) as $j\n    \
-| if $j == null or $j.error != null or (($j.snapshot.rows | type) != \"array\") or (($j.snapshot.overflow // 0) != 0) then \"unreadable\"\n      \
+| if $j == null or $j.error != null or (($j.snapshot.rows | type) != \"array\") then \"unreadable\"\n    \
+elif ($j.snapshot.mode != \"report\" and $j.snapshot.mode != \"enforce\") or $j.snapshot.overflow != 0\n      \
+or (($j.snapshot.source_overflow // []) | length) != 0 or ($j.snapshot.recording_since | type) != \"string\"\n      \
+or ($j.snapshot.recording_since | epoch) > $cut then \"uncovered\"\n    \
 else ([ $j.snapshot.rows[] | select(.user == \"<the caller>\" and .presented == \"none\") | select((.last_seen | epoch) > $cut) ] | length | tostring) end')\n  \
-case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally could not be read whole'; exit 75;; esac\n  \
+case ${live:-empty} in uncovered) echo 'not yet: the live tally did not record the whole window'; exit 75;; unreadable|empty|*[!0-9]*) echo 'not yet: the live tally could not be read whole'; exit 75;; esac\n  \
 if [ \"$live\" -gt 0 ]; then echo \"FAILED: $live tokenless row(s) seen since the cut\"; exit 1; fi";
+
+/// What a probe's text must read of the live tally before its rows may
+/// clear a caller (backlog a3b383c5): WHEN the tally began, WHETHER it
+/// was recording, and WHETHER it held every key — the three ways an
+/// empty tally is silence rather than evidence. One list, read by
+/// `reads_the_live_tally_with_its_coverage` and named in the evidence
+/// above (§9a).
+pub const LIVE_TALLY_COVERAGE: [&str; 3] = ["recording_since", ".mode", ".overflow"];
+
+/// The rule id for [`clears_a_caller_from_the_gate_log_alone`], recorded
+/// on a car's `proof_attempt` by the one door that REFUSES the shape —
+/// the unattended run-car-probe rule, which has no person to warn.
+pub const GATE_LOG_ALONE_RULE: &str = "clears-a-caller-from-the-gate-log-alone";
 
 /// The two kinds a tokenless request is stated under on the gate's log:
 /// `would_refuse` while the gate reports, `refused` once it enforces.
 /// Both are written by `MachineGate::record` on a key's first sighting
 /// and by nothing afterwards.
 const GATE_MISS_KINDS: [&str; 2] = ["machine_gate.would_refuse", "machine_gate.refused"];
+
+/// What [`clears_a_caller_from_the_gate_log_alone`] names when the
+/// probe counts `log.dirty` and names NO fact kind at all — car
+/// 59e0d3dd's spelling (`[.log.dirty[] | select(.payload.key.user ==
+/// …)] | length`). `log.dirty` holds only would-refuse, refusal and
+/// overflow facts (`Window::dirty`, boss-core `gate_evidence.rs`), so a
+/// caller filter over it IS a count of the two once-per-key kinds,
+/// whether or not it says so (review 4ce5ca85 B2, e8f13664 FN5).
+const NO_KIND_NAMED: &str = "machine_gate.would_refuse or .refused (no kind named)";
 
 /// WHEN A PROBE CLEARS A CALLER FROM THE GATE LOG ALONE — the tenth
 /// shape, and one that fails OPEN.
@@ -1180,18 +1286,33 @@ const GATE_MISS_KINDS: [&str; 2] = ["machine_gate.would_refuse", "machine_gate.r
 /// same-head re-gate; of the eight other cars measured carrying it,
 /// five had landed and been recorded PROVEN on it.
 ///
-/// Returns the fact kind as written, so the warning can name it. Four
-/// conditions, all required, each there to keep a correct probe quiet:
+/// Returns the fact kind as written (or [`NO_KIND_NAMED`]), so the
+/// warning can name it. Four conditions, all required, each there to
+/// keep a correct probe quiet:
 ///
 /// - it reads the `gate-window`;
 /// - it reads that window's `log.dirty` — the list a clean claim is
 ///   counted over;
 /// - it names a kind the gate writes once per key (`would_refuse`,
-///   `refused`), because a window read for its roster, its coverage or
-///   its `asked` facts makes no claim this gap can break;
-/// - and it never reads `snapshot.rows`, the live tally's rows, where
-///   every request moves a `last_seen` whether or not a fact was
-///   written. A probe that names them has taken the second reading.
+///   `refused`), OR names no `machine_gate.` kind at all. A window read
+///   for its roster or its coverage never touches `log.dirty`; one that
+///   names ANOTHER kind there (`machine_gate.asked`, counted to show the
+///   reader files no ask as dirty) is asking how the reader classifies,
+///   which this gap cannot break. But a `log.dirty` count that names no
+///   kind is counting the once-per-key kinds under another spelling:
+///   car 59e0d3dd carried exactly that, and cars f6e406bf and cee7d4bb
+///   were recorded PROVEN on it by the unattended door (measured
+///   2026-10-10, review 4ce5ca85 B2) — the condition that used to
+///   require a named kind let every one of them through;
+/// - and it never takes the second reading WHOLE: the live tally's rows
+///   (`snapshot.rows`, or `/api/machine-gate/misses`), where every
+///   request moves a `last_seen` whether or not a fact was written,
+///   together with the tally's coverage — [`LIVE_TALLY_COVERAGE`], see
+///   `reads_the_live_tally_with_its_coverage`. Rows read without it
+///   used to pass here (review aa1a9c75 of car 59e0d3dd), and an
+///   hourly recheck usually reads a tally a train restarted after the
+///   cut, so its silence covers none of the window and the log alone
+///   judged after all (backlog a3b383c5).
 ///
 /// WARNING, NOT REFUSAL, on its siblings' argument and no stronger one:
 /// the text cannot tell an ABSENCE assertion ("no fact since the cut"),
@@ -1199,17 +1320,148 @@ const GATE_MISS_KINDS: [&str; 2] = ["machine_gate.would_refuse", "machine_gate.r
 /// ("the gate did record this caller"), which the log answers correctly
 /// and which fails closed. So it is said at the two doors with a reader
 /// — `boss gate --park-probe` and `boss prove` — and its text says which
-/// way it fails.
-pub fn clears_a_caller_from_the_gate_log_alone(probe: &str) -> Option<&str> {
+/// way it fails. The door with NO reader, the unattended run-car-probe
+/// rule, refuses it instead under [`GATE_LOG_ALONE_RULE`]: there a warning
+/// is read by nobody, and recording was measured to file false proofs.
+/// And since 5605c2b5 `boss gate --park-probe` refuses it too: all ten
+/// false proofs were parked past its warning, and once the unattended
+/// door refuses the shape a car parked with it can never be machine-
+/// proven — so the warning there only deferred a refusal to the moment
+/// the car could no longer be re-parked. `boss prove` alone still warns.
+pub fn clears_a_caller_from_the_gate_log_alone(probe: &str) -> Option<&'static str> {
     if !probe.contains("gate-window")
         || !probe.contains("log.dirty")
-        || probe.contains("snapshot.rows")
+        || reads_the_live_tally_with_its_coverage(probe)
     {
         return None;
     }
     GATE_MISS_KINDS
         .iter()
-        .find_map(|kind| probe.find(kind).map(|i| &probe[i..i + kind.len()]))
+        .find(|kind| probe.contains(*kind))
+        .copied()
+        .or_else(|| (!probe.contains("machine_gate.")).then_some(NO_KIND_NAMED))
+}
+
+/// Does this probe read the machine gate's LIVE tally together with
+/// what says the tally covered the window — when it began recording,
+/// its mode, its overflow ([`LIVE_TALLY_COVERAGE`])? (backlog a3b383c5)
+///
+/// THE DEFECT. The tally (`Misses` in boss-core's `machine_gate.rs`)
+/// lives in memory: a restart empties it and resets `recording_since`,
+/// a gate in `off` records nothing, and a key past the tally's bound is
+/// counted only in `overflow`. Every train restarts the jobs service,
+/// so a probe rechecked hourly usually reads a tally that began AFTER
+/// its cut — and "no tokenless row since the cut" is then true of a
+/// caller that sent nothing but tokenless requests before the restart,
+/// whose one log fact predates the cut too. Reading the rows without
+/// the coverage is reading the log alone with extra steps.
+///
+/// A text check, like every rule in this file: it cannot see that the
+/// probe COMPARES `recording_since` with its cut, only that it reads
+/// all three; [`GATE_LOG_ALONE_EVIDENCE`] carries the comparison that
+/// answers not-yet, never a pass.
+///
+/// Private on purpose: it is a PART of the gate-log-alone detector, not
+/// a detector of its own — a probe that reads no log at all is not
+/// judged by it — so it reaches every door through that one function
+/// and `every_probe_detector_reaches_a_door` has nothing to chain.
+fn reads_the_live_tally_with_its_coverage(probe: &str) -> bool {
+    (probe.contains("snapshot.rows") || probe.contains("machine-gate/misses"))
+        && LIVE_TALLY_COVERAGE
+            .iter()
+            .all(|field| probe.contains(field))
+}
+
+/// THE HAND PROOF, AS EVERY DOOR THAT NAMES IT SPELLS IT (review
+/// 446039a0 F1). A refusal on a landed car sends its reader to `boss
+/// prove` with a replacement probe, and three doors said so in three
+/// copies — the unattended executor, the dispatcher's pre-filing
+/// refusal, and the EVENT-BOUND note — of which two left out
+/// `--verified`, which the hand door requires whenever `--probe` is
+/// given. The command they printed was itself refused. One spelling,
+/// held to the CLI's own parse by `boss-cli`'s test (§9a).
+pub fn hand_proof_command(car_id: &str) -> String {
+    format!(
+        "boss prove {car_id} --probe '<that probe>' --expect '<the line it prints>' \
+         --verified '<what it shows, in prose>'"
+    )
+}
+
+/// The hand door's run of the car's OWN recorded probe — the way round
+/// for a shape the unattended door refuses and the hand door only warns
+/// of, when a person can say the warning does not apply (review
+/// 446039a0 F3: a PRESENCE claim over the gate log).
+pub fn from_car_command(car_id: &str) -> String {
+    format!("boss prove {car_id} --from-car")
+}
+
+/// The rule id for [`pins_file_bytes`], said by the door that refuses it.
+pub const PINNED_BYTES_RULE: &str = "pins-file-bytes";
+
+/// The measured evidence for [`pins_file_bytes`], in one copy.
+pub const PINNED_BYTES_EVIDENCE: &str = "\
+Measured 2026-10-10 (backlog 2770eba8, review 2640f08a of car 1ef711ce): that car's probe \
+pinned the exact blob id of 55 paths, Cargo.lock among them, as they stood at the commit it \
+was written on. At the car's own rerailed head 9 of the 55 already differed and it answered \
+not-yet; after a squash onto a main that any other car has touched since, it answers FAILING \
+on correct code — the class car bfb219b4 was recorded under. A blob id proves which bytes \
+were checked out, not that the change does what it says, and every train that edits one of \
+those files moves it. Of the 1613 recorded car probes read that day, 28 carried the shape, \
+one of them on a car still open.\n\
+Assert the behaviour instead: the definition that must exist (`grep -c '^pub fn <name>('`), \
+the line that must be gone, the verb's output on a fixture, or the record the change \
+writes.";
+
+/// WHEN A PROBE PINS A FILE'S BYTES — a blob id or a digest compared to
+/// a literal (backlog 2770eba8).
+///
+/// Returns the reading tool, so the refusal can name it. Two conditions,
+/// both required:
+///
+/// - the probe reads a content id: `git rev-parse <ref>:<path>` (a
+///   blob or tree id — a colon the shell owns, as in `${1:-HEAD}`, is
+///   not one), `git hash-object`, or a `sha256sum` / `sha1sum` /
+///   `md5sum`;
+/// - and it carries a LITERAL 40- or 64-hex id to compare that against.
+///
+/// The literal is what makes it a pin. A probe that hashes its own
+/// fixture and checks the verb printed the same digest (car c6e882c7)
+/// computes both sides, holds no literal, and is a behavioural test.
+pub fn pins_file_bytes(probe: &str) -> Option<&'static str> {
+    if !carries_a_hex_id(probe) {
+        return None;
+    }
+    if pipelines(probe).into_iter().any(rev_parses_a_path) {
+        return Some("git rev-parse <ref>:<path>");
+    }
+    ["git hash-object", "sha256sum", "sha1sum", "md5sum"]
+        .into_iter()
+        .find(|tool| probe.contains(tool))
+}
+
+/// A maximal run of lowercase hex exactly 40 (sha-1) or 64 (sha-256)
+/// long, not part of a longer word.
+fn carries_a_hex_id(probe: &str) -> bool {
+    probe.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| {
+        (w.len() == 40 || w.len() == 64)
+            && w.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    })
+}
+
+/// `rev-parse` handed a `<ref>:<path>` argument in this segment, read up
+/// to the command substitution or pipe that ends it.
+fn rev_parses_a_path(segment: &str) -> bool {
+    segment.match_indices("rev-parse").any(|(i, _)| {
+        let rest = &segment[i + "rev-parse".len()..];
+        let args = &rest[..rest.find([')', '|']).unwrap_or(rest.len())];
+        args.split_whitespace()
+            .filter(|w| !w.starts_with('-'))
+            .any(|w| {
+                w.match_indices(':')
+                    .any(|(j, _)| !matches!(w[j + 1..].chars().next(), Some('-' | '=' | '+' | '?')))
+            })
+    })
 }
 
 /// WHEN A PROBE GREPS A NAME WHERE A DEFINITION IS MEANT — the eighth
@@ -1934,6 +2186,111 @@ case "$key" in ecdsa-*|ssh-*) echo "DEV DOOR CA RECORDED";; *) echo "observation
             None
         );
         assert_eq!(names_an_actor("boss-sor-read /api/yard/status"), None);
+    }
+
+    #[test]
+    fn known_record_clients_share_target_and_parser_classification() {
+        for (probe, client) in [
+            ("boss-api GET /api/jobs/fixture | jq .status", "boss-api"),
+            (
+                "env BOSS_SOR_SERVICE=jobs command /work/tools/bin/boss-api GET /api/jobs/fixture",
+                "boss-api",
+            ),
+            (
+                "x=$(boss-sor-read /api/jobs/fixture); echo done",
+                SOR_READER,
+            ),
+            (
+                "curl -H \"x-boss-user: $BOSS_SOR_USER\" $BOSS_JOBS_URL/api/jobs/fixture",
+                "curl",
+            ),
+            ("wget -qO- $BOSS_JOBS_URL/api/jobs/fixture", "wget"),
+            (
+                "python -c \"import requests; requests.get('$BOSS_JOBS_URL/api/jobs/fixture')\"",
+                "python",
+            ),
+            (
+                "python3 -c \"import urllib.request; urllib.request.urlopen('$BOSS_JOBS_URL/api/jobs/fixture')\"",
+                "python3",
+            ),
+            (
+                "boss-api GET /api/jobs/fixture | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+                "boss-api",
+            ),
+        ] {
+            assert_eq!(record_read_client(probe), Some(client), "{probe}");
+        }
+        for probe in [
+            "git show HEAD:infra/dev/boss-api | grep -c 'GET /api/jobs'",
+            "echo boss-api reads the record",
+            "printf '%s' '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+            "grep -c BOSS_JOBS_URL infra/ops/ops-runner.sh",
+            "curl -fsS https://example.com/health",
+            "git show HEAD:infra/forge/probe-bin/boss-sor-read",
+        ] {
+            assert_eq!(record_read_client(probe), None, "{probe}");
+        }
+    }
+
+    #[test]
+    fn the_public_gateway_status_door_cannot_launder_a_record_client() {
+        let source = include_str!("../../../../infra/forge/probe-bin/boss-gateway-read");
+        let production = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(production.contains("status=$(curl -sS -o /dev/null -w '%{http_code}'"));
+        assert!(production.contains("printf '%s\\n' \"$status\""));
+        assert!(production.contains("sor_port_for_service gateway"));
+        assert_eq!(record_read_client("boss-gateway-read /api/jobs"), None);
+        assert_eq!(
+            record_read_client("boss-gateway-read /api/jobs; boss-api GET /api/jobs"),
+            Some("boss-api")
+        );
+        assert_eq!(
+            record_read_client("boss-gateway-read /api/jobs; curl $BOSS_JOBS_URL/api/jobs"),
+            Some("curl")
+        );
+    }
+
+    #[test]
+    fn native_cli_and_published_wrappers_keep_their_actual_record_boundary() {
+        for (probe, client) in [
+            ("boss jobs --json", "boss"),
+            ("command /usr/local/bin/boss receipt fixture-car", "boss"),
+            ("boss job get fixture-job", "boss"),
+            ("boss orient", "boss"),
+            ("bash -c 'boss jobs --json'", "boss"),
+            ("bash infra/dev/boss-api GET /api/jobs/fixture", "boss-api"),
+            (
+                "bash infra/boss-api-curl.sh -fsS $BOSS_JOBS_URL/api/jobs/fixture",
+                "boss-api-curl.sh",
+            ),
+            (
+                "boss-api-curl -fsS $BOSS_JOBS_URL/api/jobs/fixture",
+                "boss-api-curl",
+            ),
+            ("boss --help; boss jobs --json", "boss"),
+            ("boss reach 192.0.2.1 80; boss job get fixture-job", "boss"),
+        ] {
+            assert_eq!(record_read_client(probe), Some(client), "{probe}");
+        }
+        for probe in [
+            "boss --help",
+            "boss help receipt",
+            "boss receipt --help",
+            "boss --version",
+            "boss reach 192.0.2.1 80",
+            "boss probe-door-check",
+            "boss dev-control-contract",
+            "bash -c 'boss reach 192.0.2.1 80'",
+            "# boss jobs reads the record\necho done",
+            "git show HEAD:infra/boss-api-curl.sh | grep -c curl",
+            "bash unrelated.sh boss-api /api/jobs/fixture",
+        ] {
+            assert_eq!(record_read_client(probe), None, "{probe}");
+        }
     }
 
     /// Every spelling the measured instances used: the env var, the
@@ -2721,15 +3078,87 @@ echo 'DISCOVER_ADMISSION_SOURCE_PRESENTS_THE_MACHINE_TOKEN'
         }
     }
 
-    /// The corrected probe is clean — the log leg WITH the live leg under
-    /// it — and so is car 217c2d66's, which read both in one jq.
+    /// THE SAME COUNT WITH NO KIND NAMED (review 4ce5ca85 B2; FN5 of
+    /// review e8f13664). `log.dirty` holds only would-refuse, refusal and
+    /// overflow facts, so a caller filter over it counts the once-per-key
+    /// kinds without spelling one. Verbatim from the recorded probes of
+    /// car 59e0d3dd (open, landing next) and car f6e406bf (recorded
+    /// PROVEN by the unattended door 2026-10-10T00:01Z on this text).
     #[test]
-    fn a_probe_that_also_reads_the_live_tally_is_not_reported() {
-        let corrected = format!("{F636_LOG_LEG}{F636_LIVE_LEG}");
-        for clean in [
-            corrected.as_str(),
-            r#"read_out=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --arg cut "$cut" 'if (.log_error == null) and ((.log.dirty | type) == "array") and ((.live | type) == "array") then ([.live[] | select(.service == "jobs")] | .[0]) as $j | if $j == null or $j.error != null or (($j.snapshot.rows | type) != "array") or (($j.snapshot.overflow // 0) != 0) then empty else "\([.log.dirty[] | select(.kind == "machine_gate.would_refuse" and .payload.key.presented == "none" and .at > $cut)] | length) \([$j.snapshot.rows[] | select(.presented == "none" and .last_seen > $cut)] | length)" end else empty end')"#,
+    fn a_dirty_log_count_that_names_no_kind_is_named_too() {
+        for probe in [
+            r#"w=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=168')
+n=$(printf '%s' "$w" | jq --argjson s "$since" '[.log.dirty[] | select(.payload.key.user == "automation:probe-admission-source-access") | select((.at | sub("\\.[0-9]+Z$"; "Z") | fromdate) > ($s + 1800))] | length')
+[ "$n" -eq 0 ] || { echo "FAILED: $n tokenless reads"; exit 1; }"#,
+            r#"w=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=24') || { echo 'not yet: the machine-gate window could not be read'; exit 75; }
+n=$(printf '%s' "$w" | jq -r --argjson cut "$cut" 'if (.log.dirty | type) == "array" then [.log.dirty[] | select(.payload.key.route == "/api/tenant/edit-level" and .payload.key.presented == "none") | select((.at | sub("\\.[0-9]+Z$"; "Z") | fromdate) > $cut)] | length else "nolog" end' 2>/dev/null)"#,
         ] {
+            assert_eq!(
+                clears_a_caller_from_the_gate_log_alone(probe),
+                Some(NO_KIND_NAMED),
+                "{probe}"
+            );
+        }
+    }
+
+    /// Car 217c2d66's probe, verbatim: the log and the live rows in one
+    /// jq, the live rows' overflow checked, their coverage not.
+    const C217_ONE_JQ: &str = r#"read_out=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --arg cut "$cut" 'if (.log_error == null) and ((.log.dirty | type) == "array") and ((.live | type) == "array") then ([.live[] | select(.service == "jobs")] | .[0]) as $j | if $j == null or $j.error != null or (($j.snapshot.rows | type) != "array") or (($j.snapshot.overflow // 0) != 0) then empty else "\([.log.dirty[] | select(.kind == "machine_gate.would_refuse" and .payload.key.presented == "none" and .at > $cut)] | length) \([$j.snapshot.rows[] | select(.presented == "none" and .last_seen > $cut)] | length)" end else empty end')"#;
+
+    /// THE LIVE ROWS WITHOUT THEIR COVERAGE ARE THE LOG ALONE (backlog
+    /// a3b383c5, review aa1a9c75 of car 59e0d3dd). Both probes the door
+    /// used to admit on reading `snapshot.rows` — f636c71b's re-gated
+    /// leg and 217c2d66's one jq — check the rows' overflow and never
+    /// when the tally began or whether it was recording, so a tally a
+    /// train restarted after the cut reads as a clean window. Each is
+    /// named, as is a read of the gate's own misses door with the same
+    /// gap.
+    #[test]
+    fn live_rows_read_without_their_coverage_still_clear_from_the_log_alone() {
+        let f636 = format!("{F636_LOG_LEG}{F636_LIVE_LEG}");
+        let misses = format!(
+            "{F636_LOG_LEG}live=$(boss-sor-read '/api/machine-gate/misses' | jq '[.rows[] | select(.presented == \"none\")] | length')"
+        );
+        for probe in [f636.as_str(), C217_ONE_JQ, misses.as_str()] {
+            assert!(!reads_the_live_tally_with_its_coverage(probe), "{probe}");
+            assert_eq!(
+                clears_a_caller_from_the_gate_log_alone(probe),
+                Some("machine_gate.would_refuse"),
+                "{probe}"
+            );
+        }
+        // Each coverage field is required on its own: a probe missing
+        // any ONE of them is still named.
+        let whole = format!("{F636_LOG_LEG}{}", covering_live_leg());
+        for field in LIVE_TALLY_COVERAGE {
+            let without = whole.replace(field, ".elided");
+            assert!(
+                clears_a_caller_from_the_gate_log_alone(&without).is_some(),
+                "{field} left out: {without}"
+            );
+        }
+    }
+
+    /// The live leg [`GATE_LOG_ALONE_EVIDENCE`] teaches, cut out of it —
+    /// the repair every door quotes, so the repair is what is tested.
+    fn covering_live_leg() -> &'static str {
+        let at = GATE_LOG_ALONE_EVIDENCE
+            .find("live=$(")
+            .expect("the evidence carries a live leg");
+        &GATE_LOG_ALONE_EVIDENCE[at..]
+    }
+
+    /// The corrected probe is clean — the log leg WITH the covering live
+    /// leg the evidence teaches under it — and so is the same coverage
+    /// read through the gate's own misses door.
+    #[test]
+    fn a_probe_that_also_reads_the_live_tally_whole_is_not_reported() {
+        let corrected = format!("{F636_LOG_LEG}{}", covering_live_leg());
+        let misses = format!(
+            "{F636_LOG_LEG}m=$(boss-sor-read '/api/machine-gate/misses'); printf '%s' \"$m\" | jq -r --argjson cut \"$cut\" 'if .mode == \"off\" or .overflow != 0 or (.recording_since | sub(\"\\\\.[0-9]+\"; \"\") | fromdateiso8601) > $cut then \"uncovered\" else ([.rows[] | select(.presented == \"none\")] | length) end'"
+        );
+        for clean in [corrected.as_str(), misses.as_str()] {
+            assert!(reads_the_live_tally_with_its_coverage(clean), "{clean}");
             assert_eq!(
                 clears_a_caller_from_the_gate_log_alone(clean),
                 None,
@@ -3045,5 +3474,81 @@ enum Commands {
             let found = a_grep_only_prose_answers(probe, |_| Some(file.to_string()));
             assert_eq!(found.is_some(), named, "{file:?} -> {found:?}");
         }
+    }
+
+    /// A PROBE THAT PINS BYTES (backlog 2770eba8). The three spellings
+    /// are the recorded probes of cars 47a035e5 (`rev-parse "$ref:<path>"`
+    /// against a literal blob id, and `sha256sum` against a literal
+    /// digest), a992926a (`rev-parse "HEAD:$path"` inside a helper) and
+    /// 1ef711ce (`git hash-object` over a `git show` body), each cut to
+    /// the lines that carry the shape.
+    #[test]
+    fn a_probe_that_pins_a_blob_id_or_a_digest_is_named() {
+        let named = [
+            (
+                r#"blob=$(git rev-parse "$ref:crates/core/boss-testing/tests/admission_reader_identity_sh.rs") || { echo "not yet: absent"; exit 75; }
+[ "$blob" = "1383df753778f96d04a1bde6fec53f1abbb01455" ] || { echo "not yet: differs"; exit 75; }"#,
+                "git rev-parse <ref>:<path>",
+            ),
+            (
+                r#"check() { actual=$(git rev-parse "HEAD:$path" 2>/dev/null) || exit 75; [ "$actual" = "$2" ] || exit 75; }
+check crates/core/boss-testing/tests/a_declared_broker_secret_is_created_empty.rs a436a7f257e9a27c636a35621bcad9dd1038954f"#,
+                "git rev-parse <ref>:<path>",
+            ),
+            (
+                r#"git show "$commit:$path" > "$body"
+actual=$(git hash-object "$body")
+[[ "$actual" != 77827214558ab0e8bb2bdc3cdd1e3e56f9a1f5d1 ]] && exit 75"#,
+                "git hash-object",
+            ),
+            (
+                r#"[ "$(sha256sum 'infra/estate/ops-credentials.sh' | cut -c1-64)" = 9f2c1b0e4d5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c ] || exit 75"#,
+                "sha256sum",
+            ),
+        ];
+        for (probe, token) in named {
+            assert_eq!(pins_file_bytes(probe), Some(token), "{probe}");
+        }
+    }
+
+    /// And the shapes that share its tools without pinning anything stay
+    /// quiet: a digest the probe computes of its OWN fixture and checks
+    /// against the verb's output (car c6e882c7 — no literal), a commit
+    /// resolved through `${1:-HEAD}` (the colon is the shell's), an
+    /// existence check, and a literal commit id read with no hashing.
+    #[test]
+    fn a_probe_that_hashes_without_pinning_is_not_named() {
+        let quiet = [
+            r#"sha=$(sha256sum "$c/second-stack.sql" | cut -c1-64); case "$out" in *"sha256 $sha"*) ;; *) exit 1;; esac"#,
+            r#"commit=$(git rev-parse --verify "${1:-HEAD}^{commit}") || exit 75; git merge-base --is-ancestor 777524920b4a3f3c1e3d0a5c5b5e1f2a3b4c5d6e "$commit""#,
+            r#"git cat-file -e HEAD:infra/dev/probe-rehearsal/boss-sor-read || exit 75; echo ok"#,
+            r#"git show HEAD:crates/core/boss-jobs/src/probe.rs | grep -c '^pub fn pins_file_bytes('"#,
+        ];
+        for probe in quiet {
+            assert_eq!(pins_file_bytes(probe), None, "{probe}");
+        }
+        assert_eq!(pins_file_bytes(PINNED_BYTES_EVIDENCE), None);
+    }
+
+    /// THE HAND PROOF A REFUSAL NAMES IS ONE THE HAND DOOR TAKES (review
+    /// 446039a0 F1): `boss prove <car> --probe` with no `--verified` is
+    /// refused by `boss prove` itself, so a refusal that printed it sent
+    /// its reader to a second refusal. The parse is pinned at the CLI,
+    /// which owns the flags; this holds the words every door prints.
+    #[test]
+    fn the_hand_proof_names_every_flag_the_hand_door_requires() {
+        let by_hand = hand_proof_command("c0ffee12");
+        for flag in [
+            "boss prove c0ffee12 ",
+            "--probe '",
+            "--expect '",
+            "--verified '",
+        ] {
+            assert!(by_hand.contains(flag), "{flag} missing: {by_hand}");
+        }
+        assert_eq!(
+            from_car_command("c0ffee12"),
+            "boss prove c0ffee12 --from-car"
+        );
     }
 }

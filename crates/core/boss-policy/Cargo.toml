@@ -21,7 +21,7 @@ path = "src/bin/boss_policy_bootstrap.rs"
 # build silently produces an in-memory-only binary that fails on
 # startup. Same fix as boss-docs (postgres → default 2026-05-05).
 default = ["postgres"]
-postgres = ["dep:sqlx", "dep:boss-events"]
+postgres = ["dep:sqlx", "dep:boss-events", "boss-policy-client/postgres"]
 
 [dependencies]
 # `blocking`: the policy bootstrap walk sends through

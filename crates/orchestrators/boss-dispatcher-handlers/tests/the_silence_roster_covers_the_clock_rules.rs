@@ -220,6 +220,15 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          sweep could count. It is itself the watch on a warn no event reports.",
     ),
     (
+        "an-ask-from-a-stranger-is-read-hourly",
+        "runs `machine.gate.asked.alarm`, which reads the machine gate's durable window and \
+         files one backlog-item alarm when a value no slot holds was asked about by a caller \
+         that is neither the dispatcher nor a depositor the rule names (backlog d653e090). On \
+         an hour with no such ask it produces NOTHING, and that zero is the healthy reading; \
+         what it files is an alarm keyed by finding, not a packet of a kind a sweep could \
+         count. It is itself the watch on a fact no event reports.",
+    ),
+    (
         "a-flight-past-its-period-is-an-alarm",
         "runs `jobs.flight_overdue`, which files one backlog-item alarm per flight past its \
          observe period with no verdict, or decided and not cleaned up (design c4c2a607, \

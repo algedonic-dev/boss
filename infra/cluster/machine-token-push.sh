@@ -51,8 +51,9 @@
 #   - any other text — a login banner above all: `this key reaches a
 #     shell`, RED on a route of its own, naming the line to remove;
 #   - nothing, then a clean end on an empty stream: the same;
-#   - nothing, then the OLDER receiver's refusal of an empty deposit:
-#     not yet, naming boss-gcp's converge (the two halves land apart).
+#   - nothing, then an OLDER receiver's refusal of an empty deposit: RED
+#     on the push's own route, naming boss-gcp's converge (it was not-yet
+#     while the two halves landed apart, a window that closed 2026-10-08).
 # In every case but the first, no byte of a slot leaves this pod.
 # WHAT THIS DOES NOT SEE: a line that forces the receiver and lacks
 # `restrict`. That key is confined to the command and can still forward
@@ -303,13 +304,18 @@ if [ "$GREETED" -eq 0 ]; then
     if [ "$src" -eq 124 ] || [ "$src" -eq 137 ]; then
         refuse "the push to $TARGET did not finish inside $SHIP_TIMEOUT_S seconds and was stopped before the far side had said anything; nothing was sent, and boss-gcp holds whatever it held"
     fi
-    # 3. THE OLDER RECEIVER, which reads its whole stdin before it says
-    # anything (this sender and boss-gcp's receiver land by two
-    # converges). Handed an empty stream it refuses in its own words —
-    # proof of what is behind the key — so this is a converge that is
-    # owed, not a finding, and it is the one the sender waits out.
+    # 3. A RECEIVER THAT DOES NOT SPEAK FIRST, which reads its whole
+    # stdin before it says anything. Handed an empty stream it refuses in
+    # its own words — proof of what is behind the key, so not the shell
+    # finding. This closed not-yet while the sender and boss-gcp's
+    # receiver landed by two converges; that window closed at 23:30Z on
+    # 2026-10-08 (two not-yet ticks, then every push greeted — backlog
+    # dea2236f, first_live_pushes_20261008), and a quiet answer kept past
+    # it had no bound: a receiver install that failed would read not-yet
+    # every ten minutes and file nothing (review N2 of car c1cdb202). So
+    # it is a RED on the push's own route now.
     if [ "$src" -eq 65 ] && grep -Fq 'ops-credential-recv: REFUSED — an empty deposit' "$ERR"; then
-        not_yet "boss-gcp's receiver does not speak first yet, so nothing was sent to it. MISSING: boss-gcp's converge has not installed this tree's ops-credential-recv (infra/gcp/install-ops-credential-receiver.sh, on its next tick); boss-gcp holds the token it held"
+        refuse "boss-gcp's receiver does not speak first, so nothing was sent to it: its converge has not installed this tree's ops-credential-recv (infra/gcp/install-ops-credential-receiver.sh), or installed an older one; boss-gcp holds the token it held"
     fi
     # 4. Accepted, silent, and a clean end on an empty stream: the
     # receiver never ends cleanly on one. A shell does.

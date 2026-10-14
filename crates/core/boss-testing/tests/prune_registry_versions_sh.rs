@@ -2442,18 +2442,23 @@ fn the_registry_and_the_stamp_are_the_ones_the_converge_declares() {
         std::fs::read_to_string(repo_root().join("infra/forge/cluster-deploy-runner.sh")).unwrap();
     let want = |s: &str| assert!(src.contains(s), "script lacks `{s}`");
     // Since 2026-09-18 (backlog 5222163e) neither script spells the
-    // image repo: both source forge-defaults.sh and ask it for REGISTRY,
-    // and the stamp's file name is that file's LAST_BUILT_NAME.
+    // image repo: both source forge-defaults.sh and ask it for REGISTRY.
+    // Since backlog 683d7fe9 neither spells the stamp or the login
+    // either: both are forge-defaults.sh's, root's, and this script no
+    // longer derives a home from the checkout's owner to find them.
     want("forge-defaults.sh");
     want("forge_need REGISTRY");
     assert!(runner.contains("forge-defaults.sh") && runner.contains("forge_need REGISTRY"));
-    want("${BOSS_FORGE_LAST_BUILT:-");
-    want("$LAST_BUILT_NAME");
+    want("DOCKER_CONFIG_FILE=\"${BOSS_PRUNE_DOCKER_CONFIG:-$REGISTRY_PUSH_DIR/config.json}\"");
+    assert!(
+        !src.lines()
+            .any(|l| !l.trim_start().starts_with('#') && l.contains("STAMP_FILE=")),
+        "the script spells the stamp's path again; it is forge-defaults.sh's STAMP_FILE"
+    );
     let defaults =
         std::fs::read_to_string(repo_root().join("infra/forge/forge-defaults.sh")).unwrap();
-    assert!(defaults.contains("LAST_BUILT_NAME=\".boss-last-built\""));
     assert!(
-        defaults.contains("STAMP_FILE=\"${BOSS_FORGE_LAST_BUILT:-${HOME:-}/$LAST_BUILT_NAME}\"")
+        defaults.contains("STAMP_FILE=\"${BOSS_FORGE_LAST_BUILT:-$CONVERGE_STATE/last-built}\"")
     );
     // The landed shas come from the one lib the sweep reads, not a copy.
     want("landed-train-shas.lib.sh");
@@ -2472,7 +2477,7 @@ fn the_registry_and_the_stamp_are_the_ones_the_converge_declares() {
         "the script traces (set -x) — a trace prints the credential"
     );
     // The ops runner runs verbs as root with no HOME; the docker login
-    // is the checkout owner's, read off the directory, never $HOME.
+    // is the deposited one, at a fixed root path, never under $HOME.
     assert!(
         !src.lines()
             .any(|l| !l.trim_start().starts_with('#') && l.contains("$HOME")),

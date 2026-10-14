@@ -152,7 +152,6 @@
         // catalog entry (it is everyone's, ungated).
         { id: 'my-day', label: 'My Day', path: '/' },
         ROUTE_CATALOG.inbox,
-        ROUTE_CATALOG.views,
         ROUTE_CATALOG.schedule,
         ROUTE_CATALOG['company-map'],
         ROUTE_CATALOG.manual,

@@ -733,12 +733,24 @@
                   title={formatFullTimestamp(row.timestamp)}
                 >{formatTimestamp(row.timestamp)}</td>
                 <td class="mono">{row.source}</td>
-                <td class="mono">{row.kind}</td>
+                <td class="mono">
+                  <button
+                    type="button"
+                    class="events-payload-toggle"
+                    aria-label="Toggle payload for {row.kind} event {row.event_id}"
+                    aria-expanded={isOpen}
+                    aria-controls="audit-payload-{row.event_id}"
+                    onclick={(event) => {
+                      event.stopPropagation();
+                      toggleRow(row.event_id);
+                    }}>{row.kind}</button
+                  >
+                </td>
                 <td class="mono">{actorOf(row.payload) ?? '—'}</td>
               </tr>
               {#if isOpen}
                 {@const packet = packetOf(row.kind, row.payload)}
-                <tr class="events-payload-row">
+                <tr class="events-payload-row" id="audit-payload-{row.event_id}">
                   <td colspan="4">
                     <pre class="events-payload">{JSON.stringify(row.payload, null, 2)}</pre>
                     <div class="events-event-id">event_id: <code>{row.event_id}</code></div>
@@ -789,6 +801,9 @@
   .events-filter input,
   .events-filter select {
     min-width: 160px;
+  }
+  /* A checkbox is not a text-entry field; retain its existing rule. */
+  .events-filter input[type="checkbox"] {
     padding: 4px 6px;
     border: 1px solid var(--border);
     border-radius: 4px;
@@ -883,6 +898,15 @@
     color: var(--static);
   }
   .events-table tbody tr.events-row {
+    cursor: pointer;
+  }
+  .events-payload-toggle {
+    background: none;
+    border: 0;
+    padding: 0;
+    color: inherit;
+    font: inherit;
+    text-align: left;
     cursor: pointer;
   }
   .events-table tbody tr.events-row:hover {

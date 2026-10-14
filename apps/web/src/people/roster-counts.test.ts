@@ -16,36 +16,36 @@ import { countedRoster, headcount, rosterHeader } from './roster-counts';
 
 describe('rosterHeader', () => {
   it('counts a read roster, zero included — an empty roster that was read is empty', () => {
-    expect(rosterHeader(okRead, 12, 3)).toEqual({
+    expect(rosterHeader(okRead, 12)).toEqual({
       title: '12 active employees',
-      subtitle: '3 certifications expiring in 90 days',
+      subtitle: '',
     });
     // One is one employee (backlog 6a123f1f made one the live count).
-    expect(rosterHeader(okRead, 1, 1)).toEqual({
+    expect(rosterHeader(okRead, 1)).toEqual({
       title: '1 active employee',
-      subtitle: '1 certification expiring in 90 days',
+      subtitle: '',
     });
-    expect(rosterHeader(okRead, 0, 0)).toEqual({
+    expect(rosterHeader(okRead, 0)).toEqual({
       title: '0 active employees',
-      subtitle: '0 certifications expiring in 90 days',
+      subtitle: '',
     });
   });
 
   it('states no count while the roster is loading', () => {
-    const h = rosterHeader(loadingRead, 0, 0);
+    const h = rosterHeader(loadingRead, 0);
     expect(h.title).toBe('Active employees');
     expect(h.subtitle).toBe('Loading the roster…');
   });
 
   it('says the counts are unknown when the read failed', () => {
-    const h = rosterHeader(failedRead('people HTTP 500'), 0, 0);
+    const h = rosterHeader(failedRead('people HTTP 500'), 0);
     expect(h.title).toBe('Active employees');
     expect(h.subtitle).toBe('Counts unknown: the roster did not load');
   });
 
   it('never prints a number for an unread roster, whatever the arrays hold', () => {
     for (const read of [loadingRead, failedRead('people HTTP 500')]) {
-      const h = rosterHeader(read, 7, 2);
+      const h = rosterHeader(read, 7);
       expect(`${h.title} ${h.subtitle}`).not.toMatch(/\d/);
     }
   });
@@ -85,7 +85,7 @@ describe('headcount', () => {
 
 // Backlog ad2da739 (page audit b959394e): /hr counted emp-audit in its
 // title, its At a glance block (Contractors 1 was emp-audit, the only
-// contractor), its Headcount table and its average tenure. Every count
+// contractor) and its Headcount table. Every count
 // /hr states is taken over the same roster headcount() counts, so the
 // excluded-role set is decided once.
 describe('countedRoster', () => {

@@ -101,11 +101,23 @@ fi
 HOST="${1:?usage: install-ops-runner.sh <estate node id>}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # INSTALL_OPS_RUNNER_REPO: the tree the runner's ExecStart names when it
-# is NOT the one this installer runs from. The forge's installer sets it
-# while it runs from root's tree and the runner's verbs still work on the
-# checkout (infra/forge/install.sh says why; backlog a604a35b). Unset or
-# empty, as on boss-gcp, it is the tree this file is in.
+# is NOT the one this installer runs from — the forge names root's tree
+# by its `current` link, never the generation this file stands in, which
+# the next refresh may prune (infra/forge/install.sh says why; backlog
+# a604a35b). Unset or empty, as on boss-gcp, it is the tree this file is
+# in.
 REPO="${INSTALL_OPS_RUNNER_REPO:-$(cd "$HERE/../.." && pwd)}"
+# INSTALL_OPS_RUNNER_CHECKOUT: the git checkout the runner's verbs WORK
+# ON when the tree they run from is not one (stage 2 of design c98c79aa,
+# backlog a604a35b). Root's tree on the forge is an export with no .git
+# and no forge remote, so a verb that reads or pushes git — tag-release,
+# sweep-archive-branches and the rest — is handed the checkout as
+# BOSS_OPS_CHECKOUT in the drop-in, a directory its git runs in AS ITS
+# OWNER; nothing in it is executed by root. Unset or empty, as on
+# boss-gcp, the drop-in carries no such line and each verb works on the
+# tree it runs from, as before.
+CHECKOUT="${INSTALL_OPS_RUNNER_CHECKOUT:-}"
+TREE_HELPER="${INSTALL_OPS_RUNNER_TREE_HELPER:-}"
 ETC="${INSTALL_ETC:-/etc/systemd/system}"
 SYSTEMCTL="${INSTALL_SYSTEMCTL:-systemctl}"
 
@@ -370,8 +382,23 @@ done
 
 install -d -m 0755 "$ETC/boss-ops-runner.service.d" \
     || refuse "could not create $ETC/boss-ops-runner.service.d"
-printf '[Service]\nEnvironment=HOST_ID=%s\nExecStart=\nExecStart=%s/infra/ops/ops-runner.sh\n' \
-    "$HOST" "$REPO" >"$ETC/boss-ops-runner.service.d/$HOST.conf" \
+# One word on one line of a unit file: a path systemd would split, or one
+# that ends the line, is refused rather than written as something else.
+case "$CHECKOUT" in
+    *[[:space:]\'\"\\]*) refuse "the checkout '$CHECKOUT' (INSTALL_OPS_RUNNER_CHECKOUT) carries whitespace, a quote or a backslash, which a drop-in's Environment= line cannot carry as one value" ;;
+esac
+if [ -n "$TREE_HELPER" ] && ! [[ "$TREE_HELPER" =~ ^/[A-Za-z0-9_./-]+$ ]]; then
+    refuse 'tree helper is not one absolute executable path'
+fi
+{
+    printf '[Service]\nEnvironment=HOST_ID=%s\n' "$HOST"
+    [ -z "$CHECKOUT" ] || printf 'Environment=BOSS_OPS_CHECKOUT=%s\n' "$CHECKOUT"
+    if [ -n "$TREE_HELPER" ]; then
+        printf 'ExecStart=\nExecStart=%s run infra/ops/ops-runner.sh\n' "$TREE_HELPER"
+    else
+        printf 'ExecStart=\nExecStart=%s/infra/ops/ops-runner.sh\n' "$REPO"
+    fi
+} >"$ETC/boss-ops-runner.service.d/$HOST.conf" \
     || refuse "could not write the $HOST drop-in, without which the runner has no HOST_ID and refuses every tick"
 
 # THE UNDO OF A RETIREMENT IS THIS INSTALL (design a79a8067): the role is
@@ -390,5 +417,5 @@ fi
 "$SYSTEMCTL" daemon-reload || refuse "systemctl daemon-reload failed"
 "$SYSTEMCTL" enable --now boss-ops-runner.timer \
     || refuse "systemctl enable --now boss-ops-runner.timer failed — the unit files are in place but nothing fires them"
-echo "install-ops-runner: boss-ops-runner installed for HOST_ID=$HOST from $REPO, reporting to $JOBS_URL"
+echo "install-ops-runner: boss-ops-runner installed for HOST_ID=$HOST from $REPO${CHECKOUT:+ (verbs work on the checkout $CHECKOUT)}, reporting to $JOBS_URL"
 run_summary_field ops_runner installed

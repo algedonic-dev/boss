@@ -30,8 +30,10 @@ fn the_conductor_runs_as_a_service_account_bound_to_the_gates_role() {
         "the Deployment must run as the boss-conductor ServiceAccount"
     );
     assert!(
-        !m.contains("automountServiceAccountToken: false"),
-        "the token must be mounted — a launcher without a token cannot create a Job"
+        m.contains("automountServiceAccountToken: false")
+            && m.contains("{name: conductor-api, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true}")
+            && m.contains("serviceAccountToken: {path: token, expirationSeconds: 3600}"),
+        "the conductor alone must mount its existing ServiceAccount token — preparation needs no API credential"
     );
     assert!(
         m.contains("kind: RoleBinding") && m.contains("name: dev-session-gates\nsubjects:"),

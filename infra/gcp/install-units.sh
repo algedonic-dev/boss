@@ -209,6 +209,24 @@ host_check boss-gcp install-units
 [ -z "$HOST_CHECK_VERDICT" ] || echo "install-units: host check — $HOST_CHECK_VERDICT"
 echo "==> install timer units from $REPO_ROOT (files only: no build, no schema, no restart)"
 
+# Native adoption requires the accepted preparation before the FIRST unit write.
+# Legacy fixture roots still exercise the ordinary roster without a live tree.
+ROOT_UNITS=
+if [ -n "${BOSS_GCP_ACCEPTED_SHA:-}" ] || [ "$TIMER_ETC" = /etc/systemd/system ]; then
+    [[ "${BOSS_GCP_ACCEPTED_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || { echo 'install-units: REFUSED — no accepted root generation; units unchanged' >&2; exit 78; }
+    ROOT_UNITS="${BOSS_GCP_PREPARED_DIR:-/var/lib/boss/gcp-root-prepared}/units"
+    [ -d "$ROOT_UNITS" ] && [ ! -L "$ROOT_UNITS" ] \
+        && [ "$(cat "$ROOT_UNITS/accepted-sha" 2>/dev/null)" = "$BOSS_GCP_ACCEPTED_SHA" ] \
+        || { echo 'install-units: REFUSED — root unit preparation is absent or stale; units unchanged' >&2; exit 78; }
+    prepared_files=("$ROOT_UNITS"/*.service)
+    [ "${#prepared_files[@]}" = 4 ] || { echo 'install-units: REFUSED — all four prepared units are required; units unchanged' >&2; exit 78; }
+    for file in "$ROOT_UNITS"/*.service; do
+        [ -f "$file" ] && [ ! -L "$file" ] \
+            && cmp -s "$file" "$REPO_ROOT/infra/gcp/root-tree-units/$(basename "$file").in" \
+            || { echo 'install-units: REFUSED — prepared unit differs from accepted generation; units unchanged' >&2; exit 78; }
+    done
+fi
+
 # WHAT IT INSTALLED IS COUNTED, NOT ASSUMED. The tail line used to print
 # the ROSTER LENGTH, so a run that skipped two pairs still claimed it had
 # installed every one of them. A count that cannot disagree with the
@@ -233,6 +251,16 @@ if [[ -n "${BOSS_NODE_ROLES:-}" ]]; then
     echo "  roles: ${BOSS_NODE_ROLES} — installing only the rows they name (infra/estate/roles.toml)"
 else
     echo "  roles: none declared — installing every row"
+fi
+# Move the converge and the protocol door first. A failed preparation above
+# leaves every old unit intact, and no four-unit activation can precede this.
+if [ -n "$ROOT_UNITS" ]; then
+    install -m 0644 "$REPO_ROOT/infra/gcp/boss-gcp-converge.service" "$TIMER_ETC/boss-gcp-converge.service"
+    INSTALL_OPS_RUNNER_REPO="${BOSS_GCP_ROOT_TREE:-/var/lib/boss/gcp-tree}/current" \
+        INSTALL_OPS_RUNNER_CHECKOUT="${BOSS_GCP_DEPOSIT_CHECKOUT:-/opt/boss}" \
+        INSTALL_OPS_RUNNER_TREE_HELPER="${BOSS_GCP_PREPARED_DIR:-/var/lib/boss/gcp-root-prepared}/bootstrap/infra/gcp/gcp-root-launch.sh" \
+        INSTALL_ETC="$TIMER_ETC" INSTALL_SYSTEMCTL="$TIMER_SYSTEMCTL" \
+        bash "$REPO_ROOT/infra/ops/install-ops-runner.sh" boss-gcp
 fi
 for stem in $ALL_STEMS; do
     if ! stem_in_role "$stem" "$roster"; then
@@ -259,7 +287,17 @@ for stem in $ALL_STEMS; do
         run_summary_note "SKIP $stem — no ${stem}.service + ${stem}.timer pair under $REPO_ROOT/infra"
         continue
     fi
-    install -m 0644 "$svc_src" "${TIMER_ETC}/${stem}.service"
+    if [ -n "$ROOT_UNITS" ] && [ -f "$ROOT_UNITS/$stem.service" ]; then
+        install -m 0644 "$ROOT_UNITS/$stem.service" "${TIMER_ETC}/${stem}.service"
+    elif [ -n "$ROOT_UNITS" ]; then
+        # Remaining callers hold the same generation lock too; a direct
+        # current/script path could be pruned midway through a sourced read.
+        launcher="${BOSS_GCP_PREPARED_DIR:-/var/lib/boss/gcp-root-prepared}/bootstrap/infra/gcp/gcp-root-launch.sh"
+        sed -E "s@^(Exec[^=]*=)(-?)/opt/boss/(infra/[A-Za-z0-9_./-]+[.]sh)([[:space:]]|$)@\\1\\2$launcher run \\3\\4@" "$svc_src" > "${TIMER_ETC}/${stem}.service"
+        chmod 0644 "${TIMER_ETC}/${stem}.service"
+    else
+        install -m 0644 "$svc_src" "${TIMER_ETC}/${stem}.service"
+    fi
     install -m 0644 "$tmr_src" "${TIMER_ETC}/${stem}.timer"
     # NO jobs-url DROP-IN. deploy-services wrote every row an
     # `Environment=BOSS_JOBS_URL=http://127.0.0.1:<jobs port>` drop-in —
@@ -324,8 +362,10 @@ run_summary_field summary \
 # unconditionally. A host outside the role gets exit 0 and a `not in
 # role` verdict on the packet, never the refusal this block exits with.
 ops_runner_rc=0
+if [ -z "$ROOT_UNITS" ]; then
 INSTALL_ETC="$TIMER_ETC" INSTALL_SYSTEMCTL="$TIMER_SYSTEMCTL" \
     bash "$REPO_ROOT/infra/ops/install-ops-runner.sh" boss-gcp || ops_runner_rc=$?
+fi
 # THE TAIL LINE SAYS WHAT HAPPENED, not what the roster holds.
 echo "units: installed $TIMER_UNITS_INSTALLED of $ROSTER_LEN timer unit pair(s) from $REPO_ROOT ($TIMER_UNITS_SKIPPED skipped)"
 if [[ "$ops_runner_rc" -ne 0 ]]; then

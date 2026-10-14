@@ -147,7 +147,7 @@ pub(crate) async fn read(
 /// host, each service on its `boss_ports` prod port (the rule
 /// `owner::people_base_from` already applies for filing).
 pub(crate) async fn section(http: &boss_core::machine_token::Client) -> Vec<String> {
-    let base = match crate::gate::resolve_jobs_base(None) {
+    let base = match crate::sor_client::resolve_jobs_base(None) {
         Ok(b) => b,
         Err(e) => return lines(&Err(e.to_string())),
     };
@@ -164,7 +164,7 @@ async fn get(
     base: &str,
     path: &str,
 ) -> Result<Value, String> {
-    match crate::gate::api_at(http, base, reqwest::Method::GET, path, None).await {
+    match crate::sor_client::api_at(http, base, reqwest::Method::GET, path, None).await {
         Ok(Some(v)) => Ok(v),
         Ok(None) => Err(format!("GET {path} answered no JSON")),
         Err(e) => Err(e.to_string()),
@@ -306,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn the_read_follows_owner_to_employee_to_location() {
         let base = stub().await;
-        let http = crate::gate::machine_client().unwrap();
+        let http = crate::sor_client::machine_client().unwrap();
         let r = read(&http, &Fixed("emp-ada".into()), &base, &base)
             .await
             .unwrap();

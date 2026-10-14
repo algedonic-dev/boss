@@ -128,7 +128,10 @@ if [[ -z "${BOSS_SOR_DOOR:-}" ]]; then
   unidentified reader is answered with a NARROWER WORLD, silently (backlog 61085a9e:
   21 open cars read as 0, a busy yard read as idle). Refusing rather than returning an
   answer that cannot be told apart from 'nothing is there'. The unattended door exports
-  this; by hand, export the read-scoped actor yourself."
+  this. Do not export it by hand: this reader sends no machine token without its door, so
+  a hand read is a would-refuse fact on every machine gate now and a 401 once they enforce
+  (backlog 37742794 R3). To rehearse a probe on the dev pod, put
+  infra/dev/probe-rehearsal first on PATH: its boss-sor-read reads through the pod's door."
 fi
 
 base="${BOSS_JOBS_URL%/}"

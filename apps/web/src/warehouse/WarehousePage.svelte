@@ -6,6 +6,7 @@
 
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
   import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
@@ -37,6 +38,7 @@
   import { href, navigate } from '../router';
 
   type Tab = 'overview' | 'inventory' | 'receiving';
+  let partsEnabled = $derived(moduleEnabled('parts'));
   const TABS: ReadonlyArray<{ id: Tab; label: string }> = [
     { id: 'overview', label: 'Overview' },
     { id: 'inventory', label: 'Inventory' },
@@ -200,7 +202,15 @@
   let createPoStatus = $state<string | null>(null);
 
   async function handleCreatePo(): Promise<void> {
-    if (!createPoVendor || !createPoSku || createPoQty < 1) return;
+    if (!createPoVendor || !createPoSku) return;
+    if (createPoQty < 1) {
+      createPoStatus = 'Error: Quantity must be at least 1';
+      return;
+    }
+    if (createPoCost < 0) {
+      createPoStatus = 'Error: Unit cost must not be negative';
+      return;
+    }
     try {
       const r = await fetch('/api/inventory/orders/create', {
         method: 'POST',
@@ -325,6 +335,9 @@
         </div>
 
         <section class="tab-section">
+          {#if !partsEnabled}
+            <p>Part details are unavailable because the Parts module is disabled.</p>
+          {/if}
           {#if s.parts_stock.below_reorder_items.length === 0}
             <h3 style="margin-top:0">Below reorder</h3>
             <p class="empty">All SKUs at or above reorder point.</p>
@@ -346,23 +359,27 @@
               </thead>
               <tbody>
                 {#each s.parts_stock.below_reorder_items as r (r.part_sku)}
-                  <tr
-                    use:rowLink={{
-                      onActivate: () => navigate(entityHref('part', r.part_sku)),
-                      label: `Part ${r.part_sku}`,
-                    }}
-                  >
+                  {#snippet cells()}
                     <td class="mono">
+                      {#if partsEnabled}
                       <Link to={entityHref('part', r.part_sku)}>
                         {r.part_sku}
                       </Link>
+                      {:else}{r.part_sku}{/if}
                     </td>
                     <td class="mono">{r.bin}</td>
                     <td class="num">{r.on_hand.toLocaleString()}</td>
                     <td class="num">{r.allocated.toLocaleString()}</td>
                     <td class="num">{r.available.toLocaleString()}</td>
                     <td class="num">{r.reorder_point.toLocaleString()}</td>
-                  </tr>
+                  {/snippet}
+                  {#if partsEnabled}
+                    <tr use:rowLink={{ onActivate: () => navigate(entityHref('part', r.part_sku)), label: `Part ${r.part_sku}` }}>
+                      {@render cells()}
+                    </tr>
+                  {:else}
+                    <tr>{@render cells()}</tr>
+                  {/if}
                 {/each}
               </tbody>
             </table>
@@ -387,6 +404,9 @@
       </aside>
 
       <section class="list-section">
+        {#if !partsEnabled}
+          <p>Part details are unavailable because the Parts module is disabled.</p>
+        {/if}
         {#if invView.kind === 'failed'}
           <p class="empty load-failed" role="alert">
             Couldn't load {invView.source} — {invView.error}
@@ -410,16 +430,13 @@
             </thead>
             <tbody>
               {#each invSorted as r (r.item.part_sku)}
-                <tr
-                  use:rowLink={{
-                    onActivate: () => navigate(entityHref('part', r.item.part_sku)),
-                    label: `Part ${r.item.part_sku}`,
-                  }}
-                >
+                {#snippet cells()}
                   <td class="mono">
+                    {#if partsEnabled}
                     <Link to={entityHref('part', r.item.part_sku)}>
                       {r.item.part_sku}
                     </Link>
+                    {:else}{r.item.part_sku}{/if}
                   </td>
                   <td class="mono">{r.item.bin}</td>
                   <td class="num">{r.item.on_hand}</td>
@@ -427,7 +444,14 @@
                   <td class="num">{r.available}</td>
                   <td class="num">{r.item.reorder_point}</td>
                   <td><StatusChip value={r.status} tone={stockTone(r.status)} /></td>
-                </tr>
+                {/snippet}
+                {#if partsEnabled}
+                  <tr use:rowLink={{ onActivate: () => navigate(entityHref('part', r.item.part_sku)), label: `Part ${r.item.part_sku}` }}>
+                    {@render cells()}
+                  </tr>
+                {:else}
+                  <tr>{@render cells()}</tr>
+                {/if}
               {/each}
             </tbody>
           </table>
@@ -510,7 +534,7 @@
                   id="cpo-cost"
                   class="hr-select"
                   type="number"
-                  min="1"
+                  min="0"
                   bind:value={createPoCost}
                   style="width:80px"
                 />

@@ -840,6 +840,16 @@ pub enum RegistryError {
     /// sixty-file registry is not sent to grep for the row.
     #[error("{file}: {reason}")]
     RuleFile { file: String, reason: String },
+    /// A name the role resolver would not count as one of the family the
+    /// rule signs under (backlog 1a172f43): its writes would resolve to
+    /// no registry row. `boss_core::role_of_record::is_family_member`
+    /// decides; the message names the actor so the author sees why.
+    #[error(
+        "rule name {rule:?} is refused: its writes would sign as {family}{rule}, which the role \
+         resolver does not recognise as a member of the {family} family — a rule name is \
+         `:`-separated segments of letters, digits and `-`, none empty"
+    )]
+    NotAFamilyMember { rule: String, family: String },
 }
 
 // ---------------------------------------------------------------------------

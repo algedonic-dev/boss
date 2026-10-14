@@ -155,6 +155,7 @@
             <thead>
               <tr>
                 <th>Packet</th>
+                <th>Priority</th>
                 <th>Answers</th>
                 <th>Opened</th>
                 <th>Review</th>
@@ -164,6 +165,7 @@
               {#each rows as packet (packet.id)}
                 <tr>
                   <td><strong>{packet.title}</strong></td>
+                  <td>{packet.priority ?? 'Unknown'}</td>
                   <td
                     class="design-progress"
                     class:design-saved={packet.progress.kind === 'saved'}

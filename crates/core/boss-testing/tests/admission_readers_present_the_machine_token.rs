@@ -7,12 +7,16 @@
 //! alone. It runs on the forge under the ops runner (root,
 //! `RuntimeDirectory=boss-ops-runner`), where the token is readable.
 //!
-//! ITS TWIN IS NOT HERE. `probe-admission-source-access.sh` sends the same
-//! read, and is the one of the two on the live record (1 would-refuse
-//! fact, 2026-10-05). Its bytes and its sourced files are a bound method
-//! of design f927de0c (infra/forge/admission-reader-identity.py METHODS),
-//! so stamping it is that design's car; the sender pin's NOT_YET entry
-//! says what removes it. `VERBS` is a list so that car adds one row.
+//! ITS TWIN IS THE SECOND ROW. `probe-admission-source-access.sh` sends
+//! the same read, and is the one of the two on the live record (2
+//! would-refuse facts as automation:probe-admission-source-access in the
+//! 7 days to 2026-10-10, the last 2026-10-05T18:43Z). Its bytes and its
+//! sourced files are a bound method of design f927de0c
+//! (infra/forge/admission-reader-identity.py METHODS), so it was held
+//! back until that design folded; it is stamped exactly as its twin is,
+//! and ../lib/secret-header.sh is bound in METHODS beside it (backlog
+//! 44b2087e B1, 2026-10-10), so the identity that design reviews is the
+//! stamped one.
 //!
 //! The script is RUN here against a stub `curl` and a stub `sudo`, with
 //! every state of the mount:
@@ -37,7 +41,7 @@
 //! runner's own timeout kills — leaves nothing. Nothing is left under
 //! TMPDIR on any exit either.
 
-use boss_testing::{create_dir, repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{create_dir, repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::process::Command;
 
 const TOKEN: &str = "synthetic-machine-fixture";
@@ -49,11 +53,18 @@ struct Verb {
     report: &'static str,
 }
 
-const VERBS: &[Verb] = &[Verb {
-    script: "infra/forge/discover-admission-source.sh",
-    signer: "automation:discover-admission-source",
-    report: r#"{"schema":"boss.admission-source-discovery.v1","scope":"configuration_discovery_only","history_verdict":"unavailable","roster":{"state":"unavailable","reason":"native_read_failed"},"nodes":[]}"#,
-}];
+const VERBS: &[Verb] = &[
+    Verb {
+        script: "infra/forge/discover-admission-source.sh",
+        signer: "automation:discover-admission-source",
+        report: r#"{"schema":"boss.admission-source-discovery.v1","scope":"configuration_discovery_only","history_verdict":"unavailable","roster":{"state":"unavailable","reason":"native_read_failed"},"nodes":[]}"#,
+    },
+    Verb {
+        script: "infra/forge/probe-admission-source-access.sh",
+        signer: "automation:probe-admission-source-access",
+        report: r#"{"schema":"boss.admission-source-access.v1","scope":"retained_source_access_probe","history_verdict":"unavailable","roster":{"state":"unavailable","reason":"native_read_failed"},"nodes":[]}"#,
+    },
+];
 
 struct Outcome {
     code: Option<i32>,
@@ -147,6 +158,7 @@ exit 4
 "#,
     );
     let mut cmd = Command::new("bash");
+    without_proxy(&mut cmd);
     cmd.arg(root.join(verb.script))
         .env(
             "PATH",

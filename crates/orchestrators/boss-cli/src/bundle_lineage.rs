@@ -156,7 +156,7 @@ async fn live_lineage<S: serde::de::DeserializeOwned>(
     route: &str,
 ) -> anyhow::Result<Vec<S>> {
     let rows =
-        crate::train::rows(crate::gate::api(http, reqwest::Method::GET, route, None).await?)?;
+        crate::train::rows(crate::sor_client::api(http, reqwest::Method::GET, route, None).await?)?;
     rows.into_iter()
         .map(serde_json::from_value::<S>)
         .collect::<Result<Vec<_>, _>>()

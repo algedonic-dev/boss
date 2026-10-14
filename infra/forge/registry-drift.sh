@@ -205,6 +205,14 @@ for tool in curl python3 git; do
 done
 [ -f "$REPO/$PLINT" ] && [ -f "$REPO/$RLINT" ] \
     || finish "nothing compared — $REPO does not carry $PLINT and $RLINT"
+# WHICH SIDE IS AHEAD IS READ FROM GIT, so a tree git cannot read is no
+# tree to judge from (review 1ba2873d, B1). Unasked, HEAD read `unknown`,
+# the shallow probe answered nothing and so "shallow", and every kind not
+# placed by a file was filed "side not measured … SHALLOW" — items about
+# the checkout, not the registries. That was every converge run from an
+# export of root's tree with no .git (backlog 683d7fe9).
+git -C "$REPO" rev-parse --verify -q 'HEAD^{commit}' >/dev/null 2>&1 \
+    || finish "nothing compared — CANNOT ANSWER: git rev-parse HEAD failed in $REPO, so which side is ahead cannot be read from its history; nothing filed"
 
 # The system of record — no fallback address (infra/lib/sor.sh).
 # shellcheck source=infra/lib/sor.sh
@@ -241,14 +249,51 @@ api() {
 }
 
 # ---------------------------------------------------------------------------
+# The two reads, made HERE, stamped, and handed to the lints.
+# ---------------------------------------------------------------------------
+# A lint holds no machine token by rule, so each lint's own read of its
+# registry went out with none: one GET /api/workflows and one GET
+# /api/dispatcher/rules per converge, signed automation:gate-runner from
+# the forge, 24 of each in the machine-gate window on 2026-10-09 (backlog
+# 44b2087e). This script holds the token, so it reads both registries
+# itself — as the lints would, a reader's identity (infra/lib/sor-reader.sh)
+# and a rollout waited out (infra/lib/curl-through-a-roll.sh) — and hands
+# each lint its read (infra/lint/lib/sor-read.sh lint_sor_handed). The
+# lints send nothing. The dispatcher's header file is its own reader call,
+# because the reader judges the host where it is called.
+# shellcheck source=infra/lib/sor-reader.sh
+. "$SELF_DIR/../lib/sor-reader.sh" || finish "nothing compared — infra/lib/sor-reader.sh is missing"
+# shellcheck source=infra/lib/curl-through-a-roll.sh
+. "$SELF_DIR/../lib/curl-through-a-roll.sh" || finish "nothing compared — infra/lib/curl-through-a-roll.sh is missing"
+READER=$(sor_reader_header "$ACTOR")
+SOR_WAIT="${BOSS_SOR_WAIT_SECONDS:-60}"
+PURL="$BOSS_JOBS_URL/api/workflows"
+pcode=$(curl_through_a_roll "$SOR_WAIT" "$NAME" "the jobs API" "GET $PURL" \
+    -sS -m 10 -H "x-boss-user: $READER" ${MT_HDR:+-H "$MT_HDR"} \
+    -o "$work/live-workflows.json" -w '%{http_code}' "$PURL") || true
+rcode=000
+if [ -n "${BOSS_DISPATCHER_URL:-}" ]; then
+    machine_token_header RULES_MT_HDR "$BOSS_DISPATCHER_URL" \
+        || finish "nothing compared — the machine token's header file for the dispatcher could not be written"
+    RURL="$BOSS_DISPATCHER_URL/api/dispatcher/rules"
+    rcode=$(curl_through_a_roll "$SOR_WAIT" "$NAME" "the dispatcher" "GET $RURL" \
+        -sS -m 10 -H "x-boss-user: $READER" ${RULES_MT_HDR:+-H "$RULES_MT_HDR"} \
+        -o "$work/live-rules.json" -w '%{http_code}' "$RURL") || true
+fi
+
+# ---------------------------------------------------------------------------
 # The two comparisons, through the lints themselves.
 # ---------------------------------------------------------------------------
 prc=0
-BOSS_JOBS_URL="$BOSS_JOBS_URL" bash "$REPO/$PLINT" --require-live --report-json "$work/protocols.json" \
+BOSS_JOBS_URL="$BOSS_JOBS_URL" BOSS_LINT_SOR_HANDED_URL="$PURL" BOSS_LINT_SOR_HANDED_CODE="${pcode:-000}" \
+    BOSS_LINT_SOR_HANDED_BODY="$work/live-workflows.json" \
+    bash "$REPO/$PLINT" --require-live --report-json "$work/protocols.json" \
     > "$work/protocols.log" 2>&1 || prc=$?
 rrc=0
 if [ -n "${BOSS_DISPATCHER_URL:-}" ]; then
-    BOSS_DISPATCHER_URL="$BOSS_DISPATCHER_URL" bash "$REPO/$RLINT" --findings "$work/rules.tsv" \
+    BOSS_DISPATCHER_URL="$BOSS_DISPATCHER_URL" BOSS_LINT_SOR_HANDED_URL="$RURL" \
+        BOSS_LINT_SOR_HANDED_CODE="${rcode:-000}" BOSS_LINT_SOR_HANDED_BODY="$work/live-rules.json" \
+        bash "$REPO/$RLINT" --findings "$work/rules.tsv" \
         > "$work/rules.log" 2>&1 || rrc=$?
 else
     rrc=3

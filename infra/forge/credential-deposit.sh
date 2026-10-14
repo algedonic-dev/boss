@@ -246,8 +246,10 @@ else
     # host: infra/forge/host-absent-tools.txt).
     KC="${BOSS_OPS_DIR:-/etc/boss-ops}/kubeconfig"
     # --request-timeout: the read ends itself inside the container, which
-    # the outer kill in read_secret would otherwise leave running.
-    KUBECTL=(docker run --rm --network host -v "$KC:/kc:ro" alpine/k8s:1.33.3 kubectl --kubeconfig=/kc --request-timeout=15s)
+    # the outer kill in read_secret would otherwise leave running. No
+    # container log: the Secret kubectl prints is this script's alone
+    # (backlog aa700921).
+    KUBECTL=(docker run --rm --log-driver=none --network host -v "$KC:/kc:ro" alpine/k8s:1.33.3 kubectl --kubeconfig=/kc --request-timeout=15s)
     # ABSENT is not REFUSED (backlog 714bc71f). A kubeconfig David has
     # not placed is root material no converge can mint or repair, so it
     # is recorded as not ready and does not red the pass — install-
@@ -384,100 +386,24 @@ elif [ -n "$USERINFO" ]; then
 fi
 
 # --- 4. the delivery record --------------------------------------------
+# The record itself is infra/lib/credential-delivery.sh — the one
+# definition this deposit and the registry push token's share (backlog
+# 683d7fe9; it was written here, and moved there verbatim). What is this
+# deposit's own is the PROOF it asks for before recording: the installed
+# value authenticates through the owner's global config, the path every
+# consumer takes — already shown this pass when a value was installed or
+# the remote stripped.
+# shellcheck source=infra/lib/credential-delivery.sh
+. "$INFRA/lib/credential-delivery.sh"
 DELIVERY_STATE="nothing to record"
-BOSS_USER="{\"id\":\"automation:credential-deposit\",\"role\":\"platform-admin\",\"access_tier\":\"operator\",\"territory_account_ids\":[],\"direct_report_ids\":[],\"department\":\"platform\"}"
-API_CURL="$INFRA/boss-api-curl.sh"
-[ -x "$API_CURL" ] || API_CURL=boss-api-curl.sh
-record_delivery() {
-    local jobs rows total pending n job step body l8 hdrs
-    if [ -z "${BOSS_JOBS_URL:-}" ]; then
-        DELIVERY_STATE="not recorded: BOSS_JOBS_URL is unset (/etc/boss/sor.env)"
-        return 0
-    fi
-    hdrs=(-H "x-boss-user: $BOSS_USER")
-    # The machine token rides to curl in a 0600 file, never in its argv,
-    # where every local user reads it in ps — the defect the publish
-    # review of 8d7a3507 found at this line (backlog 5f3ad356). This
-    # runs in the script's own shell, after the EXIT trap above. It is
-    # the mounted Secret's `current` slot, stamped only on an estate
-    # host (infra/lib/secret-header.sh machine_token_header; design
-    # 6805c764 car 4).
-    if ! machine_token_header MT_HDR "$BOSS_JOBS_URL"; then
-        DELIVERY_STATE="not recorded: the machine token's header file could not be written; the next pass retries"
-        return 0
-    fi
-    [ -z "$MT_HDR" ] || hdrs+=(-H "$MT_HDR")
-    if ! jobs="$("$API_CURL" -fsS "${hdrs[@]}" \
-        "$BOSS_JOBS_URL/api/jobs?kind=rotate-a-credential&status=open&limit=500" 2>/dev/null)"; then
-        # Not a failure of the deposit: the value is installed and the
-        # next pass records it. The packet line says so.
-        DELIVERY_STATE="not recorded: the jobs API did not answer; the next pass retries"
-        return 0
-    fi
-    rows="$(jq '(if type == "object" and has("data") then .data else . end) | length' <<< "$jobs")"
-    total="$(jq '(if type == "object" then .total else null end) // empty' <<< "$jobs")"
-    if [ -n "$total" ] && [ "$total" != "$rows" ]; then
-        DELIVERY_STATE="refused: the open-rotation read held $rows of $total rows — a limit is not a filter"
-        rc=1
-        return 0
-    fi
-    pending="$(jq -c --arg c "$CRED" '[(if type == "object" and has("data") then .data else . end)[]
-        | select(.status == "open" and (.subject.id // .subject_id) == $c)
-        | {job: .id, step: ((.steps // [])[] | select(.spec_slug == "delivered" and (.status == "ready" or .status == "active")) | .id)}]' <<< "$jobs")"
-    n="$(jq 'length' <<< "$pending")"
-    if [ "$n" -eq 0 ]; then
-        DELIVERY_STATE="no open rotation of $CRED awaits delivery"
-        return 0
-    fi
-    if [ "$n" -gt 1 ]; then
-        DELIVERY_STATE="refused: $n open rotations of $CRED await delivery ($(jq -r '[.[].job[:8]] | join(", ")' <<< "$pending")) — not guessing which"
-        rc=1
-        return 0
-    fi
+delivery_proof() {
     if [ "$VERIFIED" -eq 0 ] && ! verify_global; then
-        DELIVERY_STATE="not recorded: the installed value did not authenticate — $VERIFY_ERR"
-        rc=1
-        return 0
+        DELIVERY_PROOF_WHY="$VERIFY_ERR"
+        return 1
     fi
-    # THE SECRET AGAIN, AFTER THE PACKET WAS FOUND (review F3 of car
-    # 85b7b55f, 2026-09-26). This pass read the Secret at its start; the
-    # broker may since have installed a NEW value and readied this very
-    # step — it readies only after its install, so a read made now sees
-    # whatever value readied it. Recording the start-of-pass value would
-    # complete `delivered` with the OLD last eight: the broker refuses
-    # the mismatch, and a completed step cannot be recorded again, so
-    # the rotation could never finish. A value that moved is recorded
-    # by the next pass, which installs it first.
-    read_secret
-    if [ "$READ_VALUE" != "$SECRET_VALUE" ]; then
-        case "$READ_STATE" in
-            unreadable*)
-                DELIVERY_STATE="not recorded: the Secret could not be read again before the record — $READ_STATE"
-                rc=1
-                ;;
-            *)
-                DELIVERY_STATE="not recorded: the Secret moved during this pass (…$(last8 "$SECRET_VALUE") when read, $READ_STATE now); the next pass installs it and records that"
-                ;;
-        esac
-        return 0
-    fi
-    job="$(jq -r '.[0].job' <<< "$pending")"
-    step="$(jq -r '.[0].step' <<< "$pending")"
-    l8="$(last8 "$SECRET_VALUE")"
-    body="$(jq -nc --arg l8 "$l8" --arg to "${BOSS_NODE_ID:-$(hostname)}:$DEST" \
-        '{delivered_last_eight: $l8, delivered_to: $to}')"
-    if ! "$API_CURL" -fsS -X PATCH "${hdrs[@]}" -H "content-type: application/json" \
-            -d "$body" "$BOSS_JOBS_URL/api/jobs/$job/steps/$step/metadata" >/dev/null 2>&1 \
-        || ! "$API_CURL" -fsS -X PUT "${hdrs[@]}" -H "content-type: application/json" \
-            -d '{"status":"completed"}' "$BOSS_JOBS_URL/api/jobs/$job/steps/$step" >/dev/null 2>&1; then
-        DELIVERY_STATE="not recorded: the write to ${job:0:8}'s delivered step failed; the next pass retries"
-        rc=1
-        return 0
-    fi
-    DELIVERY_STATE="recorded on ${job:0:8}: delivered …$l8"
 }
 if [ -n "$SECRET_VALUE" ] && [ "$CUR" = "$SECRET_VALUE" ]; then
-    record_delivery
+    record_credential_delivery "$DEST"
 fi
 say "delivery: $DELIVERY_STATE"
 

@@ -56,7 +56,7 @@ audience = { role = "platform-admin" }
 # (CLAUDE.md §Engineering Session Startup, step 4), read the open list
 # before filing a route, record through the verb's `-file` twin — ride
 # here, on the step, or the run does not do them.
-agent = { profile = "analyst", model = "opus-5[1m]", budget_usd = 2, effort = "medium" }
+agent = { profile = "analyst", model = "opus-5-5", budget_usd = 2, effort = "medium" }
 metadata_defaults = { procedure = """Measure the claim yourself before you route it, and put the measurement in `evidence` — a route chosen off the packet's own text is the failure this step exists to refuse.
 
 MEASURE ON origin/main, NOT ON THE DAY IT WAS FILED. Run `git fetch origin`, then read the site as it stands now: `git show origin/main:<path>` for the file the claim names, `git log origin/main --oneline -S '<the string>' -- <path>` for a change that already removed it, and `boss merged <branch>` when the packet names a branch. A claim filed against an older tree may already be fixed — on 2026-09-01 a session closed five 'open' packets whose fixes were already on main. A claim about the live system (a count, a queue, an answer a service gives) is re-read now through `boss-api GET`, never quoted from the description, and an empty answer gets a control read whose answer you already know before it counts as absence.
@@ -148,7 +148,7 @@ authority_role = "platform-admin"
 # THIS item goes on to it. A measurement with no disposition still
 # reaches `closed` (the closure fallback), for a claim that held and
 # asked for nothing beyond being measured.
-agent = { profile = "analyst", model = "opus-5[1m]", budget_usd = 2, effort = "medium" }
+agent = { profile = "analyst", model = "opus-5-5", budget_usd = 2, effort = "medium" }
 metadata_defaults = { procedure = """Re-measure the claim triage could not settle, and put the measurement in `evidence` — it is required: no evidence is not a pass (828381c0). Triage routed here with `verify`, and its evidence names what would measure the claim; start there.
 
 MEASURE ON origin/main AND THE LIVE SYSTEM, NOW. Run `git fetch origin`, read the site with `git show origin/main:<path>` — the file the packet names, reproduced in the shape it actually has, not the shape its prose describes — and look for the change that removed it with `git log origin/main --oneline -S '<the string>' -- <path>`. A claim about the live system is re-read through `boss-api GET` with the time you read it; an empty answer gets a control read whose answer you already know before it counts as absence. An absence verdict names the shape you tested and where that shape came from: the triage step on this packet carries the two rules and the case that paid for them (fac521bc), and they bind here too.
@@ -186,7 +186,7 @@ audience = { role = "platform-admin" }
 # An analyst's step, not a builder's: agent-claude completed it 4 times
 # live (measured 2026-09-18) writing a design, never code. Same block
 # shape as `build` below; see the note there (c87fb59b car 1).
-agent = { profile = "analyst", model = "opus-5[1m]", budget_usd = 2, effort = "medium" }
+agent = { profile = "analyst", model = "opus-5-5", budget_usd = 2, effort = "medium" }
 # The procedure's second paragraph (backlog 4f71e608, 2026-09-24):
 # design e1dba350 carried three questions the company frame answered,
 # so the author now decides those and asks only the five classes named.
@@ -323,7 +323,7 @@ authority_role = "platform-admin"
 # briefed with. Materialisation projects this
 # onto the packet as agent_profile / agent_model / agent_budget_usd /
 # agent_effort, which a station predicate and the claim door read.
-agent = { profile = "builder", model = "opus-5[1m]", budget_usd = 5, effort = "high" }
+agent = { profile = "builder", model = "opus-5-5", budget_usd = 5, effort = "high" }
 # A BUILDER MAY REFUTE (backlog 6c114a23, 2026-09-20). Verify-the-claim
 # is required of every builder, and when it fires HERE rather than at
 # triage the packet used to have nowhere to land: the three withdrawal

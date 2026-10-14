@@ -604,7 +604,7 @@ pub(super) async fn list_assignments<R: JobsRepository + 'static, B: EventBus + 
         };
     }
     let (ids, roles): (Vec<String>, Vec<String>) = match &me {
-        Some(me) => (me.ids.clone(), me.roles.clone()),
+        Some((me, _)) => (me.ids.clone(), me.roles.clone()),
         None => (
             q.assignee_id.into_iter().collect(),
             q.roles
@@ -666,10 +666,44 @@ pub(super) async fn list_assignments<R: JobsRepository + 'static, B: EventBus + 
         Err(refusal) => return refusal,
     };
     let total = rows.len();
+    // WHETHER ANYONE IS ON EACH CLAIM (backlog e2519eca item 2): under
+    // `for=me`, an ACTIVE row an agent holds carries the run the top
+    // board reads for it — the one predicate, over the same open-run
+    // read. Judged only for a caller who reads every packet and only on
+    // a whole page, exactly as the board: a run outside a narrowed
+    // scope or past a cut page would read as a confident wrong
+    // "no-run". The runs are read only when some row is claimed.
+    let claims = match &me {
+        Some((_, agents)) if rows.iter().any(|r| r.step.status == StepStatus::Active) => {
+            let runs = if cut {
+                None
+            } else {
+                super::regions::read_open_runs(&state, crate::port::JobScope::All)
+                    .await
+                    .filter(|(_, whole)| *whole)
+                    .map(|(runs, _)| runs)
+            };
+            let now = boss_clock_client::now_from(&state.clock).await;
+            Some((runs, agents.clone(), now))
+        }
+        _ => None,
+    };
     let data: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
             let mut v = assignment_row_json(r, &state.step_registry);
+            if let Some((runs, agents, now)) = &claims {
+                let reading = crate::outranks::claim_run(
+                    &r.job_id.to_string(),
+                    &r.step,
+                    runs.as_deref().map(|open| crate::outranks::Runs { open }),
+                    agents.as_ref(),
+                    *now,
+                );
+                if let Some(reading) = reading {
+                    v["run"] = serde_json::to_value(reading).unwrap_or_default();
+                }
+            }
             // The act's words and the car ride on the row, so the
             // owner's queue says what to do without a second read.
             if let Some((car, w)) = waits.iter().find(|(car, _)| *car == r.job_id) {
@@ -685,7 +719,7 @@ pub(super) async fn list_assignments<R: JobsRepository + 'static, B: EventBus + 
     let mut body = serde_json::json!({ "data": data, "total": total });
     // Whom `for=me` read for, so a surface can say "assigned to you (+
     // your alias)" from the answer rather than guess it.
-    if let Some(me) = &me {
+    if let Some((me, _)) = &me {
         body["for"] = serde_json::to_value(me).unwrap_or_default();
     }
     Json(body).into_response()
@@ -704,7 +738,7 @@ pub(super) async fn list_assignments<R: JobsRepository + 'static, B: EventBus + 
 async fn resolve_me<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &JobsApiState<R, B>,
     user: &boss_policy_client::User,
-) -> Result<crate::me::Me, Response> {
+) -> Result<(crate::me::Me, Option<crate::outranks::Agents>), Response> {
     let Some(id) = self_id(user) else {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -734,7 +768,16 @@ async fn resolve_me<R: JobsRepository + 'static, B: EventBus + 'static>(
             |candidate| Some(crate::me::me(id, &candidate.role, &agents).roles),
         );
     }
-    Ok(original)
+    // Every id an agent acts as, for whether a claim's holder has a run
+    // to read (backlog e2519eca item 2) — the set the top board builds
+    // off the same registry rows. No registry wired: nobody can say.
+    let agent_ids = state.agent_budget.as_ref().map(|_| {
+        agents
+            .into_iter()
+            .flat_map(|r| std::iter::once(r.id).chain(r.aliases))
+            .collect()
+    });
+    Ok((original, agent_ids))
 }
 
 /// The first `limit` assignment rows `user` may see: those on a packet
@@ -2722,6 +2765,24 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
         stamp_close_instant(&mut job, &now);
     }
 
+    // A retry can read a finished packet whose prior close committed,
+    // but whose step read or cleanup did not (ec304ffe). Finishing that
+    // abandonment still needs Close on THIS packet. Update-only terminal
+    // annotations keep their existing permission and do not skip work.
+    // Pre-reading before the job save alone cannot repair an already
+    // committed close, or an interruption between the save and cleanup.
+    let reconcile_end = if !ends(job.status) {
+        false
+    } else if !was_terminal {
+        true // This transition was judged through CLOSE_JOB above.
+    } else {
+        match state.policy.ask(&user, controls::CLOSE_JOB).await {
+            Ok(Decision::Allow { scope }) => scope_matches(&user, &scope, &existing),
+            Ok(Decision::Deny { .. }) => false,
+            Err(e) => return e.into_response(),
+        }
+    };
+
     // OUTBOX (phase 2): the state event (full row state, what the
     // rebuild consumes) + the status-transition markers (topic-only
     // duplicates for downstream consumers; rebuild ignores them)
@@ -2803,6 +2864,22 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
                 .into_response();
         }
         Err(e) => return persist_error_response(e),
+    }
+
+    // Ending through the job door abandons its still-open steps just as a
+    // protocol terminal does. The shared CAS skip releases only abandoned
+    // active holds and preserves completed steps and their calendar history
+    // (design e1dba350). A Close-authorized retry reconciles the same
+    // unfinished cleanup; its skipped/completed rows are no-ops in the
+    // shared CAS door, so a successful retry releases no hold twice.
+    if reconcile_end {
+        let steps = match state.jobs.list_steps_versioned(&job_id).await {
+            Ok(steps) => steps,
+            Err(e) => return persist_error_response(e),
+        };
+        for read in steps {
+            super::steps::skip_open_step(&state, &job_id, read, &stamp).await;
+        }
     }
 
     // A Job update can flip a metadata-gated `ready_when` (the v3
@@ -3216,16 +3293,19 @@ async fn judge_move<R: JobsRepository + 'static, B: EventBus + 'static>(
     // Where the packet actually stands: each step's status, by slug —
     // not only the completed ones, because a changed predicate bites a
     // ready step and not a skipped one (backlog 4c6b4b74).
-    let steps =
-        state.jobs.list_steps(&job_id).await.map_err(|e| {
-            answer((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
-        })?;
-    let at: std::collections::BTreeMap<String, boss_core::job::StepStatus> = steps
+    // Read VERSIONED: the plan carries each row's version, and the write
+    // lands only on rows still at it (third review 85c11887 B1).
+    let rows = state
+        .jobs
+        .list_steps_versioned(&job_id)
+        .await
+        .map_err(|e| answer((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()))?;
+    let at: std::collections::BTreeMap<String, boss_core::job::StepStatus> = rows
         .iter()
-        .filter_map(|s| s.spec_slug.clone().map(|slug| (slug, s.status)))
+        .filter_map(|(s, _)| s.spec_slug.clone().map(|slug| (slug, s.status)))
         .collect();
     let verdict = crate::protocol_conversion::convertibility_for_packet(&from, &to, &at);
-    let plan = crate::repin::plan(&from, &to, &existing, &steps);
+    let plan = crate::repin::plan_read(&from, &to, &existing, &rows);
     Ok(JudgedMove {
         existing,
         from: from.version,
@@ -3457,6 +3537,26 @@ pub(super) async fn convert_job<R: JobsRepository + 'static, B: EventBus + 'stat
             })),
         )
             .into_response(),
+        // A step was written between the read this move was planned from
+        // and its write — a claim, a release, a completion — so the plan
+        // no longer describes the row: refused whole, nothing written
+        // (third review 85c11887 B1). Running the move again plans it
+        // from the row as it now stands.
+        Err(crate::port::JobsError::StepChanged { id }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "converted": false,
+                "from": judged.from,
+                "to": judged.to,
+                "obstacles": [{
+                    "step": id.to_string(),
+                    "reason": "this step was written after the move was read from it, so \
+                               the plan no longer describes it; nothing was written — run \
+                               the move again to plan it from the step as it stands",
+                }],
+            })),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -3563,6 +3663,16 @@ pub(super) struct EstateEventsQuery {
 /// row, confidently — a wrong target answering instead of erroring.
 pub(super) const LATEST_PER_KEYS: &[&str] = &["host"];
 
+/// Rows an estate series read answers when it names no `?limit=`.
+/// Deliberately small: a status read wants the newest few, and every
+/// in-tree reader that wants more names its limit (backlog 7b709f78 —
+/// the doc named only the ceiling, and a reader took it for this).
+pub const ESTATE_PAGE_DEFAULT: i64 = 5;
+
+/// The most rows one estate series read answers, whatever `?limit=`
+/// asks; `?until=` pages past it (bf362f25).
+pub const ESTATE_PAGE_CEILING: i64 = 50;
+
 /// `GET /api/estate/observations` and `/api/estate/comparisons` — the
 /// read half of the estate loop's event series (d471a8ce).
 ///
@@ -3579,8 +3689,10 @@ pub(super) const LATEST_PER_KEYS: &[&str] = &["host"];
 /// a second instrument. They were guest-readable like
 /// `/api/estate/nodes` until backlog e5f7b51e; each now asks Read on
 /// `estate` through [`estate_read_refusal`]. Small default, hard cap —
-/// this is a status surface,
-/// not an export (the events service's export door owns bulk).
+/// [`ESTATE_PAGE_DEFAULT`] (5) rows when no `?limit=` is named, never
+/// more than [`ESTATE_PAGE_CEILING`] (50) whatever it asks, with `total`
+/// counting the window either way. This is a status surface, not an
+/// export (the events service's export door owns bulk).
 ///
 /// `?scope=` is what makes that small cap honest. One kind carries
 /// many series at different cadences, and a page taken across all of
@@ -3588,8 +3700,8 @@ pub(super) const LATEST_PER_KEYS: &[&str] = &["host"];
 /// 50-row ceiling held 49 `kubernetes-nodes` rows and 1 `host` and
 /// covered only 04:30Z–17:30Z, so the nightly `codebase` observation
 /// could not be read through the one door that serves it. Asking for
-/// a scope answers about THAT scope — 50 rows of a nightly series is
-/// fifty nights, not half a day.
+/// a scope answers about THAT scope — a ceiling page (`limit=50`) of a
+/// nightly series is fifty nights, not half a day.
 ///
 /// `?since=` / `?until=` do the same for TIME (backlog bf362f25). The
 /// cap had no way past it: post-mortem 3c3b202c, thirty hours after an
@@ -3705,7 +3817,10 @@ async fn estate_events<R: JobsRepository + 'static, B: EventBus + 'static>(
     kind: &str,
     q: &EstateEventsQuery,
 ) -> Response {
-    let limit = q.limit.unwrap_or(5).clamp(1, 50);
+    let limit = q
+        .limit
+        .unwrap_or(ESTATE_PAGE_DEFAULT)
+        .clamp(1, ESTATE_PAGE_CEILING);
     if let Some(key) = q.latest_per.as_deref()
         && !LATEST_PER_KEYS.contains(&key)
     {

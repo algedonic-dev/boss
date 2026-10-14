@@ -171,9 +171,12 @@ WORK="$(mktemp -d)" || node_fail "cannot make a scratch directory"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/decl"
 
-# The checkout the runner itself runs from (ops-runner.sh's OPS_REPO_ROOT
-# is the same directory); BOSS_NODE_CONVERGE_TREE is the tests' seam.
-TREE="${BOSS_NODE_CONVERGE_TREE:-$(cd "$HERE/../.." && pwd)}"
+# The checkout the runner hands its verbs (BOSS_OPS_CHECKOUT: on the
+# forge the runner executes root's tree, which has no .git, so the
+# declaration's history is read in the checkout, as its owner — backlog
+# a604a35b), else the tree this script runs from (ops-runner.sh's
+# OPS_REPO_ROOT); BOSS_NODE_CONVERGE_TREE is the tests' seam.
+TREE="${BOSS_NODE_CONVERGE_TREE:-${BOSS_OPS_CHECKOUT:-$(cd "$HERE/../.." && pwd)}}"
 REL="infra/cluster/talos/patches/$NODE.yaml"
 CHECK="$HERE/../cluster/talos/check-declared.sh"
 [ -r "$CHECK" ] || node_fail "the read-back $CHECK is not in this checkout — an effect nobody can read is not applied"

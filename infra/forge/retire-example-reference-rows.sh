@@ -107,8 +107,8 @@
 #   BOSS_FORGE_TENANTS_DIR  where the converge stages tenant checkouts,
 #                         one directory per instance name — the same
 #                         variable and the same default the converge
-#                         derives it from (cluster-deploy-runner.sh:
-#                         beside the checkout, `<parent>/tenants`)
+#                         reads (forge-defaults.sh TENANTS_DIR, under
+#                         the converge's root-only state directory)
 #   BOSS_KUBECTL / KUBECONFIG  see undeclared-objects.sh; resolved once
 
 set -uo pipefail
@@ -130,14 +130,13 @@ TREE="${BOSS_RETIRE_TREE:-$REPO}"
 RESOLVE="$REPO/infra/cluster/undeclared-objects.sh"
 DERIVE="$REPO/infra/postgres/example-reference-rows.sh"
 INSTANCES="$TREE/infra/cluster/instances.toml"
-# The converge's tenant checkouts: cluster-deploy-runner.sh derives
-# `$(dirname "$REPO")/tenants` from ITS checkout, which on the forge is
-# this one (/home/david/boss), so the two agree by construction.
-TENANTS_DIR="${BOSS_FORGE_TENANTS_DIR:-$(dirname "$TREE")/tenants}"
 
 # The target, as infra/cluster/manifests/boss.yaml declares it: the
 # StatefulSet `postgres`, container `postgres`, POSTGRES_USER=boss; the
-# namespace is the packet's; the database is the Secret's.
+# namespace is the packet's; the database is the Secret's. And the
+# converge's tenant checkouts, TENANTS_DIR: forge-defaults.sh's, the one
+# definition the converge reads too (it was derived beside each script's
+# checkout until the converge moved to root's tree, backlog 683d7fe9).
 . "$(dirname "$0")/forge-defaults.sh"
 SECRET_NAME="boss-secrets"
 SECRET_KEY="database-url"

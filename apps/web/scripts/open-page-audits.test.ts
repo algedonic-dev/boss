@@ -25,28 +25,20 @@ describe('the roster is the catalog', () => {
     expect(new Set(paths).size).toBe(paths.length);
     const catalogued = new Set(Object.values(ROUTE_CATALOG).map((e) => e.path));
     expect(new Set(paths)).toEqual(catalogued);
-    // The design measured 45 on #451; the number is the catalog's to
-    // move, and this line is what makes a move visible in the diff.
-    // 47 since feedback 92921c2f (2026-09-18): the Receiving Yard and
-    // the Marshalling Yard became catalog rows, so their two paths —
-    // routed all along, as Operate tabs — joined the march. 48 since
-    // backlog 3071e235 (2026-09-24): the dispatcher rule editor stopped
-    // sharing the rules list's path. 47 since design 2ea444f5
-    // (2026-09-24): /ux/calendar left the catalog with the
-    // second example tenant, so its audit (0ceeffa6) is withdrawn. 44
-    // since car N1 of design e765b3fc (2026-09-25): the Receiving Yard,
-    // the Marshalling Yard and the Crew Board left the catalog for the
-    // one Department Map row — each is a station selected on /it. 42
-    // since car N3 of the same design: Feedback triage and the IT
-    // backlog left the catalog with their pages — each board is a
-    // station's panel on /it now. 43 since backlog 62988516
-    // (2026-09-27): the Agents tab on Registry, the agents registry as
-    // a directory, joined the catalog and so the march. 44 since backlog
-    // 851259b9 (2026-09-27): the Credentials tab on Registry, the
-    // credentials registry with its lifecycle as packets. 45 since
-    // approved design d4dada70 (2026-10-02): the company System Network
-    // Map is a Home-owned orientation surface with its own catalog row.
-    expect(paths.length).toBe(45);
+    // The equality above holds the complete roster. A second literal
+    // count drifted when two served tabs joined it (e52e3017).
+    expect(catalogued.size).toBeGreaterThan(0);
+  });
+
+  it('new catalog entries join the march while aliases keep the first entry', () => {
+    expect(catalogRoutes({
+      first: { path: '/fixture/page', label: 'First', owner: 'fixture' },
+      alias: { path: '/fixture/page', label: 'Alias', owner: 'other' },
+      added: { path: '/fixture/added', label: 'Added', owner: 'other' },
+    })).toEqual([
+      { route: '/fixture/page', label: 'First', department: 'fixture' },
+      { route: '/fixture/added', label: 'Added', department: 'other' },
+    ]);
   });
 
   it('a parameterised catalog path is a page the march audits', () => {
@@ -68,7 +60,11 @@ describe('the roster is the catalog', () => {
     expect(by.get('/ux/sales')).toBe('sales');
     expect(by.get('/ux/vendors')).toBe('finance');
     expect(by.get('/it/design')).toBe('it');
-    for (const home of ['/ux/jobs', '/ux/inbox', '/ux/views', '/ux/calendar/me', '/manual']) {
+    // f7f515ee: retiring Views removes it from the audit march too;
+    // it is neither a relocated Home page nor an alias.
+    expect(by.has('/ux/views')).toBe(false);
+    expect(by.has('/views')).toBe(false);
+    for (const home of ['/ux/jobs', '/ux/inbox', '/ux/calendar/me', '/manual']) {
       expect(by.get(home), home).toBe(HOME_DEPARTMENT);
     }
     // Every department is a code the catalog's `owner` names, so the

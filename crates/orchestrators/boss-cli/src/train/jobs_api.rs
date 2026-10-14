@@ -420,7 +420,17 @@ pub(crate) async fn send_through_a_roll(
     what: &str,
     build: impl Fn() -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response> {
-    send_through(&ROLL_WAIT, what, &|m| eprintln!("boss: {m}"), build).await
+    send_through(&ROLL_WAIT, what, &say_on_stderr, build).await
+}
+
+/// The roll wait's voice, written WITHOUT `eprintln!` (review 0facb916,
+/// N1): `eprintln!` panics when the write fails, so a verb whose
+/// terminal had gone died on the retry line of the very write it was
+/// waiting to make — for `boss dispatch --launch`, Building's `died`. A
+/// line nobody can read is dropped; the write it narrates goes on.
+fn say_on_stderr(m: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "boss: {m}");
 }
 
 /// [`send_through_a_roll`] with the wait and the voice chosen — the
@@ -545,7 +555,7 @@ pub(crate) fn track_occupied_by(open_trains: &[Value]) -> Option<String> {
 /// There were five, and they disagreed. `gate::rows` — ~40 callers,
 /// orient, park, dispatch, cadence and job among them — answered an
 /// EMPTY list for anything that was not a list, while this one refused;
-/// `gate::api` answers `Ok(None)` for a 200 whose body is not JSON (a
+/// `crate::sor_client::api` answers `Ok(None)` for a 200 whose body is not JSON (a
 /// proxy's login page, an error envelope), so through that helper a
 /// dark or wrong door read as an empty yard: the "a wrong target
 /// answers instead of erroring" failure CLAUDE.md §Doors names. The
@@ -614,7 +624,7 @@ pub(crate) fn every_row(resp: Option<Value>) -> Result<Vec<Value>> {
 }
 
 /// How much of a non-list body [`rows`]' refusal quotes — and of a
-/// non-JSON answer to a write, `gate::success_answer`'s: enough to
+/// non-JSON answer to a write, `crate::sor_client::success_answer`'s: enough to
 /// recognise an error envelope or a login page, not the whole page.
 pub(crate) const ROWS_REFUSAL_QUOTE: usize = 200;
 
@@ -774,6 +784,54 @@ pub(crate) fn dead_gate_run_hours(run: &Value, now: DateTime<Utc>) -> Option<i64
     (hours >= GATE_DEADLINE_HOURS).then_some(hours)
 }
 
+/// How long a recorded verdict is left to the settle of the write that
+/// recorded it. That settle — the readiness pass that readies the
+/// verdict's outcome, and the close — runs inside the same request,
+/// milliseconds after the step lands (gate-run a2cb4f44: 12 ms), so a
+/// packet still open a reconcile pass later was never settled.
+pub(crate) const VERDICT_SETTLE_GRACE_MINUTES: i64 = 2;
+
+/// PURE: the `record-verdict` step id of an OPEN gate-run whose verdict
+/// is recorded and older than [`VERDICT_SETTLE_GRACE_MINUTES`] — a packet
+/// the recording write never settled. `None` leaves the run alone.
+///
+/// WHY (backlog f4f5c271). Gate-run 21ad0189's verdict was completed
+/// green at 2026-10-09T01:40:46Z and its readiness pass did not run, so
+/// `green` stayed pending and the packet stood open for a day and a half,
+/// drawn as a gate still running. The jobs API answered that write 204
+/// then; since 17bf6f3e it answers 500 and runs the missed pass on a
+/// re-send of the completed step. Nothing here re-sent: `verdict_owed`
+/// and `complete_step` both skip a verdict step that is done, so the
+/// retry the 500 asks for never came. The re-send is the status alone
+/// ([`step_completion_writes`] with no fields), which writes nothing to
+/// the step and is idempotent on the server.
+///
+/// A step with no readable `completed_at` is owed the re-send: an
+/// absent stamp is not evidence of a recent write, and the re-send
+/// changes nothing a settled packet holds.
+pub(crate) fn unsettled_verdict_step(run: &Value, now: DateTime<Utc>) -> Option<&str> {
+    if run.get("kind").and_then(Value::as_str) != Some("gate-run")
+        || run.get("status").and_then(Value::as_str) != Some("open")
+    {
+        return None;
+    }
+    let step = find_step(run, "record-verdict", "Record the gate verdict")?;
+    if step.get("status").and_then(Value::as_str) != Some("completed") {
+        return None;
+    }
+    let recent = step
+        .get("completed_at")
+        .and_then(Value::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .is_some_and(|at| {
+            (now - at.with_timezone(&Utc)).num_minutes() < VERDICT_SETTLE_GRACE_MINUTES
+        });
+    if recent {
+        return None;
+    }
+    step.get("id").and_then(Value::as_str)
+}
+
 /// Whole minutes since a gate-run last said it was alive — the same
 /// reading as both clocks above — or `None` when it carries no stamp
 /// that parses. For the recorder's note on a run it is keeping waiting
@@ -919,7 +977,7 @@ pub(crate) fn orphan_evidence(
         "last_alive": o.last_alive,
         "idle_minutes": o.idle_minutes,
         "queued_at": o.queued_at,
-        "observed_at": crate::gate::stamp(observed_at),
+        "observed_at": crate::sor_client::stamp(observed_at),
         "observer": "boss train cadence (conductor reconcile)",
     })
 }
@@ -1268,6 +1326,53 @@ mod tests {
     use crate::train::test_support::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    /// Owed a settle: open, verdict completed, past the grace. Not owed:
+    /// a verdict still open, a closed packet, one recorded a moment ago,
+    /// a skipped verdict step, or another kind (backlog f4f5c271).
+    #[test]
+    fn only_an_open_gate_run_with_an_old_recorded_verdict_is_owed_a_settle() {
+        let now = DateTime::parse_from_rfc3339("2026-10-10T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let run = |status: &str, step: &str, at: Option<&str>| {
+            let mut s = json!({"id": "s-v", "spec_slug": "record-verdict",
+                               "title": "Record the gate verdict", "status": step,
+                               "metadata": {"verdict": "green"}});
+            if let Some(at) = at {
+                s["completed_at"] = json!(at);
+            }
+            json!({"id": "r", "kind": "gate-run", "status": status, "steps": [s]})
+        };
+        // The live case: 21ad0189, recorded 2026-10-09T01:40:46Z.
+        let stuck = run("open", "completed", Some("2026-10-09T01:40:46.453747Z"));
+        assert_eq!(unsettled_verdict_step(&stuck, now), Some("s-v"));
+        assert_eq!(
+            unsettled_verdict_step(&run("open", "completed", None), now),
+            Some("s-v"),
+            "no stamp is not evidence of a recent write"
+        );
+        assert_eq!(
+            unsettled_verdict_step(&run("open", "completed", Some("2026-10-10T14:59:30Z")), now),
+            None,
+            "inside the grace the recording write's own settle is still running"
+        );
+        assert_eq!(
+            unsettled_verdict_step(&run("open", "ready", None), now),
+            None
+        );
+        assert_eq!(
+            unsettled_verdict_step(&run("open", "skipped", None), now),
+            None
+        );
+        assert_eq!(
+            unsettled_verdict_step(&run("closed", "completed", None), now),
+            None
+        );
+        let mut other = stuck.clone();
+        other["kind"] = json!("ship-a-change");
+        assert_eq!(unsettled_verdict_step(&other, now), None);
+    }
+
     /// A completion is the fields through the merge door, then a PUT
     /// carrying the status and NOTHING else — the only form that
     /// survives the step PUT refusing any metadata body (e39a9d2a).
@@ -1321,7 +1426,7 @@ mod tests {
         );
     }
 
-    /// Everything that is not a list refuses — no body (what `gate::api`
+    /// Everything that is not a list refuses — no body (what `crate::sor_client::api`
     /// answers for a 200 that is not JSON), an error envelope, a `data`
     /// that is not an array — and the refusal quotes the body, CUT, so
     /// a login page does not bury the line that says what failed
@@ -2405,7 +2510,7 @@ mod tests {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
-                crate::gate::stub::read_request(&mut sock).await;
+                crate::sor_client::stub::read_request(&mut sock).await;
                 let n = count.fetch_add(1, Ordering::SeqCst) as usize;
                 let (status, body) = answers[n.min(answers.len() - 1)];
                 let resp = format!(
@@ -2556,5 +2661,72 @@ mod tests {
             crate::gate::is_transient(&said),
             "boss gate --wait still reads it as a roll: {said}"
         );
+    }
+
+    /// Set to a directory, [`the_roll_voice_in_its_own_process`] runs;
+    /// unset, it returns at once.
+    const ROLL_VOICE_HELPER: &str = "BOSS_TEST_ROLL_VOICE";
+
+    /// Not a test on its own: the process that
+    /// [`a_roll_wait_whose_stderr_has_gone_does_not_panic`] starts with
+    /// [`ROLL_VOICE_HELPER`] set and its stderr's reader gone. It walks
+    /// the whole roll window of [`send_through_a_roll`] — the one every
+    /// operator verb's write goes through — against a port that refuses,
+    /// on a paused clock, and leaves the error it came back with.
+    #[tokio::test(start_paused = true)]
+    async fn the_roll_voice_in_its_own_process() {
+        let Some(tell) = std::env::var_os(ROLL_VOICE_HELPER).map(std::path::PathBuf::from) else {
+            return;
+        };
+        // Held, not bound and released (review 465e723f F3).
+        let refusing = boss_testing::dark_port();
+        let url = format!("{}/api/jobs/x", refusing.base);
+        let client = reqwest::Client::new();
+        let err = send_through_a_roll("jobs api PATCH /api/jobs/x/metadata", || {
+            client.patch(&url).body("{}")
+        })
+        .await
+        .expect_err("nothing answers");
+        std::fs::write(tell.join("ended"), format!("{err:#}")).unwrap();
+    }
+
+    /// Review 0facb916, N1. THE ROLL WAIT'S RETRY LINE DOES NOT PANIC
+    /// WHEN STDERR HAS GONE. Its voice was `eprintln!`, which panics when
+    /// the write fails — so a verb whose terminal had closed, writing
+    /// while the jobs API refused connects (a roll: about a minute dark
+    /// per converge), died 101 on the retry line and never wrote what it
+    /// was writing: for `boss dispatch --launch` that is Building's
+    /// `died` (the N19 failure of review b149c579, through this file).
+    #[test]
+    fn a_roll_wait_whose_stderr_has_gone_does_not_panic() {
+        let tell = boss_testing::scratch_dir("roll-voice-no-stderr");
+        let (reader, writer) = std::io::pipe().unwrap();
+        // Nobody reads the verb's stderr: every write to it fails.
+        drop(reader);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "train::jobs_api::tests::the_roll_voice_in_its_own_process",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ROLL_VOICE_HELPER, &tell)
+            .stdout(std::process::Stdio::from(
+                std::fs::File::create(tell.join("stdout")).unwrap(),
+            ))
+            .stderr(std::process::Stdio::from(writer))
+            .status()
+            .unwrap();
+        let ended = std::fs::read_to_string(tell.join("ended")).unwrap_or_else(|_| {
+            panic!(
+                "the roll wait ended ({status}) without coming back: a retry line panicked. {}",
+                std::fs::read_to_string(tell.join("stdout")).unwrap_or_default()
+            )
+        });
+        assert!(
+            ended.contains("refused every connection"),
+            "it walked the whole window and came back with the outage: {ended}"
+        );
+        assert!(status.success(), "{status}");
     }
 }

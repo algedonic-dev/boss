@@ -1,7 +1,7 @@
 # Algedonic Ales (example tenant)
 
 Public OSS demo tenant. BOSS expands to **Beer Open Source Software
-— for System Modeling**; this brewery is its namesake.
+— for System Modeling**, named after Stafford Beer.
 **Algedonic** is Stafford Beer's term for the pleasure/pain
 feedback signal in cybernetic systems — fitting for the demo
 brewery running on a state-machine OS, and a nod to Algedonic, LLC
@@ -9,8 +9,8 @@ brewery running on a state-machine OS, and a nod to Algedonic, LLC
 
 The tenant exercises BOSS core through a domain anyone can reason
 about — production batches, kegs, fermenters, distributor routes
-— rather than the heavier device-refurb-and-service specifics that
-the in-tree used-device-shop example uses.
+— using the same registries and bootstrap doors a company uses for
+its own model. It is the one example tenant shipped in the repository.
 
 Algedonic Ales is industrial-scale: a 30+ BBL brewhouse, multiple
 fermenters in parallel, daily kegging, a working taproom, regional

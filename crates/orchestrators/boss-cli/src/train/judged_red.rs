@@ -118,7 +118,13 @@ pub(crate) fn judged_red_cancel_reason(named: &[String], stall_hours: i64) -> St
 /// - a line that is only `<path>:<line>:<col>`, followed by one that
 ///   starts `Error` — svelte-check as both the gate and the forge
 ///   print it (trains f7bd1e9d and 02801b05, 2026-09-24); the same
-///   shape followed by `Warn` is a warning and is skipped.
+///   shape followed by `Warn` is a warning and is skipped;
+/// - inside a panic's MESSAGE (the panic line's own text and the lines
+///   after it, up to cargo's `note:` or the next test), every
+///   `<path>:<line>` it names ([`named_location_path`]) — a whole-tree
+///   scanner panics in its own file and lists the offending lines in
+///   the message, so the panic's location alone blames no car (train
+///   22789ff1, 2026-09-26, backlog 4a56c797).
 ///
 /// Forge log lines carry a runner timestamp and ANSI colour inside the
 /// path itself (`…/apps/web/\x1b[32msrc/…`), so both come off first.
@@ -130,16 +136,27 @@ pub(crate) fn located_failures(text: &str) -> Vec<String> {
     let lines: Vec<String> = text.lines().map(clean_log_line).collect();
     let mut out: Vec<String> = Vec::new();
     let mut under_error = false;
+    let mut in_panic = false;
     for (i, line) in lines.iter().enumerate() {
         if let Some((_, rest)) = line.split_once("panicked at ") {
-            if let Some(path) = rest
-                .split_whitespace()
+            let mut words = rest.split_whitespace();
+            if let Some(path) = words
                 .next()
                 .and_then(|t| location_path(t.strip_suffix(':').unwrap_or(t)))
             {
                 out.push(path);
             }
+            out.extend(words.filter_map(named_location_path));
+            in_panic = true;
             continue;
+        }
+        if in_panic {
+            if PANIC_MESSAGE_ENDS.iter().any(|p| line.starts_with(p)) {
+                in_panic = false;
+            } else {
+                out.extend(line.split_whitespace().filter_map(named_location_path));
+                continue;
+            }
         }
         if line.starts_with("error") {
             under_error = true;
@@ -214,6 +231,44 @@ fn location_path(token: &str) -> Option<String> {
     (numeric(col) && numeric(line) && !path.is_empty()).then(|| path.to_string())
 }
 
+/// The lines that close a Rust panic's message: cargo's backtrace note,
+/// the next test's header, the failures list, the result line, another
+/// panic's thread line, or a compiler/runner diagnostic.
+const PANIC_MESSAGE_ENDS: &[&str] = &[
+    "note:",
+    "---- ",
+    "failures:",
+    "test result:",
+    "thread '",
+    "error",
+    "warning",
+];
+
+/// A file a panic MESSAGE names as `<path>:<line>` or
+/// `<path>:<line>:<col>` — the shape a whole-tree scanner prints its
+/// offenders in (the_sim_bypass_has_one_door: `{rel}:{n}`, train
+/// 22789ff1, backlog 4a56c797). Surrounding punctuation comes off; the
+/// path must have a directory and a file extension, so prose (`see
+/// crates/a/`), a Rust path (`Client::from_env(`) and a URL are not
+/// locations. A path without a line number is prose, not a location.
+fn named_location_path(word: &str) -> Option<String> {
+    let token = word
+        .trim_start_matches(['(', '[', '\'', '"', '`'])
+        .trim_end_matches([',', ';', '.', ')', ']', ':', '\'', '"', '`']);
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let (head, last) = token.rsplit_once(':')?;
+    if !numeric(last) {
+        return None;
+    }
+    let path = match head.rsplit_once(':') {
+        Some((p, line)) if numeric(line) => p,
+        _ => head,
+    };
+    let file = path.rsplit_once('/')?.1;
+    (!path.contains("://") && !path.contains(':') && file.contains('.') && !file.ends_with('.'))
+        .then(|| path.to_string())
+}
+
 /// `a/b/../c` → `a/c`, keeping a leading `/`.
 fn normalise_path(path: &str) -> String {
     let mut segs: Vec<&str> = Vec::new();
@@ -264,7 +319,7 @@ pub(crate) fn verdict_located_files(
 /// file below the repo root — the located path ends in `/<file>`. A
 /// top-level file matches only itself: a car's `Cargo.toml` is not
 /// `/gate-target/repo/crates/x/Cargo.toml`.
-fn names_file(located: &str, file: &str) -> bool {
+pub(crate) fn names_file(located: &str, file: &str) -> bool {
     located == file
         || (file.contains('/')
             && located
@@ -648,6 +703,113 @@ error: script \"typecheck\" exited with code 1"
             vec![
                 "crates/b/src/lib.rs".to_string(),
                 "crates/core/boss-jobs/src/car.rs".to_string(),
+            ]
+        );
+    }
+
+    // -- a whole-tree scanner names the car's file in its message ---------
+    //
+    // Train 22789ff1 (2026-09-26 04:47): the train gate (gate-run
+    // 94ac9e33) failed boss-testing's the_sim_bypass_has_one_door, a
+    // tree-wide pin no car changed, and its panic MESSAGE named the two
+    // files car 9acb27f1 had added — as `path:line`, no column. Only the
+    // panic's own location was read, so the red read "outside the
+    // consist", every car was released unstruck, and the next train
+    // (7f3bc955) boarded the same car again (backlog 4a56c797). The
+    // receipt's `fails` line and `fails_excerpt`, trimmed, never retyped.
+
+    const T22789_FAILS: &str = "test: the_bypass_is_built_only_from_the_deployments_switch - panicked at crates/core/boss-testing/tests/the_sim_bypass_has_one_door.rs:147:5: the sim bypass is installed here without the deployment's switch \u{2014} build it with SimBypassPolicyClient::from_env(inner), which returns the inner client unless BOSS_SIM_ENABLED is on (backlog 85e7f10f): crates/modules/boss-assets/tests/the_assets_api_wires_po... (+81 char(s); the Job log replay has the full text)";
+
+    const T22789_EXCERPT: &str = "... (245 line(s) before the first failure marker omitted; the Job log replay has them)\n\
+     Running tests/the_sim_bypass_has_one_door.rs (/gate-target/target/debug/deps/the_sim_bypass_has_one_door-3f0bcbfc763579a0)\n\
+\n\
+running 3 tests\n\
+test the_chain_flag_is_read_for_provenance_and_never_to_authorize ... ok\n\
+test the_scanners_read_code_and_not_prose ... ok\n\
+test the_bypass_is_built_only_from_the_deployments_switch ... FAILED\n\
+\n\
+failures:\n\
+\n\
+---- the_bypass_is_built_only_from_the_deployments_switch stdout ----\n\
+\n\
+thread 'the_bypass_is_built_only_from_the_deployments_switch' (301414) panicked at crates/core/boss-testing/tests/the_sim_bypass_has_one_door.rs:147:5:\n\
+the sim bypass is installed here without the deployment's switch \u{2014} build it with SimBypassPolicyClient::from_env(inner), which returns the inner client unless BOSS_SIM_ENABLED is on (backlog 85e7f10f):\n\
+  crates/modules/boss-assets/tests/the_assets_api_wires_policy.rs:30\n\
+  crates/modules/boss-commerce/tests/the_commerce_api_wires_policy.rs:30\n\
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+\n\
+\n\
+failures:\n\
+    the_bypass_is_built_only_from_the_deployments_switch\n\
+\n\
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s\n\
+\n\
+error: test failed, to rerun pass `-p boss-testing --test the_sim_bypass_has_one_door`";
+
+    const SIM_DOOR: &str = "crates/core/boss-testing/tests/the_sim_bypass_has_one_door.rs";
+    const ASSETS_PIN: &str = "crates/modules/boss-assets/tests/the_assets_api_wires_policy.rs";
+    const COMMERCE_PIN: &str =
+        "crates/modules/boss-commerce/tests/the_commerce_api_wires_policy.rs";
+
+    #[test]
+    fn train_22789ff1_locates_the_files_its_panic_message_names() {
+        assert_eq!(
+            located_failures(T22789_EXCERPT),
+            vec![
+                SIM_DOOR.to_string(),
+                ASSETS_PIN.to_string(),
+                COMMERCE_PIN.to_string(),
+            ],
+            "the panic's location AND the path:line offenders its message lists"
+        );
+        // The receipt's one-line rung truncates the message before the
+        // first offender's line number: it locates the panic alone.
+        assert_eq!(located_failures(T22789_FAILS), vec![SIM_DOOR.to_string()]);
+    }
+
+    #[test]
+    fn train_22789ff1_holds_the_car_its_message_names() {
+        let located = verdict_located_files(
+            &[T22789_FAILS.to_string()],
+            &[("test".to_string(), T22789_EXCERPT.to_string())],
+            None,
+        );
+        // Car 9acb27f1's files are the two the packet names it as adding;
+        // the second car is 19bee523 of the same consist, its file list
+        // a stand-in (its branch is gone): it changed neither pin.
+        let cars = vec![
+            (
+                "19bee523-9904-43c2-91ea-c6778bc07c13".to_string(),
+                vec!["crates/orchestrators/boss-cli/src/train/dock.rs".to_string()],
+            ),
+            (
+                "9acb27f1-00d0-474c-b5ac-5862b5b1437a".to_string(),
+                vec![ASSETS_PIN.to_string(), COMMERCE_PIN.to_string()],
+            ),
+        ];
+        assert_eq!(
+            cars_to_hold(&located, &cars),
+            vec![(
+                "9acb27f1-00d0-474c-b5ac-5862b5b1437a".to_string(),
+                vec![ASSETS_PIN.to_string(), COMMERCE_PIN.to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn a_message_path_counts_only_inside_a_panic_and_only_with_a_line() {
+        let text = "  crates/a/src/before.rs:3\n\
+                    thread 't' panicked at crates/x/tests/pin.rs:9:5:\n\
+                    see crates/a/src/prose.rs and docs/design/x.md, not a location;\n\
+                    offender (crates/b/src/lib.rs:12), also crates/c/src/lib.rs:4:2.\n\
+                    note: run with `RUST_BACKTRACE=1`\n\
+                    crates/d/src/after.rs:7\n";
+        assert_eq!(
+            located_failures(text),
+            vec![
+                "crates/b/src/lib.rs".to_string(),
+                "crates/c/src/lib.rs".to_string(),
+                "crates/x/tests/pin.rs".to_string(),
             ]
         );
     }

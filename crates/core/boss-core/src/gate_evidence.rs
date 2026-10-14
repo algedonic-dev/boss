@@ -25,7 +25,8 @@
 //!   alone is never clean: without these a projection cannot tell a
 //!   quiet gate from one in `off`, or from a process that never
 //!   recorded. `instance` is the process's own id, on every fact it
-//!   states. The machine gate's also carries `roster` — the generation
+//!   states. The machine gate's and the actor-role report's (backlog
+//!   b13bd730) also carry `roster` — the generation
 //!   of the launch record the process was started under and its image's
 //!   commit, or why it has none (design 3cc6152a, backlog 14fe115c;
 //!   `gate_window::roster_stamp`) — so every watch on the log names the
@@ -44,7 +45,10 @@
 //!   degraded `enforce`), `refused` when it did not.
 //! * `<gate>.tally_overflowed` — the first sighting past a cap: a
 //!   would-refuse that names no one, so a window containing one is never
-//!   clean.
+//!   clean. On the machine gate one per presentation past the whole
+//!   tally, and one per source and presentation past a source's share —
+//!   including an ASK past its room, which names no asker (design
+//!   e3d19d1a q1).
 //! * `machine_gate.previous_presented` — a key presenting the `previous`
 //!   slot, which every mode admits: what a rotation's revoke drains on
 //!   (design point 5), and NOT a would-refuse.
@@ -55,11 +59,15 @@
 //!   clean window. On the log for the reader's own rotation.
 //! * `machine_gate.asked` — a key ASKING the gate's accepts route about
 //!   one value no slot holds (`machine_gate::asks`; backlog 89fc511e),
-//!   at its first sighting or past its source's share. A rotation asks
+//!   at its first sighting. (Past its room an ask is no longer keyed,
+//!   and is a `tally_overflowed` — design e3d19d1a q1. A build before
+//!   that stated the spill as a KEYLESS `asked` of scope `source`, which
+//!   the enforce window reads as the overflow it is — backlog aba44bac.)
+//!   A rotation asks
 //!   every gate about a value it has just staged, ahead of kubelet's
 //!   projection; so may anyone testing a value. Named, so that neither
 //!   is invisible, and NOT a would-refuse: an ask is answered `none`
-//!   whatever the mode, and ends no clean window.
+//!   whatever the mode, and a keyed one ends no clean window.
 //!
 //! TWO HALVES, and neither is the verdict alone (design point 3). The
 //! log half is [`window`] over what a [`GateEvidenceLog`] reads back.
@@ -245,7 +253,8 @@ pub enum Fact {
     /// The machine gate only: an ASK — one value no slot holds, on a GET
     /// of the accepts route (`machine_gate::asks`; backlog 89fc511e).
     /// Answered and named, and never a would-refuse: it is the question
-    /// the route exists for, so it ends no clean window.
+    /// the route exists for, so a keyed one ends no clean window. One
+    /// with no key names no asker and does ([`Gate::dirtied_by`]).
     Asked,
 }
 
@@ -332,6 +341,38 @@ impl Gate {
     pub fn fact_of(self, kind: &str) -> Option<Fact> {
         self.facts().iter().copied().find(|f| self.kind(*f) == kind)
     }
+
+    /// Does this fact end a clean ENFORCE window where it stands? One
+    /// definition for the log's [`window`] and the join's retired-epoch
+    /// rule (`gate_window`), as [`DrainedSlot::dirtied_by`] is for a drain.
+    ///
+    /// Every fact that [`Fact::dirties`] — and an `asked` that carries no
+    /// key. A keyed ask is the question the route exists for; an ask with
+    /// no key names no asker, which is how a build before design e3d19d1a
+    /// stated an asker past its source's share (scope `source`), before
+    /// that spill became a `tally_overflowed`. The log keeps what earlier
+    /// builds said, and during a roll one is still saying it (review
+    /// 42836ede of car 10ea15f6, N1; backlog aba44bac). An ask nobody can
+    /// place is no evidence that it named its asker, so it counts too —
+    /// and a key places it only when its `presented` parses as an ask,
+    /// the fail-closed parse [`DrainedSlot::dirtied_by`] holds a
+    /// presentation to. Until backlog ebc09e5b any object under `key`
+    /// read as a named asker, `{}` included (review 828fae07, nit 2).
+    pub fn dirtied_by(self, e: &Event) -> bool {
+        match self.fact_of(&e.kind) {
+            Some(Fact::Asked) => {
+                serde_json::from_value::<crate::machine_gate::Presented>(
+                    e.payload
+                        .pointer("/key/presented")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                )
+                .ok()
+                    != Some(crate::machine_gate::Presented::Asked)
+            }
+            fact => fact.is_some_and(Fact::dirties),
+        }
+    }
 }
 
 /// Every kind the gates state, as the `event_kinds` migrations declare
@@ -366,7 +407,16 @@ pub const KINDS: [&str; 20] = [
 /// up, and what does not fit is LOST — counted, stated on the log as
 /// `facts_lost` once it takes writes, never waited on: the request path
 /// never blocks on the log.
-pub const QUEUE_DEPTH: usize = 2048;
+///
+/// The machine gate's tally is the largest: two rooms of keys, since
+/// asks were given their own (backlog d653e090), plus its spills and
+/// overflows — `machine_gate::FACTS_ONE_TALLY_CAN_STATE`. At 2048 this
+/// held exactly the two rooms' keys and nothing past them, so a full
+/// tally lost its spill and overflow facts (review of car 1dff2293).
+/// It now holds a whole tally and a further room of the next one, which
+/// a mode move starts while the recorder may still be draining; the
+/// machine gate asserts that at compile time.
+pub const QUEUE_DEPTH: usize = 4096;
 
 /// The first and the longest wait between attempts at a fact the
 /// recorder refuses. Refused, a fact is retried, never dropped: the
@@ -1248,9 +1298,7 @@ pub fn window(
     now: DateTime<Utc>,
     facts: &[Event],
 ) -> Window {
-    window_selected(gate, services, from, now, facts, |e| {
-        gate.fact_of(&e.kind).is_some_and(Fact::dirties)
-    })
+    window_selected(gate, services, from, now, facts, |e| gate.dirtied_by(e))
 }
 
 /// Which of a machine gate's two slot sets a drain waits out the
@@ -1409,6 +1457,34 @@ mod tests {
 
     fn at(h: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 1, h, 0, 0).unwrap()
+    }
+
+    /// Backlog ebc09e5b (review 828fae07, nit 2). An ask is clean only
+    /// when its key places it AS an ask: any object under `key` — `{}`,
+    /// or a key presenting something else — used to read as a named
+    /// asker. The same fail-closed parse `DrainedSlot::dirtied_by` holds
+    /// a presentation to.
+    #[test]
+    fn an_ask_is_clean_only_when_its_key_parses_as_asked() {
+        let gate = Gate::MachineGate;
+        let asked = |payload: Value| Event::new("policy", gate.kind(Fact::Asked), payload, at(1));
+        assert!(
+            !gate.dirtied_by(&asked(json!({"key":{"peer":"10.20.0.66","user":"u",
+            "method":"GET","route":"/api/machine-gate/accepts","presented":"asked"}})))
+        );
+        for key in [
+            json!({}),
+            json!({"presented":"previous"}),
+            json!({"presented":"not-a-presentation"}),
+            json!({"presented":null}),
+            json!("asked"),
+        ] {
+            assert!(
+                gate.dirtied_by(&asked(json!({ "key": key }))),
+                "an ask whose key does not parse as asked names no asker: {key}"
+            );
+        }
+        assert!(gate.dirtied_by(&asked(json!({"scope":"source","presented":"asked"}))));
     }
 
     #[tokio::test]

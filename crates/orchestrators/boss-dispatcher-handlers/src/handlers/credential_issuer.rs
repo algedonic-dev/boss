@@ -84,6 +84,23 @@ pub trait ForgeTokenIssuer: Send + Sync {
     async fn delete_token(&self, user: &str, token_id: i64) -> Result<bool, String>;
     /// Verify by effect: authenticate a repo read with `token`.
     async fn repo_readable_with(&self, token: &str, repo: &str) -> Result<bool, String>;
+    /// Verify by effect for a REGISTRY PUSH token (backlog 683d7fe9,
+    /// design c8502e17): the forge's container registry accepts the first
+    /// act of a push to `image` (`owner/name`) from `user` with `token` —
+    /// an upload session opened, then cancelled, so nothing is stored. A
+    /// token that only reads packages opens no session, which is why this
+    /// is the proof and a bare login is not. `Ok(false)` = the registry
+    /// refused the credential (401/403); anything else is an `Err`. The
+    /// default refuses, so an issuer with no registry cannot answer yes.
+    async fn registry_push_accepted_with(
+        &self,
+        user: &str,
+        token: &str,
+        image: &str,
+    ) -> Result<bool, String> {
+        let _ = (user, token, image);
+        Err("this issuer has no container registry to prove a push against".into())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +208,31 @@ pub enum WriteAt {
 }
 
 // ---------------------------------------------------------------------------
+// Estate-host clients
+// ---------------------------------------------------------------------------
+
+/// The one way this module builds a client that carries a credential to
+/// an ESTATE host — the forge's admin API, the cluster API: every proxy
+/// off, the environment's and any the builder named (backlog 6162aff2,
+/// review bad26eb2). reqwest honours `HTTP_PROXY`/`HTTPS_PROXY`/
+/// `ALL_PROXY` by default, and the forge is reached over PLAIN HTTP, so a
+/// proxy exported where the dispatcher ran would have read the broker's
+/// forge admin ROOT token in cleartext. The cluster API is HTTPS, but its
+/// CA is added to the system roots rather than replacing them, and no
+/// egress proxy has a reason to stand between a pod and its own cluster.
+///
+/// Deliberately NOT used by the third-party adapters below: Cloudflare
+/// and GitHub are public HTTPS APIs validated against the system roots,
+/// where an egress proxy is a legitimate deployment shape and relays
+/// only ciphertext through CONNECT.
+fn estate_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, String> {
+    builder
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("http client: {e}"))
+}
+
+// ---------------------------------------------------------------------------
 // Forgejo adapter
 // ---------------------------------------------------------------------------
 
@@ -204,13 +246,17 @@ impl ForgejoAdmin {
     /// `root_token` is the broker's root credential (k8s Secret
     /// `boss-credential-broker-root`, key `forgejo-token`), handed in
     /// by the binary from env. It is held to sign requests and is
-    /// never logged, serialized, or included in an error.
-    pub fn new(base: impl Into<String>, root_token: impl Into<String>) -> Arc<Self> {
-        Arc::new(Self {
-            client: reqwest::Client::new(),
+    /// never logged, serialized, or included in an error. Its base is the
+    /// estate forge over plain HTTP, so the client is an [`estate_client`].
+    pub fn new(
+        base: impl Into<String>,
+        root_token: impl Into<String>,
+    ) -> Result<Arc<Self>, String> {
+        Ok(Arc::new(Self {
+            client: estate_client(reqwest::Client::builder())?,
             base: base.into(),
             root_token: root_token.into(),
-        })
+        }))
     }
 
     fn auth(&self) -> String {
@@ -270,6 +316,51 @@ pub fn forge_username(user: &str) -> Result<&str, String> {
              it never enters an admin URL"
         ))
     }
+}
+
+/// A container image the registry proof may name: `owner/name`, exactly
+/// two segments. `verify_image` is rule-arg data that enters a registry
+/// URL path beside a freshly minted push token, so — as with
+/// [`forge_username`], and for the reason round 3 of car 85b7b55f found
+/// (F1d: a string in a path is a path) — an image the registry could
+/// never hold never becomes a URL. The owner is held to the forge's
+/// username grammar; the name to the OCI repository grammar's one-segment
+/// form (lowercase letters and digits, single `.`, `_` or `-` between
+/// them), at most 128 characters.
+pub fn registry_image(image: &str) -> Result<&str, String> {
+    const MAX: usize = 128;
+    let refuse = || {
+        format!(
+            "verify_image {image:?} is not owner/name (a forge username, then a lowercase \
+             image name of letters, digits and single ._- separators, at most {MAX} \
+             characters); it never enters a registry URL"
+        )
+    };
+    let (owner, name) = image.split_once('/').ok_or_else(refuse)?;
+    forge_username(owner).map_err(|_| refuse())?;
+    let sep = |c: char| matches!(c, '.' | '_' | '-');
+    let word = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let ends_ok = name.starts_with(word) && name.ends_with(word);
+    let chars_ok = name.chars().all(|c| word(c) || sep(c));
+    let runs_ok = !name
+        .as_bytes()
+        .windows(2)
+        .any(|w| sep(w[0] as char) && sep(w[1] as char));
+    if ends_ok && chars_ok && runs_ok && name.len() <= MAX {
+        Ok(image)
+    } else {
+        Err(refuse())
+    }
+}
+
+/// The upload session id the registry answers an opened push with, when
+/// it is one this adapter will put back into a URL to cancel it: letters,
+/// digits and `-` only (the forge mints a UUID), at most 64 characters.
+fn upload_session(id: &str) -> Option<&str> {
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    ok.then_some(id)
 }
 
 /// One listed row, or `None` when the row lacks an id or a name.
@@ -431,6 +522,77 @@ impl ForgeTokenIssuer for ForgejoAdmin {
             .map_err(|e| format!("GET {url}: {e}"))?;
         Ok(resp.status().is_success())
     }
+
+    /// The OCI distribution push, first act only (Forgejo's container
+    /// routes, as in Gitea 1.22 `routers/api/packages/container`):
+    ///   POST   /v2/{owner}/{name}/blobs/uploads/         — 202, Docker-Upload-UUID
+    ///   DELETE /v2/{owner}/{name}/blobs/uploads/{uuid}   — cancel the session
+    /// Basic auth, the user and the token as its password — the pair
+    /// `docker login` stores. The forge checks the token's package WRITE
+    /// scope before it opens a session, so 202 is the registry accepting a
+    /// push from this credential; no blob is sent, and the session is
+    /// cancelled so nothing is left to clean (a cancel that fails leaves a
+    /// session the forge's own package cleanup expires; it is not this
+    /// proof's failure and is not reported as one). NOT measured against
+    /// the live forge by the car that wrote it — the first rotation is the
+    /// measurement, and a wrong reading here fails closed: `verified` is
+    /// not recorded and nothing is revoked.
+    async fn registry_push_accepted_with(
+        &self,
+        user: &str,
+        token: &str,
+        image: &str,
+    ) -> Result<bool, String> {
+        let user = forge_username(user)?;
+        let image = registry_image(image)?;
+        let url = format!(
+            "{}/v2/{image}/blobs/uploads/",
+            self.base.trim_end_matches('/')
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .basic_auth(user, Some(token))
+            .header(reqwest::header::CONTENT_LENGTH, 0)
+            .send()
+            .await
+            .map_err(|e| format!("POST {url}: {e}"))?;
+        match resp.status() {
+            reqwest::StatusCode::ACCEPTED => {
+                let session = resp
+                    .headers()
+                    .get("docker-upload-uuid")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(upload_session)
+                    .map(str::to_string);
+                if let Some(session) = session {
+                    let cancel = format!("{url}{session}");
+                    let cancelled = self
+                        .client
+                        .delete(&cancel)
+                        .basic_auth(user, Some(token))
+                        .send()
+                        .await
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false);
+                    if !cancelled {
+                        tracing::warn!(
+                            image,
+                            "the registry proof's upload session was not cancelled; the forge's \
+                             package cleanup expires it"
+                        );
+                    }
+                }
+                Ok(true)
+            }
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => Ok(false),
+            // Body dropped, as every Forgejo failure here is.
+            s => Err(format!(
+                "POST {url} returned {s}; neither a push accepted (202) nor a credential \
+                 refused (401/403)"
+            )),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +609,8 @@ impl KubeSecretStore {
     /// Build from an explicit endpoint + credential (tests, or an
     /// out-of-cluster operator context). `ca_pem` is the cluster CA;
     /// `None` means the endpoint's cert chains to a system root
-    /// (plain-http test stubs also land here).
+    /// (plain-http test stubs also land here). The cluster API is an
+    /// estate host, so the client is an [`estate_client`].
     pub fn new(
         base: impl Into<String>,
         bearer: impl Into<String>,
@@ -460,7 +623,7 @@ impl KubeSecretStore {
             b = b.add_root_certificate(cert);
         }
         Ok(Arc::new(Self {
-            client: b.build().map_err(|e| format!("http client: {e}"))?,
+            client: estate_client(b)?,
             base: base.into(),
             bearer: bearer.into(),
         }))
@@ -707,6 +870,14 @@ impl ForgeTokenIssuer for Unconfigured {
         Err(self.0.clone())
     }
     async fn repo_readable_with(&self, _t: &str, _r: &str) -> Result<bool, String> {
+        Err(self.0.clone())
+    }
+    async fn registry_push_accepted_with(
+        &self,
+        _u: &str,
+        _t: &str,
+        _i: &str,
+    ) -> Result<bool, String> {
         Err(self.0.clone())
     }
 }
@@ -2322,6 +2493,7 @@ mod forgejo_tests {
         tokens.extend(forge_stub::newer_tokens(60));
         let forge = forge_stub::serve(tokens, 50).await;
         let all = ForgejoAdmin::new(forge.url.clone(), "root")
+            .unwrap()
             .list_tokens("david")
             .await
             .expect("listed");
@@ -2342,6 +2514,7 @@ mod forgejo_tests {
         tokens.extend(forge_stub::newer_tokens(60));
         let forge = forge_stub::serve(tokens, 30).await;
         let all = ForgejoAdmin::new(forge.url.clone(), "root")
+            .unwrap()
             .list_tokens("david")
             .await
             .expect("listed");
@@ -2358,6 +2531,7 @@ mod forgejo_tests {
         let forge = forge_stub::serve(tokens, 50).await;
         forge.state.lock().unwrap().ignores_page = true;
         let err = ForgejoAdmin::new(forge.url.clone(), "root")
+            .unwrap()
             .list_tokens("david")
             .await
             .expect_err("a ledger that may be partial is refused");
@@ -2373,6 +2547,7 @@ mod forgejo_tests {
         let forge = forge_stub::serve(tokens, 50).await;
         forge.state.lock().unwrap().claims_total = Some(62);
         let err = ForgejoAdmin::new(forge.url.clone(), "root")
+            .unwrap()
             .list_tokens("david")
             .await
             .expect_err("61 read, 62 counted");
@@ -2393,6 +2568,7 @@ mod forgejo_tests {
         let forge = forge_stub::serve(tokens, 50).await;
         forge.state.lock().unwrap().deletes_after_page_one = Some(1059);
         let err = ForgejoAdmin::new(forge.url.clone(), "root")
+            .unwrap()
             .list_tokens("david")
             .await
             .expect_err("page one counted 61, page two counts 60");
@@ -2415,6 +2591,7 @@ mod forgejo_tests {
             let forge = forge_stub::serve(vec![leak()], 50).await;
             forge.state.lock().unwrap().stray_row = Some(stray.clone());
             let err = ForgejoAdmin::new(forge.url.clone(), "root")
+                .unwrap()
                 .list_tokens("david")
                 .await
                 .expect_err("a row the adapter cannot read");
@@ -2459,7 +2636,7 @@ mod forgejo_tests {
     #[tokio::test]
     async fn a_forge_user_outside_the_grammar_reaches_no_forge_route() {
         let forge = forge_stub::serve(vec![leak()], 50).await;
-        let admin = ForgejoAdmin::new(forge.url.clone(), "root");
+        let admin = ForgejoAdmin::new(forge.url.clone(), "root").unwrap();
         let user = "../../../repos/david/boss";
         admin.list_tokens(user).await.expect_err("list");
         admin
@@ -2479,7 +2656,7 @@ mod forgejo_tests {
     #[tokio::test]
     async fn a_delete_names_the_token_by_its_number() {
         let forge = forge_stub::serve(vec![leak()], 50).await;
-        let admin = ForgejoAdmin::new(forge.url.clone(), "root");
+        let admin = ForgejoAdmin::new(forge.url.clone(), "root").unwrap();
         assert!(admin.delete_token("david", 7).await.expect("deleted"));
         assert!(!admin.delete_token("david", 7).await.expect("absent"));
         assert_eq!(
@@ -2489,6 +2666,185 @@ mod forgejo_tests {
                 "/api/v1/admin/users/david/tokens/7".to_string(),
             ]
         );
+    }
+
+    // ----- the registry proof (backlog 683d7fe9) -----
+
+    type Seen = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A container registry as far as the proof asks it: an upload session
+    /// opens (202) for the one Basic credential it knows and is refused
+    /// with `refusal` for any other; a cancel is recorded.
+    async fn registry(good: &'static str, refusal: u16) -> (String, Seen) {
+        use axum::extract::Path;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::{Router, routing::delete, routing::post};
+
+        let seen: Seen = Default::default();
+        let (opened, cancelled) = (seen.clone(), seen.clone());
+        let app = Router::new()
+            .route(
+                "/v2/{owner}/{name}/blobs/uploads/",
+                post(
+                    move |Path((owner, name)): Path<(String, String)>, headers: HeaderMap| {
+                        let seen = opened.clone();
+                        async move {
+                            seen.lock().unwrap().push(format!("POST {owner}/{name}"));
+                            let want = format!(
+                                "Basic {}",
+                                base64::engine::general_purpose::STANDARD.encode(good)
+                            );
+                            let got = headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or_default();
+                            if got == want {
+                                (
+                                    StatusCode::ACCEPTED,
+                                    [("docker-upload-uuid", "0a1b2c3d-session")],
+                                )
+                                    .into_response()
+                            } else {
+                                StatusCode::from_u16(refusal).unwrap().into_response()
+                            }
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v2/{owner}/{name}/blobs/uploads/{session}",
+                delete(
+                    move |Path((owner, name, session)): Path<(String, String, String)>| {
+                        let seen = cancelled.clone();
+                        async move {
+                            seen.lock()
+                                .unwrap()
+                                .push(format!("DELETE {owner}/{name} {session}"));
+                            StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The proof is the first act of a push: a session the registry opens
+    /// for this user and token, then cancelled so nothing is stored.
+    #[tokio::test]
+    async fn a_push_the_registry_accepts_is_opened_and_then_cancelled() {
+        let (url, seen) = registry("david:fresh-token", 401).await;
+        let admin = ForgejoAdmin::new(url, "root").unwrap();
+        assert_eq!(
+            admin
+                .registry_push_accepted_with("david", "fresh-token", "david/boss")
+                .await,
+            Ok(true)
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "POST david/boss".to_string(),
+                "DELETE david/boss 0a1b2c3d-session".to_string(),
+            ]
+        );
+    }
+
+    /// A token the registry will not push with is `false`, never an error
+    /// and never a yes: 401 for a dead value, 403 for one without the
+    /// package write scope. No session opened, so nothing to cancel.
+    #[tokio::test]
+    async fn a_credential_the_registry_refuses_is_not_a_proof() {
+        for refusal in [401, 403] {
+            let (url, seen) = registry("david:fresh-token", refusal).await;
+            let admin = ForgejoAdmin::new(url, "root").unwrap();
+            assert_eq!(
+                admin
+                    .registry_push_accepted_with("david", "read-only-token", "david/boss")
+                    .await,
+                Ok(false),
+                "{refusal}"
+            );
+            assert_eq!(*seen.lock().unwrap(), vec!["POST david/boss".to_string()]);
+        }
+    }
+
+    /// Any other answer is neither: a registry that is down or strange
+    /// proves nothing either way.
+    #[tokio::test]
+    async fn an_answer_that_is_neither_accepted_nor_refused_is_an_error() {
+        let (url, _seen) = registry("david:fresh-token", 500).await;
+        let err = ForgejoAdmin::new(url, "root")
+            .unwrap()
+            .registry_push_accepted_with("david", "other", "david/boss")
+            .await
+            .expect_err("a 500 is not a verdict");
+        assert!(err.contains("neither a push accepted"), "{err}");
+        assert!(!err.contains("other"), "no value in an error: {err}");
+    }
+
+    #[test]
+    fn the_registry_image_grammar_is_owner_and_one_name() {
+        for ok in ["david/boss", "david/boss-ci", "a.b/c_d.e-f", "david/b0ss"] {
+            assert_eq!(registry_image(ok), Ok(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "boss",
+            "david/",
+            "/boss",
+            "david/boss/extra",
+            "david/..",
+            "david/../../api/v1/repos/david/boss",
+            "david/Boss",
+            "david/boss?x=1",
+            "david/boss#f",
+            "david/bo ss",
+            "david/-boss",
+            "david/boss-",
+            "david/bo--ss",
+            "david/%2e%2e",
+            "../david/boss",
+        ] {
+            let err = registry_image(bad).expect_err(bad);
+            assert!(err.contains("verify_image"), "{bad}: {err}");
+        }
+    }
+
+    /// A user or an image outside its grammar reaches no registry route —
+    /// the proof carries a live push token in its Authorization header.
+    #[tokio::test]
+    async fn a_name_outside_its_grammar_reaches_no_registry_route() {
+        let (url, seen) = registry("david:fresh-token", 401).await;
+        let admin = ForgejoAdmin::new(url, "root").unwrap();
+        admin
+            .registry_push_accepted_with("david", "fresh-token", "david/../../api/v1/user")
+            .await
+            .expect_err("image");
+        admin
+            .registry_push_accepted_with("../david", "fresh-token", "david/boss")
+            .await
+            .expect_err("user");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    /// An issuer with no registry cannot answer yes: the port's default
+    /// refuses, so a fake or a future issuer that never learned the proof
+    /// fails a registry rotation closed.
+    #[tokio::test]
+    async fn an_issuer_without_a_registry_refuses_the_proof() {
+        let err = Unconfigured("broker unconfigured".into())
+            .registry_push_accepted_with("david", "t", "david/boss")
+            .await
+            .expect_err("unconfigured");
+        assert_eq!(err, "broker unconfigured");
     }
 }
 

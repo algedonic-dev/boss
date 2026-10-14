@@ -90,7 +90,8 @@
               "$REFERENCE",
               "$HEAD",
               "refs/heads/main",
-              "$BASELINE"
+              "$BASELINE",
+              "$TMP_SUBPATH"
             ],
             "volumeMounts": [
               {
@@ -105,6 +106,10 @@
               {
                 "name": "clone-tmp",
                 "mountPath": "/tmp"
+              },
+              {
+                "name": "worker-tmp",
+                "mountPath": "/consist-tmp"
               }
             ]
           }
@@ -145,7 +150,8 @@
               "$BASELINE",
               "$BUDGET",
               "$NAME",
-              "/work/repo"
+              "/work/repo",
+              "$EDIT_LEVEL"
             ],
             "volumeMounts": [
               {
@@ -155,7 +161,8 @@
               },
               {
                 "name": "worker-tmp",
-                "mountPath": "/tmp"
+                "mountPath": "/tmp",
+                "subPath": "$TMP_SUBPATH"
               }
             ]
           }

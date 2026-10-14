@@ -360,6 +360,89 @@ async fn consume_part_emits_item_consumed_event() {
 // POST /api/inventory/orders/create
 // ---------------------------------------------------------------------------
 
+/// Decision 0a8e95f1: ordinary Draft writes allow zero cost, but a
+/// negative line is refused before persistence or its event. Signed
+/// historical facts remain representable; this is the admission edge.
+#[tokio::test]
+async fn ordinary_purchase_costs_refuse_negative_and_keep_zero_drafts() {
+    for cents in [-300, 0, 1200] {
+        let app = InventoryTestApp::with_vendors(vec![vendor_fixture("Acme Parts Co")]);
+        let resp = TestRequest::post("/api/inventory/orders/create")
+            .json(&json!({
+                "vendor": "Acme Parts Co",
+                "lines": [{"part_sku": "PART-001", "qty": 10, "unit_cost_cents": cents}]
+            }))
+            .send(&app.router)
+            .await;
+        if cents < 0 {
+            resp.assert_status(StatusCode::BAD_REQUEST);
+            assert!(resp.body_text().contains("unit cost must not be negative"));
+            app.assert_event_not_recorded("inventory.purchase_order.upserted");
+            let list = TestRequest::get("/api/inventory/orders")
+                .send(&app.router)
+                .await;
+            let rows: Vec<boss_inventory::types::PurchaseOrder> = list.assert_json();
+            assert!(rows.is_empty());
+        } else {
+            resp.assert_status(StatusCode::CREATED);
+            let event = app.assert_event_recorded("inventory.purchase_order.upserted");
+            assert_eq!(event.payload["lines"][0]["unit_cost_cents"], cents);
+            assert_eq!(event.payload["status"], "draft");
+        }
+    }
+}
+
+#[tokio::test]
+async fn ordinary_purchase_costs_batch_refuses_negative_draft_and_placed_lines() {
+    for status in ["draft", "submitted"] {
+        for cents in [-1, 0] {
+            let app = InventoryTestApp::with_vendors(vec![vendor_fixture("Acme Parts Co")]);
+            let mut po = purchase_order_fixture("PO-COST-BATCH");
+            po.status = boss_inventory::types::PoStatus::new(status);
+            po.lines[0].unit_cost_cents = cents;
+            let resp = TestRequest::post("/api/inventory/orders/batch")
+                .json(&json!([po]))
+                .send(&app.router)
+                .await;
+            if cents < 0 {
+                resp.assert_status(StatusCode::BAD_REQUEST);
+                assert!(resp.body_text().contains("unit cost must not be negative"));
+                app.assert_event_not_recorded("inventory.purchase_order.upserted");
+            } else {
+                resp.assert_status(StatusCode::OK);
+                let event = app.assert_event_recorded("inventory.purchase_order.upserted");
+                assert_eq!(event.payload["lines"][0]["unit_cost_cents"], 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn ordinary_purchase_costs_refuse_new_placement_without_rewriting_history() {
+    for (status, target, cents, expected) in [
+        ("draft", "submitted", -1, StatusCode::BAD_REQUEST),
+        ("draft", "submitted", 0, StatusCode::OK),
+        ("submitted", "received", -1, StatusCode::OK),
+    ] {
+        let mut po = purchase_order_fixture("PO-COST-STATUS");
+        po.status = boss_inventory::types::PoStatus::new(status);
+        po.lines[0].unit_cost_cents = cents;
+        let app = InventoryTestApp::with_orders(vec![po]);
+        let resp = TestRequest::put("/api/inventory/orders/PO-COST-STATUS/status")
+            .json(&json!({"status":target}))
+            .send(&app.router)
+            .await;
+        resp.assert_status(expected);
+        if expected == StatusCode::BAD_REQUEST {
+            assert!(resp.body_text().contains("unit cost must not be negative"));
+            app.assert_event_not_recorded("inventory.purchase_order.upserted");
+        } else {
+            let event = app.assert_event_recorded("inventory.purchase_order.upserted");
+            assert_eq!(event.payload["lines"][0]["unit_cost_cents"], cents);
+        }
+    }
+}
+
 #[tokio::test]
 async fn create_order_returns_201_and_emits_po_upserted_event() {
     // A placed order names a vendor that exists (the subject edge on

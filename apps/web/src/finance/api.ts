@@ -1,6 +1,7 @@
 // Commerce API fetchers — port of apps/web/src/finance/api.ts.
 
 import type { Invoice } from './types';
+import { fetchRemote, type Remote } from '../data/remote';
 
 const API_BASE = '/api/commerce';
 
@@ -63,20 +64,19 @@ export function loadInvoices(): Promise<PagedResult<Invoice>> {
   return fetchPaged<Invoice>(INVOICES_LIST_URL);
 }
 
-/// A 200 whose body is not the shape answers null, like a failed read:
-/// the cast these used to make let `[]` through as a summary, and the
-/// overview died on `undefined.toLocaleString()` (backlog 9045a570).
-export async function loadCommerceSummary(): Promise<CommerceSummary | null> {
-  try {
-    const r = await fetch(`${API_BASE}/summary`);
-    if (!r.ok) return null;
-    const parsed = CommerceSummarySchema.safeParse(await r.json());
-    return parsed.success ? parsed.data : null;
-  } catch {
-    return null;
-  }
+/// Keep the failed read and its cause through the overview (98ef10a6).
+/// A malformed 200 is a failed answer too, never a partial summary.
+export function loadCommerceSummary(): Promise<Exclude<Remote<CommerceSummary>, { kind: 'loading' }>> {
+  return fetchRemote(`${API_BASE}/summary`, (raw) => {
+    const parsed = CommerceSummarySchema.safeParse(raw);
+    if (!parsed.success) throw new Error(`${API_BASE}/summary: invalid response — ${parsed.error.message}`);
+    return parsed.data;
+  }).then((result) => result.kind === 'failed' && !result.error.includes(`${API_BASE}/summary`)
+    ? { ...result, error: `${API_BASE}/summary: ${result.error}` }
+    : result);
 }
 
+/// The AP consumer renders null as its unavailable alert (9045a570).
 export async function loadApAging(): Promise<ApAging | null> {
   try {
     const r = await fetch('/api/inventory/ap-aging');

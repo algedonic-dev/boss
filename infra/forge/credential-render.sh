@@ -155,7 +155,9 @@ else
     # credential-deposit.sh reads the checkout token's Secret. ABSENT is
     # not ready (root material David places), not a red.
     KC="${BOSS_OPS_DIR:-/etc/boss-ops}/kubeconfig"
-    KUBECTL=(docker run --rm --network host -v "$KC:/kc:ro" alpine/k8s:1.33.3 kubectl --kubeconfig=/kc)
+    # No container log: the Secret kubectl prints is this script's alone
+    # (backlog aa700921).
+    KUBECTL=(docker run --rm --log-driver=none --network host -v "$KC:/kc:ro" alpine/k8s:1.33.3 kubectl --kubeconfig=/kc)
     if [ ! -e "$KC" ] && [ ! -L "$KC" ]; then
         KC_STATE="not ready: $KC absent — root material, placed by David (design 835c0c9c)"
     elif [ ! -r "$KC" ]; then

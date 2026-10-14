@@ -25,7 +25,8 @@
 //! - each reader serves ONLY its own kind — an observation never
 //!   appears among comparisons and vice versa;
 //! - `?limit=` is respected and rows come newest-first, verbatim as
-//!   recorded;
+//!   recorded; absent, the page is `ESTATE_PAGE_DEFAULT` (5) rows, and
+//!   no limit passes `ESTATE_PAGE_CEILING` (50) (7b709f78);
 //! - `?scope=` selects one series, and selects it BEFORE the limit —
 //!   the property that makes a slow-cadence scope readable at all;
 //! - `?since=` / `?until=` bound a half-open window in the same WHERE
@@ -364,6 +365,58 @@ async fn limit_is_respected_and_rows_come_newest_first() {
         vec!["obs-3", "obs-2"],
         "two newest, newest first"
     );
+}
+
+/// THE DEFAULT AND THE CEILING ARE TWO NAMED NUMBERS (backlog 7b709f78).
+///
+/// A read with no `limit` answers [`ESTATE_PAGE_DEFAULT`] rows, and no
+/// `limit` reaches past [`ESTATE_PAGE_CEILING`]. The handler said only
+/// "small default, hard cap" while its prose named the 50 three times,
+/// so builder run 2240d663 read the 50 as the default and took a 5-row
+/// live answer (2026-10-10, totals in the thousands) for a defect. Both
+/// numbers are constants now, the doc points at them, and this pins the
+/// wire to the constants on both readers — a change to either number is
+/// a change to one line that this test and the doc follow.
+#[tokio::test]
+async fn an_unbounded_read_answers_the_default_page_and_no_limit_passes_the_ceiling() {
+    use boss_jobs::http::{ESTATE_PAGE_CEILING, ESTATE_PAGE_DEFAULT};
+    const {
+        assert!(
+            ESTATE_PAGE_DEFAULT < ESTATE_PAGE_CEILING,
+            "the default is a page, the ceiling is the most a page can be"
+        )
+    };
+    let (app, jobs) = app();
+    record_minutely(
+        &jobs,
+        "host-units",
+        "2026-09-22T00:00:00Z",
+        ESTATE_PAGE_CEILING + 10,
+    )
+    .await;
+    for i in 0..ESTATE_PAGE_CEILING + 10 {
+        post_comparison(&app, &format!("cmp-{i}")).await;
+    }
+    for reader in ["/api/estate/observations", "/api/estate/comparisons"] {
+        let (status, body) = get_as_reader(&app, reader).await;
+        assert_eq!(status, StatusCode::OK, "{reader}: {body}");
+        assert_eq!(
+            markers(&body).len() as i64,
+            ESTATE_PAGE_DEFAULT,
+            "{reader} with no limit answers the default page"
+        );
+        assert_eq!(
+            body["total"].as_i64(),
+            Some(ESTATE_PAGE_CEILING + 10),
+            "{reader}: total counts the window, not the page"
+        );
+        let (_, body) = get_as_reader(&app, &format!("{reader}?limit=500")).await;
+        assert_eq!(
+            markers(&body).len() as i64,
+            ESTATE_PAGE_CEILING,
+            "{reader}?limit=500 is clamped to the ceiling"
+        );
+    }
 }
 
 #[tokio::test]

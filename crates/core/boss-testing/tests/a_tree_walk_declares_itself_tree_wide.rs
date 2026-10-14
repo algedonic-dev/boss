@@ -85,8 +85,13 @@ fn classify(text: &str) -> Verdict {
     if !reads_dirs || !code.iter().any(|l| joins_a_top_level_tree(l)) {
         return Verdict::NoWalk;
     }
+    // The marker is the whole line or the marker and an em dash, the
+    // shape gate.sh's `tree_wide_pins` reads — a sentence that begins
+    // with its words is prose (backlog 18e58c96).
+    let is_marker = |rest: Option<&str>| rest.is_some_and(|r| r.is_empty() || r.starts_with(" —"));
     let marked = text.lines().any(|l| {
-        l.starts_with("//! tree-wide pin") || l.trim_start().starts_with("// tree-wide pin")
+        is_marker(l.strip_prefix("//! tree-wide pin"))
+            || is_marker(l.trim_start().strip_prefix("// tree-wide pin"))
     });
     if marked {
         return Verdict::Marked;
@@ -147,6 +152,10 @@ fn the_classifier_tells_a_silent_walk_from_a_declared_one() {
     assert_eq!(
         classify(&format!("    // tree-wide pin — reasons\n{walk}")),
         Verdict::Marked
+    );
+    assert_eq!(
+        classify(&format!("    // tree-wide pin no car changed, and\n{walk}")),
+        Verdict::Silent
     );
     assert_eq!(
         classify(&format!(

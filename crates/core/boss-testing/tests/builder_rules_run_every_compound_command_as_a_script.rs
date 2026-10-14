@@ -208,6 +208,115 @@ fn a_runner_word_is_judged_as_a_whole_word_the_way_the_guard_measured() {
     assert!(!carries_a_runner_word("--field status=complete"));
 }
 
+/// THE CWD IS NOT THE BUILDER'S (backlog 916fe290). MEASURED 2026-10-09
+/// by four builders (runs f6a9b90f, 503689a2, 3c758be6, b9bf68e4) and
+/// on purpose by run 171055b8: in an isolated-worktree agent every Bash
+/// call starts in the dispatching session's checkout, `/work/boss`, and
+/// the harness DROPS a leading `cd <worktree> &&` from the command text
+/// — the `bash -c` line it ran held no cd, and `pwd` printed
+/// `/work/boss` — while `cd <worktree>;` and a script that cds first
+/// took effect. One builder's `git checkout -b` switched the shared
+/// checkout off main; another's relative-path `sed` edited two of its
+/// files. Rule 0 must say where a call starts and the two forms that
+/// leave it.
+#[test]
+fn rule_zero_says_where_a_call_starts_and_the_forms_that_leave_it() {
+    let text = rules();
+    let zero = rule_zero(&text).unwrap_or_default();
+    for phrase in [
+        "/work/boss",
+        "`cd <your worktree> &&`",
+        "`cd <your worktree> || exit 1`",
+        "`pwd`",
+        "`git -C <your worktree>",
+        "BOSS_AGENT_RUN",
+        "916fe290",
+    ] {
+        assert!(
+            zero.contains(phrase),
+            "rule 0 of {RULES} must say `{phrase}` — where a Bash call starts, the cd \
+             the harness drops, and the script header and `git -C` form that leave the \
+             shared checkout (backlog 916fe290): {zero}"
+        );
+    }
+}
+
+/// No rule but rule 0 (which names it as the refused shape) shows the cd
+/// the harness drops — not in a backticked span and not in rule 7's
+/// indented gate template, which is not one: that template was the
+/// briefs' `cd <worktree> && exec boss gate`, safe in a script and
+/// silently wrong typed bare (backlog 916fe290).
+#[test]
+fn no_rule_shows_the_cd_the_harness_drops() {
+    let text = rules();
+    let zero = rule_zero(&text).unwrap_or_default();
+    let judged = text.replacen(zero, "", 1);
+    let shown: Vec<&str> = judged
+        .lines()
+        .filter(|l| l.contains("cd <your worktree> &&"))
+        .collect();
+    assert!(
+        shown.is_empty(),
+        "{RULES} shows `cd <your worktree> &&`, which the harness drops from a bare \
+         command so the rest runs in the shared checkout — show the script header \
+         `cd <your worktree> || exit 1` then `pwd` instead (rule 0, backlog 916fe290):\n  {}",
+        shown.join("\n  ")
+    );
+}
+
+/// The git subcommands that write — to the index, a ref, the working
+/// tree or the forge. Run bare, each lands in the shared checkout.
+const GIT_WRITES: [&str; 11] = [
+    "fetch",
+    "checkout",
+    "switch",
+    "commit",
+    "push",
+    "merge",
+    "cherry-pick",
+    "add",
+    "stash",
+    "reset",
+    "rebase",
+];
+
+/// Every git command the rules TELL a builder to run that writes names
+/// its tree with `git -C <your worktree>`, so it is right whatever the
+/// shell's cwd (backlog 916fe290: run 3c758be6's `git checkout -b` moved
+/// the shared checkout off main). A span the rules forbid — introduced
+/// by "never" — is not an instruction to run it and is not judged.
+#[test]
+fn every_git_write_the_rules_tell_a_builder_to_run_names_its_worktree() {
+    let text = rules();
+    let zero = rule_zero(&text).unwrap_or_default();
+    let judged = text.replacen(zero, "", 1);
+    let parts: Vec<&str> = judged.split('`').collect();
+    let mut bare = Vec::new();
+    for (i, span) in parts.iter().enumerate().skip(1).step_by(2) {
+        let words: Vec<&str> = span.split_whitespace().collect();
+        if words.first() != Some(&"git") {
+            continue;
+        }
+        let sub = words.get(1).copied().unwrap_or_default();
+        if !GIT_WRITES.contains(&sub) {
+            continue;
+        }
+        let before = parts[i - 1];
+        let lead = &before[before.len().saturating_sub(12)..];
+        if lead.to_lowercase().contains("never") {
+            continue;
+        }
+        bare.push(format!("`{span}`"));
+    }
+    assert!(
+        bare.is_empty(),
+        "{RULES} tells a builder to run a git write without naming its tree — a bare \
+         call runs in the shared checkout, so write `git -C <your worktree> …` (rule 0, \
+         backlog 916fe290):\n  {}",
+        bare.join("\n  ")
+    );
+}
+
 #[test]
 fn no_command_the_rules_show_is_a_shape_the_worktree_guard_refuses() {
     let text = rules();

@@ -46,6 +46,12 @@ if [ -r "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh" ]; then . "$(di
 ALERT_ACTOR="${ALERT_ACTOR:-automation:cluster-watchdog}"
 ALERT_USER='{"id":"'"$ALERT_ACTOR"'","role":"platform-admin","access_tier":"operator"}'
 ALERT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The two header variables are this lib's, made only by
+# alert_machine_headers — never inherited (backlog df38075a, F5 of review
+# a92c0b94). Unset, a caller that posted through alert_post before any
+# alert handed curl whatever `@<file>` its environment carried.
+ALERT_MT_HDR=""
+ALERT_PEOPLE_MT_HDR=""
 
 # alert_people_api — the people door: ALERT_API's host on the people
 # port from sor-ports.env (read as data, never sourced). Empty when the
@@ -139,17 +145,62 @@ python_free_json() {
     printf '{"kind":"backlog-item","status":"open","owner_id":"%s","priority":"urgent","tags":["alert","cluster"],"subject":{"subject_kind":"custom","id":"boss-cluster"},"title":"%s","metadata":{"area":"alert","filed_by":"%s","raised_at":"%s","detail":"%s"}}' "$owner" "$title" "$ALERT_ACTOR" "$at" "$detail"
 }
 
-# alert_post JSON — POST one alert packet. Returns 0 on 201.
+# alert_post JSON [ANSWER_FILE] — POST one alert packet. Returns 0 on
+# 201. ALERT_POST_CODE is left holding the HTTP code the API gave (000
+# or empty when it gave none), and the answer's body goes to ANSWER_FILE
+# when one is named, so a replay can tell a refusal from silence and
+# keep what the refusal said.
+#
+# ANY NON-ZERO CURL EXIT IS NO ANSWER (review 4d18be3a, finding 3), as
+# the dev memory watch already reads it. curl can exit non-zero AFTER
+# the server answered — 23 when the answer could not be written (a full
+# spool disk), 28 on a timeout after the headers — and the code it
+# printed then is not one this lib can act on: a 201 read as a refusal
+# was re-posted (a duplicate urgent packet per back-off) and then moved
+# aside although it had been filed. As 000 the replay stops and counts
+# nothing; the worst case is one duplicate on the next tick.
+ALERT_POST_CODE=""
 alert_post() {
     local code
-    code=$(printf '%s' "$1" | curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+    ALERT_POST_CODE=""
+    code=$(printf '%s' "$1" | curl -s -o "${2:-/dev/null}" -w '%{http_code}' --max-time 15 \
         -X POST -H 'content-type: application/json' ${ALERT_MT_HDR:+-H "$ALERT_MT_HDR"} -H "x-boss-user: $ALERT_USER" \
-        --data-binary @- "$ALERT_API/api/jobs") || return 1
+        --data-binary @- "$ALERT_API/api/jobs") || { ALERT_POST_CODE=000; return 1; }
+    ALERT_POST_CODE="$code"
     [ "$code" = "201" ]
+}
+
+# alert_answer_judges_the_body CODE — 0 when CODE is the jobs API's
+# judgement of THIS body, the only answer a replay may count against it;
+# 1 when the answer says nothing about the body, so the next one would
+# get the same and the replay should stop:
+#   000, empty   no answer (dark, or curl failed — see alert_post);
+#   5xx          the API is failing, not judging;
+#   401, 403     the CALLER is refused (review 4d18be3a, finding 1): the
+#                machine gate's answers to a missing, stale or revoked
+#                token, and the create door's policy refusal, which is
+#                asked of who signs and the kind it opens
+#                (open_authority::may_open in boss-jobs http/jobs.rs) —
+#                every alert this lib files is the same signer and the
+#                same kind, so no body can pass where another did not;
+#   407, 408     a proxy or the connection, not the API;
+#   429          too many requests, whoever sent them.
+# What remains (400, 409, 422 — what the create door answers for a body
+# it reads and refuses, an owner it cannot resolve among them) is the
+# body's own, and backs that body off.
+alert_answer_judges_the_body() {
+    case "${1:-000}" in
+        000 | 5[0-9][0-9] | 401 | 403 | 407 | 408 | 429) return 1 ;;
+    esac
+    return 0
 }
 
 # alert_count — alerts waiting to be filed.
 alert_count() { [ -d "$ALERT_SPOOL" ] || { echo 0; return; }; ls -1 "$ALERT_SPOOL" 2>/dev/null | grep -c '\.json$'; }
+
+# alert_refused_count — alerts the jobs API refused ALERT_REFUSALS_MAX
+# times, moved aside under $ALERT_SPOOL/refused/ (see alert_replay).
+alert_refused_count() { [ -d "$ALERT_SPOOL/refused" ] || { echo 0; return; }; ls -1 "$ALERT_SPOOL/refused" 2>/dev/null | grep -c '\.json$'; }
 
 # alert TITLE DETAIL — raise an alert: journal it, file it, or keep it.
 alert() {
@@ -167,13 +218,66 @@ alert() {
     fi
 }
 
-# alert_replay — file every kept alert, oldest first; stop at the first failure.
+# alert_replay — file every kept alert, oldest first. Returns 0 when
+# nothing is left waiting.
+#
+# A REFUSED BODY DOES NOT HOLD THE SPOOL (backlog 9ecd12ea, residue of
+# car 7849553a's review, finding 3). Until 2026-10-10 the replay stopped
+# at the first alert that was not filed, whatever the answer, so a body
+# the jobs API judged bad (a 4xx — an owner it cannot resolve, a field
+# it refuses) was retried every five minutes for ever, and every alert
+# raised after it — "cluster DARK: hands needed" among them — waited
+# behind it, kept and never filed. The dev memory watch already answered
+# this for its own spool (dev-memory-watch.sh file_kept_alerts); this is
+# the same rule for the forge's:
+#   201              filed; the file goes.
+#   no answer, 5xx,  the API is dark or failing, or refuses the CALLER,
+#   401/403/407/     not judging the body (alert_answer_judges_the_body):
+#   408/429          stop, nothing else will pass either, and nothing is
+#                    counted against the alert.
+#   any other code   REFUSED. The body backs off (2, 4, 8, 16 minutes,
+#                    in <file>.tries) and the ones behind it are still
+#                    tried; at the ALERT_REFUSALS_MAX-th refusal it is
+#                    moved aside to $ALERT_SPOOL/refused/ with the answer
+#                    it got beside it as <file>.why, and counted by
+#                    alert_refused_count for the caller's record. It is
+#                    never deleted here: it may be the one copy of what
+#                    the alert said, and the journal has the line.
+ALERT_REFUSALS_MAX="${ALERT_REFUSALS_MAX:-5}"
 alert_replay() {
-    local n f; n=$(alert_count); [ "$n" -gt 0 ] || return 0
+    local n f tries k next now
+    n=$(alert_count); [ "$n" -gt 0 ] || return 0
     alert_machine_headers
     echo "alert: filing $n kept alert(s), oldest first" >&2
+    now=$(date -u +%s)
     for f in $(ls -1 "$ALERT_SPOOL" | grep '\.json$' | sort); do
-        if alert_post "$(cat "$ALERT_SPOOL/$f")"; then rm -f "$ALERT_SPOOL/$f"; else echo "alert: replay stopped at $f — $(alert_count) still waiting" >&2; return 1; fi
+        tries="$ALERT_SPOOL/$f.tries"; k=0; next=0
+        if [ -r "$tries" ]; then read -r k next < "$tries" || true; fi
+        case "${k:-empty}" in empty | *[!0-9]*) k=0 ;; esac
+        case "${next:-empty}" in empty | *[!0-9]*) next=0 ;; esac
+        [ "$now" -ge "$next" ] || continue
+        if alert_post "$(cat "$ALERT_SPOOL/$f")" "$ALERT_SPOOL/.answer"; then
+            rm -f "$ALERT_SPOOL/$f" "$tries"
+            continue
+        fi
+        if ! alert_answer_judges_the_body "$ALERT_POST_CODE"; then
+            echo "alert: replay stopped at $f (answer ${ALERT_POST_CODE:-none}, which judges the API or the caller, not this alert) — $(alert_count) still waiting, nothing counted against them" >&2
+            rm -f "$ALERT_SPOOL/.answer"
+            return 1
+        fi
+        k=$((k + 1))
+        if [ "$k" -ge "$ALERT_REFUSALS_MAX" ]; then
+            mkdir -p "$ALERT_SPOOL/refused"
+            { echo "refused $k times, last answer $ALERT_POST_CODE:"; head -c 2000 "$ALERT_SPOOL/.answer" 2>/dev/null; } > "$ALERT_SPOOL/refused/$f.why"
+            mv "$ALERT_SPOOL/$f" "$ALERT_SPOOL/refused/" && rm -f "$tries"
+            echo "alert REFUSED $k times (last answer $ALERT_POST_CODE): $f moved aside to $ALERT_SPOOL/refused, so the alerts behind it pass — $(alert_refused_count) refused there, each with its answer as .why" >&2
+        else
+            printf '%s %s\n' "$k" "$((now + 60 * (1 << k)))" > "$tries"
+            echo "alert refused (answer $ALERT_POST_CODE, refusal $k of $ALERT_REFUSALS_MAX): $f waits $((1 << k)) min; the ones behind it are still tried" >&2
+        fi
     done
+    rm -f "$ALERT_SPOOL/.answer"
+    n=$(alert_count)
+    if [ "$n" -gt 0 ]; then echo "alert: $n kept alert(s) still waiting on a refusal's back-off" >&2; return 1; fi
     echo "alert: all kept alerts filed" >&2
 }

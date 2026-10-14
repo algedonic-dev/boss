@@ -580,7 +580,9 @@ spec:
                     # checkout's copy, and APPENDS its verdict to
                     # postStart.log — naming the copy it used, or, when the
                     # switch is on and nothing could be read, saying so in
-                    # capitals before it starts the session idle.
+                    # capitals and passes a fixed failure notice to the
+                    # session (e5cb7c6e). A log alone has no active reader;
+                    # the notice is the first task, never a resumed drain.
                     cat > /work/dev-claude.sh <<'DC'
                     #!/usr/bin/env bash
                     export HOME=/work/home
@@ -602,7 +604,8 @@ spec:
                         echo "dev session: drain-on-boot is ON - the first prompt is infra/dev/drain.md from $from" >> "$log"
                         exec claude --remote-control boss-dev "$prompt"
                       fi
-                      echo "dev session: DRAIN-ON-BOOT IS ON BUT NO DRAIN PROMPT COULD BE READ (not at origin/main:infra/dev/drain.md, not at /work/boss/infra/dev/drain.md) - the session starts IDLE and the drain has NOT resumed" >> "$log"
+                      echo "dev session: DRAIN-ON-BOOT IS ON BUT NO DRAIN PROMPT COULD BE READ (not at origin/main:infra/dev/drain.md, not at /work/boss/infra/dev/drain.md) - the session receives a failure notice and the drain has NOT resumed" >> "$log"
+                      exec claude --remote-control boss-dev 'The drain did not resume: drain-on-boot is on, but neither origin/main:infra/dev/drain.md nor the checkout copy could be read as a non-empty prompt. Report this failure to David. Do not claim that backlog work resumed or infer new permission to repair or activate it.'
                     fi
                     exec claude --remote-control boss-dev
                     DC

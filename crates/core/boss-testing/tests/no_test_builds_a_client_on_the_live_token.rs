@@ -4,7 +4,7 @@
 //! car A's widening of the name scan car B added for boss-cli).
 //!
 //! WHAT WAS MEASURED (car B's run 6cb04ff7, 2026-09-29). The boss-cli
-//! half of F2 sat inside `gate::machine_client`, but the same read was
+//! half of F2 sat inside `sor_client::machine_client`, but the same read was
 //! everywhere else: the gateway's tests call
 //! `MachineClient::build(reqwest::Client::builder())` dozens of times
 //! (local_auth.rs, role_headers.rs, break_glass.rs, tests/*), and

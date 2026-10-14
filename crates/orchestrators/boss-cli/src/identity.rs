@@ -200,7 +200,7 @@ pub(crate) fn sign(method: &reqwest::Method, path: &str) -> Result<String> {
 
 /// The id to sign a READ with — [`sign`] with the arm that cannot
 /// fail already taken. For the handful of read verbs that build their
-/// own request instead of going through `gate::api`.
+/// own request instead of going through `crate::sor_client::api`.
 pub(crate) fn reader() -> String {
     match signature_for(&reqwest::Method::GET, "", caller()) {
         Signature::As(id) => id,

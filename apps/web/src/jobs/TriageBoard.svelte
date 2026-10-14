@@ -819,12 +819,8 @@
     font-size: 10px;
     color: var(--text-dim);
   }
+  /* The shared Enamel field owns the look; drafts keep their layout. */
   .tb-finding-input {
-    font: inherit;
-    font-size: 12px;
-    padding: 6px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
     resize: vertical;
     width: 100%;
     box-sizing: border-box;
@@ -840,13 +836,6 @@
     align-items: center;
   }
   .tb-select {
-    font: inherit;
-    font-size: 12px;
-    padding: 3px 6px;
-    border-radius: 4px;
-    border: 1px solid var(--border);
-    background: var(--card);
-    color: inherit;
     flex: 1 1 auto;
     min-width: 0;
   }

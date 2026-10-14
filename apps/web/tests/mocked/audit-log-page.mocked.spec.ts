@@ -1,5 +1,5 @@
 import { isPageWrite, pageWrites } from './_smokeMocks';
-// /it/operate/audit — the Audit Log (catalogued as "Monitoring"), pinned
+// /it/operate/audit — the Audit Log, pinned
 // control by control. Page audit 65a273d5, step `test`.
 //
 // WHY THIS FILE EXISTS. The route sat in DEFERRED (_routes.ts) for want
@@ -14,7 +14,7 @@ import { isPageWrite, pageWrites } from './_smokeMocks';
 // the assertion below states today's behaviour and names the backlog id,
 // so the car that closes the gap turns that assertion red and must
 // rewrite it — a gap cannot close without this file saying so:
-//   91b41817  the page has two names; the row toggle is mouse-only
+//   91b41817  one page name; payload toggles work by mouse and keyboard
 //
 // THE STREAM IS MOCKED HONESTLY, AND HERE IS WHAT THAT CAN AND CANNOT
 // REACH. Playwright fulfils an EventSource request with a whole body and
@@ -138,16 +138,16 @@ const CATALOGUED = new Set(Object.values(ROUTE_CATALOG).map((i) => i.path));
 
 /// The operate tab strip, in order, as ItTabs.svelte declares it — and
 /// whether the nav catalog (the ONE list, never a second one) carries
-/// each path. Two do not: that is today's catalog, pinned so a change
-/// to it is a decision this file hears about. Car N3 of design e765b3fc
+/// each path. Every served tab belongs to the page-audit catalog
+/// (e52e3017). Car N3 of design e765b3fc
 /// (2026-09-25) took four tabs off the strip — Yard status, Conductor,
 /// Receiving Yard and Marshalling Yard — each a station's panel on the
 /// Department Map now, its page not found.
 const TABS: ReadonlyArray<{ label: string; path: string; catalogued: boolean }> = [
   { label: 'Incidents', path: '/it/operate', catalogued: true },
   { label: 'Audit Log', path: '/it/operate/audit', catalogued: true },
-  { label: 'Performance', path: '/it/operate/perf', catalogued: false },
-  { label: 'Atlas', path: '/it/operate/atlas', catalogued: false },
+  { label: 'Performance', path: '/it/operate/perf', catalogued: true },
+  { label: 'Atlas', path: '/it/operate/atlas', catalogued: true },
   { label: 'Bottlenecks', path: '/it/operate/bottlenecks', catalogued: true },
 ];
 
@@ -156,7 +156,7 @@ const stream = (page: Page) => page.locator('.events-table tbody tr.events-row')
 const liveLine = (page: Page) => page.locator('.events-live');
 
 test.describe('/it/operate/audit — the page and its names', () => {
-  test('the header, the three sections, and the two names the page goes by', async ({ page }) => {
+  test('the header, the three sections, and the catalog use Audit Log (91b41817)', async ({ page }) => {
     await installAuditReads(page);
     await mountPage(page, PATH, { titleMatch: /Audit Log/ });
     await expect(page.getByText('IT · Event stream')).toBeVisible();
@@ -164,16 +164,15 @@ test.describe('/it/operate/audit — the page and its names', () => {
     for (const s of ['Size and growth', 'Filters', 'Stream']) {
       await expect(page.getByRole('heading', { name: s, exact: true })).toBeVisible();
     }
-    // Gap 91b41817: the catalog calls this route "Monitoring", the tab
-    // and the header call it "Audit Log".
     expect(ROUTE_CATALOG['system-monitoring'].path).toBe(PATH);
-    expect(ROUTE_CATALOG['system-monitoring'].label).toBe('Monitoring');
+    expect(ROUTE_CATALOG['system-monitoring'].label).toBe('Audit Log');
+    expect(ROUTE_CATALOG['system-monitoring'].permKey).toBe('system-monitoring');
     expect(route(PATH)).toEqual({ kind: 'systemMonitoringEvents' });
   });
 });
 
 test.describe('/it/operate/audit — the tab links', () => {
-  test('five tabs, each served by the router, three of them catalogued', async ({ page }) => {
+  test('five tabs, each served by the router and catalogued', async ({ page }) => {
     await installAuditReads(page);
     await mountPage(page, PATH, { titleMatch: /Audit Log/ });
     const tabs = page.locator('nav.it-tabs a');
@@ -381,10 +380,57 @@ test.describe('/it/operate/audit — the stream (GET /api/events/tail)', () => {
     await expect(open.locator('a[href="/jobs/step-1"]')).toHaveCount(0);
     await row.click();
     await expect(page.locator('.events-payload-row')).toHaveCount(0);
-    // Gap 91b41817: the toggle is a bare <tr onclick> — no tabindex and
-    // no role, so it cannot be reached from the keyboard.
+    // The row keeps table semantics; its native button owns keyboard activation.
     expect(await row.getAttribute('tabindex')).toBeNull();
     expect(await row.getAttribute('role')).toBeNull();
+    await expect(row.getByRole('button', { name: 'Toggle payload for jobs.step.updated event ev-3' })).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  test('native payload toggles preserve focus and activate exactly once with Enter and Space (91b41817)', async ({ page }) => {
+    await installAuditReads(page);
+    await mountPage(page, PATH, { titleMatch: /Audit Log/ });
+    const first = stream(page).first().getByRole('button', { name: 'Toggle payload for jobs.step.updated event ev-3' });
+    await expect(first).toHaveAttribute('aria-expanded', 'false');
+    await first.focus();
+    await expect(first).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(first).not.toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(first).toBeFocused();
+    expect(await first.evaluate((button) => {
+      const painted = getComputedStyle(button);
+      return [painted.outlineStyle, painted.outlineWidth];
+    })).toEqual(['solid', '3px']);
+    await page.keyboard.press('Enter');
+    await expect(first).toHaveAttribute('aria-expanded', 'true');
+    await expect(first).toBeFocused();
+    const target = await first.getAttribute('aria-controls');
+    expect(target).toBeTruthy();
+    expect(await page.locator('.events-payload-row').getAttribute('id')).toBe(target);
+    await expect(page.locator('.events-payload-row')).toContainText('event_id: ev-3');
+    const packet = page.locator('.events-payload-row .events-packet a');
+    await page.keyboard.press('Tab');
+    await expect(packet).toBeFocused();
+    await first.focus();
+    await page.keyboard.press('Space');
+    await expect(first).toHaveAttribute('aria-expanded', 'false');
+    await expect(first).toBeFocused();
+    await expect(page.locator('.events-payload-row')).toHaveCount(0);
+    await first.click();
+    await expect(first).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.locator('.events-payload-row')).toContainText('event_id: ev-3');
+    const second = stream(page).nth(1).getByRole('button', { name: 'Toggle payload for dispatcher.rule.fired event ev-2' });
+    await second.focus();
+    await page.keyboard.press('Space');
+    await expect(second).toHaveAttribute('aria-expanded', 'true');
+    await expect(first).toHaveAttribute('aria-expanded', 'false');
+    await expect(second).toBeFocused();
+    await expect(page.locator('.events-payload-row')).toHaveCount(1);
+    await expect(page.locator('.events-payload-row')).toContainText('event_id: ev-2');
+    await expect(page.locator('.events-payload-row .events-packet a')).toHaveCount(0);
+    await page.keyboard.press('Enter');
+    await expect(second).toHaveAttribute('aria-expanded', 'false');
+    await expect(page.locator('.events-payload-row')).toHaveCount(0);
   });
 
   test('a failed attachments read says so; a 503 renders the designed-off note', async ({ page }) => {

@@ -24,6 +24,12 @@ pub enum JobsError {
         holder: Option<String>,
         status: String,
     },
+    #[error("station selection refused: {0}")]
+    SelectionConflict(String),
+    #[error("station calendar conflict: {existing:?}")]
+    SelectionCalendarConflict {
+        existing: Vec<boss_core::calendar::Reservation>,
+    },
     /// A metadata merge targeted a terminal (completed/skipped) step.
     /// `update_step_at` freezes those fields SILENTLY — its callers
     /// re-send whole rows and must stay idempotent — but a merge's
@@ -385,7 +391,7 @@ impl DepartmentFilter {
 /// `DepartmentIs` is absent because Jobs don't carry a department
 /// column (the HTTP handler still handles that case as an all-or-nothing
 /// pre-check since the answer only depends on the caller's department).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum JobScope {
     /// No additional constraint. Adapter applies only the usual filter
     /// fields.
@@ -447,17 +453,24 @@ impl JobScope {
     /// 0964ba80) both ask it here, so the two cannot disagree about what
     /// a scope admits. The Postgres adapter spells the same rule in SQL.
     pub fn admits(&self, job: &Job) -> bool {
+        self.admits_binding(
+            &job.owner_id,
+            boss_core::primitives::Subject::kind(&job.subject),
+            boss_core::primitives::Subject::id(&job.subject),
+        )
+    }
+
+    /// The same read predicate applied to an immutable captured subject binding.
+    pub(crate) fn admits_binding(&self, owner: &str, kind: &str, id: &str) -> bool {
         match self {
             JobScope::All => true,
             JobScope::None => false,
-            JobScope::OwnerIs(u) => &job.owner_id == u,
-            JobScope::OwnerIn(us) => us.contains(&job.owner_id),
+            JobScope::OwnerIs(u) => owner == u,
+            JobScope::OwnerIn(us) => us.iter().any(|user| user == owner),
             JobScope::AccountIn(ps) => {
                 // Same territory-scope shape as policy_glue::territory_matches
                 // (Wave 3): only Account/Employee subjects carry an id
                 // that maps into the account list; all others deny.
-                let kind = boss_core::primitives::Subject::kind(&job.subject);
-                let id = boss_core::primitives::Subject::id(&job.subject);
                 matches!(kind, "account" | "employee") && ps.iter().any(|p| p == id)
             }
         }
@@ -1413,9 +1426,14 @@ pub trait JobsRepository: Send + Sync {
     /// inserted one — recorded as JOB_UPDATED, a STEP_UPDATED per
     /// rewritten row and a STEP_CREATED per inserted one (the state the
     /// rebuild replays), and the `jobs.job.repinned` marker carrying
-    /// `record`. A re-projected row that finished between the caller's
-    /// read and this write keeps everything but its `sort_order`: a
-    /// completed step keeps the text it ran under, whoever raced.
+    /// `record`. Each re-projected row is written only at the version the
+    /// plan read it at ([`crate::repin::Reprojected::read`]), judged under
+    /// the row's lock: a row anything wrote since — a claim, a release, a
+    /// completion — refuses the whole move with
+    /// [`JobsError::StepChanged`], nothing written, and the caller plans
+    /// again from a fresh read (third review 85c11887 B1: the move had
+    /// erased a first claim's mark). A completed row the plan read as
+    /// completed still keeps everything but its `sort_order`.
     async fn repin_workflow_version_at(
         &self,
         id: &JobId,
@@ -1708,6 +1726,61 @@ pub trait JobsRepository: Send + Sync {
     ) -> Result<Step, JobsError> {
         self.claim_step_displacing_at(step_id, actor, &[], stamp, events)
             .await
+    }
+
+    /// A persisted request receipt is evidence of the original selection,
+    /// never permission to acquire another ACTIVE step on a client retry.
+    async fn station_claim_receipt(
+        &self,
+        request_id: uuid::Uuid,
+    ) -> Result<Option<crate::station_claim::SelectionReceipt>, JobsError> {
+        let _ = request_id;
+        Err(JobsError::Storage(
+            "adapter does not support durable station selection".into(),
+        ))
+    }
+
+    /// Optional real native read owner, including current-scope original replay.
+    /// None means this adapter does not supply that owner; no copied transport
+    /// response can be turned into a native authority witness.
+    fn native_selection_requires_ingress(&self) -> bool {
+        false
+    }
+
+    async fn native_selection_read(
+        &self,
+        ingress: &crate::station_claim::AuthenticatedSelectionIngress,
+        request_id: uuid::Uuid,
+        station: &str,
+    ) -> Result<Option<crate::station_claim::NativeSelectionRead>, JobsError> {
+        let _ = (ingress, request_id, station);
+        Ok(None)
+    }
+
+    async fn prepare_native_selection(
+        &self,
+        ingress: crate::station_claim::AuthenticatedSelectionIngress,
+        request_id: uuid::Uuid,
+        station: &str,
+    ) -> Result<Option<crate::station_claim::NativeAuthorityObservation>, JobsError> {
+        let _ = (ingress, request_id, station);
+        Ok(None)
+    }
+
+    /// Recheck the prepared head/shape under the same intake serialization
+    /// boundary as the READY claim, and commit its receipt and state events.
+    async fn claim_station_head_at(
+        &self,
+        context: &crate::station_claim::SelectionContext,
+        actor: &str,
+        displaceable: &[String],
+        stamp: &boss_core::publisher::EventStamp,
+        events: &[boss_core::event::Event],
+    ) -> Result<crate::station_claim::SelectionResult, JobsError> {
+        let _ = (context, actor, displaceable, stamp, events);
+        Err(JobsError::Storage(
+            "adapter does not support transactional station selection".into(),
+        ))
     }
 
     /// [`Self::claim_step_at`], where a READY step held by one of

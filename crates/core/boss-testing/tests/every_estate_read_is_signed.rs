@@ -146,10 +146,10 @@ const READERS: &[Reader] = &[
     },
     Reader {
         file: "crates/orchestrators/boss-cli/src/door.rs",
-        door: "its READ is sent by `boss orient` through gate::api, which signs every \
+        door: "its READ is sent by `boss orient` through sor_client::api, which signs every \
                call (identity::signature_for — the reader role when no actor is named)",
         proof_file: "crates/orchestrators/boss-cli/src/orient.rs",
-        proof: "crate::gate::api(&http, reqwest::Method::GET, crate::door::READ, None)",
+        proof: "crate::sor_client::api(&http, reqwest::Method::GET, crate::door::READ, None)",
     },
     Reader {
         file: "crates/orchestrators/boss-cli/src/train/conductor.rs",

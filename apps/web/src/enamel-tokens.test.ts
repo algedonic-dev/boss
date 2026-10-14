@@ -572,20 +572,8 @@ describe('the field is Enamel’s', () => {
     // Enamel itself (c6db2cfb) — without its own rule it would fall to the
     // browser's field there.
     const LEFT = [
-      'auth/AuthAdminPage.svelte',
-      'auth/LoginPage.svelte',
-      'dispatcher/DispatcherCascadePage.svelte',
-      'finance/MonthlyClosePackageButton.svelte',
-      'it/monitoring/EventsPage.svelte',
-      'it/registry/WorkflowsPage.svelte',
-      'jobs/JobsListPage.svelte',
-      'jobs/TriageBoard.svelte',
-      'landing/SystemModelLiveView.svelte',
-      'steps/ProductionConsumeSurface.svelte',
-      'steps/ReceivingSurface.svelte',
       'web-kit/FeedbackControl.svelte',
       'web-kit/GlobalSearch.svelte',
-      'workflows/StepInspector.svelte',
     ];
     const drawing = svelteFiles
       .filter(([, src]) => {

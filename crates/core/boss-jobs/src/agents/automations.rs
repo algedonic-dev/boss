@@ -91,30 +91,19 @@ pub struct AutomationActor {
     pub signs_for: Option<String>,
 }
 
-fn is_slug(s: &str) -> bool {
-    s.chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
 /// Whether `id` is `automation:<slug>` — the Rust spelling of the SQL
 /// CHECK on `automation_actors.id` (`^automation:[a-z0-9][a-z0-9-]*$`).
 /// A colon inside the slug is a FAMILY member, declared by its signer's
 /// `signs_for`, never a row of its own.
 pub fn is_automation_id(id: &str) -> bool {
-    id.strip_prefix(AUTOMATION_PREFIX).is_some_and(is_slug)
+    id.strip_prefix(AUTOMATION_PREFIX)
+        .is_some_and(boss_core::role_of_record::is_slug)
 }
 
-/// Whether `prefix` is `automation:<slug>:` — the shape of a
-/// `signs_for` (the SQL CHECK spells it `^automation:[a-z0-9][a-z0-9-]*:$`).
-pub fn is_family_prefix(prefix: &str) -> bool {
-    prefix
-        .strip_prefix(AUTOMATION_PREFIX)
-        .and_then(|s| s.strip_suffix(':'))
-        .is_some_and(is_slug)
-}
+/// The shape of a `signs_for`, defined once in boss-core so the
+/// resolver every service mounts refuses what this write side refuses
+/// (review ed9181b4, F2).
+pub use boss_core::role_of_record::is_family_prefix;
 
 /// Why a row is refused, naming it — the same check the loader and the
 /// in-memory adapter run, so the tree, the double and Postgres refuse

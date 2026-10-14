@@ -21,12 +21,15 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
 }
 
-/// The runner's tag is a seven-character substring of the full sha.
+/// The runner's tag is a seven-character substring of the full sha —
+/// the one the generation of root's tree it builds names (root-tree.sh
+/// writes `.boss-tree-sha` into every generation; backlog 683d7fe9 moved
+/// the converge off its own checkout's `git rev-parse forgejo/main`).
 #[test]
 fn the_runner_tags_with_seven_characters_of_the_full_sha() {
     let runner = read(RUNNER);
     assert!(
-        runner.contains("HEAD_FULL=$(git rev-parse forgejo/main)")
+        runner.contains("HEAD_FULL=$(cat .boss-tree-sha)")
             && runner.contains("HEAD=${HEAD_FULL:0:7}"),
         "{RUNNER}: the tag must be HEAD=${{HEAD_FULL:0:7}} of the full sha"
     );

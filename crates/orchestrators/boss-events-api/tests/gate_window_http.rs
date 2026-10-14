@@ -757,12 +757,9 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
     };
     let jobs = serve(upstream(machine("jobs").to_string(), StatusCode::OK)).await;
     let people = serve(upstream(machine("people").to_string(), StatusCode::OK)).await;
-    // A port nothing listens on: bound once so the number is real, then
-    // released.
-    let closed = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        format!("http://{}", listener.local_addr().unwrap())
-    };
+    // A port nothing listens on, HELD for the whole test rather than
+    // bound and released (review 465e723f F3).
+    let closed = boss_testing::dark_port();
     // A process the record does not account for. It refuses the tally
     // read, as a service that is up and unhealthy would; the port
     // answering is what gives it away.
@@ -799,7 +796,7 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
     let cases = [
         Case {
             name: "skipped and silent",
-            assets: closed.clone(),
+            assets: closed.base.clone(),
             record: Ok(record.clone()),
             clean: true,
             required: two.clone(),
@@ -811,7 +808,7 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
         // record's; those hours were watched under another.
         Case {
             name: "the processes on the log state another selection",
-            assets: closed.clone(),
+            assets: closed.base.clone(),
             record: Ok(record.clone()),
             clean: false,
             required: two.clone(),
@@ -819,7 +816,7 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
         },
         Case {
             name: "the processes on the log state no selection",
-            assets: closed.clone(),
+            assets: closed.base.clone(),
             record: Ok(record.clone()),
             clean: false,
             required: two.clone(),
@@ -835,7 +832,7 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
         },
         Case {
             name: "started and down",
-            assets: closed.clone(),
+            assets: closed.base.clone(),
             record: Ok(all_started),
             clean: false,
             required: three.clone(),
@@ -843,7 +840,7 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
         },
         Case {
             name: "the record is missing",
-            assets: closed.clone(),
+            assets: closed.base.clone(),
             record: Ok(dir.join("absent")),
             clean: false,
             required: three.clone(),
@@ -851,7 +848,7 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
         },
         Case {
             name: "the record is cut short",
-            assets: closed.clone(),
+            assets: closed.base.clone(),
             record: Ok(cut),
             clean: false,
             required: three.clone(),
@@ -859,7 +856,7 @@ async fn the_required_services_are_what_the_launcher_started_and_no_record_hides
         },
         Case {
             name: "no record path was handed to this process",
-            assets: closed.clone(),
+            assets: closed.base.clone(),
             record: Err("BOSS_LAUNCH_RECORD is unset".into()),
             clean: false,
             required: three.clone(),

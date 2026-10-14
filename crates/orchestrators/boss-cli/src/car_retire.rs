@@ -848,7 +848,7 @@ pub(crate) async fn retire(
     accept_net_diff: bool,
     dry_run: bool,
 ) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     // The actor FIRST: a write nobody names is refused, and the refusal
     // costs a line rather than a half-retired car (5083d6f5).
     let actor = if dry_run {
@@ -862,7 +862,7 @@ pub(crate) async fn retire(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("car {branch} carries no id"))?
         .to_string();
-    let cars = crate::gate::all_cars(&http).await?;
+    let cars = crate::sor_client::all_cars(&http).await?;
     println!("boss car retire: car {} ({branch})", &id[..8]);
 
     let retirement = match (carried_by, superseded_by) {
@@ -968,7 +968,7 @@ pub(crate) trait Door: Send + Sync {
     ) -> Result<Option<Value>>;
 }
 
-/// The operator's door: `crate::gate::api`, signed as the actor running
+/// The operator's door: `crate::sor_client::api`, signed as the actor running
 /// the verb.
 pub(crate) struct Http<'a>(pub(crate) &'a boss_core::machine_token::Client);
 
@@ -980,7 +980,7 @@ impl Door for Http<'_> {
         path: &str,
         body: Option<Value>,
     ) -> Result<Option<Value>> {
-        crate::gate::api(self.0, method, path, body).await
+        crate::sor_client::api(self.0, method, path, body).await
     }
 }
 
@@ -1059,17 +1059,16 @@ pub(crate) async fn apply_via(
     {
         // Put the brake back on: a released duplicate with no terminal
         // would board the next train and red it on an empty diff.
-        if let (Some(review), Some(reason)) = (
-            held,
-            car::find_step(car_json, car::REVIEW_SLUG, car::REVIEW)
-                .and_then(|s| s.pointer("/metadata/hold"))
-                .and_then(Value::as_str),
-        ) {
+        let review_md = car::find_step(car_json, car::REVIEW_SLUG, car::REVIEW)
+            .and_then(|s| s.get("metadata"))
+            .unwrap_or(&Value::Null);
+        if let (Some(review), Some(reason)) = (held, review_md.get("hold").and_then(Value::as_str))
+        {
             let _ = door
                 .send(
                     Method::PATCH,
                     &format!("/api/jobs/{id}/steps/{review}/metadata"),
-                    Some(crate::steps::hold_patch(reason)),
+                    Some(crate::steps::hold_patch(review_md, reason)),
                 )
                 .await;
         }

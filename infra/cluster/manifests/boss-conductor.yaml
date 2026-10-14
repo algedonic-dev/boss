@@ -93,10 +93,9 @@
 #   binary into /usr/local/bin), so `command: [boss, train, cadence]`
 #   resolves. The tag committed here (:latest) is a PLACEHOLDER: on every
 #   converge cluster-deploy-runner.sh rewrites this Deployment's image to
-#   the freshly-built :$HEAD (a `kubectl set image` on this single-
-#   container Deployment — simpler than the boss deployment's json patch,
-#   which needs one only because it also has an initContainer). See the
-#   boss-conductor `set image` line added to that runner. The committed
+#   the freshly-built :$HEAD (one named image update advances the conductor and
+#   its private-journal preparation init container together). See the
+#   boss-conductor image update in that runner. The committed
 #   tag is never what actually runs after a converge; it only needs to be
 #   a valid pullable reference for a hand-apply before the first converge,
 #   which :latest is.
@@ -188,6 +187,8 @@ data:
   # The conductor's clone + lock live under here (clone = $HOME/repo). The
   # PVC above is mounted at this path.
   BOSS_TRAIN_HOME: "/var/lib/boss-train"
+  # The same durable PVC child mounted outside its group-writable root.
+  BOSS_TRAIN_DIAGNOSTICS_HOME: "/var/lib/boss-train-diagnostics"
   # The conductor drives merges. Off by default; the boss-gcp unit turns
   # it on via a drop-in, and so must this.
   BOSS_TRAIN_AUTO_MERGE: "1"
@@ -275,7 +276,9 @@ spec:
       # conductor creates gate Jobs in this namespace and reads their
       # pods, nothing else.
       serviceAccountName: boss-conductor
-      automountServiceAccountToken: true
+      # Only the conductor receives its existing API identity; preparation
+      # mounts the durable volume alone and needs no API or forge credential.
+      automountServiceAccountToken: false
       # The forge registry needs a pull secret, same as every boss-image
       # consumer in this namespace (boss-dev.yaml).
       imagePullSecrets:
@@ -285,6 +288,9 @@ spec:
         # (UID 1500 in the image) can write to it — matches boss.yaml's
         # boss-auth posture.
         fsGroup: 1500
+        # Once the root matches, do not recursively widen retained journals.
+        # Preparation refuses a widened child instead of changing evidence.
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile: {type: RuntimeDefault}
         # The uid ITSELF, declared rather than left to the image (backlog
         # 5234cda4). fsGroup above is the VOLUME half of the answer; this
@@ -305,6 +311,18 @@ spec:
         runAsNonRoot: true
         runAsUser: 1500
         runAsGroup: 1500
+      initContainers:
+        - name: prepare-diagnostics
+          image: 10.20.0.15:3000/david/boss:latest
+          command: ["/bin/bash", "/opt/boss/infra/train/prepare-diagnostics.sh", "/conductor-home"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: home, mountPath: /conductor-home}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 64Mi}
       containers:
         - name: conductor
           # Placeholder tag — cluster-deploy-runner.sh rewrites this to the
@@ -326,6 +344,8 @@ spec:
             - {name: BOSS_TRAIN_FORGE_TOKEN_FILE, value: /etc/boss-train/forge.token}
           volumeMounts:
             - {name: home, mountPath: /var/lib/boss-train}
+            - {name: home, mountPath: /var/lib/boss-train-diagnostics, subPath: diagnostics}
+            - {name: conductor-api, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true}
             - {name: forge-token, mountPath: /etc/boss-train, readOnly: true}
             # The estate machine token, at boss-core's default directory:
             # the boss CLI stamps its `current` slot on every jobs-API
@@ -338,6 +358,17 @@ spec:
             requests: {cpu: 100m, memory: 256Mi}
             limits: {cpu: "1", memory: 1Gi}
       volumes:
+        # The normal in-cluster token, CA and namespace paths, projected
+        # explicitly so the nonroot preparation container receives none.
+        - name: conductor-api
+          projected:
+            sources:
+              - serviceAccountToken: {path: token, expirationSeconds: 3600}
+              - configMap:
+                  name: kube-root-ca.crt
+                  items: [{key: ca.crt, path: ca.crt}]
+              - downwardAPI:
+                  items: [{path: namespace, fieldRef: {apiVersion: v1, fieldPath: metadata.namespace}}]
         - name: home
           persistentVolumeClaim: {claimName: boss-conductor-home}
         # THE FORGE WRITE TOKEN, mounted rather than hand-placed

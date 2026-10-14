@@ -59,6 +59,20 @@
 //! string; a rule that pointed at an object would match nothing and
 //! say so.
 //!
+//! ## An event that is not a closing packet (backlog f4cfb793)
+//!
+//! `ledger.period.locked` names a PERIOD, not a packet: its payload is
+//! `{period_id, locked_by, actor_id, checksum, locked_at}` with no `id`.
+//! The handler used to require a payload `id` and return, before any
+//! log line, when there was none — so a rule on the lock selected every
+//! lock and completed nothing, in silence. Now a payload with no string
+//! `id` is evidenced by the event's OWN id (`triggering_event_id`, the
+//! envelope id the runner hands every handler), and `event_path` is read
+//! from the payload ONLY: an event id is not a Job, so nothing is
+//! fetched. A delivery with neither id is refused with a warning naming
+//! the rule and topic. A payload that carries an `id` reads exactly as
+//! it did, which is every rule written before this one.
+//!
 //! ## Matching the packet itself — no `match_step` (design b35456ac)
 //!
 //! `match_step` is optional. Absent, `match_field` is read off the
@@ -77,7 +91,8 @@
 //! already carry (a value a person wrote is their record), with string
 //! values substituting `{event.<key>}` from the marker's top-level
 //! scalars and `{value}` for the matched value. The triggering Job's id
-//! lands under `evidence_key` (default `matched_from`) as a plain
+//! (or, for a non-packet event, the event's id) lands under
+//! `evidence_key` (default `matched_from`) as a plain
 //! string — the evidence is WHICH packet made this one true, and a
 //! reader follows the id. Richer provenance is the template's to
 //! carry, in the step kind's own vocabulary, because only the tenant
@@ -142,11 +157,12 @@ impl JobsCompleteStepMatching {
     }
 
     /// The value at `event_path`: the payload first, then the closed Job
-    /// (fetched only when the payload does not answer).
+    /// (fetched only when the payload does not answer, and only when
+    /// the trigger IS a Job — an event id is never fetched as one).
     async fn event_value(
         &self,
         path: &str,
-        job_id: &str,
+        trigger: &Trigger<'_>,
         ctx: &InvocationContext,
     ) -> Result<Option<String>, HandlerError> {
         let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
@@ -156,6 +172,9 @@ impl JobsCompleteStepMatching {
         if let Some(v) = walk(&ctx.event_payload, &segments).and_then(scalar_text) {
             return Ok(Some(v));
         }
+        let Trigger::Packet(job_id) = trigger else {
+            return Ok(None);
+        };
         let job = get_json(
             &self.client,
             &format!("{}/api/jobs/{job_id}", self.base()),
@@ -201,6 +220,31 @@ struct Facts<'a> {
     triggering_id: &'a str,
     payload: &'a serde_json::Value,
     value: &'a str,
+}
+
+/// What made this delivery happen, and so what the evidence names and
+/// whether `event_path` may fall back to fetching a Job.
+#[derive(Debug, PartialEq)]
+enum Trigger<'a> {
+    /// A closing packet: the payload's `id` is the Job, fetchable.
+    Packet(&'a str),
+    /// Any other event (`ledger.period.locked`, backlog f4cfb793): its
+    /// envelope id, and the payload is the whole record.
+    Event(&'a str),
+}
+
+/// PURE: the payload's string `id` first — every rule written before
+/// f4cfb793 reads exactly as it did — else the event's own id. `None`
+/// when neither names anything: the runner hands `unknown` for an
+/// envelope with no id, and that is no identity to write as evidence.
+fn trigger<'a>(payload: &'a serde_json::Value, event_id: &'a str) -> Option<Trigger<'a>> {
+    if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
+        return Some(Trigger::Packet(id));
+    }
+    match event_id {
+        "" | "unknown" => None,
+        id => Some(Trigger::Event(id)),
+    }
 }
 
 /// The string a JSON scalar compares as; `None` for anything that is
@@ -305,14 +349,24 @@ impl Handler for JobsCompleteStepMatching {
         };
         let template = template_arg(args, "done_metadata", &ctx.rule_name);
 
-        // The `jobs.job.closed` payload carries the closing Job's id. A
-        // malformed marker is not something a redelivery can fix, so it
-        // is a no-op rather than an error that retries forever.
-        let Some(triggering_id) = ctx.event_payload.get("id").and_then(|v| v.as_str()) else {
+        // A `jobs.job.closed` payload carries the closing Job's id; any
+        // other event is evidenced by its own id (backlog f4cfb793). One
+        // with neither cannot be evidenced, and a redelivery would find
+        // the same absence, so it is a no-op rather than an error that
+        // retries forever — but a LOGGED one: until f4cfb793 this return
+        // came before every log line, and a rule on `ledger.period.locked`
+        // selected every lock and completed nothing in silence.
+        let Some(fired_by) = trigger(&ctx.event_payload, &ctx.triggering_event_id) else {
+            tracing::warn!(
+                rule = %ctx.rule_name,
+                topic = %ctx.triggering_topic,
+                "event carries no payload id and no event id to record as evidence — completing nothing"
+            );
             return Ok(());
         };
+        let (Trigger::Packet(triggering_id) | Trigger::Event(triggering_id)) = fired_by;
 
-        let Some(value) = self.event_value(event_path, triggering_id, ctx).await? else {
+        let Some(value) = self.event_value(event_path, &fired_by, ctx).await? else {
             // The rule selected this event and the event carries nothing
             // at the path the rule named: the two disagree about what
             // the event records, which is rule authoring worth a line
@@ -320,7 +374,7 @@ impl Handler for JobsCompleteStepMatching {
             // would find the same absence.
             tracing::warn!(
                 rule = %ctx.rule_name,
-                job = %triggering_id,
+                trigger = %triggering_id,
                 event_path = %event_path,
                 "no value at event_path — completing nothing"
             );
@@ -363,7 +417,7 @@ impl Handler for JobsCompleteStepMatching {
                 tracing::info!(
                     rule = %ctx.rule_name,
                     packet = %job_id,
-                    job = %triggering_id,
+                    trigger = %triggering_id,
                     "`{step_slug}` already completed — no-op"
                 );
                 continue;
@@ -392,7 +446,7 @@ impl Handler for JobsCompleteStepMatching {
         if matched == 0 {
             tracing::debug!(
                 rule = %ctx.rule_name,
-                job = %triggering_id,
+                trigger = %triggering_id,
                 "no open {kind} packet records {}.{match_field} = {value:?}",
                 match_step.unwrap_or("metadata")
             );
@@ -833,6 +887,181 @@ mod tests {
         assert_eq!(calls[0].2["result"], "overtaken");
         assert_eq!(calls[0].2[DEFAULT_EVIDENCE_KEY], CONVERGE);
         assert_eq!((calls[1].0.as_str(), calls[1].1.as_str()), (SITE_A, LIVE_A));
+    }
+
+    // ── A non-packet event (backlog f4cfb793) ──────────────────────
+    //
+    // `ledger.period.locked` names a period, not a packet: its payload
+    // is `{period_id, locked_by, actor_id, checksum, locked_at}` with no
+    // `id` (boss-ledger `periods.rs`). Until this car the handler
+    // returned before its first log line on such an event, so a rule on
+    // it selected every lock and completed nothing, in silence.
+
+    const PERIOD: &str = "66666666-6666-6666-6666-666666666666";
+    const CLOSE_A: &str = "77777777-7777-7777-7777-777777777777";
+    const CLOSE_B: &str = "88888888-8888-8888-8888-888888888888";
+    const LOCK_A: &str = "99999999-9999-9999-9999-999999999999";
+    const LOCK_B: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    /// The envelope id the runner hands every handler as
+    /// `triggering_event_id` — the only identity a lock event has.
+    const LOCK_EVENT: &str = "d610597e-ae6a-4062-8563-ae0d3a182969";
+
+    /// The lock event's payload in the shape the ledger emits it (plus
+    /// the `_actor`/`_partition` stamp keys the live row carries).
+    fn lock_marker() -> serde_json::Value {
+        json!({
+            "_actor": "emp-david",
+            "_partition": "real",
+            "period_id": PERIOD,
+            "locked_by": "emp-david",
+            "actor_id": "emp-david",
+            "checksum": "sha256:d26b",
+            "locked_at": "2026-10-09T17:28:52Z",
+        })
+    }
+
+    fn lock_ctx(event_id: &str) -> InvocationContext {
+        InvocationContext {
+            event_timestamp: None,
+            rule_name: "a-period-lock-completes-its-close".into(),
+            triggering_event_id: event_id.into(),
+            triggering_topic: "ledger.period.locked".into(),
+            event_payload: lock_marker(),
+        }
+    }
+
+    /// The args 621f57f7's tenant rule would evaluate to.
+    fn lock_args() -> Vec<(String, Value)> {
+        vec![
+            ("kind".to_string(), Value::String("close-a-period".into())),
+            ("step".to_string(), Value::String("lock".into())),
+            ("match_step".to_string(), Value::String("period".into())),
+            ("match_field".to_string(), Value::String("period_id".into())),
+            ("event_path".to_string(), Value::String("period_id".into())),
+            (
+                "done_metadata".to_string(),
+                Value::String(
+                    r#"{"checksum": "{event.checksum}", "locked_at": "{event.locked_at}"}"#.into(),
+                ),
+            ),
+            (
+                "evidence_key".to_string(),
+                Value::String("lock_event".into()),
+            ),
+        ]
+    }
+
+    /// An open close-a-period packet whose `period` step recorded
+    /// `period_id` and whose `lock` step is in `lock_status`.
+    fn close_a_period(
+        id: &str,
+        lock_id: &str,
+        period_id: &str,
+        lock_status: &str,
+    ) -> serde_json::Value {
+        json!({
+            "id": id,
+            "kind": "close-a-period",
+            "status": "open",
+            "metadata": {},
+            "steps": [
+                { "id": format!("{id}-period"), "spec_slug": "period", "status": "completed",
+                  "metadata": { "period_id": period_id } },
+                { "id": lock_id, "spec_slug": "lock", "status": lock_status,
+                  "metadata": {} },
+            ],
+        })
+    }
+
+    /// The obligation f4cfb793 exists for: the lock of PERIOD completes
+    /// `lock` on the ONE close that recorded PERIOD — the value read
+    /// from the payload, the evidence the event's own id, and the
+    /// template filled from the payload's scalars.
+    #[tokio::test]
+    async fn a_non_packet_event_completes_from_its_payload_under_its_event_id() {
+        let (base, puts) = mock_jobs(vec![
+            close_a_period(CLOSE_A, LOCK_A, PERIOD, "ready"),
+            close_a_period(CLOSE_B, LOCK_B, "another-period", "ready"),
+        ])
+        .await;
+        let h = JobsCompleteStepMatching::with_client(crate::handlers::common::api_client(), base);
+        h.invoke(&lock_args(), &lock_ctx(LOCK_EVENT))
+            .await
+            .expect("runs");
+
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "the merge, then the flip: {calls:?}");
+        let (job, step, body) = &calls[0];
+        assert_eq!(job, CLOSE_A, "the close that recorded the locked period");
+        assert_eq!(step, &format!("{LOCK_A}/metadata"));
+        assert_eq!(
+            body["lock_event"], LOCK_EVENT,
+            "the evidence is the event's own id — the lock has no packet"
+        );
+        assert_eq!(body["checksum"], "sha256:d26b", "{{event.checksum}}");
+        assert_eq!(body["locked_at"], "2026-10-09T17:28:52Z");
+        assert_eq!(
+            (calls[1].0.as_str(), calls[1].1.as_str()),
+            (CLOSE_A, LOCK_A)
+        );
+        assert_eq!(calls[1].2, json!({ "status": "completed" }));
+    }
+
+    /// A non-packet event's id is an EVENT id: it is never fetched as a
+    /// Job. The mock holds a Job under that very id whose metadata
+    /// would answer the path — fetched, it would match and complete;
+    /// read from the payload only, the path finds nothing, and nothing
+    /// is completed.
+    #[tokio::test]
+    async fn a_non_packet_event_is_never_fetched_as_a_job() {
+        let impostor = json!({
+            "id": LOCK_EVENT,
+            "kind": "something-else",
+            "status": "closed",
+            "metadata": { "period_id": PERIOD },
+            "steps": [],
+        });
+        let (base, puts) = mock_jobs(vec![
+            impostor,
+            close_a_period(CLOSE_A, LOCK_A, PERIOD, "ready"),
+        ])
+        .await;
+        let mut a = lock_args();
+        a.retain(|(k, _)| k != "event_path");
+        a.push((
+            "event_path".to_string(),
+            Value::String("metadata.period_id".into()),
+        ));
+        let h = JobsCompleteStepMatching::with_client(crate::handlers::common::api_client(), base);
+        h.invoke(&a, &lock_ctx(LOCK_EVENT)).await.expect("runs");
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "the payload has no metadata.period_id, and the event id is not a Job"
+        );
+    }
+
+    /// Where the triggering identity comes from: a closing packet's
+    /// payload `id` first (every rule written before f4cfb793 reads
+    /// exactly as it did), else the event's own id, else nothing — the
+    /// runner's `unknown` stand-in for an envelope with no id is not an
+    /// identity to record as evidence.
+    #[test]
+    fn the_trigger_is_the_packet_id_then_the_event_id_then_none() {
+        assert_eq!(
+            trigger(&close_marker(), "evt-close-1"),
+            Some(Trigger::Packet(CONVERGE))
+        );
+        assert_eq!(
+            trigger(&lock_marker(), LOCK_EVENT),
+            Some(Trigger::Event(LOCK_EVENT))
+        );
+        assert_eq!(trigger(&lock_marker(), ""), None);
+        assert_eq!(trigger(&lock_marker(), "unknown"), None);
+        assert_eq!(
+            trigger(&json!({ "id": 7 }), LOCK_EVENT),
+            Some(Trigger::Event(LOCK_EVENT)),
+            "a non-string id names no packet"
+        );
     }
 
     /// `is_unset` semantics: a value a person already wrote on the step

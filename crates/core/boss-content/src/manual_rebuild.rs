@@ -7,6 +7,7 @@ use serde::Deserialize;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use crate::manual_baseline::ManualBaseline;
 use crate::types::{ManualSection, ManualSectionVersion};
 
 #[derive(Deserialize)]
@@ -27,18 +28,101 @@ fn decode(event: &ReplayEvent) -> Result<ManualFact, String> {
 
 /// Validate chronology and identity from the log, then coverage of existing rows.
 /// Values may drift and be repaired; an identity absent from the log must survive.
-pub(crate) async fn validate_manual(
+pub(crate) async fn prepare_manual(
     conn: &mut PgConnection,
     events: &[ReplayEvent],
-) -> Result<(), String> {
+) -> Result<Vec<ReplayEvent>, String> {
     let mut sections: BTreeMap<Uuid, ManualSection> = BTreeMap::new();
     let mut slugs: BTreeMap<String, Uuid> = BTreeMap::new();
     let mut history = BTreeSet::new();
     let mut history_ids = BTreeSet::new();
-    for event in events
+    let mut plan: Vec<ReplayEvent> = Vec::new();
+    let baselines: Vec<_> = events
         .iter()
-        .filter(|e| e.kind.starts_with("content.manual."))
-    {
+        .filter(|e| e.kind == crate::events::BASELINE_OBSERVED)
+        .collect();
+    if baselines.len() > 1 {
+        return Err("manual log has more than one observed baseline".into());
+    }
+    let mut cutoff = None;
+    if let Some(event) = baselines.first() {
+        let baseline: ManualBaseline = serde_json::from_value(event.payload.clone())
+            .map_err(|e| format!("manual baseline: {e}"))?;
+        let source: String =
+            sqlx::query_scalar("SELECT source FROM audit_log WHERE id=$1 AND event_id=$2")
+                .bind(event.audit_id)
+                .bind(event.event_id)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| e.to_string())?;
+        baseline.validate_fact(event.event_id, &source, event.ts, &event.payload)?;
+        if baseline.log_cutoff >= event.audit_id {
+            return Err("manual baseline observation provenance disagrees with its event".into());
+        }
+        for raw in &baseline.inventory.sections {
+            let section: ManualSection =
+                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+            slugs.insert(section.slug.clone(), section.id);
+            sections.insert(section.id, section);
+        }
+        for raw in &baseline.inventory.history {
+            let id = raw["id"]
+                .as_i64()
+                .ok_or("manual baseline history id absent")?;
+            let version: ManualSectionVersion =
+                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+            history.insert((id, version.section_id, version.version));
+            history_ids.insert(id);
+        }
+        // Earlier real facts remain facts, and must agree with the stored
+        // history observed by this baseline. No missing creation is invented.
+        for prior in events
+            .iter()
+            .filter(|e| e.kind.starts_with("content.manual.") && e.audit_id <= baseline.log_cutoff)
+        {
+            if !matches!(
+                prior.kind.as_str(),
+                crate::events::SECTION_CREATED | crate::events::SECTION_UPDATED
+            ) {
+                return Err("unsupported manual fact before observed baseline".into());
+            }
+            let fact = decode(prior)?;
+            let stored = baseline
+                .inventory
+                .history
+                .iter()
+                .find(|h| h["id"].as_i64() == Some(fact.history_id))
+                .ok_or("manual baseline omits previously recorded history")?;
+            let version: ManualSectionVersion =
+                serde_json::from_value(stored.clone()).map_err(|e| e.to_string())?;
+            let observed = sections
+                .get(&fact.section.id)
+                .ok_or("manual baseline omits prior section")?;
+            if version != fact.version
+                || fact.section.id != fact.version.section_id
+                || fact.section.current_version != fact.version.version
+                || fact.section.title != fact.version.title
+                || fact.section.body != fact.version.body
+                || fact.section.audience != fact.version.audience
+                || fact.section.updated_at != fact.version.edited_at
+                || (prior.kind == crate::events::SECTION_CREATED && fact.version.version != 1)
+                || prior.payload["_actor"].as_str() != Some(fact.version.edited_by.as_str())
+                || prior.ts.timestamp_micros() != fact.version.edited_at.timestamp_micros()
+                || observed.slug != fact.section.slug
+                || observed.parent_slug != fact.section.parent_slug
+                || observed.created_at != fact.section.created_at
+            {
+                return Err("manual baseline disagrees with previously recorded fact".into());
+            }
+        }
+        cutoff = Some(baseline.log_cutoff);
+        plan.push((*event).clone());
+    }
+    for event in events.iter().filter(|e| {
+        e.kind.starts_with("content.manual.")
+            && e.kind != crate::events::BASELINE_OBSERVED
+            && cutoff.is_none_or(|cut| e.audit_id > cut)
+    }) {
         let fact = decode(event)?;
         let s = &fact.section;
         let v = &fact.version;
@@ -129,7 +213,27 @@ pub(crate) async fn validate_manual(
             ));
         }
     }
-    Ok(())
+    plan.extend(
+        events
+            .iter()
+            .filter(|e| e.kind != crate::events::BASELINE_OBSERVED)
+            .cloned(),
+    );
+    Ok(plan)
+}
+
+pub(crate) async fn covered_by_baseline(
+    conn: &mut PgConnection,
+    event: &ReplayEvent,
+) -> Result<bool, String> {
+    let cutoff: Option<i64> = sqlx::query_scalar(
+        "SELECT (payload->>'log_cutoff')::bigint FROM audit_log WHERE kind = $1",
+    )
+    .bind(crate::events::BASELINE_OBSERVED)
+    .fetch_optional(conn)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(cutoff.is_some_and(|cut| event.audit_id <= cut))
 }
 
 pub(crate) async fn apply_manual(

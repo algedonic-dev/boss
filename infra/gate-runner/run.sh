@@ -39,6 +39,27 @@ FORGE_URL="${FORGE_URL:-http://10.20.0.15:3000/david/boss.git}"
 JOBS_API="${JOBS_API:-http://10.20.0.34:7900}"
 ACTOR='{"id":"automation:gate-runner","role":"platform-admin","access_tier":"operator"}'
 
+# --- runner provenance (begin) ---
+# WHICH SCRIPT IS RUNNING, read off the script itself (backlog e3100bc8,
+# design 1d7a1669). This file reached the pod one of three ways: straight
+# from ConfigMap gate-runner-script, which the forge converge rewrites
+# from MAIN (`configmap` - so a car that changes this file was, until the
+# converge after it landed, gated by the old one); from bootstrap.sh,
+# fetched at the sha being gated (`branch`); or from bootstrap.sh's
+# fallback to main's copy (`main-fallback`, with the reason). Both ride
+# the receipt, with the sha256 of the bytes bash is reading, so which
+# script ran is read from the record, never inferred from an absent key.
+# GATE_SHA, when the bootstrap set it, is the commit to gate (the "gated
+# sha" block below). All four are taken into shell variables and exported
+# to nothing: the branch's gate.sh and every test it runs are children
+# of this script, and none of them is the runner.
+RUNNER_SOURCE="${GATE_RUNNER_SOURCE:-configmap}"
+RUNNER_FALLBACK_REASON="${GATE_RUNNER_FALLBACK_REASON:-}"
+RUNNER_SHA256=$(sha256sum "${BASH_SOURCE[0]}" 2>/dev/null | cut -d' ' -f1) || RUNNER_SHA256=""
+GATE_SHA="${GATE_SHA:-}"
+export -n GATE_SHA GATE_RUNNER_SOURCE GATE_RUNNER_FALLBACK_REASON GATE_RUNNER_SHA256
+# --- runner provenance (end) ---
+
 # --- report-back (begin) ---
 # THE REPORT RETRIES, because the system of record rolls.
 #
@@ -440,7 +461,9 @@ leave_verdict() { # <verdict> <one-line receipt>
 # when there was one.
 early_receipt() { # <verdict> <key> <why>
     jq -nc --arg v "$1" --arg k "$2" --arg w "$3" --arg h "${HEAD_SHA:-}" \
-        '{verdict: $v, head: $h} + {($k): $w}' 2>/dev/null \
+        --arg rs "${RUNNER_SOURCE:-}" --arg rh "${RUNNER_SHA256:-}" \
+        '{verdict: $v, head: $h} + {($k): $w}
+         + (if $rs == "" then {} else {runner_source: $rs, runner_sha256: $rh} end)' 2>/dev/null \
         || printf '{"verdict":"%s"}' "$1"
 }
 
@@ -780,9 +803,26 @@ cd /gate-target/repo
 # updates FETCH_HEAD but creates no remote-tracking ref, so the
 # checkout below died with "origin/<branch> is not a commit" - the
 # second reason this rig had never completed a run.
+# --- gated sha (begin) ---
 git fetch origin "$GATE_BRANCH:refs/remotes/origin/$GATE_BRANCH"
-git checkout -B "$GATE_BRANCH" "origin/$GATE_BRANCH"
+# ONE SHA FOR THE SCRIPT AND THE TREE (design 1d7a1669). bootstrap.sh
+# resolved the branch once and fetched THIS script from that commit, so
+# the gate checks out that commit, not whatever the branch says now: a
+# push in between would otherwise gate one tree with another tree's
+# runner. A sha the forge no longer has (a force-push beyond the 50 the
+# clone holds) ends the run lost, by name - never a different tree.
+# Started without the bootstrap (no GATE_SHA), the branch head as before.
+GATE_TREE="origin/$GATE_BRANCH"
+if [ -n "$GATE_SHA" ]; then
+    if ! git cat-file -e "$GATE_SHA^{commit}" 2>/dev/null; then
+        git fetch --depth 50 origin "$GATE_SHA" \
+            || fail_lost "the gated sha $GATE_SHA of $GATE_BRANCH is not on the forge"
+    fi
+    GATE_TREE="$GATE_SHA"
+fi
+git checkout -B "$GATE_BRANCH" "$GATE_TREE"
 HEAD_SHA=$(git rev-parse HEAD)
+# --- gated sha (end) ---
 # The checkout is the last write to the sources and nothing has built
 # yet, so this is the order cargo will judge. It rides the receipt as
 # `seed_order` (the summary block below); a failed measurement is an
@@ -856,6 +896,11 @@ CPUS=$(gate_cpus)
 # /dev/shm exhaustion and the schema-load race this rig has already
 # been bitten by. Raising both at once would also make the result
 # unattributable. Widen it as a separate, measured change.
+#
+# What WAS widened is the number of test BINARIES at a time (backlog
+# 2d234222): infra/cargo-test-wide.sh runs a quarter of CARGO_BUILD_JOBS
+# of them at once, at most four, each still 2 threads — its header says
+# why four, and the receipt's `test_binaries` says what it cost.
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$CPUS}" RUST_TEST_THREADS="${RUST_TEST_THREADS:-2}"
 export BOSS_GATE_RUNTIME_EVIDENCE=/gate-target/runtime-evidence.jsonl
 export BOSS_GATE_SOURCE_HEAD="$HEAD_SHA"
@@ -886,7 +931,7 @@ python3 infra/gate-runner/runtime-evidence.py sample "$BOSS_GATE_RUNTIME_EVIDENC
 if [ -n "${BOSS_GATE_PGDATA:-}" ]; then
     python3 infra/gate-runner/runtime-evidence.py watch "$BOSS_GATE_RUNTIME_EVIDENCE" 15 &
 fi
-echo "gate-runner: building ${CARGO_BUILD_JOBS}-wide (cgroup quota), tests 2-wide"
+echo "gate-runner: building ${CARGO_BUILD_JOBS}-wide (cgroup quota), tests 2 threads per binary, binaries per infra/cargo-test-wide.sh"
 
 # THIS IS A LOADED GATE, SAID TO THE WEB SUITES (backlog ebb750cd). On
 # 2026-09-28 two trains went red in the web suite on tests that pass in
@@ -1953,7 +1998,12 @@ fi
 # every cloned source is newer than every seeded artifact (646c0ade). It
 # is added to an unreadable receipt too — a run that died is exactly
 # the one whose build a reader may want to rule a stale artifact out of.
-SUMMARY=$(python3 - "$RECEIPT" "$HEAD_SHA" "${SEED_ORDER:-}" <<'PY'
+#
+# `runner_source` / `runner_sha256` (and `runner_fallback_reason` when
+# there is one) name the script that produced this receipt — the
+# "runner provenance" block at the top (backlog e3100bc8).
+SUMMARY=$(python3 - "$RECEIPT" "$HEAD_SHA" "${SEED_ORDER:-}" \
+    "${RUNNER_SOURCE:-}" "${RUNNER_SHA256:-}" "${RUNNER_FALLBACK_REASON:-}" <<'PY'
 import json, sys
 def with_order(body):
     if isinstance(body, dict) and sys.argv[3]:
@@ -1961,6 +2011,11 @@ def with_order(body):
             body["seed_order"] = json.loads(sys.argv[3])
         except ValueError:
             body["seed_order"] = {"unparsed": sys.argv[3]}
+    if isinstance(body, dict) and sys.argv[4]:
+        body["runner_source"] = sys.argv[4]
+        body["runner_sha256"] = sys.argv[5] or None
+        if sys.argv[6]:
+            body["runner_fallback_reason"] = sys.argv[6]
     return body
 try:
     print(json.dumps(with_order(json.load(open(sys.argv[1]))), separators=(",", ":")))

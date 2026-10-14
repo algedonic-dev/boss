@@ -222,8 +222,8 @@ async fn record_snapshot(mut snapshot: Value) -> Result<()> {
         .ambient_actor()
         .context("native recorder has no execution identity")?
         .to_string();
-    let base = crate::gate::resolve_jobs_base(None)?;
-    let http = crate::gate::machine_client_with(
+    let base = crate::sor_client::resolve_jobs_base(None)?;
+    let http = crate::sor_client::machine_client_with(
         reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)),
     )?;
     let id = text(&snapshot, "capture_id")?.to_string();
@@ -231,7 +231,7 @@ async fn record_snapshot(mut snapshot: Value) -> Result<()> {
     let body = json!({"id":id,"kind":KIND,"subject":{"subject_kind":"custom","id":snapshot["namespace"]},
         "title":"Explicit native runtime roster snapshot","owner_id":actor,"priority":"standard","status":"open","tags":["native-roster"],
         "metadata":{"source":SOURCE,"namespace":snapshot["namespace"],"call_id":snapshot["call_id"],"payload_sha256":snapshot["payload_sha256"]}});
-    crate::gate::api_at_signed(
+    crate::sor_client::api_at_signed(
         &http,
         &base,
         reqwest::Method::POST,
@@ -241,7 +241,7 @@ async fn record_snapshot(mut snapshot: Value) -> Result<()> {
     )
     .await?;
     let read = || async {
-        let held = crate::gate::api_at_signed(
+        let held = crate::sor_client::api_at_signed(
             &http,
             &base,
             reqwest::Method::GET,
@@ -283,7 +283,7 @@ async fn record_snapshot(mut snapshot: Value) -> Result<()> {
     let path = format!("/api/jobs/{id}/steps/{sid}");
     if capture["status"] != "completed" {
         if capture["status"] == "ready" {
-            crate::gate::api_at_signed(
+            crate::sor_client::api_at_signed(
                 &http,
                 &base,
                 reqwest::Method::POST,
@@ -298,7 +298,7 @@ async fn record_snapshot(mut snapshot: Value) -> Result<()> {
         if active["status"] != "active" || active["assignee_id"] != actor {
             bail!("capture is not owned by this recorder");
         }
-        crate::gate::api_at_signed(
+        crate::sor_client::api_at_signed(
             &http,
             &base,
             reqwest::Method::PATCH,
@@ -313,7 +313,7 @@ async fn record_snapshot(mut snapshot: Value) -> Result<()> {
         {
             bail!("capture evidence did not read back");
         }
-        crate::gate::api_at_signed(
+        crate::sor_client::api_at_signed(
             &http,
             &base,
             reqwest::Method::PUT,
@@ -334,7 +334,7 @@ async fn record_snapshot(mut snapshot: Value) -> Result<()> {
     let terminal = step(&held, "recorded")?;
     if terminal["status"] != "completed" {
         let tid = text(terminal, "id")?;
-        crate::gate::api_at_signed(
+        crate::sor_client::api_at_signed(
             &http,
             &base,
             reqwest::Method::PUT,

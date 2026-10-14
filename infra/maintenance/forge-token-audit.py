@@ -231,8 +231,18 @@ READER = json.dumps({
 #
 # NEVER A REASON TO STOP. No mount, a blank slot, a slot the reader
 # refuses, a host off the list, no library beside this file, a child that
-# will not start or hangs: the read goes out exactly as it did before, and
-# the reader (or this function) says why on stderr, without the value.
+# will not start or hangs: the read goes out exactly as it did before.
+# NOT EVERY ONE OF THOSE IS SAID (review d434e1b0 F3, backlog ce72aea9;
+# this paragraph used to promise stderr for all of them). A slot the
+# reader refuses and a host off its list are said by the reader, and a
+# child that will not start, hangs or answers something that is not one
+# header is said by this function — on stderr, without the value. No
+# mount, an empty mount and a blank slot are SILENT by the reader's own
+# rule (NEVER A REFUSAL in secret-header.sh: every host looked like that
+# until the broker's first mint), and so is a token directory this
+# account cannot enter, because the slot's existence test fails inside
+# it and it reads as no mount. No library beside this file is silent
+# too: TOKEN_READER's first line exits 0 without a word.
 SECRET_LIB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           os.pardir, "lib", "secret-header.sh")
 # sh -c <this> forge-token-audit <library> <url>
@@ -287,6 +297,18 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# NOR THROUGH A PROXY (backlog 50708d76, F-a of review 0a666c59). The
+# reader withholds the token from a request CURL would proxy, judged by the
+# variables curl reads; urllib's default opener reads its own, and for an
+# http URL that includes uppercase HTTP_PROXY, which curl ignores — so the
+# token the reader admitted went to whatever HTTP_PROXY named (measured by
+# the reviewer through a loopback stub). An empty ProxyHandler takes no
+# proxy from the environment or anywhere else: the one host the reader
+# judged is the one host this request can reach, whatever the shell holds.
+def _opener():
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
 def load_registry(registry_json, registry_url):
     """Return (rows, limit_message). rows is None when the registry was not
     read; limit_message says why when a configured source failed. Neither
@@ -305,7 +327,7 @@ def load_registry(registry_json, registry_url):
         headers.update(machine_token_headers(url))
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.build_opener(_NoRedirect).open(req, timeout=10) as resp:
+            with _opener().open(req, timeout=10) as resp:
                 return json.loads(resp.read().decode("utf-8")), None
         except (OSError, ValueError) as e:
             # URLError (and its HTTPError subclass) are OSErrors; a

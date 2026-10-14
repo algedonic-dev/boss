@@ -2,7 +2,9 @@
 # forge-converge-launch — WHICH forge-converge.sh this tick runs. Installed
 # by infra/forge/install.sh as a root-owned copy outside every tree
 # (/usr/local/libexec/boss/forge-converge-launch), and it is what
-# forge-converge.service starts. It sources nothing.
+# forge-converge.service starts. It sources nothing. It is replaced only
+# from a generation marked good, and never by a copy that does not parse
+# (review 5f3736a2, F5; install.sh says why).
 #
 # WHY A LAUNCHER (backlog a604a35b). The forge converge is the loop that
 # installs this host's repairs, and since this car it runs from the tree

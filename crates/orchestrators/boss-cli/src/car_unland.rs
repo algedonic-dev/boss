@@ -194,7 +194,7 @@ pub(crate) fn read_main(
     Ok(MainReading {
         main,
         merge: merge_full,
-        read_at: crate::gate::stamp(now),
+        read_at: crate::sor_client::stamp(now),
         carries,
     })
 }
@@ -400,7 +400,7 @@ pub(crate) async fn unland(
     dry_run: bool,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     // The actor FIRST: a write nobody names is refused, and the refusal
     // costs a line rather than a half-unlanded car (5083d6f5).
     if !dry_run {

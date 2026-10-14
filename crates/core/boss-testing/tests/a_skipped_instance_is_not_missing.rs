@@ -541,12 +541,10 @@ fn finish_block() -> String {
 }
 
 fn run_finish(dir: &Path, stage: &str, outcome: &str, exit: i32) -> serde_json::Value {
-    let snap = dir.join("snap");
-    write_file(&snap, "");
     let script = format!(
-        "set -euo pipefail\nREPO=x\nBOSS_RUNNER_SNAPSHOT={snap}\nOUTCOME='{outcome}'\nSTAGE='{stage}'\n\
+        "set -euo pipefail\nREPO=x\nCONVERGE_STATE={state}\nOUTCOME='{outcome}'\nSTAGE='{stage}'\n\
          answer_converge_requests() {{ :; }}\n. {lib}\n{block}\ntrap _finish EXIT\nexit {exit}\n",
-        snap = snap.display(),
+        state = dir.join("converge").display(),
         lib = repo_root().join(RUN_SUMMARY).display(),
         block = finish_block()
     );

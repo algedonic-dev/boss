@@ -57,7 +57,7 @@
   <Breadcrumb to={href('/it/registry/dispatcher')}>← Dispatcher cascade</Breadcrumb>
   <PageHeader
     eyebrow="Platform · Dispatcher rules"
-    title="Dispatcher rules"
+    title="Rule authoring"
     subtitle={loading
       ? 'Loading…'
       : error

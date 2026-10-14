@@ -39,7 +39,7 @@
 //! assertion message here prints a slot's content, only whether a header
 //! file came and what mode it had.
 
-use boss_testing::{create_dir, repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{create_dir, repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -198,7 +198,7 @@ impl Chore {
                 format!("set -euo pipefail\nsaid=$({chore})\nprintf '%s\\n' \"$said\"\n")
             }
         };
-        let out = Command::new("bash")
+        let out = without_proxy(&mut Command::new("bash"))
             .arg("-c")
             .arg(&text)
             .env("BOSS_JOBS_URL", "http://jobs.test:7900")

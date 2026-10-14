@@ -23,7 +23,7 @@
 //! ids it was asked to infer and fails for a chosen set. The same
 //! shape as `gate_sh.rs` overriding `df` via `BOSS_GATE_DF_CMD`.
 
-use boss_testing::repo_root;
+use boss_testing::{repo_root, without_proxy};
 
 const SCRIPT: &str = "infra/ml/run-inference-batch.sh";
 
@@ -110,6 +110,7 @@ fn run(fake_api: Fake) -> RunOutcome {
 
     let summary_file = dir.join("summary.json");
     let mut cmd = std::process::Command::new("bash");
+    without_proxy(&mut cmd);
     cmd.arg(root.join(SCRIPT))
         .env("BOSS_ML_CURL", &fake)
         .env("BOSS_RUN_SUMMARY_FILE", &summary_file)
@@ -550,6 +551,7 @@ fn run_token(case: TokenCase) -> TokenRun {
     let summary_file = dir.join("summary.json");
     // `exec` keeps the pid the fake curl is told to kill.
     let mut cmd = std::process::Command::new("bash");
+    without_proxy(&mut cmd);
     cmd.arg("-c")
         .arg("echo $$ > \"$FAKE_PIDFILE\"; exec bash \"$0\"")
         .arg(root.join(SCRIPT))

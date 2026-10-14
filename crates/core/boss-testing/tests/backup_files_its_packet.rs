@@ -329,6 +329,14 @@ fn assert_rebased(name: &str, script: &str, dir: &Path) {
 
 /// Run the manifest's containers the way Kubernetes would.
 fn run_pod(tag: &str, fail: Fail) -> PodRun {
+    run_pod_seeded(tag, fail, &[])
+}
+
+/// `run_pod`, on a backups volume already holding earlier nights' files:
+/// each `(name, age in hours)` is written before the pod runs and its
+/// mtime set that far back, so a retention `find -mtime` judges it the
+/// way it judges a real night's file.
+fn run_pod_seeded(tag: &str, fail: Fail, seed: &[(&str, u64)]) -> PodRun {
     let yaml = manifest();
     // No thread id in the path: `ThreadId(3)` puts parentheses in a
     // directory name the container scripts then have to quote. Each
@@ -338,6 +346,19 @@ fn run_pod(tag: &str, fail: Fail) -> PodRun {
     let dir = scratch::scratch_dir(&format!("boss-backup-pod-{tag}"));
     for sub in ["backup", "gcs", "bin", "tmp", "files"] {
         scratch::create_dir(&dir.join(sub));
+    }
+    for (name, hours) in seed {
+        let path = dir.join("backup").join(name);
+        scratch::write_file(&path, "an earlier night's file\n");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|f| {
+                f.set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600),
+                )
+            })
+            .unwrap_or_else(|e| panic!("dating {}: {e}", path.display()));
     }
     // The file store, laid out the way LocalDiskStorage writes it:
     // `sha256/<hex>` under the root. Two objects, so a count that is
@@ -998,4 +1019,61 @@ fn a_missing_store_never_closes_the_packet_green() {
         r.log
     );
     assert!(r.closes().is_empty(), "{:?}\n{}", r.closes(), r.log);
+}
+
+// ------------------------------------------------------------ retention
+
+/// THE DEFECT (backlog 3be7e44e, estate alarm, measured 2026-10-09).
+/// boss/boss-backups (19.5 GiB) fell under its 4 GiB floor: the dump leg
+/// kept FIFTEEN nights (`-mtime +14`) while the nightly dump grew from
+/// 105M on 2026-09-20 to 1.6G on 2026-10-09, so every night added a dump
+/// far larger than the one it pruned — used 8.70 GiB on 10-03, 15.57 GiB
+/// on 10-09, read off the run step of each maintenance-backup packet.
+/// The GCS bucket is the one offsite copy and keeps 21 dumps, so the
+/// volume's local history was a second copy of what the bucket holds.
+/// It now keeps the three newest dumps, as it already kept the three
+/// newest file-store archives, for the reason the header gives for those:
+/// enough to survive a bad night.
+#[test]
+fn the_volume_keeps_the_three_newest_dumps() {
+    let r = run_pod_seeded(
+        "retention",
+        Fail::Nothing,
+        &[
+            ("boss-20261008-091012.sql.gz", 25),
+            ("boss-20261007-091013.sql.gz", 49),
+            ("boss-20261006-091011.sql.gz", 73),
+            ("boss-20260926-091010.sql.gz", 313),
+        ],
+    );
+    assert!(r.succeeded(), "the happy path must pass:\n{}", r.log);
+    let dumps: Vec<&str> = r
+        .backups
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .filter(|n| {
+            n.starts_with("boss-") && !n.starts_with("boss-files-") && n.ends_with(".sql.gz")
+        })
+        .collect();
+    assert_eq!(
+        dumps.len(),
+        3,
+        "the volume must hold tonight's dump and the two before it, and no older — the bucket \
+         keeps 21, and fifteen local nights of a growing dump filled boss-backups (3be7e44e): \
+         {dumps:?}\n{}",
+        r.log
+    );
+    for kept in ["boss-20261008-091012.sql.gz", "boss-20261007-091013.sql.gz"] {
+        assert!(
+            dumps.contains(&kept),
+            "{kept} is one of the three newest and must stay: {dumps:?}"
+        );
+    }
+    for gone in ["boss-20261006-091011.sql.gz", "boss-20260926-091010.sql.gz"] {
+        assert!(
+            r.log.contains(gone),
+            "the prune of {gone} must be printed, never silent:\n{}",
+            r.log
+        );
+    }
 }

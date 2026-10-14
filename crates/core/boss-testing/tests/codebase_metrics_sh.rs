@@ -37,7 +37,7 @@
 //! which is what breaks git in a gate workspace — cannot decide whether
 //! the test passes.
 
-use boss_testing::repo_root;
+use boss_testing::{repo_root, without_proxy};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -197,7 +197,7 @@ impl Fixture {
     }
 
     fn try_run(&self, args: &[&str]) -> std::process::Output {
-        Command::new("bash")
+        without_proxy(&mut Command::new("bash"))
             .arg(script())
             .args(args)
             .arg("--repo")
@@ -451,7 +451,7 @@ fn the_row_carries_the_two_headline_ratios_and_says_what_it_could_not_count() {
 
 #[test]
 fn a_repo_it_cannot_read_refuses_rather_than_reporting_an_empty_series() {
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(script())
         .args(["series", "--repo", "/nonexistent-codebase-metrics-repo"])
         .output()
@@ -552,7 +552,7 @@ fn a_machine_with_no_counter_says_so_instead_of_reporting_zero() {
     // or a probe can tell apart from a count.
     let fx = Fixture::with_a_leaked_branch("no-counter");
     let absent = fx.dir.join("no-such-counter");
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(script())
         .args(["snapshot", "--repo"])
         .arg(&fx.dir)
@@ -614,10 +614,16 @@ fn a_machine_with_no_counter_says_so_instead_of_reporting_zero() {
 const PACKET: &str = "11111111-2222-4333-8444-555555555555";
 
 /// A stub jobs API: two GETs and one PATCH, with every PATCH body logged.
-/// argv: port, log path, the `measured.head` the closed packet carries,
-/// the readiness marker, the open packet's id.
+/// argv: port (0 = the kernel's pick), log path, the `measured.head` the
+/// closed packet carries, the readiness marker, the open packet's id.
+///
+/// The stub binds port 0 ITSELF and writes the port it got into the
+/// readiness marker, renamed into place whole. The test used to bind 0,
+/// read the port, release it, and hand the number over — and between the
+/// release and the stub's bind any `bind(0)` on the host could take it
+/// (review 465e723f F3: the gate runs four test binaries at once).
 const STUB: &str = r#"
-import http.server, json, sys, pathlib
+import http.server, json, os, sys, pathlib
 port = int(sys.argv[1]); log = sys.argv[2]; last_head = sys.argv[3]; bound = sys.argv[4]
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -648,7 +654,8 @@ class H(http.server.BaseHTTPRequestHandler):
         self._reply(200)
 
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
-pathlib.Path(bound).write_text("bound\n")
+pathlib.Path(bound + ".part").write_text("%d\n" % srv.server_address[1])
+os.replace(bound + ".part", bound)
 srv.serve_forever()
 "#;
 
@@ -669,19 +676,14 @@ fn the_filing_run_patches_the_open_packet_and_starts_at_the_last_filed_head() {
     let fx = Fixture::new("file");
     let last_head = fx.sha("adds only");
 
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port();
     let stub_py = fx.dir.join("stub.py");
     let log = fx.dir.join("patches.log");
     let bound = fx.dir.join("bound");
     boss_testing::write_file(&stub_py, STUB);
 
-    let mut child = Command::new("python3")
+    let mut child = without_proxy(&mut Command::new("python3"))
         .arg(&stub_py)
-        .arg(port.to_string())
+        .arg("0")
         .arg(&log)
         .arg(&last_head)
         .arg(&bound)
@@ -707,8 +709,13 @@ fn the_filing_run_patches_the_open_packet_and_starts_at_the_last_filed_head() {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    let port: u16 = std::fs::read_to_string(&bound)
+        .expect("read the stub's port")
+        .trim()
+        .parse()
+        .expect("the stub wrote the port it bound");
 
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .arg(script())
         .args(["file", "--repo"])
         .arg(&fx.dir)

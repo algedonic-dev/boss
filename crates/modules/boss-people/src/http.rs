@@ -33,15 +33,6 @@ pub struct PeopleApiState<R: PeopleRepository> {
     /// exception is pay: None is no compensation grant, so reads
     /// redact it (see `compensation_scope`).
     pub policy: Option<Arc<dyn PolicyClient>>,
-    /// SubjectKind registry — opt-in validator for tenant-extensible
-    /// Subject discriminators. Today the boss-people surface accepts
-    /// closed Subject variants (Account, Employee, Vendor, ...) so
-    /// the validator never fires; it lands here as scaffolding for
-    /// the future boss-accounts carve-out + account_type lift, which
-    /// will introduce Subject::Custom into account-shaped writes.
-    /// See `boss-jobs::http::check_custom_subject` for the canonical
-    /// shape this mirrors.
-    pub subject_kinds: Option<Arc<dyn boss_subject_kinds_client::SubjectKindsClient>>,
     /// Authoritative clock. See `boss-clock-client`.
     pub clock: Arc<dyn boss_clock_client::ClockClient>,
 }
@@ -566,7 +557,6 @@ mod tests {
             people,
             publisher: None,
             policy: Some(policy),
-            subject_kinds: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
         })
     }
@@ -582,7 +572,6 @@ mod tests {
             people,
             publisher: None,
             policy: Some(policy),
-            subject_kinds: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
         })
     }
@@ -742,7 +731,6 @@ mod tests {
             people,
             publisher: None,
             policy: Some(policy),
-            subject_kinds: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
         });
 
@@ -879,7 +867,6 @@ mod tests {
             people,
             publisher: None,
             policy,
-            subject_kinds: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
         })
     }

@@ -227,13 +227,17 @@ pub(super) fn dock(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
             // lane, each named by the brake that holds it. They are
             // counted in the garage, so they are not in this region's
             // count — but they stand on the dock and the kpi below asks
-            // which cars cannot board, so they are in its answer.
+            // which cars cannot board, so they are in its answer. They
+            // are said as AWAITING RELEASE (backlog ed8e5c85): on
+            // 2026-10-09 David looked for held cars in the Garage, whose
+            // held GREENS are another thing. The dock's own panel lists
+            // them, each with its Release control.
             let held_kinds = held_by_kind(&status.held_cars);
             let clear_why = if held_kinds.is_empty() {
                 clear_why
             } else {
                 format!(
-                    "{clear_why} · {} held: {held_kinds}",
+                    "{clear_why} · {} held — awaiting release ({held_kinds})",
                     status.held_cars.len()
                 )
             };
@@ -575,8 +579,9 @@ mod tests {
             dock.why
         );
         assert!(
-            dock.why
-                .contains("3 held: 2 on an operator's hold, 1 on a red re-gate"),
+            dock.why.contains(
+                "3 held — awaiting release (2 on an operator's hold, 1 on a red re-gate)"
+            ),
             "{}",
             dock.why
         );

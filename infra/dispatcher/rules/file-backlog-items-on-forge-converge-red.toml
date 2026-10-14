@@ -1,0 +1,72 @@
+# The forge host's own converge is judged by its own record (delta
+# review aa901496 of car 14142ab6, the ALARM note; backlog 62b09c57).
+# forge-converge.service runs every ten minutes and closes its
+# maintenance-forge-converge packet `failed` when any carried step reds
+# it. Four of those reds stand until a person acts, and each was only a
+# failed packet every ten minutes:
+#
+#   - a REFUSED tree: the forge's main rewound or was replaced (the
+#     2026-09-25 shape), or root's tree is not root's own — root-tree.sh
+#     keeps the tree where it was, and the fix is a person reading both
+#     commits (infra/forge/OPERATIONS.md, failure mode 9);
+#   - HELD units: a command a unit names is not an executable file, so
+#     install.sh replaces no unit file and every unit keeps running as
+#     it was installed;
+#   - a REFUSED host check: the machine no longer holds the address the
+#     estate declares for the forge, so every tick exits 78 before it
+#     fetches anything and the fix cannot arrive by merge (added
+#     2026-10-09, a follow-up recorded on car ad35743a);
+#   - a RED from boss-gcp's runner credential push: its deposit key
+#     reaches a shell, boss-gcp refuses a signed key, or boss-gcp's
+#     receiver is older than the tree's past the grace (backlog
+#     1e50e66b, review f15070d2 of car 2c628718, B1).
+#
+# forge-converge.sh now leaves `output` on the run step with ONE line
+# per such state, in the shape the chore judge reads:
+#   RED forge-converge/root-tree refused: <root-tree.sh's own last line>
+#   RED forge-converge/units-held held: <the unit:command pairs>
+#   RED forge-converge/host-check refused: <infra/lib/host-check.sh's why>
+#   RED runner-credential-send/<kind> refused: <the sender's why> — boss-gcp's
+#     runner credential push: a key that reaches a shell, a signed key
+#     boss-gcp refuses, a stale receiver (backlog 1e50e66b, review f15070d2)
+# This rule fires when a converge packet closes `failed` and hands it to
+# that judge (maintenance.chore.file_reds): one backlog-item per route,
+# deduped while it is open, so a refusal repeated 144 times a day is ONE
+# item — and a closed item files again, because a recurrence after a fix
+# is a new fact.
+#
+# NO FALLBACK ROUTE, ON PURPOSE. A converge red for any other reason —
+# a fetch that failed, a deposit, protect-main, the off-site push —
+# prints no RED line and files nothing: several of those pass by
+# themselves on the next tick, and an item per passing red is the alarm
+# nobody reads. The handler notes `judged` on the packet either way. The
+# `no_red_failure_route` arg stays the break-glass deposit's alone
+# (chore_file_reds.rs pins it there; backlog e4a9a9b3).
+#
+# NOT THE CLUSTER CONVERGE. A HELD cluster converge exits 0 — a hold is
+# a decision, not a failure — so no `failed` close exists to judge; a
+# hold that outlives its purpose is raised by the converge itself,
+# through its own alert door (cluster-deploy-lib.sh converge_hold_report).
+[[rule]]
+name = "file-backlog-items-on-forge-converge-red"
+why = """
+A CROSS-PROTOCOL REACTOR: maintenance-forge-converge -> backlog-item,
+which no single Workflow consequence can express — the converge's
+protocol records its own failure but cannot open another kind's packet.
+The cadence-silence sweep watches ARRIVAL only, and the unit opens and
+closes a packet `failed` every ten minutes, so a refused rewind of main
+or a HELD install arrives on time and raises nothing: review aa901496
+found the operator's first-hour read was the only alarm, on the loop
+that installs the host's own repairs. No authority widened: the handler
+is the crawl's judge (maintenance.chore.file_reds), its only writes are
+standard backlog-items owned by the platform owner and one `judged` note
+on the converge's own packet, and the dedup key is the route the
+converge prints. The same handler as
+file-backlog-items-on-machine-token-push-red, likewise without the
+break-glass rule's fallback route for a failure that prints no RED line.
+"""
+on_event = "jobs.job.closed"
+when = 'kind = "maintenance-forge-converge" AND outcome = "failed"'
+[[rule.do]]
+handler = "maintenance.chore.file_reds"
+args = { step = "\"run\"", design = "\"c98c79aa\"", area = "\"forge\"" }

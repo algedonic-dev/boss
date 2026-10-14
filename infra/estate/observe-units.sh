@@ -431,7 +431,18 @@ if [ -r "$(dirname "$0")/../lib/secret-header.sh" ]; then . "$(dirname "$0")/../
 if command -v machine_token_header >/dev/null 2>&1; then
     machine_token_header MT_HDR "$JOBS_API" || MT_HDR=""
 fi
+# A TIME BOUND, by observe-lib.sh post_observation's variable and rule
+# (backlog df38075a, the half of F1 the first car left): this curl had
+# none, in a oneshot whose start timeout systemd leaves off, so a system
+# of record that accepts and never answers held the tick, its timer and
+# the header for as long as it liked. Curl exit 28 fails the unit like
+# any other unreachable API. Whole seconds; not a number, or 0 (curl's
+# "no bound"), is the default.
+case "${OBSERVE_POST_MAX_TIME:-}" in
+    '' | *[!0-9]* | 0*) OBSERVE_POST_MAX_TIME=60 ;;
+esac
 resp=$(printf '%s' "$observation" | curl -s -w '\n%{http_code}' \
+    --connect-timeout 10 --max-time "$OBSERVE_POST_MAX_TIME" \
     -X POST -H 'content-type: application/json' \
     ${MT_HDR:+-H "$MT_HDR"} \
     -H 'x-boss-user: {"id":"automation:estate-observer-units","role":"platform-admin","access_tier":"operator"}' \

@@ -65,14 +65,6 @@ async fn malformed_upstream() -> String {
     format!("http://{addr}")
 }
 
-/// An address nothing listens on: bound, then released.
-async fn dark() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    format!("http://{addr}")
-}
-
 fn router(people_base: String, jobs_base: String) -> Router {
     let origin = Url::parse("https://boss.test").unwrap();
     passkey_router(Arc::new(PasskeyState {
@@ -110,7 +102,10 @@ async fn call(router: &Router, method: &str, path: &str, body: Value) -> (Status
 #[tokio::test]
 async fn an_unreachable_jobs_service_is_named_without_its_url() {
     let upstream = malformed_upstream().await;
-    let jobs = dark().await;
+    // An address nothing listens on, HELD for the whole test rather than
+    // bound and released (review 465e723f F3).
+    let dark = boss_testing::dark_port();
+    let jobs = dark.base.clone();
     let router = router(upstream, jobs.clone());
     let (status, body) = call(
         &router,

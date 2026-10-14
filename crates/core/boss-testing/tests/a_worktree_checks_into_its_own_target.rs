@@ -115,6 +115,137 @@ impl Fixture {
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
     }
+
+    /// Source the helper in `cwd`, call `wt_bound_build_jobs`, and
+    /// report what `CARGO_BUILD_JOBS` became. `jobs` is the ambient
+    /// value, or `None` for unset — the pod's own case, since nothing
+    /// in its manifest sets one.
+    fn bound(&self, cwd: &Path, jobs: Option<&str>) -> (i32, String, String) {
+        let script = format!(
+            "set -u\n. '{}' || exit 2\nwt_bound_build_jobs || exit $?\necho \"jobs=${{CARGO_BUILD_JOBS:-unset}}\"\n",
+            repo_root().join(HELPER).display()
+        );
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(script)
+            .current_dir(cwd)
+            .env_remove("WT_JOBS");
+        match jobs {
+            Some(j) => cmd.env("CARGO_BUILD_JOBS", j),
+            None => cmd.env_remove("CARGO_BUILD_JOBS"),
+        };
+        let out = cmd.output().expect("run the helper");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+}
+
+/// The bound pod-build.env declares, read from the file rather than
+/// retyped (the same reading wt_cargo_sh.rs makes).
+fn pod_bound() -> String {
+    std::fs::read_to_string(repo_root().join("infra/dev/pod-build.env"))
+        .expect("infra/dev/pod-build.env")
+        .lines()
+        .find_map(|l| l.strip_prefix("CARGO_BUILD_JOBS="))
+        .expect("pod-build.env sets CARGO_BUILD_JOBS")
+        .trim()
+        .to_string()
+}
+
+/// THE DEFECT OF BACKLOG 9ecd12ea, ASK 3. `infra/gate.sh --lint` runs
+/// `cargo clippy --workspace` in a builder's worktree, and nothing bounded
+/// its width: cargo takes one job per CPU, and on the dev pod `nproc`
+/// reads the NODE (32), not the container's cgroup (16 CPU / 32Gi).
+/// Measured 2026-10-10 from the memory watch's ring: one such check held
+/// ten clippy-drivers at once (3.6 GB summed, the two largest 1.10 and
+/// 1.05 GB), more than the four any wt-cargo builder build is allowed.
+/// A linked builder worktree must check at the width wt-cargo builds at.
+#[test]
+fn a_builder_worktrees_check_runs_at_the_builder_width_and_says_so() {
+    let f = Fixture::new("jobs-builder");
+    let wt = f.worktree("agent-0123abcd");
+
+    let (rc, stdout, stderr) = f.bound(&wt, None);
+    assert_eq!(rc, 0, "{stdout}{stderr}");
+    assert!(
+        stdout.contains("jobs=4"),
+        "a builder worktree's check runs 4 wide, as wt-cargo builds it: {stdout}{stderr}"
+    );
+    assert!(
+        stderr.contains("9ecd12ea") && stderr.contains('4'),
+        "the bound is said, with the packet that measured it: {stderr:?}"
+    );
+}
+
+/// The operator's own linked worktree takes the pod's bound, the one
+/// wt-cargo gives it — read from pod-build.env, never retyped.
+#[test]
+fn an_operator_linked_worktrees_check_runs_at_the_pod_bound() {
+    let f = Fixture::new("jobs-operator");
+    let wt = f.worktree("feature-x");
+
+    let (rc, stdout, stderr) = f.bound(&wt, None);
+    assert_eq!(rc, 0, "{stdout}{stderr}");
+    assert!(
+        stdout.contains(&format!("jobs={}", pod_bound())),
+        "{stdout}{stderr}"
+    );
+}
+
+/// THE CASE THAT MUST NOT NARROW. The cluster gate runner and forge CI
+/// are main checkouts on machines sized for one build; bounding them to
+/// the dev pod's share would slow the judge to suit a shared box (the
+/// argument pod-build.env makes against `.cargo/config.toml`).
+#[test]
+fn a_main_checkouts_check_keeps_cargos_own_width() {
+    let f = Fixture::new("jobs-main");
+
+    let (rc, stdout, stderr) = f.bound(&f.main, None);
+    assert_eq!(rc, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("jobs=unset"), "{stdout}{stderr}");
+    assert_eq!(stderr, "", "nothing was changed, so nothing is said");
+}
+
+/// A width the caller already chose — wt-cargo's own, or a human's —
+/// is kept: the helper bounds an UNBOUNDED cargo, nothing else.
+#[test]
+fn a_width_already_chosen_is_kept() {
+    let f = Fixture::new("jobs-explicit");
+    let wt = f.worktree("agent-explicit");
+
+    let (rc, stdout, stderr) = f.bound(&wt, Some("2"));
+    assert_eq!(rc, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("jobs=2"), "{stdout}{stderr}");
+    assert_eq!(stderr, "", "nothing was changed, so nothing is said");
+}
+
+/// §9a — the builder width lives ONCE, in the helper: wt-cargo builds
+/// at it and gate.sh checks at it, and neither spells the number.
+#[test]
+fn wt_cargo_and_the_gate_both_take_the_width_from_here() {
+    let helper = std::fs::read_to_string(repo_root().join(HELPER)).expect(HELPER);
+    assert!(
+        helper.contains("wt_build_jobs()") && helper.contains("wt_bound_build_jobs()"),
+        "{HELPER} defines both the width and the decision"
+    );
+    for (path, call) in [
+        ("infra/dev/wt-cargo", "wt_build_jobs"),
+        ("infra/gate.sh", "wt_bound_build_jobs"),
+    ] {
+        let text = std::fs::read_to_string(repo_root().join(path))
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert!(
+            text.contains(call),
+            "{path} must call {call}() rather than choose a width itself"
+        );
+        assert!(
+            !text.contains("WT_JOBS:-4"),
+            "{path} must not retype the builder width — that is the drift §9a names"
+        );
+    }
 }
 
 /// THE DEFECT. A builder's worktree must not check into the dir the

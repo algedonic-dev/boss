@@ -83,8 +83,19 @@ pub fn judge(job: &Json, d: &Declared, now: DateTime<Utc>) -> Result<Option<Over
         // No retrospective expectation on legacy or unmarked workers.
         return Ok(None);
     };
-    if expectation.get("schema").and_then(Json::as_u64) != Some(1) {
+    if !matches!(
+        expectation.get("schema").and_then(Json::as_u64),
+        Some(1 | 2)
+    ) {
         return Err("receipt expectation has an unsupported schema".into());
+    }
+    if expectation["schema"] == 2
+        && !boss_jobs::agent_budget::observer_start_expectation_valid(
+            expectation,
+            step["assignee_id"].as_str().unwrap_or(""),
+        )
+    {
+        return Err("launcher observation expectation is incomplete or names another actor".into());
     }
     let minutes = expectation
         .get("minutes")
@@ -104,6 +115,24 @@ pub fn judge(job: &Json, d: &Declared, now: DateTime<Utc>) -> Result<Option<Over
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "receipt watch read no execution actor".to_string())?;
     if let Some(receipt) = job.get("metadata").and_then(|m| m.get(&d.receipt_key)) {
+        if expectation["schema"] == 2 {
+            let assigned = step
+                .get("assignee_id")
+                .and_then(Json::as_str)
+                .ok_or("observer receipt has no assigned actor")?;
+            if !boss_jobs::agent_budget::observer_start_receipt_matches(
+                expectation,
+                receipt,
+                packet,
+                assigned,
+            ) {
+                return Err(
+                    "launcher observation, input digests or native incarnation cannot be verified"
+                        .into(),
+                );
+            }
+            return Ok(None);
+        }
         let shape = receipt.as_object().is_some_and(|m| m.len() == 3);
         let assigned = step.get("assignee_id").and_then(Json::as_str);
         if !shape
@@ -554,6 +583,36 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn launcher_observation_is_a_distinct_opt_in_receipt_and_not_a_worker_self_claim() {
+        let mut job = printed_prompt();
+        job["steps"][1]["metadata"]["start_expected"] = json!({"schema":2,"minutes":15,"observer":"launcher","actor":"agent-codex","prompt_sha256":"a".repeat(64),"snapshot_sha256":"b".repeat(64)});
+        job["metadata"]["worker_started"] = json!({"schema":2,"run":"run-1","observer":"launcher","actor":"agent-codex",
+            "prompt_sha256":"a".repeat(64),"snapshot_sha256":"b".repeat(64),
+            "binding":{"job_uid":"job","pod_uid":"pod","container_id":"containerd://one"},
+            "acknowledgment":{"schema":1,"start_read":true,"run":"run-1","prompt_sha256":"a".repeat(64),"snapshot_sha256":"b".repeat(64)}});
+        assert!(
+            judge(&job, &declaration(), at("2026-10-03T12:20:00Z"))
+                .unwrap()
+                .is_none()
+        );
+        for pointer in [
+            "/metadata/worker_started/observer",
+            "/metadata/worker_started/actor",
+            "/metadata/worker_started/prompt_sha256",
+            "/metadata/worker_started/binding/pod_uid",
+        ] {
+            let mut changed = job.clone();
+            *changed.pointer_mut(pointer).unwrap() = json!("");
+            assert!(
+                judge(&changed, &declaration(), at("2026-10-03T12:20:00Z")).is_err(),
+                "{pointer}"
+            );
+        }
+        job["steps"][1]["metadata"]["start_expected"] = json!({"schema":1,"minutes":15});
+        assert!(judge(&job, &declaration(), at("2026-10-03T12:20:00Z")).is_err());
     }
 
     #[test]

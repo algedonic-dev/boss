@@ -19,77 +19,55 @@
 //!   findings, at}`, the sha read from the forge, never typed. A
 //!   review's verdict was prose in a handback until this; now it is a
 //!   record ([`review_record`]).
-//! - `boss release <car> --review <run>` writes the release record on
-//!   the car's review step — `{sha, review, verdict, by, at, main_sha}`
-//!   ([`release_record`]) — and clears the hold, only when that run's
-//!   review [`vouches`] for the car at its current forge head.
+//! - `boss release <car> --review <run>` asks the jobs API's release
+//!   door, `POST /api/jobs/{car}/release`, with the head and main it
+//!   read from the forge and the shell it runs in ([`release`]). The
+//!   RULE is `boss_jobs::car_release` (backlog ed8e5c85). It lived here
+//!   until the yard needed the same act, and the yard cannot run a CLI.
+//!   The door writes `{sha, review, verdict, by, at, main_sha,
+//!   reviewer_model, agent_shell, run?}` on the car's review step and
+//!   clears the hold, only when that run's review vouches for the car at
+//!   that head. `by` is the caller the API authenticated.
 //! - The conductor, at boarding, reads the same record and asks the same
-//!   [`vouches`] of the named run in one GET: a release at another sha
-//!   is no release, and the car is held again (`mutating_verb::dock`).
+//!   [`vouches_with_executor`] of the named run in one GET: a release at
+//!   another sha is no release, and the car is held again
+//!   (`mutating_verb::dock`).
 //!
 //! THE BUILDER IS A RUN, NOT AN ACTOR (D5): the agent-run the car
 //! carries as `agent_run`, which the auto-park handler copies from the
 //! gate-run whose green filed or last refreshed it. A review by that run
-//! is no review.
-//!
-//! `main_sha` (D8, folding 23fbe4e3 as a record only) says which main
-//! the release was given against, so a later red traced to a stale hold
-//! is read off the record rather than re-derived. It is not re-checked:
-//! design 6af5acdf (2026-09-26) made the train gate the backstop.
-//!
-//! THE BUILDER DOES NOT RELEASE EITHER (car 3, design 7cedfa29 Q1,
-//! enforcement order design b08725c2 row A, after DR readiness
-//! 62dac114): `boss release`, in both its forms, refuses a shell whose
-//! `BOSS_AGENT_RUN` is the car's builder run ([`may_release`]), or is
-//! not a full run id. The refusal binds runs, never a person: a shell
-//! with no run is not refused, so the three-verb human road in `boss
-//! release --help` stands, and a person who gated the car inside a run
-//! of his own releases from a shell without it.
+//! is no review, and that run does not release the car in either form
+//! (`car_release::may_release_identity`, car 3 of design 7cedfa29). The
+//! refusal binds runs, never a person: a shell with no run is not
+//! refused, so the three-verb human road in `boss release --help`
+//! stands.
 //!
 //! WHAT A RELEASE RECORDS OF ITS SHELL, AND WHAT IT CANNOT (reviews
-//! 5aa91689 B1, c91ba45b B1'). Every release — the review's (`release`)
-//! and the bare one ([`BARE_RELEASE`]) — carries `agent_shell`
+//! 5aa91689 B1, c91ba45b B1'). Every release carries `agent_shell`
 //! (CLAUDECODE set) and, when one is exported, `run`, beside `by`
 //! ([`Releaser`]). So the record DISTINGUISHES an agent's shell from a
 //! person's, and names the run when there is one. It does NOT
-//! distinguish a dispatched builder from the operator session: a builder
-//! exports its run only in the one shell it gates from, so its later
-//! shells have none, and in the dev pod every agent shell — the
-//! operator's included — is a child of one process carrying the same
-//! session markers (measured 2026-09-30: the operator's shell reads
-//! CLAUDE_CODE_CHILD_SESSION=1 and the same CLAUDE_CODE_SESSION_ID as
-//! the subagents'). No field built on those markers is recorded, because
-//! it could not mean what its name says. Every field here is what the
-//! shell SAYS; a shell that unsets CLAUDECODE is recorded as a person's.
-//! The real fix is per-actor credentials (design 7cedfa29 D7).
-//!
-//! WHAT HOLDS REGARDLESS: a review-held car is released only on a
-//! RELEASE verdict recorded by a run that is not the builder's — `boss
-//! review` refuses the builder's run, and [`vouches`] refuses a verdict
-//! the builder's run recorded — so a builder's self-release can only act
-//! on another run's verdict at the car's current head.
-//!
-//! NOT HERE. A human's own-review road through his passkey session (the
-//! rest of Q1) is unbuilt. No server-side writer refuses the builder:
-//! the merge door cannot know which run a caller is, and the per-field
-//! `writer` declaration for `hold`, `hold_sha` and `release` (D7) waits
-//! on a credential door — `field_writer::RESOLVABLE_PRINCIPALS` is
-//! empty, and the viability lint refuses a writer no door resolves. The
-//! conductor does not read the shell fields at boarding.
+//! distinguish a dispatched builder from the operator session: in the
+//! dev pod every agent shell is a child of one process carrying the same
+//! session markers (measured 2026-09-30). Every field here is what the
+//! shell SAYS. The real fix is per-actor credentials (design 7cedfa29
+//! D7).
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::steps::Wire;
 
-/// The agent-run packet key a review's verdict lives under.
-pub(crate) const REVIEW_KEY: &str = "review";
-
-/// The verdict that releases a car.
-pub(crate) const RELEASE: &str = "release";
-
-/// Every verdict `boss review` records.
-pub(crate) const VERDICTS: [&str; 2] = [RELEASE, "changes"];
+// The rule's one copy, in core (backlog ed8e5c85). Re-exported so the
+// conductor, `boss review` and the bare release read it where they
+// always have.
+pub(crate) use boss_jobs::car_release::{
+    ExecutorRecordReader, ORIGINAL_VERDICT_KEY, RELEASE, REVIEW_KEY, VERDICTS, branch_of,
+    builder_run, immutable_record_resource, judgment_time, may_release, original_verdict_matches,
+    pinned_executor_requirement, read_executor_eligibility, vouches_with_executor,
+};
+#[cfg(test)]
+pub(crate) use boss_jobs::car_release::{release_record, reviewer_model, vouches};
 
 fn str_at<'a>(v: &'a Value, pointer: &str) -> &'a str {
     v.pointer(pointer)
@@ -102,122 +80,15 @@ fn short(id: &str) -> &str {
     &id[..8.min(id.len())]
 }
 
-/// The run that built this car: its `agent_run`, or `None` for a car
-/// gated by hand.
-pub(crate) fn builder_run(car: &Value) -> Option<&str> {
-    Some(str_at(car, "/metadata/agent_run")).filter(|s| !s.is_empty())
-}
-
-/// PURE: does `run`'s recorded review vouch for `car` at `head`? `Ok`
-/// only when every fact holds: the run is an agent-run that is not the
-/// car's builder, it records a review OF THIS CAR, the verdict is
-/// RELEASE, and it read exactly `head`. Each refusal names the fact.
-#[cfg(test)]
-pub(crate) fn vouches(run: &Value, car: &Value, head: &str) -> Result<(), String> {
-    executor_review_eligibility(car)?;
-    vouches_inner(run, car, head)
-}
-
-fn vouches_inner(run: &Value, car: &Value, head: &str) -> Result<(), String> {
-    let run_id = str_at(run, "/id");
-    let car_id = str_at(car, "/id");
-    if run_id.is_empty() {
-        return Err("the named review run carries no id".into());
-    }
-    if str_at(run, "/kind") != "agent-run" {
-        return Err(format!(
-            "{} is a {} packet, not an agent-run — a review verdict is recorded on the \
-             reviewer's run by boss review",
-            short(run_id),
-            str_at(run, "/kind")
-        ));
-    }
-    if builder_run(car) == Some(run_id) {
-        return Err(format!(
-            "run {} built this car (its agent_run) — the builder's review is no review",
-            short(run_id)
-        ));
-    }
-    // A DISPATCHED run names the packet and step it claimed (`boss
-    // dispatch` writes both). Held to them, a run opened on car A's
-    // review cannot vouch for car B (review 0545d1b1, 2026-09-30). A
-    // hand-filed run names none, and is judged as before.
-    let opened_on = str_at(run, "/metadata/packet");
-    if !opened_on.is_empty() {
-        if opened_on != car_id {
-            return Err(format!(
-                "run {} was opened on {}, not on car {} — a reviewer vouches only for the \
-                 car it was dispatched to",
-                short(run_id),
-                short(opened_on),
-                short(car_id)
-            ));
-        }
-        let step = str_at(run, "/metadata/step");
-        if step != boss_jobs::car::REVIEW_SLUG {
-            return Err(format!(
-                "run {} was opened on step `{step}` of car {}, not on its `{}` step",
-                short(run_id),
-                short(car_id),
-                boss_jobs::car::REVIEW_SLUG
-            ));
-        }
-    }
-    let Some(review) = run
-        .pointer(&format!("/metadata/{REVIEW_KEY}"))
-        .filter(|r| r.is_object())
-    else {
-        return Err(format!(
-            "run {} records no review verdict — the reviewer runs boss review <car> --verdict \
-             release inside its own run",
-            short(run_id)
-        ));
-    };
-    let reviewed = str_at(review, "/car");
-    if reviewed != car_id {
-        return Err(format!(
-            "run {}'s review is of car {}, not {}",
-            short(run_id),
-            short(reviewed),
-            short(car_id)
-        ));
-    }
-    let verdict = str_at(review, "/verdict");
-    if verdict != RELEASE {
-        return Err(format!(
-            "run {}'s verdict is {:?}, not {RELEASE:?}",
-            short(run_id),
-            verdict
-        ));
-    }
-    let sha = str_at(review, "/reviewed_sha");
-    if head.is_empty() || sha != head {
-        return Err(format!(
-            "run {} reviewed {}, and the car's head is {} — a review of another head is no \
-             review of this one",
-            short(run_id),
-            short(sha),
-            short(head)
-        ));
-    }
-    Ok(())
-}
-
-#[async_trait::async_trait]
-pub(crate) trait ExecutorRecordReader: Sync {
-    async fn executor_read(&self, path: &str) -> Result<Option<Value>>;
-    async fn executor_original(
-        &self,
-        job: uuid::Uuid,
-        step: uuid::Uuid,
-        key: &str,
-    ) -> Result<Option<boss_jobs::first_record::FirstRecord>>;
-}
-
 #[async_trait::async_trait]
 impl ExecutorRecordReader for Wire {
-    async fn executor_read(&self, path: &str) -> Result<Option<Value>> {
-        self.call(reqwest::Method::GET, path, None).await
+    async fn protocol_version(&self, kind: &str, version: i64) -> Result<Option<Value>> {
+        self.call(
+            reqwest::Method::GET,
+            &format!("/api/workflows/{kind}/versions/{version}"),
+            None,
+        )
+        .await
     }
     async fn executor_original(
         &self,
@@ -227,95 +98,6 @@ impl ExecutorRecordReader for Wire {
     ) -> Result<Option<boss_jobs::first_record::FirstRecord>> {
         self.immutable_record(job, step, key).await
     }
-}
-
-pub(crate) fn immutable_record_resource(
-    record: &boss_jobs::first_record::FirstRecord,
-    job: uuid::Uuid,
-    step: uuid::Uuid,
-    key: &str,
-) -> Result<()> {
-    if record.job_id.inner().as_uuid() != &job
-        || record.step_id.inner().as_uuid() != &step
-        || record.key != key
-    {
-        bail!("the immutable record response belongs to another resource");
-    }
-    Ok(())
-}
-
-/// Resolve the admitted protocol, never the mutable convenience projection.
-pub(crate) async fn pinned_executor_requirement(
-    reader: &impl ExecutorRecordReader,
-    car: &Value,
-) -> Result<boss_jobs::executor_attestation::ExecutorProvenanceRequirement> {
-    use boss_jobs::executor_attestation::ExecutorProvenanceRequirement;
-    let kind = car
-        .get("kind")
-        .and_then(Value::as_str)
-        .context("the source packet has no protocol kind")?;
-    let version = car
-        .get("workflow_version")
-        .and_then(Value::as_i64)
-        .filter(|v| *v > 0)
-        .context("the source packet has no pinned protocol version")?;
-    let row = reader
-        .executor_read(&format!("/api/workflows/{kind}/versions/{version}"))
-        .await?
-        .context("the pinned source protocol is unavailable")?;
-    if row["kind"] != kind
-        || row["version"] != version
-        || !matches!(row["status"].as_str(), Some("active" | "retired"))
-    {
-        bail!("the source protocol read does not match its immutable pin");
-    }
-    let step = row
-        .get("steps")
-        .and_then(Value::as_array)
-        .and_then(|steps| {
-            steps
-                .iter()
-                .find(|step| step["title"] == boss_jobs::car::REVIEW_SLUG)
-        })
-        .context("the pinned protocol has no review step")?;
-    match step.get("agent") {
-        None | Some(Value::Null) => Ok(ExecutorProvenanceRequirement::Advisory),
-        Some(value) => {
-            let agent: boss_jobs::agent_spec::AgentSpec = serde_json::from_value(value.clone())
-                .context("the pinned executor declaration is unreadable")?;
-            Ok(agent.executor_provenance)
-        }
-    }
-}
-
-/// Authority read during this operation. Neither callers nor metadata can
-/// construct it. A verified result retains the original receipt's identity.
-#[derive(Debug)]
-pub(crate) struct ExecutorReviewEligibility {
-    car: String,
-    head: String,
-    verified: Option<boss_jobs::executor_attestation::VerifiedExecutor>,
-    original_verdict: Option<boss_jobs::first_record::FirstRecord>,
-    original_receipt: Option<boss_jobs::first_record::FirstRecord>,
-}
-
-const ORIGINAL_VERDICT_KEY: &str = "review.verdict";
-
-fn judgment_time(
-    value: &Value,
-    receipt: &boss_jobs::first_record::FirstRecord,
-) -> Result<chrono::DateTime<chrono::Utc>, String> {
-    let at = value
-        .get("at")
-        .and_then(Value::as_str)
-        .and_then(|at| at.parse::<chrono::DateTime<chrono::Utc>>().ok())
-        .ok_or("the original verdict judgment time is unreadable")?;
-    if receipt.recorded_at > at {
-        return Err(
-            "an executor receipt recorded after judgment cannot be bound to that verdict".into(),
-        );
-    }
-    Ok(at)
 }
 
 fn select_original_verdict(original: Option<&Value>, candidate: &Value) -> Result<Value, String> {
@@ -373,222 +155,6 @@ async fn persist_original_verdict(
         bail!("the immutable verdict write returned a different judgment");
     }
     Ok(original)
-}
-
-fn original_verdict_matches(
-    original: &boss_jobs::first_record::FirstRecord,
-    run: &Value,
-    building: uuid::Uuid,
-    receipt: &boss_jobs::first_record::FirstRecord,
-) -> Result<(), String> {
-    use sha2::{Digest, Sha256};
-    let scalar: Value = serde_json::from_str(&original.value_json)
-        .map_err(|_| "the original verdict scalar is unreadable")?;
-    let canonical = boss_core::job::canonical_json_bytes(&scalar);
-    let judged_at = judgment_time(&scalar, receipt)?;
-    if original.job_id.to_string() != str_at(run, "/id")
-        || original.step_id.to_string() != building.to_string()
-        || original.key != ORIGINAL_VERDICT_KEY
-        || scalar != original.value
-        || canonical != original.canonical
-        || hex::encode(Sha256::digest(&canonical)) != original.digest
-        || run.pointer(&format!("/metadata/{REVIEW_KEY}")) != Some(&original.value)
-        || receipt.job_id != original.job_id
-        || receipt.step_id != original.step_id
-        || receipt.key != boss_jobs::executor_attestation::EXECUTOR_BINDING_KEY
-        || receipt.value.get("actor").and_then(Value::as_str)
-            != Some(original.actor.to_string().as_str())
-        || receipt.recorded_at > original.recorded_at
-        || judged_at > original.recorded_at
-        || original.value.get("executor_binding")
-            != Some(&json!({"digest":receipt.digest,"event_id":receipt.event_id}))
-    {
-        return Err(
-            "the verdict does not conserve its original receipt, actor, bytes and order".into(),
-        );
-    }
-    Ok(())
-}
-
-impl ExecutorReviewEligibility {
-    pub(crate) fn record_binding(&self) -> Option<Value> {
-        self.verified
-            .as_ref()
-            .map(|executor| json!({"digest":executor.digest(),"event_id":executor.event_id()}))
-    }
-}
-
-pub(crate) fn vouches_with_executor(
-    run: &Value,
-    car: &Value,
-    head: &str,
-    eligibility: &ExecutorReviewEligibility,
-) -> Result<(), String> {
-    if eligibility.car != str_at(car, "/id") || eligibility.head != head {
-        return Err("executor eligibility belongs to another source claim/head".into());
-    }
-    let binding = eligibility.record_binding();
-    if run.pointer(&format!("/metadata/{REVIEW_KEY}/executor_binding")) != binding.as_ref() {
-        return Err("the verdict does not retain the original verified executor receipt".into());
-    }
-    if eligibility.verified.is_some() {
-        let original = eligibility
-            .original_verdict
-            .as_ref()
-            .ok_or("verified review has no original immutable verdict")?;
-        let receipt = eligibility
-            .original_receipt
-            .as_ref()
-            .ok_or("verified review has no original immutable receipt")?;
-        let building = crate::envelope::steps(run)
-            .into_iter()
-            .find(|step| step["spec_slug"] == crate::dispatch::BUILDING_SLUG)
-            .and_then(|step| step["id"].as_str())
-            .and_then(|id| id.parse().ok())
-            .ok_or("verified review has no valid Building identity")?;
-        original_verdict_matches(original, run, building, receipt)?;
-    }
-    vouches_inner(run, car, head)
-}
-
-/// Original immutable records are read from storage. The current production
-/// verifier refuses because no authenticated host/tool issuer is installed.
-pub(crate) async fn read_executor_eligibility(
-    reader: &impl ExecutorRecordReader,
-    run: &Value,
-    car: &Value,
-    head: &str,
-) -> Result<ExecutorReviewEligibility> {
-    use boss_jobs::executor_attestation::{
-        EXECUTOR_BINDING_KEY, ExecutorExpectation, ExecutorProvenanceRequirement, SOURCE_CLAIM_KEY,
-        UnavailableLaunchReceiptVerifier, executor_eligibility,
-    };
-    let requirement = pinned_executor_requirement(reader, car).await?;
-    let advisory = || ExecutorReviewEligibility {
-        car: str_at(car, "/id").into(),
-        head: head.into(),
-        verified: None,
-        original_verdict: None,
-        original_receipt: None,
-    };
-    let native = str_at(run, "/id");
-    let building = crate::envelope::steps(run)
-        .into_iter()
-        .find(|step| step["spec_slug"] == crate::dispatch::BUILDING_SLUG);
-    let Some(building) = building else {
-        if requirement == ExecutorProvenanceRequirement::Advisory {
-            return Ok(advisory());
-        }
-        bail!("the native run has no Building claim");
-    };
-    let building_id = building
-        .get("id")
-        .and_then(Value::as_str)
-        .context("the Building claim has no id")?;
-    let native_id: uuid::Uuid = native.parse().context("the native run id is invalid")?;
-    let building_uuid: uuid::Uuid = building_id
-        .parse()
-        .context("the Building claim id is invalid")?;
-    let source = reader
-        .executor_original(native_id, building_uuid, SOURCE_CLAIM_KEY)
-        .await?;
-    let Some(source) = source else {
-        if requirement == ExecutorProvenanceRequirement::Advisory {
-            return Ok(advisory());
-        }
-        bail!("verified executor requires the original immutable source claim");
-    };
-    let claim = boss_jobs::executor_attestation::read_source_claim(&source)?;
-    let source_step = crate::envelope::steps(car)
-        .into_iter()
-        .find(|step| step["spec_slug"] == boss_jobs::car::REVIEW_SLUG)
-        .context("the source packet has no review step")?;
-    let reference = format!("refs/heads/{}", branch_of(car)?);
-    if claim.native_run.to_string() != native
-        || claim.source_job.to_string() != str_at(car, "/id")
-        || claim.source_step.to_string() != str_at(source_step, "/id")
-        || claim.source_slug != boss_jobs::car::REVIEW_SLUG
-        || Some(i64::from(claim.protocol_version)) != car["workflow_version"].as_i64()
-        || claim.executor_provenance != requirement
-        || claim
-            .source_ref
-            .as_deref()
-            .is_some_and(|value| value != reference)
-        || claim
-            .source_head
-            .as_deref()
-            .is_some_and(|value| value != head)
-    {
-        bail!(
-            "the original source claim cannot be downgraded or reused after its protocol/head changes"
-        );
-    }
-    if requirement == ExecutorProvenanceRequirement::Advisory {
-        return Ok(advisory());
-    }
-    let record = reader
-        .executor_original(native_id, building_uuid, EXECUTOR_BINDING_KEY)
-        .await?
-        .context("verified executor requires an immutable launch receipt")?;
-    let mut expectation: ExecutorExpectation = serde_json::from_value(record.value.clone())
-        .context("the executor binding is unreadable")?;
-    if expectation.native_run.to_string() != native
-        || expectation.source_job.to_string() != str_at(car, "/id")
-        || expectation.source_step.to_string() != str_at(source_step, "/id")
-        || expectation.source_slug != boss_jobs::car::REVIEW_SLUG
-        || Some(i64::from(expectation.protocol_version)) != car["workflow_version"].as_i64()
-        || expectation.source_ref.as_deref() != Some(reference.as_str())
-        || expectation.source_head.as_deref() != Some(head)
-        || record.step_id.to_string() != building_id
-        || building
-            .get("assignee_id")
-            .and_then(Value::as_str)
-            .is_some_and(|actor| actor != expectation.actor)
-        || source_step
-            .get("assignee_id")
-            .and_then(Value::as_str)
-            .is_some_and(|actor| actor != expectation.actor)
-    {
-        bail!("the immutable executor binding does not match the exact current source claim/head");
-    }
-    expectation.source_claim = Some(source);
-    let verified = executor_eligibility(
-        requirement,
-        Some(&record),
-        Some(&expectation),
-        &UnavailableLaunchReceiptVerifier,
-    )?;
-    let original_verdict = reader
-        .executor_original(native_id, building_uuid, ORIGINAL_VERDICT_KEY)
-        .await?;
-    Ok(ExecutorReviewEligibility {
-        car: str_at(car, "/id").into(),
-        head: head.into(),
-        verified,
-        original_verdict,
-        original_receipt: Some(record),
-    })
-}
-
-pub(crate) fn executor_review_eligibility(car: &Value) -> Result<(), String> {
-    use boss_jobs::executor_attestation::{
-        ExecutorProvenanceRequirement, UnavailableLaunchReceiptVerifier, executor_eligibility,
-    };
-    let declaration = crate::envelope::steps(car)
-        .into_iter()
-        .find(|step| step["spec_slug"] == boss_jobs::car::REVIEW_SLUG)
-        .and_then(|step| step["metadata"].get(boss_jobs::agent_spec::EXECUTOR_PROVENANCE_KEY));
-    let requirement = match declaration {
-        None => ExecutorProvenanceRequirement::Advisory,
-        Some(value) => serde_json::from_value(value.clone())
-            .map_err(|_| "the pinned executor provenance declaration is unreadable".to_string())?,
-    };
-    // There is no authenticated host/tool receipt adapter in this deployment.
-    // An actor header, model metadata or self-attestation must not stand in
-    // for that authority. The same domain predicate keeps every door closed.
-    executor_eligibility(requirement, None, None, &UnavailableLaunchReceiptVerifier)
-        .map(|_| ())
-        .map_err(|why| format!("the pinned FORMAL executor requirement is unmet: {why}; no authenticated host/tool receipt adapter is available"))
 }
 
 /// The review-step key a BARE release records itself under: `{hold, by,
@@ -661,65 +227,6 @@ pub(crate) fn bare_release_record(hold: &str, by: &str, at: &str, releaser: &Rel
     rec
 }
 
-/// PURE: may the run this shell is (`releaser`, its `BOSS_AGENT_RUN`)
-/// release `car`? Refused when it is not a full run id — the record
-/// carries the id that was checked, never whatever the variable held
-/// (review 5aa91689 N5) — and when it is the car's builder run
-/// (backlog b7b02024 car 3, design 7cedfa29 Q1, design b08725c2 row A).
-///
-/// THE BUILDER RUN is the car's `agent_run`: the run the gate that filed
-/// the car stamped, re-stamped by every later green that carries a run
-/// (the auto-park refresh). A green with NO run — a gate launched by
-/// hand, or the dock's own replay — keeps the one before, so after a
-/// hand repair the refusal still binds the run that built the car, not
-/// the repairer (review 5aa91689 N1: fails open, locks no one out).
-///
-/// No run in the shell, another run, or a car with no builder run is
-/// not refused: the refusal binds agent runs, never a person, and a
-/// person's road is the release from a shell that is not the builder
-/// run. The error is the whole refusal — the car, the run and that road
-/// — because a refusal that leaves its reader to find the way round is
-/// a dead end at the wrong moment.
-pub(crate) fn may_release(car: &Value, releaser: Option<&str>) -> Result<(), String> {
-    executor_review_eligibility(car)?;
-    may_release_identity(car, releaser)
-}
-
-fn may_release_identity(car: &Value, releaser: Option<&str>) -> Result<(), String> {
-    let env = crate::gate::AGENT_RUN_ENV;
-    let id = str_at(car, "/id");
-    let branch = str_at(car, "/metadata/branch");
-    let target = if branch.is_empty() { short(id) } else { branch };
-    let Some(run) = releaser.map(str::trim).filter(|r| !r.is_empty()) else {
-        return Ok(());
-    };
-    if !crate::job::looks_like_uuid(run) {
-        return Err(format!(
-            "boss release: REFUSED — {env}={run:?} is not a full run id (36 characters, \
-             8-4-4-4-12), and a release records the run that gave it. Nothing was written. \
-             Export the run's full id, or release from a shell that is no run: `env -u {env} \
-             boss release {target} …`."
-        ));
-    }
-    let Some(builder) = builder_run(car) else {
-        return Ok(());
-    };
-    if !run.eq_ignore_ascii_case(builder) {
-        return Ok(());
-    }
-    Err(format!(
-        "boss release: REFUSED — this shell is run {builder} ({env}), the run that built car \
-         {} {branch} (the car's agent_run, stamped by the green that filed or last refreshed \
-         it), and the run that built a car does not release it (backlog b7b02024 car 3). \
-         Nothing was written; the car stays held. The road around it: any other actor \
-         releases it on its review, from a shell that is not this run — `boss release \
-         {target} --review <the reviewer's run, full id>`, the three verbs `boss release \
-         --help` names. A person who gated the car inside a run of his own releases from a \
-         shell without it: `env -u {env} boss release {target} --review <run>`.",
-        short(id)
-    ))
-}
-
 /// The review a reviewer's run records ([`REVIEW_KEY`]).
 pub(crate) fn review_record(
     car: &Value,
@@ -735,18 +242,6 @@ pub(crate) fn review_record(
         "verdict": verdict,
         "findings": findings,
         "at": at,
-    })
-}
-
-/// The release record on the review step (`boss_jobs::car::RELEASE`).
-pub(crate) fn release_record(sha: &str, review: &str, by: &str, at: &str, main_sha: &str) -> Value {
-    json!({
-        "sha": sha,
-        "review": review,
-        "verdict": RELEASE,
-        "by": by,
-        "at": at,
-        "main_sha": main_sha,
     })
 }
 
@@ -824,13 +319,6 @@ pub(crate) fn forge_sha(refname: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("the forge holds no {refname}"))
 }
 
-/// A car's branch, or a refusal naming the car.
-fn branch_of(car: &Value) -> Result<&str> {
-    Some(str_at(car, "/metadata/branch"))
-        .filter(|b| !b.is_empty())
-        .ok_or_else(|| anyhow!("car {} names no branch", short(str_at(car, "/id"))))
-}
-
 /// `boss review <car> --verdict <v>`: record the verdict of the run this
 /// shell is (`BOSS_AGENT_RUN`) on that run's own packet, at the car's
 /// forge head. `forge` reads a ref's sha (the live one is [`forge_sha`]).
@@ -879,23 +367,19 @@ pub(crate) async fn record(
     let branch = branch_of(&packet)?;
     let head = forge(&format!("refs/heads/{branch}"))?;
     let executor = read_executor_eligibility(wire, &run_packet, &packet, &head).await.context("boss review: FORMAL executor eligibility refused; advisory findings remain reportable on the run")?;
-    let at = crate::gate::stamp(boss_clock_client::wall_now());
+    let at = crate::sor_client::stamp(boss_clock_client::wall_now());
     let mut rec = review_record(&packet, &head, verdict, findings.trim(), &at);
     if let Some(binding) = executor.record_binding() {
         rec["executor_binding"] = binding;
     }
-    if executor.verified.is_some() {
+    if executor.is_verified() {
         rec = select_original_verdict(
-            executor
-                .original_verdict
-                .as_ref()
-                .map(|record| &record.value),
+            executor.original_verdict().map(|record| &record.value),
             &rec,
         )
         .map_err(|why| anyhow!(why))?;
         let receipt = executor
-            .original_receipt
-            .as_ref()
+            .original_receipt()
             .context("verified review has no original receipt")?;
         judgment_time(&rec, receipt).map_err(|why| anyhow!(why))?;
         let original = persist_original_verdict(
@@ -937,11 +421,14 @@ pub(crate) async fn record(
     Ok(())
 }
 
-/// `boss release <car> --review <run>`: release the car on a review
-/// verdict of RELEASE at its current forge head, recording the release.
-/// `releaser` is the shell it is given from: the car's builder run is
-/// refused ([`may_release`]) before anything is read from the forge or
-/// written, and the shell's [`Releaser::provenance`] rides on the record.
+/// `boss release <car> --review <run>`: ask the jobs API's release door
+/// (`POST /api/jobs/{car}/release`, backlog ed8e5c85) to release the car
+/// on that review's verdict at the head the forge holds now. The door
+/// owns the rule (`boss_jobs::car_release::judge`) and the write, and
+/// it reads the release back before it answers. This verb supplies what
+/// only a clone can read, the branch head and main, plus the shell it
+/// runs in ([`Releaser`]), whose builder run the door refuses before it
+/// writes anything.
 pub(crate) async fn release(
     wire: &Wire,
     car: &str,
@@ -949,64 +436,44 @@ pub(crate) async fn release(
     releaser: &Releaser,
     forge: impl Fn(&str) -> Result<String>,
 ) -> Result<()> {
-    if !crate::job::looks_like_uuid(review) {
-        bail!(
-            "boss release: --review {review:?} is not a full run id — the record carries the id \
-             that was checked, never the characters that were typed"
-        );
-    }
     let packet = wire.car(car).await?;
-    let step = crate::steps::holdable(&packet).map_err(|e| anyhow!("{e}"))?;
-    may_release_identity(&packet, releaser.run()).map_err(|why| anyhow!("{why}"))?;
-    let branch = branch_of(&packet)?;
+    let jid = str_at(&packet, "/id").to_string();
+    let branch = branch_of(&packet)?.to_string();
     let head = forge(&format!("refs/heads/{branch}"))?;
     let main = forge("refs/heads/main")?;
-    let run = wire.packet(review).await?;
-    let executor = read_executor_eligibility(wire, &run, &packet, &head)
-        .await
-        .context("boss release: pinned executor eligibility refused")?;
-    vouches_with_executor(&run, &packet, &head, &executor)
-        .map_err(|why| anyhow!("boss release: REFUSED — {why}"))?;
-    let by = wire
-        .caller_id()
-        .context("an unnamed release is refused before it is sent")?;
-    let at = crate::gate::stamp(boss_clock_client::wall_now());
-    // Which run and which shell released it, beside `by`: every agent
-    // signs as agent-claude, so the actor alone cannot say (car 3,
-    // review 5aa91689 B1).
-    let mut rec = release_record(&head, review, by, &at, &main);
-    if let Some(binding) = executor.record_binding() {
-        rec["executor_binding"] = binding;
+    let mut ask = json!({
+        "review": review.trim(),
+        "head": head,
+        "main_sha": main,
+        "agent_shell": releaser.agent_shell,
+    });
+    if let Some(run) = releaser.run() {
+        ask["run"] = json!(run);
     }
-    if let (Some(fields), Value::Object(shell)) = (rec.as_object_mut(), releaser.provenance()) {
-        fields.extend(shell);
-    }
-    let jid = str_at(&packet, "/id");
-    let sid = str_at(step, "/id");
-    wire.call(
-        reqwest::Method::PATCH,
-        &format!("/api/jobs/{jid}/steps/{sid}/metadata"),
-        Some(json!({ "hold": Value::Null, boss_jobs::car::RELEASE: rec })),
-    )
-    .await
-    .context("writing the release onto the car's review step")?;
-    let after = wire.packet(jid).await?;
-    let held =
-        boss_jobs::car::find_step(&after, boss_jobs::car::REVIEW_SLUG, boss_jobs::car::REVIEW)
-            .and_then(|s| s.get("metadata"))
-            .and_then(boss_jobs::stranded::hold_reason);
-    if let Some(h) = held {
-        bail!("the API answered the write but the review step still reads as held: {h:?}");
-    }
-    if release_on(&after).map(|r| r.sha) != Some(head.as_str()) {
-        bail!("the API answered the write but the car does not read back a release at {head}");
-    }
+    let answer = wire
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/jobs/{jid}/release"),
+            Some(ask),
+        )
+        // The door's refusal is the error as it came: its status line and
+        // its sentence, which name why and the road around it.
+        .await?
+        .context("boss release: the release door answered with no body")?;
+    let model_says = answer
+        .pointer(&format!(
+            "/release/{}/says",
+            boss_jobs::car_release::REVIEWER_MODEL_KEY
+        ))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     println!(
-        "boss release: {} {branch} — released at {} on review run {} (main {})\n  it boards \
-         at the next tick while its head stays {}",
-        short(jid),
+        "boss release: {} {branch} — released at {} on review run {} (main {})\n  reviewer \
+         model: {model_says} (recorded on the release, not refused)\n  it boards at the next \
+         tick while its head stays {}",
+        short(&jid),
         short(&head),
-        short(review),
+        short(review.trim()),
         short(&main),
         short(&head)
     );
@@ -1268,26 +735,6 @@ mod tests {
                 .is_err()
         );
         server.abort();
-    }
-
-    #[test]
-    fn an_advisory_result_cannot_supply_or_retarget_a_verified_receipt_reference() {
-        let eligibility = ExecutorReviewEligibility {
-            car: CAR.into(),
-            head: H1.into(),
-            verified: None,
-            original_verdict: None,
-            original_receipt: None,
-        };
-        let mut reviewer = run(REVIEWER, release_at(H1));
-        assert!(vouches_with_executor(&reviewer, &car(), H1, &eligibility).is_ok());
-        assert!(vouches_with_executor(&reviewer, &car(), H2, &eligibility).is_err());
-        reviewer["metadata"][REVIEW_KEY]["executor_binding"] =
-            json!({"digest":"self-declared","event_id":REVIEWER});
-        assert!(vouches_with_executor(&reviewer, &car(), H1, &eligibility).is_err());
-        let mut another_car = car();
-        another_car["id"] = json!("another-car");
-        assert!(vouches_with_executor(&reviewer, &another_car, H1, &eligibility).is_err());
     }
 
     #[tokio::test]
@@ -1575,5 +1022,78 @@ mod tests {
             "metadata": {boss_jobs::car::RELEASE: fwd}}]});
         let m = release_on(&moved).expect("a release");
         assert_eq!((m.sha, m.reviewed), (H2, H1));
+    }
+
+    /// WHICH MODEL REVIEWED IT, said at the release (backlog ad82090a),
+    /// and since backlog e6b05dd6 (D2 of design fb9ba887) decided ONLY by
+    /// the launcher's first record. The incident's shape — a run whose
+    /// own report observed a model other than the one it declared, and
+    /// no launcher record — no longer reads DIFFER off the run's word
+    /// about itself: unknown, with the observation beside it as the
+    /// cross-check. A launcher's record decides; nothing here refuses.
+    #[test]
+    fn a_release_says_which_model_the_review_declared_and_which_ran() {
+        use boss_core::{
+            actor::ActorId,
+            job::{JobId, StepId},
+            publisher::EventStamp,
+        };
+        let mut differs = run(REVIEWER, release_at(H1));
+        differs["metadata"]["model"] = json!("opus-5[1m]");
+        differs["metadata"]["model_observed"] = json!({"declared": "opus-5[1m]",
+            "observed": "opus-5-5", "says": "declared opus-5[1m], observed opus-5-5 — they DIFFER"});
+        let said = reviewer_model(&differs, &Ok(None));
+        assert_eq!(said["declared"], json!("opus-5[1m]"));
+        assert_eq!(said["observed"], json!("opus-5-5"));
+        assert_eq!(said["launched"], Value::Null);
+        assert_eq!(
+            said["matches"],
+            Value::Null,
+            "the run's own word decides nothing"
+        );
+
+        // The launcher's record of a Codex launch decides it.
+        let launched = |model: &str| {
+            boss_jobs::first_record::FirstRecord::new(
+                JobId::from_uuid(uuid::Uuid::from_u128(1)),
+                StepId::from_uuid(uuid::Uuid::from_u128(2)),
+                boss_jobs::car_release::LAUNCHED_MODEL_KEY,
+                &json!({"model": model, "harness": "codex-exec", "via": "argv"}),
+                &EventStamp::new(
+                    "jobs.record",
+                    ActorId::RegisteredAgent("agent-claude".into()),
+                ),
+                uuid::Uuid::from_u128(3),
+            )
+        };
+        let mut same = run(REVIEWER, release_at(H1));
+        same["metadata"]["model"] = json!("gpt-6.1-sol");
+        same["metadata"]["model_observed"] =
+            json!({"declared": "gpt-6.1-sol", "observed": "gpt-6.1-sol"});
+        let said = reviewer_model(&same, &Ok(Some(launched("gpt-6.1-sol"))));
+        assert_eq!(said["matches"], json!(true));
+        assert_eq!(said["cross_check"], json!(true));
+        assert_eq!(
+            said["says"],
+            json!("declared gpt-6.1-sol, launched gpt-6.1-sol; observed gpt-6.1-sol")
+        );
+        let said = reviewer_model(&same, &Ok(Some(launched("opus-5-5"))));
+        assert_eq!(said["matches"], json!(false));
+
+        // An unread record is unknown with its reason, never a match.
+        let said = reviewer_model(&same, &Err("the jobs API was dark".into()));
+        assert_eq!(said["matches"], Value::Null);
+        assert!(
+            said["says"]
+                .as_str()
+                .unwrap()
+                .starts_with("declared gpt-6.1-sol, launched unknown (the jobs API was dark)"),
+            "{said}"
+        );
+
+        // A run that declares nothing (the human road files one bare).
+        let said = reviewer_model(&run(REVIEWER, release_at(H1)), &Ok(None));
+        assert_eq!(said["declared"], Value::Null);
+        assert_eq!(said["matches"], Value::Null);
     }
 }

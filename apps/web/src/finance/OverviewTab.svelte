@@ -19,12 +19,14 @@
     type CsvColumn,
   } from './csvExport';
   import { formatMoney } from '@boss/web-kit/ui/money';
+  import type { ReadState } from '../data/readState';
 
   type Props = {
     summary: CommerceSummary | null;
     loading: boolean;
+    summaryRead: ReadState;
   };
-  let { summary, loading }: Props = $props();
+  let { summary, loading, summaryRead }: Props = $props();
 
   let ap = $state<ApAging | null>(null);
   let apLoading = $state(true);
@@ -78,7 +80,7 @@
 {#if loading && !summary}
   <p class="empty">Loading finance summary…</p>
 {:else if !summary}
-  <p class="empty load-failed" role="alert">Finance summary unavailable.</p>
+  <p class="empty load-failed" role="alert">Finance summary unavailable.{#if summaryRead.kind === 'failed'} {summaryRead.error}{/if}</p>
 {:else}
   {@const s = summary}
   {@const arTotalCount = s.ar_aging.reduce((acc, b) => acc + b.count, 0)}

@@ -88,9 +88,10 @@
 # one thing it cannot declare:
 #   - a StorageClass with no provisioner and WaitForFirstConsumer, the
 #     standard shape for a hand-declared local volume;
-#   - the PersistentVolume itself: 200Gi of /var/local/gate-seed on
-#     w-1, Retain (a warm seed is minutes of every gate; never reclaim
-#     it by accident), bound only on w-1 by nodeAffinity;
+#   - (until 2026-10-10) the PersistentVolume gate-seed-w-1: 200Gi of
+#     /var/local/gate-seed on w-1, Retain (a warm seed is minutes of
+#     every gate; never reclaim it by accident), bound only on w-1 by
+#     nodeAffinity — RETIRED, see the end of this header;
 #   - NOT the directory itself. A local PV refuses a path that does
 #     not exist, and nothing in this cluster may make one: the only
 #     Kubernetes way is a hostPath mount, and boss-dev — no pod-security
@@ -156,6 +157,47 @@
 # new layout runs cold once and its green refresh writes the new seed.
 # gate-seed-w-1 and its claim then stay declared until no gate mounts
 # them, and a car retires them like gate-runner-disk.
+#
+# RETIRED (backlog 1f13b894, 2026-10-10). Ten days after the move
+# neither old volume had been retired, and w-1's install disk read
+# disk_tight in the estate series (182-191 GiB free against a 200
+# floor). node-disk-usage w-1 (ops-request e66b045d, 00:56Z) put the
+# Longhorn replica of `gate-runner-disk` at 197.7 GiB actual and left
+# ~173.5 GiB of the disk in none of the kubelet's categories — the
+# suspect being this PV's directory, which a PV's writes are never
+# counted against (not measured: no verb reads a Talos host path). So
+# the PV gate-seed-w-1 left this file and the claims `gate-seed` and
+# `gate-runner-disk` left infra/gate-runner/gate-runner.yaml. The
+# StorageClass stays: the gate PV and its claim below are of it.
+#
+# Removing a declaration removes no object (the converge does not
+# prune), and none of the three is one delete-orphan-object may touch
+# (a PVC is bytes; a PV is cluster-scoped, outside the orphan
+# derivation). They go by hand, IN THIS ORDER:
+#   1. EMPTY the old seed through its own claim, while the claim still
+#      binds the directory. Deleting a local PV deletes no byte (no
+#      provisioner, Retain), and no pod in boss-dev can mount the host
+#      path any other way (baseline refuses hostPath). One pod in
+#      boss-dev on claim `gate-seed`, as the gate's own identity (uid
+#      65534, gid 1500, fsGroup 1500 — the identity that wrote it),
+#      prints `du -sk` of the seed — the measurement the 173.5 GiB was
+#      missing — removes every entry but Talos's .declared-by-talos
+#      marker, and prints `du -sk` again.
+#   2. Delete PVC boss-dev/gate-seed and PVC boss-dev/gate-runner-disk
+#      BEFORE the car that removed their lines lands. Nothing re-creates
+#      either (no converge applies gate-runner.yaml), and once those
+#      lines are gone the orphan lint's live half names any claim still
+#      standing — on every pre-flight that can read the cluster.
+#      gate-runner-disk's class, longhorn-dev-disposable, reclaims with
+#      Delete, so Longhorn removes the volume and its 197.7 GiB replica
+#      itself.
+#   3. Delete PV gate-seed-w-1 AFTER that car lands: before it, the
+#      converge re-applies the PV.
+# The DIRECTORY stays: w-1's Talos declaration makes it and binds it
+# into the kubelet, and the daily trim pod (CronJob boss-node-trim)
+# mounts it as its handle on EPHEMERAL. Removing those entries
+# is a node-converge and a credentials-area change of their own, and
+# buys nothing an empty directory costs.
 ---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -165,25 +207,6 @@ metadata:
 provisioner: kubernetes.io/no-provisioner
 volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Retain
----
-apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: gate-seed-w-1
-  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: build}
-spec:
-  capacity:
-    storage: 200Gi
-  accessModes: [ReadWriteOnce]
-  persistentVolumeReclaimPolicy: Retain
-  storageClassName: gate-seed-local
-  local:
-    path: /var/local/gate-seed
-  nodeAffinity:
-    required:
-      nodeSelectorTerms:
-        - matchExpressions:
-            - {key: kubernetes.io/hostname, operator: In, values: ["w-1"]}
 ---
 # THE GATE VOLUME: the whole second NVMe (see THE GATE VOLUME above).
 # The capacity is a label, not a quota — a local PV has no way to bound

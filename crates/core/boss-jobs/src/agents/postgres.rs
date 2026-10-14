@@ -32,6 +32,35 @@ impl PgAgents {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    pub(crate) async fn selection_rows_budgeted_in(
+        conn: &mut sqlx::PgConnection,
+        budget: Option<boss_events::statement_budget::StatementBudget>,
+    ) -> Result<(Vec<AgentRow>, Vec<AutomationActor>), AgentsError> {
+        boss_events::statement_budget::refresh(conn, budget)
+            .await
+            .map_err(AgentsError::Storage)?;
+        let rows: Vec<AgentDbRow> = sqlx::query_as(&format!("{SELECT} ORDER BY id COLLATE \"C\""))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(storage)?;
+        boss_events::statement_budget::refresh(conn, budget)
+            .await
+            .map_err(AgentsError::Storage)?;
+        let aliases = aliases_by_actor(&mut *conn).await?;
+        boss_events::statement_budget::refresh(conn, budget)
+            .await
+            .map_err(AgentsError::Storage)?;
+        let automations: Vec<AutomationDbRow> =
+            sqlx::query_as(&format!("{SELECT_AUTOMATIONS} ORDER BY id COLLATE \"C\""))
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(storage)?;
+        Ok((
+            rows.into_iter().map(|row| to_row(row, &aliases)).collect(),
+            automations.into_iter().map(AutomationActor::from).collect(),
+        ))
+    }
 }
 
 fn storage(e: sqlx::Error) -> AgentsError {
@@ -106,7 +135,7 @@ const SELECT: &str = "SELECT id, display_name, default_model, role, department, 
 /// One agent's row with its aliases (`None` when the registry does
 /// not hold the id), read inside the batch's transaction so the
 /// writes just made are seen.
-async fn row_in_tx(
+pub(crate) async fn row_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: &str,
 ) -> Result<Option<AgentRow>, AgentsError> {

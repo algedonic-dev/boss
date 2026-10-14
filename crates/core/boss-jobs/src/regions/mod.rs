@@ -106,7 +106,7 @@ pub use self::partition::{
     Ids, Lookups, Placed, TRIGGER_STEP_KIND, members, place, taken_in, train_region,
 };
 pub(crate) use self::partition::{
-    count_in, marshalling_view, receiving_standing, taken_in_at, trains_in,
+    at_the_gates, count_in, marshalling_view, receiving_standing, taken_in_at, trains_in,
 };
 use self::publish::publish;
 pub use self::publish::{PUBLISH_KIND, PublishPr, STALLED_PUBLISH_HOURS, publish_prs};
@@ -121,7 +121,10 @@ pub use self::stale_proof::{NOT_YET_STARVED_HOURS, PROOF_STALE_HOURS};
 pub(crate) use self::stale_proof::{StaleProof, stale_proof};
 pub(crate) use self::stuck::stuck_ids;
 pub use self::stuck::{THIRDS, ThirdStuck, stuck};
-pub use self::track::{TRAIN_GATE_FALLBACK, TRAIN_GATE_WAIT_REASON, train_gate_troubled};
+pub use self::track::{
+    TRAIN_GATE_FALLBACK, TRAIN_GATE_LAUNCHED_AT, TRAIN_GATE_WAIT_MINUTES, TRAIN_GATE_WAIT_REASON,
+    train_gate_troubled, train_gate_wait_since,
+};
 use self::track::{track, train_findings};
 
 /// The regions, in map order. The count and the order are the
@@ -357,6 +360,24 @@ pub struct Region {
     /// What is here. `None` when the region could not be read — the
     /// state is then `troubled` and `why` names the read.
     pub count: Option<usize>,
+    /// THE LINE, a second figure beside the count (backlog 357fe1da,
+    /// design 85c3f793 decision 2): the region's members that stand in it
+    /// waiting for what the bound counts — today the gate-runs waiting
+    /// for a bay. Not part of `count`, because a line behind full bays
+    /// must not read as more bays in use than exist; `count + waiting` is
+    /// what the partition places here. Absent where no line stands, and
+    /// on an older payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<usize>,
+    /// THE JUDGED, a third figure beside the count and the line (backlog
+    /// bce67f09): the region's members whose verdict is already in and
+    /// who therefore need neither a bay nor a place in line — today a
+    /// train at the gates whose own gate has spoken (green and awaiting
+    /// forge CI or the merge, or red and blocked). `count + waiting +
+    /// judged` is what the partition places here. Absent where none
+    /// stands, and on an older payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judged: Option<usize>,
     /// The bound the count is read against, where the region has one:
     /// the gate concurrency, the boarding depth, the run cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -83,7 +83,10 @@
 # container per BOSS_DEV_MEMORY_ALERT_WINDOW_S; the restarts in between
 # are counted into the next item. A restart found on the watch's FIRST
 # tick for a pod, with no sample before it, predates the watch: it is
-# filed at standard priority under a title that says so. An alert the
+# filed at standard priority under a title that says so. A sample is
+# evidence only for the pod it was taken in: the ring outlives a roll,
+# and a new pod's kill is never described with the old pod's sample
+# (backlog 36b1aa00). An alert the
 # API REFUSES backs off and is moved aside at the fifth refusal, so it
 # cannot hold the ones behind it. The spool keeps its newest 48 and
 # counts what it drops, alert-refused/ its newest 20, kills/ its newest
@@ -99,6 +102,13 @@
 #   dev-memory-watch.sh --loop     tick forever (what --ensure starts)
 #   dev-memory-watch.sh --ensure   start the loop unless one is alive
 #   dev-memory-watch.sh --state    the watch's state, key=value lines
+#   dev-memory-watch.sh --acknowledge
+#                                  a person has read the refused and
+#                                  dropped alerts: keep them aside, zero
+#                                  the counts, and say so on the next
+#                                  reclaim packet (see `acknowledge`)
+#   dev-memory-watch.sh --recorded <acknowledgement>...
+#                                  the reclaim pass: those rode a packet
 #
 # Tunables (env): BOSS_DEV_MEMORY_INTERVAL_S (15), BOSS_DEV_MEMORY_RING
 # (240), BOSS_DEV_MEMORY_TOP (15), BOSS_DEV_MEMORY_CONTAINER (dev — the
@@ -133,6 +143,16 @@ ALERT_WINDOW_S="${BOSS_DEV_MEMORY_ALERT_WINDOW_S:-3600}"
 SPOOL_KEEP=48
 REFUSALS_MAX=5
 REFUSED_KEEP=20
+# How long a kept alert may wait before the hold itself is the reclaim
+# pass's problem (review fb97dd5d of car 1fe37401, finding F1): twice
+# the back-offs a body the API refuses can wait out before its fifth
+# refusal moves it aside — 2 + 4 + 8 + 16 minutes, 60 * (2^REFUSALS_MAX
+# - 2) s. Past it no refusal of the body explains the wait; only answers
+# that count nothing against it do (no answer, a 5xx, a refusal of the
+# caller), and nothing else would ever end that silence. `--state`
+# prints it beside the oldest kept alert's age, so the bound lives here
+# with the back-off it is derived from and the reclaim only compares.
+HELD_AFTER_S=$((2 * 60 * ((1 << REFUSALS_MAX) - 2)))
 LOG_MAX_BYTES="${BOSS_DEV_MEMORY_LOG_MAX_BYTES:-1048576}"
 # Bump when `loop` itself changes: --ensure replaces a running loop
 # whose pidfile names another generation.
@@ -253,46 +273,152 @@ cgroup_line() {
     else
         printf 'cgroup\t%s\tunreadable from this container (it holds no capability over that one)\n' "$name"
     fi
+    # Kernel accounting categories, not a guess from process RSS. Keep
+    # missing, malformed and duplicate counters unknown, never zero.
+    { cat "$base/memory.stat" 2>/dev/null || true; } | awk -v name="$name" '
+        BEGIN { n = split("anon file kernel kernel_stack pagetables sec_pagetables percpu sock vmalloc shmem zswap zswapped file_mapped file_dirty file_writeback swapcached anon_thp file_thp shmem_thp inactive_anon active_anon inactive_file active_file unevictable slab_reclaimable slab_unreclaimable slab", keys, " ") }
+        { seen[$1]++; if (NF == 2 && $2 ~ /^[0-9]+$/) value[$1] = $2 }
+        END { printf "memory-stat\t%s", name
+              for (i = 1; i <= n; i++) printf "\t%s=%s", keys[i], (seen[keys[i]] == 1 && keys[i] in value) ? value[keys[i]] : "unknown"
+              printf "\n" }'
+}
+
+# In a private cgroup namespace our processes show only 0::/. Bind
+# that root only when this pod's current running IDs and every observed
+# external ID leave exactly one candidate. No limit/name heuristic and
+# no historical sample is reinterpreted using this answer.
+own_binding() {
+    printf 'own-binding\tself\tunknown\n' > "$TMP/own-binding"
+    OWN_NAME=self
+    [ -z "$POD_UNREAD" ] && [ ! -s "$TMP/cgroup-unread" ] || return 0
+    jq_doc_file "$TMP/pod.json" || return 0
+    jq -er --arg pod "$POD" '
+        def valid_running_state:
+            (.state | type == "object") and
+            (.state.running == null or
+                (.state.running | type == "object" and
+                    (.startedAt | type == "string" and length > 0)));
+        select(.metadata.name == $pod and (.metadata.uid | type == "string" and length > 0))
+        | select(([.spec.containers[].name] | sort) == ([.status.containerStatuses[].name] | sort))
+        | select(all(.status.containerStatuses[]; valid_running_state))
+        | [.status.containerStatuses[] | select(.state.running != null)
+            | {name, id: ((.containerID // "") | sub("^containerd://"; ""))}]
+        | select(length > 0 and (map(.name) | unique | length) == length
+            and (map(.id) | unique | length) == length)
+        | .[] | select(.name | test("^[a-z0-9][a-z0-9-]*$"))
+        | select(.id | test("^[0-9a-f]{64}$")) | [.name, .id] | @tsv
+        ' "$TMP/pod.json" > "$TMP/running" 2>/dev/null || return 0
+    # Invalid running rows must not disappear and manufacture uniqueness.
+    local count rows binding uid external sandbox
+    count=$(jq '[.status.containerStatuses[] | select(.state.running != null)] | length' "$TMP/pod.json")
+    rows=$(wc -l < "$TMP/running")
+    [ "$count" = "$rows" ] || return 0
+    # This reader's own hostname bind mount independently names its pod
+    # sandbox. Inspect only that mount metadata, never mounted file contents.
+    # An absent attestation exempts nothing; malformed/duplicate rows refuse.
+    sandbox=
+    if [ -r "$PROC_ROOT/self/mountinfo" ]; then
+        sandbox=$(awk '
+            $5 == "/etc/hostname" {
+                selected++
+                separators = 0
+                for (i = 7; i <= NF; i++) if ($i == "-") { separators++; sep = i }
+                if (NF < 10 || separators != 1 || sep + 3 != NF ||
+                    $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+:[0-9]+$/ ||
+                    $4 !~ /^\/(var\/)?lib\/containerd\/io[.]containerd[.]grpc[.]v1[.]cri\/sandboxes\/[0-9a-f]+\/hostname$/) bad = 1
+                n = split($4, path, "/"); id = path[n-1]
+                if (length(id) != 64 || id !~ /^[0-9a-f]+$/) bad = 1
+            }
+            END { if (bad || selected > 1) exit 1; if (selected == 1) print id }
+            ' "$PROC_ROOT/self/mountinfo" 2>/dev/null) || return 0
+    fi
+    binding=$(awk -F'\t' -v sandbox="$sandbox" '
+        NR == FNR { names[$2] = $1; next }
+        $1 == "root" { root = 1; next }
+        $1 == "external" { if (!($2 in names) && $2 != sandbox) bad = 1; observed[$2] = 1; next }
+        { bad = 1 }
+        END { if (sandbox in names) bad = 1
+              for (id in names) if (!(id in observed)) { missing++; own = id }
+              if (root && !bad && missing == 1) printf "%s\t%s", names[own], own }' \
+        "$TMP/running" "$TMP/cgroups")
+    [ -n "$binding" ] || return 0
+    OWN_NAME=${binding%%$'\t'*}
+    uid=$(jq -r '.metadata.uid' "$TMP/pod.json" | tr -cd 'A-Za-z0-9._-')
+    external=$(awk -F'\t' -v sandbox="$sandbox" '$1 == "external" && $2 != sandbox {print $2}' "$TMP/cgroups" | sort -u | paste -sd, -)
+    printf 'own-binding\t%s\tmethod=unique-running-minus-external\tid=%s\tpod_uid=%s\texternal_ids=%s' \
+        "$OWN_NAME" "${binding#*$'\t'}" "$uid" "$external" > "$TMP/own-binding"
+    if [ -n "$sandbox" ]; then
+        printf '\tsandbox_id=%s\tsandbox_source=own-hostname-mount' "$sandbox" >> "$TMP/own-binding"
+    fi
+    printf '\n' >> "$TMP/own-binding"
 }
 
 # One sample into the ring. Line kinds, tab-separated:
 #   at         <utc> <epoch> <pod> <interval_s>
 #   pod-status unread <why>            (only when the API did not answer)
+#   own-binding <name> method/id/pod_uid/external_ids | self unknown
 #   container  <name> procs=N rss_kib=N anon_kib=N restarts=N limit=X
 #   cgroup     <name> current=… peak=… max=… oom_kill=… | unreadable …
+#   memory-stat <name> <kernel-category>=<bytes|unknown> …
 #   proc       <rss_kib> <anon_kib> <container> <pid> <comm> <cmdline>
 # rss is statm's resident pages, anon is resident minus shared.
+git_phase_snapshot() {
+    local mode="${1:---snapshot}" result
+    result=$(BOSS_RECLAIM_GIT_DIR="${BOSS_RECLAIM_GIT_DIR:-${WORK_MOUNT:-/work}/telemetry/dev-reclaim-git}" \
+        bash "$(dirname "$(readlink -f "$SELF")")/dev-reclaim-git.sh" "$mode" 2>/dev/null) || result=""
+    if [ -n "$result" ]; then
+        printf '%s\n' "$result"
+    else
+        printf '%s\n' '{"state":"unknown","reason":"phase reader unavailable","phases":[]}'
+    fi
+}
+
 sample() {
     local epoch at page_kb p res shr cg pid c comm cmd out
     epoch=$(date -u +%s)
     at=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ)
     page_kb=$(( $(getconf PAGESIZE 2>/dev/null || echo 4096) / 1024 ))
+    : > "$TMP/cgroups"; : > "$TMP/cgroup-unread"
     for p in "$PROC_ROOT"/[0-9]*; do
+        [ -d "$p" ] || continue
+        if ! read -r cg 2> /dev/null < "$p/cgroup"; then
+            printf 'unread\n' >> "$TMP/cgroup-unread"
+            continue
+        fi
+        case "$cg" in
+            '0::/') printf 'root\n' >> "$TMP/cgroups" ;;
+            '0::/../'*) printf 'external\t%s\n' "${cg#0::/../}" >> "$TMP/cgroups" ;;
+            *) printf 'unrecognized\n' >> "$TMP/cgroups" ;;
+        esac
         read -r _ res shr _ 2> /dev/null < "$p/statm" || continue
         case "${res:-0}" in '' | *[!0-9]* | 0) continue ;; esac
-        read -r cg 2> /dev/null < "$p/cgroup" || continue
         printf '%s\t%s\t%s\t%s\n' "$res" "${shr:-0}" "${p##*/}" "${cg##*/}"
     done > "$TMP/procs"
-    # A process in this script's own container shows the cgroup root, an
-    # empty tail: `self`. One the pod status does not name keeps the
-    # first twelve characters of its cgroup id.
-    awk -F'\t' -v kb="$page_kb" '
-        NR == FNR { name[$2] = $1; next }
-        { c = ($4 in name) ? name[$4] : ($4 == "" ? "self" : substr($4, 1, 12))
+    own_binding
+    # A process in this script's own container shows an empty root
+    # tail; keep self unless the recorded native reconciliation binds
+    # it. Unknown or duplicate external IDs keep their twelve-byte ID.
+    awk -F'\t' -v kb="$page_kb" -v own="$OWN_NAME" '
+        FILENAME == ARGV[1] { name[$2] = $1; count[$2]++; next }
+        { c = (count[$4] == 1) ? name[$4] : ($4 == "" ? own : substr($4, 1, 12))
           printf "%d\t%d\t%s\t%s\n", $1 * kb, ($1 - $2) * kb, c, $3 }' \
         "$TMP/containers" "$TMP/procs" > "$TMP/rows"
     sort -rn -k1,1 "$TMP/rows" > "$TMP/sorted"
     out="$TMP/sample"
     {
         printf 'at\t%s\t%s\t%s\t%s\n' "$at" "$epoch" "$POD" "$INTERVAL"
+        cat "$TMP/own-binding"
+        # This observer's namespace only; OWN_NAME remains self when the native
+        # container reconciliation is unavailable. No PID/argv-only attribution.
+        printf 'git-phase\t%s\t%s\n' "$OWN_NAME" "$(git_phase_snapshot)"
         [ -z "$POD_UNREAD" ] || printf 'pod-status\tunread\t%s\n' "$POD_UNREAD"
         awk -F'\t' '
-            NR == FNR { restarts[$1] = $3; limit[$1] = $7; next }
+            FILENAME == ARGV[1] { restarts[$1] = $3; limit[$1] = $7; next }
             { n[$3]++; rss[$3] += $1; anon[$3] += $2 }
             END { for (c in n) printf "container\t%s\tprocs=%d\trss_kib=%d\tanon_kib=%d\trestarts=%s\tlimit=%s\n",
                       c, n[c], rss[c], anon[c], (c in restarts) ? restarts[c] : "-", (c in limit) ? limit[c] : "-" }' \
             "$TMP/containers" "$TMP/rows" | sort
-        for c in "$WATCHED" self; do
+        for c in $(printf '%s\n%s\n' "$WATCHED" "$OWN_NAME" | sort -u); do
             pid=$(awk -F'\t' -v c="$c" '$3 == c {print $4; exit}' "$TMP/rows")
             [ -z "$pid" ] || cgroup_line "$c" "$pid"
         done
@@ -335,10 +461,21 @@ describe_sample() {
     local f="$1" name="$2"
     awk -F'\t' -v name="$name" '
         $1 == "container" && $2 == name {
+            bound = 1
             split($3, a, "="); split($4, b, "="); split($5, c, "=")
             printf "%d processes, resident %.1f GiB, anonymous %.1f GiB", a[2], b[2] / 1048576, c[2] / 1048576
         }
         $1 == "cgroup" && $2 == name { cg = $3; for (i = 4; i <= NF; i++) cg = cg " " $i }
+        $1 == "memory-stat" && $2 == name {
+            for (i = 3; i <= NF; i++) if ($i ~ /^[a-z_]+=(unknown|[0-9]+)$/) stats = stats " " $i
+        }
+        $1 == "container" && $2 == "self" { unassigned = 1 }
+        $1 == "memory-stat" && $2 == "self" {
+            for (i = 3; i <= NF; i++) if ($i ~ /^[a-z_]+=(unknown|[0-9]+)$/) ownstats = ownstats " " $i
+        }
+        $1 == "cgroup" && $2 == "self" {
+            for (i = 3; i <= NF; i++) if ($i ~ /^(current|peak|max|oom_kill)=([0-9]+|max|-)$/) owncg = owncg " " $i
+        }
         $1 == "proc" && $4 == name && shown < 8 {
             shown++
             # The name and the pid, each held to its own class HERE as
@@ -352,7 +489,14 @@ describe_sample() {
             top = top sprintf(" | %d MiB %s[%s]", $2 / 1024, comm, pid)
         }
         END {
+            if (!bound) {
+                printf "container binding unknown; no bound process measurements for %s", name
+                if (unassigned) printf "; unassigned sampler cgroup evidence:%s", owncg == "" ? " counters unknown" : owncg
+                if (unassigned && ownstats != "") printf "; unassigned memory.stat%s", ownstats
+                exit
+            }
             if (cg != "") printf "; cgroup %s", cg
+            if (stats != "") printf "; memory.stat%s", stats
             if (top != "") printf "; largest processes in it by resident size:%s", top
             else printf "; none of its processes is among the largest in the pod in this sample"
         }' "$f"
@@ -374,7 +518,9 @@ freeze_ring() {
     [ ! -d "$frozen" ] || return 0
     mkdir -p "$DIR/kills" "$DIR/ring" || return 1
     rm -rf "$frozen.copying"
-    cp -a "$DIR/ring" "$frozen.copying" && mv "$frozen.copying" "$frozen" || return 1
+    cp -a "$DIR/ring" "$frozen.copying" || return 1
+    git_phase_snapshot --archive > "$frozen.copying/git-phases.json" || return 1
+    mv "$frozen.copying" "$frozen" || return 1
     ls -1tr "$DIR/kills" | all_but_newest "$KILLS_KEEP" | while read -r f; do
         rm -rf "${DIR:?}/kills/$f"
     done
@@ -394,6 +540,7 @@ freeze_ring() {
 keep_restart_alert() {
     local name="$1" prev="$2" count="$3" reason="$4" code="$5" finished="$6" limit="$7" first="$8"
     local frozen fin_epoch f e last="" last_epoch="" peak="" peak_kib=0 kib n=0 oldest="" title detail priority=urgent since out
+    local kind spod other=0 other_pod="" other_epoch=""
     frozen=$(frozen_dir "$name" "$count" "$finished")
     # date -d '' answers midnight rather than an error: guard it.
     fin_epoch=""
@@ -405,6 +552,22 @@ keep_restart_alert() {
         [ -n "$oldest" ] || oldest="$e"
         # A sample after the kill is the restarted container's, not evidence.
         if [ -n "$fin_epoch" ] && [ "$e" -gt "$fin_epoch" ]; then continue; fi
+        # NOR IS A SAMPLE TAKEN IN ANOTHER POD (backlog 36b1aa00, from
+        # delta review d617cf4e). The ring is on the PVC and survives a
+        # roll, and a new pod's loop starts only with the sidecar's first
+        # pass, minutes in; until this asked, a kill in that window was
+        # filed with `Last sample, N s before the kill` describing the
+        # PREVIOUS pod's container of the same name. The pod is the
+        # fourth field of the sample's first line (`sample` writes it);
+        # a sample that does not name THIS pod there is counted, and
+        # named in the item, and never described.
+        kind=""; spod=""
+        IFS=$'\t' read -r kind _ _ spod _ 2> /dev/null < "$f" || true
+        if [ "$kind" != "at" ] || [ "$spod" != "$POD" ]; then
+            other=$((other + 1)); other_epoch="$e"
+            other_pod=$(printf '%s' "$spod" | tr -cd 'A-Za-z0-9._-' | cut -c1-80)
+            continue
+        fi
         n=$((n + 1)); last="$f"; last_epoch="$e"
         kib=$(awk -F'\t' -v name="$name" '$1 == "container" && $2 == name { split($4, b, "="); print b[2] }' "$f")
         case "${kib:-empty}" in empty | *[!0-9]*) continue ;; esac
@@ -427,6 +590,14 @@ keep_restart_alert() {
             detail="$detail Largest sample in the ring, $(kib_as_gib "$peak_kib") GiB resident at epoch ${peak##*/}: $(describe_sample "$peak" "$name")."
         fi
         detail="$detail Resident sums count shared pages once per process and see no page cache or tmpfs. Processes are named here without their command lines; those are in the whole ring from before the kill, kept on the dev pod's volume at $frozen ($n samples, one every $INTERVAL s)."
+        [ "$other" -eq 0 ] || detail="$detail $other more sample(s) in that ring were taken in another pod before this one (the newest at epoch $other_epoch, in pod ${other_pod:-unnamed}); they are not this container and are not described here."
+    elif [ "$other" -gt 0 ]; then
+        # Before the `first` arm, and urgent: the ring holding another
+        # pod's samples is the evidence that the watch ran before this
+        # pod did, so this kill does not predate the watch — it fell in
+        # the window before this pod's first sample, and nobody else
+        # recorded it.
+        detail="$detail No sample of this pod precedes this kill: the $other sample(s) the ring held from before it were taken in another pod (the newest at epoch $other_epoch, in pod ${other_pod:-unnamed}), so the watch had not sampled this pod yet and what filled the container is not recorded. The ring as it stood is kept at $frozen."
     elif [ "$first" = 1 ]; then
         priority=standard
         title="dev pod: container $name restarted before the memory watch ran — $reason (exit $code) at $finished; restart predates this watch, no samples"
@@ -488,16 +659,29 @@ load_alert_lib() {
 
 # Send what the spool holds, oldest first. Three answers, three acts:
 #   201             filed; the file goes.
-#   no answer       the API is dark: stop, nothing else will pass
-#                   either, and nothing is counted against the alert.
-#   any other code  REFUSED. alert-lib's replay stops at the first
-#                   refusal and retries it every run for ever, holding
-#                   every later alert behind it (review of car 7849553a,
-#                   finding 3). Here a refused body backs off (2, 4, 8,
-#                   16 minutes) and the ones behind it are still tried;
-#                   at the fifth refusal it is moved aside to
-#                   alert-refused/ with the answer it got, kept on the
-#                   volume and counted on the reclaim's packet.
+#   an answer that  no answer, a 5xx, or a refusal of the CALLER (401,
+#   is not about    403, 407, 408, 429): stop, and count nothing against
+#   this body       the alert. That the alerts behind it would get the
+#                   same answer is an ASSUMPTION, true of a dark API or
+#                   a refused signer (every alert here is one signer and
+#                   one kind) and not of a 5xx this one body provokes,
+#                   which holds every alert behind it (review fb97dd5d,
+#                   N2). Neither case is counted, so neither ends by
+#                   itself: --state names the oldest kept alert's age,
+#                   and past HELD_AFTER_S the reclaim pass raises it as
+#                   memory-watch-alerts-held (the same review, F1).
+#                   alert-lib.sh decides which answers those are, in
+#                   alert_answer_judges_the_body, for this spool and the
+#                   forge's alike. Until it did here (backlog 9ecd12ea,
+#                   residue named by car 97edf615), a stale machine token
+#                   or a failing API moved a kill alert aside at its
+#                   fifth answer, half an hour in, and it was never filed.
+#   any other code  REFUSED, the API's judgement of the body (review of
+#                   car 7849553a, finding 3): it backs off (2, 4, 8, 16
+#                   minutes) and the ones behind it are still tried; at
+#                   the fifth refusal it is moved aside to alert-refused/
+#                   with the answer it got, kept on the volume and
+#                   counted on the reclaim's packet.
 file_kept_alerts() {
     local url f tries n next now owner code
     ls "$DIR/alert-spool"/*.json > /dev/null 2>&1 || return 0
@@ -539,6 +723,10 @@ file_kept_alerts() {
                 return 0
                 ;;
             *)
+                if ! alert_answer_judges_the_body "$code"; then
+                    echo "alert: send stopped at ${f##*/} (answer $code, which judges the API or the caller, not this alert) — $(ls -1 "$DIR/alert-spool" | grep -c '\.json$') kept for the next tick, nothing counted against them" >&2
+                    return 0
+                fi
                 n=$((n + 1))
                 if [ "$n" -ge "$REFUSALS_MAX" ]; then
                     mkdir -p "$DIR/alert-refused"
@@ -729,6 +917,25 @@ ensure() {
     fi
 }
 
+# Seconds since the oldest alert in the spool was kept, empty when the
+# spool holds none. Kept alerts are named `<epoch kept>-<pid>-<n>.json`;
+# a name that does not start with an epoch falls back to the file's
+# mtime, so an odd name is still measured rather than skipped.
+oldest_kept_age() {
+    local f e oldest="" now
+    for f in "$DIR/alert-spool"/*.json; do
+        [ -f "$f" ] || continue
+        e="${f##*/}"
+        e="${e%%-*}"
+        case "${e:-empty}" in empty | *[!0-9]*) e=$(stat -c %Y "$f" 2> /dev/null) ;; esac
+        case "${e:-empty}" in empty | *[!0-9]*) continue ;; esac
+        if [ -z "$oldest" ] || [ "$e" -lt "$oldest" ]; then oldest="$e"; fi
+    done
+    [ -n "$oldest" ] || return 0
+    now=$(date -u +%s)
+    if [ "$oldest" -gt "$now" ]; then echo 0; else echo "$((now - oldest))"; fi
+}
+
 # The watch's state as `key=value` lines, for the reclaim pass to put on
 # the maintenance packet it files — the one path by which a watch that
 # is not sampling, or alerts that are not leaving, reach a reader who is
@@ -761,7 +968,88 @@ state() {
     printf 'memory_watch_alerts_kept=%s\n' "${kept:-0}"
     printf 'memory_watch_alerts_refused=%s\n' "${refused:-0}"
     printf 'memory_watch_alerts_dropped=%s\n' "${dropped:-0}"
+    # How long the oldest kept alert has waited, from when it was kept
+    # (its name's leading epoch) — not from its last try — and the bound
+    # past which the reclaim pass raises it (HELD_AFTER_S above).
+    printf 'memory_watch_alerts_oldest_kept_age_s=%s\n' "$(oldest_kept_age)"
+    printf 'memory_watch_alerts_held_after_s=%s\n' "$HELD_AFTER_S"
     printf 'memory_watch_ensure=%s\n' "$(printf '%s' "$said" | tr -cd '\40-\176' | cut -c1-400)"
+    # Where all of the above lives, so the packet that counts a refused
+    # alert also says where to read it.
+    printf 'memory_watch_dir=%s\n' "$DIR"
+    # Acknowledgements no packet has carried yet: their names (what
+    # --recorded takes back) and what each one says.
+    local stamps="" said_acks="" d line
+    for d in "$DIR"/acknowledged/*/; do
+        [ -f "$d/unrecorded" ] || continue
+        line=""
+        read -r line 2> /dev/null < "$d/record" || true
+        stamps="${stamps:+$stamps }$(basename "$d")"
+        said_acks="${said_acks:+$said_acks; }$(basename "$d") $line"
+    done
+    printf 'memory_watch_acknowledgements=%s\n' "$stamps"
+    printf 'memory_watch_acknowledged=%s\n' "$(printf '%s' "$said_acks" | tr -cd '\40-\176' | cut -c1-400)"
+}
+
+# THE ACKNOWLEDGEMENT (backlog 9ecd12ea; the operator call recorded on
+# it when car 7849553a was released, 2026-10-08). A refused or dropped
+# alert is a kill notice nobody received, so the reclaim pass counts it
+# as a problem every hour and nothing ages it out. Until this verb the
+# only way to clear it was to empty alert-refused/ and remove
+# alerts-dropped by hand: an act no record saw, which also destroyed
+# the refused bodies — the one copy of what the kill alert said.
+# `--acknowledge` moves the bodies (with each refusal's answer) and the
+# dropped count into acknowledged/<when>/, beside one line saying who
+# and how many; the counts read zero from then on. The acknowledgement
+# stays named on --state until the reclaim pass reports it carried it
+# on a packet (`--recorded <name>...`), so the clearing is on the
+# record and not only on this volume. Who: BOSS_ACTOR, else the box's
+# actor file — the same rule every `boss` verb signs by.
+ACK_KEEP=20
+acknowledge() {
+    local refused dropped=0 stamp dest who f
+    mkdir -p "$DIR" || return 1
+    # Under the tick's lock: a tick moves a body INTO alert-refused/.
+    if command -v flock > /dev/null 2>&1 && { exec 8>> "$DIR/.tick.lock"; } 2> /dev/null; then
+        flock -w 60 8 || { log "a tick held the lock for 60 s — nothing acknowledged" >&2; return 1; }
+    fi
+    refused=$(ls -1 "$DIR/alert-refused" 2> /dev/null | grep -c '\.json$')
+    if [ -r "$DIR/alerts-dropped" ]; then read -r dropped < "$DIR/alerts-dropped" || dropped=0; fi
+    case "${dropped:-empty}" in empty | *[!0-9]*) dropped=0 ;; esac
+    if [ "${refused:-0}" -eq 0 ] && [ "$dropped" -eq 0 ]; then
+        log "nothing to acknowledge: no refused alert under $DIR/alert-refused and none dropped"
+        return 0
+    fi
+    who="${BOSS_ACTOR:-$(head -n1 "${HOME:-/nonexistent}/.config/boss/actor" 2> /dev/null)}"
+    who=$(printf '%s' "${who:-unidentified}" | tr -cd 'A-Za-z0-9@._:-')
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    dest="$DIR/acknowledged/$stamp"
+    [ ! -e "$dest" ] || dest="$dest-$$"
+    mkdir -p "$dest" || return 1
+    for f in "$DIR/alert-refused"/*; do
+        [ -e "$f" ] || continue
+        mv "$f" "$dest/" || return 1
+    done
+    printf '%s\n' "$dropped" > "$dest/dropped" && rm -f "$DIR/alerts-dropped"
+    printf 'acknowledged %s by %s: %s refused kept here, %s dropped\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$refused" "$dropped" > "$dest/record"
+    : > "$dest/unrecorded"
+    log "acknowledged by $who: $refused refused alert(s) kept at $dest, $dropped dropped — the next reclaim packet carries it"
+    # The bound: the newest ACK_KEEP, never one no packet has carried.
+    ls -1 "$DIR/acknowledged" | sort | all_but_newest "$ACK_KEEP" | while read -r f; do
+        [ -f "$DIR/acknowledged/$f/unrecorded" ] || rm -rf "${DIR:?}/acknowledged/$f"
+    done
+}
+
+# The reclaim pass's word that its packet carried these acknowledgements.
+# A name that is not one (empty, a path) is skipped, never followed.
+recorded() {
+    local name
+    [ "$#" -gt 0 ] || { echo "usage: dev-memory-watch.sh --recorded <acknowledgement>..." >&2; return 64; }
+    for name in "$@"; do
+        case "$name" in '' | *[!A-Za-z0-9-]*) continue ;; esac
+        rm -f "$DIR/acknowledged/$name/unrecorded"
+    done
 }
 
 case "${1:-}" in
@@ -779,8 +1067,15 @@ case "${1:-}" in
     --state)
         state
         ;;
+    --acknowledge)
+        acknowledge
+        ;;
+    --recorded)
+        shift
+        recorded "$@"
+        ;;
     *)
-        echo "usage: dev-memory-watch.sh --tick | --loop | --ensure | --state" >&2
+        echo "usage: dev-memory-watch.sh --tick | --loop | --ensure | --state | --acknowledge | --recorded <acknowledgement>..." >&2
         exit 64
         ;;
 esac

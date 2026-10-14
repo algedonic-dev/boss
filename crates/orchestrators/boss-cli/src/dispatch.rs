@@ -327,7 +327,7 @@ pub(crate) fn no_block_refusal(
     format!(
         "step `{slug}` of {kind} declares no agent block, so nothing says which model, at \
          what effort, under what spend — add `agent = {{ profile = \"builder\", model = \
-         \"opus-5[1m]\", budget_usd = 5, effort = \"high\" }}` to that step in its Workflow \
+         \"opus-5-5\", budget_usd = 5, effort = \"high\" }}` to that step in its Workflow \
          row (infra/platform/workflows/{kind}.toml{then}"
     )
 }
@@ -692,8 +692,9 @@ pub(crate) fn level_refusal(
 }
 
 /// The run packet's body, through the one envelope every filing verb
-/// uses. The brief rides as `brief` — the record of what the agent was
-/// told, copied from the prompt and never retyped.
+/// uses. `brief` begins as the exact prose. Before admission, an oversized
+/// body retains that prose as a verified attachment and records its reference
+/// instead; the printed and handed prompt remains complete (c495addb).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_body(
     packet_id: &str,
@@ -753,6 +754,16 @@ pub(crate) fn briefed_writes(prompt_bytes: usize) -> Value {
 /// miss is no longer a race and is not retried into silence.
 pub(crate) const BRIEFED_ATTEMPTS: usize = 2;
 
+/// How many times `briefed`'s status-only completion is sent while each
+/// answer is the named step race (`step_changed`, which writes nothing).
+/// One retry was the bound until run ea76e79f (2026-10-10, backlog
+/// deba68e8) lost the race TWICE and was left at briefed=ready with its
+/// prompt printed — unstartable, so its reviewer's `--started` was
+/// refused. The completion is idempotent (same status, same
+/// prompt_bytes), so a few more re-read-then-send attempts cost nothing;
+/// a bound still holds, because a race that never ends is not a race.
+pub(crate) const BRIEFED_COMPLETE_ATTEMPTS: usize = 4;
+
 /// The refusal when `briefed`'s field does not read back after
 /// [`BRIEFED_ATTEMPTS`] writes that each answered success. It names the
 /// run, the step, what the step holds instead, and the two writes that
@@ -773,6 +784,21 @@ pub(crate) fn briefed_unheld_refusal(
          boss-api PATCH /api/jobs/{run_id}/steps/{briefed_id}/metadata  body {writes}\n  \
          boss-api PUT /api/jobs/{run_id}/steps/{briefed_id}  body {{\"status\":\"completed\"}}",
         &run_id[..8.min(run_id.len())],
+    )
+}
+
+/// The context on a `briefed` completion that did not land: the prompt
+/// is printed and names this run, but `building` opens only when
+/// `briefed` completes, so the executor's `--started` will be refused.
+/// Said loudly, with the one command that finishes THIS run (backlog
+/// deba68e8 — on ea76e79f the coordinator had to work it out by hand).
+pub(crate) fn briefed_not_startable(run_id: &str, prompt_bytes: usize, attempts: usize) -> String {
+    format!(
+        "completing the run's briefed step (after {attempts} attempt(s)): run {run_id} is NOT \
+         startable — its prompt is printed but `briefed` is still open, so the executor's \
+         `--started` will be refused. Finish THIS run (do not dispatch again; the printed \
+         prompt names it):\n  boss step complete {run_id} --step briefed --field \
+         prompt_bytes={prompt_bytes}"
     )
 }
 
@@ -808,6 +834,52 @@ pub(crate) fn stub_merge(
             for (k, v) in sent {
                 md.insert(k.clone(), v.clone());
             }
+        }
+    }
+}
+
+/// The test stubs' first-record door, as the jobs API's
+/// (`POST /api/jobs/{run}/steps/{step}/metadata/records`): the FIRST
+/// write of a key lands on the step and answers `recorded`; the same
+/// value again answers `replayed`; another value is a 409 and changes
+/// nothing (backlog e6b05dd6). A path naming no step of `run_id` is a
+/// 404.
+#[cfg(test)]
+pub(crate) fn stub_record(
+    run: &std::sync::Mutex<Option<Value>>,
+    run_id: &str,
+    path: &str,
+    body: &Value,
+) -> (&'static str, String) {
+    let not_found = ("404 Not Found", "step not found".to_string());
+    let Some(sid) = path
+        .strip_prefix(&format!("/api/jobs/{run_id}/steps/"))
+        .and_then(|rest| rest.strip_suffix("/metadata/records"))
+    else {
+        return not_found;
+    };
+    let (Some(key), Some(value)) = (body["key"].as_str(), body.get("value")) else {
+        return ("422 Unprocessable Entity", "key and value".to_string());
+    };
+    let Ok(mut guard) = run.lock() else {
+        return not_found;
+    };
+    let Some(step) = guard
+        .as_mut()
+        .and_then(|filed| filed["steps"].as_array_mut())
+        .and_then(|steps| steps.iter_mut().find(|s| s["id"] == sid))
+    else {
+        return not_found;
+    };
+    match step["metadata"].get(key) {
+        Some(held) if held == value => ("200 OK", json!({ "result": "replayed" }).to_string()),
+        Some(_) => (
+            "409 Conflict",
+            json!({ "result": "conflict", "record": { "key": key } }).to_string(),
+        ),
+        None => {
+            step["metadata"][key] = value.clone();
+            ("201 Created", json!({ "result": "recorded" }).to_string())
         }
     }
 }
@@ -901,6 +973,13 @@ fn hook_definition_compatibility(repo: &Path, settings: &Settings) -> Result<()>
 /// claim unless its hold marker is set — read by
 /// `boss_jobs::stranded::hold_reason`, the one definition the dock and
 /// the loading-dock station share.
+///
+/// WHERE IT POINTS (backlog c851ed24, review fe7b1b1e F4). Since option
+/// A (bd331d38) an unheld car's review is owed AFTER it lands, on its
+/// `landed-review` step, and a change that needs one BEFORE boarding is
+/// a trust boundary whose item is marked (`boss mark`) — `boss gate`
+/// refuses a `--hold` no rule requires. The refusal said "hold the car
+/// first (boss hold)" until then, the opposite of coordinator rule 3.
 pub(crate) fn unheld_review_refusal(kind: &str, slug: &str, step: &Value) -> Option<String> {
     if kind != boss_jobs::regions::CAR_KIND || slug != boss_jobs::car::REVIEW_SLUG {
         return None;
@@ -913,8 +992,12 @@ pub(crate) fn unheld_review_refusal(kind: &str, slug: &str, step: &Value) -> Opt
         format!(
             "step `{slug}` of this car carries no hold, so no adversarial review waits on it — \
              an unheld car boards on its green, and a reviewer claimed here would hold the step \
-             the conductor completes at boarding. Hold the car first (boss hold) if it needs \
-             review; nothing claimed, nothing filed"
+             the conductor completes at boarding. Its review is owed AFTER it lands: once it \
+             has, dispatch `boss dispatch <car> --step {}`. A change that must be reviewed \
+             BEFORE it boards is a trust boundary: mark its item (`boss mark <item> \
+             --trust-boundary <area> --trust-reason '<why>'`) and re-gate, and the gate holds \
+             the car; nothing claimed, nothing filed",
+            boss_jobs::car::LANDED_REVIEW_SLUG
         )
     })
 }
@@ -1415,13 +1498,37 @@ pub(crate) async fn dispatch_to(
     source: BriefSource<'_>,
     launch: Option<&crate::dispatch_launch::Request>,
 ) -> Result<Dispatched> {
+    dispatch_to_with_content(
+        http, base, repo, packet_ref, step_slug, station, over, force, actor, owner, host, source,
+        launch, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_to_with_content(
+    http: &boss_core::machine_token::Client,
+    base: &str,
+    repo: &Path,
+    packet_ref: &str,
+    step_slug: Option<&str>,
+    station: Option<&str>,
+    over: &Overrides,
+    force: bool,
+    actor: &str,
+    owner: &str,
+    host: &str,
+    source: BriefSource<'_>,
+    launch: Option<&crate::dispatch_launch::Request>,
+    content_base: Option<&str>,
+) -> Result<Dispatched> {
     use reqwest::Method;
 
     // Every call signed as the actor the verb resolved: the run is
     // theirs, and so is the claim.
     let api_at = |method: Method, path: String, body: Option<Value>| {
         let signature = crate::identity::Signature::As(actor.to_string());
-        async move { crate::gate::api_at_signed(http, base, method, &path, body, signature).await }
+        async move { crate::sor_client::api_at_signed(http, base, method, &path, body, signature).await }
     };
 
     let id = crate::job::fetch_and_resolve(http, packet_ref).await?;
@@ -1513,12 +1620,8 @@ pub(crate) async fn dispatch_to(
     // measured against what landed.
     let prior = match crate::prior_work::item_of(&job) {
         Some(item) => {
-            let cars = api_at(
-                Method::GET,
-                crate::prior_work::partial_cars_query(item),
-                None,
-            )
-            .await;
+            let cars =
+                crate::prior_work::read_cars(item, |path| api_at(Method::GET, path, None)).await;
             Some(crate::prior_work::assemble(repo, item, cars))
         }
         None => None,
@@ -1596,13 +1699,47 @@ pub(crate) async fn dispatch_to(
     // and the budget reservation always (`boss_jobs::agent_budget` —
     // the block's budget against the actor's hour, before the CAS), so
     // a queued dispatch and a hand dispatch are gated by one rule.
-    let claim_path = match station {
-        Some(s) => format!("/api/jobs/{id}/steps/{step_id}/claim?station={s}"),
-        None => format!("/api/jobs/{id}/steps/{step_id}/claim"),
+    //
+    // A LAUNCHED STEP IS CLAIMED FOR THE HARNESS'S ACTOR (review
+    // b149c579, N2). The door judges the HOLDER's agents row — its
+    // concurrency cap (a refusal) over the open runs filed under it, and
+    // its hourly budget (a reading on the log since e6b2066f) — and a
+    // claim for oneself made the holder the coordinator: a run filed under
+    // agent-codex was capped by agent-claude's row and priced against
+    // agent-claude's $40 hour, while agent-codex's own cap counted runs it
+    // was never asked about and its $10 hour was read by no claim at all.
+    // The door's `claimed_for` (design 611fbffd)
+    // installs the nominee and judges the caller's `step-assign`; it
+    // refuses a station beside it, and a launch names none (`run` passes
+    // None), so a queue-pulled launch would be refused there, loudly. It
+    // takes a READY step from the coordinator's nomination, never an
+    // ACTIVE one: a step the coordinator already holds is refused 409
+    // naming it, nothing filed, and the hand-over is a release first.
+    let mut query: Vec<String> = Vec::new();
+    if let Some(s) = station {
+        query.push(format!("station={s}"));
+    }
+    let claimed_for = plan.as_ref().map(|p| p.harness.actor.as_str());
+    if let Some(nominee) = claimed_for {
+        query.push(format!(
+            "claimed_for={}",
+            percent_encoding::utf8_percent_encode(nominee, crate::job::QUERY_VALUE)
+        ));
+    }
+    let claim_path = if query.is_empty() {
+        format!("/api/jobs/{id}/steps/{step_id}/claim")
+    } else {
+        format!("/api/jobs/{id}/steps/{step_id}/claim?{}", query.join("&"))
     };
     api_at(Method::POST, claim_path, None)
         .await
-        .with_context(|| format!("claiming `{slug}` on {} as {actor}", &id[..8]))?;
+        .with_context(|| match claimed_for {
+            Some(nominee) => format!(
+                "claiming `{slug}` on {} as {actor} FOR {nominee}, the launched run's actor",
+                &id[..8]
+            ),
+            None => format!("claiming `{slug}` on {} as {actor}", &id[..8]),
+        })?;
 
     // The brief, rendered ONCE: it is the prompt and the record. The
     // hook hands the prompt the agent was already given, which is the
@@ -1621,8 +1758,9 @@ pub(crate) async fn dispatch_to(
                 .with_context(|| {
                     format!(
                         "claimed `{slug}` on {} and then could not read the packet back to \
-                         brief from — the step is held by {actor} and needs releasing",
-                        &id[..8]
+                         brief from — the step is held by {} and needs releasing",
+                        &id[..8],
+                        claimed_for.unwrap_or(actor)
                     )
                 })?;
             // The active Workflow row, so the brief can date the
@@ -1672,6 +1810,11 @@ pub(crate) async fn dispatch_to(
     {
         body["metadata"]["session"] = json!(session);
     }
+    let content = match content_base {
+        Some(base) => base.to_string(),
+        None => crate::tenant_publish::service_on_door(base, "content")?,
+    };
+    let body = crate::dispatch_brief::retain_at(http, &content, actor, &id, body).await?;
     let created = api_at(Method::POST, "/api/jobs".to_string(), Some(body))
         .await?
         .context("the run's create returned no body")?;
@@ -1845,19 +1988,57 @@ pub(crate) async fn dispatch_to(
     // ready), and the jobs API now refuses the loser of such a race by
     // name instead of letting it erase the other write. A status-only
     // body carries nothing that can be stale, so exactly that refusal
-    // is sent once more; any other error, or a second loss, stands.
-    let complete = || {
-        api_at(
+    // is sent again — re-reading the run first, so a `briefed` the other
+    // writer completed is taken as done and a field it erased is merged
+    // back — up to BRIEFED_COMPLETE_ATTEMPTS times (one retry lost twice
+    // on run ea76e79f, backlog deba68e8). Any other error, or the last
+    // loss, stands, and says the run is NOT startable and how to finish it.
+    let mut attempt = 1;
+    loop {
+        let answer = api_at(
             Method::PUT,
             format!("/api/jobs/{run_id}/steps/{briefed_id}"),
             Some(completed()),
         )
-    };
-    match complete().await {
-        Err(e) if lost_the_step_race(&e) => complete().await,
-        answer => answer,
+        .await;
+        let e = match answer {
+            Ok(_) => break,
+            Err(e) if lost_the_step_race(&e) && attempt < BRIEFED_COMPLETE_ATTEMPTS => e,
+            Err(e) => {
+                return Err(e.context(briefed_not_startable(&run_id, prompt.len(), attempt)));
+            }
+        };
+        attempt += 1;
+        // Step out of the writer's burst (~25 ms on 9aa88562) before
+        // reading the step again.
+        tokio::time::sleep(std::time::Duration::from_millis(25 << attempt)).await;
+        let now = api_at(Method::GET, format!("/api/jobs/{run_id}"), None)
+            .await?
+            .with_context(|| format!("{e:#}; and could not read run {run_id} back"))?;
+        let step = crate::envelope::steps(&now)
+            .into_iter()
+            .find(|s| s.get("id").and_then(Value::as_str) == Some(briefed_id.as_str()));
+        if step
+            .as_ref()
+            .and_then(|s| s.get("status"))
+            .and_then(Value::as_str)
+            == Some("completed")
+        {
+            break;
+        }
+        let held = step
+            .and_then(|s| s.get("metadata").cloned())
+            .unwrap_or_else(|| json!({}));
+        if !crate::job::confirm_patch(&held, &writes).1 {
+            api_at(
+                Method::PATCH,
+                format!("/api/jobs/{run_id}/steps/{briefed_id}/metadata"),
+                Some(writes.clone()),
+            )
+            .await
+            .context("recording prompt_bytes again after a lost completion race")?;
+        }
     }
-    .context("completing the run's briefed step")?;
     eprintln!(
         "boss dispatch: run {} open for `{slug}` on {} — {} bytes of prompt printed, \
          building as {run_agent} on {host}",
@@ -1954,7 +2135,7 @@ where
 
 /// Is this refused write the step race — the one refusal a status-only
 /// completion answers by sending itself once more? Judged on the JSON
-/// body the jobs API answered with (`gate::api_at_signed` carries it
+/// body the jobs API answered with (`crate::sor_client::api_at_signed` carries it
 /// after the status), by `boss_jobs::step_metadata_write::is_step_race`:
 /// the `code`, never the words, which are a person's (backlog 2aa2b19e,
 /// review of car 24eb9471).
@@ -2040,7 +2221,7 @@ pub(crate) async fn next_at(
 
     let api_at = |method: Method, path: String| {
         let signature = crate::identity::Signature::As(actor.to_string());
-        async move { crate::gate::api_at_signed(http, base, method, &path, None, signature).await }
+        async move { crate::sor_client::api_at_signed(http, base, method, &path, None, signature).await }
     };
 
     // The queue read is the ONLY input: no packet is passed in, and a
@@ -2131,7 +2312,7 @@ pub async fn next(
     budget: Option<f64>,
     effort: Option<String>,
 ) -> Result<()> {
-    let base = crate::gate::resolve_jobs_base(None)?;
+    let base = crate::sor_client::resolve_jobs_base(None)?;
     let repo = crate::brief::repo_root()?;
     let actor = crate::identity::sign(&reqwest::Method::POST, "/api/jobs")?;
     let owner = crate::owner::for_filing_at(&base).await;
@@ -2147,7 +2328,7 @@ pub async fn next(
         bail!("--budget must be a positive number of dollars, got {b}");
     }
     next_at(
-        &crate::gate::machine_client()?,
+        &crate::sor_client::machine_client()?,
         &base,
         &repo,
         &station,
@@ -2286,7 +2467,7 @@ pub(crate) fn report_patch(r: &Report) -> Value {
 }
 
 /// The run packet key the report writes [`model_observed`] under.
-pub(crate) const MODEL_OBSERVED_KEY: &str = "model_observed";
+pub(crate) const MODEL_OBSERVED_KEY: &str = boss_jobs::car_release::MODEL_OBSERVED_KEY;
 
 /// The declared model and the observed one, as two facts and a sentence.
 /// `observed` is what the metered transcript's billed turns name, and
@@ -2350,7 +2531,7 @@ pub(crate) fn resolve_agent(agents: &[Value], login: &str) -> Option<String> {
 }
 
 /// The step whose `result` says which terminal the run reached.
-pub(crate) const BUILDING_SLUG: &str = "building";
+pub(crate) const BUILDING_SLUG: &str = boss_jobs::car_release::BUILDING_SLUG;
 
 /// The run's outcome, READ from the terminal it reached rather than
 /// asserted (backlog 8f1de7bf, 2026-09-19: `run_record` hardcoded
@@ -2556,8 +2737,15 @@ pub(crate) async fn transcript_slice_at(
     let get = |path: String| {
         let signature = crate::identity::Signature::As(actor.to_string());
         async move {
-            crate::gate::api_at_signed(http, base, reqwest::Method::GET, &path, None, signature)
-                .await
+            crate::sor_client::api_at_signed(
+                http,
+                base,
+                reqwest::Method::GET,
+                &path,
+                None,
+                signature,
+            )
+            .await
         }
     };
     let run = get(format!("/api/jobs/{run_id}"))
@@ -2618,7 +2806,7 @@ pub(crate) async fn transcript_source_at(
     Option<std::path::PathBuf>,
     std::result::Result<crate::transcript_usage::Layout, String>,
 ) {
-    let run = crate::gate::api_at_signed(
+    let run = crate::sor_client::api_at_signed(
         http,
         base,
         reqwest::Method::GET,
@@ -3225,7 +3413,7 @@ pub(crate) async fn report_with_receipt_at(
     use reqwest::Method;
     let api_at = |method: Method, path: String, body: Option<Value>| {
         let signature = crate::identity::Signature::As(actor.to_string());
-        async move { crate::gate::api_at_signed(http, base, method, &path, body, signature).await }
+        async move { crate::sor_client::api_at_signed(http, base, method, &path, body, signature).await }
     };
 
     let run_id = crate::job::fetch_and_resolve(http, run_ref).await?;
@@ -3537,9 +3725,9 @@ pub async fn report(
         .map(parse_tokens)
         .transpose()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let base = crate::gate::resolve_jobs_base(None)?;
+    let base = crate::sor_client::resolve_jobs_base(None)?;
     let actor = crate::identity::sign(&reqwest::Method::POST, "/api/jobs")?;
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     // METER THE RUN (backlog e6b2066f): its transcript's four counts
     // are what it consumed, and they supersede a typed count. Read here,
     // at the CLI boundary, because it is filesystem I/O. The week only
@@ -3665,7 +3853,7 @@ pub async fn run(
     // directory given, and stay until it ends (`crate::dispatch_launch`).
     launch: Option<crate::dispatch_launch::Request>,
 ) -> Result<()> {
-    let base = crate::gate::resolve_jobs_base(None)?;
+    let base = crate::sor_client::resolve_jobs_base(None)?;
     let repo = crate::brief::repo_root()?;
     // Named before any read: a run signs as the actor running the
     // verb, and an unnamed dispatch would file the run under nobody.
@@ -3686,7 +3874,7 @@ pub async fn run(
         crate::dispatch_launch::roster_is_mains(&repo)
             .map_err(|e| anyhow::anyhow!("boss dispatch --launch: {e}"))?;
     }
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let dispatched = dispatch_to(
         &http,
         &base,
@@ -5318,6 +5506,21 @@ pub(crate) mod wire_tests {
         lost: usize,
         raced: usize,
     ) -> (String, Log) {
+        stub_racing(packet, row, claim_conflict, level, lost, raced, false).await
+    }
+
+    /// [`stub_losing`], and `won_by_another`: the writer each lost race
+    /// loses TO completes `briefed` itself (a coordinator finishing the
+    /// run by hand, as on ea76e79f), so a re-read sees it completed.
+    async fn stub_racing(
+        packet: Value,
+        row: Value,
+        claim_conflict: bool,
+        level: Option<Option<&'static str>>,
+        lost: usize,
+        raced: usize,
+        won_by_another: bool,
+    ) -> (String, Log) {
         let run: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
         let lost = Arc::new(Mutex::new(lost));
         let raced = Arc::new(Mutex::new(raced));
@@ -5371,6 +5574,15 @@ pub(crate) mod wire_tests {
                         let mut left = raced.lock().unwrap();
                         if *left > 0 {
                             *left -= 1;
+                            if won_by_another
+                                && let Some(filed) = run.lock().unwrap().as_mut()
+                            {
+                                for step in filed["steps"].as_array_mut().into_iter().flatten() {
+                                    if step["id"] == "run-briefed" {
+                                        step["status"] = json!("completed");
+                                    }
+                                }
+                            }
                             (
                                 "409 Conflict",
                                 json!({
@@ -5501,6 +5713,9 @@ pub(crate) mod wire_tests {
                     stub_merge(&held, RUN, p, body);
                     ("204 No Content", String::new())
                 }
+                ("POST", p) if p.starts_with(&run_step) && p.ends_with("/metadata/records") => {
+                    stub_record(&held, RUN, p, body)
+                }
                 ("PUT", p) if p.starts_with(&run_step) => {
                     if body.get("metadata").is_some() {
                         return run_step_put(body);
@@ -5548,7 +5763,7 @@ pub(crate) mod wire_tests {
             let (base, log, run) =
                 keeping_stub(packet_without_projection(), row_with_block(), live_agents()).await;
             dispatch_at(
-                &crate::gate::machine_client().unwrap(),
+                &crate::sor_client::machine_client().unwrap(),
                 &base,
                 &repo(),
                 PACKET,
@@ -5610,7 +5825,7 @@ pub(crate) mod wire_tests {
         let (base, log, run) =
             keeping_stub(packet_without_projection(), row_with_block(), agents).await;
         dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -5649,7 +5864,7 @@ pub(crate) mod wire_tests {
     async fn an_unreadable_registry_leaves_the_nomination_to_the_dispatcher_service() {
         let (base, log) = stub(packet_without_projection(), row_with_block(), false).await;
         dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -5718,7 +5933,7 @@ pub(crate) mod wire_tests {
     async fn a_hook_cannot_claim_a_non_opus_model_for_an_opus_definition() {
         let (base, log) = stub(packet_without_projection(), row_with_block(), false).await;
         let result = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -5761,7 +5976,7 @@ pub(crate) mod wire_tests {
             ..Overrides::default()
         };
         let prompt = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -5791,8 +6006,10 @@ pub(crate) mod wire_tests {
                 // a packet a merged car already names is refused while
                 // nothing has been claimed and nothing filed.
                 ("GET".to_string(), "/api/jobs".to_string()),
-                // What is already named (7562d7a0): the landed
-                // `partial_item` cars, also read while nothing is held.
+                // What is already named (17bcc877): partial, closing and
+                // also-answer cars are all read while nothing is held.
+                ("GET".to_string(), "/api/jobs".to_string()),
+                ("GET".to_string(), "/api/jobs".to_string()),
                 ("GET".to_string(), "/api/jobs".to_string()),
                 ("GET".to_string(), "/api/workflows/backlog-item".to_string()),
                 (
@@ -5911,6 +6128,65 @@ pub(crate) mod wire_tests {
         assert_eq!(*briefed, json!({ "status": "completed" }));
     }
 
+    #[tokio::test]
+    async fn accumulated_evidence_dispatch_keeps_the_event_bounded_and_the_prompt_whole() {
+        let (base, log) = stub(packet_without_projection(), row_with_block(), false).await;
+        // Nested JSON evidence expands when copied into a JSON string, as
+        // the actual2710 packet's retained observation does (c495addb).
+        let brief = "{\"observation\":\"full original evidence\"}\n".repeat(30_000);
+        let content = crate::attach::tests::store().await;
+        let actor = boss_testing::test_values::example_email();
+        let dispatched = dispatch_to_with_content(
+            &crate::sor_client::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            &actor,
+            "emp-david",
+            "boss-dev-0",
+            BriefSource::Handed {
+                prompt: &brief,
+                session: None,
+            },
+            None,
+            Some(&content),
+        )
+        .await
+        .unwrap();
+        assert!(
+            dispatched.prompt.starts_with(&brief),
+            "full prompt must not be clipped"
+        );
+        let body = log
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+            .unwrap()
+            .2
+            .clone();
+        assert!(
+            serde_json::to_vec(&body).unwrap().len() < boss_events::outbox::MAX_STAGED_EVENT_BYTES,
+            "accumulated evidence makes the run creation event undispatchable"
+        );
+        assert_eq!(
+            crate::dispatch_brief::read_at(
+                &crate::sor_client::machine_client().unwrap(),
+                &content,
+                &actor,
+                &body["metadata"]["brief"]
+            )
+            .await
+            .unwrap(),
+            brief
+        );
+    }
+
     /// A TRUST-BOUNDARY ITEM IS DISPATCHED HELD (backlog 486dde37). The
     /// operator marked about ten cars by hand on 2026-09-27, each by
     /// remembering to tell the builder; the mark now rides the item and
@@ -5968,7 +6244,7 @@ pub(crate) mod wire_tests {
 
     async fn dispatch_to(base: &str) -> Result<Dispatched> {
         dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             base,
             &repo(),
             PACKET,
@@ -6033,10 +6309,14 @@ pub(crate) mod wire_tests {
         assert_eq!(briefed_calls(&log), vec!["PATCH", "PUT", "PUT"]);
     }
 
-    /// Losing twice is not a race any longer, and it is not retried
-    /// into silence: the refusal is the API's own, named.
+    /// Run ea76e79f, 2026-10-10 ~17:2xZ (backlog deba68e8): the
+    /// completion lost the race TWICE — one retry was not enough — and
+    /// the run stayed at briefed=ready with its prompt already printed,
+    /// so the reviewer's `--started` was refused. The completion is
+    /// idempotent (same status, same prompt_bytes), so it is re-read and
+    /// sent again up to [`BRIEFED_COMPLETE_ATTEMPTS`] times.
     #[tokio::test]
-    async fn a_completion_that_keeps_losing_is_refused_with_the_apis_reason() {
+    async fn a_completion_that_loses_the_race_twice_still_completes() {
         let (base, log) = stub_losing(
             packet_without_projection(),
             row_with_block(),
@@ -6046,16 +6326,76 @@ pub(crate) mod wire_tests {
             2,
         )
         .await;
+        dispatch_to(&base)
+            .await
+            .expect("dispatches on the third completion");
+        assert_eq!(briefed_calls(&log), vec!["PATCH", "PUT", "PUT", "PUT"]);
+    }
+
+    /// Losing every bounded attempt is not a race any longer, and it is
+    /// not retried into silence: the refusal is the API's own, named,
+    /// and it says loudly that the run is NOT startable and prints the
+    /// one command that finishes it — the prompt already printed names
+    /// this run, so a fresh dispatch would orphan it.
+    #[tokio::test]
+    async fn a_completion_that_keeps_losing_is_refused_with_the_apis_reason() {
+        let (base, log) = stub_losing(
+            packet_without_projection(),
+            row_with_block(),
+            false,
+            Some(None),
+            0,
+            BRIEFED_COMPLETE_ATTEMPTS,
+        )
+        .await;
         let err = match dispatch_to(&base).await {
-            Ok(_) => panic!("a completion refused twice must not dispatch"),
+            Ok(_) => panic!("a completion refused every time must not dispatch"),
             Err(e) => format!("{e:#}"),
         };
-        assert_eq!(briefed_calls(&log), vec!["PATCH", "PUT", "PUT"]);
+        let mut want = vec!["PATCH"];
+        want.extend(std::iter::repeat_n("PUT", BRIEFED_COMPLETE_ATTEMPTS));
+        assert_eq!(briefed_calls(&log), want);
         assert!(
             err.contains("completing the run's briefed step")
                 && err.contains("the stub lost a step race"),
             "{err}"
         );
+        assert!(err.contains("NOT startable"), "{err}");
+        let bytes = log
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(m, p, _)| m == "PATCH" && p.ends_with("/steps/run-briefed/metadata"))
+            .map(|(_, _, b)| b["prompt_bytes"].as_str().unwrap().to_string())
+            .expect("the field was written");
+        assert!(
+            err.contains(&format!(
+                "boss step complete {RUN} --step briefed --field prompt_bytes={bytes}"
+            )),
+            "{err}"
+        );
+    }
+
+    /// A race the re-read shows was WON by someone completing `briefed`
+    /// (a coordinator finishing it by hand, as on ea76e79f) is the
+    /// outcome dispatch wanted: no further completion is sent over it.
+    #[tokio::test]
+    async fn a_race_lost_to_a_completed_briefed_stops_retrying() {
+        let (base, log) = stub_racing(
+            packet_without_projection(),
+            row_with_block(),
+            false,
+            Some(None),
+            0,
+            BRIEFED_COMPLETE_ATTEMPTS,
+            true,
+        )
+        .await;
+        dispatch_to(&base)
+            .await
+            .expect("a briefed someone else completed is done");
+        assert_eq!(briefed_calls(&log), vec!["PATCH", "PUT"]);
     }
 
     /// A merge that never holds is not retried into silence: the run is
@@ -6109,7 +6449,7 @@ pub(crate) mod wire_tests {
         });
         let (base, log) = stub(packet_without_projection(), row_without, false).await;
         let err = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -6164,7 +6504,7 @@ pub(crate) mod wire_tests {
         });
         let (base, _log) = stub(packet_without_projection(), row_without, false).await;
         let err = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &checkout,
             PACKET,
@@ -6209,7 +6549,7 @@ pub(crate) mod wire_tests {
         ]);
         let (base, log) = stub(packet, row, false).await;
         let err = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -6288,7 +6628,7 @@ pub(crate) mod wire_tests {
         let served = served_repo();
         let (base, log) = stub(packet_in(json!(served.repo)), row_with_block(), false).await;
         let d = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -6409,7 +6749,7 @@ pub(crate) mod wire_tests {
         let car = car_at_review(Some("adversarial review of a trust-boundary change"));
         let (base, log) = stub(car.clone(), row_with_block(), false).await;
         let d = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -6517,7 +6857,7 @@ pub(crate) mod wire_tests {
     async fn a_review_step_with_no_hold_is_refused_before_the_claim() {
         let (base, log) = stub(car_at_review(None), row_with_block(), false).await;
         let err = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -6538,6 +6878,34 @@ pub(crate) mod wire_tests {
         assert_eq!(writes_of(&log), 0, "nothing claimed, nothing filed");
     }
 
+    /// THE REFUSAL POINTS WHERE OPTION A POINTS (backlog c851ed24, review
+    /// fe7b1b1e F4). Since bd331d38 a car needing a review BEFORE it
+    /// boards is a trust boundary — its ITEM is marked and the gate then
+    /// holds it — and `boss gate` refuses a `--hold` no rule requires;
+    /// every other car is reviewed after it lands. "Hold the car first
+    /// (boss hold)" said the opposite of coordinator rule 3: a door and
+    /// its rule saying two things.
+    #[test]
+    fn the_unheld_review_refusal_names_the_landed_review_and_the_mark() {
+        let car = car_at_review(None);
+        let step = &car["steps"][1];
+        let why = unheld_review_refusal("ship-a-change", "review", step)
+            .expect("an unheld review step is refused");
+        assert!(
+            why.contains("--step landed-review"),
+            "names where an unheld car's review is owed: {why}"
+        );
+        assert!(
+            why.contains("boss mark"),
+            "names the mark for a review before boarding: {why}"
+        );
+        assert!(
+            !why.contains("boss hold"),
+            "no longer advises the hold coordinator rule 3 retired: {why}"
+        );
+        assert!(why.contains("nothing claimed, nothing filed"), "{why}");
+    }
+
     /// A repo no instance serves has nowhere to land — tenant main is
     /// an instance's, reached only through merge-tenant-main — so the
     /// packet is refused before the claim, naming what IS served.
@@ -6550,7 +6918,7 @@ pub(crate) mod wire_tests {
         )
         .await;
         let err = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -6587,7 +6955,7 @@ pub(crate) mod wire_tests {
         )
         .await;
         let d = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -6823,7 +7191,7 @@ pub(crate) mod wire_tests {
 
         let (base, log) = report_stub(tenant_run("ready")).await;
         let err = report_with_receipt_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             RUN,
             &report,
@@ -6843,7 +7211,7 @@ pub(crate) mod wire_tests {
         let pass = receipt(passing_check());
         let (base, log) = report_stub(tenant_run("ready")).await;
         report_with_receipt_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             RUN,
             &report,
@@ -6908,7 +7276,7 @@ pub(crate) mod wire_tests {
         )
         .await;
         let err = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -6943,7 +7311,7 @@ pub(crate) mod wire_tests {
         )
         .await;
         let d = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -6984,7 +7352,7 @@ pub(crate) mod wire_tests {
             session: None,
         };
         dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -7010,7 +7378,7 @@ pub(crate) mod wire_tests {
             )
             .await;
             dispatch_at(
-                &crate::gate::machine_client().unwrap(),
+                &crate::sor_client::machine_client().unwrap(),
                 &base,
                 &repo(),
                 PACKET,
@@ -7035,7 +7403,7 @@ pub(crate) mod wire_tests {
     async fn a_held_step_is_refused_and_no_run_is_filed() {
         let (base, log) = stub(packet_without_projection(), row_with_block(), true).await;
         let err = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -7099,7 +7467,7 @@ pub(crate) mod wire_tests {
         })
         .await;
         let err = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -7190,7 +7558,7 @@ pub(crate) mod wire_tests {
             .await
         };
         dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -7215,8 +7583,14 @@ pub(crate) mod wire_tests {
         assert!(
             !calls
                 .iter()
-                .any(|(m, p, _)| m == "GET" && p.contains("backlog_item")),
-            "and --force does not spend the read it would ignore: {calls:?}"
+                .any(|(m, p, _)| m == "GET" && p == &cars_for_item_query(PACKET)),
+            "--force skips the refusal read, not the full closing-car evidence read: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|(m, p, _)| {
+                m == "GET" && p == &format!("{}&full=true&offset=0", cars_for_item_query(PACKET))
+            }),
+            "forced dispatch still briefs the closing car's evidence: {calls:?}"
         );
     }
 
@@ -7289,7 +7663,7 @@ pub(crate) mod wire_tests {
             .await
         };
         let prompt = dispatch_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             &repo(),
             PACKET,
@@ -7314,7 +7688,7 @@ pub(crate) mod wire_tests {
         assert!(packet < named && named < invariants, "{prompt}");
         assert!(
             prompt.contains(
-                "0d9163d3 feat/a-correction-names-what-it-corrects — merged at 5d1e2f3a4b5c"
+                "0d9163d3 feat/a-correction-names-what-it-corrects — landed at 5d1e2f3a4b5c"
             ),
             "{prompt}"
         );
@@ -7418,7 +7792,7 @@ pub(crate) mod wire_tests {
         .await;
         let now: chrono::DateTime<chrono::Utc> = "2026-09-18T19:00:00Z".parse().unwrap();
         let slice = transcript_slice_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             "claude@algedonic.dev",
             RUN,
@@ -7469,7 +7843,7 @@ pub(crate) mod wire_tests {
             })
             .await;
             let got = transcript_slice_at(
-                &crate::gate::machine_client().unwrap(),
+                &crate::sor_client::machine_client().unwrap(),
                 &base,
                 "claude@algedonic.dev",
                 RUN,
@@ -7523,7 +7897,7 @@ pub(crate) mod wire_tests {
             }),
         };
         report_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             RUN,
             &report,
@@ -7564,7 +7938,7 @@ pub(crate) mod wire_tests {
             }),
         };
         report_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             RUN,
             &report,
@@ -7653,7 +8027,7 @@ pub(crate) mod wire_tests {
             ),
         };
         report_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             RUN,
             &Report {
@@ -7700,7 +8074,7 @@ pub(crate) mod wire_tests {
                                   "status": "ready", "metadata": {} });
         let (base, log) = report_stub(run).await;
         report_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             RUN,
             &Report {
@@ -7975,7 +8349,7 @@ pub(crate) mod wire_tests {
             .await
         };
         report_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             RUN,
             &Report {
@@ -8033,7 +8407,7 @@ pub(crate) mod wire_tests {
             tokens: Some(Tokens::Total(1000)),
         };
         report_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             RUN,
             &report,
@@ -8071,7 +8445,7 @@ pub(crate) mod wire_tests {
         run["metadata"]["agent"] = json!("stranger@example.test");
         let (base, log) = report_stub(run).await;
         let err = report_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             RUN,
             &Report {
@@ -8130,7 +8504,7 @@ pub(crate) mod wire_tests {
         })
         .await;
         let err = report_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             RUN,
             &Report {
@@ -8298,7 +8672,7 @@ pub(crate) mod wire_tests {
 
         async fn take_next(base: &str) -> Result<Option<Dispatched>> {
             next_at(
-                &crate::gate::machine_client().unwrap(),
+                &crate::sor_client::machine_client().unwrap(),
                 base,
                 &repo(),
                 STATION,

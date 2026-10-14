@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------
+# The broker revokes the forge registry push token's OLD instance once
+# the forge host has recorded delivery of the new one (backlog 683d7fe9;
+# the off-host order of design 1c90d183, D1).
+#
+# THE GAP THIS CLOSES. The forge host reads a FILE its converge fills
+# from the Secret on its next pass, up to ten minutes later. Revoking in
+# that gap would leave the host holding a dead push token — and, once
+# the item's second car has moved the build onto that file, a converge
+# that builds the image and cannot push it. So
+# `broker-rotates-the-forge-registry-push-token` stops after verify, and
+# the host's deposit (infra/forge/registry-token-deposit.sh) completes
+# the packet's `delivered` step — a dedicated kind,
+# `credential-delivery`, so this fires on nothing else — carrying the
+# last eight of the value it installed. The handler then re-plans (the
+# Secret already holds this packet's token; a delivery firing never
+# mints), compares the host's last eight with the Secret's, and only
+# then revokes the token the scope step named.
+#
+# THE ARGS ARE THE ROTATION RULE'S, verbatim: one declaration, two
+# triggers. crates/core/boss-dispatcher/tests/
+# forge_registry_push_token_rules.rs pins them equal (CLAUDE.md §9a).
+[[rule]]
+name = "broker-revokes-the-forge-registry-push-token-on-delivery"
+why = """
+EXTERNAL GLUE, the same class as the rotation rule it completes: the
+effect is a DELETE on the forge's admin API, which no Workflow
+definition can address, and the condition is a fact only the host can
+observe — that it now holds the new value — which it records as the
+packet's `delivered` step. It adds no routing: it advances the very
+packet that fired it and spawns nothing. Design c8502e17 (2026-10-07).
+"""
+# v2 (design db018094, backlog ca356c79, 2026-10-10): `spare` learns
+# `boss-gcp-root-tree-token-*`, the read-only token root on boss-gcp
+# fetches its tree with — another token of the same forge user. A
+# content edit is a version bump (backlog 732c3cf9).
+version = 2
+on_event = "step.done.credential-delivery"
+when = 'subject_id = "forge-registry-push-token"'
+[[rule.do]]
+handler = "credential.rotate.forgejo-registry"
+args = { forge_user = "\"david\"", secret_namespace = "\"boss\"", secret_name = "\"forge-registry-push-token\"", secret_key = "\"token\"", scopes = "\"write:package\"", verify_image = "\"david/boss\"", delivery = "\"off-host\"", spare = "\"boss-gcp,boss-gcp-root-tree-token-*,boss-dev-forge-token-*,forge-host-checkout-token-*\"" }

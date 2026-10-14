@@ -22,8 +22,10 @@
 # own and no other, no password (locked), /usr/sbin/nologin for a shell,
 # /nonexistent for a home, no sudoers rule, no cron and no at. It is not
 # in `docker`, so neither daemon's socket opens for it. `runuser -u
-# boss-probe -- bash -c …` — the form prove.rs uses — execs the command
-# directly, so nologin stops a login and not a probe.
+# boss-probe -- setpriv --no-new-privs bash -c …` — the form prove.rs
+# uses — execs the command directly, so nologin stops a login and not a
+# probe, and no setuid binary lifts the probe above the account (review
+# acab446c F8b).
 #
 # THE FOUR MODES
 #
@@ -42,8 +44,11 @@
 #   verify-tick   ROOT, ExecStartPre=- of the ops runner (every tick, so
 #                 before any probe that tick runs). Removes the marker,
 #                 brings the view to the converged checkout's HEAD,
-#                 verifies the account again, and writes the marker only
-#                 if all of it held.
+#                 verifies the account again — what it reaches, and that
+#                 it can be launched with no_new_privs, too — and
+#                 writes the marker only if all of it held; when it does
+#                 not, it leaves its reason beside the marker, which the
+#                 door hands to the car's refusal.
 #   reap          ROOT, ExecStopPost=- of the ops runner: every process
 #                 the account still has is stopped and killed, and every
 #                 file it left in the shared temp directories is removed.
@@ -140,7 +145,9 @@
 # (what verify-tick writes), INSTALL_PROBE_GITCONFIG (a file instead of
 # --system), INSTALL_PROBE_ETC (where cron.deny, at.deny and
 # security/limits.d live), PROBE_TMP_DIRS, PROBE_CONTROL_SECRETS,
-# PROBE_CONTROL_NOWRITE, PROBE_CONTROL_SOCKETS, PROBE_FETCH_TIMEOUT.
+# PROBE_CONTROL_NOWRITE, PROBE_CONTROL_SOCKETS, PROBE_FETCH_TIMEOUT,
+# PROBE_TICK_REACH (the paths a tick asks the account to reach, in place
+# of the checkout owner's home, the secret paths and the docker sockets).
 # Pinned by crates/core/boss-testing/tests/probe_account_sh.rs.
 set -uo pipefail
 export LC_ALL=C
@@ -303,6 +310,21 @@ reap() {
     return 0
 }
 
+# ── what the account must never reach ────────────────────────────────
+# ONE LIST FOR BOTH ASKERS (review acab446c F5, backlog dda26693): the
+# controls walk each secret path to depth 3; every tick tries each at its
+# top, with the checkout owner's home itself. Two copies of this list
+# would be two answers to "what must a probe not open" (CLAUDE.md §9a).
+secret_paths() { # <the checkout owner's home, or empty>
+    printf '%s ' /etc/boss/machine-token /etc/boss/ops-runner.credential /etc/boss-ops \
+        /etc/boss-train /etc/boss-publish /root /run/boss-ops-runner /run/forge-converge
+    [ -z "$1" ] || printf '%s ' "$1/.config/boss" "$1/.ssh" "$1/.docker" "$1/.kube"
+}
+docker_sockets() { # <the checkout owner's uid, or empty>: both daemons
+    printf '%s ' /var/run/docker.sock
+    [ -z "$1" ] || printf '%s ' "/run/user/$1/docker.sock"
+}
+
 # ── verify ───────────────────────────────────────────────────────────
 # What the host answers NOW about the account and its view: reads only,
 # nothing repaired. Returns 0 with V_* set, or 1 with WHY set. Shared by
@@ -351,6 +373,66 @@ verify_now() {
         WHY="$ACCOUNT can WRITE the view at $VIEW"
         return 1
     fi
+    verify_launch || return 1
+    verify_reach
+}
+
+# THE LAUNCH, NOT ONLY THE ACCOUNT (review acab446c F8b, backlog
+# dda26693). runuser hands the account its uid and nothing that stops it
+# gaining more: every setuid binary on the host was a step up from inside
+# car text. The door (boss-cli prove.rs, NO_NEW_PRIVS) now launches each
+# probe as `runuser -u <account> -- setpriv --no-new-privs bash -c …`, so
+# an exec grants nothing the process did not hold. A host whose setpriv is
+# missing or cannot set the flag would answer every probe with exit 127 or
+# 1 — NOT PROVEN on correct code — so the tick asks the account to run the
+# SAME words (held equal to prove.rs by a test there) and reads the flag
+# back from the kernel: a launch that only looks like one is not a pass.
+verify_launch() {
+    local seen rc=0
+    seen="$(cd / && as_account setpriv --no-new-privs grep '^NoNewPrivs:' /proc/self/status 2>&1)" || rc=$?
+    case "$(printf '%s' "$seen" | tr -s ' \t' ' ')" in
+        "NoNewPrivs: 1") return 0 ;;
+    esac
+    WHY="$ACCOUNT cannot be launched with no_new_privs set, the way the door launches every probe: setpriv (exit $rc) answered '$(printf '%s' "$seen" | tr '\n' ' ' | cut -c1-200)'"
+    return 1
+}
+
+# REACH, NOT ONLY IDENTITY (review acab446c F5, backlog dda26693). The
+# checks above say who the account is; whether it can open what it must
+# not — the checkout owner's home, either docker socket, a token path —
+# was measured only by the controls verb, which does not gate, while
+# builder-rules.md and OPERATIONS.md state as fact that nothing of the
+# owner's is readable. A mode that drifts (a home made 0755, a socket
+# 0666) now stops the very next tick. ONE call as the account, so a tick
+# adds one session line to the journal, not one per path; and the call
+# must say it finished, because a runuser that dies prints nothing and
+# nothing is not "reaches nothing".
+verify_reach() {
+    local paths owner owner_home="" owner_uid="" reached
+    if [ -n "${PROBE_TICK_REACH+set}" ]; then
+        paths="$PROBE_TICK_REACH"
+    else
+        owner="$(stat -c %U -- "$SRC" 2>/dev/null)"
+        [[ "$owner" =~ ^[a-z_][a-z0-9_-]*$ ]] \
+            || { WHY="who owns $SRC cannot be read, so what $ACCOUNT can reach of its owner's was not asked"; return 1; }
+        owner_home="$(getent passwd "$owner" | cut -d: -f6)"
+        owner_uid="$(getent passwd "$owner" | cut -d: -f3)"
+        paths="$(secret_paths "$owner_home")${owner_home:+$owner_home }$(docker_sockets "$owner_uid")"
+    fi
+    # shellcheck disable=SC2016,SC2086 # the inner script's own $p; a word list
+    reached="$(cd / && as_account sh -c 'for p do
+            if [ -e "$p" ] && { [ -r "$p" ] || [ -w "$p" ]; }; then printf "%s\n" "$p"; fi
+        done
+        echo asked' sh $paths 2>/dev/null)"
+    case "$reached" in
+        asked | *$'\n'asked) reached="${reached%asked}" ;;
+        *) WHY="could not ask what $ACCOUNT can reach (the one command run as it did not finish)"; return 1 ;;
+    esac
+    reached="$(printf '%s' "$reached" | tr '\n' ' ')"
+    if [ -n "${reached// /}" ]; then
+        WHY="$ACCOUNT can reach ${reached% } — a path it must neither read nor write"
+        return 1
+    fi
     return 0
 }
 
@@ -359,23 +441,46 @@ verify_now() {
 # REMOVED FIRST, and written again only when the view is current and the
 # account verifies now. Anything else — this copy missing, a hang cut by
 # the bound, a drift — leaves no marker, and no probe runs that tick.
+#
+# AND IT SAYS WHY WHERE THE CAR WILL READ IT (review acab446c F3, backlog
+# dda26693). The reason was said only on the runner's journal, while the
+# refusal the car records sent its reader to the converge packet's
+# `probe_account` — written every ten minutes, and `verified` while a tick
+# fails for a cause of its own (the 30 s fetch, a runuser bound under
+# load, the marker write). So the car named a cause that was not the
+# cause. Now a tick that writes no marker writes its one line beside it,
+# `<marker>.why`, root's alone in the runner's own runtime directory, and
+# the door (boss-cli prove.rs, `probe_account_refusal`) carries it into
+# the refusal. Both are removed first: neither outlives its tick.
+tick_refuses() { # <reason file> <the line>
+    say "$2"
+    (umask 077 && printf '%s: %s\n' "$ME" "$(printf '%s' "$2" | tr '\n' ' ')" >"$1.new" \
+        && mv -f -- "$1.new" "$1") 2>/dev/null || rm -f -- "$1.new" 2>/dev/null
+    return 0
+}
+
 verify_tick() {
     local marker="${BOSS_PROBE_VERIFIED_FILE:-}"
     case "$marker" in
         /*) ;;
         *) say "verify-tick REFUSED — BOSS_PROBE_VERIFIED_FILE is not an absolute path ('$marker'); the drop-in sets it"; return 1 ;;
     esac
-    rm -f -- "$marker" 2>/dev/null
+    local why="$marker.why" line rc=0
+    rm -f -- "$marker" "$why" 2>/dev/null
     if [ -e "$marker" ] || [ -L "$marker" ]; then
-        say "verify-tick FAILED — the last tick's marker at $marker could not be removed"
+        tick_refuses "$why" "verify-tick FAILED — the last tick's marker at $marker could not be removed"
         return 1
     fi
-    if ! refresh_view; then
-        say "verify-tick: NO PROBE RUNS THIS TICK — the view could not be made current (the line above)"
+    # Its one line is said as before, and kept: the reason file has no
+    # "line above".
+    line="$(refresh_view)" || rc=$?
+    [ -z "$line" ] || printf '%s\n' "$line"
+    if [ "$rc" -ne 0 ]; then
+        tick_refuses "$why" "verify-tick: NO PROBE RUNS THIS TICK — the view could not be made current: ${line#"$ME: "}"
         return 1
     fi
     if ! verify_now; then
-        say "verify-tick: NO PROBE RUNS THIS TICK — $WHY"
+        tick_refuses "$why" "verify-tick: NO PROBE RUNS THIS TICK — $WHY"
         return 1
     fi
     umask 077
@@ -383,7 +488,7 @@ verify_tick() {
         return 0
     fi
     rm -f -- "$marker.new" "$marker" 2>/dev/null
-    say "verify-tick FAILED — could not write $marker; no probe runs this tick"
+    tick_refuses "$why" "verify-tick FAILED — could not write $marker; no probe runs this tick"
     return 1
 }
 
@@ -433,6 +538,12 @@ prepare() {
 
     # No cron, no at, a bounded process count. cron.allow, where a host
     # has one, already excludes everyone it does not name.
+    #
+    # A denial or a bound that cannot be written is NOT_REPAIRED and the
+    # converge goes on (review acab446c F7, backlog dda26693): neither is
+    # something verify reads, so the tick still writes its marker, and
+    # stopping here used to leave the view unmade and the packet saying
+    # STOPPED while probes ran. `ensure` reports it, red.
     for f in cron at; do
         if [ -f "$HOST_ETC/$f.allow" ]; then
             if grep -qxF -- "$ACCOUNT" "$HOST_ETC/$f.allow"; then
@@ -440,13 +551,13 @@ prepare() {
                 return 1
             fi
         elif ! grep -qxF -- "$ACCOUNT" "$HOST_ETC/$f.deny" 2>/dev/null; then
-            printf '%s\n' "$ACCOUNT" >>"$HOST_ETC/$f.deny" || { WHY="could not add $ACCOUNT to $HOST_ETC/$f.deny"; return 1; }
+            printf '%s\n' "$ACCOUNT" >>"$HOST_ETC/$f.deny" || NOT_REPAIRED+=("could not add $ACCOUNT to $HOST_ETC/$f.deny")
         fi
     done
     install -d -m 0755 -- "$HOST_ETC/security/limits.d" \
         && printf '# Rendered by infra/forge/probe-account.sh ensure (backlog 703358ce).\n%s hard nproc %s\n' \
             "$ACCOUNT" "$NPROC_LIMIT" >"$HOST_ETC/security/limits.d/boss-probe.conf" \
-        || { WHY="could not write the process bound under $HOST_ETC/security/limits.d"; return 1; }
+        || NOT_REPAIRED+=("could not write the process bound under $HOST_ETC/security/limits.d")
 
     # The view, and the one git setting that lets the account read a
     # repository root owns.
@@ -470,13 +581,15 @@ prepare() {
     if ! grep -qxF -- "$VIEW" <<<"$safe"; then
         "${gitcfg[@]}" --add safe.directory "$VIEW" || { WHY="could not add $VIEW to the system gitconfig's safe.directory"; return 1; }
     fi
-    refresh_view || { WHY="the probe's view at $VIEW could not be made current (see the line above)"; return 1; }
+    # The view itself is made by `ensure` beside the verify, as a tick
+    # makes it: the two steps that decide whether a tick writes a marker.
     return 0
 }
 
 FACTS=()
+NOT_REPAIRED=()
 ensure() {
-    local verified=0 dropin runner_unit cli marker knows=0
+    local verified=0 dropin runner_unit cli marker knows=0 prep_why="" r
     # WHICH MACHINE THIS IS, BEFORE THE COPY AND THE ACCOUNT (backlog
     # 62b09c57, N7; infra/lib/host-check.sh carries the incident — the
     # `boss-probe` account this function made on the dev pod on
@@ -507,14 +620,32 @@ ensure() {
         exit 1
     fi
 
-    # Make and repair what can be, then ask the host — whatever the
-    # repairs returned.
-    if prepare && verify_now; then
+    # Make and repair what can be, then ask the host — WHATEVER the
+    # repairs returned. It said it did and did not: `prepare &&
+    # verify_now` never asked when a repair failed, so the packet said
+    # STOPPED on a host whose tick — which repairs nothing and runs this
+    # same verify — still wrote the marker (review acab446c F7, backlog
+    # dda26693). Now a failed repair and the account's own answer are two
+    # facts, and the line below says which one stops probes: STOPPED is
+    # what a tick decides — the view made current, then the verify — and
+    # those two run here exactly as a tick runs them.
+    local view_ok=1
+    prepare || prep_why="$WHY"
+    for r in "${NOT_REPAIRED[@]}"; do prep_why="${prep_why:+$prep_why; }$r"; done
+    refresh_view || view_ok=0
+    if [ "$view_ok" -eq 1 ] && verify_now; then
         verified=1
         run_summary_field probe_account_id "uid=$V_UID gid=$V_GID groups=$V_GROUPS shell=$V_SHELL"
         run_summary_field probe_account_sudo "$V_SUDO"
         run_summary_field probe_view "$VIEW at $V_HEAD"
+        if [ -n "$prep_why" ]; then
+            echo "$ME: NOT REPAIRED — $prep_why" >&2
+            run_summary_note "$ME: NOT REPAIRED — $prep_why"
+        fi
     else
+        [ "$view_ok" -eq 1 ] || WHY="the probe's view at $VIEW could not be made current (see the line above)"
+        # The converge's own cause leads: it is usually why verify failed.
+        [ -z "$prep_why" ] || WHY="$prep_why (and the account does not verify: $WHY)"
         echo "$ME: NOT VERIFIED — $WHY" >&2
         run_summary_note "$ME: NOT VERIFIED — $WHY"
     fi
@@ -522,6 +653,10 @@ ensure() {
     runner_unit="$ETC/boss-ops-runner.service"
     if [ ! -f "$runner_unit" ]; then
         say "this host has no ops runner unit at $runner_unit — no probe runs here, so no drop-in is written"
+        if [ "$verified" -eq 1 ] && [ -n "$prep_why" ]; then
+            run_summary_field probe_account "NOT REPAIRED: $prep_why (verified; no ops runner on this host)"
+            return 1
+        fi
         if [ "$verified" -eq 1 ]; then
             run_summary_field probe_account "verified; no ops runner on this host"
             return 0
@@ -580,6 +715,11 @@ ensure() {
     } >"$dropin.new" && mv -f -- "$dropin.new" "$dropin" \
         || { run_summary_field probe_account "FAILED: could not write $dropin"; return 1; }
 
+    if [ "$verified" -eq 1 ] && [ -n "$prep_why" ]; then
+        say "$ACCOUNT verifies as it stands, but this converge could not finish: $prep_why"
+        run_summary_field probe_account "NOT REPAIRED: $prep_why — $ACCOUNT verifies as it stands, so a tick whose verify-tick holds still runs probes as $ACCOUNT in $VIEW; this converge stays red until the repair lands"
+        return 1
+    fi
     if [ "$verified" -eq 1 ]; then
         say "$ACCOUNT verified (uid $V_UID, no group but its own, sudo: $V_SUDO); the view is at ${V_HEAD:0:12}; $dropin points the ops runner's probes at both"
         run_summary_field probe_account "verified${FACTS[*]:+ (${FACTS[*]})}; probes run as $ACCOUNT in $VIEW"
@@ -655,7 +795,7 @@ controls() {
     else
         owner=""
     fi
-    local secrets="${PROBE_CONTROL_SECRETS-/etc/boss/machine-token /etc/boss/ops-runner.credential /etc/boss-ops /etc/boss-train /etc/boss-publish /root /run/boss-ops-runner /run/forge-converge ${owner_home:+$owner_home/.config/boss $owner_home/.ssh $owner_home/.docker $owner_home/.kube}}"
+    local secrets="${PROBE_CONTROL_SECRETS-$(secret_paths "$owner_home")}"
     for p in $secrets; do
         if [ ! -e "$p" ]; then absent "read: $p"; continue; fi
         n=0
@@ -719,7 +859,7 @@ controls() {
     done
 
     # DOCKER, both daemons.
-    local sockets="${PROBE_CONTROL_SOCKETS-/var/run/docker.sock ${owner_uid:+/run/user/$owner_uid/docker.sock}}"
+    local sockets="${PROBE_CONTROL_SOCKETS-$(docker_sockets "$owner_uid")}"
     for p in $sockets; do
         if [ ! -e "$p" ]; then absent "docker: $p"; continue; fi
         if as_account test -r "$p" || as_account test -w "$p"; then

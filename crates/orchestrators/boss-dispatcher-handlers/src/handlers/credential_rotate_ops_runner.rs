@@ -120,9 +120,10 @@ pub const DELIVERY_OFF_HOST: &str = "off-host";
 pub const DEPOSIT_ACTOR: &str = "automation:runner-credential-deposit";
 
 /// Names the file a separately projected ServiceAccount token sits in —
-/// one audience, ten minutes (design 6e28ed42, David 2026-10-06). Set
-/// NOWHERE today: no manifest projects that volume, because the decision
-/// authorized no activation. Unset, the stage commands go out as before.
+/// one audience, ten minutes (design 6e28ed42, David 2026-10-06). Set by
+/// boss.yaml since the activation (backlog 25fff647), beside the
+/// projected volume and the jobs API's door, which then REFUSES a runner
+/// stage that arrives without it. Unset, the stage commands go out as before.
 pub const STAGE_TOKEN_FILE_ENV: &str = "BOSS_BROKER_STAGE_TOKEN_FILE";
 
 /// The step kinds of the two firings.
@@ -439,8 +440,8 @@ pub struct CredentialRotateOpsRunner {
     secrets: Arc<dyn SecretStore>,
     poll: ResolvePoll,
     /// The projected broker-stage token's file (design 6e28ed42), when
-    /// the deployment names one. `None` — every deployment today — sends
-    /// the phases exactly as before.
+    /// the deployment names one (boss.yaml, since backlog 25fff647).
+    /// `None` sends the phases exactly as before.
     stage_token_file: Option<PathBuf>,
 }
 

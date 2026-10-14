@@ -72,15 +72,13 @@ crates/orchestrators/boss-cli/src/cadence.rs	the CLI names the record in a refus
 crates/orchestrators/boss-cli/src/credential.rs	BOSS_TRAIN_FORGE_URL default and a refusal message (the CLI reads env as before)
 crates/orchestrators/boss-cli/src/gate.rs	#[cfg(test)] probe fixtures
 crates/orchestrators/boss-cli/src/git_auth.rs	BOSS_TRAIN_FORGE_URL default plus #[cfg(test)] fixtures
-crates/orchestrators/boss-cli/src/host_readiness.rs	#[cfg(test)] estate fixture
 crates/orchestrators/boss-cli/src/prove.rs	#[cfg(test)] probe fixture
 crates/orchestrators/boss-cli/src/publish.rs	#[cfg(test)] clone-URL fixture
+crates/orchestrators/boss-cli/src/sor_client.rs	#[cfg(test)] service_at and signing fixtures, moved from gate.rs with the client (backlog 76b846cd)
 crates/orchestrators/boss-cli/src/train/forge.rs	the Forgejo adapter's BOSS_TRAIN_FORGE_URL default (the CLI reads env as before)
 crates/orchestrators/boss-cli/src/train/jobs_api.rs	#[cfg(test)] fixture: the transport error a blip classifies
 crates/orchestrators/boss-cli/src/train/mod.rs	the conductor Config's BOSS_TRAIN_FORGE_URL default (the CLI reads env as before)
 crates/orchestrators/boss-cli/src/train/preflight.rs	refusal prose and #[cfg(test)] fixtures for the forge/adapter mismatch
-crates/orchestrators/boss-cli/src/train/red_verdict.rs	#[cfg(test)] fixtures: the forge target_url a red check carries
-crates/orchestrators/boss-dispatcher-handlers/src/handlers/estate_compare.rs	#[cfg(test)] estate fixtures
 infra/cluster/manifests/boss-audit-integrity.yaml	a CronJob's image: the kubelet pulls it; a manifest reads no host file (the registry as a render parameter is a later car)
 infra/cluster/manifests/boss-backup.yaml	CronJob images, as above
 infra/cluster/manifests/boss-break-glass-deposit.yaml	CronJob image
@@ -107,6 +105,7 @@ infra/cluster/talos/patches/cp-2.yaml	machine.registries.mirrors, as above
 infra/cluster/talos/patches/cp-3.yaml	machine.registries.mirrors, as above
 infra/cluster/talos/patches/w-1.yaml	machine.registries.mirrors, as above
 infra/forge/boss-ci/Dockerfile	FROM lines pull mirrored bases by registry tag; a Dockerfile reads no env
+infra/gate-runner/bootstrap.sh	run.sh's fetch, one step earlier: it runs in the gate Job before any checkout and fetches run.sh itself (e3100bc8)
 infra/gate-runner/gate-runner.yaml	the gate Job's images (a manifest rendered by gate.rs)
 infra/gate-runner/run.sh	runs in a cluster Job before it has a checkout or a host file; gate.rs rendering both addresses from the source is the follow-up
 infra/lint/ci-checks-out-from-the-forge.sh	the expected checkout line it holds ci.yml to

@@ -407,10 +407,10 @@ test.describe('/ux/warehouse — State B: the Inventory tab', () => {
 });
 
 test.describe('/ux/warehouse — State B: every link lands on a catalogued route, and back', () => {
-  test('the four link placements go to three routes; parts is module-gated, POs and vendors are not', async () => {
+  test('the four link placements keep PO availability separate from Warehouse-gated Vendors and Parts', async () => {
     expect(landing(`${ROUTE_CATALOG.parts.path}/ING-HOPS-01`)).toEqual({ kind: 'part', section: 'parts', module: 'parts' });
-    expect(landing('/ux/purchase-orders/PO-101')).toEqual({ kind: 'po', section: 'vendors', module: null });
-    expect(landing(`${ROUTE_CATALOG.vendors.path}/v-riverside`)).toEqual({ kind: 'vendor', section: 'vendors', module: null });
+    expect(landing('/ux/purchase-orders/PO-101')).toEqual({ kind: 'po', section: 'purchase-order', module: null });
+    expect(landing(`${ROUTE_CATALOG.vendors.path}/v-riverside`)).toEqual({ kind: 'vendor', section: 'vendors', module: 'warehouse' });
   });
 
   test('Overview: each below-reorder SKU links to its part; following one lands there and back returns to the Overview', async ({ page }) => {
@@ -531,18 +531,67 @@ test.describe('/ux/warehouse — State B: every link lands on a catalogued route
     }
   });
 
-  // Gap 13 (9db5097f): the SKU links go through the `parts` flag, a
-  // second tenant flag, so warehouse on with parts off lands on the
-  // module-disabled notice.
-  test('with warehouse on and parts off, a SKU link lands on ModuleDisabled', async ({ page }) => {
+  // Gap 13 (9db5097f): Parts-disabled warehouse rows retain their SKU
+  // without offering navigation to an unavailable detail surface.
+  test('with warehouse on and parts off, SKU detail navigation is unavailable with a reason', async ({ page }) => {
     await installWarehouse(page);
     await installTenantManifest(page, { ...MODULES_ON, parts: false });
     await mountWarehouse(page);
-    await body(page).locator('section.tab-section').last().getByRole('link', { name: 'PKG-CAN-01', exact: true }).click();
-    await expect.poll(() => new URL(page.url()).pathname).toBe(`${ROUTE_CATALOG.parts.path}/PKG-CAN-01`);
-    await expect(page.locator('.module-disabled strong')).toHaveText('Ingredients & parts');
+    await expect(body(page).getByRole('link', { name: 'PKG-CAN-01', exact: true })).toHaveCount(0);
+    await expect(body(page)).toContainText('Part details are unavailable because the Parts module is disabled.');
+    await expect(body(page)).toContainText('PKG-CAN-01');
   });
 });
+
+const unavailablePartsManifests: ReadonlyArray<Readonly<Record<string, boolean>>> = [
+  { ...MODULES_ON, parts: false }, { warehouse: true },
+];
+for (const placement of ['Overview', 'Inventory']) {
+  for (const modules of unavailablePartsManifests) {
+    test(`SKU guard ${placement}: ${'parts' in modules ? 'disabled' : 'unlisted'} Parts leaves plain rows and visible SKUs`, async ({ page }) => {
+      await installWarehouse(page);
+      await installTenantManifest(page, modules);
+      const seen = watch(page);
+      await mountWarehouse(page);
+      await tab(page, placement).click();
+      const row = body(page).locator('tbody tr').filter({ hasText: 'PKG-CAN-01' });
+      await expect(row).toHaveCount(1);
+      await expect(row.locator('a')).toHaveCount(0);
+      await expect(row).not.toHaveAttribute('role', 'link');
+      await expect(row).not.toHaveAttribute('tabindex', '0');
+      await expect(row).not.toHaveClass(/data-table-row-link/);
+      await expect(body(page)).toContainText('Part details are unavailable because the Parts module is disabled.');
+      await row.locator('td').nth(1).click();
+      await row.evaluate((node) => {
+        node.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        node.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }));
+      });
+      expect(new URL(page.url()).pathname).toBe(PATH);
+      expect(seen.writes).toHaveLength(0);
+    });
+  }
+  for (const activation of ['anchor', 'row-click', 'row-enter', 'row-space']) {
+    test(`SKU enabled ${placement}: ${activation} reaches the Part detail`, async ({ page }) => {
+      await installWarehouse(page);
+      const seen = watch(page);
+      await mountWarehouse(page);
+      await tab(page, placement).click();
+      const anchor = body(page).getByRole('link', { name: 'PKG-CAN-01', exact: true });
+      const row = anchor.locator('xpath=ancestor::tr');
+      await expect(anchor).toHaveAttribute('href', `${ROUTE_CATALOG.parts.path}/PKG-CAN-01`);
+      if (activation === 'anchor') await anchor.click();
+      else if (activation === 'row-click') await row.locator('td').nth(1).click();
+      else {
+        await row.focus();
+        await row.press(activation === 'row-enter' ? 'Enter' : 'Space');
+      }
+      await expect.poll(() => new URL(page.url()).pathname).toBe(`${ROUTE_CATALOG.parts.path}/PKG-CAN-01`);
+      await expect(page.locator('.detail-page')).toContainText('16oz can');
+      await expect(page.locator('.module-disabled')).toHaveCount(0);
+      expect(seen.writes).toHaveLength(0);
+    });
+  }
+}
 
 test.describe('/ux/warehouse — State B: the Receiving tab', () => {
   test('paints Open and All, one button per status present, the toggle, and the open POs', async ({ page }) => {
@@ -620,7 +669,7 @@ test.describe('/ux/warehouse — State B: the Create PO form (the one write)', (
     await expect(body(page).getByLabel('Qty', { exact: true })).toHaveValue('10');
     await expect(body(page).getByLabel('Qty', { exact: true })).toHaveAttribute('min', '1');
     await expect(body(page).getByLabel('Unit cost ($)', { exact: true })).toHaveValue('500');
-    await expect(body(page).getByLabel('Unit cost ($)', { exact: true })).toHaveAttribute('min', '1');
+    await expect(body(page).getByLabel('Unit cost ($)', { exact: true })).toHaveAttribute('min', '0');
 
     // Submit is disabled until both Vendor and Part SKU are set.
     await expect(button(page, 'Submit')).toBeDisabled();
@@ -699,11 +748,13 @@ test.describe('/ux/warehouse — State B: the Create PO form (the one write)', (
     await expect(poStatusLine(page)).toHaveText('Error: Failed to fetch');
   });
 
-  // Gap 10 (aad31699): a quantity below 1 makes Submit a silent no-op —
-  // the button stays enabled, nothing is sent and nothing is said.
-  test('a quantity below 1 sends nothing and says nothing', async ({ page }) => {
+  // Gap 10 (aad31699): the existing below-one quantity refusal must
+  // explain itself. Cost semantics remain the native Draft contract.
+  test('a quantity below 1 sends nothing and explains the refusal', async ({ page }) => {
+    const seen = watch(page);
     await recordPageRequests(page);
     await installWarehouse(page);
+    await page.route(CREATE, (r) => json(r, { id: 'PO-VALID-QTY' }));
     await mountWarehouse(page);
     await openForm(page);
     await body(page).getByLabel('Vendor', { exact: true }).fill('v-riverside');
@@ -712,17 +763,50 @@ test.describe('/ux/warehouse — State B: the Create PO form (the one write)', (
       await body(page).getByLabel('Qty', { exact: true }).fill(qty);
       await expect(button(page, 'Submit')).toBeEnabled();
       await button(page, 'Submit').click();
+      await expect(poStatusLine(page)).toHaveText('Error: Quantity must be at least 1');
     }
     // The page's own record, read once Submit has returned: a write the
     // click opened is in it already. It slept 300 ms and read Playwright's
     // request event until backlog 840c5a76 — a bet on the event's transit.
     const writes = pageWrites(await openedRequests(page));
     expect(writes.map((e) => `${e.method} ${e.path}`)).toEqual([]);
-    await expect(poStatusLine(page)).toHaveCount(0);
+    await expect(poStatusLine(page)).toHaveText('Error: Quantity must be at least 1');
     await expect(button(page, 'Cancel')).toBeVisible();
+    // The refusal leaves the form usable: correcting just the quantity
+    // performs the ordinary Draft request, with its cost untouched.
+    await body(page).getByLabel('Qty', { exact: true }).fill('2');
+    await button(page, 'Submit').click();
+    await expect(poStatusLine(page)).toHaveText('PO PO-VALID-QTY created');
+    const corrected = pageWrites(await openedRequests(page));
+    expect(corrected).toHaveLength(1);
+    expect(seen.writes[0]!.postDataJSON()).toEqual({
+      vendor: 'v-riverside',
+      lines: [{ part_sku: 'PKG-CAN-01', qty: 2, unit_cost_cents: 50000, currency: 'USD' }],
+    });
   });
 
-  // Gap 10 (aad31699): the unit cost is not guarded — 0 is sent.
+  test('a negative unit cost explains the refusal without writing and recovers at zero', async ({ page }) => {
+    const seen = watch(page);
+    await recordPageRequests(page);
+    await installWarehouse(page);
+    await page.route(CREATE, (r) => json(r, { id: 'PO-ZERO-COST' }));
+    await mountWarehouse(page);
+    await openForm(page);
+    await body(page).getByLabel('Vendor', { exact: true }).fill('v-riverside');
+    await body(page).getByLabel('Part SKU', { exact: true }).selectOption('PKG-CAN-01');
+    await body(page).getByLabel('Unit cost ($)', { exact: true }).fill('-3');
+    await button(page, 'Submit').click();
+    await expect(poStatusLine(page)).toHaveText('Error: Unit cost must not be negative');
+    expect(pageWrites(await openedRequests(page))).toEqual([]);
+    await expect(button(page, 'Cancel')).toBeVisible();
+    await body(page).getByLabel('Unit cost ($)', { exact: true }).fill('0');
+    await button(page, 'Submit').click();
+    await expect(poStatusLine(page)).toHaveText('PO PO-ZERO-COST created');
+    expect(seen.writes).toHaveLength(1);
+    expect(seen.writes[0]!.postDataJSON().lines[0].unit_cost_cents).toBe(0);
+  });
+
+  // Decision 0a8e95f1 settles gap10's cost rule: zero Draft cost is valid.
   test('a unit cost of 0 is sent as 0 cents', async ({ page }) => {
     const seen = watch(page);
     await installWarehouse(page);

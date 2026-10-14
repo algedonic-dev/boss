@@ -383,6 +383,14 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // by the forge host's deposit, never by this handler — the same
         // argument holds.
         ("credential.rotate.forgejo", vec!["jobs.step.completed"]),
+        // The same handler under its registry-proof name (backlog
+        // 683d7fe9): one code path, so the same emission and the same
+        // argument — it completes `task` steps of the packet that fired
+        // it, never a credential-rotation or credential-delivery step.
+        (
+            "credential.rotate.forgejo-registry",
+            vec!["jobs.step.completed"],
+        ),
         // Installation diagnostics (99a2649d) record immutable evidence
         // through the first-record door, then complete the task. The
         // read grants no permission and emits no credential lifecycle fact.
@@ -501,6 +509,20 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // write is to its OWN alarm; it grants and refuses nothing.
         (
             "policy.check.refusals.alarm",
+            vec![
+                "jobs.job.created",
+                "jobs.job.updated",
+                "jobs.step.completed",
+            ],
+        ),
+        // The watch on asks (backlog d653e090): an hourly read of the
+        // machine gate's durable window that files (`jobs.job.created`)
+        // at most one alarm for asks from a caller nobody expects and
+        // adds a later one to it (`jobs.job.updated`), and withdraws its
+        // own unreadable alarm through its step (`jobs.step.completed`).
+        // Every write is to its OWN alarm; it grants and refuses nothing.
+        (
+            "machine.gate.asked.alarm",
             vec![
                 "jobs.job.created",
                 "jobs.job.updated",

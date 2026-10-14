@@ -80,6 +80,8 @@ cd "$LINT_DIR/../.."
 . "$LINT_DIR/lib/allowlist.sh" || exit 3
 # shellcheck source=infra/lint/lib/test-file.sh
 . "$LINT_DIR/lib/test-file.sh" || exit 3
+# shellcheck source=infra/lint/lib/policy-insert-wallclock.sh
+. "$LINT_DIR/lib/policy-insert-wallclock.sh" || exit 3
 
 LINT=no-wallclock
 
@@ -727,6 +729,11 @@ while IFS= read -r line; do
   code="${line#*:}"
   code="${code#*:}"
   if sql_allow_line "$code"; then
+    continue
+  fi
+  rest="${line#*:}"
+  lineno="${rest%%:*}"
+  if policy_operational_insert_allowed "$file" "$file" "$lineno"; then
     continue
   fi
   sql_violation_lines+=("$line")

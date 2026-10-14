@@ -109,12 +109,13 @@ prune_ci_images() {
     local total_bytes=0 freed_bytes=0 candidates=0 listed=0
     landed_keys=$(printf '%s\n' "$landed" | grep -c . || true)
 
-    # (1) WHICH DAEMON. `$docker_cmd` is deliberately word-split: it is
-    # "sudo -n docker" for the system daemon, the same sudo the converge
-    # runner uses for `docker run`. A refusal is a skip that SAYS SO.
+    # (1) WHICH DAEMON. `$docker_cmd` is deliberately word-split: a
+    # command and its words — `docker` as root for the system daemon
+    # since the sweep moved to root (backlog 683d7fe9), `sudo -n docker`
+    # before. A refusal is a skip that SAYS SO.
     # shellcheck disable=SC2086
     if ! root="$($docker_cmd info --format '{{.DockerRootDir}}' 2>/dev/null)" || [ -z "$root" ]; then
-        echo "$prefix: CI-IMAGE PRUNE SKIPPED — \`$docker_cmd info\` could not be read, so there is no daemon to prune (sudo -n refused, or no daemon there). Nothing was freed; this is not a clean pass." >&2
+        echo "$prefix: CI-IMAGE PRUNE SKIPPED — \`$docker_cmd info\` could not be read, so there is no daemon to prune (it refused, or no daemon is there). Nothing was freed; this is not a clean pass." >&2
         return 1
     fi
     case "$root" in

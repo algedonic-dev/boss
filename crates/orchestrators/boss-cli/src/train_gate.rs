@@ -51,7 +51,9 @@ pub(crate) const DEFAULT_NAMESPACE: &str = "boss-dev";
 
 /// The metadata keys the train carries about its gate.
 pub(crate) const KEY_RUN: &str = "train_gate_run";
-pub(crate) const KEY_LAUNCHED_AT: &str = "train_gate_launched_at";
+/// ONE spelling, in boss-jobs: the yard dates a relaunched train's wait
+/// for a bay from it (`regions::train_gate_wait_since`, 19227ca8).
+pub(crate) const KEY_LAUNCHED_AT: &str = boss_jobs::regions::TRAIN_GATE_LAUNCHED_AT;
 pub(crate) const KEY_RELAUNCHES: &str = "train_gate_relaunches";
 pub(crate) const KEY_REFUSALS: &str = "train_gate_refusals";
 pub(crate) const KEY_LAUNCH_FAILURES: &str = "train_gate_launch_failures";
@@ -64,6 +66,14 @@ pub(crate) const KEY_FALLBACK: &str = boss_jobs::regions::TRAIN_GATE_FALLBACK;
 /// and no reason; the yard drew a healthy train (48f7aba1). Cleared the
 /// pass the gate is filed.
 pub(crate) const KEY_WAIT_REASON: &str = boss_jobs::regions::TRAIN_GATE_WAIT_REASON;
+/// The train's PLACE in the gate line (design 1e787fc2): set only while
+/// the conductor finds the gate bound full (or a gate ended and is owed a
+/// relaunch), cleared the pass the gate is filed or a launch fails for
+/// any other reason. Its own key because the wait reason above carries
+/// every launch fault, and a fault is no claim on a bay (backlog
+/// 82071657); `gate::trains_waiting` counts it only while the conductor
+/// is alive to honour it.
+pub(crate) const KEY_BOUND_WAIT: &str = "train_gate_bound_wait";
 
 /// Launch attempts the conductor makes (one per reconcile pass, a minute
 /// apart) before a gate it cannot file is read as unavailable.
@@ -145,7 +155,7 @@ fn verdict_metadata(gate_run: &Value) -> Option<&Value> {
 
 /// The receipt as an object. It rides the step as a JSON STRING (the
 /// runner's encoding); one already parsed to an object reads the same.
-fn receipt(gate_run: &Value) -> Option<Value> {
+pub(crate) fn receipt(gate_run: &Value) -> Option<Value> {
     verdict_metadata(gate_run)
         .and_then(|m| m.get("receipt"))
         .and_then(|r| match r {

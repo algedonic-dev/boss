@@ -34,20 +34,23 @@
 //! refuses a credentialed caller first), and this token is not consulted
 //! by the delivery door at all.
 //!
-//! IT IS OFF UNTIL CONFIGURED, AND NOTHING CONFIGURES IT. The decision
-//! authorizes no deployment, no grant and no enforcement flip, so the
-//! five variables of [`Door::from_env`] are set nowhere and no manifest
-//! projects the token. Off, a runner row's phases are recorded as they
+//! IT IS OFF UNTIL CONFIGURED. Off — none of the five variables of
+//! [`Door::from_env`] set — a runner row's phases are recorded as they
 //! always were. Partly configured is not off: it refuses runner stages
 //! by name. A token presented to a door that cannot verify it is refused
-//! too — a presented identity is never quietly ignored.
+//! too — a presented identity is never quietly ignored. ON IS A NEW
+//! REFUSAL: a runner row's phase with no verified token is refused 403.
+//! The activation (backlog 25fff647) sets all five in boss.yaml, beside
+//! the projected token the dispatcher presents, in ONE container, so the
+//! door and its one caller turn on in the same roll.
 //!
 //! NO TokenReview. The decision grants none, so nothing here asks the
 //! cluster whether a token is still live; that is the ten-minute limit
 //! above, stated rather than hidden. The trusted keys arrive through the
-//! [`StageKeys`] port, whose one adapter reads a key-set file on every
-//! verification. Who fills that file — and with what proof of the
-//! cluster's TLS trust — belongs to the activation packet, not this car.
+//! [`StageKeys`] port: [`ClusterKeySet`] fetches the issuer's key set
+//! from the API server on every verification, presenting this pod's own
+//! ServiceAccount token over TLS trusting only the cluster CA (David on
+//! design 20058482, `stage-keys`); [`KeySetFile`] reads a file instead.
 //!
 //! NO VALUE LEAVES THIS MODULE: a refusal is one of a closed set of
 //! fixed sentences, and a verified token is logged as its audience, its
@@ -176,6 +179,11 @@ pub struct TrustedKey {
 /// blocking pool. An error is a refusal, never an empty key set.
 pub trait StageKeys: Send + Sync {
     fn trusted(&self) -> Result<Vec<TrustedKey>, String>;
+
+    /// Where, in words, for the boot line — never a key, never a token.
+    fn source(&self) -> String {
+        "a key source with no description".into()
+    }
 }
 
 /// A key set (the issuer's `/openid/v1/jwks` document) in a file, read on
@@ -197,6 +205,138 @@ impl StageKeys for KeySetFile {
             return Err(format!("{path}: holds no RS256 signing key"));
         }
         Ok(keys)
+    }
+
+    fn source(&self) -> String {
+        format!("the key-set file {}", self.0.display())
+    }
+}
+
+/// The pod's own ServiceAccount token and the cluster CA, where the
+/// kubelet mounts them in every pod that automounts its token (the boss
+/// pod does: boss.yaml, `automountServiceAccountToken: true`).
+pub const CLUSTER_TOKEN_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+pub const CLUSTER_CA_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+const MAX_POD_FILE_BYTES: u64 = 64 * 1024;
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The issuer's key set fetched from the cluster API server, on every
+/// verification — the posture of [`KeySetFile`], with no cache to go
+/// stale and no filler whose own TLS trust would need proving (David on
+/// design 20058482, `stage-keys`: the jobs API fetches it itself).
+///
+/// WHY THE POD TOKEN NEVER LEAVES THE CLUSTER. The fetch presents the
+/// pod's OWN ServiceAccount token — the one that holds the broker's
+/// Secret grants — because the discovery endpoints answer 401 to an
+/// anonymous read (measured 2026-10-06). So the one trust root of the
+/// connection is the cluster CA in `ca_file`; the platform's built-in
+/// roots are switched off, plain HTTP and redirects are refused, and the
+/// bearer is written only after a handshake that CA verified. A server
+/// the cluster CA never certified — anything but an API server — never
+/// receives a byte of it, whatever `url` names.
+pub struct ClusterKeySet {
+    pub url: String,
+    pub token_file: PathBuf,
+    pub ca_file: PathBuf,
+}
+
+impl ClusterKeySet {
+    /// The pod's own files at the kubelet's paths.
+    pub fn in_pod(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            token_file: PathBuf::from(CLUSTER_TOKEN_FILE),
+            ca_file: PathBuf::from(CLUSTER_CA_FILE),
+        }
+    }
+
+    /// A bounded read of one mounted file. The error names the path and
+    /// the fault, never the content.
+    fn read_pod_file(path: &std::path::Path) -> Result<String, String> {
+        let shown = path.display();
+        let meta = std::fs::metadata(path).map_err(|e| format!("{shown}: {e}"))?;
+        if !meta.is_file() || meta.len() > MAX_POD_FILE_BYTES {
+            return Err(format!("{shown}: not a regular file within bounds"));
+        }
+        std::fs::read_to_string(path).map_err(|e| format!("{shown}: {e}"))
+    }
+}
+
+impl StageKeys for ClusterKeySet {
+    fn trusted(&self) -> Result<Vec<TrustedKey>, String> {
+        use std::io::Read as _;
+        let url = &self.url;
+        let ca_shown = self.ca_file.display();
+        let ca = Self::read_pod_file(&self.ca_file)?;
+        if !ca.contains("-----BEGIN CERTIFICATE-----") {
+            return Err(format!("{ca_shown}: holds no PEM certificate"));
+        }
+        let ca = reqwest::Certificate::from_pem(ca.as_bytes())
+            .map_err(|_| format!("{ca_shown}: not a readable certificate"))?;
+        let token = Self::read_pod_file(&self.token_file)?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(format!("{}: is empty", self.token_file.display()));
+        }
+        let mut bearer = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| format!("{}: not one header-safe line", self.token_file.display()))?;
+        bearer.set_sensitive(true);
+        let client = reqwest::blocking::Client::builder()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(ca)
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(FETCH_TIMEOUT)
+            .build()
+            .map_err(|e| format!("a client trusting only {ca_shown} could not be built: {e}"))?;
+        // reqwest's error names the URL and the fault; it never carries a
+        // request header.
+        let response = client
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, bearer)
+            .send()
+            .map_err(|e| format!("{url}: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("{url}: answered {status}"));
+        }
+        let mut text = String::new();
+        response
+            .take(MAX_KEY_SET_BYTES + 1)
+            .read_to_string(&mut text)
+            .map_err(|e| format!("{url}: the body is unreadable ({e})"))?;
+        if text.len() as u64 > MAX_KEY_SET_BYTES {
+            return Err(format!("{url}: the key set is larger than its bound"));
+        }
+        let keys = parse_key_set(&text).ok_or_else(|| format!("{url}: not a key set"))?;
+        if keys.is_empty() {
+            return Err(format!("{url}: holds no RS256 signing key"));
+        }
+        Ok(keys)
+    }
+
+    fn source(&self) -> String {
+        format!(
+            "{} with this pod's ServiceAccount token, trusting only {}",
+            self.url,
+            self.ca_file.display()
+        )
+    }
+}
+
+/// The key source a `BOSS_BROKER_STAGE_KEY_SET` value names: an `https`
+/// URL is fetched from the cluster ([`ClusterKeySet`]); anything else
+/// spelled as a URL is refused, because the fetch presents the pod's own
+/// token and verified TLS is the only channel it may cross; a path is a
+/// key-set file ([`KeySetFile`]).
+fn key_source(value: &str) -> Result<Arc<dyn StageKeys>, String> {
+    match value.split_once("://") {
+        Some(("https", _)) => Ok(Arc::new(ClusterKeySet::in_pod(value))),
+        Some(_) => Err(format!(
+            "{KEY_SET_ENV} names a key set by a scheme other than https; the fetch presents \
+             the pod's own ServiceAccount token, so it crosses verified TLS or nothing"
+        )),
+        None => Ok(Arc::new(KeySetFile(PathBuf::from(value)))),
     }
 }
 
@@ -395,6 +535,10 @@ impl Door {
                 "{AUDIENCE_ENV} is the issuer itself, which is the cluster's own audience and not a distinct one"
             ));
         }
+        let keys = match key_source(key_set) {
+            Ok(keys) => keys,
+            Err(why) => return Door::Broken(why),
+        };
         Door::On {
             terms: Terms {
                 issuer: issuer.clone(),
@@ -402,7 +546,19 @@ impl Door {
                 namespace: namespace.clone(),
                 service_account: service_account.clone(),
             },
-            keys: Arc::new(KeySetFile(PathBuf::from(key_set))),
+            keys,
+        }
+    }
+
+    /// The boot's one read of the key set (blocking), so the log says at
+    /// start whether this pod's identity can fetch it — the activation's
+    /// first evidence, read before any stage needs it. `None` when the
+    /// door is not on; the count of trusted keys, or why there are none.
+    /// It refuses nothing: every verification reads the keys afresh.
+    pub fn check_keys(&self) -> Option<Result<usize, String>> {
+        match self {
+            Door::On { keys, .. } => Some(keys.trusted().map(|k| k.len())),
+            Door::Off | Door::Broken(_) => None,
         }
     }
 
@@ -415,9 +571,13 @@ impl Door {
             Door::Broken(why) => {
                 format!("REFUSING runner credential stages — misconfigured: {why}")
             }
-            Door::On { terms, .. } => format!(
-                "on: issuer {}, audience {}, workload {}/{}, lifetime at most {MAX_LIFETIME_SECS}s",
-                terms.issuer, terms.audience, terms.namespace, terms.service_account
+            Door::On { terms, keys } => format!(
+                "on: issuer {}, audience {}, workload {}/{}, lifetime at most {MAX_LIFETIME_SECS}s, keys from {}",
+                terms.issuer,
+                terms.audience,
+                terms.namespace,
+                terms.service_account,
+                keys.source()
             ),
         }
     }

@@ -1,0 +1,5 @@
+{
+  "worker_image": {"repository": "david/boss-ci", "tag": "rust1.96"},
+  "postgres_image": {"repository": "david/postgres", "tag": "16"},
+  "forge_repository": "david/boss"
+}

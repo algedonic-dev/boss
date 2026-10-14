@@ -93,8 +93,34 @@ fn the_retired_observability_service_gets_no_config() {
         );
         // The run still produced the fleet's configs, so the absence
         // above is the generator's choice, not a run that stopped early.
-        assert!(etc.join("boss-dispatcher.toml").is_file(), "{case}");
+        assert!(etc.join("boss-jobs-api.toml").is_file(), "{case}");
     }
+}
+
+#[test]
+fn environment_configured_services_get_no_unread_toml() {
+    let etc = generate("environment-only-services", &[]);
+    for name in ["boss-policy-api.toml", "boss-dispatcher.toml"] {
+        assert!(!etc.join(name).exists(), "unread config generated: {name}");
+    }
+    // The generator still configures its real readers and their validators.
+    let people: toml::Value =
+        toml::from_str(&std::fs::read_to_string(etc.join("boss-people-api.toml")).unwrap())
+            .unwrap();
+    assert_eq!(
+        people["classes_api_url"].as_str(),
+        Some("http://127.0.0.1:7100")
+    );
+    assert_eq!(
+        people["locations_api_url"].as_str(),
+        Some("http://127.0.0.1:7100")
+    );
+    let jobs: toml::Value =
+        toml::from_str(&std::fs::read_to_string(etc.join("boss-jobs-api.toml")).unwrap()).unwrap();
+    assert_eq!(
+        jobs["subject_kinds_api_url"].as_str(),
+        Some("http://127.0.0.1:7130")
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -254,25 +280,10 @@ fn the_people_api_reaches_the_calendar_on_the_port_boss_ports_gives_it() {
 // this is caught at the gate instead.
 
 /// What a generated toml is read by.
-enum Reader {
-    /// The binary whose `--config` defaults to this toml deserializes
-    /// it into `name`, a struct declared at top level of `file`. Found
-    /// by reading each binary's `load`/`toml::from_str` call, and held
-    /// to that binary below: its source must name both the struct and
-    /// `/etc/<toml>`.
-    Struct {
-        bin: &'static str,
-        file: &'static str,
-        name: &'static str,
-    },
-    /// No binary reads the file — its configuration comes from the
-    /// environment. Held below: the binary names no `/etc/<toml>`, and
-    /// the file may carry no `*_api_url` key, because one there would
-    /// configure nothing.
-    Unread {
-        bin: &'static str,
-        why: &'static str,
-    },
+struct Reader {
+    bin: &'static str,
+    file: &'static str,
+    name: &'static str,
 }
 
 /// Every file generate-configs.sh writes, and what reads it. A new block
@@ -280,7 +291,7 @@ enum Reader {
 const SERVICES: &[(&str, Reader)] = &[
     (
         "boss-shipping-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/modules/boss-shipping/src/bin/boss_shipping_api.rs",
             file: "crates/modules/boss-shipping/src/shipping_config.rs",
             name: "ShippingApiConfig",
@@ -288,7 +299,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-messages-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/modules/boss-messages/src/bin/boss_messages_api.rs",
             file: "crates/modules/boss-messages/src/messages_config.rs",
             name: "MessagesApiConfig",
@@ -296,7 +307,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-inventory-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/modules/boss-inventory/src/bin/boss_inventory_api.rs",
             file: "crates/modules/boss-inventory/src/inventory_config.rs",
             name: "InventoryApiConfig",
@@ -304,7 +315,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-commerce-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/modules/boss-commerce/src/bin/boss_commerce_api.rs",
             file: "crates/modules/boss-commerce/src/commerce_config.rs",
             name: "CommerceApiConfig",
@@ -312,7 +323,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-people-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/modules/boss-people/src/bin/boss_people_api.rs",
             file: "crates/modules/boss-people/src/people_config.rs",
             name: "PeopleApiConfig",
@@ -320,7 +331,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-accounts-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/modules/boss-accounts/src/bin/boss_accounts_api.rs",
             file: "crates/modules/boss-accounts/src/accounts_api_config.rs",
             name: "AccountsApiConfig",
@@ -328,7 +339,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-assets-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/modules/boss-assets/src/bin/boss_assets_api.rs",
             file: "crates/modules/boss-assets/src/asset_config.rs",
             name: "AssetsApiConfig",
@@ -336,7 +347,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-catalog-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/modules/boss-catalog/src/bin/boss_catalog_api.rs",
             file: "crates/modules/boss-catalog/src/kb_config.rs",
             name: "KbApiConfig",
@@ -344,7 +355,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-calendar-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/core/boss-calendar/src/bin/boss_calendar_api.rs",
             file: "crates/core/boss-calendar/src/calendar_config.rs",
             name: "CalendarApiConfig",
@@ -352,7 +363,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-jobs-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/core/boss-jobs/src/bin/boss_jobs_api.rs",
             file: "crates/core/boss-jobs/src/jobs_config.rs",
             name: "JobsApiConfig",
@@ -360,7 +371,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-ml-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/orchestrators/boss-ml-api/src/main.rs",
             file: "crates/core/boss-ml/src/config.rs",
             name: "MlApiConfig",
@@ -368,7 +379,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-ledger-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/modules/boss-ledger/src/bin/boss_ledger_api.rs",
             file: "crates/modules/boss-ledger/src/config.rs",
             name: "LedgerApiConfig",
@@ -376,23 +387,15 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-content-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/core/boss-content/src/bin/boss_content_api.rs",
             file: "crates/core/boss-content/src/config.rs",
             name: "ContentApiConfig",
         },
     ),
     (
-        "boss-policy-api.toml",
-        Reader::Unread {
-            bin: "crates/core/boss-policy/src/bin/boss_policy_api.rs",
-            why: "boss-policy-api reads BOSS_POSTGRES_URL and BOSS_POLICY_PORT from the \
-                  environment and takes no --config",
-        },
-    ),
-    (
         "boss-classes-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/core/boss-classes/src/bin/boss_classes_api.rs",
             file: "crates/core/boss-classes/src/classes_config.rs",
             name: "ClassesApiConfig",
@@ -400,7 +403,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-locations-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/core/boss-locations/src/bin/boss_locations_api.rs",
             file: "crates/core/boss-locations/src/locations_config.rs",
             name: "LocationsApiConfig",
@@ -408,7 +411,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-subject-kinds-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/core/boss-subject-kinds/src/bin/boss_subject_kinds_api.rs",
             file: "crates/core/boss-subject-kinds/src/subject_kinds_config.rs",
             name: "SubjectKindsApiConfig",
@@ -416,7 +419,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-events-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/orchestrators/boss-events-api/src/main.rs",
             file: "crates/core/boss-events/src/events_api_config.rs",
             name: "EventsApiConfig",
@@ -424,7 +427,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-products-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/modules/boss-products/src/bin/boss_products_api.rs",
             file: "crates/modules/boss-products/src/config.rs",
             name: "ProductsApiConfig",
@@ -432,7 +435,7 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-campaigns-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/modules/boss-campaigns/src/bin/boss_campaigns_api.rs",
             file: "crates/modules/boss-campaigns/src/bin/boss_campaigns_api.rs",
             name: "Config",
@@ -440,33 +443,13 @@ const SERVICES: &[(&str, Reader)] = &[
     ),
     (
         "boss-customers-api.toml",
-        Reader::Struct {
+        Reader {
             bin: "crates/modules/boss-customers/src/bin/boss_customers_api.rs",
             file: "crates/modules/boss-customers/src/bin/boss_customers_api.rs",
             name: "Config",
         },
     ),
-    (
-        "boss-dispatcher.toml",
-        Reader::Unread {
-            bin: "crates/orchestrators/boss-dispatcher-handlers/src/bin/boss_dispatcher.rs",
-            why: "boss-dispatcher builds DispatcherConfig::default(), which reads BOSS_*_URL \
-                  from the environment and falls back to boss_ports::url for each",
-        },
-    ),
 ];
-
-/// `(toml, field, reason)`: fields a config struct declares that the
-/// generator deliberately does not write. Each must still be declared,
-/// must not be written, and must say why.
-const URLS_NOT_WRITTEN: &[(&str, &str, &str)] = &[(
-    "boss-people-api.toml",
-    "subject_kinds_api_url",
-    "boss-people-api builds the client into PeopleApiState.subject_kinds and no handler \
-     reads it: http.rs says the validator never fires, scaffolding for a Subject::Custom \
-     write the people surface does not accept. Writing it would log \"SubjectKind registry \
-     validation enabled\" for a check that does not run (backlog 6777fecf).",
-)];
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
@@ -515,13 +498,6 @@ fn every_service_is_told_exactly_the_urls_its_config_declares() {
         generated, tabled,
         "SERVICES must name every file generate-configs.sh writes, and only those"
     );
-    for (toml_name, field, reason) in URLS_NOT_WRITTEN {
-        assert!(
-            !reason.trim().is_empty(),
-            "{toml_name} {field}: an excuse needs a reason"
-        );
-    }
-
     let mut failures = Vec::new();
     let mut declared_total = 0;
     for (toml_name, reader) in SERVICES {
@@ -537,52 +513,21 @@ fn every_service_is_told_exactly_the_urls_its_config_declares() {
             .cloned()
             .collect();
         let etc_path = format!("\"/etc/{toml_name}\"");
-        let declared = match reader {
-            Reader::Struct { bin, file, name } => {
-                let bin_src = read(bin);
-                assert!(
-                    bin_src.contains(&etc_path) && bin_src.contains(name),
-                    "{bin} must default --config to {etc_path} and load {name} — \
-                     the row for {toml_name} names the wrong reader"
-                );
-                declared_urls(file, name)
-            }
-            Reader::Unread { bin, why } => {
-                assert!(
-                    !read(bin).contains(&etc_path),
-                    "{bin} names {etc_path} now, so the row saying nothing reads \
-                     {toml_name} ({why}) is stale: map it to the struct it loads"
-                );
-                BTreeSet::new()
-            }
-        };
+        let Reader { bin, file, name } = reader;
+        let bin_src = read(bin);
+        assert!(
+            bin_src.contains(&etc_path) && bin_src.contains(name),
+            "{bin} must default --config to {etc_path} and load {name} — \
+             the row for {toml_name} names the wrong reader"
+        );
+        let declared = declared_urls(file, name);
         declared_total += declared.len();
-        let excused: BTreeSet<String> = URLS_NOT_WRITTEN
-            .iter()
-            .filter(|(t, _, _)| t == toml_name)
-            .map(|(_, f, _)| f.to_string())
-            .collect();
-        for field in excused.difference(&declared) {
-            failures.push(format!(
-                "{toml_name}: {field} is excused in URLS_NOT_WRITTEN but its config no \
-                 longer declares it — drop the excuse"
-            ));
-        }
-        for field in excused.intersection(&written) {
-            failures.push(format!(
-                "{toml_name}: {field} is excused in URLS_NOT_WRITTEN but the generator \
-                 writes it — drop the excuse"
-            ));
-        }
         for field in declared.difference(&written) {
-            if !excused.contains(field) {
-                failures.push(format!(
-                    "{toml_name}: its config declares {field} and generate-configs.sh does \
-                     not write it, so whatever it switches on is off on every container pod \
-                     (aa6b4b5c, b224ab3c). Write it in the block, delete the field, or \
-                     excuse it in URLS_NOT_WRITTEN with the reason"
-                ));
-            }
+            failures.push(format!(
+                "{toml_name}: its config declares {field} and generate-configs.sh does \
+                 not write it, so whatever it switches on is off on every container pod \
+                 (aa6b4b5c, b224ab3c). Write it in the block or delete the unused field."
+            ));
         }
         for field in written.difference(&declared) {
             failures.push(format!(

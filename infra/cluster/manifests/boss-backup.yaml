@@ -1,7 +1,7 @@
 # Nightly pg_dump of the cluster BOSS database — the system of
 # record gets backups on day one (David, 2026-08-12).
 #
-# Dump to a Longhorn PVC (14-day retention), then upload the fresh
+# Dump to a Longhorn PVC (the three newest kept), then upload the fresh
 # dump offsite to a GCS bucket. A failed upload fails the Job loudly —
 # an offsite copy that silently stops is worse than none.
 #
@@ -49,10 +49,10 @@
 # boss-files-gc deletes bytes only when their last ref was soft-deleted
 # more than 30 days earlier (DEFAULT_GC_GRACE_DAYS). So the newest
 # archive holds every object any dump younger than 30 days points to —
-# and every dump either copy keeps (14 days here, 21 in the bucket) is. Each
-# archive is a FULL copy, so keeping 14 of them would fill this volume
-# long before the dumps did; three are kept on each side, enough to
-# survive a bad night.
+# and every dump either copy keeps (three here, 21 in the bucket) is. Each
+# archive is a FULL copy, so keeping one per bucket dump would fill this
+# volume long before the dumps did; three are kept on each side, enough
+# to survive a bad night.
 #
 # boss-files is ReadWriteOnce, so this pod runs beside deploy/boss (the
 # podAffinity below); a run while that pod is down waits until it is
@@ -196,8 +196,13 @@ spec:
                   # cannot quietly ship yesterday's dump if today's is
                   # missing.
                   echo "$OUT" > /backup/.latest
-                  # Retention: 14 days. Prune loudly, never silently.
-                  find /backup -name 'boss-*.sql.gz' -mtime +14 -print -delete
+                  # Retention: the three newest, as the archives below.
+                  # It was 14 days until the volume fell under its floor
+                  # (estate alarm 3be7e44e, 2026-10-09): the dump grew
+                  # from 105M to 1.6G in nineteen nights, so fifteen of
+                  # them outgrew 20Gi, and the bucket keeps 21 anyway.
+                  # Prune loudly, never silently.
+                  find /backup -name 'boss-*.sql.gz' -mtime +2 -print -delete
                   echo "backups on volume:"; ls -lh /backup | tail -8
               env:
                 - name: DATABASE_URL

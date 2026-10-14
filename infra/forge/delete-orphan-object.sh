@@ -78,10 +78,14 @@
 #
 # ENV
 #   BOSS_CLUSTER_TREE  the tree whose manifests are the declaration set
-#                      (default: the repository this script lives in).
-#                      A test seam; a packet cannot set it, because the
-#                      ops-runner passes no packet-supplied environment
-#                      — only an argv built from the allowlist.
+#                      (default: the runner's BOSS_OPS_CHECKOUT, else the
+#                      repository this script lives in — the forge's
+#                      runner executes root's tree, which has no .git to
+#                      read, so its drop-in hands the checkout; backlog
+#                      a604a35b). A test seam; a packet cannot set it,
+#                      because the ops-runner passes no packet-supplied
+#                      environment — only an argv built from the
+#                      allowlist.
 #   BOSS_KUBECTL       see undeclared-objects.sh; resolved there, once.
 #   KUBECONFIG         a credential that can read the managed namespaces
 #                      and delete in them. Under the ops-runner there is
@@ -97,7 +101,7 @@ refuse() { say "REFUSED — $*"; exit 2; }
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SELF_DIR/.." && cd .. && pwd)"
 DERIVE="$REPO/infra/cluster/undeclared-objects.sh"
-TREE="${BOSS_CLUSTER_TREE:-$REPO}"
+TREE="${BOSS_CLUSTER_TREE:-${BOSS_OPS_CHECKOUT:-$REPO}}"
 MANIFEST_REL="infra/cluster/manifests"
 
 # --- bound 1: the argument's shape -----------------------------------------

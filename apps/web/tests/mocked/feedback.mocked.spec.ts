@@ -35,7 +35,7 @@ test.describe('feedback control', () => {
   // reports the first failure without saying which navigation was
   // slow, and re-navigating three times in a single test made this
   // the flakiest thing in the suite.
-  for (const path of ['/ux/jobs', '/it', '/ux/views']) {
+  for (const path of ['/ux/jobs', '/it', '/ux/inbox']) {
     test(`is in the chrome on ${path}`, async ({ page }) => {
       await mountPage(page, path);
       await expect(chromeFeedback(page)).toBeVisible();
@@ -50,7 +50,7 @@ test.describe('feedback control', () => {
       return route.fulfill({ json: { id: 'job-fb-1', kind: 'user-feedback' } });
     });
 
-    await mountPage(page, '/ux/views');
+    await mountPage(page, '/ux/inbox');
     await chromeFeedback(page).click();
     await page.getByRole('radio', { name: /^feature$/i }).click();
     await page.getByPlaceholder(/idea, a gap/i).fill('Column picker forgets my choice');
@@ -69,8 +69,8 @@ test.describe('feedback control', () => {
     // Identity-first shape. The pre-2026-06-13 {custom_kind, ref_id}
     // form 422s with "missing field `id`" — the failure that left the
     // design-review button dead for weeks.
-    expect(body.subject).toEqual({ subject_kind: 'custom', id: '/ux/views' });
-    expect(body.metadata.route).toBe('/ux/views');
+    expect(body.subject).toEqual({ subject_kind: 'custom', id: '/ux/inbox' });
+    expect(body.metadata.route).toBe('/ux/inbox');
     expect(body.metadata.message).toContain('Column picker');
     expect(body.tags).toContain('feedback');
   });
@@ -107,7 +107,7 @@ test.describe('feedback control', () => {
       return route.fulfill({ json: { id: 'job-fb-2', kind: 'user-feedback' } });
     });
 
-    await mountPage(page, '/ux/views');
+    await mountPage(page, '/ux/inbox');
     await chromeFeedback(page).click();
 
     // Bug is the default, and Send stays disabled until BOTH halves are

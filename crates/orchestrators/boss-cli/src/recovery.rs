@@ -175,7 +175,7 @@ pub async fn dispatch(cmd: Cmd, now: chrono::DateTime<chrono::Utc>) -> Result<()
             };
             let wire = crate::steps::Wire::live()?;
             let content = crate::tenant_publish::service_on_door(
-                &crate::gate::resolve_jobs_base(None)?,
+                &crate::sor_client::resolve_jobs_base(None)?,
                 "content",
             )?;
             let print = || {
@@ -2242,9 +2242,14 @@ mod tests {
             fact(backups, "Offsite dumps kept"),
             &Value::Text("21".into())
         );
+        // The figure is find's own -mtime N, so the label says what N
+        // is: a dump is deleted once its age in WHOLE days passes it.
+        // It said "kept (days)" and printed 14 while fifteen nights were
+        // kept; at 2 it would have read "two" over a volume holding
+        // three (estate alarm 3be7e44e, review 298f7808 B1).
         assert_eq!(
-            fact(backups, "In-cluster copies kept"),
-            &Value::Text("14".into())
+            fact(backups, "In-cluster dumps deleted once older than"),
+            &Value::Text("2".into())
         );
     }
 
@@ -2369,9 +2374,10 @@ mod tests {
         // the one step whose omission silently undoes the patch at the
         // next converge, and it was the only step the reader had to
         // compose: the road printed the script's path and left `sudo`,
-        // the checkout and the verb to memory. The checkout is read from
-        // the unit that runs the converge the hold stops.
-        let hold = "sudo bash /home/david/boss/infra/forge/converge-hold.sh";
+        // the checkout and the verb to memory. The tree is read from the
+        // unit that runs the converge the hold stops — root's tree since
+        // backlog 683d7fe9, which runs the converge from it.
+        let hold = "sudo bash /var/lib/boss/tree/current/infra/forge/converge-hold.sh";
         assert_eq!(
             text("Then hold the converge"),
             format!(
@@ -2392,8 +2398,8 @@ mod tests {
         };
         assert!(
             source("Then hold the converge")
-                .contains("checkout=infra/forge/cluster-deploy-runner.service#"),
-            "the checkout is the converge unit's own: {}",
+                .contains("tree=infra/forge/cluster-deploy-runner.service#"),
+            "the tree is the converge unit's own: {}",
             source("Then hold the converge")
         );
         // THE IMAGE IS READ WHERE THE FORGE RUNS KUBECTL (F1, blocking).
@@ -2459,12 +2465,12 @@ mod tests {
         let path = dir.join(runner);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
-            text.contains("\nK=\"sudo docker run "),
+            text.contains("\nK=\"docker run "),
             "{runner} runs kubectl as K"
         );
         write_file(
             &path,
-            &text.replace("\nK=\"sudo docker run ", "\nKC=\"sudo docker run "),
+            &text.replace("\nK=\"docker run ", "\nKC=\"docker run "),
         );
         let problems = load(&dir).expect_err("a moved image line must fail the sheet");
         assert!(

@@ -5,7 +5,19 @@ The existing verified-image installer supplies this artifact. Its
 internal manifest conserves bytes and paths, not image authenticity.
 The installer also publishes this file as image-cli/<commit>/dev-control.
 Explicit activation uses that installed door with `activate <full commit>
---config <reviewed configuration>`; installation never invokes it.
+--config <reviewed configuration>`. Installation never ACTIVATES: where a
+selector already exists the installer runs `activate <full commit>
+--reactivate` so the doors follow main (design a68fc42a D6), and with no
+selector that pass is inert.
+
+Rollback uses the SAME transition lock as follow-main and refusal:
+image-cli/<verified-sha>/dev-control deactivate <verified-sha>.
+It validates the published archive, records off durably, and removes
+the selector under the lock. Keep the store and its lock; bare rm of
+enabled or the store is not a serialized rollback. After this door
+acknowledges off, maintenance cannot turn isolation back on. Only a
+new explicit activate with reviewed config clears off. All live
+activation/deactivation remains a separately authorized operator act.
 """
 import argparse
 import hashlib
@@ -18,6 +30,8 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import tomllib
+from urllib.parse import urlsplit
 
 
 MAX_BYTES = 512 * 1024 * 1024
@@ -150,17 +164,64 @@ def main():
     activation = sub.add_parser("activate", help="explicitly activate a verified installed image artifact")
     activation.add_argument("commit")
     activation.add_argument("--cli-store", type=Path, default=Path("/work/tools/image-cli"))
-    activation.add_argument("--config", type=Path, required=True)
+    activation.add_argument("--store", type=Path, help="the controller store (default: activate-control.py's own)")
+    # Exactly one: an operator's activation names its reviewed config;
+    # the hourly installer's follow-main pass (design a68fc42a D6) names
+    # none and re-activates only through a selector that already exists.
+    mode = activation.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--config", type=Path)
+    mode.add_argument("--reactivate", action="store_true")
+    deactivation = sub.add_parser("deactivate", help="supported rollback: serialize with reactivation and keep isolation off")
+    deactivation.add_argument("commit")
+    deactivation.add_argument("--cli-store", type=Path, default=Path("/work/tools/image-cli"))
+    deactivation.add_argument("--store", type=Path)
+    inputs = sub.add_parser("config-inputs", help="read validated generation-owned image and estate data; never activate")
+    inputs.add_argument("commit")
+    inputs.add_argument("--cli-store", type=Path, default=Path("/work/tools/image-cli"))
     args = parser.parse_args()
     if args.verb == "pack":
         pack(args.source, args.binaries, args.destination, args.commit)
     elif args.verb == "extract":
         extract(args.archive, args.destination, args.commit)
+    elif args.verb == "config-inputs":
+        bootstrap(args.cli_store, args.commit, None, read_inputs=True)
     else:
-        bootstrap(args.cli_store, args.commit, args.config)
+        bootstrap(args.cli_store, args.commit, getattr(args, "config", None), args.store,
+                  deactivate=args.verb == "deactivate")
 
 
-def bootstrap(store, commit, config):
+def config_inputs(generation, commit):
+    names = ("infra/dev/control-images.json", "infra/estate/estate.toml")
+    raw = {}
+    for name in names:
+        with (generation / name).open("rb") as source:
+            raw[name] = source.read(65536 + 1)
+    if any(len(value) > 65536 for value in raw.values()):
+        raise ValueError("controller configuration inputs exceed their bound")
+    images = json.loads(raw[names[0]])
+    estate = tomllib.loads(raw[names[1]].decode())
+    if set(images) != {"worker_image", "postgres_image", "forge_repository"}:
+        raise ValueError("controller image inputs contain undeclared fields")
+    registry = estate["forge_registry"]
+    if not isinstance(registry, str) or not re.fullmatch(r"[A-Za-z0-9.:-]+", registry):
+        raise ValueError("controller registry is not the estate's uncredentialed host")
+    result = {"commit": commit}
+    for field in ("worker_image", "postgres_image"):
+        image = images[field]
+        if set(image) != {"repository", "tag"} or not re.fullmatch(r"[a-z0-9_-]+(?:/[a-z0-9_-]+)+", image["repository"]) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", image["tag"]):
+            raise ValueError("controller image repository or tag is invalid")
+        result[field] = registry + "/" + image["repository"] + ":" + image["tag"]
+    repository = images["forge_repository"]
+    url = estate["forge_url"]
+    parsed = urlsplit(url)
+    if not re.fullmatch(r"[a-z0-9_-]+(?:/[a-z0-9_-]+)+", repository) or parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+        raise ValueError("controller forge input is not an uncredentialed estate URL")
+    result["forge_url"] = url.rstrip("/") + "/" + repository + ".git"
+    result["source_sha256"] = {name: hashlib.sha256(value).hexdigest() for name, value in raw.items()}
+    return result
+
+
+def bootstrap(store, commit, config, control_store=None, deactivate=False, read_inputs=False):
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("activation requires the full installed commit")
     generation = store / commit
@@ -184,12 +245,22 @@ def bootstrap(store, commit, config):
         extract(archive, staged, commit)
         if (staged / "infra/dev/control-artifact.py").read_bytes() != Path(__file__).read_bytes():
             raise ValueError("installed bootstrap differs from its published archive generation")
+        if read_inputs:
+            print(json.dumps(config_inputs(staged, commit), sort_keys=True))
+            return
         if not (staged / "infra/dev/activate-control.py").is_file():
             raise ValueError("activation entrypoint is absent from published closure")
         (staged / "dev-control.tar").write_bytes(raw)
-        result = subprocess.run(["/usr/bin/python3", "-I", str(staged / "infra/dev/activate-control.py"), commit,
-                                 "--cli-store", str(root), "--config", str(config.resolve())],
-                                env={"PATH": "/usr/bin:/bin", "HOME": "/work/home"}, check=False)
+        argv = ["/usr/bin/python3", "-I", str(staged / "infra/dev/activate-control.py"), commit, "--cli-store", str(root)]
+        if control_store is not None:
+            argv += ["--store", str(control_store.resolve())]
+        if deactivate:
+            argv += ["--deactivate"]
+        else:
+            argv += ["--reactivate"] if config is None else ["--config", str(config.resolve())]
+            if config is None:
+                argv += ["--prepared-config", str(generation / "config.json")]
+        result = subprocess.run(argv, env={"PATH": "/usr/bin:/bin", "HOME": "/work/home"}, check=False)
         if result.returncode:
             raise ValueError("published activation refused with exit " + str(result.returncode))
 

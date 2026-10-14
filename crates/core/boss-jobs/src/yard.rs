@@ -624,6 +624,15 @@ pub struct HeldCar {
     /// 3eddffc4). Absent on an older payload → an operator's hold.
     #[serde(default)]
     pub kind: CarHoldKind,
+    /// What a release of this car rests on — its review, the verdict,
+    /// the head that review read against the head the hold was placed
+    /// at, the reviewer's SAFE line and models — and the release door's
+    /// own answer, asked now (backlog ed8e5c85). Filled by the yard
+    /// status handler for an operator's hold, which is the hold a review
+    /// releases. `None` here in the pure read-model, for a red re-gate,
+    /// and on a payload from an older server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<crate::car_release::Decision>,
 }
 
 /// The two brakes that hold a car on the dock ([`dock_lanes`]).
@@ -739,6 +748,7 @@ pub fn dock_lanes(dock_cars: &[(Job, Vec<Step>)]) -> (Vec<DockCar>, Vec<HeldCar>
                 car: dock_car(job),
                 reason,
                 kind,
+                release: None,
             }),
             None => parked.push(dock_car(job)),
         }
@@ -2248,7 +2258,7 @@ pub const QUEUED_AT: &str = "queued_at";
 /// that wrote an empty string instead of deleting the key leaves behind,
 /// and reading that as "queued" would hide a genuinely running gate from
 /// the bays.
-fn queued_for_a_slot(g: &Job) -> bool {
+pub(crate) fn queued_for_a_slot(g: &Job) -> bool {
     meta_str(&g.metadata, QUEUED_AT).is_some_and(|s| !s.is_empty())
 }
 
@@ -2462,7 +2472,7 @@ fn queued_gates(
 /// The pr-train a gate-run tests, when it is a TRAIN gate (128b5496):
 /// `metadata.train`, read only when `metadata.train_gate` is true, so a
 /// car's run — whatever else its metadata says — names no train.
-fn train_of_gate(g: &Job) -> Option<String> {
+pub(crate) fn train_of_gate(g: &Job) -> Option<String> {
     crate::stranded::is_train_gate(&g.metadata)
         .then(|| meta_str(&g.metadata, "train").filter(|t| !t.is_empty()))
         .flatten()

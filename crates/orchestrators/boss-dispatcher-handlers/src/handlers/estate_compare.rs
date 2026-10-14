@@ -1492,15 +1492,33 @@ mod tests {
 
     fn declared_fixture() -> Vec<Json> {
         vec![
-            json!({"id":"cp-1","role":"talos-control-plane","cpu":8,"memory_gb":15,"address":"10.20.0.11","disk_gb":200,"retired":false}),
-            json!({"id":"w-2","role":"talos-worker","cpu":4,"memory_gb":15,"address":"10.20.0.16","disk_gb":110,"retired":false}),
-            json!({"id":"boss-gcp","role":"conductor","cpu":4,"memory_gb":15,"address":"34.45.110.40","disk_gb":48,"retired":false}),
-            json!({"id":"forge","role":"forge","cpu":16,"memory_gb":30,"address":"10.20.0.15","disk_gb":437,"retired":false}),
+            json!({"id":"cp-1","role":"talos-control-plane","cpu":8,"memory_gb":15,"address":boss_testing::test_values::test_net_1(11).to_string(),"disk_gb":200,"retired":false}),
+            json!({"id":"w-2","role":"talos-worker","cpu":4,"memory_gb":15,"address":boss_testing::test_values::test_net_1(16).to_string(),"disk_gb":110,"retired":false}),
+            json!({"id":"boss-gcp","role":"conductor","cpu":4,"memory_gb":15,"address":boss_testing::test_values::test_net_1(40).to_string(),"disk_gb":48,"retired":false}),
+            json!({"id":"forge","role":"forge","cpu":16,"memory_gb":30,"address":boss_testing::test_values::test_net_1(15).to_string(),"disk_gb":437,"retired":false}),
         ]
     }
 
     fn observed(nodes: Json) -> Json {
         json!({"observed_at":"2026-08-30T10:20:00Z","observer":"boss-estate-observe","scope":"kubernetes-nodes","nodes":nodes})
+    }
+
+    #[test]
+    fn synthetic_declared_nodes_use_reserved_fixture_addresses() {
+        for row in declared_fixture() {
+            let address: std::net::Ipv4Addr = row["address"].as_str().unwrap().parse().unwrap();
+            assert_eq!(&address.octets()[..3], &[192, 0, 2], "{row}");
+        }
+        assert_eq!(
+            compare(
+                &declared_fixture(),
+                &observed(json!([
+                    {"id":"cp-1","cpu":8,"memory_gb":15,"address":boss_testing::test_values::test_net_1(11).to_string(),"ready":true},
+                    {"id":"w-2","cpu":4,"memory_gb":15,"address":boss_testing::test_values::test_net_1(16).to_string(),"ready":true},
+                ]))
+            )["counts"]["drift"],
+            0
+        );
     }
 
     #[test]
@@ -1510,8 +1528,8 @@ mod tests {
         let out = compare(
             &declared_fixture(),
             &observed(json!([
-                {"id":"cp-1","cpu":8,"memory_gb":15,"address":"10.20.0.11","ready":true},
-                {"id":"w-2","cpu":4,"memory_gb":15,"address":"10.20.0.16","ready":true},
+                {"id":"cp-1","cpu":8,"memory_gb":15,"address":boss_testing::test_values::test_net_1(11).to_string(),"ready":true},
+                {"id":"w-2","cpu":4,"memory_gb":15,"address":boss_testing::test_values::test_net_1(16).to_string(),"ready":true},
             ])),
         );
         assert_eq!(out["counts"]["declared_not_observed"], 0);
@@ -1526,9 +1544,9 @@ mod tests {
         let out = compare(
             &declared_fixture(),
             &observed(json!([
-                {"id":"cp-1","cpu":8,"memory_gb":15,"address":"10.20.0.11","ready":true},
-                {"id":"w-2","cpu":4,"memory_gb":15,"address":"10.20.0.16","ready":true},
-                {"id":"w-1","cpu":32,"memory_gb":63,"address":"10.20.0.14","purpose":"build","ready":true},
+                {"id":"cp-1","cpu":8,"memory_gb":15,"address":boss_testing::test_values::test_net_1(11).to_string(),"ready":true},
+                {"id":"w-2","cpu":4,"memory_gb":15,"address":boss_testing::test_values::test_net_1(16).to_string(),"ready":true},
+                {"id":"w-1","cpu":32,"memory_gb":63,"address":boss_testing::test_values::test_net_1(14).to_string(),"purpose":"build","ready":true},
             ])),
         );
         assert_eq!(out["counts"]["observed_not_declared"], 1);
@@ -1540,7 +1558,7 @@ mod tests {
         let out = compare(
             &declared_fixture(),
             &observed(json!([
-                {"id":"cp-1","cpu":8,"memory_gb":15,"address":"10.20.0.11","ready":true},
+                {"id":"cp-1","cpu":8,"memory_gb":15,"address":boss_testing::test_values::test_net_1(11).to_string(),"ready":true},
             ])),
         );
         assert_eq!(out["counts"]["declared_not_observed"], 1);
@@ -1550,12 +1568,12 @@ mod tests {
     #[test]
     fn a_retired_row_does_not_participate() {
         let mut declared = declared_fixture();
-        declared.push(json!({"id":"w-9","role":"talos-worker","cpu":8,"memory_gb":15,"address":"10.20.0.99","retired":true}));
+        declared.push(json!({"id":"w-9","role":"talos-worker","cpu":8,"memory_gb":15,"address":boss_testing::test_values::test_net_1(99).to_string(),"retired":true}));
         let out = compare(
             &declared,
             &observed(json!([
-                {"id":"cp-1","cpu":8,"memory_gb":15,"address":"10.20.0.11","ready":true},
-                {"id":"w-2","cpu":4,"memory_gb":15,"address":"10.20.0.16","ready":true},
+                {"id":"cp-1","cpu":8,"memory_gb":15,"address":boss_testing::test_values::test_net_1(11).to_string(),"ready":true},
+                {"id":"w-2","cpu":4,"memory_gb":15,"address":boss_testing::test_values::test_net_1(16).to_string(),"ready":true},
             ])),
         );
         assert_eq!(out["counts"]["declared_not_observed"], 0);
@@ -1568,8 +1586,8 @@ mod tests {
         let out = compare(
             &declared_fixture(),
             &observed(json!([
-                {"id":"cp-1","cpu":8,"memory_gb":15,"address":"10.20.0.11","ready":true},
-                {"id":"w-2","cpu":4,"memory_gb":16,"address":"10.20.0.16","ready":true},
+                {"id":"cp-1","cpu":8,"memory_gb":15,"address":boss_testing::test_values::test_net_1(11).to_string(),"ready":true},
+                {"id":"w-2","cpu":4,"memory_gb":16,"address":boss_testing::test_values::test_net_1(16).to_string(),"ready":true},
             ])),
         );
         assert_eq!(out["counts"]["drift"], 1);
@@ -1585,8 +1603,8 @@ mod tests {
         let out = compare(
             &declared_fixture(),
             &observed(json!([
-                {"id":"cp-1","cpu":8,"memory_gb":15,"address":"10.20.0.11","disk_gb":199,"ready":true},
-                {"id":"w-2","cpu":4,"memory_gb":15,"address":"10.20.0.16","disk_gb":110,"ready":true},
+                {"id":"cp-1","cpu":8,"memory_gb":15,"address":boss_testing::test_values::test_net_1(11).to_string(),"disk_gb":199,"ready":true},
+                {"id":"w-2","cpu":4,"memory_gb":15,"address":boss_testing::test_values::test_net_1(16).to_string(),"disk_gb":110,"ready":true},
             ])),
         );
         assert_eq!(out["counts"]["drift"], 0);
@@ -1598,8 +1616,8 @@ mod tests {
         let out = compare(
             &declared_fixture(),
             &observed(json!([
-                {"id":"cp-1","cpu":8,"memory_gb":15,"address":"10.20.0.11","ready":true},
-                {"id":"w-2","cpu":4,"memory_gb":15,"address":"10.20.0.16","ready":false},
+                {"id":"cp-1","cpu":8,"memory_gb":15,"address":boss_testing::test_values::test_net_1(11).to_string(),"ready":true},
+                {"id":"w-2","cpu":4,"memory_gb":15,"address":boss_testing::test_values::test_net_1(16).to_string(),"ready":false},
             ])),
         );
         assert_eq!(out["counts"]["declared_not_observed"], 0);
@@ -1630,7 +1648,7 @@ mod tests {
         let out = compare(
             &declared,
             &observed(json!([
-                {"id":"cp-1","cpu":8,"memory_gb":15,"address":"10.20.0.11","ready":true},
+                {"id":"cp-1","cpu":8,"memory_gb":15,"address":boss_testing::test_values::test_net_1(11).to_string(),"ready":true},
             ])),
         );
         assert_eq!(out["counts"]["participating_declared"], 0);
@@ -1641,7 +1659,7 @@ mod tests {
 
     fn cluster_obs(id: &str, total: i64, free: Option<i64>) -> Json {
         let mut node = json!({
-            "id": id, "cpu": 32, "memory_gb": 125, "address": "10.20.0.21",
+            "id": id, "cpu": 32, "memory_gb": 125, "address": boss_testing::test_values::test_net_1(21).to_string(),
             "disk_gb": total, "ready": true });
         if let Some(free) = free {
             node["disk_free_gb"] = json!(free);
@@ -1659,7 +1677,7 @@ mod tests {
         // so (a520737f).
         let declared = vec![
             json!({"id":"w-1","role":"talos-worker","cpu":32,"memory_gb":125,
-            "address":"10.20.0.21","disk_gb":929,"retired":false}),
+            "address":boss_testing::test_values::test_net_1(21).to_string(),"disk_gb":929,"retired":false}),
         ];
         // 390 GiB free of 929 is 42% — the reading on the day the gap
         // was found, and correctly not tight.
@@ -1948,7 +1966,7 @@ mod tests {
         let out = compare(
             &declared_fixture(),
             &observed(json!([
-                {"id":"cp-1","cpu":8,"memory_gb":15,"address":"10.20.0.11","ready":true},
+                {"id":"cp-1","cpu":8,"memory_gb":15,"address":boss_testing::test_values::test_net_1(11).to_string(),"ready":true},
             ])),
         );
         assert_eq!(
@@ -2607,13 +2625,28 @@ mod tests {
     }
 
     fn open_lan() -> Json {
-        json!({"half":"lan","target":"10.20.0.35:22","open":true,"tcp":true,
+        json!({"half":"lan","target":format!("{}:22", boss_testing::test_values::test_net_1(35)),"open":true,"tcp":true,
                "keyscan":"ssh-ed25519","reason":null,"dark_since":null})
     }
 
     fn open_public() -> Json {
-        json!({"half":"public","target":"dev.algedonic.dev","open":true,
-               "address":"104.21.0.1","reason":null,"dark_since":null})
+        json!({"half":"public","target":boss_testing::test_values::EXAMPLE_HOST,"open":true,
+               "address":boss_testing::test_values::test_net_2(1).to_string(),"reason":null,"dark_since":null})
+    }
+
+    #[test]
+    fn synthetic_door_halves_use_reserved_targets_without_changing_the_judgment() {
+        assert_eq!(
+            open_lan()["target"],
+            format!("{}:22", boss_testing::test_values::test_net_1(35))
+        );
+        assert_eq!(
+            open_public()["target"],
+            boss_testing::test_values::EXAMPLE_HOST
+        );
+        let body = compare_door(&door_obs(json!([open_lan(), open_public()])));
+        assert_eq!(body["counts"]["dark"], 0);
+        assert_eq!(body["counts"]["halves"], 2);
     }
 
     #[test]
@@ -2632,7 +2665,10 @@ mod tests {
         // The halves ride the comparison, so a reader of the judged
         // record (boss orient) prints the door without a second read.
         assert_eq!(body["doors"][0]["id"], "dev-ssh");
-        assert_eq!(body["doors"][0]["halves"][1]["target"], "dev.algedonic.dev");
+        assert_eq!(
+            body["doors"][0]["halves"][1]["target"],
+            boss_testing::test_values::EXAMPLE_HOST
+        );
     }
 
     #[test]
@@ -2640,7 +2676,7 @@ mod tests {
         // Dark since 11:40, observed 12:00 — 20 minutes against a
         // 15-minute band.
         let body = compare_door(&door_obs(json!([
-            {"half":"lan","target":"10.20.0.35:22","open":false,"tcp":false,
+            {"half":"lan","target":format!("{}:22", boss_testing::test_values::test_net_1(35)),"open":false,"tcp":false,
              "reason":"connection refused","dark_since":"2026-09-24T11:40:00Z"},
             open_public(),
         ])));
@@ -2649,7 +2685,10 @@ mod tests {
         assert_eq!(dark[0]["id"], "dev-ssh/lan");
         assert_eq!(dark[0]["door"], "dev-ssh");
         assert_eq!(dark[0]["half"], "lan");
-        assert_eq!(dark[0]["target"], "10.20.0.35:22");
+        assert_eq!(
+            dark[0]["target"],
+            format!("{}:22", boss_testing::test_values::test_net_1(35))
+        );
         assert_eq!(dark[0]["reason"], "connection refused");
         assert_eq!(dark[0]["dark_for_s"], 1200);
         assert_eq!(dark[0]["band_s"], 900);
@@ -2663,7 +2702,7 @@ mod tests {
         // inside a minute, but this is still weather until the band.
         let body = compare_door(&door_obs(json!([
             open_lan(),
-            {"half":"public","target":"dev.algedonic.dev","open":false,
+            {"half":"public","target":boss_testing::test_values::EXAMPLE_HOST,"open":false,
              "reason":"does not resolve","dark_since":"2026-09-24T11:55:00Z"},
         ])));
         assert_eq!(body["findings"]["door_dark"], json!([]));
@@ -2676,7 +2715,7 @@ mod tests {
     #[test]
     fn exactly_the_band_is_past_it() {
         let body = compare_door(&door_obs(json!([
-            {"half":"lan","target":"10.20.0.35:22","open":false,
+            {"half":"lan","target":format!("{}:22", boss_testing::test_values::test_net_1(35)),"open":false,
              "reason":"timed out","dark_since":"2026-09-24T11:45:00Z"},
             open_public(),
         ])));
@@ -2689,8 +2728,8 @@ mod tests {
         // pass — a malformed instrument must surface, like a unit row
         // with no healthy flag.
         let mut obs = door_obs(json!([
-            {"half":"lan","target":"10.20.0.35:22","open":false,"reason":"refused"},
-            {"half":"public","target":"dev.algedonic.dev"},
+            {"half":"lan","target":format!("{}:22", boss_testing::test_values::test_net_1(35)),"open":false,"reason":"refused"},
+            {"half":"public","target":boss_testing::test_values::EXAMPLE_HOST},
         ]));
         let body = compare_door(&obs);
         let ids: Vec<&str> = body["findings"]["door_dark"]
@@ -2703,7 +2742,7 @@ mod tests {
 
         obs["nodes"][0].as_object_mut().unwrap().remove("band_s");
         obs["nodes"][0]["halves"] = json!([
-            {"half":"lan","target":"10.20.0.35:22","open":false,
+            {"half":"lan","target":format!("{}:22", boss_testing::test_values::test_net_1(35)),"open":false,
              "reason":"refused","dark_since":"2026-09-24T11:59:00Z"},
         ]);
         let body = compare_door(&obs);
@@ -2817,7 +2856,7 @@ mod tests {
             "scope": HOST_SCOPE,
             "observed_at": at,
             "observer": "automation:estate-observer-host",
-            "nodes": [{"id":"forge","cpu":16,"memory_gb":30,"address":"10.20.0.15","disk_gb":437,"disk_free_gb":300,"ready":true}],
+            "nodes": [{"id":"forge","cpu":16,"memory_gb":30,"address":boss_testing::test_values::test_net_1(15).to_string(),"disk_gb":437,"disk_free_gb":300,"ready":true}],
         })
     }
 
@@ -2937,9 +2976,9 @@ mod tests {
             "observer": "boss-estate-observe-nodefs",
             "mount": "/var",
             "nodes": [
-                {"id":"w-1","address":"10.20.0.21","disk_gb":929,"disk_free_gb":390},
-                {"id":"cp-9","address":"10.20.0.19","disk_gb":null,"disk_free_gb":null,
-                 "unread":"talosctl -n 10.20.0.19 mounts failed: connection refused"},
+                {"id":"w-1","address":boss_testing::test_values::test_net_1(21).to_string(),"disk_gb":929,"disk_free_gb":390},
+                {"id":"cp-9","address":boss_testing::test_values::test_net_1(19).to_string(),"disk_gb":null,"disk_free_gb":null,
+                 "unread":format!("talosctl -n {} mounts failed: connection refused", boss_testing::test_values::test_net_1(19))},
             ],
         })
     }

@@ -120,6 +120,17 @@ function catalogued(path: string): string | null {
 }
 
 test.describe('/it/registry/step-plugins — the rows', () => {
+  test('shows recorded creation and genuine authoring job without inventing missing provenance', async ({ page }) => {
+    const author = '9ce24f0b-c784-424c-b4eb-197748d04d05';
+    await install(page, [{...ROWS[0], authoring_job_id: author}, ROWS[1]]);
+    await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });
+    const authored = page.locator('.catalog tbody tr').filter({hasText: 'sign-off'});
+    const unknown = page.locator('.catalog tbody tr').filter({hasText: 'review-design'});
+    await expect(authored.locator('td[data-provenance="created"]')).toHaveText('Sep 16, 2026');
+    await expect(authored.locator('td[data-provenance="author"] a')).toHaveAttribute('href', new RegExp(author));
+    await expect(unknown.locator('td[data-provenance="author"]')).toHaveText('Not recorded');
+    await expect(unknown.locator('td[data-provenance="author"] a')).toHaveCount(0);
+  });
   test('groups rows by category, sorts each by kind, and renders registry and usage columns', async ({ page }) => {
     await install(page);
     await mountPage(page, PAGE, { titleMatch: new RegExp(TITLE) });
@@ -135,10 +146,10 @@ test.describe('/it/registry/step-plugins — the rows', () => {
     ]);
 
     const heads = await page.locator('.catalog table').first().locator('thead th').allTextContents();
-    expect(heads.map((h) => h.trim())).toEqual(['Kind', 'Label', 'Owner', 'Version', 'Frontend bundle', 'Active workflow steps', 'In flight (all packets)']);
+    expect(heads.map((h) => h.trim())).toEqual(['Kind', 'Label', 'Owner', 'Version', 'Frontend bundle', 'Active workflow steps', 'In flight (all packets)', 'Created', 'Authoring job']);
 
     const row = (kind: string) => page.locator('.catalog tbody tr').filter({ hasText: kind });
-    await expect(row('sign-off').locator('td')).toHaveText(['sign-off', 'Sign off', 'system', '3', 'sign-off.js', 'None in active workflows', '0']);
+    await expect(row('sign-off').locator('td')).toHaveText(['sign-off', 'Sign off', 'system', '3', 'sign-off.js', 'None in active workflows', '0', 'Sep 16, 2026', 'Not recorded']);
     // The second Owner branch: a team that is not `platform` is named.
     await expect(row('marketing-brief').locator('td').nth(2)).toHaveText('marketing');
     // The bundle is text, not a link to /plugins/<url>.

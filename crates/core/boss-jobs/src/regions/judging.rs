@@ -192,6 +192,10 @@ pub(super) fn region(
     Region {
         name: name.to_string(),
         count,
+        // Set by the one region with a line ([`Region::waiting`]).
+        waiting: None,
+        // Set by the one region with judged members ([`Region::judged`]).
+        judged: None,
         bound: bound.map(|(b, _)| b),
         bound_kind: bound.map(|(_, k)| k),
         unit: unit.to_string(),

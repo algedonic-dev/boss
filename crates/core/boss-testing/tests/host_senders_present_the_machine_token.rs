@@ -56,7 +56,7 @@
 //! reads a mount, and every run names its own empty or planted
 //! `BOSS_MACHINE_TOKEN_DIR`.
 
-use boss_testing::{create_dir, repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{create_dir, repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -153,8 +153,16 @@ impl Bench {
             self.dir.join("bin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let mut cmd = Command::new(shell);
-        cmd.arg(driver)
+        // A TIME BOUND (backlog df38075a, F4 of review a92c0b94). A reader
+        // or a sender that hangs — a read of a FIFO, a wait on a peer —
+        // used to hang this suite with it, and a hung suite is a gate that
+        // never answers rather than a red that names the cell. Two minutes
+        // is far past any cell here (each is a few stub calls); `timeout`
+        // answers 124, which the assertion below names.
+        let mut cmd = Command::new("timeout");
+        without_proxy(&mut cmd);
+        cmd.args(["-k", "5", "120", shell])
+            .arg(driver)
             .current_dir(&cell)
             .env("PATH", path)
             .env("TMPDIR", &tmp)
@@ -182,6 +190,13 @@ impl Bench {
             cmd.env(k, v);
         }
         let out = cmd.output().expect("run the driver");
+        assert_ne!(
+            out.status.code(),
+            Some(124),
+            "{} [{slot:?}]: the run did not end inside its two-minute bound — a reader or sender hung\nstderr:\n{}",
+            driver.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
         let leaked = std::fs::read_dir(&tmp)
             .map(|rd| {
                 rd.flatten()
@@ -652,9 +667,9 @@ fn a_dark_api_keeps_the_alert_with_or_without_a_token() {
 /// cleanup has already run and no further trap can.
 const DEPLOY: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
-FAKE="$CELL/repo"
-mkdir -p "$FAKE/.git"
-printf '%s\n' 0a1b2c3d-0000-4000-8000-00000000abcd > "$FAKE/.git/boss-converge-requests.run"
+FAKE="$CELL/converge"
+mkdir -p "$FAKE"
+printf '%s\n' 0a1b2c3d-0000-4000-8000-00000000abcd > "$FAKE/requests.run"
 export ALERT_SPOOL="$CELL/spool"
 _finish() {
     local rc=$?
@@ -707,4 +722,192 @@ fn the_converge_alerts_and_answers_from_its_exit_trap_with_or_without_a_token() 
         let run = bench.run("bash", &driver, slot, &[("STUB_REPLY", "201")]);
         assert_eq!(run.rc, 3, "{slot:?}: {}", run.stderr);
     }
+}
+
+// ---------------------------------------------------------------------
+// THE CELLS REVIEW a92c0b94 FOUND MISSING (backlog df38075a, F4 and F5).
+// Each holds a line that the matrix above passes with or without: a
+// fallback, a guard, a header call. Removing any one of them turns the
+// test that names it red.
+
+/// observe-units.sh runs under `set -eu`, and the reader's only non-zero
+/// return is a header file it could not make. Its call carries
+/// `|| MT_HDR=""`; without that, a full or missing temp directory ends
+/// the observer before it posts — the alarm stopped by the token it was
+/// only presenting.
+#[test]
+fn the_unit_observer_posts_when_no_header_directory_can_be_made() {
+    let bench = Bench::new("observe-units-no-dir");
+    write_exec(&bench.dir.join("bin/systemctl"), SYSTEMCTL);
+    write_exec(&bench.dir.join("bin/journalctl"), "#!/bin/sh\nexit 0\n");
+    let script = repo_root().join("infra/estate/observe-units.sh");
+    let nowhere = bench.dir.join("no-such-temp-directory");
+    let nowhere = nowhere.to_str().unwrap();
+    for slot in [Slot::Absent, Slot::Present] {
+        let run = bench.run(
+            "sh",
+            &script,
+            slot,
+            &[
+                ("STUB_REPLY", "{\"accepted\":true}\\n202"),
+                ("HOST_ID", "fixture-host"),
+                ("UNITS", "boss-fixture.service"),
+                ("BOSS_NODE_ROLES", "ops-runner"),
+                ("TMPDIR", nowhere),
+            ],
+        );
+        assert_eq!(
+            run.rc, 0,
+            "{slot:?}: the observer posts and exits 0 with no header directory\nstdout:\n{}\nstderr:\n{}",
+            run.stdout, run.stderr
+        );
+        assert!(
+            run.stdout.contains("jobs api: 202"),
+            "{slot:?}: the observation went out: {}",
+            run.stdout
+        );
+        assert!(
+            !run.argv.contains(" -H @"),
+            "{slot:?}: unstamped, since no header file could be made: {}",
+            run.argv
+        );
+        if slot == Slot::Present {
+            assert!(
+                run.stderr.contains("cannot make a private directory"),
+                "{slot:?}: and the reader says why it is unstamped: {}",
+                run.stderr
+            );
+        }
+    }
+}
+
+/// The watchdog replays kept alerts at the top of a run that may raise
+/// none, so `alert_replay` makes its own headers rather than living off
+/// an `alert` before it. With no alert in the run, a kept alert's POST
+/// still carries the token.
+const REPLAY_ONLY: &str = r#"#!/usr/bin/env bash
+set -uo pipefail
+marker=$(mktemp)
+trap 'rm -f "$marker"; echo caller-trap-ran' EXIT
+export ALERT_SPOOL="$CELL/spool"
+mkdir -p "$ALERT_SPOOL"
+printf '%s' '{"kind":"backlog-item","title":"kept"}' > "$ALERT_SPOOL/2026-10-09T00:00:00Z-1-1-1.json"
+. "$REPO/infra/forge/alert-lib.sh"
+alert_replay 2>> "$CELL/alert.err" || true
+echo "after-replay=$(alert_count)"
+cat "$CELL/alert.err" | grep -v '^alert:' >&2 || true
+"#;
+
+#[test]
+fn a_replay_with_no_alert_before_it_carries_the_token() {
+    let bench = Bench::new("alert-replay-only");
+    let driver = bench.dir.join("replay.sh");
+    write_exec(&driver, REPLAY_ONLY);
+    judge(
+        &bench,
+        &Site {
+            name: "alert-lib.sh alert_replay (no alert before it)",
+            shell: "bash",
+            top: &driver,
+            sub: &driver,
+            env: &[("STUB_REPLY", "201")],
+            sends: &["http://sor.test:7900/api/jobs"],
+            // The kept alert's POST alone: a replay reads no owner.
+            stamped: 1,
+            did: &["after-replay=0", "caller-trap-ran"],
+        },
+    );
+}
+
+/// alert-lib sources the reader only when it is beside it. The converge
+/// runs it under `set -e`, where a `.` of a missing file ends the shell:
+/// an alert lib whose checkout lacks the reader must still file.
+const ALERT_NO_READER: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+trap 'echo caller-trap-ran' EXIT
+export ALERT_SPOOL="$CELL/spool"
+. "$TREE/infra/forge/alert-lib.sh"
+alert "fixture alert" "a detail" 2>> "$CELL/alert.err"
+echo "waiting=$(alert_count)"
+"#;
+
+#[test]
+fn an_alert_lib_with_no_reader_beside_it_still_files() {
+    let bench = Bench::new("alert-lib-no-reader");
+    let tree = bench.dir.join("tree");
+    for rel in [
+        "infra/forge/alert-lib.sh",
+        "infra/forge/sor-ports.env",
+        "infra/lib/sor.sh",
+        "infra/lib/sor-reader.sh",
+    ] {
+        let body = std::fs::read_to_string(repo_root().join(rel)).unwrap();
+        create_dir(tree.join(rel).parent().unwrap());
+        write_file(&tree.join(rel), &body);
+    }
+    assert!(
+        !tree.join("infra/lib/secret-header.sh").exists(),
+        "the control: this tree has no reader"
+    );
+    let driver = bench.dir.join("alert.sh");
+    write_exec(&driver, ALERT_NO_READER);
+    for slot in [Slot::Absent, Slot::Present] {
+        let run = bench.run(
+            "bash",
+            &driver,
+            slot,
+            &[("STUB_REPLY", "201"), ("TREE", tree.to_str().unwrap())],
+        );
+        assert_eq!(run.rc, 0, "{slot:?}: {}\n{}", run.stdout, run.stderr);
+        assert!(
+            run.stdout.contains("waiting=0") && run.stdout.contains("caller-trap-ran"),
+            "{slot:?}: the alert was filed: {}\nstderr:\n{}",
+            run.stdout,
+            run.stderr
+        );
+        assert!(
+            run.argv.contains("http://sor.test:7900/api/jobs"),
+            "{slot:?}: {}",
+            run.argv
+        );
+        assert!(!run.argv.contains(" -H @"), "{slot:?}: {}", run.argv);
+    }
+}
+
+/// F5: the two header variables are the lib's, not the environment's. A
+/// caller that posts through `alert_post` before any `alert` — or an
+/// environment that happens to carry the name — must not hand curl a
+/// header file the lib never made.
+const ALERT_INHERITED: &str = r#"#!/usr/bin/env bash
+set -uo pipefail
+export ALERT_SPOOL="$CELL/spool"
+printf 'x-boss-machine-token: planted\n' > "$CELL/planted"
+export ALERT_MT_HDR="@$CELL/planted" ALERT_PEOPLE_MT_HDR="@$CELL/planted"
+. "$REPO/infra/forge/alert-lib.sh"
+alert_post '{"kind":"backlog-item"}' && echo posted
+alert_owner >/dev/null
+"#;
+
+#[test]
+fn the_alert_header_variables_start_empty_whatever_the_environment_holds() {
+    let bench = Bench::new("alert-lib-inherited");
+    let driver = bench.dir.join("inherited.sh");
+    write_exec(&driver, ALERT_INHERITED);
+    let run = bench.run(
+        "bash",
+        &driver,
+        Slot::Absent,
+        &[("STUB_REPLY", "201"), ("STUB_PEOPLE", "[]")],
+    );
+    assert!(
+        run.stdout.contains("posted"),
+        "{}\n{}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        !run.argv.contains("/planted"),
+        "a header file the lib never made reached curl:\n{}",
+        run.argv
+    );
 }

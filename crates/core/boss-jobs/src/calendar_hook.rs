@@ -138,7 +138,7 @@ pub async fn apply_step_transition(
 
 /// The hold a start of `step` asks for: its assignee, over its window,
 /// keyed on the step. `None` when the step lacks a complete schedule.
-fn start_request(
+pub(crate) fn start_request(
     step: &Step,
     actor: &str,
 ) -> Result<Option<ReservationRequest>, CalendarClientError> {

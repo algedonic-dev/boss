@@ -71,8 +71,8 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 /// Header the token rides in. Lowercase because axum/reqwest header
 /// names are; the gateway's edge strip covers it via the `x-boss-`
@@ -98,6 +98,10 @@ pub const MAX_SLOT_BYTES: u64 = 4096;
 /// Secret in about a minute, so five seconds adds nothing a rotation
 /// would notice — the same interval the gate re-reads at.
 pub const REREAD: Duration = Duration::from_secs(5);
+
+/// A persistent read failure must stay visible without logging every
+/// watcher pass (review S1 follow-up 3, backlog 2710c8fc).
+pub const STALE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The mounted directory, from the environment or its default.
 pub fn token_dir() -> PathBuf {
@@ -390,6 +394,14 @@ fn stamp(
 /// policy afterwards, which is why there is no constructor, and no
 /// `From`, that takes one. A 3xx comes back to the caller as a response.
 ///
+/// NOR THROUGH A PROXY (backlog 1ff6cabe, 2026-10-10). reqwest honours
+/// `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` by default, loopback included,
+/// so a proxy exported where a service or a test ran received every
+/// stamped request — measured as the policy coverage read going to a
+/// dark proxy port instead of the jobs router beside it. The same
+/// finish clears every proxy, the environment's and any the builder
+/// named: a stamped request goes where its URL says or not at all.
+///
 /// A URL is taken as `impl AsRef<str>` rather than `reqwest::IntoUrl`,
 /// whose conversion is sealed: the host decision ([`token_for`]) must
 /// read the URL before reqwest consumes it. Every `IntoUrl` type — a
@@ -434,6 +446,7 @@ impl Client {
     ) -> reqwest::Result<Self> {
         let http = builder
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()?;
         Ok(Client { http, token, hosts })
     }
@@ -479,10 +492,11 @@ impl Client {
 
 /// [`Client`] on reqwest's BLOCKING half, for the walks that run on it —
 /// `boss tenant publish` and `export`, `boss estate declare` (design
-/// 6805c764 car 2, the CLI slice, 2026-09-29). The same two guarantees
-/// and the same shape: the token is stamped per request from a watched
+/// 6805c764 car 2, the CLI slice, 2026-09-29). The same guarantees and
+/// the same shape: the token is stamped per request from a watched
 /// [`Source`], so a walk that outlasts a rotation sends the new value,
-/// and the only way in is a `ClientBuilder` finished with redirects off.
+/// and the only way in is a `ClientBuilder` finished with redirects and
+/// proxies off.
 /// A blocking client must not be built or dropped on an async worker —
 /// the walks that use it already run under `spawn_blocking`.
 #[cfg(feature = "blocking")]
@@ -521,6 +535,7 @@ impl BlockingClient {
     ) -> reqwest::Result<Self> {
         let http = builder
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()?;
         Ok(BlockingClient { http, token, hosts })
     }
@@ -572,11 +587,12 @@ impl BlockingClient {
 /// error is not a revocation, and dropping to no token would turn every
 /// request into a gate miss until the next read. A file that is GONE or
 /// blank is a deliberate state and is followed. Every change is logged,
-/// never the value.
+/// never the value. A failed read is said immediately and every
+/// [`STALE_WARNING_INTERVAL`] until a successful read clears it.
 #[derive(Default)]
 pub struct Source {
     value: RwLock<Option<String>>,
-    failing: AtomicBool,
+    last_failure_warning: Mutex<Option<Instant>>,
 }
 
 /// Never prints the value: a `Debug` of a struct holding a Source (the
@@ -595,7 +611,7 @@ impl Source {
     pub fn fixed(value: Option<String>) -> Self {
         Source {
             value: RwLock::new(value.and_then(|v| clean(&v).ok().flatten())),
-            failing: AtomicBool::new(false),
+            last_failure_warning: Mutex::new(None),
         }
     }
 
@@ -636,9 +652,17 @@ impl Source {
     }
 
     fn observe(&self, dir: &Path, read: io::Result<Option<String>>) {
+        self.observe_at(dir, read, Instant::now());
+    }
+
+    fn observe_at(&self, dir: &Path, read: io::Result<Option<String>>, now: Instant) {
+        let mut last_warning = self
+            .last_failure_warning
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         match read {
             Ok(next) => {
-                if self.failing.swap(false, Ordering::Relaxed) {
+                if last_warning.take().is_some() {
                     tracing::info!(dir = %dir.display(), "machine token slot readable again");
                 }
                 let mut value = self.value.write().unwrap_or_else(PoisonError::into_inner);
@@ -653,7 +677,10 @@ impl Source {
                 }
             }
             Err(e) => {
-                if !self.failing.swap(true, Ordering::Relaxed) {
+                if last_warning.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= STALE_WARNING_INTERVAL
+                }) {
+                    *last_warning = Some(now);
                     tracing::warn!(
                         dir = %dir.display(),
                         error = %e,
@@ -847,12 +874,106 @@ mod tests {
         // revocation. Then a real value again, which is followed.
         std::fs::remove_file(d.join("current")).unwrap();
         std::fs::create_dir(d.join("current")).unwrap();
-        assert!(eventually(|| s.failing.load(Ordering::Relaxed)));
+        assert!(eventually(|| s
+            .last_failure_warning
+            .lock()
+            .unwrap()
+            .is_some()));
         assert_eq!(s.current().as_deref(), Some("good"));
         std::fs::remove_dir(d.join("current")).unwrap();
         std::fs::write(d.join("current"), "rotated\n").unwrap();
         assert!(eventually(|| s.current().as_deref() == Some("rotated")));
-        assert!(!s.failing.load(Ordering::Relaxed));
+        assert!(s.last_failure_warning.lock().unwrap().is_none());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_persistently_unreadable_source_warns_again_without_losing_the_token() {
+        let d = dir();
+        std::fs::write(d.join(CURRENT), "fixture-token-never-log").unwrap();
+        let s = Source::fixed(read_slot(&d, CURRENT));
+        std::fs::remove_file(d.join(CURRENT)).unwrap();
+        std::fs::create_dir(d.join(CURRENT)).unwrap();
+        let start = Instant::now();
+        let logged = warnings_of(|| {
+            for seconds in [0, 1, 59, 60, 61, 120] {
+                s.observe_at(
+                    &d,
+                    read_slot_checked(&d, CURRENT),
+                    start + Duration::from_secs(seconds),
+                );
+                assert_eq!(s.current().as_deref(), Some("fixture-token-never-log"));
+            }
+        });
+        assert_eq!(
+            logged.matches("machine token slot unreadable").count(),
+            3,
+            "{logged}"
+        );
+        assert!(!logged.contains("fixture-token-never-log"), "{logged}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_readable_slot_rearms_the_next_failure_warning_even_when_removed() {
+        let d = dir();
+        let s = Source::fixed(Some("fixture-last-good".into()));
+        let start = Instant::now();
+        let logged = warnings_of(|| {
+            for seconds in [0, 1] {
+                s.observe_at(
+                    &d,
+                    Err(io::Error::other("fixture refusal")),
+                    start + Duration::from_secs(seconds),
+                );
+            }
+            // Missing and blank are deliberate removals, not failed reads.
+            s.observe_at(
+                &d,
+                read_slot_checked(&d, CURRENT),
+                start + Duration::from_secs(2),
+            );
+            assert_eq!(s.current(), None);
+            s.observe_at(
+                &d,
+                Err(io::Error::other("fixture refusal")),
+                start + Duration::from_secs(3),
+            );
+            std::fs::write(d.join(CURRENT), "fixture-rotated").unwrap();
+            s.observe_at(
+                &d,
+                read_slot_checked(&d, CURRENT),
+                start + Duration::from_secs(4),
+            );
+            s.observe_at(
+                &d,
+                Err(io::Error::other("fixture refusal")),
+                start + Duration::from_secs(5),
+            );
+            assert_eq!(s.current().as_deref(), Some("fixture-rotated"));
+            std::fs::write(d.join(CURRENT), " \n").unwrap();
+            s.observe_at(
+                &d,
+                read_slot_checked(&d, CURRENT),
+                start + Duration::from_secs(6),
+            );
+            assert_eq!(s.current(), None);
+            s.observe_at(
+                &d,
+                Err(io::Error::other("fixture refusal")),
+                start + Duration::from_secs(7),
+            );
+        });
+        assert_eq!(
+            logged.matches("machine token slot unreadable").count(),
+            4,
+            "{logged}"
+        );
+        assert!(logged.contains("holds_token=false"), "{logged}");
+        assert!(
+            !logged.contains("fixture-last-good") && !logged.contains("fixture-rotated"),
+            "{logged}"
+        );
         std::fs::remove_dir_all(&d).unwrap();
     }
 

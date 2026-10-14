@@ -23,9 +23,9 @@
   import TierChip from './TierChip.svelte';
   import type { Asset, Job, Account, AccountOpenAr } from './types';
   import { fetchPaged, isCapped, type Paged } from '../data/paginated';
-  import { ACCOUNTS_LIST_URL, fetchAccountsPage } from './api';
+  import { ACCOUNTS_LIST_URL, fetchAccountsPage, fetchAccountAssetsPage } from './api';
   import { manifest, moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
-  import { emptyState, okRead, readStateOf, readStateOfLoad, type ReadState } from '../data/readState';
+  import { blankMeaning, countLabel, emptyState, loadingRead, okRead, readStateOf, readStateOfLoad, type ReadState } from '../data/readState';
   import ListEmpty from '../data/ListEmpty.svelte';
   import { loadClasses, classesFor } from '@boss/web-kit/session/classes.svelte';
   import { tierAdmits, tierBuckets, type TierFilter } from './tiers';
@@ -58,15 +58,12 @@
   const supportKnown = $derived(manifest.value.kind === 'ready');
 
   let openArPage = $state<Paged<AccountOpenAr> | null>(null);
-  // What each secondary read did. Their `failed` arms were dropped on
-  // the floor (`dPaged.kind === 'ready' ? dPaged.page : null`), and the
-  // tenant-shaping below hides an all-zero column — so a failed read
-  // removed its column without a word, the paint of "no account has
-  // any" (backlogs 223ebcd6 and e30ee8b9). The column still goes, since
-  // there is nothing true to put in it, but the page now says why.
-  let devicesRead = $state<ReadState>(okRead);
+  // Keep the contributing read's outcome beside its counts. The first
+  // read-state car named failures but still removed their columns;
+  // e30ee8b9 also requires keeping the column, with unknown counts.
+  let devicesRead = $state<ReadState>(loadingRead);
   let jobsRead = $state<ReadState>(okRead);
-  let openArRead = $state<ReadState>(okRead);
+  let openArRead = $state<ReadState>(loadingRead);
 
   let devices = $derived(devicesPage?.data ?? []);
   let jobs = $derived(jobsPage?.data ?? []);
@@ -88,7 +85,7 @@
           // path; it has no route and fell through to
           // `/api/assets/{asset_id}` → 404, so this list rendered
           // empty since the rename.
-          fetchPaged<Asset>('/api/assets?limit=1000'),
+          fetchAccountAssetsPage(),
           // Open AR — the service's per-account sum over every invoice
           // still owed. This read was `/api/commerce/invoices?limit=10000`
           // summed here, and its comment promised an OverflowBanner that
@@ -132,6 +129,7 @@
     jobsPage = null;
     jobsRead = okRead;
     if (known && enabled) {
+      jobsRead = loadingRead;
       void fetchPaged<Job>('/api/jobs?department=support&limit=5000').then((result) => {
         if (!cancelled) {
           jobsPage = result.kind === 'ready' ? result.page : null;
@@ -144,7 +142,7 @@
 
   let rows = $derived(
     accounts.map((c) => {
-      const accountDevices = devices.filter((d) => d.account_id === c.id);
+      const accountDevices = devices.filter((d) => d.holder_kind === 'account' && d.holder_id === c.id);
       const openTickets = jobs.filter(
         (j) =>
           j.subject.subject_kind === 'account' &&
@@ -205,23 +203,30 @@
   let hasAnyOpenAr = $derived(
     rows.some((r) => r.openArCents > 0),
   );
+  // A successful empty read can shape a column away. A missing answer
+  // cannot: it stays visible without inventing a count or a debt.
+  let showDevices = $derived(hasAnyDevices || blankMeaning(devicesRead) === 'unknown');
+  let showServiceJobs = $derived(supportOn && (hasAnyServiceJobs || blankMeaning(jobsRead) === 'unknown'));
+  let showOpenAr = $derived(hasAnyOpenAr || blankMeaning(openArRead) === 'unknown');
   let subtitleLine = $derived(
+    // These subsets are over returned reads and loaded accounts, not
+    // service-wide totals. Overflow banners retain the missing-row warning.
     [
       hasAnyDevices
-        ? `${(devicesPage?.total ?? 0).toLocaleString()} installed devices`
+        ? countLabel('Installed assets on loaded accounts', devicesRead, rows.reduce((sum, row) => sum + row.activeDevices, 0))
         : null,
       hasAnyServiceJobs
-        ? `${(jobsPage?.total ?? 0).toLocaleString()} service jobs`
+        ? countLabel('Open support jobs on loaded accounts', jobsRead, rows.reduce((sum, row) => sum + row.openTickets, 0))
         : null,
     ]
       .filter((s): s is string => s !== null)
       .join(' · ') || undefined,
   );
 
-  // Each failed secondary read, with the column it takes away.
+  // Each failed secondary read, with the column whose counts are unknown.
   let failedColumns = $derived(
     [
-      { what: 'installed devices', read: devicesRead, column: 'Equipment' },
+      { what: 'assets', read: devicesRead, column: 'Equipment' },
       { what: 'service jobs', read: jobsRead, column: 'Open SRs' },
       { what: 'open receivables', read: openArRead, column: 'Open AR' },
     ].flatMap((f) => (f.read.kind === 'failed' ? [{ ...f, error: f.read.error }] : [])),
@@ -247,7 +252,7 @@
 <div class="catalog theme-exec">
   <PageHeader
     eyebrow="Customers"
-    title={error ? 'Accounts' : `${accounts.length} accounts`}
+    title={countLabel('Accounts', readStateOfLoad(loading, error), accounts.length)}
     subtitle={error
       ? // "0 accounts" above the failure line read as an empty book
         // (sweep c3e4edcc). The count is unknown, so say so.
@@ -271,8 +276,8 @@
     <OverflowBanner
       showing={devices.length}
       total={devicesPage!.total}
-      noun="installed devices loaded for per-account rollups"
-      hint="Per-row device counts may undercount; raise the cap or filter."
+      noun="assets loaded for per-account rollups"
+      hint="Per-row equipment and installed-asset counts may undercount; raise the cap or filter."
     />
   {/if}
   {#if isCapped(jobsPage)}
@@ -321,7 +326,7 @@
       {#if !loading && !error}
         {#each failedColumns as f (f.what)}
           <p class="empty load-failed" role="alert">
-            Couldn't load {f.what} — {f.error}. The {f.column} column is not shown: its counts are unknown, not zero.
+            Couldn't load {f.what} — {f.error}. The {f.column} counts below are unknown, not zero.
           </p>
         {/each}
       {/if}
@@ -335,9 +340,9 @@
               <th>Tier</th>
               <th>Location</th>
               <th>Primary contact</th>
-              {#if hasAnyDevices}<th class="num">Equipment</th>{/if}
-              {#if hasAnyServiceJobs}<th class="num">Open SRs</th>{/if}
-              {#if hasAnyOpenAr}<th class="num">Open AR</th>{/if}
+              {#if showDevices}<th class="num">Equipment</th>{/if}
+              {#if showServiceJobs}<th class="num">Open SRs</th>{/if}
+              {#if showOpenAr}<th class="num">Open AR</th>{/if}
               <th>Customer since</th>
             </tr>
           </thead>
@@ -358,19 +363,31 @@
                 <td><TierChip tier={r.account.tier} /></td>
                 <td>{r.account.city ?? '—'}, {r.account.state ?? '—'}</td>
                 <td class="prose-cell">{r.account.director ?? '—'}</td>
-                {#if hasAnyDevices}<td class="num">{r.deviceCount}</td>{/if}
-                {#if hasAnyServiceJobs}
+                {#if showDevices}
                   <td class="num">
-                    {#if r.openTickets > 0}
+                    {#if blankMeaning(devicesRead) === 'unknown'}
+                      {devicesRead.kind === 'loading' ? 'Loading…' : 'Unknown'}
+                    {:else}
+                      {r.deviceCount}
+                    {/if}
+                  </td>
+                {/if}
+                {#if showServiceJobs}
+                  <td class="num">
+                    {#if blankMeaning(jobsRead) === 'unknown'}
+                      {jobsRead.kind === 'loading' ? 'Loading…' : 'Unknown'}
+                    {:else if r.openTickets > 0}
                       <strong>{r.openTickets}</strong>
                     {:else}
                       0
                     {/if}
                   </td>
                 {/if}
-                {#if hasAnyOpenAr}
+                {#if showOpenAr}
                   <td class="num">
-                    {#if r.openArCents > 0}
+                    {#if blankMeaning(openArRead) === 'unknown'}
+                      {openArRead.kind === 'loading' ? 'Loading…' : 'Unknown'}
+                    {:else if r.openArCents > 0}
                       <strong>{formatMoney({ amount_cents: r.openArCents, currency: 'USD' }, { precision: 'whole' })}</strong>
                     {:else}
                       —

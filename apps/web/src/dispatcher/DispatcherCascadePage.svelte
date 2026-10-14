@@ -455,10 +455,6 @@
     gap: 6px;
   }
   .dx-filter-select {
-    font-size: 0.78rem;
-    padding: 3px 6px;
-    border: 1px solid var(--hairline);
-    border-radius: 6px;
     max-width: 340px;
   }
   .dx-chip {

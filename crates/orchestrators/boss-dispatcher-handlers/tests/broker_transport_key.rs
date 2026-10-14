@@ -904,18 +904,36 @@ fn the_published_preparation_shape_keeps_scope_and_enrollment_human_and_distinct
         step("enroll")["metadata_defaults"]["human_only"].as_bool(),
         Some(true)
     );
-    for field in ["public_key", "receiver_host", "purpose"] {
-        assert!(
-            step("enroll")["fields"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value["name"].as_str() == Some(field)
-                    && value["filled_by"].as_str() == Some("executor")
-                    && value["required"].as_bool() == Some(true)),
-            "human must review {field} before enrollment"
-        );
+    // v2 (item 3dc0b247): the broker SUPPLIES the proposal — the whole
+    // authorized_keys line, never a bare key (dea2236f) — as filer-filled
+    // fields its rule alone may write; the person's half is the decision
+    // and its record, required at done.
+    let field = |name: &str| {
+        step("enroll")["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|value| value["name"].as_str() == Some(name))
+            .cloned()
+    };
+    assert!(
+        field("public_key").is_none(),
+        "enroll shows a bare key beside the line"
+    );
+    for name in ["authorized_keys_line", "receiver_host", "purpose"] {
+        let declared = field(name).unwrap_or_else(|| panic!("human must review {name}"));
+        assert_eq!(declared["filled_by"].as_str(), Some("filer"), "{name}");
     }
+    for name in ["decision", "enrollment_record"] {
+        let declared = field(name).unwrap_or_else(|| panic!("enroll declares no {name}"));
+        assert_eq!(declared["filled_by"].as_str(), Some("executor"), "{name}");
+        assert_eq!(declared["required"].as_bool(), Some(true), "{name}");
+    }
+    assert_eq!(
+        step("enroll")["metadata_defaults"]["written_by"].as_str(),
+        Some(format!("rule:{}", preparation_rule_name()).as_str()),
+        "the proposal is the runner rule's alone"
+    );
     assert!(
         step("verify")["ready_when"]
             .as_str()

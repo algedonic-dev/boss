@@ -467,10 +467,13 @@ pub(crate) fn rebase_onto_main(repo: &Path, branch: &str) -> anyhow::Result<Reba
 /// force-push rule 1 also forbids — so a builder at a conflict had no
 /// allowed path. A merge commit is harmless: trains squash, the base
 /// check's three-dot diff reads from the merge-base, which is then
-/// main's head, and the push is a fast-forward.
+/// main's head, and the push is a fast-forward. Each git command names
+/// its tree with `-C` (backlog 916fe290): a builder's bare call runs in
+/// the shared checkout, not its worktree, and rule 1 now says so too.
 pub(crate) const MERGE_MAIN_PATH: &str = "Merge main into the car instead, in your own \
-     worktree: git fetch origin, then git merge origin/main (a normal merge commit; trains \
-     squash), resolve, commit, run the whole suites, push as a fast-forward, then gate again \
+     worktree: git -C <your worktree> fetch origin, then git -C <your worktree> merge \
+     origin/main (a normal merge commit; trains squash), resolve, commit, run the whole \
+     suites, push as a fast-forward, then gate again \
      with the --park-* flags, or run boss rerail <car> --finish if the car is already docked.";
 
 /// How many times a racing branch is replayed before the verb refuses.
@@ -1451,7 +1454,8 @@ mod tests {
         // command rule 1 forbids, whose push then needs the force-push
         // rule 1 also forbids.
         assert!(
-            err.contains(MERGE_MAIN_PATH) && err.contains("git merge origin/main"),
+            err.contains(MERGE_MAIN_PATH)
+                && err.contains("git -C <your worktree> merge origin/main"),
             "{err}"
         );
         assert!(!err.contains("git rebase"), "{err}");
@@ -1572,7 +1576,8 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.contains(MERGE_MAIN_PATH) && err.contains("git merge origin/main"),
+            err.contains(MERGE_MAIN_PATH)
+                && err.contains("git -C <your worktree> merge origin/main"),
             "{err}"
         );
         Forge::git(&f.clone, &["fetch", "-q", "origin"]);
@@ -1637,8 +1642,8 @@ mod tests {
         let end = rules[start..].find("\n2. ").expect("rule 2") + start;
         let rule_one = &rules[start..end];
         for said in [
-            "git fetch origin",
-            "git merge origin/main",
+            "git -C <your worktree> fetch origin",
+            "git -C <your worktree> merge origin/main",
             "fast-forward",
             "--park-*",
             "boss rerail <car> --finish",

@@ -301,6 +301,17 @@ pub struct PurchaseOrder {
 }
 
 impl PurchaseOrder {
+    /// Prospective ordinary purchase admission (decision 0a8e95f1):
+    /// zero-cost lines are valid, negative costs need an explicit credit
+    /// contract. Keep this separate from storage and replay validation,
+    /// which must continue to represent recorded signed historical facts.
+    pub fn validate_ordinary_costs(&self) -> Result<(), String> {
+        if self.lines.iter().any(|line| line.unit_cost_cents < 0) {
+            return Err("ordinary purchase line unit cost must not be negative".into());
+        }
+        Ok(())
+    }
+
     /// Required-at-place: a PO that has been placed (any status past
     /// `Draft`) must name a vendor, carry at least one line, and record
     /// when it was placed. A `Draft` PO may be a bare identity.

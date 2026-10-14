@@ -36,11 +36,15 @@
 # closes cannot re-run on its own probe's answer (the loop the handler's
 # `REQUEST_TITLE` guard exists for).
 #
-# FIRST OF A PLAN, AND DORMANT UNTIL THE LAST. This car ships the
+# FIRST OF A PLAN, AND DORMANT UNTIL THE LAST. This car shipped the
 # obligation only; no car carries `proof_owed` until the ship-a-change
-# exit that sets it is published, and the forge door that pays an owed
-# proof on a CLOSED car (and files loudly when one fails) is the next
-# car. The plan rides on the backlog item.
+# exit that sets it is published. The forge door that pays an owed
+# proof on a CLOSED car was the second car (`boss prove --from-car
+# --unattended` admits the skipped `proven` of a car carrying the
+# marker, and a green writes `proof_owed = "paid"` beside the proof
+# under `owed_proof`). Still owed by the plan: the exit, and filing
+# loudly when an owed proof is judged false. The plan rides on the
+# backlog item.
 [[rule]]
 name = "rerun-owed-proofs-on-job-closed"
 why = """

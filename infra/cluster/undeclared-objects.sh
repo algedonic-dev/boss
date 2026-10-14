@@ -295,19 +295,27 @@ derived_exemptions() {
 # second resolution is a second set of assumptions about a host.
 #
 # The forge host is the measured case and it is not simple: the converge
-# unit runs a bare `kubectl` with an admin kubeconfig at
-# /home/david/kc.yaml (journal, 2026-09-10: `check-manifests-applied: 49
-# present`), while a probe run as david through a minimal environment
-# finds none (infra/forge/host-absent-tools.txt, 2026-09-09) and the
-# converge's own apply goes through `docker run alpine/k8s`. Two true
-# statements about one host — so try the binary, then the container, and
-# say which when neither is there.
+# unit runs a bare `kubectl` with the admin kubeconfig (journal,
+# 2026-09-10: `check-manifests-applied: 49 present`), while a probe
+# through a minimal environment finds none
+# (infra/forge/host-absent-tools.txt, 2026-09-09) and the converge's own
+# apply goes through `docker run alpine/k8s`. Two true statements about
+# one host — so try the binary, then the container, and say which when
+# neither is there. The kubeconfig is the one David places, root's
+# (infra/estate/ops-credentials.sh ops_kubeconfig; backlog fb444bbb):
+# the converge read /home/david/kc.yaml, a second copy nothing checked,
+# until it moved to root (backlog 683d7fe9), and so did every verb here.
 resolve_kubectl() {
     if [ -n "${BOSS_KUBECTL:-}" ]; then
         printf '%s\n' "$BOSS_KUBECTL"
         return 0
     fi
-    local kc="${KUBECONFIG:-${BOSS_FORGE_KUBECONFIG:-/home/david/kc.yaml}}"
+    local kc="${KUBECONFIG:-${BOSS_FORGE_KUBECONFIG:-}}"
+    if [ -z "$kc" ]; then
+        # shellcheck source=infra/estate/ops-credentials.sh
+        . "$(dirname "${BASH_SOURCE[0]}")/../estate/ops-credentials.sh"
+        kc="$(ops_kubeconfig)"
+    fi
     case "$kc" in
         *[[:space:]]*)
             say "the kubeconfig path \`$kc\` contains whitespace; name one without it"
@@ -327,8 +335,10 @@ resolve_kubectl() {
     fi
     if command -v docker >/dev/null 2>&1 && [ -f "$kc" ]; then
         # The shape the converge uses, plus the tree mounted at its own
-        # path so `-f <file>` means the same thing inside and out.
-        printf 'docker run --rm --network host -v %s:/kc:ro -v %s:%s:ro -w %s alpine/k8s:1.33.3 kubectl --kubeconfig=/kc\n' \
+        # path so `-f <file>` means the same thing inside and out. No
+        # container log: what kubectl prints is the script's alone
+        # (backlog aa700921, a_kubectl_container_keeps_no_log.rs).
+        printf 'docker run --rm --log-driver=none --network host -v %s:/kc:ro -v %s:%s:ro -w %s alpine/k8s:1.33.3 kubectl --kubeconfig=/kc\n' \
             "$kc" "$TREE" "$TREE" "$TREE"
         return 0
     fi
@@ -482,10 +492,11 @@ trap 'rm -rf "$TMP"' EXIT
 shopt -s nullglob
 MANIFESTS=("$DIR"/*.yaml)
 # Every other Kubernetes manifest in the tree. These are applied by
-# something other than the converge (the gate runner applies its own PVC
-# and Job), so an object they declare IS declared — just not converged.
-# Reading them is what keeps `gate-runner-disk` from reading as an
-# orphan, and it collapses two more exemption lines.
+# something other than the converge (`boss gate` creates the gate Job),
+# so an object they declare IS declared — just not converged. Reading
+# them is what kept the gate's old claim `gate-runner-disk` from reading
+# as an orphan while it was declared there (retired 2026-10-10, backlog
+# 1f13b894), and it collapses two more exemption lines.
 OTHER_MANIFESTS=("$TREE"/infra/gate-runner/*.yaml)
 shopt -u nullglob
 

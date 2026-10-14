@@ -213,16 +213,7 @@
   }
   .form-row input {
     width: 100%;
-    padding: 9px 10px;
-    border: 1px solid var(--hairline);
-    border-radius: 6px;
-    font-size: 14px;
-    background: var(--ink);
     box-sizing: border-box;
-  }
-  .form-row input:focus {
-    outline: none;
-    border-color: var(--border-strong);
   }
   .submit-btn {
     width: 100%;

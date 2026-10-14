@@ -810,9 +810,11 @@
                 <!-- THE TRAIN GATE (128b5496): the verdict is the forge's
                      and the cluster gate's read together; both halves
                      are shown; a train CI alone judged, or one whose gate is
-                     waiting at the bound (0d16df6f), says so in the trouble style. -->
+                     waiting for a bay past TRAIN_GATE_WAIT_MINUTES (0d16df6f,
+                     19227ca8), says so in the trouble style; a shorter wait is
+                     the train holding the first place in line, not trouble. -->
                 <dt>verdict</dt>
-                <dd class:yard-trouble={trainGateTroubled(t.gate)}>{trainGateLabel(t.gate)}</dd>
+                <dd class:yard-trouble={trainGateTroubled(t.gate, nowMs)}>{trainGateLabel(t.gate)}</dd>
               {/if}
             </dl>
             <div class="yard-label">Its steps</div>
@@ -1080,10 +1082,21 @@
           <div class="yard-entity-sub">
             {gatesInUse} / {gateCapacity} bays in use{queueTypical !== null ? ` · a gate here measures ~${journeyText(queueTypical)}` : ' · no gate measured yet — the waits below are unknown, not zero'}
           </div>
-          {#if gateQueue.length === 0}
+          {@const trainsFirst = floor.wagons.filter(w => w.station === 'gate-queue' && w.id === w.trainId)}
+          {#if gateQueue.length === 0 && trainsFirst.length === 0}
             <div class="yard-empty">Nothing is waiting for a bay.</div>
           {:else}
             <ul class="yard-garage">
+              <!-- A train whose gate the bound refused holds the first
+                   place (design 1e787fc2, 19227ca8): listed ahead of the
+                   queued runs, as the floor draws it. -->
+              {#each trainsFirst as w (w.id)}
+                <li class="yard-garage-row">
+                  <span class="yard-held-branch">{w.title}</span>
+                  <span class="yard-garage-check">{w.status}</span>
+                  <button type="button" class="yard-verb-link" onclick={() => select(`train:${w.id}`)}>open train</button>
+                </li>
+              {/each}
               {#each gateQueue as q (q.packet_id)}
                 <li class="yard-garage-row">
                   <span class="yard-held-branch">{q.branch}</span>

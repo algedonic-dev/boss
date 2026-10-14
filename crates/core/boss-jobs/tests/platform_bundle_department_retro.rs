@@ -14,6 +14,37 @@
 use boss_jobs::registry::{WorkflowSpec, platform_bundle_path};
 use boss_jobs::seed_loader::load_workflows;
 
+#[test]
+fn the_it_retro_reads_the_whole_simplification_window_and_its_coverage() {
+    let wf = bundled("department-retro");
+    let collect = wf.steps.iter().find(|s| s.title == "collect").unwrap();
+    let procedure = collect.metadata_defaults["procedure"].as_str().unwrap();
+    for contract in [
+        "retro-simplification.py",
+        "--collect",
+        "--ref",
+        "--since",
+        "--until",
+        "median_files",
+        "median_adds",
+        "median_removes",
+        "removes_adds_ratio",
+        "core_share",
+        "cars_landed",
+        "coverage",
+        "trend",
+        "UNKNOWN",
+    ] {
+        assert!(procedure.contains(contract), "IT collect omits {contract}");
+    }
+    assert!(
+        collect
+            .fields
+            .iter()
+            .any(|f| f.name == "simplification" && !f.required)
+    );
+}
+
 fn bundled(kind: &str) -> WorkflowSpec {
     load_workflows(platform_bundle_path())
         .expect("the platform bundle parses")

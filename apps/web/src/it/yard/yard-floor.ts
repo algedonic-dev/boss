@@ -641,11 +641,15 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  *  expects — the number an operator actually wants, since everyone
  *  behind it waits at least that long. "clear" when nobody waits; the
  *  count alone when the server measured no gate to estimate from. */
-function queueLaneLabel(queue: readonly QueuedGate[]): string {
+function queueLaneLabel(queue: readonly QueuedGate[], trainsFirst = 0): string {
   const front = queue[0];
-  if (!front) return 'clear';
-  const waiting = `${queue.length} waiting`;
-  if (front.estimated_wait_seconds === null) return waiting;
+  const count = queue.length + trainsFirst;
+  if (count === 0) return 'clear';
+  const waiting = `${count} waiting`;
+  // A train at the head takes the next bay, so the front RUN's estimate
+  // no longer names the next departure: the line says who goes first.
+  if (trainsFirst > 0) return `train first · ${waiting}`;
+  if (!front || front.estimated_wait_seconds === null) return waiting;
   return front.estimated_wait_seconds === 0
     ? `${waiting} · a bay is free now`
     : `${waiting} · next ~${journeyText(front.estimated_wait_seconds)}`;
@@ -976,6 +980,34 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
   // a queue is the pipeline working to its bound, not an alarm — the
   // distinction the floor learned from held greens.
   const queue = status?.gates.queued ?? [];
+  // THE HEAD OF THE LINE (backlog 19227ca8, design 1e787fc2): a train
+  // whose gate the bound refused holds the FIRST place and takes the next
+  // bay that frees. It has no gate-run yet, so the server's queue does not
+  // carry it — drawn here, ahead of every queued run, as the train-gate
+  // wagon it becomes once filed. Neutral like the rest of the line: the
+  // verdict row says when the wait has held long enough to be trouble.
+  const trainsFirst = yard.inFlight.filter(
+    t => t.gate != null && t.gate.wait_reason !== null && t.gate.run === null && t.gate.fallback === null,
+  );
+  trainsFirst.forEach((t, i) => {
+    if (claimedIds.has(t.id)) return;
+    place({
+      id: t.id,
+      tag: 'train gate',
+      title: `train gate — ${t.title}, first in the gate line`,
+      branch: '',
+      head: null,
+      kind: 'train-gate',
+      sim: false,
+      station: 'gate-queue',
+      slot: i,
+      trainId: t.id,
+      tone: 'static',
+      lamp: 'off',
+      status: `waiting · first in line for the next bay · ${t.gate?.wait_reason ?? ''}`,
+      since: t.gate?.wait_since ?? null,
+    });
+  });
   queue.forEach(q => {
     if (claimedBranches.has(q.branch)) return;
     const car = carByBranch.get(q.branch);
@@ -990,7 +1022,7 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
       kind: tg?.kind ?? car?.kind ?? 'gate-run',
       sim: car?.sim ?? false,
       station: 'gate-queue',
-      slot: q.position > 0 ? q.position - 1 : 0,
+      slot: trainsFirst.length + (q.position > 0 ? q.position - 1 : 0),
       trainId: tg?.trainId ?? null,
       tone: 'static',
       lamp: 'off',
@@ -1311,7 +1343,7 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
         cooldownMinutes: cooldown,
         lamp: !unread && parked > 0 ? 'ok' : 'off',
       },
-      queue: { label: queueLaneLabel(queue), count: queue.length },
+      queue: { label: queueLaneLabel(queue, trainsFirst.length), count: queue.length + trainsFirst.length },
       garage: { label: garageCount > 0 ? `${garageCount} gated red` : 'empty', count: garageCount },
       arrivals: { label: `${landedRecently} landed · 24h`, landed: landedRecently },
       cancelled: { label: withdrawnCount > 0 ? `${withdrawnCount} withdrawn` : 'empty', count: withdrawnCount },

@@ -64,8 +64,10 @@ image="$(ops_image 2>/dev/null)" || unavailable operator_image_unavailable
 # read-only alongside the existing credentials. No host scratch for raw
 # protected input; read-only root, ephemeral tmpfs and no capabilities.
 # Both bounds matter: killing only the Docker client can leave a container.
+# No container log either: what the program prints, stderr included, is
+# never kept by the docker daemon's log driver (backlog aa700921).
 status=0
-report="$(timeout -k 5 855 sudo -n docker run --rm -i --network host \
+report="$(timeout -k 5 855 sudo -n docker run --rm --log-driver=none -i --network host \
     --read-only --cap-drop ALL --security-opt no-new-privileges --ulimit core=0 \
     --tmpfs /tmp:rw,noexec,nosuid,size=8m \
     --mount "type=bind,src=$(ops_kubeconfig),dst=/kc,readonly" \

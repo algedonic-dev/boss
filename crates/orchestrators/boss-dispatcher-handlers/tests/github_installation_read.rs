@@ -141,10 +141,9 @@ async fn a_redirect_cannot_move_the_issuer_read_to_another_endpoint() {
 
 #[tokio::test]
 async fn unavailable_transport_refuses_without_an_invented_snapshot() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    let reader = GitHubApi::new(format!("http://{address}"), root()).unwrap();
+    // Held, not bound and released (review 465e723f F3).
+    let dark = boss_testing::dark_port();
+    let reader = GitHubApi::new(dark.base.clone(), root()).unwrap();
     assert_eq!(
         reader.read_installation(&expected()).await.unwrap_err(),
         "installation GET transport unavailable"

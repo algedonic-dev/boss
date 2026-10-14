@@ -45,6 +45,10 @@ METHODS = {
     "operator": "../estate/ops-credentials.sh",
     "estate": "../lib/sor.sh",
     "reader": "../lib/sor-reader.sh",
+    # The host door presents the estate machine token through the one
+    # shell reader (backlog 44b2087e B1, 2026-10-10), so the reviewed
+    # identity binds the stamped door and the reader it sources.
+    "machine_token": "../lib/secret-header.sh",
     "json": "../lib/jq.sh",
     "access_verb": "../ops/verbs/probe-admission-source-access.json",
     "identity_verb": "../ops/verbs/probe-admission-reader-identity.json",

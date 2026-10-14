@@ -25,7 +25,7 @@
 //! also checks is that none of them reaches the output, the run
 //! summary, or a request body.
 
-use boss_testing::{repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -281,14 +281,8 @@ base64 -w0 < "$STUB_SECRET"
         cmd.env("GIT_CONFIG_GLOBAL", &self.gitconfig)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("HOME", self.root.join("home"))
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("NO_PROXY", "127.0.0.1")
-            .env("no_proxy", "127.0.0.1")
-            .env_remove("http_proxy")
-            .env_remove("HTTP_PROXY")
-            .env_remove("https_proxy")
-            .env_remove("HTTPS_PROXY")
-            .env_remove("ALL_PROXY");
+            .env("GIT_TERMINAL_PROMPT", "0");
+        without_proxy(&mut cmd);
         cmd
     }
 
@@ -372,13 +366,6 @@ base64 -w0 < "$STUB_SECRET"
             .env("GIT_CONFIG_GLOBAL", &self.gitconfig)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("HOME", self.root.join("home"))
-            .env("NO_PROXY", "127.0.0.1")
-            .env("no_proxy", "127.0.0.1")
-            .env_remove("http_proxy")
-            .env_remove("HTTP_PROXY")
-            .env_remove("https_proxy")
-            .env_remove("HTTPS_PROXY")
-            .env_remove("ALL_PROXY")
             .env("BOSS_DEPOSIT_KUBECTL", &self.kubectl)
             .env("STUB_KUBECTL_LOG", self.root.join("kubectl.log"))
             .env("STUB_SECRET", &self.secret)
@@ -387,6 +374,7 @@ base64 -w0 < "$STUB_SECRET"
             .env("BOSS_RUN_SUMMARY_FILE", &self.summary)
             .env("BOSS_NODE_ID", "forge")
             .env("BOSS_API_RETRY_DEADLINE", "0");
+        without_proxy(&mut cmd);
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -916,15 +904,12 @@ fn every_act_on_the_owners_files_runs_as_the_owner() {
         .env("GIT_CONFIG_GLOBAL", &c.gitconfig)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("HOME", c.root.join("home"))
-        .env("NO_PROXY", "127.0.0.1")
-        .env("no_proxy", "127.0.0.1")
-        .env_remove("http_proxy")
-        .env_remove("HTTP_PROXY")
         .env("BOSS_DEPOSIT_KUBECTL", &c.kubectl)
         .env("STUB_KUBECTL_LOG", c.root.join("kubectl.log"))
         .env("STUB_SECRET", &c.secret)
         .env("BOSS_SOR_ENV", c.root.join("sor.env"))
         .env_remove("BOSS_JOBS_URL");
+    without_proxy(&mut cmd);
     let out = cmd.output().unwrap();
     let text = format!(
         "{}{}",
@@ -951,16 +936,20 @@ fn every_act_on_the_owners_files_runs_as_the_owner() {
 }
 
 /// The consumers move with the credential (D2): once the remote carries
-/// no userinfo, a consumer that derives its URL from it — here the
-/// tenant-source check the cluster converge runs as the owner
-/// (cluster-deploy-lib.sh) — authenticates through the owner's helper
-/// alone. Measured against the same forge, which 401s anything else.
+/// no userinfo, a consumer that derives its URL from it — the tenant URL
+/// cluster-deploy-lib.sh derives from the checkout's remote, which
+/// merge-tenant-main.sh pushes a tenant through as the owner — reads
+/// through the owner's helper alone. Measured against the same forge,
+/// which 401s anything else. (The cluster converge itself read its
+/// tenant this way until backlog 683d7fe9 moved it to root, which reads
+/// the forge's repository from disk and needs no credential.)
 #[test]
-fn after_the_cutover_the_tenant_check_authenticates_through_the_helper() {
+fn after_the_cutover_the_tenant_url_authenticates_through_the_helper() {
     let c = Case::new("tenant-check");
     c.converted(OLD);
     let script = format!(
-        ". '{}'\ntenant_source_check '{}' david/boss main\n",
+        "set -o pipefail\n. '{}'\nurl=$(tenant_repo_url '{}' david/boss) || exit 2\n\
+         GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code \"$url\" refs/heads/main | cut -f1\n",
         repo_root()
             .join("infra/forge/cluster-deploy-lib.sh")
             .display(),

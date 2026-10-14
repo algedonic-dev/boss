@@ -165,14 +165,14 @@ pub(crate) async fn run(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let overriding = prove::override_reason(probe_anyway.as_deref())?;
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     // The actor FIRST: a write nobody names is refused, and the refusal
     // costs a line rather than a probe against production (5083d6f5).
     if !dry {
         crate::identity::sign(&reqwest::Method::PATCH, "/api/jobs")?;
     }
-    let base = crate::gate::resolve_jobs_base(None)?;
-    let cars = crate::gate::all_cars_at(&http, &base).await?;
+    let base = crate::sor_client::resolve_jobs_base(None)?;
+    let cars = crate::sor_client::all_cars_at(&http, &base).await?;
     let car = prove::find_car(&cars, car_ref, Eligible::Live)?.clone();
     let id = car
         .get("id")
@@ -238,6 +238,10 @@ pub(crate) async fn run(
     let shell = Shell::here(None)
         .with_probe_reader(tree.as_deref(), &base)
         .with_car_instant(prove::car_merge_ref(&car));
+    // A record read on a host with no reader credential is refused before
+    // anything is sent: under enforce its 401 would read as FALSE, and a
+    // disproof would be recorded against correct code (design 00227628).
+    prove::refuse_a_record_read_without_a_reader(&probe, &shell, prove::Door::Disproved)?;
     let obs = prove::probe_tree(&shell);
     println!("boss prove --disproved: {short}  $ {probe}");
     // A disproof records only a probe judged false; a refusal records
@@ -274,7 +278,7 @@ pub(crate) async fn run(
         disproof: serde_json::to_string(&record)?,
         superseded_by: remedy_id,
         remedy,
-        completed_at: crate::gate::stamp(now),
+        completed_at: crate::sor_client::stamp(now),
     };
 
     // A car pinned to a version without the terminal is MOVED first —

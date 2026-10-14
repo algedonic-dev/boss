@@ -9,7 +9,7 @@
 //! history identity. Incomplete legacy coverage or malformed manual facts
 //! refuse the protected transaction before any content table is cleared.
 
-use boss_events::replay::{Applied, replay_projection_checked};
+use boss_events::replay::{Applied, replay_projection_planned};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sqlx::PgPool;
@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::types::Bulletin;
 
-const REBUILD_LOCK_KEY: i64 = boss_core::rebuild::lock_key("content");
+pub(crate) const REBUILD_LOCK_KEY: i64 = boss_core::rebuild::lock_key("content");
 
 #[derive(Debug, thiserror::Error)]
 pub enum RebuildError {
@@ -34,6 +34,7 @@ pub struct RebuildReport {
     pub bulletins_deleted: u64,
     pub dismissals_inserted: u64,
     pub manual_versions_replayed: u64,
+    pub manual_events_covered: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,7 +47,7 @@ struct DismissPayload {
 pub async fn rebuild_content(pool: &PgPool) -> Result<RebuildReport, RebuildError> {
     let mut report = RebuildReport::default();
 
-    let stats = replay_projection_checked(
+    let stats = replay_projection_planned(
         pool,
         REBUILD_LOCK_KEY,
         &[
@@ -56,10 +57,20 @@ pub async fn rebuild_content(pool: &PgPool) -> Result<RebuildReport, RebuildErro
             "DELETE FROM manual_sections",
         ],
         "kind LIKE 'content.bulletin.%' OR kind LIKE 'content.manual.%'",
-        crate::manual_rebuild::validate_manual,
+        crate::manual_rebuild::prepare_manual,
         async |conn, ev| {
             match ev.kind.as_str() {
+                crate::events::BASELINE_OBSERVED => {
+                    let baseline: crate::manual_baseline::ManualBaseline=serde_json::from_value(ev.payload.clone()).map_err(|e|e.to_string())?;
+                    crate::manual_baseline_pg::restore(conn,&baseline).await?;
+                    report.manual_versions_replayed+=baseline.inventory.history_count as u64;
+                    Ok(Applied::Yes)
+                }
                 crate::events::SECTION_CREATED | crate::events::SECTION_UPDATED => {
+                    if crate::manual_rebuild::covered_by_baseline(conn, &ev).await? {
+                        report.manual_events_covered += 1;
+                        return Ok(Applied::Skipped);
+                    }
                     crate::manual_rebuild::apply_manual(conn, &ev).await?;
                     report.manual_versions_replayed += 1;
                     Ok(Applied::Yes)

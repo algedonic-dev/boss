@@ -8,6 +8,7 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import EditPolicyFlyout from './EditPolicyFlyout.svelte';
+  import UserOverrides from './UserOverrides.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
   import { classesFor, loadClasses } from '@boss/web-kit/session/classes.svelte';
   import { failedWithReason, failedRead, loadingRead, okRead, type ReadState } from '../data/readState';
@@ -146,6 +147,8 @@
       </Section>
     {/if}
   {/if}
+
+  <UserOverrides />
 
   {#if editing}
     <EditPolicyFlyout

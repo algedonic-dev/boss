@@ -1210,15 +1210,11 @@ mod tests {
         );
     }
 
-    /// The fresh instance: one founder, platform-admin, one user-tier
-    /// key, the shipped defaults. Every control a door asks for is held
-    /// by the founder — except the operator tier, which no default can
-    /// give (it is a key, not a rule). A door that asks for a pair the
-    /// defaults never grant platform-admin fails HERE, naming it: the
-    /// 432f0eb4 gap (posting-rule create, absent until a rollout) was
-    /// exactly that, found by hand.
+    /// Fresh defaults leave the operator key and privileged manual controls
+    /// unheld. Accidental gaps still fail this exact list; intentional
+    /// manual gaps are reported, never suppressed from coverage.
     #[test]
-    fn a_fresh_instance_founder_holds_every_control_but_the_operator_tier() {
+    fn a_fresh_instance_founder_keeps_manual_observation_ungranted() {
         let founder = vec![person("emp-founder", PLATFORM_ADMIN_ROLE)];
         let keys = vec![key("emp-founder", AccessTier::User)];
         let wf: Vec<WorkflowFacts> = serde_json::from_value(serde_json::json!([
@@ -1234,7 +1230,99 @@ mod tests {
             &founder,
             &keys,
         );
-        assert_eq!(ids(&orphans), vec!["operator-tier"], "{orphans:#?}");
+        assert_eq!(
+            ids(&orphans),
+            vec![
+                "operator-tier",
+                "policy:create:manual-baseline",
+                "policy:read:manual-inventory"
+            ],
+            "{orphans:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn privileged_manual_coverage_matches_exact_scope_all_authority() {
+        use crate::{Decision, FakePolicyClient, PolicyClient, User};
+        let manual = [
+            crate::controls::CREATE_MANUAL_BASELINE,
+            crate::controls::READ_MANUAL_INVENTORY,
+        ];
+        let selected: Vec<_> = manual
+            .iter()
+            .chain(std::iter::once(&crate::controls::READ_POLICY_RULE))
+            .map(|pair| Control::Policy {
+                action: pair.action(),
+                resource: pair.resource_name().into(),
+                all_only: pair.all_only(),
+            })
+            .collect();
+        assert_eq!(selected.len(), 3);
+        let founder = vec![person("emp-founder", PLATFORM_ADMIN_ROLE)];
+        let keys = vec![key("emp-founder", AccessTier::User)];
+        let mut user = User::service("fixture");
+        user.id = "emp-founder".into();
+        for scope in [None, Some(Scope::Self_), Some(Scope::All)] {
+            let mut rules = crate::defaults::default_rules();
+            let mut builder = FakePolicyClient::builder().with_default_rules();
+            // Literal wildcard rows are not exact authority in this engine.
+            // Broad shipped grants still hold READ_POLICY_RULE beside them.
+            for action in [Action::Read, Action::Create] {
+                rules.push(rule(PLATFORM_ADMIN_ROLE, "*", action, Scope::All));
+                builder = builder.allow(
+                    PLATFORM_ADMIN_ROLE,
+                    action,
+                    crate::Resource::new("*"),
+                    Scope::All,
+                );
+            }
+            if let Some(scope) = &scope {
+                for pair in manual {
+                    rules.push(rule(
+                        PLATFORM_ADMIN_ROLE,
+                        pair.resource_name(),
+                        pair.action(),
+                        scope.clone(),
+                    ));
+                    builder = builder.allow(
+                        PLATFORM_ADMIN_ROLE,
+                        pair.action(),
+                        pair.resource(),
+                        scope.clone(),
+                    );
+                }
+            }
+            let client = builder.build();
+            let orphans = coverage(&selected, &rules, &[], &founder, &keys);
+            let expected = if scope == Some(Scope::All) {
+                vec![]
+            } else {
+                vec![
+                    "policy:create:manual-baseline",
+                    "policy:read:manual-inventory",
+                ]
+            };
+            assert_eq!(ids(&orphans), expected);
+            assert!(matches!(
+                client
+                    .ask(&user, crate::controls::READ_POLICY_RULE)
+                    .await
+                    .unwrap(),
+                Decision::Allow { scope: Scope::All }
+            ));
+            for pair in manual {
+                let held = matches!(
+                    client.ask(&user, pair).await.unwrap(),
+                    Decision::Allow { scope: Scope::All }
+                );
+                assert_eq!(held, scope == Some(Scope::All));
+                assert_eq!(
+                    orphans.iter().any(|orphan| orphan.control
+                        == format!("policy:{}:{}", pair.action().as_str(), pair.resource_name())),
+                    !held
+                );
+            }
+        }
     }
 
     // ----- the guard's judgement (car 3 of design 1c4e42e1, G1 of

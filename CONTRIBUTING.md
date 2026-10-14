@@ -100,8 +100,8 @@ change:
 
 - New bespoke workflow code paths. New work ships as
   Workflow/StepPlugin rows, not new `match` branches.
-- Tenant-specific assumptions in BOSS core. The brewery and
-  used-device-shop crates are example tenants, not core.
+- Tenant-specific assumptions in BOSS core. The brewery is an example
+  tenant; its business-specific logic belongs in the tenant tier.
 - Code without tests. PRs that include "tests deferred" comments
   get closed.
 - Dependencies added without justification — every new crate

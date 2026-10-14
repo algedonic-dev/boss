@@ -163,7 +163,16 @@ duration_hours = 2.0
 # Only newly materialized versions carry this receipt obligation. The
 # worker records it after reading START; no host/session/claim is a receipt.
 # This report-only deadline is independent of the four-hour silence rule.
-metadata_defaults = { worker_start_expectation = { schema = 1, minutes = 15 } }
+#
+# `launch.model` is the LAUNCHER's first record of the model it handed
+# the harness, the only record a release counts for the reviewer model
+# (backlog e6b05dd6, D2 of design fb9ba887). The launcher and the run it
+# starts sign as the same agent, so what tells their writes apart is
+# WHEN: declared `records_before_claim`, the first-record door refuses
+# it once this step is claimed and the merge door never writes it
+# (review fd7f1030 F1), and a release believes it only on a step that
+# declares it.
+metadata_defaults = { worker_start_expectation = { schema = 1, minutes = 15 }, records_before_claim = ["launch.model"] }
 fields = [
   { name = "result", field_type = "gated|delivered|refused|died", required = true },
 ]

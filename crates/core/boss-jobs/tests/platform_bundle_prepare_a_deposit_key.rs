@@ -16,8 +16,14 @@ fn bundled_kind(kind: &str) -> WorkflowSpec {
         .unwrap_or_else(|| panic!("the platform bundle ships no kind {kind}"))
 }
 
+/// The person's half of the enrollment is owed at done; the broker's
+/// half is supplied, so it is owed at neither filing nor done — what
+/// holds it present is the order (`enroll` is ready only after
+/// `install`, and the handler writes the proposal before it completes
+/// `install`). Until item 3dc0b247 the proposal was executor-filled and
+/// required here, which is what refused the broker's own write.
 #[test]
-fn enrollment_requires_its_complete_public_proposal_after_creation() {
+fn enrollment_requires_the_persons_decision_and_record_after_creation() {
     use boss_core::job::FilledBy;
     use boss_jobs::step_registry::StepRegistry;
     let workflow = bundled();
@@ -31,9 +37,10 @@ fn enrollment_requires_its_complete_public_proposal_after_creation() {
     );
     assert!(boss_jobs::registry::missing_filer_fields(&empty_steps).is_empty());
     let enroll = workflow.steps.iter().find(|s| s.title == "enroll").unwrap();
-    let complete = json!({"public_key":"ssh-rsa fixture", "receiver_host":"boss-gcp",
-        "purpose":"runner deposit", "decision":"approved", "enrollment_record":"signed proposal"});
-    for field in ["public_key", "receiver_host", "purpose"] {
+    let complete = json!({"authorized_keys_line":"command=\"x\",restrict ssh-rsa fixture",
+        "receiver_host":"boss-gcp", "purpose":"runner deposit", "decision":"approved",
+        "enrollment_record":"signed proposal"});
+    for field in ["decision", "enrollment_record"] {
         let declared = enroll.fields.iter().find(|f| f.name == field).unwrap();
         let mut missing = complete.clone();
         missing.as_object_mut().unwrap().remove(field);
@@ -46,11 +53,12 @@ fn enrollment_requires_its_complete_public_proposal_after_creation() {
             StepRegistry::validate_authored_fields(&enroll.fields, &missing).is_err(),
             "null {field}"
         );
-        assert_eq!(
-            declared.filled_by,
-            FilledBy::Executor,
-            "not owed at filing: {field}"
-        );
+        assert_eq!(declared.filled_by, FilledBy::Executor, "{field}");
+    }
+    for field in ["receiver_host", "purpose", "authorized_keys_line"] {
+        let declared = enroll.fields.iter().find(|f| f.name == field).unwrap();
+        assert_eq!(declared.filled_by, FilledBy::Filer, "supplied: {field}");
+        assert!(!declared.required, "owed at filing: {field}");
     }
     assert!(StepRegistry::validate_authored_fields(&enroll.fields, &complete).is_ok());
 }
@@ -60,9 +68,10 @@ fn enrollment_completion_refuses_blank_public_proposal_values() {
     use boss_jobs::step_registry::StepRegistry;
     let workflow = bundled();
     let enroll = workflow.steps.iter().find(|s| s.title == "enroll").unwrap();
-    let complete = json!({"public_key":"ssh-rsa fixture", "receiver_host":"boss-gcp",
-        "purpose":"runner deposit", "decision":"approved", "enrollment_record":"signed proposal"});
-    for field in ["public_key", "receiver_host", "purpose"] {
+    let complete = json!({"authorized_keys_line":"command=\"x\",restrict ssh-rsa fixture",
+        "receiver_host":"boss-gcp", "purpose":"runner deposit", "decision":"approved",
+        "enrollment_record":"signed proposal"});
+    for field in ["authorized_keys_line", "receiver_host", "purpose"] {
         for blank in ["", " ", "\t\r\n", "\u{2003}"] {
             let mut proposal = complete.clone();
             proposal[field] = json!(blank);
@@ -104,7 +113,7 @@ fn native_bundle_keeps_public_preparation_distinct_from_human_enrollment() {
             .iter()
             .any(|f| f.name == "enrollment_record" && f.required)
     );
-    for name in ["public_key", "receiver_host", "purpose"] {
+    for name in ["authorized_keys_line", "receiver_host", "purpose"] {
         assert!(enroll.fields.iter().any(|f| f.name == name));
     }
     assert!(
@@ -466,6 +475,21 @@ mod native_boundary {
             .await;
             assert_eq!(status, StatusCode::CONFLICT, "{body}");
             assert_eq!(bus.event_count(), before);
+            // The receipt names the public half it is about (v2, item
+            // 3dc0b247): declared, so required at done and reserved by
+            // `written_by` like the receipt itself.
+            let (status, body) = send(
+                &app,
+                &job,
+                &step,
+                "PATCH",
+                "/metadata",
+                "automation:other",
+                "platform-admin",
+                json!({"public_key":"ssh-rsa AAAAother"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
             let (status, body) = send(
                 &app,
                 &job,
@@ -482,6 +506,34 @@ mod native_boundary {
                 jobs.get_step(&step.id).await.unwrap().unwrap().metadata[field],
                 "public receipt"
             );
+            let (status, body) = send(
+                &app,
+                &job,
+                &step,
+                "PUT",
+                "",
+                "automation:other",
+                "platform-admin",
+                json!({"status":"completed"}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "a receipt without its public key completed: {body}"
+            );
+            let (status, body) = send(
+                &app,
+                &job,
+                &step,
+                "PATCH",
+                "/metadata",
+                RULE,
+                "platform-admin",
+                json!({"public_key":"ssh-rsa AAAAfixture"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
             // written_by guards field changes, not status. A normally
             // authorised machine can complete already-recorded evidence.
             let (status, body) = send(
@@ -517,7 +569,8 @@ mod native_boundary {
             "/metadata",
             "emp-david",
             "platform-admin",
-            json!({"issued":"explicit human recovery receipt"}),
+            json!({"issued":"explicit human recovery receipt",
+                   "public_key":"ssh-rsa AAAAfixture"}),
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
@@ -594,43 +647,122 @@ mod native_boundary {
         }
     }
 
-    /// The rule row of the machine token's deposit key, read from the
-    /// tree: the actor its handler signs as, and the protocol kind it
-    /// declares its packets are.
-    fn machine_token_rule() -> (String, String) {
+    const MACHINE_TOKEN_RULE: &str = "broker-prepares-the-machine-token-deposit-key";
+    const RUNNER_RULE: &str = "broker-prepares-the-runner-deposit-key";
+    const ROOT_TREE_RULE: &str = "broker-prepares-the-root-tree-deposit-key";
+
+    /// The third transport must reach the native record boundary just
+    /// like the existing two: a synthetic completed enrollment bypassed
+    /// this seam and hid all three writer refusals (review c1dad76a).
+    #[tokio::test]
+    async fn the_root_tree_keys_rule_writes_the_receipts_of_the_protocol_it_names() {
+        a_keys_rule_writes_the_receipts_of_the_protocol_it_names(ROOT_TREE_RULE).await;
+    }
+
+    #[test]
+    fn the_root_tree_keys_protocol_names_its_actual_receiver_and_keeps_the_human_gates() {
+        a_keys_protocol_declares_the_line_and_keeps_every_human_gate(ROOT_TREE_RULE);
+        let (_, kind) = rule_of(ROOT_TREE_RULE);
+        assert_ne!(kind, "prepare-a-deposit-key");
+        assert_ne!(kind, rule_arg(MACHINE_TOKEN_RULE, "protocol_kind"));
+        let workflow = bundled_kind(&kind);
+        let enroll = workflow
+            .steps
+            .iter()
+            .find(|step| step.title == "enroll")
+            .unwrap();
+        let procedure = enroll.metadata_defaults["procedure"].as_str().unwrap();
+        for required in [
+            "root-tree-token-recv.sh",
+            "root_tree_token_receiver installed",
+            "SIGN ONLY ONCE THE RECEIVER IS INSTALLED.",
+            "Until a converge records it, do not sign.",
+        ] {
+            assert!(
+                procedure.contains(required),
+                "missing {required}: {procedure}"
+            );
+        }
+        assert!(!procedure.contains("runner_credential_receiver installed"));
+        assert!(!procedure.contains("machine_token_receiver installed"));
+        for slug in ["scope", "enroll", "verify", "revoke"] {
+            let step = workflow
+                .steps
+                .iter()
+                .find(|step| step.title == slug)
+                .unwrap();
+            assert_eq!(step.metadata_defaults["human_only"], true, "{slug}");
+        }
+        assert_eq!(enroll.assurance_required, Some(Assurance::Presence));
+        assert_eq!(enroll.sign_offs_required, vec!["platform-admin"]);
+        let verify = workflow
+            .steps
+            .iter()
+            .find(|step| step.title == "verify")
+            .unwrap();
+        for decision in [json!("rejected"), json!(null), json!("pending")] {
+            assert!(!permits(
+                &verify.ready_when,
+                &json!({"steps":{"enroll":{"done":true,"metadata":{"decision":decision}}}})
+            ));
+        }
+    }
+
+    /// A deposit key's rule row, read from the tree.
+    fn rule_row(name: &str) -> toml::Value {
         let path = std::path::Path::new(boss_jobs::registry::platform_bundle_path())
             .parent()
             .unwrap()
             .parent()
             .unwrap()
-            .join("dispatcher/rules/broker-prepares-the-machine-token-deposit-key.toml");
-        let rule: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        let actor = format!("rule:{}", rule["rule"][0]["name"].as_str().unwrap());
-        let kind = rule["rule"][0]["do"][0]["args"]["protocol_kind"]
-            .as_str()
-            .unwrap()
-            .trim_matches('"')
-            .to_string();
-        (actor, kind)
+            .join(format!("dispatcher/rules/{name}.toml"));
+        toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
-    /// THE MACHINE TOKEN KEY'S RULE CAN WRITE THE RECEIPTS OF THE
+    /// The actor a key's handler signs as, and the protocol kind its row
+    /// declares its packets are.
+    fn rule_of(name: &str) -> (String, String) {
+        let rule = rule_row(name);
+        let actor = format!("rule:{}", rule["rule"][0]["name"].as_str().unwrap());
+        (actor, rule_arg(name, "protocol_kind"))
+    }
+
+    fn rule_arg(name: &str, arg: &str) -> String {
+        rule_row(name)["rule"][0]["do"][0]["args"][arg]
+            .as_str()
+            .unwrap_or_else(|| panic!("the rule row {name} declares no {arg}"))
+            .trim_matches('"')
+            .to_string()
+    }
+
+    /// The sibling key's rule: each protocol names its own rule as the
+    /// writer of its receipts and proposal, and refuses the other's.
+    fn other_rule(name: &str) -> &'static str {
+        if name == RUNNER_RULE {
+            MACHINE_TOKEN_RULE
+        } else {
+            RUNNER_RULE
+        }
+    }
+
+    /// EACH KEY'S RULE CAN WRITE THE RECEIPTS AND THE PROPOSAL OF THE
     /// PROTOCOL IT NAMES (adversarial review ecd9263a, F1; backlog
-    /// 88379df3). The handler signs every write as `rule:<the rule that
-    /// fired>`, and a step's `written_by` believes ONE machine actor. The
-    /// first draft pointed the new rule at prepare-a-deposit-key, whose
-    /// `issue` and `install` name the RUNNER's rule: sent through the
-    /// real router, both of the handler's receipts answered 403, so after
-    /// the human scope the pair was minted, the line landed on `enroll`,
-    /// and `enroll` could never become ready. The handler's own tests ran
-    /// against a stub jobs server that enforces nothing. This sends the
-    /// handler's own bodies, as the rule's own actor, through the real
-    /// router against the bundled protocol the rule names — and holds
-    /// the property the declaration exists for: the other broker rule,
-    /// and every other automation, is still refused.
-    #[tokio::test]
-    async fn the_machine_token_keys_rule_writes_the_receipts_of_the_protocol_it_names() {
-        let (actor, kind) = machine_token_rule();
+    /// 88379df3; item 3dc0b247 for the runner's). The handler signs every
+    /// write as `rule:<the rule that fired>`, and a step's `written_by`
+    /// believes ONE machine actor. Pointed at a protocol naming another
+    /// rule, the machine token key's receipts answered 403; and the runner
+    /// key's own protocol, prepare-a-deposit-key v1, refused its proposal
+    /// on the human-only `enroll`, so after the human scope the pair was
+    /// minted and the person's step never opened. The handler's own tests
+    /// ran against a stub jobs server that enforces nothing. This sends
+    /// the handler's own bodies, as the rule's own actor, through the real
+    /// router against the bundled protocol the rule names — and holds the
+    /// property the declaration exists for: the other broker rule, and
+    /// every other automation, is still refused.
+    async fn a_keys_rule_writes_the_receipts_of_the_protocol_it_names(name: &str) {
+        let (actor, kind) = rule_of(name);
+        let (other, _) = rule_of(other_rule(name));
+        let purpose = rule_arg(name, "purpose");
         let workflow = bundled_kind(&kind);
         for (slug, field, evidence) in [
             (
@@ -650,22 +782,26 @@ mod native_boundary {
                 field: evidence,
                 "public_key": "ssh-rsa AAAAfixture",
                 "receiver_host": "boss-gcp",
-                "purpose": "estate machine token deposit",
+                "purpose": purpose,
                 "enrollment": "pending",
             });
-            for other in [RULE, "automation:other", "agent-codex"] {
+            for who in [other.as_str(), "automation:other", "agent-codex"] {
                 let (status, answer) = send(
                     &app,
                     &job,
                     &step,
                     "PATCH",
                     "/metadata",
-                    other,
+                    who,
                     "platform-admin",
                     body.clone(),
                 )
                 .await;
-                assert_eq!(status, StatusCode::FORBIDDEN, "{slug} by {other}: {answer}");
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{name}: {slug} by {who}: {answer}"
+                );
             }
             let (status, answer) = send(
                 &app,
@@ -681,7 +817,7 @@ mod native_boundary {
             assert_eq!(
                 status,
                 StatusCode::NO_CONTENT,
-                "{slug}: the rule's own receipt was refused: {answer}"
+                "{name}: {slug}: the rule's own receipt was refused: {answer}"
             );
             let (status, answer) = send(
                 &app,
@@ -694,7 +830,7 @@ mod native_boundary {
                 json!({"status":"completed"}),
             )
             .await;
-            assert_eq!(status, StatusCode::NO_CONTENT, "{slug}: {answer}");
+            assert_eq!(status, StatusCode::NO_CONTENT, "{name}: {slug}: {answer}");
             let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
             assert_eq!(stored.status, StepStatus::Completed);
             assert_eq!(stored.metadata[field], evidence);
@@ -702,15 +838,18 @@ mod native_boundary {
 
         // The proposal the handler writes onto `enroll`, as that actor.
         let (app, jobs, _, job, step) = fixture_of(workflow.clone(), "enroll").await;
-        let line = "command=\"exec sudo -n /usr/local/libexec/boss/ops-credential-recv machine-token\",restrict ssh-rsa AAAAfixture";
+        let line = format!(
+            "command=\"{}\",restrict ssh-rsa AAAAfixture",
+            rule_arg(name, "forced_command")
+        );
         // ONLY that actor (delta review 76249509, question 2): filer-filled
         // alone let every machine write the proposal and the case text
         // above the procedure; `written_by` on `enroll` reserves each
         // declared field for the broker's rule. The whole road, with the
         // handler itself, is boss-dispatcher-handlers'
         // deposit_key_enrollment_e2e.rs.
-        for other in [
-            RULE,
+        for who in [
+            other.as_str(),
             "automation:other",
             "agent-codex",
             "codex@algedonic.dev",
@@ -727,7 +866,7 @@ mod native_boundary {
                     &step,
                     "PATCH",
                     "/metadata",
-                    other,
+                    who,
                     "platform-admin",
                     body.clone(),
                 )
@@ -735,9 +874,9 @@ mod native_boundary {
                 assert_eq!(
                     status,
                     StatusCode::FORBIDDEN,
-                    "enroll {body} by {other}: {answer}"
+                    "{name}: enroll {body} by {who}: {answer}"
                 );
-                assert_eq!(answer["written_by"], actor, "{other}: {answer}");
+                assert_eq!(answer["written_by"], actor, "{who}: {answer}");
             }
         }
         let (status, answer) = send(
@@ -748,14 +887,13 @@ mod native_boundary {
             "/metadata",
             &actor,
             "platform-admin",
-            json!({"receiver_host":"boss-gcp",
-                   "purpose":"estate machine token deposit","authorized_keys_line":line}),
+            json!({"receiver_host":"boss-gcp", "purpose":purpose, "authorized_keys_line":line}),
         )
         .await;
         assert_eq!(
             status,
             StatusCode::NO_CONTENT,
-            "the broker's proposal was refused on the person's step: {answer}"
+            "{name}: the broker's proposal was refused on the person's step: {answer}"
         );
         // The bare key is nobody's to put on this step, the broker's rule
         // included (backlog dea2236f): the step's signer places a line.
@@ -773,7 +911,7 @@ mod native_boundary {
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
-            "the bare public key was admitted beside the line to place: {answer}"
+            "{name}: the bare public key was admitted beside the line to place: {answer}"
         );
         assert_eq!(
             jobs.get_step(&step.id).await.unwrap().unwrap().metadata["authorized_keys_line"],
@@ -791,7 +929,7 @@ mod native_boundary {
             json!({"decision":"approved","enrollment_record":"placed"}),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{name}: {answer}");
         let (status, answer) = send(
             &app,
             &job,
@@ -806,60 +944,38 @@ mod native_boundary {
         assert_ne!(
             status,
             StatusCode::NO_CONTENT,
-            "a machine completed the enrollment: {answer}"
+            "{name}: a machine completed the enrollment: {answer}"
         );
     }
 
-    /// ON THE RECORD, NOT REPAIRED HERE: the generic protocol's `enroll`
-    /// refuses the same handler's proposal. Its three proposal fields are
-    /// executor-filled on a human-only step, where a machine may write
-    /// only context or a filer-filled field, so the runner key's own rule
-    /// is refused at that write too — the second refusal on the road the
-    /// reviewer's F1 found the first of. prepare-a-deposit-key is live as
-    /// v1 and has never run; repairing it is a new version of a row the
-    /// runner's delivery owns (1e50e66b). When that lands, this leg turns
-    /// and is deleted with the fix.
     #[tokio::test]
-    async fn the_generic_protocols_enroll_still_refuses_the_brokers_proposal() {
-        let (app, _, _, job, step) = fixture("enroll").await;
-        let (status, answer) = send(
-            &app,
-            &job,
-            &step,
-            "PATCH",
-            "/metadata",
-            RULE,
-            "platform-admin",
-            json!({"public_key":"ssh-rsa AAAAfixture","receiver_host":"boss-gcp",
-                   "purpose":"ops-runner credential deposit"}),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::FORBIDDEN,
-            "prepare-a-deposit-key's enroll now takes the broker's proposal — delete this \
-             leg and say so on 1e50e66b: {answer}"
-        );
-        assert!(answer.to_string().contains("human_only"), "{answer}");
+    async fn the_machine_token_keys_rule_writes_the_receipts_of_the_protocol_it_names() {
+        a_keys_rule_writes_the_receipts_of_the_protocol_it_names(MACHINE_TOKEN_RULE).await;
+    }
+
+    /// The runner key's road through its own protocol. It replaces the
+    /// leg that recorded prepare-a-deposit-key v1 refusing this very
+    /// proposal (item 3dc0b247), which said to delete itself when the
+    /// row was repaired.
+    #[tokio::test]
+    async fn the_runner_keys_rule_writes_the_receipts_of_the_protocol_it_names() {
+        a_keys_rule_writes_the_receipts_of_the_protocol_it_names(RUNNER_RULE).await;
     }
 
     /// THE STEP NAMES THE LINE ITS SIGNER PLACES (review ecd9263a, F4).
     /// The line is placed on the host BEFORE the sign-off, so the step
-    /// must declare it — required at done — and its procedure must say
-    /// what to check in it. And the per-key protocol is the generic one
-    /// in every contract that matters: the same steps, kinds, human
-    /// gates and presence sign-off, differing in the two writers and in
-    /// what `enroll` declares.
-    #[test]
-    fn the_per_key_protocol_declares_the_line_and_keeps_every_human_gate() {
+    /// must declare it and its procedure must say what to check in it.
+    /// And the two keys' protocols are one protocol in every contract
+    /// that matters: the same steps, kinds, human gates and presence
+    /// sign-off, differing in the rule each names and in what the
+    /// procedure sends the signer to read before signing.
+    fn a_keys_protocol_declares_the_line_and_keeps_every_human_gate(name: &str) {
         use boss_jobs::step_registry::StepRegistry;
-        let (actor, kind) = machine_token_rule();
-        assert_ne!(
-            kind, "prepare-a-deposit-key",
-            "the generic protocol's receipts are the runner rule's to write"
-        );
+        let (actor, kind) = rule_of(name);
+        let (_, other_kind) = rule_of(other_rule(name));
+        assert_ne!(kind, other_kind, "each key's receipts are its own rule's");
         let own = bundled_kind(&kind);
-        let generic = bundled();
+        let other = bundled_kind(&other_kind);
         let shape =
             |w: &WorkflowSpec| -> Vec<(String, String, Option<Assurance>, Vec<String>, bool)> {
                 w.steps
@@ -875,10 +991,13 @@ mod native_boundary {
                     })
                     .collect()
             };
-        assert_eq!(shape(&own), shape(&generic));
+        assert_eq!(shape(&own), shape(&other));
         for slug in ["issue", "install"] {
             let step = own.steps.iter().find(|s| s.title == slug).unwrap();
-            assert_eq!(step.metadata_defaults["written_by"], actor, "{slug}");
+            assert_eq!(
+                step.metadata_defaults["written_by"], actor,
+                "{name}: {slug}"
+            );
         }
         let enroll = own.steps.iter().find(|s| s.title == "enroll").unwrap();
         // The three proposal fields are SUPPLIED to the person: filer-filled
@@ -894,51 +1013,56 @@ mod native_boundary {
         use boss_core::job::FilledBy;
         assert!(
             enroll.fields.iter().all(|f| f.name != "public_key"),
-            "enroll declares a bare public_key beside the line its signer places"
+            "{name}: enroll declares a bare public_key beside the line its signer places"
         );
-        for name in ["receiver_host", "purpose", "authorized_keys_line"] {
+        for field_name in ["receiver_host", "purpose", "authorized_keys_line"] {
             let field = enroll
                 .fields
                 .iter()
-                .find(|f| f.name == name)
-                .unwrap_or_else(|| panic!("enroll must declare {name}"));
-            assert_eq!(field.filled_by, FilledBy::Filer, "{name}");
+                .find(|f| f.name == field_name)
+                .unwrap_or_else(|| panic!("{name}: enroll must declare {field_name}"));
+            assert_eq!(field.filled_by, FilledBy::Filer, "{name}: {field_name}");
             assert!(
                 !field.required,
-                "{name} would be owed when the packet is filed"
+                "{name}: {field_name} would be owed when the packet is filed"
             );
         }
-        for name in ["decision", "enrollment_record"] {
-            let field = enroll.fields.iter().find(|f| f.name == name).unwrap();
-            assert_eq!(field.filled_by, FilledBy::Executor, "{name}");
-            assert!(field.required, "{name}");
+        for field_name in ["decision", "enrollment_record"] {
+            let field = enroll.fields.iter().find(|f| f.name == field_name).unwrap();
+            assert_eq!(field.filled_by, FilledBy::Executor, "{name}: {field_name}");
+            assert!(field.required, "{name}: {field_name}");
         }
         // The proposal and the case text above the procedure are the
         // broker's rule's ALONE (delta review 76249509, question 2):
         // `written_by` judges a step's DECLARED fields, so the step names
         // the writer and declares the two context keys beside the three
         // proposal fields.
-        assert_eq!(enroll.metadata_defaults["written_by"], actor, "enroll");
-        for name in ["context_md", "sign_off_context"] {
+        assert_eq!(
+            enroll.metadata_defaults["written_by"], actor,
+            "{name}: enroll"
+        );
+        for field_name in ["context_md", "sign_off_context"] {
             let field = enroll
                 .fields
                 .iter()
-                .find(|f| f.name == name)
-                .unwrap_or_else(|| panic!("enroll must declare {name} for written_by to cover it"));
-            assert_eq!(field.filled_by, FilledBy::Filer, "{name}");
-            assert!(!field.required, "{name}");
+                .find(|f| f.name == field_name)
+                .unwrap_or_else(|| {
+                    panic!("{name}: enroll must declare {field_name} for written_by to cover it")
+                });
+            assert_eq!(field.filled_by, FilledBy::Filer, "{name}: {field_name}");
+            assert!(!field.required, "{name}: {field_name}");
         }
         use boss_core::job::{JobId, StepId, Subject};
         let empty = boss_jobs::registry::materialize_steps(
             &own,
-            &Subject::new("custom", "machine-token-deposit-key"),
+            &Subject::new("custom", rule_arg(name, "credential_id")),
             JobId::new(),
             &json!({}),
             StepId::new,
         );
         assert!(
             boss_jobs::registry::missing_filer_fields(&empty).is_empty(),
-            "the packet must be fileable before any key exists"
+            "{name}: the packet must be fileable before any key exists"
         );
         // What holds the proposal present: the step is ready only after
         // `install`, and the handler writes the proposal before it
@@ -952,8 +1076,8 @@ mod native_boundary {
                 .fields
                 .iter()
                 .find(|f| f.name == "public_key")
-                .unwrap_or_else(|| panic!("{slug} must declare public_key"));
-            assert!(key.required, "{slug}.public_key");
+                .unwrap_or_else(|| panic!("{name}: {slug} must declare public_key"));
+            assert!(key.required, "{name}: {slug}.public_key");
             assert!(
                 StepRegistry::validate_authored_fields(
                     &step.fields,
@@ -967,12 +1091,11 @@ mod native_boundary {
             "authorized_keys_line",
             "command=",
             "restrict",
-            "machine-token",
             "install step",
         ] {
             assert!(
                 procedure.contains(said),
-                "the procedure must name `{said}`: {procedure}"
+                "{name}: the procedure must name `{said}`: {procedure}"
             );
         }
         // THE SENTENCES, NOT THE KEYWORDS (delta review 76249509, mutants
@@ -985,34 +1108,66 @@ mod native_boundary {
         // forced command wrapped as the handler wraps it, in one
         // sentence with where the line must end; and the check is sent
         // to the install step by name.
-        let forced = machine_token_rule_arg("forced_command");
+        let forced = rule_arg(name, "forced_command");
         let must_begin = format!(
             "it must begin command=\"{forced}\",restrict and end with the public_key on this \
              packet's install step, with nothing between and nothing after."
         );
         assert!(
             procedure.contains(&must_begin),
-            "the procedure must state the whole required prefix `{must_begin}`: {procedure}"
-        );
-        assert!(
-            procedure.contains("Check it against the INSTALL step, not this one:"),
-            "the procedure must send the check to the install step: {procedure}"
-        );
-        assert!(
-            procedure
-                .contains("a missing restrict, or a second key is a refusal: abandon the packet."),
-            "{procedure}"
+            "{name}: the procedure must state the whole required prefix `{must_begin}`: {procedure}"
         );
         // WHAT THE FIRST LIVE ENROLMENT TAUGHT, AS SENTENCES (backlog
-        // dea2236f): what is placed is the line and never the key, the
-        // install step's key is for comparing, and the push reads the
-        // placement before the passkey does — with each of its three
-        // closes named, the shell among them.
+        // dea2236f): what is placed is the line and never the key, and the
+        // install step's key is for comparing.
         for sentence in [
+            "Check it against the INSTALL step, not this one:",
+            "a missing restrict, or a second key is a refusal: abandon the packet.",
             "PLACE THE authorized_keys_line, WHOLE, AND NOTHING ELSE:",
             "the public key alone is never what you place.",
             "A bare key in authorized_keys is a login, not a deposit key:",
             "The install step's public_key is there to COMPARE with, never to place.",
+        ] {
+            assert!(
+                procedure.contains(sentence),
+                "{name}: the procedure must say `{sentence}`: {procedure}"
+            );
+        }
+        assert!(
+            !procedure.contains("signs this step's public_key"),
+            "{name}: the passkey signs no bare key on this step: {procedure}"
+        );
+        // And never the sibling key's command: a line that reached the
+        // other receiver would carry this key's purpose to it.
+        let sibling = rule_arg(other_rule(name), "forced_command");
+        assert!(
+            !procedure.contains(&format!("command=\"{sibling}\"")),
+            "{name}: the procedure names the other key's forced command: {procedure}"
+        );
+    }
+
+    /// The machine token key: the push reads the placement BEFORE the
+    /// passkey does, with each of its three closes named, the shell among
+    /// them (backlog dea2236f).
+    #[test]
+    fn the_per_key_protocol_declares_the_line_and_keeps_every_human_gate() {
+        a_keys_protocol_declares_the_line_and_keeps_every_human_gate(MACHINE_TOKEN_RULE);
+        let (_, kind) = rule_of(MACHINE_TOKEN_RULE);
+        assert_ne!(
+            kind, "prepare-a-deposit-key",
+            "the generic protocol's receipts are the runner rule's to write"
+        );
+        let enroll = bundled_kind(&kind)
+            .steps
+            .into_iter()
+            .find(|s| s.title == "enroll")
+            .unwrap();
+        let procedure = enroll.metadata_defaults["procedure"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for sentence in [
+            "machine-token",
             "THEN LET THE PUSH READ YOUR PLACEMENT BEFORE YOU SIGN.",
             "Wait for the first maintenance-machine-token-push packet opened after you placed the line,",
             "put that packet's id in enrollment_record and sign.",
@@ -1024,24 +1179,62 @@ mod native_boundary {
                 "the procedure must say `{sentence}`: {procedure}"
             );
         }
-        assert!(
-            !procedure.contains("signs this step's public_key"),
-            "the passkey signs no bare key on this step: {procedure}"
-        );
     }
 
-    fn machine_token_rule_arg(name: &str) -> String {
-        let path = std::path::Path::new(boss_jobs::registry::platform_bundle_path())
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("dispatcher/rules/broker-prepares-the-machine-token-deposit-key.toml");
-        let rule: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        rule["rule"][0]["do"][0]["args"][name]
+    /// The runner key (item 3dc0b247): its sender sends nothing until the
+    /// enrollment is SIGNED (infra/gcp/runner-credential-send.sh refuses
+    /// without a completed, approved enroll), so no push can read the
+    /// placement first; the procedure says so, and sends the signer to the
+    /// converge that records the receiver installed before the signature.
+    #[test]
+    fn the_runner_keys_protocol_declares_the_line_and_keeps_every_human_gate() {
+        a_keys_protocol_declares_the_line_and_keeps_every_human_gate(RUNNER_RULE);
+        let (_, kind) = rule_of(RUNNER_RULE);
+        assert_eq!(kind, "prepare-a-deposit-key");
+        let enroll = bundled()
+            .steps
+            .into_iter()
+            .find(|s| s.title == "enroll")
+            .unwrap();
+        let procedure = enroll.metadata_defaults["procedure"]
             .as_str()
-            .unwrap_or_else(|| panic!("the rule row declares no {name}"))
-            .trim_matches('"')
-            .to_string()
+            .unwrap()
+            .to_string();
+        for sentence in [
+            "runner-credential-recv.sh",
+            "SIGN ONLY ONCE THE RECEIVER IS INSTALLED.",
+            "the runner credential's sender sends nothing until this step is completed, so nothing machine-run reads your placement before you sign:",
+            "put in enrollment_record the boss-gcp converge packet whose summary records runner_credential_receiver installed,",
+            "Until a converge records it, do not sign.",
+        ] {
+            assert!(
+                procedure.contains(sentence),
+                "the procedure must say `{sentence}`: {procedure}"
+            );
+        }
+        // The forced command is the line the enrollment template proposes.
+        // The receiver it names is placed, and granted with no arguments,
+        // by infra/gcp/install-runner-credential-receiver.sh, whose
+        // rendered rule runner_credential_recv_sh.rs derives from this
+        // same forced command (backlog 1e50e66b, R-b) — the template no
+        // longer carries a second spelling of that rule.
+        let template = std::fs::read_to_string(
+            std::path::Path::new(boss_jobs::registry::platform_bundle_path())
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("gcp/runner-credential-enrollment.template"),
+        )
+        .unwrap();
+        let forced = rule_arg(RUNNER_RULE, "forced_command");
+        assert!(
+            forced.starts_with("exec sudo -n "),
+            "the runner's forced command runs the receiver through sudo -n: {forced}"
+        );
+        assert!(
+            template.contains(&format!("command=\"{forced}\",restrict")),
+            "the template's authorized_keys line is not the one the broker joins: {forced}"
+        );
     }
 }

@@ -192,7 +192,7 @@ authority_role = "platform-admin"
 # when the car boards on `boss release <car> --review <run>`. High
 # effort, because every car that waits here waits for exactly the
 # review a medium read would wave through.
-agent = { profile = "reviewer", model = "opus-5[1m]", budget_usd = 3, effort = "high" }
+agent = { profile = "reviewer", model = "opus-5-5", budget_usd = 3, effort = "high" }
 metadata_defaults = { procedure = "Left ready for the conductor. It completes this when the car boards, recording the train's PR — cars do not open their own PRs, a train opens one for the batch. A car left behind gets a skip_reason on its metadata; if the branch legitimately moved, re-gate and put the fresh receipt in metadata.regate_receipt rather than abandoning the packet, which loses its history." }
 [[workflow.step.fields]]
 name = "pr_url"
@@ -268,10 +268,59 @@ name = "completed_at"
 field_type = "date-time"
 required = false
 
+# THE REVIEW A CAR NO RULE HELD OWES AFTER IT LANDS (backlog bd331d38;
+# David, 2026-10-09: "Go with option A for the review hold"). A parked
+# car waits at `review` for an independent review ONLY when its diff is
+# a finding of mutating_verb::judge or its item carries a trust_boundary
+# mark; `boss gate` refuses a --hold neither asks for. Every other car
+# boards on its green, and its review is owed HERE, after the merge.
+# Measured on W40 before the change: 207 of 383 parked cars held, 85% of
+# the dock-minutes, park -> proven median doubled to 104.6 min, and 200
+# of 200 releases read release.
+#
+# OWED, NOT OPTIONAL. Silence is the failure this exists to refuse, so
+# the step is never skipped by the engine (its predicate reads job
+# metadata, which the reevaluator never auto-skips), and `merged` below
+# waits for it — a terminal close would otherwise skip it unread. It is
+# ready only for a car that boarded WITHOUT a review: a car released at
+# the dock carries `release.review` on its review step, the run whose
+# verdict the conductor checked before it boarded, so its review is
+# already on the record and `merged` does not wait for this one. The
+# owed reviews are a queue: the `landed-review` station counts them.
+# An unlanded car (main lost its merge) owes none; its successor does.
+[[workflow.step]]
+title = "landed-review"
+kind = "task"
+ready_when = "steps.review.done AND job.metadata.merged = \"true\" AND NOT (steps.review.metadata.release.review > \"\") AND NOT (job.metadata.unlanded = \"true\")"
+title_template = "Reviewed after landing"
+authority_role = "platform-admin"
+agent = { profile = "reviewer", model = "opus-5-5", budget_usd = 3, effort = "medium" }
+metadata_defaults = { procedure = """An independent review of a change that LANDED without one, because no rule held it: its diff touched nothing mutating_verb::judge holds and its item carried no trust_boundary mark (backlog bd331d38). Never the run that built the car.
+
+Read the change as it landed. The car's branch is gone once its train merged, so read its own commits: the head its gate vouched for is in the receipt on the `gate` step (`boss receipt <branch>` prints it); `git fetch origin <head>` then `git diff origin/main...<head>` (three dots: from the merge-base, the car's own base, since a squash merge never makes the head an ancestor of main), or the train's squash commit restricted to the car's files when the head is no longer fetchable. Review against what the car claimed (its scope summary and excludes, the item it answers) and the correctness protocol at the tier it touched.
+
+Record the verdict here: `boss step complete <car> --step landed-review --field verdict=clean|findings --field reviewed=<the sha you read> --field-file findings=<file>`. `findings` says what you read and why nothing is wrong, or each finding with its file, line, the input that fails and what a reader sees. A finding is NOT a revert and does not reopen the car: file each as its own backlog item and name the items in `findings`, so the defect count stays honest (scope's own rule). The car closes `merged` when this step and its proof are both done.""" }
+[[workflow.step.fields]]
+name = "verdict"
+field_type = "clean|findings"
+required = true
+[[workflow.step.fields]]
+name = "findings"
+field_type = "string"
+required = true
+[[workflow.step.fields]]
+name = "reviewed"
+field_type = "string"
+required = true
+[[workflow.step.fields]]
+name = "completed_at"
+field_type = "date-time"
+required = false
+
 [[workflow.step]]
 title = "merged"
 kind = "outcome"
-ready_when = "steps.proven.done"
+ready_when = "steps.proven.done AND (steps.landed-review.done OR steps.review.metadata.release.review > \"\")"
 title_template = "Merged"
 terminal = { outcome = "merged" }
 metadata_defaults = { outcome_kind = "completed" }

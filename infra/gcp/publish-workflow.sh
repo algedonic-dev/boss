@@ -29,10 +29,9 @@
 # ---------------------------------------------------------------------
 # The live row is safe to overwrite iff it is a row THE TREE ONCE SAID:
 # some revision of the bundle under infra/platform/ renders to the same
-# label, description, category, subject_kinds and steps (title, kind,
-# ready_when, title_template, authority_role, metadata_defaults, and
-# each field's name/type/required). Then the tree moved ahead and live
-# lags — publish. Otherwise the live row carries an edit the tree lacks:
+# row, on EVERY key either side states (the comparator's header names
+# the few left out, each with its reason). Then the tree moved ahead and
+# live lags — publish. Otherwise the live row carries an edit the tree lacks:
 # REFUSE, name the drift field by field, and publish only when the
 # request says `--force-tree`. The walk covers the bundle DIRECTORY's
 # history, not one file's, because the bundle was one file until
@@ -42,13 +41,17 @@
 # maintenance-views-catchup matched 8cc7a03e:infra/platform/workflows.toml,
 # pr-train and ship-a-change matched nothing).
 #
-# WHAT IT DOES NOT COMPARE, and why that is not a hole: metadata_schema,
-# entitlements, the workflow-level `metadata`, sign_offs_required. They
-# are part of the row `boss workflow publish` sends, so they GO LIVE
-# with a publish; they are left out of the equality only, so a tree that
-# changed nothing but those reads as "nothing to publish" — and
-# `--force-tree` publishes anyway, saying so. Widening the view is one
-# edit to `row_view` below.
+# WHAT IT DOES NOT COMPARE: only what no file can say — the row's
+# version, status, created_at, authoring_job_id, and the owning_team the
+# loader stamps. Until 2026-10-08 this paragraph read "and why that is
+# not a hole", and listed metadata_schema, entitlements, the workflow
+# `metadata` and sign_offs_required as left out of the equality. It WAS
+# a hole (backlog aa28f921; review 4746c046, F1): a field's `writer` and
+# a step's `executor` and `assurance_required` were out too, unlisted,
+# so a live row that lost the keys deciding who may write read "nothing
+# to publish" forever, and "confirmed equal" after a publish proved
+# nothing about them. The comparison is infra/gcp/workflow-row-compare.py
+# now, and it has no list to widen.
 #
 # THE SEQUENCE, each step checked rather than assumed
 # ---------------------------------------------------------------------
@@ -133,7 +136,8 @@
 #  75  cannot answer: the registry could not be read
 #  78  configuration: no BOSS_JOBS_URL, no `boss`, a `boss` older than
 #      the bundle loader (or of unknown provenance), no python3/tomllib,
-#      or holds that cannot be read (REFUSED in every mode)
+#      no comparator beside this script, or holds that cannot be read
+#      (REFUSED in every mode)
 #
 # Runs as root under the ops-runner with NO HOME; every git read drops
 # to the checkout's owner (root cannot even READ a checkout it does not
@@ -333,111 +337,22 @@ fi
 say "boss: $BOSS_BIN built from ${BUILT_FROM:0:8} (floor ${CLI_FLOOR:0:8} reached)"
 
 # --- the comparator -----------------------------------------------------------
-# `python3 compare.py <toml> <live.json> <kind>`: exit 0 and print EQUAL
-# when the kind's row in the TOML renders to the live row's view, else
-# exit 1 and print one `DIFF <path> <tree> <live>` line per differing
-# field with a window of each side (the lint's excerpt idiom — both full
-# copies stay readable at their homes, so nothing only-copy is lost).
-# Exit 3 when the TOML does not parse or lacks the kind (a historical
-# revision may legitimately lack it).
-cat > "$TMP/compare.py" <<'PY'
-import json, sys, tomllib
-
-def norm(v):
-    # The registry hands back null where the file has no key and [] / {}
-    # where it has an empty one; the file never distinguishes them.
-    return None if v in (None, [], {}, "") else v
-
-def projected_authority(s):
-    # The seed loader PROJECTS a step's `audience` onto the selector keys
-    # every reader still uses (boss-jobs/src/audience.rs `selectors_for`:
-    # role -> authority_role, individual -> assignee_id, station ->
-    # metadata.station). A file that says `audience = { role = "x" }`
-    # and no bare authority_role renders to a row carrying BOTH, so the
-    # comparison applies the same projection or it reads a correct
-    # publish as NOT CONFIRMED — which it did on 2026-09-16 02:10Z
-    # (backlog-item v8, ops-request deb264ed). One rule, mirrored here.
-    if s.get("authority_role") not in (None, ""):
-        return s.get("authority_role")
-    aud = s.get("audience")
-    if isinstance(aud, dict) and isinstance(aud.get("role"), str):
-        return aud["role"]
-    return None
-
-def step_view(s):
-    return {
-        "title": s.get("title"), "kind": s.get("kind"), "ready_when": s.get("ready_when"),
-        "title_template": norm(s.get("title_template")),
-        "authority_role": norm(projected_authority(s)),
-        "audience": norm(s.get("audience")),
-        "metadata_defaults": norm(s.get("metadata_defaults")),
-        "fields": norm([[f.get("name"), f.get("field_type"), bool(f.get("required", False))]
-                        for f in (s.get("fields") or [])]),
-        # The step's agent block (design c87fb59b car 1) is what the
-        # tree says about WHO runs the step; a step that gains one is
-        # the tree ahead. Measured 2026-09-18: without this line the
-        # live backlog-item v2 read equal to a file that carried the
-        # block, and `boss dispatch` refused every build step for want
-        # of it. Numbers compare as floats: TOML `5` and JSON `5.0`.
-        "agent": norm(agent_view(s.get("agent"))),
-    }
-
-def agent_view(a):
-    if not isinstance(a, dict):
-        return None
-    out = dict(a)
-    if isinstance(out.get("budget_usd"), (int, float)):
-        out["budget_usd"] = float(out["budget_usd"])
-    return out
-
-def row_view(r, steps_key):
-    return {"label": r.get("label"), "description": r.get("description"),
-            "category": r.get("category"), "subject_kinds": norm(r.get("subject_kinds")),
-            "steps": [step_view(s) for s in (r.get(steps_key) or [])]}
-
-def window(v, width=80):
-    s = json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
-    s = s.replace("\n", "\\n")
-    return s if len(s) <= width else s[:width] + "…"
-
-def diffs(a, b, path=""):
-    if isinstance(a, dict) and isinstance(b, dict):
-        for k in a:
-            yield from diffs(a[k], b.get(k), f"{path}.{k}" if path else k)
-        return
-    if isinstance(a, list) and isinstance(b, list) and path.endswith("steps"):
-        for i in range(max(len(a), len(b))):
-            x = a[i] if i < len(a) else None
-            y = b[i] if i < len(b) else None
-            if x is None or y is None:
-                yield (f"{path}[{i}]", x, y)
-            else:
-                yield from diffs(x, y, f"{path}[{i}]")
-        return
-    if a != b:
-        yield (path, a, b)
-
-toml_path, live_path, kind = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    with open(toml_path, "rb") as fh:
-        doc = tomllib.load(fh)
-except Exception as e:
-    print(f"UNREADABLE {toml_path}: {e}")
-    sys.exit(3)
-rows = [w for w in (doc.get("workflow") or []) if isinstance(w, dict) and w.get("kind") == kind]
-if not rows:
-    print(f"NOKIND {toml_path}")
-    sys.exit(3)
-with open(live_path) as fh:
-    live = json.load(fh)
-a, b = row_view(rows[0], "step"), row_view(live, "steps")
-if a == b:
-    print("EQUAL")
-    sys.exit(0)
-for path, x, y in diffs(a, b):
-    print(f"DIFF\t{path}\ttree={window('<absent>' if x is None else x)}\tlive={window('<absent>' if y is None else y)}")
-sys.exit(1)
-PY
+# infra/gcp/workflow-row-compare.py, beside this script: `python3 <it>
+# <toml> <live.json> <kind>` exits 0 and prints EQUAL when the kind's row
+# in the TOML renders to the live row, else exits 1 and prints one
+# `DIFF <path> <tree> <live>` line per differing key, the path naming
+# the step by title and the field by name. Exit 3 when the TOML does not
+# parse or lacks the kind (a historical revision may legitimately lack
+# it). It compares EVERY key either side states — its header says why
+# there is no list, and names the few keys left out and the reason for
+# each. It was a heredoc here until 2026-10-08 (backlog aa28f921); it is
+# a file so a test and an operator can run it offline over a saved row,
+# which is how the review that found its blind spot had to measure it —
+# by lifting it out of this script by hand.
+COMPARE_PY="$SELF_DIR/workflow-row-compare.py"
+if [ ! -f "$COMPARE_PY" ]; then
+    refuse 78 "the comparator $COMPARE_PY is missing, so whether the live '$KIND' says what the tree says cannot be judged, and an unjudged row is neither equal nor adrift — nothing compared, nothing published"
+fi
 
 # --- 2. the live active row ---------------------------------------------------
 # Unauthenticated, like the drift lint's read: /api/workflows is a public
@@ -478,11 +393,11 @@ esac
 LIVE_VERSION=$(jq -r '.version' "$TMP/live.json")
 
 # --- 3. tree vs live ------------------------------------------------------------
-python3 "$TMP/compare.py" "$KIND_FILE" "$TMP/live.json" "$KIND" > "$TMP/diff.txt"; cmp_rc=$?
+python3 "$COMPARE_PY" "$KIND_FILE" "$TMP/live.json" "$KIND" > "$TMP/diff.txt"; cmp_rc=$?
 case "$cmp_rc" in
     0)
         if [ "$MODE" != "--force-tree" ]; then
-            refuse 5 "nothing to publish — the live $KIND v$LIVE_VERSION already says what $KIND_FILE_REL says (label, description, category, subject_kinds and every step compared equal). A publish now would mint an identical version; --force-tree does that anyway, if a field this comparison leaves out (metadata_schema, entitlements) is what changed."
+            refuse 5 "nothing to publish — the live $KIND v$LIVE_VERSION already says what $KIND_FILE_REL says (every key either side states compared equal, each step and each field's writer among them). A publish now would mint an identical version; --force-tree does that anyway."
         fi
         say "FORCED: live $KIND v$LIVE_VERSION equals the tree on every compared field; publishing an identical row because the request said --force-tree"
         ;;
@@ -506,7 +421,7 @@ case "$cmp_rc" in
                     [ -n "$path" ] || continue
                     case "$path" in *.toml) ;; *) continue ;; esac
                     as_owner "git -C '$REPO' show '$sha:$path'" > "$TMP/rev.toml" 2>/dev/null || continue
-                    if python3 "$TMP/compare.py" "$TMP/rev.toml" "$TMP/live.json" "$KIND" >/dev/null 2>&1; then
+                    if python3 "$COMPARE_PY" "$TMP/rev.toml" "$TMP/live.json" "$KIND" >/dev/null 2>&1; then
                         matched="${sha:0:8}:$path"
                         break 2
                     fi
@@ -570,7 +485,7 @@ if [ "$NEW_VERSION" -le "$LIVE_VERSION" ]; then
     say "NOT CONFIRMED — the active row is still v$NEW_VERSION after a publish over v$LIVE_VERSION; the CLI's report above is not borne out by the registry"
     exit 7
 fi
-if ! python3 "$TMP/compare.py" "$KIND_FILE" "$TMP/after.json" "$KIND" > "$TMP/after-diff.txt"; then
+if ! python3 "$COMPARE_PY" "$KIND_FILE" "$TMP/after.json" "$KIND" > "$TMP/after-diff.txt"; then
     say "NOT CONFIRMED — v$NEW_VERSION is live but does not equal $KIND_FILE_REL:"
     sed 's/^DIFF\t/  /; s/\t/  /g' "$TMP/after-diff.txt"
     exit 7

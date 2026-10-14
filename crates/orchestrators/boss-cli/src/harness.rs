@@ -83,18 +83,76 @@ pub(crate) fn forbidden_env(name: &str) -> Option<&'static str> {
     if upper == "SSH_AUTH_SOCK" {
         return Some("hands over a live agent socket");
     }
+    // THE LOADERS, BY THE MEMBERS KNOWN TODAY. N13's list named one
+    // member of most families; review b149c579 found eleven siblings and
+    // review b40dbff7 eighteen more, five of them run as attacker-named
+    // code on the dev pod. So this list is NOT complete and does not
+    // claim to be: it holds the members of each family known so far —
+    // the dynamic linker (LD_, DYLD_), every git variable but its
+    // identity text, the programs ssh, sudo, cargo, a shell and a pager
+    // run on their own, the configuration homes and library configs
+    // whose files name code to load, and each interpreter's module path
+    // and start-up options. The control on a pass list is the dock hold
+    // every change under [`DIR`] gets; this floor only spares that review
+    // the names it already knows.
+    //
+    // git is a PREFIX (b40dbff7): GIT_DIR, GIT_COMMON_DIR and
+    // GIT_WORK_TREE choose whose config — core.fsmonitor, core.pager,
+    // hooks — git reads, and naming members one at a time is how two
+    // reviews each found more. GIT_AUTHOR_* and GIT_COMMITTER_* stay
+    // passable: text a commit records, which runs nothing.
+    let git_identity = upper.starts_with("GIT_AUTHOR_") || upper.starts_with("GIT_COMMITTER_");
     if upper.starts_with("LD_")
+        || upper.starts_with("DYLD_")
+        || (upper.starts_with("GIT_") && !git_identity)
         || [
+            // Shells.
             "BASH_ENV",
             "ENV",
-            "GIT_ASKPASS",
+            "PROMPT_COMMAND",
+            "ZDOTDIR",
+            "SHELLOPTS",
+            "PS4",
+            // Programs ssh, sudo and other tools run by themselves.
             "SSH_ASKPASS",
-            "GIT_SSH",
-            "GIT_SSH_COMMAND",
-            "GIT_CONFIG_GLOBAL",
-            "GIT_CONFIG_SYSTEM",
+            "SSH_SK_PROVIDER",
+            "SSH_SK_HELPER",
+            "SUDO_ASKPASS",
+            "EDITOR",
+            "VISUAL",
+            "PAGER",
+            "MANPAGER",
+            "LESSOPEN",
+            "LESSCLOSE",
+            // The compilers and wrappers cargo runs.
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTFLAGS",
+            "CC",
+            "CXX",
+            // Configuration homes and library configs whose files name
+            // programs to run or modules to load.
+            "XDG_CONFIG_HOME",
+            "XDG_CONFIG_DIRS",
+            "OPENSSL_CONF",
+            "OPENSSL_MODULES",
+            "GCONV_PATH",
+            // Interpreters' module paths and start-up options.
             "NODE_OPTIONS",
+            "NODE_PATH",
             "PYTHONSTARTUP",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONUSERBASE",
+            "PYTHONWARNINGS",
+            "PYTHONBREAKPOINT",
+            "PERL5OPT",
+            "PERL5LIB",
+            "PERLLIB",
+            "RUBYOPT",
+            "RUBYLIB",
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
         ]
         .contains(&upper.as_str())
     {
@@ -132,6 +190,9 @@ pub(crate) enum Home {
 pub(crate) enum Launch {
     /// `boss dispatch --launch` spawns `argv`.
     Process,
+    /// A trusted launcher observes a private cluster Job. Selection does
+    /// not authorize activation or supply image/login credentials.
+    Cluster,
     /// The coordinator's own session starts it (an Agent tool call);
     /// there is nothing for `boss` to spawn.
     HostTool,
@@ -247,7 +308,7 @@ impl Harness {
                     );
                 }
             }
-            Launch::Process => {
+            Launch::Process | Launch::Cluster => {
                 if h.argv.is_empty() {
                     return Err("a process harness declares its argv".into());
                 }
@@ -390,7 +451,8 @@ impl Harness {
     /// of its own the file's `transcript.home_env` — and
     /// [`Harness::parse`] holds BOTH to [`forbidden_env`]: no identity,
     /// credential, other harness's session, agent socket or code loader
-    /// by name. That is all it is. The
+    /// that it knows by name — a list known to be incomplete. That is all
+    /// it is. The
     /// process runs as the same account: it can read the account's
     /// files by their paths and set `BOSS_ACTOR` to anything, and
     /// nothing downstream authenticates that header.
@@ -652,10 +714,29 @@ mod tests {
         read_all(&repo()).expect("every shipped harness file parses")
     }
 
-    /// The live registry as read 2026-10-07 (`boss-api GET /api/agents`).
+    #[test]
+    fn a_cluster_backend_is_registry_selected_without_changing_the_shipped_default() {
+        let source = std::fs::read_to_string(
+            boss_testing::repo_root().join("infra/platform/harnesses/codex-exec.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            Harness::parse("codex-exec", &source).unwrap().launch,
+            Launch::Process
+        );
+        let selected = source.replace("launch = \"process\"", "launch = \"cluster\"");
+        assert!(Harness::parse("codex-exec", &selected).is_ok());
+    }
+
+    /// The registry rows the shipped Workflow blocks need, shaped as
+    /// `boss-api GET /api/agents` answers. Read live 2026-10-07; then
+    /// agent-claude's `default_model` moved from `opus-5[1m]` to
+    /// `opus-5-5` with the blocks (backlog ad82090a, R2). A test cannot
+    /// read the live row, so this is a stated copy: the live row is a
+    /// person's write, and the dispatch path reads THAT one.
     fn registry() -> Vec<Value> {
         vec![
-            json!({"id":"agent-claude","default_model":"opus-5[1m]","aliases":["claude@algedonic.dev"],"role":"engineering-agent"}),
+            json!({"id":"agent-claude","default_model":"opus-5-5","aliases":["claude@algedonic.dev"],"role":"platform-admin"}),
             json!({"id":"agent-codex","default_model":"gpt-6.1-sol","aliases":["codex@algedonic.dev"],"role":null}),
         ]
     }
@@ -666,7 +747,7 @@ mod tests {
         let codex = for_model(&all, &registry(), "gpt-6.1-sol").unwrap();
         assert_eq!(codex.actor, "agent-codex");
         assert_eq!(codex.launch, Launch::Process);
-        let claude = for_model(&all, &registry(), "opus-5[1m]").unwrap();
+        let claude = for_model(&all, &registry(), "opus-5-5").unwrap();
         assert_eq!(claude.actor, "agent-claude");
         assert_eq!(claude.launch, Launch::HostTool);
     }
@@ -841,6 +922,153 @@ mod tests {
         }
         // Not a safe-list: these pass, and the hold is what reads them.
         for name in ["DATABASE_URL", "KUBECONFIG", "NETRC", "GIT_AUTHOR_NAME"] {
+            assert_eq!(forbidden_env(name), None, "{name}");
+        }
+    }
+
+    /// The rest of the floor (review b149c579): every name below reached
+    /// a launched process through a pass list the parser accepted on
+    /// origin/main 7124c4c2. Each makes a program the file's argv never
+    /// names load or run code — a module path (PYTHONPATH, PERL5OPT,
+    /// RUBYOPT, NODE_PATH), a program git or a shell runs by itself
+    /// (GIT_EXEC_PATH, GIT_PROXY_COMMAND, GIT_EXTERNAL_DIFF, EDITOR,
+    /// PAGER, PROMPT_COMMAND), or a configuration home whose files name
+    /// such programs (XDG_CONFIG_HOME holds git's own config: core.pager,
+    /// core.hooksPath, core.fsmonitor). The first eleven are the review's
+    /// list; the rest are the KNOWN members of the same families. That is
+    /// not every member — the next review found more (review b40dbff7,
+    /// the test below) — and this test does not claim it: the floor is
+    /// deliberately incomplete, and the control on a pass list is the
+    /// dock hold every change under [`DIR`] gets, not this list.
+    #[test]
+    fn a_pass_list_naming_a_module_path_a_program_tools_run_or_a_config_home_is_refused() {
+        let text = std::fs::read_to_string(repo().join(DIR).join("codex-exec.toml")).unwrap();
+        for name in [
+            "XDG_CONFIG_HOME",
+            "PYTHONPATH",
+            "PERL5OPT",
+            "RUBYOPT",
+            "NODE_PATH",
+            "GIT_EXEC_PATH",
+            "GIT_PROXY_COMMAND",
+            "GIT_EXTERNAL_DIFF",
+            "EDITOR",
+            "PAGER",
+            "PROMPT_COMMAND",
+            // The families.
+            "XDG_CONFIG_DIRS",
+            "PYTHONHOME",
+            "PYTHONUSERBASE",
+            "PERL5LIB",
+            "PERLLIB",
+            "RUBYLIB",
+            "GIT_EDITOR",
+            "GIT_SEQUENCE_EDITOR",
+            "GIT_PAGER",
+            "GIT_TEMPLATE_DIR",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "VISUAL",
+            "MANPAGER",
+            "LESSOPEN",
+            "LESSCLOSE",
+            "ZDOTDIR",
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
+            "DYLD_INSERT_LIBRARIES",
+            "xdg_config_home",
+        ] {
+            assert_eq!(
+                forbidden_env(name),
+                Some("makes the process load or run code its argv never names"),
+                "{name}"
+            );
+            let planted = text.replace("\"PATH\",", &format!("\"PATH\", \"{name}\","));
+            assert_ne!(planted, text, "the plant landed");
+            let refused =
+                Harness::parse("codex-exec", &planted).expect_err(&format!("{name} is refused"));
+            assert!(refused.contains(name), "{refused}");
+        }
+        // Still a floor and not a safe-list, and the shipped pass list
+        // is untouched by it: its names, and the plain ones beside them,
+        // pass.
+        for name in [
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "TMPDIR",
+            "SSL_CERT_FILE",
+            "XDG_RUNTIME_DIR",
+            "GIT_AUTHOR_NAME",
+        ] {
+            assert_eq!(forbidden_env(name), None, "{name}");
+        }
+    }
+
+    /// Review b40dbff7 of car d47c0edd: the floor above still passed
+    /// these, and the reviewer ran attacker-named code through five of
+    /// them on the dev pod under `env -i` — GIT_DIR (a repository whose
+    /// config sets core.fsmonitor), SSH_SK_PROVIDER (a dlopened library's
+    /// constructor), SSH_SK_HELPER (exec'd by ssh), RUSTC_WRAPPER (exec'd
+    /// by cargo) and OPENSSL_CONF (a provider module dlopened at library
+    /// init under python3's ssl). The rest name a program or a module the
+    /// same way. git is closed as a PREFIX — GIT_DIR, GIT_COMMON_DIR and
+    /// GIT_WORK_TREE choose whose config git reads, and git(1) documents
+    /// many more GIT_ variables — with only GIT_AUTHOR_* and GIT_COMMITTER_*
+    /// left passable, which are identity text a commit records and run
+    /// nothing. Like the test above this lists the members KNOWN today and
+    /// claims no more: the floor is deliberately incomplete and the dock
+    /// hold is the control.
+    #[test]
+    fn a_pass_list_naming_a_repository_a_helper_a_wrapper_or_a_library_config_is_refused() {
+        let text = std::fs::read_to_string(repo().join(DIR).join("codex-exec.toml")).unwrap();
+        for name in [
+            // The review's list, each by name.
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_WORK_TREE",
+            "SSH_SK_PROVIDER",
+            "SSH_SK_HELPER",
+            "SUDO_ASKPASS",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTFLAGS",
+            "CC",
+            "CXX",
+            "OPENSSL_CONF",
+            "OPENSSL_MODULES",
+            "GCONV_PATH",
+            "PYTHONWARNINGS",
+            "PYTHONBREAKPOINT",
+            "SHELLOPTS",
+            "PS4",
+            // git by prefix, not by name: two more it reads.
+            "GIT_INDEX_FILE",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "git_dir",
+        ] {
+            assert_eq!(
+                forbidden_env(name),
+                Some("makes the process load or run code its argv never names"),
+                "{name}"
+            );
+            let planted = text.replace("\"PATH\",", &format!("\"PATH\", \"{name}\","));
+            assert_ne!(planted, text, "the plant landed");
+            let refused =
+                Harness::parse("codex-exec", &planted).expect_err(&format!("{name} is refused"));
+            assert!(refused.contains(name), "{refused}");
+        }
+        // The prefix keeps git's identity text passable.
+        for name in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_AUTHOR_DATE",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+            "GIT_COMMITTER_DATE",
+        ] {
             assert_eq!(forbidden_env(name), None, "{name}");
         }
     }
@@ -1022,5 +1250,70 @@ mod tests {
         assert!(segment_matches("subagents", "subagents"));
         assert!(!segment_matches("subagents", "subagents2"));
         assert!(!segment_matches("agent-*.jsonl", "other-1.jsonl"));
+    }
+
+    /// What a Claude Code subagent's transcript says it ran, as the
+    /// model attachment and every billed turn spell it. Measured
+    /// 2026-10-09 on three subagent transcripts of the dispatching
+    /// session (55, 80 and 367 billed turns, each `claude-opus-5-5`,
+    /// identity `claude-opus-5-5` with no `[1m]` — a subagent does not
+    /// run the 1M window), and on the newest 200 agent-runs: 115 of 115
+    /// Claude rows read `observed: opus-5-5`. `.claude/agents/effort-*.md`
+    /// say `model: opus`, an alias the harness resolves; when it moves
+    /// to a newer Opus this measurement is re-taken and the blocks follow.
+    const CLAUDE_SUBAGENT_RUNS: &str = "claude-opus-5-5";
+
+    /// A WORKFLOW BLOCK DECLARES THE MODEL THAT RUNS (backlog ad82090a,
+    /// R2). Every block said `opus-5[1m]` while every Claude run was
+    /// observed as `opus-5-5`, so `--report` printed "they DIFFER" on 106
+    /// of 108 observed runs (finish ledger, 2026-10-09) — a warning
+    /// nobody reads, and a record naming a model that did not run.
+    ///
+    /// Three halves, for every distinct model a shipped block names: the
+    /// rate card prices it; the dispatch path's registry read
+    /// ([`for_model`]) names a harness for it; and when that harness is
+    /// a Claude subagent, the observation `--report` makes of such a
+    /// transcript ([`crate::transcript_usage::read_models`], the one
+    /// spelling rule) equals the declaration, so [`model_line`] does not
+    /// say DIFFER. Exact equality, no alias table (decided 2026-10-09,
+    /// decision 2).
+    ///
+    /// [`model_line`]: crate::dispatch_launch::model_line
+    #[test]
+    fn every_workflow_block_names_a_priced_model_its_harness_is_observed_running() {
+        let harnesses = shipped();
+        let models: std::collections::BTreeSet<String> =
+            boss_jobs::seed_loader::load_workflows(boss_jobs::registry::platform_bundle_path())
+                .expect("the platform bundle parses")
+                .into_iter()
+                .flat_map(|w| w.steps.into_iter().filter_map(|s| s.agent.map(|a| a.model)))
+                .collect();
+        assert!(!models.is_empty(), "the bundle declares agent blocks");
+        let transcript = [
+            format!(
+                r#"{{"type":"attachment","attachment":{{"type":"model","identity":{{"modelId":"{CLAUDE_SUBAGENT_RUNS}"}}}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"msg_a","model":"{CLAUDE_SUBAGENT_RUNS}","usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#
+            ),
+        ]
+        .join("\n");
+        let observed = crate::transcript_usage::read_models(&transcript).recorded();
+        for model in &models {
+            assert!(
+                boss_jobs::agent_spec::known_models().contains(model),
+                "a block names `{model}`, which the rate card does not price"
+            );
+            let harness = for_model(&harnesses, &registry(), model)
+                .unwrap_or_else(|why| panic!("a block names `{model}`: {why}"));
+            if harness.transcript.adapter == "claude-subagent" {
+                let line = crate::dispatch_launch::model_line(model, observed.as_deref(), None);
+                assert!(
+                    !line.contains("DIFFER") && observed.as_deref() == Some(model.as_str()),
+                    "a block declares `{model}` for {}, whose runs are observed as {observed:?}: {line}",
+                    harness.id
+                );
+            }
+        }
     }
 }

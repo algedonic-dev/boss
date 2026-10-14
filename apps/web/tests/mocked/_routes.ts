@@ -21,10 +21,18 @@
 ///
 /// Pinned against the route catalog by route-smoke.mocked.spec.ts, so a
 /// newly registered surface is crawled by default — by BOTH crawls.
+import { VENDOR_CRAWL_PATH } from '../fixtures/vendor';
+
 export const ROUTES: ReadonlyArray<string> = [
   // User Experiences perspective — bare / is the public home alias; the
   // operator surfaces are re-rooted under /ux/*.
-  '/', '/ux/me', '/ux/inbox', '/ux/views', '/ux/jobs', '/ux/accounts', '/ux/vendors', '/ux/people', '/ux/parts',
+  '/', '/ux/me', '/ux/inbox', '/ux/jobs', '/ux/accounts', '/ux/vendors', '/ux/people', '/ux/parts',
+  // e9c8e28d: focused specs already open VendorPage; shared crawls need
+  // their own answered representative of the same native detail route.
+  VENDOR_CRAWL_PATH,
+  //6d6f88bd separates Finance detail availability from Vendors. These
+  // concrete addresses open the catalog's native route-field patterns.
+  '/ux/purchase-orders/po-review', '/ux/vendor-invoices/bill-review',
   // Approved company orientation (d4dada70, 2026-10-02): real registry
   // regions, one connected IT example. All shared crawls exercise it.
   '/map',
@@ -79,7 +87,7 @@ export const ROUTES: ReadonlyArray<string> = [
   // the mock's empty /api/workflows — page chrome + picker. The map
   // and flow pages died into the Atlas tab (already crawled above).
   '/it/operate/bottlenecks',
-  // The Audit Log (catalogued as Monitoring). Deferred until 2026-09-23
+  // The Audit Log. Deferred until 2026-09-23
   // for want of an object-shaped /api/events/stats fixture, which
   // _smokeMocks.ts now carries (EVENTS_STATS); its live stream answers
   // the floor's 204, so the page falls to its snapshot poll. Its own

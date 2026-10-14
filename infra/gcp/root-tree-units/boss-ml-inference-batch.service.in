@@ -1,0 +1,19 @@
+# Dormant replacement: ca356c79 / fe6d1124. Not installed by any caller.
+# Activate only after the root fetch credential and tree handover are proven.
+[Unit]
+Description=BOSS ML daily inference batch
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/boss/sor.env
+WorkingDirectory=/var/lib/boss/gcp-tree/current
+RuntimeDirectory=boss-ml-inference-batch
+RuntimeDirectoryMode=0700
+TimeoutStartSec=10min
+Environment=BOSS_RUN_SUMMARY_FILE=/run/boss-ml-inference-batch/summary.json
+ExecStartPre=-/var/lib/boss/gcp-tree/current/infra/gcp/root-tree.sh run infra/boss-maintenance-wrap.sh maintenance-ml-inference-batch "ML inference batch"
+ExecStart=/var/lib/boss/gcp-tree/current/infra/gcp/root-tree.sh run infra/ml/run-inference-batch.sh
+ExecStopPost=-/var/lib/boss/gcp-tree/current/infra/gcp/root-tree.sh run infra/boss-step.sh maintenance-ml-inference-batch run

@@ -201,6 +201,19 @@ impl BudgetDoor {
         budget_usd: f64,
         now: DateTime<Utc>,
     ) -> Result<Reservation, BudgetDoorError> {
+        self.reserve_with_inputs(row, budget_usd, now)
+            .await
+            .map(|(reading, _)| reading)
+    }
+
+    /// The historical advisory reading and the exact rows its query returned.
+    /// This is evidence, not a stronger authorization or a new hard cap.
+    pub async fn reserve_with_inputs(
+        &self,
+        row: &AgentRow,
+        budget_usd: f64,
+        now: DateTime<Utc>,
+    ) -> Result<(Reservation, Vec<AgentRun>), BudgetDoorError> {
         let window_from = ADMISSION_WINDOW.cutoff(now);
         let runs = self
             .runs
@@ -215,14 +228,17 @@ impl BudgetDoor {
         let cap = row
             .hourly_budget_usd_micros
             .and_then(|n| u64::try_from(n).ok());
-        Ok(Reservation {
-            actor: row.id.clone(),
-            spent_usd_micros,
-            budget_usd_micros,
-            hourly_budget_usd_micros: cap,
-            window_from,
-            decision: reserve(cap, spent_usd_micros, budget_usd_micros),
-        })
+        Ok((
+            Reservation {
+                actor: row.id.clone(),
+                spent_usd_micros,
+                budget_usd_micros,
+                hourly_budget_usd_micros: cap,
+                window_from,
+                decision: reserve(cap, spent_usd_micros, budget_usd_micros),
+            },
+            runs,
+        ))
     }
 }
 
@@ -267,15 +283,20 @@ pub fn declares_an_agent_run(metadata: &serde_json::Value) -> bool {
 pub fn in_flight_runs(open_runs: &[Job], held_by: &[String]) -> u32 {
     let n = open_runs
         .iter()
-        .filter(|j| j.status == JobStatus::Open)
-        .filter(|j| {
-            j.metadata
-                .get(RUN_AGENT_KEY)
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|a| held_by.iter().any(|h| h == a))
-        })
+        .filter(|job| counted_run(job, held_by))
         .count();
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// The counter and its copied evidence consume this same membership predicate.
+/// Unrelated actor rows do not contribute to this actor's run population.
+pub(crate) fn counted_run(job: &Job, held_by: &[String]) -> bool {
+    job.status == JobStatus::Open
+        && job
+            .metadata
+            .get(RUN_AGENT_KEY)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|actor| held_by.iter().any(|holder| holder == actor))
 }
 
 /// The key an `agent-run` packet spells its actor under — written by
@@ -284,6 +305,100 @@ pub const RUN_AGENT_KEY: &str = "agent";
 
 /// The workflow kind a run packet is filed under.
 pub const RUN_KIND: &str = "agent-run";
+
+/// The key a run's `building` step carries its worker's start bound
+/// under — `{ schema = 1, minutes = N }`, a `metadata_defaults` of
+/// agent-run.toml (train #956). `boss dispatch --started` reads it to
+/// know a receipt is owed, and the top board to know how long a run may
+/// stand briefed before it reads as never started (backlog 57326714).
+pub const WORKER_START_EXPECTATION: &str = "worker_start_expectation";
+
+/// Schema 2 is a launcher observation, never a worker's self-claim. Only
+/// newly admitted runs opt in with an exact observer and input digests.
+pub fn observer_start_receipt_matches(
+    expected: &serde_json::Value,
+    receipt: &serde_json::Value,
+    run: &str,
+    actor: &str,
+) -> bool {
+    use serde_json::Value;
+    let nonempty = |value: &Value| {
+        value
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && !s.chars().any(char::is_whitespace))
+    };
+    let digest = |value: &Value| {
+        value.as_str().is_some_and(|s| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    };
+    let keys = receipt.as_object().is_some_and(|m| {
+        m.len() == 8
+            && [
+                "schema",
+                "run",
+                "actor",
+                "observer",
+                "prompt_sha256",
+                "snapshot_sha256",
+                "binding",
+                "acknowledgment",
+            ]
+            .iter()
+            .all(|k| m.contains_key(*k))
+    });
+    let binding = &receipt["binding"];
+    let ack = &receipt["acknowledgment"];
+    observer_start_expectation_valid(expected, actor)
+        && receipt["schema"] == 2
+        && keys
+        && expected["actor"] == actor
+        && receipt["actor"] == actor
+        && receipt["run"] == run
+        && nonempty(&expected["observer"])
+        && receipt["observer"] == expected["observer"]
+        && expected["observer"] != actor
+        && ["prompt_sha256", "snapshot_sha256"]
+            .iter()
+            .all(|k| digest(&expected[k]) && receipt[k] == expected[k])
+        && binding.as_object().is_some_and(|b| {
+            (3..=4).contains(&b.len())
+                && b.keys()
+                    .all(|k| ["job_uid", "pod", "pod_uid", "container_id"].contains(&k.as_str()))
+        })
+        && ["job_uid", "pod_uid", "container_id"]
+            .iter()
+            .all(|k| nonempty(&binding[k]))
+        && ack.as_object().is_some_and(|a| a.len() == 5)
+        && ack["schema"] == 1
+        && ack["start_read"] == true
+        && ack["run"] == run
+        && ack["prompt_sha256"] == expected["prompt_sha256"]
+        && ack["snapshot_sha256"] == expected["snapshot_sha256"]
+}
+
+pub fn observer_start_expectation_valid(expected: &serde_json::Value, actor: &str) -> bool {
+    let text = |key| {
+        expected[key]
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && !s.chars().any(char::is_whitespace))
+    };
+    expected.as_object().is_some_and(|m| m.len() == 6)
+        && expected["schema"] == 2
+        && expected["minutes"].as_i64().is_some_and(|n| n > 0)
+        && expected["actor"] == actor
+        && text("observer")
+        && expected["observer"] != actor
+        && ["prompt_sha256", "snapshot_sha256"].iter().all(|k| {
+            expected[k].as_str().is_some_and(|s| {
+                s.len() == 64
+                    && s.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        })
+}
 
 /// What the concurrency half measured and decided — the same shape
 /// [`Reservation`] has, for the same reason: a refusal carries every

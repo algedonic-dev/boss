@@ -27,7 +27,7 @@
 #
 # EVERY NAME BELOW KEEPS THE OVERRIDE IT HAD: the tests and the units
 # that set BOSS_FORGE_REGISTRY, REGISTRY, BOSS_FORGE_LAST_BUILT,
-# BOSS_CONVERGE_HOLD and the rest still win.
+# BOSS_CONVERGE_HOLD, BOSS_REGISTRY_PUSH_DIR and the rest still win.
 
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/sor.sh"
 
@@ -81,14 +81,51 @@ forge_need() {
     done
 }
 
-# The converge's stamp — the last build it rolled and verified — and the
-# quarantine stamp for a head whose boot failed. Under $HOME by default
-# (the converge runs as david; a verb under the ops runner has no HOME
-# and names the file, as prune-registry-versions.sh does from the
-# checkout's owner).
-LAST_BUILT_NAME=".boss-last-built"
-STAMP_FILE="${BOSS_FORGE_LAST_BUILT:-${HOME:-}/$LAST_BUILT_NAME}"
-FAILED_FILE="${BOSS_FORGE_LAST_FAILED:-${HOME:-}/.boss-last-failed}"
+# EVERYTHING THE CLUSTER CONVERGE KEEPS, under one directory root owns
+# (backlog 683d7fe9, car 2; design c8502e17, question image-build, and
+# position B of the forge sudo decision, David 2026-10-07). The converge
+# ran as david and kept its stamps under his home, so the watchdog — root
+# — read a file another account wrote, and every verb that wanted the
+# stamp derived that home from the checkout's owner. It runs as root from
+# root's tree now, and cluster-deploy-runner.service makes this directory
+# (StateDirectory=boss/converge, 0700: every reader is root) before
+# every start.
+#
+#   last-built         the last build the converge rolled and verified —
+#                      what the watchdog and rollback-to roll to BY NAME
+#   last-failed        a head whose BOOT failed: quarantined until main
+#                      moves (and last-failed.<namespace> per instance)
+#   last-build-failed  a head whose BUILD failed: retried, but the log
+#                      says which attempt this is
+#   requests           the ops-requests a `converge` asked for, answered
+#                      when the run ends (converge-now.sh writes it)
+#   tenants/           each repo-sourced instance's tenant checkout
+#   alert-spool/       what the converge's alert door kept, replayed by
+#                      the converge itself on every tick — the RUNNER's
+#                      default, whoever starts it (review 1ba2873d, B2:
+#                      started without its unit's environment, alert-lib.sh
+#                      fell back to /var/tmp, which every account can write,
+#                      and root replayed what was there with the machine
+#                      token). The unit names the same path, because
+#                      probe-account.sh reads the spools off the units; the
+#                      two are held equal by
+#                      the_converge_runs_as_root_from_roots_tree.rs.
+#   run-tree.<pid>/    the view of root's tree each run executes from
+CONVERGE_STATE="${BOSS_FORGE_CONVERGE_STATE:-/var/lib/boss/converge}"
+STAMP_FILE="${BOSS_FORGE_LAST_BUILT:-$CONVERGE_STATE/last-built}"
+FAILED_FILE="${BOSS_FORGE_LAST_FAILED:-$CONVERGE_STATE/last-failed}"
+TENANTS_DIR="${BOSS_FORGE_TENANTS_DIR:-$CONVERGE_STATE/tenants}"
+CONVERGE_ALERT_SPOOL="$CONVERGE_STATE/alert-spool"
+
+# THE REGISTRY PUSH LOGIN: the docker config the forge converge's
+# registry-token-deposit.sh writes from the broker-minted token (Secret
+# boss/forge-registry-push-token; backlog 683d7fe9, car 1), root:root
+# 0700 and 0600. The converge pushes with it, the sweeps verify a tag
+# against the registry with it, and the registry prune reads its token.
+# It replaced the login the operator once ran by hand into his own
+# ~/.docker/config.json, which no registry row named and no rotation
+# reached.
+REGISTRY_PUSH_DIR="${BOSS_REGISTRY_PUSH_DIR:-/etc/boss/registry-push}"
 
 # An operator's hand on the converge (converge-hold.sh). A FIXED path,
 # not $HOME: the ops runner executes verbs as root with no HOME in its
@@ -101,8 +138,9 @@ FAILED_FILE="${BOSS_FORGE_LAST_FAILED:-${HOME:-}/.boss-last-failed}"
 # so could every other account: /var/tmp is sticky and world-writable,
 # so anyone on the forge could create the hold first (holding every
 # converge) or plant a symlink the root verbs then read through. The
-# hold is written by ROOT (the ops runner) and only READ by david, so it
-# belongs in a directory root owns and david can read: install.sh makes
+# hold is written by ROOT (the ops runner) and READ by the converge
+# (root too, since backlog 683d7fe9), so it belongs in a directory root
+# owns: install.sh makes
 # /var/lib/boss root:root 0755 on every converge (converge-hold.sh
 # prepare, which also carried a hold standing at the old path across,
 # once). Survives a reboot, as /var/tmp did.

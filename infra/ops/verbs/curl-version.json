@@ -1,0 +1,12 @@
+{
+  "about": "READ-ONLY: which curl this host runs — `curl --version`, its version, protocols and features. Added for backlog 50708d76: the machine-token host rule and its proxy rule in infra/lib/secret-header.sh agree with curl only as far as they were measured, and every measurement (how a URL with no scheme is guessed, which proxy variable an http URL reads) was taken against the dev pod's curl 7.88.1. The shell senders of the machine token and the runner credential run on the ops-runner hosts, whose curl nobody had read; this is the door that reads it. Its hosts are every node infra/estate/estate.toml gives the ops-runner role, held equal by secret_header_sh.rs. No arguments, nothing mutated.",
+  "hosts": [
+    "boss-gcp",
+    "forge"
+  ],
+  "argv": [
+    "curl",
+    "--version"
+  ],
+  "params": []
+}

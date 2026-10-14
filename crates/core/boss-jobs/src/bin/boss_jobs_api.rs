@@ -431,11 +431,29 @@ async fn run_server<R: JobsRepository + 'static>(
     // sensors door; clone the Arcs before the state takes them.
     let department_jobs: Arc<dyn JobsRepository> = jobs.clone();
     // The broker-stage door (design 6e28ed42; backlog 1e50e66b): OFF
-    // unless all five BOSS_BROKER_STAGE_* variables are set, and no
-    // manifest sets one — the decision authorized no activation. One Arc,
+    // unless all five BOSS_BROKER_STAGE_* variables are set — which
+    // boss.yaml does since the activation (backlog 25fff647). One Arc,
     // read by the layer that takes the token off the request and by the
     // rotation door that judges a runner credential's stage with it.
     let stage_door = Arc::new(boss_jobs::credentials::broker_stage::Door::from_env());
+    // One read of the key set at boot, off the request path, so the log
+    // says whether this pod's ServiceAccount can fetch it before any stage
+    // needs it. It refuses nothing and holds nothing: every verification
+    // fetches afresh, and a pod whose read failed here still boots.
+    {
+        let door = stage_door.clone();
+        tokio::task::spawn_blocking(move || match door.check_keys() {
+            None => {}
+            Some(Ok(count)) => info!(
+                count,
+                "broker-stage key set read: {count} trusted RS256 key(s)"
+            ),
+            Some(Err(why)) => error!(
+                %why,
+                "broker-stage key set UNREADABLE at boot: every runner credential stage will be refused until it reads"
+            ),
+        });
+    }
     let stage_packets: Arc<dyn boss_jobs::credentials::broker_stage::StagePackets> = Arc::new(
         boss_jobs::credentials::broker_stage::JobsStagePackets(jobs.clone()),
     );

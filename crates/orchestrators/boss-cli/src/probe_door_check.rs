@@ -130,9 +130,8 @@ pub(crate) struct Named {
 
 impl Named {
     fn by_this_host() -> Self {
-        let (account, named) = crate::prove::probe_user();
         Self {
-            account: named.then_some(account),
+            account: crate::prove::probe_user(),
             view: std::env::var_os("BOSS_PROBE_DIR")
                 .filter(|dir| !dir.is_empty())
                 .map(PathBuf::from),
@@ -426,12 +425,14 @@ pub(crate) fn not_root(uid: u32) -> Option<String> {
 /// candidate third accounts with theirs.
 ///
 /// THE ACCOUNT MUST BE NAMED BY THE HOST (review cd3f6a99, N4). The
-/// unattended door falls back to the checkout's owner when
-/// `BOSS_PROBE_USER` is unset, and a check that fell back with it could
+/// unattended door used to fall back to the checkout's owner when
+/// `BOSS_PROBE_USER` was unset, and a check that fell back with it could
 /// end HELD, exit 0, about an account that is not the probe account —
 /// with one word on its first line to say so. This check exists to
 /// prove the hand-over to the PROBE ACCOUNT before a credential is
-/// deposited, so with none named it refuses.
+/// deposited, so with none named it refuses; and since 2026-10-09 the
+/// door itself runs no probe on such a host (backlog 703358ce,
+/// `prove::unnamed_probe_host_refusal`).
 ///
 /// Root is not an account to hand to, and the third account is neither
 /// root nor the first: a "stranger" that is the probe account would
@@ -443,10 +444,9 @@ pub(crate) fn cast(
 ) -> Result<(u32, &'static str, u32), String> {
     let Some(account) = account else {
         return Err(
-            "BOSS_PROBE_USER is unset here, so this host names no probe account to check; the \
-             door's fallback is the checkout's owner, and a hand-over to that account proves \
-             nothing about the probe account (infra/forge/probe-account.sh writes the drop-in \
-             that names it)"
+            "BOSS_PROBE_USER is unset here, so this host names no probe account to check, and \
+             the unattended door runs no probe here either (infra/forge/probe-account.sh writes \
+             the drop-in that names it)"
                 .to_string(),
         );
     };
@@ -1196,7 +1196,7 @@ mod tests {
     }
 
     /// N4 and N6 (review cd3f6a99), THE CAST, pure. No account named by
-    /// the host is a refusal — never a run for the door's fallback; root
+    /// the host is a refusal — never a run for an account it did not name; root
     /// is not a probe account; and the third account is neither root nor
     /// the first, taken in order.
     #[test]
@@ -1214,7 +1214,7 @@ mod tests {
         let said = cast(None, None, &both).unwrap_err();
         assert!(said.contains("BOSS_PROBE_USER is unset here"), "{said}");
         assert!(said.contains("names no probe account"), "{said}");
-        // Unset is refused even where the fallback account exists.
+        // Unset is refused even where the checkout's owner (uid 1000) exists.
         assert!(cast(None, Some(1000), &both).is_err());
         let said = cast(Some("boss-probe"), None, &both).unwrap_err();
         assert!(said.contains("no account `boss-probe`"), "{said}");

@@ -645,8 +645,7 @@ shop = true
         blank.role = Some("  ".into());
 
         for s in [employee, guest, break_glass, roleless, blank] {
-            let header: serde_json::Value =
-                serde_json::from_str(&crate::role_headers::build_user_json(&s)).unwrap();
+            let header: serde_json::Value = serde_json::from_str(&s.user_json()).unwrap();
             let answer = SessionResponse::from(s.clone());
             assert_eq!(
                 (

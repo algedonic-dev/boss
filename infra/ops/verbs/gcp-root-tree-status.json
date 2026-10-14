@@ -1,0 +1,7 @@
+{
+  "about": "READ-ONLY GCP root-adoption evidence: current generation equals the authenticated accepted ref, protected bootstrap ownership, and actual root User/loaded executable for converge, ops runner and four observers. Prints no argv, credential or token values. Exit 0 proves installed callers only; observer execution remains evidenced by its maintenance packet. Missing or unreadable state is UNVERIFIED, never a pass. No arguments.",
+  "hosts": ["boss-gcp"],
+  "argv": ["infra/gcp/root-tree-status.sh"],
+  "params": [],
+  "timeout": 30
+}

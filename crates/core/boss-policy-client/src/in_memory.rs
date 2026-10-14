@@ -1,11 +1,13 @@
 //! In-memory adapter — for tests and the `FakePolicyClient` backbone.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
 
-use crate::port::{Judge, PolicyError, PolicyRepository, ReconcileStats, id_taken};
+use crate::port::{
+    Judge, PolicyError, PolicyRepository, PolicySelectionRows, ReconcileStats, id_taken,
+};
 use crate::types::{PolicyRule, UserOverride};
 
 #[derive(Default)]
@@ -21,6 +23,21 @@ struct State {
     /// uses, so reconcile semantics match across adapters in tests.
     bootstrap_owned: std::collections::HashSet<String>,
     overrides: HashMap<String, UserOverride>,
+}
+
+struct LockedPolicySelectionRows<'a> {
+    _guard: MutexGuard<'a, State>,
+    rules: Vec<PolicyRule>,
+    overrides: Vec<UserOverride>,
+}
+
+impl PolicySelectionRows for LockedPolicySelectionRows<'_> {
+    fn rules(&self) -> &[PolicyRule] {
+        &self.rules
+    }
+    fn overrides(&self) -> &[UserOverride] {
+        &self.overrides
+    }
 }
 
 impl InMemoryPolicy {
@@ -44,6 +61,40 @@ impl InMemoryPolicy {
 
 #[async_trait]
 impl PolicyRepository for InMemoryPolicy {
+    fn try_lock_selection_rows(
+        &self,
+    ) -> Result<Option<Box<dyn PolicySelectionRows + '_>>, PolicyError> {
+        let guard = match self.inner.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(PolicyError::Storage("policy writer lock poisoned".into()));
+            }
+        };
+        let rules = guard.rules.values().cloned().collect();
+        let overrides = guard.overrides.values().cloned().collect();
+        Ok(Some(Box::new(LockedPolicySelectionRows {
+            _guard: guard,
+            rules,
+            overrides,
+        })))
+    }
+    fn lock_selection_rows(&self) -> Result<Box<dyn PolicySelectionRows + '_>, PolicyError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| PolicyError::Storage("policy writer lock poisoned".into()))?;
+        let rules = guard.rules.values().cloned().collect();
+        // Preserve the actual repository iteration order; no separate clock
+        // filters expired rows before the consumer's expiry linearization.
+        let overrides = guard.overrides.values().cloned().collect();
+        Ok(Box::new(LockedPolicySelectionRows {
+            _guard: guard,
+            rules,
+            overrides,
+        }))
+    }
+
     async fn list_rules(&self) -> Result<Vec<PolicyRule>, PolicyError> {
         // Active rules only, as the port says and postgres answers
         // (`WHERE active = TRUE`). Until the adapters-agree suite
@@ -217,6 +268,103 @@ impl PolicyRepository for InMemoryPolicy {
 mod tests {
     use super::*;
     use crate::types::{Action, Resource, Scope, UserOverride};
+
+    #[tokio::test]
+    async fn a_native_selection_guard_holds_the_actual_policy_writer_until_consumed() {
+        let repo = std::sync::Arc::new(InMemoryPolicy::with_rules([PolicyRule::new(
+            "cto",
+            Resource::step(),
+            Action::Update,
+            Scope::All,
+        )]));
+        let guard = repo.lock_selection_rows().unwrap();
+        assert!(
+            repo.inner.try_lock().is_err(),
+            "the actual writer mutex is held"
+        );
+        assert_eq!(guard.rules().len(), 1);
+        assert!(guard.rules()[0].active);
+        let writer_repo = repo.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            started_tx.send(()).unwrap();
+            runtime
+                .block_on(writer_repo.deactivate_rule("cto:step:update", "test"))
+                .unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(
+            guard.rules()[0].active,
+            "no policy change can cross the held owner"
+        );
+        drop(guard);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        writer.join().unwrap();
+        assert!(
+            !repo
+                .rule_for("cto:step:update")
+                .await
+                .unwrap()
+                .unwrap()
+                .active
+        );
+    }
+
+    #[tokio::test]
+    async fn a_native_owner_retains_expired_inputs_for_its_consumption_instant() {
+        let repo = InMemoryPolicy::new();
+        let user = crate::types::User {
+            id: "emp-owner".into(),
+            ..crate::types::User::anonymous()
+        };
+        let expiry = crate::engine::expiry_now() - chrono::Duration::seconds(1);
+        let override_row = UserOverride {
+            id: "selection-expired".into(),
+            user_id: user.id.clone(),
+            resource: Resource::step(),
+            action: Action::Update,
+            scope: Scope::All,
+            reason: "bounded native grant".into(),
+            expires_at: Some(expiry),
+        };
+        repo.upsert_user_override(&override_row, "test")
+            .await
+            .unwrap();
+        assert!(repo.list_user_overrides(&user.id).await.unwrap().is_empty());
+        let guard = repo.lock_selection_rows().unwrap();
+        assert_eq!(guard.overrides(), &[override_row]);
+        let before = crate::engine::evaluate_snapshot(
+            &user,
+            Action::Update,
+            &Resource::step(),
+            guard.overrides(),
+            None,
+            expiry - chrono::Duration::nanoseconds(1),
+        );
+        assert!(matches!(before.0, crate::types::Decision::Allow { .. }));
+        let consumed = crate::engine::evaluate_snapshot(
+            &user,
+            Action::Update,
+            &Resource::step(),
+            guard.overrides(),
+            None,
+            crate::engine::expiry_now(),
+        );
+        assert!(matches!(consumed.0, crate::types::Decision::Deny { .. }));
+    }
 
     #[tokio::test]
     async fn bootstrap_reconcile_inserts_missing_rules() {

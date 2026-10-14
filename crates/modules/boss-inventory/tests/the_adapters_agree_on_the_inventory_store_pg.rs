@@ -186,6 +186,7 @@ boss_testing::adapters_agree! {
         a_re_posted_purchase_order_moves_its_status_and_keeps_its_placement_and_lines,
         a_purchase_order_naming_an_unregistered_vendor_is_refused_not_found,
         a_status_flip_records_the_post_flip_order_and_an_unknown_order_is_not_found,
+        ordinary_purchase_placement_refuses_negative_and_preserves_recorded_history,
         an_open_order_with_a_line_for_the_part_is_what_open_po_exists_answers,
         the_primary_vendor_is_the_latest_placed_order_s_then_the_category_s,
         inbound_reserved_for_a_part_nobody_is_restocking_is_zero,
@@ -206,6 +207,66 @@ boss_testing::adapters_agree! {
 }
 
 // ----- fixtures ------------------------------------------------------------
+
+async fn ordinary_purchase_placement_refuses_negative_and_preserves_recorded_history<W: World>(
+    w: &W,
+    adapter: &str,
+) {
+    let negative = po(
+        "suite-cost-negative",
+        None,
+        PoStatus::DRAFT,
+        None,
+        vec![line("suite-cost-part", 1, -1)],
+    );
+    place(w, &negative, 35).await;
+    let before = w.facts().await.len();
+    let result = w
+        .repo()
+        .update_po_status(&negative.id, PoStatus::SUBMITTED, &stamp(36))
+        .await;
+    assert!(
+        matches!(result, Err(InventoryError::Invalid(ref reason)) if reason.contains("unit cost must not be negative")),
+        "{adapter}: {result:?}"
+    );
+    assert_eq!(
+        w.facts().await.len(),
+        before,
+        "{adapter}: refusal recorded facts"
+    );
+    assert_eq!(
+        w.repo()
+            .purchase_order_by_id(&negative.id)
+            .await
+            .expect("read"),
+        Some(negative),
+        "{adapter}"
+    );
+    for (id, status, cents) in [
+        ("suite-cost-zero", PoStatus::DRAFT, 0),
+        ("suite-cost-history", PoStatus::SUBMITTED, -1),
+    ] {
+        let order = po(
+            id,
+            None,
+            status,
+            None,
+            vec![line("suite-cost-part", 1, cents)],
+        );
+        place(w, &order, 37).await;
+        w.repo()
+            .update_po_status(id, PoStatus::RECEIVED, &stamp(38))
+            .await
+            .expect("zero or historical cost remains representable");
+        let saved = w
+            .repo()
+            .purchase_order_by_id(id)
+            .await
+            .expect("read")
+            .expect("order");
+        assert_eq!(saved.lines[0].unit_cost_cents, cents, "{adapter}");
+    }
+}
 
 /// An instant `secs` after a fixed origin, carrying nanoseconds no
 /// column keeps.

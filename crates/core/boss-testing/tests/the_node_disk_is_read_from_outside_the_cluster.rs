@@ -232,8 +232,12 @@ fn the_talos_call_mounts_the_pinned_binary_and_the_placed_talosconfig_read_only(
     let bin = w.dir.join("talosctl-pinned");
     for l in &talos {
         // `-n`: the stub records argv after sudo, so this is `sudo -n docker
-        // run`, in the forge registry's mirrored image (backlog cf321ffd).
-        assert!(l.starts_with("-n docker run --rm --network host "), "{l}");
+        // run`, in the forge registry's mirrored image (backlog cf321ffd),
+        // keeping no container log (backlog aa700921).
+        assert!(
+            l.starts_with("-n docker run --rm --log-driver=none --network host "),
+            "{l}"
+        );
         assert!(l.contains(" reg.test/david/alpine-k8s:1.33.3 "), "{l}");
         assert!(
             l.contains(&format!(

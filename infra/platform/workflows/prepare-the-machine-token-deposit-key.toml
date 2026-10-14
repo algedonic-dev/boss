@@ -123,7 +123,8 @@ metadata_defaults = { human_only = true, written_by = "rule:broker-prepares-the-
 # three fields are `filled_by = "filer"`. `enroll` is human-only, and on a
 # human-only step a machine may write only context or a filer-filled
 # field (boss-jobs human_only.rs, default-deny): declared executor-filled,
-# as prepare-a-deposit-key declares them, the broker's own proposal is
+# as prepare-a-deposit-key v1 declared them (v2 took this repair, item
+# 3dc0b247), the broker's own proposal is
 # refused 403 — the second refusal the real-router leg found, after the
 # writer (review ecd9263a, F1). Not `required`: a filer-required field is
 # owed when the packet is FILED, and nobody holds a key then. What holds

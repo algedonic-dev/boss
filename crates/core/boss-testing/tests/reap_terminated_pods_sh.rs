@@ -438,6 +438,62 @@ fn an_empty_set_is_a_plan_and_its_apply_deletes_nothing() {
     assert!(!calls.contains("delete"), "{calls}");
 }
 
+/// AN EMPTY REAP ASKS NOBODY (backlog 8828d47d). On 2026-10-09 ops-request
+/// d2a031b4 put a 0-pod plan in front of David's passkey; he rejected it,
+/// and the rejection was filed as an urgent runner refusal. The plan verb
+/// now declares `nothing_to_do`, so the runner closes such a request
+/// through ops-request's `nothing-to-do` terminal instead. Held here to
+/// the bytes THIS SCRIPT renders — the empty plan matches, a plan naming a
+/// pod does not — so the regex and the renderer cannot drift apart
+/// unseen; `ops_runner_approval_sh`'s shipped-declarations test holds the
+/// same regex to its anchoring.
+#[test]
+fn the_empty_plan_is_the_one_the_plan_verbs_nothing_to_do_names() {
+    let verb: Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("infra/ops/verbs/plan-a-pod-reap.json")).unwrap(),
+    )
+    .unwrap();
+    let re = verb["nothing_to_do"]
+        .as_str()
+        .expect("plan-a-pod-reap declares nothing_to_do, so an empty reap asks for no passkey");
+    let judge = |plan: &str| -> String {
+        let out = Command::new("jq")
+            .args(["-rn", "--arg", "p", plan, "--arg", "re", re])
+            .arg("$p | test($re)")
+            .output()
+            .expect("jq runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let empty = fixture("nothing-to-do-empty");
+    set_pods(
+        &empty,
+        "boss-dev",
+        &[pod(
+            "boss-dev-alive",
+            "u1",
+            "Running",
+            "2026-09-01T00:00:00Z",
+        )],
+    );
+    let (code, plan, err) = plan_at(&empty, NOW);
+    assert_eq!(code, 0, "{err}");
+    assert!(plan.contains("== pods to reap (0) =="), "{plan}");
+    assert_eq!(judge(&plan), "true", "the empty plan:\n{plan}");
+
+    let work = fixture("nothing-to-do-work");
+    ordinary(&work);
+    let (code, plan, err) = plan_at(&work, NOW);
+    assert_eq!(code, 0, "{err}");
+    assert!(plan.contains("== pods to reap (2) =="), "{plan}");
+    assert_eq!(judge(&plan), "false", "a plan naming pods:\n{plan}");
+}
+
 #[test]
 fn the_write_deletes_exactly_the_planned_uids_and_prints_them_first() {
     let f = fixture("write");

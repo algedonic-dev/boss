@@ -32,6 +32,7 @@ import {
   toTrainRow,
   trainGateLabel,
   trainGateTroubled,
+  TRAIN_GATE_WAIT_MINUTES,
   cancelRequestBody,
   canOfferCancel,
   CANCEL_ROLE,
@@ -1752,7 +1753,7 @@ describe('TrainRow reads the train gate off the train and its ci step', () => {
       none,
       false,
     ).gate;
-    expect(g).toEqual({ run: '0123456789abcdef', line: null, forge: null, fallback: null, wait_reason: null, relaunches: 1 });
+    expect(g).toEqual({ run: '0123456789abcdef', line: null, forge: null, fallback: null, wait_reason: null, wait_since: null, relaunches: 1 });
     expect(g && trainGateLabel(g)).toBe('forge pending · gate running (01234567) · relaunched 1×');
   });
 
@@ -1815,6 +1816,41 @@ describe('TrainRow reads the train gate off the train and its ci step', () => {
     expect(g?.wait_reason).toBe(why);
     expect(g && trainGateLabel(g)).toBe(`forge pending · gate waiting: ${why}`);
     expect(g && trainGateTroubled(g)).toBe(true);
+  });
+
+  // Backlog 19227ca8: since design 1e787fc2 a train at a full bound
+  // holds the FIRST place in the gate line and takes the next bay, so a
+  // short wait is the normal path, not trouble. The wait is dated from
+  // the later of the PR's opening and the last gate launch, and it wears
+  // the trouble style only once it has held TRAIN_GATE_WAIT_MINUTES — the
+  // one number track.rs judges by (a test there pins this constant).
+  test('a train briefly waiting for a bay is not trouble; one past the threshold is', () => {
+    const why = 'the cluster is at its gate bound (3 running of 3: a, b, c) — the train holds the first place';
+    const g = toTrainRow(
+      train({
+        metadata: { train_gate_wait_reason: why, train_gate_launched_at: '2026-10-10T11:50:00Z' },
+        steps: [s('pr', 'completed', { completed_at: '2026-10-10T11:40:00Z' }), s('ci', 'ready')],
+      }),
+      none,
+      false,
+    ).gate;
+    expect(TRAIN_GATE_WAIT_MINUTES).toBe(10);
+    expect(g?.wait_since).toBe('2026-10-10T11:50:00Z');
+    const at = (iso: string): number => Date.parse(iso);
+    expect(g && trainGateTroubled(g, at('2026-10-10T11:53:00Z'))).toBe(false);
+    expect(g && trainGateTroubled(g, at('2026-10-10T11:59:59Z'))).toBe(false);
+    expect(g && trainGateTroubled(g, at('2026-10-10T12:00:00Z'))).toBe(true);
+    // A first wait, never launched, is dated from the PR's opening.
+    const first = toTrainRow(
+      train({
+        metadata: { train_gate_wait_reason: why },
+        steps: [s('pr', 'completed', { completed_at: '2026-10-10T11:40:00Z' }), s('ci', 'ready')],
+      }),
+      none,
+      false,
+    ).gate;
+    expect(first?.wait_since).toBe('2026-10-10T11:40:00Z');
+    expect(first && trainGateTroubled(first, at('2026-10-10T11:53:00Z'))).toBe(true);
   });
 
   test('once the gate is filed the conductor nulls the reason and the train is running, not waiting', () => {

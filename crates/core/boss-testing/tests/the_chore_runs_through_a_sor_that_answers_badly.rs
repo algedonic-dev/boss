@@ -36,7 +36,7 @@
 //! to this crate, so every scoped gate runs it whatever its scope
 //! (`tree_wide_pins` in infra/gate.sh; backlog c87ad472).
 
-use boss_testing::{dark_port, repo_root, scratch_dir};
+use boss_testing::{dark_port, repo_root, scratch_dir, without_proxy};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -187,6 +187,7 @@ fn wrap(url: &str, home: &Path, kind: &str) -> Out {
 /// environment laid over the unit's.
 fn wrap_with(url: Option<&str>, home: &Path, kind: &str, env: &[(&str, &str)]) -> Out {
     let mut cmd = Command::new("bash");
+    without_proxy(&mut cmd);
     cmd.arg(repo_root().join(WRAP))
         .args([kind, "Cluster converge on forge main"])
         .env("HOME", home)
@@ -641,7 +642,7 @@ fn carried_ids(body: &Value) -> Vec<String> {
 /// is the real jq everywhere else (the ledger lives in HOME, a different
 /// filesystem from TMPDIR on the forge).
 fn full_tmpdir_path(dir: &Path) -> String {
-    let real = Command::new("bash")
+    let real = without_proxy(&mut Command::new("bash"))
         .args(["-c", "command -v jq"])
         .output()
         .unwrap();
@@ -862,7 +863,7 @@ fn a_sigterm_mid_post_marks_the_rows() {
         }
         _ => (200, r#"{"data":[]}"#.to_string()),
     }));
-    let mut child = Command::new("bash")
+    let mut child = without_proxy(&mut Command::new("bash"))
         .arg(repo_root().join(WRAP))
         .args([kind, "x"])
         .env("BOSS_JOBS_URL", &sor.url)
@@ -888,7 +889,7 @@ fn a_sigterm_mid_post_marks_the_rows() {
     let group = format!("-{}", child.id());
     // bash's builtin kill: the gate's image has no /bin/kill (the first
     // gate of this test died on NotFound).
-    let killed = Command::new("bash")
+    let killed = without_proxy(&mut Command::new("bash"))
         .args(["-c", "kill -TERM -- \"$1\"", "kill", &group])
         .status()
         .unwrap();
@@ -970,7 +971,7 @@ fn a_stray_is_written_aside_and_only_then_named_for_the_sweep() {
     // logs the template it was asked for.
     let shim = home.join("mktemp-log-bin");
     std::fs::create_dir_all(&shim).unwrap();
-    let real = Command::new("bash")
+    let real = without_proxy(&mut Command::new("bash"))
         .args(["-c", "command -v mktemp"])
         .output()
         .unwrap();
@@ -1057,7 +1058,7 @@ fn unlocked_there_is_no_claim_sweep() {
         "jq", "mkdir", "mktemp", "mv", "readlink", "rm", "sleep", "tail", "touch", "uname", "wc",
         "curl", "tr", "sed", "head",
     ] {
-        let found = Command::new("bash")
+        let found = without_proxy(&mut Command::new("bash"))
             .args(["-c", &format!("command -v {tool}")])
             .output()
             .unwrap();
@@ -1178,7 +1179,7 @@ fn a_copy_cut_short_sends_nothing_twice() {
     let ledger_rows: String = (0..10).map(|i| row(format!("r{i}"))).collect();
     std::fs::write(&path, ledger_rows).unwrap();
 
-    let real = Command::new("bash")
+    let real = without_proxy(&mut Command::new("bash"))
         .args(["-c", "command -v cat"])
         .output()
         .unwrap();
@@ -1253,7 +1254,7 @@ fn pid_reuse_loses_nothing() {
         path.display(),
         repo_root().join(WRAP).display()
     );
-    let out = Command::new("bash")
+    let out = without_proxy(&mut Command::new("bash"))
         .args(["-c", &script])
         .env("BOSS_JOBS_URL", &sor.url)
         .env("HOME", &home)

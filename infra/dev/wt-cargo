@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-if [[ -e /etc/boss-dev-control/enabled || -L /etc/boss-dev-control/enabled ]]; then
-    exec /opt/boss-dev-control/wt-cargo "$@"
+# Dev isolation (b3071bf4): with a selector, candidate code runs only in
+# the worker; a selector naming no activated generation REFUSES (design
+# a68fc42a D1), never runs it here beside the token.
+dev_control=/work/tools/dev-control
+if [[ -e $dev_control/enabled || -L $dev_control/enabled ]]; then
+    [[ "$(/usr/bin/readlink -- "$dev_control/enabled")" =~ ^"$dev_control"/generations/[0-9a-f]{40}$ ]] && exec "$dev_control/wt-cargo" "$@"
+    echo "wt-cargo: REFUSED — dev isolation is on and its selector $dev_control/enabled names no activated generation, so candidate code does not run beside this container's credentials (design a68fc42a D1). Why: $dev_control/activation.log. boss-api and boss without --built still run." >&2
+    exit 75
 fi
 # wt-cargo — run cargo in a WORKTREE with its own target dir, seeded by
 # reflink from the warm shared one (bottleneck #6, 2026-09-12).
@@ -48,6 +54,35 @@ if [ -r "$here/door-freshness.sh" ]; then
 fi
 
 root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "wt-cargo: not in a git worktree" >&2; exit 2; }
+
+# A RUN DOES NOT BUILD IN THE SHARED CHECKOUT (backlog 916fe290). Measured
+# 2026-10-09, four builders in four runs: an isolated-worktree agent's
+# Bash call starts in the dispatching session's checkout (/work/boss),
+# and the harness DROPS a leading `cd <worktree> &&` from the command
+# text, so cargo, git and once a relative-path sed ran there — silently,
+# every command answering from the wrong tree. So when BOSS_AGENT_RUN
+# names a run, the main checkout that worktrees hang off is refused
+# before any target is seeded. Shared is judged by shape, not by a typed
+# path: git-dir equals git-common-dir (a main checkout, not a linked
+# worktree) AND worktrees are registered under it — a lone clone, the
+# run's own worktree, and the operator naming no run all build. `boss
+# gate` refuses the same case (crates/orchestrators/boss-cli/src/
+# shared_checkout.rs), pinned by wt_cargo_sh.rs here.
+agent_run=${BOSS_AGENT_RUN:-}
+if [ -n "${agent_run//[[:space:]]/}" ]; then
+    git_dir=$(git rev-parse --path-format=absolute --git-dir 2>/dev/null) || git_dir=
+    common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common_dir=
+    if [ -n "$git_dir" ] && [ "$git_dir" = "$common_dir" ] \
+        && [ -n "$(ls -A "$common_dir/worktrees" 2>/dev/null)" ]; then
+        {
+            echo "wt-cargo: REFUSED — BOSS_AGENT_RUN=$agent_run names an agent run, and this shell is in $root, the SHARED checkout: the main checkout worktrees hang off and every door on this host runs from, not a worktree of the run's own (backlog 916fe290)."
+            echo 'An isolated-worktree agent'\''s Bash call starts here, and its harness drops a leading `cd <worktree> &&` from the command text, so a cd written that way never ran.'
+            echo 'Run wt-cargo from a script you wrote whose first lines are `cd <your worktree> || exit 1` and `pwd`, by absolute path, and read the pwd in its log;'
+            echo "git -C $root worktree list names every worktree. An operator building this checkout on purpose unsets BOSS_AGENT_RUN."
+        } >&2
+        exit 2
+    fi
+fi
 name=$(basename "$root")
 seed=${WT_SEED:-/scratch/target}
 # THE NAME IS READ, NOT TYPED (backlog 955c99b6, 2026-09-22). gate.sh
@@ -154,12 +189,37 @@ export CARGO_TARGET_DIR="$dir"
 # builder that read code for half an hour holds an idle one — it must
 # not be taken the moment before it builds. A failed pass is named and
 # the build goes on: the hourly pass reports a floor it cannot meet.
+#
+# THE PASS SIGNS WHAT IT FILES (review fb78c7b0 of car 099f8a9f, F7;
+# backlog ffd309c1). A pass that acts files a maintenance packet through
+# the wrap and step helpers, and their reader looks for the token at
+# its default directory — which the dev container does not mount, on
+# purpose: builders run tests here, and every stamping client a test
+# builds reads that default. So the pass filed its packets with no
+# token (twice in the review alone, ce62d977 and 6ed3e993). This is a
+# door, and a door names the doors' directory — ./machine-token-dir —
+# and the record's host to what it runs, as the shim and boss-api do:
+# to this ONE child, on its command line, never exported. cargo is not
+# told, because every test binary a build runs inherits cargo's
+# environment. A caller's own directory, or host list (even empty), is
+# kept, as the shim keeps them.
 touch "$dir"
+floor_env=("SCRATCH_MOUNT=${WT_TARGET_ROOT:-/scratch}" "CARGO_TARGET_DIR=$seed")
+if [ -z "${BOSS_MACHINE_TOKEN_DIR:-}" ] && [ -s "$here/machine-token-dir" ]; then
+    floor_env+=("BOSS_MACHINE_TOKEN_DIR=$(tr -d '[:space:]' < "$here/machine-token-dir")")
+fi
+if [ -z "${BOSS_MACHINE_TOKEN_HOSTS+set}" ] && [ -s "$here/sor-url" ]; then
+    token_host=$(tr -d '[:space:]' < "$here/sor-url")
+    token_host=${token_host#*://}
+    token_host=${token_host%%[/?#]*}
+    token_host=${token_host##*@}
+    token_host=${token_host%%:*}
+    floor_env+=("BOSS_MACHINE_TOKEN_HOSTS=$token_host")
+fi
 reclaim=${WT_RECLAIM:-$here/../cluster/dev-scratch-reclaim.sh}
 if [ -f "$reclaim" ]; then
     rrc=0
-    SCRATCH_MOUNT="${WT_TARGET_ROOT:-/scratch}" CARGO_TARGET_DIR="$seed" \
-        bash "$reclaim" --scratch-floor >&2 || rrc=$?
+    env "${floor_env[@]}" bash "$reclaim" --scratch-floor >&2 || rrc=$?
     [ "$rrc" -eq 0 ] || echo "wt-cargo: WARNING — the scratch-floor pass exited $rrc; building anyway" >&2
 else
     echo "wt-cargo: WARNING — no scratch-floor pass at $reclaim; /scratch is watched only hourly" >&2
@@ -184,9 +244,13 @@ set -a; . "$env_file"; set +a
 # builds 4-wide and nice'd, so the interactive shell wins the scheduler
 # when they collide; the operator's own worktrees keep the pod bound
 # (infra/dev/pod-build.env, sourced above). WT_JOBS overrides either.
+# The width is wt-target-dir.sh's wt_build_jobs, because gate.sh's
+# pre-flight checks a worktree at the same width (backlog 9ecd12ea).
+CARGO_BUILD_JOBS=$(wt_build_jobs "$root" "$CARGO_BUILD_JOBS")
+export CARGO_BUILD_JOBS
 case "$name" in
-    agent-*) export CARGO_BUILD_JOBS="${WT_JOBS:-4}"; runner=(nice -n 10 cargo) ;;
-    *)       export CARGO_BUILD_JOBS="${WT_JOBS:-$CARGO_BUILD_JOBS}"; runner=(cargo) ;;
+    agent-*) runner=(nice -n 10 cargo) ;;
+    *)       runner=(cargo) ;;
 esac
 
 # `wt-cargo suite <crate>` — the crate's whole suite in chunks that each

@@ -104,6 +104,10 @@ fn gated_station() -> StationSpec {
         StationKind::Constraint,
         StationPredicate {
             kind: Some("car-kind".into()),
+            step: Some(StepMatch {
+                slug: Some("review".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         },
         chrono::Utc::now(),
@@ -138,31 +142,67 @@ fn watchlist_station() -> StationSpec {
 }
 
 fn app() -> (axum::Router, Arc<InMemoryJobs>) {
+    app_with_agents(Some(Arc::new(boss_jobs::agents::InMemoryAgents::new())))
+}
+
+fn app_with_agents(
+    agents: Option<Arc<dyn boss_jobs::agents::AgentsRegistry>>,
+) -> (axum::Router, Arc<InMemoryJobs>) {
+    app_with_workflow_and_agents(car_kind(), agents)
+}
+
+fn app_with_workflow(workflow: WorkflowSpec) -> (axum::Router, Arc<InMemoryJobs>) {
+    app_with_workflow_and_agents(
+        workflow,
+        Some(Arc::new(boss_jobs::agents::InMemoryAgents::new())),
+    )
+}
+
+fn app_with_workflow_and_agents(
+    workflow: WorkflowSpec,
+    agents: Option<Arc<dyn boss_jobs::agents::AgentsRegistry>>,
+) -> (axum::Router, Arc<InMemoryJobs>) {
+    app_with_policy_and_agents(workflow, agents, None)
+}
+
+fn app_with_policy_and_agents(
+    workflow: WorkflowSpec,
+    agents: Option<Arc<dyn boss_jobs::agents::AgentsRegistry>>,
+    policy_override: Option<Arc<dyn PolicyClient>>,
+) -> (axum::Router, Arc<InMemoryJobs>) {
     let kinds = Arc::new(InMemoryWorkflows::for_fixture());
-    kinds.seed(car_kind()).unwrap();
+    kinds.seed(workflow).unwrap();
     let stations = Arc::new(InMemoryStations::new());
     stations.seed(dock_station()).unwrap();
     stations.seed(gated_station()).unwrap();
     stations.seed(watchlist_station()).unwrap();
-    let jobs = Arc::new(InMemoryJobs::new());
-    let policy: Arc<dyn PolicyClient> = Arc::new(
-        FakePolicyClient::builder()
-            .allow("ceo", Action::Create, Resource::job(), Scope::All)
-            .allow("ceo", Action::Read, Resource::job(), Scope::All)
-            .allow("ceo", Action::Update, Resource::step(), Scope::All)
-            .allow("head-brewer", Action::Read, Resource::job(), Scope::All)
-            .allow("head-brewer", Action::Update, Resource::step(), Scope::All)
-            .allow("reporter", Action::Read, Resource::job(), Scope::All)
-            // A guest that policy would let read everything: the only
-            // thing standing between them and somebody's watchlist is
-            // the placeholder failing to bind, which is what the guest
-            // test below is actually asserting.
-            .allow("guest", Action::Read, Resource::job(), Scope::All)
-            .build(),
-    );
+    let jobs = Arc::new(InMemoryJobs::for_selection_fixture());
+    let policy: Arc<dyn PolicyClient> = policy_override.unwrap_or_else(|| {
+        Arc::new(
+            FakePolicyClient::builder()
+                .allow("ceo", Action::Create, Resource::job(), Scope::All)
+                .allow("ceo", Action::Read, Resource::job(), Scope::All)
+                .allow("ceo", Action::Update, Resource::step(), Scope::All)
+                .allow("head-brewer", Action::Read, Resource::job(), Scope::All)
+                .allow("head-brewer", Action::Update, Resource::step(), Scope::All)
+                .allow("reporter", Action::Read, Resource::job(), Scope::All)
+                // A guest that policy would let read everything: the only
+                // thing standing between them and somebody's watchlist is
+                // the placeholder failing to bind, which is what the guest
+                // test below is actually asserting.
+                .allow("guest", Action::Read, Resource::job(), Scope::All)
+                .build(),
+        )
+    });
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let state = JobsApiState {
+        agent_budget: agents.map(|agents| {
+            Arc::new(boss_jobs::agent_budget::BudgetDoor {
+                agents,
+                runs: Arc::new(boss_jobs::agent_runs::InMemoryAgentRuns::new(vec![])),
+            })
+        }),
         stations: Some(stations as Arc<dyn StationRegistry>),
         kind_registry: Some(kinds as Arc<dyn WorkflowRegistry>),
         ..JobsApiState::minimal(
@@ -796,4 +836,795 @@ async fn claim_from_a_station_the_packet_is_not_at_conflicts() {
     // A stationless claim keeps today's behavior: CAS only.
     let status = claim(&app, &job_id, &step_id, "", "emp-ceo", "ceo").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// The native selection must conserve its actual choice on retry; it cannot
+/// be a station GET followed by a specific-step claim chosen by the client.
+#[tokio::test]
+async fn station_claim_next_selects_priority_and_conserves_the_owned_receipt() {
+    let (app, jobs) = app_with_agents(Some(Arc::new(boss_jobs::agents::InMemoryAgents::new())));
+    let older = post_car(&app, "older-standard", "standard", "2026-10-01", false).await;
+    let urgent = post_car(&app, "newer-urgent", "urgent", "2026-10-04", false).await;
+    let request = serde_json::json!({"request_id":"a1d3b6c8-0456-4789-8123-000000000001"});
+    let mut receipts = Vec::new();
+    let mut response_bytes = Vec::new();
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/stations/test-dock/claim-next")
+                    .header("content-type", "application/json")
+                    .header("x-boss-user", user_header("emp-ceo", "ceo"))
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "selection and owned claim must leave one copied receipt"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        response_bytes.push(body.to_vec());
+        receipts.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+    }
+    assert_eq!(
+        receipts[0], receipts[1],
+        "retry must not acquire another packet"
+    );
+    assert_eq!(
+        response_bytes[0], response_bytes[1],
+        "the HTTP receipt is copied byte for byte"
+    );
+    assert_eq!(receipts[0]["selected"]["job_id"], urgent);
+    assert_eq!(receipts[0]["station"]["name"], "test-dock");
+    let old_steps = jobs
+        .list_steps(&boss_core::job::JobId::from_uuid(older.parse().unwrap()))
+        .await
+        .unwrap();
+    let urgent_steps = jobs
+        .list_steps(&boss_core::job::JobId::from_uuid(urgent.parse().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(old_steps[0].status, boss_core::job::StepStatus::Ready);
+    assert_eq!(urgent_steps[0].status, boss_core::job::StepStatus::Active);
+    assert_eq!(urgent_steps[0].assignee_id.as_deref(), Some("emp-ceo"));
+}
+
+#[tokio::test]
+async fn station_claim_next_uses_the_same_derived_station_as_the_claim_door() {
+    let mut workflow = car_kind();
+    workflow.steps[0].authority_role = Some("head-brewer".into());
+    let (app, jobs) = app_with_workflow_and_agents(
+        workflow,
+        Some(Arc::new(boss_jobs::agents::InMemoryAgents::new())),
+    );
+    let id = post_car(&app, "derived-claim", "standard", "2026-10-04", false).await;
+    let response = app
+        .oneshot(
+            Request::post("/api/stations/q.head-brewer.task/claim-next")
+                .header("content-type", "application/json")
+                .header("x-boss-user", user_header("emp-brewer", "head-brewer"))
+                .body(Body::from(
+                    r#"{"request_id":"a1d3b6c8-0456-4789-8123-000000000002"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let steps = jobs
+        .list_steps(&boss_core::job::JobId::from_uuid(id.parse().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(steps[0].assignee_id.as_deref(), Some("emp-brewer"));
+}
+
+#[tokio::test]
+async fn derived_station_selection_refuses_two_eligible_steps_without_claiming_either() {
+    let mut workflow = car_kind();
+    workflow.steps[0].authority_role = Some("head-brewer".into());
+    let mut second = workflow.steps[0].clone();
+    second.title = "second".into();
+    workflow.steps.push(second);
+    let (app, jobs) = app_with_workflow(workflow);
+    let id = post_car(&app, "ambiguous", "standard", "2026-10-04", false).await;
+    let response = app
+        .oneshot(
+            Request::post("/api/stations/q.head-brewer.task/claim-next")
+                .header("content-type", "application/json")
+                .header("x-boss-user", user_header("emp-brewer", "head-brewer"))
+                .body(Body::from(
+                    r#"{"request_id":"a1d3b6c8-0456-4789-8123-000000000003"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let steps = jobs
+        .list_steps(&boss_core::job::JobId::from_uuid(id.parse().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(steps.len(), 2);
+    assert!(
+        steps
+            .iter()
+            .all(|step| step.status == boss_core::job::StepStatus::Ready
+                && step.assignee_id.is_none())
+    );
+}
+
+#[tokio::test]
+async fn station_selection_preserves_policy_and_station_capability_refusals() {
+    let (app, jobs) = app();
+    let id = post_car(&app, "refuse-owned-claim", "standard", "2026-10-04", false).await;
+    for (station, actor, role, request_id) in [
+        (
+            "test-dock",
+            "emp-guest",
+            "guest",
+            "a1d3b6c8-0456-4789-8123-000000000004",
+        ),
+        (
+            "brewer-gate",
+            "emp-ceo",
+            "ceo",
+            "a1d3b6c8-0456-4789-8123-000000000005",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/stations/{station}/claim-next"))
+                    .header("content-type", "application/json")
+                    .header("x-boss-user", user_header(actor, role))
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"request_id":request_id})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            jobs.station_claim_receipt(uuid::Uuid::parse_str(request_id).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    let steps = jobs
+        .list_steps(&boss_core::job::JobId::from_uuid(id.parse().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(steps[0].status, boss_core::job::StepStatus::Ready);
+    assert!(steps[0].assignee_id.is_none());
+}
+
+#[tokio::test]
+async fn an_empty_station_or_an_active_only_station_returns_no_owned_receipt() {
+    let (app, jobs) = app_with_agents(Some(Arc::new(boss_jobs::agents::InMemoryAgents::new())));
+    for (request_id, expected) in [
+        (
+            "a1d3b6c8-0456-4789-8123-000000000006",
+            StatusCode::NO_CONTENT,
+        ),
+        ("a1d3b6c8-0456-4789-8123-000000000007", StatusCode::CREATED),
+        (
+            "a1d3b6c8-0456-4789-8123-000000000008",
+            StatusCode::NO_CONTENT,
+        ),
+    ] {
+        if expected == StatusCode::CREATED {
+            post_car(&app, "one-ready-packet", "standard", "2026-10-04", false).await;
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/stations/test-dock/claim-next")
+                    .header("content-type", "application/json")
+                    .header("x-boss-user", user_header("emp-ceo", "ceo"))
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"request_id":request_id})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        assert_eq!(
+            jobs.station_claim_receipt(uuid::Uuid::parse_str(request_id).unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            expected == StatusCode::CREATED
+        );
+    }
+}
+
+/// The actual registry writer lands a revocation after the read copied its
+/// prior row. This wrapper controls only the interleaving; both states and
+/// the update event are produced by the real in-memory registry adapter.
+struct RevokeAfterAgentRead {
+    inner: boss_jobs::agents::InMemoryAgents,
+    replacement: boss_jobs::agents::AgentInput,
+    revoked: std::sync::atomic::AtomicBool,
+    fail_after_consume: bool,
+}
+
+#[async_trait::async_trait]
+impl boss_jobs::agents::AgentsRegistry for RevokeAfterAgentRead {
+    fn lock_selection_rows(
+        &self,
+    ) -> Result<
+        Box<dyn boss_jobs::agents::port::AgentSelectionRows + '_>,
+        boss_jobs::agents::AgentsError,
+    > {
+        if self.fail_after_consume {
+            Err(boss_jobs::agents::AgentsError::Storage(
+                "owner could not complete its fence".into(),
+            ))
+        } else {
+            self.inner.lock_selection_rows()
+        }
+    }
+    async fn resolve_login(
+        &self,
+        login: &str,
+    ) -> Result<Option<String>, boss_jobs::agents::AgentsError> {
+        self.inner.resolve_login(login).await
+    }
+    async fn list(
+        &self,
+    ) -> Result<Vec<boss_jobs::agents::AgentRow>, boss_jobs::agents::AgentsError> {
+        let copied = self.inner.list().await?;
+        if !self.revoked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let stamp = boss_core::publisher::EventStamp::new(
+                "test",
+                boss_core::actor::ActorId::automation("registry-writer"),
+            );
+            self.inner
+                .publish(
+                    std::slice::from_ref(&self.replacement),
+                    boss_core::publish::PublishMode::Take,
+                    &stamp,
+                )
+                .await?;
+        }
+        Ok(copied)
+    }
+    async fn publish(
+        &self,
+        rows: &[boss_jobs::agents::AgentInput],
+        mode: boss_core::publish::PublishMode,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<boss_jobs::agents::AgentsBatchOutcome, boss_jobs::agents::AgentsError> {
+        self.inner.publish(rows, mode, stamp).await
+    }
+    async fn list_automations(
+        &self,
+    ) -> Result<Vec<boss_jobs::agents::AutomationActor>, boss_jobs::agents::AgentsError> {
+        self.inner.list_automations().await
+    }
+    async fn declare_automations(
+        &self,
+        rows: &[boss_jobs::agents::AutomationActor],
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<boss_jobs::agents::AutomationsSeedOutcome, boss_jobs::agents::AgentsError> {
+        self.inner.declare_automations(rows, stamp).await
+    }
+}
+
+#[tokio::test]
+async fn an_actor_role_revoked_after_preflight_cannot_leave_a_selection_claim_or_receipt() {
+    use boss_jobs::agents::AgentsRegistry;
+    let registry = boss_jobs::agents::InMemoryAgents::new().with_rate_card(["gpt-6.1-sol"]);
+    let original = boss_jobs::agents::AgentInput {
+        id: "agent-selector".into(),
+        display_name: "Selector".into(),
+        default_model: "gpt-6.1-sol".into(),
+        role: Some("head-brewer".into()),
+        department: None,
+        hourly_budget_usd_micros: None,
+        max_concurrent_runs: None,
+        aliases: vec![],
+    };
+    let stamp = boss_core::publisher::EventStamp::new(
+        "test",
+        boss_core::actor::ActorId::automation("registry-writer"),
+    );
+    registry
+        .publish(
+            std::slice::from_ref(&original),
+            boss_core::publish::PublishMode::Take,
+            &stamp,
+        )
+        .await
+        .unwrap();
+    let mut replacement = original;
+    replacement.role = None;
+    let registry = Arc::new(RevokeAfterAgentRead {
+        inner: registry,
+        replacement,
+        revoked: std::sync::atomic::AtomicBool::new(false),
+        fail_after_consume: false,
+    });
+    let (app, jobs) = app_with_agents(Some(registry.clone()));
+    let job_id = post_car(&app, "revoked-selector", "standard", "2026-10-04", false).await;
+    let step_id = first_step_id(&app, &job_id).await;
+    let step_id: boss_core::job::StepId =
+        serde_json::from_value(serde_json::json!(step_id)).unwrap();
+    let before = jobs.get_step(&step_id).await.unwrap().unwrap();
+    let request_id = uuid::Uuid::new_v4();
+    let response = app
+        .oneshot(
+            Request::post("/api/stations/brewer-gate/claim-next")
+                .header("content-type", "application/json")
+                .header("x-boss-user", user_header("agent-selector", "ceo"))
+                .body(Body::from(
+                    serde_json::json!({"request_id": request_id}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        registry.inner.list().await.unwrap()[0].role,
+        None,
+        "the actual writer must have removed the role before the claim verdict"
+    );
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "revoked capability must be rechecked under the commit fence: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(jobs.get_step(&step_id).await.unwrap().unwrap(), before);
+    assert!(
+        jobs.station_claim_receipt(request_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn unchanged_actor_owner_conserves_its_observation_and_original_replay() {
+    use boss_jobs::agents::AgentsRegistry;
+    let registry =
+        Arc::new(boss_jobs::agents::InMemoryAgents::new().with_rate_card(["gpt-6.1-sol"]));
+    let declared = boss_jobs::agents::AgentInput {
+        id: "agent-selector".into(),
+        display_name: "Selector".into(),
+        default_model: "gpt-6.1-sol".into(),
+        role: Some("head-brewer".into()),
+        department: None,
+        hourly_budget_usd_micros: None,
+        max_concurrent_runs: None,
+        aliases: vec!["selector-login".into()],
+    };
+    let stamp = boss_core::publisher::EventStamp::new(
+        "test",
+        boss_core::actor::ActorId::automation("registry-writer"),
+    );
+    registry
+        .publish(&[declared], boss_core::publish::PublishMode::Take, &stamp)
+        .await
+        .unwrap();
+    let actual_row = registry.list().await.unwrap().remove(0);
+    let (app, jobs) = app_with_agents(Some(registry));
+    post_car(&app, "unchanged-selector", "standard", "2026-10-04", false).await;
+    let request_id = uuid::Uuid::new_v4();
+    let request = || {
+        Request::post("/api/stations/brewer-gate/claim-next")
+            .header("content-type", "application/json")
+            .header("x-boss-user", user_header("agent-selector", "ceo"))
+            .body(Body::from(
+                serde_json::json!({"request_id": request_id}).to_string(),
+            ))
+            .unwrap()
+    };
+    let first = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first = first.into_body().collect().await.unwrap().to_bytes();
+    let parsed: serde_json::Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(
+        parsed["validated"]["actor_observation"]["row"],
+        serde_json::json!(actual_row)
+    );
+    assert_eq!(
+        parsed["validated"]["actor_observation"]["requested_user"]["id"],
+        "agent-selector"
+    );
+    let prepared = &parsed["owner_consumption"]["policy"]["prepared_inputs"];
+    assert_eq!(prepared["user"]["id"], "agent-selector");
+    assert_eq!(
+        prepared["rules"],
+        parsed["owner_consumption"]["policy"]["rules"]
+    );
+    assert_eq!(
+        prepared["overrides"],
+        parsed["owner_consumption"]["policy"]["overrides"]
+    );
+    assert_eq!(prepared["request_id"], parsed["request_id"]);
+    assert!(prepared["observed_at"].as_str().is_some());
+    assert_eq!(
+        prepared["source_binding"],
+        "same native PolicyClient owner instance; actual writer guard"
+    );
+    assert_eq!(
+        parsed["owner_consumption"]["actor"]["row"],
+        serde_json::json!(actual_row)
+    );
+    assert_eq!(
+        parsed["owner_consumption"]["policy"]["user"]["id"],
+        "agent-selector"
+    );
+    assert_eq!(
+        parsed["owner_consumption"]["policy"]["prepared_update"],
+        serde_json::json!(boss_policy_client::Decision::Allow { scope: Scope::All })
+    );
+    assert_eq!(
+        parsed["owner_consumption"]["policy"]["prepared_read_scope"],
+        serde_json::json!(boss_jobs::port::JobScope::All)
+    );
+    assert!(
+        parsed["owner_consumption"]["policy"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule["resource"] == "step" && rule["action"] == "update")
+    );
+    assert_eq!(
+        parsed["owner_consumption"]["policy"]["overrides"],
+        serde_json::json!([])
+    );
+    assert!(
+        parsed["owner_consumption"]["policy"]["linearized_at"]
+            .as_str()
+            .is_some()
+    );
+    assert_eq!(
+        parsed["owner_consumption"]["definitions"]["workflows"],
+        serde_json::json!(
+            parsed["validated"]["workflows"]
+                .as_object()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        )
+    );
+    assert_eq!(
+        parsed["owner_consumption"]["run_population"]["applicable"],
+        false
+    );
+    let copied = boss_jobs::station_claim::SelectionReceipt::from_json(
+        String::from_utf8(first.to_vec()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(copied.json().as_bytes(), first.as_ref());
+    let mut changed = parsed.clone();
+    changed["owner_consumption"]["actor"]["row"]["default_model"] =
+        serde_json::json!("changed-after-consumption");
+    assert!(
+        boss_jobs::station_claim::SelectionReceipt::from_json(changed.to_string()).is_err(),
+        "copied owner inputs cannot be changed under the conserved digest"
+    );
+    let mut missing = parsed.clone();
+    missing.as_object_mut().unwrap().remove("owner_consumption");
+    assert!(
+        boss_jobs::station_claim::SelectionReceipt::from_json(missing.to_string()).is_err(),
+        "missing owner artifact cannot keep its digest"
+    );
+    let before = serde_json::to_value(jobs.recorded_events()).unwrap();
+    let replay = app.oneshot(request()).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(
+        replay.into_body().collect().await.unwrap().to_bytes(),
+        first
+    );
+    assert_eq!(
+        serde_json::to_value(jobs.recorded_events()).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn fresh_selection_without_an_actor_owner_refuses_without_writing() {
+    let (app, jobs) = app_with_agents(None);
+    let job_id = post_car(&app, "unowned-selector", "standard", "2026-10-04", false).await;
+    let step_id = first_step_id(&app, &job_id).await;
+    let step_id: boss_core::job::StepId =
+        serde_json::from_value(serde_json::json!(step_id)).unwrap();
+    let before = jobs.get_step(&step_id).await.unwrap().unwrap();
+    let before_events = serde_json::to_value(jobs.recorded_events()).unwrap();
+    let request_id = uuid::Uuid::new_v4();
+    let response = app
+        .oneshot(
+            Request::post("/api/stations/test-dock/claim-next")
+                .header("content-type", "application/json")
+                .header("x-boss-user", user_header("emp-ceo", "ceo"))
+                .body(Body::from(
+                    serde_json::json!({"request_id": request_id}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "no native actor owner can fence this fresh selection: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(jobs.get_step(&step_id).await.unwrap().unwrap(), before);
+    assert_eq!(
+        serde_json::to_value(jobs.recorded_events()).unwrap(),
+        before_events
+    );
+    assert!(
+        jobs.station_claim_receipt(request_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Both the copied allow and its revocation come from the real policy
+/// repository/evaluator; this wrapper controls only their interleaving.
+struct RevokeAfterPolicyRead {
+    repo: Arc<boss_policy_client::InMemoryPolicy>,
+    engine: boss_policy_client::PolicyEngine<boss_policy_client::InMemoryPolicy>,
+    revoke_rule: String,
+    revoked: std::sync::atomic::AtomicBool,
+}
+
+#[tokio::test]
+async fn an_agent_owner_failure_cannot_escape_as_a_durable_selection_effect() {
+    let registry = Arc::new(RevokeAfterAgentRead {
+        inner: boss_jobs::agents::InMemoryAgents::new(),
+        replacement: boss_jobs::agents::AgentInput {
+            id: "agent-unused".into(),
+            display_name: "Unused".into(),
+            default_model: "gpt-6.1-sol".into(),
+            role: None,
+            department: None,
+            hourly_budget_usd_micros: None,
+            max_concurrent_runs: None,
+            aliases: vec![],
+        },
+        revoked: std::sync::atomic::AtomicBool::new(true),
+        fail_after_consume: true,
+    });
+    let (app, jobs) = app_with_agents(Some(registry));
+    let job_id = post_car(
+        &app,
+        "failed-owner-selector",
+        "standard",
+        "2026-10-04",
+        false,
+    )
+    .await;
+    let step_id = first_step_id(&app, &job_id).await;
+    let step_id: boss_core::job::StepId =
+        serde_json::from_value(serde_json::json!(step_id)).unwrap();
+    let before = jobs.get_step(&step_id).await.unwrap().unwrap();
+    let before_events = serde_json::to_value(jobs.recorded_events()).unwrap();
+    let request_id = uuid::Uuid::new_v4();
+    let response = app
+        .oneshot(
+            Request::post("/api/stations/test-dock/claim-next")
+                .header("content-type", "application/json")
+                .header("x-boss-user", user_header("emp-ceo", "ceo"))
+                .body(Body::from(
+                    serde_json::json!({"request_id": request_id}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        jobs.get_step(&step_id).await.unwrap().unwrap(),
+        before,
+        "an owner error must precede every durable effect"
+    );
+    assert_eq!(
+        serde_json::to_value(jobs.recorded_events()).unwrap(),
+        before_events
+    );
+    assert!(
+        jobs.station_claim_receipt(request_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[async_trait::async_trait]
+impl PolicyClient for RevokeAfterPolicyRead {
+    fn lock_selection_rows(
+        &self,
+    ) -> Result<
+        Box<dyn boss_policy_client::port::PolicySelectionRows + '_>,
+        boss_policy_client::port::PolicyError,
+    > {
+        use boss_policy_client::PolicyRepository;
+        self.repo.lock_selection_rows()
+    }
+
+    async fn check(
+        &self,
+        user: &User,
+        action: Action,
+        resource: Resource,
+    ) -> Result<boss_policy_client::Decision, boss_policy_client::PolicyClientError> {
+        use boss_policy_client::PolicyRepository;
+        let copied = self
+            .engine
+            .check(user, action, resource.clone())
+            .await
+            .map_err(|e| boss_policy_client::PolicyClientError::Transport(e.to_string()))?;
+        if action == Action::Update
+            && resource == Resource::step()
+            && !self.revoked.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.repo
+                .deactivate_rule(&self.revoke_rule, "native-policy-writer")
+                .await
+                .map_err(|e| boss_policy_client::PolicyClientError::Transport(e.to_string()))?;
+        }
+        Ok(copied)
+    }
+    async fn scope_predicate(
+        &self,
+        user: &User,
+        resource: Resource,
+    ) -> Result<boss_policy_client::Predicate, boss_policy_client::PolicyClientError> {
+        self.engine
+            .scope_predicate(user, resource)
+            .await
+            .map_err(|e| boss_policy_client::PolicyClientError::Transport(e.to_string()))
+    }
+}
+
+#[tokio::test]
+async fn an_update_grant_revoked_after_preflight_cannot_leave_a_selection_claim_or_receipt() {
+    use boss_policy_client::PolicyRepository;
+    let update =
+        boss_policy_client::PolicyRule::new("ceo", Resource::step(), Action::Update, Scope::All);
+    let repo = Arc::new(boss_policy_client::InMemoryPolicy::with_rules([
+        boss_policy_client::PolicyRule::new("ceo", Resource::job(), Action::Create, Scope::All),
+        boss_policy_client::PolicyRule::new("ceo", Resource::job(), Action::Read, Scope::All),
+        update.clone(),
+    ]));
+    let policy = Arc::new(RevokeAfterPolicyRead {
+        engine: boss_policy_client::PolicyEngine::new(repo.clone()),
+        repo: repo.clone(),
+        revoke_rule: update.id.clone(),
+        revoked: std::sync::atomic::AtomicBool::new(false),
+    });
+    let agents = Arc::new(boss_jobs::agents::InMemoryAgents::new());
+    let (app, jobs) = app_with_policy_and_agents(car_kind(), Some(agents), Some(policy));
+    let job_id = post_car(
+        &app,
+        "revoked-policy-selector",
+        "standard",
+        "2026-10-04",
+        false,
+    )
+    .await;
+    let step_id = first_step_id(&app, &job_id).await;
+    let step_id: boss_core::job::StepId =
+        serde_json::from_value(serde_json::json!(step_id)).unwrap();
+    let before = jobs.get_step(&step_id).await.unwrap().unwrap();
+    let before_events = serde_json::to_value(jobs.recorded_events()).unwrap();
+    let request_id = uuid::Uuid::new_v4();
+    let response = app
+        .oneshot(
+            Request::post("/api/stations/test-dock/claim-next")
+                .header("content-type", "application/json")
+                .header("x-boss-user", user_header("emp-ceo", "ceo"))
+                .body(Body::from(
+                    serde_json::json!({"request_id": request_id}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(!repo.rule_for(&update.id).await.unwrap().unwrap().active);
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the native writer revoked the actual grant before commit: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(jobs.get_step(&step_id).await.unwrap().unwrap(), before);
+    assert_eq!(
+        serde_json::to_value(jobs.recorded_events()).unwrap(),
+        before_events
+    );
+    assert!(
+        jobs.station_claim_receipt(request_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_read_grant_revoked_after_selection_read_cannot_leave_a_selection_claim_or_receipt() {
+    use boss_policy_client::PolicyRepository;
+    let update =
+        boss_policy_client::PolicyRule::new("ceo", Resource::step(), Action::Update, Scope::All);
+    let read =
+        boss_policy_client::PolicyRule::new("ceo", Resource::job(), Action::Read, Scope::All);
+    let repo = Arc::new(boss_policy_client::InMemoryPolicy::with_rules([
+        boss_policy_client::PolicyRule::new("ceo", Resource::job(), Action::Create, Scope::All),
+        read.clone(),
+        update.clone(),
+    ]));
+    let policy = Arc::new(RevokeAfterPolicyRead {
+        engine: boss_policy_client::PolicyEngine::new(repo.clone()),
+        repo: repo.clone(),
+        revoke_rule: read.id.clone(),
+        revoked: std::sync::atomic::AtomicBool::new(false),
+    });
+    let agents = Arc::new(boss_jobs::agents::InMemoryAgents::new());
+    let (app, jobs) = app_with_policy_and_agents(car_kind(), Some(agents), Some(policy));
+    let job_id = post_car(
+        &app,
+        "revoked-policy-selector",
+        "standard",
+        "2026-10-04",
+        false,
+    )
+    .await;
+    let step_id = first_step_id(&app, &job_id).await;
+    let step_id: boss_core::job::StepId =
+        serde_json::from_value(serde_json::json!(step_id)).unwrap();
+    let before = jobs.get_step(&step_id).await.unwrap().unwrap();
+    let before_events = serde_json::to_value(jobs.recorded_events()).unwrap();
+    let request_id = uuid::Uuid::new_v4();
+    let response = app
+        .oneshot(
+            Request::post("/api/stations/test-dock/claim-next")
+                .header("content-type", "application/json")
+                .header("x-boss-user", user_header("emp-ceo", "ceo"))
+                .body(Body::from(
+                    serde_json::json!({"request_id": request_id}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(!repo.rule_for(&read.id).await.unwrap().unwrap().active);
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the native writer revoked the actual grant before commit: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(jobs.get_step(&step_id).await.unwrap().unwrap(), before);
+    assert_eq!(
+        serde_json::to_value(jobs.recorded_events()).unwrap(),
+        before_events
+    );
+    assert!(
+        jobs.station_claim_receipt(request_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

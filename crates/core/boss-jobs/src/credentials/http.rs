@@ -78,7 +78,8 @@ pub struct CredentialsApiState {
 
 impl CredentialsApiState {
     /// The registry's doors with the broker-stage door off — what every
-    /// deployment runs until an activation configures one.
+    /// deployment without the five variables runs (boss.yaml sets them
+    /// since backlog 25fff647).
     pub fn new(registry: Arc<dyn CredentialsRegistry>) -> Self {
         Self {
             registry,
@@ -393,7 +394,7 @@ async fn record_rotation_phase(
     // The broker-stage door (design 6e28ed42): a RUNNER credential's
     // stage is believed from a verified workload token and bound to its
     // own open rotation packet, or refused by name. Off and with nothing
-    // presented — every deployment today — this judges nothing; every
+    // presented — an unconfigured deployment — this judges nothing; every
     // other credential's phases never reach it (5840's legacy behaviour).
     // A row the registry does not hold falls through to the 404 below.
     let verified_stage = match stage_judgement(&state, &id, presented.as_ref(), &payload).await {

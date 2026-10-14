@@ -37,7 +37,7 @@
 import type { Remote } from '../../data/remote';
 import { ageDays } from '../receiving/receiving';
 import type { AssignmentRow } from '../../me/assignments';
-import { regionHref, type MachineAt, type Regions } from './regions';
+import { regionHref, type Dispatch, type MachineAt, type Regions, type StepRun } from './regions';
 
 export type Figure =
   | Readonly<{ kind: 'value'; text: string; troubled: boolean }>
@@ -94,6 +94,45 @@ export type OutrankLine = Readonly<{
   where: string | null;
 }>;
 
+/** The step a packet stands at, and whether anyone is on it (backlog
+ *  8e9d3723): a claim whose run is gone, or was never launched, used to
+ *  read exactly like one a builder was on that minute. The words are
+ *  `boss orient`'s, so the page and the terminal say the same thing. */
+function atText(step: string, run: StepRun | null, dispatch: Dispatch | null): string {
+  if (run === null) return dispatchText(step, dispatch);
+  switch (run.state) {
+    case 'building':
+      return `${step} · run ${run.run.slice(0, 8)}`;
+    case 'starting':
+      return `${step} · run ${run.run.slice(0, 8)} starting: briefed ${
+        run.age_minutes === null ? '?' : run.age_minutes <= 0 ? 'just now' : `${ageText(run.age_minutes)} ago`
+      }, ${run.expect_minutes === null ? '?' : ageText(run.expect_minutes)} allowed`;
+    case 'never-started':
+      return `${step} · STALLED: run ${run.run.slice(0, 8)} briefed ${
+        run.age_minutes === null ? '?' : ageText(run.age_minutes)
+      } ago, never started`;
+    case 'no-run':
+      return `${step} · STALLED: claimed, no open run`;
+    case 'unread':
+      return `${step} · run unread`;
+  }
+}
+
+/** A ready step nothing can dispatch (backlog e2519eca): no agent block,
+ *  and no person holds it, so it used to read exactly like a step a
+ *  dispatch would pick up. Names the row to fix, in `boss orient`'s words. */
+function dispatchText(step: string, dispatch: Dispatch | null): string {
+  if (dispatch === null) return step;
+  switch (dispatch.state) {
+    case 'undispatchable':
+      return `${step} · UNDISPATCHABLE: ${dispatch.kind} v${
+        dispatch.version === null ? '?' : dispatch.version
+      } declares no agent block on ${step} and no person holds it`;
+    case 'unread':
+      return `${step} · dispatch unread`;
+  }
+}
+
 export function outranksBoard(read: Remote<Regions>): Board<OutrankLine> {
   const why = notRead(read);
   if (why !== null || read.kind !== 'ready') return { kind: 'unread', why: why ?? 'not read yet' };
@@ -111,7 +150,7 @@ export function outranksBoard(read: Remote<Regions>): Board<OutrankLine> {
     protocol: o.kind,
     title: o.title,
     age: o.age_minutes === null ? '?' : ageText(o.age_minutes),
-    at: o.at === null ? 'between steps' : (o.at.slug ?? o.at.title),
+    at: o.at === null ? 'between steps' : atText(o.at.slug ?? o.at.title, o.at.run, o.at.dispatch),
     where: o.stations === null ? null : o.stations.join(', '),
   }));
   // Anything here outranks the queue, so its count wears the troubled plate.

@@ -149,7 +149,7 @@ impl ItemAnswer {
         let mut all = Vec::new();
         for kind in ["backlog-item", "user-feedback"] {
             all.extend(crate::train::rows(
-                crate::gate::api(
+                crate::sor_client::api(
                     http,
                     reqwest::Method::GET,
                     &format!("/api/jobs?kind={kind}&limit=200"),
@@ -360,7 +360,7 @@ pub(crate) async fn open(
     // answer costs a line of output rather than a half-filled packet. The
     // refusal is the GATE'S OWN (see `ItemAnswer::check`).
     item.check(summary, excludes)?;
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
 
     // The actor FIRST, before anything is created: a write nobody names
     // is refused, and the refusal names both fixes (backlog 5083d6f5).
@@ -379,7 +379,7 @@ pub(crate) async fn open(
     // because the car sat past page one — that false negative is what
     // filed three twins (a-limit-is-not-a-filter; 832 ship-a-change
     // packets existed on 2026-09-09).
-    let cars = crate::gate::all_open_cars(&http).await?;
+    let cars = crate::sor_client::all_open_cars(&http).await?;
     match open_action(&cars, branch) {
         OpenAction::Refuse(why) => bail!("boss car: REFUSED — {why}"),
         OpenAction::Already(existing) => {
@@ -425,8 +425,8 @@ pub(crate) async fn open(
         return Ok(());
     }
 
-    let owner = crate::owner::for_filing_at(&crate::gate::resolve_jobs_base(None)?).await;
-    let created = crate::gate::api(
+    let owner = crate::owner::for_filing_at(&crate::sor_client::resolve_jobs_base(None)?).await;
+    let created = crate::sor_client::api(
         &http,
         reqwest::Method::POST,
         "/api/jobs",
@@ -445,7 +445,7 @@ pub(crate) async fn open(
     // A 201 IS A CLAIM; THE READ-BACK IS THE FACT — and the read is
     // needed anyway, because the step ids only exist once the packet
     // does (`boss job file` encodes the same rule).
-    let car_json = crate::gate::api(
+    let car_json = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         &format!("/api/jobs/{id}"),
@@ -460,14 +460,14 @@ pub(crate) async fn open(
     // PUT carrying metadata replaces the step's stored keys wholesale
     // (backlog e39a9d2a; `car::StepWrite` says why the order matters).
     for w in car::open_writes(&car_json, summary, excludes, now).map_err(anyhow::Error::msg)? {
-        crate::gate::api(
+        crate::sor_client::api(
             &http,
             reqwest::Method::PATCH,
             &w.merge_path(&id),
             Some(w.metadata.clone()),
         )
         .await?;
-        crate::gate::api(
+        crate::sor_client::api(
             &http,
             reqwest::Method::PUT,
             &w.status_path(&id),
@@ -482,7 +482,7 @@ pub(crate) async fn open(
     // refusal naming the other one instead of a second car.
     let build_id = car::step_id_for(&car_json, BUILD_SLUG, BUILD)
         .ok_or_else(|| anyhow::anyhow!("car {id} has no `{BUILD_SLUG}` step to claim"))?;
-    let claimed = crate::gate::api(
+    let claimed = crate::sor_client::api(
         &http,
         reqwest::Method::POST,
         &format!("/api/jobs/{id}/steps/{build_id}/claim"),
@@ -502,7 +502,7 @@ pub(crate) async fn open(
     // CONFIRM BY READING IT BACK, not by the status codes above: a step
     // PUT carrying an unknown field is a silent 204 no-op, and a claim
     // that lost its race is a 409 we chose not to fail on.
-    let after = crate::gate::api(
+    let after = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         &format!("/api/jobs/{id}"),
@@ -565,7 +565,7 @@ pub(crate) async fn waits_on(
     if !clear {
         fields.update()?;
     }
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let (found, branch) = crate::rerail::find_car(&http, given).await?;
     let id = found
         .get("id")
@@ -577,7 +577,7 @@ pub(crate) async fn waits_on(
         println!("boss car waits-on: DRY — would PATCH /api/jobs/{id}/metadata with {body}");
         return Ok(());
     }
-    crate::gate::api(
+    crate::sor_client::api(
         &http,
         reqwest::Method::PATCH,
         &format!("/api/jobs/{id}/metadata"),

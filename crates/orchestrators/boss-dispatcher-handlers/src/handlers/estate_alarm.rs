@@ -1651,8 +1651,14 @@ mod tests {
     #[test]
     fn a_door_dark_past_its_band_is_hard_and_a_dimming_one_is_not() {
         let c = door_comparison(
-            &[door_entry("lan", "10.20.0.35:22")],
-            &[door_entry("public", "dev.algedonic.dev")],
+            &[door_entry(
+                "lan",
+                &format!("{}:22", boss_testing::test_values::test_net_1(35)),
+            )],
+            &[door_entry(
+                "public",
+                boss_testing::test_values::EXAMPLE_HOST,
+            )],
         );
         // One key per HALF: which half is down is the finding.
         assert_eq!(
@@ -1666,7 +1672,13 @@ mod tests {
         // The band already integrated the darkness over time, the way
         // STALE_MULTIPLIER does for silence: waiting PERSIST_N more
         // comparisons would make the declared band a lie by ten minutes.
-        let c = door_comparison(&[door_entry("lan", "10.20.0.35:22")], &[]);
+        let c = door_comparison(
+            &[door_entry(
+                "lan",
+                &format!("{}:22", boss_testing::test_values::test_net_1(35)),
+            )],
+            &[],
+        );
         let banded: Vec<String> = banded_findings(&c).into_iter().map(|(k, _)| k).collect();
         assert_eq!(banded, vec!["door_dark:dev-ssh/lan".to_string()]);
         // Every other hard finding still waits for its persistence.
@@ -1675,12 +1687,18 @@ mod tests {
 
     #[test]
     fn the_door_alarm_names_the_half_its_target_and_its_band() {
-        let entry = door_entry("lan", "10.20.0.35:22");
+        let entry = door_entry(
+            "lan",
+            &format!("{}:22", boss_testing::test_values::test_net_1(35)),
+        );
         let b = door_body("door_dark:dev-ssh/lan", &entry, "evt", "emp-owner");
         let title = b["title"].as_str().unwrap();
         assert!(title.contains("door_dark:dev-ssh/lan"), "{title}");
         assert!(title.contains("lan half"), "{title}");
-        assert!(title.contains("10.20.0.35:22"), "{title}");
+        assert!(
+            title.contains(&format!("{}:22", boss_testing::test_values::test_net_1(35))),
+            "{title}"
+        );
         assert!(title.contains("15-minute band"), "{title}");
         assert!(
             !title.contains("consecutive"),
@@ -2438,7 +2456,7 @@ mod no_data_array_tests {
             "scope": "door",
             "findings": {
                 "door_dark": [{"id": "dev-ssh/lan", "door": "dev-ssh", "half": "lan",
-                               "target": "10.20.0.35:22", "reason": "connection refused",
+                               "target": format!("{}:22", boss_testing::test_values::test_net_1(35)), "reason": "connection refused",
                                "dark_since": "2026-09-24T11:40:00Z",
                                "dark_for_s": 1200, "band_s": 900}],
                 "door_dimming": [],

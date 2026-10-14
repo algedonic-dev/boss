@@ -21,6 +21,12 @@ machine:
   # does not exist and nothing in the cluster may create one (baseline
   # pod security refuses hostPath), so the node's own config makes it.
   # Talos creates the parents at boot.
+  # That PV is RETIRED (backlog 1f13b894, 2026-10-10; the order is in
+  # gate-seed-local.yaml). The directory and its kubelet bind stay: the
+  # daily trim pod (CronJob boss-node-trim) mounts it as its handle
+  # on EPHEMERAL. The file's content below still names the PV because it
+  # is LIVE text — editing it here would read DRIFT against a node that
+  # node-converge cannot yet patch (backlog 9cf1673d).
   files:
     - content: |
         local PV gate-seed-w-1 (infra/cluster/manifests/gate-seed-local.yaml) mounts this directory

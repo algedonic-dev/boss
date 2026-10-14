@@ -598,11 +598,6 @@ which one matters first.
       Compounds with Integrated IAM above — once dept heads
       sign in with their real identity, the modeling UX they
       reach is what the platform is for.
-      - **used-device-shop `workflow-approver` parity.** Core defaults
-        grant `step-signoff:workflow-approver` to `platform-admin` and the
-        brewery grants it to its leaders; the used-device-shop tenant has
-        no grant, so if it ever drives `workflow-design` Jobs its leaders
-        can't approve. Add the grant when that tenant authors Workflows.
 
 - [ ] **Information theory on audit_log — triage, anomaly
       detection, error handling.** The audit_log is a stream

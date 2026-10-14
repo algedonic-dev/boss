@@ -48,8 +48,7 @@
 //   3  84d97547  FIXED   — the Status column printed the constant `open`
 //                          and is gone; the Answers column already
 //                          reads the review step it would have shown
-//   4  b56aa2c7  open    — the lede claims priority order, and priority
-//                          is not shown
+//   4  b56aa2c7  FIXED   — the station's priority is visible beside age
 //   5  08372fdb  FIXED   — WORKING: decided designs at fold
 //   6  08372fdb  FIXED   — OUT: settled in the station's 7-day window
 //   7  c3e4edcc  FIXED   — the failure line wears `.load-failed` (the
@@ -129,7 +128,7 @@ const LENS = {
   with_steps: true,
 };
 
-/// Three rows in the STATION's order: priority, then age. The high one
+/// Three rows in the STATION's order: priority, then age. The urgent one
 /// is first although it is not the oldest, and the oldest standard one
 /// comes before the newest. Neither sort by date gives this order, so
 /// if the page re-sorted, the order test would see it.
@@ -142,7 +141,7 @@ const queue = () => ({
   lens: LENS,
   total: 3,
   data: [
-    packet(HIGH, 'Admit every packet through one edge', { priority: 'high', opened_on: ago(2) }),
+    packet(HIGH, 'Admit every packet through one edge', { priority: 'urgent', opened_on: ago(2) }),
     packet(BARE, 'A design whose steps the envelope did not carry', { opened_on: ago(9) }),
     packet(FRESH, 'An untouched design', { opened_on: ago(1) }),
   ],
@@ -275,19 +274,19 @@ test.describe('/it/design — the route and the words it says', () => {
     await expect(page.locator('.design-lede')).toHaveText(
       'In the station\'s order: priority, then age. The first row is the one it would hand out next.',
     );
-    await expect(queueTable(page).locator('thead th')).toHaveText(['Packet', 'Answers', 'Opened', 'Review']);
+    await expect(queueTable(page).locator('thead th')).toHaveText(['Packet', 'Priority', 'Answers', 'Opened', 'Review']);
     const rows = queueTable(page).locator('tbody tr');
     await expect(rows).toHaveCount(3);
     await expect(rows.nth(0).locator('td')).toHaveText([
-      'Admit every packet through one edge', 'saved · 2 of 3 answered', '2d ago', 'Review',
+      'Admit every packet through one edge', 'urgent', 'saved · 2 of 3 answered', '2d ago', 'Review',
     ]);
     // No steps on the wire for this packet: its progress is unread, and
     // "—" says so. It never reads as "not started".
     await expect(rows.nth(1).locator('td')).toHaveText([
-      'A design whose steps the envelope did not carry', '—', '9d ago', 'Review',
+      'A design whose steps the envelope did not carry', 'standard', '—', '9d ago', 'Review',
     ]);
     await expect(rows.nth(2).locator('td')).toHaveText([
-      'An untouched design', 'not started · 2 questions', '1d ago', 'Review',
+      'An untouched design', 'standard', 'not started · 2 questions', '1d ago', 'Review',
     ]);
   });
 
@@ -313,14 +312,33 @@ test.describe('/it/design — the route and the words it says', () => {
     await expect(queueTable(page).locator('tbody td').filter({ hasText: /^\s*open\s*$/ })).toHaveCount(0);
   });
 
-  test('CURRENT, gap 4 (b56aa2c7): the lede claims priority order, and no row shows a priority', async ({ page }) => {
+  test('gap 4 (b56aa2c7): priority is visible and the station order and ages are preserved', async ({ page }) => {
     await install(page);
     await mountPage(page, PATH, TITLE);
     await expect(page.locator('.design-lede')).toContainText('priority, then age');
-    await expect(queueTable(page).locator('thead th')).not.toContainText(['Priority']);
-    // The first row is first BECAUSE it is high priority, and the page
-    // never says so.
-    await expect(queueTable(page)).not.toContainText(/\bhigh\b/i);
+    await expect(queueTable(page).getByRole('columnheader', { name: 'Priority', exact: true })).toBeVisible();
+    const rows = queueTable(page).locator('tbody tr');
+    await expect(rows.locator('td:nth-child(1)')).toHaveText([
+      'Admit every packet through one edge', 'A design whose steps the envelope did not carry', 'An untouched design',
+    ]);
+    await expect(rows.locator('td:nth-child(2)')).toHaveText(['urgent', 'standard', 'standard']);
+    await expect(rows.locator('td.design-when')).toHaveText(['2d ago', '9d ago', '1d ago']);
+  });
+
+  test('native priorities remain verbatim and missing or malformed evidence never becomes standard', async ({ page }) => {
+    // boss-core::job::Priority serializes these native variants in kebab case.
+    // The lens displays the received value, never maintains its own rank table.
+    const priorities: unknown[] = ['emergency', 'urgent', 'standard', 'scheduled', undefined, null, '', 42];
+    const body = { ...queue(), total: priorities.length, steps: {}, data: priorities.map((priority, i) =>
+      packet(`priority-${i}`, `Priority witness ${i}`, { priority, opened_on: ago(i + 1) })) };
+    await install(page, { queue: (r) => json(r, body) });
+    await mountPage(page, PATH, TITLE);
+    const rows = queueTable(page).locator('tbody tr');
+    await expect(rows.locator('td:nth-child(1)')).toHaveText(priorities.map((_, i) => `Priority witness ${i}`));
+    await expect(rows.locator('td:nth-child(2)')).toHaveText([
+      'emergency', 'urgent', 'standard', 'scheduled', 'Unknown', 'Unknown', 'Unknown', 'Unknown',
+    ]);
+    await expect(rows.locator('td.design-when')).toHaveText(priorities.map((_, i) => `${i + 1}d ago`));
   });
 
   test('WORKING and OUT (gaps 5 and 6, 08372fdb) are FIXED — their columns and every fold label, verbatim', async ({ page }) => {

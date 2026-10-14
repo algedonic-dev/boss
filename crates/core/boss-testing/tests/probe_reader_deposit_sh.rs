@@ -24,7 +24,7 @@
 //! that can be run is the one on the directory: a parent anyone else can
 //! write is refused before a byte is written.
 
-use boss_testing::{create_dir, repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{create_dir, repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -284,6 +284,7 @@ impl Case {
             std::env::var("PATH").unwrap_or_default()
         );
         let mut c = Command::new("bash");
+        without_proxy(&mut c);
         c.arg(repo_root().join(SCRIPT))
             .args(["--rule", &repo_root().join(RULE).display().to_string()])
             .args([
@@ -923,7 +924,7 @@ fn the_create_refuses_a_name_that_is_already_there() {
     );
     let root = scratch_dir("probe-reader-deposit-create");
     let run = |tmp: &Path| -> bool {
-        Command::new("bash")
+        without_proxy(&mut Command::new("bash"))
             .args(["-c", &format!("set -euo pipefail\n{create}\n")])
             .env("V", LIVE)
             .env("TMP", tmp)

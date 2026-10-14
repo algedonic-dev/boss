@@ -60,16 +60,12 @@ RuntimeDirectoryMode=0700
 # (backlog fb444bbb). This line used to point it at /home/david/kc.yaml,
 # a second copy nothing checked.
 #
-# THE ONE PATH UNDER A HOME, AND IT IS READ AS DATA, NEVER RUN. The stamp
-# is written by the cluster converge (cluster-deploy-runner.service),
-# which still runs as david until its build moves off his rootless
-# docker daemon; the watchdog reads it to know which build to roll to.
-# So root reads a file another account writes: cluster-watchdog.sh takes
-# it only when it is exactly a build name (seven hex) and never prints
-# what it found otherwise, so a name planted there to be read through
-# reaches neither the patch nor the journal. It names a tag of the image
-# repository that account already pushes, which is no new power.
-Environment=BOSS_FORGE_LAST_BUILT=/home/david/.boss-last-built
+# The stamp it rolls to is the cluster converge's, read at
+# forge-defaults.sh's STAMP_FILE: root's, under the converge's own state
+# directory, since the converge moved to root (backlog 683d7fe9). Until
+# then this line named a file in david's home, the one path under a home
+# a root unit was handed; cluster-watchdog.sh still takes the stamp only
+# when it is exactly a build name, which costs nothing.
 # EVERYTHING THIS UNIT KEEPS IS ROOT'S, UNDER ONE DIRECTORY systemd
 # makes before every start (so no tick can find it missing): the dark
 # count, the blind marker, and the three directories it replays from.
@@ -96,10 +92,12 @@ Environment=WATCHDOG_DARK_LIMIT=3
 # door, and a planted state file becomes a door's dark_since. Now that
 # this unit presents the machine token, a planted body would also ride a
 # credential; under a 0700 root directory nobody but root can make a
-# name. THE CLUSTER CONVERGE NO LONGER SHARES THE ALERT SPOOL: it runs as
-# david and keeps what it could not file in its own, and replays that
-# itself (cluster-deploy-lib.sh replay_kept_alerts) — root never replays
-# a file another account wrote. NOT CARRIED ACROSS: an alert or a reading
+# name. THE CLUSTER CONVERGE NO LONGER SHARES THE ALERT SPOOL: it keeps
+# what it could not file in its own and replays that itself
+# (cluster-deploy-lib.sh replay_kept_alerts) — in david's home while it
+# ran as david, under its own root-only state directory since backlog
+# 683d7fe9 — and no unit replays a file another unit wrote. NOT CARRIED
+# ACROSS: an alert or a reading
 # still waiting in the old home at the tick that moves this is not read
 # by root; a kept alert there is filed by the cluster converge's replay,
 # and a door dark at that tick restarts its dark-since. The journal has

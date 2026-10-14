@@ -25,8 +25,9 @@
 # or simply `sudo infra/forge/install.sh`, which now covers it.
 set -euo pipefail
 
-# SNAPSHOT-EXEC before touching git — the identical hazard
-# cluster-deploy-runner.sh documents at length: the git checkout below
+# SNAPSHOT-EXEC before touching git — the hazard cluster-deploy-runner.sh
+# documented at length while it ran from a checkout (it runs from root's
+# tree since backlog 683d7fe9): the git checkout below
 # rewrites THIS file's bytes while bash is still reading it by offset,
 # so it resumes mid-token in the new contents — a silent, unrepeatable
 # failure. exec into a copy first, so the bytes bash executes are
@@ -92,12 +93,21 @@ run_summary_reset
 # root, once: BOSS_FIRST_INSTALL_AS=forge
 # /usr/local/libexec/boss/forge-converge-launch. The line it prints, and
 # `host_check` on that run's packet, say it was overridden.
+#
+# AND A REFUSAL FILES AN ITEM (backlog 62b09c57, a follow-up recorded on
+# car ad35743a). It stands until a person acts, like the two reds the
+# judge already files from (A RED THAT STANDS, near the end), so it
+# leaves the same shape of line: `RED forge-converge/host-check refused:
+# <why>` as this run's `output`, written by host-check.sh at the refusal
+# because nothing after it runs.
+HOST_CHECK_RED_ROUTE="forge-converge/host-check"
 # shellcheck source=infra/lib/host-check.sh
 . "${BOSS_FORGE_CONVERGE_INFRA:-$(dirname "$0")/..}/lib/host-check.sh"
 host_seam BOSS_FORGE_REPO_DIR /home/david/boss
 host_seam BOSS_FORGE_TOKEN_FILE
 host_seam BOSS_MACHINE_TOKEN_DIR /etc/boss/machine-token
 host_seam BOSS_PROBE_READER_CREDENTIAL /etc/boss/probe-reader.credential
+host_seam BOSS_REGISTRY_PUSH_DIR /etc/boss/registry-push
 host_seam BOSS_GITHUB_DR_TOKEN_FILE /etc/boss-publish/github-dr.token
 host_seam BOSS_RUNNER_CREDENTIAL_FILE /etc/boss/ops-runner.credential
 host_seam BOSS_FORGE_STALE_HEADER_DIR /tmp
@@ -224,28 +234,66 @@ case "$probe_reader_rc" in
         ;;
 esac
 
+# THE REGISTRY PUSH TOKEN, ROOT-ONLY (design c8502e17, question
+# image-build, David 2026-10-07; backlog 683d7fe9, its first car). The
+# broker mints a write:package token into Secret
+# boss/forge-registry-push-token; registry-token-deposit.sh proves it by
+# a login the registry accepts, writes it as a docker config in
+# /etc/boss/registry-push (root:root, 0700 and 0600), and records
+# delivery on the rotation packet so the broker may revoke the old one.
+#
+# NOTHING BUILDS WITH IT YET. The deploy runner and the disk-floor sweep
+# still push as the operator's account with his own login; they move to
+# root, the system docker daemon and this directory in the item's second
+# car, which waits for `registry_token_effect` on this packet to read
+# `accepted`. Until the first rotation is scoped the Secret is empty and
+# this is a not-yet on the packet, never a red.
+#
+# HERE, BESIDE THE OTHER TWO ROOT-ONLY DEPOSITS, AND FOR THEIR REASONS:
+# before the fetch, so a broken forge token cannot stop the host taking a
+# rotated one; its exit RECORDED and never carried; its time bounded, so
+# a stalled read or a silent registry costs this bound and never a tick.
+# The three bounds together stay well inside the unit's TimeoutStartSec
+# (registry_token_deposit_sh.rs holds that sum).
+FORGE_REGISTRY_DEPOSIT_BOUND_S="${BOSS_FORGE_REGISTRY_DEPOSIT_BOUND_S:-180}"
+registry_token_rc=0
+timeout -k 5 "$FORGE_REGISTRY_DEPOSIT_BOUND_S" "$INFRA/forge/registry-token-deposit.sh" \
+    --rule "$INFRA/dispatcher/rules/broker-rotates-the-forge-registry-push-token.toml" \
+    --dest "${BOSS_REGISTRY_PUSH_DIR:-/etc/boss/registry-push}" || registry_token_rc=$?
+run_summary_field registry_token_deposit_status "$registry_token_rc"
+case "$registry_token_rc" in
+    124 | 137)
+        echo "forge-converge: the registry push token's deposit did not finish inside $FORGE_REGISTRY_DEPOSIT_BOUND_S seconds and was stopped; the converge goes on, and the next tick deposits again" >&2
+        run_summary_field registry_token_action "STOPPED: the deposit did not finish inside $FORGE_REGISTRY_DEPOSIT_BOUND_S seconds (a stalled cluster API, docker daemon, registry or jobs API); a file it had already renamed into place stands, and the next tick asks again"
+        run_summary_field registry_token_effect "UNVERIFIED: the deposit was stopped at its bound before it recorded what the registry said"
+        ;;
+esac
+
 # Fetch and check out forge main as the checkout's OWNER, never as root
 # — a root `git` in a david-owned clone leaves root-owned objects that
 # break the owner's later pulls. `-l` gives the owner's login env so the
 # credential helper that carries the forge token is found. Detached at
-# the sha (like cluster-deploy-runner) rather than a tracking branch, so
+# the sha rather than a tracking branch, so
 # the host holds no branch state of its own to diverge. --ff-only is
 # implicit in a detached checkout of the fetched sha: no merge is made.
 #
 # Through the checkout's ONE lock (checkout-lock.sh, sourced inside the
 # owner's shell so the lock file is the owner's): cluster-deploy-runner
-# fetches this same checkout on this same tick, and its merge-triggered
-# start lands a second after any merge. On 2026-09-07 22:01 this fetch
-# held `refs/remotes/forgejo/main` while the runner's fetch died on it
-# (backlog d66f92b2). The helper is read whole at source time, so the
-# checkout it then performs cannot rewrite the code running it.
+# fetched this same checkout on this same tick, its merge-triggered
+# start a second after any merge, until backlog 683d7fe9 moved it to
+# root's tree; on 2026-09-07 22:01 this fetch held
+# `refs/remotes/forgejo/main` while the runner's fetch died on it
+# (backlog d66f92b2). A hand-run git still takes the same lock. The
+# helper is read whole at source time, so the checkout it then performs
+# cannot rewrite the code running it.
 #
 # ITS EXIT IS CARRIED, NO LONGER FATAL (backlog a604a35b). Until root had
 # a tree of its own this checkout was what the rest of the run executed,
 # so a fetch that failed had to end the run. It no longer is: the units
 # and install.sh come from root's tree below, and the checkout is kept
-# current only for what still reads it — the ops runner's verbs and the
-# cluster converge, until each moves. A broken checkout or a revoked
+# current only for what still reads it — the ops runner's verbs, until
+# they move (the cluster converge left in backlog 683d7fe9). A broken
+# checkout or a revoked
 # checkout token reds this run and stops nothing.
 checkout_rc=0
 runuser -l "$OWNER" -c "cd '$REPO' && . infra/forge/checkout-lock.sh && checkout_git '$REPO' fetch -q forgejo main && checkout_git '$REPO' checkout -qf \"\$(git rev-parse forgejo/main)\"" || checkout_rc=$?
@@ -333,6 +381,14 @@ run_summary_field converge_sha "$BOSS_CONVERGE_SHA"
 NODE_ID="${BOSS_NODE_ID:-forge}"
 . "${BOSS_FORGE_CONVERGE_INFRA:-$(dirname "$0")/..}/estate/node-roles.sh"
 BOSS_CONVERGE_NAME="forge-converge" read_node_roles "$NODE_ID"
+# The roles read is this script's only request through the token's
+# reader, and the reader's cleanup rides the EXIT trap — which the forge
+# header below REPLACES (`trap … EXIT`, further down). So the header
+# directory is closed here, now, rather than left to a trap that will not
+# run it (backlog df38075a, F6 of review a92c0b94: safe until then only
+# because that branch runs under RUNTIME_DIRECTORY, which systemd
+# removes). Defined only when node-roles.sh found the reader.
+if declare -F secret_header_close >/dev/null; then secret_header_close; fi
 run_summary_field node_id "$NODE_ID"
 run_summary_field node_roles "${BOSS_NODE_ROLES:-}"
 
@@ -355,10 +411,15 @@ install_rc=0
 # it stood for a tick, until the reinstalled checkout converge repointed
 # it. That installer cannot be changed; this script, still the car's on
 # the tick that fetches the revert, runs ITS OWN generation's runner
-# installer right after, naming the checkout — the same line the car's
-# install.sh passes. What remains is the seconds between the two
-# daemon-reloads. Its exit is carried: the runner is a door, and a door
-# pointed at an export is a red run.
+# installer right after, naming the checkout. What remains is the
+# seconds between the two daemon-reloads. Its exit is carried: the
+# runner is a door, and a door pointed at an export is a red run.
+#
+# THE CHECKOUT, NOT ROOT'S TREE, even though this car's own install.sh
+# points the runner at root's tree (stage 2 of design c98c79aa): a
+# pre-car generation's verbs are pre-car too, and know no
+# BOSS_OPS_CHECKOUT — run from the export they would look for git in it.
+# Rolled back, the host runs as it did before root had a tree.
 repoint_rc=0
 if [ -n "$TREE_NOW" ] && [ ! -e "$TREE_NOW/infra/forge/root-tree.sh" ]; then
     echo "forge-converge: the generation just installed from ($TREE_NOW) carries no root-tree.sh — a commit from before root's tree, so its installer pointed the ops runner at that export; pointing it back at $REPO"
@@ -413,8 +474,9 @@ fi
 # still runs: none of them touches this header, and install.sh is the step
 # that installs the unit carrying the directive. That is load-bearing, and
 # the first draft of this car got it wrong (adversarial review, 2026-09-28):
-# cluster-deploy-runner checks this same checkout out at the new sha about
-# a minute after every train merge, so the timer's next tick runs THIS
+# the new commit reaches this host minutes after every train merge (it was
+# cluster-deploy-runner's checkout of this same clone until backlog
+# 683d7fe9; it is root's tree now), so the timer's next tick runs THIS
 # script under the OLD unit, which has no directory. Refusing the whole
 # run there would never install the new unit and would refuse every tick
 # after — a wedge only a hand `sudo install.sh` clears. Refusing only the
@@ -441,6 +503,9 @@ else
 
     auth_hdr="$(mktemp -p "$rtdir" forge-auth.XXXXXX)"
     chmod 600 "$auth_hdr"
+    # REPLACES the EXIT trap, the reader's chained cleanup with it: the
+    # roles read above closed its own header directory first, and nothing
+    # after this line asks the reader for another.
     trap 'rm -f "$BOSS_CONVERGE_SNAPSHOT" "$auth_hdr"' EXIT
     # The token file is the OWNER's to write and this script runs as root,
     # so root never reads it (review A1 of the re-review of 5ef6db0b,
@@ -488,6 +553,44 @@ runner_rc=0
     --rule "$INFRA/dispatcher/rules/broker-rotates-the-forge-ops-runner-credential.toml" \
     --dest "${BOSS_RUNNER_CREDENTIAL_FILE:-/etc/boss/ops-runner.credential}" || runner_rc=$?
 
+# BOSS-GCP'S OPS RUNNER CREDENTIAL (backlog 1e50e66b). The other ops runner
+# host reads no Secret, so the forge — the consumer the runner deposit key's
+# signed scope names — pushes it there: runner-credential-push.sh reads the
+# broker-prepared deposit key and boss-gcp's pinned host key with the admin
+# kubeconfig the deposit above already reads with, and runs
+# infra/gcp/runner-credential-send.sh, which delivers a staged
+# boss-gcp.next to the forced-command receiver, or — with nothing staged —
+# proves the enrolled key reaches that receiver and records the effect on
+# the key's verify step. It says which on this packet
+# (`runner_credential_boss_gcp`), and its exit is carried like the deposit's.
+# BOUNDED, as the machine token's deposit is: a far side that never answers
+# is stopped (124, in runner_credential_boss_gcp_status) and the tick's
+# exit carries it. The sender's own bounds — 30 s for the greeting inside
+# 60 s for the transfer — plus three kubectl reads and two jobs-API calls
+# sit inside this one. With the three root-only deposits above (180 + 90 +
+# 180) and each `timeout -k 5`, the four bounded steps take at most 590 s
+# of the unit's TimeoutStartSec=10min — so bounded stalls alone never
+# kill a tick; it was 620 s at 150 here (review f15070d2, N2). That is NOT
+# the whole tick: the forge's own runner deposit, the fetch and install.sh
+# are unbounded here, and stalls in several at once still meet the unit's
+# timeout, which is the backstop. runner_credential_send_sh.rs holds the
+# sum.
+FORGE_RUNNER_PUSH_BOUND_S="${BOSS_FORGE_RUNNER_PUSH_BOUND_S:-120}"
+# Both independent credentials share this existing wall-clock bound.
+# Disable child summary writes: run-summary's file merge is not concurrent.
+root_tree_push_log="$(mktemp -t boss-forge-root-tree-push.XXXXXX)"
+BOSS_RUN_SUMMARY_FILE='' timeout -k 5 "$FORGE_RUNNER_PUSH_BOUND_S" \
+    bash "$INFRA/forge/root-tree-token-push.sh" > "$root_tree_push_log" 2>&1 &
+ROOT_TREE_PUSH_PID=$!
+gcp_runner_rc=0
+timeout -k 5 "$FORGE_RUNNER_PUSH_BOUND_S" "$INFRA/forge/runner-credential-push.sh" || gcp_runner_rc=$?
+run_summary_field runner_credential_boss_gcp_status "$gcp_runner_rc"
+root_tree_push_rc=0
+wait "$ROOT_TREE_PUSH_PID" || root_tree_push_rc=$?
+cat "$root_tree_push_log"
+rm -f "$root_tree_push_log"
+run_summary_field root_tree_token_boss_gcp_status "$root_tree_push_rc"
+
 # THE OFF-SITE COPY, pushed by us and not by Forgejo (backlog 21d54f4a,
 # decided 2026-09-26: no mirror can wipe what it mirrors). Forgejo's push
 # mirror is `git push -f --mirror` whatever its filter, and it was the
@@ -509,15 +612,72 @@ if [ "$offsite_rc" -eq 0 ]; then
     BOSS_FORGE_AUTH_HEADER_FILE="$auth_hdr" "$RUN_FROM/forge/offsite-push.sh" || offsite_rc=$?
 fi
 
+# A RED THAT STANDS UNTIL A PERSON ACTS, ON A LINE THE JUDGE READS (delta
+# review aa901496 of car 14142ab6, the ALARM note; backlog 62b09c57).
+# Every carried exit below reds this run, and a red run was the whole
+# alarm: a packet that closes `failed` every ten minutes ARRIVES on time,
+# so the silence sweep never sees it, and nothing opened. Three of the reds
+# below do not pass by themselves (a fourth, a refused host check, leaves
+# its line at the top, where the run ends):
+#   - root-tree.sh REFUSED — main rewound or was replaced, or the tree is
+#     not root's own. The tree stays where it was until a person reads
+#     both commits (OPERATIONS.md, failure mode 9).
+#   - install.sh HELD the units — a command a unit names is not there,
+#     so no unit file was replaced (`units_held`, which the installer of
+#     whichever generation ran put on this run's summary).
+#   - boss-gcp's runner credential push said RED (below).
+# Each becomes ONE line of `output` on this packet, `RED <route> <kind>:
+# <error>` — the shape maintenance.chore.file_reds already files one
+# backlog-item per route from, deduped while it is open
+# (infra/dispatcher/rules/file-backlog-items-on-forge-converge-red.toml).
+# The words are the scripts' own, copied. Nothing here changes an exit,
+# and a refresh that FAILED, a deposit, the fetch — reds that a later
+# tick may clear — print no line: they are read on this packet.
+reds=""
+case "$(printf '%s' "$tree_line" | tail -n 1)" in
+    *REFUSED:*)
+        reds="RED forge-converge/root-tree refused: $(printf '%s' "$tree_line" | tail -n 1 | cut -c1-600)" ;;
+esac
+# A summary that cannot be read is named as that (and prints no line:
+# the installer's own stderr and exit still red the run); it is never
+# taken for "no unit was held".
+units_held_now="" gcp_runner_line="" summary_unread=""
+if [ -n "${BOSS_RUN_SUMMARY_FILE:-}" ] && [ -s "$BOSS_RUN_SUMMARY_FILE" ]; then
+    units_held_now="$(jq -r '.units_held // empty' "$BOSS_RUN_SUMMARY_FILE" 2>/dev/null | tr '\n' ' ')" || summary_unread=1
+    gcp_runner_line="$(jq -r '(.runner_credential_boss_gcp // "") | split("\n")[0] // "" | .[0:600]' "$BOSS_RUN_SUMMARY_FILE" 2>/dev/null)" || summary_unread=1
+fi
+if [ -n "$summary_unread" ]; then
+    echo "forge-converge: this run's summary at $BOSS_RUN_SUMMARY_FILE could not be read for units_held or runner_credential_boss_gcp — no RED line is left for either this tick" >&2
+elif [ -n "$units_held_now" ]; then
+    reds="${reds:+$reds
+}RED forge-converge/units-held held: no unit file was replaced, a command a unit names is not an executable file or a tree file it hands one is not there —$units_held_now"
+fi
+# boss-gcp's runner credential push said RED (review f15070d2 of car
+# 2c628718, B1): a deposit key that reaches a shell, a signed key boss-gcp
+# refuses, a receiver its converge never replaced. Each stands until a
+# person acts, and it reached only `runner_credential_boss_gcp`, which the
+# judge does not read. The sender already prints it in the judge's shape,
+# on its own route (`RED runner-credential-send/<kind> refused: …`), so
+# its line is copied whole; a `not yet` is not one.
+case "$gcp_runner_line" in
+    "RED "*)
+        reds="${reds:+$reds
+}$gcp_runner_line" ;;
+esac
+[ -z "$reds" ] || run_summary_field output "$reds"
+
 # install.sh's verdict first (it is the older and wider one), then the
 # protection's, then the off-site push's, the DR render's, the runner
-# credential's, then the checkout deposit's: any reds this run and puts
+# credential's, boss-gcp's runner credential push's, then the checkout
+# deposit's: any reds this run and puts
 # the packet on `failed`.
 [ "$install_rc" -eq 0 ] || exit "$install_rc"
 [ "$protect_rc" -eq 0 ] || exit "$protect_rc"
 [ "$offsite_rc" -eq 0 ] || exit "$offsite_rc"
 [ "$render_rc" -eq 0 ] || exit "$render_rc"
 [ "$runner_rc" -eq 0 ] || exit "$runner_rc"
+[ "$gcp_runner_rc" -eq 0 ] || exit "$gcp_runner_rc"
+[ "$root_tree_push_rc" -eq 0 ] || exit "$root_tree_push_rc"
 [ "$repoint_rc" -eq 0 ] || exit "$repoint_rc"
 # Root's tree, then the owner's checkout: each already said why on this
 # packet (root_tree, checkout), and neither stopped anything above.

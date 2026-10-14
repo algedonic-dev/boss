@@ -46,6 +46,16 @@ car boards. Its rules are not the analyst's because the analyst's
 first rule is "the step is the deliverable": on this step the
 deliverable is the verdict, and completing the step is the train's.
 
+A FIFTH, FOR THE REVIEW OF A TENANT MERGE. `tenant-reviewer-rules.md`
+(backlog 84e7c3e4, design 9de0cd1c) serves ops-request's `review` step,
+ready only on a request whose verb declares `requires_review` — today
+`merge-tenant-main`. The BOSS `reviewer` cannot serve it: `boss review`
+resolves a ship-a-change car through the BOSS forge, and a tenant
+branch is neither. Its deliverable is the step itself — a verdict over
+the exact plan the host runner rendered there, the source run named —
+so it runs in the `step` lane, and the runner puts those bytes in front
+of David's passkey only once its run has landed.
+
 WHICH PROFILES NEED A DOCUMENT IS NOT A LIST HERE (CLAUDE.md 9a): the
 tests in `boss_cli::documents` read the profiles off the platform
 Workflow bundle's `agent` blocks and require a document for each, so a

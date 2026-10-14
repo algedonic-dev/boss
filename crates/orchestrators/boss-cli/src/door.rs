@@ -172,6 +172,7 @@ pub(crate) fn lines(latest: &Result<Option<Value>, String>, now: DateTime<Utc>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boss_testing::test_values::{EXAMPLE_HOST, test_net_1};
     use chrono::TimeZone;
     use serde_json::json;
 
@@ -186,12 +187,21 @@ mod tests {
                 "scope": "door",
                 "observed_at": "2026-09-24T12:00:00Z",
                 "doors": [{"id": "dev-ssh", "band_s": 900, "halves": [
-                    {"half": "lan", "target": "10.20.0.35:22"},
-                    {"half": "public", "target": "dev.algedonic.dev"},
+                    {"half": "lan", "target": format!("{}:22", test_net_1(35))},
+                    {"half": "public", "target": EXAMPLE_HOST},
                 ]}],
                 "findings": findings,
             }
         })
+    }
+
+    #[test]
+    fn synthetic_estate_door_targets_are_reserved_and_keep_the_observation() {
+        let comparison = row(json!({"door_dark": [], "door_dimming": []}));
+        let halves = &comparison["payload"]["doors"][0]["halves"];
+        assert_eq!(halves[0]["target"], format!("{}:22", test_net_1(35)));
+        assert_eq!(halves[1]["target"], EXAMPLE_HOST);
+        assert!(lines(&Ok(Some(comparison)), now())[0].ends_with("(observed 4m ago)"));
     }
 
     #[test]
@@ -202,9 +212,10 @@ mod tests {
         );
         assert_eq!(
             out,
-            vec![
-                "  DOOR — dev-ssh open: lan 10.20.0.35:22 open · public dev.algedonic.dev open  (observed 4m ago)"
-            ]
+            vec![format!(
+                "  DOOR — dev-ssh open: lan {}:22 open · public {EXAMPLE_HOST} open  (observed 4m ago)",
+                test_net_1(35)
+            )]
         );
     }
 
@@ -220,9 +231,10 @@ mod tests {
         );
         assert_eq!(
             out,
-            vec![
-                "  DOOR — dev-ssh DARK: lan 10.20.0.35:22 DARK 42m, past its 15m band (connection refused) · public dev.algedonic.dev open  (observed 4m ago)"
-            ]
+            vec![format!(
+                "  DOOR — dev-ssh DARK: lan {}:22 DARK 42m, past its 15m band (connection refused) · public {EXAMPLE_HOST} open  (observed 4m ago)",
+                test_net_1(35)
+            )]
         );
     }
 
@@ -238,9 +250,9 @@ mod tests {
         );
         assert!(out[0].starts_with("  DOOR — dev-ssh dimming: "), "{out:?}");
         assert!(
-            out[0].contains(
-                "public dev.algedonic.dev dark 6m, inside its 15m band (does not resolve)"
-            ),
+            out[0].contains(&format!(
+                "public {EXAMPLE_HOST} dark 6m, inside its 15m band (does not resolve)"
+            )),
             "{out:?}"
         );
     }

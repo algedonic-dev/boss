@@ -8,7 +8,7 @@ import { isPageWrite } from './_smokeMocks';
 // (gap 6), people-status-filter (gap 7), people-row-link (gap 8) and
 // people-class-labels (gap 10). None of them clicks the View buttons,
 // renders the Hierarchy, types a search, sorts a column, reads a
-// Tenure / Skills / Location cell or the certifications subtitle, or
+// registry Location cell or the roster subtitle, or
 // follows a link and comes back. This spec is the page's whole meaning
 // in one place; the six stay, as the regression pins of their fixes.
 //
@@ -16,22 +16,20 @@ import { isPageWrite } from './_smokeMocks';
 // origin/main on 2026-09-25): 2 View buttons, 1 Status button per
 // (employee, status) Class plus Unknown when a row has none plus All,
 // 1 Department button per department the Status selection admits plus
-// All, 8 sortable headers, 1 search input — no form; 1 link per
+// All, 6 sortable headers, 1 search input — no form; 1 link per
 // rendered employee (the ID cell in List, the name in Hierarchy) and
 // the row itself; ONE read, GET /api/people, and ZERO writes, so there
 // is no refused write to show, and the watch below pins that the page
 // sends none.
 //
-// Tenure is measured from the app clock and the certifications
-// subtitle from a 90-day window on it, so the clock is fixed at NOW.
+// Detail records use the app clock, so it is fixed at NOW.
 //
 // Lines that pin a FILED gap's current behaviour name the gap and its
 // item. They are meant to be edited by the car that fixes it, so the
 // fix shows up here as a changed expectation instead of a silently
 // passing one:
-//   gap 13 9a0e18d5  the certifications subtitle counts the whole
-//                    roster, terminated included, and links nowhere;
-//                    Location prints the raw location id
+//   gap 13 9a0e18d5  unsupported metrics removed; Location resolves
+//                    the recorded registry name (design 93789cf4)
 // Answered, and pinned as answered: gaps 3, 4, 6, 7, 8, 10 (above);
 // gap 5 (c71498fe, the Hierarchy is drawn from the filtered rows) and
 // gap 12 (6a123f1f, a role whose Class says counts_in_headcount: false
@@ -118,6 +116,15 @@ async function install(page: Page, roster: unknown): Promise<void> {
     const row = PEOPLE.find((e) => e.id === id);
     return row ? json(r, row) : json(r, 'not found', 404);
   });
+  const locations = [
+    { id: 'loc-hq', name: 'Headquarters' }, { id: 'loc-taproom', name: 'Taproom' },
+    { id: 'loc-remote-default', name: 'Remote' },
+  ];
+  await page.route(/\/api\/locations\/[^/?]+$/, (r) => {
+    const id = decodeURIComponent(new URL(r.request().url()).pathname.split('/').at(-1)!);
+    const location = locations.find((entry) => entry.id === id);
+    return location ? json(r, location) : json(r, 'not found', 404);
+  });
   await page.route(ROSTER, (r) =>
     typeof roster === 'function' ? (roster as (r: Route) => Promise<void>)(r) : json(r, roster));
 }
@@ -167,11 +174,12 @@ const ids = (page: Page) => page.locator('table.data-table tbody td.mono');
 async function expectHeader(page: Page, title: string, subtitle: string): Promise<void> {
   await expect(page.locator('.exec-eyebrow')).toHaveText('People');
   await expect(page.locator('h1.exec-title')).toHaveText(title);
-  await expect(page.locator('header.exec-header p')).toHaveText(subtitle);
+  if (subtitle) await expect(page.locator('header.exec-header p')).toHaveText(subtitle);
+  else await expect(page.locator('header.exec-header p')).toHaveCount(0);
 }
 
 const READ_TITLE = '3 active employees';
-const READ_SUBTITLE = '3 certifications expiring in 90 days';
+const READ_SUBTITLE = '';
 
 async function open(page: Page): Promise<void> {
   await install(page, PEOPLE);
@@ -183,8 +191,7 @@ test.describe('/ux/people — the roster, read', () => {
     const seen = watch(page);
     await open(page);
 
-    // Gap 13 (9a0e18d5): three certifications fall inside the window,
-    // and one of them is the TERMINATED employee's.
+    // Design 93789cf4 / backlog 9a0e18d5 removes unsupported summary quantities.
     await expectHeader(page, READ_TITLE, READ_SUBTITLE);
     await expect(filters(page).locator('.filter-label')).toHaveText(['View', 'Search', 'Status', 'Department']);
     await expect(searchbox(page)).toHaveAttribute('placeholder', 'Name, email, role…');
@@ -197,16 +204,14 @@ test.describe('/ux/people — the roster, read', () => {
     await expect(filters(page).locator('button[aria-pressed="true"]')).toHaveText(['List', 'Active (3)', 'All (3)']);
 
     await expect(headers(page)).toHaveText([
-      'BOSS ID', 'Name', 'Role', 'Department ↑', 'Tenure', 'Skills', 'Location', 'Status',
+      'BOSS ID', 'Name', 'Role', 'Department ↑', 'Location', 'Status',
     ]);
     await expect(headers(page).nth(3)).toHaveAttribute('aria-sort', 'ascending');
-    // Default order: department code, then name within it. Tenure is
-    // (NOW - hire_date) / 365 days, to one place. Gap 13 (9a0e18d5):
-    // Location is the raw location id.
+    // Default order stays department then name; location is the recorded registry name.
     expect(await table(page)).toEqual([
-      ['emp-001', 'Ada Brewer', 'CEO', 'Executive', '6.6y', '2', 'loc-hq', 'active'],
-      ['emp-003', 'Cy Tapp', 'Brewer', 'IT', '1.7y', '0', 'loc-hq', 'active'],
-      ['emp-002', 'Bo Cellar', 'Head of sales', 'Sales', '3.3y', '1', 'loc-taproom', 'active'],
+      ['emp-001', 'Ada Brewer', 'CEO', 'Executive', 'Headquarters', 'active'],
+      ['emp-003', 'Cy Tapp', 'Brewer', 'IT', 'Headquarters', 'active'],
+      ['emp-002', 'Bo Cellar', 'Head of sales', 'Sales', 'Taproom', 'active'],
     ]);
 
     // One read of the path: the page's. The shell's session used to read
@@ -228,7 +233,7 @@ test.describe('/ux/people — the roster, read', () => {
 
     await button(page, 'Status', 'Terminated (1)').click();
     await expect(ids(page)).toHaveText(['emp-005']);
-    expect((await table(page))[0]).toEqual(['emp-005', 'Ed Gone', 'Brewer', 'IT', '7.7y', '0', 'loc-remote-default', 'terminated']);
+    expect((await table(page))[0]).toEqual(['emp-005', 'Ed Gone', 'Brewer', 'IT', 'Remote', 'terminated']);
 
     await button(page, 'Status', 'All (5)').click();
     await expect(ids(page)).toHaveText(['emp-001', 'emp-003', 'emp-005', 'emp-002', 'emp-004']);
@@ -301,14 +306,11 @@ test.describe('/ux/people — the roster, read', () => {
     await button(page, 'Status', 'All (5)').click();
     const th = (name: string) => headers(page).filter({ hasText: new RegExp(`^\\s*${name}`) });
 
-    // Each column's first click, with its default direction: Tenure and
-    // Skills open descending (most first), the rest ascending.
+    // Each supported column opens ascending.
     const orders: ReadonlyArray<readonly [string, string, ReadonlyArray<string>]> = [
       ['BOSS ID', 'ascending', ['emp-001', 'emp-002', 'emp-003', 'emp-004', 'emp-005']],
       ['Name', 'ascending', ['emp-001', 'emp-002', 'emp-003', 'emp-004', 'emp-005']],
       ['Role', 'ascending', ['emp-003', 'emp-004', 'emp-005', 'emp-001', 'emp-002']],
-      ['Tenure', 'descending', ['emp-005', 'emp-001', 'emp-004', 'emp-002', 'emp-003']],
-      ['Skills', 'descending', ['emp-001', 'emp-002', 'emp-004', 'emp-003', 'emp-005']],
       ['Location', 'ascending', ['emp-001', 'emp-003', 'emp-004', 'emp-005', 'emp-002']],
       ['Status', 'ascending', ['emp-001', 'emp-002', 'emp-003', 'emp-004', 'emp-005']],
       ['Department', 'ascending', ['emp-001', 'emp-003', 'emp-005', 'emp-002', 'emp-004']],
@@ -450,7 +452,7 @@ test.describe('/ux/people — empty and failed reads never paint alike', () => {
     await mountPage(page, PATH, { titleMatch: /0 active employees/ });
 
     // A roster that was read and is empty IS empty: its zeros are facts.
-    await expectHeader(page, '0 active employees', '0 certifications expiring in 90 days');
+    await expectHeader(page, '0 active employees', '');
     await expect(filters(page).getByRole('button')).toHaveText([
       'List', 'Hierarchy', 'Active (0)', 'On Leave (0)', 'Terminated (0)', 'All (0)', 'All (0)',
     ]);
@@ -467,7 +469,7 @@ test.describe('/ux/people — empty and failed reads never paint alike', () => {
     await install(page, [DI, ED]);
     await mountPage(page, PATH, { titleMatch: /0 active employees/ });
 
-    await expectHeader(page, '0 active employees', '2 certifications expiring in 90 days');
+    await expectHeader(page, '0 active employees', '');
     await button(page, 'View', 'Hierarchy').click();
     await expect(empty(page)).toHaveText('No employees match those filters.');
     await button(page, 'View', 'List').click();
@@ -530,7 +532,7 @@ test.describe('/ux/people — the headcount', () => {
     ]));
     await mountPage(page, PATH, { titleMatch: /1 active employee$/ });
 
-    await expectHeader(page, '1 active employee', '0 certifications expiring in 90 days');
+    await expectHeader(page, '1 active employee', '');
     await expect(button(page, 'Status', 'Active (2)')).toBeVisible();
     await expect(ids(page)).toHaveText(['emp-david', 'emp-audit']);
   });

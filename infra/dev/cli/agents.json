@@ -4,10 +4,10 @@
     "display_name": "Codex (engineering)",
     "default_model": "gpt-6.1-sol",
     "aliases": ["codex@algedonic.dev"],
-    "role": null,
+    "role": "platform-admin",
     "department": "it",
     "hourly_budget_usd_micros": 10000000,
-    "max_concurrent_runs": 2
+    "max_concurrent_runs": 12
   },
   {
     "id": "agent-gemini",

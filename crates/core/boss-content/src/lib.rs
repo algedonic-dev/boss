@@ -12,6 +12,8 @@ pub mod error;
 pub mod events;
 pub mod files;
 pub mod in_memory;
+pub mod manual_baseline;
+pub mod manual_baseline_http;
 pub mod port;
 pub mod role_reports;
 pub mod seed;
@@ -21,6 +23,8 @@ pub mod types;
 pub mod config;
 #[cfg(feature = "postgres")]
 pub mod http;
+#[cfg(feature = "postgres")]
+mod manual_baseline_pg;
 #[cfg(feature = "postgres")]
 mod manual_rebuild;
 #[cfg(feature = "postgres")]

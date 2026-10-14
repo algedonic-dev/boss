@@ -9,6 +9,7 @@
 
 pub const SECTION_CREATED: &str = "content.manual.section_created";
 pub const SECTION_UPDATED: &str = "content.manual.section_updated";
+pub const BASELINE_OBSERVED: &str = "content.manual.baseline_observed";
 
 pub const BULLETIN_CREATED: &str = "content.bulletin.created";
 pub const BULLETIN_UPDATED: &str = "content.bulletin.updated";

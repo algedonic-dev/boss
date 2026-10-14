@@ -114,6 +114,17 @@
 //!   - F1e: a last eight shared by two live tokens named whichever the
 //!     record said. It now names exactly one, or nothing is revoked by it.
 //!
+//! ## Two kinds, one rotation
+//!
+//! This file is registered under two handler names (backlog 683d7fe9,
+//! design c8502e17): `credential.rotate.forgejo`, proved by reading the
+//! repository in `verify_repo`, and `credential.rotate.forgejo-registry`
+//! for a registry PUSH token (`write:package`), proved by a push the
+//! forge's container registry accepts for the image in `verify_image`.
+//! The proof is the whole difference ([`Proof`]); everything above and
+//! below is shared, so a registry token's revoke is judged by the same
+//! code four review rounds hardened.
+//!
 //! Round 4 (of c4cbc6b5, 2026-09-26) found that "simply absent" was
 //! believed on the FIRST firing too: a mistyped `old_token` recorded a
 //! revoke while the token the scoper meant stayed live (backlog 95dc0521).
@@ -133,7 +144,9 @@ use serde_json::{Value as JsonValue, json};
 use std::sync::Arc;
 
 use super::common::{StepEvent, dispatcher_reader_header};
-use super::credential_issuer::{ForgeTokenIssuer, SecretStore, TokenInfo, forge_username};
+use super::credential_issuer::{
+    ForgeTokenIssuer, SecretStore, TokenInfo, forge_username, registry_image,
+};
 
 // ---------------------------------------------------------------------------
 // Pure planning — the decision under test
@@ -454,11 +467,60 @@ pub fn revoke_gate(
 // The handler
 // ---------------------------------------------------------------------------
 
+/// What "proven working" means for the token a rule declares — the one
+/// thing that differs between the two credential KINDS this file rotates
+/// (backlog 683d7fe9, design c8502e17 question image-build). Everything
+/// else — the ledger, the naming, the off-host delivery gate, every
+/// revoke judgement four review rounds hardened — is one code path, on
+/// purpose: a second copy of it would be a second thing to review and a
+/// first thing to drift.
+///
+/// The proof is fixed by the HANDLER a rule names, never by a rule arg:
+/// a registry token (`write:package`) cannot read a repository and a
+/// repository token cannot push an image, so a rule that could choose
+/// its proof could choose one its token passes for the wrong reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proof {
+    /// `credential.rotate.forgejo`: the token reads the repository the
+    /// rule names in `verify_repo`.
+    RepoRead,
+    /// `credential.rotate.forgejo-registry`: the forge's container
+    /// registry accepts the first act of a push to the image the rule
+    /// names in `verify_image`, as `forge_user` with the token.
+    RegistryPush,
+}
+
+impl Proof {
+    fn handler_name(self) -> &'static str {
+        match self {
+            Self::RepoRead => "credential.rotate.forgejo",
+            Self::RegistryPush => "credential.rotate.forgejo-registry",
+        }
+    }
+
+    /// The rule arg that names what the proof is made against.
+    fn target_arg(self) -> &'static str {
+        match self {
+            Self::RepoRead => "verify_repo",
+            Self::RegistryPush => "verify_image",
+        }
+    }
+
+    /// The `method` the verify step and event record.
+    fn method(self) -> &'static str {
+        match self {
+            Self::RepoRead => "api",
+            Self::RegistryPush => "registry-push",
+        }
+    }
+}
+
 pub struct CredentialRotateForgejo {
     client: boss_core::machine_token::Client,
     jobs_base: String,
     issuer: Arc<dyn ForgeTokenIssuer>,
     secrets: Arc<dyn SecretStore>,
+    proof: Proof,
 }
 
 /// One step of the rotation packet as the jobs-api lists it. Its
@@ -570,11 +632,32 @@ impl CredentialRotateForgejo {
         issuer: Arc<dyn ForgeTokenIssuer>,
         secrets: Arc<dyn SecretStore>,
     ) -> Arc<Self> {
+        Self::with_proof(jobs_base, issuer, secrets, Proof::RepoRead)
+    }
+
+    /// The registry push token's handler,
+    /// `credential.rotate.forgejo-registry`: the same rotation, proven by
+    /// a push the forge's container registry accepts ([`Proof`]).
+    pub fn registry(
+        jobs_base: impl Into<String>,
+        issuer: Arc<dyn ForgeTokenIssuer>,
+        secrets: Arc<dyn SecretStore>,
+    ) -> Arc<Self> {
+        Self::with_proof(jobs_base, issuer, secrets, Proof::RegistryPush)
+    }
+
+    fn with_proof(
+        jobs_base: impl Into<String>,
+        issuer: Arc<dyn ForgeTokenIssuer>,
+        secrets: Arc<dyn SecretStore>,
+        proof: Proof,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client: super::common::api_client(),
             jobs_base: jobs_base.into(),
             issuer,
             secrets,
+            proof,
         })
     }
 
@@ -733,7 +816,7 @@ impl CredentialRotateForgejo {
 #[async_trait]
 impl Handler for CredentialRotateForgejo {
     fn name(&self) -> &'static str {
-        "credential.rotate.forgejo"
+        self.proof.handler_name()
     }
 
     async fn invoke(
@@ -759,7 +842,16 @@ impl Handler for CredentialRotateForgejo {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        let verify_repo = arg_string(args, "verify_repo")?;
+        // What the proof is made against: the repository this handler's
+        // kind reads, or the image its kind pushes to ([`Proof`]). The
+        // image enters a registry URL path beside the new token, so it is
+        // judged here, before any call, and refused permanently — the rule
+        // row says the same on every redelivery (the forge_user argument
+        // above, for the same reason).
+        let verify_target = arg_string(args, self.proof.target_arg())?;
+        if self.proof == Proof::RegistryPush {
+            registry_image(verify_target).map_err(HandlerError::Permanent)?;
+        }
         let delivery = delivery_arg(args)?;
         let spare = match arg_string(args, "spare") {
             Err(HandlerError::MissingArg(_)) => Vec::new(),
@@ -1040,16 +1132,30 @@ impl Handler for CredentialRotateForgejo {
 
         // Verify by effect BEFORE anything destructive: the new
         // token must actually work at the thing it exists for.
-        let readable = self
-            .issuer
-            .repo_readable_with(&token_value, verify_repo)
-            .await
-            .map_err(HandlerError::Downstream)?;
-        if !readable {
-            return Err(HandlerError::Downstream(format!(
-                "verify-by-effect failed: token {token_name} cannot read {verify_repo}; \
-                 old token NOT revoked"
-            )));
+        let proven = match self.proof {
+            Proof::RepoRead => {
+                self.issuer
+                    .repo_readable_with(&token_value, verify_target)
+                    .await
+            }
+            Proof::RegistryPush => {
+                self.issuer
+                    .registry_push_accepted_with(forge_user, &token_value, verify_target)
+                    .await
+            }
+        }
+        .map_err(HandlerError::Downstream)?;
+        if !proven {
+            return Err(HandlerError::Downstream(match self.proof {
+                Proof::RepoRead => format!(
+                    "verify-by-effect failed: token {token_name} cannot read {verify_target}; \
+                     old token NOT revoked"
+                ),
+                Proof::RegistryPush => format!(
+                    "verify-by-effect failed: the registry refused a push to {verify_target} \
+                     as {forge_user} with token {token_name}; old token NOT revoked"
+                ),
+            }));
         }
         if !step_done("verify") {
             self.record_phase(
@@ -1059,8 +1165,8 @@ impl Handler for CredentialRotateForgejo {
                 json!({
                     "job_id": ev.job_id,
                     "token_name": token_name,
-                    "verify_repo": verify_repo,
-                    "method": "api",
+                    (self.proof.target_arg()): verify_target,
+                    "method": self.proof.method(),
                 }),
             )
             .await?;
@@ -1248,9 +1354,18 @@ impl Handler for CredentialRotateForgejo {
             &[
                 (
                     "verified",
-                    format!("GET /api/v1/repos/{verify_repo} authenticated with the new token"),
+                    match self.proof {
+                        Proof::RepoRead => format!(
+                            "GET /api/v1/repos/{verify_target} authenticated with the new token"
+                        ),
+                        Proof::RegistryPush => format!(
+                            "POST /v2/{verify_target}/blobs/uploads/ as {forge_user} with the \
+                             new token: the registry opened a push session (202), cancelled \
+                             unused"
+                        ),
+                    },
                 ),
-                ("method", "api".to_string()),
+                ("method", self.proof.method().to_string()),
             ],
         )
         .await?;
@@ -1350,6 +1465,11 @@ mod tests {
         values: Mutex<HashMap<String, String>>,
         minted: Mutex<Vec<(String, Vec<String>)>>,
         next_id: Mutex<i64>,
+        /// Every proof asked, in order: `repo <repo>` or
+        /// `push <image> as <user>`.
+        proofs: Mutex<Vec<String>>,
+        /// The registry refuses every push (a token without the scope).
+        registry_refuses: Mutex<bool>,
     }
 
     impl FakeIssuer {
@@ -1396,8 +1516,22 @@ mod tests {
             toks.retain(|t| t.id != token_id);
             Ok(toks.len() < before)
         }
-        async fn repo_readable_with(&self, token: &str, _repo: &str) -> Result<bool, String> {
+        async fn repo_readable_with(&self, token: &str, repo: &str) -> Result<bool, String> {
+            self.proofs.lock().unwrap().push(format!("repo {repo}"));
             Ok(self.values.lock().unwrap().values().any(|v| v == token))
+        }
+        async fn registry_push_accepted_with(
+            &self,
+            user: &str,
+            token: &str,
+            image: &str,
+        ) -> Result<bool, String> {
+            self.proofs
+                .lock()
+                .unwrap()
+                .push(format!("push {image} as {user}"));
+            Ok(!*self.registry_refuses.lock().unwrap()
+                && self.values.lock().unwrap().values().any(|v| v == token))
         }
     }
 
@@ -2942,7 +3076,7 @@ mod tests {
                 .unwrap()
                 .insert(OLD_TOKEN_RESOLVED_KEY.into(), r);
         }
-        let issuer = ForgejoAdmin::new(forge.url.clone(), "broker-root-stub");
+        let issuer = ForgejoAdmin::new(forge.url.clone(), "broker-root-stub").unwrap();
         let h =
             CredentialRotateForgejo::new(api.url.clone(), issuer, Arc::new(FakeSecrets::default()));
         let mut ctx = scope_done_ctx(old_token);
@@ -3197,7 +3331,7 @@ mod tests {
         .await;
         let h = CredentialRotateForgejo::new(
             api.url.clone(),
-            ForgejoAdmin::new(forge.url.clone(), "broker-root-stub"),
+            ForgejoAdmin::new(forge.url.clone(), "broker-root-stub").unwrap(),
             Arc::new(FakeSecrets::default()),
         );
         let mut args = rotation_args();
@@ -3295,6 +3429,251 @@ mod tests {
             .expect_err("the replacement is never the old token");
     }
 
+    // ----- the registry push token (backlog 683d7fe9) -----
+
+    fn registry_args() -> Vec<(String, Value)> {
+        [
+            ("forge_user", "david"),
+            ("secret_namespace", "boss"),
+            ("secret_name", "forge-registry-push-token"),
+            ("secret_key", "token"),
+            ("scopes", "write:package"),
+            ("verify_image", "david/boss"),
+            ("delivery", "off-host"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), Value::String(v.into())))
+        .collect()
+    }
+
+    fn registry_scope_ctx(old_token: Option<&str>) -> InvocationContext {
+        let mut ctx = scope_done_ctx(old_token);
+        ctx.rule_name = "broker-rotates-the-forge-registry-push-token".into();
+        ctx.event_payload["subject_id"] = json!("forge-registry-push-token");
+        ctx.event_payload["metadata"]["credential"] = json!("forge-registry-push-token");
+        ctx
+    }
+
+    const REGISTRY_TOKEN: &str = "forge-registry-push-token-7ee101aa";
+
+    const OFF_HOST_PHASES: &[(&str, &str)] = &[
+        ("scope", "completed"),
+        ("issue", "ready"),
+        ("install", "pending"),
+        ("verify", "pending"),
+        ("delivered", "pending"),
+        ("revoke", "pending"),
+    ];
+
+    /// The registry kind is the same rotation with ONE thing changed: the
+    /// proof. The token is minted with the package scope, proved by a push
+    /// the registry accepts as the declared user to the declared image —
+    /// never by a repository read, which a package token cannot make —
+    /// and, being delivered off-host, nothing is revoked until the forge
+    /// host records that it holds the value.
+    #[tokio::test]
+    async fn a_registry_token_is_proved_by_a_push_and_waits_for_the_hosts_delivery() {
+        let issuer = FakeIssuer::with_tokens(vec![tok(7, "image-push-20260812", "0ldpush1")]);
+        let secrets = Arc::new(FakeSecrets::default());
+        let api = stub_api(
+            OFF_HOST_PHASES
+                .iter()
+                .map(|(slug, status)| (*slug, *status, json!({})))
+                .collect(),
+        )
+        .await;
+        let h = CredentialRotateForgejo::registry(api.url.clone(), issuer.clone(), secrets.clone());
+        assert_eq!(h.name(), "credential.rotate.forgejo-registry");
+        h.invoke(
+            &registry_args(),
+            &registry_scope_ctx(Some("image-push-20260812")),
+        )
+        .await
+        .expect("the scope firing mints, installs and verifies");
+
+        let minted = issuer.minted.lock().unwrap().clone();
+        assert_eq!(
+            minted,
+            vec![(
+                REGISTRY_TOKEN.to_string(),
+                vec!["write:package".to_string()]
+            )]
+        );
+        assert_eq!(
+            *issuer.proofs.lock().unwrap(),
+            vec!["push david/boss as david".to_string()],
+            "one proof, and it is the push"
+        );
+        let value = issuer.values.lock().unwrap()[REGISTRY_TOKEN].clone();
+        assert_eq!(
+            secrets
+                .get("boss", "forge-registry-push-token", "token")
+                .as_deref(),
+            Some(value.as_str())
+        );
+        assert_eq!(api.status("verify"), "completed");
+        assert_eq!(api.step_meta("verify")["method"], "registry-push");
+        assert!(
+            api.step_meta("verify")["verified"]
+                .as_str()
+                .unwrap()
+                .contains("/v2/david/boss/blobs/uploads/"),
+            "{}",
+            api.step_meta("verify")
+        );
+        let events = api.rotations.lock().unwrap().clone();
+        let verified = events
+            .iter()
+            .find(|(p, _)| p == "forge-registry-push-token/verified")
+            .expect("a verified event");
+        assert_eq!(verified.1["verify_image"], "david/boss");
+        assert_eq!(verified.1["method"], "registry-push");
+        for (path, body) in &events {
+            assert!(
+                !body.to_string().contains(&value),
+                "secret value leaked into {path}"
+            );
+        }
+        // Off-host: the old push token is still live, the revoke unrecorded.
+        assert!(
+            issuer.tokens.lock().unwrap().iter().any(|t| t.id == 7),
+            "nothing is revoked before the host holds the new value"
+        );
+        assert_ne!(api.status("revoke"), "completed");
+
+        // The host records delivery of exactly that value: now the revoke.
+        api.complete(
+            "delivered",
+            json!({ "delivered_last_eight": last_eight(&value) }),
+        );
+        let mut delivered = registry_scope_ctx(None);
+        delivered.triggering_topic = "step.done.credential-delivery".into();
+        delivered.event_payload["kind"] = json!("credential-delivery");
+        delivered.event_payload["step_id"] = json!("step-delivered");
+        delivered.event_payload["metadata"] = json!({ "delivered_last_eight": last_eight(&value) });
+        api.steps
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|(s, _, _)| s == "scope")
+            .unwrap()
+            .2 = json!({
+            "credential": "forge-registry-push-token",
+            "old_token": "image-push-20260812",
+        });
+        h.invoke(&registry_args(), &delivered)
+            .await
+            .expect("the delivery firing revokes");
+        assert!(
+            !issuer.tokens.lock().unwrap().iter().any(|t| t.id == 7),
+            "the old push token is revoked once the host holds the new one"
+        );
+        assert_eq!(api.status("revoke"), "completed");
+        assert_eq!(
+            issuer.minted.lock().unwrap().len(),
+            1,
+            "a delivery never mints"
+        );
+    }
+
+    /// A token the registry will not push with is not proven: `verified`
+    /// is never recorded and the old token stays.
+    #[tokio::test]
+    async fn a_registry_that_refuses_the_push_stops_before_verified() {
+        let issuer = FakeIssuer::with_tokens(vec![tok(7, "image-push-20260812", "0ldpush1")]);
+        *issuer.registry_refuses.lock().unwrap() = true;
+        let secrets = Arc::new(FakeSecrets::default());
+        let (jobs_url, captured, rotations) = stub_jobs_api(OFF_HOST_PHASES).await;
+        let h = CredentialRotateForgejo::registry(jobs_url, issuer.clone(), secrets);
+        let err = h
+            .invoke(
+                &registry_args(),
+                &registry_scope_ctx(Some("image-push-20260812")),
+            )
+            .await
+            .expect_err("an unproven token is an error");
+        match err {
+            HandlerError::Downstream(why) => {
+                assert!(
+                    why.contains("the registry refused a push to david/boss"),
+                    "{why}"
+                )
+            }
+            other => panic!("expected a retryable refusal, got {other:?}"),
+        }
+        assert!(issuer.tokens.lock().unwrap().iter().any(|t| t.id == 7));
+        assert!(captured.lock().unwrap().is_empty(), "no step was completed");
+        let order: Vec<String> = rotations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "forge-registry-push-token/minted",
+                "forge-registry-push-token/installed",
+            ]
+        );
+    }
+
+    /// The proof belongs to the handler, not the rule: a registry rule
+    /// that names only `verify_repo` is an authoring fault, and an image
+    /// outside the grammar is refused before anything is minted.
+    #[tokio::test]
+    async fn a_registry_rule_must_name_an_image_the_registry_could_hold() {
+        for (image, want) in [
+            (None, "verify_image"),
+            (Some("david/../../api/v1/user"), "verify_image"),
+        ] {
+            let issuer = FakeIssuer::with_tokens(vec![]);
+            let (jobs_url, _captured, rotations) = stub_jobs_api(OFF_HOST_PHASES).await;
+            let h = CredentialRotateForgejo::registry(
+                jobs_url,
+                issuer.clone(),
+                Arc::new(FakeSecrets::default()),
+            );
+            let mut args: Vec<(String, Value)> = registry_args()
+                .into_iter()
+                .filter(|(k, _)| k != "verify_image")
+                .collect();
+            args.push(("verify_repo".into(), Value::String("david/boss".into())));
+            if let Some(image) = image {
+                args.push(("verify_image".into(), Value::String(image.into())));
+            }
+            let err = h
+                .invoke(&args, &registry_scope_ctx(None))
+                .await
+                .expect_err("refused");
+            assert!(format!("{err:?}").contains(want), "{image:?}: {err:?}");
+            assert!(issuer.minted.lock().unwrap().is_empty(), "nothing minted");
+            assert!(issuer.proofs.lock().unwrap().is_empty());
+            assert!(rotations.lock().unwrap().is_empty());
+        }
+    }
+
+    /// The repository kind is untouched: it still proves by a repo read
+    /// and never asks the registry.
+    #[tokio::test]
+    async fn the_repository_kind_still_proves_by_a_repository_read() {
+        let issuer = FakeIssuer::with_tokens(vec![]);
+        let (jobs_url, _captured, _rotations) = stub_jobs_api(PENDING_PHASES).await;
+        let h = CredentialRotateForgejo::new(
+            jobs_url,
+            issuer.clone(),
+            Arc::new(FakeSecrets::default()),
+        );
+        assert_eq!(h.name(), "credential.rotate.forgejo");
+        h.invoke(&rotation_args(), &scope_done_ctx(None))
+            .await
+            .expect("rotation");
+        assert_eq!(
+            *issuer.proofs.lock().unwrap(),
+            vec!["repo david/boss".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn missing_declaration_arg_is_reported() {
         let issuer = FakeIssuer::with_tokens(vec![]);
@@ -3307,5 +3686,187 @@ mod tests {
             .await
             .expect_err("missing arg");
         assert!(matches!(err, HandlerError::MissingArg(_)));
+    }
+
+    // ----- the verify method lives twice (backlog 1c05c1b2) -----
+
+    /// The `method` values a `rotate-a-credential` verify step can
+    /// COMPLETE with: the row's own `field_type`, read from the tree file
+    /// the registry publishes. Completion validates against it; the
+    /// metadata merge before it does not, so a value outside it is
+    /// stored, the completion is refused 400, and the rotation dead-
+    /// letters at verify after the token has already been proven.
+    fn declared_verify_methods() -> Vec<String> {
+        let path =
+            boss_testing::repo_root().join("infra/platform/workflows/rotate-a-credential.toml");
+        let raw =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let doc: toml::Value = toml::from_str(&raw).expect("the row parses");
+        let verify = doc["workflow"][0]["step"]
+            .as_array()
+            .expect("the row declares steps")
+            .iter()
+            .find(|s| s["title"].as_str() == Some("verify"))
+            .expect("the row declares a verify step");
+        let method = verify["fields"]
+            .as_array()
+            .expect("verify declares fields")
+            .iter()
+            .find(|f| f["name"].as_str() == Some("method"))
+            .expect("verify declares a method field");
+        method["field_type"]
+            .as_str()
+            .expect("method has a field_type")
+            .split('|')
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Every `"method"` a source writes, by line: `Ok(literal)`, or
+    /// `Err(expression)` when the value is not a string literal and so
+    /// cannot be judged by reading the file. A `"method"` not followed by
+    /// `,` or `:` (an index, a comparison) is not a write and is skipped.
+    fn method_writes(src: &str) -> Vec<(usize, Result<String, String>)> {
+        const KEY: &str = "\"method\"";
+        let mut out = Vec::new();
+        for (at, _) in src.match_indices(KEY) {
+            let line = src[..at].matches('\n').count() + 1;
+            let rest = &src[at + KEY.len()..];
+            let rest = rest
+                .strip_prefix(".into()")
+                .or_else(|| rest.strip_prefix(".to_string()"))
+                .unwrap_or(rest)
+                .trim_start();
+            let Some(value) = rest.strip_prefix([',', ':']).map(str::trim_start) else {
+                continue;
+            };
+            out.push((
+                line,
+                match value.strip_prefix('"').and_then(|v| v.split_once('"')) {
+                    Some((literal, _)) => Ok(literal.to_string()),
+                    None => Err(value.lines().next().unwrap_or("").trim().to_string()),
+                },
+            ));
+        }
+        out
+    }
+
+    fn rotate_handler_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .map(|e| e.expect("a dir entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                rotate_handler_sources(&path, out);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The pin CLAUDE.md §9a asks for, over EVERY rotate handler: the
+    /// verify `method` each one writes is a value the row declares.
+    /// Measured 2026-10-09 on rotation 8549fcef: this handler wrote
+    /// `registry-push`, the row allowed `browser|api|log`, and the
+    /// rotation sat dead-lettered at verify with its proof already made.
+    /// The handler tests above passed throughout, because their stub
+    /// jobs API completes a step without validating it against the row.
+    #[test]
+    fn every_verify_method_a_rotate_handler_writes_is_one_the_row_declares() {
+        let declared = declared_verify_methods();
+        let mut undeclared = Vec::new();
+
+        // A new Proof is a compile error here until it is listed.
+        let listed = |p: Proof| match p {
+            Proof::RepoRead | Proof::RegistryPush => p,
+        };
+        for proof in [Proof::RepoRead, Proof::RegistryPush].map(listed) {
+            if !declared.iter().any(|d| d == proof.method()) {
+                undeclared.push(format!(
+                    "{:?} (credential_rotate_forgejo.rs Proof::method) writes {:?}",
+                    proof,
+                    proof.method()
+                ));
+            }
+        }
+
+        let handlers = boss_testing::repo_root()
+            .join("crates/orchestrators/boss-dispatcher-handlers/src/handlers");
+        let mut sources = Vec::new();
+        for entry in std::fs::read_dir(&handlers).expect("the handlers directory") {
+            let path = entry.expect("a dir entry").path();
+            let rotate = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("credential_rotate"));
+            if rotate && path.is_dir() {
+                rotate_handler_sources(&path, &mut sources);
+            } else if rotate {
+                sources.push(path);
+            }
+        }
+        sources.sort();
+        assert!(
+            sources.len() >= 5,
+            "found {} rotate handler sources under {}: the scan is reading the wrong place",
+            sources.len(),
+            handlers.display()
+        );
+
+        let mut literals = 0;
+        for path in &sources {
+            let src = std::fs::read_to_string(path).expect("a handler source");
+            let name = path.strip_prefix(&handlers).unwrap_or(path).display();
+            for (line, value) in method_writes(&src) {
+                match value {
+                    Ok(literal) => {
+                        literals += 1;
+                        if !declared.contains(&literal) {
+                            undeclared.push(format!("{name}:{line} writes {literal:?}"));
+                        }
+                    }
+                    // Proof::method, judged variant by variant above.
+                    Err(expr) if expr.starts_with("self.proof.method()") => {}
+                    Err(expr) => undeclared.push(format!(
+                        "{name}:{line} writes `{expr}`, which this pin cannot read; \
+                         write a literal, or judge it here the way Proof::method is"
+                    )),
+                }
+            }
+        }
+        assert!(
+            literals > 0,
+            "no literal method write found in {} sources: the scan is not reading them",
+            sources.len()
+        );
+        assert!(
+            undeclared.is_empty(),
+            "infra/platform/workflows/rotate-a-credential.toml verify.method allows {declared:?}; \
+             a completion carrying anything else is refused 400 and the rotation dead-letters \
+             at verify (backlog 1c05c1b2):\n  {}",
+            undeclared.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn method_writes_reads_literals_and_names_what_it_cannot_read() {
+        let src = "x\n(\"method\", \"api\".to_string()),\n\
+                   json!({\"method\": \"log\"})\n\
+                   (\"method\".into(), \"api\".into())\n\
+                   (\"method\",\n    \"browser\")\n\
+                   assert_eq!(v[\"method\"], \"api\");\n\
+                   (\"method\", other()),\n";
+        assert_eq!(
+            method_writes(src),
+            vec![
+                (2, Ok("api".to_string())),
+                (3, Ok("log".to_string())),
+                (4, Ok("api".to_string())),
+                (5, Ok("browser".to_string())),
+                (8, Err("other()),".to_string())),
+            ]
+        );
     }
 }

@@ -40,7 +40,7 @@ type RoleClass = Readonly<{ code: string; metadata: Readonly<Record<string, unkn
 /// The roster a count is taken over: every row, whatever its status,
 /// less those whose role's Class says `counts_in_headcount: false`.
 /// headcount() is its active rows. /hr states more counts than the one
-/// header — At a glance, the Headcount table, average tenure — and
+/// header — At a glance and the Headcount table — and
 /// counted emp-audit in all of them (backlog ad2da739, page audit
 /// b959394e), so the excluded-role set is decided here, once, for both
 /// People pages.
@@ -62,12 +62,11 @@ const plural = (n: number, one: string, many: string): string => `${n} ${n === 1
 export function rosterHeader(
   read: ReadState,
   activeCount: number,
-  expiringCount: number,
 ): Readonly<{ title: string; subtitle: string }> {
   if (read.kind === 'ok') {
     return {
       title: plural(activeCount, 'active employee', 'active employees'),
-      subtitle: `${plural(expiringCount, 'certification', 'certifications')} expiring in 90 days`,
+      subtitle: '',
     };
   }
   return {

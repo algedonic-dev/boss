@@ -398,6 +398,289 @@ async fn first_record_http_preserves_null_and_server_receipt_on_replay() {
     );
 }
 
+/// A RECORD OF HOW THE WORK WAS STARTED IS WRITTEN BEFORE ANYONE HOLDS IT
+/// (backlog e6b05dd6, review fd7f1030 F1). An agent-run's Building step
+/// declares `records_before_claim = ["launch.model"]`: the launcher writes
+/// the model it started before the run exists, and only that record counts
+/// for the release. A run that started with no launcher record could claim
+/// its Building and then write `launch.model` itself, and every reader
+/// would believe it, because both sign as the same agent. So the door
+/// refuses a declared key once the step is claimed, the merge door never
+/// writes one, and the declaration itself is the protocol's.
+#[tokio::test]
+async fn a_record_declared_before_the_claim_is_refused_once_the_step_is_claimed() {
+    let (app, jobs, job, mut step) = build_app(true).await;
+    step.metadata = json!({"records_before_claim": ["launch.model"]});
+    jobs.update_step(&step).await.unwrap();
+    let launch = json!({"key":"launch.model","value":{"model":"opus-5-5"},"expected_absence":true});
+    let stored = |jobs: Arc<InMemoryJobs>, step: Step| async move {
+        jobs.get_step(&step.id).await.unwrap().unwrap().metadata
+    };
+
+    // Active (claimed): the run's own write is refused, nothing lands.
+    let before = jobs.recorded_events().len();
+    let (status, body) = post(&app, &job, &step, launch.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["refused_key"], json!("launch.model"), "{body}");
+    assert_eq!(before, jobs.recorded_events().len());
+    assert!(
+        stored(jobs.clone(), step.clone())
+            .await
+            .get("launch.model")
+            .is_none()
+    );
+    // An undeclared key on the same claimed step is the door's ordinary
+    // contract, unchanged.
+    assert_eq!(
+        post(
+            &app,
+            &job,
+            &step,
+            json!({"key":"evidence","value":"seen","expected_absence":true})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+
+    // The merge door never writes a declared key, open or not yet claimed,
+    // so a PATCH cannot stand in for the record or squat on it.
+    for status in [StepStatus::Active, StepStatus::Ready] {
+        step = jobs.get_step(&step.id).await.unwrap().unwrap();
+        step.status = status;
+        jobs.update_step(&step).await.unwrap();
+        let (code, body) = patch_as(&app, &job, &step, json!({"launch.model":"opus-5-5"})).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{status:?}: {body}");
+        // ...nor sheds the declaration that makes it a launch record.
+        let (code, body) = patch_as(&app, &job, &step, json!({"records_before_claim":null})).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{status:?}: {body}");
+    }
+
+    // Ready (not yet claimed): the launcher's record lands, and the server
+    // stamps it.
+    let (status, receipt) = post(&app, &job, &step, launch).await;
+    assert_eq!(status, StatusCode::CREATED, "{receipt}");
+    assert_eq!(
+        stored(jobs.clone(), step.clone()).await["launch.model"],
+        json!({"model":"opus-5-5"})
+    );
+}
+
+/// ONCE CLAIMED, ALWAYS CLAIMED, for a record of how the work was started
+/// (backlog e6b05dd6, re-review 211cbae4 B1). The door above asked only
+/// whether the step is held NOW, and its holder can release it: a run that
+/// had claimed its Building sent the supported release (PUT `ready`, no
+/// holder: 204), wrote `launch.model` while the step stood Ready (201),
+/// and claimed it again (200) — a record written after its claim, which
+/// every reader believed as the launch. Driven here through the real
+/// router, claim door included, because the claim is what closes the key.
+#[tokio::test]
+async fn a_record_declared_before_the_claim_stays_refused_after_a_release() {
+    let (app, jobs, job, mut step) = build_app(true).await;
+    step.metadata = json!({"records_before_claim": ["launch.model"]});
+    step.status = StepStatus::Ready;
+    step.assignee_id = None;
+    jobs.update_step(&step).await.unwrap();
+    let launch = json!({"key":"launch.model","value":{"model":"opus-5-5"},"expected_absence":true});
+    let claim = format!("/api/jobs/{}/steps/{}/claim", job.id, step.id);
+    let step_url = format!("/api/jobs/{}/steps/{}", job.id, step.id);
+
+    // The run claims its Building through the claim door.
+    let (code, body) = send_as(&app, "POST", &claim, None).await;
+    assert_eq!(code, StatusCode::OK, "claim: {body}");
+
+    // It releases its own step: the supported release, answered 204.
+    let (code, body) = send_as(
+        &app,
+        "PUT",
+        &step_url,
+        Some(json!({"status":"ready","assignee_id":null})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT, "release: {body}");
+    let released = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(released.status, StepStatus::Ready);
+    assert_eq!(released.assignee_id, None);
+
+    // Ready again, but claimed once: the record is refused, nothing lands.
+    let before = jobs.recorded_events().len();
+    let (code, body) = post(&app, &job, &step, launch).await;
+    assert_eq!(code, StatusCode::CONFLICT, "record after a release: {body}");
+    assert_eq!(body["refused_key"], json!("launch.model"), "{body}");
+    assert_eq!(before, jobs.recorded_events().len());
+
+    // Re-claimed, the step carries no launch record for a reader to believe.
+    let (code, body) = send_as(&app, "POST", &claim, None).await;
+    assert_eq!(code, StatusCode::OK, "re-claim: {body}");
+    let row = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(row.status, StepStatus::Active);
+    assert!(
+        row.metadata.get("launch.model").is_none(),
+        "{}",
+        row.metadata
+    );
+
+    // And the mark the claim left cannot be merged away to reopen it.
+    let (code, body) = patch_as(
+        &app,
+        &job,
+        &row,
+        json!({boss_jobs::records_before_claim::CLAIMED_KEY: null}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+}
+
+/// A RE-PIN WRITES ONLY THE ROW IT READ (backlog e6b05dd6, third review
+/// 85c11887 B1). The convert door plans from a `list_steps` read and
+/// writes later; a first claim landing in between marked the row, and the
+/// re-pin wrote the read's metadata over it — mark gone, the step Active
+/// with no holder — so release, record and re-claim forged a launch record
+/// written after the claim. The plan now carries each row's version from
+/// its read, and the adapter refuses a row that moved since, under its
+/// lock, as every judged step write does. Driven through the real router
+/// for the claim, release and record; the convert's write is the adapter
+/// call the handler makes.
+#[tokio::test]
+async fn a_repin_planned_before_the_first_claim_cannot_erase_its_mark() {
+    let (app, jobs, job, mut step) = build_app(true).await;
+    step.metadata = json!({"records_before_claim": ["launch.model"]});
+    step.status = StepStatus::Ready;
+    step.assignee_id = None;
+    jobs.update_step(&step).await.unwrap();
+    let claim = format!("/api/jobs/{}/steps/{}/claim", job.id, step.id);
+    let step_url = format!("/api/jobs/{}/steps/{}", job.id, step.id);
+
+    // The convert's read: Ready, unmarked. Its plan re-projects the text
+    // (both versions declare the key, so the declared-writer rule passes).
+    let (mut next, read) = jobs.get_step_versioned(&step.id).await.unwrap().unwrap();
+    next.title = "Record (v2 text)".into();
+    let plan = boss_jobs::repin::RepinPlan {
+        reprojected: vec![boss_jobs::repin::Reprojected {
+            step: next,
+            changed: vec!["title".into()],
+            kept: vec![],
+            unskipped: false,
+            read: Some(read),
+        }],
+        inserted: vec![],
+    };
+
+    // The run's FIRST claim lands between the convert's read and its write.
+    let (code, body) = send_as(&app, "POST", &claim, None).await;
+    assert_eq!(code, StatusCode::OK, "claim: {body}");
+    let claimed = jobs.get_step(&step.id).await.unwrap().unwrap();
+    let mark = claimed.metadata[boss_jobs::records_before_claim::CLAIMED_KEY].clone();
+    assert!(
+        !mark.is_null(),
+        "the first claim marks: {}",
+        claimed.metadata
+    );
+
+    // The convert's write is refused whole: nothing moves, not the pin.
+    let stamp = boss_core::publisher::EventStamp::new(
+        "jobs",
+        boss_core::actor::ActorId::Automation("platform".into()),
+    );
+    let record = boss_jobs::repin::record(&plan, 1, 2, "automation:platform", stamp.timestamp);
+    let before = jobs.recorded_events().len();
+    let refused = jobs
+        .repin_workflow_version_at(&job.id, 2, &plan, &record, &stamp)
+        .await;
+    assert!(
+        matches!(refused, Err(boss_jobs::JobsError::StepChanged { id }) if id == step.id),
+        "{refused:?}"
+    );
+    assert_eq!(
+        before,
+        jobs.recorded_events().len(),
+        "no event rides a refusal"
+    );
+    assert_eq!(jobs.get_step(&step.id).await.unwrap().unwrap(), claimed);
+    assert_eq!(
+        jobs.get_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .workflow_version,
+        job.workflow_version
+    );
+
+    // So the release, record, re-claim sequence still finds the mark.
+    let (code, body) = send_as(
+        &app,
+        "PUT",
+        &step_url,
+        Some(json!({"status":"ready","assignee_id":null})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT, "release: {body}");
+    let launch = json!({"key":"launch.model","value":{"model":"opus-5-5"},"expected_absence":true});
+    let (code, body) = post(&app, &job, &step, launch).await;
+    assert_eq!(code, StatusCode::CONFLICT, "record after the claim: {body}");
+    assert!(
+        jobs.first_step_record(&step.id, "launch.model")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+async fn send_as(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let user = json!({"id":"emp-1","role":"service-tech","access_tier":"user","territory_account_ids":[],"direct_report_ids":[],"department":"service"});
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-boss-user", user.to_string());
+    let body = match body {
+        Some(body) => {
+            request = request.header("content-type", "application/json");
+            Body::from(body.to_string())
+        }
+        None => Body::empty(),
+    };
+    let response = app
+        .clone()
+        .oneshot(request.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into())),
+    )
+}
+
+async fn patch_as(app: &Router, job: &Job, step: &Step, body: Value) -> (StatusCode, Value) {
+    let user = json!({"id":"emp-1","role":"service-tech","access_tier":"user","territory_account_ids":[],"direct_report_ids":[],"department":"service"});
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/jobs/{}/steps/{}/metadata", job.id, step.id))
+                .header("content-type", "application/json")
+                .header("x-boss-user", user.to_string())
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 #[tokio::test]
 async fn original_first_record_read_preserves_receipt_without_a_replay_write() {
     let policy = FakePolicyClient::builder()

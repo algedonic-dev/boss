@@ -1,5 +1,21 @@
 import { describe, expect, test } from 'bun:test';
-import { AccountSchema, RiskScoreListSchema } from './schemas';
+import { AccountSchema, AssetSchema, RiskScoreListSchema } from './schemas';
+
+describe('AssetSchema native custody contract', () => {
+  const native = {
+    asset_id: 'asset-native', sku: null, phase: 'registered',
+    holder_kind: null, holder_id: null, warranty_through: null,
+    open_ticket_count: 0, first_seen: '2026-01-01', last_event_at: '2026-09-01', oem_serial: null,
+  };
+  test('accepts the actual nullable-SKU native holder shape', () => {
+    expect(AssetSchema.safeParse(native).success).toBe(true);
+    expect(AssetSchema.safeParse({ ...native, sku: 'MODEL-1', phase: 'installed', holder_kind: 'account', holder_id: 'acct-1' }).success).toBe(true);
+  });
+  test('does not fall back to the obsolete account_id property', () => {
+    const { holder_kind: _kind, holder_id: _id, ...legacy } = native;
+    expect(AssetSchema.safeParse({ ...legacy, sku: 'MODEL-1', account_id: 'acct-1' }).success).toBe(false);
+  });
+});
 
 // The crash this schema exists to stop: WatchlistPage cast the payload
 // and read `.length` off the result, so a response without `accounts`

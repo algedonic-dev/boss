@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------
+# The broker revokes root's OLD tree token on boss-gcp once boss-gcp has
+# recorded delivery of the new one (design-doc db018094, q1; backlog
+# ca356c79; the off-host order of design 1c90d183, D1).
+#
+# THE GAP THIS CLOSES. boss-gcp reads no Secret: the value reaches
+# /etc/boss/root-tree/forge.token on a later pass. Revoking before then
+# would leave root's tree fetch holding a dead token, and the units that
+# run from that tree would run a tree that can no longer advance. So
+# `broker-rotates-the-boss-gcp-root-tree-token` stops after verify, and
+# the host's deposit completes the packet's `delivered` step — the
+# dedicated kind `credential-delivery`, so this fires on nothing else —
+# carrying the last eight of the value it installed. The handler then
+# re-plans (a delivery firing never mints), compares the host's last
+# eight with the Secret's, and only then revokes the token the scope
+# step named.
+#
+# THE ARGS ARE THE ROTATION RULE'S, verbatim: one declaration, two
+# triggers. crates/core/boss-dispatcher/tests/
+# boss_gcp_root_tree_token_rules.rs pins them equal (CLAUDE.md §9a).
+[[rule]]
+name = "broker-revokes-the-boss-gcp-root-tree-token-on-delivery"
+why = """
+EXTERNAL GLUE, the same class as the rotation rule it completes: the
+effect is a DELETE on the forge's admin API, which no Workflow
+definition can address, and the condition is a fact only the host can
+observe — that it now holds the new value — which it records as the
+packet's `delivered` step. It adds no routing: it advances the very
+packet that fired it and spawns nothing. Design db018094 (2026-10-10).
+"""
+on_event = "step.done.credential-delivery"
+when = 'subject_id = "boss-gcp-root-tree-token"'
+[[rule.do]]
+handler = "credential.rotate.forgejo"
+args = { forge_user = "\"david\"", secret_namespace = "\"boss\"", secret_name = "\"boss-gcp-root-tree-token\"", secret_key = "\"token\"", scopes = "\"read:repository\"", verify_repo = "\"david/boss\"", delivery = "\"off-host\"", spare = "\"boss-gcp,boss-dev-forge-token-*,forge-host-checkout-token-*,forge-registry-push-token-*\"" }

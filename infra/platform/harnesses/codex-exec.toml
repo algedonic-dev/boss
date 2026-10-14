@@ -88,10 +88,17 @@
 # model runs.
 #
 # THE REAL FIX IS STILL OWED (option 3 of the same design): launched agents
-# under a separate Unix account or in a pod of their own, where the boundary
-# is the kernel's and not a sentence. It belongs to the unattended-launch
-# item, backlog 167a877c. Until it lands, do not read these two rows as a
-# control, and do not add a third for a builder on their precedent.
+# in a pod of their own, where the boundary is the kernel's and not a
+# sentence. David chose the pod on design 21062f95 (2026-10-10): a Job of its
+# own in boss-dev, holding no credential of the dev pod but this harness's
+# login, read-only, and bounded by the cluster. It belongs to backlog
+# 3869107c (167a877c, which named it first, closed 2026-10-10). Its first car
+# is the Job's contract (crates/orchestrators/boss-cli/src/launch_job.rs);
+# the controller now has a dormant source path, but its row is disabled and
+# requires verified image/login inputs and genuine activation. This file
+# still selects a process. Until a reviewed car moves it, do not read these
+# two rows as a control, and do not
+# add a third for a builder on their precedent.
 #
 # NOT MEASURED: no launch has run under `danger-full-access` from this file
 # yet. That the word starts in this pod is read off the hand-driven Codex

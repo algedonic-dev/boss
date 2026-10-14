@@ -64,8 +64,18 @@ fn router(people_base: String) -> Router {
 }
 
 async fn call(router: &Router, method: &str, path: &str, body: Value) -> StatusCode {
+    call_employee(router, method, path, body, EMPLOYEE).await
+}
+
+async fn call_employee(
+    router: &Router,
+    method: &str,
+    path: &str,
+    body: Value,
+    employee: &str,
+) -> StatusCode {
     let mut sess = Session::new("path-segment", 600);
-    sess.employee_id = Some(EMPLOYEE.to_string());
+    sess.employee_id = Some(employee.to_string());
     let req = Request::builder()
         .method(method)
         .uri(path)
@@ -74,6 +84,61 @@ async fn call(router: &Router, method: &str, path: &str, body: Value) -> StatusC
         .body(Body::from(body.to_string()))
         .unwrap();
     router.clone().oneshot(req).await.unwrap().status()
+}
+
+fn registration_envelope() -> Value {
+    json!({
+        "challenge_id": "fixture-registration-challenge",
+        "credential": {
+            "id": CREDENTIAL_ID, "rawId": CREDENTIAL_ID, "type": "public-key",
+            "response": {"attestationObject": "AAAA", "clientDataJSON": "e30"},
+            "extensions": {}
+        }
+    })
+}
+
+#[tokio::test]
+async fn registration_refuses_a_nonsegment_employee_before_consuming_a_challenge() {
+    let (people, seen) = recording_people().await;
+    let router = router(people);
+    for employee in ["emp invalid", ".", "emp/invalid"] {
+        let status = call_employee(
+            &router,
+            "POST",
+            "/api/auth/passkey/register/finish",
+            registration_envelope(),
+            employee,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{employee}");
+    }
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "refused employee must not consume or store anything"
+    );
+}
+
+#[tokio::test]
+async fn registration_preserves_a_valid_employees_challenge_read() {
+    let (people, seen) = recording_people().await;
+    let router = router(people);
+    let status = call_employee(
+        &router,
+        "POST",
+        "/api/auth/passkey/register/finish",
+        registration_envelope(),
+        EMPLOYEE,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "the existing empty stub response remains malformed"
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["/api/people/presence-challenges/fixture-registration-challenge/consume"]
+    );
 }
 
 #[tokio::test]

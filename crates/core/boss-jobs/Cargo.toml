@@ -29,7 +29,7 @@ required-features = ["postgres"]
 
 [features]
 default = []
-postgres = ["dep:sqlx", "boss-events/postgres"]
+postgres = ["dep:sqlx", "boss-policy-client/postgres", "boss-calendar/postgres", "boss-events/postgres"]
 # The unjudged whole-row step write (`JobsRepository::update_step` /
 # `update_step_at`): tests plant rows and interleaved writers with it,
 # and no service may write through it, so it exists only here, turned on
@@ -48,6 +48,7 @@ boss-events = { path = "../boss-events" }
 boss-nats = { path = "../boss-nats" }
 boss-policy-client = { path = "../boss-policy-client" }
 boss-calendar-client = { path = "../boss-calendar-client" }
+boss-calendar = { path = "../boss-calendar", default-features = false }
 boss-subject-kinds-client = { path = "../boss-subject-kinds-client" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
@@ -513,4 +514,8 @@ required-features = ["postgres"]
 
 [[test]]
 name = "workflow_publish_coverage"
+required-features = ["postgres"]
+
+[[test]]
+name = "station_claim_next_pg"
 required-features = ["postgres"]

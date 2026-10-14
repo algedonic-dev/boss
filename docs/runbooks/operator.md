@@ -48,7 +48,7 @@ and boss-gcp's journals are also readable over HTTP on `:19531`
 - **The `boss-pg-backup` CronJob** in namespace `boss`
   (`infra/cluster/manifests/boss-backup.yaml`) runs nightly at 09:10
   UTC: `pg_dump` of the whole `boss` database, gzipped, onto the
-  `boss-backups` PVC (14-day retention), then uploaded offsite to the
+  `boss-backups` PVC (the three newest kept), then uploaded offsite to the
   GCS bucket named in secret `boss-gcs-offsite` — the one offsite copy
   (boss-gcp stopped holding one on 2026-10-01, backlog 4bf7bdd1). The
   recovery sheet's backups road prints how to fetch a dump from it.

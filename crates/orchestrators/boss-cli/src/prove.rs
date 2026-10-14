@@ -110,7 +110,15 @@ pub(crate) struct Outcome {
 /// ops-request runs `boss prove <car> --from-car --unattended` on the
 /// forge — so the prelude, the judge, the verdict sentences and the
 /// attempt record are written here once and nowhere else.
-pub(crate) const PRELUDE: &str = r#"
+///
+/// ITS FIRST LINE PUTS `probe-bin` ON PATH, INSIDE THE PROBE'S OWN SHELL
+/// (review 717a7f7c N1 of car f5d53af7). The door names the directory in
+/// [`PROBE_BIN_ENV`] and this line moves it onto PATH and unsets the name,
+/// so the lookup it changes is the probe's — never the one that finds
+/// `timeout`, `runuser`, `setpriv` and `bash` (see [`Shell::command`]).
+/// No empty PATH entry is made when PATH is unset: an empty one is the
+/// working directory.
+pub(crate) const PRELUDE: &str = r#"[ -z "${BOSS_PROBE_BIN:-}" ] || export PATH="$BOSS_PROBE_BIN${PATH:+:$PATH}"; unset BOSS_PROBE_BIN
 { exec 9>>"${BOSS_PROBE_NOTFOUND:-/dev/null}"; } 2>/dev/null || exec 9>/dev/null
 command_not_found_handle() {
     printf "%s: command not found\n" "$1" >&2
@@ -144,7 +152,8 @@ const KILL_AFTER_SECS: u64 = 5;
 /// as it is, and no timeout of its own — a probe is bounded there only
 /// while a reader door stands open for it ([`Shell::bound`]). The unattended door ([`Shell::unattended`]) is
 /// what the forge's shell twin did and what the ops-request now asks
-/// `boss prove --unattended` to do: drop from root to the probe user,
+/// `boss prove --unattended` to do: drop from root to the probe user
+/// with no way back up ([`NO_NEW_PRIVS`]),
 /// run in the converged checkout, under a timeout, with exactly the
 /// environment a recorded probe is promised — the system of record's
 /// address, the read-only reader's identity and port table, the car's
@@ -167,14 +176,72 @@ pub(crate) struct Shell {
     pub env: Vec<(String, String)>,
     /// Removed from the probe's environment.
     pub strip: Vec<String>,
-    /// Prepended to the probe's PATH, colon-separated.
+    /// Prepended to the probe's PATH, colon-separated — by the probe's
+    /// own shell ([`PRELUDE`]), never on the launch's.
     pub path_prefix: Option<std::path::PathBuf>,
+    /// `Some`: the probe's environment starts EMPTY and takes only these
+    /// names from this process's own, before `strip` and `env` — the
+    /// unattended door's [`UNATTENDED_INHERITS`]. `None`: everything this
+    /// process holds, as the hand door's operator shell always has.
+    pub inherit: Option<&'static [&'static str]>,
     /// Where a reader door for this probe would be opened FROM. Naming
     /// it opens nothing: `execute_with` asks `probe_reader::open`, and a
     /// host that holds no reader credential gets no door and reads as
     /// it did before the door existed (review 0bd6a9c2, B1).
     pub reader: Option<crate::probe_reader::Config>,
 }
+
+/// THE WORDS AFTER `runuser -u <account> --` AT A DOOR THAT DROPS TO THE
+/// PROBE ACCOUNT (backlog dda26693, review acab446c F8b). runuser hands
+/// the account its uid and nothing to stop it gaining more: every setuid
+/// binary on the host was a step up from inside car text. With
+/// no_new_privs set, an exec never grants privilege the process did not
+/// already hold (setuid, setgid and file capabilities are ignored), and
+/// the flag is inherited by everything the probe starts. verify-tick
+/// (infra/forge/probe-account.sh) asks the account to run these same
+/// words and read the flag back before it writes the marker, so a host
+/// whose setpriv cannot set it runs no probe at all — the environment's
+/// refusal, never the car's NOT PROVEN. Held equal to the script by
+/// `the_launch_words_are_the_ones_the_tick_asks_the_account_to_run`.
+pub(crate) const NO_NEW_PRIVS: [&str; 2] = ["setpriv", "--no-new-privs"];
+
+/// THE ONLY NAMES THE UNATTENDED PROBE TAKES FROM THIS PROCESS'S OWN
+/// ENVIRONMENT (backlog dda26693, review acab446c F8b, the environment
+/// half). Everything else it is handed, the door sets by name: the
+/// system of record's address, the reader's identity, port table and
+/// door, the car's instant, the not-found channel and the empty token
+/// directory.
+///
+/// WHY AN ALLOW-LIST. The probe inherited the forge's ops runner whole,
+/// minus a strip list of the names somebody had thought of. Read from
+/// the files that set them, that runner holds every address in
+/// /etc/boss/sor.env (the forge's, its journal's, the registry's, the
+/// mirror's, the ML API's), the host's id (`HOST_ID`), the request's
+/// (`OPS_REQUEST_ID`), the probe account's own drop-in names
+/// (`BOSS_PROBE_USER`, `BOSS_PROBE_DIR`, the marker's path, the view's
+/// source), the reader's override (`BOSS_PROBE_READER_ACTOR`) and
+/// systemd's (`RUNTIME_DIRECTORY`, the runner's 0700 directory where a
+/// verb's token header lives, `INVOCATION_ID`, `JOURNAL_STREAM`). None
+/// of it is a probe's to read, and a name added to that unit tomorrow
+/// would have reached car text the day it landed.
+///
+/// WHAT PROBES READ, MEASURED BEFORE CHOOSING (2026-10-10, 1,584
+/// ship-a-change cars, 1,582 with a recorded probe, 18 of them open): no
+/// probe reads a runner name except as text inside a quoted grep or a
+/// `${NAME:-default}` it supplies itself; the names they read bare are
+/// the door's (`BOSS_CAR_CONVERGED_AT` in 311, `BOSS_JOBS_URL`,
+/// `BOSS_SOR_USER`, `BOSS_SOR_DOOR`), and the tools in `probe-bin` read
+/// only the door's four. `HOME`, `USER`, `LOGNAME` and `SHELL` are the
+/// account's own, set by `runuser` after this list is applied — so not
+/// listed here: off the forge, where nothing drops to an account, an
+/// operator's HOME would hand the probe that operator's actor file.
+pub(crate) const UNATTENDED_INHERITS: [&str; 4] = ["PATH", "LANG", "LC_ALL", "TZ"];
+
+/// The name the door hands `path_prefix` to the probe's shell under; the
+/// [`PRELUDE`]'s first line moves it onto PATH and unsets it. Held equal
+/// to that line by `the_probe_bin_prefix_does_not_resolve_the_launch_words`,
+/// which needs the two to agree to find its tool.
+const PROBE_BIN_ENV: &str = "BOSS_PROBE_BIN";
 
 /// THE CAR'S OWN CONVERGENCE INSTANT, read off the car: the `merge_ref`
 /// the conductor wrote when its train landed. `None` when the car has
@@ -266,12 +333,13 @@ impl Shell {
             env: Vec::new(),
             strip: Vec::new(),
             path_prefix: None,
+            inherit: None,
             reader: None,
         }
     }
 
-    /// The argv the shell runs — `timeout`, `runuser` and `bash -c` in
-    /// the forge runner's order — with the prelude ahead of the probe's
+    /// The argv the shell runs — `timeout`, `runuser`, [`NO_NEW_PRIVS`]
+    /// and `bash -c` in the forge runner's order — with the prelude ahead of the probe's
     /// text, under the bound this run actually has: [`Self::bound`],
     /// once it is known whether a door opened. Pure, so the test pins
     /// the words rather than a run.
@@ -296,6 +364,7 @@ impl Shell {
         }
         if let (Some(u), true) = (&self.user, as_root) {
             argv.extend(["runuser", "-u", u, "--"].map(str::to_string));
+            argv.extend(NO_NEW_PRIVS.map(str::to_string));
         }
         argv
     }
@@ -341,11 +410,28 @@ impl Shell {
 
     /// Shared by execution and its provenance reads: the same directory,
     /// environment and effective user, without any broader git trust.
+    ///
+    /// PATH HERE IS THIS PROCESS'S OWN, so the launch words resolve where
+    /// verify-tick resolved them, on the runner's PATH. `path_prefix`
+    /// rides as [`PROBE_BIN_ENV`] for the [`PRELUDE`] to put on the
+    /// probe's PATH inside `bash -c`: set on this Command's PATH, as it
+    /// was until review 717a7f7c N1, it was the lookup for `timeout`
+    /// too, and through it for `runuser`, `setpriv` and `bash` — a file
+    /// of one of those names in the converged tree's `probe-bin` ran as
+    /// root, ahead of the drop to the account.
     fn command(&self, argv: &[String]) -> std::process::Command {
         let mut cmd = std::process::Command::new(&argv[0]);
         cmd.args(&argv[1..]);
         if let Some(dir) = &self.cwd {
             cmd.current_dir(dir);
+        }
+        if let Some(names) = self.inherit {
+            cmd.env_clear();
+            for name in names {
+                if let Some(value) = std::env::var_os(name) {
+                    cmd.env(name, value);
+                }
+            }
         }
         for name in &self.strip {
             cmd.env_remove(name);
@@ -353,10 +439,10 @@ impl Shell {
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
-        if let Some(prefix) = &self.path_prefix {
-            let path = std::env::var("PATH").unwrap_or_default();
-            cmd.env("PATH", format!("{}:{path}", prefix.display()));
-        }
+        match &self.path_prefix {
+            Some(prefix) => cmd.env(PROBE_BIN_ENV, prefix),
+            None => cmd.env_remove(PROBE_BIN_ENV),
+        };
         cmd
     }
 
@@ -685,6 +771,108 @@ pub(crate) fn exit_refused(door: Door, cause: &str) -> ! {
     std::process::exit(on_environment_refusal(door).exit)
 }
 
+/// The forge's unattended door, by the two dispatcher rules that file its
+/// `run-car-probe` ops-requests (`infra/dispatcher/rules/`): the run on a
+/// train's arrival, and the hourly re-run of every car whose last attempt
+/// did not prove it. Held equal to those files by a test.
+pub(crate) const ARRIVAL_PROBE_RULE: &str = "run-car-probes-on-train-arrived";
+pub(crate) const HOURLY_PROBE_RULE: &str = "recheck-failing-probes-hourly";
+
+/// A RECORD READ WITH NO READER CREDENTIAL IS REFUSED AT A HAND DOOR,
+/// BEFORE IT RUNS (design 00227628, decided by David 2026-10-09, option
+/// 3; item 64576122, parent 37742794 R3a).
+///
+/// MEASURED. The 24 h machine-gate window read 2026-10-09 18:35Z (builder
+/// run f76adc85) put two tokenless reads at 05:53:31Z on this door: a
+/// hand `boss prove` on the dev pod, 60 ms before car d6e1979f's `proven`
+/// was completed. The pod holds no reader credential by design (b35c22b4)
+/// and a pin forbids it a copy, so [`probe_reader::open`] finds none,
+/// opens no door, and every `boss-sor-read` the probe runs goes out with
+/// no token — which the machine gate refuses once it enforces. Under
+/// enforce that is a 401, `curl -f` makes it exit 22, and the door would
+/// record a NOT PROVEN (or, at `--disproved`, a disproof) about correct
+/// code: a verdict on the host, written as a verdict on the change.
+///
+/// THE DECISION. Those reads are named refused, not routed elsewhere —
+/// the alternatives were a reader slot in the dev container (it widens
+/// what the pod holds) and a read through the pod's stamping door as the
+/// operator (against review 177b4976 N2). A probe that reads the record
+/// is proven by the forge's unattended door ([`ARRIVAL_PROBE_RULE`],
+/// [`HOURLY_PROBE_RULE`]), which needs no hand. So this door says so
+/// before anything is sent, rather than letting the gate say it after.
+///
+/// WHICH PROBES: one that RUNS a known record client, in command position
+/// ([`boss_jobs::probe::record_read_client`]) — a mention, a grep for its
+/// name, or a `git show` of its file reads only the tree and still runs.
+/// The original reader-only check missed `boss-api` (0b4705f8); naming
+/// an identity does not put a reader credential in this environment.
+/// WHICH HOSTS: one whose credential path holds nothing at all
+/// ([`probe_reader::holds_no_credential`], the reading `open` uses). A
+/// host that holds one gets the door and reads as the reader; a broken
+/// deposit is `open`'s environment refusal, unchanged. The unattended
+/// door is never refused here: it is the door this sentence names.
+///
+/// `None` when the probe may run.
+///
+/// [`probe_reader::open`]: crate::probe_reader::open
+/// [`probe_reader::holds_no_credential`]: crate::probe_reader::holds_no_credential
+pub(crate) fn record_read_refusal(probe: &str, door: Door, no_credential: bool) -> Option<String> {
+    if door == Door::Unattended || !no_credential {
+        return None;
+    }
+    let reader = boss_jobs::probe::record_read_client(probe)?;
+    let what_here = match door {
+        Door::Hand => {
+            "This door records nothing for it: once the car's train has arrived, the forge \
+             records the proof (or the attempt) on the car by itself."
+        }
+        Door::Recheck => {
+            "--recheck re-runs it only on a host that holds the credential; the forge's \
+             hourly door re-runs it while the car is not proven."
+        }
+        Door::Disproved => {
+            "A disproof of it is recorded only on a host that holds the credential; the \
+             forge records a probe that fails as the car's NOT PROVEN attempt by itself."
+        }
+        Door::Unattended => "",
+    };
+    Some(format!(
+        "REFUSED BEFORE ANYTHING WAS SENT — this probe reads the system of record through \
+         `{reader}`, and this host holds no reader credential, so each read would go out \
+         carrying no token, which the machine gate refuses under enforce. Decided on design \
+         00227628 (David, 2026-10-09): a probe that reads the record is proven by the forge's \
+         unattended door — `{ARRIVAL_PROBE_RULE}` runs it when the car's train arrives, and \
+         `{HOURLY_PROBE_RULE}` runs it again every hour while its last attempt has not proven \
+         it. {what_here} Nothing ran and nothing is recorded, and no stated reason overrides \
+         this. A probe that reads only the tree (`git show HEAD:<path>`) still runs here."
+    ))
+}
+
+/// [`record_read_refusal`] asked of a door's own shell, as an error the
+/// door returns before `execute_with` — the one call each hand door makes
+/// between building its shell and running the probe. A shell that names
+/// no reader can open no door, so it counts as holding none.
+pub(crate) fn refuse_a_record_read_without_a_reader(
+    probe: &str,
+    shell: &Shell,
+    door: Door,
+) -> Result<()> {
+    let no_credential = shell
+        .reader
+        .as_ref()
+        .is_none_or(crate::probe_reader::holds_no_credential);
+    match record_read_refusal(probe, door, no_credential) {
+        None => Ok(()),
+        Some(why) => bail!(
+            "{why}\n  (the reader credential this host would use: {})",
+            shell.reader.as_ref().map_or_else(
+                || "none named".to_string(),
+                |c| c.credential.display().to_string()
+            )
+        ),
+    }
+}
+
 /// The file whose presence says "the probe account verified on this host,
 /// this runner tick" — named by the drop-in `infra/forge/probe-account.sh`
 /// writes for the ops runner, and written by that script's `verify-tick`
@@ -701,23 +889,105 @@ pub(crate) const PROBE_VERIFIED_FILE_ENV: &str = "BOSS_PROBE_VERIFIED_FILE";
 /// It has to be here, before `runuser`: `runuser -u <absent>` exits 1,
 /// and exit 1 is what a probe that ran and failed exits.
 ///
-/// `None` from a host that names no marker: that host's converge has not
-/// reached this rule yet, and the door behaves as it did.
+/// `None` when no marker is named. At the unattended door that case never
+/// reaches here: [`unattended_ground`] refuses a host that names no marker
+/// (or no account, or no view) first, through [`unnamed_probe_host_refusal`].
+/// What is left is a hand run of a shell that names a user, which runs as
+/// whoever runs it.
 pub(crate) fn probe_account_refusal(user: &str, marker: Option<&Path>) -> Option<String> {
     let marker = marker?;
     let said = std::fs::read_to_string(marker).ok();
     if said.as_deref().map(str::trim) == Some(user) {
         return None;
     }
+    let why = match tick_reason(marker) {
+        Some(reason) => format!(
+            "this tick's verify-tick said: {reason} — the host's converge is what repairs it"
+        ),
+        None => "verify-tick left no reason beside the marker (it did not run this tick, or \
+                 predates the reason) — the host's converge packet says what it found under \
+                 probe_account, and that converge is what repairs it"
+            .to_string(),
+    };
     Some(format!(
         "the probe account {user} is not verified on this host for this runner tick ({} {}); \
-         no probe runs until it is — the host's converge packet says why under probe_account, \
-         and that converge is what repairs it",
+         no probe runs until it is — {why}",
         marker.display(),
         match said {
             Some(other) => format!("names {:?}", other.trim()),
             None => "is absent".to_string(),
         }
+    ))
+}
+
+/// Beside the marker, the file `verify-tick` leaves when it writes none:
+/// `<marker>.why`, one line (backlog dda26693, review acab446c F3). Held
+/// equal to the script's `local why=` line by a test.
+pub(crate) const PROBE_TICK_WHY_SUFFIX: &str = ".why";
+
+/// The most of it a refusal carries. The file is root's own in the
+/// runner's 0700 runtime directory, so this is a bound on a sentence,
+/// not a defence: nothing is read whole on the door's path.
+pub(crate) const PROBE_TICK_WHY_MAX: usize = 1024;
+
+/// THE TICK'S OWN REASON (backlog dda26693, review acab446c F3). A tick
+/// that refused used to say why only on the runner's journal, while this
+/// refusal sent the car's reader to the converge packet — written every
+/// ten minutes, and `verified` while ticks failed for a cause of their
+/// own (the 30 s fetch, a runuser bound under load). `None` when there is
+/// no reason file, or nothing in it.
+fn tick_reason(marker: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut name = marker.as_os_str().to_os_string();
+    name.push(PROBE_TICK_WHY_SUFFIX);
+    let mut bytes = Vec::new();
+    std::fs::File::open(PathBuf::from(name))
+        .ok()?
+        .take(PROBE_TICK_WHY_MAX as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!line.is_empty()).then_some(line)
+}
+
+/// THE HOST NAMES ALL THREE, OR NO PROBE (decision c98c79aa, question
+/// `fallback`; backlog 703358ce, 2026-10-09). The unattended door runs
+/// car text only as the account the host names (`BOSS_PROBE_USER`), in
+/// the view it names (`BOSS_PROBE_DIR`), on a tick whose marker it names
+/// (`BOSS_PROBE_VERIFIED_FILE`) — all three set by the one drop-in
+/// infra/forge/probe-account.sh writes on the forge's converge. Until
+/// this, an unset account was filled with `david` and an unset view with
+/// `/home/david/boss`, and a host naming no marker "behaved as it did":
+/// so a forge whose drop-in was never written, or was lost, ran car text
+/// as the checkout's owner — who reaches root on that host. Measured
+/// unreachable on the forge when this landed (every proof since
+/// 2026-10-07 records user boss-probe, uid 997), which is why it can be a
+/// refusal now: the transition the default covered is over. Any one
+/// missing is an environment refusal, named, so the car records
+/// did-not-run and the hourly recheck retries it once the converge has
+/// written the drop-in.
+pub(crate) fn unnamed_probe_host_refusal(
+    user: Option<&str>,
+    dir: Option<&Path>,
+    marker: Option<&Path>,
+) -> Option<String> {
+    let unset: Vec<&str> = [
+        (user.is_none(), "BOSS_PROBE_USER"),
+        (dir.is_none(), "BOSS_PROBE_DIR"),
+        (marker.is_none(), PROBE_VERIFIED_FILE_ENV),
+    ]
+    .into_iter()
+    .filter_map(|(missing, name)| missing.then_some(name))
+    .collect();
+    if unset.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "this host does not name the probe account's {} — no probe runs here until the \
+         drop-in infra/forge/probe-account.sh writes on this host's converge names it, and \
+         never as the checkout's owner or as root",
+        unset.join(", ")
     ))
 }
 
@@ -755,18 +1025,42 @@ fn probe_account_marker() -> Option<PathBuf> {
 /// runs" was not literally true of this door. Now it is: a refusal
 /// returns before either, and the caller records it as the environment's
 /// the same way `execute_with` would have.
+///
+/// AND THE HOST IS ASKED BEFORE THE ACCOUNT: a host that names no
+/// account, view or marker refuses here ([`unnamed_probe_host_refusal`]),
+/// so the shell [`Shell::unattended`] builds without them — no user, no
+/// directory — never reaches `execute_with`, where no user would mean
+/// this process's own: root, at the forge's ops runner.
+///
+/// AND NO FILE BEFORE EITHER (backlog dda26693, review 37f44583 F1): the
+/// reader half of the shell — the port table root reads out of the probe's
+/// directory, and `base`, the system of record this verb resolved — is
+/// added here, after the answer, so a refusal returns before root opens
+/// anything there, not only before it runs anything.
 pub(crate) fn unattended_ground(
     shell: Shell,
     merge_ref: Option<&str>,
+    base: &str,
 ) -> (Shell, ProbeObservation, Option<String>) {
-    let refused = shell
-        .user
-        .as_deref()
-        .and_then(|user| probe_account_refusal(user, probe_account_marker().as_deref()));
+    let marker = probe_account_marker();
+    let refused = unnamed_probe_host_refusal(
+        shell.user.as_deref(),
+        shell.cwd.as_deref(),
+        marker.as_deref(),
+    )
+    .or_else(|| {
+        shell
+            .user
+            .as_deref()
+            .and_then(|user| probe_account_refusal(user, marker.as_deref()))
+    });
     if refused.is_some() {
         return (shell, ProbeObservation::default(), refused);
     }
-    let shell = shell.with_car_instant(merge_ref);
+    let tree = shell.cwd.clone();
+    let shell = shell
+        .with_probe_reader(tree.as_deref(), base)
+        .with_car_instant(merge_ref);
     let tree = probe_tree(&shell);
     (shell, tree, None)
 }
@@ -1657,15 +1951,20 @@ pub(crate) fn admit(probe: &str, from_car: bool) -> Admission {
              NARROWER WORLD, silently. What this verb would record is a proof of nothing.\
              \n\n{evidence}\n\n\
              Read it as a named reader instead — `boss-api GET /api/...` where that door \
-             exists, `{reader} /api/...` on the forge, a curl that sends an identity \
+             has a reader credential, `{reader} /api/...` on the forge, a curl that sends an identity \
              header, or a gateway session (POST /api/auth/guest, then curl -b). The DOOR \
              has to do the read; `jq` or `python3` fed its stdout is a parser and is not \
-             refused (5dc5159d).\n\n\
+             refused (5dc5159d). On a host with no reader credential, every known record \
+             client is refused BEFORE execution at the manual proof doors, even with a \
+             stated identity: design 00227628 routes such proof to the forge's \
+             `{hourly}` door instead. This guidance does not authorize an operator token \
+             or a reader deposit in the dev pod.\n\n\
              If this read IS identified in a way a text check cannot see, say so and it \
              runs: {OVERRIDE_FLAG} '<reason>'. The reason is recorded in the proof, because \
              `--recheck` re-runs this probe later when nobody is watching.",
             evidence = boss_jobs::probe::UNIDENTIFIED_READ_EVIDENCE,
             reader = boss_jobs::probe::SOR_READER,
+            hourly = HOURLY_PROBE_RULE,
         )
     });
     // The git-date rule (c0ac92b8) fails open the same way — a string
@@ -1733,7 +2032,45 @@ pub(crate) fn admit(probe: &str, from_car: bool) -> Admission {
     Admission { refusal, warnings }
 }
 
-/// THE SIX SHAPE WARNINGS, in the wording every door can use (the
+/// What the UNATTENDED door refuses: everything [`admit`] refuses, and
+/// the gate-log-alone clearance that [`admit`] only warns of (review
+/// 4ce5ca85 N1, backlog ce72aea9).
+///
+/// The hand door warns because a person is standing there to say
+/// whether the probe asserts an absence (which the one-fact-per-caller
+/// gap turns green) or a presence (which it does not). Here nobody is,
+/// and the dispatcher's refusal before filing (`ship_refusal` in
+/// `jobs_run_car_probes.rs`) does not cover every request this door
+/// executes: one filed by hand, by another rule, or by a dispatcher
+/// still on the old build runs all the same, and its PROVEN is recorded.
+/// Car 176d5c9d was recorded PROVEN here at 2026-10-10T04:00Z on such a
+/// probe, the third after 033c5c2f and 099f8a9f. No override: there is
+/// no one to state a reason, and the hand door is the way round.
+pub(crate) fn unattended_refusal(car_id: &str, probe: &str) -> Option<Refusal> {
+    admit(probe, true).refusal.or_else(|| {
+        let kind = boss_jobs::probe::clears_a_caller_from_the_gate_log_alone(probe)?;
+        Some(Refusal {
+            rule: boss_jobs::probe::GATE_LOG_ALONE_RULE,
+            text: format!(
+                "THE PROBE CLEARS A CALLER FROM THE GATE LOG ALONE — it counts `{kind}` facts \
+                 in the gate window's `.log.dirty` and never reads the live tally's \
+                 `.live[].snapshot.rows`, so a caller the running service had already tallied \
+                 passes whatever it sends, and this door has nobody to ask whether that is \
+                 the claim.\n\n{evidence}\n\n\
+                 The car has landed, so it is not re-parked: prove it by hand with a probe \
+                 that also reads the live rows —\n  {by_hand}\n\n\
+                 If the claim is a PRESENCE — the gate DID state this caller, which the log \
+                 answers correctly — run this same probe by hand, where it warns rather than \
+                 refuses and a person reads which claim it makes:\n  {from_car}",
+                evidence = boss_jobs::probe::GATE_LOG_ALONE_EVIDENCE,
+                by_hand = boss_jobs::probe::hand_proof_command(car_id),
+                from_car = boss_jobs::probe::from_car_command(car_id),
+            ),
+        })
+    })
+}
+
+/// THE EIGHT SHAPE WARNINGS, in the wording every door can use (the
 /// prefix is the door's). All read the probe TEXT, like the two rules
 /// above them, and all are host-independent — so they are said at every
 /// door a human is standing at, `--from-car` or not. The third
@@ -1761,7 +2098,10 @@ pub(crate) fn admit(probe: &str, from_car: bool) -> Admission {
 /// logged facts with the live tally never read. The gate writes one
 /// would-refuse fact per caller key per process, so "none since the
 /// cutoff" is true of a caller already tallied — but a probe asserting
-/// that a fact EXISTS has the same text and is correct.
+/// that a fact EXISTS has the same text and is correct. That argument
+/// holds only where a person stands: `boss gate --park-probe` refuses
+/// it since 5605c2b5, because the unattended door refuses it and a car
+/// parked with it could never be proven by the machine.
 pub(crate) fn shape_warnings(probe: &str) -> impl Iterator<Item = String> {
     let inverted = boss_jobs::probe::asserts_its_own_negation(probe).then(|| {
         format!(
@@ -1865,6 +2205,21 @@ pub(crate) fn shape_warnings(probe: &str) -> impl Iterator<Item = String> {
             evidence = boss_jobs::probe::GATE_LOG_ALONE_EVIDENCE,
         )
     });
+    // A PINNED BLOB (2770eba8) is refused at park, where re-parking is
+    // free. Here it is said and run: it fails toward RED, never toward a
+    // false green, and a landed car whose pins still hold is honestly
+    // proven by it once.
+    let pinned = boss_jobs::probe::pins_file_bytes(probe).map(|tool| {
+        format!(
+            "THIS PROBE PINS A FILE'S BYTES — it reads a content id with `{tool}` and \
+             compares it to a literal, so it proves which bytes were checked out, not that \
+             the change works, and the next edit to that file turns it red on correct code.\
+             \n  {evidence}\n  \
+             This is a warning here and a refusal at `boss gate --park-probe`: the shape \
+             fails CLOSED, and a landed car cannot be re-parked.",
+            evidence = boss_jobs::probe::PINNED_BYTES_EVIDENCE,
+        )
+    });
     inverted
         .into_iter()
         .chain(rewritten)
@@ -1873,6 +2228,7 @@ pub(crate) fn shape_warnings(probe: &str) -> impl Iterator<Item = String> {
         .chain(truncated)
         .chain(mention)
         .chain(log_alone)
+        .chain(pinned)
 }
 
 /// THE NINTH SHAPE, AND THE ONE THE TEXT CANNOT SHOW (backlog
@@ -2170,7 +2526,7 @@ pub(crate) enum Eligible {
     Live,
     /// `--recheck` re-runs a probe already recorded on the car and
     /// writes nothing, so a finished car is a legitimate target — which
-    /// is the whole reason [`crate::gate::all_cars_at`] pages over closed
+    /// is the whole reason [`crate::sor_client::all_cars_at`] pages over closed
     /// cars instead of filtering `status=open` at the API.
     AnyStatus,
 }
@@ -2533,7 +2889,8 @@ pub(crate) fn car_probe(car: &Value) -> Result<(String, String)> {
             "this car is EVENT-BOUND, not probed: {event}\n\n\
              Its builder recorded the event that proves it instead of a command, so there \
              is nothing for --from-car to run. Prove it by hand when the event fires: \
-             boss prove <car> --probe '<what you observed>' --expect '<string>' --verified '<prose>'."
+             {}.",
+            boss_jobs::probe::hand_proof_command("<car>")
         );
     }
     let Some(probe) = md(boss_jobs::car::PROOF_PROBE) else {
@@ -2607,7 +2964,7 @@ fn proven_metadata(
         // VERBATIM, as a string, exactly like the gate receipt: what the
         // machine saw, not a summary of it.
         "proof": proof,
-        "completed_at": crate::gate::stamp(now),
+        "completed_at": crate::sor_client::stamp(now),
     });
     if let Some(m) = method {
         md["method"] = json!(m);
@@ -2671,9 +3028,9 @@ fn proven_writes(car_id: &str, step_id: &str, md: &Value) -> Vec<(reqwest::Metho
 //     ($BOSS_PROBE_TIMEOUT, default 60 s) — `Shell::unattended`. On the
 //     forge both are named by the drop-in infra/forge/probe-account.sh
 //     writes: the account boss-probe and its read-only view,
-//     /var/lib/boss/probe-view (backlog 703358ce). The code's own
-//     defaults, david and /home/david/boss, are the twin's from before
-//     that account, and are what a host with no drop-in still gets;
+//     /var/lib/boss/probe-view (backlog 703358ce). There is no default:
+//     the twin's, david and /home/david/boss, were retired on 2026-10-09,
+//     and a host with no drop-in runs no probe (`unattended_ground`);
 //   - the probe's environment is exactly what a recorded probe is
 //     promised: BOSS_JOBS_URL, a READ-ONLY reader identity as
 //     BOSS_SOR_USER (backlog 61085a9e — never this verb's own write
@@ -2683,7 +3040,12 @@ fn proven_writes(car_id: &str, step_id: &str, md: &Value) -> Vec<(reqwest::Metho
 //     PATH so `boss-sor-read` is the cheap thing to type, and the
 //     car's OWN converged instant (backlog a92571a6 — the fixed cutoff
 //     a dated claim compares against, since the checkout's HEAD moves
-//     with every train);
+//     with every train) — every piece read out of the checkout only
+//     after the account has answered (`unattended_ground`, review
+//     37f44583 F1), and the probe launched with no_new_privs set
+//     (`NO_NEW_PRIVS`, review acab446c F8b) — and NOTHING ELSE of the
+//     ops runner's environment but PATH, LANG, LC_ALL and TZ
+//     (`UNATTENDED_INHERITS`, the same finding's environment half);
 //   - every outcome lands on the car: PROVEN completes `proven` with
 //     the proof record (and `proven_by`, which the yard reads); every
 //     other verdict — NOT YET, NOT RUN, NOT PROVEN — stamps
@@ -2737,18 +3099,18 @@ pub(crate) fn sor_ports_table(text: &str) -> String {
         .join(" ")
 }
 
-/// THE ACCOUNT THE UNATTENDED DOOR DROPS TO, and whether the host named
-/// it: `BOSS_PROBE_USER` from the ops runner's drop-in
-/// (infra/forge/probe-account.sh), or the default the twin had. One
-/// reading, so the host check of the reader socket's hand-over
-/// (`probe_door_check`) hands to the account this door would.
-pub(crate) fn probe_user() -> (String, bool) {
-    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-    // The read and its default stay on ONE line: boss-testing's
-    // machine_token_deposit_sh holds the forge's unit roster to it.
-    let user = var("BOSS_PROBE_USER").unwrap_or_else(|| "david".into());
-    let named = var("BOSS_PROBE_USER").is_some();
-    (user, named)
+/// THE ACCOUNT THE UNATTENDED DOOR DROPS TO, if the host names one:
+/// `BOSS_PROBE_USER` from the ops runner's drop-in
+/// (infra/forge/probe-account.sh). `None` is a host that names none, and
+/// there the door runs nothing ([`unnamed_probe_host_refusal`]) — the
+/// twin's default, the checkout's owner, was retired on 2026-10-09
+/// (backlog 703358ce). One reading, so the host check of the reader
+/// socket's hand-over (`probe_door_check`) hands to the account this
+/// door would.
+pub(crate) fn probe_user() -> Option<String> {
+    std::env::var("BOSS_PROBE_USER")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
 }
 
 /// Where the twin's tools live, relative to the checkout the probe runs
@@ -2759,15 +3121,22 @@ pub(crate) const SOR_PORTS_ENV: &str = "infra/forge/sor-ports.env";
 impl Shell {
     /// The unattended door's shell, from the same environment the
     /// twin read (`BOSS_PROBE_USER`, `BOSS_PROBE_DIR`,
-    /// `BOSS_PROBE_TIMEOUT`, `BOSS_PROBE_READER_ACTOR`) so a forge that
-    /// set none of them changes nothing. `base` is the system of record
-    /// this verb resolved, handed to the probe as `BOSS_JOBS_URL`.
-    pub(crate) fn unattended(base: &str) -> Result<Self> {
+    /// `BOSS_PROBE_TIMEOUT`). An account or directory the host does not
+    /// name stays `None` — never the checkout's owner or its checkout —
+    /// and [`unattended_ground`] refuses such a shell before anything
+    /// runs.
+    ///
+    /// ENVIRONMENT ONLY, NO FILE (backlog dda26693, review 37f44583 F1).
+    /// This used to end in [`Shell::with_probe_reader`], which opens the
+    /// port table inside `BOSS_PROBE_DIR` as root, and the door built it
+    /// as the argument to [`unattended_ground`] — so on the tick whose
+    /// verify had refused the view, root still opened a path in it,
+    /// following a link and reading it whole. The reader half is now
+    /// added by `unattended_ground`, after the account has answered.
+    pub(crate) fn unattended() -> Result<Self> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-        let (user, _) = probe_user();
-        let dir = std::path::PathBuf::from(
-            var("BOSS_PROBE_DIR").unwrap_or_else(|| "/home/david/boss".into()),
-        );
+        let user = probe_user();
+        let dir = var("BOSS_PROBE_DIR").map(std::path::PathBuf::from);
         let timeout = match var("BOSS_PROBE_TIMEOUT") {
             Some(t) => t.parse::<u64>().map_err(|_| {
                 anyhow::anyhow!("BOSS_PROBE_TIMEOUT={t:?} is not a number of seconds")
@@ -2777,10 +3146,13 @@ impl Shell {
         Ok(Self {
             path_prefix: None,
             reader: None,
-            cwd: Some(dir.clone()),
-            user: Some(user),
+            cwd: dir,
+            user,
             timeout_secs: Some(timeout),
             env: Vec::new(),
+            // Nothing of the ops runner's own beyond the allow-list
+            // (review acab446c F8b, the environment half).
+            inherit: Some(&UNATTENDED_INHERITS),
             // This verb's own write credential never reaches the
             // probe's text; `boss_jobs::probe::names_an_actor` refuses
             // a probe that sets one, and this is the other half. Nor
@@ -2791,8 +3163,7 @@ impl Shell {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-        }
-        .with_probe_reader(Some(&dir), base))
+        })
     }
 
     /// THE ENVIRONMENT A RECORDED PROBE IS PROMISED, BUILT ONCE FOR
@@ -2887,6 +3258,14 @@ pub(crate) enum Admitted {
         step_id: String,
         verified: String,
     },
+    /// A car that closed LANDED with its proof OWED (backlog b9005734):
+    /// run this probe, and pay the debt on the car itself — its `proven`
+    /// was skipped by the landing close, so there is no step to complete.
+    Owed {
+        probe: String,
+        expect: String,
+        verified: String,
+    },
     /// `proven` is already completed — nothing to run, and not a red.
     AlreadyProven,
     /// Not a car this door will run: the reason, for the packet.
@@ -2923,9 +3302,49 @@ pub(crate) fn admit_unattended(car: &Value) -> Admitted {
     let Some(step) = proven_step_unattended(car) else {
         return Admitted::Refused(format!("{short} has no proven step"));
     };
+    // `verified` is the car's own claim (the summary), the same
+    // default the hand door's --from-car uses; a car without one is
+    // still proven, by the probe it recorded.
+    let verified = || {
+        car_verified(car, None)
+            .unwrap_or_else(|_| "proven by the probe the car recorded at park time".into())
+    };
+    let md = car.get("metadata");
+    let marked = |k: &str| md.and_then(|m| m.get(k)).and_then(Value::as_str) == Some("true");
+    // THE MARKER IS NOT ENOUGH (review 9daaa7a9 F2). Any UPDATE_JOB
+    // holder can PATCH `proof_owed`, and nothing clears it when a car
+    // marked owed is later disproved, abandoned or unlanded — each of
+    // which skips `proven` exactly as the landing close does. So an owed
+    // proof is run only for a car that is CLOSED, still LANDED by the one
+    // definition (`is_landed`, which reads `unlanded` where the bare
+    // `merged` string above cannot), and neither disproved nor abandoned.
+    let owed = md.is_some_and(boss_jobs::car::owes_proof)
+        && car.get("status").and_then(Value::as_str) == Some("closed")
+        && boss_jobs::car::is_landed(car)
+        && !marked("disproved")
+        && !marked("abandoned");
+    let paid = md
+        .and_then(|m| m.get(boss_jobs::car::PROOF_OWED))
+        .and_then(Value::as_str)
+        == Some("paid");
     match step.get("status").and_then(Value::as_str).unwrap_or("") {
         "ready" | "active" => {}
         "completed" => return Admitted::AlreadyProven,
+        // A PAID debt is proven, not abandoned (review 9daaa7a9 F1): a
+        // repeat request — filed by hand, re-filed, or the hourly settle
+        // of an unsettled one — answers as the step path's repeat does,
+        // nothing to run, exit 0, never REFUSED with the wrong reason.
+        "skipped" if paid => return Admitted::AlreadyProven,
+        // THE OBLIGATION'S DOOR (b9005734, car 2). The landing close
+        // skipped `proven`, and the marker — not the step — is what is
+        // owed, on a car that still stands landed (see `owed` above).
+        "skipped" if owed => {
+            return Admitted::Owed {
+                probe,
+                expect,
+                verified: verified(),
+            };
+        }
         other => {
             return Admitted::Refused(format!(
                 "{short}'s proven step is {other:?} (pending = not merged; skipped = abandoned)"
@@ -2935,17 +3354,37 @@ pub(crate) fn admit_unattended(car: &Value) -> Admitted {
     let Some(step_id) = step.get("id").and_then(Value::as_str) else {
         return Admitted::Refused(format!("{short}'s proven step has no id"));
     };
-    // `verified` is the car's own claim (the summary), the same
-    // default the hand door's --from-car uses; a car without one is
-    // still proven, by the probe it recorded.
-    let verified = car_verified(car, None)
-        .unwrap_or_else(|_| "proven by the probe the car recorded at park time".into());
     Admitted::Run {
         probe,
         expect,
         step_id: step_id.to_string(),
-        verified,
+        verified: verified(),
     }
+}
+
+/// The car metadata key an owed proof is paid under: the same record
+/// `proven` carries when completed (`verified`, `proof`, `completed_at`)
+/// plus `proven_by`, held on the car because its `proven` step was
+/// skipped by the landing close and a closed packet's steps are history.
+pub(crate) const OWED_PROOF: &str = "owed_proof";
+
+/// PURE: the one metadata PATCH that pays an owed proof — the proof on
+/// the car and the marker turned to `paid`, in ONE write, so no reader
+/// can see a proof recorded while the debt still reads open, or the
+/// reverse. `paid` (not a deleted key) because the obligation's reader
+/// asks `metadata_has=proof_owed`: a paid car stays findable as one
+/// that owed and was paid, and `owes_proof` answers false for it.
+pub(crate) fn owed_paid_patch(
+    verified: &str,
+    proof: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    let mut paid = proven_metadata(verified, proof, None, now);
+    paid["proven_by"] = json!(PROVEN_BY);
+    json!({
+        (boss_jobs::car::PROOF_OWED): "paid",
+        (OWED_PROOF): paid,
+    })
 }
 
 /// The one line the ops-request's output leads its verdict with: the
@@ -2988,9 +3427,9 @@ pub(crate) const PROVEN_BY: &str = "run-car-probe";
 /// admitted; the car is re-read from the system of record, never
 /// trusted from the packet that asked.
 pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::Utc>) -> Result<()> {
-    let http = crate::gate::machine_client()?;
-    let base = crate::gate::resolve_jobs_base(None)?;
-    let car = crate::gate::api(
+    let http = crate::sor_client::machine_client()?;
+    let base = crate::sor_client::resolve_jobs_base(None)?;
+    let car = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         &format!("/api/jobs/{car_id}"),
@@ -2999,13 +3438,20 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
     .await?
     .ok_or_else(|| anyhow::anyhow!("GET /api/jobs/{car_id} answered no body"))?;
     let short = crate::train::id8(car_id);
+    // `step_id` is `None` for an OWED car: closed, its `proven` skipped,
+    // so a green pays the debt on the car rather than completing a step.
     let (probe, expect, step_id, verified) = match admit_unattended(&car) {
         Admitted::Run {
             probe,
             expect,
             step_id,
             verified,
-        } => (probe, expect, step_id, verified),
+        } => (probe, expect, Some(step_id), verified),
+        Admitted::Owed {
+            probe,
+            expect,
+            verified,
+        } => (probe, expect, None, verified),
         Admitted::AlreadyProven => {
             println!("boss prove: {short} is already proven — nothing to run");
             return Ok(());
@@ -3018,8 +3464,10 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
     // The gate's rule on a recorded probe, at this door too: a probe
     // that reads the system of record unidentified is refused — it
     // would pass an absence assertion against a narrowed world — and
-    // there is no operator here to override.
-    if let Some(r) = admit(&probe, true).refusal {
+    // there is no operator here to override. A caller cleared from the
+    // gate log alone is refused here too, where the hand door only warns
+    // ([`unattended_refusal`], review 4ce5ca85 N1).
+    if let Some(r) = unattended_refusal(car_id, &probe) {
         eprintln!("boss prove: REFUSED — {r}");
         std::process::exit(REFUSED_EXIT);
     }
@@ -3031,9 +3479,10 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
     // remote-tracking ref, and `tree_head` is the fact that matters:
     // production's own revision at the moment the claim was judged.
     // Observed only once the account has answered: `unverified` is its
-    // refusal, and then nothing was run in that directory at all.
+    // refusal, and then nothing was run or opened in that directory at
+    // all — the reader's port table included (review 37f44583 F1).
     let (shell, tree, unverified) =
-        unattended_ground(Shell::unattended(&base)?, car_merge_ref(&car));
+        unattended_ground(Shell::unattended()?, car_merge_ref(&car), &base);
     let at = now.to_rfc3339();
     let here = host();
     let o = match unverified.map_or_else(|| execute_with(&probe, &shell), not_run) {
@@ -3052,7 +3501,7 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
                 false,
                 &refusal_patch(&car, &probe, Some(&expect), &here, &at, &cause),
                 |patch| async move {
-                    crate::gate::api(http, reqwest::Method::PATCH, &path, Some(patch))
+                    crate::sor_client::api(http, reqwest::Method::PATCH, &path, Some(patch))
                         .await
                         .map(|_| ())
                 },
@@ -3069,10 +3518,21 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
     let verdict = verdict(&probe, &o, Some(&expect));
     if let Verdict::Proven = verdict {
         let proof = proof_json(&probe, Some(&expect), &o, &here, &at, &tree, None);
-        let mut md = proven_metadata(&verified, &serde_json::to_string(&proof)?, None, now);
-        md["proven_by"] = json!(PROVEN_BY);
-        for (method, path, body) in proven_writes(car_id, &step_id, &md) {
-            crate::gate::api(&http, method, &path, Some(body))
+        let proof = serde_json::to_string(&proof)?;
+        let writes = match &step_id {
+            Some(step_id) => {
+                let mut md = proven_metadata(&verified, &proof, None, now);
+                md["proven_by"] = json!(PROVEN_BY);
+                proven_writes(car_id, step_id, &md)
+            }
+            None => vec![(
+                reqwest::Method::PATCH,
+                format!("/api/jobs/{car_id}/metadata"),
+                owed_paid_patch(&verified, &proof, now),
+            )],
+        };
+        for (method, path, body) in writes {
+            crate::sor_client::api(&http, method, &path, Some(body))
                 .await
                 .map_err(|e| {
                     anyhow::anyhow!(
@@ -3105,7 +3565,7 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
     let prior = car.pointer("/metadata/proof_attempt");
     let attempt = attempt_json(&probe, Some(&expect), &o, &here, &at, &why, prior);
     let attempt = with_wait_observed(attempt, &car, &shell, prior, &at);
-    crate::gate::api(
+    crate::sor_client::api(
         &http,
         reqwest::Method::PATCH,
         &format!("/api/jobs/{car_id}/metadata"),
@@ -3122,7 +3582,14 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
         "boss prove: {}",
         unattended_verdict_line(&short, &verdict, &expect, &why)
     );
-    println!("boss prove: proof_attempt recorded, proven stays ready");
+    println!(
+        "boss prove: proof_attempt recorded, {}",
+        if step_id.is_some() {
+            "proven stays ready"
+        } else {
+            "the proof stays owed"
+        }
+    );
     println!(
         "  stdout: {}\n  stderr: {}",
         if o.stdout.trim().is_empty() {
@@ -3159,9 +3626,9 @@ pub(crate) async fn run(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let overriding = override_reason(probe_anyway.as_deref())?;
-    let http = crate::gate::machine_client()?;
-    let base = crate::gate::resolve_jobs_base(None)?;
-    let cars = crate::gate::all_cars_at(&http, &base).await?;
+    let http = crate::sor_client::machine_client()?;
+    let base = crate::sor_client::resolve_jobs_base(None)?;
+    let cars = crate::sor_client::all_cars_at(&http, &base).await?;
     // THE TREE THE PROBE'S READER COMES OUT OF (backlog 18fee481): the
     // worktree the operator is standing in, which carries
     // `infra/forge/probe-bin` by construction. Outside one there is no
@@ -3293,6 +3760,9 @@ pub(crate) async fn run(
         let shell = Shell::here(cwd.map(Path::new))
             .with_probe_reader(tree.as_deref(), &base)
             .with_car_instant(car_merge_ref(car));
+        // A record read on a host with no reader credential is refused
+        // before anything is sent (design 00227628).
+        refuse_a_record_read_without_a_reader(&probe, &shell, Door::Recheck)?;
         // WHICH TREE THIS RE-RUN READS (backlog 6f581de6). A recheck
         // records nothing, so there is no immutable fact to refuse —
         // but its HOLDS / NO LONGER HOLDS is acted on by a human, and
@@ -3446,6 +3916,10 @@ pub(crate) async fn run(
     let shell = Shell::here(None)
         .with_probe_reader(tree.as_deref(), &base)
         .with_car_instant(car_merge_ref(car));
+    // A record read on a host with no reader credential is refused before
+    // anything is sent, `--dry` included — a dry run still runs the probe
+    // (design 00227628).
+    refuse_a_record_read_without_a_reader(&probe, &shell, Door::Hand)?;
     // OBSERVED ONCE, USED TWICE: the guard below judges it, and the
     // proof records it (backlog 6f581de6). Two readings could disagree
     // — a train lands between them — and a proof stamped with a tree
@@ -3488,7 +3962,7 @@ pub(crate) async fn run(
                 dry,
                 &refusal_patch(car, &probe, expect.as_deref(), &host(), &at, &cause),
                 |patch| async move {
-                    crate::gate::api(http, reqwest::Method::PATCH, &path, Some(patch))
+                    crate::sor_client::api(http, reqwest::Method::PATCH, &path, Some(patch))
                         .await
                         .map(|_| ())
                 },
@@ -3526,7 +4000,7 @@ pub(crate) async fn run(
             }
             let prior = car.pointer("/metadata/proof_attempt");
             let attempt = attempt_json(&probe, expect.as_deref(), &o, &here, &at, &why, prior);
-            crate::gate::api(
+            crate::sor_client::api(
                 &http,
                 reqwest::Method::PATCH,
                 &format!("/api/jobs/{car_id}/metadata"),
@@ -3561,7 +4035,7 @@ pub(crate) async fn run(
             let prior = car.pointer("/metadata/proof_attempt");
             let attempt = attempt_json(&probe, expect.as_deref(), &o, &here, &at, &why, prior);
             let attempt = with_wait_observed(attempt, car, &shell, prior, &at);
-            crate::gate::api(
+            crate::sor_client::api(
                 &http,
                 reqwest::Method::PATCH,
                 &format!("/api/jobs/{car_id}/metadata"),
@@ -3634,9 +4108,9 @@ pub(crate) async fn run(
         history.push(json!({
             "proof": serde_json::to_string(&proof)?,
             "verified": verified,
-            "recorded_at": crate::gate::stamp(now),
+            "recorded_at": crate::sor_client::stamp(now),
         }));
-        crate::gate::api(
+        crate::sor_client::api(
             &http,
             reqwest::Method::PATCH,
             &format!("/api/jobs/{car_id}/metadata"),
@@ -3653,7 +4127,7 @@ pub(crate) async fn run(
     }
 
     for (method, path, body) in proven_writes(&car_id, &sid, &md) {
-        crate::gate::api(&http, method, &path, Some(body)).await?;
+        crate::sor_client::api(&http, method, &path, Some(body)).await?;
     }
 
     println!("boss prove: {short} proven — the probe is recorded and re-runnable");
@@ -4484,7 +4958,7 @@ mod tests {
         );
         // The stamp must match the conductor's format byte for byte —
         // proof lag is this minus `review.completed_at`.
-        assert_eq!(md["completed_at"], json!(crate::gate::stamp(now)));
+        assert_eq!(md["completed_at"], json!(crate::sor_client::stamp(now)));
         // And it does not disturb what the step already carried.
         assert_eq!(md["verified"], json!("v"));
         assert_eq!(md["proof"], json!("{\"exit\":0}"));
@@ -4695,12 +5169,12 @@ mod tests {
     /// false negative the paging above exists to prevent.
     #[tokio::test]
     async fn a_car_page_without_a_total_is_refused_not_read_as_all() {
-        let (base, stub) = crate::gate::stub::one_request(
+        let (base, stub) = crate::sor_client::stub::one_request(
             r#"{"data":[{"id":"00000000-0000-0000-0000-0000000000cc","status":"closed"}]}"#,
         )
         .await;
-        let http = crate::gate::machine_client().unwrap();
-        let why = crate::gate::all_cars_at(&http, &base)
+        let http = crate::sor_client::machine_client().unwrap();
+        let why = crate::sor_client::all_cars_at(&http, &base)
             .await
             .expect_err("a page without its total cannot say the read is complete")
             .to_string();
@@ -4775,8 +5249,8 @@ mod tests {
         });
 
         let base = format!("http://{addr}");
-        let http = crate::gate::machine_client().unwrap();
-        let cars = crate::gate::all_cars_at(&http, &base)
+        let http = crate::sor_client::machine_client().unwrap();
+        let cars = crate::sor_client::all_cars_at(&http, &base)
             .await
             .expect("paging read succeeds");
         assert_eq!(
@@ -5801,9 +6275,9 @@ ugrep: warning: complete\": No such file or directory\n";
     }
 
     /// THE SHELL'S ARGV, in the twin's order: `timeout -k 5 <secs>`,
-    /// then `runuser -u <user> --` only when this process is root, then
-    /// `bash -c` with the prelude ahead of the probe's text. The hand
-    /// door is the bare `bash -c`.
+    /// then `runuser -u <user> -- setpriv --no-new-privs` only when this
+    /// process is root, then `bash -c` with the prelude ahead of the
+    /// probe's text. The hand door is the bare `bash -c`.
     #[test]
     fn the_unattended_shell_runs_under_timeout_and_drops_to_the_probe_user() {
         let shell = Shell {
@@ -5813,16 +6287,28 @@ ugrep: warning: complete\": No such file or directory\n";
             env: Vec::new(),
             strip: Vec::new(),
             path_prefix: None,
+            inherit: None,
             reader: None,
         };
         let as_root = shell.command_line("echo x", true);
         assert_eq!(
-            &as_root[..8],
-            &["timeout", "-k", "5", "60", "runuser", "-u", "david", "--"]
+            &as_root[..10],
+            &[
+                "timeout",
+                "-k",
+                "5",
+                "60",
+                "runuser",
+                "-u",
+                "david",
+                "--",
+                "setpriv",
+                "--no-new-privs"
+            ]
         );
-        assert_eq!(&as_root[8..10], &["bash", "-c"]);
-        assert!(as_root[10].contains("command_not_found_handle()"));
-        assert!(as_root[10].ends_with("\necho x"), "{}", as_root[10]);
+        assert_eq!(&as_root[10..12], &["bash", "-c"]);
+        assert!(as_root[12].contains("command_not_found_handle()"));
+        assert!(as_root[12].ends_with("\necho x"), "{}", as_root[12]);
         // Not root: the twin's by-hand path, as this user, still timed.
         let as_user = shell.command_line("echo x", false);
         assert_eq!(&as_user[..6], &["timeout", "-k", "5", "60", "bash", "-c"]);
@@ -5830,6 +6316,57 @@ ugrep: warning: complete\": No such file or directory\n";
         let hand = Shell::here(None).command_line("echo x", true);
         assert_eq!(&hand[..2], &["bash", "-c"]);
         assert_eq!(hand.len(), 3);
+    }
+
+    /// THE LAUNCH THE DOOR USES IS THE ONE THE TICK ASKS FOR (backlog
+    /// dda26693, review acab446c F8b; CLAUDE.md §9a). The door drops to
+    /// the account and then sets no_new_privs; verify-tick asks the
+    /// account to run those same words before it writes the marker, so a
+    /// host whose setpriv cannot set the flag stops probes (did-not-run)
+    /// instead of answering each with exit 1 — NOT PROVEN on correct code.
+    /// The words live twice, here and in the script, and are held equal.
+    #[test]
+    fn the_launch_words_are_the_ones_the_tick_asks_the_account_to_run() {
+        let shell = Shell {
+            user: Some("boss-probe".into()),
+            ..Shell::here(None)
+        };
+        let prefix = shell.command_prefix(true, None);
+        let after = prefix
+            .split(|w| w == "--")
+            .nth(1)
+            .expect("runuser's words end at --");
+        assert_eq!(after, NO_NEW_PRIVS, "{prefix:?}");
+        let script =
+            std::fs::read_to_string(boss_testing::repo_root().join("infra/forge/probe-account.sh"))
+                .expect("infra/forge/probe-account.sh");
+        let asked = format!("as_account {} ", NO_NEW_PRIVS.join(" "));
+        assert_eq!(
+            script.matches(&asked).count(),
+            1,
+            "probe-account.sh must ask the account to run `{asked}` once, in verify_now"
+        );
+        // And the words run here and leave the flag set. Both the dev pod
+        // and the gate run with allowPrivilegeEscalation: false, where the
+        // flag is already 1, so this cannot tell the flag from its absence
+        // on those boxes; what it proves is that the spelling is one this
+        // host's setpriv runs. The tick's own read of the flag is what
+        // tells them apart on the forge.
+        let o = std::process::Command::new(NO_NEW_PRIVS[0])
+            .args(&NO_NEW_PRIVS[1..])
+            .args(["grep", "^NoNewPrivs:", "/proc/self/status"])
+            .output()
+            .expect("setpriv is util-linux, beside runuser");
+        let seen = String::from_utf8_lossy(&o.stdout);
+        assert!(
+            o.status.success(),
+            "{seen}{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert_eq!(
+            seen.split_whitespace().collect::<Vec<_>>(),
+            ["NoNewPrivs:", "1"]
+        );
     }
 
     /// A PROBE THAT OUTLIVES ITS TIMEOUT IS KILLED AND SAYS SO: exit
@@ -5855,7 +6392,7 @@ ugrep: warning: complete\": No such file or directory\n";
     /// of this verb's own: `env` set, `strip` removed, `path_prefix`
     /// first on PATH, and the run in `cwd`. The reader identity a
     /// recorded probe's `boss-sor-read` sends is exactly the one
-    /// `Shell::unattended` builds.
+    /// `Shell::with_probe_reader` builds for the unattended door.
     #[test]
     fn the_unattended_shell_hands_the_probe_its_env_and_strips_the_verbs_actor() {
         let dir = boss_testing::scratch::scratch_dir("prove-unattended-env");
@@ -5873,6 +6410,7 @@ ugrep: warning: complete\": No such file or directory\n";
             ],
             strip: vec!["BOSS_PROVE_TEST_LEAK".into()],
             path_prefix: Some(bin),
+            inherit: Some(&UNATTENDED_INHERITS),
             reader: None,
         };
         let o = execute_with(
@@ -5912,7 +6450,7 @@ ugrep: warning: complete\": No such file or directory\n";
     #[test]
     fn both_doors_hand_a_probe_the_same_reader_environment() {
         let base = "http://sor.invalid:7900";
-        let unattended = Shell::unattended(base).expect("the unattended door builds");
+        let unattended = unattended_answered(base);
         // Its own checkout, so this holds wherever BOSS_PROBE_DIR points.
         let hand = Shell::here(None).with_probe_reader(unattended.cwd.as_deref(), base);
         assert_eq!(hand.env, unattended.env, "the promised env is one thing");
@@ -5978,6 +6516,17 @@ ugrep: warning: complete\": No such file or directory\n";
         assert_ne!(user["id"], crate::identity::UNIDENTIFIED);
     }
 
+    /// The unattended door's shell as it stands once the account has
+    /// answered: what `Shell::unattended` builds from the environment,
+    /// with the reader half `unattended_ground` then adds out of its view
+    /// (review 37f44583 F1) — without asking this process's environment
+    /// for a marker.
+    fn unattended_answered(base: &str) -> Shell {
+        let built = Shell::unattended().expect("the unattended door builds");
+        let view = built.cwd.clone();
+        built.with_probe_reader(view.as_deref(), base)
+    }
+
     /// THE FOUR DOORS A CAR'S PROBE RUNS AT, each built the way its own
     /// call site builds it, with the reader credential at `credential`
     /// and the system of record at `base`. The unattended door runs here
@@ -5990,7 +6539,7 @@ ugrep: warning: complete\": No such file or directory\n";
         let unattended = Shell {
             user: None,
             cwd: Some(scratch.clone()),
-            ..Shell::unattended(base).unwrap()
+            ..unattended_answered(base)
         };
         let mut doors = vec![
             ("unattended", unattended),
@@ -6009,14 +6558,14 @@ ugrep: warning: complete\": No such file or directory\n";
 
     /// Each of those four sites names the door in non-test source: the
     /// three `Shell::here(..).with_probe_reader(..)` and the unattended
-    /// constructor, which calls it itself.
+    /// door's, which `unattended_ground` adds once the account answers.
     #[test]
     fn every_door_names_the_reader_door_it_may_open() {
         let prod = |src: &'static str| src.split("#[cfg(test)]").next().unwrap_or("");
         let prove = prod(include_str!("prove.rs"));
         let disprove = prod(include_str!("disprove.rs"));
         let named = |src: &str| src.matches(".with_probe_reader(").count();
-        // recheck, hand, and inside `Shell::unattended`.
+        // recheck, hand, and inside `unattended_ground`.
         assert_eq!(
             named(prove),
             3,
@@ -6695,7 +7244,7 @@ case ${n:-empty} in empty|*[!0-9]*) echo 'not yet: the machine-gate window could
         // is not warned about in turn.
         let fixed = format!(
             "{log}{}",
-            r#"live=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r '([ .live[]? | select(.service == "jobs") ] | first) as $j | if $j == null or (($j.snapshot.rows | type) != "array") or (($j.snapshot.overflow // 0) != 0) then "unreadable" else ([ $j.snapshot.rows[] | select(.user == "automation:estate-observer" and .presented == "none") ] | length | tostring) end')
+            r#"live=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --arg cut "$cut" '([ .live[]? | select(.service == "jobs") ] | first) as $j | if $j == null or (($j.snapshot.rows | type) != "array") or $j.snapshot.overflow != 0 or $j.snapshot.mode == "off" or $j.snapshot.recording_since > $cut then "unreadable" else ([ $j.snapshot.rows[] | select(.user == "automation:estate-observer" and .presented == "none") ] | length | tostring) end')
 case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally could not be read whole'; exit 75;; esac
 "#
         );
@@ -6704,6 +7253,103 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             "{:?}",
             shape_warnings(&fixed).collect::<Vec<_>>()
         );
+    }
+
+    /// AND REFUSED AT THE EXECUTOR WHEN NOBODY IS THERE (review 4ce5ca85
+    /// N1). The dispatcher refuses this shape before filing a
+    /// run-car-probe request, but a request filed by hand, by another
+    /// rule, or by a dispatcher still on the old build reaches
+    /// `boss prove --from-car --unattended` all the same — and the car
+    /// is recorded PROVEN on what comes back (176d5c9d, 2026-10-10T04:00Z,
+    /// by a request filed before any refusal existed). So the unattended
+    /// door refuses it too, while the hand door keeps the warning. The
+    /// spelling with no kind named is car 59e0d3dd's.
+    #[test]
+    fn the_unattended_door_refuses_a_probe_that_clears_a_caller_from_the_gate_log_alone() {
+        let named = r#"n=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --arg cut "$cut" '[.log.dirty[] | select(.kind == "machine_gate.would_refuse" and .payload.key.user == "automation:estate-observer" and .at > $cut)] | length')"#;
+        let unnamed = r#"w=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=168'); n=$(printf '%s' "$w" | jq '[.log.dirty[] | select(.payload.key.user == "automation:probe-admission-source-access")] | length')"#;
+        for probe in [named, unnamed] {
+            assert!(
+                admit(probe, true).refusal.is_none(),
+                "the hand door warns and runs: {probe}"
+            );
+            let r = unattended_refusal("c0ffee12", probe)
+                .unwrap_or_else(|| panic!("the unattended door must refuse: {probe}"));
+            assert_eq!(r.rule, boss_jobs::probe::GATE_LOG_ALONE_RULE);
+            assert!(r.text.contains("snapshot.rows"), "{r}");
+            assert!(
+                r.text
+                    .contains(&boss_jobs::probe::hand_proof_command("c0ffee12")),
+                "the refusal names the act that moves a landed car: {r}"
+            );
+            // F3 of review 446039a0: a presence claim has the hand door.
+            assert!(
+                r.text
+                    .contains(&boss_jobs::probe::from_car_command("c0ffee12")),
+                "{r}"
+            );
+        }
+        // The two rules every door refuses still come first, unchanged.
+        let unidentified = "curl -fsS $BOSS_JOBS_URL/api/jobs?kind=gate-run | grep -q c0ffee";
+        assert_eq!(
+            unattended_refusal("c0ffee12", unidentified).map(|r| r.rule),
+            Some(UNIDENTIFIED_RULE)
+        );
+        // And the probe that also reads the live rows runs.
+        let both = format!(
+            "{named}\nlive=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=1' | jq --arg cut \"$cut\" '[.live[] | select(.snapshot.mode != \"off\" and .snapshot.overflow == 0 and .snapshot.recording_since <= $cut) | .snapshot.rows[]] | length')"
+        );
+        assert!(unattended_refusal("c0ffee12", &both).is_none());
+    }
+
+    /// THE COMMANDS A REFUSAL PRINTS ARE COMMANDS THIS VERB TAKES (review
+    /// 446039a0 F1). The unattended refusal printed `boss prove <car>
+    /// --probe … --expect …`, and this verb refuses that line for want of
+    /// `--verified` — so the act it named was itself refused. Both
+    /// spellings every door prints are parsed here by the CLI's own
+    /// parser, and the hand proof carries every value `run` requires.
+    #[test]
+    fn the_hand_proofs_a_refusal_names_parse_as_this_verb() {
+        use clap::Parser;
+        // Words as the shell would split them: a single-quoted run is one.
+        let argv = |line: String| -> Vec<String> {
+            line.split('\'')
+                .enumerate()
+                .flat_map(|(i, part)| {
+                    if i % 2 == 1 {
+                        vec![part.to_string()]
+                    } else {
+                        part.split_whitespace().map(str::to_string).collect()
+                    }
+                })
+                .collect()
+        };
+        let by_hand =
+            crate::Cli::try_parse_from(argv(boss_jobs::probe::hand_proof_command("c0ffee12")))
+                .unwrap_or_else(|e| panic!("{e}"));
+        let crate::Commands::Prove {
+            car,
+            probe,
+            expect,
+            verified,
+            from_car,
+            ..
+        } = by_hand.command
+        else {
+            panic!("not a prove");
+        };
+        assert_eq!(car, "c0ffee12");
+        assert!(!from_car);
+        assert!(
+            probe.is_some() && expect.is_some() && verified.is_some(),
+            "run() refuses a hand proof missing any of the three"
+        );
+        let from = crate::Cli::try_parse_from(argv(boss_jobs::probe::from_car_command("c0ffee12")))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            from.command,
+            crate::Commands::Prove { from_car: true, .. }
+        ));
     }
 
     /// A MENTION IS NOT A DEFINITION, SAID AT THE SAME DOOR (e7cf78c6):
@@ -6777,10 +7423,153 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             printed.contains("STRIP-SAW=unset"),
             "the strip must remove it: {printed}"
         );
-        let shell = Shell::unattended("http://sor.invalid:7900").unwrap();
+        let shell = Shell::unattended().unwrap();
         for name in ["BOSS_ACTOR", "BOSS_ACTOR_FILE"] {
             assert!(shell.strip.contains(&name.to_string()), "{:?}", shell.strip);
         }
+    }
+
+    /// THE UNATTENDED PROBE STARTS FROM AN ALLOW-LIST (backlog dda26693,
+    /// review acab446c F8b, the environment half). The forge's ops runner
+    /// carries the account's own names, the reader's, the host's id, the
+    /// request's, every address in /etc/boss/sor.env and systemd's, and a
+    /// strip list removed only the ones somebody had thought of. Proven
+    /// by effect, as the strip is: this binary re-run with a runner-shaped
+    /// environment, the unattended door's probe listing every exported
+    /// name it was handed, and the hand door's beside it — which is the
+    /// operator's own shell and keeps everything.
+    #[test]
+    fn the_unattended_probe_inherits_only_the_allow_list() {
+        const INNER: &str = "BOSS_PROVE_ALLOW_INNER";
+        // Names the forge's runner holds that no probe is promised, read
+        // from the units and files that set them (infra/ops/
+        // boss-ops-runner.service, install-ops-runner.sh's drop-in,
+        // probe-account.sh's drop-in, render-sor-env.sh, ops-runner.sh's
+        // verb launch, systemd's own).
+        let runner: [(&str, &str); 10] = [
+            (
+                PROBE_VERIFIED_FILE_ENV,
+                "/run/boss-ops-runner/probe-verified",
+            ),
+            ("BOSS_PROBE_USER", "boss-probe"),
+            (
+                "BOSS_PROBE_READER_ACTOR",
+                "a-reader-of-the-runners-choosing",
+            ),
+            ("BOSS_PROBE_VIEW_SOURCE", "/var/lib/boss/tree/current"),
+            ("HOST_ID", "forge"),
+            ("OPS_REQUEST_ID", "00000000-0000-0000-0000-000000000000"),
+            ("JOBS_API", "http://sor.invalid:7900"),
+            ("BOSS_FORGE_URL", "http://forge.invalid:3000"),
+            ("RUNTIME_DIRECTORY", "/run/boss-ops-runner"),
+            ("INVOCATION_ID", "0123456789abcdef"),
+        ];
+        let list = "compgen -e | sort | tr '\\n' ' '";
+        if std::env::var(INNER).is_ok() {
+            let scratch = boss_testing::scratch::scratch_dir("prove-allow-list");
+            let unattended = Shell {
+                user: None,
+                cwd: Some(scratch),
+                ..unattended_answered("http://sor.invalid:7900")
+            };
+            for (door, shell) in [("here", Shell::here(None)), ("unattended", unattended)] {
+                let o = execute_with(list, &shell).unwrap();
+                println!("{door}: {}", o.stdout.trim());
+            }
+            return;
+        }
+        let me = std::env::current_exe().unwrap();
+        let mut cmd = std::process::Command::new(me);
+        cmd.args([
+            "--exact",
+            "prove::tests::the_unattended_probe_inherits_only_the_allow_list",
+            "--nocapture",
+        ])
+        .env(INNER, "1")
+        .env("LANG", "C.UTF-8")
+        .env("TZ", "UTC");
+        for (k, v) in runner {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let printed = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{printed}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let names = |door: &str| -> Vec<String> {
+            printed
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{door}: ")))
+                .unwrap_or_else(|| panic!("no {door} line: {printed}"))
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        let unattended = names("unattended");
+        // What the door itself sets, what bash exports of its own, and
+        // the allow-list: nothing else.
+        let door_set = [
+            "BOSS_JOBS_URL",
+            "BOSS_SOR_USER",
+            "BOSS_SOR_PORTS",
+            "BOSS_PROBE_NOTFOUND",
+            boss_core::machine_token::TOKEN_DIR_ENV,
+        ];
+        let bash_own = ["PWD", "OLDPWD", "SHLVL", "_"];
+        for name in &unattended {
+            assert!(
+                UNATTENDED_INHERITS.contains(&name.as_str())
+                    || door_set.contains(&name.as_str())
+                    || bash_own.contains(&name.as_str()),
+                "the unattended probe was handed {name}, which is neither the door's own nor \
+                 on the allow-list: {unattended:?}"
+            );
+        }
+        for name in ["PATH", "LANG", "TZ", "BOSS_JOBS_URL", "BOSS_SOR_USER"] {
+            assert!(
+                unattended.iter().any(|n| n == name),
+                "{name} must reach it: {unattended:?}"
+            );
+        }
+        // The hand door is the operator's shell, as it was: it keeps the
+        // runner-shaped names this door drops.
+        let here = names("here");
+        for (k, _) in runner {
+            assert!(
+                here.iter().any(|n| n == k),
+                "{k} at the hand door: {here:?}"
+            );
+        }
+    }
+
+    /// THE LAUNCH WORDS RESOLVE ON THE RUNNER'S PATH, NOT THE TREE'S
+    /// (review 717a7f7c N1 of car f5d53af7). `probe-bin` was put first on
+    /// the PATH of the Command itself, so `timeout`, and through it
+    /// `runuser`, `setpriv` and `bash`, were looked up there first: a file
+    /// named `timeout` in the converged tree's `infra/forge/probe-bin` ran
+    /// as root at the forge, ahead of the drop to the account, while
+    /// verify-tick had checked the launch on the unit's own PATH. The
+    /// prefix now reaches the probe inside `bash -c`, where it is the
+    /// account's lookup and nobody else's.
+    #[test]
+    fn the_probe_bin_prefix_does_not_resolve_the_launch_words() {
+        let dir = boss_testing::scratch::scratch_dir("prove-launch-words");
+        let bin = dir.join("pbin");
+        std::fs::create_dir_all(&bin).unwrap();
+        boss_testing::write_exec(&bin.join("timeout"), "#!/bin/sh\necho HIJACKED\n");
+        boss_testing::write_exec(&bin.join("tool-on-prefix"), "#!/bin/sh\necho prefix:ok\n");
+        let shell = Shell {
+            cwd: Some(dir.clone()),
+            timeout_secs: Some(30),
+            path_prefix: Some(bin),
+            ..Shell::here(None)
+        };
+        let o = execute_with("tool-on-prefix", &shell).expect("bash runs");
+        assert!(!o.stdout.contains("HIJACKED"), "{o:?}");
+        assert_eq!(o.exit, 0, "{o:?}");
+        assert!(o.stdout.contains("prefix:ok"), "{o:?}");
     }
 
     /// NO MACHINE TOKEN REACHES A PROBE, AT EITHER DOOR (design 6805c764
@@ -6810,7 +7599,7 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             let unattended = Shell {
                 user: None,
                 cwd: Some(scratch),
-                ..Shell::unattended("http://sor.invalid:7900").unwrap()
+                ..unattended_answered("http://sor.invalid:7900")
             };
             for (door, shell) in [("here", Shell::here(None)), ("unattended", unattended)] {
                 let o = execute_with(&probe, &shell).unwrap();
@@ -7045,6 +7834,103 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
         }
     }
 
+    /// AN OWED PROOF IS PAID ON A CLOSED CAR (backlog b9005734, car 2).
+    /// The obligation (car 1, rule `rerun-owed-proofs-on-job-closed`)
+    /// files `run-car-probe` for a car that closed LANDED with its proof
+    /// owed — closed, `proven` skipped by the landing, `proof_owed =
+    /// "true"` — and until this car the door it files to refused exactly
+    /// that car ("proven step is skipped"), so the obligation fired and
+    /// nothing ran. Such a car is now run; a skipped `proven` on a car
+    /// that owes NOTHING (abandoned, disproved, or already paid) is still
+    /// refused, because the marker, not the step, is what is owed.
+    #[test]
+    fn the_unattended_door_runs_an_owed_proof_on_a_closed_car() {
+        let owed = |marker: Value, proven: &str| {
+            let mut m = json!({"merged": "true", "proof_probe": "true && echo x:ok",
+                               "proof_expect": "x:ok", "summary": "the claim"});
+            m[boss_jobs::car::PROOF_OWED] = marker;
+            json!({
+                "id": "aaaaaaaa-0000-4000-8000-000000000000", "kind": "ship-a-change",
+                "status": "closed", "metadata": m,
+                "steps": [{"id": "s-proven", "spec_slug": "proven", "title": PROVEN, "status": proven}]
+            })
+        };
+        match admit_unattended(&owed(json!("true"), "skipped")) {
+            Admitted::Owed {
+                probe,
+                expect,
+                verified,
+            } => {
+                assert_eq!(probe, "true && echo x:ok");
+                assert_eq!(expect, "x:ok");
+                assert_eq!(verified, "the claim");
+            }
+            other => panic!("an owed, closed car is run: {other:?}"),
+        }
+        for marker in [Value::Null, json!(true)] {
+            match admit_unattended(&owed(marker.clone(), "skipped")) {
+                Admitted::Refused(why) => assert!(why.contains("skipped"), "{why}"),
+                other => panic!("{marker:?} owes nothing, so skipped is refused: {other:?}"),
+            }
+        }
+        // A PAID debt answers as a proven step does — nothing to run,
+        // exit 0 — never "skipped = abandoned" (review 9daaa7a9 F1).
+        assert!(matches!(
+            admit_unattended(&owed(json!("paid"), "skipped")),
+            Admitted::AlreadyProven
+        ));
+        // THE MARKER ALONE ADMITS NOTHING (review 9daaa7a9 F2): a car
+        // still carrying `proof_owed = "true"` that was disproved,
+        // abandoned, unlanded (it keeps `merged = "true"`, car.rs
+        // `is_landed`), or is not closed at all, is refused.
+        let mark = |key: &str, value: Value| {
+            let mut car = owed(json!("true"), "skipped");
+            car["metadata"][key] = value;
+            car
+        };
+        let mut open = owed(json!("true"), "skipped");
+        open["status"] = json!("open");
+        for (why_refused, car) in [
+            ("disproved", mark("disproved", json!("true"))),
+            ("abandoned", mark("abandoned", json!("true"))),
+            (
+                "unlanded",
+                mark(boss_jobs::car_unland::UNLANDED_MARKER, json!("true")),
+            ),
+            ("not closed", open),
+        ] {
+            match admit_unattended(&car) {
+                Admitted::Refused(why) => assert!(why.contains("skipped"), "{why}"),
+                other => panic!("a {why_refused} car owes nothing to run: {other:?}"),
+            }
+        }
+        // A car marked owed while still OPEN at `proven` takes the
+        // ordinary road: the step is there to complete.
+        assert!(matches!(
+            admit_unattended(&owed(json!("true"), "ready")),
+            Admitted::Run { .. }
+        ));
+    }
+
+    /// PAYING IT: the proof lands on the CAR, never on its skipped step
+    /// (a closed packet's steps are history), and the marker turns to
+    /// `paid`, so the obligation stops asking and a reader sees what paid
+    /// it and when.
+    #[test]
+    fn an_owed_proof_is_paid_by_the_marker_and_the_proof_on_the_car() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let patch = owed_paid_patch("the claim", "{\"exit\":0}", now);
+        assert_eq!(patch[boss_jobs::car::PROOF_OWED], "paid");
+        let paid = &patch[OWED_PROOF];
+        assert_eq!(paid["verified"], "the claim");
+        assert_eq!(paid["proof"], "{\"exit\":0}");
+        assert_eq!(paid["proven_by"], PROVEN_BY);
+        assert!(paid["completed_at"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(!boss_jobs::car::owes_proof(&patch));
+    }
+
     /// THE OUTPUT SHAPE THE PACKET'S READERS EXPECT: the verdict line
     /// leads with its ALL-CAPS word — PROVEN, NOT YET, NOT RUN, NOT
     /// PROVEN — then the car, then why; and the exit code is one of
@@ -7186,8 +8072,10 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
         assert_eq!(o.exit, 0, "{o:?}");
         assert!(ran.exists());
 
-        // A host that names no marker has not converged onto the rule,
-        // and the hand door drops to nobody: both run as before.
+        // No marker handed in, and the hand door drops to nobody: both
+        // run here. At the unattended door a host naming no marker never
+        // gets this far — `unattended_ground` refuses it first
+        // (`a_host_that_names_no_probe_account_runs_no_probe_as_anyone`).
         assert!(execute_gated("true", &shell, token(), None).is_ok());
         assert!(
             execute_gated("true", &Shell::here(None), token(), Some(&dir.join("none"))).is_ok()
@@ -7324,6 +8212,62 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
         }
     }
 
+    /// THE TICK'S OWN REASON REACHES THE CAR (backlog dda26693, review
+    /// acab446c F3). The refusal a car records used to say only that the
+    /// marker was absent and send its reader to the converge packet's
+    /// `probe_account` — written every ten minutes, and `verified` while a
+    /// tick failed for a cause of its own (its 30 s fetch, a runuser bound
+    /// under load). Now the tick leaves its reason beside the marker and the
+    /// refusal carries it, bounded; a tick that left none says so rather
+    /// than point at a packet that may not know.
+    #[test]
+    fn an_unverified_tick_hands_its_own_reason_to_the_car() {
+        let dir = boss_testing::scratch::scratch_dir("prove-tick-why");
+        let marker = dir.join("probe-account.verified");
+        let why = dir.join(format!("probe-account.verified{PROBE_TICK_WHY_SUFFIX}"));
+        let said_by_tick = "probe-account: verify-tick: NO PROBE RUNS THIS TICK — \
+                            refresh-view FAILED — fetching /home/david/boss as its owner: timed out";
+        std::fs::write(&why, format!("{said_by_tick}\n")).unwrap();
+        let cause = probe_account_refusal("boss-probe", Some(&marker)).expect("refused");
+        assert!(cause.contains("is not verified on this host"), "{cause}");
+        assert!(
+            cause.contains(&format!("this tick's verify-tick said: {said_by_tick}")),
+            "{cause}"
+        );
+        assert!(!cause.contains("converge packet says why"), "{cause}");
+
+        // A reason that is not one line of a sentence is cut, not read whole.
+        std::fs::write(&why, "x".repeat(64 * 1024)).unwrap();
+        let cause = probe_account_refusal("boss-probe", Some(&marker)).expect("refused");
+        assert!(
+            cause.len() < 2 * PROBE_TICK_WHY_MAX,
+            "{} bytes",
+            cause.len()
+        );
+
+        // No reason left: said, and the converge named as the other place.
+        std::fs::remove_file(&why).unwrap();
+        let cause = probe_account_refusal("boss-probe", Some(&marker)).expect("refused");
+        assert!(cause.contains("verify-tick left no reason"), "{cause}");
+
+        // The control: a marker naming the account runs, whatever is beside it.
+        std::fs::write(&why, "stale\n").unwrap();
+        std::fs::write(&marker, "boss-probe\n").unwrap();
+        assert_eq!(probe_account_refusal("boss-probe", Some(&marker)), None);
+    }
+
+    /// The reason file's name lives twice — the suffix here and the line
+    /// `verify_tick` names it on — and is held equal (CLAUDE.md §9a).
+    #[test]
+    fn the_tick_reason_is_written_where_the_door_reads_it() {
+        let (_, script) = marker_name_the_drop_in_sets();
+        let line = format!("local why=\"$marker{PROBE_TICK_WHY_SUFFIX}\"");
+        assert!(
+            script.contains(&line),
+            "probe-account.sh's verify_tick must name its reason file `{line}`"
+        );
+    }
+
     /// AND THE DOOR READS IT FROM THE ENVIRONMENT (review acab446c F1,
     /// mutant X1). Both tests above hand the marker to `execute_gated`, so
     /// the one line that reads this process's environment was held by
@@ -7404,7 +8348,10 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
 
         let (printed, ran) = leg("unconverged", None);
         assert!(printed.contains("WIRE=ran exit=0"), "{printed}");
-        assert!(ran, "a host that names no marker runs as before: {printed}");
+        // `execute_with` alone, as a hand run reaches it: the unattended
+        // door refuses a host naming no marker before this, in
+        // `unattended_ground` (a_host_that_names_no_probe_account_…).
+        assert!(ran, "with no marker named, execute_with runs: {printed}");
     }
 
     /// THE UNATTENDED DOOR ASKS THE ACCOUNT BEFORE IT RUNS ANYTHING IN THE
@@ -7431,7 +8378,8 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
                 user: Some("root".into()),
                 ..Shell::here(Some(&std::env::current_dir().unwrap()))
             };
-            let (shell, tree, refused) = unattended_ground(shell, Some("0123456789ab"));
+            let (shell, tree, refused) =
+                unattended_ground(shell, Some("0123456789ab"), "http://sor.invalid:7900");
             match refused {
                 Some(cause) => println!("GROUND=refused {cause}"),
                 None => println!(
@@ -7531,6 +8479,237 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
                 "run_unattended calls `{early}` itself, ahead of the account's answer"
             );
         }
+    }
+
+    /// The environment NAME the forge's drop-in sets for `value`, read off
+    /// infra/forge/probe-account.sh's own `echo "Environment=<NAME>=<value>"`
+    /// line — so the names the door reads are the script's, not a copy.
+    fn drop_in_name(script: &str, value: &str) -> String {
+        let names: Vec<String> = script
+            .lines()
+            .filter_map(|l| {
+                l.trim()
+                    .strip_prefix("echo \"Environment=")?
+                    .strip_suffix(&format!("={value}\""))
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            names.len(),
+            1,
+            "probe-account.sh must write exactly one drop-in line whose value is {value}: \
+             {names:?}"
+        );
+        names[0].clone()
+    }
+
+    /// A HOST THAT NAMES NO PROBE ACCOUNT RUNS NO PROBE — NOT AS THE
+    /// CHECKOUT'S OWNER, NOT AS ROOT (decision c98c79aa, question
+    /// `fallback`; backlog 703358ce, run a4d6ded7). The unattended door
+    /// used to fill an unset BOSS_PROBE_USER with `david` and an unset
+    /// BOSS_PROBE_DIR with `/home/david/boss`, and a host that named no
+    /// marker "behaved as it did": a forge whose drop-in was never written
+    /// or was lost ran car text as the account that reaches root there.
+    /// By effect, through `unattended_ground` with the shell
+    /// `Shell::unattended` builds, in this binary re-run with exactly the
+    /// names the script's drop-in sets: each one missing is a refusal that
+    /// names it; all three named, with a marker for the account, is the
+    /// control — the door then asks the tree, so the refusals are the
+    /// names' and not a door that never runs.
+    #[test]
+    fn a_host_that_names_no_probe_account_runs_no_probe_as_anyone() {
+        const INNER: &str = "BOSS_PROVE_UNNAMED_INNER";
+        if std::env::var(INNER).is_ok() {
+            let shell = Shell::unattended().unwrap();
+            let (_, _, refused) =
+                unattended_ground(shell, Some("0123456789ab"), "http://sor.invalid:7900");
+            match refused {
+                Some(cause) => println!("GROUND=refused {cause}"),
+                None => println!("GROUND=asked"),
+            }
+            return;
+        }
+        let (marker_name, script) = marker_name_the_drop_in_sets();
+        let user_name = drop_in_name(&script, "$ACCOUNT");
+        let dir_name = drop_in_name(&script, "$VIEW");
+        let scratch = boss_testing::scratch::scratch_dir("prove-unnamed-host");
+        let view = scratch.join("view");
+        std::fs::create_dir_all(&view).unwrap();
+        // `root`, as above: it runs wherever this test does.
+        let marker = scratch.join("root.verified");
+        std::fs::write(&marker, "root\n").unwrap();
+        let leg = |user: bool, dir: bool, mark: bool| {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "prove::tests::a_host_that_names_no_probe_account_runs_no_probe_as_anyone",
+                "--nocapture",
+            ])
+            .env(INNER, "1");
+            for name in [&user_name, &dir_name, &marker_name] {
+                cmd.env_remove(name);
+            }
+            if user {
+                cmd.env(&user_name, "root");
+            }
+            if dir {
+                cmd.env(&dir_name, &view);
+            }
+            if mark {
+                cmd.env(&marker_name, &marker);
+            }
+            let out = cmd.output().unwrap();
+            let printed = String::from_utf8_lossy(&out.stdout).to_string();
+            assert!(
+                out.status.success(),
+                "{printed}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            printed
+        };
+
+        for (user, dir, mark) in [
+            (false, false, false),
+            (true, true, false),
+            (false, true, true),
+            (true, false, true),
+        ] {
+            let printed = leg(user, dir, mark);
+            assert!(
+                printed.contains("GROUND=refused"),
+                "a host naming account={user} view={dir} marker={mark} must refuse: {printed}"
+            );
+            assert!(
+                printed.contains("never as the checkout's owner"),
+                "{printed}"
+            );
+            for (named, name) in [(user, &user_name), (dir, &dir_name), (mark, &marker_name)] {
+                assert_eq!(
+                    printed.contains(name.as_str()),
+                    !named,
+                    "the refusal names exactly what the host left unset ({name}): {printed}"
+                );
+            }
+        }
+
+        let printed = leg(true, true, true);
+        assert!(
+            printed.contains("GROUND=asked"),
+            "a host naming all three, its account verified, is asked: {printed}"
+        );
+    }
+
+    /// ROOT OPENS NO FILE IN THE PROBE VIEW BEFORE THE ACCOUNT ANSWERS
+    /// (backlog dda26693, review 37f44583 F1). `Shell::unattended` used to
+    /// end in `with_probe_reader`, which opens
+    /// `$BOSS_PROBE_DIR/infra/forge/sor-ports.env` as root — following a
+    /// link, reading it whole — and `run_unattended` built that shell as
+    /// the ARGUMENT to `unattended_ground`, so the read happened before
+    /// the account's refusal on exactly the tick whose verify had refused
+    /// the view. Measured by effect, through the shell the door builds and
+    /// the names the drop-in sets: the file is a FIFO, which an open blocks
+    /// on until a writer comes, so a door that opens it never returns and
+    /// is killed at the deadline. The control is a verified account over a
+    /// plain file: the door then reads that same path into the reader's
+    /// port table, so a refusal that returns is the account's and not a
+    /// path nobody opens.
+    #[test]
+    fn root_opens_nothing_in_the_view_before_the_account_answers() {
+        const INNER: &str = "BOSS_PROVE_VIEW_READ_INNER";
+        if std::env::var(INNER).is_ok() {
+            let shell = Shell::unattended().unwrap();
+            let (shell, _, refused) = unattended_ground(shell, None, "http://sor.invalid:7900");
+            let ports = shell
+                .env
+                .iter()
+                .find(|(k, _)| k == "BOSS_SOR_PORTS")
+                .map(|(_, v)| v.clone());
+            println!(
+                "GROUND={} reader={} ports={ports:?}",
+                if refused.is_some() {
+                    "refused"
+                } else {
+                    "asked"
+                },
+                shell.reader.is_some()
+            );
+            return;
+        }
+        let (marker_name, script) = marker_name_the_drop_in_sets();
+        let user_name = drop_in_name(&script, "$ACCOUNT");
+        let dir_name = drop_in_name(&script, "$VIEW");
+        let scratch = boss_testing::scratch::scratch_dir("prove-view-read-first");
+        let verified = scratch.join("root.verified");
+        std::fs::write(&verified, "root\n").unwrap();
+        let view_with = |label: &str, fifo: bool| {
+            let view = scratch.join(label);
+            let forge = view.join("infra/forge");
+            std::fs::create_dir_all(&forge).unwrap();
+            let ports = view.join(SOR_PORTS_ENV);
+            if fifo {
+                let made = std::process::Command::new("mkfifo")
+                    .arg(&ports)
+                    .status()
+                    .expect("mkfifo is coreutils");
+                assert!(made.success(), "mkfifo {}", ports.display());
+            } else {
+                std::fs::write(&ports, "jobs=7900\n").unwrap();
+            }
+            view
+        };
+        // `root`, as the tests above: it runs wherever this test does.
+        let leg = |view: &Path, marker: &Path| {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "prove::tests::root_opens_nothing_in_the_view_before_the_account_answers",
+                    "--nocapture",
+                ])
+                .env(INNER, "1")
+                .env(&user_name, "root")
+                .env(&dir_name, view)
+                .env(&marker_name, marker)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "the door blocked opening {} — root read the probe view before the \
+                         account answered",
+                        view.join(SOR_PORTS_ENV).display()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let out = child.wait_with_output().unwrap();
+            let printed = String::from_utf8_lossy(&out.stdout).to_string();
+            assert!(
+                out.status.success(),
+                "{printed}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            printed
+        };
+
+        let printed = leg(
+            &view_with("refused", true),
+            &scratch.join("absent.verified"),
+        );
+        assert!(
+            printed.contains("GROUND=refused reader=false ports=None"),
+            "{printed}"
+        );
+
+        let printed = leg(&view_with("asked", false), &verified);
+        assert!(
+            printed.contains("GROUND=asked reader=true ports=Some(\"jobs=7900\")"),
+            "the control: a verified account's door reads the view's port table: {printed}"
+        );
     }
 
     /// Every site in non-test source where a door runs a car's probe —
@@ -8058,5 +9237,281 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             with_wait_observed(failed.clone(), &car("true"), &shell, None, "T1"),
             failed
         );
+    }
+
+    #[test]
+    fn every_supported_record_client_is_refused_without_a_reader_at_manual_doors() {
+        for probe in [
+            "boss-api GET /api/jobs/fixture | jq -r .status",
+            "command /work/tools/bin/boss-api GET /api/jobs/fixture",
+            "body=$(env BOSS_SOR_SERVICE=jobs boss-api GET /api/jobs/fixture); echo done",
+            "boss-api GET /api/jobs/fixture | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+            "boss-sor-read /api/jobs/fixture",
+            "curl -fsS -H \"x-boss-user: $BOSS_SOR_USER\" $BOSS_JOBS_URL/api/jobs/fixture",
+            "wget -qO- $BOSS_JOBS_URL/api/jobs/fixture",
+            "python3 -c \"import urllib.request; urllib.request.urlopen('$BOSS_JOBS_URL/api/jobs/fixture')\"",
+        ] {
+            for door in [Door::Hand, Door::Recheck, Door::Disproved] {
+                let refusal = record_read_refusal(probe, door, true)
+                    .unwrap_or_else(|| panic!("{door:?} would run this record client: {probe}"));
+                assert!(refusal.contains("BEFORE ANYTHING WAS SENT"));
+                assert!(refusal.contains(ARRIVAL_PROBE_RULE));
+                assert!(refusal.contains(HOURLY_PROBE_RULE));
+                assert_eq!(record_read_refusal(probe, door, false), None);
+            }
+            assert_eq!(record_read_refusal(probe, Door::Unattended, true), None);
+        }
+    }
+
+    #[test]
+    fn the_actual_manual_guard_rejects_boss_api_before_a_client_can_execute() {
+        let held = tempfile::tempdir().unwrap();
+        let absent = held.path().join("never-deposited.credential");
+        let present = held.path().join("synthetic-present.credential");
+        std::fs::write(&present, "synthetic fixture").unwrap();
+        let broken = held.path().join("synthetic-broken.credential");
+        std::os::unix::fs::symlink(held.path().join("missing"), &broken).unwrap();
+        let probe = "boss-api GET /api/jobs/fixture";
+        for (name, door) in [
+            ("hand", Door::Hand),
+            ("recheck", Door::Recheck),
+            ("disproved", Door::Disproved),
+        ] {
+            let shell = the_four_doors("http://sor.invalid:7900", &absent)
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, s)| s)
+                .unwrap();
+            let refusal = refuse_a_record_read_without_a_reader(probe, &shell, door)
+                .expect_err("the existing guard must stop the client, without executing it");
+            assert!(format!("{refusal:#}").contains("boss-api"));
+            let bare = Shell {
+                reader: None,
+                ..shell
+            };
+            assert!(refuse_a_record_read_without_a_reader(probe, &bare, door).is_err());
+            for credential in [&present, &broken] {
+                let shell = the_four_doors("http://sor.invalid:7900", credential)
+                    .into_iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, s)| s)
+                    .unwrap();
+                assert!(refuse_a_record_read_without_a_reader(probe, &shell, door).is_ok());
+            }
+            for source_only in [
+                "git show HEAD:infra/dev/boss-api | grep -c 'GET /api/jobs'",
+                "printf '%s' '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+                "boss-gateway-read /api/jobs",
+            ] {
+                assert_eq!(record_read_refusal(source_only, door, true), None);
+            }
+        }
+    }
+
+    #[test]
+    fn identity_guidance_does_not_offer_a_tokenless_manual_record_door() {
+        let refusal = admit("curl -fsS $BOSS_JOBS_URL/api/jobs/fixture", false)
+            .refusal
+            .unwrap();
+        assert!(refusal.text.contains("no reader credential"));
+        assert!(refusal.text.contains(HOURLY_PROBE_RULE));
+    }
+
+    #[test]
+    fn wrapper_and_native_cli_record_reads_are_not_omitted_from_the_manual_guard() {
+        for probe in [
+            "bash infra/boss-api-curl.sh -fsS $BOSS_JOBS_URL/api/jobs/fixture",
+            "boss-api-curl -fsS $BOSS_JOBS_URL/api/jobs/fixture",
+            "bash infra/dev/boss-api GET /api/jobs/fixture",
+            "boss receipt fixture-car",
+            "boss job get fixture-job",
+            "boss jobs --json",
+            "boss orient",
+        ] {
+            for door in [Door::Hand, Door::Recheck, Door::Disproved] {
+                assert!(
+                    record_read_refusal(probe, door, true).is_some(),
+                    "{door:?}: {probe}"
+                );
+            }
+        }
+    }
+
+    /// DESIGN 00227628, DECIDED BY DAVID 2026-10-09 (item 64576122): a
+    /// probe that reads the record through the reader, on a host holding
+    /// no reader credential, is refused at a hand door BEFORE it runs —
+    /// its reads would go out with no token, which the machine gate
+    /// refuses under enforce — and the refusal names the forge's
+    /// unattended door, which is where such a probe is proven. A probe
+    /// that reads only the tree still runs, and so does any probe on a
+    /// host that holds the credential (the door opens for it).
+    #[test]
+    fn a_record_read_with_no_reader_credential_is_refused_before_it_runs() {
+        for reads in [
+            "boss-sor-read /api/jobs/abc | jq -r .status",
+            "n=$(boss-sor-read '/api/jobs?kind=x' | jq '.total // empty'); echo \"$n\"",
+            "set -e\nboss-sor-read /api/yard/status >/dev/null && echo ok",
+        ] {
+            for door in [Door::Hand, Door::Recheck, Door::Disproved] {
+                let r = record_read_refusal(reads, door, true).unwrap_or_else(|| {
+                    panic!("{door:?}: a record read with no credential would run: {reads}")
+                });
+                for named in [
+                    boss_jobs::probe::SOR_READER,
+                    ARRIVAL_PROBE_RULE,
+                    HOURLY_PROBE_RULE,
+                    "00227628",
+                ] {
+                    assert!(r.contains(named), "{door:?} does not name {named}: {r}");
+                }
+                assert_eq!(
+                    record_read_refusal(reads, door, false),
+                    None,
+                    "{door:?}: a host holding the credential opens the door: {reads}"
+                );
+            }
+            // The forge's own door is the one this refusal points at; it
+            // is never refused here (its credential is open()'s business).
+            assert_eq!(record_read_refusal(reads, Door::Unattended, true), None);
+        }
+        for tree_only in [
+            "git show HEAD:crates/x.rs | grep -q 'pub fn y' && echo y:ok",
+            "echo boss-sor-read is the reader",
+            "git show HEAD:infra/forge/probe-bin/boss-sor-read | grep -c curl",
+        ] {
+            assert_eq!(
+                record_read_refusal(tree_only, Door::Hand, true),
+                None,
+                "only a probe that RUNS the reader reads the record: {tree_only}"
+            );
+        }
+    }
+
+    /// The same refusal through the doors' own shells: every hand door
+    /// built on a host with no credential file refuses the record read,
+    /// and the same doors on a host holding one do not. A dangling link
+    /// is a deposit that broke, not a host without one — `open` refuses
+    /// it as the environment's, so it is not refused HERE as absent.
+    #[test]
+    fn every_hand_door_refuses_a_record_read_on_a_host_with_no_reader_credential() {
+        let held = tempfile::tempdir().unwrap();
+        let absent = held.path().join("never-deposited.credential");
+        let present = held.path().join("deposited.credential");
+        std::fs::write(&present, "x").unwrap();
+        let broken = held.path().join("broken.credential");
+        std::os::unix::fs::symlink(held.path().join("gone"), &broken).unwrap();
+        let probe = "boss-sor-read /api/jobs/abc | jq -r .status";
+        for (name, door) in [
+            ("hand", Door::Hand),
+            ("recheck", Door::Recheck),
+            ("disproved", Door::Disproved),
+        ] {
+            let shell = |credential: &Path| {
+                the_four_doors("http://sor.invalid:7900", credential)
+                    .into_iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, s)| s)
+                    .unwrap()
+            };
+            let e = refuse_a_record_read_without_a_reader(probe, &shell(&absent), door)
+                .expect_err(name);
+            let said = format!("{e:#}");
+            assert!(
+                said.contains(&absent.display().to_string()),
+                "{name}: {said}"
+            );
+            assert!(said.contains(HOURLY_PROBE_RULE), "{name}: {said}");
+            assert!(
+                refuse_a_record_read_without_a_reader(probe, &shell(&present), door).is_ok(),
+                "{name}: a host holding the credential is refused"
+            );
+            assert!(
+                refuse_a_record_read_without_a_reader(probe, &shell(&broken), door).is_ok(),
+                "{name}: a broken deposit is open()'s refusal, not absence"
+            );
+            // A shell that names no reader at all can open no door.
+            let bare = Shell {
+                reader: None,
+                ..shell(&present)
+            };
+            assert!(refuse_a_record_read_without_a_reader(probe, &bare, door).is_err());
+        }
+    }
+
+    /// WHERE IT IS ASKED: at each hand door between the shell and the
+    /// run, so nothing is sent before the refusal — and not at the
+    /// unattended door, the forge's, which is the one it names. A door
+    /// that moved the call after `execute_with`, or dropped it, would
+    /// send the reads the decision forbids.
+    #[test]
+    fn each_hand_door_asks_before_it_runs_and_the_unattended_door_does_not() {
+        let mut seen = Vec::new();
+        for src in [include_str!("prove.rs"), include_str!("disprove.rs")] {
+            let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+            let lines: Vec<&str> = prod.lines().collect();
+            for (i, l) in lines.iter().enumerate() {
+                if !l.contains("execute_with(&probe, &shell)") {
+                    continue;
+                }
+                let door = lines[i..lines.len().min(i + 40)]
+                    .iter()
+                    .find_map(|n| n.split("Door::").nth(1))
+                    .map(|r| {
+                        r.chars()
+                            .take_while(char::is_ascii_alphanumeric)
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                let start = lines[..i]
+                    .iter()
+                    .rposition(|p| {
+                        p.contains(".with_probe_reader(")
+                            || p.contains("unattended_ground(Shell::unattended")
+                    })
+                    .unwrap_or(0);
+                let between = lines[start..i].join("\n").replace("prove::", "");
+                let flat: String = between.chars().filter(|c| !c.is_whitespace()).collect();
+                let asked = flat.contains(&format!(
+                    "refuse_a_record_read_without_a_reader(&probe,&shell,Door::{door})"
+                ));
+                seen.push((door, asked));
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("Disproved".to_string(), true),
+                ("Hand".to_string(), true),
+                ("Recheck".to_string(), true),
+                ("Unattended".to_string(), false),
+            ]
+        );
+    }
+
+    /// The two rules the refusal names are the forge door's own rows:
+    /// a rename there that left the sentence naming a rule nobody runs
+    /// is the drift CLAUDE.md §9a pins.
+    #[test]
+    fn the_forge_door_the_refusal_names_is_the_rules_on_disk() {
+        for (name, file) in [
+            (
+                ARRIVAL_PROBE_RULE,
+                include_str!(
+                    "../../../../infra/dispatcher/rules/run-car-probes-on-train-arrived.toml"
+                ),
+            ),
+            (
+                HOURLY_PROBE_RULE,
+                include_str!(
+                    "../../../../infra/dispatcher/rules/recheck-failing-probes-hourly.toml"
+                ),
+            ),
+        ] {
+            assert!(
+                file.contains(&format!("name = \"{name}\"")),
+                "the rule file does not define {name}"
+            );
+        }
     }
 }

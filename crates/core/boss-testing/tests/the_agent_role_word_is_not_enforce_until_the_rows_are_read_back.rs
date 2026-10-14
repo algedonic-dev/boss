@@ -1,5 +1,7 @@
 //! No manifest line sets the `agent-role` word to `enforce` until the
-//! agents registry rows carry the roles the operator decided, read back.
+//! agents registry rows carry the roles the operator decided, read back
+//! — and since 2026-10-09, when they did, the manifest's line IS
+//! `enforce`, and the door judges a registered agent by its row.
 //!
 //! Backlog 4e51bf23, review cdff423f N7 and N8. The jobs API's login
 //! door can judge a registered agent by its registry row's role, behind
@@ -22,6 +24,26 @@
 //! WORD EDITS THIS PIN, in the same commit, and says in its park prose
 //! what it read back from `GET /api/agents`. A car that sets the word
 //! and leaves this file alone is red here, by name.
+//!
+//! THAT CAR IS THIS ONE (2026-10-09). David decided at ~02:40Z to set
+//! both agent rows to `platform-admin`, and sent the take himself. This
+//! run read the rows back at 03:28:10Z (`GET /api/agents`, total 2):
+//! `agent-claude` and `agent-codex` both held `platform-admin`. The jobs
+//! API's actor-role tally since 02:38Z saw no other agent-shaped actor,
+//! and every request from those two asserted `platform-admin`, so under
+//! `enforce` the door judges each observed request exactly as it was
+//! asserted. The pin now holds the manifest TO `enforce`. Taking the
+//! word out, or writing `report`, is the revert car's job, and that car
+//! edits this pin back in the same commit. The manifest's word is also
+//! handed to the door itself (the second test below), so what this pin
+//! holds is what the door does.
+//!
+//! WHAT THE PIN CANNOT HOLD is the tenant declaration: the algedonic-llc
+//! repo's `seeds/agents.toml`, which no gate clones. On 2026-10-09 it
+//! still declared `agent-claude` as `engineering-agent`, so a `boss
+//! tenant publish --take agents` would narrow the row, and under this
+//! word that narrows the session. The car is held until that file says
+//! `platform-admin` (backlog 4e51bf23, `finish_ledger_20261009`).
 //!
 //! N8, the second refusal: the key's value must be a string a ConfigMap
 //! can hold. Written bare, `agent-role: off` is a YAML boolean, not the
@@ -159,7 +181,7 @@ fn config_map_inline(data: &str) -> String {
 }
 
 #[test]
-fn no_manifest_line_sets_agent_role_to_enforce_or_to_a_yaml_boolean() {
+fn the_manifest_sets_agent_role_to_enforce_as_a_yaml_reader_reads_it() {
     let key = key();
     assert_eq!(key, "agent-role", "the door's word, off its own constant");
     let read = |text: &str| judged("shape", text, key);
@@ -294,44 +316,58 @@ fn no_manifest_line_sets_agent_role_to_enforce_or_to_a_yaml_boolean() {
         "ConfigMap {CONFIG_MAP} in {MANIFEST} carries the machine gate's `mode` key; if it does \
          not, this pin is reading the wrong document"
     );
-    match judged(MANIFEST, &manifest, key) {
-        Ok(documents) => assert!(
-            documents >= 1,
-            "{MANIFEST} declares ConfigMap {CONFIG_MAP}; a pin that judged no document judged \
-             nothing"
-        ),
-        Err(Refusal::Enforce(line)) => panic!(
-            "{MANIFEST}: ConfigMap {CONFIG_MAP} sets `{key}` to enforce (`{line}`).\n\
-             Under that word the jobs API judges every registered agent by its agents-registry \
-             row and drops the role it sends. Measured 2026-10-08: agent-claude's row held \
-             `engineering-agent`, which holds no policy rule, and agent-codex's held null. With \
-             rows like those, this one line locks the coordinating session and every builder \
-             out of the system of record at the next converge, and the dev session cannot patch \
-             the word back.\n\
-             WHAT MUST BE TRUE FIRST: the agents registry rows carry the roles the operator \
-             decided, READ BACK from the live registry (`boss-api GET /api/agents`), not \
-             assumed from a publish, and the tenant declaration says the same so a later \
-             `boss tenant publish --take agents` does not undo it.\n\
-             THIS PIN IS EDITED IN THE SAME CAR THAT SETS THE WORD (backlog 4e51bf23; review \
-             cdff423f N7), and that car's park prose quotes the rows it read. If you are that \
-             car, change this pin to hold the word to `enforce` on this one line; if you are \
-             not, take the line out."
-        ),
-        Err(Refusal::NotAString(line)) => panic!(
-            "{MANIFEST}: ConfigMap {CONFIG_MAP} gives `{key}` a value that is not a string as \
+    // THE WORD IS SET (2026-10-09). EVERY document of the name is judged
+    // one by one, because `judged` stops at the first `enforce` and an
+    // apply takes the last; each must say `enforce` and nothing else is
+    // admitted, so a revert is a car that edits this arm, not one line
+    // that slips past it.
+    let documents: Vec<Result<(), Refusal>> = rbac::read_stream(MANIFEST, &manifest)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .iter()
+        .filter(|o| o.kind == "ConfigMap" && o.name == CONFIG_MAP)
+        .map(|o| judge(o, &manifest, key))
+        .collect();
+    assert!(
+        !documents.is_empty(),
+        "{MANIFEST} declares ConfigMap {CONFIG_MAP}; a pin that judged no document judged nothing"
+    );
+    for document in documents {
+        match document {
+            // The line shown is the key's own: a word written anywhere
+            // else is not the one the pod mounts.
+            Err(Refusal::Enforce(line)) => assert!(
+                line.contains(key) && line.to_ascii_lowercase().contains("enforce"),
+                "{MANIFEST}: the `{key}` word is read off its own line, which says enforce: \
+                 {line}"
+            ),
+            Ok(()) => panic!(
+                "{MANIFEST}: ConfigMap {CONFIG_MAP} does not set `{key}` to enforce.\n\
+             Since 2026-10-09 it does (backlog 4e51bf23). The agents registry rows were read \
+             back at platform-admin (agent-claude, agent-codex; GET /api/agents, total 2), and \
+             the jobs API judges a registered agent by its row, never by the role it sends. \
+             Taking the word out, or writing `report` or \"off\", puts the asserted role back in \
+             charge. That is a revert, and the revert car edits this arm in the same commit, \
+             saying why in its park prose. The live way back, for when there is no time for a \
+             train, is David's: patch the ConfigMap over the LAN kube road (the comment above \
+             the key in {MANIFEST})."
+            ),
+            Err(Refusal::NotAString(line)) => panic!(
+                "{MANIFEST}: ConfigMap {CONFIG_MAP} gives `{key}` a value that is not a string as \
              written (`{line}`). An unquoted off, on, yes, no, true or false is a YAML boolean, \
              an empty value is null, and a ConfigMap's data holds strings: the apply is refused \
-             or the word is not the one written. Write \"off\" in quotes, or `report` — and put \
-             the word on the key's own line, never in a block scalar (review cdff423f N8)."
-        ),
-        Err(Refusal::Unread(what)) => panic!(
-            "{MANIFEST}: this pin could not read what ConfigMap {CONFIG_MAP} gives `{key}`: \
+             or the word is not the one written. The word is `enforce`, on the key's own line, \
+             never in a block scalar; a revert writes `report` or \"off\" in quotes, in a car \
+             that edits this pin (review cdff423f N8)."
+            ),
+            Err(Refusal::Unread(what)) => panic!(
+                "{MANIFEST}: this pin could not read what ConfigMap {CONFIG_MAP} gives `{key}`: \
              {what}\n\
              It reads the manifest the way YAML does and refuses what its reader does not read \
              (a tag, an anchor, a duplicate key, a double-quoted escape, a List), \
              because a shape it cannot read is not a word it has judged. Write the key as one \
              plain or quoted word on its own line under `data:` (delta review 012ccafa D1)."
-        ),
+            ),
+        }
     }
 }
 
@@ -442,4 +478,163 @@ fn the_doors_default_path_is_the_agent_role_key_of_the_mounted_config_map() {
         boss_jobs::agents::ROW_ROLE_MODE_FILE_ENV,
         "BOSS_AGENT_ROLE_MODE_FILE"
     );
+}
+
+/// The word the manifest hands the jobs pod, read the way YAML reads it:
+/// the LAST `boss-machine-gate` document's `data.agent-role`, because an
+/// apply takes the last of two. No key is `None`, which the door reads
+/// as `off`.
+fn the_manifests_word(manifest: &str) -> Option<String> {
+    rbac::read_stream(MANIFEST, manifest)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .iter()
+        .rfind(|o| o.kind == "ConfigMap" && o.name == CONFIG_MAP)
+        .and_then(|o| o.root.path(&["data", key()]).cloned())
+        .and_then(|node| match node.value {
+            Value::Str(word) => Some(word),
+            _ => None,
+        })
+}
+
+/// THE ROW'S ROLE DECIDES, NOT THE ASSERTED ONE — under the word the
+/// manifest actually ships (backlog 4e51bf23, 2026-10-09). The first
+/// test holds the line's spelling; this one hands that spelling to the
+/// door, through the same parse the pod's mount uses, and asks what a
+/// handler sees. On a manifest with no key (`off`) the door keeps what
+/// the caller asserted and every row-decided assertion below is red,
+/// which is what this test read before the word was set.
+///
+/// Four callers, each asserting the opposite of what its row gives:
+///  - a null row asserting platform-admin at operator tier writes as
+///    `guest` at user tier (review 42cd8068 N1: agent-codex's row);
+///  - a platform-admin row asserting `guest` writes as platform-admin at
+///    operator tier — the row raises as well as lowers, which is what
+///    lets the client doors stop asserting later;
+///  - an engineering-agent row asserting platform-admin writes as
+///    engineering-agent at user tier;
+///  - a person (`emp-*`) is not this door's question and keeps what it
+///    sent (door.rs, WHAT THIS DOES NOT CLOSE).
+#[tokio::test]
+async fn under_the_manifests_word_a_registered_agent_writes_with_its_rows_role() {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{HeaderMap, Request};
+    use axum::routing::any;
+    use boss_core::port::EventBus;
+    use boss_core::publish::PublishMode;
+    use boss_core::publisher::DomainPublisher;
+    use boss_jobs::agents::{AgentInput, AgentsRegistry, InMemoryAgents, LoginDoor, resolve_login};
+    use boss_testing::RecordingEventBus;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let manifest = std::fs::read_to_string(repo_root().join(MANIFEST))
+        .unwrap_or_else(|e| panic!("{MANIFEST}: {e}"));
+    let word = the_manifests_word(&manifest);
+    let mode = Mode::parse_as(word.as_deref(), "agent role").0;
+
+    let bus = RecordingEventBus::new();
+    let bus_dyn: Arc<dyn EventBus> = bus.clone();
+    let publisher = DomainPublisher::new(bus_dyn, "jobs");
+    let registry = InMemoryAgents::new();
+    let stamp = publisher.stamp_with_actor(publisher.default_actor()).await;
+    let row = |id: &str, login: &str, role: Option<&str>| AgentInput {
+        id: id.to_string(),
+        display_name: id.to_string(),
+        default_model: "opus-5".to_string(),
+        aliases: vec![login.to_string()],
+        role: role.map(str::to_string),
+        department: None,
+        hourly_budget_usd_micros: None,
+        max_concurrent_runs: None,
+    };
+    registry
+        .publish(
+            &[
+                row("agent-codex", "codex@algedonic.dev", None),
+                row(
+                    "agent-claude",
+                    "claude@algedonic.dev",
+                    Some("platform-admin"),
+                ),
+                row(
+                    "agent-narrow",
+                    "narrow@algedonic.dev",
+                    Some("engineering-agent"),
+                ),
+            ],
+            PublishMode::InsertIfAbsent,
+            &stamp,
+        )
+        .await
+        .expect("declare the agents");
+    let door = Arc::new(
+        LoginDoor::new(Arc::new(registry) as Arc<dyn AgentsRegistry>, publisher)
+            .judging_rows_when(move || mode),
+    );
+    async fn echo(headers: HeaderMap) -> axum::Json<serde_json::Value> {
+        let seen: serde_json::Value = headers
+            .get("x-boss-user")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        axum::Json(seen)
+    }
+    let app = axum::Router::new()
+        .route("/echo", any(echo))
+        .layer(axum::middleware::from_fn_with_state(door, resolve_login));
+
+    let seen = |id: &'static str, role: &'static str, tier: &'static str| {
+        let app = app.clone();
+        async move {
+            let header = serde_json::json!({
+                "id": id, "role": role, "access_tier": tier,
+                "territory_account_ids": [], "direct_report_ids": [], "department": null,
+            });
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/echo")
+                        .header("x-boss-user", header.to_string())
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+            let text = |f: &str| v[f].as_str().unwrap_or("").to_string();
+            (text("id"), text("role"), text("access_tier"))
+        }
+    };
+    let owned = |(a, b, c): (&str, &str, &str)| (a.to_string(), b.to_string(), c.to_string());
+    let cases = [
+        (
+            ("codex@algedonic.dev", "platform-admin", "operator"),
+            ("agent-codex", boss_core::roles::GUEST_ROLE, "user"),
+        ),
+        (
+            ("claude@algedonic.dev", "guest", "user"),
+            ("agent-claude", "platform-admin", "operator"),
+        ),
+        (
+            ("agent-narrow", "platform-admin", "operator"),
+            ("agent-narrow", "engineering-agent", "user"),
+        ),
+        (
+            ("emp-david", "platform-admin", "operator"),
+            ("emp-david", "platform-admin", "operator"),
+        ),
+    ];
+    for ((id, role, tier), want) in cases {
+        assert_eq!(
+            seen(id, role, tier).await,
+            owned(want),
+            "{id} asserting {role} at {tier}, under the manifest's agent-role word {word:?} \
+             ({mode:?}): a registered agent writes with its ROW's role and tier, never the one \
+             it sends (backlog 4e51bf23)"
+        );
+    }
 }

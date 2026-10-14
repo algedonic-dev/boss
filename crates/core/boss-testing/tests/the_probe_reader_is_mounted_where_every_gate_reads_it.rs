@@ -58,7 +58,9 @@
 use boss_core::machine_gate::{DEFAULT_READER_DIR, READER_DIR_ENV, is_gated};
 use boss_core::machine_token::DEFAULT_TOKEN_DIR;
 use boss_testing::repo_root;
+use serde::Deserialize;
 use std::collections::BTreeMap;
+use yaml_serde::Value;
 
 const MANIFESTS: &str = "infra/cluster/manifests";
 const BROKER: &str = "boss-credential-broker.yaml";
@@ -106,15 +108,111 @@ fn live_lines(text: &str) -> impl Iterator<Item = &str> {
 fn flow_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let at = line.find(&format!("{key}: "))? + key.len() + 2;
     let rest = &line[at..];
-    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    let end = rest.find([',', '}', '\n']).unwrap_or(rest.len());
     Some(rest[..end].trim().trim_matches('"'))
 }
 
-/// The mount lines naming `volume`.
-fn mounts<'a>(text: &'a str, volume: &str) -> Vec<&'a str> {
-    live_lines(text)
-        .filter(|l| flow_value(l, "name") == Some(volume) && l.contains("mountPath:"))
-        .collect()
+#[derive(Debug)]
+struct Mount {
+    owner: Vec<String>,
+    fields: Value,
+}
+
+/// Mounts are YAML data, regardless of their inline/block spelling.
+/// Retain the containing mapping's path so the reader and estate token
+/// must still belong to the same container (review bd73dbb7; 2710c8fc).
+fn mounts(text: &str, volume: &str) -> Vec<Mount> {
+    fn visit(value: &Value, path: &[String], volume: &str, found: &mut Vec<Mount>) {
+        match value {
+            Value::Mapping(map) => {
+                for (key, child) in map {
+                    let name = key.as_str().expect("manifest mapping keys are strings");
+                    if name == "volumeMounts" {
+                        for fields in child.as_sequence().expect("volumeMounts is a YAML list") {
+                            assert!(
+                                fields.is_mapping(),
+                                "a volume mount is a mapping: {fields:?}"
+                            );
+                            if fields["name"].as_str() == Some(volume) {
+                                found.push(Mount {
+                                    owner: path.to_vec(),
+                                    fields: fields.clone(),
+                                });
+                            }
+                        }
+                    } else {
+                        let next = [path, &[name.to_string()]].concat();
+                        visit(child, &next, volume, found);
+                    }
+                }
+            }
+            Value::Sequence(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    let next = [path, &[index.to_string()]].concat();
+                    visit(child, &next, volume, found);
+                }
+            }
+            Value::Tagged(tagged) => visit(&tagged.value, path, volume, found),
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    for (index, document) in yaml_serde::Deserializer::from_str(text).enumerate() {
+        let mut value = Value::deserialize(document)
+            .expect("manifest is valid YAML; never skip a parse failure");
+        value
+            .apply_merge()
+            .expect("manifest YAML merges are valid; never skip a merge failure");
+        visit(&value, &[index.to_string()], volume, &mut found);
+    }
+    found
+}
+
+#[test]
+fn the_mount_scan_sees_a_second_block_style_mount() {
+    let text = "volumeMounts:\n  - {name: probe-reader, mountPath: /etc/boss/probe-reader}\n  - name: probe-reader\n    mountPath: /another-reader\n    readOnly: true\n";
+    assert_eq!(mounts(text, VOLUME).len(), 2);
+    assert_eq!(mounts(text, "absent").len(), 0);
+    let unindented = "volumeMounts:\n- mountPath: /etc/boss/probe-reader\n  name: probe-reader\n  readOnly: true\nother: value\n";
+    assert_eq!(mounts(unindented, VOLUME).len(), 1);
+    assert!(mounts(unindented, VOLUME)[0].fields.get("other").is_none());
+}
+
+#[test]
+fn a_second_inline_volume_mount_list_is_still_seen() {
+    let text = "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n        - name: boss\n          volumeMounts:\n            - {name: probe-reader, mountPath: /etc/boss/probe-reader}\n        - name: other\n          volumeMounts: [{name: probe-reader, mountPath: /another-reader, readOnly: true}]\n";
+    assert_eq!(
+        mounts(text, VOLUME).len(),
+        2,
+        "a valid inline list grants a second reader mount too"
+    );
+}
+
+#[test]
+fn mount_lists_are_yaml_data_and_keep_container_ownership() {
+    let text = "reader: &reader {name: probe-reader, mountPath: /reader, readOnly: true}\ncontainers:\n  - name: first\n    volumeMounts: [*reader, {\"name\": \"probe-reader\", mountPath: '/a,#quoted{path}'}]\n  - name: second\n    volumeMounts:\n      - <<: *reader\n        mountPath: /another-reader\n";
+    let found = mounts(text, VOLUME);
+    assert_eq!(
+        found.len(),
+        3,
+        "inline entries, quoted keys, aliases and merges are mounts"
+    );
+    assert_eq!(found[0].owner, found[1].owner);
+    assert_ne!(found[0].owner, found[2].owner);
+    assert_eq!(
+        found[1].fields["mountPath"].as_str(),
+        Some("/a,#quoted{path}")
+    );
+    assert_eq!(
+        found[2].fields["mountPath"].as_str(),
+        Some("/another-reader")
+    );
+}
+
+#[test]
+fn a_mount_parse_failure_is_a_failed_pin_not_an_empty_roster() {
+    assert!(std::panic::catch_unwind(|| mounts("volumeMounts: [*missing]", VOLUME)).is_err());
+    assert!(std::panic::catch_unwind(|| mounts("volumeMounts: not-a-list", VOLUME)).is_err());
 }
 
 #[test]
@@ -158,14 +256,14 @@ fn the_boss_pod_mounts_the_reader_slots_whole_optional_and_read_only() {
     let m = mounts(deployment, VOLUME);
     assert_eq!(m.len(), 1, "one mount of {VOLUME}: {m:?}");
     assert_eq!(
-        flow_value(m[0], "mountPath"),
+        m[0].fields["mountPath"].as_str(),
         Some(DEFAULT_READER_DIR),
-        "at boss-core's default, where every gate looks: {}",
+        "at boss-core's default, where every gate looks: {:?}",
         m[0]
     );
-    assert_eq!(flow_value(m[0], "readOnly"), Some("true"), "{}", m[0]);
+    assert_eq!(m[0].fields["readOnly"].as_bool(), Some(true), "{:?}", m[0]);
     assert!(
-        !m[0].contains("subPath"),
+        m[0].fields.get("subPath").is_none() && m[0].fields.get("subPathExpr").is_none(),
         "a subPath is never refreshed, and a rotation must reach the gates with no pod roll"
     );
 
@@ -174,13 +272,8 @@ fn the_boss_pod_mounts_the_reader_slots_whole_optional_and_read_only() {
     // of one credential can never be read as the other's.
     let token = mounts(deployment, TOKEN_VOLUME);
     assert_eq!(token.len(), 1, "{token:?}");
-    let block_of = |line: &str| {
-        let at = deployment.find(line).expect("the mount line");
-        deployment[..at].rfind("volumeMounts:").expect("its block")
-    };
     assert_eq!(
-        block_of(m[0]),
-        block_of(token[0]),
+        m[0].owner, token[0].owner,
         "the reader slots are mounted in the container that holds the estate token's"
     );
     assert_ne!(DEFAULT_READER_DIR, DEFAULT_TOKEN_DIR);
@@ -347,6 +440,49 @@ fn every_gated_port_a_probe_reads_is_served_from_that_pod() {
 /// `a_declared_broker_secret_is_created_empty.rs` demands of every
 /// Secret a broker rule declares, held here before that rule exists so
 /// the rule's car edits no Role.
+fn bound_to_pod(doc: &str, role: &str, account: &str) -> bool {
+    let block = |key: &str| {
+        doc.split_once(&format!("\n{key}:\n"))
+            .map(|(_, body)| {
+                live_lines(body)
+                    .take_while(|line| line.trim().is_empty() || line.starts_with(' '))
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    doc.contains("\nkind: RoleBinding\n")
+        && doc.contains("\n  namespace: boss\n")
+        && doc.contains(&format!("\n  name: {role}\n"))
+        && block("roleRef")
+            == [
+                "apiGroup: rbac.authorization.k8s.io",
+                "kind: Role",
+                &format!("name: {role}"),
+            ]
+        && block("subjects")
+            == [
+                "- kind: ServiceAccount",
+                &format!("name: {account}"),
+                "namespace: boss",
+            ]
+}
+
+#[test]
+fn the_broker_binding_refuses_a_second_subject() {
+    let binding = "apiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBinding\nmetadata:\n  name: reader-role\n  namespace: boss\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: Role\n  name: reader-role\nsubjects:\n  - kind: ServiceAccount\n    name: boss\n    namespace: boss\n";
+    assert!(bound_to_pod(binding, "reader-role", "boss"));
+    let widened =
+        format!("{binding}  - kind: ServiceAccount\n    name: another\n    namespace: boss\n");
+    assert!(!bound_to_pod(&widened, "reader-role", "boss"));
+    assert!(!bound_to_pod(
+        &binding.replace("name: boss", "name: another"),
+        "reader-role",
+        "boss"
+    ));
+}
+
 #[test]
 fn the_broker_may_fill_it_in_prod_and_nowhere_else() {
     let manifest = read(&format!("{MANIFESTS}/{BROKER}"));
@@ -394,10 +530,7 @@ fn the_broker_may_fill_it_in_prod_and_nowhere_else() {
         .find_map(|l| l.trim_start().strip_prefix("serviceAccountName: "))
         .expect("the boss Deployment names its service account");
     assert!(
-        docs.iter().any(|d| d.contains("\nkind: RoleBinding\n")
-            && d.contains("\n  namespace: boss\n")
-            && d.contains(&format!("\n  name: {role_name}\n"))
-            && d.contains(&format!("    name: {pod_sa}\n    namespace: boss"))),
+        docs.iter().any(|d| bound_to_pod(d, role_name, pod_sa)),
         "Role {role_name} is bound to the boss pod's service account `{pod_sa}`, in boss"
     );
 }

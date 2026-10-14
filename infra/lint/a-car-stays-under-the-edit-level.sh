@@ -63,17 +63,27 @@
 # request such a pod still made (277 would-refuse facts in 72 h,
 # 2026-10-06) - refused, and every gate with it, the day the machine door
 # enforces. So the launcher, which holds the token and runs no branch
-# code (`boss gate`; the conductor for a train's gate and the dock's
-# re-gate), reads the door ONCE and hands its answer to the Job as
+# code (`boss gate`; the conductor for a train's gate, the dock's
+# re-gate, and the consist worker it runs every lint in before a train
+# forms - backlog 37742794, 27 tokenless reads from consist pods in the
+# 24 h to 2026-10-09T05:30Z), reads the door ONCE and hands its answer
+# to the Job as
 # BOSS_EDIT_LEVEL_ANSWER: the door's own JSON object, whole, so this
 # file judges a handed answer exactly as it judges a read one. Handed,
 # no request is made. A handed answer that is not that object is CANNOT
 # ANSWER (exit 3), never a level guessed.
 #
+# THE DEV POD'S PRE-FLIGHT HANDS IT TOO (backlog 37742794, R2): with no
+# launcher, infra/gate.sh --quick / --lint asks the pod's door
+# (`boss-api`, which presents the container's machine token) once and
+# hands its answer here the same way — see `edit_level_through_the_door`
+# in gate.sh for when it does and does not.
+#
 # NOT HANDED, it says so and reads the door itself, as it always did:
-# the dev pod's pre-flight, a hand run, and a gate launched by a `boss`
-# from before this landed (the launcher is the cluster's binary, this
-# file is the branch's) have no launcher's answer. Under an enforcing
+# a hand run, a pre-flight with no door on PATH (or one aimed at its own
+# BOSS_JOBS_URL), and a gate launched by a `boss` from before this
+# landed (the launcher is the cluster's binary, this file is the
+# branch's) have no launcher's answer. Under an enforcing
 # door that read is refused in a pod with no token, and the refusal is
 # this lint's exit 3 - so the fallback can only ever cost a request,
 # never pass a car.

@@ -8,9 +8,8 @@ of operations as it runs (the SPA is sparse on first load). BOSS expands to **Be
 Software — for System Modeling**; *algedonic* is Stafford Beer's
 term for the pleasure/pain feedback signal in cybernetic systems
 — a fitting brand for the demo brewery, and the company name
-(Algedonic, LLC) behind the project. It's the second example
-tenant in the repo — the other, `examples/used-device-shop/`, is a
-used-device refurbisher — and exists to exercise BOSS core through a
+(Algedonic, LLC) behind the project. It is the one shipped example
+tenant and exercises BOSS core through a
 domain anyone can reason about without prior context.
 
 The brewery is **not a microbrewery**. Think regional production-scale:
@@ -140,6 +139,5 @@ is the running sim.
   is a signal that BOSS core is leaking example-tenant-flavored
   assumptions. The `# Gaps` block in `tenant.toml` is the explicit
   list.
-- **Sim drives both tenants.** The shape-driven sim runs against
-  either tenant's seed files without modification — both the brewery
-  and the used-device shop prove the registries are load-bearing.
+- **Sim drives the example.** The shape-driven simulator reads the
+  brewery's registry data and builds its operations from events.

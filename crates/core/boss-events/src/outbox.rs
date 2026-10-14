@@ -112,6 +112,14 @@ pub async fn record_event_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     event: &Event,
 ) -> Result<(), String> {
+    record_event_with_budget_in_tx(tx, event, None).await
+}
+
+pub async fn record_event_with_budget_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &Event,
+    budget: Option<crate::statement_budget::StatementBudget>,
+) -> Result<(), String> {
     let size = serde_json::to_vec(event).map_err(|e| e.to_string())?.len();
     if size > MAX_STAGED_EVENT_BYTES {
         return Err(format!(
@@ -121,6 +129,7 @@ pub async fn record_event_in_tx(
             event.kind
         ));
     }
+    crate::statement_budget::refresh(tx, budget).await?;
     sqlx::query(
         "INSERT INTO event_outbox (event_id, timestamp, source, kind, payload) \
          VALUES ($1, $2, $3, $4, $5)",
@@ -190,7 +199,12 @@ pub struct Undrained {
 /// (CLAUDE.md §9a). `o` is the outbox row.
 const UNDRAINED_ROWS: &str = "FROM event_outbox o \
      WHERE o.delivered_at IS NULL AND o.dead_lettered_at IS NULL \
-       AND NOT EXISTS (SELECT 1 FROM audit_log a WHERE a.event_id = o.event_id)";
+       AND NOT EXISTS (SELECT 1 FROM audit_log a \
+                       WHERE a.event_id = o.event_id \
+                         AND a.timestamp = o.timestamp \
+                         AND a.source = o.source \
+                         AND a.kind = o.kind \
+                         AND a.payload = o.payload)";
 
 /// The ONE query for [`Undrained`] (CLAUDE.md §9a): the events door
 /// serves it on the pool, and design b046f510's rebuild runs it on its
@@ -1015,8 +1029,8 @@ type OutboxRow = (i64, Uuid, DateTime<Utc>, String, String, serde_json::Value);
 
 /// Drain one batch of pending rows through audit_log and the bus.
 /// Returns Ok even when the bus is down — the undelivered rows simply
-/// stay pending and the next drain retries them; only storage errors
-/// are `Err`.
+/// stay pending and the next drain retries them. Storage errors or an
+/// immutable identity conflict are `Err`; neither publishes the batch.
 pub async fn drain_outbox_once(
     pool: &PgPool,
     bus: &Arc<dyn EventBus>,
@@ -1046,7 +1060,7 @@ pub async fn drain_outbox_once(
     }
 
     let mut audit_inserted = 0u64;
-    for (_, event_id, timestamp, source, kind, payload) in &rows {
+    for (outbox_id, event_id, timestamp, source, kind, payload) in &rows {
         let res = sqlx::query(
             "INSERT INTO audit_log (event_id, timestamp, source, kind, payload) \
              SELECT $1, $2, $3, $4, $5 \
@@ -1061,6 +1075,35 @@ pub async fn drain_outbox_once(
         .await
         .map_err(|e| e.to_string())?;
         audit_inserted += res.rows_affected();
+        // A prior audit row proves a retry only when it holds this
+        // whole fact (ee2176c6). Judge in PostgreSQL so both timestamps
+        // have the same persistence precision. Never publish a reused
+        // identity's different fact, or discard its queued evidence.
+        let changed: Vec<String> = sqlx::query_scalar(
+            "SELECT array_remove(ARRAY[ \
+                 CASE WHEN timestamp <> $2 THEN 'timestamp' END, \
+                 CASE WHEN source <> $3 THEN 'source' END, \
+                 CASE WHEN kind <> $4 THEN 'kind' END, \
+                 CASE WHEN payload <> $5 THEN 'payload' END, \
+                 CASE WHEN (payload->'_actor') IS DISTINCT FROM ($5::jsonb->'_actor') \
+                      THEN 'actor' END], NULL) \
+             FROM audit_log WHERE event_id = $1 FOR KEY SHARE",
+        )
+        .bind(event_id)
+        .bind(timestamp)
+        .bind(source)
+        .bind(kind)
+        .bind(payload)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        if !changed.is_empty() {
+            return Err(format!(
+                "outbox row {outbox_id} event {event_id}: immutable identity conflict in {}; \
+                 original audit fact preserved, queued fact remains pending, batch not published",
+                changed.join(", ")
+            ));
+        }
     }
     tx.commit().await.map_err(|e| e.to_string())?;
 

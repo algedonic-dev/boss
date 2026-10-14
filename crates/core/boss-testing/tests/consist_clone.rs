@@ -1,11 +1,11 @@
-use boss_testing::{repo_root, scratch_dir};
+use boss_testing::{repo_root, scratch_dir, without_proxy};
 use std::process::Command;
 
 #[test]
 fn bootstrap_checks_both_fetched_refs_before_checking_out_candidate() {
     let script = r#"
 import functools, http.server, pathlib, subprocess, sys, threading
-source, root = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+source, root, repo_root = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
 def git(cwd, *args):
     return subprocess.check_output(['git', '-C', str(cwd), *args], stderr=subprocess.PIPE).decode().strip()
 seed = root / 'seed'
@@ -34,10 +34,13 @@ thread.start()
 try:
     for label, expected_head, expected_base, accepted in [('different', head, base, True), ('wrong-head', base, base, False), ('wrong-base', head, head, False)]:
         checkout, home = root / label / 'repo', root / label / 'home'
-        body = source.read_text().replace('/work/repo', str(checkout)).replace('/tmp/clone-home', str(home))
+        volume = root / label / 'volume'
+        volume.mkdir(parents=True)
+        helper = repo_root / 'infra/consist-worker/private-tmp.sh'
+        body = (helper.read_text() + '\n' + source.read_text()).replace('/work/repo', str(checkout)).replace('/tmp/clone-home', str(home)).replace('/consist-tmp', str(volume))
         result = subprocess.run(['bash', '-c', body, 'consist-clone',
             'http://127.0.0.1:' + str(server.server_port) + '/remote.git',
-            'refs/heads/assembled', expected_head, 'refs/heads/main', expected_base], capture_output=True, timeout=30)
+            'refs/heads/assembled', expected_head, 'refs/heads/main', expected_base, 'private'], capture_output=True, timeout=30)
         assert (result.returncode == 0) == accepted, (label, result.returncode, result.stdout, result.stderr)
         if accepted:
             assert git(checkout, 'rev-parse', 'HEAD') == head
@@ -52,10 +55,11 @@ finally:
     thread.join()
     server.server_close()
 "#;
-    let result = Command::new("python3")
+    let result = without_proxy(&mut Command::new("python3"))
         .args(["-c", script])
         .arg(repo_root().join("crates/orchestrators/boss-cli/src/train/consist_clone.sh"))
         .arg(scratch_dir("consist-clone"))
+        .arg(repo_root())
         .output()
         .unwrap();
     assert!(

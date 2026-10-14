@@ -1141,14 +1141,28 @@ export type TrainGateReading = Readonly<{
   forge: string | null;
   fallback: string | null;
   wait_reason: string | null;
+  /** When the wait for a bay began, as the record holds it: the later of
+   *  the PR's opening and the last gate launch (track.rs
+   *  `train_gate_wait_since`, the same two facts). Null when neither is
+   *  recorded — then a wait is trouble at once, never guessed short. */
+  wait_since: string | null;
   relaunches: number;
 }>;
+
+/** HOW LONG A TRAIN MAY WAIT FOR A BAY BEFORE THE WAIT IS TROUBLE, in
+ *  minutes (backlog 19227ca8). Since design 1e787fc2 a train at a full
+ *  bound holds the first place in the gate line and takes the next bay
+ *  that frees, so a short wait is the normal path. ONE number: the
+ *  waiting band's hold, track.rs `TRAIN_GATE_WAIT_MINUTES`, which a test
+ *  there holds this line equal to. */
+export const TRAIN_GATE_WAIT_MINUTES = 10;
 
 export function readTrainGate(j: JobLite): TrainGateReading | null {
   const md = (j.metadata ?? {}) as {
     train_gate_run?: unknown;
     train_gate_fallback?: unknown;
     train_gate_wait_reason?: unknown;
+    train_gate_launched_at?: unknown;
     train_gate_relaunches?: unknown;
   };
   const ci = (step(j, 'ci', 'CI verdict')?.metadata ?? {}) as {
@@ -1164,7 +1178,18 @@ export function readTrainGate(j: JobLite): TrainGateReading | null {
   const wait_reason = text(md.train_gate_wait_reason);
   const relaunches = typeof md.train_gate_relaunches === 'number' ? md.train_gate_relaunches : 0;
   if (run === null && line === null && forge === null && fallback === null && wait_reason === null) return null;
-  return { run, line, forge, fallback, wait_reason, relaunches };
+  const wait_since = laterStamp(stampAt(step(j, 'pr', 'Open the batched PR')), text(md.train_gate_launched_at));
+  return { run, line, forge, fallback, wait_reason, wait_since, relaunches };
+}
+
+/** The later of two instants, either of which may be absent or
+ *  unparseable; null when neither reads. */
+function laterStamp(a: string | null, b: string | null): string | null {
+  const ms = (x: string | null): number => (x === null ? Number.NaN : Date.parse(x));
+  const [am, bm] = [ms(a), ms(b)];
+  if (Number.isNaN(am)) return Number.isNaN(bm) ? null : b;
+  if (Number.isNaN(bm)) return a;
+  return bm > am ? b : a;
 }
 
 /** The verdict row's one line: both halves, in words the conductor
@@ -1182,11 +1207,18 @@ export function trainGateLabel(g: TrainGateReading): string {
 }
 
 /** Whether the verdict row wears the yard's trouble style: a gate that
- *  could not be filed, whether the conductor gave up (fallback) or is
- *  still waiting at the bound (wait_reason). A troubled packet must
- *  look troubled — the same rule the label follows, in one place. */
-export function trainGateTroubled(g: TrainGateReading): boolean {
-  return g.fallback !== null || g.wait_reason !== null;
+ *  could not be filed (fallback) at once; one still waiting for a bay
+ *  (wait_reason) once the wait has held TRAIN_GATE_WAIT_MINUTES — a
+ *  short wait is the train holding the first place in line, the normal
+ *  path since 1e787fc2 (19227ca8). A troubled packet must look
+ *  troubled; a wait with no onset on record is trouble at once. Ported
+ *  to track.rs `train_gate_troubled`, which judges by the same number. */
+export function trainGateTroubled(g: TrainGateReading, nowMs: number = Date.now()): boolean {
+  if (g.fallback !== null) return true;
+  if (g.wait_reason === null) return false;
+  const since = g.wait_since === null ? Number.NaN : Date.parse(g.wait_since);
+  if (Number.isNaN(since)) return true;
+  return nowMs - since >= TRAIN_GATE_WAIT_MINUTES * 60_000;
 }
 
 export function ciLamp(j: JobLite): Lamp {

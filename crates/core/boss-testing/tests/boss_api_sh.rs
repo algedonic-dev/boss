@@ -55,7 +55,7 @@
 //!     then fails naming the elapsed time; every other exit and every
 //!     HTTP status is surfaced on the first attempt.
 
-use boss_testing::{create_dir, repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{create_dir, repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -147,6 +147,7 @@ impl Fixture {
     /// shell — and NO `BOSS_JOBS_URL`, so a test can watch the default.
     fn command(&self, script: &Path) -> Command {
         let mut cmd = Command::new(script);
+        without_proxy(&mut cmd);
         cmd.current_dir(&self.root)
             .env(
                 "PATH",

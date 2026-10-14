@@ -186,19 +186,10 @@ export default defineConfig({
     : {
         command: 'bun src/dev-server.ts',
         url: `${ORIGIN}/`,
-        // false under CI so a stale/occupied port fails loudly instead
-        // of silently reusing a possibly-broken server; true locally for
-        // fast re-runs against a `bun run dev` already up.
-        //
-        // NOTE: Playwright's own reuse test is "does the url answer" —
-        // it cannot check WHICH tree answers, which is the whole of
-        // eaca07e1. That check lives in tests/run-mocked.ts, the
-        // entrypoint every gated run uses, so this dormant fallback is
-        // the one place reuse is still identity-blind. It is reached
-        // only by invoking playwright directly (--ui, --headed, one
-        // spec) — a hand-driven debugging path where the operator reads
-        // the output — so it keeps the faster ergonomics.
-        reuseExistingServer: !process.env['CI'],
+        // Playwright knows whether a URL answers, not which tree serves
+        // it. Refuse occupied ports on the direct debugging path too
+        // (e89446d8); tests/run-mocked.ts owns identity-aware reuse.
+        reuseExistingServer: false,
         timeout: 180_000,
         stdout: 'pipe',
         stderr: 'pipe',

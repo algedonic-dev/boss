@@ -19,6 +19,228 @@ use crate::station_projection::derived_stations;
 use crate::station_queue::evaluate_station;
 use crate::stations::{StationError, StationRegistry, StationSpec};
 
+// This macro is used only by the two native read-preparation surfaces.
+// It preserves each port's ordinary result and never wraps COMMIT.
+macro_rules! prepare_selection {
+    ($ingress:expr, $read:expr) => {{
+        match $ingress {
+            Some(ingress) => match ingress.prepare($read).await {
+                Ok(result) => result,
+                Err(error) => {
+                    return (axum::http::StatusCode::CONFLICT, error.to_string()).into_response();
+                }
+            },
+            None => $read.await,
+        }
+    }};
+}
+pub(super) use prepare_selection;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ClaimNextRequest {
+    request_id: uuid::Uuid,
+}
+
+pub(super) async fn claim_next_at_station<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    Path(name): Path<String>,
+    CurrentUser(mut user): CurrentUser,
+    caller: Option<axum::Extension<crate::field_writer::CredentialedCaller>>,
+    ingress: Option<axum::Extension<crate::station_claim::AuthenticatedSelectionIngress>>,
+    Json(request): Json<ClaimNextRequest>,
+) -> Response {
+    if state.jobs.native_selection_requires_ingress() && ingress.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "native selection requires server-authenticated ingress",
+        )
+            .into_response();
+    }
+    let admitted_ingress = ingress.as_ref().map(|extension| extension.0.clone());
+    let preparation = admitted_ingress.as_ref();
+    let native_read = match ingress.as_ref() {
+        Some(ingress) => match state
+            .jobs
+            .native_selection_read(&ingress.0, request.request_id, &name)
+            .await
+        {
+            Ok(read) => read,
+            Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+        },
+        None => None,
+    };
+    if let Some(read) = &native_read {
+        user = read.user.clone();
+        if let Some(original) = &read.original {
+            return selection_receipt_response(original.clone());
+        }
+    }
+    let scope = if let Some(read) = &native_read {
+        read.scope.clone()
+    } else {
+        let predicate = match readable_predicate(&state, &user).await {
+            Ok(predicate) => predicate,
+            Err(response) => return response,
+        };
+        JobScope::from_predicate(&user, &predicate)
+    };
+    let original = if native_read.is_some() {
+        Ok(None)
+    } else {
+        state.jobs.station_claim_receipt(request.request_id).await
+    };
+    match original {
+        Ok(Some(receipt)) => {
+            if let Err(error) =
+                crate::station_claim::replay(&receipt, &user.id, &name, request.request_id)
+            {
+                return (StatusCode::CONFLICT, error.to_string()).into_response();
+            }
+            let id = receipt
+                .pointer("/selected/job_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(parse_job_id);
+            let Some(id) = id else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "selection receipt lacks its packet identity",
+                )
+                    .into_response();
+            };
+            return match state.jobs.get_job(&id).await {
+                Ok(Some(job)) if scope.admits(&job) => selection_receipt_response(receipt),
+                Ok(_) => (
+                    StatusCode::FORBIDDEN,
+                    "selection receipt packet is outside current read scope",
+                )
+                    .into_response(),
+                Err(error) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                }
+            };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    }
+    let native_authority = match ingress {
+        Some(ingress) if native_read.is_some() => match state
+            .jobs
+            .prepare_native_selection(ingress.0, request.request_id, &name)
+            .await
+        {
+            Ok(Some(observation)) if observation.user == user => Some(Arc::new(observation)),
+            Ok(_) => {
+                return (
+                    StatusCode::CONFLICT,
+                    "native selection preparation changed its read identity",
+                )
+                    .into_response();
+            }
+            Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+        },
+        _ => None,
+    };
+    let prepared_policy = if native_authority.is_some() {
+        None
+    } else {
+        Some(
+            match crate::station_claim::PolicySelectionObservation::prepare(
+                state.policy.clone(),
+                user.clone(),
+                request.request_id,
+            ) {
+                Ok(observation) => std::sync::Arc::new(observation),
+                Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+            },
+        )
+    };
+    let registry = match stations_or_503(&state) {
+        Ok(registry) => registry,
+        Err(response) => return response,
+    };
+    let row = match prepare_selection!(preparation, station_by_name(&state, registry, &name)) {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
+    let Some(station) = row.bind_self(self_id(&user)) else {
+        return (StatusCode::UNAUTHORIZED, "selection requires a bound actor").into_response();
+    };
+    let active = match &state.kind_registry {
+        Some(registry) => match prepare_selection!(preparation, registry.list_active(None)) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| (row.kind.clone(), row))
+                .collect(),
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("selection protocol registry unreadable: {error}"),
+                )
+                    .into_response();
+            }
+        },
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "selection protocol registry not configured",
+            )
+                .into_response();
+        }
+    };
+    let packets = match prepare_selection!(
+        preparation,
+        resolved_open_packets(&state, scope.clone(), &std::collections::BTreeMap::new(),)
+    ) {
+        Ok(packets) => packets,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let candidate = match crate::station_claim::head(&station, &scope, &active, &packets) {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => return StatusCode::NO_CONTENT.into_response(),
+        Err(error) => return (StatusCode::CONFLICT, error.to_string()).into_response(),
+    };
+    let context = crate::station_claim::SelectionContext {
+        native_authority,
+        actor_observation: None,
+        prepared_policy,
+        definition_fence: None,
+        request_id: request.request_id,
+        station,
+        scope,
+        active_workflows: active,
+        validated_job: candidate.0,
+        validated_step: candidate.1,
+    };
+    super::steps::claim_step_with_selection(
+        State(state),
+        Path((
+            context.validated_job.id.to_string(),
+            context.validated_step.id.to_string(),
+        )),
+        CurrentUser(user),
+        caller,
+        axum::extract::Query(super::steps::ClaimQuery::from_station(name)),
+        Some(context),
+    )
+    .await
+}
+
+pub(super) fn selection_receipt_response(
+    receipt: crate::station_claim::SelectionReceipt,
+) -> Response {
+    (
+        StatusCode::CREATED,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        receipt.into_json(),
+    )
+        .into_response()
+}
+
 #[allow(
     clippy::result_large_err,
     reason = "idiomatic axum Response error; crate-wide Box<Response> cleanup tracked separately"

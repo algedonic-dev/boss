@@ -55,9 +55,140 @@ pub struct InMemoryCalendar {
     recorded: std::sync::Mutex<Vec<boss_core::event::Event>>,
 }
 
+/// A prepared row and fact under the actual reservation AND recording writers.
+/// Dropping this plan changes nothing. Consuming it once retains both guards
+/// until the caller finishes its joined, already-validated effects.
+pub struct StagedReservation<'a> {
+    rows: std::sync::RwLockWriteGuard<'a, Vec<Reservation>>,
+    recorded: std::sync::MutexGuard<'a, Vec<boss_core::event::Event>>,
+    reservation: Reservation,
+    event: Option<boss_core::event::Event>,
+    overlapping: Vec<Reservation>,
+}
+
+pub struct AppliedReservationGuard<'a> {
+    _rows: std::sync::RwLockWriteGuard<'a, Vec<Reservation>>,
+    _recorded: std::sync::MutexGuard<'a, Vec<boss_core::event::Event>>,
+}
+
+impl StagedReservation<'_> {
+    pub fn observation(&self) -> serde_json::Value {
+        serde_json::json!({"row": self.reservation, "inserted": self.event.is_some(), "overlapping": self.overlapping,
+            "kind": {"subject_kind": self.reservation.subject.kind, "calendar_reservable": true,
+                "source": "actual InMemoryCalendar immutable reservable-kind definition", "definition": RESERVABLE_KINDS}})
+    }
+
+    pub fn event(&self) -> Option<&boss_core::event::Event> {
+        self.event.as_ref()
+    }
+}
+
+impl<'a> StagedReservation<'a> {
+    pub fn apply(mut self) -> AppliedReservationGuard<'a> {
+        if let Some(event) = self.event.take() {
+            self.rows.push(self.reservation);
+            self.recorded.push(event);
+        }
+        AppliedReservationGuard {
+            _rows: self.rows,
+            _recorded: self.recorded,
+        }
+    }
+}
+
 impl InMemoryCalendar {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn try_stage_claim(
+        &self,
+        req: ReservationRequest,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<Option<StagedReservation<'_>>, CalendarError> {
+        if req.window.duration_seconds() <= 0 {
+            return Err(CalendarError::Invalid(
+                "window end must be after start".into(),
+            ));
+        }
+        if !RESERVABLE_KINDS.contains(&req.subject.kind.as_str()) {
+            return Err(CalendarError::Invalid(format!(
+                "subject kind `{}` is not calendar-reservable",
+                req.subject.kind
+            )));
+        }
+        let rows = match self.rows.try_write() {
+            Ok(rows) => rows,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(CalendarError::Storage(
+                    "calendar reservation owner unavailable".into(),
+                ));
+            }
+        };
+        let recorded = match self.recorded.try_lock() {
+            Ok(recorded) => recorded,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(CalendarError::Storage(
+                    "calendar event owner unavailable".into(),
+                ));
+            }
+        };
+        let mut overlapping: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row.cancelled_at.is_none()
+                    && row.subject == req.subject
+                    && row.window.overlaps(&req.window)
+            })
+            .cloned()
+            .collect();
+        by_start_then_id(&mut overlapping);
+        let hard: Vec<_> = overlapping
+            .iter()
+            .filter(|row| row.strength == ReservationStrength::Hard)
+            .cloned()
+            .collect();
+        if req.strength == ReservationStrength::Hard && !hard.is_empty() {
+            if hard.len() == 1
+                && hard[0].reason_kind == req.reason_kind
+                && hard[0].reason_ref_id == req.reason_ref_id
+                && hard[0].subject == req.subject
+                && hard[0].window == req.window
+            {
+                return Ok(Some(StagedReservation {
+                    rows,
+                    recorded,
+                    reservation: hard[0].clone(),
+                    event: None,
+                    overlapping,
+                }));
+            }
+            return Err(CalendarError::Conflict { existing: hard });
+        }
+        let reservation = Reservation {
+            id: ReservationId::new(),
+            subject: req.subject,
+            window: req.window,
+            reason_kind: req.reason_kind,
+            reason_ref_id: req.reason_ref_id,
+            strength: req.strength,
+            notes: req.notes,
+            created_by: req.created_by,
+            created_at: stamp.timestamp,
+            cancelled_at: None,
+        };
+        let payload = serde_json::to_value(&reservation)
+            .map_err(|error| CalendarError::Storage(error.to_string()))?;
+        let event = stamp.event(crate::events::RESERVATION_RESERVED, payload);
+        Ok(Some(StagedReservation {
+            rows,
+            recorded,
+            reservation,
+            event: Some(event),
+            overlapping,
+        }))
     }
 
     /// Events the outbox paths recorded — test visibility (the

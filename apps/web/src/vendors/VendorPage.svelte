@@ -36,6 +36,7 @@
     type VendorContract,
   } from './types';
   import { href } from '../router';
+  import { purchaseOrderIsOpen, vendorInvoiceIsPaid } from './vendor-status';
   import { loadingRead, okRead, readStateOfResponse, type ReadState } from '../data/readState';
   import { loadOwnerNames, personIdsOf } from '../data/ownerNames';
 
@@ -189,7 +190,7 @@
       : [],
   );
   let openPos = $derived(
-    vendorPos.filter((po) => po.status !== 'received' && po.status !== 'closed'),
+    vendorPos.filter((po) => purchaseOrderIsOpen(po.status)),
   );
   let vendorBills = $derived(
     vendor
@@ -201,7 +202,7 @@
           .sort((a, b) => (b.received_on ?? '').localeCompare(a.received_on ?? ''))
       : [],
   );
-  let unpaidBills = $derived(vendorBills.filter((vi) => vi.status !== 'paid'));
+  let unpaidBills = $derived(vendorBills.filter((vi) => !vendorInvoiceIsPaid(vi.status)));
   let outstandingCents = $derived(
     unpaidBills.reduce((sum, vi) => sum + vi.amount_cents, 0),
   );
@@ -216,7 +217,7 @@
   );
   let lifetimePaidCents = $derived(
     vendorBills
-      .filter((vi) => vi.status === 'paid')
+      .filter((vi) => vendorInvoiceIsPaid(vi.status))
       .reduce((sum, vi) => sum + vi.amount_cents, 0),
   );
   let lastPoDate = $derived(

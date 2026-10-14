@@ -749,7 +749,7 @@ test.describe('/it/registry/dispatcher — links, reads and writes', () => {
 
     await edit.click();
     await expect(page).toHaveURL((u) => u.pathname === RULES_PAGE);
-    await expect(page.locator('h1').first()).toHaveText('Dispatcher rules');
+    await expect(page.locator('h1').first()).toHaveText('Rule authoring');
     await backHere(page);
   });
 });

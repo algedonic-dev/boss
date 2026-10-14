@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use boss_core::machine_gate::{Mode, ModeSwitch};
 use boss_core::machine_token::{self, Source};
-use boss_core::role_of_record::{RoleLookupError, RoleOfRecord, RoleRecord, is_family_member};
+use boss_core::role_of_record::{
+    RoleLookupError, RoleOfRecord, RoleRecord, is_family_member, is_family_prefix,
+};
 use serde_json::Value;
 
 use crate::User;
@@ -191,12 +193,18 @@ impl RegistryRoles {
 }
 
 /// An automation row's declared family prefix. Absent or null is no
-/// family; anything else that is not a non-blank string is a registry
-/// that could not answer.
+/// family; anything else that is not `automation:<slug>:` is a registry
+/// that could not answer. The shape is checked HERE as well as at the
+/// write side (review ed9181b4, F2): this reads a response, not the
+/// table, and a row whose `signs_for` was `automation:` answered for
+/// every automation-spelled caller with no row of its own. Two
+/// well-formed prefixes cannot nest, so the longest-prefix arm in
+/// `automation_of_record` never chooses between two; it stays as the
+/// registry's own rule (`row_of_record`) states it.
 fn signs_for(row: &Value) -> Result<Option<&str>, RoleLookupError> {
     match row.get("signs_for") {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(prefix)) if !prefix.trim().is_empty() => Ok(Some(prefix)),
+        Some(Value::String(prefix)) if is_family_prefix(prefix) => Ok(Some(prefix)),
         _ => Err(RoleLookupError::Unavailable(
             "automation registry row has a malformed signs_for".into(),
         )),

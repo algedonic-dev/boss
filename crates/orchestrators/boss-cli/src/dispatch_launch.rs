@@ -17,8 +17,11 @@
 //!    its coordinator starts, a profile it has no sandbox for, a missing
 //!    executable and an existing `--launch-dir` each refuse here, while
 //!    nothing is claimed or filed.
-//! 2. Dispatch files the run with `agent` = the harness's actor and
-//!    nominates the run's Building to it (see `dispatch::nominate_building`).
+//! 2. Dispatch claims the step FOR the harness's actor (`?claimed_for=`,
+//!    review b149c579 N2 — so the claim door's concurrency cap and budget
+//!    reading judge that actor's agents row, not the coordinator's), files
+//!    the run with `agent` = the harness's actor and nominates the run's
+//!    Building to it (see `dispatch::nominate_building`).
 //! 3. [`run_at`]: a new 0700 directory, a locked detached worktree, the
 //!    prompt on stdin, the process in a process group of its own, and an
 //!    environment that is cleared and then holds the harness file's pass
@@ -64,7 +67,9 @@
 //! reachable by a process that goes looking, and `BOSS_ACTOR` is a
 //! default it is told to keep, not a bound: the actor header is asserted
 //! and nothing authenticates it. Only a separate uid (or a container)
-//! closes that, and this verb has neither.
+//! closes that, and this verb has neither. Design 21062f95 chose the
+//! container (2026-10-10): [`crate::launch_job`] is that Job's contract,
+//! and nothing here creates it yet.
 //!
 //! STOPPING THE VERB IS AN ENDING TOO (review e9514316, B5). The process
 //! leads a group of its own, so a Ctrl-C, a tool's timeout or a session
@@ -77,16 +82,38 @@
 //!   non-zero.
 //! - A verb that is KILLED handles nothing, so the kernel tells the
 //!   process: it is started with a parent-death signal (SIGTERM). That
-//!   reaches the ONE process the verb spawned. It does not reach a
-//!   descendant (the setting is not inherited across fork), a process
-//!   that cleared it, or — not the case for any shipped harness — a
-//!   setuid executable, for which the kernel clears it. A killed verb
-//!   also writes nothing: the run keeps its `running` receipt until the
-//!   silence clock ends it.
+//!   is SENT to the ONE process the verb spawned, and it is a request:
+//!   a process that ignores TERM outlives a killed verb, and so does
+//!   everything it started (review b149c579, N20 — this text and the
+//!   verb's help used to say a killed verb takes that process with it).
+//!   It does not reach a descendant (the setting is not inherited
+//!   across fork), a process that cleared it, or — not the case for any
+//!   shipped harness — a setuid executable, for which the kernel clears
+//!   it. A killed verb also writes nothing: the run keeps its `launch`
+//!   receipt at `starting`, beside the `launch_process` that says the
+//!   process was spawned, until the silence clock ends it.
 //! - So the pid and process group are ON THE PACKET as soon as the
-//!   process exists (`launch.pid`, `launch.pgid`, status `running`) and
+//!   process exists (`launch_process.pid`, `launch_process.pgid`, under
+//!   a key of their own so that write arriving late can never replace
+//!   the ending — review 0facb916, B1) and
 //!   in `<launch-dir>/pid`: what a killed verb leaves can be found and
-//!   stopped by hand — `kill -TERM -<pgid>`.
+//!   stopped by hand — `kill -TERM -<pgid>`, then `kill -KILL -<pgid>`
+//!   for whatever is left, which is what the verb itself does.
+//!
+//! WHAT THE VERB'S OWN ENDINGS DO NOT WAIT FOR (review b149c579, N18 and
+//! N19). The bound is counted from the spawn and the receipt that
+//! carries the pid is written BESIDE the wait, never before it: a system
+//! of record that is dark or stalled delays that receipt, not the bound
+//! and not the verb's hearing of its own stop — and it is not waited for
+//! after the stop either, because it names only the process, on its own
+//! key. The lines the verb says, and the retry line of the jobs-API
+//! client every write here goes through (review 0facb916, N1), are
+//! written without panicking, so a verb whose stderr has gone still
+//! stops the group and writes `died`; and whatever unwinds the launch —
+//! a panic, a dropped future — KILLs the group on the way out
+//! ([`StopOnDrop`]). The writes made AFTER the group is stopped (the
+//! ending, the `died` terminal) are still awaited with the client's own
+//! patience: a stalled record then holds the VERB, not the process.
 //!
 //! NOT DONE HERE, said so the record is not read as more than it is: the
 //! budget is not enforced while the process runs (only the time bound
@@ -108,6 +135,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// The run packet key the launcher's receipt lives under.
 pub(crate) const RECEIPT_KEY: &str = "launch";
+
+/// The run packet key the process's pid and group are written under the
+/// moment it exists — its own key, never [`RECEIPT_KEY`], so a write that
+/// the record applies late cannot replace the ending (review 0facb916,
+/// B1). It holds only facts that stay true once the process is gone.
+pub(crate) const PROCESS_KEY: &str = "launch_process";
 
 /// The Building key a launcher-witnessed death is explained under.
 pub(crate) const DIED_KEY: &str = "launch_died";
@@ -144,6 +177,10 @@ pub(crate) struct Plan {
     /// The harness's argv[0], resolved once to an absolute path — a
     /// later PATH entry can then never be what runs.
     pub executable: PathBuf,
+    pub cluster: Option<crate::launch_cluster::Bindings>,
+    pub snapshot: Option<crate::launch_controller::Snapshot>,
+    pub bundle: Vec<u8>,
+    pub members: Vec<u8>,
 }
 
 /// The first executable regular file named `name` on `path`.
@@ -165,7 +202,7 @@ pub(crate) async fn agents_at(
     base: &str,
     actor: &str,
 ) -> Result<Vec<Value>> {
-    let body = crate::gate::api_at_signed(
+    let body = crate::sor_client::api_at_signed(
         http,
         base,
         reqwest::Method::GET,
@@ -208,7 +245,7 @@ pub(crate) fn plan(
     // have every launched process sign as the session that launched it —
     // the one identity a launch exists to keep apart. The file cannot
     // know who will dispatch, so it is judged here, before the claim.
-    if harness.launch == crate::harness::Launch::Process
+    if harness.launch != crate::harness::Launch::HostTool
         && dispatcher == Some(harness.actor.as_str())
     {
         return Err(format!(
@@ -217,7 +254,7 @@ pub(crate) fn plan(
             harness.id, harness.actor
         ));
     }
-    if harness.launch != crate::harness::Launch::Process {
+    if harness.launch == crate::harness::Launch::HostTool {
         return Err(format!(
             "`{}` is run by harness {} ({}), which its coordinator's own session starts — \
              there is no process for --launch to spawn. Dispatch without --launch and hand \
@@ -226,15 +263,22 @@ pub(crate) fn plan(
         ));
     }
     let sandbox = harness.sandbox_for(&settings.profile)?.to_string();
+    if harness.launch == crate::harness::Launch::Cluster && !request.dir.is_absolute() {
+        return Err("cluster --launch-dir is an absolute private durable locator".into());
+    }
     let name = harness.argv.first().ok_or("the harness declares no argv")?;
-    let executable = search_path
-        .and_then(|p| find_executable(name, p))
-        .ok_or_else(|| {
-            format!(
-                "no executable `{name}` on PATH to start harness {} with",
-                harness.id
-            )
-        })?;
+    let executable = if harness.launch == crate::harness::Launch::Cluster {
+        PathBuf::from(name)
+    } else {
+        search_path
+            .and_then(|p| find_executable(name, p))
+            .ok_or_else(|| {
+                format!(
+                    "no executable `{name}` on PATH to start harness {} with",
+                    harness.id
+                )
+            })?
+    };
     if request.dir.exists() {
         return Err(format!(
             "--launch-dir {} already exists — an attempt's directory is new, so its files are \
@@ -246,6 +290,10 @@ pub(crate) fn plan(
         harness: harness.clone(),
         sandbox,
         executable,
+        cluster: None,
+        snapshot: None,
+        bundle: Vec::new(),
+        members: Vec::new(),
     })
 }
 
@@ -261,7 +309,7 @@ pub(crate) async fn plan_at(
     let harnesses = crate::harness::read_all(repo)?;
     let agents = agents_at(http, base, actor).await?;
     let dispatcher = crate::dispatch::resolve_agent(&agents, actor);
-    plan(
+    let mut selected = plan(
         &harnesses,
         &agents,
         settings,
@@ -269,7 +317,18 @@ pub(crate) async fn plan_at(
         request.search_path.as_ref(),
         dispatcher.as_deref(),
     )
-    .map_err(|e| anyhow::anyhow!("boss dispatch --launch: {e}"))
+    .map_err(|e| anyhow::anyhow!("boss dispatch --launch: {e}"))?;
+    if selected.harness.launch == crate::harness::Launch::Cluster {
+        let binding =
+            crate::launch_cluster::resolve(http, base, repo, actor, &selected.harness).await?;
+        let (snapshot, bundle, members) = crate::launch_cluster::snapshot(repo).await?;
+        selected.executable = PathBuf::from(&binding.binary);
+        selected.cluster = Some(binding);
+        selected.snapshot = Some(snapshot);
+        selected.bundle = bundle;
+        selected.members = members;
+    }
+    Ok(selected)
 }
 
 /// THE ROSTER A LAUNCH READS IS MAIN'S (review f7f0b689, N6). The
@@ -307,38 +366,44 @@ pub(crate) fn roster_is_mains(repo: &Path) -> std::result::Result<(), String> {
             .output()
             .map_err(|e| format!("could not run git: {e}"))
     };
-    let dir = crate::harness::DIR;
-    let status = git(&["status", "--porcelain", "--ignored", "--", dir])?;
-    if !status.status.success() {
-        return Err(format!(
-            "whether {dir} is origin/main's could not be read (git status: {}) — no evidence \
+    for dir in [crate::harness::DIR, crate::launch_cluster::ROWS] {
+        let status = git(&["status", "--porcelain", "--ignored", "--", dir])?;
+        if !status.status.success() {
+            return Err(format!(
+                "whether {dir} is origin/main's could not be read (git status: {}) — no evidence \
              is not a pass, and --launch reads the roster from this checkout",
-            String::from_utf8_lossy(&status.stderr).trim()
-        ));
-    }
-    let dirty = String::from_utf8_lossy(&status.stdout).trim().to_string();
-    if !dirty.is_empty() {
-        return Err(format!(
-            "{dir} in {} holds uncommitted, untracked or ignored files ({}) — --launch starts \
+                String::from_utf8_lossy(&status.stderr).trim()
+            ));
+        }
+        let dirty = String::from_utf8_lossy(&status.stdout).trim().to_string();
+        if !dirty.is_empty() {
+            return Err(format!(
+                "{dir} in {} holds uncommitted, untracked or ignored files ({}) — --launch starts \
              what the roster says, so it reads only a roster that is origin/main's",
-            repo.display(),
-            dirty.lines().collect::<Vec<_>>().join("; ")
-        ));
-    }
-    let diff = git(&["diff", "--quiet", "origin/main", "--", dir])?;
-    match diff.status.code() {
-        Some(0) => Ok(()),
-        Some(1) => Err(format!(
-            "{dir} in {} differs from origin/main — --launch starts what the roster says, so \
+                repo.display(),
+                dirty.lines().collect::<Vec<_>>().join("; ")
+            ));
+        }
+        let diff = git(&["diff", "--quiet", "origin/main", "--", dir])?;
+        match diff.status.code() {
+            Some(0) => {}
+            Some(1) => {
+                return Err(format!(
+                    "{dir} in {} differs from origin/main — --launch starts what the roster says, so \
              it reads only a roster that has landed. Run it from a checkout of main",
-            repo.display()
-        )),
-        _ => Err(format!(
-            "whether {dir} is origin/main's could not be read (git diff: {}) — no evidence is \
+                    repo.display()
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "whether {dir} is origin/main's could not be read (git diff: {}) — no evidence is \
              not a pass. If this clone has no origin/main yet, `git fetch origin` gives it one",
-            String::from_utf8_lossy(&diff.stderr).trim()
-        )),
+                    String::from_utf8_lossy(&diff.stderr).trim()
+                ));
+            }
+        }
     }
+    Ok(())
 }
 
 /// What the launcher appends to the dispatched prompt. It states what
@@ -358,11 +423,11 @@ pub(crate) fn launcher_section(
          BOSS_ACTOR={actor} and BOSS_AGENT_RUN={run_id}: sign as that actor and no other, and \
          set neither.\n\
          WHERE THIS RUN DIFFERS FROM THE RULES ABOVE. The step you were dispatched for is \
-         claimed and held by {dispatcher}, who launched you — NOT by you. Where the rules say \
-         `boss dispatch` has already claimed that step as you, that is not true of a launched \
-         run. Do not claim it, complete it, or record a verdict on it. Write your verdict and \
-         your findings as your FINAL message: it is kept at {last}, and {dispatcher} records it \
-         on the step and as this run's report.\n\
+         held by {actor}, claimed FOR you by {dispatcher}, who launched you: it counts against \
+         your own run cap and budget, but {dispatcher} records its outcome. Do not claim it, \
+         complete it, or record a verdict on it. Write your verdict and your findings as your \
+         FINAL message: it is kept at {last}, and {dispatcher} records it on the step and as \
+         this run's report.\n\
          Your own run's building step IS yours, and the worker receipt above takes it. If your \
          sandbox does not let a command reach the jobs API, do not work around it: say so in \
          your final message and go on with the work. Where the rules name a tool of another \
@@ -426,7 +491,7 @@ struct Ending {
 }
 
 /// The three signals that stop the verb, as one stream of names.
-struct Stops {
+pub(crate) struct Stops {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
     hangup: tokio::signal::unix::Signal,
@@ -435,7 +500,7 @@ struct Stops {
 impl Stops {
     /// From here on these signals no longer end the process by default:
     /// they are an ending this verb carries out.
-    fn listen() -> std::io::Result<Stops> {
+    pub(crate) fn listen() -> std::io::Result<Stops> {
         use tokio::signal::unix::{SignalKind, signal};
         Ok(Stops {
             interrupt: signal(SignalKind::interrupt())?,
@@ -444,7 +509,7 @@ impl Stops {
         })
     }
 
-    async fn next(&mut self) -> &'static str {
+    pub(crate) async fn next(&mut self) -> &'static str {
         tokio::select! {
             _ = self.interrupt.recv() => "SIGINT",
             _ = self.terminate.recv() => "SIGTERM",
@@ -524,12 +589,26 @@ fn observe(
             );
         }
     };
+    // THE FILE IS NAMED BY ITS VARIABLE TOO (review b149c579, N21): a
+    // transcript that was found and could not be read, or names no
+    // model, was explained by its whole path — the home's, as above —
+    // and that sentence goes onto the packet twice (`observed_model_unread`
+    // and `model`). The path itself is `launch.transcript`, the one key
+    // the report reads the file by.
+    let named = format!(
+        "{} under ${} (else $HOME/{})",
+        path.strip_prefix(&home)
+            .map(|within| within.display().to_string())
+            .unwrap_or_else(|_| "the transcript".into()),
+        harness.transcript.home_env,
+        harness.transcript.home_default
+    );
     let read = std::fs::read_to_string(&path)
-        .map_err(|e| format!("could not read {}: {e}", path.display()))
+        .map_err(|e| format!("could not read {named}: {e}"))
         .and_then(|text| {
             let model = crate::transcript_usage::read_models(&text)
                 .recorded()
-                .ok_or_else(|| format!("{} names no model on any billed turn", path.display()))?;
+                .ok_or_else(|| format!("{named} names no model on any billed turn"))?;
             let seen = match crate::transcript_usage::sum_usage(&text) {
                 Some(u) => json!({
                     "input": u.input, "cache_read": u.cache_read,
@@ -542,15 +621,142 @@ fn observe(
     (Some(path), read)
 }
 
-/// The sentence the receipt and the terminal carry about the model.
-pub(crate) fn model_line(declared: &str, observed: Option<&str>, why: Option<&str>) -> String {
-    match observed {
-        Some(o) if o == declared => format!("declared {declared}, observed {o}"),
-        Some(o) => format!("declared {declared}, observed {o} — they DIFFER"),
-        None => format!(
-            "declared {declared}, observed unknown ({})",
-            why.unwrap_or("the transcript was not read")
-        ),
+/// The sentence the receipt and the terminal carry about the model. One
+/// copy, in core (backlog ed8e5c85).
+pub(crate) use boss_jobs::car_release::model_line;
+
+/// The record a launcher writes about the model it started: `model` is
+/// EXACTLY the name it handed the harness (`null` when it handed none),
+/// `harness` the roster file it started when it started one by name, and
+/// `via` the control the name went through. Nothing here is inferred:
+/// the reader judges whether the name pins a model ([`reviewer_model`]).
+///
+/// [`reviewer_model`]: boss_jobs::car_release::reviewer_model
+pub(crate) fn launched_model(
+    model: Option<&str>,
+    harness: Option<&str>,
+    via: &str,
+    launched_by: &str,
+) -> Value {
+    let mut record = json!({ "model": model, "via": via, "launched_by": launched_by });
+    if let Some(h) = harness {
+        record["harness"] = json!(h);
+    }
+    record
+}
+
+/// THE LAUNCHER'S RECORD OF THE MODEL IT STARTED (backlog e6b05dd6, D2
+/// of design fb9ba887, David 2026-10-09: "the dispatcher or harness that
+/// launches a run writes the model onto the agent-run, and only that
+/// record counts").
+///
+/// WHY A FIRST RECORD. The release used to read the model the run's own
+/// `--report` observed in a transcript on its own host — the agent
+/// describing itself. This is written by whatever STARTS the run, through
+/// the first-record door (`POST …/steps/{building}/metadata/records`,
+/// `expected_absence`), on the run's Building step: the first write
+/// stands, its writer and time are stamped by the server, and no later
+/// write can replace it. Written before the run exists — the hook writes
+/// it before it hands the Agent call back, `--launch` before the spawn —
+/// so the run cannot have written it first.
+///
+/// ONLY A RUN THAT HAS NOT BEGUN. A Building step that is already active
+/// or finished belongs to a run that is running or ran: a record written
+/// now would describe a launch this caller did not make (a prompt that
+/// merely names another run, read by the hook as its own). Refused here,
+/// and the run reads `launched unknown`, which is true.
+///
+/// `Err` is every way it was not written, said whole. The callers carry
+/// on: a launch that cannot record its model is still a launch, and its
+/// release reads `launched unknown` rather than nothing at all — except
+/// [`NotRecorded::Contradicted`], which the hook refuses the call on.
+pub(crate) async fn record_launched_model<F, Fut>(
+    api: &F,
+    run_id: &str,
+    record: &Value,
+) -> std::result::Result<(), NotRecorded>
+where
+    F: Fn(reqwest::Method, String, Option<Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
+    use boss_jobs::car_release::{BUILDING_SLUG, LAUNCHED_MODEL_KEY};
+    use boss_jobs::records_before_claim::CLAIMED_KEY;
+    let other = NotRecorded::Other;
+    let run = api(reqwest::Method::GET, format!("/api/jobs/{run_id}"), None)
+        .await
+        .map_err(|e| other(format!("reading run {run_id}: {e:#}")))?
+        .ok_or_else(|| other(format!("run {run_id} read back empty")))?;
+    let building = run
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|s| s["spec_slug"] == BUILDING_SLUG)
+        .ok_or_else(|| other(format!("run {run_id} has no {BUILDING_SLUG} step")))?;
+    let status = building["status"].as_str().unwrap_or_default();
+    // Claimed once is begun, even released back to Ready (re-review
+    // 211cbae4 B1): the server refuses the record then too, and this
+    // says why in the launcher's words.
+    let claimed = building["metadata"].get(CLAIMED_KEY).is_some();
+    if claimed || !matches!(status, "pending" | "ready") {
+        return Err(other(format!(
+            "run {run_id}'s {BUILDING_SLUG} step is {status:?}{}: the run has begun, so this \
+             is not its launch",
+            if claimed { " and has been claimed" } else { "" }
+        )));
+    }
+    // ANOTHER LAUNCH ALREADY STANDS (re-review 211cbae4 N2). A first
+    // record is never replaced, so a different value already there is
+    // either a launch this caller did not make or a write by someone
+    // signing as the launcher before it — and the release would believe
+    // it. Not a quiet journal line: the hook refuses the call on it.
+    if let Some(stored) = building["metadata"].get(LAUNCHED_MODEL_KEY)
+        && stored != record
+    {
+        return Err(NotRecorded::Contradicted {
+            stored: stored.clone(),
+        });
+    }
+    let step = building["id"].as_str().unwrap_or_default();
+    let answer = api(
+        reqwest::Method::POST,
+        format!("/api/jobs/{run_id}/steps/{step}/metadata/records"),
+        Some(json!({ "key": LAUNCHED_MODEL_KEY, "value": record, "expected_absence": true })),
+    )
+    .await
+    .map_err(|e| other(format!("the first-record door refused it: {e:#}")))?;
+    match answer
+        .as_ref()
+        .and_then(|a| a.get("result"))
+        .and_then(Value::as_str)
+    {
+        Some("recorded" | "replayed") => Ok(()),
+        found => Err(other(format!(
+            "the first-record door answered {found:?}, not recorded — nothing stands for it"
+        ))),
+    }
+}
+
+/// Why [`record_launched_model`] wrote nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum NotRecorded {
+    /// The run's Building already holds a DIFFERENT `launch.model`.
+    Contradicted { stored: Value },
+    /// Every other way, said whole.
+    Other(String),
+}
+
+impl std::fmt::Display for NotRecorded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contradicted { stored } => write!(
+                f,
+                "the run's launch is already on the record as {stored}, which is not this \
+                 launch: a first record is never replaced, so either this run was launched \
+                 before or someone signing as its launcher wrote it first"
+            ),
+            Self::Other(why) => f.write_str(why),
+        }
     }
 }
 
@@ -637,6 +843,44 @@ async fn stop_group(
     })
 }
 
+/// WHATEVER UNWINDS THE LAUNCH STOPS THE GROUP (review b149c579, N19).
+/// [`stop_group`] is the stop; this is for the launch that never reaches
+/// it — a panic, a future that is dropped. Until it existed that path
+/// was `kill_on_drop` alone, which kills the ONE process spawned: a
+/// wrapper-shaped harness (the real `codex` on PATH is a node script
+/// that spawns the native program) lost its wrapper and the program ran
+/// on with no bound, on a packet that read `running`.
+///
+/// KILL, not TERM then a grace: a drop cannot wait, and a signal that
+/// may be ignored is not a stop. Disarmed once [`stop_group`] has run —
+/// the group is then gone, and its id is not signalled again. It is
+/// declared AFTER the child, so it drops first, while the unreaped
+/// leader still holds the group's id. What escapes it is what escapes
+/// [`stop_group`], and a verb that is KILLED drops nothing.
+struct StopOnDrop(Option<u32>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if let Some(leader) = self.0 {
+            let _ = signal_group(leader, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+/// A line on the verb's stderr, written WITHOUT `eprintln!` (review
+/// b149c579, N19). `eprintln!` panics when the write fails, and a verb
+/// whose terminal has closed is told so by SIGHUP — the moment it must
+/// stop the group and write `died`. Measured: with the reader of stderr
+/// gone and then SIGHUP, the group was stopped, the next line panicked,
+/// the verb exited 101 and Building's `died` was never written. A line
+/// nobody can read is lost; the ending it announced is not.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 /// Remove the attempt's worktree after a FINISHED turn, when it holds no
 /// change (review f7f0b689, N8: each launch left a locked worktree
 /// registered in the dispatching checkout for ever). A worktree with
@@ -696,9 +940,15 @@ pub(crate) async fn run_at(
     request: &Request,
     env: &(dyn Fn(&str) -> Option<OsString> + Sync),
 ) -> Result<Value> {
+    if plan.harness.launch == crate::harness::Launch::Cluster {
+        return crate::launch_cluster::launch_at(
+            http, base, actor, run_id, prompt, settings, plan, request,
+        )
+        .await;
+    }
     let api = |method: reqwest::Method, path: String, body: Option<Value>| {
         let signature = crate::identity::Signature::As(actor.to_string());
-        async move { crate::gate::api_at_signed(http, base, method, &path, body, signature).await }
+        async move { crate::sor_client::api_at_signed(http, base, method, &path, body, signature).await }
     };
     let short = &run_id[..8.min(run_id.len())];
     let stamp = || boss_clock_client::wall_now().to_rfc3339();
@@ -824,6 +1074,26 @@ pub(crate) async fn run_at(
             return finish(&api, run_id, receipt, &ending, None, settings).await;
         }
     };
+    // THE MODEL IT STARTS, AS A FIRST RECORD, BEFORE THE PROCESS EXISTS
+    // (backlog e6b05dd6): the name exactly as the argv hands it to the
+    // harness, or none when the harness file's argv carries no model.
+    // Not written is not a reason to start nothing — the release then
+    // reads `launched unknown` — but it is said, and kept on the receipt.
+    // Read off the harness file's argv TEMPLATE, where `{model}` is the
+    // launcher's own placeholder, never by finding the name in the
+    // rendered words, which any other word could contain (review fd7f1030
+    // F4).
+    let handed = plan
+        .harness
+        .argv
+        .iter()
+        .any(|w| w.contains("{model}"))
+        .then_some(settings.model.as_str());
+    let launch_model = launched_model(handed, Some(&plan.harness.id), "argv", actor);
+    if let Err(why) = record_launched_model(&api, run_id, &launch_model).await {
+        say!("boss dispatch: run {short} — the model it starts is not on the record: {why}");
+        receipt["launch_model_unrecorded"] = json!(why.to_string());
+    }
 
     let mut command = tokio::process::Command::new(&plan.executable);
     command
@@ -865,34 +1135,70 @@ pub(crate) async fn run_at(
     };
     // Read before any wait: a reaped child no longer answers its id.
     let leader = child.id();
+    // From here to the stop below, nothing that unwinds this function
+    // leaves the group running.
+    let mut on_unwind = StopOnDrop(leader);
+    // THE BOUND IS COUNTED FROM THE SPAWN (review b149c579, N18), not
+    // from whenever the record next answers.
+    let bound = tokio::time::sleep(request.bound);
+    tokio::pin!(bound);
     receipt["pid"] = json!(leader);
     // It leads its own group, so the group's id is its pid.
     receipt["pgid"] = json!(leader);
-    receipt["status"] = json!("running");
-    // THE RECEIPT AGAIN, NOW THAT THERE IS A PID (review e9514316, B5):
-    // the one written before the spawn could not carry it, and a verb
-    // that dies without a word must leave a process that can be found.
-    // In the launch directory too, for a packet that cannot be written.
+    // THE PROCESS ON THE PACKET, NOW THAT THERE IS A PID (review
+    // e9514316, B5): the receipt written before the spawn could not carry
+    // it, and a verb that dies without a word must leave a process that
+    // can be found. In the launch directory too, for a packet that cannot
+    // be written.
+    //
+    // UNDER ITS OWN KEY (review 0facb916, B1). It was the whole `launch`
+    // receipt again, with status `running`. Once this write rode beside
+    // the wait (N18, below) it could still be in flight when the ending
+    // was written, and the record applies a metadata write as a
+    // top-level merge: measured, a pid write held 4 s and then delivered
+    // turned a `died` receipt back into `running` and took ended_at,
+    // exit_code, stopped and transcript with it. Waiting for its answer
+    // after the stop would close that only while the connection answers
+    // at all — a client with no timeout on a stalled connection would
+    // hold the ending for ever. On a key of its own, holding only what
+    // stays true once the process is gone, its arriving late changes
+    // nothing it should not, in whatever order the record applies it.
+    let process = json!({ "pid": leader, "pgid": leader, "spawned_at": stamp() });
     let who = leader.map_or("?".to_string(), |p| p.to_string());
     let _ = tokio::fs::write(dir.join("pid"), format!("{who}\n")).await;
-    if let Err(e) = api(
+    //
+    // THE WRITE IS ONE OF THE THINGS WAITED FOR, NEVER THE THING WAITED
+    // ON (review b149c579, N18). It was awaited here, inline, before the
+    // wait that enforces the bound, on a client with no timeout that
+    // retries a refused connect for 120 s. Measured: a 0.5 s bound with
+    // this write held 4 s let the process live 4.54 s, and a SIGTERM
+    // during a 2.5 s hold was acted on 2.53 s later. A dark system of
+    // record stretched the bound by up to two minutes; a stalled
+    // connection removed it and left the verb deaf to its own stop. So
+    // it is polled in the wait below, beside the exit, the bound and the
+    // signals, and whichever ending comes first is not kept waiting.
+    let pid_receipt = api(
         reqwest::Method::PATCH,
         format!("/api/jobs/{run_id}/metadata"),
-        Some(json!({ RECEIPT_KEY: receipt.clone() })),
-    )
-    .await
-    {
-        eprintln!(
+        Some(json!({ PROCESS_KEY: process })),
+    );
+    tokio::pin!(pid_receipt);
+    let mut pid_receipt_answered = false;
+    let pid_unwritten = |e: &anyhow::Error| {
+        say!(
             "boss dispatch: run {short}'s pid could not be written onto the run ({e:#}); it is \
              in {}",
             dir.join("pid").display()
         );
-    }
-    eprintln!(
+    };
+    // N20 (review b149c579): TERM THEN KILL. The line used to name TERM
+    // alone, which a process that ignores it — and its child — outlives.
+    say!(
         "boss dispatch: run {short} launched on harness {} as {} (pid {who}, process group \
          {who}), bound {} s, files in {}. Stopping THIS verb (Ctrl-C, TERM, HUP) stops it and \
-         ends the run died; if this verb is killed instead, stop it by hand with `kill -TERM \
-         -{who}` — the pid is launch.pid on the run and in {}",
+         ends the run died; if this verb is killed instead, the process is sent TERM and may \
+         ignore it, so stop the group by hand with `kill -TERM -{who}` and then, for whatever \
+         is left, `kill -KILL -{who}` — the pid is {PROCESS_KEY}.pid on the run and in {}",
         plan.harness.id,
         plan.harness.actor,
         request.bound.as_secs(),
@@ -940,18 +1246,37 @@ pub(crate) async fn run_at(
     };
     // THREE ENDINGS: the process exits, the bound passes, or the verb
     // itself is told to stop. The last two stop the group below.
-    tokio::select! {
-        exited = child.wait() => match exited {
-            Ok(status) => ending.exit_code = status.code(),
-            Err(e) => ending.spawn_error = Some(format!("waiting for the process: {e}")),
-        },
-        _ = tokio::time::sleep(request.bound) => ending.timed_out = true,
-        signal = async {
-            match stops.as_mut() {
-                Some(stops) => stops.next().await,
-                None => std::future::pending().await,
+    // The receipt's answer is not an ending: it is noted and the wait
+    // goes on.
+    loop {
+        tokio::select! {
+            exited = child.wait() => {
+                match exited {
+                    Ok(status) => ending.exit_code = status.code(),
+                    Err(e) => ending.spawn_error = Some(format!("waiting for the process: {e}")),
+                }
+                break;
             }
-        } => ending.stopped_by = Some(signal),
+            _ = &mut bound => {
+                ending.timed_out = true;
+                break;
+            }
+            signal = async {
+                match stops.as_mut() {
+                    Some(stops) => stops.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                ending.stopped_by = Some(signal);
+                break;
+            }
+            written = &mut pid_receipt, if !pid_receipt_answered => {
+                pid_receipt_answered = true;
+                if let Err(e) = written {
+                    pid_unwritten(&e);
+                }
+            }
+        }
     }
     // A process that exited gets a grace for what it wrote last to be
     // read; one stopped at the bound or with the verb gets none before
@@ -963,7 +1288,19 @@ pub(crate) async fn run_at(
             .is_ok();
     // Nothing the launch started outlives its ending, however it ended.
     receipt["stopped"] = stop_group(&mut child, leader, request.grace).await;
+    on_unwind.0 = None;
     let _ = tokio::time::timeout(request.grace, child.wait()).await;
+    // With the group stopped, a pid receipt still in flight is not waited
+    // for: the ending carries the pid, and that write names only the
+    // process under its own key, so if the record applies it after the
+    // ending it replaces nothing the ending says (review 0facb916, B1).
+    if !pid_receipt_answered {
+        say!(
+            "boss dispatch: run {short}'s pid receipt ({PROCESS_KEY}) was still unanswered when \
+             the process was stopped; the ending is written with the pid, and that receipt, if \
+             it lands, names only the process"
+        );
+    }
     if !drained {
         // With the group gone the pipe has no writer and this returns
         // at once; a holder that escaped the group is not waited for.
@@ -1068,24 +1405,28 @@ where
         Some(json!({ RECEIPT_KEY: receipt.clone() })),
     )
     .await;
-    eprintln!("boss dispatch: run {short} — {line}");
+    say!("boss dispatch: run {short} — {line}");
     let Some(why) = died else {
         recorded.context("the process finished a turn and its receipt could not be written")?;
         // WHO WRITES THE TERMINAL (review e9514316, N17). This run has
         // no gate, so no green ends it, and the launcher ends only a
-        // death. The step it worked on is held by the actor who launched
-        // it; completing THAT step is what ends the run, through the
-        // rule that follows the step's `agent_run` edge.
-        eprintln!(
+        // death. The step it worked on is held by the harness's actor,
+        // claimed for it by the actor who launched it (N2), and the
+        // launcher completes it — a status-only completion, admitted by
+        // the launcher's scope; completing THAT step is what ends the
+        // run, through the rule that follows the step's `agent_run` edge.
+        say!(
             "boss dispatch: run {short}'s process exited 0 after a completed turn; its handback \
              is {}. The run is still OPEN and nothing here ends it. To end it: read the \
-             handback, complete the step it was dispatched for (you hold it) — the rule \
+             handback, complete the step it was dispatched for (held by {}, claimed for it by \
+             you) — the rule \
              agent-run-delivers-when-its-step-is-done then completes this run's building \
              `delivered` — and record the report with `boss dispatch --report {run_id} \
              --summary-file <that file>`. If that step is not being completed, end the run \
              yourself: `boss step complete {run_id} --step building --field result=delivered` \
              (or result=refused)",
-            receipt["last_message_file"].as_str().unwrap_or("not kept")
+            receipt["last_message_file"].as_str().unwrap_or("not kept"),
+            receipt["actor"].as_str().unwrap_or("the harness's actor")
         );
         return Ok(receipt);
     };
@@ -1155,7 +1496,7 @@ where
         }
     }
     if let Err(e) = recorded {
-        eprintln!("boss dispatch: run {short}'s launch receipt could not be written ({e:#})");
+        say!("boss dispatch: run {short}'s launch receipt could not be written ({e:#})");
     }
     bail!(
         "run {short} DIED — {why}. Its building step is ended `died`{}; the step it was \
@@ -1234,6 +1575,7 @@ case "$mode" in
     sleep 30 &
     echo $! > "$cap/childpid"
     printf '%s\n' "$started"
+    echo yes > "$cap/spinning"
     while :; do :; done
     ;;
   deaf)
@@ -1381,7 +1723,7 @@ esac
         row_profile_launch: bool,
     ) -> Result<crate::dispatch::Dispatched> {
         dispatch_to(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             base,
             &repo(),
             PACKET,
@@ -1403,7 +1745,7 @@ esac
 
     async fn launch(base: &str, world: &World, d: &crate::dispatch::Dispatched) -> Result<Value> {
         run_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             base,
             &world.source,
             "claude@algedonic.dev",
@@ -1440,10 +1782,45 @@ esac
             assert_eq!(filed["steps"][2]["status"], "ready");
         }
         assert_eq!(d.building_assignee.as_deref(), Some("agent-codex"));
+        // N2 (review b149c579): THE STEP IS CLAIMED FOR THE HARNESS'S
+        // ACTOR, so the claim door reserves the run's budget against
+        // agent-codex's hour and counts it under agent-codex's
+        // concurrency cap — the actor the run is filed under — and never
+        // under the coordinator's row. One claim, sent once.
+        assert_eq!(
+            packet_claims(&log),
+            [format!(
+                "/api/jobs/{PACKET}/steps/s-build/claim?claimed_for=agent-codex"
+            )]
+        );
 
         let receipt = launch(&base, &world, &d)
             .await
             .expect("the stub finished a turn");
+
+        // THE LAUNCHER'S RECORD (backlog e6b05dd6): the model the argv
+        // hands the harness, as a first record on the run's Building,
+        // written before the process existed — so before the pid is.
+        {
+            let filed = run.lock().unwrap().clone().unwrap();
+            assert_eq!(
+                filed["steps"][2]["metadata"][boss_jobs::car_release::LAUNCHED_MODEL_KEY],
+                json!({"model": "gpt-6.1-sol", "harness": "codex-exec", "via": "argv",
+                       "launched_by": "claude@algedonic.dev"}),
+                "{filed}"
+            );
+            assert!(
+                receipt.get("launch_model_unrecorded").is_none(),
+                "{receipt}"
+            );
+            let calls = log.calls.lock().unwrap();
+            let at = |want: &dyn Fn(&(String, String, Value)) -> bool| {
+                calls.iter().position(want).expect("the call was made")
+            };
+            let recorded = at(&|(m, p, _)| m == "POST" && p.ends_with("/metadata/records"));
+            let spawned = at(&|(m, _, b)| m == "PATCH" && b.get(PROCESS_KEY).is_some());
+            assert!(recorded < spawned, "recorded before the process existed");
+        }
 
         // (a) THE PROCESS: the argv `codex exec --help` spells, in the
         // attempt's own worktree, with the dispatched prompt on stdin.
@@ -1500,12 +1877,14 @@ esac
         );
         assert!(stdin.contains(&format!("agent-run {RUN}")));
         assert!(stdin.contains("== THE LAUNCHER =="));
-        // N10: the launched worker is told who holds the step it works on.
+        // N10: the launched worker is told who holds the step it works on
+        // — itself, since N2 — and who records the verdict on it.
         assert!(
             stdin.contains(
-                "The step you were dispatched for is claimed and held by claude@algedonic.dev"
+                "The step you were dispatched for is held by agent-codex, claimed FOR you by \
+                 claude@algedonic.dev"
             ),
-            "the launcher section says who holds the source step"
+            "the launcher section says who holds the source step:\n{stdin}"
         );
 
         // (a) THE IDENTITY: its own actor and run, and nothing of the
@@ -1589,7 +1968,7 @@ esac
         // launcher's record — no search, no --transcript — and the
         // existing adapter counts it.
         let (recorded, _) = crate::dispatch::transcript_source_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             "claude@algedonic.dev",
             RUN,
@@ -1629,7 +2008,7 @@ esac
         let elsewhere = world.root.join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
         let (outside, _) = crate::dispatch::transcript_source_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             &base,
             "claude@algedonic.dev",
             RUN,
@@ -1654,7 +2033,7 @@ esac
         // (d) `--started`, as the launched worker: its environment's
         // actor claims the Building it was nominated for, then the
         // receipt. The coordinator cannot: the step is not its own.
-        let client = crate::gate::machine_client().unwrap();
+        let client = crate::sor_client::machine_client().unwrap();
         let refused = crate::dispatch_started::started_at(
             &client,
             &base,
@@ -2010,6 +2389,15 @@ esac
     /// stub is spinning. Returns the verb, where it tells, and its world.
     fn verb_running(name: &str) -> (std::process::Child, PathBuf, PathBuf) {
         let tell = boss_testing::scratch_dir(name);
+        let stderr = Stdio::from(std::fs::File::create(tell.join("stderr")).unwrap());
+        verb_running_saying_to(tell, stderr)
+    }
+
+    /// [`verb_running`], with the verb's stderr chosen by the caller.
+    fn verb_running_saying_to(
+        tell: PathBuf,
+        stderr: Stdio,
+    ) -> (std::process::Child, PathBuf, PathBuf) {
         let verb = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -2023,9 +2411,7 @@ esac
             .stdout(Stdio::from(
                 std::fs::File::create(tell.join("stdout")).unwrap(),
             ))
-            .stderr(Stdio::from(
-                std::fs::File::create(tell.join("stderr")).unwrap(),
-            ))
+            .stderr(stderr)
             .spawn()
             .unwrap();
         let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -2115,6 +2501,14 @@ esac
             // N12: no VALUE of a variable in anything written or said.
             let said = std::fs::read_to_string(tell.join("stderr")).unwrap();
             assert!(said.contains("launched on harness codex-exec"), "{said}");
+            // N20 (review b149c579): the by-hand line is TERM THEN KILL.
+            // TERM alone does not end a process that ignores it.
+            let group = launched.trim();
+            assert!(
+                said.contains(&format!("`kill -TERM -{group}`"))
+                    && said.contains(&format!("`kill -KILL -{group}`")),
+                "{name}: the by-hand stop names both signals: {said}"
+            );
             for (place, text) in [
                 ("stderr", said.as_str()),
                 ("the writes", &ended["writes"].to_string()),
@@ -2147,9 +2541,12 @@ esac
     }
 
     /// B5 (3). The pid and the process group are on the packet as soon as
-    /// the process exists — a second receipt, right after the spawn — so
+    /// the process exists — a second write, right after the spawn — so
     /// a verb that dies without a word leaves a process that can be
     /// found. The pre-spawn receipt cannot carry them: there is no pid.
+    /// That write is under its own key, never the receipt's (review
+    /// 0facb916, B1): the receipt is written twice, before the spawn and
+    /// at the end, and nothing else writes it.
     #[tokio::test]
     async fn the_receipt_carries_the_pid_as_soon_as_the_process_exists() {
         let world = World::new("dispatch-launch-pid", "hang", 500);
@@ -2160,29 +2557,49 @@ esac
             .unwrap();
         launch(&base, &world, &d).await.unwrap_err();
         let launched = world.captured("pid").trim().to_string();
-        let receipts: Vec<Value> = log
+        let writes: Vec<Value> = log
             .calls
             .lock()
             .unwrap()
             .iter()
             .filter(|(m, p, _)| m == "PATCH" && p == &format!("/api/jobs/{RUN}/metadata"))
-            .map(|(_, _, b)| b[RECEIPT_KEY].clone())
+            .map(|(_, _, b)| b.clone())
             .collect();
-        let states: Vec<&str> = receipts
+        let keys: Vec<Vec<&str>> = writes
             .iter()
-            .map(|r| r["status"].as_str().unwrap())
+            .map(|b| b.as_object().unwrap().keys().map(String::as_str).collect())
             .collect();
-        assert_eq!(states, ["starting", "running", "died"]);
         assert_eq!(
-            receipts[0].get("pid"),
+            keys,
+            [[RECEIPT_KEY], [PROCESS_KEY], [RECEIPT_KEY]],
+            "the receipt, the process, the receipt — each write one key"
+        );
+        let states: Vec<&str> = [&writes[0], &writes[2]]
+            .iter()
+            .map(|b| b[RECEIPT_KEY]["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(states, ["starting", "died"]);
+        assert_eq!(
+            writes[0][RECEIPT_KEY].get("pid"),
             None,
             "before the spawn there is none"
         );
-        assert_eq!(receipts[1]["pid"].to_string(), launched);
+        let process = &writes[1][PROCESS_KEY];
+        assert_eq!(process["pid"].to_string(), launched);
         assert_eq!(
-            receipts[1]["pgid"].to_string(),
+            process["pgid"].to_string(),
             launched,
             "it leads its own group"
+        );
+        assert_eq!(
+            process.get("status"),
+            None,
+            "it says nothing that stops being true when the process ends"
+        );
+        assert_eq!(
+            writes[2][RECEIPT_KEY]["pid"].to_string(),
+            launched,
+            "the ending carries the pid too"
         );
         assert_eq!(
             std::fs::read_to_string(world.request.dir.join("pid"))
@@ -2258,6 +2675,288 @@ esac
             "the deaf process is gone"
         );
         assert!(!alive(&world.captured("childpid")), "and its deaf child");
+    }
+
+    /// What a system of record in front of the launcher does with the
+    /// SECOND metadata write — the one that carries the pid, made right
+    /// after the spawn — once it has held it for a while.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Held {
+        /// Dropped unanswered: the stalled connection of review
+        /// b149c579, N18.
+        Dropped,
+        /// Delivered late, so the record applies it after whatever was
+        /// written meanwhile: a server that took the request and applied
+        /// it slowly (review 0facb916, B1).
+        DeliveredLate,
+    }
+
+    /// A system of record in front of `base` whose SECOND metadata write
+    /// is held for `hold` and then `held`. Every other request passes
+    /// through untouched.
+    async fn stalling_the_pid_receipt(base: &str, hold: std::time::Duration, held: Held) -> String {
+        let upstream = base.trim_start_matches("http://").to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let receipt = format!("PATCH /api/jobs/{RUN}/metadata ");
+        tokio::spawn(async move {
+            let mut receipts = 0;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                // The request line, looked at and left in the socket.
+                let mut head = [0u8; 256];
+                let mut seen = 0;
+                for _ in 0..400 {
+                    seen = sock.peek(&mut head).await.unwrap_or(0);
+                    if seen == 0 || head[..seen].contains(&b'\n') {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                if head[..seen].starts_with(receipt.as_bytes()) {
+                    receipts += 1;
+                }
+                let stall = receipts == 2 && head[..seen].starts_with(receipt.as_bytes());
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    if stall {
+                        tokio::time::sleep(hold).await;
+                        if held == Held::Dropped {
+                            return;
+                        }
+                    }
+                    if let Ok(mut up) = tokio::net::TcpStream::connect(&upstream).await {
+                        let _ = tokio::io::copy_bidirectional(&mut sock, &mut up).await;
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// N18 (review b149c579). THE BOUND IS COUNTED FROM THE SPAWN,
+    /// WHATEVER THE RECORD IS DOING. The receipt that carries the pid
+    /// was awaited inline, before the wait that enforces the bound: with
+    /// that write held 4 s and a bound of 0.5 s the process lived 4.54 s,
+    /// and a signal during the hold was not heard until it ended. A dark
+    /// system of record stretched the bound; a stalled one removed it.
+    #[tokio::test]
+    async fn the_bound_is_kept_while_the_pid_receipt_cannot_be_written() {
+        let mut world = World::new("dispatch-launch-stalled-receipt", "hang", 500);
+        world.request.grace = std::time::Duration::from_millis(400);
+        let (base, _log, run) =
+            keeping_stub(packet_without_projection(), reviewer_row(), live_agents()).await;
+        let d = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .unwrap();
+        let hold = std::time::Duration::from_secs(4);
+        let stalled = stalling_the_pid_receipt(&base, hold, Held::Dropped).await;
+        let began = std::time::Instant::now();
+        let refused = launch(&stalled, &world, &d).await.unwrap_err().to_string();
+        let took = began.elapsed();
+        assert!(
+            refused.contains("still running at its time bound"),
+            "{refused}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "a 0.5 s bound was enforced {took:?} after the launch began: the stalled receipt \
+             write ({hold:?}) held it"
+        );
+        let filed = run.lock().unwrap().clone().unwrap();
+        let receipt = &filed["metadata"][RECEIPT_KEY];
+        assert_eq!(receipt["status"], "died");
+        assert_eq!(receipt["timed_out"], true);
+        // The ending carries the pid the stalled write could not.
+        assert_eq!(receipt["pid"].to_string(), world.captured("pid").trim());
+        assert!(!alive(&receipt["pid"].to_string()), "the process is gone");
+        assert_eq!(filed["steps"][2]["metadata"]["result"], "died");
+    }
+
+    /// B1 (review 0facb916). A PID RECEIPT THAT LANDS LATE CANNOT REPLACE
+    /// THE ENDING. Once the pid write rode beside the wait instead of
+    /// before it, it could still be in flight when the ending was
+    /// written — and both wrote the whole `launch` receipt through a
+    /// top-level merge, so whichever the record applied LAST was the
+    /// receipt. Measured on 90597863 with this proxy: at return the run
+    /// read `died`; five seconds later it read `running`, with ended_at,
+    /// exit_code, stopped and transcript gone, while Building read died.
+    #[tokio::test]
+    async fn a_pid_receipt_that_lands_late_cannot_replace_the_ending() {
+        let mut world = World::new("dispatch-launch-late-receipt", "hang", 500);
+        world.request.grace = std::time::Duration::from_millis(400);
+        let (base, _log, run) =
+            keeping_stub(packet_without_projection(), reviewer_row(), live_agents()).await;
+        let d = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .unwrap();
+        let hold = std::time::Duration::from_secs(4);
+        let late = stalling_the_pid_receipt(&base, hold, Held::DeliveredLate).await;
+        let refused = launch(&late, &world, &d).await.unwrap_err().to_string();
+        assert!(
+            refused.contains("still running at its time bound"),
+            "{refused}"
+        );
+        let at_return = run.lock().unwrap().clone().unwrap()["metadata"][RECEIPT_KEY].clone();
+        assert_eq!(at_return["status"], "died");
+        // Long enough for the held write to reach the record.
+        tokio::time::sleep(hold + std::time::Duration::from_secs(1)).await;
+        let later = run.lock().unwrap().clone().unwrap();
+        let receipt = &later["metadata"][RECEIPT_KEY];
+        assert_eq!(
+            receipt["status"], "died",
+            "after the late pid write landed the receipt reads {}, building reads {}",
+            receipt["status"], later["steps"][2]["metadata"]["result"]
+        );
+        assert_eq!(receipt, &at_return, "the ending is the receipt, untouched");
+        // The control: the late write DID land, so the case was run.
+        let launched = world.captured("pid").trim().to_string();
+        assert_eq!(
+            later["metadata"][PROCESS_KEY]["pid"].to_string(),
+            launched,
+            "the held write was applied after the ending"
+        );
+        assert_eq!(later["steps"][2]["metadata"]["result"], "died");
+    }
+
+    /// N19 (review b149c579), the first half. A VERB WHOSE STDERR HAS
+    /// GONE STILL ENDS THE RUN. With the reader of its stderr gone and
+    /// then SIGHUP — what a closed terminal does — the group was stopped
+    /// but the next `eprintln!` panicked: the verb exited 101 and
+    /// Building's `died` was never written.
+    #[test]
+    fn a_verb_whose_stderr_has_gone_still_ends_the_run_died() {
+        let tell = boss_testing::scratch_dir("dispatch-launch-no-stderr");
+        let (reader, writer) = std::io::pipe().unwrap();
+        let (mut verb, tell, root) = verb_running_saying_to(tell, Stdio::from(writer));
+        let launched = std::fs::read_to_string(root.join("home/capture/pid")).unwrap();
+        assert!(alive(&launched), "the stub is running");
+        // Nobody reads the verb's stderr from here: its next write fails.
+        drop(reader);
+        let pid = rustix::process::Pid::from_raw(verb.id() as i32).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::HUP).unwrap();
+        let status = verb.wait().unwrap();
+        assert!(
+            gone_within(&launched, std::time::Duration::from_secs(5)),
+            "the launched process outlived the verb"
+        );
+        let ended: Value = serde_json::from_str(
+            &std::fs::read_to_string(tell.join("ended")).unwrap_or_else(|_| {
+                panic!("the verb ended ({status}) without ending the run: a write to its stderr panicked")
+            }),
+        )
+        .unwrap();
+        let building = &ended["run"]["steps"][2];
+        assert_eq!(building["status"], "completed");
+        assert_eq!(building["metadata"]["result"], "died");
+        assert!(
+            building["metadata"][DIED_KEY]["why"]
+                .as_str()
+                .unwrap()
+                .contains("SIGHUP")
+        );
+        assert_eq!(ended["run"]["metadata"][RECEIPT_KEY]["status"], "died");
+        assert_eq!(status.code(), Some(0), "the verb's process did not panic");
+    }
+
+    /// N19, the second half. WHATEVER UNWINDS THE LAUNCH STOPS THE GROUP.
+    /// A launch that was dropped — a panic, a cancelled future — left the
+    /// stop to `kill_on_drop`, which kills the ONE process spawned. For a
+    /// wrapper-shaped harness (the real `codex` on PATH is a node script
+    /// that spawns the native program) the wrapper died and its child ran
+    /// on with no bound, on a packet that read `running`.
+    #[tokio::test]
+    async fn a_launch_that_is_dropped_stops_the_whole_group() {
+        let world = World::new("dispatch-launch-dropped", "hang-with-child", 60_000);
+        let (base, _log, _run) =
+            keeping_stub(packet_without_projection(), reviewer_row(), live_agents()).await;
+        let d = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .unwrap();
+        let mut launching = Box::pin(launch(&base, &world, &d));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !world.home.join("capture/spinning").is_file() {
+            assert!(std::time::Instant::now() < until, "the stub never started");
+            tokio::select! {
+                out = &mut launching => panic!("the launch ended by itself: {out:?}"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+            }
+        }
+        let (leader, child) = (world.captured("pid"), world.captured("childpid"));
+        assert!(alive(&leader) && alive(&child), "both are running");
+        drop(launching);
+        let wait = std::time::Duration::from_secs(5);
+        let (leader_gone, child_gone) = (gone_within(&leader, wait), gone_within(&child, wait));
+        assert!(leader_gone, "the spawned process outlived the launch");
+        assert!(
+            child_gone,
+            "what the spawned process started outlived the launch"
+        );
+    }
+
+    /// N21 (review b149c579). A transcript that is FOUND and names no
+    /// model was explained by its whole path — under the harness's home,
+    /// the value of a variable of the launching session — in
+    /// `observed_model_unread` and in `model`. Those two are sentences;
+    /// they name the variable, as the missing-transcript sentence does
+    /// (N12). `launch.transcript` is the one key that IS the path: the
+    /// report reads the file by it.
+    #[tokio::test]
+    async fn a_transcript_that_names_no_model_is_explained_without_the_homes_path() {
+        let world = World::new("dispatch-launch-no-model", "ok", 20_000);
+        let without: String = rollout("gpt-6-astra")
+            .lines()
+            .filter(|l| !l.contains("turn_context"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(world.home.join("fixture.jsonl"), without).unwrap();
+        let (base, _log, _run) =
+            keeping_stub(packet_without_projection(), reviewer_row(), live_agents()).await;
+        let d = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .unwrap();
+        let receipt = launch(&base, &world, &d).await.unwrap();
+        assert_eq!(receipt["observed_model"], Value::Null);
+        let home = world.home.to_str().unwrap();
+        assert!(
+            receipt["transcript"].as_str().unwrap().starts_with(home),
+            "the fixture: the transcript was found, under the home"
+        );
+        for key in ["observed_model_unread", "model"] {
+            let said = receipt[key].as_str().unwrap();
+            assert!(said.contains("names no model"), "{key}: {said}");
+            assert!(
+                !said.contains(home),
+                "{key} carries the home's path: {said}"
+            );
+            assert!(
+                said.contains(
+                    "sessions/2026/10/07/rollout-2026-10-07T10-00-00-01a1-thread.jsonl under \
+                     $CODEX_HOME (else $HOME/.codex)"
+                ),
+                "{key} names the file by its variable: {said}"
+            );
+        }
+    }
+
+    /// Every claim made on the dispatched PACKET's steps, as sent — the
+    /// query string included, because who the claim is for rides there.
+    fn packet_claims(log: &crate::dispatch::wire_tests::Log) -> Vec<String> {
+        log.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| {
+                m == "POST"
+                    && p.starts_with(&format!("/api/jobs/{PACKET}/steps/"))
+                    && p.split('?')
+                        .next()
+                        .is_some_and(|path| path.ends_with("/claim"))
+            })
+            .map(|(_, p, _)| p.clone())
+            .collect()
     }
 
     fn writes_of(log: &crate::dispatch::wire_tests::Log) -> usize {
@@ -2338,12 +3037,18 @@ esac
     #[tokio::test]
     async fn without_launch_the_run_is_the_dispatching_actors_and_nothing_is_spawned() {
         let world = World::new("dispatch-no-launch", "ok", 20_000);
-        let (base, _log, run) =
+        let (base, log, run) =
             keeping_stub(packet_without_projection(), reviewer_row(), live_agents()).await;
         let d = dispatch(&base, &world, Some("gpt-6.1-sol"), false)
             .await
             .unwrap();
         assert!(d.plan.is_none());
+        // N2's other half: a printed prompt's step is the dispatching
+        // actor's own claim, naming no one else.
+        assert_eq!(
+            packet_claims(&log),
+            [format!("/api/jobs/{PACKET}/steps/s-build/claim")]
+        );
         let filed = run.lock().unwrap().clone().unwrap();
         assert_eq!(filed["metadata"]["agent"], "claude@algedonic.dev");
         assert!(filed["metadata"].get("harness").is_none());

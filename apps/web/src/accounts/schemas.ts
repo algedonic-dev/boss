@@ -32,9 +32,10 @@ export const AccountSchema = z.object({
 /// class of crash that bit catalog (extras: null).
 export const AssetSchema = z.object({
   asset_id: z.string(),
-  sku: z.string(),
+  sku: z.string().nullable(),
   phase: z.string(),
-  account_id: z.string().nullable(),
+  holder_kind: z.string().nullable(),
+  holder_id: z.string().nullable(),
   warranty_through: z.string().nullable(),
   open_ticket_count: z.number(),
   first_seen: z.string(),

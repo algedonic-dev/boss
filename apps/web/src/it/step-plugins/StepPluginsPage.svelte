@@ -5,6 +5,8 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import { formatDate } from '@boss/web-kit/ui/date';
   import type { StepPluginSpec } from './stepPluginTypes';
   import { href } from '../../router';
   import { readBindings, readCount, type Binding, type Usage } from './pluginUsage';
@@ -116,6 +118,8 @@
                 <th>Frontend bundle</th>
                 <th>Active workflow steps</th>
                 <th class="num">In flight (all packets)</th>
+                <th>Created</th>
+                <th>Authoring job</th>
               </tr>
             </thead>
             <tbody>
@@ -151,6 +155,12 @@
                     {#if !count || count.kind === 'loading'}Loading…
                     {:else if count.kind === 'unknown'}<span title={count.reason}>Unknown</span>
                     {:else}{count.value}{/if}
+                  </td>
+                  <td data-provenance="created">{formatDate(p.created_at)}</td>
+                  <td data-provenance="author">
+                    {#if p.authoring_job_id}
+                      <EntityLink kind="job" id={p.authoring_job_id} />
+                    {:else}Not recorded{/if}
                   </td>
                 </tr>
               {/each}

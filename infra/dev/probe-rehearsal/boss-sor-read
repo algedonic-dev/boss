@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# boss-sor-read /api/path — the DEV POD's copy of a recorded probe's
+# reader, for REHEARSING a probe before it is recorded. It takes what the
+# forge's reader (infra/forge/probe-bin/boss-sor-read) takes, refuses
+# what it refuses, and reads through the pod's door, `boss-api`, which
+# presents this container's machine token. It sends nothing itself.
+# Put it on PATH inside the rehearsal SCRIPT, never in an interactive
+# shell (a hand `boss prove` outside a checkout inherits that shell's
+# PATH — review 9edcfa36 N2). rehearse.sh, builder rule 7:
+#
+#   cd <your worktree> || exit 1
+#   pwd
+#   export PATH=<your worktree>/infra/dev/probe-rehearsal:$PATH
+#   bash <your scratch dir>/probe.sh    # its boss-sor-read calls land here
+#
+# WHY IT EXISTS (backlog 37742794 R3, part of urgent 2710c8fc; measured
+# by builder run f76adc85, 2026-10-09T18:35Z, against origin/main
+# 8ba37163075f). The machine gate's 24 h window held would-refuse facts
+# signed automation:run-car-probe-reader from the dev pod, presenting no
+# token. Three were a builder rehearsing a probe by hand: it exported
+# BOSS_SOR_USER as the probe reader and ran the FORGE's reader from its
+# worktree (run 0c777a6b, 16:49:44Z, 16:49:46Z and 16:58:38Z). The
+# forge's reader sends no machine token by design — it runs car-supplied
+# text, and on the forge its door is a reader credential behind a socket
+# (design b35c22b4) — and its own refusal told a hand runner to export
+# the reader's actor. Each such read dirties the gate's clean window
+# now, and the day the gate enforces it is a 401 that a rehearsal reads
+# as the car failing.
+#
+# WHAT IS THE SAME AS THE FORGE, AND IS HELD SO. The argv (one path,
+# never a URL, no method), the list read asked for whole (backlog
+# 9b473d4a), and the services a path may reach: a path whose service the
+# forge's port table does not carry is REFUSED here as it is there,
+# because the pod's door also reaches the read-only services the forge
+# cannot (backlog 9a440539), and a rehearsal that passes a probe the
+# forge refuses is worse than none. The table is the forge's own
+# infra/forge/sor-ports.env read as data — the one the unattended door
+# always hands its reader — and never a caller's: a BOSS_SOR_PORTS in
+# the shell that says anything else is refused (review 9edcfa36 N5), and
+# the door is handed the tree's table and none of the base or read-only
+# overrides it would otherwise honour. And WHAT A REFUSED READ PRINTS:
+# the forge's curl -fsS prints no body on a 4xx/5xx and exits 22; the
+# door prints the error body and exits 1. So the door's answer is held
+# here and printed only on its 0, and its 1 leaves as 22. Exec'ing the
+# door instead made an absence probe (`jq '.items | length'` on an error
+# body is 0) PASS the rehearsal and read not-yet on the forge (review
+# 9edcfa36 B1, measured against a loopback 403). Each of these is run
+# against the forge's reader side by side in
+# crates/core/boss-testing/tests/a_probe_rehearsal_reads_through_the_pods_door.rs.
+#
+# WHAT IS NOT. The identity: the door signs as the session's own actor
+# (platform-admin), not as the probe reader (audit-readonly) — the two
+# read the same world on every list (verified by effect, 61085a9e), and a
+# rehearsal is not a proof. The door prints `HTTP:<code>` on stderr. A
+# recorded proof is still run by `boss prove` on the forge, through its
+# own door, and a prove door's environment (BOSS_SOR_USER, BOSS_SOR_DOOR)
+# is refused here, so no proof is ever read through this session's token.
+#
+# Exit: 0 and the body on stdout; 22 and nothing on stdout on a non-2xx,
+# as curl -f; the door's own on anything else it fails on; 2 on a
+# refusal here, before the door is asked anything.
+set -uo pipefail
+
+me="boss-sor-read (dev pod rehearsal)"
+refuse() { echo "$me: REFUSED — $*" >&2; exit 2; }
+
+# A PROVE DOOR'S ENVIRONMENT. Both are what a `boss prove` door hands the
+# reader it runs, and a hand prove outside a checkout inherits its
+# caller's PATH — so a shell that had put this directory first would
+# record a PROOF read through this session's token, where today it is an
+# honest did-not-run (review 9edcfa36 N2). A builder who exported the
+# reader's identity by hand, as the forge's old refusal told them to,
+# lands here too, and needs to hear the same thing.
+for var in BOSS_SOR_USER BOSS_SOR_DOOR; do
+    [[ -z "${!var:-}" ]] || refuse \
+        "$var is set, which is a prove door's environment, or a hand export of the forge
+  reader's identity. This reader rehearses; it never proves, and it signs through the pod's
+  door as this session whatever $var says. Unset it in the rehearsal script (unset $var)."
+done
+
+[[ $# -eq 1 ]] || refuse \
+    "usage: boss-sor-read /api/path — exactly one argument, and it is a PATH, as the
+  forge's reader takes it. There is no method argument: a probe proves a claim by
+  reading. Got $# argument(s)."
+
+path="$1"
+case "$path" in
+    /*) ;;
+    *://*) refuse \
+        "'$path' is a URL. A recorded probe's reader takes the base from its door, never
+  from the probe, and so does this one: pass the path alone, e.g. boss-sor-read /api/yard/status" ;;
+    *) refuse "the path must start with '/': got '$path'" ;;
+esac
+
+HERE="$(dirname "$(readlink -f "$0")")"
+FORGE_BIN="$HERE/../../forge/probe-bin"
+
+# The list read, asked for whole unless the probe names `full` — the
+# forge reader's own rule, held equal to it by the pin named above.
+case "$path" in
+    /api/jobs) path="/api/jobs?full=true" ;;
+    /api/jobs\?*)
+        case "$path" in
+            *'?full='* | *'&full='*) ;;
+            *) path="${path}&full=true" ;;
+        esac
+        ;;
+esac
+
+# Only what the forge can route. The one route table both doors source,
+# from beside the forge's reader in this tree.
+routes="$FORGE_BIN/sor-routes.sh"
+[[ -r "$routes" ]] || refuse \
+    "$routes is missing — a tree that carries this reader without the forge's route table
+  cannot say which service a path belongs to."
+# shellcheck source=../../forge/probe-bin/sor-routes.sh
+. "$routes"
+# The forge's table, from the tree — the forge's door hands its reader
+# this file's table every time, never one from a caller's shell.
+ports_file="$HERE/../../forge/sor-ports.env"
+[[ -r "$ports_file" ]] || refuse \
+    "$ports_file is missing — without the forge's port table this reader cannot say which
+  paths the forge's reader would refuse."
+table=$(grep -Ev '^[[:space:]]*(#|$)' "$ports_file" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//' || true)
+[[ -n "$table" ]] || refuse "$ports_file names no service."
+if [[ -n "${BOSS_SOR_PORTS:-}" ]]; then
+    given=$(printf '%s' "$BOSS_SOR_PORTS" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')
+    [[ "$given" == "$table" ]] || refuse \
+        "BOSS_SOR_PORTS in this shell ('$given') is not the forge's table ('$table', from
+  $ports_file). The forge's door always hands its reader the file's table, so a rehearsal
+  routed by another would judge a different set of paths. Unset it."
+fi
+service=$(sor_service_for_path "$path")
+if [[ "$service" != jobs ]]; then
+    sor_port_for_service "$service" "$table" >/dev/null || refuse \
+        "'$path' is served by $service, and the forge's port table names no port for it
+  (table: '$table'). The forge's reader refuses this read, so a rehearsal that answered it
+  through the pod's door would pass a probe the forge cannot run."
+fi
+
+command -v boss-api >/dev/null 2>&1 || refuse \
+    "no boss-api on PATH — this reader reads through the pod's door and has no other way
+  to reach the system of record (CLAUDE.md §Doors)."
+
+# The door routes by the path, on the table this path was just judged
+# with. Everything else it would take from the caller's shell is a
+# hand reader's override the forge's reader never has: a service NAME,
+# a base URL (the forge's comes from its door), and the read-only rows
+# and their host (the forge carries none).
+unset BOSS_SOR_SERVICE BOSS_JOBS_URL BOSS_SOR_READ_PORTS BOSS_SOR_READ_URL
+export BOSS_SOR_PORTS="$table"
+
+# The answer is held and printed only on the door's 0, as curl -f
+# prints nothing on a 4xx/5xx: the door prints the error body and exits
+# 1, and that body read as a list is an empty one (review 9edcfa36 B1).
+# The trailing '.' keeps the body's own last newline and carries rc.
+out=$(boss-api GET "$path"; printf '.%s' "$?")
+rc=${out##*.}
+out=${out%.*}
+case "$rc" in
+    0) printf '%s' "$out" ;;
+    1) exit 22 ;;
+    *) exit "$rc" ;;
+esac

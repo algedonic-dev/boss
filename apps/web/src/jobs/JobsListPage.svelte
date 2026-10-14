@@ -1084,13 +1084,9 @@
     font-size: 10px;
     font-weight: 600;
   }
+  /* Worklist fields inherit Enamel; scoped rules keep only their layout. */
   .job-filter select,
   .job-filter input {
-    padding: 6px 10px;
-    font-size: 13px;
-    border: 1px solid var(--hairline);
-    border-radius: 4px;
-    background: var(--ink);
     min-width: 160px;
   }
   .job-filter-clear {
@@ -1166,11 +1162,6 @@
   }
   .form-row input,
   .form-row select {
-    padding: 6px 10px;
-    border-radius: 4px;
-    border: 1px solid var(--border);
-    background: var(--ink);
-    font: inherit;
     min-width: 220px;
   }
   .form-error {

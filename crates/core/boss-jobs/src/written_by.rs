@@ -19,11 +19,13 @@
 //! `credential.rotate.ops-runner`'s `DEPOSIT_ACTOR` draws for the same
 //! reason (review 3930a3eb, N2). The forger-proof guard is the declared
 //! field `writer` (design f623e425, [`crate::field_writer`]), which
-//! believes only a server-resolved credential; it lands on a protocol
-//! when the runner presents one, and no runner does yet
-//! ([`crate::field_writer::RESOLVABLE_PRINCIPALS`] is empty), so a
-//! `writer` declared today would lock the runner out. This is the guard
-//! that can hold until then, and it can sit beside a `writer` after.
+//! believes only a server-resolved credential. It landed on ops-request
+//! once both runner hosts presented one (row E, 2026-10-10; backlog
+//! 6c9183de), and REPLACED this declaration on `nothing-to-do` there:
+//! the seven record keys now declare `writer = "runner:ops"`. This
+//! mechanism stays for the steps whose one writer is a rule or a broker
+//! handler with no credential of its own (the deposit-key `enroll`
+//! step), and it can sit beside a `writer` where both apply.
 //!
 //! NEVER ON A PERSON'S PATH (DR rule 62dac114). A signer that is not
 //! machine-shaped ([`crate::owner_resolution::is_automation_shaped`]) is

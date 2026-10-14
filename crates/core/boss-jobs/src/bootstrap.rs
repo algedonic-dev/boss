@@ -1,7 +1,7 @@
 //! Tenant Workflow-publish bootstrap, shared by tenant `prepare`
 //! steps (the brewery's converged prepare and the used-device-shop's
 //! prepare both call this) — the Workflow-registry sibling of
-//! `boss_policy::bootstrap::publish_policy_rules`: one impl seeds a
+//! the policy bootstrap's `publish_policy_rules`: one impl seeds a
 //! tenant's `workflows.toml` through the public API so the offline
 //! regen, the live demo, and a fresh-VM install cannot drift.
 //!

@@ -2,9 +2,9 @@
 
 A **tenant is a directory of its own**, outside the product tree, in
 exactly the shape of `examples/<tenant>/` in this repo: `tenant.toml`
-(the manifest) plus `seeds/`. The product's two examples —
-`examples/brewery` and `examples/used-device-shop` — exercise this
-contract publicly; a company's own tenant (Algedonic, LLC's is the
+(the manifest) plus `seeds/`. The product's example,
+`examples/brewery`, exercises this contract publicly; a company's own
+tenant (Algedonic, LLC's is the
 private repo `david/algedonic-llc`, the first real customer) lives in
 its own repository and is never part of the product. Decided with
 David on 2026-09-16 (backlog `fcc1d57b`): *"someone downloading BOSS
@@ -164,14 +164,13 @@ stating plainly:
   `tenant.toml` riding as `seeds/tenant.toml` (a mount inside a
   read-only mount cannot be created), so both spellings stay.
 - `seeds/classes.json` (brewery) or `seeds/classes.toml` (`[[class]]`
-  rows, used-device-shop): the same rows, two formats, one endpoint.
+  rows): the same rows, two supported formats, one endpoint.
 
 ## What is outside the contract
 
 - **Prose** — `README.md`, `DOMAIN.md` — is not judged.
 - **`data/`** — the tenant engines' bulk data (`catalog.json`,
-  `assets.json`, `marketing-assets.json`, and used-device-shop's
-  `data/employees.json`) is read by those engines from `seeds/../data`
+  `assets.json` and `marketing-assets.json`) is read by those engines from `seeds/../data`
   and is not part of the platform contract; `check` does not descend
   into it.
 - **A field the registry cannot hold.** `seeds/agents.toml` was the

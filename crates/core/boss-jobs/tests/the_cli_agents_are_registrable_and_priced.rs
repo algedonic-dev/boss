@@ -9,8 +9,16 @@
 //! agent row holding a ROLE is put on the dispatcher's roster by
 //! `roster_union`, while `eligible_candidates` / `capability_executor`
 //! never read `max_concurrent_runs` — a role would let the dispatcher
-//! assign these CLIs steps nothing launches them for. So each holds no
+//! assign these CLIs steps nothing launches them for. So each held no
 //! role: reachable by id, never by a role audience.
+//!
+//! CODEX NOW HOLDS platform-admin (backlog 4e51bf23, 2026-10-09). David
+//! decided Codex sessions are platform-admin like Claude's (2026-10-01)
+//! and set the live row so (~02:42Z, read back 03:58Z: role
+//! platform-admin, max_concurrent_runs 12). With the agent-role word at
+//! `enforce` the row's role is what the session writes with, so this
+//! file says what the row says: a take of a null here would make Codex a
+//! guest. Gemini has no live row and keeps none.
 //!
 //! The file is not seeded by anything; the operator POSTs it to
 //! `/api/agents/batch?mode=insert-if-absent` after it lands. A refusal
@@ -64,12 +72,18 @@ fn each_cli_agent_passes_the_batch_doors_checks_and_names_a_priced_model() {
         "the file declares exactly the two CLI agents"
     );
 
-    for (id, alias, display) in [
-        ("agent-codex", "codex@algedonic.dev", "Codex (engineering)"),
+    for (id, alias, display, role) in [
+        (
+            "agent-codex",
+            "codex@algedonic.dev",
+            "Codex (engineering)",
+            Some("platform-admin"),
+        ),
         (
             "agent-gemini",
             "gemini@algedonic.dev",
             "Gemini (engineering)",
+            None,
         ),
     ] {
         let a = agent(id);
@@ -86,9 +100,14 @@ fn each_cli_agent_passes_the_batch_doors_checks_and_names_a_priced_model() {
         assert_eq!(a.aliases, [alias], "{id}: its login is its one alias");
         assert_eq!(a.display_name, display, "{id}: display name");
         assert_eq!(
-            a.role, None,
-            "{id}: a role puts it on the dispatcher roster (roster_union), which would assign \
-             it steps it cannot claim — reachable by id only"
+            a.role.as_deref(),
+            role,
+            "{id}: agent-codex holds platform-admin, the role its live row holds (David \
+             2026-10-01 and 2026-10-09, backlog 4e51bf23), because under the agent-role word at \
+             enforce the row's role IS what the session writes with, and a take of a null \
+             here would leave codex a guest. agent-gemini has no live row and holds none: a \
+             role puts it on the dispatcher roster (roster_union), which would assign it steps \
+             it cannot claim"
         );
         assert_eq!(a.department.as_deref(), Some("it"), "{id}: department");
         assert!(

@@ -355,6 +355,99 @@ fn a_handed_edit_level_is_judged_without_a_request() {
     }
 }
 
+/// HANDED ITS READ, A REGISTRY LINT MAKES NO REQUEST (backlog 44b2087e,
+/// 2026-10-09). A lint holds no token by rule, so a script that does —
+/// the converge's registry-drift phase, the daily protocol drift — reads
+/// the registry itself, stamped, and hands the read in as
+/// `BOSS_LINT_SOR_HANDED_URL` / `_CODE` / `_BODY`. lint_sor_read answers
+/// from it and curl never runs. Handed a read of ANOTHER URL, or a 200
+/// whose body it cannot read, it answers 000 — the launcher's word that
+/// this lint must not send the request itself — never a tokenless
+/// request in its place.
+#[test]
+fn a_handed_registry_read_is_judged_without_a_request() {
+    for (rel, var, path) in [
+        (
+            "infra/lint/the-live-protocols-are-the-authored-protocols.sh",
+            "BOSS_JOBS_URL",
+            "/api/workflows",
+        ),
+        (
+            "infra/lint/the-live-rules-are-the-authored-rules.sh",
+            "BOSS_DISPATCHER_URL",
+            "/api/dispatcher/rules",
+        ),
+    ] {
+        let tag = Path::new(rel)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("lint");
+        let url = format!("http://registry.test:7900{path}");
+        let s = stubs(&format!("handed-read-{tag}"));
+        let body = s.calls.with_file_name("handed.json");
+        std::fs::write(&body, "{\"error\":\"upstream unavailable\"}").unwrap();
+        let body = body.display().to_string();
+        let gone = s.calls.with_file_name("no-such-body.json");
+        let gone = gone.display().to_string();
+        let other = "http://registry.test:7900/api/somewhere-else".to_string();
+        for (case, handed, code, said) in [
+            // The handed code is the one the lint judges.
+            (
+                "match",
+                url.as_str(),
+                "503",
+                "was read by this run's launcher and handed in (HTTP 503)",
+            ),
+            (
+                "another-url",
+                other.as_str(),
+                "200",
+                "no request is sent in its place",
+            ),
+        ] {
+            let r = run_lint(
+                &s,
+                rel,
+                var,
+                &[
+                    ("BOSS_LINT_SOR_HANDED_URL", handed),
+                    ("BOSS_LINT_SOR_HANDED_CODE", code),
+                    ("BOSS_LINT_SOR_HANDED_BODY", &body),
+                    ("STUB_CODE", "200"),
+                ],
+            );
+            assert!(
+                read_lines(&s.calls).is_empty(),
+                "{rel} ({case}): handed its read, the lint still made a request:\n{}",
+                r.stderr
+            );
+            assert_eq!(r.code, 3, "{rel} ({case}):\n{}\n{}", r.stdout, r.stderr);
+            assert!(
+                r.stderr.contains(said),
+                "{rel} ({case}): {said:?} not said:\n{}",
+                r.stderr
+            );
+        }
+        let r = run_lint(
+            &s,
+            rel,
+            var,
+            &[
+                ("BOSS_LINT_SOR_HANDED_URL", &url),
+                ("BOSS_LINT_SOR_HANDED_CODE", "200"),
+                ("BOSS_LINT_SOR_HANDED_BODY", &gone),
+            ],
+        );
+        assert!(read_lines(&s.calls).is_empty(), "{rel}: {}", r.stderr);
+        assert_eq!(
+            r.code, 3,
+            "{rel}: a 200 with no body is no answer:\n{}",
+            r.stderr
+        );
+        assert!(r.stderr.contains("HTTP 000"), "{rel}:\n{}", r.stderr);
+    }
+}
+
 /// Past the window the lint refuses as it always did — exit 3, the
 /// CANNOT ANSWER marker, `HTTP 000` — with the wait's own line naming
 /// how long it waited, and never a clean pass.

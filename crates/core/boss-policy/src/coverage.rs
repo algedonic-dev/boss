@@ -577,14 +577,21 @@ mod tests {
             .collect()
     }
 
-    /// The live gap, on a test roster: the founder holds every control
-    /// but the operator tier, which is reported with 0 holders and the
-    /// remedy that names the promotion door and the register fix.
+    /// Defaults retain the operator gap and intentionally ungranted
+    /// privileged manual controls. Coverage reports all three.
     #[tokio::test]
-    async fn the_read_reports_the_operator_tier_as_the_one_gap() {
+    async fn the_read_reports_operator_and_ungranted_manual_gaps() {
         let (status, body) = read(instance(), repo_with_defaults().await, Some(SIGNED)).await;
         assert_eq!(status, 200, "{body}");
-        assert_eq!(orphan_ids(&body), vec!["operator-tier"], "{body:#}");
+        assert_eq!(
+            orphan_ids(&body),
+            vec![
+                "operator-tier",
+                "policy:create:manual-baseline",
+                "policy:read:manual-inventory"
+            ],
+            "{body:#}"
+        );
         assert_eq!(body["real_people"], json!(["emp-founder"]));
         assert_eq!(body["active_people"], 2);
         let remedy = body["orphans"][0]["remedy"].as_str().unwrap();
@@ -627,7 +634,12 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(
             orphan_ids(&body),
-            vec!["operator-tier", "policy:create:class"]
+            vec![
+                "operator-tier",
+                "policy:create:class",
+                "policy:create:manual-baseline",
+                "policy:read:manual-inventory"
+            ]
         );
     }
 
@@ -664,8 +676,7 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("tier counts"));
     }
 
-    /// A promoted key makes the founder the operator tier's holder, and
-    /// the read's one gap closes.
+    /// A promoted key covers the operator tier; it grants no manual authority.
     #[tokio::test]
     async fn a_promoted_key_covers_the_operator_tier() {
         let mut promoted = instance();
@@ -673,7 +684,51 @@ mod tests {
             keys_from_row(&json!({"employee_id": "emp-founder", "user": 2, "operator": 1}));
         let (status, body) = read(promoted, repo_with_defaults().await, Some(SIGNED)).await;
         assert_eq!(status, 200);
-        assert!(orphan_ids(&body).is_empty(), "{body:#}");
+        assert_eq!(
+            orphan_ids(&body),
+            vec![
+                "policy:create:manual-baseline",
+                "policy:read:manual-inventory"
+            ],
+            "{body:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fixture_manual_grants_close_only_the_exact_scope_all_gaps() {
+        for scope in [Scope::Self_, Scope::All] {
+            let repo = repo_with_defaults().await;
+            for pair in [
+                boss_policy_client::controls::READ_MANUAL_INVENTORY,
+                boss_policy_client::controls::CREATE_MANUAL_BASELINE,
+            ] {
+                repo.upsert_rule(
+                    &PolicyRule::new(
+                        "platform-admin",
+                        pair.resource(),
+                        pair.action(),
+                        scope.clone(),
+                    ),
+                    "fixture-only",
+                )
+                .await
+                .unwrap();
+            }
+            let mut promoted = instance();
+            promoted.keys =
+                keys_from_row(&json!({"employee_id":"emp-founder","user":2,"operator":1}));
+            let (status, body) = read(promoted, repo, Some(SIGNED)).await;
+            assert_eq!(status, 200);
+            let expected = if scope == Scope::All {
+                vec![]
+            } else {
+                vec![
+                    "policy:create:manual-baseline",
+                    "policy:read:manual-inventory",
+                ]
+            };
+            assert_eq!(orphan_ids(&body), expected, "{body:#}");
+        }
     }
 
     /// The header exactly as the gateway's `/api/policy/{*rest}` proxy
@@ -707,7 +762,14 @@ mod tests {
         let (status, body) = read(instance(), repo_with_defaults().await, Some(&clerk)).await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["holders_named"], false);
-        assert_eq!(orphan_ids(&body), vec!["operator-tier"]);
+        assert_eq!(
+            orphan_ids(&body),
+            vec![
+                "operator-tier",
+                "policy:create:manual-baseline",
+                "policy:read:manual-inventory"
+            ]
+        );
         for hidden in ["controls", "real_people", "active_people"] {
             assert!(body.get(hidden).is_none(), "{hidden} leaked: {body}");
         }

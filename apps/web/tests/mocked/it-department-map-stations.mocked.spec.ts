@@ -76,6 +76,81 @@ async function mocks(page: Page): Promise<void> {
 const PANEL = 'section[data-map-panel]';
 const board = (page: Page, name: string) => page.locator(`${PANEL} [data-station-board="${name}"]`);
 
+test('a station retries a transient render failure on the next successful regions read', async ({ page }) => {
+  await mocks(page);
+  let reads = 0;
+  await page.route(YARD_REGIONS, (r) => {
+    reads += 1;
+    return json(r, REGIONS);
+  });
+  // Throw once from an actual DOM operation inside the station boundary.
+  // The failed snippet must catch it; there is no production test hook.
+  await page.addInitScript(() => {
+    const original = Element.prototype.setAttribute;
+    let thrown = false;
+    Element.prototype.setAttribute = function (name: string, value: string): void {
+      if (!thrown && name === 'data-station-board' && value === 'feedback') {
+        thrown = true;
+        throw new Error('one-shot station render fault');
+      }
+      original.call(this, name, value);
+    };
+  });
+  await page.goto('/it?at=receiving');
+  const failure = page.locator(`${PANEL} [data-region="receiving"].load-failed`);
+  await expect(failure).toContainText('one-shot station render fault');
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Department Map');
+  await expect(page.locator('.yard-empty', { hasText: 'Reading the regions…' })).toHaveCount(0);
+  await expect.poll(() => reads).toBeGreaterThan(1);
+  await expect(failure).toHaveCount(0);
+  await expect(board(page, 'feedback')).toBeVisible();
+  await expect(page).toHaveURL(/\/it\?at=receiving$/);
+});
+
+test('a successful regions poll preserves a healthy station subtree', async ({ page }) => {
+  await mocks(page);
+  let reads = 0;
+  await page.route(YARD_REGIONS, (r) => {
+    reads += 1;
+    return json(r, REGIONS);
+  });
+  await page.goto('/it?at=receiving');
+  const feedback = board(page, 'feedback');
+  await expect(feedback).toBeVisible();
+  const original = await feedback.elementHandle();
+  expect(original).not.toBeNull();
+  await expect.poll(() => reads).toBeGreaterThan(1);
+  await expect(feedback).toBeVisible();
+  expect(await original!.evaluate((node) => node.isConnected)).toBe(true);
+});
+
+test('a persistent station render failure retries once per successful poll', async ({ page }) => {
+  await mocks(page);
+  let reads = 0;
+  await page.route(YARD_REGIONS, (r) => {
+    reads += 1;
+    return json(r, REGIONS);
+  });
+  await page.addInitScript(() => {
+    const original = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function (name: string, value: string): void {
+      if (name === 'data-station-board' && value === 'feedback') {
+        const attempts = Number(document.documentElement.dataset['stationAttempts'] ?? '0') + 1;
+        document.documentElement.dataset['stationAttempts'] = String(attempts);
+        throw new Error('persistent station render fault');
+      }
+      original.call(this, name, value);
+    };
+  });
+  await page.goto('/it?at=receiving');
+  const failure = page.locator(`${PANEL} [data-region="receiving"].load-failed`);
+  await expect(failure).toContainText('persistent station render fault');
+  await expect(page.locator('html')).toHaveAttribute('data-station-attempts', '1');
+  await expect.poll(() => reads).toBeGreaterThan(1);
+  await expect(page.locator('html')).toHaveAttribute('data-station-attempts', '2');
+  await expect(failure).toContainText('persistent station render fault');
+});
+
 // ---------------------------------------------------------------------
 // The retired pages: not found, with the Department Map as the door
 // ---------------------------------------------------------------------
@@ -213,51 +288,44 @@ test.describe('each retired page’s content is in its station’s panel', () =>
 // The map, pinned
 // ---------------------------------------------------------------------
 
-test.describe('the map is pinned at the top', () => {
+test.describe('the map scrolls normally even in a tall desktop window', () => {
   // A window with room for it (MapPage.svelte PIN_QUERY: 900px tall).
   test.use({ viewport: { width: 1440, height: 1000 } });
 
-  test('the panel scrolls beneath the map, and the map stays on the screen', async ({ page }) => {
+  test('scrolling the panel moves the map off the screen', async ({ page }) => {
     await mocks(page);
     await page.goto('/it?at=track');
     const pin = page.locator('[data-map-pin]');
-    await expect(pin).toHaveAttribute('data-map-pin', 'pinned');
-    expect(await pin.evaluate((el) => getComputedStyle(el).position)).toBe('sticky');
+    await expect(pin).toHaveAttribute('data-map-pin', 'scrolls');
+    expect(await pin.evaluate((el) => getComputedStyle(el).position)).toBe('static');
     await expect(board(page, 'conductor')).toBeVisible();
 
     // Down to the foot of the page: the map holds under the 44px bar.
     await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
     await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
     const box = (await pin.boundingBox())!;
-    expect(Math.round(box.y)).toBe(44);
+    expect(box.y + box.height).toBeLessThanOrEqual(44);
     // The panel's head has gone up under it; the map is what is on top.
-    const head = (await page.locator(`${PANEL} .panel-head`).boundingBox())!;
-    expect(head.y).toBeLessThan(box.y + box.height);
-    const onTop = await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.closest('[data-map-pin]') !== null, {
-      x: box.x + box.width / 2,
-      y: box.y + box.height / 2,
-    });
-    expect(onTop).toBe(true);
+    expect(await page.evaluate(() => document.documentElement.style.scrollPaddingTop)).toBe('');
   });
 
-  test('a selection lands the panel right under the pinned map', async ({ page }) => {
+  test('a selection reveals the panel in normal document flow', async ({ page }) => {
     await mocks(page);
     await page.goto('/it?at=dock');
-    await expect(page.locator('[data-map-pin]')).toHaveAttribute('data-map-pin', 'pinned');
+    await expect(page.locator('[data-map-pin]')).toHaveAttribute('data-map-pin', 'scrolls');
     const pin = (await page.locator('[data-map-pin]').boundingBox())!;
     const panel = (await page.locator(PANEL).boundingBox())!;
     expect(panel.y).toBeGreaterThanOrEqual(pin.y + pin.height - 1);
     expect(panel.y).toBeLessThan(pin.y + pin.height + 40);
   });
 
-  test('what the pinned map covers is not "in view": the page scroll padding is the bar and the map, and goes with the page', async ({ page }) => {
+  test('the map never reserves document scroll padding', async ({ page }) => {
     await mocks(page);
     await page.goto('/it?at=dock');
-    const pin = (await page.locator('[data-map-pin]').boundingBox())!;
     const padding = () => page.evaluate(() => document.documentElement.style.scrollPaddingTop);
     // The map's height as the layout rounds it (clientHeight), against the
     // box's fractional one: within a pixel.
-    await expect.poll(async () => Math.abs(parseFloat(await padding()) - (44 + pin.height))).toBeLessThanOrEqual(1);
+    await expect.poll(padding).toBe('');
     await page.goto('/it/estate');
     await expect(page.getByRole('heading', { level: 1 })).toHaveText('The estate');
     await expect.poll(padding).toBe('');

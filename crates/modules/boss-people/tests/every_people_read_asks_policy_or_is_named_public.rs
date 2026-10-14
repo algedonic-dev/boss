@@ -285,7 +285,6 @@ fn assembled(pool: &PgPool, policy: Arc<dyn PolicyClient>) -> Router {
         people: Arc::new(PgPeople::new(pool.clone())),
         publisher: None,
         policy: Some(policy),
-        subject_kinds: None,
         clock,
     }))
     .fallback(|| async { (UNMOUNTED, "this pin does not mount the route") })

@@ -285,17 +285,17 @@ pub async fn run(
     since: Option<chrono::NaiveDate>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
 
     let backlog = read_backlog(|path| {
         let http = http.clone();
-        async move { crate::gate::api(&http, reqwest::Method::GET, &path, None).await }
+        async move { crate::sor_client::api(&http, reqwest::Method::GET, &path, None).await }
     })
     .await?;
 
     // Every user-feedback job is the user-feedback lane, so it needs a
     // COUNT, not a full fetch — read `total` off a single-row page.
-    let uf = crate::gate::api(
+    let uf = crate::sor_client::api(
         &http,
         reqwest::Method::GET,
         "/api/jobs?kind=user-feedback&limit=1",
@@ -382,9 +382,9 @@ pub async fn run(
     // Every boardable car in the dock, not just page one: the dock
     // builds past a page (in-flight + parked + landed-but-unclosed
     // residue), and a bare `limit=` read undercounts the delivery mix
-    // silently (a-limit-is-not-a-filter). `gate::all_open_cars` pages on
+    // silently (a-limit-is-not-a-filter). `crate::sor_client::all_open_cars` pages on
     // `total`.
-    let cars = crate::gate::all_open_cars(&http).await?;
+    let cars = crate::sor_client::all_open_cars(&http).await?;
     let boardable = boardable_cars(cars);
 
     let mut dmix: std::collections::BTreeMap<DeliveryChannel, usize> =
@@ -838,7 +838,7 @@ async fn landed_tier_reading(
     let trains = crate::train::list_all_pages(|offset| {
         let http = http.clone();
         async move {
-            crate::gate::api(
+            crate::sor_client::api(
                 &http,
                 reqwest::Method::GET,
                 &format!(
@@ -884,7 +884,7 @@ pub async fn tiers(
 ) -> Result<()> {
     let since =
         since.unwrap_or_else(|| (now - chrono::Duration::days(TIER_WINDOW_DAYS)).date_naive());
-    let reading = landed_tier_reading(&crate::gate::machine_client()?, since).await?;
+    let reading = landed_tier_reading(&crate::sor_client::machine_client()?, since).await?;
     println!("boss channels --tiers — is the core settling while work moves outward");
     print_landed(since, &reading);
     Ok(())
@@ -1009,11 +1009,11 @@ fn print_tier_mix(mix: &BTreeMap<String, usize>, total: usize) {
 /// so the verb can be re-run after every convergence without
 /// rewriting what an arrival stamped live.
 pub async fn backfill_tiers(since: Option<chrono::NaiveDate>) -> Result<()> {
-    let http = crate::gate::machine_client()?;
+    let http = crate::sor_client::machine_client()?;
     let trains = crate::train::list_all_pages(|offset| {
         let http = http.clone();
         async move {
-            crate::gate::api(
+            crate::sor_client::api(
                 &http,
                 reqwest::Method::GET,
                 &format!(
@@ -1043,7 +1043,7 @@ pub async fn backfill_tiers(since: Option<chrono::NaiveDate>) -> Result<()> {
             continue;
         };
         let patch = backfill_patch(&paths, merge_ref);
-        crate::gate::api(
+        crate::sor_client::api(
             &http,
             reqwest::Method::PATCH,
             &format!("/api/jobs/{id}/metadata"),

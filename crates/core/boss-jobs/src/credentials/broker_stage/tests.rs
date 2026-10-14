@@ -549,3 +549,206 @@ async fn a_verified_stage_belongs_to_the_open_rotation_packet_on_its_credential(
         Err(Refusal::PacketUnavailable)
     );
 }
+
+// ----- the key set fetched from the cluster (backlog 25fff647; design
+// 20058482 `stage-keys`: the jobs API fetches it itself, with its own pod
+// ServiceAccount token, over the cluster's verified TLS) -----
+
+/// A PUBLIC trust root whose private key was discarded the moment it was
+/// generated (2026-10-09): a CA no server can ever present a chain for, so
+/// a test that trusts it can only ever watch a handshake fail.
+const TEST_ROOT: &str = include_str!("test-root.pem");
+/// What the pod token file holds in these tests. No refusal, log line or
+/// byte on the wire before a verified handshake may carry it.
+const POD_TOKEN: &str = "pod-token-SENTINEL-never-in-an-error";
+
+fn pod_files(name: &str, token: Option<&str>, ca: Option<&str>) -> (PathBuf, PathBuf) {
+    let dir = boss_testing::scratch_dir(name);
+    let (token_file, ca_file) = (dir.join("token"), dir.join("ca.crt"));
+    if let Some(token) = token {
+        std::fs::write(&token_file, token).unwrap();
+    }
+    if let Some(ca) = ca {
+        std::fs::write(&ca_file, ca).unwrap();
+    }
+    (token_file, ca_file)
+}
+
+fn with_key_set(value: &str) -> Door {
+    let mut all = ALL;
+    all[4] = (KEY_SET_ENV, value);
+    vars(&all)
+}
+
+#[test]
+fn a_key_set_is_a_file_or_a_url_over_verified_tls_and_never_plain() {
+    for plain in [
+        "http://kubernetes.default.svc/openid/v1/jwks",
+        "HTTP://kubernetes.default.svc/openid/v1/jwks",
+        "ftp://kubernetes.default.svc/openid/v1/jwks",
+    ] {
+        match with_key_set(plain) {
+            Door::Broken(why) => {
+                assert!(why.contains(KEY_SET_ENV) && why.contains("TLS"), "{why}")
+            }
+            other => panic!("{plain} must be refused: {}", other.describe()),
+        }
+    }
+    let url = "https://kubernetes.default.svc/openid/v1/jwks";
+    match with_key_set(url) {
+        Door::On { keys, .. } => {
+            let said = keys.source();
+            assert!(
+                said.contains(url) && said.contains(CLUSTER_CA_FILE),
+                "{said}"
+            );
+        }
+        other => panic!("{}", other.describe()),
+    }
+    // The boot line names where the keys come from.
+    assert!(with_key_set(url).describe().contains(url));
+    match with_key_set("/etc/boss/jwks.json") {
+        Door::On { keys, .. } => assert!(keys.source().contains("/etc/boss/jwks.json")),
+        other => panic!("{}", other.describe()),
+    }
+}
+
+#[test]
+fn the_cluster_key_set_needs_its_pod_identity_and_its_trust_root_and_names_neither_value() {
+    for (name, token, ca, named) in [
+        ("cluster-keys-no-ca", Some(POD_TOKEN), None, "ca.crt"),
+        (
+            "cluster-keys-bad-ca",
+            Some(POD_TOKEN),
+            Some("not a certificate"),
+            "ca.crt",
+        ),
+        ("cluster-keys-no-token", None, Some(TEST_ROOT), "token"),
+        (
+            "cluster-keys-blank-token",
+            Some("  \n"),
+            Some(TEST_ROOT),
+            "token",
+        ),
+    ] {
+        let (token_file, ca_file) = pod_files(name, token, ca);
+        let source = ClusterKeySet {
+            // Port 9 is never dialled: each case fails before a connection.
+            url: "https://127.0.0.1:9/openid/v1/jwks".into(),
+            token_file,
+            ca_file,
+        };
+        let why = source.trusted().err().expect(name);
+        assert!(why.contains(named), "{name}: {why}");
+        assert!(!why.contains(POD_TOKEN), "{name}: {why}");
+        assert_eq!(
+            verify(&cluster().sign(&claims()), &terms(), &source, NOW),
+            Err(Refusal::KeysUnavailable),
+            "{name}"
+        );
+    }
+}
+
+/// A listener that answers one connection with a perfectly good key set
+/// in plain HTTP, and hands back every byte the client sent it.
+fn plain_key_server() -> (u16, std::thread::JoinHandle<Vec<u8>>) {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = json!({"keys":[cluster().jwk(KID)]}).to_string();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut heard = vec![0u8; 16 * 1024];
+        let n = stream.read(&mut heard).unwrap_or(0);
+        heard.truncate(n);
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        heard
+    });
+    (port, server)
+}
+
+#[test]
+fn the_pod_token_never_crosses_a_connection_that_did_not_verify() {
+    let (port, server) = plain_key_server();
+    let (token_file, ca_file) = pod_files(
+        "cluster-keys-plain-server",
+        Some(POD_TOKEN),
+        Some(TEST_ROOT),
+    );
+    let source = ClusterKeySet {
+        url: format!("https://127.0.0.1:{port}/openid/v1/jwks"),
+        token_file,
+        ca_file,
+    };
+    let why = source
+        .trusted()
+        .err()
+        .expect("a server the cluster CA did not certify holds no key set");
+    assert!(!why.contains(POD_TOKEN), "{why}");
+    let heard = server.join().unwrap();
+    assert!(!heard.is_empty(), "the client dialled, and spoke TLS first");
+    let heard = String::from_utf8_lossy(&heard).to_ascii_lowercase();
+    assert!(
+        !heard.contains(&POD_TOKEN.to_ascii_lowercase()) && !heard.contains("authorization"),
+        "a bearer crossed before the handshake verified: {heard}"
+    );
+}
+
+#[test]
+fn a_plain_url_handed_to_the_cluster_key_set_is_never_dialled() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (token_file, ca_file) =
+        pod_files("cluster-keys-plain-url", Some(POD_TOKEN), Some(TEST_ROOT));
+    let source = ClusterKeySet {
+        url: format!("http://127.0.0.1:{port}/openid/v1/jwks"),
+        token_file,
+        ca_file,
+    };
+    let why = source.trusted().err().expect("plain HTTP is refused");
+    assert!(!why.contains(POD_TOKEN), "{why}");
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "the plain URL was dialled"
+    );
+}
+
+#[test]
+fn the_boot_reads_the_key_set_once_and_says_what_it_found() {
+    assert_eq!(Door::Off.check_keys(), None);
+    assert_eq!(Door::Broken("X unset".into()).check_keys(), None);
+    let on = |keys: Arc<dyn StageKeys>| Door::On {
+        terms: terms(),
+        keys,
+    };
+    assert_eq!(on(Arc::new(keys())).check_keys(), Some(Ok(1)));
+    assert!(matches!(
+        on(Arc::new(Dark)).check_keys(),
+        Some(Err(why)) if why.contains("not mounted")
+    ));
+}
+
+#[test]
+fn the_stage_actor_is_a_registered_automation_of_its_own() {
+    use crate::agents::automations::{
+        load_automations_dir, platform_automations_path, row_of_record,
+    };
+    let rows = load_automations_dir(std::path::Path::new(platform_automations_path()))
+        .expect("the in-tree automations bundle loads");
+    let row = row_of_record(&rows, ACTOR).expect("a row answers for the broker-stage actor");
+    // Its OWN row, not a family's: the actor is assigned from a verified
+    // workload, so no signer's prefix may answer for it.
+    assert_eq!(row.id, ACTOR);
+    assert_eq!(row.signs_for, None);
+    // The role the stage command already carries (the dispatcher rule's
+    // `platform-admin`); the door replaces the id and keeps the role.
+    assert_eq!(row.role, "platform-admin");
+}

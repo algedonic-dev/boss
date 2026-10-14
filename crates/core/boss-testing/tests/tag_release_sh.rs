@@ -307,6 +307,41 @@ fn a_landed_sha_gets_an_annotated_tag_pushed_read_back_and_answered() {
     );
 }
 
+/// RUN FROM ROOT'S TREE, THE VERB TAGS IN THE CHECKOUT IT IS HANDED
+/// (backlog a604a35b, stage 2 of design c98c79aa). On the forge the ops
+/// runner executes /var/lib/boss/tree/current — an export root owns, with
+/// no `.git` and no `forgejo` remote — and its drop-in hands every verb
+/// BOSS_OPS_CHECKOUT, the checkout whose git, run as its owner, reaches
+/// the forge. With no seam of the verb's own, that is the tree it works
+/// on; the script itself is still read from where it stands.
+#[test]
+fn handed_the_checkout_the_verb_works_on_it_and_not_on_the_tree_it_runs_from() {
+    let c = Case::new("ops-checkout");
+    let out = Command::new("bash")
+        .arg(repo_root().join(SCRIPT))
+        .args(["v1.2.3", &c.b, RELEASE])
+        .env_remove("BOSS_TAG_RELEASE_TREE")
+        .env("BOSS_OPS_CHECKOUT", &c.tree)
+        .env("BOSS_TAG_RELEASE_REMOTE", "origin")
+        .env("BOSS_TAG_RELEASE_SOR_READ", &c.sor_read)
+        .env("OPS_REQUEST_ID", "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f")
+        .env_remove("BOSS_JOBS_URL")
+        .output()
+        .expect("the script runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert_eq!(c.forge_tags(), "v1.2.3", "{text}");
+    assert_eq!(
+        c.tree_tags(),
+        "v1.2.3",
+        "tagged in the handed checkout: {text}"
+    );
+}
+
 #[test]
 fn a_malformed_version_is_refused_before_anything_is_read() {
     let c = Case::new("malformed_version");

@@ -47,7 +47,9 @@ use boss_core::job::{Job, JobId, JobStatus, Priority, Step, StepId, StepStatus, 
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
 use boss_jobs::http::{JobsApiState, router};
-use boss_jobs::{InMemoryJobs, JobsRepository};
+use boss_jobs::{
+    InMemoryJobs, InMemoryStations, InMemoryWorkflows, JobsRepository, StationKind, StationSpec,
+};
 use boss_policy_client::{AccessTier, Action, Resource, Scope, User};
 use boss_policy_client::{FakePolicyClient, PolicyClient};
 use boss_testing::RecordingEventBus;
@@ -206,16 +208,61 @@ fn technician() -> User {
 }
 
 fn build_app() -> (Router, Arc<InMemoryJobs>, Arc<HeldCalendar>) {
-    let jobs = Arc::new(InMemoryJobs::new());
+    build_app_with_station(false)
+}
+
+fn build_app_with_station(selection: bool) -> (Router, Arc<InMemoryJobs>, Arc<HeldCalendar>) {
+    let jobs = Arc::new(InMemoryJobs::for_selection_fixture());
     let calendar = Arc::new(HeldCalendar::default());
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
+            .allow("technician", Action::Read, Resource::job(), Scope::All)
             .allow("technician", Action::Update, Resource::step(), Scope::All)
             .build(),
     );
+    let workflows = Arc::new(InMemoryWorkflows::new());
+    workflows
+        .seed(boss_jobs::registry::WorkflowSpec::platform_seed(
+            "service-visit",
+            "Visit",
+            "test",
+            vec!["custom".into()],
+            vec![boss_jobs::registry::StepSpec {
+                title: "visit".into(),
+                kind: "task".into(),
+                ready_when: "true".into(),
+                ..Default::default()
+            }],
+        ))
+        .unwrap();
+    let stations = Arc::new(InMemoryStations::new());
+    let mut station = StationSpec::draft(
+        "visits",
+        "Visits",
+        StationKind::Batch,
+        boss_jobs::station_queue::StationPredicate {
+            kind: Some("service-visit".into()),
+            step: Some(boss_jobs::station_queue::StepMatch {
+                kind: Some("task".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        chrono::Utc::now(),
+    );
+    station.status = boss_jobs::registry::WorkflowStatus::Active;
+    stations.seed(station).unwrap();
     let state = JobsApiState {
+        agent_budget: selection.then(|| {
+            Arc::new(boss_jobs::agent_budget::BudgetDoor {
+                agents: Arc::new(boss_jobs::agents::InMemoryAgents::new()),
+                runs: Arc::new(boss_jobs::agent_runs::InMemoryAgentRuns::new(vec![])),
+            })
+        }),
+        stations: selection.then_some(stations as Arc<dyn boss_jobs::StationRegistry>),
+        kind_registry: selection.then_some(workflows as Arc<dyn boss_jobs::WorkflowRegistry>),
         calendar: Some(calendar.clone() as Arc<dyn CalendarClient>),
         ..JobsApiState::minimal(
             jobs.clone(),
@@ -276,6 +323,56 @@ async fn start(app: &Router, job: &Job, step: &Step) -> (StatusCode, String) {
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn a_station_selection_refused_after_reserving_returns_only_its_own_hold() {
+    let (app, jobs, calendar) = build_app_with_station(true);
+    let (_job, step) = scheduled(&jobs).await;
+    let mut note = serde_json::Map::new();
+    note.insert("note".into(), serde_json::json!("new source observation"));
+    jobs.merge_after_next_read(&step.id, note);
+    let request_id = Uuid::new_v4();
+    let response = app
+        .oneshot(
+            Request::post("/api/stations/visits/claim-next")
+                .header("content-type", "application/json")
+                .header("x-boss-user", serde_json::to_string(&technician()).unwrap())
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"request_id":request_id})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(calendar.live_for(&step.id.to_string()), 0);
+    {
+        let history = calendar.held.lock().unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "this refusal must happen after its reservation was created: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(history[0].cancelled_at.is_some());
+    }
+    assert!(
+        jobs.station_claim_receipt(request_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let actual = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert_eq!(actual.status, StepStatus::Ready);
+    assert_eq!(actual.metadata["note"], "new source observation");
 }
 
 async fn put_status(app: &Router, job: &Job, step: &Step, status: &str) -> (StatusCode, String) {

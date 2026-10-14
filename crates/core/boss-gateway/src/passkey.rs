@@ -609,6 +609,10 @@ pub async fn register_finish(
     let refused = |reason: &str, r: ErrResp| {
         presence_refused("register_finish", Some(&employee_id), reason, r)
     };
+    let employee = match people_segment(&employee_id, "employee id") {
+        Ok(employee) => employee,
+        Err(r) => return refused("registration: malformed employee id", r),
+    };
     let row = match consume_challenge(&state, &body.challenge_id).await {
         Ok(v) => v,
         Err(r) => return refused("challenge consume", r),
@@ -670,7 +674,7 @@ pub async fn register_finish(
             reqwest::Method::POST,
             format!(
                 "{}/api/people/{}/webauthn-credentials",
-                state.people_base, employee_id
+                state.people_base, employee
             ),
         )
         .json(&json!({
@@ -786,18 +790,7 @@ pub async fn assert_begin(
     // The step's CURRENT content is what the passkey will approve.
     let job_url = format!("{}/api/jobs/{job_id}", state.jobs_base);
     let job: Value = {
-        let user_json = json!({
-            "id": employee_id,
-            // A roleless session reads as the least access, not the
-            // widest (design 2830b6b7) — the Session's one fallback,
-            // shared with role_headers and the proxy's refusal.
-            "role": sess.effective_role(),
-            "access_tier": sess.access_tier(),
-            "territory_account_ids": sess.territory_account_ids,
-            "direct_report_ids": sess.direct_report_ids,
-            "department": sess.department,
-        })
-        .to_string();
+        let user_json = sess.user_json();
         // Read as the session, never as the gateway: the employee sees
         // only what their own scope lets them (18b9e09d).
         let resp = sign_as_session(state.http.get(job_url), user_json)

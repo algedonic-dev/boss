@@ -521,15 +521,33 @@ mod red_train_alert_tests {
     /// the rollup carrying each check's `description` — the same adapter
     /// layer that once dropped `context`. From the forge's statuses, as
     /// its API spells them, through the entry mapping, to the verdict.
-    #[test]
-    fn a_refusal_survives_the_rollup_and_spares_the_cars() {
-        let forge_statuses = json!([
+    fn refusal_forge_statuses() -> Value {
+        json!([
             {"context": "CI / build-image (pull_request)", "status": "success", "description": ""},
             {"context": "CI / locomotive refusal", "status": "failure",
              "description": "refused: 65GB free on the workspace filesystem, need 70GB",
-             "target_url": "http://10.20.0.15:3000/david/boss/actions/runs/9/jobs/1"},
+             "target_url": format!("http://{}:3000/david/boss/actions/runs/9/jobs/1", boss_testing::test_values::test_net_1(15))},
             {"context": "CI / test (pull_request)", "status": "pending", "description": ""},
-        ]);
+        ])
+    }
+
+    #[test]
+    fn the_refusal_rollup_uses_a_reserved_synthetic_address() {
+        let statuses = refusal_forge_statuses();
+        let entry = super::rollup_entry(&statuses[1]);
+        let target = reqwest::Url::parse(entry["target_url"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            target.host_str().unwrap(),
+            boss_testing::test_values::test_net_1(15).to_string()
+        );
+        assert_eq!(target.port(), Some(3000));
+        assert_eq!(target.path(), "/david/boss/actions/runs/9/jobs/1");
+        assert_eq!(super::parse_run_job_ref(target.as_str()), Some((9, 1)));
+    }
+
+    #[test]
+    fn a_refusal_survives_the_rollup_and_spares_the_cars() {
+        let forge_statuses = refusal_forge_statuses();
         let entries: Vec<Value> = forge_statuses
             .as_array()
             .unwrap()
@@ -543,10 +561,7 @@ mod red_train_alert_tests {
             refusal["description"], "refused: 65GB free on the workspace filesystem, need 70GB",
             "the description is the refusal channel; dropping it turns the refusal into a strike"
         );
-        assert_eq!(
-            refusal["target_url"],
-            "http://10.20.0.15:3000/david/boss/actions/runs/9/jobs/1"
-        );
+        assert_eq!(refusal["target_url"], forge_statuses[1]["target_url"]);
         assert_eq!(entries[2]["status"], "PENDING");
         let rollup = json!(entries);
         assert!(super::any_failing_check_refused(Some(&rollup)));
@@ -731,9 +746,16 @@ mod red_verdict_log_tests {
             Some((467, 2))
         );
         // Absolute form, and a trailing query/fragment after the index.
+        let absolute_target = format!(
+            "http://{}:3000/david/boss/actions/runs/462/jobs/0?x=1",
+            boss_testing::test_values::test_net_1(15)
+        );
+        assert_eq!(parse_run_job_ref(&absolute_target), Some((462, 0)));
+        let declared_host = boss_testing::test_values::test_net_1(15).to_string();
         assert_eq!(
-            parse_run_job_ref("http://10.20.0.15:3000/david/boss/actions/runs/462/jobs/0?x=1"),
-            Some((462, 0))
+            reqwest::Url::parse(&absolute_target).unwrap().host_str(),
+            Some(declared_host.as_str()),
+            "the constructed absolute parser fixture must use the shared reserved host"
         );
     }
 

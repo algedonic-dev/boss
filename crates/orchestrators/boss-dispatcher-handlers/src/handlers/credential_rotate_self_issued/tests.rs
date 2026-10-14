@@ -2022,14 +2022,12 @@ async fn local_gates_read_the_real_gate_and_a_refused_port_is_not_served() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let served = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    // A port that was bound and released: nothing listens there.
-    let closed = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap()
-    };
+    // A port nothing listens on, HELD for the whole test rather than
+    // bound and released (review 465e723f F3).
+    let closed = boss_testing::dark_port();
     let gates = LocalGates::new(vec![
         ("jobs".into(), format!("http://{served}")),
-        ("sim-control".into(), format!("http://{closed}")),
+        ("sim-control".into(), closed.base.clone()),
     ]);
     assert_eq!(gates.roster(), vec!["jobs", "sim-control"]);
     match gates.accepts("jobs", "next-value").await {

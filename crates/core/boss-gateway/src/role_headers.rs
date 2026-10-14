@@ -61,7 +61,7 @@ pub async fn inject_role_headers(
         // gate could never open and the override was dead; a
         // client-supplied cookie deciding who you are is not something
         // to leave lying around unreachable.
-        let user_json = build_user_json(&session);
+        let user_json = session.user_json();
         if let Ok(val) = axum::http::HeaderValue::from_str(&user_json) {
             req.headers_mut().insert("x-boss-user", val);
         }
@@ -123,6 +123,11 @@ pub async fn inject_role_headers(
     // Never on the gate's own routes (review of car 1, a159e1ee): there
     // the token would let any signed-in user read `/misses`, every
     // caller's address, with the gateway's credential.
+    //
+    // This stamp is a MARK, not the value that leaves: no upstream is
+    // chosen yet, so the host rule cannot be asked here.
+    // [`restamp_for_upstream`] asks it once the forward knows where it is
+    // sending (backlog 6162aff2).
     if !boss_core::machine_gate::is_gate_route(req.uri().path())
         && let Some(token) = state.machine_token.current()
         && let Ok(val) = axum::http::HeaderValue::from_str(&token)
@@ -132,6 +137,31 @@ pub async fn inject_role_headers(
     }
 
     next.run(req).await
+}
+
+/// Re-decide the edge's stamp for the upstream a forward is about to send
+/// to (backlog 6162aff2). [`inject_role_headers`] stamps the INBOUND
+/// request before any route has chosen an upstream, so it cannot ask the
+/// host rule every other stamp asks; its header says only that this
+/// request passed the edge strip and is not one of the gate's own routes.
+/// The upstream is operator-set (`BOSS_<NAME>_UPSTREAM`) and can name any
+/// host, so the forward calls this: a marked request carries
+/// `machine_token::token_for`'s value for `upstream_url` — none for a host
+/// that is not loopback and not in `BOSS_MACHINE_TOKEN_HOSTS`, said once
+/// per process — and an unmarked one carries none. Until 6162aff2 the
+/// mark was forwarded verbatim, the one stamp in the estate that skipped
+/// that rule.
+pub(crate) fn restamp_for_upstream(
+    headers: &mut axum::http::HeaderMap,
+    source: &boss_core::machine_token::Source,
+    hosts: &boss_core::machine_token::Hosts,
+    upstream_url: &str,
+) {
+    if headers.remove(boss_core::machine_token::HEADER).is_some()
+        && let Some(value) = boss_core::machine_token::token_for(source, hosts, upstream_url)
+    {
+        headers.insert(boss_core::machine_token::HEADER, value);
+    }
 }
 
 /// Remove every inbound `x-boss-*` header. HeaderName is always
@@ -145,47 +175,6 @@ fn strip_boss_headers(headers: &mut axum::http::HeaderMap) {
     for name in inbound {
         headers.remove(&name);
     }
-}
-
-/// Build the JSON payload the `CurrentUser` extractor expects. Shape
-/// mirrors `boss_policy::User` — hand-written rather than importing the
-/// policy crate to keep the gateway's deps minimal.
-///
-/// Reads scope fields (territory / reports / department) off the
-/// signed Session cookie — they're captured at login time
-/// from `GET /api/people/{id}/scope` and baked into the cookie.
-/// That keeps the per-request injection zero-cost; staleness is
-/// bounded by the 8h session TTL.
-pub(crate) fn build_user_json(session: &Session) -> String {
-    // "operator" only for an ELEVATED session — `Session::access_tier`
-    // answers it from the stored tier and the elevation's instant
-    // together (adversarial review of car 0bde9b99, M2).
-    let access_tier_value = session.access_tier();
-    // The signed `employee_id` when the session has one, otherwise the
-    // username. A guest session has no employee_id by design, so it
-    // identifies downstream as `guest@algedonic.dev` — which is what
-    // should appear against anything it touches. `Session::policy_id`,
-    // because `/api/session` hands the same id to the SPA (9dad102c).
-    let id = session.policy_id();
-    // Default-fall-through is `visitor` (design 2830b6b7; it was
-    // `audit-readonly`, the widest read) so that any session reaching a
-    // backend without an explicit role gets the least access and writes
-    // nothing — belt-and-suspenders for any path that lands here with
-    // role == None. The fallback is the Session's own, shared with the
-    // proxy's read-only refusal.
-    let role = session.effective_role();
-    // serde_json for robust escaping of id/role — some usernames
-    // contain characters (`.`, `-`) that are header-safe but we want
-    // to be defensive.
-    serde_json::json!({
-        "id": id,
-        "role": role,
-        "access_tier": access_tier_value,
-        "territory_account_ids": session.territory_account_ids,
-        "direct_report_ids": session.direct_report_ids,
-        "department": session.department,
-    })
-    .to_string()
 }
 
 fn extract_session(req: &Request, key: &[u8]) -> Option<Session> {
@@ -203,7 +192,7 @@ mod tests {
     fn identity_is_the_signed_employee_id() {
         let mut session = Session::new("real@example.com", 3600);
         session.employee_id = Some("emp-001".to_string());
-        let json = build_user_json(&session);
+        let json = session.user_json();
         assert!(json.contains("\"id\":\"emp-001\""), "got: {json}");
     }
 
@@ -214,7 +203,7 @@ mod tests {
     fn a_session_without_an_employee_identifies_by_username() {
         let mut session = Session::new("guest@algedonic.dev", 3600);
         session.role = Some("audit-readonly".to_string());
-        let json = build_user_json(&session);
+        let json = session.user_json();
         assert!(
             json.contains("\"id\":\"guest@algedonic.dev\""),
             "got: {json}"
@@ -230,7 +219,7 @@ mod tests {
     #[test]
     fn a_session_without_a_role_is_announced_as_a_visitor() {
         let session = Session::new("nobody@example.com", 3600);
-        let json = build_user_json(&session);
+        let json = session.user_json();
         let role = boss_core::roles::VISITOR_ROLE;
         assert!(
             json.contains(&format!("\"role\":\"{role}\"")),
@@ -651,6 +640,102 @@ mod tests {
             .unwrap();
         let seen = probe_response(stamping_probe_app(), req).await;
         assert!(seen.contains(TOKEN_HEADER), "{seen}");
+    }
+
+    /// The gateway in front of the service port, forwarding as proxy.rs
+    /// does: the edge's mark re-decided for `upstream_url` under `hosts`
+    /// before the request leaves. The in-process port stands in for
+    /// whatever host the URL names; what is under test is the header.
+    fn gateway_forwarding_to(upstream_url: &'static str, hosts: &[&str]) -> axum::Router {
+        let source = Arc::new(Source::fixed(Some(ESTATE_TOKEN.into())));
+        let hosts = Arc::new(boss_core::machine_token::Hosts::listed(hosts));
+        let state = Arc::new(crate::AppState {
+            session_key: TEST_KEY.to_vec(),
+            proxy_client: reqwest::Client::new(),
+            perf: Arc::new(crate::perf::PerfCollector::new()),
+            machine_token: source.clone(),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
+        });
+        let forward = move |req: Request<axum::body::Body>| {
+            let (source, hosts) = (source.clone(), hosts.clone());
+            async move {
+                let mut req = req;
+                restamp_for_upstream(req.headers_mut(), &source, &hosts, upstream_url);
+                service_port().oneshot(req).await.unwrap()
+            }
+        };
+        axum::Router::new()
+            .fallback(forward)
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                inject_role_headers,
+            ))
+    }
+
+    /// Backlog 6162aff2: the forward stamp asks the shared host rule
+    /// (`machine_token::token_for`) of the upstream it sends to, as every
+    /// other stamp in the estate does. Loopback and a listed host are
+    /// stamped and admitted; an upstream an operator pointed anywhere else
+    /// arrives unstamped, so an enforcing port refuses it rather than the
+    /// estate token reaching that host.
+    #[tokio::test]
+    async fn the_forward_stamp_asks_the_host_rule_of_its_upstream() {
+        let cookie = session_cookie();
+        let req = || {
+            put(
+                "/api/things/1",
+                &[(header::COOKIE.as_str(), cookie.as_str())],
+            )
+        };
+        for (upstream, listed, admitted) in [
+            ("http://127.0.0.1:7900/api/things/1", &[][..], true),
+            (
+                "http://boss-things.boss.svc.cluster.local:7900/api/things/1",
+                &[".boss.svc.cluster.local"][..],
+                true,
+            ),
+            (
+                "http://upstream.example.net:7900/api/things/1",
+                &[".boss.svc.cluster.local"][..],
+                false,
+            ),
+        ] {
+            let (status, body) = send(gateway_forwarding_to(upstream, listed), req()).await;
+            let want = if admitted { 200 } else { 401 };
+            assert_eq!(
+                status, want,
+                "a forward to {upstream} under {listed:?} answered {status}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restamp_carries_only_the_rules_value_and_only_for_a_marked_request() {
+        let source = Source::fixed(Some(ESTATE_TOKEN.into()));
+        let hosts = boss_core::machine_token::Hosts::listed([".boss.svc.cluster.local"]);
+        let after = |marked: bool, url: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            if marked {
+                h.insert(
+                    TOKEN_HEADER,
+                    axum::http::HeaderValue::from_static("the-edges-mark"),
+                );
+            }
+            restamp_for_upstream(&mut h, &source, &hosts, url);
+            h.get(TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        };
+        assert_eq!(
+            after(true, "http://127.0.0.1:7900/x").as_deref(),
+            Some(ESTATE_TOKEN)
+        );
+        assert_eq!(after(true, "http://upstream.example.net:7900/x"), None);
+        // A gate route is never marked, so never stamped, even to loopback.
+        assert_eq!(after(false, "http://127.0.0.1:7900/x"), None);
     }
 
     /// The header probe, behind a gateway that holds the token, on every

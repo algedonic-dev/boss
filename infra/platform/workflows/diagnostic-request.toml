@@ -1,0 +1,35 @@
+# f7e3aba0: diagnostic work is a packet. Source preparation only;
+# publication and actual controller execution are separate recorded acts.
+[[workflow]]
+kind = "diagnostic-request"
+label = "Diagnostic request"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "A bounded diagnostic request executed by the registered actor named in its pinned operation contract, retaining complete original evidence without changing the subject's lifecycle."
+metadata = { department = "it", owner_role = "platform-admin", diagnostic_executor = "automation:train-conductor" }
+
+[[workflow.step]]
+title = "filed"
+kind = "trigger"
+ready_when = "true"
+metadata_defaults = { trigger_kind = "operator", trigger_name = "diagnostic-requested" }
+
+[[workflow.step]]
+title = "execute"
+kind = "task"
+ready_when = "steps.filed.done"
+audience = { individual = "automation:train-conductor" }
+metadata_defaults = { request = "{metadata.request}", diagnostic_operation = { handler = "isolated-consist", version = 1, capacity = 1, required_checks = ["alerts-are-packets"] }, procedure = "Use the declared actor's existing isolated controller. Retain immutable intent, exact candidate/baseline, original policy and edit-level, native Job/Pod UID and complete output before completing. Unknown launch acknowledgements never relaunch. This request changes no hold, review, PR or departure. A required-check pass is not a whole suite or delivery proof." }
+fields = [
+  { name = "request", field_type = "object", required = true, filled_by = "filer" },
+  { name = "outcome", field_type = "required-checks-passed|candidate-failed|incomplete|execution-failed|observer-unknown|refused", required = true },
+  { name = "evidence", field_type = "object", required = true },
+]
+
+[[workflow.step]]
+title = "answered"
+kind = "outcome"
+ready_when = "steps.execute.done"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "answered" }

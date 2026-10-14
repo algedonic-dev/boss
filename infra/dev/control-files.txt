@@ -2,6 +2,8 @@
 infra/dev/dev-build.py
 infra/dev/dev-lifecycle.py
 infra/dev/control-artifact.py
+infra/dev/control-images.json
+infra/estate/estate.toml
 infra/dev/activate-control.py
 infra/dev/control-tools.py
 infra/dev/control-files.txt

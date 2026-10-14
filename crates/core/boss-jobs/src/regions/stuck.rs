@@ -553,6 +553,7 @@ mod tests {
             car: crate::yard::dock_car(&held),
             reason: "wait for the migration".into(),
             kind: crate::yard::CarHoldKind::Operator,
+            release: None,
         }];
         status.held = vec![crate::yard::HeldGreen {
             branch: "feat/held-green".into(),

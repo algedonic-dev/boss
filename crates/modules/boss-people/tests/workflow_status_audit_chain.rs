@@ -53,7 +53,6 @@ fn build_app(pool: PgPool) -> Router {
         people: people.clone(),
         publisher: None,
         policy: None,
-        subject_kinds: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
     };
     workflow_router(

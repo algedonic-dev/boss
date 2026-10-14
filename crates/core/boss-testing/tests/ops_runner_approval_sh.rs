@@ -99,8 +99,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// The stubbed system of record. A GET of the open-request LIST serves
 /// `jobs.json`; a GET of ONE job (`/api/jobs/<id>`, the re-read the
-/// runner makes immediately before it claims) serves `reread.json` when
-/// a case wrote one, else that same job — so a case can move the record
+/// runner makes immediately before it claims) serves `job-<id>.json`
+/// when a case wrote one (the agent-runs a review names, backlog
+/// 84e7c3e4), else `reread.json` when a case wrote one, else that same
+/// job — so a case can move the record
 /// between the runner's first read and its claim. Every write is logged
 /// in order with its method, url, the `x-boss-user` it was signed as and
 /// its body (`null` for a bodyless POST, which is what the claim door
@@ -138,7 +140,9 @@ done
 if [ "$m" = GET ]; then
     case "$url" in
         */api/jobs/*)
-            if [ -f "$STUB_DIR/reread.json" ]; then cat "$STUB_DIR/reread.json"
+            one=${url%%\?*}; one=${one##*/}
+            if [ -f "$STUB_DIR/job-$one.json" ]; then cat "$STUB_DIR/job-$one.json"
+            elif [ -f "$STUB_DIR/reread.json" ]; then cat "$STUB_DIR/reread.json"
             else jq -c '.data[0]' "$STUB_DIR/jobs.json"; fi ;;
         *) cat "$STUB_DIR/jobs.json" ;;
     esac
@@ -944,18 +948,22 @@ fn the_nothing_to_do_terminal_waits_on_the_marker_the_runner_writes() {
 }
 
 /// ONLY THE RUNNER WRITES THE RECORD (backlog aa816dd4, LOW-1 of review
-/// ea2ecfd4), held to the runner (§9a): the `nothing-to-do` terminal
-/// declares `written_by` as exactly the account ops-runner.sh signs as
-/// when no unit overrides it, so the jobs API refuses the record from
-/// every other automation or agent session and admits the runner's.
+/// ea2ecfd4), and since row E (backlog 6c9183de, 2026-10-10) the runner
+/// is known by the credential it PRESENTS, not the account it types:
+/// every key of the record ops-runner.sh `close_nothing_to_do` writes
+/// declares the writer the jobs API's credential door resolves
+/// (`boss_jobs::runner_credential::PRINCIPAL`), the self-asserted
+/// `written_by` it replaced is gone, and the runner sends that door's
+/// header on its writes (§9a: the principal and the header are each
+/// read from their one definition, not retyped here).
 #[test]
-fn the_nothing_to_do_record_is_written_by_the_runners_account() {
+fn the_nothing_to_do_record_is_written_by_the_credentialed_runner() {
     let runner = std::fs::read_to_string(repo_root().join("infra/ops/ops-runner.sh")).unwrap();
-    let actor = runner
-        .lines()
-        .find_map(|l| l.strip_prefix("ACTOR=\"${BOSS_OPS_ACTOR:-"))
-        .and_then(|rest| rest.strip_suffix("}\""))
-        .expect("ops-runner.sh defines ACTOR=\"${BOSS_OPS_ACTOR:-<account>}\"");
+    let header = format!("{}: $rc_value", boss_jobs::runner_credential::HEADER);
+    assert!(
+        runner.contains(&header),
+        "ops-runner.sh builds its credential header as `{header}`, the header the door resolves"
+    );
     let path = repo_root().join("infra/platform/workflows/ops-request.toml");
     let doc: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let step = doc["workflow"][0]["step"]
@@ -965,15 +973,30 @@ fn the_nothing_to_do_record_is_written_by_the_runners_account() {
         .find(|s| s.get("title").and_then(|t| t.as_str()) == Some("nothing-to-do"))
         .expect("ops-request declares a nothing-to-do terminal")
         .clone();
-    assert_eq!(
-        step["metadata_defaults"]["written_by"].as_str(),
-        Some(actor),
-        "the nothing-to-do record's declared writer is the runner's account"
+    assert!(
+        step["metadata_defaults"].get("written_by").is_none(),
+        "the forger-proof writer replaces the self-asserted written_by: {:?}",
+        step["metadata_defaults"]
     );
+    let fields = step["fields"].as_array().expect("the record's fields");
+    assert_eq!(
+        fields.len(),
+        7,
+        "the seven keys the runner writes: {fields:?}"
+    );
+    for field in fields {
+        assert_eq!(
+            field.get("writer").and_then(|w| w.as_str()),
+            Some(boss_jobs::runner_credential::PRINCIPAL),
+            "nothing-to-do.{} is the credentialed runner's",
+            field["name"]
+        );
+    }
 }
 
-/// A record write the jobs API refuses — a runner signing as another
-/// account than the step declares — is a doubt, and a doubt asks: the
+/// A record write the jobs API refuses — a runner whose credential the
+/// door does not resolve for this host (until row E, one signing as
+/// another account than `written_by` named) — is a doubt, and a doubt asks: the
 /// plan is rendered onto the approve step for a passkey, rather than
 /// the request waiting forever on a close it can never make.
 #[test]
@@ -1029,6 +1052,31 @@ fn nothing_to_do_plans(verb: &str) -> Option<(Vec<String>, Vec<String>)> {
                         "would keep /opt/boss-binbak-x — it holds a git checkout, and this verb removes only /opt/boss-dev-bak's (when its plan proves it holds nothing unpushed). Its unpushed state, against its own remote-tracking refs as of its last fetch:\n  checkout /opt/boss-binbak-x:\n{journal}"
                     ),
                     format!("{journal}{journal}"),
+                ],
+            ))
+        }
+        // The live empty plan of ops-request d2a031b4 (backlog 8828d47d),
+        // byte for byte; reap_terminated_pods_sh holds the regex to what
+        // the script itself renders.
+        "plan-a-pod-reap" => {
+            let head = "plan: reap-terminated-pods\nnamespaces: boss boss-dev boss-node-maintenance\nselects: every pod in those namespaces whose status.phase is Failed, which no Job owns and which is not already being deleted, which failed more than 3600s before the render (failed by: the latest time the pod records — creation, a condition transition or a container finish). The render time is deliberately not in these bytes.\n\n";
+            let none = "== pods to reap (0) ==\nnone — nothing to reap\n\n== the deletes this plan authorises ==\nnone\n";
+            Some((
+                vec![format!("{head}{none}")],
+                vec![
+                    format!(
+                        "{head}== pods to reap (1) ==\npod boss-dev/boss-dev-7d9f-abcde\n  uid: u1\n  node: w-1\n  created: 2026-09-21T12:00:00Z\n  failed by: 2026-09-21T18:00:00Z\n  reason: Evicted\n  message: none\n  container session: Error (exit 1)\n\n== the deletes this plan authorises ==\nDELETE /api/v1/namespaces/boss-dev/pods/boss-dev-7d9f-abcde with preconditions.uid=u1\n"
+                    ),
+                    // A pod's status.reason is not newline-scrubbed: a
+                    // reason forging the empty plan's tail still sits under
+                    // a header that counts it.
+                    format!(
+                        "{head}== pods to reap (1) ==\npod boss/x\n  uid: u2\n  reason: x\n\n{none}"
+                    ),
+                    format!("{head}{none}{none}"),
+                    format!(
+                        "{head}== pods to reap (0) ==\nnone — nothing to reap\n\n== the deletes this plan authorises ==\nDELETE /api/v1/namespaces/boss/pods/x with preconditions.uid=u2\n"
+                    ),
                 ],
             ))
         }
@@ -2331,4 +2379,729 @@ fn an_active_execute_held_by_anyone_but_a_runner_pass_is_refused_by_name() {
             "{holder}: outcome unknown is recorded only for a runner pass: {writes:?}"
         );
     }
+}
+
+// -------------------------------------------------------------- review
+//
+// A VERB THAT DECLARES `requires_review` IS APPROVED ONLY OVER A CLOSED
+// INDEPENDENT REVIEW OF THE SAME BYTES (backlog 84e7c3e4, design
+// 9de0cd1c, Q1 answered by David 2026-10-04). Tenant merges reached
+// David's passkey with nothing on the record saying anyone but their
+// author had read them: the BOSS reviewer resolves only ship-a-change
+// cars, and a tenant branch is not one. So the request carries a
+// `review` step; the runner renders the plan onto it first, the way it
+// renders one for the passkey, and renders the approval's plan only
+// once that step records a RELEASE of those exact bytes by a landed
+// run that is not the source run — and checks it all again before the
+// claim. Only the verb that declares it waits (David's option A,
+// bd331d38): every other approval verb is untouched, which the cases
+// above, run unchanged, are the evidence for.
+
+const REQUEST: &str = "aaaaaaaa-0000-4000-8000-000000000000";
+const REVIEW_RUN: &str = "bbbbbbbb-0000-4000-8000-00000000000b";
+const SOURCE_RUN: &str = "cccccccc-0000-4000-8000-00000000000c";
+/// The commit the source run's tenant receipt names, which the plan
+/// lands — the tie between the author and the bytes under review.
+const SOURCE_SHA: &str = "9039060f215dc90e0025e857de88ccedf6d2ba2e";
+const REVIEWER: &str = "tenant-reviewer";
+
+/// The plan a review case renders: [`PLAN`] plus the line that names
+/// what it lands, as `plan-a-tenant-merge` does (`lands as: <sha>`).
+fn review_plan() -> String {
+    format!("{PLAN}lands as: {SOURCE_SHA}\n")
+}
+
+/// An agent-run packet as `boss dispatch` files it: the profile, the
+/// packet and the step it was dispatched for, and — for a tenant
+/// builder — the receipt `--report` copied onto it.
+fn run_packet(id: &str, profile: &str, step: &str, landed: bool, receipt: Option<&str>) -> Value {
+    let mut md = json!({"profile": profile, "packet": REQUEST, "step": step});
+    if let Some(sha) = receipt {
+        md["packet"] = json!("dddddddd-0000-4000-8000-00000000000d");
+        md["tenant_receipt"] = json!({"branch": "fix/a-branch", "sha": sha, "check": "PASS"});
+    }
+    json!({
+        "id": id, "kind": "agent-run", "status": if landed { "closed" } else { "open" },
+        "metadata": md,
+        "steps": [
+            {"spec_slug": "building", "status": "completed", "metadata": {"result": "delivered"}},
+            {"spec_slug": "landed", "status": if landed { "completed" } else { "pending" }}
+        ]
+    })
+}
+
+/// A fixture whose write verb declares `requires_review`, rendering
+/// [`review_plan`], with the reviewer's run landed and the source run
+/// carrying its receipt.
+fn review_fixture(case: &str) -> Fixture {
+    let f = Fixture::new(case);
+    let wipe: Value =
+        serde_json::from_str(&std::fs::read_to_string(f.verbs.join("wipe.json")).unwrap()).unwrap();
+    let mut wipe = wipe;
+    wipe["requires_review"] = json!(true);
+    f.verb_file("wipe", wipe);
+    std::fs::write(f.root.join("review-plan.txt"), review_plan()).unwrap();
+    f.run_file(
+        REVIEW_RUN,
+        run_packet(REVIEW_RUN, REVIEWER, "review", true, None),
+    );
+    f.run_file(
+        SOURCE_RUN,
+        run_packet(
+            SOURCE_RUN,
+            "tenant-builder",
+            "build",
+            true,
+            Some(SOURCE_SHA),
+        ),
+    );
+    f
+}
+
+impl Fixture {
+    /// What a GET of `/api/jobs/<id>` answers for that one id.
+    fn run_file(&self, id: &str, packet: Value) {
+        std::fs::write(self.root.join(format!("job-{id}.json")), packet.to_string()).unwrap();
+    }
+
+    /// Run with the review plan as what the plan verb renders now.
+    fn run_review(&self) -> (String, Vec<Value>) {
+        let p = self.root.join("review-plan.txt").display().to_string();
+        self.run(&[("PLAN_OVERRIDE", &p)])
+    }
+}
+
+/// The review step's metadata once the runner rendered `plan` onto it
+/// and the dispatched reviewer recorded `verdict` over it.
+fn review_meta(plan: Option<&str>, verdict: Option<&str>) -> Value {
+    let mut m = json!({"authority_role": "platform-admin", "agent_profile": REVIEWER});
+    if let Some(p) = plan {
+        m["plan"] = json!(p);
+        m["verb"] = json!("wipe");
+        m["host"] = json!("forge");
+        m["args"] = json!(["target-a"]);
+        m["rendered_plan_sha256"] = json!(sha256_hex(p.as_bytes()));
+    }
+    if let (Some(p), Some(v)) = (plan, verdict) {
+        m["agent_run"] = json!(REVIEW_RUN);
+        m["verdict"] = json!(v);
+        m["reviewed_plan_sha256"] = json!(sha256_hex(p.as_bytes()));
+        m["source_run"] = json!(SOURCE_RUN);
+        m["findings"] = json!("read every byte of the plan and the branch");
+    }
+    m
+}
+
+/// `j` as a request for a review verb: the flag `boss ops` sets, and the
+/// review step the protocol puts between `filed` and `approve`.
+fn with_review(mut j: Value, status: &str, meta: Value) -> Value {
+    j["metadata"]["requires_review"] = json!(true);
+    let review = json!({"id": "s-review", "spec_slug": "review",
+        "title": "Review the plan: wipe on forge", "status": status, "metadata": meta});
+    j["steps"].as_array_mut().unwrap().insert(1, review);
+    j["steps"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id": "s-not-released",
+        "spec_slug": "not-released", "title": "Refused — its independent review asked for changes",
+        "status": "pending", "metadata": {"outcome_kind": "aborted"}}));
+    j
+}
+
+/// The approve step's metadata once the runner rendered the reviewed plan
+/// onto it: the review it relied on rides inside the signed shape.
+fn approve_meta_reviewed() -> Value {
+    let mut m = approve_meta(Some(&review_plan()));
+    m["review_run"] = json!(REVIEW_RUN);
+    m
+}
+
+/// A request whose review released the plan and whose approval signed it.
+fn reviewed_and_approved_job() -> Value {
+    let meta = approve_meta_reviewed();
+    let shape = shape_of(&meta);
+    let plan = review_plan();
+    with_review(
+        job(
+            "completed",
+            meta,
+            json!([stamp("platform-admin", "presence", &shape, 60)]),
+            "ready",
+        ),
+        "completed",
+        review_meta(Some(&plan), Some("release")),
+    )
+}
+
+/// A request whose review released the plan and whose approve step is
+/// ready for the runner to render the approval's plan.
+fn released_job() -> Value {
+    let plan = review_plan();
+    with_review(
+        job("ready", approve_meta(None), json!([]), "pending"),
+        "completed",
+        review_meta(Some(&plan), Some("release")),
+    )
+}
+
+/// The refusal a plan-stage review check closes the request with.
+fn refused_reason(writes: &[Value], out: &str) -> String {
+    let md = step_completion(writes, "s-refused", out);
+    md["reason"].as_str().unwrap_or_default().to_string()
+}
+
+#[test]
+fn a_review_verb_renders_its_plan_onto_the_review_step_before_any_approval() {
+    needs_tools!();
+    let f = review_fixture("review-render");
+    f.packet(with_review(
+        job("pending", approve_meta(None), json!([]), "pending"),
+        "ready",
+        review_meta(None, None),
+    ));
+    let (out, writes) = f.run_review();
+    let patch = writes_to(&writes, "s-review")
+        .into_iter()
+        .find(|w| w["method"] == "PATCH")
+        .unwrap_or_else(|| panic!("no plan was written onto the review step: {writes:?}\n{out}"));
+    assert!(
+        patch["url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/api/jobs/{REQUEST}/steps/s-review/metadata")),
+        "{patch}"
+    );
+    assert_eq!(patch["body"]["plan"], review_plan(), "{patch}");
+    assert_eq!(
+        patch["body"]["rendered_plan_sha256"],
+        sha256_hex(review_plan().as_bytes()),
+        "{patch}"
+    );
+    assert!(
+        writes_to(&writes, "s-approve").is_empty() && f.applied().is_none(),
+        "the plan for review asks no passkey and runs nothing: {writes:?}\n{out}"
+    );
+}
+
+#[test]
+fn a_plan_waiting_for_its_review_is_not_rendered_again() {
+    needs_tools!();
+    let f = review_fixture("review-waits");
+    let plan = review_plan();
+    f.packet(with_review(
+        job("pending", approve_meta(None), json!([]), "pending"),
+        "active",
+        review_meta(Some(&plan), None),
+    ));
+    let (out, writes) = f.run_review();
+    assert!(writes.is_empty(), "{writes:?}\n{out}");
+    assert!(out.contains("waits for its independent review"), "{out}");
+}
+
+/// A REQUEST PINNED BEFORE THE REVIEW STEP IS REFUSED BY NAME, never
+/// rendered for a passkey and never silently moved onto a version that
+/// has one (decided_2026-10-04_9de0cd1c: no silent repin).
+#[test]
+fn a_review_verb_filed_without_a_review_step_is_refused_by_name() {
+    needs_tools!();
+    let f = review_fixture("review-absent");
+    f.packet(job("ready", approve_meta(None), json!([]), "pending"));
+    let (out, writes) = f.run_review();
+    assert!(
+        writes_to(&writes, "s-approve").is_empty(),
+        "{writes:?}\n{out}"
+    );
+    let reason = refused_reason(&writes, &out);
+    assert!(
+        reason.contains("requires_review") && reason.contains("no review step"),
+        "{reason}"
+    );
+}
+
+/// A RELEASE OPENS THE APPROVAL, AND THE APPROVAL NAMES IT: the plan the
+/// passkey will sign is the reviewed bytes, with the review run beside
+/// them inside the signed shape.
+#[test]
+fn a_released_review_opens_the_approval_and_the_approve_step_names_it() {
+    needs_tools!();
+    let f = review_fixture("review-released");
+    f.packet(released_job());
+    let (out, writes) = f.run_review();
+    let patch = writes_to(&writes, "s-approve")
+        .into_iter()
+        .find(|w| w["method"] == "PATCH")
+        .unwrap_or_else(|| panic!("no plan was written onto the approve step: {writes:?}\n{out}"));
+    assert_eq!(patch["body"]["plan"], review_plan(), "{patch}");
+    assert_eq!(patch["body"]["review_run"], REVIEW_RUN, "{patch}");
+    assert!(writes_to(&writes, "s-refused").is_empty(), "{writes:?}");
+}
+
+/// A review is "actually closed" only when its run LANDED — a verdict on
+/// a run still building opens nothing, and nothing is written.
+#[test]
+fn a_review_whose_run_has_not_landed_waits() {
+    needs_tools!();
+    let f = review_fixture("review-unlanded");
+    f.run_file(
+        REVIEW_RUN,
+        run_packet(REVIEW_RUN, REVIEWER, "review", false, None),
+    );
+    f.packet(released_job());
+    let (out, writes) = f.run_review();
+    assert!(writes.is_empty(), "{writes:?}\n{out}");
+    assert!(out.contains("has not landed"), "{out}");
+}
+
+/// Each way the review can fail to be an independent release of these
+/// bytes, refused at the plan stage with the request closed and no plan
+/// put in front of a passkey.
+#[test]
+fn a_review_that_is_not_an_independent_release_of_these_bytes_is_refused() {
+    needs_tools!();
+    type Mutate = fn(&Fixture, &mut Value);
+    let cases: [(&str, Mutate, &[&str]); 7] = [
+        (
+            // The step's own metadata names the builder profile, and the
+            // run IS a builder run: they agree with each other, and the
+            // run is still held to the fixed profile (review N1 of car
+            // e1f4fc2a: whoever may PATCH the step could choose it).
+            "another-profile-the-step-agrees-with",
+            |f, j| {
+                j["steps"][1]["metadata"]["agent_profile"] = json!("builder");
+                f.run_file(
+                    REVIEW_RUN,
+                    run_packet(REVIEW_RUN, "builder", "review", true, None),
+                );
+            },
+            &["profile", "builder", REVIEWER],
+        ),
+        (
+            "self-review",
+            |f, j| {
+                j["steps"][1]["metadata"]["agent_run"] = json!(SOURCE_RUN);
+                f.run_file(SOURCE_RUN, {
+                    let mut r = run_packet(SOURCE_RUN, REVIEWER, "review", true, Some(SOURCE_SHA));
+                    r["metadata"]["packet"] = json!(REQUEST);
+                    r
+                });
+            },
+            &["source run", SOURCE_RUN],
+        ),
+        (
+            "another-profile",
+            |f, _| {
+                f.run_file(
+                    REVIEW_RUN,
+                    run_packet(REVIEW_RUN, "builder", "review", true, None),
+                )
+            },
+            &["profile", "builder", REVIEWER],
+        ),
+        (
+            "another-packet",
+            |f, _| {
+                let mut r = run_packet(REVIEW_RUN, REVIEWER, "review", true, None);
+                r["metadata"]["packet"] = json!("eeeeeeee-0000-4000-8000-00000000000e");
+                f.run_file(REVIEW_RUN, r);
+            },
+            &["dispatched for", "eeeeeeee"],
+        ),
+        (
+            "another-plan",
+            |_, j| j["steps"][1]["metadata"]["reviewed_plan_sha256"] = json!("0".repeat(64)),
+            &["reviewed", "rendered"],
+        ),
+        (
+            "no-source",
+            |_, j| {
+                j["steps"][1]["metadata"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("source_run");
+            },
+            &["source_run"],
+        ),
+        (
+            "source-not-landed-here",
+            |f, _| {
+                f.run_file(
+                    SOURCE_RUN,
+                    run_packet(
+                        SOURCE_RUN,
+                        "tenant-builder",
+                        "build",
+                        true,
+                        Some(&"1".repeat(40)),
+                    ),
+                )
+            },
+            &["does not land", "1111111111"],
+        ),
+    ];
+    for (case, mutate, names) in cases {
+        let f = review_fixture(&format!("review-refused-{case}"));
+        let mut j = released_job();
+        mutate(&f, &mut j);
+        f.packet(j);
+        let (out, writes) = f.run_review();
+        assert!(
+            !writes_to(&writes, "s-approve")
+                .iter()
+                .any(|w| w["method"] == "PATCH"),
+            "{case}: no plan reaches the passkey: {writes:?}\n{out}"
+        );
+        let reason = refused_reason(&writes, &out);
+        for n in names {
+            assert!(
+                reason.contains(n),
+                "{case}: the refusal names {n:?}: {reason}"
+            );
+        }
+    }
+}
+
+/// A REVIEW THAT ASKS FOR CHANGES CLOSES THE REQUEST ON `not-released`,
+/// the terminal whose title says so (review N4 of car e1f4fc2a, run
+/// bd3091d2), never on `refused`, whose title reads "outside the
+/// allowlist". The reason still names the verdict, and no plan reaches a
+/// passkey.
+#[test]
+fn a_review_that_asks_for_changes_closes_the_request_on_its_own_terminal() {
+    needs_tools!();
+    let f = review_fixture("review-changes");
+    let mut j = released_job();
+    j["steps"][1]["metadata"]["verdict"] = json!("changes");
+    f.packet(j);
+    let (out, writes) = f.run_review();
+    assert!(
+        writes_to(&writes, "s-approve").is_empty() && writes_to(&writes, "s-refused").is_empty(),
+        "a review that said changes is not an allowlist refusal and asks no passkey: {writes:?}\n{out}"
+    );
+    let md = step_completion(&writes, "s-not-released", &out);
+    let reason = md["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("changes") && reason.contains("requires_review"),
+        "{reason}"
+    );
+}
+
+/// The report a refused review run carries — the words of the live one
+/// (run e7a24d1a on request d50a93ca, 2026-10-09), which is the shape
+/// this pins.
+const REFUSAL_REPORT: &str = "REFUSED under rule 5, because the branch has no source run: no agent-run's tenant_receipt.sha equals the landing commit";
+
+/// A tenant-reviewer run dispatched for the request's review step that
+/// ended the way the reviewer rules direct when it records nothing
+/// (rules 1 and 5): `building` completed with `result = refused`, the
+/// run closed through its `refused` terminal, its report beside it.
+fn refused_review_run(id: &str) -> Value {
+    json!({
+        "id": id, "kind": "agent-run", "status": "closed",
+        "metadata": {"profile": REVIEWER, "packet": REQUEST, "step": "review",
+                     "outcome": "refused", "report": REFUSAL_REPORT},
+        "steps": [
+            {"spec_slug": "building", "status": "completed", "metadata": {"result": "refused"}},
+            {"spec_slug": "reported", "status": "skipped"},
+            {"spec_slug": "landed", "status": "skipped"},
+            {"spec_slug": "refused", "status": "completed", "metadata": {"outcome_kind": "aborted"}},
+            {"spec_slug": "died", "status": "skipped"}
+        ]
+    })
+}
+
+/// A review step the dispatcher handed to `run`, which recorded no
+/// verdict — with the plan on it, or (`plan = None`) before the runner
+/// rendered one.
+fn review_held_by(run: &str, plan: Option<&str>) -> Value {
+    let mut m = review_meta(plan, None);
+    m["agent_run"] = json!(run);
+    with_review(
+        job("pending", approve_meta(None), json!([]), "pending"),
+        "active",
+        m,
+    )
+}
+
+/// A REVIEW RUN THAT ENDED REFUSED CLOSES THE REQUEST ON `not-released`
+/// (backlog 112d2f92, measured live 2026-10-09 on d50a93ca). The reviewer
+/// rules direct a run that finds no source run (rule 5) — or no plan
+/// (rule 1) — to record NOTHING on the review step and end its own run
+/// refused. The step stays active with no verdict, so neither the engine's
+/// `not-released` predicate nor the `changes` path below ever fired, and
+/// the runner said "waits for its independent review" every minute for a
+/// review that had already ended. The refusal now closes the request on
+/// the terminal whose title says its review did not release it, with the
+/// run and its own report as the reason; nothing reaches a passkey.
+#[test]
+fn a_review_run_that_ended_refused_closes_the_request_on_not_released() {
+    needs_tools!();
+    let plan = review_plan();
+    for (case, on_step) in [("with-plan", Some(plan.as_str())), ("before-plan", None)] {
+        let f = review_fixture(&format!("review-run-refused-{case}"));
+        f.run_file(REVIEW_RUN, refused_review_run(REVIEW_RUN));
+        f.packet(review_held_by(REVIEW_RUN, on_step));
+        let (out, writes) = f.run_review();
+        assert!(
+            writes_to(&writes, "s-approve").is_empty()
+                && writes_to(&writes, "s-refused").is_empty()
+                && !writes_to(&writes, "s-review")
+                    .iter()
+                    .any(|w| w["method"] == "PATCH"),
+            "{case}: a refused review asks no passkey, is no allowlist refusal, and gets no plan rendered for nobody: {writes:?}\n{out}"
+        );
+        let md = step_completion(&writes, "s-not-released", &out);
+        let reason = md["reason"].as_str().unwrap_or_default();
+        for n in ["requires_review", REVIEW_RUN, "refused", REFUSAL_REPORT] {
+            assert!(
+                reason.contains(n),
+                "{case}: the reason names {n:?}: {reason}"
+            );
+        }
+        assert!(f.applied().is_none(), "{case}: nothing runs: {out}");
+    }
+}
+
+/// ONLY A REFUSAL BY THIS REQUEST'S OWN REVIEWER CLOSES IT. A run still
+/// building, a run that DIED (an infrastructure end the rescue re-runs,
+/// not a judgement), and a refused run the step names but that was
+/// dispatched for another packet, another step or another profile — the
+/// step's `agent_run` is writable through the merge door — each leave the
+/// request waiting, as before, and write nothing.
+#[test]
+fn a_review_run_that_did_not_refuse_this_review_leaves_the_request_waiting() {
+    needs_tools!();
+    type Mutate = fn(&mut Value);
+    let cases: [(&str, Mutate); 5] = [
+        ("still-building", |r| {
+            r["status"] = json!("open");
+            r["steps"] = json!([
+                {"spec_slug": "building", "status": "active", "metadata": {}},
+                {"spec_slug": "refused", "status": "pending"}
+            ]);
+        }),
+        ("died", |r| {
+            r["metadata"]["outcome"] = json!("died");
+            r["steps"] = json!([
+                {"spec_slug": "building", "status": "completed", "metadata": {"result": "died"}},
+                {"spec_slug": "refused", "status": "skipped"},
+                {"spec_slug": "died", "status": "completed"}
+            ]);
+        }),
+        ("another-packet", |r| {
+            r["metadata"]["packet"] = json!("eeeeeeee-0000-4000-8000-00000000000e")
+        }),
+        ("another-step", |r| r["metadata"]["step"] = json!("build")),
+        ("another-profile", |r| {
+            r["metadata"]["profile"] = json!("builder")
+        }),
+    ];
+    let plan = review_plan();
+    for (case, mutate) in cases {
+        let f = review_fixture(&format!("review-run-not-refused-{case}"));
+        let mut run = refused_review_run(REVIEW_RUN);
+        mutate(&mut run);
+        f.run_file(REVIEW_RUN, run);
+        f.packet(review_held_by(REVIEW_RUN, Some(&plan)));
+        let (out, writes) = f.run_review();
+        assert!(writes.is_empty(), "{case}: {writes:?}\n{out}");
+        assert!(
+            out.contains("waits for its independent review"),
+            "{case}: {out}"
+        );
+    }
+}
+
+/// THE PROFILE IS THE RUNNER'S, NOT THE STEP'S (review N1 of car
+/// e1f4fc2a). The step's `agent_profile` key is projected from the row,
+/// but the metadata merge door takes it from anyone with update scope, so
+/// a release is judged against the fixed `tenant-reviewer` whatever the
+/// step carries — and a step that carries no such key at all still opens
+/// the approval over a tenant-reviewer run's release.
+#[test]
+fn a_tenant_reviewer_release_opens_the_approval_whatever_the_step_says_its_profile_is() {
+    needs_tools!();
+    for (case, profile) in [("absent", None), ("another", Some("builder"))] {
+        let f = review_fixture(&format!("review-profile-{case}"));
+        let mut j = released_job();
+        let md = j["steps"][1]["metadata"].as_object_mut().unwrap();
+        match profile {
+            Some(p) => {
+                md.insert("agent_profile".into(), json!(p));
+            }
+            None => {
+                md.remove("agent_profile");
+            }
+        }
+        f.packet(j);
+        let (out, writes) = f.run_review();
+        let patch = writes_to(&writes, "s-approve")
+            .into_iter()
+            .find(|w| w["method"] == "PATCH")
+            .unwrap_or_else(|| {
+                panic!("{case}: no plan was written onto the approve step: {writes:?}\n{out}")
+            });
+        assert_eq!(patch["body"]["review_run"], REVIEW_RUN, "{case}: {patch}");
+    }
+}
+
+/// THE BYTES MOVED SINCE THE REVIEW: the reviewer released one plan and
+/// the plan verb renders another now — a main, a branch or a check that
+/// moved. Refused, naming both hashes; fresh review and approval needed.
+#[test]
+fn a_plan_that_moved_since_its_review_is_refused() {
+    needs_tools!();
+    let f = review_fixture("review-moved");
+    f.packet(released_job());
+    let moved = f.root.join("moved.txt");
+    std::fs::write(&moved, format!("{}main moved\n", review_plan())).unwrap();
+    let (out, writes) = f.run(&[("PLAN_OVERRIDE", &moved.display().to_string())]);
+    assert!(
+        writes_to(&writes, "s-approve").is_empty(),
+        "{writes:?}\n{out}"
+    );
+    let reason = refused_reason(&writes, &out);
+    assert!(
+        reason.contains(&sha256_hex(review_plan().as_bytes()))
+            && reason.contains("since it was reviewed"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_reviewed_and_approved_plan_runs_the_write_once() {
+    needs_tools!();
+    let f = review_fixture("review-approved");
+    f.packet(reviewed_and_approved_job());
+    let (out, writes) = f.run_review();
+    let plan_sha = sha256_hex(review_plan().as_bytes());
+    assert_eq!(
+        f.applied(),
+        Some(vec!["target-a".to_string(), plan_sha]),
+        "{out}"
+    );
+    assert_eq!(execute_completion(&writes, &out)["disposition"], "answered");
+}
+
+/// THE REVIEW IS READ AGAIN BEFORE THE CLAIM: an approval that names a
+/// review run other than the one on the review step, or a review that
+/// stopped being a landed release, runs nothing.
+#[test]
+fn an_approval_whose_review_no_longer_holds_runs_nothing() {
+    needs_tools!();
+    // The approval names another review run.
+    let f = review_fixture("review-exec-other");
+    let mut meta = approve_meta_reviewed();
+    meta["review_run"] = json!("ffffffff-0000-4000-8000-00000000000f");
+    let shape = shape_of(&meta);
+    let mut j = reviewed_and_approved_job();
+    j["steps"][2]["metadata"] = meta;
+    j["steps"][2]["sign_offs"] = json!([stamp("platform-admin", "presence", &shape, 60)]);
+    f.packet(j);
+    let (out, writes) = f.run_review();
+    assert_refused(&f, &out, &writes, &["review", "ffffffff"]);
+
+    // The review run is no longer readable as landed.
+    let f = review_fixture("review-exec-unlanded");
+    f.run_file(
+        REVIEW_RUN,
+        run_packet(REVIEW_RUN, REVIEWER, "review", false, None),
+    );
+    f.packet(reviewed_and_approved_job());
+    let (out, writes) = f.run_review();
+    assert_refused(&f, &out, &writes, &["review", "has not landed"]);
+}
+
+/// THE PROTOCOL HALF, read off the tree: the review step exists, waits
+/// on the flag, funds the profile whose rules document exists; approve
+/// waits for a release; a CHANGES verdict closes the request on its own
+/// terminal; the runner's fixed review profile is the one funded; and the
+/// one verb that declares the requirement is the tenant merge.
+#[test]
+fn the_protocol_puts_a_review_between_the_plan_and_the_passkey() {
+    let root = repo_root();
+    let doc: toml::Table = toml::from_str(
+        &std::fs::read_to_string(root.join("infra/platform/workflows/ops-request.toml")).unwrap(),
+    )
+    .unwrap();
+    let steps = doc["workflow"][0]["step"].as_array().unwrap();
+    let step = |t: &str| {
+        steps
+            .iter()
+            .find(|s| s.get("title").and_then(|v| v.as_str()) == Some(t))
+            .unwrap_or_else(|| panic!("ops-request declares a {t} step"))
+    };
+    let review = step("review");
+    assert_eq!(
+        review["ready_when"].as_str(),
+        Some("steps.filed.done AND job.metadata.requires_review")
+    );
+    let profile = review["agent"]["profile"].as_str().unwrap();
+    assert_eq!(profile, REVIEWER);
+    assert!(
+        root.join(format!("infra/platform/documents/{profile}-rules.md"))
+            .is_file(),
+        "the review step funds a profile with no rules document"
+    );
+    let fields: Vec<&str> = review["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f.get("name").and_then(|n| n.as_str()))
+        .collect();
+    for k in [
+        "plan",
+        "rendered_plan_sha256",
+        "verdict",
+        "reviewed_plan_sha256",
+        "source_run",
+        "findings",
+    ] {
+        assert!(
+            fields.contains(&k),
+            "the review step declares {k}: {fields:?}"
+        );
+    }
+    let approve = step("approve")["ready_when"].as_str().unwrap();
+    assert!(
+        approve.contains(
+            "(NOT job.metadata.requires_review OR (steps.review.done AND steps.review.metadata.verdict = \"release\"))"
+        ),
+        "{approve}"
+    );
+    // A `changes` verdict closes the request on `not-released`, and only
+    // there (review N4 of car e1f4fc2a): `refused` reads no review.
+    let not_released = step("not-released");
+    assert_eq!(
+        not_released["ready_when"].as_str(),
+        Some("steps.review.done AND NOT (steps.review.metadata.verdict = \"release\")")
+    );
+    assert_eq!(
+        not_released["terminal"]["outcome"].as_str(),
+        Some("refused")
+    );
+    let refused = step("refused")["ready_when"].as_str().unwrap();
+    assert!(!refused.contains("steps.review"), "{refused}");
+    // The profile the runner holds a review run to is ITS OWN constant
+    // (review N1 of car e1f4fc2a), never the step's metadata — and it is
+    // the profile this row funds, held equal here because the two cannot
+    // be one definition: the runner must not take it from the step.
+    let runner = std::fs::read_to_string(root.join("infra/ops/ops-runner.sh")).unwrap();
+    assert!(
+        runner
+            .lines()
+            .any(|l| l == format!("REVIEW_PROFILE='{profile}'")),
+        "infra/ops/ops-runner.sh declares REVIEW_PROFILE='{profile}', the profile ops-request's review step funds"
+    );
+    let declaring: Vec<String> = std::fs::read_dir(root.join("infra/ops/verbs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter(|e| {
+            let v: Value =
+                serde_json::from_str(&std::fs::read_to_string(e.path()).unwrap()).unwrap();
+            v.get("requires_review").is_some_and(|r| r != &json!(false))
+        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(declaring, ["merge-tenant-main.json"]);
 }

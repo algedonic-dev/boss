@@ -45,10 +45,22 @@
 #   * at least one service is required, and EVERY required service has a
 #     coverage row with no `gap`, and a live row that was read (`error`
 #     null, a `snapshot`) whose mode is recording (`report` or `enforce`,
-#     no `mode_error`), whose `rows` are empty, whose `overflow` is 0 and
+#     no `mode_error`), whose rows hold no enforce-refused caller, whose `overflow` is 0 and
 #     whose own `not_clean` is empty.
-#   * for the machine gate, whose required services come from the
-#     launcher's record: `roster_generations` names EXACTLY ONE launch
+#   * machine rows also count accepted previous, reader and asked
+#     presentations (01d841a3). Those do not change on enforcement; an
+#     absent, unknown or malformed presentation is refused. The native
+#     Presented verdict and this reader are held equal by their test.
+#   * for the actor-role window (row H; backlog b13bd730), the live row
+#     is a service's `actor-role-reports` answer and the tally is its
+#     `report` member. That tally also counts every MATCHING request, so
+#     its `rows` are not empty when it is clean: the line refused is a
+#     row whose `would_refuse` is anything but an explicit null — a shape
+#     `enforce` would answer differently, or one the producer did not
+#     judge.
+#   * for the machine gate and the actor-role window, whose required
+#     services come from the launcher's record and whose excuses are
+#     bound to it: `roster_generations` names EXACTLY ONE launch
 #     roster generation, and it is stated. The join already refuses a
 #     window whose hours span a change of selection (its `not_clean`
 #     names both generations and the instant — design 3cc6152a, backlog
@@ -79,7 +91,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/../lib/jq.sh" || { echo "$me: UNREADABLE — $here/../lib/jq.sh could not be sourced" >&2; exit 2; }
 
 usage() {
-    echo "$me: usage: $me <machine-gate|policy-check> [hours, default 72] < the answer of GET /api/events/gate-window?gate=<gate>&hours=<hours> — $*" >&2
+    echo "$me: usage: $me <machine-gate|policy-check|actor-role> [hours, default 72] < the answer of GET /api/events/gate-window?gate=<gate>&hours=<hours> — $*" >&2
     exit 2
 }
 
@@ -87,7 +99,7 @@ usage() {
 gate="$1"
 hours="${2:-72}"
 case "$gate" in
-    machine-gate|policy-check) ;;
+    machine-gate|policy-check|actor-role) ;;
     *) usage "'$gate' is not a gate" ;;
 esac
 case "$hours" in
@@ -149,7 +161,7 @@ reasons="$(printf '%s' "$body" | jq -r --arg gate "$gate" --argjson hours "$hour
 
         ($w.live | listed("live")),
 
-        (if $gate != "machine-gate" then empty
+        (if $gate == "policy-check" then empty
          elif ($w.roster_generations | type) != "array" then
            "roster_generations is missing or not a list: the answer does not say which launch roster its hours were judged under"
          elif ($w.roster_generations | length) != 1 then
@@ -174,13 +186,31 @@ reasons="$(printf '%s' "$body" | jq -r --arg gate "$gate" --argjson hours "$hour
                   (if ($l.not_clean | type) == "array" and ($l.not_clean | length) == 0 then empty
                    else "\($s): live not_clean: \($l.not_clean | tojson)" end),
                   (if ($l.snapshot | type) != "object" then "\($s): no live snapshot"
-                   else $l.snapshot as $t
+                   elif $gate == "actor-role" and ($l.snapshot.report | type) != "object" then
+                     "\($s): the actor-role answer carries no report: its tally was not read"
+                   else (if $gate == "actor-role" then $l.snapshot.report else $l.snapshot end) as $t
                      | (if $t.mode == "report" or $t.mode == "enforce" then empty
                         else "\($s): mode is \($t.mode | tojson), which records nothing" end),
                        (if $t.mode_error? == null then empty
                         else "\($s): mode_error \($t.mode_error | tojson)" end),
-                       (if ($t.rows | type) == "array" and ($t.rows | length) == 0 then empty
-                        else "\($s): the live tally holds \(if ($t.rows | type) == "array" then ($t.rows | length) else "unreadable" end) row(s) (rows)" end),
+                       (if ($t.rows | type) != "array" then "\($s): the live tally holds unreadable row(s) (rows)"
+                        elif $gate == "actor-role" then
+                          ([$t.rows[] | select((type != "object") or (has("would_refuse") | not) or .would_refuse != null)] | length) as $held
+                          | if $held == 0 then empty
+                            else "\($s): the live tally holds \($held) row(s) that enforce would answer differently, or that state no would_refuse (rows)" end
+                        elif $gate == "machine-gate" then
+                          ([$t.rows[] | .presented as $p | select(
+                            (type != "object") or
+                            ($p | type) != "string" or
+                            (.peer | type) != "string" or (.user | type) != "string" or
+                            (.method | type) != "string" or (.route | type) != "string" or
+                            (.count | type) != "number" or .count <= 0 or .count != (.count | floor) or
+                            (["previous", "reader.current", "reader.next", "reader.previous", "asked"] | index($p)) == null
+                          )] | length) as $held
+                          | if $held == 0 then empty
+                            else "\($s): the live tally holds \($held) enforce-refused or unreadable row(s) (rows)" end
+                        elif ($t.rows | length) == 0 then empty
+                        else "\($s): the live tally holds \($t.rows | length) row(s) (rows)" end),
                        (if $t.overflow == 0 then empty
                         else "\($s): overflow is \($t.overflow | tojson), not 0 — past the key cap refusals go uncounted" end),
                        (if ($t.not_clean | type) == "array" and ($t.not_clean | length) == 0 then empty
@@ -210,5 +240,5 @@ fi
 
 # The receipt line: every value copied out of the answer judged.
 printf '%s' "$body" | jq -r --arg gate "$gate" --arg hours "$hours" '
-    "GATE-WINDOW-CLEAN gate=\($gate) hours=\($hours) from=\(.from) now=\(.now) clean_since=\(.clean_since) services=\(.required_services | join(",")) modes=\([.live[] | "\(.service):\(.snapshot.mode)"] | join(","))"
-    + (if $gate == "machine-gate" then " roster_generation=\(.roster_generations[0].generation)" else "" end)'
+    "GATE-WINDOW-CLEAN gate=\($gate) hours=\($hours) from=\(.from) now=\(.now) clean_since=\(.clean_since) services=\(.required_services | join(",")) modes=\([.live[] | "\(.service):\(if $gate == "actor-role" then .snapshot.report.mode else .snapshot.mode end)"] | join(","))"
+    + (if $gate != "policy-check" then " roster_generation=\(.roster_generations[0].generation)" else "" end)'

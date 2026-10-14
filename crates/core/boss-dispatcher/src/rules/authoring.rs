@@ -125,10 +125,30 @@ const SELECT_COLS: &str = "name, version, status, on_event, when_expr, do_steps,
      schedule_cadence, schedule_anchor, schedule_calendar, source, created_by, published_by, \
      retired_by, created_at";
 
+/// The family every rule signs under: a rule's writes carry
+/// `automation:rule:<name>`, and the dispatcher's registry row answers
+/// for them through its `signs_for`
+/// (`infra/platform/automations/dispatcher.toml`, pinned equal below).
+pub const RULE_FAMILY: &str = "automation:rule:";
+
 /// Parse a draft through the SAME `Rule::from_raw` the runtime uses, so an
 /// authoring error (bad topic / `when` / arg expr) surfaces before persist.
 /// Pure — no I/O.
+///
+/// The NAME is asked first, through the role resolver's own predicate
+/// (backlog 1a172f43): a name whose actor
+/// [`boss_core::role_of_record::is_family_member`] does not recognise
+/// would resolve UNREGISTERED and see its writes refused once the
+/// resolver enforces, so it is refused at authoring rather than in
+/// production. Not re-spelled here — one definition, in boss-core.
 pub fn validate(raw: &RawRule) -> Result<(), RegistryError> {
+    let signs_as = format!("{RULE_FAMILY}{}", raw.name);
+    if !boss_core::role_of_record::is_family_member(RULE_FAMILY, &signs_as) {
+        return Err(RegistryError::NotAFamilyMember {
+            rule: raw.name.clone(),
+            family: RULE_FAMILY.to_string(),
+        });
+    }
     Rule::from_raw(raw.clone()).map(|_| ())
 }
 
@@ -524,5 +544,110 @@ mod tests {
     fn a_row_with_no_trigger_at_all_is_refused() {
         let orphan = version("orphan", None, "assign_step");
         assert!(validate(&orphan.to_raw()).is_err());
+    }
+
+    /// A rule signs every write as `automation:rule:<name>`, and the
+    /// role resolver answers for that actor only if
+    /// `boss_core::role_of_record::is_family_member` calls it one
+    /// (backlog 1a172f43, from review 844e9883 of car 10016447). A name
+    /// the resolver would not recognise is refused HERE, at the draft,
+    /// the dry run, the publish and the boot seed alike — not discovered
+    /// later as an UNREGISTERED writer whose writes the enforce arm
+    /// refuses.
+    ///
+    /// Pinned as AGREEMENT, not as a second list of legal shapes: for
+    /// every name, the door accepts it exactly when the predicate calls
+    /// its actor a member, so whatever shape boss-core requires (car
+    /// 10016447 narrowed the tail to `:`-separated `[A-Za-z0-9-]`
+    /// segments) is the shape this door requires, with no copy to drift.
+    /// The names are the predicate's own unit-test shapes.
+    #[test]
+    fn a_rule_is_named_only_as_a_member_of_the_family_it_signs_under() {
+        for name in [
+            "auto-park-on-gate-green",
+            "x",
+            "a-tenant-declared-rule-9",
+            "Mixed-Case-9",
+            "a:b",
+            "",
+            "watch_x",
+            "a.b",
+            "a/b",
+            "../../x",
+            " x",
+            "x ",
+            "x\u{202e}",
+            "x\n",
+            ":x",
+            "x:",
+            "x::y",
+        ] {
+            let member = boss_core::role_of_record::is_family_member(
+                RULE_FAMILY,
+                &format!("{RULE_FAMILY}{name}"),
+            );
+            let v = version(name, Some("jobs.step.done"), "assign_step");
+            match validate(&v.to_raw()) {
+                Ok(()) => assert!(member, "{name:?} accepted, but its actor is no member"),
+                Err(err) => {
+                    assert!(!member, "{name:?} is a member, refused: {err}");
+                    assert!(
+                        matches!(err, RegistryError::NotAFamilyMember { .. }),
+                        "{name:?} refused for its name, not something else: {err}"
+                    );
+                    assert!(
+                        err.to_string().contains(RULE_FAMILY),
+                        "the refusal names the family: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The packet's own two examples (backlog 1a172f43), against the
+    /// predicate as car 10016447 landed it: a tenant rule named
+    /// `watch_x` or `a.b` would have signed as an actor the resolver
+    /// calls UNREGISTERED. Refused at the draft now, while the shape of
+    /// a legal name stays boss-core's alone.
+    #[test]
+    fn the_names_the_packet_measured_are_refused_at_authoring() {
+        for name in ["watch_x", "a.b"] {
+            let v = version(name, Some("jobs.step.done"), "assign_step");
+            assert!(
+                matches!(
+                    validate(&v.to_raw()),
+                    Err(RegistryError::NotAFamilyMember { .. })
+                ),
+                "{name:?} must be refused for its name"
+            );
+        }
+    }
+
+    /// The one refusal every spelling of the predicate makes: the prefix
+    /// alone names no member, so a rule with no name is refused. Before
+    /// 1a172f43 `Rule::from_raw` loaded one.
+    #[test]
+    fn a_rule_with_no_name_is_refused() {
+        let v = version("", Some("jobs.step.done"), "assign_step");
+        assert!(matches!(
+            validate(&v.to_raw()),
+            Err(RegistryError::NotAFamilyMember { .. })
+        ));
+    }
+
+    /// `RULE_FAMILY` is the dispatcher's registry row's `signs_for`
+    /// spelled a second time — the row is data the policy seed reads,
+    /// this is the constant the authoring door checks against — so the
+    /// two are pinned equal (CLAUDE.md §9a).
+    #[test]
+    fn the_rule_family_is_the_dispatcher_rows_signs_for() {
+        let row: toml::Value = toml::from_str(include_str!(
+            "../../../../../infra/platform/automations/dispatcher.toml"
+        ))
+        .expect("dispatcher.toml parses");
+        assert_eq!(
+            row["automation"][0]["signs_for"].as_str(),
+            Some(RULE_FAMILY)
+        );
     }
 }

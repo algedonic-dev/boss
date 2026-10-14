@@ -47,34 +47,29 @@ use std::path::{Path, PathBuf};
 /// The blocking senders — the policy and operator-baseline bootstraps,
 /// boss-sim's workforce, the brewery's prepare walk — left it in car 2's
 /// blocking-senders slice (2026-09-29), onto
-/// `machine_token::BlockingClient`. What remains is not a client that
-/// has not moved but a trust question that has not been built.
-const NOT_YET: &[(&str, &str)] = &[(
-    "crates/orchestrators/boss-simulator/src/bin/boss_simulator.rs",
-    "a RELAY: it forwards its own caller's x-boss-user upstream. Stamping the estate token \
-         on a caller's ASSERTED identity would launder that assertion into a machine one. \
-         Decided (review of 39949355, 2026-09-28), not yet built: stamp outbound ONLY when the \
-         inbound request passed machine_gate with a verified token; otherwise forward it \
-         unstamped, or sign as the simulator's own actor — never stamp a caller-asserted \
-         identity.",
-)];
+/// `machine_token::BlockingClient`. The last relay, boss-simulator,
+/// now forwards only its inbound gate's VerifiedEstate credential;
+/// admitting an assertion under report never stamps it (2710c8fc R5).
+const NOT_YET: &[(&str, &str)] = &[];
 
 /// The most [`NOT_YET`] may hold: its length when it was written (41),
 /// less the 23 dispatcher handlers that now hold their jobs-API client
 /// as a `machine_token::Client` (car 2's handlers slice), less the 11
 /// boss verbs whose jobs-API helpers now take one, the conductor's with
 /// them (car 2's CLI slice), less the six blocking senders (car 2's
-/// blocking-senders slice, 2026-09-29). Lower it as rows go; never
+/// blocking-senders slice, 2026-09-29), and the simulator relay (R5).
+/// Lower it as rows go; never
 /// raise it.
-const NOT_YET_CEILING: usize = 1;
+const NOT_YET_CEILING: usize = 0;
 
 /// Names that mean the file stamps the token on what it sends.
 const STAMPING_DOORS: &[&str] = &[
+    "RelayClient",
     "machine_token::Client",
     "machine_token::BlockingClient",
     // boss-cli's one constructor of a `machine_token::Client` (and
     // `machine_client_with`), which every boss verb builds its client by.
-    "gate::machine_client",
+    "sor_client::machine_client",
     "http_client::base",
     "MachineClient",
     "machine_token::HEADER",
@@ -227,8 +222,9 @@ fn every_x_boss_user_sender_stamps_the_machine_token() {
     let found = senders(&root);
     let named: Vec<&str> = NOT_YET.iter().map(|(f, _)| *f).collect();
 
-    assert!(
-        NOT_YET.len() <= NOT_YET_CEILING,
+    assert_eq!(
+        NOT_YET.len(),
+        NOT_YET_CEILING,
         "NOT_YET holds {} rows and its ceiling is {NOT_YET_CEILING}: the list only shrinks. \
          Send through a stamping client instead of adding a row.",
         NOT_YET.len()

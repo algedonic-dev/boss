@@ -1,0 +1,19 @@
+# Dormant replacement: ca356c79 / fe6d1124. Not installed by any caller.
+# Activate only after the root fetch credential and tree handover are proven.
+[Unit]
+Description=BOSS daily codebase trend from protected main
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/boss/sor.env
+WorkingDirectory=/var/lib/boss/gcp-tree/current
+RuntimeDirectory=boss-codebase-metrics
+RuntimeDirectoryMode=0700
+TimeoutStartSec=10min
+Environment=BOSS_LEAKED_POLICY_BIN=/opt/boss-cli/current/boss-leaked-policy
+ExecStartPre=-/var/lib/boss/gcp-tree/current/infra/gcp/root-tree.sh run infra/boss-maintenance-wrap.sh maintenance-codebase-metrics "Codebase metrics"
+ExecStart=/var/lib/boss/gcp-tree/current/infra/gcp/root-tree.sh run infra/codebase-metrics.sh file --repo . --ref HEAD
+ExecStopPost=-/var/lib/boss/gcp-tree/current/infra/gcp/root-tree.sh run infra/boss-step.sh maintenance-codebase-metrics run

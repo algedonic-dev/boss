@@ -1776,8 +1776,40 @@ pub enum WorkflowError {
 // Port
 // ---------------------------------------------------------------------------
 
+pub trait WorkflowSelectionRows {
+    fn rows(&self) -> &[WorkflowSpec];
+}
+
+struct LockedWorkflowSelectionRows<'a> {
+    _guard: std::sync::MutexGuard<'a, HashMap<(String, i32), WorkflowSpec>>,
+    active: Vec<WorkflowSpec>,
+}
+
+impl WorkflowSelectionRows for LockedWorkflowSelectionRows<'_> {
+    fn rows(&self) -> &[WorkflowSpec] {
+        &self.active
+    }
+}
+
 #[async_trait]
 pub trait WorkflowRegistry: Send + Sync {
+    /// Nonblocking acquisition of the same actual writer owner. None means
+    /// contention; consumers release partial owners before awaiting a retry.
+    fn try_lock_active_selection_rows(
+        &self,
+    ) -> Result<Option<Box<dyn WorkflowSelectionRows + '_>>, crate::port::JobsError> {
+        Err(crate::port::JobsError::Storage(
+            "workflow adapter has no nonblocking selection fence".into(),
+        ))
+    }
+    /// Acquire the actual local writer guard before any selection effects.
+    fn lock_active_selection_rows(
+        &self,
+    ) -> Result<Box<dyn WorkflowSelectionRows + '_>, crate::port::JobsError> {
+        Err(crate::port::JobsError::Storage(
+            "workflow adapter has no local selection fence".into(),
+        ))
+    }
     /// Return the currently-active spec for `kind`, or NotFound if
     /// no active row exists.
     async fn get_active(&self, kind: &str) -> Result<WorkflowSpec, WorkflowError>;
@@ -2265,6 +2297,46 @@ fn spent_high_water(
 
 #[async_trait]
 impl WorkflowRegistry for InMemoryWorkflows {
+    fn try_lock_active_selection_rows(
+        &self,
+    ) -> Result<Option<Box<dyn WorkflowSelectionRows + '_>>, crate::port::JobsError> {
+        let guard = match self.rows.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(crate::port::JobsError::Storage(
+                    "workflow selection lock poisoned".into(),
+                ));
+            }
+        };
+        let mut active: Vec<_> = guard
+            .values()
+            .filter(|row| row.status == WorkflowStatus::Active)
+            .cloned()
+            .collect();
+        active.sort_by(|left, right| left.kind.cmp(&right.kind));
+        Ok(Some(Box::new(LockedWorkflowSelectionRows {
+            _guard: guard,
+            active,
+        })))
+    }
+    fn lock_active_selection_rows(
+        &self,
+    ) -> Result<Box<dyn WorkflowSelectionRows + '_>, crate::port::JobsError> {
+        let guard = self.rows.lock().map_err(|_| {
+            crate::port::JobsError::Storage("workflow selection lock poisoned".into())
+        })?;
+        let mut active: Vec<_> = guard
+            .values()
+            .filter(|row| row.status == WorkflowStatus::Active)
+            .cloned()
+            .collect();
+        active.sort_by(|left, right| left.kind.cmp(&right.kind));
+        Ok(Box::new(LockedWorkflowSelectionRows {
+            _guard: guard,
+            active,
+        }))
+    }
     async fn publish_authored_if_absent(
         &self,
         mut spec: WorkflowSpec,
@@ -2739,6 +2811,50 @@ mod pg {
         publication_coverage: PublicationCoverage,
     }
 
+    pub(crate) async fn active_rows_in<'e, E>(
+        exec: E,
+        category: Option<&str>,
+    ) -> Result<Vec<WorkflowSpec>, WorkflowError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        // BYTE order, `COLLATE "C"`: a bare `ORDER BY kind` sorts by
+        // the database's locale, which ignores `-` at first level,
+        // so `ab` came before `a-z` here and after it in memory —
+        // the order a listing answered depended on the server it
+        // ran against (backlog be459ab9, found by the adapters-agree
+        // suite on its first run).
+        let rows: Vec<Row> = match category {
+            Some(c) => {
+                sqlx::query_as(
+                    "SELECT kind, version, status, label, description, category,
+                            subject_kinds, steps, metadata_schema, entitlements, metadata,
+                            on_complete_create, owning_team, authoring_job_id, created_at
+                     FROM workflows
+                     WHERE status = 'active' AND category = $1
+                     ORDER BY kind COLLATE \"C\"",
+                )
+                .bind(c)
+                .fetch_all(exec)
+                .await
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT kind, version, status, label, description, category,
+                            subject_kinds, steps, metadata_schema, entitlements, metadata,
+                            on_complete_create, owning_team, authoring_job_id, created_at
+                     FROM workflows
+                     WHERE status = 'active'
+                     ORDER BY kind COLLATE \"C\"",
+                )
+                .fetch_all(exec)
+                .await
+            }
+        }
+        .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+        rows.into_iter().map(row_to_spec).collect()
+    }
+
     impl PgWorkflows {
         pub fn new(pool: PgPool) -> Self {
             Self {
@@ -3054,41 +3170,7 @@ mod pg {
             &self,
             category: Option<&str>,
         ) -> Result<Vec<WorkflowSpec>, WorkflowError> {
-            // BYTE order, `COLLATE "C"`: a bare `ORDER BY kind` sorts by
-            // the database's locale, which ignores `-` at first level,
-            // so `ab` came before `a-z` here and after it in memory —
-            // the order a listing answered depended on the server it
-            // ran against (backlog be459ab9, found by the adapters-agree
-            // suite on its first run).
-            let rows: Vec<Row> = match category {
-                Some(c) => {
-                    sqlx::query_as(
-                        "SELECT kind, version, status, label, description, category,
-                            subject_kinds, steps, metadata_schema, entitlements, metadata,
-                            on_complete_create, owning_team, authoring_job_id, created_at
-                     FROM workflows
-                     WHERE status = 'active' AND category = $1
-                     ORDER BY kind COLLATE \"C\"",
-                    )
-                    .bind(c)
-                    .fetch_all(&self.pool)
-                    .await
-                }
-                None => {
-                    sqlx::query_as(
-                        "SELECT kind, version, status, label, description, category,
-                            subject_kinds, steps, metadata_schema, entitlements, metadata,
-                            on_complete_create, owning_team, authoring_job_id, created_at
-                     FROM workflows
-                     WHERE status = 'active'
-                     ORDER BY kind COLLATE \"C\"",
-                    )
-                    .fetch_all(&self.pool)
-                    .await
-                }
-            }
-            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
-            rows.into_iter().map(row_to_spec).collect()
+            active_rows_in(&self.pool, category).await
         }
 
         async fn list_versions(&self, kind: &str) -> Result<Vec<WorkflowSpec>, WorkflowError> {
@@ -3797,6 +3879,8 @@ mod pg {
 
 #[cfg(feature = "postgres")]
 pub use pg::PgWorkflows;
+#[cfg(feature = "postgres")]
+pub(crate) use pg::active_rows_in as active_workflow_rows_in;
 
 // ---------------------------------------------------------------------------
 // Tests

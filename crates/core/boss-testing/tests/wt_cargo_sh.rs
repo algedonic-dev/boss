@@ -82,6 +82,7 @@ impl Fixture {
              echo \"target=${CARGO_TARGET_DIR:-unset}\"\n\
              echo \"jobs=${CARGO_BUILD_JOBS:-unset}\"\n\
              echo \"argv=$*\"\n\
+             echo \"cargo_token_dir=${BOSS_MACHINE_TOKEN_DIR-unset} cargo_token_hosts=${BOSS_MACHINE_TOKEN_HOSTS-unset}\"\n\
              if [ -n \"${STUB_LOCK:-}\" ]; then\n\
                if flock -n -x \"$STUB_LOCK\" true; then echo lock=free; else echo lock=held; fi\n\
              fi\n\
@@ -134,6 +135,7 @@ impl Fixture {
             "#!/usr/bin/env bash\n\
              {\n\
                echo \"argv=$* mount=${SCRATCH_MOUNT:-unset} primary=${CARGO_TARGET_DIR:-unset}\"\n\
+               echo \"token_dir=${BOSS_MACHINE_TOKEN_DIR-unset} token_hosts=${BOSS_MACHINE_TOKEN_HOSTS-unset}\"\n\
                for d in \"$SCRATCH_MOUNT\"/*/; do\n\
                  [ -d \"$d\" ] && echo \"dir=$(basename \"$d\") mtime=$(stat -c %Y \"$d\")\"\n\
                done\n\
@@ -231,7 +233,10 @@ impl Fixture {
             .env_remove("STUB_BUILD_FAIL")
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("CARGO_BUILD_JOBS")
-            .env_remove("STUB_LOCK");
+            .env_remove("STUB_LOCK")
+            .env_remove("BOSS_MACHINE_TOKEN_DIR")
+            .env_remove("BOSS_MACHINE_TOKEN_HOSTS")
+            .env_remove("BOSS_AGENT_RUN");
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -466,6 +471,83 @@ fn outside_a_worktree_it_refuses() {
     assert_eq!(rc, 2, "must refuse with exit 2: {out}");
     assert!(out.contains("not in a git worktree"), "must say why: {out}");
     assert!(!out.contains("argv="), "cargo must not run: {out}");
+}
+
+/// A RUN DOES NOT BUILD IN THE SHARED CHECKOUT (backlog 916fe290).
+/// MEASURED 2026-10-09: in an isolated-worktree agent each Bash call
+/// starts in the dispatching session's checkout (`/work/boss`), and the
+/// harness drops a leading `cd <worktree> &&` from the command text, so
+/// four builders ran cargo, git and a `sed` there — silently, because
+/// every command answered from the wrong tree. With `BOSS_AGENT_RUN`
+/// set, the main checkout worktrees hang off is refused, naming the fix,
+/// before a target is seeded or cargo runs. The controls are every
+/// legitimate caller: the run's own worktree (from its top and from a
+/// subdirectory), the operator in the shared checkout with no run named,
+/// and a lone clone nothing hangs off.
+#[test]
+fn a_run_in_the_shared_checkout_is_refused_and_its_own_worktree_is_not() {
+    const RUN: &str = "171055b8-1a59-4399-9ba1-9fc460cb1c66";
+    let f = Fixture::new("shared");
+    let main = f.worktree("boss");
+    git(&main, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    let lone = f.worktree("lone");
+    git(&lone, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    let own = f.root.join("trees").join("agent-own");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            own.to_str().expect("utf-8"),
+        ],
+    );
+    let seed = f.root.join("no-such-seed");
+    let run = [("BOSS_AGENT_RUN", RUN)];
+
+    let (rc, out) = f.run(&main, &seed, &run);
+    assert_eq!(rc, 2, "a run in the shared checkout is refused: {out}");
+    for needle in [
+        "REFUSED",
+        RUN,
+        "SHARED checkout",
+        "cd <your worktree> || exit 1",
+        "worktree list",
+        "unsets BOSS_AGENT_RUN",
+    ] {
+        assert!(out.contains(needle), "the refusal names {needle:?}: {out}");
+    }
+    assert!(!out.contains("argv="), "cargo must not run: {out}");
+    assert!(
+        !f.targets().join("target-boss").exists(),
+        "no target is made for a refused build: {out}"
+    );
+
+    let sub = main.join("crates");
+    boss_testing::create_dir(&sub);
+    let (rc, out) = f.run(&sub, &seed, &run);
+    assert_eq!(
+        rc, 2,
+        "a subdirectory of the shared checkout is in it: {out}"
+    );
+
+    for (dir, env, why) in [
+        (&own, &run[..], "the run's own worktree"),
+        (&main, &[][..], "the operator, naming no run"),
+        (&lone, &run[..], "a clone nothing hangs off"),
+    ] {
+        let (rc, out) = f.run(dir, &seed, env);
+        assert_eq!(rc, 0, "{why} builds: {out}");
+        assert!(out.contains("argv=test -p boss-cli"), "{why}: {out}");
+    }
+    let own_sub = own.join("crates");
+    boss_testing::create_dir(&own_sub);
+    let (rc, out) = f.run(&own_sub, &seed, &run);
+    assert_eq!(
+        rc, 0,
+        "a subdirectory of the run's own worktree builds: {out}"
+    );
 }
 
 /// MEASURED 2026-09-22 (backlog 3566f5b4). `cargo test -p boss-jobs
@@ -710,6 +792,74 @@ fn the_default_floor_pass_is_the_sidecars_own_script() {
             .join("infra/cluster/dev-scratch-reclaim.sh")
             .is_file(),
         "the pass wt-cargo runs by default is the sidecar's"
+    );
+}
+
+/// THE FLOOR PASS SIGNS WHAT IT FILES, AND CARGO IS TOLD NOTHING (review
+/// fb78c7b0 of car 099f8a9f, finding F7; backlog ffd309c1). The pass
+/// files a maintenance-dev-scratch-reclaim packet when it acts, through
+/// the wrap and step helpers, and those read the token from the
+/// reader's default directory — which the dev container does not
+/// mount, because builders' tests read that default. So twice during
+/// the review the pass filed its packet with no token (ce62d977,
+/// 6ed3e993). This door names the doors' directory and the record's
+/// host to that ONE child, as the shim and boss-api do for theirs, and
+/// never to cargo: every test binary a build runs inherits cargo's
+/// environment.
+#[test]
+fn the_floor_pass_is_handed_the_doors_token_directory_and_cargo_is_not() {
+    let read = |p: &str| {
+        std::fs::read_to_string(repo_root().join(p))
+            .unwrap_or_else(|e| panic!("{p}: {e}"))
+            .trim()
+            .to_string()
+    };
+    let doors = read("infra/dev/machine-token-dir");
+    let sor = read("infra/dev/sor-url");
+    let host = sor
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split(['/', ':', '?', '#']).next())
+        .unwrap_or_else(|| panic!("infra/dev/sor-url names no host: {sor}"))
+        .to_string();
+    assert!(
+        doors.starts_with('/') && !host.is_empty(),
+        "{doors} / {host}"
+    );
+
+    let f = Fixture::new("floor-token");
+    let wt = f.worktree("agent-floor0005");
+    let seed = f.root.join("no-such-seed");
+    let (rc, out) = f.run(&wt, &seed, &[]);
+    assert_eq!(rc, 0, "wt-cargo failed: {out}");
+    let calls = f.reclaim_calls();
+    assert!(
+        calls.contains(&format!("token_dir={doors} token_hosts={host}")),
+        "the floor pass must be handed the doors' token directory and the record's host: {calls}"
+    );
+    assert!(
+        out.contains("cargo_token_dir=unset cargo_token_hosts=unset"),
+        "cargo must inherit neither — every test binary would: {out}"
+    );
+
+    // A caller's own directory and host list are kept, as the shim keeps
+    // them; an empty list is a list.
+    let f = Fixture::new("floor-token-caller");
+    let wt = f.worktree("agent-floor0006");
+    let (rc, out) = f.run(
+        &wt,
+        &seed,
+        &[
+            ("BOSS_MACHINE_TOKEN_DIR", "/callers/own"),
+            ("BOSS_MACHINE_TOKEN_HOSTS", ""),
+        ],
+    );
+    assert_eq!(rc, 0, "wt-cargo failed: {out}");
+    assert!(
+        f.reclaim_calls()
+            .contains("token_dir=/callers/own token_hosts=\n"),
+        "{}",
+        f.reclaim_calls()
     );
 }
 

@@ -61,6 +61,7 @@ use boss_dispatcher_handlers::handlers::{
     ledger_payroll_run_submit::LedgerPayrollRunSubmit,
     ledger_tax_accrue::LedgerTaxAccrue,
     ledger_tax_remit::LedgerTaxRemit,
+    machine_gate_asked_alarm::MachineGateAskedAlarm,
     messages_expire_for_job::MessagesExpireForJob,
     messages_expire_notices::MessagesExpireNotices,
     messages_notify::MessagesNotify,
@@ -477,6 +478,21 @@ async fn main() -> Result<()> {
                 cfg.jobs_api_url.clone(),
                 platform_owner.clone(),
             ));
+            // The watch on asks (backlog d653e090): hourly, read the
+            // machine gate's durable window and file one alarm when a
+            // value no slot holds was asked about by a caller that is
+            // neither this dispatcher nor a depositor the rule names.
+            // The roster is the rotation's own: every gated port. It
+            // refuses nothing.
+            handlers.register(MachineGateAskedAlarm::new(
+                boss_ports::url("events"),
+                cfg.jobs_api_url.clone(),
+                boss_ports::all()
+                    .filter(|s| boss_core::machine_gate::is_gated(s.name))
+                    .map(|s| s.name.to_string())
+                    .collect(),
+                platform_owner.clone(),
+            ));
             // A release packet's `tag` step going ready files the
             // forge's tag-release request itself — v<version> off the
             // packet, the newest closed train's merge_ref off the
@@ -605,7 +621,14 @@ async fn main() -> Result<()> {
                     KubeSecretStore, SecretStore, Unconfigured, WorkloadRestarter, ZoneRecords,
                 };
                 let issuer: Arc<dyn ForgeTokenIssuer> = match &cfg.broker_forgejo_token {
-                    Some(root) => ForgejoAdmin::new(cfg.broker_forge_url.clone(), root.clone()),
+                    Some(root) => {
+                        match ForgejoAdmin::new(cfg.broker_forge_url.clone(), root.clone()) {
+                            Ok(admin) => admin,
+                            Err(e) => Arc::new(Unconfigured(format!(
+                                "credential broker has no forge admin client: {e}"
+                            ))),
+                        }
+                    }
                     None => Arc::new(Unconfigured(
                         "credential broker unconfigured: BOSS_BROKER_FORGEJO_TOKEN unset \
                          (secret boss-credential-broker-root, key forgejo-token)"
@@ -623,6 +646,17 @@ async fn main() -> Result<()> {
                     ))),
                 };
                 handlers.register(CredentialRotateForgejo::new(
+                    cfg.jobs_api_url.clone(),
+                    issuer.clone(),
+                    secrets.clone(),
+                ));
+                // The forge REGISTRY push token (backlog 683d7fe9, design
+                // c8502e17): the same issuer, Secret store and rotation,
+                // proved by a push the forge's container registry accepts
+                // instead of a repository read. Its own handler name, so
+                // a rule cannot choose a proof its token passes for the
+                // wrong reason.
+                handlers.register(CredentialRotateForgejo::registry(
                     cfg.jobs_api_url.clone(),
                     issuer,
                     secrets.clone(),
@@ -847,7 +881,10 @@ async fn main() -> Result<()> {
             // playing external counterparties). No-op when
             // BOSS_EVENT_WEBHOOK_URL is unset; the system stays
             // unaware of who, if anyone, is on the other end.
-            handlers.register(WebhookNotify::new(cfg.webhook_url.clone()));
+            handlers.register(
+                WebhookNotify::new(cfg.webhook_url.clone())
+                    .context("building the webhook.notify client")?,
+            );
             handlers.register(LedgerTaxRemit::new(cfg.ledger_api_url.clone()));
             // Per-production tax accrual (DR 6550 / CR 2320), fired by a
             // tenant's rule when production completes — the liability

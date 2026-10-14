@@ -86,6 +86,9 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=infra/lib/secret-header.sh
 . "$SELF_DIR/lib/secret-header.sh" \
     || { echo "$(basename "$0"): $SELF_DIR/lib/secret-header.sh is missing — without it the machine token could only ride in curl's command line; nothing filed" >&2; exit 78; }
+# shellcheck source=infra/lib/sor-reader.sh
+. "$SELF_DIR/lib/sor-reader.sh" \
+    || { echo "$(basename "$0"): $SELF_DIR/lib/sor-reader.sh is missing — the registry's read is signed as a reader; nothing filed" >&2; exit 78; }
 
 NAME="protocol-drift"
 KIND="maintenance-protocol-drift"
@@ -153,7 +156,16 @@ report_json() { # prints the report's path; the caller removes its dir
         echo "$NAME: $LINT_CANNOT_ANSWER_MARKER — no writable temp dir, so the lint's report had nowhere to land." >&2
         return "$LINT_CANNOT_ANSWER"
     }
-    bash "$LINT" --require-live --report-json "$t/report.json" >"$t/out" 2>"$t/err"
+    # THE LINT ASKS NOTHING ITSELF (backlog 44b2087e, 2026-10-09). A lint
+    # holds no machine token by rule, so its own read of the registry
+    # went out with none. This script holds it: the read is made here,
+    # stamped, signed as a reader the way the lint signs
+    # (infra/lib/sor-reader.sh), and handed in (infra/lint/lib/sor-read.sh).
+    local url="$BOSS_JOBS_URL/api/workflows" code
+    code=$("$API_CURL" -sS -m 10 -H "x-boss-user: $(sor_reader_header automation:protocol-drift)" \
+        ${MT_HDR:+-H "$MT_HDR"} -o "$t/live.json" -w '%{http_code}' "$url") || true
+    BOSS_LINT_SOR_HANDED_URL="$url" BOSS_LINT_SOR_HANDED_CODE="${code:-000}" BOSS_LINT_SOR_HANDED_BODY="$t/live.json" \
+        bash "$LINT" --require-live --report-json "$t/report.json" >"$t/out" 2>"$t/err"
     rc=$?
     case "$rc" in
         # 0 clean, 1 a failure of the tree (an unauthored live kind is one —

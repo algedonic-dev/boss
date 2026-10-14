@@ -53,6 +53,11 @@
 //!   [`crate::dispatch::SESSION_DEFINITIONS_ENV`]; no snapshot means
 //!   nothing is known, and an unknown is never a refusal.
 //!
+//! For a run it dispatched or linked, the door is also the run's
+//! LAUNCHER, so it writes the model the Agent call hands the harness as
+//! the run's first `launch.model` record before the agent exists — the
+//! only record a release counts (backlog e6b05dd6, [`call_record`]).
+//!
 //! stdout is the hook's answer and nothing else: the updatedInput JSON
 //! when there is one, empty otherwise. Every status line goes to
 //! stderr, and the run's id goes there too as one machine-readable
@@ -99,15 +104,31 @@ fn is_packet_ref(s: &str) -> bool {
     s.len() >= 8 && is_hex(s)
 }
 
-/// `agent-run <uuid>` anywhere in the prompt — the run section's own
-/// phrase (`dispatch::run_section`).
+/// The run the prompt says is its own: `Your run is agent-run <uuid>`,
+/// the run section's own sentence (`dispatch::run_section`).
+///
+/// ONLY THE SENTENCE, AND THE LAST ONE (review fd7f1030 F2, backlog
+/// e6b05dd6). The run read here gets this call's host and an immutable
+/// launch record, so a prompt that merely mentions another run (a review
+/// naming the builder's) must not be read as that run's launch. The
+/// sentence is `Your run is agent-run <id>`, as every renderer spells it
+/// (`dispatch::run_section`, the executor adapter, a coordinator's
+/// pointer prompt), with whatever punctuation follows the id; the last
+/// one stands, since a brief can quote an earlier prompt above its own.
 fn existing_run(prompt: &str) -> Option<String> {
     prompt
         .split_whitespace()
         .collect::<Vec<_>>()
-        .windows(2)
-        .find(|w| w[0] == "agent-run" && w[1].len() == 36 && is_packet_ref(w[1]))
-        .map(|w| w[1].to_string())
+        .windows(5)
+        .rev()
+        .find_map(|w| {
+            let sentence = w[0].trim_start_matches(|c: char| !c.is_alphanumeric()) == "Your"
+                && w[1] == "run"
+                && w[2] == "is"
+                && w[3] == "agent-run";
+            let id = w[4].trim_end_matches(|c: char| !c.is_ascii_hexdigit());
+            (sentence && id.len() == 36 && is_packet_ref(id)).then(|| id.to_string())
+        })
 }
 
 /// The first `Packet: <ref>` line, then the first brief path
@@ -226,6 +247,82 @@ pub(crate) fn refusal(missing: &[String]) -> Value {
     })
 }
 
+/// How the Agent tool call reaches the harness, as the launch record
+/// names it.
+const VIA_AGENT_TOOL: &str = "the Agent tool call the PreToolUse hook handed back";
+
+/// PURE: the launch record of an Agent tool call `call` (its
+/// `tool_input`): the `model` it hands the harness, verbatim, and the
+/// definition it names. Claude Code resolves both itself, so this pins
+/// a model only if the name is one the rate card prices — which the
+/// reader judges, not this.
+pub(crate) fn call_record(call: &Value, actor: &str) -> Value {
+    let text = |k: &str| {
+        call.get(k)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let mut record =
+        crate::dispatch_launch::launched_model(text("model"), None, VIA_AGENT_TOOL, actor);
+    record["subagent_type"] = json!(text("subagent_type"));
+    record
+}
+
+/// Write [`call_record`] onto `run` through the launcher's door
+/// ([`crate::dispatch_launch::record_launched_model`]). A record that
+/// could not be written is a stderr line in the journal, while the run's
+/// release reads `launched unknown`, and the call goes ahead.
+///
+/// ONE REFUSAL (re-review 211cbae4 N2): when a DIFFERENT launch record
+/// already stands on the run, the answer is a PreToolUse deny naming it,
+/// returned here for the caller to print. Going ahead would start an
+/// agent whose release believes someone else's launch — the stored
+/// record is evidence of exactly the squat the review described, and a
+/// stderr line nobody reads is not where that evidence belongs.
+async fn record_the_call<F, Fut>(api: &F, run: &str, call: &Value, actor: &str) -> Option<Value>
+where
+    F: Fn(reqwest::Method, String, Option<Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
+    use crate::dispatch_launch::NotRecorded;
+    let record = call_record(call, actor);
+    let short = &run[..8.min(run.len())];
+    match crate::dispatch_launch::record_launched_model(api, run, &record).await {
+        Ok(()) => {
+            eprintln!(
+                "boss dispatch --from-hook: run {short} — the launch is on the record (model {})",
+                record["model"]
+            );
+            None
+        }
+        Err(why @ NotRecorded::Contradicted { .. }) => {
+            eprintln!("boss dispatch --from-hook: run {short} — REFUSED: {why}");
+            Some(contradicted(run, &why))
+        }
+        Err(why) => {
+            eprintln!(
+                "boss dispatch --from-hook: run {short} — the launch is NOT on the record: {why}"
+            );
+            None
+        }
+    }
+}
+
+/// The hook's deny for a run whose launch record contradicts this call.
+pub(crate) fn contradicted(run: &str, why: &crate::dispatch_launch::NotRecorded) -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": format!(
+                "boss dispatch: run {run} — {why}. The agent was not started. Read the run's \
+                 building step (launch.model: its writer and time) before anything else; a new \
+                 launch is a new run (backlog e6b05dd6)."
+            ),
+        }
+    })
+}
+
 /// The session's next untracked count, off its current metadata.
 pub(crate) fn next_untracked(session: &Value) -> u64 {
     session
@@ -251,6 +348,11 @@ pub(crate) enum Outcome {
     Refused {
         missing: Vec<String>,
     },
+    /// A different launch record already stands on the run: the call
+    /// was denied rather than started (re-review 211cbae4 N2).
+    Contradicted {
+        run: String,
+    },
     Dispatched(Dispatched),
 }
 
@@ -271,7 +373,7 @@ pub(crate) async fn from_hook_at(
     use reqwest::Method;
     let api_at = |method: Method, path: String, body: Option<Value>| {
         let signature = crate::identity::Signature::As(actor.to_string());
-        async move { crate::gate::api_at_signed(http, base, method, &path, body, signature).await }
+        async move { crate::sor_client::api_at_signed(http, base, method, &path, body, signature).await }
     };
     match parse(input) {
         Parsed::NotADispatch { why } => {
@@ -331,6 +433,15 @@ pub(crate) async fn from_hook_at(
                 "boss dispatch --from-hook: the prompt carries run {} already — linked, not refiled",
                 &run[..8]
             );
+            // This call is the run's launch too, unrewritten: its model,
+            // as the call carries it, goes on the record — refused by
+            // the writer when the run has already begun (backlog
+            // e6b05dd6).
+            let call = input.get("tool_input").cloned().unwrap_or(Value::Null);
+            if let Some(deny) = record_the_call(&api_at, &run, &call, actor).await {
+                print!("{deny}");
+                return Ok(Outcome::Contradicted { run });
+            }
             eprintln!("{RUN_LINE_PREFIX}{run}");
             Ok(Outcome::Linked { run })
         }
@@ -370,15 +481,28 @@ pub(crate) async fn from_hook_at(
             )
             .await?;
             eprintln!("{RUN_LINE_PREFIX}{}", dispatched.run_id);
-            print!(
-                "{}",
-                updated_input(
-                    input,
-                    &dispatched.prompt,
-                    dispatched.subagent_type.as_deref(),
-                    dispatched.isolation,
-                )
+            let answer = updated_input(
+                input,
+                &dispatched.prompt,
+                dispatched.subagent_type.as_deref(),
+                dispatched.isolation,
             );
+            // The call it hands back is the launch: its model goes on the
+            // record before the agent exists (backlog e6b05dd6).
+            if let Some(deny) = record_the_call(
+                &api_at,
+                &dispatched.run_id,
+                &answer["hookSpecificOutput"]["updatedInput"],
+                actor,
+            )
+            .await
+            {
+                print!("{deny}");
+                return Ok(Outcome::Contradicted {
+                    run: dispatched.run_id,
+                });
+            }
+            print!("{answer}");
             Ok(Outcome::Dispatched(dispatched))
         }
     }
@@ -396,7 +520,7 @@ pub async fn run(session: String) -> Result<()> {
         serde_json::from_str(&text).context("the hook payload is not JSON")?
     };
     let session = (session != "-" && !session.trim().is_empty()).then_some(session);
-    let base = crate::gate::resolve_jobs_base(None)?;
+    let base = crate::sor_client::resolve_jobs_base(None)?;
     let repo = crate::brief::repo_root()?;
     let actor = crate::identity::sign(&reqwest::Method::POST, "/api/jobs")?;
     let owner = crate::owner::for_filing_at(&base).await;
@@ -409,7 +533,7 @@ pub async fn run(session: String) -> Result<()> {
         .filter(|v| !v.trim().is_empty())
         .map(std::path::PathBuf::from);
     from_hook_at(
-        &crate::gate::machine_client()?,
+        &crate::sor_client::machine_client()?,
         &base,
         &repo,
         &input,
@@ -480,6 +604,54 @@ mod tests {
         let p = format!(
             "== THE PACKET ==\nPacket: {PACKET}\n\n== THE RUN ==\n\nYour run is agent-run {RUN} \
              (profile `builder`, model opus-5[1m], budget $5, effort high).\n"
+        );
+        assert_eq!(parse(&call(&p)), Parsed::ExistingRun { run: RUN.into() });
+    }
+
+    /// THE RUN IS THE ONE THE PROMPT SAYS IS ITS OWN (review fd7f1030 F2).
+    /// The hook now writes an immutable launch record onto the run it
+    /// reads here, so a prompt that merely MENTIONS another run — a
+    /// review naming the builder's run, a rework quoting an earlier one —
+    /// must not be read as that run's launch: it would pre-empt the real
+    /// launcher's record and re-point that run's host. Only the run
+    /// section's own sentence, `Your run is agent-run <id>`, names the
+    /// run, and the last one stands, since a brief can quote an earlier
+    /// prompt above its own run section.
+    #[test]
+    fn only_the_prompts_own_run_sentence_names_its_run() {
+        const OTHER: &str = "0bf3c2d1-aaaa-4bbb-8ccc-0123456789ab";
+        // Mentioned, never claimed: not this call's run.
+        let p = format!("Review the car built by agent-run {OTHER} and report.");
+        assert_eq!(parse(&call(&p)), Parsed::Untracked);
+        let p = format!("Packet: {PACKET}\nThe builder (agent-run {OTHER}, green) asks for this.");
+        assert_eq!(
+            parse(&call(&p)),
+            Parsed::Packet {
+                packet_ref: PACKET.into()
+            }
+        );
+        // The sentence, wherever punctuation ends it: the executor
+        // adapter's `…agent-run <id>.` and a coordinator's pointer prompt
+        // `…agent-run <id> (item …). Your full brief is the file …`.
+        for p in [
+            format!("== EXECUTOR ADAPTER ==\nYour run is agent-run {RUN}.\n"),
+            format!(
+                "Your run is agent-run {RUN} (item e6b05dd6, car 1b944a52). Your full brief is \
+                 the file /x/scratchpad/p-e6b0-rw.txt"
+            ),
+            format!("Your run is agent-run {RUN}, briefed in /x/brief.txt"),
+        ] {
+            assert_eq!(
+                parse(&call(&p)),
+                Parsed::ExistingRun { run: RUN.into() },
+                "{p}"
+            );
+        }
+        // A quoted earlier prompt above this one's own run section: the
+        // last sentence is the run.
+        let p = format!(
+            "Earlier prompt, quoted: \"Your run is agent-run {OTHER}.\"\n\n== THE RUN ==\nYour \
+             run is agent-run {RUN} (profile `builder`)."
         );
         assert_eq!(parse(&call(&p)), Parsed::ExistingRun { run: RUN.into() });
     }
@@ -604,12 +776,21 @@ mod wire_tests {
     type Calls = Arc<Mutex<Vec<(String, String, Value)>>>;
 
     async fn stub() -> (String, Calls) {
+        let (base, calls, _) = stub_seeded(None).await;
+        (base, calls)
+    }
+
+    /// The stub, holding `seed` as the run [`RUN`] from the start — a
+    /// run `boss dispatch` filed before the Agent call carried it — and
+    /// handing back the run it keeps.
+    async fn stub_seeded(seed: Option<Value>) -> (String, Calls, Arc<Mutex<Option<Value>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let calls: Calls = Arc::new(Mutex::new(Vec::new()));
         let log = calls.clone();
-        let run: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let run: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(seed));
+        let kept = run.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
@@ -677,6 +858,9 @@ mod wire_tests {
                     ("POST", p) if p.ends_with("/claim") => {
                         ("200 OK", json!({ "status": "active" }).to_string())
                     }
+                    ("POST", p) if p.ends_with("/metadata/records") => {
+                        crate::dispatch::stub_record(&run, RUN, p, &body)
+                    }
                     ("POST", "/api/jobs") => {
                         let mut filed = body.clone();
                         filed["id"] = json!(RUN);
@@ -712,7 +896,7 @@ mod wire_tests {
                 let _ = sock.shutdown().await;
             }
         });
-        (format!("http://{addr}"), calls)
+        (format!("http://{addr}"), calls, kept)
     }
 
     fn repo() -> std::path::PathBuf {
@@ -741,7 +925,7 @@ mod wire_tests {
         definitions: Option<&std::path::Path>,
     ) -> Outcome {
         from_hook_at(
-            &crate::gate::machine_client().unwrap(),
+            &crate::sor_client::machine_client().unwrap(),
             base,
             &repo(),
             input,
@@ -810,6 +994,24 @@ mod wire_tests {
                 && *p == format!("/api/jobs/{RUN}/steps/run-briefed")
                 && b["status"] == "completed"),
             "briefed is completed"
+        );
+        // THE LAUNCH ON THE RECORD (backlog e6b05dd6): the model the
+        // call it hands back carries — the definition's `opus`, which the
+        // harness resolves — as a first record on the run's Building,
+        // signed by the actor running the hook.
+        let record = calls
+            .iter()
+            .find(|(m, p, _)| {
+                m == "POST" && *p == format!("/api/jobs/{RUN}/steps/run-building/metadata/records")
+            })
+            .map(|(_, _, b)| b.clone())
+            .expect("the launch was recorded");
+        assert_eq!(
+            record,
+            json!({ "key": boss_jobs::car_release::LAUNCHED_MODEL_KEY, "expected_absence": true,
+                    "value": { "model": boss_jobs::agent_spec::DEFINITION_MODEL,
+                               "via": VIA_AGENT_TOOL, "launched_by": "emp-david",
+                               "subagent_type": "effort-high" } })
         );
     }
 
@@ -894,12 +1096,17 @@ mod wire_tests {
         let out = go(&base, &call(&prompt), Some(SESSION)).await;
         assert_eq!(out, Outcome::Linked { run: RUN.into() });
         let calls = calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 1, "{calls:?}");
         assert_eq!(calls[0].0, "PATCH");
         assert_eq!(calls[0].1, format!("/api/jobs/{RUN}/metadata"));
         assert_eq!(
             calls[0].2,
             json!({ "session": SESSION, "host": "boss-dev-0" })
+        );
+        // A run this stub cannot read records no launch, and is still
+        // linked: the record is never the call's refusal.
+        assert!(
+            !calls.iter().any(|(m, _, _)| m == "POST"),
+            "nothing filed, nothing recorded: {calls:?}"
         );
 
         // No session: the host is still where the agent starts.
@@ -907,8 +1114,117 @@ mod wire_tests {
         let out = go(&base, &call(&prompt), None).await;
         assert_eq!(out, Outcome::Linked { run: RUN.into() });
         let calls = calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 1, "{calls:?}");
         assert_eq!(calls[0].2, json!({ "host": "boss-dev-0" }));
+    }
+
+    /// THE PASTED RUN'S LAUNCH IS ON THE RECORD TOO (backlog e6b05dd6):
+    /// the Agent call that carries a run `boss dispatch` printed is that
+    /// run's launch, so the model the call carries — here the
+    /// definition named and no model, the shape an operator types — is
+    /// written as the run's first record. But only for a run that has
+    /// not begun: a prompt that merely names a run already working is
+    /// not its launch, and a first record cannot be taken back.
+    #[tokio::test]
+    async fn a_pasted_runs_launch_is_recorded_only_before_the_run_begins() {
+        let prompt = format!("== THE RUN ==\nYour run is agent-run {RUN} (profile `builder`).");
+        let mut input = call(&prompt);
+        input["tool_input"]["subagent_type"] = json!("effort-high");
+        let filed = |building: &str| {
+            json!({ "id": RUN, "kind": "agent-run", "metadata": {},
+                    "steps": [{ "id": "run-building", "spec_slug": "building",
+                                "status": building, "metadata": {} }] })
+        };
+
+        let (base, _calls, run) = stub_seeded(Some(filed("ready"))).await;
+        let out = go(&base, &input, Some(SESSION)).await;
+        assert_eq!(out, Outcome::Linked { run: RUN.into() });
+        let kept = run.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            kept["steps"][0]["metadata"][boss_jobs::car_release::LAUNCHED_MODEL_KEY],
+            json!({ "model": null, "via": VIA_AGENT_TOOL, "launched_by": "emp-david",
+                    "subagent_type": "effort-high" }),
+            "{kept}"
+        );
+
+        // Claimed once and released back to Ready is begun too
+        // (re-review 211cbae4 B1): no record is attempted.
+        let mut released = filed("ready");
+        released["steps"][0]["metadata"] =
+            json!({ boss_jobs::records_before_claim::CLAIMED_KEY: "2026-10-10T00:00:00Z" });
+        let (base, calls, _run) = stub_seeded(Some(released)).await;
+        let out = go(&base, &input, Some(SESSION)).await;
+        assert_eq!(out, Outcome::Linked { run: RUN.into() });
+        assert!(
+            !calls.lock().unwrap().iter().any(|(m, _, _)| m == "POST"),
+            "a released run gets no launch record"
+        );
+
+        for begun in ["active", "completed"] {
+            let (base, calls, run) = stub_seeded(Some(filed(begun))).await;
+            let out = go(&base, &input, Some(SESSION)).await;
+            assert_eq!(out, Outcome::Linked { run: RUN.into() }, "{begun}");
+            assert!(
+                !calls.lock().unwrap().iter().any(|(m, _, _)| m == "POST"),
+                "{begun}: a run that has begun gets no launch record"
+            );
+            let kept = run.lock().unwrap().clone().unwrap();
+            assert!(
+                kept["steps"][0]["metadata"]
+                    .get(boss_jobs::car_release::LAUNCHED_MODEL_KEY)
+                    .is_none(),
+                "{begun}"
+            );
+        }
+    }
+
+    /// A DIFFERENT LAUNCH ALREADY ON THE RECORD REFUSES THE CALL (re-review
+    /// 211cbae4 N2). Anyone signing as the launcher's agent could write
+    /// `launch.model` on a Ready Building first, the door keeps the first
+    /// write, and the hook used to print one stderr line and start the
+    /// agent anyway — its release then believed the squatter. Now the
+    /// call is denied, naming the stored record, and nothing is written.
+    /// The SAME record already there is this launch replayed, and goes on.
+    #[tokio::test]
+    async fn a_contradicting_launch_record_refuses_the_call() {
+        let prompt = format!("== THE RUN ==\nYour run is agent-run {RUN} (profile `builder`).");
+        let mut input = call(&prompt);
+        input["tool_input"]["subagent_type"] = json!("effort-high");
+        let held = |launch: Value| {
+            json!({ "id": RUN, "kind": "agent-run", "metadata": {},
+                    "steps": [{ "id": "run-building", "spec_slug": "building",
+                                "status": "ready",
+                                "metadata": { boss_jobs::car_release::LAUNCHED_MODEL_KEY: launch } }] })
+        };
+
+        let squat = json!({ "model": "opus-5-5", "via": "argv", "launched_by": "emp-david" });
+        let (base, calls, run) = stub_seeded(Some(held(squat.clone()))).await;
+        let out = go(&base, &input, Some(SESSION)).await;
+        assert_eq!(out, Outcome::Contradicted { run: RUN.into() });
+        assert!(
+            !calls.lock().unwrap().iter().any(|(m, _, _)| m == "POST"),
+            "nothing written over the stored record"
+        );
+        let kept = run.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            kept["steps"][0]["metadata"][boss_jobs::car_release::LAUNCHED_MODEL_KEY],
+            squat
+        );
+        let why = crate::dispatch_launch::NotRecorded::Contradicted { stored: squat };
+        let deny = contradicted(RUN, &why);
+        assert_eq!(deny["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            deny["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|r| r.contains("opus-5-5") && r.contains(RUN)),
+            "{deny}"
+        );
+
+        // The same launch, replayed: linked, not refused.
+        let same = json!({ "model": null, "via": VIA_AGENT_TOOL, "launched_by": "emp-david",
+                           "subagent_type": "effort-high" });
+        let (base, _calls, _run) = stub_seeded(Some(held(same))).await;
+        let out = go(&base, &input, Some(SESSION)).await;
+        assert_eq!(out, Outcome::Linked { run: RUN.into() });
     }
 
     /// No packet: counted on the session, nothing filed — and with no

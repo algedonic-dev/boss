@@ -99,6 +99,18 @@ impl Converge {
             &infra.join("forge/runner-credential-deposit.sh"),
             &logged("runner-credential-deposit"),
         );
+        // boss-gcp's runner credential push (backlog 1e50e66b) — its own
+        // suite is runner_credential_send_sh.rs.
+        write_exec(
+            &infra.join("forge/runner-credential-push.sh"),
+            &logged("runner-credential-push"),
+        );
+        // This fixture isolates convergence from off-host transport; its
+        // complete root-token sender has its own native controls.
+        write_exec(
+            &infra.join("forge/root-tree-token-push.sh"),
+            &logged("root-tree-token-push"),
+        );
         write_exec(
             &infra.join("forge/machine-token-deposit.sh"),
             &logged("machine-token-deposit"),
@@ -106,6 +118,10 @@ impl Converge {
         write_exec(
             &infra.join("forge/probe-reader-deposit.sh"),
             &logged("probe-reader-deposit"),
+        );
+        write_exec(
+            &infra.join("forge/registry-token-deposit.sh"),
+            &logged("registry-token-deposit"),
         );
         write_exec(&infra.join("forge/install.sh"), &logged("install"));
         // root-tree.sh (backlog a604a35b): by default a host with NO tree
@@ -190,6 +206,9 @@ impl Converge {
                 "BOSS_PROBE_READER_CREDENTIAL",
                 self.root.join("probe-reader.credential"),
             )
+            // The registry push token's directory (backlog 683d7fe9): a
+            // fourth destination, redirected for the same reason.
+            .env("BOSS_REGISTRY_PUSH_DIR", self.root.join("registry-push"))
             .env(
                 "BOSS_RUNNER_CREDENTIAL_FILE",
                 self.root.join("ops-runner.credential"),
@@ -748,6 +767,130 @@ fn a_tree_that_could_not_be_refreshed_still_installs_and_reds_the_run() {
     );
     assert!(!calls.contains("root-tree-mark-good"), "{calls}");
     assert_eq!(c.summary()["root_tree"], "root-tree: fixture refresh");
+}
+
+/// A RED THAT STANDS UNTIL A PERSON ACTS SAYS SO ON A LINE THE JUDGE
+/// READS (delta review aa901496, the ALARM note; backlog 62b09c57). A
+/// refused rewind of main and a HELD install were each only a red
+/// converge every ten minutes: the packet closed `failed` and nothing
+/// opened. The run now leaves `output` on its packet, one `RED <route>
+/// <kind>: <error>` line per such state — the shape
+/// maintenance.chore.file_reds files one backlog-item per route from
+/// (infra/dispatcher/rules/file-backlog-items-on-forge-converge-red.toml)
+/// — and the exit is what it was.
+#[test]
+fn a_refused_tree_and_held_units_leave_a_red_line_for_the_judge() {
+    let c = Converge::new("red-lines");
+    let tree_gen = a_tree(&c, "89abcdef0123456789abcdef0123456789abcdef");
+    // The refresh refuses a rewound main, in root-tree.sh's own words.
+    write_exec(
+        &c.root.join("infra/forge/root-tree.sh"),
+        &format!(
+            "#!/bin/sh\nR='{root}'\ncase \"$1\" in\n\
+             refresh) echo 'root-tree: REFUSED: the forge main is at 0123456789ab, which is NOT a descendant of the commit root last accepted; current stays at 89abcdef0123'; exit 3 ;;\n\
+             path) cat \"$R/tree-path\" ;;\n\
+             head) cat \"$R/tree-head\" ;;\n\
+             esac\nexit 0\n",
+            root = c.root.display()
+        ),
+    );
+    // And the generation's installer holds the units, as install.sh does.
+    write_exec(
+        &tree_gen.join("infra/forge/install.sh"),
+        &format!(
+            "#!/bin/bash\n. '{rs}'\nrun_summary_field units_held ' forge-backup.service:/var/lib/boss/tree/current/infra/forge/forge-backup.sh'\nexit 1\n",
+            rs = repo_root().join("infra/run-summary.sh").display()
+        ),
+    );
+    let out = c.cmd().output().expect("forge-converge.sh runs");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the installer's exit is still the run's: {}",
+        text(&out)
+    );
+    let s = c.summary();
+    let output = s["output"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no `output` on the packet: {s}"));
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), 2, "{output}");
+    assert!(
+        lines.iter().any(|l| l.starts_with(
+            "RED forge-converge/root-tree refused: root-tree: REFUSED: the forge main is at 0123456789ab"
+        )),
+        "{output}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("RED forge-converge/units-held held: ")
+                && l.contains(
+                    "forge-backup.service:/var/lib/boss/tree/current/infra/forge/forge-backup.sh"
+                )),
+        "{output}"
+    );
+
+    // A green run, and a red one with no such state, say nothing there:
+    // a refresh that FAILED may pass by itself and is read on the packet.
+    let c = Converge::new("no-red-lines");
+    let out = c.cmd().output().expect("forge-converge.sh runs");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(c.summary().get("output").is_none(), "{}", c.summary());
+    let c = Converge::new("failed-not-refused");
+    a_tree(&c, "89abcdef0123456789abcdef0123456789abcdef");
+    write_file(&c.root.join("tree-refresh-rc"), "1\n");
+    let out = c.cmd().output().expect("forge-converge.sh runs");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(c.summary().get("output").is_none(), "{}", c.summary());
+}
+
+/// BOSS-GCP'S RUNNER CREDENTIAL PUSH LEAVES ITS RED FOR THE JUDGE TOO
+/// (review f15070d2 of car 2c628718, B1; backlog 1e50e66b). A key placed
+/// bare on boss-gcp, a signed key boss-gcp refuses, a receiver its
+/// converge never replaced: each stands until a person acts, and the
+/// push wrote its RED line only to `runner_credential_boss_gcp`, which the
+/// judge does not read — so the converge closed `failed` every ten
+/// minutes and nothing was filed. The line is copied into `output` in
+/// the sender's own words; a `not yet` (or any line that is not a RED)
+/// leaves none.
+#[test]
+fn a_red_from_boss_gcps_runner_push_leaves_a_line_for_the_judge() {
+    const RED: &str = "RED runner-credential-send/key-unconfined refused: this key reaches a shell on boss-gcp: the far side accepted the key and answered with its own text ('Welcome') where the receiver's first line was expected.";
+    let push_says = |c: &Converge, line: &str, rc: i32| {
+        write_exec(
+            &c.root.join("infra/forge/runner-credential-push.sh"),
+            &format!(
+                "#!/bin/bash\n. '{rs}'\nrun_summary_field runner_credential_boss_gcp \"{line}\"\nexit {rc}\n",
+                rs = repo_root().join("infra/run-summary.sh").display()
+            ),
+        );
+    };
+    let c = Converge::new("gcp-runner-red");
+    push_says(&c, RED, 1);
+    let out = c.cmd().output().expect("forge-converge.sh runs");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the push's exit is still the run's: {}",
+        text(&out)
+    );
+    let s = c.summary();
+    let output = s["output"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no `output` on the packet: {s}"));
+    assert_eq!(output, RED, "{s}");
+
+    // Not yet passes by itself: nothing for the judge.
+    let c = Converge::new("gcp-runner-not-yet");
+    push_says(
+        &c,
+        "not yet: the enroll step of prepare-a-deposit-key packet 00000000 is not signed",
+        0,
+    );
+    let out = c.cmd().output().expect("forge-converge.sh runs");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(c.summary().get("output").is_none(), "{}", c.summary());
 }
 
 /// THE OWNER'S CHECKOUT IS NO LONGER WHAT THE RUN DEPENDS ON. A fetch or

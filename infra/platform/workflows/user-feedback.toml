@@ -100,7 +100,7 @@ title_template = "Draft the design"
 authority_role = "platform-admin"
 # The analyst block backlog-item's `draft-design` carries — one step,
 # one declaration in both kinds (c87fb59b car 1).
-agent = { profile = "analyst", model = "opus-5[1m]", budget_usd = 2, effort = "medium" }
+agent = { profile = "analyst", model = "opus-5-5", budget_usd = 2, effort = "medium" }
 # The procedure's second paragraph is backlog-item's draft-design's,
 # word for word (backlog 4f71e608, 2026-09-24) — one step, one text in
 # both kinds, pinned by the_author_decides_from_the_company_frame.rs.
@@ -147,7 +147,7 @@ authority_role = "platform-admin"
 # is the same step: the executor lane's build. Projected onto the
 # packet as agent_profile / agent_model / agent_budget_usd /
 # agent_effort at materialisation.
-agent = { profile = "builder", model = "opus-5[1m]", budget_usd = 5, effort = "high" }
+agent = { profile = "builder", model = "opus-5-5", budget_usd = 5, effort = "high" }
 
 [[workflow.step]]
 title = "needs-info"

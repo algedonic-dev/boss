@@ -118,10 +118,8 @@
     color: var(--static); margin-bottom: 4px;
   }
   .form-row input {
-    width: 100%; padding: 8px 10px; border: 1px solid var(--hairline);
-    border-radius: 6px; font-size: 13px; box-sizing: border-box;
+    width: 100%; box-sizing: border-box;
   }
-  .form-row input:focus { outline: none; border-color: var(--border-strong); }
   .submit-btn {
     background: var(--band); color: var(--on-band); border: none; border-radius: 6px;
     padding: 8px 14px; font-size: 13px; font-weight: 500; cursor: pointer;

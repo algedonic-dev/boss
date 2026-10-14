@@ -86,17 +86,21 @@ async fn a_row_of_its_own_still_answers_for_itself_and_nothing_else_widens() {
     }
 }
 
+/// Two well-formed prefixes cannot nest (a slug holds no colon), so a
+/// response that declares a nested one has a malformed row, and is a
+/// registry that could not answer — never a narrower family that
+/// quietly wins (review ed9181b4, F2). Two rows declaring the same
+/// prefix are ambiguous: this reads a response, not the table.
 #[tokio::test]
-async fn the_longest_family_answers_and_a_family_declared_twice_is_ambiguous() {
+async fn a_nested_family_is_refused_and_a_family_declared_twice_is_ambiguous() {
     let nested = json!({"data":[
         {"id":"automation:dispatcher","role":"platform-admin","signs_for":"automation:rule:"},
         {"id":"automation:tenant-rules","role":"audit-readonly","signs_for":"automation:rule:tenant-"}
     ],"total":2});
-    let roles = RegistryRoles::from_sources(none(), nested, json!([])).unwrap();
-    let got = roles.role_for("rule:tenant-x").await.unwrap().unwrap();
-    assert_eq!(got.actor_id, "automation:tenant-rules");
-    let got = roles.role_for("rule:other").await.unwrap().unwrap();
-    assert_eq!(got.actor_id, "automation:dispatcher");
+    assert!(matches!(
+        RegistryRoles::from_sources(none(), nested, json!([])),
+        Err(RoleLookupError::Unavailable(_))
+    ));
 
     let twice = json!({"data":[
         {"id":"automation:a","role":"platform-admin","signs_for":"automation:rule:"},
@@ -124,11 +128,19 @@ async fn only_an_automation_row_declares_a_family_and_a_malformed_one_is_refused
     let roles = RegistryRoles::from_sources(agents, none(), people).unwrap();
     assert_eq!(roles.role_for("rule:x").await.unwrap(), None);
 
+    // The last four are strings of the wrong SHAPE. The write side refuses
+    // each three ways, and measured 2026-10-07 (review ed9181b4, F2) this
+    // reader accepted them: `automation:` answered for every
+    // automation-spelled caller with no row of its own, at platform-admin.
     for bad in [
         json!(42),
         json!(""),
         json!("   "),
         json!(["automation:rule:"]),
+        json!("a"),
+        json!("automation:"),
+        json!("automation:ops-"),
+        json!("rule:"),
     ] {
         let rows = json!({"data":[
             {"id":"automation:dispatcher","role":"platform-admin","signs_for":bad}
@@ -137,6 +149,34 @@ async fn only_an_automation_row_declares_a_family_and_a_malformed_one_is_refused
             RegistryRoles::from_sources(none(), rows, json!([])),
             Err(RoleLookupError::Unavailable(_))
         ));
+    }
+}
+
+/// A family vouches only for a member whose tail is `:`-separated
+/// `[A-Za-z0-9-]` segments — every one of the 124 live dispatcher rule
+/// names and the ops runner's `<host>:<moment>-<pid>`, read 2026-10-10.
+/// Measured 2026-10-07 (review ed9181b4, F5), each id below resolved to
+/// the dispatcher's platform-admin row. Report mode only states it today;
+/// under enforce it would be a grant to whatever the caller typed.
+#[tokio::test]
+async fn a_member_tail_of_any_other_shape_is_unregistered() {
+    let roles = roles();
+    for typed in [
+        "rule: ",
+        "rule:x ",
+        "rule:../../x",
+        "rule:a/b",
+        "rule:x\u{202e}",
+        "automation:rule:x\u{202e}gnp.exe",
+        "rule::x",
+        "rule:x:",
+        "automation:ops-runner:forge:",
+    ] {
+        assert_eq!(
+            roles.role_for(typed).await.unwrap(),
+            None,
+            "{typed:?} must stay unregistered"
+        );
     }
 }
 

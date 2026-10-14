@@ -11,6 +11,7 @@
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import { formatMoney } from '@boss/web-kit/ui/money';
   import type { PurchaseOrder, Vendor, VendorInvoice } from './types';
+  import { purchaseOrderIsOpen, vendorInvoiceIsPaid } from './vendor-status';
   import {
     emptyState,
     failedRead,
@@ -105,11 +106,9 @@
   let rows = $derived(
     vendors.map((v) => {
       const vendorPos = pos.filter((po) => po.vendor === v.name);
-      const openPos = vendorPos.filter(
-        (po) => po.status !== 'received' && po.status !== 'closed',
-      );
+      const openPos = vendorPos.filter((po) => purchaseOrderIsOpen(po.status));
       const vendorBills = bills.filter((b) => b.vendor === v.name);
-      const unpaidBills = vendorBills.filter((b) => b.status !== 'paid');
+      const unpaidBills = vendorBills.filter((b) => !vendorInvoiceIsPaid(b.status));
       const outstandingCents = unpaidBills.reduce((s, b) => s + b.amount_cents, 0);
       return {
         vendor: v,
@@ -248,7 +247,7 @@
                 </td>
                 <td>{r.vendor.category?.replace(/-/g, ' ') ?? '—'}</td>
                 <td>{r.vendor.city ?? '—'}, {r.vendor.state ?? '—'}</td>
-                <td>{r.vendor.payment_terms}</td>
+                <td>{r.vendor.payment_terms ?? '—'}</td>
                 <td class="num">{r.vendor.lead_time_days}d</td>
                 <td class="num">
                   {#if ordersUnknown}

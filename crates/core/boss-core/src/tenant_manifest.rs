@@ -84,6 +84,10 @@ pub struct TenantToml {
     /// `[gateway]` — the sessionless read set, and nothing else yet.
     #[serde(default)]
     pub gateway: TenantGateway,
+    /// Optional declaration data only. Existing manifests remain valid;
+    /// parsing it neither publishes nor activates an integration (8f28b94f).
+    #[serde(default)]
+    pub integrations: Option<crate::integration::IntegrationConfig>,
 }
 
 impl TenantToml {
@@ -97,6 +101,38 @@ impl TenantToml {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_integration_declaration_cannot_silently_drop_its_required_version() {
+        let malformed = "[integrations]\nauthor = \"fixture-author\"\n[ integrations.entries.commerce ]\nactive = true\nservice = \"commerce\"\n";
+        assert!(
+            TenantToml::parse(malformed).is_err(),
+            "a present but unversioned declaration must not disappear as an unknown TOML section"
+        );
+    }
+
+    #[test]
+    fn integration_data_is_independent_of_presentation_and_old_manifests_stay_valid() {
+        let old = TenantToml::parse("[modules]\nfinance = true\n").unwrap();
+        assert!(old.integrations.is_none());
+        let declared = TenantToml::parse("[modules]\nfinance = false\n[integrations]\nversion = 2\nauthor = \"fixture-author\"\nsupersedes = 1\n[integrations.entries.billing]\nactive = true\nservice = \"fixture-service\"\n").unwrap();
+        let config = declared.integrations.unwrap();
+        assert_eq!(config.version, 2);
+        assert_eq!(config.supersedes, Some(1));
+        assert!(config.entries["billing"].active);
+        assert!(!declared.modules["finance"]);
+        for missing in ["active", "service"] {
+            let text = format!(
+                "[integrations]\nversion = 2\nauthor = \"fixture-author\"\n[integrations.entries.billing]\n{}\n",
+                if missing == "active" {
+                    "service = \"fixture-service\""
+                } else {
+                    "active = true"
+                }
+            );
+            assert!(TenantToml::parse(&text).is_err(), "missing {missing}");
+        }
+    }
 
     #[test]
     fn a_bare_meta_block_parses_and_everything_else_defaults() {

@@ -19,6 +19,7 @@ mod credential;
 mod delivery_policy;
 mod design;
 mod dispatch;
+mod dispatch_brief;
 mod dispatch_hook;
 mod dispatch_launch;
 #[cfg(test)]
@@ -45,6 +46,10 @@ mod item_source;
 mod job;
 mod kept_probe;
 mod launch;
+mod launch_binding;
+mod launch_cluster;
+mod launch_controller;
+mod launch_job;
 mod ledger;
 mod memory_index;
 mod merged;
@@ -74,6 +79,8 @@ mod roster;
 mod running;
 mod scratch_target;
 mod script;
+mod shared_checkout;
+mod sor_client;
 mod source_backfill;
 mod steps;
 mod strike_release;
@@ -512,7 +519,11 @@ enum Commands {
         /// review, with every receipt field carried (backlog 486dde37).
         /// A park intent naming an item marked trust-boundary
         /// (`metadata.trust_boundary`, set by `boss triage
-        /// --trust-boundary`) is REFUSED without this flag.
+        /// --trust-boundary`) is REFUSED without this flag. And WITH
+        /// --park-*, this flag is REFUSED when no item it names is
+        /// marked and `mutating_verb::judge` finds nothing in the diff:
+        /// such a car boards on its green and is reviewed after it
+        /// lands (backlog bd331d38, option A).
         #[arg(long, value_name = "REASON")]
         hold: Option<String>,
     },
@@ -628,6 +639,15 @@ enum Commands {
     /// and the prompt's rules carry them as the commit trailer, saying
     /// where they came from (89d1572c).
     Dispatch {
+        /// Recover retained artifacts from a previously admitted cluster
+        /// launch. Requires a fresh own active BOSS_AGENT_RUN; never starts
+        /// a harness, changes its old terminal or deletes a retained workspace.
+        #[arg(long,conflicts_with_all=["replay_launch","started","report","from_hook","next","launch","step","model","budget","effort","force"])]
+        recover_launch: bool,
+        /// Replay durable cluster observer/terminal receipts as their original
+        /// observer. Requires a fresh active own run; performs no compute effect.
+        #[arg(long,conflicts_with_all=["recover_launch","started","report","from_hook","next","launch","step","model","budget","effort","force"])]
+        replay_launch: bool,
         /// After reading the whole START: record the declared own-run
         /// worker receipt. Requires BOSS_AGENT_RUN and your own building
         /// assignment: a READY step nominated to you is claimed first (it
@@ -751,13 +771,16 @@ enum Commands {
         /// because anything stops it signing as you. Only a separate
         /// account would. STOPPING THIS VERB STOPS THE PROCESS: Ctrl-C,
         /// TERM or HUP stops the launched group and ends the run `died`,
-        /// and a verb that is killed outright takes the one process it
-        /// spawned with it (a parent-death signal) — but not what that
-        /// process started, and it then writes nothing, so the run stays
-        /// `running` until the silence clock ends it. The pid and process
-        /// group are on the run (launch.pid, launch.pgid) and in
+        /// and a verb that is killed outright has the kernel send TERM to
+        /// the one process it spawned (a parent-death signal). That is
+        /// a request: a process that ignores TERM outlives a killed
+        /// verb, and what that process started is not signalled at all.
+        /// A killed verb also writes nothing, so the run's launch stays
+        /// `starting` until the silence clock ends it. The pid and process
+        /// group are on the run (launch_process.pid, launch_process.pgid) and in
         /// <launch-dir>/pid from the moment the process exists; stop a
-        /// leftover by hand with `kill -TERM -<pgid>`. Start it where
+        /// leftover by hand with `kill -TERM -<pgid>` and then, for
+        /// whatever is left, `kill -KILL -<pgid>`. Start it where
         /// nothing stops the verb before --launch-minutes. The verb
         /// stays until the process exits,
         /// judges it on that exit, stops its whole process group, and
@@ -902,6 +925,12 @@ enum Commands {
     /// output verbatim, refusing unless the probe exits zero and prints
     /// what was claimed. `proven` used to require only prose, which is
     /// how a change got reported done on an HTTP 204.
+    ///
+    /// On a host holding no reader credential — the dev pod, by design —
+    /// a probe that runs `boss-sor-read` is refused before it runs, by
+    /// hand, by --recheck and by --disproved: its reads would carry no
+    /// token. The forge's unattended door proves it instead, on the
+    /// train's arrival and hourly after (design 00227628).
     Prove {
         /// Car to prove: its branch, or 8+ characters of its id.
         car: String,
@@ -1514,6 +1543,10 @@ enum WorkflowAction {
         /// (`infra/platform/workflows/<kind>.toml`), or the bundle
         /// directory itself (infra/platform/workflows) — the `kind`
         /// row is taken from it, one definition for seed and publish.
+        /// A bundle's owning team is the `[meta] tenant_id` of the
+        /// `tenant.toml` around it; with none (the platform bundle, a
+        /// slice in a scratch file) it is the live row's, and the
+        /// live row's authoring job is kept (backlog 6645addc).
         spec: std::path::PathBuf,
         /// Lint and report without writing anything.
         #[arg(long)]
@@ -1969,6 +2002,28 @@ async fn main() -> Result<()> {
         },
         Commands::Orient { all } => orient::run(all).await,
         Commands::Brief { packet, profile } => brief::run(packet, profile).await,
+        Commands::Dispatch {
+            replay_launch: true,
+            packet,
+            ..
+        } => {
+            launch_cluster::recover_recorded(
+                packet.expect("clap requires the original full run UUID"),
+                true,
+            )
+            .await
+        }
+        Commands::Dispatch {
+            recover_launch: true,
+            packet,
+            ..
+        } => {
+            launch_cluster::recover_recorded(
+                packet.expect("clap requires the original full run UUID"),
+                false,
+            )
+            .await
+        }
         Commands::Dispatch {
             started: true,
             packet,

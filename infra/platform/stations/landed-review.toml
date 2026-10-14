@@ -1,0 +1,39 @@
+# ---------------------------------------------------------------------------
+# landed-review — landed cars that owe their review (backlog bd331d38).
+#
+# OPTION A (David, 2026-10-09: "Go with option A for the review hold").
+# A parked car waits for an independent review before it boards ONLY
+# when mutating_verb::judge finds its diff or its item carries a
+# trust_boundary mark. Every other car boards on its green and owes the
+# review AFTER it lands, on ship-a-change's `landed-review` step. This
+# station is that debt as a queue: every open car whose `landed-review`
+# step is ready or being worked. Its depth is the number of landed
+# changes no independent reader has looked at yet — counted, never
+# silent — and `GET /api/stations/landed-review/queue` is the read.
+#
+# Discipline `age`: the oldest unreviewed landing has been on main the
+# longest. No WIP limit — the depth IS the signal, as at `repair`.
+#
+# Declared here only — no migration ever seeded it (migrations declare
+# schema only since 2026-09-18). To change this station, bump `version`.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "landed-review"
+version = 1
+status = "active"
+title = "Landed cars that owe their review"
+kind = "batch"
+discipline = ["age"]
+
+[station.predicate]
+kind = "ship-a-change"
+status = "open"
+
+[station.predicate.step]
+slug = "landed-review"
+status_in = ["ready", "active"]
+
+[station.upstream]
+label = "THE YARD"
+href = "/system/yard"

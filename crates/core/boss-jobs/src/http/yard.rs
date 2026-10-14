@@ -85,6 +85,9 @@ pub(super) async fn yard_status<R: JobsRepository + 'static, B: EventBus + 'stat
         Ok(read) => read,
         Err(resp) => return resp,
     };
+    // The held cars carry what their release rests on, judged by the
+    // release door's own rule (backlog ed8e5c85).
+    let status = with_release_decisions(&state, &user, status).await;
     Json(with_gate_run_window(
         with_dock_source(with_conductor(with_now(status, now), health), dock_reading),
         gate_runs_truncated,

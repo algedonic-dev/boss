@@ -168,6 +168,8 @@ describe('nav catalog — app assignment', () => {
     // "both where we respond to active incidents and document post
     // mortems for posterity").
     'system-incidents',
+    'system-performance',
+    'system-atlas',
     // The hardware registry page — declared beside observed, plus the
     // dev-workspace ssh door (59ef456a).
     'system-estate',
@@ -729,5 +731,18 @@ describe('a surface that lists a department names it by its owner', () => {
   // surface. Same field, same reason as the warehouse's above.
   it('the finance surface lists the finance department it sits under', () => {
     expect(ROUTE_CATALOG.finance.owner).toBe('finance');
+  });
+});
+
+describe('standalone Views retirement', () => {
+  it('removes Views without removing the remaining Home catalog entries', () => {
+    for (const path of ['/ux/views', '/views']) {
+      expect(withRoster(parseRoute(path), path, SEEDED).kind).toBe('notFound');
+    }
+    const rows = Object.values(ROUTE_CATALOG);
+    expect(rows.some((row) => row.path === '/ux/views' || row.label === 'Views')).toBe(false);
+    for (const id of ['inbox', 'jobs', 'schedule']) {
+      expect(rows.some((row) => row.id === id)).toBe(true);
+    }
   });
 });

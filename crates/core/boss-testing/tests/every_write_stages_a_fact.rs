@@ -70,9 +70,9 @@ use syn::visit::Visit;
 /// The one allowlist, repo-relative.
 const ALLOWLIST: &str = "crates/core/boss-events/writes-without-a-fact.txt";
 
-/// The call that stages a fact — the one door every staging path goes
-/// through (crates/core/boss-events/src/outbox.rs).
-const STAGE_CALL: &str = "record_event_in_tx";
+/// The two public forms of the same outbox staging door. The owning
+/// source pin below verifies their shared caller-transaction contract.
+const STAGE_CALLS: &[&str] = &["record_event_in_tx", "record_event_with_budget_in_tx"];
 
 /// The parameter types that hand a function its caller's transaction,
 /// matched as a type name's SUFFIX (sqlx's `Transaction`, its Postgres
@@ -115,7 +115,7 @@ struct Func {
     /// connection, or returns the SQL text for the caller to run. Only
     /// such a function writes or stages INSIDE its caller's transaction.
     for_caller: bool,
-    /// Calls `record_event_in_tx` or inserts into `event_outbox` itself.
+    /// Calls an owning outbox staging door or inserts into `event_outbox` itself.
     stages_directly: bool,
 }
 
@@ -240,7 +240,7 @@ impl Scan {
 
     fn call(&mut self, name: &str) {
         if let Some(f) = self.open.last_mut() {
-            if name == STAGE_CALL {
+            if STAGE_CALLS.contains(&name) {
                 f.stages_directly = true;
             }
             f.calls.insert(name.to_string());
@@ -957,6 +957,119 @@ const HELPER_AND_STAGING_CALLER: &str = r#"
         tx.commit().await
     }
 "#;
+
+#[test]
+fn the_budgeted_outbox_door_covers_only_the_callers_transaction() {
+    let source = HELPER_AND_STAGING_CALLER.replace(
+        "record_event_in_tx(tx, e)",
+        "record_event_with_budget_in_tx(tx, e, Some(budget))",
+    );
+    let j = judge_source(&source, "");
+    assert_eq!(j.writes, 1);
+    assert!(j.unexcused.is_empty(), "{:?}", j.unexcused);
+
+    let nonstaging = format!(
+        "{source}\nasync fn orphan(tx: &mut Transaction<'_, Postgres>, r: &Row) -> Result<(), E> {{ insert_row(tx, r).await }}"
+    );
+    assert_eq!(
+        tables(&judge_source(&nonstaging, "")),
+        vec![("insert_row".to_string(), "widgets".to_string())],
+        "one nonstaging caller still uncovers the shared write"
+    );
+
+    let separate = source.replace(
+        "async fn stage(tx: &mut Transaction<'_, Postgres>, e: &Event) -> Result<(), E> {",
+        "async fn stage(pool: &Pool, e: &Event) -> Result<(), E> { let mut tx = pool.begin().await?;",
+    );
+    assert_eq!(
+        tables(&judge_source(&separate, "")),
+        vec![("insert_row".to_string(), "widgets".to_string())],
+        "a helper staging in its own transaction cannot cover the caller"
+    );
+}
+
+#[test]
+fn the_recognized_outbox_doors_retain_the_actual_caller_transaction_contract() {
+    let funcs = scan_source(
+        "crates/core/boss-events/src/outbox.rs",
+        "crates/core/boss-events",
+        include_str!("../../boss-events/src/outbox.rs"),
+    )
+    .expect("the actual outbox owner parses");
+    for name in STAGE_CALLS {
+        let owner = funcs.iter().find(|f| f.name == *name).expect(name);
+        assert!(
+            owner.for_caller,
+            "{name} must take the caller's transaction"
+        );
+    }
+    let budgeted = funcs
+        .iter()
+        .find(|f| f.name == "record_event_with_budget_in_tx")
+        .unwrap();
+    assert!(
+        budgeted.stages_directly,
+        "the budgeted owner must insert into event_outbox"
+    );
+    assert!(
+        budgeted
+            .calls
+            .iter()
+            .all(|call| !STAGE_CALLS.contains(&call.as_str())),
+        "the budgeted owner stages SQL itself rather than borrowing recognized-call coverage"
+    );
+    let ordinary = funcs
+        .iter()
+        .find(|f| f.name == "record_event_in_tx")
+        .unwrap();
+    assert!(ordinary.calls.contains("record_event_with_budget_in_tx"));
+
+    struct Executes(Vec<bool>);
+    impl<'ast> Visit<'ast> for Executes {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if call.method == "execute" {
+                let supplied_tx = match call.args.first() {
+                    Some(syn::Expr::Reference(reference)) if reference.mutability.is_some() => {
+                        match reference.expr.as_ref() {
+                            syn::Expr::Unary(first) if matches!(first.op, syn::UnOp::Deref(_)) => {
+                                match first.expr.as_ref() {
+                                    syn::Expr::Unary(second)
+                                        if matches!(second.op, syn::UnOp::Deref(_)) =>
+                                    {
+                                        matches!(second.expr.as_ref(), syn::Expr::Path(path) if path.path.is_ident("tx"))
+                                    }
+                                    _ => false,
+                                }
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                self.0.push(supplied_tx);
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+    let owner = syn::parse_file(include_str!("../../boss-events/src/outbox.rs")).unwrap();
+    let function = owner
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "record_event_with_budget_in_tx" => {
+                Some(function)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let mut executes = Executes(Vec::new());
+    executes.visit_block(&function.block);
+    assert_eq!(
+        executes.0,
+        [true],
+        "the actual INSERT executes on the supplied tx, never a pool or separate connection"
+    );
+}
 
 #[test]
 fn a_helper_is_covered_only_while_every_caller_stages() {

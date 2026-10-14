@@ -90,6 +90,7 @@ boss-views-catchup.yaml instance
 # instances from it — one pipeline, one forge, two converges.
 boss-conductor.yaml pipeline
 boss-dev.yaml pipeline
+boss-dev-build-egress.yaml pipeline
 boss-dev-access.yaml pipeline
 boss-credential-broker.yaml pipeline
 gate-seed-local.yaml pipeline

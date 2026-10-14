@@ -14,6 +14,25 @@ use boss_core::job::Job;
 // tests still construct directly.
 use boss_policy_client::{Scope, User};
 
+/// The stored-row own-work exception shared by HTTP and native selection.
+pub fn step_is_callers(user: &User, packet_open: bool, step: &boss_core::job::Step) -> bool {
+    use boss_core::job::StepStatus;
+    if user.ambient_actor().is_none() {
+        return false;
+    }
+    if step.assignee_id.as_deref() == Some(user.id.as_str()) {
+        return true;
+    }
+    packet_open
+        && matches!(step.status, StepStatus::Ready | StepStatus::Active)
+        && (step.assignee_id.is_none() || step.status == StepStatus::Active)
+        && step
+            .metadata
+            .get("authority_role")
+            .and_then(serde_json::Value::as_str)
+            == Some(user.role.as_str())
+}
+
 /// Does this `job` fall within `scope` for `user`?
 ///
 /// Used after a successful `policy.check()` to verify the *specific*

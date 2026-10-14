@@ -14,7 +14,7 @@
 
 import { fetchRemote, type Remote } from '../../data/remote';
 import { NOT_IN_SCOPE } from '../../policy/withheld';
-import { DELIVERY_CHANNELS, type DeliveryChannel } from './yard';
+import { CANCEL_ROLE, DELIVERY_CHANNELS, type DeliveryChannel } from './yard';
 
 // ---------------------------------------------------------------------
 // Wire types — the shape of GET /api/yard/status. Parsed once, below.
@@ -127,6 +127,34 @@ export type HeldCar = Readonly<{
   /** Why it cannot board. A bare `hold: true` reads "no reason
    *  recorded" — the same words the held-green lane uses. */
   reason: string;
+  /** What a release of this car rests on, and the release door's own
+   *  answer, asked when the status was read (backlog ed8e5c85). `null`
+   *  when the server stated none: a red re-gate, a car this viewer
+   *  cannot read, or an older server. Optional so the rows other lenses
+   *  build (the floor's fixtures) need not invent one. */
+  release?: ReleaseDecision | null;
+}>;
+
+/** `boss_jobs::car_release::Decision`, as the server states it. Nothing
+ *  here is judged: `releasable` and `refusal` come from the same rule
+ *  `POST /api/jobs/{car}/release` applies, so the row cannot offer a
+ *  release the door refuses. */
+export type ReleaseDecision = Readonly<{
+  /** The reviewer's agent-run the release would name. */
+  review: string | null;
+  verdict: string | null;
+  /** The head that review read. */
+  reviewed_sha: string | null;
+  /** The head the hold was placed at. */
+  head: string | null;
+  head_matches: boolean | null;
+  /** The reviewer's own "SAFE TO RELEASE WITHOUT DAVID: …" line. */
+  safe_line: string | null;
+  /** The model the review declared and the one its report observed. */
+  model: string | null;
+  model_differs: boolean;
+  releasable: boolean;
+  refusal: string | null;
 }>;
 
 /** Whether the server could READ one of the boarding block's inputs, as
@@ -561,7 +589,67 @@ function parseRedTrains(raw: unknown): number | undefined {
 function parseHeldCar(raw: unknown): HeldCar {
   const o = asObjectOrEmpty(raw);
   const reason = typeof o.reason === 'string' && o.reason !== '' ? o.reason : 'no reason recorded';
-  return { ...parseDockCar(raw), reason };
+  return { ...parseDockCar(raw), reason, release: parseReleaseDecision(o.release) };
+}
+
+/** The server's decision, or `null` when it stated none. `releasable`
+ *  is true ONLY when the server said exactly `true`: a missing or
+ *  malformed answer never offers the button. */
+export function parseReleaseDecision(raw: unknown): ReleaseDecision | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const o = raw as Record<string, unknown>;
+  const str = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null);
+  const m = (typeof o.reviewer_model === 'object' && o.reviewer_model !== null
+    ? o.reviewer_model
+    : {}) as Record<string, unknown>;
+  return {
+    review: str(o.review),
+    verdict: str(o.verdict),
+    reviewed_sha: str(o.reviewed_sha),
+    head: str(o.head),
+    head_matches: typeof o.head_matches === 'boolean' ? o.head_matches : null,
+    safe_line: str(o.safe_line),
+    model: str(m.says),
+    model_differs: m.matches === false,
+    releasable: o.releasable === true,
+    refusal: str(o.refusal),
+  };
+}
+
+/** The role the page offers Release to: the yard's write role, the one
+ *  the cancel button uses. Affordance, not the gate. The gate is the
+ *  merge door's step update, which the release door writes through. */
+export const RELEASE_ROLE = CANCEL_ROLE;
+
+/** The held cars the yard may release now, each by the server's own
+ *  answer — what the "release every reviewed car" control lists before
+ *  it asks for one confirmation. */
+export function releasableHeld(held: readonly HeldCar[]): readonly HeldCar[] {
+  return held.filter(h => h.release?.releasable === true && h.release.review !== null);
+}
+
+/** The exact body the yard's Release control posts to the door. It names
+ *  the review it rests on and nothing else: the head is the one the
+ *  hold was placed at, and `by` is the session the API authenticated. */
+export function releaseBody(d: ReleaseDecision): Readonly<{ review: string }> | null {
+  return d.review === null ? null : { review: d.review };
+}
+
+/** Did the reviewer answer "no" on its SAFE TO RELEASE WITHOUT DAVID
+ *  line? The Release-all confirmation marks such a car (review 4822764d
+ *  N1). Only the answer after the colon is read, and only a leading
+ *  word "no" counts: the line is the reviewer's prose, shown and never
+ *  judged by the door, so anything less plain is left unmarked and
+ *  read in full beside it. */
+export function safeSaysNo(line: string | null): boolean {
+  if (line === null) return false;
+  const answer = line.slice(line.indexOf(':') + 1).trim().toLowerCase();
+  return /^no\b/.test(answer);
+}
+
+/** A sha as the row shows it. */
+export function shortSha(sha: string | null): string {
+  return sha === null ? '—' : sha.slice(0, 8);
 }
 
 /** A reading the server states, or `null` when it states none. Anything

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-if [[ ( -e /etc/boss-dev-control/enabled || -L /etc/boss-dev-control/enabled ) && "$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")" != /opt/boss-dev-control/generations/*/infra/dev/boss-api ]]; then
-    exec /opt/boss-dev-control/boss-api "$@"
+# Dev isolation (b3071bf4): an activated generation answers from its
+# published copy. A REFUSED selector (design a68fc42a D1) runs this
+# trusted door here, so the operator keeps the system of record.
+dev_control=/work/tools/dev-control
+if [[ "$(/usr/bin/readlink -- "$dev_control/enabled" 2>/dev/null)" =~ ^"$dev_control"/generations/[0-9a-f]{40}$ && "$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")" != "$dev_control"/generations/*/infra/dev/boss-api ]]; then
+    exec "$dev_control/boss-api" "$@"
 fi
 # boss-api METHOD /api/path [body.json] — the door to the system of record.
 #

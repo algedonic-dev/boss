@@ -111,6 +111,7 @@ const MARSHALLING_NEEDS_INBOUND: &str = "the inbound packets could not be read, 
 /// The eight regions whose OWN predicates name what they hold — a car on
 /// the dock or in the shed, a gate-run in a bay or the garage, a train at
 /// the dock, the gates or on the track ([`train_region`]) or arrived, a
+/// gate-run in line for a bay ([`at_the_gates`]), a
 /// run on the shop floor, a pull request on the mirror — each as the ids
 /// its predicate names, in claim order. `None` exactly where the region's
 /// count is `None`: an unread region claims nothing, and says so on its
@@ -158,6 +159,18 @@ fn claimed(inputs: &RegionInputs<'_>) -> [(&'static str, Option<Ids>); 8] {
                     .iter()
                     .filter(|g| !g.train.as_ref().is_some_and(|t| under_test.contains(t)))
                     .map(|g| g.packet_id.clone())
+                    // THE LINE STANDS AT THE GATES (backlog 357fe1da, design
+                    // 85c3f793 decision 1): a run waiting for a bay is drawn
+                    // at the station it waits for, as a train waiting for a
+                    // platform is. Until then it stood on no region, and a
+                    // run that died in line was first seen in the garage.
+                    .chain(
+                        s.gates
+                            .queued
+                            .iter()
+                            .filter(|q| !q.train.as_ref().is_some_and(|t| under_test.contains(t)))
+                            .map(|q| q.packet_id.clone()),
+                    )
                     .chain(under_test.iter().cloned())
                     .collect(),
             ),
@@ -228,11 +241,89 @@ fn carried(inputs: &RegionInputs<'_>) -> std::collections::BTreeMap<String, Stri
             .filter_map(Value::as_str)
             .map(move |car| (car.to_string(), id.clone()))
     });
-    let gates = s.gates.active.iter().filter_map(|g| {
-        let train = g.train.as_ref().filter(|t| at_gates(t))?;
-        Some((g.packet_id.clone(), train.clone()))
+    let in_bays = s.gates.active.iter().map(|g| (&g.packet_id, &g.train));
+    // A train gate still in line rides its train the same way (backlog
+    // 357fe1da): the train under test stands in the line, counted once.
+    let in_line = s.gates.queued.iter().map(|q| (&q.packet_id, &q.train));
+    let gates = in_bays.chain(in_line).filter_map(|(packet, train)| {
+        let train = train.as_ref().filter(|t| at_gates(t))?;
+        Some((packet.clone(), train.clone()))
     });
     cars.chain(gates).collect()
+}
+
+/// WHERE AT THE GATES each packet [`place`] puts there stands — three
+/// disjoint sets whose union is the region's members, so `count +
+/// waiting + judged` is the partition by construction (backlog bce67f09).
+#[derive(Debug, Default)]
+pub(crate) struct AtTheGates {
+    /// In a bay: a gate-run running, or a train whose own gate runs.
+    pub bays: Ids,
+    /// THE LINE (backlog 357fe1da, design 85c3f793 decision 2): a
+    /// gate-run waiting for a bay, a train whose own gate waits for one,
+    /// and a train under test with NO gate-run yet. The region's second
+    /// figure, `waiting` — never part of its count of bays in use.
+    pub line: Ids,
+    /// THE JUDGED (backlog bce67f09): a train whose own gate has already
+    /// spoken — green and awaiting forge CI or the merge, or red and
+    /// blocked. It needs no bay and waits in no line, so until this set it
+    /// stood in the line and read "0 bays in use, 1 waiting" while the
+    /// "N waiting for a slot" text, which counts queued runs only, said
+    /// none. The region's third figure, `judged`.
+    pub judged: Ids,
+}
+
+/// The open trains whose own gate has spoken: the `ci` step holds a
+/// verdict (the yard's [`crate::yard::TrainPhase::AwaitingMerge`]), or a
+/// train gate of theirs closed `completed` or `failed`, which is the gate
+/// green while forge CI is still out. A gate closed `lost` produced no
+/// verdict, so its train waits for the next one, in line.
+fn judged_trains(inputs: &RegionInputs<'_>) -> Ids {
+    let by_ci = inputs
+        .status
+        .trains
+        .iter()
+        .filter(|t| t.phase == crate::yard::TrainPhase::AwaitingMerge)
+        .map(|t| t.id.clone());
+    let by_gate = inputs
+        .gate_runs
+        .iter()
+        .filter(|g| g.status != JobStatus::Open)
+        .filter(|g| {
+            matches!(
+                g.metadata.get("outcome").and_then(Value::as_str),
+                Some("completed" | "failed")
+            )
+        })
+        .filter_map(crate::yard::train_of_gate);
+    by_ci.chain(by_gate).collect()
+}
+
+/// The gates' members, split into [`AtTheGates`]. ONE build of the
+/// partition for the region's three figures — it used to be two, one for
+/// the line and one for the count (the cost named on backlog bce67f09).
+/// A train whose gate is in a bay or in line stands there whatever an
+/// earlier gate of its said: a re-gate is the train under test again.
+/// `None` where the gates were not read.
+pub(crate) fn at_the_gates(inputs: &RegionInputs<'_>) -> Option<AtTheGates> {
+    let g = &inputs.status.gates;
+    let in_a_bay: Ids = g
+        .active
+        .iter()
+        .flat_map(|a| std::iter::once(&a.packet_id).chain(a.train.as_ref()))
+        .cloned()
+        .collect();
+    let gate_in_line: Ids = g.queued.iter().filter_map(|q| q.train.clone()).collect();
+    let judged = judged_trains(inputs);
+    let ids = members(inputs)
+        .into_iter()
+        .find(|(name, _)| *name == "gates")
+        .and_then(|(_, ids)| ids)?;
+    let (bays, rest): (Ids, Ids) = ids.into_iter().partition(|id| in_a_bay.contains(id));
+    let (judged, line): (Ids, Ids) = rest
+        .into_iter()
+        .partition(|id| judged.contains(id) && !gate_in_line.contains(id));
+    Some(AtTheGates { bays, line, judged })
 }
 
 /// WHAT [`place`] READS: everything one reading says about which packet
@@ -622,15 +713,17 @@ mod tests {
         );
         assert_eq!(place("nobody", &lookups), Placed::Off);
 
-        // The partition still sums: every region's count is what it holds.
+        // The partition still sums: every region's count, line and judged
+        // are what it holds (backlog bce67f09).
         let out = regions(&i);
         let held = members(&i);
         for r in &out.regions {
             let (_, ids) = held.iter().find(|(n, _)| *n == r.name).unwrap();
             assert_eq!(
-                r.count,
+                r.count
+                    .map(|n| n + r.waiting.unwrap_or(0) + r.judged.unwrap_or(0)),
                 ids.as_ref().map(Ids::len),
-                "{}: its count and its members disagree — {ids:?}",
+                "{}: its count, line and judged and its members disagree — {ids:?}",
                 r.name
             );
         }
@@ -763,7 +856,21 @@ mod tests {
             ),
             step(&train, "ci", StepStatus::Ready, None),
         ];
-        let open_trains = vec![(train, train_steps)];
+        // A train whose gate has spoken: `ci` judged red, not merged.
+        let judged = job("pr-train", "train #10", JobStatus::Open, json!({}));
+        let mut judged_ci = step(&judged, "ci", StepStatus::Completed, Some(NOW));
+        judged_ci.metadata = json!({ "result": "failing" });
+        let judged_steps = vec![
+            step(
+                &judged,
+                "pr",
+                StepStatus::Completed,
+                Some("2026-09-19T11:01:00Z"),
+            ),
+            judged_ci,
+            step(&judged, "merged", StepStatus::Ready, None),
+        ];
+        let open_trains = vec![(train, train_steps), (judged, judged_steps)];
         let arrived = job(
             "pr-train",
             "train #8",
@@ -789,6 +896,16 @@ mod tests {
             stale: false,
             train: None,
             ..Default::default()
+        }];
+        // A run waiting for a bay: placed at the gates, once (357fe1da).
+        status.gates.queued = vec![crate::yard::QueuedGate {
+            branch: "fix/in-line".into(),
+            packet_id: "gate-in-line".into(),
+            queued_at: "2026-09-19T11:40:00Z".into(),
+            position: 1,
+            waiting_seconds: None,
+            estimated_wait_seconds: None,
+            train: None,
         }];
         status.held = vec![crate::yard::HeldGreen {
             branch: "feat/held".into(),
@@ -823,6 +940,7 @@ mod tests {
             id(&dock_car.0),
             id(&open_trains[0].0),
             "gate-in-a-bay".to_string(),
+            "gate-in-line".to_string(),
             "gate-held".to_string(),
             "gate-lost".to_string(),
             "gate-red".to_string(),
@@ -867,16 +985,27 @@ mod tests {
                 }
             }
         }
-        // Every region's count IS its members.
+        // Every region's count IS its members — with the gates' line, its
+        // second figure (backlog 357fe1da), and its judged, the third
+        // (backlog bce67f09), beside the bays.
         for r in &out.regions {
             let (_, ids) = held.iter().find(|(n, _)| *n == r.name).unwrap();
             assert_eq!(
-                r.count,
+                r.count
+                    .map(|n| n + r.waiting.unwrap_or(0) + r.judged.unwrap_or(0)),
                 ids.as_ref().map(Ids::len),
-                "{}: its count and its members disagree — {ids:?}",
+                "{}: its count, line and judged and its members disagree — {ids:?}",
                 r.name
             );
         }
+        // The line: the run waiting for a bay and train #9, under test
+        // with no gate-run. Train #10's gate has spoken: judged, not line.
+        let gates = by_name(&out, "gates");
+        assert_eq!(
+            (gates.count, gates.waiting, gates.judged),
+            (Some(1), Some(2), Some(1)),
+            "{held:?}"
+        );
         // And the station's packets are all accounted for, each once.
         for pid in &everyone {
             assert!(owner.contains_key(pid.as_str()), "{pid} is in no region");
@@ -889,6 +1018,7 @@ mod tests {
         assert_eq!(region_of(&id(&shed_car.0)), Some("shed"));
         assert_eq!(region_of(&id(&dock_car.0)), Some("dock"));
         assert_eq!(region_of("gate-in-a-bay"), Some("gates"));
+        assert_eq!(region_of("gate-in-line"), Some("gates"));
         assert_eq!(region_of("gate-red"), Some("garage"));
 
         // The two borders out of the upstream pair wait on the same

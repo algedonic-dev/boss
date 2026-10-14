@@ -51,6 +51,74 @@ ready_when = "true"
 title_template = "Host read requested: {metadata.verb} on {metadata.host}"
 metadata_defaults = { trigger_kind = "operator", trigger_name = "operator-requests-a-host-read" }
 
+# THE INDEPENDENT REVIEW BEFORE THE PASSKEY (backlog 84e7c3e4, design
+# 9de0cd1c — Q1 answered by David 2026-10-04: "Require an actually
+# closed independent RELEASE ... before the passkey approval becomes
+# ready and again before any push"). Tenant merges reached David's
+# passkey with nothing on the record saying anyone but their author had
+# read them: the BOSS reviewer resolves only ship-a-change cars, and a
+# tenant branch is not one.
+#
+# READY ONLY WHERE THE VERB ASKS FOR IT. `boss ops` sets
+# `job.metadata.requires_review` when the verb's allowlist file declares
+# `requires_review` — today merge-tenant-main alone, because David's
+# option A (bd331d38, 2026-10-09) holds work for an independent review
+# only where a rule requires one. On every other request the flag is
+# absent, reads FALSE, and this step never becomes ready; `approve`
+# below is ready exactly as before. The flag is ROUTING: the runner reads
+# the requirement off the verb and the review off this step.
+#
+# WHAT IS REVIEWED IS WHAT WILL BE SIGNED. The runner renders the verb's
+# `plan_verb` onto this step (`plan`, `rendered_plan_sha256`, and the
+# request it was rendered for) exactly as it later renders it onto
+# `approve`; the reviewer — dispatched under the profile below, whose
+# rules are infra/platform/documents/tenant-reviewer-rules.md — records
+# `verdict`, the hash of the bytes it reviewed, the `source_run` that
+# authored the branch, and its findings. The runner opens the approval
+# only over a `release` of exactly those bytes by a LANDED review run
+# that is not the source run, renders the approval's plan only if it
+# still hashes to what was reviewed, writes the review run onto
+# `approve` inside the signed shape, and checks all of it again before
+# the claim. `changes` closes the request on `not-released`.
+#
+# THE PROFILE IS FIXED, NOT READ OFF THIS STEP (review N1 of car
+# e1f4fc2a). The runner holds the review run to its own REVIEW_PROFILE,
+# held equal to the profile below by boss-testing's
+# the_protocol_puts_a_review_between_the_plan_and_the_passkey: the step's
+# projected `agent_profile` key is writable through the merge door, so
+# reading the expected profile there let whoever may update the step
+# choose it.
+#
+# AND THIS ROW IS HELD (review bd3091d2, B1): it changes when `approve`
+# and `execute` become ready on every ops-request, so it goes live only
+# at David's hand publish with its controls — see
+# infra/platform/workflow-holds/ops-request.toml.
+#
+# THE PLAN HERE IS THE RUNNER'S TOO (row E, backlog 6c9183de). The five
+# keys the runner renders onto this step are the bytes the reviewer
+# releases and the runner later holds the approval's plan to, so they
+# declare the same one writer they declare on `approve` below. The
+# reviewer's four keys are its own record and declare none.
+[[workflow.step]]
+title = "review"
+kind = "task"
+ready_when = "steps.filed.done AND job.metadata.requires_review"
+title_template = "Review the plan: {metadata.verb} on {metadata.host}"
+authority_role = "platform-admin"
+agent = { profile = "tenant-reviewer", model = "opus-5-5", budget_usd = 5, effort = "high" }
+metadata_defaults = { procedure = "REVIEW THE PLAN ON THIS STEP AND THE BRANCH IT LANDS, as the tenant-reviewer rules say. `plan` is the document the host runner rendered — the exact bytes a passkey will be asked to sign once you release them. Record `verdict` (release or changes), `reviewed_plan_sha256` (the `rendered_plan_sha256` on this step, copied), `source_run` (the agent-run that built the branch) and `findings`. A release you did not earn is the one failure this step exists to refuse." }
+fields = [
+    { name = "plan", field_type = "string", required = true, writer = "runner:ops" },
+    { name = "verb", field_type = "string", required = true, writer = "runner:ops" },
+    { name = "host", field_type = "string", required = true, writer = "runner:ops" },
+    { name = "args", field_type = "array", required = true, writer = "runner:ops" },
+    { name = "rendered_plan_sha256", field_type = "string", required = true, writer = "runner:ops" },
+    { name = "verdict", field_type = "release|changes", required = true },
+    { name = "reviewed_plan_sha256", field_type = "string", required = true },
+    { name = "source_run", field_type = "string", required = true },
+    { name = "findings", field_type = "string", required = true },
+]
+
 # THE APPROVAL, AND THE FIRST PRESENCE-ASSURED STEP IN THE SYSTEM.
 #
 # Design 17835005, answered by David 2026-09-21: he approves a
@@ -89,10 +157,16 @@ metadata_defaults = { trigger_kind = "operator", trigger_name = "operator-reques
 # approval off this step's sign-off record — it renders the verb's
 # `plan_verb` into `plan` here, and runs the write only once this step
 # is completed with a presence stamp bound to its current shape.
+#
+# AND, WHERE THE VERB REQUIRES A REVIEW, ONLY AFTER A RELEASE (backlog
+# 84e7c3e4). The absent `requires_review` reads false, so every approval
+# verb but the one that declares it is ready exactly as before; a
+# request that carries it waits for the review step above to complete
+# with verdict `release`.
 [[workflow.step]]
 title = "approve"
 kind = "sign-off"
-ready_when = "steps.filed.done AND job.metadata.requires_approval"
+ready_when = "steps.filed.done AND job.metadata.requires_approval AND (NOT job.metadata.requires_review OR (steps.review.done AND steps.review.metadata.verdict = \"release\"))"
 assurance_required = "presence"
 # WHO MUST STAMP IT. Declared because an assurance with no required
 # sign-off is unreachable by the door that enforces it (backlog
@@ -122,10 +196,25 @@ metadata_defaults = { procedure = "READ THE PLAN ON THIS STEP AND NOTHING ELSE. 
 # array the runner writes with --argjson, empty for a verb whose only
 # param is the plan hash the runner appends (reclaim-gcp-root, filed by
 # machine with `args = []`) — present, and an array, so it completes.
-# No `writer` ON THESE FIVE yet: `runner:ops` is declared in the car
-# that delivers the runner credential (design f623e425), because a
-# writer no door resolves locks its key against everyone and the publish
-# lint refuses it (workflow_lint phase 9).
+#
+# THE FIVE ARE THE RUNNER'S, AND SO IS `review_run` (row E of design
+# b08725c2's order; design f623e425 option A; backlog 6c9183de, finish
+# ledger R2). `writer = "runner:ops"` is believed only through the
+# credential the host's runner PRESENTS in x-boss-runner-credential,
+# resolved by the jobs API's credential door against the broker's slots
+# (boss_jobs::runner_credential) — never through the x-boss-user id,
+# which every machine-door caller can type. The credential is bound to a
+# host, so the forge runner writes only requests whose `host` is forge,
+# and `host` is frozen at admission on every packet that declares a
+# writer (review S2). Declared only once BOTH runner hosts held a
+# delivered credential — forge presenting since 2026-10-09, boss-gcp
+# since its first issuance was delivered on 2026-10-10 (rotation
+# f194ab3e) — because a writer no door resolves for some host locks that
+# host's runner out of the plan David is asked to sign, and the publish
+# lint refuses a writer outside RESOLVABLE_PRINCIPALS (phase 9).
+# `review_run` is written by the runner in the same patch as the plan
+# and sits inside the shape the passkey signs, so it is reserved with
+# them.
 #
 # THE SIGNER'S TWO KEYS ARE THE SIGNER'S (design 09618594, question
 # `signer`, David 2026-10-06; the signer half of backlog 6c9183de, ahead
@@ -165,35 +254,43 @@ metadata_defaults = { procedure = "READ THE PLAN ON THIS STEP AND NOTHING ELSE. 
 # twice over: by default, because the row declares a writer, and by
 # declaration, in infra/platform/workflow-holds/ops-request.toml.
 #
-# THAT FILE NOW SAYS `released`, for these two keys only, and carries
-# the evidence. So a later edit to this row rides the unattended roads
-# like any other kind's — and a hand rollback no longer stays rolled
-# back by itself. The one-kind `publish-workflow ops-request` declares
-# no approval and puts this row back at once for anyone who may file an
-# ops-request; publish-drift does the same after its next clean check
-# (none was clean on 2026-10-07: ten unrelated kinds refused, which is
-# an accident and not a control). A deliberate rollback re-holds in a
-# car FIRST. A car that declares ANOTHER writer here, or an executor,
-# adds a refusal that release never covered and puts `held` back in the
-# same car (pinned in boss-testing's publish_drift_sh.rs, which reads
-# the parsed row).
+# THAT FILE SAID `released` from 2026-10-07, for these two keys only,
+# and SAYS `held` AGAIN from the review car (backlog 84e7c3e4, car
+# e1f4fc2a, review bd3091d2 B1): that car changes when this step and
+# `execute` become ready, which is David's approval path, so it goes
+# live at his hand publish with a positive and a negative control, and a
+# rollback of it stays rolled back. A car that releases it again rewrites
+# boss-testing's publish_drift_sh.rs pins with its reason; a car that
+# declares ANOTHER writer here, or an executor, keeps it held in the same
+# car (the same pins read the parsed row). THE RUNNER HALF IS THAT CAR
+# (row E): the file says `held` for it, with its own why and lift.
 #
 # In-flight requests keep the fields they
 # were admitted with and are approved exactly as before; the convert
 # door refuses to move one onto this row (field_writer::repin_refusals).
-# THE ROAD BACK needs no approval, no passkey and no session: publish
-# this file as it stood before car 3616120a through the same verb, then
-# cancel and refile any request admitted under the declared row. Rehearsed
-# end to end in boss-jobs'
-# tests/only_the_signer_writes_an_ops_request_decision.rs.
+# THE ROAD BACK needs no approval, no passkey, no session and no
+# credential: publish this file as it stood before the car that declares
+# a half through the same verb (for the runner half, this row without
+# `runner:ops` and with `written_by` back on `nothing-to-do` — the row
+# live as v12 before it), then cancel
+# and refile any request admitted under the declared row — never inside
+# G3's enforcement window (design b08725c2). Rehearsed end to end in
+# boss-jobs' tests/only_the_signer_writes_an_ops_request_decision.rs
+# (the signer half) and
+# tests/the_ops_runner_is_the_only_writer_of_the_plan_a_human_signs.rs
+# (the runner half).
 fields = [
-    { name = "plan", field_type = "string", required = true },
-    { name = "verb", field_type = "string", required = true },
-    { name = "host", field_type = "string", required = true },
-    { name = "args", field_type = "array", required = true },
-    { name = "rendered_plan_sha256", field_type = "string", required = true },
+    { name = "plan", field_type = "string", required = true, writer = "runner:ops" },
+    { name = "verb", field_type = "string", required = true, writer = "runner:ops" },
+    { name = "host", field_type = "string", required = true, writer = "runner:ops" },
+    { name = "args", field_type = "array", required = true, writer = "runner:ops" },
+    { name = "rendered_plan_sha256", field_type = "string", required = true, writer = "runner:ops" },
     { name = "decision", field_type = "pending|approved|rejected|changes-requested", required = false, writer = "signer" },
     { name = "comment", field_type = "string", required = false, writer = "signer" },
+    # The review run the approval relied on (backlog 84e7c3e4), written by
+    # the runner with the plan in the same patch, so the passkey signs it;
+    # absent on every request whose verb asks for no review.
+    { name = "review_run", field_type = "string", required = false, writer = "runner:ops" },
 ]
 
 [[workflow.step]]
@@ -212,7 +309,14 @@ kind = "task"
 # decision but `approved` leaves execute pending (never skipped by the
 # engine, because the predicate reads job metadata), and `refused` below
 # becomes ready and closes the request, which skips it.
-ready_when = "steps.filed.done AND (NOT job.metadata.requires_approval OR (steps.approve.done AND steps.approve.metadata.decision = \"approved\"))"
+#
+# AND, WHERE THE VERB REQUIRES A REVIEW, ONLY OVER A RELEASE (backlog
+# 84e7c3e4). `approve` already waits for one; saying it here too keeps
+# the protocol itself from readying a write whose review did not
+# release, whatever the approve step says — the engine's half of the
+# runner's "again before any push". Absent, the flag reads false, so
+# every other request is ready exactly as before.
+ready_when = "steps.filed.done AND (NOT job.metadata.requires_approval OR (steps.approve.done AND steps.approve.metadata.decision = \"approved\")) AND (NOT job.metadata.requires_review OR (steps.review.done AND steps.review.metadata.verdict = \"release\"))"
 title_template = "Run {metadata.verb} on {metadata.host}"
 # Gated the way the maintenance kinds gate `run`: the simulated
 # workforce must not role-match onto a real host read. The runner's
@@ -231,6 +335,21 @@ authority_role = "platform-admin"
 # unaffected. Pinned by boss-dispatcher's
 # `an_ops_request_execute_is_left_for_its_role_queue`.
 claimable = true
+# AND ONLY THE CREDENTIALED RUNNER OF THE PACKET'S HOST MOVES IT (row E;
+# extend_2026-09-25 of backlog 6c9183de; design f623e425). Without this
+# any machine-door caller could set x-boss-user to a runner-shaped id,
+# claim an approved execute, return an active one to ready inside the
+# approval window, or complete it with invented output. Declared, the
+# step PUT and the claim door move its status or holder only for the
+# credential `runner:ops` bound to this packet's `host`
+# (boss_jobs::credential_executor), and record the credential's account
+# as the actor whatever the header said. Policy still grants the
+# authority; the credential only proves who is executing. A runner pass
+# whose credential is not presented has every execute write refused
+# 409: a read verb's answer is then held on the request as a refused
+# completion (ops-runner.sh record_refused_completion), and an approval
+# verb's claim is refused before anything runs.
+executor = "runner:ops"
 [[workflow.step.fields]]
 name = "disposition"
 field_type = "answered|refused"
@@ -261,10 +380,32 @@ kind = "outcome"
 # dispatcher's complete-on-ready rule cannot close one at open (the
 # workflow-design shape); `NOT (… = "approved")`, not `!=`, so an absent
 # decision reads as not approved.
+# A PLAN ITS REVIEWER DID NOT RELEASE closes on `not-released` below, not
+# here: this title is rendered when the request is filed, so a request
+# its reviewer sent back read "outside the allowlist" (review N4 of car
+# e1f4fc2a, run bd3091d2).
 ready_when = "(steps.execute.done AND steps.execute.metadata.disposition = \"refused\") OR (steps.approve.done AND NOT (steps.approve.metadata.decision = \"approved\"))"
 title_template = "Refused — outside the allowlist"
 # `aborted`, matching backlog-item's `declined`: the request was turned
 # down, not taken back by its filer.
+metadata_defaults = { outcome_kind = "aborted" }
+terminal = { outcome = "refused" }
+
+# A PLAN ITS INDEPENDENT REVIEWER DID NOT RELEASE (backlog 84e7c3e4): a
+# review completed with `changes` opens no approval, so the request closes
+# here rather than waiting on an approve step that can never become ready.
+# Its own terminal for its own title — a step's title is rendered at
+# materialisation, so one terminal cannot say two reasons — and the same
+# outcome, `refused`, because it is one: the request was turned down. The
+# reason is the reviewer's `findings` on the review step, and the runner's
+# words when the runner is the one that closes it. Led by
+# `steps.review.done`, which a SKIPPED review (every request whose verb
+# asks for none) reads as false, so this never readies on those.
+[[workflow.step]]
+title = "not-released"
+kind = "outcome"
+ready_when = "steps.review.done AND NOT (steps.review.metadata.verdict = \"release\")"
+title_template = "Refused — its independent review asked for changes"
 metadata_defaults = { outcome_kind = "aborted" }
 terminal = { outcome = "refused" }
 
@@ -293,30 +434,34 @@ terminal = { outcome = "refused" }
 # ONLY THE RUNNER WRITES THE RECORD (backlog aa816dd4, LOW-1 of review
 # ea2ecfd4). Required at done stopped a marker ALONE; it did not stop a
 # caller writing the seven keys AND the marker, which closed a request
-# on a plan no runner rendered. `written_by` names the runner's account
-# (ops-runner.sh's ACTOR, held equal to this line by boss-testing's
-# the_nothing_to_do_record_is_written_by_the_runners_account), and the
-# jobs API's step merge door refuses these fields from any OTHER
-# automation or agent session (boss_jobs::written_by). Never a person:
-# David closing a request by hand stays his to do (DR rule 62dac114).
-# It refuses the honest mistake, not a forger — the signer is the
-# self-asserted x-boss-user — and the forger-proof field `writer =
-# "runner:ops"` (design f623e425) replaces it once the runner presents
-# its credential. A runner signing under another BOSS_OPS_ACTOR is
-# refused here and renders the plan for a passkey instead.
+# on a plan no runner rendered. Until row E a `written_by` default named
+# the runner's account and the merge door refused these fields from any
+# OTHER automation or agent session — the honest mistake, not a forger,
+# because the signer it read was the self-asserted x-boss-user.
+#
+# THE FORGER-PROOF WRITER REPLACES IT (row E, backlog 6c9183de; design
+# f623e425). Each of the seven declares `writer = "runner:ops"`, believed
+# only through the credential the runner of THIS request's host
+# presents, so a forger signing as the runner's own account is refused
+# too. It replaces `written_by` rather than sitting beside it: one guard
+# on one record. A person is refused as well now: David closing a
+# request by hand closes the request (its status), which needs no
+# record here, and a runner whose close is refused renders the plan for
+# a passkey instead (ops-runner.sh render_plan), so no request is left
+# open with nobody asked.
 [[workflow.step]]
 title = "nothing-to-do"
 kind = "outcome"
 ready_when = "steps.filed.done AND job.metadata.plan_names_nothing"
 title_template = "Nothing to do — the plan names no change"
-metadata_defaults = { outcome_kind = "skipped", written_by = "automation:ops-runner" }
+metadata_defaults = { outcome_kind = "skipped" }
 terminal = { outcome = "nothing-to-do" }
 fields = [
-    { name = "plan", field_type = "string", required = true },
-    { name = "verb", field_type = "string", required = true },
-    { name = "host", field_type = "string", required = true },
-    { name = "args", field_type = "array", required = true },
-    { name = "rendered_plan_sha256", field_type = "string", required = true },
-    { name = "plan_verb", field_type = "string", required = true },
-    { name = "nothing_to_do", field_type = "string", required = true },
+    { name = "plan", field_type = "string", required = true, writer = "runner:ops" },
+    { name = "verb", field_type = "string", required = true, writer = "runner:ops" },
+    { name = "host", field_type = "string", required = true, writer = "runner:ops" },
+    { name = "args", field_type = "array", required = true, writer = "runner:ops" },
+    { name = "rendered_plan_sha256", field_type = "string", required = true, writer = "runner:ops" },
+    { name = "plan_verb", field_type = "string", required = true, writer = "runner:ops" },
+    { name = "nothing_to_do", field_type = "string", required = true, writer = "runner:ops" },
 ]

@@ -144,7 +144,7 @@ class PublishedDoors(unittest.TestCase):
             self.assertEqual(env["BOSS_MACHINE_TOKEN_HOSTS"], "control.invalid,read.invalid")
 
     def test_cargo_web_and_candidate_cli_go_only_through_the_fixed_worker_controller(self):
-        root = Path("/opt/boss-dev-control/generations/" + "a" * 40)
+        root = Path(self.STORE + "/generations/" + "a" * 40)
         for name in ("wt-cargo", "wt-web"):
             argv, env = self.mod.tool_plan(root, name, ["literal;touch /control"], {})
             self.assertEqual(argv[:4], ["/usr/bin/python3", "-I", str(root / "infra/dev/dev-build.py"), "exec-auto"])
@@ -154,23 +154,91 @@ class PublishedDoors(unittest.TestCase):
         self.assertIn("exec-auto", argv)
         self.assertNotIn(str(root / "bin/boss"), argv)
 
+    # THE ONE SPELLING of the durable store (design a68fc42a D6): the four
+    # doors, the activation door and the CLI's child forwarding each name
+    # it, so they are held equal here (CLAUDE.md §9a) — a door reading an
+    # old root-fs path would see no selector and run candidates locally.
+    STORE = "/work/tools/dev-control"
+    DOORS = ("boss", "boss-api", "wt-cargo", "wt-web")
+
+    def door(self, root, name, extra_env=None, args=("literal;touch /control",)):
+        source = Path(__file__).with_name(name).read_text()
+        self.assertEqual(source.count(self.STORE), 1, name + " spells the store once, in one assignment")
+        entry = root / (name + "-entry")
+        entry.write_text(source.replace(self.STORE, str(root / "store")))
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(root)}
+        env.update(extra_env or {})
+        return subprocess.run(["/bin/bash", str(entry), *args], env=env, capture_output=True, check=False)
+
+    def published(self, root):
+        store = root / "store"
+        store.mkdir()
+        for name in self.DOORS:
+            target = store / name
+            target.write_text('#!/bin/bash\nprintf "published:%s\\n" "$@"\n')
+            target.chmod(0o755)
+        return store
+
+    def test_every_reader_of_the_selector_spells_the_one_durable_store(self):
+        repo = Path(__file__).resolve().parents[2]
+        readers = [Path(__file__).with_name(n) for n in (*self.DOORS, "activate-control.py")]
+        readers.append(repo / "crates/orchestrators/boss-cli/src/door_env.rs")
+        for path in readers:
+            with self.subTest(reader=path.name):
+                text = path.read_text()
+                self.assertIn(self.STORE, text)
+                self.assertNotIn("/etc/boss-dev-control", text)
+                self.assertNotIn("/opt/boss-dev-control", text)
+
     def test_each_source_door_routes_before_reading_candidate_state(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            marker = root / "enabled"
-            marker.write_text("reviewed generation")
-            for name in ("boss", "boss-api", "wt-cargo", "wt-web"):
+            store = self.published(root)
+            (store / "enabled").symlink_to(store / "generations" / ("a" * 40))
+            for name in self.DOORS:
                 with self.subTest(door=name):
-                    target = root / name
-                    target.write_text('#!/bin/bash\nprintf "published:%s\\n" "$@"\n')
-                    target.chmod(0o755)
-                    source = Path(__file__).with_name(name).read_text()
-                    source = source.replace("/etc/boss-dev-control/enabled", str(marker)).replace("/opt/boss-dev-control/" + name, str(target))
-                    entry = root / (name + "-entry")
-                    entry.write_text(source)
-                    result = subprocess.run(["/bin/bash", str(entry), "literal;touch /control"], env={"PATH":"/usr/bin:/bin", "HOME":str(root)}, capture_output=True, check=False)
+                    result = self.door(root, name)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, b"published:literal;touch /control\n")
+
+    def test_a_refused_selector_stops_candidate_doors_and_keeps_trusted_reads(self):
+        # Design a68fc42a D1 (David, 2026-10-10): when activation cannot be
+        # re-established the selector is REFUSED, and candidate execution
+        # stops with 75 naming the activation log, while boss-api and the
+        # published CLI keep answering — the operator keeps the record.
+        for shape in ("refused", "regular-file", "foreign-link"):
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                store = self.published(root)
+                if shape == "refused":
+                    (store / "enabled").symlink_to("refused")
+                elif shape == "regular-file":
+                    (store / "enabled").write_text("not a generation")
+                else:
+                    (store / "enabled").symlink_to(root / "elsewhere" / ("a" * 40))
+                for name in ("wt-cargo", "wt-web"):
+                    result = self.door(root, name)
+                    self.assertEqual(result.returncode, 75, (name, result.stderr))
+                    self.assertNotIn(b"published:", result.stdout)
+                    self.assertIn(str(store / "activation.log").encode(), result.stderr)
+                for extra, args in (({}, ("--built", "--version")), ({"BOSS_SHIM_BUILT": "1"}, ("--version",))):
+                    result = self.door(root, "boss", extra, args)
+                    self.assertEqual(result.returncode, 75, (extra, result.stderr))
+                    self.assertIn(str(store / "activation.log").encode(), result.stderr)
+                # Trusted reads fall through to the local door. A candidate
+                # build in the target is never run, not even for --version.
+                candidate = root / "scratch/target/debug/boss"
+                candidate.parent.mkdir(parents=True)
+                ran = root / "candidate-ran"
+                candidate.write_text("#!/bin/sh\ntouch '" + str(ran) + "'\necho 'boss 0.1.0 built from unknown'\n")
+                candidate.chmod(0o755)
+                result = self.door(root, "boss", {"BOSS_JOBS_URL": "http://sor.invalid:7900", "BOSS_SHIM_IMAGE_STORE": str(root / "no-image"), "BOSS_SHIM_TARGET_ROOT": str(root / "scratch")}, ("orient",))
+                self.assertNotIn(result.returncode, (0, 75), result.stderr)
+                self.assertNotIn(b"published:", result.stdout)
+                self.assertFalse(ran.exists(), "a refused selector must not run a candidate build, even to read its version")
+                result = self.door(root, "boss-api")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(b"usage: boss-api", result.stderr, "boss-api ran locally and answered")
 
 
 if __name__ == "__main__":

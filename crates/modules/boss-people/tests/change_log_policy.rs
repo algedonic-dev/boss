@@ -44,7 +44,6 @@ fn build_app(pool: PgPool, policy: Option<Arc<dyn PolicyClient>>) -> Router {
         people,
         publisher: None,
         policy,
-        subject_kinds: None,
         clock,
     }))
 }

@@ -1,0 +1,18 @@
+# Approved root-owned GCP tree transport (db018094 q1). Source declaration
+# only: registry publication and human scope/enrollment remain separate.
+[[rule]]
+name = "broker-prepares-the-root-tree-deposit-key"
+why = """
+EXTERNAL GLUE: root on boss-gcp fetches Forgejo main with a broker-minted
+read-only credential. A separate fixed-purpose transport pair delivers
+that credential to its root-owned receiver. Existing preparation orders
+human scope, broker pair preparation, and signed receiver enrollment.
+This rule writes only the named transport Secret and public evidence;
+it neither enrolls the key nor delivers a credential nor revokes one.
+"""
+on_event = "step.done.credential-rotation"
+when = 'subject_id = "root-tree-deposit-key"'
+version = 1
+[[rule.do]]
+handler = "credential.prepare.ssh-deposit"
+args = { secret_namespace = "\"boss\"", secret_name = "\"root-tree-deposit-key\"", credential_id = "\"root-tree-deposit-key\"", protocol_kind = "\"prepare-the-root-tree-deposit-key\"", receiver_host = "\"boss-gcp\"", purpose = "\"root-tree credential deposit\"", forced_command = "\"exec sudo -n /usr/local/libexec/boss/root-tree-delivery/infra/gcp/root-tree-token-recv.sh\"" }

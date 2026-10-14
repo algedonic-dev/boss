@@ -86,6 +86,23 @@ pub enum AgentsError {
 
 #[async_trait]
 pub trait AgentsRegistry: Send + Sync {
+    fn try_lock_selection_rows(
+        &self,
+    ) -> Result<Option<Box<dyn AgentSelectionRows + '_>>, AgentsError> {
+        Err(AgentsError::Storage(
+            "agent owner cannot acquire selection without blocking".into(),
+        ))
+    }
+    /// Acquire the actual agent/alias writer boundary before any commit.
+    /// The returned guard keeps it held until the selector drops it. No owner
+    /// callback can commit twice or report a new failure after effects.
+    /// A remote read or a second list is not a commit fence.
+    fn lock_selection_rows(&self) -> Result<Box<dyn AgentSelectionRows + '_>, AgentsError> {
+        Err(AgentsError::Storage(
+            "agent owner cannot fence native selection".into(),
+        ))
+    }
+
     /// The registered actor id this login signs as, or `None` when no
     /// alias maps it. `None` is an answer — the door treats it as an
     /// unresolved login, which during the migration window is admitted
@@ -148,6 +165,13 @@ pub trait AgentsRegistry: Send + Sync {
         rows: &[AutomationActor],
         stamp: &EventStamp,
     ) -> Result<AutomationsSeedOutcome, AgentsError>;
+}
+
+/// Complete rows observed while the actual owner writer guard remains held.
+/// Acquisition errors precede effects; dropping the guard is infallible.
+pub trait AgentSelectionRows {
+    fn rows(&self) -> &[AgentRow];
+    fn automations(&self) -> &[AutomationActor];
 }
 
 /// Build the `automation.declared` event for one inserted row: the row

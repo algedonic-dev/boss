@@ -120,7 +120,7 @@ impl Host {
         write_exec(
             &bin.join("getent"),
             &format!(
-                "{pre}if [ \"$1\" = passwd ] && [ \"$last\" = {ACCOUNT} ]; then\n  [ -f \"$S/uid\" ] || exit 2\n  echo \"{ACCOUNT}:x:$(cat \"$S/uid\"):$(cat \"$S/gid\")::/nonexistent:$(cat \"$S/shell\")\"\n  exit 0\nfi\nPATH=\"$REAL\" exec getent \"$@\"\n"
+                "{pre}if [ \"$1\" = passwd ] && [ \"$last\" = {ACCOUNT} ]; then\n  [ -f \"$S/uid\" ] || exit 2\n  echo \"{ACCOUNT}:x:$(cat \"$S/uid\"):$(cat \"$S/gid\")::/nonexistent:$(cat \"$S/shell\")\"\n  exit 0\nfi\nif [ \"$1\" = passwd ] && [ -f \"$S/owner-passwd\" ]; then cat \"$S/owner-passwd\"; exit 0; fi\nPATH=\"$REAL\" exec getent \"$@\"\n"
             ),
         );
         write_exec(
@@ -185,6 +185,11 @@ impl Host {
         self.dir.join("run/probe-account.verified")
     }
 
+    /// What a tick that wrote no marker left beside it: its reason.
+    fn why(&self) -> PathBuf {
+        self.dir.join("run/probe-account.verified.why")
+    }
+
     /// One runner tick's ExecStartPre.
     fn tick(&self) -> (i32, String) {
         let o = self.command("verify-tick").output().unwrap();
@@ -220,6 +225,10 @@ impl Host {
             .env("INSTALL_PROBE_CLI", self.dir.join("boss-cli"))
             .env("INSTALL_PROBE_MARKER", self.marker())
             .env("BOSS_PROBE_VERIFIED_FILE", self.marker())
+            // What the account must not reach: nothing, unless a test
+            // names it. On one uid "the account" is this process, which
+            // reaches its own home; the reach legs below say otherwise.
+            .env("PROBE_TICK_REACH", "")
             .env("BOSS_RUN_SUMMARY_FILE", self.dir.join("summary.json"))
             .env_remove("BOSS_FORGE_REPO_DIR");
         c
@@ -1120,6 +1129,294 @@ fn a_root_primary_group_stops_probes_and_an_unlocked_account_is_locked() {
         read(&h.dir.join("summary.json")).contains("(locked)"),
         "{out}"
     );
+}
+
+// ── what the tick says, and what the converge says it does ────────────
+//
+// Review acab446c F3, F5, F7 (backlog dda26693).
+
+/// F3. A tick that writes no marker leaves its REASON beside it, root's
+/// alone, and a tick that writes the marker leaves none — so the refusal
+/// a car records (boss-cli prove.rs reads it) names the tick's own cause:
+/// its 30 s fetch, a drift, the marker itself. Until this it was said
+/// only on the runner's journal, and the car's refusal sent its reader to
+/// the converge packet, which can read verified while ticks fail.
+#[test]
+fn a_tick_that_refuses_leaves_its_reason_beside_the_marker() {
+    let (h, one) = verified("why");
+    assert!(!h.why().exists(), "a tick that held: {}", read(&h.why()));
+
+    // A cause only a tick has: the converge verified, this fetch fails.
+    land(&h, "two.txt");
+    let no_serve = h.dir.join("bin/owner-serves-nothing");
+    write_exec(
+        &no_serve,
+        "#!/bin/sh\n[ \"$2\" = upload-pack ] && exit 1\nexec \"$@\"\n",
+    );
+    let t = tick_with(&h, &[("PROBE_SOURCE_RUNAS", &no_serve)]);
+    assert_no_marker_over(&h, &t, "refresh-view FAILED — fetching", &one);
+    let said = read(&h.why());
+    assert!(said.contains("NO PROBE RUNS THIS TICK"), "{said}");
+    // The cause itself, not "the line above", which a file has none of.
+    assert!(said.contains("refresh-view FAILED — fetching"), "{said}");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(h.why()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "the reason is root's alone: {mode:o}");
+    }
+
+    // A drift the account's verify finds; the last tick's reason does not
+    // outlive this one.
+    write_file(&h.state.join("shell"), "/bin/bash\n");
+    let (rc, out) = h.tick();
+    assert_eq!(rc, 1, "{out}");
+    let said = read(&h.why());
+    assert!(said.contains("shell is /bin/bash"), "{said}");
+    assert!(!said.contains("refresh-view"), "{said}");
+
+    // The marker that cannot be cleared says so in the same place.
+    let stuck = h.dir.join("run/stuck.verified");
+    create_dir(&stuck);
+    write_file(&stuck.join("kept"), "");
+    let (rc, out) = tick_with(&h, &[("BOSS_PROBE_VERIFIED_FILE", &stuck)]);
+    assert_eq!(rc, 1, "{out}");
+    assert!(
+        read(&h.dir.join("run/stuck.verified.why")).contains("could not be removed"),
+        "{out}"
+    );
+
+    // The control: the drift repaired, the tick holds and the reason goes.
+    write_file(&h.state.join("shell"), "/usr/sbin/nologin\n");
+    let (rc, out) = h.tick();
+    assert_eq!(rc, 0, "{out}");
+    assert!(h.marker().exists(), "{out}");
+    assert!(!h.why().exists(), "{}", read(&h.why()));
+}
+
+/// F7. The converge's packet line said STOPPED whenever any repair
+/// failed — `prepare && verify_now` — while verify-tick, which repairs
+/// nothing, still verified the account and wrote the marker: the packet
+/// said stopped while probes ran. A repair verify does not read (the
+/// cron and at denials, the process bound) no longer stops the rest of
+/// the converge; the account is asked whatever the repairs returned; and
+/// the line says what the tick will do. The converge stays red.
+#[test]
+fn a_converge_whose_repair_fails_while_the_account_verifies_does_not_say_stopped() {
+    let h = Host::new("repair-fails").exists();
+    // The process bound cannot be written (its name is a directory).
+    create_dir(&h.dir.join("hostetc/security/limits.d/boss-probe.conf"));
+    let (rc, out) = h.ensure();
+    assert_eq!(rc, 1, "a repair that did not land is red: {out}");
+    let summary = read(&h.dir.join("summary.json"));
+    assert!(!summary.contains("STOPPED"), "{summary}");
+    assert!(!out.contains("PROBES ARE STOPPED"), "{out}");
+    assert!(
+        summary.contains("NOT REPAIRED: could not write the process bound"),
+        "{summary}"
+    );
+    assert!(summary.contains("still runs probes"), "{summary}");
+    // The repairs after it still ran: the view, and the denials.
+    assert_eq!(
+        read(&h.dir.join("hostetc/cron.deny")),
+        format!("{ACCOUNT}\n")
+    );
+    assert_dropin_stops(&h);
+    // And the line is true: the next tick writes the marker.
+    let (rc, out) = h.tick();
+    assert_eq!(rc, 0, "{out}");
+    assert!(h.marker().exists(), "{out}");
+
+    // A denial that cannot be written, the same way.
+    let h = Host::new("deny-fails").exists();
+    create_dir(&h.dir.join("hostetc/cron.deny"));
+    let (rc, out) = h.ensure();
+    assert_eq!(rc, 1, "{out}");
+    let summary = read(&h.dir.join("summary.json"));
+    assert!(
+        summary.contains("NOT REPAIRED: could not add boss-probe to"),
+        "{summary}"
+    );
+    assert!(!summary.contains("STOPPED"), "{summary}");
+    assert_eq!(h.tick().0, 0);
+
+    // The control: a repair failure the account's verify DOES read is
+    // still STOPPED, and the converge's own cause leads.
+    let h = Host::new("repair-and-verify-fail");
+    write_file(&h.state.join("useradd-fails"), "");
+    let (rc, out) = h.ensure();
+    assert_eq!(rc, 1, "{out}");
+    let summary = read(&h.dir.join("summary.json"));
+    assert!(
+        summary.contains("STOPPED: useradd could not create"),
+        "{summary}"
+    );
+}
+
+/// F5. The tick verified identity and the view, not REACH: whether the
+/// account can open what it must not — the checkout owner's home, a
+/// docker socket, a token path — was measured only by the controls verb,
+/// which does not gate. Now each tick asks, in one call as the account,
+/// and a path it can read or write stops probes and is named.
+#[test]
+fn a_tick_where_the_account_reaches_what_it_must_not_stops_probes() {
+    let (h, _) = verified("reach");
+    let home = h.dir.join("owner-home");
+    create_dir(&home);
+    let absent = h.dir.join("no-such-socket");
+
+    // Nothing there to reach is not reached.
+    let (rc, out) = tick_with(&h, &[("PROBE_TICK_REACH", &absent)]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(h.marker().exists(), "{out}");
+
+    // On one uid "the account" is this process, which reads what it made.
+    let list = format!("{} {}", absent.display(), home.display());
+    let o = h
+        .command("verify-tick")
+        .env("PROBE_TICK_REACH", &list)
+        .output()
+        .unwrap();
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("NO PROBE RUNS THIS TICK"), "{out}");
+    assert!(
+        out.contains(&format!("{ACCOUNT} can reach {}", home.display())),
+        "{out}"
+    );
+    assert!(!out.contains(&absent.display().to_string()), "{out}");
+    assert!(!h.marker().exists(), "{out}");
+
+    // Silence is not a pass: the one call that asks cannot run as the
+    // account, so nothing was asked.
+    let mute = h.dir.join("bin/runas-without-sh");
+    write_exec(
+        &mute,
+        &format!(
+            "#!/bin/sh\n[ \"$1\" = sh ] && exit 1\nexec {} \"$@\"\n",
+            h.dir.join("bin/fake-runas").display()
+        ),
+    );
+    let o = h
+        .command("verify-tick")
+        .env("PROBE_RUNAS", &mute)
+        .env("PROBE_TICK_REACH", &absent)
+        .output()
+        .unwrap();
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("could not ask what"), "{out}");
+    assert!(!h.marker().exists(), "{out}");
+}
+
+/// F8b. The door launches every probe as `runuser -u <account> --
+/// setpriv --no-new-privs bash -c …` (prove.rs `NO_NEW_PRIVS`), so no
+/// setuid binary on the host lifts car text above the account. A host
+/// whose setpriv is missing or cannot set the flag would answer every
+/// probe with exit 127 or 1 — NOT PROVEN on correct code — so the tick
+/// asks the account to run the same words and read the flag back, and a
+/// launch that cannot is no marker, with the reason beside it. The words
+/// themselves are held equal to prove.rs's there.
+#[test]
+fn a_tick_whose_account_cannot_set_no_new_privs_stops_probes() {
+    let (h, _) = verified("no-new-privs");
+    let path_with = |stub: &str| {
+        let dir = h.dir.join(format!("setpriv-{stub}"));
+        create_dir(&dir);
+        write_exec(&dir.join("setpriv"), stub_setpriv(stub));
+        format!(
+            "{}:{}:{}",
+            dir.display(),
+            h.dir.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        )
+    };
+    let tick_on = |path: &str| {
+        let o = h.command("verify-tick").env("PATH", path).output().unwrap();
+        (o.status.code().unwrap_or(-1), text(&o))
+    };
+
+    // A setpriv that refuses the flag.
+    let (rc, out) = tick_on(&path_with("refuses"));
+    assert_eq!(rc, 1, "{out}");
+    assert!(out.contains("NO PROBE RUNS THIS TICK"), "{out}");
+    assert!(out.contains("no_new_privs"), "{out}");
+    assert!(!h.marker().exists(), "{out}");
+    assert!(read(&h.why()).contains("no_new_privs"), "{out}");
+
+    // One that runs the command and never sets it: the flag is read back,
+    // so a launch that only looks like one is not a pass. Where this box
+    // already runs with the flag set (a pod with allowPrivilegeEscalation:
+    // false), the read cannot tell the two apart and the leg says so.
+    let already = read(Path::new("/proc/self/status"))
+        .lines()
+        .any(|l| l.split_whitespace().collect::<Vec<_>>() == ["NoNewPrivs:", "1"]);
+    let (rc, out) = tick_on(&path_with("ignores"));
+    if already {
+        eprintln!(
+            "the ignoring setpriv leg is NOT RUN here: this process already has no_new_privs"
+        );
+        assert_eq!(rc, 0, "{out}");
+    } else {
+        assert_eq!(rc, 1, "{out}");
+        assert!(out.contains("no_new_privs"), "{out}");
+        assert!(!h.marker().exists(), "{out}");
+    }
+
+    // The control: the real setpriv, and the tick writes its marker.
+    let (rc, out) = h.tick();
+    assert_eq!(rc, 0, "{out}");
+    assert!(h.marker().exists(), "{out}");
+}
+
+/// A stand-in setpriv: `refuses` fails the way a kernel without the
+/// prctl does; `ignores` drops its flags and runs the command anyway.
+fn stub_setpriv(how: &str) -> &'static str {
+    match how {
+        "refuses" => {
+            "#!/bin/sh\necho 'setpriv: disallow granting new privileges failed: Invalid argument' >&2\nexit 1\n"
+        }
+        _ => "#!/bin/sh\nwhile [ \"${1#--}\" != \"$1\" ]; do shift; done\nexec \"$@\"\n",
+    }
+}
+
+/// What the tick tries when no test names it: the checkout owner's home
+/// (read off the passwd entry of whoever owns the checkout) and the paths
+/// the controls walk — one list, so the two cannot drift.
+#[test]
+fn the_tick_tries_the_checkout_owners_home_by_default() {
+    let (h, _) = verified("reach-default");
+    let home = h.dir.join("home-of-the-owner");
+    create_dir(&home);
+    write_file(
+        &h.state.join("owner-passwd"),
+        &format!(
+            "owner:x:{uid}:{uid}::{}:/bin/sh\n",
+            home.display(),
+            uid = 4343
+        ),
+    );
+    let o = h
+        .command("verify-tick")
+        .env_remove("PROBE_TICK_REACH")
+        .output()
+        .unwrap();
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains(&format!("{ACCOUNT} can reach")) && out.contains(&home.display().to_string()),
+        "{out}"
+    );
+    assert!(!h.marker().exists(), "{out}");
+    // And the converge says STOPPED for it, naming the same path.
+    let o = h
+        .command("ensure")
+        .env_remove("PROBE_TICK_REACH")
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    let summary = read(&h.dir.join("summary.json"));
+    assert!(summary.contains("STOPPED"), "{summary}");
+    assert!(summary.contains(&home.display().to_string()), "{summary}");
 }
 
 // ── the kernel's own answers: root with a second uid ──────────────────

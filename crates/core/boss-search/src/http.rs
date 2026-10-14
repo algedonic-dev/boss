@@ -108,12 +108,11 @@ mod tests {
     /// pool is lazy and never reached, because scope is decided first.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_policy_outage_answers_503_with_retry_after_and_no_address() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dark = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
+        // Held, not bound and released (review 465e723f F3).
+        let dark = boss_testing::dark_port();
         let app = router(SearchApiState {
             pool: sqlx::PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").unwrap(),
-            policy: Arc::new(ReqwestPolicyClient::new("search", dark)),
+            policy: Arc::new(ReqwestPolicyClient::new("search", dark.base.clone())),
         });
         let resp = app
             .oneshot(

@@ -38,6 +38,7 @@ use std::process::Command;
 const SWITCH: &str = "/work/home/.config/boss/drain-on-boot";
 const PROMPT: &str = "/work/boss/infra/dev/drain.md";
 const BOOT_LOG: &str = "/work/ssh/postStart.log";
+const MISSING_PROMPT_NOTICE: &str = "The drain did not resume: drain-on-boot is on, but neither origin/main:infra/dev/drain.md nor the checkout copy could be read as a non-empty prompt. Report this failure to David. Do not claim that backlog work resumed or infer new permission to repair or activate it.";
 
 fn manifest() -> String {
     std::fs::read_to_string(repo_root().join("infra/cluster/manifests/boss-dev.yaml"))
@@ -242,11 +243,11 @@ fn the_prompt_survives_shell_metacharacters() {
 }
 
 #[test]
-fn a_switch_with_no_prompt_file_starts_the_session_idle_rather_than_empty() {
+fn a_switch_with_no_prompt_file_starts_with_a_failure_notice_rather_than_idle() {
     assert_eq!(
         boot(true, None),
-        ["--remote-control", "boss-dev"],
-        "a missing drain.md must not become an empty first prompt"
+        ["--remote-control", "boss-dev", MISSING_PROMPT_NOTICE],
+        "e5cb7c6e: missing prompt must reach the session, not only its boot log"
     );
 }
 
@@ -314,13 +315,25 @@ fn without_origin_the_checkouts_copy_is_the_prompt_and_the_log_says_so() {
 #[test]
 fn a_switch_with_no_readable_prompt_says_so_loudly_in_the_boot_log() {
     let booted = boot_with(true, None, None);
-    assert_eq!(booted.argv, ["--remote-control", "boss-dev"]);
+    assert_eq!(
+        booted.argv,
+        ["--remote-control", "boss-dev", MISSING_PROMPT_NOTICE]
+    );
     assert!(
         booted
             .log
             .contains("dev session: DRAIN-ON-BOOT IS ON BUT NO DRAIN PROMPT COULD BE READ"),
         "an ON switch with no prompt is loud in postStart.log:\n{}",
         booted.log
+    );
+}
+
+#[test]
+fn an_empty_drain_prompt_also_reports_failure_as_one_argument() {
+    assert_eq!(
+        boot(true, Some("")),
+        ["--remote-control", "boss-dev", MISSING_PROMPT_NOTICE],
+        "an empty readable file cannot silently resume work or start idle"
     );
 }
 

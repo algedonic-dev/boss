@@ -61,10 +61,6 @@ const BY_DESIGN: &[(&str, &str)] = &[
         "in-cluster non-holder: the gate runs a car's own code, so whether it may hold the token is the decision owed before enforce (2710c8fc before_enforce)",
     ),
     (
-        "infra/cluster/dev-scratch-reclaim.sh",
-        "the dev pod's sidecar: the pod's token is moving behind an uncredentialed worker (design c395e62c), decided with that isolation",
-    ),
-    (
         "infra/forge/probe-bin/boss-sor-read",
         "the recorded probe's reader runs car-supplied shell on the forge and must not hold the estate token; its own reader door is backlog d26515c5",
     ),
@@ -93,32 +89,24 @@ const BY_DESIGN_DIRS: &[&str] = &["infra/lint/"];
 /// …`, held by `each_owed_entry_says_what_removes_it`), so the list
 /// cannot become a place a sender is simply left.
 ///
-/// Three remain (measured 2026-10-08 on origin/main 07dc168f1 and on the
-/// live record). Two for one reason: each is run by a unit whose
-/// ExecStart is a copy installed BY HAND at /usr/local/lib/boss, outside
-/// any checkout, so `../lib/secret-header.sh` is not beside it; neither
-/// unit is in a role of infra/estate/roles.toml; and neither identity
-/// appears once in 72 hours of `machine_gate.would_refuse` facts.
-/// Stamping the tree's copy would turn this pin green over an installed
-/// copy that presents nothing. The third is the one of the three that
-/// IS on the live record, and it is held back by a binding, not by an
-/// install: see its entry. The three other files of the roster car
+/// None remain (2026-10-10). The three other files of the roster car
 /// 217c2d66 left were stamped on 2026-10-08 (backlog 44b2087e):
 /// discover-admission-source.sh, the ML batch and the Python token audit.
-const NOT_YET: &[(&str, &str)] = &[
-    (
-        "infra/codebase-observe/observe-codebase.sh",
-        "its unit runs a copy installed by hand at /usr/local/lib/boss/observe-codebase.sh, with no reader lib beside it; in no role of infra/estate/roles.toml and on no host (0 would-refuse facts as automation:observe-codebase in 72 hours to 2026-10-08, 0 packets on 2026-10-07). Leaves this list when its unit's ExecStart is the checkout's own copy under a role (then it is stamped like infra/codebase-metrics.sh, one call before its one POST), or when the script and its unit are deleted",
-    ),
-    (
-        "infra/forge/probe-admission-source-access.sh",
-        "runs on the forge under the ops runner (root, the token readable) and is on the live record: 1 would-refuse fact as automation:probe-admission-source-access, GET /api/estate/nodes, 2026-10-05T18:43Z. Not stamped here because its bytes and every file it sources are a BOUND METHOD of design f927de0c: infra/forge/admission-reader-identity.py METHODS hashes this script as `host` and holds its consumed closure equal to the table (admission-identity-test.py test_method_table_equals_the_derived_consumed_closure went red the moment this script sourced the reader), so the stamp changes the identity that design's independent source review is to release. Leaves this list when a car under design f927de0c stamps it exactly as discover-admission-source.sh is stamped (one reader call before the read, the header file closed right after it) AND adds ../lib/secret-header.sh to METHODS, so the reviewed identity is the stamped one",
-    ),
-    (
-        "infra/install-smoke/nightly.sh",
-        "as observe-codebase.sh: a hand-installed copy at /usr/local/lib/boss/install-smoke-nightly.sh with no reader lib beside it, in no role and on no host (0 would-refuse facts as automation:install-smoke in 72 hours to 2026-10-08); and its two requests are sent from inside its EXIT trap, the one shape the reader's own cleanup cannot serve without secret_header_close. Leaves this list when its unit's ExecStart is the checkout's own copy under a role (then both requests are stamped and the trap calls secret_header_close after the second, as cluster-deploy-lib.sh answer_converge_requests does), or when the script and its unit are deleted",
-    ),
-];
+/// Two more were listed here until 2026-10-10 —
+/// infra/codebase-observe/observe-codebase.sh and
+/// infra/install-smoke/nightly.sh, each run by a unit whose ExecStart
+/// was a copy installed BY HAND at /usr/local/lib/boss — and were
+/// deleted with their units rather than stamped (see
+/// `no_unit_runs_a_hand_installed_copy`). A third was listed until
+/// 2026-10-10 — infra/forge/probe-admission-source-access.sh, the one on
+/// the live record (2 would-refuse facts in the 7 days to 2026-10-10, the
+/// last 2026-10-05T18:43Z), held back because its bytes are a bound
+/// method of design f927de0c. That design folded, and the script is
+/// stamped as discover-admission-source.sh is, with
+/// ../lib/secret-header.sh bound in
+/// infra/forge/admission-reader-identity.py METHODS, so the reviewed
+/// identity is the stamped one; both halves of this pin now judge it.
+const NOT_YET: &[(&str, &str)] = &[];
 
 /// Files this pin holds by NAME as well, because their request signs
 /// nothing and the derivation above cannot see them.
@@ -138,8 +126,18 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Shell by NAME. `.bash` and `.inc` are here because a sourced fragment
+/// carries no `#!` line, so under either name it was no shell file at all
+/// to both halves of this pin (backlog 7369b078, F5 of review 9c484ca8;
+/// none exists under infra/ on 2026-10-09 — the first one is read from
+/// its first commit).
+const SHELL_EXTENSIONS: &[&str] = &["sh", "bash", "inc"];
+
 fn is_shell(path: &Path, text: &str) -> bool {
-    if path.extension().is_some_and(|x| x == "sh") {
+    if path
+        .extension()
+        .is_some_and(|x| SHELL_EXTENSIONS.iter().any(|s| x == *s))
+    {
         return true;
     }
     path.extension().is_none()
@@ -297,6 +295,60 @@ fn each_owed_entry_says_what_removes_it() {
              write `Leaves this list when …` into its reason"
         );
     }
+}
+
+/// No unit in the tree runs a copy installed BY HAND at
+/// /usr/local/lib/boss (backlog 44b2087e R1, 2026-10-10). Such a copy
+/// sits outside every checkout, so `../lib/secret-header.sh` is not
+/// beside it and no stamp in the tree's copy reaches what runs; no
+/// converge installs it, so no role in infra/estate/roles.toml places
+/// it on a host. Two such units were the last NOT_YET debts of that
+/// shape — observe-codebase (scope `codebase`: 0 estate observations on
+/// the record, against 10178 for `host-units`, read 2026-10-10T00:58Z)
+/// and the install smoke (`docker compose` on boss-gcp, which has no
+/// container runtime, per .forgejo/workflows/install-smoke.yml) — and
+/// neither appeared once in 7 days of machine-gate would-refuse facts.
+/// They were deleted rather than stamped. A sender that must run on a
+/// host runs the checkout's copy under a role, as
+/// infra/codebase-metrics.sh does.
+#[test]
+fn no_unit_runs_a_hand_installed_copy() {
+    let mut files = Vec::new();
+    walk(&repo_root().join("infra"), &mut files);
+    let units: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|x| x == "service"))
+        .collect();
+    assert!(
+        units.len() >= 20,
+        "found {} unit files under infra/ — the walk has stopped seeing the tree",
+        units.len()
+    );
+    let root = repo_root();
+    let offenders: Vec<String> = units
+        .iter()
+        .flat_map(|u| {
+            let rel = u
+                .strip_prefix(&root)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            std::fs::read_to_string(u)
+                .unwrap_or_default()
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| l.starts_with("Exec") && l.contains("/usr/local/lib/boss/"))
+                .map(|(i, l)| format!("{rel}:{}: {l}", i + 1))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "these units run a copy installed by hand at /usr/local/lib/boss, outside any \
+         checkout: no stamp in the tree reaches it and no role places it on a host. Run the \
+         checkout's own copy under a role of infra/estate/roles.toml, or delete the unit and \
+         its script:\n  {}",
+        offenders.join("\n  ")
+    );
 }
 
 // =====================================================================
@@ -561,6 +613,26 @@ fn an_unstamped_python_sender_is_refused() {
 // request goes to — the reader decides the host once, where it is
 // called. The two senders measured live are also run against a stub,
 // request by request (`ops_runner_sh.rs`, `read_publish_checks_sh.rs`).
+//
+// THAT LIST WAS SHORTER THAN THE TRUTH (backlog 7369b078, F5 of review
+// 9c484ca8, which found six more and none of them in the tree). Closed
+// on 2026-10-09, each with a planted case below: a name given a curl by
+// `${N:=…}`, `N=$(command -v curl)`, `printf -v N` or `read N <<<`; a
+// curl that is only a parameter's default (`"${DOOR:-curl}"`); curl as
+// xargs's command, where nothing follows the word; a fragment named
+// `.bash` or `.inc`; and a unit's own `Exec…=` line (the section A UNIT
+// RUNS NO REQUEST OF ITS OWN). STILL UNSEEN, and written here so green
+// is not read as more: a name filled by `read` from a file or a pipe, by
+// `eval`, by `declare`/`local -n`, or by a loop variable (`for c in curl;
+// do "$c" …`); a curl word built at run time (`"cu${x}rl"`, `$(echo
+// curl)`); xargs given its command through `sh -c`; `env`, `timeout`,
+// `nice` or `sudo` in front of a NAME that is one of the unseen kinds
+// (in front of the word curl itself they change nothing — the word is
+// still read); a shell file with no `#!` line under an extension
+// SHELL_EXTENSIONS does not name, or embedded in a heredoc of a file
+// that is not shell (a Dockerfile `RUN`, a Python string); and a unit
+// file that is not `.service` (a `.timer` runs no command; a drop-in
+// `.conf` could).
 
 /// One roster entry: in `file`, at most `sends` unstamped sends on
 /// commands whose text holds `needle`.
@@ -583,6 +655,18 @@ const fn site(file: &'static str, needle: &'static str, sends: usize, why: &'sta
 /// Sends that do not go to a gated service port: another party's API, a
 /// download, a registry, a local stack, or a path the gate exempts.
 const NOT_THE_ESTATE: &[Site] = &[
+    site(
+        "infra/gcp/adopt-root-tree.sh",
+        "\"$BOSS_FORGE_URL/api/v1/repos/david/boss\"",
+        1,
+        "Forgejo repository authentication with its scoped broker token; the estate machine token must not be sent to Forgejo. Lifecycle reads in this file remain stamped.",
+    ),
+    site(
+        "infra/gcp/root-tree-token-recv.sh",
+        "\"$BOSS_FORGE_URL/api/v1/repos/david/boss\"",
+        1,
+        "Forgejo repository authentication with the staged read-only broker token; this receiver must not hold or send the estate machine token",
+    ),
     site(
         "infra/forge/publish-github-pr.sh",
         "\"$GITHUB_API/repos/$MIRROR_SLUG/$1\"",
@@ -625,11 +709,28 @@ const NOT_THE_ESTATE: &[Site] = &[
         1,
         "the recorded probe's read of the gateway's public port, which carries nothing that says who asks",
     ),
+    // One entry per destination, each needle the URL argument as the
+    // file spells it. Until 2026-10-09 this was one entry of three sends
+    // whose needle was curl and its flags (`"$($CURL -sS -m 15`), as were
+    // journal-read.sh's and move-forgejo-data.sh's below (7369b078 F5);
+    // `every_roster_needle_names_a_destination_or_a_credential` holds it.
     site(
         "infra/forge/ci-image-report.sh",
-        "\"$($CURL -sS -m 15",
-        3,
-        "the forge's container registry: its ping, its token endpoint and a tag read",
+        "\"$REGISTRY_URL/v2/\"",
+        1,
+        "the forge's container registry: its ping",
+    ),
+    site(
+        "infra/forge/ci-image-report.sh",
+        "\"$turl\"",
+        1,
+        "the forge's container registry: the token endpoint its ping named, for an anonymous pull token",
+    ),
+    site(
+        "infra/forge/ci-image-report.sh",
+        "\"$murl\"",
+        1,
+        "the forge's container registry: a tag read, with the registry's own pull token",
     ),
     site(
         "infra/forge/github-act.sh",
@@ -645,9 +746,21 @@ const NOT_THE_ESTATE: &[Site] = &[
     ),
     site(
         "infra/forge/journal-read.sh",
-        "curl -s -m",
-        3,
-        "a host's systemd-journal-gatewayd, not a service port",
+        "\"${BASE}/machine\"",
+        1,
+        "a host's systemd-journal-gatewayd, not a service port: its /machine cutoff",
+    ),
+    site(
+        "infra/forge/journal-read.sh",
+        "\"${BASE}/entries\"",
+        1,
+        "a host's systemd-journal-gatewayd: the one tail entry of the freshness read",
+    ),
+    site(
+        "infra/forge/journal-read.sh",
+        "\"Range: entries=:-${COUNT}:${COUNT}\" \"$url\"",
+        1,
+        "a host's systemd-journal-gatewayd: the entries the caller asked for ($url is ${BASE}/entries and its filters)",
     ),
     site(
         "infra/forge/locomotive.sh",
@@ -657,9 +770,21 @@ const NOT_THE_ESTATE: &[Site] = &[
     ),
     site(
         "infra/forge/move-forgejo-data.sh",
-        "code=$(curl -sS --max-time",
-        3,
-        "the forge's own healthz and its container registry",
+        "\"$HEALTHZ\"",
+        1,
+        "the forge's own healthz",
+    ),
+    site(
+        "infra/forge/move-forgejo-data.sh",
+        "\"http://$REG_HOST/v2/token?service=container_registry\"",
+        1,
+        "the forge's container registry: its token endpoint",
+    ),
+    site(
+        "infra/forge/move-forgejo-data.sh",
+        "\"http://$REG_HOST/v2/$REG_OWNER/$REG_NAME/manifests/$1\"",
+        1,
+        "the forge's container registry: one manifest",
     ),
     site(
         "infra/forge/offsite-push.sh",
@@ -678,6 +803,12 @@ const NOT_THE_ESTATE: &[Site] = &[
         "-K \"$cfg\"",
         1,
         "the forge's package registry",
+    ),
+    site(
+        "infra/forge/registry-token-deposit.sh",
+        "\"$REG_URL/v2/token?service=container_registry\"",
+        1,
+        "the forge's container registry: the login exchange that proves the push token (its own Authorization rides in a header file; the estate token is not the registry's to see)",
     ),
     site(
         "infra/estate/install-cli-from-image.sh",
@@ -861,6 +992,12 @@ fn is_curl_word(word: &str, aliases: &[String]) -> bool {
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
         let rest = &var[name.len()..];
+        // `${DOOR:-curl}` / `${DOOR:=curl}`: the name says nothing and
+        // the default is the curl (backlog 7369b078, F5).
+        let default = rest.strip_prefix(':').unwrap_or(rest);
+        if default.starts_with(['-', '=']) && default.to_ascii_lowercase().contains("curl") {
+            return true;
+        }
         return (name.to_ascii_lowercase().contains("curl") || aliases.contains(&name))
             && (rest.is_empty() || rest.starts_with('}') || rest.starts_with(':'));
     }
@@ -874,15 +1011,37 @@ fn is_curl_word(word: &str, aliases: &[String]) -> bool {
 /// followed by a word that opens like one (a flag, a quoted or expanded
 /// value, a header file, a URL). Prose names curl and then says `exit`
 /// or `failed`; a command hands it something.
+///
+/// OR IT IS xargs's COMMAND (backlog 7369b078, F5 of review 9c484ca8):
+/// `… | xargs curl` hands curl its arguments on stdin, so the word can be
+/// the last on the line and still send. A curl word that follows `xargs`
+/// and its options is a send whatever comes after it.
 fn sends(reader: &Reader, command: &str) -> usize {
     let words: Vec<&str> = command.split_whitespace().collect();
-    words
-        .windows(2)
-        .filter(|w| {
-            is_curl_word(w[0], &reader.aliases)
-                && (w[1].starts_with(['-', '"', '$', '@', '\'']) || w[1].starts_with("http"))
+    (0..words.len())
+        .filter(|&i| {
+            is_curl_word(words[i], &reader.aliases)
+                && (words.get(i + 1).is_some_and(|next| {
+                    next.starts_with(['-', '"', '$', '@', '\'']) || next.starts_with("http")
+                }) || xargs_runs(&words, i))
         })
         .count()
+}
+
+/// Is `words[i]` the command `xargs` runs? Walk back over xargs's own
+/// options and their values (`-0`, `-r`, `-n 1`, `-P 4`, `-I {}`).
+fn xargs_runs(words: &[&str], i: usize) -> bool {
+    words[..i]
+        .iter()
+        .rev()
+        .find(|w| {
+            let bare = w.trim_matches(['"', '\'']);
+            !(bare.starts_with('-') || bare == "{}" || bare.chars().all(|c| c.is_ascii_digit()))
+        })
+        .is_some_and(|w| {
+            w.trim_start_matches(['|', ';', '&', '('])
+                .ends_with("xargs")
+        })
 }
 
 /// The command without a trailing comment. Cutting too early only loses
@@ -914,20 +1073,60 @@ static ASSIGNMENT: LazyLock<Regex> =
 /// The names a file assigns a curl to: the value names curl and is not a
 /// command substitution (`out=$(curl …)` holds an ANSWER, and `"$out"`
 /// handed to jq is not a request).
+///
+/// AND THE FOUR WAYS TO NAME ONE THAT ARE NOT `NAME=value` (backlog
+/// 7369b078, F5 of review 9c484ca8; none is in the tree on 2026-10-09):
+/// a default assigned in the expansion (`${NAME:=curl}`), the path a
+/// lookup prints (`NAME=$(command -v curl)` — a substitution, and the one
+/// whose answer IS a curl), `printf -v NAME … curl`, and `read NAME <<<
+/// …curl…`. Each is read off its own line; a `read` from a file or a
+/// pipe names nothing this scan can know.
 fn aliases_of(text: &str) -> Vec<String> {
     live(text)
         .flat_map(|l| {
+            let l = before_comment(l);
             ASSIGNMENT
-                .captures_iter(before_comment(l))
+                .captures_iter(l)
                 .filter(|c| {
                     let value = c[2].to_ascii_lowercase();
                     value.contains("curl") && !value.contains("$(") && !value.contains('`')
                 })
                 .map(|c| c[1].to_string())
+                .chain(
+                    ALIAS_BY_DEFAULT
+                        .captures_iter(l)
+                        .filter(|c| c[2].to_ascii_lowercase().contains("curl"))
+                        .map(|c| c[1].to_string()),
+                )
+                .chain(
+                    [&*ALIAS_BY_LOOKUP, &*ALIAS_BY_PRINTF, &*ALIAS_BY_READ]
+                        .into_iter()
+                        .flat_map(|re| re.captures_iter(l).map(|c| c[1].to_string())),
+                )
                 .collect::<Vec<_>>()
         })
         .collect()
 }
+
+/// `${NAME:=value}` / `${NAME=value}`.
+static ALIAS_BY_DEFAULT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?=([^}]*)\}").unwrap());
+/// `NAME=$(command -v …curl)`, `which` and `type -p` the same.
+static ALIAS_BY_LOOKUP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?:^|[\s;&|(])([A-Za-z_][A-Za-z0-9_]*)="?\$\(\s*(?:command\s+-v|which|type\s+-[pP])\s+\S*(?i:curl)"#,
+    )
+    .unwrap()
+});
+/// `printf -v NAME … curl`.
+static ALIAS_BY_PRINTF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[\s;&|(])printf\s+-v\s+([A-Za-z_][A-Za-z0-9_]*)\s.*(?i:curl)").unwrap()
+});
+/// `read [-r …] NAME <<< …curl…`.
+static ALIAS_BY_READ: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[\s;&|(])read\s+(?:-\S+\s+)*([A-Za-z_][A-Za-z0-9_]*)\s*<<<.*(?i:curl)")
+        .unwrap()
+});
 
 /// A reader CALL, not a mention: at the start of the line, or behind
 /// `if`, `!`, a command separator or a case arm's `)`.
@@ -1234,8 +1433,51 @@ fn an_unstamped_send_is_refused_however_it_is_spelled() {
              \"$api\" -fsS -H \"x-boss-user: $U\" \"$BASE/api/x\"\n",
         ),
         ("alias.sh", "c=curl\n$c -fsS \"$BASE/api/x\"\n"),
+        // The default is the curl, and the name says nothing.
+        (
+            "default-under-another-name.sh",
+            "\"${DOOR:-curl}\" -fsS \"$BASE/api/x\"\n",
+        ),
+        // The four ways to give a curl another name that are not
+        // `NAME=value` (backlog 7369b078, F5 of review 9c484ca8).
+        (
+            "alias-by-default.sh",
+            ": \"${api:=curl}\"\n\"$api\" -fsS \"$BASE/api/x\"\n",
+        ),
+        (
+            "alias-by-command-v.sh",
+            "api=\"$(command -v curl)\"\n\"$api\" -fsS \"$BASE/api/x\"\n",
+        ),
+        (
+            "alias-by-printf-v.sh",
+            "printf -v api '%s' curl\n\"$api\" -fsS \"$BASE/api/x\"\n",
+        ),
+        (
+            "alias-by-read.sh",
+            "read -r api <<< \"$here/boss-api-curl.sh\"\n\"$api\" -fsS \"$BASE/api/x\"\n",
+        ),
+        // curl as xargs's command: its arguments arrive on stdin, so
+        // nothing follows the word on the line.
+        (
+            "xargs-at-line-end.sh",
+            "printf '%s\\n' \"$BASE/api/x\" | xargs curl\n",
+        ),
+        (
+            "xargs-with-flags.sh",
+            "printf '%s\\n' \"$BASE/api/x\" | xargs -r -n 1 curl -fsS\n",
+        ),
+        // Shell under a name that is not `.sh` and has no `#!` line: the
+        // head here is a comment, as a sourced fragment's is.
+        ("fragment.bash", "curl -fsS \"$BASE/api/x\"\n"),
+        ("fragment.inc", "curl -fsS \"$BASE/api/x\"\n"),
     ];
     for (name, body) in refused_cases {
+        // A fragment has no `#!` line: its extension alone makes it shell.
+        let head = if name.ends_with(".sh") {
+            head
+        } else {
+            "# sourced\n# by its caller\n"
+        };
         boss_testing::write_file(&dir.join(name), &format!("{head}{body}"));
     }
     // A file whose header variable only LOOKS like the token's: no reader
@@ -1366,7 +1608,7 @@ fn a_roster_entry_excuses_its_count_and_no_more() {
         "the send past the count is refused: {refused:#?}"
     );
     boss_testing::write_file(
-        &root.join("infra/forge/some-other-sender.sh"),
+        &root.join(std::path::Path::new(entry.file).with_file_name("some-other-sender.sh")),
         &format!("#!/usr/bin/env bash\n{line}"),
     );
     let (refused, _) = unstamped_sends(&root);
@@ -1375,6 +1617,180 @@ fn a_roster_entry_excuses_its_count_and_no_more() {
         2,
         "the same line in another file is refused: {refused:#?}"
     );
+}
+
+/// A roster needle says WHERE the request goes, or which credential it
+/// carries — never only curl and its flags (backlog 7369b078, F5 of
+/// review 9c484ca8). Three did: `curl -s -m` (journal-read.sh),
+/// `code=$(curl -sS --max-time` (move-forgejo-data.sh) and
+/// `"$($CURL -sS -m 15` (ci-image-report.sh), each excusing three sends.
+/// Such an entry excuses whatever request is next written with the same
+/// flags in that file, up to its count, wherever it goes: after one of
+/// the three was deleted, a new `curl -s -m 5 "$BASE/api/jobs"` would
+/// have been excused as "a host's systemd-journal-gatewayd".
+fn needle_names_more_than_curl_and_its_flags(needle: &str) -> bool {
+    needle.split_whitespace().any(|w| {
+        let bare = w.trim_matches(['"', '\'']);
+        !is_curl_word(w, &[])
+            && !bare.starts_with('-')
+            && !bare.is_empty()
+            && !bare.chars().all(|c| c.is_ascii_digit())
+    })
+}
+
+#[test]
+fn every_roster_needle_names_a_destination_or_a_credential() {
+    assert!(!needle_names_more_than_curl_and_its_flags("curl -s -m"));
+    assert!(!needle_names_more_than_curl_and_its_flags(
+        "code=$(curl -sS --max-time"
+    ));
+    assert!(!needle_names_more_than_curl_and_its_flags(
+        "\"$($CURL -sS -m 15"
+    ));
+    assert!(needle_names_more_than_curl_and_its_flags(
+        "\"${BASE}/machine\""
+    ));
+    assert!(needle_names_more_than_curl_and_its_flags(
+        "-H \"$FORGE_HDR\""
+    ));
+    for s in roster() {
+        assert!(
+            needle_names_more_than_curl_and_its_flags(s.needle),
+            "{}: the needle {:?} is curl and its flags and nothing else, so it excuses the next \
+             request written with those flags, wherever that one goes. Name the destination \
+             (the URL argument as the file spells it) or the credential header it carries",
+            s.file,
+            s.needle
+        );
+    }
+}
+
+// =====================================================================
+// A UNIT RUNS NO REQUEST OF ITS OWN (backlog 7369b078, F5 of review
+// 9c484ca8)
+// =====================================================================
+//
+// Everything above reads shell FILES. A systemd unit's `ExecStart=` (or
+// any `Exec…=` line) is a command line too, and one that ran curl — bare,
+// or inside `/bin/sh -c '…'` — would send a request no scan here opens:
+// the unit is not shell by name or by `#!`. None does today (measured
+// 2026-10-09 on origin/main cb0790715: 11 units under infra/ name curl,
+// every one in a comment). So this is a plain denial with no roster: a
+// unit runs a script, and the script is judged where it stands. A request
+// that truly belongs in a unit line gets a roster here, written by the
+// car that needs it, with the reason.
+
+/// (refused `file:line: text`, unit files with at least one Exec line).
+fn unit_sends(root: &Path) -> (Vec<String>, usize) {
+    let mut files = Vec::new();
+    walk(&root.join("infra"), &mut files);
+    files.sort();
+    let none = reader_of("", "");
+    let mut refused = Vec::new();
+    let mut units = 0;
+    for f in files {
+        if f.extension().is_none_or(|x| x != "service") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        let rel = f.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+        let mut has_exec = false;
+        for (n, command) in commands(&text) {
+            let line = command.trim_start();
+            if line.starts_with(';') || !line.starts_with("Exec") {
+                continue;
+            }
+            let Some((_, run)) = line.split_once('=') else {
+                continue;
+            };
+            has_exec = true;
+            // systemd's own prefixes on the executable: `-`, `@`, `+`,
+            // `!`, `!!`, `:`.
+            let run = run
+                .trim_start()
+                .trim_start_matches(['-', '@', '+', '!', ':']);
+            if sends(&none, run) > 0 {
+                refused.push(format!("{rel}:{n}: {}", line.trim_end()));
+            }
+        }
+        units += usize::from(has_exec);
+    }
+    (refused, units)
+}
+
+#[test]
+fn no_unit_runs_curl_in_its_own_exec_line() {
+    let (refused, units) = unit_sends(&repo_root());
+    assert!(
+        units >= 10,
+        "the unit scan found {units} unit files with an Exec line, fewer than ten — it has \
+         stopped seeing the tree, and a scanner that sees nothing passes everything"
+    );
+    assert!(
+        refused.is_empty(),
+        "these unit lines run curl themselves, so the request is sent by no shell file and the \
+         per-call-site rule in this file never reads it — it would reach a service port without \
+         the estate machine token, or carry a secret in a command line. Move the request into a \
+         script under infra/ that calls `machine_token_header` and hands curl its file, and have \
+         the unit run the script:\n  {}",
+        refused.join("\n  ")
+    );
+}
+
+#[test]
+fn a_unit_that_runs_curl_is_refused() {
+    let root = boss_testing::scratch_dir("unit-sends");
+    let dir = root.join("infra/forge");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cases: &[(&str, &str, usize)] = &[
+        (
+            "bare.service",
+            "[Service]\nExecStart=/usr/bin/curl -fsS http://127.0.0.1:7900/api/jobs\n",
+            1,
+        ),
+        (
+            "prefixed.service",
+            "[Service]\nExecStartPre=-curl -fsS \"http://sor/api/x\"\n",
+            1,
+        ),
+        (
+            "in-a-shell.service",
+            "[Service]\nExecStart=/bin/sh -c 'curl -fsS -X POST \"$BOSS_JOBS_URL/api/jobs\"'\n",
+            1,
+        ),
+        (
+            "continued.service",
+            "[Service]\nExecStopPost=/bin/sh -c 'test -n \"$X\" && \\\n    curl -fsS \"$U\"'\n",
+            1,
+        ),
+        (
+            "runs-a-script.service",
+            "[Service]\n# curl -fsS http://x is what this does NOT run\n; ExecStart=/usr/bin/curl -fsS http://x\n\
+             Environment=BOSS_API_CURL=/usr/local/lib/boss/boss-api-curl.sh\n\
+             ExecStart=/usr/local/lib/boss/ops-runner.sh --once\n",
+            0,
+        ),
+    ];
+    for (name, body, _) in cases {
+        boss_testing::write_file(&dir.join(name), body);
+    }
+    // Not a unit: the scan reads `.service` only.
+    boss_testing::write_file(
+        &dir.join("notes.txt"),
+        "ExecStart=/usr/bin/curl -fsS http://x\n",
+    );
+    let (refused, units) = unit_sends(&root);
+    assert_eq!(units, cases.len());
+    for (name, _, want) in cases {
+        let got = refused
+            .iter()
+            .filter(|l| l.starts_with(&format!("infra/forge/{name}:")))
+            .count();
+        assert_eq!(got, *want, "{name}: refused {got} time(s): {refused:#?}");
+    }
+    assert_eq!(refused.len(), 4, "{refused:#?}");
 }
 
 #[test]
@@ -1394,6 +1810,9 @@ fn the_per_site_matchers_read_a_command_not_a_line() {
     assert!(!is_curl_word("\"$TMP/curl.err\"", &[]));
     assert!(!is_curl_word("API_CURL=\"$HERE/boss-api-curl.sh\"", &[]));
     assert!(!is_curl_word("$BASE", &[]));
+    assert!(is_curl_word("\"${DOOR:-curl}\"", &[]));
+    assert!(is_curl_word("\"${DOOR:=/usr/bin/curl}\"", &[]));
+    assert!(!is_curl_word("\"${DOOR:-wget}\"", &[]));
     let none = reader_of("x.sh", "");
     assert_eq!(sends(&none, "echo \"failed (curl exit $rc)\""), 0);
     assert_eq!(sends(&none, "command -v curl >/dev/null"), 0);
@@ -1407,6 +1826,36 @@ fn the_per_site_matchers_read_a_command_not_a_line() {
     assert_eq!(door.aliases, vec!["api".to_string()]);
     assert_eq!(sends(&door, "\"$api\" -fsS \"$u\""), 1);
     assert!(aliases_of("out=$(curl -s \"$u\")\nlocal x=\"$(\"$CURL\" -s)\"\n").is_empty());
+    // Not `NAME=value`, and a name all the same (7369b078 F5).
+    assert_eq!(aliases_of(": \"${api:=curl}\"\n"), vec!["api"]);
+    assert_eq!(
+        aliases_of("echo \"${door=/x/boss-api-curl.sh}\"\n"),
+        vec!["door"]
+    );
+    assert_eq!(
+        aliases_of("  api=$(command -v curl) || exit 1\n"),
+        vec!["api"]
+    );
+    assert_eq!(aliases_of("api=\"$(which curl)\"\n"), vec!["api"]);
+    assert_eq!(
+        aliases_of("printf -v api '%s' \"$dir/curl\"\n"),
+        vec!["api"]
+    );
+    assert_eq!(aliases_of("IFS= read -r api <<< curl\n"), vec!["api"]);
+    assert!(aliases_of("# : \"${api:=curl}\"\n").is_empty());
+    assert!(aliases_of("x=1 # ${api:=curl}\n").is_empty());
+    assert!(aliases_of("printf -v msg '%s' \"$rc\"\nread -r line <<< \"$out\"\n").is_empty());
+    assert!(aliases_of("command -v curl >/dev/null || exit 1\n").is_empty());
+    // xargs hands curl its arguments on stdin.
+    assert_eq!(sends(&none, "echo \"$u\" | xargs curl"), 1);
+    assert_eq!(sends(&none, "echo \"$u\" | xargs -0 -n 1 -I {} curl"), 1);
+    assert_eq!(sends(&none, "echo \"$u\" | xargs -r curl -fsS"), 1);
+    assert_eq!(sends(&none, "find . -print0 | xargs -0 grep -l curl"), 0);
+    assert_eq!(sends(&none, "for tool in jq xargs curl; do :; done"), 0);
+    // Shell by extension, with no `#!` line.
+    assert!(is_shell(Path::new("infra/lib/x.bash"), "f() { :; }\n"));
+    assert!(is_shell(Path::new("infra/lib/x.inc"), "f() { :; }\n"));
+    assert!(!is_shell(Path::new("infra/lib/x.txt"), "f() { :; }\n"));
     let cmds = commands("a \\\n  b\n# c\nd # e\n");
     assert_eq!(
         cmds,
@@ -1415,5 +1864,295 @@ fn the_per_site_matchers_read_a_command_not_a_line() {
     assert_eq!(
         before_comment("curl x # ${MT_HDR:+-H \"$MT_HDR\"}"),
         "curl x"
+    );
+}
+
+// =====================================================================
+// A LINT THAT READS THE RECORD, RUN BY A SCRIPT THAT HOLDS THE TOKEN
+// (backlog 44b2087e, 2026-10-09)
+// =====================================================================
+//
+// THE DEFECT. Everything above judges the commands a file runs itself,
+// and excuses infra/lint/ whole, because a lint holds no token by rule
+// (BY_DESIGN_DIRS). So a script that stamps every request it sends and
+// then RUNS a lint that reads the record sends that lint's read with no
+// token, and neither half of this pin sees it: the script's own curls
+// are stamped and the lint's curl is in an excused file. Measured
+// 2026-10-09 10:04Z on the machine-gate window (24 h): 24 would-refuse
+// facts each for `GET /api/workflows` (jobs) and `GET /api/dispatcher/
+// rules` (dispatcher), signed `automation:gate-runner` from the forge's
+// address, one pair per converge, at the second the converge's last
+// phase ran (09:19:38Z) — infra/forge/registry-drift.sh, which stamps
+// its own reads and writes, running the two live-registry lints. The
+// daily infra/protocol-drift.sh runs one of them the same way.
+//
+// THE RULE. The lints that send a request of their own are DERIVED: each
+// shell file under infra/lint/ whose live text sources `lib/sor-read.sh`
+// (the one helper a lint reads the record through, held by
+// a_lint_read_of_the_record_is_signed.rs). In every shell file outside
+// infra/lint/ that calls the reader (`machine_token_header <VAR>`), every
+// command that RUNS one of them — `bash <it>`, `sh <it>`, or <it> as the
+// command word, named literally or through a variable this file assigns
+// its path — must hand it the read in that same command:
+// `BOSS_LINT_SOR_HANDED_URL=…` (with `_CODE` and `_BODY`), which
+// lint_sor_read answers from without a request, and which the script
+// reads itself, stamped. A file that holds no token sends the same
+// request either way and is not judged here.
+//
+// WHAT IT DOES NOT SEE. A lint run through a loop over the directory
+// (infra/gate.sh's roster, which holds no token), through a name built at
+// run time, or from Rust (boss-cli hands the edit-level lint its answer
+// as BOSS_EDIT_LEVEL_ANSWER, backlog 934ccad1); and a stamping file that
+// exports the handed variables once and runs the lint later — written
+// per command on purpose, so the hand-over is read where the lint runs.
+
+/// The helper a lint reads the record through.
+const LINT_READ_LIB: &str = "lib/sor-read.sh";
+/// The hand-over lint_sor_read answers from without a request.
+const HANDED_READ: &str = "BOSS_LINT_SOR_HANDED_URL=";
+
+/// The basenames of the lints that send a request of their own.
+fn record_reading_lints(root: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    walk(&root.join("infra/lint"), &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .filter(|f| f.extension().is_some_and(|x| x == "sh"))
+        .filter(|f| {
+            std::fs::read_to_string(f).is_ok_and(|t| live(&t).any(|l| l.contains(LINT_READ_LIB)))
+        })
+        .filter_map(|f| Some(f.file_name()?.to_string_lossy().into_owned()))
+        .collect()
+}
+
+static LINT_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:^|[\s;(])([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|[^\s;]+)"#).unwrap()
+});
+
+/// Variables this file assigns a path naming one of `lints`.
+fn lint_vars(text: &str, lints: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = live(text)
+        .flat_map(|l| LINT_ASSIGNMENT.captures_iter(l))
+        .filter(|c| lints.iter().any(|b| c[2].contains(b.as_str())))
+        .map(|c| c[1].to_string())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Does this word name one of `lints`, literally or through one of `vars`?
+fn names_a_lint(word: &str, lints: &[String], vars: &[String]) -> bool {
+    lints.iter().any(|b| word.contains(b.as_str()))
+        || vars.iter().any(|v| {
+            [format!("${v}"), format!("${{{v}}}"), format!("${{{v}:")]
+                .iter()
+                .any(|r| {
+                    word.match_indices(r.as_str()).any(|(i, m)| {
+                        r.ends_with(['}', ':'])
+                            || !word[i + m.len()..]
+                                .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                    })
+                })
+        })
+}
+
+/// A word as the command it may start: what follows its last `$(`, with
+/// the quote, `(` or `!` in front of it dropped. `out=$(bash` is `bash`;
+/// `"$LINT"` is `$LINT"`, which still names its variable.
+fn command_word(word: &str) -> &str {
+    word.rsplit("$(")
+        .next()
+        .unwrap_or(word)
+        .trim_start_matches(['(', '"', '\'', '!'])
+}
+
+/// Does this command RUN one of `lints`: as the argument of `bash` or
+/// `sh` (after their flags), as the command word after any `NAME=value`
+/// prefixes, or as the command word of a `$(…)`?
+fn runs_a_lint(command: &str, lints: &[String], vars: &[String]) -> bool {
+    let raw: Vec<&str> = before_comment(command).split_whitespace().collect();
+    let first = raw.iter().position(|w| !ASSIGNMENT_WORD.is_match(w));
+    raw.iter().enumerate().any(|(i, w)| {
+        let word = command_word(w);
+        let is_command_word = Some(i) == first || w.contains("$(");
+        (is_command_word && names_a_lint(word, lints, vars))
+            || (matches!(word, "bash" | "sh")
+                && raw[i + 1..]
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .is_some_and(|a| names_a_lint(a, lints, vars)))
+    })
+}
+
+static ASSIGNMENT_WORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*=").unwrap());
+
+static READER_CALL_LINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(^|[\s;&|({!])machine_token_header\s+[A-Za-z_]+").unwrap());
+
+/// (refused `file:line: command`, runs seen) for every stamping shell file
+/// outside infra/lint/ under `root`.
+fn unhanded_lint_runs(root: &Path) -> (Vec<String>, usize) {
+    let lints = record_reading_lints(root);
+    let mut files = Vec::new();
+    walk(&root.join("infra"), &mut files);
+    files.sort();
+    let mut refused = Vec::new();
+    let mut runs = 0;
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        let rel = f.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+        if !is_shell(&f, &text)
+            || rel.starts_with("infra/lint/")
+            || !live(&text).any(|l| READER_CALL_LINE.is_match(l))
+        {
+            continue;
+        }
+        let vars = lint_vars(&text, &lints);
+        for (n, command) in commands(&text) {
+            if !runs_a_lint(&command, &lints, &vars) {
+                continue;
+            }
+            runs += 1;
+            if !before_comment(&command).contains(HANDED_READ) {
+                let shown = command.split_whitespace().collect::<Vec<_>>().join(" ");
+                refused.push(format!("{rel}:{n}: {shown}"));
+            }
+        }
+    }
+    (refused, runs)
+}
+
+#[test]
+fn a_stamping_script_hands_the_lints_it_runs_their_read() {
+    let root = repo_root();
+    assert!(
+        record_reading_lints(&root).len() >= 2,
+        "fewer than two lints under infra/lint/ source {LINT_READ_LIB} — the derivation has \
+         stopped seeing the tree: {:?}",
+        record_reading_lints(&root)
+    );
+    let (refused, runs) = unhanded_lint_runs(&root);
+    assert!(
+        refused.is_empty(),
+        "these commands, in a script that holds the estate machine token, run a lint that reads \
+         the record itself — and a lint holds no token by rule, so that read reaches a service \
+         port with none, a caller every machine gate records as one it would refuse (the \
+         converge's registry-drift phase sent one pair per converge, backlog 44b2087e). Read it \
+         in this script, stamped, and hand it in on the same command: \
+         `BOSS_LINT_SOR_HANDED_URL=<the URL the lint asks> BOSS_LINT_SOR_HANDED_CODE=<code> \
+         BOSS_LINT_SOR_HANDED_BODY=<file> bash <lint>` (infra/lint/lib/sor-read.sh):\n  {}",
+        refused.join("\n  ")
+    );
+    assert!(
+        runs >= 3,
+        "the scan found {runs} runs of a record-reading lint from a stamping script, fewer than \
+         the three it was written against (infra/forge/registry-drift.sh twice, \
+         infra/protocol-drift.sh once) — it has stopped seeing them"
+    );
+}
+
+/// The scan, on a planted tree. Never executed.
+#[test]
+fn an_unhanded_lint_run_is_refused_however_it_is_spelled() {
+    let root = boss_testing::scratch_dir("unhanded-lint-runs");
+    let lint = root.join("infra/lint");
+    let forge = root.join("infra/forge");
+    std::fs::create_dir_all(&lint).unwrap();
+    std::fs::create_dir_all(&forge).unwrap();
+    // Shell by their `.sh` name; read as text, never run.
+    for (name, text) in [
+        ("the-live-x.sh", ". infra/lint/lib/sor-read.sh || exit 3\n"),
+        (
+            "hermetic.sh",
+            "# reads lib/sor-read.sh? no: this is a comment\nexit 0\n",
+        ),
+    ] {
+        std::fs::write(lint.join(name), text).unwrap();
+    }
+    let stamps = "#!/usr/bin/env bash\nmachine_token_header MT_HDR \"$BASE\" || MT_HDR=\"\"\n";
+    let cases: &[(&str, &str, &str, usize)] = &[
+        (
+            "by-variable.sh",
+            stamps,
+            "LINT=\"infra/lint/the-live-x.sh\"\nbash \"$LINT\" --require-live > \"$t/out\" 2>&1\n",
+            1,
+        ),
+        ("by-path.sh", stamps, "bash infra/lint/the-live-x.sh\n", 1),
+        (
+            "in-a-substitution.sh",
+            stamps,
+            "PLINT=infra/lint/the-live-x.sh\nout=$(bash \"$REPO/$PLINT\" 2>&1) || rc=$?\n",
+            1,
+        ),
+        (
+            "env-prefix-without-the-read.sh",
+            stamps,
+            "BOSS_JOBS_URL=\"$B\" bash \\\n    \"$REPO/infra/lint/the-live-x.sh\" --require-live\n",
+            1,
+        ),
+        (
+            "as-the-command-word.sh",
+            stamps,
+            "L=\"$REPO/infra/lint/the-live-x.sh\"\n\"$L\" --require-live\n",
+            1,
+        ),
+        (
+            "handed.sh",
+            stamps,
+            "LINT=infra/lint/the-live-x.sh\nBOSS_LINT_SOR_HANDED_URL=\"$B/api/x\" BOSS_LINT_SOR_HANDED_CODE=\"$c\" \\\n    BOSS_LINT_SOR_HANDED_BODY=\"$t/x.json\" bash \"$LINT\" --require-live\n",
+            0,
+        ),
+        (
+            "handed-only-in-a-comment.sh",
+            stamps,
+            "bash infra/lint/the-live-x.sh # BOSS_LINT_SOR_HANDED_URL=\"$u\"\n",
+            1,
+        ),
+        (
+            "a-test-of-the-file-is-no-run.sh",
+            stamps,
+            "LINT=infra/lint/the-live-x.sh\n[ -f \"$LINT\" ] || exit 3\necho \"$(basename \"$LINT\")\"\n",
+            0,
+        ),
+        (
+            "a-longer-name-is-another-variable.sh",
+            stamps,
+            "LINT=infra/lint/the-live-x.sh\nbash \"$LINT_OTHER\"\n",
+            0,
+        ),
+        (
+            "a-hermetic-lint.sh",
+            stamps,
+            "bash infra/lint/hermetic.sh\n",
+            0,
+        ),
+        (
+            "holds-no-token.sh",
+            "#!/usr/bin/env bash\n",
+            "bash infra/lint/the-live-x.sh\n",
+            0,
+        ),
+    ];
+    for (name, head, body, _) in cases {
+        std::fs::write(forge.join(name), format!("{head}{body}")).unwrap();
+    }
+    let (refused, _) = unhanded_lint_runs(&root);
+    for (name, _, _, want) in cases {
+        let got = refused
+            .iter()
+            .filter(|l| l.starts_with(&format!("infra/forge/{name}:")))
+            .count();
+        assert_eq!(got, *want, "{name}: refused {got} time(s): {refused:#?}");
+    }
+    assert!(
+        refused
+            .iter()
+            .any(|l| l.starts_with("infra/forge/by-path.sh:3:")),
+        "the refusal names the line the run is on: {refused:#?}"
     );
 }

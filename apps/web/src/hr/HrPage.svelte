@@ -1,8 +1,9 @@
 <script lang="ts">
   // HR admin — port of apps/web/src/hr/HrPage.tsx.
   //
-  // Four tabs: Overview, Workflows (onboarding/offboarding task
-  // tracking through their Job surfaces), Certifications, Headcount.
+  // Overview, Workflows (onboarding/offboarding task tracking through
+  // their Job surfaces), and Headcount. Unsupported summaries were removed
+  // under design 93789cf4 / backlog 9a0e18d5.
   //
   // A fifth, Requisitions, went with page audit b959394e (backlog
   // 0ab0fbac): it said the requisitions API was not implemented when it
@@ -15,7 +16,6 @@
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
-  import { appNow } from '@boss/web-kit/sim-clock';
   import {
     classLabel,
     departmentNames,
@@ -24,7 +24,6 @@
   } from '../people/types';
   import { classesFor } from '@boss/web-kit/session/classes.svelte';
   import { departments } from '@boss/web-kit/session/departments.svelte';
-  import { tenureYears, expiringCerts } from '../people/utils';
   import {
     workflowSurfaces,
     type WorkflowSpec,
@@ -40,12 +39,11 @@
   import { readStateOfLoad } from '../data/readState';
   import { href, navigate } from '../router';
 
-  type Tab = 'overview' | 'certs' | 'headcount' | 'workflows';
+  type Tab = 'overview' | 'headcount' | 'workflows';
 
   const TABS: ReadonlyArray<{ id: Tab; label: string }> = [
     { id: 'overview', label: 'Overview' },
     { id: 'workflows', label: 'Workflows' },
-    { id: 'certs', label: 'Certifications' },
     { id: 'headcount', label: 'Headcount' },
   ];
 
@@ -91,13 +89,6 @@
   let counted = $derived(countedRoster(roster, roleClasses));
   let active = $derived(counted.filter((e) => e.status === 'active'));
   let onLeave = $derived(counted.filter((e) => e.status === 'on-leave'));
-  let expiring90 = $derived(expiringCerts(90, roster));
-  let expiring30 = $derived(expiringCerts(30, roster));
-  let avgTenure = $derived(
-    active.length > 0
-      ? (active.reduce((s, e) => s + tenureYears(e), 0) / active.length).toFixed(1)
-      : '0',
-  );
 
   // The header is /ux/people's, through the same helper (backlog
   // d8d48a49): it printed "0 active employees" while the roster was
@@ -107,7 +98,6 @@
     rosterHeader(
       readStateOfLoad(loading, rosterFailed),
       headcount(roster, roleClasses),
-      expiring90.length,
     ),
   );
 
@@ -345,7 +335,7 @@
     {#if loading}
       <p class="empty">Loading…</p>
     {:else if rosterFailed && tab !== 'workflows'}
-      <!-- Overview, certs and headcount all derive from the roster —
+      <!-- Overview and headcount derive from the roster —
            with the roster fetch failed their zeros would be fiction.
            The Workflows tab says it above its picker instead. -->
       <p class="empty load-failed" role="alert">
@@ -359,27 +349,7 @@
               <dt>Active</dt><dd class="num">{active.length}</dd>
               <dt>On leave</dt><dd class="num">{onLeave.length}</dd>
               <dt>Contractors</dt><dd class="num">{counted.filter((e) => e.employment_type === 'contractor').length}</dd>
-              <dt>Avg tenure</dt><dd>{avgTenure} years</dd>
             </dl>
-        </Section>
-
-        <Section title="Urgent">
-            {#if expiring30.length === 0}
-              <p class="empty">Nothing urgent today.</p>
-            {:else}
-              <div style="margin-bottom:12px">
-                <h4 style="font-size:13px; font-weight:600; color:var(--err); margin:0 0 4px">
-                  {expiring30.length} cert{expiring30.length > 1 ? 's' : ''} expiring in 30 days
-                </h4>
-                {#each expiring30.slice(0, 5) as { employee, cert } (`${employee.id}-${cert.name}`)}
-                  <div style="font-size:13px">
-                    <Link to={entityHref('employee', employee.id)}>
-                      {employee.name}
-                    </Link> — {cert.name} ({cert.expires_on})
-                  </div>
-                {/each}
-              </div>
-            {/if}
         </Section>
       </div>
     {:else if tab === 'workflows'}
@@ -546,53 +516,6 @@
             {/if}
           </Section>
         {/if}
-      </div>
-    {:else if tab === 'certs'}
-      <div class="tab-grid">
-        <Section title={`Expiring in 90 days (${expiring90.length})`} wide>
-            {#if expiring90.length === 0}
-              <p class="empty">No certifications expiring in the next 90 days.</p>
-            {:else}
-              <table class="data-table data-table-striped">
-                <thead>
-                  <tr>
-                    <th>Employee</th>
-                    <th>Certification</th>
-                    <th>Issuer</th>
-                    <th>Expires</th>
-                    <th>Days left</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {#each expiring90 as { employee, cert } (`${employee.id}-${cert.name}`)}
-                    {@const daysLeft = cert.expires_on
-                      ? Math.ceil(
-                          (new Date(cert.expires_on).getTime() - appNow().getTime()) /
-                            (1000 * 60 * 60 * 24),
-                        )
-                      : null}
-                    <tr>
-                      <td>
-                        <Link to={entityHref('employee', employee.id)}>
-                          {employee.name}
-                        </Link>
-                      </td>
-                      <td>{cert.name}</td>
-                      <td>{cert.issuing_body}</td>
-                      <td>{cert.expires_on ?? '—'}</td>
-                      <td class="num">
-                        {#if daysLeft !== null && daysLeft <= 30}
-                          <span style="color:var(--err); font-weight:600">{daysLeft}d</span>
-                        {:else}
-                          <span>{daysLeft}d</span>
-                        {/if}
-                      </td>
-                    </tr>
-                  {/each}
-                </tbody>
-              </table>
-            {/if}
-        </Section>
       </div>
     {:else if tab === 'headcount'}
       <div class="tab-grid">

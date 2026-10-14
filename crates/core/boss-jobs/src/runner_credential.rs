@@ -44,13 +44,13 @@
 //! (infra/forge/runner-credential-deposit.sh) has installed it and
 //! recorded delivery. With no Secret there is an empty directory, every
 //! request reads as uncredentialed, and nothing any caller sees changes —
-//! the machine token's deploy-order posture. `runner:ops` is NOT yet in
-//! [`crate::field_writer::RESOLVABLE_PRINCIPALS`]: only the forge has a
-//! delivery today (boss-gcp's waits on the remote deposit, backlog
-//! 7336cb5f), and a protocol that declared the writer before every runner
-//! host could present a credential would lock that host's runner out of
-//! its own plan — the approval David signs would never be offered. The
-//! principal enters that list once both hosts are delivered.
+//! the machine token's deploy-order posture. `runner:ops` entered
+//! [`crate::field_writer::RESOLVABLE_PRINCIPALS`] only once both hosts
+//! were delivered (row E, 2026-10-10: forge presenting since 2026-10-09,
+//! boss-gcp's first issuance promoted on delivery, rotation f194ab3e),
+//! because a protocol that declared the writer before every runner host
+//! could present a credential would lock that host's runner out of its
+//! own plan — the approval David signs would never be offered.
 //!
 //! NO VALUE LEAVES THIS MODULE. Not in a log line, an error, the whoami
 //! answer or a hash of one; a slot is named by its file name only.
@@ -267,11 +267,22 @@ pub async fn resolve_runner_credential(
                     req.headers_mut().insert("x-boss-user", header);
                 }
             }
-            req.extensions_mut().insert(CredentialedCaller {
+            let caller = CredentialedCaller {
                 principal: PRINCIPAL.to_string(),
                 actor_id: ACTOR.to_string(),
                 host: Some(host),
-            });
+            };
+            if let Some(mode) = req
+                .extensions()
+                .get::<boss_core::machine_gate::RequestModeObservation>()
+                .copied()
+            {
+                let ingress = crate::station_claim::AuthenticatedSelectionIngress::from_credential(
+                    &caller, mode,
+                );
+                req.extensions_mut().insert(ingress);
+            }
+            req.extensions_mut().insert(caller);
             req.extensions_mut().insert(ResolvedSlot(slot));
             if let Some(delivery) = delivery {
                 req.extensions_mut().insert(delivery);
@@ -331,6 +342,55 @@ pub fn mount(app: Router, dir: PathBuf) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn selector_ingress_requires_the_real_resolver_not_an_asserted_header() {
+        use tower::ServiceExt;
+        async fn observed(
+            ingress: Option<axum::Extension<crate::station_claim::AuthenticatedSelectionIngress>>,
+        ) -> String {
+            ingress
+                .map(|axum::Extension(value)| value.actor_id().to_string())
+                .unwrap_or_else(|| "unavailable".into())
+        }
+        let dir = slots(&[("forge.current", "fixture-runner-key")]);
+        let app = mount(
+            Router::new().route("/selection-ingress", axum::routing::get(observed)),
+            dir,
+        );
+        let gate = Arc::new(boss_core::machine_gate::MachineGate::new(
+            "jobs",
+            &[],
+            boss_core::machine_gate::Reading::new(
+                boss_core::machine_gate::Mode::Off,
+                Default::default(),
+            ),
+        ));
+        let app = boss_core::machine_gate::gated(app, gate);
+        for (key, expected) in [
+            (Some("fixture-runner-key"), ACTOR),
+            (None, "unavailable"),
+            (Some("foreign-key"), "unavailable"),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .uri("/selection-ingress")
+                .header(
+                    "x-boss-user",
+                    serde_json::to_string(&boss_policy_client::User::service("forged")).unwrap(),
+                );
+            if let Some(key) = key {
+                request = request.header(HEADER, key);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let raw = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(std::str::from_utf8(&raw).unwrap(), expected);
+        }
+    }
 
     fn slots(files: &[(&str, &str)]) -> PathBuf {
         let dir = boss_testing::scratch_dir("runner-credential-unit");

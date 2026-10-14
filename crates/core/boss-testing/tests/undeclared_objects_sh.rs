@@ -1250,7 +1250,10 @@ fn generated_workers_require_the_declared_shape_not_just_a_forged_app_label() {
         "$URL": "https://example.invalid/repo.git", "$REFERENCE": "refs/heads/test",
         "$HEAD": "0123456789abcdef0123456789abcdef01234567",
         "$BASELINE": "fedcba9876543210fedcba9876543210fedcba98",
-        "$BUDGET": "120", "$DEADLINE": 300
+        "$BUDGET": "120", "$DEADLINE": 300,
+        // The conductor's handed edit level (backlog 37742794).
+        "$EDIT_LEVEL": "{\"edit_level\":null}",
+        "$TMP_SUBPATH": "private"
     });
     fn fill(value: &mut serde_json::Value, bindings: &serde_json::Value) {
         match value {
@@ -1313,6 +1316,29 @@ fn generated_workers_require_the_declared_shape_not_just_a_forged_app_label() {
     unrelated["spec"]["template"]["spec"]["containers"][0]["command"][6] =
         unrelated["metadata"]["name"].clone();
     objects.push(unrelated);
+    // A handed edit level that is not the door's own object is no value
+    // the conductor hands (backlog 37742794), so its Job is not declared.
+    let mut forged_level = good.clone();
+    forged_level["metadata"]["name"] = serde_json::json!(format!("consist-{:032x}", 9));
+    forged_level["spec"]["template"]["spec"]["containers"][0]["command"][6] =
+        forged_level["metadata"]["name"].clone();
+    forged_level["spec"]["template"]["spec"]["containers"][0]["command"][8] =
+        serde_json::json!("$(not the door's answer)");
+    objects.push(forged_level);
+    // The generation before that argument, retained by the TTL for a day
+    // after the conductor that stamped it is replaced, is still the
+    // conductor's: unrecognised, it is an "orphan" that reds every dev
+    // pre-flight's a-deleted-manifest-leaves-no-object for that day
+    // (measured on this car's own first pre-flight, 2026-10-09).
+    let mut previous = good.clone();
+    let previous_name = "consist-a0000000000000000000000000000000";
+    previous["metadata"]["name"] = serde_json::json!(previous_name);
+    let command = previous["spec"]["template"]["spec"]["containers"][0]["command"]
+        .as_array_mut()
+        .unwrap();
+    command[6] = serde_json::json!(previous_name);
+    command.pop();
+    objects.push(previous);
     for (i, key, value) in [
         (
             5,
@@ -1353,9 +1379,13 @@ fn generated_workers_require_the_declared_shape_not_just_a_forged_app_label() {
         !stdout.contains(values["$NAME"].as_str().unwrap()),
         "legitimate retained worker must be declared: {all}"
     );
+    assert!(
+        !stdout.contains(previous_name),
+        "a retained worker of the generation before the handed edit level is declared: {all}"
+    );
     assert_eq!(
         stdout.lines().count(),
-        9,
+        10,
         "every hostile/unrelated labelled Job remains undeclared: {all}"
     );
     let (rc, _, all) = c.run(&[
@@ -1751,6 +1781,38 @@ fn the_consuming_lint_refuses_rather_than_calling_a_declared_object_an_orphan() 
     assert!(
         !out.contains("Service/svc-a"),
         "the lint named a DECLARED object as an orphan because its manifest would not parse:\n{out}"
+    );
+}
+
+/// Property A reads the deleted manifests out of git history, and history
+/// that cannot be read is not history with no deletions in it (review
+/// 1ba2873d, B1). Since backlog 683d7fe9 the converge runs this lint from
+/// a VIEW of root's tree, and a generation is an export: with no `.git`
+/// every `git log` here answered nothing under `2>/dev/null`, and the
+/// converge's packet read `orphans_check: ok` having walked no deletion
+/// at all — measured, the same commit as a checkout names three deleted
+/// manifests. A tree git cannot read is CANNOT ANSWER, never clean.
+#[test]
+fn the_lint_refuses_a_tree_whose_history_git_cannot_read() {
+    let c = LintCase::new("lint-no-history", &[]);
+    let ceiling = ("GIT_CEILING_DIRECTORIES", c.c.root.display().to_string());
+    let (rc, out) = c.run(std::slice::from_ref(&ceiling));
+    assert_eq!(rc, 0, "the lint did not pass a clean fixture:\n{out}");
+
+    std::fs::remove_dir_all(c.c.tree.join(".git")).unwrap();
+    let (rc, out) = c.run(&[ceiling]);
+    assert_ne!(
+        rc, 0,
+        "a tree whose history cannot be read was reported clean:\n{out}"
+    );
+    names_all(
+        &out,
+        &["CANNOT ANSWER", "git rev-parse"],
+        "the lint's unreadable-history case",
+    );
+    assert!(
+        !out.contains("OK —"),
+        "a lint that could not look said OK:\n{out}"
     );
 }
 

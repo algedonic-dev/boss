@@ -1,5 +1,17 @@
 # Source declaration only. Publishing this rule, declaring the credential,
 # human scoping and receiver enrollment are separate recorded operations.
+#
+# THE PURPOSE AND THE ONE LINE ARE THIS ROW'S TO DECLARE (1e50e66b; item
+# 3dc0b247), as the machine token key's row declares its own. Unnamed,
+# the handler fell back to the runner's purpose and joined no line, so
+# the person enrolling the key would have been shown a bare public key —
+# the one that opened a shell on boss-gcp when it was placed alone
+# (packet 96a0f7bb, item dea2236f). The forced command is the receiver's
+# root-owned copy, the path infra/gcp/runner-credential-enrollment.template
+# proposes and the sudoers rule there grants with no arguments; the
+# handler joins it to the public half as `command="…",restrict <key>`
+# and writes that WHOLE line onto the enroll step of
+# prepare-a-deposit-key, whose `written_by` names this rule.
 [[rule]]
 name = "broker-prepares-the-runner-deposit-key"
 why = """
@@ -12,6 +24,10 @@ delivery, revoke an identity, or spawn a packet.
 """
 on_event = "step.done.credential-rotation"
 when = 'subject_id = "runner-deposit-key"'
+# v2 adds `purpose` and `forced_command` (above). The seed keeps a row it
+# already holds at its version, so without the bump the live rule would
+# stay at v1 and keep proposing a bare key (a-rule-edit-bumps-its-version).
+version = 2
 [[rule.do]]
 handler = "credential.prepare.ssh-deposit"
-args = { secret_namespace = "\"boss\"", secret_name = "\"runner-deposit-key\"", credential_id = "\"runner-deposit-key\"", protocol_kind = "\"prepare-a-deposit-key\"", receiver_host = "\"boss-gcp\"" }
+args = { secret_namespace = "\"boss\"", secret_name = "\"runner-deposit-key\"", credential_id = "\"runner-deposit-key\"", protocol_kind = "\"prepare-a-deposit-key\"", receiver_host = "\"boss-gcp\"", purpose = "\"ops-runner credential deposit\"", forced_command = "\"exec sudo -n /usr/local/libexec/boss/runner-delivery/infra/gcp/runner-credential-recv.sh\"" }

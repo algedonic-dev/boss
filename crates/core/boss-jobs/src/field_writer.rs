@@ -27,14 +27,14 @@
 //! extension, which a client cannot set; a signer judgment comes from the
 //! verified session and scoped required-role check described below.
 //! The runner door is [`crate::runner_credential`] (the resolve step of
-//! design f623e425 option A); until the broker's Secret it reads is
-//! mounted and filled (the credential kind and its broker handler, the
-//! next car), no caller satisfies a declared writer, which is why no
-//! live protocol declares a runner writer yet — the declaration lands on the
-//! ops-request row with the credential delivery, never before it. The
-//! viability lint holds that: runner writers not in
-//! [`RESOLVABLE_PRINCIPALS`] are refused at publish. A signer declaration
-//! independently requires the step's sign-off roles.
+//! design f623e425 option A), and only a slot the credential broker has
+//! filled satisfies it — which is why the ops-request row declared the
+//! runner as a writer only once both runner hosts had a delivered
+//! credential (row E, 2026-10-10): the declaration lands with the
+//! credential delivery, never before it. The viability lint holds that:
+//! runner writers not in [`RESOLVABLE_PRINCIPALS`] are refused at
+//! publish. A signer declaration independently requires the step's
+//! sign-off roles.
 //!
 //! THE HOST BINDING. A credential bound to a host writes only packets
 //! whose `host` (job metadata) is that host — "a runner for host h
@@ -93,14 +93,20 @@ pub struct ReservedKey {
 /// declaration lands with the credential delivery, never before it"
 /// stopped being a sentence and became a refusal.
 ///
-/// STILL EMPTY WITH THE DOOR MOUNTED (2026-09-29). The resolve step
-/// ([`crate::runner_credential`]) resolves `runner:ops`, but only from a
-/// slot the broker has filled, and no broker fills one yet: listed now,
-/// a protocol could declare the writer and lock the runner out of the
-/// plan David approves. `runner:ops` enters here in the car that
-/// delivers a credential the runner can present; the door's test pins
-/// every entry to a principal it resolves.
-pub const RESOLVABLE_PRINCIPALS: &[&str] = &[];
+/// EMPTY WITH THE DOOR MOUNTED (2026-09-29), because the resolve step
+/// ([`crate::runner_credential`]) resolves `runner:ops` only from a slot
+/// the broker has filled: listed before every runner host could present
+/// one, a protocol could declare the writer and lock that host's runner
+/// out of the plan David approves.
+///
+/// `runner:ops` ENTERED ON 2026-10-10 (row E of design b08725c2, backlog
+/// 6c9183de), once both hosts that run an ops runner held a delivered
+/// credential: forge, presenting since 2026-10-09, and boss-gcp, whose
+/// first issuance (rotation f194ab3e) the broker promoted on delivery at
+/// 2026-10-10T22:18Z. The same car declares it on the ops-request row.
+/// The entry is the door's own constant, and the door's test pins every
+/// entry to a principal it resolves.
+pub const RESOLVABLE_PRINCIPALS: &[&str] = &[crate::runner_credential::PRINCIPAL];
 
 /// Gateway session authority is distinct from enrolled host credentials.
 pub const SIGNER_WRITER: &str = "signer";
@@ -226,6 +232,18 @@ pub fn repin_refusals(
 ) -> Vec<String> {
     let executor_changed = now_metadata.get(crate::credential_executor::KEY)
         != next_metadata.get(crate::credential_executor::KEY);
+    // THE BEFORE-CLAIM DECLARATION DOES NOT MOVE ON A LIVE STEP EITHER
+    // (re-review 211cbae4 N1, backlog e6b05dd6). It is a projected
+    // default, so a convert re-projected it: up-pinned onto a Building
+    // its run had claimed under a version declaring nothing, it made a
+    // record the run wrote itself read as its launch; dropped and then
+    // restored, it opened the same hole. Nor its claim mark.
+    let before_claim_changed = [
+        crate::records_before_claim::KEY,
+        crate::records_before_claim::CLAIMED_KEY,
+    ]
+    .iter()
+    .any(|k| now_metadata.get(k) != next_metadata.get(k));
     let writer_of = |fields: &[StepField], name: &str| {
         fields
             .iter()
@@ -272,6 +290,12 @@ pub fn repin_refusals(
     if executor_changed {
         out.push(
             "a live step's credential executor cannot be added, removed or changed by a re-pin"
+                .into(),
+        );
+    }
+    if before_claim_changed {
+        out.push(
+            "a live step's records_before_claim cannot be added, removed or changed by a re-pin"
                 .into(),
         );
     }

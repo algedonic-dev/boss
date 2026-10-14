@@ -267,8 +267,12 @@ async function controls(page: Page, scope: Scope): Promise<ReadonlyArray<Control
       const h = el as HTMLElement;
       const style = getComputedStyle(h);
       const rect = h.getBoundingClientRect();
-      const visible = style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-      const disabled = (h as HTMLButtonElement).disabled || h.getAttribute('aria-disabled') === 'true';
+      // A closed details child can keep a layout box while the browser
+      // refuses its click; native visibility catches that. SVG groups have
+      // no CSS box, so retain their existing geometric census.
+      const nativeVisible = h.namespaceURI !== 'http://www.w3.org/1999/xhtml' || h.checkVisibility();
+      const visible = nativeVisible && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+      const disabled = h.matches(':disabled') || h.getAttribute('aria-disabled') === 'true';
       if (!visible || disabled) return [];
       if (scope === 'page' && !h.closest(pageScope)) return [];
       if (scope === 'dialog' && !h.closest(dialogs)) return [];
@@ -467,6 +471,21 @@ async function clickLeg(
   // (a) every in-app href is served — and one that lands on / says
   // Home (HOME_LINK above).
   if (leg === 'main' && scope === 'page') {
+    // 50ab513c: a green link crawl must actually have product rows to
+    // judge. Dedicated page specs cannot prove the shared mock paints them.
+    if (route === '/ux/products') {
+      const rows = page.locator('.prod-table tbody tr');
+      await expect(rows).toHaveCount(2);
+      const active = rows.filter({ hasText: 'CRAWL-ACTIVE' });
+      const retired = rows.filter({ hasText: 'CRAWL-RETIRED' });
+      await expect(active.locator('td').nth(4)).toHaveText('23');
+      await expect(retired.locator('td').nth(4)).toHaveText('7');
+      await expect(active).not.toHaveClass(/retired/);
+      await expect(retired).toHaveClass(/retired/);
+      await expect(retired).toHaveCSS('opacity', '0.5');
+      await expect(active.locator('a')).toHaveAttribute('href', '/ux/products/CRAWL-ACTIVE');
+      await expect(retired.locator('a')).toHaveAttribute('href', '/ux/products/CRAWL-RETIRED');
+    }
     const anchors = await page.locator('a[href]').evaluateAll((els) =>
       els.map((a) => ({
         href: a.getAttribute('href') ?? '',
@@ -777,6 +796,31 @@ const SHARDS = 4;
 test.describe('the interaction crawl — every rendered link lands, every control answers, back returns', () => {
   test.describe.configure({ mode: 'parallel' });
 
+  test('the control census respects closed details and inherited disabled fieldsets', async ({ page }) => {
+    await page.setContent(`<main class="shell-content">
+      <button>Available</button>
+      <details><summary>Prepared input</summary><button>Hidden until opened</button></details>
+      <fieldset disabled><legend><button>Legend exception</button></legend><button>Inherited refusal</button></fieldset>
+      <svg width="30" height="30"><g role="button" aria-label="SVG control"><rect width="20" height="20" /></g></svg>
+    </main>`);
+    expect((await controls(page, 'page')).map(control => control.label)).toEqual(['Available', 'Legend exception', 'SVG control']);
+    await page.locator('summary').click();
+    expect((await controls(page, 'page')).map(control => control.label)).toEqual(['Available', 'Hidden until opened', 'Legend exception', 'SVG control']);
+  });
+
+  test('the policy control census does not try to click a closed prepared-input button', async ({ page }) => {
+    await installLegs(page, { refuse: false, empty: false });
+    await page.goto('/it/registry/policy');
+    await expect(page.getByRole('heading', { name: 'Named-person permissions' })).toBeVisible();
+    const measured = await page.locator('button').evaluateAll(buttons => buttons.map((button, index) => ({
+      index, text: button.textContent?.trim(), innerText: (button as HTMLButtonElement).innerText,
+      visible: button.checkVisibility(), disabled: button.matches(':disabled'),
+      ownDisabled: (button as HTMLButtonElement).disabled, closedDetails: !!button.closest('details:not([open])'),
+    })));
+    console.log('policy native button observations', JSON.stringify(measured));
+    expect((await controls(page, 'page')).some(control => control.label.startsWith('<button #'))).toBe(false);
+  });
+
   for (let shard = 0; shard < SHARDS; shard++) {
     test(`shard ${shard + 1}/${SHARDS}: links, clicks, back, empty backend, refused writes`, async ({ page }) => {
       test.setTimeout(600_000);
@@ -796,6 +840,16 @@ test.describe('the interaction crawl — every rendered link lands, every contro
         mode.refuse = false;
         mode.empty = false;
         found.push(...(await clickLeg(page, route, 'main', 'page', tally, errors)));
+        if (route === '/ux/products') {
+          for (const [sku, name] of [['CRAWL-ACTIVE', 'Crawl output'], ['CRAWL-RETIRED', 'Retired crawl output']] as const) {
+            await page.locator('.prod-table').getByRole('link', { name: sku, exact: true }).click();
+            await expect(page).toHaveURL(new RegExp(`/ux/products/${sku}$`));
+            await expect(page.locator('h1')).toContainText(name);
+            await page.goBack();
+            await expect(page).toHaveURL(/\/ux\/products$/);
+            await expect(page.locator('.prod-table tbody tr')).toHaveCount(2);
+          }
+        }
         mode.refuse = true;
         found.push(...(await clickLeg(page, route, 'refused', 'page', tally, errors)));
         mode.refuse = false;

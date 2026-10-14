@@ -187,19 +187,17 @@ fn every_swallowing_shape_is_refused_by_file_and_line() {
 /// The early-return spelling of the same line (backlog 865d3d51):
 /// `if (!r.ok) return [];` sat in `vendors/api.ts` for months, outside
 /// the ternary pattern, and turned four vendor CRM refusals into "No
-/// contacts captured yet". `[]` and `{}` are refused, braced or not;
-/// `return null` is NOT — measured on origin/main 158bf310 it is ten
-/// readers whose `null` is the "no reading" arm their caller renders as
-/// unknown, which a grep cannot tell from a swallow.
+/// contacts captured yet". Empty arrays, objects and null are refused,
+/// braced or not; measured no-reading consumers require exact allowances.
 #[test]
-fn the_early_return_shape_is_refused_and_null_is_not() {
+fn the_early_return_shape_is_refused_including_null() {
     let tree = Tree::new("early-return");
     tree.file(
         "apps/web/src/vendors/api.ts",
         "async function f(r: Response) {\n  if (!r.ok) return [];\n  if ( ! resp.ok ) { return {}; }\n  return r.json();\n}\n",
     );
     tree.file(
-        "apps/web/src/finance/api.ts",
+        "apps/web/src/new-reader.ts",
         "async function g(r: Response) {\n  if (!r.ok) return null;\n  if (!r.ok) return;\n  return r.json();\n}\n",
     );
     let out = tree.run();
@@ -213,6 +211,7 @@ fn the_early_return_shape_is_refused_and_null_is_not() {
     for expect in [
         "apps/web/src/vendors/api.ts:2",
         "apps/web/src/vendors/api.ts:3",
+        "apps/web/src/new-reader.ts:2",
     ] {
         assert!(
             msg.contains(expect),
@@ -220,9 +219,24 @@ fn the_early_return_shape_is_refused_and_null_is_not() {
         );
     }
     assert!(
-        !msg.contains("apps/web/src/finance/api.ts"),
-        "`return null` and a bare `return` are not the class:\n{msg}"
+        !msg.contains("apps/web/src/new-reader.ts:3"),
+        "a bare return carries no empty value: {msg}"
     );
+}
+
+#[test]
+fn multiline_and_dropped_page_shapes_are_refused() {
+    let tree = Tree::new("multiline-page");
+    tree.file("apps/web/src/new-reader.ts", "const body = resp.ok\n ? await resp.json()\n : [];\nif (!resp.ok) {\n return null;\n}\nconst page = result.kind === 'ready'\n ? result.page\n : null;\n");
+    let out = tree.run();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    for line in [1, 4, 7] {
+        assert!(
+            text(&out).contains(&format!("apps/web/src/new-reader.ts:{line}")),
+            "{}",
+            text(&out)
+        );
+    }
 }
 
 /// What is NOT the class: a comment quoting the line (readState.ts and
@@ -274,14 +288,11 @@ fn an_allowance_is_held_to_its_count_both_ways() {
         assert_eq!(out.status.code(), Some(1), "{}", text(&out));
         assert!(text(&out).contains(rel), "{}", text(&out));
 
-        let fixed: String = real
-            .lines()
-            .filter(|l| !l.contains(".ok ? await") || !l.contains(".json()"))
-            .map(|l| format!("{l}\n"))
-            .collect();
-        assert_ne!(fixed, real, "the fixture must remove one allowed site");
+        // Removing all sites tests the stale allowance regardless of
+        // whether the native file uses a ternary, early return or page.
+        let fixed = "// all previously allowed sites were removed\n";
         let tree = Tree::new("under");
-        tree.file(rel, &fixed);
+        tree.file(rel, fixed);
         let out = tree.run();
         assert_eq!(
             out.status.code(),

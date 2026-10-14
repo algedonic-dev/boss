@@ -73,6 +73,7 @@ COPY crates ./crates
 COPY infra/gate-runner/gate-runner.yaml ./infra/gate-runner/gate-runner.yaml
 # The generator and lifecycle reader share this owning Job spec.
 COPY infra/consist-worker/job.json ./infra/consist-worker/job.json
+COPY infra/consist-worker/private-tmp.sh ./infra/consist-worker/private-tmp.sh
 COPY examples ./examples
 # EVERY PATH THE CRATES READ AT BUILD TIME MUST BE HERE — through a
 # build.rs, which RUNS in this stage, or an `include_str!`, which is
@@ -99,6 +100,7 @@ COPY infra/postgres ./infra/postgres
 # Rust build layer every time a shell script moved.
 COPY infra/estate/observe-lib.sh ./infra/estate/observe-lib.sh
 COPY infra/forge/host-absent-tools.txt ./infra/forge/host-absent-tools.txt
+COPY infra/forge/probe-bin/boss-gateway-read ./infra/forge/probe-bin/boss-gateway-read
 # boss-core `include_str!`s the tiers registry (ba429e7f). The runtime
 # stage copies all of infra/platform for the services to READ at run
 # time; that copy is a different stage and does not feed rustc here —
@@ -344,6 +346,7 @@ COPY infra/operator-baseline /opt/boss/infra/operator-baseline
 # hunt — and it is the version the cluster's own tooling runs.
 COPY --from=10.20.0.15:3000/david/alpine-k8s:1.33.3 /usr/bin/kubectl /usr/local/bin/kubectl
 COPY infra/gate-runner /opt/boss/infra/gate-runner
+COPY infra/train/prepare-diagnostics.sh /opt/boss/infra/train/prepare-diagnostics.sh
 # The platform Workflow bundle — protocols shipped as DATA
 # (protocols-as-data step 1). bootstrap-db.sh seeds it insert-if-
 # missing at ../platform/workflows/ relative to itself, and until

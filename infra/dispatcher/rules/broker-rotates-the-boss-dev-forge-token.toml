@@ -29,6 +29,7 @@
 # it at boot (rules::seed — backlog 41ba00cd).
 [[rule]]
 name = "broker-rotates-the-boss-dev-forge-token"
+version = 2
 why = """
 EXTERNAL GLUE, the census class for reactions whose effect lives
 outside the system: the credential broker (7ee101aa) speaks to the
@@ -45,4 +46,7 @@ on_event = "step.done.credential-rotation"
 when = 'subject_id = "boss-dev-forge-token"'
 [[rule.do]]
 handler = "credential.rotate.forgejo"
-args = { forge_user = "\"david\"", secret_namespace = "\"boss-dev\"", secret_name = "\"boss-dev-forge-token\"", secret_key = "\"token\"", scopes = "\"write:repository\"", verify_repo = "\"david/boss\"" }
+# The revoke ledger belongs to the forge user, not this Secret. Protect
+# every other declared consumer, including root's pending tree token
+# (review 7a693f47 of car 3880faeb, F1).
+args = { forge_user = "\"david\"", secret_namespace = "\"boss-dev\"", secret_name = "\"boss-dev-forge-token\"", secret_key = "\"token\"", scopes = "\"write:repository\"", verify_repo = "\"david/boss\"", spare = "\"boss-gcp,boss-gcp-root-tree-token-*,forge-host-checkout-token-*,forge-registry-push-token-*\"" }

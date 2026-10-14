@@ -105,27 +105,26 @@ fn exercise(mode: &str, listed: bool, token: bool) -> Vec<String> {
         }
         requests
     });
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "child_driver", "--nocapture"])
-        .env("CLOCK_TRANSPORT_CHILD", mode)
-        .env("CLOCK_TRANSPORT_URL", base)
-        .env("BOSS_MACHINE_TOKEN_DIR", dir)
-        .env(
-            "BOSS_MACHINE_TOKEN_HOSTS",
-            if listed {
-                host.as_str()
-            } else {
-                "unrelated.invalid"
-            },
-        )
-        .env_remove("HTTP_PROXY")
-        .env_remove("http_proxy")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("https_proxy")
-        .env_remove("ALL_PROXY")
-        .env_remove("all_proxy")
-        .output()
-        .unwrap();
+    // reqwest reads a proxy from the environment, which would carry the
+    // request (and the token the rule admitted) past the stub; the one
+    // list of variables is boss_testing's (backlog 50708d76, F-b).
+    let output = boss_testing::without_proxy(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "child_driver", "--nocapture"])
+            .env("CLOCK_TRANSPORT_CHILD", mode)
+            .env("CLOCK_TRANSPORT_URL", base)
+            .env("BOSS_MACHINE_TOKEN_DIR", dir)
+            .env(
+                "BOSS_MACHINE_TOKEN_HOSTS",
+                if listed {
+                    host.as_str()
+                } else {
+                    "unrelated.invalid"
+                },
+            ),
+    )
+    .output()
+    .unwrap();
     let requests = server.join().unwrap();
     assert!(
         output.status.success(),

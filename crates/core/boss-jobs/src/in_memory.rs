@@ -15,6 +15,11 @@ use crate::port::{
 
 #[derive(Default)]
 pub struct InMemoryJobs {
+    selection_identity: std::sync::Arc<()>,
+    native_selection:
+        Option<std::sync::Arc<crate::memory_selection_store::NativeMemorySelectionStore>>,
+    #[cfg(feature = "test-support")]
+    selection_fixture: bool,
     inner: Mutex<State>,
     recorded: Mutex<Vec<boss_core::event::Event>>,
     #[cfg(test)]
@@ -33,6 +38,7 @@ pub struct InMemoryJobs {
 struct State {
     jobs: HashMap<String, Job>,
     steps: HashMap<String, Step>,
+    station_receipts: HashMap<uuid::Uuid, crate::station_claim::SelectionReceipt>,
     first_records: HashMap<(String, String), crate::first_record::FirstRecord>,
     /// The in-memory mirror of `steps.became_ready_at`: the instant a
     /// step FIRST landed in `Ready`, written once and never moved by a
@@ -95,9 +101,586 @@ type StepChange = Box<dyn FnOnce(&mut Step) + Send>;
 /// A change another writer lands on a job row (test hook).
 type JobChange = Box<dyn FnOnce(&mut Job) + Send>;
 
+fn verify_memory_deadline(deadline: std::time::Instant) -> Result<(), JobsError> {
+    if std::time::Instant::now() >= deadline {
+        Err(JobsError::SelectionConflict(
+            "selection ingress deadline expired before commit dispatch".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn retry_memory_owners(deadline: std::time::Instant) -> Result<(), JobsError> {
+    let remaining = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .ok_or_else(|| {
+            JobsError::SelectionConflict(
+                "selection ingress deadline expired during owner acquisition".into(),
+            )
+        })?;
+    tokio::time::sleep(remaining.min(std::time::Duration::from_millis(2))).await;
+    verify_memory_deadline(deadline)
+}
+
 impl InMemoryJobs {
+    async fn claim_station_native_at(
+        &self,
+        context: &crate::station_claim::SelectionContext,
+        actor: &str,
+        displaceable: &[String],
+        stamp: &boss_core::publisher::EventStamp,
+        events: &[boss_core::event::Event],
+    ) -> Result<crate::station_claim::SelectionResult, JobsError> {
+        use crate::station_claim::SelectionResult;
+        let store = self
+            .native_selection
+            .as_ref()
+            .ok_or_else(|| JobsError::Storage("native memory owners unavailable".into()))?;
+        let observation = context.native_authority.as_ref().ok_or_else(|| {
+            JobsError::SelectionConflict("native memory requires authenticated ingress".into())
+        })?;
+        if !std::sync::Arc::ptr_eq(&self.selection_identity, &observation.store_identity)
+            || context.request_id != observation.request_id
+            || context.station.name != observation.station_name
+            || actor != observation.ingress.actor_id()
+            || Some(stamp.actor()) != observation.user.ambient_actor().as_ref()
+        {
+            return Err(JobsError::SelectionConflict(
+                "native memory constructor or authenticated request identity changed".into(),
+            ));
+        }
+        // Current read authority is independent of fresh Update/actor owners.
+        // The original record wins before a fresh owner retirement refusal.
+        let read = self
+            .native_selection_read(
+                &observation.ingress,
+                context.request_id,
+                &context.station.name,
+            )
+            .await?
+            .ok_or_else(|| JobsError::Storage("native memory read owner unavailable".into()))?;
+        if let Some(original) = read.original {
+            return Ok(SelectionResult::Replayed(original));
+        }
+        if read.user != observation.user
+            || read.scope != observation.scope
+            || context.scope != observation.scope
+        {
+            return Err(JobsError::SelectionConflict(
+                "native memory read identity or scope changed".into(),
+            ));
+        }
+        let mut owned = context.clone();
+        owned.actor_observation = Some(crate::station_claim::ActorSelectionObservation {
+            owner: store.agents.clone(),
+            holder: actor.to_owned(),
+            row: observation
+                .agents
+                .iter()
+                .find(|row| row.id == actor || row.aliases.iter().any(|alias| alias == actor))
+                .cloned(),
+            requested_user: serde_json::to_value(&observation.user)
+                .map_err(|error| JobsError::Storage(error.to_string()))?,
+        });
+        owned.definition_fence = Some(std::sync::Arc::new(
+            crate::station_claim::RegistrySelectionFence {
+                workflows: store.workflows.clone(),
+                stations: store.stations.clone(),
+                policy: std::sync::Arc::new(
+                    crate::station_claim::PolicySelectionObservation::from_native(
+                        store.policy.clone(),
+                        observation,
+                    )?,
+                ),
+            },
+        ));
+        let deadline =
+            observation.ingress.started() + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET;
+        let mut predicted = context.validated_step.clone();
+        predicted.assignee_id = Some(actor.to_owned());
+        if crate::calendar_hook::start_request(&predicted, actor)
+            .map_err(|error| JobsError::Storage(error.to_string()))?
+            .is_some()
+            && store.calendar.is_none()
+        {
+            return Err(JobsError::Storage(
+                "native memory calendar owner composition is not implemented".into(),
+            ));
+        }
+        loop {
+            match self.claim_station_native_attempt(
+                &owned,
+                observation,
+                actor,
+                displaceable,
+                stamp,
+                events,
+                deadline,
+            ) {
+                Ok(Some(result)) => return Ok(result),
+                Ok(None) => retry_memory_owners(deadline).await?,
+                Err(error) => {
+                    // A competitor may have created the first record while a
+                    // writer was changing fresh authority. Re-read through
+                    // current read owners, never a bare receipt-map bypass.
+                    let read = self
+                        .native_selection_read(
+                            &observation.ingress,
+                            context.request_id,
+                            &context.station.name,
+                        )
+                        .await?;
+                    if let Some(original) = read.and_then(|read| read.original) {
+                        return Ok(SelectionResult::Replayed(original));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+    fn claim_station_native_attempt(
+        &self,
+        context: &crate::station_claim::SelectionContext,
+        observation: &crate::station_claim::NativeAuthorityObservation,
+        actor: &str,
+        displaceable: &[String],
+        stamp: &boss_core::publisher::EventStamp,
+        events: &[boss_core::event::Event],
+        deadline: std::time::Instant,
+    ) -> Result<Option<crate::station_claim::SelectionResult>, JobsError> {
+        use crate::station_claim::SelectionResult;
+        verify_memory_deadline(deadline)?;
+        let fence = context.definition_fence.as_ref().ok_or_else(|| {
+            JobsError::Storage("native memory owner composition unavailable".into())
+        })?;
+        let Some(_owners) = fence.try_lock_verified(context, actor, stamp.timestamp)? else {
+            return Ok(None);
+        };
+        let mut predicted = context.validated_step.clone();
+        predicted.assignee_id = Some(actor.to_owned());
+        let calendar_request = crate::station_claim::native_calendar_request(
+            observation,
+            &predicted,
+            boss_policy_client::engine::expiry_now(),
+        )?;
+        let calendar_plan = match &calendar_request {
+            Some((request, _)) => {
+                let calendar = self
+                    .native_selection
+                    .as_ref()
+                    .and_then(|store| store.calendar.as_ref())
+                    .ok_or_else(|| {
+                        JobsError::Storage("native memory calendar owner unavailable".into())
+                    })?;
+                match calendar.try_stage_claim(request.clone(), stamp).map_err(
+                    |error| match error {
+                        boss_calendar::CalendarError::Conflict { existing } => {
+                            JobsError::SelectionCalendarConflict { existing }
+                        }
+                        other => JobsError::SelectionConflict(other.to_string()),
+                    },
+                )? {
+                    Some(plan) => Some(plan),
+                    None => return Ok(None),
+                }
+            }
+            None => None,
+        };
+        let mut state = match self.inner.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(JobsError::Storage("selection state unavailable".into()));
+            }
+        };
+        if let Some(receipt) = state.station_receipts.get(&context.request_id) {
+            crate::station_claim::replay(
+                receipt,
+                actor,
+                &context.station.name,
+                context.request_id,
+            )?;
+            receipt.require_read_scope(&context.scope)?;
+            return Ok(Some(SelectionResult::Replayed(receipt.clone())));
+        }
+        let mut owner_consumption = _owners.verify_at_commit()?;
+        crate::station_claim::require_native_claim_constraints(observation, context)?;
+        let at = boss_policy_client::engine::expiry_now();
+        owner_consumption["step_authority"] = crate::station_claim::require_native_step_authority(
+            observation,
+            &context.validated_step,
+            at,
+        )?;
+        owner_consumption["ingress"] = observation.ingress.observation();
+        owner_consumption["budget_hour"] = observation.budget_hour_observation(context);
+        owner_consumption["prepared_inputs"] = observation.prepared_inputs();
+        owner_consumption["credential_executor"] = crate::station_claim::require_native_executor(
+            observation,
+            &context.validated_step,
+            &context.validated_job,
+        )?;
+        owner_consumption["calendar"] = match (&calendar_request, &calendar_plan) {
+            (Some((request, decision)), Some(plan)) => {
+                serde_json::json!({"required":true, "request":request,"decision":decision,"evaluated_at":at,"consumed":plan.observation()})
+            }
+            _ => {
+                serde_json::json!({"required":false,"reason":"stored step has no complete scheduling window"})
+            }
+        };
+        let decision = observation.policy_decision(
+            boss_policy_client::controls::UPDATE_STEP.action(),
+            &boss_policy_client::controls::UPDATE_STEP.resource(),
+        );
+        let boss_policy_client::Decision::Allow {
+            scope: update_scope,
+        } = decision
+        else {
+            return Err(JobsError::SelectionConflict(
+                "native step update authority unavailable".into(),
+            ));
+        };
+        if !crate::policy_glue::scope_matches(
+            &observation.user,
+            &update_scope,
+            &context.validated_job,
+        ) && !crate::policy_glue::step_is_callers(
+            &observation.user,
+            context.validated_job.status == JobStatus::Open,
+            &context.validated_step,
+        ) {
+            return Err(JobsError::SelectionConflict(
+                "native step update is outside its actual grant scope".into(),
+            ));
+        }
+        owner_consumption["run_population"] = serde_json::json!({"applicable": false, "method": "actual Jobs writer lock", "reason": "validated step or actor declares no run cap"});
+        // This population is owned by the Jobs writer lock already held,
+        // not a second HTTP count or a cached authorization observation.
+        if let Some(row) = context
+            .actor_observation
+            .as_ref()
+            .and_then(|observation| observation.row.as_ref())
+        {
+            let resolved = crate::agent_spec::resolved_steps(
+                std::slice::from_ref(&context.validated_step),
+                context.active_workflows.get(&context.validated_job.kind),
+            );
+            if resolved
+                .first()
+                .is_some_and(|step| crate::agent_budget::declares_an_agent_run(&step.metadata))
+                && let Some(cap) = row
+                    .max_concurrent_runs
+                    .and_then(|cap| u32::try_from(cap).ok())
+            {
+                let held_by: Vec<String> = std::iter::once(row.id.clone())
+                    .chain(row.aliases.iter().cloned())
+                    .collect();
+                let mut runs: Vec<_> = state
+                    .jobs
+                    .values()
+                    .filter(|job| job.kind == crate::agent_budget::RUN_KIND)
+                    .cloned()
+                    .collect();
+                runs.sort_by_key(|run| *run.id.inner().as_uuid());
+                let count = crate::agent_budget::in_flight_runs(&runs, &held_by);
+                let reading = crate::agent_budget::Concurrency::measure(&row.id, Some(cap), count);
+                owner_consumption["run_population"] = serde_json::json!({
+                    "applicable": true, "method": "actual Jobs writer lock", "actor": row,
+                    "held_by": held_by, "query": {"kind": crate::agent_budget::RUN_KIND, "status": "open"},
+                    "rows_predicate": {"agent_in":held_by,"status":"open"},
+                    "rows": runs.iter().filter(|run| crate::agent_budget::counted_run(run,&held_by))
+                        .map(|run| serde_json::json!({"id":run.id,"kind":run.kind,"status":run.status,
+                            "agent":run.metadata.get(crate::agent_budget::RUN_AGENT_KEY),
+                            "owner_id":run.owner_id,"subject":run.subject})).collect::<Vec<_>>(),
+                    "count": count, "reading": reading,
+                });
+                if !reading.decision.is_allowed() {
+                    return Err(JobsError::SelectionConflict(
+                        serde_json::to_string(&reading.refusal_body())
+                            .map_err(|error| JobsError::Storage(error.to_string()))?,
+                    ));
+                }
+            }
+        }
+
+        let mut packets = Vec::new();
+        for job in state
+            .jobs
+            .values()
+            .filter(|job| job.status == JobStatus::Open && context.scope.admits(job))
+        {
+            let id = job.id.to_string();
+            if state.unreadable_jobs.contains(&id) || state.unreadable_steps.contains(&id) {
+                return Err(JobsError::Storage(
+                    "selection packet or step roster unavailable".into(),
+                ));
+            }
+            let mut steps: Vec<_> = state
+                .steps
+                .values()
+                .filter(|step| step.job_id == job.id)
+                .cloned()
+                .collect();
+            steps.sort_by_key(|step| (step.sort_order, *step.id.inner().as_uuid()));
+            packets.push((job.clone(), steps));
+        }
+        packets.sort_by_key(|(job, _)| *job.id.inner().as_uuid());
+        context.revalidate(&packets)?;
+        owner_consumption["open_population"] = serde_json::json!(packets);
+        let mut recorded = match self.recorded.try_lock() {
+            Ok(recorded) => recorded,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(JobsError::Storage("event log unavailable".into()));
+            }
+        };
+        let (step, invalidated) = prepare_claim_in_state(
+            &state,
+            &context.validated_step.id,
+            actor,
+            displaceable,
+            stamp,
+            events,
+        )?;
+        let (receipt, event) = context.record_consumed(actor, stamp, &step, owner_consumption)?;
+        _owners.verify_at_commit()?;
+        crate::station_claim::require_native_executor(observation, &step, &context.validated_job)?;
+        crate::station_claim::require_native_step_authority(
+            observation,
+            &context.validated_step,
+            boss_policy_client::engine::expiry_now(),
+        )?;
+        let final_calendar = crate::station_claim::native_calendar_request(
+            observation,
+            &step,
+            boss_policy_client::engine::expiry_now(),
+        )?;
+        if final_calendar.as_ref().map(|(request, _)| request)
+            != calendar_request.as_ref().map(|(request, _)| request)
+        {
+            return Err(JobsError::SelectionConflict(
+                "calendar plan disagrees with actual stored assignee or window".into(),
+            ));
+        }
+        verify_memory_deadline(deadline)?;
+        let calendar_event = calendar_plan
+            .as_ref()
+            .and_then(|plan| plan.event().cloned());
+        // The applied guard retains both actual calendar writers until every
+        // joined Job/receipt/event effect is in place. No fallible work follows.
+        let _applied_calendar = calendar_plan.map(|plan| plan.apply());
+        let key = step_key(&step.id);
+        state.steps.insert(key.clone(), step.clone());
+        touch_step(&mut state, key, stamp.timestamp);
+        state
+            .station_receipts
+            .insert(context.request_id, receipt.clone());
+        recorded.extend_from_slice(events);
+        recorded.extend(invalidated);
+        recorded.extend(event);
+        if let Some(event) = calendar_event {
+            recorded.push(event);
+        }
+        Ok(Some(SelectionResult::Claimed {
+            step: Box::new(step),
+            receipt,
+        }))
+    }
+    #[cfg(feature = "test-support")]
+    fn claim_station_fixture_at(
+        &self,
+        context: &crate::station_claim::SelectionContext,
+        actor: &str,
+        displaceable: &[String],
+        stamp: &boss_core::publisher::EventStamp,
+        events: &[boss_core::event::Event],
+    ) -> Result<crate::station_claim::SelectionResult, JobsError> {
+        use crate::station_claim::SelectionResult;
+        {
+            let state = self
+                .inner
+                .lock()
+                .map_err(|_| JobsError::Storage("selection state unavailable".into()))?;
+            if let Some(receipt) = state.station_receipts.get(&context.request_id) {
+                crate::station_claim::replay(
+                    receipt,
+                    actor,
+                    &context.station.name,
+                    context.request_id,
+                )?;
+                return Ok(SelectionResult::Replayed(receipt.clone()));
+            }
+        }
+        let fence = context
+            .definition_fence
+            .as_ref()
+            .ok_or_else(|| JobsError::Storage("selection definition fence unavailable".into()))?;
+        let _owners = match fence.lock_verified(context, actor, stamp.timestamp) {
+            Ok(owners) => owners,
+            Err(error) => {
+                // A competitor can commit the original receipt after our
+                // first lookup but before an owner retires. That durable
+                // first record is replay, not a fresh acquisition.
+                let state = self
+                    .inner
+                    .lock()
+                    .map_err(|_| JobsError::Storage("selection state unavailable".into()))?;
+                if let Some(receipt) = state.station_receipts.get(&context.request_id) {
+                    crate::station_claim::replay(
+                        receipt,
+                        actor,
+                        &context.station.name,
+                        context.request_id,
+                    )?;
+                    return Ok(SelectionResult::Replayed(receipt.clone()));
+                }
+                return Err(error);
+            }
+        };
+        (|| {
+            let mut state = self
+                .inner
+                .lock()
+                .map_err(|_| JobsError::Storage("selection state unavailable".into()))?;
+            if let Some(receipt) = state.station_receipts.get(&context.request_id) {
+                crate::station_claim::replay(
+                    receipt,
+                    actor,
+                    &context.station.name,
+                    context.request_id,
+                )?;
+                return Ok(SelectionResult::Replayed(receipt.clone()));
+            }
+            let mut owner_consumption = _owners.verify_at_commit()?;
+            owner_consumption["run_population"] = serde_json::json!({"applicable": false, "method": "actual Jobs writer lock", "reason": "validated step or actor declares no run cap"});
+            // This population is owned by the Jobs writer lock already held,
+            // not a second HTTP count or a cached authorization observation.
+            if let Some(row) = context
+                .actor_observation
+                .as_ref()
+                .and_then(|observation| observation.row.as_ref())
+            {
+                let resolved = crate::agent_spec::resolved_steps(
+                    std::slice::from_ref(&context.validated_step),
+                    context.active_workflows.get(&context.validated_job.kind),
+                );
+                if resolved
+                    .first()
+                    .is_some_and(|step| crate::agent_budget::declares_an_agent_run(&step.metadata))
+                    && let Some(cap) = row
+                        .max_concurrent_runs
+                        .and_then(|cap| u32::try_from(cap).ok())
+                {
+                    let held_by: Vec<String> = std::iter::once(row.id.clone())
+                        .chain(row.aliases.iter().cloned())
+                        .collect();
+                    let runs: Vec<_> = state
+                        .jobs
+                        .values()
+                        .filter(|job| job.kind == crate::agent_budget::RUN_KIND)
+                        .cloned()
+                        .collect();
+                    let count = crate::agent_budget::in_flight_runs(&runs, &held_by);
+                    let reading =
+                        crate::agent_budget::Concurrency::measure(&row.id, Some(cap), count);
+                    owner_consumption["run_population"] = serde_json::json!({
+                        "applicable": true, "method": "actual Jobs writer lock", "actor": row,
+                        "held_by": held_by, "query": {"kind": crate::agent_budget::RUN_KIND, "status": "open"},
+                        "rows": runs.iter().filter(|run| run.status == JobStatus::Open).collect::<Vec<_>>(),
+                        "count": count, "reading": reading,
+                    });
+                    if !reading.decision.is_allowed() {
+                        return Err(JobsError::SelectionConflict(
+                            serde_json::to_string(&reading.refusal_body())
+                                .map_err(|error| JobsError::Storage(error.to_string()))?,
+                        ));
+                    }
+                }
+            }
+
+            let mut packets = Vec::new();
+            for job in state
+                .jobs
+                .values()
+                .filter(|job| job.status == JobStatus::Open && context.scope.admits(job))
+            {
+                let id = job.id.to_string();
+                if state.unreadable_jobs.contains(&id) || state.unreadable_steps.contains(&id) {
+                    return Err(JobsError::Storage(
+                        "selection packet or step roster unavailable".into(),
+                    ));
+                }
+                let steps = state
+                    .steps
+                    .values()
+                    .filter(|step| step.job_id == job.id)
+                    .cloned()
+                    .collect();
+                packets.push((job.clone(), steps));
+            }
+            context.revalidate(&packets)?;
+            let mut recorded = self
+                .recorded
+                .lock()
+                .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
+            let (step, invalidated) = prepare_claim_in_state(
+                &state,
+                &context.validated_step.id,
+                actor,
+                displaceable,
+                stamp,
+                events,
+            )?;
+            let (receipt, event) =
+                context.record_consumed(actor, stamp, &step, owner_consumption)?;
+            let key = step_key(&step.id);
+            state.steps.insert(key.clone(), step.clone());
+            touch_step(&mut state, key, stamp.timestamp);
+            state
+                .station_receipts
+                .insert(context.request_id, receipt.clone());
+            recorded.extend_from_slice(events);
+            recorded.extend(invalidated);
+            recorded.extend(event);
+            Ok(SelectionResult::Claimed {
+                step: Box::new(step),
+                receipt,
+            })
+        })()
+    }
+
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Join actual in-process writer owners. No copied HTTP response or
+    /// caller-supplied User becomes authorization through this constructor.
+    pub fn for_native_selection(
+        store: crate::memory_selection_store::NativeMemorySelectionStore,
+    ) -> Self {
+        Self {
+            native_selection: Some(std::sync::Arc::new(store)),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn for_selection_fixture() -> Self {
+        Self {
+            selection_fixture: true,
+            ..Self::default()
+        }
+    }
+
+    fn is_selection_fixture(&self) -> bool {
+        #[cfg(feature = "test-support")]
+        {
+            self.selection_fixture
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            false
+        }
     }
 
     /// Stamp new steps from `registry`, as the Pg adapter stamps from
@@ -149,6 +732,14 @@ impl InMemoryJobs {
     pub fn fail_steps_read(&self, job_id: &JobId) {
         if let Ok(mut state) = self.inner.lock() {
             state.unreadable_steps.insert(job_key(job_id));
+        }
+    }
+
+    /// Restore step reads after an injected temporary storage failure.
+    /// A retry test must recover the same store, not build a fresh one.
+    pub fn restore_steps_read(&self, job_id: &JobId) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.unreadable_steps.remove(&job_key(job_id));
         }
     }
 
@@ -579,6 +1170,81 @@ fn pinned_to_workflow_locked(state: &State, kind: &str, version: i32) -> crate::
 
 #[async_trait]
 impl JobsRepository for InMemoryJobs {
+    fn native_selection_requires_ingress(&self) -> bool {
+        !self.is_selection_fixture()
+    }
+
+    async fn native_selection_read(
+        &self,
+        ingress: &crate::station_claim::AuthenticatedSelectionIngress,
+        request_id: uuid::Uuid,
+        station: &str,
+    ) -> Result<Option<crate::station_claim::NativeSelectionRead>, JobsError> {
+        let store = self
+            .native_selection
+            .as_ref()
+            .ok_or_else(|| JobsError::Storage("native memory owners unavailable".into()))?;
+        let deadline = ingress.started() + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET;
+        loop {
+            verify_memory_deadline(deadline)?;
+            let result = store.try_read(ingress, |user, scope| {
+                let state = match self.inner.try_lock() {
+                    Ok(state) => state,
+                    Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(JobsError::Storage("selection state unavailable".into()));
+                    }
+                };
+                let original = state.station_receipts.get(&request_id).cloned();
+                if let Some(receipt) = &original {
+                    crate::station_claim::replay(receipt, ingress.actor_id(), station, request_id)?;
+                    receipt.require_read_scope(&scope)?;
+                    let selected = receipt
+                        .pointer("/selected/job_id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|id| state.jobs.get(id));
+                    if !selected.is_some_and(|job| scope.admits(job)) {
+                        return Err(JobsError::SelectionConflict(
+                            "original packet is outside current read scope".into(),
+                        ));
+                    }
+                }
+                verify_memory_deadline(deadline)?;
+                Ok(Some(crate::station_claim::NativeSelectionRead {
+                    user,
+                    scope,
+                    original,
+                }))
+            })?;
+            if let Some(read) = result {
+                return Ok(Some(read));
+            }
+            retry_memory_owners(deadline).await?;
+        }
+    }
+
+    async fn prepare_native_selection(
+        &self,
+        ingress: crate::station_claim::AuthenticatedSelectionIngress,
+        request_id: uuid::Uuid,
+        station: &str,
+    ) -> Result<Option<crate::station_claim::NativeAuthorityObservation>, JobsError> {
+        let store = self
+            .native_selection
+            .as_ref()
+            .ok_or_else(|| JobsError::Storage("native memory owners unavailable".into()))?;
+        let deadline = ingress.started() + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET;
+        loop {
+            verify_memory_deadline(deadline)?;
+            if let Some(observation) =
+                store.try_observe(&ingress, request_id, station, &self.selection_identity)?
+            {
+                verify_memory_deadline(deadline)?;
+                return Ok(Some(observation));
+            }
+            retry_memory_owners(deadline).await?;
+        }
+    }
     async fn create_job_with_steps_at(
         &self,
         job: &Job,
@@ -1133,6 +1799,11 @@ impl JobsRepository for InMemoryJobs {
                     .steps
                     .get(&key)
                     .ok_or(JobsError::StepNotFound(r.step.id))?;
+                // Only the row the plan was read from (third review
+                // 85c11887 B1, [`crate::repin::Reprojected::read`]).
+                if r.read != Some(version_of(&state, &key)) {
+                    return Err(JobsError::StepChanged { id: r.step.id });
+                }
                 if !matches!(stored.status, StepStatus::Completed | StepStatus::Skipped)
                     || r.unskipped
                 {
@@ -1454,14 +2125,8 @@ impl JobsRepository for InMemoryJobs {
         let shape = next.shape_hash();
         next.metadata = serde_json::Value::Object(metadata);
         let invalidated = crate::events::void_stamps_if_moved(stamp, &shape, &mut next);
-        let mut event = stamp.event(crate::events::STEP_FIRST_RECORDED, serde_json::Value::Null);
-        let record = FirstRecord::new(next.job_id, *id, key, value, stamp, event.id);
-        event.payload = stamp
-            .event(
-                crate::events::STEP_FIRST_RECORDED,
-                serde_json::json!({"step":next,"record":record}),
-            )
-            .payload;
+        let record = FirstRecord::new(next.job_id, *id, key, value, stamp, uuid::Uuid::new_v4());
+        let event = record.event(&next, stamp);
         let state_event = stamp.event(
             crate::events::STEP_UPDATED,
             crate::events::step_state_payload(&next),
@@ -1568,6 +2233,33 @@ impl JobsRepository for InMemoryJobs {
         Ok(merged)
     }
 
+    async fn station_claim_receipt(
+        &self,
+        request_id: uuid::Uuid,
+    ) -> Result<Option<crate::station_claim::SelectionReceipt>, JobsError> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("selection state unavailable".into()))?;
+        Ok(state.station_receipts.get(&request_id).cloned())
+    }
+
+    async fn claim_station_head_at(
+        &self,
+        context: &crate::station_claim::SelectionContext,
+        actor: &str,
+        displaceable: &[String],
+        stamp: &boss_core::publisher::EventStamp,
+        events: &[boss_core::event::Event],
+    ) -> Result<crate::station_claim::SelectionResult, JobsError> {
+        #[cfg(feature = "test-support")]
+        if self.is_selection_fixture() {
+            return self.claim_station_fixture_at(context, actor, displaceable, stamp, events);
+        }
+        self.claim_station_native_at(context, actor, displaceable, stamp, events)
+            .await
+    }
+
     async fn claim_step_displacing_at(
         &self,
         step_id: &StepId,
@@ -1582,68 +2274,8 @@ impl JobsRepository for InMemoryJobs {
                 .recorded
                 .lock()
                 .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
-            let key = step_key(step_id);
-            let records: Vec<_> = state
-                .first_records
-                .iter()
-                .filter(|((id, _), _)| id == &key)
-                .map(|(_, record)| record.clone())
-                .collect();
-            for event in events
-                .iter()
-                .filter(|event| event.kind == crate::events::STEP_UPDATED)
-            {
-                crate::first_record::preserve(
-                    records.iter(),
-                    event
-                        .payload
-                        .get("metadata")
-                        .unwrap_or(&serde_json::Value::Null),
-                )?;
-            }
-            let Some(existing) = state.steps.get_mut(&key) else {
-                return Err(JobsError::StepNotFound(*step_id));
-            };
-            // Exact spelling only: no alias admission here, unlike the
-            // Pg adapter — the port doc on `claim_step_at` states the
-            // gap (backlog 28dcc735).
-            let held_by_actor = existing.assignee_id.as_deref() == Some(actor);
-            // A Ready step held by a holder the route named displaceable
-            // is free to this claim (backlog 5d1c0b7a) — the same rule
-            // as the Pg WHERE clause, by exact spelling in both.
-            let displaced = existing
-                .assignee_id
-                .as_ref()
-                .is_some_and(|h| displaceable.contains(h));
-            let claimable = existing.status == StepStatus::Ready
-                && (existing.assignee_id.is_none() || held_by_actor || displaced);
-            let idempotent = existing.status == StepStatus::Active && held_by_actor;
-            if !claimable && !idempotent {
-                return Err(JobsError::ClaimConflict {
-                    holder: existing.assignee_id.clone(),
-                    status: format!("{:?}", existing.status).to_lowercase(),
-                });
-            }
-            // A new holder does not inherit the previous run's edge
-            // (9562f6df). No alias table here, so the holder is `actor`
-            // exactly — the Pg adapter admits its aliases too.
-            let shape_before = existing.shape_hash();
-            if crate::agent_runs::claim_changes_holder(existing.assignee_id.as_deref(), actor, &[])
-            {
-                let next = crate::agent_runs::without_edge(&existing.metadata);
-                crate::first_record::preserve(records.iter(), &next)?;
-                existing.metadata = next;
-            }
-            existing.assignee_id = Some(actor.to_string());
-            existing.status = StepStatus::Active;
-            // The edge is inside the shape, so dropping it is an edit of
-            // the signed content, and it voids like one (backlog
-            // 4174c4a9) — or writing the edge back would revive them.
-            let invalidated = crate::events::void_stamps_if_moved(stamp, &shape_before, existing);
-            let claimed = existing.clone();
-            // A claim bumps `updated_at` in the Pg adapter; the ready
-            // stamp, already written at the flip, stays put.
-            touch_step(&mut state, key, stamp.timestamp);
+            let (claimed, invalidated) =
+                claim_in_state(&mut state, step_id, actor, displaceable, stamp, events)?;
             (claimed, invalidated, recorded)
         };
         recorded.extend_from_slice(events);
@@ -1946,6 +2578,95 @@ pub fn compute_job_status(steps: &[Step]) -> JobStatus {
     JobStatus::Open
 }
 
+fn claim_in_state(
+    state: &mut State,
+    step_id: &StepId,
+    actor: &str,
+    displaceable: &[String],
+    stamp: &boss_core::publisher::EventStamp,
+    events: &[boss_core::event::Event],
+) -> Result<(Step, Option<boss_core::event::Event>), JobsError> {
+    let (claimed, invalidated) =
+        prepare_claim_in_state(state, step_id, actor, displaceable, stamp, events)?;
+    let key = step_key(step_id);
+    state.steps.insert(key.clone(), claimed.clone());
+    touch_step(state, key, stamp.timestamp);
+    Ok((claimed, invalidated))
+}
+
+fn prepare_claim_in_state(
+    state: &State,
+    step_id: &StepId,
+    actor: &str,
+    displaceable: &[String],
+    stamp: &boss_core::publisher::EventStamp,
+    events: &[boss_core::event::Event],
+) -> Result<(Step, Option<boss_core::event::Event>), JobsError> {
+    let key = step_key(step_id);
+    let records: Vec<_> = state
+        .first_records
+        .iter()
+        .filter(|((id, _), _)| id == &key)
+        .map(|(_, record)| record.clone())
+        .collect();
+    for event in events
+        .iter()
+        .filter(|event| event.kind == crate::events::STEP_UPDATED)
+    {
+        crate::first_record::preserve(
+            records.iter(),
+            event
+                .payload
+                .get("metadata")
+                .unwrap_or(&serde_json::Value::Null),
+        )?;
+    }
+    let Some(mut existing) = state.steps.get(&key).cloned() else {
+        return Err(JobsError::StepNotFound(*step_id));
+    };
+    // Exact spelling only: no alias admission here, unlike the
+    // Pg adapter — the port doc on `claim_step_at` states the
+    // gap (backlog 28dcc735).
+    let held_by_actor = existing.assignee_id.as_deref() == Some(actor);
+    // A Ready step held by a holder the route named displaceable
+    // is free to this claim (backlog 5d1c0b7a) — the same rule
+    // as the Pg WHERE clause, by exact spelling in both.
+    let displaced = existing
+        .assignee_id
+        .as_ref()
+        .is_some_and(|h| displaceable.contains(h));
+    let claimable = existing.status == StepStatus::Ready
+        && (existing.assignee_id.is_none() || held_by_actor || displaced);
+    let idempotent = existing.status == StepStatus::Active && held_by_actor;
+    if !claimable && !idempotent {
+        return Err(JobsError::ClaimConflict {
+            holder: existing.assignee_id.clone(),
+            status: format!("{:?}", existing.status).to_lowercase(),
+        });
+    }
+    // A new holder does not inherit the previous run's edge
+    // (9562f6df). No alias table here, so the holder is `actor`
+    // exactly — the Pg adapter admits its aliases too.
+    let shape_before = existing.shape_hash();
+    if crate::agent_runs::claim_changes_holder(existing.assignee_id.as_deref(), actor, &[]) {
+        let next = crate::agent_runs::without_edge(&existing.metadata);
+        crate::first_record::preserve(records.iter(), &next)?;
+        existing.metadata = next;
+    }
+    existing.assignee_id = Some(actor.to_string());
+    existing.status = StepStatus::Active;
+    existing.metadata = crate::records_before_claim::closed_by_claim(
+        &existing.metadata,
+        &serde_json::to_value(stamp.timestamp).unwrap_or_default(),
+    );
+    // The edge is inside the shape, so dropping it is an edit of
+    // the signed content, and it voids like one (backlog
+    // 4174c4a9) — or writing the edge back would revive them.
+    let invalidated = crate::events::void_stamps_if_moved(stamp, &shape_before, &mut existing);
+    let claimed = existing.clone();
+    Ok((claimed, invalidated))
+}
+
 #[cfg(test)]
 mod tests {
     use boss_core::job::{Priority, Subject};
@@ -2031,6 +2752,9 @@ mod tests {
             repo.create_job(&job).await.unwrap();
             let step = Step::new(job.id, "task", "Evidence", 0);
             repo.add_step(&step).await.unwrap();
+            // The re-pin is handed the row's true version, so what it
+            // refuses on is the event log, not a stale read.
+            let (_, read) = repo.get_step_versioned(&step.id).await.unwrap().unwrap();
             let poison = repo.clone();
             assert!(
                 std::thread::spawn(move || {
@@ -2090,6 +2814,7 @@ mod tests {
                                 changed: vec!["metadata".into()],
                                 kept: vec![],
                                 unskipped: false,
+                                read: Some(read),
                             }],
                             inserted: vec![],
                         },

@@ -89,6 +89,24 @@
 #   matches when it names no change, and a matching plan closes the
 #   request through its `nothing-to-do` terminal with the plan on it,
 #   never reaching the approve step (see `render_plan`).
+# - A VERB THAT ALSO DECLARES `requires_review` IS APPROVED ONLY OVER A
+#   CLOSED INDEPENDENT REVIEW OF THE SAME BYTES (backlog 84e7c3e4,
+#   design 9de0cd1c — Q1 answered by David 2026-10-04). The plan is
+#   rendered FIRST onto the request's `review` step, for a dispatched
+#   reviewer; the approval's plan is rendered only once that step
+#   records verdict `release` of exactly those bytes, by a LANDED
+#   agent-run of the tenant-reviewer profile (REVIEW_PROFILE, fixed
+#   here, never read off the step), dispatched for this
+#   request's review, that is not the `source_run` whose tenant receipt
+#   names a commit the plan lands; and the plan rendered for the passkey
+#   must still hash to what was reviewed. The approve step carries the
+#   review run it relied on, inside the signed shape, and the whole
+#   check runs again before the claim (see `verify_review`). Only a verb
+#   that declares it waits — today merge-tenant-main alone (David's
+#   option A, bd331d38: a hold only where a rule requires one). A review
+#   that does not release closes the request on `not-released`: a
+#   `changes` verdict, and a review run that ended refused with no
+#   verdict at all (backlog 112d2f92, see `review_run_refused`).
 #
 # ## Behaviour
 #
@@ -135,6 +153,10 @@
 #   (b7bfe821). The request's own stamps span this runner's poll
 #   latency — up to a minute — so they cannot cost a verb; this is
 #   taken around the exec. A refusal ran nothing and records neither.
+# - Records whether this pass presented its own credential, as
+#   `runner_credential` — `presented` or `NOT presented (<why>)`, null
+#   with no credential file (backlog 50708d76, F5; see THIS RUNNER'S OWN
+#   CREDENTIAL below).
 # - A per-packet problem (refusal, missing step) never kills the loop;
 #   a transport failure to the SoR fails the unit loudly, systemd
 #   records it red, and the same loud-local-failure posture as the
@@ -323,11 +345,17 @@ fi
 # never reaches a log line, and the shell variable is emptied once the
 # header file holds it.
 #
-# IT NEVER STOPS AN ANSWER (DR rule 62dac114: no refusal on David's path).
-# No file is today's state on every host — the pass runs exactly as
-# before, sending none. A file that cannot be one header is said here and
-# the pass goes on without it: the credential adds identity, and until a
-# protocol declares a writer, identity is all it adds.
+# THIS SCRIPT NEVER STOPS A PASS FOR IT (DR rule 62dac114: no refusal on
+# David's path). No file, the pass runs sending none; a file that cannot
+# be one header is said here and the pass goes on without it. BUT THE
+# SERVER MAY REFUSE THE WRITES (row E, backlog 6c9183de, 2026-10-10):
+# under an ops-request row that declares `runner:ops` — the tree's since
+# that car, live at David's hand publish — every key this runner renders
+# (approve's and review's plan keys, the nothing-to-do record) and every
+# execute status or claim is refused 409 without this host's credential.
+# A pass without it then has its plan refused, its approval claim
+# refused before anything runs, and a read verb's answer held on the
+# request as a refused completion: loud, never a quiet answer.
 #
 # AND IT LEAVES ONLY FOR A HOST THE MACHINE TOKEN MAY LEAVE FOR (backlog
 # 7369b078, F1 of review 9c484ca8). Its header was made whatever $BASE
@@ -336,13 +364,35 @@ fi
 # this. The host is judged FIRST, by the library's own rule
 # (machine_token_admits — loopback or BOSS_MACHINE_TOKEN_HOSTS), so off
 # the estate the file is not read at all; said below, and the pass goes
-# on, as for every other reason it is not presented.
+# on, as for every other reason it is not presented. The rule also
+# withholds a request curl would send through a proxy (backlog 50708d76,
+# F4), and the line says which of the two refused.
+#
+# AND THE VERDICT RIDES EVERY ANSWER (backlog 50708d76, F5 of review
+# 927f8602). The NOT presented line went to stderr — the unit's journal,
+# once a pass — and nothing read it. The engineering call: it is read
+# where the identity it is about is spent, on the request the pass
+# answered. RC_STATE goes onto each execute step as `runner_credential`
+# — `presented`, or `NOT presented (<why>)` — so whoever reads an answer
+# reads which identity wrote it, and the step that made the credential
+# matter (runner:ops entering RESOLVABLE_PRINCIPALS, row E, 2026-10-10;
+# see crates/core/boss-jobs/src/runner_credential.rs) could count a
+# host's recent answers instead of trusting that its file is used — both
+# hosts' execute steps read `presented` on 2026-10-10. No file records
+# nothing: there is nothing to present and nothing withheld. Not an alarm
+# here: under a row that declares the runner, the server's 409 is the
+# alarm, on the write it refused.
 RUNNER_CREDENTIAL_FILE="${BOSS_RUNNER_CREDENTIAL_FILE:-/etc/boss/ops-runner.credential}"
 RC_HDR=""
+RC_STATE=""
 if [ -e "$RUNNER_CREDENTIAL_FILE" ]; then
     rc_value=""
     rc_why=""
-    if ! machine_token_admits "$BASE"; then
+    rc_rule=0
+    machine_token_admits "$BASE" || rc_rule=$?
+    if [ "$rc_rule" -eq 2 ]; then
+        rc_why="curl would send it through the proxy in \$$(machine_token_proxy "$BASE"), which would read it"
+    elif [ "$rc_rule" -ne 0 ]; then
         rc_why="the system of record's host '$(machine_token_host "$BASE")' is not loopback and not in BOSS_MACHINE_TOKEN_HOSTS"
     elif [ ! -r "$RUNNER_CREDENTIAL_FILE" ]; then
         rc_why="this runner cannot read it"
@@ -352,13 +402,18 @@ if [ -e "$RUNNER_CREDENTIAL_FILE" ]; then
     elif [ -z "$rc_value" ]; then
         rc_why="it is empty"
     fi
-    if [ -n "$rc_why" ]; then
-        echo "ops-runner: the runner credential at $RUNNER_CREDENTIAL_FILE is NOT presented ($rc_why); this pass answers without it" >&2
-    elif ! secret_header RC_HDR "x-boss-runner-credential: $rc_value" 2>"$workdir/rc-err"; then
+    if [ -z "$rc_why" ] && ! secret_header RC_HDR "x-boss-runner-credential: $rc_value" 2>"$workdir/rc-err"; then
         RC_HDR=""
-        echo "ops-runner: the runner credential at $RUNNER_CREDENTIAL_FILE is NOT presented ($(cat "$workdir/rc-err")); this pass answers without it" >&2
+        rc_why="$(cat "$workdir/rc-err")"
+        [ -n "$rc_why" ] || rc_why="its header could not be made"
     fi
     rc_value=""
+    if [ -n "$rc_why" ]; then
+        RC_STATE="NOT presented ($rc_why)"
+        echo "ops-runner: the runner credential at $RUNNER_CREDENTIAL_FILE is $RC_STATE; this pass answers without it" >&2
+    else
+        RC_STATE="presented"
+    fi
 fi
 
 # THE CLAIMANT A PASS SIGNS ITS CLAIM AS, and the test for one — side by
@@ -582,22 +637,28 @@ close_nothing_to_do() {
 # PUT carrying the refused step's metadata as READ plus the reason, with
 # no resend, so the one 409 that says nothing was written left the
 # request open over a refusal the runner had already decided.
+#
+# An optional third argument names another `aborted` terminal to close
+# through: `not-released`, for a request whose independent review asked
+# for changes (review N4 of car e1f4fc2a), so its title says why instead
+# of "outside the allowlist".
 abort_request() {
     ab_id=$(printf '%s' "$1" | jq -r '.id')
     ab_short=$(printf '%s' "$ab_id" | cut -c1-8)
-    ab_step=$(printf '%s' "$1" | jq -c '((.steps // []) | map(select(.spec_slug == "refused")) | .[0]) // empty')
+    ab_slug=${3:-refused}
+    ab_step=$(printf '%s' "$1" | jq -c --arg s "$ab_slug" '((.steps // []) | map(select(.spec_slug == $s)) | .[0]) // empty')
     if [ -z "$ab_step" ]; then
-        echo "ops-runner: $ab_short has no refused step to close it by — $2" >&2
+        echo "ops-runner: $ab_short has no $ab_slug step to close it by — $2" >&2
         return 1
     fi
     ab_sid=$(printf '%s' "$ab_step" | jq -r '.id')
     jq -cn --arg r "$2" --arg h "$HOST_ID" '{reason: $r, runner_host: $h}' > "$workdir/abort"
     complete_step "$workdir/abort" "$workdir/abort-body" \
-        "$BASE/api/jobs/$ab_id/steps/$ab_sid" "$ab_short's refused step"
+        "$BASE/api/jobs/$ab_id/steps/$ab_sid" "$ab_short's $ab_slug step"
     case "${cs_code:-000}" in
         2??) return 0 ;;
     esac
-    echo "ops-runner: could not close $ab_short refused — $cs_write HTTP ${cs_code:-none}: $(head -c 2000 "$workdir/abort-body" | tr '\n' ' ')$(cat "$workdir/put-err") — the refusal was: $2" >&2
+    echo "ops-runner: could not close $ab_short $ab_slug — $cs_write HTTP ${cs_code:-none}: $(head -c 2000 "$workdir/abort-body" | tr '\n' ' ')$(cat "$workdir/put-err") — the refusal was: $2" >&2
     return 1
 }
 
@@ -839,8 +900,18 @@ ARGV
 # hash. The request's own metadata stays writable after the signature;
 # these do not, and execute compares the request against them before it
 # builds an argv.
+#
+# THE SAME RENDER SERVES THE REVIEW (backlog 84e7c3e4). The 7th arg names
+# the step the plan goes onto — `approve` unless said — and for a verb
+# that declares `requires_review` it is first `review`, where the
+# dispatched reviewer reads the very bytes a passkey will later sign.
+# When the approval's plan is rendered after a release, the 8th and 9th
+# args are the hash the review released and the review run: bytes that
+# no longer hash to what was reviewed are refused rather than put in
+# front of a passkey, and the review run rides into the signed shape.
 render_plan() {
     rp_job=$1; rp_verb=$2; rp_args=$3; rp_approve=$4; rp_write=$5; rp_nothing=${6:-}
+    rp_onto=${7:-approve}; rp_reviewed=${8:-}; rp_review_run=${9:-}
     rp_id=$(printf '%s' "$rp_job" | jq -r '.id')
     rp_short=$(printf '%s' "$rp_id" | cut -c1-8)
     rp_sid=$(printf '%s' "$rp_approve" | jq -r '.id')
@@ -862,12 +933,14 @@ render_plan() {
                         echo "ops-runner: $rp_short — the plan $rp_verb rendered names nothing to do, but the request has no nothing-to-do terminal (filed under an ops-request version from before it); rendering it for a passkey as before" >&2 ;;
                     # A CLOSE THE SERVER DID NOT TAKE IS A DOUBT, AND A
                     # DOUBT ASKS (backlog aa816dd4). The terminal's record
-                    # is the runner account's alone (`written_by`), so a
-                    # runner signing under another BOSS_OPS_ACTOR is
-                    # refused it on every pass; returning here left such a
-                    # request open forever with nobody asked. The plan
-                    # goes onto the approve step instead — a no-op signed
-                    # is a no-op run. The reason is already on stderr.
+                    # is the credentialed runner's alone (`writer =
+                    # "runner:ops"` since row E; `written_by` before it),
+                    # so a refused close recurs on every pass; returning
+                    # here left such a request open forever with nobody
+                    # asked. The plan goes onto the approve step instead —
+                    # a no-op signed is a no-op run. The reason is already
+                    # on stderr. (A pass with no credential is refused
+                    # there too, under the same writer, and says so.)
                     *)
                         echo "ops-runner: $rp_short — the plan $rp_verb rendered names nothing to do, but the request could not be closed that way (above); rendering it for a passkey" >&2 ;;
                 esac ;;
@@ -878,11 +951,14 @@ render_plan() {
     fi
     if [ -n "$rv_why" ]; then
         rp_why="$rv_why — so there is nothing to sign"
+    elif [ -n "$rp_reviewed" ] && [ "$rv_sha" != "$rp_reviewed" ]; then
+        rp_why="the plan $rp_verb renders now hashes to $rv_sha, and review run $rp_review_run released the plan hashing to $rp_reviewed: something the plan names has moved since it was reviewed. Nothing is put in front of a passkey; file the request again for a fresh review and a fresh approval"
     else
         rp_sha=$rv_sha
         jq -cn --rawfile p "$workdir/plan" --arg v "$rp_write" --arg h "$HOST_ID" \
-            --argjson a "$rp_args" --arg s "$rp_sha" \
-            '{plan: $p, verb: $v, host: $h, args: $a, rendered_plan_sha256: $s}' > "$workdir/plan-patch"
+            --argjson a "$rp_args" --arg s "$rp_sha" --arg rr "$rp_review_run" \
+            '{plan: $p, verb: $v, host: $h, args: $a, rendered_plan_sha256: $s}
+             + (if $rr == "" then {} else {review_run: $rr} end)' > "$workdir/plan-patch"
     fi
     if [ -n "$rp_why" ]; then
         if abort_request "$rp_job" "$rp_why"; then
@@ -896,11 +972,175 @@ render_plan() {
             ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
             --data-binary @"$workdir/plan-patch" \
             "$BASE/api/jobs/$rp_id/steps/$rp_sid/metadata" 2>&1 >/dev/null); then
-        echo "ops-runner: could not write the plan onto $rp_short's approve step — $rp_err" >&2
+        echo "ops-runner: could not write the plan onto $rp_short's $rp_onto step — $rp_err" >&2
         return 0
     fi
-    echo "ops-runner: rendered the plan for $rp_verb on $rp_short (plan-sha256 $rp_sha) — it waits for a passkey approval on its approve step"
+    if [ "$rp_onto" = review ]; then
+        echo "ops-runner: rendered the plan for $rp_verb on $rp_short (plan-sha256 $rp_sha) — it waits for its independent review on its review step"
+    else
+        echo "ops-runner: rendered the plan for $rp_verb on $rp_short (plan-sha256 $rp_sha) — it waits for a passkey approval on its approve step"
+    fi
     plan_outcome=planned
+}
+
+# verify_review <job json> — whether the request's `review` step holds a
+# closed, independent RELEASE this runner may open an approval on
+# (backlog 84e7c3e4, design 9de0cd1c). Prints {ok: true, review_run,
+# reviewed} or {wait: reason} — a review run not landed yet, or a run
+# this pass could not read — or {refuse: reason}. Like the approval, it
+# reads only the system of record: the review step (its status, its
+# verdict, the plan the runner rendered onto it, the run `boss dispatch`
+# stamped on it) and the two agent-runs it names.
+#
+# INDEPENDENCE IS RUN-LEVEL. Every agent signs as a shared actor id, so
+# the run is the one identity that tells an author from a reviewer —
+# the rule `boss review` applies to BOSS cars. The review run must be a
+# LANDED agent-run (its report recorded: "actually closed"), of the
+# tenant-reviewer profile, dispatched for THIS request's review step,
+# and not the `source_run` the reviewer names; that source run must be
+# an agent-run whose tenant receipt names a commit the reviewed plan
+# lands, so a reviewer cannot name a stranger as the author.
+#
+# THE PROFILE IS THIS RUNNER'S, NOT THE STEP'S (review N1 of car
+# e1f4fc2a, run bd3091d2). It was read off the review step's
+# `agent_profile`, a key projected from the row that the metadata merge
+# door accepts from anyone with update scope on the step — so whoever
+# could PATCH the step before dispatch chose the profile the run was
+# held to. It is fixed here instead, and held equal to the profile
+# ops-request's review step funds by boss-testing's
+# the_protocol_puts_a_review_between_the_plan_and_the_passkey.
+REVIEW_PROFILE='tenant-reviewer'
+
+verify_review() {
+    vr_job=$1
+    vr_id=$(printf '%s' "$vr_job" | jq -r '.id')
+    vr_r=$(printf '%s' "$vr_job" | jq -c '((.steps // []) | map(select(.spec_slug == "review")) | .[0]) // empty')
+    if [ -z "$vr_r" ]; then
+        jq -cn '{refuse: "this request has no review step (filed under an ops-request version from before it, or not through boss ops), so there is nothing a review could have released. A pinned request is never moved onto a review it did not carry: file it again with boss ops"}'
+        return 0
+    fi
+    vr_plansha=$(printf '%s' "$vr_r" | jq -j '.metadata.plan // "" | strings' | sha256sum | cut -c1-64)
+    vr_pre=$(printf '%s' "$vr_r" | jq -c --arg plansha "$vr_plansha" '
+        def hex64: type == "string" and test("^[0-9a-f]{64}$");
+        def id: type == "string" and test("^[0-9a-f-]{36}$");
+        def no(m): {refuse: m};
+        (.metadata // {}) as $m
+        | if .status != "completed" then no("its review step is \(.status), not completed")
+          elif $m.verdict != "release" then
+            no("its review step records verdict \($m.verdict // "none" | tojson), not \"release\": a review that did not release the plan opens no approval")
+          elif ($m.plan | type) != "string" or $m.plan == "" then
+            no("its review step carries no plan, so the review released nothing this runner rendered")
+          elif ($m.rendered_plan_sha256 // null) != $plansha then
+            no("its review step carries rendered_plan_sha256 \($m.rendered_plan_sha256 // "none" | tostring), and its plan hashes to \($plansha): the plan on the step is not the plan this runner rendered")
+          elif ($m.reviewed_plan_sha256 | hex64 | not) or $m.reviewed_plan_sha256 != $plansha then
+            no("its review step says the reviewer reviewed \($m.reviewed_plan_sha256 // "nothing" | tostring), and the plan rendered onto it hashes to \($plansha): a verdict vouches only for the bytes it names")
+          elif ($m.agent_run | id | not) then
+            no("its review step carries no dispatched review run (agent_run), so nothing says who reviewed it")
+          elif ($m.source_run | id | not) then
+            no("its review step names no source_run, so its independence from the author cannot be judged")
+          elif $m.agent_run == $m.source_run then
+            no("its review run \($m.agent_run) is the source run \($m.source_run): an author'"'"'s verdict on its own work is no independent review")
+          else {ok: true, review_run: $m.agent_run, source_run: $m.source_run,
+                reviewed: $m.reviewed_plan_sha256} end')
+    if [ -z "$(printf '%s' "$vr_pre" | jq -r '.ok // empty')" ]; then
+        printf '%s' "$vr_pre"
+        return 0
+    fi
+    vr_run=$(printf '%s' "$vr_pre" | jq -r '.review_run')
+    vr_src=$(printf '%s' "$vr_pre" | jq -r '.source_run')
+    if ! vr_rj=$(curl -fsS -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
+            "$BASE/api/jobs/$vr_run" 2>&1); then
+        jq -cn --arg r "$vr_run" --arg e "$vr_rj" '{wait: "the review run \($r) could not be read: \($e)"}'
+        return 0
+    fi
+    if ! vr_sj=$(curl -fsS -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
+            "$BASE/api/jobs/$vr_src" 2>&1); then
+        jq -cn --arg r "$vr_src" --arg e "$vr_sj" '{wait: "the source run \($r) could not be read: \($e)"}'
+        return 0
+    fi
+    printf '%s' "$vr_r" | jq -j '.metadata.plan' > "$workdir/reviewed-plan"
+    vr_out=$(jq -cn --argjson pre "$vr_pre" --arg id "$vr_id" --arg profile "$REVIEW_PROFILE" \
+        --argjson rj "$vr_rj" --argjson sj "$vr_sj" --rawfile plan "$workdir/reviewed-plan" '
+        def body: if type == "object" and has("data") then .data else . end;
+        def no(m): {refuse: m};
+        ($rj | body) as $r | ($sj | body) as $s
+        | ($s.metadata.tenant_receipt.sha // null) as $sha
+        | if $r.kind != "agent-run" then no("its review run \($pre.review_run) is a \($r.kind // "nothing" | tostring), not an agent-run")
+          elif $r.metadata.packet != $id or $r.metadata.step != "review" then
+            no("its review run \($pre.review_run) was dispatched for \($r.metadata.packet // "no packet" | tostring) step \($r.metadata.step // "none" | tostring), not this request'"'"'s review step")
+          elif $r.metadata.profile != $profile then
+            no("its review run \($pre.review_run) is a \($r.metadata.profile // "no" | tostring) profile run, and a review is held to the \($profile) profile")
+          elif ([($r.steps // [])[] | select(.spec_slug == "landed" and .status == "completed")] | length) == 0 then
+            {wait: "its review run \($pre.review_run) has not landed (its report is not recorded), so the review is not closed"}
+          elif $s.kind != "agent-run" then no("its source run \($pre.source_run) is a \($s.kind // "nothing" | tostring), not an agent-run")
+          elif ($sha | type) != "string" or ($sha | test("^[0-9a-f]{40}([0-9a-f]{24})?$") | not) then
+            no("its source run \($pre.source_run) carries no tenant receipt sha, so nothing ties it to the bytes reviewed")
+          elif ($plan | contains($sha) | not) then
+            no("the reviewed plan does not land \($sha), the commit its source run \($pre.source_run) reported: the run named as the author is not the author of this merge")
+          else $pre end' 2>&1) || vr_out=$(jq -cn --arg e "$vr_out" '{refuse: "the review runs could not be judged: \($e)"}')
+    printf '%s' "$vr_out"
+}
+
+# review_holds_for <job json> <plan sha256> — 0 when the request's review
+# is a closed independent release of exactly that plan AND the approve
+# step names the same review run; otherwise 1 with the reason in
+# `rh_why`. The check before the claim (backlog 84e7c3e4: "again before
+# any push"); a review still waiting is no review at this point.
+review_holds_for() {
+    rh_why=""
+    rh_v=$(verify_review "$1")
+    rh_why=$(printf '%s' "$rh_v" | jq -r '.refuse // .wait // empty' 2>/dev/null)
+    [ -z "$rh_why" ] || return 1
+    rh_run=$(printf '%s' "$rh_v" | jq -r '.review_run // empty')
+    rh_reviewed=$(printf '%s' "$rh_v" | jq -r '.reviewed // empty')
+    rh_named=$(printf '%s' "$1" | jq -r '((.steps // []) | map(select(.spec_slug == "approve")) | .[0].metadata.review_run) // "" | strings')
+    if [ "$rh_reviewed" != "$2" ]; then
+        rh_why="its review released the plan hashing to $rh_reviewed, and the signed plan hashes to $2"
+        return 1
+    fi
+    if [ "$rh_named" != "$rh_run" ]; then
+        rh_why="its approve step names review run ${rh_named:-none}, and its review step was released by review run $rh_run: the approval did not sign the review on the record"
+        return 1
+    fi
+    return 0
+}
+
+# review_run_refused <job json> — prints why the request closes on
+# `not-released` when the review run dispatched for its OPEN review step
+# ended refused, and nothing otherwise (backlog 112d2f92). The reviewer
+# rules direct a run that finds no plan (rule 1) or no source run (rule
+# 5) to record NOTHING on the step and end its own run refused, so the
+# step stays active with no verdict: the engine's `not-released`
+# predicate never fired, and this runner said "waits for its independent
+# review" every minute, for good, over a review that had already ended.
+# Measured on the first live negative control of ops-request v11,
+# 2026-10-09: request d50a93ca, review run e7a24d1a.
+#
+# ONLY THIS REQUEST'S OWN REVIEWER CAN END IT. The step's `agent_run` is
+# writable through the merge door, so the run it names is held to what
+# `verify_review` holds a release to — an agent-run of this runner's
+# REVIEW_PROFILE dispatched for THIS request's `review` step — and must
+# have closed through its `refused` terminal. A run still building, a
+# run that DIED (an end the rescue re-runs, not a judgement) or a run
+# that cannot be read prints nothing, and the request waits as before.
+# The outcome is only ever a refusal: nothing here opens an approval.
+review_run_refused() {
+    rr_id=$(printf '%s' "$1" | jq -r '.id')
+    rr_run=$(printf '%s' "$1" | jq -r '((.steps // []) | map(select(.spec_slug == "review")) | .[0].metadata.agent_run) // ""
+        | strings | select(test("^[0-9a-f-]{36}$"))')
+    [ -n "$rr_run" ] || return 0
+    if ! rr_rj=$(curl -fsS -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} ${RC_HDR:+-H "$RC_HDR"} \
+            "$BASE/api/jobs/$rr_run" 2>&1); then
+        echo "ops-runner: $rr_id's review run $rr_run could not be read, so whether it ended refused is unknown this pass: $rr_rj" >&2
+        return 0
+    fi
+    printf '%s' "$rr_rj" | jq -r --arg id "$rr_id" --arg profile "$REVIEW_PROFILE" --arg run "$rr_run" '
+        (if type == "object" and has("data") then .data else . end) as $r
+        | select($r.kind == "agent-run" and $r.metadata.packet == $id
+            and $r.metadata.step == "review" and $r.metadata.profile == $profile
+            and ([($r.steps // [])[] | select(.spec_slug == "refused" and .status == "completed")] | length) > 0)
+        | "its review run \($run) ended refused and recorded no verdict on the review step, so nothing can release this plan. The run reported: \($r.metadata.report // "nothing — no report was on the run when this runner read it; read the run itself" | tostring). File the request again for a fresh review"' 2>/dev/null
+    return 0
 }
 
 # verify_approval <job json> <verb> <execute status> — {plan_sha256,
@@ -1231,6 +1471,14 @@ while [ "$i" -lt "$n" ]; do
         (.verbs[$v] // {}) as $s
         | if (($s.hosts // []) | index($h)) != null and ($s.requires_approval // false) != false
           then "yes" else "no" end' "$VERBS_FILE")
+    # AND WHETHER ITS APPROVAL WAITS FOR AN INDEPENDENT REVIEW, read the
+    # same way off the same file (backlog 84e7c3e4): the packet's
+    # `requires_review` only makes its review step ready.
+    needs_review=no
+    if [ "$needs_approval" = yes ]; then
+        needs_review=$(jq -r --arg v "$verb" '
+            if ((.verbs[$v] // {}).requires_review // false) != false then "yes" else "no" end' "$VERBS_FILE")
+    fi
 
     # THE PLAN STAGE (design 17835005 q1). An approval verb's execute
     # waits, pending, behind the approve step. While it does, this
@@ -1240,6 +1488,88 @@ while [ "$i" -lt "$n" ]; do
     # whose verb cannot carry an approval, or whose plan verb refuses,
     # is closed refused here, because nothing it could wait for exists.
     if [ "$needs_approval" = yes ] && [ "$step_status" = pending ]; then
+        # THE REVIEW STAGE COMES FIRST (backlog 84e7c3e4). The plan goes
+        # onto the review step for the dispatched reviewer, exactly as it
+        # will onto the approve step; the approval's plan is rendered
+        # only over a closed independent release of those bytes.
+        reviewed_sha=""; review_run_id=""; abort_slug=refused
+        if [ "$needs_review" = yes ]; then
+            review=$(printf '%s' "$job" | jq -c '((.steps // []) | map(select(.spec_slug == "review")) | .[0]) // empty')
+            r_status=$(printf '%s' "$review" | jq -r '.status // "absent"' 2>/dev/null)
+            r_plan=$(printf '%s' "$review" | jq -r '(.metadata.plan // "") | length' 2>/dev/null)
+            # A REVIEW THAT ASKED FOR CHANGES closes on its own terminal,
+            # whose title says so (review N4 of car e1f4fc2a) — the one
+            # the engine readies for it, never `refused`.
+            r_verdict=$(printf '%s' "$review" | jq -r '.metadata.verdict // "" | strings' 2>/dev/null)
+            if [ "${r_status:-absent}" = completed ] && [ -n "$r_verdict" ] && [ "$r_verdict" != release ]; then
+                abort_slug=not-released
+            fi
+            case "${r_status:-absent}" in
+                ready|active)
+                    # A REVIEW RUN THAT ENDED REFUSED closes the request
+                    # on `not-released` (backlog 112d2f92) — read FIRST, so
+                    # a run that refused before the plan existed (rule 1)
+                    # gets no plan rendered for a reviewer who has gone.
+                    why=$(review_run_refused "$job")
+                    if [ -n "$why" ]; then
+                        why="verb $verb requires an independent review of its plan before any approval (requires_review), and $why"
+                        abort_slug=not-released
+                    elif [ "${r_plan:-0}" -gt 0 ]; then
+                        echo "ops-runner: $short waits for its independent review of its plan on its review step ($verb)"
+                        waiting=$((waiting + 1))
+                        continue
+                    else
+                        contract=$(approval_contract "$verb")
+                        why=$(printf '%s' "$contract" | jq -r '.refuse // empty')
+                        if [ -z "$why" ]; then
+                            render_plan "$job" "$(printf '%s' "$contract" | jq -r '.plan_verb')" "$args" "$review" "$verb" "" review
+                            case "$plan_outcome" in
+                                planned) planned=$((planned + 1)) ;;
+                                refused) refused=$((refused + 1)) ;;
+                                *) failed=$((failed + 1)) ;;
+                            esac
+                            continue
+                        fi
+                    fi ;;
+                completed | absent)
+                    rv_verdict=$(verify_review "$job")
+                    why=$(printf '%s' "$rv_verdict" | jq -r '.refuse // empty' 2>/dev/null)
+                    rv_wait=$(printf '%s' "$rv_verdict" | jq -r '.wait // empty' 2>/dev/null)
+                    if [ -n "$rv_wait" ]; then
+                        echo "ops-runner: $short waits — verb $verb requires an independent review, and $rv_wait" >&2
+                        waiting=$((waiting + 1))
+                        continue
+                    fi
+                    if [ -n "$why" ]; then
+                        why="verb $verb requires an independent review of its plan before any approval (requires_review), and $why"
+                    else
+                        reviewed_sha=$(printf '%s' "$rv_verdict" | jq -r '.reviewed')
+                        review_run_id=$(printf '%s' "$rv_verdict" | jq -r '.review_run')
+                    fi ;;
+                *)
+                    # A REVIEW STEP THAT CAN NEVER BECOME READY is said
+                    # once, on the request: filed without the flag (by
+                    # hand, not through boss ops), its approve step
+                    # would wait on nothing while the review waits on a
+                    # flag nobody sets.
+                    if [ "$(printf '%s' "$job" | jq -r '.metadata.requires_review // false')" != true ]; then
+                        why="verb $verb requires an independent review of its plan before any approval (requires_review), and this request was filed without requires_review, so its review step can never become ready. File it with boss ops, which reads requires_review off the verb"
+                    else
+                        echo "ops-runner: $short execute is pending and its review step is '${r_status}' — skipping this cycle" >&2
+                        skipped=$((skipped + 1))
+                        continue
+                    fi ;;
+            esac
+            if [ -n "$why" ]; then
+                if abort_request "$job" "$why" "$abort_slug"; then
+                    echo "ops-runner: refused $short — $why"
+                    refused=$((refused + 1))
+                else
+                    failed=$((failed + 1))
+                fi
+                continue
+            fi
+        fi
         approve=$(printf '%s' "$job" | jq -c '((.steps // []) | map(select(.spec_slug == "approve")) | .[0]) // empty')
         a_status=$(printf '%s' "$approve" | jq -r '.status // "absent"' 2>/dev/null)
         a_plan=$(printf '%s' "$approve" | jq -r '(.metadata.plan // "") | length' 2>/dev/null)
@@ -1268,7 +1598,8 @@ while [ "$i" -lt "$n" ]; do
             continue
         fi
         render_plan "$job" "$(printf '%s' "$contract" | jq -r '.plan_verb')" "$args" "$approve" "$verb" \
-            "$(printf '%s' "$contract" | jq -r '.nothing_to_do // empty | strings')"
+            "$(printf '%s' "$contract" | jq -r '.nothing_to_do // empty | strings')" \
+            approve "$reviewed_sha" "$review_run_id"
         case "$plan_outcome" in
             planned) planned=$((planned + 1)) ;;
             nothing) nothing=$((nothing + 1)) ;;
@@ -1455,6 +1786,12 @@ while [ "$i" -lt "$n" ]; do
                 approval_why="verb $verb requires a passkey approval, and the signed plan could not be checked against a fresh render: $rv_why"
             elif [ "$rv_sha" != "$plan_sha" ]; then
                 approval_why="verb $verb requires a passkey approval, and the signed plan hashes to $plan_sha while the plan verb $plan_verb renders $rv_sha on $HOST_ID now: the plan on the approve step is not what this runner renders here (written by someone else, or the state moved since it was signed). Nothing runs on it; file the request again and approve its fresh plan"
+            # THE REVIEW, READ AGAIN BEFORE ANYTHING IS CLAIMED (backlog
+            # 84e7c3e4, design 9de0cd1c Q1: "and again before any push"):
+            # still a landed, independent release of exactly the signed
+            # bytes, and the review the approval signed.
+            elif [ "$needs_review" = yes ] && ! review_holds_for "$job" "$plan_sha"; then
+                approval_why="verb $verb requires an independent review of the plan it runs (requires_review), and $rh_why. Nothing runs on it; file the request again for a fresh review and a fresh approval"
             else
                 approved=true
                 args=$(printf '%s' "$args" | jq -c --arg h "$plan_sha" '. + [$h]')
@@ -1560,6 +1897,8 @@ ARGV
                 moved="the approval no longer holds: $again_why"
             elif [ "$(printf '%s' "$again" | jq -r '.plan_sha256 // empty')" != "$plan_sha" ]; then
                 moved="the signed plan is no longer the one checked"
+            elif [ "$needs_review" = yes ] && ! review_holds_for "$fresh" "$plan_sha"; then
+                moved="the review no longer holds: $rh_why"
             fi
         fi
         if [ -n "$moved" ]; then
@@ -1757,8 +2096,10 @@ ARGV
     jq -cn --rawfile out "$outf" --slurpfile streams "$streamsf" --arg su "$streams_unread" \
         --arg d "$disp" --arg rc "$rc_str" --arg h "$HOST_ID" --arg ms "${dur_ms:-}" \
         --arg ps "$plan_sha" --arg sa "$signed_at" --arg ap "$approved" --arg ca "$claimant" \
-        --arg el "$eff_line" --arg eu "$eff_unproven" --arg er "$eff_unread" '
+        --arg el "$eff_line" --arg eu "$eff_unproven" --arg er "$eff_unread" \
+        --arg rcs "$RC_STATE" '
         {disposition: $d, output: $out, runner_host: $h, streams:$streams[0],
+         runner_credential: (if $rcs == "" then null else $rcs end),
          streams_unread:(if $su == "" then null else $su end),
          exit_code: (if $rc == "" then null else $rc end),
          duration_ms: (if $ms == "" then null else ($ms | tonumber) end),

@@ -19,6 +19,8 @@ pub const JOB_CREATED: &str = "jobs.job.created";
 pub const JOB_UPDATED: &str = "jobs.job.updated";
 pub const STEP_CREATED: &str = "jobs.step.created";
 pub const STEP_UPDATED: &str = "jobs.step.updated";
+pub const STATION_CLAIMED: &str = "jobs.station.claimed";
+pub const STATION_SELECTION_EVIDENCE: &str = "jobs.station.selection_evidence";
 /// Full step state plus the immutable first record and server receipt.
 /// Unlike a marker, this event reconstructs both projections on replay.
 pub const STEP_FIRST_RECORDED: &str = "jobs.step.first_recorded";

@@ -117,7 +117,7 @@ impl HttpStamps {
             client: if bases.through_gateway {
                 boss_core::machine_token::Client::unstamped(builder)?
             } else {
-                crate::gate::machine_client_with(builder)?
+                crate::sor_client::machine_client_with(builder)?
             },
         })
     }

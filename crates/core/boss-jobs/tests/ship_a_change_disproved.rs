@@ -354,13 +354,17 @@ async fn a_disproved_car_closes_through_its_own_terminal_with_the_failing_probe(
 /// This stands the car in exactly the state the second PUT saw — the
 /// terminal completed and the rest skipped by the first close, the Job
 /// not yet closed — and sends the dispatcher's PUT. Since b416ad40 an
-/// unchanged re-send of a terminal step writes NOTHING, so it can no
-/// longer race the first closer: the Job stays open with no outcome
-/// written by the re-send, and the close is left to the terminal
-/// closer, which names the outcome (and, since 29a7ea09, merges only
-/// the fields a close owns).
+/// unchanged re-send of a terminal step writes nothing to the STEP.
+/// Since 17bf6f3e it settles the packet still open: it closes it through
+/// the declared-terminal close, NAMING the outcome — the thing 228c9a7d
+/// lost. It used to leave the close to the first closer, and on
+/// 2026-10-09 two ops-requests (4a5ac945, 85cd57f1) showed what that
+/// costs when the first closer never arrives: the terminal completed,
+/// the close's skips written, and the packet open for good. Whichever
+/// closer lands first now names the same outcome; the other no-ops on a
+/// closed row.
 #[tokio::test]
-async fn a_resend_that_races_the_terminal_close_leaves_the_close_to_it() {
+async fn a_resend_that_races_the_terminal_close_closes_with_the_terminals_outcome() {
     use boss_core::job::{JobId, StepStatus};
     use boss_jobs::JobsRepository;
 
@@ -403,12 +407,12 @@ async fn a_resend_that_races_the_terminal_close_leaves_the_close_to_it() {
 
     let after = get_job(&app, &id).await;
     assert_eq!(
-        after["status"], "open",
-        "an unchanged re-send must not close the packet itself: {after:#}"
+        after["status"], "closed",
+        "a re-send of a completed terminal settles the packet: {after:#}"
     );
-    assert!(
-        after["metadata"].get("outcome").is_none_or(|o| o.is_null()),
-        "the re-send wrote no outcome of its own: {after:#}"
+    assert_eq!(
+        after["metadata"]["outcome"], "disproved",
+        "and the close names the terminal's outcome: {after:#}"
     );
 }
 

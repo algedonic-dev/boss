@@ -15,12 +15,11 @@
   import { classLabel, departmentNames, employmentTone, type Employee } from './types';
   import {
     departmentBuckets,
-    expiringCerts,
     statusBuckets,
-    tenureYears,
     type CodeFilter,
   } from './utils';
   import { headcount, rosterHeader } from './roster-counts';
+  import { readRosterLocation, type RosterLocationRead } from './roster-location';
   import { countLabel, emptyState, readStateOfLoad } from '../data/readState';
   import { readList } from '../data/shape';
   import ListEmpty from '../data/ListEmpty.svelte';
@@ -45,6 +44,28 @@
   let dept = $state<DeptFilter>({ kind: 'all' });
   let status = $state<StatusFilter>({ kind: 'code', code: 'active' });
   let query = $state('');
+  // Location identity is registry data; a failed read is not an unknown id.
+  let locationReads = $state<Readonly<Record<string, RosterLocationRead>>>({});
+  const locationLabel = (id: string | null): string => {
+    if (id === null) return 'Unspecified';
+    const answer = Object.hasOwn(locationReads, id) ? locationReads[id] : undefined;
+    if (!answer) return `Loading location — ${id}`;
+    if (answer.kind === 'failed') return `Location unavailable — ${id}`;
+    if (answer.kind === 'absent') return `Unresolved location — ${id}`;
+    return answer.name;
+  };
+
+  $effect(() => {
+    let cancelled = false;
+    const ids = [...new Set(roster.flatMap((e) => e.location === null ? [] : [e.location]))];
+    locationReads = {};
+    for (const id of ids) {
+      void readRosterLocation(id).then((answer) => {
+        if (!cancelled) locationReads = { ...locationReads, [id]: answer };
+      });
+    }
+    return () => { cancelled = true; };
+  });
 
   $effect(() => {
     let cancelled = false;
@@ -73,8 +94,6 @@
     };
   });
 
-  let expiring90 = $derived(expiringCerts(90, roster));
-
   // The header and the filter buttons count only a roster that was
   // read — backlog 47eadca3: they counted the `[]` it starts as, so a
   // loading or failed read printed "0 active employees" and Active (0)
@@ -83,7 +102,7 @@
   // (backlog 6a123f1f: the System Audit Account was counted).
   let read = $derived(readStateOfLoad(loading, loadFailed));
   let header = $derived(
-    rosterHeader(read, headcount(roster, classesFor('employee', 'role')), expiring90.length),
+    rosterHeader(read, headcount(roster, classesFor('employee', 'role'))),
   );
 
   // The Status buttons come from the (employee, status) Classes (loaded
@@ -139,23 +158,16 @@
     | 'name'
     | 'role'
     | 'dept'
-    | 'tenure'
-    | 'skills'
     | 'location'
     | 'status';
-  const DESC_FIRST: ReadonlyArray<SortKey> = ['tenure', 'skills'];
-  const sort = createSortState<SortKey>({ key: 'dept', dir: 'asc' }, (k) =>
-    DESC_FIRST.includes(k) ? 'desc' : 'asc',
-  );
+  const sort = createSortState<SortKey>({ key: 'dept', dir: 'asc' });
   let sortedVisible = $derived(
     sort.sorted(visible, {
       id: (e) => e.id,
       name: (e) => e.name,
       role: (e) => classLabel(e.role, roleClasses),
       dept: (e) => `${e.department ?? ''} ${e.name ?? ''}`,
-      tenure: (e) => tenureYears(e),
-      skills: (e) => e.skills.length,
-      location: (e) => e.location,
+      location: (e) => locationLabel(e.location),
       status: (e) => e.status,
     }),
   );
@@ -270,8 +282,6 @@
               <SortHeader {sort} key="name">Name</SortHeader>
               <SortHeader {sort} key="role">Role</SortHeader>
               <SortHeader {sort} key="dept">Department</SortHeader>
-              <SortHeader {sort} key="tenure" num={true}>Tenure</SortHeader>
-              <SortHeader {sort} key="skills" num={true}>Skills</SortHeader>
               <SortHeader {sort} key="location">Location</SortHeader>
               <SortHeader {sort} key="status">Status</SortHeader>
             </tr>
@@ -292,9 +302,7 @@
                 <td>{e.name}</td>
                 <td class="prose-cell">{classLabel(e.role, roleClasses)}</td>
                 <td>{classLabel(e.department, departmentClasses)}</td>
-                <td class="num">{tenureYears(e).toFixed(1)}y</td>
-                <td class="num">{e.skills.length}</td>
-                <td>{e.location}</td>
+                <td>{locationLabel(e.location)}</td>
                 <td><StatusChip value={e.status ?? 'unknown'} tone={employmentTone(e.status)} /></td>
               </tr>
             {/each}

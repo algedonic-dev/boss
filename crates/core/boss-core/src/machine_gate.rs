@@ -14,17 +14,21 @@
 //!
 //! THREE MODES, read from a mounted file so a change needs no pod roll:
 //!
-//! * `off` — admits everything and records nothing. Today's dormant
-//!   behaviour, and the default: a missing or blank mode file is `off`,
-//!   so this car changes nothing any caller sees. A mode file that EXISTS
-//!   but cannot be read is not `off`: it is `report`, said at error level.
+//! * `off` — admits estate-token and uncredentialed requests without
+//!   tallying them. Probe-reader scope still applies: writes are refused
+//!   403, and a reader credential beside another token value is refused
+//!   400. A missing or blank mode file is `off`. A mode file that EXISTS
+//!   but cannot be read is not `off`: it is `report`, said at error level
+//!   — and so is anything at the path that is not a regular file (a FIFO
+//!   would hang the read) and a link whose target is gone.
 //! * `report` — admits everything, and tallies every request that
 //!   presents no accepted token (and every one that presents the
 //!   `previous` token, which a rotation's revoke step reads). The tally
 //!   is how enforcement is earned: a clean window, not a belief.
 //! * `enforce` — refuses what `report` tallies, with a 401 naming the
 //!   header and the mode. With NO readable token it degrades to
-//!   `report` and says so at error level on every request and on
+//!   `report` and says so at error level — on the request path once and
+//!   then every [`RESAY_EVERY`] with a count, never per request — and on
 //!   `accepts` — never refuses everything, because a guard that stops
 //!   the system it guards is the 2026-09-05 shape (design choice 4).
 //!
@@ -94,12 +98,14 @@
 //! no slot is an ask, answered `none`, tallied as `asked` and stated as
 //! `machine_gate.asked`, which `enforce_refuses` does not count (`asks`;
 //! backlog 89fc511e), so a rotation asking ahead of kubelet is on the
-//! record and dirties no window; `GET /api/machine-gate/misses` answers the
+//! record and dirties no window — until asks overflow their room, which
+//! names no asker and does (design e3d19d1a q1);
+//! `GET /api/machine-gate/misses` answers the
 //! tally, and ONLY to a caller presenting an accepted token in every
 //! mode — a caller's address is a record, and `report` admits everyone
 //! else.
 
-use crate::gate_evidence::{Evidence, EvidenceHealth, Fact, Gate as EvidenceGate};
+use crate::gate_evidence::{Evidence, EvidenceHealth, Fact, Gate as EvidenceGate, RESAY_EVERY};
 use crate::machine_token;
 use crate::port::EventRecorder;
 use axum::Json;
@@ -112,7 +118,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -216,6 +222,28 @@ pub const MAX_TALLY_KEYS: usize = 1024;
 /// asks leave its misses their names (backlog d653e090, N2).
 pub const MAX_KEYS_PER_SOURCE: usize = MAX_TALLY_KEYS / 16;
 
+/// The most facts one tally can state, which the recorder's queue
+/// ([`crate::gate_evidence::QUEUE_DEPTH`]) must hold with room to spare
+/// (review of car 1dff2293, backlog d653e090): its two `recording_began`
+/// — the one it starts with and one mode move it does not restart on,
+/// `report` raised to `enforce` or lowered to `off`; every other move
+/// restarts it (review 42836ede of car 10ea15f6, N3; backlog aba44bac);
+/// one per key in both rooms; one spill per full share and presentation
+/// — at most sixteen full shares in each room, five presentations held
+/// to a miss share (`none`, `mismatch`, the three `reader.*`) and one to
+/// an ask share; and one overflow per presentation, of seven.
+pub const FACTS_ONE_TALLY_CAN_STATE: usize = {
+    let shares = MAX_TALLY_KEYS / MAX_KEYS_PER_SOURCE;
+    2 + 2 * MAX_TALLY_KEYS + shares * 5 + shares + 7
+};
+
+// A whole tally and a further room of the next one fit the recorder's
+// queue: a bound moved on either side fails the build, not a window.
+const _: () = assert!(
+    crate::gate_evidence::QUEUE_DEPTH >= FACTS_ONE_TALLY_CAN_STATE + MAX_TALLY_KEYS,
+    "the recorder's queue cannot hold one machine-gate tally's facts"
+);
+
 /// How often the mounted files are re-read. Kubelet refreshes a mounted
 /// Secret or ConfigMap in about a minute, so five seconds adds nothing
 /// a rotation would notice.
@@ -316,6 +344,22 @@ impl Mode {
 
 /// The machine gate's own name in what its mode reader says.
 const GATE: &str = "machine gate";
+
+/// The mounted machine mode observed at this service ingress. This is
+/// lifetime evidence, not actor authentication or a native writer fence.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestModeObservation {
+    mode: Mode,
+    started: std::time::Instant,
+}
+impl RequestModeObservation {
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+    pub fn started(&self) -> std::time::Instant {
+        self.started
+    }
+}
 
 /// Which accepted slot a presented token matched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
@@ -522,15 +566,43 @@ impl MountedFiles {
 }
 
 /// The mode file's text, read to at most [`MAX_MODE_BYTES`]. `Ok(None)`
-/// only when the file is ABSENT — the one case that is `off`. A file
-/// that exists and cannot be read as bounded UTF-8 (a directory in its
-/// place, a permission, bytes that are not text, more than the bound)
-/// is `Err` naming the path and why. Until 2026-09-27 every such case
+/// only when NOTHING is at the path — the one case that is `off`. A
+/// file that exists and cannot be read as bounded UTF-8 (a directory or
+/// a FIFO in its place, a link whose target is gone, a permission,
+/// bytes that are not text, more than the bound) is `Err` naming the
+/// path and why. Until 2026-09-27 every such case
 /// went through `.ok()` to `off` and logged INFO, so a broken ConfigMap
 /// mount read as a gate switched off on purpose (reviews of car 1,
 /// a159e1ee, and of car 2 slice 1, S8; backlog 2710c8fc).
 fn read_mode_file(path: &std::path::Path) -> Result<Option<String>, String> {
     use std::io::Read;
+    // Anything that is not a regular file is refused BEFORE it is opened:
+    // `open` on a FIFO blocks until a writer appears, and this read runs
+    // inline at boot, for every service's gate and for every switch that
+    // borrows it (the policy check's, row D), so a FIFO at the path hung
+    // the process before it served (mode-file review (b), 2026-09-27; the
+    // token slots' reader got the same refusal, machine_token.rs).
+    // `metadata` follows the link a ConfigMap key is. A LINK whose target
+    // is gone is not absent: it read as `off` and said nothing, so a gate
+    // in `enforce` dropped to admitting everything on a dangling link
+    // (the same review, (a) and (e)). Only nothing at the path is `off`.
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(path) {
+                Ok(_) => Err(format!(
+                    "{}: a link whose target is missing",
+                    path.display()
+                )),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!("{}: {e}", path.display())),
+            };
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    if !meta.is_file() {
+        return Err(format!("{}: not a regular file", path.display()));
+    }
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -908,6 +980,9 @@ struct Tally {
     /// presentations each share applies to.
     source_overflow: HashMap<(String, Presented), (u64, DateTime<Utc>, DateTime<Utc>)>,
     overflow: u64,
+    /// The presentations whose overflow the log has been told of: each
+    /// one's first, so at most one fact per presentation.
+    overflow_stated: HashSet<Presented>,
     /// When this tally began: the gate's mount, or the last time it
     /// left `off` or was lowered from `enforce` ([`MachineGate::observe`]).
     since: DateTime<Utc>,
@@ -921,6 +996,7 @@ impl Tally {
             per_source: HashMap::new(),
             source_overflow: HashMap::new(),
             overflow: 0,
+            overflow_stated: HashSet::new(),
             since,
         }
     }
@@ -959,7 +1035,8 @@ pub struct Misses {
     /// `report` a minute earlier as a clean day).
     pub recording_since: DateTime<Utc>,
     /// Why THIS process's tally is not clean, one reason each, empty
-    /// when it is: `off`, a key `enforce` refuses, either overflow, a
+    /// when it is: `off`, a key `enforce` refuses, either overflow, an
+    /// asker past its share (design e3d19d1a q1), a
     /// fact the recorder is refusing right now, or a fact lost that no
     /// `facts_lost` on the log states yet — which no tally restart
     /// forgives (review e4417d48, B2). The LIVE half of
@@ -1010,6 +1087,22 @@ impl Misses {
             why.push(format!(
                 "{spilled} source(s) past their share of the tally, whose further callers \
                  `enforce` refuses are unnamed"
+            ));
+        }
+        // And an asker past its share, which no caller `enforce` refuses
+        // but which the gate has stopped naming: a clean window must mean
+        // every request was seen (design e3d19d1a q1, the platform owner
+        // 2026-10-10, on backlog d653e090). Its own reason, so a reader
+        // can tell an asker's spill from a caller's.
+        let asked = self
+            .source_overflow
+            .iter()
+            .filter(|o| o.presented == Presented::Asked)
+            .count();
+        if asked > 0 {
+            why.push(format!(
+                "{asked} source(s) past their own share of asks ({MAX_KEYS_PER_SOURCE} keys), \
+                 whose further asks are counted by source and name no asker"
             ));
         }
         why.extend(self.evidence.not_clean());
@@ -1073,6 +1166,40 @@ pub struct Accepts {
     pub degraded: bool,
 }
 
+/// A line that would otherwise repeat on every request: said at its
+/// first occurrence, then at most once per [`RESAY_EVERY`] — the interval
+/// an outage is re-said at ([`crate::gate_evidence`]) — naming how many
+/// occurrences it did not say in between. Once and silent would read as
+/// recovered (backlog 06ae925a); every time buries the line under its own
+/// copies.
+#[derive(Debug, Default)]
+struct Throttled {
+    last: Option<std::time::Instant>,
+    /// Occurrences since the line was last said that it did not say.
+    unsaid: u64,
+    /// How many times it has been said.
+    times: u64,
+}
+
+impl Throttled {
+    /// Count one occurrence at `now`. `Some(n)` when the line is due —
+    /// `n` being the occurrences it did not say since it last was —
+    /// and `None` when it is not.
+    fn due(&mut self, now: std::time::Instant) -> Option<u64> {
+        let due = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= RESAY_EVERY);
+        if !due {
+            self.unsaid += 1;
+            return None;
+        }
+        let unsaid = std::mem::take(&mut self.unsaid);
+        self.last = Some(now);
+        self.times += 1;
+        Some(unsaid)
+    }
+}
+
 /// One service's gate: its name, its exact health exemptions, the last
 /// reading of the mounted files, and its miss tally.
 pub struct MachineGate {
@@ -1084,6 +1211,9 @@ pub struct MachineGate {
     /// (design 21946380): the tally restarts with the process, the log
     /// does not.
     evidence: Evidence,
+    /// When a degraded `enforce` last said, on the request path, that it
+    /// admitted a request it would have refused ([`Throttled`]).
+    degraded_said: Mutex<Throttled>,
 }
 
 impl std::fmt::Debug for MachineGate {
@@ -1117,6 +1247,7 @@ impl MachineGate {
             reading: RwLock::new(Arc::new(reading)),
             tally: Mutex::new(Tally::starting(since)),
             evidence,
+            degraded_said: Mutex::new(Throttled::default()),
         }
     }
 
@@ -1320,14 +1451,15 @@ impl MachineGate {
             // two facts) for a source however long it sends.
             if n.0 == 1 {
                 // Past its share, a probe reader is still named by what it
-                // presented: a reader fact, which dirties nothing — and
-                // an asker by its ask. Only an overflow of what `enforce`
-                // refuses is a tally overflow.
+                // presented: a reader fact, which dirties nothing. An
+                // overflow of what `enforce` refuses is a tally overflow,
+                // and so is an asker's (design e3d19d1a q1, the platform
+                // owner 2026-10-10): its further asks name no asker, and a
+                // clean window must mean every request was seen. Scoped to
+                // its source and naming `asked`, it holds no revoke.
                 self.evidence.emit(
-                    if presented.enforce_refuses() {
+                    if presented.enforce_refuses() || presented == Presented::Asked {
                         Fact::TallyOverflowed
-                    } else if presented == Presented::Asked {
-                        Fact::Asked
                     } else {
                         Fact::ReaderPresented
                     },
@@ -1353,7 +1485,10 @@ impl MachineGate {
         }
         // An ask no key can name is STILL an overflow, and still ends a
         // clean window: it has its own room, not a way to go uncounted
-        // that reads clean. The fact says what the first one presented.
+        // that reads clean. The fact says what the overflowed request
+        // presented, once for each presentation (review of car 1dff2293):
+        // once per tally, asks overflowing first left a later miss
+        // overflow with no fact naming it a caller `enforce` refuses.
         let held = if asking {
             tally.asked
         } else {
@@ -1361,7 +1496,7 @@ impl MachineGate {
         };
         if held >= MAX_TALLY_KEYS {
             tally.overflow += 1;
-            if tally.overflow == 1 {
+            if tally.overflow_stated.insert(presented) {
                 self.evidence.emit(
                     Fact::TallyOverflowed,
                     serde_json::json!({
@@ -1590,6 +1725,21 @@ impl Matched {
 #[derive(Clone, Copy, Debug)]
 struct ReaderMatched(Slot);
 
+/// An estate credential actually matched by this request's gate. A
+/// relay may carry that same credential on; admission under off,
+/// report, an exemption or degraded enforce does not vouch for one.
+/// Only the gate constructs this proof (backlog 2710c8fc, R5).
+#[derive(Clone)]
+pub struct VerifiedEstate(axum::http::HeaderValue);
+
+impl VerifiedEstate {
+    /// Relaying follows the same destination bound as machine clients,
+    /// without replacing an asserted caller's token with our own.
+    pub fn header_for(&self, url: &str) -> Option<&axum::http::HeaderValue> {
+        machine_token::hosts().allows_url(url).then_some(&self.0)
+    }
+}
+
 /// The value a request presents, for the slot match. `None` when it
 /// sends no `x-boss-machine-token` — and when it sends MORE THAN ONE,
 /// which is no accepted token at all ([`sent_several`]): no slot is
@@ -1656,14 +1806,19 @@ fn sent_several(headers: &HeaderMap) -> bool {
 /// * it changes what a request is COUNTED AS, never what is admitted:
 ///   `enforce` answers the ask 401 exactly as before;
 /// * an asker is held to its source's share like any unvouched caller
-///   ([`held_to_a_share`]), and past it is counted under its source —
-///   as `asked`, never as a tally overflow, which would dirty a window;
-/// * that holds for the SOURCE's share only (review 02e21a45, N1). Asks
-///   are bounded together as well, at [`MAX_TALLY_KEYS`] of their own,
-///   and an ask past that which no source's share takes — a seventeenth
-///   LAN source, or an in-pod caller, which no share holds — IS a tally
-///   overflow and does end a clean window. What it can no longer do is
-///   take a key a miss would have been named in (backlog d653e090).
+///   ([`held_to_a_share`]), and past it is counted under its source, as
+///   `asked`;
+/// * asks are bounded together as well, at [`MAX_TALLY_KEYS`] of their
+///   own (review 02e21a45, N1), and an ask past that which no source's
+///   share takes — a seventeenth LAN source, or an in-pod caller, which
+///   no share holds — is counted in `overflow`. Neither room can take a
+///   key a miss would have been named in (backlog d653e090);
+/// * an ask past EITHER room is a tally overflow, a `tally_overflowed`
+///   fact, and ends a clean window (design e3d19d1a q1, the platform
+///   owner 2026-10-10): past its room an ask is no longer keyed, so the
+///   gate has stopped seeing who asked, and a clean window must mean
+///   every request was seen. A source's spill names its source and
+///   `asked`, so it holds no revoke; only a whole room's does.
 ///
 /// A value of whitespace alone asks about nothing, like the empty one
 /// (the same review, N4): a wire parser trims it to empty before the
@@ -1787,10 +1942,18 @@ fn printable_user(id: &str) -> String {
 /// The middleware. Layered by [`gated`]; never mounted by hand.
 pub async fn machine_gate(
     State(gate): State<Arc<MachineGate>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
+    // A nested gate must judge afresh, never inherit another gate's
+    // proof after headers or accepted slots have changed.
+    req.extensions_mut().remove::<VerifiedEstate>();
+    let started = std::time::Instant::now();
     let reading = gate.reading();
+    req.extensions_mut().insert(RequestModeObservation {
+        mode: reading.mode,
+        started,
+    });
     let several = sent_several(req.headers());
     // A probe-reader value beside any other value reaches no handler, in
     // EVERY mode and for every method (review 177b4976, N1). Its scope —
@@ -1815,19 +1978,25 @@ pub async fn machine_gate(
         )
             .into_response();
     }
-    let provided = presented_token(req.headers());
+    let provided = presented_token(req.headers()).map(str::to_owned);
     // The reader's scope comes FIRST and holds in every mode, health and
     // OPTIONS included: a probe-reader value reads, and never writes,
     // whatever window the gate is in (design b35c22b4, Q2).
-    let matched = match Matched::of(&reading, provided) {
+    let matched = match Matched::of(&reading, provided.as_deref()) {
         Some(Matched::Reader(slot)) => return gate.as_reader(reading.mode, slot, req, next).await,
         Some(Matched::Estate(slot)) => Some(slot),
         None => None,
     };
+    if matched.is_some()
+        && let Some(mut token) = req.headers().get(machine_token::HEADER).cloned()
+    {
+        token.set_sensitive(true);
+        req.extensions_mut().insert(VerifiedEstate(token));
+    }
     if reading.mode == Mode::Off || gate.exempt(&req) {
         return next.run(req).await;
     }
-    match (matched, provided) {
+    match (matched, provided.as_deref()) {
         (Some(Slot::Previous), _) => gate.record(&req, Presented::Previous),
         (Some(_), _) => {}
         // More than one value presents no value to match, and is a
@@ -1847,11 +2016,23 @@ pub async fn machine_gate(
         return next.run(req).await;
     }
     if reading.degraded() {
-        tracing::error!(
-            service = %gate.service,
-            "machine gate DEGRADED: mode enforce with no readable token; admitting as report \
-             (design 6805c764 choice 4)"
-        );
+        // Once, then on the interval, never per request (must-fix of the
+        // review of car 1): with no readable token EVERY request lands
+        // here, and a line per request buried the one a reader needed.
+        let due = gate
+            .degraded_said
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .due(std::time::Instant::now());
+        if let Some(unsaid) = due {
+            tracing::error!(
+                service = %gate.service,
+                unsaid,
+                "machine gate DEGRADED: mode enforce with no readable token; admitting as report \
+                 (design 6805c764 choice 4); said again every {RESAY_EVERY:?} while it lasts, \
+                 `unsaid` counting the admitted requests since the last line"
+            );
+        }
         return next.run(req).await;
     }
     (
@@ -2024,6 +2205,62 @@ mod tests {
     use tower::ServiceExt;
 
     const HEALTH: &str = "/api/things/health";
+
+    #[test]
+    fn a_verified_relay_credential_is_sensitive_and_stays_on_estate_hosts() {
+        let mut header = axum::http::HeaderValue::from_static("fixture-token");
+        header.set_sensitive(true);
+        let proof = VerifiedEstate(header);
+        let allowed = proof.header_for("http://127.0.0.1:1/").unwrap();
+        assert!(allowed.is_sensitive());
+        assert_eq!(allowed, "fixture-token");
+        assert!(proof.header_for("http://relay-outside.invalid/").is_none());
+        assert!(proof.header_for("not a URL").is_none());
+    }
+
+    #[tokio::test]
+    async fn exempt_and_reader_admission_cannot_inherit_an_estate_relay_proof() {
+        let inner = Router::new().route(
+            HEALTH,
+            get(
+                |proof: Option<axum::Extension<VerifiedEstate>>| async move {
+                    if proof.is_some() {
+                        "verified"
+                    } else {
+                        "unverified"
+                    }
+                },
+            ),
+        );
+        let gate = Arc::new(MachineGate::new(
+            "things",
+            &[HEALTH],
+            Reading::new(Mode::Enforce, slots()).with_reader(Slots::new(
+                Some("reader-value".into()),
+                None,
+                None,
+            )),
+        ));
+        let router = gated(inner, gate);
+        for token in [None, Some("wrong"), Some("reader-value")] {
+            let mut request = axum::http::Request::builder().uri(HEALTH);
+            if let Some(token) = token {
+                request = request.header(machine_token::HEADER, token);
+            }
+            let mut request = request.body(Body::empty()).unwrap();
+            request
+                .extensions_mut()
+                .insert(VerifiedEstate(axum::http::HeaderValue::from_static(
+                    "cur-value",
+                )));
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), b"unverified");
+        }
+    }
 
     fn slots() -> Slots {
         Slots::new(
@@ -2556,6 +2793,14 @@ mod tests {
                         !body.contains(first) && !body.contains(also) && !body.contains("agent-"),
                         "no value and no handler output: {body}"
                     );
+                    let misses = g.misses();
+                    if mode == Mode::Off {
+                        assert!(misses.rows.is_empty(), "off records no mismatch");
+                    } else {
+                        assert_eq!(misses.rows.len(), 1, "one refused reader request");
+                        assert_eq!(misses.rows[0].key.presented, Presented::Mismatch);
+                        assert_eq!(misses.rows[0].count, 1);
+                    }
                 }
             }
             // Health is exempt for a GET without a token; it is no way
@@ -2952,6 +3197,43 @@ mod tests {
         assert_eq!(a["mode"], "enforce");
     }
 
+    /// Must-fix of the review of car 1 (a159e1ee, backlog 2710c8fc): a
+    /// degraded `enforce` admits every request, and it said so at ERROR
+    /// on EVERY one — with no readable token every request matches
+    /// nothing, so a busy port wrote an error line per request for as
+    /// long as the Secret stayed unreadable, and the one line a reader
+    /// needed was buried under its own copies. Said once, then again on
+    /// the interval an outage is re-said at, counting what it stood for.
+    #[tokio::test]
+    async fn a_degraded_gate_says_so_once_and_again_on_an_interval_not_per_request() {
+        let g = gate(Mode::Enforce, Slots::default());
+        for _ in 0..5 {
+            assert_eq!(
+                call(&g, "PUT", "/api/things/1", None).await.0,
+                StatusCode::OK
+            );
+        }
+        let said = g.degraded_said.lock().unwrap();
+        assert_eq!(said.times, 1, "said once for five degraded requests");
+        assert_eq!(said.unsaid, 4, "the other four counted, not said");
+    }
+
+    #[test]
+    fn a_throttled_line_is_due_first_then_once_per_interval_with_its_count() {
+        let t0 = std::time::Instant::now();
+        let mut said = Throttled::default();
+        assert_eq!(said.due(t0), Some(0), "the first occurrence is said");
+        assert_eq!(said.due(t0 + Duration::from_secs(1)), None);
+        assert_eq!(said.due(t0 + Duration::from_secs(2)), None);
+        assert_eq!(
+            said.due(t0 + RESAY_EVERY),
+            Some(2),
+            "said again on the interval, naming the two it did not say"
+        );
+        assert_eq!(said.due(t0 + RESAY_EVERY + Duration::from_secs(1)), None);
+        assert_eq!(said.times, 2);
+    }
+
     #[tokio::test]
     async fn health_is_exempt_by_exact_path_for_get_only_and_options_stays_open() {
         let g = gate(Mode::Enforce, slots());
@@ -3140,13 +3422,27 @@ mod tests {
 
     /// An asker is held to its source's share like any caller nothing
     /// vouches for: asserting a new `x-boss-user` per ask cannot grow the
-    /// tally past the share, what it sends beyond is counted under its
-    /// source as `asked` — and neither the rows nor the spill is a tally
-    /// overflow or a reader fact, so a noisy asker dirties nothing either.
+    /// tally past the share, and what it sends beyond is counted under
+    /// its source as `asked`. Its rows dirty nothing — an ask is the
+    /// question the route exists for — but THE SPILL DOES (design
+    /// e3d19d1a q1, decided by the platform owner 2026-10-10 on backlog
+    /// d653e090): past its share an ask is no longer keyed, so the gate
+    /// has stopped seeing who asked, and a clean window must mean every
+    /// request was seen. Fail closed, naming the overflow: the live half
+    /// says so, and the log holds a `tally_overflowed` of scope `source`,
+    /// which ends the enforce window and — naming its source and a
+    /// presentation that is not `previous` — holds no revoke.
     #[tokio::test]
-    async fn an_asker_past_its_share_is_counted_by_source_and_dirties_nothing() {
+    async fn an_asker_past_its_share_is_counted_by_source_and_ends_a_clean_window() {
         let (g, mut rx) = stating(Mode::Report);
-        for i in 0..MAX_KEYS_PER_SOURCE + 3 {
+        for i in 0..MAX_KEYS_PER_SOURCE {
+            ask_as(&g, [10, 20, 0, 66], &format!("asker-{i}"), "a-wrong-guess").await;
+        }
+        assert!(
+            g.misses().not_clean.is_empty(),
+            "a full share of asks, every one keyed, is still clean"
+        );
+        for i in MAX_KEYS_PER_SOURCE..MAX_KEYS_PER_SOURCE + 3 {
             ask_as(&g, [10, 20, 0, 66], &format!("asker-{i}"), "a-wrong-guess").await;
         }
         let m = g.misses();
@@ -3159,18 +3455,36 @@ mod tests {
             (spilled.source.as_str(), spilled.presented, spilled.count),
             ("10.20.0.66", Presented::Asked, 3)
         );
-        assert!(m.not_clean.is_empty(), "{:?}", m.not_clean);
+        assert_eq!(
+            m.not_clean,
+            vec![format!(
+                "1 source(s) past their own share of asks ({MAX_KEYS_PER_SOURCE} keys), whose \
+                 further asks are counted by source and name no asker"
+            )],
+            "dirty by the spill, and by its own reason"
+        );
         let facts = stated(&mut rx);
         let mut want = vec!["recording_began".to_string()];
         want.extend(std::iter::repeat_n(
             "asked".to_string(),
-            MAX_KEYS_PER_SOURCE + 1,
+            MAX_KEYS_PER_SOURCE,
         ));
+        want.push("tally_overflowed".to_string());
         assert_eq!(kinds(&facts), want, "one per key, and one for the spill");
         let spill = facts.last().unwrap();
+        assert!(Fact::TallyOverflowed.dirties());
         assert_eq!(spill.payload["scope"], "source");
         assert_eq!(spill.payload["source"], "10.20.0.66");
         assert_eq!(spill.payload["presented"], "asked");
+        for drained in [
+            crate::gate_evidence::DrainedSlot::Estate,
+            crate::gate_evidence::DrainedSlot::Reader,
+        ] {
+            assert!(
+                !drained.dirtied_by(EvidenceGate::MachineGate, spill),
+                "an ask spill names its source and is no `previous`: it holds no revoke"
+            );
+        }
     }
 
     /// Backlog d653e090 (review 02e21a45 of car 176d5c9d, N1; its probe
@@ -3307,9 +3621,10 @@ mod tests {
     /// past no one source's share — is still a tally overflow, still one
     /// `tally_overflowed` on the log, and the tally is still not clean
     /// until it restarts. Asks have room of their own; they were not
-    /// given a way to go uncounted that reads clean. Whether such an ask
-    /// SHOULD end a clean window is the platform owner's decision, left
-    /// open on that item.
+    /// given a way to go uncounted that reads clean — and the platform
+    /// owner decided that they must not have one (design e3d19d1a q1,
+    /// 2026-10-10): an ask past its own room, this one or its source's
+    /// share, ends a clean window.
     #[tokio::test]
     async fn an_ask_no_key_can_name_is_still_a_tally_overflow() {
         let (g, mut rx) = stating(Mode::Report);
@@ -3337,6 +3652,127 @@ mod tests {
         assert_eq!(overflowed.len(), 1, "stated once");
         assert_eq!(overflowed[0].payload["scope"], "tally");
         assert_eq!(overflowed[0].payload["presented"], "asked");
+    }
+
+    /// The converse of `asks_take_none_of_the_room_a_miss_is_named_in`,
+    /// which no test held (review of car 1dff2293): with every key a miss
+    /// can be named in taken, an ask is still a row by address and user,
+    /// and it is the next MISS that overflows, not the ask.
+    #[tokio::test]
+    async fn an_ask_is_still_named_when_the_room_a_miss_is_named_in_is_full() {
+        let g = gate(Mode::Report, slots());
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        for i in 0..MAX_TALLY_KEYS {
+            g.record(&from(loopback, &format!("in-pod-{i}")), Presented::None);
+        }
+        assert_eq!(g.misses().overflow, 0, "the fill is exactly the room");
+        g.record(&from(v4(0, 66), "a-lan-asker"), Presented::Asked);
+        g.record(&from(loopback, "an-in-pod-asker"), Presented::Asked);
+        let m = g.misses();
+        assert_eq!(m.overflow, 0, "no ask overflowed: {:?}", m.not_clean);
+        for (peer, user) in [
+            ("10.20.0.66", "a-lan-asker"),
+            ("127.0.0.1", "an-in-pod-asker"),
+        ] {
+            assert!(
+                m.rows.iter().any(|r| r.key.peer == peer
+                    && r.key.user == user
+                    && r.key.presented == Presented::Asked),
+                "{user} is a row"
+            );
+        }
+        g.record(&from(v4(0, 30), "one-more-miss"), Presented::None);
+        assert_eq!(g.misses().overflow, 1, "the miss is what overflows");
+    }
+
+    /// An overflow names no caller, so its first sighting is a fact — and
+    /// that fact names what the overflowed request presented. Once per
+    /// TALLY it named only the first one (review of car 1dff2293): asks
+    /// overflowing their room first left a later miss overflow, a caller
+    /// `enforce` would refuse, with no fact naming it as one. Once per
+    /// presentation the log names every kind of request that overflowed,
+    /// still bounded — there are seven presentations, not one per caller.
+    #[tokio::test]
+    async fn a_tally_overflow_is_stated_once_for_each_presentation() {
+        let (g, mut rx) = stating(Mode::Report);
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        for i in 0..MAX_TALLY_KEYS {
+            g.record(&from(loopback, &format!("ask-{i}")), Presented::Asked);
+            g.record(&from(loopback, &format!("miss-{i}")), Presented::None);
+        }
+        for i in 0..3 {
+            g.record(
+                &from(loopback, &format!("one-more-ask-{i}")),
+                Presented::Asked,
+            );
+            g.record(
+                &from(loopback, &format!("one-more-miss-{i}")),
+                Presented::None,
+            );
+            g.record(
+                &from(loopback, &format!("a-wrong-one-{i}")),
+                Presented::Mismatch,
+            );
+        }
+        let m = g.misses();
+        assert_eq!(m.overflow, 9);
+        let overflowed: Vec<(String, String)> = stated(&mut rx)
+            .iter()
+            .filter(|e| e.kind == "machine_gate.tally_overflowed")
+            .map(|e| {
+                (
+                    e.payload["scope"].as_str().unwrap().to_string(),
+                    e.payload["presented"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            overflowed,
+            [("tally", "asked"), ("tally", "none"), ("tally", "mismatch")]
+                .map(|(s, p)| (s.to_string(), p.to_string()))
+                .to_vec(),
+            "one fact for each presentation that overflowed, in the order each first did"
+        );
+    }
+
+    /// What the recorder's queue is sized against (review of car
+    /// 1dff2293: QUEUE_DEPTH was 2048, exactly the two rooms' keys, so a
+    /// full tally lost its spill and overflow facts — fail closed, as
+    /// `facts_lost`, but lost). The queue is held to this count plus a
+    /// room by a compile-time assertion beside the constant; this spells
+    /// the count out, so a bound moved on either side is read in numbers.
+    ///
+    /// Two starts, not one (review 42836ede of car 10ea15f6, N3; backlog
+    /// aba44bac): a mode move the tally does not restart on — `report`
+    /// raised to `enforce`, or lowered to `off` — states a second
+    /// `recording_began` into the same tally. Every other move restarts
+    /// it, so no tally carries a third. Measured below, not assumed.
+    #[tokio::test]
+    async fn the_facts_one_tally_can_state_are_its_keys_spills_and_overflows() {
+        assert_eq!(
+            FACTS_ONE_TALLY_CAN_STATE,
+            2 * MAX_TALLY_KEYS + 2 + 16 * 5 + 16 + 7,
+            "both rooms' keys, its two starts, every full share's spill (five presentations \
+             in a miss share, one in an ask share) and every presentation's overflow"
+        );
+        assert_eq!(FACTS_ONE_TALLY_CAN_STATE + MAX_TALLY_KEYS, 3177);
+        assert_eq!(crate::gate_evidence::QUEUE_DEPTH, 4096);
+
+        for moved in [Mode::Enforce, Mode::Off] {
+            let (g, mut rx) = stating(Mode::Report);
+            let since = g.misses().recording_since;
+            g.observe(Reading::new(moved, slots()).with_reader(reader()));
+            assert_eq!(
+                g.misses().recording_since,
+                since,
+                "report to {moved:?} keeps the tally"
+            );
+            assert_eq!(
+                kinds(&stated(&mut rx)),
+                vec!["recording_began", "recording_began"],
+                "and states a second start into it"
+            );
+        }
     }
 
     /// An ask's first sighting is said at INFO: it is the traffic the
@@ -3976,6 +4412,70 @@ mod tests {
         std::fs::remove_file(&mode).unwrap();
         let r = files.read_blocking();
         assert_eq!((r.mode, r.mode_error), (Mode::Off, None));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review of the mode-file car, 2026-09-27, (b), (a) and (e), due
+    /// before any service enforces (backlog 2710c8fc). (b) `open` on a
+    /// FIFO blocks until a writer appears, and this read runs inline at
+    /// boot — for the machine gate on every service and for row D's
+    /// policy-check switch, which shares it — so a FIFO at the path hung
+    /// the process before it served. The token slots got this refusal;
+    /// the mode file did not. (a)/(e) A link whose target is gone read as
+    /// ABSENT, which is `off`, and said nothing: a gate in `enforce`
+    /// dropped to admitting everything on a dangling link. Both now read
+    /// as a file that exists and cannot be read: `report`, said at error
+    /// level, and promptly.
+    #[test]
+    fn a_fifo_or_a_dangling_link_at_the_mode_path_reads_as_report_promptly() {
+        let dir = std::env::temp_dir().join(format!(
+            "boss-core-machine-gate-mode-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let tokens = dir.join("tokens");
+        std::fs::create_dir_all(&tokens).unwrap();
+        let mode = dir.join("mode");
+
+        // A FIFO. mkfifo is coreutils, as the slot reader's test uses.
+        let made = std::process::Command::new("mkfifo")
+            .arg(&mode)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (m, t) = (mode.clone(), tokens.clone());
+        std::thread::spawn(move || {
+            let gate = MountedFiles::new(&m, &t).read_blocking();
+            let switch = read_mode(&m, "policy check");
+            tx.send((gate.mode, gate.mode_error, switch)).unwrap();
+        });
+        let (gate_mode, gate_error, switch) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a FIFO at the mode path must not block the read");
+        assert_eq!(gate_mode, Mode::Report);
+        let e = gate_error.unwrap_or_default();
+        assert!(
+            e.contains("not a regular file") && e.contains("report"),
+            "{e}"
+        );
+        assert_eq!(switch.0, Mode::Report);
+        assert!(switch.1.unwrap_or_default().contains("policy check"));
+        std::fs::remove_file(&mode).unwrap();
+
+        // A link whose target is gone: not absent, so not `off`.
+        std::os::unix::fs::symlink(dir.join("..data/mode"), &mode).unwrap();
+        let r = MountedFiles::new(&mode, &tokens).read_blocking();
+        assert_eq!(r.mode, Mode::Report, "{r:?}");
+        let e = r.mode_error.clone().unwrap_or_default();
+        assert!(e.contains("missing") && e.contains("report"), "{e}");
+
+        // A link to a real word is read through, as a ConfigMap key is.
+        std::fs::write(dir.join("word"), "enforce\n").unwrap();
+        std::fs::remove_file(&mode).unwrap();
+        std::os::unix::fs::symlink(dir.join("word"), &mode).unwrap();
+        let r = MountedFiles::new(&mode, &tokens).read_blocking();
+        assert_eq!((r.mode, r.mode_error), (Mode::Enforce, None));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

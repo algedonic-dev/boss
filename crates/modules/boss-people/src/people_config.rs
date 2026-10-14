@@ -34,13 +34,6 @@ pub struct PeopleApiConfig {
     /// configured. Set this once the calendar service is deployed.
     #[serde(default)]
     pub calendar_api_url: Option<String>,
-    /// Base URL for the boss-subject-kinds HTTP API. Optional —
-    /// SubjectKind validation is opt-in (see
-    /// `http.rs::check_custom_subject`). When set, write paths that
-    /// accept Subject::Custom validate the custom_kind against the
-    /// registry.
-    #[serde(default)]
-    pub subject_kinds_api_url: Option<String>,
 }
 
 impl PeopleApiConfig {

@@ -45,9 +45,9 @@
         {:else if snapshot.rows.length === 0}
           <p>No agents in this complete snapshot of this namespace.</p>
         {:else}
-          <ul>
+          <ul class="runtime-stations">
             {#each snapshot.rows as row (row.path)}
-              <li>{row.path} · {snapshot.state === 'stale' ? 'stale observation' : `observed ${row.status}`} · current registered task unknown</li>
+              <li><strong>{row.path}</strong> · {snapshot.state === 'stale' ? 'stale observation' : `observed ${row.status}`} · current registered task unknown</li>
             {/each}
           </ul>
         {/if}
@@ -61,4 +61,7 @@
   section { border: 1px solid var(--border); padding: 1rem; margin: 1rem 0; max-width: 68rem; }
   p, li { font-size: 0.78rem; overflow-wrap: anywhere; }
   article { border-top: 1px solid var(--border); margin-top: 0.75rem; padding-top: 0.5rem; }
+  .runtime-stations { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr)); gap: .75rem; padding: 0; list-style: none; }
+  .runtime-stations li { padding: .85rem; border: 1px solid var(--border); background: var(--ink-raised); line-height: 1.6; }
+  strong { font-weight: 600; }
 </style>

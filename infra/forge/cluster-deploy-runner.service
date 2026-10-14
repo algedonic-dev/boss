@@ -9,47 +9,77 @@ Description=BOSS cluster converges on forge main (build + push + roll)
 # install.sh wrote carried the address instead (backlog 5222163e).
 EnvironmentFile=/etc/boss/sor.env
 Type=oneshot
-User=david
-# The build is a cached docker build (~minutes warm, ~an hour cold).
+# ROOT, FROM ROOT'S TREE, ON THE SYSTEM DOCKER DAEMON (backlog 683d7fe9,
+# car 2; decided by David 2026-10-07 on design-doc c8502e17, question
+# image-build, and as position B of the forge sudo decision). This unit
+# ran as david out of /home/david/boss: it built the image every pod runs
+# on his rootless docker daemon, pushed it with a registry login he once
+# typed by hand, read his ~/kc.yaml — and reached root through a
+# passwordless `sudo docker` for every kubectl, so the loop that deploys
+# every fix was one edit of a file his account owns away from running
+# anything. It needs nothing an account has: the tree is root's
+# (infra/forge/root-tree.sh), the push token is the credential broker's,
+# deposited root-only by the forge converge (registry-token-deposit.sh),
+# and the kubeconfig is the one David places under /etc/boss-ops. As root
+# it can also READ the estate machine token, so the wrap pair, the
+# request annotations, the alerts and registry-drift's two lints are
+# stamped (infra/lib/secret-header.sh) where they went out tokenless.
+User=root
+# The build is a cached docker build (~minutes warm, ~an hour cold; the
+# first build on the system daemon is cold).
 TimeoutStartSec=90min
 # THE TOKEN'S HEADER FILE NEVER OUTLIVES A RUN (backlog df38075a, F1 of
 # review a92c0b94). The wrap pair and the converge's own posts present
 # the machine token, and the 0600 header file infra/lib/secret-header.sh
 # hands curl is made in $RUNTIME_DIRECTORY when a unit declares one:
-# /run/cluster-deploy-runner, tmpfs, 0700 and david's because User= is,
+# /run/cluster-deploy-runner, tmpfs, 0700 and root's because User= is,
 # removed by systemd when this oneshot stops whatever ended it — the
 # 90-minute kill above and a SIGKILL included, neither of which runs the
-# reader's EXIT trap. Without it the file sat in the host's shared /tmp.
-# It is there through ExecStopPost and gone after it. RuntimeDirectory=
-# makes no mount namespace; the shape of estate-observe-host.service.
+# reader's EXIT trap. It is there through ExecStopPost and gone after it.
+# RuntimeDirectory= makes no mount namespace; the shape of
+# estate-observe-host.service.
 RuntimeDirectory=cluster-deploy-runner
 RuntimeDirectoryMode=0700
-# Job visibility. The forge host has no /opt/boss — it runs from
-# this checkout, which is where the installed units already point.
+# EVERYTHING THIS UNIT KEEPS IS ROOT'S, UNDER ONE DIRECTORY systemd
+# makes before every start: the stamps, the request inbox, the tenant
+# checkouts, the view of the tree a run executes from, and the alert
+# spool below — forge-defaults.sh's CONVERGE_STATE, which names each.
+# 0700: every reader of the stamp is root (the watchdog, rollback-to, the
+# registry prune and the data move, the last three under the ops
+# runner), and only root may make a name where the alert spool is
+# replayed from. The first run carries the stamps across from the old
+# home, once (cluster-deploy-lib.sh carry_converge_state).
+StateDirectory=boss/converge
+StateDirectoryMode=0700
 # The facts the run leaves for its own packet (build_s, push_s, roll_s,
 # verify_s, build_head, or unchanged): run-summary.sh writes them here
 # during ExecStart and boss-step.sh (ExecStopPost) merges them onto the
-# run step and deletes the file. Under $HOME because this unit runs as
-# david and /run is root's; one path, declared once, inherited by both
-# Exec lines (CLAUDE.md §9a).
-Environment=BOSS_RUN_SUMMARY_FILE=/home/david/.boss-cluster-converge.summary.json
+# run step and deletes the file. Under /run, like every other root
+# unit's; one path, declared once, inherited by both Exec lines
+# (CLAUDE.md §9a).
+Environment=BOSS_RUN_SUMMARY_FILE=/run/cluster-deploy-runner.summary.json
 # The estate id the wrap stamps on the packet and boss-step records on
 # the run step, rather than whatever the machine calls itself (backlog
 # 79f7678b, 2026-09-26).
 Environment=HOST_ID=forge
 # Where an alert this converge raises is KEPT when the record will not
-# take it (the tenant check's refusals, cluster-deploy-lib.sh through
-# alert-lib.sh), in this user's home and not alert-lib's default under
-# world-writable /var/tmp (backlog dda26693). This converge replays it
-# itself on every tick (replay_kept_alerts): the watchdog, root since
-# backlog a604a35b, keeps a spool of its own and replays only that.
-Environment=ALERT_SPOOL=/home/david/.boss-alert-spool
+# take it (the tenant check's refusals, a standing hold — through
+# alert-lib.sh), in a directory only root can make a name in: the
+# converge replays it itself on every tick (replay_kept_alerts) and
+# presents the machine token when it does, so a planted body there would
+# ride a credential. The watchdog keeps a spool of its own. The runner
+# defaults to this same path when started without this environment
+# (forge-defaults.sh CONVERGE_ALERT_SPOOL, review 1ba2873d B2); it is
+# still named here because infra/forge/probe-account.sh reads every
+# installed unit's spool to prove the probe account cannot make it, and
+# the_converge_runs_as_root_from_roots_tree.rs holds the two equal.
+Environment=ALERT_SPOOL=/var/lib/boss/converge/alert-spool
 # `-`: the packet is visibility, never a precondition. This is the loop
 # that deploys a fix to the SoR, so it cannot wait on the SoR — not while
 # it is dark (2026-09-05) and not while it answers 503 on a policy outage
 # (backlog 9fd7f51e). The wrap exits 0 on both; the `-` covers a wrap
 # that fails for any other reason. Pinned by
 # the_chore_runs_through_a_sor_that_answers_badly.rs.
-ExecStartPre=-/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-cluster-converge "Cluster converge on forge main"
-ExecStart=/home/david/boss/infra/forge/cluster-deploy-runner.sh
-ExecStopPost=-/home/david/boss/infra/boss-step.sh maintenance-cluster-converge run
+ExecStartPre=-/var/lib/boss/tree/current/infra/boss-maintenance-wrap.sh maintenance-cluster-converge "Cluster converge on forge main"
+ExecStart=/var/lib/boss/tree/current/infra/forge/cluster-deploy-runner.sh
+ExecStopPost=-/var/lib/boss/tree/current/infra/boss-step.sh maintenance-cluster-converge run

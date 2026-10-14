@@ -96,3 +96,11 @@ required-features = ["postgres"]
 [[test]]
 name = "audience_observation_preserves_visibility"
 required-features = ["postgres"]
+
+[[test]]
+name = "manual_baseline_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "manual_baseline_authority"
+required-features = ["postgres"]

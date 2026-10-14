@@ -774,3 +774,170 @@ async fn the_rule_records_and_completes_a_ready_observe_step_assigned_to_an_agen
         StepStatus::Completed
     );
 }
+
+/// Backlog ce9b9207 (2026-10-09): the protocol's one terminal was
+/// `observed`, so a request that was replaced (df452c4d, admitted under the
+/// generic subject and superseded by 87b68bf3) or no longer needed (87b68bf3,
+/// whose question c78bd9d5 answered) had no way to close and stood urgent
+/// for days. A `withdrawn` terminal follows the signed scope and waits on a
+/// job-metadata marker whose value is the reason: absent at admission, so it
+/// cannot close a packet on create (workflow lint phase 6, judged by the
+/// publish gate below), and set through the job metadata door, which
+/// re-evaluates `ready_when` so the dispatcher's complete-on-ready rule
+/// closes the packet at `withdrawn`. Run through the real jobs router with
+/// the tree's own row.
+#[tokio::test]
+async fn a_replaced_or_unneeded_inspection_closes_withdrawn_on_its_marker() {
+    use boss_core::{
+        actor::ActorId,
+        job::{Job, JobStatus, Priority, StepId, StepStatus, Subject},
+        port::EventBus,
+        publisher::DomainPublisher,
+    };
+    use boss_jobs::{
+        InMemoryJobs, InMemoryWorkflows, JobsRepository,
+        http::{JobsApiState, router},
+        registry::WorkflowRegistry,
+    };
+    use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    let workflow = boss_jobs::seed_loader::load_workflows(
+        boss_testing::repo_root()
+            .join("infra/platform/workflows/inspect-a-github-installation.toml"),
+    )
+    .unwrap()
+    .remove(0);
+    let spec = workflow
+        .steps
+        .iter()
+        .find(|s| s.title == "withdrawn")
+        .expect("the row declares a withdrawn terminal");
+    assert_eq!(
+        spec.terminal.as_ref().map(|t| t.outcome.as_str()),
+        Some("withdrawn")
+    );
+    assert_eq!(spec.metadata_defaults["outcome_kind"], "withdrawn");
+    assert!(
+        boss_jobs::workflow_lint::gate_active(&workflow).is_ok(),
+        "the publish gate refuses the row: {:?}",
+        boss_jobs::workflow_lint::gate_active(&workflow).err()
+    );
+
+    // The live shape of both stranded requests: David's scope signed, the
+    // observe step left READY by a rule that never wrote, nothing closed.
+    let jobs = Arc::new(InMemoryJobs::new());
+    let mut job = Job::new(
+        "inspect-a-github-installation",
+        Subject::new("custom", "example-credential"),
+        "Inspect",
+        "emp-owner",
+        Priority::Urgent,
+        chrono::Utc::now().date_naive(),
+    );
+    job.status = JobStatus::Open;
+    jobs.create_job(&job).await.unwrap();
+    let job_id = job.id;
+    for mut step in boss_jobs::registry::materialize_steps(
+        &workflow,
+        &job.subject,
+        job.id,
+        &job.metadata,
+        StepId::new,
+    ) {
+        match step.spec_slug.as_deref() {
+            Some("scope") => {
+                step.status = StepStatus::Completed;
+                step.completed_by = Some(ActorId::human("emp-owner"));
+            }
+            Some("observe") => step.status = StepStatus::Ready,
+            _ => assert_eq!(step.status, StepStatus::Pending),
+        }
+        jobs.add_step(&step).await.unwrap();
+    }
+
+    let kinds = Arc::new(InMemoryWorkflows::for_fixture());
+    kinds.seed(workflow).unwrap();
+    let kind_registry: Arc<dyn WorkflowRegistry> = kinds;
+    let policy: Arc<dyn PolicyClient> = Arc::new(
+        FakePolicyClient::builder()
+            .allow(
+                "platform-admin",
+                Action::Update,
+                Resource::job(),
+                Scope::All,
+            )
+            .build(),
+    );
+    let bus = boss_testing::RecordingEventBus::new();
+    let bus_dyn: Arc<dyn EventBus> = bus.clone();
+    let app = router(JobsApiState {
+        kind_registry: Some(kind_registry),
+        ..JobsApiState::minimal(
+            jobs.clone(),
+            bus,
+            DomainPublisher::new(bus_dyn, "jobs"),
+            policy,
+            Arc::new(boss_clock_client::WallClockClient),
+        )
+    });
+    let admin = json!({"id":"emp-owner","role":"platform-admin","access_tier":"operator",
+        "territory_account_ids":[],"direct_report_ids":[],"department":"platform"})
+    .to_string();
+    let send = |method: &str, path: String, body: Value| {
+        let (app, admin) = (app.clone(), admin.clone());
+        let method = method.to_owned();
+        async move {
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method.as_str())
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header("x-boss-user", admin)
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+    let status_of = |slug: &'static str| {
+        let jobs = jobs.clone();
+        async move {
+            jobs.list_steps(&job_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.spec_slug.as_deref() == Some(slug))
+                .unwrap()
+                .status
+        }
+    };
+
+    // Control: a metadata write that is not the marker leaves it waiting, so
+    // the terminal reads the marker and not any write through the door.
+    let path = format!("/api/jobs/{job_id}/metadata");
+    let (status, body) = send("PATCH", path.clone(), json!({"note":"still needed"})).await;
+    assert_eq!(status, axum::http::StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(status_of("withdrawn").await, StepStatus::Pending);
+
+    let (status, body) = send(
+        "PATCH",
+        path,
+        json!({"withdrawn":"superseded by a correctly targeted request"}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(status_of("withdrawn").await, StepStatus::Ready);
+    assert_eq!(
+        status_of("observed").await,
+        StepStatus::Pending,
+        "a withdrawn request claims no observation"
+    );
+}

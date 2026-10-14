@@ -39,9 +39,10 @@
 #     deny-list: whoever holds the deposit key can write this file, and
 #     the allow-list is what keeps that from being a root shell.
 #
-# WHAT IS PRINTED: byte counts, the path and its mode — never a value.
-# The deposit Job compares the byte count with what it sent, so the
-# receipt is read back rather than assumed.
+# WHAT IS PRINTED: first, before a byte is read, one fixed line saying
+# this is the receiver and it is ready; then byte counts, the path and
+# its mode — never a value. The deposit Job compares the byte count
+# with what it sent, so the receipt is read back rather than assumed.
 #
 # Exit: 0 installed, or unchanged; 65 the deposit was refused and the
 # file left as it was; 78 a refusal of how it was invoked; 1 the write
@@ -237,6 +238,18 @@ fi
 DEST="$DIR/$NAME"
 TMP="$(mktemp "$DIR/.$NAME.recv.XXXXXX")" || fail "cannot stage a file in $DIR"
 trap 'rm -f "$TMP"' EXIT
+
+# THIS SPEAKS FIRST HERE TOO (backlog dea2236f). The machine token's
+# first live enrolment (packet 96a0f7bb, 2026-10-07) placed a deposit
+# key without its command= prefix, and a sender that wrote before it
+# read handed that account's shell what was meant for this script. The
+# break-glass deposit wrote the kubeconfig the same way. It now writes
+# nothing until it has read this exact line, which only this branch
+# prints and only once it is ready to take the deposit;
+# break_glass_deposit_sh.rs holds the literal equal to the Job's. A
+# sender that does not wait for it is unaffected: the line is one more
+# on its output, and the byte count it reads back is on its own line.
+echo 'ops-credential-recv: kubeconfig: ready for one kubeconfig'
 
 # One byte past the bound, so an oversize deposit is measurable without
 # reading an unbounded stream into this host.

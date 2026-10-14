@@ -180,12 +180,9 @@ checks for itself, not something authors have to remember.
 4. **Tenant seed + lifecycle tests.** The brewery crate's
    `tests/protocol_holds_e2e.rs` runs the layer-1 static lint
    over every Workflow in the tenant's seed files — a broken
-   Workflow fails `cargo test`. The used-device-shop
-   crate's `tests/parity_harness.rs` and `shape_driven_smoke.rs`
-   drive the tenant through a 30-day window and assert coverage
-   (every authored Workflow fires) and lifecycle (jobs open,
-   steps complete, jobs close, the canonical side-effect topics
-   fire). The sim does not materialize or drive steps in-process,
+   Workflow fails `cargo test`. The brewery simulation exercises jobs
+   opening, steps completing, jobs closing and side-effect topics.
+   The sim does not materialize or drive steps in-process,
    so step volumes, metadata shapes, and side-effect wiring are
    validated end-to-end by the live 365-day regen.
 

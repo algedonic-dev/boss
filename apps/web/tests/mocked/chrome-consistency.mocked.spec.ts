@@ -18,7 +18,7 @@ import { DEPARTMENT_CLASSES, installApiFloor } from './_smokeMocks';
 /// Surfaces that render the chrome through different code paths:
 /// a normal AppShell route, the full-page step route (rendered
 /// OUTSIDE AppShell), and an IT surface.
-const SURFACES = ['/ux/jobs', '/it', '/ux/views'] as const;
+const SURFACES = ['/ux/jobs', '/it', '/ux/inbox'] as const;
 
 /// The playground tenant: named, and with a simulation to drive — a
 /// module is on only when listed true (ce68f137), and the Simulator

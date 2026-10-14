@@ -170,8 +170,11 @@ export function parseCars(raw: unknown): ReadonlyArray<Car> {
 
 export type GateRun = Readonly<{
   id: string;
+  agentRun: string | null;
+  launchedAt: string | null;
+  closedAt: string | null;
   branch: string | null;
-  /// `passed` / `failed` / `null` while the verdict is not yet recorded.
+  /// Native `completed` / `failed`; older records may say `passed`.
   outcome: string | null;
   open: boolean;
   openedAt: string | null;
@@ -184,14 +187,47 @@ export function parseGateRuns(raw: unknown): ReadonlyArray<GateRun> {
       const c = parseJobLike(r);
       return {
         id: c.id,
+        agentRun: str(meta(r).agent_run),
+        launchedAt: str(meta(r).launched_at),
+        closedAt: str(meta(r).closed_at),
         branch: c.branch,
         outcome: str(meta(r).outcome),
         open: c.open,
-        openedAt: c.openedAt,
+        openedAt: str(meta(r).opened_at),
         completions: c.completions,
       };
     })
     .filter((g) => g.id !== '');
+}
+
+export type GateActivity = Readonly<{
+  gateId: string;
+  label: 'Running' | 'Passed' | 'Failed' | 'Unknown';
+  at: string | null;
+}>;
+
+/// A gate names its dispatched run directly. Branches and actor aliases cannot
+/// identify which worker produced it; the newest admitted attempt owns the label.
+export function gateActivity(runId: string, gates: ReadonlyArray<GateRun>): GateActivity | null {
+  const matching = gates.filter((gate) => gate.agentRun === runId);
+  if (matching.length === 0) return null;
+  const instant = (value: string | null): string | null =>
+    value !== null && Number.isFinite(Date.parse(value)) ? value : null;
+  // An undated attempt cannot be ordered behind a recorded success honestly.
+  const undated = matching.find((gate) => instant(gate.openedAt) === null);
+  if (undated) return { gateId: undated.id, label: 'Unknown', at: null };
+  const latest = [...matching].sort((a, b) =>
+    Date.parse(b.openedAt!) - Date.parse(a.openedAt!) || a.id.localeCompare(b.id),
+  )[0];
+  if (latest === undefined) return null;
+  if (!latest.open && (latest.outcome === 'completed' || latest.outcome === 'passed'))
+    return { gateId: latest.id, label: 'Passed', at: instant(latest.closedAt) };
+  if (!latest.open && latest.outcome === 'failed')
+    return { gateId: latest.id, label: 'Failed', at: instant(latest.closedAt) };
+  const launchedAt = instant(latest.launchedAt);
+  if (latest.open && latest.outcome === null && launchedAt !== null)
+    return { gateId: latest.id, label: 'Running', at: launchedAt };
+  return { gateId: latest.id, label: 'Unknown', at: instant(latest.closedAt) ?? instant(latest.openedAt) };
 }
 
 /// Every branch the gate registry has a run for.

@@ -20,7 +20,11 @@
 //! `/api/dispatcher/rules` with no deploy). A workflow nobody declared is
 //! not read at all, and that is deliberate: `backlog-item` holds ~200
 //! agent steps days old, and an alarm per backlog build would be the
-//! flat list again, shouted.
+//! flat list again, shouted. `hours.<workflow>.<slug>` narrows a
+//! declaration to ONE step of the workflow (backlog c851ed24): a landed
+//! car's owed `landed-review` is real work — the item it carries stays
+//! open until a reviewer reads it — while the `proven` step beside it
+//! waits honestly on the world for days.
 //!
 //! WHAT "WAITED" IS MEASURED FROM. The last instant the PACKET provably
 //! moved — the newest `completed_at` on any of its steps, else
@@ -105,20 +109,30 @@ const TICK_AT: &str = "_at";
 /// number of hours refuses by name rather than vanishing — and a rule
 /// that declares nothing refuses too, because a watch over nothing is a
 /// check that is not running.
+///
+/// A declaration may be NARROWED to one step, `hours.<workflow>.<slug>`
+/// (backlog c851ed24): a workflow whose packets hold one step that is
+/// real work beside others that wait honestly. ship-a-change is the
+/// case — a landed car's `landed-review` holds its item open until a
+/// reviewer reads it (option A, bd331d38), while its `proven` step sits
+/// on the same agent for days waiting on the world. Workflow names are
+/// kebab-case and never carry a dot, so the first dot is the split.
 pub fn declarations(args: &[(String, Value)]) -> Result<BTreeMap<String, i64>, String> {
     let mut out = BTreeMap::new();
     for (key, value) in args {
-        let Some(workflow) = key.strip_prefix(ARG_PREFIX) else {
+        let Some(declared) = key.strip_prefix(ARG_PREFIX) else {
             continue;
         };
+        let (workflow, slug) = declared_scope(declared);
         match value {
-            Value::Int(n) if *n > 0 && !workflow.is_empty() => {
-                out.insert(workflow.to_string(), *n);
+            Value::Int(n) if *n > 0 && !workflow.is_empty() && slug != Some("") => {
+                out.insert(declared.to_string(), *n);
             }
             other => {
                 return Err(format!(
-                    "`{key}` must be a positive whole number of hours for a named workflow, got \
-                     a {} ({other:?})",
+                    "`{key}` must be a positive whole number of hours for a named workflow (or \
+                     one named step of it, `{ARG_PREFIX}<workflow>.<slug>`), got a {} \
+                     ({other:?})",
                     other.kind()
                 ));
             }
@@ -130,6 +144,17 @@ pub fn declarations(args: &[(String, Value)]) -> Result<BTreeMap<String, i64>, S
         ));
     }
     Ok(out)
+}
+
+/// A declaration's two halves: the workflow it reads, and the one step
+/// slug it is narrowed to, if any — `ship-a-change.landed-review` is
+/// (`ship-a-change`, `landed-review`), `receive-a-payout` is the whole
+/// workflow.
+pub fn declared_scope(declared: &str) -> (&str, Option<&str>) {
+    match declared.split_once('.') {
+        Some((workflow, slug)) => (workflow, Some(slug)),
+        None => (declared, None),
+    }
 }
 
 /// Every id the agents registry names — each agent's id and aliases.
@@ -166,17 +191,19 @@ pub struct Overdue {
     pub bound_hours: i64,
 }
 
-/// The late steps among one declared workflow's open packets. Pure.
-/// A packet whose age cannot be read is skipped — "I cannot tell how
-/// old this is" is not "late" — and reported in the journal by the
-/// caller's count.
+/// The late steps among one declaration's open packets — `declared` is
+/// the key after [`ARG_PREFIX`], a workflow or a workflow narrowed to
+/// one step slug ([`declared_scope`]). Pure. A packet whose age cannot
+/// be read is skipped — "I cannot tell how old this is" is not "late" —
+/// and reported in the journal by the caller's count.
 pub fn overdue_steps(
-    workflow: &str,
+    declared: &str,
     bound_hours: i64,
     packets: &[Json],
     agents: &BTreeSet<String>,
     now: DateTime<Utc>,
 ) -> Vec<Overdue> {
+    let (workflow, only) = declared_scope(declared);
     let mut out = Vec::new();
     for job in packets {
         let Some(since) = last_moved(job, None) else {
@@ -196,6 +223,9 @@ pub fn overdue_steps(
             let status = text(step, "status");
             let assignee = text(step, "assignee_id");
             if !matches!(status.as_str(), "ready" | "active") || !agents.contains(&assignee) {
+                continue;
+            }
+            if only.is_some_and(|slug| text(step, "spec_slug") != slug) {
                 continue;
             }
             out.push(Overdue {
@@ -407,10 +437,15 @@ impl Handler for JobsAgentStepOverdue {
         }
 
         let mut late: Vec<Overdue> = Vec::new();
-        for (workflow, bound) in &declared {
+        for (scope, bound) in &declared {
+            let (workflow, _) = declared_scope(scope);
             let packets = open_jobs_of_kind(&self.client, self.base(), workflow, rule).await?;
-            late.extend(overdue_steps(workflow, *bound, &packets, &agents, now));
+            late.extend(overdue_steps(scope, *bound, &packets, &agents, now));
         }
+        // A step two declarations both cover (a workflow AND one of its
+        // steps) is one late step, alarmed once.
+        let mut seen = BTreeSet::new();
+        late.retain(|o| seen.insert(o.step_id.clone()));
 
         // EVERY status: a step alarmed once is never alarmed again.
         let filed = alarms_by_step(
@@ -756,6 +791,67 @@ mod tests {
         );
     }
 
+    /// A ship-a-change car whose landed review is owed: proof and review
+    /// both ready on the agent, the car last moved when it boarded.
+    fn landed_car(id: &str, boarded_at: &str) -> Json {
+        json!({
+            "id": id, "kind": "ship-a-change", "status": "open",
+            "title": format!("fix/{id}"),
+            "metadata": {"opened_at": "2026-09-20T00:00:00Z", "merged": "true"},
+            "steps": [
+                {"id": format!("{id}-review"), "spec_slug": "review", "status": "completed",
+                 "completed_at": boarded_at},
+                {"id": format!("{id}-proven"), "spec_slug": "proven", "status": "ready",
+                 "assignee_id": "agent-claude"},
+                {"id": format!("{id}-landed-review"), "spec_slug": "landed-review",
+                 "status": "ready", "assignee_id": "agent-claude"},
+            ],
+        })
+    }
+
+    /// A DECLARATION NARROWED TO ONE STEP (backlog c851ed24). Option A
+    /// (bd331d38) makes every unheld car owe a `landed-review` after it
+    /// lands, and the item it carries closes only when that completes —
+    /// so a review nobody dispatches must age into a packet. But the
+    /// same car's `proven` step sits on the agent for days honestly
+    /// waiting on the world, and a whole-workflow bound would alarm on
+    /// every one of them. `hours.<workflow>.<slug>` watches that one
+    /// step and nothing else on the packet.
+    #[test]
+    fn a_slug_qualified_declaration_watches_only_that_step() {
+        let declared =
+            declarations(&[("hours.ship-a-change.landed-review".into(), Value::Int(24))]).unwrap();
+        assert_eq!(
+            declared,
+            BTreeMap::from([("ship-a-change.landed-review".to_string(), 24)])
+        );
+        assert_eq!(
+            declared_scope("ship-a-change.landed-review"),
+            ("ship-a-change", Some("landed-review"))
+        );
+        assert_eq!(
+            declared_scope("receive-a-payout"),
+            ("receive-a-payout", None)
+        );
+        assert!(
+            declarations(&[("hours.ship-a-change.".into(), Value::Int(24))]).is_err(),
+            "a narrowed declaration names its step"
+        );
+        let cars = vec![
+            landed_car("old", "2026-09-22T10:00:00Z"),
+            landed_car("fresh", "2026-09-23T10:00:00Z"),
+        ];
+        let late = overdue_steps("ship-a-change.landed-review", 24, &cars, &agents(), at(NOW));
+        let steps: Vec<&str> = late.iter().map(|o| o.step_id.as_str()).collect();
+        assert_eq!(
+            steps,
+            vec!["old-landed-review"],
+            "the owed review past a day, never the proof beside it: {late:?}"
+        );
+        assert_eq!(late[0].workflow, "ship-a-change");
+        assert_eq!(late[0].slug, "landed-review");
+    }
+
     /// The shipped rule's declarations parse — every `hours.<workflow>`
     /// is a positive whole number — and name at least the payout, the
     /// case this handler exists for.
@@ -788,6 +884,18 @@ mod tests {
         assert!(
             !declared.contains_key("backlog-item"),
             "backlog builds are the flat list this alarm exists to stand apart from"
+        );
+        // The owed landed review is watched, and ONLY that step of a car
+        // — a whole-ship-a-change bound would alarm on every honest
+        // proof wait (backlog c851ed24).
+        assert!(
+            declared.contains_key("ship-a-change.landed-review"),
+            "{}: {declared:?}",
+            rule.name
+        );
+        assert!(
+            !declared.contains_key("ship-a-change"),
+            "a car's proof waits on the world; only its owed review is watched"
         );
     }
 

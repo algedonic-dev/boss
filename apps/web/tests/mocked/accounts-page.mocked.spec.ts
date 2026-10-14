@@ -107,13 +107,12 @@ const ANCHOR = account('acct-anchor', 'Anchor Pub', 'Ada Brewer', 'Portland', 'O
 const ZED = account('acct-zed', 'Zed Taproom', 'Zoe Tap', 'Seattle', 'WA', 'platinum', '2023-01-15');
 const FLEET = [ANCHOR, ZED, SPONSOR];
 
-const asset = (asset_id: string, phase: string, account_id: string | null) => ({
-  asset_id, sku: 'DM-FERM-1', phase, account_id, warranty_through: null, open_ticket_count: 0,
+const asset = (asset_id: string, phase: string, holder_id: string | null) => ({
+  asset_id, sku: 'DM-FERM-1', phase, holder_kind: holder_id === null ? null : 'account', holder_id, warranty_through: null, open_ticket_count: 0,
   first_seen: '2026-01-01', last_event_at: '2026-09-01', oem_serial: null,
 });
-/// Three assets: two on Anchor (one installed, one received), one owned
-/// by nobody. The subtitle's "installed devices" is the READ's total
-/// (3), not the installed count (1) — UNFILED, see the subtitle test.
+/// Native custody: two held by Anchor (one installed, one received),
+/// one unheld. Custody says nothing about legal ownership.
 const ASSETS_BODY = [
   asset('a-1', 'installed', 'acct-anchor'),
   asset('a-2', 'received', 'acct-anchor'),
@@ -220,6 +219,79 @@ async function mountFleet(page: Page): Promise<void> {
   await expect(body(page).locator('tbody tr')).toHaveCount(FLEET_ROWS.length);
 }
 
+test('the account heading uses the shared label-count grammar for one account', async ({ page }) => {
+  await installLive(page);
+  await mountPage(page, PATH);
+  await expect(title(page)).toHaveText('Accounts (1)');
+});
+
+test('the subtitle cannot describe every returned asset as installed', async ({ page }) => {
+  await installFleet(page);
+  await mountFleet(page);
+  await expect(body(page).locator('tbody tr')).toHaveCount(3);
+  await expect(body(page).locator('tbody tr').first().locator('td').nth(4)).toHaveText('2');
+  await expect(subtitle(page)).not.toContainText('3 installed devices');
+});
+
+test('native custody edges associate only account-held assets and nonterminal Account Subjects with loaded accounts', async ({ page }) => {
+  await installFleet(page);
+  const nativeAsset = (asset_id: string, phase: string, holder_kind: string | null, holder_id: string | null) => ({
+    asset_id, sku: 'DM-FERM-1', phase, holder_kind, holder_id,
+    warranty_through: null, open_ticket_count: 0, first_seen: '2026-01-01',
+    last_event_at: '2026-09-01', oem_serial: null,
+  });
+  await page.route(ASSETS, (r) => json(r, paged([
+    nativeAsset('native-installed', 'installed', 'account', ANCHOR.id),
+    nativeAsset('native-received', 'received', 'account', ANCHOR.id),
+    nativeAsset('native-location', 'installed', 'location', ANCHOR.id),
+    nativeAsset('native-unheld', 'installed', null, null),
+    nativeAsset('native-unloaded', 'installed', 'account', 'acct-not-loaded'),
+  ], 1000)));
+  await page.route(JOBS, (r) => json(r, paged([
+    ...JOBS_BODY,
+    job('native-draft', ANCHOR.id, 'draft'),
+    job('native-other-account', 'acct-not-loaded', 'open'),
+    { ...job('native-custom', ANCHOR.id, 'open'), subject: { subject_kind: 'custom', id: 'charge-ref' }, metadata: { sponsor_account_id: ANCHOR.id } },
+  ], 5000)));
+  await mountFleet(page);
+  const rows = body(page).locator('tbody tr');
+  await expect(rows).toHaveCount(3);
+  const headings = await body(page).locator('thead th').allTextContents();
+  const workColumn = headings.indexOf('Open SRs');
+  expect(workColumn).toBeGreaterThan(-1);
+  await expect(rows.nth(0).locator('td').nth(workColumn)).toHaveText('1');
+  await expect(rows.nth(1).locator('td').nth(workColumn)).toHaveText('1');
+  await expect(body(page).getByRole('columnheader', { name: 'Equipment', exact: true })).toHaveCount(1);
+  const equipmentColumn = (await body(page).locator('thead th').allTextContents()).indexOf('Equipment');
+  await expect(rows.nth(0).locator('td').nth(equipmentColumn)).toHaveText('2');
+  await expect(subtitle(page)).toHaveText('Installed assets on loaded accounts (1) · Open support jobs on loaded accounts (2)');
+  await button(page, 'Gold (1)').click();
+  await expect(rows).toHaveCount(1);
+  await expect(subtitle(page)).toHaveText('Installed assets on loaded accounts (1) · Open support jobs on loaded accounts (2)');
+});
+
+test('native nonterminal support count excludes unloaded accounts and undeclared custom-Subject metadata', async ({ page }) => {
+  await installFleet(page);
+  await page.route(ASSETS, (r) => json(r, paged([], 1000)));
+  await page.route(JOBS, (r) => json(r, paged([
+    job('11111111-1111-4111-8111-111111111111', ZED.id, 'open'),
+    job('22222222-2222-4222-8222-222222222222', ANCHOR.id, 'draft'),
+    job('33333333-3333-4333-8333-333333333333', ZED.id, 'closed'),
+    job('44444444-4444-4444-8444-444444444444', ANCHOR.id, 'cancelled'),
+    job('55555555-5555-4555-8555-555555555555', 'acct-not-loaded', 'open'),
+    { ...job('66666666-6666-4666-8666-666666666666', ANCHOR.id, 'open'), subject: { subject_kind: 'custom', id: 'charge-ref' }, metadata: { sponsor_account_id: ANCHOR.id } },
+  ], 1000, 9000)));
+  await mountFleet(page);
+  await expect(body(page).locator('tbody tr')).toHaveCount(3);
+  const headings = await body(page).locator('thead th').allTextContents();
+  const workColumn = headings.indexOf('Open SRs');
+  expect(workColumn).toBeGreaterThan(-1);
+  await expect(body(page).locator('tbody tr').nth(0).locator('td').nth(workColumn)).toHaveText('1');
+  await expect(body(page).locator('tbody tr').nth(1).locator('td').nth(workColumn)).toHaveText('1');
+  await expect(body(page).locator('.overflow-banner')).toContainText('9,000');
+  await expect(subtitle(page)).toHaveText('Open support jobs on loaded accounts (2)');
+});
+
 // ── The live instance ───────────────────────────────────────────────
 
 test.describe(`/ux/accounts — the live instance (the manifest recorded ${LIVE_MANIFEST_RECORDED_AT}, one account)`, () => {
@@ -239,8 +311,7 @@ test.describe(`/ux/accounts — the live instance (the manifest recorded ${LIVE_
 
     await expect(page.locator('.module-disabled')).toHaveCount(0);
     await expect(body(page).locator('.exec-eyebrow')).toHaveText('Customers');
-    // UNFILED: the count is not pluralised — "1 accounts".
-    await expect(title(page)).toHaveText('1 accounts');
+    await expect(title(page)).toHaveText('Accounts (1)');
     await expect(subtitle(page)).toHaveCount(0);
     await expect(body(page).locator('.filter-label')).toHaveText(['Search', 'Tier', 'State']);
     await expect(group(page, 1).getByRole('button')).toHaveText([
@@ -293,12 +364,9 @@ test.describe('/ux/accounts — the fleet shape (support on): the list', () => {
     expect(await settledReads(page, () => seen.reads.length, 4)).toBe(4);
     expect([...seen.reads].sort()).toEqual([...PAGE_READS].sort());
 
-    await expect(title(page)).toHaveText('3 accounts');
-    // UNFILED: "installed devices" is /api/assets' total — every asset in
-    // every phase, owned by any account or none (3 here) — not the
-    // installed count (1); "service jobs" is the support department's
-    // total including the closed and the cancelled (3), not open ones.
-    await expect(subtitle(page)).toHaveText('3 installed devices · 3 service jobs');
+    await expect(title(page)).toHaveText('Accounts (3)');
+    // Installed custody and nonterminal direct-account work, over loaded reads.
+    await expect(subtitle(page)).toHaveText('Installed assets on loaded accounts (1) · Open support jobs on loaded accounts (1)');
     await expect(group(page, 1).getByRole('button')).toHaveText([
       'All (3)', 'Platinum (1)', 'Gold (1)', 'Silver (0)', 'No tier (1)',
     ]);
@@ -365,7 +433,7 @@ test.describe('/ux/accounts — the fleet shape (support on): the list', () => {
     await expect(body(page).locator('thead th')).toHaveText([
       'Account', 'Tier', 'Location', 'Primary contact', 'Equipment', 'Open AR', 'Customer since',
     ]);
-    await expect(subtitle(page)).toHaveText('3 installed devices');
+    await expect(subtitle(page)).toHaveText('Installed assets on loaded accounts (1)');
   });
 });
 
@@ -479,6 +547,73 @@ async function installDetail(page: Page, id: string, row: ReturnType<typeof acco
 }
 
 test.describe('/ux/accounts — the account link, the row, and back', () => {
+  test('contracts loading never claims a zero or empty agreement list', async ({ page }) => {
+    await installFleet(page);
+    await installDetail(page, 'acct-zed', ZED);
+    let release: () => void = () => {};
+    const answer = new Promise<void>((resolve) => { release = resolve; });
+    await page.route(/\/api\/commerce\/agreements\?account_id=acct-zed&/, async r => {
+      await answer;
+      await json(r, { data: [] });
+    });
+    await mountFleet(page);
+    await body(page).getByRole('link', { name: 'Zed Taproom', exact: true }).click();
+    await expect(page.getByText('Active contracts', { exact: true })).toBeVisible();
+    await expect(page.getByText('Active contracts (0)', { exact: true })).toHaveCount(0);
+    await expect(page.getByText('No active agreements.', { exact: true })).toHaveCount(0);
+    release();
+    await expect(page.getByText('Active contracts (0)', { exact: true })).toBeVisible();
+  });
+  for (const failure of ['http', 'network', 'malformed'] as const) {
+    test(`contracts ${failure} failure stays unknown instead of no agreements`, async ({ page }) => {
+      await installFleet(page);
+      await installDetail(page, 'acct-zed', ZED);
+      await page.route(/\/api\/commerce\/agreements\?account_id=acct-zed&/, async (r) => {
+        if (failure === 'network') await r.abort('failed');
+        else if (failure === 'http') await r.fulfill({ status: 503, body: 'unavailable' });
+        else await json(r, { unexpected: [] });
+      });
+      await mountFleet(page);
+      await body(page).getByRole('link', { name: 'Zed Taproom', exact: true }).click();
+      await expect(page.getByRole('alert')).toContainText("Couldn't load active contracts");
+      await expect(page.getByRole('alert')).toContainText('/api/commerce/agreements');
+      await expect(page.getByText('Active contracts', { exact: true })).toBeVisible();
+      await expect(page.getByText('No active agreements.', { exact: true })).toHaveCount(0);
+      await expect(page.getByText('Active contracts (0)', { exact: true })).toHaveCount(0);
+    });
+  }
+  for (const rows of [[], [{ id: 'agreement-native', end_date: '2027-01-01' }]]) {
+    test(`contracts successful read preserves ${rows.length} real agreements`, async ({ page }) => {
+      await installFleet(page);
+      await installDetail(page, 'acct-zed', ZED);
+      await page.route(/\/api\/commerce\/agreements\?account_id=acct-zed&/, r => json(r, { data: rows }));
+      await mountFleet(page);
+      await body(page).getByRole('link', { name: 'Zed Taproom', exact: true }).click();
+      await expect(page.getByText(`Active contracts (${rows.length})`, { exact: true })).toBeVisible();
+      if (rows.length === 0) await expect(page.getByText('No active agreements.', { exact: true })).toBeVisible();
+      else await expect(page.getByText('agreement-native', { exact: true })).toBeVisible();
+      await expect(page.getByRole('alert')).toHaveCount(0);
+    });
+  }
+  test('native nullable SKU custody rows remain readable on account detail without a fabricated catalog link', async ({ page }) => {
+    await installFleet(page);
+    await installDetail(page, 'acct-zed', ZED);
+    const native = {
+      asset_id: 'native-unidentified', sku: null, phase: 'registered',
+      holder_kind: 'account', holder_id: 'acct-zed', warranty_through: null,
+      open_ticket_count: 0, first_seen: '2026-01-01', last_event_at: '2026-09-01', oem_serial: null,
+    };
+    await page.route(/\/api\/assets\?account_id=acct-zed&/, r => json(r, paged([
+      native, { ...native, asset_id: 'native-identified', sku: 'MODEL-1', phase: 'installed' },
+    ], 500)));
+    await mountFleet(page);
+    await body(page).getByRole('link', { name: 'Zed Taproom', exact: true }).click();
+    await expect(page.locator('h1.exec-title')).toHaveText('Zed Taproom');
+    await expect(page.getByText('Equipment (2)', { exact: true })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'MODEL-1', exact: true })).toHaveAttribute('href', '/ux/catalog/MODEL-1');
+    await expect(page.locator('a[href="/ux/catalog/null"]')).toHaveCount(0);
+    await expect(page.getByText('Not identified', { exact: true })).toBeVisible();
+  });
   // Backlog 18890a16: the link sits inside a row that navigates on
   // click, and Link.svelte prevented the default without stopping the
   // click bubbling, so ONE click on the name navigated twice — two
@@ -598,12 +733,13 @@ test.describe('/ux/accounts — a capped read says so', () => {
 
     await expect(bannerText(page)).toHaveText([
       'Showing 3 of 1,500 accounts. The list and its filters cover only the accounts loaded.',
-      'Showing 3 of 2,000 installed devices loaded for per-account rollups. Per-row device counts may undercount; raise the cap or filter.',
+      'Showing 3 of 2,000 assets loaded for per-account rollups. Per-row equipment and installed-asset counts may undercount; raise the cap or filter.',
       'Showing 3 of 6,000 service jobs loaded for per-account rollups. Per-row open-ticket counts may undercount; raise the cap or filter.',
     ]);
     await expect(banners(page).first()).toHaveAttribute('role', 'status');
     // The title counts the rows loaded, not the directory's total.
-    await expect(title(page)).toHaveText('3 accounts');
+    await expect(title(page)).toHaveText('Accounts (3)');
+    await expect(subtitle(page)).toHaveText('Installed assets on loaded accounts (1) · Open support jobs on loaded accounts (1)');
   });
 
   // Backlog 5257bfa9 pinned here that a capped invoices read raised no
@@ -631,14 +767,14 @@ test.describe('/ux/accounts — empty, loading, and a failed read', () => {
     await expect(page.getByText('No accounts match those filters.')).toHaveCount(0);
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
     await expect(body(page).locator('table')).toHaveCount(0);
-    await expect(title(page)).toHaveText('0 accounts');
+    await expect(title(page)).toHaveText('Accounts (0)');
     await expect(subtitle(page)).toHaveCount(0);
     await expect(body(page).getByRole('button')).toHaveText([
       'All (0)', 'Platinum (0)', 'Gold (0)', 'Silver (0)', 'All states',
     ]);
   });
 
-  test('a pending directory read paints "Loading…" beside a zero header', async ({ page }) => {
+  test('a pending directory read paints "Loading…" without an invented zero header', async ({ page }) => {
     let release: () => void = () => {};
     const held = new Promise<void>((resolve) => { release = resolve; });
     await installFleet(page);
@@ -649,7 +785,7 @@ test.describe('/ux/accounts — empty, loading, and a failed read', () => {
     await mountPage(page, PATH);
 
     await expect(status(page)).toHaveText('Loading…');
-    await expect(title(page)).toHaveText('0 accounts');
+    await expect(title(page)).toHaveText('Accounts');
     await expect(button(page, 'All (0)')).toBeVisible();
     release();
     await expect(nameColumn(page)).toHaveText(FLEET_NAMES);
@@ -699,27 +835,25 @@ test.describe('/ux/accounts — empty, loading, and a failed read', () => {
     await expect(body(page).locator('table')).toHaveCount(0);
   });
 
-  // Backlogs 223ebcd6 / e30ee8b9, answered: the three secondary reads
-  // still degrade their column by hiding it — there is nothing true to
-  // put in it — but each now says so with the shared failure line,
-  // naming the read and the column. Before, the page painted "no
-  // account has any", and a failed invoices read read as "nobody owes
-  // anything".
+  // The broader 223ebcd6 car named failures but hid their columns.
+  // Finish e30ee8b9: retain each column with unknown counts, alongside
+  // the named failure line, rather than painting absence or zero debt.
   for (const [name, re, url, what, gone] of [
-    ['GET /api/assets', ASSETS, ASSETS_URL, 'installed devices', 'Equipment'],
+    ['GET /api/assets', ASSETS, ASSETS_URL, 'assets', 'Equipment'],
     ['GET /api/jobs?department=support', JOBS, JOBS_URL, 'service jobs', 'Open SRs'],
     ['GET /api/commerce/open-ar', OPEN_AR, OPEN_AR_URL, 'open receivables', 'Open AR'],
   ] as const) {
-    test(`a failed ${name} hides the ${gone} column and says why`, async ({ page }) => {
+    test(`a failed ${name} keeps the ${gone} column and says why`, async ({ page }) => {
       await installFleet(page);
       await page.route(re, (r) => json(r, { error: 'down' }, 503));
       await mountFleet(page);
 
-      const headings = FLEET_HEADINGS.filter((h) => h !== gone);
-      await expect(body(page).locator('thead th')).toHaveText(headings);
+      await expect(body(page).locator('thead th')).toHaveText(FLEET_HEADINGS);
+      const index = FLEET_HEADINGS.indexOf(gone);
+      await expect(body(page).locator(`tbody tr td:nth-child(${index + 1})`)).toHaveText(['Unknown', 'Unknown', 'Unknown']);
       await expect(nameColumn(page)).toHaveText(FLEET_NAMES);
       await expect(body(page).locator(`${FAILURE_MARKER}[role=alert]`)).toHaveText(
-        `Couldn't load ${what} — ${url}: HTTP 503. The ${gone} column is not shown: its counts are unknown, not zero.`,
+        `Couldn't load ${what} — ${url === ASSETS_URL ? `HTTP 503 Service Unavailable on ${url}` : `${url}: HTTP 503`}. The ${gone} counts below are unknown, not zero.`,
       );
     });
   }
@@ -760,4 +894,64 @@ test('an unavailable manifest leaves the core account directory usable and suppo
   expect(await settledReads(page, () => seen.reads.length, 3)).toBe(3);
   expect(seen.reads.filter((url) => url.includes('department=support'))).toEqual([]);
   expect(seen.writes).toEqual([]);
+});
+
+for (const [column, pattern] of [['Equipment', ASSETS], ['Open SRs', JOBS], ['Open AR', OPEN_AR]] as const) {
+  for (const transport of ['HTTP', 'network'] as const) {
+    test(`desired retained ${column} column after ${transport} failure`, async ({page}) => {
+      await installFleet(page);
+      await page.route(pattern, r => transport === 'HTTP' ? json(r, {}, 503) : r.abort('failed'));
+      await mountFleet(page);
+      await expect(body(page).locator('thead th')).toHaveText(FLEET_HEADINGS);
+      const index = FLEET_HEADINGS.indexOf(column);
+      await expect(body(page).locator(`tbody tr td:nth-child(${index + 1})`)).toHaveText(['Unknown','Unknown','Unknown']);
+      await expect(body(page).locator('[role=alert]')).toContainText('unknown, not zero');
+      await expect(nameColumn(page)).toHaveText(FLEET_NAMES);
+    });
+  }
+  test(`desired ${column} read loading never paints zero`, async ({page}) => {
+    await installFleet(page);
+    let release: () => void = () => {};
+    const held = new Promise<void>(r => {release = r;});
+    await page.route(pattern, async r => {await held; await json(r, paged(column === 'Equipment' ? ASSETS_BODY : column === 'Open SRs' ? JOBS_BODY : OPEN_AR_BODY, 1000));});
+    await mountPage(page, PATH);
+    if (column === 'Open SRs') {
+      await expect(nameColumn(page)).toHaveText(FLEET_NAMES);
+      await expect(body(page).locator('thead th')).toHaveText(FLEET_HEADINGS);
+      await expect(body(page).locator('tbody tr td:nth-child(6)')).toHaveText(['Loading…','Loading…','Loading…']);
+    } else {
+      await expect(status(page)).toHaveText('Loading…');
+      await expect(body(page).locator('table')).toHaveCount(0);
+    }
+    release();
+    await expect(body(page).locator('thead th')).toHaveText(FLEET_HEADINGS);
+  });
+}
+
+test('successful empty secondary reads still shape away their columns without unknowns', async ({ page }) => {
+  await installFleet(page);
+  for (const pattern of [ASSETS, JOBS, OPEN_AR]) {
+    await page.route(pattern, (r) => json(r, paged([], 1000)));
+  }
+  await mountFleet(page);
+  await expect(nameColumn(page)).toHaveText(FLEET_NAMES);
+  await expect(body(page).locator('[role=alert]')).toHaveCount(0);
+  await expect(body(page).locator('thead th')).toHaveText(
+    FLEET_HEADINGS.filter((h) => !['Equipment', 'Open SRs', 'Open AR'].includes(h)),
+  );
+  await expect(subtitle(page)).toHaveCount(0);
+  await expect(body(page).getByText('Unknown', { exact: true })).toHaveCount(0);
+});
+
+test('two failed secondary reads keep unknown cells beside the successful service count', async ({ page }) => {
+  await installFleet(page);
+  await page.route(ASSETS, (r) => json(r, {}, 503));
+  await page.route(OPEN_AR, (r) => r.abort('failed'));
+  await mountFleet(page);
+  await expect(body(page).locator('[role=alert]')).toHaveCount(2);
+  await expect(body(page).locator('thead th')).toHaveText(FLEET_HEADINGS);
+  await expect(body(page).locator('tbody tr').nth(1).locator('td')).toHaveText([
+    'Zed Taproom', 'Platinum', 'Seattle, WA', 'Zoe Tap', 'Unknown', '1', 'Unknown', '2023-01-15',
+  ]);
+  await expect(subtitle(page)).toHaveText('Open support jobs on loaded accounts (1)');
 });

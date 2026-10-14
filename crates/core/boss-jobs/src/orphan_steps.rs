@@ -246,6 +246,38 @@ mod tests {
     }
 
     #[test]
+    fn the_static_check_materializes_the_active_agent_block_before_matching() {
+        let reg = StepRegistry::v1();
+        let mut build = work("build", "task");
+        build.agent = Some(crate::agent_spec::AgentSpec {
+            executor_provenance: Default::default(),
+            profile: "builder".into(),
+            model: "opus-5[1m]".into(),
+            budget_usd: 5.0,
+            effort: crate::agent_spec::Effort::High,
+        });
+        let wf = workflow("active-agent", vec![trigger(), build]);
+        let queue = station(
+            "builders",
+            StationPredicate {
+                step: Some(StepMatch {
+                    slug: Some("build".into()),
+                    status_in: vec![StepStatus::Ready],
+                    metadata_equals: BTreeMap::from([("agent_profile".into(), "builder".into())]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(orphan_steps(std::slice::from_ref(&wf), &[queue], &reg).is_empty());
+        assert_eq!(
+            orphan_steps(&[wf], &[], &reg).len(),
+            1,
+            "the declaration alone does not invent a holding station"
+        );
+    }
+
+    #[test]
     fn a_persons_step_that_no_station_holds_and_nobody_is_named_for_is_an_orphan() {
         let reg = StepRegistry::v1();
         let wf = workflow("lonely", vec![trigger(), work("decide", "answer-question")]);

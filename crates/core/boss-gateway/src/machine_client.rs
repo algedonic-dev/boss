@@ -39,6 +39,24 @@ use std::sync::Arc;
 
 use boss_core::machine_token::{self, Hosts, Source};
 
+/// Finish a builder for a client that carries the token: redirects off
+/// and every proxy off, whatever the builder set — the one place the
+/// gateway does it. [`MachineClient`] is built on it, and so is the
+/// reverse-proxy client `main()` builds, whose forwarded requests
+/// `role_headers.rs` stamps (it is a bare `reqwest::Client` because the
+/// stamp is on the inbound request, not on the client).
+///
+/// NO PROXY (backlog 1ff6cabe, 2026-10-10): reqwest honours
+/// `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` by default, loopback included,
+/// so a proxy exported where the gateway ran would receive every stamped
+/// request. boss-core's `machine_token::Client` finishes the same way.
+pub fn finish(builder: reqwest::ClientBuilder) -> reqwest::Result<reqwest::Client> {
+    builder
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+}
+
 #[derive(Clone, Debug)]
 pub struct MachineClient {
     http: reqwest::Client,
@@ -47,7 +65,7 @@ pub struct MachineClient {
 }
 
 impl MachineClient {
-    /// Finish `builder` with redirects off; stamp from the process's
+    /// Finish `builder` with [`finish`]; stamp from the process's
     /// one watched source, on the process's host list.
     pub fn build(builder: reqwest::ClientBuilder) -> reqwest::Result<Self> {
         Self::build_with_source(builder, machine_token::shared())
@@ -58,11 +76,8 @@ impl MachineClient {
         builder: reqwest::ClientBuilder,
         token: Arc<Source>,
     ) -> reqwest::Result<Self> {
-        let http = builder
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
         Ok(MachineClient {
-            http,
+            http: finish(builder)?,
             token,
             hosts: machine_token::hosts(),
         })
@@ -267,5 +282,103 @@ mod tests {
             reached.is_empty(),
             "the token followed a redirect: {reached:?}"
         );
+    }
+
+    /// What the origin and a proxy each saw of one request, `send` given
+    /// the origin's URL and the proxy's. The proxy ANSWERS, as one that
+    /// collects headers would.
+    async fn proxied(
+        send: impl FnOnce(String, String) -> reqwest::RequestBuilder,
+    ) -> (Vec<String>, Vec<String>) {
+        let ok = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        let proxy = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let proxy_at = proxy.local_addr().unwrap();
+        let (proxy_tx, mut proxy_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(answer_once(proxy, ok.into(), proxy_tx));
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_at = origin.local_addr().unwrap();
+        let (origin_tx, mut origin_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(answer_once(origin, ok.into(), origin_tx));
+        send(
+            format!("http://{origin_at}/api/x"),
+            format!("http://{proxy_at}"),
+        )
+        .send()
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let drain = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>| {
+            let mut seen = Vec::new();
+            while let Ok(h) = rx.try_recv() {
+                seen.push(h);
+            }
+            seen
+        };
+        (drain(&mut origin_rx), drain(&mut proxy_rx))
+    }
+
+    #[tokio::test]
+    async fn a_token_bearing_client_sends_through_no_proxy_whatever_its_builder_named() {
+        // Backlog 1ff6cabe: reqwest honours HTTP_PROXY / HTTPS_PROXY by
+        // default, loopback included, so a proxy exported where the
+        // gateway runs received every stamped request. `finish` clears
+        // every proxy — the environment's and any the builder named — the
+        // way it clears the redirect policy. A builder naming a proxy
+        // stands in for the environment here, because a unit test may
+        // not write the process's variables under its siblings
+        // (boss-core's tests/a_machine_client_follows_no_ambient_proxy.rs
+        // sets them, alone in its process).
+        let with_proxy =
+            |proxy: &str| reqwest::Client::builder().proxy(reqwest::Proxy::all(proxy).unwrap());
+
+        // The control: that builder, finished plainly, goes to the proxy
+        // with the header, so the fixture sees a leak when there is one.
+        let (origin, proxy) = proxied(|url, proxy| {
+            with_proxy(&proxy)
+                .build()
+                .unwrap()
+                .get(url)
+                .header(machine_token::HEADER, "estate-token-value")
+        })
+        .await;
+        assert!(origin.is_empty(), "the control went direct: {origin:?}");
+        assert!(
+            proxy.iter().any(|h| h.contains("estate-token-value")),
+            "the control's proxy saw no token: {proxy:?}"
+        );
+
+        // The machine client, on the same builder.
+        let (origin, proxy) = proxied(|url, proxy| {
+            MachineClient::build_with_source(
+                with_proxy(&proxy),
+                Arc::new(Source::fixed(Some("estate-token-value".into()))),
+            )
+            .unwrap()
+            .get(url)
+        })
+        .await;
+        assert!(
+            proxy.is_empty(),
+            "the machine client used the proxy: {proxy:?}"
+        );
+        assert!(
+            origin.iter().any(|h| h.contains("estate-token-value")),
+            "the origin did not receive the stamped request: {origin:?}"
+        );
+
+        // The reverse-proxy client main() builds, whose forwarded
+        // requests role_headers.rs stamps: the same finish.
+        let (origin, proxy) = proxied(|url, proxy| {
+            finish(with_proxy(&proxy))
+                .unwrap()
+                .get(url)
+                .header(machine_token::HEADER, "estate-token-value")
+        })
+        .await;
+        assert!(
+            proxy.is_empty(),
+            "the forward client used the proxy: {proxy:?}"
+        );
+        assert_eq!(origin.len(), 1, "the origin was not reached directly");
     }
 }

@@ -163,14 +163,15 @@ pub enum Cmd {
     /// Release a held car: the hold comes off its review step and it boards at the next tick.
     ///
     /// With `--diagnosis-file`, release a car the conductor holds after
-    /// red trains instead: the diagnosis must name, by full id, a red
-    /// train gate-run the car rode; `red_trains` is cleared and the look
+    /// red trains instead: the diagnosis must name, by full id, the
+    /// gate-run of a failed train the car rode (RED gate, or checked
+    /// GREEN gate with completed failing Forge CI); `red_trains` is cleared and the look
     /// is appended to the car's `strike_releases` (backlog c96aac11).
     Release {
         /// The car: its branch, or 8+ characters of its id.
         car: String,
         /// Clear the car's red-train strikes on this written diagnosis.
-        /// It must name at least one red train gate-run the car rode by
+        /// It must name at least one failed train's gate-run the car rode by
         /// its FULL id; it is recorded verbatim with who looked and when.
         /// A file, so no shell sits between the prose and the record
         /// (backlog 2376b89e).
@@ -866,34 +867,29 @@ pub(crate) fn fold_writes(
 /// The review step a hold goes on — open, because a hold on a car past
 /// review is a note on a terminal step (the API refuses it, 409) and a
 /// hold on a car not yet gated has nothing to brake.
+///
+/// The rule is core's (`boss_jobs::car_release::holdable`), the one the
+/// release door asks (backlog ed8e5c85). This verb adds where the car
+/// stands when the review is closed.
 pub(crate) fn holdable(car: &Value) -> Result<&Value, String> {
-    let review =
-        boss_jobs::car::find_step(car, boss_jobs::car::REVIEW_SLUG, boss_jobs::car::REVIEW)
-            .ok_or_else(|| {
-                format!(
-                    "car {} ({}) has no review step — a hold brakes a car at the dock, and this \
-                 packet is not one",
-                    short(car),
-                    kind_of(car)
-                )
-            })?;
-    if is_open(review) {
-        Ok(review)
-    } else {
-        Err(format!(
-            "car {}'s review is {} — a hold brakes a car standing at the dock (review open); {}",
-            short(car),
-            status_of(review),
-            standing(car)
-        ))
-    }
+    boss_jobs::car_release::holdable(car).map_err(|why| {
+        if boss_jobs::car_release::review_step(car).is_some() {
+            format!("{why}; {}", standing(car))
+        } else {
+            why
+        }
+    })
 }
 
 /// The merge-door body that puts the hold on — the marker in the one
-/// shape `stranded::hold_reason` reads (a non-blank string). One key,
-/// so every other key on the review step is untouched by construction.
-pub(crate) fn hold_patch(reason: &str) -> Value {
-    json!({ "hold": reason.trim() })
+/// shape `stranded::hold_reason` reads (a non-blank string), over the
+/// review step whose metadata is `review_md`. The `hold` key, plus a
+/// `hold_sha` deleted when a release already lifted the hold it names,
+/// so this hold does not read as judged at that head (backlog 6c463c66,
+/// `boss_jobs::car::hold_body`). Every other key on the review step is
+/// untouched by construction.
+pub(crate) fn hold_patch(review_md: &Value, reason: &str) -> Value {
+    boss_jobs::car::hold_body(review_md, reason)
 }
 
 /// The merge-door body that takes the hold OFF — the key DELETED (an
@@ -951,12 +947,15 @@ impl Wire {
     /// The live one: the system of record `BOSS_JOBS_URL` names and the
     /// actor `BOSS_ACTOR` (or the actor file) names.
     pub(crate) fn live() -> Result<Self> {
-        Self::at(crate::gate::resolve_jobs_base(None)?, identity::caller())
+        Self::at(
+            crate::sor_client::resolve_jobs_base(None)?,
+            identity::caller(),
+        )
     }
 
     pub(crate) fn at(base: String, caller: Option<identity::Caller>) -> Result<Self> {
         Ok(Self {
-            http: crate::gate::machine_client()?,
+            http: crate::sor_client::machine_client()?,
             base,
             caller,
         })
@@ -971,7 +970,8 @@ impl Wire {
         payload: Option<Value>,
     ) -> Result<Option<Value>> {
         let signature = identity::signature_for(&method, path, self.caller.clone());
-        crate::gate::api_at_signed(&self.http, &self.base, method, path, payload, signature).await
+        crate::sor_client::api_at_signed(&self.http, &self.base, method, path, payload, signature)
+            .await
     }
 
     /// Read an original record without turning an outage or policy refusal
@@ -1504,9 +1504,10 @@ pub(crate) async fn hold_as(
         .pointer("/metadata/branch")
         .and_then(Value::as_str)
         .unwrap_or("?");
-    let already = boss_jobs::stranded::hold_reason(review.get("metadata").unwrap_or(&Value::Null));
+    let review_md = review.get("metadata").unwrap_or(&Value::Null);
+    let already = boss_jobs::stranded::hold_reason(review_md);
     let patch = match reason {
-        Some(r) => hold_patch(r),
+        Some(r) => hold_patch(review_md, r),
         None => {
             if already.is_none() {
                 // A car the conductor holds after red trains carries no
@@ -1519,8 +1520,9 @@ pub(crate) async fn hold_as(
                         "boss release: {} {branch} \"{}\" carries no review hold, but it carries \
                          {reds} red-train strike(s) — the conductor holds a car at the policy's \
                          max_red_trains until someone looks. Record the look: `boss release \
-                         {branch} --diagnosis-file <PATH>`, a diagnosis naming a red train \
-                         gate-run it rode by full id.",
+                         {branch} --diagnosis-file <PATH>`, a diagnosis naming a failed train's \
+                         gate-run it rode by full id (RED gate, or checked GREEN gate with \
+                         completed failing Forge CI).",
                         short(&packet),
                         title_of(&packet)
                     );
@@ -1544,7 +1546,7 @@ pub(crate) async fn hold_as(
             let by = wire
                 .caller_id()
                 .context("an unnamed release is refused before it is sent")?;
-            let at = crate::gate::stamp(boss_clock_client::wall_now());
+            let at = crate::sor_client::stamp(boss_clock_client::wall_now());
             let mut body = release_patch_body();
             body[crate::review_verdict::BARE_RELEASE] = crate::review_verdict::bare_release_record(
                 already.as_deref().unwrap_or_default(),
@@ -1908,6 +1910,48 @@ pub(crate) fn covering_design_check(packet_id: &str, design: &Value) -> Result<(
     Ok(())
 }
 
+/// THE LANDED REVIEW IS AN INDEPENDENT ONE, ON THE RECORD (backlog
+/// c851ed24, review fe7b1b1e F5). Option A (bd331d38) lets a car no rule
+/// held board unreviewed and owe its review after it lands; completing
+/// `landed-review` is what lets the car close `merged` and its item
+/// close with it. Every agent signs `agent-claude`, so the actor proves
+/// nothing about who read the change. The step must carry the run
+/// `boss dispatch` claimed it for (`agent_run`), and that run must not
+/// be the car's own builder run — the line `review_verdict::vouches`
+/// already draws for a held car. `None` for every other step and kind.
+pub(crate) fn landed_review_refusal(packet: &Value, step: &Value) -> Option<String> {
+    use boss_jobs::car::LANDED_REVIEW_SLUG;
+    let slug = step.get("spec_slug").and_then(Value::as_str);
+    if kind_of(packet) != boss_jobs::regions::CAR_KIND || slug != Some(LANDED_REVIEW_SLUG) {
+        return None;
+    }
+    let run_of = |v: &Value| {
+        v.get("metadata")
+            .and_then(|m| m.get(crate::gate::AGENT_RUN_KEY))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let id = crate::envelope::job_id(packet).unwrap_or("?");
+    let id8 = &id[..id.len().min(8)];
+    match (run_of(step), run_of(packet)) {
+        (None, _) => Some(format!(
+            "car {id8}'s `{LANDED_REVIEW_SLUG}` names no reviewer run — the record would not \
+             show who read the change. Dispatch one: `boss dispatch {id8} --step \
+             {LANDED_REVIEW_SLUG}`, and complete the step as that run (reviewer rules 9); \
+             nothing written"
+        )),
+        (Some(reviewer), Some(builder)) if reviewer == builder => Some(format!(
+            "car {id8}'s `{LANDED_REVIEW_SLUG}` is held by run {}, the run that built this car \
+             — a builder's own review is no independent one. Release the step (`boss step \
+             release {id8} --step {LANDED_REVIEW_SLUG} --why '<why>'`) and dispatch a \
+             reviewer; nothing written",
+            &reviewer[..reviewer.len().min(8)]
+        )),
+        _ => None,
+    }
+}
+
 pub(crate) async fn complete(
     wire: &Wire,
     packet_ref: &str,
@@ -1916,6 +1960,9 @@ pub(crate) async fn complete(
 ) -> Result<()> {
     let packet = wire.resolve(packet_ref, None).await?;
     let step = open_step(&packet, slug).map_err(|e| anyhow!("{e}"))?;
+    if let Some(why) = landed_review_refusal(&packet, step) {
+        bail!("boss step complete: REFUSED — {why}");
+    }
     // The kind's own fields, from the registry the API validates
     // against. Best-effort: if the read fails the verb falls back to
     // the row alone, which is how it behaved before — a door that
@@ -2695,7 +2742,7 @@ mod tests {
     /// end-to-end test below reads that back).
     #[test]
     fn a_hold_is_the_marker_the_readers_read_and_nothing_else() {
-        let md = hold_patch(" waiting on a kubectl delete ");
+        let md = hold_patch(&Value::Null, " waiting on a kubectl delete ");
         assert_eq!(md, json!({ "hold": "waiting on a kubectl delete" }));
         assert_eq!(
             boss_jobs::stranded::hold_reason(&md).as_deref(),
@@ -2831,6 +2878,95 @@ mod tests {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         if method == "GET" && path == "/api/workflows/ship-a-change/versions/7" {
             return ("200 OK", protocol.to_string());
+        }
+        // THE RELEASE DOOR (`http/release.rs`, backlog ed8e5c85), faked
+        // the way this stub fakes every door: the RULE is the real one,
+        // `boss_jobs::car_release::judge`, asked with this stub's protocol
+        // and no first records, and the write goes through the merge
+        // door below. The authenticated caller is this stub's one caller,
+        // `named()`.
+        if method == "POST"
+            && let Some(jid) = path
+                .strip_prefix("/api/jobs/")
+                .and_then(|r| r.strip_suffix("/release"))
+        {
+            let (car, ask) = {
+                let packets = store.lock().unwrap();
+                let car = packets.iter().find(|p| p["id"] == jid).cloned();
+                let ask: Option<boss_jobs::car_release::ReleaseAsk> =
+                    serde_json::from_str(body).ok();
+                (car, ask)
+            };
+            let (Some(car), Some(ask)) = (car, ask) else {
+                return (
+                    "422 Unprocessable Entity",
+                    "no such car, or no release body".into(),
+                );
+            };
+            let run = store
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == ask.review.trim())
+                .cloned()
+                .unwrap_or_else(|| json!({"id": ask.review.trim(), "kind": "missing"}));
+            struct Reader(Value);
+            #[async_trait::async_trait]
+            impl boss_jobs::car_release::ExecutorRecordReader for Reader {
+                async fn protocol_version(&self, _: &str, _: i64) -> Result<Option<Value>> {
+                    Ok(Some(self.0.clone()))
+                }
+                async fn executor_original(
+                    &self,
+                    _: uuid::Uuid,
+                    _: uuid::Uuid,
+                    _: &str,
+                ) -> Result<Option<boss_jobs::first_record::FirstRecord>> {
+                    Ok(None)
+                }
+            }
+            let reader = Reader(protocol.clone());
+            let judged = boss_jobs::car_release::judge(
+                &reader,
+                &car,
+                &run,
+                &ask,
+                "claude@algedonic.dev",
+                "2026-10-09T14:00:00Z",
+            );
+            // Every read above answers at once, so one poll settles it.
+            let std::task::Poll::Ready(judged) = std::pin::pin!(judged)
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            else {
+                return (
+                    "500 Internal Server Error",
+                    "the stub's judge did not settle".into(),
+                );
+            };
+            return match judged {
+                Err(why) => ("409 Conflict", why),
+                Ok(granted) => {
+                    let merge = format!("/api/jobs/{jid}/steps/{}/metadata", granted.step_id);
+                    let wrote = route(
+                        store,
+                        puts,
+                        protocol,
+                        dropping,
+                        "PATCH",
+                        &merge,
+                        &granted.patch.to_string(),
+                    );
+                    if !wrote.0.starts_with('2') {
+                        return wrote;
+                    }
+                    (
+                        "200 OK",
+                        json!({"car": jid, "head": granted.head, "release": granted.record})
+                            .to_string(),
+                    )
+                }
+            };
         }
         let param = |k: &str| -> Option<String> {
             query
@@ -3663,6 +3799,39 @@ mod tests {
         );
     }
 
+    /// A HOLD PLACED AFTER A RELEASE IS NOT A REVIEW HOLD (backlog
+    /// 6c463c66). `boss hold` and the conductor's red-train hold write
+    /// through `hold_patch` over the step as it stands. A released car
+    /// still carries the `hold_sha` its release lifted, so the bare
+    /// release used to say "this was a REVIEW hold" of a car its release
+    /// boards. The patch now deletes that head, and the note reads true.
+    #[test]
+    fn a_hold_over_a_release_reads_as_no_review_hold_once_written() {
+        let h1 = "1111111111111111111111111111111111111111";
+        let released = json!({ boss_jobs::car::HOLD_SHA: h1, "agent_run": "run-r",
+                               boss_jobs::car::RELEASE: {"sha": h1, "review": "run-r"} });
+        let patch = hold_patch(&released, "held for the restart");
+        let mut after = released.as_object().cloned().unwrap();
+        for (k, v) in patch.as_object().unwrap() {
+            if v.is_null() {
+                after.remove(k);
+            } else {
+                after.insert(k.clone(), v.clone());
+            }
+        }
+        let review = json!({ "metadata": after });
+        assert_eq!(
+            boss_jobs::stranded::hold_reason(&review["metadata"]).as_deref(),
+            Some("held for the restart")
+        );
+        assert_eq!(bare_release_note(&review), "it boards at the next tick");
+        assert_eq!(
+            review["metadata"][boss_jobs::car::RELEASE]["sha"],
+            json!(h1),
+            "the release it boards on stays"
+        );
+    }
+
     #[tokio::test]
     async fn immutable_record_reads_distinguish_absence_from_refusal_and_damage() {
         use axum::{Router, body::Body, extract::Path, http::StatusCode, response::Response};
@@ -3905,6 +4074,179 @@ mod tests {
             a_train(OTHER_TRAIN, &["dcdc6c64-0000-4000-8000-000000000009"]),
             train_gate_run(OTHER_RUN, OTHER_TRAIN, "failed"),
         ]
+    }
+
+    /// Native cancelled train8de: completed Forge web failure, checked
+    /// GREEN assembled gate433, immutable boarding of carbe8. Copied
+    /// records are the measured shape, not a guessed gate-only fixture.
+    #[tokio::test]
+    async fn diagnosed_native_forge_failure_with_green_gate_releases_only_the_boarded_car() {
+        let car: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/strike-recovery/car.json"))
+                .unwrap();
+        let train: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/strike-recovery/train.json"))
+                .unwrap();
+        let gate: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/strike-recovery/gate.json"))
+                .unwrap();
+        let car_id = car["id"].as_str().unwrap().to_owned();
+        let gate_id = gate["id"].as_str().unwrap().to_owned();
+        assert_eq!(crate::strike_release::red_trains(&car), 2);
+        assert_eq!(
+            crate::train_gate::standing(&gate),
+            crate::train_gate::Standing::Green
+        );
+        let original = json!({"by": "earlier-look"});
+        let mut car = car;
+        car["metadata"]["strike_releases"] = json!([original.clone()]);
+        let s = stub(vec![car, train, gate]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let diagnosis = format!(
+            "Forge CI web failed ownership checks; gate {gate_id} was GREEN. Repaired source is independently reviewed; this is the exact train the car rode."
+        );
+        crate::strike_release::release_struck(&wire, &car_id, &diagnosis)
+            .await
+            .expect("approved combined failing train evidence");
+        let puts = s.puts.lock().unwrap();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].0, format!("/{car_id}/metadata"));
+        let after = s.packets.lock().unwrap()[0].clone();
+        assert!(after["metadata"].get("red_trains").is_none());
+        let looks = after["metadata"]["strike_releases"].as_array().unwrap();
+        assert_eq!(looks.len(), 2);
+        assert_eq!(looks[0], original);
+        assert_eq!(looks[1]["gate_runs"], json!([gate_id]));
+        assert_eq!(looks[1]["diagnosis"], diagnosis);
+        assert_eq!(looks[1]["by"], "claude@algedonic.dev");
+    }
+
+    #[tokio::test]
+    async fn combined_strike_evidence_refuses_unknown_unrelated_and_nonfailed_records_without_writes()
+     {
+        let car: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/strike-recovery/car.json"))
+                .unwrap();
+        let train: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/strike-recovery/train.json"))
+                .unwrap();
+        let gate: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/strike-recovery/gate.json"))
+                .unwrap();
+        let car_id = car["id"].as_str().unwrap().to_owned();
+        let gate_id = gate["id"].as_str().unwrap().to_owned();
+        let ci_index = train["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|s| s["spec_slug"] == "ci")
+            .unwrap();
+        let verdict_index = gate["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|s| s["spec_slug"] == "record-verdict")
+            .unwrap();
+        let cases = [
+            ("train", "/kind".to_owned(), json!("ship-a-change")),
+            ("train", "/metadata/boarded_jobs".to_owned(), json!([])),
+            (
+                "train",
+                "/metadata/train_gate_run".to_owned(),
+                json!(OTHER_RUN),
+            ),
+            ("train", format!("/steps/{ci_index}/status"), json!("ready")),
+            (
+                "train",
+                format!("/steps/{ci_index}/metadata/train_gate_run"),
+                json!(OTHER_RUN),
+            ),
+            (
+                "train",
+                format!("/steps/{ci_index}/metadata/forge_result"),
+                json!("green"),
+            ),
+            (
+                "train",
+                format!("/steps/{ci_index}/metadata/forge_result"),
+                json!("pending"),
+            ),
+            (
+                "train",
+                format!("/steps/{ci_index}/metadata/forge_result"),
+                json!("aborted"),
+            ),
+            (
+                "train",
+                format!("/steps/{ci_index}/metadata/forge_result"),
+                Value::Null,
+            ),
+            (
+                "train",
+                format!("/steps/{ci_index}/metadata/result"),
+                json!("pending"),
+            ),
+            (
+                "train",
+                format!("/steps/{ci_index}/metadata/result"),
+                json!("green"),
+            ),
+            ("gate", "/metadata/train".to_owned(), json!(OTHER_TRAIN)),
+            ("gate", "/status".to_owned(), json!("open")),
+            (
+                "gate",
+                format!("/steps/{verdict_index}/status"),
+                json!("ready"),
+            ),
+            (
+                "gate",
+                format!("/steps/{verdict_index}/metadata/verdict"),
+                json!("lost"),
+            ),
+            (
+                "gate",
+                format!("/steps/{verdict_index}/metadata/verdict"),
+                json!("pending"),
+            ),
+            (
+                "gate",
+                format!("/steps/{verdict_index}/metadata/receipt"),
+                Value::Null,
+            ),
+            (
+                "gate",
+                format!("/steps/{verdict_index}/metadata/receipt"),
+                json!("unreadable receipt"),
+            ),
+            (
+                "gate",
+                format!("/steps/{verdict_index}/metadata/receipt"),
+                json!({"verdict":"green", "head":"unrelated", "checks":[{"name":"fmt", "result":"pass"}]}),
+            ),
+            (
+                "gate",
+                format!("/steps/{verdict_index}/metadata/receipt"),
+                json!({"verdict":"green", "head":gate["metadata"]["sha"], "checks":[]}),
+            ),
+            (
+                "gate",
+                format!("/steps/{verdict_index}/metadata/receipt"),
+                json!({"verdict":"green", "head":gate["metadata"]["sha"], "checks":[{"name":"fmt", "result":"fail"}]}),
+            ),
+        ];
+        for (which, path, value) in cases {
+            let mut t = train.clone();
+            let mut g = gate.clone();
+            let record = if which == "train" { &mut t } else { &mut g };
+            *record.pointer_mut(&path).unwrap() = value;
+            let s = stub(vec![car.clone(), t, g]).await;
+            let wire = Wire::at(s.base.clone(), named()).unwrap();
+            crate::strike_release::release_struck(&wire, &car_id, &gate_id)
+                .await
+                .expect_err(&format!("refuse {which} {path}"));
+            assert!(s.puts.lock().unwrap().is_empty(), "{which} {path} wrote");
+            assert_eq!(s.packets.lock().unwrap()[0]["metadata"]["red_trains"], 2);
+        }
     }
 
     /// The verb end to end: the diagnosis names the red gate-run the car
@@ -5167,5 +5509,59 @@ mod design_link_tests {
             .expect_err("a backlog-item is not a design");
         assert!(err.contains("backlog-item"), "{err}");
         assert!(err.contains("design-doc"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod landed_review_tests {
+    use super::*;
+
+    const BUILDER: &str = "0b1d2c3e-0000-4000-8000-00000000000b";
+    const REVIEWER: &str = "5eed5eed-0000-4000-8000-000000000000";
+
+    /// A landed car owing its review, the step carrying `step_md` (the
+    /// `agent_run` a dispatch writes onto the step it claims).
+    fn car(step_md: Value) -> Value {
+        json!({
+            "id": "aaaaaaaa-0000-4000-8000-000000000001",
+            "kind": "ship-a-change",
+            "metadata": { "branch": "fix/a", "merged": "true", "agent_run": BUILDER },
+            "steps": [
+                { "id": "s-lr", "spec_slug": "landed-review", "status": "active",
+                  "metadata": step_md },
+            ],
+        })
+    }
+
+    /// THE INDEPENDENCE IS ON THE RECORD (backlog c851ed24, review
+    /// fe7b1b1e F5). A landed car's review closes its item, and every
+    /// agent signs `agent-claude`, so the actor proves nothing: the step
+    /// must carry the run `boss dispatch` claimed it for, and that run
+    /// must not be the one that BUILT the car — the same line `boss
+    /// review` already draws for a held car (`review_verdict::vouches`).
+    /// Every other step, and every other kind, is untouched.
+    #[test]
+    fn a_landed_review_completes_only_under_a_dispatched_run_that_did_not_build_the_car() {
+        let ok = car(json!({ "agent_run": REVIEWER }));
+        assert_eq!(landed_review_refusal(&ok, &ok["steps"][0]), None);
+
+        let by_hand = car(json!({}));
+        let why = landed_review_refusal(&by_hand, &by_hand["steps"][0])
+            .expect("a hand completion with no dispatched run is refused");
+        assert!(
+            why.contains("boss dispatch aaaaaaaa --step landed-review"),
+            "names the door: {why}"
+        );
+
+        let self_review = car(json!({ "agent_run": BUILDER }));
+        let why = landed_review_refusal(&self_review, &self_review["steps"][0])
+            .expect("the car's own builder run is refused");
+        assert!(why.contains("built this car"), "{why}");
+
+        let other_step = json!({ "spec_slug": "proven", "metadata": {} });
+        assert_eq!(landed_review_refusal(&by_hand, &other_step), None);
+        let mut item = by_hand.clone();
+        item["kind"] = json!("backlog-item");
+        assert_eq!(landed_review_refusal(&item, &item["steps"][0]), None);
     }
 }

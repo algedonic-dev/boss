@@ -8,15 +8,12 @@
 # filed one at all. Same disease the forge host had, same cure
 # (infra/forge/forge-converge.service is the sibling).
 #
-# ONE-TIME BOOTSTRAP — the hand action that ends the hand actions. Run
-# once on boss-gcp, as root; idempotent, and the `units` mode installs
-# THIS unit pair among the rest, so it never needs repeating:
-#
-#   cd /opt/boss && git fetch forge main && git merge --ff-only FETCH_HEAD \
-#     && sudo ./infra/gcp/install-units.sh units
+# The legacy converge prepares an authenticated root bootstrap only after the
+# credential lifecycles close. That bootstrap refreshes protected main and
+# executes this loop from the accepted generation; no /opt/boss fallback.
 [Unit]
 Description=BOSS boss-gcp adopts its own systemd units from forge main
-Documentation=file:/opt/boss/infra/gcp/boss-gcp-converge.sh
+Documentation=file:/var/lib/boss/gcp-tree/current/infra/gcp/boss-gcp-converge.sh
 Wants=network-online.target
 After=network-online.target
 
@@ -30,9 +27,8 @@ After=network-online.target
 # unit on the host reads the file hard.
 EnvironmentFile=-/etc/boss/sor.env
 Type=oneshot
-# Root: install-units.sh writes /etc/systemd/system. The script drops
-# to the checkout's owner for every git operation, so /opt/boss never
-# accumulates root-owned objects.
+# Root: units and authenticated generations are root-owned. The deposit
+# account's checkout is data for bounded Git verbs, never executable code.
 User=root
 # The whole run is one shallow fetch of main, file copies, a
 # daemon-reload — and, when main moved, one pull of the cluster image's
@@ -83,6 +79,6 @@ Environment=BOSS_NODE_ID=boss-gcp
 # lost 23 nights to a hard ExecStartPre, and on 2026-09-05 the cluster
 # converge could not run at all because its own packet-opener refused.
 # A converge that cannot be seen still converges.
-ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-boss-gcp-converge "boss-gcp adopts its own units"
-ExecStart=/opt/boss/infra/gcp/boss-gcp-converge.sh
-ExecStopPost=-/opt/boss/infra/boss-step.sh maintenance-boss-gcp-converge run
+ExecStartPre=-/var/lib/boss/gcp-root-prepared/bootstrap/infra/gcp/gcp-root-launch.sh run infra/boss-maintenance-wrap.sh maintenance-boss-gcp-converge "boss-gcp adopts its own units"
+ExecStart=/var/lib/boss/gcp-root-prepared/bootstrap/infra/gcp/gcp-root-launch.sh converge
+ExecStopPost=-/var/lib/boss/gcp-root-prepared/bootstrap/infra/gcp/gcp-root-launch.sh run infra/boss-step.sh maintenance-boss-gcp-converge run

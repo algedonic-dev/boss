@@ -437,6 +437,18 @@ fn app_with_cadence_repo(
     policy: Vec<StoredPolicy>,
     stations: Option<Arc<dyn boss_jobs::StationRegistry>>,
 ) -> (axum::Router, Arc<InMemoryJobs>) {
+    app_with_kinds(cadence, policy, stations, None)
+}
+
+/// `app_with_cadence_repo` with a workflow registry, which the held
+/// cars' release judgement reads the pinned protocol from (backlog
+/// ed8e5c85).
+fn app_with_kinds(
+    cadence: Arc<dyn CadenceRepository>,
+    policy: Vec<StoredPolicy>,
+    stations: Option<Arc<dyn boss_jobs::StationRegistry>>,
+    kinds: Option<Arc<dyn boss_jobs::registry::WorkflowRegistry>>,
+) -> (axum::Router, Arc<InMemoryJobs>) {
     let jobs = Arc::new(InMemoryJobs::new());
     let policy_client: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
@@ -464,6 +476,7 @@ fn app_with_cadence_repo(
     let delivery: Arc<dyn DeliveryPolicyRepository> = Arc::new(InMemoryDeliveryPolicy::new(policy));
     let state = JobsApiState {
         stations,
+        kind_registry: kinds,
         cadence: Some(cadence),
         delivery: Some(delivery),
         ..JobsApiState::minimal(
@@ -2588,5 +2601,187 @@ async fn a_converge_whose_steps_cannot_be_read_leaves_the_landing_unread() {
         landing_of(&body),
         "unread",
         "an unread converge is not a converging one: {body}"
+    );
+}
+
+/// WHAT A HELD CAR'S RELEASE RESTS ON, ON ITS ROW (backlog ed8e5c85,
+/// David 2026-10-09: "I can't see them, can't see why they are held,
+/// nor can I easily release them when they are ready"). Each held car
+/// carries its reviewer run, the verdict, the head that review read
+/// against the head the hold was placed at, the reviewer's SAFE line,
+/// the models, and the release door's own answer. A car reviewed at its
+/// held head is releasable. A car whose review read another head is not,
+/// and says why in the door's words.
+#[tokio::test]
+async fn a_held_cars_row_carries_what_its_release_rests_on() {
+    const H1: &str = "1111111111111111111111111111111111111111";
+    const H2: &str = "2222222222222222222222222222222222222222";
+    let kinds = Arc::new(boss_jobs::InMemoryWorkflows::for_fixture());
+    let mut spec = boss_jobs::WorkflowSpec::platform_seed(
+        "ship-a-change",
+        "Ship a change",
+        "test",
+        vec!["custom".into()],
+        vec![boss_jobs::StepSpec {
+            title: "review".into(),
+            kind: "task".into(),
+            ready_when: "true".into(),
+            title_template: "Open for review".into(),
+            ..Default::default()
+        }],
+    );
+    spec.version = 16;
+    kinds.seed(spec).unwrap();
+    let stations = Arc::new(boss_jobs::InMemoryStations::new());
+    stations.seed(dock_station_row()).unwrap();
+    let mut d = depth_rule();
+    d.min_dock_depth = Some(1);
+    let (app, jobs) = app_with_kinds(
+        Arc::new(InMemoryCadence::new(vec![d])),
+        vec![policy_row()],
+        Some(stations),
+        Some(kinds),
+    );
+    let now = t(NOW);
+    for (car_id, run_id, branch, reviewed) in [
+        (
+            "22222222-2222-2222-2222-222222222222",
+            "5eed5eed-0000-4000-8000-000000000001",
+            "feat/a",
+            H1,
+        ),
+        (
+            "44444444-4444-4444-4444-444444444444",
+            "5eed5eed-0000-4000-8000-000000000002",
+            "feat/b",
+            H2,
+        ),
+    ] {
+        let car = job(
+            "ship-a-change",
+            car_id,
+            "A held car",
+            JobStatus::Open,
+            json!({ "branch": branch }),
+        );
+        jobs.create_job_at(&car, now, &[]).await.unwrap();
+        jobs.add_step_at(
+            &step(
+                &car.id,
+                "review",
+                "Open for review",
+                StepStatus::Active,
+                json!({ "hold": "trust-boundary car", "hold_sha": H1, "agent_run": run_id }),
+            ),
+            now,
+            &[],
+        )
+        .await
+        .unwrap();
+        let run = job(
+            "agent-run",
+            run_id,
+            "review the held car",
+            JobStatus::Closed,
+            json!({
+                "model": "opus-5[1m]",
+                "model_observed": { "observed": "opus-5-5" },
+                "review": {
+                    "car": car_id, "branch": branch, "reviewed_sha": reviewed,
+                    "verdict": "release", "at": "2026-09-03T11:00:00Z",
+                    "findings": "### VERDICT: release\nSAFE TO RELEASE WITHOUT DAVID: yes. Narrow.",
+                },
+            }),
+        );
+        jobs.create_job_at(&run, now, &[]).await.unwrap();
+    }
+
+    let (status, body) = get(&app, "operator").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let held = body["held_cars"].as_array().unwrap();
+    assert_eq!(held.len(), 2, "{body}");
+    let row = |branch: &str| {
+        held.iter()
+            .find(|h| h["branch"] == branch)
+            .unwrap_or_else(|| panic!("{branch} in {body}"))["release"]
+            .clone()
+    };
+    let a = row("feat/a");
+    assert_eq!(a["releasable"], true, "{a}");
+    assert_eq!(a["refusal"], Value::Null, "{a}");
+    assert_eq!(a["review"], "5eed5eed-0000-4000-8000-000000000001");
+    assert_eq!(a["verdict"], "release");
+    assert_eq!(a["reviewed_sha"], H1);
+    assert_eq!(a["head"], H1);
+    assert_eq!(a["head_matches"], true);
+    assert_eq!(
+        a["safe_line"],
+        "SAFE TO RELEASE WITHOUT DAVID: yes. Narrow."
+    );
+    assert_eq!(a["reviewer_model"]["observed"], "opus-5-5");
+    // The observation is a cross-check; only a launcher's record decides
+    // a match, and this run has none (backlog e6b05dd6).
+    assert_eq!(a["reviewer_model"]["matches"], Value::Null);
+    assert!(
+        a["reviewer_model"]["says"]
+            .as_str()
+            .unwrap()
+            .contains("launched unknown"),
+        "{a}"
+    );
+    let b = row("feat/b");
+    assert_eq!(b["releasable"], false, "{b}");
+    assert_eq!(b["head_matches"], false, "{b}");
+    assert!(
+        b["refusal"]
+            .as_str()
+            .unwrap()
+            .contains("a review of another head is no review of this one"),
+        "{b}"
+    );
+
+    // The door the row's control calls refuses the same car in the same
+    // words, and a granted release still passes the merge door's write
+    // gate: this caller reads every packet but holds no step update, so
+    // it is refused there and the hold stays on.
+    let post = |car: &'static str, review: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/jobs/{car}/release"))
+                        .header("x-boss-user", user_header("operator"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({ "review": review }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+    let (status, text) = post(
+        "44444444-4444-4444-4444-444444444444",
+        "5eed5eed-0000-4000-8000-000000000002",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{text}");
+    assert!(text.starts_with("boss release: REFUSED — "), "{text}");
+    assert!(text.contains("another head"), "{text}");
+    let (status, text) = post(
+        "22222222-2222-2222-2222-222222222222",
+        "5eed5eed-0000-4000-8000-000000000001",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+    let (_, body) = get(&app, "operator").await;
+    assert_eq!(
+        body["held_cars"].as_array().unwrap().len(),
+        2,
+        "a refused write leaves both cars held: {body}"
     );
 }

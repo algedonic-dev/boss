@@ -31,6 +31,180 @@ impl PgCalendar {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// Consume calendar and kind writers inside a caller-owned transaction.
+    /// This adapter is not authorization: its caller must retain actual policy
+    /// owners and validate CREATE_SCHEDULE before dispatching the write.
+    pub async fn reserve_joined_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        req: ReservationRequest,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<JoinedReservation, CalendarError> {
+        Self::reserve_joined_with_budget_in(tx, req, stamp, None).await
+    }
+
+    pub async fn reserve_joined_with_budget_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        req: ReservationRequest,
+        stamp: &boss_core::publisher::EventStamp,
+        budget: Option<boss_events::statement_budget::StatementBudget>,
+    ) -> Result<JoinedReservation, CalendarError> {
+        Self::lock_selection_rows_with_budget_in(tx, budget).await?;
+
+        boss_events::statement_budget::refresh(tx, budget)
+            .await
+            .map_err(CalendarError::Storage)?;
+        let kind = reservable_kind_on(&mut **tx, &req.subject.kind).await?;
+        // Compare an existing hold with the exact timestamps this database
+        // would store for these parameters, not a guessed client precision.
+        boss_events::statement_budget::refresh(tx, budget)
+            .await
+            .map_err(CalendarError::Storage)?;
+        let (start, end): (DateTime<Utc>, DateTime<Utc>) =
+            sqlx::query_as("SELECT $1::timestamptz, $2::timestamptz")
+                .bind(req.window.start)
+                .bind(req.window.end)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|error| CalendarError::Storage(error.to_string()))?;
+        let stored_window = TimeWindow::new(start, end)
+            .map_err(|error| CalendarError::Invalid(error.to_string()))?;
+        boss_events::statement_budget::refresh(tx, budget)
+            .await
+            .map_err(CalendarError::Storage)?;
+        let rows: Vec<ReservationRow> = sqlx::query_as(
+            "SELECT id, resource_kind, resource_id, start_ts, end_ts, reason_kind, reason_ref_id, strength, notes, created_by, created_at, cancelled_at FROM calendar_reservations WHERE cancelled_at IS NULL AND resource_kind = $1 AND resource_id = $2 AND start_ts < $4 AND end_ts > $3 ORDER BY start_ts, id",
+        ).bind(&req.subject.kind).bind(&req.subject.id).bind(req.window.start).bind(req.window.end)
+            .fetch_all(&mut **tx).await.map_err(|error| CalendarError::Storage(error.to_string()))?;
+        let overlapping = rows
+            .into_iter()
+            .map(Reservation::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let hard: Vec<_> = overlapping
+            .iter()
+            .filter(|row| row.strength == ReservationStrength::Hard)
+            .cloned()
+            .collect();
+        if req.strength == ReservationStrength::Hard && !hard.is_empty() {
+            if hard.len() == 1
+                && hard[0].reason_kind == req.reason_kind
+                && hard[0].reason_ref_id == req.reason_ref_id
+                && hard[0].subject == req.subject
+                && hard[0].window == stored_window
+            {
+                return Ok(JoinedReservation {
+                    reservation: hard[0].clone(),
+                    inserted: false,
+                    kind,
+                    overlapping,
+                });
+            }
+            return Err(CalendarError::Conflict { existing: hard });
+        }
+        let reservation =
+            insert_reservation_with_budget_in(tx, req, stamp.timestamp, stamp, budget).await?;
+        Ok(JoinedReservation {
+            reservation,
+            inserted: true,
+            kind,
+            overlapping,
+        })
+    }
+
+    /// Ordering shared by the native selector and this transaction helper.
+    pub async fn lock_selection_rows_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), CalendarError> {
+        Self::lock_selection_rows_with_budget_in(tx, None).await
+    }
+
+    pub async fn lock_selection_rows_with_budget_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        budget: Option<boss_events::statement_budget::StatementBudget>,
+    ) -> Result<(), CalendarError> {
+        boss_events::statement_budget::refresh(tx, budget)
+            .await
+            .map_err(CalendarError::Storage)?;
+        sqlx::query("LOCK TABLE subject_kinds IN SHARE MODE")
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| CalendarError::Storage(error.to_string()))?;
+        boss_events::statement_budget::refresh(tx, budget)
+            .await
+            .map_err(CalendarError::Storage)?;
+        sqlx::query("LOCK TABLE calendar_reservations IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| CalendarError::Storage(error.to_string()))?;
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct JoinedReservation {
+    pub reservation: Reservation,
+    pub inserted: bool,
+    pub kind: serde_json::Value,
+    pub overlapping: Vec<Reservation>,
+}
+
+async fn reservable_kind_on<'a>(
+    executor: impl sqlx::Executor<'a, Database = sqlx::Postgres>,
+    kind: &str,
+) -> Result<serde_json::Value, CalendarError> {
+    let row: Option<(serde_json::Value, bool)> = sqlx::query_as("SELECT to_jsonb(sk), COALESCE((metadata->>'calendar_reservable')::bool, false) FROM subject_kinds sk WHERE kind = $1 AND retired_at IS NULL")
+        .bind(kind).fetch_optional(executor).await.map_err(|error| CalendarError::Storage(error.to_string()))?;
+    match row {
+        Some((row, true)) => Ok(row),
+        _ => Err(CalendarError::Invalid(format!(
+            "subject kind `{kind}` is not calendar-reservable"
+        ))),
+    }
+}
+
+async fn insert_reservation_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    req: ReservationRequest,
+    now: chrono::DateTime<chrono::Utc>,
+    stamp: &boss_core::publisher::EventStamp,
+) -> Result<Reservation, CalendarError> {
+    insert_reservation_with_budget_in(tx, req, now, stamp, None).await
+}
+
+async fn insert_reservation_with_budget_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    req: ReservationRequest,
+    now: chrono::DateTime<chrono::Utc>,
+    stamp: &boss_core::publisher::EventStamp,
+    budget: Option<boss_events::statement_budget::StatementBudget>,
+) -> Result<Reservation, CalendarError> {
+    if req.window.duration_seconds() <= 0 {
+        return Err(CalendarError::Invalid(
+            "window end must be after start".into(),
+        ));
+    }
+    let id = Uuid::new_v4();
+    boss_events::statement_budget::refresh(tx, budget)
+        .await
+        .map_err(CalendarError::Storage)?;
+    let row = sqlx::query_as::<_, ReservationRow>("INSERT INTO calendar_reservations (id, resource_kind, resource_id, start_ts, end_ts, reason_kind, reason_ref_id, strength, notes, created_by, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id, resource_kind, resource_id, start_ts, end_ts, reason_kind, reason_ref_id, strength, notes, created_by, created_at, cancelled_at")
+        .bind(id).bind(&req.subject.kind).bind(&req.subject.id).bind(req.window.start).bind(req.window.end)
+        .bind(&req.reason_kind).bind(&req.reason_ref_id).bind(req.strength.db_value()).bind(req.notes.as_deref()).bind(&req.created_by).bind(now)
+        .fetch_one(&mut **tx).await.map_err(|error| {
+            if error.as_database_error().is_some_and(|error| error.code().as_deref() == Some(SQLSTATE_EXCLUSION_VIOLATION)) {
+                CalendarError::Conflict { existing: Vec::new() }
+            } else { CalendarError::Storage(error.to_string()) }
+        })?;
+    let reservation = Reservation::try_from(row)?;
+    let event = stamp.event(
+        crate::events::RESERVATION_RESERVED,
+        serde_json::to_value(&reservation)
+            .map_err(|error| CalendarError::Storage(error.to_string()))?,
+    );
+    boss_events::outbox::record_event_with_budget_in_tx(tx, &event, budget)
+        .await
+        .map_err(CalendarError::Storage)?;
+    Ok(reservation)
 }
 
 /// Row shape mirroring `calendar_reservations`. Kept private — the
@@ -108,88 +282,28 @@ impl CalendarClient for PgCalendar {
                 "window end must be after start".into(),
             ));
         }
-        // Reservability is data: only a subject kind flagged
-        // `calendar_reservable` in the subject_kinds registry can be
-        // reserved. The single-occupancy guarantee is per individual
-        // subject, enforced by the GIST exclusion constraint below.
-        let reservable: Option<bool> = sqlx::query_scalar(
-            "SELECT COALESCE((metadata->>'calendar_reservable')::bool, false)
-             FROM subject_kinds WHERE kind = $1 AND retired_at IS NULL",
-        )
-        .bind(&req.subject.kind)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| CalendarError::Storage(e.to_string()))?;
-        if reservable != Some(true) {
-            return Err(CalendarError::Invalid(format!(
-                "subject kind `{}` is not calendar-reservable",
-                req.subject.kind
-            )));
-        }
-        let id = Uuid::new_v4();
+        reservable_kind_on(&self.pool, &req.subject.kind).await?;
+        let subject = req.subject.clone();
+        let window = req.window;
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| CalendarError::Storage(e.to_string()))?;
-        let res = sqlx::query(
-            "INSERT INTO calendar_reservations
-             (id, resource_kind, resource_id, start_ts, end_ts,
-              reason_kind, reason_ref_id, strength, notes, created_by, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-        )
-        .bind(id)
-        .bind(&req.subject.kind)
-        .bind(&req.subject.id)
-        .bind(req.window.start)
-        .bind(req.window.end)
-        .bind(&req.reason_kind)
-        .bind(&req.reason_ref_id)
-        .bind(req.strength.db_value())
-        .bind(req.notes.as_deref())
-        .bind(&req.created_by)
-        .bind(now)
-        .execute(&mut *tx)
-        .await;
-
-        if let Err(e) = res {
-            // Dropping the tx rolls back the failed INSERT.
-            drop(tx);
-            if let sqlx::Error::Database(db_err) = &e
-                && db_err.code().as_deref() == Some(SQLSTATE_EXCLUSION_VIOLATION)
-            {
-                let existing = self.find_overlapping(&req.subject, req.window).await?;
-                return Err(CalendarError::Conflict { existing });
+        let reservation = match insert_reservation_in(&mut tx, req, now, stamp).await {
+            Ok(reservation) => reservation,
+            Err(CalendarError::Conflict { .. }) => {
+                drop(tx);
+                return Err(CalendarError::Conflict {
+                    existing: self.find_overlapping(&subject, window).await?,
+                });
             }
-            return Err(CalendarError::Storage(e.to_string()));
-        }
-
-        // OUTBOX (phase 2): the reserved event (full post-INSERT row
-        // state, built from the same values just written) records
-        // with the row.
-        let reservation = Reservation {
-            id: ReservationId::from_uuid(id),
-            subject: req.subject,
-            window: req.window,
-            reason_kind: req.reason_kind,
-            reason_ref_id: req.reason_ref_id,
-            strength: req.strength,
-            notes: req.notes,
-            created_by: req.created_by,
-            created_at: now,
-            cancelled_at: None,
+            Err(error) => return Err(error),
         };
-        let event = stamp.event(
-            crate::events::RESERVATION_RESERVED,
-            serde_json::to_value(&reservation).unwrap_or_default(),
-        );
-        boss_events::outbox::record_event_in_tx(&mut tx, &event)
-            .await
-            .map_err(CalendarError::Storage)?;
         tx.commit()
             .await
             .map_err(|e| CalendarError::Storage(e.to_string()))?;
-        Ok(ReservationId::from_uuid(id))
+        Ok(reservation.id)
     }
 
     async fn list(

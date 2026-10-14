@@ -535,12 +535,26 @@ echo "stub kubectl: unexpected: $*" >&2
 exit 2
 "#;
 
+/// The far side, by `ssh-mode`. `real` (the default) execs the REAL
+/// receiver. `denied` is sshd refusing the key, before any channel
+/// exists, so it reads nothing; `short` greets as the receiver does and
+/// then reports the wrong byte count. THE ONES THAT ARE NOT THE RECEIVER
+/// (backlog dea2236f): `shell` is a real shell behind a login banner —
+/// what a key placed without its `command=` reaches, the machine token's
+/// first live enrolment's own shape (packet 96a0f7bb, 2026-10-07);
+/// `silent-shell` is that shell with no banner; `old-recv` is the
+/// receiver as it stood before it greeted, which reads its whole stdin
+/// first and refuses an empty one. Each records what it was handed in
+/// `ssh.stdin`, so "no kubeconfig byte was sent" is a file's length.
 const SSH_STUB: &str = r#"#!/usr/bin/env bash
 D=@D@
 { printf 'ssh'; printf ' %q' "$@"; echo; } >> "$D/calls"
 case "$(cat "$D/ssh-mode" 2>/dev/null || echo real)" in
-  denied) cat >/dev/null; echo 'recovery@receiver.example.invalid: Permission denied (publickey).' >&2; exit 255 ;;
-  short) cat >/dev/null; echo 'ops-credential-recv: kubeconfig: received 3 bytes; installed at /etc/boss-ops/kubeconfig, root:root 0600 (was absent)'; exit 0 ;;
+  denied) echo 'recovery@receiver.example.invalid: Permission denied (publickey).' >&2; exit 255 ;;
+  short) echo 'ops-credential-recv: kubeconfig: ready for one kubeconfig'; cat >/dev/null; echo 'ops-credential-recv: kubeconfig: received 3 bytes; installed at /etc/boss-ops/kubeconfig, root:root 0600 (was absent)'; exit 0 ;;
+  shell) echo 'Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.8.0-1015-gcp x86_64)'; echo; tee "$D/ssh.stdin" | bash --noprofile --norc; exit 0 ;;
+  silent-shell) tee "$D/ssh.stdin" | bash --noprofile --norc; exit 0 ;;
+  old-recv) n="$(tee "$D/ssh.stdin" | wc -c)"; if [ "$n" -eq 0 ]; then echo 'ops-credential-recv: REFUSED — an empty deposit — the transfer carried nothing; /etc/boss-ops/kubeconfig left as it was' >&2; exit 65; fi; echo "ops-credential-recv: kubeconfig: received $n bytes; installed at /etc/boss-ops/kubeconfig, root:root 0600 (was absent)"; exit 0 ;;
 esac
 BOSS_OPS_DIR="$D/ops" BOSS_RECV_OWNER= exec bash @REPO@/infra/gcp/ops-credential-recv.sh kubeconfig
 "#;
@@ -776,6 +790,12 @@ fn a_credential_that_can_roll_only_images_is_deposited_and_the_receipt_is_read_b
             got.len()
         )),
         "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "{TARGET} answered first as the receiver; sending the kubeconfig"
+        )),
+        "the record says the receiver spoke before anything was sent: {out}"
     );
     assert!(out.contains("can-i get nodes: yes (wanted yes)"), "{out}");
     assert!(out.contains("refused (wanted refused)"), "{out}");
@@ -1768,6 +1788,137 @@ fn a_key_boss_gcp_does_not_accept_yet_names_the_line_to_place() {
         "{out}"
     );
     j.assert_nothing_leaked(&out);
+}
+
+/// The receiver's first line for the kubeconfig, which the Job requires
+/// before it writes a byte. One literal in two scripts: held equal below.
+const GREETING: &str = "ops-credential-recv: kubeconfig: ready for one kubeconfig";
+
+/// What the far side was handed on its stdin, for the stubs that record
+/// it: `None` when it was never reached, else the byte count.
+fn far_stdin(j: &Job) -> Option<u64> {
+    std::fs::metadata(j.dir.join("ssh.stdin"))
+        .ok()
+        .map(|m| m.len())
+}
+
+/// A DEPOSIT KEY PLACED WITHOUT ITS `command=` REACHES A SHELL, AND THE
+/// JOB HANDS THAT SHELL NO KUBECONFIG BYTE (backlog dea2236f). The
+/// machine token's first live enrolment (packet 96a0f7bb, 2026-10-07)
+/// placed the bare public key, sshd ran the account's shell, and the
+/// push — which wrote before it read — put its slots on that shell's
+/// stdin. This Job wrote the same way: the kubeconfig went to ssh's
+/// stdin before anything had answered. Here a real shell stands behind
+/// the stub: the Job must send it nothing (the stub records its stdin,
+/// and the file is empty), name the cause on a route of its own, and
+/// say which line to remove.
+#[test]
+fn a_key_that_reaches_a_shell_is_named_and_handed_no_kubeconfig_byte() {
+    for (mode, want) in [
+        ("shell", "answered with its own text"),
+        ("silent-shell", "said nothing"),
+    ] {
+        let j = Job::new(mode);
+        j.set("ssh-mode", mode);
+        let (rc, out) = j.run_with(&[("BOSS_DEPOSIT_GREETING_TIMEOUT_S", "1")]);
+        assert_eq!(rc, 1, "[{mode}] {out}");
+        assert_eq!(
+            far_stdin(&j),
+            Some(0),
+            "[{mode}] the far side was reached and handed NO byte: {out}"
+        );
+        let reds = Job::reds(&out);
+        assert_eq!(reds.len(), 1, "[{mode}] one RED line: {out}");
+        assert_eq!(
+            (reds[0].0.as_str(), reds[0].1.as_str()),
+            ("break-glass-deposit/key-unconfined", "refused"),
+            "[{mode}] its own route, so an open deposit item cannot swallow it: {out}"
+        );
+        for needle in [
+            "this key reaches a shell on receiver.example.invalid",
+            want,
+            "REMOVE THAT LINE NOW",
+            "~recovery/.ssh/authorized_keys",
+            &job_forced_line(),
+            "No kubeconfig byte was sent",
+        ] {
+            assert!(
+                reds[0].2.contains(needle),
+                "[{mode}] wants `{needle}`: {out}"
+            );
+        }
+        assert!(j.deposited().is_none(), "[{mode}]");
+        j.assert_nothing_leaked(&out);
+    }
+}
+
+/// A RECEIVER THAT DOES NOT SPEAK FIRST IS SENT NOTHING, AND SAYS SO ON
+/// A RED LINE. boss-gcp's receiver lands by its own converge (thirty
+/// minutes) and this Job by the cluster's, so for one tick the Job may
+/// face the receiver that reads its whole stdin before it says anything.
+/// Closing the stream with nothing written makes that receiver refuse an
+/// empty deposit in its own words — proof of what is behind the key, so
+/// it is not the shell finding — and the line names the converge owed.
+/// It is RED, never quiet: the same words after the window mean a
+/// receiver install that failed, and that must reach a reader.
+#[test]
+fn a_receiver_that_does_not_greet_is_red_and_sent_nothing() {
+    let j = Job::new("old-recv");
+    j.set("ssh-mode", "old-recv");
+    let (rc, out) = j.run_with(&[("BOSS_DEPOSIT_GREETING_TIMEOUT_S", "1")]);
+    assert_eq!(rc, 1, "{out}");
+    assert_eq!(far_stdin(&j), Some(0), "{out}");
+    let reds = Job::reds(&out);
+    assert_eq!(reds.len(), 1, "{out}");
+    assert_eq!(reds[0].0, "break-glass-deposit", "{out}");
+    assert!(
+        reds[0].2.contains("does not speak first") && reds[0].2.contains("converge"),
+        "{out}"
+    );
+    j.assert_nothing_leaked(&out);
+
+    for bad in ["0", "soon"] {
+        let j = Job::new("bad-bound");
+        let (rc, out) = j.run_with(&[("BOSS_DEPOSIT_GREETING_TIMEOUT_S", bad)]);
+        assert_eq!(rc, 78, "[{bad}] {out}");
+        assert!(!j.called_ssh(), "[{bad}] {out}");
+    }
+}
+
+/// The greeting is ONE literal in the two scripts, and the real receiver
+/// says it BEFORE it has been handed a byte: its stdin is held open and
+/// unwritten while the line is read.
+#[test]
+fn the_receiver_greets_before_it_reads_the_kubeconfig() {
+    for file in [JOB, RECEIVER] {
+        assert!(tree(file).contains(GREETING), "{file} carries the greeting");
+    }
+    let dir = scratch_dir("bg-recv-greets-first");
+    let ops = dir.join("ops");
+    let mut child = Command::new("bash")
+        .arg(repo_root().join(RECEIVER))
+        .arg("kubeconfig")
+        .env("BOSS_OPS_DIR", &ops)
+        .env("BOSS_RECV_OWNER", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the receiver");
+    let mut out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut out, &mut first).expect("first line");
+    assert_eq!(first.trim_end(), GREETING);
+    let kc = kubeconfig(TOKEN);
+    feed_stdin(&mut child, kc.as_bytes());
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut out, &mut rest).expect("the rest");
+    assert!(child.wait().expect("wait").success(), "{rest}");
+    assert!(
+        rest.contains(&format!("received {} bytes; installed at", kc.len())),
+        "{rest}"
+    );
+    assert_eq!(read(&ops.join("kubeconfig")), kc);
 }
 
 #[test]
