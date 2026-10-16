@@ -56,6 +56,9 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "One change, from declaring its boundary to merging it. The Subject is a `custom` Subject whose id is the branch, so \"what shipped here\" is a Subject-history question. The `scope` step is the point of the kind: it asks a person what the change contains and what it deliberately excludes BEFORE the work, which is the only moment that decision keeps a PR small. Counted on /system/flow, so a cadence target needs no second mechanism. OPERATOR EDIT 2026-08-27, deliberate and load-bearing: this sentence exists only to make this registry row DIFFER from infra/platform/workflows.toml. The bundle was authored FROM the live specs, so every row matched and nothing could distinguish \"the seeder left my edit alone\" from \"the seeder rewrote it with identical bytes\". If this sentence is still here after the boss pod has restarted, the seeder is insert-if-absent in production and an operator edit survives a boot - the arbiter for the ship-a-change car \"ship-a-change is registry data\" (b10b3b52). If it has vanished, that claim is false and the car must not be stamped proven. Safe to delete once the observation is recorded. EVERY STEP CARRIES ITS OWN PROCEDURE in metadata_defaults, so how the work is actually done travels with the packet rather than living in a document someone has to know about. That also makes the procedure versioned and measurable: /api/workflows/ship-a-change/terminal-report reports cycle time and outcomes per version, so a change to the procedure can be compared against the versions before it instead of argued about."
+# Structured wait declarations can record their next actual observation.
+# Optional at admission; an alarm may qualify only a complete record.
+metadata_schema = { type = "object", properties = { waits_on = { type = "object", properties = { next_check_at = { type = "string", format = "date-time", description = "The recorded next observable check, not a date guessed from job age." }, clean_window = { type = "object", required = ["begin_at", "duration_seconds"], additionalProperties = false, properties = { begin_at = { type = "string", format = "date-time" }, duration_seconds = { type = "integer", minimum = 1 } } } } } } }
 metadata = { department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
@@ -176,6 +179,10 @@ required = false
 [[workflow.step]]
 title = "review"
 kind = "task"
+# A declared review expectation, matching the current agent-run building
+# allowance. Readers consult each packet's pinned workflow, never infer
+# this bound for older versions from the active row.
+duration_hours = 2.0
 ready_when = "steps.gate.done"
 title_template = "Open for review"
 authority_role = "platform-admin"
@@ -291,6 +298,10 @@ required = false
 [[workflow.step]]
 title = "landed-review"
 kind = "task"
+# A declared review expectation, matching the current agent-run building
+# allowance. Readers consult each packet's pinned workflow, never infer
+# this bound for older versions from the active row.
+duration_hours = 2.0
 ready_when = "steps.review.done AND job.metadata.merged = \"true\" AND NOT (steps.review.metadata.release.review > \"\") AND NOT (job.metadata.unlanded = \"true\")"
 title_template = "Reviewed after landing"
 authority_role = "platform-admin"

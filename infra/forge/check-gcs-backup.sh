@@ -27,6 +27,25 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# The alpine SDK deliberately removes bootstrap system Python. Its supported
+# musl interpreter is bundled outside PATH (f0093dbc). Exercise that image
+# contract without network or credential mounts BEFORE reading the Secret.
+GCS_READBACK_PYTHON="/google-cloud-sdk/platform/bundledpythonunixmusl/bin/python3"
+if ! timeout -k 5 120 sudo -n docker image inspect google/cloud-sdk:alpine >/dev/null 2>&1; then
+    timeout -k 5 120 sudo -n docker pull google/cloud-sdk:alpine > "$WORK/pull.log" 2>&1 \
+        || fail 'the existing uploader SDK image could not be pulled within 120 seconds'
+fi
+GCS_READBACK_IMAGE="$(timeout -k 5 30 sudo -n docker image inspect --format '{{.Id}}' google/cloud-sdk:alpine)" \
+    || fail 'the SDK image identity could not be read; no credential was read'
+[[ "$GCS_READBACK_IMAGE" =~ ^sha256:[a-f0-9]{64}$ ]] \
+    || fail 'the SDK image identity was not a digest; no credential was read'
+CONTAINER="boss-gcs-runtime-${WORK##*.}"
+timeout -k 5 120 sudo -n docker run --rm --name "$CONTAINER" --network none --read-only --memory=2g --pids-limit=128 \
+    --cap-drop=ALL --security-opt=no-new-privileges \
+    --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m --env PYTHONDONTWRITEBYTECODE=1 \
+    "$GCS_READBACK_IMAGE" timeout 60 "$GCS_READBACK_PYTHON" \
+    -c 'import gzip, hashlib, json, ssl, subprocess, urllib.request' \
+    || fail 'the SDK image failed its credential-free Python runtime check; no credential was read'
 ops_image_ready > "$WORK/door.log" 2>&1 || fail 'the kubectl door image could not be made ready'
 K="$(ops_kubectl)"
 # This is the only Kubernetes read. Never echo provider error bodies or the
@@ -47,10 +66,6 @@ jq -r '.data.bucket' "$WORK/secret.json" | base64 -d > "$WORK/bucket" \
 # credential cache lives only in its bounded tmpfs; the archive streams through
 # bounded validators without a workspace copy. The container has no
 # database, recovery-kit or backup-volume mount and no Kubernetes credential.
-if ! timeout -k 5 120 sudo -n docker image inspect google/cloud-sdk:alpine >/dev/null 2>&1; then
-    timeout -k 5 120 sudo -n docker pull google/cloud-sdk:alpine > "$WORK/pull.log" 2>&1 \
-        || fail 'the existing uploader SDK image could not be pulled within 120 seconds'
-fi
 rc=0
 CONTAINER="boss-gcs-readback-${WORK##*.}"
 timeout -k 5 900 sudo -n docker run --rm --name "$CONTAINER" --read-only --memory=2g --pids-limit=128 \
@@ -61,7 +76,7 @@ timeout -k 5 900 sudo -n docker run --rm --name "$CONTAINER" --read-only --memor
     --mount "type=bind,src=$WORK/sa.json,dst=/gcs/sa.json,readonly" \
     --mount "type=bind,src=$WORK/bucket,dst=/gcs/bucket,readonly" \
     --mount "type=bind,src=$HERE/gcs-readback.py,dst=/check.py,readonly" \
-    google/cloud-sdk:alpine timeout 840 python3 /check.py 2>&1 | tee "$WORK/check.log" || rc=$?
+    "$GCS_READBACK_IMAGE" timeout 840 "$GCS_READBACK_PYTHON" /check.py 2>&1 | tee "$WORK/check.log" || rc=$?
 [ "$rc" -eq 0 ] || fail "remote readback failed (exit $rc); no remote bytes were written or deleted"
 # A silent exit 0 proves nothing. Keep output streaming to the runner while
 # also validating the one final receipt before this door prints its effect.

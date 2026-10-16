@@ -171,6 +171,7 @@ pub fn place_alone(
                 over_limit: false,
                 members: vec![job.id.to_string()],
                 served: None,
+                flow_blind: None,
                 previous_served: None,
                 opened: Default::default(),
             })
@@ -178,6 +179,7 @@ pub fn place_alone(
         _ => Vec::new(),
     };
     let inputs = RegionInputs {
+        internal_protocols: None,
         status: &status,
         dock_reading: Reading::Read,
         open_trains,

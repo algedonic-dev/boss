@@ -1386,6 +1386,39 @@ pub trait JobsRepository: Send + Sync {
     /// holds, one read from the step. `limit` keeps the NEWEST rows:
     /// a long history answers with its most recent `limit` events in
     /// the order they happened.
+    /// Complete oldest-first immutable history through an exact audit sequence.
+    /// More than the bound is an error, never a truncated proof.
+    async fn historical_events(
+        &self,
+        _job_id: &JobId,
+        _upto: i64,
+        _limit: i64,
+    ) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        Err(JobsError::Storage(
+            "bounded historical events unavailable".into(),
+        ))
+    }
+    /// One consistent native audit snapshot, identities resolved from an immutable diagnosis.
+    async fn move_admission_snapshot(
+        &self,
+        _diagnosis: &crate::move_diagnosis::Diagnosis,
+    ) -> Result<crate::move_admission::Snapshot, JobsError> {
+        Err(JobsError::Storage(
+            "native admission snapshot unavailable".into(),
+        ))
+    }
+    /// Immutable publications/retirements of ONE station through an audit sequence.
+    async fn historical_station_events(
+        &self,
+        _name: &str,
+        _upto: i64,
+        _limit: i64,
+    ) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        Err(JobsError::Storage(
+            "historical station publications unavailable".into(),
+        ))
+    }
+
     async fn events_for_job(
         &self,
         job_id: &JobId,

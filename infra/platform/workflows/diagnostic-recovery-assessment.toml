@@ -1,0 +1,34 @@
+# Decision2751a5d3: a separate assessment never changes a pinned diagnostic.
+[[workflow]]
+kind = "diagnostic-recovery-assessment"
+label = "Diagnostic recovery assessment"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "Assess the decided retained preparation from original evidence without repeating compute or changing the original diagnostic."
+metadata = { department = "it", owner_role = "platform-admin", diagnostic_executor = "automation:train-conductor", diagnostic_recovery_assessment = "v1" }
+
+[[workflow.step]]
+title = "filed"
+kind = "trigger"
+ready_when = "true"
+metadata_defaults = { trigger_kind = "operator", trigger_name = "recovery-assessment-requested" }
+
+[[workflow.step]]
+title = "execute"
+kind = "task"
+ready_when = "steps.filed.done"
+audience = { individual = "automation:train-conductor" }
+metadata_defaults = { request = "{metadata.request}", recovery_operation = { handler = "retained-preparation-assessment", version = 1, original_request = "688b4f42-9e65-4f58-aaf7-53c841113cd0", authority_design = "2751a5d3-49b0-423e-a98f-4e574c86387f", authority_anchor = "R1", resolution_sha256 = "6ed8a6cdec0b2170bbbce9606f4e46ee321c7afd2a1acbcf6b0264431c3c9089" }, procedure = "The registered conductor independently reads the exact original immutable intent and winning invocation, retains the full contiguous journal and streams, and reads Jobs and Pods in its fixed namespace. Only a successful fetch followed by a valid fixed baseline mismatch with no create or interrupted evidence may produce recovered-refusal. Read back every append. This assessment changes no original protocol, intent, step, hold, grant or compute admission. Missing or conflicting evidence stays UNKNOWN. Future operation versions are separate contracts." }
+fields = [
+  { name = "request", field_type = "object", required = true, filled_by = "filer" },
+  { name = "outcome", field_type = "non-empty-string", required = true },
+  { name = "evidence", field_type = "object", required = true },
+]
+
+[[workflow.step]]
+title = "answered"
+kind = "outcome"
+ready_when = "steps.execute.done"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "assessed" }

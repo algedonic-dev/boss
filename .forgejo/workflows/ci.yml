@@ -13,12 +13,11 @@
 # fails every run at checkout with exitcode 127 before a line of the
 # gate executes.
 #
-# Deliberately split into two jobs. `fast` is fmt + clippy and returns in
-# under a minute on the Ryzen — that is the feedback loop you actually
-# live in. `test` carries the Postgres service and runs `infra/gate.sh`,
-# and is allowed to take as long as it takes. Reporting them separately
-# means a formatting slip is not hidden behind a ten-minute test run, and
-# the bottleneck is visible rather than averaged away.
+# Three jobs, in series: `build-image` (the runner image, from the
+# tree), `locomotive` (the host and image checks, in seconds), `web` (the
+# frontend checks the train's cluster gate may skip). The `fast` and
+# `test` jobs this paragraph used to describe were moved to that gate by
+# design 128b5496; see the note at the foot of this file.
 name: CI
 
 # THE PULL REQUEST ALONE. Until 2026-09-12 `push: branches: [main]` was
@@ -329,7 +328,24 @@ jobs:
   # because Playwright 1.61 refuses to start below 20 and that is not
   # something a job step can paper over.
   #
-  # Runs parallel to `test`, so it adds no wall-clock to a green train.
+  # IT RUNS IN SERIES, AND IT IS NOT FREE. This line used to say the job
+  # "runs parallel to `test`, so it adds no wall-clock" — there has been
+  # no `test` job since design 128b5496 (2026-09-13), and the graph is a
+  # chain: build-image -> locomotive -> web, on the forge's one runner
+  # slot, so every step here is track time on a train (backlog 81ee98b3).
+  #
+  # SO IT RUNS ONLY WHAT THE TRAIN'S GATE MAY SKIP. The conductor gates
+  # every train branch with `--auto` and merges none without that verdict
+  # (BOSS_TRAIN_GATE_REQUIRED=1). In `--auto`, gate.sh runs svelte-check
+  # on every tree, which is why this job has no Typecheck step any more.
+  # The rest of the gate's web phase runs only when the train touches
+  # apps/web, apps/simulator or libs/web-kit, while the specs also read
+  # files from infra/step-plugins, infra/estate, infra/postgres, examples/
+  # and docs/ (readFileSync, 2026-10-15) — so for a train that changes
+  # only those, the steps below are the only run of the web suite, and
+  # they stay.
+  # Pinned both ways by boss-testing's gate_sh.rs
+  # the_forge_web_job_runs_only_what_the_train_gate_may_skip.
   web:
     runs-on: docker
     needs: [locomotive]
@@ -362,10 +378,6 @@ jobs:
         # and the failure reads as a missing tool.
         working-directory: apps/web
         run: PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile
-
-      - name: Typecheck
-        working-directory: apps/web
-        run: bun run typecheck
 
       - name: web-kit unit tests
         # RUN FIRST, and from libs/web-kit, because the step below does

@@ -22,6 +22,7 @@ pub struct InMemoryJobs {
     selection_fixture: bool,
     inner: Mutex<State>,
     recorded: Mutex<Vec<boss_core::event::Event>>,
+    audit_created_at: Mutex<HashMap<uuid::Uuid, DateTime<Utc>>>,
     #[cfg(test)]
     before_step_events: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     refusals: Mutex<Vec<crate::refusals::RecordedRefusal>>,
@@ -720,6 +721,49 @@ impl InMemoryJobs {
     /// in-memory analogue of the Pg adapter's in-tx recording).
     pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
         self.recorded.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    /// Append an owned audit envelope. Ordinary event recording has no original
+    /// insertion clock and remains unknown; existing events cannot be backfilled.
+    pub fn record_audit_event(
+        &self,
+        event: boss_core::event::Event,
+        created_at: DateTime<Utc>,
+    ) -> Result<(), JobsError> {
+        let mut events = self
+            .recorded
+            .lock()
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let mut instants = self
+            .audit_created_at
+            .lock()
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        if events.iter().any(|recorded| recorded.id == event.id) {
+            return Err(JobsError::Storage("audit event already recorded".into()));
+        }
+        instants.insert(event.id, created_at);
+        events.push(event);
+        Ok(())
+    }
+
+    fn historical_records(&self) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        let events = self
+            .recorded
+            .lock()
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let instants = self
+            .audit_created_at
+            .lock()
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok(events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| crate::move_diagnosis::HistoricalEvent {
+                seq: index as i64 + 1,
+                created_at: instants.get(&event.id).copied(),
+                event: event.clone(),
+            })
+            .collect())
     }
 
     /// Make every later `list_steps` of this packet fail with a
@@ -1740,6 +1784,112 @@ impl JobsRepository for InMemoryJobs {
             .collect())
     }
 
+    async fn historical_events(
+        &self,
+        job_id: &JobId,
+        upto: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        if !(0..=4096).contains(&limit) || upto < 0 {
+            return Err(JobsError::Storage("invalid historical bound".into()));
+        }
+        let want = job_id.to_string();
+        let rows: Vec<_> = self
+            .historical_records()?
+            .into_iter()
+            .filter(|row| {
+                row.seq <= upto
+                    && (row.event.payload.get("job_id").and_then(|v| v.as_str())
+                        == Some(want.as_str())
+                        || row.event.payload.get("id").and_then(|v| v.as_str())
+                            == Some(want.as_str()))
+            })
+            .collect();
+        if limit < 0 || rows.len() as i64 > limit {
+            return Err(JobsError::Storage("historical event bound exceeded".into()));
+        }
+        Ok(rows)
+    }
+
+    async fn move_admission_snapshot(
+        &self,
+        d: &crate::move_diagnosis::Diagnosis,
+    ) -> Result<crate::move_admission::Snapshot, JobsError> {
+        let (run, parent) = crate::move_admission::identities(d).map_err(JobsError::Storage)?;
+        let acquired_at = boss_clock_client::wall_now();
+        let rows = self.historical_records()?;
+        let max = rows.last().map_or(0, |r| r.seq);
+        let slice =
+            |id: uuid::Uuid| -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+                let id = id.to_string();
+                let selected = rows
+                    .iter()
+                    .filter(|r| {
+                        r.seq <= d.original.r#move.cause_seq
+                            && r.event
+                                .payload
+                                .get("job_id")
+                                .or_else(|| r.event.payload.get("id"))
+                                .and_then(|v| v.as_str())
+                                == Some(id.as_str())
+                    })
+                    .take(crate::move_admission::MAX_ROWS + 1)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if selected.len() > crate::move_admission::MAX_ROWS {
+                    return Err(JobsError::Storage("historical event bound exceeded".into()));
+                }
+                Ok(selected)
+            };
+        let native_admissions = rows
+            .iter()
+            .filter(|r| {
+                r.event.source == "jobs"
+                    && r.event.kind == crate::events::JOB_CREATED
+                    && (r.event.payload.get("id").and_then(|v| v.as_str())
+                        == Some(run.to_string().as_str())
+                        || r.event.payload.get("job_id").and_then(|v| v.as_str())
+                            == Some(run.to_string().as_str()))
+            })
+            .take(2)
+            .cloned()
+            .collect();
+        Ok(crate::move_admission::Snapshot {
+            captured_max_seq: max,
+            acquired_at,
+            run: slice(run)?,
+            parent: slice(parent)?,
+            native_admissions,
+        })
+    }
+
+    async fn historical_station_events(
+        &self,
+        name: &str,
+        upto: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        if !(0..=4096).contains(&limit) || upto < 0 {
+            return Err(JobsError::Storage("invalid historical bound".into()));
+        }
+        let rows: Vec<_> = self
+            .historical_records()?
+            .into_iter()
+            .filter(|row| {
+                row.seq <= upto
+                    && row.event.source == "jobs"
+                    && matches!(
+                        row.event.kind.as_str(),
+                        crate::events::STATION_PUBLISHED | crate::events::STATION_RETIRED
+                    )
+                    && row.event.payload.get("name").and_then(|v| v.as_str()) == Some(name)
+            })
+            .collect();
+        if rows.len() as i64 > limit {
+            return Err(JobsError::Storage("historical event bound exceeded".into()));
+        }
+        Ok(rows)
+    }
     async fn events_for_job(
         &self,
         job_id: &JobId,

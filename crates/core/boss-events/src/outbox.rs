@@ -1072,8 +1072,19 @@ pub async fn drain_outbox_once(
         .bind(kind)
         .bind(payload)
         .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
+        .await;
+        let res = match res {
+            Ok(res) => res,
+            Err(error) => {
+                // A competing audit writer can win after NOT EXISTS.
+                // Finish the aborted transaction before a caller retries;
+                // dropping it only queues rollback in SQLx's pool task.
+                tx.rollback().await.map_err(|rollback| {
+                    format!("{error}; rolling back the refused batch failed: {rollback}")
+                })?;
+                return Err(error.to_string());
+            }
+        };
         audit_inserted += res.rows_affected();
         // A prior audit row proves a retry only when it holds this
         // whole fact (ee2176c6). Judge in PostgreSQL so both timestamps
@@ -1098,11 +1109,18 @@ pub async fn drain_outbox_once(
         .await
         .map_err(|e| e.to_string())?;
         if !changed.is_empty() {
-            return Err(format!(
+            let conflict = format!(
                 "outbox row {outbox_id} event {event_id}: immutable identity conflict in {}; \
                  original audit fact preserved, queued fact remains pending, batch not published",
                 changed.join(", ")
-            ));
+            );
+            // Drop only queues SQLx's rollback. Until the pool flushes it,
+            // a retry can SKIP LOCKED our own refused row and report zero.
+            // Finish the refusal before returning it (f9cfb5ed).
+            tx.rollback().await.map_err(|rollback| {
+                format!("{conflict}; rolling back the refused batch failed: {rollback}")
+            })?;
+            return Err(conflict);
         }
     }
     tx.commit().await.map_err(|e| e.to_string())?;

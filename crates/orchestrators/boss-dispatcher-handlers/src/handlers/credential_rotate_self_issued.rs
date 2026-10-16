@@ -473,7 +473,15 @@ impl LocalGates {
         {
             Ok(r) => r,
             Err(e) if connection_refused(&e) => return GateRead::NotServed,
-            Err(e) => return GateRead::Failed(format!("GET {url}: {e}")),
+            Err(e) if e.is_timeout() => {
+                return GateRead::Failed(format!(
+                    "GET {url}: request timed out ({:?})",
+                    e.without_url()
+                ));
+            }
+            Err(e) => {
+                return GateRead::Failed(format!("GET {url}: {:?}", e.without_url()));
+            }
         };
         let status = resp.status();
         if !status.is_success() {

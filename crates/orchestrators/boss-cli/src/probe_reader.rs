@@ -1016,6 +1016,7 @@ pub(crate) mod fixture {
         let seen = Seen::default();
         let handed = seen.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let (ready, prepared) = std::sync::mpsc::sync_channel(0);
         let worker = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1025,12 +1026,16 @@ pub(crate) mod fixture {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                 let app =
                     build(handed).into_make_service_with_connect_info::<std::net::SocketAddr>();
+                // Router/runtime setup is fixture preparation, not time spent
+                // by the production reader's bounded accepts request.
+                ready.send(()).unwrap();
                 tokio::select! {
                     _ = stopped => {},
                     _ = axum::serve(listener, app) => {},
                 }
             });
         });
+        prepared.recv().unwrap();
         Upstream {
             base: format!("http://127.0.0.1:{port}"),
             port,
@@ -1165,6 +1170,24 @@ mod tests {
             Ok(None) => panic!("no door, silently, where a refusal was owed"),
             Err(error) => format!("{error:#}"),
         }
+    }
+
+    #[test]
+    fn fixture_router_setup_does_not_spend_the_readers_vouch_budget() {
+        let upstream = fixture::serve(|seen| {
+            std::thread::sleep(VOUCH_TIMEOUT + Duration::from_secs(1));
+            fixture::recorder(seen).merge(fixture::accepts_route("reader.current"))
+        });
+        let (_held, guard) = door(VALUE, &upstream.base, "");
+        assert!(
+            guard.is_ok(),
+            "fixture preparation must finish before the actual bounded reader begins: {}",
+            guard
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        );
     }
 
     /// Can this test process give a file to `uid`? The B2 controls mean

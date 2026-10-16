@@ -38,6 +38,7 @@
   // piece of new styling here, and it names no colour but a --map-*
   // token, so the redesign still reskins one grammar.
   import { navigate } from '@boss/web-kit/nav';
+  import { recordedWaitText } from './waits';
   import {
     bandText,
     compactCountText,
@@ -535,7 +536,7 @@
         {#if row.holds.length > 0}
           <ol class="crossing-holds">
             {#each row.holds as h, i (i)}
-              <li><span class="crossing-what">{h.what}</span> — {h.why}</li>
+              <li><span class="crossing-what">{h.what}</span> — {h.why}{#if h.wait} · {recordedWaitText(h.wait)}{/if}</li>
             {/each}
           </ol>
         {/if}

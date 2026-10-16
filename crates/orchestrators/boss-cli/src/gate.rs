@@ -6737,6 +6737,8 @@ mod tests {
             seen: Some("true".into()),
             owner: Some("world".into()),
             max_wait_hours: Some(336),
+            next_check_at: None,
+            clean_window: None,
         };
         assert!(p.require_complete().is_ok());
         assert_eq!(

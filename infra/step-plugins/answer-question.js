@@ -41,7 +41,7 @@
   padding-bottom: 12px; margin-bottom: var(--aq-gap);
   border-bottom: 1px solid var(--border, #e7e5e4);
 }
-.step-answer-question .aq-head h3 { margin: 0; font-size: 17px; flex: 1 1 auto; line-height: 1.35; }
+.step-answer-question .aq-head h3 { margin: 0; font-size: 17px; flex: 1 1 auto; line-height: 1.35; white-space: pre-wrap; }
 .step-answer-question .aq-asker {
   font-size: 12px; color: var(--text-dim, #78716c); white-space: nowrap;
 }
@@ -57,6 +57,7 @@
   .step-answer-question .aq-panes { grid-template-columns: minmax(0, 1fr); }
   .step-answer-question .aq-rail { position: static !important; max-height: none !important; }
 }
+.step-answer-question .aq-panes.aq-reading { grid-template-columns: minmax(0, 1fr); }
 
 .step-answer-question .aq-context {
   background: var(--card, #fff); border: 1px solid var(--border, #e7e5e4);
@@ -319,6 +320,10 @@
     let verdict = (step.metadata && step.metadata.verdict) || '';
     let answer = (step.metadata && step.metadata.answer) || '';
     let job = null;
+    let linkedDesign = null;
+    let linkedDesignId = null;
+    let loading = true;
+    let detailsFailed = false;
     let saving = false;
     let error = null;
 
@@ -354,17 +359,39 @@
       return router ? router.metadata[key].trim() : '';
     }
 
+    function decisionReference() {
+      // The drafting step holds the recorded edge. Do not extract an
+      // id from the question's prose: the linked decision owns its review.
+      const rows = [step.metadata, job && job.metadata,
+        ...((job && Array.isArray(job.steps)) ? job.steps
+          .filter((s) => s && s.status === 'completed').map((s) => s.metadata) : [])];
+      const row = rows.find((m) => m && typeof m.design_id === 'string' && m.design_id.trim());
+      return row && row.design_id.trim() !== jobId ? row.design_id.trim() : null;
+    }
+
+    function verdictChoices() {
+      const field = Array.isArray(step.fields) ? step.fields.find((f) => f.name === 'verdict') : null;
+      const declared = field && typeof field.field_type === 'string' ? field.field_type.split('|').map((value) => value.trim()) : [];
+      const choices = VERDICTS.filter((v) => declared.includes(v.key));
+      return choices.length ? choices : VERDICTS;
+    }
+
     function render() {
       body.replaceChildren();
       if (error) body.appendChild(h('div', { className: 'aq-error' }, error));
 
       const asker = meta('asked_by');
+      const q = meta('question') || meta('message') || meta('body');
+      const recorded = linkedDesign && linkedDesign.metadata &&
+        linkedDesign.metadata.no_open_questions === true &&
+        Array.isArray(linkedDesign.metadata.questions) && linkedDesign.metadata.questions.length === 0;
       body.appendChild(
         h('div', { className: 'aq-head' },
-          h('h3', {}, (job && job.title) || 'Answer a question'),
+          h('h3', {}, recorded ? 'No answer needed' : linkedDesign ? 'Review the linked design' : q || 'Question details'),
           asker ? h('span', { className: 'aq-asker' }, `asked by ${asker}`) : null,
         ),
       );
+      if (job && job.title) body.appendChild(h('p', { className: 'aq-hint' }, job.title));
 
       if (isDone) {
         body.appendChild(
@@ -374,10 +401,38 @@
         return;
       }
 
-      const panes = h('div', { className: 'aq-panes' });
+      if (loading) {
+        body.appendChild(h('p', { className: 'aq-hint' }, 'Loading question details…'));
+        return;
+      }
+      if (detailsFailed) {
+        const retry = h('button', { type: 'button', className: 'aq-use' }, 'Retry');
+        retry.addEventListener('click', loadDetails);
+        body.appendChild(h('div', { className: 'aq-error' }, 'Could not load the question details.', retry));
+        return;
+      }
+
+      const parent = meta('parent_job_id');
+      if (parent && parent !== jobId) {
+        body.appendChild(h('p', {}, h('a', { href: `/ux/jobs/${encodeURIComponent(parent)}` }, 'View related work')));
+      }
+      if (linkedDesign) {
+        body.appendChild(h('div', { className: 'aq-card' },
+          h('p', {}, recorded ? 'This decision is already recorded.' : 'Answer the design’s questions in its own review. The result will be recorded here.'),
+          h('p', {}, linkedDesign.title || ''),
+          h('a', { href: `/ux/jobs/${encodeURIComponent(linkedDesignId)}` }, 'View decision'),
+        ));
+      } else if (!q) {
+        body.appendChild(h('div', { className: 'aq-empty-context' }, 'No question has been recorded. The asker needs to add the question before it can be answered.'));
+        return;
+      }
+
+      const panes = h('div', { className: linkedDesign ? 'aq-panes aq-reading' : 'aq-panes' });
 
       // ---- Left: the context the asker supplied. ----
-      const ctx = meta('context_md');
+      const ctx = meta('context_md') ||
+        (linkedDesign && linkedDesign.metadata && typeof linkedDesign.metadata.markdown === 'string' ? linkedDesign.metadata.markdown : '') ||
+        meta('description');
       const ctxPane = h('div', { className: 'aq-context' });
       if (ctx) {
         const inner = h('div', { className: 'aq-context-inner' });
@@ -393,29 +448,25 @@
       }
       panes.appendChild(ctxPane);
 
+      if (linkedDesign) {
+        body.appendChild(panes);
+        return;
+      }
+
       // ---- Right: the decision. ----
       const rail = h('div', { className: 'aq-rail' });
 
-      // A feedback packet rarely carries a `question` key — the filed
-      // message is the question. Chain, never blank.
-      const q = meta('question') || meta('message') || meta('body');
-      rail.appendChild(
-        h('div', { className: 'aq-card' },
-          h('span', { className: 'aq-label' }, 'The question'),
-          h('div', { className: 'aq-question' }, q || '(no question recorded)'),
-        ),
-      );
-
       const ta = h('textarea', {
         rows: 6,
-        placeholder: 'What you decided, and why…',
+        'aria-label': 'Your answer',
+        placeholder: 'Your answer, and any reasoning the asker needs…',
         disabled: isDone,
       });
       ta.value = answer;
       ta.addEventListener('input', (e) => { answer = e.target.value; refreshActions(); });
 
       const verdictRow = h('div', { className: 'aq-verdicts' });
-      VERDICTS.forEach((v) => {
+      verdictChoices().forEach((v) => {
         const b = h('button', {
           type: 'button',
           className: `aq-verdict aq-${v.key}${verdict === v.key ? ' is-on' : ''}`,
@@ -483,6 +534,7 @@
     }
 
     async function submit() {
+      if (loading || detailsFailed || linkedDesign || saving) return;
       saving = true; error = null; refreshActions();
       try {
         // 1. Merge ONLY the keys this surface owns. The old idiom sent
@@ -518,18 +570,28 @@
       }
     }
 
-    (async () => {
+    async function loadDetails() {
+      loading = true;
+      detailsFailed = false;
+      render();
       try {
         const r = await fetch(`/api/jobs/${jobId}`);
-        if (r.ok) job = await r.json();
+        if (!r.ok) throw new Error('Question read refused');
+        job = await r.json();
+        linkedDesignId = decisionReference();
+        linkedDesign = null;
+        if (linkedDesignId && !isDone) {
+          const decision = await fetch(`/api/jobs/${encodeURIComponent(linkedDesignId)}`);
+          if (!decision.ok) throw new Error('Decision read refused');
+          linkedDesign = await decision.json();
+        }
       } catch (e) {
-        // The question and context live on the Job; without it the
-        // surface can still record an answer, so degrade rather than
-        // block.
-        console.warn('[answer-question] job fetch failed:', e);
+        detailsFailed = true;
       }
+      loading = false;
       render();
-    })();
+    }
+    loadDetails();
 
     return () => container.replaceChildren();
   }

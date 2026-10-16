@@ -86,6 +86,8 @@ boss_testing::adapters_agree! {
         a_move_that_goes_nowhere_refuses_its_whole_batch,
         crossings_count_each_route_in_the_window_and_an_exit_by_its_off_ramp,
         crossings_are_off_the_map_first_then_byte_order,
+        dispatch_context_is_conserved_and_missing_context_stays_distinct,
+        a_misbound_dispatch_context_refuses_the_whole_batch,
     }
 }
 
@@ -161,6 +163,7 @@ fn at(m: u32, s: u32) -> DateTime<Utc> {
 
 fn moved(n: u128, packet: &str, from: Option<&str>, to: Option<&str>) -> Move {
     Move {
+        dispatch: None,
         at: at(0, n as u32),
         packet: packet.into(),
         kind: "pr-train".into(),
@@ -196,6 +199,9 @@ fn route(
 ) -> RouteCount {
     let own = |s: Option<&str>| s.map(str::to_string);
     RouteCount {
+        lineage: None,
+        dispatch: None,
+        declared: None,
         from: own(ends.0),
         to: own(ends.1),
         kind: own(by.0),
@@ -206,6 +212,85 @@ fn route(
 }
 
 // ----- cases -----------------------------------------------------------------
+
+async fn dispatch_context_is_conserved_and_missing_context_stays_distinct<L: Logged>(
+    l: &L,
+    adapter: &str,
+) {
+    use boss_jobs::moves::DispatchContext;
+    let store = l.moves();
+    let mut known = moved(1, "run-1", Some("shed"), Some("shop-floor"));
+    known.kind = "agent-run".into();
+    known.lineage = Some("packet".into());
+    known.handoff_from = Some("car-1".into());
+    known.dispatch = Some(DispatchContext::Registered {
+        run: known.packet.clone(),
+        parent: "car-1".into(),
+        step_id: "step-1".into(),
+        source_kind: "ship-a-change".into(),
+        source_version: 9,
+        source_step: "landed-review".into(),
+    });
+    let mut unknown = known.clone();
+    unknown.cause_event_id = Uuid::from_u128(2);
+    unknown.cause_seq = 2;
+    unknown.dispatch = None;
+    let mut refused = known.clone();
+    refused.cause_event_id = Uuid::from_u128(3);
+    refused.cause_seq = 3;
+    refused.dispatch = Some(DispatchContext::Refused {
+        why: "unregistered original".into(),
+    });
+    let originals = vec![known, unknown, refused];
+    store.record(&originals).await.unwrap();
+    store.record(&originals).await.unwrap();
+    assert_eq!(
+        rows_of(&store.since(0, 10).await.unwrap()),
+        originals,
+        "{adapter}: original rows and replay"
+    );
+    let counts = store.crossings(at(0, 0)).await.unwrap();
+    assert_eq!(
+        counts.len(),
+        3,
+        "{adapter}: context groups must not collapse"
+    );
+    assert_eq!(counts.iter().map(|c| c.moves).sum::<i64>(), 3);
+    for original in &originals {
+        assert_eq!(
+            counts
+                .iter()
+                .filter(|c| c.dispatch == original.dispatch
+                    && c.lineage == original.lineage
+                    && c.kind.as_deref() == Some("agent-run"))
+                .count(),
+            1,
+            "{adapter}: each exact context retained"
+        );
+    }
+}
+
+async fn a_misbound_dispatch_context_refuses_the_whole_batch<L: Logged>(l: &L, adapter: &str) {
+    use boss_jobs::moves::DispatchContext;
+    let valid = moved(1, "car-1", Some("dock"), Some("gates"));
+    let mut forged = moved(2, "run-1", Some("shed"), Some("shop-floor"));
+    forged.dispatch = Some(DispatchContext::Registered {
+        run: "other-run".into(),
+        parent: "car-1".into(),
+        step_id: "step-1".into(),
+        source_kind: "ship-a-change".into(),
+        source_version: 9,
+        source_step: "landed-review".into(),
+    });
+    assert!(
+        l.moves().record(&[valid, forged]).await.is_err(),
+        "{adapter}: misbound proof refused"
+    );
+    assert!(
+        l.moves().since(0, 10).await.unwrap().is_empty(),
+        "{adapter}: refusal is atomic"
+    );
+}
 
 async fn an_empty_record_has_no_moves_and_no_seq<L: Logged>(l: &L, adapter: &str) {
     let m = l.moves();

@@ -1049,23 +1049,17 @@ mod tests {
         // `executor_for` already treats an unknown kind as
         // decision-shaped so the verdict still reaches a person.
         //
-        // Named rather than silently skipped. An exemption nobody can
-        // see is how a rule stops covering what it was written for, so a
-        // SECOND unregistered kind is a decision that lands in a diff —
-        // and the entry is checked for staleness both ways, the same
-        // discipline `the-live-protocols-are-the-authored-protocols.sh`
-        // applies to its own list.
-        //
-        // THE SECOND, decided 2026-09-24 (backlog 59d15039): `incident`'s
-        // review step declares `incident-review` for the same reason —
-        // the surface lays the packet's findings and every step's
-        // answers out as one document, and registered against `task` it
-        // would mount on every task step. It authors no `fields`: the
-        // review is an attestation, and the step's `human_only`
-        // declaration (enforced at assignment) plus `completed_by` IS
-        // its record — the same contract incident-post-mortem's bare
-        // `task` review had, which this protocol replaced.
-        const PLUGIN_ONLY_KINDS: [&str; 2] = ["correction-verdict", "incident-review"];
+        // An attestation-only plugin may instead declare human_only:
+        // its presence-checked completion is the record (incident-review).
+        // The active plugin bundle is the authority for plugin-only kinds.
+        // A separate exemption list would make every new data-owned surface
+        // change core again. Its completion contract stays on the Workflow.
+        let plugins = crate::seed_loader::load_step_plugins(
+            crate::step_plugin_seed::platform_step_plugins_path(),
+        )
+        .expect("the platform step-plugin bundle parses");
+        let plugin_kinds: std::collections::HashSet<&str> =
+            plugins.iter().map(|plugin| plugin.kind.as_str()).collect();
 
         let reg = StepRegistry::v1();
         let defined: std::collections::HashSet<&str> = reg.all().iter().map(|t| t.kind).collect();
@@ -1073,14 +1067,23 @@ mod tests {
         let specs = crate::registry::seedable_platform_workflows();
         assert!(!specs.is_empty(), "an empty set would prove nothing");
         let mut missing: Vec<(String, String)> = Vec::new();
-        let mut seen_exempt: Vec<&str> = Vec::new();
         for spec in &specs {
             for step in &spec.steps {
                 if defined.contains(step.kind.as_str()) {
                     continue;
                 }
-                if let Some(k) = PLUGIN_ONLY_KINDS.iter().find(|k| **k == step.kind.as_str()) {
-                    seen_exempt.push(k);
+                if plugin_kinds.contains(step.kind.as_str()) {
+                    assert!(
+                        !step.fields.is_empty()
+                            || step
+                                .metadata_defaults
+                                .get("human_only")
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(true),
+                        "{} / {}: a plugin-only kind needs inline completion fields or a human attestation",
+                        spec.kind,
+                        step.title
+                    );
                     continue;
                 }
                 missing.push((spec.kind.clone(), step.kind.clone()));
@@ -1090,21 +1093,8 @@ mod tests {
             missing.is_empty(),
             "platform Workflows reference undefined StepType kinds: {missing:?} — define \
              each in StepRegistry::v1(), or, if it exists only to mount a StepPlugin whose \
-             contract is the step's own `fields`, add it to PLUGIN_ONLY_KINDS above with why"
+             contract is the step's own `fields`, declare its row in the platform plugin bundle"
         );
-        for kind in PLUGIN_ONLY_KINDS {
-            assert!(
-                !defined.contains(kind),
-                "`{kind}` is in the StepType registry now — drop it from \
-                 PLUGIN_ONLY_KINDS, or the exemption silently excuses the next \
-                 unregistered kind of that name"
-            );
-            assert!(
-                seen_exempt.contains(&kind),
-                "no platform Workflow declares a `{kind}` step any more — drop it from \
-                 PLUGIN_ONLY_KINDS"
-            );
-        }
     }
 
     #[test]

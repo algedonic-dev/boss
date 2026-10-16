@@ -204,6 +204,17 @@ async fn fixture() -> (
     SelectionContext,
     NativeSelectionStore,
 ) {
+    let (db, repo, context, native, _) = fixture_with_ingress_time().await;
+    (db, repo, context, native)
+}
+
+async fn fixture_with_ingress_time() -> (
+    boss_testing::TestDb,
+    PgJobs,
+    SelectionContext,
+    NativeSelectionStore,
+    std::time::Instant,
+) {
     let db = boss_testing::TestDb::new().await;
     let native = NativeSelectionStore::new(db.pool.clone());
     let repo = PgJobs::for_native_selection(native.clone());
@@ -327,8 +338,15 @@ async fn fixture() -> (
         .map(|workflow| (workflow.kind.clone(), workflow))
         .collect();
     let request_id = uuid::Uuid::new_v4();
+    let ingress = ingress().await;
+    let ingress_started = ingress.started();
     let context = SelectionContext {
-        native_authority: Some(prepared(&repo, request_id).await),
+        native_authority: Some(Arc::new(
+            repo.prepare_native_selection(ingress, request_id, "claim-fixture")
+                .await
+                .unwrap()
+                .unwrap(),
+        )),
         actor_observation: None,
         prepared_policy: None,
         definition_fence: None,
@@ -339,7 +357,7 @@ async fn fixture() -> (
         validated_job: job.clone(),
         validated_step: step.clone(),
     };
-    (db, repo, context, native)
+    (db, repo, context, native, ingress_started)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1172,9 +1190,136 @@ async fn corrupt_owned_actor_in_the_audit_receipt_refuses_rebuild_without_changi
     );
 }
 
+async fn selection_effects(pool: &sqlx::PgPool) -> serde_json::Value {
+    sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+            'jobs', (SELECT coalesce(jsonb_agg(to_jsonb(j) ORDER BY id), '[]') FROM jobs j),
+            'steps', (SELECT coalesce(jsonb_agg(to_jsonb(s) ORDER BY id), '[]') FROM steps s),
+            'receipts', (SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY request_id), '[]') FROM station_claim_receipts r),
+            'outbox', (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY id), '[]') FROM event_outbox e))",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+fn bounded_selection_refusal(error: &boss_jobs::port::JobsError) -> Option<&'static str> {
+    use boss_jobs::port::JobsError;
+    match error {
+        JobsError::Storage(message)
+            if matches!(
+                message.as_str(),
+                "error returned from database: canceling statement due to lock timeout"
+                    | "error returned from database: canceling statement due to statement timeout"
+                    | "pre-commit statement budget expired"
+            ) =>
+        {
+            Some("sql-budget")
+        }
+        JobsError::SelectionConflict(message)
+            if message == "selection ingress deadline expired before commit dispatch" =>
+        {
+            Some("ingress-budget")
+        }
+        _ => None,
+    }
+}
+
+#[test]
+fn contention_refusal_does_not_accept_unrelated_errors_or_the_wrong_variant() {
+    use boss_jobs::port::JobsError;
+    for error in [
+        JobsError::SelectionConflict("native current read identity or scope changed".into()),
+        JobsError::Storage("connection closed".into()),
+        JobsError::Storage("selection ingress deadline expired before commit dispatch".into()),
+        JobsError::SelectionConflict("pre-commit statement budget expired".into()),
+        JobsError::Storage("not a lock timeout".into()),
+    ] {
+        assert_eq!(bounded_selection_refusal(&error), None, "{error:?}");
+    }
+}
+
+async fn fresh_request_can_claim_after_refusal(repo: &PgJobs, context: &SelectionContext) {
+    // This is a distinct authenticated request after a proven non-mutating
+    // refusal, not a renewed deadline or uncertain-commit retry of the first.
+    let mut fresh = context.clone();
+    fresh.request_id = uuid::Uuid::new_v4();
+    fresh.native_authority = Some(prepared(repo, fresh.request_id).await);
+    let stamp = boss_core::publisher::EventStamp::new(
+        "jobs",
+        boss_core::actor::ActorId::automation("ops-runner"),
+    );
+    let SelectionResult::Claimed { step, receipt } = repo
+        .claim_station_head_at(&fresh, ACTOR, &[], &stamp, &[])
+        .await
+        .unwrap()
+    else {
+        panic!("the newly authenticated request must claim after the lock is released")
+    };
+    assert_eq!(step.id, context.validated_step.id);
+    assert_eq!(step.status, StepStatus::Active);
+    assert_eq!(
+        repo.station_claim_receipt(fresh.request_id).await.unwrap(),
+        Some(receipt)
+    );
+    assert!(
+        repo.station_claim_receipt(context.request_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn original_ingress_expiration_refuses_without_dispatching_the_contended_claim() {
+    let (db, repo, context, _, ingress_started) = fixture_with_ingress_time().await;
+    let before = selection_effects(&db.pool).await;
+    let mut held = db.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE jobs, steps IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    // Retain the authenticated ingress, including time already spent before
+    // the repository call. This must never become a new five-second budget.
+    tokio::time::sleep(
+        boss_jobs::station_claim::SELECTION_PRE_COMMIT_BUDGET
+            + std::time::Duration::from_millis(100),
+    )
+    .await;
+    let stamp = boss_core::publisher::EventStamp::new(
+        "jobs",
+        boss_core::actor::ActorId::automation("ops-runner"),
+    );
+    let started = std::time::Instant::now();
+    let refused = repo
+        .claim_station_head_at(&context, ACTOR, &[], &stamp, &[])
+        .await;
+    eprintln!(
+        "expired original ingress actual_error={:?}; elapsed={:?}; original_ingress_age={:?}",
+        refused.as_ref().err(),
+        started.elapsed(),
+        ingress_started.elapsed()
+    );
+    let error = refused
+        .err()
+        .expect("an expired ingress cannot claim or replay");
+    assert_eq!(
+        bounded_selection_refusal(&error),
+        Some("ingress-budget"),
+        "{error:?}"
+    );
+    assert!(ingress_started.elapsed() >= boss_jobs::station_claim::SELECTION_PRE_COMMIT_BUDGET);
+    // Do not add another wallclock race: exact pre-dispatch expiry and the
+    // retained rows prove refusal without relying on a sub-second scheduler.
+    held.rollback().await.unwrap();
+    assert_eq!(selection_effects(&db.pool).await, before);
+    fresh_request_can_claim_after_refusal(&repo, &context).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn contention_refuses_with_a_bounded_wait_and_leaves_the_step_and_receipt_untouched() {
-    let (db, repo, context, _) = fixture().await;
+    let (db, repo, context, _, ingress_started) = fixture_with_ingress_time().await;
+    let before = selection_effects(&db.pool).await;
     let mut held = db.pool.begin().await.unwrap();
     sqlx::query("LOCK TABLE jobs, steps IN SHARE ROW EXCLUSIVE MODE")
         .execute(&mut *held)
@@ -1189,19 +1334,25 @@ async fn contention_refuses_with_a_bounded_wait_and_leaves_the_step_and_receipt_
         .claim_station_head_at(&context, ACTOR, &[], &stamp, &[])
         .await;
     let elapsed = started.elapsed();
-    let Err(boss_jobs::port::JobsError::Storage(message)) = refused else {
-        panic!("contention must refuse instead of selecting without its fence")
-    };
+    eprintln!(
+        "selection contention actual_error={:?}; elapsed={elapsed:?}; original_ingress_age={:?}",
+        refused.as_ref().err(),
+        ingress_started.elapsed()
+    );
+    let error = refused
+        .err()
+        .expect("contention must refuse instead of selecting without its fence");
+    // SQL's remaining statement timeout and the outer absolute ingress timeout
+    // guard the same operation. Either can report its own exact refusal first.
     assert!(
-        message.contains("lock timeout")
-            || message.contains("statement timeout")
-            || message.contains("budget expired"),
-        "refusal must name actual lock contention: {message}"
+        bounded_selection_refusal(&error).is_some(),
+        "refusal must name its actual bounded wait: {error:?}"
     );
     assert!(elapsed >= std::time::Duration::from_millis(1500));
     assert!(elapsed < std::time::Duration::from_millis(5700));
     eprintln!("selection lock refusal elapsed={elapsed:?}; actual total ingress budget is 5s");
     held.commit().await.unwrap();
+    assert_eq!(selection_effects(&db.pool).await, before);
     assert_eq!(
         repo.get_step(&context.validated_step.id)
             .await
@@ -1215,6 +1366,7 @@ async fn contention_refuses_with_a_bounded_wait_and_leaves_the_step_and_receipt_
             .unwrap()
             .is_none()
     );
+    fresh_request_can_claim_after_refusal(&repo, &context).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -15,9 +15,14 @@
 //!
 //! THE SHAPES THIS HOLDS.
 //!
-//!   1. Every file under `crates/` that calls `axum::serve(` outside its
-//!      `#[cfg(test)]` region calls `machine_gate::mount(` at least as
-//!      many times — or is named in [`UNGATED`] with the reason. A file
+//!   1. Known serving calls and unaccounted TCP binds outside test items
+//!      are inventoried through Rust syntax. A served app must have its
+//!      own lexical mount relationship — a neighbouring mount is no
+//!      proof — or the listener is named in [`UNGATED`] with the reason.
+//!      Opaque macro serving syntax refuses rather than inventing that
+//!      relationship. This is a source pin, not complete runtime listener
+//!      ownership evidence; design2afd8e21 owns that separate observation.
+//!      A file
 //!      its parent declares only as `#[cfg(test)] mod …;` is all test
 //!      region (`test_only_modules`).
 //!   2. Every mount names its service by its `boss-ports` name, so the
@@ -49,6 +54,516 @@ use std::path::{Path, PathBuf};
 use boss_core::machine_gate::UNGATED;
 
 const ROLE_SERVER_ADAPTER: &str = "crates/core/boss-policy-client/src/role_service.rs";
+mod server_gate_scan;
+
+#[test]
+fn serving_an_app_requires_its_own_unshadowed_mount() {
+    let good = "fn main() { let app = machine_gate::mount(app); axum::serve(listener, app); }";
+    assert!(server_gate_scan::scan(good).unwrap()[0].gated);
+    for source in [
+        "fn main() { let mut app = machine_gate::mount(app); { let mut app = other; replace(&mut app); } axum::serve(listener, app); }",
+        "fn main() { let mut app = machine_gate::mount(app); replace(&mut app); let app = machine_gate::mount(app); axum::serve(listener, app); }",
+    ] {
+        assert!(server_gate_scan::scan(source).unwrap()[0].gated);
+    }
+
+    for source in [
+        "fn main() { let app = Router::new(); { let app = machine_gate::mount(app); } axum::serve(listener, app); }",
+        "fn main() { let app = machine_gate::mount(app); let app = Router::new(); axum::serve(listener, app); }",
+        "fn main() { let app = machine_gate::mount(app); axum::serve(listener, other); }",
+        "fn main() { let mut app = machine_gate::mount(app); app = Router::new(); axum::serve(listener, app); }",
+        "fn main() { let app = machine_gate::mount(app); axum_server::bind(addr).serve(other); }",
+        "fn main() { let app = machine_gate::mount(app); let f = |app| { axum::serve(listener, app); }; }",
+        "fn main() { let app = machine_gate::mount(app); for app in others { axum::serve(listener, app); } }",
+        "fn main() { let app = machine_gate::mount(app); if let Some(app) = other { axum::serve(listener, app); } }",
+        "fn main() { let mut app = machine_gate::mount(app); replace(&mut app); axum::serve(listener, app); }",
+        "fn main() { let mut app = machine_gate::mount(app); { app = other; } axum::serve(listener, app); }",
+        "fn main() { let mut app = machine_gate::mount(app); if condition { replace(&mut app); } axum::serve(listener, app); }",
+        "use axum::serve as http; fn endpoint() { let app = machine_gate::mount(app); let http = other; http(listener, app); }",
+    ] {
+        assert!(
+            !server_gate_scan::scan(source).unwrap()[0].gated,
+            "unguarded served app: {source}"
+        );
+    }
+}
+
+#[test]
+fn the_private_tenant_callback_is_explicitly_classified() {
+    let rows = private_listeners(&repo_root());
+    let row = rows
+        .iter()
+        .find(|u| u.file == "crates/tenants/boss-brewery-engine/src/lib.rs")
+        .expect("the inventoried callback needs an explicit bounded classification");
+    assert_eq!(row.function, "private_callback_listener");
+    let nested = server_gate_scan::scan(
+        "mod foreign { fn private_callback_listener() { std::net::TcpListener::bind(addr); } }",
+    )
+    .unwrap();
+    assert_ne!(
+        row.function, nested[0].function,
+        "a same-named function in another module is not the callback"
+    );
+}
+
+#[test]
+fn pattern_bindings_cannot_inherit_an_outer_mount() {
+    let mut wrong = Vec::new();
+    for (source, expected) in [
+        (
+            "fn main() { let app = machine_gate::mount(app); let (app,) = (ungated,); axum::serve(listener, app); }",
+            vec![false],
+        ),
+        (
+            "fn main() { let app = machine_gate::mount(app); let State { app } = ungated; axum::serve(listener, app); }",
+            vec![false],
+        ),
+        (
+            "fn main() { let app = machine_gate::mount(app); let [app] = ungated; axum::serve(listener, app); }",
+            vec![false],
+        ),
+        (
+            "fn main() { let app = machine_gate::mount(app); match ungated { app => { axum::serve(listener, app); } } }",
+            vec![false],
+        ),
+        (
+            "fn main() { let app = machine_gate::mount(app); axum::serve(listener, app); }",
+            vec![true],
+        ),
+        (
+            "fn main() { let app = machine_gate::mount(app); let (app,) = (ungated,); let app = machine_gate::mount(app); axum::serve(listener, app); }",
+            vec![true],
+        ),
+        (
+            "fn main() { let app = machine_gate::mount(app); { let (app,) = (ungated,); axum::serve(listener, app); } axum::serve(listener, app); }",
+            vec![false, true],
+        ),
+        (
+            "fn main() { let app = machine_gate::mount(app); match ungated { Some(app) => axum::serve(listener, app), _ => axum::serve(listener, app) } axum::serve(listener, app); }",
+            vec![false, true, true],
+        ),
+        (
+            "fn main() { let mut app = machine_gate::mount(app); match other { _ => { app = ungated; } } axum::serve(listener, app); }",
+            vec![false],
+        ),
+        (
+            "fn main() { let app = machine_gate::mount(app); while let Some(app) = other { axum::serve(listener, app); } axum::serve(listener, app); }",
+            vec![false, true],
+        ),
+        (
+            "fn main() { let app = machine_gate::mount(app); let app = { axum::serve(listener, app); ungated }; axum::serve(listener, app); }",
+            vec![true, false],
+        ),
+        (
+            "fn main() { let app = machine_gate::mount(app); let Some(app) = other else { axum::serve(listener, app); return; }; axum::serve(listener, app); }",
+            vec![true, false],
+        ),
+    ] {
+        let actual = server_gate_scan::scan(source)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.gated)
+            .collect::<Vec<_>>();
+        if actual != expected {
+            wrong.push((source, actual, expected));
+        }
+    }
+    assert!(wrong.is_empty(), "false pattern provenance: {wrong:#?}");
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateListener {
+    file: String,
+    function: String,
+    bound: String,
+    why: String,
+}
+
+fn private_listeners(root: &Path) -> Vec<PrivateListener> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Inventory {
+        version: u32,
+        engine_crate: String,
+        private_listener: Vec<PrivateListener>,
+    }
+    let mut rows = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(root.join("crates/tenants")).unwrap() {
+        let entry = entry.unwrap();
+        if !entry.file_type().unwrap().is_dir() {
+            continue;
+        }
+        let file = entry.path().join("listener-inventory.toml");
+        let metadata = match std::fs::symlink_metadata(&file) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("cannot read listener inventory {}: {error}", file.display()),
+        };
+        assert!(
+            metadata.file_type().is_file(),
+            "inventory must be a regular file"
+        );
+        let inventory: Inventory =
+            toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(inventory.version, 1);
+        assert!(
+            inventory.engine_crate.starts_with("boss-")
+                && inventory
+                    .engine_crate
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        );
+        assert_eq!(
+            entry.file_name().to_str().unwrap(),
+            inventory.engine_crate,
+            "inventory belongs to its own tenant crate"
+        );
+        let prefix = format!("crates/tenants/{}/src/", inventory.engine_crate);
+        for row in inventory.private_listener {
+            assert!(
+                row.file.starts_with(&prefix)
+                    && !Path::new(&row.file)
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+            );
+            assert!(
+                !row.function.is_empty()
+                    && row
+                        .function
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            );
+            assert_eq!(row.bound, "loopback");
+            assert!(!row.why.trim().is_empty());
+            assert!(
+                seen.insert((row.file.clone(), row.function.clone())),
+                "duplicate listener declaration"
+            );
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+#[test]
+fn private_inventory_cannot_excuse_other_owners_or_bounds() {
+    for (owner, file, bound) in [
+        (
+            "boss-other",
+            "crates/tenants/boss-other/src/lib.rs",
+            "loopback",
+        ),
+        (
+            "boss-engine",
+            "crates/core/boss-core/src/lib.rs",
+            "loopback",
+        ),
+        (
+            "boss-engine",
+            "crates/tenants/boss-other/src/lib.rs",
+            "loopback",
+        ),
+        (
+            "boss-engine",
+            "crates/tenants/boss-engine/src/../lib.rs",
+            "loopback",
+        ),
+        (
+            "boss-engine",
+            "crates/tenants/boss-engine/src/lib.rs",
+            "LAN",
+        ),
+    ] {
+        let root = boss_testing::scratch_dir("private-listener-owner");
+        std::fs::create_dir_all(root.join("crates/tenants/boss-engine")).unwrap();
+        let document = format!(
+            "version = 1\nengine_crate = {owner:?}\n[[private_listener]]\nfile = {file:?}\nfunction = \"callback\"\nbound = {bound:?}\nwhy = \"fixture\"\n"
+        );
+        std::fs::write(
+            root.join("crates/tenants/boss-engine/listener-inventory.toml"),
+            document,
+        )
+        .unwrap();
+        assert!(std::panic::catch_unwind(|| private_listeners(&root)).is_err());
+    }
+}
+
+#[test]
+fn alternate_listener_forms_cannot_disappear_from_the_inventory() {
+    for source in [
+        "use axum::serve; fn main() { serve(listener, app); }",
+        "fn endpoint() { http(listener, app); } use axum::serve as http;",
+        "fn endpoint() { http(listener, app); use axum::serve as http; }",
+        "use axum::{serve as http}; fn main() { http(listener, app); }",
+        "fn main() { axum_server::bind(addr).serve(app); }",
+        "fn main() { hyper::Server::bind(&addr).serve(app); }",
+        "fn callback() { let listener = std::net::TcpListener::bind(addr); }",
+        "use std::net::TcpListener as Listener; fn callback() { Listener::bind(addr); }",
+        "fn main() { fn hidden() { std::net::TcpListener::bind(addr); } }",
+    ] {
+        assert_eq!(server_calls("service.rs", source), 1, "missing {source}");
+    }
+}
+
+#[test]
+fn literal_macro_text_is_not_a_listener_and_a_foreign_mount_proves_nothing() {
+    assert_eq!(
+        server_calls(
+            "service.rs",
+            "fn main() { tracing::info!(\"axum::serve(\"); }"
+        ),
+        0
+    );
+    let foreign =
+        "fn main() { let app = other::machine_gate::mount(app); axum::serve(listener, app); }";
+    assert!(!server_gate_scan::scan(foreign).unwrap()[0].gated);
+}
+
+#[test]
+fn mount_calls_require_unshadowed_lexical_imports() {
+    let prefix = "use boss_core::machine_gate::mount as gate;";
+    for (body, expected) in [
+        (
+            "fn main() { let app = gate(app); axum::serve(listener, app); }",
+            vec![true],
+        ),
+        (
+            "fn main() { let gate = |app| app; let app = gate(app); axum::serve(listener, app); }",
+            vec![false],
+        ),
+        (
+            "fn main() { let (gate,) = (identity,); let app = gate(app); axum::serve(listener, app); }",
+            vec![false],
+        ),
+        (
+            "fn main(gate: F) { let app = gate(app); axum::serve(listener, app); }",
+            vec![false],
+        ),
+        (
+            "fn main((gate,): (F,)) { let app = gate(app); axum::serve(listener, app); }",
+            vec![false],
+        ),
+        (
+            "impl Service { fn run(gate: F) { let app = gate(app); axum::serve(listener, app); } }",
+            vec![false],
+        ),
+        (
+            "fn main() { fn run(gate: F) { let app = gate(app); axum::serve(listener, app); } }",
+            vec![false],
+        ),
+        (
+            "fn main() { let run = |gate| { let app = gate(app); axum::serve(listener, app); }; let app = gate(app); axum::serve(listener, app); }",
+            vec![false, true],
+        ),
+        (
+            "fn main() { match identity { gate => { let app = gate(app); axum::serve(listener, app); } } let app = gate(app); axum::serve(listener, app); }",
+            vec![false, true],
+        ),
+        (
+            "fn main() { { let gate = identity; let app = gate(app); axum::serve(listener, app); } let app = gate(app); axum::serve(listener, app); }",
+            vec![false, true],
+        ),
+        (
+            "fn main() { let gate = { let app = gate(app); axum::serve(listener, app); identity }; let app = gate(app); axum::serve(listener, app); }",
+            vec![true, false],
+        ),
+        (
+            "fn main() { let app = gate(app); axum::serve(listener, app); fn gate(app: App) -> App { app } }",
+            vec![false],
+        ),
+    ] {
+        let source = format!("{prefix} {body}");
+        let actual: Vec<_> = server_gate_scan::scan(&source)
+            .unwrap()
+            .iter()
+            .map(|s| s.gated)
+            .collect();
+        assert_eq!(actual, expected, "mount identity differs: {source}");
+    }
+}
+
+#[test]
+fn nested_functions_inherit_items_without_capturing_local_values() {
+    mod lexical {
+        fn original(app: u8) -> u8 {
+            app + 1
+        }
+        use original as gate;
+        pub fn observed() -> (u8, u8) {
+            fn gate(app: u8) -> u8 {
+                app
+            }
+            fn run(app: u8) -> u8 {
+                gate(app)
+            }
+            (self::gate(7), run(7))
+        }
+    }
+    assert_eq!(lexical::observed(), (8, 7));
+    for (body, expected) in [
+        (
+            "fn main() { fn gate(app: App) -> App { app } fn run(app: App, listener: Listener) { let app = gate(app); axum::serve(listener, app); } }",
+            vec![false],
+        ),
+        (
+            "fn main() { fn run(app: App, listener: Listener) { let app = gate(app); axum::serve(listener, app); } fn gate(app: App) -> App { app } }",
+            vec![false],
+        ),
+        (
+            "fn main() { fn gate(app: App) -> App { app } fn outer() { fn run(app: App, listener: Listener) { let app = gate(app); axum::serve(listener, app); } } }",
+            vec![false],
+        ),
+        (
+            "fn main() { fn run(app: App, listener: Listener) { let app = gate(app); axum::serve(listener, app); } }",
+            vec![true],
+        ),
+        (
+            "fn main() { { fn gate(app: App) -> App { app } fn run(app: App, listener: Listener) { let app = gate(app); axum::serve(listener, app); } } fn run(app: App, listener: Listener) { let app = gate(app); axum::serve(listener, app); } }",
+            vec![false, true],
+        ),
+        (
+            "fn main() { let app = gate(app); fn run(listener: Listener) { axum::serve(listener, app); } }",
+            vec![false],
+        ),
+    ] {
+        let source = format!("use boss_core::machine_gate::mount as gate; {body}");
+        let actual: Vec<_> = server_gate_scan::scan(&source)
+            .unwrap()
+            .iter()
+            .map(|s| s.gated)
+            .collect();
+        assert_eq!(actual, expected, "nested item identity differs: {source}");
+    }
+}
+
+#[test]
+fn locally_declared_mount_namespaces_are_not_the_imported_gate() {
+    mod lexical {
+        mod original {
+            pub fn mount(app: u8) -> u8 {
+                app + 1
+            }
+        }
+        use original as machine_gate;
+        pub fn observed() -> (u8, u8, u8) {
+            mod machine_gate {
+                pub fn mount(app: u8) -> u8 {
+                    app
+                }
+            }
+            mod boss_core {
+                pub mod machine_gate {
+                    pub fn mount(app: u8) -> u8 {
+                        app
+                    }
+                }
+            }
+            (
+                self::machine_gate::mount(7),
+                machine_gate::mount(7),
+                boss_core::machine_gate::mount(7),
+            )
+        }
+    }
+    assert_eq!(lexical::observed(), (8, 7, 7));
+    mod imported_local {
+        mod machine_gate {
+            pub fn mount(app: u8) -> u8 {
+                app
+            }
+        }
+        use machine_gate::mount as gate;
+        pub fn observed() -> u8 {
+            gate(7)
+        }
+    }
+    assert_eq!(imported_local::observed(), 7);
+    for body in [
+        "fn main(app: App, listener: Listener) { mod machine_gate { pub fn mount(app: App) -> App { app } } let app = machine_gate::mount(app); axum::serve(listener, app); }",
+        "fn main(app: App, listener: Listener) { mod boss_core { pub mod machine_gate { pub fn mount(app: App) -> App { app } } } let app = boss_core::machine_gate::mount(app); axum::serve(listener, app); }",
+        "mod machine_gate { pub fn mount(app: App) -> App { app } } fn main(app: App, listener: Listener) { let app = machine_gate::mount(app); axum::serve(listener, app); }",
+        "mod boss_core { pub mod machine_gate { pub fn mount(app: App) -> App { app } } } fn main(app: App, listener: Listener) { let app = boss_core::machine_gate::mount(app); axum::serve(listener, app); }",
+        "mod machine_gate { pub fn mount<T>(app: T) -> T { app } } use machine_gate::mount as gate; fn main(app: App, listener: Listener) { let app = gate(app); axum::serve(listener, app); }",
+        "mod boss_core { pub mod machine_gate { pub fn mount<T>(app: T) -> T { app } } } use boss_core::machine_gate::mount as gate; fn main(app: App, listener: Listener) { let app = gate(app); axum::serve(listener, app); }",
+        "mod boss_core { pub mod machine_gate { pub fn mount<T>(app: T) -> T { app } } } use boss_core as core; fn main(app: App, listener: Listener) { let app = core::machine_gate::mount(app); axum::serve(listener, app); }",
+    ] {
+        let servers = server_gate_scan::scan(body).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert!(
+            !servers[0].gated,
+            "local namespace supplied gate provenance: {body}"
+        );
+    }
+}
+
+#[test]
+fn a_local_modules_import_cannot_change_the_enclosing_mount_identity() {
+    mod lexical {
+        fn original(app: u8) -> u8 {
+            app + 1
+        }
+        fn foreign(app: u8) -> u8 {
+            app
+        }
+        use foreign as gate;
+        pub fn observed() -> (u8, u8) {
+            mod helper {
+                use super::original as gate;
+                pub fn run(app: u8) -> u8 {
+                    gate(app)
+                }
+            }
+            (helper::run(7), gate(7))
+        }
+    }
+    assert_eq!(lexical::observed(), (8, 7));
+    for (source, expected) in [
+        (
+            "use foreign::mount as gate; fn main(app: App, listener: Listener) { mod helper { use boss_core::machine_gate::mount as gate; } let app = gate(app); axum::serve(listener, app); }",
+            false,
+        ),
+        (
+            "use boss_core::machine_gate::mount as gate; fn main(app: App, listener: Listener) { mod helper { use foreign::mount as gate; } let app = gate(app); axum::serve(listener, app); }",
+            true,
+        ),
+    ] {
+        let servers = server_gate_scan::scan(source).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers[0].gated, expected,
+            "module import escaped: {source}"
+        );
+    }
+}
+
+#[test]
+fn known_opaque_macro_servers_are_visible_but_unproved() {
+    for source in [
+        "fn main() { tokio::select! { _ = axum_server::bind(addr).serve(app) => {} } }",
+        "fn main() { tokio::select! { _ = hyper::Server::bind(&addr).serve(app) => {} } }",
+        "use axum::serve as http; fn main() { tokio::select! { _ = http(listener, app) => {} } }",
+    ] {
+        let servers = server_gate_scan::scan(source).unwrap();
+        assert_eq!(servers.len(), 1, "opaque server vanished: {source}");
+        assert!(!servers[0].gated, "macro expansion was not proven");
+    }
+}
+
+#[test]
+fn a_builder_must_be_the_known_transport_as_well_as_receive_the_mounted_app() {
+    for builder in ["axum_server::bind(addr)", "hyper::Server::bind(&addr)"] {
+        let source =
+            format!("fn main() {{ let app = machine_gate::mount(app); {builder}.serve(app); }}");
+        assert!(server_gate_scan::scan(&source).unwrap()[0].gated);
+    }
+    let unknown = "fn main() { let app = machine_gate::mount(app); unknown_transport.serve(app); }";
+    assert!(
+        !server_gate_scan::scan(unknown).unwrap()[0].gated,
+        "unknown adapter semantics must stay unproved"
+    );
+}
 
 /// The report transport serves its caller's finished app. Count the
 /// caller as the boundary that must mount the gate, and verify that the
@@ -61,8 +576,9 @@ fn server_calls(relative: &str, source: &str) -> usize {
         );
         return 0;
     }
-    source.matches("axum::serve(").count()
-        + source.matches("role_service::serve_with_refresh(").count()
+    server_gate_scan::scan(source)
+        .expect("server source parses")
+        .len()
 }
 
 fn transparent_role_transport(source: &str) -> bool {
@@ -173,30 +689,15 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The part of a source file before its first `#[cfg(test)]` that opens
-/// an inline module (`mod tests {`) — where a server is production code
-/// rather than a test's fixture. A `#[cfg(test)] mod name;` declaration
-/// does not open a region here (its file is judged by
-/// `test_only_modules`): cutting at the first `#[cfg(test)]` of any kind
-/// took the whole of the gateway's `main.rs` out of the scan the day it
-/// gained two at its top (2026-09-25).
-fn production_part(text: &str) -> &str {
-    let inline = Regex::new(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z0-9_]+\s*\{").unwrap();
-    let mut offset = 0;
-    let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    for (i, line) in lines.iter().enumerate() {
-        if let Some(rest) = line.trim().strip_prefix("#[cfg(test)]") {
-            let opens = std::iter::once(rest.trim())
-                .chain(lines[i + 1..].iter().map(|l| l.trim()))
-                .find(|l| !l.is_empty() && !l.starts_with("#["))
-                .is_some_and(|l| inline.is_match(l));
-            if opens {
-                return &text[..offset];
-            }
-        }
-        offset += line.len();
+/// Use the shared item-aware reader: test code disappears, production
+/// after it survives, and line numbers remain the source's own.
+fn production_part(text: &str) -> String {
+    let mut production =
+        boss_testing::production_source::production_text(text).expect("production source parses");
+    if text.ends_with('\n') {
+        production.push('\n');
     }
-    text
+    production
 }
 
 /// Every module a parent declares only under `#[cfg(test)]`, as the
@@ -270,7 +771,7 @@ fn mounts(root: &Path) -> BTreeMap<String, (String, Vec<String>)> {
     for f in files.iter().filter(|f| !is_test_file(&tests, f)) {
         let text = std::fs::read_to_string(f).unwrap_or_default();
         let rel = f.strip_prefix(root).unwrap().to_string_lossy().to_string();
-        for c in re.captures_iter(production_part(&text)) {
+        for c in re.captures_iter(&production_part(&text)) {
             let exempt = lit.captures_iter(&c[2]).map(|l| l[1].to_string()).collect();
             let prior = out.insert(c[1].to_string(), (rel.clone(), exempt));
             assert!(
@@ -293,24 +794,41 @@ fn every_server_outside_a_test_mounts_the_machine_gate() {
     let mut servers = 0;
     let mut offenders = Vec::new();
     let mut ungated_seen = Vec::new();
+    let private = private_listeners(&root);
+    let mut private_seen = vec![0; private.len()];
     for f in files.iter().filter(|f| !is_test_file(&tests, f)) {
         let rel = f.strip_prefix(&root).unwrap().to_string_lossy().to_string();
         let text = std::fs::read_to_string(f).unwrap_or_default();
         let prod = production_part(&text);
-        let serves = server_calls(&rel, prod);
+        let serves = server_calls(&rel, &prod);
         if serves == 0 {
             continue;
         }
         servers += 1;
-        if UNGATED.iter().any(|u| u.file == rel) {
-            ungated_seen.push(rel);
+        if rel == ROLE_SERVER_ADAPTER {
             continue;
         }
-        let gated = prod.matches("machine_gate::mount(").count();
-        if gated < serves {
-            offenders.push(format!(
-                "{rel}: {serves} axum::serve call(s), {gated} machine_gate::mount call(s)"
-            ));
+        for server in server_gate_scan::scan(&prod).expect("server inventory parses") {
+            if let Some(row) = UNGATED.iter().find(|u| u.file == rel) {
+                ungated_seen.push(row.file);
+            } else if let Some((index, row)) = private
+                .iter()
+                .enumerate()
+                .find(|(_, row)| row.file == rel && row.function == server.function)
+            {
+                assert_eq!(
+                    server.kind, "unaccounted TCP listener",
+                    "a private declaration cannot excuse another adapter: {}",
+                    row.why
+                );
+                assert_eq!(row.bound, "loopback");
+                private_seen[index] += 1;
+            } else if !server.gated {
+                offenders.push(format!(
+                    "{rel}: {}: {} has no proven mounted served app",
+                    server.function, server.kind
+                ));
+            }
         }
     }
     // A control: the scan found the servers it exists to judge. 27
@@ -328,12 +846,17 @@ fn every_server_outside_a_test_mounts_the_machine_gate() {
          or add the file to UNGATED with the reason:\n  {}",
         offenders.join("\n  ")
     );
-    for p in UNGATED.iter().map(|u| u.file) {
+    for row in UNGATED {
         assert!(
-            ungated_seen.iter().any(|s| s == p),
-            "UNGATED names {p}, which no longer serves HTTP outside its tests — delete the row"
+            ungated_seen.contains(&row.file),
+            "UNGATED names {}, which no longer serves outside its tests — delete the row",
+            row.file
         );
     }
+    assert!(
+        private_seen.iter().all(|count| *count == 1),
+        "each private function declaration must account for exactly one listener"
+    );
 }
 
 /// A module file whose parent declares it only under `#[cfg(test)]` is
@@ -445,7 +968,7 @@ fn every_mount_states_its_facts_on_the_log_or_says_why_not() {
         .filter(|f| !is_test_file(&tests, f))
         .flat_map(|f| {
             let text = std::fs::read_to_string(f).unwrap_or_default();
-            none.captures_iter(production_part(&text))
+            none.captures_iter(&production_part(&text))
                 .map(|c| c[1].to_string())
                 .collect::<Vec<_>>()
         })
@@ -499,7 +1022,7 @@ fn a_gated_binary_does_not_listen_for_sigterm() {
         let tests = test_only_modules(&files);
         for f in files.iter().filter(|f| !is_test_file(&tests, f)) {
             let text = std::fs::read_to_string(f).unwrap_or_default();
-            if sigterm.is_match(production_part(&text)) {
+            if sigterm.is_match(&production_part(&text)) {
                 offenders.push(f.strip_prefix(&root).unwrap().display().to_string());
             }
         }
@@ -524,7 +1047,7 @@ fn the_shared_role_shutdown_leaves_sigterm_to_gate_evidence() {
     assert!(sigterm.is_match("signal(SignalKind::terminate())"));
     assert!(!sigterm.is_match("tokio::signal::ctrl_c().await"));
     assert!(
-        !sigterm.is_match(production_part(&source)),
+        !sigterm.is_match(&production_part(&source)),
         "the shared role-report shutdown registers a second process termination owner"
     );
     assert!(source.contains("tokio::signal::ctrl_c().await"));

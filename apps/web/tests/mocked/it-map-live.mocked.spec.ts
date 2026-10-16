@@ -19,6 +19,7 @@
 // exactly once.
 
 import { expect, test, type Page, type Route } from './_test';
+import { holdClock } from './_clock';
 import { TRANSIT_MS, liveText } from '../../src/it/yard/live-motion';
 import { TRANSIT_KEY } from '../../src/it/yard/transit-choice';
 import { TERRITORIES } from '../../src/it/yard/world';
@@ -101,31 +102,6 @@ async function mocks(page: Page, flights: ReadonlyArray<string>, moves: Readonly
 
 const live = (page: Page) => page.locator('section.transit [data-live]');
 
-/** How far past NOW the held clock stands. It is only a lead over the
- *  blank page that exists before the first goto, whose installed clock
- *  runs in real time until pauseAt; a minute is the whole test's budget,
- *  so the two calls cannot fall that far apart. */
-const HELD_LEAD_MS = 60_000;
-
-/** Hold the page's clock from BEFORE the page loads, so a 700 ms ping is
- *  still there when the test looks and a dot's crossing starts at a
- *  time no scheduler can move — the clock moves only by runFor.
- *
- *  It used to pause AFTER the dot was drawn: read the page's Date.now(),
- *  then pauseAt(now + 10). Between those two calls the installed clock
- *  kept running in real time, so under load more than 10 ms passed and
- *  pauseAt refused ("clock.pauseAt: Cannot fast-forward to the past",
- *  seen at the crossing-choice test by the truncated-reads builder,
- *  2026-09-27); and every real millisecond between the dot's admission
- *  and the pause was eaten out of the 1 000 ms slack each crossing
- *  assertion leaves. Called before the goto, pauseAt is recorded and
- *  replayed on the page as it loads — the time SET to the held instant,
- *  not fast-forwarded to it — so neither race exists. */
-async function holdClock(page: Page): Promise<void> {
-  await page.clock.install({ time: new Date(NOW) });
-  await page.clock.pauseAt(new Date(NOW).getTime() + HELD_LEAD_MS);
-}
-
 test('flight OFF: no live layer, and the rate-replay blocks run as before', async ({ page }) => {
   await mocks(page, ['it-map-transit'], [move(1)]);
   await page.goto('/it');
@@ -136,7 +112,7 @@ test('flight OFF: no live layer, and the rate-replay blocks run as before', asyn
 });
 
 test('one move is one transit, then one ping — and the replay blocks are off', async ({ page }) => {
-  await holdClock(page);
+  await holdClock(page, new Date(NOW));
   await mocks(page, LIVE, [move(1)]);
   await page.goto('/it');
   const g = live(page);
@@ -208,7 +184,7 @@ test('a hidden tab draws nothing, then pings once per station with its count', a
     Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
     Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
   });
-  await holdClock(page);
+  await holdClock(page, new Date(NOW));
   await mocks(page, LIVE, [move(1), move(2), move(3, { from: 'gates', to: 'dock' })]);
   await page.goto('/it');
   const g = live(page);
@@ -287,7 +263,7 @@ test('storage the browser refuses is the default, and a choice still holds for t
 
 test('a dot takes the crossing the viewer chose', async ({ page }) => {
   await page.addInitScript((k) => localStorage.setItem(k, '6000'), TRANSIT_KEY);
-  await holdClock(page);
+  await holdClock(page, new Date(NOW));
   await mocks(page, LIVE, [move(1)]);
   await page.goto('/it');
   const g = live(page);

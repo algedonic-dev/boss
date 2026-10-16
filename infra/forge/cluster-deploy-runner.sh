@@ -541,6 +541,20 @@ SOURCE_NS=$("$REPO/infra/cluster/render-instance.sh" --source)
 # The source instance's row — its name and its tenant source — read
 # off the same list every other instance is read from.
 SOURCE_NAME=""; SOURCE_TENANT_REPO=""; SOURCE_TENANT_REF=""; SOURCE_TENANT_DIR=""; SOURCE_SITE=""
+# 31d76e37: dev work growth belongs to its exact-plan approval, never to
+# converge. Preserve the current bounded request in the staged PVC only;
+# every Deployment/template byte is unchanged. A dark/denied read aborts,
+# an absent claim keeps the reviewed 40Gi bootstrap, and >64Gi refuses.
+STAGE="preserve dev work volume request"
+$K get pvc boss-dev-work -n boss-dev --ignore-not-found=true -o json --request-timeout=20s \
+    > "$APPLY_DIR/dev-work-claim.json"
+python3 "$REPO/infra/forge/dev-work-volume.py" --render-converge \
+    "$RENDER_DIR/$SOURCE_NS/boss-dev.yaml" "$APPLY_DIR/dev-work-claim.json"
+if [ -s "$APPLY_DIR/dev-work-claim.json" ]; then
+    run_summary_json dev_work_claim "$(cat "$APPLY_DIR/dev-work-claim.json")"
+else
+    run_summary_json dev_work_claim '{"absent":true,"bootstrap":"40Gi"}'
+fi
 # The deposit template is generic; the deployment's existing ConfigMap
 # and CronJob are its authoritative nonsecret inputs (877ad378). Resolve
 # both before image staging or ANY apply. Record immutable read identities
@@ -1293,3 +1307,9 @@ if [ -n "$drift_line" ] && [ "$drift_rc" -eq 0 ]; then
 else
     run_summary_field registry_drift "the phase exited $drift_rc; last said: ${drift_line:-nothing}"
 fi
+
+# Agent publication is a separate purpose after all core convergence checks.
+# Failure refuses agent readiness, and never undoes or blocks BOSS delivery.
+. "$REPO/infra/agent/publication-stage.sh"
+STAGE="agent image publication"
+agent_image_publication_stage "$REPO/infra/agent/publish-image.sh" "$HEAD_FULL" "$CONVERGE_STATE"

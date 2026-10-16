@@ -113,6 +113,7 @@ pub(super) async fn yard_regions<R: JobsRepository + 'static, B: EventBus + 'sta
 /// rows, never a second set of queries free to disagree with them
 /// (which is the defect the regions read was built to end).
 pub(super) struct MapRows {
+    internal_protocols: Option<regions::PinnedProtocols>,
     read: super::yard::YardRead,
     closed_trains: Vec<(Job, Vec<Step>)>,
     cars: Vec<(Job, Vec<Step>)>,
@@ -232,6 +233,7 @@ impl MapRows {
         window_hours: i64,
     ) -> RegionInputs<'_> {
         RegionInputs {
+            internal_protocols: self.internal_protocols.as_ref(),
             status: &self.read.status,
             dock_reading: self.read.dock_reading,
             open_trains: &self.read.open_trains,
@@ -278,6 +280,7 @@ pub(super) async fn read_map<R: JobsRepository + 'static, B: EventBus + 'static>
     let scope = JobScope::from_predicate(user, &predicate);
     if matches!(scope, crate::port::JobScope::None) {
         return Ok(MapRows {
+            internal_protocols: Some(Default::default()),
             read: empty_read(),
             closed_trains: Vec::new(),
             cars: Vec::new(),
@@ -618,7 +621,13 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
     // query, one priority at a time, every page of each.
     let outranking = read_outranking(state, scope.clone(), open_packets.as_deref(), &active).await;
 
+    let internal_protocols = read_internal_protocols(
+        state.kind_registry.as_deref(),
+        cars.iter().map(|(job, _)| job).chain(gate_runs.iter()),
+    )
+    .await;
     Ok(MapRows {
+        internal_protocols,
         read,
         closed_trains,
         cars,
@@ -1057,9 +1066,9 @@ async fn marshalling_stations<R: JobsRepository + 'static, B: EventBus + 'static
                 let over_limit = bound
                     .wip_limit
                     .is_some_and(|l| members.len() as i64 > i64::from(l));
-                let served = crate::station_flow::station_flow(&spec.predicate, &cells_now)
-                    .ok()
-                    .map(|f| f.served);
+                let flow = crate::station_flow::station_flow(&spec.predicate, &cells_now);
+                let flow_blind = flow.as_ref().err().copied();
+                let served = flow.ok().map(|f| f.served);
                 let served_both = crate::station_flow::station_flow(&spec.predicate, &cells_both)
                     .ok()
                     .map(|f| f.served);
@@ -1068,6 +1077,7 @@ async fn marshalling_stations<R: JobsRepository + 'static, B: EventBus + 'static
                     over_limit,
                     members,
                     served,
+                    flow_blind,
                     previous_served: served.zip(served_both).map(|(w, b)| b - w),
                     opened,
                 })
@@ -1085,4 +1095,148 @@ fn with_now(map: regions::Regions, now: chrono::DateTime<chrono::Utc>) -> serde_
         obj.insert("now".to_string(), serde_json::json!(now));
     }
     v
+}
+
+async fn read_internal_protocols<'a>(
+    registry: Option<&dyn crate::registry::WorkflowRegistry>,
+    jobs: impl IntoIterator<Item = &'a Job>,
+) -> Option<regions::PinnedProtocols> {
+    let pinned = jobs
+        .into_iter()
+        .map(|job| (job.kind.clone(), job.workflow_version))
+        .collect::<std::collections::BTreeSet<_>>();
+    if pinned.is_empty() {
+        return Some(Default::default());
+    }
+    let registry = registry?;
+    let rows = futures::future::join_all(pinned.into_iter().map(async |(kind, version)| {
+        let reading = if version <= 0 {
+            Err(format!(
+                "{kind}@{version}: no exact pinned version; latest active is not a substitute"
+            ))
+        } else {
+            match registry.get_version(&kind, version).await {
+                Ok(spec) if spec.kind == kind && spec.version == version => Ok(spec),
+                Ok(_) => Err(format!(
+                    "{kind}@{version}: registry returned a different binding"
+                )),
+                Err(error) => Err(format!("{kind}@{version}: {error}")),
+            }
+        };
+        ((kind, version), reading)
+    }))
+    .await;
+    Some(rows.into_iter().collect())
+}
+
+#[cfg(test)]
+mod pinned_protocol_tests {
+    use super::*;
+    #[tokio::test]
+    async fn no_visible_packets_need_no_registry_but_required_packets_do() {
+        assert!(
+            read_internal_protocols(None, std::iter::empty::<&Job>())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let packet = Job::new(
+            "ship-a-change",
+            boss_core::job::Subject::new("custom", "subject"),
+            "review",
+            "owner",
+            boss_core::job::Priority::Standard,
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
+        );
+        assert!(read_internal_protocols(None, [&packet]).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unpinned_packet_cannot_resolve_to_the_active_protocol() {
+        let registry = crate::registry::InMemoryWorkflows::for_fixture();
+        registry
+            .seed(crate::registry::WorkflowSpec::platform_seed(
+                "ship-a-change",
+                "Change",
+                "platform",
+                vec!["custom".into()],
+                vec![],
+            ))
+            .unwrap();
+        let mut packet = Job::new(
+            "ship-a-change",
+            boss_core::job::Subject::new("custom", "subject"),
+            "review",
+            "owner",
+            boss_core::job::Priority::Standard,
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
+        );
+        packet.workflow_version = 0;
+        let rows = read_internal_protocols(Some(&registry), [&packet, &packet])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[&(packet.kind, 0)]
+                .as_ref()
+                .unwrap_err()
+                .contains("latest active is not a substitute")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unread_protocol_does_not_discard_another_packets_pinned_version() {
+        let registry = crate::registry::InMemoryWorkflows::for_fixture();
+        let mut old = crate::registry::WorkflowSpec::platform_seed(
+            "ship-a-change",
+            "Change",
+            "platform",
+            vec!["custom".into()],
+            vec![crate::registry::StepSpec {
+                title: "review".into(),
+                duration_hours: Some(2.0),
+                ..Default::default()
+            }],
+        );
+        old.status = crate::registry::WorkflowStatus::Retired;
+        registry.seed(old.clone()).unwrap();
+        let mut newer = old.clone();
+        newer.version = 2;
+        newer.status = crate::registry::WorkflowStatus::Active;
+        newer.steps[0].duration_hours = Some(0.25);
+        registry.seed(newer).unwrap();
+        let packet_of = |kind| {
+            Job::new(
+                kind,
+                boss_core::job::Subject::new("custom", "subject"),
+                "review",
+                "owner",
+                boss_core::job::Priority::Standard,
+                chrono::NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(),
+            )
+        };
+        let mut packet = packet_of("ship-a-change");
+        packet.workflow_version = 1;
+        let missing = packet_of("missing-protocol");
+        let rows = read_internal_protocols(Some(&registry), [&packet, &missing])
+            .await
+            .expect("one failed key must not discard an independently read protocol");
+        let recorded = rows
+            .get(&(packet.kind.clone(), 1))
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert!(
+            rows.get(&(missing.kind.clone(), 1))
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .contains("missing-protocol@1")
+        );
+        assert_eq!(
+            recorded.steps[0].duration_hours,
+            Some(2.0),
+            "never substitute the active version"
+        );
+    }
 }

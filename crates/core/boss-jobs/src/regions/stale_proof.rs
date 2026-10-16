@@ -4,6 +4,10 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "proof_contract_test.rs"]
+mod proof_contract_test;
+
 /// How long a landed car may stand unproven before the shed says so.
 ///
 /// WHY A BOUND AT ALL (backlog 488d42e6). The shed troubled itself only
@@ -68,6 +72,8 @@ pub const NOT_YET_STARVED_HOURS: i64 = 72;
 /// [`StaleProof::Theirs`] is ours.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StaleProof {
+    /// An attempt exists without its required outcome.
+    Unread,
     /// No probe, no event: nothing mechanical can settle it.
     Unproven,
     /// Its probe ran and failed.
@@ -102,6 +108,7 @@ pub(crate) fn stale_proof(md: &Value, hours: i64) -> StaleProof {
     use crate::car::Starved;
     match shed_place(md) {
         ShedPlace::Unproven => StaleProof::Unproven,
+        ShedPlace::ProbeUnread => StaleProof::Unread,
         ShedPlace::ProbePending { last: Some(_) } => StaleProof::Failing,
         ShedPlace::ProbePending { last: None } => StaleProof::NeverProbed,
         // No probe runs, so no `seen` check does either: a world event
@@ -127,6 +134,266 @@ pub(crate) fn stale_proof(md: &Value, hours: i64) -> StaleProof {
     }
 }
 
+/// Admission time is a native immutable job field. Older packets may
+/// carry only the historical metadata stamp; it never overrides a
+/// native reading and a date alone cannot establish an exact deadline.
+pub(crate) fn proof_opened_at(job: &Job) -> Option<Instant> {
+    job.opened_at
+        .or_else(|| meta_instant(&job.metadata, "opened_at"))
+}
+
+/// A present proof fault, independent of the stale-proof age band.
+/// Regions and the delivery stuck block consume the same classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProofFault {
+    Unproven,
+    Failing,
+    Unread,
+    Unowned,
+    Unobserved,
+    Overdue(crate::car::OwnedWait),
+    SatisfiedCondition(String),
+}
+
+pub(crate) fn proof_fault(md: &Value, age_seconds: Option<i64>) -> Option<ProofFault> {
+    match stale_proof(md, 0) {
+        StaleProof::Unproven => Some(ProofFault::Unproven),
+        StaleProof::Failing => Some(ProofFault::Failing),
+        StaleProof::Unread => Some(ProofFault::Unread),
+        StaleProof::Unowned => Some(ProofFault::Unowned),
+        StaleProof::Unobserved => Some(ProofFault::Unobserved),
+        StaleProof::Seen(on) => Some(ProofFault::SatisfiedCondition(on)),
+        StaleProof::Theirs(wait) if age_seconds.is_some_and(|age| wait.overdue_seconds(age)) => {
+            Some(ProofFault::Overdue(wait))
+        }
+        _ => None,
+    }
+}
+
+/// The record behind an understood proof wait, carried to every reader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedProofWait {
+    pub packet: String,
+    pub owner: String,
+    pub condition_owner: String,
+    pub title: String,
+    pub condition: String,
+    pub next_check_at: Instant,
+    pub evidence: ProofWaitEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ProofWaitEvidence {
+    Gate {
+        run: String,
+        head: String,
+        workflow_version: i32,
+        launched_at: Instant,
+    },
+    Review {
+        run: String,
+        head: String,
+        workflow_version: i32,
+        started_at: Instant,
+    },
+    Observation {
+        at: Instant,
+        probe: String,
+        exit: i64,
+    },
+    CleanWindow {
+        begin_at: Instant,
+        duration_seconds: i64,
+        through_at: Instant,
+        observer: String,
+    },
+    Claim {
+        step: String,
+        assignee: String,
+        observed_at: Instant,
+    },
+}
+
+/// Qualification consumes recorded facts; a declaration is not an observation.
+pub(crate) fn recorded_proof_wait(
+    job: &Job,
+    steps: &[Step],
+    now: Instant,
+) -> Result<Option<RecordedProofWait>, String> {
+    let age = proof_opened_at(job).map(|opened| (now - opened).num_seconds());
+    if proof_fault(&job.metadata, age).is_some() {
+        return Ok(None);
+    }
+    let StaleProof::Theirs(wait) = stale_proof(&job.metadata, 0) else {
+        return Ok(None);
+    };
+    if wait.max_wait_hours.is_some() && age.is_none() {
+        return Err("bounded wait start clock is unread".into());
+    }
+    let md = &job.metadata;
+    let read_time = |pointer: &str| -> Result<Instant, String> {
+        let text = md
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("required wait reading absent: {pointer}"))?;
+        chrono::DateTime::parse_from_rfc3339(text)
+            .map(|at| at.with_timezone(&chrono::Utc))
+            .map_err(|_| format!("required wait time unread: {pointer}"))
+    };
+    let next_check_at = read_time("/waits_on/next_check_at")?;
+    if next_check_at <= now {
+        return Err(format!("missed recorded next check at {next_check_at}"));
+    }
+    let owner = steps
+        .iter()
+        .find(|step| step.spec_slug.as_deref() == Some("proven"))
+        .and_then(|step| step.assignee_id.as_deref())
+        .unwrap_or(&job.owner_id)
+        .trim();
+    if owner.is_empty() {
+        return Err("required native action owner absent".into());
+    }
+    if let crate::car::WaitOwner::Actor(declared) = &wait.owner
+        && declared != owner
+        && declared != &job.owner_id
+    {
+        return Err("declared wait owner is not its native owner or step assignee".into());
+    }
+    if let crate::car::WaitOwner::Actor(declared) = &wait.owner
+        && md.pointer("/waits_on/clean_window").is_none()
+        && crate::car::waits_on(md).is_some_and(|wait| wait.seen.is_none())
+    {
+        let claim = steps
+            .iter()
+            .find(|step| {
+                step.spec_slug.as_deref() == Some("proven")
+                    && step.status == StepStatus::Active
+                    && step.assignee_id.as_deref() == Some(declared.as_str())
+            })
+            .ok_or_else(|| {
+                "required human claim is absent; nomination is not a claim".to_string()
+            })?;
+        if md.get(crate::car::PROOF_EVENT).and_then(Value::as_str) != Some(wait.on.as_str()) {
+            return Err("human claim does not bind the recorded proof condition".into());
+        }
+        return Ok(Some(RecordedProofWait {
+            packet: job.id.to_string(),
+            owner: declared.clone(),
+            condition_owner: wait.owner.to_string(),
+            title: job.title.clone(),
+            condition: wait.on,
+            next_check_at,
+            evidence: ProofWaitEvidence::Claim {
+                step: claim.id.to_string(),
+                assignee: declared.clone(),
+                observed_at: now,
+            },
+        }));
+    }
+    let at = read_time("/proof_attempt/at")?;
+    if at > now {
+        return Err("proof observation is dated in the future".into());
+    }
+    let observer = crate::car::waits_on(md)
+        .and_then(|wait| wait.seen)
+        .ok_or_else(|| "required supporting observation absent".to_string())?;
+    if md
+        .pointer("/proof_attempt/waits_on_probe")
+        .and_then(Value::as_str)
+        != Some(observer.as_str())
+    {
+        return Err("observer outcome does not bind the declared observer".into());
+    }
+    if md.pointer("/proof_attempt/probe").and_then(Value::as_str)
+        != md.get(crate::car::PROOF_PROBE).and_then(Value::as_str)
+    {
+        return Err("proof outcome does not bind the declared proof".into());
+    }
+    let exit = md
+        .pointer("/proof_attempt/waits_on_exit")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "required observer outcome unread".to_string())?;
+    if exit == 0 {
+        return Err("required condition was seen but the proof still waits".into());
+    }
+    if crate::car::wait_observation(&md["proof_attempt"]) != crate::car::WaitObservation::Unseen {
+        return Err(
+            "required observer did not record an explicit successful negative reading".into(),
+        );
+    }
+    let evidence = if md.pointer("/waits_on/clean_window").is_some() {
+        let begin_at = read_time("/waits_on/clean_window/begin_at")?;
+        let duration_seconds = md
+            .pointer("/waits_on/clean_window/duration_seconds")
+            .and_then(Value::as_i64)
+            .filter(|duration| *duration > 0)
+            .ok_or_else(|| "clean-window duration absent or invalid".to_string())?;
+        let deadline = chrono::Duration::try_seconds(duration_seconds)
+            .and_then(|duration| begin_at.checked_add_signed(duration))
+            .ok_or_else(|| "clean-window deadline is outside the clock range".to_string())?;
+        let coverage_begin = read_time("/proof_attempt/waits_on_coverage/begin_at")?;
+        let through_at = read_time("/proof_attempt/waits_on_coverage/through_at")?;
+        let gaps = md
+            .pointer("/proof_attempt/waits_on_coverage/gaps")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "clean-window gaps reading absent".to_string())?;
+        if coverage_begin != begin_at
+            || through_at < begin_at
+            || through_at > at
+            || !gaps.is_empty()
+        {
+            return Err(
+                "clean-window coverage does not cover its recorded beginning without gaps".into(),
+            );
+        }
+        if md
+            .pointer("/proof_attempt/waits_on_coverage/source")
+            .and_then(Value::as_str)
+            != Some(observer.as_str())
+        {
+            return Err("clean-window coverage does not bind the executed observer".into());
+        }
+        if now >= deadline {
+            return Err(
+                "clean-window deadline reached; a new observation or completed proof is required"
+                    .into(),
+            );
+        }
+        ProofWaitEvidence::CleanWindow {
+            begin_at,
+            duration_seconds,
+            through_at,
+            observer,
+        }
+    } else {
+        ProofWaitEvidence::Observation {
+            at,
+            probe: observer,
+            exit,
+        }
+    };
+    Ok(Some(RecordedProofWait {
+        packet: job.id.to_string(),
+        owner: owner.into(),
+        condition_owner: wait.owner.to_string(),
+        title: job.title.clone(),
+        condition: wait.on,
+        next_check_at,
+        evidence,
+    }))
+}
+
+/// Count each packet requiring action once, using the same immediate
+/// faults and stale classification as the region and delivery readers.
+pub(crate) fn proof_requires_action(md: &Value, age_seconds: Option<i64>) -> bool {
+    proof_fault(md, age_seconds).is_some()
+        || age_seconds.is_some_and(|age| {
+            let hours = age / 3600;
+            hours >= PROOF_STALE_HOURS && !matches!(stale_proof(md, hours), StaleProof::Theirs(_))
+        })
+}
+
 /// An owned wait, inside or past the patience it declared.
 fn owed(o: crate::car::OwnedWait, hours: i64) -> StaleProof {
     if o.overdue(hours) {
@@ -137,9 +404,123 @@ fn owed(o: crate::car::OwnedWait, hours: i64) -> StaleProof {
 }
 
 #[cfg(test)]
+mod independent_observer_review {
+    use super::*;
+    use crate::regions::fixtures::*;
+
+    #[test]
+    fn an_executed_observer_error_is_not_a_negative_observation() {
+        let status = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "printf 'synthetic observer read error\\n' >&2; exit 2",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(status.status.code(), Some(2));
+        let packet = job(
+            "ship-a-change",
+            "synthetic failed observer",
+            JobStatus::Open,
+            serde_json::json!({
+                "proof_probe": "check-proof", "proof_attempt": {
+                    "at": NOW, "probe": "check-proof", "exit": 75,
+                    "waits_on_probe": "read-event", "waits_on_exit": status.status.code()
+                },
+                "waits_on": {"on": "the event", "owner": "world", "seen": "read-event",
+                    "next_check_at": "2026-09-19T13:00:00Z"}
+            }),
+        );
+        let reading = recorded_proof_wait(&packet, &[], t(NOW));
+        assert!(
+            !matches!(reading, Ok(Some(_))),
+            "an observer that reports an execution error cannot qualify the condition as unseen: {reading:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::regions::fixtures::*;
+
+    #[test]
+    fn a_clean_window_requires_matching_continuous_coverage_before_its_deadline() {
+        let mut j = job(
+            "ship-a-change",
+            "fix/clean-window",
+            JobStatus::Open,
+            observed_wait_fixture(json!({
+                "opened_at": "2026-09-19T09:00:00Z", "proof_probe": "judge-window",
+                "proof_attempt": {"at": "2026-09-19T12:00:00Z", "probe": "judge-window", "exit": 75,
+                    "not_yet": true, "waits_on_exit": 1,
+                    "waits_on_coverage": {"begin_at": "2026-09-19T10:00:00Z", "through_at": "2026-09-19T12:00:00Z", "gaps": [], "source": "window-observer"}},
+                "waits_on": {"on": "a four-hour clean window", "owner": "world", "seen": "window-observer",
+                    "next_check_at": "2026-09-19T13:00:00Z", "clean_window": {"begin_at": "2026-09-19T10:00:00Z", "duration_seconds": 14400}}
+            })),
+        );
+        let claim = step(&j, "proven", StepStatus::Ready, None);
+        let mut human_window = j.clone();
+        human_window.metadata["waits_on"]["owner"] = json!("emp-david");
+        human_window.metadata["waits_on"]["seen"] = Value::Null;
+        human_window.metadata["proof_event"] = json!("a four-hour clean window");
+        let mut human_claim = claim.clone();
+        human_claim.status = StepStatus::Active;
+        human_claim.assignee_id = Some("emp-david".into());
+        assert!(
+            recorded_proof_wait(&human_window, &[human_claim], t(NOW)).is_err(),
+            "a human claim cannot replace clean-window coverage"
+        );
+        let wait = recorded_proof_wait(&j, std::slice::from_ref(&claim), t(NOW))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(wait).unwrap()["evidence"]["kind"],
+            "clean-window"
+        );
+        j.metadata["proof_attempt"]["waits_on_coverage"]["gaps"] =
+            json!([{"from": "2026-09-19T11:00:00Z", "until": "2026-09-19T11:01:00Z"}]);
+        assert!(recorded_proof_wait(&j, std::slice::from_ref(&claim), t(NOW)).is_err());
+        j.metadata["proof_attempt"]["waits_on_coverage"]["gaps"] = json!([]);
+        j.metadata["proof_attempt"]["waits_on_coverage"]["begin_at"] =
+            json!("2026-09-19T11:00:00Z");
+        assert!(recorded_proof_wait(&j, &[claim], t(NOW)).is_err());
+    }
+
+    #[test]
+    fn a_named_human_act_can_use_its_actual_claim_as_supporting_evidence() {
+        let mut j = job(
+            "ship-a-change",
+            "fix/ceremony",
+            JobStatus::Open,
+            json!({
+                "proof_event": "the SSH CA ceremony",
+                "waits_on": {"on": "the SSH CA ceremony", "owner": "emp-david",
+                    "max_wait_hours": 72, "next_check_at": "2026-09-19T13:00:00Z"}
+            }),
+        );
+        j.owner_id = "emp-david".into();
+        j.opened_at = Some(t("2026-09-19T10:00:00Z"));
+        let mut claim = step(&j, "proven", StepStatus::Active, None);
+        claim.assignee_id = Some("emp-david".into());
+        let wait = recorded_proof_wait(&j, &[claim.clone()], t(NOW))
+            .unwrap()
+            .unwrap();
+        assert_eq!(wait.owner, "emp-david");
+        let mut missing_clock = j.clone();
+        missing_clock.opened_at = None;
+        assert!(
+            recorded_proof_wait(&missing_clock, &[claim.clone()], t(NOW)).is_err(),
+            "a bounded wait without its start clock cannot be qualified"
+        );
+        let wire = serde_json::to_value(&wait).unwrap();
+        assert_eq!(wire["evidence"]["step"], claim.id.to_string());
+        claim.status = StepStatus::Ready;
+        assert!(
+            recorded_proof_wait(&j, &[claim], t(NOW)).is_err(),
+            "nomination alone is not an actual claim"
+        );
+    }
 
     /// A STALE PROOF IS EITHER ON US OR ON THE WORLD, and the shed said
     /// neither.
@@ -352,21 +733,21 @@ mod tests {
     fn a_declared_wait_is_the_worlds_until_its_event_is_seen() {
         let car = |branch: &str, seen_at: Option<&str>| {
             let mut attempt = json!({
-                "at": "2026-09-19T11:00:00Z", "not_yet": true, "exit": 75, "probe": "true",
+                "at": "2026-09-19T11:00:00Z", "not_yet": true, "exit": 75, "probe": "true", "waits_on_exit": 1,
                 (crate::car::NOT_YET_SINCE): "2026-09-15T11:00:00Z",
                 (crate::car::NOT_YET_RUNS): 96,
             });
             if let Some(s) = seen_at {
                 attempt[crate::car::WAITS_ON_SEEN_AT] = json!(s);
             }
-            let md = json!({
+            let md = observed_wait_fixture(json!({
                 "branch": branch, "merged": true, "opened_at": "2026-09-15T10:00:00Z",
                 "proof_probe": "true", "proof_attempt": attempt,
                 (crate::car::WAITS_ON): {
                     "on": "a real Stripe sponsorship charge", "seen": "true",
                     (crate::car::WAITS_ON_OWNER): "world",
                 },
-            });
+            }));
             let j = job("ship-a-change", branch, JobStatus::Open, md);
             let s = vec![
                 step(
@@ -416,7 +797,7 @@ mod tests {
                 "branch": branch, "merged": true, "opened_at": "2026-09-15T10:00:00Z",
                 "proof_probe": "true",
                 "proof_attempt": {
-                    "at": "2026-09-19T11:00:00Z", "not_yet": true, "exit": 75, "probe": "true",
+                    "at": "2026-09-19T11:00:00Z", "not_yet": true, "exit": 75, "probe": "true", "waits_on_exit": 1,
                     (crate::car::NOT_YET_SINCE): "2026-09-15T11:00:00Z",
                     (crate::car::NOT_YET_RUNS): 96,
                 },
@@ -425,7 +806,12 @@ mod tests {
                     (crate::car::WAITS_ON_OWNER): "world",
                 },
             });
-            let j = job("ship-a-change", branch, JobStatus::Open, md);
+            let j = job(
+                "ship-a-change",
+                branch,
+                JobStatus::Open,
+                observed_wait_fixture(md),
+            );
             let s = vec![
                 step(
                     &j,
@@ -489,10 +875,12 @@ mod tests {
                 "branch": branch, "merged": true, "opened_at": "2026-09-15T10:00:00Z",
                 (crate::car::WAITS_ON): {
                     "on": "the Access SSH CA ceremony",
+                    "next_check_at": "2026-09-19T13:00:00Z",
                     (crate::car::WAITS_ON_OWNER): owner,
                     (crate::car::WAITS_ON_MAX_WAIT_HOURS): max,
                 },
             });
+            md["proof_event"] = json!("the Access SSH CA ceremony");
             if probe {
                 md["proof_probe"] = json!("true");
                 md["proof_attempt"] = json!({
@@ -500,8 +888,6 @@ mod tests {
                     (crate::car::NOT_YET_SINCE): "2026-09-15T11:00:00Z",
                     (crate::car::NOT_YET_RUNS): 96,
                 });
-            } else {
-                md["proof_event"] = json!("David completes the Access SSH CA ceremony");
             }
             let j = job("ship-a-change", branch, JobStatus::Open, md);
             let s = vec![
@@ -511,7 +897,11 @@ mod tests {
                     StepStatus::Completed,
                     Some("2026-09-15T06:00:00Z"),
                 ),
-                step(&j, "proven", StepStatus::Ready, None),
+                {
+                    let mut claim = step(&j, "proven", StepStatus::Active, None);
+                    claim.assignee_id = Some("emp-david".into());
+                    claim
+                },
             ];
             (j, s)
         };

@@ -65,6 +65,7 @@ pub mod ledger_tax_remit;
 #[cfg(test)]
 mod listing_stub;
 pub mod machine_gate_asked_alarm;
+pub mod managed_collector_tls;
 pub mod messages_expire_for_job;
 pub mod messages_expire_notices;
 pub mod messages_notify;

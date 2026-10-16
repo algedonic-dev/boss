@@ -31,6 +31,10 @@
 #          protocol puts it while that step is ready (or once it closed
 #          on that step, for a terminal). Omitted for a filing onto the
 #          map from nowhere.
+#   from_agent_steps — for verb:dispatch, derive registered origins from
+#          eligible workflow agent steps that the walk places on the map.
+#          Mutually exclusive with from; original dispatch context is
+#          required to judge an observed crossing against this family.
 #   to   — `<kind>@<step>`: the packet that continues, standing where
 #          its protocol puts it while that step is ready. Omitted when
 #          the maker takes the packet OFF the map without a terminal:
@@ -88,21 +92,9 @@ why = "A run that died two hours ago releases the step it held: the step goes ba
 
 [[hand_off]]
 by = "verb:dispatch"
-from = "backlog-item@build"
+from_agent_steps = true
 to = "agent-run@briefed"
-why = "boss dispatch claims a ready step at its station and files the run that will execute it on the shop floor."
-
-# DISPATCH FROM RECEIVING (backlog 47880c86). An item's `triage` step is
-# dispatchable too — it carries an analyst agent block — and an item
-# stands in receiving until triage completes, so the run it files leaves
-# from there. Measured 2026-09-26: 27 runs receiving -> shop-floor, e.g.
-# run 29526d60 on item eed361e0's `triage` at 14:00:43, four minutes
-# before that triage completed.
-[[hand_off]]
-by = "verb:dispatch"
-from = "backlog-item@triage"
-to = "agent-run@briefed"
-why = "boss dispatch claims an untriaged item's triage step at its station and files the analyst run that measures it; the item still stands in receiving, the run on the shop floor."
+why = "boss dispatch claims an eligible agent step declared by its workflow and files its registered run. Origins come from the same protocol walk, including receiving triage and shed landed-review; an original step/run registration context is required to judge an individual crossing (a4de1e72)."
 
 [[hand_off]]
 by = "verb:gate"

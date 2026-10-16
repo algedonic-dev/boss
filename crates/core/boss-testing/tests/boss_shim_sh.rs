@@ -295,6 +295,96 @@ fn short(sha: &str) -> &str {
     &sha[..8]
 }
 
+/// ca356c79: OFF selects the ordinary shim, so the published planner's
+/// refusal cannot prevent a recorded probe from reaching its CLI here.
+#[test]
+fn a_recorded_probe_is_refused_before_the_off_shim_executes_any_cli() {
+    let f = Fixture::new("recorded-probe-off");
+    let repo = f.root.join("repo");
+    boss_testing::create_dir(&repo.join("infra/dev"));
+    git(&repo, &["init", "-q"]);
+    boss_testing::write_file(&repo.join("README"), "synthetic OFF fixture\n");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "fixture"]);
+    let main = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["update-ref", "refs/remotes/origin/main", &main]);
+    let copy = repo.join(SCRIPT);
+    let text = std::fs::read_to_string(repo_root().join(SCRIPT)).unwrap();
+    assert!(text.contains("dev_control=/work/tools/dev-control"));
+    write_exec(
+        &copy,
+        &text.replace(
+            "dev_control=/work/tools/dev-control",
+            &format!("dev_control={}", f.root.join("off-controller").display()),
+        ),
+    );
+    f.image(&main);
+    f.build("debug", &main);
+    let effect = f.root.join("cli-effect");
+    for binary in [
+        f.store.join(&main).join("boss"),
+        f.root.join("target/debug/boss"),
+    ] {
+        write_exec(
+            &binary,
+            &format!(
+                "#!/usr/bin/env bash\nprintf executed >> '{}'\nprintf '%s\\n' 'boss built from {main}'\n",
+                effect.display()
+            ),
+        );
+    }
+    let run = |args: &[&str], marker: Option<(&str, &str)>| {
+        let mut copied = Command::new(&copy);
+        copied
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &f.root)
+            .args(args)
+            .arg("synthetic-record")
+            .env("BOSS_SHIM_TARGET_ROOT", &f.root)
+            .env("BOSS_SHIM_IMAGE_STORE", &f.store)
+            .env("BOSS_SHIM_INSTALLER", &f.installer)
+            .env("BOSS_SHIM_CLI_WAIT", "0")
+            .env("BOSS_JOBS_URL", "http://owned-fixture.invalid")
+            .env("BOSS_MACHINE_TOKEN_DIR", &f.root);
+        // Keep the real production shim, replacing only the controller
+        // pathname with an owned absent selector: no live activation.
+        if let Some((key, value)) = marker {
+            copied.env(key, value);
+        }
+        output(copied)
+    };
+    for args in [
+        vec!["job", "get"],
+        vec!["--built", "job", "get"],
+        vec!["ops", "check"],
+        vec!["--version"],
+    ] {
+        for ordinary in [
+            None,
+            Some(("BOSS_SOR_USER", "")),
+            Some(("BOSS_SOR_DOOR", "")),
+        ] {
+            let (rc, out) = run(&args, ordinary);
+            assert_eq!(rc, 0, "ordinary session positive {args:?}: {out}");
+            assert!(effect.exists(), "the positive must execute its CLI");
+            std::fs::remove_file(&effect).unwrap();
+        }
+        for marker in [
+            ("BOSS_PROBE_NOTFOUND", "fixture"),
+            ("BOSS_PROBE_NOTFOUND", ""),
+            ("BOSS_SOR_USER", "fixture"),
+            ("BOSS_SOR_DOOR", "fixture"),
+        ] {
+            let (rc, out) = run(&args, Some(marker));
+            assert_eq!(rc, 2, "recorded context {marker:?}/{args:?}: {out}");
+            assert!(out.contains("boss-sor-read"), "{out}");
+            assert!(!effect.exists(), "not even a CLI version probe may run");
+            assert!(f.install_log().is_empty(), "no image installation may run");
+        }
+    }
+}
+
 #[test]
 fn the_shim_is_in_the_tree_and_executable() {
     use std::os::unix::fs::PermissionsExt;

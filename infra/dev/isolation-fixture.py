@@ -9,6 +9,32 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import json
+
+
+def write_bun_lifecycle_fixture(work):
+    """A zero-dependency, offline hook using only caller-generated fake paths.
+
+    The marker proves the real install executed JS; the copied fake effect is
+    a filesystem control, never privileged network use or a worker attestation.
+    """
+    (work / "package.json").write_text(json.dumps({
+        "name": "boss-synthetic-lifecycle", "version": "1.0.0",
+        "scripts": {"postinstall": "bun lifecycle.js"},
+    }))
+    (work / "lifecycle.js").write_text('''import {readFileSync, writeFileSync} from "node:fs";
+const result = {lifecycle: true, javascript: 6 * 7, read: false, effect: false};
+try {
+    const material = readFileSync(process.env.FAKE_PATH, "utf8");
+    if (!material.startsWith("BOSS_SYNTHETIC_FIXTURE:")) throw new Error("fake material required");
+    result.read = true;
+    writeFileSync(process.env.FAKE_EFFECT, material);
+    result.effect = true;
+} catch (error) {
+    if (error.code !== "ENOENT" && error.code !== "EACCES") throw error;
+}
+writeFileSync("lifecycle-observed.json", JSON.stringify(result));
+''')
 
 
 def copy_tool(jail, tool):

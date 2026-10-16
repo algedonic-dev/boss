@@ -5337,6 +5337,14 @@ impl Conductor {
     /// set per waiting car per departure.
     pub(super) async fn refresh(&self) -> Result<()> {
         if let Some(occupant) = self.track_occupant().await? {
+            // Evidence-only recovery owes nothing to a clear track. Keep the
+            // ordinary diagnostic drain (and its native launch admission)
+            // below the clear-track fence, even when this reader refuses.
+            if let Err(error) = super::diagnostic_adapter::drain_recovery_assessments(self).await {
+                log(format!(
+                    "diagnostic recovery UNKNOWN (track remains occupied): {error:#}; assessment remains pending, no diagnostic pass recorded"
+                ));
+            }
             let cars = list_all_pages(|offset| async move {
                 self.api(
                     Method::GET,

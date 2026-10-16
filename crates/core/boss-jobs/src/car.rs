@@ -553,12 +553,17 @@ pub const NOT_YET_SINCE: &str = "not_yet_since";
 /// this one included. See [`NOT_YET_SINCE`].
 pub const NOT_YET_RUNS: &str = "not_yet_runs";
 
-/// Did this recorded attempt answer NOT YET? The flag the doors stamp,
-/// or a bare exit 75 on records older than the flag — one definition,
-/// read by the shed's classification and the streak both.
+/// Did this attempt defer completion? An observed exit wins over any
+/// convenience flag. A recorded environment refusal also preserves retry
+/// accounting, but the shed still judges that unexecuted probe unread.
 pub fn attempt_said_not_yet(attempt: &Value) -> bool {
-    attempt.get("not_yet").and_then(Value::as_bool) == Some(true)
-        || attempt.get("exit").and_then(Value::as_i64) == Some(75)
+    match attempt.get("exit").and_then(Value::as_i64) {
+        Some(exit) => exit == 75,
+        None => {
+            attempt.get("environment").and_then(Value::as_bool) == Some(true)
+                && attempt.get("not_yet").and_then(Value::as_bool) == Some(true)
+        }
+    }
 }
 
 /// Where a not-yet run's streak began and how many runs it now holds,
@@ -650,8 +655,10 @@ pub fn not_yet_streak(md: &Value) -> Option<NotYetStreak> {
 /// So the car SAYS what it waits on, as `{"on": <prose naming the event
 /// or the actor>, "seen": <optional shell text>}`. `seen` is a second,
 /// smaller probe, run by the same door and on the same host as the
-/// proof probe whenever that one answers not-yet, which exits 0 once the
-/// awaited event is in the record. It is what turns the declaration from
+/// proof probe whenever that one answers not-yet. Exit 0 means the event
+/// is seen. A successful negative read exits 1 with JSON stdout containing
+/// `"observation":"unseen"`; a legacy nonzero or failed read is unread.
+/// It is what turns the declaration from
 /// a belief into something the record can contradict: a probe still
 /// saying not-yet AFTER its own declared event was seen is the true
 /// "ours to read", at any streak length. Written by `boss car waits-on`
@@ -813,6 +820,51 @@ impl OwnedWait {
     pub fn overdue(&self, age_hours: i64) -> bool {
         self.max_wait_hours.is_some_and(|max| age_hours > max)
     }
+
+    /// Compare the recorded bound without rounding away a missed check.
+    pub fn overdue_seconds(&self, age_seconds: i64) -> bool {
+        self.max_wait_hours
+            .is_some_and(|max| i128::from(age_seconds) > i128::from(max) * 3600)
+    }
+}
+
+/// An executed observer's result. Exit zero is a sighting. A negative
+/// reading requires exit one AND the executed observer's JSON stdout
+/// `{"observation":"unseen"}`. Other exits, and legacy nonzero outputs,
+/// cannot distinguish a negative observation from a failed read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitObservation {
+    Seen,
+    Unseen,
+    Unread,
+}
+
+pub fn wait_observation(attempt: &Value) -> WaitObservation {
+    if attempt
+        .get("waits_on_missing_tools")
+        .is_some_and(|tools| tools.as_array().is_none_or(|tools| !tools.is_empty()))
+        || ["waits_on_refusal", "waits_on_error"]
+            .iter()
+            .any(|field| attempt.get(*field).is_some_and(|value| !value.is_null()))
+    {
+        return WaitObservation::Unread;
+    }
+    match attempt.get("waits_on_exit").and_then(Value::as_i64) {
+        Some(0) => WaitObservation::Seen,
+        Some(1)
+            if attempt.get("waits_on_observation").and_then(Value::as_str) == Some("unseen") =>
+        {
+            WaitObservation::Unseen
+        }
+        _ => WaitObservation::Unread,
+    }
+}
+
+/// A declared observation requires an executed, distinguishable outcome.
+/// Declaring a command alone cannot establish that the event is unseen.
+pub fn wait_observer_unread(md: &Value) -> bool {
+    waits_on(md).is_some_and(|w| w.seen.is_some())
+        && wait_observation(&md["proof_attempt"]) == WaitObservation::Unread
 }
 
 /// Is this car's wait someone else's move? Only when all four hold: it
@@ -833,6 +885,18 @@ pub fn owned_wait(md: &Value) -> Option<OwnedWait> {
     let w = waits_on(md)?;
     let owner = wait_owner(md)?;
     if owner == WaitOwner::World && w.seen.is_none() {
+        return None;
+    }
+    // The proof door explicitly records null when its observer was
+    // refused, could not execute, or lacked a tool. That is unread
+    // evidence, not a negative observation of the event.
+    if wait_observer_unread(md)
+        || md.get("proof_attempt").and_then(|a| a.get("waits_on_exit")) == Some(&Value::Null)
+        || (w.seen.is_some()
+            && md
+                .get("proof_attempt")
+                .is_some_and(|attempt| wait_observation(attempt) != WaitObservation::Unseen))
+    {
         return None;
     }
     if starved(md).is_some() {
@@ -1805,6 +1869,84 @@ pub fn boards_after_outcome(declared: &str, pred: &Predecessor) -> EdgeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_observation_keeps_error_and_legacy_records_unread() {
+        use WaitObservation::{Seen, Unread, Unseen};
+        for (attempt, expected) in [
+            (json!({"waits_on_exit": 0}), Seen),
+            (
+                json!({"waits_on_exit": 1, "waits_on_observation": "unseen"}),
+                Unseen,
+            ),
+            (json!({"waits_on_exit": 1}), Unread),
+            (
+                json!({"waits_on_exit": 2, "waits_on_observation": "unseen"}),
+                Unread,
+            ),
+            (json!({"waits_on_exit": -1}), Unread),
+            (json!({"waits_on_exit": 256}), Unread),
+            (
+                json!({"waits_on_exit": 1.0, "waits_on_observation": "unseen"}),
+                Unread,
+            ),
+            (
+                json!({"waits_on_exit": true, "waits_on_observation": "unseen"}),
+                Unread,
+            ),
+            (
+                json!({"waits_on_exit": "1", "waits_on_observation": "unseen"}),
+                Unread,
+            ),
+            (
+                json!({"waits_on_exit": 1, "waits_on_observation": {"unseen": true}}),
+                Unread,
+            ),
+            (
+                json!({"waits_on_exit": 1, "waits_on_observation": "unseen", "waits_on_missing_tools": ["observer"]}),
+                Unread,
+            ),
+            (
+                json!({"waits_on_exit": 0, "waits_on_refusal": {"rule": "refused"}}),
+                Unread,
+            ),
+            (
+                json!({"waits_on_exit": 1, "waits_on_observation": "unseen", "waits_on_error": "could not execute"}),
+                Unread,
+            ),
+        ] {
+            assert_eq!(wait_observation(&attempt), expected, "{attempt}");
+        }
+    }
+
+    #[test]
+    fn an_environment_refusal_preserves_retry_accounting_but_is_not_an_observed_wait() {
+        let refusal = json!({
+            "exit": null, "not_yet": true, "environment": true,
+            "probe": "echo claim:ok", "why": "host refused the execution environment"
+        });
+        assert!(attempt_said_not_yet(&refusal));
+        let metadata = json!({"proof_probe": "echo claim:ok", "proof_attempt": refusal});
+        assert_eq!(
+            crate::regions::shed_place(&metadata),
+            crate::regions::ShedPlace::ProbeUnread
+        );
+        assert!(!attempt_said_not_yet(
+            &json!({"exit": 1, "not_yet": true, "environment": true})
+        ));
+        assert!(!attempt_said_not_yet(
+            &json!({"exit": null, "not_yet": true})
+        ));
+        assert_eq!(
+            crate::regions::shed_place(&json!({
+                "proof_probe": "echo claim:ok",
+                "proof_attempt": {"exit": 1, "environment": true, "why": "actual failure"}
+            })),
+            crate::regions::ShedPlace::ProbePending {
+                last: Some("actual failure".into())
+            }
+        );
+    }
 
     const HEAD: &str = "e16708f69bc5b0a0a3f4bd1572f9db6dec76e7c8";
     const GREEN: &str = r#"{"verdict": "green", "head": "e16708f69bc5b0a0a3f4bd1572f9db6dec76e7c8", "mode": "full", "fails": []}"#;
@@ -3178,6 +3320,8 @@ mod waits_on_tests {
         let since = (last - chrono::Duration::hours(hours)).to_rfc3339();
         let mut attempt = json!({
             "at": last.to_rfc3339(), "exit": 75, "not_yet": true, "probe": PROBE,
+            "waits_on_exit": if seen_at.is_some() { 0 } else { 1 },
+            "waits_on_observation": if seen_at.is_some() { Value::Null } else { json!("unseen") },
             NOT_YET_SINCE: since, NOT_YET_RUNS: hours + 1,
         });
         if let Some(s) = seen_at {
@@ -3354,6 +3498,43 @@ mod waits_on_tests {
         assert_eq!(owned_wait(&waiting(134, Some(unowned), None)), None);
         // Undeclared.
         assert_eq!(owned_wait(&waiting(134, None, None)), None);
+    }
+
+    /// A declared observer that explicitly did not run is not evidence
+    /// that the external event remains unseen.
+    #[test]
+    fn an_unread_observer_cannot_qualify_an_owned_world_wait() {
+        let w = owned("a Stripe charge", Some("true"), json!("world"), json!(336));
+        let mut md = waiting(3, Some(w), None);
+        md["proof_attempt"]["waits_on_exit"] = Value::Null;
+        assert_eq!(owned_wait(&md), None);
+        md["proof_attempt"]["waits_on_exit"] = json!(1);
+        assert!(
+            owned_wait(&md).is_some(),
+            "an executed negative observation remains a wait"
+        );
+    }
+
+    #[test]
+    fn a_world_wait_requires_an_actual_integer_observer_outcome() {
+        for outcome in [None, Some(Value::Null), Some(json!("1")), Some(json!(true))] {
+            let w = owned("a Stripe charge", Some("false"), json!("world"), json!(336));
+            let mut md = waiting(3, Some(w), None);
+            let attempt = md["proof_attempt"].as_object_mut().unwrap();
+            attempt.remove("waits_on_exit");
+            if let Some(value) = outcome {
+                attempt.insert("waits_on_exit".into(), value);
+            }
+            assert_eq!(
+                owned_wait(&md),
+                None,
+                "unread observer is not an observed wait: {md}"
+            );
+        }
+        let w = owned("a Stripe charge", Some("false"), json!("world"), json!(336));
+        let mut md = waiting(3, Some(w), None);
+        md["proof_attempt"]["waits_on_exit"] = json!(1);
+        assert!(owned_wait(&md).is_some());
     }
 
     /// A NAMED ACTOR'S ACT NEEDS NO SEEN CHECK TO BE THEIRS (backlog

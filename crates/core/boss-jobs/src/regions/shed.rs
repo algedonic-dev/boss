@@ -14,6 +14,8 @@ pub enum ShedPlace {
     /// A probe is recorded; `last` is the failed attempt's `why`, if
     /// any (a succeeding attempt completes the step and the car leaves).
     ProbePending { last: Option<String> },
+    /// An attempt exists, but its required exit outcome is unread.
+    ProbeUnread,
     /// The probe ran and exited 75: NOT YET — early, not wrong.
     ProbeNotYet { said: String },
     /// Only an event is recorded: prose naming what has to happen.
@@ -28,16 +30,44 @@ pub fn shed_place(md: &Value) -> ShedPlace {
     let event = md_str(md, crate::car::PROOF_EVENT);
     if !probe.is_empty() {
         let attempt = md.get("proof_attempt");
+        if attempt
+            .and_then(|attempt| attempt.get("environment"))
+            .and_then(Value::as_bool)
+            == Some(true)
+            && attempt
+                .and_then(|attempt| attempt.get("exit"))
+                .and_then(Value::as_i64)
+                .is_none()
+        {
+            return ShedPlace::ProbeUnread;
+        }
         let not_yet = attempt.is_some_and(crate::car::attempt_said_not_yet);
         let last = attempt
             .and_then(|a| a.get("why"))
             .and_then(Value::as_str)
             .filter(|w| !w.is_empty())
             .map(str::to_string);
+        if not_yet
+            && (crate::car::wait_observer_unread(md)
+                || attempt.and_then(|a| a.get("waits_on_exit")) == Some(&Value::Null))
+        {
+            return ShedPlace::ProbeUnread;
+        }
         if not_yet {
             return ShedPlace::ProbeNotYet {
                 said: last.unwrap_or_else(|| "the probe said not yet".to_string()),
             };
+        }
+        if let Some(attempt) = attempt {
+            match attempt.get("exit").and_then(Value::as_i64) {
+                None => return ShedPlace::ProbeUnread,
+                Some(exit) if exit != 0 => {
+                    return ShedPlace::ProbePending {
+                        last: Some(last.unwrap_or_else(|| format!("probe exited {exit}"))),
+                    };
+                }
+                _ => {}
+            }
         }
         return ShedPlace::ProbePending { last };
     }
@@ -83,16 +113,36 @@ pub(super) fn shed(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
     let awaiting = awaiting_proof(inputs.cars);
     let mut unproven = Vec::new();
     let mut failing = Vec::new();
+    let mut unread = Vec::new();
+    let mut unowned_now = Vec::new();
+    let mut unobserved_now = Vec::new();
+    let mut overdue_now = Vec::new();
+    let mut seen_now = Vec::new();
+    let mut recorded_waits = Vec::new();
+    let mut unqualified_waits = Vec::new();
+    for (job, steps) in &awaiting {
+        match super::stale_proof::recorded_proof_wait(job, steps, inputs.now) {
+            Ok(Some(wait)) => recorded_waits.push(wait),
+            Err(why) => unqualified_waits.push(format!("{}: {why}", job.title)),
+            Ok(None) => {}
+        }
+    }
     for (j, _) in &awaiting {
         let branch = j
             .metadata
             .get("branch")
             .and_then(Value::as_str)
             .unwrap_or(j.title.as_str());
-        match shed_place(&j.metadata) {
-            ShedPlace::Unproven => unproven.push(branch),
-            ShedPlace::ProbePending { last: Some(_) } => failing.push(branch),
-            _ => {}
+        let age_seconds = proof_opened_at(j).map(|opened| (inputs.now - opened).num_seconds());
+        match proof_fault(&j.metadata, age_seconds) {
+            Some(ProofFault::Unproven) => unproven.push(branch),
+            Some(ProofFault::Unread) => unread.push(branch),
+            Some(ProofFault::Failing) => failing.push(branch),
+            Some(ProofFault::Unowned) => unowned_now.push(branch),
+            Some(ProofFault::Unobserved) => unobserved_now.push(branch),
+            Some(ProofFault::Overdue(wait)) => overdue_now.push((wait, age_seconds, branch)),
+            Some(ProofFault::SatisfiedCondition(on)) => seen_now.push((on, branch)),
+            None => {}
         }
     }
     let proven = inputs
@@ -150,28 +200,29 @@ pub(super) fn shed(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
             .get("branch")
             .and_then(Value::as_str)
             .unwrap_or(j.title.as_str());
-        let Some(opened) = j
-            .metadata
-            .get("opened_at")
-            .and_then(Value::as_str)
-            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        else {
+        let Some(opened) = proof_opened_at(j) else {
             continue;
         };
-        let hours = (inputs.now - opened.with_timezone(&chrono::Utc)).num_hours();
+        let hours = (inputs.now - opened).num_hours();
         if hours >= PROOF_STALE_HOURS {
             stale.push((hours, branch));
-            let class = stale_proof(&j.metadata, hours);
+            let class = match proof_fault(&j.metadata, Some((inputs.now - opened).num_seconds())) {
+                Some(ProofFault::Overdue(wait)) => StaleProof::Overdue(wait),
+                _ => stale_proof(&j.metadata, hours),
+            };
             if !matches!(
                 class,
-                StaleProof::Theirs(_) | StaleProof::Unproven | StaleProof::Failing
+                StaleProof::Theirs(_)
+                    | StaleProof::Unproven
+                    | StaleProof::Failing
+                    | StaleProof::Unread
             ) {
                 oldest_ours = oldest_ours.max(Some(hours));
             }
             match class {
                 // Named by the sentences above this one, which lead
                 // whenever any car is unproven or failing.
-                StaleProof::Unproven | StaleProof::Failing => {}
+                StaleProof::Unproven | StaleProof::Failing | StaleProof::Unread => {}
                 StaleProof::NeverProbed => never_probed += 1,
                 StaleProof::ProseOnly => prose_only.push(branch),
                 StaleProof::Starved(streak) => starved.push((streak, branch)),
@@ -189,17 +240,18 @@ pub(super) fn shed(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
 
     let n = awaiting.len();
     // THE KPI (decision 9): cars owed a proof whose move is OURS — the
-    // unproven, the failing, and every stale car whose wait is not a
-    // declared, observed, owned one.
-    let ours_stale = never_probed
-        + starved.len()
-        + seen.len()
-        + unobserved.len()
-        + undeclared.len()
-        + prose_only.len()
-        + unowned.len()
-        + overdue.len();
-    let ours = unproven.len() + failing.len() + ours_stale;
+    // present proof faults and every stale car whose wait is not a
+    // declared, observed, owned one, each packet counted once.
+    let ours = awaiting
+        .iter()
+        .filter(|(job, steps)| {
+            super::stale_proof::recorded_proof_wait(job, steps, inputs.now).is_err()
+                || super::stale_proof::proof_requires_action(
+                    &job.metadata,
+                    proof_opened_at(job).map(|opened| (inputs.now - opened).num_seconds()),
+                )
+        })
+        .count();
     let kpi = vec![measure_said(
         "cars owed a proof that are ours",
         count_value(ours),
@@ -229,6 +281,82 @@ pub(super) fn shed(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
         (
             Some((bands::SHED_FAILING, None, String::new())),
             format!("probe FAILING: {}", failing.join(", ")),
+        )
+    } else if !unread.is_empty() {
+        (
+            Some((bands::SHED_UNREAD, None, String::new())),
+            format!("proof outcome unread: {}", unread.join(", ")),
+        )
+    } else if !unowned_now.is_empty() {
+        (
+            Some((bands::SHED_UNOWNED, None, String::new())),
+            format!(
+                "{} declared no owner for their wait — {}; naming one (world, or the actor whose act it is) is ours",
+                unowned_now.len(),
+                unowned_now.join(", "),
+            ),
+        )
+    } else if !unobserved_now.is_empty() {
+        (
+            Some((bands::SHED_UNOBSERVED, None, String::new())),
+            format!(
+                "{} declared a wait with no seen check (world observer) — {}; nothing can ever say its event arrived, so writing one is ours",
+                unobserved_now.len(),
+                unobserved_now.join(", "),
+            ),
+        )
+    } else if !overdue_now.is_empty() {
+        (
+            Some((bands::SHED_WAIT_OVERDUE, None, String::new())),
+            format!(
+                "past the max wait they declared: {}",
+                overdue_now
+                    .iter()
+                    .map(|(wait, age, branch)| format!(
+                        "{branch}, waiting on {}: {}; {}m against {}h",
+                        wait.owner,
+                        wait.on,
+                        age.unwrap_or_default() / 60,
+                        wait.max_wait_hours.unwrap_or_default()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        )
+    } else if !seen_now.is_empty() {
+        (
+            Some((bands::SHED_CONDITION_SEEN, None, String::new())),
+            format!(
+                "told not yet AFTER their required condition was seen: {}; the probe cannot see its own event, so it is ours to read",
+                seen_now
+                    .iter()
+                    .map(|(on, branch)| format!("{branch}, waiting on {on}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        )
+    } else if !unqualified_waits.is_empty() {
+        (
+            Some((bands::SHED_WAIT_UNQUALIFIED, None, String::new())),
+            unqualified_waits.join("; "),
+        )
+    } else if !recorded_waits.is_empty() && ours == 0 {
+        (
+            Some((bands::SHED_WAIT_EXPECTED, None, String::new())),
+            recorded_waits
+                .iter()
+                .map(|wait| {
+                    format!(
+                        "waiting on {}: {} ({}); owner {}; next check {}",
+                        wait.condition_owner,
+                        wait.condition,
+                        wait.title,
+                        wait.owner,
+                        wait.next_check_at
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
         )
     } else if let Some((oldest, branch)) = stale.first().copied() {
         // The age is the finding, so it leads — and the oldest car is
@@ -353,6 +481,28 @@ pub(super) fn shed(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
     } else {
         (None, "every landed car is proven".to_string())
     };
+    // An immediate ownership/observer fault does not erase the owned
+    // waits beside it. Keep their conditions visible while preserving
+    // the genuine fault as the region's deciding finding.
+    let why = if decided_by
+        .as_ref()
+        .is_some_and(|(band, _, _)| *band != bands::SHED_WAIT_EXPECTED)
+        && !recorded_waits.is_empty()
+    {
+        let waits = recorded_waits
+            .iter()
+            .map(|wait| {
+                format!(
+                    "waiting on {}: {} ({})",
+                    wait.condition_owner, wait.condition, wait.title
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("{why}; the rest wait on their declared owner — {waits}")
+    } else {
+        why
+    };
     let settled = match decided_by {
         Some((band, since, measured)) => settle(
             vec![Finding::new(band, since, measured, why)],
@@ -376,6 +526,7 @@ pub(super) fn shed(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
         })
         .collect();
     Region {
+        waits: recorded_waits,
         places,
         ..region(
             "shed",
@@ -398,7 +549,9 @@ pub const SHED_PLACES: [&str; 3] = ["inspection-shed", "siding-event", "siding-n
 /// no-probe siding — the floor's `shedPlace`, over [`shed_place`].
 pub fn shed_station(place: &ShedPlace) -> &'static str {
     match place {
-        ShedPlace::ProbePending { .. } | ShedPlace::ProbeNotYet { .. } => SHED_PLACES[0],
+        ShedPlace::ProbePending { .. } | ShedPlace::ProbeNotYet { .. } | ShedPlace::ProbeUnread => {
+            SHED_PLACES[0]
+        }
         ShedPlace::WaitingOn(_) => SHED_PLACES[1],
         ShedPlace::Unproven => SHED_PLACES[2],
     }
@@ -408,6 +561,211 @@ pub fn shed_station(place: &ShedPlace) -> &'static str {
 mod tests {
     use super::*;
     use crate::regions::fixtures::*;
+
+    #[test]
+    fn a_failed_observer_is_unread_for_world_and_named_actor_waits() {
+        for owner in ["world", "actor-observer"] {
+            let metadata = json!({
+                "proof_probe": "check-proof",
+                "proof_attempt": {"exit": 75, "not_yet": true, "waits_on_exit": 2},
+                "waits_on": {"on": "the condition", "owner": owner, "seen": "read-condition"}
+            });
+            assert_eq!(
+                shed_place(&metadata),
+                ShedPlace::ProbeUnread,
+                "an observer failure is not missing ownership: {owner}"
+            );
+        }
+    }
+
+    /// The recorded exit is the evidence. A waiting flag cannot hide a
+    /// failed proof, and a flag without an outcome is not an observation.
+    #[test]
+    fn a_waiting_flag_cannot_hide_a_failed_or_unread_proof() {
+        let car = |exit: Value| {
+            let job = job(
+                "ship-a-change",
+                "fix/proof",
+                JobStatus::Open,
+                observed_wait_fixture(json!({
+                    "branch": "fix/proof", "merged": true,
+                    "opened_at": "2026-09-19T11:00:00Z",
+                    "proof_probe": "check-the-event",
+                    "proof_attempt": {
+                        "at": NOW, "probe": "check-the-event",
+                        "exit": exit, "not_yet": true, "why": "waiting flag retained", "waits_on_exit": 1,
+                    },
+                    "waits_on": {"on": "the event", "seen": "check-the-event", "owner": "world", "max_wait_hours": 24},
+                })),
+            );
+            let steps = vec![step(&job, "proven", StepStatus::Ready, None)];
+            (job, steps)
+        };
+        let status = empty_status();
+        for exit in [json!(1), Value::Null] {
+            let cars = vec![car(exit)];
+            let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+            let shed = by_name(&out, "shed");
+            assert_eq!(shed.state, RegionState::Troubled, "{}", shed.why);
+        }
+        let cars = vec![car(json!(75))];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        assert_eq!(by_name(&out, "shed").state, RegionState::Attention);
+    }
+
+    #[test]
+    fn a_recorded_next_check_qualifies_an_observed_wait_and_a_missed_check_requires_action() {
+        let status = empty_status();
+        for (next_check, expected) in [
+            ("2026-09-19T13:00:00Z", RegionState::Attention),
+            ("2026-09-19T11:30:00Z", RegionState::Troubled),
+        ] {
+            let j = job(
+                "ship-a-change",
+                "feat/observed",
+                JobStatus::Open,
+                json!({
+                    "branch": "feat/observed", "merged": true,
+                    "opened_at": "2026-09-19T10:00:00Z", "proof_probe": "check-proof",
+                    "proof_attempt": {"at": "2026-09-19T11:00:00Z", "probe": "check-proof", "exit": 75,
+                        "waits_on_probe": "check-event", "waits_on_exit": 1, "waits_on_observation": "unseen"},
+                    "waits_on": {"on": "the ordinary batch", "seen": "check-event", "owner": "world",
+                        "max_wait_hours": 26, "next_check_at": next_check}
+                }),
+            );
+            let mut claimed = step(&j, "proven", StepStatus::Active, None);
+            claimed.assignee_id = Some("agent-codex".into());
+            let cars = vec![(j, vec![claimed])];
+            let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+            let shed = by_name(&out, "shed");
+            assert_eq!(
+                shed.state, expected,
+                "next check {next_check}: {}",
+                shed.why
+            );
+            let input = inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[]));
+            let rails = crate::borders::borders(&crate::borders::BorderInputs {
+                regions: &input,
+                firings: Some(&[]),
+                dispatcher_firings: Some(&[]),
+                machines_withheld: None,
+            });
+            let rail = rails
+                .borders
+                .iter()
+                .find(|rail| rail.from == "arrivals" && rail.to == "shed")
+                .unwrap();
+            assert_eq!(
+                rail.holds[0].wait.as_ref(),
+                shed.waits.first(),
+                "the border and shed use the same qualified observation; overdue checks carry none"
+            );
+            if expected == RegionState::Attention {
+                let wire = serde_json::to_value(shed).unwrap();
+                assert_eq!(wire["waits"][0]["packet"], cars[0].0.id.to_string());
+                assert_eq!(wire["waits"][0]["owner"], "agent-codex");
+                assert_eq!(wire["waits"][0]["condition"], "the ordinary batch");
+                assert_eq!(wire["waits"][0]["next_check_at"], next_check);
+                assert_eq!(wire["waits"][0]["evidence"]["probe"], "check-event");
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_observer_requires_action_before_the_age_band() {
+        let status = empty_status();
+        let car = |observer_exit: Value| {
+            let job = job(
+                "ship-a-change",
+                "fix/observer",
+                JobStatus::Open,
+                observed_wait_fixture(json!({
+                    "branch": "fix/observer", "merged": true,
+                    "opened_at": "2026-09-19T11:00:00Z",
+                    "proof_probe": "check-the-proof",
+                    "proof_attempt": {"at": NOW, "probe": "check-the-proof", "exit": 75,
+                        "not_yet": true, "waits_on_exit": observer_exit},
+                    "waits_on": {"on": "the event", "seen": "check-the-event",
+                        "owner": "world", "max_wait_hours": 24}
+                })),
+            );
+            let steps = vec![step(&job, "proven", StepStatus::Ready, None)];
+            (job, steps)
+        };
+        let cars = vec![car(Value::Null)];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        assert_eq!(by_name(&out, "shed").state, RegionState::Troubled);
+        assert_eq!(
+            by_name(&out, "shed").kpi[0].value,
+            Some(1.0),
+            "the action count must conserve the present unread fault"
+        );
+        let cars = vec![car(json!(1))];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        assert_eq!(by_name(&out, "shed").state, RegionState::Attention);
+    }
+
+    #[test]
+    fn a_declared_world_wait_without_an_owner_requires_action_now() {
+        let status = empty_status();
+        let car = |owner: Value| {
+            let job = job(
+                "ship-a-change",
+                "fix/unowned-wait",
+                JobStatus::Open,
+                observed_wait_fixture(json!({
+                    "branch": "fix/unowned-wait", "merged": true,
+                    "opened_at": "2026-09-19T11:00:00Z",
+                    "proof_probe": "check-the-proof",
+                    "proof_attempt": {"at": NOW, "probe": "check-the-proof", "exit": 75,
+                        "not_yet": true, "waits_on_exit": 1},
+                    "waits_on": {"on": "the event", "seen": "check-the-event",
+                        "owner": owner, "max_wait_hours": 24}
+                })),
+            );
+            let steps = vec![step(&job, "proven", StepStatus::Ready, None)];
+            (job, steps)
+        };
+        let cars = vec![car(Value::Null)];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        let shed = by_name(&out, "shed");
+        assert_eq!(shed.state, RegionState::Troubled, "{}", shed.why);
+        assert!(shed.why.contains("owner") && shed.why.contains("fix/unowned-wait"));
+        let cars = vec![car(json!("world"))];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        assert_eq!(by_name(&out, "shed").state, RegionState::Attention);
+    }
+
+    #[test]
+    fn a_world_wait_without_an_observer_requires_action_now() {
+        let status = empty_status();
+        let car = |observer: Value| {
+            let job = job(
+                "ship-a-change",
+                "fix/unobserved-wait",
+                JobStatus::Open,
+                observed_wait_fixture(json!({
+                    "branch": "fix/unobserved-wait", "merged": true,
+                    "opened_at": "2026-09-19T11:00:00Z",
+                    "proof_probe": "check-the-proof",
+                    "proof_attempt": {"at": NOW, "probe": "check-the-proof", "exit": 75,
+                        "not_yet": true, "waits_on_exit": 1},
+                    "waits_on": {"on": "the event", "seen": observer,
+                        "owner": "world", "max_wait_hours": 24}
+                })),
+            );
+            let steps = vec![step(&job, "proven", StepStatus::Ready, None)];
+            (job, steps)
+        };
+        let cars = vec![car(Value::Null)];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        let shed = by_name(&out, "shed");
+        assert_eq!(shed.state, RegionState::Troubled, "{}", shed.why);
+        assert!(shed.why.contains("observer") && shed.why.contains("fix/unobserved-wait"));
+        let cars = vec![car(json!("check-the-event"))];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        assert_eq!(by_name(&out, "shed").state, RegionState::Attention);
+    }
 
     /// The shed counts open cars at `proven`; an unproven one troubles
     /// it; the trend is cars proven per day.
@@ -591,11 +949,11 @@ mod tests {
     #[test]
     fn the_shed_is_troubled_only_by_waits_that_are_ours() {
         let car = |branch: &str, on: &str, owner: Value, max: Value| {
-            let md = json!({
+            let md = observed_wait_fixture(json!({
                 "branch": branch, "merged": true, "opened_at": "2026-09-15T10:00:00Z",
                 "proof_probe": "true",
                 "proof_attempt": {
-                    "at": "2026-09-19T11:00:00Z", "not_yet": true, "exit": 75, "probe": "true",
+                    "at": "2026-09-19T11:00:00Z", "not_yet": true, "exit": 75, "probe": "true", "waits_on_exit": 1,
                     (crate::car::NOT_YET_SINCE): "2026-09-15T11:00:00Z",
                     (crate::car::NOT_YET_RUNS): 96,
                 },
@@ -604,7 +962,7 @@ mod tests {
                     (crate::car::WAITS_ON_OWNER): owner,
                     (crate::car::WAITS_ON_MAX_WAIT_HOURS): max,
                 },
-            });
+            }));
             let j = job("ship-a-change", branch, JobStatus::Open, md);
             let s = vec![
                 step(
@@ -653,13 +1011,12 @@ mod tests {
             .band
             .as_ref()
             .expect("a non-clear state names its band");
-        assert_eq!(band.id, "shed-theirs-stale");
-        assert!(band.reads.contains("oldest open 98h"), "{}", band.reads);
+        assert_eq!(band.id, "shed-wait-expected");
         assert_eq!(
-            band.held_minutes,
-            Some(74 * 60),
-            "98h open, past 24h for 74h"
+            band.held_minutes, None,
+            "a wait declaration does not record alarm onset"
         );
+        assert_eq!(shed.waits.len(), 2);
         assert_eq!(shed.kpi[0].value, Some(0.0), "none of them is ours");
         assert!(
             shed.why
@@ -679,6 +1036,18 @@ mod tests {
             shed.why.contains("past the max wait they declared")
                 && shed.why.contains("feat/late")
                 && shed.why.contains("the rest wait on their declared owner"),
+            "{}",
+            shed.why
+        );
+
+        // An unread latest attempt preserves the qualified wait beside it.
+        let (mut unread, steps) = world();
+        unread.metadata["proof_attempt"]["waits_on_exit"] = Value::Null;
+        let shed = read(&[(unread, steps), david()]);
+        assert_eq!(shed.state, RegionState::Troubled);
+        assert!(
+            shed.why
+                .contains("waiting on emp-david: a cut-a-release packet"),
             "{}",
             shed.why
         );
@@ -709,7 +1078,11 @@ mod tests {
         let shed = read(&[(j, s), david()]);
         assert_eq!(shed.state, RegionState::Troubled, "{}", shed.why);
         assert!(
-            shed.why.contains("only prose names") && shed.why.contains("feat/prose"),
+            shed.why.contains("only prose names")
+                && shed.why.contains("feat/prose")
+                && shed
+                    .why
+                    .contains("waiting on emp-david: a cut-a-release packet"),
             "{}",
             shed.why
         );
@@ -730,12 +1103,12 @@ mod tests {
                 "ship-a-change",
                 branch,
                 JobStatus::Open,
-                json!({
+                observed_wait_fixture(json!({
                     "branch": branch, "merged": true, "opened_at": opened,
                     "proof_probe": "true",
                     "proof_attempt": {
                         "at": "2026-09-19T11:00:00Z", "not_yet": true, "exit": 75,
-                        "probe": "true",
+                        "probe": "true", "waits_on_exit": 1,
                         (crate::car::NOT_YET_SINCE): "2026-09-19T10:00:00Z",
                         (crate::car::NOT_YET_RUNS): 2,
                     },
@@ -743,7 +1116,7 @@ mod tests {
                         "on": "an event", "seen": "true",
                         (crate::car::WAITS_ON_OWNER): owner,
                     },
-                }),
+                })),
             );
             let s = vec![
                 step(
@@ -757,9 +1130,18 @@ mod tests {
             (j, s)
         };
         let status = empty_status();
+        // Missing ownership is now an immediate fault, independent of
+        // age. Keep this age-band control about a genuinely unrun proof:
+        // the old observed world wait cannot supply its onset.
+        let mut ours = car("fix/ours-young", "2026-09-17T20:00:00Z", json!("world"));
+        ours.0
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("proof_attempt");
         let cars = vec![
             car("feat/theirs-old", "2026-09-12T12:00:00Z", json!("world")),
-            car("fix/ours-young", "2026-09-17T20:00:00Z", Value::Null),
+            ours,
         ];
         let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
         let shed = by_name(&out, "shed");

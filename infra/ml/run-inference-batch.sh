@@ -72,6 +72,17 @@ fi
 run_summary_field ml_api_url "$BASE"
 CURL="${BOSS_ML_CURL:-curl}"
 
+# ca356c79: name this unit's actual caller without borrowing the maintenance
+# closer or granting a role. Guest/user is the no-header default this route
+# received before attribution. This assertion is not an authenticated principal.
+if [ "${BOSS_ACTOR:-}" != 'automation:ml-inference-batch' ]; then
+  echo 'inference-batch: BOSS_ACTOR must name automation:ml-inference-batch; no request sent.' >&2
+  exit 78
+fi
+CALLER_HEADER="$(jq -cn --arg id "$BOSS_ACTOR" '{id:$id,role:"guest",access_tier:"user"}')"
+run_summary_field ml_caller "$BOSS_ACTOR"
+run_summary_field ml_caller_evidence 'unit-asserted; authenticated principal unproved'
+
 # The machine token, PRESENTED and never required (design 6805c764;
 # backlog 44b2087e). The seven POSTs below go to the record's `ml` port,
 # which is gated, and went out with nothing: the ml gate recorded
@@ -130,7 +141,7 @@ by_model='{}'
 run_model() {
   local id="$1" body written errors
   echo "==> infer-batch ${id}"
-  if ! body="$("${CURL}" -sSf -X POST ${MT_HDR:+-H "$MT_HDR"} "${BASE}/api/ml/models/${id}/infer-batch")"; then
+  if ! body="$("${CURL}" -sSf -X POST -H "x-boss-user: $CALLER_HEADER" ${MT_HDR:+-H "$MT_HDR"} "${BASE}/api/ml/models/${id}/infer-batch")"; then
     echo
     echo "inference-batch: infer-batch FAILED for ${id}" >&2
     return 1

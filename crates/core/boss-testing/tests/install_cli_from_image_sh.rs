@@ -347,6 +347,49 @@ fn installed_control_config_is_resolved_from_its_published_inputs_without_activa
 }
 
 #[test]
+fn a_new_image_generation_uses_its_own_bootstrap_even_when_the_previous_reader_is_broken() {
+    assert!(tools(), "required installer fixture tools missing");
+    let case = Case::with_image(
+        "control-reader-recovery",
+        Image {
+            control_config: true,
+            ..Image::default()
+        },
+    );
+    let (exit, output) = case.run(SHA_A, &[]);
+    assert_eq!(exit, 0, "{output}");
+    // The local fixture publishes SHA_A's archive. Move its installed
+    // layout to the old name, whose reader deliberately refuses before
+    // inspecting any archive, then require a fresh verified SHA_A pull.
+    std::fs::rename(case.store.join(SHA_A), case.store.join(SHA_B)).unwrap();
+    std::fs::remove_file(case.store.join("current")).unwrap();
+    std::os::unix::fs::symlink(SHA_B, case.store.join("current")).unwrap();
+    let previous = case.store.join(SHA_B).join("dev-control");
+    std::fs::write(
+        &previous,
+        b"#!/bin/bash\necho old-reader-refused >&2\nexit 73\n",
+    )
+    .unwrap();
+    let (exit, output) = case.run(SHA_B, &[]);
+    assert_ne!(
+        exit, 0,
+        "warm old generation must expose its broken reader: {output}"
+    );
+    assert!(output.contains("old-reader-refused"), "{output}");
+    let (exit, output) = case.run(SHA_A, &[]);
+    assert_eq!(
+        exit, 0,
+        "new generation must install without warming the old reader: {output}"
+    );
+    assert_eq!(case.current().as_deref(), Some(SHA_A));
+    assert!(case.store.join(SHA_A).join("config.json").is_file());
+    assert!(
+        !case.dev_control().exists(),
+        "recovery cannot activate isolation"
+    );
+}
+
+#[test]
 fn resolved_control_configuration_is_immutable_and_a_warm_missing_config_is_prepared() {
     assert!(tools());
     let case = Case::with_image(

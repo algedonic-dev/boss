@@ -290,8 +290,15 @@ ops_image_ready() {
 # offsite key, a database URL) reaches the caller through the attach and
 # never the docker daemon's log (backlog aa700921).
 ops_kubectl() {
+    # File input crosses Docker only with -i; ordinary reads keep their argv.
+    _ok_stdin=
+    case "$#:${1:-}" in
+        0:) ;;
+        1:--stdin) _ok_stdin='-i ' ;;
+        *) echo 'ops-credentials: ops_kubectl accepts only --stdin or no arguments' >&2; echo false; return 0 ;;
+    esac
     _ok_img="$(ops_image)" || { echo false; return 0; }
-    printf 'sudo -n docker run --rm --log-driver=none --network host --mount type=bind,src=%s,dst=/kc,readonly %s kubectl --kubeconfig=/kc\n' "$(ops_kubeconfig)" "$_ok_img"
+    printf 'sudo -n docker run --rm %s--log-driver=none --network host --mount type=bind,src=%s,dst=/kc,readonly %s kubectl --kubeconfig=/kc\n' "$_ok_stdin" "$(ops_kubeconfig)" "$_ok_img"
 }
 
 ops_boss_image() {

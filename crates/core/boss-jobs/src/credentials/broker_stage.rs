@@ -295,7 +295,16 @@ impl StageKeys for ClusterKeySet {
             .get(url)
             .header(reqwest::header::AUTHORIZATION, bearer)
             .send()
-            .map_err(|e| format!("{url}: {e}"))?;
+            .map_err(|e| {
+                use std::error::Error as _;
+                let mut why = format!("{url}: {e}");
+                let mut cause = e.source();
+                while let Some(error) = cause {
+                    why.push_str(&format!("; caused by: {error}"));
+                    cause = error.source();
+                }
+                why
+            })?;
         let status = response.status();
         if !status.is_success() {
             return Err(format!("{url}: answered {status}"));
@@ -730,3 +739,6 @@ pub async fn bind_packet(
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod transport_tests;

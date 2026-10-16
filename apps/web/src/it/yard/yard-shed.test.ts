@@ -1,3 +1,4 @@
+import { proofFixture as proofOf } from './proof-test-fixtures';
 import { describe, expect, test } from 'bun:test';
 import {
   flakeLabel,
@@ -12,20 +13,17 @@ import {
   shedTone,
 } from './yard-shed';
 import { readCarProof, type CarProof, type CarRow, type JobLite } from './yard';
+import { parseProofJobsJSON } from './proof-json';
+
+const nativeJob = (job: JobLite): JobLite =>
+  (parseProofJobsJSON(JSON.stringify({ data: [job] })) as { data: JobLite[] }).data[0]!;
 
 // The inspection shed is the floor's last stage. Every state below is a
 // real one read off live packets on 2026-09-11: one car with a probe and
 // a failed attempt, one carrying only `proof_event`, one carrying
 // nothing — one in each of the three places, all at once.
 
-const proofOf = (over: Partial<CarProof> = {}): CarProof => ({
-  probe: null,
-  expect: null,
-  event: null,
-  attempt: null,
-  stamped: null,
-  ...over,
-});
+
 
 const car = (id: string, proof: CarProof | null): CarRow => ({
   id,
@@ -84,7 +82,7 @@ describe('readCarProof', () => {
         },
       },
     };
-    expect(readCarProof(j)).toEqual({
+    expect(readCarProof(nativeJob(j))).toMatchObject({
       probe: 'bash infra/lint/x.sh --self-test',
       expect: 'MAINTENANCE-PROTOCOLS-STATE-THEIR-CATEGORY',
       event: null,
@@ -119,7 +117,7 @@ describe('readCarProof', () => {
         },
       ],
     };
-    expect(readCarProof(j)?.stamped).toEqual({ at: '2026-09-11T04:01:38Z', by: 'run-car-probe' });
+    expect(readCarProof(nativeJob(j))?.stamped).toEqual({ at: '2026-09-11T04:01:38Z', by: 'run-car-probe' });
   });
 
   test('a proven step still pending is not a stamp', () => {
@@ -132,7 +130,7 @@ describe('readCarProof', () => {
       metadata: { proof_event: 'The next train in flight.' },
       steps: [{ spec_slug: 'proven', title: 'Proven in production', status: 'pending' }],
     };
-    expect(readCarProof(j)).toEqual({
+    expect(readCarProof(nativeJob(j))).toMatchObject({
       probe: null,
       expect: null,
       event: 'The next train in flight.',
@@ -348,13 +346,13 @@ describe('the shed as a whole', () => {
 
   test('the counts and the label are the three places, nothing invented', () => {
     const shed = inspectionShed([probed, failed, evented, bare], null);
-    expect(shedCounts(shed)).toEqual({ inspecting: 2, failed: 1, notYet: 0, onEvent: 1, noProbe: 1 });
-    expect(shedLabel(shedCounts(shed))).toBe('2 inspecting · 1 probe failed · 1 on an event · 1 with no probe');
+    expect(shedCounts(shed)).toEqual({ inspecting: 2, needsAction: 2, failed: 1, unread: 0, conditionSeen: 0, notYet: 0, onEvent: 1, noProbe: 1 });
+    expect(shedLabel(shedCounts(shed))).toBe('2 inspecting · 1 probe failed · 1 proof records need attention · 1 on an event · 1 with no probe');
   });
 
   test('an empty shed says clear', () => {
     expect(shedLabel(shedCounts([]))).toBe('clear');
-    expect(shedCounts([])).toEqual({ inspecting: 0, failed: 0, notYet: 0, onEvent: 0, noProbe: 0 });
+    expect(shedCounts([])).toEqual({ inspecting: 0, needsAction: 0, failed: 0, unread: 0, conditionSeen: 0, notYet: 0, onEvent: 0, noProbe: 0 });
   });
 
   test('each place states itself in one line', () => {
@@ -363,7 +361,7 @@ describe('the shed as a whole', () => {
       'inspection shed · probe queued on the forge',
       'inspection shed · probe failed, exit 1',
       'siding · waiting on an event, no probe can settle it',
-      'siding · no probe recorded',
+      'siding · no proof or event recorded — needs attention',
     ]);
   });
 
@@ -390,10 +388,10 @@ describe('the shed as a whole', () => {
     expect(shedCounts(shed).failed).toBe(0);
   });
 
-  test('a failed probe draws red; a siding is a holding track, not an alarm', () => {
+  test('a failed probe and an unproven packet draw red; an event siding retains its disposition', () => {
     const shed = inspectionShed([probed, failed, evented, bare], null);
-    expect(shed.map(shedTone)).toEqual(['ok', 'red', 'static', 'static']);
-    expect(shed.map(shedLamp)).toEqual(['working', 'err', 'off', 'off']);
+    expect(shed.map(shedTone)).toEqual(['ok', 'red', 'static', 'red']);
+    expect(shed.map(shedLamp)).toEqual(['working', 'err', 'off', 'err']);
   });
 
   test('a probe that said not yet stands in the shed working, not red, and is counted apart', () => {
@@ -417,7 +415,7 @@ describe('the shed as a whole', () => {
       opened_on: '2026-09-12',
       metadata: { branch: 'feat/g', proof_probe: 'x', proof_attempt: { exit: 75, why: 'NOT YET: …' } },
     };
-    expect(readCarProof(j)?.attempt?.notYet).toBe(true);
+    expect(readCarProof(nativeJob(j))?.attempt?.notYet).toBe(true);
   });
 });
 
@@ -457,4 +455,57 @@ describe('the flake tally', () => {
     expect(flakeTally([])).toEqual([]);
     expect(flakeLabel([])).toBe('no flakes in the runs read');
   });
+});
+
+// Observed outcomes outrank retry convenience flags.
+function observed(attempt: Record<string, unknown>) {
+  const job: JobLite = { id: 'synthetic-outcome', kind: 'ship-a-change', title: 'outcome', status: 'open', opened_on: '2026-10-15', metadata: { proof_probe: 'synthetic-no-effect', proof_attempt: attempt } };
+  const proof = readCarProof(nativeJob(job));
+  const row = car(job.id, proof);
+  const shed = inspectionShed([row], null);
+  return { proof, row: shed[0]!, counts: shedCounts(shed) };
+}
+test('a typed unexecuted environment refusal cannot draw as observed not yet', () => {
+  const x = observed({ exit: null, not_yet: true, environment: true, why: 'ENVIRONMENT REFUSAL: no execution' });
+  expect(x.proof?.attempt?.notYet).toBe(false);
+  expect(x.counts.notYet).toBe(0);
+  expect(shedTone(x.row)).toBe('red');
+});
+test('a recorded failing integer exit outranks a conflicting convenience flag', () => {
+  const x = observed({ exit: 1, not_yet: true, why: 'actual failure' });
+  expect(x.proof?.attempt?.notYet).toBe(false);
+  expect(x.counts.failed).toBe(1);
+  expect(shedTone(x.row)).toBe('red');
+});
+test('a missing exit is called unread rather than asserting the probe ran', () => {
+  const x = observed({ exit: null, why: 'no observed outcome' });
+  expect(shedStatus(x.row)).toContain('unread');
+});
+test('actual exit75 without convenience flag preserves the observed wait', () => {
+  const x = observed({ exit: 75, why: 'observed not yet' });
+  expect(x.proof?.attempt?.notYet).toBe(true);
+  expect(x.counts.notYet).toBe(1);
+  expect(shedTone(x.row)).toBe('ok');
+});
+
+test('an unread attempt stays distinct from an observed failure in counts', () => {
+ const x = observed({exit:null,not_yet:true,environment:true});
+ expect(x.counts.failed).toBe(0);
+ expect(x.counts.unread).toBe(1);
+});
+test('malformed and missing outcomes cannot become observed waits through flags', () => {
+ for (const exit of [undefined, '75', 1.5, NaN, Infinity]) {
+  const x = observed({exit,not_yet:true});
+  expect(x.proof?.attempt?.exit).toBeNull();
+  expect(x.proof?.attempt?.notYet).toBe(false);
+  expect(x.counts.unread).toBe(1);
+  expect(shedTone(x.row)).toBe('red');
+ }
+});
+test('observed success cannot be relabeled as waiting by a convenience flag', () => {
+ const x=observed({exit:0,not_yet:true});
+ expect(x.proof?.attempt?.notYet).toBe(false);
+ expect(x.counts.failed).toBe(0);
+ expect(x.counts.unread).toBe(0);
+ expect(x.counts.notYet).toBe(0);
 });

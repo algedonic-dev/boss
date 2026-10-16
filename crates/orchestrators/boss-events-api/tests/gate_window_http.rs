@@ -358,7 +358,7 @@ async fn the_actual_transport_requires_one_json_document_and_preserves_refusals(
 }
 
 #[tokio::test]
-async fn the_actual_transport_follows_no_redirect_and_times_out_as_a_named_gap() {
+async fn the_actual_transport_refuses_a_redirect_without_reading_its_target() {
     use boss_events_api::gate_window_http::LocalTallies;
     let target_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let target = serve(Upstream {
@@ -377,22 +377,26 @@ async fn the_actual_transport_follows_no_redirect_and_times_out_as_a_named_gap()
             target.base,
             boss_events_api::gate_window_http::POLICY_REFUSALS_PATH
         )),
-        delay: std::time::Duration::ZERO,
+        delay: std::time::Duration::from_millis(100),
         reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     })
     .await;
     let reader = LocalTallies::new(
-        fixture_client(std::time::Duration::from_millis(50)),
+        fixture_client(std::time::Duration::from_secs(1)),
         vec![("policy".into(), redirect.base.clone())],
     );
+    let error = reader.read(Gate::PolicyCheck, "policy").await.unwrap_err();
+    assert!(error.contains("302"), "actual redirect error: {error:?}");
     assert!(
-        reader
-            .read(Gate::PolicyCheck, "policy")
-            .await
-            .unwrap_err()
-            .contains("302")
+        error.contains("upstream moved"),
+        "actual redirect error: {error:?}"
     );
     assert_eq!(target_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn the_actual_timeout_is_retained_as_a_named_gap_with_its_cause() {
+    use boss_events_api::gate_window_http::LocalTallies;
     let slow = serve(Upstream {
         body: "{}".into(),
         status: StatusCode::OK,
@@ -405,12 +409,35 @@ async fn the_actual_transport_follows_no_redirect_and_times_out_as_a_named_gap()
         fixture_client(std::time::Duration::from_millis(30)),
         vec![("policy".into(), slow.base.clone())],
     );
+    // Pin the actual transport classification, independently of the string adapter.
+    let url = format!(
+        "{}{}",
+        slow.base,
+        boss_events_api::gate_window_http::POLICY_REFUSALS_PATH
+    );
+    let transport = fixture_client(std::time::Duration::from_millis(30));
+    let transport_error = transport
+        .get(&url)
+        .header(
+            "x-boss-user",
+            serde_json::to_string(&boss_policy_client::User::service("events")).unwrap(),
+        )
+        .send()
+        .await
+        .unwrap_err();
     assert!(
-        reader
-            .read(Gate::PolicyCheck, "policy")
-            .await
-            .unwrap_err()
-            .contains("GET")
+        transport_error.is_timeout(),
+        "actual transport error: {transport_error:?}"
+    );
+    let error = reader.read(Gate::PolicyCheck, "policy").await.unwrap_err();
+    assert!(
+        error.contains(&format!("GET {url}")),
+        "actual named gap: {error:?}"
+    );
+    assert!(error.contains("timed out"), "actual named gap: {error:?}");
+    assert!(
+        error.contains("operation timed out"),
+        "actual named gap: {error:?}"
     );
 }
 

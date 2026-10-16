@@ -1,0 +1,8 @@
+{
+  "about": "READ-ONLY: two bounded passive metadata samples of the live gate volume, through the forge's existing Kubernetes and Talos doors (design a3053877, item82ffaff3). Takes no arguments. Native PVC/PV/Node/estate/Talos volume and stable disk identities must agree; no kernel-device argument, arbitrary read, shell, configuration, grant, SMART helper, cleanup, tuning or experiment. Raw versioned records are attached in bounded chunks to this ops request using boss attach and verified by that door; stdout names the artifacts and unavailable fields. Media health remains unavailable. Source tests do not establish native field availability or performance improvement. Collection plus attachment is bounded180s, calls20s, scalar128KiB, raw8MiB, roster128; incomplete evidence fails explicitly and retains its local record.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/read-gate-storage.sh"],
+  "params": [],
+  "capture": "separate-streams",
+  "timeout": 190
+}

@@ -1147,6 +1147,19 @@ pub const UNGATED: &[Ungated] = &[
           or at its own 60 s bound. Each of these is held by a test beside the code \
           (review 0bd6a9c2, F1), not by this sentence.",
     },
+    Ungated {
+        service: None,
+        file: "crates/orchestrators/boss-cli/src/launch_controller/managed_cache/collection/tls.rs",
+        why: "the dedicated private collector channel of accepted design \
+          001fe8d0-d3d8-4ac2-bad3-87eb8395024c, not an estate machine door. Its entry \
+          accepts only a handshaken TLS stream; the fixed collection route verifies \
+          the short-lived collection-audience bearer, collector ServiceAccount and \
+          Pod incarnation against protected installation and native records BEFORE \
+          polling private bytes. Asserted x-boss-user or x-boss-machine-token headers \
+          grant no authority. Authentication, scope, replay, plaintext and real TLS \
+          controls live beside collection.rs and collection/tls.rs. Installation and \
+          native qualification remain separately owed; no machine-token slot is rotated here.",
+    },
 ];
 
 /// Does the server named `service` (a `boss-ports` name) mount a gate?
@@ -4038,6 +4051,22 @@ mod tests {
             "the private reader requires an explicit ungated rationale"
         );
         assert_eq!(reader.unwrap().service, None);
+        assert!(is_gated("jobs") && is_gated("dispatcher"));
+    }
+
+    #[test]
+    fn the_private_collector_uses_its_own_bound_identity_not_a_machine_token() {
+        let collector = UNGATED.iter().find(|entry| {
+            entry.file == "crates/orchestrators/boss-cli/src/launch_controller/managed_cache/collection/tls.rs"
+        });
+        let collector = collector
+            .expect("the private collector requires its explicit authentication classification");
+        assert_eq!(collector.service, None);
+        assert!(
+            collector
+                .why
+                .contains("001fe8d0-d3d8-4ac2-bad3-87eb8395024c")
+        );
         assert!(is_gated("jobs") && is_gated("dispatcher"));
     }
 

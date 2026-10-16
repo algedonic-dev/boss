@@ -1,0 +1,9 @@
+# ca356c79: the daily unit's infer-batch calls previously carried no actor.
+# This row records its own asserted caller, not the maintenance closer.
+# Guest/user preserves the existing no-header User default. No policy grant,
+# authenticated principal, prediction provenance or new write authority is
+# established here. Native attribution and the clean token watch remain owed.
+[[automation]]
+id = "automation:ml-inference-batch"
+role = "guest"
+description = 'The daily ML inference batch on the root-owned GCP unit; asserted caller only, at the existing anonymous-default guest authority.'

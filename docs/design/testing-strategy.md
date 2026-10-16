@@ -190,6 +190,54 @@ answer "yes" stops the search:
 
 ## Anti-patterns
 
+### Clock and physical completion witnesses
+
+Domain time, authentication time, record timestamps and the test harness's
+timeout serve different contracts. Inject domain time for a query window;
+keep wall time where a record or external authentication protocol requires
+it. An elapsed ingress budget is absolute: earlier preparation consumes
+it, and a later port receives only what remains. A harness timeout bounds
+the observation; it must not restart or enlarge the production deadline.
+
+For mocked browser tests that assert elapsed ages or animation frames,
+use `tests/mocked/_clock.ts`'s `holdClock(page, now)` before navigation.
+Installing Playwright time alone keeps it advancing while HTTP and host
+scheduling settle. The helper refuses an already navigated page; only
+explicit `runFor` advances the held page. Its lead before pausing is a
+blank-page setup allowance, not added age or a production timeout.
+`yard-refresh` and `it-map-live` share this boundary; the focused consumer
+pin refuses local install/pause copies in those measured specs. Other
+raw-clock specs still require individual inspection: real-time behavior
+must retain a real-clock integration witness.
+
+Observe completion through the relevant port. `_clock.ts`'s
+`responseBarrier` reports that a mocked route actually arrived and lets
+the test release it, including in teardown. A host delay after observed
+arrival can test scheduling adversity; sleeping and assuming arrival
+cannot. The yard refresh regression delays a failed response while
+checking unchanged browser time, the original ten/eleven-second age,
+retained rows and recovery. Keep a causal control that removes the pause
+and actually fails the original age assertion when changing this boundary.
+
+The same principle already appears in
+`boss-jobs/src/native_selection_store.rs`: `wait_for_actual_writer`
+observes PostgreSQL locks while racing the owning writer's completion;
+delayed-writer and escaped-writer tests cover both sides. Its HTTP
+preparation fixture observes entry to the slow station port, subtracts
+real earlier preparation from the ingress budget, then advances only the
+remaining virtual time. Reuse these mechanisms, preserving slow-port
+refusal and the original production bounds. Do not replace database
+contracts with mocked arrivals or label a completed writer as blocked.
+
+The inventory and acceptance record for the wider clock/barrier work is
+packet `a4896fd2-0589-439b-bad6-e8a9dba9e34c`. The shared browser boundary
+does not certify every raw-clock spec, rerun the Rust controls, or settle
+calendar-window coverage. The production routes/regions window audit is
+separately owned by `5fb858ea-a4fc-4500-8e4c-ed42f71f8a90`; preserve that
+ownership and the distinction between domain windows and wall stamps.
+
+### General checks
+
 - **Mock the database in tests where the schema is the contract.**
   Adapters get tested against real Postgres. A passing mocked
   test that fails against `PgInventory` has bought zero

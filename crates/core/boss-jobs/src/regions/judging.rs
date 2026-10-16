@@ -6,6 +6,12 @@
 
 use super::*;
 
+pub(super) fn exact_source_head(value: Option<&Value>) -> Option<&str> {
+    value.and_then(Value::as_str).filter(|head| {
+        matches!(head.len(), 40 | 64) && head.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
 pub(super) fn md_str<'a>(md: &'a Value, key: &str) -> &'a str {
     md.get(key).and_then(Value::as_str).unwrap_or("")
 }
@@ -200,6 +206,7 @@ pub(super) fn region(
         bound_kind: bound.map(|(_, k)| k),
         unit: unit.to_string(),
         state: settled.state,
+        waits: Vec::new(),
         why: settled.why,
         band: settled.band,
         trend,

@@ -36,3 +36,7 @@ python3
 # The deposit renderer validates the public ed25519 host pin locally.
 # A missing parser must fail the image's tool check before its suites.
 ssh-keygen
+# Native gate reservation controls use the real client against loopback.
+kubectl
+# procps supplies the external process-group cancellation binary.
+kill

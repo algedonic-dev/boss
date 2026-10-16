@@ -34,7 +34,11 @@ for their node's roles, the recorded probe's reader, and the disk sweep's
 train read — and a tree scan found eleven more that had not called in
 the window. All sixteen are
 rows now. A reader holds `audit-readonly`, the role `sor_reader_header`
-already signs it with, so the bundle spells two roles and no third.
+already signs it with. The daily ML batch adds the existing anonymous-default
+`guest` role (ca356c79), recording its own previously unnamed caller without
+granting privileged authority. Its unit assertion does not authenticate a
+principal or establish prediction provenance; the native clean watch remains
+a separate proof.
 
 Three rows hold LESS than their script asserts: `disk-floor-sweep`,
 `prune-registry-versions` and `machine-token-deposit` send

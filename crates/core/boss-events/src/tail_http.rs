@@ -1065,3 +1065,51 @@ async fn stream(
         .keep_alive(KeepAlive::default())
         .into_response()
 }
+
+/// Complete bounded packet slice at an immutable audit sequence, never newest-only.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct HistoricalEntry {
+    pub seq: i64,
+    pub event_id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    /// Original audit insertion instant, independent of the event's timestamp.
+    pub created_at: DateTime<Utc>,
+    pub source: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
+}
+pub async fn history_through(
+    pool: &PgPool,
+    job_id: &str,
+    upto: i64,
+    limit: i64,
+) -> Result<Vec<HistoricalEntry>, String> {
+    if !(0..=4096).contains(&limit) || upto < 0 {
+        return Err("invalid historical bound".into());
+    }
+    let rows = sqlx::query_as::<_, HistoricalEntry>(
+        "SELECT id AS seq,event_id,timestamp,created_at,source,kind,payload FROM audit_log WHERE id <= $2 AND (payload->>'job_id'=$1 OR payload->>'id'=$1) ORDER BY id LIMIT $3")
+        .bind(job_id).bind(upto).bind(limit + 1).fetch_all(pool).await.map_err(|e|e.to_string())?;
+    if rows.len() as i64 > limit {
+        return Err("historical event bound exceeded".into());
+    }
+    Ok(rows)
+}
+/// Complete bounded native registry history; the caller chooses fixed domain kinds.
+pub async fn registry_history_through(
+    pool: &PgPool,
+    name: &str,
+    kinds: &[&str],
+    upto: i64,
+    limit: i64,
+) -> Result<Vec<HistoricalEntry>, String> {
+    if !(0..=4096).contains(&limit) || upto < 0 {
+        return Err("invalid historical bound".into());
+    }
+    let rows=sqlx::query_as::<_,HistoricalEntry>("SELECT id AS seq,event_id,timestamp,created_at,source,kind,payload FROM audit_log WHERE id <= $2 AND source='jobs' AND payload->>'name'=$1 AND kind=ANY($3) ORDER BY id LIMIT $4")
+        .bind(name).bind(upto).bind(kinds).bind(limit+1).fetch_all(pool).await.map_err(|e|e.to_string())?;
+    if rows.len() as i64 > limit {
+        return Err("historical event bound exceeded".into());
+    }
+    Ok(rows)
+}

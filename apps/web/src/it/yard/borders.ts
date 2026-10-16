@@ -24,6 +24,7 @@
 import { fetchRemote, type Remote } from '../../data/remote';
 import { NOT_IN_SCOPE } from '../../policy/withheld';
 import type { RegionState, Trend } from './regions';
+import { parseRecordedWait, type RecordedWait } from './waits';
 
 /** What moves packets across a border, and what records that it fired
  *  — the server's `MachineKind`, kebab-cased on the wire. */
@@ -47,7 +48,7 @@ export type Machine = Readonly<{
 }>;
 
 /** One packet standing at a border, with the record's own reason. */
-export type Hold = Readonly<{ what: string; why: string }>;
+export type Hold = Readonly<{ what: string; why: string; wait?: RecordedWait }>;
 
 export type Border = Readonly<{
   from: string;
@@ -153,7 +154,8 @@ function parseBorder(raw: unknown): Border {
     waiting: numberOrNull(o.waiting),
     holds: holds.map((h) => {
       const held = asObject(h, 'hold');
-      return { what: String(held.what ?? ''), why: String(held.why ?? '') };
+      return { what: String(held.what ?? ''), why: String(held.why ?? ''),
+        ...(held.wait == null ? {} : { wait: parseRecordedWait(held.wait) }) };
     }),
     holds_by_class: parseClasses(o.holds_by_class),
     flowing: boolOrNull(o.flowing),

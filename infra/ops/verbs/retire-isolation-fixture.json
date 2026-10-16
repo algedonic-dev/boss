@@ -1,0 +1,9 @@
+{
+  "about": "MUTATING: David's accepted a21c491c-6a72-4698-804d-65cc38e68f9c R1 permits only retirement of the original fixed synthetic fixture. Copy and independently read back complete evidence before deletion; enforce the recorded original Service and Job UIDs at the API server and independently observe their absence. Acknowledgement, TTL, expiry, a missing original or a changed UID is not teardown proof. No clearing unresolved intent, re-creation, grant, credential or isolation change.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/isolation-fixture.sh", "retire", "{1}"],
+  "params": [{"name": "original_request", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}],
+  "capture": "separate-streams",
+  "effect": "^isolation-fixture: TEARDOWN original-request [0-9a-f-]{36} original UID absence and evidence readback verified$",
+  "timeout": 120
+}

@@ -21,6 +21,10 @@
 //! idea quietly becomes decoration — which is the sharper version of
 //! the declared-but-unenforced class the a2358e7c sweep hunts.
 
+//! tree-wide pin — the record must retain the VSM mapping whichever
+//! scoped car changes it; running this target does not require running
+//! every unrelated boss-testing target (urgent271a2f6e).
+
 use boss_testing::repo_root;
 
 const MAPPING_HEADING: &str = "### The Viable System Model, mapped";

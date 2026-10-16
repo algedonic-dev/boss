@@ -93,14 +93,15 @@ pub(super) fn command(
     input: Option<&[u8]>,
     output: &Output,
 ) -> Result<()> {
+    keep(path, &command_value(args, input, output))
+}
+
+pub(super) fn command_value(args: &[&str], input: Option<&[u8]>, output: &Output) -> Value {
     let base64 = base64::engine::general_purpose::STANDARD;
-    keep(
-        path,
-        &json!({"version":1,"argv":args,
+    json!({"version":1,"argv":args,
         "input_b64":input.map(|bytes|base64.encode(bytes)),
         "stdout_b64":base64.encode(&output.stdout),"stderr_b64":base64.encode(&output.stderr),
-        "exit":output.status.code()}),
-    )
+        "exit":output.status.code()})
 }
 
 pub(super) fn recovered_launch(

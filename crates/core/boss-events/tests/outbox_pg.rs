@@ -365,6 +365,73 @@ async fn stage(db: &TestDb, e: &Event) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_identity_refusal_releases_its_row_before_returning() {
+    use boss_core::audit::AuditWriter;
+    use std::sync::atomic::AtomicBool;
+
+    let db = TestDb::new().await;
+    let original = event("events.outbox.pruned");
+    boss_events::PgAuditWriter::new(db.pool.clone())
+        .write(&original)
+        .await
+        .unwrap();
+    let mut conflicting = original.clone();
+    conflicting.source = "different-fact".into();
+    stage(&db, &conflicting).await;
+
+    // SQLx flushes a dropped transaction's queued rollback AFTER this
+    // hook. Hold that real return path: a completed refusal must not
+    // depend on the pool's background task releasing its row later.
+    let first_release = Arc::new(AtomicBool::new(true));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_release({
+            let first_release = first_release.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            move |_connection, _metadata| {
+                let first_release = first_release.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    if first_release.swap(false, Ordering::SeqCst) {
+                        entered.notify_one();
+                        release.acquire().await.unwrap().forget();
+                    }
+                    Ok(true)
+                })
+            }
+        })
+        .connect_lazy_with((*db.pool.connect_options()).clone());
+    let bus = RecordingEventBus::new();
+    let first = drain_outbox_once(&pool, &(bus.clone() as Arc<dyn EventBus>), 100)
+        .await
+        .unwrap_err();
+    assert!(first.contains("immutable identity conflict"), "{first}");
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the first real connection reached its return hook");
+    let second = drain_outbox_once(&pool, &(bus.clone() as Arc<dyn EventBus>), 100).await;
+    // Release before any assertion so the deliberately paused connection
+    // cannot strand test cleanup when the original implementation fails.
+    release.add_permits(1);
+    let second = second.expect_err("a returned refusal must not leave its row SKIP LOCKED");
+    assert!(second.contains("immutable identity conflict"), "{second}");
+    assert_eq!(bus.event_count(), 0);
+    assert_eq!(pending_count(&db.pool).await.unwrap(), 1);
+    let audited: serde_json::Value =
+        sqlx::query_scalar("SELECT payload FROM audit_log WHERE event_id=$1")
+            .bind(original.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(audited, original.payload);
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn identity_conflicts_never_publish_or_discard_the_queued_fact() {
     use boss_core::audit::AuditWriter;
     let db = TestDb::new().await;
@@ -530,6 +597,145 @@ async fn identity_conflict_rolls_back_the_whole_audit_batch_before_any_publish()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn identity_unique_race_finishes_rollback_before_returning_storage_error() {
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+    for (identical, delay_ms) in [(true, 0), (false, 0), (true, 250), (false, 250)] {
+        eprintln!("rollback fixture identical={identical} drain_delay_ms={delay_ms}");
+        let db = TestDb::new().await;
+        let queued = event("events.outbox.pruned");
+        stage(&db, &queued).await;
+        let mut original = queued.clone();
+        if !identical {
+            original.payload["_actor"] = serde_json::json!("emp-different");
+        }
+        let mut writer = db.pool.begin().await.unwrap();
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *writer)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audit_log (event_id,timestamp,source,kind,payload) VALUES ($1,$2,$3,$4,$5)")
+            .bind(original.id).bind(original.timestamp).bind(&original.source).bind(&original.kind).bind(&original.payload)
+            .execute(&mut *writer).await.unwrap();
+
+        // Freeze SQLx's deferred pool cleanup, not the database or drain.
+        // A refusal must finish its own rollback before handing back Err;
+        // a later pool ping is not evidence that it already finished.
+        let pid = Arc::new(AtomicI32::new(0));
+        let cleanup_armed = Arc::new(AtomicBool::new(false));
+        let cleanup = Arc::new(tokio::sync::Semaphore::new(0));
+        let released = Arc::new(tokio::sync::Notify::new());
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect({
+                let pid = pid.clone();
+                move |connection, _| {
+                    let pid = pid.clone();
+                    Box::pin(async move {
+                        pid.store(
+                            sqlx::query_scalar("SELECT pg_backend_pid()")
+                                .fetch_one(connection)
+                                .await?,
+                            Ordering::SeqCst,
+                        );
+                        Ok(())
+                    })
+                }
+            })
+            .after_release({
+                let cleanup = cleanup.clone();
+                let released = released.clone();
+                let cleanup_armed = cleanup_armed.clone();
+                move |_, _| {
+                    let cleanup = cleanup.clone();
+                    let released = released.clone();
+                    let cleanup_armed = cleanup_armed.clone();
+                    Box::pin(async move {
+                        // Connecting the pool can release its first connection
+                        // before the drain acquires it. Only hold cleanup once
+                        // the drain's actual INSERT is blocked on our writer.
+                        if cleanup_armed.load(Ordering::SeqCst) {
+                            released.notify_one();
+                            cleanup.acquire().await.unwrap().forget();
+                        }
+                        Ok(true)
+                    })
+                }
+            })
+            .connect_with((*db.pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let recording = RecordingEventBus::new();
+        let bus = recording.clone() as Arc<dyn EventBus>;
+        let mut drain = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            drain_outbox_once(&pool, &bus, 100).await
+        });
+        // A pending task is not evidence that it reached this SQL statement.
+        // The bound catches a broken fixture; PostgreSQL proves arrival.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut drain => panic!("drain finished before its INSERT wait was observed: {result:?}"),
+                    waiting = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND datname=current_database() AND state='active' AND wait_event_type='Lock' AND $2=ANY(pg_blocking_pids(pid)) AND query LIKE 'INSERT INTO audit_log%')"
+                    ).bind(pid.load(Ordering::SeqCst)).bind(writer_pid).fetch_one(&db.pool) => {
+                        if waiting.unwrap() {
+                            break;
+                        }
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain's INSERT never reached the known competing writer");
+        cleanup_armed.store(true, Ordering::SeqCst);
+        writer.commit().await.unwrap();
+        let error = drain.await.unwrap().unwrap_err();
+        assert!(error.contains("audit_log_event_id_unique"), "{error}");
+        released.notified().await;
+        let state: String = sqlx::query_scalar("SELECT state FROM pg_stat_activity WHERE pid=$1")
+            .bind(pid.load(Ordering::SeqCst))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let mut available = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM event_outbox WHERE event_id=$1 FOR UPDATE NOWAIT")
+            .bind(queued.id)
+            .fetch_one(&mut *available)
+            .await
+            .expect("refused drain retained its row lock before deferred pool cleanup");
+        available.rollback().await.unwrap();
+        cleanup.add_permits(1);
+        assert_eq!(
+            state, "idle",
+            "storage error returned before rollback finished: {error}"
+        );
+        assert_eq!(recording.event_count(), 0);
+        assert_eq!(pending_count(&db.pool).await.unwrap(), 1);
+        let retry =
+            drain_outbox_once(&db.pool, &(recording.clone() as Arc<dyn EventBus>), 100).await;
+        if identical {
+            assert_eq!(retry.unwrap().delivered, 1);
+            assert_eq!(recording.event_count(), 1);
+        } else {
+            assert!(retry.unwrap_err().contains("actor"));
+            assert_eq!(recording.event_count(), 0);
+            assert_eq!(pending_count(&db.pool).await.unwrap(), 1);
+        }
+        let audited: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM audit_log WHERE event_id=$1")
+                .bind(original.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(audited, original.payload);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn identity_concurrent_audit_writer_cannot_authorize_a_different_bus_fact() {
     for identical in [true, false] {
         let db = TestDb::new().await;
@@ -540,23 +746,49 @@ async fn identity_concurrent_audit_writer_cannot_authorize_a_different_bus_fact(
             original.payload["_actor"] = serde_json::json!("emp-different");
         }
         let mut writer = db.pool.begin().await.unwrap();
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *writer)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO audit_log (event_id,timestamp,source,kind,payload) VALUES ($1,$2,$3,$4,$5)")
             .bind(original.id).bind(original.timestamp).bind(&original.source).bind(&original.kind).bind(&original.payload)
             .execute(&mut *writer).await.unwrap();
         let recording = RecordingEventBus::new();
         let pool = db.pool.clone();
         let bus = recording.clone() as Arc<dyn EventBus>;
-        let mut drain = tokio::spawn(async move { drain_outbox_once(&pool, &bus, 100).await });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), &mut drain)
+        let drain = tokio::spawn(async move { drain_outbox_once(&pool, &bus, 100).await });
+        // Observe the actual INSERT blocked behind this writer. Elapsed
+        // time alone also passes when the drain has not been scheduled,
+        // which never exercises the SQL-error rollback path.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE datname = current_database() \
+                     AND $1 = ANY(pg_blocking_pids(pid)) \
+                     AND query LIKE 'INSERT INTO audit_log%')",
+                )
+                .bind(writer_pid)
+                .fetch_one(&db.pool)
                 .await
-                .is_err(),
-            "the competing uncommitted audit insert holds the chain lock"
-        );
+                .unwrap();
+                if blocked {
+                    break;
+                }
+                assert!(
+                    !drain.is_finished(),
+                    "drain finished before the raced insert"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the competing INSERT must reach the writer's native lock");
         writer.commit().await.unwrap();
-        // A unique-constraint race may refuse this first attempt. A
+        // The observed unique-constraint race refuses this first attempt. A
         // retry must then judge the committed whole fact, never the id.
         let first = drain.await.unwrap();
+        assert!(first.is_err(), "the raced INSERT must refuse: {first:?}");
         if identical {
             if first.is_err() {
                 assert_eq!(recording.event_count(), 0);

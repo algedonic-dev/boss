@@ -39,6 +39,11 @@ metadata_defaults = { trigger_kind = "operator", trigger_name = "gate-runner-reg
 [[workflow.step]]
 title = "record-verdict"
 kind = "gate-verdict"
+# A protocol bound, recorded on future pinned versions and read from
+# that version by the station judge. Three hours is the selected receipt
+# deadline; the runner independently enforces the same execution limit.
+# Older packets with no recorded bound remain unqualified.
+duration_hours = 3.0
 ready_when = "steps.launched.done"
 title_template = "Record the receipt"
 metadata_defaults = { heartbeat_at = "" }

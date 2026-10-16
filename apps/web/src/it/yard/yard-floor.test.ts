@@ -1,3 +1,4 @@
+import { proofFixture as proofOf } from './proof-test-fixtures';
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -99,14 +100,7 @@ const car = (id: string, branch: string, over: Partial<CarRow> = {}): CarRow => 
 
 /** What a car's packet records about proving it — the four `proof_*`
  *  fields plus the `proven` step's stamp, as [`readCarProof`] reads them. */
-const proofOf = (over: Partial<CarProof> = {}): CarProof => ({
-  probe: null,
-  expect: null,
-  event: null,
-  attempt: null,
-  stamped: null,
-  ...over,
-});
+
 
 const trainRow = (id: string, status: TrainRow['status'], over: Partial<TrainRow> = {}): TrainRow => ({
   id,
@@ -1046,8 +1040,8 @@ describe('the inspection shed', () => {
     const s = scene(yardOf({ awaitingProof: [ev, bare] }), statusOf(), NOW);
     expect(wagon(s, 'c2')).toMatchObject({ station: 'siding-event', slot: 0, tone: 'static', lamp: 'off', probe: null });
     expect(wagon(s, 'c2').status).toBe('siding · waiting on an event, no probe can settle it');
-    expect(wagon(s, 'c3')).toMatchObject({ station: 'siding-no-probe', slot: 0, tone: 'static', lamp: 'off' });
-    expect(wagon(s, 'c3').status).toBe('siding · no probe recorded');
+    expect(wagon(s, 'c3')).toMatchObject({ station: 'siding-no-probe', slot: 0, tone: 'red', lamp: 'err' });
+    expect(wagon(s, 'c3').status).toBe('siding · no proof or event recorded — needs attention');
   });
 
   // ONE BRANCH, ONE WAGON. A car in the shed has landed, so its train is
@@ -1097,8 +1091,11 @@ describe('the inspection shed', () => {
       NOW,
     );
     expect(s.machines.inspection).toEqual({
-      label: '1 inspecting · 1 on an event · 1 with no probe',
+      label: '1 inspecting · 1 proof records need attention · 1 on an event · 1 with no probe',
+      needsAction: 1,
       inspecting: 1,
+      unread: 0,
+      conditionSeen: 0,
       failed: 0,
       notYet: 0,
       onEvent: 1,
@@ -1108,7 +1105,10 @@ describe('the inspection shed', () => {
     });
     expect(scene(yardOf(), statusOf(), NOW).machines.inspection).toEqual({
       label: 'clear',
+      needsAction: 0,
       inspecting: 0,
+      unread: 0,
+      conditionSeen: 0,
       failed: 0,
       notYet: 0,
       onEvent: 0,

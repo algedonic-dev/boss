@@ -1216,6 +1216,9 @@ pub(crate) fn landed_review_lines(
 /// they are one fact read twice (bc416f60).
 fn shed_text(car: &Value) -> String {
     match shed_place(car) {
+        Shed::ProbeUnread => {
+            "proof or observer outcome unread — read the original attempt".to_string()
+        }
         Shed::ProbePending { last: None } => {
             "probe pending (the forge runs it on arrival)".to_string()
         }
@@ -3451,7 +3454,7 @@ mod tests {
         assert_eq!(
             shed_place(&landed(
                 "fix/b",
-                json!({ "proof_probe": "bash x.sh", "proof_attempt": { "why": "exit 1: grep found nothing" } })
+                json!({ "proof_probe": "bash x.sh", "proof_attempt": { "exit": 1, "why": "exit 1: grep found nothing" } })
             )),
             Shed::ProbePending {
                 last: Some("exit 1: grep found nothing".into())
@@ -3533,6 +3536,8 @@ mod tests {
                     "at": "2026-09-23T07:00:00Z", "exit": 75, "not_yet": true,
                     "probe": "bash x.sh", "why": "NOT YET: no tag",
                     "not_yet_since": "2026-09-19T05:50:00Z", "not_yet_runs": 86,
+                    "waits_on_exit": if seen_at.is_null() { 1 } else { 0 },
+                    "waits_on_observation": if seen_at.is_null() { json!("unseen") } else { Value::Null },
                     "waits_on_seen_at": seen_at,
                 } }),
             )
@@ -3543,6 +3548,21 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains("straight"), "{line}");
+        for outcome in [None, Some(Value::Null), Some(json!("1")), Some(json!(true))] {
+            let mut unread = declared(Value::Null);
+            let attempt = unread["metadata"]["proof_attempt"].as_object_mut().unwrap();
+            attempt.remove("waits_on_exit");
+            if let Some(outcome) = outcome {
+                attempt.insert("waits_on_exit".into(), outcome);
+            }
+            assert!(shed_lines(&[unread])[0].contains("outcome unread"));
+        }
+        let mut legacy_negative = declared(Value::Null);
+        legacy_negative["metadata"]["proof_attempt"]
+            .as_object_mut()
+            .unwrap()
+            .remove("waits_on_observation");
+        assert!(shed_lines(&[legacy_negative])[0].contains("outcome unread"));
         let line = &shed_lines(&[declared(json!("2026-09-23T06:00:00Z"))])[0];
         assert!(
             line.contains("was seen in the record at 2026-09-23T06:00:00Z"),
@@ -3617,7 +3637,7 @@ mod tests {
             landed("fix/probe", json!({ "proof_probe": "bash x.sh" })),
             landed(
                 "fix/failing",
-                json!({ "proof_probe": "bash x.sh", "proof_attempt": { "why": "exit 1" } }),
+                json!({ "proof_probe": "bash x.sh", "proof_attempt": { "exit": 1, "why": "exit 1" } }),
             ),
             landed("fix/forgot", json!({})),
             closed,
@@ -3643,7 +3663,7 @@ mod tests {
         let long = "x ".repeat(400);
         let lines = shed_lines(&[landed(
             "fix/long",
-            json!({ "proof_probe": "bash x.sh", "proof_attempt": { "why": long } }),
+            json!({ "proof_probe": "bash x.sh", "proof_attempt": { "exit": 1, "why": long } }),
         )]);
         let line = &lines[0];
         assert!(line.ends_with('…'), "{line}");
@@ -5267,6 +5287,7 @@ mod tests {
                     name: name.into(),
                     count,
                     waiting: None,
+                    waits: Vec::new(),
                     judged: None,
                     bound,
                     bound_kind: bound.map(|_| BoundKind::Capacity),

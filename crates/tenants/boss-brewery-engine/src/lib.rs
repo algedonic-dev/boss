@@ -818,15 +818,9 @@ pub fn start_callback_receiver() -> Arc<Mutex<VecDeque<SimBusEvent>>> {
     let Ok(bind) = std::env::var("BOSS_SIM_CALLBACK_BIND") else {
         return buffer;
     };
-    let listener = match std::net::TcpListener::bind(&bind) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!(error = %e, bind = %bind,
-                "callback receiver bind failed; counterparties will stay dark");
-            return buffer;
-        }
+    let Some(listener) = private_callback_listener(&bind) else {
+        return buffer;
     };
-    tracing::info!(bind = %bind, "external-party callback receiver listening");
 
     let buf = buffer.clone();
     std::thread::spawn(move || {
@@ -874,6 +868,32 @@ pub fn start_callback_receiver() -> Arc<Mutex<VecDeque<SimBusEvent>>> {
         }
     });
     buffer
+}
+
+// Keep the actual private bind boundary testable with a held port0 listener:
+// a test must not release a port and assume the next connection still owns it.
+fn private_callback_listener(bind: &str) -> Option<std::net::TcpListener> {
+    // This models an external counterparty inside the example tenant,
+    // not another LAN machine door (2710c8fc R4).
+    let bind = match bind.parse::<std::net::SocketAddr>() {
+        Ok(address) if address.ip().is_loopback() => address,
+        _ => {
+            tracing::warn!(
+                "callback receiver requires a literal loopback address; no listener opened"
+            );
+            return None;
+        }
+    };
+    let listener = match std::net::TcpListener::bind(bind) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, bind = %bind,
+                "callback receiver bind failed; counterparties will stay dark");
+            return None;
+        }
+    };
+    tracing::info!(bind = %bind, "external-party callback receiver listening");
+    Some(listener)
 }
 
 /// Build the sim [`Workforce`](boss_sim::workforce::Workforce) executor
@@ -1097,6 +1117,27 @@ pub fn run_brewery(seeds: &Path, days: u32, start: Option<NaiveDate>) -> Result<
 mod synth_tests {
     use super::*;
     use boss_inventory::types::{BehaviorProvenance, BehaviorSource};
+
+    #[test]
+    fn callback_receiver_accepts_only_private_loopback_bindings() {
+        use std::net::{SocketAddr, TcpStream};
+        for host in ["127.0.0.1", "::1"] {
+            let bind = SocketAddr::new(host.parse().unwrap(), 0);
+            let listener = private_callback_listener(&bind.to_string()).unwrap();
+            let address = listener.local_addr().unwrap();
+            assert!(
+                TcpStream::connect_timeout(&address, std::time::Duration::from_secs(1)).is_ok()
+            );
+            // The original listener remains held through the connection.
+            assert_eq!(listener.local_addr().unwrap(), address);
+        }
+        for bind in ["0.0.0.0:0", "[::]:0", "localhost:0", "not-an-address"] {
+            assert!(
+                private_callback_listener(bind).is_none(),
+                "private callback accepted {bind}"
+            );
+        }
+    }
 
     fn behavior(lead: f64, fulfil: f64) -> VendorBehavior {
         VendorBehavior {

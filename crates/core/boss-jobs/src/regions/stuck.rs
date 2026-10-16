@@ -135,14 +135,7 @@ fn stations_stuck(inputs: &RegionInputs<'_>) -> StuckPart {
         .collect();
     let unknown = stations
         .iter()
-        .filter(|s| !s.over_limit && s.served.is_none() && !s.members.is_empty())
-        .map(|s| {
-            format!(
-                "station {}: {} standing — the flow cube is blind to its predicate, so whether it drains cannot be told",
-                s.name,
-                s.members.len()
-            )
-        })
+        .filter_map(super::marshalling::unread_station_flow)
         .collect();
     StuckPart {
         stuck,
@@ -166,12 +159,24 @@ fn stations_stuck(inputs: &RegionInputs<'_>) -> StuckPart {
 /// the grace a green is still becoming a car, so it counts as neither.
 fn garage_stuck(inputs: &RegionInputs<'_>) -> StuckPart {
     let s = inputs.status;
-    let cars = s.held_cars.iter().map(|h| {
-        (
-            h.car.id.clone(),
-            hours_since(&h.car.parked_since, inputs.now),
-        )
-    });
+    let mut part = StuckPart::new("garage");
+    for held in &s.held_cars {
+        let qualified = inputs
+            .cars
+            .iter()
+            .find(|(car, _)| car.id.to_string() == held.car.id)
+            .is_some_and(|(car, steps)| {
+                super::garage::recorded_review_wait(car, steps, inputs).is_ok()
+            });
+        if qualified && held.kind != crate::yard::CarHoldKind::RegateRed {
+            part.waiting.push(held.car.id.clone());
+        } else {
+            part.stuck.push((
+                held.car.id.clone(),
+                hours_since(&held.car.parked_since, inputs.now),
+            ));
+        }
+    }
     let greens = s
         .held
         .iter()
@@ -189,10 +194,8 @@ fn garage_stuck(inputs: &RegionInputs<'_>) -> StuckPart {
         .chain(s.limbo.iter().map(|l| (&l.packet_id, &l.since)))
         .filter(|(_, since)| past_grace(since))
         .map(|(id, since)| (id.clone(), hours_since(since, inputs.now)));
-    StuckPart {
-        stuck: cars.chain(greens).chain(unclaimed).collect(),
-        ..StuckPart::new("garage")
-    }
+    part.stuck.extend(greens.chain(unclaimed));
+    part
 }
 
 /// THE DOCK: parked cars held on a declared ordering edge, judged by the
@@ -230,15 +233,32 @@ fn dock_stuck(inputs: &RegionInputs<'_>) -> StuckPart {
     part
 }
 
-/// THE SHED: landed cars past [`PROOF_STALE_HOURS`], split by
+/// THE SHED: immediate proof faults and cars past [`PROOF_STALE_HOURS`], split by
 /// [`stale_proof`] — the shed's own answer to whose move each is.
 fn shed_stuck(inputs: &RegionInputs<'_>) -> StuckPart {
     let mut part = StuckPart::new("shed");
-    for (j, _) in awaiting_proof(inputs.cars) {
-        let Some(opened) = meta_instant(&j.metadata, "opened_at") else {
+    for (j, steps) in awaiting_proof(inputs.cars) {
+        let opened = proof_opened_at(j);
+        let age_seconds = opened.map(|opened| (inputs.now - opened).num_seconds());
+        let hours = opened.map(|opened| (inputs.now - opened).num_hours());
+        match super::stale_proof::recorded_proof_wait(j, steps, inputs.now) {
+            Ok(Some(_)) => {
+                part.waiting.push(j.id.to_string());
+                continue;
+            }
+            Err(_) => {
+                part.stuck.push((j.id.to_string(), hours));
+                continue;
+            }
+            Ok(None) => {}
+        }
+        if super::stale_proof::proof_requires_action(&j.metadata, age_seconds) {
+            part.stuck.push((j.id.to_string(), hours));
+            continue;
+        }
+        let Some(hours) = hours else {
             continue;
         };
-        let hours = (inputs.now - opened).num_hours();
         if hours < PROOF_STALE_HOURS {
             continue;
         }
@@ -385,6 +405,142 @@ mod tests {
         assert!(older.stuck.is_empty());
     }
 
+    #[test]
+    fn immediate_proof_faults_are_counted_before_the_age_band() {
+        let status = empty_status();
+        for metadata in [
+            json!({}),
+            json!({"proof_probe": "true", "proof_attempt": {"exit": 1}}),
+            json!({"proof_probe": "true", "proof_attempt": {"exit": null}}),
+            json!({"proof_probe": "true", "proof_attempt": {"exit": 75},
+                "waits_on": {"on": "the event", "seen": "true"}}),
+            json!({"proof_probe": "true", "proof_attempt": {"exit": 75},
+                "waits_on": {"on": "the event", "owner": "world"}}),
+        ] {
+            let cars = vec![landed("fix/immediate", "2026-09-19T11:00:00Z", metadata)];
+            let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+            assert_eq!(by_name(&out, "shed").state, RegionState::Troubled);
+            let delivery = third(&out, "delivery");
+            assert_eq!(
+                delivery.stuck, 1,
+                "a red proof fault must be counted: {delivery:?}"
+            );
+            assert_eq!(delivery.waiting, 0);
+        }
+        let cars = vec![landed(
+            "fix/scheduled",
+            "2026-09-19T11:00:00Z",
+            json!({"proof_probe": "true"}),
+        )];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        assert_eq!(third(&out, "delivery").stuck, 0);
+    }
+
+    #[test]
+    fn a_declared_wait_deadline_is_not_hidden_by_the_stale_band() {
+        let status = empty_status();
+        let car = |opened| {
+            landed(
+                "fix/bounded-wait",
+                opened,
+                observed_wait_fixture(json!({
+                    "proof_probe": "true", "proof_attempt": {"exit": 75, "waits_on_exit": 1},
+                    "waits_on": {"on": "the event", "seen": "true", "owner": "world", "max_wait_hours": 1}
+                })),
+            )
+        };
+        let cars = vec![car("2026-09-19T09:00:00Z")];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        let shed = by_name(&out, "shed");
+        assert_eq!(shed.state, RegionState::Troubled, "{}", shed.why);
+        assert!(shed.why.contains("max wait") && shed.why.contains("fix/bounded-wait"));
+        assert_eq!(third(&out, "delivery").stuck, 1);
+        // One minute past the recorded bound is overdue too; rounding
+        // down to whole hours cannot grant another hour of silence.
+        let cars = vec![car("2026-09-19T10:59:00Z")];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        assert_eq!(by_name(&out, "shed").state, RegionState::Troubled);
+        assert_eq!(third(&out, "delivery").stuck, 1);
+        let cars = vec![car("2026-09-19T11:00:00Z")];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        assert_eq!(by_name(&out, "shed").state, RegionState::Attention);
+        assert_eq!(third(&out, "delivery").stuck, 0);
+    }
+
+    #[test]
+    fn mutable_metadata_cannot_move_a_native_wait_deadline() {
+        let status = empty_status();
+        let mut car = landed(
+            "fix/native-clock",
+            "2026-09-19T11:00:00Z",
+            observed_wait_fixture(json!({
+                "proof_probe": "true", "proof_attempt": {"exit": 75, "waits_on_exit": 1},
+                "waits_on": {"on": "the event", "seen": "true", "owner": "world", "max_wait_hours": 1}
+            })),
+        );
+        car.0.opened_at = Some(t("2026-09-19T09:00:00Z"));
+        let cars = vec![car.clone()];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        assert_eq!(by_name(&out, "shed").state, RegionState::Troubled);
+        assert_eq!(third(&out, "delivery").stuck, 1);
+        // The reverse mismatch cannot invent an overdue native record.
+        car.0.opened_at = Some(t("2026-09-19T11:00:00Z"));
+        car.0.metadata["opened_at"] = json!("2026-09-19T09:00:00Z");
+        let cars = vec![car];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        assert_eq!(by_name(&out, "shed").state, RegionState::Attention);
+        assert_eq!(third(&out, "delivery").stuck, 0);
+    }
+
+    #[test]
+    fn an_unread_clock_does_not_erase_a_known_proof_fault() {
+        let status = empty_status();
+        let mut car = landed(
+            "fix/unread-clock",
+            "2026-09-19T11:00:00Z",
+            json!({
+                "proof_probe": "true", "proof_attempt": {"exit": 1}
+            }),
+        );
+        car.0.metadata.as_object_mut().unwrap().remove("opened_at");
+        assert!(car.0.opened_at.is_none());
+        let cars = vec![car];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        assert_eq!(by_name(&out, "shed").state, RegionState::Troubled);
+        let delivery = third(&out, "delivery");
+        assert_eq!(delivery.stuck, 1);
+        assert_eq!(delivery.oldest_hours, None, "no timestamp is invented");
+    }
+
+    #[test]
+    fn a_satisfied_condition_with_a_not_yet_proof_requires_action_now() {
+        let status = empty_status();
+        let car = |seen: Value| {
+            landed(
+                "fix/seen-event",
+                "2026-09-19T11:00:00Z",
+                observed_wait_fixture(json!({
+                    "proof_probe": "true", "proof_attempt": {"at": NOW, "probe": "true", "exit": 75, "waits_on_exit": 0,
+                        "waits_on_seen_at": seen},
+                    "waits_on": {"on": "the recorded event", "seen": "true", "owner": "world", "max_wait_hours": 24}
+                })),
+            )
+        };
+        let cars = vec![car(json!("2026-09-19T11:59:00Z"))];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        let shed = by_name(&out, "shed");
+        assert_eq!(shed.state, RegionState::Troubled, "{}", shed.why);
+        assert!(shed.why.contains("seen") && shed.why.contains("fix/seen-event"));
+        assert_eq!(third(&out, "delivery").stuck, 1);
+        let mut control = car(Value::Null);
+        control.0.metadata["proof_attempt"]["waits_on_exit"] = json!(1);
+        control.0.metadata["proof_attempt"]["waits_on_observation"] = json!("unseen");
+        let cars = vec![control];
+        let out = regions(&inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[])));
+        assert_eq!(by_name(&out, "shed").state, RegionState::Attention);
+        assert_eq!(third(&out, "delivery").stuck, 0);
+    }
+
     /// DELIVERY: stuck and waiting side by side, never summed. A landed
     /// car past a day whose move is ours is stuck; one waiting on its
     /// declared owner is waiting. A parked car behind an edge that can
@@ -408,10 +564,10 @@ mod tests {
         let world = landed(
             "feat/stripe",
             "2026-09-15T10:00:00Z",
-            json!({
+            observed_wait_fixture(json!({
                 "proof_probe": "true",
                 "proof_attempt": {
-                    "at": "2026-09-19T11:00:00Z", "not_yet": true, "exit": 75, "probe": "true",
+                    "at": "2026-09-19T11:00:00Z", "not_yet": true, "exit": 75, "probe": "true", "waits_on_exit": 1,
                     (crate::car::NOT_YET_SINCE): "2026-09-15T11:00:00Z",
                     (crate::car::NOT_YET_RUNS): 96,
                 },
@@ -419,7 +575,7 @@ mod tests {
                     "on": "a Stripe charge", "seen": "true",
                     (crate::car::WAITS_ON_OWNER): "world",
                 },
-            }),
+            })),
         );
         let fresh = landed(
             "fix/fresh",
@@ -480,6 +636,7 @@ mod tests {
                 over_limit: over,
                 members: members.iter().map(|m| (*m).to_string()).collect(),
                 served,
+                flow_blind: None,
                 previous_served: served,
                 opened: Default::default(),
             };

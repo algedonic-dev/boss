@@ -31,6 +31,7 @@ import { bandText, stateText, trendText, type Region, type RegionName } from './
 import { sourceLines, type Route } from './routes';
 import { NOT_IN_SCOPE } from '../../policy/withheld';
 import { headwayText, stationLabel } from './transit';
+import { recordedWaitText } from './waits';
 
 export type PanelField = 'route' | 'crossing' | 'rate' | 'waiting' | 'stuck' | 'trend' | 'verdict' | 'machines' | 'crossings';
 
@@ -84,7 +85,7 @@ function queueText(b: Border): string {
 /** The holds the server listed, and what it counted but did not list. */
 function holdLines(b: Border): ReadonlyArray<string> {
   const unlisted = unlistedText(b);
-  return [...b.holds.map((h) => `${h.what} — ${h.why}`), ...(unlisted === '' ? [] : [unlisted])];
+  return [...b.holds.map((h) => `${h.what} — ${h.why}${h.wait ? `; ${recordedWaitText(h.wait)}` : ''}`), ...(unlisted === '' ? [] : [unlisted])];
 }
 
 const stuckText = (b: Border): string | null =>
@@ -105,7 +106,7 @@ export function stationCells(region: Region, borders: Borders | null, now: strin
   const band = bandText(region);
   return [
     cellOf('rate', perRail((r) => [`${railHead(r)}: ${headwayText(r.border)}`], noRail)),
-    cellOf('waiting', perRail((r) => [`${railHead(r)}: ${queueText(r.border)}`, ...holdLines(r.border)], noRail)),
+    cellOf('waiting', [...perRail((r) => [`${railHead(r)}: ${queueText(r.border)}`, ...holdLines(r.border)], noRail), ...(region.waits ?? []).map(recordedWaitText)]),
     cellOf(
       'stuck',
       perRail((r) => {

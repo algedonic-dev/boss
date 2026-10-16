@@ -49,7 +49,7 @@
 #
 # Bash: it reads $SECONDS and uses `local`.
 
-curl_through_a_roll() {
+curl_through_a_roll() (
   local window=$1 who=$2 service=$3 what=$4
   shift 4
   case "$window" in
@@ -58,13 +58,34 @@ curl_through_a_roll() {
       return 2
       ;;
   esac
-  local started=$SECONDS attempt=1 pause=2 rc answer elapsed
+  # A shell string drops NULs and terminal newlines (6cc6d770). Keep
+  # stdout as bytes, including partial replies, and scope cleanup to
+  # this subshell so sourcing callers keep their own traps.
+  local started=$SECONDS attempt=1 pause=2 rc answer elapsed output_rc write_fd read_fd
+  answer=
+  trap 'rm -f -- "$answer"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   while :; do
-    rc=0; answer=$(curl "$@") || rc=$?
+    # Separate opens give the reader its own offset on every platform.
+    # Unlink before sending: SIGKILL cannot run a cleanup trap.
+    answer=$(mktemp "${TMPDIR:-/tmp}/boss-curl.XXXXXXXX") || return $?
+    exec {write_fd}>"$answer" || return $?
+    exec {read_fd}<"$answer" || return $?
+    rm -f -- "$answer" || return $?
+    rc=0; curl "$@" >&"$write_fd" || rc=$?
+    exec {write_fd}>&-
     case "$rc" in
       6|7) ;;
-      *) printf '%s' "$answer"; return "$rc" ;;
+      *)
+        output_rc=0; cat <&"$read_fd" || output_rc=$?
+        exec {read_fd}<&-
+        [ "$rc" -ne 0 ] || rc=$output_rc
+        return "$rc"
+        ;;
     esac
+    exec {read_fd}<&-
     elapsed=$((SECONDS - started))
     if [ "$elapsed" -ge "$window" ]; then
       echo "$who: $what: $service refused every connection for ${elapsed}s ($attempt attempts, curl exit $rc; waited out for up to ${window}s in case it was a rollout) — nothing was sent, so nothing landed and relaunching is safe" >&2
@@ -76,4 +97,4 @@ curl_through_a_roll() {
     attempt=$((attempt + 1))
     pause=$((pause * 2)); [ "$pause" -le 15 ] || pause=15
   done
-}
+)

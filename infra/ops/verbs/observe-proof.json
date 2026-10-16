@@ -1,0 +1,7 @@
+{
+  "about": "READ-ONLY registered native evidence observation (4196a7b1). Runs only an exact append-only proof-observers contract name from the verified converged source, through the existing boss-probe account/view/verification marker, protected GET reader and timeout. The contract fixes its original car, branch, claim version and delay; native reads and the original immutable merge derive the fixed convergence cut. Closed already-proven originals are valid observation subjects. No caller supplies script, URL, cutoff, actor, evidence or executable path. Complete selected native witness packets and original/contract/source hashes ride the separate structured result, with full raw execution streams under the existing output cap; overflow is UNKNOWN, never a cropped positive. Page bytes and unchanged old proof history are referenced explicitly, not represented as retained whole inputs. No car proof, attempt, status or step is written, and no domain operation occurs. An event-only timeout observation does not prove quotation correctness; sponsorship admission does not prove consent copying; archive integrity does not prove restore. The immutable completed ops execution is the evidence carrier, not a new ledger. Existing data-access capabilities only; native acceptance after reviewed deployment remains separately owed.",
+  "hosts": ["forge"],
+  "argv": ["boss", "observe-proof", "{1}"],
+  "params": [{"name": "contract", "pattern": "^[a-z][a-z0-9-]{0,59}-v[1-9][0-9]*$"}],
+  "timeout": 120
+}

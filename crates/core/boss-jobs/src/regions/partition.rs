@@ -387,16 +387,34 @@ impl Lookups {
         }
     }
 
-    /// Whether `region` was read at all: `None` in [`members`] otherwise.
-    fn read(&self, region: &str) -> bool {
+    /// Whether this territory's packet lookup answered. `None` means it
+    /// holds no packets (sensors measures readings); `Some(false)` is an
+    /// unread packet lookup. The mover must not collapse them (814e6c66).
+    pub fn packet_read(&self, region: &str) -> Option<bool> {
         match region {
-            "receiving" => self.untaken.is_some(),
-            "marshalling" => self.stationed.is_some(),
+            "receiving" => Some(self.untaken.is_some()),
+            "marshalling" => Some(self.stationed.is_some()),
             _ => self
                 .claims
                 .iter()
-                .any(|(name, ids)| *name == region && ids.is_some()),
+                .find(|(name, _)| *name == region)
+                .map(|(_, ids)| ids.is_some()),
         }
+    }
+
+    /// Whether `region` was read at all: `None` in [`members`] otherwise.
+    fn read(&self, region: &str) -> bool {
+        self.packet_read(region).unwrap_or(false)
+    }
+
+    /// Carriage that the placement actually chooses, retaining its exact
+    /// carrier id even when no separate cargo facts row was read.
+    pub fn carriage(&self) -> std::collections::BTreeMap<String, String> {
+        self.aboard
+            .iter()
+            .filter(|(packet, _)| matches!(place(packet, self), Placed::Aboard(_)))
+            .map(|(packet, carrier)| (packet.clone(), carrier.clone()))
+            .collect()
     }
 
     /// Every packet any lookup names.
@@ -547,6 +565,200 @@ pub(crate) fn trains_in<'a>(inputs: &RegionInputs<'a>, region: &str) -> Vec<&'a 
 mod tests {
     use super::*;
     use crate::regions::fixtures::*;
+
+    #[test]
+    fn moves_snapshot_does_not_invent_an_unread_packet_holder_for_sensors() {
+        let status = empty_status();
+        let input = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[]));
+        let snapshot = crate::moves::Snapshot::of(&input);
+        assert!(
+            snapshot.unread.is_empty(),
+            "all packet reads answered: {:?}",
+            snapshot.unread
+        );
+        assert_eq!(snapshot.place("no-packet"), crate::moves::Where::Off);
+    }
+
+    #[test]
+    fn moves_snapshot_knows_a_car_is_aboard_instead_of_retaining_its_old_dock() {
+        let car = parked("fix/native-carriage-witness", json!({}));
+        let car_id = car.0.id.to_string();
+        let train = job(
+            "pr-train",
+            "native carriage witness",
+            JobStatus::Open,
+            json!({"boarded_jobs":[car_id]}),
+        );
+        let train_id = train.id.to_string();
+        let trains = vec![(
+            train.clone(),
+            vec![step(&train, "ci", StepStatus::Ready, None)],
+        )];
+        let status = build_status_for(
+            YardInputs {
+                open_trains: &trains,
+                now: Some(t(NOW)),
+                ..Default::default()
+            },
+            Reading::Read,
+            BoardingReadings::default(),
+        );
+        let cars = vec![car];
+        let input = inputs(&status, &trains, &[], &cars, &[], Some(&[]), Some(&[]));
+        assert_eq!(
+            place(&car_id, &Lookups::of(&input)),
+            Placed::Aboard(train_id)
+        );
+        assert_eq!(
+            crate::moves::Snapshot::of(&input).place(&car_id),
+            crate::moves::Where::Off
+        );
+    }
+
+    #[test]
+    fn moves_snapshot_preserves_known_carriage_when_an_unrelated_packet_region_is_unread() {
+        use crate::moves::{
+            Baseline, CARRIES, Cause, Reading as MoveReading, Snapshot, Tick, Where,
+        };
+        let car = parked("fix/native-carriage-witness", json!({}));
+        let car_id = car.0.id.to_string();
+        let train = job(
+            "pr-train",
+            "native carriage witness",
+            JobStatus::Open,
+            json!({"boarded_jobs":[car_id]}),
+        );
+        let train_id = train.id.to_string();
+        let trains = vec![(
+            train.clone(),
+            vec![
+                step(&train, "pr", StepStatus::Completed, Some(NOW)),
+                step(&train, "ci", StepStatus::Ready, None),
+            ],
+        )];
+        let status = build_status_for(
+            YardInputs {
+                open_trains: &trains,
+                now: Some(t(NOW)),
+                ..Default::default()
+            },
+            Reading::Read,
+            BoardingReadings::default(),
+        );
+        let cars = vec![car];
+        let input = inputs(&status, &trains, &[], &cars, &[], None, Some(&[]));
+        assert_eq!(
+            place(&car_id, &Lookups::of(&input)),
+            Placed::Aboard(train_id.clone())
+        );
+        let next = Snapshot::of(&input);
+        assert_eq!(next.place(&car_id), Where::Off);
+        assert_eq!(next.place("unread-packet"), Where::Unknown);
+        let mut previous = Snapshot::default();
+        previous.places.insert(car_id.clone(), "dock");
+        previous
+            .facts
+            .insert(car_id.clone(), crate::moves::Facts::of(&cars[0].0));
+        let (baseline, reading) = crate::moves::advance(
+            Some(&Baseline {
+                cursor: 1,
+                snapshot: previous,
+            }),
+            Tick {
+                head: 2,
+                causes: vec![Cause {
+                    seq: 2,
+                    event_id: uuid::Uuid::new_v4(),
+                    at: t(NOW),
+                    kind: "jobs.job.updated".into(),
+                    packet: train_id,
+                }],
+                truncated: false,
+                snapshot: next,
+            },
+        );
+        let MoveReading::Moves(moves) = reading else {
+            panic!("a continuous observed batch")
+        };
+        let car_moves: Vec<_> = moves.iter().filter(|m| m.packet == car_id).collect();
+        assert_eq!(car_moves.len(), 1);
+        assert_eq!(
+            (car_moves[0].from.as_deref(), car_moves[0].to.as_deref()),
+            (Some("dock"), Some("gates"))
+        );
+        assert_eq!(car_moves[0].lineage.as_deref(), Some(CARRIES));
+        assert_eq!(
+            baseline.snapshot.place(&car_id),
+            Where::Off,
+            "the baseline must not retain the old dock"
+        );
+    }
+
+    #[test]
+    fn moves_snapshot_refuses_carriage_whose_carrier_region_is_not_observed() {
+        let car = parked("fix/native-carriage-witness", json!({}));
+        let car_id = car.0.id.to_string();
+        let train = job(
+            "pr-train",
+            "unplaced carrier",
+            JobStatus::Open,
+            json!({"boarded_jobs":[car_id]}),
+        );
+        let train_id = train.id.to_string();
+        let trains = vec![(
+            train.clone(),
+            vec![step(&train, "ci", StepStatus::Ready, None)],
+        )];
+        let status = empty_status();
+        let cars = vec![car];
+        let input = inputs(&status, &trains, &[], &cars, &[], None, Some(&[]));
+        assert_eq!(
+            place(&car_id, &Lookups::of(&input)),
+            Placed::Aboard(train_id)
+        );
+        assert_eq!(
+            crate::moves::Snapshot::of(&input).place(&car_id),
+            crate::moves::Where::Unknown
+        );
+    }
+
+    #[test]
+    fn moves_snapshot_conserves_partition_carriage_even_without_a_separate_car_facts_row() {
+        let car = parked("fix/native-carriage-witness", json!({}));
+        let car_id = car.0.id.to_string();
+        let train = job(
+            "pr-train",
+            "native carriage witness",
+            JobStatus::Open,
+            json!({"boarded_jobs":[car_id]}),
+        );
+        let train_id = train.id.to_string();
+        let trains = vec![(
+            train.clone(),
+            vec![
+                step(&train, "pr", StepStatus::Completed, Some(NOW)),
+                step(&train, "ci", StepStatus::Ready, None),
+            ],
+        )];
+        let status = build_status_for(
+            YardInputs {
+                open_trains: &trains,
+                now: Some(t(NOW)),
+                ..Default::default()
+            },
+            Reading::Read,
+            BoardingReadings::default(),
+        );
+        let input = inputs(&status, &trains, &[], &[], &[], None, Some(&[]));
+        assert_eq!(
+            place(&car_id, &Lookups::of(&input)),
+            Placed::Aboard(train_id)
+        );
+        assert_eq!(
+            crate::moves::Snapshot::of(&input).place(&car_id),
+            crate::moves::Where::Off
+        );
+    }
 
     /// RECEIVING UNTIL THE INTAKE STEP COMPLETES, MARSHALLING ONLY AFTER.
     /// Measured 2026-09-24: 216 of the 232 open backlog-items had

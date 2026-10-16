@@ -145,6 +145,167 @@ fn a_file_copied_nowhere_is_red() {
     );
 }
 
+/// The collector's formatted includes put the literal on the next line.
+/// The old line-oriented scanner silently omitted both real artifacts.
+fn multiline_tree(tag: &str, cargo_copies: &str, runtime_copies: &str) -> Tree {
+    let tree = Tree::new(tag, &dockerfile(cargo_copies, runtime_copies));
+    scratch::write_file(
+        &tree.0.join("crates/x/src/lib.rs"),
+        "pub const Y: &[u8] = include_bytes!(\n    \"../../../infra/x/y.toml\"\n);\n\
+         pub const Z: &str = include_str! (\n    \"../../../infra/x/z.json\",\n);\n",
+    );
+    scratch::write_file(&tree.0.join("infra/x/z.json"), "{}\n");
+    tree
+}
+
+#[test]
+fn multiline_literal_includes_missing_from_cargo_are_red() {
+    let tree = multiline_tree("multiline-missing", "", "");
+    let out = tree.run();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    for path in ["infra/x/y.toml", "infra/x/z.json"] {
+        assert!(
+            text(&out).contains(&format!("a crate reads {path} at build time")),
+            "{}",
+            text(&out)
+        );
+    }
+}
+
+#[test]
+fn multiline_literal_includes_in_runtime_only_are_red() {
+    let tree = multiline_tree("multiline-runtime", "", "COPY infra ./infra\n");
+    let out = tree.run();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    for path in ["infra/x/y.toml", "infra/x/z.json"] {
+        assert!(
+            text(&out).contains(&format!("a crate reads {path} at build time")),
+            "{}",
+            text(&out)
+        );
+    }
+}
+
+#[test]
+fn multiline_literal_includes_copied_into_cargo_are_carried() {
+    for (tag, copies) in [
+        (
+            "multiline-files",
+            "COPY infra/x/y.toml ./infra/x/y.toml\nCOPY infra/x/z.json ./infra/x/z.json\n",
+        ),
+        ("multiline-ancestor", "COPY infra ./infra\n"),
+    ] {
+        let tree = multiline_tree(tag, copies, "");
+        let out = tree.run();
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(
+            text(&out).contains("scanned 2 out-of-crate path"),
+            "{}",
+            text(&out)
+        );
+    }
+}
+
+#[test]
+fn an_unavailable_literal_matcher_refuses_instead_of_hiding_missing_copies() {
+    let tree = multiline_tree(
+        "matcher-refusal",
+        "COPY infra/x/y.toml ./infra/x/y.toml\n",
+        "",
+    );
+    scratch::write_file(
+        &tree.0.join("crates/x/build.rs"),
+        "const PATH: &str = \"../../infra/x/y.toml\";\n",
+    );
+    scratch::create_dir(&tree.0.join("bin"));
+    scratch::write_exec(
+        &tree.0.join("bin/grep"),
+        "#!/bin/sh\ncase \"$1\" in *P*) echo 'literal matcher unavailable' >&2; exit 2;; esac\nexec /usr/bin/grep \"$@\"\n",
+    );
+    let out = Command::new("bash")
+        .arg(tree.0.join(LINT))
+        .current_dir(&tree.0)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                tree.0.join("bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("literal matcher unavailable"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        !text(&out).contains("every out-of-crate path"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_valid_empty_literal_match_is_not_a_reader_failure() {
+    let tree = Tree::new("build-only", &dockerfile("COPY infra ./infra\n", ""));
+    scratch::write_file(
+        &tree.0.join("crates/x/src/lib.rs"),
+        "pub const Y: u8 = 1;\n",
+    );
+    scratch::write_file(
+        &tree.0.join("crates/x/build.rs"),
+        "const PATH: &str = \"../../infra/x/y.toml\";\n",
+    );
+    let out = tree.run();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("scanned 1 out-of-crate path"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn unavailable_build_or_coverage_readers_cannot_issue_a_clean_verdict() {
+    for reader in ["-ho", "-qE"] {
+        let tree = Tree::new("reader-refusal", &dockerfile("COPY infra ./infra\n", ""));
+        scratch::write_file(
+            &tree.0.join("crates/x/build.rs"),
+            "const PATH: &str = \"../../infra/x/y.toml\";\n",
+        );
+        scratch::create_dir(&tree.0.join("bin"));
+        scratch::write_exec(
+            &tree.0.join("bin/grep"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = '{reader}' ]; then echo 'reader unavailable' >&2; exit 2; fi\nexec /usr/bin/grep \"$@\"\n"
+            ),
+        );
+        let out = Command::new("bash")
+            .arg(tree.0.join(LINT))
+            .current_dir(&tree.0)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    tree.0.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{reader}: {}", text(&out));
+        assert!(text(&out).contains("reader unavailable"), "{}", text(&out));
+        assert!(
+            !text(&out).contains("every out-of-crate path"),
+            "{}",
+            text(&out)
+        );
+    }
+}
+
 /// A Dockerfile with no stage running cargo is one this lint cannot
 /// read; it says so instead of finding every path uncovered — or, in
 /// an earlier shape, covered by any COPY anywhere.

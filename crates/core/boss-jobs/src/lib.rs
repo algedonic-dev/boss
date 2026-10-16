@@ -61,6 +61,10 @@ pub mod me;
 pub mod memory_selection_store;
 pub mod metadata_containment;
 pub mod metadata_key;
+pub mod move_admission;
+#[cfg(feature = "postgres")]
+mod move_admission_pg;
+pub mod move_diagnosis;
 pub mod moves;
 #[cfg(feature = "postgres")]
 pub mod native_selection_store;

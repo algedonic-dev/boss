@@ -1,0 +1,339 @@
+{
+  "provenance": "Original registered run4b from analyst6ad and contemporaneous open parent from reviewer4b car.json; source-relevant stages and projection fields copied, irrelevant brief/receipt/prose removed. This is copied input shape, not a new native execution or runtime proof.",
+  "run": {
+    "id": "4b3c991d-18a4-4442-869a-6adce1c062fe",
+    "kind": "agent-run",
+    "workflow_version": 8,
+    "subject": {
+      "subject_kind": "custom",
+      "id": "bosspipeline"
+    },
+    "title": "reviewer run: Repair the measured snapshot cause of dock-to-shed shortcuts: distinguish non-packet sensor territory from unread packet",
+    "owner_id": "emp-david",
+    "status": "open",
+    "priority": "standard",
+    "opened_on": "2026-10-14",
+    "opened_at": "2026-10-14T17:03:01.285718Z",
+    "due_on": null,
+    "closed_on": null,
+    "metadata": {
+      "agent": "codex@algedonic.dev",
+      "budget_usd": 3.0,
+      "effort": "medium",
+      "host": "boss-dev-549f4b77f6-trdbp",
+      "model": "opus-5-5",
+      "opened_at": "2026-10-14T17:03:01.285718087+00:00",
+      "opened_by": "agent-codex",
+      "packet": "b94b96de-f3f0-4b97-bd93-116d87d94aac",
+      "profile": "reviewer",
+      "step": "landed-review",
+      "worker_started": {
+        "actor": "agent-codex",
+        "run": "4b3c991d-18a4-4442-869a-6adce1c062fe",
+        "schema": 1
+      }
+    },
+    "tags": [],
+    "partition": "real",
+    "simulated": false,
+    "steps": [
+      {
+        "id": "e7423fa5-bab3-40f3-8a84-38f5b697bbfb",
+        "job_id": "4b3c991d-18a4-4442-869a-6adce1c062fe",
+        "kind": "trigger",
+        "title": "Step claimed by the agent",
+        "spec_slug": "claimed",
+        "assignee_id": null,
+        "status": "completed",
+        "sort_order": 0,
+        "blocked_by": [],
+        "sign_offs_required": [],
+        "fields": [],
+        "sign_offs": [],
+        "completed_on": "2026-10-14",
+        "completed_by": null,
+        "completed_at": "2026-10-14T17:03:01.285718Z",
+        "metadata": {
+          "trigger_kind": "operator",
+          "trigger_name": "boss-dispatch"
+        },
+        "notes": null,
+        "step_plugin_version": 0,
+        "embedded_job": null
+      },
+      {
+        "id": "3c148576-af0d-4e3e-8803-76fd6e72a08f",
+        "job_id": "4b3c991d-18a4-4442-869a-6adce1c062fe",
+        "kind": "task",
+        "title": "Prompt printed",
+        "spec_slug": "briefed",
+        "assignee_id": null,
+        "status": "completed",
+        "sort_order": 1,
+        "blocked_by": [
+          "e7423fa5-bab3-40f3-8a84-38f5b697bbfb"
+        ],
+        "sign_offs_required": [],
+        "fields": [
+          {
+            "name": "prompt_bytes",
+            "field_type": "string",
+            "required": true,
+            "filled_by": "executor"
+          }
+        ],
+        "sign_offs": [],
+        "completed_on": "2026-10-14",
+        "completed_by": "agent-codex",
+        "completed_at": "2026-10-14T17:03:01.790488Z",
+        "metadata": {
+          "authority_role": "platform-admin",
+          "prompt_bytes": "107909"
+        },
+        "notes": null,
+        "step_plugin_version": 0,
+        "embedded_job": null
+      },
+      {
+        "id": "3c8e7d7c-bb93-4252-b8c1-072363238134",
+        "job_id": "4b3c991d-18a4-4442-869a-6adce1c062fe",
+        "kind": "task",
+        "title": "Building",
+        "spec_slug": "building",
+        "assignee_id": "agent-codex",
+        "status": "active",
+        "sort_order": 2,
+        "blocked_by": [
+          "3c148576-af0d-4e3e-8803-76fd6e72a08f"
+        ],
+        "sign_offs_required": [],
+        "fields": [
+          {
+            "name": "result",
+            "field_type": "gated|delivered|refused|died",
+            "required": true,
+            "filled_by": "executor"
+          }
+        ],
+        "sign_offs": [],
+        "completed_on": null,
+        "completed_by": null,
+        "completed_at": null,
+        "metadata": {
+          "authority_role": "platform-admin",
+          "records_before_claim": [
+            "launch.model"
+          ],
+          "records_before_claim_closed_at": "2026-10-14T17:03:44.562722255Z",
+          "worker_start_expectation": {
+            "minutes": 15,
+            "schema": 1
+          }
+        },
+        "notes": null,
+        "step_plugin_version": 0,
+        "embedded_job": null
+      },
+      {
+        "id": "afe8cf41-0474-4775-b1be-50a113fc89cc",
+        "job_id": "4b3c991d-18a4-4442-869a-6adce1c062fe",
+        "kind": "outcome",
+        "title": "Refused \u2014 the builder stopped without building",
+        "spec_slug": "refused",
+        "assignee_id": null,
+        "status": "pending",
+        "sort_order": 6,
+        "blocked_by": [
+          "3c8e7d7c-bb93-4252-b8c1-072363238134"
+        ],
+        "sign_offs_required": [],
+        "fields": [],
+        "sign_offs": [],
+        "completed_on": null,
+        "completed_by": null,
+        "completed_at": null,
+        "metadata": {
+          "outcome_kind": "aborted"
+        },
+        "notes": null,
+        "step_plugin_version": 0,
+        "embedded_job": null
+      }
+    ]
+  },
+  "parent": {
+    "id": "b94b96de-f3f0-4b97-bd93-116d87d94aac",
+    "kind": "ship-a-change",
+    "workflow_version": 9,
+    "subject": {
+      "subject_kind": "custom",
+      "id": "fix/preserve-known-move-placement"
+    },
+    "title": "Repair the measured snapshot cause of dock-to-shed shortcuts: distinguish non-packet sensor territory from unread packet",
+    "owner_id": "emp-david",
+    "status": "open",
+    "priority": "standard",
+    "opened_on": "2026-10-14",
+    "opened_at": "2026-10-14T16:21:31.878363Z",
+    "due_on": null,
+    "closed_on": null,
+    "metadata": {
+      "branch": "fix/preserve-known-move-placement",
+      "merged": "true"
+    },
+    "tags": [],
+    "partition": "real",
+    "simulated": false,
+    "steps": [
+      {
+        "id": "0ff5a4fd-42ca-4a9d-8ed0-e23eb4e9f2f2",
+        "job_id": "b94b96de-f3f0-4b97-bd93-116d87d94aac",
+        "kind": "task",
+        "title": "Open for review",
+        "spec_slug": "review",
+        "assignee_id": "agent-claude",
+        "status": "completed",
+        "sort_order": 4,
+        "blocked_by": [
+          "6c3dedd6-2933-45ef-a7e6-b5ed4c6cd1b6"
+        ],
+        "sign_offs_required": [],
+        "fields": [
+          {
+            "name": "pr_url",
+            "field_type": "string",
+            "required": true,
+            "filled_by": "executor"
+          },
+          {
+            "name": "completed_at",
+            "field_type": "date-time",
+            "required": false,
+            "filled_by": "executor"
+          }
+        ],
+        "sign_offs": [],
+        "completed_on": "2026-10-14",
+        "completed_by": "automation:train-conductor",
+        "completed_at": "2026-10-14T16:56:18.401316Z",
+        "metadata": {
+          "agent_budget_usd": 3.0,
+          "agent_effort": "high",
+          "agent_executor_provenance": "advisory",
+          "agent_model": "opus-5-5",
+          "agent_profile": "reviewer",
+          "authority_role": "platform-admin"
+        },
+        "notes": null,
+        "step_plugin_version": 0,
+        "embedded_job": null
+      },
+      {
+        "id": "5d8ee7d2-dd09-4977-baf8-1306e839d5fe",
+        "job_id": "b94b96de-f3f0-4b97-bd93-116d87d94aac",
+        "kind": "task",
+        "title": "Proven in prod",
+        "spec_slug": "proven",
+        "assignee_id": "agent-claude",
+        "status": "ready",
+        "sort_order": 5,
+        "blocked_by": [
+          "0ff5a4fd-42ca-4a9d-8ed0-e23eb4e9f2f2"
+        ],
+        "sign_offs_required": [],
+        "fields": [
+          {
+            "name": "verified",
+            "field_type": "string",
+            "required": true,
+            "filled_by": "executor"
+          },
+          {
+            "name": "method",
+            "field_type": "browser|api|log",
+            "required": false,
+            "filled_by": "executor"
+          },
+          {
+            "name": "proof",
+            "field_type": "string",
+            "required": true,
+            "filled_by": "executor"
+          },
+          {
+            "name": "completed_at",
+            "field_type": "date-time",
+            "required": false,
+            "filled_by": "executor"
+          }
+        ],
+        "sign_offs": [],
+        "completed_on": null,
+        "completed_by": null,
+        "completed_at": null,
+        "metadata": {
+          "authority_role": "platform-admin"
+        },
+        "notes": null,
+        "step_plugin_version": 0,
+        "embedded_job": null
+      },
+      {
+        "id": "18223eaf-5911-42b6-b147-eb743804df0c",
+        "job_id": "b94b96de-f3f0-4b97-bd93-116d87d94aac",
+        "kind": "task",
+        "title": "Reviewed after landing",
+        "spec_slug": "landed-review",
+        "assignee_id": "agent-codex",
+        "status": "active",
+        "sort_order": 6,
+        "blocked_by": [
+          "0ff5a4fd-42ca-4a9d-8ed0-e23eb4e9f2f2"
+        ],
+        "sign_offs_required": [],
+        "fields": [
+          {
+            "name": "verdict",
+            "field_type": "clean|findings",
+            "required": true,
+            "filled_by": "executor"
+          },
+          {
+            "name": "findings",
+            "field_type": "string",
+            "required": true,
+            "filled_by": "executor"
+          },
+          {
+            "name": "reviewed",
+            "field_type": "string",
+            "required": true,
+            "filled_by": "executor"
+          },
+          {
+            "name": "completed_at",
+            "field_type": "date-time",
+            "required": false,
+            "filled_by": "executor"
+          }
+        ],
+        "sign_offs": [],
+        "completed_on": null,
+        "completed_by": null,
+        "completed_at": null,
+        "metadata": {
+          "agent_budget_usd": 3.0,
+          "agent_effort": "medium",
+          "agent_executor_provenance": "advisory",
+          "agent_model": "opus-5-5",
+          "agent_profile": "reviewer",
+          "agent_run": "4b3c991d-18a4-4442-869a-6adce1c062fe",
+          "authority_role": "platform-admin"
+        },
+        "notes": null,
+        "step_plugin_version": 0,
+        "embedded_job": null
+      }
+    ]
+  }
+}

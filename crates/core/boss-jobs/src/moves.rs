@@ -45,6 +45,12 @@ use uuid::Uuid;
 
 use crate::regions::RegionInputs;
 
+// v2 hashes dispatch.rs verbatim, including its original tests. Keep that
+// versioned input immutable; the live production prefix is equality-pinned.
+#[path = "moves/dispatch_live.rs"]
+mod dispatch;
+pub use dispatch::{DispatchContext, dispatch_context};
+
 pub type Instant = chrono::DateTime<chrono::Utc>;
 
 /// The metadata keys by which one packet names ANOTHER packet it
@@ -140,6 +146,10 @@ impl Facts {
 pub struct Snapshot {
     pub places: BTreeMap<String, &'static str>,
     pub facts: BTreeMap<String, Facts>,
+    /// Exact carriage from the partition, packet -> carrier. An observed
+    /// carrier places its cargo even when an unrelated region is unread.
+    pub aboard: BTreeMap<String, String>,
+    pub dispatch: BTreeMap<String, DispatchContext>,
     /// Regions whose reading failed. While any is unread, a packet that
     /// is in no read region might be in one of these — so it is
     /// [`Where::Unknown`], never "off the map".
@@ -150,9 +160,10 @@ pub struct Snapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Where {
     At(&'static str),
-    /// On no region of the map, and every region was read.
+    /// On no region of its own: all packet regions answered, or the
+    /// partition placed it aboard an independently observed carrier.
     Off,
-    /// On no READ region, while some region was unread.
+    /// On no read region while a packet region or its carrier is unread.
     Unknown,
 }
 
@@ -170,12 +181,23 @@ impl Snapshot {
     /// members ([`crate::regions::members`]), and the facts of every row
     /// the reading holds.
     pub fn of(inputs: &RegionInputs<'_>) -> Self {
+        Self::of_with_registry(inputs, &[])
+    }
+
+    /// Preserve registration from the same original rows that place the
+    /// move. A later parent claim is never substituted for this reading.
+    pub fn of_with_registry(
+        inputs: &RegionInputs<'_>,
+        specs: &[crate::registry::WorkflowSpec],
+    ) -> Self {
         let mut places = BTreeMap::new();
         let mut unread = Vec::new();
+        let lookups = crate::regions::Lookups::of(inputs);
         for (region, ids) in crate::regions::members(inputs) {
             match ids {
                 Some(ids) => places.extend(ids.into_iter().map(|id| (id, region))),
-                None => unread.push(region),
+                None if lookups.packet_read(region).is_some() => unread.push(region),
+                None => {}
             }
         }
         let rows = inputs
@@ -188,10 +210,37 @@ impl Snapshot {
             .chain(inputs.publish_packets.unwrap_or_default())
             .map(|(j, _)| j)
             .chain(inputs.gate_runs);
-        let facts = rows.map(|j| (j.id.to_string(), Facts::of(j))).collect();
+        let facts: BTreeMap<_, _> = rows.map(|j| (j.id.to_string(), Facts::of(j))).collect();
+        let aboard = lookups.carriage();
+        let parents: Vec<_> = inputs
+            .open_trains
+            .iter()
+            .chain(inputs.closed_trains)
+            .chain(inputs.cars)
+            .chain(inputs.inbound.unwrap_or_default())
+            .chain(inputs.agent_runs.unwrap_or_default())
+            .chain(inputs.publish_packets.unwrap_or_default())
+            .chain(inputs.ops_requests.unwrap_or_default())
+            .collect();
+        let dispatch = inputs
+            .agent_runs
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|(run, steps)| {
+                let parent_id = run.metadata.get("packet")?.as_str()?;
+                let (parent, parent_steps) = parents
+                    .iter()
+                    .find(|(p, _)| p.id.to_string() == parent_id)?;
+                let active = specs.iter().find(|s| s.kind == parent.kind);
+                dispatch_context(run, steps, parent, parent_steps, active)
+                    .map(|context| (run.id.to_string(), context))
+            })
+            .collect();
         Snapshot {
             places,
             facts,
+            aboard,
+            dispatch,
             unread,
         }
     }
@@ -199,6 +248,19 @@ impl Snapshot {
     pub fn place(&self, packet: &str) -> Where {
         match self.places.get(packet) {
             Some(r) => Where::At(r),
+            None if self.aboard.contains_key(packet) => {
+                // The partition's exact carrier must itself be observed;
+                // an unread carrier never turns cargo into a guessed exit.
+                if self
+                    .aboard
+                    .get(packet)
+                    .is_some_and(|carrier| self.places.contains_key(carrier))
+                {
+                    Where::Off
+                } else {
+                    Where::Unknown
+                }
+            }
             None if self.unread.is_empty() => Where::Off,
             None => Where::Unknown,
         }
@@ -261,6 +323,10 @@ pub struct Move {
     /// on an exit whose packet the mover could not read back.
     #[serde(default)]
     pub terminal: Option<String>,
+    /// Original registered dispatch context. Never reconstructed from a
+    /// later claim or guessed for old rows that did not retain it.
+    #[serde(default)]
+    pub dispatch: Option<DispatchContext>,
 }
 
 impl Move {
@@ -436,6 +502,17 @@ impl<'a> Links<'a> {
     fn carrier(&self, p: &str, reading: &Snapshot) -> Option<(&'a str, &'static str)> {
         if reading.facts.get(p).is_some_and(|f| f.closed) {
             return None;
+        }
+        if let Some(carrier) = reading.aboard.get(p) {
+            // The partition's current carrier wins over historical cargo
+            // links retained by earlier trains (814e6c66).
+            return self
+                .names
+                .keys()
+                .copied()
+                .find(|name| *name == carrier)
+                .filter(|name| self.carries(name, p) && reading.place(name).region().is_some())
+                .map(|name| (name, CARRIES));
         }
         self.named_by
             .get(p)
@@ -622,6 +699,9 @@ pub fn moves(prev: &Snapshot, next: &Snapshot, causes: &[Cause]) -> Vec<Move> {
                     .unwrap_or_default(),
                 // Read back by the mover ([`described`]).
                 terminal: None,
+                dispatch: linked
+                    .filter(|(_, key)| handoff && *key == "packet")
+                    .and_then(|_| next.dispatch.get(p).cloned()),
             })
         })
         .collect();
@@ -637,12 +717,22 @@ pub fn judged(moves: Vec<Move>, routes: &crate::routes::RouteMap) -> Vec<Move> {
     moves
         .into_iter()
         .map(|m| Move {
-            declared: Some(routes.judges(
-                m.from.as_deref(),
-                m.to.as_deref(),
-                Some(m.kind.as_str()),
-                m.terminal.as_deref(),
-            )),
+            declared: if m
+                .dispatch
+                .as_ref()
+                .is_some_and(|d| !d.belongs_to(&m.packet, m.handoff_from.as_deref()))
+            {
+                Some(false)
+            } else {
+                routes.judges_context(
+                    m.from.as_deref(),
+                    m.to.as_deref(),
+                    Some(m.kind.as_str()),
+                    m.terminal.as_deref(),
+                    m.lineage.as_deref(),
+                    m.dispatch.as_ref(),
+                )
+            },
             ..m
         })
         .collect()
@@ -757,6 +847,14 @@ pub struct RouteCount {
     pub kind: Option<String>,
     #[serde(default)]
     pub terminal: Option<String>,
+    #[serde(default)]
+    pub lineage: Option<String>,
+    #[serde(default)]
+    pub dispatch: Option<DispatchContext>,
+    /// Current route judgment. Null for missing original dispatch
+    /// context, not a claim that the historical crossing was valid.
+    #[serde(default)]
+    pub declared: Option<bool>,
     pub moves: i64,
     pub last_at: Instant,
 }
@@ -766,19 +864,35 @@ impl RouteCount {
     /// kind and terminal.
     fn key_of(
         m: &Move,
-    ) -> (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) {
-        let exit = m.to.is_none();
+    ) -> Result<
         (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+        MovesError,
+    > {
+        let exit = m.to.is_none();
+        let dispatch =
+            m.kind == crate::agent_budget::RUN_KIND && m.lineage.as_deref() == Some("packet");
+        Ok((
             m.from.clone(),
             m.to.clone(),
-            exit.then(|| m.kind.clone()).filter(|k| !k.is_empty()),
+            (exit || dispatch)
+                .then(|| m.kind.clone())
+                .filter(|k| !k.is_empty()),
             exit.then(|| m.terminal.clone()).flatten(),
-        )
+            dispatch.then(|| m.lineage.clone()).flatten(),
+            dispatch
+                .then_some(m.dispatch.as_ref())
+                .flatten()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| MovesError::Storage(e.to_string()))?,
+        ))
     }
 }
 
@@ -788,10 +902,39 @@ pub enum MovesError {
     Storage(String),
 }
 
+fn validate_dispatch(m: &Move) -> Result<(), MovesError> {
+    if m.dispatch
+        .as_ref()
+        .is_some_and(|d| !d.belongs_to(&m.packet, m.handoff_from.as_deref()))
+    {
+        return Err(MovesError::Storage(
+            "dispatch context names another move's run or predecessor".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// THE PORT: the audit log's packet-naming events (read) and the moves
 /// record (written once per move, read by seq).
 #[async_trait]
 pub trait MovesStore: Send + Sync {
+    async fn admission_observation(
+        &self,
+        _id: Uuid,
+    ) -> Result<Option<crate::move_admission::Observation>, MovesError> {
+        Err(MovesError::Storage(
+            "admission observations unavailable".into(),
+        ))
+    }
+    async fn append_admission_observation(
+        &self,
+        _o: &crate::move_admission::Observation,
+        _e: &boss_core::event::Event,
+    ) -> Result<bool, MovesError> {
+        Err(MovesError::Storage(
+            "admission observations unavailable".into(),
+        ))
+    }
     /// `MAX(audit_log.id)`, 0 on an empty log — the one read a quiet
     /// second costs.
     async fn log_head(&self) -> Result<i64, MovesError>;
@@ -803,6 +946,29 @@ pub trait MovesStore: Send + Sync {
     async fn record(&self, moves: &[Move]) -> Result<u64, MovesError>;
     /// The recorded moves after `seq`, oldest first, at most `limit`.
     async fn since(&self, seq: i64, limit: i64) -> Result<Vec<Recorded>, MovesError>;
+    /// Append-only diagnosis/correction ledger. Unwired adapters refuse.
+    async fn correction_entries(&self) -> Result<Vec<crate::move_diagnosis::Entry>, MovesError> {
+        Err(MovesError::Storage(
+            "move correction ledger unavailable".into(),
+        ))
+    }
+    async fn append_correction(
+        &self,
+        _entry: &crate::move_diagnosis::Entry,
+        _event: &boss_core::event::Event,
+    ) -> Result<bool, MovesError> {
+        Err(MovesError::Storage(
+            "move correction ledger unavailable".into(),
+        ))
+    }
+    async fn correction_conservation(
+        &self,
+        _since: Instant,
+    ) -> Result<crate::move_diagnosis::Conservation, MovesError> {
+        Err(MovesError::Storage(
+            "move correction conservation unavailable".into(),
+        ))
+    }
     /// The newest seq recorded, 0 when there is none.
     async fn latest_seq(&self) -> Result<i64, MovesError>;
     /// Every route a move took at or after `since` — drawn or not, onto
@@ -815,13 +981,25 @@ pub trait MovesStore: Send + Sync {
 /// In-memory adapter: a log a test appends to, and the record.
 #[derive(Default)]
 pub struct InMemoryMoves {
+    admission_observations: std::sync::Mutex<BTreeMap<Uuid, crate::move_admission::Observation>>,
+    admission_events: std::sync::Mutex<Vec<boss_core::event::Event>>,
     log: std::sync::Mutex<Vec<Cause>>,
     rows: std::sync::Mutex<Vec<Recorded>>,
+    corrections: std::sync::Mutex<Vec<crate::move_diagnosis::Entry>>,
+    correction_events: std::sync::Mutex<Vec<boss_core::event::Event>>,
 }
 
 impl InMemoryMoves {
+    pub fn admission_events(&self) -> Result<Vec<boss_core::event::Event>, MovesError> {
+        Ok(self.admission_events.lock().map_err(poisoned)?.clone())
+    }
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Immutable events written atomically with the correction projection.
+    pub fn correction_events(&self) -> Result<Vec<boss_core::event::Event>, MovesError> {
+        Ok(self.correction_events.lock().map_err(poisoned)?.clone())
     }
 
     /// Append an event to the log this adapter reads.
@@ -847,6 +1025,60 @@ fn page(limit: i64) -> Result<usize, MovesError> {
 
 #[async_trait]
 impl MovesStore for InMemoryMoves {
+    async fn admission_observation(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<crate::move_admission::Observation>, MovesError> {
+        Ok(self
+            .admission_observations
+            .lock()
+            .map_err(poisoned)?
+            .get(&id)
+            .cloned())
+    }
+    async fn append_admission_observation(
+        &self,
+        o: &crate::move_admission::Observation,
+        e: &boss_core::event::Event,
+    ) -> Result<bool, MovesError> {
+        crate::move_admission::validate_event(o, e).map_err(MovesError::Storage)?;
+        let originals = self.rows.lock().map_err(poisoned)?;
+        let original = originals
+            .iter()
+            .find(|r| r.seq == o.diagnosis.original.seq)
+            .ok_or_else(|| MovesError::Storage("original missing".into()))?;
+        let entries = self.corrections.lock().map_err(poisoned)?;
+        crate::move_admission::validate_binding(o, original, &entries)
+            .map_err(MovesError::Storage)?;
+        let mut observations = self.admission_observations.lock().map_err(poisoned)?;
+        if let Some(old) = observations.get(&o.id) {
+            if !crate::move_admission::same_request(old, o) {
+                return Err(MovesError::Storage(
+                    "observation request identity conflict".into(),
+                ));
+            }
+            return Ok(false);
+        }
+        let mut events = self.admission_events.lock().map_err(poisoned)?;
+        if events.iter().any(|event| event.id == e.id) {
+            return Err(MovesError::Storage(
+                "observation event identity conflict".into(),
+            ));
+        }
+        #[cfg(feature = "postgres")]
+        if serde_json::to_vec(e)
+            .map_err(|e| MovesError::Storage(e.to_string()))?
+            .len()
+            > boss_events::outbox::MAX_STAGED_EVENT_BYTES
+        {
+            return Err(MovesError::Storage(
+                "whole observation event exceeds outbox transport bound".into(),
+            ));
+        }
+        observations.insert(o.id, o.clone());
+        events.push(e.clone());
+        Ok(true)
+    }
     async fn log_head(&self) -> Result<i64, MovesError> {
         Ok(self
             .log
@@ -873,6 +1105,7 @@ impl MovesStore for InMemoryMoves {
     }
 
     async fn record(&self, moves: &[Move]) -> Result<u64, MovesError> {
+        moves.iter().try_for_each(validate_dispatch)?;
         let mut rows = self.rows.lock().map_err(poisoned)?;
         let mut added = 0;
         // The table's own check (`yard_moves_goes_somewhere`), kept here
@@ -911,6 +1144,57 @@ impl MovesStore for InMemoryMoves {
             .collect())
     }
 
+    async fn correction_entries(&self) -> Result<Vec<crate::move_diagnosis::Entry>, MovesError> {
+        Ok(self.corrections.lock().map_err(poisoned)?.clone())
+    }
+    async fn append_correction(
+        &self,
+        entry: &crate::move_diagnosis::Entry,
+        event: &boss_core::event::Event,
+    ) -> Result<bool, MovesError> {
+        if event.kind != entry.event_kind()
+            || event.payload.get("entry")
+                != Some(
+                    &serde_json::to_value(entry).map_err(|e| MovesError::Storage(e.to_string()))?,
+                )
+        {
+            return Err(MovesError::Storage("correction event mismatch".into()));
+        }
+        let rows = self.rows.lock().map_err(poisoned)?;
+        let original = rows
+            .iter()
+            .find(|r| r.seq == entry.original_seq())
+            .ok_or_else(|| MovesError::Storage("original missing".into()))?;
+        let mut entries = self.corrections.lock().map_err(poisoned)?;
+        let mut events = self.correction_events.lock().map_err(poisoned)?;
+        let added = crate::move_diagnosis::append(&entries, entry, original)
+            .map_err(MovesError::Storage)?;
+        if added {
+            let event = crate::move_diagnosis::conserved_event(
+                entry,
+                event,
+                original,
+                entries.len() as i64 + 1,
+            )
+            .map_err(MovesError::Storage)?;
+            entries.push(entry.clone());
+            events.push(event);
+        }
+        Ok(added)
+    }
+
+    async fn correction_conservation(
+        &self,
+        since: Instant,
+    ) -> Result<crate::move_diagnosis::Conservation, MovesError> {
+        let rows = self.rows.lock().map_err(poisoned)?;
+        let entries = self.corrections.lock().map_err(poisoned)?;
+        let mut counts = crate::move_diagnosis::Conservation::default();
+        for row in rows.iter().filter(|r| r.r#move.at >= since) {
+            counts.observe(&entries, row);
+        }
+        Ok(counts)
+    }
     async fn latest_seq(&self) -> Result<i64, MovesError> {
         Ok(self
             .rows
@@ -923,16 +1207,32 @@ impl MovesStore for InMemoryMoves {
     async fn crossings(&self, since: Instant) -> Result<Vec<RouteCount>, MovesError> {
         let rows = self.rows.lock().map_err(poisoned)?;
         let mut out = BTreeMap::new();
-        for m in rows.iter().map(|r| &r.r#move) {
+        let entries = self.corrections.lock().map_err(poisoned)?;
+        for row in rows.iter() {
+            // Unavailable proof leaves the original active. Raw range reads never change.
+            if crate::move_diagnosis::active(&entries, row)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                continue;
+            }
+            let m = &row.r#move;
             if m.at < since {
                 continue;
             }
-            let key = RouteCount::key_of(m);
+            let key = RouteCount::key_of(m)?;
             let slot = out.entry(key.clone()).or_insert_with(|| RouteCount {
                 from: key.0,
                 to: key.1,
                 kind: key.2,
                 terminal: key.3,
+                lineage: key.4,
+                dispatch: (m.kind == crate::agent_budget::RUN_KIND
+                    && m.lineage.as_deref() == Some("packet"))
+                .then(|| m.dispatch.clone())
+                .flatten(),
+                declared: None,
                 moves: 0,
                 last_at: m.at,
             });
@@ -944,7 +1244,7 @@ impl MovesStore for InMemoryMoves {
 }
 
 #[cfg(feature = "postgres")]
-mod pg {
+pub(crate) mod pg {
     use super::*;
     use sqlx::{PgPool, Row};
 
@@ -964,7 +1264,7 @@ mod pg {
         MovesError::Storage(e.to_string())
     }
 
-    fn recorded(r: &sqlx::postgres::PgRow) -> Result<Recorded, MovesError> {
+    pub(crate) fn recorded(r: &sqlx::postgres::PgRow) -> Result<Recorded, MovesError> {
         let aboard: Value = r.try_get("aboard").map_err(storage)?;
         Ok(Recorded {
             seq: r.try_get("seq").map_err(storage)?,
@@ -983,12 +1283,35 @@ mod pg {
                 lineage: r.try_get("lineage").map_err(storage)?,
                 aboard: serde_json::from_value(aboard).map_err(storage)?,
                 terminal: r.try_get("terminal").map_err(storage)?,
+                dispatch: r
+                    .try_get::<Option<String>, _>("dispatch_context")
+                    .map_err(storage)?
+                    .map(|s| serde_json::from_str(&s))
+                    .transpose()
+                    .map_err(storage)?,
             },
         })
     }
 
     #[async_trait]
     impl MovesStore for PgMoves {
+        async fn admission_observation(
+            &self,
+            id: Uuid,
+        ) -> Result<Option<crate::move_admission::Observation>, MovesError> {
+            crate::move_admission_pg::get(&self.pool, id)
+                .await
+                .map_err(storage)
+        }
+        async fn append_admission_observation(
+            &self,
+            o: &crate::move_admission::Observation,
+            e: &boss_core::event::Event,
+        ) -> Result<bool, MovesError> {
+            crate::move_admission_pg::append(&self.pool, o, e)
+                .await
+                .map_err(storage)
+        }
         async fn log_head(&self) -> Result<i64, MovesError> {
             boss_events::tail_http::log_head(&self.pool)
                 .await
@@ -1018,14 +1341,15 @@ mod pg {
         }
 
         async fn record(&self, moves: &[Move]) -> Result<u64, MovesError> {
+            moves.iter().try_for_each(validate_dispatch)?;
             let mut tx = self.pool.begin().await.map_err(storage)?;
             let mut added = 0;
             for m in moves {
                 let done = sqlx::query(
                     "INSERT INTO yard_moves (at, packet, kind, label, from_region, to_region, \
                      declared, cause_event_id, cause_seq, cause_kind, handoff_from, lineage, aboard, \
-                     terminal) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                     terminal, dispatch_context) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
                      ON CONFLICT (cause_event_id, packet) DO NOTHING",
                 )
                 .bind(m.at)
@@ -1042,6 +1366,7 @@ mod pg {
                 .bind(&m.lineage)
                 .bind(serde_json::json!(m.aboard))
                 .bind(&m.terminal)
+                .bind(m.dispatch.as_ref().map(serde_json::to_string).transpose().map_err(storage)?)
                 .execute(&mut *tx)
                 .await
                 .map_err(storage)?;
@@ -1054,7 +1379,7 @@ mod pg {
         async fn since(&self, seq: i64, limit: i64) -> Result<Vec<Recorded>, MovesError> {
             let rows = sqlx::query(
                 "SELECT seq, at, packet, kind, label, from_region, to_region, declared, \
-                 cause_event_id, cause_seq, cause_kind, handoff_from, lineage, aboard, terminal \
+                     cause_event_id, cause_seq, cause_kind, handoff_from, lineage, aboard, terminal, dispatch_context \
                  FROM yard_moves WHERE seq > $1 ORDER BY seq LIMIT $2",
             )
             .bind(seq)
@@ -1065,6 +1390,113 @@ mod pg {
             rows.iter().map(recorded).collect()
         }
 
+        async fn correction_entries(
+            &self,
+        ) -> Result<Vec<crate::move_diagnosis::Entry>, MovesError> {
+            let rows: Vec<(String,)> =
+                sqlx::query_as("SELECT body FROM yard_move_corrections ORDER BY seq LIMIT 4097")
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(storage)?;
+            if rows.len() > 4096 {
+                return Err(storage("move correction ledger bound exceeded"));
+            }
+            rows.into_iter()
+                .map(|(body,)| serde_json::from_str(&body).map_err(storage))
+                .collect()
+        }
+        async fn append_correction(
+            &self,
+            entry: &crate::move_diagnosis::Entry,
+            event: &boss_core::event::Event,
+        ) -> Result<bool, MovesError> {
+            if event.source != "jobs"
+                || event.kind != entry.event_kind()
+                || event.payload.get("entry")
+                    != Some(&serde_json::to_value(entry).map_err(storage)?)
+            {
+                return Err(storage("correction event mismatch"));
+            }
+            let mut tx = self.pool.begin().await.map_err(storage)?;
+            // One writer over the ledger, preserving global request identity and order.
+            sqlx::query("LOCK TABLE yard_move_corrections IN SHARE ROW EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+            let row = sqlx::query("SELECT * FROM yard_moves WHERE seq=$1 FOR SHARE")
+                .bind(entry.original_seq())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(storage)?
+                .ok_or_else(|| storage("original missing"))?;
+            let original = recorded(&row)?;
+            let rows: Vec<(String,)> =
+                sqlx::query_as("SELECT body FROM yard_move_corrections ORDER BY seq LIMIT 4097")
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(storage)?;
+            if rows.len() > 4096 {
+                return Err(storage("move correction ledger bound exceeded"));
+            }
+            let entries: Vec<crate::move_diagnosis::Entry> = rows
+                .into_iter()
+                .map(|(body,)| serde_json::from_str(&body).map_err(storage))
+                .collect::<Result<_, _>>()?;
+            let added =
+                crate::move_diagnosis::append(&entries, entry, &original).map_err(storage)?;
+            if added {
+                let event = crate::move_diagnosis::conserved_event(
+                    entry,
+                    event,
+                    &original,
+                    entries.len() as i64 + 1,
+                )
+                .map_err(storage)?;
+                sqlx::query("INSERT INTO yard_move_corrections(seq,id,original_seq,body,event_id) VALUES($5,$1,$2,$3,$4)")
+                    .bind(entry.id()).bind(entry.original_seq()).bind(serde_json::to_string(entry).map_err(storage)?).bind(event.id)
+                    .bind(entries.len() as i64 + 1)
+                    .execute(&mut *tx).await.map_err(storage)?;
+                boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                    .await
+                    .map_err(storage)?;
+            }
+            tx.commit().await.map_err(storage)?;
+            Ok(added)
+        }
+
+        async fn correction_conservation(
+            &self,
+            since: Instant,
+        ) -> Result<crate::move_diagnosis::Conservation, MovesError> {
+            let entries = self.correction_entries().await?;
+            let raw: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM yard_moves WHERE at >= $1")
+                .bind(since)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(storage)?;
+            let candidates: Vec<i64> = entries
+                .iter()
+                .filter_map(|e| match e {
+                    crate::move_diagnosis::Entry::Correction { original_seq, .. } => {
+                        Some(*original_seq)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let rows = sqlx::query("SELECT * FROM yard_moves WHERE seq=ANY($1) AND at >= $2")
+                .bind(candidates)
+                .bind(since)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?;
+            let mut counts = crate::move_diagnosis::Conservation::default();
+            for row in rows {
+                counts.observe(&entries, &recorded(&row)?);
+            }
+            counts.active += raw - counts.raw;
+            counts.raw = raw;
+            Ok(counts)
+        }
         async fn latest_seq(&self) -> Result<i64, MovesError> {
             sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM yard_moves")
                 .fetch_one(&self.pool)
@@ -1084,20 +1516,53 @@ mod pg {
             // case (backlog 2987fb2d) — and `with_undeclared` names a
             // troubled region's routes in this order, so the two adapters
             // wrote the same reading two ways.
+            let entries = self.correction_entries().await?;
+            let candidates: Vec<i64> = entries
+                .iter()
+                .filter_map(|e| match e {
+                    crate::move_diagnosis::Entry::Correction { original_seq, .. } => {
+                        Some(*original_seq)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let originals = sqlx::query("SELECT * FROM yard_moves WHERE seq=ANY($1)")
+                .bind(&candidates)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(storage)?;
+            let mut excluded = Vec::new();
+            for row in originals {
+                let original = recorded(&row)?;
+                // A changed/unsupported proof cannot demote the raw finding.
+                if crate::move_diagnosis::active(&entries, &original)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    excluded.push(original.seq);
+                }
+            }
             let rows = sqlx::query(
                 "SELECT * FROM ( \
                  SELECT from_region, to_region, \
-                 CASE WHEN to_region IS NULL AND kind <> '' THEN kind END AS exit_kind, \
+                 CASE WHEN (to_region IS NULL OR (kind = $2 AND lineage = 'packet')) AND kind <> '' THEN kind END AS crossing_kind, \
                  CASE WHEN to_region IS NULL THEN terminal END AS exit_terminal, \
+                 CASE WHEN kind = $2 AND lineage = 'packet' THEN lineage END AS dispatch_lineage, \
+                 CASE WHEN kind = $2 AND lineage = 'packet' THEN dispatch_context END AS dispatch_context, \
                  COUNT(*)::BIGINT AS moves, MAX(at) AS last_at \
-                 FROM yard_moves WHERE at >= $1 \
-                 GROUP BY 1, 2, 3, 4) routes \
+                 FROM yard_moves WHERE at >= $1 AND NOT (seq = ANY($3)) \
+                 GROUP BY 1, 2, 3, 4, 5, 6) routes \
                  ORDER BY from_region COLLATE \"C\" NULLS FIRST, \
                  to_region COLLATE \"C\" NULLS FIRST, \
-                 exit_kind COLLATE \"C\" NULLS FIRST, \
-                 exit_terminal COLLATE \"C\" NULLS FIRST",
+                 crossing_kind COLLATE \"C\" NULLS FIRST, \
+                 exit_terminal COLLATE \"C\" NULLS FIRST, \
+                 dispatch_lineage COLLATE \"C\" NULLS FIRST, \
+                 dispatch_context COLLATE \"C\" NULLS FIRST",
             )
             .bind(since)
+            .bind(crate::agent_budget::RUN_KIND)
+            .bind(excluded)
             .fetch_all(&self.pool)
             .await
             .map_err(storage)?;
@@ -1106,8 +1571,16 @@ mod pg {
                     Ok(RouteCount {
                         from: r.try_get("from_region").map_err(storage)?,
                         to: r.try_get("to_region").map_err(storage)?,
-                        kind: r.try_get("exit_kind").map_err(storage)?,
+                        kind: r.try_get("crossing_kind").map_err(storage)?,
                         terminal: r.try_get("exit_terminal").map_err(storage)?,
+                        lineage: r.try_get("dispatch_lineage").map_err(storage)?,
+                        dispatch: r
+                            .try_get::<Option<String>, _>("dispatch_context")
+                            .map_err(storage)?
+                            .map(|s| serde_json::from_str(&s))
+                            .transpose()
+                            .map_err(storage)?,
+                        declared: None,
                         moves: r.try_get("moves").map_err(storage)?,
                         last_at: r.try_get("last_at").map_err(storage)?,
                     })
@@ -1148,7 +1621,12 @@ pub fn with_undeclared(
     use crate::regions::RegionState;
     let undeclared: Option<Vec<RouteCount>> = crossings.zip(routes).map(|(all, routes)| {
         all.into_iter()
-            .filter(|c| c.from != c.to && !routes.judges_count(c))
+            .filter(|c| c.from != c.to)
+            .map(|c| RouteCount {
+                declared: routes.judges_observation(&c),
+                ..c
+            })
+            .filter(|c| c.declared != Some(true))
             .collect()
     });
     let regions = map
@@ -1175,10 +1653,15 @@ pub fn with_undeclared(
                         _ => String::new(),
                     };
                     format!(
-                        "{} → {}{by} ×{}",
+                        "{} → {}{by} ×{}{}",
                         c.from.as_deref().unwrap_or("off the map"),
                         c.to.as_deref().unwrap_or("off the map"),
-                        c.moves
+                        c.moves,
+                        if c.declared.is_none() {
+                            " (unknown: original dispatch cannot be judged)"
+                        } else {
+                            ""
+                        }
                     )
                 })
                 .collect();
@@ -1189,9 +1672,18 @@ pub fn with_undeclared(
             if said.is_empty() || region.state == RegionState::Troubled {
                 return region;
             }
+            let has_unknown = region
+                .undeclared
+                .as_ref()
+                .is_some_and(|counts| counts.iter().any(|c| c.declared.is_none()));
             let lead = format!(
-                "packets took {} the map does not declare: {}",
+                "packets took {} {}: {}",
                 if said.len() == 1 { "a route" } else { "routes" },
+                if has_unknown {
+                    "whose declaration is false or unjudged"
+                } else {
+                    "no protocol declares"
+                },
                 said.join(", ")
             );
             crate::regions::Region {
@@ -1317,11 +1809,13 @@ mod tests {
 
     fn snapshot(places: &[(&str, &'static str)], known: &[(&str, Facts)]) -> Snapshot {
         Snapshot {
+            dispatch: BTreeMap::new(),
             places: places.iter().map(|(p, r)| ((*p).to_string(), *r)).collect(),
             facts: known
                 .iter()
                 .map(|(p, f)| ((*p).to_string(), f.clone()))
                 .collect(),
+            aboard: BTreeMap::new(),
             unread: Vec::new(),
         }
     }
@@ -1334,6 +1828,76 @@ mod tests {
             kind: kind.into(),
             packet: packet.into(),
         }
+    }
+
+    /// A declared dispatch line cannot establish an arbitrary metadata
+    /// packet link. Historical missing registration is unjudged, never
+    /// promoted to a pass merely because its two regions match.
+    #[test]
+    fn registered_dispatch_route_does_not_vouch_for_an_unregistered_packet_link() {
+        let routes = crate::routes::RouteMap {
+            routes: vec![crate::routes::Route {
+                from: Some("shed".into()),
+                to: Some("shop-floor".into()),
+                declared: true,
+                sources: vec![crate::routes::Source::HandOff {
+                    agent_version: None,
+                    by: "verb:dispatch".into(),
+                    from: Some("ship-a-change@landed-review".into()),
+                    to: Some("agent-run@briefed".into()),
+                    why: "registered agent step, not a region exemption".into(),
+                    terminal: None,
+                }],
+            }],
+            walked: vec![],
+            refused: vec![],
+        };
+        let car = facts("ship-a-change", None, &[]);
+        let run = facts("agent-run", None, &[("packet", "car")]);
+        let previous = snapshot(&[("car", "shed")], &[("car", car.clone())]);
+        let next = snapshot(
+            &[("car", "shed"), ("unregistered", "shop-floor")],
+            &[("car", car), ("unregistered", run)],
+        );
+        let found = moves(
+            &previous,
+            &next,
+            &[cause(1, "unregistered", "jobs.job.created")],
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].handoff_from.as_deref(), Some("car"));
+        assert_eq!(found[0].lineage.as_deref(), Some("packet"));
+        assert_ne!(judged(found, &routes)[0].declared, Some(true));
+    }
+
+    #[test]
+    fn an_observed_partition_carrier_wins_over_a_closed_trains_historical_cargo_link() {
+        let car_id = "00000000-0000-0000-0000-000000000003";
+        let old_id = "00000000-0000-0000-0000-000000000001";
+        let current_id = "00000000-0000-0000-0000-000000000002";
+        let car = facts("ship-a-change", Some("fix/exact-carrier"), &[]);
+        let previous = snapshot(&[(car_id, "dock")], &[(car_id, car.clone())]);
+        let mut next = snapshot(
+            &[(old_id, "arrivals"), (current_id, "gates")],
+            &[
+                (car_id, car),
+                (
+                    old_id,
+                    closed(facts("pr-train", None, &[(CARRIES, car_id)])),
+                ),
+                (current_id, facts("pr-train", None, &[(CARRIES, car_id)])),
+            ],
+        );
+        next.aboard.insert(car_id.into(), current_id.into());
+        next.unread.push("receiving");
+        let found = moves(&previous, &next, &[cause(101, car_id, "jobs.job.updated")]);
+        let car_moves: Vec<_> = found.iter().filter(|m| m.packet == car_id).collect();
+        assert_eq!(car_moves.len(), 1);
+        assert_eq!(
+            (car_moves[0].from.as_deref(), car_moves[0].to.as_deref()),
+            (Some("dock"), Some("gates"))
+        );
+        assert_eq!(car_moves[0].lineage.as_deref(), Some(CARRIES));
     }
 
     /// A GATE-RUN GREEN, THEN A CAR FILED, IS ONE HAND-OFF. The gate-run
@@ -1576,6 +2140,9 @@ mod tests {
             &[],
             &[],
             Some(&[RouteCount {
+                lineage: None,
+                dispatch: None,
+                declared: None,
                 from: Some("track".into()),
                 to: Some("shed".into()),
                 kind: None,
