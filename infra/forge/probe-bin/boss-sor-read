@@ -99,6 +99,12 @@ set -uo pipefail
 me="boss-sor-read"
 refuse() { echo "$me: REFUSED — $*" >&2; exit 2; }
 
+# 4196a7b1: opt-in, registry-owned native evidence validation. The
+# observer reuses this door's ordinary one-path GET; it holds no token.
+if [[ $# -eq 2 && "$1" = --evidence ]]; then
+    exec python3 -I -B "$(dirname "$(readlink -f "$0")")/../proof-observer.py" "$2"
+fi
+
 [[ $# -eq 1 ]] || refuse \
     "usage: $me /api/path — exactly one argument, and it is a PATH. There is no method
   argument: this reads, and a probe proves a claim about production by reading it.

@@ -32,6 +32,45 @@ pub(super) fn job(kind: &str, title: &str, status: JobStatus, metadata: Value) -
     }
 }
 
+/// A synthetic negative observation in the complete shape the proof door
+/// now records. Only use for controls that explicitly say the observer ran.
+/// Missing/null outcomes and intentionally changed source remain untouched.
+pub(super) fn observed_wait_fixture(mut metadata: Value) -> Value {
+    let Some(observer) = metadata
+        .pointer("/waits_on/seen")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return metadata;
+    };
+    if metadata
+        .pointer("/proof_attempt/waits_on_exit")
+        .and_then(Value::as_i64)
+        .is_none()
+    {
+        return metadata;
+    }
+    metadata["waits_on"]["next_check_at"] = json!("2026-09-19T13:00:00Z");
+    let proof = metadata
+        .get(crate::car::PROOF_PROBE)
+        .cloned()
+        .unwrap_or(Value::Null);
+    if let Some(attempt) = metadata
+        .get_mut("proof_attempt")
+        .and_then(Value::as_object_mut)
+    {
+        attempt.entry("waits_on_probe").or_insert(json!(observer));
+        attempt.entry("at").or_insert(json!(NOW));
+        attempt.entry("probe").or_insert(proof);
+        if attempt.get("waits_on_exit").and_then(Value::as_i64) == Some(1) {
+            attempt
+                .entry("waits_on_observation")
+                .or_insert(json!("unseen"));
+        }
+    }
+    metadata
+}
+
 pub(super) fn step(job: &Job, slug: &str, status: StepStatus, done_at: Option<&str>) -> Step {
     let mut s = Step::new(job.id, "task", slug, 0);
     s.id = StepId::new();
@@ -69,6 +108,7 @@ pub(super) fn inputs<'a>(
     stations: Option<&'a [StationReading]>,
 ) -> RegionInputs<'a> {
     RegionInputs {
+        internal_protocols: None,
         status,
         dock_reading: Reading::Read,
         open_trains,

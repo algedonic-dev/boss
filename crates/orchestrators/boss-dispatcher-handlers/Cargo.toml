@@ -33,8 +33,10 @@ chrono = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
 rand = "0.10"
+openssl = "0.10"
+rustix = { version = "1", features = ["fs"] }
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # The credential broker's GitHub App issuer (design 76155676): the App
 # JWT is RS256 over the App private key. `rsa` is already in the lock
 # (sqlx-mysql); `sha2` re-exported through it keeps the digest version

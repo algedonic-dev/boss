@@ -1,0 +1,16 @@
+{
+  "about": "MUTATING: David accepted design a21c491c-6a72-4698-804d-65cc38e68f9c R1 on 2026-10-15. Prepare one fixed uncredentialed synthetic receiver Job and ClusterIP Service on the existing forge executor. Original ops request, active registered b307 runtime, published helper/image and 60–600 second lifetime are resolved and conserved; missing rights or quiescence refuses. No arbitrary manifest, image repository, namespace, URL, argv, credentials, grant, egress change or isolation activation. Unknown create acknowledgement holds the original intent without relaunch. Source publication is not runtime qualification.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/isolation-fixture.sh", "prepare", "{1}", "{2}", "{3}", "{4}", "{5}", "{6}"],
+  "params": [
+    {"name": "runtime", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    {"name": "nonce", "pattern": "^[0-9a-f]{64}$"},
+    {"name": "source_head", "pattern": "^[0-9a-f]{40}$"},
+    {"name": "helper_sha256", "pattern": "^[0-9a-f]{64}$"},
+    {"name": "image_sha256", "pattern": "^[0-9a-f]{64}$"},
+    {"name": "lifetime_seconds", "pattern": "^(60|[6-9][0-9]|[1-5][0-9]{2}|600)$"}
+  ],
+  "capture": "separate-streams",
+  "effect": "^isolation-fixture: READY original-request [0-9a-f-]{36} native UID binding and synthetic counter readback verified$",
+  "timeout": 180
+}

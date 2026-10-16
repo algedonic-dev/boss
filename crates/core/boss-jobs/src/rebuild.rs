@@ -180,12 +180,16 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
     // delete steps first to make the order explicit and to make the
     // rebuild work even if the cascade is ever loosened.
     let conserved = std::sync::Mutex::new(std::collections::HashMap::new());
+    let move_ledger = std::sync::Mutex::new(std::collections::HashMap::new());
+    let admission_observations = std::sync::Mutex::new(std::collections::HashMap::new());
     let stats = replay_projection_checked(
         pool,
         REBUILD_LOCK_KEY,
-        &["DELETE FROM station_claim_receipts", "DELETE FROM steps", "DELETE FROM jobs"],
-        "kind LIKE 'jobs.job.%' OR kind LIKE 'jobs.step.%' OR kind IN ('jobs.station.claimed', 'jobs.station.selection_evidence')",
+        &["DELETE FROM yard_move_admission_observations", "DELETE FROM yard_move_corrections", "DELETE FROM station_claim_receipts", "DELETE FROM steps", "DELETE FROM jobs"],
+        "kind LIKE 'jobs.job.%' OR kind LIKE 'jobs.step.%' OR kind IN ('jobs.station.claimed', 'jobs.station.selection_evidence') OR kind LIKE 'jobs.yard.move.%'",
         async |_, events| {
+            *admission_observations.lock().map_err(|_|"admission observation ledger unavailable")?=crate::move_admission::reconstruct(&events.iter().map(|e|boss_core::event::Event{id:e.event_id,timestamp:e.ts,source:"jobs".into(),kind:e.kind.clone(),payload:e.payload.clone()}).collect::<Vec<_>>())?.into_iter().collect::<std::collections::HashMap<_,_>>();
+            *move_ledger.lock().map_err(|_|"move ledger unavailable")? = crate::move_diagnosis::reconstruct(&events.iter().map(|e|boss_core::event::Event{id:e.event_id,timestamp:e.ts,source:"jobs".into(),kind:e.kind.clone(),payload:e.payload.clone()}).collect::<Vec<_>>())?.into_iter().enumerate().map(|(index,(id,entry))|(id,(index as i64 + 1,entry))).collect();
             let artifacts = crate::selection_evidence::reconstruct(events).map_err(|error| error.to_string())?;
             *conserved.lock().map_err(|_| "selection evidence unavailable")? = artifacts.into_iter()
                 .filter(|event| event.payload.get("receipt_manifest").is_some())
@@ -196,6 +200,20 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
         },
         async |conn, ev| {
             match ev.kind.as_str() {
+                crate::move_admission::EVENT_KIND=>{
+                    let observation=admission_observations.lock().map_err(|_|"admission observation ledger unavailable")?.get(&ev.event_id).cloned().ok_or("admission observation receipt missing")?;
+                    sqlx::query("INSERT INTO yard_move_admission_observations(id,original_seq,diagnosis_id,body,event_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO NOTHING")
+                        .bind(observation.id).bind(observation.diagnosis.original.seq).bind(observation.diagnosis.id).bind(serde_json::to_string(&observation).map_err(|e|e.to_string())?).bind(ev.event_id).execute(&mut *conn).await.map_err(|e|e.to_string())?;
+                    Ok(Applied::Yes)
+                }
+                crate::move_diagnosis::EVENT_KIND | crate::move_diagnosis::CORRECTED_KIND | crate::move_diagnosis::WITHDRAWN_KIND => {
+                    let (seq,entry)=move_ledger.lock().map_err(|_|"move ledger unavailable")?.get(&ev.event_id).cloned().ok_or("move ledger receipt missing")?;
+                    let body=serde_json::to_string(&entry).map_err(|e|e.to_string())?;
+                    sqlx::query("INSERT INTO yard_move_corrections(seq,id,original_seq,body,event_id) VALUES($5,$1,$2,$3,$4) ON CONFLICT(id) DO NOTHING")
+                        .bind(entry.id()).bind(entry.original_seq()).bind(body).bind(ev.event_id).bind(seq).execute(&mut *conn).await.map_err(|e|e.to_string())?;
+                    Ok(Applied::Yes)
+                }
+
                 crate::events::STATION_CLAIMED => {
                     let receipt_json = if ev.payload.get("receipt_manifest").is_some() {
                         conserved.lock().map_err(|_| "selection evidence unavailable")?.get(&ev.event_id).cloned()

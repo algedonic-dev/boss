@@ -214,12 +214,19 @@ fn station_machines(inputs: &RegionInputs<'_>) -> Vec<Machine> {
             let (state, why) = match (s.over_limit, s.served) {
                 (true, _) => (
                     MachineState::Failed,
-                    format!("{held} standing — over its WIP limit"),
+                    s.flow_blind.map_or_else(
+                        || format!("{held} standing — over its WIP limit"),
+                        |blind| format!("{held} standing — over its WIP limit; {}", blind.reason()),
+                    ),
                 ),
                 (false, None) => (
                     MachineState::Unknown,
                     format!(
-                        "{held} standing — the flow cube is blind to this station's predicate, so whether it moves cannot be told"
+                        "{held} standing — {}",
+                        s.flow_blind.map_or(
+                            "the flow cube is blind to this station's predicate, so whether it moves cannot be told",
+                            crate::station_flow::FlowBlind::reason,
+                        )
                     ),
                 ),
                 (false, Some(0)) if held > 0 => (
@@ -729,6 +736,7 @@ mod tests {
                 over_limit: false,
                 members: vec!["a".into(), "b".into()],
                 served: None,
+                flow_blind: None,
                 previous_served: None,
                 opened: Default::default(),
             },
@@ -737,6 +745,7 @@ mod tests {
                 over_limit: true,
                 members: vec!["c".into()],
                 served: Some(3),
+                flow_blind: None,
                 previous_served: Some(2),
                 opened: Default::default(),
             },
@@ -745,6 +754,7 @@ mod tests {
                 over_limit: false,
                 members: vec![],
                 served: Some(0),
+                flow_blind: None,
                 previous_served: Some(0),
                 opened: Default::default(),
             },
@@ -762,6 +772,46 @@ mod tests {
             machine_state(&out, "marshalling", "station:quiet"),
             MachineState::Idle
         );
+    }
+
+    #[test]
+    fn each_original_flow_refusal_survives_empty_and_over_limit_machine_readings() {
+        use crate::station_flow::FlowBlind;
+        let status = empty_status();
+        for blind in [
+            FlowBlind::NoStepClause,
+            FlowBlind::StatusIsNotAWait,
+            FlowBlind::JobMetadataClause,
+            FlowBlind::JobTagsClause,
+            FlowBlind::SelfBound,
+            FlowBlind::StepAssigneeClause,
+            FlowBlind::StepMetadataBeyondRole,
+        ] {
+            for over_limit in [false, true] {
+                let rows = [StationReading {
+                    name: "refused-flow".into(),
+                    over_limit,
+                    flow_blind: Some(blind),
+                    ..Default::default()
+                }];
+                let out = regions(&inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&rows)));
+                let machines = machines_in(&out, "marshalling");
+                let station = machines
+                    .iter()
+                    .find(|machine| machine.id == "station:refused-flow")
+                    .unwrap();
+                assert_eq!(
+                    station.state,
+                    if over_limit {
+                        MachineState::Failed
+                    } else {
+                        MachineState::Unknown
+                    }
+                );
+                assert!(station.why.contains(blind.reason()), "{blind:?}");
+                assert_eq!(station.why.contains("over its WIP limit"), over_limit);
+            }
+        }
     }
 
     /// The verbs the handler fetches are DERIVED from the runner table

@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# ca356c79: recorded probes inherit an empty token directory. Refuse
+# the session CLI before selector routing, version probes or token I/O;
+# their permitted read path is boss-sor-read. Presence also marks an
+# admission whose optional diagnostic channel could not be created.
+if [[ -n "${BOSS_PROBE_NOTFOUND+set}" || -n "${BOSS_SOR_USER:-}" || -n "${BOSS_SOR_DOOR:-}" ]]; then
+    echo "boss: REFUSED — recorded probe context must read through boss-sor-read; this session door cannot execute an intentionally tokenless probe request" >&2
+    exit 2
+fi
+
 # Dev isolation (b3071bf4): an activated generation answers from its
 # published copy. A REFUSED selector (design a68fc42a D1) refuses a
 # candidate CLI (--built) with 75 and runs only the published image CLI

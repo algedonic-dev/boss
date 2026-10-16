@@ -63,6 +63,7 @@ mod park;
 mod prior_work;
 mod probe_door_check;
 mod probe_reader;
+mod proof_observation;
 mod prose;
 mod prove;
 mod publish;
@@ -919,6 +920,12 @@ enum Commands {
         #[arg(long = "bind")]
         binds: Vec<String>,
     },
+    /// Observe a registered native evidence contract as the protected probe
+    /// account. Reports a separate observation; records no car proof or attempt.
+    ObserveProof {
+        /// Exact append-only versioned contract name, never executable text.
+        contract: String,
+    },
     /// Prove a merged car in production by RUNNING a probe.
     ///
     /// The verb executes the command itself and records exit status and
@@ -944,6 +951,11 @@ enum Commands {
         /// print a unique token instead.
         #[arg(long)]
         expect: Option<String>,
+        /// Record a probe for a landed car without executing or proving it.
+        /// Retains the original event and prior probe beside this registration;
+        /// the forge's existing run-car-probe door runs the recorded command.
+        #[arg(long, requires_all = ["probe", "expect"], conflicts_with_all = ["from_car", "unattended", "recheck", "replace", "exit_only", "disproved", "superseded_by", "probe_anyway", "method", "method_file"])]
+        record_probe: bool,
         /// Assert on the exit code alone, when the command IS the test
         /// (`grep -q`, `test -f`). Recorded, so a reader sees it.
         #[arg(long)]
@@ -1232,9 +1244,10 @@ enum CarAction {
         /// unless the car already declares one.
         #[arg(long)]
         on: Option<String>,
-        /// Shell text that exits 0 once that event is in the record. Run
-        /// by the door that records each not-yet, on the forge, under the
-        /// probe's rules. Without it the wait can never be contradicted.
+        /// Shell text that exits 0 when the event is seen. A successful
+        /// negative read prints JSON {"observation":"unseen"} and exits 1;
+        /// every other or legacy nonzero outcome is unread. Run on the
+        /// forge under the probe's rules after each not-yet.
         #[arg(long)]
         seen: Option<String>,
         /// Whose move the wait is: `world` for an event nobody here can
@@ -1246,8 +1259,11 @@ enum CarAction {
         /// the wait is ours again. Optional; positive.
         #[arg(long)]
         max_wait_hours: Option<u32>,
+        /// The next observable check, as an RFC3339 time.
+        #[arg(long)]
+        next_check_at: Option<String>,
         /// Remove the declaration.
-        #[arg(long, conflicts_with_all = ["on", "seen", "owner", "max_wait_hours"])]
+        #[arg(long, conflicts_with_all = ["on", "seen", "owner", "max_wait_hours", "next_check_at"])]
         clear: bool,
         /// Print the PATCH body without writing it.
         #[arg(long)]
@@ -1899,6 +1915,7 @@ async fn main() -> Result<()> {
                 seen,
                 owner,
                 max_wait_hours,
+                next_check_at,
                 clear,
                 dry_run,
             } => {
@@ -1907,6 +1924,8 @@ async fn main() -> Result<()> {
                     seen,
                     owner,
                     max_wait_hours,
+                    next_check_at,
+                    clean_window: None,
                 };
                 car::waits_on(&given, &fields, clear, dry_run).await
             }
@@ -2177,10 +2196,12 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Commands::ObserveProof { contract } => proof_observation::run(&contract),
         Commands::Prove {
             car,
             probe,
             expect,
+            record_probe,
             exit_only,
             verified,
             verified_file,
@@ -2204,6 +2225,17 @@ async fn main() -> Result<()> {
                 verified,
                 verified_file.as_deref(),
             )?;
+            if record_probe {
+                return prove::record_probe(
+                    &car,
+                    probe.as_deref().unwrap_or_default(),
+                    expect.as_deref().unwrap_or_default(),
+                    verified.as_deref().unwrap_or_default(),
+                    dry_run,
+                    chrono::Utc::now(),
+                )
+                .await;
+            }
             if disproved {
                 return disprove::run(
                     &car,
@@ -2343,6 +2375,8 @@ async fn main() -> Result<()> {
                     seen: park_waits_on_seen,
                     owner: park_waits_on_owner,
                     max_wait_hours: park_waits_on_max_wait_hours,
+                    next_check_at: None,
+                    clean_window: None,
                 }),
             };
             // clap requires the branch unless --withdraw is present, and

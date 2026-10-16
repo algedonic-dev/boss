@@ -382,18 +382,18 @@ pub fn seed_tenant_data(
     // the live smoke suite, 2026-09-18, design 0e07ce64.) Reachability
     // probe is a 2-second timeout against the service health
     // endpoint; on success the seed step runs as before.
-    if base_reachable(&client, &bases.content, "/api/content/health") {
+    if base_reachable(&client, &bases.content, "/api/content/health")? {
         ensure_bulletins(&client, &bases.content, &headers)?;
     } else {
         info!(base = %bases.content, "content base unreachable — skipping bulletin seed");
     }
-    if base_reachable(&client, &bases.calendar, "/api/calendar/health") {
+    if base_reachable(&client, &bases.calendar, "/api/calendar/health")? {
         ensure_reservations(&client, &bases.calendar, &headers)?;
     } else {
         info!(base = %bases.calendar, "calendar base unreachable — skipping reservation seed");
     }
 
-    if base_reachable(&client, &bases.products, "/api/products/health") {
+    if base_reachable(&client, &bases.products, "/api/products/health")? {
         ensure_finished_product_inventory(&client, &bases.products, &headers)?;
     } else {
         info!(base = %bases.products, "products base unreachable — skipping finished-product inventory seed");
@@ -411,8 +411,8 @@ pub fn seed_tenant_data(
     // audit_log shows the source — both paths land on the same
     // source_id (`opening-raw-{sku}`), colliding cleanly on the
     // (kind, source_table, source_id) unique index.
-    if base_reachable(&client, &bases.inventory, "/api/inventory/health")
-        && base_reachable(&client, &bases.ledger, "/api/ledger/health")
+    if base_reachable(&client, &bases.inventory, "/api/inventory/health")?
+        && base_reachable(&client, &bases.ledger, "/api/ledger/health")?
     {
         ensure_raw_inventory_opening_balances(&client, &bases.inventory, &headers, seeds_dir)?;
         // Cash opening balance — the brewery doesn't open its
@@ -433,20 +433,20 @@ pub fn seed_tenant_data(
     // real graduated math instead of the dispatcher rule's flat
     // fallback. Ledger-only — independent of the inventory-gated
     // opening-JE block above.
-    if base_reachable(&client, &bases.ledger, "/api/ledger/health") {
+    if base_reachable(&client, &bases.ledger, "/api/ledger/health")? {
         ensure_excise_rate_schedules(&client, &bases.ledger, &headers, seeds_dir)?;
     } else {
         info!(base = %bases.ledger, "ledger base unreachable — skipping excise rate schedules");
     }
 
-    if base_reachable(&client, &bases.catalog, "/api/catalog/health") {
+    if base_reachable(&client, &bases.catalog, "/api/catalog/health")? {
         ensure_equipment_catalog(&client, &bases.catalog, &headers, seeds_dir)?;
         ensure_marketing_assets(&client, &bases.catalog, &headers, seeds_dir)?;
     } else {
         info!(base = %bases.catalog, "catalog base unreachable — skipping equipment catalog + marketing assets seed");
     }
 
-    if base_reachable(&client, &bases.assets, "/api/assets/health") {
+    if base_reachable(&client, &bases.assets, "/api/assets/health")? {
         ensure_brewhouse_assets(&client, &bases.assets, &headers, seeds_dir)?;
         // Pair the assets seed with its PP&E opening JE — same
         // shape as raw + FG opening balances. Without this the
@@ -2126,23 +2126,100 @@ fn ensure_excise_rate_schedules(
     Ok(())
 }
 
-/// Best-effort reachability probe. Returns false on any error
-/// (connection refused, timeout, non-2xx) so callers can skip a
-/// seed step without raising.
-fn base_reachable(client: &BlockingClient, base: &str, health_path: &str) -> bool {
+/// An optional module may be absent, but a present refusal is not absence
+/// (c98a21ae, original review92b128c2 L2). Keep the no-redirect transport;
+/// callers must propagate an unreadable or refused health response instead
+/// of silently omitting that module's seed data.
+fn base_reachable(client: &BlockingClient, base: &str, health_path: &str) -> Result<bool> {
     let url = format!("{base}{health_path}");
-    matches!(
-        client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(2))
-            .send(),
-        Ok(r) if r.status().is_success()
-    )
+    let response = match client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            // A closed optional service port is the standalone partial-stack
+            // contract. DNS, timeout and other unreadable inputs do not prove
+            // that the module is absent.
+            let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+            while let Some(current) = cause {
+                if current
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+                {
+                    return Ok(false);
+                }
+                cause = current.source();
+            }
+            return Err(error)
+                .with_context(|| format!("GET {url}: optional module health unreadable"));
+        }
+    };
+    let status = response.status();
+    if status.is_success() {
+        Ok(true)
+    } else if status == reqwest::StatusCode::NOT_FOUND {
+        Ok(false)
+    } else {
+        anyhow::bail!("GET {url}: optional module health refused with {status}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reachability_reply(status: u16) -> Result<bool> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let count = socket.read(&mut request).unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..count]).starts_with("GET /api/content/health ")
+            );
+            write!(socket, "HTTP/1.1 {status} Test\r\nLocation: http://127.0.0.1:1/not-followed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let client = BlockingClient::unstamped(reqwest::blocking::Client::builder()).unwrap();
+        let observed = base_reachable(&client, &base, "/api/content/health");
+        server.join().unwrap();
+        observed
+    }
+
+    #[test]
+    fn a_present_but_refused_optional_module_is_not_absent() {
+        for status in [301, 302, 307, 308, 401, 403, 429, 500, 503] {
+            let error = reachability_reply(status)
+                .expect_err("a present health refusal must stop preparation");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains(&status.to_string()), "{diagnostic}");
+            assert!(diagnostic.contains("/api/content/health"), "{diagnostic}");
+        }
+    }
+
+    #[test]
+    fn a_healthy_optional_module_and_a_genuinely_absent_one_stay_distinct() {
+        assert!(reachability_reply(200).unwrap());
+        assert!(!reachability_reply(404).unwrap());
+        let dark = boss_testing::dark_port();
+        let client = BlockingClient::unstamped(reqwest::blocking::Client::builder()).unwrap();
+        assert!(!base_reachable(&client, &dark.base, "/api/content/health").unwrap());
+    }
+
+    #[test]
+    fn an_unreadable_optional_module_target_is_not_absence() {
+        let client = BlockingClient::unstamped(reqwest::blocking::Client::builder()).unwrap();
+        let error = base_reachable(&client, "http://[invalid", "/api/content/health")
+            .expect_err("a malformed address is unreadable, not an absent module");
+        assert!(
+            error
+                .to_string()
+                .contains("optional module health unreadable")
+        );
+    }
 
     /// The seed's idempotence read takes the inbox envelope a page at a
     /// time (backlog 74da899d): the subjects, how many rows the page held,

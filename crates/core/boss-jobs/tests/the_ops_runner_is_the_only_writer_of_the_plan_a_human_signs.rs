@@ -51,6 +51,9 @@ use tower::ServiceExt;
 const FORGE: &str = "forge-runner-credential-fixture";
 const GCP: &str = "boss-gcp-runner-credential-fixture";
 
+/// The execution evidence consumed as independently recorded machine proof.
+const EXECUTE_RUNNER_KEYS: [&str; 3] = ["disposition", "output", "exit_code"];
+
 // ---------------------------------------------------------------------
 // The declaration
 // ---------------------------------------------------------------------
@@ -116,6 +119,13 @@ fn the_runner_half_is_every_key_the_runner_renders_and_the_execution() {
         "the forger-proof writer replaces the self-asserted written_by, it does not sit beside it"
     );
     assert_eq!(step(&row, "execute").executor.as_deref(), Some(RUNNER));
+    for key in EXECUTE_RUNNER_KEYS {
+        assert_eq!(
+            writer_of(&row, "execute", key).as_deref(),
+            Some(RUNNER),
+            "execute.{key}"
+        );
+    }
     assert_eq!(
         step(&row, "execute").claimable,
         Some(true),
@@ -166,6 +176,11 @@ fn the_runner_half_is_every_key_the_runner_renders_and_the_execution() {
             NOTHING_TO_DO_RUNNER_KEYS
                 .iter()
                 .map(|k| format!("nothing-to-do.{k}={RUNNER}")),
+        )
+        .chain(
+            EXECUTE_RUNNER_KEYS
+                .iter()
+                .map(|k| format!("execute.{k}={RUNNER}")),
         )
         .chain([
             "approve.decision=signer".into(),
@@ -530,6 +545,18 @@ async fn the_execution_is_the_credentialed_runners() {
         ("automation:ops-runner", None),
         ("automation:ops-runner", Some(GCP)),
     ] {
+        for key in EXECUTE_RUNNER_KEYS {
+            let (status, body) = send(
+                &app,
+                "PATCH",
+                &merge_door(&job, &execute),
+                who,
+                credential,
+                Some(json!({key: "forged execution evidence"})),
+            )
+            .await;
+            assert_reserved(status, &body, key, "a forged execution record");
+        }
         let (status, body) = send(
             &app,
             "PUT",

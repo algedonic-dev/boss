@@ -354,14 +354,17 @@ executor = "runner:ops"
 name = "disposition"
 field_type = "answered|refused"
 required = true
+writer = "runner:ops"
 [[workflow.step.fields]]
 name = "output"
 field_type = "string"
 required = true
+writer = "runner:ops"
 [[workflow.step.fields]]
 name = "exit_code"
 field_type = "string"
 required = false
+writer = "runner:ops"
 
 [[workflow.step]]
 title = "answered"

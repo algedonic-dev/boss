@@ -25,6 +25,7 @@ fn moved(
     declared: Option<bool>,
 ) -> Move {
     Move {
+        dispatch: None,
         at: t("2026-09-26T03:00:00Z") + chrono::Duration::seconds(n as i64),
         packet: packet.into(),
         kind: "pr-train".into(),

@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "version": 1,
+  "module": "archive-integrity",
+  "kind": "ops-request",
+  "query": "/api/jobs?kind=ops-request&status=closed&metadata=%7B%22verb%22%3A%22check-gcs-backup%22%2C%22host%22%3A%22forge%22%7D",
+  "car": "ad535209-74c0-41d2-b113-802bcd017998",
+  "branch": "fix/record-gcs-backup-readback",
+  "claim": "A native forge readback verified remote archive integrity after this car converged; this does not prove a restore.",
+  "delay_seconds": 0,
+  "host": "forge",
+  "verb": "check-gcs-backup",
+  "step": "execute",
+  "completion_actor": "automation:ops-runner",
+  "disposition": "answered"
+}

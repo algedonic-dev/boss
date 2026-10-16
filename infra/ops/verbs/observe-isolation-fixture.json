@@ -1,0 +1,8 @@
+{
+  "about": "READ-ONLY native observation under David's accepted a21c491c-6a72-4698-804d-65cc38e68f9c R1: resolve one original prepare request from the forge journal; conserve full original receiver requests/responses and native UIDs through the protected artifact recorder. No creation, token access, replacement, activation or guessed absence. Truncated, expired, replaced or unreadable evidence remains UNKNOWN.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/isolation-fixture.sh", "observe", "{1}"],
+  "params": [{"name": "original_request", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}],
+  "capture": "separate-streams",
+  "timeout": 120
+}

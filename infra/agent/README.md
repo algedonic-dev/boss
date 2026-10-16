@@ -6,6 +6,31 @@ the model through the agents registry and its reviewed harness, then reads
 the corresponding versioned row under `infra/platform/agent-controllers`.
 That row is disabled. No builder sandbox row is added.
 
+David's recorded decision
+[`6f3ef63c`](https://boss.algedonic.dev/ux/jobs/6f3ef63c-469e-47e9-a48c-0eb7cbcb3214)
+amends only design21062 Q2: the issuer mount remains read-only, while
+one serialized run may retain renewed managed login in a private writable
+cache. `launch_controller::managed_cache` prepares the trusted lease,
+native incarnation binding, terminal collection, principal validation,
+generation CAS and quarantine contract behind one private broker port.
+Its state carries metadata only; cache bytes have no journal/serialization
+path in that component. A successful `finish` stages a validated collection
+in `Collected`, which remains unavailable to new runs. A save that commits
+before its acknowledgement fails stays unavailable too; no rollback is
+inferred. The kernel has no `Collected` to `Ready` release. Exact durable
+private publication/recovery remains source work. Descriptor-confined private
+filesystem persistence and authenticated metadata IPC now implement the kernel's
+store boundary; neither is installed or configured natively.
+
+The native managed path refuses before compute while that adapter and
+its independently observed scope and private collector placement are absent.
+The image helper can prepare a new private writable cache from the pinned
+read-only issuer projection only with an exact run/incarnation lease plan.
+Preparing that helper does not enable the native managed path. This checkpoint installs no enrollment surface,
+credential, cache or activation selector. Dedicated private human
+enrollment UX and genuine issuer/consumer installation, expiry/revocation,
+collection/recovery and runtime acceptance remain parent386 obligations.
+
 A launch needs a protected, publisher-produced
 `agent-controller-<harness>.json` beside the verified installed CLI generation.
 Its typed `Bindings` contract names the OCI platform digest, exact binary
@@ -73,3 +98,50 @@ Cleanup needs an independently bound complete archive acknowledgment and an
 authorized collection path. Source fixtures establish controller behavior;
 real network/kernel READ/USE, cancellation and escaped-descendant observations
 remain owed after genuine activation. Parent3869107c stays open.
+
+The forge converge now runs `publish-image.sh publish <full source sha>` as a
+separate stage after core convergence. It uses the broker's existing registry
+push login, verifies the retained platform manifest and every configuration and
+layer blob through the shared registry transport, and probes the digest-pinned
+image without network access. The required CLI version comes from the controller
+row. A failed optional publication leaves core BOSS delivery and previous image
+witnesses intact; its complete streams and typed receipt remain under the
+root-owned converge state, with `agent_image_publication` on the maintenance
+packet. This finding is separate from core convergence success.
+
+Successful records live at
+`/var/lib/boss/converge/agent-images/<full sha>/agent/image-witness.json`.
+Schema 1, kind `agent-image`, binds the source generation, platform digest,
+verified blob descriptors, full original hashes, and actual native command
+exits to the CLI version, help, package closure and helper witnesses.
+The read-only `agent-image-status <full sha>` ops verb rechecks those originals.
+`launch_ready` remains false: this artifact cannot substitute for the genuine
+issuer-installed login generation, controller/kubectl witness or authorized
+native runtime acceptance. Parent3869107c remains open.
+
+Verified layer staging is removed only after the digest-pinned daemon pull,
+inspect and executable probes succeed. Exact expected/observed byte counts and
+SHA256 values remain in `blob-verification.json`; raw manifests, configuration
+and all native streams remain. Failed transfers keep their complete bodies.
+A matching recipe/helper/controller/harness and resolved toolchain fingerprint
+can reuse an existing immutable image. Each new source generation still fetches,
+verifies, pulls and probes that digest; `image_generation` preserves the original
+build generation and `reused_publication` copies its full witness. No build or
+push exit is invented for a reused artifact. Missing registry content refuses
+publication. The optional stage reserves 20 GiB before admission and bounds its
+retained store to 64 GiB; exhaustion refuses further publication without deleting
+a previous original or blocking core convergence.
+
+Npm downloads ignore lifecycle scripts. Downloaded Codex version/help commands
+run only in BuildKit `RUN --network=none` stages and the subsequent native
+network-none probes. The publisher requires that build mode and never falls
+back to networked vendor execution. Help flags come from the harness registry,
+and the native pre-push image ID must equal the verified registry configuration
+digest and the post-pull image ID. The [OCI image configuration contract](https://github.com/opencontainers/image-spec/blob/main/config.md#imageid)
+defines that content identity.
+
+The optional stage records an unconfirmed receipt before invoking the publisher;
+a kill before terminal acknowledgement cannot look like publication success.
+When no immutable witness exists, `agent-image-status` returns the latest
+attempt receipt with its complete stdout/stderr as an
+`agent-image-publication-attempt`, which cannot serve as an image binding.

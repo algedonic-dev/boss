@@ -795,7 +795,7 @@ fn a_row_declaring_a_writer_is_refused_by_default_and_published_once_released() 
 /// an explicit hold refuses both ordinary and force-tree modes before
 /// any publish: a rollback must rehold before its deliberate publication.
 #[test]
-fn the_shipped_row_is_released_to_the_one_kind_verb_and_an_explicit_rehold_refuses_it() {
+fn the_shipped_evidence_row_is_held_and_only_an_explicit_release_reaches_drift() {
     if !ready() {
         return;
     }
@@ -814,6 +814,19 @@ fn the_shipped_row_is_released_to_the_one_kind_verb_and_an_explicit_rehold_refus
     // The stub registry carries the unrelated synthetic maintenance row.
     // Check-only must reach the comparison's drift refusal, rather than
     // bypass it merely because the shipped publication hold was released.
+    let (rc, out) = c.run(&["ops-request"]);
+    assert_eq!(rc, 9, "{out}");
+    contains_all(
+        &out,
+        &["'ops-request' is HELD", "6b8e4e5a"],
+        "protected evidence publication is owed",
+    );
+    assert!(c.boss_calls().is_empty());
+    hold_file(
+        &c,
+        "ops-request.toml",
+        "drift_publish = 'released'\nwhy = 'Synthetic deliberate publication and controls; exercise the release mechanism only.'\n",
+    );
     let (rc, out) = c.run(&["ops-request", "--check"]);
     assert_eq!(rc, 6, "{out}");
     assert!(

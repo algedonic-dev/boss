@@ -96,6 +96,7 @@ impl Fixture {
                  printf '%s\\n' \"$hdr\" > \"$STUB_DIR/path.txt\"\n\
                  cat \"$hdr\" > \"$STUB_DIR/header.txt\" 2>/dev/null\n\
              fi\n\
+             printf '%s\\n' \"$PPID\" > \"$STUB_DIR/curl-parent-pid\"\n\
              : > \"$STUB_DIR/started\"\n\
              if [ -n \"${STUB_HANG:-}\" ]; then\n\
                  n=0\n\
@@ -233,6 +234,7 @@ impl Fixture {
             .map(|rd| {
                 rd.filter_map(Result::ok)
                     .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.starts_with("boss-secret-header."))
                     .collect()
             })
             .unwrap_or_default();
@@ -240,7 +242,7 @@ impl Fixture {
         v
     }
 
-    /// Every file under `dir`, at any depth, whose text holds the token.
+    /// Every file under `dir`, at any depth, whose bytes hold the token.
     fn files_holding_the_token(dir: &Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let Ok(rd) = std::fs::read_dir(dir) else {
@@ -253,8 +255,12 @@ impl Fixture {
             };
             if meta.is_dir() {
                 found.extend(Self::files_holding_the_token(&p));
-            } else if std::fs::read_to_string(&p)
-                .map(|t| t.contains(SECRET))
+            } else if std::fs::read(&p)
+                .map(|bytes| {
+                    bytes
+                        .windows(SECRET.len())
+                        .any(|part| part == SECRET.as_bytes())
+                })
                 .unwrap_or(false)
             {
                 found.push(p);
@@ -262,6 +268,37 @@ impl Fixture {
         }
         found
     }
+}
+
+#[test]
+fn header_inventory_distinguishes_response_files_without_hiding_token_bytes() {
+    let f = Fixture::new("header-inventory");
+    let response = f.tmp.join("boss-api-response.synthetic");
+    let spool = f.tmp.join("boss-curl.synthetic");
+    write_file(&response, "ordinary response");
+    write_file(&spool, "ordinary spool");
+    assert!(Fixture::headers_under(&f.tmp).is_empty());
+    let header = plant(&f.tmp, "synthetic", None);
+    assert_eq!(
+        Fixture::headers_under(&f.tmp),
+        ["boss-secret-header.synthetic"]
+    );
+    assert_eq!(
+        Fixture::files_holding_the_token(&f.tmp),
+        [header.join("TOKEN_HDR")]
+    );
+    std::fs::write(
+        &response,
+        [b"\xff".as_slice(), SECRET.as_bytes(), b"\0"].concat(),
+    )
+    .unwrap();
+    let holding = Fixture::files_holding_the_token(&f.tmp);
+    assert_eq!(holding.len(), 2);
+    assert!(
+        holding.contains(&response),
+        "response names cannot hide token bytes"
+    );
+    assert!(holding.contains(&header.join("TOKEN_HDR")));
 }
 
 /// Signal `child` with bash's BUILTIN kill. The gate's image ships no
@@ -584,6 +621,7 @@ fn the_pod_door_killed_mid_request_leaves_no_header_on_disk() {
         "nor is there a header directory"
     );
     kill(&mut door, "KILL");
+    assert!(Fixture::files_holding_the_token(&f.tmp).is_empty());
     assert_eq!(
         Fixture::headers_under(&f.tmp),
         Vec::<String>::new(),
@@ -591,6 +629,26 @@ fn the_pod_door_killed_mid_request_leaves_no_header_on_disk() {
     );
     f.release();
     f.wait_for("header-after.txt", "door");
+    let sender_pid: u32 = f.read("curl-parent-pid").trim().parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let state = std::fs::read_to_string(format!("/proc/{sender_pid}/stat"));
+        if state
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            || state.as_ref().is_ok_and(|stat| {
+                stat.rsplit_once(") ")
+                    .is_some_and(|(_, fields)| fields.starts_with('Z'))
+            })
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "synthetic curl's parent did not finish: {state:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(
         f.read("header-after.txt"),
         format!("x-boss-machine-token: {SECRET}\n"),
@@ -598,9 +656,43 @@ fn the_pod_door_killed_mid_request_leaves_no_header_on_disk() {
          curl — finds the whole line again"
     );
     let path = f.read("path.txt");
+    let remaining: Vec<_> = std::fs::read_dir(&f.tmp)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    eprintln!(
+        "post-kill response-path observation after synthetic curl's parent terminated: {remaining:?}"
+    );
+    assert!(
+        remaining.is_empty(),
+        "completed descendants leave no response spool after parent SIGKILL"
+    );
     assert!(
         !Path::new(path.trim()).starts_with(&f.tmp),
         "curl was handed no path under the temp directory: {path}"
+    );
+}
+
+#[test]
+fn killing_the_sender_and_descendants_leaves_no_response_spool() {
+    use std::os::unix::process::CommandExt;
+    let f = Fixture::new("door-kill-group");
+    let mut command = f.door();
+    command.process_group(0);
+    let mut child = f.spawn_until_in_flight(command, "group");
+    assert!(Fixture::files_holding_the_token(&f.tmp).is_empty());
+    let status = without_proxy(&mut Command::new("bash"))
+        .args(["-c", "kill -KILL -- \"-$1\"", "kill-group"])
+        .arg(child.id().to_string())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    child.wait().unwrap();
+    let entries: Vec<_> = std::fs::read_dir(&f.tmp).unwrap().collect();
+    assert!(
+        entries.is_empty(),
+        "killed sender and descendants left {} response spools",
+        entries.len()
     );
 }
 

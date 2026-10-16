@@ -59,6 +59,23 @@ pub trait LiveTallies: Send + Sync {
 /// spelling every gated process reads its own roster stamp through.
 pub const LAUNCH_RECORD_ENV: &str = boss_core::gate_window::LAUNCH_RECORD_ENV;
 
+/// Keep the transport classification and full cause chain in the named gap.
+/// Display alone omits reqwest's underlying timeout or connection failure.
+fn transport_gap(url: &str, phase: &str, error: reqwest::Error) -> String {
+    let causes = std::iter::successors(Some(&error as &dyn std::error::Error), |cause| {
+        cause.source()
+    })
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join(": ");
+    let classification = if error.is_timeout() {
+        "timed out: "
+    } else {
+        ""
+    };
+    format!("GET {url}{phase}: {classification}{causes}")
+}
+
 /// Existing stamped machine client, at the registry's local ports.
 pub struct LocalTallies {
     http: machine_token::Client,
@@ -232,12 +249,12 @@ impl LiveTallies for LocalTallies {
             .header("x-boss-user", actor)
             .send()
             .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
+            .map_err(|e| transport_gap(&url, "", e))?;
         let status = response.status();
         let body = response
             .bytes()
             .await
-            .map_err(|e| format!("GET {url} body: {e}"))?;
+            .map_err(|e| transport_gap(&url, " body", e))?;
         if !status.is_success() {
             return Err(format!(
                 "GET {url} answered {status}: {}",

@@ -46,6 +46,7 @@ User=boss
 RuntimeDirectory=boss-ml-inference-batch
 RuntimeDirectoryMode=0700
 Environment=BOSS_RUN_SUMMARY_FILE=/run/boss-ml-inference-batch/summary.json
+Environment=BOSS_ACTOR=automation:ml-inference-batch
 ExecStartPre=-/opt/boss/infra/boss-maintenance-wrap.sh maintenance-ml-inference-batch "ML inference batch"
 ExecStart=/opt/boss/infra/ml/run-inference-batch.sh
 ExecStopPost=-/opt/boss/infra/boss-step.sh maintenance-ml-inference-batch run

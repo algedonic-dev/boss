@@ -1775,6 +1775,60 @@ ready_when = "true"
     /// `platform_seed`'s `{}` — every file authored before this reads
     /// exactly as it did.
     #[test]
+    fn internal_wait_bounds_are_owned_by_the_authored_protocols() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infra/platform/workflows");
+        for (file, slug) in [
+            ("gate-run.toml", "record-verdict"),
+            ("ship-a-change.toml", "review"),
+            ("ship-a-change.toml", "landed-review"),
+        ] {
+            let rows = load_workflows(root.join(file)).unwrap();
+            let step = rows[0]
+                .steps
+                .iter()
+                .find(|step| step.title == slug)
+                .unwrap();
+            assert!(
+                step.duration_hours
+                    .is_some_and(|hours| hours.is_finite() && hours > 0.0),
+                "{file}/{slug} requires its own positive recorded bound"
+            );
+        }
+    }
+
+    #[test]
+    fn the_agent_protocol_declares_the_copied_claim_receipt() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infra/platform/workflows");
+        let rows = load_workflows(root.join("agent-run.toml")).unwrap();
+        assert_eq!(
+            rows[0]
+                .metadata_schema
+                .pointer("/properties/claim_receipt/type"),
+            Some(&serde_json::json!("object")),
+            "the run protocol must describe the native claim receipt"
+        );
+    }
+
+    #[test]
+    fn the_car_registry_declares_the_clean_window_record() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infra/platform/workflows");
+        let rows = load_workflows(root.join("ship-a-change.toml")).unwrap();
+        let window = rows[0]
+            .metadata_schema
+            .pointer("/properties/waits_on/properties/clean_window")
+            .expect("the supported wait declaration must describe its clean window");
+        assert_eq!(
+            window["required"],
+            serde_json::json!(["begin_at", "duration_seconds"])
+        );
+        assert_eq!(window["properties"]["begin_at"]["format"], "date-time");
+        assert_eq!(window["properties"]["duration_seconds"]["minimum"], 1);
+    }
+
+    #[test]
     fn a_row_can_author_its_metadata_schema_and_entitlements() {
         let text = r#"
 [[workflow]]

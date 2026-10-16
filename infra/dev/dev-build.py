@@ -38,6 +38,19 @@ def security():
             "capabilities": {"drop": ["ALL"]}, "seccompProfile": {"type": "RuntimeDefault"}}
 
 
+def pod_security():
+    return {"fsGroup": 1500, "fsGroupChangePolicy": "OnRootMismatch"}
+
+
+def security_matches(actual, expected):
+    """Authority is exact, including nested keys and boolean types."""
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and actual.keys() == expected.keys() and all(security_matches(actual[k], v) for k, v in expected.items())
+    if isinstance(expected, list):
+        return isinstance(actual, list) and len(actual) == len(expected) and all(security_matches(a, e) for a, e in zip(actual, expected))
+    return type(actual) is type(expected) and actual == expected
+
+
 def worker_environment():
     return [{"name": k, "value": v} for k, v in (
         ("HOME", "/workspace/home"), ("CARGO_HOME", "/workspace/cargo"),
@@ -75,6 +88,8 @@ def postgres_volumes():
 
 def declared_matches(actual, expected):
     """Compare owned fields while allowing API-added default fields."""
+    if isinstance(expected, bool):
+        return actual is expected
     if isinstance(expected, dict):
         return isinstance(actual, dict) and all(k in actual and declared_matches(actual[k], v) for k, v in expected.items())
     if isinstance(expected, list):
@@ -136,7 +151,7 @@ ln -s /workspace/source/infra/dev/wt-web /workspace/bin/wt-web
                    {"matchExpressions": [{"key": "node-role.kubernetes.io/control-plane", "operator": "DoesNotExist"}]}]},
                "preferredDuringSchedulingIgnoredDuringExecution": [{"weight": 100, "preference": {
                    "matchExpressions": [{"key": "boss.dev/purpose", "operator": "In", "values": ["build"]}]}}]}},
-           "securityContext": {"fsGroup": 1500, "fsGroupChangePolicy": "OnRootMismatch"},
+           "securityContext": pod_security(),
            "containers": [worker, postgres_container(postgres_image)], "initContainers": [init],
            "volumes": [{"name": "workspace", "persistentVolumeClaim": {"claimName": name}},
                        {"name": "forge-read", "secret": {"secretName": "forge-read", "defaultMode": 0o440}},
@@ -150,16 +165,60 @@ ln -s /workspace/source/infra/dev/wt-web /workspace/bin/wt-web
                      "template": {"metadata": {"labels": labels}, "spec": pod}}}
 
 
+def observed_pod_spec(spec):
+    # The API omits these non-pointer false booleans (first native
+    # worker, 2026-10-14). Normalize only their documented false defaults;
+    # token mounting and process sharing still need explicit refusal.
+    # https://kubernetes.io/docs/reference/kubernetes-api/core/pod-v1/
+    return {**spec, **{field: spec.get(field, False)
+                      for field in ("hostNetwork", "hostPID", "hostIPC")}}
+
+
+def native_job_matches(job, expected=None):
+    """Conserve the owning Job shape after the shared bounded API defaults."""
+    try:
+        path = Path(__file__).resolve().parent.parent / "consist-worker/declaration.py"
+        loader = importlib.util.spec_from_file_location("worker_api_defaults", path)
+        defaults = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(defaults)
+        pod = job["spec"]["template"]["spec"]
+        init = pod["initContainers"][0]["command"]
+        factory = worker_job(job["metadata"]["name"], init[4], pod["containers"][0]["image"], init[5], pod["containers"][1]["image"])
+        if expected is not None and not native_job_matches(expected):
+            return False
+        actual = defaults.normalized(job)
+        if actual is None or worker_error(job):
+            return False
+        if not defaults.remove_default(actual["spec"]["template"]["spec"]["initContainers"][0], "resources", {}):
+            return False
+        probe = actual["spec"]["template"]["spec"]["containers"][1]["readinessProbe"]
+        for key, value in {"failureThreshold": 3, "successThreshold": 1, "timeoutSeconds": 1}.items():
+            if not defaults.remove_default(probe, key, value):
+                return False
+        return defaults.matches(factory if expected is None else expected, actual, {})
+    except (OSError, KeyError, TypeError, IndexError, ValueError, AttributeError):
+        return False
+
+
 def worker_error(job):
     try:
-        pod = job["spec"]["template"]["spec"]
+        if job.get("metadata", {}).get("deletionTimestamp") is not None:
+            return "worker Job is retiring"
+        pod = observed_pod_spec(job["spec"]["template"]["spec"])
         if any(pod.get(k) is not False for k in ("automountServiceAccountToken", "hostNetwork", "hostPID", "hostIPC", "shareProcessNamespace")):
             return "worker carries host or token authority"
         if pod.get("enableServiceLinks") is not False or pod.get("restartPolicy") != "Never":
             return "worker lifecycle or inherited environment changed"
         if len(pod["containers"]) != 2 or len(pod["initContainers"]) != 1:
             return "unexpected container"
+        # API defaults may extend other fields; security authority must be
+        # exactly the factory's, including the credential-bearing bootstrap.
+        if not security_matches(pod.get("securityContext"), pod_security()):
+            return "worker Pod security context changed"
         for container in pod["containers"] + pod["initContainers"]:
+            context = postgres_container(container.get("image"))["securityContext"] if container.get("name") == "postgres" else security()
+            if not security_matches(container.get("securityContext"), context):
+                return "container security context changed"
             if any(container.get(k) for k in ("envFrom", "lifecycle", "volumeDevices", "ports")):
                 return "container carries an undeclared authority or startup hook"
         worker = pod["containers"][0]
@@ -200,6 +259,8 @@ def worker_error(job):
 
 def session_error(session, pod):
     try:
+        if pod.get("metadata", {}).get("deletionTimestamp") is not None:
+            return "worker Pod is retiring"
         if pod["metadata"]["name"] != session.pod or pod["metadata"]["uid"] != session.pod_uid:
             return "worker Pod identity changed"
         owners = pod["metadata"].get("ownerReferences", [])
@@ -208,6 +269,10 @@ def session_error(session, pod):
         error = worker_error({"metadata": {"name": session.job}, "spec": {"template": {"spec": pod["spec"]}}})
         if error:
             return error
+        spec = pod["spec"]
+        expected = worker_job(session.job, session.source_head, spec["containers"][0]["image"], spec["initContainers"][0]["command"][5], spec["containers"][1]["image"])
+        if not declared_matches(pod["metadata"].get("labels"), expected["spec"]["template"]["metadata"]["labels"]):
+            return "worker Pod fence or controller labels changed"
         bootstrap = [c for c in pod["status"].get("initContainerStatuses", []) if c["name"] == "published-bootstrap"]
         if len(bootstrap) != 1 or bootstrap[0].get("restartCount") != 0 or bootstrap[0].get("state", {}).get("terminated", {}).get("exitCode") != 0:
             return "credential-bearing bootstrap completion is not observed"
@@ -469,24 +534,23 @@ def load_record(path):
         return json.load(stream)
 
 
-def observe(session):
-    root = Path("/work/home/.config/boss/workers")
+def observe(session, root=Path("/work/home/.config/boss/workers"), transport=kube):
     def read(argv):
-        return kube_json(argv, record=lambda receipt: save_record(root / (session.job + ".observation-" + uuid.uuid4().hex + ".json"), receipt))
+        return kube_json(argv, transport=transport, record=lambda receipt: save_record(root / (session.job + ".observation-" + uuid.uuid4().hex + ".json"), receipt))
     job = read(["get", "job", session.job])
-    if job["metadata"]["uid"] != session.job_uid:
+    if worker_error(job) or job["metadata"]["uid"] != session.job_uid:
         raise RuntimeError("worker Job changed")
     intent = load_record(root / (session.job + ".intent.json"))
     if intent["head"] != session.source_head or intent["name"] != session.job:
         raise RuntimeError("worker source binding changed")
     expected = intent["job"]["spec"]["template"]["spec"]
-    if not declared_matches(job["spec"]["template"]["spec"], expected):
+    if not native_job_matches(job, intent["job"]):
         raise RuntimeError("worker Job differs from recorded controller intent")
     pod = read(["get", "pod", session.pod])
-    if not declared_matches(pod["spec"], expected):
+    if not declared_matches(observed_pod_spec(pod["spec"]), expected):
         raise RuntimeError("worker Pod differs from recorded controller intent")
     volume = read(["get", "pvc", session.job])
-    if not session.volume_uid or volume["metadata"]["uid"] != session.volume_uid or not any(o.get("uid") == session.job_uid and o.get("kind") == "Job" for o in volume["metadata"].get("ownerReferences", [])):
+    if volume["metadata"].get("deletionTimestamp") is not None or not session.volume_uid or volume["metadata"]["uid"] != session.volume_uid or not any(o.get("uid") == session.job_uid and o.get("kind") == "Job" for o in volume["metadata"].get("ownerReferences", [])):
         raise RuntimeError("private worker volume identity or lifecycle owner changed")
     error = session_error(session, pod)
     if error:
@@ -585,12 +649,78 @@ def launch(head, config, root, local_root=None, transport=None):
     raise RuntimeError("worker unavailable after 300 seconds; no local fallback")
 
 
+def recover_start(name, root, local_root=None, transport=kube):
+    """Recover an acknowledged launch; never create, replace or execute it."""
+    if not re.fullmatch(r"dev-build-[0-9a-f]{16}", name):
+        raise ValueError("recovery needs a controller-owned worker name")
+    if retirement_requested(root, name) or (root / (name + ".json")).exists():
+        raise ValueError("worker is already admitted or retirement was requested")
+    if local_root is not None and (not local_root.is_absolute() or ".." in local_root.parts):
+        raise ValueError("local source binding must be absolute without traversal")
+    intent = load_record(root / (name + ".intent.json"))
+    if intent.get("name") != name or not re.fullmatch(r"[0-9a-f]{40}", intent.get("head", "")) or not native_job_matches(intent.get("job", {})):
+        raise ValueError("retained worker intent is incomplete or unsafe")
+    expected = intent["job"]["spec"]["template"]["spec"]
+    if intent["job"]["metadata"].get("name") != name or intent["job"]["metadata"].get("namespace") != "boss-dev" or expected["initContainers"][0]["command"][4] != intent["head"]:
+        raise ValueError("retained launch identity or source is inconsistent")
+    acknowledged = []
+    for path in root.glob(name + ".launch-*.json"):
+        receipt = load_record(path)
+        if receipt.get("argv") != ["create", "-f", "-", "-o", "json"] or receipt.get("completion") != "observed" or type(receipt.get("exit")) is not int or receipt["exit"] != 0:
+            continue
+        body = json.loads(base64.b64decode(receipt.get("stdout_base64", ""), validate=True))
+        if not isinstance(body, dict):
+            raise ValueError("original creation is not a Kubernetes object; no recovery")
+        if body.get("kind") == "Job" and body.get("metadata", {}).get("name") == name:
+            if body["metadata"].get("namespace") != "boss-dev" or not body["metadata"].get("uid"):
+                raise ValueError("original creation did not acknowledge the bounded Job identity")
+            if not native_job_matches(body, intent["job"]):
+                raise ValueError("original creation differs from retained intent; no recovery")
+            acknowledged.append(body["metadata"]["uid"])
+    if len(acknowledged) != 1:
+        raise ValueError("original Job creation is unknown or ambiguous; no recovery or retry")
+    volume = load_record(root / (name + ".volume.json"))
+    if volume.get("name") != name or not volume.get("uid"):
+        raise ValueError("original private volume identity is unknown")
+    record = lambda receipt: save_record(root / (name + ".recovery-" + uuid.uuid4().hex + ".json"), receipt)
+    def read(argv):
+        return kube_json(argv, transport=lambda command: transport(command, None), record=record)
+    job = read(["get", "job", name])
+    if job["metadata"].get("name") != name or job["metadata"].get("namespace") != "boss-dev" or job["metadata"].get("uid") != acknowledged[0] or not native_job_matches(job, intent["job"]):
+        raise RuntimeError("acknowledged worker Job changed; no recovery")
+    current_volume = read(["get", "pvc", name])
+    if current_volume["metadata"].get("deletionTimestamp") is not None or current_volume["metadata"].get("name") != name or current_volume["metadata"].get("namespace") != "boss-dev" or current_volume["metadata"].get("uid") != volume["uid"] or not any(owner.get("kind") == "Job" and owner.get("name") == name and owner.get("uid") == acknowledged[0] for owner in current_volume["metadata"].get("ownerReferences", [])):
+        raise RuntimeError("private volume identity or owner changed; no recovery")
+    pods = read(["get", "pods", "-l", "job-name=" + name])["items"]
+    if len(pods) != 1:
+        raise RuntimeError("worker does not have one observed Pod; no recovery")
+    pod = pods[0]
+    if pod["metadata"].get("namespace") != "boss-dev" or not declared_matches(observed_pod_spec(pod["spec"]), expected):
+        raise RuntimeError("worker Pod differs from retained intent; no recovery")
+    workers = [status for status in pod.get("status", {}).get("containerStatuses", []) if status.get("name") == "worker"]
+    if len(workers) != 1 or not workers[0].get("containerID") or not pod["metadata"].get("uid"):
+        raise RuntimeError("worker incarnation is not observed; no recovery")
+    session = Session(name, acknowledged[0], pod["metadata"]["name"], pod["metadata"]["uid"], workers[0]["containerID"], intent["head"], volume["uid"])
+    error = session_error(session, pod)
+    if error:
+        raise RuntimeError(error)
+    if local_root is not None and source_head(local_root, record) != intent["head"]:
+        raise ValueError("local source differs from the retained launch; no recovery")
+    save_record(root / (name + ".json"), asdict(session))
+    if local_root is not None:
+        save_record(root / (name + ".binding.json"), {"session": name, "local_root": str(local_root), "source_head": intent["head"]})
+    return session
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="verb", required=True)
     start = sub.add_parser("start")
     start.add_argument("head")
     start.add_argument("--local-root", type=Path)
+    recover = sub.add_parser("recover-start")
+    recover.add_argument("session")
+    recover.add_argument("--local-root", type=Path)
     run = sub.add_parser("exec")
     run.add_argument("session")
     run.add_argument("argv", nargs=argparse.REMAINDER)
@@ -615,6 +745,9 @@ def main():
         if local_root is not None and (not local_root.is_absolute() or ".." in local_root.parts):
             raise ValueError("local source binding must be an absolute path without traversal")
         launch(args.head, config, root, local_root)
+        return 0
+    if args.verb == "recover-start":
+        print(json.dumps(asdict(recover_start(args.session, root, args.local_root))))
         return 0
     if args.verb == "stop":
         argv = []

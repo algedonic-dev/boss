@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 
 WORKSPACE = Path("/workspace")
 LIMITS = {"bundle": 128 * 1024 * 1024, "prompt": 4 * 1024 * 1024,
@@ -139,7 +140,108 @@ def validate_argv(argv):
     return argv
 
 
+def managed_plan(request):
+    plan = request.get("managed_cache")
+    keys = {"schema", "run", "nonce", "credential", "issuer", "principal", "generation", "binding"}
+    binding_keys = {"job_uid", "pod", "pod_uid", "container_id"}
+    if not isinstance(plan, dict) or set(plan) != keys or type(plan["schema"]) is not int or plan["schema"] != 1:
+        raise ValueError("managed cache requires the bound private lease plan")
+    for key in ["run", "nonce"]:
+        try:
+            identity = uuid.UUID(plan[key])
+            if not identity.int or str(identity) != plan[key]:
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("managed cache lease identity is invalid") from None
+    binding = plan["binding"]
+    if plan["run"] != request.get("run") or not isinstance(binding, dict) or set(binding) != binding_keys:
+        raise ValueError("managed cache run/incarnation differs")
+    if binding["pod_uid"] != os.environ.get("AGENT_POD_UID"):
+        raise ValueError("managed cache belongs to another Pod")
+    values = [plan[key] for key in ["credential", "issuer", "principal", "generation"]] + list(binding.values())
+    if any(not isinstance(value, str) or not value or any(c.isspace() or ord(c) < 32 for c in value) for value in values):
+        raise ValueError("managed cache metadata is absent or malformed")
+    return plan
+
+
+def directory_fd(path):
+    path = Path(path)
+    if not path.is_absolute():
+        raise ValueError("private directory must be absolute")
+    current = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in path.parts[1:]:
+            if component in [".", ".."]:
+                raise ValueError("private directory traversal is refused")
+            following = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+            os.close(current)
+            current = following
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
+def issuer_bytes(root):
+    """Only the fixed read-only mount, including its pinned atomic-writer generation."""
+    descriptor = directory_fd(root)
+    selected = descriptor
+    try:
+        try:
+            target = os.readlink("auth.json", dir_fd=descriptor)
+        except OSError:
+            target = None
+        if target is not None:
+            if target != "..data/auth.json":
+                raise ValueError("issuer projection link differs")
+            generation = os.readlink("..data", dir_fd=descriptor)
+            if not generation.startswith("..") or "/" in generation or generation in [".", ".."]:
+                raise ValueError("issuer projection generation is unsafe")
+            selected = os.open(generation, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+        fd = os.open("auth.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=selected)
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o222 or info.st_size > 256 * 1024:
+                raise ValueError("issuer input is not a bounded read-only regular file")
+            raw = source.read(256 * 1024 + 1)
+            if len(raw) != info.st_size or len(raw) > 256 * 1024:
+                raise ValueError("issuer input changed during materialization")
+            return raw
+    finally:
+        if selected != descriptor:
+            os.close(selected)
+        os.close(descriptor)
+
+
+def prepare_managed_login(request, state, issuer=Path("/harness/login")):
+    """No bytes or private parse errors enter an acknowledgment or diagnostic."""
+    managed_plan(request)
+    if request.get("login_file") != "auth.json" or request.get("home_env") != "CODEX_HOME":
+        raise ValueError("managed cache layout differs")
+    descriptor = None
+    try:
+        descriptor = directory_fd(state)
+        info = os.fstat(descriptor)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o777 != 0o700:
+            raise ValueError("worker cache directory is not private")
+        raw = issuer_bytes(issuer)
+        fd = os.open("auth.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=descriptor)
+        with os.fdopen(fd, "wb") as output:
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        os.fsync(descriptor)
+    except Exception:
+        raise ValueError("private managed cache preparation refused") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def run_harness(request, workspace, remaining):
+    managed = request.get("home_env") == "CODEX_HOME" and request.get("login_file") == "auth.json"
+    if managed:
+        managed_plan(request)
     prompt = read_regular(workspace / "prompt.txt", LIMITS["prompt"])
     if digest(prompt) != request["prompt_sha256"]:
         raise ValueError("prompt differs from the prepared bytes")
@@ -154,7 +256,10 @@ def run_harness(request, workspace, remaining):
     login_file = request["login_file"]
     if not isinstance(login_file, str) or "/" in login_file or login_file in ["", ".", ".."]:
         raise ValueError("login item is not the declared single filename")
-    os.symlink("/harness/login/" + login_file, state / login_file)
+    if managed:
+        prepare_managed_login(request, state)
+    else:
+        os.symlink("/harness/login/" + login_file, state / login_file)
     variable = request["home_env"]
     if not variable or not all(c.isupper() or c == "_" for c in variable) or variable in ["HOME", "PATH"]:
         raise ValueError("harness state variable is invalid")

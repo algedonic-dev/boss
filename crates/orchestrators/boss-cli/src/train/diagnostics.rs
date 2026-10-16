@@ -123,15 +123,109 @@ pub(super) struct Receipt {
     pub outcome: Outcome,
 }
 
+// Operation v2 records an observed preparation refusal without pretending
+// compute existed. The original executed receipt stays compatible with v1.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PreCreateRefusal {
+    pub schema: u32,
+    pub intent: Intent,
+    pub invocation: Uuid,
+    pub native_launch: NativeLaunchAbsent,
+    pub command: Value,
+    pub originals: Vec<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum NativeLaunchAbsent {
+    Absent,
+}
+
+impl std::fmt::Display for PreCreateRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "observed preparation refusal before native creation")
+    }
+}
+impl std::error::Error for PreCreateRefusal {}
+
+pub(super) fn allows_pre_create_refusal(intent: &Intent) -> bool {
+    intent.inputs.pinned_protocol["steps"]
+        .as_array()
+        .is_some_and(|steps| {
+            steps.iter().any(|s| {
+                s["title"] == "execute"
+                    && s["metadata_defaults"]["diagnostic_operation"]["version"] == 2
+            })
+        })
+}
+
+pub(super) fn validate_pre_create_refusal(value: &PreCreateRefusal) -> Result<()> {
+    use base64::Engine;
+    if value.schema != 1 || value.invocation.is_nil() || !allows_pre_create_refusal(&value.intent) {
+        bail!("pre-create refusal has no versioned invocation contract");
+    }
+    let start = serde_json::json!({"phase":"preparing","invocation":value.invocation,"attempt":value.intent.attempt});
+    if value
+        .originals
+        .iter()
+        .filter(|r| r["observation"] == start)
+        .count()
+        != 1
+        || value
+            .originals
+            .iter()
+            .filter(|r| r["observation"]["phase"] == "preparing")
+            .count()
+            != 1
+        || value
+            .originals
+            .iter()
+            .any(|r| r["observation"]["phase"] == "entering-create")
+        || value.originals.iter().any(|r| {
+            let observation = &r["observation"];
+            // ConsistControl journals args before spawning kubectl. A missing
+            // acknowledgement cannot erase that write-before-create evidence.
+            ["argv", "args"].iter().any(|field| {
+                observation[field]
+                    .as_array()
+                    .is_some_and(|argv| argv.first().is_some_and(|value| value == "create"))
+            })
+        })
+        || value.originals.last().map(|r| &r["observation"]) != Some(&value.command)
+        || value.command["argv"] != serde_json::json!(["fetch", "origin"])
+        || value.command["version"] != 1
+        || !value.command["input_b64"].is_null()
+        || value.command["exit"].as_i64().is_none_or(|exit| exit == 0)
+    {
+        bail!("pre-create refusal has no complete observed first-fetch failure");
+    }
+    for field in ["stdout_b64", "stderr_b64"] {
+        base64::engine::general_purpose::STANDARD.decode(
+            value.command[field]
+                .as_str()
+                .context("pre-create refusal command stream absent")?,
+        )?;
+    }
+    for (sequence, row) in value.originals.iter().enumerate() {
+        if row["sequence"].as_u64() != Some(sequence as u64) {
+            bail!("pre-create refusal original sequence differs");
+        }
+    }
+    Ok(())
+}
+
 pub(super) enum FirstIntent {
     Recorded(Intent),
     Replayed(Intent),
 }
 
 pub(super) enum Advance {
+    Assessed,
     Pending,
     Unknown(String),
     Complete(Box<Receipt>),
+    Refused(Box<PreCreateRefusal>),
 }
 
 /// A native adapter must retain original command observations BEFORE parsing,
@@ -148,6 +242,15 @@ pub(super) trait Door: Send + Sync {
     async fn observe(&self, intent: &Intent, launch: &Launch) -> Result<Option<Observation>>;
     async fn keep_receipt(&self, receipt: &Receipt) -> Result<()>;
     async fn finish(&self, receipt: &Receipt) -> Result<()>;
+    async fn pre_create_refusal_record(&self) -> Result<Option<PreCreateRefusal>> {
+        Ok(None)
+    }
+    async fn keep_pre_create_refusal(&self, _refusal: &PreCreateRefusal) -> Result<()> {
+        bail!("pre-create refusal retention is unavailable")
+    }
+    async fn finish_pre_create_refusal(&self, _refusal: &PreCreateRefusal) -> Result<()> {
+        bail!("pre-create refusal completion is unavailable")
+    }
 }
 
 pub(super) async fn advance(door: &dyn Door, nonce: Uuid) -> Result<Advance> {
@@ -188,11 +291,39 @@ pub(super) async fn advance(door: &dyn Door, nonce: Uuid) -> Result<Advance> {
         door.finish(&receipt).await?;
         return Ok(Advance::Complete(Box::new(receipt)));
     }
+    if let Some(refusal) = door.pre_create_refusal_record().await? {
+        if refusal.intent != intent {
+            bail!("retained pre-create refusal belongs to another intent");
+        }
+        validate_pre_create_refusal(&refusal)?;
+        if door.launch_record().await?.is_some() {
+            bail!("pre-create refusal conflicts with acknowledged launch");
+        }
+        door.finish_pre_create_refusal(&refusal).await?;
+        return Ok(Advance::Refused(Box::new(refusal)));
+    }
     let launch =
         match door.launch_record().await? {
             Some(launch) => launch,
             None if fresh => {
-                let launch = door.launch(&intent).await?;
+                let launch = match door.launch(&intent).await {
+                    Ok(launch) => launch,
+                    Err(error) => {
+                        let Some(refusal) = error.downcast_ref::<PreCreateRefusal>() else {
+                            return Err(error);
+                        };
+                        if refusal.intent != intent {
+                            bail!("pre-create refusal differs from admitted intent");
+                        }
+                        validate_pre_create_refusal(refusal)?;
+                        door.keep_pre_create_refusal(refusal).await?;
+                        if door.pre_create_refusal_record().await?.as_ref() != Some(refusal) {
+                            bail!("pre-create refusal original readback differs; no completion");
+                        }
+                        door.finish_pre_create_refusal(refusal).await?;
+                        return Ok(Advance::Refused(Box::new(refusal.clone())));
+                    }
+                };
                 door.keep_launch(&launch).await?;
                 launch
             }

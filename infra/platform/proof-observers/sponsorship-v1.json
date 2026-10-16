@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "version": 1,
+  "module": "sponsorship",
+  "kind": "receive-a-sponsorship",
+  "query": "/api/jobs?kind=receive-a-sponsorship",
+  "car": "7f01b854-c4e5-4ec8-909c-8728b8e4e96d",
+  "branch": "feat/stripe-sensor-reads-sponsor-roll-consent",
+  "claim": "A real sponsorship packet was admitted after this car converged; this does not prove sponsor roll consent was copied.",
+  "delay_seconds": 0
+}

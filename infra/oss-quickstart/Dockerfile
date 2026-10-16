@@ -113,6 +113,13 @@ COPY infra/platform/tiers.toml ./infra/platform/tiers.toml
 COPY infra/ops/verbs ./infra/ops/verbs
 # The CLI and dev activation door read ONE compatibility contract.
 COPY infra/dev/control-contract.txt ./infra/dev/control-contract.txt
+# The collector's immutable helper witnesses are embedded by rustc.
+COPY infra/agent/private-collector.py ./infra/agent/private-collector.py
+COPY infra/agent/private-collector-contract.json ./infra/agent/private-collector-contract.json
+# The same multiline guard covers test includes without guessing cfg.
+COPY infra/dispatcher/rules/run-car-probes-on-train-arrived.toml ./infra/dispatcher/rules/run-car-probes-on-train-arrived.toml
+COPY infra/dispatcher/rules/recheck-failing-probes-hourly.toml ./infra/dispatcher/rules/recheck-failing-probes-hourly.toml
+COPY infra/platform/automations/dispatcher.toml ./infra/platform/automations/dispatcher.toml
 # `boss tenant check` compiles the platform workflow roster in — the
 # DIRECTORY of kind files, listed by the same build.rs — because it
 # judges a tenant's sensor references offline, with no registry to ask
@@ -465,6 +472,7 @@ COPY infra/cluster/machine-token-push.sh /usr/local/bin/boss-machine-token-push
 COPY infra/lint/conservation-invariants.sh /opt/boss/infra/lint/conservation-invariants.sh
 COPY infra/lint/lib/conservation.sh /opt/boss/infra/lint/lib/conservation.sh
 COPY infra/lib/secret-header.sh /opt/boss/infra/lib/secret-header.sh
+COPY infra/forge/isolation-receiver.py /opt/boss/infra/forge/isolation-receiver.py
 COPY infra/oss-quickstart/generate-configs.sh /usr/local/bin/boss-generate-configs
 RUN chmod +x /opt/boss/infra/oss-quickstart/database-from-url.sh /usr/local/bin/boss-init /usr/local/bin/boss-launch \
     /usr/local/bin/boss-generate-configs \

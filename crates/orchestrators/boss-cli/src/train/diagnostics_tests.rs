@@ -15,12 +15,49 @@ struct Memory {
     lost_ack: bool,
     fail_retention: bool,
     fail_finish: bool,
+    fetch_refused: bool,
+    pre_create_refusal: Option<PreCreateRefusal>,
+    preparations: usize,
+    bad_refusal_readback: bool,
 }
 
 struct Port {
     inputs: Inputs,
     state: Mutex<Memory>,
     observation: Observation,
+}
+
+#[tokio::test]
+async fn recovered_disposition_never_bypasses_fresh_diagnostic_authority() {
+    for fault in 0..6 {
+        let mut port = Port::new();
+        match fault {
+            0 => port.inputs.observed_cluster_identity = "another-actor".into(),
+            1 => port.inputs.policy = serde_json::Value::Null,
+            2 => port.inputs.edit_level = serde_json::Value::Null,
+            3 => port.inputs.car_binding = serde_json::Value::Null,
+            4 => port.inputs.required_checks.clear(),
+            _ => port.inputs.request.baseline = "invalid-current-baseline".into(),
+        }
+        assert!(
+            advance(&port, Uuid::from_u128(1)).await.is_err(),
+            "fresh ordinary fault {fault}"
+        );
+        let state = port.state.lock().unwrap();
+        assert_eq!(state.effects, 0);
+        assert_eq!(state.preparations, 0);
+        assert!(state.intent.is_none());
+    }
+    let port = Port::new();
+    assert!(matches!(
+        advance(&port, Uuid::from_u128(1)).await.unwrap(),
+        Advance::Complete(_)
+    ));
+    assert_eq!(
+        port.state.lock().unwrap().effects,
+        1,
+        "legitimate ordinary launch must still work"
+    );
 }
 
 impl Port {
@@ -84,6 +121,40 @@ impl Door for Port {
     }
     async fn launch(&self, intent: &Intent) -> Result<Launch> {
         let mut state = self.state.lock().unwrap();
+        if state.fetch_refused {
+            state.preparations += 1;
+            let root = tempfile::tempdir().unwrap();
+            let initialized = std::process::Command::new("git")
+                .args(["init", root.path().to_str().unwrap()])
+                .output()
+                .unwrap();
+            assert!(initialized.status.success());
+            let output = std::process::Command::new("git")
+                .args(["-C", root.path().to_str().unwrap(), "fetch", "origin"])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(128));
+            assert!(!output.stderr.is_empty());
+            if !allows_pre_create_refusal(intent) {
+                bail!("legacy fetch origin exited 128 before native create");
+            }
+            let invocation = Uuid::from_u128(77);
+            let command =
+                super::diagnostic_journal::command_value(&["fetch", "origin"], None, &output);
+            let originals = vec![
+                json!({"sequence":0,"observation":{"phase":"preparing","invocation":invocation,"attempt":intent.attempt}}),
+                json!({"sequence":1,"observation":command}),
+            ];
+            return Err(PreCreateRefusal {
+                schema: 1,
+                intent: intent.clone(),
+                invocation,
+                native_launch: NativeLaunchAbsent::Absent,
+                command,
+                originals,
+            }
+            .into());
+        }
         state.effects += 1;
         assert_eq!(
             state.intent.as_ref(),
@@ -128,6 +199,225 @@ impl Door for Port {
         state.finishes += 1;
         Ok(())
     }
+    async fn pre_create_refusal_record(&self) -> Result<Option<PreCreateRefusal>> {
+        let state = self.state.lock().unwrap();
+        Ok(if state.bad_refusal_readback {
+            None
+        } else {
+            state.pre_create_refusal.clone()
+        })
+    }
+    async fn keep_pre_create_refusal(&self, refusal: &PreCreateRefusal) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.fail_retention {
+            bail!("refusal artifact retention failed");
+        }
+        state.pre_create_refusal = Some(refusal.clone());
+        Ok(())
+    }
+    async fn finish_pre_create_refusal(&self, refusal: &PreCreateRefusal) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        assert_eq!(state.pre_create_refusal.as_ref(), Some(refusal));
+        assert!(state.launch.is_none());
+        if state.fail_finish {
+            bail!("completion acknowledgement lost");
+        }
+        state.finishes += 1;
+        Ok(())
+    }
+}
+
+fn fetch_refusal_port() -> Port {
+    let mut port = Port::new();
+    let specs = boss_jobs::seed_loader::parse_workflows(
+        include_str!("../../../../../infra/platform/workflows/diagnostic-request.toml"),
+        "platform",
+        "diagnostic-request.toml",
+    )
+    .unwrap();
+    port.inputs.pinned_protocol = serde_json::to_value(&specs[0]).unwrap();
+    port.state.lock().unwrap().fetch_refused = true;
+    port
+}
+
+#[tokio::test]
+async fn reviewer_native_create_invocation_without_ack_must_remain_unknown() {
+    let port = fetch_refusal_port();
+    advance(&port, Uuid::from_u128(1)).await.unwrap();
+    let mut refusal = port
+        .state
+        .lock()
+        .unwrap()
+        .pre_create_refusal
+        .clone()
+        .unwrap();
+    // This is the existing ConsistControl::captured write-before-effect shape,
+    // not an invented argv marker: a missing ACK leaves this original behind.
+    refusal.originals.insert(
+        1,
+        json!({"sequence":1,"observation":{
+        "phase":"native-invocation","program":"/usr/local/bin/kubectl",
+        "namespace":"boss-dev","args":["create","-f","-","-o","json"],
+        "request_timeout_seconds":15,"input_b64":"e30="}}),
+    );
+    for (sequence, row) in refusal.originals.iter_mut().enumerate() {
+        row["sequence"] = json!(sequence);
+    }
+    port.state.lock().unwrap().pre_create_refusal = Some(refusal);
+    port.state.lock().unwrap().finishes = 0;
+    let result = advance(&port, Uuid::from_u128(1)).await;
+    assert!(
+        result.is_err() || matches!(result, Ok(Advance::Unknown(_))),
+        "native create invocation lacking ACK was accepted as absent-launch refusal"
+    );
+    assert_eq!(port.state.lock().unwrap().finishes, 0);
+}
+
+#[tokio::test]
+async fn pre_create_refusal_keeps_readonly_native_preparation_observations() {
+    for args in [
+        json!(["auth", "can-i", "create", "jobs.batch"]),
+        json!(["get", "jobs", "-o", "json"]),
+    ] {
+        let port = fetch_refusal_port();
+        advance(&port, Uuid::from_u128(1)).await.unwrap();
+        let mut refusal = port
+            .state
+            .lock()
+            .unwrap()
+            .pre_create_refusal
+            .clone()
+            .unwrap();
+        refusal.originals.insert(
+            1,
+            json!({"sequence":1,"observation":{
+            "phase":"native-invocation","program":"/usr/local/bin/kubectl",
+            "namespace":"boss-dev","args":args,"request_timeout_seconds":15,"input_b64":null}}),
+        );
+        for (sequence, row) in refusal.originals.iter_mut().enumerate() {
+            row["sequence"] = json!(sequence);
+        }
+        port.state.lock().unwrap().pre_create_refusal = Some(refusal);
+        port.state.lock().unwrap().finishes = 0;
+        assert!(matches!(
+            advance(&port, Uuid::from_u128(1)).await.unwrap(),
+            Advance::Refused(_)
+        ));
+        let state = port.state.lock().unwrap();
+        assert_eq!(state.finishes, 1);
+        assert_eq!(state.effects, 0);
+    }
+}
+
+#[tokio::test]
+async fn observed_pre_create_fetch_refusal_finishes_without_inventing_a_native_identity() {
+    let port = fetch_refusal_port();
+    let result = advance(&port, Uuid::from_u128(1)).await;
+    assert!(
+        result.is_ok(),
+        "observed fetch128 has no truthful refusal path: {:#}",
+        result.err().unwrap()
+    );
+    assert_eq!(port.state.lock().unwrap().effects, 0);
+    assert_eq!(port.state.lock().unwrap().finishes, 1);
+    let state = port.state.lock().unwrap();
+    let refusal = state.pre_create_refusal.as_ref().unwrap();
+    assert_eq!(refusal.command["exit"], 128);
+    assert_eq!(
+        serde_json::to_value(&refusal.native_launch).unwrap(),
+        "absent"
+    );
+    assert!(state.launch.is_none());
+}
+
+#[tokio::test]
+async fn pre_create_refusal_replays_without_preparation_or_compute_and_checks_readback() {
+    let port = fetch_refusal_port();
+    assert!(matches!(
+        advance(&port, Uuid::from_u128(1)).await.unwrap(),
+        Advance::Refused(_)
+    ));
+    assert!(matches!(
+        advance(&port, Uuid::from_u128(1)).await.unwrap(),
+        Advance::Refused(_)
+    ));
+    assert_eq!(port.state.lock().unwrap().preparations, 1);
+    assert_eq!(port.state.lock().unwrap().effects, 0);
+    for mismatch in [false, true] {
+        let port = fetch_refusal_port();
+        port.state.lock().unwrap().fail_retention = !mismatch;
+        port.state.lock().unwrap().bad_refusal_readback = mismatch;
+        assert!(advance(&port, Uuid::from_u128(1)).await.is_err());
+        assert_eq!(port.state.lock().unwrap().finishes, 0);
+    }
+}
+
+#[tokio::test]
+async fn legacy_fetch_failure_and_create_ambiguity_cannot_become_pre_create_refusals() {
+    let legacy = Port::new();
+    legacy.state.lock().unwrap().fetch_refused = true;
+    assert!(advance(&legacy, Uuid::from_u128(1)).await.is_err());
+    assert!(legacy.state.lock().unwrap().pre_create_refusal.is_none());
+    let create = fetch_refusal_port();
+    create.state.lock().unwrap().fetch_refused = false;
+    create.state.lock().unwrap().lost_ack = true;
+    assert!(advance(&create, Uuid::from_u128(1)).await.is_err());
+    assert!(create.state.lock().unwrap().pre_create_refusal.is_none());
+    assert!(matches!(
+        advance(&create, Uuid::from_u128(1)).await.unwrap(),
+        Advance::Unknown(_)
+    ));
+    assert_eq!(create.state.lock().unwrap().effects, 1);
+}
+
+#[tokio::test]
+async fn malformed_or_create_entered_refusal_is_never_a_terminal() {
+    let port = fetch_refusal_port();
+    advance(&port, Uuid::from_u128(1)).await.unwrap();
+    let original = port
+        .state
+        .lock()
+        .unwrap()
+        .pre_create_refusal
+        .clone()
+        .unwrap();
+    for fault in [
+        "schema",
+        "invocation",
+        "intent",
+        "exit",
+        "stream",
+        "entered",
+        "missing-start",
+        "sequence",
+        "native-create",
+        "multiple-invocations",
+    ] {
+        let mut bad = original.clone();
+        match fault {
+            "schema" => bad.schema = 2,
+            "invocation" => bad.invocation = Uuid::nil(),
+            "intent" => bad.intent.inputs.pinned_protocol = json!({"version":1}),
+            "exit" => bad.command["exit"] = json!(0),
+            "stream" => bad.command["stdout_b64"] = json!("invalid!"),
+            "entered" => bad.originals.insert(
+                1,
+                json!({"sequence":1,"observation":{"phase":"entering-create"}}),
+            ),
+            "missing-start" => bad.originals[0]["observation"] = json!({}),
+            "sequence" => bad.originals[1]["sequence"] = json!(5),
+            "native-create" => bad.originals.insert(1,json!({"sequence":1,"observation":{"argv":["create","-f","-"]}})),
+            "multiple-invocations" => bad.originals.insert(1,json!({"sequence":1,"observation":{"phase":"preparing","invocation":Uuid::new_v4()}})),
+            _ => unreachable!(),
+        }
+        assert!(
+            validate_pre_create_refusal(&bad).is_err(),
+            "accepted {fault}"
+        );
+    }
+    let mut raw = serde_json::to_value(original).unwrap();
+    raw["job_uid"] = json!("invented");
+    assert!(serde_json::from_value::<PreCreateRefusal>(raw).is_err());
 }
 
 #[tokio::test]
@@ -400,6 +690,10 @@ fn registered_diagnostic_protocol_uses_owning_loader_and_actor_projection() {
         Some(super::ACTOR)
     );
     assert!(execute.selectors().authority_role.is_none());
+    assert_eq!(
+        execute.metadata_defaults["diagnostic_operation"]["version"],
+        2
+    );
     assert_eq!(
         execute.metadata_defaults["diagnostic_operation"]["capacity"],
         1

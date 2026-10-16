@@ -385,6 +385,14 @@ fn no_unit_runs_a_hand_installed_copy() {
 /// port. (file, where its requests go).
 const PYTHON_NOT_THE_ESTATE: &[(&str, &str)] = &[
     (
+        "infra/forge/isolation-receiver.py",
+        "a21c491c R1 bounded synthetic receiver: controls connect only to its original-request-derived isolation-fixture Service in boss-dev; fake routes and fake credentials never address an estate service, and this fixture must not read or hold the estate machine token",
+    ),
+    (
+        "infra/agent/private-collector.py",
+        "accepted001 private collection only: the image-owned contract fixes HTTPS boss-managed-cache-collection.boss.svc:7444/v1/collect, authenticated by the distinct Pod-bound boss-managed-cache-collection audience; this is not a machine-token-gated service port, and the collector must never hold the estate machine token",
+    ),
+    (
         "infra/dev/dev-lifecycle.py",
         "the cluster's Kubernetes API, with the dev session's own service-account credential, to retire one Job by UID",
     ),
@@ -492,6 +500,22 @@ fn every_python_sender_takes_the_machine_token_from_the_one_reader_or_is_rostere
         assert!(repo_root().join(p).is_file(), "{p} is gone — drop it");
         assert!(!why.is_empty(), "{p} is listed with no reason");
     }
+}
+
+/// The Python scan, on a planted tree that is never executed.
+#[test]
+fn only_the_named_synthetic_isolation_receiver_is_outside_the_estate() {
+    let root = boss_testing::scratch_dir("python-synthetic-isolation-receiver");
+    std::fs::create_dir_all(root.join("infra/forge")).unwrap();
+    for path in [
+        "infra/forge/isolation-receiver.py",
+        "infra/forge/another-receiver.py",
+    ] {
+        boss_testing::write_file(&root.join(path), "import http.client\n");
+    }
+    let (refused, _) = python_senders(&root);
+    assert_eq!(refused.len(), 1, "{refused:#?}");
+    assert!(refused[0].starts_with("infra/forge/another-receiver.py:"));
 }
 
 /// The Python scan, on a planted tree that is never executed.
@@ -655,6 +679,12 @@ const fn site(file: &'static str, needle: &'static str, sends: usize, why: &'sta
 /// Sends that do not go to a gated service port: another party's API, a
 /// download, a registry, a local stack, or a path the gate exempts.
 const NOT_THE_ESTATE: &[Site] = &[
+    site(
+        "infra/agent/publish-image.sh",
+        "\"$registry_url\"",
+        1,
+        "The shared OCI reader's registry requests: registry_url is validated before curl to /v2/ on the two published image repository authorities, without userinfo, fragment or traversal; owning actual-curl controls refuse service paths before transport. Only the anonymous registry bearer file may ride here, never the estate machine token.",
+    ),
     site(
         "infra/gcp/adopt-root-tree.sh",
         "\"$BOSS_FORGE_URL/api/v1/repos/david/boss\"",
@@ -864,7 +894,7 @@ const NOT_THE_ESTATE: &[Site] = &[
 const NOT_A_SEND: &[Site] = &[
     site(
         "infra/lib/curl-through-a-roll.sh",
-        "answer=$(curl \"$@\")",
+        "curl \"$@\" >&\"$write_fd\"",
         1,
         "the retry wrapper: it runs its caller's argv whole, and the header is judged on the caller's line",
     ),

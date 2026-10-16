@@ -519,10 +519,14 @@ if [ "${#ak_files[@]}" -eq 0 ]; then
     echo "deposit-key-audit: UNVERIFIED — the home of $OWNER, the deposit account, could not be read" >"$alog"
     arc=2
 elif [ "$(id -un)" = "$DEPOSIT_ACCOUNT" ]; then
-    timeout -k 5 "$audit_bound" bash "$audit_script" "${ak_files[@]}" >"$alog" 2>&1 || arc=$?
+    timeout -k 5 "$audit_bound" bash -s -- "${ak_files[@]}" >"$alog" 2>&1 < "$audit_script" || arc=$?
 else
+    # The accepted generation is root-only (4d7465d2). Root opens its
+    # immutable code before dropping uid; the account still reads its own
+    # key files, and neither the generation nor root's read authority is
+    # handed to it. The inner timeout still owns the descendant session.
     timeout -k 5 "$((audit_bound + 10))" runuser -u "$DEPOSIT_ACCOUNT" -- \
-        timeout -k 5 "$audit_bound" bash "$audit_script" "${ak_files[@]}" >"$alog" 2>&1 || arc=$?
+        timeout -k 5 "$audit_bound" bash -s -- "${ak_files[@]}" >"$alog" 2>&1 < "$audit_script" || arc=$?
 fi
 sed 's/^/  deposit keys: /' "$alog"
 averdict="$(tail -n 1 "$alog")"

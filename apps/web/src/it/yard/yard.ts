@@ -1,3 +1,4 @@
+import { nonBlankProofString } from './proof-strings';
 // The train yard's data — a lens over the pipeline's queues
 // (departure-board.md; pages-as-lenses). Every row derives from
 // pr-train and ship-a-change Jobs the conductor already writes;
@@ -9,10 +10,16 @@
 // old hand-rolled derivation kept as fallback for clusters that
 // predate the registry.
 
+import { judgeProof, waitObservation, type ProofFacts, type ProofJudgment } from './proof-judgment';
+import { serdeI64, type ProofNumbers } from './proof-numbers';
+import type { ProofNow } from './proof-clock';
+import { parseProofJobsJSON, readProofJobsEnvelope } from './proof-json';
+
 export type StepLite = Readonly<{
   spec_slug?: string | null;
   title: string;
   status: string;
+  assignee_id?: string | null;
   metadata?: Record<string, unknown> | null;
   completed_on?: string | null;
   /** RFC3339 instant, when the conductor stamped one. The steps table
@@ -33,6 +40,9 @@ export type JobLite = Readonly<{
   title: string;
   status: string;
   opened_on: string;
+  opened_at?: string | null;
+  owner_id?: string | null;
+  proofNumbers?: ProofNumbers;
   tags?: readonly string[];
   metadata?: Record<string, unknown> | null;
   steps?: readonly StepLite[];
@@ -54,6 +64,9 @@ export type CarFacts = Readonly<{
   id: string;
   kind: string;
   title: string;
+  opened_at?: string | null;
+  owner_id?: string | null;
+  proofNumbers?: ProofNumbers;
   tags?: readonly string[];
   metadata?: Record<string, unknown> | null;
   steps?: readonly StepLite[] | null;
@@ -138,13 +151,15 @@ export type CarRow = Readonly<{
   deliveryChannel: DeliveryChannel;
 }>;
 
-/** A probe run the forge wrote back onto the car (`proof_attempt`). Only
- *  a run that did NOT settle the car survives here: a run that exits
+/** A probe attempt the forge recorded on the car (`proof_attempt`). Only
+ *  an attempt that did NOT settle the car survives here: a run that exits
  *  zero and prints what was claimed completes the `proven` step, which
  *  is recorded as a [`ProvenStamp`] instead. */
 export type ProofAttempt = Readonly<{
   at: string | null;
+  /** Safe numeric convenience only; the exact native integer is exitText. */
   exit: number | null;
+  exitText?: string;
   host: string | null;
   /** The two streams, SEPARATELY, as the runner records them and as the
    *  proof record has always carried them. They used to arrive merged in
@@ -166,6 +181,16 @@ export type ProofAttempt = Readonly<{
    *  again. Not a verdict against the change, and the shed must not
    *  draw it red (2026-09-12: four early probes read as regressions). */
   notYet: boolean;
+  facts?: ProofFacts;
+  /** Preserve the complete recorded evidence separately from the main
+   *  proof exit. An unread declared observer cannot establish a wait. */
+  observer?: Readonly<{
+    declaration: unknown;
+    evidence: Readonly<Record<string, unknown>>;
+    observation: 'seen' | 'unseen' | 'unread';
+    required: boolean;
+    recordedProbe?: unknown;
+  }>;
 }>;
 
 /** The `proven` step completed — the transition a car leaves the
@@ -187,23 +212,54 @@ export type CarProof = Readonly<{
   event: string | null;
   attempt: ProofAttempt | null;
   stamped: ProvenStamp | null;
+  facts?: ProofFacts;
 }>;
 
 const text = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null);
 
-function proofAttempt(v: unknown): ProofAttempt | null {
+export type ProofOutcome = ProofJudgment;
+
+/** One judgment for the parser and floor, including the backend's
+ *  SeenWhileNotYet: the condition is recorded, so the next move is ours. */
+export function proofOutcome(attempt: Pick<ProofAttempt, 'exit' | 'observer' | 'facts'>, nowMs: ProofNow = null): ProofOutcome {
+  return judgeProof(attempt.facts ?? {
+    metadata: { proof_probe: attempt.observer?.recordedProbe ?? 'probe',
+      proof_attempt: attempt.observer?.evidence ?? { exit: attempt.exit }, waits_on: attempt.observer?.declaration },
+    ownerId: null, openedAt: null, steps: [],
+  }, nowMs);
+}
+
+export function proofOutcomeUnread(attempt: Pick<ProofAttempt, 'exit' | 'observer' | 'facts'>): boolean {
+  return proofOutcome(attempt).kind === 'unread';
+}
+
+function proofAttempt(v: unknown, facts: ProofFacts): ProofAttempt | null {
   if (typeof v !== 'object' || v === null) return null;
   const a = v as Record<string, unknown>;
+  const reading = serdeI64(a.exit, facts.numbers?.['/proof_attempt/exit']);
+  const exit = typeof reading === 'bigint' && Number.isSafeInteger(Number(reading)) ? Number(reading) : null;
   const tools = Array.isArray(a.missing_tools) ? a.missing_tools.filter((t): t is string => typeof t === 'string') : [];
+  const declaration = facts.metadata.waits_on;
+  const recordedProbe = facts.metadata.proof_probe;
+  const wait = typeof declaration === 'object' && declaration !== null ? declaration as Record<string, unknown> : {};
+  const declared = nonBlankProofString(wait.on) !== null && nonBlankProofString(wait.seen) !== null;
+  const observation = waitObservation(a, facts.numbers);
+  const required = declared || a.waits_on_exit === null;
+  const observer = declared || Object.keys(a).some(key => key.startsWith('waits_on_'))
+    ? { declaration, evidence: { ...a }, observation, required, recordedProbe } as const : undefined;
   return {
     at: text(a.at),
-    exit: typeof a.exit === 'number' ? a.exit : null,
+    exit,
+    ...(typeof reading === 'bigint' ? { exitText: reading.toString() } : {}),
     host: text(a.host),
     stdout: text(a.stdout) ?? text(a.output),
     stderr: text(a.stderr),
     why: text(a.why),
     missingTools: tools,
-    notYet: a.not_yet === true || a.exit === NOT_YET_EXIT,
+    // A retry flag cannot establish an observed outcome or override its exit.
+    notYet: exit === NOT_YET_EXIT && proofOutcome({ exit, observer, facts }).kind === 'not-yet',
+    facts,
+    ...(observer === undefined ? {} : { observer }),
   };
 }
 
@@ -216,6 +272,8 @@ function proofAttempt(v: unknown): ProofAttempt | null {
 export function readCarProof(j: CarFacts | null | undefined): CarProof | null {
   if (!j) return null;
   const md = (j.metadata ?? {}) as Record<string, unknown>;
+  const facts: ProofFacts = { metadata: { ...md }, ownerId: j.owner_id ?? null,
+    openedAt: j.opened_at ?? null, steps: j.steps ?? [], numbers: j.proofNumbers };
   const proven = step(j, 'proven', 'Proven in production');
   const stamped: ProvenStamp | null =
     proven !== null && proven.status === 'completed'
@@ -225,8 +283,9 @@ export function readCarProof(j: CarFacts | null | undefined): CarProof | null {
     probe: text(md.proof_probe),
     expect: text(md.proof_expect),
     event: text(md.proof_event),
-    attempt: proofAttempt(md.proof_attempt),
+    attempt: proofAttempt(md.proof_attempt, facts),
     stamped,
+    facts,
   };
   const empty =
     proof.probe === null &&
@@ -252,6 +311,7 @@ import type { Partition } from '@boss/web-kit/ui/packet-card';
 // ITS lanes, not this lens's derivation — see [`approach`].
 import type { YardStatus } from './yard-status';
 import { fetchEvery } from '../../data/paginated';
+import { readEnvelope } from '../../data/shape';
 export { isSim, partitionOf, PROTOCOL_PALETTE, protocolHue, redTrainsPhrase } from '@boss/web-kit/ui/packet-card';
 export type { Partition } from '@boss/web-kit/ui/packet-card';
 
@@ -1443,7 +1503,7 @@ async function fetchStationQueue(name: string): Promise<StationQueueEnvelope | n
   try {
     const r = await fetch(`/api/stations/${name}/queue`);
     if (!r.ok) return null;
-    const env = (await r.json()) as StationQueueEnvelope;
+    const env = parseProofJobsJSON(await r.text()) as StationQueueEnvelope;
     return Array.isArray(env?.data) && Array.isArray(env?.discipline) ? env : null;
   } catch {
     return null;
@@ -1467,7 +1527,27 @@ async function fetchStationQueue(name: string): Promise<StationQueueEnvelope | n
  *  conductor's feed names its cars from the same read. */
 export const CARS_QUERY = '/api/jobs?kind=ship-a-change&closed_within=1';
 
+export type YardRead =
+  | Readonly<{ kind: 'ready'; data: YardState; observedAt: number }>
+  | Readonly<{ kind: 'failed'; error: string }>;
+
+export async function readYard(): Promise<YardRead> {
+  try {
+    const data = await fetchYardOrThrow();
+    return { kind: 'ready', data, observedAt: Date.now() };
+  } catch (error) {
+    return { kind: 'failed', error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// Preserve the nullable model reader for existing callers; the live floor
+// consumes the explicit refusal so retained rows cannot pretend to be fresh.
 export async function fetchYard(): Promise<YardState | null> {
+  const read = await readYard();
+  return read.kind === 'ready' ? read.data : null;
+}
+
+async function fetchYardOrThrow(): Promise<YardState> {
   const [tr, cars, dockQueue, report, gateRuns, publishRequests, dayPage] = await Promise.all([
     // 40, not 20: the window has to hold the open trains, the five
     // arrivals the board shows, AND the arrivals the ETA medians are
@@ -1478,7 +1558,7 @@ export async function fetchYard(): Promise<YardState | null> {
     // short of its total is no yard, never a yard missing cars. Whole
     // steps (`full=true`, backlog 9b473d4a): the floor reads the proof
     // and review steps' metadata.
-    fetchEvery<JobLite>(`${CARS_QUERY}&full=true`),
+    fetchEvery<JobLite>(`${CARS_QUERY}&full=true`, { read: readProofJobsEnvelope }),
     fetchStationQueue('loading-dock'),
     // The scoreboard is ADDITIVE: a yard that cannot show its stats is
     // still a yard, so this resolves to null rather than failing the
@@ -1514,8 +1594,9 @@ export async function fetchYard(): Promise<YardState | null> {
       r.kind === 'failed' ? null : { data: r.data, total: r.total },
     ),
   ]);
-  if (!tr.ok || cars.kind !== 'ready') return null;
-  const trains = ((await tr.json()) as { data?: JobLite[] }).data ?? [];
+  if (!tr.ok) throw new Error(`Train reading: HTTP ${tr.status}`);
+  if (cars.kind !== 'ready') throw new Error(cars.kind === 'failed' ? cars.error : cars.why);
+  const trains = readEnvelope('/api/jobs?kind=pr-train&limit=40&full=true', await tr.json()).data as JobLite[];
   const ships = cars.data;
   return assembleYard(trains, ships, dockQueue, Date.now(), report, gateRuns, publishRequests, dayPage);
 }

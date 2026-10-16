@@ -48,12 +48,16 @@ async fn the_bundle_lands_once_at_the_role_its_callers_assert_and_a_narrowed_row
     // Widens no one. On 2026-10-01 every row carried platform-admin, the
     // role each writer sends. The readers registered on 2026-10-07 (the
     // converge and observer reads, the probe's reader, the sweeps' train
-    // read) hold the read role, so the bundle now spells two roles and no
-    // third: a row at any other role is a grant somebody has to argue
-    // for in its own change, never a default.
+    // read) hold the read role. ca356c79 adds only the existing anonymous
+    // default for the previously unnamed ML batch, not a privileged grant.
+    // Any role beyond those existing authorities still needs its own change.
     let other: Vec<_> = rows
         .iter()
-        .filter(|a| a.role != "platform-admin" && a.role != "audit-readonly")
+        .filter(|a| {
+            a.role != "platform-admin"
+                && a.role != "audit-readonly"
+                && a.role != boss_policy_client::User::ANONYMOUS_ROLE
+        })
         .map(|a| (&a.id, &a.role))
         .collect();
     assert!(

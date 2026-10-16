@@ -35,7 +35,9 @@
 // not "no request was filed", and `ProbeRun`'s `waiting` says the weaker
 // of the two (a-limit-is-not-a-filter).
 
-import type { CarProof, CarRow, JobLite } from './yard';
+import { proofOutcome, type CarProof, type CarRow, type JobLite, type ProofAttempt } from './yard';
+import type { ProofNow } from './proof-clock';
+import { judgeProof, type ProofFacts, type ProofJudgment } from './proof-judgment';
 
 /** Where an arrived, unproven car stands. */
 export type ShedPlace = 'inspection-shed' | 'siding-event' | 'siding-no-probe';
@@ -64,20 +66,7 @@ export function shedPlace(proof: CarProof | null | undefined): ShedPlace {
  *  no open request in the rows the page read, and no run on record. */
 export type ProbeRun =
   | Readonly<{ kind: 'queued'; id: string; at: string | null }>
-  | Readonly<{
-      kind: 'ran';
-      at: string | null;
-      exit: number | null;
-      host: string | null;
-      /** Both streams, and the runner's one-sentence verdict. Never a
-       *  merged stream: see `ProofAttempt` (4fccc595). */
-      stdout: string | null;
-      stderr: string | null;
-      why: string | null;
-      missingTools: readonly string[];
-      /** Exit 75: ran, said "not yet" — see `ProofAttempt.notYet`. */
-      notYet: boolean;
-    }>
+  | (Readonly<{ kind: 'ran' }> & ProofAttempt)
   | Readonly<{ kind: 'waiting' }>;
 
 const md = (j: JobLite): Record<string, unknown> => (j.metadata ?? {}) as Record<string, unknown>;
@@ -115,14 +104,7 @@ export function probeRun(
   if (a !== null) {
     return {
       kind: 'ran',
-      at: a.at,
-      exit: a.exit,
-      host: a.host,
-      stdout: a.stdout,
-      stderr: a.stderr,
-      why: a.why,
-      missingTools: a.missingTools,
-      notYet: a.notYet,
+      ...a,
     };
   }
   return { kind: 'waiting' };
@@ -141,6 +123,7 @@ export type ShedCar = Readonly<{
   /** The event prose, on the event siding; null elsewhere. */
   event: string | null;
   run: ProbeRun;
+  judgment?: ProofJudgment;
 }>;
 
 /** The shed's population, in the order the cars were given. Every
@@ -148,10 +131,16 @@ export type ShedCar = Readonly<{
 export function inspectionShed(
   awaiting: readonly CarRow[],
   requests: readonly JobLite[] | null,
+  nowMs: ProofNow = null,
 ): readonly ShedCar[] {
   return awaiting.map(car => {
     const proof = car.proof ?? null;
     const place = shedPlace(proof);
+    const facts: ProofFacts = proof?.facts ?? { metadata: {
+      ...(proof?.probe ? { proof_probe: proof.probe } : {}),
+      ...(proof?.event ? { proof_event: proof.event } : {}),
+      ...(proof?.attempt ? { proof_attempt: { exit: proof.attempt.exit, at: proof.attempt.at, why: proof.attempt.why } } : {}),
+    }, ownerId: null, openedAt: null, steps: [] };
     return {
       car,
       place,
@@ -159,22 +148,35 @@ export function inspectionShed(
       expect: place === 'inspection-shed' ? proof?.expect ?? null : null,
       event: place === 'siding-event' ? proof?.event ?? null : null,
       run: place === 'inspection-shed' ? probeRun(car.id, proof, requests) : { kind: 'waiting' },
+      judgment: judgeProof(facts, nowMs),
     };
   });
 }
 
-/** A probe that ran and said NOT YET (exit 75): the world is not ready
- *  to judge the claim, and the probe said why. Early, not wrong. */
-const ranNotYet = (s: ShedCar): boolean => s.run.kind === 'ran' && s.run.notYet;
+/** A qualified not-yet execution remains separate from packets requiring action. */
+const judgment = (s: ShedCar): ProofJudgment => s.judgment ?? (s.run.kind === 'ran'
+  ? proofOutcome(s.run) : judgeProof(s.car.proof?.facts ?? { metadata: { proof_probe: s.probe, proof_event: s.event }, ownerId: null, openedAt: null, steps: [] }, null));
+const ranNotYet = (s: ShedCar): boolean => !judgment(s).action && judgment(s).execution === 'not-yet';
 
-/** A probe that ran and did not print what was claimed — and did not
- *  say "not yet". This is the one red thing in the shed. */
-const ranRed = (s: ShedCar): boolean => s.run.kind === 'ran' && s.run.exit !== 0 && !s.run.notYet;
+/** An observed failing outcome, distinct from a missing outcome. */
+const ranRed = (s: ShedCar): boolean => judgment(s).execution === 'failed';
+
+const conditionSeen = (s: ShedCar): boolean => judgment(s).kind === 'satisfied-condition';
+
+/** Missing outcome requires attention without asserting execution or failure. */
+const ranUnread = (s: ShedCar): boolean => judgment(s).kind === 'unread';
 
 export type ShedCounts = Readonly<{
   inspecting: number;
   /** Of those inspecting, how many have a failed run on record. */
   failed: number;
+  /** Recorded attempts whose outcome cannot be read. */
+  unread: number;
+  /** The declared condition is recorded, but the proof still says not yet. */
+  conditionSeen: number;
+  /** Distinct packets requiring action, across all three places. The
+   *  failed/unread/conditionSeen figures above are details, not addends. */
+  needsAction: number;
   /** Of those inspecting, how many said "not yet" on their last run. */
   notYet: number;
   onEvent: number;
@@ -185,6 +187,9 @@ export function shedCounts(cars: readonly ShedCar[]): ShedCounts {
   return {
     inspecting: cars.filter(s => s.place === 'inspection-shed').length,
     failed: cars.filter(s => s.place === 'inspection-shed' && ranRed(s)).length,
+    unread: cars.filter(s => s.place === 'inspection-shed' && ranUnread(s)).length,
+    conditionSeen: cars.filter(s => s.place === 'inspection-shed' && conditionSeen(s)).length,
+    needsAction: cars.filter(s => judgment(s).action).length,
     notYet: cars.filter(s => s.place === 'inspection-shed' && ranNotYet(s)).length,
     onEvent: cars.filter(s => s.place === 'siding-event').length,
     noProbe: cars.filter(s => s.place === 'siding-no-probe').length,
@@ -196,6 +201,9 @@ export function shedLabel(c: ShedCounts): string {
   const parts = [
     ...(c.inspecting > 0 ? [`${c.inspecting} inspecting`] : []),
     ...(c.failed > 0 ? [`${c.failed} probe failed`] : []),
+    ...(c.unread > 0 ? [`${c.unread} probe outcome unread`] : []),
+    ...(c.conditionSeen > 0 ? [`${c.conditionSeen} condition already seen — proof needs attention`] : []),
+    ...(c.needsAction > c.failed + c.unread + c.conditionSeen ? [`${c.needsAction - c.failed - c.unread - c.conditionSeen} proof records need attention`] : []),
     ...(c.notYet > 0 ? [`${c.notYet} not yet`] : []),
     ...(c.onEvent > 0 ? [`${c.onEvent} on an event`] : []),
     ...(c.noProbe > 0 ? [`${c.noProbe} with no probe`] : []),
@@ -205,6 +213,12 @@ export function shedLabel(c: ShedCounts): string {
 
 /** The wagon's one line: where it stands and what its run says. */
 export function shedStatus(s: ShedCar): string {
+  const outcome = judgment(s);
+  if (outcome.action) {
+    if (outcome.kind === 'satisfied-condition') return `inspection shed · condition already seen: ${outcome.condition} at ${outcome.seenAt} — proof still says not yet; needs attention`;
+    if (outcome.kind === 'failed' && outcome.execution === 'failed') return `inspection shed · probe failed, exit ${outcome.exitText ?? 'unread'}`;
+    return `${s.place === 'inspection-shed' ? 'inspection shed' : 'siding'} · ${outcome.reason} — needs attention`;
+  }
   switch (s.place) {
     case 'siding-event':
       return 'siding · waiting on an event, no probe can settle it';
@@ -214,14 +228,13 @@ export function shedStatus(s: ShedCar): string {
       switch (s.run.kind) {
         case 'queued':
           return 'inspection shed · probe queued on the forge';
-        case 'ran':
-          return s.run.exit === null
-            ? 'inspection shed · probe ran, no exit recorded'
-            : s.run.exit === 0
+        case 'ran': {
+          return s.run.exit === 0
               ? 'inspection shed · probe exit 0, not stamped'
-              : s.run.notYet
+              : outcome.kind === 'not-yet'
                 ? 'inspection shed · probe says not yet — rechecked daily'
                 : `inspection shed · probe failed, exit ${s.run.exit}`;
+        }
         case 'waiting':
           // Deliberately the weaker claim: the page read a window of
           // ops-requests, and an absence there is not an absence.
@@ -230,19 +243,17 @@ export function shedStatus(s: ShedCar): string {
   }
 }
 
-/** A failed run is the one red thing in the shed. Both sidings draw
- *  STATIC: a siding is a holding track — a car waiting on an event is
- *  the system working as designed, and one with no probe is waiting for
- *  a person, not failing. Neither is an alarm the floor should raise on
- *  its own. */
+/** Packet actionability applies in every place, independently of execution. */
 export function shedTone(s: ShedCar): 'ok' | 'warn' | 'red' | 'static' {
+  if (judgment(s).action) return 'red';
   if (s.place !== 'inspection-shed') return 'static';
-  return ranRed(s) ? 'red' : 'ok';
+  return 'ok';
 }
 
 export function shedLamp(s: ShedCar): 'ok' | 'working' | 'warn' | 'err' | 'off' {
+  if (judgment(s).action) return 'err';
   if (s.place !== 'inspection-shed') return 'off';
-  return ranRed(s) ? 'err' : 'working';
+  return 'working';
 }
 
 /** When the run happened, for a wagon with no better entry stamp. */

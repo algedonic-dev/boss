@@ -38,8 +38,17 @@ accepted=$(env -i PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C GIT_CONFIG_GLOBA
 printf 'generation=%s accepted=%s tree_uid=%s tree_mode=%s\n' "$head" "$accepted" "$(stat -c %u "$TREE")" "$(stat -c %a "$TREE")"
 verdict=0
 for unit in boss-gcp-converge boss-ops-runner boss-codebase-metrics boss-protocol-drift boss-surface-usage boss-ml-inference-batch; do
-    properties=$(timeout -k 1 3 "$SYSTEMCTL" show "$unit.service" --no-pager --property=User,ExecStart,LoadState,ActiveState,FragmentPath) || unknown "unit-read-$unit"
+    properties=$(timeout -k 1 3 "$SYSTEMCTL" --system show "$unit.service" --all --no-pager --property=User,DynamicUser,ExecStart,LoadState,ActiveState,FragmentPath) || unknown "unit-read-$unit"
+    # systemd.exec: an unset User is root for system services, unless
+    # DynamicUser allocates an identity. --all retains the empty property;
+    # an absent or repeated field is an unreadable answer, never a default.
+    user_count=$(awk '/^User=/ { n++ } END { print n+0 }' <<< "$properties")
+    [ "$user_count" = 1 ] || unknown "unreadable-user-$unit"
     user=$(sed -n 's/^User=//p' <<< "$properties")
+    dynamic=$(sed -n 's/^DynamicUser=//p' <<< "$properties")
+    [ "$dynamic" = no ] || unknown "unverified-dynamic-user-$unit"
+    user_source=explicit
+    if [ -z "$user" ]; then user=root; user_source=system-default; fi
     loaded=$(sed -n 's/^LoadState=//p' <<< "$properties")
     active=$(sed -n 's/^ActiveState=//p' <<< "$properties")
     # Print only the executable, never argv or environment values.
@@ -51,7 +60,7 @@ for unit in boss-gcp-converge boss-ops-runner boss-codebase-metrics boss-protoco
     esac
     result=adopted
     if [ "$user" != root ] || [ "$loaded" != loaded ] || [ "$executable" != "$expected" ]; then result=unadopted; verdict=1; fi
-    printf 'unit=%s user=%s load=%s active=%s executable=%s verdict=%s\n' "$unit" "$user" "$loaded" "$active" "$executable" "$result"
+    printf 'unit=%s user=%s user_source=%s load=%s active=%s executable=%s verdict=%s\n' "$unit" "$user" "$user_source" "$loaded" "$active" "$executable" "$result"
 done
 # Inactive oneshot services are normal. This proves installed callers, not that
 # an observer completed successfully; its native maintenance packet is separate.

@@ -1,5 +1,6 @@
 # Reviewed source closure for the published dev control artifact.
 infra/dev/dev-build.py
+infra/consist-worker/declaration.py
 infra/dev/dev-lifecycle.py
 infra/dev/control-artifact.py
 infra/dev/control-images.json
@@ -15,6 +16,7 @@ infra/dev/sor-read-url
 infra/dev/sor-read-ports.env
 infra/dev/machine-token-dir
 infra/forge/probe-bin/sor-routes.sh
+infra/forge/isolation-receiver.py
 infra/forge/sor-ports.env
 infra/lib/secret-header.sh
 infra/lib/curl-through-a-roll.sh

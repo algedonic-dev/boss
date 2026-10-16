@@ -75,6 +75,102 @@ const UNIDENTIFIED: &str = "operator:unidentified";
 /// The one-line file beside the script that spells the system of record.
 const SOR_URL_FILE: &str = "infra/dev/sor-url";
 
+/// 6cc6d770: the door must not put the helper's binary bytes back into
+/// a Bash string while separating curl's write-out status.
+#[test]
+fn binary_response_bytes_survive_the_whole_door_even_on_errors() {
+    for (http, curl_rc, expected_rc) in [("200", 0, 0), ("409", 0, 1), ("000", 28, 28)] {
+        let f = Fixture::new(&format!("binary-{http}"));
+        write_exec(
+            &f.bin.join("curl"),
+            &format!(
+                r#"#!/bin/bash
+printf 'call\n' >> "$STUB_ARGV"
+printf 'A\000B\377\n\n\n{http}'
+exit {curl_rc}
+"#
+            ),
+        );
+        let out = f
+            .command(&repo_root().join(SCRIPT))
+            .args(["POST", "/api/jobs"])
+            .env("BOSS_ACTOR", "agent-fixture")
+            .env("BOSS_JOBS_URL", "http://sor.test:7900")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(expected_rc), "{:?}", out);
+        assert_eq!(out.stdout, b"A\0B\xff\n\n", "HTTP {http}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("HTTP:{http}\n")));
+        assert_eq!(f.curl_argv(), vec!["call"], "the POST is never replayed");
+    }
+}
+
+/// ca356c79: a nested Python probe invoked this trusted session door
+/// after prove deliberately supplied an empty token directory. Report
+/// mode answered the unstamped request and dirtied the clean window.
+#[test]
+fn a_recorded_probe_never_sends_through_the_session_api_door() {
+    for (context, value) in [
+        ("BOSS_PROBE_NOTFOUND", "fake-only-context"),
+        ("BOSS_PROBE_NOTFOUND", ""),
+        ("BOSS_SOR_USER", "fake-only-context"),
+        ("BOSS_SOR_DOOR", "fake-only-context"),
+    ] {
+        for method in ["GET", "POST"] {
+            let f = Fixture::new(&format!("probe-context-{context}-{method}"));
+            let r = f.run(
+                &[method, "/api/jobs/record"],
+                &[("BOSS_ACTOR", "agent-probe"), (context, value)],
+            );
+            assert_eq!(r.code, 2, "{context}/{method}: {}", r.stderr);
+            assert!(r.stdout.is_empty());
+            assert!(r.stderr.contains("boss-sor-read"), "{}", r.stderr);
+            assert!(
+                f.curl_argv().is_empty(),
+                "a recorded probe must never reach curl"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_published_frontend_cannot_erase_a_recorded_probe_context() {
+    let source = repo_root().join("infra/dev/control-tools.py");
+    let out = Command::new("python3")
+        .args(["-I", "-c", r#"
+import sys, types
+from pathlib import Path
+module = types.ModuleType('owned_source')
+exec(compile(Path(sys.argv[1]).read_bytes(), sys.argv[1], 'exec'), module.__dict__)
+# No generation files exist here: refusal must precede their read,
+# rather than consulting a credential or silently clearing the marker.
+generation = Path(sys.argv[1]).parent / 'no-generation-for-this-test'
+for marker, value in [('BOSS_PROBE_NOTFOUND', 'fixture'), ('BOSS_PROBE_NOTFOUND', ''), ('BOSS_SOR_USER', 'fixture'), ('BOSS_SOR_DOOR', 'fixture')]:
+    for tool in ['boss-api', 'boss']:
+        try:
+            module.tool_plan(generation, tool, ['GET', '/api/jobs/record'], {marker: value})
+        except ValueError as error:
+            assert 'boss-sor-read' in str(error), str(error)
+        else:
+            raise AssertionError('published frontend erased recorded probe context: ' + marker + '/' + tool)
+# Ordinary legacy tokenless reads keep their existing contract. Empty
+# reader variables alone declare no reader or recorded-probe channel.
+for inherited in [{}, {'BOSS_SOR_USER': '', 'BOSS_SOR_DOOR': ''}]:
+    argv, env = module.tool_plan(generation, 'boss-api', ['GET', '/api/jobs/record'], inherited)
+    assert argv == ['/bin/bash', str(generation / 'infra/dev/boss-api'), 'GET', '/api/jobs/record']
+print('published probe-context refusals and ordinary session positives passed')
+"#])
+        .arg(source)
+        .output()
+        .expect("run inert published tool planning");
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 struct Fixture {
     root: PathBuf,
     bin: PathBuf,
@@ -265,8 +361,8 @@ fn a_get_prints_the_body_and_the_http_line() {
     // copy leaves on the body; `boss-api GET … > file` has always
     // written it, so it stays.
     assert_eq!(
-        r.stdout, "{\"total\":3}\n",
-        "the body (and the separator newline) goes to stdout, nothing else"
+        r.stdout, "{\"total\":3}",
+        "only the exact response body goes to stdout"
     );
     assert_eq!(
         r.stderr, "HTTP:200\n",
@@ -322,7 +418,7 @@ fn a_write_sends_the_body_file_and_a_non_2xx_exits_1() {
         ],
     );
     assert_eq!(r.code, 0, "{}", r.stderr);
-    assert_eq!(r.stdout, "{\"ok\":true}\n");
+    assert_eq!(r.stdout, "{\"ok\":true}");
     let argv = f.curl_argv();
     let data = argv
         .iter()
@@ -341,7 +437,7 @@ fn a_write_sends_the_body_file_and_a_non_2xx_exits_1() {
     );
     assert_eq!(r.code, 1, "a non-2xx exits 1: {}", r.stderr);
     assert_eq!(
-        r.stdout, "{\"error\":\"conflict\"}\n",
+        r.stdout, "{\"error\":\"conflict\"}",
         "the error body still reaches stdout"
     );
     assert_eq!(r.stderr, "HTTP:409\n");
@@ -1633,7 +1729,7 @@ fn a_refused_connect_is_waited_out_and_the_write_goes_out_once_the_api_is_back()
         r.stderr
     );
     assert_eq!(
-        r.stdout, "{\"id\":\"j1\"}\n",
+        r.stdout, "{\"id\":\"j1\"}",
         "only the answer reaches stdout"
     );
     assert_eq!(count_lines(&calls), 3, "two refusals, then the write");

@@ -1558,6 +1558,73 @@ impl JobsRepository for PgJobs {
             .collect())
     }
 
+    async fn historical_events(
+        &self,
+        job_id: &JobId,
+        upto: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        Ok(
+            boss_events::tail_http::history_through(&self.pool, &job_id.to_string(), upto, limit)
+                .await
+                .map_err(JobsError::Storage)?
+                .into_iter()
+                .map(|r| crate::move_diagnosis::HistoricalEvent {
+                    seq: r.seq,
+                    created_at: Some(r.created_at),
+                    event: boss_core::event::Event {
+                        id: r.event_id,
+                        timestamp: r.timestamp,
+                        source: r.source,
+                        kind: r.kind,
+                        payload: r.payload,
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    async fn move_admission_snapshot(
+        &self,
+        d: &crate::move_diagnosis::Diagnosis,
+    ) -> Result<crate::move_admission::Snapshot, JobsError> {
+        crate::move_admission_pg::snapshot(&self.pool, d)
+            .await
+            .map_err(JobsError::Storage)
+    }
+
+    async fn historical_station_events(
+        &self,
+        name: &str,
+        upto: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        Ok(boss_events::tail_http::registry_history_through(
+            &self.pool,
+            name,
+            &[
+                crate::events::STATION_PUBLISHED,
+                crate::events::STATION_RETIRED,
+            ],
+            upto,
+            limit,
+        )
+        .await
+        .map_err(JobsError::Storage)?
+        .into_iter()
+        .map(|r| crate::move_diagnosis::HistoricalEvent {
+            seq: r.seq,
+            created_at: Some(r.created_at),
+            event: boss_core::event::Event {
+                id: r.event_id,
+                timestamp: r.timestamp,
+                source: r.source,
+                kind: r.kind,
+                payload: r.payload,
+            },
+        })
+        .collect())
+    }
     async fn events_for_job(
         &self,
         job_id: &JobId,

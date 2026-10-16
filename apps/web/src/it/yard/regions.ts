@@ -16,6 +16,7 @@
 // Nothing is deleted; every panel is one click deeper.
 
 import { fetchRemote, type Remote } from '../../data/remote';
+import { parseRecordedWaits, type RecordedWait } from './waits';
 
 // ---------------------------------------------------------------------
 // Wire types — the shape of GET /api/yard/regions. Parsed once, below.
@@ -120,6 +121,7 @@ export type Machine = Readonly<{
 }>;
 
 export type Region = Readonly<{
+  waits?: ReadonlyArray<RecordedWait>;
   name: string;
   /** What is here. `null` when the region could not be read — the
    *  state is then `troubled` and `why` names the read. */
@@ -371,6 +373,7 @@ function parseRegion(raw: unknown): Region {
     unit: String(o.unit ?? ''),
     state: state as RegionState,
     why: String(o.why ?? ''),
+    ...(o.waits === undefined ? {} : { waits: parseRecordedWaits(o.waits) }),
     band: parseDecided(o.band),
     trend: parseTrend(o.trend),
     kpi: Array.isArray(o.kpi) ? o.kpi.map(parseMeasure) : [],

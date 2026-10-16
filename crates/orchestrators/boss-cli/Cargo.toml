@@ -78,6 +78,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 http = "1"
 # The per-probe Unix reader door uses the same HTTP parser as services.
 axum = { workspace = true }
+# Private collection serves only an already-handshaken TLS stream. These are
+# the existing reqwest/axum transport crates, named for that concrete adapter.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # `boss attach` states the file store's body limit from the constant the
 # content-api's route applies (UPLOAD_BODY_LIMIT_BYTES), not a copy of
 # it; its tests serve that REAL router over in-memory adapters.
@@ -106,9 +111,14 @@ flate2 = "1"
 # stop must reach what a launched harness starts, and the gate image has no
 # `kill` binary to shell out to. Already in the lock (tempfile depends on it);
 # `process` adds modules, not crates.
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "fs"] }
+# Independent managed identity verification uses the same RS256 implementation
+# already used by the broker and synthetic workload-token tests.
+rsa = { version = "0.9", features = ["sha2", "getrandom"] }
 
 [dev-dependencies]
+futures = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 # Paused time (backlog 034002b3): a jobs-API call against a dark SoR
 # now waits out a rollout for 120s, and a test that pins what a
 # best-effort read does when the SoR is dark walks that window on the

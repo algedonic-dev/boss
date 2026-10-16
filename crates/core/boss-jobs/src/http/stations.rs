@@ -24,7 +24,21 @@ use crate::stations::{StationError, StationRegistry, StationSpec};
 macro_rules! prepare_selection {
     ($ingress:expr, $read:expr) => {{
         match $ingress {
-            Some(ingress) => match ingress.prepare($read).await {
+            Some(ingress) => match {
+                #[cfg(all(test, feature = "postgres"))]
+                let mut trace = crate::native_selection_store::SelectionPhase::start(
+                    stringify!($read).to_string(),
+                    ingress.started(),
+                );
+                let result = ingress.prepare($read).await;
+                #[cfg(all(test, feature = "postgres"))]
+                trace.finish(if result.is_ok() {
+                    "returned"
+                } else {
+                    "deadline"
+                });
+                result
+            } {
                 Ok(result) => result,
                 Err(error) => {
                     return (axum::http::StatusCode::CONFLICT, error.to_string()).into_response();

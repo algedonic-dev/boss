@@ -55,6 +55,7 @@ import {
   shedStatus,
   shedTone,
   type FlakeCount,
+  type ShedCounts,
   type ShedPlace,
 } from './yard-shed';
 import {
@@ -268,13 +269,8 @@ export type Machines = Readonly<{
    *  places; `failed` is how many of the inspected cars have a failing
    *  probe run on record, and `notYet` how many said "not yet" (exit
    *  75) — early, not wrong, and not red. */
-  inspection: Readonly<{
+  inspection: ShedCounts & Readonly<{
     label: string;
-    inspecting: number;
-    failed: number;
-    notYet: number;
-    onEvent: number;
-    noProbe: number;
     /** Reds that were flakes, by check — a green after a red at the
      *  same head, read off the gate-runs the page holds (yard-shed.ts
      *  `flakeTally`, backlog 36cc4913). The shed's line for it is
@@ -804,7 +800,7 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
       arrivedCar.set(c.id, { trainId: t.id, at: t.arrivedAt.at !== '' ? t.arrivedAt.at : null }),
     ),
   );
-  const shed = inspectionShed(yard.awaitingProof, feeds.probes);
+  const shed = inspectionShed(yard.awaitingProof, feeds.probes, nowMs);
   const shedSlot: Record<ShedPlace, number> = { 'inspection-shed': 0, 'siding-event': 0, 'siding-no-probe': 0 };
   shed.forEach(s => {
     if (claimedIds.has(s.car.id)) return;

@@ -1311,7 +1311,7 @@ fn shipped_hold(kind: &str) -> Option<(String, String, String, String)> {
 /// in the release declaration. The parsed declaration and exact refusal
 /// roster are pinned together: a new refusal needs a new held car.
 #[test]
-fn the_shipped_row_is_released_after_its_runner_controls_hold() {
+fn the_shipped_proof_evidence_row_is_held_until_its_native_controls() {
     if !ready() {
         return;
     }
@@ -1319,8 +1319,8 @@ fn the_shipped_row_is_released_after_its_runner_controls_hold() {
         panic!("the shipped tree says nothing about {SIGNER_KIND}: a row that declares a writer is held by default, and the reader names it either way")
     });
     assert_eq!(
-        state, "released",
-        "{SIGNER_KIND} is `{state}` in the shipped tree ({source}); the earned row-E release and its exact controls must remain on the record"
+        state, "held",
+        "{SIGNER_KIND} is `{state}` in the shipped tree ({source}); new evidence writers require their own publication and controls"
     );
     assert_eq!(
         source, SIGNER_HOLD_SOURCE,
@@ -1329,20 +1329,15 @@ fn the_shipped_row_is_released_after_its_runner_controls_hold() {
     contains_all(
         &why,
         &[
-            "6c9183de",
-            "f623e425",
+            "6b8e4e5a",
+            "c8d22e63",
             "runner:ops",
             "execute",
-            "David",
-            "rollback",
-            "G3",
-            "84e7c3e4",
-            "ceab6636",
-            "a34155dd2aeaec0d83adb9eb6f3a5a1980b091dc531fd7482f4a12feec5becd5",
-            "3ec85469",
-            "v13",
-            "24-hour",
-            "negative control",
+            "output",
+            "exit_code",
+            "publication",
+            "native",
+            "6c9183de",
         ],
         "the why names the item, the design, what is reserved, whose publish puts it live, that a rollback sticks and when it may not run, and keeps the review row's half true",
     );
@@ -1354,6 +1349,9 @@ fn the_shipped_row_is_released_after_its_runner_controls_hold() {
         ("approve", "rendered_plan_sha256"),
         ("approve", "review_run"),
         ("approve", "verb"),
+        ("execute", "disposition"),
+        ("execute", "output"),
+        ("execute", "exit_code"),
         ("nothing-to-do", "args"),
         ("nothing-to-do", "host"),
         ("nothing-to-do", "nothing_to_do"),
@@ -1438,6 +1436,18 @@ fn for_real_publishes_the_released_row_but_a_rehold_preserves_the_rollback() {
         )
         .expect("the shipped tree declares what it says about ops-request"),
     );
+    let (rc, out) = c.run(&["--for-real"]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(c.publishes(), vec!["maintenance-alpha"]);
+    contains_all(
+        &out,
+        &[&format!(
+            "publish-drift: held {SIGNER_KIND} ({SIGNER_HOLD_SOURCE})"
+        )],
+        "new evidence source stays held",
+    );
+    c.clear_calls();
+    c.hold_file(&format!("{SIGNER_KIND}.toml"),"drift_publish = 'released'\nwhy = 'Synthetic deliberate publication and controls; exercise the release mechanism only.'\n");
     let (rc, out) = c.run(&["--for-real"]);
     assert_eq!(rc, 0, "{out}");
     assert_eq!(c.publishes(), vec!["maintenance-alpha", SIGNER_KIND]);

@@ -48,14 +48,14 @@ impl Tree {
             .unwrap_or_else(|e| panic!("read {LINT}: {e}"));
         scratch::write_exec(&root.join(LINT), &body);
         copy_dir(&repo_root().join("infra/ops"), &root.join("infra/ops"));
-        // The verbs' argv[0] scripts live in these three directories and
+        // The verbs' argv[0] scripts live in these directories and
         // the lint checks each is a file in the tree. `infra/lib` — what
         // `infra/ops/verbs-allowlist.sh` sources its `jq_doc_file` guard
         // from (d96e38ab) — is already here: `copy_lint_libs` carries it
         // since backlog 834ddb7c, and the copied `infra/ops` above
         // resolves it as a sibling. Symlinked rather than copied: this
         // fixture varies the ESTATE and nothing else.
-        for dir in ["infra/cluster", "infra/forge", "infra/gcp"] {
+        for dir in ["infra/cluster", "infra/forge", "infra/gcp", "infra/agent"] {
             std::os::unix::fs::symlink(repo_root().join(dir), root.join(dir))
                 .unwrap_or_else(|e| panic!("link {dir}: {e}"));
         }

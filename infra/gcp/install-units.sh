@@ -262,6 +262,43 @@ if [ -n "$ROOT_UNITS" ]; then
         INSTALL_ETC="$TIMER_ETC" INSTALL_SYSTEMCTL="$TIMER_SYSTEMCTL" \
         bash "$REPO_ROOT/infra/ops/install-ops-runner.sh" boss-gcp
 fi
+
+# STOPPING A WRITER DOES NOT RETIRE ITS FILE (6856303c). Seven current
+# units still carried the old second-stack address on 2026-10-15, although
+# their unit bodies already read sor.env. Retire only the old installer's
+# exact two-directive shape, under a unit this pass actually installs.
+# Other drop-ins, out-of-role subjects and unfamiliar files stay put.
+retire_jobs_url_drop_in() { # <installed stem>
+    local dir="$TIMER_ETC/$1.service.d" file mode path
+    file="$dir/jobs-url.conf"
+    [ -e "$file" ] || [ -L "$file" ] || return 0
+    for path in "$TIMER_ETC" "$dir" "$file"; do
+        mode="$(stat -c %a -- "$path")" || return 78
+        if [ -L "$path" ] || [ ! -O "$path" ] \
+            || ! [[ "$mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$mode & 0022) != 0 )); then
+            echo "install-units: REFUSED — obsolete drop-in path is linked, unowned or replaceable: $path; $file retained" >&2
+            return 78
+        fi
+    done
+    if [ ! -f "$file" ] || ! awk '
+        /^[[:space:]]*($|#)/ { next }
+        $0 == "[Service]" && !section { section = 1; next }
+        section && /^Environment=BOSS_JOBS_URL=http:\/\/127[.]0[.]0[.]1:[0-9]+$/ && !address { address = 1; next }
+        { other = 1 }
+        END { exit (!section || !address || other) }
+    ' "$file"; then
+        echo "install-units: REFUSED — $file is not the obsolete installer's address-only drop-in; file retained" >&2
+        return 78
+    fi
+    rm -- "$file"
+    if [ -e "$file" ] || [ -L "$file" ]; then
+        echo "install-units: FAILED — obsolete drop-in still exists after removal: $file" >&2
+        return 1
+    fi
+    echo "  retired obsolete drop-in $file (read back absent)"
+    run_summary_note "retired obsolete drop-in $file (read back absent)"
+}
+
 for stem in $ALL_STEMS; do
     if ! stem_in_role "$stem" "$roster"; then
         echo "  NOT IN ROLE $stem — this host's roles do not name it; the uninstall-not-in-role verb removes it"
@@ -303,10 +340,9 @@ for stem in $ALL_STEMS; do
     # `Environment=BOSS_JOBS_URL=http://127.0.0.1:<jobs port>` drop-in —
     # the second, older stack this host carried. That stack was retired
     # on 2026-09-15 (ops-request 7912c9ae) and its chores uninstalled;
-    # every unit still in a role pins the system of record INLINE with
-    # env(1) on both Exec lines, which timers-leave-a-packet.sh check 7
-    # makes the rule. A drop-in naming a port nothing listens on would
-    # be a wrong target one layer down.
+    # every current unit reads the system of record from sor.env. Retire
+    # the obsolete file too; merely declining to write it left it in place.
+    retire_jobs_url_drop_in "$stem"
     echo "  installed $stem unit + timer"
     TIMER_UNITS_INSTALLED=$((TIMER_UNITS_INSTALLED + 1))
 done

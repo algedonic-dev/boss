@@ -2,6 +2,15 @@
 # Dev isolation (b3071bf4): an activated generation answers from its
 # published copy. A REFUSED selector (design a68fc42a D1) runs this
 # trusted door here, so the operator keeps the system of record.
+# Recorded probes deliberately receive no machine token. A nested
+# interpreter can hide this invocation from the probe-text judge
+# (ca356c79, 2026-10-14), so refuse here before routing or reading a
+# credential. The probe's GET-only reader owns its approved read path;
+# an unavailable reader is a refusal, never this session's fallback.
+if [[ -n "${BOSS_PROBE_NOTFOUND+set}" || -n "${BOSS_SOR_USER:-}" || -n "${BOSS_SOR_DOOR:-}" ]]; then
+    echo 'boss-api: REFUSED — recorded probe context must read through boss-sor-read; this session door cannot issue an intentionally tokenless probe request' >&2
+    exit 2
+fi
 dev_control=/work/tools/dev-control
 if [[ "$(/usr/bin/readlink -- "$dev_control/enabled" 2>/dev/null)" =~ ^"$dev_control"/generations/[0-9a-f]{40}$ && "$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")" != "$dev_control"/generations/*/infra/dev/boss-api ]]; then
     exec "$dev_control/boss-api" "$@"
@@ -285,6 +294,20 @@ if [ -z "$ACTOR_ID" ]; then
 fi
 ACTOR='{"id":"'"$ACTOR_ID"'","role":"'"$ROLE"'","access_tier":"'"$TIER"'","territory_account_ids":[],"direct_report_ids":[],"department":null}'
 
+# Keep response bytes out of Bash strings even after the shared helper
+# returns (6cc6d770). Arm cleanup before the secret-header lib chains it.
+response=$(mktemp "${TMPDIR:-/tmp}/boss-api-response.XXXXXXXX")
+trap 'rm -f -- "$response"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# Independent read offsets avoid platform-specific descriptor path seeks.
+# No response pathname survives into a request that may be killed.
+exec {response_out}>"$response"
+exec {response_tail}<"$response"
+exec {response_size}<"$response"
+exec {response_body}<"$response"
+rm -f -- "$response"
 args=( -sS -X "$METHOD" -H 'Content-Type: application/json' -H "X-Boss-User: $ACTOR" -w '\n%{http_code}' )
 # THE MACHINE TOKEN — read, host-checked and handed to curl by the ONE
 # shell reader, infra/lib/secret-header.sh's machine_token_header, which
@@ -387,9 +410,22 @@ ROLL_LIB="$HERE/../lib/curl-through-a-roll.sh"
 # shellcheck source=../lib/curl-through-a-roll.sh
 . "$ROLL_LIB"
 
-out=$(curl_through_a_roll "$WAIT_WINDOW" boss-api 'the jobs API' "$METHOD $API_PATH" "${args[@]}" "$BASE$API_PATH")
-code=${out##*$'\n'}
-body=${out%"$code"}
-printf '%s' "$body"
+request_rc=0
+curl_through_a_roll "$WAIT_WINDOW" boss-api 'the jobs API' "$METHOD $API_PATH" "${args[@]}" "$BASE$API_PATH" >&"$response_out" || request_rc=$?
+# Only curl's fixed four-byte write-out trailer is text. Strip its
+# separator too: it is not part of an attachment's response body.
+suffix=$(tail -c 4 <&"$response_tail")
+case "$suffix" in
+  $'\n'[0-9][0-9][0-9]) code=${suffix:1} ;;
+  *)
+    cat <&"$response_body"
+    [ "$request_rc" -eq 0 ] || exit "$request_rc"
+    echo 'boss-api: response lacks the curl HTTP status trailer — refusing success' >&2
+    exit 1
+    ;;
+esac
+response_bytes=$(wc -c <&"$response_size")
+head -c "$((response_bytes - 4))" <&"$response_body"
 printf 'HTTP:%s\n' "$code" >&2
+[ "$request_rc" -eq 0 ] || exit "$request_rc"
 case "$code" in 2*) exit 0 ;; *) exit 1 ;; esac

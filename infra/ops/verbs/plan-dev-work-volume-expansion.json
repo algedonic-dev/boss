@@ -1,0 +1,8 @@
+{
+  "about": "READ-ONLY fixed dev work purpose, accepted design 9687bcaf / urgent31d76e37. Only boss-dev/boss-dev-work, explicit41..64Gi; no namespace, claim, path, manifest or command argument. Renders exact UID/old request/volume identity CAS, current pod/container/mount/session bindings, complete unique healthy replicas and native Longhorn physical plus scheduling admission through the shared checked ledger. Current physical free space is retained and rechecked separately from stable signed plan bytes. The current attached unencrypted RWO/ext4/blockdev configuration and running Longhorn1.11.3 CSI image identity support the documented online expansion path; this is not a direct CSI RPC receipt or observation of actual growth. Planning-only: no authoritative billing adapter exists. Native monetary cost is unknown and executable=false; even its exact approved hash cannot authorize a patch. A later approved authoritative reader must supply fresh bounded original monetary evidence bound to the entire resource plan, including amount, currency, billing period and authority/reference. No zero-cost inference from existing disks or replicas. Rights or identities unknown, partial lists, drift, unsupported versions/configuration and oversized evidence refuse. Complete original read streams and exits ride a lossless gzip+base64 evidence envelope; consumers require complete ops stream capture. No write, movement, restart, deletion, permission or credential change. Source implementation approval does not approve the later resize.",
+  "hosts": ["forge"],
+  "capture": "separate-streams",
+  "argv": ["infra/forge/dev-work-volume.sh", "--plan", "{1}"],
+  "params": [{"name":"size", "pattern":"^(4[1-9]|5[0-9]|6[0-4])Gi$"}],
+  "timeout": 240
+}

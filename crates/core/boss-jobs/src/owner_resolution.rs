@@ -204,7 +204,9 @@ impl ReqwestRosterLookup {
             .headers(h)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            // Display retains only the URL; keep the original transport cause
+            // so a timeout, refused connection and broken reply stay distinct.
+            .map_err(|e| format!("{e:?}"))?;
         if !resp.status().is_success() {
             return Err(format!("{url} {}", resp.status()));
         }
@@ -355,6 +357,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roster_transport_failure_keeps_the_original_source_chain() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                drop(socket);
+            }
+        });
+        let roster = ReqwestRosterLookup {
+            client: boss_core::machine_token::Client::unstamped(
+                reqwest::Client::builder().timeout(Duration::from_secs(5)),
+            )
+            .unwrap(),
+            people_base: base,
+            cache: Mutex::new(HashMap::new()),
+            ttl: Duration::from_secs(60),
+        };
+        let error = roster.active_holders("platform-admin").await.unwrap_err();
+        server.abort();
+        assert!(
+            error.contains("source:"),
+            "original transport source lost: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn step_authority_role_is_the_fallback() {
         let roster = InMemoryRoster::new().with_holder("workflow-approver", "emp-lead-1");
         let owner = resolve_owner(&roster, "system-sim", "j", None, Some("workflow-approver"))
@@ -375,23 +404,45 @@ mod tests {
     async fn an_empty_holder_list_is_not_cached() {
         use std::sync::Arc;
         use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let people: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(vec![]));
         let served = people.clone();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
         let app = axum::Router::new().route(
             "/api/people",
-            axum::routing::get(move || {
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                assert!(headers.get(boss_core::machine_token::HEADER).is_none());
+                seen.fetch_add(1, Ordering::SeqCst);
                 let rows = served.lock().unwrap().clone();
                 async move { axum::Json(serde_json::Value::Array(rows)) }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let roster = ReqwestRosterLookup::new(base);
+        // This cache fixture exercises real HTTP with the production five-second
+        // timeout, but must never read or transmit the estate's mounted token.
+        let roster = ReqwestRosterLookup {
+            client: boss_core::machine_token::Client::unstamped(
+                reqwest::Client::builder().timeout(Duration::from_secs(5)),
+            )
+            .unwrap(),
+            people_base: base,
+            cache: Mutex::new(HashMap::new()),
+            ttl: Duration::from_secs(60),
+        };
+        assert!(
+            !server.is_finished(),
+            "fixture server ended before the roster read"
+        );
+        let began = Instant::now();
         assert_eq!(
-            roster.active_holders("platform-admin").await.unwrap(),
+            roster.active_holders("platform-admin").await.unwrap_or_else(|error| {
+                panic!("initial roster read failed after {:?}, server ended={}, requests={}: {error}", began.elapsed(), server.is_finished(), requests.load(Ordering::SeqCst))
+            }),
             Vec::<String>::new(),
             "roster starts empty"
         );
@@ -401,7 +452,9 @@ mod tests {
             "id": "emp-admin", "role": "platform-admin", "status": "active"
         }));
         assert_eq!(
-            roster.active_holders("platform-admin").await.unwrap(),
+            roster.active_holders("platform-admin").await.unwrap_or_else(|error| {
+                panic!("seeded roster read failed after {:?}, server ended={}, requests={}: {error}", began.elapsed(), server.is_finished(), requests.load(Ordering::SeqCst))
+            }),
             vec!["emp-admin".to_string()],
             "the just-seeded admin must be visible immediately — empty is not a fact"
         );
@@ -412,9 +465,13 @@ mod tests {
             "id": "emp-admin-2", "role": "platform-admin", "status": "active"
         }));
         assert_eq!(
-            roster.active_holders("platform-admin").await.unwrap(),
+            roster.active_holders("platform-admin").await.unwrap_or_else(|error| {
+                panic!("cached roster read failed after {:?}, server ended={}, requests={}: {error}", began.elapsed(), server.is_finished(), requests.load(Ordering::SeqCst))
+            }),
             vec!["emp-admin".to_string()],
             "populated results keep the TTL cache"
         );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 }

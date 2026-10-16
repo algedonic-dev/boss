@@ -516,10 +516,11 @@ fn adoption_fetches_authenticated_source_then_launcher_accepts_the_same_generati
     write_exec(
         &systemctl,
         r#"#!/bin/bash
-case "$2" in boss-gcp-converge.service|boss-ops-runner.service) executable="$BOSS_GCP_PREPARED_DIR/bootstrap/infra/gcp/gcp-root-launch.sh";; *) executable="$BOSS_GCP_ROOT_TREE/current/infra/gcp/root-tree.sh";; esac
+for argument; do case "$argument" in *.service) unit=$argument ;; esac; done
+case "$unit" in boss-gcp-converge.service|boss-ops-runner.service) executable="$BOSS_GCP_PREPARED_DIR/bootstrap/infra/gcp/gcp-root-launch.sh";; *) executable="$BOSS_GCP_ROOT_TREE/current/infra/gcp/root-tree.sh";; esac
 user=root
-if [ "${STATUS_UNADOPTED:-}" = 1 ] && [ "$2" = boss-ml-inference-batch.service ]; then user=boss; fi
-printf 'User=%s\nLoadState=loaded\nActiveState=inactive\nExecStart={ path=%s ; argv[]=%s secret-sentinel ; }\n' "$user" "$executable" "$executable"
+if [ "${STATUS_UNADOPTED:-}" = 1 ] && [ "$unit" = boss-ml-inference-batch.service ]; then user=boss; fi
+printf 'User=%s\nDynamicUser=no\nLoadState=loaded\nActiveState=inactive\nExecStart={ path=%s ; argv[]=%s secret-sentinel ; }\n' "$user" "$executable" "$executable"
 "#,
     );
     let status = |unadopted: bool| {

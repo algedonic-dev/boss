@@ -2007,6 +2007,24 @@ async fn a_clock_firing_must_say_it_advances_and_the_drain_floor_is_the_rules() 
 // ----- the HTTP adapter, against the real gate -----
 
 #[tokio::test]
+async fn a_gate_deadline_names_timeout_and_never_becomes_an_absent_port() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = axum::Router::new()
+        .fallback(|| async { std::future::pending::<axum::http::StatusCode>().await });
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut gates = LocalGates::new(vec![("jobs".into(), format!("http://{address}"))]);
+    // Only this synthetic never-answering endpoint uses a short deadline.
+    // The production constructor and real-gate positive tests keep theirs.
+    Arc::get_mut(&mut gates).unwrap().timeout = Duration::from_millis(20);
+    match gates.accepts("jobs", "synthetic-value").await {
+        GateRead::Failed(why) => assert!(why.contains("request timed out"), "{why}"),
+        other => panic!("a listening but unanswered port is not absent: {other:?}"),
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn local_gates_read_the_real_gate_and_a_refused_port_is_not_served() {
     use boss_core::machine_gate::{MachineGate, Reading, gated};
     let gate = Arc::new(MachineGate::new(

@@ -62,6 +62,7 @@ fn moved(
     declared: Option<bool>,
 ) -> Move {
     Move {
+        dispatch: None,
         at: boss_clock_client::wall_now() - chrono::Duration::minutes(1),
         packet: packet.into(),
         kind: "ship-a-change".into(),

@@ -32,6 +32,8 @@ mod census;
 mod flights;
 mod jobs;
 mod kinds;
+mod move_admission;
+mod move_corrections;
 mod moves;
 mod plugins;
 mod presence;
@@ -352,6 +354,26 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         // as a page after a seq and as a stream that resumes from one.
         .route("/api/yard/moves", get(yard_moves::<R, B>))
         .route("/api/yard/moves/stream", get(yard_moves_stream::<R, B>))
+        .route(
+            "/api/yard/moves/{seq}/diagnoses",
+            post(move_corrections::diagnosis::<R, B>),
+        )
+        .route(
+            "/api/yard/moves/{seq}/diagnoses/{diagnosis}/admission-observations",
+            post(move_admission::observe::<R, B>),
+        )
+        .route(
+            "/api/yard/moves/{seq}/diagnoses/{diagnosis}/admission-observations/{request}",
+            get(move_admission::get::<R, B>),
+        )
+        .route(
+            "/api/yard/moves/{seq}/corrections",
+            post(move_corrections::correction::<R, B>),
+        )
+        .route(
+            "/api/yard/moves/{seq}/withdrawals",
+            post(move_corrections::withdrawal::<R, B>),
+        )
         // THE ROUTES (design e765b3fc §2b, car R2): every line the map
         // may draw, derived from the protocols, the declared hand-offs
         // and the moves record — each with the sources that support it.

@@ -6,6 +6,8 @@ import json
 import subprocess
 import tempfile
 import shlex
+import uuid
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("agent_io", Path(__file__).with_name("agent-io.py"))
 io = importlib.util.module_from_spec(spec)
@@ -27,6 +29,126 @@ class FenceTests(unittest.TestCase):
             changed[field] = "other" if isinstance(changed[field], str) else changed[field] + 1
             with self.assertRaises(ValueError, msg=field):
                 io.require_fence(changed)
+
+    def test_managed_cache_without_bound_private_plan_refuses_before_any_login_path(self):
+        with tempfile.TemporaryDirectory(prefix=f"agent-cache-{os.getuid()}-{os.getpid()}-", dir=os.environ.get("BOSS_TEST_SCRATCH")) as directory:
+            root = Path(directory)
+            prompt = b"synthetic prompt"
+            io.private_write(root / "prompt.txt", prompt)
+            request = {"prompt_sha256": io.digest(prompt), "argv": ["/usr/local/bin/codex"],
+                       "snapshot": {}, "login_file": "auth.json", "home_env": "CODEX_HOME"}
+            with patch.object(io, "import_snapshot", return_value=root), patch.object(io.os, "symlink") as link:
+                with self.assertRaises(ValueError):
+                    io.run_harness(request, root, lambda: 5)
+            link.assert_not_called()
+
+    def cache_plan(self):
+        return {"schema": 1, "run": str(uuid.uuid4()), "nonce": str(uuid.uuid4()),
+                "credential": "fixture-login", "issuer": "fixture-issuer", "principal": "fixture-principal",
+                "generation": "fixture-generation", "binding": {"job_uid": "fixture-job", "pod": "fixture-pod",
+                "pod_uid": "synthetic-pod-uid", "container_id": "containerd://fixture"}}
+
+    def test_managed_materialization_is_private_writable_and_never_writes_issuer(self):
+        with tempfile.TemporaryDirectory(prefix=f"agent-managed-{os.getuid()}-{os.getpid()}-", dir=os.environ.get("BOSS_TEST_SCRATCH")) as directory:
+            root = Path(directory)
+            issuer, state = root / "issuer", root / "state"
+            issuer.mkdir(mode=0o700)
+            state.mkdir(mode=0o700)
+            original = b'{"synthetic_private_fixture":"original"}'
+            io.private_write(issuer / "auth.json", original)
+            os.chmod(issuer / "auth.json", 0o400)
+            plan = self.cache_plan()
+            request = {"run": plan["run"], "managed_cache": plan, "login_file": "auth.json", "home_env": "CODEX_HOME"}
+            io.prepare_managed_login(request, state, issuer)
+            self.assertFalse((state / "auth.json").is_symlink())
+            self.assertEqual((state / "auth.json").stat().st_mode & 0o777, 0o600)
+            (state / "auth.json").write_bytes(b'{"synthetic_private_fixture":"renewed"}')
+            self.assertEqual((issuer / "auth.json").read_bytes(), original)
+            with self.assertRaises(ValueError):
+                io.prepare_managed_login(request, state, issuer)
+
+    def test_projected_readonly_issuer_is_pinned_and_arbitrary_links_are_refused(self):
+        with tempfile.TemporaryDirectory(prefix="agent-projection-", dir=os.environ.get("BOSS_TEST_SCRATCH")) as directory:
+            root = Path(directory)
+            issuer = root / "issuer"
+            issuer.mkdir(mode=0o700)
+            version = issuer / "..fixture-version"
+            version.mkdir(mode=0o700)
+            io.private_write(version / "auth.json", b"synthetic-private-fixture")
+            os.chmod(version / "auth.json", 0o400)
+            (issuer / "..data").symlink_to(version.name)
+            (issuer / "auth.json").symlink_to("..data/auth.json")
+            self.assertEqual(io.issuer_bytes(issuer), b"synthetic-private-fixture")
+            (issuer / "..data").unlink()
+            (issuer / "..data").symlink_to("../outside-private-fixture")
+            with self.assertRaises((OSError, ValueError)):
+                io.issuer_bytes(issuer)
+            (issuer / "auth.json").unlink()
+            (issuer / "auth.json").symlink_to(version / "auth.json")
+            with self.assertRaises((OSError, ValueError)):
+                io.issuer_bytes(issuer)
+
+    def test_private_materialization_refuses_hardlinks_special_files_and_foreign_state(self):
+        with tempfile.TemporaryDirectory(prefix="agent-cache-refusal-", dir=os.environ.get("BOSS_TEST_SCRATCH")) as directory:
+            root = Path(directory)
+            issuer, state = root / "issuer", root / "state"
+            issuer.mkdir(mode=0o700)
+            state.mkdir(mode=0o700)
+            plan = self.cache_plan()
+            request = {"run":plan["run"], "managed_cache":plan, "login_file":"auth.json", "home_env":"CODEX_HOME"}
+            for kind in ["hardlink", "fifo", "writable", "state-permission", "state-symlink"]:
+                leaf = issuer / "auth.json"
+                if leaf.exists():
+                    leaf.unlink()
+                if kind == "fifo":
+                    os.mkfifo(leaf)
+                else:
+                    io.private_write(leaf, b"synthetic-private-fixture")
+                    os.chmod(leaf, 0o400)
+                if kind == "hardlink":
+                    os.link(leaf, root / "other-link")
+                if kind == "writable":
+                    leaf.chmod(0o600)
+                target = state
+                if kind == "state-permission":
+                    state.chmod(0o755)
+                if kind == "state-symlink":
+                    target = root / "linked-state"
+                    target.symlink_to(state)
+                with self.assertRaisesRegex(ValueError, "^private managed cache preparation refused$"):
+                    io.prepare_managed_login(request, target, issuer)
+                state.chmod(0o700)
+                self.assertFalse((state / "auth.json").exists())
+
+    def test_unbound_or_foreign_private_plan_refuses_before_issuer_read(self):
+        with tempfile.TemporaryDirectory(prefix=f"agent-plan-{os.getuid()}-{os.getpid()}-", dir=os.environ.get("BOSS_TEST_SCRATCH")) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            for bad in ["run", "nonce", "pod_uid", "principal", "extra"]:
+                plan = self.cache_plan()
+                request = {"run": plan["run"], "managed_cache": plan, "login_file": "auth.json", "home_env": "CODEX_HOME"}
+                if bad == "run":
+                    request["run"] = str(uuid.uuid4())
+                elif bad == "nonce":
+                    plan["nonce"] = str(uuid.UUID(int=0))
+                elif bad == "pod_uid":
+                    plan["binding"]["pod_uid"] = "replacement"
+                elif bad == "principal":
+                    plan["principal"] = ""
+                else:
+                    plan["issuer_path"] = "/untrusted/path"
+                with patch.object(io, "read_regular") as read:
+                    with self.assertRaises(ValueError):
+                        io.prepare_managed_login(request, root, root / "missing")
+                    read.assert_not_called()
+
+    def test_private_plan_schema_is_an_integer_not_a_python_boolean_or_float(self):
+        for schema in [True, 1.0, "1", None]:
+            plan = self.cache_plan()
+            plan["schema"] = schema
+            with patch.dict(os.environ, {"AGENT_POD_UID": plan["binding"]["pod_uid"]}):
+                with self.assertRaises(ValueError):
+                    io.managed_plan({"run": plan["run"], "managed_cache": plan})
 
     def test_image_entrypoint_ignores_candidate_python_site_before_the_fence(self):
         with tempfile.TemporaryDirectory(prefix=f"agent-io-{os.getuid()}-{os.getpid()}-",dir=os.environ.get("BOSS_TEST_SCRATCH")) as directory:

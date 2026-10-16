@@ -1,0 +1,15 @@
+{
+  "about": "MUTATING fixed dev work purpose, accepted design9687bcaf / urgent31d76e37. Actual operation requires David's separate passkey on the exact paired plan. Native writes refuse: no authoritative billing adapter exists. Unknown cost cannot authorize any patch, even with its exact approved hash. Execution requires bounded fresh monetary evidence bound to the entire resource plan, revalidated immediately before the write; no monetary/provider authority is inferred. Only boss-dev/boss-dev-work41..64Gi: grows only, at most2x, same UID/old request/bound volume. Rerenders stable plan and live physical admission immediately before its sole JSON patch. No replica move, restart, replacement, deletion, arbitrary target, grant or credential. Readback requires API/PV/Longhorn capacity, unchanged current pod/container/mount/session process identities and mounted available space strictly greater than18GiB. Pending expansion, timeout or continuity loss is unproven and never retries the patch or shrinks. Complete original read/patch streams and exits ride a lossless compressed evidence envelope; incomplete receiver capture is not proof. Effect records only mounted capacity and session continuity. Full independent record/source hash and append continuity plus existing-owner unreadable-fixture attestation remain unpaid on parent31d; this operation does not close that parent by itself. Existing instances-only expansion guard is unchanged.",
+  "hosts": ["forge"],
+  "capture": "separate-streams",
+  "requires_approval": true,
+  "plan_verb": "plan-dev-work-volume-expansion",
+  "approvers": ["emp-david"],
+  "argv": ["infra/forge/dev-work-volume.sh", "{1}", "{2}"],
+  "params": [
+    {"name":"size", "pattern":"^(4[1-9]|5[0-9]|6[0-4])Gi$"},
+    {"name":"plan_sha256", "pattern":"^[0-9a-f]{64}$"}
+  ],
+  "timeout": 900,
+  "effect": "^expand-dev-work-volume: mounted capacity and session continuity observed; record conservation remains unproven$"
+}

@@ -244,6 +244,9 @@ pub struct Hold {
     /// packet title.
     pub what: String,
     pub why: String,
+    /// Qualified by the same record judge as the station and stuck summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<crate::regions::RecordedProofWait>,
 }
 
 /// ON WHOM what stands at a border is waiting — every packet `waiting`
@@ -544,6 +547,7 @@ fn hold(what: &str, why: String) -> Hold {
     Hold {
         what: what.to_string(),
         why,
+        wait: None,
     }
 }
 
@@ -828,10 +832,18 @@ fn flow_of(spec: &BorderSpec, r: &RegionInputs<'_>, w: &Windows, stuck: &BTreeSe
                 .held_cars
                 .iter()
                 .map(|h| {
-                    hold(
+                    let mut reading = hold(
                         h.car.branch.as_deref().unwrap_or(h.car.title.as_str()),
                         format!("held on the dock — {}", h.reason),
-                    )
+                    );
+                    reading.wait = r
+                        .cars
+                        .iter()
+                        .find(|(car, _)| car.id.to_string() == h.car.id)
+                        .and_then(|(car, steps)| {
+                            crate::regions::recorded_review_wait(car, steps, r).ok()
+                        });
+                    reading
                 })
                 .collect();
             let waiting_for = match status.boarding.threshold_met {
@@ -938,13 +950,17 @@ fn flow_of(spec: &BorderSpec, r: &RegionInputs<'_>, w: &Windows, stuck: &BTreeSe
             let awaiting = awaiting_proof(r.cars);
             let holds = awaiting
                 .iter()
-                .map(|(j, _)| {
+                .map(|(j, steps)| {
                     let branch = j
                         .metadata
                         .get("branch")
                         .and_then(Value::as_str)
                         .unwrap_or(j.title.as_str());
-                    hold(branch, shed_words(&j.metadata))
+                    let mut reading = hold(branch, shed_words(&j.metadata));
+                    reading.wait = crate::regions::recorded_proof_wait(j, steps, r.now)
+                        .ok()
+                        .flatten();
+                    reading
                 })
                 .collect();
             // A probe recorded and not yet run waits on the probe runner;
@@ -1118,6 +1134,9 @@ fn shed_words(md: &Value) -> String {
         }
         crate::regions::ShedPlace::ProbeNotYet { said } => {
             format!("the probe said not yet — {said}")
+        }
+        crate::regions::ShedPlace::ProbeUnread => {
+            "the recorded proof outcome is unread".to_string()
         }
         crate::regions::ShedPlace::WaitingOn(event) => format!("waiting on {event}"),
         crate::regions::ShedPlace::Unproven => {
@@ -1566,6 +1585,7 @@ mod tests {
         stations: Option<&'a [StationReading]>,
     ) -> RegionInputs<'a> {
         RegionInputs {
+            internal_protocols: None,
             status,
             dock_reading: Reading::Read,
             open_trains: &[],

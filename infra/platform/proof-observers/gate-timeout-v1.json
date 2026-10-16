@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "version": 1,
+  "module": "gate-timeout",
+  "kind": "gate-run",
+  "query": "/api/jobs?kind=gate-run&status=closed",
+  "car": "2d011537-06e6-493c-8874-803028b65772",
+  "branch": "fix/gate-receipt-quotes-a-timeouts-reason-not-error-context-paths",
+  "claim": "An executed native failed check retained a timed-out Playwright spec after the fixed two-hour cut; quotation correctness remains a separate proof.",
+  "delay_seconds": 7200,
+  "completion_actors": ["automation:train-conductor", "automation:gate-runner"]
+}

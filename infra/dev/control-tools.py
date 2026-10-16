@@ -47,6 +47,15 @@ def observed_generation(generation):
 
 
 def tool_plan(generation, tool, args, inherited):
+    # A recorded probe's own writer supplies this channel even when it
+    # cannot open a log. Refuse before clearing inherited markers or
+    # selecting the credential-bearing session door (ca356c79).
+    if tool in ("boss", "boss-api") and (
+        "BOSS_PROBE_NOTFOUND" in inherited
+        or inherited.get("BOSS_SOR_USER")
+        or inherited.get("BOSS_SOR_DOOR")
+    ):
+        raise ValueError("recorded probe context must read through boss-sor-read, never this session door")
     # No loader hooks, provider tokens, mutable executable directories,
     # npm settings, git settings or worker environment are inherited.
     env = {"HOME": "/work/home", "PATH": "/usr/bin:/bin"}

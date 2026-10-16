@@ -59,6 +59,8 @@ struct RunOutcome {
 /// How the fake ML API answers one run.
 #[derive(Default)]
 struct Fake<'a> {
+    no_actor: bool,
+    actor: Option<&'a str>,
     /// Model ids whose infer-batch fails (curl exit 22, an HTTP error).
     fail: &'a [&'a str],
     /// Model ids that answer 2xx with an EMPTY body — a wrong target
@@ -118,6 +120,7 @@ fn run(fake_api: Fake) -> RunOutcome {
         .env("FAKE_CURL_FAIL", fake_api.fail.join(" "))
         .env("FAKE_CURL_EMPTY", fake_api.empty.join(" "))
         .env("FAKE_CURL_WRITTEN", fake_api.written.to_string())
+        .env_remove("BOSS_ACTOR")
         .env_remove("BOSS_ML_API_URL")
         // No machine token in these cases, whatever the machine running
         // them holds: the token cells below bring their own mount.
@@ -126,6 +129,12 @@ fn run(fake_api: Fake) -> RunOutcome {
         .current_dir(&root);
     if !fake_api.no_url {
         cmd.env("BOSS_ML_API_URL", "http://ml.test");
+    }
+    if !fake_api.no_actor {
+        cmd.env(
+            "BOSS_ACTOR",
+            fake_api.actor.unwrap_or("automation:ml-inference-batch"),
+        );
     }
     let out = cmd.output().expect("run run-inference-batch.sh");
     let summary = std::fs::read_to_string(&summary_file)
@@ -263,6 +272,79 @@ fn all_models_run_and_exit_zero_on_full_success() {
         r.success,
         "a run with no failures must exit 0.\nstdout: {}\nstderr: {}",
         r.stdout, r.stderr
+    );
+}
+
+#[test]
+fn absent_or_foreign_batch_actor_refuses_before_any_request() {
+    for actor in [
+        None,
+        Some(""),
+        Some("automation:boss-step"),
+        Some("emp-david"),
+        Some("automation:ml-inference-batch\nforged"),
+        Some("automation:ml-inference-batch\"}"),
+    ] {
+        let r = run(Fake {
+            no_actor: actor.is_none(),
+            actor,
+            written: 2,
+            ..Fake::default()
+        });
+        assert_eq!(r.code, Some(78), "{actor:?}: {}", r.stderr);
+        assert!(r.invoked.is_empty(), "{actor:?}: {:?}", r.invoked);
+        assert!(r.stderr.contains("BOSS_ACTOR"), "{}", r.stderr);
+    }
+}
+
+#[test]
+fn batch_summary_records_its_caller_without_claiming_authentication() {
+    let r = run_with_failures(&[]);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(r.summary["ml_caller"], "automation:ml-inference-batch");
+    assert_eq!(
+        r.summary["ml_caller_evidence"],
+        "unit-asserted; authenticated principal unproved"
+    );
+}
+
+#[test]
+fn actual_and_root_tree_units_name_the_same_unprivileged_batch_caller() {
+    let root = repo_root();
+    for path in [
+        "infra/ml/boss-ml-inference-batch.service",
+        "infra/gcp/root-tree-units/boss-ml-inference-batch.service.in",
+    ] {
+        let unit = std::fs::read_to_string(root.join(path)).unwrap();
+        assert_eq!(
+            unit.lines()
+                .filter(|l| *l == "Environment=BOSS_ACTOR=automation:ml-inference-batch")
+                .count(),
+            1,
+            "{path}"
+        );
+    }
+    let row: toml::Value = toml::from_str(
+        &std::fs::read_to_string(root.join("infra/platform/automations/ml-inference-batch.toml"))
+            .unwrap(),
+    )
+    .unwrap();
+    let rows = row["automation"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["id"].as_str(),
+        Some("automation:ml-inference-batch")
+    );
+    assert_eq!(
+        rows[0]["role"].as_str(),
+        Some(boss_policy_client::User::ANONYMOUS_ROLE)
+    );
+    let default = serde_json::to_value(boss_policy_client::User::anonymous()).unwrap();
+    assert_eq!(default["role"], "guest");
+    assert_eq!(default["access_tier"], "user");
+    assert!(
+        rows[0].get("signs_for").is_none(),
+        "no borrowed actor family"
     );
 }
 
@@ -557,6 +639,7 @@ fn run_token(case: TokenCase) -> TokenRun {
         .arg(root.join(SCRIPT))
         .env("BOSS_ML_CURL", dir.join("curl"))
         .env("BOSS_ML_API_URL", "http://ml.test")
+        .env("BOSS_ACTOR", "automation:ml-inference-batch")
         .env("BOSS_RUN_SUMMARY_FILE", &summary_file)
         .env("BOSS_MACHINE_TOKEN_DIR", &mount)
         .env("BOSS_MACHINE_TOKEN_HOSTS", case.hosts)
@@ -613,6 +696,10 @@ fn every_infer_batch_presents_the_machine_token_and_is_never_stopped_by_it() {
     assert_eq!(absent.code, Some(0), "{}", absent.stderr);
     assert_eq!(absent.headers, "", "no token, and a header file was sent");
     assert_eq!(absent.argv.lines().count(), ALL_MODELS.len());
+    for argv in absent.argv.lines() {
+        assert!(argv.contains(r#"x-boss-user: {"id":"automation:ml-inference-batch","role":"guest","access_tier":"user"}"#), "{argv}");
+        assert!(!argv.contains("platform-admin"), "{argv}");
+    }
     assert_eq!(absent.summary["exit_status"], "0");
 
     let fixture = format!("{TOKEN}\n");
