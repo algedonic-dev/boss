@@ -162,6 +162,10 @@ const PENDING: &[(&str, &str)] = &[];
 /// refuses the request (400) before the handler runs, which would say
 /// nothing about whether the handler asks. Held to the derived set.
 const QUERY: &[(&str, &str)] = &[
+    (
+        "/api/jobs/{id}/metadata/conditional/{command}",
+        "actor=pin-probe",
+    ),
     ("/api/agent-runs/profiles", "since=2020-01-01T00:00:00Z"),
     ("/api/surface-opens/rollup", "since=2020-01-01T00:00:00Z"),
 ];
@@ -591,7 +595,7 @@ fn concrete(pattern: &str) -> String {
         .split('/')
         .map(
             |seg| match seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-                Some("id") | Some("step_id") => Uuid::nil().to_string(),
+                Some("id") | Some("step_id") | Some("command") => Uuid::nil().to_string(),
                 Some("version") | Some("v") => "1".to_string(),
                 Some(_) => STATION.to_string(),
                 None => seg.to_string(),

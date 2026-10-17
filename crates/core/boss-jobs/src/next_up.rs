@@ -748,6 +748,7 @@ mod tests {
             firing_id: "cadence:train-board-on-dock-depth:2026-09-27T17:07Z".into(),
             fired_at: t("2026-09-27T17:07:00Z"),
             rc: Some(-2),
+            observations: None,
             board_decision: Some(decision.clone()),
         };
         let b = crate::yard::boarding_predicate(
@@ -883,6 +884,7 @@ mod tests {
                 QueuedGate {
                     branch: "feat/c".into(),
                     packet_id: "p3".into(),
+                    next_owner: None,
                     queued_at: "2026-09-27T17:06:00Z".into(),
                     position: 1,
                     waiting_seconds: Some(120),
@@ -892,6 +894,7 @@ mod tests {
                 QueuedGate {
                     branch: "feat/d".into(),
                     packet_id: "p4".into(),
+                    next_owner: None,
                     queued_at: "2026-09-27T17:07:00Z".into(),
                     position: 2,
                     waiting_seconds: Some(60),

@@ -1,0 +1,8 @@
+{
+  "about": "READ-ONLY: observe only boss-dev/boss-dev-build-egress CiliumNetworkPolicy and kube-system/cilium DaemonSet through the existing forge ops_kubectl authority. No arguments, arbitrary paths, grants, policy applies or activation. Expected policy is rendered from this accepted root generation's managed manifest and estate, then serialized by fixed kubectl create --dry-run=client --validate=false (local serialization, never server creation; discovery failures are retained). Full raw actual/expected responses, errors and SHA-256 precede judgement. Refuses unreadable, missing, different spec/identity or unready Cilium. A pass proves the installed expected spec and observed DaemonSet readiness only; actual worker network enforcement requires the separate native fake-only matrix.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/dev-build-fence-status.sh"],
+  "params": [],
+  "capture": "separate-streams",
+  "timeout": 90
+}

@@ -60,6 +60,44 @@ trap 'rm -rf "$tmp"' EXIT
 # (a-lint-sources-a-header-lib-only-hermetic.sh; the 2026-10-01 incident).
 # The token states are a-manifest-sender-presents-the-machine-token.sh's.
 mkdir -p "$tmp/no-machine-token"
+# Exercise the pod's real init argv before the settlement fixtures: a fourth
+# sh -c argument is $0, not another script (e194, review 0f71a3b9).
+python3 - "$manifest" "$here/../lib" "$tmp" <<'PY' || exit 1
+import pathlib
+import shutil
+import subprocess
+import sys
+
+manifest, libraries, fixture = map(pathlib.Path, sys.argv[1:])
+section = manifest.read_text().split('            - name: reader\n', 1)[1].split('              securityContext:', 1)[0]
+lines = section.split('              command:\n', 1)[1].splitlines()
+assert all(line.startswith('                - ') for line in lines), 'unreadable reader init argv'
+argv = [line[len('                - '):] for line in lines]
+source, target = fixture / 'image-lib', fixture / 'reader'
+source.mkdir()
+target.mkdir()
+names = ['secret-header.sh', 'jobs-pages.sh', 'immutable-metadata.jq']
+for name in names:
+    shutil.copyfile(libraries / name, source / name)
+actual = [arg.replace('/usr/local/bin/lib', str(source)).replace('/reader/', str(target) + '/') for arg in argv]
+result = subprocess.run(actual, capture_output=True, text=True)
+assert result.returncode == 0, (result.stdout, result.stderr)
+assert sorted(path.name for path in target.iterdir()) == sorted(names), (
+    'reader init did not install every library', argv, result.stdout, result.stderr,
+    sorted(path.name for path in target.iterdir()))
+for name in names:
+    assert (target / name).read_bytes() == (libraries / name).read_bytes(), name
+# Both failures remain best-effort and speak their existing reason, so the
+# observer can still report even when its image lacks either dependency.
+for name in names:
+    (source / name).unlink()
+result = subprocess.run(actual, capture_output=True, text=True)
+assert result.returncode == 0, (result.stdout, result.stderr)
+assert 'reader - the copy failed, so this pass sends no machine token' in result.stdout
+assert 'gate readers unavailable - dead-host settlement will refuse' in result.stdout
+print('reader init: actual manifest argv installed all three exact libraries into an empty volume; missing-source messages remain best-effort')
+PY
+export BOSS_GATE_READERS="$tmp/reader"
 export BOSS_MACHINE_TOKEN_DIR="$tmp/no-machine-token" BOSS_SOR_ENV="$tmp/no-sor.env" BOSS_OBSERVE_READER="$tmp/no-reader.sh"
 unset BOSS_JOBS_URL BOSS_MACHINE_TOKEN_HOSTS RUNTIME_DIRECTORY
 
@@ -153,6 +191,10 @@ gate() { # id status verdict
 printf '{"total":1,"data":[%s]}\n' "$(gate aaaaaaaa-0000-4000-8000-00000000000a open '')"     >"$tmp/gates-$GATING.json"
 printf '{"total":1,"data":[%s]}\n' "$(gate bbbbbbbb-0000-4000-8000-00000000000b closed green)" >"$tmp/gates-$GREEN.json"
 printf '{"total":1,"data":[%s]}\n' "$(gate cccccccc-0000-4000-8000-00000000000c closed failed)" >"$tmp/gates-$RED.json"
+for fixture_run in "$GATING" "$GREEN" "$RED"; do
+    jq --arg run "$fixture_run" '.data[].metadata.agent_run = $run' "$tmp/gates-$fixture_run.json" >"$tmp/gate-with-edge.json"
+    mv "$tmp/gate-with-edge.json" "$tmp/gates-$fixture_run.json"
+done
 # A gate-run read that answers NOTHING — a 200 with no body. jq-1.6 reads
 # silence as a pass under -e, and here that would mean "no gate owns this
 # run" and end a live one (backlog d96e38ab).
@@ -199,7 +241,10 @@ case "$method $url" in
     "GET "*"/api/jobs?kind=agent-run"*) cat "$FIXTURES/runs.json" ;;
     "GET "*"/api/jobs?kind=gate-run"*)
         id="${url##*agent_run%22%3A%22}"; id="${id%%%22*}"
-        if [[ -f "$FIXTURES/gates-$id.empty" ]]; then :
+        if [[ "$url" == *gate_submission* ]]; then
+            if [[ -f "$FIXTURES/canonical-gates-$id.json" ]]; then cat "$FIXTURES/canonical-gates-$id.json"; else printf '{"total":0,"data":[]}'; fi
+        elif [[ "$url" == *offset=1* && -f "$FIXTURES/gates-$id-offset1.json" ]]; then cat "$FIXTURES/gates-$id-offset1.json"
+        elif [[ -f "$FIXTURES/gates-$id.empty" ]]; then :
         elif [[ -f "$FIXTURES/gates-$id.json" ]]; then cat "$FIXTURES/gates-$id.json"; else printf '{"total":0,"data":[]}'; fi ;;
     "PATCH "*/steps/*/metadata) [[ -n "$want_code" ]] && printf '204' ;;
     # The step PUT carries the status alone (backlog e39a9d2a, design
@@ -272,4 +317,54 @@ grep -qE '^(PUT|PATCH)	' "$tmp/log-refused" && fail "a refused pods read still p
 grep -qi 'forbidden' "$tmp/out-refused" \
     || { cat "$tmp/out-refused" >&2; fail "the refused pods read was not spoken on stdout with the server's reason"; }
 
-echo "a-dead-host-ends-its-runs: ok — runs on an evicted and an absent dev pod, and one whose only gate is red, ended died with the host named; a live host, a workstation, an open and a green gate, and a finished build untouched; a refused read costs one line"
+# Durable ownership cannot disappear when its compatibility index is
+# corrupted, and a negative decision cannot come from a partial page.
+printf '{"total":1,"data":[%s]}\n' "$(run "$GONE" boss-dev-bc5b956bf-lx2cw ready)" >"$tmp/runs.json"
+printf '{"total":0,"data":[]}\n' >"$tmp/gates-$GONE.json"
+durable=$(gate dddddddd-0000-4000-8000-00000000000d open '' | jq --arg run "$GONE" '
+    .metadata.agent_run = "wrong-index" |
+    {contract_version:1,source:{agent_run:$run}} as $source |
+    .metadata.gate_submission=$source | .metadata._immutable_metadata={gate_submission:$source}')
+ownership_failures=0
+owned_kept() {
+    local label="$1" status=0
+    run_observer "$label" || status=$?
+    if [[ $status != 0 ]] || grep -qE "^(PUT|PATCH)[[:space:]]http://stub/api/jobs/$GONE/" "$tmp/log-$label"; then
+        cat "$tmp/runs.json" "$tmp/gates-$GONE.json" "$tmp/canonical-gates-$GONE.json" "$tmp/log-$label" "$tmp/out-$label" >&2
+        echo "durable observer control $label: wrong run completion or observer failure" >&2
+        ownership_failures=$((ownership_failures+1))
+    fi
+}
+printf '{"total":1,"data":[%s]}\n' "$durable" >"$tmp/canonical-gates-$GONE.json"
+owned_kept locator-corruption
+printf '{"total":1,"data":[%s]}\n' "$(jq 'del(.metadata._immutable_metadata)' <<<"$durable")" >"$tmp/canonical-gates-$GONE.json"
+owned_kept unbound-presence
+: >"$tmp/canonical-gates-$GONE.json"
+owned_kept canonical-silence
+printf '{"total":0,"data":[]}\n' >"$tmp/canonical-gates-$GONE.json"
+legacy_red=$(gate eeeeeeee-0000-4000-8000-00000000000e closed failed | jq --arg run "$GONE" '.metadata.agent_run=$run')
+printf '{"total":2,"data":[%s]}\n' "$legacy_red" >"$tmp/gates-$GONE.json"
+owned_kept incomplete-pages
+printf '{"total":2,"data":[%s]}\n' "$legacy_red" >"$tmp/gates-$GONE-offset1.json"
+owned_kept repeated-page
+legacy_live=$(gate ffffffff-0000-4000-8000-00000000000f open '' | jq --arg run "$GONE" '.metadata.agent_run=$run')
+printf '{"total":2,"data":[%s]}\n' "$legacy_live" >"$tmp/gates-$GONE-offset1.json"
+owned_kept later-page-owner
+if ! grep -q 'ffffffff-0000-4000-8000-00000000000f' "$tmp/out-later-page-owner"; then
+    cat "$tmp/log-later-page-owner" "$tmp/out-later-page-owner" >&2
+    echo 'observer never identified the owner on its later page' >&2
+    ownership_failures=$((ownership_failures+1))
+fi
+[[ $ownership_failures == 0 ]] || fail "$ownership_failures durable ownership/pagination controls failed"
+
+# A failed local accumulation cannot turn one recorded owner into [].
+if (
+    . "$here/../lib/jobs-pages.sh" || exit 3
+    job_pages_get() { printf '{"total":1,"data":[{"id":"owner"}]}'; }
+    mv() { return 1; }
+    read_job_pages 'kind=gate-run' "$tmp/failed-accumulation" >"$tmp/failed-accumulation.json"
+); then
+    fail 'a refused page-accumulation write returned a confident empty ownership list'
+fi
+
+echo "a-dead-host-ends-its-runs: ok — legacy dead-host decisions preserved; durable/index ambiguity and incomplete reads retain runs; later-page ownership is observed"

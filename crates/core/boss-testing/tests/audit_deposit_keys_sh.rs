@@ -906,8 +906,8 @@ fn the_converge_runs_the_audit_and_carries_its_verdict() {
     // The bound runs INSIDE runuser (review dd8f18e0, N8): runuser
     // starts its command in a session of its own, so a `timeout` outside
     // it kills runuser and leaves the audit's children running. Pinned
-    // by text because the runuser branch needs a second account, which
-    // the gate does not have.
+    // by text in the unprivileged gate; gcp_deposit_audit_transport also
+    // exercises the command boundary and a real uid drop when run as root.
     let runuser = converge
         .lines()
         .position(|l| l.contains("runuser -u \"$DEPOSIT_ACCOUNT\" --") && l.contains("audit_bound"))
@@ -919,7 +919,7 @@ fn the_converge_runs_the_audit_and_carries_its_verdict() {
     assert!(
         converge.lines().nth(runuser + 1).is_some_and(|l| l
             .trim_start()
-            .starts_with("timeout -k 5 \"$audit_bound\" bash \"$audit_script\"")),
+            .starts_with("timeout -k 5 \"$audit_bound\" bash -s --")),
         "the audit's own bound must run inside runuser, so it kills the audit's process group"
     );
     // The one word the alarm rule's `when` compares (review 1fa0d093,

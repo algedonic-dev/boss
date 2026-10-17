@@ -1216,6 +1216,9 @@ pub(crate) fn landed_review_lines(
 /// they are one fact read twice (bc416f60).
 fn shed_text(car: &Value) -> String {
     match shed_place(car) {
+        Shed::ProbeUnread => {
+            "proof or observer outcome unread — read the original attempt".to_string()
+        }
         Shed::ProbePending { last: None } => {
             "probe pending (the forge runs it on arrival)".to_string()
         }
@@ -2163,6 +2166,49 @@ fn machine_text(m: &Value) -> String {
     }
 }
 
+/// MAIN — when main was last proven by the conductor's unscoped full
+/// gate, how long ago, the trains merged since, and what main's newest
+/// gate is doing (backlog 77596188). The line is
+/// `boss_jobs::full_gate_on_main::proven_line`; a read that fails says
+/// so in the line and the approach still prints.
+async fn main_proven_line(
+    http: &crate::machine_http::MachineClient,
+    main: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    use boss_jobs::full_gate_on_main as fgm;
+    let filter = serde_json::json!({ "branch": fgm::BRANCH }).to_string();
+    let q = percent_encoding::utf8_percent_encode(&filter, crate::job::QUERY_VALUE).to_string();
+    let path = format!(
+        "/api/jobs?kind=gate-run&full=true&limit={}&metadata={q}",
+        fgm::PAGE
+    );
+    let body = match api(http, reqwest::Method::GET, &path, None).await {
+        Ok(b) => b,
+        Err(e) => return format!("  MAIN — unread: {e:#}"),
+    };
+    let total = body
+        .as_ref()
+        .and_then(|b| b.get("total"))
+        .and_then(Value::as_u64)
+        .map(|t| t as usize);
+    let runs = match rows(body) {
+        Ok(r) => r,
+        Err(e) => return format!("  MAIN — unread: {e:#}"),
+    };
+    let trains = api(
+        http,
+        reqwest::Method::GET,
+        "/api/jobs?kind=pr-train&status=closed&limit=30&full=true",
+        None,
+    )
+    .await
+    .and_then(rows)
+    .ok();
+    let since = trains.as_deref().and_then(|t| fgm::merged_since(t, &runs));
+    fgm::proven_line(&runs, total, main, since, now)
+}
+
 pub async fn run(all: bool) -> Result<()> {
     let http = crate::sor_client::machine_client()?;
 
@@ -2334,28 +2380,41 @@ pub async fn run(all: bool) -> Result<()> {
             println!("{}", before_the_track_line(t, board_now));
         }
     }
+    println!(
+        "{}",
+        main_proven_line(&http, main.as_deref(), board_now).await
+    );
 
     // Gates running now.
-    let gating = rows(
-        api(
-            &http,
-            reqwest::Method::GET,
-            "/api/jobs?kind=gate-run&status=open&limit=20",
-            None,
-        )
-        .await?,
-    )?;
+    let gating = crate::train::list_all_pages(|offset| {
+        let http = &http;
+        async move {
+            api(
+                http,
+                reqwest::Method::GET,
+                &format!(
+                    "/api/jobs?kind=gate-run&status=open&full=true&limit={}&offset={offset}",
+                    crate::train::PAGE_LIMIT
+                ),
+                None,
+            )
+            .await
+        }
+    })
+    .await?;
     // A QUEUED run is not gating: it is waiting for a slot and has no
     // Job at all (boss_jobs::yard::QUEUED_AT). Reporting it as GATING
     // would overstate what the node is doing by exactly the number of
     // builders standing in line.
-    let (waiting, running): (Vec<&Value>, Vec<&Value>) = gating
-        .iter()
-        .partition(|g| !md_str(g, boss_jobs::yard::QUEUED_AT).is_empty());
+    let (waiting, running): (Vec<&Value>, Vec<&Value>) = gating.iter().partition(|g| {
+        g.get("metadata")
+            .is_some_and(boss_jobs::gate_reservation::waiting_for_native)
+            || !md_str(g, boss_jobs::yard::QUEUED_AT).is_empty()
+    });
     // The yard's reading of the bays: each run's queued and running ages
     // and the median running time (backlog 4d088a7e). Read only when
     // something is gating; a failed read is printed beside each line.
-    let bays: Result<boss_jobs::yard::Gates, String> = if running.is_empty() {
+    let bays: Result<boss_jobs::yard::Gates, String> = if gating.is_empty() {
         Err("no run".into())
     } else {
         match api(&http, reqwest::Method::GET, "/api/yard/status", None).await {
@@ -2396,6 +2455,41 @@ pub async fn run(all: bool) -> Result<()> {
             in_line.iter().any(|held| held == id)
         }) {
             println!("    {}{}", queued_lane_line(g, &trains), queued_for(g, now));
+        }
+    }
+    let resident: Vec<_> = gating
+        .iter()
+        .filter(|g| {
+            g.get("metadata")
+                .is_some_and(boss_jobs::gate_reservation::waiting_for_native)
+        })
+        .collect();
+    if !resident.is_empty() {
+        println!(
+            "\n  RESIDENT GATE QUEUE — {} request(s); no client heartbeat expiry",
+            resident.len()
+        );
+        for g in resident {
+            let id = g.get("id").and_then(Value::as_str).unwrap_or_default();
+            let row = bays
+                .as_ref()
+                .ok()
+                .and_then(|b| b.queued.iter().find(|q| q.packet_id == id));
+            match row {
+                Some(q) if q.position > 0 => println!(
+                    "    {}  {}  #{}; original acceptance {}; waiting {}s",
+                    q.branch,
+                    id,
+                    q.position,
+                    q.queued_at,
+                    q.waiting_seconds
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                ),
+                _ => println!(
+                    "    {id}  position and acceptance time UNKNOWN; original receipt or source is unreadable"
+                ),
+            }
         }
     }
     // Which of them main already holds — asked only when there is a
@@ -3451,7 +3545,7 @@ mod tests {
         assert_eq!(
             shed_place(&landed(
                 "fix/b",
-                json!({ "proof_probe": "bash x.sh", "proof_attempt": { "why": "exit 1: grep found nothing" } })
+                json!({ "proof_probe": "bash x.sh", "proof_attempt": { "exit": 1, "why": "exit 1: grep found nothing" } })
             )),
             Shed::ProbePending {
                 last: Some("exit 1: grep found nothing".into())
@@ -3533,6 +3627,8 @@ mod tests {
                     "at": "2026-09-23T07:00:00Z", "exit": 75, "not_yet": true,
                     "probe": "bash x.sh", "why": "NOT YET: no tag",
                     "not_yet_since": "2026-09-19T05:50:00Z", "not_yet_runs": 86,
+                    "waits_on_exit": if seen_at.is_null() { 1 } else { 0 },
+                    "waits_on_observation": if seen_at.is_null() { json!("unseen") } else { Value::Null },
                     "waits_on_seen_at": seen_at,
                 } }),
             )
@@ -3543,6 +3639,21 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains("straight"), "{line}");
+        for outcome in [None, Some(Value::Null), Some(json!("1")), Some(json!(true))] {
+            let mut unread = declared(Value::Null);
+            let attempt = unread["metadata"]["proof_attempt"].as_object_mut().unwrap();
+            attempt.remove("waits_on_exit");
+            if let Some(outcome) = outcome {
+                attempt.insert("waits_on_exit".into(), outcome);
+            }
+            assert!(shed_lines(&[unread])[0].contains("outcome unread"));
+        }
+        let mut legacy_negative = declared(Value::Null);
+        legacy_negative["metadata"]["proof_attempt"]
+            .as_object_mut()
+            .unwrap()
+            .remove("waits_on_observation");
+        assert!(shed_lines(&[legacy_negative])[0].contains("outcome unread"));
         let line = &shed_lines(&[declared(json!("2026-09-23T06:00:00Z"))])[0];
         assert!(
             line.contains("was seen in the record at 2026-09-23T06:00:00Z"),
@@ -3617,7 +3728,7 @@ mod tests {
             landed("fix/probe", json!({ "proof_probe": "bash x.sh" })),
             landed(
                 "fix/failing",
-                json!({ "proof_probe": "bash x.sh", "proof_attempt": { "why": "exit 1" } }),
+                json!({ "proof_probe": "bash x.sh", "proof_attempt": { "exit": 1, "why": "exit 1" } }),
             ),
             landed("fix/forgot", json!({})),
             closed,
@@ -3643,7 +3754,7 @@ mod tests {
         let long = "x ".repeat(400);
         let lines = shed_lines(&[landed(
             "fix/long",
-            json!({ "proof_probe": "bash x.sh", "proof_attempt": { "why": long } }),
+            json!({ "proof_probe": "bash x.sh", "proof_attempt": { "exit": 1, "why": long } }),
         )]);
         let line = &lines[0];
         assert!(line.ends_with('…'), "{line}");
@@ -5050,7 +5161,10 @@ mod tests {
         let refused = my_work_section(None, &[], &[], &[], now).join("\n");
         assert!(refused.contains("MY WORK — REFUSED"), "{refused}");
         assert!(refused.contains("BOSS_ACTOR"), "{refused}");
-        assert!(refused.contains(".config/boss/actor"), "{refused}");
+        assert!(
+            refused.contains(&crate::identity::actor_file_display()),
+            "{refused}"
+        );
     }
 
     /// An item a car already carries is not unstarted work, and MY WORK
@@ -5267,6 +5381,7 @@ mod tests {
                     name: name.into(),
                     count,
                     waiting: None,
+                    waits: Vec::new(),
                     judged: None,
                     bound,
                     bound_kind: bound.map(|_| BoundKind::Capacity),

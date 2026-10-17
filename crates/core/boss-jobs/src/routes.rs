@@ -124,6 +124,10 @@ pub struct Walk {
     /// hands off, and what an exit move names.
     #[serde(skip)]
     pub terminals: BTreeSet<String>,
+    /// Steps whose materialized execution contract actually admits an
+    /// agent; the same resolution reader the dispatch door uses.
+    #[serde(skip)]
+    pub agent_steps: BTreeSet<String>,
 }
 
 /// A packet's state as the walk holds it.
@@ -407,6 +411,17 @@ pub fn walk(
         _ => None,
     };
     let first = admit(spec, seeds, now);
+    let mut agent_steps: BTreeSet<String> = first
+        .steps
+        .iter()
+        .filter_map(|step| {
+            let agent = crate::agent_spec::projected(&step.metadata)?;
+            (crate::agent_spec::agent_takes(&step.metadata)
+                && crate::agent_spec::refusal(&agent).is_none())
+            .then(|| step.spec_slug.clone())
+            .flatten()
+        })
+        .collect();
     // The step that admits the packet: its trigger, or — for a protocol
     // that declares none — its first step.
     let trigger = spec
@@ -565,6 +580,7 @@ pub fn walk(
             }
         }
     }
+    agent_steps.retain(|step| matches!(at.get(step), Some(Placed::At(_))));
     Walk {
         kind: spec.kind.clone(),
         version: spec.version,
@@ -572,6 +588,7 @@ pub fn walk(
         truncated,
         crossings: crossings.into_iter().collect(),
         at,
+        agent_steps,
         terminals: spec
             .steps
             .iter()
@@ -672,6 +689,10 @@ pub struct HandOff {
     /// the map from nowhere.
     #[serde(default)]
     pub from: Option<String>,
+    /// Derive origins from eligible agent steps, rather than keeping a
+    /// second roster beside the workflow registry.
+    #[serde(default)]
+    pub from_agent_steps: bool,
     /// `kind@step` of the packet that continues; `None` when the maker
     /// takes the one handed off off the map without a terminal —
     /// absorbed into a packet already standing, or released by a reading
@@ -739,6 +760,9 @@ pub enum Source {
         /// the garage); `None` when it takes the packet from a step
         /// before its close, whatever that close turns out to be.
         terminal: Option<String>,
+        /// A derived agent-step origin requires original registered
+        /// dispatch context; a region-pair match alone does not vouch.
+        agent_version: Option<i32>,
     },
     /// The moves record: how many moves took it in the window. An exit
     /// is counted per kind and terminal ([`RouteCount`]); both are
@@ -749,6 +773,8 @@ pub enum Source {
         last_at: Instant,
         kind: Option<String>,
         terminal: Option<String>,
+        lineage: Option<String>,
+        dispatch: Option<crate::moves::DispatchContext>,
     },
 }
 
@@ -842,8 +868,78 @@ impl RouteMap {
                 .filter(|r| r.from.as_deref() == from && r.to.is_none())
                 .flat_map(|r| &r.sources)
                 .any(|s| s.declares_exit(kind, terminal)),
-            _ => self.declares(from, to),
+            _ => {
+                from == to
+                    || self
+                        .routes
+                        .iter()
+                        .filter(|r| r.from.as_deref() == from && r.to.as_deref() == to)
+                        .flat_map(|r| &r.sources)
+                        .any(|s| {
+                            s.declares()
+                                && !matches!(
+                                    s,
+                                    Source::HandOff {
+                                        agent_version: Some(_),
+                                        ..
+                                    }
+                                )
+                        })
+            }
         }
+    }
+
+    /// A dispatch route is conditional on its original registration.
+    /// Old/unread context is unknown, never a region-pair permission.
+    pub fn judges_context(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        kind: Option<&str>,
+        terminal: Option<&str>,
+        lineage: Option<&str>,
+        dispatch: Option<&crate::moves::DispatchContext>,
+    ) -> Option<bool> {
+        if kind != Some(crate::agent_budget::RUN_KIND) || lineage != Some("packet") {
+            return Some(self.judges(from, to, kind, terminal));
+        }
+        let context = dispatch?;
+        let crate::moves::DispatchContext::Registered {
+            source_kind,
+            source_version,
+            source_step,
+            ..
+        } = context
+        else {
+            return Some(false);
+        };
+        if !self
+            .walked
+            .iter()
+            .any(|w| w.kind == *source_kind && w.version == *source_version && !w.truncated)
+        {
+            return None;
+        }
+        let source = format!("{source_kind}@{source_step}");
+        if !self.routes.iter().flat_map(|r| &r.sources).any(|s| {
+            matches!(s,
+            Source::HandOff { by, from: Some(at), agent_version: Some(version), .. }
+                if by == "verb:dispatch" && *at == source && *version == *source_version)
+        }) {
+            return None;
+        }
+        Some(
+            self.routes
+                .iter()
+                .filter(|r| r.from.as_deref() == from && r.to.as_deref() == to)
+                .flat_map(|r| &r.sources)
+                .any(|s| {
+                    matches!(s, Source::HandOff {
+                by, from: Some(at), to: Some(target), agent_version: Some(version), ..
+            } if by == "verb:dispatch" && *at == source && *version == *source_version
+                && target.split_once('@').map(|(k, _)| k) == kind)
+                }),
+        )
     }
 
     /// The observed counts no source declares ([`RouteMap::judges`]),
@@ -858,28 +954,43 @@ impl RouteMap {
                         last_at,
                         kind,
                         terminal,
+                        lineage,
+                        dispatch,
                     } => Some(RouteCount {
                         from: r.from.clone(),
                         to: r.to.clone(),
                         kind: kind.clone(),
                         terminal: terminal.clone(),
+                        lineage: lineage.clone(),
+                        dispatch: dispatch.clone(),
+                        declared: None,
                         moves: *moves,
                         last_at: *last_at,
                     }),
                     _ => None,
                 })
             })
-            .filter(|c| !self.judges_count(c))
+            .map(|c| RouteCount {
+                declared: self.judges_observation(&c),
+                ..c
+            })
+            .filter(|c| c.declared != Some(true))
             .collect()
     }
 
     /// [`RouteMap::judges`] over one observed count.
     pub fn judges_count(&self, c: &RouteCount) -> bool {
-        self.judges(
+        self.judges_observation(c).unwrap_or(false)
+    }
+
+    pub fn judges_observation(&self, c: &RouteCount) -> Option<bool> {
+        self.judges_context(
             c.from.as_deref(),
             c.to.as_deref(),
             c.kind.as_deref(),
             c.terminal.as_deref(),
+            c.lineage.as_deref(),
+            c.dispatch.as_ref(),
         )
     }
 }
@@ -905,6 +1016,45 @@ pub fn derive(walks: &[Walk], hand_offs: &[HandOff], observed: Option<&[RouteCou
     }
     let mut refused = Vec::new();
     for h in hand_offs {
+        if h.from_agent_steps {
+            if h.from.is_some() || h.by != "verb:dispatch" {
+                refused.push(format!(
+                    "{}: agent-step origins require the dispatch maker and no explicit from",
+                    h.by
+                ));
+                continue;
+            }
+            let destination = h.to.as_ref().map(|at| stands(walks, at)).transpose();
+            let Ok(Some(to)) = destination else {
+                refused.push(format!(
+                    "{}: agent-step destination cannot be resolved",
+                    h.by
+                ));
+                continue;
+            };
+            for w in walks {
+                for step in &w.agent_steps {
+                    let at = format!("{}@{step}", w.kind);
+                    match stands(walks, &at) {
+                        Ok(from) if from == to => {}
+                        Ok(from) => {
+                            by.entry(key(Some(from), Some(to)))
+                                .or_default()
+                                .push(Source::HandOff {
+                                    by: h.by.clone(),
+                                    from: Some(at),
+                                    to: h.to.clone(),
+                                    why: h.why.clone(),
+                                    terminal: None,
+                                    agent_version: Some(w.version),
+                                })
+                        }
+                        Err(e) => refused.push(format!("{}: {e}", h.by)),
+                    }
+                }
+            }
+            continue;
+        }
         let end = |at: &Option<String>| at.as_ref().map(|a| stands(walks, a)).transpose();
         match (end(&h.from), end(&h.to)) {
             (Ok(None), Ok(None)) => refused.push(format!("{}: names neither end", h.by)),
@@ -922,6 +1072,7 @@ pub fn derive(walks: &[Walk], hand_offs: &[HandOff], observed: Option<&[RouteCou
                         .filter(|w| w.terminals.contains(step))
                         .map(|_| step.to_string())
                 }),
+                agent_version: None,
             }),
             (Err(e), _) | (_, Err(e)) => refused.push(format!("{}: {e}", h.by)),
         }
@@ -937,6 +1088,8 @@ pub fn derive(walks: &[Walk], hand_offs: &[HandOff], observed: Option<&[RouteCou
                 last_at: c.last_at,
                 kind: c.kind.clone(),
                 terminal: c.terminal.clone(),
+                lineage: c.lineage.clone(),
+                dispatch: c.dispatch.clone(),
             });
     }
     RouteMap {
@@ -1019,6 +1172,21 @@ mod tests {
         map.routes
             .iter()
             .find(|r| r.from.as_deref() == from && r.to.as_deref() == to)
+    }
+
+    /// Native move13538 (a4de1e72): the registered run continues the
+    /// car's landed-review from the shed, not a backlog build station.
+    #[test]
+    fn registered_landed_review_dispatch_has_a_registry_derived_route() {
+        let map = tree_routes();
+        let r = route(&map, Some("shed"), Some("shop-floor"))
+            .expect("the supported registered landed-review dispatch is drawn");
+        assert!(r.declared);
+        assert!(r.sources.iter().any(|s| matches!(s,
+            Source::HandOff { by, from: Some(from), to: Some(to), .. }
+            if by == "verb:dispatch" && from == "ship-a-change@landed-review"
+                && to == "agent-run@briefed"
+        )));
     }
 
     fn by_workflow(r: &Route, kind: &str) -> Vec<String> {
@@ -1430,6 +1598,7 @@ mod tests {
         let bad = derive(
             &walks,
             &[HandOff {
+                from_agent_steps: false,
                 by: "verb:gate".into(),
                 from: Some("gate-run@no-such-step".into()),
                 to: Some("design-doc@review".into()),
@@ -1564,6 +1733,9 @@ mod tests {
         let (specs, stations) = tree();
         let at = now();
         let exit = |kind: &str, terminal: &str, moves: i64| RouteCount {
+            lineage: None,
+            dispatch: None,
+            declared: None,
             from: Some("marshalling".into()),
             to: None,
             kind: Some(kind.into()),
@@ -1614,6 +1786,9 @@ mod tests {
         let at = now();
         let observed = [
             RouteCount {
+                lineage: None,
+                dispatch: None,
+                declared: None,
                 from: Some("gates".into()),
                 to: Some("dock".into()),
                 kind: None,
@@ -1622,6 +1797,9 @@ mod tests {
                 last_at: at,
             },
             RouteCount {
+                lineage: None,
+                dispatch: None,
+                declared: None,
                 from: Some("shed".into()),
                 to: Some("arrivals".into()),
                 kind: None,

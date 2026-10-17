@@ -24,7 +24,21 @@ use crate::stations::{StationError, StationRegistry, StationSpec};
 macro_rules! prepare_selection {
     ($ingress:expr, $read:expr) => {{
         match $ingress {
-            Some(ingress) => match ingress.prepare($read).await {
+            Some(ingress) => match {
+                #[cfg(all(test, feature = "postgres"))]
+                let mut trace = crate::native_selection_store::SelectionPhase::start(
+                    stringify!($read).to_string(),
+                    ingress.started(),
+                );
+                let result = ingress.prepare($read).await;
+                #[cfg(all(test, feature = "postgres"))]
+                trace.finish(if result.is_ok() {
+                    "returned"
+                } else {
+                    "deadline"
+                });
+                result
+            } {
                 Ok(result) => result,
                 Err(error) => {
                     return (axum::http::StatusCode::CONFLICT, error.to_string()).into_response();
@@ -660,32 +674,26 @@ const MAX_FLOW_WINDOW_HOURS: i64 = 720;
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct FlowQuery {
     window_hours: Option<i64>,
+    basis: Option<String>,
 }
 
-/// `GET /api/stations/flow` — the drain rate, per station.
+/// `GET /api/stations/flow` — original packet membership crossings.
 ///
-/// WHY IT EXISTS. [`stations_load`] answers depth and the age of the
-/// oldest packet, and says in its own header that depth is close to
-/// meaningless without a drain rate. Depth tells an operator what is
-/// waiting; it does not tell them whether a queue is FORMING, which is
-/// a rate question — is it growing faster than it drains. That is the
-/// question this answers, and it needs no new stamp anywhere: the two
-/// transitions a step-waiting station's membership turns on are
-/// already in the log as `step.ready.<kind>` and `step.done.<kind>`.
+/// The default `packet-membership-v1` basis folds original Job/Step
+/// states, complete producer groups and registry publications at one
+/// native audit cut. Personal predicates bind to the authenticated
+/// caller; current authorization bounds every historical identity.
+/// Original clock mappings evaluate terminal retention while the rate
+/// window remains the log's own wall-clock insertion interval.
 ///
-/// THE WINDOW IS WALL CLOCK. Not the sim clock, and not event time:
-/// `boss-views/src/flow.rs` states the doctrine and the incident, and
-/// the port method says the same. A rate on sim time would be a rate
-/// about a brewery, not about a queue.
+/// Unavailable originals produce null totals with deciding reasons,
+/// covered/unknown intervals and separately conserved known crossings.
+/// Expiry, cancellation, reassignment and registry changes keep their
+/// causes without being promoted into work served.
 ///
-/// A STATION WHOSE FLOW CANNOT BE COUNTED SAYS SO. `arrived`, `served`
-/// and `net` come back `null` with a `basis` of `"unavailable"` and a
-/// sentence naming the clause that blinded it — never a zero, which
-/// on this surface reads as "nothing is waiting". See
-/// [`crate::station_flow`] for which predicates are countable and why.
-///
-/// The predicate is evaluated UNBOUND, so a per-actor station reports
-/// blind rather than one person's flow dressed as the network's.
+/// `?basis=step-events` retains the distinct ready/done obligation cube
+/// as a separate unit. Its global aggregate is unavailable to a narrow
+/// grant; it never supplies fallback packet counts.
 pub(super) async fn stations_flow<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
@@ -697,9 +705,10 @@ pub(super) async fn stations_flow<R: JobsRepository + 'static, B: EventBus + 'st
     };
     // Same read gate as every other station surface: a caller who may
     // read no packets is refused (403), never shown a calm network.
-    if let Err(r) = readable_predicate(&state, &user).await {
-        return r;
-    }
+    let predicate = match readable_predicate(&state, &user).await {
+        Ok(predicate) => predicate,
+        Err(response) => return response,
+    };
     let stations = match effective_stations(&state, reg).await {
         Ok(s) => s,
         Err(r) => return r,
@@ -717,6 +726,83 @@ pub(super) async fn stations_flow<R: JobsRepository + 'static, B: EventBus + 'st
     // has to be the same instant the log's `created_at` is written on.
     let as_of = boss_clock_client::wall_now();
     let since = as_of - chrono::Duration::hours(window_hours);
+    if q.basis
+        .as_deref()
+        .is_some_and(|basis| !matches!(basis, "packet-membership-v1" | "step-events"))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "flow basis must be packet-membership-v1 or step-events",
+        )
+            .into_response();
+    }
+    if q.basis.as_deref() != Some("step-events") {
+        let scope = JobScope::from_predicate(&user, &predicate);
+        let source = state
+            .jobs
+            .membership_snapshot(since, Some(user.id.clone()), &scope, 250_000)
+            .await;
+        let mut rows = BTreeMap::<String, serde_json::Value>::new();
+        let mut clock_coverage = serde_json::Value::Null;
+        let (until, cutoff, failure) = match source {
+            Ok(input) => {
+                clock_coverage = serde_json::json!(&input.clock);
+                let reading = crate::membership_replay::replay(&input);
+                for flow in reading.stations {
+                    let mut value = match serde_json::to_value(&flow) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                                .into_response();
+                        }
+                    };
+                    value["net"] = serde_json::json!(
+                        flow.arrived
+                            .zip(flow.departed)
+                            .map(|(a, d)| i128::from(a) - i128::from(d))
+                    );
+                    value["unavailable_reason"] = serde_json::json!(if flow.unknown.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            flow.unknown
+                                .iter()
+                                .map(|u| u.reason.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                        )
+                    });
+                    rows.insert(flow.station, value);
+                }
+                (input.until, Some(input.audit_cutoff), None)
+            }
+            Err(error) => (as_of, None, Some(error.to_string())),
+        };
+        for spec in &stations {
+            let value=rows.entry(spec.name.clone()).or_insert_with(||{
+                let reason=failure.clone().unwrap_or_else(||"original applicable station publication history unavailable".into());
+                serde_json::json!({"station":spec.name,"basis":"packet-membership-v1","arrived":null,"departed":null,"served":null,"net":null,
+                    "known_arrived":0,"known_departed":0,"known_served":0,"covered":[],"versions":[],"scope":scope,
+                    "caller_binding":if spec.predicate.binds_self(){Some(user.id.clone())}else{None},
+                    "unknown":[{"since":since,"until":until,"reason":reason}],"unavailable_reason":reason})
+            });
+            value["kind"] = serde_json::json!(spec.kind);
+        }
+        let total = rows.len();
+        return Json(serde_json::json!({"basis":"packet-membership-v1","data":rows.into_values().collect::<Vec<_>>(),"total":total,
+            "window_hours":window_hours,"since":since,"as_of":until,"audit_cutoff":cutoff,"clock_coverage":clock_coverage,"scope":scope,"caller":user.id})).into_response();
+    }
+    let scope = JobScope::from_predicate(&user, &predicate);
+    if scope != JobScope::All {
+        let rows=stations.iter().map(|spec|serde_json::json!({"station":spec.name,"kind":spec.kind,
+            "basis":"unavailable","arrived":null,"served":null,"net":null,
+            "unavailable_reason":"the distinct-step cube is global; use packet-membership-v1 for this authorized scope"})).collect::<Vec<_>>();
+        return Json(
+            serde_json::json!({"basis":"step-events","total":rows.len(),"data":rows,
+            "window_hours":window_hours,"since":since,"as_of":as_of,"scope":scope}),
+        )
+        .into_response();
+    }
     let cells = match state.jobs.step_flow_cube(since).await {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -749,6 +835,7 @@ pub(super) async fn stations_flow<R: JobsRepository + 'static, B: EventBus + 'st
         .collect();
     let total = rows.len();
     Json(serde_json::json!({
+        "basis":"step-events",
         "data": rows,
         "total": total,
         "window_hours": window_hours,

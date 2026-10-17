@@ -301,21 +301,21 @@ test.describe('the marshalling station — the selection, and the words it says'
     ]);
 
     await expect(b.locator('table.my-table').first().locator('thead th')).toHaveText([
-      'Station', 'Depth', 'Oldest', 'Arrived', 'Served', 'Net', 'Clears in', 'Why it is not moving',
+      'Station', 'Depth', 'Oldest', 'Arrived', 'Departed', 'Served', 'Net', 'Clears in', 'Why it is not moving',
     ]);
     // Pressure order: the deepest blind queues first, the dock's last.
     const rows = sidingRows(page);
     await expect(rows).toHaveCount(3);
     await expect(rows.nth(0).locator('td')).toHaveText([
-      'q.platform-admin.task', '297 / 24', '6 d', '—', '—', '—', '—',
+      'q.platform-admin.task', '297 / 24', '6 d', '—', '—', '—', '—', '—',
       `297 waiting; rate not counted — ${TASK_BLIND}.`,
     ]);
     await expect(rows.nth(1).locator('td')).toHaveText([
-      'a.platform-admin.opus-5-1m', '213', '5 d', '—', '—', '—', '—',
+      'a.platform-admin.opus-5-1m', '213', '5 d', '—', '—', '—', '—', '—',
       `213 waiting; rate not counted — ${AGENT_BLIND}.`,
     ]);
     await expect(rows.nth(2).locator('td')).toHaveText([
-      'q.platform-admin.sign-off', '6', '2 d', '6', '5', '+1', '29 h',
+      'q.platform-admin.sign-off legacy distinct Steps', '6', '2 d', '6', '5', '5', '+1', '29 h',
       '6 arrived, 5 served: growing by 1 a 24h window — 29h to clear at that rate.',
     ]);
     await expect(rows.nth(2)).toHaveClass(/constraint/);
@@ -341,9 +341,49 @@ test.describe('the marshalling station — the selection, and the words it says'
     ]);
     await expect(b.locator('.my-clear')).toHaveText('q.platform-admin.checklist');
     await expect(b.locator('.my-footnote')).toHaveText(
-      'Depth and the oldest packet\'s age come from /api/stations/load; arrivals and departures from /api/stations/flow, counted over the window from the log\'s own step.ready / step.done transitions on their WALL-CLOCK write instant — never event time, which is sim-authoritative here. "Oldest" is the oldest member packet\'s age since it opened, which over-reports time in this queue; the per-obligation wait below it is the step-level figure. Nothing on this page is estimated: a queue whose rate could not be counted says so.',
+      'Depth and the oldest packet\'s age come from /api/stations/load; arrivals and departures from /api/stations/flow, counted over the window from conserved original packet state and original transaction groups, on the audit insertion clock. Retention uses the original business-clock mapping. Departures include cancellation, reassignment and retention expiry; served counts completed work. A legacy step-events answer counts distinct Steps and is labelled per station; it is a different unit. "Oldest" is the oldest member packet\'s age since it opened, which over-reports time in this queue; the per-obligation wait below it is the step-level figure. Nothing on this page is estimated: a queue whose rate could not be counted says so.',
     );
     await expect(failures(page)).toHaveCount(0);
+  });
+
+  test('packet crossings show departures separately from completed-work service', async ({ page }) => {
+    await install(page, {
+      flow: (r) => json(r, {
+        window_hours: 24, as_of: AS_OF_24,
+        data: [{ station: 'q.platform-admin.sign-off', basis: 'packet-membership-v1',
+          arrived: 3, departed: 2, served: 0, unknown: [], departure_causes: { cancellation: 2 } }],
+      }),
+    });
+    await mountPage(page, PATH, TITLE);
+    const row = sidingRows(page).filter({ has: page.locator('.my-station', { hasText: 'q.platform-admin.sign-off' }) });
+    await expect(row.locator('td')).toHaveText([
+      'q.platform-admin.sign-off packet crossings', '6', '2 d', '3', '2', '0', '+1', 'not draining',
+      '6 waiting; 3 arrived, 2 departed, 0 served in the last 24h. No completed-work service was recorded; departures can have other causes.',
+    ]);
+    await expect(board(page).locator('.my-constraint-why')).toHaveText(
+      '6 waiting, 3 arrived, 2 departed and 0 served in the last 24h. No completed-work service rate was recorded.',
+    );
+    await expect(row).not.toContainText('Nothing left');
+  });
+
+  test('packet counts accompanied by unknown original coverage never paint a measured rate', async ({ page }) => {
+    const reason = 'original Step creation missing';
+    await install(page, {
+      flow: (r) => json(r, {
+        window_hours: 24, as_of: AS_OF_24,
+        data: [{ station: 'q.platform-admin.sign-off', basis: 'packet-membership-v1',
+          arrived: 3, departed: 2, served: 1,
+          unknown: [{ since: '2026-09-24T05:00:00Z', until: AS_OF_24, reason }],
+          unavailable_reason: reason }],
+      }),
+    });
+    await mountPage(page, PATH, TITLE);
+    const row = sidingRows(page).filter({ has: page.locator('.my-station', { hasText: 'q.platform-admin.sign-off' }) });
+    await expect(row.locator('td')).toHaveText([
+      'q.platform-admin.sign-off', '6', '2 d', '—', '—', '—', '—', '—',
+      `6 waiting; rate not counted — ${reason}.`,
+    ]);
+    await expect(board(page).locator('.my-constraint-name')).toHaveText('No queue can be named');
   });
 
   test('gap 1 (ba1fcc6d): the constraint is named from the countable queues, and the box says which blind queues it was not judged against', async ({ page }) => {
@@ -392,7 +432,7 @@ test.describe('the marshalling station — the selection, and the words it says'
     await mountPage(page, PATH, TITLE);
     await expect(sidingRows(page).locator('.my-station')).toHaveText([name]);
     await expect(sidingRows(page).locator('td').nth(1)).toHaveText('2');
-    await expect(sidingRows(page).locator('td').nth(4)).toHaveText('2');
+    await expect(sidingRows(page).locator('td').nth(5)).toHaveText('2');
     await expect(sidingRows(page).getByRole('link', { name: 'design-doc by step' })).toHaveAttribute('href', '/it/operate/bottlenecks?kind=design-doc');
   });
 
@@ -631,7 +671,7 @@ test.describe('the marshalling station — every control', () => {
     await expect(board(page).locator('.my-constraint-why')).toHaveText(
       '6 waiting against 30 served in the last 72h: 14h to clear at the rate it is actually being worked, longer than any other counted queue.',
     );
-    await expect(sidingRows(page).nth(2).locator('td').nth(6)).toHaveText('14 h');
+    await expect(sidingRows(page).nth(2).locator('td').nth(7)).toHaveText('14 h');
     await expect(board(page)).not.toContainText('168h:');
   });
 

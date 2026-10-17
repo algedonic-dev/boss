@@ -1,3 +1,4 @@
+import { proofFixture as proofOf } from './proof-test-fixtures';
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -99,14 +100,7 @@ const car = (id: string, branch: string, over: Partial<CarRow> = {}): CarRow => 
 
 /** What a car's packet records about proving it — the four `proof_*`
  *  fields plus the `proven` step's stamp, as [`readCarProof`] reads them. */
-const proofOf = (over: Partial<CarProof> = {}): CarProof => ({
-  probe: null,
-  expect: null,
-  event: null,
-  attempt: null,
-  stamped: null,
-  ...over,
-});
+
 
 const trainRow = (id: string, status: TrainRow['status'], over: Partial<TrainRow> = {}): TrainRow => ({
   id,
@@ -457,10 +451,19 @@ describe('the gate QUEUE lane — runs waiting for a bay', () => {
     );
     expect(wagon(s, 'q1')).toMatchObject({ station: 'gate-queue', slot: 0, since: '2026-09-07T23:05:00Z' });
     expect(wagon(s, 'q2').slot).toBe(1);
-    expect(wagon(s, 'q1').status).toBe('queued · #1 in line · waiting 10m · est. ~5m');
+    expect(wagon(s, 'q1').status).toBe('queued · #1 in line · waiting 10m · est. ~5m · supervision unknown · next owner unknown');
     expect(wagon(s, 'q2').status).toContain('#2 in line');
     // The bay is still busy with its own run — a queued run takes none.
     expect(s.bays[0]?.branch).toBe('feat/gating');
+  });
+
+  test('an unavailable resident queue names its accepted next owner', () => {
+    const s = scene(yardOf(), statusOf({ gates: {
+      capacity: 1, active: [], typical_seconds: null,
+      queued: [{ ...queued('feat/owned', 'owned', 1), next_owner: 'accepted-supervisor' }],
+    } }), NOW);
+    expect(wagon(s, 'owned').status).toContain('supervision unknown · next owner accepted-supervisor');
+    expect(s.machines.queue.label).toContain('next owner accepted-supervisor');
   });
 
   test('a queue is neutral — never the warn tone a stranded green wears', () => {
@@ -483,8 +486,14 @@ describe('the gate QUEUE lane — runs waiting for a bay', () => {
       },
     });
     expect(scene(yardOf(), two, NOW).machines.queue).toMatchObject({ count: 2 });
-    expect(scene(yardOf(), two, NOW).machines.queue.label).toBe('2 waiting · next ~5m');
-    expect(scene(yardOf(), statusOf(), NOW).machines.queue.label).toBe('clear');
+    const unknown = statusOf({ gates: { ...two.gates, queued: two.gates.queued.map(q => ({ ...q, position: 0, estimated_wait_seconds: 0 })) } });
+    const unknownLabel = scene(yardOf(), unknown, NOW).machines.queue.label;
+    expect(unknownLabel).toContain('position unknown');
+    expect(unknownLabel).not.toContain('a bay is free');
+
+    expect(scene(yardOf(), two, NOW).machines.queue.label).toBe('2 waiting · next ~5m · supervision unknown · next owner unknown');
+    expect(scene(yardOf(), statusOf(), NOW).machines.queue.label).toBe('clear · supervision unknown');
+    expect(scene(yardOf(), statusOf({ gate_queue_supervision: { state: 'completed', reason: null } }), NOW).machines.queue.label).toBe('clear · supervision observed');
   });
 
   // Backlog 19227ca8 (design 1e787fc2): a train whose gate the bound
@@ -527,13 +536,13 @@ describe('the gate QUEUE lane — runs waiting for a bay', () => {
     expect(wagon(s, 't1').status).toContain('first in line');
     expect(wagon(s, 'q1').slot).toBe(1);
     expect(s.machines.queue).toMatchObject({ count: 2 });
-    expect(s.machines.queue.label).toBe('train first · 2 waiting');
+    expect(s.machines.queue.label).toBe('train first · 2 waiting · supervision unknown · next owner unknown');
     // A train whose gate is already filed, or judged by CI alone, is not
     // waiting in line.
     const filed = trainRow('t2', 'DEPARTED', { gate: { ...waitGate, run: 'abcdef0123', wait_reason: null } });
     const s2 = scene(yardOf({ inFlight: [filed] }), statusOf(), NOW);
     expect(s2.wagons.find(w => w.id === 't2')).toBeUndefined();
-    expect(s2.machines.queue.label).toBe('clear');
+    expect(s2.machines.queue.label).toBe('clear · supervision unknown');
   });
 
   test('the departure board places a queued car before the bays', () => {
@@ -1046,8 +1055,8 @@ describe('the inspection shed', () => {
     const s = scene(yardOf({ awaitingProof: [ev, bare] }), statusOf(), NOW);
     expect(wagon(s, 'c2')).toMatchObject({ station: 'siding-event', slot: 0, tone: 'static', lamp: 'off', probe: null });
     expect(wagon(s, 'c2').status).toBe('siding · waiting on an event, no probe can settle it');
-    expect(wagon(s, 'c3')).toMatchObject({ station: 'siding-no-probe', slot: 0, tone: 'static', lamp: 'off' });
-    expect(wagon(s, 'c3').status).toBe('siding · no probe recorded');
+    expect(wagon(s, 'c3')).toMatchObject({ station: 'siding-no-probe', slot: 0, tone: 'red', lamp: 'err' });
+    expect(wagon(s, 'c3').status).toBe('siding · no proof or event recorded — needs attention');
   });
 
   // ONE BRANCH, ONE WAGON. A car in the shed has landed, so its train is
@@ -1097,8 +1106,11 @@ describe('the inspection shed', () => {
       NOW,
     );
     expect(s.machines.inspection).toEqual({
-      label: '1 inspecting · 1 on an event · 1 with no probe',
+      label: '1 inspecting · 1 proof records need attention · 1 on an event · 1 with no probe',
+      needsAction: 1,
       inspecting: 1,
+      unread: 0,
+      conditionSeen: 0,
       failed: 0,
       notYet: 0,
       onEvent: 1,
@@ -1108,7 +1120,10 @@ describe('the inspection shed', () => {
     });
     expect(scene(yardOf(), statusOf(), NOW).machines.inspection).toEqual({
       label: 'clear',
+      needsAction: 0,
       inspecting: 0,
+      unread: 0,
+      conditionSeen: 0,
       failed: 0,
       notYet: 0,
       onEvent: 0,

@@ -3682,6 +3682,13 @@ prose = "p"
             more.roads[0].lines.len()
         );
         assert!(missing.contains(&line), "{missing:?}");
+
+        // These controls judge the same immutable real print. Four
+        // independent browsers printed identical input before f10419f9;
+        // sharing the output avoids redundant concurrent renderer work.
+        the_footer_prints_in_its_own_band_on_every_page(&sheet, &at, &runs);
+        a_pdf_printed_with_another_stamp_is_refused(&sheet, &at, &runs);
+        a_short_value_is_found_only_as_its_own_line(&sheet, &runs);
     }
 
     const TREE: &str = "0123456789abcdef";
@@ -3708,12 +3715,14 @@ prose = "p"
     /// control plants one body run in page 2's band and is refused by
     /// page. (The fixed-position footer this replaced printed over road
     /// 1's and road 7's continuations and passed the text-only check.)
-    #[test]
-    fn the_footer_prints_in_its_own_band_on_every_page() {
-        let (sheet, at, _, runs) = printed_tree_sheet();
+    fn the_footer_prints_in_its_own_band_on_every_page(
+        sheet: &Rendered,
+        at: &str,
+        runs: &[pdf::Run],
+    ) {
         let pages = runs.iter().map(|r| r.page + 1).max().unwrap_or(0);
         assert!(pages >= 2, "the sheet runs to several pages: {pages}");
-        let footer = squash(&sheet.footer(TREE, &at));
+        let footer = squash(&sheet.footer(TREE, at));
         for page in 0..pages {
             let band: Vec<pdf::Run> = runs
                 .iter()
@@ -3722,13 +3731,13 @@ prose = "p"
                 .collect();
             assert_eq!(squash(&pdf::join(&band)), footer, "page {}", page + 1);
         }
-        let mut over = runs.clone();
+        let mut over = runs.to_vec();
         over.push(pdf::Run {
             page: 1,
             y: FOOTER_BAND_PT - 20.0,
             text: "to.json".into(),
         });
-        let problems = sheet.judge_print(&over, &sheet.footer(TREE, &at));
+        let problems = sheet.judge_print(&over, &sheet.footer(TREE, at));
         assert!(
             problems.iter().any(|p| p.starts_with("page 2:")),
             "{problems:?}"
@@ -3738,18 +3747,16 @@ prose = "p"
     /// Review of car 2, F3: a PDF printed with another render time (or
     /// another tree, or another version) is not this print, and is
     /// refused on every page — deleting the footer check fails here.
-    #[test]
-    fn a_pdf_printed_with_another_stamp_is_refused() {
-        let (sheet, at, _, runs) = printed_tree_sheet();
+    fn a_pdf_printed_with_another_stamp_is_refused(sheet: &Rendered, at: &str, runs: &[pdf::Run]) {
         let pages = runs.iter().map(|r| r.page + 1).max().unwrap_or(0);
         for footer in [
             sheet.footer(TREE, &at.replace("06:11", "06:12")),
-            sheet.footer("fedcba9876543210", &at),
+            sheet.footer("fedcba9876543210", at),
             sheet
-                .footer(TREE, &at)
+                .footer(TREE, at)
                 .replace(&sheet.hash()[..12], "000000000000"),
         ] {
-            let problems = sheet.judge_print(&runs, &footer);
+            let problems = sheet.judge_print(runs, &footer);
             assert_eq!(
                 problems
                     .iter()
@@ -3764,10 +3771,8 @@ prose = "p"
     /// Review of car 2, F2: a fact is found as `Label: value` in its own
     /// road's stretch — so a short value that also appears elsewhere
     /// ("22", "dev") does not pass for a line that never printed.
-    #[test]
-    fn a_short_value_is_found_only_as_its_own_line() {
-        let (sheet, _, _, runs) = printed_tree_sheet();
-        let text = pdf::join(&runs);
+    fn a_short_value_is_found_only_as_its_own_line(sheet: &Rendered, runs: &[pdf::Run]) {
+        let text = pdf::join(runs);
         assert!(text.contains("22") && text.contains("dev"));
         let mut more = sheet.clone();
         for (label, value) in [("Port", "22"), ("Session", "dev")] {

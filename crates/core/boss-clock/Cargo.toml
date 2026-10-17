@@ -40,8 +40,17 @@ tokio-stream = "0.1"
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono"], optional = true }
 
 [dev-dependencies]
+boss-testing = { path = "../boss-testing", features = ["postgres"] }
 tower = { workspace = true }
 http-body-util = "0.1"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "clock_mapping_failure"
+required-features = ["postgres"]
+
+[[test]]
+name = "clock_mode_coverage"
+required-features = ["postgres"]

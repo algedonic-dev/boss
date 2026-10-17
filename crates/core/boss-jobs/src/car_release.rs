@@ -23,6 +23,9 @@
 //!   head it read is the head the release is given at ([`vouches`]);
 //! - the shell releasing is not the car's builder run
 //!   ([`may_release_identity`]);
+//! - an automation (the release rule, design 393bdef6 Q1) does not
+//!   release a car whose review step reserves it for a named actor
+//!   ([`may_release_by`]);
 //! - the pinned executor requirement is met ([`read_executor_eligibility`]);
 //! - the review step records no release by this same review at that
 //!   head already: a hold placed after a release is not that review's to
@@ -661,6 +664,71 @@ pub fn may_release_identity(car: &Value, releaser: Option<&str>) -> Result<(), S
     ))
 }
 
+/// The actor a car's release is reserved for, when its review step names
+/// one ([`crate::car::RELEASER`], written by `boss hold --releaser`). A
+/// blank or non-string value names no one here, and [`may_release_by`]
+/// refuses every automation on it (fail closed, review 3af8f7e2 N1).
+pub fn reserved_for(car: &Value) -> Option<&str> {
+    review_step(car)
+        .map(|s| str_at(s, &format!("/metadata/{}", crate::car::RELEASER)))
+        .filter(|r| !r.is_empty())
+}
+
+/// Is `by` an automation rather than a person or an agent: the recorded
+/// `automation:<slug>` spelling, or a rule's wire spelling `rule:<name>`
+/// (the same actor, `boss_policy_client::automation_slug`).
+fn is_automation(by: &str) -> bool {
+    let by = by.trim();
+    by.starts_with("automation:") || by.starts_with("rule:")
+}
+
+/// PURE: may `by` release `car` given the car's own-release mark (design
+/// 393bdef6 Q1, backlog 0cfc57e6)? A car reserved for a named actor
+/// waits for a person: an AUTOMATION is refused, which is how the
+/// release rule leaves David's cars to him, through this door and not
+/// around it. A person's or an agent's release is not refused by the
+/// mark — that is the road "as today", and the reviewer's verdict is
+/// still the rule every release rests on.
+pub fn may_release_by(car: &Value, by: &str) -> Result<(), String> {
+    let id = str_at(car, "/id");
+    let branch = str_at(car, "/metadata/branch");
+    let target = if branch.is_empty() { short(id) } else { branch };
+    let Some(reserved) = reserved_for(car) else {
+        // FAIL CLOSED (review 3af8f7e2 N1): a mark PRESENT in a shape
+        // that names no one — a list, an object, a bool, null, a blank
+        // string — is a hand-written merge whose intent cannot be read,
+        // so no automation releases the car. Only an absent mark leaves
+        // it unreserved. `boss hold --releaser` writes a string.
+        let mark = review_step(car)
+            .and_then(|s| s.pointer(&format!("/metadata/{}", crate::car::RELEASER)));
+        return match mark {
+            Some(mark) if is_automation(by) => Err(format!(
+                "car {} {target} carries {}={mark} on its review step, which names no actor, so \
+                 its release cannot be read as unreserved and {} does not release it (review \
+                 3af8f7e2 N1). Nothing was written; the car stays held for a person, who \
+                 releases it on its review: `boss release {target} --review <the reviewer's \
+                 run, full id>`, or the yard's Release.",
+                short(id),
+                crate::car::RELEASER,
+                by.trim()
+            )),
+            _ => Ok(()),
+        };
+    };
+    if !is_automation(by) || by.trim() == reserved {
+        return Ok(());
+    }
+    Err(format!(
+        "car {} {target} is reserved for {reserved}'s own release ({} on its review step, \
+         written by boss hold --releaser), so {} does not release it (design 393bdef6 Q1). \
+         Nothing was written; the car stays held for {reserved}, who releases it on its review: \
+         `boss release {target} --review <the reviewer's run, full id>`, or the yard's Release.",
+        short(id),
+        crate::car::RELEASER,
+        by.trim()
+    ))
+}
+
 /// The release record on the review step (`crate::car::RELEASE`).
 pub fn release_record(sha: &str, review: &str, by: &str, at: &str, main_sha: &str) -> Value {
     json!({
@@ -903,7 +971,8 @@ pub struct Granted {
 /// THE RULE, as the door asks it: may `ask` release `car` on `run`'s
 /// review, and what is written if so. Every refusal is the whole
 /// sentence a reader needs. The checks run in the CLI's order: the step
-/// is open, the shell is not the builder, there is a head, no release is
+/// is open, the shell is not the builder, an automation is not releasing
+/// a car reserved for a person ([`may_release_by`]), there is a head, no release is
 /// recorded at it already, the executor is eligible, and the review
 /// vouches.
 pub async fn judge(
@@ -923,6 +992,7 @@ pub async fn judge(
     }
     let step = holdable(car)?;
     may_release_identity(car, ask.run.as_deref())?;
+    may_release_by(car, by)?;
     let head = ask
         .head
         .as_deref()
@@ -1829,5 +1899,114 @@ mod tests {
         let mut another_car = car.clone();
         another_car["id"] = json!("another-car");
         assert!(vouches_with_executor(&reviewer, &another_car, H1, &eligibility).is_err());
+    }
+
+    /// The actor a dispatcher rule's release is stamped with: the
+    /// recorded spelling of its wire id `rule:<name>` (the door stamps
+    /// `User::ambient_actor`, the same actor the merge event records).
+    const RULE_ACTOR: &str = "automation:rule:release-a-held-car-on-its-reviewer-verdict";
+
+    /// A CAR MARKED FOR A PERSON'S OWN RELEASE WAITS FOR A PERSON (design
+    /// 393bdef6 Q1, backlog 0cfc57e6). `boss hold --releaser emp-david`
+    /// writes `releaser` on the review step; the release rule asks the
+    /// door like anyone else and the JUDGE refuses it, so the refusal is
+    /// the door's and no handler carries a second copy of the check. A
+    /// person releases the marked car exactly as before: David, and any
+    /// other person or agent, because the mark binds automation only.
+    #[tokio::test]
+    async fn a_car_marked_for_a_persons_own_release_is_refused_to_a_rule() {
+        let mut car = held_car();
+        car["steps"][0]["metadata"][crate::car::RELEASER] = json!("emp-david");
+        let run = reviewer(review_at(H1, RELEASE, ""));
+        let why = judge(&Advisory, &car, &run, &ask(None), RULE_ACTOR, "t")
+            .await
+            .expect_err("a rule does not release a car reserved for a person");
+        assert!(why.contains("emp-david"), "{why}");
+        assert!(why.contains(crate::car::RELEASER), "{why}");
+        // The legacy wire spelling is the same automation.
+        let legacy = RULE_ACTOR.trim_start_matches("automation:");
+        judge(&Advisory, &car, &run, &ask(None), legacy, "t")
+            .await
+            .expect_err("rule:<name> is the same rule");
+        for person in ["emp-david", "agent-codex", ""] {
+            judge(&Advisory, &car, &run, &ask(None), person, "t")
+                .await
+                .unwrap_or_else(|why| panic!("{person:?} releases it as today: {why}"));
+        }
+    }
+
+    /// A MARK THAT NAMES NO ONE FAILS CLOSED (review 3af8f7e2 N1). The
+    /// mark was read only as a string, so a `releaser` PRESENT in any
+    /// other shape — a list, an object, a bool, null, a blank string —
+    /// reserved nothing and the rule was GRANTED. `boss hold` writes a
+    /// string; any other shape is a hand-written merge whose intent the
+    /// judge cannot read, so every automation is refused, and a person
+    /// still releases it as today. Absent is the only unmarked car.
+    #[tokio::test]
+    async fn a_releaser_mark_in_any_other_shape_refuses_every_automation() {
+        let run = reviewer(review_at(H1, RELEASE, ""));
+        for mark in [
+            json!(["emp-david"]),
+            json!({"id": "emp-david"}),
+            json!(true),
+            json!(false),
+            json!(null),
+            json!(""),
+            json!("  "),
+            json!(7),
+        ] {
+            let mut car = held_car();
+            car["steps"][0]["metadata"][crate::car::RELEASER] = mark.clone();
+            for caller in [RULE_ACTOR, "rule:x", "automation:train-conductor"] {
+                let why = judge(&Advisory, &car, &run, &ask(None), caller, "t")
+                    .await
+                    .expect_err("a mark naming no one refuses an automation");
+                assert!(why.contains(crate::car::RELEASER), "{mark}: {why}");
+            }
+            judge(&Advisory, &car, &run, &ask(None), "emp-david", "t")
+                .await
+                .unwrap_or_else(|why| panic!("{mark}: a person releases it as today: {why}"));
+        }
+    }
+
+    /// The refusals the release rule must leave untouched are the
+    /// judge's own, asked as the rule: a verdict for a head the hold no
+    /// longer names, a CHANGES verdict, and a run with no verdict.
+    #[tokio::test]
+    async fn the_rule_is_refused_what_any_caller_is_refused() {
+        for (run, says) in [
+            (
+                reviewer(review_at(H2, RELEASE, "")),
+                "a review of another head",
+            ),
+            (reviewer(review_at(H1, "changes", "")), "not \"release\""),
+            (
+                json!({"id": REVIEWER, "kind": "agent-run", "metadata": {}}),
+                "records no review verdict",
+            ),
+        ] {
+            let why = judge(&Advisory, &held_car(), &run, &ask(None), RULE_ACTOR, "t")
+                .await
+                .expect_err("refused");
+            assert!(why.contains(says), "{says}: {why}");
+        }
+    }
+
+    /// THE ONE HAPPY PATH: an unmarked held car whose dispatched
+    /// reviewer recorded RELEASE at the head the hold names is released
+    /// to the rule, and the record credits the rule, never a person.
+    #[tokio::test]
+    async fn an_unmarked_car_is_released_to_the_rule_and_credited_to_it() {
+        let run = reviewer(review_at(H1, RELEASE, ""));
+        let granted = judge(&Advisory, &held_car(), &run, &ask(None), RULE_ACTOR, "t")
+            .await
+            .expect("granted");
+        assert_eq!(granted.head, H1);
+        assert_eq!(granted.patch["hold"], Value::Null);
+        assert_eq!(granted.patch[crate::car::RELEASE]["by"], json!(RULE_ACTOR));
+        assert_eq!(
+            granted.patch[crate::car::RELEASE]["review"],
+            json!(REVIEWER)
+        );
     }
 }

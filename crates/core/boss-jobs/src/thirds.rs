@@ -451,6 +451,7 @@ mod tests {
         runs: Option<&'a [(Job, Vec<Step>)]>,
     ) -> RegionInputs<'a> {
         RegionInputs {
+            internal_protocols: None,
             status,
             dock_reading: Reading::Read,
             open_trains: &[],

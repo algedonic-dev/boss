@@ -534,6 +534,18 @@ if [ -f "$WORKER_DECLARATION" ]; then
         || cannot_answer "cannot read owning consist worker declaration"
 fi
 
+DEV_WORKER_READER="$(dirname "${BASH_SOURCE[0]}")/../dev/dev-declaration.py"
+if [ -f "$TREE/infra/dev/dev-build.py" ]; then
+    python3 "$DEV_WORKER_READER" --declaration "$TREE/infra/dev/dev-build.py" >> "$TMP/templates" \
+        || cannot_answer "cannot read owning dev worker declaration"
+fi
+
+FIXTURE_READER="$(dirname "${BASH_SOURCE[0]}")/../forge/isolation-fixture-declaration.py"
+if [ -f "$TREE/infra/forge/isolation-fixture.py" ]; then
+    python3 "$FIXTURE_READER" --declaration "$TREE/infra/forge/isolation-fixture.py" >> "$TMP/templates" \
+        || cannot_answer "cannot read owning isolation fixture declaration"
+fi
+
 # --- what the tree declares ------------------------------------------------
 declared_converged="$TMP/declared-converged"
 declared_all="$TMP/declared-all"
@@ -722,6 +734,20 @@ template_names() { # kind ns
             fi
             names=$(python3 "$WORKER_READER" --names "$WORKER_DECLARATION" \
                 "$TMP/workers.json" 2> "$TMP/get.err") || return 1
+        elif [ "$file" = infra/dev/dev-build.py ]; then
+            if ! "${KUBECTL[@]}" get "$1" -n "$2" -l "$sel" -o json \
+                    --request-timeout=10s > "$TMP/dev-workers.json" 2> "$TMP/get.err"; then
+                return 1
+            fi
+            names=$(python3 "$DEV_WORKER_READER" --names \
+                "$TMP/dev-workers.json" 2> "$TMP/get.err") || return 1
+        elif [ "$file" = infra/forge/isolation-fixture.py ]; then
+            if ! "${KUBECTL[@]}" get "$1" -n "$2" -l "$sel" -o json \
+                    --request-timeout=10s > "$TMP/isolation-fixtures.json" 2> "$TMP/get.err"; then
+                return 1
+            fi
+            names=$(python3 "$FIXTURE_READER" --names \
+                "$TMP/isolation-fixtures.json" 2> "$TMP/get.err") || return 1
         else
             names=$(live_selected_names "$1" "$2" "$sel") || return 1
         fi

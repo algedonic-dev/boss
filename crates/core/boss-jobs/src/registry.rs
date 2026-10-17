@@ -188,11 +188,59 @@ pub struct StepSpec {
     /// exactly: nothing is written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<crate::agent_spec::AgentSpec>,
+    /// WHO IS MEANT TO MOVE THIS STEP, declared (backlog 9ca41c08, design
+    /// 393bdef6): a machine, an agent or a person. What the IT map's
+    /// automation reading holds each step's recorded `completed_by`
+    /// against, so a step declared `machine` that people keep moving
+    /// reads as a defect, and one declared for hands that nobody moves
+    /// by hand reads as a candidate to harden. `None` means the class is
+    /// read off the row ([`StepSpec::executor_class`]). Protocol data,
+    /// editable live like `claimable`: declaring it is a Workflow edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_class: Option<ExecutorClass>,
     #[serde(default)]
     pub metadata_defaults: serde_json::Value,
 }
 
+/// The three classes of CPU a step can be moved by, matching the
+/// classes [`boss_core::actor::ActorId`] records: an automation, an
+/// agent, a person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutorClass {
+    Machine,
+    Agent,
+    Human,
+}
+
 impl StepSpec {
+    /// The step's executor class: the declared one, or else the one
+    /// the facts on the row already carry — an `agent` block is an
+    /// agent; `metadata_defaults.human_only` is a person; a StepType
+    /// the dispatcher completes itself is a machine (`Completion::Agent`
+    /// means the DISPATCHER executes it, not an LLM — the naming trap in
+    /// `step_registry.rs` — and `External` / `AutoOnMaterialize` are
+    /// completed by an event or at materialisation). Otherwise a person,
+    /// which is `Completion`'s own default.
+    pub fn executor_class(&self, types: &crate::step_registry::StepRegistry) -> ExecutorClass {
+        use crate::step_registry::Completion;
+        if let Some(declared) = self.executor_class {
+            return declared;
+        }
+        if self.agent.is_some() {
+            return ExecutorClass::Agent;
+        }
+        if crate::human_only::declared(&self.metadata_defaults) {
+            return ExecutorClass::Human;
+        }
+        match types.get(&self.kind).map(|t| t.completion) {
+            Some(Completion::Agent | Completion::External | Completion::AutoOnMaterialize) => {
+                ExecutorClass::Machine
+            }
+            _ => ExecutorClass::Human,
+        }
+    }
+
     /// The placement keys this step projects — the ONE reader's door
     /// for "who is this for" on a spec. An audience wins outright; a
     /// step that declares none projects its legacy `authority_role`
@@ -3888,6 +3936,58 @@ pub(crate) use pg::active_rows_in as active_workflow_rows_in;
 
 #[cfg(test)]
 mod tests {
+
+    /// EXECUTOR CLASS (backlog 9ca41c08, design 393bdef6): a declared
+    /// class wins; otherwise the facts a row already carries decide — an
+    /// `agent` block is an agent, `human_only` is a person, and a kind
+    /// the dispatcher completes itself (StepType `Completion` of
+    /// `agent`, `external` or `auto-on-materialize` — `agent` there
+    /// means the DISPATCHER, the naming trap at step_registry.rs) is a
+    /// machine. Anything else is a person.
+    #[test]
+    fn a_steps_executor_class_is_declared_or_read_off_the_row() {
+        use super::ExecutorClass::{Agent, Human, Machine};
+        let types = crate::step_registry::StepRegistry::v1();
+        let step = |kind: &str| super::StepSpec {
+            title: "s".into(),
+            kind: kind.into(),
+            ..Default::default()
+        };
+        assert_eq!(step("task").executor_class(&types), Human);
+        assert_eq!(step("demand-gate").executor_class(&types), Machine);
+        assert_eq!(step("trigger").executor_class(&types), Machine);
+        assert_eq!(step("no-such-kind").executor_class(&types), Human);
+        let agent = super::StepSpec {
+            agent: Some(crate::agent_spec::AgentSpec {
+                profile: "builder".into(),
+                model: "opus-5".into(),
+                budget_usd: 1.0,
+                effort: crate::agent_spec::Effort::Medium,
+                executor_provenance: Default::default(),
+            }),
+            ..step("task")
+        };
+        assert_eq!(agent.executor_class(&types), Agent);
+        let human_only = super::StepSpec {
+            metadata_defaults: serde_json::json!({ "human_only": true }),
+            ..step("demand-gate")
+        };
+        assert_eq!(human_only.executor_class(&types), Human);
+        let declared = super::StepSpec {
+            executor_class: Some(Machine),
+            ..agent.clone()
+        };
+        assert_eq!(declared.executor_class(&types), Machine);
+        // On the wire it is one lowercase word, and absent when undeclared.
+        let wire = serde_json::to_value(&declared).unwrap();
+        assert_eq!(wire["executor_class"], serde_json::json!("machine"));
+        assert!(
+            serde_json::to_value(step("task"))
+                .unwrap()
+                .get("executor_class")
+                .is_none()
+        );
+    }
 
     /// 228c9a7d: the outcome a close names is the first COMPLETED
     /// declared terminal, paired by sort_order — a skipped terminal, a

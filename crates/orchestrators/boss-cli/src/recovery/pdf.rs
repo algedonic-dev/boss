@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -157,6 +157,32 @@ pub fn print(chromium: &Path, html: &str) -> Result<Vec<u8>, String> {
         .process_group(0)
         .spawn()
         .map_err(|e| format!("{}: {e}", chromium.display()))?;
+    let status = wait_for_print(&mut child, chromium, &log_path, PRINT_DEADLINE)?;
+    let bytes = std::fs::read(&out).unwrap_or_default();
+    if !status.success() || !bytes.starts_with(b"%PDF-") {
+        return Err(format!(
+            "{} did not print a PDF ({status}); it said:\n{}",
+            chromium.display(),
+            printer_output(&log_path)
+        ));
+    }
+    Ok(bytes)
+}
+
+fn printer_output(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| format!("could not read printer output {}: {e}", path.display()))
+}
+
+// The production caller always supplies PRINT_DEADLINE. Separating the
+// child wait lets its timeout test observe output readiness before expiring
+// the wait, without a minute-long fixture or a startup scheduling race.
+fn wait_for_print(
+    child: &mut Child,
+    chromium: &Path,
+    log_path: &Path,
+    deadline: Duration,
+) -> Result<ExitStatus, String> {
     // Signalled only while the leader is alive and unreaped, so the group
     // id cannot have been reused by anything else.
     let group = format!("-{}", child.id());
@@ -168,32 +194,24 @@ pub fn print(chromium: &Path, html: &str) -> Result<Vec<u8>, String> {
             .status();
     };
     let started = Instant::now();
-    let status = loop {
+    loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() > PRINT_DEADLINE => {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started.elapsed() > deadline => {
                 kill_group();
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!(
-                    "{} did not finish printing in {}s — killed",
+                    "{} did not finish printing in {}s — killed; it said:\n{}",
                     chromium.display(),
-                    PRINT_DEADLINE.as_secs()
+                    deadline.as_secs(),
+                    printer_output(log_path)
                 ));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(e) => return Err(format!("{}: {e}", chromium.display())),
         }
-    };
-    let bytes = std::fs::read(&out).unwrap_or_default();
-    if !status.success() || !bytes.starts_with(b"%PDF-") {
-        let said = std::fs::read_to_string(&log_path).unwrap_or_default();
-        return Err(format!(
-            "{} did not print a PDF ({status}); it said:\n{said}",
-            chromium.display()
-        ));
     }
-    Ok(bytes)
 }
 
 /// `file://` + the absolute path, with the bytes a URL cannot carry
@@ -848,6 +866,70 @@ pub fn runs(pdf: &[u8]) -> Result<Vec<Run>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timed_out_printer_carries_its_whole_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let printer = dir.path().join("printer");
+        boss_testing::write_exec(
+            &printer,
+            "#!/bin/sh\nprintf 'first printer diagnostic\\n'\ni=0\nwhile [ \"$i\" -lt 6000 ]; do printf 'printer diagnostic %s\\n' \"$i\"; i=$((i + 1)); done\nprintf 'last printer diagnostic\\n' >&2\nwhile :; do sleep 30; done\n",
+        );
+        let log_path = dir.path().join("printer.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut child = Command::new(&printer)
+            .stdin(Stdio::null())
+            .stderr(Stdio::from(log.try_clone().unwrap()))
+            .stdout(Stdio::from(log))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // Output, not elapsed startup time, tells us the fixture is ready.
+        let readiness = Instant::now();
+        while !printer_output(&log_path).ends_with("last printer diagnostic\n") {
+            if readiness.elapsed() > Duration::from_secs(10) {
+                let stopped = wait_for_print(&mut child, &printer, &log_path, Duration::ZERO);
+                panic!("fixture never wrote its output: {stopped:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let error = wait_for_print(&mut child, &printer, &log_path, Duration::ZERO).unwrap_err();
+        assert!(error.contains("did not finish printing in 0s"), "{error}");
+        assert!(child.try_wait().unwrap().is_some(), "the leader was reaped");
+        assert!(error.contains("first printer diagnostic\n"), "{error}");
+        for i in 0..6000 {
+            assert!(
+                error.contains(&format!("printer diagnostic {i}\n")),
+                "missing {i}"
+            );
+        }
+        assert!(error.contains("last printer diagnostic\n"), "{error}");
+    }
+
+    #[test]
+    fn a_finished_printer_is_not_timed_out() {
+        let mut child = Command::new("true").spawn().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            wait_for_print(
+                &mut child,
+                Path::new("true"),
+                &dir.path().join("unused.log"),
+                PRINT_DEADLINE,
+            )
+            .unwrap()
+            .success()
+        );
+    }
+
+    #[test]
+    fn unreadable_printer_output_names_the_missing_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.log");
+        let error = printer_output(&path);
+        assert!(error.contains("could not read printer output"), "{error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+    }
 
     /// A ToUnicode map in the three shapes the spec allows: single
     /// codes, a range counting up from one destination, and a range

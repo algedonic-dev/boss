@@ -133,7 +133,7 @@ pub(crate) fn remedy_by_branch<'a>(cars: &'a [Value], given: &str) -> Option<&'a
 /// The remedy packet `given` names: a car by branch, else any packet by
 /// id (open first, then closed), read in full.
 async fn resolve_remedy(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     cars: &[Value],
     given: &str,
 ) -> Result<Value> {

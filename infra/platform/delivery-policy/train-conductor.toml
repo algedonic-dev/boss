@@ -108,7 +108,7 @@
 
 [[delivery_policy]]
 name = "train-conductor"
-version = 7
+version = 9
 status = "active"
 # THE HOLD: red trains a car may be released from before boarding
 # leaves it behind until a human looks.
@@ -133,4 +133,52 @@ ci_host_floor_gb = 40
 # number the CLI obeys and the number the yard draws as slots. Three
 # since v7, until the untrimmed gate drive is fixed and four is
 # measured under load (see the header).
+gate_queue_owner = 'legacy'
 gate_max_concurrent = 3
+
+# Version 8: one frozen plan selects image need and completion evidence in CI,
+# deploy and the conductor. Review and publishing authority remain independent
+# obligations. No config/infra family has a lighter apply contract yet.
+[delivery_policy.channels]
+schema = 1
+# Version 9 enables the bounded channels after compatible pr-train v5 was
+# deliberately published and its complete row read back. Each delivery still
+# owes its selected native evidence; an enabled channel is not proof of arrival.
+enabled = true
+
+# The measured image copies architecture assets but does not carry repository
+# prose. If that layout changes, default heavy until a reviewed policy updates
+# this guard; a directory label alone never grants an image skip.
+[[delivery_policy.channels.guards]]
+path = "infra/oss-quickstart/Dockerfile"
+sha256 = "9beb46745881d71a674454ef5ad579fc72b6fcdc919b6b72275191b07f22c992"
+
+[[delivery_policy.channels.rules]]
+prefix = "docs/"
+suffix = ".md"
+evidence = "forge_blob"
+excluded_prefixes = ["docs/architecture/"]
+
+[[delivery_policy.channels.rules]]
+prefix = "infra/platform/workflows/"
+suffix = ".toml"
+evidence = "workflow_equality"
+# The standalone CLI compiles the kind-name roster. Existing protocol bodies
+# remain data; adding/removing a kind changes that actual compiler input.
+existing_only = true
+# The existing protection registry is the source of family names, including
+# released entries: a released publish hold does not erase protected purpose.
+protected_names_from = "infra/platform/workflow-holds/"
+protected_keys = ["authority", "authority_role", "audience", "entitlements", "writer", "owner_role", "owning_team", "grants", "permissions"]
+
+[[delivery_policy.channels.rules]]
+prefix = "infra/dispatcher/rules/"
+suffix = ".toml"
+evidence = "rule_equality"
+existing_only = true
+# Changing an operation's identity is a security/unknown-effect change. Ordinary
+# typed predicate, schedule, delay and argument data still use live equality.
+protected_keys = ["handler", "operation", "grants", "permissions", "actor", "signs_as"]
+# Job coordination can change as ordinary typed data. Credential, host and
+# unknown effect families retain image delivery even if their handler stays.
+allowed_handlers = ["jobs.spawn", "messages.notify", "messages.notify_job_terminal", "retro.open"]

@@ -98,7 +98,7 @@ mod brief_reference_tests {
 }
 
 async fn api(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     actor: &str,
     method: reqwest::Method,
@@ -117,7 +117,7 @@ async fn api(
 }
 
 async fn get(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     actor: &str,
     id: &str,
@@ -139,7 +139,7 @@ async fn get(
 }
 
 async fn patch(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     actor: &str,
     id: &str,
@@ -176,7 +176,7 @@ fn one_step<'a>(job: &'a Value, slug: &str) -> Result<&'a Value> {
 }
 
 async fn finish(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     actor: &str,
     id: &str,
@@ -271,7 +271,7 @@ async fn executable(name: &str) -> Result<PathBuf> {
 /// again immediately before spawn; separate packet reads are not an atomic
 /// ownership lock for the executor's lifetime.
 async fn revalidate_start(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     actor: &str,
     run: &str,

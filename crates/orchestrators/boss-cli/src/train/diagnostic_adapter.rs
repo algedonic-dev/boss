@@ -9,11 +9,38 @@ use std::io::Write;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+#[cfg(test)]
+mod artifact_tests;
+mod artifacts;
+mod recovery;
+#[cfg(test)]
+mod recovery_refresh_tests;
+
 fn find_step<'a>(job: &'a Value, slug: &str) -> Option<&'a Value> {
     super::find_step(job, slug, slug)
 }
 
 pub(super) async fn drain(conductor: &Conductor) -> Result<()> {
+    drain_scope(conductor, DrainScope::Ordinary).await
+}
+
+/// This entrypoint cannot dispatch an ordinary diagnostic or admit compute.
+pub(super) async fn drain_recovery_assessments(conductor: &Conductor) -> Result<()> {
+    drain_scope(conductor, DrainScope::RecoveryAssessmentsOnly).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DrainScope {
+    Ordinary,
+    RecoveryAssessmentsOnly,
+}
+
+enum Selection {
+    Ordinary { may_launch: bool },
+    RecoveryAssessment,
+}
+
+async fn drain_scope(conductor: &Conductor, scope: DrainScope) -> Result<()> {
     let filter = percent_encoding::utf8_percent_encode(
         &json!({"diagnostic_executor":ACTOR}).to_string(),
         crate::job::QUERY_VALUE,
@@ -59,8 +86,52 @@ pub(super) async fn drain(conductor: &Conductor) -> Result<()> {
         }
         return Ok(());
     }
+    if scope == DrainScope::RecoveryAssessmentsOnly {
+        // Markers select candidates; the whole pinned protocol and its exact
+        // decided authority are still validated by recovery::advance. Never
+        // hydrate or claim an ordinary request on an occupied track.
+        let assessments = ours
+            .into_iter()
+            .filter(|job| job["metadata"]["diagnostic_recovery_assessment"] == "v1")
+            .collect();
+        return advance_requests(assessments, |selected, _| {
+            advance_selected(conductor, selected, Selection::RecoveryAssessment)
+        })
+        .await;
+    }
+    let filter = percent_encoding::utf8_percent_encode(
+        &json!({"diagnostic_executor":ACTOR,"diagnostic_recovery_assessment":"v1"}).to_string(),
+        crate::job::QUERY_VALUE,
+    )
+    .to_string();
+    let completed = if ours.iter().any(|job| {
+        job["kind"] == "diagnostic-request"
+            && job["workflow_version"] == 2
+            && find_step(job, "execute").is_some_and(|step| step["status"] == "active")
+    }) {
+        list_all_pages(|offset|{let filter=&filter;async move {
+        conductor.api(Method::GET,&format!("/api/jobs?status=closed&metadata={filter}&limit={PAGE_LIMIT}&offset={offset}"),None).await
+        }}).await?
+    } else {
+        Vec::new()
+    };
+    let mut assessed = std::collections::BTreeSet::new();
+    for candidate in completed.iter().filter(|job| {
+        job["metadata"]["diagnostic_recovery_assessment"] == "v1"
+            && job["metadata"]["diagnostic_executor"] == ACTOR
+    }) {
+        match recovery::covered_original(conductor, candidate).await {
+            Ok(original) => {
+                assessed.insert(original);
+            }
+            Err(error) => log(format!(
+                "diagnostic recovery disposition unread: {error:#}; original queue position retained"
+            )),
+        }
+    }
+    let ours = recovery::pending_originals(ours, &assessed)?;
     advance_requests(ours, |selected, may_launch| {
-        advance_selected(conductor, selected, may_launch)
+        advance_selected(conductor, selected, Selection::Ordinary { may_launch })
     })
     .await
 }
@@ -77,6 +148,9 @@ where
         // An UNKNOWN must not authorize another create; later packets
         // can reconcile only an intent already retained before this pass.
         match advance_one(selected, position == 0).await {
+            Ok(Advance::Assessed) => log(format!(
+                "diagnostic {id}: recovered refusal assessment retained; original operation and all subject holds unchanged"
+            )),
             Ok(Advance::Pending) => log(format!(
                 "diagnostic {id}: native worker pending; original attempt retained"
             )),
@@ -86,6 +160,10 @@ where
             Ok(Advance::Complete(receipt)) => log(format!(
                 "diagnostic {id}: {:?}; no subject hold, review or departure changed",
                 receipt.outcome
+            )),
+            Ok(Advance::Refused(refusal)) => log(format!(
+                "diagnostic {id}: first fetch exited {}; pre-create refusal retained for invocation {}; no subject hold or departure changed",
+                refusal.command["exit"], refusal.invocation
             )),
             Err(error) => {
                 log(format!(
@@ -103,7 +181,7 @@ where
 async fn advance_selected(
     conductor: &Conductor,
     selected: Value,
-    may_launch: bool,
+    selection: Selection,
 ) -> Result<Advance> {
     let id = Uuid::parse_str(job_id(&selected)?)?;
     // Queue rows carry compact steps, never their admitted request. Read
@@ -144,6 +222,17 @@ async fn advance_selected(
     {
         bail!("diagnostic selected execute identity, actor or state changed");
     }
+    let recovery =
+        step["metadata"]["recovery_operation"]["handler"] == "retained-preparation-assessment";
+    let may_launch = match selection {
+        Selection::Ordinary { may_launch } => may_launch,
+        Selection::RecoveryAssessment => {
+            if job["metadata"]["diagnostic_recovery_assessment"] != "v1" || !recovery {
+                bail!("occupied-track recovery selection has no registered assessment handler");
+            }
+            false
+        }
+    };
     let directory = PathBuf::from(&conductor.cfg.diagnostics_home).join(id.to_string());
     let content = crate::tenant_publish::service_on_door(&conductor.cfg.jobs, "content")?;
     let door = NativeDoor {
@@ -157,7 +246,11 @@ async fn advance_selected(
     };
     // One original request has one stable attempt. An explicit retry is
     // another admitted packet, never a fresh UUID on a polling pass.
-    advance(&door, id).await
+    if recovery {
+        recovery::advance(&door).await
+    } else {
+        advance(&door, id).await
+    }
 }
 
 pub(super) fn launch_admission(fresh: bool, may_launch: bool) -> Result<()> {
@@ -232,7 +325,7 @@ impl NativeDoor<'_> {
         path: &str,
         body: Option<Value>,
     ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
-        let http: &boss_core::machine_token::Client = &self.conductor.http;
+        let http: &crate::machine_http::MachineClient = &self.conductor.http;
         let mut request = http
             .request(method.clone(), format!("{}{path}", self.conductor.cfg.jobs))
             .header("content-type", "application/json")
@@ -245,7 +338,7 @@ impl NativeDoor<'_> {
             Ok(response) => response,
             Err(error) => {
                 self.journal(json!({"phase":"http-transport-error","actor":self.actor,"http_method":method.as_str(),"path":path,"request":body,"error":error.to_string()})).await?;
-                return Err(error.into());
+                return Err(error);
             }
         };
         let status = response.status();
@@ -304,6 +397,12 @@ impl NativeDoor<'_> {
         if inline {
             return Ok(value.clone());
         }
+        if raw.len() as u64 > crate::attach::largest_file() {
+            return Box::pin(artifacts::retain(self, &raw)).await;
+        }
+        self.attach_bytes(raw).await
+    }
+    async fn attach_bytes(&self, raw: Vec<u8>) -> Result<Value> {
         let file = tokio::task::spawn_blocking(move || -> Result<tempfile::NamedTempFile> {
             let mut file = tempfile::Builder::new()
                 .prefix("boss-diagnostic-original-")
@@ -332,7 +431,10 @@ impl NativeDoor<'_> {
             "size_bytes":attached.size_bytes,"encoding":"utf-8"}),
         )
     }
-    async fn original(&self, key: &str) -> Result<Option<Value>> {
+    async fn original_record(
+        &self,
+        key: &str,
+    ) -> Result<Option<boss_jobs::first_record::FirstRecord>> {
         let path = format!(
             "/api/jobs/{}/steps/{}/records/{key}",
             self.id()?,
@@ -363,23 +465,44 @@ impl NativeDoor<'_> {
         {
             bail!("diagnostic immutable record original/actor/equality witness differs");
         }
-        if record.value.get("kind").and_then(Value::as_str) == Some("attachment") {
+        Ok(Some(record))
+    }
+    async fn original(&self, key: &str) -> Result<Option<Value>> {
+        let Some(record) = self.original_record(key).await? else {
+            return Ok(None);
+        };
+        self.record_value(&record).await.map(Some)
+    }
+    async fn record_value(&self, record: &boss_jobs::first_record::FirstRecord) -> Result<Value> {
+        self.read_artifact(&record.value).await
+    }
+    async fn read_artifact(&self, value: &Value) -> Result<Value> {
+        if value.get("kind").and_then(Value::as_str) == Some("chunked-json") {
+            artifacts::read(self, value).await
+        } else if value.get("kind").and_then(Value::as_str) == Some("attachment") {
             let text = crate::dispatch_brief::read_at(
                 &self.conductor.http,
                 &self.content,
                 &crate::identity::header(&self.actor),
-                &record.value,
+                value,
             )
             .await?;
-            Ok(Some(serde_json::from_str(&text)?))
+            Ok(serde_json::from_str(&text)?)
         } else {
-            Ok(Some(record.value))
+            Ok(value.clone())
         }
     }
     async fn keep(&self, key: &str, value: &Value) -> Result<Value> {
+        Ok(self.keep_record(key, value).await?.1)
+    }
+    async fn keep_record(
+        &self,
+        key: &str,
+        value: &Value,
+    ) -> Result<(boss_jobs::first_record::FirstRecordResult, Value)> {
         let reference = self.artifact(value, Some(key)).await?;
-        let raw = self
-            .api(
+        let (status, raw) = self
+            .response(
                 Method::POST,
                 &format!(
                     "/api/jobs/{}/steps/{}/metadata/records",
@@ -389,15 +512,40 @@ impl NativeDoor<'_> {
                 Some(json!({"key":key,"value":reference,"expected_absence":true})),
             )
             .await?;
-        let result: boss_jobs::first_record::FirstRecordResult = serde_json::from_value(raw)?;
-        match result {
-            boss_jobs::first_record::FirstRecordResult::Recorded(_)
-            | boss_jobs::first_record::FirstRecordResult::Replayed(_) => {}
-            _ => bail!("diagnostic original record was not accepted; no completion"),
+        if !status.is_success() {
+            bail!(
+                "diagnostic first record write HTTP {status}; complete original response retained"
+            );
         }
-        self.original(key)
+        let result: boss_jobs::first_record::FirstRecordResult = serde_json::from_slice(&raw)?;
+        let accepted = match &result {
+            boss_jobs::first_record::FirstRecordResult::Recorded(record)
+                if status == reqwest::StatusCode::CREATED =>
+            {
+                record
+            }
+            boss_jobs::first_record::FirstRecordResult::Replayed(record)
+                if status == reqwest::StatusCode::OK =>
+            {
+                record
+            }
+            boss_jobs::first_record::FirstRecordResult::Recorded(_)
+            | boss_jobs::first_record::FirstRecordResult::Replayed(_) => {
+                bail!("diagnostic first record disposition and HTTP status disagree; no new effect")
+            }
+            _ => bail!("diagnostic original record was not accepted; no completion"),
+        };
+        let original = self
+            .original_record(key)
             .await?
-            .context("diagnostic original record read-back absent")
+            .context("diagnostic original record read-back absent")?;
+        if accepted != &original {
+            bail!(
+                "diagnostic first record response differs from its authoritative original; no new effect"
+            );
+        }
+        let value = self.record_value(&original).await?;
+        Ok((result, value))
     }
 }
 
@@ -480,7 +628,7 @@ impl Door for NativeDoor<'_> {
         }
         let operation = &spec.metadata_defaults["diagnostic_operation"];
         if operation["handler"] != "isolated-consist"
-            || operation["version"] != 1
+            || !matches!(operation["version"].as_u64(), Some(1 | 2))
             || operation["capacity"] != 1
         {
             bail!("diagnostic operation has no registered fixed controller adapter");
@@ -578,14 +726,20 @@ impl Door for NativeDoor<'_> {
         if let Some(old) = self.original("diagnostic.intent").await? {
             return Ok(FirstIntent::Replayed(serde_json::from_value(old)?));
         }
-        let accepted = self
-            .keep("diagnostic.intent", &serde_json::to_value(proposed)?)
+        let (disposition, accepted) = self
+            .keep_record("diagnostic.intent", &serde_json::to_value(proposed)?)
             .await?;
         let intent: Intent = serde_json::from_value(accepted)?;
-        Ok(if intent == *proposed {
-            FirstIntent::Recorded(intent)
-        } else {
-            FirstIntent::Replayed(intent)
+        // Equal intent data says nothing about which concurrent caller
+        // recorded it. Only the owning door's disposition admits an effect.
+        Ok(match disposition {
+            boss_jobs::first_record::FirstRecordResult::Recorded(_) => {
+                FirstIntent::Recorded(intent)
+            }
+            boss_jobs::first_record::FirstRecordResult::Replayed(_) => {
+                FirstIntent::Replayed(intent)
+            }
+            _ => bail!("diagnostic first intent has no accepted record disposition"),
         })
     }
     async fn launch_record(&self) -> Result<Option<Launch>> {
@@ -619,6 +773,23 @@ impl Door for NativeDoor<'_> {
     }
     async fn launch(&self, intent: &Intent) -> Result<Launch> {
         super::consist_job::validate_clone_url(&self.conductor.cfg.fork_url)?;
+        let invocation = if allows_pre_create_refusal(intent) {
+            let invocation = Uuid::new_v4();
+            let proposed =
+                json!({"phase":"preparing","invocation":invocation,"attempt":intent.attempt});
+            let (disposition, accepted) =
+                self.keep_record("diagnostic.invocation", &proposed).await?;
+            if !matches!(
+                disposition,
+                boss_jobs::first_record::FirstRecordResult::Recorded(_)
+            ) || accepted != proposed
+            {
+                bail!("preparation invocation is already owned or differs; no new effect");
+            }
+            Some(invocation)
+        } else {
+            None
+        };
         let clone = self.conductor.cfg.clone.clone();
         let url = self.conductor.cfg.fork_url.clone();
         let directory = self.directory.clone();
@@ -627,6 +798,10 @@ impl Door for NativeDoor<'_> {
         tokio::task::spawn_blocking(move || -> Result<Launch> {
             let name = intent.job_name();
             let tree = directory.with_extension("assembly");
+            if let Some(invocation) = invocation {
+                super::diagnostic_journal::keep(&directory,
+                    &json!({"phase":"preparing","invocation":invocation,"attempt":intent.attempt}))?;
+            }
             // Separate normal assembly; no car branch, hold or conductor HEAD moves.
             let git = |args: &[&str]| -> Result<std::process::Output> {
                 let output = crate::git_auth::command()
@@ -635,6 +810,14 @@ impl Door for NativeDoor<'_> {
                     .output()?;
                 super::diagnostic_journal::command(&directory, args, None, &output)?;
                 if !output.status.success() {
+                    if args == ["fetch", "origin"] && let Some(invocation) = invocation {
+                        let refusal = PreCreateRefusal { schema:1, intent:intent.clone(), invocation,
+                            native_launch:NativeLaunchAbsent::Absent,
+                            command:super::diagnostic_journal::command_value(args,None,&output),
+                            originals:super::diagnostic_journal::originals(&directory)? };
+                        validate_pre_create_refusal(&refusal)?;
+                        return Err(refusal.into());
+                    }
                     bail!("diagnostic fixed git operation failed; complete originals retained");
                 }
                 Ok(output)
@@ -704,6 +887,10 @@ impl Door for NativeDoor<'_> {
                 budget,
                 &intent.inputs.edit_level,
             )?;
+            if let Some(invocation) = invocation {
+                super::diagnostic_journal::keep(&directory,
+                    &json!({"phase":"entering-create","invocation":invocation,"attempt":intent.attempt}))?;
+            }
             super::consist_job::diagnostic_create(&directory, &manifest, &assembled)
         })
         .await?
@@ -739,7 +926,34 @@ impl Door for NativeDoor<'_> {
     async fn finish(&self, receipt: &Receipt) -> Result<()> {
         let value = serde_json::to_value(&receipt.outcome)?;
         let outcome = value.as_str().context("diagnostic outcome is not text")?;
-        let evidence = self.artifact(&serde_json::to_value(receipt)?, None).await?;
+        self.complete_result(outcome, &serde_json::to_value(receipt)?)
+            .await
+    }
+    async fn pre_create_refusal_record(&self) -> Result<Option<PreCreateRefusal>> {
+        self.original("diagnostic.pre-create-refusal")
+            .await?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(Into::into)
+    }
+    async fn keep_pre_create_refusal(&self, refusal: &PreCreateRefusal) -> Result<()> {
+        validate_pre_create_refusal(refusal)?;
+        let value = serde_json::to_value(refusal)?;
+        if self.keep("diagnostic.pre-create-refusal", &value).await? != value {
+            bail!("pre-create refusal original differs; no completion");
+        }
+        Ok(())
+    }
+    async fn finish_pre_create_refusal(&self, refusal: &PreCreateRefusal) -> Result<()> {
+        validate_pre_create_refusal(refusal)?;
+        self.complete_result("refused", &serde_json::to_value(refusal)?)
+            .await
+    }
+}
+
+impl NativeDoor<'_> {
+    async fn complete_result(&self, outcome: &str, result: &Value) -> Result<()> {
+        let evidence = self.artifact(result, None).await?;
         self.api(
             Method::PATCH,
             &format!(
@@ -806,11 +1020,14 @@ mod tests {
         );
         let request = serde_json::to_value(proposed().inputs.request).unwrap();
         job.status = JobStatus::Open;
+        if fault == Some("active-v2") {
+            job.workflow_version = 2;
+        }
         job.metadata = json!({"diagnostic_executor":ACTOR,"request":request});
         jobs.create_job(&job).await.unwrap();
         let mut step = Step::new(job.id, "task", "Execute", 0);
         step.spec_slug = Some("execute".into());
-        step.status = if fault == Some("active") {
+        step.status = if matches!(fault, Some("active" | "active-v2")) {
             StepStatus::Active
         } else {
             StepStatus::Ready
@@ -833,7 +1050,9 @@ mod tests {
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = calls.clone();
         let selected_path = format!("/api/jobs/{}", job.id);
-        let fault = fault.filter(|fault| *fault != "active").map(str::to_owned);
+        let fault = fault
+            .filter(|fault| !matches!(*fault, "active" | "active-v2"))
+            .map(str::to_owned);
         let app = boss_jobs::http::router(state).layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
                 let recorded = recorded.clone();
@@ -892,7 +1111,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut conductor = Conductor::diagnostic_fixture(directory.path());
         conductor.http =
-            boss_core::machine_token::Client::unstamped(reqwest::Client::builder()).unwrap();
+            crate::machine_http::MachineClient::unstamped(reqwest::Client::builder()).unwrap();
         conductor.cfg.jobs = format!("http://{address}");
         conductor.cfg.diagnostics_home = directory
             .path()
@@ -1043,8 +1262,44 @@ mod tests {
         }
     }
 
-    async fn owning_records(
+    #[tokio::test]
+    async fn active_v2_reads_closed_assessments_without_bypassing_ordinary_binding() {
+        let (conductor, calls, jobs, _, directory) =
+            selected_request_fixture(Some("active-v2")).await;
+        let before = jobs.recorded_events().len();
+        let error = drain(&conductor).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("credential-free HTTP repository URL")
+                || error
+                    .to_string()
+                    .contains("running registered conductor actor"),
+            "{error:#}"
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "GET /api/jobs")
+                .count(),
+            2,
+            "owning API must accept the closed-assessment string filter"
+        );
+        assert!(calls.iter().all(|call| call.starts_with("GET ")));
+        assert_eq!(jobs.recorded_events().len(), before);
+        assert!(!directory.path().join("absent-journal").exists());
+    }
+
+    pub(super) async fn owning_records(
         allow_update: bool,
+    ) -> (String, Arc<boss_jobs::InMemoryJobs>, Value, Value) {
+        owning_records_with_fault(allow_update, None).await
+    }
+
+    async fn owning_records_with_fault(
+        allow_update: bool,
+        fault: Option<&'static str>,
     ) -> (String, Arc<boss_jobs::InMemoryJobs>, Value, Value) {
         use boss_core::{
             job::{Job, Priority, Step, StepStatus, Subject},
@@ -1088,7 +1343,71 @@ mod tests {
             Arc::new(policy.build()),
             Arc::new(boss_clock_client::WallClockClient),
         );
-        let app = boss_jobs::http::router(state);
+        let absent = Arc::new(tokio::sync::Barrier::new(2));
+        let writes = Arc::new(tokio::sync::Mutex::new(()));
+        let app = boss_jobs::http::router(state).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let absent = absent.clone();
+                let writes = writes.clone();
+                async move {
+                    let read = request.method() == axum::http::Method::GET
+                        && request.uri().path().ends_with("/records/diagnostic.intent");
+                    let write = request.method() == axum::http::Method::POST
+                        && request.uri().path().ends_with("/metadata/records");
+                    // Both callers actually observe absence. Serializing the
+                    // real POST handlers then exposes a valid server replay,
+                    // rather than an unrelated version-CAS refusal.
+                    let _write = if write && fault == Some("concurrent") {
+                        Some(writes.lock().await)
+                    } else {
+                        None
+                    };
+                    let response = next.run(request).await;
+                    if read
+                        && fault == Some("concurrent")
+                        && response.status() == axum::http::StatusCode::NOT_FOUND
+                    {
+                        absent.wait().await;
+                    }
+                    if !write
+                        || fault.is_none()
+                        || fault == Some("concurrent")
+                        || !response.status().is_success()
+                    {
+                        return response;
+                    }
+                    use axum::response::IntoResponse;
+                    if fault == Some("transport-ambiguous") {
+                        return (
+                            axum::http::StatusCode::BAD_GATEWAY,
+                            "original accepted by the owning router; acknowledgement unavailable",
+                        )
+                            .into_response();
+                    }
+                    let mut status = response.status();
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+                    match fault.unwrap() {
+                        "missing-disposition" => {
+                            value.as_object_mut().unwrap().remove("result");
+                        }
+                        "disposition-status" => status = axum::http::StatusCode::OK,
+                        "record-actor" => value["record"]["actor"] = json!("another-actor"),
+                        "record-job" => value["record"]["job_id"] = json!(Uuid::new_v4()),
+                        "record-step" => value["record"]["step_id"] = json!(Uuid::new_v4()),
+                        "record-key" => value["record"]["key"] = json!("another-record"),
+                        "record-event" => value["record"]["event_id"] = json!(Uuid::nil()),
+                        "record-digest" => value["record"]["digest"] = json!("0".repeat(64)),
+                        "record-canonical" => value["record"]["canonical"] = json!([0]),
+                        "record-value" => value["record"]["value"] = json!({"another":"value"}),
+                        other => panic!("unknown record fixture fault: {other}"),
+                    }
+                    (status, axum::Json(value)).into_response()
+                }
+            },
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1121,6 +1440,332 @@ mod tests {
                 observed_cluster_identity: super::super::consist_job::CONTROLLER_IDENTITY.into(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn actual_fetch128_retains_versioned_refusal_through_the_owning_record_door() {
+        if std::env::var_os("BOSS_PRECREATE_REFUSAL_FIXTURE").is_none() {
+            // The native adapter reads its own credential configuration.
+            // Give this fixture a private child environment, never the pod's.
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","train::diagnostic_adapter::tests::actual_fetch128_retains_versioned_refusal_through_the_owning_record_door","--nocapture"])
+                .env_clear().env("PATH",std::env::var_os("PATH").unwrap())
+                .env("HOME",home.path()).env("GIT_CONFIG_NOSYSTEM","1")
+                .env("GIT_TERMINAL_PROMPT","0")
+                .env("BOSS_PRECREATE_REFUSAL_FIXTURE","child")
+                .env("BOSS_TRAIN_FORGE_TOKEN_FILE",home.path().join("absent-fixture-token"))
+                .env("BOSS_TRAIN_FORGE_URL","http://fixture.invalid")
+                .env("BOSS_MACHINE_TOKEN_DIR",home.path().join("absent-machine-token"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (base, jobs, job, step) = owning_records(true).await;
+        let root = tempfile::tempdir().unwrap();
+        let clone = root.path().join("clone");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", clone.to_str().unwrap()])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", root.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let mut conductor = Conductor::diagnostic_fixture(&clone);
+        conductor.cfg.jobs = base;
+        conductor.cfg.fork_url = "http://fixture.invalid/source.git".into();
+        let door = NativeDoor {
+            conductor: &conductor,
+            job: job.clone(),
+            step: step.clone(),
+            directory: super::super::diagnostic_journal::private_directory(
+                &root.path().join("journal"),
+            )
+            .unwrap(),
+            actor: ACTOR.into(),
+            content: crate::attach::tests::store().await,
+            may_launch: true,
+        };
+        let mut intent = proposed();
+        intent.inputs.pinned_protocol = json!({"steps":[{"title":"execute","metadata_defaults":{"diagnostic_operation":{"version":2}}}]});
+        let error = door.launch(&intent).await.unwrap_err();
+        let refusal = error.downcast_ref::<PreCreateRefusal>().unwrap();
+        validate_pre_create_refusal(refusal).unwrap();
+        assert_eq!(refusal.command["exit"], 128);
+        assert!(door.launch_record().await.unwrap().is_none());
+        door.keep_pre_create_refusal(refusal).await.unwrap();
+        assert_eq!(
+            door.pre_create_refusal_record().await.unwrap().as_ref(),
+            Some(refusal)
+        );
+        door.finish_pre_create_refusal(refusal).await.unwrap();
+        let after = jobs
+            .get_job(&serde_json::from_value(job["id"].clone()).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let steps = jobs.list_steps(&after.id).await.unwrap();
+        assert_eq!(steps[0].metadata["outcome"], "refused");
+        assert!(door.original("diagnostic.launch").await.unwrap().is_none());
+        // Even a direct repeat cannot reacquire preparation ownership.
+        assert!(door.launch(&intent).await.is_err());
+        let originals = super::super::diagnostic_journal::originals(&door.directory).unwrap();
+        assert_eq!(
+            originals
+                .iter()
+                .filter(|r| r["observation"]["argv"] == json!(["fetch", "origin"]))
+                .count(),
+            1
+        );
+        assert!(!door.directory.with_extension("assembly").exists());
+    }
+
+    struct IntentPort<'a> {
+        native: NativeDoor<'a>,
+        original: Intent,
+        dispositions: &'a std::sync::Mutex<Vec<&'static str>>,
+        effects: &'a std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Door for IntentPort<'_> {
+        async fn inputs(&self) -> Result<Inputs> {
+            Ok(self.original.inputs.clone())
+        }
+        async fn claim(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn first_intent(&self, proposed: &Intent) -> Result<FirstIntent> {
+            let accepted = self.native.first_intent(proposed).await?;
+            self.dispositions.lock().unwrap().push(match &accepted {
+                FirstIntent::Recorded(_) => "recorded",
+                FirstIntent::Replayed(_) => "replayed",
+            });
+            Ok(accepted)
+        }
+        async fn launch_record(&self) -> Result<Option<Launch>> {
+            Ok(None)
+        }
+        async fn receipt_record(&self) -> Result<Option<Receipt>> {
+            Ok(None)
+        }
+        async fn launch(&self, _intent: &Intent) -> Result<Launch> {
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Launch {
+                job_uid: "ordinary-port-incarnation".into(),
+                assembled: "d".repeat(40),
+                manifest: json!({"fixed":"ordinary port manifest"}),
+                original_output: json!({"complete":"ordinary port acknowledgement"}),
+            })
+        }
+        async fn keep_launch(&self, _launch: &Launch) -> Result<()> {
+            Ok(())
+        }
+        async fn observe(&self, _intent: &Intent, _launch: &Launch) -> Result<Option<Observation>> {
+            Ok(None)
+        }
+        async fn keep_receipt(&self, _receipt: &Receipt) -> Result<()> {
+            panic!("pending port has no receipt")
+        }
+        async fn finish(&self, _receipt: &Receipt) -> Result<()> {
+            panic!("pending port cannot finish")
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_intents_keep_the_owning_record_disposition_and_one_effect() {
+        let (base, jobs, job, step) = owning_records_with_fault(true, Some("concurrent")).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut conductor = Conductor::diagnostic_fixture(directory.path());
+        conductor.cfg.jobs = base;
+        let original = proposed();
+        let dispositions = std::sync::Mutex::new(Vec::new());
+        let effects = std::sync::atomic::AtomicUsize::new(0);
+        let port = IntentPort {
+            native: NativeDoor {
+                conductor: &conductor,
+                job,
+                step,
+                directory: directory.path().join("journal"),
+                actor: ACTOR.into(),
+                content: crate::attach::tests::store().await,
+                may_launch: true,
+            },
+            original: original.clone(),
+            dispositions: &dispositions,
+            effects: &effects,
+        };
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            tokio::join!(
+                advance(&port, original.attempt),
+                advance(&port, original.attempt)
+            )
+        })
+        .await
+        .expect("both owning first-record calls must settle");
+        assert!(
+            first.is_ok() && second.is_ok(),
+            "{:?} {:?}",
+            first.as_ref().err().map(ToString::to_string),
+            second.as_ref().err().map(ToString::to_string)
+        );
+        let mut observed = dispositions.lock().unwrap().clone();
+        observed.sort();
+        assert_eq!(
+            effects.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "original dispositions: {observed:?}"
+        );
+        assert_eq!(observed, ["recorded", "replayed"]);
+        assert_eq!(
+            jobs.recorded_events()
+                .iter()
+                .filter(|event| event.kind == boss_jobs::events::STEP_FIRST_RECORDED)
+                .count(),
+            1
+        );
+        let kept = port
+            .native
+            .original("diagnostic.intent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept, serde_json::to_value(original).unwrap());
+    }
+
+    #[tokio::test]
+    async fn record_disposition_and_provenance_refusals_never_launch_or_erase_the_original() {
+        for fault in [
+            "missing-disposition",
+            "disposition-status",
+            "record-actor",
+            "record-job",
+            "record-step",
+            "record-key",
+            "record-event",
+            "record-digest",
+            "record-canonical",
+            "record-value",
+        ] {
+            let (base, jobs, job, step) = owning_records_with_fault(true, Some(fault)).await;
+            let directory = tempfile::tempdir().unwrap();
+            let mut conductor = Conductor::diagnostic_fixture(directory.path());
+            conductor.cfg.jobs = base;
+            let original = proposed();
+            let dispositions = std::sync::Mutex::new(Vec::new());
+            let effects = std::sync::atomic::AtomicUsize::new(0);
+            let port = IntentPort {
+                native: NativeDoor {
+                    conductor: &conductor,
+                    job,
+                    step,
+                    directory: directory.path().join("journal"),
+                    actor: ACTOR.into(),
+                    content: crate::attach::tests::store().await,
+                    may_launch: true,
+                },
+                original: original.clone(),
+                dispositions: &dispositions,
+                effects: &effects,
+            };
+            assert!(
+                advance(&port, original.attempt).await.is_err(),
+                "{fault}: ambiguous response is not launch authority"
+            );
+            assert_eq!(
+                effects.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{fault}"
+            );
+            assert_eq!(
+                port.native
+                    .original("diagnostic.intent")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                serde_json::to_value(original.clone()).unwrap()
+            );
+            let events = jobs.recorded_events().len();
+            assert!(
+                matches!(
+                    advance(&port, original.attempt).await.unwrap(),
+                    Advance::Unknown(_)
+                ),
+                "{fault}: replay keeps the original UNKNOWN"
+            );
+            assert_eq!(
+                effects.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{fault}: no retry"
+            );
+            assert_eq!(
+                jobs.recorded_events().len(),
+                events,
+                "{fault}: immutable replay emits no new fact"
+            );
+            assert!(
+                super::super::diagnostic_journal::originals(&port.native.directory)
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["observation"]["http_method"] == "POST"
+                        && row["observation"]["complete"] == true),
+                "{fault}: complete original response retained"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_intent_with_lost_response_and_changed_binding_never_becomes_fresh() {
+        let (base, jobs, job, step) =
+            owning_records_with_fault(true, Some("transport-ambiguous")).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut conductor = Conductor::diagnostic_fixture(directory.path());
+        conductor.cfg.jobs = base;
+        let original = proposed();
+        let dispositions = std::sync::Mutex::new(Vec::new());
+        let effects = std::sync::atomic::AtomicUsize::new(0);
+        let mut port = IntentPort {
+            native: NativeDoor {
+                conductor: &conductor,
+                job,
+                step,
+                directory: directory.path().join("journal"),
+                actor: ACTOR.into(),
+                content: crate::attach::tests::store().await,
+                may_launch: true,
+            },
+            original: original.clone(),
+            dispositions: &dispositions,
+            effects: &effects,
+        };
+        assert!(advance(&port, original.attempt).await.is_err());
+        let events = jobs.recorded_events().len();
+        assert!(matches!(
+            advance(&port, original.attempt).await.unwrap(),
+            Advance::Unknown(_)
+        ));
+        port.original.inputs.request.candidate = "e".repeat(40);
+        let error = advance(&port, original.attempt).await.err().unwrap();
+        assert!(error.to_string().contains("current authoritative inputs"));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(jobs.recorded_events().len(), events);
+        assert_eq!(
+            port.native
+                .original("diagnostic.intent")
+                .await
+                .unwrap()
+                .unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1577,7 +2222,7 @@ mod tests {
         let mut conductor = Conductor::diagnostic_fixture(directory.path());
         // This ordinary transport fixture reads no credential source.
         conductor.http =
-            boss_core::machine_token::Client::unstamped(reqwest::Client::builder()).unwrap();
+            crate::machine_http::MachineClient::unstamped(reqwest::Client::builder()).unwrap();
         conductor.cfg.jobs = format!("http://{address}");
         let path =
             super::super::diagnostic_journal::private_directory(&directory.path().join("journal"))

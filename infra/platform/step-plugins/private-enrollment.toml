@@ -1,0 +1,17 @@
+[[step_plugin]]
+kind = "private-enrollment"
+version = 1
+status = "active"
+label = "Private human enrollment"
+description = "A dedicated human setup surface. Source preparation only: no provider material, generic metadata transport or completion control. The private broker adapter must be installed and verified separately."
+category = "platform"
+frontend_url = "private-enrollment.js"
+owning_team = "platform"
+
+[step_plugin.metadata_schema]
+type = "object"
+additionalProperties = false
+
+[step_plugin.metadata_schema.properties.broker_receipt_id]
+type = "string"
+format = "uuid"

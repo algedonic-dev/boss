@@ -2150,3 +2150,90 @@ fn the_lint_keeps_no_second_copy_of_the_derivations_rules() {
         "{LINT_REL} no longer asks {DERIVE_REL} --list for the orphan set"
     );
 }
+
+#[test]
+fn generated_dev_workers_are_declared_by_the_owning_factory() {
+    let c = Case::new("generated-dev-worker", &[]);
+    let dir = c.tree.join("infra/dev");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        repo_root().join("infra/dev/dev-build.py"),
+        dir.join("dev-build.py"),
+    )
+    .unwrap();
+    let good: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            repo_root().join("infra/dev/tests/fixtures/defaulted-dev-job.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let name = good["metadata"]["name"].as_str().unwrap();
+    c.add_live_labelled(
+        "Job",
+        "boss-dev",
+        name,
+        "app.kubernetes.io/part-of=boss,boss.dev/purpose=isolated-build",
+    );
+    std::fs::write(
+        c.live.join("Job.boss-dev.json"),
+        serde_json::to_vec(&serde_json::json!({"items":[good]})).unwrap(),
+    )
+    .unwrap();
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    assert!(
+        !stdout.contains(name),
+        "owning native shape is declared: {all}"
+    );
+    let (rc, _, all) = c.run(&["--check", &format!("Job/boss-dev/{name}")]);
+    assert_eq!(
+        rc, 3,
+        "declared worker cannot be deleted as an orphan: {all}"
+    );
+    std::fs::write(dir.join("dev-build.py"), "# different factory").unwrap();
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, CANNOT_ANSWER, "a different factory is unknown: {all}");
+    assert!(stdout.is_empty());
+}
+
+#[test]
+fn synthetic_fixture_inventory_preserves_unread_and_different_source_refusals() {
+    let c = Case::new("synthetic-fixture", &[]);
+    let dir = c.tree.join("infra/forge");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(
+        repo_root().join("infra/forge/isolation-fixture.py"),
+        dir.join("isolation-fixture.py"),
+    )
+    .unwrap();
+    for kind in ["Job", "Service"] {
+        std::fs::write(
+            c.live.join(format!("{kind}.boss-dev.json")),
+            r#"{"items":[]}"#,
+        )
+        .unwrap();
+    }
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "empty successful fixture collections: {all}");
+    assert!(stdout.is_empty(), "{all}");
+    let forbid = c.forbid(&[("Job", "boss-dev")]);
+    let (rc, stdout, all) = c.run_env(&["--list"], &[forbid]);
+    assert_eq!(rc, 0, "partly readable inventory remains explicit: {all}");
+    assert!(stdout.is_empty(), "unread is not an orphan: {all}");
+    assert!(
+        all.contains("UNVERIFIED") && all.contains("cannot list Job in boss-dev"),
+        "{all}"
+    );
+    std::fs::write(
+        dir.join("isolation-fixture.py"),
+        "# copied declaration differs",
+    )
+    .unwrap();
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(
+        rc, CANNOT_ANSWER,
+        "different factory cannot declare objects: {all}"
+    );
+    assert!(stdout.is_empty(), "{all}");
+}

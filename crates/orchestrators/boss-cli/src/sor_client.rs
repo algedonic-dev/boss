@@ -75,8 +75,8 @@ pub(crate) fn resolve_jobs_base_from(flag: Option<&str>, env: Option<String>) ->
 }
 
 /// The client every boss verb's BOSS-service calls go through: a
-/// `machine_token::Client`, which stamps the estate machine token on each
-/// request from the process's one watched source and follows no redirect
+/// guarded CLI `MachineClient`, which requires the estate machine token on each
+/// final request from the process's one watched source and follows no redirect
 /// (design 6805c764 car 2, the CLI slice, 2026-09-29). Until then each
 /// verb built a plain `reqwest::Client` and sent `x-boss-user` alone, so
 /// every verb would have been a 401 the minute its port's gate enforced.
@@ -84,7 +84,7 @@ pub(crate) fn resolve_jobs_base_from(flag: Option<&str>, env: Option<String>) ->
 /// has its own plain client behind its port (`train::forge`), and so do
 /// the install checks `boss doctor` makes of NATS and the local gateway's
 /// health, which assert no identity.
-pub(crate) fn machine_client() -> Result<boss_core::machine_token::Client> {
+pub(crate) fn machine_client() -> Result<crate::machine_http::MachineClient> {
     machine_client_with(reqwest::Client::builder())
 }
 
@@ -101,19 +101,16 @@ pub(crate) fn machine_client() -> Result<boss_core::machine_token::Client> {
 /// shared source itself.
 pub(crate) fn machine_client_with(
     builder: reqwest::ClientBuilder,
-) -> Result<boss_core::machine_token::Client> {
+) -> Result<crate::machine_http::MachineClient> {
     #[cfg(not(test))]
-    let client = boss_core::machine_token::Client::build(builder);
+    let client = crate::machine_http::MachineClient::build(builder);
     #[cfg(test)]
-    let client = boss_core::machine_token::Client::build_with_source(
-        builder,
-        std::sync::Arc::new(boss_core::machine_token::Source::fixed(None)),
-    );
+    let client = crate::machine_http::MachineClient::unstamped(builder);
     client.context("building the machine client")
 }
 
 pub(crate) async fn api(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     method: reqwest::Method,
     path: &str,
     payload: Option<Value>,
@@ -132,7 +129,7 @@ pub(crate) async fn api(
 /// once if not. Neither is ever signed as the conductor: that is
 /// backlog 5083d6f5, measured on the step a `boss prove` completed.
 pub(crate) async fn api_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     method: reqwest::Method,
     path: &str,
@@ -180,7 +177,7 @@ pub(crate) fn service_at(base: &str) -> String {
 /// caller, and that a refused write never reaches the network, without
 /// mutating the process's environment.
 pub(crate) async fn api_at_signed(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     method: reqwest::Method,
     path: &str,
@@ -355,7 +352,7 @@ pub(crate) fn success_answer(
 /// review step's `hold` off these rows (`receipt::select_receipt`,
 /// `car_retire`), and the list's default is going slim — step metadata
 /// only when asked (backlog 9b473d4a).
-pub(crate) async fn all_open_cars(http: &boss_core::machine_token::Client) -> Result<Vec<Value>> {
+pub(crate) async fn all_open_cars(http: &crate::machine_http::MachineClient) -> Result<Vec<Value>> {
     crate::train::list_all_pages(|offset| async move {
         api(
             http,
@@ -386,7 +383,7 @@ pub(crate) async fn all_open_cars(http: &boss_core::machine_token::Client) -> Re
 /// 500 so today's population is still one call — the query and the
 /// page are [`all_cars_via`]'s, the one car read every verb shares.
 pub(crate) async fn all_cars_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
 ) -> Result<Vec<Value>> {
     all_cars_via(|path| async move { api_at(http, base, reqwest::Method::GET, &path, None).await })
@@ -416,7 +413,7 @@ where
 }
 
 /// [`all_cars_at`] against the resolved system of record.
-pub(crate) async fn all_cars(http: &boss_core::machine_token::Client) -> Result<Vec<Value>> {
+pub(crate) async fn all_cars(http: &crate::machine_http::MachineClient) -> Result<Vec<Value>> {
     all_cars_at(http, &jobs_base()?).await
 }
 

@@ -1,0 +1,385 @@
+{
+    "apiVersion": "batch/v1",
+    "kind": "Job",
+    "metadata": {
+        "creationTimestamp": "2026-10-14T09:00:05Z",
+        "generation": 1,
+        "labels": {
+            "app.kubernetes.io/part-of": "boss",
+            "boss.dev/purpose": "isolated-build",
+            "boss.dev/session": "dev-build-8583836c7b554a0f"
+        },
+        "name": "dev-build-8583836c7b554a0f",
+        "namespace": "boss-dev",
+        "resourceVersion": "41694905",
+        "uid": "2bcb596e-ae1a-4fe3-a38d-3832dd784cc1"
+    },
+    "spec": {
+        "activeDeadlineSeconds": 86400,
+        "backoffLimit": 0,
+        "completionMode": "NonIndexed",
+        "completions": 1,
+        "manualSelector": false,
+        "parallelism": 1,
+        "podReplacementPolicy": "TerminatingOrFailed",
+        "selector": {
+            "matchLabels": {
+                "batch.kubernetes.io/controller-uid": "2bcb596e-ae1a-4fe3-a38d-3832dd784cc1"
+            }
+        },
+        "suspend": false,
+        "template": {
+            "metadata": {
+                "labels": {
+                    "app.kubernetes.io/part-of": "boss",
+                    "batch.kubernetes.io/controller-uid": "2bcb596e-ae1a-4fe3-a38d-3832dd784cc1",
+                    "batch.kubernetes.io/job-name": "dev-build-8583836c7b554a0f",
+                    "boss.dev/purpose": "isolated-build",
+                    "boss.dev/session": "dev-build-8583836c7b554a0f",
+                    "controller-uid": "2bcb596e-ae1a-4fe3-a38d-3832dd784cc1",
+                    "job-name": "dev-build-8583836c7b554a0f"
+                }
+            },
+            "spec": {
+                "affinity": {
+                    "nodeAffinity": {
+                        "preferredDuringSchedulingIgnoredDuringExecution": [
+                            {
+                                "preference": {
+                                    "matchExpressions": [
+                                        {
+                                            "key": "boss.dev/purpose",
+                                            "operator": "In",
+                                            "values": [
+                                                "build"
+                                            ]
+                                        }
+                                    ]
+                                },
+                                "weight": 100
+                            }
+                        ],
+                        "requiredDuringSchedulingIgnoredDuringExecution": {
+                            "nodeSelectorTerms": [
+                                {
+                                    "matchExpressions": [
+                                        {
+                                            "key": "node-role.kubernetes.io/control-plane",
+                                            "operator": "DoesNotExist"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                },
+                "automountServiceAccountToken": false,
+                "containers": [
+                    {
+                        "command": [
+                            "/bin/sleep",
+                            "infinity"
+                        ],
+                        "env": [
+                            {
+                                "name": "HOME",
+                                "value": "/workspace/home"
+                            },
+                            {
+                                "name": "CARGO_HOME",
+                                "value": "/workspace/cargo"
+                            },
+                            {
+                                "name": "CARGO_TARGET_DIR",
+                                "value": "/workspace/target"
+                            },
+                            {
+                                "name": "RUSTUP_HOME",
+                                "value": "/usr/local/rustup"
+                            },
+                            {
+                                "name": "CARGO_BUILD_JOBS",
+                                "value": "4"
+                            },
+                            {
+                                "name": "TMPDIR",
+                                "value": "/workspace/tmp"
+                            },
+                            {
+                                "name": "PATH",
+                                "value": "/workspace/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin"
+                            },
+                            {
+                                "name": "BUN_INSTALL_CACHE_DIR",
+                                "value": "/workspace/home/bun-cache"
+                            },
+                            {
+                                "name": "WT_TARGET_ROOT",
+                                "value": "/workspace/cache"
+                            },
+                            {
+                                "name": "WT_SEED",
+                                "value": "/workspace/no-seed"
+                            }
+                        ],
+                        "image": "10.20.0.15:3000/david/boss-ci@sha256:9ef7c7634533ebfd5b75ffd74286c62502640abb2b25626e90b4fd9e6e0b1efc",
+                        "imagePullPolicy": "IfNotPresent",
+                        "name": "worker",
+                        "resources": {
+                            "limits": {
+                                "cpu": "4",
+                                "memory": "16Gi"
+                            },
+                            "requests": {
+                                "cpu": "2",
+                                "memory": "4Gi"
+                            }
+                        },
+                        "securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "capabilities": {
+                                "drop": [
+                                    "ALL"
+                                ]
+                            },
+                            "readOnlyRootFilesystem": true,
+                            "runAsGroup": 1500,
+                            "runAsNonRoot": true,
+                            "runAsUser": 65534,
+                            "seccompProfile": {
+                                "type": "RuntimeDefault"
+                            }
+                        },
+                        "terminationMessagePath": "/dev/termination-log",
+                        "terminationMessagePolicy": "File",
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/workspace",
+                                "name": "workspace"
+                            },
+                            {
+                                "mountPath": "/tmp",
+                                "name": "worker-tmp"
+                            }
+                        ],
+                        "workingDir": "/workspace/source"
+                    },
+                    {
+                        "args": [
+                            "-c",
+                            "fsync=off",
+                            "-c",
+                            "synchronous_commit=off",
+                            "-c",
+                            "full_page_writes=off"
+                        ],
+                        "env": [
+                            {
+                                "name": "POSTGRES_USER",
+                                "value": "boss"
+                            },
+                            {
+                                "name": "POSTGRES_PASSWORD",
+                                "value": "boss"
+                            },
+                            {
+                                "name": "POSTGRES_DB",
+                                "value": "postgres"
+                            },
+                            {
+                                "name": "PGDATA",
+                                "value": "/pgdata/data"
+                            }
+                        ],
+                        "image": "10.20.0.15:3000/david/postgres@sha256:a85daf0dbd5e79586e850e3fe4b21b796799828ad015ce2166aeb98cc24da61c",
+                        "imagePullPolicy": "IfNotPresent",
+                        "name": "postgres",
+                        "readinessProbe": {
+                            "exec": {
+                                "command": [
+                                    "pg_isready",
+                                    "-U",
+                                    "boss",
+                                    "-d",
+                                    "postgres"
+                                ]
+                            },
+                            "failureThreshold": 3,
+                            "initialDelaySeconds": 2,
+                            "periodSeconds": 2,
+                            "successThreshold": 1,
+                            "timeoutSeconds": 1
+                        },
+                        "resources": {
+                            "limits": {
+                                "cpu": "2",
+                                "ephemeral-storage": "12Gi",
+                                "memory": "4Gi"
+                            },
+                            "requests": {
+                                "cpu": "500m",
+                                "ephemeral-storage": "4Gi",
+                                "memory": "1Gi"
+                            }
+                        },
+                        "securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "capabilities": {
+                                "drop": [
+                                    "ALL"
+                                ]
+                            },
+                            "readOnlyRootFilesystem": true,
+                            "runAsGroup": 1500,
+                            "runAsNonRoot": true,
+                            "runAsUser": 999,
+                            "seccompProfile": {
+                                "type": "RuntimeDefault"
+                            }
+                        },
+                        "terminationMessagePath": "/dev/termination-log",
+                        "terminationMessagePolicy": "File",
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/pgdata",
+                                "name": "pgdata"
+                            },
+                            {
+                                "mountPath": "/var/run/postgresql",
+                                "name": "pg-run"
+                            },
+                            {
+                                "mountPath": "/dev/shm",
+                                "name": "pg-shm"
+                            },
+                            {
+                                "mountPath": "/tmp",
+                                "name": "pg-tmp"
+                            }
+                        ]
+                    }
+                ],
+                "dnsPolicy": "ClusterFirst",
+                "enableServiceLinks": false,
+                "imagePullSecrets": [
+                    {
+                        "name": "forgejo-registry"
+                    }
+                ],
+                "initContainers": [
+                    {
+                        "command": [
+                            "/bin/bash",
+                            "-c",
+                            "set -euo pipefail\nexport HOME=/workspace/bootstrap GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null\nmkdir -p /workspace/bootstrap /workspace/home /workspace/cargo /workspace/target /workspace/cache /workspace/tmp /workspace/bin\ngit -c core.hooksPath=/dev/null init -q /workspace/source\ncd /workspace/source\ngit -c http.followRedirects=false -c core.hooksPath=/dev/null -c credential.helper= -c 'credential.helper=!f() { printf \"username=x-access-token\\npassword=\"; cat /bootstrap-forge/token; printf \"\\n\"; }; f' fetch --no-tags -- \"$2\" \"$1\"\ntest \"$(git rev-parse FETCH_HEAD)\" = \"$1\"\ngit -c core.hooksPath=/dev/null checkout -q --detach \"$1\"\ngit config --local core.hooksPath /dev/null\ngit config --local --unset-all credential.helper || test \"$?\" = 5\ntest \"$(git rev-parse HEAD)\" = \"$1\"\nln -s /workspace/source/infra/dev/wt-cargo /workspace/bin/wt-cargo\nln -s /workspace/source/infra/dev/wt-web /workspace/bin/wt-web\n",
+                            "bootstrap",
+                            "970f548816c085879f128f310802ee7624fa19ec",
+                            "http://10.20.0.15:3000/david/boss.git"
+                        ],
+                        "env": [
+                            {
+                                "name": "TMPDIR",
+                                "value": "/workspace/tmp"
+                            }
+                        ],
+                        "image": "10.20.0.15:3000/david/boss-ci@sha256:9ef7c7634533ebfd5b75ffd74286c62502640abb2b25626e90b4fd9e6e0b1efc",
+                        "imagePullPolicy": "IfNotPresent",
+                        "name": "published-bootstrap",
+                        "resources": {},
+                        "securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "capabilities": {
+                                "drop": [
+                                    "ALL"
+                                ]
+                            },
+                            "readOnlyRootFilesystem": true,
+                            "runAsGroup": 1500,
+                            "runAsNonRoot": true,
+                            "runAsUser": 65534,
+                            "seccompProfile": {
+                                "type": "RuntimeDefault"
+                            }
+                        },
+                        "terminationMessagePath": "/dev/termination-log",
+                        "terminationMessagePolicy": "File",
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/workspace",
+                                "name": "workspace"
+                            },
+                            {
+                                "mountPath": "/bootstrap-forge",
+                                "name": "forge-read",
+                                "readOnly": true
+                            }
+                        ]
+                    }
+                ],
+                "restartPolicy": "Never",
+                "schedulerName": "default-scheduler",
+                "securityContext": {
+                    "fsGroup": 1500,
+                    "fsGroupChangePolicy": "OnRootMismatch"
+                },
+                "shareProcessNamespace": false,
+                "terminationGracePeriodSeconds": 30,
+                "volumes": [
+                    {
+                        "name": "workspace",
+                        "persistentVolumeClaim": {
+                            "claimName": "dev-build-8583836c7b554a0f"
+                        }
+                    },
+                    {
+                        "name": "forge-read",
+                        "secret": {
+                            "defaultMode": 288,
+                            "secretName": "forge-read"
+                        }
+                    },
+                    {
+                        "emptyDir": {
+                            "sizeLimit": "10Gi"
+                        },
+                        "name": "pgdata"
+                    },
+                    {
+                        "emptyDir": {
+                            "medium": "Memory",
+                            "sizeLimit": "16Mi"
+                        },
+                        "name": "pg-run"
+                    },
+                    {
+                        "emptyDir": {
+                            "medium": "Memory",
+                            "sizeLimit": "1Gi"
+                        },
+                        "name": "pg-shm"
+                    },
+                    {
+                        "emptyDir": {
+                            "sizeLimit": "1Gi"
+                        },
+                        "name": "pg-tmp"
+                    },
+                    {
+                        "emptyDir": {
+                            "sizeLimit": "2Gi"
+                        },
+                        "name": "worker-tmp"
+                    }
+                ]
+            }
+        },
+        "ttlSecondsAfterFinished": 3600
+    },
+    "status": {
+        "active": 1,
+        "ready": 1,
+        "startTime": "2026-10-14T09:00:05Z",
+        "terminating": 0,
+        "uncountedTerminatedPods": {}
+    }
+}

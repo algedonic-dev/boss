@@ -67,6 +67,7 @@ const STAMPING_DOORS: &[&str] = &[
     "RelayClient",
     "machine_token::Client",
     "machine_token::BlockingClient",
+    "BlockingHttp",
     // boss-cli's one constructor of a `machine_token::Client` (and
     // `machine_client_with`), which every boss verb builds its client by.
     "sor_client::machine_client",

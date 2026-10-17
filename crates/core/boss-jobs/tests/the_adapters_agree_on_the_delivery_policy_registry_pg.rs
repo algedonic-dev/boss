@@ -67,6 +67,7 @@ boss_testing::adapters_agree! {
     cases {
         a_fresh_registry_holds_no_suite_policy,
         a_publish_lands_active_served_and_read_back_whole,
+        queue_owner_and_channels_survive_the_same_publication,
         a_version_bump_retires_the_prior_row_and_keeps_it_readable_by_version,
         a_publish_not_above_the_newest_is_a_conflict_and_writes_nothing,
         each_name_is_its_own_lineage,
@@ -103,7 +104,9 @@ fn row(name: &str, version: i32) -> DeliveryPolicyRow {
         skip_reason_file_budget: 96,
         blip_cause_budget: 80,
         ci_host_floor_gb: 40,
+        gate_queue_owner: boss_jobs::delivery::legacy_gate_queue_owner(),
         gate_max_concurrent: 3,
+        channels: serde_json::Value::Null,
     }
 }
 
@@ -120,7 +123,9 @@ fn ones(name: &str) -> DeliveryPolicyRow {
         skip_reason_file_budget: 1,
         blip_cause_budget: 1,
         ci_host_floor_gb: 1,
+        gate_queue_owner: boss_jobs::delivery::legacy_gate_queue_owner(),
         gate_max_concurrent: 1,
+        channels: serde_json::Value::Null,
     }
 }
 
@@ -203,6 +208,34 @@ async fn a_fresh_registry_holds_no_suite_policy<P: Policies>(p: &P, adapter: &st
 /// clock over the declaration's own status and `created_at`; the write
 /// answers the row it wrote, the lineage reads that row back whole, and
 /// the conductor's two reads serve it column for column.
+async fn queue_owner_and_channels_survive_the_same_publication<P: Policies>(p: &P, adapter: &str) {
+    let mut policy = row("suite-owner-channels", 1);
+    policy.gate_queue_owner = "resident".into();
+    policy.gate_max_concurrent = 4;
+    policy.channels = serde_json::json!({"enabled": false, "marker": "both-fields-retained"});
+    let want = written(policy.clone(), at(12, 0));
+    assert_eq!(
+        publish(p, policy.clone(), at(12, 0))
+            .await
+            .expect("publish both fields"),
+        want,
+        "{adapter}"
+    );
+    assert_eq!(
+        in_force(p, &policy.name).await,
+        Some(policy.clone()),
+        "{adapter}"
+    );
+    assert_eq!(pinned(p, &policy.name, 1).await, Some(policy), "{adapter}");
+    assert_eq!(
+        p.live_versions("suite-owner-channels")
+            .await
+            .expect("whole lineage"),
+        vec![want],
+        "{adapter}"
+    );
+}
+
 async fn a_publish_lands_active_served_and_read_back_whole<P: Policies>(p: &P, adapter: &str) {
     let now = at(12, 0);
     let want = written(row("suite-one", 1), now);
@@ -439,6 +472,13 @@ async fn the_policy_check_is_the_tables_check() {
         if name == "delivery_policy_status_check" {
             continue;
         }
+        if name == "delivery_policy_gate_queue_owner_check" {
+            assert_eq!(
+                def,
+                "CHECK ((gate_queue_owner = ANY (ARRAY['legacy'::text, 'resident'::text])))"
+            );
+            continue;
+        }
         let column = def
             .strip_prefix("CHECK ((")
             .and_then(|d| d.strip_suffix(" > 0))"))
@@ -466,6 +506,16 @@ async fn the_policy_check_is_the_tables_check() {
             budgets()
                 .into_iter()
                 .map(|c| with(row("edge-max", 1), c, i32::MAX)),
+        )
+        .chain(
+            ["legacy", "resident", "", "unknown", "RESIDENT"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, owner)| {
+                    let mut candidate = row(&format!("edge-owner-{i}"), 1);
+                    candidate.gate_queue_owner = owner.to_owned();
+                    candidate
+                }),
         );
     let mut disagree = Vec::new();
     for r in corpus {
@@ -492,8 +542,8 @@ async fn table_admits(pool: &sqlx::PgPool, r: &DeliveryPolicyRow) -> bool {
     let got = sqlx::query(
         "INSERT INTO delivery_policy (name, version, status, max_red_trains, stall_hours, \
          consist_budget_secs, consist_output_budget, consist_files_named, \
-         skip_reason_file_budget, blip_cause_budget, ci_host_floor_gb, gate_max_concurrent) \
-         VALUES ($1, 1, 'active', $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+         skip_reason_file_budget, blip_cause_budget, ci_host_floor_gb, gate_max_concurrent, gate_queue_owner) \
+         VALUES ($1, 1, 'active', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(&r.name)
     .bind(r.max_red_trains)
@@ -505,6 +555,7 @@ async fn table_admits(pool: &sqlx::PgPool, r: &DeliveryPolicyRow) -> bool {
     .bind(r.blip_cause_budget)
     .bind(r.ci_host_floor_gb)
     .bind(r.gate_max_concurrent)
+    .bind(&r.gate_queue_owner)
     .execute(&mut *tx)
     .await;
     tx.rollback().await.expect("rollback");

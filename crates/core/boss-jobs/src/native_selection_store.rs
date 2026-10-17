@@ -7,6 +7,71 @@ use crate::station_claim::{
 use sqlx::{PgPool, Postgres, Transaction};
 use std::sync::Arc;
 
+/// Test evidence survives successful-output capture and future cancellation.
+#[cfg(test)]
+pub(crate) struct SelectionPhase {
+    phase: String,
+    ingress: std::time::Instant,
+    began: std::time::Instant,
+    finished: bool,
+    sink: Arc<dyn Fn(serde_json::Value) + Send + Sync>,
+}
+
+#[cfg(test)]
+impl SelectionPhase {
+    pub(crate) fn start(phase: String, ingress: std::time::Instant) -> Self {
+        Self::start_to(
+            phase,
+            ingress,
+            Arc::new(|record| {
+                use std::io::Write;
+                // A single bounded write avoids splicing libtest stdout into JSON.
+                let line = format!("selection_trace {record}\n");
+                let _ = std::io::stderr().lock().write_all(line.as_bytes());
+            }),
+        )
+    }
+    fn start_to(
+        phase: String,
+        ingress: std::time::Instant,
+        sink: Arc<dyn Fn(serde_json::Value) + Send + Sync>,
+    ) -> Self {
+        let trace = Self {
+            phase,
+            ingress,
+            began: std::time::Instant::now(),
+            finished: false,
+            sink,
+        };
+        trace.write("start");
+        trace
+    }
+    fn write(&self, event: &str) {
+        let record = serde_json::json!({
+            "phase": self.phase,
+            "ingress": format!("{:?}", self.ingress),
+            "operation": format!("{}@{:?}", self.phase, self.began),
+            "event": event,
+            "elapsed_us": self.began.elapsed().as_micros(),
+            "ingress_elapsed_us": self.ingress.elapsed().as_micros(),
+        });
+        (self.sink)(record);
+    }
+    pub(crate) fn finish(&mut self, outcome: &str) {
+        self.write(outcome);
+        self.finished = true;
+    }
+}
+
+#[cfg(test)]
+impl Drop for SelectionPhase {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.write("cancelled");
+        }
+    }
+}
+
 /// The shared policy adapter consumes the caller's actual connection and
 /// absolute ingress budget; it cannot acquire a second pool or reset time.
 struct SelectionStatementRefresh(boss_events::statement_budget::StatementBudget);
@@ -52,27 +117,62 @@ impl SelectionDeadline {
     }
     /// Dropping this future cancels pre-dispatch work and drops its transaction;
     /// no detached task retains permission to mutate after expiration.
-    pub async fn before_dispatch<T>(
+    #[track_caller]
+    pub fn before_dispatch<T>(
         &self,
         work: impl std::future::Future<Output = Result<T, JobsError>>,
-    ) -> Result<T, JobsError> {
-        self.remaining()?;
-        tokio::time::timeout_at(self.0, work).await.map_err(|_| {
-            JobsError::SelectionConflict(
-                "selection ingress deadline expired before commit dispatch".into(),
-            )
-        })?
+    ) -> impl std::future::Future<Output = Result<T, JobsError>> {
+        let deadline = *self;
+        #[cfg(test)]
+        let caller = std::panic::Location::caller();
+        async move {
+            #[cfg(test)]
+            let mut trace = SelectionPhase::start(
+                format!("pre_dispatch@{caller}"),
+                deadline.0.into_std() - crate::station_claim::SELECTION_PRE_COMMIT_BUDGET,
+            );
+            deadline.remaining()?;
+            let result = tokio::time::timeout_at(deadline.0, work)
+                .await
+                .map_err(|_| {
+                    JobsError::SelectionConflict(
+                        "selection ingress deadline expired before commit dispatch".into(),
+                    )
+                })
+                .and_then(|result| result);
+            #[cfg(test)]
+            trace.finish(if result.is_ok() { "returned" } else { "error" });
+            result
+        }
     }
     pub fn sql_budget(&self) -> boss_events::statement_budget::StatementBudget {
         boss_events::statement_budget::StatementBudget::until(self.0)
     }
-    pub async fn constrain_sql(&self, tx: &mut Transaction<'_, Postgres>) -> Result<(), JobsError> {
-        self.sql_budget()
-            .refresh(tx)
-            .await
-            .map_err(JobsError::Storage)?;
-        self.remaining()?;
-        Ok(())
+    #[track_caller]
+    pub fn constrain_sql<'a, 'c>(
+        &self,
+        tx: &'a mut Transaction<'c, Postgres>,
+    ) -> impl std::future::Future<Output = Result<(), JobsError>> + 'a {
+        let deadline = *self;
+        #[cfg(test)]
+        let caller = std::panic::Location::caller();
+        async move {
+            #[cfg(test)]
+            let mut trace = SelectionPhase::start(
+                format!("sql_refresh@{caller}"),
+                deadline.0.into_std() - crate::station_claim::SELECTION_PRE_COMMIT_BUDGET,
+            );
+            let result = deadline
+                .sql_budget()
+                .refresh(tx)
+                .await
+                .map_err(JobsError::Storage);
+            #[cfg(test)]
+            trace.finish(if result.is_ok() { "returned" } else { "error" });
+            result?;
+            deadline.remaining()?;
+            Ok(())
+        }
     }
 }
 
@@ -797,6 +897,39 @@ async fn lock_policy_rows_in(tx: &mut Transaction<'_, Postgres>) -> Result<(), J
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn phase_evidence_keeps_original_ingress_and_names_cancelled_work() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let sink: Arc<dyn Fn(serde_json::Value) + Send + Sync> = Arc::new(move |record| {
+            captured.lock().unwrap().push(record);
+        });
+        let ingress = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        let pending_sink = sink.clone();
+        let mut pending = Box::pin(async move {
+            let mut trace = SelectionPhase::start_to("pool.acquire".into(), ingress, pending_sink);
+            std::future::pending::<()>().await;
+            trace.finish("returned");
+        });
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        drop(pending);
+        let mut returned = SelectionPhase::start_to("station.read".into(), ingress, sink);
+        returned.finish("returned");
+        drop(returned);
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0]["phase"], "pool.acquire");
+        assert_eq!(records[0]["event"], "start");
+        assert_eq!(records[1]["event"], "cancelled");
+        assert_eq!(records[0]["operation"], records[1]["operation"]);
+        assert_eq!(records[2]["phase"], "station.read");
+        assert_eq!(records[3]["event"], "returned");
+        for record in records.iter() {
+            assert_eq!(record["ingress"], format!("{ingress:?}"));
+            assert!(record["ingress_elapsed_us"].as_u64().unwrap() >= 2_000_000);
+        }
+    }
+
     struct DelayedPolicyRefresh {
         budget: SelectionStatementRefresh,
         calls: std::sync::atomic::AtomicUsize,
@@ -951,6 +1084,11 @@ mod tests {
         context: crate::station_claim::SelectionContext,
     }
     async fn native_claim_fixture() -> NativeClaimFixture {
+        native_claim_fixture_with_preparation_delay(std::time::Duration::ZERO).await
+    }
+    async fn native_claim_fixture_with_preparation_delay(
+        preparation_delay: std::time::Duration,
+    ) -> NativeClaimFixture {
         use crate::agents::{AgentsRegistry, PgAgents};
         use crate::{JobsRepository, StationRegistry, WorkflowRegistry};
         use boss_policy_client::{Action, PolicyRepository, PolicyRule, Resource, Scope};
@@ -1050,10 +1188,7 @@ mod tests {
             .await
             .unwrap();
         let request_id = uuid::Uuid::new_v4();
-        let observation = store
-            .observe_authority(resolved_ingress().await, request_id, "fixture")
-            .await
-            .unwrap();
+        tokio::time::sleep(preparation_delay).await;
         let active_workflows = crate::PgWorkflows::new(db.pool.clone())
             .list_active(None)
             .await
@@ -1061,6 +1196,14 @@ mod tests {
             .into_iter()
             .map(|row| (row.kind.clone(), row))
             .collect();
+        let validated_job = repo.get_job(&job.id).await.unwrap().unwrap();
+        let validated_step = repo.get_step(&step.id).await.unwrap().unwrap();
+        // Test-row preparation is not part of the request under test. Begin
+        // its unchanged ingress budget after the fixture's reads complete.
+        let observation = store
+            .observe_authority(resolved_ingress().await, request_id, "fixture")
+            .await
+            .unwrap();
         let context = crate::station_claim::SelectionContext {
             native_authority: Some(Arc::new(observation)),
             actor_observation: None,
@@ -1070,8 +1213,8 @@ mod tests {
             station,
             scope: crate::port::JobScope::All,
             active_workflows,
-            validated_job: repo.get_job(&job.id).await.unwrap().unwrap(),
-            validated_step: repo.get_step(&step.id).await.unwrap().unwrap(),
+            validated_job,
+            validated_step,
         };
         NativeClaimFixture {
             db,
@@ -1081,6 +1224,28 @@ mod tests {
             policy,
             context,
         }
+    }
+    #[tokio::test]
+    async fn fixture_preparation_does_not_spend_the_native_claim_ingress_budget() {
+        use crate::JobsRepository;
+        let NativeClaimFixture {
+            db: _db,
+            repo,
+            stamp,
+            context,
+            ..
+        } = native_claim_fixture_with_preparation_delay(
+            crate::station_claim::SELECTION_PRE_COMMIT_BUDGET + std::time::Duration::from_secs(1),
+        )
+        .await;
+        let result = repo
+            .claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            crate::station_claim::SelectionResult::Claimed { .. }
+        ));
     }
     #[tokio::test]
     async fn direct_native_original_replay_requires_current_read_authority() {
@@ -1488,12 +1653,12 @@ mod tests {
         }).await.unwrap();
         let rule_id =
             boss_policy_client::types::rule_id("platform-admin", &Resource::step(), Action::Update);
-        let writer = tokio::spawn(async move {
+        let mut writer = tokio::spawn(async move {
             policy
                 .deactivate_rule(&rule_id, "retire-during-native-claim")
                 .await
         });
-        wait_for_actual_writer(&db.pool, "policy_rules").await;
+        wait_for_actual_writer(&db.pool, "policy_rules", &mut writer).await;
         assert!(
             !writer.is_finished(),
             "real policy writer must conflict with the joined claim, not copied observations"
@@ -2316,6 +2481,7 @@ mod tests {
     struct SlowNativeStations {
         inner: crate::PgStations,
         slow: bool,
+        entered: Arc<tokio::sync::Notify>,
     }
     #[async_trait::async_trait]
     impl crate::stations::StationRegistry for SlowNativeStations {
@@ -2324,6 +2490,7 @@ mod tests {
             name: &str,
         ) -> Result<crate::stations::StationSpec, crate::stations::StationError> {
             if self.slow {
+                self.entered.notify_one();
                 tokio::time::sleep(std::time::Duration::from_secs(6)).await;
             }
             self.inner.get_active(name).await
@@ -2392,6 +2559,17 @@ mod tests {
         native_http_control(true, true, false, false).await;
     }
     #[tokio::test]
+    async fn native_http_slow_read_keeps_its_ingress_cut_after_observer_descheduling() {
+        native_http_control_with_pause_delay(
+            true,
+            true,
+            false,
+            false,
+            NativeHttpAdversity::ObserverPause(std::time::Duration::from_millis(900)),
+        )
+        .await;
+    }
+    #[tokio::test]
     async fn native_http_copies_actual_budget_query_inputs_and_keeps_over_budget_advisory() {
         native_http_control(true, false, true, false).await;
     }
@@ -2400,11 +2578,55 @@ mod tests {
     {
         native_http_control(true, false, true, true).await;
     }
+    #[tokio::test]
+    async fn native_http_budget_fixture_wait_before_admission_does_not_spend_ingress() {
+        native_http_control_with_pause_delay(
+            true,
+            false,
+            true,
+            false,
+            NativeHttpAdversity::FixturePreparation(std::time::Duration::from_secs(6)),
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn native_http_budget_actual_sql_wait_expires_without_a_claim() {
+        native_http_control_with_pause_delay(
+            true,
+            false,
+            true,
+            false,
+            NativeHttpAdversity::BudgetInputWait,
+        )
+        .await;
+    }
+    enum NativeHttpAdversity {
+        None,
+        ObserverPause(std::time::Duration),
+        FixturePreparation(std::time::Duration),
+        BudgetInputWait,
+    }
     async fn native_http_control(
         external_allow: bool,
         slow_station: bool,
         with_budget: bool,
         budget_unavailable: bool,
+    ) {
+        native_http_control_with_pause_delay(
+            external_allow,
+            slow_station,
+            with_budget,
+            budget_unavailable,
+            NativeHttpAdversity::None,
+        )
+        .await;
+    }
+    async fn native_http_control_with_pause_delay(
+        external_allow: bool,
+        slow_station: bool,
+        with_budget: bool,
+        budget_unavailable: bool,
+        adversity: NativeHttpAdversity,
     ) {
         use crate::JobsRepository;
         use boss_core::{port::EventBus, publisher::DomainPublisher};
@@ -2456,10 +2678,12 @@ mod tests {
         } else {
             builder.build()
         });
+        let slow_station_entered = Arc::new(tokio::sync::Notify::new());
         let station_registry: Arc<dyn crate::stations::StationRegistry> =
             Arc::new(SlowNativeStations {
                 inner: crate::PgStations::new(db.pool.clone()),
                 slow: slow_station,
+                entered: slow_station_entered.clone(),
             });
         let app = crate::http::router(crate::http::JobsApiState {
             stations: Some(station_registry),
@@ -2477,6 +2701,18 @@ mod tests {
             )
         });
         let dir = boss_testing::scratch_dir("native-http-selection-ingress");
+        let app = if slow_station {
+            // Make an actual earlier preparation wait visible: the slow port
+            // must inherit ingress's remaining budget, not receive five more.
+            app.layer(axum::middleware::from_fn(
+                |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    next.run(request).await
+                },
+            ))
+        } else {
+            app
+        };
         boss_testing::write_file(&dir.join("forge.current"), "native-http-fixture-key");
         let app = crate::runner_credential::mount(app, dir);
         let gate = Arc::new(boss_core::machine_gate::MachineGate::new(
@@ -2531,33 +2767,90 @@ mod tests {
             );
         }
         let user = boss_policy_client::User::service("forged-header-owner");
+        if let NativeHttpAdversity::FixturePreparation(delay) = adversity {
+            tokio::time::sleep(delay).await;
+        }
+        let mut budget_blocker = if matches!(adversity, NativeHttpAdversity::BudgetInputWait) {
+            let mut tx = db.pool.begin().await.unwrap();
+            sqlx::query("LOCK TABLE agent_runs IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            Some(tx)
+        } else {
+            None
+        };
         let began = tokio::time::Instant::now();
-        let response = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/api/stations/fixture/claim-next")
-                    .header(crate::runner_credential::HEADER, "native-http-fixture-key")
-                    .header("x-boss-user", serde_json::to_string(&user).unwrap())
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(
-                        serde_json::json!({"request_id": context.request_id}).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let request = app.clone().oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/stations/fixture/claim-next")
+                .header(crate::runner_credential::HEADER, "native-http-fixture-key")
+                .header("x-boss-user", serde_json::to_string(&user).unwrap())
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"request_id": context.request_id}).to_string(),
+                ))
+                .unwrap(),
+        );
+        tokio::pin!(request);
+        let response = if slow_station {
+            tokio::select! {
+                result = &mut request => panic!(
+                    "native HTTP fixture ended before its slow port was exercised: {}",
+                    result.unwrap().status()
+                ),
+                () = slow_station_entered.notified() => {}
+            }
+            // Preparation has already spent real ingress time. Advancing
+            // another five seconds would test a freshly restarted budget.
+            if let NativeHttpAdversity::ObserverPause(delay) = adversity {
+                std::thread::sleep(delay);
+            }
+            tokio::time::pause();
+            // Freeze the observer first: a host deschedule between reading
+            // remaining and pausing must not be counted a second time when
+            // the virtual clock advances to the original ingress boundary.
+            let remaining =
+                crate::station_claim::SELECTION_PRE_COMMIT_BUDGET.saturating_sub(began.elapsed());
+            tokio::time::advance(remaining).await;
+            request.await.unwrap()
+        } else if budget_blocker.is_some() {
+            // Both the real HTTP request and PostgreSQL must be running;
+            // observing a pending task alone does not establish its SQL wait.
+            loop {
+                tokio::select! {
+                    result = &mut request => panic!(
+                        "native budget request ended before its SQL wait: {}",
+                        result.unwrap().status()
+                    ),
+                    waiting = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND relation = 'agent_runs'::regclass AND NOT granted)").fetch_one(&db.pool) => {
+                        if waiting.unwrap() { break; }
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+            request.await.unwrap()
+        } else {
+            request.await.unwrap()
+        };
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 65536)
             .await
             .unwrap();
-        if slow_station {
-            assert!(
-                began.elapsed() < std::time::Duration::from_millis(5800),
-                "native preparation must cancel its real port read within original five seconds, elapsed {:?}",
-                began.elapsed()
-            );
+        if slow_station || budget_blocker.is_some() {
+            let elapsed = began.elapsed();
+            if slow_station {
+                tokio::time::resume();
+                assert!(
+                    elapsed < std::time::Duration::from_millis(5800),
+                    "native preparation must cancel its real port read within original five seconds, elapsed {:?}",
+                    elapsed
+                );
+            }
+            if let Some(blocker) = budget_blocker.take() {
+                blocker.rollback().await.unwrap();
+            }
             assert_eq!(status, axum::http::StatusCode::CONFLICT);
             assert!(String::from_utf8_lossy(&body).contains("deadline"));
             let repo = crate::PgJobs::new(db.pool.clone());
@@ -2579,7 +2872,8 @@ mod tests {
         assert_eq!(
             status,
             axum::http::StatusCode::CREATED,
-            "actual authenticated HTTP selection must reach the configured native transaction: {}",
+            "actual authenticated HTTP selection must reach the configured native transaction; ingress elapsed {:?}: {}",
+            began.elapsed(),
             String::from_utf8_lossy(&body)
         );
         if with_budget {
@@ -3178,12 +3472,12 @@ mod tests {
             "calendar",
             boss_core::actor::ActorId::automation("calendar-fixture"),
         );
-        let writer = tokio::spawn(async move {
+        let mut writer = tokio::spawn(async move {
             calendar
                 .reserve_at(request, writer_stamp.timestamp, &writer_stamp)
                 .await
         });
-        wait_for_actual_writer(&db.pool, "calendar_reservations").await;
+        wait_for_actual_writer(&db.pool, "calendar_reservations", &mut writer).await;
         assert!(
             !writer.is_finished(),
             "real calendar write must conflict with the selector's actual owner"
@@ -3460,26 +3754,43 @@ mod tests {
     async fn prior_ingress_wait_is_not_a_new_repository_budget() {
         let db = boss_testing::TestDb::new().await;
         let store = NativeSelectionStore::new(db.pool.clone());
-        let deadline = SelectionDeadline::at_ingress();
-        tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
         let mut writer = db.pool.begin().await.unwrap();
         sqlx::query("LOCK TABLE workflows IN ACCESS EXCLUSIVE MODE")
             .execute(&mut *writer)
             .await
             .unwrap();
-        let started = std::time::Instant::now();
-        let result = store
-            .acquire_selection_before(
-                &store,
-                uuid::Uuid::new_v4(),
-                "emp-worker",
-                "fixture",
-                deadline,
-            )
-            .await;
+        // Keep the paused timer from auto-advancing while real PostgreSQL
+        // answers. Arrival at its blocked owner lock is observed explicitly.
+        let keep_clock = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::time::pause();
+        let deadline = SelectionDeadline::at_ingress();
+        tokio::time::advance(std::time::Duration::from_millis(4500)).await;
+        let started = tokio::time::Instant::now();
+        let mut acquiring = tokio::spawn(async move {
+            store
+                .acquire_selection_before(
+                    &store,
+                    uuid::Uuid::new_v4(),
+                    "emp-worker",
+                    "fixture",
+                    deadline,
+                )
+                .await
+        });
+        wait_for_actual_writer(&db.pool, "workflows", &mut acquiring).await;
+        tokio::time::advance(std::time::Duration::from_millis(501)).await;
+        keep_clock.abort();
+        assert!(keep_clock.await.unwrap_err().is_cancelled());
+        let result = acquiring.await.unwrap();
+        let elapsed = started.elapsed();
+        tokio::time::resume();
         writer.rollback().await.unwrap();
         assert!(result.is_err());
-        assert!(started.elapsed() < std::time::Duration::from_millis(1200));
+        assert!(elapsed < std::time::Duration::from_millis(1200));
     }
     #[tokio::test]
     async fn real_automation_declaration_waits_for_the_native_actor_fence() {
@@ -3504,18 +3815,7 @@ mod tests {
                 .declare_automations(&[declared], &stamp)
                 .await
         });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(150), &mut writer)
-                .await
-                .is_err(),
-            "actual automation row declaration escaped the native actor fence"
-        );
-        let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND relation = 'automation_actors'::regclass AND NOT granted)")
-            .fetch_one(&db.pool).await.unwrap();
-        assert!(
-            waiting,
-            "the actual owning writer must conflict on its real table"
-        );
+        wait_for_actual_writer(&db.pool, "automation_actors", &mut writer).await;
         assert!(registry.list_automations().await.unwrap().is_empty());
         tx.rollback().await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), writer)
@@ -3545,11 +3845,12 @@ mod tests {
             )
             .await
             .unwrap();
+            // The observer may be descheduled after the owner refreshes SQL.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let configured_ms: i64 = sqlx::query_scalar("SELECT (extract(epoch FROM current_setting('statement_timeout')::interval) * 1000)::bigint")
                 .fetch_one(&mut *tx).await.unwrap();
-            let remaining_ms = deadline.remaining().unwrap().as_millis() as i64;
             tx.rollback().await.unwrap();
-            (configured_ms, remaining_ms)
+            configured_ms
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -3560,25 +3861,38 @@ mod tests {
             }
         }).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        // The blocked owner cannot refresh until this lock is released. Sample
+        // that causal upper bound, not a later observer's scheduling instant.
+        let release_budget_ms = deadline.remaining().unwrap().as_millis() as i64;
         blocker.rollback().await.unwrap();
-        let (configured_ms, remaining_ms) = reading.await.unwrap();
+        let configured_ms = reading.await.unwrap();
         assert!(
-            configured_ms <= remaining_ms + 100,
-            "owning adapter retained {configured_ms}ms after its agents wait; ingress has {remaining_ms}ms left"
+            configured_ms <= release_budget_ms,
+            "owning adapter retained {configured_ms}ms after its agents wait; ingress had {release_budget_ms}ms before release"
         );
     }
     #[tokio::test]
     async fn later_owner_statements_use_the_remaining_ingress_budget() {
+        later_owner_statements_control(std::time::Duration::ZERO).await;
+    }
+    #[tokio::test]
+    async fn later_owner_statements_observe_a_descheduled_actual_owner() {
+        later_owner_statements_control(std::time::Duration::from_millis(2100)).await;
+    }
+    async fn later_owner_statements_control(arrival_delay: std::time::Duration) {
         let db = boss_testing::TestDb::new().await;
         let store = NativeSelectionStore::new(db.pool.clone());
-        let deadline = SelectionDeadline::at_ingress();
         let mut blocker = db.pool.begin().await.unwrap();
         sqlx::query("LOCK TABLE workflows IN ACCESS EXCLUSIVE MODE")
             .execute(&mut *blocker)
             .await
             .unwrap();
+        // Installing the test's blocker is fixture setup, before admission.
+        // The target's real owner wait still consumes its original budget.
+        let deadline = SelectionDeadline::at_ingress();
         let acquiring_store = store.clone();
-        let acquiring = tokio::spawn(async move {
+        let mut acquiring = tokio::spawn(async move {
+            tokio::time::sleep(arrival_delay).await;
             acquiring_store
                 .acquire_selection_before(
                     &acquiring_store,
@@ -3589,26 +3903,21 @@ mod tests {
                 )
                 .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND relation = 'workflows'::regclass AND NOT granted)")
-                    .fetch_one(&db.pool).await.unwrap();
-                if waiting { break; }
-                tokio::task::yield_now().await;
-            }
-        }).await.unwrap();
+        wait_for_actual_writer(&db.pool, "workflows", &mut acquiring).await;
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let release_budget_ms = deadline.remaining().unwrap().as_millis() as i64;
         blocker.rollback().await.unwrap();
         let mut tx = match acquiring.await.unwrap().unwrap() {
             NativeSelectionAcquisition::Fresh(tx) => tx,
             NativeSelectionAcquisition::Replayed(_) => panic!("no original receipt"),
         };
+        // Deliberately exercise a descheduled observer after the owner refreshed.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let configured_ms: i64 = sqlx::query_scalar("SELECT (extract(epoch FROM current_setting('statement_timeout')::interval) * 1000)::bigint")
             .fetch_one(&mut *tx).await.unwrap();
-        let remaining_ms = deadline.remaining().unwrap().as_millis() as i64;
         assert!(
-            configured_ms <= remaining_ms + 100,
-            "later statement retained {configured_ms}ms after a real owner wait; ingress only has {remaining_ms}ms left"
+            configured_ms <= release_budget_ms,
+            "later statement retained {configured_ms}ms after a real owner wait; ingress had {release_budget_ms}ms before release"
         );
         tx.rollback().await.unwrap();
     }
@@ -3821,19 +4130,7 @@ mod tests {
                 .publish(&[changed], PublishMode::Take, &stamp)
                 .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND relation = 'agents'::regclass AND NOT granted)").fetch_one(&db.pool).await.unwrap();
-                if waiting { break; }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        }).await.unwrap();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(150), &mut writer)
-                .await
-                .is_err(),
-            "actual agent registry writer entered during native actor fence"
-        );
+        wait_for_actual_writer(&db.pool, "agents", &mut writer).await;
         assert_eq!(
             registry
                 .list()
@@ -3889,7 +4186,7 @@ mod tests {
                 )
                 .await
         });
-        wait_for_actual_writer(&db.pool, "workflows").await;
+        wait_for_actual_writer(&db.pool, "workflows", &mut writer).await;
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(150), &mut writer)
                 .await
@@ -3944,7 +4241,7 @@ mod tests {
                 )
                 .await
         });
-        wait_for_actual_writer(&db.pool, "stations").await;
+        wait_for_actual_writer(&db.pool, "stations", &mut writer).await;
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(150), &mut writer)
                 .await
@@ -3973,14 +4270,62 @@ mod tests {
             1
         );
     }
-    async fn wait_for_actual_writer(pool: &PgPool, table: &str) {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND relation = $1::regclass AND NOT granted)").bind(table).fetch_one(pool).await.unwrap();
-                if waiting { break; }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    #[tokio::test]
+    async fn a_delayed_owning_writer_is_observed_at_its_lock_not_a_scheduler_guess() {
+        let db = boss_testing::TestDb::new().await;
+        let store = NativeSelectionStore::new(db.pool.clone());
+        let tx = store
+            .begin_definition_actor_policy_fence_for(&store.clone())
+            .await
+            .unwrap();
+        let pool = db.pool.clone();
+        let mut writer = tokio::spawn(async move {
+            // The gate's competing binaries can delay arrival past the old
+            // two-second observation window without weakening a single lock.
+            tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+            sqlx::query("UPDATE stations SET name = name")
+                .execute(&pool)
+                .await
+                .unwrap();
+        });
+        wait_for_actual_writer(&db.pool, "stations", &mut writer).await;
+        assert!(!writer.is_finished());
+        tx.rollback().await.unwrap();
+        writer.await.unwrap();
+    }
+    #[tokio::test]
+    #[should_panic(expected = "writer finished before its native fence was observed")]
+    async fn an_escaped_writer_fails_the_arrival_barrier_instead_of_waiting_forever() {
+        let db = boss_testing::TestDb::new().await;
+        let pool = db.pool.clone();
+        let mut writer = tokio::spawn(async move {
+            sqlx::query("UPDATE stations SET name = name")
+                .execute(&pool)
+                .await
+                .unwrap();
+        });
+        wait_for_actual_writer(&db.pool, "stations", &mut writer).await;
+    }
+    async fn wait_for_actual_writer<T>(
+        pool: &PgPool,
+        table: &str,
+        writer: &mut tokio::task::JoinHandle<T>,
+    ) {
+        // Arrival is a PostgreSQL fact, not a deadline on the test runner's
+        // scheduler. A writer that escapes or fails before reaching its lock
+        // fails this barrier immediately instead of becoming a vacuous pass.
+        loop {
+            tokio::select! {
+                _ = &mut *writer => panic!("actual {table} writer finished before its native fence was observed"),
+                waiting = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND relation = $1::regclass AND NOT granted)").bind(table).fetch_one(pool) => {
+                    if waiting.unwrap() {
+                        assert!(!writer.is_finished(), "actual {table} writer escaped its observed fence");
+                        return;
+                    }
+                }
             }
-        }).await.unwrap();
+            tokio::task::yield_now().await;
+        }
     }
     #[tokio::test]
     async fn native_transaction_reads_the_same_complete_active_definitions_as_the_owning_ports() {
@@ -4042,7 +4387,7 @@ mod tests {
                 )
                 .await
         });
-        wait_for_actual_writer(&db.pool, "jobs").await;
+        wait_for_actual_writer(&db.pool, "jobs", &mut writer).await;
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(150), &mut writer)
                 .await

@@ -312,6 +312,7 @@ export type ActiveGate = Readonly<{
 export type QueuedGate = Readonly<{
   branch: string;
   packet_id: string;
+  next_owner?: string | null;
   /** When the place in line was taken (RFC3339) — the ordering key. */
   queued_at: string;
   /** Place in line, 1-based, oldest first. */
@@ -441,6 +442,9 @@ export type YardStatus = Readonly<{
    *  row stops listing them. Empty on a server that predates it. */
   held_cars: readonly HeldCar[];
   gates: Gates;
+  gate_queue_supervision?: Readonly<{ state: 'completed' | 'unknown'; reason: string | null;
+    last_observed?: string | null;
+    retained?: readonly Readonly<{ packet: string; reason: string }>[] }>;
   garage: readonly GaragedCar[];
   /** The gate exit. Empty on a server that predates the reading. */
   limbo: readonly LimboCar[];
@@ -717,11 +721,42 @@ function parseActiveGate(raw: unknown): ActiveGate {
   };
 }
 
+function parseGateSupervision(raw: unknown): NonNullable<YardStatus['gate_queue_supervision']> {
+  const o = typeof raw === 'object' && raw !== null ? raw as Record<string, unknown> : {};
+  const object = (value: unknown): Record<string, unknown> => typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
+  const retained = object(object(o.observation).report).retained;
+  const historical = object(o.last_successful);
+  const stamp = object(object(object(historical.record).detail).observations).gate_queue;
+  const observed = object(stamp).observed_at;
+  return {
+    state: o.contract_version === 1 && o.state === 'completed' ? 'completed' : 'unknown',
+    reason: typeof o.reason === 'string' ? o.reason : null,
+    last_observed: o.last_successful === undefined ? undefined
+      : historical.state === 'observed' && typeof observed === 'string' && Number.isFinite(Date.parse(observed)) ? observed : null,
+    retained: Array.isArray(retained) ? retained.flatMap((value: unknown) => {
+      const row = object(value);
+      return typeof row.packet === 'string' && typeof row.reason === 'string'
+        ? [{ packet: row.packet, reason: row.reason }] : [];
+    }) : [],
+  };
+}
+
+export function gateSupervisionLabel(reading: YardStatus['gate_queue_supervision'], packet?: string): string {
+  if (reading?.state === 'completed') {
+    const reasons = reading.retained?.filter(row => row.packet === packet).map(row => row.reason);
+    return reasons?.length ? `retained: ${reasons.join('; ')}` : 'supervision observed';
+  }
+  const unavailable = reading?.reason ? `supervision unknown: ${reading.reason}` : 'supervision unknown';
+  return reading?.last_observed === undefined ? unavailable
+    : `${unavailable} · last observed ${reading.last_observed ?? 'unknown'}`;
+}
+
 function parseQueuedGate(raw: unknown): QueuedGate {
   const o = asObject(raw, 'queued gate');
   return {
     branch: String(o.branch ?? ''),
     packet_id: String(o.packet_id ?? ''),
+    next_owner: typeof o.next_owner === 'string' && o.next_owner.length > 0 ? o.next_owner : null,
     queued_at: String(o.queued_at ?? ''),
     position: Number(o.position ?? 0),
     // A wait the server could not derive stays unknown — never zero,
@@ -855,6 +890,7 @@ export function parseYardStatus(raw: unknown): YardStatus {
     held: Array.isArray(o.held) ? o.held.map(parseHeldGreen) : [],
     held_cars: Array.isArray(o.held_cars) ? o.held_cars.map(parseHeldCar) : [],
     gates: parseGates(o.gates),
+    gate_queue_supervision: parseGateSupervision(o.gate_queue_supervision),
     garage: Array.isArray(o.garage) ? o.garage.map(parseGaragedCar) : [],
     limbo: Array.isArray(o.limbo) ? o.limbo.map(parseLimboCar) : [],
     policy: parsePolicy(o.policy),
@@ -954,9 +990,9 @@ export type GateSlot =
  *  free, which is a real state: `boss gate` queues on the count it saw
  *  and a slot can free before its next poll. */
 export function queueLabel(q: QueuedGate): string {
-  const parts = [`#${q.position} in line`];
+  const parts = [q.position > 0 ? `#${q.position} in line` : 'position unknown'];
   if (q.waiting_seconds !== null) parts.push(`waiting ${journeyText(q.waiting_seconds)}`);
-  if (q.estimated_wait_seconds !== null) {
+  if (q.position > 0 && q.estimated_wait_seconds !== null) {
     parts.push(
       q.estimated_wait_seconds === 0
         ? 'a slot is free now'

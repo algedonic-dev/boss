@@ -54,6 +54,7 @@ pub mod jobs_complete_step_matching;
 pub mod jobs_flight_overdue;
 pub mod jobs_receipt_overdue;
 pub mod jobs_reclaim_abandoned_step;
+pub mod jobs_release_on_review;
 pub mod jobs_retract_matching;
 pub mod jobs_run_car_probes;
 pub mod jobs_subjob_resolve;
@@ -65,6 +66,7 @@ pub mod ledger_tax_remit;
 #[cfg(test)]
 mod listing_stub;
 pub mod machine_gate_asked_alarm;
+pub mod managed_collector_tls;
 pub mod messages_expire_for_job;
 pub mod messages_expire_notices;
 pub mod messages_notify;

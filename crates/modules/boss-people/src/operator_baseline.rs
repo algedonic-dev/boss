@@ -601,6 +601,120 @@ pub fn seed(
 mod tests {
     use super::*;
 
+    /// R9/S1: observe the actual hire POST, not the client's defaults or
+    /// a serialized seed row. Its caller must be the baseline actor even
+    /// though the receiving people port has no policy check on this path.
+    #[test]
+    fn the_actual_baseline_hire_post_carries_its_caller() {
+        use std::io::{Read, Write};
+        // The real seed resolves an email before posting. A child owns
+        // its fake email without changing parallel tests' environment
+        // or consulting an installed authentication file.
+        if std::env::var_os("BOSS_BASELINE_HEADER_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "operator_baseline::tests::the_actual_baseline_hire_post_carries_its_caller",
+                    "--nocapture",
+                ])
+                .env("BOSS_BOOTSTRAP_ADMIN_EMAIL", "audit@boss.example")
+                .env("BOSS_BASELINE_HEADER_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fake-only hire subprocess failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "the exact child test must execute, never an empty passing selection"
+            );
+            return;
+        }
+        assert_eq!(
+            std::env::var("BOSS_BOOTSTRAP_ADMIN_EMAIL").unwrap(),
+            "audit@boss.example",
+            "this focused test must run with its fake-only email; never read an auth file"
+        );
+        let directory = boss_testing::scratch_dir("baseline-hire-caller");
+        boss_testing::create_dir(&directory);
+        let path = directory.join("operators.toml");
+        boss_testing::create_dir(&directory.join("seeds"));
+        boss_testing::write_file(
+            &directory.join("seeds/employees.json"),
+            r#"[{"email":"audit@boss.example"}]"#,
+        );
+        let employee = audit_only().hire.remove(0);
+        boss_testing::write_file(
+            &path,
+            &format!("[[hire]]\n{}", toml::to_string(&employee).unwrap()),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0u8; 4096];
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+                assert!(request.len() < 16384);
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            assert!(headers.starts_with("POST /api/people "));
+            let field = |name: &str| {
+                headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.trim().to_string())
+            };
+            let caller: serde_json::Value = serde_json::from_str(
+                &field("x-boss-user").expect("actual hire POST carries caller"),
+            )
+            .unwrap();
+            assert_eq!(caller["id"], "automation:operator-baseline");
+            assert_eq!(caller["role"], "platform-admin");
+            assert_eq!(caller["access_tier"], "operator");
+            assert_eq!(caller["department"], "it");
+            assert!(field("x-sim-origin").is_none());
+            let length: usize = field("content-length").unwrap().parse().unwrap();
+            while request.len() < header_end + length {
+                let mut chunk = [0u8; 4096];
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
+            assert_eq!(body["id"], "emp-audit");
+            socket
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let client = BlockingClient::unstamped(reqwest::blocking::Client::builder()).unwrap();
+        let result = seed(&client, &base, &path, Some(&directory));
+        server.join().unwrap();
+        let summary = result.unwrap();
+        assert_eq!(summary.inserted, 1);
+        assert_eq!(summary.skipped, 0);
+        assert!(matches!(
+            summary.injection,
+            Injection::DeclaredByTenant { .. }
+        ));
+    }
+
     /// The exact shape the gateway's local_auth writes, byte-for-byte
     /// from the playground's `/var/lib/boss/auth/credentials.toml`.
     /// This file read as valid UTF-8 and parsed fine in other TOML

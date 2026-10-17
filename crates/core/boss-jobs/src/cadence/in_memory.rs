@@ -72,6 +72,41 @@ impl InMemoryCadence {
 
 #[async_trait]
 impl CadenceRepository for InMemoryCadence {
+    async fn firing_history(
+        &self,
+        rule: &str,
+        observation_key: Option<&str>,
+        before: Option<(DateTime<Utc>, String)>,
+        limit: usize,
+    ) -> Result<Vec<NewFiring>, CadenceError> {
+        if !(1..=500).contains(&limit) {
+            return Err(CadenceError::BadRequest(
+                "history limit must be between 1 and 500".into(),
+            ));
+        }
+        let mut rows: Vec<_> = self
+            .firings
+            .read()
+            .await
+            .values()
+            .filter(|row| {
+                row.rule_name == rule
+                    && before.as_ref().is_none_or(|cursor| {
+                        (&row.fired_at, &row.firing_id) < (&cursor.0, &cursor.1)
+                    })
+                    && observation_key.is_none_or(|key| {
+                        row.detail
+                            .get("observations")
+                            .and_then(serde_json::Value::as_object)
+                            .is_some_and(|object| object.contains_key(key))
+                    })
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| (&b.fired_at, &b.firing_id).cmp(&(&a.fired_at, &a.firing_id)));
+        rows.truncate(limit);
+        Ok(rows)
+    }
     async fn active_rules(&self) -> Result<Vec<CadenceRuleRow>, CadenceError> {
         let mut out: Vec<CadenceRuleRow> = self
             .rules
@@ -102,6 +137,11 @@ impl CadenceRepository for InMemoryCadence {
                     .get("rc")
                     .and_then(serde_json::Value::as_i64)
                     .map(|v| v as i32),
+                observations: f
+                    .detail
+                    .get("observations")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned(),
                 board_decision: crate::board_decision::BoardDecision::of_detail(&f.detail),
             }))
     }
@@ -132,10 +172,12 @@ impl CadenceRepository for InMemoryCadence {
     ) -> Result<(), CadenceError> {
         let mut guard = self.firings.write().await;
         if let Some(f) = guard.get_mut(firing_id) {
-            // Mirrors `detail || $2` — merge, don't replace.
+            // Mirrors `(detail - 'observations') || $2`: an absent
+            // observation supersedes an earlier result on this firing.
             let patch = outcome.detail_patch();
             match (f.detail.as_object_mut(), patch.as_object()) {
                 (Some(map), Some(p)) => {
+                    map.remove("observations");
                     map.extend(p.iter().map(|(k, v)| (k.clone(), v.clone())));
                 }
                 // Unreachable through a claim — `claim_detail` lands only
@@ -245,6 +287,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn newest_unknown_or_missing_observation_supersedes_old_success() {
+        let repo = InMemoryCadence::default();
+        let old = firing("old", "queue");
+        repo.claim_firing(&old).await.unwrap();
+        let completed = serde_json::json!({"gate_queue":{"contract_version":1,"state":"completed","whole":[1,2,3]}});
+        let outcome: FiringOutcome = serde_json::from_value(
+            serde_json::json!({"rc":0,"runtime_secs":1,"observations":completed}),
+        )
+        .unwrap();
+        repo.record_outcome("old", &outcome).await.unwrap();
+        let mut newer = firing("new", "queue");
+        newer.fired_at += chrono::Duration::seconds(1);
+        repo.claim_firing(&newer).await.unwrap();
+        assert!(
+            repo.last_firing("queue")
+                .await
+                .unwrap()
+                .unwrap()
+                .observations
+                .is_none()
+        );
+        let unknown = serde_json::json!({"gate_queue":{"contract_version":1,"state":"unknown","reason":"native list unreadable"}});
+        let outcome: FiringOutcome = serde_json::from_value(
+            serde_json::json!({"rc":75,"runtime_secs":2,"observations":unknown}),
+        )
+        .unwrap();
+        repo.record_outcome("new", &outcome).await.unwrap();
+        let last = repo.last_firing("queue").await.unwrap().unwrap();
+        assert_eq!(last.firing_id, "new");
+        assert_eq!(last.rc, Some(75));
+        assert_eq!(serde_json::to_value(last.observations).unwrap(), unknown);
+        let absent: FiringOutcome =
+            serde_json::from_value(serde_json::json!({"rc":0,"runtime_secs":3})).unwrap();
+        repo.record_outcome("new", &absent).await.unwrap();
+        assert!(
+            repo.last_firing("queue")
+                .await
+                .unwrap()
+                .unwrap()
+                .observations
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn claim_is_exactly_once() {
         let repo = InMemoryCadence::default();
         let f = firing("cadence:board:2026-08-14T12:00Z", "board");
@@ -266,6 +353,7 @@ mod tests {
             &FiringOutcome {
                 rc: 0,
                 runtime_secs: 42,
+                observations: None,
                 board_decision: None,
             },
         )
@@ -309,6 +397,7 @@ mod tests {
             &FiringOutcome {
                 rc: -2,
                 runtime_secs: 9,
+                observations: None,
                 board_decision: Some(decision.clone()),
             },
         )

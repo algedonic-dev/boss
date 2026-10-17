@@ -1,6 +1,6 @@
 //! The platform step-plugin bundle (`infra/platform/step-plugins/`)
-//! preserves every column of migration history. Current declarations plus
-//! withdrawn historical fixtures describe those rows; only current declarations
+//! preserves every column of migration history. Immutable migrated and
+//! withdrawn fixtures describe those rows; only current declarations
 //! seed an empty registry. Withdrawal never retires an existing row.
 //!
 //! MEASURED 2026-09-18 on origin/main 6286857f (backlog 393d3234,
@@ -17,9 +17,10 @@
 //!
 //! TWO PINS, in the order the move needs them:
 //!
-//!   1. Current and withdrawn source declarations preserve the active
+//!   1. Immutable migrated and withdrawn source declarations preserve the active
 //!      rows a TestDb holds after the migrations equal the rows the
-//!      migration rows, kind for kind and column for column
+//!      migration rows, kind for kind and column for column. New data-only
+//!      declarations are seeded once; they do not rewrite this historical oracle
 //!      (`created_at` excepted — it is when the deployment was built,
 //!      not part of the declaration).
 //!   2. With the `step_plugins` table emptied, the seed publishes only
@@ -66,7 +67,13 @@ fn bundle() -> Vec<StepPluginSpec> {
 }
 
 fn historical_declarations() -> BTreeMap<String, serde_json::Value> {
-    let current = bundle();
+    // Immutable source snapshot at a8f41524, before data-only additions.
+    // Future bundle rows are not retroactively part of migration history.
+    let current = load_step_plugins(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/migrated-step-plugins"
+    ))
+    .expect("independent migrated declarations parse");
     let withdrawn = withdrawn_plugins::declarations();
     let expected_count = current.len() + withdrawn.len();
     let all: Vec<_> = current.into_iter().chain(withdrawn).collect();
@@ -74,12 +81,12 @@ fn historical_declarations() -> BTreeMap<String, serde_json::Value> {
     assert_eq!(
         expected.len(),
         expected_count,
-        "current and historical kinds are disjoint"
+        "migrated and withdrawn historical kinds are disjoint"
     );
     expected
 }
 
-/// PIN 1 — every migrated row matches its current or withdrawn immutable
+/// PIN 1 — every migrated row matches its migrated or withdrawn immutable
 /// source declaration, column for column, with no missing or extra history.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bundle_declares_every_active_row_the_migrations_produce() {
@@ -95,13 +102,13 @@ async fn the_bundle_declares_every_active_row_the_migrations_produce() {
     let bundle_kinds: Vec<&String> = from_bundle.keys().collect();
     assert_eq!(
         migration_kinds, bundle_kinds,
-        "the migration history equals current declarations plus independently retained withdrawn declarations"
+        "the migration history equals independently retained migrated and withdrawn declarations"
     );
     for (kind, migrated) in &from_migrations {
         let declared = &from_bundle[kind];
         assert_eq!(
             declared, migrated,
-            "the current or withdrawn source declaration for {kind} must equal the active row the \
+            "the historical source declaration for {kind} must equal the active row the \
              migrations produce, every column (left = bundle, right = migrations)"
         );
     }
@@ -173,11 +180,10 @@ async fn an_emptied_registry_is_rebuilt_from_the_bundle_alone() {
     );
 }
 
-/// On a registry the migrations already filled, the seed inserts
-/// nothing and says every row is present — the insert-if-missing
-/// posture every boot relies on.
+/// New data-only rows are inserted once without rewriting migrated history;
+/// the next boot is a no-op. No new bundle row becomes historical by inference.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_present_registry_is_left_untouched() {
+async fn a_historical_registry_adds_new_declarations_once_and_conserves_history() {
     let db = TestDb::new().await;
     let registry = PgStepPlugins::new(db.pool.clone());
     let before = declarations(&registry.list_active(None).await.expect("list_active"));
@@ -190,12 +196,22 @@ async fn a_present_registry_is_left_untouched() {
     let report = seed_step_plugins(&registry, &bundle(), &actor(), chrono::Utc::now(), false)
         .await
         .expect("a present registry is not a failure");
+    let current = declarations(&bundle());
+    let added = current
+        .keys()
+        .filter(|kind| !before.contains_key(*kind))
+        .count();
     assert_eq!(
         report.count(|o| matches!(o, SeedOutcome::Present)),
-        bundle().len(),
-        "every bundle row is already present: {report}"
+        current.len() - added
     );
-    assert_eq!(report.count(|o| matches!(o, SeedOutcome::Inserted)), 0);
+    assert_eq!(report.count(|o| matches!(o, SeedOutcome::Inserted)), added);
+    let expected: BTreeMap<_, _> = before.clone().into_iter().chain(current).collect();
+    assert_eq!(
+        declarations(&registry.list_active(None).await.expect("list_active")),
+        expected,
+        "new declarations are added and every historical column is conserved"
+    );
 
     let outbox: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM event_outbox WHERE kind LIKE 'jobs.step_plugin.%'",
@@ -203,10 +219,28 @@ async fn a_present_registry_is_left_untouched() {
     .fetch_one(&db.pool)
     .await
     .expect("count plugin events");
-    assert_eq!(outbox, 0, "a no-op seed records no plugin event");
+    assert_eq!(
+        outbox, added as i64,
+        "exactly one event per newly inserted declaration"
+    );
+    let repeated = seed_step_plugins(&registry, &bundle(), &actor(), chrono::Utc::now(), false)
+        .await
+        .expect("the second boot is a no-op");
+    assert_eq!(
+        repeated.count(|o| matches!(o, SeedOutcome::Present)),
+        bundle().len()
+    );
+    assert_eq!(repeated.count(|o| matches!(o, SeedOutcome::Inserted)), 0);
+    let after_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_outbox WHERE kind LIKE 'jobs.step_plugin.%'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("count plugin events");
+    assert_eq!(after_events, outbox, "a repeated seed adds no event");
     assert_eq!(
         declarations(&registry.list_active(None).await.expect("list_active")),
-        before
+        expected
     );
 }
 
@@ -278,9 +312,16 @@ async fn a_version_bump_publishes_and_retires_the_live_row() {
     bumped.version = live.version + 1;
     bumped.label = "Checklist v2".into();
 
-    let report = seed_step_plugins(&registry, &specs, &actor(), chrono::Utc::now(), false)
-        .await
-        .expect("a version bump publishes");
+    // Isolate the version transition under test from independent new declarations.
+    let report = seed_step_plugins(
+        &registry,
+        std::slice::from_ref(bumped),
+        &actor(),
+        chrono::Utc::now(),
+        false,
+    )
+    .await
+    .expect("a version bump publishes");
     assert_eq!(
         report.count(|o| matches!(o, SeedOutcome::Published { .. })),
         1,

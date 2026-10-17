@@ -28,6 +28,7 @@ pub mod car_release;
 pub mod car_retire;
 pub mod car_unland;
 pub mod channels;
+pub mod conditional_metadata;
 pub mod corrections;
 pub mod credential_executor;
 pub mod credentials;
@@ -48,6 +49,9 @@ pub mod field_writer;
 pub mod first_record;
 pub mod flake;
 pub mod flights;
+pub mod full_gate_on_main;
+pub mod gate_queue_observation;
+pub mod gate_reservation;
 pub mod http;
 pub mod human_only;
 pub mod in_memory;
@@ -57,10 +61,19 @@ pub mod jobs_config;
 pub mod kind_ledger;
 pub mod landing;
 pub mod list_every;
+pub mod lost_gate;
 pub mod me;
+#[cfg(feature = "postgres")]
+mod membership_history_pg;
+pub mod membership_replay;
 pub mod memory_selection_store;
 pub mod metadata_containment;
+pub mod metadata_immutability;
 pub mod metadata_key;
+pub mod move_admission;
+#[cfg(feature = "postgres")]
+mod move_admission_pg;
+pub mod move_diagnosis;
 pub mod moves;
 #[cfg(feature = "postgres")]
 pub mod native_selection_store;
@@ -149,3 +162,5 @@ pub use stations::{
 pub use step_plugins::PgStepPlugins;
 pub use step_plugins::{InMemoryStepPlugins, StepPluginError, StepPluginRegistry, StepPluginSpec};
 pub mod conditional_completion;
+
+pub mod state_receipt;

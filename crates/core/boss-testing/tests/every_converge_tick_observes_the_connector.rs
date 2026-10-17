@@ -57,7 +57,19 @@ fn unchanged_block() -> String {
     let end = src[start..]
         .find("_stage_started=$(date +%s)")
         .expect("the stage clock is reset after the unchanged block");
-    src[start..start + end].to_string()
+    let lib = std::fs::read_to_string(repo_root().join(LIB)).unwrap();
+    format!(
+        "{}\n{}\n{}",
+        shell_function(&src, "require_cluster_credentials"),
+        shell_function(&lib, "observe_deployed_surfaces"),
+        &src[start..start + end]
+    )
+}
+
+fn shell_function<'a>(source: &'a str, name: &str) -> &'a str {
+    let start = source.find(&format!("{name}() {{")).unwrap();
+    let end = start + source[start..].find("\n}\n").unwrap() + 3;
+    &source[start..end]
 }
 
 /// A stub kubectl: logs every call; answers a client dry run from the
@@ -127,10 +139,27 @@ struct Run {
 /// both `$K` and what `kubectl_seeing` hands back — recording through
 /// the real run-summary.sh.
 fn run_unchanged(name: &str, present: &[&str], env: &[(&str, &str)]) -> Run {
+    run_tick(name, present, env, false)
+}
+
+fn run_tick(name: &str, present: &[&str], env: &[(&str, &str)], data: bool) -> Run {
     let dir = scratch_dir(&format!("tick-observes-{name}"));
     let kubectl = stub_kubectl(&dir);
     let present_file = dir.join("present");
     write_file(&present_file, &format!("{}\n", present.join("\n")));
+    write_file(
+        &dir.join("kubeconfig"),
+        "local fixture; no native credential\n",
+    );
+    let block = if data {
+        let source = std::fs::read_to_string(repo_root().join(RUNNER)).unwrap();
+        format!(
+            "{}\nobserve_data_surfaces \"$STUB_STATE\"\nexit 0\n",
+            shell_function(&source, "require_cluster_credentials")
+        )
+    } else {
+        unchanged_block()
+    };
     let script = format!(
         "set -euo pipefail\nREPO='{repo}'\nHEAD=abc1234\nLAST=abc1234\nSTAGE=start\nOUTCOME=''\n\
          K='{k}'\nkubectl_seeing() {{ echo '{k}'; }}\n\
@@ -139,7 +168,7 @@ fn run_unchanged(name: &str, present: &[&str], env: &[(&str, &str)]) -> Run {
         k = kubectl.display(),
         summary = repo_root().join(RUN_SUMMARY).display(),
         lib = repo_root().join(LIB).display(),
-        block = unchanged_block()
+        block = block
     );
     let summary = dir.join("summary.json");
     let log = dir.join("calls");
@@ -151,6 +180,8 @@ fn run_unchanged(name: &str, present: &[&str], env: &[(&str, &str)]) -> Run {
         .env("STUB_PRESENT", &present_file)
         .env("STUB_CONNECTOR", dir.join("connector.json"))
         .env("STUB_INSTANCE", dir.join("instance.json"))
+        .env("KUBECONFIG_PATH", dir.join("kubeconfig"))
+        .env("STUB_STATE", &dir)
         .env_remove("BOSS_CLUSTER_TREE")
         .current_dir(&dir);
     for (k, v) in env {
@@ -176,6 +207,67 @@ fn is_a_write(call: &str) -> bool {
         || call.contains("--dry-run=client")
         || call.contains(" rollout status ");
     !read
+}
+
+#[test]
+fn a_data_tick_keeps_actual_read_only_observations_and_retains_refusals_as_unread() {
+    let ready = run_tick("data-ready", &["boss/tunnel-creds-fixture"], &[], true);
+    assert_eq!(ready.rc, 0, "{}\n{}", ready.out, ready.err);
+    assert_eq!(ready.recorded["cloudflared"], "connected");
+    assert_eq!(
+        ready.recorded["tunnel_ingress"],
+        tunnel_ingress_summary(SKIPPED)
+    );
+    assert_eq!(
+        ready.recorded["delivery_side_observations"]["state"],
+        "completed"
+    );
+    assert!(!ready.calls.is_empty());
+    assert!(
+        ready.calls.lines().all(|call| !is_a_write(call)),
+        "{}",
+        ready.calls
+    );
+    for (name, env, reason) in [
+        (
+            "data-forbidden",
+            vec![("STUB_FORBIDDEN", "boss-secrets")],
+            "Forbidden",
+        ),
+        (
+            "data-no-credential",
+            vec![(
+                "KUBECONFIG_PATH",
+                "/nonexistent/lighter-unit-test-kubeconfig",
+            )],
+            "admin kubeconfig",
+        ),
+    ] {
+        let unread = run_tick(name, &["boss/tunnel-creds-fixture"], &env, true);
+        assert_eq!(
+            unread.rc, 0,
+            "data arrival has its own proof; these reads remain unread: {}",
+            unread.err
+        );
+        assert_eq!(
+            unread.recorded["delivery_side_observations"]["state"],
+            "unread"
+        );
+        assert!(unread.recorded.get("cloudflared").is_none());
+        assert!(unread.recorded.get("site").is_none());
+        let original = std::fs::read_to_string(
+            unread.recorded["delivery_side_observations"]["stderr"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(original.contains(reason), "{original}");
+        assert!(
+            unread.calls.lines().all(|call| !is_a_write(call)),
+            "{}",
+            unread.calls
+        );
+    }
 }
 
 #[test]
@@ -317,7 +409,7 @@ fn both_ticks_record_through_one_definition() {
     }
     let unchanged = unchanged_block();
     assert!(
-        unchanged.contains("observe_connector \"$K\"") && unchanged.contains(" unchanged\n"),
+        unchanged.contains("observe_connector \"$K\"") && unchanged.contains(" unchanged ||"),
         "the unchanged tick calls the lib, tagged unchanged: {unchanged}"
     );
     let stamped = runner

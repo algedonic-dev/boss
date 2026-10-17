@@ -116,14 +116,20 @@ pub fn spent_reason(gate_run_metadata: &Value) -> Option<&'static str> {
 /// no text reads "no reason recorded" — the same words the web approach
 /// lens uses.
 pub fn hold_reason(gate_run_metadata: &Value) -> Option<String> {
-    marked(gate_run_metadata, "hold")
+    marked(
+        crate::gate_reservation::source_metadata(gate_run_metadata).ok()?,
+        "hold",
+    )
 }
 
 /// Did this gate carry a `--park-*` park intent (so `jobs.auto-park`
 /// owed it a car)? `park_summary` is the flag the handler itself keys
 /// on: no summary, no auto-park.
 pub fn park_intent(gate_run_metadata: &Value) -> bool {
-    gate_run_metadata
+    let Ok(source) = crate::gate_reservation::source_metadata(gate_run_metadata) else {
+        return false;
+    };
+    source
         .get("park_summary")
         .and_then(Value::as_str)
         .is_some_and(|s| !s.trim().is_empty())
@@ -157,7 +163,11 @@ pub fn any_green<'a>(step_metadata: impl IntoIterator<Item = &'a Value>) -> bool
 /// out of the stranded list and put it INTO the yard's held lane, where
 /// four `train/…` branches then stood as if they were parked cars.
 pub fn is_train_gate(gate_run_metadata: &Value) -> bool {
-    gate_run_metadata.get("train_gate").and_then(Value::as_bool) == Some(true)
+    crate::gate_reservation::source_metadata(gate_run_metadata)
+        .ok()
+        .and_then(|source| source.get("train_gate"))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 pub fn unparked_green<'a>(
@@ -165,7 +175,10 @@ pub fn unparked_green<'a>(
     step_metadata: impl IntoIterator<Item = &'a Value>,
     claimed: impl Fn(&str) -> bool,
 ) -> Option<UnparkedGreen> {
-    if is_train_gate(gate_run_metadata) {
+    // Main's full gate (backlog 77596188) is no car's either: its red
+    // files its own item and nothing parks from its green.
+    if is_train_gate(gate_run_metadata) || crate::full_gate_on_main::is_main_gate(gate_run_metadata)
+    {
         return None;
     }
     if spent_reason(gate_run_metadata).is_some() {
@@ -174,6 +187,7 @@ pub fn unparked_green<'a>(
     if !any_green(step_metadata) {
         return None;
     }
+    let gate_run_metadata = crate::gate_reservation::source_metadata(gate_run_metadata).ok()?;
     let branch = gate_run_metadata
         .get("branch")
         .and_then(Value::as_str)
@@ -222,6 +236,15 @@ mod tests {
         let bare = json!({"branch": "train/20260913-0457", "train_gate": true});
         assert!(call(&bare, &green(), &[]).is_none());
         assert!(is_train_gate(&bare) && !is_train_gate(&json!({"branch": "feat/x"})));
+    }
+
+    /// Main's full gate (backlog 77596188) is no car's green either: it
+    /// has no branch a car could carry, and a green with no car on
+    /// `main` filed a STRANDED GREEN item every pass until this.
+    #[test]
+    fn a_main_gate_is_no_cars_green_at_all() {
+        let main = json!({"branch": "main", "sha": "abc", "main_gate": true});
+        assert!(call(&main, &green(), &[]).is_none());
     }
 
     #[test]

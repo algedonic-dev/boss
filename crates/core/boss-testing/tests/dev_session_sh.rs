@@ -3,8 +3,9 @@
 //!
 //! An interactive ssh login used to exec straight into the one durable
 //! tmux session, `dev` (the Remote Control / drain session). It now
-//! offers four: 1 Claude + Claude Code (`dev`), 2 GPT + Codex (`codex`),
-//! 3 Gemini + Code Assist (`gemini`), 4 Shell (`shell`). Each joins its
+//! offers five: 1 Claude + Claude Code (`dev`), 2 GPT + Codex (`codex`),
+//! 3 Gemini + Code Assist (`gemini`), 4 Shell (`shell`), 5 Claude B +
+//! Claude Code (`claude-b`, a second account's own login). Each joins its
 //! session when it runs and creates it when it does not, and Enter or the
 //! timeout is option 1, so anything that relied on landing in `dev` still
 //! lands there. The selector is VERSIONED in the checkout and the
@@ -77,7 +78,7 @@ case $code in 2??) exit 0 ;; *) exit 1 ;; esac
 "#;
 
 /// The registry as it stands with both new agents posted.
-const AGENTS_ALL: &str = r#"{"data":[{"aliases":["claude@algedonic.dev"],"id":"agent-claude"},{"aliases":["codex@algedonic.dev"],"id":"agent-codex"},{"aliases":["gemini@algedonic.dev"],"id":"agent-gemini"}],"total":3}"#;
+const AGENTS_ALL: &str = r#"{"data":[{"aliases":["claude@algedonic.dev"],"id":"agent-claude"},{"aliases":["codex@algedonic.dev"],"id":"agent-codex"},{"aliases":["gemini@algedonic.dev"],"id":"agent-gemini"},{"aliases":["claude-b@algedonic.dev"],"id":"agent-claude-b"}],"total":4}"#;
 
 /// The registry as it stood on 2026-10-01: Claude alone.
 const AGENTS_CLAUDE_ONLY: &str =
@@ -219,6 +220,7 @@ fn enter_joins_the_dev_session() {
         "2) GPT + Codex",
         "3) Gemini + Code Assist",
         "4) Shell",
+        "5) Claude B + Claude Code",
     ] {
         assert!(out.contains(line), "the menu must offer `{line}`: {out}");
     }
@@ -1052,5 +1054,67 @@ fn the_versioned_cli_configs_parse() {
     assert!(
         claude_md <= 131_072,
         "CLAUDE.md is {claude_md} bytes, past codex's project_doc_max_bytes: raise it"
+    );
+}
+
+/// Option 5 is a SECOND Claude account (David 2026-10-17: practise
+/// scaling to two accounts). Its own login home, `$HOME/.claude-b`, is
+/// a `-e CLAUDE_CONFIG_DIR` on the session, so the login the person makes
+/// with `/login` there never touches option 1's. It signs as its own
+/// registered alias, claude-b@algedonic.dev, like codex and gemini.
+#[test]
+fn option_five_is_a_second_claude_account_with_its_own_login_home() {
+    let alias = "claude-b@algedonic.dev";
+    let who = "Claude (engineering, account B)";
+    for running in ["", "claude-b"] {
+        let f = Fixture::new(&format!("claude-b-{}", running.len()), &["claude"]);
+        let (rc, out) = f.run(running, "5\n", &[]);
+        assert_eq!(rc, 0, "{out}");
+        let signed = running.is_empty();
+        assert_eq!(
+            f.attached(),
+            format!(
+                "tmux new-session -A -s claude-b -c {} {} -e CLAUDE_CONFIG_DIR={}/.claude-b claude HOME={}",
+                f.boss(),
+                identity(alias, who, signed),
+                f.home(),
+                f.home()
+            ),
+            "option 5 with sessions `{running}`: {out}"
+        );
+    }
+}
+
+/// Creating option 5 PREPARES its login home when missing: the account's
+/// settings copied from option 1's, and memory (`projects`), skills and
+/// plugins linked so both accounts work from one record. It never copies
+/// or links a credential: the login is the person's own act, on first
+/// launch, with `/login`.
+#[test]
+fn option_five_prepares_its_home_and_never_copies_a_credential() {
+    let f = Fixture::new("claude-b-home", &["claude"]);
+    let a = std::path::Path::new(&f.home()).join(".claude");
+    std::fs::create_dir_all(a.join("projects")).unwrap();
+    std::fs::create_dir_all(a.join("skills")).unwrap();
+    std::fs::create_dir_all(a.join("plugins")).unwrap();
+    std::fs::write(a.join("settings.json"), "{}").unwrap();
+    std::fs::write(a.join(".credentials.json"), "secret").unwrap();
+    let (rc, out) = f.run("", "5\n", &[]);
+    assert_eq!(rc, 0, "{out}");
+    let b = std::path::Path::new(&f.home()).join(".claude-b");
+    for linked in ["projects", "skills", "plugins"] {
+        assert_eq!(
+            std::fs::read_link(b.join(linked)).unwrap_or_else(|e| panic!("{linked}: {e}: {out}")),
+            a.join(linked),
+            "{linked} must be linked to option 1's"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(b.join("settings.json")).unwrap(),
+        "{}"
+    );
+    assert!(
+        !b.join(".credentials.json").exists(),
+        "a credential must never be copied into the second account's home: {out}"
     );
 }

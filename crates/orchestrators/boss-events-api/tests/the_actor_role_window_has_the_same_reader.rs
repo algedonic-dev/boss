@@ -220,6 +220,17 @@ async fn the_transport_asks_each_service_at_its_own_report_path() {
             .map(|s| (s.to_string(), base.clone()))
             .collect(),
     );
+    // This witness asks which path and identity cross real HTTP, not how
+    // quickly the host schedules this fixture. Keep Tokio's deadline clock
+    // fixed while real sockets progress; otherwise a loaded gate can spend
+    // the client's two seconds before its loopback server runs. A runnable
+    // task prevents paused time auto-advancing while socket I/O is pending.
+    let keep_clock = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio::time::pause();
     for service in services {
         reader.read(Gate::ActorRole, service).await.unwrap();
     }
@@ -232,5 +243,60 @@ async fn the_transport_asks_each_service_at_its_own_report_path() {
             "/actor-role-reports"
         ]
     );
+    keep_clock.abort();
+    assert!(keep_clock.await.unwrap_err().is_cancelled());
+    tokio::time::resume();
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_unanswered_transport_still_expires_at_the_client_deadline() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let signal = entered.clone();
+    let app = axum::Router::new().fallback(axum::routing::get(move || {
+        let signal = signal.clone();
+        async move {
+            signal.notify_one();
+            std::future::pending::<axum::Json<Value>>().await
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = boss_core::machine_token::Client::build_with_source(
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)),
+        Arc::new(boss_core::machine_token::Source::fixed(None)),
+    )
+    .unwrap();
+    let reader = LocalTallies::new(client, vec![("jobs".into(), base)]);
+    let keep_clock = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio::time::pause();
+    let request = reader.read(Gate::ActorRole, "jobs");
+    tokio::pin!(request);
+    tokio::select! {
+        result = &mut request => panic!("the held server answered before its request arrived: {result:?}"),
+        () = entered.notified() => {}
+    }
+    tokio::time::advance(std::time::Duration::from_millis(1999)).await;
+    tokio::select! {
+        biased;
+        result = &mut request => panic!("the two-second deadline expired early: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    tokio::time::advance(std::time::Duration::from_millis(2)).await;
+    let error = tokio::select! {
+        biased;
+        result = &mut request => result.unwrap_err(),
+        () = tokio::task::yield_now() => panic!("the request survived its two-second deadline")
+    };
+    assert!(error.contains("/api/jobs/actor-role-reports"), "{error}");
+    assert!(error.contains("timed out"), "{error}");
+    keep_clock.abort();
+    assert!(keep_clock.await.unwrap_err().is_cancelled());
+    tokio::time::resume();
     server.abort();
 }

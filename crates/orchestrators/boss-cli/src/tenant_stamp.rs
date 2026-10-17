@@ -103,7 +103,7 @@ pub trait PublishedStamps: Send + Sync {
 /// in the instance that was published.
 pub struct HttpStamps {
     base: String,
-    client: boss_core::machine_token::Client,
+    client: crate::machine_http::MachineClient,
 }
 
 impl HttpStamps {
@@ -115,7 +115,7 @@ impl HttpStamps {
         Ok(Self {
             base: bases.jobs.trim_end_matches('/').to_string(),
             client: if bases.through_gateway {
-                boss_core::machine_token::Client::unstamped(builder)?
+                crate::machine_http::MachineClient::gateway(builder)?
             } else {
                 crate::sor_client::machine_client_with(builder)?
             },
@@ -518,7 +518,7 @@ mod tests {
         // is the condition waited on: the same unstamped client, no timer.
         let http = HttpStamps {
             base: http.base,
-            client: boss_core::machine_token::Client::unstamped(reqwest::Client::builder())
+            client: crate::machine_http::MachineClient::unstamped(reqwest::Client::builder())
                 .unwrap(),
         };
         let line = stamp_after_publish(&http, &new_stamp(&["departments"]), "agent-claude")

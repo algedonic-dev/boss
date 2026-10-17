@@ -111,8 +111,8 @@ pub fn declare(source: &Path, gateway: Option<&str>, dry_run: bool) -> Result<St
 fn declare_client(
     gateway: Option<&str>,
     token: std::sync::Arc<boss_core::machine_token::Source>,
-) -> Result<boss_core::machine_token::BlockingClient> {
-    use boss_core::machine_token::BlockingClient;
+) -> Result<crate::machine_http::BlockingMachineClient> {
+    use crate::machine_http::BlockingMachineClient;
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "x-boss-user",
@@ -122,8 +122,8 @@ fn declare_client(
         .timeout(std::time::Duration::from_secs(30))
         .default_headers(headers);
     Ok(match gateway {
-        Some(_) => BlockingClient::unstamped(builder)?,
-        None => BlockingClient::build_with_source(builder, token)?,
+        Some(_) => BlockingMachineClient::gateway(builder)?,
+        None => BlockingMachineClient::build_with_source(builder, token)?,
     })
 }
 
@@ -192,7 +192,7 @@ mod tests {
     fn a_gateway_declare_never_stamps_and_the_jobs_port_does() {
         use boss_core::machine_token::{HEADER, Source};
         let token = || std::sync::Arc::new(Source::fixed(Some("estate-token-value".into())));
-        let stamped = |c: &boss_core::machine_token::BlockingClient, url: &str| {
+        let stamped = |c: &crate::machine_http::BlockingMachineClient, url: &str| {
             c.post(url).build().unwrap().headers().get(HEADER).is_some()
         };
         let url = "http://127.0.0.1:1/api/estate/nodes/batch";

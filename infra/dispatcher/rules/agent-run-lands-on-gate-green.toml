@@ -43,9 +43,9 @@ pipeline: the edge is declared by the gate at launch
 behalf, and not one of those builds had a packet of its own to land —
 the run existed in a terminal transcript and nowhere in the record.
 """
-version = 1
+version = 2
 on_event = "jobs.job.closed"
 when = "kind = \"gate-run\" AND outcome = \"completed\""
 [[rule.do]]
 handler = "jobs.complete_linked_step"
-args = { link = "\"agent_run\"", steps = "\"building\"", evidence_key = "\"gate_run\"", done_metadata = '"{\"result\": \"gated\"}"' }
+args = { link = "\"agent_run\"", steps = "\"building\"", evidence_key = "\"gate_run\"", done_metadata = '"{\"result\": \"gated\"}"', metadata_envelope = '"gate_submission"', metadata_pointer = '"/source"', metadata_version = '"1"', metadata_equal = '"branch,sha,agent_run,worktree"' }

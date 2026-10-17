@@ -7,7 +7,7 @@ widened by `202609030800` and `202609031000`, narrowed by
 `20260918102236`): `name`, `version`, `status`, `max_red_trains`,
 `stall_hours`, `consist_budget_secs`, `consist_output_budget`,
 `consist_files_named`, `skip_reason_file_budget`, `blip_cause_budget`,
-`ci_host_floor_gb`, `gate_max_concurrent`. There is one policy,
+`ci_host_floor_gb`, `gate_max_concurrent`, and `channels`. There is one policy,
 `train-conductor`, because there is one delivery pipeline; **the
 version is what moves.** Changing the policy is bumping its `version`.
 
@@ -86,6 +86,27 @@ that already has the row. A lineage with no active row is one an
 operator retired (the conductor then runs on the compiled fallback and
 says so in its journal) and a boot leaves it that way; re-activation is
 an explicit publish.
+
+`channels` declares optional lighter delivery eligibility and its evidence.
+Old rows carry JSON null and retain image delivery. The staged v8 declaration
+keeps `enabled=false`: installation alone does not activate the new route.
+Activation needs a new policy version, an active train workflow whose whole
+typed body matches the compatible completion contract, and no merged train
+still owing its previously admitted image completion. Existing admissions are
+never rewritten. Unsupported, mixed, migration, security and unread changes
+retain software delivery.
+
+Repository documentation completes on the exact native forge publication.
+Supported existing workflow/rule body changes complete on ordinary authorized
+publication and whole typed registry equality for every changed file; the
+drift reader does not publish. Adding a workflow kind changes the standalone
+CLI's compiled roster, while new/retired rule names need bundle transport, so
+those lifecycle changes retain software delivery. An unchanged CLI may serve
+a later qualified data source only after its complete image compiler-input
+receipt and fresh native evidence agree. Its actual image commit stays intact;
+compatible source is recorded separately. `boss channels --delivery-times`
+reports actual durations with the full sample, missing, unknown and censored
+population rather than treating historical data labels as lighter receipts.
 
 Parsed by `boss_jobs::seed_loader::load_delivery_policies`, which
 refuses a file named for a policy it does not hold, a status other than

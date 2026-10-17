@@ -120,7 +120,7 @@ pub(crate) fn lines(reader: &Result<Reader, String>) -> Vec<String> {
 /// fails becomes the named reason, never an early return that drops the
 /// section.
 pub(crate) async fn read(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     owner: &dyn PlatformOwner,
     people_base: &str,
     locations_base: &str,
@@ -146,7 +146,7 @@ pub(crate) async fn read(
 /// [`read`] against the service ports the jobs base implies — the same
 /// host, each service on its `boss_ports` prod port (the rule
 /// `owner::people_base_from` already applies for filing).
-pub(crate) async fn section(http: &boss_core::machine_token::Client) -> Vec<String> {
+pub(crate) async fn section(http: &crate::machine_http::MachineClient) -> Vec<String> {
     let base = match crate::sor_client::resolve_jobs_base(None) {
         Ok(b) => b,
         Err(e) => return lines(&Err(e.to_string())),
@@ -160,7 +160,7 @@ pub(crate) async fn section(http: &boss_core::machine_token::Client) -> Vec<Stri
 
 /// A GET through the signed door, as a named reason on failure.
 async fn get(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     path: &str,
 ) -> Result<Value, String> {

@@ -53,8 +53,8 @@ pub struct ClockApiState {
     /// during the cold-start window before `/configure` or
     /// `read_sim_clock` primes them.
     pub params: Arc<RwLock<Option<SimClockParams>>>,
-    /// Optional pool for persisting parameter changes. Wall
-    /// mode + tests leave this `None`.
+    /// Persistent formula/mode authority. Both native modes use it;
+    /// nonpersistent source-test configurations may leave this None.
     #[cfg(feature = "postgres")]
     pub pool: Option<sqlx::PgPool>,
 }
@@ -91,19 +91,15 @@ async fn ticks_stream_handler(
     State(state): State<Arc<ClockApiState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let interval = tokio::time::interval(Duration::from_secs(1));
-    let stream = IntervalStream::new(interval).map(move |_| {
-        let now = match state.mode {
-            ClockMode::Wall => ClockNow::wall(),
-            ClockMode::Sim => match state.params.read() {
-                Ok(p) => p.as_ref().map(|p| p.now()).unwrap_or_else(ClockNow::wall),
-                Err(_) => ClockNow::wall(),
-            },
-        };
-        // Emit the full `ClockNow`, not just the timestamp, so streaming
-        // consumers — the dispatcher's timing triggers and the sim daemon —
-        // drive their loops off the stream alone, with no companion
-        // `/api/clock/now` poll.
-        Ok(Event::default().data(serde_json::to_string(&now).unwrap_or_default()))
+    let stream = IntervalStream::new(interval).then(move |_| {
+        let state = state.clone();
+        async move {
+            let event = match current_now(&state).await {
+                Ok(now) => Event::default().data(serde_json::to_string(&now).unwrap_or_default()),
+                Err(error) => Event::default().event("clock-unavailable").data(error),
+            };
+            Ok::<_, Infallible>(event)
+        }
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
@@ -178,6 +174,21 @@ async fn baseline_handler(State(state): State<Arc<ClockApiState>>) -> Response {
 }
 
 async fn now_handler(State(state): State<Arc<ClockApiState>>) -> Response {
+    match current_now(&state).await {
+        Ok(now) => Json(now).into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    }
+}
+
+async fn current_now(state: &ClockApiState) -> Result<ClockNow, String> {
+    #[cfg(feature = "postgres")]
+    if let Some(pool) = &state.pool {
+        // Direct Jobs reset writers and API writers share this recorded
+        // authority. A lagging cache is not evidence for its old mapping.
+        return crate::postgres::authoritative_now(pool, state.mode)
+            .await
+            .map_err(|error| error.to_string());
+    }
     let now = match state.mode {
         ClockMode::Wall => ClockNow::wall(),
         ClockMode::Sim => match state.params.read() {
@@ -208,7 +219,7 @@ async fn now_handler(State(state): State<Arc<ClockApiState>>) -> Response {
                 .unwrap_or_else(ClockNow::wall),
         },
     };
-    Json(now).into_response()
+    Ok(now)
 }
 
 async fn configure_handler(
@@ -222,7 +233,7 @@ async fn configure_handler(
         )
             .into_response();
     }
-    let new_params = match update_params(&state.params, |p| {
+    let new_params = match update_params(&state, |p| {
         if let Some(es) = req.epoch_start {
             p.epoch_start = es;
             // Resetting epoch_start rebases the formula — sim-time
@@ -282,8 +293,6 @@ async fn configure_handler(
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    #[cfg(feature = "postgres")]
-    persist_if_pool(&state.pool, &new_params).await;
     Json(new_params).into_response()
 }
 
@@ -291,7 +300,7 @@ async fn pause_handler(State(state): State<Arc<ClockApiState>>) -> Response {
     if state.mode != ClockMode::Sim {
         return (StatusCode::METHOD_NOT_ALLOWED, "sim-only").into_response();
     }
-    let new = match update_params(&state.params, |p| {
+    let new = match update_params(&state, |p| {
         if !p.paused {
             p.paused = true;
             p.paused_at = Some(Utc::now());
@@ -302,8 +311,6 @@ async fn pause_handler(State(state): State<Arc<ClockApiState>>) -> Response {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    #[cfg(feature = "postgres")]
-    persist_if_pool(&state.pool, &new).await;
     Json(new.now()).into_response()
 }
 
@@ -311,7 +318,7 @@ async fn resume_handler(State(state): State<Arc<ClockApiState>>) -> Response {
     if state.mode != ClockMode::Sim {
         return (StatusCode::METHOD_NOT_ALLOWED, "sim-only").into_response();
     }
-    let new = match update_params(&state.params, |p| {
+    let new = match update_params(&state, |p| {
         if p.paused {
             if let Some(paused_at) = p.paused_at {
                 let elapsed = (Utc::now() - paused_at).num_milliseconds().max(0) as f64 / 1000.0;
@@ -326,8 +333,6 @@ async fn resume_handler(State(state): State<Arc<ClockApiState>>) -> Response {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    #[cfg(feature = "postgres")]
-    persist_if_pool(&state.pool, &new).await;
     Json(new.now()).into_response()
 }
 
@@ -335,7 +340,7 @@ async fn restart_epoch_handler(State(state): State<Arc<ClockApiState>>) -> Respo
     if state.mode != ClockMode::Sim {
         return (StatusCode::METHOD_NOT_ALLOWED, "sim-only").into_response();
     }
-    let new = match update_params(&state.params, |p| {
+    let new = match update_params(&state, |p| {
         p.wall_anchor = Utc::now();
         p.paused_offset_seconds = 0.0;
         p.paused_at = None;
@@ -346,41 +351,40 @@ async fn restart_epoch_handler(State(state): State<Arc<ClockApiState>>) -> Respo
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    #[cfg(feature = "postgres")]
-    persist_if_pool(&state.pool, &new).await;
     Json(new.now()).into_response()
 }
 
-async fn update_params<F>(
-    state: &Arc<RwLock<Option<SimClockParams>>>,
-    mutator: F,
-) -> Result<SimClockParams, &'static str>
+async fn update_params<F>(state: &ClockApiState, mutator: F) -> Result<SimClockParams, String>
 where
     F: FnOnce(&mut SimClockParams),
 {
-    let mut guard = state.write().map_err(|_| "params lock poisoned")?;
-    let mut params = guard.unwrap_or(SimClockParams {
-        epoch_start: chrono::Utc::now().date_naive(),
-        epoch_end: None,
-        warp_factor: 8640.0,
-        wall_anchor: Utc::now(),
-        paused: false,
-        paused_at: None,
-        paused_offset_seconds: 0.0,
-        restart_in_progress: false,
-    });
+    let initial = state
+        .params
+        .read()
+        .map_err(|_| "params lock poisoned")?
+        .unwrap_or(SimClockParams {
+            epoch_start: chrono::Utc::now().date_naive(),
+            epoch_end: None,
+            warp_factor: 8640.0,
+            wall_anchor: Utc::now(),
+            paused: false,
+            paused_at: None,
+            paused_offset_seconds: 0.0,
+            restart_in_progress: false,
+        });
+    #[cfg(feature = "postgres")]
+    if let Some(pool) = &state.pool {
+        let params = crate::postgres::change_params(pool, initial, mutator)
+            .await
+            .map_err(|error| error.to_string())?;
+        *state.params.write().map_err(|_| "params lock poisoned")? = Some(params);
+        return Ok(params);
+    }
+    let mut guard = state.params.write().map_err(|_| "params lock poisoned")?;
+    let mut params = guard.unwrap_or(initial);
     mutator(&mut params);
     *guard = Some(params);
     Ok(params)
-}
-
-#[cfg(feature = "postgres")]
-async fn persist_if_pool(pool: &Option<sqlx::PgPool>, params: &SimClockParams) {
-    if let Some(pool) = pool
-        && let Err(e) = crate::postgres::write_params(pool, params).await
-    {
-        tracing::warn!(error = %e, "failed to persist sim_clock params");
-    }
 }
 
 /// Spawn a background task that re-reads `sim_clock` from the DB

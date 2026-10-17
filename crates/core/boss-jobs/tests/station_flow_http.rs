@@ -239,7 +239,14 @@ async fn flow(app: &axum::Router, query: &str) -> serde_json::Value {
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/api/stations/flow{query}"))
+                .uri(format!(
+                    "/api/stations/flow{}basis=step-events",
+                    if query.is_empty() {
+                        "?".to_owned()
+                    } else {
+                        format!("{query}&")
+                    }
+                ))
                 .header("x-boss-user", user_header("emp-david", "operator"))
                 .body(Body::empty())
                 .unwrap(),
@@ -329,5 +336,42 @@ async fn the_envelope_names_its_own_window() {
     assert!(
         body["since"].as_str().is_some(),
         "and the instant it opened"
+    );
+}
+
+/// a4de1e72: the map must conserve the evaluator's original diagnosis,
+/// including an empty station. Missing flow is never a zero or idle.
+#[tokio::test]
+async fn the_map_retains_the_exact_clause_that_refused_a_station_flow() {
+    let app = app().await;
+    let original = flow(&app, "?window_hours=24").await;
+    let refused = row(&original, "test-dock");
+    let reason = refused["unavailable_reason"].as_str().unwrap();
+    assert!(refused["served"].is_null());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/yard/regions?window=24h")
+                .header("x-boss-user", user_header("emp-david", "operator"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let map: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let machine = map["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|region| region["machines"].as_array().unwrap())
+        .find(|machine| machine["id"] == "station:test-dock")
+        .expect("the same evaluated station is on the map");
+    assert_eq!(machine["state"], "unknown");
+    assert!(
+        machine["why"].as_str().unwrap().contains(reason),
+        "the map discarded the original refusal: expected {reason:?}, got {machine}"
     );
 }

@@ -856,16 +856,88 @@ export CARGO_TARGET_DIR=/gate-target/target
 # The registry cache is content-addressed by version + checksum, so a
 # stale entry cannot produce a wrong build — only a faster one.
 #
+# BUN'S DOWNLOAD CACHE JOINS IT (backlog 4bbf875d, 2026-10-16), for
+# the same reason. HOME is /gate-target (gate-runner.yaml), so bun's
+# default cache ($HOME/.bun/install/cache) started empty on every gate
+# and died with it. The silenced web warm-up below filled it at minute
+# 0; with that gone (car ade746a1), a non-web --auto gate's first
+# package download is svelte-check's install ~40 minutes in, and a
+# registry blip there cost the whole gate. BUN_INSTALL_CACHE_DIR is the
+# first thing bun 1.3 reads for its cache (fetchCacheDirectoryPath, ahead
+# of bunfig, BUN_INSTALL, XDG_CACHE_HOME and HOME), and the pin asks bun
+# itself — `bun pm cache` — rather than trusting the spelling.
+# Concurrent gates share it without our lock, as they share CARGO_HOME:
+# bun extracts each tarball, integrity-checked against the lockfile, into
+# a uniquely named temp directory and renames it into place with
+# renameat2(RENAME_NOREPLACE), swapping atomically (RENAME_EXCHANGE)
+# when another install got there first; a cached manifest is a temp file
+# renamed over. A package directory therefore appears whole or not at
+# all (bun-v1.3.14 src/install/extract_tarball.zig moveToCacheDirectory,
+# src/sys/sys.zig renameatConcurrently — "gracefully handle duplicate
+# concurrent `bun install` calls").
+#
+# BUN COPIES OUT OF IT; IT DOES NOT HARDLINK. bun's default backend is
+# a hardlink, but /gate-seed and /gate-target are two separate subPath
+# bind mounts of the gate disk (gate-runner.yaml, the gate container's
+# volumeMounts), and link(2) answers EXDEV across mount points even on
+# one filesystem — so bun falls back to a copy and every node_modules
+# file is the gate's own inode (measured by review 2f67531c, and again
+# by run 797f3b9b on bun 1.3.14: with cache and project on different
+# mounts 0 of 14,697 node_modules files share an inode with the cache;
+# on one mount all 14,697 do). That is what keeps a branch that
+# rewrites a node_modules file in place from rewriting the shared cache
+# under every later gate, train gates included. ONE mount for seed and
+# workspace would turn the hardlinks, and that exposure, on: a change
+# that merges them makes the gate's installs copy explicitly (bun
+# install --backend=copyfile) in the same car.
+#
+# IT IS SWEPT, BECAUSE BUN LEAKS INTO IT. The container's /tmp is its
+# overlay, a different device, so bun's temp-dir probe (a rename from
+# /tmp into the cache) fails and it unpacks under <cache>/.tmp instead
+# (PackageManagerDirectories.zig getTemporaryDirectory). Every install
+# re-applies the root patchedDependencies patch and swaps the result in
+# with RENAME_EXCHANGE, which never deletes the copy it swaps out, and a
+# killed extract leaves its temp directory too. Measured by review
+# 2f67531c with this tree's lockfile: three .tmp entries per install,
+# ~2.4 MB and ~620 inodes, reclaimed by nothing; the dev pod's
+# one-week-old cache was 658M, 376M of it .tmp. In /gate-target that
+# died with the run; on the seed it grows without bound. So each gate
+# removes the .tmp entries whose CTIME is over 240 minutes old. ctime,
+# not mtime: a swapped-out directory keeps its old mtime while another
+# install may still be copying out of it, but the rename that swapped
+# it stamped its ctime. 240 minutes is past the Job's
+# activeDeadlineSeconds (10800 s), so no live install can own an entry
+# that old, and the pin holds the two apart. Errors are tolerated — two
+# gates sweeping at once race for the same entries, and a sweep is
+# never worth a gate. Measured 2026-10-16 (run 797f3b9b, bun 1.3.14,
+# cache and project on different devices): six installs with no sweep
+# left 18 entries and 15M, growing by 3 each; eight installs each behind
+# this block, its age scaled to 30 s, held .tmp at 6. Its cost, on a
+# copy of the dev pod's whole week of leaks (424 entries, 87k inodes,
+# 337M): 0.004 s to find nothing old, 3.9 s to remove all of it — and a
+# gate removes only what installs left since the previous gate's
+# cutoff, so the gate's start pays a fraction of that. The rest of the
+# cache is not trimmed, as cargo/ is not: it keeps every package
+# version any gated branch's lockfile has named, including branches
+# that never land.
+#
 # The [ -d ] probe is a SKEW guard: a session gating from a stale
 # checkout renders the old manifest, which mounts no /gate-seed. That
 # run must cost speed, not the gate — cold and loud beats dead.
+# --- download caches (begin) ---
 if [ -d "$SEED" ]; then
     export CARGO_HOME="$SEED/cargo"
+    export BUN_INSTALL_CACHE_DIR="$SEED/bun-install-cache"
 else
     echo "gate-runner: /gate-seed is not mounted (manifest older than this script?) — running cold"
     export CARGO_HOME=/gate-target/cargo
+    export BUN_INSTALL_CACHE_DIR=/gate-target/.bun/install/cache
 fi
-mkdir -p "$CARGO_HOME"
+mkdir -p "$CARGO_HOME" "$BUN_INSTALL_CACHE_DIR"
+bun_tmp_swept=$(find "$BUN_INSTALL_CACHE_DIR/.tmp" -mindepth 1 -maxdepth 1 -cmin +240 \
+    -print -exec rm -rf {} + 2>/dev/null | wc -l) || true
+echo "gate-runner: download caches CARGO_HOME=$CARGO_HOME BUN_INSTALL_CACHE_DIR=$BUN_INSTALL_CACHE_DIR (swept ${bun_tmp_swept:-0} stale .tmp entries)"
+# --- download caches (end) ---
 
 # Build parallelism follows the CPU the container was actually GIVEN.
 # It was pinned at 4, so raising the gate ceiling from 6 CPU to 20 in
@@ -946,11 +1018,18 @@ echo "gate-runner: building ${CARGO_BUILD_JOBS}-wide (cgroup quota), tests 2 thr
 export BOSS_WEB_GATE_LOAD=1
 echo "gate-runner: web budgets scaled for gate load (BOSS_WEB_GATE_LOAD=1; the factor is GATE_LOAD_SCALE in apps/web/src/dev-load.ts)"
 
-# Warm the web toolchain: the mocked suite's webServer boot on a cold
-# container exceeded its timeout three times on 2026-08-23; every spec
-# then fails on connect within seconds. (The durable fix is the
-# config-side timeout car; this keeps the first boot off the clock.)
-(cd apps/web && bun install --frozen-lockfile >/dev/null 2>&1 && bun run build >/dev/null 2>&1) || true
+# NO WEB WARM-UP HERE (backlog efd7f75c, 2026-10-15). This line used to
+# install and build apps/web before the gate, `>/dev/null 2>&1 || true`,
+# because on 2026-08-23 the mocked suite's webServer boot overran its
+# timeout three times on a cold container. gate.sh then installed and
+# built again, so every gate paid both twice, and the first pair left
+# neither its time nor its failure anywhere: a reduction before storing
+# (CLAUDE.md §Diagnosis). The reason is held where its comment said the
+# durable fix would land: tests/run-mocked.ts owns readiness with a
+# 240 s deadline (backlog 63a242ca), and the web suite's own build runs
+# right before test:mocked. gate.sh's `web install` and `web-suite`
+# checks do the install and the one build, each timed on the receipt;
+# the_gate_builds_the_web_app_once.rs holds that.
 
 RECEIPT=/gate-target/receipt.json
 if BOSS_GATE_RECEIPT="$RECEIPT" ./infra/gate.sh ${GATE_MODE:-} > /gate-target/gate.log 2>&1; then

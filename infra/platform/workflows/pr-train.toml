@@ -125,11 +125,15 @@ required = true
 title = "converged"
 kind = "task"
 ready_when = "steps.deployed.done"
-title_template = "In transit — cluster converged"
+title_template = "In transit — delivery converged"
 audience = { individual = "automation:train-conductor" }
 [[workflow.step.fields]]
 name = "cluster_commit"
 field_type = "string"
+required = false
+[[workflow.step.fields]]
+name = "delivery_evidence"
+field_type = "object"
 required = true
 [[workflow.step.fields]]
 name = "verified"

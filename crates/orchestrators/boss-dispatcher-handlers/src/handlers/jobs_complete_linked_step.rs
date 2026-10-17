@@ -659,7 +659,41 @@ impl Handler for JobsCompleteLinkedStep {
         };
 
         let closing = self.get_job(closing_id, &ctx.rule_name).await?;
-        let closing_meta = closing.get("metadata").cloned().unwrap_or(json!({}));
+        let raw_meta = closing.get("metadata").cloned().unwrap_or(json!({}));
+        let closing_meta = match arg(args, "metadata_envelope") {
+            None => raw_meta,
+            Some(Value::String(envelope)) if !envelope.is_empty() => {
+                let pointer = arg_string(args, "metadata_pointer")?;
+                let version = arg_string(args, "metadata_version")?
+                    .parse::<u32>()
+                    .map_err(|error| {
+                        HandlerError::Permanent(format!("metadata_version is invalid: {error}"))
+                    })?;
+                let equal = match arg(args, "metadata_equal") {
+                    None => Vec::new(),
+                    Some(Value::String(keys)) => keys
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|key| !key.is_empty())
+                        .collect(),
+                    _ => {
+                        return Err(HandlerError::Permanent(
+                            "metadata_equal must name comma-separated locator fields".into(),
+                        ));
+                    }
+                };
+                boss_jobs::metadata_immutability::view(
+                    &raw_meta, envelope, pointer, version, &equal,
+                )
+                .map_err(HandlerError::Permanent)?
+                .clone()
+            }
+            _ => {
+                return Err(HandlerError::Permanent(
+                    "metadata_envelope must name an immutable field".into(),
+                ));
+            }
+        };
 
         // Not this rule's verb: another answered request on the same
         // topic, possibly carrying the same edge. Silent — it is
@@ -3643,6 +3677,87 @@ mod tests {
                 Value::String(r#"{"result": "gated"}"#.into()),
             ),
         ]
+    }
+
+    #[tokio::test]
+    async fn post_launch_raw_drift_cannot_land_a_different_agent_run() {
+        let source =
+            json!({"agent_run":RUN,"branch":"fix/original","worktree":"/scratch/original"});
+        let envelope = json!({"contract_version":1,"source":source});
+        let wrong = "88888888-8888-4888-8888-888888888888";
+        let mut incorrect = run("ready");
+        incorrect["id"] = json!(wrong);
+        incorrect["steps"][2]["id"] = json!("wrong-building");
+        let gate = green_gate(
+            json!({"agent_run":wrong,"branch":"fix/changed","worktree":"/scratch/changed",
+            "gate_launch_observation":{"uid":"native-before-drift"},"gate_submission":envelope,
+            "_immutable_metadata":{"gate_submission":envelope}}),
+        );
+        let (base, puts, _patches) = mock_jobs(vec![gate, run("ready"), incorrect]).await;
+        let handler = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
+        let mut args = landing_args();
+        args.push((
+            "metadata_envelope".into(),
+            Value::String("gate_submission".into()),
+        ));
+        args.push(("metadata_pointer".into(), Value::String("/source".into())));
+        args.push(("metadata_version".into(), Value::String("1".into())));
+        handler.invoke(&args,&ctx(json!({"id":GATE,"kind":"gate-run","outcome":"completed","closed_on":"2026-10-16","parent_step_id":null}))).await.unwrap();
+        let writes = puts.lock().unwrap();
+        eprintln!(
+            "actual post-launch linked-step writes {}",
+            serde_json::to_string(&*writes).unwrap()
+        );
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            writes[0].0, "r-building",
+            "only the original source run may land"
+        );
+        assert_eq!(
+            writes[0].1["metadata"]["gate_run"]["branch"],
+            source["branch"]
+        );
+        assert_eq!(
+            writes[0].1["metadata"]["gate_run"]["worktree"],
+            source["worktree"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_index_mismatch_refuses_before_landing_any_run() {
+        let source =
+            json!({"agent_run":RUN,"branch":"fix/original","worktree":"/scratch/original"});
+        let envelope = json!({"contract_version":1,"source":source});
+        let wrong = "88888888-8888-4888-8888-888888888888";
+        let mut incorrect = run("ready");
+        incorrect["id"] = json!(wrong);
+        incorrect["steps"][2]["id"] = json!("wrong-building");
+        let gate = green_gate(
+            json!({"agent_run":wrong,"branch":"fix/original","worktree":"/scratch/original",
+            "gate_submission":envelope,"_immutable_metadata":{"gate_submission":envelope}}),
+        );
+        let (base, puts, _) = mock_jobs(vec![gate, run("ready"), incorrect]).await;
+        let handler = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
+        let mut args = landing_args();
+        for (key, value) in [
+            ("metadata_envelope", "gate_submission"),
+            ("metadata_pointer", "/source"),
+            ("metadata_version", "1"),
+            ("metadata_equal", "branch,sha,agent_run,worktree"),
+        ] {
+            args.push((key.into(), Value::String(value.into())));
+        }
+        let result=handler.invoke(&args,&ctx(json!({"id":GATE,"kind":"gate-run","outcome":"completed","closed_on":"2026-10-16","parent_step_id":null}))).await;
+        assert!(matches!(result, Err(HandlerError::Permanent(_))));
+        assert!(puts.lock().unwrap().is_empty());
     }
 
     /// THE BUILDER'S WORKTREE RIDES THE GREEN (backlog a3355e14). The

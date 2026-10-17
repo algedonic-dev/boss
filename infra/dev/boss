@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# ca356c79: recorded probes inherit an empty token directory. Refuse
+# the session CLI before selector routing, version probes or token I/O;
+# their permitted read path is boss-sor-read. Presence also marks an
+# admission whose optional diagnostic channel could not be created.
+if [[ -n "${BOSS_PROBE_NOTFOUND+set}" || -n "${BOSS_SOR_USER:-}" || -n "${BOSS_SOR_DOOR:-}" ]]; then
+    echo "boss: REFUSED — recorded probe context must read through boss-sor-read; this session door cannot execute an intentionally tokenless probe request" >&2
+    exit 2
+fi
+
 # Dev isolation (b3071bf4): an activated generation answers from its
 # published copy. A REFUSED selector (design a68fc42a D1) refuses a
 # candidate CLI (--built) with 75 and runs only the published image CLI
@@ -221,6 +230,18 @@ if [ "$prefer" = image ] && [ -n "$main" ] && [ -n "$image_bin" ] \
     echo "boss: running the image CLI at ${image_sha:0:8} ($rel) — $image_bin" >&2
   fi
   exec "$image_bin" "$@"
+fi
+
+# An unchanged published binary can serve a later data-only source after its
+# actual publication and whole native equality are read. Its image identity
+# stays the image identity; neither the store link nor its runtime sha moves.
+if [ "$prefer" = image ] && [ -n "$main" ] && [ -n "$image_bin" ] \
+    && [ -r "$repo/infra/estate/cli-compatible.sh" ]; then
+  . "$repo/infra/estate/cli-compatible.sh"
+  if compatibility_receipt=$(cli_image_compatible "$store" "$image_sha" "$main" "$repo"); then
+    echo "boss: image CLI ${image_sha:0:8} has unchanged compiler inputs and native delivery evidence for source ${main:0:8}; whole receipt: $compatibility_receipt" >&2
+    exec env BOSS_BUILD_COMMIT="$image_sha" "$store/$image_sha/boss" "$@"
+  fi
 fi
 
 # The build: the newer profile, and what it says it was built from —

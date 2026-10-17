@@ -173,10 +173,14 @@ pub(crate) struct ApiFailure {
 
 impl ApiFailure {
     /// A reqwest failure — classified by what reqwest says went wrong.
-    pub(crate) fn transport(e: reqwest::Error, context: String) -> Self {
+    pub(crate) fn transport(e: impl Into<anyhow::Error>, context: String) -> Self {
+        let cause = e.into();
         ApiFailure {
-            kind: classify_transport(&e),
-            cause: anyhow::Error::new(e).context(context),
+            kind: cause
+                .downcast_ref::<reqwest::Error>()
+                .map(classify_transport)
+                .unwrap_or(Failure::Malformed),
+            cause: cause.context(context),
         }
     }
 }
@@ -416,9 +420,9 @@ where
 /// status comes back to the caller as the answer it is — except, on an
 /// idempotent call, a 403 or 503 whose body names a policy outage,
 /// which is waited out inside the same window (backlog f13c719e).
-pub(crate) async fn send_through_a_roll(
+pub(crate) async fn send_through_a_roll<B: Into<crate::machine_http::MachineRequest>>(
     what: &str,
-    build: impl Fn() -> reqwest::RequestBuilder,
+    build: impl Fn() -> B,
 ) -> Result<reqwest::Response> {
     send_through(&ROLL_WAIT, what, &say_on_stderr, build).await
 }
@@ -436,19 +440,19 @@ fn say_on_stderr(m: &str) {
 /// [`send_through_a_roll`] with the wait and the voice chosen — the
 /// seam the wire tests go through, so a real socket can walk the
 /// window in milliseconds.
-async fn send_through(
+async fn send_through<B: Into<crate::machine_http::MachineRequest>>(
     wait: &RollWait,
     what: &str,
     say: &(dyn Fn(&str) + Sync),
-    build: impl Fn() -> reqwest::RequestBuilder,
+    build: impl Fn() -> B,
 ) -> Result<reqwest::Response> {
     waiting_out_a_roll(wait, what, say, || {
-        let (client, req) = build().build_split();
+        let request = build().into();
         async move {
-            let transport = |e| ApiFailure::transport(e, what.to_string());
-            let req = req.map_err(transport)?;
-            let method = req.method().clone();
-            let resp = client.execute(req).await.map_err(transport)?;
+            let (method, resp) = request
+                .send_with_method()
+                .await
+                .map_err(|cause| ApiFailure::transport(cause, what.to_string()))?;
             unless_a_policy_outage(&method, resp, what).await
         }
     })
@@ -634,6 +638,68 @@ pub(crate) const ROWS_REFUSAL_QUOTE: usize = 200;
 /// the page bigger.
 pub(crate) const PAGE_LIMIT: usize = 100;
 
+/// One explicit bound for a response before JSON materialization and
+/// for retained recovery inventory, including a union of censuses.
+pub(crate) const MAX_INVENTORY_BYTES: usize = 16 * 1024 * 1024;
+
+pub(crate) async fn bounded_api_body(
+    mut response: reqwest::Response,
+    method: &Method,
+    path: &str,
+) -> std::result::Result<Vec<u8>, ApiFailure> {
+    let refusal = || ApiFailure {
+        kind: Failure::Malformed,
+        cause: anyhow!(
+            "{method} {path}: HTTP {} exceeds response byte bound {MAX_INVENTORY_BYTES}; body unjudged",
+            response.status()
+        ),
+    };
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_INVENTORY_BYTES as u64)
+    {
+        return Err(refusal());
+    }
+    let status = response.status();
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        ApiFailure::transport(error, format!("reading {method} {path} response"))
+    })? {
+        if chunk.len() > MAX_INVENTORY_BYTES.saturating_sub(body.len()) {
+            return Err(ApiFailure {
+                kind: Failure::Malformed,
+                cause: anyhow!(
+                    "{method} {path}: HTTP {status} exceeds response byte bound {MAX_INVENTORY_BYTES}; body unjudged"
+                ),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Charge serialized bytes without allocating a second JSON document.
+/// An over-budget inventory is UNKNOWN, never an accepted prefix.
+pub(crate) fn charge_census_json(value: &Value, remaining: &mut usize) -> Result<()> {
+    struct Counter<'a>(&'a mut usize);
+    impl std::io::Write for Counter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > *self.0 {
+                return Err(std::io::Error::other(
+                    "recovery inventory byte bound exceeded",
+                ));
+            }
+            *self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Counter(remaining), value)
+        .context("recovery inventory byte bound; census unjudged")
+}
+
 /// The `total` a list response carries — the DB-wide count of rows
 /// matching the filter AND the caller's policy scope, authoritative
 /// over any single page's length (`http/jobs.rs` builds it beside
@@ -641,10 +707,21 @@ pub(crate) const PAGE_LIMIT: usize = 100;
 /// wrong deployment answers (CLAUDE.md §Doors), and this number decides
 /// whether every matching car has been read.
 pub(crate) fn list_total(body: &Value) -> Result<usize> {
-    let total = body
-        .get("total")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("list response carries no `total`: {body}"))?;
+    let total = body.get("total").and_then(Value::as_u64).ok_or_else(|| {
+        // An invalid envelope is not a census. Echoing unrelated fields
+        // here made its own refusal PATCH exceed ordinary ingress, so
+        // the unresolved loss aged out without a handback (0ce12d49).
+        let kind = match body.get("total") {
+            None => "missing",
+            Some(Value::Null) => "null",
+            Some(Value::Bool(_)) => "boolean",
+            Some(Value::Number(_)) => "outside the unsigned integer range",
+            Some(Value::String(_)) => "string",
+            Some(Value::Array(_)) => "array",
+            Some(Value::Object(_)) => "object",
+        };
+        anyhow!("list response `total` is {kind}; expected an unsigned integer")
+    })?;
     usize::try_from(total).context("list total does not fit a usize")
 }
 
@@ -702,6 +779,49 @@ where
         }
     }
     Ok(out)
+}
+
+/// A launch decision needs a complete, stable census, not the dock's
+/// best-effort view while cars move. SELECT and COUNT can race; an
+/// inconsistent response therefore holds the train rather than granting
+/// another CREATE (971c9006, review 40b35d72).
+pub(crate) async fn list_original_attempts<F, Fut>(fetch: F) -> Result<Vec<Value>>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
+    let mut out = Vec::new();
+    let mut expected_total = None;
+    let mut identities = std::collections::HashSet::new();
+    let mut remaining_bytes = MAX_INVENTORY_BYTES;
+    loop {
+        let body = fetch(out.len())
+            .await?
+            .ok_or_else(|| anyhow!("empty original-attempt list response"))?;
+        let total = list_total(&body)?;
+        charge_census_json(&body, &mut remaining_bytes)?;
+        if expected_total.is_some_and(|expected| total != expected) {
+            bail!("original-attempt total changed during pagination");
+        }
+        expected_total = Some(total);
+        let page = rows(Some(body))?;
+        let remaining = total
+            .checked_sub(out.len())
+            .ok_or_else(|| anyhow!("original-attempt census exceeds total"))?;
+        if page.len() != remaining.min(PAGE_LIMIT) {
+            bail!("original-attempt page is truncated or exceeds its requested bound");
+        }
+        for row in &page {
+            let id = job_id(row)?;
+            if id.is_empty() || !identities.insert(id.to_owned()) {
+                bail!("original-attempt census has missing or repeated identity");
+            }
+        }
+        out.extend(page);
+        if out.len() == total {
+            return Ok(out);
+        }
+    }
 }
 
 pub(crate) fn find_step<'a>(job: &'a Value, slug: &str, title: &str) -> Option<&'a Value> {
@@ -940,6 +1060,12 @@ pub(crate) struct OrphanCandidate {
 /// nobody took (review of car 2ca8c7e9). The runner lives inside the
 /// Job, so the cluster read the adapter makes is the heartbeat.
 pub(crate) fn orphaned_gate_run(run: &Value, now: DateTime<Utc>) -> Option<OrphanCandidate> {
+    if run
+        .get("metadata")
+        .is_some_and(boss_jobs::gate_reservation::unresolved_intent)
+    {
+        return None;
+    }
     let verdict_step = find_step(run, "record-verdict", "Record the gate verdict")?;
     if step_done(Some(verdict_step)) {
         return None;
@@ -1024,6 +1150,14 @@ pub(crate) const APPROACH_FRESH_DAYS: i64 = 2;
 
 pub(crate) fn verdict_to_bury(run: &Value, now: DateTime<Utc>) -> Option<(String, String)> {
     if run.get("status").and_then(Value::as_str) != Some("closed") {
+        return None;
+    }
+    // Main's full gate gates main itself: "landed" is always true of it,
+    // and its red is answered by its own item (backlog 77596188).
+    if run
+        .get("metadata")
+        .is_some_and(boss_jobs::full_gate_on_main::is_main_gate)
+    {
         return None;
     }
     let md = metadata_map(run);
@@ -1317,6 +1451,24 @@ mod burial_tests {
             None,
             "no sha, nothing to ask git"
         );
+    }
+
+    /// Main's full gate (backlog 77596188) gates a sha that IS main, so
+    /// "its sha landed" is true the moment it is filed. Buried, a red
+    /// main would be stamped "the change went in without this gate" — a
+    /// false sentence on the one red that says main is broken.
+    #[test]
+    fn a_main_gate_is_never_buried() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 5, 17, 0, 0).unwrap();
+        for v in ["lost", "failed"] {
+            let r = run(
+                "closed",
+                v,
+                "2026-09-04T00:20:43Z",
+                json!({"branch": "main", "main_gate": true}),
+            );
+            assert_eq!(verdict_to_bury(&r, now), None, "{v}");
+        }
     }
 }
 
@@ -1774,6 +1926,109 @@ mod tests {
         assert_eq!(list_total(&body).unwrap(), 150);
         // no `total` is an error, never zero: zero is a wrong deployment.
         assert!(list_total(&json!({"data": []})).is_err());
+    }
+
+    #[test]
+    fn list_total_invalid_field_describes_type_without_echoing_payload() {
+        for (total, kind) in [
+            (Value::Null, "null"),
+            (json!(true), "boolean"),
+            (json!(-1), "outside the unsigned integer range"),
+            (json!(1.5), "outside the unsigned integer range"),
+            (json!("x".repeat(MAX_INVENTORY_BYTES)), "string"),
+            (json!([]), "array"),
+            (json!({}), "object"),
+        ] {
+            let error =
+                list_total(&json!({"total":total,"data":[],"other":"private unrelated field"}))
+                    .unwrap_err()
+                    .to_string();
+            assert_eq!(
+                error,
+                format!("list response `total` is {kind}; expected an unsigned integer")
+            );
+        }
+        assert_eq!(
+            list_total(&json!({"data":[],"other":"x".repeat(MAX_INVENTORY_BYTES)}))
+                .unwrap_err()
+                .to_string(),
+            "list response `total` is missing; expected an unsigned integer"
+        );
+        assert_eq!(list_total(&json!({"total":0,"data":[]})).unwrap(), 0);
+        assert_eq!(list_total(&json!({"total":123,"data":[]})).unwrap(), 123);
+    }
+
+    #[tokio::test]
+    async fn original_attempt_census_requires_complete_stable_unique_pages() {
+        let full: Vec<Value> = (0..101)
+            .map(|id| json!({"id":format!("gate-{id}")}))
+            .collect();
+        let all = &full;
+        let gathered = list_original_attempts(|offset| async move {
+            Ok(Some(json!({"total":all.len(), "data":all.iter().skip(offset).take(PAGE_LIMIT).collect::<Vec<_>>()})))
+        }).await.unwrap();
+        assert_eq!(gathered, full);
+        assert!(
+            list_original_attempts(|_| async { Ok(Some(json!({"total":0,"data":[]}))) })
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for body in [
+            json!({"total":1,"data":[]}),
+            json!({"total":0,"data":[{"id":"extra"}]}),
+            json!({"total":1,"data":[{}]}),
+            json!({"data":[]}),
+        ] {
+            assert!(
+                list_original_attempts(|_| {
+                    let body = body.clone();
+                    async move { Ok(Some(body)) }
+                })
+                .await
+                .is_err()
+            );
+        }
+        for tail in [
+            json!({"total":101,"data":[]}),
+            json!({"total":101,"data":[{"id":"gate-0"}]}),
+            json!({"total":102,"data":[{"id":"gate-100"}]}),
+            json!({"total":100,"data":[]}),
+        ] {
+            let head = &full;
+            assert!(
+                list_original_attempts(|offset| {
+                    let body = if offset == 0 {
+                        json!({"total":101,"data":&head[..100]})
+                    } else {
+                        tail.clone()
+                    };
+                    async move { Ok(Some(body)) }
+                })
+                .await
+                .is_err()
+            );
+        }
+        assert!(
+            list_original_attempts(|_| async { anyhow::bail!("unreadable original page") })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn original_attempt_census_refuses_aggregate_bytes_across_small_pages() {
+        let all: Vec<Value> = (0..200)
+            .map(|id| json!({"id":format!("gate-{id}"),"padding":"x".repeat(100_000)}))
+            .collect();
+        let rows = &all;
+        let result=list_original_attempts(|offset|async move {
+            Ok(Some(json!({"total":rows.len(),"data":rows.iter().skip(offset).take(PAGE_LIMIT).collect::<Vec<_>>()})))
+        }).await;
+        assert!(
+            result.is_err(),
+            "two individually bounded pages must not create an unbounded inventory"
+        );
     }
 
     /// THE STARVATION REGRESSION. A parked-ready car opened days ago

@@ -1,0 +1,76 @@
+# publish-to-github's `measure` is completed from the machine's own
+# drift reading (backlog f4bafd6b; design 393bdef6 Q3, David
+# 2026-10-16), the way `open-pr`, `read-checks` and `merge` already are.
+#
+# MEASURED, NOT INFERRED. 2026-10-09..16: the publish packet's measure
+# step was completed by an agent twice, after waits of 41.8 h and
+# 96.9 h, and the publish region read TROUBLED from 2026-10-15 — while
+# `publish-github-pr --measure` (the `mirror-drift` verb, filed daily by
+# refresh-publish-drift-daily) had already written `drift_refresh` onto
+# the very packet the agent was waiting to measure. The step's procedure
+# said "do not transcribe", because the reading did not carry everything
+# the step records: no shas, the newly-public count meant something
+# else, the file list was cut at twenty, and nothing said whether the
+# mirror held foreign work. The verb now records each of those in the
+# instrument's own vocabulary (infra/prep-github-publish.sh --json), so
+# copying it IS the measurement, not a transcription of a lead.
+#
+# THE TRIGGER IS THE READING LANDING. `measure` goes ready the instant
+# the packet opens; the reading arrives minutes later, through PATCH
+# /api/jobs/{id}/metadata, which emits `jobs.job.updated` carrying the
+# packet as merged. A rule on `step.ready` would always find nothing to
+# copy. A packet already past `measure` (held at approve, re-measured
+# daily) finds the step closed and writes nothing.
+#
+# WHAT IT REFUSES, and leaves to the agent block that stays on the
+# step (each the record's own answer, not a guess):
+#
+# - a reading that is not CLEAN or carries a `blocking` note — a FAILED
+#   secrets scan or foreign mirror content. The agent's procedure quotes
+#   the lint's own report there, which the reading does not carry. The
+#   `when` below selects an EVENT only on `secrets_scan = "clean"` and
+#   `blocking = ""`, and an ABSENT `blocking` (a reading from before this
+#   car's verb converged) is unequal to every literal. The `when` judges
+#   the triggering event, but the handler copies the packet as it
+#   re-reads it, which a later reading may have changed (a late or
+#   retried event; review 4e3a8e59 N1) — so `requires_equal` makes the
+#   handler judge the RE-READ reading by the same two conditions, and a
+#   test holds the two lists equal.
+# - a reading taken BEFORE the packet opened (`measured_at` older than
+#   `opened_at`, or either unreadable): a day-old number is not this
+#   packet's measurement.
+# - a reading missing any key the step records (`whole_record`): a
+#   partial copy is not a measurement.
+# - a step an agent has CLAIMED (`unless_claimed`): it is re-measuring,
+#   and completing its step would land its run as delivered.
+# - a measure or approve step already holding a DIFFERENT value: someone
+#   recorded another tree, and two trees on one packet is the defect the
+#   passkey binding exists to refuse.
+#
+# THE APPROVE STEP GETS THE SAME TWO SHAS FIRST (`also`), as the agent's
+# procedure required: David's passkey signs approve's own keys, and the
+# forge publishes exactly that commit. They are `filled_by = "filer"`
+# there, which a non-person may write on a human-only step.
+[[rule]]
+name = "publish-measure-lands-the-drift-reading"
+why = """
+A COPY OF A READING THE RECORD ALREADY HOLDS, onto the step that asks
+for it: the Workflow row can require the measure fields at done, but it
+cannot copy a value from its packet's metadata onto a step, and its
+`ready_when` cannot complete anything — the same reason open-pr,
+read-checks and merge are completed by rules. Measured 2026-10-09..16
+(design 393bdef6): two measure completions, both by an agent, after
+41.8 h and 96.9 h, while the mirror-drift verb had written the reading
+onto the packet minutes after it opened. No authority widened: the
+fields are the verb's own, copied, never computed here; a reading that
+is not clean, blocking, older than the packet, partial, or contradicted
+by a value already on the step is left to the agent block that stays on
+the step; and the only other write is the two filer shas on approve
+that the agent's procedure already wrote.
+"""
+version = 1
+on_event = "jobs.job.updated"
+when = 'kind = "publish-to-github" AND metadata.drift_refresh.secrets_scan = "clean" AND metadata.drift_refresh.blocking = ""'
+[[rule.do]]
+handler = "jobs.complete_step_from_record"
+args = { kind = "\"publish-to-github\"", step = "\"measure\"", requires = "\"drift_refresh\"", record = '"{\"commits_ahead\": \"/drift_refresh/commits_ahead\", \"files_changed\": \"/drift_refresh/files_changed\", \"secrets_scan\": \"/drift_refresh/secrets_scan\", \"newly_public\": \"/drift_refresh/newly_public_sensitive\", \"newly_public_files\": \"/drift_refresh/newly_public_files\", \"has_drift\": \"/drift_refresh/has_drift\", \"source_sha\": \"/drift_refresh/source_sha\", \"scanned_sha\": \"/drift_refresh/scanned_sha\"}"', done_metadata = '"{\"items\": [{\"label\": \"Measured by the machine: the publish-github-pr --measure reading on this packet, copied field for field by the dispatcher rule publish-measure-lands-the-drift-reading\", \"checked\": true, \"checked_by\": \"rule:publish-measure-lands-the-drift-reading\"}]}"', measured_at = "\"/drift_refresh/measured_at\"", whole_record = "\"true\"", unless_claimed = "\"true\"", also = '"{\"approve\": {\"source_sha\": \"/drift_refresh/source_sha\", \"scanned_sha\": \"/drift_refresh/scanned_sha\"}}"', requires_equal = '"{\"/drift_refresh/secrets_scan\": \"clean\", \"/drift_refresh/blocking\": \"\"}"' }

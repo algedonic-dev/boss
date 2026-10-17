@@ -812,6 +812,17 @@ impl JobsRepository for PgJobs {
         job_events: &[boss_core::event::Event],
         step_events: &[boss_core::event::Event],
     ) -> Result<Admission, JobsError> {
+        if [
+            crate::metadata_immutability::KEY,
+            crate::metadata_immutability::GUARDED_KEY,
+        ]
+        .iter()
+        .any(|key| job.metadata.get(key).is_some())
+        {
+            return Err(JobsError::ImmutableMetadata(
+                "first-write bindings are created only by the conditional metadata door".into(),
+            ));
+        }
         // Refused before BEGIN: a short zip would commit rows the log
         // does not hold (the port doc says why that is a rebuild
         // divergence, not an inconvenience).
@@ -876,6 +887,23 @@ impl JobsRepository for PgJobs {
                     version: job.workflow_version,
                 });
             }
+        }
+        if row_stands.is_some() {
+            let schema: serde_json::Value = sqlx::query_scalar(
+                "SELECT metadata_schema FROM workflows WHERE kind=$1 AND version=$2",
+            )
+            .bind(&job.kind)
+            .bind(job.workflow_version)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| JobsError::Storage(error.to_string()))?;
+            crate::metadata_immutability::validate_protocol(
+                &schema,
+                &serde_json::json!({}),
+                &job.metadata,
+                None,
+            )
+            .map_err(JobsError::ImmutableMetadata)?;
         }
         // Birth-by-job subject kinds (`metadata.birth = "job"` in the
         // SubjectKind registry: `workflow`, `custom`) have no domain
@@ -1076,6 +1104,33 @@ impl JobsRepository for PgJobs {
             .begin()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let before: Option<(String, i32, serde_json::Value)> = sqlx::query_as(
+            "SELECT kind,workflow_version,metadata FROM jobs WHERE id=$1 FOR UPDATE",
+        )
+        .bind(*job.id.inner().as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let before = before.ok_or(JobsError::NotFound(job.id))?;
+        crate::metadata_immutability::preserve(&before.2, &job.metadata, false)
+            .map_err(JobsError::ImmutableMetadata)?;
+        let schema: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT metadata_schema FROM workflows WHERE kind=$1 AND version=$2",
+        )
+        .bind(&before.0)
+        .bind(before.1)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| JobsError::Storage(error.to_string()))?;
+        if let Some(schema) = schema {
+            crate::metadata_immutability::validate_protocol(
+                &schema,
+                &before.2,
+                &job.metadata,
+                None,
+            )
+            .map_err(JobsError::ImmutableMetadata)?;
+        }
         // `partition` (and its derived `simulated`) and `opened_at`
         // are deliberately absent from the SET list: a Job's origin
         // and the instant it was admitted are decided at admission and
@@ -1154,6 +1209,108 @@ impl JobsRepository for PgJobs {
         Ok(())
     }
 
+    async fn conditional_job_metadata_receipt(
+        &self,
+        id: &JobId,
+        actor: &str,
+        command_id: uuid::Uuid,
+    ) -> Result<Option<crate::conditional_metadata::Receipt>, JobsError> {
+        let receipt:Option<String>=sqlx::query_scalar("SELECT receipt FROM job_metadata_receipts WHERE job_id=$1 AND actor=$2 AND command_id=$3")
+            .bind(*id.inner().as_uuid()).bind(actor).bind(command_id).fetch_optional(&self.pool).await.map_err(|error|JobsError::Storage(error.to_string()))?;
+        receipt
+            .map(|text| {
+                serde_json::from_str(&text).map_err(|error| JobsError::Storage(error.to_string()))
+            })
+            .transpose()
+    }
+
+    async fn conditional_job_metadata_decision_at(
+        &self,
+        id: &JobId,
+        command: &crate::conditional_metadata::Command,
+        judged_on: Option<&Job>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::conditional_metadata::Outcome, JobsError> {
+        command
+            .validate()
+            .map_err(|e| JobsError::Storage(e.into()))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // Lock the packet BEFORE checking receipts: same-packet retries
+        // serialize even when their receipt row does not exist yet.
+        let row = sqlx::query_as::<_, JobRow>("SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition FROM jobs WHERE id=$1 FOR UPDATE")
+            .bind(*id.inner().as_uuid()).fetch_optional(&mut *tx).await.map_err(|e| JobsError::Storage(e.to_string()))?.ok_or(JobsError::NotFound(*id))?;
+        let current = row_to_job(row);
+        let actor = stamp.actor().to_string();
+        let stored: Option<String> = sqlx::query_scalar("SELECT receipt FROM job_metadata_receipts WHERE job_id=$1 AND actor=$2 AND command_id=$3")
+            .bind(*id.inner().as_uuid()).bind(&actor).bind(command.idempotency_key)
+            .fetch_optional(&mut *tx).await.map_err(|e| JobsError::Storage(e.to_string()))?;
+        if let Some(stored) = stored {
+            let prior: crate::conditional_metadata::Receipt =
+                serde_json::from_str(&stored).map_err(|e| JobsError::Storage(e.to_string()))?;
+            return if &prior.command == command {
+                Ok(crate::conditional_metadata::Outcome {
+                    receipt: prior,
+                    applied: false,
+                })
+            } else {
+                Err(JobsError::JobChanged { id: *id })
+            };
+        }
+        if !command.matches(&current)
+            || judged_on.is_some_and(|read| {
+                read.status != current.status || read.metadata != current.metadata
+            })
+        {
+            return Err(JobsError::JobChanged { id: *id });
+        }
+        let job = command.apply(&current)?;
+        if !command.immutable_keys.is_empty() || !command.guarded_keys.is_empty() {
+            let schema: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT metadata_schema FROM workflows WHERE kind=$1 AND version=$2 AND status <> 'draft'",
+            ).bind(&current.kind).bind(current.workflow_version)
+                .fetch_optional(&mut *tx).await.map_err(|error| JobsError::Storage(error.to_string()))?;
+            crate::metadata_immutability::validate_protocol(
+                &schema.ok_or_else(|| {
+                    JobsError::ImmutableMetadata(
+                        "published pinned first-binding declaration is unavailable".into(),
+                    )
+                })?,
+                &current.metadata,
+                &job.metadata,
+                Some(command),
+            )
+            .map_err(JobsError::ImmutableMetadata)?;
+        }
+        sqlx::query("UPDATE jobs SET metadata=$2, updated_at=$3 WHERE id=$1")
+            .bind(*id.inner().as_uuid())
+            .bind(&job.metadata)
+            .bind(stamp.timestamp)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let (receipt, pair) = crate::conditional_metadata::recorded_pair(stamp, command, job)?;
+        sqlx::query("INSERT INTO job_metadata_receipts (job_id,actor,command_id,receipt) VALUES ($1,$2,$3,$4)")
+            .bind(*id.inner().as_uuid()).bind(&receipt.actor).bind(command.idempotency_key)
+            .bind(serde_json::to_string(&receipt).map_err(|e| JobsError::Storage(e.to_string()))?)
+            .execute(&mut *tx).await.map_err(|e| JobsError::Storage(e.to_string()))?;
+        for event in pair {
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(JobsError::Storage)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok(crate::conditional_metadata::Outcome {
+            receipt,
+            applied: true,
+        })
+    }
+
     async fn merge_job_metadata_at(
         &self,
         id: &JobId,
@@ -1184,7 +1341,7 @@ impl JobsRepository for PgJobs {
         // lock, parsed as the caller's copy was, and a moved status or
         // metadata refuses before anything is written. The lock holds
         // to the UPDATE below, so nothing lands between the two.
-        if let Some(read) = judged_on {
+        {
             let row = sqlx::query_as::<_, JobRow>(
                 "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, opened_at, due_on, closed_on, metadata, tags, partition FROM jobs WHERE id = $1 FOR UPDATE",
             )
@@ -1196,7 +1353,21 @@ impl JobsRepository for PgJobs {
                 return Err(JobsError::NotFound(*id));
             };
             let current = row_to_job(row);
-            if current.status != read.status || current.metadata != read.metadata {
+            crate::metadata_immutability::patch(&current.metadata, patch)
+                .map_err(JobsError::ImmutableMetadata)?;
+            let schema:Option<serde_json::Value>=sqlx::query_scalar("SELECT metadata_schema FROM workflows WHERE kind=$1 AND version=$2 AND status <> 'draft'")
+                .bind(&current.kind).bind(current.workflow_version).fetch_optional(&mut *tx).await.map_err(|error|JobsError::Storage(error.to_string()))?;
+            if let Some(schema) = schema {
+                crate::metadata_immutability::validate_protocol_patch(
+                    &schema,
+                    &current.metadata,
+                    patch,
+                )
+                .map_err(JobsError::ImmutableMetadata)?;
+            }
+            if judged_on.is_some_and(|read| {
+                current.status != read.status || current.metadata != read.metadata
+            }) {
                 return Err(JobsError::JobChanged { id: *id });
             }
         }
@@ -1258,6 +1429,40 @@ impl JobsRepository for PgJobs {
             .begin()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let before: Option<(String, i32, serde_json::Value)> = sqlx::query_as(
+            "SELECT kind,workflow_version,metadata FROM jobs WHERE id=$1 FOR UPDATE",
+        )
+        .bind(*id.inner().as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        if let Some(before) = before {
+            crate::metadata_immutability::patch(&before.2, owned)
+                .map_err(JobsError::ImmutableMetadata)?;
+            let schema: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT metadata_schema FROM workflows WHERE kind=$1 AND version=$2",
+            )
+            .bind(&before.0)
+            .bind(before.1)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| JobsError::Storage(error.to_string()))?;
+            if let Some(schema) = schema {
+                let mut after = before.2.as_object().cloned().unwrap_or_default();
+                after.extend(
+                    owned
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
+                crate::metadata_immutability::validate_protocol(
+                    &schema,
+                    &before.2,
+                    &serde_json::Value::Object(after),
+                    None,
+                )
+                .map_err(JobsError::ImmutableMetadata)?;
+            }
+        }
         // ONE statement is both halves of the contract. The merge is
         // `merge_job_metadata_at`'s — against the row as it stands, so
         // a key another writer merged after this closer read the row
@@ -1558,6 +1763,85 @@ impl JobsRepository for PgJobs {
             .collect())
     }
 
+    async fn historical_events(
+        &self,
+        job_id: &JobId,
+        upto: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        Ok(
+            boss_events::tail_http::history_through(&self.pool, &job_id.to_string(), upto, limit)
+                .await
+                .map_err(JobsError::Storage)?
+                .into_iter()
+                .map(|r| crate::move_diagnosis::HistoricalEvent {
+                    seq: r.seq,
+                    created_at: Some(r.created_at),
+                    event: boss_core::event::Event {
+                        id: r.event_id,
+                        timestamp: r.timestamp,
+                        source: r.source,
+                        kind: r.kind,
+                        payload: r.payload,
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    async fn membership_snapshot(
+        &self,
+        since: DateTime<Utc>,
+        actor: Option<String>,
+        scope: &JobScope,
+        limit: i64,
+    ) -> Result<crate::membership_replay::ReplayInput, JobsError> {
+        crate::membership_history_pg::snapshot(&self.pool, since, actor, scope, limit)
+            .await
+            .map_err(JobsError::Storage)
+    }
+
+    async fn move_admission_snapshot(
+        &self,
+        d: &crate::move_diagnosis::Diagnosis,
+    ) -> Result<crate::move_admission::Snapshot, JobsError> {
+        crate::move_admission_pg::snapshot(&self.pool, d)
+            .await
+            .map_err(JobsError::Storage)
+    }
+
+    async fn historical_station_events(
+        &self,
+        name: &str,
+        upto: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        Ok(boss_events::tail_http::registry_history_through(
+            &self.pool,
+            name,
+            &[
+                crate::events::STATION_PUBLISHED,
+                crate::events::STATION_RETIRED,
+            ],
+            upto,
+            limit,
+        )
+        .await
+        .map_err(JobsError::Storage)?
+        .into_iter()
+        .map(|r| crate::move_diagnosis::HistoricalEvent {
+            seq: r.seq,
+            created_at: Some(r.created_at),
+            event: boss_core::event::Event {
+                id: r.event_id,
+                timestamp: r.timestamp,
+                source: r.source,
+                kind: r.kind,
+                payload: r.payload,
+            },
+        })
+        .collect())
+    }
     async fn events_for_job(
         &self,
         job_id: &JobId,
@@ -1944,6 +2228,10 @@ impl JobsRepository for PgJobs {
               AND ($20::bool IS NULL
                    OR (status IN ('closed', 'cancelled')) = $20)
               AND ($21::text[] IS NULL OR NOT (kind = ANY($21)))
+              AND ($23::timestamptz IS NULL OR EXISTS (
+                SELECT 1 FROM steps s
+                WHERE s.job_id = jobs.id AND s.completed_at >= $23
+              ))
               -- opened_on is a DATE: a busy day is one big tie, and a
               -- LIMIT over an arbitrary order returns an arbitrary
               -- subset (2026-09-07 held 398 closed pr-trains; the
@@ -1981,6 +2269,7 @@ impl JobsRepository for PgJobs {
             .bind(filter.terminal)
             .bind(filter.excluded_kinds.as_deref())
             .bind(filter.oldest_first)
+            .bind(filter.step_completed_since)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -2040,6 +2329,10 @@ impl JobsRepository for PgJobs {
               AND ($18::bool IS NULL
                    OR (status IN ('closed', 'cancelled')) = $18)
               AND ($19::text[] IS NULL OR NOT (kind = ANY($19)))
+              AND ($20::timestamptz IS NULL OR EXISTS (
+                SELECT 1 FROM steps s
+                WHERE s.job_id = jobs.id AND s.completed_at >= $20
+              ))
             "#,
         )
         .bind(filter.kind.as_deref())
@@ -2061,6 +2354,7 @@ impl JobsRepository for PgJobs {
         .bind(filter.priority.map(priority_str))
         .bind(filter.terminal)
         .bind(filter.excluded_kinds.as_deref())
+        .bind(filter.step_completed_since)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;

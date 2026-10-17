@@ -1234,6 +1234,219 @@ behind X)" — busy, or troubled when the edge can never clear. Built
 (`boss_jobs::regions::stuck`, `ThirdStuck`), and the HUD frame below and
 `boss orient` read it through the `thirds` rows.
 
+### Station membership flow requires conserved original state
+
+Design `aa0f88c1-4845-4b96-ab5a-8a8e8bd3b5ce`, settled with no open
+questions on 2026-10-15, answers part of urgent
+`a4de1e72-0010-4247-8c38-35d791d6e1e4`. Packet membership is a separate,
+versioned flow basis from the existing distinct ready/done **step-events**
+counts. Count every false-to-true arrival and true-to-false departure,
+including re-entry; two eligible steps on one packet are not two packets.
+Expiry, cancellation, reassignment and registry publication can change
+membership without proving work served. Preserve their departure causes.
+
+Evaluate the full registry population through `StationPredicate::matches`,
+`bind_self` and `in_window`, rather than station-name branches. The native
+2026-10-15 measurement contained **19 of 19 stations**; five predicates
+need more than the existing cube: agent model/authority step metadata;
+completed design review and its seven-day terminal window; the caller's
+submitted-by/dismissed watchlist and its fourteen-day window; original
+proof-probe absence alongside platform-admin task membership; and original
+failing CI judgement, later repair and terminal train state. Loading-dock's
+metadata predicate also remains in scope. Derived station history comes
+from immutable workflow publications with authored-row precedence, not a
+projection's read-time creation stamp or today's protocol set.
+
+Replay full original Job/Step snapshots in audit order, with the original
+station version, an initial state before the requested window and complete
+bounded history. Reuse the landed packet/station historical read ports;
+their current carriers still omit `audit_log.created_at`. Conserve that
+original insertion instant through both adapters. A live Event's
+`timestamp` is wall time under the current Event contract, but it is a
+different original from the audit insertion instant used for rate windows.
+Neither today's packet metadata nor a timestamp guessed at read time can
+supply missing history.
+
+An original domain transaction needs a conserved group and completeness
+witness, so its sibling snapshots do not manufacture intermediate queue
+crossings. Equal timestamps, adjacent audit rows and the outbox relay's
+transaction do not establish that boundary. A relay that has delivered only
+part of an original group leaves that interval unavailable. Terminal expiry
+also needs original, versioned business-clock configuration and epoch
+coverage: wall-to-business intervals must survive configure, pause, resume,
+restart and the direct Jobs reset writers. Ephemeral ticks and the current
+mutable clock row prove no past mapping; wall mode needs its original mode
+and coverage witness too. This decision specifies the evidence contract,
+not an invented clock-history implementation.
+
+The reader reports basis, station version, caller binding, authorized scope,
+window, covered interval and audit cutoffs. Personal flow stays explicitly
+bound to the actual caller. Narrow or denied scope must not become a global
+aggregate or expose unauthorized historical packets. Missing snapshots,
+original wall instants, group completeness, clock mapping, registry history
+or safe scope remain **UNKNOWN**, with the deciding original reason; a
+truncated slice is not empty success. Preserve unaffected known intervals
+without disguising the unknown part as zero.
+
+This is a source plan, not delivery of the new reader. Acceptance still
+requires causal controls for all five predicates and the full population:
+metadata-only changes, repeated entry, atomic sibling changes and partial
+relay, pause/resume/reset expiry, publication/retirement, caller binding,
+narrow/denied scope and incomplete originals. The same originals must
+replay deterministically. Preflight, gates, independent review and deployed
+full-window evidence remain owed. No history is rewritten, move cleared,
+alarm demoted or new private read authority granted by this fold.
+
+### Station alarms state the action the factory needs
+
+Design `5da17ace-7e35-4eae-a7c6-20e063c1791a`, settled with no open
+questions on 2026-10-14 from David's coordination-session instruction,
+answers urgent `df8fe965-8d0c-407b-a47b-532b5da20c0e`. **Red means
+immediate action required.** An urgent packet waiting for proof or a
+clean window can remain open without making its station red. Severity
+describes the present station condition; job priority is separate.
+
+Keep the four existing wire states, with no fifth waiting state:
+**Clear** and **Full** retain their healthy-flow meanings; **Attention**
+is yellow, an understood wait or warning that needs watching;
+**Troubled** is red, a specific fault, an overdue or unowned action, or
+a required reading that cannot be taken. These meanings refine the
+earlier map decision's three displayed state words; retaining Full
+does not restore the retired busy vocabulary.
+
+A qualified wait identifies its packet, actual owner, required
+condition, supporting evidence and next observable check. A world
+event needs a working observer. A clean window needs its recorded
+beginning, requested duration and coverage. A failed proof is a fault;
+a green gate is neither deployment nor runtime proof. No boolean
+waiting flag may exempt a packet from a genuine fault.
+
+Use structured `waits_on`, `owned_wait`, `proof_attempt` and registered
+step claims wherever they already hold the facts. Internal gate and
+review waits derive from their actual registered run, exact head and
+recorded bound. Missing owner or bound belongs in an extension to the
+appropriate versioned workflow or station contract, written through
+its audited door. Do not derive an exemption by parsing hold prose.
+Observe the next check when due: a failed observer, missed check,
+missing owner or satisfied condition without subsequent action names
+work to do now. A finished run with an overdue handback is such work;
+an active exact-head review inside its bound is an expected wait.
+
+The supported proof observer distinguishes a negative reading from a
+failed read: exit 0 means the condition is seen; exit 1 qualifies as
+unseen only when its executed stdout is JSON containing
+`"observation":"unseen"`. The same JSON may carry clean-window coverage.
+Other exits, missing tools, refused execution and legacy nonzero outputs
+remain unread. Existing records are not relabeled or backfilled. The
+proof attempt retains the complete observer stdout, stderr and any actual
+process exit separately from admission, environment and missing-tool
+diagnoses; a refusal invents no process streams. The shared wait judge
+consumes this outcome before qualifying a world or named actor's wait.
+
+Preserve the worst genuine finding in mixed fault-and-wait membership.
+Healthy activity remains healthy. An external event not yet observed
+inside its recorded wait is not a failed probe. A scheduled proof or
+covered clean window is not overdue before its actual deadline.
+
+Implementation remains separate work. The accepted plan inventories
+each Troubled band with its packet, source, action owner and observable
+clearance condition (urgent `a4de1e72`), repairs measured placement and
+intake faults first, then shares one pure fault/wait classification
+across shed, garage, marshalling and their border and alert consumers.
+Owner, condition and check evidence travel in the payload so the UI
+and alarms read the same judgment. Registry contracts extend only for
+information that the existing records lack.
+
+Each actual misclassification requires failing-first tests with paired
+controls: an observed event wait, a covered window before its deadline,
+an active exact-head review, a missing observer, overdue internal work,
+a failed proof, unknown input and mixed membership. Clear/Full healthy
+controls and Attention/Troubled styling remain distinct. Source is
+gated and independently reviewed under existing trust rules; deployment
+must then be observed in fresh native region and alert output. An alarm
+clears when its tested predicate clears, while an open urgent packet
+keeps its owner until its protocol actually finishes.
+
+Undeclared moves remain engineering findings: urgent `814e6c66`
+records the measured non-packet sensor and lost-carriage cause; old
+`c8d22e63` is the distinct historical mover-provenance obligation.
+Repair and prove the transitions rather than colouring them yellow.
+Retain immutable history and record any correction or supersession
+explicitly. Overdue retros require real department evidence; an
+inapplicable generated retro requires a truthful supported outcome
+and a fix to the registered producer. The existing fourteen-day and
+three-day intake thresholds remain until separately measured evidence
+justifies changing them.
+
+**The undeclared band counts only the current mover's readings** (David,
+2026-10-17, on `c8d22e63`; supersedes in part the coordination rule
+below). Every `yard_moves` row carries `mover_version`, a content
+address of the source that decides placement (`moves.rs` and
+`regions/partition.rs`, computed like the diagnosis model, never bumped
+by hand), and `crossings` — what the band and the routes' observed
+counts read — counts only rows the deployed version wrote. So the
+deploy that carries a mover fix clears what its predecessor misread,
+instead of leaving a region TROUBLED for the 24h window. Nothing is
+rewritten or deleted: superseded rows, and rows written before the
+stamp (`NULL`, unknown), stay in the record and on `/api/yard/moves`
+naming their mover, and the correction ledger below still governs a
+current mover's row. The price is that any edit to either file restarts
+the band's window; a genuine undeclared route is re-observed the next
+time a packet takes it, while a misreading could only ever age out.
+
+**Among the current mover's rows, a historical finding is superseded only by an exact diagnosis**
+(operational design `a34bc69e`, 2026-10-14, answers `c8d22e63`). This
+conservative coordination decision follows the already authorized alarm
+repairs and correctness rules; it does not claim a separate approval
+from David. A producer SHA, reader-model version, deployment or changed
+route map never clears findings — except the mover's own version, as
+David decided above. Originals and their audit causes stay
+immutable. Genuine historical faults recorded by the current mover, and
+missing proof, remain loud; a row written by a superseded mover version
+stops counting toward the band on the deploy that supersedes it, though
+it stays in the raw record (David's decision above).
+
+Among the current mover's rows, only a falsely interpreted crossing may
+stop driving the current fault,
+after an append-only diagnosis binds its exact sequence, packet, audit
+cause and canonical original-record hash to the corrective artifact and
+an independently recorded machine-run proof. Resolve that proof from the
+record: require actual completion, successful execution, exact observed
+artifact, readable context and complete structured output naming those
+originals. Pasted output, missing tools, an override, clipped output,
+unrelated proof and a later correct crossing do not prove the past
+reading false. One invalid original refuses the entire bounded batch.
+
+Record the admitted diagnosis as an audit event and derive its projection
+from that event. Copy the validated original bindings and proof into the
+record so replay does not consult a changed reference, rerun a live probe
+or guess past placement from today's map. Retries are idempotent;
+withdrawals append records; unresolved conflicts remain visible. Use the
+existing packet update policy and exact packet/proof scope, with no new
+alarm-muting privilege or bypass.
+
+Raw reads retain every move. Give readers the separate correction and its
+evidence; partition counts into active, diagnosed-superseded and unknown
+or conflicted dispositions, conserving the raw total. Rows written by a
+superseded mover version are a fourth class: held in the raw record and
+the conserved total, excluded from the band. Among the current mover's
+rows, only a validated, unwithdrawn false reading leaves the fault count. Never rewrite its
+original declaration as true or infer missing dispatch context. The
+workflow version retained by `e95433aa` is dispatch provenance, not a
+reader version. No legacy row is automatically superseded in the ledger.
+
+The ledger's typed validation, immutable projection and admission
+observation landed under `c8d22e63`. Its further native-proof
+acquisition (branch `feat/acknowledge-exact-historical-evidence-loss`)
+was set aside by David on 2026-10-17 in favour of the version stamp
+above, which is how `c8d22e63` closes.
+
+This fold records accepted meaning, not an implemented alarm classifier
+or runtime clearance. Urgent `df8fe965` stays open for implementation
+and proof. No alarm is muted, no red threshold is relaxed to meet a
+colour target, and no private, provider, credential or activation
+authority is granted.
+
 **The HUD frame answers about the whole system, one fixed row per third;
 the map answers about the parts** (design `00774ca8`, David 2026-09-24,
 recorded as decisions with no open questions; answers backlog
@@ -2285,6 +2498,33 @@ named at start rather than silently dead air.
 
 ## Policy & auth
 
+### Guest access is an instance declaration
+
+The operating instance offers no guest sessions; the playground explicitly
+opts into the system-audit read. The OSS default is Basic: a `visitor`
+session with Read on published workflows and step plugins, widened only
+by the install's policy data. Unpublished drafts and company records are
+outside that default. Guests never gain write authority. Decision history:
+[2830b6b7](https://boss.algedonic.dev/ux/jobs/2830b6b7-ed66-4b58-bf4c-925afa396836),
+review completed by emp-david on 2026-09-25.
+
+The instance declaration is one value, `false | "basic" | "audit"`,
+rendered as `BOSS_GUEST_ACCESS=0 | basic | audit`. The gateway also accepts
+legacy `1` as Basic. Unknown values refuse guest access rather than
+choosing a role; the configuration never accepts an arbitrary role name.
+Basic mints `visitor`, Audit mints `audit-readonly`, and both belong to
+the shared read-only floor. `guest`, the historical internal no-header
+identity, is not the browser visitor role.
+
+This is the access contract, not proof that every module enforces it.
+The current gateway source still names module reads that lack policy
+checks; backlog `cda177ef` owns that remaining boundary. Offering Basic
+must not be described as completed isolation of all company data until
+those reads have their own refusal evidence. The playground's deliberate
+audit read does not excuse a Basic-mode leak.
+
+### Policy decisions and authority
+
 Every write passes `boss-policy` via the `PolicyClient` port.
 Rules are row-level grants of `(action, resource)` within a scope;
 user overrides take precedence; every decision is auditable. Scope
@@ -3093,6 +3333,24 @@ wait for the transport car, so no credential is minted without a reader.
 
 ## Calendar
 
+Release milestones are plans, separate from the act of cutting a release.
+The settled practical test uses one `release-milestone` packet per date
+on the schedule step assignee's calendar, initially emp-david. Moving a
+date withdraws the old packet and files a new one, preserving both dates;
+a reschedule mechanism is deferred until moves justify it. The agent may
+schedule the accepted target under the recorded company-frame decision;
+the fold supplies no new date. The historical 2026-09-30 target was not a
+promise and is not renewed by this record. Decision history and the
+original target remain on
+[e1dba350](https://boss.algedonic.dev/ux/jobs/e1dba350-7556-49f4-a6f2-d5a73c59fea0).
+
+Scheduling uses `duration_minutes`, the StepType and surface spelling;
+the hook's old `duration_hours` spelling is retired. A workflow step's
+capacity estimate is a different fact. The implementation obligation on
+backlog `fe199985` requires an actual active scheduling step, its matching
+calendar reservation and rendered calendar evidence. Recording the design
+does not prove that obligation or create a milestone, reservation or tag.
+
 Reservations store **UTC**; `strength` defaults `hard` for
 subjects that can't double-book, `soft` for advisory holds.
 Multi-occupancy resources are distinct subjects, not capacity-N; one
@@ -3184,6 +3442,32 @@ rule models with plain string-template substitution — no embedded
 scripting.
 
 ## Content, files, knowledge
+
+### The public engineering explanation lives on the tenant website
+
+The company website keeps its small-business lead. A separate engineering
+page, visibly linked from the homepage, explains refusals, recorded
+evidence and measured reliability. It belongs to the tenant's `site/`
+content and publishing path, not a BOSS application route. Decision:
+[59c0133a](https://boss.algedonic.dev/ux/jobs/59c0133a-8a8f-4a57-89b7-9b30e3e7adf4),
+placement approved by emp-david on 2026-10-02.
+
+The implementation is `site/engineering.html` and its homepage link in
+`david/algedonic-llc`, signed merge `f51ed7f7`, tenant commit
+`7434c8b5cd6def3c8f156c273530f78cae97e29e`. On 2026-10-15 the deployed
+site reader returned both files with HTTP 200 and bodies byte-identical
+to that commit; the complete bodies and hash receipts are attached to
+implementation job
+[f24df452](https://boss.algedonic.dev/ux/jobs/f24df452-ae24-46bb-b09b-c8bad52a17a8).
+That is content-delivery evidence, not a change to public Access policy
+or proof of an external authenticated browser journey.
+
+The explanation leads with a real recorded refusal. Historical claims
+need their original records, current measurements need dates and native
+evidence, and detecting a fault is distinct from fixing it. A protocol's
+existence proves neither completed backups nor guaranteed uptime.
+
+### Content records and attachments
 
 Bulletins and the company manual are separate tables in
 `boss-content`, Markdown-authored, searched via the shared FTS;
@@ -3280,6 +3564,26 @@ than name-lookup-first — the join on system-issued identity is the
 point, not a later feature.
 
 ## Step UX & frontend
+
+### Unmatched routes preserve the failed address
+
+An unmatched path renders a `notFound` route at the requested URL,
+including an unmatched path inside IT. It does not redirect to a landing
+page or draw a healthy yard. The surface names the address as escaped
+text and offers a route back to the relevant department or My Day.
+Single-identity route tails exclude raw slashes; a legitimate slash in
+an identifier must be encoded. Hierarchical manual section paths retain
+their separate slug semantics. A real landing surface has an explicit
+route rather than depending on the catch-all to remain reachable.
+
+This is the settled routing contract from
+[ee3a3a2f](https://boss.algedonic.dev/ux/jobs/ee3a3a2f-865d-4f7e-a9e0-4c5aa2b3e063).
+The original `/ux` spellings are historical: subsequent routing work may
+move a valid destination without restoring the misleading fallback.
+The current router and `App.svelte` carry the not-found branch. Source
+presence is not a fresh browser rendering receipt; implementation job
+`c4f2ae24` retains its own acceptance record. This fold adds no telemetry
+or inferred destination suggestions.
 
 Step surfaces ship as **data**: the registry row names a
 `surface` id; the SPA loads the step-type registry once and mounts
@@ -3723,7 +4027,10 @@ the region map drew the floor.
 **The map's meaning is fixed before its drawing: three state words, a
 partition, the order a car walks, borders drawn** (design `62de32ae`,
 "The IT map, round 3", David 2026-09-24, its one question accepted as
-proposed; the build rode as parts of feedback `c3105b2a`). A fresh-eyes
+proposed; the build rode as parts of feedback `c3105b2a`). The later
+[station alarm decision](#station-alarms-state-the-action-the-factory-needs)
+refines its severity meanings and retains the four existing wire states.
+A fresh-eyes
 review that day, by an agent that had not seen the map's history and
 rendered it against live reads at 1440 and 390 px, found the
 foundations right — one shared world, flow-ordered territories, the
@@ -4114,6 +4421,48 @@ manifest reads exec, finance and support on and every other declared
 module off.
 
 ## Deployment, the forge, and the cluster
+
+### A gate judges its tree; registry drift is estate work
+
+The live protocol and dispatcher-rule comparisons run after convergence,
+when the deployed image, authored tree and registry should agree. Their
+live reads are excluded from the consist gate; their tree checks and
+reader self-tests remain testable. A car cannot be failed because another
+train changed a live registry while its frozen tree was being tested.
+Decision history:
+[d349e0ba](https://boss.algedonic.dev/ux/jobs/d349e0ba-dd36-4b45-82d3-fe174b32043b).
+
+The converge records discrepancies and files deduplicated work naming
+the affected protocol or rule and the evidence for which side is ahead.
+A disagreement does not fail the deployment or silently overwrite a live
+edit. The current `registry-drift.sh` files work and does not publish.
+The approved successor may publish only a lineage-proven tree-ahead edit,
+after the lineage guard required by `9235802a` exists, under a named actor
+with the declared publication scope. A live-ahead row, unmatched lineage
+or retirement remains filed work. That conditional approval is not proof
+that automatic publication or the separate cadence observer has shipped.
+
+### Type checks cover dependent fixtures
+
+Test fixtures for `Job`, `Step` and `StepField` use constructor bases
+instead of copying every field. Production literals stay exhaustive
+where a new field needs an explicit semantic choice. `StepField::new`
+requires the name and field type while supplying the existing defaults;
+an empty-name `Default` would conceal a meaningless field. The
+`test-fixtures-use-constructor-bases` lint refuses exhaustive literals
+under crate `tests/` directories without a baseline allowance. In-source
+test modules remain outside that textual lint's reliable scope.
+
+Both the car gate and `--lint` preflight run workspace clippy with
+`--all-features --all-targets`, including normal binaries and dependent
+test targets. Build and test can retain their scoped gate selection;
+there is no second workspace check duplicating clippy. A warm leaf edit
+can reuse cached dependents; a cold cache or core type change pays the
+actual dependent compilation cost. A preflight pass is still not a gate
+or runtime proof. A changed parked head needs a new qualified receipt.
+These are the engineering decisions recorded in
+[caa2acc9](https://boss.algedonic.dev/ux/jobs/caa2acc9-4d2f-4224-9d2a-d96d281c3f30),
+not a claim that every in-source literal has been migrated.
 
 **Deployment is modeled on how networks patch** (living reference:
 `docs/design/deployment-as-network.md`, which the deploy scripts and
@@ -5543,3 +5892,244 @@ actual candidate result. Publication, arrival and the real diagnostic
 receipt remain separately observed obligations. Urgent ddcdf6eb still
 requires an observed successful departure. The next operator admission
 surface and presentation are separate implementation work under this plan.
+
+### Pre-create refusal and unresolved historical requests — d66ee7fa (2026-10-14)
+
+A pre-create refusal is a distinct result with no native Job or Pod UID.
+It retains the intent, unique invocation, winning immutable first-record
+disposition, phase and complete command originals with verified readback.
+Only the invocation that receives Recorded201 may prepare the candidate;
+Replayed200 reconciles originals without repeating an effect. Durable
+invocation entry precedes preparation, and an entering-create mark precedes
+creation. A fully observed failure before that mark can establish refusal.
+Create entry, lost acknowledgement, transport ambiguity, incomplete journal
+or failed record readback remains UNKNOWN. Current native absence cannot
+establish historical absence. The new result contract is an append-only
+protocol version; existing packets retain their pinned interpretation.
+
+David accepted administrative cancellation of historical diagnostic
+47648ecc-5ef9-4823-bd1c-5365fec2c09c as unresolved after preservation of its
+complete intent, original journal and current native census. That packet
+is cancelled under v1; cancellation skips unfinished steps and records no
+native outcome. Its original execution remains UNKNOWN. The immutable
+intent, all 1657 hash-bound journal observations and current census are
+preserved in verified content attachments, with a reconstruction manifest
+on the packet. This retirement proves no refusal, launch or candidate
+acceptance, cancels no native compute, releases no spool hold and authorizes
+no subsequent request. Future source behavior and actual runtime proof
+remain separate obligations; urgent ddcdf6eb still requires its observed
+departure.
+
+### Retained preparation recovery assessment — 2751a5d3 (2026-10-15)
+
+David authorized a separate versioned read-only assessment for the retained
+v2 preparation on diagnostic688b4f42. The assessment is its own packet,
+linked to that original request and the decided design. It preserves the
+original protocol, execute state, intent and invocation. A recovered refusal
+is evidence on the assessment, never a retrospective v2 execution result.
+
+The published assessment contract pins the authority resolution and exact
+original request. Only the registered conductor reads its retained journal
+and fixed native namespace. It retains whole original files and command
+streams before judging them, checks one winning preparation, an adjacent
+successful fetch and valid differing baseline read, and positive Job and
+Pod absence. Interrupted streams or staged writes, conflicting journals,
+duplicate preparation, any create entry or possible unacknowledged create,
+and missing native evidence remain UNKNOWN. Append-only first records and
+readback bind the assessment; replay repeats no preparation or compute.
+
+This source implementation is carried by SOURCE39286f51. Its gate, distinct
+review, convergence, registry publication and actual native assessment are
+separate obligations. A subsequent current-baseline diagnostic needs its own
+ordinary admission. No assessment clears a hold, grants authority or proves
+a required check or departure. Future operationv3 baseline refusals remain
+a distinct contract. Urgent ddcdf6eb stays open for its actual departure.
+
+The ordinary queue reader may consume a completed assessment only after
+independently checking its immutable disposition, original intent and
+invocation, decided authority, pinned assessment contract and full evidence
+readback. It then stops reserving the old attempt's effect-admission position;
+the original packet remains unchanged. UNKNOWN, incomplete or conflicting
+assessments never remove that reservation. A separately admitted diagnostic
+still passes all ordinary claim, current-baseline, authority and launch gates.
+The assessment itself neither changes ordering nor admits another effect.
+
+The full retained journal exceeds one content-store upload. Its lossless
+transport uses bounded files and an ordered manifest of byte offsets,
+lengths and hashes, with whole-body verification before interpretation.
+Immutable part records and the packet's file census reconcile interrupted
+uploads; missing bytes, changed hashes, repeated positions or incomplete
+references refuse the assessment. Events and completed-step evidence carry
+bounded references, and the same reader reconstructs intermediate originals and the final
+assessment on replay. Inline and single-file historical records keep their
+meaning. No upload or event limit is increased and no original is shortened.
+
+## Managed Codex cache boundary
+
+David completed design-doc `6f3ef63c-469e-47e9-a48c-0eb7cbcb3214`
+on 2026-10-14 at 01:10:34 UTC, resolving `managed-cache-boundary`.
+It amends only design21062 Q2 credential storage. The issuer input stays
+read-only; a dedicated managed run may materialize its login in a private
+writable cache. No coordination-session cache is read or copied.
+
+The trusted supervisor acquires a durable exclusive lease before granting
+the installed generation to any run. It retains the original generation
+and binds the run, JobUID, PodUID and container incarnation. After the
+run is terminal, a trusted private collector verifies the exact retained
+cache, its supported account metadata and the same authorized principal.
+Publication compares and swaps against the leased generation. Cache bytes
+stay private; only generation, issuer, consumer and effect metadata enter
+BOSS. The worker receives no broker write authority, machine or forge
+credential, ServiceAccount token or writable issuer Secret mount.
+
+Uncertain refresh, failed save, unexpected format, collection refusal,
+principal mismatch or replaced incarnation makes the stream unavailable.
+Loss after a possible provider exchange quarantines the generation; it
+does not retry the old refresh token or expire the lease into availability.
+Recovery reconciles the exact retained renewed cache or requires dedicated
+re-enrollment, preserving the original outcome. Expiry or revocation blocks
+new launches. Cluster deadlines, UID-fenced teardown and private artifact
+retention remain independent requirements.
+
+The first source checkpoint adds cache transitions to the existing trusted
+controller through a private broker port and fake-only controls. Validated
+collection is staged in an unavailable `Collected` state, conserving the
+lease and next-generation identity even when a save commits before its
+acknowledgement fails (review962f1165). The kernel never releases that state
+to `Ready`; exact durable publication/recovery remains trusted adapter source
+work. It has no durable broker/provider adapter and does not wire the real worker cache.
+The native managed path refuses before compute until those prerequisites
+exist. Dedicated authenticated private human enrollment UX, genuine consent,
+issuer installation, private collection/recovery and native runtime acceptance
+remain owed by3869107c. Neither this decision fold nor a source GREEN is
+evidence of those effects or authority to activate isolation.
+
+### Private collector placement
+
+David accepted design-doc `001fe8d0-d3d8-4ac2-bad3-87eb8395024c`
+on 2026-10-14 at 13:45:53 UTC, resolving
+`managed-cache-collector-placement`. It settles collector placement and
+the additional broker authority while preserving the cache boundary above.
+The broker remains the sole issuer and owner in `boss`. The existing
+trusted controller creates one broker-owned collector Job in `boss-dev`
+only after independently observing the original compute Job and Pod stopped.
+
+The collector mounts only the original retained workspace PVC read-only
+at a fixed path. Its publisher-verified immutable image must contain the
+pinned supported CLI and collector helper; previous image publication does
+not prove that helper exists. The broker binds the complete fixed intent,
+image digest, Job/Pod/container incarnation and original/current PVC UID
+to its own records. Caller paths, images, addresses, UIDs and terminal
+claims supply no authority. Issuer login, coordination home, machine/forge
+credentials, hostPath and broker state are excluded from the collector.
+
+The dedicated `boss-dev/boss-managed-cache-collector` ServiceAccount has
+automount disabled and no Kubernetes API RoleBinding. A short-lived,
+Pod-bound projected token uses audience `boss-managed-cache-collection`,
+separate from metadata-only IPC and Kubernetes API authentication. Bearer
+bytes remain in a protected projection, never argv or execution output.
+Private cache bytes travel directly to a fixed additional HTTPS listener
+on the existing broker through an internal Service. Journaled Exec and
+metadata-only IPC cannot carry them. The sole operation collects at most
+256 KiB for an exact active lease/run/nonce. Before reading private bytes,
+the broker verifies cluster signature, audience, expiry, dedicated SA UID
+and Pod UID, then independently reobserves matching native objects and
+original compute stop evidence.
+
+Only the collector gains a route to that fixed TLS Service/port and DNS.
+It remains denied to the SoR, Kubernetes API, private hosts, other managed
+endpoints and public network; worker denies remain unchanged. Private
+originals and full durability receipts stay in a descriptor-confined,
+ownership-verified 0700 broker-only directory on the existing `boss-auth`
+PVC. No cache bytes enter BOSS packets, attachments, access logs, execution
+transcripts or KubeTransport journals. Diagnostics use fixed error codes;
+only identities, generations, hashes, counts and fixed receipts leave
+the private channel.
+
+The accepted source authority additions bind only `boss/boss`:
+
+| Namespace / Role | Resources | Verbs / names |
+| --- | --- | --- |
+| `boss-dev/managed-cache-native-observer` | batch Jobs; core Pods, PVCs | get |
+| same | core ServiceAccounts | get; resourceNames `dev-session`, `boss-managed-cache-collector` |
+| `boss/managed-cache-server-tls` | core Secrets | get, patch; resourceNames `boss-managed-cache-server-tls` |
+
+Dynamic Job/Pod/PVC names make the read boundary whole native objects in
+`boss-dev`, including specs. Software derives names only from trusted
+original run records. There is no list/watch, create/update/delete,
+pods/exec, pods/log, node, cluster-wide or namespace Secret-read grant.
+The controller retains its existing authority and the collector gains
+none. Native broker RBAC remains unverified after the controller's refused
+403 censuses; reconcile actual installed grants before adding duplicates.
+
+A fixed-purpose broker handler mints, renews and revokes server TLS key
+and certificate into that one named Secret, declared empty through normal
+converge. The broker cannot create Secrets. Its private key remains in a
+read-only projection; only public trust material reaches the protected
+collector launch plan. This derivable credential requires no human minting
+or placement. Rotation uses bounded overlap and trust generations, with
+old keys revoked only after effect verification. Issuer enrollment and
+installation remain separate obligations.
+
+Collection durably closes the exact lease operation; token validity is
+not replay authority. Retirement uses original UID-conditioned deletion
+and independently observed absence. Lost acknowledgement, replacement,
+expiry or uncertain collection retains or quarantines the exact stream
+and workspace. `Collected` remains unavailable until trusted publication
+and recovery prove their effect and acknowledgement.
+
+This decision records no installed grant, Secret, helper, image, Service,
+network policy, provider action or native launch. Implementation still
+owes independent native observation, adversarial privacy/UID/token/mount/
+writer/body/durability/lost-acknowledgement controls, exact installer and
+archive witnesses, distinct review and actual installed effect evidence.
+Supported account/format verification, issuer installation and renewal,
+publication/recovery, controller acknowledgement and complete native agent
+acceptance remain separately owed. Urgent `3869107c-1ff5-462e-ae24-9b11dfc37d97`
+stays open; approval and this fold authorize no activation or enrollment.
+
+### Protected collector observation reads — source authority 916ea815
+
+David accepted design-doc `916ea815-4fd2-4969-b006-4f48d325f097`
+on 2026-10-16 at 03:28:44 UTC, resolving
+`protected-collector-native-reads`. It amends only the accepted source
+authority of `001fe8d0`; it installs no grant or observer binding.
+The additional reads bind only `boss/boss`:
+
+| Namespace | Resources | Verbs / names |
+| --- | --- | --- |
+| `boss` | core Pods | get |
+| `boss-dev` | core ConfigMaps | get; resourceNames `boss-managed-cache-public-trust` |
+
+The namespace Pod grant exposes whole dynamic Pod objects in `boss`,
+including specs and inline environment values. Software requests only its
+retained original broker Pod name and refuses a changed UID or container.
+The trust reader compares the complete protected original ConfigMap,
+generation and digest before and after the fixed TLS handshake. Existing
+`001fe8d0` grants remain unchanged. No list/watch, mutation, exec/log,
+namespace Secret, TokenRequest, TokenReview, cluster-wide or worker
+authority is added. Actual effective broker RBAC remains UNKNOWN and must
+be measured before any separately authorized grant convergence.
+
+The next source work must join the protected producer and installer,
+reusing the concrete current-trust reader rather than adding another
+disconnected observer. Retain original empty Secret creation and broker
+Pod/container receipts before publishing metadata; configure the fixed
+listener, projection, Service and network route, plus a real registered
+generation-closure producer. A later mutable read or caller assertion
+cannot supply an original installation or prove closed issuance.
+
+The projected-token compatibility debt remains open. A kubelet-managed
+600-second projection does not give the broker every original TokenRequest
+request/response or enumerate all rotated tokens. The producer must
+reconcile that path with real issuer-bound evidence and durable closure,
+including cancellation, restart and lost acknowledgement. Preserve the
+consumer's original-token expiry and complete issuance-witness obligations;
+do not fabricate replies, weaken expiry, grant collector API access or add
+an issuer. Any extra TokenRequest/TokenReview authority needs its own
+explicit decision.
+
+This amendment proves no installed grant, producer, TLS endpoint,
+credential/provider effect, enrollment or native READ/USE acceptance.
+Urgent `3869107c-1ff5-462e-ae24-9b11dfc37d97` remains open, and the
+existing isolation hold remains in force.

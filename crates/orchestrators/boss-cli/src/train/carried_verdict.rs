@@ -2654,6 +2654,15 @@ mod tests {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path).unwrap();
+                if path.ends_with("gate/reservation/native_tests.rs") {
+                    let parent = path.parent().unwrap().with_extension("rs");
+                    let owner = std::fs::read_to_string(parent).unwrap();
+                    assert!(
+                        owner.contains("#[cfg(test)]\nmod native_tests;"),
+                        "native client overrides are allowed only in the isolated test-only fixture"
+                    );
+                    continue;
+                }
                 for (n, line) in text.lines().enumerate() {
                     for flag in CLIENT_CONFIG_OVERRIDES {
                         let (bare, with_value) = (format!("\"--{flag}\""), format!("\"--{flag}="));

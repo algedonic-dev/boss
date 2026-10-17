@@ -264,6 +264,7 @@
             <th class="num">Depth</th>
             <th class="num">Oldest</th>
             <th class="num">Arrived</th>
+            <th class="num">Departed</th>
             <th class="num">Served</th>
             <th class="num">Net</th>
             <th class="num">Clears in</th>
@@ -275,6 +276,9 @@
             <tr class:constraint={constraint.kind === 'station' && constraint.station === s.station}>
               <td class="mono">
                 <button type="button" class="my-station my-queue" onclick={() => selectedQueue = s.station}>{s.station}</button>
+                {#if s.flow.kind === 'counted'}
+                  <span class="dim">{s.flow.basis === 'packet-membership-v1' ? 'packet crossings' : 'legacy distinct Steps'}</span>
+                {/if}
                 <!-- The per-kind drill-down, where the station's predicate
                      names one Workflow kind (c7c5c1de): which step of
                      that kind the pile stands at, and whether it drains.
@@ -296,6 +300,7 @@
               </td>
               <td class="num dim">{s.oldestAgeDays === null ? '—' : `${s.oldestAgeDays} d`}</td>
               <td class="num">{s.flow.kind === 'counted' ? s.flow.arrived : '—'}</td>
+              <td class="num">{s.flow.kind === 'counted' ? s.flow.departed : '—'}</td>
               <td class="num" class:stalled={s.flow.kind === 'counted' && s.flow.served === 0}>
                 {s.flow.kind === 'counted' ? s.flow.served : '—'}
               </td>
@@ -380,9 +385,11 @@
     <p class="my-footnote">
       Depth and the oldest packet's age come from <span class="mono">/api/stations/load</span>;
       arrivals and departures from <span class="mono">/api/stations/flow</span>, counted over
-      the window from the log's own <span class="mono">step.ready</span> /
-      <span class="mono">step.done</span> transitions on their WALL-CLOCK write instant — never
-      event time, which is sim-authoritative here. "Oldest" is the oldest member packet's age
+      the window from conserved original packet state and original transaction groups, on
+      the audit insertion clock. Retention uses the original business-clock mapping.
+      Departures include cancellation, reassignment and retention expiry; served counts
+      completed work. A legacy step-events answer counts distinct Steps and is labelled
+      per station; it is a different unit. "Oldest" is the oldest member packet's age
       since it opened, which over-reports time in this queue; the per-obligation wait below it
       is the step-level figure. Nothing on this page is estimated: a queue whose rate could not
       be counted says so.

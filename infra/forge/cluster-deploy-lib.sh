@@ -1616,3 +1616,51 @@ CARRY
     echo "cluster-deploy-runner: the converge's state moved to $CONVERGE_STATE; carried from $old:${carried:- nothing (no stamp stood there)}"
     run_summary_field converge_state "moved to $CONVERGE_STATE; carried:${carried:- nothing}"
 }
+
+# One read-only observation stage for unchanged images, including data arrivals.
+# No apply, image patch, Secret creation or provider publication happens here.
+observe_deployed_surfaces() {
+    local directory source_ns ko skipped instances
+    STAGE="observe connector"
+    directory=$(mktemp -d -t cluster-deploy-observe.XXXXXX) || return 1
+    if ! "$REPO/infra/cluster/render-instance.sh" --all "$directory"; then
+        rm -rf "$directory"; return 1
+    fi
+    source_ns=$("$REPO/infra/cluster/render-instance.sh" --source) || { rm -rf "$directory"; return 1; }
+    instances=$("$REPO/infra/cluster/render-instance.sh" --instances) || { rm -rf "$directory"; return 1; }
+    ko=$(kubectl_seeing "$directory") || { rm -rf "$directory"; return 1; }
+    skipped=$(instances_skipped_by_gate "$K" "$ko" "$source_ns" "$instances" /manifests) || {
+        echo "cluster-deploy-runner: cannot tell which instances are skipped — a Secret read the credential could not make; no connector observation is claimed" >&2
+        rm -rf "$directory"; return 1
+    }
+    observe_connector "$K" "$ko" "$source_ns" "/manifests/$source_ns/cloudflared.yaml" cloudflared "$skipped" unchanged || { rm -rf "$directory"; return 1; }
+    observe_sites "$K" "$instances" "$source_ns" "$skipped" || { rm -rf "$directory"; return 1; }
+    rm -rf "$directory"
+}
+
+# A data delivery does not owe a cluster mutation or cluster credential. Keep
+# its independent liveness reads, including their complete failure streams and
+# explicit unread result, without manufacturing connector or site evidence.
+observe_data_surfaces() { # root-owned state directory
+    local state="$1" attempt rc=0 record
+    attempt=$(mktemp -d "$state/data-observation.XXXXXXXX") || {
+        run_summary_json delivery_side_observations '{"schema":1,"state":"unread","reason":"cannot retain observation originals"}'
+        return 0
+    }
+    if ! : > "$attempt/stdout" || ! : > "$attempt/stderr"; then
+        run_summary_json delivery_side_observations '{"schema":1,"state":"unread","reason":"cannot retain observation streams"}'
+        return 0
+    fi
+    record=$(jq -n --arg stdout "$attempt/stdout" --arg stderr "$attempt/stderr" \
+        '{schema:1,state:"unconfirmed",exit:null,stdout:$stdout,stderr:$stderr}') || return 0
+    printf '%s\n' "$record" > "$attempt/receipt.json"
+    run_summary_json_file delivery_side_observations "$attempt/receipt.json"
+    (require_cluster_credentials && observe_deployed_surfaces) > "$attempt/stdout" 2> "$attempt/stderr" || rc=$?
+    record=$(printf '%s' "$record" | jq --argjson exit "$rc" \
+        '. + {state:(if $exit == 0 then "completed" else "unread" end),exit:$exit}') || return 0
+    printf '%s\n' "$record" > "$attempt/receipt.json"
+    run_summary_json_file delivery_side_observations "$attempt/receipt.json"
+    printf 'data delivery side observations: %s\n' "$record"
+    [ "$rc" -eq 0 ] || cat "$attempt/stdout" "$attempt/stderr" >&2
+    return 0
+}

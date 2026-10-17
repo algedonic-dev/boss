@@ -51,6 +51,7 @@ boss_testing::adapters_agree! {
     }
     cases {
         kind,
+        step_completed_since,
         kind_prefix,
         kind_prefix_is_literal_text,
         kinds,
@@ -77,23 +78,24 @@ boss_testing::adapters_agree! {
 /// named — and each name points at the case that covers it.
 const _: fn(JobFilter) = |filter| {
     let JobFilter {
-        kind: _,              // case `kind`
-        kind_prefix: _,       // cases `kind_prefix`, `kind_prefix_is_literal_text`
-        kinds: _,             // case `kinds`
-        excluded_kinds: _,    // case `excluded_kinds`
-        oldest_first: _,      // case `oldest_first`
-        department: _,        // case `department`
-        status: _,            // case `status`
-        closed_since: _,      // case `closed_since`
-        terminal: _,          // cases `terminal`, `terminal_inside_the_window`
-        priority: _,          // case `priority`
-        owner_id: _,          // case `owner_id`
-        subject_id: _,        // case `subject_id`
-        waiting_on: _,        // case `waiting_on`
-        metadata_contains: _, // case `metadata_contains`
-        metadata_has: _,      // case `metadata_has`
-        scope: _,             // case `scope`
-        partition: _,         // case `partition`
+        step_completed_since: _, // case `step_completed_since`
+        kind: _,                 // case `kind`
+        kind_prefix: _,          // cases `kind_prefix`, `kind_prefix_is_literal_text`
+        kinds: _,                // case `kinds`
+        excluded_kinds: _,       // case `excluded_kinds`
+        oldest_first: _,         // case `oldest_first`
+        department: _,           // case `department`
+        status: _,               // case `status`
+        closed_since: _,         // case `closed_since`
+        terminal: _,             // cases `terminal`, `terminal_inside_the_window`
+        priority: _,             // case `priority`
+        owner_id: _,             // case `owner_id`
+        subject_id: _,           // case `subject_id`
+        waiting_on: _,           // case `waiting_on`
+        metadata_contains: _,    // case `metadata_contains`
+        metadata_has: _,         // case `metadata_has`
+        scope: _,                // case `scope`
+        partition: _,            // case `partition`
     } = filter;
 };
 
@@ -256,6 +258,79 @@ async fn kind<R: JobsRepository>(repo: &R, adapter: &str) {
         ..Default::default()
     };
     narrows(repo, adapter, filter, &["field-a", "field-b"]).await;
+}
+
+async fn step_completed_since<R: JobsRepository>(repo: &R, adapter: &str) {
+    use boss_core::job::{Step, StepStatus};
+    for (i, (title, at)) in [
+        ("before", Some(instant(-1))),
+        ("boundary", Some(instant(0))),
+        ("future", Some(instant(3600))),
+        ("undated", None),
+        ("no-steps", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut job = packet(title);
+        job.status = JobStatus::Closed;
+        job.closed_on = None;
+        repo.create_job_at(&job, instant(i as i64), &[])
+            .await
+            .unwrap();
+        if title != "no-steps" {
+            let mut step = Step::new(job.id, "task", "Legacy title only", 0);
+            step.status = StepStatus::Completed;
+            step.completed_at = at;
+            repo.add_step_at(&step, instant(0), &[]).await.unwrap();
+            if title == "boundary" {
+                let mut other = Step::new(
+                    job.id,
+                    "task",
+                    "Another completion must not duplicate a job",
+                    1,
+                );
+                other.completed_at = Some(instant(1));
+                repo.add_step_at(&other, instant(0), &[]).await.unwrap();
+            }
+        }
+    }
+    let filter = JobFilter {
+        step_completed_since: Some(instant(0)),
+        oldest_first: true,
+        ..Default::default()
+    };
+    for (offset, title) in [(0, "boundary"), (1, "future")] {
+        let (rows, total) = repo.list_jobs(&filter, 1, offset).await.unwrap();
+        assert_eq!(total, 2, "{adapter}: total applies the completion frontier");
+        assert_eq!(
+            rows.iter()
+                .map(|job| job.title.as_str())
+                .collect::<Vec<_>>(),
+            [title],
+            "{adapter}"
+        );
+    }
+    let (_, total) = repo
+        .list_jobs(
+            &JobFilter {
+                scope: JobScope::None,
+                ..filter.clone()
+            },
+            100,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        total, 0,
+        "{adapter}: completion time never widens policy scope"
+    );
+    let (_, total) = repo.list_jobs(&JobFilter::default(), 100, 0).await.unwrap();
+    assert_eq!(
+        total, 5,
+        "{adapter}: absence of the new filter preserves the whole set"
+    );
 }
 
 async fn kind_prefix<R: JobsRepository>(repo: &R, adapter: &str) {

@@ -2,6 +2,81 @@
 
 use super::*;
 
+fn recorded_gate_wait(
+    active: &crate::yard::ActiveGate,
+    inputs: &RegionInputs<'_>,
+) -> Result<RecordedProofWait, String> {
+    let run = inputs
+        .gate_runs
+        .iter()
+        .find(|run| run.id.to_string() == active.packet_id)
+        .ok_or("registered gate packet is unread")?;
+    if run.kind != "gate-run"
+        || run.status != JobStatus::Open
+        || crate::yard::queued_for_a_slot(run)
+    {
+        return Err("gate has no matching open execution record".into());
+    }
+    let owner = run.owner_id.as_str();
+    if owner.trim().is_empty() {
+        return Err("gate action owner is unread".into());
+    }
+    let head = super::judging::exact_source_head(run.metadata.get("sha"))
+        .ok_or("gate exact source head is unread")?;
+    if run.metadata.get("branch").and_then(Value::as_str) != Some(active.branch.as_str()) {
+        return Err("gate branch does not match its registered execution".into());
+    }
+    let launched_at = meta_instant(&run.metadata, crate::yard::LAUNCHED_AT)
+        .filter(|at| *at <= inputs.now)
+        .ok_or("gate observed launch clock is unread or in the future")?;
+    if active.launched_at.as_deref().and_then(stamp_instant) != Some(launched_at) {
+        return Err("gate launch reading does not match the registered execution".into());
+    }
+    let protocols = inputs
+        .internal_protocols
+        .ok_or("pinned gate protocol is unread")?;
+    let protocol = match protocols.get(&(run.kind.clone(), run.workflow_version)) {
+        Some(Ok(spec))
+            if spec.kind == run.kind
+                && spec.version == run.workflow_version
+                && spec.status != crate::registry::WorkflowStatus::Draft =>
+        {
+            spec
+        }
+        Some(Err(reason)) => return Err(reason.clone()),
+        _ => return Err("exact published gate protocol is unread".into()),
+    };
+    let hours = protocol
+        .steps
+        .iter()
+        .find(|step| step.title == "record-verdict")
+        .and_then(|step| step.duration_hours)
+        .filter(|hours| hours.is_finite() && *hours > 0.0)
+        .ok_or("pinned gate receipt bound is unread")?;
+    let next_check_at = chrono::Duration::try_seconds((hours * 3600.0).ceil() as i64)
+        .and_then(|duration| launched_at.checked_add_signed(duration))
+        .ok_or("gate deadline exceeds the clock range")?;
+    if next_check_at <= inputs.now {
+        return Err(format!(
+            "gate receipt is overdue at its pinned bound {next_check_at}"
+        ));
+    }
+    Ok(RecordedProofWait {
+        packet: run.id.to_string(),
+        owner: owner.into(),
+        condition_owner: owner.into(),
+        title: run.title.clone(),
+        condition: format!("gate receipt at {head}"),
+        next_check_at,
+        evidence: ProofWaitEvidence::Gate {
+            run: run.id.to_string(),
+            head: head.into(),
+            workflow_version: protocol.version,
+            launched_at,
+        },
+    })
+}
+
 /// THE GATES: bays in use, of the policy's bound. Troubled when a bay
 /// holds a corpse (`stale` — active past the gate Job's own deadline,
 /// `yard::GATE_MAX_ACTIVE_HOURS`) or every bay is in use and no verdict
@@ -35,6 +110,19 @@ pub(super) fn gates(inputs: &RegionInputs<'_>, w: &Windows, out: &[OutRail]) -> 
     };
     let stale: Vec<&crate::yard::ActiveGate> = g.active.iter().filter(|a| a.stale).collect();
     let mut findings = Vec::new();
+    let mut unread = Vec::new();
+    let mut waits = Vec::new();
+    for active in &g.active {
+        match recorded_gate_wait(active, inputs) {
+            Ok(wait) => waits.push(wait),
+            Err(reason) => unread.push(Finding::new(
+                bands::UNREAD,
+                None,
+                String::new(),
+                format!("{}: {reason}", active.packet_id),
+            )),
+        }
+    }
     if !stale.is_empty() {
         findings.push(Finding::new(
             bands::GATES_CORPSE,
@@ -56,12 +144,17 @@ pub(super) fn gates(inputs: &RegionInputs<'_>, w: &Windows, out: &[OutRail]) -> 
             ),
         ));
     }
+    findings.extend(unread);
     // THE BAY RUNNING PAST TWICE THE MEDIAN (backlog 4d088a7e) — the
     // yard's own per-bay judgement (`ActiveGate::troubled`), read here
     // rather than re-derived, dated from when the first such run crossed
     // the line. Its RUNNING age, never the packet's: on 2026-09-28 a gate
     // queued 46 minutes and running 14 read as "going for an hour".
-    let long: Vec<&crate::yard::ActiveGate> = g.active.iter().filter(|a| a.troubled).collect();
+    let long: Vec<&crate::yard::ActiveGate> = g
+        .active
+        .iter()
+        .filter(|a| a.troubled && !waits.iter().any(|wait| wait.packet == a.packet_id))
+        .collect();
     if let (Some(median), Some(longest)) = (
         g.typical_seconds,
         long.iter().filter_map(|a| a.running_seconds).max(),
@@ -111,13 +204,7 @@ pub(super) fn gates(inputs: &RegionInputs<'_>, w: &Windows, out: &[OutRail]) -> 
         active,
         capacity,
         &what,
-        onset_of_count(
-            g.active
-                .iter()
-                .filter_map(|a| stamp_instant(&a.since))
-                .collect(),
-            capacity,
-        ),
+        onset_of_count(g.active.iter().filter_map(started).collect(), capacity),
         out,
         w.hours,
         inputs.now,
@@ -184,6 +271,7 @@ pub(super) fn gates(inputs: &RegionInputs<'_>, w: &Windows, out: &[OutRail]) -> 
     let at = at_the_gates(inputs);
     let figure = |ids: Option<&Ids>| ids.filter(|ids| !ids.is_empty()).map(Ids::len);
     Region {
+        waits,
         waiting: figure(at.as_ref().map(|a| &a.line)),
         judged: figure(at.as_ref().map(|a| &a.judged)),
         ..region(
@@ -260,6 +348,80 @@ fn queue_wait(inputs: &RegionInputs<'_>, w: &Windows) -> Measure {
 mod tests {
     use super::*;
     use crate::regions::fixtures::*;
+
+    #[test]
+    fn a_registered_exact_head_gate_inside_its_pinned_bound_is_an_owned_wait() {
+        let head = "a".repeat(40);
+        let run = job(
+            "gate-run",
+            "fix/bounded",
+            JobStatus::Open,
+            json!({
+                "branch": "fix/bounded", "sha": head, "launched_at": "2026-09-19T11:30:00Z",
+                "opened_at": "2026-09-19T11:29:00Z",
+            }),
+        );
+        let mut status = empty_status();
+        status.gates.typical_seconds = Some(600);
+        status.gates.active.push(crate::yard::ActiveGate {
+            branch: "fix/bounded".into(),
+            packet_id: run.id.to_string(),
+            since: "2026-09-19T11:29:00Z".into(),
+            stale: false,
+            train: None,
+            launched_at: Some("2026-09-19T11:30:00Z".into()),
+            queued_seconds: Some(60),
+            running_seconds: Some(1800),
+            troubled: true,
+        });
+        let protocols = [WorkflowSpec::platform_seed(
+            "gate-run",
+            "Gate",
+            "platform",
+            vec!["custom".into()],
+            vec![crate::registry::StepSpec {
+                title: "record-verdict".into(),
+                duration_hours: Some(3.0),
+                ..Default::default()
+            }],
+        )]
+        .into_iter()
+        .map(|spec| ((spec.kind.clone(), spec.version), Ok(spec)))
+        .collect::<PinnedProtocols>();
+        let runs = [run];
+        let mut input = inputs(&status, &[], &[], &[], &runs, Some(&[]), Some(&[]));
+        input.internal_protocols = Some(&protocols);
+        let map = regions(&input);
+        let gate = by_name(&map, "gates");
+        assert_eq!(
+            gate.state,
+            RegionState::Clear,
+            "the measured median cannot turn healthy gate execution inside its recorded bound into a fault: {}",
+            gate.why
+        );
+        assert_eq!(gate.waits.len(), 1);
+        assert_eq!(gate.waits[0].packet, runs[0].id.to_string());
+        assert_eq!(gate.waits[0].owner, runs[0].owner_id);
+        assert_eq!(gate.waits[0].next_check_at, t("2026-09-19T14:30:00Z"));
+        input.internal_protocols = None;
+        let unread_map = regions(&input);
+        let unread = by_name(&unread_map, "gates");
+        assert_eq!(unread.state, RegionState::Troubled);
+        assert!(
+            unread.why.contains("pinned gate protocol is unread"),
+            "an unavailable required reading must name that defect: {}",
+            unread.why
+        );
+        assert!(unread.waits.is_empty());
+        input.internal_protocols = Some(&protocols);
+        let mut overdue = input;
+        overdue.now = t("2026-09-19T14:30:00Z");
+        let overdue_map = regions(&overdue);
+        let overdue_gate = by_name(&overdue_map, "gates");
+        assert_eq!(overdue_gate.state, RegionState::Troubled);
+        assert!(overdue_gate.why.contains("pinned bound"));
+        assert!(overdue_gate.waits.is_empty());
+    }
 
     /// The gates: a stale bay is trouble; full bays settle into attention; the trend is
     /// the run duration from the rows' own stamps.
@@ -397,6 +559,7 @@ mod tests {
             .map(|(i, q)| crate::yard::QueuedGate {
                 branch: format!("fix/q{i}"),
                 packet_id: format!("q{i}"),
+                next_owner: None,
                 queued_at: (*q).into(),
                 position: i32::try_from(i + 1).unwrap(),
                 waiting_seconds: None,
@@ -408,11 +571,45 @@ mod tests {
     }
 
     fn read_gates(status: &YardStatus, runs: &[Job]) -> Region {
-        by_name(
-            &regions(&inputs(status, &[], &[], &[], runs, Some(&[]), Some(&[]))),
-            "gates",
-        )
-        .clone()
+        // These capacity/line fixtures have real registered execution rows,
+        // independent of the closed verdict history being measured.
+        let mut status = status.clone();
+        let mut runs = runs.to_vec();
+        for active in &mut status.gates.active {
+            let launched = active.launched_at.clone().unwrap_or_else(|| {
+                stamp_instant(&active.since)
+                    .unwrap()
+                    .max(t(NOW) - chrono::Duration::hours(2))
+                    .to_rfc3339()
+            });
+            let run = job(
+                "gate-run",
+                &active.branch,
+                JobStatus::Open,
+                json!({
+                    "branch": active.branch, "sha": "a".repeat(40),
+                    "opened_at": active.since, "launched_at": launched,
+                }),
+            );
+            active.packet_id = run.id.to_string();
+            active.launched_at = Some(launched);
+            runs.push(run);
+        }
+        let protocol = WorkflowSpec::platform_seed(
+            "gate-run",
+            "Gate",
+            "platform",
+            vec!["custom".into()],
+            vec![crate::registry::StepSpec {
+                title: "record-verdict".into(),
+                duration_hours: Some(3.0),
+                ..Default::default()
+            }],
+        );
+        let protocols = [((protocol.kind.clone(), protocol.version), Ok(protocol))].into();
+        let mut input = inputs(&status, &[], &[], &[], &runs, Some(&[]), Some(&[]));
+        input.internal_protocols = Some(&protocols);
+        by_name(&regions(&input), "gates").clone()
     }
 
     /// EVERY BAY IN USE, VERDICTS LANDING: FULL — the good state, which
@@ -441,19 +638,14 @@ mod tests {
         assert!(bands::BANDS.iter().all(|b| b.id != "gates-at-bound"));
     }
 
-    /// EVERY BAY IN USE, NO VERDICT FOR SIX HOURS against an hourly gap:
-    /// stuck — ours, and not moving — dated from when the four gaps ran
-    /// out after the later of the last verdict (05:45) and the fill
-    /// (05:50).
+    /// Old admission/queue clocks do not make recently launched,
+    /// registered executions inside their pinned bounds overdue.
     #[test]
-    fn every_bay_in_use_with_no_verdict_landing_is_stuck() {
+    fn bounded_current_executions_do_not_inherit_the_old_queue_deadline() {
         let status = every_bay("2026-09-19T05:50:00Z", &[]);
         let g = read_gates(&status, &verdicts_until("2026-09-19T05:45:00Z"));
-        assert_eq!(g.state, RegionState::Troubled, "{}", g.why);
-        let band = g.band.as_ref().unwrap();
-        assert_eq!(band.id, "stuck-at-capacity");
-        assert_eq!(band.since.as_deref(), Some("2026-09-19T09:50:00+00:00"));
-        assert_eq!(band.held_minutes, Some(130));
+        assert_eq!(g.state, RegionState::Full, "{}", g.why);
+        assert_eq!(g.waits.len(), 3);
     }
 
     /// THE LINE, NOT THE BAYS: a run waiting an hour when a gate takes
@@ -475,14 +667,10 @@ mod tests {
         assert_eq!(g.state, RegionState::Full, "{}", g.why);
     }
 
-    /// THE RUN, NOT THE PACKET (backlog 4d088a7e). The bay the yard calls
-    /// troubled is the one whose RUNNING age is past twice the median —
-    /// here 41 minutes against a 20-minute median, dated from when it
-    /// crossed (its launch at 11:14 + 40m). A run that waited an hour in
-    /// line and has run five minutes is not it: that wait is the line's,
-    /// and it outranks nothing.
+    /// A measured median is context; a valid execution's pinned bound
+    /// decides when its receipt is overdue. Queue time is not runtime.
     #[test]
-    fn a_bay_running_past_twice_the_median_is_the_troubled_one() {
+    fn a_bay_past_the_median_inside_its_pinned_bound_remains_healthy() {
         let mut status = every_bay("2026-09-19T11:20:00Z", &[]);
         status.gates.typical_seconds = Some(1200);
         status.gates.active[0].launched_at = Some("2026-09-19T11:14:00Z".into());
@@ -492,17 +680,8 @@ mod tests {
         status.gates.active[1].queued_seconds = Some(3600);
         status.gates.active[1].running_seconds = Some(5 * 60);
         let g = read_gates(&status, &verdicts_until("2026-09-19T11:55:00Z"));
-        assert_eq!(g.state, RegionState::Troubled, "{}", g.why);
-        let band = g.band.as_ref().unwrap();
-        assert_eq!(band.id, "gates-run-long");
-        assert_eq!(band.reads, "running 41m > 2× the median gate running time");
-        assert_eq!(band.since.as_deref(), Some("2026-09-19T11:54:00+00:00"));
-        assert!(
-            g.why
-                .contains("1 run running past 2× the 20 minutes a gate runs"),
-            "{}",
-            g.why
-        );
+        assert_eq!(g.state, RegionState::Full, "{}", g.why);
+        assert_eq!(g.waits.len(), 3);
         // The same bays with nothing past the line read full, as before.
         status.gates.active[0].troubled = false;
         let g = read_gates(&status, &verdicts_until("2026-09-19T11:55:00Z"));
@@ -580,6 +759,7 @@ mod tests {
         status.gates.queued = vec![crate::yard::QueuedGate {
             branch: "train/x".into(),
             packet_id: "train-gate".into(),
+            next_owner: None,
             queued_at: "2026-09-19T11:30:00Z".into(),
             position: 1,
             waiting_seconds: None,
@@ -711,7 +891,7 @@ mod tests {
                 "lost",
             ),
         ];
-        let status = every_bay("2026-09-19T11:20:00Z", &[]);
+        let status = empty_status();
         // Lost WITHOUT ever standing in line (backlog bce67f09): no launch
         // and no `queued_at` — it died before it took a place, so it is
         // neither a wait nor a death in line.
@@ -737,7 +917,10 @@ mod tests {
             "gates wait 10 minutes for a bay (median), 1 run lost in line"
         );
         // A line standing now puts its oldest wait beside the median.
-        let status = every_bay("2026-09-19T11:20:00Z", &["2026-09-19T11:30:00Z"]);
+        let mut status = empty_status();
+        status.gates.queued = every_bay("2026-09-19T11:20:00Z", &["2026-09-19T11:30:00Z"])
+            .gates
+            .queued;
         let g = read_gates(&status, &runs[..2]);
         let wait = g.kpi.iter().find(|m| m.name == "queue wait").unwrap();
         assert_eq!(
@@ -745,7 +928,7 @@ mod tests {
             "gates wait 10 minutes for a bay (median), the oldest in line now 30m"
         );
         // Nothing waited in the window: unknown, never zero.
-        let g = read_gates(&every_bay("2026-09-19T11:20:00Z", &[]), &[]);
+        let g = read_gates(&empty_status(), &[]);
         let wait = g.kpi.iter().find(|m| m.name == "queue wait").unwrap();
         assert_eq!(wait.value, None);
         assert_eq!(wait.text, "no gate launched in 24h");

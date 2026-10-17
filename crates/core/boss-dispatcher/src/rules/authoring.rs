@@ -30,13 +30,13 @@
 //! as opaque strings and resolve at dispatch, where an unknown one is a
 //! loud `DispatchError::UnknownHandler` rather than a silent no-op.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
 use super::registry::{Cadence, RawDoStep, RawRule, RawSchedule, RegistryError, Rule};
 
 /// One stored `dispatcher_rules` row: the rule content + its lifecycle.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleVersion {
     pub name: String,
     pub version: i32,

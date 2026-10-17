@@ -198,7 +198,12 @@ pub(crate) fn run_verdict(
     // GUARD 4. The death is the last word only while it stays the last
     // word: a packet that moved after it — a late handback, a hand
     // correcting the record — is not a packet nobody is attending.
-    if let Some(moved) = last_moved(run, None)
+    // Movement is read off the run WITHOUT its outcome terminals: the
+    // death itself readies the `died` outcome, which completes a
+    // fraction of a second after the stamp (run db18726d: 0.285 s), and
+    // read as movement it held every died run's step forever (backlog
+    // 41229ba2). A late handback is a task step, and still counts.
+    if let Some(moved) = last_moved(&without_outcomes(run), None)
         && moved > at
     {
         return holds(format!(
@@ -209,6 +214,28 @@ pub(crate) fn run_verdict(
     }
     RunVerdict::Dead { at }
 }
+
+/// The run as GUARD 4 reads it for movement: every step but its
+/// `outcome`-kind terminals. Kept local rather than taught to
+/// `last_moved`, whose other callers (the age-out rule's silence and
+/// linked-success reads, the agent-step overdue alarm) measure how long
+/// an OPEN packet has been quiet, where a terminal closing is movement
+/// like any other.
+fn without_outcomes(run: &serde_json::Value) -> serde_json::Value {
+    let steps: Vec<serde_json::Value> = run
+        .get("steps")
+        .and_then(|s| s.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("kind").and_then(|k| k.as_str()) != Some(OUTCOME))
+        .cloned()
+        .collect();
+    json!({ "metadata": run.get("metadata"), "steps": steps })
+}
+
+/// The step kind of a protocol's terminals — the one a death completes
+/// as its own consequence.
+const OUTCOME: &str = "outcome";
 
 /// The `after_hours` arg as a non-negative bound. Unlike the death
 /// rule's `hours`, zero is legal and means "release as soon as the
@@ -971,6 +998,97 @@ mod tests {
             matches!(&held, RunVerdict::Holds { why } if why.contains("after it died")),
             "{held:?}"
         );
+    }
+
+    /// An `agent-run` in the shape a death leaves it LIVE, copied from
+    /// run db18726d (2026-10-17): `building` completed `died`, then the
+    /// run's own `died` OUTCOME completed 0.285 s later as the
+    /// consequence of that death, the other terminals and `reported`
+    /// skipped. The fixture above has no outcome steps at all, which is
+    /// how GUARD 4 shipped reading this shape as movement (41229ba2).
+    fn died_as_live(id: &str) -> serde_json::Value {
+        let task = |slug: &str, status: &str, at: Option<&str>| {
+            json!({ "id": format!("{id}-{slug}"), "spec_slug": slug, "kind": "task",
+                    "status": status, "completed_at": at, "metadata": {} })
+        };
+        let outcome = |slug: &str, status: &str, at: Option<&str>| {
+            json!({ "id": format!("{id}-{slug}"), "spec_slug": slug, "kind": "outcome",
+                    "status": status, "completed_at": at, "metadata": {} })
+        };
+        let mut building = task("building", "completed", Some("2026-10-17T09:00:13.506620Z"));
+        building["metadata"] = json!({ "result": "died" });
+        json!({
+            "id": id,
+            "kind": "agent-run",
+            "status": "closed",
+            "metadata": { "packet": PACKET, "step": "build", "agent": "claude@algedonic.dev" },
+            "steps": [
+                { "id": format!("{id}-claimed"), "spec_slug": "claimed", "kind": "trigger",
+                  "status": "completed", "completed_at": "2026-10-17T04:13:59.994706Z",
+                  "metadata": {} },
+                task("briefed", "completed", Some("2026-10-17T04:14:02.385080Z")),
+                building,
+                task("reported", "skipped", None),
+                outcome("landed", "skipped", None),
+                outcome("unreported", "skipped", None),
+                outcome("refused", "skipped", None),
+                outcome("died", "completed", Some("2026-10-17T09:00:13.791093Z")),
+            ],
+        })
+    }
+
+    /// THE OBSERVED SHAPE (backlog 41229ba2). The run's own `died`
+    /// outcome closes a fraction of a second AFTER `building` is
+    /// stamped `died` — it is the death's consequence, not somebody
+    /// attending the run — so GUARD 4 must not read it as movement.
+    /// Read as movement, it held EVERY died run's step forever: 21
+    /// agent-codex claims sat six hours past their bound.
+    #[test]
+    fn a_runs_own_died_outcome_is_not_movement_after_its_death() {
+        assert_eq!(
+            run_verdict(
+                &died_as_live(DEAD_RUN),
+                "building",
+                "died",
+                DEFAULT_EVIDENCE_KEY
+            ),
+            RunVerdict::Dead {
+                at: DateTime::parse_from_rfc3339("2026-10-17T09:00:13.506620Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            }
+        );
+    }
+
+    /// GUARD 4 still holds for what it was written for: a TASK step
+    /// completed after the death — a late `reported` handback — is
+    /// somebody attending the run, outcome terminal or not.
+    #[test]
+    fn a_late_handback_after_the_death_still_holds_the_step() {
+        let mut r = died_as_live(DEAD_RUN);
+        r["steps"][3]["status"] = json!("completed");
+        r["steps"][3]["completed_at"] = json!("2026-10-17T10:30:00Z");
+        let held = run_verdict(&r, "building", "died", DEFAULT_EVIDENCE_KEY);
+        assert!(
+            matches!(&held, RunVerdict::Holds { why } if why.contains("after it died")),
+            "{held:?}"
+        );
+    }
+
+    /// The same live shape end to end: past the two-hour bound the
+    /// tick releases the step the dead run held.
+    #[tokio::test]
+    async fn a_step_held_by_a_run_dead_in_the_live_shape_is_released_past_the_bound() {
+        let (base, puts) =
+            mock_jobs(vec![packet(PACKET, Some(DEAD_RUN)), died_as_live(DEAD_RUN)]).await;
+        let h = JobsReclaimAbandonedStep::with_client(crate::handlers::common::api_client(), &base);
+        h.invoke(&args(), &ctx(tick("2026-10-17T11:05:00Z")))
+            .await
+            .expect("the tick runs");
+        let step = stored_step(&base, PACKET, &format!("{PACKET}-build")).await;
+        assert_eq!(step["status"], "ready", "{:?}", puts.lock().unwrap());
+        assert!(step["metadata"].get("agent_run").is_none(), "{step}");
+        assert_eq!(step["metadata"]["reclaimed"]["from_run"], DEAD_RUN);
     }
 
     /// A death with no instant is a finding, not a licence to start the

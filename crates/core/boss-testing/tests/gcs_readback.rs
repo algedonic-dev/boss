@@ -355,6 +355,12 @@ fn launcher_reads_only_the_named_secret_hides_values_and_cleans_its_container() 
 set -eu
 printf '%s\n' "$*" >> "$STUB_LOG"
 case "$*" in
+  *'docker image inspect --format '*)
+    [ "${STUB_FAIL:-}" != identity ] || { echo 'not-an-image-digest'; exit 0; }
+    printf 'sha256:%064d\n' 1 ;;
+  *'docker run --rm --name boss-gcs-runtime-'*' --network none '*'/google-cloud-sdk/platform/bundledpythonunixmusl/bin/python3 -c '*)
+    [ "${STUB_FAIL:-}" != runtime ] || { echo 'runtime interpreter unavailable' >&2; exit 127; }
+    exit 0 ;;
   *'kubectl --kubeconfig=/kc get secret boss-gcs-offsite -n boss '*)
     [ "${STUB_FAIL:-}" != secret ] || { echo credential-marker >&2; exit 1; }
     echo '{"kind":"Secret","metadata":{"name":"boss-gcs-offsite","namespace":"boss"},"data":{"sa.json":"Y3JlZGVudGlhbC1tYXJrZXI=","bucket":"dGVzdC1idWNrZXQ="}}' ;;
@@ -373,7 +379,16 @@ esac
 "#,
     );
     let log = dir.join("argv");
-    for mode in ["", "secret", "download", "silent", "legacy", "gzip-exit"] {
+    for mode in [
+        "",
+        "identity",
+        "runtime",
+        "secret",
+        "download",
+        "silent",
+        "legacy",
+        "gzip-exit",
+    ] {
         write_file(&log, "");
         let output = Command::new("bash")
             .arg(repo_root().join("infra/forge/check-gcs-backup.sh"))
@@ -405,10 +420,42 @@ esac
         let calls = std::fs::read_to_string(&log).unwrap();
         assert_eq!(
             calls.matches("get secret boss-gcs-offsite -n boss").count(),
-            1
+            usize::from(mode != "runtime" && mode != "identity")
         );
-        if mode != "secret" {
+        if mode != "runtime" && mode != "identity" {
+            let runtime = calls
+                .find("docker run --rm --name boss-gcs-runtime-")
+                .expect("credential-free runtime check missing");
+            let secret = calls.find("get secret boss-gcs-offsite -n boss").unwrap();
+            assert!(
+                runtime < secret,
+                "runtime must qualify before reading credentials"
+            );
+        }
+        if mode == "runtime" {
+            assert!(calls.contains("docker rm -f boss-gcs-runtime-"));
+        }
+        if mode != "secret" && mode != "runtime" && mode != "identity" {
             assert!(calls.contains("--read-only"));
+            assert!(calls.contains(
+                "timeout 840 /google-cloud-sdk/platform/bundledpythonunixmusl/bin/python3 /check.py"
+            ));
+            let image = format!("sha256:{:064}", 1);
+            assert_eq!(
+                calls.matches(&image).count(),
+                2,
+                "both commands must use the same immutable image id"
+            );
+            for bound in [
+                "--memory=2g",
+                "--pids-limit=128",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "size=1g",
+                "size=64m",
+            ] {
+                assert!(calls.contains(bound), "missing bound {bound}");
+            }
             assert!(
                 calls.contains("docker rm -f boss-gcs-readback-"),
                 "owned container was not cleaned: {calls}"

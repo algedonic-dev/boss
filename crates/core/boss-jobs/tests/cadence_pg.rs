@@ -293,6 +293,7 @@ async fn outcome_merges_and_preserves_why_the_rule_fired() {
         &FiringOutcome {
             rc: 0,
             runtime_secs: 37,
+            observations: None,
             board_decision: None,
         },
     )
@@ -334,6 +335,7 @@ async fn a_boards_decision_is_merged_and_read_back_on_the_last_firing() {
         &FiringOutcome {
             rc: -2,
             runtime_secs: 11,
+            observations: None,
             board_decision: Some(decision.clone()),
         },
     )

@@ -21,7 +21,7 @@ struct BriefFile {
 }
 
 pub(crate) async fn retain_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     content_base: &str,
     actor: &str,
     packet: &str,
@@ -74,7 +74,7 @@ pub(crate) async fn retain_at(
 /// attachment. URLs never ride the reference: the existing service door
 /// chooses the target, and the file id cannot select another host/path.
 pub(crate) async fn read_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     content_base: &str,
     actor: &str,
     value: &Value,

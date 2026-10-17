@@ -185,7 +185,7 @@
 
 3	crates/core/boss-jobs/src/http/sim_clock.rs
 
-2	crates/core/boss-jobs/src/http/stations.rs
+1	crates/core/boss-jobs/src/http/stations.rs
 
 1	crates/core/boss-jobs/src/http/steps.rs
 

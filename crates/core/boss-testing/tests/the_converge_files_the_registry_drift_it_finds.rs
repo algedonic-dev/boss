@@ -1640,7 +1640,7 @@ fn a_tree_whose_history_git_cannot_read_files_nothing() {
     );
 }
 
-/// The converge runs the phase LAST — after every roll, so every seed has
+/// The converge runs the phase after every roll, so every seed has
 /// run — records its summary on the packet, and cannot be failed by it.
 #[test]
 fn the_converge_runs_the_comparison_last_and_cannot_fail_on_it() {
@@ -1656,15 +1656,26 @@ fn the_converge_runs_the_comparison_last_and_cannot_fail_on_it() {
         call > last_roll,
         "the comparison runs after the last roll, when the seeds have run"
     );
-    // The phase, lifted verbatim from its STAGE line to the end of the
-    // runner, run under the runner's own `set -euo pipefail` against a
+    // Lift only this phase; the separate optional image publisher follows
+    // it (partial386) and has its own failure/conservation owning controls.
+    // Run under the runner's own `set -euo pipefail` against a
     // stand-in script: one that says its summary, and one that dies
     // saying nothing with the usage-error status.
     let start = src
         .find("STAGE=\"registry drift\"")
         .expect("the phase names its stage");
     assert!(start < call, "the stage is named before the phase runs");
-    let block = &src[start..];
+    // Data completion has its own earlier publication; this phase belongs
+    // to the software path after the last roll, not the first text match.
+    let end = call
+        + src[call..]
+            .find(". \"$REPO/infra/agent/publication-stage.sh\"")
+            .expect("optional publication follows the registry comparison");
+    assert!(
+        end > call,
+        "registry comparison precedes optional publication"
+    );
+    let block = &src[start..end];
     for (case, stand_in, recorded) in [
         (
             "says",

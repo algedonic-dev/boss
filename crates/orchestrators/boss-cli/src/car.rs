@@ -139,7 +139,7 @@ impl ItemAnswer {
     /// validates would otherwise record provenance pointing at nothing,
     /// and the next reader would have no way to tell that from a real
     /// link (never write an id you did not read).
-    async fn resolve_ids(self, http: &boss_core::machine_token::Client) -> Result<Self> {
+    async fn resolve_ids(self, http: &crate::machine_http::MachineClient) -> Result<Self> {
         if self.backlog_item.is_none() && self.partial_item.is_none() {
             return Ok(self);
         }
@@ -599,6 +599,15 @@ pub(crate) struct WaitsOnFields {
     pub seen: Option<String>,
     pub owner: Option<String>,
     pub max_wait_hours: Option<u32>,
+    pub next_check_at: Option<String>,
+    pub clean_window: Option<CleanWindowFields>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CleanWindowFields {
+    pub begin_at: String,
+    pub duration_seconds: i64,
 }
 
 impl WaitsOnFields {
@@ -620,7 +629,7 @@ impl WaitsOnFields {
     pub(crate) fn update(&self) -> Result<Value> {
         if self.is_empty() {
             bail!(
-                "nothing to declare: give --on, --seen, --owner or --max-wait-hours \
+                "nothing to declare: give --on, --seen, --owner, --max-wait-hours or --next-check-at \
                  (or --clear to remove the declaration)"
             );
         }
@@ -636,6 +645,11 @@ impl WaitsOnFields {
         let on = blank("--on", &self.on)?;
         let seen = blank("--seen", &self.seen)?;
         let owner = blank("--owner", &self.owner)?;
+        let next_check_at = blank("--next-check-at", &self.next_check_at)?;
+        if let Some(at) = next_check_at.as_deref() {
+            chrono::DateTime::parse_from_rfc3339(at)
+                .map_err(|_| anyhow::anyhow!("--next-check-at must be an RFC3339 time"))?;
+        }
         if let Some(s) = seen.as_deref()
             && let Some(r) = crate::prove::admit(s, true).refusal
         {
@@ -650,6 +664,17 @@ impl WaitsOnFields {
                  reads it as that actor, so prose there is a wait on nobody"
             );
         }
+        if let Some(window) = &self.clean_window {
+            let begin = chrono::DateTime::parse_from_rfc3339(&window.begin_at)
+                .map_err(|_| anyhow::anyhow!("clean-window begin_at must be an RFC3339 time"))?;
+            if window.duration_seconds <= 0
+                || chrono::Duration::try_seconds(window.duration_seconds)
+                    .and_then(|duration| begin.checked_add_signed(duration))
+                    .is_none()
+            {
+                bail!("clean-window duration_seconds must give a positive, representable deadline");
+            }
+        }
         if self.max_wait_hours == Some(0) {
             bail!("--max-wait-hours 0 is no patience at all: give a positive number of hours");
         }
@@ -662,6 +687,14 @@ impl WaitsOnFields {
         put("on", on.map(Value::from));
         put("seen", seen.map(Value::from));
         put(car::WAITS_ON_OWNER, owner.map(Value::from));
+        put("next_check_at", next_check_at.map(Value::from));
+        put(
+            "clean_window",
+            self.clean_window
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
+        );
         put(
             car::WAITS_ON_MAX_WAIT_HOURS,
             self.max_wait_hours.map(Value::from),
@@ -790,6 +823,49 @@ mod tests {
         assert!(waits_on_body(None, &with("  ", None), false).is_err());
         let err = waits_on_body(None, &with("world", Some(0)), false).unwrap_err();
         assert!(err.to_string().contains("--max-wait-hours"), "{err}");
+    }
+
+    #[test]
+    fn a_parked_clean_window_keeps_its_beginning_and_positive_duration() {
+        let fields: WaitsOnFields = serde_json::from_value(json!({"clean_window": {
+            "begin_at": "2026-10-15T01:00:00Z", "duration_seconds": 14400
+        }}))
+        .expect("park declarations must carry clean-window data");
+        let body = waits_on_body(
+            Some(&json!({"on": "the clean window", "owner": "world", "seen": "false"})),
+            &fields,
+            false,
+        )
+        .unwrap();
+        assert_eq!(body["waits_on"]["clean_window"]["duration_seconds"], 14400);
+        for window in [
+            json!({"begin_at": "after lunch", "duration_seconds": 10}),
+            json!({"begin_at": "2026-10-15T01:00:00Z", "duration_seconds": 0}),
+        ] {
+            let fields: WaitsOnFields =
+                serde_json::from_value(json!({"clean_window": window})).unwrap();
+            assert!(fields.update().is_err());
+        }
+    }
+
+    #[test]
+    fn a_next_observation_is_recorded_as_a_typed_time_without_replacing_the_wait() {
+        let fields: WaitsOnFields = serde_json::from_value(json!({
+            "next_check_at": "2026-10-15T01:00:00Z"
+        }))
+        .expect("the supported declaration door must carry a next check");
+        let body = waits_on_body(
+            Some(&json!({"on": "the ordinary batch", "owner": "world", "seen": "false"})),
+            &fields,
+            false,
+        )
+        .unwrap();
+        assert_eq!(body["waits_on"]["next_check_at"], "2026-10-15T01:00:00Z");
+        assert_eq!(body["waits_on"]["owner"], "world");
+        assert_eq!(body["waits_on"]["seen"], "false");
+        let invalid: WaitsOnFields =
+            serde_json::from_value(json!({"next_check_at": "after lunch"})).unwrap();
+        assert!(invalid.update().is_err());
     }
 
     const BRANCH: &str = "feat/a-car-opens-when-the-build-starts";

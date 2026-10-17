@@ -857,15 +857,12 @@ pub(crate) fn unfiled_reason(stamp: &RegateStamp, why: &str) -> String {
     )
 }
 
-/// The skip reason for a re-gate whose gate-run was FILED and then never
-/// started (backlog 7919fdcc, item 11): the run is named — it is on the
-/// stamp now, settled `lost` — and so is what happens next, because the
-/// next pass reads that verdict and the red rule bounds the retry.
+/// A filed run stays linked after a launch error. Its recorded verdict,
+/// rather than the transport error, determines whether another attempt is safe.
 pub(crate) fn unstarted_reason(stamp: &RegateStamp, why: &str) -> String {
     format!(
-        "replayed onto main {} as {} to re-gate it; gate-run {} was filed but its Job never \
-         started ({why}) — settled lost, so it is retried as a red: when main moves, or once \
-         its bound passes",
+        "replayed onto main {} as {} to re-gate it; gate-run {} was filed but launch confirmation is unavailable \
+         ({why}); read its recorded verdict before retrying; an open run remains linked",
         short(&stamp.main),
         short(&stamp.head),
         short(&stamp.gate_run),

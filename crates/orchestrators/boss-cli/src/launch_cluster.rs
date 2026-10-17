@@ -160,7 +160,7 @@ fn protected_bytes(path: &Path) -> Result<Vec<u8>, String> {
 
 /// Missing published/issuer inputs refuse BEFORE dispatch claims a step.
 pub(crate) async fn resolve(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     repo: &Path,
     observer: &str,
@@ -261,21 +261,7 @@ pub(crate) async fn resolve(
     let credential = api(format!("/api/credentials/{}", binding.credential)).await?;
     let credential = credential.get("data").unwrap_or(&credential);
     let row: boss_jobs::credentials::CredentialRow = serde_json::from_value(credential.clone())?;
-    let expected_storage = format!("Secret boss-dev/{}/{}", binding.secret, binding.login_file);
-    if row.id != binding.credential
-        || row.issuer != binding.issuer
-        || row.principal != binding.principal
-        || row.scopes != json!(binding.scopes)
-        || row.storage_location != expected_storage
-        || !row.consumers.as_array().is_some_and(|items| {
-            items
-                .iter()
-                .any(|c| c["kind"] == "harness" && c["location"] == harness.id)
-        })
-        || row.rotated_at.map(|t| t.to_rfc3339()).as_deref()
-            != Some(binding.storage_generation.as_str())
-        || crate::launch_job::DEV_POD_SECRETS.contains(&binding.secret.as_str())
-    {
+    if !credential_matches(&row, &binding) {
         bail!(
             "issuer-owned login registry/install generation or consumer does not match; no Secret data was read"
         );
@@ -308,6 +294,28 @@ pub(crate) async fn resolve(
         bail!("published image helper witness differs from the landed source generation");
     }
     Ok(binding)
+}
+
+/// One registry/install predicate for launcher and private broker metadata.
+/// Parsing the typed row happens before this judgement; no value is read.
+pub(crate) fn credential_matches(
+    row: &boss_jobs::credentials::CredentialRow,
+    binding: &Bindings,
+) -> bool {
+    let expected_storage = format!("Secret boss-dev/{}/{}", binding.secret, binding.login_file);
+    row.id == binding.credential
+        && row.issuer == binding.issuer
+        && row.principal == binding.principal
+        && row.scopes == json!(binding.scopes)
+        && row.storage_location == expected_storage
+        && row.consumers.as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|c| c["kind"] == "harness" && c["location"] == binding.harness)
+        })
+        && row.rotated_at.map(|t| t.to_rfc3339()).as_deref()
+            == Some(binding.storage_generation.as_str())
+        && !crate::launch_job::DEV_POD_SECRETS.contains(&binding.secret.as_str())
 }
 
 fn is_digest(s: &str) -> bool {
@@ -421,7 +429,7 @@ pub(crate) async fn snapshot(
 /// selecting Cluster; missing bindings refuse before the source claim.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn launch_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     observer: &str,
     run: &str,
@@ -740,7 +748,7 @@ pub(crate) async fn launch_at(
 
 struct ObserverJournal {
     files: FileJournal,
-    http: boss_core::machine_token::Client,
+    http: crate::machine_http::MachineClient,
     base: String,
     observer: String,
     run: String,

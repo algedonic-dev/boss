@@ -1,0 +1,71 @@
+# Inert source declaration for accepted 6f3ef63c. No adapter is installed,
+# no packet is admitted by this file, and no provider material is a field.
+[[workflow]]
+kind = "enroll-a-managed-agent"
+label = "Enroll dedicated managed agent access"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "A person authorizes a dedicated private enrollment. Provider consent stays in an authenticated broker channel. Opaque receipts conserve each effect; initial consent alone proves neither installation nor native execution."
+metadata = { department = "it", owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scope"
+kind = "sign-off"
+ready_when = "true"
+title_template = "Authorize dedicated access for the approved account"
+authority_role = "platform-admin"
+assurance_required = "presence"
+sign_offs_required = ["platform-admin"]
+metadata_defaults = { human_only = true, credential = "{metadata.credential}", expected_principal = "{metadata.expected_principal}", procedure = "Your passkey signs the public credential and expected principal identifiers filed from the accepted decision. The approved account is already selected; do not choose another one here. No password, code, token, auth cache, provider URL or confirmation material belongs here. Private confirmation requires the authenticated broker transport; this scope does not install a login or activate a worker." }
+fields = [
+  { name = "credential", field_type = "non-empty-string", required = true, filled_by = "filer" },
+  { name = "expected_principal", field_type = "non-empty-string", required = true, filled_by = "filer" },
+  { name = "decision", field_type = "approved|rejected", required = true },
+]
+
+[[workflow.step]]
+title = "enroll"
+kind = "private-enrollment"
+ready_when = "steps.scope.done AND steps.scope.metadata.decision = \"approved\""
+title_template = "Confirm dedicated access privately"
+authority_role = "platform-admin"
+metadata_defaults = { human_only = true, written_by = "rule:private-enrollment-broker", procedure = "Private setup is unavailable until the authenticated broker adapter is installed. Do not paste provider material or use generic job metadata as its transport. Only the broker's original opaque consent receipt can complete this step; the surface has no manual receipt or completion input." }
+fields = [{ name = "broker_receipt_id", field_type = "non-empty-string", required = true }]
+
+[[workflow.step]]
+title = "install"
+kind = "task"
+ready_when = "steps.enroll.done"
+title_template = "Record the broker's installed generation"
+audience = { role = "platform-admin" }
+metadata_defaults = { written_by = "rule:private-enrollment-broker", procedure = "The broker records only opaque installed-generation and original effect receipt identifiers. Dedicated consent alone does not establish installation. No authentication bytes may enter the packet." }
+fields = [
+  { name = "generation_id", field_type = "non-empty-string", required = true },
+  { name = "broker_receipt_id", field_type = "non-empty-string", required = true },
+]
+
+[[workflow.step]]
+title = "verify"
+kind = "task"
+ready_when = "steps.install.done"
+title_template = "Observe the exact installed login effect"
+audience = { role = "platform-admin" }
+metadata_defaults = { written_by = "rule:private-enrollment-broker", procedure = "Require the private broker's original verification of the authorized principal and exact installed generation. Record only its opaque receipt id. This verifies enrollment, never native worker activation or runtime acceptance." }
+fields = [{ name = "broker_receipt_id", field_type = "non-empty-string", required = true }]
+
+[[workflow.step]]
+title = "enrolled"
+kind = "outcome"
+ready_when = "steps.verify.done"
+title_template = "Dedicated enrollment verified — activation remains separate"
+terminal = { outcome = "enrolled" }
+metadata_defaults = { outcome_kind = "completed" }
+
+[[workflow.step]]
+title = "declined"
+kind = "outcome"
+ready_when = "steps.scope.done AND steps.scope.metadata.decision = \"rejected\""
+title_template = "Enrollment declined — no private setup authorized"
+terminal = { outcome = "declined" }
+metadata_defaults = { outcome_kind = "aborted" }

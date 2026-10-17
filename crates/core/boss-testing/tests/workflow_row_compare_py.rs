@@ -41,7 +41,9 @@ use boss_core::job::{Assurance, FilledBy, StepField};
 use boss_jobs::agent_spec::{AgentSpec, Effort};
 use boss_jobs::audience::Audience;
 use boss_jobs::executor_attestation::ExecutorProvenanceRequirement;
-use boss_jobs::registry::{JobTrigger, StepSpec, Terminal, WorkflowSpec, WorkflowStatus};
+use boss_jobs::registry::{
+    ExecutorClass, JobTrigger, StepSpec, Terminal, WorkflowSpec, WorkflowStatus,
+};
 use boss_testing::{repo_root, scratch_dir, write_file};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -155,6 +157,7 @@ fn a_row_with_every_key_stated() -> WorkflowSpec {
         authority_role: Some("platform-admin".into()),
         claimable: Some(true),
         executor: Some("runner:ops".into()),
+        executor_class: Some(ExecutorClass::Agent),
         // A station, not a role: a role would be projected onto
         // `authority_role`, and removing that key would then be undone.
         audience: Some(Audience::Station("approvals".into())),

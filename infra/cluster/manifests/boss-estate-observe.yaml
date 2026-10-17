@@ -289,7 +289,7 @@ spec:
               command:
                 - /bin/sh
                 - -c
-                - cp /usr/local/bin/lib/secret-header.sh /reader/secret-header.sh || echo "reader - the copy failed, so this pass sends no machine token"
+                - cp /usr/local/bin/lib/secret-header.sh /reader/secret-header.sh || echo "reader - the copy failed, so this pass sends no machine token"; cp /usr/local/bin/lib/jobs-pages.sh /usr/local/bin/lib/immutable-metadata.jq /reader/ || echo "gate readers unavailable - dead-host settlement will refuse"
               securityContext:
                 allowPrivilegeEscalation: false
                 capabilities: {drop: ["ALL"]}
@@ -941,13 +941,26 @@ spec:
                       # jq-1.6 exits 0 on an input carrying no document
                       # (backlog d96e38ab), and an empty answer here read
                       # as "no gate owns this run" would end a live one.
-                      if ! api_curl -sf -H "x-boss-user: $OBSERVER_USER" \
-                          "$JOBS_API/api/jobs?kind=gate-run&limit=50&full=true&metadata=%7B%22agent_run%22%3A%22$run%22%7D" >"$WORK/run-gates.json" 2>/dev/null \
-                          || [ "$(jq -r '.data | type' "$WORK/run-gates.json" 2>/dev/null)" != array ]; then
-                        echo "run $run: $seen, but its gate-runs could not be read — left for the clock"
+                      GATE_READERS="${BOSS_GATE_READERS:-/reader}"
+                      if [ ! -r "$GATE_READERS/jobs-pages.sh" ] || [ ! -r "$GATE_READERS/immutable-metadata.jq" ]; then
+                        echo "run $run: gate readers unavailable — retained"
                         continue
                       fi
-                      gating=$(jq -r '[ .data[]
+                      . "$GATE_READERS/jobs-pages.sh"
+                      job_pages_get() { api_curl -fsS -H "x-boss-user: $OBSERVER_USER" "$JOBS_API/api/jobs?$1"; }
+                      raw_query=$(jq -rn --arg run "$run" '{agent_run:$run}|tojson|@uri')
+                      source_query=$(jq -rn --arg run "$run" '{gate_submission:{source:{agent_run:$run}}}|tojson|@uri')
+                      if ! read_job_pages "kind=gate-run&metadata=$raw_query" "$WORK/run-$run-legacy" >"$WORK/run-$run-legacy.json" \
+                          || ! read_job_pages "kind=gate-run&metadata=$source_query" "$WORK/run-$run-canonical" >"$WORK/run-$run-canonical.json" \
+                          || ! jq -s --arg run "$run" -L "$GATE_READERS" '
+                            include "immutable-metadata";
+                            add | group_by(.id) | map(. as $group | if all(.[]; . == $group[0]) then .[0] else error("gate changed between ownership reads") end) | map(. as $row | (.metadata | gate_source) as $source
+                              | if $source.agent_run != $run then error("gate index disagrees with owner") else $row end)
+                            ' "$WORK/run-$run-legacy.json" "$WORK/run-$run-canonical.json" >"$WORK/run-gates.json" 2>"$WORK/run-$run-authority.stderr"; then
+                        echo "run $run: $seen, but its complete authoritative gate-runs could not be read — left for the clock"
+                        continue
+                      fi
+                      gating=$(jq -r '[ .[]
                                         | select(.status == "open"
                                                  or any((.steps // [])[]; .kind == "gate-verdict" and (.metadata.verdict // "") == "green"))
                                         | .id ] | .[0] // empty' "$WORK/run-gates.json") || gating="unparsed"

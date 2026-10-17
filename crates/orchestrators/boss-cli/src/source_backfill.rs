@@ -329,7 +329,7 @@ where
 
 /// Every open backlog-item, page after page until the rows agree with
 /// the server's `total` — a limit is not a filter.
-async fn open_items(http: &boss_core::machine_token::Client) -> Result<Vec<Value>> {
+async fn open_items(http: &crate::machine_http::MachineClient) -> Result<Vec<Value>> {
     const PAGE: usize = 200;
     let mut rows: Vec<Value> = Vec::new();
     loop {

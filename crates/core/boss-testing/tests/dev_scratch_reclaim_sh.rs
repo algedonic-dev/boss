@@ -124,7 +124,7 @@ fn stub_curl(root: &Path) -> PathBuf {
             "                m=${url##*metadata=}; m=${m%%&*}; m=$(printf '%b' \"${m//%/\\\\x}\")\n",
             "                case \"$url\" in *kind=gate-run*) c=gate_runs ;; *) c=cars ;; esac\n",
             "                jq -c --argjson m \"$m\" --arg c \"$c\" '\n",
-            "                    [(.[$c] // [])[] | select(. as $r | $m | to_entries | all(.value == $r[.key]))]\n",
+            "                    [(.[$c] // [])[] | select(contains($m))]\n",
             "                    | {total: length, data: [.[] | {id: (.id // \"packet\"), status: (.status // \"open\"),\n",
             "                                                    metadata: del(.id, .status)}]}' <<<\"$rec\" ;;\n",
             "        esac\n",
@@ -3555,5 +3555,29 @@ fn every_problem_the_pass_counts_is_named_on_the_packet() {
             .all(|l| l.starts_with("RED dev-scratch-reclaim/")
                 && l.split_whitespace().nth(2) == Some("problem:")),
         "every line is the chore judge's shape, `RED <route> <kind>: <error>`\n{output}"
+    );
+}
+
+#[test]
+fn durable_gate_index_drift_cannot_reclaim_a_live_original_checkout() {
+    let root = boss_testing::scratch_dir("boss-dsr-durable-index");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let tree = yard.worktree("agent-original-open", Some("fix/original-open"), 2);
+    let source = serde_json::json!({"worktree":path_str(&tree),"branch":"fix/original-open","agent_run":"runoriginal","sha":"head"});
+    let envelope = serde_json::json!({"contract_version":1,"source":source});
+    write_record(
+        &root,
+        serde_json::json!({"gate_runs":[{
+        "id":"durablegate","worktree":path_str(&tree),"branch":"fix/original-open","agent_run":"runwrong","sha":"head",
+        "gate_submission":envelope,"_immutable_metadata":{"gate_submission":envelope}}],
+        "runs":{"runoriginal":"open","runwrong":"closed"}}),
+    );
+    let free = under_the_work_floor();
+    let out = run(&root, &[("STUB_DF_WORK_GB", &free)]);
+    assert!(
+        tree.exists(),
+        "an inconsistent raw locator cannot substitute a closed run for the original open owner\n{}",
+        say(&out)
     );
 }

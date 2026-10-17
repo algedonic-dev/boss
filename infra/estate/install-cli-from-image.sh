@@ -180,6 +180,7 @@ set -uo pipefail
 
 NAME="install-cli-from-image"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF_DIR/cli-compatible.sh" || exit 1
 
 # shellcheck source=infra/run-summary.sh
 . "$SELF_DIR/../run-summary.sh"
@@ -205,7 +206,7 @@ if [ -z "${BOSS_CLI_IMAGE_REPO:-}" ]; then
 fi
 IMAGE_REPO="$BOSS_CLI_IMAGE_REPO"
 SCHEME="${BOSS_CLI_REGISTRY_SCHEME:-http}"
-STORE="${BOSS_CLI_STORE:-/opt/boss-cli}"
+STORE="$(cli_host_store)"
 LINK="${BOSS_CLI_LINK:-/usr/local/bin/boss}"
 WRAPPER_SRC="${BOSS_CLI_WRAPPER_SRC:-$SELF_DIR/boss-cli-wrapper.sh}"
 KEEP="${BOSS_CLI_KEEP:-3}"
@@ -220,6 +221,7 @@ REGISTRY_HOST="${IMAGE_REPO%%/*}"
 REPO_PATH="${IMAGE_REPO#*/}"
 REGISTRY_URL="$SCHEME://$REGISTRY_HOST"
 MEMBER="usr/local/bin/boss"
+INPUTS_MEMBER="usr/local/bin/boss-inputs.json"
 # The codebase-metrics chore's counter, installed beside the CLI when the
 # image carries it (see THE CODE-BRANCH COUNTER above). Its basename is
 # what lands in the generation; the unit's BOSS_LEAKED_POLICY_BIN is
@@ -320,6 +322,38 @@ if ! cmp -s "$WRAPPER_SRC" "$STORE/boss"; then
     say "wrapper installed at $STORE/boss"
 fi
 
+# A later data-only source can use this actual image unchanged. Re-read every
+# qualification; a previous local compatibility result is never authority.
+# Keep cli_sha/image truthful and record compatible source separately.
+previous_image=$(readlink "$STORE/current" 2>/dev/null || true)
+if [ -n "$previous_image" ] && [ "$previous_image" != "$SHA" ] \
+    && [ -r "$SELF_DIR/cli-compatible.sh" ]; then
+    . "$SELF_DIR/cli-compatible.sh"
+    source_repo="$(cd "$SELF_DIR/../.." && pwd -P)"
+    source_reader=""
+    [ ! -f "$source_repo/.boss-tree-sha" ] || source_reader="$source_repo/infra/forge/root-tree.sh"
+    if compatibility_receipt=$(cli_image_compatible "$STORE" "$previous_image" "$SHA" "$source_repo" "$source_reader"); then
+        if [ "$(readlink "$LINK" 2>/dev/null || true)" != "$STORE/boss" ]; then
+            mkdir -p "$(dirname "$LINK")"
+            gen_atomic_link "$STORE/boss" "$LINK" || refuse 'failed: cannot link compatible CLI' "$LINK"
+        fi
+        line="$(version_of "$LINK" --version)" || true
+        case "$line" in
+            *"built from $previous_image"*) ;;
+            *) refuse 'unconfirmed: compatible image wrapper identity differs' "$line" ;;
+        esac
+        run_summary_field cli_sha "$previous_image"
+        run_summary_field cli_image "$IMAGE_REPO:${previous_image:0:7}"
+        run_summary_field cli_compatible_source "$SHA"
+        run_summary_field cli_compatibility_receipt "$compatibility_receipt"
+        run_summary_field cli_compatibility_sha256 "$(sha256sum "$compatibility_receipt" | cut -d' ' -f1)"
+        run_summary_field cli_action compatible
+        run_summary_field cli_result ok
+        say "compatible source $SHA; actual image CLI remains $previous_image; whole native observation: $compatibility_receipt"
+        exit 0
+    fi
+fi
+
 # --- the registry, over HTTP ------------------------------------------------
 # One request shape for everything, so a failure always has the same
 # three facts beside it: the URL, the HTTP code, and the body in full.
@@ -400,6 +434,7 @@ stage=""
 # The counter's verdict: empty until a layer decides it, then
 # `installed` or `absent: <why>`.
 counter=""
+compiler_inputs=""
 control=""
 bootstrap=""
 if [ -x "$STORE/$SHA/boss" ]; then
@@ -453,6 +488,26 @@ else
         # grep on a 230 MB tar listing is the SIGPIPE coin-flip.
         if ! tar -tzf "$blob" >"$pull/layer.list" 2>"$pull/layer.err"; then
             refuse "refused: layer $i of $IMAGE is not a readable gzip tar" "tar said: $(tr '\n' ' ' <"$pull/layer.err")"
+        fi
+        # Optional complete compiler evidence from this same verified image.
+        # Topmost mention wins, including whiteouts, just like the binary.
+        if [ -z "$compiler_inputs" ]; then
+            if grep -qx -- "$INPUTS_MEMBER" "$pull/layer.list"; then
+                if [ "$(grep -cx -- "$INPUTS_MEMBER" "$pull/layer.list")" -eq 1 ] \
+                    && tar -xzf "$blob" -C "$pull" -- "$INPUTS_MEMBER" 2>"$pull/inputs.err" \
+                    && [ -f "$pull/$INPUTS_MEMBER" ] && [ ! -L "$pull/$INPUTS_MEMBER" ] \
+                    && mv -- "$pull/$INPUTS_MEMBER" "$stage/boss-inputs.json"; then
+                    compiler_inputs=staged
+                else
+                    compiler_inputs='unusable: image compiler receipt is not one regular member'
+                fi
+            else
+                iwh="$(grep -m 1 -x -e "$(dirname "$INPUTS_MEMBER")/.wh.boss-inputs.json" \
+                    -e "$(dirname "$INPUTS_MEMBER")/.wh..wh.opq" -e "usr/local/.wh.bin" \
+                    -e "usr/local/.wh..wh.opq" -e "usr/.wh.local" -e "usr/.wh..wh.opq" \
+                    -e ".wh.usr" -e ".wh..wh.opq" "$pull/layer.list")"
+                [ -z "$iwh" ] || compiler_inputs="unusable: image deletes compiler receipt ($iwh)"
+            fi
         fi
         # The counter, decided in the first layer that mentions it —
         # BEFORE the CLI's check below, which ends the walk and removes
@@ -552,6 +607,21 @@ else
     # in one COPY, so a lower layer carrying it alone is not this image.
     [ -n "$counter" ] || counter="absent: no layer of $IMAGE at or above the CLI's (layer $found) carries $COUNTER_MEMBER"
     chmod 0755 "$stage/boss"
+    if [ "$compiler_inputs" = staged ]; then
+        binary_hash=$(sha256sum "$stage/boss" | cut -d' ' -f1)
+        if jq_doc_file "$stage/boss-inputs.json" && jq -e --arg h "$binary_hash" \
+            '.schema == 1 and .reusable == true and .binaries.boss == $h and (.files | type == "object")' \
+            "$stage/boss-inputs.json" >/dev/null; then
+            chmod 0644 "$stage/boss-inputs.json"
+            compiler_inputs='verified: whole image receipt matches actual CLI bytes'
+        else
+            mv -- "$stage/boss-inputs.json" "$stage/boss-inputs.invalid.json"
+            compiler_inputs='unusable: compiler receipt is malformed, refused, or names other binary bytes'
+        fi
+    fi
+    [ -n "$compiler_inputs" ] || compiler_inputs='unavailable: image carries no compiler receipt at or above the CLI layer'
+    say "compiler inputs: $compiler_inputs"
+    run_summary_field cli_compiler_inputs "$compiler_inputs"
 
     # CONFIRM THE STAGED BINARY BEFORE IT BECOMES A GENERATION: run it
     # the way the wrapper will, and read what it says it was built from.

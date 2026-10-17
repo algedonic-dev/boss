@@ -62,6 +62,7 @@ fn moved(
     declared: Option<bool>,
 ) -> Move {
     Move {
+        dispatch: None,
         at: boss_clock_client::wall_now() - chrono::Duration::minutes(1),
         packet: packet.into(),
         kind: "ship-a-change".into(),
@@ -203,6 +204,11 @@ async fn the_page_is_the_record_after_a_seq_with_the_undrawn_routes_it_took() {
         ),
         "gates -> shed is declared now, whatever its row was stamped"
     );
+    // Which mover wrote each row, and which one the band counts
+    // (backlog c8d22e63): here, the same one.
+    let current = boss_jobs::moves::mover_version();
+    assert_eq!(body["undeclared"]["mover_version"], current.as_str());
+    assert_eq!(body["moves"][0]["mover_version"], current.as_str());
     assert_eq!(
         body["mover"]["state"], "starting",
         "the mover says what it is doing"

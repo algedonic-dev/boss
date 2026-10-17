@@ -109,6 +109,50 @@ use crate::sor_client::{all_open_cars, api, api_at, jobs_base, stamp};
 // The ONE rows helper (backlog 7b7e0529): a body that is not a list
 // refuses rather than reading as an empty yard. See `train::rows`.
 use crate::train::rows;
+mod reservation;
+
+pub(crate) async fn guard_conductor_settlement(
+    http: &crate::machine_http::MachineClient,
+    jobs: &str,
+    packet: &str,
+    namespace: &str,
+    receipt: &Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    reservation::guard_settlement_for_conductor(http, jobs, packet, namespace, receipt, now).await
+}
+
+pub(crate) async fn supervise_queue(
+    http: &crate::machine_http::MachineClient,
+    jobs: &str,
+    checkout: &Path,
+    namespace: &str,
+    max: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    match reservation::supervise_for_conductor(http, jobs, checkout, namespace, max, now).await {
+        Ok(observation) => observation,
+        Err(error) => json!({"contract_version":1,"state":"unknown","reason":format!("{error:#}"),
+            "observed_at":now,"source_build":crate::built_from::built_from()}),
+    }
+}
+
+/// The existing conductor and operator producers share the exact guarded
+/// sender. This does not adopt old attempts: incompatible pinned packets
+/// refuse before any native send, and ambiguous attempts remain UNKNOWN.
+pub(crate) async fn launch_controlled(
+    http: &crate::machine_http::MachineClient,
+    jobs: &str,
+    packet: &str,
+    namespace: &str,
+    head: &str,
+    mode: &str,
+    manifest: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<String> {
+    reservation::launch_for_conductor(http, jobs, packet, namespace, head, mode, manifest, now)
+        .await
+}
 
 /// The COMPILED fallback for how many gates run at once — the last
 /// resort when neither the env override nor the delivery policy can be
@@ -330,7 +374,7 @@ pub(crate) fn max_concurrent_from(raw: Option<&str>, fallback: usize) -> Result<
 /// wedging every train. A degraded read is warned about (one line) so
 /// "the bound looks wrong" has a trail, then the compiled default
 /// carries the gate.
-async fn policy_max_concurrent(http: &boss_core::machine_token::Client) -> usize {
+async fn policy_max_concurrent(http: &crate::machine_http::MachineClient) -> usize {
     let fetched = api(
         http,
         reqwest::Method::GET,
@@ -364,7 +408,7 @@ async fn policy_max_concurrent(http: &boss_core::machine_token::Client) -> usize
 
 /// The concurrency bound in force: env override > delivery policy >
 /// compiled fallback.
-pub(crate) async fn max_concurrent(http: &boss_core::machine_token::Client) -> Result<usize> {
+pub(crate) async fn max_concurrent(http: &crate::machine_http::MachineClient) -> Result<usize> {
     let fallback = policy_max_concurrent(http).await;
     max_concurrent_from(
         std::env::var("BOSS_GATE_MAX_CONCURRENT").ok().as_deref(),
@@ -381,6 +425,24 @@ pub(crate) enum Requester {
     /// verdict since design 128b5496, one per train, 2–10 min on a
     /// warm target.
     Train,
+    /// Main's unscoped full gate, filed by the conductor after a
+    /// converge (backlog 77596188). Admitted like a car, and the
+    /// conductor asks it to go LAST before it ever gets here
+    /// (`boss_jobs::full_gate_on_main::launch`); it is the one launch
+    /// that runs in full rather than `--auto`.
+    MainFull,
+}
+
+impl Requester {
+    /// The gate mode this requester's launch runs: `--auto` for a car's
+    /// and a train's gate, and the empty mode — a full gate, as
+    /// `normalize_mode` spells it — for main's.
+    pub(crate) const fn mode(self) -> &'static str {
+        match self {
+            Requester::Car | Requester::Train => "--auto",
+            Requester::MainFull => "",
+        }
+    }
 }
 
 /// THE ONE DEFINITION OF ADMISSION AT THE GATE BOUND. `live` is the
@@ -407,7 +469,7 @@ pub(crate) enum Requester {
 /// it would idle about three quarters of the time.
 pub(crate) const fn admits(live: usize, ahead: usize, max: usize, who: Requester) -> bool {
     match who {
-        Requester::Car => live + ahead < max,
+        Requester::Car | Requester::MainFull => live + ahead < max,
         Requester::Train => live < max,
     }
 }
@@ -531,7 +593,7 @@ fn rule_keeps_claims(
 
 /// `rule`'s last firing, read now; `Ok(None)` when it has never fired.
 async fn last_firing_now(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     rule: &str,
 ) -> Result<Option<boss_jobs::cadence::LastFiring>> {
     let path = format!("/api/cadence/rules/{rule}/last-firing");
@@ -551,7 +613,7 @@ async fn last_firing_now(
 /// `Err` says why for the caller to print. The reconcile rule's firing
 /// is read only when some train claims a bay.
 pub(crate) async fn trains_waiting_now(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     now: chrono::DateTime<chrono::Utc>,
 ) -> std::result::Result<Vec<String>, String> {
     let trains = api(
@@ -790,6 +852,9 @@ pub(crate) fn queue_order(
         .iter()
         .filter_map(|j| {
             let md = j.get("metadata")?;
+            if boss_jobs::gate_reservation::durable_presence(md) {
+                return None;
+            }
             let taken = md
                 .get(QUEUED_AT)
                 .and_then(Value::as_str)
@@ -942,8 +1007,8 @@ pub(crate) fn dock_waiting(
 /// refresh rule's last firing — counts none, the line as it was before
 /// design 42279fb2 D3, and the `Err` says why for the caller to print.
 /// The firing is read only when some car carries a claim.
-async fn dock_waiting_now(
-    http: &boss_core::machine_token::Client,
+pub(crate) async fn dock_waiting_now(
+    http: &crate::machine_http::MachineClient,
     now: chrono::DateTime<chrono::Utc>,
 ) -> std::result::Result<usize, String> {
     let cars = api(
@@ -1192,6 +1257,9 @@ pub(crate) fn abandoned_places(
         .filter_map(|j| {
             let id = j.get("id").and_then(Value::as_str)?;
             let md = j.get("metadata")?;
+            if boss_jobs::gate_reservation::durable_presence(md) {
+                return None;
+            }
             // The queued MARKER, the same reading the yard's gate bays
             // make: a blank string is no marker (boss_jobs::yard).
             let queued_at = md
@@ -1413,7 +1481,7 @@ pub(crate) fn handable_edit_level(answer: Option<&Value>) -> Option<String> {
 /// The edit-level door's answer, for [`hand_edit_level`]. NEVER FATAL
 /// and never a guess: a door that cannot be read hands nothing, the
 /// launch goes on, and the lint in the pod says no level was handed.
-pub(crate) async fn edit_level_answer(http: &boss_core::machine_token::Client) -> Option<Value> {
+pub(crate) async fn edit_level_answer(http: &crate::machine_http::MachineClient) -> Option<Value> {
     match api(
         http,
         reqwest::Method::GET,
@@ -2381,7 +2449,7 @@ pub(crate) fn green_frees(job: &Value) -> Option<(String, PathBuf, String)> {
 /// Best effort, like every stamp this verb writes: the verdict is the
 /// deliverable, and a target left behind is the hourly reclaim's.
 async fn free_at_green(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     job: &Value,
     now: chrono::DateTime<chrono::Utc>,
 ) {
@@ -2796,6 +2864,23 @@ pub(crate) fn withdraw_refusal(packet: &str, job: &Value) -> Option<String> {
              ({said}) — a runner reported, so there is nothing left to stand down"
         ));
     }
+    let metadata = job.get("metadata");
+    let no_child_candidate = metadata
+        .and_then(|md| md.pointer("/gate_launch_attempt/state"))
+        .and_then(Value::as_str)
+        == Some("not_started");
+    if metadata.is_some_and(|md| {
+        md.get("gate_launch_observation").is_some()
+            || !no_child_candidate
+                && ["gate_launch_attempt", "gate_launch_intent"]
+                    .iter()
+                    .any(|key| md.get(*key).is_some())
+    }) {
+        return Some(format!(
+            "boss gate --withdraw: {packet} carries a protected native attempt/intent/observation; \
+            a later absence or pod-less Job cannot prove no effect. Retained for exact guarded/native reconciliation (UNKNOWN)."
+        ));
+    }
     if !admits_withdrawn(job) {
         return Some(format!(
             "boss gate --withdraw: gate-run {packet} was admitted under a gate-run version \
@@ -2951,7 +3036,7 @@ pub(crate) fn unrefreshed_car_warning(
 /// is allowed to fail; an unobservable signal is `None`, never a
 /// landing.
 async fn observe_landing(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     branch: &str,
     sha: &str,
 ) -> Option<Landing> {
@@ -3039,7 +3124,7 @@ pub(crate) fn prior_runs_query(branch: &str, sha: &str) -> String {
 /// SoR must not stop a launch that `wait_for_verdict` is built to
 /// survive.
 async fn observe_prior(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     branch: &str,
     sha: &str,
@@ -3141,7 +3226,7 @@ fn verdict_writes(
 /// one writer both refusal paths share, so neither can drift back to a
 /// metadata-carrying PUT on its own.
 async fn write_verdict(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     packet: &str,
     receipt: &Value,
 ) -> Result<()> {
@@ -3169,7 +3254,7 @@ async fn write_verdict(
     Ok(())
 }
 
-async fn close_refused(http: &boss_core::machine_token::Client, packet: &str, reason: &str) {
+async fn close_refused(http: &crate::machine_http::MachineClient, packet: &str, reason: &str) {
     // A LAUNCH REFUSED IS A REFUSAL, not silence: something
     // declined out loud, with a reason, and no check ever ran. It
     // was filed as `lost` only because the verdict enum had no
@@ -3361,17 +3446,22 @@ pub(crate) fn kubectl(namespace: &str) -> std::process::Command {
 /// verdicts — workspaces are per-run) but kubectl is needed to CREATE
 /// the Job anyway, so a cluster too sick to answer this was never
 /// going to run the gate either.
+fn gate_jobs_command(namespace: &str, selector: &str) -> std::process::Command {
+    let mut command = kubectl(namespace);
+    command.args([
+        "get",
+        "jobs",
+        "-l",
+        selector,
+        "--no-headers",
+        "-o",
+        "custom-columns=NAME:.metadata.name,S:.status.succeeded,F:.status.failed",
+    ]);
+    command
+}
+
 fn gate_jobs_table(namespace: &str, selector: &str) -> Result<String> {
-    let out = kubectl(namespace)
-        .args([
-            "get",
-            "jobs",
-            "-l",
-            selector,
-            "--no-headers",
-            "-o",
-            "custom-columns=NAME:.metadata.name,S:.status.succeeded,F:.status.failed",
-        ])
+    let out = gate_jobs_command(namespace, selector)
         .output()
         .context("kubectl get jobs — is KUBECONFIG set and the cluster reachable?")?;
     if !out.status.success() {
@@ -3445,6 +3535,7 @@ pub async fn withdraw(
     reason: Option<String>,
     namespace: &str,
     dry: bool,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let http = crate::sor_client::machine_client()?;
     let packet = crate::job::fetch_and_resolve(&http, packet_ref).await?;
@@ -3460,11 +3551,17 @@ pub async fn withdraw(
     if let Some(why) = withdraw_refusal(short, &job) {
         bail!("{why}");
     }
-    let md = |k: &str| {
-        job.pointer(&format!("/metadata/{k}"))
+    let source = boss_jobs::gate_reservation::source_metadata(
+        job.get("metadata")
+            .context("withdraw target lacks metadata")?,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let md = |key: &str| {
+        source
+            .get(key)
             .and_then(Value::as_str)
             .unwrap_or_default()
-            .to_string()
+            .to_owned()
     };
     let (branch, sha) = (md("branch"), md("sha"));
     let cars = all_open_cars(&http).await?;
@@ -3503,6 +3600,9 @@ pub async fn withdraw(
         );
         return Ok(());
     }
+    reservation::guard_settlement(&http, &packet, namespace, &receipt, now)
+        .await
+        .context("claiming the exact negative decision before deletion or verdict")?;
     for j in &jobs {
         let out = kubectl(namespace)
             .args(["delete", "job", j, "--ignore-not-found", "--wait=true"])
@@ -3564,6 +3664,7 @@ pub async fn run(
     manifest: Option<PathBuf>,
     namespace: &str,
     wait: bool,
+    submit: bool,
     dry: bool,
     mut park: ParkIntent,
     force_regate: Option<String>,
@@ -3572,6 +3673,28 @@ pub async fn run(
     hold: Option<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
+    // A full packet id is a read handle. Resolve it before looking at
+    // the local branch/tree, runner manifest, process run marker or any
+    // native door. A reader cannot renew, adopt, stamp or relaunch.
+    if uuid::Uuid::parse_str(branch).is_ok() {
+        if !wait
+            || submit
+            || dry
+            || mode.is_some()
+            || manifest.is_some()
+            || !park.is_empty()
+            || force_regate.is_some()
+            || stale_base_anyway.is_some()
+            || rebase
+            || hold.is_some()
+        {
+            bail!(
+                "a gate packet handle accepts only --wait; submission modifiers cannot change the original request"
+            );
+        }
+        let http = crate::sor_client::machine_client()?;
+        return reservation::observe(&http, branch).await;
+    }
     // Carries `now` forward to a stamp written later in this verb.
     let verb_started = std::time::Instant::now();
     let manifest_path =
@@ -3582,6 +3705,7 @@ pub async fn run(
     // BEFORE the sha lookup, the packet, the manifest and kubectl —
     // a bad mode, a half-filled park intent, or a typo'd concurrency
     // bound should cost a line of output, not a gate slot.
+    let mode_was_set = mode.is_some();
     let mode = normalize_mode(&mode.unwrap_or_default())?;
     park.require_complete()?;
     // WHICH ITEM — refused here, with the receipt, because the edge is
@@ -3635,6 +3759,15 @@ pub async fn run(
         eprintln!("{w}");
     }
     let http = crate::sor_client::machine_client()?;
+    let ownership_policy = if dry {
+        None
+    } else {
+        Some(reservation::ownership_policy(&http).await?)
+    };
+    let durable = submit
+        || ownership_policy.as_ref().is_some_and(|row| {
+            row.get("gate_queue_owner").and_then(Value::as_str) == Some("resident")
+        });
     // The trust marks on the items the park intent names, once read
     // (never on a dry run, which reads no packet).
     let mut trust_marks: Option<Vec<(&'static str, String, crate::trust_boundary::Mark)>> = None;
@@ -3825,6 +3958,36 @@ pub async fn run(
     // matched nothing and filed a new packet with no intent (backlog
     // e9cdd83f, 2026-09-24: 91594262 and 03af83b4).
     let reuse = reusable_packet(&open, branch, &sha);
+    if let Some(id) = reuse.as_deref()
+        && let Some(existing) = open
+            .iter()
+            .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
+        && existing.pointer("/metadata/gate_submission").is_some()
+    {
+        if !park.is_empty()
+            || rebase
+            || force_regate.is_some()
+            || stale_base_anyway.is_some()
+            || hold.is_some()
+            || mode_was_set
+                && existing
+                    .pointer("/metadata/gate_submission/intent/mode")
+                    .and_then(Value::as_str)
+                    != Some(reservation::execution_mode(&mode)?.0.as_str())
+        {
+            bail!(
+                "packet {id} already owns the immutable request; reattach with boss gate {id} --wait"
+            );
+        }
+        println!(
+            "boss gate: existing durable packet {id}; no metadata or launch ownership changed"
+        );
+        return if wait {
+            reservation::observe(&http, id).await
+        } else {
+            Ok(())
+        };
+    }
 
     // A REUSED PACKET MAY ALREADY BE GATING — and attaching to it is
     // neither a launch nor a refusal, so it is settled before admission.
@@ -3836,9 +3999,11 @@ pub async fn run(
     // recorded as `lost`. Attaching is what the advice always meant.
     if let Some(id) = reuse.as_deref()
         && !dry
-        && let Some(name) = live_gate_for_packet(namespace, id)?
+        && let Some(name) = existing_gate_for_packet(namespace, id)?
     {
-        println!("boss gate: packet {id} is already being gated by {name}");
+        println!(
+            "boss gate: packet {id} already has native Job {name} (including terminal evidence)"
+        );
         if wait {
             println!("boss gate: attaching to it — a second Job would race it");
             return wait_for_verdict(&http, id, namespace, &name, now).await;
@@ -4089,7 +4254,7 @@ pub async fn run(
         max,
         pvc_backed_workspace(&job_document(&manifest_text)?),
         &manifest_path.display().to_string(),
-        wait,
+        wait || durable,
         ahead,
         QUEUE_CAP,
         dock_count_or_say(dock_waiting_now(&http, now).await),
@@ -4148,6 +4313,78 @@ pub async fn run(
             }
         }
     };
+
+    if durable && !dry {
+        reservation::capability(&http).await?;
+        reservation::renew(&http, &packet, now).await?;
+        let mut patch = ParkIntent::clear_patch()
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        patch.extend(
+            park.metadata_patch()
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        patch.extend(
+            crate::freshness::base_metadata(&base_obs, stale_base_anyway.as_deref())
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        if let Some(fields) = agent_run.as_ref().and_then(Value::as_object) {
+            patch.extend(fields.clone());
+        }
+        if let Some((_, stamp)) =
+            crate::mutating_verb::hold_stamp(hold.as_deref(), hold_bound, false)
+        {
+            patch.extend(stamp.as_object().cloned().unwrap_or_default());
+        } else {
+            patch.insert("hold".into(), Value::Null);
+            patch.insert(boss_jobs::car::HOLD_UNBOUND.into(), Value::Null);
+        }
+        patch.insert("mode".into(), json!(reservation::execution_mode(&mode)?.0));
+        patch.insert(
+            "gate_queue_policy".into(),
+            ownership_policy
+                .clone()
+                .context("durable request lacks resolved ownership policy")?,
+        );
+        patch.insert(
+            "gate_queue_selection".into(),
+            json!(if submit {
+                "explicit-submit"
+            } else {
+                "resident-default"
+            }),
+        );
+        if let Some(reason) = &force_regate {
+            patch.insert("force_regate_reason".into(), json!(reason));
+        }
+        if let Some(prior) = prior_red {
+            patch.extend(
+                boss_jobs::flake::regate_patch(prior, &sha)
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+        let job = render_job(&manifest_text, branch, &packet, &mode)?;
+        let job = hand_edit_level(&job, edit_level_answer(&http).await.as_ref());
+        let (intent, _bytes) =
+            reservation::prepare(&http, &packet, namespace, &sha, &mode, &job).await?;
+        let receipt = reservation::submit(&http, &intent, &Value::Object(patch)).await?;
+        println!(
+            "boss gate: durable submission {packet} accepted {} by {}; resident supervisor owns progress",
+            receipt.applied_at, receipt.actor
+        );
+        return if wait {
+            reservation::observe(&http, &packet).await
+        } else {
+            Ok(())
+        };
+    }
 
     // THE BASE THIS GREEN WILL VOUCH FOR. A receipt that does not say
     // which main it was taken against cannot be read later at all: the
@@ -4394,25 +4631,7 @@ pub async fn run(
     // request for it (backlog 934ccad1).
     let job = hand_edit_level(&job, edit_level_answer(&http).await.as_ref());
 
-    let mut child = kubectl(namespace)
-        .args(["create", "-f", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("spawning kubectl create — is kubectl on PATH?")?;
-    {
-        use std::io::Write;
-        child
-            .stdin
-            .as_mut()
-            .context("kubectl stdin")?
-            .write_all(job.as_bytes())?;
-    }
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        bail!("kubectl create failed for {branch}");
-    }
-    let created = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let created = reservation::launch(&http, &packet, namespace, &sha, &mode, &job, now).await?;
     println!("boss gate: {created}");
     println!("boss gate: packet {packet}  branch {branch}@{sha}");
     // THE RUN BEGINS NOW, and the packet says so (backlog 4d088a7e): the
@@ -5017,7 +5236,7 @@ fn absence_named(msg: &str) -> &'static str {
 
 /// watch. Reading the packet is also what any other actor would do.
 async fn wait_for_verdict(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     packet: &str,
     namespace: &str,
     job_name: &str,
@@ -5230,7 +5449,7 @@ fn pod_start(namespace: &str, job_name: &str) -> PodStart {
 /// reads one way whichever side declined. Best-effort, like
 /// `close_refused`: a failure to write is said, not raised, because the
 /// wait is about to end with the reason either way.
-async fn record_refusal(http: &boss_core::machine_token::Client, packet: &str, receipt: &Value) {
+async fn record_refusal(http: &crate::machine_http::MachineClient, packet: &str, receipt: &Value) {
     // THE STEP SAYS WHAT THE RECEIPT SAYS. `verdict` is the
     // gate-run protocol's enum, and since ff5b9634 it carries
     // `refused` — so this no longer has to file an out-loud
@@ -5289,7 +5508,7 @@ enum Slot {
 /// waiters agree on who is next without any of them coordinating — the
 /// thing five hand-rolled retry loops could not do.
 async fn wait_for_slot(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     packet: &str,
     branch: &str,
     namespace: &str,
@@ -5364,7 +5583,7 @@ async fn wait_for_slot(
             Err(e) => return Err(e),
         };
         // Did another actor reuse this packet and launch it meanwhile?
-        if let Some(name) = live_gate_for_packet(namespace, packet)? {
+        if let Some(name) = existing_gate_for_packet(namespace, packet)? {
             return Ok(Slot::Gating(name));
         }
         let order = queue_order(&open, at, QUEUE_PLACE_TTL_SECS);
@@ -5493,7 +5712,7 @@ async fn wait_for_slot(
 /// gate as red — the exact confusion cf0021ae exists about. But a
 /// silent failure leaves the lie in place, so it warns with what the
 /// packet still wrongly records.
-async fn record_gated_head(http: &boss_core::machine_token::Client, packet: &str, job: &Value) {
+async fn record_gated_head(http: &crate::machine_http::MachineClient, packet: &str, job: &Value) {
     let recorded = job
         .pointer("/metadata/sha")
         .and_then(Value::as_str)
@@ -5591,13 +5810,13 @@ pub(crate) fn live_gates(rows: &str) -> Vec<String> {
         .collect()
 }
 
-/// Is a Job already gating this packet?
+/// Any retained Job owns this packet's native attempt, even after termination.
 ///
 /// FAILS CLOSED (via [`gate_jobs_table`]): the dangerous act is
 /// CREATING a second Job against the same packet — two Jobs racing to
 /// report one verdict — so an unreadable cluster must not read as
 /// "nothing is running".
-fn live_gate_for_packet(namespace: &str, packet: &str) -> Result<Option<String>> {
+fn existing_gate_for_packet(namespace: &str, packet: &str) -> Result<Option<String>> {
     let table =
         gate_jobs_table(namespace, &format!("boss.dev/packet={packet}")).with_context(|| {
             format!(
@@ -5605,7 +5824,19 @@ fn live_gate_for_packet(namespace: &str, packet: &str) -> Result<Option<String>>
                 &packet[..8.min(packet.len())]
             )
         })?;
-    Ok(live_gates(&table).into_iter().next())
+    gate_rejoin_job(&table)
+}
+
+fn gate_rejoin_job(table: &str) -> Result<Option<String>> {
+    let names = job_names(table);
+    match names.as_slice() {
+        [] => Ok(None),
+        [name] => Ok(Some(name.clone())),
+        _ => bail!(
+            "gate rejoin UNKNOWN: multiple native Jobs carry this packet: {}; no Job created, deleted or selected; reconcile all original identities",
+            names.join(", ")
+        ),
+    }
 }
 
 /// Every gate Job carrying this packet, in ANY state, by name — the
@@ -5689,7 +5920,7 @@ mod tests {
         };
         let stamp = at("Some(launching_patch(at))");
         let reread = at("launch_target_refusal(&packet,");
-        let create = at(".args([\"create\", \"-f\", \"-\"])");
+        let create = at("reservation::launch(&http, &packet,");
         assert!(stamp < reread, "the stamp precedes the re-read");
         assert!(reread < create, "the re-read precedes kubectl create");
     }
@@ -5720,7 +5951,13 @@ mod tests {
             body.find(needle)
                 .unwrap_or_else(|| panic!("{needle:?} is not in fn run"))
         };
-        let refused = at("bail!(\"kubectl create failed for {branch}\")");
+        let refused = at("reservation::launch(&http, &packet,");
+        assert!(
+            body[refused..].starts_with(
+                "reservation::launch(&http, &packet, namespace, &sha, &mode, &job, now).await?;"
+            ),
+            "a failed protected sender must return before the launched stamp"
+        );
         let stamped = at("Some(launched_patch(");
         let waited = at("wait_for_verdict(&http, &packet, namespace, &job_name, now)");
         assert!(refused < stamped, "only a created Job is stamped launched");
@@ -6391,6 +6628,23 @@ mod tests {
     }
 
     /// A gate-run at its verdict step, open, for a withdrawal to read.
+    #[test]
+    fn protected_native_attempts_cannot_be_withdrawn_from_a_later_absence() {
+        for field in [
+            "gate_launch_attempt",
+            "gate_launch_intent",
+            "gate_launch_observation",
+        ] {
+            let mut row = withdrawable_run("open", "ready");
+            row["metadata"][field] = json!({"unknown":"unbound or potentially effective"});
+            let refusal = withdraw_refusal("packet", &row);
+            assert!(
+                refusal.is_some(),
+                "{field} cannot authorize a negative verdict or deletion from a later absence"
+            );
+        }
+    }
+
     fn withdrawable_run(status: &str, verdict_status: &str) -> Value {
         json!({
             "id": "8c2f644a-1b71-4a5a-bb46-cb2f340d59d4", "kind": "gate-run", "status": status,
@@ -6737,6 +6991,8 @@ mod tests {
             seen: Some("true".into()),
             owner: Some("world".into()),
             max_wait_hours: Some(336),
+            next_check_at: None,
+            clean_window: None,
         };
         assert!(p.require_complete().is_ok());
         assert_eq!(
@@ -7972,6 +8228,20 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
     }
 
     #[test]
+    fn rejoin_observes_terminal_jobs_and_refuses_multiple_native_identities() {
+        for rows in [
+            "gate-original 1 <none>",
+            "gate-original <none> 1",
+            "gate-original <none> <none>",
+        ] {
+            assert_eq!(gate_rejoin_job(rows).unwrap(), Some("gate-original".into()));
+        }
+        assert!(gate_rejoin_job("gate-original 1 <none>\ngate-second <none> <none>").is_err());
+        assert!(gate_rejoin_job("gate-one <none> <none>\ngate-two <none> <none>").is_err());
+        assert_eq!(gate_rejoin_job("").unwrap(), None);
+    }
+
+    #[test]
     fn a_finished_job_is_not_live() {
         assert!(live_gates("gate-abc12   1   <none>").is_empty());
         assert!(live_gates("gate-abc12   <none>   1").is_empty());
@@ -8346,6 +8616,20 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
     /// no Job and no holder for ten minutes — rendered, the whole time,
     /// exactly like a run patiently waiting its turn.
     #[test]
+    fn a_durable_owner_is_not_abandoned_when_its_client_disappears() {
+        let mut run = queued_run(
+            "durable",
+            "2026-09-08T18:00:00Z",
+            Some("2026-09-08T18:02:00Z"),
+        );
+        run["metadata"]["gate_submission"] =
+            json!({"unknown":"requires original receipt reconciliation"});
+        assert!(
+            abandoned_places(&[run], at("2026-09-09T20:00:00Z"), QUEUE_PLACE_TTL_SECS).is_empty()
+        );
+    }
+
+    #[test]
     fn a_queued_place_whose_holder_died_is_abandoned() {
         let now = at("2026-09-08T20:00:00Z");
         let open = vec![
@@ -8601,6 +8885,7 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
             firing_id: format!("cadence:{DOCK_REFRESH_RULE}:{fired_at}"),
             fired_at: at(fired_at),
             rc,
+            observations: None,
             board_decision: None,
         }
     }
@@ -8774,6 +9059,21 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
     /// 2026-10-10 a train launched as the bound+1th Job five times in
     /// ten hours — and its priority is a place, not overage: a waiting
     /// train stands ahead of every car, so the bay that frees is its.
+    /// Main's full gate (backlog 77596188) is admitted like a car — a
+    /// waiting train stands ahead of it — and it is the one launch that
+    /// runs unscoped: its mode is the empty one `normalize_mode` calls a
+    /// full gate, where a car's and a train's stay `--auto`.
+    #[test]
+    fn mains_full_gate_is_admitted_like_a_car_and_runs_unscoped() {
+        assert!(admits(2, 0, 3, Requester::MainFull));
+        assert!(!admits(2, 1, 3, Requester::MainFull));
+        assert!(!admits(3, 0, 3, Requester::MainFull));
+        assert_eq!(Requester::MainFull.mode(), "");
+        assert_eq!(normalize_mode(Requester::MainFull.mode()).unwrap(), "");
+        assert_eq!(Requester::Car.mode(), "--auto");
+        assert_eq!(Requester::Train.mode(), "--auto");
+    }
+
     #[test]
     fn a_train_is_refused_at_the_bound_and_a_waiting_train_goes_first() {
         assert!(
@@ -9656,7 +9956,7 @@ kind: Job\n\
             .find("let job = hand_edit_level(&job, edit_level_answer(&http).await.as_ref());")
             .expect("boss gate hands the edit level to its Job");
         let create = run
-            .find(".args([\"create\", \"-f\", \"-\"])")
+            .find("reservation::launch(&http, &packet,")
             .expect("boss gate creates its Job");
         assert!(handed < create, "handed after the Job was created");
         let conductor = include_str!("train/conductor.rs");
@@ -9671,7 +9971,7 @@ kind: Job\n\
             .find("let job = crate::gate::hand_edit_level(&job, edit_level.as_ref());")
             .expect("the conductor hands the edit level to its Job");
         let create = launch
-            .find(".args([\"create\", \"-f\", \"-\"])")
+            .find("crate::gate::launch_controlled(")
             .expect("the conductor creates its Job");
         assert!(read < handed && handed < create);
         // The read itself is the door, by the conductor's token.
@@ -10261,7 +10561,15 @@ mod agent_run_tests {
         };
         let refused = at("crate::shared_checkout::refusal(");
         assert!(refused < at("let agent_run = with_worktree("));
-        assert!(refused < at("crate::sor_client::machine_client()"));
+        let branch_client = body[refused..]
+            .find("crate::sor_client::machine_client()")
+            .expect("submission client after refusal");
+        assert!(branch_client > 0);
+        let reader = &body[..refused];
+        assert!(
+            reader.contains("return reservation::observe(&http, branch).await;"),
+            "the earlier packet-handle client is exclusively a returning reader"
+        );
     }
 
     /// A run's gate stamps the worktree it was launched from beside

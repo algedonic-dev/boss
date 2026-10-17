@@ -1,5 +1,7 @@
 """The dev controller forwards execution; it never runs worker programs."""
 import copy
+import base64
+import json
 import os
 import importlib.util
 from pathlib import Path
@@ -97,15 +99,245 @@ class ControllerContract(unittest.TestCase):
             container.update(terminationMessagePath="/dev/termination-log", terminationMessagePolicy="File")
         self.assertIsNone(self.mod.worker_error(job))
 
+    def test_native_api_omits_false_host_namespaces_without_adding_authority(self):
+        # Shape observed on the first native worker, 2026-10-14: these
+        # non-pointer PodSpec booleans disappear on API serialization.
+        job = self.spec()
+        pod = job["spec"]["template"]["spec"]
+        for field in ("hostNetwork", "hostPID", "hostIPC"):
+            pod.pop(field)
+        self.assertIsNone(self.mod.worker_error(job))
+        for field in ("hostNetwork", "hostPID", "hostIPC"):
+            for value in (True, "false", None, 0):
+                changed = copy.deepcopy(job)
+                changed["spec"]["template"]["spec"][field] = value
+                self.assertIsNotNone(self.mod.worker_error(changed), (field, value))
+        for field in ("automountServiceAccountToken", "shareProcessNamespace", "enableServiceLinks"):
+            changed = copy.deepcopy(job)
+            changed["spec"]["template"]["spec"].pop(field)
+            self.assertIsNotNone(self.mod.worker_error(changed), field)
+
+    def test_native_namespace_defaults_match_intent_but_changed_authority_does_not(self):
+        expected = self.spec()["spec"]["template"]["spec"]
+        actual = copy.deepcopy(expected)
+        for field in ("hostNetwork", "hostPID", "hostIPC"):
+            actual.pop(field)
+        self.assertTrue(self.mod.declared_matches(self.mod.observed_pod_spec(actual), expected))
+        for field in ("hostNetwork", "hostPID", "hostIPC", "automountServiceAccountToken"):
+            for value in (True, "false", None, 0):
+                changed = {**actual, field: value}
+                self.assertFalse(self.mod.declared_matches(self.mod.observed_pod_spec(changed), expected), (field, value))
+        changed = copy.deepcopy(actual)
+        changed["containers"][0]["volumeMounts"].append({"name": "forge-read", "mountPath": "/unexpected"})
+        self.assertFalse(self.mod.declared_matches(self.mod.observed_pod_spec(changed), expected))
+
+    def recovery_fixture(self, root, mutate=lambda _: None, acknowledged=True, mutate_ack=lambda _: None):
+        name = "dev-build-1234567890abcdef"
+        intent = self.spec()
+        self.mod.save_record(root / (name + ".intent.json"), {"name": name, "head": "a" * 40, "job": intent})
+        self.mod.save_record(root / (name + ".volume.json"), {"name": name, "uid": "volume-uid"})
+        job = {**copy.deepcopy(intent), "metadata": {**copy.deepcopy(intent["metadata"]), "uid": "job-uid"}}
+        pod = {"metadata": {"name": name + "-pod", "namespace": "boss-dev", "uid": "pod-uid", "labels": copy.deepcopy(intent["spec"]["template"]["metadata"]["labels"]), "ownerReferences": [{"kind": "Job", "uid": "job-uid"}]},
+               "spec": copy.deepcopy(intent["spec"]["template"]["spec"]),
+               "status": {"phase": "Running", "initContainerStatuses": [{"name": "published-bootstrap", "restartCount": 0, "state": {"terminated": {"exitCode": 0}}}], "containerStatuses": [{"name": "worker", "ready": True, "restartCount": 0, "containerID": "container-id", "state": {"running": {}}}, {"name": "postgres", "ready": True, "restartCount": 0, "state": {"running": {}}}]}}
+        volume = {"kind": "PersistentVolumeClaim", "metadata": {"name": name, "namespace": "boss-dev", "uid": "volume-uid", "ownerReferences": [{"kind": "Job", "name": name, "uid": "job-uid"}]}}
+        if acknowledged:
+            original = {**copy.deepcopy(job), "kind": "Job"}
+            mutate_ack(original)
+            self.mod.save_record(root / (name + ".launch-original.json"), {"argv": ["create", "-f", "-", "-o", "json"], "completion": "observed", "exit": 0, "stdout_base64": base64.b64encode(json.dumps(original).encode()).decode()})
+        for spec in (job["spec"]["template"]["spec"], pod["spec"]):
+            for field in ("hostNetwork", "hostPID", "hostIPC"):
+                spec.pop(field)
+        originals = {"job": job, "pod": pod, "volume": volume}
+        mutate(originals)
+        calls = []
+        def transport(argv, stdin=None):
+            calls.append(argv)
+            data = {"job": originals["job"], "pods": {"items": [originals["pod"]]}, "pvc": originals["volume"]}[argv[1]]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(data).encode(), b"")
+        return name, originals, calls, transport
+
+    def test_recovery_uses_original_creation_uid_without_creating_or_executing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            name, _, calls, transport = self.recovery_fixture(root)
+            session = self.mod.recover_start(name, root, transport=transport)
+            self.assertEqual(session.job_uid, "job-uid")
+            self.assertEqual(session.volume_uid, "volume-uid")
+            self.assertEqual(session.source_head, "a" * 40)
+            self.assertEqual(self.mod.load_record(root / (name + ".json"))["pod_uid"], "pod-uid")
+            self.assertEqual([call[:2] for call in calls], [["get", "job"], ["get", "pvc"], ["get", "pods"]])
+            self.assertEqual(len(list(root.glob(name + ".recovery-*.json"))), 3)
+            with self.assertRaises(ValueError):
+                self.mod.recover_start(name, root, transport=transport)
+            self.assertEqual(len(calls), 3)
+
+    def test_recovery_and_observation_conserve_fence_labels_and_job_bounds(self):
+        cases = [
+            ("positive", lambda _: None),
+            ("lost fence label", lambda o: o["pod"]["metadata"]["labels"].pop("boss.dev/purpose")),
+            ("changed fence label", lambda o: o["pod"]["metadata"]["labels"].update({"boss.dev/purpose": "other"})),
+            ("changed session label", lambda o: o["pod"]["metadata"]["labels"].update({"boss.dev/session": "other"})),
+            ("changed deadline", lambda o: o["job"]["spec"].update(activeDeadlineSeconds=999999)),
+            ("changed retries", lambda o: o["job"]["spec"].update(backoffLimit=6)),
+            ("missing deadline", lambda o: o["job"]["spec"].pop("activeDeadlineSeconds")),
+            ("changed parallelism", lambda o: o["job"]["spec"].update(parallelism=2)),
+        ]
+        failures = []
+        for label, mutate in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                name, objects, calls, transport = self.recovery_fixture(root, mutate)
+                refused = False
+                try:
+                    self.mod.recover_start(name, root, transport=transport)
+                except (ValueError, RuntimeError):
+                    refused = True
+                if refused != (label != "positive"):
+                    failures.append((label, "recovery", refused))
+                if label != "positive":
+                    self.assertEqual((root / (name + ".json")).exists(), not refused)
+                def observe_transport(argv, stdin=None):
+                    calls.append(argv)
+                    value = objects[{"job": "job", "pod": "pod", "pvc": "volume"}[argv[1]]]
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(value).encode(), b"")
+                session = self.mod.Session(name, "job-uid", name + "-pod", "pod-uid", "container-id", "a" * 40, "volume-uid")
+                refused = False
+                try:
+                    self.mod.observe(session, root=root, transport=observe_transport)
+                except (ValueError, RuntimeError):
+                    refused = True
+                if refused != (label != "positive"):
+                    failures.append((label, "observation", refused))
+                self.assertTrue(all(call[0] == "get" for call in calls))
+        self.assertFalse(failures, failures)
+
+    def test_recovery_refuses_unknown_creation_replacement_and_changed_authority(self):
+        cases = [
+            (False, lambda _: None),
+            (True, lambda r: r["job"]["metadata"].update(uid="replacement")),
+            (True, lambda r: r["volume"]["metadata"].update(uid="replacement")),
+            (True, lambda r: r["volume"]["metadata"].update(ownerReferences=[])),
+            (True, lambda r: r["volume"]["metadata"].update(namespace="other")),
+            (True, lambda r: r["pod"]["metadata"].update(namespace="other")),
+            (True, lambda r: r["pod"]["spec"].update(hostNetwork=True)),
+            (True, lambda r: r["pod"]["spec"].pop("automountServiceAccountToken")),
+            (True, lambda r: r["pod"]["status"]["containerStatuses"][0].update(restartCount=1)),
+            (True, lambda r: r["pod"]["status"]["initContainerStatuses"][0].update(state={"running": {}})),
+        ]
+        for acknowledged, mutate in cases:
+            with self.subTest(acknowledged=acknowledged, mutate=mutate), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                name, _, calls, transport = self.recovery_fixture(root, mutate, acknowledged)
+                with self.assertRaises((ValueError, RuntimeError)):
+                    self.mod.recover_start(name, root, transport=transport)
+                self.assertFalse((root / (name + ".json")).exists())
+                self.assertTrue(all(call[0] == "get" for call in calls))
+                if not acknowledged:
+                    self.assertEqual(calls, [])
+
+    def test_recovery_requires_original_creation_to_match_the_retained_intent(self):
+        for mutate in (
+            lambda j: j["spec"]["template"]["spec"]["initContainers"][0]["command"].__setitem__(4, "b" * 40),
+            lambda j: j["spec"]["template"]["spec"].update(automountServiceAccountToken=True),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                name, _, calls, transport = self.recovery_fixture(root, mutate_ack=mutate)
+                with self.assertRaises(ValueError):
+                    self.mod.recover_start(name, root, transport=transport)
+                self.assertEqual(calls, [])
+                self.assertFalse((root / (name + ".json")).exists())
+
+    def test_recovery_refuses_native_retirement_without_publishing_a_session(self):
+        for kind in ("job", "pod", "volume"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                def mutate(objects):
+                    objects[kind]["metadata"]["deletionTimestamp"] = "2026-10-14T11:00:00Z"
+                name, _, calls, transport = self.recovery_fixture(root, mutate)
+                with self.assertRaises((ValueError, RuntimeError)):
+                    self.mod.recover_start(name, root, transport=transport)
+                self.assertFalse((root / (name + ".json")).exists())
+                self.assertTrue(all(call[0] == "get" for call in calls))
+
+    def test_pre_execution_observation_refuses_retiring_resources(self):
+        for kind in (None, "job", "pod", "volume"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                name, objects, calls, _ = self.recovery_fixture(root)
+                if kind:
+                    objects[kind]["metadata"]["deletionTimestamp"] = "2026-10-14T11:00:00Z"
+                def transport(argv, stdin=None):
+                    calls.append(argv)
+                    value = objects[{"job": "job", "pod": "pod", "pvc": "volume"}[argv[1]]]
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(value).encode(), b"")
+                session = self.mod.Session(name, "job-uid", name + "-pod", "pod-uid", "container-id", "a" * 40, "volume-uid")
+                if kind:
+                    with self.assertRaises(RuntimeError):
+                        self.mod.observe(session, root=root, transport=transport)
+                else:
+                    self.assertEqual(self.mod.observe(session, root=root, transport=transport), objects["pod"])
+                self.assertTrue(all(call[0] == "get" for call in calls))
+
+    def test_recovery_and_session_refuse_extra_container_and_pod_security_authority(self):
+        for section, index in (("containers", 0), ("containers", 1), ("initContainers", 0), (None, None)):
+            with self.subTest(section=section, index=index), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                def mutate(objects):
+                    spec = objects["pod"]["spec"]
+                    context = spec["securityContext"] if section is None else spec[section][index]["securityContext"]
+                    context["runAsUser" if section is None else "privileged"] = 0 if section is None else True
+                name, objects, calls, transport = self.recovery_fixture(root, mutate)
+                with self.assertRaises((ValueError, RuntimeError)):
+                    self.mod.recover_start(name, root, transport=transport)
+                session = self.mod.Session(name, "job-uid", name + "-pod", "pod-uid", "container-id", "a" * 40, "volume-uid")
+                self.assertIsNotNone(self.mod.session_error(session, objects["pod"]))
+                self.assertFalse((root / (name + ".json")).exists())
+                self.assertTrue(all(call[0] == "get" for call in calls))
+
+    def test_recovery_refuses_changed_job_template_authority_before_admission(self):
+        for section, index in (("containers", 1), ("initContainers", 0)):
+            with self.subTest(section=section), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                def mutate(objects):
+                    objects["job"]["spec"]["template"]["spec"][section][index]["securityContext"]["privileged"] = True
+                name, _, calls, transport = self.recovery_fixture(root, mutate)
+                with self.assertRaises(RuntimeError):
+                    self.mod.recover_start(name, root, transport=transport)
+                self.assertFalse((root / (name + ".json")).exists())
+                self.assertTrue(all(call[0] == "get" for call in calls))
+
+    def test_recovery_refuses_malformed_ambiguous_or_retired_creation_before_reads(self):
+        for mode in ("malformed", "duplicate", "retired"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                name, _, calls, transport = self.recovery_fixture(root)
+                path = root / (name + ".launch-original.json")
+                receipt = self.mod.load_record(path)
+                if mode == "malformed":
+                    path.unlink()
+                    receipt["stdout_base64"] = base64.b64encode(b"[]").decode()
+                    self.mod.save_record(path, receipt)
+                elif mode == "duplicate":
+                    self.mod.save_record(root / (name + ".launch-duplicate.json"), receipt)
+                else:
+                    self.mod.save_record(root / (name + ".retire-intent.json"), {"job": name})
+                with self.assertRaises(ValueError):
+                    self.mod.recover_start(name, root, transport=transport)
+                self.assertEqual(calls, [])
+                self.assertFalse((root / (name + ".json")).exists())
+
     def test_wrong_uid_restart_and_mutated_mount_refuse_before_exec(self):
         session = self.mod.Session("dev-build-1234567890abcdef", "job-uid", "pod-name", "pod-uid", "container-id", "a" * 40)
         job = self.spec()
-        pod = {"metadata": {"name": "pod-name", "uid": "pod-uid", "ownerReferences": [{"uid": "job-uid", "kind": "Job"}]},
+        pod = {"metadata": {"name": "pod-name", "uid": "pod-uid", "labels": copy.deepcopy(job["spec"]["template"]["metadata"]["labels"]), "ownerReferences": [{"uid": "job-uid", "kind": "Job"}]},
                "spec": copy.deepcopy(job["spec"]["template"]["spec"]),
                "status": {"phase": "Running", "initContainerStatuses": [{"name": "published-bootstrap", "restartCount": 0, "state": {"terminated": {"exitCode": 0}}}], "containerStatuses": [{"name": "worker", "ready": True, "restartCount": 0, "containerID": "container-id", "state": {"running": {}}}, {"name": "postgres", "ready": True, "restartCount": 0, "containerID": "postgres-id", "state": {"running": {}}}]}}
         self.assertIsNone(self.mod.session_error(session, pod))
         for mutate in (
             lambda p: p["metadata"].update(uid="replacement"),
+            lambda p: p["metadata"].update(deletionTimestamp="2026-10-14T11:00:00Z"),
             lambda p: p["status"]["containerStatuses"][0].update(restartCount=1),
             lambda p: p["status"]["containerStatuses"][0].update(containerID="replacement"),
             lambda p: p["spec"].update(automountServiceAccountToken=True),
@@ -339,7 +571,7 @@ class ControllerContract(unittest.TestCase):
                     volume["metadata"]["uid"] = "replacement"
                 return subprocess.CompletedProcess(argv, 0, json.dumps(volume).encode(), b"")
             job = objects["Job"]
-            pod = {"metadata": {"name": "bound-pod", "uid": "pod-uid", "ownerReferences": [{"kind": "Job", "uid": "job-uid"}]},
+            pod = {"metadata": {"name": "bound-pod", "uid": "pod-uid", "labels": copy.deepcopy(job["spec"]["template"]["metadata"]["labels"]), "ownerReferences": [{"kind": "Job", "uid": "job-uid"}]},
                    "spec": job["spec"]["template"]["spec"],
                    "status": {"phase": "Running", "initContainerStatuses": [{"name": "published-bootstrap", "restartCount": 0, "state": {"terminated": {"exitCode": 0}}}], "containerStatuses": [{"name": name, "ready": True, "restartCount": 0, "containerID": name + "-id", "state": {"running": {}}} for name in ("worker", "postgres")]}}
             return subprocess.CompletedProcess(argv, 0, json.dumps({"items": [pod]}).encode(), b"")

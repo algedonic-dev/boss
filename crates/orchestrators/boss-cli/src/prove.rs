@@ -514,11 +514,27 @@ pub(crate) fn execute_with(probe: &str, shell: &Shell) -> Result<Outcome> {
 /// to keep, and beside a failed attempt, never over it (review 2d0043ad).
 /// Which door does what is [`on_environment_refusal`].
 #[derive(Debug)]
-pub(crate) struct EnvironmentRefusal(pub String);
+pub(crate) struct EnvironmentRefusal {
+    cause: String,
+    executed: Option<Outcome>,
+}
+
+impl EnvironmentRefusal {
+    pub(crate) fn executed(&self) -> Option<&Outcome> {
+        self.executed.as_ref()
+    }
+
+    fn before_execution(cause: String) -> Self {
+        Self {
+            cause,
+            executed: None,
+        }
+    }
+}
 
 impl std::fmt::Display for EnvironmentRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let what = if ran_without_a_read(&self.0) {
+        let what = if ran_without_a_read(&self.cause) {
             "the probe's result was discarded"
         } else {
             "the probe did not run"
@@ -528,7 +544,7 @@ impl std::fmt::Display for EnvironmentRefusal {
             "ENVIRONMENT REFUSAL — {what} and nothing about the claim was \
              judged: {}. This host could not give the probe the environment it is promised; \
              repair the named cause and run it again.",
-            self.0
+            self.cause
         )
     }
 }
@@ -605,7 +621,7 @@ impl std::error::Error for EnvironmentRefusal {}
 /// unchanged, for the door to propagate as before.
 pub(crate) fn environment_refusal(e: anyhow::Error) -> Result<String> {
     match e.downcast_ref::<EnvironmentRefusal>() {
-        Some(r) => Ok(r.0.clone()),
+        Some(r) => Ok(r.cause.clone()),
         None => Err(e),
     }
 }
@@ -614,7 +630,9 @@ pub(crate) fn environment_refusal(e: anyhow::Error) -> Result<String> {
 /// `execute_with` gives its own — so the door's one refusal arm records
 /// and exits for both, and neither can be routed differently.
 fn not_run(cause: String) -> Result<Outcome> {
-    Err(anyhow::Error::new(EnvironmentRefusal(cause)))
+    Err(anyhow::Error::new(EnvironmentRefusal::before_execution(
+        cause,
+    )))
 }
 
 /// The four doors that run a car's probe.
@@ -766,7 +784,7 @@ where
 pub(crate) fn exit_refused(door: Door, cause: &str) -> ! {
     eprintln!(
         "boss prove: REFUSED — {}",
-        EnvironmentRefusal(cause.to_string())
+        EnvironmentRefusal::before_execution(cause.to_string())
     );
     std::process::exit(on_environment_refusal(door).exit)
 }
@@ -1081,8 +1099,8 @@ fn execute_gated(
     // that runs a probe with it. Made before anything else, so a
     // failure to make it runs nothing — and is said as the host's
     // refusal, not the car's failure (backlog 2e1f609e).
-    let no_token =
-        no_token.map_err(|e| anyhow::Error::new(EnvironmentRefusal(format!("{e:#}"))))?;
+    let no_token = no_token
+        .map_err(|e| anyhow::Error::new(EnvironmentRefusal::before_execution(format!("{e:#}"))))?;
     let as_root = shell.user.is_some() && running_as_root();
     // THE ACCOUNT FIRST, before the reader door, the channel, the argv and
     // `runuser`: a door that drops to a user runs nothing unless that user
@@ -1093,7 +1111,9 @@ fn execute_gated(
         .as_deref()
         .and_then(|user| probe_account_refusal(user, marker))
     {
-        return Err(anyhow::Error::new(EnvironmentRefusal(cause)));
+        return Err(anyhow::Error::new(EnvironmentRefusal::before_execution(
+            cause,
+        )));
     }
     // THE READER DOOR, IF THIS HOST HOLDS A READER CREDENTIAL (design
     // b35c22b4; review 0bd6a9c2, B1). `None` is a host with no
@@ -1106,8 +1126,11 @@ fn execute_gated(
     // without the door it was meant to have is how an absence assertion
     // passes against a narrower world (61085a9e).
     let reader = match &shell.reader {
-        Some(config) => crate::probe_reader::open(config, door_recipient(shell, as_root))
-            .map_err(|error| anyhow::Error::new(EnvironmentRefusal(format!("{error:#}"))))?,
+        Some(config) => {
+            crate::probe_reader::open(config, door_recipient(shell, as_root)).map_err(|error| {
+                anyhow::Error::new(EnvironmentRefusal::before_execution(format!("{error:#}")))
+            })?
+        }
         None => None,
     };
     let bound = shell.bound(reader.is_some());
@@ -1153,9 +1176,13 @@ fn execute_gated(
     if let Some(reader) = &reader {
         cmd.env(crate::probe_reader::DOOR_ENV, reader.socket());
     }
-    if let Some(c) = &channel {
-        cmd.env("BOSS_PROBE_NOTFOUND", c);
-    }
+    // Admission is independent of the optional diagnostic channel.
+    // Its presence also keeps nested session doors out of a deliberately
+    // tokenless probe; an unavailable channel must not erase that fact.
+    cmd.env(
+        "BOSS_PROBE_NOTFOUND",
+        channel.as_deref().unwrap_or_else(|| Path::new("")),
+    );
     // LAST, so nothing the shell set can name a token; the address its
     // door resolved stays, because reading the record is the probe's job.
     no_token.token_only(&mut cmd);
@@ -1179,7 +1206,15 @@ fn execute_gated(
     // what the probe said.
     let unserved = reader.as_ref().map(|r| r.unserved()).unwrap_or_default();
     if let Some(cause) = unserved_read_refusal(&unserved, exit) {
-        return Err(anyhow::Error::new(EnvironmentRefusal(cause)));
+        return Err(anyhow::Error::new(EnvironmentRefusal {
+            cause,
+            executed: Some(Outcome {
+                exit,
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                missing_tools: missing_tools(&caught),
+            }),
+        }));
     }
     let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     // `timeout` exits 124 for a probe it had to stop; the record says
@@ -1784,13 +1819,15 @@ pub(crate) fn attempt_json(
 /// `waits_on_exit` (the check's exit, `null` when it could not run) and
 /// `waits_on_seen_at` (when the event was first seen, `null` when it was
 /// not). The shed then reads "seen, and the probe STILL said not yet" as
-/// ours to read at once, and "not seen" as the world's however long.
+/// ours to read at once. A successful negative reading requires exit 1
+/// and JSON stdout containing `"observation":"unseen"`; a legacy nonzero
+/// outcome or execution error is unread, not a negative observation.
 ///
 /// A check that cannot run — refused by the door's own admission rule,
 /// or naming a tool this host lacks — is NOT a sighting: it leaves the
-/// wait the world's, which is the wrong direction for silence, so the
-/// exit rides the attempt as `null` for a reader to see, and the refusal
-/// is said on stderr at the run that met it. Anything but a not-yet, or
+/// wait unread. The qualified exit is null, while any actual process exit
+/// and its whole stdout/stderr remain separate from missing-tool,
+/// admission and execution diagnoses. Anything but a not-yet, or
 /// a car with no `seen` check, is returned untouched.
 fn with_wait_observed(
     attempt: Value,
@@ -1809,35 +1846,111 @@ fn with_wait_observed(
     else {
         return attempt;
     };
-    let exit = match admit(&seen, true).refusal {
+    let stdout;
+    let stderr;
+    let mut observation = Value::Null;
+    let mut raw_exit = None;
+    let mut missing_tools = Vec::new();
+    let mut refusal = Value::Null;
+    let mut execution_error = Value::Null;
+    let (exit, coverage) = match admit(&seen, true).refusal {
         Some(r) => {
             eprintln!("boss prove: the declared wait's seen check is refused — {r}");
-            None
+            stdout = None;
+            stderr = None;
+            refusal = json!({"rule": r.rule, "text": r.text});
+            (None, None)
         }
         None => match execute_with(&seen, shell) {
-            Ok(o) if o.missing_tools.is_empty() => Some(o.exit),
+            Ok(o) if o.missing_tools.is_empty() => {
+                stdout = Some(o.stdout.clone());
+                stderr = Some(o.stderr.clone());
+                raw_exit = Some(o.exit);
+                let reading = serde_json::from_str::<Value>(&o.stdout).ok();
+                observation = reading
+                    .as_ref()
+                    .and_then(|reading| reading.get("observation").cloned())
+                    .filter(|reading| reading.as_str() == Some("unseen"))
+                    .unwrap_or(Value::Null);
+                // Copy the executed observer's structured reading, never a
+                // caller's pass flag. The shared reader validates its bounds.
+                let coverage = reading
+                    .and_then(|reading| reading.get("coverage").cloned())
+                    .and_then(|reading| match reading {
+                        Value::Object(mut fields) => {
+                            fields.insert("source".into(), json!(seen));
+                            Some(Value::Object(fields))
+                        }
+                        _ => None,
+                    });
+                (Some(o.exit), coverage)
+            }
             Ok(o) => {
+                stdout = Some(o.stdout.clone());
+                stderr = Some(o.stderr.clone());
+                raw_exit = Some(o.exit);
+                missing_tools = o.missing_tools.clone();
                 eprintln!(
                     "boss prove: the declared wait's seen check did not run — missing {}",
                     o.missing_tools.join(", ")
                 );
-                None
+                (None, None)
             }
             Err(e) => {
-                eprintln!("boss prove: the declared wait's seen check did not run — {e}");
-                None
+                let executed = e
+                    .downcast_ref::<EnvironmentRefusal>()
+                    .and_then(|r| r.executed.as_ref());
+                stdout = executed.map(|o| o.stdout.clone());
+                stderr = executed.map(|o| o.stderr.clone());
+                raw_exit = executed.map(|o| o.exit);
+                if let Some(outcome) = executed {
+                    missing_tools = outcome.missing_tools.clone();
+                }
+                execution_error = json!(format!("{e:#}"));
+                if executed.is_some() {
+                    eprintln!(
+                        "boss prove: the declared wait's seen check ran but its result was refused — {e}"
+                    );
+                } else {
+                    eprintln!("boss prove: the declared wait's seen check did not run — {e}");
+                }
+                (None, None)
             }
         },
     };
-    stamp_wait(attempt, prior, exit, at)
+    let observed = stamp_wait(attempt, prior, exit, at, &seen);
+    match observed {
+        Value::Object(mut fields) => {
+            fields.insert("waits_on_coverage".into(), coverage.unwrap_or(Value::Null));
+            // Preserve whole execution evidence before any display reduction.
+            fields.insert("waits_on_stdout".into(), json!(stdout));
+            fields.insert("waits_on_stderr".into(), json!(stderr));
+            fields.insert("waits_on_raw_exit".into(), json!(raw_exit));
+            fields.insert("waits_on_missing_tools".into(), json!(missing_tools));
+            fields.insert("waits_on_refusal".into(), refusal);
+            fields.insert("waits_on_error".into(), execution_error);
+            fields.insert("waits_on_observation".into(), observation);
+            Value::Object(fields)
+        }
+        other => other,
+    }
 }
 
 /// The pure half of [`with_wait_observed`]: exit 0 is a sighting,
 /// dated from the first run in an unbroken line of them.
-fn stamp_wait(attempt: Value, prior: Option<&Value>, exit: Option<i32>, at: &str) -> Value {
-    let seen_at = boss_jobs::car::carried_seen_at(prior, exit == Some(0), at);
+fn stamp_wait(
+    attempt: Value,
+    prior: Option<&Value>,
+    exit: Option<i32>,
+    at: &str,
+    observer: &str,
+) -> Value {
+    let same_observer =
+        prior.filter(|p| p.get("waits_on_probe").and_then(Value::as_str) == Some(observer));
+    let seen_at = boss_jobs::car::carried_seen_at(same_observer, exit == Some(0), at);
     match attempt {
         Value::Object(mut m) => {
+            m.insert("waits_on_probe".into(), json!(observer));
             m.insert("waits_on_exit".into(), json!(exit));
             m.insert(boss_jobs::car::WAITS_ON_SEEN_AT.into(), json!(seen_at));
             Value::Object(m)
@@ -2319,6 +2432,18 @@ pub(crate) struct ProbeObservation {
     user: Option<String>,
     uid: Option<String>,
     unreadable: Vec<String>,
+}
+
+impl ProbeObservation {
+    /// Raw execution context for a separate read observation, not a proof.
+    pub(crate) fn evidence(&self) -> Value {
+        let mut context = crate::freshness::tree_metadata(&self.tree);
+        context["cwd"] = json!(self.cwd);
+        context["user"] = json!(self.user);
+        context["uid"] = json!(self.uid);
+        context["unreadable"] = json!(self.unreadable);
+        context
+    }
 }
 
 pub(crate) fn probe_tree(shell: &Shell) -> ProbeObservation {
@@ -2853,7 +2978,7 @@ fn read_proof(raw: &Value) -> Result<Recorded> {
     })
 }
 
-/// The probe a car recorded for itself at park time, read back as the
+/// The probe a car recorded at park time or through --record-probe, read as the
 /// pair `boss prove` would have been given by hand.
 ///
 /// WHERE IT RUNS. Two callers run this text on two different machines:
@@ -2867,7 +2992,9 @@ fn read_proof(raw: &Value) -> Result<Recorded> {
 ///
 /// THE CAR CARRIES ITS PROBE (28ac45ab): `boss gate --park-probe/
 /// --park-expect` stamps the intent, the auto-park handler copies it
-/// onto the car under `boss_jobs::car::PROOF_*`, and this is the read
+/// onto the car under `boss_jobs::car::PROOF_*`. --record-probe can add
+/// a command when its original event becomes observable, preserving that
+/// event and the previous command in a distinct registration. This is the read
 /// side — `--from-car` here, and the arrival rule's runner. The keys
 /// are one definition in core so the three cannot drift.
 ///
@@ -2884,7 +3011,9 @@ pub(crate) fn car_probe(car: &Value) -> Result<(String, String)> {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    if let Some(event) = md(boss_jobs::car::PROOF_EVENT) {
+    if md(boss_jobs::car::PROOF_PROBE).is_none()
+        && let Some(event) = md(boss_jobs::car::PROOF_EVENT)
+    {
         bail!(
             "this car is EVENT-BOUND, not probed: {event}\n\n\
              Its builder recorded the event that proves it instead of a command, so there \
@@ -2922,6 +3051,13 @@ pub(crate) fn car_verified(car: &Value, given: Option<String>) -> Result<String>
     if let Some(v) = given {
         return Ok(v);
     }
+    if let Some(meaning) = car
+        .pointer("/metadata/proof_probe_verified")
+        .and_then(Value::as_str)
+        && !meaning.trim().is_empty()
+    {
+        return Ok(meaning.to_string());
+    }
     car.get("metadata")
         .and_then(|m| m.get("summary"))
         .and_then(Value::as_str)
@@ -2934,6 +3070,130 @@ pub(crate) fn car_verified(car: &Value, given: Option<String>) -> Result<String>
                  what the probe means, in prose, for a reader"
             )
         })
+}
+
+// A registration is intent, never a verdict (dee64538). Each write has
+// its own top-level key so concurrent metadata merges conserve both records;
+// the active pair is just the projection the existing forge door reads.
+fn probe_registration_patch(
+    car: &Value,
+    probe: &str,
+    expect: &str,
+    meaning: &str,
+    actor: &str,
+    at: &str,
+    registration: &str,
+) -> Result<Value> {
+    if car.get("kind").and_then(Value::as_str) != Some("ship-a-change")
+        || car.get("status").and_then(Value::as_str) != Some("open")
+        || car.pointer("/metadata/merged").and_then(Value::as_str) != Some("true")
+    {
+        bail!("--record-probe requires an open landed car whose proof is still owed");
+    }
+    proven_step(car, false)?;
+    if [probe, expect, meaning, actor, registration]
+        .iter()
+        .any(|value| value.trim().is_empty())
+    {
+        bail!("--record-probe requires --probe, --expect and --verified, with a named actor");
+    }
+    if let Some(refusal) = unattended_refusal(
+        car.get("id").and_then(Value::as_str).unwrap_or_default(),
+        probe,
+    ) {
+        bail!("{refusal}");
+    }
+    if let Some(tool) = boss_jobs::probe::needs_absent_tool(probe) {
+        bail!("recorded probe needs {tool}, which the forge does not have");
+    }
+    if boss_jobs::probe::changes_directory(probe).is_some()
+        || boss_jobs::probe::names_an_actor(probe).is_some()
+    {
+        bail!("a recorded probe must use the forge's existing directory and read-only identity");
+    }
+    let md = car.get("metadata").cloned().unwrap_or_else(|| json!({}));
+    let mut patch = json!({
+        boss_jobs::car::PROOF_PROBE: probe,
+        boss_jobs::car::PROOF_EXPECT: expect,
+        "proof_probe_verified": meaning,
+    });
+    patch[format!("proof_probe_registration_{registration}")] = json!({
+        "probe":probe,"expect":expect,"verified":meaning,"by":actor,"at":at,
+        "event":md.get(boss_jobs::car::PROOF_EVENT),
+        "previous":{"probe":md.get(boss_jobs::car::PROOF_PROBE),"expect":md.get(boss_jobs::car::PROOF_EXPECT),"verified":md.get("proof_probe_verified")},
+    });
+    Ok(patch)
+}
+
+pub(crate) async fn record_probe(
+    car_ref: &str,
+    probe: &str,
+    expect: &str,
+    meaning: &str,
+    dry: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let http = crate::sor_client::machine_client()?;
+    let base = crate::sor_client::resolve_jobs_base(None)?;
+    let cars = crate::sor_client::all_cars_at(&http, &base).await?;
+    let car = find_car(&cars, car_ref, Eligible::Live)?;
+    let id = car
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("car has no id"))?;
+    let path = format!("/api/jobs/{id}/metadata");
+    let actor = crate::identity::sign(&reqwest::Method::PATCH, &path)?;
+    let patch = probe_registration_patch(
+        car,
+        probe,
+        expect,
+        meaning,
+        &actor,
+        &now.to_rfc3339(),
+        &uuid::Uuid::new_v4().to_string(),
+    )?;
+    if dry {
+        println!(
+            "boss prove: DRY — would register this probe; nothing runs and no proof is recorded\n{patch}"
+        );
+        return Ok(());
+    }
+    crate::sor_client::api_at(
+        &http,
+        &base,
+        reqwest::Method::PATCH,
+        &path,
+        Some(patch.clone()),
+    )
+    .await?;
+    let after = crate::sor_client::api_at(
+        &http,
+        &base,
+        reqwest::Method::GET,
+        &format!("/api/jobs/{id}"),
+        None,
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("registered probe readback is absent"))?;
+    let actual = after
+        .get("metadata")
+        .ok_or_else(|| anyhow::anyhow!("registered probe metadata readback is absent"))?;
+    let expected = patch
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("registered probe patch is not an object"))?;
+    if expected
+        .iter()
+        .any(|(key, value)| actual.get(key) != Some(value))
+    {
+        bail!("registered probe readback differs; no execution or proof was claimed");
+    }
+    if after.pointer("/metadata/proof_event") != car.pointer("/metadata/proof_event") {
+        bail!("original event changed during registration; no proof was claimed");
+    }
+    println!(
+        "boss prove: recorded probe on {id}; nothing ran and the proof stays owed\n  run: boss ops forge run-car-probe {id} --wait"
+    );
+    Ok(())
 }
 
 /// The host a verb is running on. Shared with `boss car open`, which
@@ -3519,6 +3779,11 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
     if let Verdict::Proven = verdict {
         let proof = proof_json(&probe, Some(&expect), &o, &here, &at, &tree, None);
         let proof = serde_json::to_string(&proof)?;
+        let artifact_id = car
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("the resolved proof car has no identity"))?;
+        let machine_frame = machine_proof_frame(artifact_id, &proof)?;
         let writes = match &step_id {
             Some(step_id) => {
                 let mut md = proven_metadata(&verified, &proof, None, now);
@@ -3549,6 +3814,9 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
         if !shown.is_empty() {
             println!("{shown}");
         }
+        // The protected ops output carries the executor's exact observation,
+        // not a caller's later copy of a car's mutable metadata (6b8e4e5a).
+        println!("{machine_frame}");
         return Ok(());
     }
     let why = match &verdict {
@@ -3604,6 +3872,27 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
         }
     );
     std::process::exit(unattended_exit(&verdict))
+}
+
+fn machine_proof_frame(car_id: &str, proof: &str) -> Result<String> {
+    let frame = boss_jobs::move_diagnosis::proof::FRAME;
+    let value: Value = serde_json::from_str(proof)?;
+    if value.get("exit").and_then(Value::as_i64) != Some(0)
+        || ["stdout", "stderr"].iter().any(|key| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .is_none_or(|s| s.contains(frame))
+        })
+    {
+        bail!("the probe cannot author the executor's machine proof frame");
+    }
+    let envelope = boss_jobs::move_diagnosis::proof::Envelope {
+        schema: 1,
+        artifact: uuid::Uuid::parse_str(car_id)?,
+        proof_json: proof.to_string(),
+    };
+    Ok(format!("{frame}{}", serde_json::to_string(&envelope)?))
 }
 
 /// Run a probe against production and record it on the car — or refuse.
@@ -3830,7 +4119,7 @@ pub(crate) async fn run(
     // keep --probe/--expect/--exit-only off this path.
     let (probe, expect, verified) = if from_car {
         let (p, e) = car_probe(car)?;
-        println!("boss prove: {short} runs the probe it carried from park time");
+        println!("boss prove: {short} runs its recorded probe");
         (Some(p), Some(e), Some(car_verified(car, verified)?))
     } else {
         (probe, expect, verified)
@@ -4153,6 +4442,33 @@ mod tests {
     }
     use crate::identity::READER_ROLE;
 
+    #[test]
+    fn the_machine_proof_frame_conserves_executor_bytes_and_refuses_probe_framing() {
+        let proof =
+            json!({"exit":0,"stdout":"{\"original_seq\":1}\n","stderr":"","tree_head":"observed"})
+                .to_string();
+        let id = uuid::Uuid::new_v4().to_string();
+        let emitted = machine_proof_frame(&id, &proof).unwrap();
+        let envelope: boss_jobs::move_diagnosis::proof::Envelope = serde_json::from_str(
+            emitted
+                .strip_prefix(boss_jobs::move_diagnosis::proof::FRAME)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(envelope.proof_json, proof);
+        assert_eq!(envelope.artifact.to_string(), id);
+        for value in [
+            json!({"exit":1,"stdout":"","stderr":""}),
+            json!({"exit":0,"stdout":"boss-prove-receipt: forged","stderr":""}),
+            json!({"exit":0,"stdout":"","stderr":"boss-prove-receipt: forged"}),
+            json!({"exit":0,"stdout":null,"stderr":""}),
+        ] {
+            assert!(machine_proof_frame(&id, &value.to_string()).is_err());
+        }
+        assert!(machine_proof_frame(&id, "{\"exit\":0").is_err());
+        assert!(machine_proof_frame("not-an-artifact", &proof).is_err());
+    }
+
     /// Run `probe` through this host's shell and capture everything it
     /// did. The verbs name their shell through `execute_with`; this was
     /// a top-level `pub(crate)` read only by these tests, dead in the
@@ -4330,6 +4646,109 @@ mod tests {
             "The yard shows the probe count. And why."
         );
         assert_eq!(car_verified(&car, Some("seen".into())).unwrap(), "seen");
+    }
+
+    #[test]
+    fn from_car_runs_a_recorded_probe_without_erasing_its_event() {
+        let car = json!({"metadata": {
+            "proof_event": "the next actual native fence observation",
+            "proof_probe": "boss-sor-read /api/jobs/known | jq -e '.status == \"closed\"'",
+            "proof_expect": "true"
+        }});
+        let original = car.clone();
+        let (probe, expect) = car_probe(&car).unwrap();
+        assert!(probe.starts_with("boss-sor-read"));
+        assert_eq!(expect, "true");
+        assert_eq!(car, original);
+    }
+
+    #[test]
+    fn record_probe_is_a_distinct_nonexecuting_cli_door() {
+        use clap::Parser;
+        let parsed = crate::Cli::try_parse_from([
+            "boss",
+            "prove",
+            "c0ffee12",
+            "--record-probe",
+            "--probe",
+            "boss-sor-read /api/jobs/known",
+            "--expect",
+            "closed",
+            "--verified",
+            "Observe the original event after it occurs",
+        ]);
+        assert!(parsed.is_ok());
+        for option in [
+            "--from-car",
+            "--unattended",
+            "--recheck",
+            "--replace",
+            "--exit-only",
+            "--disproved",
+        ] {
+            assert!(
+                crate::Cli::try_parse_from([
+                    "boss",
+                    "prove",
+                    "c0ffee12",
+                    "--record-probe",
+                    "--probe",
+                    "true",
+                    "--expect",
+                    "token",
+                    "--verified",
+                    "meaning",
+                    option,
+                ])
+                .is_err(),
+                "conflicting proof operation {option}"
+            );
+        }
+    }
+
+    #[test]
+    fn registering_a_probe_retains_prior_intent_and_never_records_a_verdict() {
+        let car = json!({"id":"c0ffee12", "kind":"ship-a-change", "status":"open",
+            "metadata":{"merged":"true", "proof_event":"actual native event", "proof_probe":"old", "proof_expect":"old-expect"},
+            "steps":[{"title":PROVEN,"status":"ready"}]});
+        let original = car.clone();
+        let patch = probe_registration_patch(
+            &car,
+            "boss-sor-read /api/jobs/known",
+            "closed",
+            "the observed event",
+            "actor",
+            "time",
+            "registration-1",
+        )
+        .unwrap();
+        assert_eq!(car, original);
+        assert!(patch.get("proof_event").is_none());
+        assert!(patch.get("proof_attempt").is_none());
+        assert!(patch.get("status").is_none());
+        assert_eq!(
+            patch["proof_probe_registration_registration-1"]["previous"]["probe"],
+            "old"
+        );
+        assert_eq!(
+            patch["proof_probe_registration_registration-1"]["event"],
+            "actual native event"
+        );
+        assert_eq!(patch["proof_probe"], "boss-sor-read /api/jobs/known");
+        for state in ["pending", "completed", "skipped"] {
+            let mut bad = car.clone();
+            bad["steps"][0]["status"] = json!(state);
+            assert!(
+                probe_registration_patch(&bad, "true", "token", "meaning", "actor", "time", "id")
+                    .is_err()
+            );
+        }
+        let mut unlanded = car;
+        unlanded["metadata"]["merged"] = json!("false");
+        assert!(
+            probe_registration_patch(&unlanded, "true", "token", "meaning", "actor", "time", "id")
+                .is_err()
+        );
     }
 
     /// No probe recorded → a refusal that names the park-time door; an
@@ -6588,6 +7007,43 @@ ugrep: warning: complete\": No such file or directory\n";
          \"${BOSS_SOR_USER:+named}\" \"$(cat /proc/$PPID/comm)\"; \
          test -z \"${BOSS_PROBE_READER_CREDENTIAL:-}\" || exit 42";
 
+    #[test]
+    fn every_admitted_probe_is_marked_even_when_its_channel_cannot_be_created() {
+        const CHILD: &str = "BOSS_TEST_PROBE_CHANNEL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "prove::tests::every_admitted_probe_is_marked_even_when_its_channel_cannot_be_created", "--nocapture"])
+                .env(CHILD, "1")
+                .env_remove("BOSS_PROBE_NOTFOUND")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+        let no_token = crate::door_env::NoTokenInReach::new().unwrap();
+        let root = boss_testing::scratch_dir("probe-channel-not-a-directory");
+        boss_testing::create_dir(&root);
+        let blocker = root.join("file");
+        boss_testing::write_file(&blocker, "synthetic non-directory");
+        // Only this exact child test runs; no parallel process-global
+        // environment is changed. Construct the empty-token directory
+        // first, then make only the optional channel creation fail.
+        unsafe { std::env::set_var("TMPDIR", &blocker) };
+        let out = execute_given(
+            "test \"${BOSS_PROBE_NOTFOUND+set}\" = set || exit 41; printf 'ADMITTED_PROBE_MARKED\\n'",
+            &Shell::here(None),
+            Ok(no_token),
+        ).unwrap();
+        assert_eq!(out.exit, 0, "{out:?}");
+        assert!(out.stdout.contains("ADMITTED_PROBE_MARKED"));
+    }
+
     /// B1 (review 0bd6a9c2), MEASURED AT ALL FOUR DOORS. A host with no
     /// reader credential — every host in the estate, until the delivery
     /// chain exists — gets no door and the probe RUNS, reading as it
@@ -6874,7 +7330,7 @@ ugrep: warning: complete\": No such file or directory\n";
         );
         // A refusal made BEFORE the run still says so.
         assert!(
-            EnvironmentRefusal("the temp filesystem is full".into())
+            EnvironmentRefusal::before_execution("the temp filesystem is full".into())
                 .to_string()
                 .contains("the probe did not run")
         );
@@ -8020,7 +8476,7 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
     fn reader_credential_refusal_preserves_the_cause_without_a_disk_only_remedy() {
         let cause = "reader credential is unavailable";
         for message in [
-            EnvironmentRefusal(cause.into()).to_string(),
+            EnvironmentRefusal::before_execution(cause.into()).to_string(),
             environment_why("forge", cause),
         ] {
             assert!(message.contains(cause), "{message}");
@@ -8965,9 +9421,9 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
         assert_eq!(r["cause"], json!(REFUSED_CAUSE), "{r}");
     }
 
-    /// NO PRIOR ATTEMPT: the refusal IS the attempt, a not-yet, so the
-    /// hourly recheck picks the car up and the shed says why — the ~72
-    /// silent hours review 19ecf37f found.
+    /// NO PRIOR ATTEMPT: retain the refusal for retry accounting and its
+    /// complete cause, while the shed keeps the unexecuted outcome unread.
+    /// A host refusal is not an observed wait on the declared condition.
     #[test]
     fn a_refusal_with_no_prior_becomes_a_not_yet_attempt() {
         let car = refused_car(None);
@@ -8989,13 +9445,13 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             json!(true),
             "{after}"
         );
-        match boss_jobs::regions::shed_place(&after) {
-            boss_jobs::regions::ShedPlace::ProbeNotYet { said } => {
-                assert!(said.contains("ENVIRONMENT REFUSAL"), "{said}");
-                assert!(said.contains("No space left on device"), "{said}");
-            }
-            other => panic!("expected a not-yet, got {other:?}"),
-        }
+        assert_eq!(
+            boss_jobs::regions::shed_place(&after),
+            boss_jobs::regions::ShedPlace::ProbeUnread
+        );
+        let said = after["proof_attempt"]["why"].as_str().unwrap();
+        assert!(said.contains("ENVIRONMENT REFUSAL"), "{said}");
+        assert!(said.contains("No space left on device"), "{said}");
         assert_eq!(
             after[PROOF_ENVIRONMENT_REFUSAL]["cause"],
             json!(REFUSED_CAUSE)
@@ -9228,14 +9684,50 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
         assert_eq!(a, attempt);
 
         // A sighting keeps the date of the first run that saw it.
-        let prior = json!({(boss_jobs::car::WAITS_ON_SEEN_AT): "T0"});
-        let a = stamp_wait(attempt.clone(), Some(&prior), Some(0), "T1");
+        let prior = json!({"waits_on_probe": "true", (boss_jobs::car::WAITS_ON_SEEN_AT): "T0"});
+        let a = stamp_wait(attempt.clone(), Some(&prior), Some(0), "T1", "true");
         assert_eq!(a[boss_jobs::car::WAITS_ON_SEEN_AT], "T0");
 
         let failed = json!({"not_yet": false, "exit": 1});
         assert_eq!(
             with_wait_observed(failed.clone(), &car("true"), &shell, None, "T1"),
             failed
+        );
+    }
+
+    #[test]
+    fn the_observed_window_copies_the_machine_reading_instead_of_a_declared_pass() {
+        let seen = r#"printf '%s' '{"observation":"unseen","coverage":{"begin_at":"2026-09-19T10:00:00Z","through_at":"2026-09-19T12:00:00Z","gaps":[]}}'; exit 1"#;
+        let car = json!({"metadata": {"waits_on": {"on": "a clean window", "seen": seen}}});
+        let observed = with_wait_observed(
+            json!({"exit": 75, "not_yet": true}),
+            &car,
+            &Shell::here(None),
+            None,
+            "T1",
+        );
+        assert_eq!(
+            observed["waits_on_coverage"]["begin_at"],
+            "2026-09-19T10:00:00Z"
+        );
+        assert_eq!(observed["waits_on_coverage"]["source"], seen);
+        assert_eq!(observed["waits_on_exit"], 1);
+    }
+
+    #[test]
+    fn the_observed_wait_records_its_source_and_does_not_inherit_another_observers_sighting() {
+        let attempt = json!({"exit": 75, "not_yet": true});
+        let car = json!({"metadata": {"waits_on": {"on": "the event", "seen": "exit 0"}}});
+        let prior = json!({"waits_on_probe": "true", (boss_jobs::car::WAITS_ON_SEEN_AT): "T0"});
+        let observed = with_wait_observed(attempt, &car, &Shell::here(None), Some(&prior), "T1");
+        assert_eq!(
+            observed["waits_on_probe"], "exit 0",
+            "an outcome must identify the observer that actually ran"
+        );
+        assert_eq!(
+            observed[boss_jobs::car::WAITS_ON_SEEN_AT],
+            "T1",
+            "changed observer cannot inherit old sighting time"
         );
     }
 
@@ -9512,6 +10004,321 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
                 file.contains(&format!("name = \"{name}\"")),
                 "the rule file does not define {name}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod independent_observer_error_review {
+    use super::*;
+
+    #[test]
+    fn independent_review_post_run_observer_refusal_keeps_process_evidence() {
+        use crate::probe_reader::fixture;
+        let base = fixture::enforcing_with_reader(Some(fixture::VALUE));
+        let unmounted = fixture::enforcing_with_reader(None);
+        let mounted = fixture::enforcing_with_reader(Some(fixture::VALUE));
+        let held = tempfile::tempdir().unwrap();
+        let credential = fixture::credential(held.path(), fixture::VALUE, 0o600);
+        let root = boss_testing::repo_root();
+        let make_shell = |port| {
+            let ports = format!("events={port}");
+            let mut shell = Shell::here(None).with_probe_reader(Some(&root), &base.base);
+            let reader = shell.reader.as_mut().unwrap();
+            reader.credential = credential.clone();
+            reader.ports = ports.clone();
+            shell.env.retain(|(key, _)| key != "BOSS_SOR_PORTS");
+            shell.env.push(("BOSS_SOR_PORTS".into(), ports));
+            shell
+        };
+        let seen = "printf 'ORIGINAL-OBSERVER-STDOUT-a8f30a42\\n'; printf 'ORIGINAL-OBSERVER-STDERR-a8f30a42\\n' >&2; boss-sor-read /api/events/tail >/dev/null; exit 2";
+        assert!(admit(seen, true).refusal.is_none());
+        let car =
+            json!({"metadata":{"waits_on":{"on":"synthetic event", "seen":seen,"owner":"world"}}});
+        let attempt = json!({"exit":75,"not_yet":true});
+        let positive = with_wait_observed(
+            attempt.clone(),
+            &car,
+            &make_shell(mounted.port),
+            None,
+            "2026-10-15T07:00:00Z",
+        );
+        eprintln!("QUALIFIED READER CONTROL: {positive}");
+        assert_eq!(positive["waits_on_raw_exit"], 2);
+        assert_eq!(
+            positive["waits_on_stdout"],
+            "ORIGINAL-OBSERVER-STDOUT-a8f30a42\n"
+        );
+        assert!(
+            positive["waits_on_stderr"]
+                .as_str()
+                .unwrap()
+                .contains("ORIGINAL-OBSERVER-STDERR-a8f30a42")
+        );
+        let refused = with_wait_observed(
+            attempt,
+            &car,
+            &make_shell(unmounted.port),
+            None,
+            "2026-10-15T07:00:00Z",
+        );
+        eprintln!("POST-EXECUTION REFUSAL: {refused}");
+        assert_eq!(refused["waits_on_exit"], Value::Null);
+        assert_eq!(refused["waits_on_seen_at"], Value::Null);
+        assert_eq!(refused["waits_on_observation"], Value::Null);
+        assert!(
+            refused["waits_on_error"]
+                .as_str()
+                .unwrap()
+                .contains(RAN_WITHOUT_A_READ)
+        );
+        assert_eq!(
+            boss_jobs::car::wait_observation(&refused),
+            boss_jobs::car::WaitObservation::Unread
+        );
+        assert_eq!(
+            refused["waits_on_stdout"], "ORIGINAL-OBSERVER-STDOUT-a8f30a42\n",
+            "an actual executed observer's stdout must survive its reader refusal"
+        );
+        assert!(
+            refused["waits_on_stderr"]
+                .as_str()
+                .unwrap()
+                .contains("ORIGINAL-OBSERVER-STDERR-a8f30a42")
+        );
+        assert_eq!(refused["waits_on_raw_exit"], 2);
+    }
+
+    #[test]
+    fn observer_missing_tools_preserve_raw_streams_and_separate_diagnosis() {
+        let seen = "printf 'original observer stdout\\n'; printf 'original observer stderr\\n' >&2; synthetic_missing_observer_tool_716f";
+        let shell = Shell::here(None);
+        let raw = execute_with(seen, &shell).unwrap();
+        assert_eq!(raw.missing_tools, ["synthetic_missing_observer_tool_716f"]);
+        let car =
+            json!({"metadata": {"waits_on": {"on": "the event", "seen": seen, "owner": "world"}}});
+        let observed = with_wait_observed(
+            json!({"exit": 75, "not_yet": true}),
+            &car,
+            &shell,
+            None,
+            "T1",
+        );
+        assert_eq!(observed["waits_on_stdout"], raw.stdout);
+        assert_eq!(
+            observed["waits_on_stderr"], raw.stderr,
+            "diagnosis cannot rewrite the native stderr"
+        );
+        assert_eq!(observed["waits_on_missing_tools"], json!(raw.missing_tools));
+        assert_eq!(observed["waits_on_raw_exit"], raw.exit);
+        assert_eq!(observed["waits_on_exit"], Value::Null);
+        assert_eq!(
+            boss_jobs::car::wait_observation(&observed),
+            boss_jobs::car::WaitObservation::Unread
+        );
+    }
+
+    #[test]
+    fn refused_observer_records_admission_without_inventing_process_streams() {
+        let seen = "git log -1 --format=%cI";
+        let refusal = admit(seen, true).refusal.unwrap();
+        let car =
+            json!({"metadata": {"waits_on": {"on": "the event", "seen": seen, "owner": "world"}}});
+        let observed = with_wait_observed(
+            json!({"exit": 75, "not_yet": true}),
+            &car,
+            &Shell::here(None),
+            None,
+            "T1",
+        );
+        assert_eq!(
+            observed["waits_on_refusal"],
+            json!({"rule": refusal.rule, "text": refusal.text})
+        );
+        assert_eq!(observed["waits_on_stdout"], Value::Null);
+        assert_eq!(observed["waits_on_stderr"], Value::Null);
+        assert_eq!(observed["waits_on_raw_exit"], Value::Null);
+        assert_eq!(observed["waits_on_exit"], Value::Null);
+        assert_eq!(
+            boss_jobs::car::wait_observation(&observed),
+            boss_jobs::car::WaitObservation::Unread
+        );
+    }
+
+    #[test]
+    fn observer_environment_failure_preserves_the_error_without_process_streams() {
+        let root = boss_testing::scratch::scratch_dir("observer-missing-cwd");
+        let absent = root.join(uuid::Uuid::new_v4().to_string());
+        let shell = Shell::here(Some(&absent));
+        let error = execute_with("true", &shell).unwrap_err();
+        let car = json!({"metadata": {"waits_on": {"on": "the event", "seen": "true", "owner": "world"}}});
+        let observed = with_wait_observed(
+            json!({"exit": 75, "not_yet": true}),
+            &car,
+            &shell,
+            None,
+            "T1",
+        );
+        assert_eq!(observed["waits_on_error"], format!("{error:#}"));
+        assert_eq!(observed["waits_on_stdout"], Value::Null);
+        assert_eq!(observed["waits_on_stderr"], Value::Null);
+        assert_eq!(observed["waits_on_raw_exit"], Value::Null);
+        assert_eq!(observed["waits_on_exit"], Value::Null);
+        assert_eq!(
+            boss_jobs::car::wait_observation(&observed),
+            boss_jobs::car::WaitObservation::Unread
+        );
+    }
+
+    #[test]
+    fn observer_streams_keep_trailing_bytes_beyond_the_display_limit() {
+        let stdout = format!(
+            "{}\n\n",
+            json!({"observation": "unseen", "padding": "x".repeat(MAX_STREAM + 32)})
+        );
+        let stderr = format!("{}\n\n", "observer warning ".repeat(MAX_STREAM / 8));
+        assert!(stdout.len() > MAX_STREAM && stderr.len() > MAX_STREAM);
+        let seen = format!("printf '%s' '{stdout}'; printf '%s' '{stderr}' >&2; exit 1");
+        let car =
+            json!({"metadata": {"waits_on": {"on": "the event", "seen": seen, "owner": "world"}}});
+        let observed = with_wait_observed(
+            json!({"exit": 75, "not_yet": true}),
+            &car,
+            &Shell::here(None),
+            None,
+            "T1",
+        );
+        assert_eq!(observed["waits_on_stdout"], stdout);
+        assert_eq!(observed["waits_on_stderr"], stderr);
+        assert_eq!(observed["waits_on_raw_exit"], 1);
+        assert_eq!(observed["waits_on_observation"], "unseen");
+        assert_eq!(
+            boss_jobs::car::wait_observation(&observed),
+            boss_jobs::car::WaitObservation::Unseen
+        );
+    }
+
+    #[test]
+    fn a_missing_observer_tool_cannot_be_hidden_by_a_successful_shell() {
+        let seen = "printf '%s' '{\"observation\":\"unseen\"}'; synthetic_missing_observer_tool_716f || true";
+        let car =
+            json!({"metadata": {"waits_on": {"on": "the event", "seen": seen, "owner": "world"}}});
+        let observed = with_wait_observed(
+            json!({"exit": 75, "not_yet": true}),
+            &car,
+            &Shell::here(None),
+            None,
+            "T1",
+        );
+        assert_eq!(observed["waits_on_raw_exit"], 0);
+        assert_eq!(observed["waits_on_exit"], Value::Null);
+        assert_eq!(observed["waits_on_seen_at"], Value::Null);
+        assert_eq!(observed["waits_on_stdout"], "{\"observation\":\"unseen\"}");
+        assert_eq!(
+            observed["waits_on_missing_tools"],
+            json!(["synthetic_missing_observer_tool_716f"])
+        );
+        assert_eq!(
+            boss_jobs::car::wait_observation(&observed),
+            boss_jobs::car::WaitObservation::Unread
+        );
+    }
+
+    #[test]
+    fn a_seen_writer_preserves_success_negative_and_error_as_distinct_outcomes() {
+        for code in [0, 1, 2] {
+            let seen = if code == 2 {
+                let missing = std::env::current_dir().unwrap().join(format!(
+                    "synthetic-observer-absent-{}",
+                    uuid::Uuid::new_v4()
+                ));
+                assert!(!missing.exists());
+                format!("grep -q synthetic_event '{}'", missing.display())
+            } else if code == 1 {
+                "printf '%s' '{\"observation\":\"unseen\"}'; exit 1".into()
+            } else {
+                format!("printf 'synthetic observer status {code}\\n'; exit {code}")
+            };
+            let raw = std::process::Command::new("sh")
+                .args(["-c", &seen])
+                .output()
+                .unwrap();
+            eprintln!(
+                "BOUNDED ORIGINAL {code}: exit={:?}, stdout={:?}, stderr={:?}",
+                raw.status.code(),
+                String::from_utf8_lossy(&raw.stdout),
+                String::from_utf8_lossy(&raw.stderr)
+            );
+            assert_eq!(raw.status.code(), Some(code));
+            let car = json!({"metadata": {
+                "proof_probe": "check-proof",
+                "waits_on": {"on": "the event", "seen": seen, "owner": "world"}
+            }});
+            let attempt = with_wait_observed(
+                json!({"at": "2026-09-19T12:00:00Z", "exit": 75, "not_yet": true, "probe": "check-proof", "not_yet_since": "2026-09-19T11:00:00Z", "not_yet_runs": 2}),
+                &car,
+                &Shell::here(None),
+                None,
+                "2026-09-19T12:00:00Z",
+            );
+            eprintln!("ACTUAL EXECUTED OBSERVER {code}: {attempt}");
+            assert_eq!(attempt["waits_on_exit"], code);
+            assert_eq!(attempt["waits_on_raw_exit"], code);
+            assert_eq!(
+                attempt["waits_on_observation"],
+                if code == 1 {
+                    json!("unseen")
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(
+                attempt["waits_on_stdout"],
+                json!(String::from_utf8_lossy(&raw.stdout))
+            );
+            assert_eq!(
+                attempt["waits_on_stderr"],
+                json!(String::from_utf8_lossy(&raw.stderr))
+            );
+            let mut metadata = car["metadata"].clone();
+            metadata["proof_attempt"] = attempt;
+            let qualified = boss_jobs::car::owned_wait(&metadata);
+            if code == 1 {
+                assert!(
+                    qualified.is_some(),
+                    "executed negative remains positive control"
+                );
+            } else {
+                assert!(
+                    qualified.is_none(),
+                    "seen success or observer execution error is not an unseen-condition wait: code={code}, actual={qualified:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_nonzero_or_malformed_negative_is_unread_not_an_observed_wait() {
+        for seen in [
+            "exit 1",
+            "printf invalid; exit 1",
+            "printf '%s' '{\"observation\":\"unseen\"}'; exit 2",
+            "printf '%s' '{\"observation\":\"unseen\"}{\"observation\":\"unseen\"}'; exit 1",
+            "printf '%s' '{\"observation\":true}'; exit 1",
+            "printf '%s' '[{\"observation\":\"unseen\"}]'; exit 1",
+            "printf '%s' '{\"observation\":\"unseen\"}extra'; exit 1",
+        ] {
+            let car = json!({"metadata": {"waits_on": {"on": "an event", "seen": seen, "owner": "world"}}});
+            let attempt = with_wait_observed(
+                json!({"not_yet": true, "exit": 75}),
+                &car,
+                &Shell::here(None),
+                None,
+                "T1",
+            );
+            let mut md = car["metadata"].clone();
+            md["proof_attempt"] = attempt;
+            assert!(boss_jobs::car::owned_wait(&md).is_none(), "{md}");
         }
     }
 }

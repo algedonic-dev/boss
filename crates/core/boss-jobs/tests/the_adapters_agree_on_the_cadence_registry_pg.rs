@@ -318,6 +318,7 @@ fn outcome(rc: i32, runtime_secs: u64, decision: Option<BoardDecision>) -> Firin
     FiringOutcome {
         rc,
         runtime_secs,
+        observations: None,
         board_decision: decision,
     }
 }
@@ -543,6 +544,7 @@ fn admitted_rows() -> Vec<CadenceRuleRow> {
     .collect();
     rows.push(clock("suite-one-time", &["06:05"]));
     rows.push(depth("suite-deep", 12, 120));
+    rows.push(depth("suite-clear-track", 1, 0));
     rows.push(CadenceRuleRow {
         business_calendar: Some("us-banking".into()),
         ..calendar("suite-banking", "monthly", "09:00")
@@ -642,7 +644,10 @@ fn refused_rows() -> Vec<(CadenceRuleRow, &'static str)> {
             "every_minutes",
         ),
         (depth("suite-bad-depth-zero", 0, 30), "min_dock_depth"),
-        (depth("suite-bad-cooldown-zero", 2, 0), "cooldown_minutes"),
+        (
+            depth("suite-bad-cooldown-negative", 2, -1),
+            "cooldown_minutes",
+        ),
         (
             CadenceRuleRow {
                 at_times: Some(json!(["06:00", "18:00"])),
@@ -718,6 +723,7 @@ async fn a_claim_is_exactly_once_and_the_first_claim_stands<W: World>(w: &W, ada
             firing_id: "suite-f1".into(),
             fired_at: at(12, 0),
             rc: None,
+            observations: None,
             board_decision: None,
         }),
         "{adapter}"

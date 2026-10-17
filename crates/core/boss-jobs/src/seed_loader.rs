@@ -183,6 +183,10 @@ struct StepToml {
     claimable: Option<bool>,
     #[serde(default)]
     executor: Option<String>,
+    /// Who is meant to move the step — `machine`, `agent` or `human`.
+    /// See `StepSpec::executor_class` (backlog 9ca41c08).
+    #[serde(default)]
+    executor_class: Option<crate::registry::ExecutorClass>,
     /// Who the step is for, declared ONCE — `audience = { role = "x" }`
     /// / `{ individual = "id" }` / `{ department = "code" }` /
     /// `{ station = "name" }` (design f5ebd2e1, backlog 67a58840).
@@ -432,6 +436,7 @@ fn workflow_toml_to_spec(
                 authority_role: s.authority_role.or(derived_role),
                 claimable: s.claimable,
                 executor: s.executor,
+                executor_class: s.executor_class,
                 audience,
                 agent,
                 metadata_defaults: s.metadata_defaults,
@@ -921,7 +926,11 @@ struct DeliveryPolicyToml {
     skip_reason_file_budget: i32,
     blip_cause_budget: i32,
     ci_host_floor_gb: i32,
+    #[serde(default = "crate::delivery::legacy_gate_queue_owner")]
+    gate_queue_owner: String,
     gate_max_concurrent: i32,
+    #[serde(default)]
+    channels: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1017,7 +1026,9 @@ fn delivery_policy_toml_to_spec(
             skip_reason_file_budget: toml.skip_reason_file_budget,
             blip_cause_budget: toml.blip_cause_budget,
             ci_host_floor_gb: toml.ci_host_floor_gb,
+            gate_queue_owner: toml.gate_queue_owner,
             gate_max_concurrent: toml.gate_max_concurrent,
+            channels: toml.channels,
         },
         // Not a declaration — see `station_toml_to_spec`.
         created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
@@ -1027,6 +1038,20 @@ fn delivery_policy_toml_to_spec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delivery_policy_retains_its_channel_evidence_contract() {
+        let bundle = std::fs::read_to_string(
+            std::path::Path::new(crate::delivery_policy_seed::platform_delivery_policy_path())
+                .join("train-conductor.toml"),
+        )
+        .unwrap();
+        let parsed = parse_delivery_policies(&bundle, "test frozen channel policy")
+            .expect("a channel contract is registry data");
+        let wire = serde_json::to_value(&parsed[0]).unwrap();
+        assert_eq!(wire["channels"]["rules"][0]["evidence"], "forge_blob");
+        assert_eq!(wire["channels"]["schema"], 1);
+    }
 
     #[test]
     fn parses_minimal_jobkind() {
@@ -1417,6 +1442,45 @@ required = true
         );
     }
 
+    /// `executor_class` (backlog 9ca41c08) parses, rides through to the
+    /// spec, and passes the publish lint `parse_workflows` runs; a word
+    /// outside the three is refused, and an undeclared step stays `None`.
+    #[test]
+    fn carries_executor_class_through_and_the_lint_accepts_it() {
+        let text = |class: &str| {
+            format!(
+                r#"
+[[workflow]]
+kind = "with-executor-class"
+label = "With Executor Class"
+category = "platform"
+subject_kinds = ["custom"]
+
+[[workflow.step]]
+title = "start"
+kind = "task"
+ready_when = "true"
+title_template = "Open"
+
+[[workflow.step]]
+title = "finish"
+kind = "task"
+ready_when = "steps.start.done"
+title_template = "Finish"
+terminal = {{ outcome = "done" }}
+executor_class = "{class}"
+"#
+            )
+        };
+        let specs = parse_workflows(&text("machine"), "platform", "<test>").unwrap();
+        assert_eq!(specs[0].steps[0].executor_class, None);
+        assert_eq!(
+            specs[0].steps[1].executor_class,
+            Some(crate::registry::ExecutorClass::Machine)
+        );
+        assert!(parse_workflows(&text("robot"), "platform", "<test>").is_err());
+    }
+
     #[test]
     fn carries_step_duration_hours_through() {
         // A step may author its own duration (`duration_hours`) —
@@ -1774,6 +1838,60 @@ ready_when = "true"
     /// Absent keys still deserialize to `Value::Null` and so keep
     /// `platform_seed`'s `{}` — every file authored before this reads
     /// exactly as it did.
+    #[test]
+    fn internal_wait_bounds_are_owned_by_the_authored_protocols() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infra/platform/workflows");
+        for (file, slug) in [
+            ("gate-run.toml", "record-verdict"),
+            ("ship-a-change.toml", "review"),
+            ("ship-a-change.toml", "landed-review"),
+        ] {
+            let rows = load_workflows(root.join(file)).unwrap();
+            let step = rows[0]
+                .steps
+                .iter()
+                .find(|step| step.title == slug)
+                .unwrap();
+            assert!(
+                step.duration_hours
+                    .is_some_and(|hours| hours.is_finite() && hours > 0.0),
+                "{file}/{slug} requires its own positive recorded bound"
+            );
+        }
+    }
+
+    #[test]
+    fn the_agent_protocol_declares_the_copied_claim_receipt() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infra/platform/workflows");
+        let rows = load_workflows(root.join("agent-run.toml")).unwrap();
+        assert_eq!(
+            rows[0]
+                .metadata_schema
+                .pointer("/properties/claim_receipt/type"),
+            Some(&serde_json::json!("object")),
+            "the run protocol must describe the native claim receipt"
+        );
+    }
+
+    #[test]
+    fn the_car_registry_declares_the_clean_window_record() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infra/platform/workflows");
+        let rows = load_workflows(root.join("ship-a-change.toml")).unwrap();
+        let window = rows[0]
+            .metadata_schema
+            .pointer("/properties/waits_on/properties/clean_window")
+            .expect("the supported wait declaration must describe its clean window");
+        assert_eq!(
+            window["required"],
+            serde_json::json!(["begin_at", "duration_seconds"])
+        );
+        assert_eq!(window["properties"]["begin_at"]["format"], "date-time");
+        assert_eq!(window["properties"]["duration_seconds"]["minimum"], 1);
+    }
+
     #[test]
     fn a_row_can_author_its_metadata_schema_and_entitlements() {
         let text = r#"

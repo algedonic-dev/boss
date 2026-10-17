@@ -36,6 +36,14 @@ postgres = ["dep:sqlx", "boss-policy-client/postgres", "boss-calendar/postgres",
 # by this crate's own dev-dependency below (backlog 428332da).
 test-support = []
 
+[[test]]
+name = "cadence_history"
+required-features = ["postgres"]
+
+[[test]]
+name = "conditional_binding_authority"
+required-features = ["postgres"]
+
 [dependencies]
 boss-clock-client = { path = "../boss-clock-client" }
 boss-ports = { path = "../boss-ports" }
@@ -80,6 +88,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # This crate's own tests reach the `test-support` write; nothing built
 # for production does (backlog 428332da).
 boss-jobs = { path = ".", features = ["test-support"] }
@@ -518,4 +527,16 @@ required-features = ["postgres"]
 
 [[test]]
 name = "station_claim_next_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "yard_move_corrections_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "move_admission_observation_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "historical_packet_receipts_pg"
 required-features = ["postgres"]

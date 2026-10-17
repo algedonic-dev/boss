@@ -66,6 +66,9 @@
 //! whole budget as a NONZERO rc so a starved loop stops reading as a
 //! 0-second success in this loop's own firing rows.
 
+#[path = "cadence_observations.rs"]
+pub(crate) mod observations;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -150,17 +153,9 @@ pub(crate) use boss_jobs::cadence::departs_a_train;
 /// already takes.
 pub(crate) const IDLE_BOARD_RC: i32 = -2;
 
-/// Did a departing board actually board a car? A boarded car takes the
-/// `train` stamp before `board()` returns, so it stops being
-/// `parked_ready` and the dock the loop probes FALLS. An idle window
-/// (nothing genuinely boardable — the reported bug: a car counted at
-/// probe time but held or branch-missing by the time boarding ran) and
-/// a consist that skipped every car both leave the dock where it was.
-///
-/// `after < before` is the whole test. New cars arriving mid-board only
-/// raise `after`, so the answer can misread a productive board as idle
-/// (never the reverse) — harmless: that board departed a train, so the
-/// track is occupied and the next window holds regardless.
+/// Queue movement is a fallback for a child without its board decision.
+/// A train removes ready cars, but so does a hold; concurrent admissions
+/// can hide a departure. The child's recorded decision takes precedence.
 pub(crate) fn board_reduced_the_dock(before: u32, after: u32) -> bool {
     after < before
 }
@@ -216,7 +211,20 @@ pub(crate) fn firing_decision(
 /// later boards at the next tick instead of waiting out the window. A
 /// board that DID board keeps `rc = 0` and starts the cooldown — the
 /// anti-thrash guard is untouched; only the zero-boarded case changes.
-pub(crate) fn recorded_rc(verb: &str, process_rc: i32, boarded_a_car: bool) -> i32 {
+pub(crate) fn recorded_rc(
+    verb: &str,
+    process_rc: i32,
+    boarded_a_car: bool,
+    decision: Option<&BoardDecision>,
+) -> i32 {
+    // 5b392fd4: the 2026-10-14 06:57 firing recorded no boardable car
+    // beside rc=0. A queue fall or unreadable fallback can hide that
+    // no-departure fact and burn the cooldown; the child's record wins.
+    let boarded_a_car = match decision {
+        Some(BoardDecision::Boarded { .. }) => true,
+        Some(BoardDecision::Held { .. } | BoardDecision::NoBoardableCar { .. }) => false,
+        None => boarded_a_car,
+    };
     if departs_a_train(verb) && process_rc == 0 && !boarded_a_car {
         IDLE_BOARD_RC
     } else {
@@ -491,6 +499,11 @@ pub(crate) fn due_window(
             // one the landing's own converge cuts off
             // (`needs_the_boarding_record`). Without the record the claim
             // holds from itself, as it did before.
+            // A declared zero cooldown disables only this elapsed-time
+            // hold, including after a cut-off claim. Per-minute claim
+            // identity, live track refusal and the conductor's process
+            // lock still prevent duplicate boarding; `running` below
+            // also holds a verb this loop has not reaped.
             //
             // TWIN, NOT YET MOVED: `boss_jobs::yard::boarding_hold` states
             // "cooldown — M min left" from the depth rule's last claim
@@ -886,7 +899,7 @@ fn rule_from_row(row: &CadenceRuleRow) -> Result<CadenceRule> {
 }
 
 async fn load_rules(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
 ) -> Result<Vec<CadenceRule>> {
     // EVERY COLUMN rule_from_row READS MUST BE SERVED. The columns
@@ -913,7 +926,7 @@ async fn load_rules(
 }
 
 async fn last_firing(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     rule: &str,
 ) -> Result<Option<LastFiring>> {
@@ -942,7 +955,7 @@ async fn last_firing(
 /// firing_id primary key; the API reports a losing claim as 200 +
 /// `{"claimed": false}` so a race never looks like a failure.
 async fn claim_firing(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     id: &str,
     rule: &CadenceRule,
@@ -979,7 +992,7 @@ async fn claim_firing(
 /// exit code are what make "what did the cadence cost" a query, and a
 /// board's decision is what the yard states (backlog 96f02540).
 async fn record_outcome(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     id: &str,
     outcome: &FiringOutcome,
@@ -1010,7 +1023,7 @@ async fn record_outcome(
 /// (nothing was received); an ambiguous claim is settled by the next
 /// tick re-evaluating the window, never by re-sending blind.
 async fn api(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     method: reqwest::Method,
     base: &str,
     path: &str,
@@ -1033,7 +1046,7 @@ async fn api(
 }
 
 async fn api_once(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     method: &reqwest::Method,
     base: &str,
     path: &str,
@@ -1072,7 +1085,7 @@ async fn api_once(
 }
 
 pub(crate) async fn probe_dock_depth(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
 ) -> Result<u32> {
     // Every open car, not just page one. A limit is not a filter: the
@@ -1140,7 +1153,7 @@ pub(crate) async fn probe_dock_depth(
 /// that matters may sit behind merged ones — a limit is not a filter.
 /// The paginator errors on a body without `total`, never reads it as
 /// zero — zero is what a wrong deployment answers.
-async fn probe_open_trains(http: &boss_core::machine_token::Client, base: &str) -> Result<u32> {
+async fn probe_open_trains(http: &crate::machine_http::MachineClient, base: &str) -> Result<u32> {
     let listed = train::list_all_pages(|offset| async move {
         api(
             http,
@@ -1268,7 +1281,7 @@ pub(crate) fn newest_boarding(trains: &[Value]) -> std::result::Result<DateTime<
 /// kept (a940e83b). Never an error: an unread record is an answer the
 /// caller journals and then holds on.
 pub(crate) async fn read_last_boarding(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     rule: &CadenceRule,
     last: Option<&LastFiring>,
@@ -1331,6 +1344,7 @@ async fn run_verb(
     rule: &str,
     now: DateTime<Utc>,
     decision_file: Option<&std::path::Path>,
+    observation_file: Option<&std::path::Path>,
 ) -> Result<i32> {
     match parse_action(verb)? {
         Action::Train(v) => {
@@ -1339,6 +1353,9 @@ async fn run_verb(
             cmd.args(["train", &v]);
             if let Some(path) = decision_file {
                 cmd.env(train::BOARD_DECISION_FILE_ENV, path);
+            }
+            if let Some(path) = observation_file {
+                cmd.env(observations::FILE_ENV, path);
             }
             let status = cmd
                 .status()
@@ -1481,7 +1498,7 @@ impl Runs {
     /// from an idle one — see `recorded_rc`.
     fn spawn_verb(
         &mut self,
-        http: &boss_core::machine_token::Client,
+        http: &crate::machine_http::MachineClient,
         base: &str,
         rule: &CadenceRule,
         firing_id: String,
@@ -1501,8 +1518,17 @@ impl Runs {
         if let Some(path) = &decision_file {
             let _ = std::fs::remove_file(path);
         }
+        let observation_file = matches!(parse_action(&verb), Ok(Action::Train(_)))
+            .then(|| observations::path(&firing_id));
         let handle = tokio::spawn(async move {
-            let process_rc = match run_verb(&verb, &rule_name, now, decision_file.as_deref()).await
+            let process_rc = match run_verb(
+                &verb,
+                &rule_name,
+                now,
+                decision_file.as_deref(),
+                observation_file.as_deref(),
+            )
+            .await
             {
                 Ok(rc) => rc,
                 Err(e) => {
@@ -1514,14 +1540,10 @@ impl Runs {
                 }
             };
             let secs = runtime_secs(started.elapsed());
-            // Did this board board a car? Only a departing verb that
-            // exited cleanly can be idle; anything else keeps its own rc.
-            // A boarded car takes the `train` stamp before the child
-            // returns, so a fresh dock probe FALLS iff at least one car
-            // boarded. A probe we cannot read leaves `boarded_a_car`
-            // true — the conservative reading holds the cooldown, exactly
-            // as before this fix.
-            let boarded_a_car = if departs_a_train(&verb) && process_rc == 0 {
+            let recorded = decision_file.as_deref().and_then(read_decision);
+            // Only a child without its decision needs the legacy queue
+            // comparison. An unreadable fallback keeps the cooldown.
+            let boarded_a_car = if departs_a_train(&verb) && process_rc == 0 && recorded.is_none() {
                 match (dock_depth, probe_dock_depth(&http, &base).await) {
                     (Some(before), Ok(after)) => board_reduced_the_dock(before, after),
                     _ => true,
@@ -1529,24 +1551,36 @@ impl Runs {
             } else {
                 true
             };
-            let rc = recorded_rc(&verb, process_rc, boarded_a_car);
+            let rc = recorded_rc(&verb, process_rc, boarded_a_car, recorded.as_ref());
             if rc == IDLE_BOARD_RC {
                 log(format!(
                     "{name}: board boarded nothing — idle firing, cooldown not held"
                 ));
             }
-            let recorded = decision_file.as_deref().and_then(read_decision);
+            let captured = observation_file
+                .as_deref()
+                .map(|path| observations::capture(path, process_rc));
             let outcome = FiringOutcome {
                 rc,
                 runtime_secs: secs,
+                observations: captured
+                    .as_ref()
+                    .map(|capture| capture.observations.clone()),
                 board_decision: firing_decision(&verb, process_rc, recorded),
             };
             if let Some(d) = &outcome.board_decision {
                 log(format!("{name}: board decided — {}", d.line()));
             }
-            if let Err(e) = record_outcome(&http, &base, &firing_id, &outcome).await {
+            let persisted = match (&observation_file, &captured) {
+                (Some(path), Some(capture)) => {
+                    observations::persist(&http, &base, &name, &firing_id, &outcome, path, capture)
+                        .await
+                }
+                _ => record_outcome(&http, &base, &firing_id, &outcome).await,
+            };
+            if let Err(e) = persisted {
                 log(format!(
-                    "{name}: recording the firing outcome failed: {e:#}"
+                    "{name}: recording the firing outcome failed; complete observation retained: {e:#}"
                 ));
             }
             log(completion_line(&name, &verb, rc, secs));
@@ -1563,7 +1597,7 @@ struct TickSummary {
 }
 
 async fn tick(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     clock: &dyn ClockClient,
     dry: bool,
@@ -2234,7 +2268,7 @@ mod tests {
             Action::Train("refresh".into())
         );
         assert!(!departs_a_train("refresh"));
-        assert_eq!(recorded_rc("refresh", 0, false), 0);
+        assert_eq!(recorded_rc("refresh", 0, false, None), 0);
     }
 
     /// A FACT THAT LIVES TWICE (CLAUDE.md §9a): the verbs this loop will
@@ -2537,6 +2571,7 @@ mod tests {
             firing_id: firing_id(&rule.name, window),
             fired_at: window,
             rc,
+            observations: None,
             board_decision: None,
         }
     }
@@ -2650,6 +2685,96 @@ mod tests {
     }
 
     // -- queue-depth basis: dock pressure --------------------------------
+
+    #[test]
+    fn declared_boarding_releases_a_clear_track_on_the_next_minute() {
+        let specs = boss_jobs::seed_loader::load_cadence_rules(
+            boss_jobs::cadence_seed::platform_cadence_path(),
+        )
+        .unwrap();
+        let spec = specs
+            .iter()
+            .find(|s| s.name() == "train-board-on-dock-depth")
+            .unwrap();
+        let rule = rule_from_row(&spec.row).unwrap();
+        let previous = utc(2026, 10, 16, 12, 0, 0);
+        let next = utc(2026, 10, 16, 12, 1, 0);
+        let last = fired(&rule, previous);
+        assert_eq!(
+            decide(&rule, next, Some(&last), Some(1), Some(0), &[], None),
+            Decision::Fire(next),
+            "a completed short train must not leave a ready car behind a thirty-minute hold"
+        );
+        assert_eq!(
+            decide(&rule, next, Some(&last), Some(1), Some(1), &[], None),
+            Decision::TrackOccupied(1)
+        );
+        assert_eq!(
+            decide(&rule, next, Some(&last), Some(1), None, &[], None),
+            Decision::TrackUnknown
+        );
+        assert_eq!(
+            decide(&rule, next, Some(&last), Some(0), Some(0), &[], None),
+            Decision::Hold
+        );
+        assert_eq!(
+            decide(&rule, next, Some(&last), None, Some(0), &[], None),
+            Decision::Hold,
+            "an unread dock cannot trigger a departure"
+        );
+        assert_eq!(
+            decide(
+                &rule,
+                next,
+                Some(&fired(&rule, next)),
+                Some(1),
+                Some(0),
+                &[],
+                None
+            ),
+            Decision::Hold,
+            "the same minute stays claimed across restart"
+        );
+        assert_eq!(
+            decide(
+                &rule,
+                next,
+                Some(&last),
+                Some(1),
+                Some(0),
+                &[running(&rule.name, 61)],
+                None
+            ),
+            Decision::StillRunning(std::time::Duration::from_secs(61))
+        );
+        let cut_off = fired_rc(&rule, previous, None);
+        assert_eq!(
+            decide(
+                &rule,
+                next,
+                Some(&cut_off),
+                Some(1),
+                Some(1),
+                &[],
+                Some(previous)
+            ),
+            Decision::TrackOccupied(1),
+            "a restart cannot board over the train left by an unfinished firing"
+        );
+        assert_eq!(
+            decide(
+                &rule,
+                next,
+                Some(&cut_off),
+                Some(1),
+                Some(0),
+                &[],
+                Some(previous)
+            ),
+            Decision::Fire(next),
+            "a cut-off claim must not recreate a cooldown after the recorded train clears"
+        );
+    }
 
     #[test]
     fn queue_depth_threshold_edge() {
@@ -3175,11 +3300,10 @@ mod tests {
         );
     }
 
-    /// A boarded car takes the `train` stamp before `board()` returns, so
-    /// the dock the loop probes FALLS iff at least one car boarded.
+    /// The legacy fallback compares the two ready-queue counts.
     #[test]
     fn board_reduced_the_dock_reads_the_fall() {
-        // The dock fell — cars left it, so the board boarded them.
+        // A fall is only a fallback signal; a hold can also cause one.
         assert!(board_reduced_the_dock(4, 1));
         assert!(board_reduced_the_dock(1, 0));
         // The dock held — an idle window (nothing genuinely boardable) or
@@ -3188,6 +3312,42 @@ mod tests {
         assert!(!board_reduced_the_dock(4, 4));
         assert!(!board_reduced_the_dock(1, 1));
         assert!(!board_reduced_the_dock(1, 5));
+    }
+
+    #[test]
+    fn an_idle_decision_releases_cooldown_even_when_a_hold_reduces_the_dock() {
+        let decision = firing_decision(
+            "board",
+            0,
+            Some(BoardDecision::NoBoardableCar {
+                reason: "no train packet opened; the candidate was held".into(),
+            }),
+        );
+        assert!(matches!(
+            decision,
+            Some(BoardDecision::NoBoardableCar { .. })
+        ));
+        // The candidate leaves the ready queue through a hold, not a train.
+        let rc = recorded_rc("board", 0, board_reduced_the_dock(1, 0), decision.as_ref());
+        assert_eq!(
+            rc, IDLE_BOARD_RC,
+            "the board's own no-departure record wins"
+        );
+    }
+
+    #[test]
+    fn a_departure_decision_keeps_cooldown_when_arrivals_hide_the_queue_fall() {
+        let boarded = BoardDecision::Boarded { cars: 2 };
+        let held = BoardDecision::Held {
+            reason: "host unavailable".into(),
+        };
+        for verb in ["board", "run"] {
+            assert_eq!(recorded_rc(verb, 0, false, Some(&boarded)), 0);
+            assert_eq!(recorded_rc(verb, 0, true, Some(&held)), IDLE_BOARD_RC);
+            assert_eq!(recorded_rc(verb, 1, true, Some(&held)), 1);
+            assert_eq!(recorded_rc(verb, 1, false, Some(&boarded)), 1);
+        }
+        assert_eq!(recorded_rc("reconcile", 0, true, Some(&held)), 0);
     }
 
     /// 2026-09-06 ~16:19: `train-board-on-dock-depth` (min 1, cooldown 45)
@@ -3255,21 +3415,21 @@ mod tests {
         // The recording contract: a departing board that ran cleanly
         // (rc 0) yet boarded nothing is recorded as an idle firing, NOT
         // the success rc that holds the cooldown...
-        assert_eq!(recorded_rc("board", 0, false), IDLE_BOARD_RC);
+        assert_eq!(recorded_rc("board", 0, false, None), IDLE_BOARD_RC);
 
-        assert_eq!(recorded_rc("run", 0, false), IDLE_BOARD_RC);
+        assert_eq!(recorded_rc("run", 0, false, None), IDLE_BOARD_RC);
         // ...while a board that boarded a car keeps rc 0 and holds it.
-        assert_eq!(recorded_rc("board", 0, true), 0);
+        assert_eq!(recorded_rc("board", 0, true, None), 0);
         // A real failure is recorded verbatim (the 2026-09-04 case
         // stands), and a non-departing verb is never an "idle board".
-        assert_eq!(recorded_rc("board", 1, false), 1);
-        assert_eq!(recorded_rc("reconcile", 0, false), 0);
+        assert_eq!(recorded_rc("board", 1, false, None), 1);
+        assert_eq!(recorded_rc("reconcile", 0, false, None), 0);
 
         // End to end at the cooldown: the idle firing releases the window,
         // so cars that parked minutes later board at the next tick...
         let rule = depth_rule(1, 45);
         let fired_at = utc(2026, 9, 6, 16, 19, 0);
-        let idle = fired_rc(&rule, fired_at, Some(recorded_rc("board", 0, false)));
+        let idle = fired_rc(&rule, fired_at, Some(recorded_rc("board", 0, false, None)));
         assert_eq!(
             due_window(
                 &rule,
@@ -3282,7 +3442,7 @@ mod tests {
             "cars that park after an idle board must board next tick, not wait out the cooldown"
         );
         // ...whereas a productive board (rc 0) still holds the window.
-        let productive = fired_rc(&rule, fired_at, Some(recorded_rc("board", 0, true)));
+        let productive = fired_rc(&rule, fired_at, Some(recorded_rc("board", 0, true, None)));
         assert_eq!(
             due_window(
                 &rule,
@@ -4020,6 +4180,7 @@ mod db_tests {
             &FiringOutcome {
                 rc: 0,
                 runtime_secs: 42,
+                observations: None,
                 board_decision: Some(decision.clone()),
             },
         )

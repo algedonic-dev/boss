@@ -8,7 +8,7 @@
 //! packet-naming rows of its slice — a step's under `job_id`, a job's
 //! under `id` — and nothing else.
 
-use boss_jobs::moves::{Move, MovesStore, PgMoves};
+use boss_jobs::moves::{Move, MovesStore, PgMoves, mover_version};
 use boss_testing::TestDb;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -25,6 +25,7 @@ fn moved(
     declared: Option<bool>,
 ) -> Move {
     Move {
+        dispatch: None,
         at: t("2026-09-26T03:00:00Z") + chrono::Duration::seconds(n as i64),
         packet: packet.into(),
         kind: "pr-train".into(),
@@ -114,6 +115,80 @@ async fn a_replayed_batch_writes_nothing_twice_and_reads_back_in_order() {
     // A move to the place it came from is refused by the table itself.
     let nowhere = moved(9, "train-3", Some("dock"), Some("dock"), Some(false));
     assert!(store.record(&[nowhere]).await.is_err());
+}
+
+/// A RECORDED MOVE NAMES THE MOVER THAT READ IT (backlog c8d22e63): the
+/// adapter writes `mover_version()` into the column and reads it back,
+/// and a row written the way every writer before the stamp wrote it —
+/// no `mover_version` at all — reads back `None`, stays in the record,
+/// and is not counted toward the undeclared band.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_move_names_its_mover_and_an_unstamped_row_reads_back_unknown() {
+    let db = TestDb::new().await;
+    let store = PgMoves::new(db.pool.clone());
+
+    // The pre-stamp writer's own INSERT, column list and all.
+    let old = moved(1, "train-1", Some("shed"), Some("arrivals"), Some(false));
+    sqlx::query(
+        "INSERT INTO yard_moves (at, packet, kind, label, from_region, to_region, \
+         declared, cause_event_id, cause_seq, cause_kind, handoff_from, lineage, aboard, terminal) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+    )
+    .bind(old.at)
+    .bind(&old.packet)
+    .bind(&old.kind)
+    .bind(&old.label)
+    .bind(&old.from)
+    .bind(&old.to)
+    .bind(old.declared)
+    .bind(old.cause_event_id)
+    .bind(old.cause_seq)
+    .bind(&old.cause_kind)
+    .bind(&old.handoff_from)
+    .bind(&old.lineage)
+    .bind(serde_json::json!(old.aboard))
+    .bind(&old.terminal)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let new = moved(2, "train-2", Some("shed"), Some("arrivals"), Some(false));
+    assert_eq!(store.record(std::slice::from_ref(&new)).await.unwrap(), 1);
+
+    let column: Vec<(i64, Option<String>)> =
+        sqlx::query_as("SELECT seq, mover_version FROM yard_moves ORDER BY seq")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        column.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+        [None, Some(mover_version())],
+        "the column holds what the adapter wrote, and NULL where nothing did"
+    );
+
+    let back = store.since(0, 10).await.unwrap();
+    assert_eq!(
+        back.iter().map(|r| r.r#move.clone()).collect::<Vec<_>>(),
+        [old, new],
+        "both rows are held"
+    );
+    assert_eq!(back[0].mover_version, None, "unknown, never guessed");
+    assert_eq!(back[1].mover_version, Some(mover_version()));
+    // On `/api/yard/moves` the stamped row carries its mover and the
+    // unstamped one carries no key at all (its correction-ledger hash
+    // is the one it always had).
+    let page = serde_json::to_value(&back).unwrap();
+    assert!(page[0].get("mover_version").is_none(), "{page}");
+    assert_eq!(page[1]["mover_version"], mover_version());
+
+    let taken = store.crossings(t("2026-09-26T00:00:00Z")).await.unwrap();
+    assert_eq!(
+        taken
+            .iter()
+            .map(|r| (r.from.as_deref(), r.to.as_deref(), r.moves))
+            .collect::<Vec<_>>(),
+        [(Some("shed"), Some("arrivals"), 1)],
+        "the band counts the current mover's row alone"
+    );
 }
 
 async fn log(pool: &sqlx::PgPool, kind: &str, payload: serde_json::Value) {

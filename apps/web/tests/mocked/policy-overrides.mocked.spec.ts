@@ -72,16 +72,42 @@ test('backend refusal stays visible and never claims success', async ({ page }) 
 test('different effect is uncertain and offers only readback, never a second blind write', async ({ page }) => {
   let writes = 0;
   let reads = 0;
+  // The human recheck's GET is HELD until the test has seen the page while
+  // it is in flight, and the count is judged only after its response and
+  // the rendered result. A click resolves when it is dispatched, not when
+  // the GET it starts is handled: counting straight after it read 2 on a
+  // loaded runner (gate 75b09a85 at f98bb27b, green on the same head
+  // before; backlog 16435a91), a test race, not a product one.
+  let arrived: () => void = () => {};
+  const recheckArrived = new Promise<void>(resolve => { arrived = resolve; });
+  let release: () => void = () => {};
+  const held = new Promise<void>(resolve => { release = resolve; });
   await open(page);
   await page.route(/\/api\/policy\/user-overrides(?:\/[^/]+)?$/, async r => {
-    if (r.request().method() === 'POST') { writes++; await r.fulfill({ json: draft }); }
-    else { reads++; await r.fulfill({ json: [{ ...draft, scope: 'none' }] }); }
+    if (r.request().method() === 'POST') { writes++; await r.fulfill({ json: draft }); return; }
+    reads++;
+    if (reads === 3) { arrived(); await held; }
+    await r.fulfill({ json: [{ ...draft, scope: 'none' }] });
   });
   await prepare(page);
   await page.getByRole('button', { name: 'Save permission', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText('could not be confirmed exactly');
   await expect(page.getByRole('button', { name: 'Save permission', exact: true })).toBeDisabled();
+  expect(writes).toBe(1);
+  expect(reads).toBe(2);
+  const recheck = page.waitForResponse(response => response.request().method() === 'GET' && /\/api\/policy\/user-overrides\/[^/]+$/.test(response.url()));
   await page.getByRole('button', { name: 'Check saved permission' }).click();
+  await recheckArrived;
+  // In flight: the explicit recheck is a GET, and nothing offers a write.
+  await expect(page.getByRole('button', { name: 'Checking…' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Check saved permission' })).toBeDisabled();
+  expect(writes).toBe(1);
+  release();
+  await recheck;
+  // Settled: still uncertain, still only the readback on offer.
+  await expect(page.getByRole('button', { name: 'Check saved permission' })).toBeEnabled();
+  await expect(page.getByRole('alert')).toContainText('could not be confirmed exactly');
+  await expect(page.getByRole('button', { name: 'Save permission', exact: true })).toBeDisabled();
   expect(writes).toBe(1);
   expect(reads).toBe(3);
 });

@@ -71,6 +71,7 @@ trap 'rm -rf "$tmp"' EXIT
 # (a-lint-sources-a-header-lib-only-hermetic.sh; the 2026-10-01 incident).
 # The token states are a-manifest-sender-presents-the-machine-token.sh's.
 mkdir -p "$tmp/no-machine-token"
+export BOSS_GATE_READERS="$here/../lib"
 export BOSS_MACHINE_TOKEN_DIR="$tmp/no-machine-token" BOSS_SOR_ENV="$tmp/no-sor.env" BOSS_OBSERVE_READER="$tmp/no-reader.sh"
 unset BOSS_JOBS_URL BOSS_MACHINE_TOKEN_HOSTS RUNTIME_DIRECTORY
 

@@ -46,7 +46,7 @@
     cancelRequestBody,
     disciplineLabel,
     dockUpstream,
-    fetchYard,
+    readYard,
     splitAtDeparture,
     trainGateLabel,
     trainGateTroubled,
@@ -58,8 +58,8 @@
     type JobLite,
     type TrainRow,
     type YardPartition,
-    type YardState,
   } from './yard';
+  import { beginYardReading, emptyYardReading, finishYardReading } from './yard-reading';
   import { session } from '@boss/web-kit/session/session.svelte';
   import {
     blockLabel,
@@ -154,8 +154,9 @@
     onselection?: (s: FloorSelection) => void;
   }> = $props();
 
-  let yard = $state<YardState | null>(null);
-  let loading = $state(true);
+  let yardReading = $state(emptyYardReading());
+  const yard = $derived(yardReading.data);
+  const loading = $derived(yardReading.data === null && yardReading.error === null);
   // The clock the "since" columns and the elapsed readings run on,
   // advanced on every poll so a wagon's age keeps counting.
   let nowMs = $state(Date.now());
@@ -510,16 +511,18 @@
   onMount(() => {
     let cancelled = false;
     async function tick() {
+      yardReading = beginYardReading(yardReading);
+      const request = yardReading.request;
       const [y, s, ops, health, conv, regs] = await Promise.all([
-        fetchYard(),
+        readYard(),
         fetchYardStatus(),
         fetchOpsRequests(),
         fetchHealth(),
         fetchConverges(),
         fetchRegions(),
       ]);
-      if (cancelled) return;
-      if (y) yard = y;
+      if (cancelled || request <= yardReading.acceptedRequest) return;
+      yardReading = finishYardReading(yardReading, request, y);
       status = s;
       regionsRead = regs;
       opsRequests = ops;
@@ -527,7 +530,6 @@
       const now = Date.now();
       cluster = clusterReading(cluster, health, now);
       nowMs = now;
-      loading = false;
       // The selected packet's steps move too; the runner's packet may
       // be a newer one than the panel was opened on.
       const runnerId = sel.kind === 'runner' ? runnerPacketId(feeds.runner) : null;
@@ -623,6 +625,16 @@
 </script>
 
 <div class="theme-exec yard-root">
+  {#if yardReading.error}
+    <div class="yard-empty load-failed" data-yard-read="failed" role="status">
+      Yard refresh failed — {yardReading.error}.
+      {#if yardReading.observedAt !== null}
+        Last successful reading: {Math.max(0, Math.floor((nowMs - yardReading.observedAt) / 1000))}s ago. The rows below are retained from that reading.
+      {:else}
+        No successful yard reading yet.
+      {/if}
+    </div>
+  {/if}
   {#if loading}
     <div class="yard-empty">Reading the yard…</div>
   {:else if !yard || !floor}

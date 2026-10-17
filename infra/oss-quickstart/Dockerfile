@@ -68,6 +68,8 @@ FROM rust-base AS rust-build
 # so only source goes into the build context.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# The receipt binds the actual compiler recipe as well as Cargo's inputs.
+COPY infra/oss-quickstart/Dockerfile ./infra/oss-quickstart/Dockerfile
 # The isolated consist worker derives its image from the gate's one
 # definition at compile time, so rustc needs it in this stage (2710c8fc).
 COPY infra/gate-runner/gate-runner.yaml ./infra/gate-runner/gate-runner.yaml
@@ -100,6 +102,7 @@ COPY infra/postgres ./infra/postgres
 # Rust build layer every time a shell script moved.
 COPY infra/estate/observe-lib.sh ./infra/estate/observe-lib.sh
 COPY infra/forge/host-absent-tools.txt ./infra/forge/host-absent-tools.txt
+COPY infra/forge/delivery-plan.py ./infra/forge/delivery-plan.py
 COPY infra/forge/probe-bin/boss-gateway-read ./infra/forge/probe-bin/boss-gateway-read
 # boss-core `include_str!`s the tiers registry (ba429e7f). The runtime
 # stage copies all of infra/platform for the services to READ at run
@@ -113,6 +116,13 @@ COPY infra/platform/tiers.toml ./infra/platform/tiers.toml
 COPY infra/ops/verbs ./infra/ops/verbs
 # The CLI and dev activation door read ONE compatibility contract.
 COPY infra/dev/control-contract.txt ./infra/dev/control-contract.txt
+# The collector's immutable helper witnesses are embedded by rustc.
+COPY infra/agent/private-collector.py ./infra/agent/private-collector.py
+COPY infra/agent/private-collector-contract.json ./infra/agent/private-collector-contract.json
+# The same multiline guard covers test includes without guessing cfg.
+COPY infra/dispatcher/rules/run-car-probes-on-train-arrived.toml ./infra/dispatcher/rules/run-car-probes-on-train-arrived.toml
+COPY infra/dispatcher/rules/recheck-failing-probes-hourly.toml ./infra/dispatcher/rules/recheck-failing-probes-hourly.toml
+COPY infra/platform/automations/dispatcher.toml ./infra/platform/automations/dispatcher.toml
 # `boss tenant check` compiles the platform workflow roster in — the
 # DIRECTORY of kind files, listed by the same build.rs — because it
 # judges a tenant's sensor references offline, with no registry to ask
@@ -142,6 +152,8 @@ RUN --mount=type=cache,id=boss-cargo-target,target=/build/target \
     --mount=type=cache,id=boss-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=boss-cargo-git,target=/usr/local/cargo/git \
     set -eu && \
+    : > /tmp/boss-cargo.jsonl && \
+    cargo_record() { "$@" --message-format=json-render-diagnostics >> /tmp/boss-cargo.jsonl || { cat /tmp/boss-cargo.jsonl >&2; return 1; }; } && \
     # Single cargo invocation across the whole workspace —
     # boss-brewery-sim builds by default (no feature gate), so it
     # rides the same --workspace --bins pass, sharing dep compilation.
@@ -149,7 +161,7 @@ RUN --mount=type=cache,id=boss-cargo-target,target=/build/target \
     # passes (different feature set) and recompiled boss-brewery-
     # engine + dep tree twice; one pass halves the cold-build
     # wall-clock on cache-cold builds.
-    cargo build --release --workspace \
+    cargo_record cargo build --release --workspace \
         --features postgres \
         --bins && \
     # boss-accounts-api + boss-events-api gate on umbrella features
@@ -157,8 +169,8 @@ RUN --mount=type=cache,id=boss-cargo-target,target=/build/target \
     # build above silently skips them. Build explicitly — else the
     # gateway 502s on /api/accounts and the brewery data-seed can't
     # land accounts/vendors.
-    cargo build --release -p boss-accounts --bin boss-accounts-api --features accounts-api && \
-    cargo build --release -p boss-events-api --bin boss-events-api --features events-api && \
+    cargo_record cargo build --release -p boss-accounts --bin boss-accounts-api --features accounts-api && \
+    cargo_record cargo build --release -p boss-events-api --bin boss-events-api --features events-api && \
     mkdir -p /out && \
     # Copy every workspace binary to /out — the runtime stage's COPY
     # source. Strict mode (set -e) means the build fails if the
@@ -168,6 +180,8 @@ RUN --mount=type=cache,id=boss-cargo-target,target=/build/target \
         \( -name 'boss' -o -name 'boss-*' \) ! -name '*.d' \
         -exec cp {} /out/ \; && \
     test -x /out/boss-gateway || (echo "FATAL: boss-gateway missing in /out" >&2; ls /out >&2; exit 1) && \
+    # Read only: preserve complete compiler evidence beside the real binaries.
+    /out/boss channels --compiler-inputs /tmp/boss-cargo.jsonl --compiler-artifacts /out --repository /build > /out/boss-inputs.json && \
     # The brewery's engine is one tenant's binary, not the platform's
     # (backlog 18d6a6c9, 2026-09-17): the launcher SKIPs it when absent
     # and starts it only for a tenant that declares the sim. Said out
@@ -436,6 +450,7 @@ COPY infra/lib/curl-through-a-roll.sh /usr/local/bin/lib/curl-through-a-roll.sh
 # crates/core/boss-testing/tests/secret_header_sh.rs pins this line.
 COPY infra/lib/secret-header.sh /usr/local/bin/lib/secret-header.sh
 COPY infra/lib/jq.sh /usr/local/bin/lib/jq.sh
+COPY infra/lib/jobs-pages.sh infra/lib/immutable-metadata.jq /usr/local/bin/lib/
 # The converge guard the playground crawl's `record` container runs
 # before it tells the browser to start (backlog 37742794): the guard
 # reads the record, so it runs where the machine token is, and that
@@ -465,6 +480,7 @@ COPY infra/cluster/machine-token-push.sh /usr/local/bin/boss-machine-token-push
 COPY infra/lint/conservation-invariants.sh /opt/boss/infra/lint/conservation-invariants.sh
 COPY infra/lint/lib/conservation.sh /opt/boss/infra/lint/lib/conservation.sh
 COPY infra/lib/secret-header.sh /opt/boss/infra/lib/secret-header.sh
+COPY infra/forge/isolation-receiver.py /opt/boss/infra/forge/isolation-receiver.py
 COPY infra/oss-quickstart/generate-configs.sh /usr/local/bin/boss-generate-configs
 RUN chmod +x /opt/boss/infra/oss-quickstart/database-from-url.sh /usr/local/bin/boss-init /usr/local/bin/boss-launch \
     /usr/local/bin/boss-generate-configs \

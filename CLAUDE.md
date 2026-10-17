@@ -879,7 +879,9 @@ a door that stops being true is a defect worth a car.
   build-free lint, run eight at a time: 23-36 s on the dev pod, measured
   2026-09-25 against 132 s one at a time, backlog dc5b6302; the closing
   line names the three slowest lints) PLUS workspace clippy when the tree
-  implies a crate, including dependent test targets. Warm leaf edits reuse
+  implies a crate, including dependent test targets, PLUS every declared
+  tree-wide pin — the database-free source scans every scoped gate runs,
+  which were 19 of 61 failed W41 car gates (2f0c722a). Warm leaf edits reuse
   cached dependents; a core-type edit pays for the workspace check that
   catches literals in other crates (4669e9d7, design caa2acc9). Neither is
   a gate, and both say so: the build and the suites

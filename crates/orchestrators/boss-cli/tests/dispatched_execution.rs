@@ -65,6 +65,12 @@ impl World {
     }
     async fn with_admission(mode: &'static str) -> Self {
         let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("fixture-token")).unwrap();
+        std::fs::write(
+            root.path().join("fixture-token/current"),
+            "synthetic-dispatch-fixture",
+        )
+        .unwrap();
         git(root.path(), &["init", "-q"]);
         git(
             root.path(),
@@ -326,7 +332,7 @@ printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":20,"cached_inp
             )
             .env(
                 "BOSS_MACHINE_TOKEN_DIR",
-                self.root.path().join("empty-token"),
+                self.root.path().join("fixture-token"),
             )
             .kill_on_drop(true)
             .stdin(Stdio::null())
@@ -369,7 +375,7 @@ printf '%s\n' '{{"type":"result","status":"success","stats":{{}}}}'
         .env("PATH", world.root.path().join("bin"))
         .env(
             "BOSS_MACHINE_TOKEN_DIR",
-            world.root.path().join("empty-token"),
+            world.root.path().join("fixture-token"),
         )
         .stdin(Stdio::null())
         .output()

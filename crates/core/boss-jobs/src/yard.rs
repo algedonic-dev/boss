@@ -2259,6 +2259,9 @@ pub const QUEUED_AT: &str = "queued_at";
 /// and reading that as "queued" would hide a genuinely running gate from
 /// the bays.
 pub(crate) fn queued_for_a_slot(g: &Job) -> bool {
+    if crate::gate_reservation::durable_presence(&g.metadata) {
+        return crate::gate_reservation::waiting_for_native(&g.metadata);
+    }
     meta_str(&g.metadata, QUEUED_AT).is_some_and(|s| !s.is_empty())
 }
 
@@ -2283,10 +2286,13 @@ pub const GATE_MAX_ACTIVE_HOURS: i64 = 3;
 pub struct QueuedGate {
     pub branch: String,
     pub packet_id: String,
+    /// Supervisor copied only from the original qualified acceptance.
+    #[serde(default)]
+    pub next_owner: Option<String>,
     /// The [`QUEUED_AT`] stamp — when the place in line was taken, which
     /// is also the ordering key.
     pub queued_at: String,
-    /// Place in line: 1-based, oldest `queued_at` first.
+    /// Place in line: 1-based; zero states that original order is unknown.
     pub position: i32,
     /// How long it has waited so far, in seconds. `None` without a clock
     /// or with a stamp that does not parse — absence is not evidence.
@@ -2425,22 +2431,40 @@ fn queued_gates(
     active: &[ActiveGate],
     capacity: i32,
     now: Option<chrono::DateTime<chrono::Utc>>,
+    acceptances: &[crate::conditional_metadata::Receipt],
 ) -> (Vec<QueuedGate>, Option<i64>) {
-    let mut waiting: Vec<((&str, &str), &Job)> = gate_runs
+    let mut waiting: Vec<(String, String, &Job, bool)> = gate_runs
         .iter()
-        .filter(|(g, _)| g.status == JobStatus::Open)
-        .filter(|(_, steps)| gate_run_verdict(steps).is_none())
+        .filter(|(g, steps)| g.status == JobStatus::Open && gate_run_verdict(steps).is_none())
         .filter(|(g, _)| queued_for_a_slot(g))
         .filter_map(|(g, _)| {
-            let stamp = meta_str(&g.metadata, QUEUED_AT).filter(|s| !s.is_empty())?;
-            let branch = meta_str(&g.metadata, "branch").filter(|b| !b.is_empty())?;
-            // The stamp is a whole-second `Z` instant, so string order is
-            // time order — the same reading `active` sorts by; the branch
-            // breaks a tie so the order is total across polls.
-            Some(((stamp, branch), g))
+            if crate::gate_reservation::durable_presence(&g.metadata) {
+                let receipt = acceptances
+                    .iter()
+                    .find(|r| r.job_id == g.id)
+                    .filter(|r| crate::gate_reservation::acceptance(g, r).is_ok());
+                let stamp = receipt
+                    .map(|r| {
+                        r.applied_at
+                            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                    })
+                    .unwrap_or_default();
+                Some((stamp, g.id.to_string(), g, true))
+            } else {
+                let stamp = meta_str(&g.metadata, QUEUED_AT).filter(|s| !s.is_empty())?;
+                let branch = meta_str(&g.metadata, "branch").filter(|s| !s.is_empty())?;
+                Some((stamp.to_owned(), branch.to_owned(), g, false))
+            }
         })
         .collect();
-    waiting.sort_by_key(|(key, _)| *key);
+    waiting.sort_by(|a, b| {
+        a.3.cmp(&b.3)
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    let unknown_order = waiting
+        .iter()
+        .any(|(stamp, _, _, resident)| *resident && stamp.is_empty());
     let typical = typical_gate_seconds(gate_runs);
     let waits = match (now, typical) {
         (Some(n), Some(t)) => estimated_waits(active, capacity, waiting.len(), t, n),
@@ -2449,19 +2473,33 @@ fn queued_gates(
     let queued = waiting
         .iter()
         .enumerate()
-        .map(|(i, (_, g))| {
-            let stamp = meta_str(&g.metadata, QUEUED_AT).unwrap_or_default();
+        .map(|(i, (stamp, _, g, resident))| {
+            let source = crate::gate_reservation::source_metadata(&g.metadata).ok();
             QueuedGate {
-                branch: meta_str(&g.metadata, "branch")
-                    .unwrap_or_default()
+                branch: source
+                    .and_then(|md| meta_str(md, "branch"))
+                    .unwrap_or("unreadable resident request")
                     .to_string(),
                 packet_id: g.id.to_string(),
+                next_owner: acceptances
+                    .iter()
+                    .find(|r| r.job_id == g.id)
+                    .and_then(|r| crate::gate_reservation::acceptance(g, r).ok())
+                    .map(|s| s.supervisor),
                 queued_at: stamp.to_string(),
-                position: i32::try_from(i + 1).unwrap_or(i32::MAX),
+                position: if *resident && unknown_order {
+                    0
+                } else {
+                    i32::try_from(i + 1).unwrap_or(i32::MAX)
+                },
                 waiting_seconds: now
                     .zip(parse_instant(stamp))
                     .map(|(n, t)| (n - t).num_seconds()),
-                estimated_wait_seconds: waits.get(i).copied(),
+                estimated_wait_seconds: if *resident && unknown_order {
+                    None
+                } else {
+                    waits.get(i).copied()
+                },
                 train: train_of_gate(g),
             }
         })
@@ -2552,6 +2590,15 @@ pub fn gates(
     capacity: i32,
     now: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Gates {
+    gates_with_acceptances(gate_runs, capacity, now, &[])
+}
+
+pub fn gates_with_acceptances(
+    gate_runs: &[(Job, Vec<Step>)],
+    capacity: i32,
+    now: Option<chrono::DateTime<chrono::Utc>>,
+    acceptances: &[crate::conditional_metadata::Receipt],
+) -> Gates {
     // Past this instant a run has outlived the Job meant to be running it.
     let dead_before = now.map(|n| n - chrono::Duration::hours(GATE_MAX_ACTIVE_HOURS));
     // The measured median RUNNING time, which every bay is judged
@@ -2601,7 +2648,7 @@ pub fn gates(
     active.sort_by(|a, b| a.since.cmp(&b.since).then_with(|| a.branch.cmp(&b.branch)));
     // The line waiting for one of those slots, and the measured gate
     // duration every estimate in it is derived from.
-    let (queued, typical_seconds) = queued_gates(gate_runs, &active, capacity, now);
+    let (queued, typical_seconds) = queued_gates(gate_runs, &active, capacity, now, acceptances);
     Gates {
         capacity,
         active,
@@ -2751,7 +2798,10 @@ fn unsettled_latest<'a>(
         // renders on the train card and strikes the cars aboard. It is
         // no car awaiting rework (garage) and no car nobody judged
         // (limbo) — the held lane makes the same exclusion for a green.
-        if crate::stranded::is_train_gate(&g.metadata) {
+        // Main's full gate is main's verdict the same way (77596188).
+        if crate::stranded::is_train_gate(&g.metadata)
+            || crate::full_gate_on_main::is_main_gate(&g.metadata)
+        {
             continue;
         }
         // A WITHDRAWN run was stood down before any pod existed (backlog
@@ -2771,6 +2821,17 @@ fn unsettled_latest<'a>(
     }
     latest
         .into_iter()
+        // A branch whose LATEST run was retired as superseded — another
+        // branch carrying the same work landed, verified by `boss gate
+        // --retire` (backlog c9c48222) — awaits nothing, exactly as a
+        // settled car's branch does. Judged on the latest run, not
+        // skipped like a withdrawal: the retirement is about the
+        // branch's work, so the red before it must not resurface, while
+        // a newer run on the name is a fresh word and is read as one.
+        // 14 of 17 reds in the garage on 2026-10-17 were this.
+        .filter(|(_, (g, _))| {
+            crate::stranded::marked(&g.metadata, crate::car_retire::SUPERSEDED_BY).is_none()
+        })
         .map(|(branch, (g, steps))| (branch, g, steps))
         .collect()
 }
@@ -2892,6 +2953,8 @@ pub fn conductor_withheld(expected_every_minutes: Option<i64>) -> ConductorHealt
 /// rows and calls this.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct YardStatus {
+    #[serde(default)]
+    pub gate_queue_supervision: Value,
     /// Open pr-trains, each with where it sits and (if stuck) why.
     pub trains: Vec<TrainStatus>,
     /// Parked cars ready to board.
@@ -3017,6 +3080,8 @@ pub struct YardInputs<'a> {
     /// Recent gate-runs with their steps — the stranded/held/garage/limbo
     /// lanes, and the gate slots.
     pub gate_runs: &'a [(Job, Vec<Step>)],
+    /// Original server receipts; unavailable receipts never become client-time order.
+    pub gate_acceptances: &'a [crate::conditional_metadata::Receipt],
     /// Branches a car claims — the stranded cross-ref.
     pub car_branches: &'a [String],
     /// Branches whose car reached a terminal; the garage drops these,
@@ -3083,6 +3148,7 @@ pub fn build_status_for(
         board_firings,
         policy,
         gate_runs,
+        gate_acceptances,
         car_branches,
         settled_car_branches,
         arrived_trains,
@@ -3164,6 +3230,9 @@ pub fn build_status_for(
         converges,
     );
     YardStatus {
+        gate_queue_supervision: crate::gate_queue_observation::unknown(
+            "resident supervision has not been read",
+        ),
         trains,
         dock,
         boarding,
@@ -3171,7 +3240,7 @@ pub fn build_status_for(
         stranded: stranded_greens(gate_runs, car_branches),
         held: held_greens(gate_runs, car_branches),
         held_cars,
-        gates: gates(gate_runs, capacity, now),
+        gates: gates_with_acceptances(gate_runs, capacity, now, gate_acceptances),
         garage: garage(gate_runs, settled_car_branches),
         limbo: limbo(gate_runs, settled_car_branches),
         policy: policy_thresholds(policy),
@@ -3977,6 +4046,7 @@ mod tests {
             firing_id: "f".into(),
             fired_at: at(at_rfc3339),
             rc,
+            observations: None,
             board_decision: None,
         }
     }
@@ -4026,6 +4096,7 @@ mod tests {
         for refusal in every_refusal() {
             let decision = BoardDecision::from(&refusal);
             let last = LastFiring {
+                observations: None,
                 board_decision: Some(decision.clone()),
                 ..fired("2026-09-28T02:47:55Z", Some(-2))
             };
@@ -4065,6 +4136,7 @@ mod tests {
         use crate::board_decision::BoardDecision;
         let now = Some(at("2026-09-28T02:48:30Z"));
         let boarded = LastFiring {
+            observations: None,
             board_decision: Some(BoardDecision::Boarded { cars: 3 }),
             ..fired("2026-09-28T01:00:00Z", Some(0))
         };
@@ -4097,6 +4169,7 @@ mod tests {
     fn a_cadence_hold_outranks_the_boards_last_refusal() {
         use crate::board_decision::{BoardDecision, NoDeparture};
         let last = LastFiring {
+            observations: None,
             board_decision: Some(BoardDecision::from(&NoDeparture::NothingParked)),
             ..fired("2026-09-28T02:47:55Z", Some(-2))
         };
@@ -5325,7 +5398,9 @@ mod tests {
             skip_reason_file_budget: 200,
             blip_cause_budget: 200,
             ci_host_floor_gb: 10,
+            gate_queue_owner: crate::delivery::legacy_gate_queue_owner(),
             gate_max_concurrent: 3,
+            channels: serde_json::Value::Null,
         };
         let t = policy_thresholds(Some(&policy));
         assert_eq!(t.stall_hours, Some(6));
@@ -6478,6 +6553,26 @@ mod tests {
         );
     }
 
+    /// Main's full gate (backlog 77596188) is main's verdict: a red files
+    /// its own urgent item naming the trains since the last green, and a
+    /// lost one is relaunched by the conductor. Neither is a car `main`
+    /// awaiting rework.
+    #[test]
+    fn a_main_gate_is_no_car_in_the_garage_or_limbo() {
+        let mut red = gate_run_on("main", 3);
+        red.metadata["main_gate"] = json!(true);
+        let mut lost = gate_run_on("main", 2);
+        lost.metadata["main_gate"] = json!(true);
+        let failed = || verdict_step("failed", json!([{"name": "test", "result": "fail"}]));
+        let reds = vec![(red, vec![failed()])];
+        assert!(
+            garage(&reds, &[]).is_empty(),
+            "main's red is main's, not a car's"
+        );
+        let losts = vec![(lost, vec![verdict_step("lost", json!([]))])];
+        assert!(limbo(&losts, &[]).is_empty());
+    }
+
     /// Backlog 8d7d0a2b. A WITHDRAWN run never ran — it was stood down
     /// before any pod existed — so it is no newer word about its branch
     /// than the run before it. Taken as the latest it would draw the
@@ -6514,6 +6609,56 @@ mod tests {
         assert!(
             limbo(&runs, &[]).is_empty(),
             "a withdrawal is not a run nobody judged — it is no run at all"
+        );
+    }
+
+    /// Backlog c9c48222, measured 2026-10-17: 14 of the garage's 17 reds
+    /// were SUPERSEDED — a successor branch carrying the same work had
+    /// landed — and no car ever existed on their names to settle them.
+    /// `boss gate --retire` records the successor on the run as
+    /// `superseded_by`; a branch whose LATEST run carries it awaits
+    /// nothing, in either lane, and an older red of the same name does
+    /// not resurface behind it. A newer run on the name is a fresh word
+    /// and is judged as any other.
+    #[test]
+    fn a_red_retired_as_superseded_leaves_the_garage_and_limbo() {
+        let red = |branch: &str, day: u32| {
+            (
+                gate_run_on(branch, day),
+                vec![verdict_step(
+                    "failed",
+                    json!([{"name": "test", "result": "fail"}]),
+                )],
+            )
+        };
+        let retired = |(mut g, steps): (Job, Vec<Step>)| {
+            g.metadata["superseded_by"] = json!("car 1a2b3c4d (feat/x-2, landed)");
+            (g, steps)
+        };
+        let lost = (
+            gate_run_on("fix/lost", 4),
+            vec![verdict_step("lost", json!([]))],
+        );
+        let runs = vec![
+            red("feat/x", 3),
+            retired(red("feat/x", 4)),
+            retired(red("feat/y", 4)),
+            red("feat/y", 5),
+            red("feat/z", 4),
+            retired(lost),
+        ];
+        assert_eq!(
+            garage(&runs, &[])
+                .iter()
+                .map(|c| c.branch.as_str())
+                .collect::<Vec<_>>(),
+            vec!["feat/y", "feat/z"],
+            "a superseded red awaits nothing, and the red before it stays retired with it; \
+             a newer red on the name is its own word"
+        );
+        assert!(
+            limbo(&runs, &[]).is_empty(),
+            "a never-judged run retired as superseded leaves the gate exit too"
         );
     }
 
@@ -7006,7 +7151,9 @@ mod tests {
             skip_reason_file_budget: 200,
             blip_cause_budget: 200,
             ci_host_floor_gb: 10,
+            gate_queue_owner: crate::delivery::legacy_gate_queue_owner(),
             gate_max_concurrent: 3,
+            channels: serde_json::Value::Null,
         };
 
         let stranded_run = (gate_run("feat/stranded", json!({})), vec![green_step()]);
@@ -7095,7 +7242,9 @@ mod tests {
             skip_reason_file_budget: 200,
             blip_cause_budget: 200,
             ci_host_floor_gb: 10,
+            gate_queue_owner: crate::delivery::legacy_gate_queue_owner(),
             gate_max_concurrent: 4,
+            channels: serde_json::Value::Null,
         };
         let status = build_status(YardInputs {
             policy: Some(&policy),
@@ -7705,5 +7854,210 @@ mod tests {
             "same timings, different consists — the basis must not move; \
              see the measurement above for why car count is not a dimension"
         );
+    }
+}
+
+#[cfg(test)]
+mod resident_queue_tests {
+    use super::*;
+    use serde_json::json;
+    fn accepted(branch: &str, at: &str) -> (Job, crate::conditional_metadata::Receipt) {
+        use crate::{
+            conditional_metadata::{Command, Expected, Receipt},
+            gate_reservation::{LaunchIntent, SUBMISSION, Submission},
+        };
+        let mut row = Job::new(
+            "gate-run",
+            boss_core::job::Subject::new("custom", "fixture"),
+            "Accepted fixture",
+            "agent-test",
+            boss_core::job::Priority::Standard,
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 16).unwrap(),
+        );
+        row.status = JobStatus::Open;
+        row.metadata = json!({"branch":branch,"sha":"0123456789abcdef0123456789abcdef01234567","hold":"Original HOLD","park_summary":"Original park intent"});
+        let command_id = uuid::Uuid::new_v4();
+        let source = Submission {
+            contract_version: 1,
+            command: command_id,
+            submitted_by: "agent-test".into(),
+            supervisor: "automation:train-conductor".into(),
+            intent: LaunchIntent {
+                contract_version: 1,
+                packet: row.id.to_string(),
+                namespace: "fixture".into(),
+                name: "fixture".into(),
+                head: row.metadata["sha"].as_str().unwrap().into(),
+                mode: "full".into(),
+                transition_generation: None,
+                file_id: "retained-request".into(),
+                sha256: "a".repeat(64),
+                size_bytes: 1,
+            },
+            source: row.metadata.as_object().unwrap().clone(),
+        };
+        let encoded = serde_json::to_value(source).unwrap();
+        let command = Command {
+            contract_version: 2,
+            idempotency_key: command_id,
+            expected: std::collections::BTreeMap::from([(
+                SUBMISSION.into(),
+                Expected {
+                    present: false,
+                    value: Value::Null,
+                },
+            )]),
+            patch: serde_json::Map::from_iter([(SUBMISSION.into(), encoded)]),
+            immutable_keys: vec![SUBMISSION.into()],
+            guarded_keys: vec![],
+        };
+        row = command.apply(&row).unwrap();
+        let receipt = Receipt {
+            contract_version: 2,
+            job_id: row.id,
+            actor: "agent-test".into(),
+            command,
+            applied_at: parse_instant(at).unwrap(),
+            event_id: uuid::Uuid::new_v4(),
+            receipt_event_id: Some(uuid::Uuid::new_v4()),
+            job: row.clone(),
+        };
+        (row, receipt)
+    }
+
+    #[test]
+    fn resident_next_owner_is_the_original_receipt_supervisor_or_unknown() {
+        let (mut row, receipt) = accepted("owned", "2026-10-16T10:00:00Z");
+        let read = gates_with_acceptances(
+            &[(row.clone(), vec![])],
+            3,
+            None,
+            std::slice::from_ref(&receipt),
+        );
+        assert_eq!(
+            serde_json::to_value(&read.queued[0]).unwrap()["next_owner"],
+            "automation:train-conductor"
+        );
+        row.metadata["gate_submission"]["supervisor"] = json!("another-actor");
+        let unread = gates_with_acceptances(&[(row, vec![])], 3, None, &[receipt]);
+        assert!(serde_json::to_value(&unread.queued[0]).unwrap()["next_owner"].is_null());
+    }
+
+    #[test]
+    fn resident_order_and_age_use_original_server_receipt_and_refuse_read_skew() {
+        let (mut first, r1) = accepted("first", "2026-10-16T10:00:00.100Z");
+        let (mut second, r2) = accepted("second", "2026-10-16T10:00:00.200Z");
+        first.metadata["queued_at"] = json!("2099-01-01T00:00:00Z");
+        second.metadata["queued_at"] = json!("2000-01-01T00:00:00Z");
+        let rows = vec![(second.clone(), vec![]), (first.clone(), vec![])];
+        let now = parse_instant("2026-10-16T10:01:00.100Z");
+        let receipts = vec![r2.clone(), r1.clone()];
+        let view = gates_with_acceptances(&rows, 3, now, &receipts);
+        assert!(view.active.is_empty());
+        assert_eq!(
+            view.queued
+                .iter()
+                .map(|q| q.branch.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(view.queued[0].waiting_seconds, Some(60));
+        assert_eq!(
+            parse_instant(&view.queued[0].queued_at),
+            Some(r1.applied_at)
+        );
+        assert_eq!(view.queued[0].position, 1);
+        first.workflow_version += 1;
+        let unread =
+            gates_with_acceptances(&[(first, vec![]), (second, vec![])], 3, now, &receipts);
+        assert_eq!(unread.queued.len(), 2);
+        assert!(
+            unread
+                .queued
+                .iter()
+                .all(|q| q.position == 0 && q.estimated_wait_seconds.is_none()),
+            "an unqualified predecessor makes exact order unknown"
+        );
+        assert!(
+            unread
+                .queued
+                .iter()
+                .any(|q| q.waiting_seconds.is_none() && q.queued_at.is_empty())
+        );
+    }
+
+    #[test]
+    fn unbound_native_copy_cannot_move_a_resident_request_into_a_bay() {
+        let (mut row, receipt) = accepted("fixture", "2026-10-16T10:00:00Z");
+        row.metadata["gate_launch_intent"] = json!({"sha256":"unbound"});
+        row.metadata["gate_launch_observation"] = json!({"uid":"copied-uid","request_sha256":"unbound","created_at":"2026-10-16T10:01:00Z"});
+        let view = gates_with_acceptances(
+            &[(row, vec![])],
+            3,
+            parse_instant("2026-10-16T10:02:00Z"),
+            &[receipt],
+        );
+        assert!(
+            view.active.is_empty(),
+            "a raw copied observation is not the protected native fact"
+        );
+        assert_eq!(view.queued.len(), 1);
+    }
+
+    #[test]
+    fn original_park_intent_is_not_reclassified_as_a_deliberate_hold_by_raw_copy_drift() {
+        let (mut row, _) = accepted("fixture", "2026-10-16T10:00:00Z");
+        row.metadata.as_object_mut().unwrap().remove("park_summary");
+        row.metadata["hold"] = json!("Wrong raw HOLD");
+        let green = [json!({"verdict":"green"})];
+        let view = crate::stranded::unparked_green(&row.metadata, green.iter(), |_| false).unwrap();
+        assert!(view.park_intent, "the auto-park original still owes a car");
+        assert_eq!(
+            view.hold, None,
+            "a wrong raw HOLD cannot turn missing promised work into a deliberate brake"
+        );
+    }
+
+    #[test]
+    fn missing_resident_supervision_is_stated_as_unknown() {
+        let value = serde_json::to_value(build_status(YardInputs::default())).unwrap();
+        assert_eq!(
+            value
+                .pointer("/gate_queue_supervision/state")
+                .and_then(Value::as_str),
+            Some("unknown"),
+            "missing subsystem evidence must not read as a healthy idle queue"
+        );
+    }
+
+    #[test]
+    fn unqualified_resident_presence_is_visible_unknown_and_never_a_running_bay() {
+        let mut row = Job::new(
+            "gate-run",
+            boss_core::job::Subject::new("custom", "fixture"),
+            "Queued fixture",
+            "agent-test",
+            boss_core::job::Priority::Standard,
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 16).unwrap(),
+        );
+        row.status = JobStatus::Open;
+        row.metadata = json!({"branch":"fixture","gate_submission":null});
+        let view = gates(&[(row, vec![])], 3, Some(chrono::Utc::now()));
+        assert!(
+            view.active.is_empty(),
+            "an unreadable resident envelope is not evidence of native execution"
+        );
+        assert_eq!(
+            view.queued.len(),
+            1,
+            "the unresolved request must remain visible"
+        );
+        assert_eq!(
+            view.queued[0].position, 0,
+            "missing original acceptance cannot invent order"
+        );
+        assert!(view.queued[0].queued_at.is_empty());
+        assert_eq!(view.queued[0].waiting_seconds, None);
+        assert_eq!(view.queued[0].estimated_wait_seconds, None);
     }
 }

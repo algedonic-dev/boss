@@ -40,7 +40,8 @@
 use boss_testing::{repo_root, scratch_dir, write_exec, write_file};
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const SCRIPT: &str = "infra/forge/trim-build-node.sh";
 const VERB: &str = "infra/ops/verbs/trim-build-node.json";
@@ -71,6 +72,7 @@ while [ $# -gt 0 ]; do
     case "$1" in --kubeconfig=/kc) shift; break ;; esac
     shift
 done
+[ "$1" != create ] || [ -z "${STUB_PRECREATE_DELAY:-}" ] || /bin/sleep "$STUB_PRECREATE_DELAY"
 printf '%s\n' "$*" >> "$STUB_ARGV"
 scenario="${STUB_SCENARIO:-ok}"
 mine=""
@@ -1337,17 +1339,29 @@ fn an_unreadable_log_falls_back_to_the_termination_message_and_says_so() {
 
 #[test]
 fn a_run_killed_mid_wait_still_removes_the_job_it_made() {
-    // The runner's `timeout` sends TERM. With the real `sleep` back on
-    // PATH the script is inside its first poll's sleep when it lands.
+    // 27c23e48: setup can exceed the former three-second cancellation
+    // timer. Cancel at the actual poll wait, independently of setup time.
     let f = Fixture::new("killed");
-    std::fs::remove_file(f.dir.join("bin/sleep")).unwrap();
+    write_exec(
+        &f.dir.join("bin/sleep"),
+        r#"#!/bin/sh
+name=$(cat "$STUB_STATE/mine") || exit 1
+uid=$(jq -er '.metadata.uid' "$STUB_STATE/jobs/$name.json") || exit 1
+[ "$uid" = uid-made-by-this-run ] || exit 1
+printf '%s %s %s\n' "$PPID" "$uid" "$name" > "$STUB_STATE/waiting-next"
+mv "$STUB_STATE/waiting-next" "$STUB_STATE/waiting"
+exec /bin/sleep 1
+"#,
+    );
     let path = format!(
         "{}:{}",
         f.dir.join("bin").display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let o = Command::new("timeout")
-        .arg("3")
+    // A separate watchdog bounds missing readiness and a stuck TERM
+    // cleanup; it never supplies the cancellation being tested.
+    let mut child = Command::new("timeout")
+        .args(["--preserve-status", "--kill-after=2", "30"])
         .arg("bash")
         .arg(repo_root().join(SCRIPT))
         .env("PATH", path)
@@ -1358,16 +1372,61 @@ fn a_run_killed_mid_wait_still_removes_the_job_it_made() {
         .env("STUB_ARGV", f.dir.join("argv"))
         .env("STUB_STATE", f.dir.join("state"))
         .env("STUB_SCENARIO", "never")
-        .output()
-        .expect("timeout runs the script");
+        .env("STUB_PRECREATE_DELAY", "4")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watchdog runs the script");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let witness = loop {
+        if let Ok(witness) = std::fs::read_to_string(f.dir.join("state/waiting")) {
+            break Some(witness);
+        }
+        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Missing readiness still gets TERM and the same bounded cleanup,
+    // before reporting the failed witness rather than stranding a child.
+    let target = witness
+        .as_deref()
+        .and_then(|s| s.split_whitespace().next())
+        .unwrap_or("")
+        .parse::<u32>()
+        .unwrap_or(child.id());
+    let signalled = child.try_wait().unwrap().is_none()
+        && Command::new("kill")
+            .args(["-TERM", &target.to_string()])
+            .status()
+            .expect("send real TERM")
+            .success();
+    let o = child.wait_with_output().expect("watchdog reaps the script");
     let t = text(&o);
-    assert_eq!(code(&o), 124, "{t}");
+    assert!(
+        f.jobs().is_empty(),
+        "child reaped but Job remains: {:?}: {t}",
+        f.jobs()
+    );
+    assert!(witness.is_some(), "never reached the owned Job wait: {t}");
+    assert!(signalled, "TERM failed: {t}");
+    let witness = witness.unwrap();
+    assert!(
+        witness.contains(" uid-made-by-this-run boss-node-trim-manual-"),
+        "{witness}"
+    );
+    assert_eq!(code(&o), 143, "{t}");
     assert_eq!(f.calls_of("create").len(), 1, "{t}");
     assert!(
         t.contains("ending before Job boss-node-trim-manual-"),
         "{t}"
     );
     assert_eq!(f.calls_of("delete").len(), 1, "{t}");
+    let name = witness.split_whitespace().nth(2).unwrap();
+    assert!(
+        f.calls_of("delete")[0].starts_with(&format!("delete job {name} ")),
+        "{t}"
+    );
     assert!(f.jobs().is_empty(), "{:?}", f.jobs());
     assert!(!shows_effect(&t), "{t}");
 }

@@ -1963,6 +1963,17 @@ fn a_measure_run_records_todays_drift_on_the_open_packet() {
     assert_eq!(d["newly_public"], "0", "newly_public: {body}");
     assert_eq!(d["secrets_scan"], "clean", "secrets_scan: {body}");
     assert_eq!(d["has_drift"], "true", "has_drift: {body}");
+    // The measure step's own names (f4bafd6b), so the reading can be
+    // COPIED onto it: the tree counted and the tree scanned, both forge
+    // main. The fixture's mirror is an unrelated history, so its one
+    // commit carries content forge main lacks — foreign, and blocking,
+    // in the words prep-github-publish.sh uses.
+    let forge = run.forge_main();
+    assert_eq!(d["source_sha"], forge.as_str(), "source_sha: {body}");
+    assert_eq!(d["scanned_sha"], forge.as_str(), "scanned_sha: {body}");
+    assert_eq!(d["newly_public_files"], serde_json::json!([]), "{body}");
+    assert_eq!(d["commits_behind_foreign"], "1", "{body}");
+    assert_eq!(d["blocking"], "mirror-has-unmerged-commits", "{body}");
     // The refresh time is the point: a held packet whose measurement
     // carries no instant is last week's number wearing today's date.
     assert!(
@@ -2087,6 +2098,71 @@ fn a_measure_run_with_no_open_packet_writes_nothing() {
     );
 }
 
+/// THE READING THE MEASURE STEP IS LANDED FROM (backlog f4bafd6b). The
+/// mirror holds only our own history and forge main is one commit ahead,
+/// adding a file under infra/forge/: nothing blocks, and the reading
+/// carries the review list WHOLE under the instrument's name — the
+/// region's twenty-line `newly_public_review` is not what the review
+/// step reads.
+#[test]
+fn a_measure_over_our_own_mirror_names_the_tree_and_the_whole_review_list() {
+    if !have_real_jq() {
+        eprintln!("publish_github_pr_sh: SKIPPED — the measure path needs a real jq");
+        return;
+    }
+    let run = Run::new("measure-own-mirror");
+    let forge = run.forge.to_str().unwrap().to_string();
+    git_in(
+        &run.mirror,
+        &["fetch", "-q", &forge, "+refs/heads/main:refs/heads/main"],
+    );
+    let base = run.forge_main();
+    let blob = git_stdin(
+        &run.forge,
+        &["hash-object", "-t", "blob", "-w", "--stdin"],
+        "#!/bin/sh\n",
+    );
+    let file = git_in(&run.forge, &["rev-parse", "refs/heads/main:file"]);
+    let dir = git_stdin(
+        &run.forge,
+        &["mktree"],
+        &format!("100755 blob {blob}\tnew.sh\n"),
+    );
+    let infra = git_stdin(
+        &run.forge,
+        &["mktree"],
+        &format!("040000 tree {dir}\tforge\n"),
+    );
+    let root = git_stdin(
+        &run.forge,
+        &["mktree"],
+        &format!("100644 blob {file}\tfile\n040000 tree {infra}\tinfra\n"),
+    );
+    let next = git_in(
+        &run.forge,
+        &["commit-tree", &root, "-p", &base, "-m", "ahead"],
+    );
+    git_in(&run.forge, &["update-ref", "refs/heads/main", &next]);
+
+    let scan = run.planted_scan(0);
+    let (ok, out) = run.measure(&[("BOSS_SECRETS_SCAN", scan)]);
+    assert!(ok, "--measure refused a complete input set: {out}");
+    let body = run.patched();
+    let d = &body["drift_refresh"];
+    assert_eq!(d["commits_ahead"], "1", "{body}");
+    assert_eq!(d["commits_behind"], "0", "{body}");
+    assert_eq!(d["commits_behind_foreign"], "0", "{body}");
+    assert_eq!(d["blocking"], "", "nothing blocks: {body}");
+    assert_eq!(d["newly_public_sensitive"], "1", "{body}");
+    assert_eq!(
+        d["newly_public_files"],
+        serde_json::json!(["infra/forge/new.sh"]),
+        "{body}"
+    );
+    assert_eq!(d["source_sha"], next.as_str(), "{body}");
+    assert_eq!(d["scanned_sha"], next.as_str(), "{body}");
+}
+
 /// A scan that FINDS something is a finding ON the packet, not a
 /// refusal: the reviewer must see what today's tree would publish. A
 /// scan that cannot RUN is the opposite — no evidence is not a pass —
@@ -2105,6 +2181,15 @@ fn a_secrets_finding_rides_the_annotation_and_an_unrunnable_scan_writes_nothing(
         found.patched()["drift_refresh"]["secrets_scan"],
         "FAILED",
         "the finding did not reach the packet: {out}"
+    );
+    // ...and says so in the blocking note, which the rule landing the
+    // measure step never selects (f4bafd6b): a finding is the agent's.
+    assert!(
+        found.patched()["drift_refresh"]["blocking"]
+            .as_str()
+            .is_some_and(|b| b.contains("secrets-lint-failed")),
+        "{}",
+        found.patched()
     );
 
     let blind = Run::new("measure-noscan");

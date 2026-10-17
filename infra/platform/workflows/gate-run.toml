@@ -26,6 +26,9 @@ label = "Gate run"
 category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
+# New packets may bind these records through the conditional metadata door.
+# Existing packets keep their pin; this declares no native activation.
+metadata_schema = { type = "object", immutable_fields = ["gate_launch_intent", "gate_launch_observation", "gate_orphan_claim", "gate_submission"], guarded_fields = ["gate_launch_attempt"] }
 description = "A full-gate execution as a tracked unit of work. The runner registers the packet at launch, heartbeats while running, and closes it with the receipt - green, failed, or lost (lost is an honest verdict). An OVERDUE open gate-run packet is the alarm: it means the runner died (pod replacement, OOM, node bounce). RELAUNCH PROTOCOL, learned 2026-08-22/23: the chain script lives on the PVC at /work/gate-out-launcher.sh and is resumable (each gate skips itself if its receipt exists in /work/gate-out/); on any overdue packet, re-exec it in a fresh tmux session, PATCH a relaunch_note onto the packet, and bump due_on. Receipts on the PVC, never /scratch. Throttle: CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=2 nice 10 under the container's 8/16Gi bounds."
 metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
@@ -39,6 +42,11 @@ metadata_defaults = { trigger_kind = "operator", trigger_name = "gate-runner-reg
 [[workflow.step]]
 title = "record-verdict"
 kind = "gate-verdict"
+# A protocol bound, recorded on future pinned versions and read from
+# that version by the station judge. Three hours is the selected receipt
+# deadline; the runner independently enforces the same execution limit.
+# Older packets with no recorded bound remain unqualified.
+duration_hours = 3.0
 ready_when = "steps.launched.done"
 title_template = "Record the receipt"
 metadata_defaults = { heartbeat_at = "" }

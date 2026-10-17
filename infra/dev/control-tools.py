@@ -47,6 +47,15 @@ def observed_generation(generation):
 
 
 def tool_plan(generation, tool, args, inherited):
+    # A recorded probe's own writer supplies this channel even when it
+    # cannot open a log. Refuse before clearing inherited markers or
+    # selecting the credential-bearing session door (ca356c79).
+    if tool in ("boss", "boss-api") and (
+        "BOSS_PROBE_NOTFOUND" in inherited
+        or inherited.get("BOSS_SOR_USER")
+        or inherited.get("BOSS_SOR_DOOR")
+    ):
+        raise ValueError("recorded probe context must read through boss-sor-read, never this session door")
     # No loader hooks, provider tokens, mutable executable directories,
     # npm settings, git settings or worker environment are inherited.
     env = {"HOME": "/work/home", "PATH": "/usr/bin:/bin"}
@@ -81,6 +90,13 @@ def tool_plan(generation, tool, args, inherited):
         raise ValueError("published system-of-record hosts are missing")
     env["BOSS_MACHINE_TOKEN_HOSTS"] = ",".join(hosts)
     env.setdefault("BOSS_JOBS_URL", (data / "sor-url").read_text().strip())
+    # Backlog 63d59f45: the CLI runs `kubectl` by name (gate launch,
+    # withdraw, gate-Job reads), and the pod's own copy is in the
+    # group-writable /work/tools/bin. The one PATH entry added is this
+    # generation's bin/: owned, hash-checked by observed_generation on
+    # every call, and holding only the two published binaries — the
+    # same kubectl dev-build.py runs by absolute path. Nothing inherited.
+    env["PATH"] = str(generation / "bin") + ":" + env["PATH"]
     return [str(generation / "bin/boss"), *args], env
 
 

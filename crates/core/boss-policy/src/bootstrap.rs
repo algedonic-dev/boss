@@ -24,7 +24,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use boss_core::machine_token::BlockingClient;
+use boss_core::machine_token::{BlockingHttp, BlockingHttpRequest};
 use boss_core::publish::{FieldChange, KeptRow, UpdatedRow};
 use boss_policy_client::PolicyRule;
 use serde_json::{Value, json};
@@ -105,7 +105,7 @@ pub fn rule_changes(live: &Value, declared: &PolicyRule) -> Vec<FieldChange> {
 /// body field it filled was how any caller signed any name). Hard-fails
 /// on any non-2xx response.
 ///
-/// `client` is the caller's [`BlockingClient`], which stamps the estate
+/// `client` is the caller's [`BlockingHttp`], which stamps the estate
 /// machine token on every request and follows no redirect (design
 /// 6805c764 car 2, the blocking-senders slice, 2026-09-29): until then
 /// this walk built a plain client and sent every policy write with no
@@ -113,7 +113,7 @@ pub fn rule_changes(live: &Value, declared: &PolicyRule) -> Vec<FieldChange> {
 /// seed. A test hands it a fixed source, never the process's live one
 /// (backlog 2ee29275, F2).
 pub fn publish_policy_rules(
-    client: &BlockingClient,
+    client: &impl BlockingHttp,
     api_base: &str,
     seeds: &Path,
     force: bool,

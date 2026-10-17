@@ -101,6 +101,8 @@ impl Forge {
         for f in [
             "infra/forge/cluster-deploy-lib.sh",
             "infra/forge/cluster-deploy-runner.sh",
+            "infra/forge/delivery-stage.sh",
+            "infra/estate/cli-compatible.sh",
             "infra/forge/forge-defaults.sh",
             "infra/forge/forge-repo-path.sh",
             "infra/forge/root-tree.sh",
@@ -281,6 +283,7 @@ impl Forge {
             .env("HOME", self.root.join("home-is-not-read"))
             .env("STUB_LOG", &self.log)
             .env("BOSS_ROOT_TREE", self.root.join("tree"))
+            .env("BOSS_CLI_STORE", self.root.join("image-cli"))
             .env("BOSS_ROOT_TREE_SOURCE", &self.bare)
             .env("ROOT_TREE_SOURCE_RUNAS", "")
             .env("BOSS_FORGE_CONVERGE_STATE", self.state())

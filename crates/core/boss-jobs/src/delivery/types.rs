@@ -42,11 +42,34 @@ pub struct DeliveryPolicyRow {
     /// GB of free disk the CI host's latest host-scope estate
     /// observation must show before boarding assembles a consist.
     pub ci_host_floor_gb: i32,
+    /// Staged ownership cutover. Publishing resident is an explicit
+    /// rollout act after compatible writers and legacy drain are proved.
+    #[serde(default = "legacy_gate_queue_owner")]
+    pub gate_queue_owner: String,
     /// How many gates `boss gate` admits at once before it refuses.
     /// Read by the gate CLI (the number it enforces) AND by the yard
     /// status surface (the number it draws as slots) — one source, so
     /// the capacity a page shows is the capacity the pipeline obeys.
     pub gate_max_concurrent: i32,
+    /// Optional lighter-delivery eligibility and evidence contract. Old policy
+    /// versions have no such contract and retain image delivery. Consumers
+    /// refuse malformed channel data to that same heavier route.
+    #[serde(default)]
+    pub channels: serde_json::Value,
+}
+
+pub fn legacy_gate_queue_owner() -> String {
+    "legacy".into()
+}
+
+pub fn resident_gate_queue(raw: &str) -> Result<bool, String> {
+    match raw {
+        "legacy" => Ok(false),
+        "resident" => Ok(true),
+        _ => Err(format!(
+            "gate_queue_owner must name legacy or resident, got {raw}"
+        )),
+    }
 }
 
 impl DeliveryPolicyRow {
@@ -82,6 +105,7 @@ impl DeliveryPolicyRow {
 /// to the live table BOTH ways. This is the registry's judgement only:
 /// the conductor still parses what it reads (the module's `types` doc).
 pub fn check_policy(row: &DeliveryPolicyRow) -> Result<(), String> {
+    resident_gate_queue(&row.gate_queue_owner)?;
     match row.budgets().into_iter().find(|(_, v)| *v <= 0) {
         Some((column, v)) => Err(format!(
             "delivery policy {}@{}: {column} must be above 0, got {v}",

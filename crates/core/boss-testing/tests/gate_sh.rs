@@ -201,6 +201,56 @@ fn the_forge_workflow_carries_no_second_definition_of_the_gate() {
     }
 }
 
+/// The forge's `web` job runs only what the train's gate may skip on
+/// the same assembled tree (backlog 81ee98b3).
+///
+/// The conductor gates every train branch with `--auto`
+/// (train/conductor.rs `render_job(.., "--auto")`) and merges no train
+/// without that verdict (`BOSS_TRAIN_GATE_REQUIRED=1`). In `--auto`,
+/// gate.sh runs `svelte-check` on every tree — a top-level `check`, no
+/// condition around it — so a `bun run typecheck` in the workflow is the
+/// same check run twice, serially, after the image build. The rest of
+/// the web phase (web-kit unit, unit, build, mocked) sits behind
+/// `web_touched`, which reads only apps/web, apps/simulator and
+/// libs/web-kit while the specs also read files from infra/step-plugins,
+/// infra/estate, infra/postgres, examples/ and docs/: a train that changes
+/// only those is judged by the forge's run of them and by nothing else. So
+/// those STAY, and this pin holds both halves — drop one from the
+/// workflow while the gate still scopes it, and this goes red.
+#[test]
+fn the_forge_web_job_runs_only_what_the_train_gate_may_skip() {
+    let ci = forge_workflow();
+    let gate = read("infra/gate.sh");
+    assert!(
+        gate.lines()
+            .any(|l| l.starts_with("check \"svelte-check\"")),
+        "infra/gate.sh no longer runs svelte-check unconditionally — the forge's web job \
+         dropped its typecheck because the train's --auto gate always ran it (81ee98b3); \
+         put the typecheck back in .forgejo/workflows/ci.yml or the check back at top level"
+    );
+    assert!(
+        !ci.contains("run: bun run typecheck"),
+        ".forgejo/workflows/ci.yml runs `bun run typecheck` again — the train's gate runs \
+         svelte-check on the identical tree on every train, so this is a serial duplicate"
+    );
+    assert!(
+        gate.contains("if [ \"$AUTO\" -eq 0 ] || [ \"$(web_touched)\" = \"yes\" ]; then"),
+        "gate.sh's web phase is no longer scoped by web_touched in --auto — if the train's \
+         gate now runs it on every tree, the forge's web job is a duplicate and can go"
+    );
+    for kept in [
+        "run: bun run test:unit",
+        "run: bun run build",
+        "run: bun run test:mocked",
+    ] {
+        assert!(
+            ci.contains(kept),
+            ".forgejo/workflows/ci.yml lost `{kept}` — the train's --auto gate skips the web \
+             phase on a train that touches no web path, so the forge's run is the only one"
+        );
+    }
+}
+
 #[test]
 fn gate_script_covers_the_checks() {
     let gate = read("infra/gate.sh");
@@ -1434,6 +1484,53 @@ fn a_doc_a_test_module_reads_by_repo_path_scopes_the_crate_that_pins_it() {
     assert!(
         stdout.contains("--auto scoping to"),
         "the gate must say it scoped for {doc}, not fall to lints-only.\nstdout: {stdout}"
+    );
+}
+
+/// A document's declared tree-wide readers already run in every scoped
+/// gate. Selecting their entire crate repeats hundreds of unrelated
+/// script tests (urgent271a2f6e measured34 minutes for a record fold).
+#[test]
+fn a_document_read_only_by_tree_wide_pins_does_not_select_the_whole_crate() {
+    let reader = read("crates/core/boss-testing/tests/the_vsm_mapping_outlives_its_code.rs");
+    let doc = reader
+        .split("repo_root().join(\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .find(|p| p.starts_with("docs/"))
+        .expect("the mapping pin reads its decision record");
+    let (stdout, receipt) = auto_scope_of("gate-scope-doc-tree-wide-readers", &[doc]);
+    assert!(
+        !scope_of(&receipt).iter().any(|c| c == "boss-testing"),
+        "tree-wide document readers must remain checked without selecting all boss-testing: {stdout}"
+    );
+    for pin in [
+        "the_vsm_mapping_outlives_its_code",
+        "a_retired_crate_is_superseded_not_dead",
+    ] {
+        let source = read(&format!("crates/core/boss-testing/tests/{pin}.rs"));
+        assert!(
+            source
+                .lines()
+                .any(|line| line.starts_with("//! tree-wide pin —")),
+            "{pin} must remain an actual declared tree-wide target"
+        );
+    }
+}
+
+#[test]
+fn file_input_scope_keeps_non_global_readers_and_does_not_duplicate_global_targets() {
+    let root = repo_root();
+    let out = std::process::Command::new("python3")
+        .arg(root.join("infra/tests/gate-input-scope-test.py"))
+        .current_dir(root)
+        .output()
+        .expect("run hermetic controls against the gate's actual scanner");
+    assert!(
+        out.status.success(),
+        "input scanner controls failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

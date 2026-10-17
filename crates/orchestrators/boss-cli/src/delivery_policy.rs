@@ -186,9 +186,13 @@ pub(crate) struct DeliveryPolicy {
     pub(crate) skip_reason_file_budget: usize,
     pub(crate) blip_cause_budget: usize,
     pub(crate) ci_host_floor_gb: i64,
+    pub(crate) gate_queue_resident: bool,
     /// The concurrency bound `boss gate` enforces. Read here so the
     /// number the CLI obeys and the number the yard draws are one.
     pub(crate) gate_max_concurrent: i64,
+    /// A registry version may authorize a lighter evidence path. Fallbacks
+    /// deliberately carry no such authority.
+    pub(crate) channels: Value,
 }
 
 impl DeliveryPolicy {
@@ -204,7 +208,9 @@ impl DeliveryPolicy {
             skip_reason_file_budget: COMPILED_SKIP_REASON_FILE_BUDGET,
             blip_cause_budget: COMPILED_BLIP_CAUSE_BUDGET,
             ci_host_floor_gb: COMPILED_CI_HOST_FLOOR_GB,
+            gate_queue_resident: false,
             gate_max_concurrent: COMPILED_GATE_MAX_CONCURRENT,
+            channels: Value::Null,
         }
     }
 
@@ -248,7 +254,10 @@ pub(crate) fn parse(row: DeliveryPolicyRow) -> Result<DeliveryPolicy> {
         )?,
         blip_cause_budget: positive_usize("blip_cause_budget", row.blip_cause_budget)?,
         ci_host_floor_gb: positive_i64("ci_host_floor_gb", row.ci_host_floor_gb)?,
+        gate_queue_resident: boss_jobs::delivery::resident_gate_queue(&row.gate_queue_owner)
+            .map_err(anyhow::Error::msg)?,
         gate_max_concurrent: positive_i64("gate_max_concurrent", row.gate_max_concurrent)?,
+        channels: row.channels,
     })
 }
 
@@ -374,8 +383,21 @@ mod tests {
             skip_reason_file_budget: 50,
             blip_cause_budget: 40,
             ci_host_floor_gb: 120,
+            gate_queue_owner: boss_jobs::delivery::legacy_gate_queue_owner(),
             gate_max_concurrent: 4,
+            channels: serde_json::Value::Null,
         }
+    }
+
+    #[test]
+    fn unknown_gate_queue_ownership_is_refused() {
+        let mut wire = serde_json::to_value(row()).unwrap();
+        wire["gate_queue_owner"] = serde_json::json!("invented-owner");
+        let raw: DeliveryPolicyRow = serde_json::from_value(wire).unwrap();
+        assert!(
+            parse(raw).is_err(),
+            "an unrecognized queue owner cannot silently select the legacy launcher"
+        );
     }
 
     #[test]
@@ -538,6 +560,7 @@ mod tests {
         assert_eq!(
             DeliveryPolicy {
                 version: NO_VERSION,
+                channels: Value::Null,
                 ..declared
             },
             DeliveryPolicy::compiled(),
@@ -673,6 +696,7 @@ mod db_tests {
         assert_eq!(
             DeliveryPolicy {
                 version: NO_VERSION,
+                channels: Value::Null,
                 ..seeded.clone()
             },
             compiled,

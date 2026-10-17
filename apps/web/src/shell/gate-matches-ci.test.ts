@@ -1,122 +1,173 @@
-// `bun run gate` must run exactly what CI runs.
-//
-// This exists because of a specific, repeated failure: changes passed
-// locally and broke in CI, over and over, and the reason was that the
-// two command sets barely overlapped.
-//
-//   CI ran:        typecheck, build, test:mocked
-//   I ran locally: typecheck, test:unit
-//
-// The only shared step was `typecheck`. So `test:mocked` — the
-// Playwright suite, the only gate that actually renders a page and
-// therefore the only one that catches a runtime crash — never ran
-// before a push. And `test:unit` (195 tests, including every equality
-// test in this directory) never ran in CI, so it was enforced only by
-// whoever remembered to type it.
-//
-// That is two facts living in two places with nothing keeping them in
-// step, which is exactly the shape CLAUDE.md §9a is about. The fix is
-// one command, `bun run gate`, plus this test asserting it covers every
-// `bun run <script>` the workflow invokes.
-//
-// If you add a step to the web job in ci.yml, this fails until `gate`
-// includes it. That is the point.
-
+// c7720abe: a train passes its cluster gate AND forge CI. Comparing the
+// local gate to forge alone rejected removal of a duplicate typecheck.
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
+import { webCoverage } from './web-ci-coverage';
 
-const read = (p: string) => readFileSync(new URL(p, import.meta.url), 'utf8');
-
-/// THE FORGE WORKFLOW, and only it. For a long time this test read the
-/// GitHub workflow — which ran on GitHub Actions against the PUBLIC
-/// MIRROR and gated nothing: the mirror had a `web` job (typecheck,
-/// unit, build, mocked smoke) from 2026-08-08; the forge had none until
-/// 2026-08-16, so the test asserted a property of a workflow nobody's
-/// branch had to satisfy, and the mocked suite went unrun for long
-/// enough that its route-smoke drift test sat red against the `/it/*`
-/// rename. `.forgejo` is what a train must pass before it merges. The
-/// mirror is a backup of source, not CI/CD (design 7b59af2c,
-/// 2026-09-08), and its ci.yml was deleted with that decision.
-const workflows = {
-  forge: read('../../../../.forgejo/workflows/ci.yml'),
+const read = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8');
+const current = {
+  workflow: read('../../../../.forgejo/workflows/ci.yml'),
+  gate: read('../../../../infra/gate.sh'),
+  typecheck: read('../../../../infra/lint/svelte-check.sh'),
+  scripts: (JSON.parse(read('../../package.json')) as { scripts: Record<string, string> }).scripts,
 };
-
-const pkg = JSON.parse(read('../../package.json')) as {
-  scripts: Record<string, string>;
+// Exact Typecheck-step removal from car62e4423/train644e8417.
+const residual = { ...current, workflow: current.workflow.replace(
+  /      - name: Typecheck\n        working-directory: apps\/web\n        run: bun run typecheck\n\n/, '',
+) };
+const removeStep = (workflow: string, name: string) => workflow.replace(
+  new RegExp(`      - name: ${name}\\n[\\s\\S]*?(?=      - name:|\\n  # THE RUST|$)`), '',
+);
+type WorkflowFixture = {
+  defaults?: unknown;
+  jobs: {
+    'delivery-plan': { steps: { id?: string; shell?: unknown }[] };
+    web: { defaults?: unknown; steps: { name?: string; run?: string; shell?: unknown }[] };
+  };
 };
+const fixture = () => Bun.YAML.parse(residual.workflow) as WorkflowFixture;
 
-const scriptsIn = (yml: string) =>
-  new Set(
-    [...yml.matchAll(/run:\s*bun run ([a-z:]+)/g)].map((m) => m[1]!).filter((s) => s !== 'gate'),
-  );
-
-/// Every `bun run <script>` invoked anywhere in the workflow, minus
-/// `gate` itself (CI runs the steps individually so a failure names the
-/// step that broke rather than one opaque red X).
-const ciScripts = new Set([...scriptsIn(workflows.forge)]);
-
-const gate = pkg.scripts['gate'] ?? '';
-const gateScripts = new Set([...gate.matchAll(/bun run ([a-z:]+)/g)].map((m) => m[1]!));
-
-describe('the local gate matches CI', () => {
-  test('gate runs every script CI runs', () => {
-    const missing = [...ciScripts].filter((s) => !gateScripts.has(s)).sort();
-    expect(
-      missing,
-      `CI runs these but \`bun run gate\` does not, so they can only fail after you push: ` +
-        `${missing.join(', ')}`,
-    ).toEqual([]);
-  });
-
-  test('gate runs nothing CI does not', () => {
-    // The other direction matters less but still costs trust: a gate
-    // that runs extra things is a gate people stop running.
-    const extra = [...gateScripts].filter((s) => !ciScripts.has(s)).sort();
-    expect(
-      extra,
-      `\`bun run gate\` runs these but CI does not: ${extra.join(', ')}`,
-    ).toEqual([]);
-  });
-
-  test('every script named actually exists', () => {
-    const unknown = [...gateScripts].filter((s) => !(s in pkg.scripts)).sort();
-    expect(unknown, `gate references undefined scripts: ${unknown.join(', ')}`).toEqual([]);
-  });
-
-  test('the scrape found something, so a green result means something', () => {
-    // Both directions above pass vacuously against two empty sets — a
-    // reformatted workflow or a renamed job would silently disable this.
-    expect(ciScripts.size).toBeGreaterThanOrEqual(4);
-    expect(gateScripts.size).toBeGreaterThanOrEqual(4);
-  });
-});
-
-// The set above answers "can this fail after I push"; this names the
-// scripts the forge must run, so a frontend check cannot quietly drop
-// out of the workflow that gates a train (which is what happened while
-// the mirror's workflow still existed and carried them instead).
-describe('the forge is what gates a train', () => {
-  const forge = scriptsIn(workflows.forge);
-
-  test('the forge runs the frontend suite', () => {
-    // `test:mocked` is the only layer that mounts a page in a browser,
-    // so it is the only one that catches a runtime crash: svelte-check
-    // passes when the *type* is the thing that is wrong, and the unit
-    // suite never mounts a component. Losing it from the forge means
-    // losing crash coverage entirely, which is what happened.
-    for (const script of ['typecheck', 'test:unit', 'build', 'test:mocked']) {
-      expect(
-        forge.has(script),
-        `.forgejo/workflows/ci.yml does not run \`bun run ${script}\` — ` +
-          `the internal forge is what a train must pass, so a frontend check ` +
-          `missing there runs nowhere`,
-      ).toBe(true);
+describe('web coverage across both required train lanes', () => {
+  test('software route coverage requires the exact upstream output and dependency', () => {
+    for (const [before, after] of [
+      ["if: needs.delivery-plan.outputs.route != 'data'", "if: false"],
+      ["if: needs.delivery-plan.outputs.route != 'data'", "if: needs.delivery-plan.outputs.route == 'data'"],
+      ['needs: [delivery-plan, locomotive]', 'needs: [locomotive]'],
+      ['route: ${{ steps.plan.outputs.route }}', 'route: data'],
+      ['id: plan', 'id: other'],
+    ] as const) {
+      expect(residual.workflow).toContain(before);
+      const workflow = before.startsWith('if:')
+        ? residual.workflow.split('  web:\n').map((part, i) => i === 1 ? part.replace(before, after) : part).join('  web:\n')
+        : residual.workflow.replace(before, after);
+      expect(webCoverage({ ...residual, workflow }).length).toBeGreaterThan(0);
+    }
+    for (const [before, after] of [
+      ['  delivery-plan:\n', '  delivery-plan:\n    if: false\n'],
+      ['  delivery-plan:\n', '  delivery-plan:\n    continue-on-error: true\n'],
+      ['        id: plan\n', '        id: plan\n        if: false\n'],
+      ['        id: plan\n', '        id: plan\n        continue-on-error: true\n'],
+      ['        id: plan\n', '        id: plan\n        shell: /usr/bin/true {0}\n'],
+      ['  delivery-plan:\n', '  delivery-plan:\n    defaults: {run: {shell: null}}\n'],
+      ['          cat delivery-plan.json\n', '          cat delivery-plan.json\n          echo route=data >> "$GITHUB_OUTPUT"\n'],
+    ] as const) {
+      expect(webCoverage({ ...residual, workflow: residual.workflow.replace(before, after) }).length).toBeGreaterThan(0);
     }
   });
-
-  test('the scrape found the forge workflow at all', () => {
-    // Guards the test above against passing vacuously if the file moves
-    // or the step syntax changes.
-    expect(forge.size).toBeGreaterThanOrEqual(4);
+  test('current and assembled residual forge shapes cover the local gate', () => {
+    expect(webCoverage(current)).toEqual([]);
+    expect(webCoverage(residual)).toEqual([]);
+  });
+  test('typecheck cannot disappear from both lanes', () => {
+    const gate = residual.gate.replace(/^check "svelte-check".*$/m, '');
+    expect(webCoverage({ ...residual, gate }).join('\n')).toContain('typecheck');
+  });
+  test('AUTO-conditional typecheck does not supply the unconditional check', () => {
+    const gate = residual.gate.replace(/^check "svelte-check".*$/m,
+      (line) => `if [ "$AUTO" -eq 0 ]; then\n${line}\nfi`);
+    expect(webCoverage({ ...residual, gate }).join('\n')).toContain('typecheck');
+  });
+  test('an uncalled function cannot hide the final train check', () => {
+    const gate = residual.gate.replace('web_touched() {', 'uncalled() {\nweb_touched() {') + '\n}\n';
+    expect(webCoverage({ ...residual, gate }).join('\n')).toContain('typecheck');
+  });
+  test('inert typecheck mentions supply nothing', () => {
+    const gate = residual.gate.replace(/^check "svelte-check".*$/m, (line) => `# ${line}`);
+    expect(webCoverage({ ...residual, gate }).join('\n')).toContain('typecheck');
+    const typecheck = residual.typecheck.replace(/^bun run typecheck.*$/m, '# removed');
+    expect(webCoverage({ ...residual, typecheck }).join('\n')).toContain('typecheck');
+  });
+  test('the typecheck carrier must run the check and propagate its failure', () => {
+    const early = residual.typecheck.replace('out="$log_dir/svelte-check.out"', 'exit 0\nout="$log_dir/svelte-check.out"');
+    const conditional = residual.typecheck.replace('out="$log_dir/svelte-check.out"', 'if false; then\nout="$log_dir/svelte-check.out"').replace('rc=$?', 'rc=$?\nfi');
+    const ignored = residual.typecheck.replace('rc=$?', 'rc=0');
+    const uncalled = `uncalled() {\n${residual.typecheck}\n}\n`;
+    const changedArgv = residual.typecheck.replace('bun run typecheck --output machine', 'bun "run typecheck" "--output machine"');
+    for (const typecheck of [early, conditional, ignored, uncalled, changedArgv]) {
+      expect(webCoverage({ ...residual, typecheck }).join('\n')).toContain('typecheck');
+    }
+  });
+  test('the gate dispatcher must execute typecheck and record its failure', () => {
+    const skipped = residual.gate.replace('check() {', 'check() {\n    if [ "$1" = "svelte-check" ]; then return 0; fi');
+    const inertRunner = residual.gate.replace('check_run() {', 'check_run() {\n    return 0');
+    const ignoredFailure = residual.gate.replace('CHECK_STATUS=$?', 'CHECK_STATUS=0');
+    for (const gate of [skipped, inertRunner, ignoredFailure]) {
+      expect(gate).not.toEqual(residual.gate);
+      expect(webCoverage({ ...residual, gate }).join('\n')).toContain('typecheck');
+    }
+  });
+  test('unit steps retain their working-directory identities', () => {
+    for (const [name, identity] of [['Unit tests', 'apps/web:test:unit'], ['web-kit unit tests', 'libs/web-kit:test:unit']]) {
+      expect(webCoverage({ ...residual, workflow: removeStep(residual.workflow, name!) }).join('\n')).toContain(identity!);
+    }
+  });
+  test('build and mocked browser checks stay on the residual lane', () => {
+    for (const name of ['Build', 'Frontend smoke \\(mocked backend\\)']) {
+      expect(webCoverage({ ...residual, workflow: removeStep(residual.workflow, name) }).length).toBeGreaterThan(0);
+    }
+  });
+  test('conditional, wrong-directory, empty and malformed workflow reads refuse', () => {
+    const conditional = residual.workflow.replace('- name: Unit tests', '- name: Unit tests\n        if: false');
+    const elsewhere = residual.workflow.replace(/(- name: Unit tests\n        working-directory:) apps\/web/, '$1 libs/web-kit');
+    for (const workflow of [conditional, elsewhere, '', 'jobs: [']) {
+      expect(webCoverage({ ...residual, workflow }).length).toBeGreaterThan(0);
+    }
+  });
+  test('shell-conditional blocks and tolerated failures do not pay the contract', () => {
+    const shellConditional = residual.workflow.replace(
+      /(- name: Unit tests\n        working-directory: apps\/web\n        run:) bun run test:unit/,
+      '$1 |\n          if false; then\n            bun run test:unit\n          fi',
+    );
+    const toleratedStep = residual.workflow.replace('- name: Unit tests', '- name: Unit tests\n        continue-on-error: true');
+    const toleratedJob = residual.workflow.replace('  web:\n', '  web:\n    continue-on-error: true\n');
+    for (const workflow of [shellConditional, toleratedStep, toleratedJob]) {
+      expect(webCoverage({ ...residual, workflow }).length).toBeGreaterThan(0);
+    }
+  });
+  test('unqualified step and inherited Actions shells supply no coverage', () => {
+    for (const scope of ['step', 'job', 'workflow']) {
+      for (const shell of ['/usr/bin/true {0}', 'bash -c true {0}', 'bash {0}', 'node {0}', '', null]) {
+        const doc = fixture();
+        if (scope === 'step') doc.jobs.web.steps.find((step) => step.name === 'Unit tests')!.shell = shell;
+        else if (scope === 'job') doc.jobs.web.defaults = { run: { shell } };
+        else doc.defaults = { run: { shell } };
+        expect(webCoverage({ ...residual, workflow: Bun.YAML.stringify(doc) }).length).toBeGreaterThan(0);
+      }
+    }
+  });
+  test('effective shell follows qualified step, job and workflow precedence', () => {
+    for (const shell of ['bash', 'sh', 'bash --noprofile --norc -e -o pipefail {0}', 'sh -e {0}']) {
+      const doc = fixture();
+      // The route producer is a separate job. Isolate web-shell precedence
+      // from its interpreter so a true workflow shell cannot kill it too.
+      doc.jobs['delivery-plan'].steps.find((step) => step.id === 'plan')!.shell = 'bash';
+      doc.defaults = { run: { shell } };
+      expect(webCoverage({ ...residual, workflow: Bun.YAML.stringify(doc) })).toEqual([]);
+      doc.defaults = { run: { shell: '/usr/bin/true {0}' } };
+      doc.jobs.web.defaults = { run: { shell } };
+      expect(webCoverage({ ...residual, workflow: Bun.YAML.stringify(doc) })).toEqual([]);
+      doc.jobs.web.defaults = { run: { shell: '/usr/bin/true {0}' } };
+      for (const step of doc.jobs.web.steps) if (step.run) step.shell = shell;
+      expect(webCoverage({ ...residual, workflow: Bun.YAML.stringify(doc) })).toEqual([]);
+    }
+  });
+  test('malformed shell defaults cannot silently become implicit defaults', () => {
+    for (const value of [null, [], 'bash', { run: null }, { run: false }, { run: { shell: null } }]) {
+      for (const scope of ['workflow', 'job']) {
+        const doc = fixture();
+        if (scope === 'workflow') doc.defaults = value;
+        else doc.jobs.web.defaults = value;
+        expect(webCoverage({ ...residual, workflow: Bun.YAML.stringify(doc) }).length).toBeGreaterThan(0);
+      }
+    }
+  });
+  test('both coverage directions and actual script existence remain checked', () => {
+    const scripts = { ...residual.scripts, gate: `${residual.scripts.gate} && bun run missing` };
+    expect(webCoverage({ ...residual, scripts }).join('\n')).toContain('missing');
+    expect(webCoverage({ ...residual, scripts: { ...residual.scripts, gate: '' } }).length).toBeGreaterThan(0);
+    const workflow = residual.workflow.replace('run: bun run build', 'run: bun run build\n      - name: New check\n        working-directory: apps/web\n        run: bun run newly-added');
+    expect(webCoverage({ ...residual, workflow }).join('\n')).toContain('newly-added');
+    const conditional = { ...residual.scripts, gate: `if false; then ${residual.scripts.gate}; fi` };
+    expect(webCoverage({ ...residual, scripts: conditional }).length).toBeGreaterThan(0);
   });
 });

@@ -22,6 +22,7 @@ pub struct InMemoryJobs {
     selection_fixture: bool,
     inner: Mutex<State>,
     recorded: Mutex<Vec<boss_core::event::Event>>,
+    audit_created_at: Mutex<HashMap<uuid::Uuid, DateTime<Utc>>>,
     #[cfg(test)]
     before_step_events: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     refusals: Mutex<Vec<crate::refusals::RecordedRefusal>>,
@@ -32,10 +33,13 @@ pub struct InMemoryJobs {
     /// adapter writes against a table with no active row (backlog
     /// 82448947).
     step_plugins: Option<std::sync::Arc<dyn crate::step_plugins::StepPluginRegistry>>,
+    workflows: Option<std::sync::Arc<dyn crate::registry::WorkflowRegistry>>,
 }
 
 #[derive(Default)]
 struct State {
+    conditional_receipts:
+        HashMap<(String, String, uuid::Uuid), crate::conditional_metadata::Receipt>,
     jobs: HashMap<String, Job>,
     steps: HashMap<String, Step>,
     station_receipts: HashMap<uuid::Uuid, crate::station_claim::SelectionReceipt>,
@@ -694,6 +698,47 @@ impl InMemoryJobs {
         self
     }
 
+    /// Use the append-only registry at the persistence boundary for first
+    /// immutable/guarded bindings, rather than trusting an HTTP pre-read.
+    pub fn with_workflows(
+        mut self,
+        registry: std::sync::Arc<dyn crate::registry::WorkflowRegistry>,
+    ) -> Self {
+        self.workflows = Some(registry);
+        self
+    }
+
+    async fn metadata_declaration(
+        &self,
+        id: &JobId,
+    ) -> Result<Option<(String, i32, serde_json::Value)>, JobsError> {
+        let Some(registry) = self.workflows.as_ref() else {
+            return Ok(None);
+        };
+        let job = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("job state unavailable".into()))?
+            .jobs
+            .get(&job_key(id))
+            .cloned()
+            .ok_or(JobsError::NotFound(*id))?;
+        let spec = registry
+            .get_version(&job.kind, job.workflow_version)
+            .await
+            .map_err(|error| {
+                JobsError::ImmutableMetadata(format!(
+                    "pinned metadata declaration unavailable: {error}"
+                ))
+            })?;
+        if spec.status == crate::registry::WorkflowStatus::Draft {
+            return Err(JobsError::ImmutableMetadata(
+                "draft workflow cannot authorize metadata binding".into(),
+            ));
+        }
+        Ok(Some((job.kind, job.workflow_version, spec.metadata_schema)))
+    }
+
     /// The discard's half of the admission/discard ordering (backlog
     /// ce8b7d66, part 4), called by `InMemoryWorkflows::discard_draft`
     /// while it holds its own rows: under THIS store's lock, count the
@@ -720,6 +765,49 @@ impl InMemoryJobs {
     /// in-memory analogue of the Pg adapter's in-tx recording).
     pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
         self.recorded.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    /// Append an owned audit envelope. Ordinary event recording has no original
+    /// insertion clock and remains unknown; existing events cannot be backfilled.
+    pub fn record_audit_event(
+        &self,
+        event: boss_core::event::Event,
+        created_at: DateTime<Utc>,
+    ) -> Result<(), JobsError> {
+        let mut events = self
+            .recorded
+            .lock()
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let mut instants = self
+            .audit_created_at
+            .lock()
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        if events.iter().any(|recorded| recorded.id == event.id) {
+            return Err(JobsError::Storage("audit event already recorded".into()));
+        }
+        instants.insert(event.id, created_at);
+        events.push(event);
+        Ok(())
+    }
+
+    fn historical_records(&self) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        let events = self
+            .recorded
+            .lock()
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let instants = self
+            .audit_created_at
+            .lock()
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok(events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| crate::move_diagnosis::HistoricalEvent {
+                seq: index as i64 + 1,
+                created_at: instants.get(&event.id).copied(),
+                event: event.clone(),
+            })
+            .collect())
     }
 
     /// Make every later `list_steps` of this packet fail with a
@@ -1253,6 +1341,34 @@ impl JobsRepository for InMemoryJobs {
         job_events: &[boss_core::event::Event],
         step_events: &[boss_core::event::Event],
     ) -> Result<Admission, JobsError> {
+        if let Some(registry) = self.workflows.as_ref() {
+            let spec = registry
+                .get_version(&job.kind, job.workflow_version)
+                .await
+                .map_err(|error| {
+                    JobsError::ImmutableMetadata(format!(
+                        "pinned admission declaration unavailable: {error}"
+                    ))
+                })?;
+            crate::metadata_immutability::validate_protocol(
+                &spec.metadata_schema,
+                &serde_json::json!({}),
+                &job.metadata,
+                None,
+            )
+            .map_err(JobsError::ImmutableMetadata)?;
+        }
+        if [
+            crate::metadata_immutability::KEY,
+            crate::metadata_immutability::GUARDED_KEY,
+        ]
+        .iter()
+        .any(|key| job.metadata.get(key).is_some())
+        {
+            return Err(JobsError::ImmutableMetadata(
+                "first-write bindings are created only by the conditional metadata door".into(),
+            ));
+        }
         // Same refusal as the Pg adapter, before the lock: nothing is
         // written for a graph whose events do not pair with its rows.
         if steps.len() != step_events.len() {
@@ -1362,12 +1478,27 @@ impl JobsRepository for InMemoryJobs {
         _now: chrono::DateTime<chrono::Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
+        let declaration = self.metadata_declaration(&job.id).await?;
         {
             let mut state = self.inner.lock().expect("poisoned");
             let key = job_key(&job.id);
             let Some(existing) = state.jobs.get(&key) else {
                 return Err(JobsError::NotFound(job.id));
             };
+            crate::metadata_immutability::preserve(&existing.metadata, &job.metadata, false)
+                .map_err(JobsError::ImmutableMetadata)?;
+            if let Some((kind, version, schema)) = declaration {
+                if existing.kind != kind || existing.workflow_version != version {
+                    return Err(JobsError::JobChanged { id: job.id });
+                }
+                crate::metadata_immutability::validate_protocol(
+                    &schema,
+                    &existing.metadata,
+                    &job.metadata,
+                    None,
+                )
+                .map_err(JobsError::ImmutableMetadata)?;
+            }
             // A finished packet's status does not move, and a finished
             // row is written only by a writer that read it finished —
             // the Pg adapter's WHERE clause, mirrored (backlogs 570e72bd,
@@ -1400,6 +1531,132 @@ impl JobsRepository for InMemoryJobs {
         Ok(())
     }
 
+    async fn conditional_job_metadata_receipt(
+        &self,
+        id: &JobId,
+        actor: &str,
+        command_id: uuid::Uuid,
+    ) -> Result<Option<crate::conditional_metadata::Receipt>, JobsError> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("conditional state lock poisoned".into()))?;
+        Ok(state
+            .conditional_receipts
+            .get(&(job_key(id), actor.to_owned(), command_id))
+            .cloned())
+    }
+
+    async fn conditional_job_metadata_decision_at(
+        &self,
+        id: &JobId,
+        command: &crate::conditional_metadata::Command,
+        judged_on: Option<&Job>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::conditional_metadata::Outcome, JobsError> {
+        command
+            .validate()
+            .map_err(|e| JobsError::Storage(e.into()))?;
+        let actor = stamp.actor().to_string();
+        if let Some(prior) = self
+            .conditional_job_metadata_receipt(id, &actor, command.idempotency_key)
+            .await?
+        {
+            return if &prior.command == command {
+                Ok(crate::conditional_metadata::Outcome {
+                    receipt: prior,
+                    applied: false,
+                })
+            } else {
+                Err(JobsError::JobChanged { id: *id })
+            };
+        }
+        // Resolve immutable published data before taking the synchronous
+        // lock; compare its exact pin again inside that same state lock.
+        let declaration = if command.immutable_keys.is_empty() && command.guarded_keys.is_empty() {
+            None
+        } else {
+            let registry = self.workflows.as_ref().ok_or_else(|| {
+                JobsError::ImmutableMetadata(
+                    "pinned workflow registry is unavailable for first binding".into(),
+                )
+            })?;
+            let observed = self.get_job(id).await?.ok_or(JobsError::NotFound(*id))?;
+            let spec = registry
+                .get_version(&observed.kind, observed.workflow_version)
+                .await
+                .map_err(|error| {
+                    JobsError::ImmutableMetadata(format!(
+                        "pinned first-binding declaration unavailable: {error}"
+                    ))
+                })?;
+            if spec.status == crate::registry::WorkflowStatus::Draft {
+                return Err(JobsError::ImmutableMetadata(
+                    "draft workflow cannot authorize first binding".into(),
+                ));
+            }
+            Some((
+                observed.kind,
+                observed.workflow_version,
+                spec.metadata_schema,
+            ))
+        };
+        let key = (job_key(id), actor.clone(), command.idempotency_key);
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("conditional state lock poisoned".into()))?;
+        let mut recorded_events = self
+            .recorded
+            .lock()
+            .map_err(|_| JobsError::Storage("conditional event lock poisoned".into()))?;
+        if let Some(prior) = state.conditional_receipts.get(&key) {
+            return if &prior.command == command {
+                Ok(crate::conditional_metadata::Outcome {
+                    receipt: prior.clone(),
+                    applied: false,
+                })
+            } else {
+                Err(JobsError::JobChanged { id: *id })
+            };
+        }
+        let current = state
+            .jobs
+            .get(&job_key(id))
+            .ok_or(JobsError::NotFound(*id))?;
+        if !command.matches(current)
+            || judged_on.is_some_and(|read| {
+                read.status != current.status || read.metadata != current.metadata
+            })
+        {
+            return Err(JobsError::JobChanged { id: *id });
+        }
+        let job = command.apply(current)?;
+        if let Some((kind, version, schema)) = declaration {
+            if current.kind != kind || current.workflow_version != version {
+                return Err(JobsError::JobChanged { id: *id });
+            }
+            crate::metadata_immutability::validate_protocol(
+                &schema,
+                &current.metadata,
+                &job.metadata,
+                Some(command),
+            )
+            .map_err(JobsError::ImmutableMetadata)?;
+        }
+        let (receipt, pair) =
+            crate::conditional_metadata::recorded_pair(stamp, command, job.clone())?;
+        state.jobs.insert(job_key(id), job);
+        state.conditional_receipts.insert(key, receipt.clone());
+        // Keep state exclusion until BOTH events are recorded, matching
+        // the transactional adapter's order under concurrent commands.
+        recorded_events.extend(pair);
+        Ok(crate::conditional_metadata::Outcome {
+            receipt,
+            applied: true,
+        })
+    }
+
     async fn merge_job_metadata_at(
         &self,
         id: &JobId,
@@ -1412,11 +1669,25 @@ impl JobsRepository for InMemoryJobs {
         // JOB_UPDATED event is built from the post-merge row. A merge
         // judged on a read refuses once the row's status or metadata
         // moved (finding B of the review of car 06973644).
+        let declaration = self.metadata_declaration(id).await?;
         let merged = {
             let mut state = self.inner.lock().expect("poisoned");
             let Some(job) = state.jobs.get_mut(&job_key(id)) else {
                 return Err(JobsError::NotFound(*id));
             };
+            crate::metadata_immutability::patch(&job.metadata, patch)
+                .map_err(JobsError::ImmutableMetadata)?;
+            if let Some((kind, version, schema)) = declaration {
+                if job.kind != kind || job.workflow_version != version {
+                    return Err(JobsError::JobChanged { id: *id });
+                }
+                crate::metadata_immutability::validate_protocol_patch(
+                    &schema,
+                    &job.metadata,
+                    patch,
+                )
+                .map_err(JobsError::ImmutableMetadata)?;
+            }
             if let Some(read) = judged_on
                 && (job.status != read.status || job.metadata != read.metadata)
             {
@@ -1452,6 +1723,7 @@ impl JobsRepository for InMemoryJobs {
         stamp: &boss_core::publisher::EventStamp,
         markers: &(dyn for<'j> Fn(&'j Job) -> Vec<boss_core::event::Event> + Send + Sync),
     ) -> Result<Option<Job>, JobsError> {
+        let declaration = self.metadata_declaration(id).await?;
         // Mirror the Pg adapter's one UPDATE: under the lock, only an
         // open row closes, and only the close's own fields move.
         let closed = {
@@ -1467,11 +1739,25 @@ impl JobsRepository for InMemoryJobs {
             if job.status != JobStatus::Open {
                 return Ok(None);
             }
+            crate::metadata_immutability::patch(&job.metadata, owned)
+                .map_err(JobsError::ImmutableMetadata)?;
             let mut md = match &job.metadata {
                 serde_json::Value::Object(m) => m.clone(),
                 _ => serde_json::Map::new(),
             };
             md.extend(owned.iter().map(|(k, v)| (k.clone(), v.clone())));
+            if let Some((kind, version, schema)) = declaration {
+                if job.kind != kind || job.workflow_version != version {
+                    return Err(JobsError::JobChanged { id: *id });
+                }
+                crate::metadata_immutability::validate_protocol(
+                    &schema,
+                    &job.metadata,
+                    &serde_json::Value::Object(md.clone()),
+                    None,
+                )
+                .map_err(JobsError::ImmutableMetadata)?;
+            }
             job.metadata = serde_json::Value::Object(md);
             job.status = JobStatus::Closed;
             job.closed_on = Some(closed_on);
@@ -1740,6 +2026,112 @@ impl JobsRepository for InMemoryJobs {
             .collect())
     }
 
+    async fn historical_events(
+        &self,
+        job_id: &JobId,
+        upto: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        if !(0..=4096).contains(&limit) || upto < 0 {
+            return Err(JobsError::Storage("invalid historical bound".into()));
+        }
+        let want = job_id.to_string();
+        let rows: Vec<_> = self
+            .historical_records()?
+            .into_iter()
+            .filter(|row| {
+                row.seq <= upto
+                    && (row.event.payload.get("job_id").and_then(|v| v.as_str())
+                        == Some(want.as_str())
+                        || row.event.payload.get("id").and_then(|v| v.as_str())
+                            == Some(want.as_str()))
+            })
+            .collect();
+        if limit < 0 || rows.len() as i64 > limit {
+            return Err(JobsError::Storage("historical event bound exceeded".into()));
+        }
+        Ok(rows)
+    }
+
+    async fn move_admission_snapshot(
+        &self,
+        d: &crate::move_diagnosis::Diagnosis,
+    ) -> Result<crate::move_admission::Snapshot, JobsError> {
+        let (run, parent) = crate::move_admission::identities(d).map_err(JobsError::Storage)?;
+        let acquired_at = boss_clock_client::wall_now();
+        let rows = self.historical_records()?;
+        let max = rows.last().map_or(0, |r| r.seq);
+        let slice =
+            |id: uuid::Uuid| -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+                let id = id.to_string();
+                let selected = rows
+                    .iter()
+                    .filter(|r| {
+                        r.seq <= d.original.r#move.cause_seq
+                            && r.event
+                                .payload
+                                .get("job_id")
+                                .or_else(|| r.event.payload.get("id"))
+                                .and_then(|v| v.as_str())
+                                == Some(id.as_str())
+                    })
+                    .take(crate::move_admission::MAX_ROWS + 1)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if selected.len() > crate::move_admission::MAX_ROWS {
+                    return Err(JobsError::Storage("historical event bound exceeded".into()));
+                }
+                Ok(selected)
+            };
+        let native_admissions = rows
+            .iter()
+            .filter(|r| {
+                r.event.source == "jobs"
+                    && r.event.kind == crate::events::JOB_CREATED
+                    && (r.event.payload.get("id").and_then(|v| v.as_str())
+                        == Some(run.to_string().as_str())
+                        || r.event.payload.get("job_id").and_then(|v| v.as_str())
+                            == Some(run.to_string().as_str()))
+            })
+            .take(2)
+            .cloned()
+            .collect();
+        Ok(crate::move_admission::Snapshot {
+            captured_max_seq: max,
+            acquired_at,
+            run: slice(run)?,
+            parent: slice(parent)?,
+            native_admissions,
+        })
+    }
+
+    async fn historical_station_events(
+        &self,
+        name: &str,
+        upto: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        if !(0..=4096).contains(&limit) || upto < 0 {
+            return Err(JobsError::Storage("invalid historical bound".into()));
+        }
+        let rows: Vec<_> = self
+            .historical_records()?
+            .into_iter()
+            .filter(|row| {
+                row.seq <= upto
+                    && row.event.source == "jobs"
+                    && matches!(
+                        row.event.kind.as_str(),
+                        crate::events::STATION_PUBLISHED | crate::events::STATION_RETIRED
+                    )
+                    && row.event.payload.get("name").and_then(|v| v.as_str()) == Some(name)
+            })
+            .collect();
+        if rows.len() as i64 > limit {
+            return Err(JobsError::Storage("historical event bound exceeded".into()));
+        }
+        Ok(rows)
+    }
     async fn events_for_job(
         &self,
         job_id: &JobId,
@@ -1929,6 +2321,13 @@ impl JobsRepository for InMemoryJobs {
             .jobs
             .values()
             .filter(|j| matches_filter(j, filter))
+            .filter(|job| {
+                filter.step_completed_since.is_none_or(|cutoff| {
+                    state.steps.values().any(|step| {
+                        step.job_id == job.id && step.completed_at.is_some_and(|at| at >= cutoff)
+                    })
+                })
+            })
             .collect();
         // Newest first, deterministically. `opened_on` is a DATE, so a
         // busy day is one big tie; break it on the admission instant

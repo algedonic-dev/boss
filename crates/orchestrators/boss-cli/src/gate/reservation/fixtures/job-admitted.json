@@ -1,0 +1,401 @@
+{
+  "apiVersion": "batch/v1",
+  "kind": "Job",
+  "metadata": {
+    "creationTimestamp": "2026-10-16T23:34:15Z",
+    "generation": 1,
+    "labels": {
+      "app": "gate-runner",
+      "boss.dev/branch": "train-20261016-2232",
+      "boss.dev/packet": "f364e3fd-c544-43ae-b972-34290ff3cb97",
+      "boss.dev/verdict-carrier": "pod-log"
+    },
+    "name": "gate-f364e3fdc54443aeb97234290ff3cb97",
+    "namespace": "boss-dev",
+    "resourceVersion": "43537934",
+    "uid": "23249090-b8a7-41b1-a0af-5895cfeb1479"
+  },
+  "spec": {
+    "activeDeadlineSeconds": 10800,
+    "backoffLimit": 0,
+    "completionMode": "NonIndexed",
+    "completions": 1,
+    "manualSelector": false,
+    "parallelism": 1,
+    "podReplacementPolicy": "TerminatingOrFailed",
+    "selector": {
+      "matchLabels": {
+        "batch.kubernetes.io/controller-uid": "23249090-b8a7-41b1-a0af-5895cfeb1479"
+      }
+    },
+    "suspend": false,
+    "template": {
+      "metadata": {
+        "labels": {
+          "app": "gate-runner",
+          "batch.kubernetes.io/controller-uid": "23249090-b8a7-41b1-a0af-5895cfeb1479",
+          "batch.kubernetes.io/job-name": "gate-f364e3fdc54443aeb97234290ff3cb97",
+          "controller-uid": "23249090-b8a7-41b1-a0af-5895cfeb1479",
+          "job-name": "gate-f364e3fdc54443aeb97234290ff3cb97"
+        }
+      },
+      "spec": {
+        "affinity": {
+          "nodeAffinity": {
+            "preferredDuringSchedulingIgnoredDuringExecution": [
+              {
+                "preference": {
+                  "matchExpressions": [
+                    {
+                      "key": "boss.dev/purpose",
+                      "operator": "In",
+                      "values": [
+                        "build"
+                      ]
+                    }
+                  ]
+                },
+                "weight": 100
+              }
+            ],
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+              "nodeSelectorTerms": [
+                {
+                  "matchExpressions": [
+                    {
+                      "key": "node-role.kubernetes.io/control-plane",
+                      "operator": "DoesNotExist"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "automountServiceAccountToken": false,
+        "containers": [
+          {
+            "command": [
+              "bash",
+              "/repo-script/run.sh"
+            ],
+            "env": [
+              {
+                "name": "GATE_BRANCH",
+                "value": "train/20261016-2232"
+              },
+              {
+                "name": "GATE_RUN_JOB_ID",
+                "value": "f364e3fd-c544-43ae-b972-34290ff3cb97"
+              },
+              {
+                "name": "GATE_MODE",
+                "value": "--auto"
+              },
+              {
+                "name": "GATE_VERDICT_CARRIER",
+                "value": "pod-log"
+              },
+              {
+                "name": "BOSS_EDIT_LEVEL_ANSWER",
+                "value": "{\"edit_level\":null,\"manifest\":\"/opt/boss/tenant/seeds/tenant.toml\"}"
+              },
+              {
+                "name": "PLAYWRIGHT_BROWSERS_PATH",
+                "value": "/opt/ms-playwright"
+              },
+              {
+                "name": "BOSS_TEST_POSTGRES_ADMIN_URL",
+                "value": "postgres://<fixture-user>:<fixture-password>@127.0.0.1:5432/postgres"
+              },
+              {
+                "name": "HOME",
+                "value": "/gate-target"
+              },
+              {
+                "name": "POD_NAME",
+                "valueFrom": {
+                  "fieldRef": {
+                    "apiVersion": "v1",
+                    "fieldPath": "metadata.name"
+                  }
+                }
+              },
+              {
+                "name": "POD_UID",
+                "valueFrom": {
+                  "fieldRef": {
+                    "apiVersion": "v1",
+                    "fieldPath": "metadata.uid"
+                  }
+                }
+              },
+              {
+                "name": "NODE_NAME",
+                "valueFrom": {
+                  "fieldRef": {
+                    "apiVersion": "v1",
+                    "fieldPath": "spec.nodeName"
+                  }
+                }
+              },
+              {
+                "name": "NATIVE_JOB_NAME",
+                "valueFrom": {
+                  "fieldRef": {
+                    "apiVersion": "v1",
+                    "fieldPath": "metadata.labels['batch.kubernetes.io/job-name']"
+                  }
+                }
+              },
+              {
+                "name": "NATIVE_JOB_UID",
+                "valueFrom": {
+                  "fieldRef": {
+                    "apiVersion": "v1",
+                    "fieldPath": "metadata.labels['batch.kubernetes.io/controller-uid']"
+                  }
+                }
+              },
+              {
+                "name": "GATE_CPU_REQUEST",
+                "valueFrom": {
+                  "resourceFieldRef": {
+                    "containerName": "gate",
+                    "divisor": "1m",
+                    "resource": "requests.cpu"
+                  }
+                }
+              },
+              {
+                "name": "GATE_CPU_LIMIT",
+                "valueFrom": {
+                  "resourceFieldRef": {
+                    "containerName": "gate",
+                    "divisor": "1m",
+                    "resource": "limits.cpu"
+                  }
+                }
+              },
+              {
+                "name": "GATE_MEMORY_REQUEST",
+                "valueFrom": {
+                  "resourceFieldRef": {
+                    "containerName": "gate",
+                    "divisor": "1",
+                    "resource": "requests.memory"
+                  }
+                }
+              },
+              {
+                "name": "GATE_MEMORY_LIMIT",
+                "valueFrom": {
+                  "resourceFieldRef": {
+                    "containerName": "gate",
+                    "divisor": "1",
+                    "resource": "limits.memory"
+                  }
+                }
+              },
+              {
+                "name": "GATE_DISK",
+                "value": "required"
+              },
+              {
+                "name": "BOSS_GATE_PGDATA",
+                "value": "/gate-pgdata"
+              },
+              {
+                "name": "GATE_SHA",
+                "value": "f98bb27b6f2c09afa61db97508dd8e6a9fb908eb"
+              }
+            ],
+            "image": "registry.example.invalid/david/boss-ci:rust1.96",
+            "imagePullPolicy": "Always",
+            "name": "gate",
+            "resources": {
+              "limits": {
+                "cpu": "20",
+                "memory": "32Gi"
+              },
+              "requests": {
+                "cpu": "4",
+                "ephemeral-storage": "40Gi",
+                "memory": "8Gi"
+              }
+            },
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              },
+              "runAsGroup": 1500,
+              "runAsUser": 65534
+            },
+            "terminationMessagePath": "/dev/termination-log",
+            "terminationMessagePolicy": "File",
+            "volumeMounts": [
+              {
+                "mountPath": "/gate-seed",
+                "name": "gate-disk",
+                "subPath": "seed"
+              },
+              {
+                "mountPath": "/gate-target",
+                "name": "gate-disk",
+                "subPathExpr": "runs/$(POD_NAME)"
+              },
+              {
+                "mountPath": "/gate-runs",
+                "name": "gate-disk",
+                "subPath": "runs"
+              },
+              {
+                "mountPath": "/gate-pgdata",
+                "name": "pgdata",
+                "readOnly": true
+              },
+              {
+                "mountPath": "/repo-script",
+                "name": "run-script"
+              },
+              {
+                "mountPath": "/etc/forge",
+                "name": "forge-token",
+                "readOnly": true
+              }
+            ]
+          }
+        ],
+        "dnsPolicy": "ClusterFirst",
+        "imagePullSecrets": [
+          {
+            "name": "forgejo-registry"
+          }
+        ],
+        "initContainers": [
+          {
+            "args": [
+              "-c",
+              "fsync=off",
+              "-c",
+              "synchronous_commit=off",
+              "-c",
+              "full_page_writes=off"
+            ],
+            "env": [
+              {
+                "name": "POSTGRES_USER",
+                "value": "boss"
+              },
+              {
+                "name": "POSTGRES_PASSWORD",
+                "value": "boss"
+              },
+              {
+                "name": "POSTGRES_DB",
+                "value": "postgres"
+              },
+              {
+                "name": "PGDATA",
+                "value": "/pgdata/data"
+              }
+            ],
+            "image": "registry.example.invalid/david/postgres:16",
+            "imagePullPolicy": "IfNotPresent",
+            "name": "postgres",
+            "resources": {
+              "limits": {
+                "cpu": "2",
+                "memory": "9Gi"
+              },
+              "requests": {
+                "cpu": "250m",
+                "memory": "3Gi"
+              }
+            },
+            "restartPolicy": "Always",
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              },
+              "runAsGroup": 999,
+              "runAsUser": 999
+            },
+            "terminationMessagePath": "/dev/termination-log",
+            "terminationMessagePolicy": "File",
+            "volumeMounts": [
+              {
+                "mountPath": "/pgdata",
+                "name": "pgdata"
+              },
+              {
+                "mountPath": "/dev/shm",
+                "name": "pg-shm"
+              }
+            ]
+          }
+        ],
+        "restartPolicy": "Never",
+        "schedulerName": "default-scheduler",
+        "securityContext": {
+          "fsGroup": 1500,
+          "runAsNonRoot": true,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "terminationGracePeriodSeconds": 30,
+        "volumes": [
+          {
+            "name": "gate-disk",
+            "persistentVolumeClaim": {
+              "claimName": "gate"
+            }
+          },
+          {
+            "emptyDir": {
+              "medium": "Memory",
+              "sizeLimit": "6Gi"
+            },
+            "name": "pgdata"
+          },
+          {
+            "emptyDir": {
+              "medium": "Memory",
+              "sizeLimit": "1Gi"
+            },
+            "name": "pg-shm"
+          },
+          {
+            "configMap": {
+              "defaultMode": 493,
+              "name": "gate-runner-script"
+            },
+            "name": "run-script"
+          },
+          {
+            "name": "forge-token",
+            "secret": {
+              "defaultMode": 256,
+              "secretName": "forge-read"
+            }
+          }
+        ]
+      }
+    },
+    "ttlSecondsAfterFinished": 86400
+  },
+  "status": {
+    "active": 1,
+    "ready": 1,
+    "startTime": "2026-10-16T23:34:15Z",
+    "terminating": 0,
+    "uncountedTerminatedPods": {}
+  }
+}

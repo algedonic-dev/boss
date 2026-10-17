@@ -544,7 +544,7 @@ pub struct Options {
 /// edge and strips inbound `x-boss-*`, so operator tooling has no way
 /// to present itself there (same path `boss queue` takes).
 struct Api {
-    client: boss_core::machine_token::Client,
+    client: crate::machine_http::MachineClient,
     base: String,
     calls: usize,
 }
@@ -573,7 +573,7 @@ impl Api {
 /// borrows the client (the car list, via `crate::sor_client::all_cars_via`) counts
 /// its own pages and adds them to [`Api::calls`].
 async fn get_raw_at(
-    client: &boss_core::machine_token::Client,
+    client: &crate::machine_http::MachineClient,
     base: &str,
     path: &str,
 ) -> Result<(reqwest::StatusCode, Value)> {
@@ -594,7 +594,7 @@ async fn get_raw_at(
 }
 
 async fn get_at(
-    client: &boss_core::machine_token::Client,
+    client: &crate::machine_http::MachineClient,
     base: &str,
     path: &str,
 ) -> Result<Value> {

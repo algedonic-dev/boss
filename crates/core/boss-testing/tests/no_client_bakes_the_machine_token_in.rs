@@ -98,6 +98,11 @@ enum Leaves {
 /// follows no redirect and uses no proxy.
 const SPELLERS: &[(&str, &str, Leaves)] = &[
     (
+        "crates/orchestrators/boss-cli/src/machine_http.rs",
+        "the guarded CLI async and blocking clients finish with proxy and redirect refusal before their final-send credential decision.",
+        Leaves::Finishes("with_authority"),
+    ),
+    (
         "crates/orchestrators/boss-simulator/src/bin/relay_client/mod.rs",
         "the reqwest-0.13 relay carries only its inbound gate's private-constructor \
          VerifiedEstate proof, within the estate host bound, with no process token source. \

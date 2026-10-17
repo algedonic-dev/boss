@@ -16,8 +16,9 @@
 //!
 //! Policy: the packet read scope to read the car and the review run,
 //! then the merge door's `(Update, step)` gate on the write. The `by` on
-//! the record is the request's authenticated caller. A body cannot name
-//! it, and an anonymous request is refused before anything is read.
+//! the record is the request's authenticated caller, in the spelling its
+//! event records ([`release_actor`]). A body cannot name it, and an
+//! anonymous request is refused before anything is read.
 
 use super::*;
 
@@ -133,6 +134,17 @@ pub(super) async fn with_release_decisions<R: JobsRepository + 'static, B: Event
     status
 }
 
+/// The `by` a release records: the actor the merge event will record for
+/// this caller (`User::ambient_actor`), in its text form. A dispatcher
+/// rule's wire id `rule:<name>` is thereby recorded as the automation
+/// `automation:rule:<name>`, as its event is (backlog 0cfc57e6), and the
+/// judge reads it as an automation. Every other id prints back as sent.
+fn release_actor(user: &boss_policy_client::User) -> String {
+    user.ambient_actor()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| user.id.clone())
+}
+
 /// The rule's refusal, as plain text: the CLI prints it after the status
 /// line, and the yard shows it as it came. A JSON body would reach both
 /// with its quotes escaped.
@@ -196,7 +208,8 @@ pub(super) async fn release_car<R: JobsRepository + 'static, B: EventBus + 'stat
     };
     let at = crate::car::stamp(boss_clock_client::wall_now());
     let reader = StoreReader { state: &state };
-    let granted = match car_release::judge(&reader, &car, &run, &ask, &user.id, &at).await {
+    let by = release_actor(&user);
+    let granted = match car_release::judge(&reader, &car, &run, &ask, &by, &at).await {
         Ok(g) => g,
         Err(why) if why.starts_with("boss release:") => return refused(why),
         Err(why) => return refused(format!("boss release: REFUSED — {why}")),
@@ -253,4 +266,31 @@ pub(super) async fn release_car<R: JobsRepository + 'static, B: EventBus + 'stat
         "release": review_md.get(crate::car::RELEASE).cloned().unwrap_or_default(),
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(id: &str) -> boss_policy_client::User {
+        serde_json::from_value(serde_json::json!({"id": id, "role": "platform-admin"}))
+            .expect("a user")
+    }
+
+    /// WHO IS CREDITED (backlog 0cfc57e6). A dispatcher rule calls with
+    /// the wire id `rule:<name>`, and the merge event the release writes
+    /// records it as `automation:rule:<name>` (`User::ambient_actor`).
+    /// The record's `by` is the same actor in the same spelling, so a
+    /// reader of `by` and a reader of the event agree on who released
+    /// the car. A person and an agent are stamped as they always were.
+    #[test]
+    fn the_release_is_stamped_with_the_actor_the_event_records() {
+        assert_eq!(
+            release_actor(&user("rule:release-a-held-car-on-its-reviewer-verdict")),
+            "automation:rule:release-a-held-car-on-its-reviewer-verdict"
+        );
+        for id in ["emp-david", "agent-codex", "automation:rule:x"] {
+            assert_eq!(release_actor(&user(id)), id);
+        }
+    }
 }

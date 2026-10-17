@@ -244,7 +244,7 @@ pub(crate) fn resolve_job_id(candidates: &[Value], given: &str) -> Result<String
 /// a write that cannot land costs a printed line saying what to do by
 /// hand, which is also the warning the builder wanted at park time.
 pub(crate) async fn route_linked_item(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     item_id: &str,
     car_id: &str,
     branch: &str,

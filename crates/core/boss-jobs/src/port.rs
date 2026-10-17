@@ -10,6 +10,8 @@ use serde::Serialize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JobsError {
+    #[error("immutable metadata refused: {0}")]
+    ImmutableMetadata(String),
     #[error("job not found: {0}")]
     NotFound(JobId),
     #[error("step not found: {0}")]
@@ -224,6 +226,11 @@ pub enum Admission {
 /// Optional filters for listing jobs.
 #[derive(Debug, Clone, Default)]
 pub struct JobFilter {
+    /// Absolute inclusive completion frontier over ANY actual step.
+    /// Applied before count and pagination; unrelated to the domain
+    /// clock, admission date, step title/slug or Job close date.
+    /// A missing completion timestamp does not match.
+    pub step_completed_since: Option<chrono::DateTime<chrono::Utc>>,
     pub kind: Option<String>,
     /// Prefix match on `kind`. Used by the UI for nav buckets that
     /// span related registry kinds (e.g. `refurb-used` + `refurb-oem-new`
@@ -1229,6 +1236,46 @@ pub trait JobsRepository: Send + Sync {
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError>;
 
+    /// Atomically test exact key presence/value, apply and retain the
+    /// actor-bound idempotency receipt and full state event. A replay
+    /// returns its ORIGINAL receipt even after the row moves.
+    async fn conditional_job_metadata_at(
+        &self,
+        id: &JobId,
+        command: &crate::conditional_metadata::Command,
+        judged_on: Option<&Job>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::conditional_metadata::Receipt, JobsError> {
+        self.conditional_job_metadata_decision_at(id, command, judged_on, stamp)
+            .await
+            .map(|outcome| outcome.receipt)
+    }
+
+    async fn conditional_job_metadata_receipt(
+        &self,
+        id: &JobId,
+        actor: &str,
+        command_id: uuid::Uuid,
+    ) -> Result<Option<crate::conditional_metadata::Receipt>, JobsError> {
+        let _ = (id, actor, command_id);
+        Err(JobsError::Storage(
+            "conditional metadata receipt lookup is unsupported by this adapter".into(),
+        ))
+    }
+
+    async fn conditional_job_metadata_decision_at(
+        &self,
+        id: &JobId,
+        command: &crate::conditional_metadata::Command,
+        judged_on: Option<&Job>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::conditional_metadata::Outcome, JobsError> {
+        let _ = (id, command, judged_on, stamp);
+        Err(JobsError::Storage(
+            "conditional metadata is unsupported by this adapter".into(),
+        ))
+    }
+
     /// Close the Job, writing ONLY the fields a close owns: `status`
     /// becomes `closed`, `closed_on` is set, and `owned`'s top-level
     /// keys (`closed_at`, and `outcome` when the close names one) merge
@@ -1386,6 +1433,52 @@ pub trait JobsRepository: Send + Sync {
     /// holds, one read from the step. `limit` keeps the NEWEST rows:
     /// a long history answers with its most recent `limit` events in
     /// the order they happened.
+    /// Complete oldest-first immutable history through an exact audit sequence.
+    /// More than the bound is an error, never a truncated proof.
+    async fn historical_events(
+        &self,
+        _job_id: &JobId,
+        _upto: i64,
+        _limit: i64,
+    ) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        Err(JobsError::Storage(
+            "bounded historical events unavailable".into(),
+        ))
+    }
+    /// Original packet/registry/clock histories and current safe policy
+    /// identity census at one native audit cut. No projection fallback.
+    async fn membership_snapshot(
+        &self,
+        _since: DateTime<Utc>,
+        _actor: Option<String>,
+        _scope: &JobScope,
+        _limit: i64,
+    ) -> Result<crate::membership_replay::ReplayInput, JobsError> {
+        Err(JobsError::Storage(
+            "native membership history unavailable".into(),
+        ))
+    }
+    /// One consistent native audit snapshot, identities resolved from an immutable diagnosis.
+    async fn move_admission_snapshot(
+        &self,
+        _diagnosis: &crate::move_diagnosis::Diagnosis,
+    ) -> Result<crate::move_admission::Snapshot, JobsError> {
+        Err(JobsError::Storage(
+            "native admission snapshot unavailable".into(),
+        ))
+    }
+    /// Immutable publications/retirements of ONE station through an audit sequence.
+    async fn historical_station_events(
+        &self,
+        _name: &str,
+        _upto: i64,
+        _limit: i64,
+    ) -> Result<Vec<crate::move_diagnosis::HistoricalEvent>, JobsError> {
+        Err(JobsError::Storage(
+            "historical station publications unavailable".into(),
+        ))
+    }
+
     async fn events_for_job(
         &self,
         job_id: &JobId,

@@ -583,6 +583,33 @@ async fn the_read_answers_every_region_each_with_count_state_and_trend() {
     let receiving = region(&v, "receiving");
     assert_eq!(receiving["count"], Value::Null);
     assert_eq!(receiving["state"], "troubled");
+    // WHO MOVED THE WORK (backlog 9ca41c08) rides every region downstream
+    // of the shop floor as its last measure; with no workflow registry
+    // wired the routes cannot be derived, and it says so rather than
+    // reading as moved by nobody. Upstream regions do not carry it.
+    for name in [
+        "gates", "dock", "track", "shed", "arrivals", "garage", "publish",
+    ] {
+        let last = region(&v, name)["kpi"].as_array().unwrap().last().cloned();
+        let last = last.unwrap_or_else(|| panic!("{name} carries no KPI"));
+        assert_eq!(last["name"], "machine-moved", "{name}: {last}");
+        assert_eq!(last["value"], Value::Null, "{name}: {last}");
+        assert!(
+            last["text"]
+                .as_str()
+                .unwrap()
+                .contains("could not be derived"),
+            "{name}: {last}"
+        );
+    }
+    assert!(
+        !receiving["kpi"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "machine-moved"),
+        "{receiving}"
+    );
 }
 
 /// THE STUCK BLOCK RIDES THE SAME READ (backlog 4142d821, design

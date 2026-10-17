@@ -12,8 +12,9 @@
 // written and none was a bottleneck, they were a bug."* Forming is a
 // rate question, so this module joins depth against
 // `GET /api/stations/flow` — arrivals and departures over a wall-clock
-// window, counted from the log's own `step.ready` / `step.done`
-// transitions — and derives one reading from the pair: how long this
+// window, reconstructed from conserved original packet membership.
+// Departures include nonservice causes; served counts completed work.
+// Legacy step-events remain a separately labelled unit. It derives how long this
 // queue would take to clear at the rate it is actually being worked.
 //
 // NO NUMBER THIS SURFACE MAKES UP. The yard's rule holds upstream. A
@@ -65,8 +66,9 @@ export type StationLoadEnvelope = Readonly<{
 /** What the log could be made to say about one station's flow. */
 export type StationFlowRow = Readonly<{
   station: string;
-  basis: 'step-events' | 'unavailable';
+  basis: 'packet-membership-v1' | 'step-events' | 'unavailable';
   arrived: number | null;
+  departed: number | null;
   served: number | null;
   net: number | null;
   unavailableReason: string | null;
@@ -81,6 +83,8 @@ export type StationFlowEnvelope = Readonly<{
 
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+const count = (v: unknown): number | null =>
+  typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : null;
 
 // The three board reads. Each parse names its own read, because a body
 // that is not the envelope is refused by the shared reader (backlog
@@ -157,14 +161,26 @@ export function parseStationFlow(raw: unknown): StationFlowEnvelope {
   const { body, data } = readEnvelope(FLOW_PATH, raw);
   return {
     rows: data
-      .map((r) => ({
-        station: str(r.station) ?? '',
-        basis: r.basis === 'step-events' ? ('step-events' as const) : ('unavailable' as const),
-        arrived: num(r.arrived),
-        served: num(r.served),
-        net: num(r.net),
-        unavailableReason: str(r.unavailable_reason),
-      }))
+      .map((r): StationFlowRow => {
+        const packet = r.basis === 'packet-membership-v1';
+        const legacy = r.basis === 'step-events';
+        const arrived = count(r.arrived);
+        const served = count(r.served);
+        const departed = packet ? count(r.departed) : legacy ? served : null;
+        const complete =
+          (packet || legacy) && arrived !== null && served !== null && departed !== null &&
+          (!packet || (Array.isArray(r.unknown) && r.unknown.length === 0));
+        return {
+          station: str(r.station) ?? '',
+          basis: complete ? (packet ? 'packet-membership-v1' : 'step-events') : 'unavailable',
+          arrived,
+          departed,
+          served,
+          net: complete ? arrived - departed : null,
+          unavailableReason: str(r.unavailable_reason) ??
+            (complete ? null : 'flow basis, counts or original coverage are incomplete'),
+        };
+      })
       .filter((r) => r.station !== ''),
     windowHours: num(body.window_hours),
     asOf: str(body.as_of),
@@ -177,7 +193,7 @@ export function parseStationFlow(raw: unknown): StationFlowEnvelope {
 
 /** A queue's flow, or the honest reason there is none to show. */
 export type SidingFlow =
-  | { readonly kind: 'counted'; readonly arrived: number; readonly served: number; readonly net: number }
+  | { readonly kind: 'counted'; readonly basis?: 'packet-membership-v1' | 'step-events'; readonly departed?: number; readonly arrived: number; readonly served: number; readonly net: number }
   | { readonly kind: 'unavailable'; readonly reason: string };
 
 export type Siding = Readonly<{
@@ -213,7 +229,7 @@ export function joinSidings(
   const joined: Siding[] = load.map((l) => {
     const f = byStation.get(l.station);
     const counted =
-      f !== undefined && f.basis === 'step-events' && f.arrived !== null && f.served !== null;
+      f !== undefined && f.basis !== 'unavailable' && f.arrived !== null && f.served !== null && f.departed !== null;
     return {
       station: l.station,
       kind: l.kind,
@@ -226,6 +242,8 @@ export function joinSidings(
       flow: counted
         ? {
             kind: 'counted',
+            basis: f!.basis as 'packet-membership-v1' | 'step-events',
+            departed: f!.departed!,
             arrived: f!.arrived!,
             served: f!.served!,
             net: f!.net ?? f!.arrived! - f!.served!,
@@ -333,7 +351,10 @@ export function constraintOf(
   const arrived = worst.flow.kind === 'counted' ? worst.flow.arrived : 0;
   const hours = drainHours(worst.depth, served, windowHours);
   const because =
-    hours === null
+    worst.flow.kind === 'counted' && worst.flow.basis === 'packet-membership-v1'
+      ? `${worst.depth} waiting, ${arrived} arrived, ${worst.flow.departed} departed and ${served} served in the last ${windowHours}h. ` +
+        (hours === null ? 'No completed-work service rate was recorded.' : `${hours.toFixed(0)}h to clear at the recorded service rate.`)
+      : hours === null
       ? `${worst.depth} waiting, ${arrived} arrived and nothing left in the last ` +
         `${windowHours}h — this queue is not draining, so it clears at no rate at all.`
       : `${worst.depth} waiting against ${served} served in the last ${windowHours}h: ` +
@@ -396,6 +417,12 @@ export function whyNotMoving(s: Siding, windowHours: number): string {
       : `${s.depth} waiting; rate not counted — ${s.flow.reason}.`;
   }
   const { arrived, served, net } = s.flow;
+  if (s.flow.basis === 'packet-membership-v1') {
+    const departed = s.flow.departed!;
+    return `${s.depth} waiting; ${arrived} arrived, ${departed} departed, ${served} served in the last ${windowHours}h. ` +
+      (served === 0 ? 'No completed-work service was recorded; departures can have other causes.' :
+        `At that service rate: ${drainHours(s.depth, served, windowHours)?.toFixed(0)}h to clear.`);
+  }
   if (s.depth === 0) {
     return served > 0
       ? `Clear — ${served} served in the last ${windowHours}h.`

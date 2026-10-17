@@ -159,6 +159,15 @@ pub enum Cmd {
         /// Why it must not ride yet. Recorded verbatim; the yard shows it.
         #[arg(long)]
         reason: String,
+        /// Reserve the car's release for this actor (e.g. emp-david):
+        /// written as `releaser` on the review step, where the release
+        /// door's judge reads it. The release rule — which lifts a review
+        /// hold on its dispatched reviewer's RELEASE verdict — is then
+        /// refused, and the car waits for a person, as every held car did
+        /// before the rule (design 393bdef6 Q1, backlog 0cfc57e6). A
+        /// person's release is not refused by it.
+        #[arg(long)]
+        releaser: Option<String>,
     },
     /// Release a held car: the hold comes off its review step and it boards at the next tick.
     ///
@@ -394,7 +403,11 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
             )?;
             fold(&wire, &design, &change, folded_into.as_deref()).await
         }
-        Cmd::Hold { car, reason } => hold(&wire, &car, Some(&reason)).await,
+        Cmd::Hold {
+            car,
+            reason,
+            releaser,
+        } => hold_reserved(&wire, &car, &reason, releaser.as_deref()).await,
         Cmd::Release {
             car,
             diagnosis_file: None,
@@ -938,7 +951,7 @@ pub(crate) fn bare_release_note(review: &Value) -> String {
 /// call, so a test can hand in a named actor and drive the whole
 /// verb against a stub socket without touching the process env.
 pub(crate) struct Wire {
-    http: boss_core::machine_token::Client,
+    http: crate::machine_http::MachineClient,
     base: String,
     caller: Option<identity::Caller>,
 }
@@ -1471,12 +1484,15 @@ pub(crate) async fn fold(
 /// `Some(reason)` holds, `None` releases — one path, because both are
 /// the same one-key write to the review step's merge door (the key set,
 /// or nulled to delete it), and the read-back checks the key the same
-/// way the readers do (`stranded::hold_reason`).
+/// way the readers do (`stranded::hold_reason`). The verb goes through
+/// [`hold_reserved`] since `--releaser` (backlog 0cfc57e6), so this
+/// shorthand is the tests' alone.
+#[cfg(test)]
 pub(crate) async fn hold(wire: &Wire, car: &str, reason: Option<&str>) -> Result<()> {
     hold_as(wire, car, reason, &Releaser::default()).await
 }
 
-/// [`hold`], given from the shell `releaser` describes: a bare release
+/// `hold`, given from the shell `releaser` describes: a bare release
 /// by the car's builder run is refused before the write, the same
 /// refusal the review release makes (`review_verdict::may_release`,
 /// backlog b7b02024 car 3), and a bare release records what it lifted,
@@ -1490,6 +1506,37 @@ pub(crate) async fn hold_as(
     reason: Option<&str>,
     releaser: &Releaser,
 ) -> Result<()> {
+    hold_inner(wire, car, reason, None, releaser).await
+}
+
+/// `boss hold <car> --reason <r> [--releaser <actor>]`: the hold, and
+/// when `reserved_for` names an actor, `releaser` beside it in the same
+/// merge ([`boss_jobs::car::RELEASER`], design 393bdef6 Q1): the release
+/// rule is refused on this car and it waits for a person.
+pub(crate) async fn hold_reserved(
+    wire: &Wire,
+    car: &str,
+    reason: &str,
+    reserved_for: Option<&str>,
+) -> Result<()> {
+    hold_inner(wire, car, Some(reason), reserved_for, &Releaser::default()).await
+}
+
+async fn hold_inner(
+    wire: &Wire,
+    car: &str,
+    reason: Option<&str>,
+    reserved_for: Option<&str>,
+    releaser: &Releaser,
+) -> Result<()> {
+    if let Some(r) = reserved_for
+        && r.trim().is_empty()
+    {
+        bail!(
+            "--releaser is blank — it names the actor id the car's release is reserved for; \
+             leave it out to reserve the release for no one"
+        );
+    }
     if let Some(r) = reason
         && r.trim().is_empty()
     {
@@ -1507,7 +1554,13 @@ pub(crate) async fn hold_as(
     let review_md = review.get("metadata").unwrap_or(&Value::Null);
     let already = boss_jobs::stranded::hold_reason(review_md);
     let patch = match reason {
-        Some(r) => hold_patch(review_md, r),
+        Some(r) => {
+            let mut body = hold_patch(review_md, r);
+            if let Some(who) = reserved_for {
+                body[boss_jobs::car::RELEASER] = json!(who.trim());
+            }
+            body
+        }
         None => {
             if already.is_none() {
                 // A car the conductor holds after red trains carries no
@@ -1567,6 +1620,15 @@ pub(crate) async fn hold_as(
             .get("metadata")
             .unwrap_or(&Value::Null),
     );
+    if let Some(who) = reserved_for.map(str::trim) {
+        let read = boss_jobs::car_release::reserved_for(&after);
+        if read != Some(who) {
+            bail!(
+                "the API answered the write but the review step reads back releaser {read:?}, \
+                 not {who:?} — the reservation did not take"
+            );
+        }
+    }
     match (reason, now) {
         (Some(r), Some(held)) if held == r.trim() => println!(
             "boss hold: {} {branch} \"{}\" — held: {held}\n  it stays at the dock and does not \
@@ -1589,6 +1651,11 @@ pub(crate) async fn hold_as(
         (None, Some(held)) => {
             bail!("the API answered the write but the review step still reads as held: {held:?}")
         }
+    }
+    if let Some(who) = reserved_for.map(str::trim) {
+        println!(
+            "  its release is reserved for {who} (releaser): the release rule leaves it to a person"
+        );
     }
     Ok(())
 }
@@ -3940,6 +4007,41 @@ mod tests {
             s.puts.lock().unwrap().is_empty(),
             "refuse before the first write"
         );
+    }
+
+    #[tokio::test]
+    async fn a_hold_can_reserve_the_cars_release_for_a_person() {
+        // THE OVERRIDE (design 393bdef6 Q1, backlog 0cfc57e6): `boss hold
+        // --releaser emp-david` writes the hold AND the actor the release
+        // is reserved for, in one merge, on the review step the release
+        // door's judge reads; the release rule then leaves the car to him.
+        let s = stub(vec![car("ready", json!({}))]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        hold_reserved(
+            &wire,
+            "fix/held",
+            "David releases this one",
+            Some(" emp-david "),
+        )
+        .await
+        .expect("holds, reserved");
+        assert_eq!(
+            s.puts.lock().unwrap()[0].1,
+            json!({ "hold": "David releases this one", boss_jobs::car::RELEASER: "emp-david" })
+        );
+        let car = s.packets.lock().unwrap()[0].clone();
+        assert_eq!(
+            boss_jobs::car_release::reserved_for(&car),
+            Some("emp-david"),
+            "the judge's reader reads it back"
+        );
+        // A blank releaser names no one, and is refused before any write.
+        assert!(
+            hold_reserved(&wire, "fix/held", "x", Some("  "))
+                .await
+                .is_err()
+        );
+        assert_eq!(s.puts.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

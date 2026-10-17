@@ -109,15 +109,25 @@
 # 1 / cooldown 30 / hold 15 — so v10 is above it. Depth and cooldown are
 # unchanged. The v9 value stays on record in its cadence publish event.
 #
+# VERSION 11 REMOVES THE FIXED COOLDOWN (backlog 613295dc, David,
+# 2026-10-16). Live lineage checked before authoring: v10 active at
+# depth 1 / cooldown 30. A ready car may depart at the next minute tick
+# after the track clears. The conductor lock, current track read,
+# eligible-car checks and deterministic per-minute firing claim remain
+# the guards; this does not reuse a gate receipt or increase gate bays.
+# The historical v7 capacity rationale above remains history, superseded
+# by this explicit throughput decision. Live publication and native
+# departure evidence are separate acceptance steps after source review.
+#
 # To change this rule, bump `version` — and check the LIVE lineage
 # first (`GET /api/cadence/rules/<name>/versions`), not just this file.
 # ---------------------------------------------------------------------------
 
 [[cadence_rule]]
 name = "train-board-on-dock-depth"
-version = 10
+version = 11
 status = "active"
 verb = "board"
 basis = "queue-depth"
 min_dock_depth = 1
-cooldown_minutes = 30
+cooldown_minutes = 0

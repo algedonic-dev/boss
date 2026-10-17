@@ -79,6 +79,96 @@ fn allow_update() -> Arc<dyn PolicyClient> {
     )
 }
 
+#[tokio::test]
+async fn a_conditional_command_commits_one_exact_original_receipt() {
+    let (app, jobs) = build_app(Arc::new(
+        FakePolicyClient::builder()
+            .allow("service-tech", Action::Update, Resource::job(), Scope::All)
+            .allow("service-tech", Action::Read, Resource::job(), Scope::All)
+            .build(),
+    ));
+    let user = filer("emp-1");
+    let job = job_with_metadata(
+        "00000000-0000-0000-0000-000000000091",
+        &user.id,
+        serde_json::json!({"place":"original","keep":true}),
+    );
+    jobs.create_job(&job).await.unwrap();
+    let command = serde_json::json!({
+        "contract_version":2,"idempotency_key":Uuid::new_v4(),
+        "expected":{"place":{"present":true,"value":"original"}},
+        "patch":{"place":"claimed"}
+    });
+    let mut original = None;
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/jobs/{}/metadata/conditional", job.id))
+                    .header("content-type", "application/json")
+                    .header("x-boss-user", serde_json::to_string(&user).unwrap())
+                    .body(Body::from(command.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the real conditional route must accept and replay the same committed command"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if let Some(first) = &original {
+            assert_eq!(
+                &receipt, first,
+                "an exact retry returns the original receipt"
+            );
+        } else {
+            original = Some(receipt);
+        }
+    }
+    let after = jobs.get_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(
+        after.metadata,
+        serde_json::json!({"place":"claimed","keep":true})
+    );
+    let original = original.unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/jobs/{}/metadata/conditional/{}?actor={}",
+                    job.id,
+                    command["idempotency_key"].as_str().unwrap(),
+                    original["actor"].as_str().unwrap()
+                ))
+                .header("x-boss-user", serde_json::to_string(&user).unwrap())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "an observer reads the server-committed original without issuing a metadata command"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        original
+    );
+}
+
 async fn patch_metadata(
     app: &Router,
     user: &User,

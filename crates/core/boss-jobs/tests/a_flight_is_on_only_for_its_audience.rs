@@ -353,15 +353,22 @@ async fn role_flight_visibility_is_reported_without_changing_codes() {
     use boss_policy_client::role_reader::{RegistryRoles, RoleSnapshotClock, SnapshotRoleReader};
     use boss_policy_client::role_reporting::{ReportMode, ReportTally};
     use std::time::{Duration, Instant};
-    struct Clock;
+    struct Clock {
+        epoch: Instant,
+        elapsed: std::sync::atomic::AtomicU64,
+    }
     impl RoleSnapshotClock for Clock {
         fn now(&self) -> Instant {
-            Instant::now()
+            self.epoch + Duration::from_secs(self.elapsed.load(std::sync::atomic::Ordering::SeqCst))
         }
     }
+    let clock = Arc::new(Clock {
+        epoch: Instant::now(),
+        elapsed: std::sync::atomic::AtomicU64::new(0),
+    });
     let roles = Arc::new(SnapshotRoleReader::new(
         Duration::from_secs(30),
-        Arc::new(Clock),
+        clock.clone(),
     ));
     let ticket = roles.begin_refresh();
     assert!(
@@ -442,4 +449,14 @@ async fn role_flight_visibility_is_reported_without_changing_codes() {
         }),
         "duplicate-code ambiguity must be conserved in the comparison"
     );
+
+    // Age the role snapshot explicitly; scheduler delays must not choose
+    // whether this visibility comparison is fresh or unavailable.
+    clock.elapsed.store(31, std::sync::atomic::Ordering::SeqCst);
+    assert!(mine(&app, &agent()).await.is_empty());
+    assert!(tally.snapshot().rows.iter().any(|row| {
+        row.observation.resource == "flight-code-visibility"
+            && row.observation.lookup_status == "unavailable"
+            && row.observation.recorded_allowed.is_none()
+    }));
 }

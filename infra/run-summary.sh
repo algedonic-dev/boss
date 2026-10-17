@@ -79,6 +79,17 @@ run_summary_json() { # <key> <json>
     _run_summary_apply --arg k "$1" --argjson v "${2-}" '. + {($k): $v}'
 }
 
+# The same record from a whole file: native receipts can exceed the OS's
+# single-argument limit. Slurp after capture, never reduce the original.
+run_summary_json_file() { # <key> <json-file>
+    [ -n "${BOSS_RUN_SUMMARY_FILE:-}" ] || return 0
+    if ! jq_doc_file "${2-}" || ! jq -e . "${2-}" >/dev/null 2>&1; then
+        echo "run-summary: $1 is not one JSON value — not recorded; original: ${2-}" >&2
+        return 0
+    fi
+    _run_summary_apply --arg k "$1" --slurpfile v "$2" '. + {($k): $v[0]}'
+}
+
 # An anomaly, VERBATIM, appended to `anomalies` — a SKIP, a warning, a
 # sub-installer's refusal. Capped, and the cap is STATED on the record
 # (`anomalies_dropped`) rather than trimming quietly: a packet is not a

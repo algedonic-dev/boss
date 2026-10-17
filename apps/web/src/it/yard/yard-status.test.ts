@@ -16,6 +16,7 @@ import {
   parseYardStatus,
   phaseLabel,
   queueLabel,
+  gateSupervisionLabel,
   redsCell,
   releasableHeld,
   releaseBody,
@@ -1175,6 +1176,7 @@ describe('the gate QUEUE — runs waiting for a slot', () => {
       estimated_wait_seconds: 1080,
     } as const;
     expect(queueLabel(q)).toBe('#2 in line · waiting 12m · est. ~18m');
+    expect(queueLabel({ ...q, position: 0, waiting_seconds: null, estimated_wait_seconds: null })).toBe('position unknown');
     expect(queueLabel({ ...q, estimated_wait_seconds: 0 })).toBe('#2 in line · waiting 12m · a slot is free now');
     expect(queueLabel({ ...q, estimated_wait_seconds: null })).toBe('#2 in line · waiting 12m');
     expect(queueLabel({ ...q, waiting_seconds: null, estimated_wait_seconds: null })).toBe('#2 in line');
@@ -1294,4 +1296,35 @@ describe('the ETA on a train in flight', () => {
     const d = etaDetail(estimate({ leg: 'merge → arrival', basis: 'median of 105 legs' }));
     expect(d).toContain('merge → arrival');
   });
+});
+
+
+test('resident supervision absence never borrows an earlier healthy word', () => {
+  expect(gateSupervisionLabel(undefined)).toBe('supervision unknown');
+  expect(gateSupervisionLabel({ state: 'unknown', reason: 'latest firing has no observation' }))
+    .toBe('supervision unknown: latest firing has no observation');
+  expect(gateSupervisionLabel({ state: 'completed', reason: null })).toBe('supervision observed');
+});
+
+test('a queued packet shows its own latest resident refusal and never another packet reason', () => {
+  const reading = parseYardStatus({ gate_queue_supervision: {
+    contract_version: 1, state: 'completed', reason: null,
+    observation: { report: { retained: [
+      { packet: 'first', reason: 'original source step is no longer active' },
+      { packet: 'other', reason: 'other source' },
+    ] } },
+  } }).gate_queue_supervision;
+  expect(gateSupervisionLabel(reading, 'first')).toBe('retained: original source step is no longer active');
+  expect(gateSupervisionLabel(reading, 'missing')).toBe('supervision observed');
+  expect(gateSupervisionLabel({ ...reading!, state: 'unknown', reason: 'latest firing failed' }, 'first'))
+    .toBe('supervision unknown: latest firing failed');
+});
+
+test('historical successful supervision stays visibly historical during an outage', () => {
+  const reading = parseYardStatus({ gate_queue_supervision: {
+    contract_version: 1, state: 'unknown', reason: 'latest firing failed',
+    last_successful: { state: 'observed', record: { firing_id: 'original',
+      detail: { observations: { gate_queue: { observed_at: '2026-10-16T00:00:01Z' } } } } },
+  } }).gate_queue_supervision;
+  expect(gateSupervisionLabel(reading)).toBe('supervision unknown: latest firing failed · last observed 2026-10-16T00:00:01Z');
 });

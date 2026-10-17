@@ -417,7 +417,7 @@ pub(crate) fn closed_rows_to_read(total: usize) -> usize {
 /// first, up to [`RESOLVE_CLOSED_MAX`] rows — stopping at the first
 /// page that matches.
 pub(crate) async fn fetch_and_resolve(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     job_ref: &str,
 ) -> Result<String> {
     if looks_like_uuid(job_ref) {

@@ -3177,6 +3177,7 @@ mod tests {
         // (review 754a492b B1).
         for want in [
             "sor_client.rs",
+            "machine_http.rs",
             "git_auth.rs",
             "mutating_verb.rs",
             "trust_boundary.rs",

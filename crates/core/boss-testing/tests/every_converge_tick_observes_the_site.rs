@@ -436,7 +436,8 @@ fn both_ticks_observe_the_site_through_one_definition() {
             .unwrap();
     let unchanged = &runner[unchanged_start..unchanged_end];
     assert!(
-        unchanged.contains("observe_sites \"$K\""),
+        unchanged.contains("observe_deployed_surfaces")
+            && lib.contains("observe_sites \"$K\" \"$instances\""),
         "the unchanged tick observes the site after the connector: {unchanged}"
     );
     let stamped = runner
@@ -453,7 +454,7 @@ fn both_ticks_observe_the_site_through_one_definition() {
     );
     assert_eq!(
         runner.matches("observe_sites \"$K\"").count(),
-        2,
-        "one call per tick, no third path"
+        1,
+        "the deployment calls directly; unchanged and data ticks share the read-only stage"
     );
 }

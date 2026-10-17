@@ -64,7 +64,7 @@ const BACKFILL: i64 = 500;
 pub const MOVER_ACTOR: &str = "automation:yard-mover";
 
 /// The caller's refusal, or `None` when they may read the record.
-async fn refused<R: JobsRepository + 'static, B: EventBus + 'static>(
+pub(super) async fn refused<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &JobsApiState<R, B>,
     user: &boss_policy_client::User,
 ) -> Option<Response> {
@@ -126,16 +126,32 @@ pub(super) async fn yard_moves<R: JobsRepository + 'static, B: EventBus + 'stati
         Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
     };
     let limit = q.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
-    let since = boss_clock_client::wall_now() - chrono::Duration::hours(window_hours);
+    let since =
+        boss_clock_client::now_from(&state.clock).await - chrono::Duration::hours(window_hours);
     let read = async {
         Ok::<_, crate::moves::MovesError>((
             feed.store.since(q.since.unwrap_or(0), limit).await?,
             feed.store.latest_seq().await?,
             feed.store.crossings(since).await?,
+            feed.store.correction_entries().await?,
+            feed.store.correction_conservation(since).await?,
         ))
     };
     match read.await {
-        Ok((moves, latest_seq, crossings)) => {
+        Ok((moves, latest_seq, crossings, corrections, history)) => {
+            let dispositions: Vec<_> = moves
+                .iter()
+                .map(|row| {
+                    let status = match crate::move_diagnosis::active(&corrections, row) {
+                        Ok(Some(id)) => {
+                            serde_json::json!({"status":"superseded","correction_id":id})
+                        }
+                        Ok(None) => serde_json::json!({"status":"active"}),
+                        Err(why) => serde_json::json!({"status":"unknown","why":why}),
+                    };
+                    serde_json::json!({"original_seq":row.seq,"disposition":status})
+                })
+                .collect();
             // Judged against the routes derived now (car R2). Routes that
             // cannot be derived leave the reading null, never empty.
             let undeclared = super::routes::derived(&state, Some(&crossings))
@@ -145,12 +161,18 @@ pub(super) async fn yard_moves<R: JobsRepository + 'static, B: EventBus + 'stati
             Json(serde_json::json!({
                 "moves": moves,
                 "latest_seq": latest_seq,
+                "corrections": corrections,
+                "dispositions": dispositions,
+                "history": history,
                 "window_hours": window_hours,
                 "undeclared": {
                     "band": crate::region_states::MOVES_UNDECLARED.id,
                     "reads": crate::region_states::MOVES_UNDECLARED.band,
                     "moves": undeclared.as_ref().map(|u| u.iter().map(|r| r.moves).sum::<i64>()),
                     "routes": undeclared,
+                    // The one mover whose rows the band counts (backlog
+                    // c8d22e63); each row names its own `mover_version`.
+                    "mover_version": crate::moves::mover_version(),
                 },
                 "mover": feed.status(),
             }))
@@ -439,7 +461,16 @@ pub async fn run_mover<R: JobsRepository + 'static, B: EventBus + 'static>(
                 continue;
             }
         };
-        let snapshot = Snapshot::of(&rows.inputs(now, crate::regions::DEFAULT_WINDOW_HOURS));
+        // Resolution uses the existing active routing contract, while
+        // the original rows are still the exact rows placement read.
+        let specs = match state.kind_registry.as_ref() {
+            Some(reg) => reg.list_active(None).await.ok(),
+            None => None,
+        };
+        let snapshot = Snapshot::of_with_registry(
+            &rows.inputs(now, crate::regions::DEFAULT_WINDOW_HOURS),
+            specs.as_deref().unwrap_or_default(),
+        );
         let unread = snapshot.unread.clone();
         let (next, reading) = crate::moves::advance(
             baseline.as_ref(),

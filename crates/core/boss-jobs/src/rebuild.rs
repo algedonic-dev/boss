@@ -180,12 +180,20 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
     // delete steps first to make the order explicit and to make the
     // rebuild work even if the cascade is ever loosened.
     let conserved = std::sync::Mutex::new(std::collections::HashMap::new());
+    let move_ledger = std::sync::Mutex::new(std::collections::HashMap::new());
+    let admission_observations = std::sync::Mutex::new(std::collections::HashMap::new());
+    let conditional_pairs =
+        std::sync::Mutex::new(crate::conditional_metadata::replay::Pairs::default());
     let stats = replay_projection_checked(
         pool,
         REBUILD_LOCK_KEY,
-        &["DELETE FROM station_claim_receipts", "DELETE FROM steps", "DELETE FROM jobs"],
-        "kind LIKE 'jobs.job.%' OR kind LIKE 'jobs.step.%' OR kind IN ('jobs.station.claimed', 'jobs.station.selection_evidence')",
+        &["DELETE FROM yard_move_admission_observations", "DELETE FROM yard_move_corrections", "DELETE FROM station_claim_receipts", "DELETE FROM steps", "DELETE FROM jobs"],
+        "kind LIKE 'jobs.job.%' OR kind LIKE 'jobs.step.%' OR kind IN ('jobs.station.claimed', 'jobs.station.selection_evidence', 'jobs.metadata.conditionally_merged') OR kind LIKE 'jobs.yard.move.%'",
         async |_, events| {
+            *admission_observations.lock().map_err(|_|"admission observation ledger unavailable")?=crate::move_admission::reconstruct(&events.iter().map(|e|boss_core::event::Event{id:e.event_id,timestamp:e.ts,source:"jobs".into(),kind:e.kind.clone(),payload:e.payload.clone()}).collect::<Vec<_>>())?.into_iter().collect::<std::collections::HashMap<_,_>>();
+            *conditional_pairs.lock().map_err(|_|"conditional pair index unavailable")?=
+                crate::conditional_metadata::replay::Pairs::read(events)?;
+            *move_ledger.lock().map_err(|_|"move ledger unavailable")? = crate::move_diagnosis::reconstruct(&events.iter().map(|e|boss_core::event::Event{id:e.event_id,timestamp:e.ts,source:"jobs".into(),kind:e.kind.clone(),payload:e.payload.clone()}).collect::<Vec<_>>())?.into_iter().enumerate().map(|(index,(id,entry))|(id,(index as i64 + 1,entry))).collect();
             let artifacts = crate::selection_evidence::reconstruct(events).map_err(|error| error.to_string())?;
             *conserved.lock().map_err(|_| "selection evidence unavailable")? = artifacts.into_iter()
                 .filter(|event| event.payload.get("receipt_manifest").is_some())
@@ -196,36 +204,26 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
         },
         async |conn, ev| {
             match ev.kind.as_str() {
+                crate::move_admission::EVENT_KIND=>{
+                    let observation=admission_observations.lock().map_err(|_|"admission observation ledger unavailable")?.get(&ev.event_id).cloned().ok_or("admission observation receipt missing")?;
+                    sqlx::query("INSERT INTO yard_move_admission_observations(id,original_seq,diagnosis_id,body,event_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO NOTHING")
+                        .bind(observation.id).bind(observation.diagnosis.original.seq).bind(observation.diagnosis.id).bind(serde_json::to_string(&observation).map_err(|e|e.to_string())?).bind(ev.event_id).execute(&mut *conn).await.map_err(|e|e.to_string())?;
+                    Ok(Applied::Yes)
+                }
+                crate::move_diagnosis::EVENT_KIND | crate::move_diagnosis::CORRECTED_KIND | crate::move_diagnosis::WITHDRAWN_KIND => {
+                    let (seq,entry)=move_ledger.lock().map_err(|_|"move ledger unavailable")?.get(&ev.event_id).cloned().ok_or("move ledger receipt missing")?;
+                    let body=serde_json::to_string(&entry).map_err(|e|e.to_string())?;
+                    sqlx::query("INSERT INTO yard_move_corrections(seq,id,original_seq,body,event_id) VALUES($5,$1,$2,$3,$4) ON CONFLICT(id) DO NOTHING")
+                        .bind(entry.id()).bind(entry.original_seq()).bind(body).bind(ev.event_id).bind(seq).execute(&mut *conn).await.map_err(|e|e.to_string())?;
+                    Ok(Applied::Yes)
+                }
+
                 crate::events::STATION_CLAIMED => {
                     let receipt_json = if ev.payload.get("receipt_manifest").is_some() {
                         conserved.lock().map_err(|_| "selection evidence unavailable")?.get(&ev.event_id).cloned()
                     } else { ev.payload.get("receipt_json").and_then(serde_json::Value::as_str).map(str::to_owned) }
                         .ok_or("station claim lacks its exact server JSON")?;
-                    let parsed = crate::station_claim::SelectionReceipt::from_json(receipt_json.clone()).map_err(|error| error.to_string())?;
-                    // Historical events carried a redundant parsed copy. Check
-                    // it when present; new events conserve only the exact text.
-                    if ev.payload.get("receipt").is_some_and(|receipt| parsed.value() != receipt) {
-                        return Err("station selection receipt disagrees with its immutable event JSON".into());
-                    }
-                    let receipt = parsed.value();
-                    let request_id: uuid::Uuid = serde_json::from_value(receipt.get("request_id").cloned().ok_or("station claim lacks request identity")?).map_err(|error| error.to_string())?;
-                    let mut step: Step = serde_json::from_value(receipt.get("claimed_step").cloned().ok_or("station claim lacks claimed state")?).map_err(|error| error.to_string())?;
-                    let selected_at: chrono::DateTime<chrono::Utc> = serde_json::from_value(receipt.get("selected_at").cloned().ok_or("station claim lacks server timestamp")?).map_err(|error| error.to_string())?;
-                    use sha2::Digest;
-                    let station = receipt.get("station").ok_or("station claim lacks its definition")?;
-                    let station_hash = hex::encode(sha2::Sha256::digest(boss_core::job::canonical_json_bytes(station)));
-                    if !matches!(receipt.get("version").and_then(serde_json::Value::as_u64), Some(1 | 2))
-                        || receipt.get("event_id") != Some(&serde_json::json!(ev.event_id))
-                        || receipt.get("event_actor") != ev.payload.get("_actor")
-                        || receipt.get("station_hash").and_then(serde_json::Value::as_str) != Some(station_hash.as_str())
-                        || selected_at.timestamp_micros() != ev.ts.timestamp_micros()
-                        || receipt.pointer("/selected/step_id") != Some(&serde_json::json!(step.id))
-                        || receipt.pointer("/selected/job_id") != Some(&serde_json::json!(step.job_id))
-                        || step.status != boss_core::job::StepStatus::Active
-                        || step.assignee_id.as_deref() != receipt.get("actor").and_then(serde_json::Value::as_str)
-                    {
-                        return Err("station selection receipt disagrees with its immutable event or owned step".into());
-                    }
+                    let (mut step, request_id) = crate::state_receipt::station_claim(&ev, &receipt_json)?;
                     let stored: Option<String> = sqlx::query_scalar("SELECT receipt FROM station_claim_receipts WHERE request_id = $1").bind(request_id).fetch_optional(&mut *conn).await.map_err(|error| error.to_string())?;
                     if stored.as_ref().is_some_and(|stored| stored != &receipt_json) {
                         return Err("audit replay attempts to replace a station selection receipt".into());
@@ -237,21 +235,7 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
                     Ok(Applied::Yes)
                 }
                 crate::events::STEP_FIRST_RECORDED => {
-                    let mut step: Step = serde_json::from_value(ev.payload.get("step").cloned().ok_or("first record lacks step state")?)
-                        .map_err(|_| "first record step state is invalid".to_string())?;
-                    let record: crate::first_record::FirstRecord = serde_json::from_value(ev.payload.get("record").cloned().ok_or("first record lacks receipt")?)
-                        .map_err(|_| "first record receipt is invalid".to_string())?;
-                    let value: serde_json::Value = serde_json::from_str(&record.value_json).map_err(|_| "first record authoritative value is invalid".to_string())?;
-                    use sha2::{Digest, Sha256};
-                    if record.step_id != step.id || record.job_id != step.job_id || record.event_id != ev.event_id
-                        || record.recorded_at.timestamp_micros() != ev.ts.timestamp_micros()
-                        || serde_json::to_value(&record.actor).map_err(|e| e.to_string())? != *ev.payload.get("_actor").ok_or("first record lacks server actor")?
-                        || !crate::first_record::valid_key(&record.key)
-                        || !record.matches(&value) || !record.matches(&record.value)
-                        || record.digest != hex::encode(Sha256::digest(&record.canonical))
-                        || !step.metadata.get(&record.key).is_some_and(|v| record.matches(v)) {
-                        return Err("first record receipt disagrees with immutable event or full step state".into());
-                    }
+                    let (mut step, record) = crate::state_receipt::first_record(&ev)?;
                     keep_the_voids(&mut *conn, &mut step).await.map_err(|e| e.to_string())?;
                     let inserted = upsert_step(&mut *conn, &step, ev.ts).await.map_err(|e| e.to_string())?;
                     let receipt = serde_json::to_string(&record).map_err(|e| e.to_string())?;
@@ -264,10 +248,48 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
                     if inserted { report.steps_inserted += 1; } else { report.steps_updated += 1; }
                     Ok(Applied::Yes)
                 }
+                "jobs.metadata.conditionally_merged" => {
+                    let receipt: crate::conditional_metadata::Receipt = serde_json::from_value(ev.payload.clone()).map_err(|e| e.to_string())?;
+                    let verified=conditional_pairs.lock().map_err(|_|"conditional pair index unavailable")?
+                        .marker(ev.event_id).cloned().ok_or("conditional receipt was not prevalidated")?;
+                    if receipt!=verified{return Err("conditional receipt differs from its checked pair".into());}
+                    receipt.command.validate().map_err(str::to_owned)?;
+                    if !matches!(receipt.contract_version,1|2) || receipt.job_id!=receipt.job.id || receipt.event_id.is_nil()
+                        || receipt.applied_at.timestamp_micros()!=ev.ts.timestamp_micros()
+                        || ev.payload.get("_actor").and_then(serde_json::Value::as_str)!=Some(receipt.actor.as_str()) {
+                        return Err("conditional receipt disagrees with its immutable event identity, actor or timestamp".into());
+                    }
+                    // event_id names the sibling state event, recorded in
+                    // the same transaction. Verify its whole post-state;
+                    // neither matching labels nor a receipt-shaped blob
+                    // can manufacture a transaction result on replay.
+                    let state:Option<(String,chrono::DateTime<chrono::Utc>,serde_json::Value)>=sqlx::query_as("SELECT kind,timestamp,payload FROM audit_log WHERE event_id=$1")
+                        .bind(receipt.event_id).fetch_optional(&mut *conn).await.map_err(|error|error.to_string())?;
+                    let Some((kind,at,payload))=state else{return Err("conditional receipt lacks its immutable post-state event".into());};
+                    let recorded:Job=serde_json::from_value(payload.clone()).map_err(|error|error.to_string())?;
+                    if kind!=crate::events::JOB_UPDATED || at.timestamp_micros()!=receipt.applied_at.timestamp_micros()
+                        || payload.get("_actor").and_then(serde_json::Value::as_str)!=Some(receipt.actor.as_str())
+                        || recorded!=receipt.job {
+                        return Err("conditional receipt disagrees with its complete post-state event".into());
+                    }
+                    let body = serde_json::to_string(&receipt).map_err(|e| e.to_string())?;
+                    let prior: Option<String> = sqlx::query_scalar("SELECT receipt FROM job_metadata_receipts WHERE job_id=$1 AND actor=$2 AND command_id=$3")
+                        .bind(*receipt.job_id.inner().as_uuid()).bind(&receipt.actor).bind(receipt.command.idempotency_key)
+                        .fetch_optional(&mut *conn).await.map_err(|e| e.to_string())?;
+                    if prior.as_ref().is_some_and(|prior| prior != &body) { return Err("conditional receipt changed during replay".into()); }
+                    sqlx::query("INSERT INTO job_metadata_receipts (job_id,actor,command_id,receipt) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING")
+                        .bind(*receipt.job_id.inner().as_uuid()).bind(&receipt.actor).bind(receipt.command.idempotency_key).bind(body)
+                        .execute(&mut *conn).await.map_err(|e| e.to_string())?;
+                    Ok(Applied::Yes)
+                }
                 "jobs.job.created" | "jobs.job.updated" => {
                     let job: Job = match serde_json::from_value(ev.payload.clone()) {
                         Ok(j) => j,
                         Err(e) => {
+                            if ev.payload.get(crate::conditional_metadata::RECEIPT_LINK).is_some()
+                                || ev.payload.pointer("/metadata/_guarded_metadata").is_some() {
+                                return Err(format!("malformed protected Job state: {e}"));
+                            }
                             warn!(
                                 event_id = ev.audit_id,
                                 kind = %ev.kind,
@@ -277,6 +299,18 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
                             return Ok(Applied::Skipped);
                         }
                     };
+                    let conditional=conditional_pairs.lock().map_err(|_|"conditional pair index unavailable")?
+                        .state(ev.event_id).cloned();
+                    if let Some(receipt)=conditional.as_ref(){
+                        let before=crate::postgres::get_job_on(&mut *conn,&job.id).await
+                            .map_err(|error|error.to_string())?.ok_or("conditional state lacks its preceding Job")?;
+                        let schema:Option<serde_json::Value>=if receipt.command.guarded_keys.is_empty() && receipt.command.immutable_keys.is_empty(){None}else{
+                            sqlx::query_scalar("SELECT metadata_schema FROM workflows WHERE kind=$1 AND version=$2 AND status <> 'draft'")
+                                .bind(&before.kind).bind(before.workflow_version).fetch_optional(&mut *conn).await.map_err(|error|error.to_string())?
+                        };
+                        conditional_pairs.lock().map_err(|_|"conditional pair index unavailable")?
+                            .next(ev.event_id,&before,schema.as_ref())?.ok_or("conditional state pair disappeared")?;
+                    }
                     // `_partition` on the create event is where a
                     // Job's origin lives in the log — with the older
                     // `_simulated` bool as the fallback for events that
@@ -285,7 +319,7 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
                     // set — otherwise a rebuild would quietly turn the
                     // whole simulated company (or the shadow lane) real.
                     let partition = Partition::from_event_payload(&ev.payload);
-                    let inserted_now = upsert_job(&mut *conn, &job, ev.ts, partition)
+                    let inserted_now = upsert_job(&mut *conn, &job, ev.ts, partition, conditional.as_ref().map(|receipt|&receipt.command))
                         .await
                         .map_err(|e| e.to_string())?;
                     if inserted_now {
@@ -425,7 +459,20 @@ async fn upsert_job(
     job: &Job,
     ts: DateTime<Utc>,
     partition: Partition,
+    conditional: Option<&crate::conditional_metadata::Command>,
 ) -> Result<bool, RebuildError> {
+    let before: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT metadata FROM jobs WHERE id=$1")
+            .bind(*job.id.inner().as_uuid())
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| RebuildError::Storage(e.to_string()))?;
+    crate::metadata_immutability::preserve_replayed(
+        &before.unwrap_or(serde_json::Value::Null),
+        &job.metadata,
+        conditional,
+    )
+    .map_err(RebuildError::Storage)?;
     let (subj_kind, subj_ref) = subject_parts(&job.subject);
     // The admission instant, derived from the log rather than invented
     // (backlog 6c2eba00, design f2cdff23 question `backfill`): the

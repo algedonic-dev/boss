@@ -340,6 +340,90 @@ async fn a_denied_caller_is_refused_by_every_station_read() {
 }
 
 #[tokio::test]
+async fn membership_flow_is_explicit_about_missing_original_history_and_keeps_step_basis_separate()
+{
+    let (app, _) = app();
+    let (status, value) = get_json(&app, "/api/stations/flow", "emp-ceo", "ceo").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["basis"], "packet-membership-v1");
+    assert!(
+        value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["arrived"].is_null()
+                && r["departed"].is_null()
+                && r["unknown"].as_array().is_some_and(|u| !u.is_empty()))
+    );
+    assert!(
+        value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["covered"] == serde_json::json!([]))
+    );
+    let (status, steps) = get_json(
+        &app,
+        "/api/stations/flow?basis=step-events",
+        "emp-ceo",
+        "ceo",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(steps["basis"], "step-events");
+    assert!(
+        steps["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["basis"] == "step-events" || r["basis"] == "unavailable")
+    );
+    let (status, _) = get_json(
+        &app,
+        "/api/stations/flow?basis=an-unmatched-basis",
+        "emp-ceo",
+        "ceo",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn legacy_distinct_step_cube_cannot_be_a_global_aggregate_for_a_narrow_reader() {
+    let policy = Arc::new(
+        FakePolicyClient::builder()
+            .allow("owner", Action::Read, Resource::job(), Scope::Self_)
+            .build(),
+    );
+    let mut workflow = car_kind();
+    workflow.steps[0].authority_role = Some("operator".into());
+    let (app, _) = app_with_policy_and_agents(workflow, None, Some(policy));
+    let (status, value) = get_json(
+        &app,
+        "/api/stations/flow?basis=step-events",
+        "alice",
+        "owner",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["station"] == "q.operator.task")
+    );
+    assert!(
+        value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["arrived"].is_null() && r["served"].is_null()),
+        "{value}"
+    );
+}
+
+#[tokio::test]
 async fn queue_is_evaluated_ordered_and_advisory_flagged() {
     let (app, _jobs) = app();
     // Three parked cars + one boarded (not a member): the queue

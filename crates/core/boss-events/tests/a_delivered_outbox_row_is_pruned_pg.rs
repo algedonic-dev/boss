@@ -215,7 +215,9 @@ async fn a_delivered_row_inside_the_age_survives() {
 /// Before ee2176c6, the relay skipped a second, DIFFERENT event under
 /// an audited id and stamped it delivered. While the
 /// outbox kept every row, its UNIQUE(event_id) refused that second
-/// staging; once retention has pruned the first copy it no longer can.
+/// staging; once retention had pruned the first copy it no longer could.
+/// Original producer rosters now retain that identity beyond pruning and
+/// refuse reuse earlier. The bad historical row still needs retention care.
 /// Retention must still preserve a historical wrongly-delivered row:
 /// it deletes a copy only when audit_log holds
 /// the same FACT, not merely the same id.
@@ -232,7 +234,35 @@ async fn a_delivered_row_whose_id_audit_log_holds_under_another_fact_survives() 
             payload: serde_json::json!({"n": n}),
         };
         let mut tx = db.pool.begin().await.unwrap();
+        if n != 1 {
+            let refused = record_event_in_tx(&mut tx, &e).await.unwrap_err();
+            assert!(refused.contains("original_event_group_members_pkey"));
+            tx.rollback().await.unwrap();
+            // Only this isolated TestDb reconstructs the pre-witness
+            // historical bad row. Do not weaken the producer to make an
+            // invalid fact look newly original; both guards are restored
+            // in the same transaction, and rollback restores them on error.
+            tx = db.pool.begin().await.unwrap();
+            sqlx::query("ALTER TABLE event_outbox DISABLE TRIGGER event_outbox_original_group")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("ALTER TABLE event_outbox DISABLE TRIGGER event_outbox_original_member")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
         record_event_in_tx(&mut tx, &e).await.expect("record");
+        if n != 1 {
+            sqlx::query("ALTER TABLE event_outbox ENABLE TRIGGER event_outbox_original_group")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("ALTER TABLE event_outbox ENABLE TRIGGER event_outbox_original_member")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
         tx.commit().await.unwrap();
         let id: i64 = sqlx::query_scalar("SELECT id FROM event_outbox WHERE event_id = $1")
             .bind(reused)
@@ -271,10 +301,23 @@ async fn a_delivered_row_whose_id_audit_log_holds_under_another_fact_survives() 
         .await
         .expect("deliver the retention fact before the conflicting batch");
 
-    // Fact B under the SAME id: the outbox accepts it (A's row is gone),
-    // and the repaired relay refuses it. Reconstruct the old delivery
-    // stamp explicitly: retention still owes that historical row care.
+    // Fact B under the SAME id: the new original roster refuses its
+    // staging. Explicitly reconstruct the pre-witness bad row and old
+    // delivery stamp: retention still owes historical data the same care.
     let (b, _) = stage("outbox.test.second-fact", 2).await;
+    let (witness, originals): (Option<Uuid>, i64) = sqlx::query_as(
+        "SELECT original_group_id, (SELECT COUNT(*) FROM original_event_group_members WHERE event_id=$1) FROM event_outbox WHERE id=$2",
+    )
+    .bind(reused)
+    .bind(b)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        witness.is_none(),
+        "historical B has no invented original witness"
+    );
+    assert_eq!(originals, 1, "only A remains the original identity");
     let b_in_log: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE kind = 'outbox.test.second-fact'")
             .fetch_one(&db.pool)

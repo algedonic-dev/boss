@@ -561,6 +561,7 @@ mod tests {
             authority_role: None,
             claimable: None,
             executor: None,
+            executor_class: None,
             audience: None,
             agent: None,
             metadata_defaults: json!({}),

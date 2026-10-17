@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use boss_core::machine_token::BlockingClient;
+use boss_core::machine_token::{BlockingHttp, BlockingHttpRequest};
 use boss_core::publish::{FieldChange, KeptRow, UpdatedRow};
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -59,7 +59,7 @@ use crate::registry::WorkflowSpec;
 /// module docs.
 ///
 /// `client` is the caller's, and it is a
-/// [`BlockingClient`]: it stamps the estate machine token on every
+/// [`BlockingHttp`]: it stamps the estate machine token on every
 /// request from the process's watched source and follows no redirect
 /// (design 6805c764 car 2, the blocking-senders slice, 2026-09-29).
 /// Until then the walk built its own client and baked the token read
@@ -68,7 +68,7 @@ use crate::registry::WorkflowSpec;
 /// test hand it a fixed source rather than the process's live one
 /// (backlog 2ee29275, F2).
 pub fn publish_workflows(
-    client: &BlockingClient,
+    client: &impl BlockingHttp,
     api_base: &str,
     seeds: &Path,
     owning_team: &str,
@@ -512,7 +512,7 @@ fn provenance_of(body: &Value) -> Provenance {
 /// The active row for `kind` as the registry answers it, with its
 /// provenance; `Missing` rides an empty body.
 fn active_kind(
-    client: &BlockingClient,
+    client: &impl BlockingHttp,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     kind: &str,
@@ -534,7 +534,7 @@ fn active_kind(
 }
 
 fn bootstrap_kind(
-    client: &BlockingClient,
+    client: &impl BlockingHttp,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     target: &WorkflowSpec,
@@ -803,7 +803,7 @@ fn already_resolved(status: &str) -> bool {
 /// cannot hide anything, while bailing would brick a bootstrap on a
 /// single flaky GET.
 fn current_step(
-    client: &BlockingClient,
+    client: &impl BlockingHttp,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     job_id: &str,
@@ -839,7 +839,7 @@ fn current_step(
 
 #[allow(clippy::too_many_arguments)]
 fn walk_step(
-    client: &BlockingClient,
+    client: &impl BlockingHttp,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     job_id: &str,

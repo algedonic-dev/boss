@@ -3,13 +3,34 @@
 use super::*;
 use std::collections::HashSet;
 
+#[cfg(test)]
+pub(crate) async fn qualification_launch(
+    jobs: &str,
+    manifest: &str,
+    branch: &str,
+    head: &str,
+) -> Result<String> {
+    let mut conductor = tests::settle_conductor(jobs.to_owned());
+    conductor.cfg.gate_manifest = manifest.to_owned();
+    conductor.cfg.gate_namespace = "fixture".into();
+    conductor
+        .launch_gate(
+            branch,
+            head,
+            crate::gate::Requester::Car,
+            json!({"regate_of_car":"fixture-car"}),
+        )
+        .await
+        .map_err(anyhow::Error::from)
+}
+
 // ---------------------------------------------------------------------------
 // The conductor
 // ---------------------------------------------------------------------------
 
 pub(super) struct Conductor {
     pub(super) cfg: Config,
-    pub(super) http: boss_core::machine_token::Client,
+    pub(super) http: crate::machine_http::MachineClient,
     forge: Box<dyn Forge>,
     /// Who the conductor's packets are filed to — the platform owner,
     /// read from the people registry through the port and cached for
@@ -138,13 +159,24 @@ impl DockHold {
 /// A gate launch that failed, and the gate-run it had already filed when
 /// it did (backlog 7919fdcc, item 11). `filed` is `None` when the failure
 /// came before the POST — nothing exists to reference — and names the
-/// run otherwise, which the launch has already settled `lost`, so a
-/// caller can stamp it rather than file a twin on its next pass.
+/// run otherwise. A native launch error leaves its outcome UNKNOWN;
+/// callers retain the original packet rather than filing a twin.
 #[derive(Debug)]
 pub(super) struct GateLaunchFailed {
     pub(super) filed: Option<String>,
     pub(super) cause: anyhow::Error,
 }
+
+#[derive(Debug)]
+struct TrainGateRecoveryHold(String);
+
+impl std::fmt::Display for TrainGateRecoveryHold {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "train gate recovery is unresolved: {}", self.0)
+    }
+}
+
+impl std::error::Error for TrainGateRecoveryHold {}
 
 impl GateLaunchFailed {
     fn unfiled(cause: anyhow::Error) -> Self {
@@ -178,6 +210,9 @@ pub(super) fn gate_bound_refusal(
         crate::gate::Requester::Car => format!(
             "{running}, and {} waiting for the next bay goes first (design 1e787fc2)",
             trains_ahead.join(", ")
+        ),
+        crate::gate::Requester::MainFull => format!(
+            "{running} — main's full gate goes last and is tried again next pass (77596188)"
         ),
     }
 }
@@ -214,7 +249,7 @@ impl std::fmt::Display for GateLaunchFailed {
         match &self.filed {
             Some(run) => write!(
                 f,
-                "{:#} (gate-run {} was filed first, and is settled lost)",
+                "{:#} (gate-run {} was filed first; inspect its recorded outcome)",
                 self.cause,
                 id8(run)
             ),
@@ -318,6 +353,10 @@ impl Conductor {
     #[cfg(test)]
     pub(super) fn diagnostic_fixture(clone: &std::path::Path) -> Self {
         tests::dock_conductor(clone)
+    }
+    #[cfg(test)]
+    pub(super) fn diagnostic_cluster(&mut self, cluster: Box<dyn GateCluster>) {
+        self.cluster = cluster;
     }
     pub(super) fn new(cfg: Config, forge: Box<dyn Forge>) -> Result<Self> {
         // The machine token is stamped per request from the process's one
@@ -467,20 +506,18 @@ impl Conductor {
             .await
             .map_err(|e| ApiFailure::transport(e, format!("{method} {path}")))?;
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| ApiFailure::transport(e, format!("reading {method} {path} response")))?;
+        let body = bounded_api_body(resp, &method, path).await?;
         if !status.is_success() {
+            let text = String::from_utf8_lossy(&body);
             return Err(ApiFailure {
-                kind: http_failure(status.as_u16(), &body),
-                cause: anyhow!("{method} {path}: HTTP {status}: {}", body.trim()),
+                kind: http_failure(status.as_u16(), &text),
+                cause: anyhow!("{method} {path}: HTTP {status}: {text}"),
             });
         }
-        if body.trim().is_empty() {
+        if body.iter().all(u8::is_ascii_whitespace) {
             return Ok(None);
         }
-        serde_json::from_str(&body)
+        serde_json::from_slice(&body)
             .map(Some)
             .map_err(|e| ApiFailure {
                 kind: Failure::Malformed,
@@ -766,7 +803,46 @@ impl Conductor {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("no merge_ref on job {} — nothing to verify", id8(&tid)))?
             .to_string();
-        let health = self.api(Method::GET, "/api/jobs/health", None).await?;
+        let policy = self.policy_for(train).await;
+        let light_plan = crate::delivery_plan::completion_plan(train, &policy);
+        let delivery_observation = if let Some(plan) = light_plan {
+            let observed: Result<Value> = async {
+                let resolved = sh(&[
+                    "git",
+                    "-C",
+                    &self.cfg.clone,
+                    "rev-parse",
+                    "--verify",
+                    &format!("{merge_ref}^{{commit}}"),
+                ])?;
+                let publication = stdout_str(&resolved).trim().to_owned();
+                crate::delivery_plan::observe(
+                    Path::new(&self.cfg.clone),
+                    plan,
+                    &publication,
+                    &self.cfg.jobs,
+                )
+                .await
+            }
+            .await;
+            Some(match observed {
+                Ok(mut evidence) => {
+                    evidence["basis"] = json!("data");
+                    evidence
+                }
+                Err(error) => json!({"schema":1,"basis":"data","arrived":false,
+                    "plan":plan,"error":format!("{error:#}")}),
+            })
+        } else {
+            None
+        };
+        // An unread or differing registry remains unarrived even if an image
+        // happens to have rolled. The frozen plan names what must become live.
+        let health = if light_plan.is_none() {
+            self.api(Method::GET, "/api/jobs/health", None).await?
+        } else {
+            None
+        };
         let cluster_commit = health
             .as_ref()
             .and_then(|h| h.get("capabilities"))
@@ -799,13 +875,37 @@ impl Conductor {
             }
             _ => None,
         };
-        let base = convergence_verdict(
-            &merge_ref,
-            cluster_commit.as_deref(),
-            ancestor,
-            mins_since_merge,
-            self.cfg.converge_alarm_mins,
-        );
+        let base = if let Some(observation) = &delivery_observation {
+            convergence_verdict(
+                &merge_ref,
+                (observation["arrived"] == true).then_some(merge_ref.as_str()),
+                None,
+                mins_since_merge,
+                self.cfg.converge_alarm_mins,
+            )
+        } else {
+            convergence_verdict(
+                &merge_ref,
+                cluster_commit.as_deref(),
+                ancestor,
+                mins_since_merge,
+                self.cfg.converge_alarm_mins,
+            )
+        };
+        if let Some(observation) = &delivery_observation
+            && !self.cfg.dry
+            && converged_step.pointer("/metadata/delivery_evidence") != Some(observation)
+        {
+            let sid = converged_step["id"]
+                .as_str()
+                .context("converged step id unread")?;
+            self.api(
+                Method::PATCH,
+                &format!("/api/jobs/{tid}/steps/{sid}/metadata"),
+                Some(json!({"delivery_evidence":observation})),
+            )
+            .await?;
+        }
         // THE MERGE-LOST ARM (backlog f9256445, design d812f1b7 D1). A
         // cluster that has not taken the merge may never take it: on
         // 2026-09-25 forge main moved back off train 20:04's merge within
@@ -860,6 +960,26 @@ impl Conductor {
                     .await
             }
             ConvergenceVerdict::Converged => {
+                if let Some(observation) = &delivery_observation {
+                    return self.complete_step(train,Some(converged_step),&[("verified",Some(format!(
+                        "native forge publication and every frozen channel obligation agree; publication {}; {} file(s); verified {} min after merge",
+                        observation.pointer("/publication/merge").and_then(Value::as_str).unwrap_or("unread"),
+                        observation["receipts"].as_array().map_or(0,Vec::len),mins_since_merge)))]) .await;
+                }
+                if crate::delivery_plan::compatible_completion(train) && !self.cfg.dry {
+                    let sid = converged_step["id"]
+                        .as_str()
+                        .context("converged step id unread")?;
+                    self.api(
+                        Method::PATCH,
+                        &format!("/api/jobs/{tid}/steps/{sid}/metadata"),
+                        Some(
+                            json!({"delivery_evidence":{"schema":1,"basis":"image","arrived":true,
+                            "health":health,"merge_ref":merge_ref,"ancestor":ancestor}}),
+                        ),
+                    )
+                    .await?;
+                }
                 let commit = cluster_commit.unwrap_or_default();
                 self.complete_step(
                     train,
@@ -1605,6 +1725,15 @@ impl Conductor {
                 orphan.idle_minutes,
             ));
             let receipt = crate::gate::withdrawal_receipt(&because, Some(&vouch));
+            crate::gate::guard_conductor_settlement(
+                &self.http,
+                &self.cfg.jobs,
+                rid,
+                &ns,
+                &receipt,
+                now,
+            )
+            .await?;
             match self
                 .complete_step(
                     &run,
@@ -1638,12 +1767,22 @@ impl Conductor {
             orphan.last_alive_key,
             orphan.last_alive,
         ));
+        let receipt = orphan_receipt(&orphan, &branch, &ns);
+        crate::gate::guard_conductor_settlement(
+            &self.http,
+            &self.cfg.jobs,
+            rid,
+            &ns,
+            &json!({"verdict":"lost","receipt":receipt}),
+            now,
+        )
+        .await?;
         self.complete_step(
             &run,
             verdict_step,
             &[
                 ("verdict", Some("lost".to_string())),
-                ("receipt", Some(orphan_receipt(&orphan, &branch, &ns))),
+                ("receipt", Some(receipt)),
             ],
         )
         .await?;
@@ -1961,6 +2100,239 @@ impl Conductor {
         }
     }
 
+    /// Relaunch a lost CAR gate once, on the same sha, with its park
+    /// intent — the hand act agent-codex did ten times in a week
+    /// (backlog 565131e1). `boss_jobs::lost_gate::answer` decides, pure
+    /// and tested; this reads its facts and writes what it says. Train
+    /// gates never qualify (`is_train_gate`): `train_gate` relaunches
+    /// those under MAX_RELAUNCHES. A LOOP WRITE: every failure is per
+    /// run, logged, and retried next pass — never fatal to reconcile.
+    async fn relaunch_lost_car_gates(&self, now: DateTime<Utc>) -> Result<()> {
+        // An unstamped candidate needs a recent verdict completion. ANY
+        // completed step is a conservative superset, including legacy
+        // verdict titles and NULL closed_on. Stamps and refusals remain
+        // eligible beyond the window, so read their entire history too.
+        // Judge all three complete partitions before any candidate effect.
+        use boss_jobs::lost_gate as lg;
+        let cutoff = now - chrono::Duration::hours(lg::WINDOW_HOURS);
+        let cutoff =
+            percent_encoding::utf8_percent_encode(&cutoff.to_rfc3339(), crate::job::QUERY_VALUE)
+                .to_string();
+        let partitions = [
+            format!("step_completed_since={cutoff}"),
+            format!("metadata_has={}", lg::STAMP),
+            format!("metadata_has={}", lg::REFUSALS),
+        ];
+        let mut runs: Vec<Value> = Vec::new();
+        let mut originals: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut remaining_bytes = MAX_INVENTORY_BYTES;
+        for partition in partitions {
+            let rows = list_original_attempts(|offset| {
+                let partition = &partition;
+                async move {
+                    self.api(Method::GET, &format!(
+                        "/api/jobs?kind=gate-run&status=closed&limit={PAGE_LIMIT}&full=true&offset={offset}&{partition}"
+                    ), None).await
+                }
+            }).await.context("lost-car candidate census unavailable; no relaunch attempted")?;
+            for row in rows {
+                let id = job_id(&row)?.to_string();
+                if let Some(index) = originals.get(&id) {
+                    anyhow::ensure!(
+                        runs[*index] == row,
+                        "lost-car candidate census has conflicting originals for {id}; no relaunch attempted"
+                    );
+                } else {
+                    charge_census_json(&row, &mut remaining_bytes)?;
+                    originals.insert(id, runs.len());
+                    runs.push(row);
+                }
+            }
+        }
+        let candidates = runs
+            .iter()
+            .filter(|r| boss_jobs::lost_gate::is_candidate(r, now));
+        for run in candidates {
+            let Ok(rid) = job_id(run).map(str::to_string) else {
+                continue;
+            };
+            if let Err(e) = self.relaunch_lost_car_gate(run, &rid, now).await {
+                log(format!(
+                    "reconcile: lost gate-run {} not acted on this pass (retries next): {e:#}",
+                    id8(&rid)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// One lost gate-run: read its facts, ask `lost_gate::answer`, write
+    /// what it says. The ATTEMPT is stamped before the launch, so an
+    /// outcome never written reads next pass as the machine's unfinished
+    /// try and is handed back; a launch refused before filing is recorded
+    /// in the same write that clears the attempt, so the loss is handed
+    /// back naming its refusals when the window closes (565131e1 review).
+    async fn relaunch_lost_car_gate(
+        &self,
+        run: &Value,
+        rid: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        use boss_jobs::lost_gate::{self as lg, Answer};
+        // The submission's view, as `lost_gate` reads it: a resident
+        // gate-run keeps its locators there.
+        let md = boss_jobs::gate_reservation::source_metadata(&run["metadata"])
+            .map_err(anyhow::Error::msg)?;
+        let field = |k: &str| md.get(k).and_then(Value::as_str).unwrap_or_default();
+        let (branch, sha) = (field("branch").to_string(), field("sha").to_string());
+        let filter = json!({ "branch": branch }).to_string();
+        let q = percent_encoding::utf8_percent_encode(&filter, crate::job::QUERY_VALUE).to_string();
+        let by_branch = |kind: &'static str| {
+            let q = q.clone();
+            async move {
+                let result = list_original_attempts(move |offset| {
+                    let path = format!(
+                        "/api/jobs?kind={kind}&full=true&limit={PAGE_LIMIT}&offset={offset}\
+                     &metadata={q}"
+                    );
+                    async move { self.api(Method::GET, &path, None).await }
+                })
+                .await
+                .with_context(|| {
+                    format!("lost-car {kind} census unavailable; no relaunch attempted")
+                });
+                if let Err(error) = &result
+                    && !self.cfg.dry
+                {
+                    // Keep a refused census eligible after the ordinary
+                    // window. This is evidence of refusal, not an attempt;
+                    // never erase a genuine unfinished attempt's stamp.
+                    // This is the packet's bounded descriptor, not the
+                    // original diagnostic. Return the unchanged error below:
+                    // the owning sweep journals its entire chain with {e:#}.
+                    // A full HTTP error body copied into metadata otherwise
+                    // refuses its own PATCH and loses handback eligibility.
+                    let cause = short_cause(error, ROWS_REFUSAL_QUOTE);
+                    let mut refusal = lg::refusal_patch(run, now, &cause);
+                    if let Some(fields) = refusal.as_object_mut() {
+                        fields.remove(lg::STAMP);
+                    }
+                    if let Err(record_error) = self
+                        .api(
+                            Method::PATCH,
+                            &format!("/api/jobs/{rid}/metadata"),
+                            Some(refusal),
+                        )
+                        .await
+                    {
+                        log(format!(
+                            "reconcile: lost gate-run {rid} census refusal {error:#}; refusal record also unavailable: {record_error:#}"
+                        ));
+                    }
+                }
+                result
+            }
+        };
+        let others = by_branch("gate-run").await?;
+        let cars = by_branch("ship-a-change").await?;
+        let head = self.forge.branch_head(&branch).await?;
+        let clone = self.cfg.clone.as_str();
+        let landed = sh_unchecked(&[
+            "git",
+            "-C",
+            clone,
+            "merge-base",
+            "--is-ancestor",
+            &sha,
+            "origin/main",
+        ])?
+        .status
+        .success();
+        let open: Vec<Value> = cars
+            .iter()
+            .filter(|c| boss_jobs::car::is_open(c))
+            .cloned()
+            .collect();
+        let car = match crate::gate::vouching_car(&branch, &sha, &open) {
+            Some(v) => lg::CarStanding::VouchesForHead { car: v.car },
+            None => lg::car_standing(&cars, &branch),
+        };
+        let facts = lg::Facts {
+            lost: run,
+            branch_head: head.as_deref(),
+            others: &others,
+            landed,
+            car,
+            now,
+        };
+        let path = format!("/api/jobs/{rid}/metadata");
+        let (stamp, said) = match lg::answer(&facts) {
+            None => return Ok(()),
+            Some(_) if self.cfg.dry => return Ok(()),
+            Some(Answer::Decline(why)) => (
+                lg::stamp(lg::DECLINED, now, None, None, Some(&why)),
+                format!("not relaunched: {why}"),
+            ),
+            Some(Answer::FileFailure {
+                branch,
+                sha,
+                first,
+                second,
+                why,
+            }) => {
+                let owner = self.owner_for_filing().await;
+                let body = lg::failure_item_body(&branch, &sha, &first, &second, &why, &owner);
+                let filed = self
+                    .api(Method::POST, "/api/jobs", Some(body))
+                    .await?
+                    .ok_or_else(|| anyhow!("filing the lost-gate item answered no body"))?;
+                let item = job_id(&filed)?.to_string();
+                (
+                    lg::stamp(lg::FAILURE_FILED, now, None, Some(&item), Some(&why)),
+                    format!("handed back as item {}: {why}", id8(&item)),
+                )
+            }
+            Some(Answer::Relaunch { branch, sha, marks }) => {
+                let attempt = lg::stamp(lg::ATTEMPTING, now, None, None, None);
+                self.api(Method::PATCH, &path, Some(attempt)).await?;
+                let launched = self
+                    .launch_gate(&branch, &sha, crate::gate::Requester::Car, marks)
+                    .await;
+                match launched {
+                    Ok(new) => (
+                        lg::stamp(lg::RELAUNCHED, now, Some(&new), None, None),
+                        format!(
+                            "relaunched as {} on {}",
+                            id8(&new),
+                            &sha[..sha.len().min(8)]
+                        ),
+                    ),
+                    Err(f) if f.filed.is_none() => {
+                        let cause = format!("{:#}", f.cause);
+                        (
+                            lg::refusal_patch(run, now, &cause),
+                            format!("relaunch refused before filing ({cause}) — retried next pass"),
+                        )
+                    }
+                    Err(f) => {
+                        let why = format!("{:#}", f.cause);
+                        (
+                            lg::stamp(lg::LAUNCH_FAILED, now, f.filed.as_deref(), None, Some(&why)),
+                            format!("relaunch filed but not started: {why}"),
+                        )
+                    }
+                }
+            }
+        };
+        self.api(Method::PATCH, &path, Some(stamp)).await?;
+        log(format!(
+            "reconcile: lost gate-run {} ({branch}) {said}",
+            id8(rid)
+        ));
+        Ok(())
+    }
+
     /// A change that landed buries its own verdicts. A closed gate-run
     /// whose verdict was `failed` or `lost` stays a red row on the yard's
     /// approach until a car names its branch, a later green answers it,
@@ -2233,6 +2605,22 @@ impl Conductor {
         relaunches: u32,
     ) -> (Option<crate::train_gate::Standing>, u32) {
         use crate::train_gate::{self as tg, Standing};
+        // Filing is already an effect, even if the native CREATE response
+        // cannot be judged. Keep that packet as the train's original attempt;
+        // its normal reconciliation owns the native outcome. An UNKNOWN is
+        // never permission to file a second packet on the next pass.
+        let (launched, uncertain) = match launched {
+            Err(error) => {
+                let filed = error
+                    .downcast_ref::<GateLaunchFailed>()
+                    .and_then(|failure| failure.filed.clone());
+                match filed {
+                    Some(run_id) => (Ok(run_id), Some(format!("{error:#}"))),
+                    None => (Err(error), None),
+                }
+            }
+            ok => (ok, None),
+        };
         match launched {
             Ok(run_id) => {
                 log(format!(
@@ -2248,7 +2636,10 @@ impl Conductor {
                             (tg::KEY_RUN, json!(run_id)),
                             (tg::KEY_LAUNCHED_AT, json!(now.to_rfc3339())),
                             // Filed: the train no longer waits for a reason.
-                            (tg::KEY_WAIT_REASON, Value::Null),
+                            (
+                                tg::KEY_WAIT_REASON,
+                                uncertain.as_ref().map_or(Value::Null, |why| json!(why)),
+                            ),
                             (tg::KEY_BOUND_WAIT, Value::Null),
                         ],
                     )
@@ -2256,13 +2647,33 @@ impl Conductor {
                 {
                     log(format!(
                         "train {}: gate-run {} launched but could not be recorded on the train ({e}) — \
-                         the next pass would file a second gate; retried",
+                         the next pass must recover this original before another CREATE",
                         id8(tid),
                         id8(&run_id)
                     ));
                 }
                 if let Ok(fresh) = self.get_job(tid).await {
                     *t = fresh;
+                }
+                (Some(Standing::Pending), relaunches)
+            }
+            Err(e) if e.downcast_ref::<TrainGateRecoveryHold>().is_some() => {
+                let why = format!("{e:#}");
+                if let Err(error) = self
+                    .merge_job_metadata(
+                        tid,
+                        vec![
+                            (tg::KEY_WAIT_REASON, json!(why)),
+                            (tg::KEY_BOUND_WAIT, Value::Null),
+                            (tg::KEY_FALLBACK, Value::Null),
+                        ],
+                    )
+                    .await
+                {
+                    log(format!(
+                        "train {}: could not retain recovery hold ({error:#}); original attempts remain authoritative",
+                        id8(tid)
+                    ));
                 }
                 (Some(Standing::Pending), relaunches)
             }
@@ -2648,6 +3059,91 @@ impl Conductor {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| short.to_string());
         let title = t.get("title").and_then(Value::as_str).unwrap_or("PR train");
+        // Train metadata can fail to persist after an effective CREATE.
+        // Recover from a complete census of the gate packets themselves,
+        // including closed verdicts. Never choose the newest of duplicates.
+        let filter = json!({"train": tid}).to_string();
+        let attempts = list_original_attempts(|offset| {
+            let filter = &filter;
+            async move {
+                self.api(Method::GET, &format!(
+                    "/api/jobs?kind=gate-run&full=true&limit={PAGE_LIMIT}&offset={offset}&metadata={}",
+                    percent_encoding::utf8_percent_encode(filter, crate::job::QUERY_VALUE)
+                ), None).await
+            }
+        }).await.map_err(|error| TrainGateRecoveryHold(format!("original attempt census unavailable: {error:#}; no new CREATE")))?;
+        let history = &t["metadata"][crate::train_gate::KEY_REFUSALS];
+        let mut retired = Vec::new();
+        if !history.is_null() {
+            let entries = history.as_array().ok_or_else(|| {
+                TrainGateRecoveryHold("retired-attempt history is malformed; no new CREATE".into())
+            })?;
+            for entry in entries {
+                let id = entry["gate_run"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        TrainGateRecoveryHold(
+                            "retired attempt has no identity; no new CREATE".into(),
+                        )
+                    })?;
+                if retired.contains(&id)
+                    || !attempts
+                        .iter()
+                        .any(|attempt| job_id(attempt).ok() == Some(id))
+                {
+                    return Err(TrainGateRecoveryHold(format!(
+                        "retired attempt {id} is missing or duplicated; no new CREATE"
+                    ))
+                    .into());
+                }
+                retired.push(id);
+            }
+        }
+        let mut recoverable = Vec::new();
+        for attempt in &attempts {
+            let id = job_id(attempt).map_err(|error| {
+                TrainGateRecoveryHold(format!(
+                    "census contains an attempt without identity: {error:#}; no new CREATE"
+                ))
+            })?;
+            let md = metadata_map(attempt);
+            if md.get("train").and_then(Value::as_str) != Some(tid)
+                || md.get("train_gate") != Some(&json!(true))
+                || md.get("branch").and_then(Value::as_str) != Some(branch)
+                || md.get("sha").and_then(Value::as_str) != Some(sha.as_str())
+                || md
+                    .get("hold")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+            {
+                return Err(TrainGateRecoveryHold(format!("original train gate {id} has missing or conflicting train/head/intent; no new CREATE")).into());
+            }
+            if retired.contains(&id) {
+                if !matches!(
+                    crate::train_gate::standing(attempt),
+                    crate::train_gate::Standing::Lost | crate::train_gate::Standing::Refused(_)
+                ) {
+                    return Err(TrainGateRecoveryHold(format!(
+                        "retired train gate {id} has no matching refusal verdict; no new CREATE"
+                    ))
+                    .into());
+                }
+                continue;
+            }
+            recoverable.push(id);
+        }
+        match recoverable.as_slice() {
+            [id] => return Ok((*id).to_string()),
+            [] => {}
+            _ => {
+                return Err(TrainGateRecoveryHold(format!(
+                    "multiple original train gates for {tid}@{sha}: {}; no new CREATE",
+                    recoverable.join(", ")
+                ))
+                .into());
+            }
+        }
         self.launch_gate(
             branch,
             &sha,
@@ -2656,8 +3152,9 @@ impl Conductor {
         )
         .await
         // The train counts its failed launches and names the cause
-        // (48f7aba1); a run filed before the failure is settled lost by
-        // the launch itself, and its id rides in this error's text.
+        // (48f7aba1). A run filed before the failure rides in the error
+        // (`GateLaunchFailed::filed`) and is bound to the train as its
+        // original attempt, whatever its native outcome (971c9006).
         .map_err(anyhow::Error::from)
     }
 
@@ -2711,13 +3208,13 @@ impl Conductor {
             // the one predicate `boss gate` also consults.
             let ahead = match who {
                 crate::gate::Requester::Train => Vec::new(),
-                crate::gate::Requester::Car => {
+                crate::gate::Requester::Car | crate::gate::Requester::MainFull => {
                     crate::gate::trains_waiting_now(&self.http, Utc::now())
                         .await
-                        .unwrap_or_else(|why| {
-                            log(format!("gate launch for {branch}: {why}"));
-                            Vec::new()
-                        })
+                        .map_err(anyhow::Error::msg)
+                        .with_context(|| {
+                            format!("gate launch for {branch}: train priority is UNKNOWN")
+                        })?
                 }
             };
             if !crate::gate::admits(live.len(), ahead.len(), max, who) {
@@ -2734,33 +3231,26 @@ impl Conductor {
         let edit_level = self
             .edit_level_to_hand(&format!("gate launch for {branch}"))
             .await;
-        let start = |run_id: &str| -> Result<()> {
-            let job = crate::gate::render_job(&manifest_text, branch, run_id, "--auto")?;
-            let job = crate::gate::hand_edit_level(&job, edit_level.as_ref());
-            let mut child = crate::gate::kubectl(&ns)
-                .args(["create", "-f", "-"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .context("spawning kubectl create — is kubectl in the conductor's image?")?;
-            {
-                use std::io::Write;
-                child
-                    .stdin
-                    .as_mut()
-                    .context("kubectl stdin")?
-                    .write_all(job.as_bytes())?;
+        let start = |run_id: String| {
+            let manifest_text = &manifest_text;
+            let edit_level = &edit_level;
+            let ns = &ns;
+            async move {
+                let job = crate::gate::render_job(manifest_text, branch, &run_id, who.mode())?;
+                let job = crate::gate::hand_edit_level(&job, edit_level.as_ref());
+                crate::gate::launch_controlled(
+                    &self.http,
+                    &self.cfg.jobs,
+                    &run_id,
+                    ns,
+                    sha,
+                    who.mode(),
+                    &job,
+                    Utc::now(),
+                )
+                .await
+                .map(|_| ())
             }
-            let out = child.wait_with_output()?;
-            if !out.status.success() {
-                bail!(
-                    "kubectl create failed for the gate of {}: {}",
-                    branch,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-            }
-            Ok(())
         };
         self.file_and_start_gate(branch, sha, marks, &start).await
     }
@@ -2781,28 +3271,33 @@ impl Conductor {
     /// and let the red rule bound the retry instead of the two-minute
     /// cadence. A settle that cannot be written is journalled: the run is
     /// then one the orphan reaper closes, as before.
-    async fn file_and_start_gate(
+    async fn file_and_start_gate<F, Fut>(
         &self,
         branch: &str,
         sha: &str,
         marks: Value,
-        start: &(dyn Fn(&str) -> Result<()> + Sync),
-    ) -> std::result::Result<String, GateLaunchFailed> {
+        start: &F,
+    ) -> std::result::Result<String, GateLaunchFailed>
+    where
+        F: Fn(String) -> Fut + Sync,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         let owner = self.owner_for_filing().await;
         let filed: Result<String> = async {
-            let created = self
-                .api(
-                    Method::POST,
-                    "/api/jobs",
-                    Some(crate::gate::gate_run_body(
-                        branch,
-                        sha,
-                        &self.cfg.gate_manifest,
-                        None,
-                        &owner,
-                    )),
-                )
-                .await?;
+            let mut body =
+                crate::gate::gate_run_body(branch, sha, &self.cfg.gate_manifest, None, &owner);
+            // Filing identity and intent is one act, before a later PATCH
+            // or native response can be lost.
+            body["metadata"]
+                .as_object_mut()
+                .context("gate filing metadata is not an object")?
+                .extend(
+                    marks
+                        .as_object()
+                        .context("gate filing marks are not an object")?
+                        .clone(),
+                );
+            let created = self.api(Method::POST, "/api/jobs", Some(body)).await?;
             Ok(created
                 .as_ref()
                 .and_then(|c| c.get("data").unwrap_or(c).get("id"))
@@ -2812,17 +3307,26 @@ impl Conductor {
         }
         .await;
         let run_id = filed.map_err(GateLaunchFailed::unfiled)?;
-        let started: Result<()> = async {
-            self.api(
+        // A refused metadata write precedes every native invocation. Once
+        // the sender has been entered, only its exact guarded evidence may
+        // establish no-child; a returned error alone never proves that.
+        if let Err(cause) = self
+            .api(
                 Method::PATCH,
                 &format!("/api/jobs/{run_id}/metadata"),
                 Some(marks),
             )
             .await
-            .with_context(|| format!("marking gate-run {} for {branch}", id8(&run_id)))?;
-            start(&run_id)
+            .with_context(|| format!("marking gate-run {} for {branch}", id8(&run_id)))
+        {
+            self.settle_unstarted_gate_run(&run_id, branch, &cause)
+                .await;
+            return Err(GateLaunchFailed {
+                filed: Some(run_id),
+                cause,
+            });
         }
-        .await;
+        let started = start(run_id.clone()).await;
         match started {
             Ok(()) => {
                 // The run's Job exists: stamp it launched, as `boss gate`
@@ -2848,8 +3352,10 @@ impl Conductor {
                 Ok(run_id)
             }
             Err(cause) => {
-                self.settle_unstarted_gate_run(&run_id, branch, &cause)
-                    .await;
+                log(format!(
+                    "gate-run {run_id} launch outcome UNKNOWN ({cause:#}); \
+                    retained open for exact native/guarded-claim reconciliation"
+                ));
                 Err(GateLaunchFailed {
                     filed: Some(run_id),
                     cause,
@@ -2866,12 +3372,22 @@ impl Conductor {
         let settled: Result<()> = async {
             let run = self.get_job(run_id).await?;
             let verdict_step = find_step(&run, "record-verdict", "Record the gate verdict");
+            let receipt = unstarted_receipt(branch, cause);
+            crate::gate::guard_conductor_settlement(
+                &self.http,
+                &self.cfg.jobs,
+                run_id,
+                &self.cfg.gate_namespace,
+                &json!({"verdict":"lost","receipt":receipt}),
+                Utc::now(),
+            )
+            .await?;
             self.complete_step(
                 &run,
                 verdict_step,
                 &[
                     ("verdict", Some("lost".to_string())),
-                    ("receipt", Some(unstarted_receipt(branch, cause))),
+                    ("receipt", Some(receipt)),
                 ],
             )
             .await
@@ -2937,6 +3453,13 @@ impl Conductor {
         if let Err(e) = self.bury_landed_verdicts(now).await {
             log(format!(
                 "reconcile: burying landed verdicts failed this pass (retries next): {e}"
+            ));
+        }
+        // After the lost settlements and the burial of landed shas: a lost
+        // car gate is relaunched once by the machine (backlog 565131e1).
+        if let Err(e) = self.relaunch_lost_car_gates(now).await {
+            log(format!(
+                "reconcile: the lost-gate relaunch sweep failed this pass (retries next): {e:#}"
             ));
         }
         if let Err(e) = self.follow_up_merge_lost(now).await {
@@ -3483,6 +4006,13 @@ impl Conductor {
                 "stranded-green alarm failed (housekeeping, run stands): {e}"
             ));
         }
+        // Main's full gate goes last, after every train has moved this
+        // pass: it is off the critical path by construction (77596188).
+        if let Err(e) = self.gate_main_in_full(now).await {
+            log(format!(
+                "reconcile: main's full-gate pass failed (retries next): {e:#}"
+            ));
+        }
         Ok(())
     }
 
@@ -3677,6 +4207,301 @@ impl Conductor {
                 ));
             }
         }
+    }
+
+    /// MAIN'S FULL GATE (backlog 77596188; design c6d314a9 Q2, option
+    /// (a), David 2026-10-16): one unscoped gate of current main after a
+    /// converge, LAST in line, and an urgent item naming the trains since
+    /// the last green when it goes red. `boss_jobs::full_gate_on_main`
+    /// decides, pure and tested; this reads its facts and writes what it
+    /// says. A LOOP WRITE: every failure is logged and retried next pass,
+    /// and a dry conductor files, stamps and launches nothing.
+    async fn gate_main_in_full(&self, now: DateTime<Utc>) -> Result<()> {
+        use boss_jobs::full_gate_on_main::{self as fgm, Launch};
+        let filter = json!({ "branch": fgm::BRANCH }).to_string();
+        let q = percent_encoding::utf8_percent_encode(&filter, crate::job::QUERY_VALUE).to_string();
+        let runs = rows(
+            self.api(
+                Method::GET,
+                &format!(
+                    "/api/jobs?kind=gate-run&full=true&limit={}&metadata={q}",
+                    fgm::PAGE
+                ),
+                None,
+            )
+            .await?,
+        )?;
+        // What a closed main gate is owed comes first: an answer never
+        // waits behind a launch decision.
+        for owed in fgm::owed(&runs) {
+            if self.cfg.dry {
+                log(format!("reconcile (dry): main's full gate owes {owed:?}"));
+                continue;
+            }
+            if let Err(e) = self.answer_main_gate(&owed, now).await {
+                log(format!(
+                    "reconcile: main's full gate answer not written this pass (retries next): \
+                     {e:#}"
+                ));
+            }
+        }
+        let clone = self.cfg.clone.as_str();
+        let main_sha = stdout_str(&sh_unchecked(&[
+            "git",
+            "-C",
+            clone,
+            "rev-parse",
+            "--verify",
+            "origin/main",
+        ])?)
+        .trim()
+        .to_string();
+        let newer: BTreeSet<String> = runs
+            .iter()
+            .filter(|r| r.get("metadata").is_some_and(fgm::is_main_gate))
+            .filter_map(|r| r.pointer("/metadata/sha").and_then(Value::as_str))
+            .filter(|s| !s.is_empty() && *s != main_sha)
+            .filter(|s| {
+                sh_unchecked(&[
+                    "git",
+                    "-C",
+                    clone,
+                    "merge-base",
+                    "--is-ancestor",
+                    &main_sha,
+                    s,
+                ])
+                .is_ok_and(|o| o.status.success())
+            })
+            .map(str::to_string)
+            .collect();
+        let trains = rows(
+            self.api(
+                Method::GET,
+                "/api/jobs?kind=pr-train&status=open&limit=50&full=true",
+                None,
+            )
+            .await?,
+        )?;
+        let in_transit = trains
+            .iter()
+            .find(|t| {
+                let converged = find_step(t, "converged", "Cluster converged");
+                step_done(find_step(t, "merged", "Merged into main"))
+                    && converged.is_some()
+                    && !step_done(converged)
+            })
+            .map(|t| {
+                format!(
+                    "train {} ({})",
+                    id8(t.get("id").and_then(Value::as_str).unwrap_or("?")),
+                    t.get("title").and_then(Value::as_str).unwrap_or("PR train")
+                )
+            });
+        let bays = self.main_gate_bays(now).await?;
+        let facts = fgm::LaunchFacts {
+            main_sha: &main_sha,
+            runs: &runs,
+            newer: &newer,
+            in_transit: in_transit.as_deref(),
+            bays,
+        };
+        let Launch::Launch { sha } = fgm::launch(&facts) else {
+            return Ok(());
+        };
+        if self.cfg.dry {
+            log(format!(
+                "reconcile (dry): would launch main's full gate on {}",
+                &sha[..sha.len().min(8)]
+            ));
+            return Ok(());
+        }
+        match self
+            .launch_gate(
+                fgm::BRANCH,
+                &sha,
+                crate::gate::Requester::MainFull,
+                fgm::marks(),
+            )
+            .await
+        {
+            Ok(run) => log(format!(
+                "reconcile: launched main's full gate {} on {}",
+                id8(&run),
+                &sha[..sha.len().min(8)]
+            )),
+            // Refused before filing (the bound moved since the read):
+            // nothing exists, and the next pass decides again.
+            Err(f) => log(format!(
+                "reconcile: main's full gate on {} not launched ({}): {:#}",
+                &sha[..sha.len().min(8)],
+                f.filed
+                    .as_deref()
+                    // Settled lost only when nothing was sent; a native
+                    // UNKNOWN stays open on its packet (971c9006).
+                    .map_or("nothing filed".to_string(), |r| format!(
+                        "filed {}; its packet carries the outcome",
+                        id8(r)
+                    )),
+                f.cause
+            )),
+        }
+        Ok(())
+    }
+
+    /// The bays as `full_gate_on_main::launch` reads them. The claims a
+    /// car's gate counts leniently (a failed read counts none) are carried
+    /// as `Err` here, and the decision yields on it.
+    async fn main_gate_bays(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<boss_jobs::full_gate_on_main::Bays> {
+        let max = crate::gate::max_concurrent(&self.http).await?;
+        let live = crate::gate::running_gates(&self.cfg.gate_namespace)?.len();
+        let open = list_all_pages(|offset| async move {
+            self.api(
+                Method::GET,
+                &format!(
+                    "/api/jobs?kind=gate-run&status=open&full=true&limit={PAGE_LIMIT}&offset={offset}"
+                ),
+                None,
+            )
+            .await
+        })
+        .await?;
+        let trains = crate::gate::trains_waiting_now(&self.http, now).await;
+        let dock = crate::gate::dock_waiting_now(&self.http, now).await;
+        let claims = match (trains, dock) {
+            (Ok(t), Ok(d)) => Ok(t.len() + d),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        };
+        Ok(boss_jobs::full_gate_on_main::Bays {
+            live,
+            max,
+            queued: boss_jobs::full_gate_on_main::car_gates_queued(&open),
+            claims,
+        })
+    }
+
+    /// One answer to a closed main gate: file what it is owed, then stamp
+    /// it. Filed before stamped, deliberately: a stamp that fails after
+    /// the POST files a second item next pass, which is loud; a stamp
+    /// written first and a POST that then failed would be silence.
+    async fn answer_main_gate(
+        &self,
+        owed: &boss_jobs::full_gate_on_main::Owed,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        use boss_jobs::full_gate_on_main::{self as fgm, Owed};
+        let (run, stamp, said) = match owed {
+            Owed::Red {
+                run,
+                sha,
+                checks,
+                green,
+            } => {
+                let commits =
+                    self.main_commits_between(green.as_ref().map(|g| g.1.as_str()), sha)?;
+                let trains = rows(
+                    self.api(
+                        Method::GET,
+                        "/api/jobs?kind=pr-train&status=closed&limit=60&full=true",
+                        None,
+                    )
+                    .await?,
+                )?;
+                let (lines, unmatched) = fgm::trains_in(&trains, &commits);
+                let owner = self.owner_for_filing().await;
+                let body = fgm::red_item_body(
+                    run,
+                    sha,
+                    checks,
+                    green.as_ref(),
+                    &lines,
+                    &unmatched,
+                    &owner,
+                );
+                let item = self.file_main_gate_item(body).await?;
+                (
+                    run,
+                    fgm::answer_stamp(fgm::RED_FILED, now, Some(&item), None),
+                    format!(
+                        "RED — filed item {} naming {} train(s)",
+                        id8(&item),
+                        lines.len()
+                    ),
+                )
+            }
+            Owed::Streak { run, item, first } => (
+                run,
+                fgm::answer_stamp(fgm::RED_STREAK, now, Some(item), Some(first)),
+                format!("RED again, same checks — streak of item {}", id8(item)),
+            ),
+            Owed::LostTwice {
+                run,
+                sha,
+                runs,
+                why,
+            } => {
+                let owner = self.owner_for_filing().await;
+                let item = self
+                    .file_main_gate_item(fgm::lost_item_body(sha, runs, why, &owner))
+                    .await?;
+                (
+                    run,
+                    fgm::answer_stamp(fgm::LOST_FILED, now, Some(&item), None),
+                    format!("lost twice — filed item {}", id8(&item)),
+                )
+            }
+        };
+        self.api(
+            Method::PATCH,
+            &format!("/api/jobs/{run}/metadata"),
+            Some(stamp),
+        )
+        .await?;
+        log(format!("reconcile: main's full gate {}: {said}", id8(run)));
+        Ok(())
+    }
+
+    async fn file_main_gate_item(&self, body: Value) -> Result<String> {
+        let filed = self
+            .api(Method::POST, "/api/jobs", Some(body))
+            .await?
+            .ok_or_else(|| anyhow!("filing main's full-gate item answered no body"))?;
+        Ok(job_id(filed.get("data").unwrap_or(&filed))?.to_string())
+    }
+
+    /// The commits main took between the last green full gate and a red
+    /// one — each a train's merge, since only trains move main. With no
+    /// green on record, the ten up to the red, which the item says.
+    fn main_commits_between(&self, green: Option<&str>, red: &str) -> Result<Vec<String>> {
+        let range = green.map(|g| format!("{g}..{red}"));
+        let mut args = vec![
+            "git",
+            "-C",
+            self.cfg.clone.as_str(),
+            "rev-list",
+            "--first-parent",
+        ];
+        match &range {
+            Some(r) => args.push(r),
+            None => args.extend(["--max-count=10", red]),
+        }
+        let out = sh_unchecked(&args)?;
+        if !out.status.success() {
+            bail!(
+                "git rev-list {} failed: {}",
+                range.as_deref().unwrap_or(red),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(stdout_str(&out)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     /// Close an alarm backlog-item the conductor filed, with `writes`
@@ -5337,6 +6162,14 @@ impl Conductor {
     /// set per waiting car per departure.
     pub(super) async fn refresh(&self) -> Result<()> {
         if let Some(occupant) = self.track_occupant().await? {
+            // Evidence-only recovery owes nothing to a clear track. Keep the
+            // ordinary diagnostic drain (and its native launch admission)
+            // below the clear-track fence, even when this reader refuses.
+            if let Err(error) = super::diagnostic_adapter::drain_recovery_assessments(self).await {
+                log(format!(
+                    "diagnostic recovery UNKNOWN (track remains occupied): {error:#}; assessment remains pending, no diagnostic pass recorded"
+                ));
+            }
             let cars = list_all_pages(|offset| async move {
                 self.api(
                     Method::GET,
@@ -5951,6 +6784,9 @@ impl Conductor {
             &train_branch,
             "origin/main",
         ])?;
+        let delivery_base = stdout_str(&sh(&["git", "-C", clone, "rev-parse", "HEAD"])?)
+            .trim()
+            .to_owned();
         // (car, branch, boarded head) — the head is WHAT boarded, and
         // the sweep's licence to delete the branch later depends on it
         // (car 23923b40). Read from the fetched `fork/<branch>` ref,
@@ -6246,11 +7082,30 @@ impl Conductor {
         // A car with no stamp reads as software, its own default
         // (cffef553, 2026-09-15).
         let train_channel = crate::channels::train_channel(boarded.iter().map(|(j, _, _)| j));
+        let delivery_head = stdout_str(&sh(&["git", "-C", clone, "rev-parse", "HEAD"])?)
+            .trim()
+            .to_owned();
+        let candidate_plan = crate::delivery_plan::request(&json!({"operation":"git_plan",
+            "repo":clone,"base":delivery_base,"head":delivery_head})).await
+            .unwrap_or_else(|error|json!({"schema":1,"route":"software","reason":format!("shared delivery judgement unread: {error:#}")}));
+        let expected_policy = json!({"name":delivery_policy::POLICY_NAME,
+            "version":self.policy.version,"channels":self.policy.channels});
+        let delivery_plan = if crate::delivery_plan::compatible_completion(&train)
+            && self.policy.is_from_registry()
+            && candidate_plan["policy"] == expected_policy
+        {
+            candidate_plan
+        } else {
+            json!({"schema":1,"route":"software",
+            "reason":"admitted completion protocol or native pinned policy does not authorize lighter delivery",
+            "candidate_plan":candidate_plan})
+        };
         self.merge_job_metadata(
             &train_id,
             vec![
                 ("boarded_jobs", json!(boarded_ids)),
                 ("delivery_channel", json!(train_channel)),
+                ("delivery_plan", delivery_plan),
                 ("skipped_branches", json!(skipped_branches)),
                 // The train's own record of who it left behind and
                 // why — the arrival report reads THIS, because a
@@ -7683,6 +8538,10 @@ mod tests {
         let patches_route = patches.clone();
         let app = Router::new()
             .route(
+                "/api/jobs",
+                get(|| async { Json(json!({"data":[], "total":0})) }),
+            )
+            .route(
                 "/api/jobs/{id}",
                 get(move |Path(_id): Path<String>| {
                     let t = train_one.clone();
@@ -7822,6 +8681,619 @@ mod tests {
         c
     }
 
+    #[tokio::test]
+    async fn actual_ingress_retains_large_census_refusal_for_handback() {
+        use axum::{
+            Json, Router,
+            routing::{get, patch},
+        };
+        use std::sync::{Arc, Mutex};
+        let now = Utc::now();
+        let original = Arc::new(Mutex::new(lost_census_fixture(now)));
+        let written = original.clone();
+        let bad_body = json!({"data": [], "padding": "x".repeat(9 * 1024 * 1024)});
+        let app = Router::new()
+            .route(
+                "/api/jobs",
+                get(move || {
+                    let body = bad_body.clone();
+                    async move { Json(body) }
+                }),
+            )
+            .route(
+                "/api/jobs/{id}/metadata",
+                patch(move |Json(body): Json<Value>| {
+                    let mut current = written.lock().unwrap();
+                    for (key, value) in body.as_object().unwrap() {
+                        current["metadata"][key] = value.clone();
+                    }
+                    async { axum::http::StatusCode::NO_CONTENT }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = gate_place_conductor(format!("http://{address}"));
+        for _ in 0..2 {
+            let before = original.lock().unwrap().clone();
+            assert!(
+                c.relaunch_lost_car_gate(&before, "lost-original", now)
+                    .await
+                    .is_err()
+            );
+        }
+        let after = original.lock().unwrap().clone();
+        server.abort();
+        assert!(
+            boss_jobs::lost_gate::is_candidate(&after, now + chrono::Duration::hours(7)),
+            "malformed census refusal was rejected by actual default ingress and the unresolved lost run silently aged out of handback eligibility"
+        );
+    }
+
+    #[tokio::test]
+    async fn small_and_large_http_census_refusals_keep_originals_and_handback() {
+        use axum::{
+            Json, Router,
+            body::Body,
+            response::Response,
+            routing::{get, patch},
+        };
+        use boss_jobs::lost_gate as lg;
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for padding in [0, 9 * 1024 * 1024] {
+            for action in [None, Some(lg::ATTEMPTING), Some(lg::LAUNCH_FAILED)] {
+                let now = Utc::now();
+                let mut run = lost_census_fixture(now);
+                if let Some(action) = action {
+                    run["metadata"][lg::STAMP] = json!({"action":action,"run":"genuine-original-attempt","at":now.to_rfc3339(),"reason":"original cause"});
+                }
+                let saved = Arc::new(Mutex::new(run.clone()));
+                let written = saved.clone();
+                let writes = Arc::new(AtomicUsize::new(0));
+                let saved_count = writes.clone();
+                let posts = Arc::new(AtomicUsize::new(0));
+                let post_count = posts.clone();
+                let original_body = format!(
+                    "original error first line\n{}\noriginal error final line",
+                    "x".repeat(padding)
+                );
+                let body = original_body.clone();
+                let app = Router::new()
+                    .route(
+                        "/api/jobs",
+                        get(move || {
+                            let body = body.clone();
+                            async move {
+                                Response::builder()
+                                    .status(409)
+                                    .body(Body::from(body))
+                                    .unwrap()
+                            }
+                        })
+                        .post(move || {
+                            post_count.fetch_add(1, Ordering::SeqCst);
+                            async { Json(json!({"id":"unexpected-launch"})) }
+                        }),
+                    )
+                    .route(
+                        "/api/jobs/{id}/metadata",
+                        patch(move |Json(body): Json<Value>| {
+                            saved_count.fetch_add(1, Ordering::SeqCst);
+                            let mut current = written.lock().unwrap();
+                            for (key, value) in body.as_object().unwrap() {
+                                assert_ne!(
+                                    key,
+                                    lg::STAMP,
+                                    "a census refusal must preserve an actual attempt"
+                                );
+                                current["metadata"][key] = value.clone();
+                            }
+                            async { axum::http::StatusCode::NO_CONTENT }
+                        }),
+                    );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let c = gate_place_conductor(format!("http://{address}"));
+                for _ in 0..2 {
+                    let before = saved.lock().unwrap().clone();
+                    let error = c
+                        .relaunch_lost_car_gate(&before, "lost-original", now)
+                        .await
+                        .unwrap_err();
+                    // The actual owning sweep journals this full chain with
+                    // {e:#}; the metadata descriptor cannot replace it.
+                    assert!(format!("{error:#}").contains(&original_body));
+                }
+                let after = saved.lock().unwrap().clone();
+                server.abort();
+                assert_eq!(posts.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    writes.load(Ordering::SeqCst),
+                    2,
+                    "ordinary Json ingress must accept the refusal"
+                );
+                assert_eq!(after["metadata"][lg::STAMP], run["metadata"][lg::STAMP]);
+                assert_eq!(after["metadata"][lg::REFUSALS]["count"], 2);
+                assert!(serde_json::to_vec(&after).unwrap().len() < 4096);
+                assert!(lg::is_candidate(&after, now + chrono::Duration::hours(7)));
+            }
+        }
+    }
+
+    fn lost_census_fixture(now: DateTime<Utc>) -> Value {
+        json!({"id":"lost-original","kind":"gate-run","status":"closed",
+            "opened_at":(now-chrono::Duration::minutes(30)).to_rfc3339(),
+            "metadata":{"branch":"fix/lost-census","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "park_summary":"retained intent","park_excludes":"none","park_test":"source controls",
+                "park_verified":"not runtime proof","park_partial_item":"original-item",
+                "park_probe":"echo ok","park_expect":"ok","hold":"distinct review"},
+            "steps":[{"spec_slug":"record-verdict","status":"completed",
+                "completed_at":(now-chrono::Duration::minutes(10)).to_rfc3339(),
+                "metadata":{"verdict":"lost"}}]})
+    }
+
+    #[tokio::test]
+    async fn an_api_response_is_bounded_before_materializing_json() {
+        use axum::{Router, body::Body, response::Response, routing::get};
+        let limit = MAX_INVENTORY_BYTES;
+        let oversized = serde_json::to_vec(&json!({"padding":"x".repeat(limit)})).unwrap();
+        let known = oversized.clone();
+        let app = Router::new()
+            .route(
+                "/known",
+                get(move || {
+                    let body = known.clone();
+                    async move { Response::new(Body::from(body)) }
+                }),
+            )
+            .route(
+                "/chunked",
+                get(move || {
+                    let body = oversized.clone();
+                    async move {
+                        Response::new(Body::from_stream(futures::stream::iter([Ok::<
+                            _,
+                            std::io::Error,
+                        >(
+                            body
+                        )])))
+                    }
+                }),
+            )
+            .route(
+                "/exact",
+                get(move || async move {
+                    Response::new(Body::from(format!("{{}}{}", " ".repeat(limit - 2))))
+                }),
+            )
+            .route(
+                "/error",
+                get(|| async {
+                    Response::builder()
+                        .status(409)
+                        .body(Body::from(
+                            "original first line\nall diagnostic details\noriginal final line\n",
+                        ))
+                        .unwrap()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = gate_place_conductor(format!("http://{address}"));
+        for path in ["/known", "/chunked"] {
+            let error = c
+                .api_once(Method::GET, path, None)
+                .await
+                .expect_err("oversized response must refuse before JSON");
+            assert!(format!("{:#}", error.cause).contains("response byte bound"));
+        }
+        assert_eq!(
+            c.api_once(Method::GET, "/exact", None)
+                .await
+                .map_err(|e| e.cause)
+                .unwrap(),
+            Some(json!({}))
+        );
+        let error = c.api_once(Method::GET, "/error", None).await.err().unwrap();
+        assert!(
+            format!("{:#}", error.cause)
+                .contains("original first line\nall diagnostic details\noriginal final line")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lost_car_incomplete_histories_do_not_stamp_an_attempt_or_post() {
+        use axum::{
+            Json, Router,
+            extract::Query,
+            routing::{get, patch},
+        };
+        use std::collections::HashMap;
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for missing_kind in ["gate-run", "ship-a-change"] {
+            let writes = Arc::new(AtomicUsize::new(0));
+            let write = writes.clone();
+            let stamp = writes.clone();
+            let app = Router::new()
+                .route(
+                    "/api/jobs",
+                    get(
+                        move |Query(query): Query<HashMap<String, String>>| async move {
+                            Json(
+                                json!({"data":[],"total":usize::from(query["kind"]==missing_kind)}),
+                            )
+                        },
+                    )
+                    .post(move || {
+                        write.fetch_add(1, Ordering::SeqCst);
+                        async { Json(json!({"id":"unexpected"})) }
+                    }),
+                )
+                .route(
+                    "/api/jobs/{id}/metadata",
+                    patch(move |Json(body): Json<Value>| {
+                        if body.get("lost_relaunch").is_some() {
+                            stamp.fetch_add(1, Ordering::SeqCst);
+                        }
+                        async { axum::http::StatusCode::NO_CONTENT }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut c = gate_place_conductor(format!("http://{address}"));
+            c.forge = Box::new(SweepForge {
+                deleted: Arc::new(Mutex::new(Vec::new())),
+                head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                performs_deletes: false,
+            });
+            let now = Utc::now();
+            let error = c
+                .relaunch_lost_car_gate(&lost_census_fixture(now), "lost-original", now)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                writes.load(Ordering::SeqCst),
+                0,
+                "{missing_kind}: {error:#}"
+            );
+            assert!(format!("{error:#}").contains("census"), "{error:#}");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_car_sweep_reads_past_one_hundred_closed_runs_before_acting() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        let now = Utc::now();
+        let mut runs: Vec<Value> = (0..100)
+            .map(|id| json!({"id":format!("old-{id}"),"status":"closed","metadata":{}}))
+            .collect();
+        runs.push(lost_census_fixture(now));
+        let reads = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let offsets = reads.clone();
+        let app=Router::new().route("/api/jobs",get(move |Query(query):Query<HashMap<String,String>>| {
+            let offset=query.get("offset").map(|v|v.parse::<usize>().unwrap()).unwrap_or(0);
+            offsets.lock().unwrap().push(offset);
+            let body=if query.contains_key("status") {json!({"total":101,"data":runs.iter().skip(offset).take(PAGE_LIMIT).collect::<Vec<_>>()})} else {json!({"total":1,"data":[]})};
+            async move {Json(body)}
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = gate_place_conductor(format!("http://{address}"));
+        c.relaunch_lost_car_gates(now).await.unwrap();
+        assert!(
+            reads.lock().unwrap().contains(&100),
+            "the actionable tail must be read"
+        );
+        assert!(
+            reads.lock().unwrap().len() > 2,
+            "the tail candidate must reach its own guard reads"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lost_car_truncated_candidate_census_is_not_a_successful_empty_sweep() {
+        use axum::{Json, Router, routing::get};
+        let app = Router::new().route(
+            "/api/jobs",
+            get(|| async { Json(json!({"data":[],"total":1})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = gate_place_conductor(format!("http://{address}"));
+        assert!(c.relaunch_lost_car_gates(Utc::now()).await.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lost_car_candidate_partition_keeps_old_unfinished_work_and_judges_the_whole_union() {
+        use axum::{
+            Json, Router,
+            extract::{Path, Query},
+            response::IntoResponse,
+            routing::{get, patch},
+        };
+        use boss_jobs::lost_gate as lg;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        for mode in ["complete", "conflicting", "missing-partition"] {
+            let now = Utc::now();
+            let mut recent = lost_census_fixture(now);
+            recent["closed_on"] = Value::Null;
+            let mut old_attempt = recent.clone();
+            old_attempt["id"] = json!("old-attempt");
+            old_attempt["steps"][0]["completed_at"] =
+                json!((now - chrono::Duration::days(7)).to_rfc3339());
+            old_attempt["metadata"][lg::STAMP] =
+                json!({"action":lg::ATTEMPTING,"run":"original-attempt"});
+            old_attempt["metadata"][lg::REFUSALS] = json!({"count":1,"last":[]});
+            let mut old_failed = old_attempt.clone();
+            old_failed["id"] = json!("old-failed");
+            old_failed["metadata"][lg::STAMP] =
+                json!({"action":lg::LAUNCH_FAILED,"run":"original-failed-attempt"});
+            old_failed["metadata"]
+                .as_object_mut()
+                .unwrap()
+                .remove(lg::REFUSALS);
+            let mut undated = old_failed.clone();
+            undated["id"] = json!("undated-attempt");
+            undated["steps"][0]["completed_at"] = Value::Null;
+            let mut old_refused = old_attempt.clone();
+            old_refused["id"] = json!("old-refused");
+            old_refused["metadata"]
+                .as_object_mut()
+                .unwrap()
+                .remove(lg::STAMP);
+            let write_ids = Arc::new(Mutex::new(Vec::new()));
+            let writes = write_ids.clone();
+            let app=Router::new().route("/api/jobs",get(move |Query(q):Query<HashMap<String,String>>| {
+                let body=if q.contains_key("metadata") {
+                    json!({"total":1,"data":[]})
+                } else if let Some(cutoff)=q.get("step_completed_since") {
+                    assert_eq!(chrono::DateTime::parse_from_rfc3339(cutoff).unwrap().to_utc(),now-chrono::Duration::hours(lg::WINDOW_HOURS));
+                    json!({"total":1,"data":[recent.clone()]})
+                } else if q.get("metadata_has").map(String::as_str)==Some(lg::STAMP) {
+                    json!({"total":3,"data":[old_attempt.clone(),old_failed.clone(),undated.clone()]})
+                } else if q.get("metadata_has").map(String::as_str)==Some(lg::REFUSALS) {
+                    let mut repeated=old_attempt.clone();
+                    if mode=="conflicting" {repeated["metadata"]["changed_after_first_read"]=json!(true);}
+                    if mode=="missing-partition" {json!({"total":2,"data":[]})} else {json!({"total":2,"data":[repeated,old_refused.clone()]})}
+                } else {
+                    return std::future::ready((axum::http::StatusCode::BAD_REQUEST,"unbounded census unsupported").into_response());
+                };
+                std::future::ready(Json(body).into_response())
+            })).route("/api/jobs/{id}/metadata",patch(move |Path(id):Path<String>,Json(body):Json<Value>| {
+                assert!(body.get(lg::STAMP).is_none(),"a refused census preserves original attempt stamps");
+                writes.lock().unwrap().push(id);
+                async {axum::http::StatusCode::NO_CONTENT}
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let c = gate_place_conductor(format!("http://{address}"));
+            let result = c.relaunch_lost_car_gates(now).await;
+            let mut recorded = write_ids.lock().unwrap().clone();
+            recorded.sort();
+            if mode == "complete" {
+                result.unwrap();
+                assert_eq!(
+                    recorded,
+                    [
+                        "lost-original",
+                        "old-attempt",
+                        "old-failed",
+                        "old-refused",
+                        "undated-attempt"
+                    ]
+                );
+            } else {
+                assert!(result.is_err());
+                assert!(
+                    recorded.is_empty(),
+                    "no candidate acts before every partition is judged"
+                );
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_car_census_refusal_survives_its_window_without_erasing_an_attempt() {
+        use axum::{
+            Json, Router,
+            routing::{get, patch},
+        };
+        use boss_jobs::lost_gate as lg;
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for action in [None, Some(lg::ATTEMPTING), Some(lg::LAUNCH_FAILED)] {
+            for dry in [false, true] {
+                let now = Utc::now();
+                let mut original = lost_census_fixture(now);
+                if let Some(action) = action {
+                    original["metadata"][lg::STAMP] = json!({"action":action,"run":"genuine-original-attempt","at":now.to_rfc3339(),"reason":"retained original cause"});
+                }
+                let saved = Arc::new(Mutex::new(original.clone()));
+                let updated = saved.clone();
+                let posts = Arc::new(AtomicUsize::new(0));
+                let count = posts.clone();
+                let app = Router::new()
+                    .route(
+                        "/api/jobs",
+                        get(|| async { Json(json!({"total":1,"data":[]})) }).post(move || {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            async { Json(json!({"id":"unexpected"})) }
+                        }),
+                    )
+                    .route(
+                        "/api/jobs/{id}/metadata",
+                        patch(move |Json(body): Json<Value>| {
+                            let mut job = updated.lock().unwrap();
+                            for (key, value) in body.as_object().unwrap() {
+                                if value.is_null() {
+                                    job["metadata"].as_object_mut().unwrap().remove(key);
+                                } else {
+                                    job["metadata"][key] = value.clone();
+                                }
+                            }
+                            async { axum::http::StatusCode::NO_CONTENT }
+                        }),
+                    );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let mut c = gate_place_conductor(format!("http://{address}"));
+                c.cfg.dry = dry;
+                assert!(
+                    c.relaunch_lost_car_gate(&original, "lost-original", now)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(posts.load(Ordering::SeqCst), 0);
+                let after = saved.lock().unwrap().clone();
+                assert_eq!(
+                    after["metadata"][lg::STAMP],
+                    original["metadata"][lg::STAMP]
+                );
+                if dry {
+                    assert_eq!(after, original);
+                } else {
+                    assert_eq!(after["metadata"][lg::REFUSALS]["count"], 1);
+                    let later = now + chrono::Duration::hours(lg::WINDOW_HOURS + 1);
+                    assert!(lg::is_candidate(&after, later));
+                    assert!(matches!(
+                        lg::answer(&lg::Facts {
+                            lost: &after,
+                            branch_head: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                            others: &[],
+                            landed: false,
+                            car: lg::CarStanding::NoCar,
+                            now: later
+                        }),
+                        Some(lg::Answer::FileFailure { .. })
+                    ));
+                }
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_car_hidden_tail_holds_but_complete_newer_gate_or_landed_car_declines() {
+        use axum::{
+            Json, Router,
+            extract::Query,
+            routing::{get, patch},
+        };
+        use std::collections::HashMap;
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for guarded_kind in ["gate-run", "ship-a-change"] {
+            for missing_tail in [true, false] {
+                let now = Utc::now();
+                let stamps = Arc::new(Mutex::new(Vec::<Value>::new()));
+                let saved = stamps.clone();
+                let posts = Arc::new(AtomicUsize::new(0));
+                let count = posts.clone();
+                let first:Vec<Value>=(0..100).map(|id|json!({"id":format!("older-{id}"),"status":"open",
+                    "opened_at":(now-chrono::Duration::minutes(120)).to_rfc3339(),
+                    "metadata":{"branch":"fix/lost-census","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}})).collect();
+                let tail = if guarded_kind == "gate-run" {
+                    json!({"id":"newer-gate","kind":"gate-run","status":"open",
+                    "opened_at":(now-chrono::Duration::minutes(5)).to_rfc3339(),
+                    "metadata":{"branch":"fix/lost-census","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}})
+                } else {
+                    json!({"id":"landed-car","status":"closed","metadata":{"branch":"fix/lost-census","merged":true}})
+                };
+                let app = Router::new()
+                    .route(
+                        "/api/jobs",
+                        get(move |Query(query): Query<HashMap<String, String>>| {
+                            let offset = query["offset"].parse::<usize>().unwrap();
+                            let data = if query["kind"] != guarded_kind {
+                                Vec::new()
+                            } else if offset == 0 {
+                                first.clone()
+                            } else if missing_tail {
+                                Vec::new()
+                            } else {
+                                vec![tail.clone()]
+                            };
+                            let total = if query["kind"] == guarded_kind {
+                                101
+                            } else {
+                                0
+                            };
+                            async move { Json(json!({"total":total,"data":data})) }
+                        })
+                        .post(move || {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            async { Json(json!({"id":"unexpected"})) }
+                        }),
+                    )
+                    .route(
+                        "/api/jobs/{id}/metadata",
+                        patch(move |Json(body): Json<Value>| {
+                            saved.lock().unwrap().push(body);
+                            async { axum::http::StatusCode::NO_CONTENT }
+                        }),
+                    );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let mut c = gate_place_conductor(format!("http://{address}"));
+                c.forge = Box::new(SweepForge {
+                    deleted: Arc::new(Mutex::new(Vec::new())),
+                    head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    performs_deletes: false,
+                });
+                let result = c
+                    .relaunch_lost_car_gate(&lost_census_fixture(now), "lost-original", now)
+                    .await;
+                assert_eq!(posts.load(Ordering::SeqCst), 0);
+                if missing_tail {
+                    assert!(result.is_err());
+                    assert_eq!(stamps.lock().unwrap().len(), 1);
+                    assert!(
+                        stamps.lock().unwrap()[0].get("lost_relaunch").is_none(),
+                        "incomplete history must not spend or erase an attempt"
+                    );
+                    assert_eq!(
+                        stamps.lock().unwrap()[0]["lost_relaunch_refusals"]["count"],
+                        1
+                    );
+                } else {
+                    result.unwrap();
+                    assert_eq!(stamps.lock().unwrap().len(), 1);
+                    assert_eq!(
+                        stamps.lock().unwrap()[0]["lost_relaunch"]["action"],
+                        "declined"
+                    );
+                }
+                server.abort();
+            }
+        }
+    }
+
     fn train_with_open_ci(metadata: Value) -> Value {
         json!({
             "id": "t1", "kind": "pr-train", "status": "open", "title": "PR train 12:00",
@@ -7918,6 +9390,392 @@ mod tests {
     /// spends NONE of the launch failures that read the gate unavailable,
     /// and is written only when the line changes — a long wait is not an
     /// audit event per pass.
+    #[tokio::test]
+    async fn incomplete_original_attempt_census_holds_before_any_post() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        use std::collections::HashMap;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let original = json!({"id":"original-gate", "kind":"gate-run", "metadata":{
+            "train":"t1","train_gate":true,"branch":"train/x","sha":"abcdef1","hold":"train gate"
+        }});
+        let full_page: Vec<Value> = (0..PAGE_LIMIT)
+            .map(|id| {
+                let mut row = original.clone();
+                row["id"] = json!(format!("original-{id}"));
+                row
+            })
+            .collect();
+        for pages in [
+            vec![json!({"data":[],"total":1})],
+            vec![
+                json!({"data":[original.clone()],"total":2}),
+                json!({"data":[],"total":2}),
+            ],
+            vec![
+                json!({"data":[original.clone()],"total":2}),
+                json!({"data":[original.clone()],"total":2}),
+            ],
+            vec![
+                json!({"data":[original.clone()],"total":2}),
+                json!({"data":[{"id":"other"}],"total":3}),
+            ],
+            vec![
+                json!({"data":full_page,"total":101}),
+                json!({"data":[],"total":101}),
+            ],
+        ] {
+            let posts = Arc::new(AtomicUsize::new(0));
+            let count = posts.clone();
+            let app = Router::new().route(
+                "/api/jobs",
+                get(move |Query(query): Query<HashMap<String, String>>| {
+                    let offset = query["offset"].parse::<usize>().unwrap();
+                    let page = pages[usize::from(offset > 0).min(pages.len() - 1)].clone();
+                    async move { Json(page) }
+                })
+                .post(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    async { Json(json!({"id":"unexpected"})) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let c = gate_place_conductor(format!("http://{address}"));
+            let train = train_with_open_ci(json!({"train_ref":"train/x@abcdef1"}));
+            let error = c.launch_train_gate(&train, "t1").await.unwrap_err();
+            assert!(
+                error.downcast_ref::<TrainGateRecoveryHold>().is_some(),
+                "{error:#}"
+            );
+            assert_eq!(posts.load(Ordering::SeqCst), 0);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_malformed_retired_attempts_do_not_authorize_recovery() {
+        use axum::{Json, Router, routing::get};
+        for history in [
+            json!([{"gate_run":"missing-original"}]),
+            json!(123),
+            json!([{}]),
+        ] {
+            let app = Router::new().route("/api/jobs", get(|| async {
+                Json(json!({"total":1,"data":[{"id":"original-gate","kind":"gate-run","metadata":{
+                    "train":"t1","train_gate":true,"branch":"train/x","sha":"abcdef1","hold":"train gate"
+                }}]}))
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let c = gate_place_conductor(format!("http://{address}"));
+            let train = train_with_open_ci(
+                json!({"train_ref":"train/x@abcdef1","train_gate_refusals":history}),
+            );
+            let error = c.launch_train_gate(&train, "t1").await.unwrap_err();
+            assert!(
+                error.downcast_ref::<TrainGateRecoveryHold>().is_some(),
+                "{error:#}"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lost_train_binding_write_and_restart_do_not_repeat_the_native_launch() {
+        use axum::{
+            Json, Router,
+            extract::Path,
+            routing::{get, patch, post},
+        };
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let saved = Arc::new(Mutex::new(None::<Value>));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let (write, read, count) = (saved.clone(), saved.clone(), posts.clone());
+        let train = train_with_open_ci(json!({"train_ref":"train/x@abcdef1"}));
+        let original_train = train.clone();
+        let app = Router::new()
+            .route(
+                "/api/jobs",
+                post(move |Json(mut body): Json<Value>| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    body["id"] = json!("original-gate");
+                    *write.lock().unwrap() = Some(body);
+                    async { Json(json!({"id":"original-gate"})) }
+                })
+                .get(move || {
+                    let data: Vec<Value> = read.lock().unwrap().clone().into_iter().collect();
+                    async move { Json(json!({"total":data.len(),"data":data})) }
+                }),
+            )
+            .route(
+                "/api/jobs/{id}",
+                get(move || {
+                    let train = original_train.clone();
+                    async move { Json(train) }
+                }),
+            )
+            .route(
+                "/api/jobs/{id}/metadata",
+                patch(|Path(id): Path<String>| async move {
+                    if id == "t1" {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = gate_place_conductor(format!("http://{address}"));
+        let native_calls = AtomicUsize::new(0);
+        let start = |_: String| {
+            native_calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Err(anyhow!("acknowledgement lost after native launch")))
+        };
+        let attempt = c
+            .file_and_start_gate(
+                "train/x",
+                "abcdef1",
+                crate::train_gate::packet_marks("t1", "test train"),
+                &start,
+            )
+            .await;
+        let mut t = train;
+        c.record_train_gate_launch(
+            &mut t,
+            "t1",
+            Utc::now(),
+            attempt.map_err(anyhow::Error::from),
+            0,
+        )
+        .await;
+        assert!(
+            t["metadata"][crate::train_gate::KEY_RUN].is_null(),
+            "binding write really failed"
+        );
+        // A new conductor has no in-memory knowledge of the previous call.
+        let restarted = gate_place_conductor(format!("http://{address}"));
+        assert_eq!(
+            restarted.launch_train_gate(&t, "t1").await.unwrap(),
+            "original-gate"
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        assert_eq!(native_calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_original_attempts_never_fall_back_to_ci_alone() {
+        use crate::train_gate as tg;
+        let train = train_with_open_ci(
+            json!({"train_gate_launch_failures":10, "train_gate_fallback":"a previous unavailable observation"}),
+        );
+        let (jobs, rows, _) = holding_jobs_api(vec![train.clone()]).await;
+        let mut c = gate_place_conductor(jobs);
+        c.cfg.gate_required = false;
+        let mut t = train;
+        let result = c
+            .record_train_gate_launch(
+                &mut t,
+                "t1",
+                Utc::now(),
+                Err(TrainGateRecoveryHold("two original attempts; no new CREATE".into()).into()),
+                0,
+            )
+            .await;
+        assert_eq!(result, (Some(tg::Standing::Pending), 0));
+        let rows = rows.lock().unwrap();
+        assert!(rows["t1"]["metadata"][tg::KEY_FALLBACK].is_null());
+        assert_eq!(rows["t1"]["metadata"][tg::KEY_LAUNCH_FAILURES], json!(10));
+    }
+
+    #[tokio::test]
+    async fn conflicting_original_train_gates_are_a_recovery_hold_before_any_post() {
+        use axum::{Json, Router, routing::get};
+        let original = json!({"id":"original-gate", "kind":"gate-run", "status":"open",
+            "metadata":{"train":"t1", "train_gate":true, "branch":"train/x", "sha":"abcdef1", "hold":"train gate"}});
+        let mut other = original.clone();
+        other["id"] = json!("other-gate");
+        let mut wrong_head = original.clone();
+        wrong_head["metadata"]["sha"] = json!("different-head");
+        let mut missing_intent = original.clone();
+        missing_intent["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("hold");
+        for attempts in [
+            vec![original.clone(), other],
+            vec![wrong_head],
+            vec![missing_intent],
+        ] {
+            let app = Router::new().route(
+                "/api/jobs",
+                get(move || {
+                    let attempts = attempts.clone();
+                    async move { Json(json!({"total":attempts.len(), "data":attempts})) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let c = gate_place_conductor(format!("http://{address}"));
+            let train = train_with_open_ci(json!({"train_ref":"train/x@abcdef1"}));
+            let error = c.launch_train_gate(&train, "t1").await.unwrap_err();
+            assert!(
+                error.downcast_ref::<TrainGateRecoveryHold>().is_some(),
+                "{error:#}"
+            );
+            assert!(format!("{error:#}").contains("no new CREATE"));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restarted_conductor_recovers_the_existing_train_gate_without_a_post() {
+        use axum::{Json, Router, routing::get};
+        let run = json!({"id":"original-gate", "kind":"gate-run", "status":"open",
+            "metadata":{"train":"t1", "train_gate":true, "branch":"train/x", "sha":"abcdef1", "hold":"train gate"}});
+        let app = Router::new().route(
+            "/api/jobs",
+            get(move || {
+                let run = run.clone();
+                async move { Json(json!({"data":[run],"total":1})) }
+            }),
+        );
+        // There is deliberately no POST handler or native launcher. Recovery
+        // must finish from the existing packet before either is attempted.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = gate_place_conductor(format!("http://{address}"));
+        let train = train_with_open_ci(json!({"train_ref":"train/x@abcdef1"}));
+        assert_eq!(
+            c.launch_train_gate(&train, "t1").await.unwrap(),
+            "original-gate"
+        );
+        server.abort();
+    }
+
+    /// Train 48bbc0b3's first gate went GREEN and closed while the train
+    /// still had no train_gate_run, and the next pass filed a second gate
+    /// on the same head (971c9006). Through the whole pass, a completed
+    /// GREEN original is bound back onto the train and its verdict read —
+    /// zero POSTs, so zero native launches.
+    #[tokio::test]
+    async fn a_completed_green_original_is_bound_and_read_without_a_post() {
+        use crate::train_gate::{self as tg, Standing};
+        use axum::{
+            Json, Router,
+            extract::Path,
+            routing::{get, patch},
+        };
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let green = json!({"id":"original-gate", "kind":"gate-run", "status":"closed",
+            "metadata":{"train":"t1", "train_gate":true, "branch":"train/x", "sha":"abcdef1", "hold":"train gate"},
+            "steps":[{"id":"s-v","spec_slug":"record-verdict","title":"Record the gate verdict",
+                "status":"completed","metadata":{"verdict":"green"}}]});
+        let train = train_with_open_ci(json!({"train_ref":"train/x@abcdef1"}));
+        let rows = Arc::new(Mutex::new(std::collections::HashMap::from([
+            ("t1".to_string(), train.clone()),
+            ("original-gate".to_string(), green.clone()),
+        ])));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let (read, write, count) = (rows.clone(), rows.clone(), posts.clone());
+        let app = Router::new()
+            .route(
+                "/api/jobs",
+                get(move || {
+                    let green = green.clone();
+                    async move { Json(json!({"data":[green],"total":1})) }
+                })
+                .post(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }
+                }),
+            )
+            .route(
+                "/api/jobs/{id}",
+                get(move |Path(id): Path<String>| {
+                    let row = read.lock().unwrap().get(&id).cloned();
+                    async move { row.map(Json).ok_or(axum::http::StatusCode::NOT_FOUND) }
+                }),
+            )
+            .route(
+                "/api/jobs/{id}/metadata",
+                patch(move |Path(id): Path<String>, Json(body): Json<Value>| {
+                    let mut rows = write.lock().unwrap();
+                    let md = rows.get_mut(&id).unwrap()["metadata"]
+                        .as_object_mut()
+                        .unwrap();
+                    for (key, value) in body.as_object().unwrap() {
+                        if value.is_null() {
+                            md.remove(key);
+                        } else {
+                            md.insert(key.clone(), value.clone());
+                        }
+                    }
+                    async { axum::http::StatusCode::NO_CONTENT }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = gate_place_conductor(format!("http://{address}"));
+        let mut t = train;
+        assert_eq!(
+            c.train_gate(&mut t, "t1", Utc::now()).await,
+            (Some(Standing::Pending), 0)
+        );
+        assert_eq!(t["metadata"][tg::KEY_RUN], json!("original-gate"));
+        assert!(t["metadata"][tg::KEY_WAIT_REASON].is_null());
+        assert_eq!(
+            c.train_gate(&mut t, "t1", Utc::now()).await,
+            (Some(Standing::Green), 0)
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_uncertain_native_launch_keeps_its_original_filed_gate_on_the_train() {
+        use crate::train_gate as tg;
+        let train =
+            train_with_open_ci(json!({"boarded_jobs": ["c1"], "train_ref": "train/x@abcdef1"}));
+        let (jobs, rows, _) = holding_jobs_api(vec![train.clone()]).await;
+        let c = gate_place_conductor(jobs);
+        let mut t = train;
+        let answer = c
+            .record_train_gate_launch(
+                &mut t,
+                "t1",
+                Utc::now(),
+                Err(GateLaunchFailed {
+                    filed: Some("original-gate".to_string()),
+                    cause: anyhow!("native CREATE acknowledgement unavailable; outcome UNKNOWN"),
+                }
+                .into()),
+                0,
+            )
+            .await;
+        assert_eq!(answer, (Some(tg::Standing::Pending), 0));
+        let rows = rows.lock().unwrap();
+        assert_eq!(rows["t1"]["metadata"][tg::KEY_RUN], json!("original-gate"));
+        assert!(rows["t1"]["metadata"][tg::KEY_BOUND_WAIT].is_null());
+        assert!(rows["t1"]["metadata"][tg::KEY_LAUNCH_FAILURES].is_null());
+    }
+
     #[tokio::test]
     async fn a_wait_at_the_gate_bound_is_a_place_written_once_and_no_launch_failure() {
         use crate::train_gate as tg;
@@ -8177,7 +10035,7 @@ mod tests {
     /// 8d7d0a2b). `None` answers that list 403 — an answer the blip
     /// guard does not retry.
     async fn settle_api_with_cars(
-        reread: Value,
+        mut reread: Value,
         refuse_step_put: bool,
         cars: Option<Vec<Value>>,
         refuse_withdrawn: bool,
@@ -8199,10 +10057,17 @@ mod tests {
             writes.clone(),
             writes.clone(),
         );
+        if reread.get("workflow_version").is_none() {
+            reread["workflow_version"] = json!(1);
+        }
         // A create answers with the id of the run it serves, so a launch
         // that files a gate-run files THIS one (backlog 7919fdcc).
         let created = reread["id"].clone();
         let app = Router::new()
+            .route(
+                "/api/workflows/gate-run/versions/{version}",
+                get(|| async { Json(json!({"kind":"gate-run","version":1,"status":"active","metadata_schema":{}})) }),
+            )
             .route(
                 "/api/jobs",
                 get(move || {
@@ -8298,7 +10163,7 @@ mod tests {
         (format!("http://{addr}"), writes)
     }
 
-    fn settle_conductor(jobs: String) -> Conductor {
+    pub(super) fn settle_conductor(jobs: String) -> Conductor {
         let mut c = cleanup_conductor(
             "forgejo",
             Box::new(FakeForge {
@@ -9204,6 +11069,38 @@ mod tests {
         assert_eq!(run["metadata"]["branch"], "fix/x");
     }
 
+    /// Main's full gate (backlog 77596188) is reached from `reconcile`
+    /// once, LAST — after the stranded sweep, so every train has moved
+    /// this pass before main's gate asks for a bay — and through the arm
+    /// whose decision is `boss_jobs::full_gate_on_main::launch`.
+    #[test]
+    fn reconcile_gates_main_in_full_once_and_last() {
+        let src = include_str!("conductor.rs");
+        let body = &src[src
+            .find("pub(super) async fn reconcile(&self, now: DateTime<Utc>) -> Result<()> {")
+            .expect("reconcile")..];
+        let body = &body[..body.find("\n    }\n").expect("the end of reconcile")];
+        let call = "self.gate_main_in_full(now).await";
+        assert_eq!(body.matches(call).count(), 1, "called once");
+        assert!(
+            body.find(call).unwrap()
+                > body
+                    .find("self.alarm_stranded_greens(now).await")
+                    .expect("the stranded sweep"),
+            "after the last sweep"
+        );
+        let arm = &src[src.find("async fn gate_main_in_full(").expect("the arm")..];
+        let arm = &arm[..arm.find("\n    }\n").expect("the end of the arm")];
+        for needle in [
+            "fgm::launch(&facts)",
+            "fgm::owed(&runs)",
+            "crate::gate::Requester::MainFull",
+            "if self.cfg.dry",
+        ] {
+            assert!(arm.contains(needle), "the arm reads {needle}");
+        }
+    }
+
     /// `reconcile` has no test of its own (it opens with a `git clone`),
     /// so the one line that reaches the gate-run half is pinned in the
     /// source: called once, before the open trains are read, and neither
@@ -9379,53 +11276,44 @@ mod tests {
         );
     }
 
-    /// A GATE-RUN FILED IS A GATE-RUN ANSWERED (backlog 7919fdcc, item
-    /// 11). The POST succeeded and the Job could not be started: the run
-    /// is settled `lost` with the cause as its receipt, and the error
-    /// names the run, so the dock can stamp it instead of filing a twin
-    /// on its next pass — which it did every two minutes before.
     #[tokio::test]
-    async fn a_gate_run_filed_but_never_started_is_settled_lost_and_named() {
+    async fn an_ambiguous_native_launch_keeps_its_named_packet_open() {
         let run = idle_gate_run(Utc::now(), 0);
         let (jobs, writes) = settle_api(run, false).await;
-        let start = |_: &str| -> Result<()> {
-            Err(anyhow!(
-                "kubectl create failed for the gate of fix/orphan: forbidden"
-            ))
+        let start = |_: String| {
+            std::future::ready(Err(anyhow!(
+                "native response lost after process spawn; acceptance UNKNOWN"
+            )))
         };
+
         let err = settle_conductor(jobs)
             .file_and_start_gate(
                 "fix/orphan",
                 "abc1234",
-                json!({"regate_of_car": "c"}),
+                json!({"regate_of_car":"c"}),
                 &start,
             )
             .await
-            .expect_err("a Job that never started is a failed launch");
-        assert_eq!(err.filed.as_deref(), Some("orph"), "the run is named");
-        let text = format!("{err:#}");
+            .expect_err("ambiguous launch is visible");
+        assert_eq!(err.filed.as_deref(), Some("orph"));
+        assert!(format!("{err:#}").contains("UNKNOWN"));
         assert!(
-            text.contains("forbidden") && text.contains("orph"),
-            "{text}"
+            !format!("{err:#}").contains("settled lost"),
+            "an error display cannot fabricate a verdict either"
         );
-        let w = writes.lock().unwrap().clone();
-        let order: Vec<(String, String)> =
-            w.iter().map(|(m, p, _)| (m.clone(), p.clone())).collect();
+        let writes = writes.lock().unwrap();
+        let creation = writes
+            .iter()
+            .find(|(method, path, _)| method == "POST" && path == "/api/jobs")
+            .unwrap();
         assert_eq!(
-            order,
-            vec![
-                ("POST".into(), "/api/jobs".into()),
-                ("PATCH".into(), "/api/jobs/orph/metadata".into()),
-                ("PATCH".into(), "/api/jobs/orph/steps/s-v/metadata".into()),
-                ("PUT".into(), "/api/jobs/orph/steps/s-v".into()),
-            ],
-            "filed, marked, then settled"
+            creation.2["metadata"]["regate_of_car"],
+            json!("c"),
+            "filing must record intent atomically, before any crash or later metadata write failure"
         );
-        assert_eq!(w[2].2["verdict"], "lost");
-        let receipt = w[2].2["receipt"].as_str().expect("a receipt");
         assert!(
-            receipt.contains("forbidden") && receipt.contains("fix/orphan"),
-            "the cause is the receipt, verbatim: {receipt}"
+            writes.iter().all(|(_, path, _)| !path.contains("/steps/")),
+            "an ambiguous send must never fabricate a negative verdict: {writes:?}"
         );
     }
 
@@ -9435,9 +11323,9 @@ mod tests {
         let run = idle_gate_run(Utc::now(), 0);
         let (jobs, writes) = settle_api(run, false).await;
         let started = std::sync::Mutex::new(Vec::new());
-        let start = |id: &str| -> Result<()> {
-            started.lock().unwrap().push(id.to_string());
-            Ok(())
+        let start = |id: String| {
+            started.lock().unwrap().push(id);
+            std::future::ready(Ok(()))
         };
         let run_id = settle_conductor(jobs)
             .file_and_start_gate(
@@ -9483,9 +11371,13 @@ mod tests {
         };
         let why = "kubectl create failed for the gate of feat/g: forbidden";
         let line = dock_regate::unstarted_reason(&stamp, why);
-        for want in ["9f1e2d3c", "forbidden", "settled lost", "main moves"] {
+        for want in ["9f1e2d3c", "forbidden", "recorded verdict", "open"] {
             assert!(line.contains(want), "{want}: {line}");
         }
+        assert!(
+            !line.contains("settled lost") && !line.contains("never started"),
+            "{line}"
+        );
     }
 
     /// f2ba226e: pr-train 06e5610f was admitted with nine of its ten

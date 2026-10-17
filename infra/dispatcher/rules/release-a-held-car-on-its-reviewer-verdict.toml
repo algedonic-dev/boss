@@ -1,0 +1,72 @@
+# A held car's reviewer verdict releases it, through the release door
+# (design 393bdef6 Q1, answered by David 2026-10-16; backlog 0cfc57e6).
+#
+# WHAT HAPPENED. A car held for its adversarial review left the dock only
+# when a person copied its reviewer's RELEASE verdict into `boss release
+# <car> --review <run>`. Measured 2026-10-09..16: 156 releases by hand
+# (agent-codex 105, emp-david 40, agent-claude 9, other 2), about 106 h
+# of delay in total. Verdict to release: agents median 0.9 min; David
+# median 34.5 min, p90 8.7 h. No hold class was released only by a
+# person, and every check the release rests on is a read of the record
+# (`boss_jobs::car_release::judge`, served at `POST
+# /api/jobs/{id}/release`). The person was the transport for a decision
+# the record had already made.
+#
+# THE TRIGGER IS THE VERDICT'S OWN WRITE. `boss review <car> --verdict`
+# writes `review` onto the reviewer's agent-run through the job merge
+# door, whose `jobs.job.updated` carries the whole post-merge row, so
+# `metadata.review.car` is in the payload. `> ""` is the present-and-
+# non-empty idiom (an absent field orders against nothing). Any verdict
+# fires it, not only RELEASE: a CHANGES verdict is refused by the door
+# and the refusal is recorded on the car, so the next reader of the hold
+# reads why the rule left it. `kind` is the first conjunct because this
+# topic is every packet write in the system.
+#
+# WHAT IT DOES NOT DECIDE. The handler asks the door with `{review}` and
+# nothing else; the door's judge decides, the same judge `boss release`
+# and the yard's Release control ask. Its refusals stay refusals: a
+# verdict for a head the hold no longer names, a non-RELEASE verdict, a
+# run with no verdict, and a car reserved for a person's own release
+# (`releaser` on its review step, `boss hold --releaser emp-david`). A
+# verdict from a run the car's review step was not dispatched to is left
+# to a person without asking. Each refusal is written once onto the
+# car's review step as `auto_release`.
+#
+# ANY LATER WRITE TO THE RUN FIRES IT AGAIN (its report, its age-out, a
+# backlog drained after an outage), not only the verdict's own write. A
+# released car is no longer held, so nothing is asked. A car held AGAIN
+# is asked about only when the verdict was recorded after the hold it
+# now carries took its reason (read off the car's history); otherwise,
+# or when either time cannot be read, it is left to a person and the
+# reason recorded (review 3af8f7e2 N2). The rule does not promise more:
+# a hold rewritten with the same text is the same hold to the record,
+# and `boss hold --releaser` is the way to say "wait for me".
+#
+# WHO IS CREDITED. The release is signed as this rule, recorded as
+# `automation:rule:release-a-held-car-on-its-reviewer-verdict` on the
+# merge event and as the release record's `by`, so `completed_by` and
+# `by` never name a person or an agent for what the rule did.
+#
+# IF THE EVENT IS LOST the car stays held, exactly as it did before this
+# rule, and a person releases it by hand: a missed trigger degrades to
+# the old behaviour, never to a release nobody judged.
+[[rule]]
+name = "release-a-held-car-on-its-reviewer-verdict"
+why = """
+A CROSS-PROTOCOL REACTOR: an `agent-run` packet's recorded review
+verdict moves a `ship-a-change` car off its held review step. Two
+protocols, so no single Workflow definition can declare it, and what
+fires is not a spawn but a judged release: the handler asks the one
+release door (`POST /api/jobs/{car}/release`), whose judge decides,
+and records the door's refusal on the car when it refuses. Measured
+2026-10-09..16 (design 393bdef6 Q1, backlog 0cfc57e6): 156 releases by
+hand, about 106 h of delay, David's median 34.5 min and p90 8.7 h from
+verdict to release, with every check a read of the record. David
+decided it, keeping a per-car override (`releaser`) for cars he will
+release himself.
+"""
+version = 1
+on_event = "jobs.job.updated"
+when = 'kind = "agent-run" AND metadata.review.car > ""'
+[[rule.do]]
+handler = "jobs.release_on_review"

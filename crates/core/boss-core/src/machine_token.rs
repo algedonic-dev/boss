@@ -327,18 +327,35 @@ pub fn hosts() -> Arc<Hosts> {
     Arc::clone(HOSTS.get_or_init(|| Arc::new(Hosts::from_env())))
 }
 
-/// THE ONE DECISION (backlog 2ee29275): the header value a request to
-/// `url` carries, or none. None when `source` holds no token, when the
-/// URL does not parse (reqwest refuses that request on its own), or when
-/// its host is not one `hosts` allows — the last said once per `hosts`,
-/// naming the scheme and host and never the path or query, which may
-/// carry a login's state. The value is marked sensitive (F8).
+/// Observation port for the current machine credential. Production uses Source;
+/// deterministic adapters can model withdrawal without reading a mounted token.
+pub trait TokenSource: Send + Sync + std::fmt::Debug {
+    fn current(&self) -> Option<String>;
+}
+
+impl TokenSource for Source {
+    fn current(&self) -> Option<String> {
+        Source::current(self)
+    }
+}
+
+impl<T: TokenSource + ?Sized> TokenSource for Arc<T> {
+    fn current(&self) -> Option<String> {
+        self.as_ref().current()
+    }
+}
+
+/// THE ONE DECISION (backlog 2ee29275): observe once, apply the host bound,
+/// and return the same sensitive header value that authorized this request.
 pub fn token_for(
-    source: &Source,
+    source: &(impl TokenSource + ?Sized),
     hosts: &Hosts,
     url: &str,
 ) -> Option<reqwest::header::HeaderValue> {
     let token = source.current()?;
+    if token.trim().is_empty() || token.len() > MAX_SLOT_BYTES as usize {
+        return None;
+    }
     let parsed = reqwest::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
     if !hosts.allows(host) {
@@ -505,6 +522,56 @@ pub struct BlockingClient {
     http: reqwest::blocking::Client,
     token: Arc<Source>,
     hosts: Arc<Hosts>,
+}
+
+/// HTTP bootstrap adapters accept the caller's transport, including a CLI's
+/// final-send credential guard. A concrete client parameter used to require
+/// handing bootstrap an unguarded client to cross this boundary (98361745).
+#[cfg(feature = "blocking")]
+pub trait BlockingHttp {
+    type Request: BlockingHttpRequest;
+    fn request(&self, method: reqwest::Method, url: &str) -> Self::Request;
+    fn get(&self, url: &str) -> Self::Request {
+        self.request(reqwest::Method::GET, url)
+    }
+    fn post(&self, url: &str) -> Self::Request {
+        self.request(reqwest::Method::POST, url)
+    }
+    fn patch(&self, url: &str) -> Self::Request {
+        self.request(reqwest::Method::PATCH, url)
+    }
+    fn put(&self, url: &str) -> Self::Request {
+        self.request(reqwest::Method::PUT, url)
+    }
+}
+
+/// Only the request operations used by the two registry bootstrap walks.
+#[cfg(feature = "blocking")]
+pub trait BlockingHttpRequest: Sized {
+    fn headers(self, headers: reqwest::header::HeaderMap) -> Self;
+    fn json<T: serde::Serialize + ?Sized>(self, value: &T) -> Self;
+    fn send(self) -> anyhow::Result<reqwest::blocking::Response>;
+}
+
+#[cfg(feature = "blocking")]
+impl BlockingHttp for BlockingClient {
+    type Request = reqwest::blocking::RequestBuilder;
+    fn request(&self, method: reqwest::Method, url: &str) -> Self::Request {
+        BlockingClient::request(self, method, url)
+    }
+}
+
+#[cfg(feature = "blocking")]
+impl BlockingHttpRequest for reqwest::blocking::RequestBuilder {
+    fn headers(self, headers: reqwest::header::HeaderMap) -> Self {
+        self.headers(headers)
+    }
+    fn json<T: serde::Serialize + ?Sized>(self, value: &T) -> Self {
+        self.json(value)
+    }
+    fn send(self) -> anyhow::Result<reqwest::blocking::Response> {
+        Ok(self.send()?)
+    }
 }
 
 #[cfg(feature = "blocking")]
@@ -723,6 +790,37 @@ pub fn verify(expected: &str, provided: Option<&str>) -> bool {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn the_observation_port_supplies_one_value_for_the_existing_host_decision() {
+        #[derive(Debug)]
+        struct Changing(std::sync::Mutex<Vec<Option<String>>>);
+        impl TokenSource for Changing {
+            fn current(&self) -> Option<String> {
+                self.0.lock().unwrap().remove(0)
+            }
+        }
+        let source = Changing(std::sync::Mutex::new(vec![
+            Some("synthetic-first".into()),
+            None,
+        ]));
+        let hosts = Hosts::listed(["record.example"]);
+        let header = token_for(&source, &hosts, "https://record.example/api/jobs").unwrap();
+        assert_eq!(header, "synthetic-first");
+        assert!(header.is_sensitive());
+        assert!(token_for(&source, &hosts, "https://record.example/api/jobs").is_none());
+        let source = Changing(std::sync::Mutex::new(vec![Some("synthetic-second".into())]));
+        assert!(token_for(&source, &hosts, "https://other.example/api/jobs").is_none());
+        assert!(source.0.lock().unwrap().is_empty());
+        for invalid in ["", "   ", "\t", "invalid\nheader"] {
+            let source = Changing(std::sync::Mutex::new(vec![Some(invalid.into())]));
+            assert!(
+                token_for(&source, &hosts, "https://record.example/api/jobs").is_none(),
+                "invalid adapter value was accepted"
+            );
+            assert!(source.0.lock().unwrap().is_empty());
+        }
+    }
 
     fn dir() -> PathBuf {
         let d = std::env::temp_dir().join(format!(

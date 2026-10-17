@@ -58,6 +58,90 @@ use std::process::Command;
 const SCRIPT: &str = "infra/dev/boss";
 const WRAPPER: &str = "infra/estate/boss-cli-wrapper.sh";
 
+#[test]
+fn verified_native_channel_reuses_the_real_image_without_running_a_candidate_or_installing() {
+    let f = Fixture::new("compatible-image");
+    let image = behind_sha();
+    let main = main_sha();
+    f.image(&image);
+    boss_testing::write_file(
+        &f.store.join(&image).join("boss-inputs.json"),
+        "published image inputs\n",
+    );
+    let marker = f.root.join("candidate-ran");
+    boss_testing::create_dir(&f.root.join("target/debug"));
+    write_exec(
+        &f.root.join("target/debug/boss"),
+        &format!("#!/bin/sh\ntouch '{}'\nexit 99\n", marker.display()),
+    );
+    write_exec(
+        &f.store.join(&image).join("boss"),
+        &format!(
+            r#"#!/bin/bash
+if [ "${{1:-}}" = channels ] && [ "${{2:-}}" = --compatible-source ]; then
+    printf '%s\n' '{{"schema":1,"compatible":true,"compiler_inputs_equal":true,"binary_image":"{image}","compatible_source":"{main}","delivery_evidence":{{"arrived":true,"selection_ready":true}}}}'
+    exit 0
+fi
+echo "ran=image binary_image=$BOSS_BUILD_COMMIT"
+"#
+        ),
+    );
+    let (exit, output) = f.run(&["gate", "fix/example"], &[]);
+    assert_eq!(exit, 0, "{output}");
+    assert!(
+        output.contains(&format!("binary_image={image}")),
+        "{output}"
+    );
+    assert!(
+        !marker.exists(),
+        "a qualified image must win before any candidate runs"
+    );
+    assert!(f.install_log().is_empty(), "{}", f.install_log());
+    assert_eq!(
+        std::fs::read_link(f.store.join("current")).unwrap(),
+        Path::new(&image)
+    );
+}
+
+#[test]
+fn incomplete_compatibility_cannot_run_a_write_on_the_old_image() {
+    for field in ["compiler_inputs_equal", "selection_ready"] {
+        let f = Fixture::new(&format!("incomplete-compatible-{field}"));
+        let image = behind_sha();
+        let main = main_sha();
+        f.image(&image);
+        boss_testing::write_file(
+            &f.store.join(&image).join("boss-inputs.json"),
+            "published receipt",
+        );
+        let mut proof = serde_json::json!({"schema":1,"compatible":true,"binary_image":image,"compatible_source":main,
+            "compiler_inputs_equal":true,"delivery_evidence":{"arrived":true,"selection_ready":true}});
+        if field == "selection_ready" {
+            proof["delivery_evidence"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        } else {
+            proof.as_object_mut().unwrap().remove(field);
+        }
+        let path = f.root.join("proof.json");
+        std::fs::write(&path, proof.to_string()).unwrap();
+        let write = f.root.join("write-ran");
+        write_exec(
+            &f.store.join(&image).join("boss"),
+            &format!(
+                "#!/bin/bash\nif [ \"${{1:-}}\" = channels ]; then cat '{}'; exit 0; fi\nif [ \"${{1:-}}\" = gate ]; then touch '{}'; fi\necho \"boss 0.1.0 built from $BOSS_BUILD_COMMIT\"\n",
+                path.display(),
+                write.display()
+            ),
+        );
+        let (exit, output) = f.run(&["gate", "fix/example"], &[]);
+        assert_ne!(exit, 0, "missing {field}: {output}");
+        assert!(!write.exists(), "missing {field} ran a write");
+        assert!(!f.install_log().is_empty());
+    }
+}
+
 /// The one spelling, read from infra/dev/sor-url — the file boss-api
 /// reads too. Read here rather than typed so the test cannot drift
 /// from it.
@@ -293,6 +377,96 @@ fn output(mut cmd: Command) -> (i32, String) {
 
 fn short(sha: &str) -> &str {
     &sha[..8]
+}
+
+/// ca356c79: OFF selects the ordinary shim, so the published planner's
+/// refusal cannot prevent a recorded probe from reaching its CLI here.
+#[test]
+fn a_recorded_probe_is_refused_before_the_off_shim_executes_any_cli() {
+    let f = Fixture::new("recorded-probe-off");
+    let repo = f.root.join("repo");
+    boss_testing::create_dir(&repo.join("infra/dev"));
+    git(&repo, &["init", "-q"]);
+    boss_testing::write_file(&repo.join("README"), "synthetic OFF fixture\n");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "fixture"]);
+    let main = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["update-ref", "refs/remotes/origin/main", &main]);
+    let copy = repo.join(SCRIPT);
+    let text = std::fs::read_to_string(repo_root().join(SCRIPT)).unwrap();
+    assert!(text.contains("dev_control=/work/tools/dev-control"));
+    write_exec(
+        &copy,
+        &text.replace(
+            "dev_control=/work/tools/dev-control",
+            &format!("dev_control={}", f.root.join("off-controller").display()),
+        ),
+    );
+    f.image(&main);
+    f.build("debug", &main);
+    let effect = f.root.join("cli-effect");
+    for binary in [
+        f.store.join(&main).join("boss"),
+        f.root.join("target/debug/boss"),
+    ] {
+        write_exec(
+            &binary,
+            &format!(
+                "#!/usr/bin/env bash\nprintf executed >> '{}'\nprintf '%s\\n' 'boss built from {main}'\n",
+                effect.display()
+            ),
+        );
+    }
+    let run = |args: &[&str], marker: Option<(&str, &str)>| {
+        let mut copied = Command::new(&copy);
+        copied
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &f.root)
+            .args(args)
+            .arg("synthetic-record")
+            .env("BOSS_SHIM_TARGET_ROOT", &f.root)
+            .env("BOSS_SHIM_IMAGE_STORE", &f.store)
+            .env("BOSS_SHIM_INSTALLER", &f.installer)
+            .env("BOSS_SHIM_CLI_WAIT", "0")
+            .env("BOSS_JOBS_URL", "http://owned-fixture.invalid")
+            .env("BOSS_MACHINE_TOKEN_DIR", &f.root);
+        // Keep the real production shim, replacing only the controller
+        // pathname with an owned absent selector: no live activation.
+        if let Some((key, value)) = marker {
+            copied.env(key, value);
+        }
+        output(copied)
+    };
+    for args in [
+        vec!["job", "get"],
+        vec!["--built", "job", "get"],
+        vec!["ops", "check"],
+        vec!["--version"],
+    ] {
+        for ordinary in [
+            None,
+            Some(("BOSS_SOR_USER", "")),
+            Some(("BOSS_SOR_DOOR", "")),
+        ] {
+            let (rc, out) = run(&args, ordinary);
+            assert_eq!(rc, 0, "ordinary session positive {args:?}: {out}");
+            assert!(effect.exists(), "the positive must execute its CLI");
+            std::fs::remove_file(&effect).unwrap();
+        }
+        for marker in [
+            ("BOSS_PROBE_NOTFOUND", "fixture"),
+            ("BOSS_PROBE_NOTFOUND", ""),
+            ("BOSS_SOR_USER", "fixture"),
+            ("BOSS_SOR_DOOR", "fixture"),
+        ] {
+            let (rc, out) = run(&args, Some(marker));
+            assert_eq!(rc, 2, "recorded context {marker:?}/{args:?}: {out}");
+            assert!(out.contains("boss-sor-read"), "{out}");
+            assert!(!effect.exists(), "not even a CLI version probe may run");
+            assert!(f.install_log().is_empty(), "no image installation may run");
+        }
+    }
 }
 
 #[test]

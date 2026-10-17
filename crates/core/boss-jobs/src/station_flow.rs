@@ -1,4 +1,6 @@
-//! Station flow — whether a queue is FORMING, not just how deep it is.
+//! Legacy distinct-step flow, explicitly requested as `step-events`.
+//! The default packet-membership basis is [`crate::membership_replay`];
+//! eligible Steps and packet crossings are different units.
 //!
 //! `GET /api/stations/load` already answers depth and the age of the
 //! oldest packet, and its own header says why that is not enough:
@@ -16,11 +18,9 @@
 //! marker). So arrivals and departures over a window are a read of
 //! `audit_log`, not a new stamp on anything.
 //!
-//! WALL CLOCK, NOT EVENT TIME. The window is `audit_log.created_at`,
-//! never `timestamp` — event time is sim-authoritative on a demo
-//! deployment and a ten-minute triage reads as a week on it. The
-//! doctrine and the incident behind it are stated once, in
-//! `boss-views/src/flow.rs`; this obeys it.
+//! The window uses `audit_log.created_at`. An Event's wall-clock
+//! producer timestamp can precede its outbox delivery, so it cannot
+//! replace the original audit insertion instant.
 //!
 //! ## Why a cube, and why some stations report blind
 //!

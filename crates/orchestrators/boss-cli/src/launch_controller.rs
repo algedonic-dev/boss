@@ -5,6 +5,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
 
+// Private persistence/metadata IPC source adapters exist (6f3ef63c), but
+// native scope/account verification and private mount installation remain owed.
+// The selected native managed launch still refuses until those bindings exist.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "386 source checkpoint: future trusted broker adapter uses these transitions after cache/worker wiring; native managed launch refuses until then"
+    )
+)]
+pub(crate) mod managed_cache;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Snapshot {
@@ -96,6 +108,9 @@ pub(crate) async fn run<T: Transport, J: Journal>(
     transport: &mut T,
     journal: &mut J,
 ) -> Result<Outcome, String> {
+    if prepared.home_env == "CODEX_HOME" && prepared.login_file == "auth.json" {
+        return Err("managed login requires the approved private cache lease/worker wiring; no compute admitted".into());
+    }
     use crate::launch_binding::JobBinding;
     use crate::launch_job;
     // Preparation, scheduling, recording and transfer all spend ONE bound.
@@ -631,7 +646,7 @@ mod tests {
             exit: Some(0),
         }
     }
-    fn prepared() -> Prepared {
+    pub(super) fn prepared() -> Prepared {
         Prepared {
             run: "61be2c4a-68ee-4156-9709-7dc1ebe89b16".into(),
             observer: "controller".into(),
@@ -660,7 +675,7 @@ mod tests {
             transcript_pattern: "sessions/*/*/*/rollout-*-{runtime}.jsonl".into(),
         }
     }
-    fn objects(p: &Prepared) -> (Value, Value, Value) {
+    pub(super) fn objects(p: &Prepared) -> (Value, Value, Value) {
         let spec = launch_job::Spec {
             run_id: &p.run,
             image: &p.image,
@@ -721,6 +736,22 @@ mod tests {
         answers
     }
     #[tokio::test]
+    async fn managed_login_refuses_before_compute_without_a_private_cache_lease() {
+        let mut p = prepared();
+        p.home_env = "CODEX_HOME".into();
+        p.login_file = "auth.json".into();
+        let mut transport = MemoryTransport {
+            answers: successful_answers(&p).into(),
+            effects: vec![],
+        };
+        let mut journal = MemoryJournal::default();
+        assert!(run(&p, &mut transport, &mut journal).await.is_err());
+        assert!(transport.effects.is_empty(), "no lease means no compute");
+    }
+
+    // Gate 8c300 failed this in-memory success path. Its 100ms cleanup
+    // grace must measure virtual I/O, not the host's scheduling delays.
+    #[tokio::test(start_paused = true)]
     async fn controller_creates_observes_transfers_and_stops_one_uid_without_worker_authority() {
         let p = prepared();
         let mut t = MemoryTransport {
@@ -738,6 +769,50 @@ mod tests {
         assert!(t.effects.iter().any(|e|matches!(e,Effect::DeleteJob {options,..} if options["preconditions"]["uid"]=="job-uid")));
         assert!(!j.originals.is_empty());
         assert!(t.answers.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_cleanup_still_expires_at_the_unchanged_grace() {
+        struct Stalled;
+        #[async_trait]
+        impl Transport for Stalled {
+            async fn perform(&mut self, _: Effect, _: Duration) -> Result<Native, String> {
+                std::future::pending().await
+            }
+        }
+        let p = prepared();
+        let (_, job, _) = objects(&p);
+        let before = tokio::time::Instant::now();
+        let result = stop_known(&p, &job, &mut Stalled, &mut MemoryJournal::default())
+            .await
+            .unwrap();
+        assert!(!result.stop_observed);
+        assert_eq!(before.elapsed(), p.grace);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn memory_success_does_not_spend_cleanup_grace_on_host_scheduling() {
+        struct Delayed(MemoryTransport);
+        #[async_trait]
+        impl Transport for Delayed {
+            async fn perform(&mut self, effect: Effect, bound: Duration) -> Result<Native, String> {
+                if matches!(effect, Effect::DeleteJob { .. }) {
+                    // Model a descheduled test thread, not native I/O latency.
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                self.0.perform(effect, bound).await
+            }
+        }
+        let p = prepared();
+        let mut transport = Delayed(MemoryTransport {
+            answers: successful_answers(&p).into(),
+            effects: vec![],
+        });
+        let result = run(&p, &mut transport, &mut MemoryJournal::default())
+            .await
+            .unwrap();
+        assert!(result.stop_observed);
+        assert!(transport.0.answers.is_empty());
     }
 
     #[tokio::test]

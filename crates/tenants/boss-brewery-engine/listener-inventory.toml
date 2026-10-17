@@ -1,0 +1,8 @@
+version = 1
+engine_crate = "boss-brewery-engine"
+
+[[private_listener]]
+file = "crates/tenants/boss-brewery-engine/src/lib.rs"
+function = "private_callback_listener"
+bound = "loopback"
+why = "The example counterparty callback is private to its network namespace. Its constructor refuses non-loopback literal addresses; it is not a LAN machine door. This source declaration does not prove runtime listener ownership."

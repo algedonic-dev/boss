@@ -55,17 +55,39 @@ fn default_field(object: &mut Value, key: &str, expected: Value) -> Result<(), S
 
 fn pod_spec_v1(raw: &Value, placed: bool) -> Result<Value, String> {
     let mut pod = raw.clone();
+    // Kubernetes omits these three non-pointer false fields (observed in the
+    // first bounded isolation pilot). Restore only their known default;
+    // null, true and non-boolean values are never normalized into authority.
+    for field in ["hostNetwork", "hostPID", "hostIPC"] {
+        match pod.get(field) {
+            None => {
+                pod.as_object_mut()
+                    .ok_or("Pod spec is not an object")?
+                    .insert(field.to_owned(), json!(false));
+            }
+            Some(Value::Bool(false)) => {}
+            Some(_) => return Err(format!("normalization v1 refuses {field}")),
+        }
+    }
     for (key, value) in [
         ("dnsPolicy", json!("ClusterFirst")),
         ("schedulerName", json!("default-scheduler")),
         ("terminationGracePeriodSeconds", json!(30)),
-        ("serviceAccountName", json!("default")),
-        ("serviceAccount", json!("default")),
         ("preemptionPolicy", json!("PreemptLowerPriority")),
         ("priority", json!(0)),
     ] {
         default_field(&mut pod, key, value)?;
     }
+    // A declared dedicated account is intent, not an invalid default. The
+    // deprecated native alias may disappear only when it names that account.
+    let account = pod
+        .get("serviceAccountName")
+        .cloned()
+        .unwrap_or(json!("default"));
+    if account == "default" {
+        default_field(&mut pod, "serviceAccountName", json!("default"))?;
+    }
+    default_field(&mut pod, "serviceAccount", account)?;
     if placed && let Some(node) = pod.get("nodeName") {
         text(node, "observed scheduled node")?;
         pod.as_object_mut()
@@ -96,7 +118,7 @@ fn pod_spec_v1(raw: &Value, placed: bool) -> Result<Value, String> {
     Ok(pod)
 }
 
-fn normalized_job_v1(raw: &Value) -> Result<Value, String> {
+pub(crate) fn normalized_job_v1(raw: &Value) -> Result<Value, String> {
     let mut job = raw.clone();
     let uid = text(&job["metadata"]["uid"], "Job UID")?.to_string();
     text(&job["metadata"]["resourceVersion"], "Job resourceVersion")?;
@@ -160,6 +182,15 @@ impl JobBinding {
         })
     }
 
+    pub(crate) fn from_collector_created(
+        job: &Value,
+        spec: &crate::launch_controller::managed_cache::collector::Spec<'_>,
+    ) -> Result<Self, String> {
+        let intent = crate::launch_controller::managed_cache::collector::manifest(spec)
+            .map_err(|_| "private collector intent unavailable".to_owned())?;
+        Self::from_intent(job, intent, |_| None)
+    }
+
     fn from_intent(
         job: &Value,
         intent: Value,
@@ -167,6 +198,11 @@ impl JobBinding {
     ) -> Result<Self, String> {
         if job["metadata"]["labels"] != intent["metadata"]["labels"] {
             return Err("created Job run labels differ from its prepared intent".into());
+        }
+        if let Some(annotations) = intent["metadata"].get("annotations")
+            && job["metadata"].get("annotations") != Some(annotations)
+        {
+            return Err("created Job differs from its declared generation annotations".into());
         }
         let judged = normalized_job_v1(job)?;
         if let Some(why) = judge(&judged) {
@@ -197,6 +233,11 @@ impl JobBinding {
         not_deleting(job, "observed Job")?;
         if job["metadata"]["labels"] != self.intent["metadata"]["labels"] {
             return Err("observed Job ownership labels changed".into());
+        }
+        if let Some(annotations) = self.intent["metadata"].get("annotations")
+            && job["metadata"].get("annotations") != Some(annotations)
+        {
+            return Err("observed Job generation annotations changed".into());
         }
         if normalized_job_v1(job)?["spec"] != self.intent["spec"] {
             return Err("observed Job no longer has its judged intent".into());
@@ -343,6 +384,9 @@ pub(crate) struct RunningBinding {
 }
 
 impl RunningBinding {
+    pub(crate) fn matches_run(&self, run: &str) -> bool {
+        self.job.intent["metadata"]["labels"]["boss.dev/agent-run"] == run
+    }
     pub(crate) fn pod_name(&self) -> &str {
         &self.pod_name
     }
@@ -371,6 +415,74 @@ mod tests {
     use crate::launch_job::{self, Spec};
     use serde_json::{Value, json};
     use std::time::Duration;
+
+    #[test]
+    fn collector_binding_matches_the_fixed_factory() {
+        use crate::launch_controller::managed_cache::collector;
+        let witness = json!({"image":format!("registry.invalid/agent@sha256:{}","a".repeat(64)),"generation":"b".repeat(40),"image_platform":"linux/amd64",
+            "collector_helper_sha256":crate::launch_controller::hash(include_bytes!("../../../../infra/agent/private-collector.py")),
+            "collector_contract_sha256":crate::launch_controller::hash(include_bytes!("../../../../infra/agent/private-collector-contract.json"))});
+        let spec = collector::Spec {
+            run: uuid::Uuid::from_u128(1),
+            nonce: uuid::Uuid::from_u128(2),
+            workspace_uid: "original",
+            image_witness: &witness,
+            trust_generation: uuid::Uuid::from_u128(3),
+        };
+        let mut original = collector::manifest(&spec).unwrap();
+        original["metadata"]["uid"] = json!("collector-job");
+        original["metadata"]["resourceVersion"] = json!("1");
+        // The actual generic binding normalization must handle the fixed
+        // collector SA, rather than treating every SA as the default one.
+        assert!(normalized_job_v1(&original).is_ok());
+        let binding = JobBinding::from_collector_created(&original, &spec).unwrap();
+        let mut aliased = original.clone();
+        aliased["spec"]["template"]["spec"]["serviceAccount"] =
+            json!("boss-managed-cache-collector");
+        assert!(JobBinding::from_collector_created(&aliased, &spec).is_ok());
+        for path in ["serviceAccountName", "serviceAccount"] {
+            let mut changed = original.clone();
+            changed["spec"]["template"]["spec"][path] = json!("wrong-account");
+            assert!(JobBinding::from_collector_created(&changed, &spec).is_err());
+        }
+        let mut altered_trust = original.clone();
+        altered_trust["metadata"]["annotations"]["boss.dev/trust-generation"] =
+            json!(uuid::Uuid::new_v4());
+        assert!(JobBinding::from_collector_created(&altered_trust, &spec).is_err());
+        let mut native_defaults = original.clone();
+        for flag in ["hostNetwork", "hostPID", "hostIPC"] {
+            native_defaults["spec"]["template"]["spec"]
+                .as_object_mut()
+                .unwrap()
+                .remove(flag);
+        }
+        assert!(JobBinding::from_collector_created(&native_defaults, &spec).is_ok());
+        for flag in ["hostNetwork", "hostPID", "hostIPC"] {
+            for forbidden in [json!(true), Value::Null, json!(0), json!("false")] {
+                let mut changed = native_defaults.clone();
+                changed["spec"]["template"]["spec"][flag] = forbidden;
+                assert!(
+                    JobBinding::from_collector_created(&changed, &spec).is_err(),
+                    "{flag}"
+                );
+            }
+        }
+        let mut observed = pod(&original);
+        observed["status"]["containerStatuses"][0]["name"] = json!("collector");
+        let running = binding
+            .observe_running(&original, &listed(observed.clone()))
+            .unwrap();
+        running
+            .recheck(&original, &listed(observed.clone()))
+            .unwrap();
+        assert!(
+            running
+                .recheck(&altered_trust, &listed(observed.clone()))
+                .is_err()
+        );
+        observed["spec"]["containers"][0]["volumeMounts"][0]["readOnly"] = json!(false);
+        assert!(running.recheck(&original, &listed(observed)).is_err());
+    }
 
     fn created() -> Value {
         let mut job = launch_job::manifest(&Spec {

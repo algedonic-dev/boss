@@ -35,6 +35,16 @@ pub(crate) fn conserve_before(
     {
         return Err(refused("receipt is not bound to its owning claim event"));
     }
+    let job_id = receipt
+        .value()
+        .pointer("/selected/job_id")
+        .cloned()
+        .ok_or_else(|| refused("receipt lacks selected packet identity"))?;
+    let _: boss_core::job::JobId = serde_json::from_value(job_id.clone())
+        .map_err(|_| refused("receipt selected packet identity is invalid"))?;
+    crate::state_receipt::packet_binding(&claim.payload, &job_id)
+        .map_err(|error| refused(&error))?;
+    claim.payload["job_id"] = job_id.clone();
     let mut events = Vec::new();
     let mut entries = Vec::new();
     let mut remaining = receipt.json();
@@ -48,7 +58,7 @@ pub(crate) fn conserve_before(
         let chunk = stamp.event(
             crate::events::STATION_SELECTION_EVIDENCE,
             json!({
-                "version":2,"claim_event_id":claim.id,"request_id":receipt["request_id"],
+                "version":2,"claim_event_id":claim.id,"request_id":receipt["request_id"],"job_id":job_id,
                 "index":events.len(),"text":text,
             }),
         );
@@ -106,7 +116,7 @@ pub fn reconstruct(events: &[ReplayEvent]) -> Result<Vec<ReplayEvent>, JobsError
                     return Err(refused("missing or extra chunk"));
                 }
                 let mut text = String::new();
-                for (index, (entry, chunk)) in entries.iter().zip(chunks).enumerate() {
+                for (index, (entry, chunk)) in entries.iter().zip(chunks.iter()).enumerate() {
                     let body = chunk.payload["text"]
                         .as_str()
                         .ok_or_else(|| refused("chunk lacks exact text"))?;
@@ -129,6 +139,13 @@ pub fn reconstruct(events: &[ReplayEvent]) -> Result<Vec<ReplayEvent>, JobsError
                     return Err(refused("full receipt length or hash differs"));
                 }
                 let receipt = SelectionReceipt::from_json(text.clone())?;
+                let selected = &receipt["selected"]["job_id"];
+                crate::state_receipt::packet_binding(&event.payload, selected)
+                    .map_err(|error| refused(&error))?;
+                for chunk in chunks {
+                    crate::state_receipt::packet_binding(&chunk.payload, selected)
+                        .map_err(|error| refused(&error))?;
+                }
                 if receipt["version"] != 2
                     || receipt["request_id"] != manifest["request_id"]
                     || receipt["event_id"] != json!(event.event_id)

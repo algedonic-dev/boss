@@ -402,7 +402,7 @@ fn publish_writes(outcome: &Outcome, now: DateTime<Utc>) -> Map<String, Value> {
 /// merge door, then the status alone. The terminals fire from the
 /// workflow; nothing here touches them.
 async fn complete_publish(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     jid: &str,
     step: &Value,
     outcome: &Outcome,
@@ -419,7 +419,7 @@ async fn complete_publish(
 }
 
 async fn drain_one(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     listed: &Value,
     clone: &str,
     remote: &str,

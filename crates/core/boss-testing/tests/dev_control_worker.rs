@@ -8,6 +8,7 @@ use std::process::Command;
 fn the_dev_controller_preserves_its_worker_and_receipt_contract() {
     for script in [
         "dev-build_test.py",
+        "dev-declaration_test.py",
         "dev-lifecycle_test.py",
         "control-artifact_test.py",
         "activate-control_test.py",

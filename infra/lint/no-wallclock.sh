@@ -385,6 +385,10 @@ HANDLER_CLOCK_ALLOWED=(
   # read as outside the window and the old token would be revoked under
   # a caller still sending it.
   "$HANDLERS_SRC/handlers/credential_rotate_self_issued.rs"
+  # Protected collector TLS observation: actual certificate/token expiry and
+  # the fresh native invocation window. Private originals only, never a packet
+  # or audit stamp. A replayed firing cannot prove the endpoint is serving NOW.
+  "$HANDLERS_SRC/handlers/managed_collector_tls/observer/evidence.rs"
 )
 handler_allow_used=""
 

@@ -16,11 +16,16 @@ postgres = ["dep:sqlx", "dep:axum", "dep:async-stream", "dep:futures", "dep:toki
 bin = ["postgres", "dep:anyhow", "dep:clap", "dep:tracing-subscriber", "dep:hex", "dep:boss-nats"]
 events-api = ["bin"]
 
+[[test]]
+name = "stream_order_pg"
+required-features = ["postgres"]
+
 [dependencies]
 boss-core = { path = "../boss-core" }
 boss-policy-client = { path = "../boss-policy-client" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 uuid = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
@@ -100,4 +105,12 @@ required-features = ["postgres"]
 
 [[test]]
 name = "the_adapters_agree_on_the_gate_evidence_log_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "original_clock_mapping_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "original_transaction_groups_pg"
 required-features = ["postgres"]

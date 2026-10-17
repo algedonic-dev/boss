@@ -88,6 +88,8 @@ mod boarding;
 mod carried_verdict;
 mod cars;
 mod conductor;
+#[cfg(test)]
+pub(crate) use conductor::qualification_launch;
 mod consist;
 mod consist_job;
 mod diagnostic_adapter;

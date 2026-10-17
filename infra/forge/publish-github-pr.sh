@@ -789,29 +789,68 @@ if [ "${1:-}" = "--measure" ]; then
     grep -E '^(docs/runbooks/|infra/(cluster|caddy|forge)/)' "$workdir/new-files" > "$workdir/sensitive" || true
     sens_count=$(grep -c . "$workdir/sensitive" || true)
 
+    # 2b. FOREIGN MIRROR CONTENT, judged by the measure step's own
+    #     instrument's rule (infra/mirror-drift-lib.sh, which
+    #     prep-github-publish.sh sources): a mirror commit forge main does
+    #     not contain is a threat only if it carries content forge main's
+    #     history lacks. Recorded, with the shas and the full review list
+    #     below, so this reading says everything the measure step records
+    #     and the rule publish-measure-lands-the-drift-reading can COPY it
+    #     onto that step (backlog f4bafd6b) instead of an agent re-deriving
+    #     it a day or four later. A classifier that cannot tell is not a
+    #     pass: the reading still lands, so the region keeps today's
+    #     numbers, but with a blocking note, which that rule never copies —
+    #     the agent judges it.
+    # shellcheck source=infra/mirror-drift-lib.sh
+    . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/mirror-drift-lib.sh"
+    blocking=""
+    if foreign=$(GIT_DIR="$CLONE" foreign_mirror_commits refs/remotes/forge/main refs/remotes/mirror/main 2>"$workdir/foreign-err"); then
+        # grep's 1 is "no lines" — zero foreign; anything else did not count.
+        foreign_count=$(grep -c . <<<"$foreign") || [ $? -eq 1 ] || foreign_count=unknown
+        case "$foreign_count" in
+            0) ;;
+            '' | *[!0-9]*) blocking="mirror-not-classified: the foreign commits could not be counted" ;;
+            *) blocking="mirror-has-unmerged-commits" ;;
+        esac
+    else
+        foreign_count=unknown
+        blocking="mirror-not-classified: $(head -c 200 "$workdir/foreign-err" | tr '\n' ' ')"
+    fi
+
     # 3. The secrets scan, over the tree that would be published — the
     #    one scan_commit a publish run also performs over its approved sha.
     scan_commit refs/remotes/forge/main
     [ "$scan_verdict" != unrunnable ] \
         || not_yet "$(cat "$workdir/scan-why"), so what forge main ($forge_head) would publish was never scanned; the drift was NOT written to ${job_id:0:8}"
     secrets="$scan_verdict"
+    # The instrument's own word for a scan that found something.
+    [ "$secrets" = clean ] || blocking="${blocking:+$blocking }secrets-lint-failed"
 
     # 4. The annotation. PATCH /api/jobs/{id}/metadata MERGES top-level
     #    keys, so the refresh lands beside everything the packet already
     #    carries; the job PUT would replace them.
     ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     if [ "$ahead" -gt 0 ]; then has_drift="true"; else has_drift="false"; fi
+    # source_sha, scanned_sha, newly_public_files and blocking are the
+    # measure step's own names (prep-github-publish.sh --json): forge main
+    # is both the tree counted and the tree scan_commit read, and the
+    # review list is WHOLE there, while newly_public_review keeps its
+    # twenty for the region's line (f4bafd6b).
     jq -n --arg ahead "$ahead" --arg behind "$behind" --arg files "$files" \
           --arg new_count "$new_count" --arg sens "$sens_count" --arg secrets "$secrets" \
           --arg has_drift "$has_drift" --arg ts "$ts" \
           --arg forge_head "$forge_head" --arg mirror_head "$mirror_head" \
+          --arg foreign "$foreign_count" --arg blocking "$blocking" \
           --rawfile sensitive "$workdir/sensitive" '
+        ($sensitive | split("\n") | map(select(. != ""))) as $review |
         {drift_refresh: {
             commits_ahead: $ahead, commits_behind: $behind, files_changed: $files,
+            commits_behind_foreign: $foreign,
             newly_public: $new_count, newly_public_sensitive: $sens,
-            newly_public_review: ($sensitive | split("\n") | map(select(. != "")) | .[0:20]),
-            secrets_scan: $secrets, has_drift: $has_drift,
+            newly_public_review: $review[0:20], newly_public_files: $review,
+            secrets_scan: $secrets, has_drift: $has_drift, blocking: $blocking,
             forge_head: $forge_head, mirror_head: $mirror_head,
+            source_sha: $forge_head, scanned_sha: $forge_head,
             measured_at: $ts, measured_by: "publish-github-pr --measure"},
          drift_refreshed_at: $ts}' > "$workdir/refresh" \
         || fail "the refresh could not be rendered as JSON"

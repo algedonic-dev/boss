@@ -56,7 +56,7 @@ FROM 10.20.0.15:3000/david/rust:1.96.1-slim-bookworm
 RUN apt-get update -qq \
  && apt-get install -y --no-install-recommends \
       git ca-certificates postgresql-client pkg-config libssl-dev curl gnupg tmux \
-      jq python3 \
+      jq python3 procps \
       openssh-client \
  && chmod u-s /usr/lib/openssh/ssh-keysign \
  && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -71,6 +71,13 @@ RUN apt-get update -qq \
 # person.
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 RUN ln -sf /usr/local/bin/bun /usr/local/bin/bunx
+
+# Native API contracts use the real client against loopback. Reuse the
+# runtime image's mirrored client, without a kubeconfig or cluster access.
+COPY --from=10.20.0.15:3000/david/alpine-k8s:1.33.3 /usr/bin/kubectl /usr/local/bin/kubectl
+# Execute both dependencies while building: a shell builtin cannot prove
+# that the external sender used for bounded process-group cancellation exists.
+RUN kubectl version --client=true --output=json && python3 -c 'import subprocess; child = subprocess.Popen(["sleep", "10"], start_new_session=True); subprocess.run(["/bin/kill", "-TERM", "--", "-" + str(child.pid)], check=True); assert child.wait(timeout=5) == -15'
 
 RUN rustup component add rustfmt clippy
 

@@ -1036,23 +1036,39 @@ pub async fn drain_outbox_once(
     bus: &Arc<dyn EventBus>,
     batch: i64,
 ) -> Result<DrainStats, String> {
-    // Phase 1 — claim + audit-insert, one short transaction. FOR
-    // UPDATE SKIP LOCKED lets a second relay instance (or the
-    // epoch-restart TRUNCATE, which queues behind the row locks)
-    // coexist without double-processing.
+    // Phase 1 — claim + audit-insert, one short transaction. Wait for
+    // a locked predecessor: skipping it records later state first and
+    // destroys causal replay (e1943ef0). Concurrent relays reconcile
+    // the same immutable identities after the earlier claim commits.
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-    let rows: Vec<OutboxRow> = sqlx::query_as(
+    // A prolonged holder yields a visible retryable storage error rather
+    // than an indefinitely stuck relay. No pending fact is skipped.
+    sqlx::query("SET LOCAL lock_timeout = '2s'")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    let claimed = sqlx::query_as(
         "SELECT id, event_id, timestamp, source, kind, payload \
          FROM event_outbox \
          WHERE delivered_at IS NULL AND dead_lettered_at IS NULL \
          ORDER BY id \
          LIMIT $1 \
-         FOR UPDATE SKIP LOCKED",
+         FOR UPDATE",
     )
     .bind(batch)
     .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| e.to_string())?;
+    .await;
+    let rows: Vec<OutboxRow> = match claimed {
+        Ok(rows) => rows,
+        Err(error) => {
+            let diagnostic =
+                format!("ordered outbox claim refused before audit insertion: {error}");
+            tx.rollback()
+                .await
+                .map_err(|rollback| format!("{diagnostic}; rollback failed: {rollback}"))?;
+            return Err(diagnostic);
+        }
+    };
 
     if rows.is_empty() {
         // Nothing to do; drop the empty tx.
@@ -1072,8 +1088,19 @@ pub async fn drain_outbox_once(
         .bind(kind)
         .bind(payload)
         .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
+        .await;
+        let res = match res {
+            Ok(res) => res,
+            Err(error) => {
+                // A competing audit writer can win after NOT EXISTS.
+                // Finish the aborted transaction before a caller retries;
+                // dropping it only queues rollback in SQLx's pool task.
+                tx.rollback().await.map_err(|rollback| {
+                    format!("{error}; rolling back the refused batch failed: {rollback}")
+                })?;
+                return Err(error.to_string());
+            }
+        };
         audit_inserted += res.rows_affected();
         // A prior audit row proves a retry only when it holds this
         // whole fact (ee2176c6). Judge in PostgreSQL so both timestamps
@@ -1098,11 +1125,18 @@ pub async fn drain_outbox_once(
         .await
         .map_err(|e| e.to_string())?;
         if !changed.is_empty() {
-            return Err(format!(
+            let conflict = format!(
                 "outbox row {outbox_id} event {event_id}: immutable identity conflict in {}; \
                  original audit fact preserved, queued fact remains pending, batch not published",
                 changed.join(", ")
-            ));
+            );
+            // Drop only queues SQLx's rollback. Until the pool flushes it,
+            // a retry can SKIP LOCKED our own refused row and report zero.
+            // Finish the refusal before returning it (f9cfb5ed).
+            tx.rollback().await.map_err(|rollback| {
+                format!("{conflict}; rolling back the refused batch failed: {rollback}")
+            })?;
+            return Err(conflict);
         }
     }
     tx.commit().await.map_err(|e| e.to_string())?;

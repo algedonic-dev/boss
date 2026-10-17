@@ -190,3 +190,47 @@ async fn oldest_order_is_applied_before_pagination() {
     );
     assert_eq!(titles(&list(&app, "limit=1").await), ["packet-3"]);
 }
+
+#[tokio::test]
+async fn an_absolute_step_completion_filter_ignores_domain_day_and_close_date() {
+    let (app, jobs) = app();
+    let cutoff = chrono::DateTime::parse_from_rfc3339("2026-10-17T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    for (n, title, completed) in [
+        (
+            1,
+            "before",
+            Some(cutoff - chrono::Duration::microseconds(1)),
+        ),
+        (2, "boundary", Some(cutoff)),
+        (3, "future", Some(cutoff + chrono::Duration::hours(1))),
+        (4, "undated", None),
+    ] {
+        let mut job = packet(n, "arbitrary", title, serde_json::json!({}));
+        job.status = JobStatus::Closed;
+        job.closed_on = None;
+        jobs.create_job_at(&job, cutoff + chrono::Duration::seconds(n.into()), &[])
+            .await
+            .unwrap();
+        let mut step = boss_core::job::Step::new(job.id, "task", "Legacy title without a slug", 0);
+        step.status = boss_core::job::StepStatus::Completed;
+        step.completed_at = completed;
+        jobs.add_step_at(&step, cutoff, &[]).await.unwrap();
+    }
+    let query = "step_completed_since=2026-10-16T17:00:00-07:00&order=oldest&limit=1";
+    let first = list(&app, query).await;
+    assert_eq!(first["total"], 2);
+    assert_eq!(titles(&first), ["boundary"]);
+    let second = list(&app, &format!("{query}&offset=1")).await;
+    assert_eq!(second["total"], 2);
+    assert_eq!(titles(&second), ["future"]);
+    for invalid in ["not-a-time", "null", ""] {
+        assert_eq!(
+            get(&app, &format!("step_completed_since={invalid}"))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}

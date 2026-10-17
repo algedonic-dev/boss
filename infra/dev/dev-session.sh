@@ -4,12 +4,14 @@
 #
 # An interactive ssh login used to exec straight into the one durable
 # tmux session, `dev` — the Remote Control / drain session the boot
-# starts running /work/dev-claude.sh. It now offers four sessions:
+# starts running /work/dev-claude.sh. It now offers five sessions:
 #
 #   1) Claude + Claude Code   tmux `dev`     /work/dev-claude.sh
 #   2) GPT + Codex            tmux `codex`   codex
 #   3) Gemini + Code Assist   tmux `gemini`  gemini
 #   4) Shell                  tmux `shell`   bash -l
+#   5) Claude B + Claude Code tmux `claude-b` claude, own login home
+#      ($HOME/.claude-b), signing as claude-b@algedonic.dev
 #
 # Each JOINS its session when it runs and CREATES it when it does not
 # (`tmux new-session -A`). Enter, or no answer within the timeout, is 1,
@@ -95,7 +97,7 @@ status() { if running "$1"; then echo running; else echo 'not running'; fi; }
 # The CLI an option's session needs to START (joining needs only tmux).
 cli_of() {
   case $1 in
-    dev) echo claude ;;
+    dev | claude-b) echo claude ;;
     codex) echo codex ;;
     gemini) echo gemini ;;
   esac
@@ -222,6 +224,20 @@ place_config() {
   done <"$src"
 }
 
+# A SECOND CLAUDE ACCOUNT's login home (David 2026-10-17: practise
+# scaling to two accounts). Prepared when missing: option 1's settings
+# copied, its memory (projects), skills and plugins LINKED so both
+# accounts work from one record. Never a credential: the login is the
+# person's own act, `/login` on first launch, and it lives only here.
+claude_b_home() {
+  local a=$HOME/.claude b=$HOME/.claude-b part
+  mkdir -p "$b" || return 0
+  [ -e "$b/settings.json" ] || { [ -f "$a/settings.json" ] && cp "$a/settings.json" "$b/settings.json"; }
+  for part in projects skills plugins; do
+    [ -e "$b/$part" ] || [ -L "$b/$part" ] || /usr/bin/ln -s "$a/$part" "$b/$part"
+  done
+}
+
 # Join or create session $1 running the rest of argv. Returns only when
 # its CLI is missing and was not installed.
 join() {
@@ -240,6 +256,11 @@ join() {
     codex)
       agent_identity codex@algedonic.dev 'Codex (engineering)' "$mode"
       [ "$mode" = check ] && place_config infra/dev/cli/codex-config.toml .codex/config.toml
+      ;;
+    claude-b)
+      agent_identity claude-b@algedonic.dev 'Claude (engineering, account B)' "$mode"
+      [ "$mode" = check ] && claude_b_home
+      flags+=(-e "CLAUDE_CONFIG_DIR=$HOME/.claude-b")
       ;;
     gemini)
       agent_identity gemini@algedonic.dev 'Gemini (engineering)' "$mode"
@@ -265,6 +286,7 @@ while :; do
   printf '  2) %-22s %-8s %s\n' 'GPT + Codex' codex "$(status codex)"
   printf '  3) %-22s %-8s %s\n' 'Gemini + Code Assist' gemini "$(status gemini)"
   printf '  4) %-22s %-8s %s\n' 'Shell' shell "$(status shell)"
+  printf '  5) %-22s %-8s %s\n' 'Claude B + Claude Code' claude-b "$(status claude-b)"
   printf '> '
   choice=''
   if ! read -r -t "$timeout" choice && [ -z "$choice" ]; then
@@ -275,6 +297,7 @@ while :; do
     2) join codex codex ;;
     3) join gemini gemini ;;
     4) join shell bash -l ;;
+    5) join claude-b claude ;;
     *) echo "no option '$choice'" ;;
   esac
 done

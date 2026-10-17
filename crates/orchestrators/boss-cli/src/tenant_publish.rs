@@ -98,8 +98,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use crate::machine_http::BlockingMachineClient;
 use anyhow::{Context, Result, bail};
-use boss_core::machine_token::BlockingClient;
 use boss_core::publish::{
     FieldChange, KeptRow, PublishMode, UpdatedRow, render_kept, render_updated,
 };
@@ -297,11 +297,11 @@ pub fn walk_client(
     bases: &Bases,
     builder: reqwest::blocking::ClientBuilder,
     token: std::sync::Arc<boss_core::machine_token::Source>,
-) -> Result<BlockingClient> {
+) -> Result<BlockingMachineClient> {
     Ok(if bases.through_gateway {
-        BlockingClient::unstamped(builder)?
+        BlockingMachineClient::gateway(builder)?
     } else {
-        BlockingClient::build_with_source(builder, token)?
+        BlockingMachineClient::build_with_source(builder, token)?
     })
 }
 
@@ -1088,7 +1088,7 @@ pub fn plan(dir: &Path) -> Result<Plan> {
     })
 }
 
-fn seed_client(bases: &Bases) -> Result<BlockingClient> {
+fn seed_client(bases: &Bases) -> Result<BlockingMachineClient> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "x-boss-user",
@@ -1186,7 +1186,7 @@ fn declared_changes(current: &Value, declared: &Value) -> Vec<FieldChange> {
 /// running instance the same overlay reverted every operator edit at
 /// the next boot, which is the collision the design decided against.
 fn seed_people(
-    client: &BlockingClient,
+    client: &BlockingMachineClient,
     people_base: &str,
     roster: &[Value],
     take: bool,
@@ -1310,7 +1310,7 @@ fn seed_people(
 /// both engines run before opening design Jobs, so role-bearing steps
 /// assign to real holders instead of dead-lettering against a cold
 /// roster. Best-effort: a timeout logs and proceeds.
-fn wait_for_people_projection(client: &BlockingClient, people_base: &str, threshold: usize) {
+fn wait_for_people_projection(client: &BlockingMachineClient, people_base: &str, threshold: usize) {
     let list_url = url(people_base, "/api/people");
     let (mut prev, mut stable) = (0usize, 0u32);
     for _ in 0..90 {
@@ -1346,7 +1346,7 @@ fn wait_for_people_projection(client: &BlockingClient, people_base: &str, thresh
 /// back, the declared body is PUT through that door, and the change is
 /// named field by field from the row read.
 fn take_classes(
-    client: &BlockingClient,
+    client: &BlockingMachineClient,
     classes_base: &str,
     rows: &[Value],
     kept: &[KeptRow],
@@ -1398,7 +1398,7 @@ fn take_classes(
 }
 
 /// Send one door. Returns the outcome line's tail.
-fn send(client: &BlockingClient, bases: &Bases, door: &Door, take: &Take) -> Result<String> {
+fn send(client: &BlockingMachineClient, bases: &Bases, door: &Door, take: &Take) -> Result<String> {
     match door {
         Door::Classes { rows } => {
             let u = url(&bases.classes, "/api/classes/batch");
@@ -1637,7 +1637,7 @@ fn rules_outcome(resp: reqwest::blocking::Response, u: &str) -> Result<String> {
 /// it took the name from. The next publish then reads the tenant's
 /// own row as ahead of its file, and leaves it alone.
 fn publish_rule(
-    client: &BlockingClient,
+    client: &BlockingMachineClient,
     dispatcher_base: &str,
     source: &str,
     rule: &boss_dispatcher::rules::registry::RawRule,
@@ -3286,7 +3286,7 @@ mod tests {
     fn a_gateway_walk_never_stamps_and_a_door_walk_keeps_the_host_decision() {
         use boss_core::machine_token::{HEADER, Source};
         let token = || Arc::new(Source::fixed(Some("estate-token-value".into())));
-        let stamped = |c: &BlockingClient, url: &str| {
+        let stamped = |c: &BlockingMachineClient, url: &str| {
             c.get(url).build().unwrap().headers().get(HEADER).is_some()
         };
         let (gw, _) = Bases::routed(Some("http://127.0.0.1:8080"), None).unwrap();

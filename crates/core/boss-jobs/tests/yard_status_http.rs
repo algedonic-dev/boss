@@ -364,6 +364,7 @@ async fn fire(cadence: &InMemoryCadence, rule: &str, verb: &str, at: &str, rc: O
                 &FiringOutcome {
                     rc,
                     runtime_secs: 30,
+                    observations: None,
                     board_decision: None,
                 },
             )
@@ -385,7 +386,9 @@ fn policy_row() -> StoredPolicy {
             skip_reason_file_budget: 200,
             blip_cause_budget: 200,
             ci_host_floor_gb: 10,
+            gate_queue_owner: boss_jobs::delivery::legacy_gate_queue_owner(),
             gate_max_concurrent: 4,
+            channels: serde_json::Value::Null,
         },
         status: "active".into(),
     }

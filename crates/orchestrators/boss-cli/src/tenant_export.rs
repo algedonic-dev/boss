@@ -80,8 +80,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
+use crate::machine_http::BlockingMachineClient;
 use anyhow::{Context, Result, bail};
-use boss_core::machine_token::BlockingClient;
 use boss_core::tenant_manifest::TenantToml;
 use serde_json::{Value, json};
 
@@ -126,7 +126,7 @@ pub struct Snapshot {
 // Reading the instance
 // ---------------------------------------------------------------------------
 
-fn seed_client(bases: &Bases) -> Result<BlockingClient> {
+fn seed_client(bases: &Bases) -> Result<BlockingMachineClient> {
     // Stamps the machine token per request and follows no redirect
     // (design 6805c764 car 2, the CLI slice): the gate guards reads too.
     // Through a gateway it stamps nothing (backlog 2ee29275), the rule
@@ -145,7 +145,7 @@ fn seed_builder() -> reqwest::blocking::ClientBuilder {
         .default_headers(headers)
 }
 
-fn get(client: &BlockingClient, base: &str, path: &str) -> Result<Value> {
+fn get(client: &BlockingMachineClient, base: &str, path: &str) -> Result<Value> {
     let u = format!("{}{path}", base.trim_end_matches('/'));
     let resp = client.get(&u).send().with_context(|| format!("GET {u}"))?;
     let status = resp.status();
@@ -186,7 +186,7 @@ fn rows_of(v: Value) -> Result<Vec<Value>> {
 
 /// One list door read, its rows refused rather than guessed, and the
 /// refusal naming the door that answered.
-fn list(client: &BlockingClient, base: &str, path: &str) -> Result<Vec<Value>> {
+fn list(client: &BlockingMachineClient, base: &str, path: &str) -> Result<Vec<Value>> {
     rows_of(get(client, base, path)?).with_context(|| format!("GET {base}{path}"))
 }
 
@@ -1088,7 +1088,7 @@ mod tests {
             sock.write_all(resp.as_bytes()).unwrap();
         });
         let why = list(
-            &BlockingClient::unstamped(seed_builder()).unwrap(),
+            &BlockingMachineClient::unstamped(seed_builder()).unwrap(),
             &base,
             "/api/agents",
         )

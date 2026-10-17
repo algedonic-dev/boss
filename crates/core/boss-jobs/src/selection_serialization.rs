@@ -140,6 +140,43 @@ fn emit(value: &serde_json::Value, writer: &mut Writer, trailing: bool) -> std::
 mod tests {
     use super::*;
     #[test]
+    fn an_expired_stream_accepts_no_further_evidence_bytes() {
+        let mut writer = Writer {
+            bytes: Some(Vec::new()),
+            hash: Sha256::new(),
+            deadline: None,
+        };
+        writer.write_all(b"retained prefix").unwrap();
+        let original_bytes = writer.bytes.clone();
+        let original_digest = writer.hash.clone().finalize();
+        // Expiry between writes models a descheduled producer resuming after
+        // its original deadline, without making scheduler speed a test oracle.
+        writer.deadline = Some(Instant::now());
+        let remaining = vec![b'x'; 128 * 1024];
+        assert_eq!(
+            writer.write_all(&remaining).unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert_eq!(writer.bytes, original_bytes);
+        assert_eq!(writer.hash.finalize(), original_digest);
+    }
+
+    #[test]
+    fn expired_serialization_and_hashing_refuse_instead_of_returning_partial_artifacts() {
+        let original = serde_json::json!({"rows":["雪".repeat(8192), "retained evidence"]});
+        let unchanged = original.clone();
+        let deadline = Some(Instant::now());
+        for result in [
+            json(&original, deadline),
+            canonical_hash(&original, deadline),
+            hash(b"original immutable evidence", deadline),
+        ] {
+            assert!(matches!(result, Err(JobsError::SelectionConflict(_))));
+        }
+        assert_eq!(original, unchanged);
+    }
+
+    #[test]
     fn streaming_bytes_and_digest_equal_the_original_formats() {
         for value in [
             serde_json::json!(null),

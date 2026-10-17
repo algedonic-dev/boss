@@ -266,7 +266,61 @@ pub const SHED_UNPROVEN: Band = band(
     "a landed car nothing can prove",
     0,
 );
+/// A proof or observer attempt whose required outcome cannot be read.
+pub const SHED_UNREAD: Band = band(
+    "shed-unread",
+    "shed",
+    Troubled,
+    "a proof attempt with no readable outcome",
+    0,
+);
+/// A declared wait with no owner requires action without an age grace.
+pub const SHED_UNOWNED: Band = band(
+    "shed-unowned",
+    "shed",
+    Troubled,
+    "a declared wait without an owner",
+    0,
+);
+/// An unobserved external condition needs an observer now.
+pub const SHED_UNOBSERVED: Band = band(
+    "shed-unobserved",
+    "shed",
+    Troubled,
+    "a world wait without an observer",
+    0,
+);
+/// A recorded wait bound takes precedence over the general age band.
+pub const SHED_WAIT_OVERDUE: Band = band(
+    "shed-wait-overdue",
+    "shed",
+    Troubled,
+    "a wait past its recorded bound",
+    0,
+);
+/// A satisfied condition cannot remain an external wait indefinitely.
+pub const SHED_CONDITION_SEEN: Band = band(
+    "shed-condition-seen",
+    "shed",
+    Troubled,
+    "a condition seen while its proof still says not yet",
+    0,
+);
 /// A landed car whose probe ran and failed.
+pub const SHED_WAIT_UNQUALIFIED: Band = band(
+    "shed-wait-unqualified",
+    "shed",
+    Troubled,
+    "required wait evidence or next check unread",
+    0,
+);
+pub const SHED_WAIT_EXPECTED: Band = band(
+    "shed-wait-expected",
+    "shed",
+    Attention,
+    "a qualified wait inside its recorded check",
+    0,
+);
 pub const SHED_FAILING: Band = band("shed-failing", "shed", Troubled, "a failing probe", 0);
 /// Open past [`PROOF_STALE_HOURS`] awaiting proof, and the next move is
 /// ours (`regions::StaleProof`, every answer but `Theirs`).
@@ -311,15 +365,31 @@ pub const GARAGE_STRANDED: Band = band(
     "a green or a gate-run with no car for 15m",
     15,
 );
-/// A car held on the dock, a green held before parking, or a red
-/// awaiting rework — deliberate, and worked, until it has stood an hour.
-pub const GARAGE_WAITING: Band = band(
-    "garage-waiting",
+/// A judged failure requires repair now, independently of the queue's
+/// age. A deliberate hold cannot turn a failed check into healthy flow.
+pub const GARAGE_FAILED: Band = band(
+    "garage-failed",
+    "garage",
+    Troubled,
+    "a failed gate requiring rework",
+    0,
+);
+/// A car held on the dock or a green held before parking.
+pub const GARAGE_WAIT_UNQUALIFIED: Band = band(
+    "garage-wait-unqualified",
+    "garage",
+    Troubled,
+    "a hold without a registered wait reading",
+    0,
+);
+pub const GARAGE_WAIT_EXPECTED: Band = band(
+    "garage-wait-expected",
     "garage",
     Attention,
-    "held or red for 60m",
-    60,
+    "an active review inside its pinned bound",
+    0,
 );
+pub const GARAGE_WAITING: Band = band("garage-waiting", "garage", Attention, "held for 60m", 60);
 
 // --- receiving --------------------------------------------------------
 
@@ -487,7 +557,7 @@ pub const SENSOR_UNREADABLE: Band = band(
 );
 
 /// EVERY BAND, once; uniqueness and coverage pins read this roster.
-pub const BANDS: [Band; 32] = [
+pub const BANDS: &[Band] = &[
     UNREAD,
     MACHINE_FAILED,
     FULL,
@@ -502,11 +572,21 @@ pub const BANDS: [Band; 32] = [
     TRACK_GATE_WAITING,
     SHED_UNPROVEN,
     SHED_FAILING,
+    SHED_UNREAD,
+    SHED_UNOWNED,
+    SHED_UNOBSERVED,
+    SHED_WAIT_OVERDUE,
+    SHED_CONDITION_SEEN,
+    SHED_WAIT_UNQUALIFIED,
+    SHED_WAIT_EXPECTED,
     SHED_OURS_STALE,
     SHED_THEIRS_STALE,
     ARRIVALS_RED_UNREPAIRED,
     GARAGE_STRANDED,
+    GARAGE_FAILED,
     GARAGE_WAITING,
+    GARAGE_WAIT_EXPECTED,
+    GARAGE_WAIT_UNQUALIFIED,
     RECEIVING_AGING,
     RECEIVING_STALE,
     MARSHALLING_OVER_LIMIT,

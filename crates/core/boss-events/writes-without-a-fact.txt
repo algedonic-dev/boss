@@ -122,10 +122,9 @@ not-a-fact fn crates/modules/boss-people/src/webauthn.rs::record_credential_use 
 # epoch restart rewinds the sim's synthetic history to the seed
 # baseline by design.
 # ---------------------------------------------------------------------
-not-a-fact fn crates/core/boss-clock/src/postgres.rs::write_params -- simulator control: the sim clock's warp, anchor and pause parameters
-not-a-fact fn crates/core/boss-jobs/src/postgres.rs::PgJobs::set_sim_clock_paused -- simulator control: pauses the sim clock
-not-a-fact fn crates/core/boss-jobs/src/postgres.rs::PgJobs::restart_sim_clock_epoch -- simulator control: flags an epoch restart in progress
-not-a-fact fn crates/core/boss-jobs/src/postgres.rs::run_restart_epoch_background -- simulator control: the epoch restart's sim_clock reset
+# Clock parameters/mode now stage original clock.mapping.recorded facts
+# through the schema's producer trigger. The pin verifies that binding;
+# these writers no longer need a not-a-fact allowance.
 not-a-fact fn crates/core/boss-jobs/src/postgres.rs::trim_epoch_audit_log -- simulator control: an epoch restart trims the sim's synthetic history back to the seed baseline, preserving platform meta-work
 not-a-fact fn crates/core/boss-jobs/src/postgres.rs::clear_epoch_payroll_state -- simulator control: an epoch restart clears the sim's payroll state before the rebuilders replay
 

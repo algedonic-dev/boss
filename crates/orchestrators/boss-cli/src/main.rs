@@ -13,10 +13,13 @@ mod car_retire;
 mod car_unland;
 mod census;
 mod channels;
+mod cli_inputs;
 mod core_changes;
 mod correct;
 mod credential;
+mod delivery_plan;
 mod delivery_policy;
+mod delivery_timing;
 mod design;
 mod dispatch;
 mod dispatch_brief;
@@ -36,6 +39,7 @@ mod estate;
 mod events;
 mod freshness;
 mod gate;
+mod gate_retire;
 mod gemini_execution;
 mod git_auth;
 mod harness;
@@ -51,6 +55,7 @@ mod launch_cluster;
 mod launch_controller;
 mod launch_job;
 mod ledger;
+mod machine_http;
 mod memory_index;
 mod merged;
 mod mutating_verb;
@@ -63,6 +68,7 @@ mod park;
 mod prior_work;
 mod probe_door_check;
 mod probe_reader;
+mod proof_observation;
 mod prose;
 mod prove;
 mod publish;
@@ -96,6 +102,8 @@ mod transcript_usage;
 mod trust_boundary;
 mod upgrade;
 mod workflow;
+#[path = "../workflow_roster.rs"]
+mod workflow_roster;
 
 #[derive(Parser)]
 #[command(
@@ -233,16 +241,38 @@ enum Commands {
     /// replaces a hand-rolled retry loop. Without `--wait` the bound
     /// refuses, naming the running gates and filing nothing.
     Gate {
-        /// Branch to gate. Absent only with --withdraw, which names a
-        /// gate-run instead.
+        /// Branch to gate. Absent only with --withdraw or --retire, which
+        /// name a gate-run instead.
         // A reason explains a withdrawal and nothing else, so a branch
         // refuses one outright: clap's `requires` on the reason did not
         // fire beside `required_unless_present` (measured under 4.6).
+        // The successor of a retirement is refused the same way.
         #[arg(
-            required_unless_present = "withdraw",
-            conflicts_with_all = ["reason", "reason_file"]
+            required_unless_present_any = ["withdraw", "retire"],
+            conflicts_with_all = ["reason", "reason_file", "superseded_by"]
         )]
         branch: Option<String>,
+        /// Retire a CLOSED gate-run no car ever claimed, because another
+        /// branch carrying the same work has landed — named by
+        /// --superseded-by and verified on the forge's main. Records
+        /// `superseded_by`, `retire_evidence` and `retired_by` on the
+        /// gate-run, and the garage stops drawing its branch. Measured
+        /// 2026-10-17: 14 of 17 reds in the garage were superseded and
+        /// no door could take them out (backlog c9c48222).
+        #[arg(
+            long,
+            value_name = "GATE-RUN",
+            requires = "superseded_by",
+            conflicts_with_all = [
+                "branch", "withdraw", "reason", "reason_file", "wait", "submit", "mode",
+                "manifest", "rebase", "hold", "force_regate", "stale_base_anyway", "park_file",
+            ]
+        )]
+        retire: Option<String>,
+        /// The successor that landed (with --retire): its branch, 8+
+        /// characters of its car's id, or the merge sha that landed it.
+        #[arg(long, requires = "retire", value_name = "LANDED")]
+        superseded_by: Option<String>,
         /// Withdraw a gate-run whose purpose is gone, before any runner
         /// pod exists: close it on the protocol's `withdrawn` terminal
         /// with the reason, deleting a queued Job whose pod never
@@ -256,7 +286,7 @@ enum Commands {
             long,
             value_name = "GATE-RUN",
             conflicts_with_all = [
-                "branch", "wait", "mode", "manifest", "rebase", "hold",
+                "branch", "wait", "submit", "mode", "manifest", "rebase", "hold",
                 "force_regate", "stale_base_anyway", "park_file",
             ]
         )]
@@ -284,6 +314,11 @@ enum Commands {
         /// Poll the gate-run packet until it reports a verdict.
         #[arg(long)]
         wait: bool,
+        /// Accept packet-owned queue intent without keeping this process
+        /// alive. --wait observes only. Staged control before the
+        /// published gate_queue_owner setting cuts ordinary calls over.
+        #[arg(long)]
+        submit: bool,
         /// Show what would happen without filing or creating anything.
         #[arg(long)]
         dry_run: bool,
@@ -810,6 +845,31 @@ enum Commands {
     /// plus the delivery mix over the dock and the per-tier mix
     /// (ba429e7f): is the core settling while work moves outward.
     Channels {
+        /// Complete native train population with actual delivery durations,
+        /// missing evidence, unknown channels and right-censored observations.
+        #[arg(long, conflicts_with_all = ["delivery_evidence", "tiers", "backfill_tiers", "core_changes", "since"])]
+        delivery_times: bool,
+        /// Read publication and whole registry equality for a frozen delivery
+        /// plan. This observes only; it never publishes or applies anything.
+        #[arg(long, group = "channel_source", requires = "publication_head", conflicts_with_all = ["tiers", "backfill_tiers", "core_changes", "since"])]
+        delivery_evidence: Option<std::path::PathBuf>,
+        /// Capture complete successful Cargo messages and actual binary inputs.
+        #[arg(long, group = "channel_source", requires = "compiler_artifacts", conflicts_with_all = ["delivery_times", "tiers", "backfill_tiers", "core_changes", "since", "root_tree_reader"])]
+        compiler_inputs: Option<std::path::PathBuf>,
+        #[arg(long, requires = "compiler_inputs")]
+        compiler_artifacts: Option<std::path::PathBuf>,
+        /// Re-read native publication/equality and actual image compiler inputs.
+        #[arg(long, group = "channel_source", conflicts_with_all = ["delivery_times", "tiers", "backfill_tiers", "core_changes", "since"])]
+        compatible_source: Option<String>,
+        /// Exact native merge commit whose published tree must equal the plan.
+        #[arg(long, requires = "delivery_evidence")]
+        publication_head: Option<String>,
+        /// Repository holding the frozen objects and the normal forge origin.
+        #[arg(long, requires = "channel_source")]
+        repository: Option<std::path::PathBuf>,
+        /// Root deployment generation's qualified, frozen read-only forge door.
+        #[arg(long, requires = "channel_source", conflicts_with = "compiler_inputs")]
+        root_tree_reader: Option<std::path::PathBuf>,
         /// Read each CLOSED train's merge commit in this checkout and
         /// stamp software_tiers on the train (idempotent: a train that
         /// carries it is skipped) instead of printing the mixes.
@@ -919,6 +979,12 @@ enum Commands {
         #[arg(long = "bind")]
         binds: Vec<String>,
     },
+    /// Observe a registered native evidence contract as the protected probe
+    /// account. Reports a separate observation; records no car proof or attempt.
+    ObserveProof {
+        /// Exact append-only versioned contract name, never executable text.
+        contract: String,
+    },
     /// Prove a merged car in production by RUNNING a probe.
     ///
     /// The verb executes the command itself and records exit status and
@@ -944,6 +1010,11 @@ enum Commands {
         /// print a unique token instead.
         #[arg(long)]
         expect: Option<String>,
+        /// Record a probe for a landed car without executing or proving it.
+        /// Retains the original event and prior probe beside this registration;
+        /// the forge's existing run-car-probe door runs the recorded command.
+        #[arg(long, requires_all = ["probe", "expect"], conflicts_with_all = ["from_car", "unattended", "recheck", "replace", "exit_only", "disproved", "superseded_by", "probe_anyway", "method", "method_file"])]
+        record_probe: bool,
         /// Assert on the exit code alone, when the command IS the test
         /// (`grep -q`, `test -f`). Recorded, so a reader sees it.
         #[arg(long)]
@@ -1232,9 +1303,10 @@ enum CarAction {
         /// unless the car already declares one.
         #[arg(long)]
         on: Option<String>,
-        /// Shell text that exits 0 once that event is in the record. Run
-        /// by the door that records each not-yet, on the forge, under the
-        /// probe's rules. Without it the wait can never be contradicted.
+        /// Shell text that exits 0 when the event is seen. A successful
+        /// negative read prints JSON {"observation":"unseen"} and exits 1;
+        /// every other or legacy nonzero outcome is unread. Run on the
+        /// forge under the probe's rules after each not-yet.
         #[arg(long)]
         seen: Option<String>,
         /// Whose move the wait is: `world` for an event nobody here can
@@ -1246,8 +1318,11 @@ enum CarAction {
         /// the wait is ours again. Optional; positive.
         #[arg(long)]
         max_wait_hours: Option<u32>,
+        /// The next observable check, as an RFC3339 time.
+        #[arg(long)]
+        next_check_at: Option<String>,
         /// Remove the declaration.
-        #[arg(long, conflicts_with_all = ["on", "seen", "owner", "max_wait_hours"])]
+        #[arg(long, conflicts_with_all = ["on", "seen", "owner", "max_wait_hours", "next_check_at"])]
         clear: bool,
         /// Print the PATCH body without writing it.
         #[arg(long)]
@@ -1899,6 +1974,7 @@ async fn main() -> Result<()> {
                 seen,
                 owner,
                 max_wait_hours,
+                next_check_at,
                 clear,
                 dry_run,
             } => {
@@ -1907,6 +1983,8 @@ async fn main() -> Result<()> {
                     seen,
                     owner,
                     max_wait_hours,
+                    next_check_at,
+                    clean_window: None,
                 };
                 car::waits_on(&given, &fields, clear, dry_run).await
             }
@@ -2122,12 +2200,48 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Channels {
+            delivery_times,
+            compiler_inputs,
+            compiler_artifacts,
+            compatible_source,
+            delivery_evidence,
+            publication_head,
+            root_tree_reader,
+            repository,
             backfill_tiers,
             tiers,
             core_changes,
             since,
         } => {
-            if core_changes {
+            if let Some(head) = compatible_source {
+                cli_inputs::run_compatible(
+                    &head,
+                    repository.as_deref(),
+                    root_tree_reader.as_deref(),
+                )
+                .await
+            } else if let Some(messages) = compiler_inputs {
+                cli_inputs::run(
+                    &messages,
+                    compiler_artifacts
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("compiler artifacts required"))?,
+                    repository.as_deref(),
+                )
+                .await
+            } else if delivery_times {
+                delivery_timing::run().await
+            } else if let Some(plan) = delivery_evidence {
+                delivery_plan::run(
+                    &plan,
+                    repository.as_deref(),
+                    publication_head
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("publication head required"))?,
+                    root_tree_reader.as_deref(),
+                )
+                .await
+            } else if core_changes {
                 core_changes::run(since, chrono::Utc::now())
             } else if backfill_tiers {
                 channels::backfill_tiers(since).await
@@ -2177,10 +2291,12 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Commands::ObserveProof { contract } => proof_observation::run(&contract),
         Commands::Prove {
             car,
             probe,
             expect,
+            record_probe,
             exit_only,
             verified,
             verified_file,
@@ -2204,6 +2320,17 @@ async fn main() -> Result<()> {
                 verified,
                 verified_file.as_deref(),
             )?;
+            if record_probe {
+                return prove::record_probe(
+                    &car,
+                    probe.as_deref().unwrap_or_default(),
+                    expect.as_deref().unwrap_or_default(),
+                    verified.as_deref().unwrap_or_default(),
+                    dry_run,
+                    chrono::Utc::now(),
+                )
+                .await;
+            }
             if disproved {
                 return disprove::run(
                     &car,
@@ -2268,17 +2395,32 @@ async fn main() -> Result<()> {
                 reason,
                 reason_file.as_deref(),
             )?;
-            gate::withdraw(&packet, reason, &namespace, dry_run).await
+            gate::withdraw(&packet, reason, &namespace, dry_run, chrono::Utc::now()).await
+        }
+        Commands::Gate {
+            retire: Some(packet),
+            superseded_by,
+            dry_run,
+            ..
+        } => {
+            // clap requires --superseded-by beside --retire.
+            let by = superseded_by.ok_or_else(|| {
+                anyhow::anyhow!("boss gate --retire: --superseded-by <landed> is required")
+            })?;
+            gate_retire::retire(&packet, &by, dry_run).await
         }
         Commands::Gate {
             branch,
             withdraw: _,
+            retire: _,
+            superseded_by: _,
             reason: _,
             reason_file: _,
             mode,
             manifest,
             namespace,
             wait,
+            submit,
             dry_run,
             park_summary,
             park_excludes,
@@ -2343,6 +2485,8 @@ async fn main() -> Result<()> {
                     seen: park_waits_on_seen,
                     owner: park_waits_on_owner,
                     max_wait_hours: park_waits_on_max_wait_hours,
+                    next_check_at: None,
+                    clean_window: None,
                 }),
             };
             // clap requires the branch unless --withdraw is present, and
@@ -2355,6 +2499,7 @@ async fn main() -> Result<()> {
                 manifest,
                 &namespace,
                 wait,
+                submit,
                 dry_run,
                 park,
                 force_regate,
@@ -2469,6 +2614,133 @@ async fn cmd_emit(kind: String, payload: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compiler_input_collection_is_an_exclusive_local_read() {
+        use clap::Parser;
+        assert!(
+            super::Cli::try_parse_from([
+                "boss",
+                "channels",
+                "--compiler-inputs",
+                "cargo.jsonl",
+                "--compiler-artifacts",
+                "/out",
+                "--repository",
+                "/source"
+            ])
+            .is_ok()
+        );
+        assert!(
+            super::Cli::try_parse_from(["boss", "channels", "--compiler-inputs", "cargo.jsonl"])
+                .is_err()
+        );
+        assert!(
+            super::Cli::try_parse_from(["boss", "channels", "--compiler-artifacts", "/out"])
+                .is_err()
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "boss",
+                "channels",
+                "--compiler-inputs",
+                "cargo.jsonl",
+                "--compiler-artifacts",
+                "/out",
+                "--tiers"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn compatible_source_requires_an_exclusive_source_read() {
+        use clap::Parser;
+        assert!(
+            super::Cli::try_parse_from([
+                "boss",
+                "channels",
+                "--compatible-source",
+                "HEAD",
+                "--repository",
+                "/source"
+            ])
+            .is_ok()
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "boss",
+                "channels",
+                "--compatible-source",
+                "HEAD",
+                "--tiers"
+            ])
+            .is_err()
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "boss",
+                "channels",
+                "--compatible-source",
+                "HEAD",
+                "--delivery-evidence",
+                "plan",
+                "--publication-head",
+                "HEAD"
+            ])
+            .is_err()
+        );
+    }
+    #[test]
+    fn delivery_times_is_an_exclusive_complete_population_read() {
+        use clap::Parser;
+        assert!(super::Cli::try_parse_from(["boss", "channels", "--delivery-times"]).is_ok());
+        for other in ["--tiers", "--backfill-tiers", "--core-changes"] {
+            assert!(
+                super::Cli::try_parse_from(["boss", "channels", "--delivery-times", other])
+                    .is_err()
+            );
+        }
+        assert!(
+            super::Cli::try_parse_from([
+                "boss",
+                "channels",
+                "--delivery-times",
+                "--since",
+                "2026-10-01"
+            ])
+            .is_err()
+        );
+    }
+    #[test]
+    fn delivery_observation_requires_its_frozen_publication_and_cannot_mix_reports() {
+        use clap::Parser;
+        let args = [
+            "boss",
+            "channels",
+            "--delivery-evidence",
+            "plan.json",
+            "--publication-head",
+            "0123456789012345678901234567890123456789",
+        ];
+        assert!(super::Cli::try_parse_from(args).is_ok());
+        let mut root = args.to_vec();
+        root.extend([
+            "--root-tree-reader",
+            "/managed/gen/infra/forge/root-tree.sh",
+        ]);
+        assert!(super::Cli::try_parse_from(root).is_ok());
+        assert!(
+            super::Cli::try_parse_from(["boss", "channels", "--root-tree-reader", "/arbitrary"])
+                .is_err()
+        );
+        assert!(
+            super::Cli::try_parse_from(["boss", "channels", "--delivery-evidence", "plan.json"])
+                .is_err()
+        );
+        let mut mixed = args.to_vec();
+        mixed.push("--tiers");
+        assert!(super::Cli::try_parse_from(mixed).is_err());
+    }
     #[test]
     fn the_published_cli_can_state_its_dev_routing_contract_before_activation() {
         use clap::Parser;
@@ -2692,6 +2964,13 @@ mod tests {
     /// keeps the shell out of the path, as `--markdown-file` already
     /// does for a design body.
     #[test]
+    fn a_durable_gate_submission_has_an_explicit_control_door() {
+        assert!(Cli::try_parse_from(["boss", "gate", "feat/source", "--submit"]).is_ok());
+        assert!(Cli::try_parse_from(["boss", "gate", "feat/source", "--submit", "--wait"]).is_ok());
+        assert!(Cli::try_parse_from(["boss", "gate", "--withdraw", "packet", "--submit"]).is_err());
+    }
+
+    #[test]
     fn a_prose_flag_has_a_file_door() {
         for (verb, args, text, file) in [
             (
@@ -2752,6 +3031,71 @@ mod tests {
             vec!["boss", "gate", "--withdraw", "8c2f644a", "--wait"],
             vec!["boss", "gate", "--withdraw", "8c2f644a", "--rebase"],
             vec!["boss", "gate", "feat/x", "--reason", "why"],
+        ] {
+            assert!(
+                Cli::try_parse_from(refused.clone()).is_err(),
+                "{refused:?} must be refused"
+            );
+        }
+    }
+
+    /// `boss gate --retire <gate-run> --superseded-by <landed>` names a
+    /// packet too (backlog c9c48222): the successor is required with it
+    /// and means nothing without it, and a retirement carries none of a
+    /// launch's or a withdrawal's flags.
+    #[test]
+    fn a_retirement_names_a_gate_run_and_its_successor() {
+        Cli::try_parse_from([
+            "boss",
+            "gate",
+            "--retire",
+            "02686d0a",
+            "--superseded-by",
+            "feat/x-2",
+            "--dry-run",
+        ])
+        .unwrap_or_else(|e| panic!("a retirement parses: {e}"));
+        for refused in [
+            vec!["boss", "gate", "--retire", "02686d0a"],
+            vec!["boss", "gate", "feat/x", "--superseded-by", "feat/x-2"],
+            vec![
+                "boss",
+                "gate",
+                "feat/x",
+                "--retire",
+                "02686d0a",
+                "--superseded-by",
+                "feat/x-2",
+            ],
+            vec![
+                "boss",
+                "gate",
+                "--retire",
+                "02686d0a",
+                "--superseded-by",
+                "feat/x-2",
+                "--withdraw",
+                "02686d0a",
+            ],
+            vec![
+                "boss",
+                "gate",
+                "--retire",
+                "02686d0a",
+                "--superseded-by",
+                "feat/x-2",
+                "--wait",
+            ],
+            vec![
+                "boss",
+                "gate",
+                "--retire",
+                "02686d0a",
+                "--superseded-by",
+                "feat/x-2",
+                "--reason",
+                "why",
+            ],
         ] {
             assert!(
                 Cli::try_parse_from(refused.clone()).is_err(),

@@ -6,10 +6,11 @@ use super::*;
 /// THE GARAGE: work off the main line — cars held on the dock, greens
 /// held before parking, greens that never became a car (stranded),
 /// reds awaiting rework, and runs the gate never judged (limbo).
-/// Troubled when a green is stranded or a run sits in limbo: a green
+/// Troubled when a gate failed, a green is stranded or a run sits in limbo: a green
 /// no car claims is a fix about to be rebuilt blind, and "we do not
-/// know" is not a verdict. Busy when the rest holds anything — a hold
-/// is deliberate and a red is being worked. The trend is reds per day.
+/// know" is not a verdict. Deliberate holds and failed checks are judged
+/// separately: repairing a failure does not make the failed branch healthy.
+/// The trend is reds per day.
 /// Is a repair already aimed at this branch?
 ///
 /// WHY (backlog aae1515e; David, 2026-09-21: "the Garage has been
@@ -41,6 +42,150 @@ fn under_repair(gate_runs: &[Job], branch: &str, packet_id: &str) -> bool {
     })
 }
 
+pub(crate) fn recorded_review_wait(
+    car: &Job,
+    steps: &[Step],
+    inputs: &RegionInputs<'_>,
+) -> Result<RecordedProofWait, String> {
+    let review = steps
+        .iter()
+        .find(|step| step.spec_slug.as_deref() == Some(crate::car::REVIEW_SLUG))
+        .ok_or("review step is unread")?;
+    let owner = review
+        .assignee_id
+        .as_deref()
+        .filter(|owner| !owner.trim().is_empty())
+        .ok_or("review action owner is unread")?;
+    if review.status != StepStatus::Active {
+        return Err("review has no active claim".into());
+    }
+    let head = super::judging::exact_source_head(review.metadata.get(crate::car::HOLD_SHA))
+        .ok_or("held source head is unread")?;
+    let protocols = inputs
+        .internal_protocols
+        .ok_or("pinned protocol reading is unavailable")?;
+    let key = (car.kind.clone(), car.workflow_version);
+    let protocol = match protocols.get(&key) {
+        Some(Ok(spec)) if spec.kind == car.kind && spec.version == car.workflow_version => spec,
+        Some(Ok(_)) => return Err("pinned protocol has a different binding".into()),
+        Some(Err(reason)) => return Err(reason.clone()),
+        None => {
+            return Err(format!(
+                "{}@{}: pinned protocol version is unread",
+                car.kind, car.workflow_version
+            ));
+        }
+    };
+    if protocol.status == crate::registry::WorkflowStatus::Draft {
+        return Err("pinned review protocol was not published".into());
+    }
+    let hours = protocol
+        .steps
+        .iter()
+        .find(|step| step.title == crate::car::REVIEW_SLUG)
+        .and_then(|step| step.duration_hours)
+        .filter(|hours| hours.is_finite() && *hours > 0.0)
+        .ok_or("pinned review bound is unread")?;
+    let candidates = inputs
+        .agent_runs
+        .ok_or("registered review runs are unread")?
+        .iter()
+        .filter(|(run, _)| {
+            run.kind == "agent-run"
+                && run.status == JobStatus::Open
+                && run.metadata.get("packet").and_then(Value::as_str)
+                    == Some(car.id.to_string().as_str())
+                && run.metadata.get("step").and_then(Value::as_str) == Some(crate::car::REVIEW_SLUG)
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        return Err("one registered review run is required".into());
+    }
+    let (run, run_steps) = candidates[0];
+    if car.metadata.get("agent_run").and_then(Value::as_str) == Some(run.id.to_string().as_str()) {
+        return Err("the car builder cannot supply an independent review wait".into());
+    }
+    let claim: Step = serde_json::from_value(
+        run.metadata
+            .get("claim_receipt")
+            .cloned()
+            .ok_or("registered claim receipt is unread")?,
+    )
+    .map_err(|_| "registered claim receipt does not decode as a native step")?;
+    if claim.id != review.id
+        || claim.job_id != car.id
+        || claim.spec_slug != review.spec_slug
+        || claim.status != StepStatus::Active
+        || claim.assignee_id.as_deref() != Some(owner)
+        || claim
+            .metadata
+            .get(crate::car::HOLD_SHA)
+            .and_then(Value::as_str)
+            != Some(head)
+    {
+        return Err("registered claim receipt does not bind this owner, step and held head".into());
+    }
+    let building = run_steps
+        .iter()
+        .find(|step| {
+            step.spec_slug.as_deref() == Some("building")
+                && step.status == StepStatus::Active
+                && step.assignee_id.as_deref() == Some(owner)
+        })
+        .ok_or("review worker has no matching active registered claim")?;
+    let receipt = &run.metadata["worker_started"];
+    let receipt_matches = match receipt.get("schema").and_then(Value::as_u64) {
+        Some(1) => receipt.as_object().is_some_and(|fields| fields.len() == 3),
+        Some(2) => crate::agent_budget::observer_start_receipt_matches(
+            &building.metadata[crate::agent_budget::WORKER_START_EXPECTATION],
+            receipt,
+            &run.id.to_string(),
+            owner,
+        ),
+        _ => false,
+    };
+    if !receipt_matches
+        || run
+            .metadata
+            .pointer("/worker_started/run")
+            .and_then(Value::as_str)
+            != Some(run.id.to_string().as_str())
+        || run
+            .metadata
+            .pointer("/worker_started/actor")
+            .and_then(Value::as_str)
+            != Some(owner)
+    {
+        return Err("review worker has no matching active registered claim".into());
+    }
+    let started_at = run
+        .opened_at
+        .ok_or("registered review admission clock is unread")?;
+    if started_at > inputs.now {
+        return Err("registered review clock is in the future".into());
+    }
+    let next_check_at = chrono::Duration::try_seconds((hours * 3600.0).ceil() as i64)
+        .and_then(|duration| started_at.checked_add_signed(duration))
+        .ok_or("review deadline is outside the clock range")?;
+    if next_check_at <= inputs.now {
+        return Err("registered review is past its pinned bound".into());
+    }
+    Ok(RecordedProofWait {
+        packet: car.id.to_string(),
+        owner: owner.into(),
+        condition_owner: owner.into(),
+        title: car.title.clone(),
+        condition: format!("independent review at {head}"),
+        next_check_at,
+        evidence: ProofWaitEvidence::Review {
+            run: run.id.to_string(),
+            head: head.into(),
+            workflow_version: protocol.version,
+            started_at,
+        },
+    })
+}
+
 pub(super) fn garage(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
     let s = inputs.status;
     let held = s.held_cars.len() + s.held.len();
@@ -67,6 +212,28 @@ pub(super) fn garage(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
             .filter(|l| under_repair(inputs.gate_runs, &l.branch, &l.packet_id))
             .count();
     let mut findings = Vec::new();
+    if red > 0 {
+        let failed = s
+            .garage
+            .iter()
+            .map(|car| {
+                format!(
+                    "{}: {} (gate {})",
+                    car.branch,
+                    car.failed_check
+                        .as_deref()
+                        .unwrap_or("failed check not recorded"),
+                    car.packet_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        findings.push(Finding::new(
+            bands::GARAGE_FAILED,
+            None,
+            String::new(),
+            format!("failed gates requiring rework: {}", failed.join("; ")),
+        ));
+    }
     if stranded > 0 || limbo > 0 {
         let mut parts = Vec::new();
         if stranded > 0 {
@@ -111,13 +278,67 @@ pub(super) fn garage(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
             parts.join("; "),
         ));
     }
+    if !s.held.is_empty() {
+        let missing = s.held.iter().map(|held| format!("{} ({}): required registered wait owner, condition, bound and next check are unread", held.packet_id, held.branch)).collect::<Vec<_>>();
+        findings.push(Finding::new(
+            bands::GARAGE_WAIT_UNQUALIFIED,
+            None,
+            String::new(),
+            missing.join("; "),
+        ));
+    }
+    let mut qualified = Vec::new();
+    for held in &s.held_cars {
+        if held.kind == crate::yard::CarHoldKind::RegateRed {
+            findings.push(Finding::new(
+                bands::GARAGE_FAILED,
+                None,
+                String::new(),
+                format!(
+                    "{}: failed dock re-gate requires repair — {}",
+                    held.car.id, held.reason
+                ),
+            ));
+        }
+        let reading = inputs
+            .cars
+            .iter()
+            .find(|(car, _)| car.id.to_string() == held.car.id)
+            .ok_or_else(|| "held packet reading is unavailable".to_string())
+            .and_then(|(car, steps)| recorded_review_wait(car, steps, inputs));
+        match reading {
+            Ok(wait) => qualified.push(wait),
+            Err(reason) => findings.push(Finding::new(
+                bands::GARAGE_WAIT_UNQUALIFIED,
+                None,
+                String::new(),
+                format!("{}: {reason}", held.car.id),
+            )),
+        }
+    }
+    if !qualified.is_empty() {
+        findings.push(Finding::new(
+            bands::GARAGE_WAIT_EXPECTED,
+            None,
+            String::new(),
+            qualified
+                .iter()
+                .map(|wait| {
+                    format!(
+                        "{}: {}; owner {}; next check {}",
+                        wait.packet, wait.condition, wait.owner, wait.next_check_at
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
     let waiting_why = format!("{held} held, {red} red awaiting rework");
-    if held + red > 0 {
+    if held > 0 {
         let since = s
-            .garage
+            .held
             .iter()
             .map(|g| g.since.as_str())
-            .chain(s.held.iter().map(|g| g.since.as_str()))
             .chain(s.held_cars.iter().map(|h| h.car.parked_since.as_str()))
             .filter_map(stamp_instant)
             .min();
@@ -140,7 +361,7 @@ pub(super) fn garage(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
         "cars",
         format!("{} awaiting rework", plural(red, "red", "reds")),
     )];
-    region(
+    let mut reading = region(
         "garage",
         Some(count),
         None,
@@ -148,13 +369,279 @@ pub(super) fn garage(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
         settled,
         trend,
         kpi,
-    )
+    );
+    reading.waits = qualified;
+    reading
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::regions::fixtures::*;
+
+    #[test]
+    fn an_active_exact_head_review_uses_its_pinned_protocol_bound() {
+        let (car, mut steps) = parked("fix/under-review", json!({}));
+        let head = "a".repeat(40);
+        steps[0].metadata = json!({"hold": "independent review", "hold_sha": head});
+        steps[0].status = StepStatus::Active;
+        steps[0].assignee_id = Some("agent-reviewer".into());
+        let mut run = job(
+            "agent-run",
+            "review",
+            JobStatus::Open,
+            json!({"packet": car.id.to_string(), "step": "review", "claim_receipt": serde_json::to_value(&steps[0]).unwrap()}),
+        );
+        run.opened_at = Some(t("2026-09-19T11:00:00Z"));
+        run.metadata["worker_started"] =
+            json!({"run": run.id.to_string(), "actor": "agent-reviewer", "schema": 1});
+        let mut building = step(&run, "building", StepStatus::Active, None);
+        building.assignee_id = Some("agent-reviewer".into());
+        let protocols = vec![WorkflowSpec::platform_seed(
+            "ship-a-change",
+            "Change",
+            "platform",
+            vec!["custom".into()],
+            vec![crate::registry::StepSpec {
+                title: "review".into(),
+                duration_hours: Some(2.0),
+                ..Default::default()
+            }],
+        )]
+        .into_iter()
+        .map(|spec| ((spec.kind.clone(), spec.version), Ok(spec)))
+        .collect::<PinnedProtocols>();
+        let mut status = empty_status();
+        status.held_cars.push(crate::yard::HeldCar {
+            car: crate::yard::dock_car(&car),
+            reason: "independent review".into(),
+            kind: crate::yard::CarHoldKind::Operator,
+            release: None,
+        });
+        let cars = vec![(car, steps)];
+        let runs = vec![(run, vec![building])];
+        let mut input = inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[]));
+        input.agent_runs = Some(&runs);
+        input.internal_protocols = Some(&protocols);
+        let out = regions(&input);
+        let garage = by_name(&out, "garage");
+        assert_eq!(garage.state, RegionState::Attention, "{}", garage.why);
+        assert!(
+            garage.why.contains("agent-reviewer") && garage.why.contains("2026-09-19 13:00"),
+            "{}",
+            garage.why
+        );
+        let building_third = stuck(&input)
+            .into_iter()
+            .find(|third| third.third == "actors-building")
+            .unwrap();
+        assert_eq!(
+            (building_third.stuck, building_third.waiting),
+            (0, 1),
+            "a qualified review is the same owned wait in the third count"
+        );
+        let borders = crate::borders::borders(&crate::borders::BorderInputs {
+            regions: &input,
+            firings: Some(&[]),
+            dispatcher_firings: Some(&[]),
+            machines_withheld: None,
+        });
+        let dock = borders
+            .borders
+            .iter()
+            .find(|border| border.from == "dock" && border.to == "track")
+            .unwrap();
+        assert_eq!(dock.holds_by_class.unwrap().stuck, 0);
+        assert_eq!(dock.holds_by_class.unwrap().person, 1);
+        assert_eq!(
+            serde_json::to_value(&dock.holds[0]).unwrap()["wait"],
+            serde_json::to_value(&garage.waits[0]).unwrap(),
+            "the rail conserves the same qualified wait evidence"
+        );
+        let mut invalid_cars = cars.clone();
+        invalid_cars[0].1[0].metadata["hold_sha"] = json!("not-an-exact-source-head");
+        let mut invalid_runs = runs.clone();
+        invalid_runs[0].0.metadata["claim_receipt"]["metadata"]["hold_sha"] =
+            json!("not-an-exact-source-head");
+        let mut invalid_input = inputs(&status, &[], &[], &invalid_cars, &[], Some(&[]), Some(&[]));
+        invalid_input.agent_runs = Some(&invalid_runs);
+        invalid_input.internal_protocols = Some(&protocols);
+        assert_eq!(
+            by_name(&regions(&invalid_input), "garage").state,
+            RegionState::Troubled,
+            "two matching invalid strings cannot establish an exact source head"
+        );
+        let mut red_status = status.clone();
+        red_status.held_cars[0].kind = crate::yard::CarHoldKind::RegateRed;
+        let mut red_input = inputs(&red_status, &[], &[], &cars, &[], Some(&[]), Some(&[]));
+        red_input.agent_runs = Some(&runs);
+        red_input.internal_protocols = Some(&protocols);
+        let red_map = regions(&red_input);
+        let red_garage = by_name(&red_map, "garage");
+        assert_eq!(
+            red_garage.state,
+            RegionState::Troubled,
+            "a qualified review cannot clear a failed dock re-gate"
+        );
+        assert_eq!(
+            red_garage.waits, garage.waits,
+            "retain the independent review evidence beside the fault"
+        );
+        let red_third = stuck(&red_input)
+            .into_iter()
+            .find(|third| third.third == "actors-building")
+            .unwrap();
+        assert_eq!((red_third.stuck, red_third.waiting), (1, 0));
+        let red_rails = crate::borders::borders(&crate::borders::BorderInputs {
+            regions: &red_input,
+            firings: Some(&[]),
+            dispatcher_firings: Some(&[]),
+            machines_withheld: None,
+        });
+        let red_rail = red_rails
+            .borders
+            .iter()
+            .find(|rail| rail.from == "dock" && rail.to == "track")
+            .unwrap();
+        assert_eq!(red_rail.holds_by_class.unwrap().stuck, 1);
+        assert_eq!(red_rail.holds[0].wait.as_ref(), garage.waits.first());
+        let mut wrong_head = runs.clone();
+        wrong_head[0].0.metadata["claim_receipt"]["metadata"]["hold_sha"] = json!("b".repeat(40));
+        input.agent_runs = Some(&wrong_head);
+        assert_eq!(
+            by_name(&regions(&input), "garage").state,
+            RegionState::Troubled
+        );
+        input.agent_runs = Some(&runs);
+        input.now = t("2026-09-19T13:00:00Z");
+        assert_eq!(
+            by_name(&regions(&input), "garage").state,
+            RegionState::Troubled
+        );
+        input.now = t(NOW);
+        let mut drafts = protocols.clone();
+        drafts
+            .get_mut(&("ship-a-change".into(), 1))
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .status = crate::registry::WorkflowStatus::Draft;
+        input.internal_protocols = Some(&drafts);
+        let draft_refused = by_name(&regions(&input), "garage").state == RegionState::Troubled;
+        input.internal_protocols = Some(&protocols);
+        let mut self_review = cars.clone();
+        self_review[0].0.metadata["agent_run"] = json!(runs[0].0.id.to_string());
+        input.cars = &self_review;
+        let self_review_refused =
+            by_name(&regions(&input), "garage").state == RegionState::Troubled;
+        assert!(
+            draft_refused && self_review_refused,
+            "draft refused={draft_refused}; builder self-review refused={self_review_refused}"
+        );
+        input.cars = &cars;
+        let mut observed = runs.clone();
+        let run_id = observed[0].0.id.to_string();
+        let prompt = "a".repeat(64);
+        let snapshot = "b".repeat(64);
+        observed[0].1[0].metadata[crate::agent_budget::WORKER_START_EXPECTATION] = json!({
+            "schema": 2, "minutes": 15, "actor": "agent-reviewer", "observer": "launcher",
+            "prompt_sha256": prompt, "snapshot_sha256": snapshot,
+        });
+        observed[0].0.metadata["worker_started"] = json!({
+            "schema": 2, "run": run_id, "actor": "agent-reviewer", "observer": "launcher",
+            "prompt_sha256": prompt, "snapshot_sha256": snapshot,
+            "binding": {"job_uid": "job", "pod_uid": "pod", "container_id": "containerd://one"},
+            "acknowledgment": {"schema": 1, "start_read": true, "run": run_id,
+                "prompt_sha256": prompt, "snapshot_sha256": snapshot},
+        });
+        input.agent_runs = Some(&observed);
+        assert_eq!(
+            by_name(&regions(&input), "garage").state,
+            RegionState::Attention
+        );
+        let mut unbound_observer = observed.clone();
+        unbound_observer[0].0.metadata["worker_started"]["binding"]["pod_uid"] = json!("");
+        input.agent_runs = Some(&unbound_observer);
+        assert_eq!(
+            by_name(&regions(&input), "garage").state,
+            RegionState::Troubled
+        );
+        for (pointer, value) in [
+            ("/claim_receipt", Value::Null),
+            ("/claim_receipt/id", json!(uuid::Uuid::new_v4())),
+            ("/claim_receipt/job_id", json!(uuid::Uuid::new_v4())),
+            ("/claim_receipt/spec_slug", json!("landed-review")),
+            ("/claim_receipt/status", json!("ready")),
+            ("/claim_receipt/assignee_id", json!("another-reviewer")),
+            ("/worker_started/schema", json!(2)),
+            ("/worker_started/run", json!(uuid::Uuid::new_v4())),
+            ("/worker_started/actor", json!("another-reviewer")),
+        ] {
+            let mut changed = runs.clone();
+            *changed[0].0.metadata.pointer_mut(pointer).unwrap() = value;
+            let mut input = inputs(&status, &[], &[], &cars, &[], Some(&[]), Some(&[]));
+            input.internal_protocols = Some(&protocols);
+            input.agent_runs = Some(&changed);
+            assert_eq!(
+                by_name(&regions(&input), "garage").state,
+                RegionState::Troubled,
+                "an invalid registered review reading must require action: {pointer}"
+            );
+            let third = stuck(&input)
+                .into_iter()
+                .find(|third| third.third == "actors-building")
+                .unwrap();
+            assert_eq!(
+                (third.stuck, third.waiting),
+                (1, 0),
+                "invalid review cannot remain an owned wait: {pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hold_with_no_recorded_internal_wait_requires_action_now() {
+        let mut status = empty_status();
+        status.held.push(crate::yard::HeldGreen {
+            branch: "fix/held-without-owner".into(),
+            reason: "waiting for review".into(),
+            since: "2026-09-19T11:59:00Z".into(),
+            packet_id: "held-gate".into(),
+            sha: Some("a".repeat(40)),
+        });
+        let out = regions(&inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[])));
+        let garage = by_name(&out, "garage");
+        assert_eq!(garage.state, RegionState::Troubled, "{}", garage.why);
+        assert!(
+            garage.why.contains("held-gate") && garage.why.contains("registered"),
+            "{}",
+            garage.why
+        );
+    }
+
+    /// A judged failure is work to repair now, not a deliberate wait.
+    /// Its first hour must not look healthy while the age band warms up.
+    #[test]
+    fn a_failed_gate_requires_action_without_waiting_for_an_age_band() {
+        let mut status = empty_status();
+        status.garage.push(crate::yard::GaragedCar {
+            branch: "fix/failed-check".into(),
+            failed_check: Some("test".into()),
+            failed_line: Some("assertion failed".into()),
+            since: "2026-09-19T11:55:00Z".into(),
+            packet_id: "failed-gate".into(),
+            sha: Some("a".repeat(40)),
+        });
+        let out = regions(&inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&[])));
+        let garage = by_name(&out, "garage");
+        assert_eq!(garage.state, RegionState::Troubled, "{}", garage.why);
+        assert!(garage.why.contains("fix/failed-check"), "{}", garage.why);
+        assert!(garage.why.contains("test"), "{}", garage.why);
+
+        let clear = empty_status();
+        let out = regions(&inputs(&clear, &[], &[], &[], &[], Some(&[]), Some(&[])));
+        assert_eq!(by_name(&out, "garage").state, RegionState::Clear);
+    }
 
     /// A stranded green — a green gate no car claims — troubles the
     /// garage; a held car alone asks for attention past its hold.

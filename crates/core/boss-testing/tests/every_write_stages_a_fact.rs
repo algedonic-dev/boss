@@ -42,8 +42,9 @@
 //! by the write and the stage sharing a function (or a caller chain),
 //! not by proving they bind the same `Transaction`; and a write assembled
 //! from pieces no single literal carries (a table name in one literal,
-//! `SET` in another) is invisible. Triggers inside the database
-//! (infra/postgres/schema) are out of its reach entirely.
+//! `SET` in another) is invisible. Unconditional schema triggers are
+//! read separately below: coverage belongs only to their bound table
+//! and operations, never to all other writes in a Rust caller.
 //!
 //! THE ALLOWLIST is ONE file, `crates/core/boss-events/writes-without-a-fact.txt`,
 //! and every entry carries a reason. It is for writes that are not
@@ -610,6 +611,14 @@ struct Judgement {
 }
 
 fn judge(funcs: &[Func], allow: &[Allow]) -> Judgement {
+    judge_with_trigger_facts(funcs, allow, &BTreeSet::new())
+}
+
+fn judge_with_trigger_facts(
+    funcs: &[Func],
+    allow: &[Allow],
+    trigger_facts: &BTreeSet<(String, String)>,
+) -> Judgement {
     // Staging helpers, to a fixpoint: a function that stages AND works
     // in its caller's transaction stages in that transaction, so calling
     // it (by name, within the crate) is staging. One that opens its own
@@ -758,6 +767,9 @@ fn judge(funcs: &[Func], allow: &[Allow]) -> Judgement {
             "stages no fact".to_string()
         };
         for w in &f.writes {
+            if trigger_facts.contains(&(w.table.clone(), w.verb.to_owned())) {
+                continue;
+            }
             let by_table: Vec<usize> = allow
                 .iter()
                 .filter(|a| a.scope == Scope::Table(w.table.clone()))
@@ -862,6 +874,227 @@ fn scan_tree(root: &Path) -> (Vec<Func>, usize) {
 }
 
 const FIXTURE_FILE: &str = "crates/x/boss-y/src/lib.rs";
+
+/// This is deliberately a small, fail-closed SQL vocabulary, like the
+/// Rust name reader above. Only a plain unqualified trigger function
+/// and an unconditional row/statement trigger count. Strings/comments
+/// are masked, and a later replacement, drop or disable removes proof.
+/// Runtime database tests still prove actual same-transaction effects.
+fn schema_trigger_facts(schema: &str) -> BTreeSet<(String, String)> {
+    let mask = Regex::new(r"(?s)'(?:''|[^'])*'|--[^\n]*|/\*.*?\*/").unwrap();
+    let schema = mask.replace_all(schema, " ").to_string();
+    let functions = Regex::new(r"(?is)CREATE(?:\s+OR\s+REPLACE)?\s+FUNCTION\s+(\w+)\s*\(\s*\)\s+RETURNS\s+TRIGGER\s+AS\s+\$\$(.*?)\$\$\s+LANGUAGE\s+plpgsql\s*;").unwrap();
+    let inserts = Regex::new(r"(?i)\bINSERT\s+INTO\s+event_outbox\b").unwrap();
+    let returns = Regex::new(r"(?i)\bRETURN\b|\bEXCEPTION\b").unwrap();
+    let ifs = Regex::new(r"(?i)\bIF\b").unwrap();
+    let end_ifs = Regex::new(r"(?i)\bEND\s+IF\b").unwrap();
+    let loops = Regex::new(r"(?i)\bLOOP\b").unwrap();
+    let end_loops = Regex::new(r"(?i)\bEND\s+LOOP\b").unwrap();
+    let mut emitters = BTreeMap::new();
+    let function_headers =
+        Regex::new(r"(?i)CREATE(?:\s+OR\s+REPLACE)?\s+FUNCTION\s+(\w+)").unwrap();
+    let mut function_events = function_headers
+        .captures_iter(&schema)
+        .map(|found| {
+            (
+                found.get(0).unwrap().start(),
+                found[1].to_ascii_lowercase(),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut ddl = schema.as_bytes().to_vec();
+    for found in functions.captures_iter(&schema) {
+        let whole = found.get(0).unwrap();
+        let body = &found[2];
+        let emits = inserts.find(body).is_some_and(|insert| {
+            let before = &body[..insert.start()];
+            !returns.is_match(before)
+                && !body.to_ascii_uppercase().contains("EXCEPTION")
+                && ifs.find_iter(before).count() == 2 * end_ifs.find_iter(before).count()
+                && loops.find_iter(before).count() == 2 * end_loops.find_iter(before).count()
+        });
+        function_events.push((whole.start(), found[1].to_ascii_lowercase(), emits));
+        ddl[whole.range()].fill(b' ');
+    }
+    let ddl = String::from_utf8(ddl).unwrap();
+    let dropped = Regex::new(r"(?i)(?:DROP|ALTER)\s+FUNCTION\s+(?:IF\s+EXISTS\s+)?(\w+)").unwrap();
+    let dropped_at = dropped
+        .captures_iter(&ddl)
+        .map(|found| (found[1].to_ascii_lowercase(), found.get(0).unwrap().start()))
+        .collect::<BTreeMap<_, _>>();
+    function_events.extend(dropped.captures_iter(&ddl).map(|found| {
+        (
+            found.get(0).unwrap().start(),
+            found[1].to_ascii_lowercase(),
+            false,
+        )
+    }));
+    function_events.sort_by_key(|event| event.0);
+    for (_, name, emits) in function_events {
+        emitters.insert(name, emits);
+    }
+    let triggers = Regex::new(r"(?is)CREATE(?:\s+OR\s+REPLACE)?\s+TRIGGER\s+(\w+)\s+(?:BEFORE|AFTER)\s+((?:INSERT|UPDATE|DELETE|TRUNCATE)(?:\s+OR\s+(?:INSERT|UPDATE|DELETE|TRUNCATE))*)\s+ON\s+(\w+)\s+FOR\s+EACH\s+(?:ROW|STATEMENT)\s+EXECUTE\s+FUNCTION\s+(\w+)\s*\(\s*\)\s*;").unwrap();
+    let mut bindings = BTreeMap::new();
+    // A replacement outside the recognized vocabulary removes the old
+    // proof too; it must not inherit an earlier unconditional binding.
+    let trigger_headers = Regex::new(
+        r"(?is)CREATE(?:\s+OR\s+REPLACE)?\s+(?:CONSTRAINT\s+)?TRIGGER\s+(\w+)[^;]*?\bON\s+(\w+)",
+    )
+    .unwrap();
+    let mut trigger_events = trigger_headers
+        .captures_iter(&ddl)
+        .map(|found| {
+            (
+                found.get(0).unwrap().start(),
+                found[2].to_ascii_lowercase(),
+                found[1].to_ascii_lowercase(),
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    for found in triggers.captures_iter(&ddl) {
+        let ops = found[2]
+            .split_whitespace()
+            .filter(|op| !op.eq_ignore_ascii_case("OR"))
+            .map(str::to_ascii_uppercase)
+            .collect::<Vec<_>>();
+        trigger_events.push((
+            found.get(0).unwrap().start(),
+            found[3].to_ascii_lowercase(),
+            found[1].to_ascii_lowercase(),
+            Some((found[4].to_ascii_lowercase(), ops)),
+        ));
+    }
+    let drops = Regex::new(r"(?i)DROP\s+TRIGGER\s+(?:IF\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)").unwrap();
+    trigger_events.extend(drops.captures_iter(&ddl).map(|found| {
+        (
+            found.get(0).unwrap().start(),
+            found[2].to_ascii_lowercase(),
+            found[1].to_ascii_lowercase(),
+            None,
+        )
+    }));
+    // Any later ALTER TABLE is conservatively unsupported until its
+    // trigger is redeclared; in particular ENABLE cannot fabricate the
+    // proof a prior DISABLE removed.
+    let alters = Regex::new(r"(?i)(?:ALTER|DROP)\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)").unwrap();
+    trigger_events.extend(alters.captures_iter(&ddl).map(|found| {
+        (
+            found.get(0).unwrap().start(),
+            found[1].to_ascii_lowercase(),
+            String::new(),
+            None,
+        )
+    }));
+    trigger_events.sort_by_key(|event| event.0);
+    for (created_at, table, name, binding) in trigger_events {
+        if name.is_empty() {
+            bindings.retain(|(bound_table, _), _| *bound_table != table);
+        } else if let Some(binding) = binding {
+            bindings.insert((table, name), (created_at, binding));
+        } else {
+            bindings.remove(&(table, name));
+        }
+    }
+    bindings
+        .into_iter()
+        .flat_map(|((table, _), (created_at, (function, ops)))| {
+            // Dropping/recreating a function cannot revive a trigger
+            // removed by CASCADE. A fresh binding must follow the drop.
+            if emitters.get(&function) == Some(&true)
+                && dropped_at.get(&function).is_none_or(|at| *at < created_at)
+            {
+                ops.into_iter()
+                    .map(|op| (table.clone(), op))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![]
+            }
+        })
+        .collect()
+}
+
+fn judge_schema_source(source: &str, schema: &str) -> Judgement {
+    let funcs = scan_source(FIXTURE_FILE, "crates/x/boss-y", source).unwrap();
+    judge_with_trigger_facts(&funcs, &[], &schema_trigger_facts(schema))
+}
+
+#[test]
+fn a_schema_trigger_stages_only_its_bound_table_and_operations() {
+    let source = r#"
+        async fn save(pool: &Pool) {
+            sqlx::query("INSERT INTO items(id) VALUES(1)").execute(pool).await;
+            sqlx::query("UPDATE items SET value=1").execute(pool).await;
+            sqlx::query("DELETE FROM items").execute(pool).await;
+            sqlx::query("INSERT INTO other(id) VALUES(1)").execute(pool).await;
+        }
+    "#;
+    let schema = r#"
+        CREATE FUNCTION capture_fact() RETURNS TRIGGER AS $$
+        BEGIN
+            INSERT INTO event_outbox(event_id,kind) VALUES(gen_random_uuid(),'items.changed');
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER capture_items AFTER INSERT OR UPDATE ON items
+            FOR EACH ROW EXECUTE FUNCTION capture_fact();
+    "#;
+    let judged = judge_schema_source(source, schema);
+    assert_eq!(judged.writes, 4);
+    assert_eq!(judged.unexcused.len(), 2);
+    assert!(judged.unexcused.iter().any(|site| site.verb == "DELETE"));
+    assert!(judged.unexcused.iter().any(|site| site.table == "other"));
+    for invalid in [
+        schema.replace("INSERT INTO event_outbox", "INSERT INTO unrelated"),
+        schema.replace(
+            "EXECUTE FUNCTION capture_fact()",
+            "EXECUTE FUNCTION absent()",
+        ),
+        format!("{schema}\nDROP TRIGGER capture_items ON items;"),
+        format!("{schema}\nALTER TABLE items DISABLE TRIGGER capture_items;"),
+        format!("{schema}\nDROP FUNCTION capture_fact();"),
+        format!(
+            "{schema}\nDROP FUNCTION capture_fact() CASCADE;\n{}",
+            schema.split_once("CREATE TRIGGER").unwrap().0
+        ),
+        format!(
+            "{}\nCREATE FUNCTION capture_fact(value integer) RETURNS TRIGGER AS $$ BEGIN INSERT INTO event_outbox(event_id) VALUES(gen_random_uuid()); RETURN NEW; END; $$ LANGUAGE plpgsql;",
+            schema.replace("INSERT INTO event_outbox", "INSERT INTO unrelated")
+        ),
+        format!(
+            "{schema}\nCREATE OR REPLACE FUNCTION capture_fact() RETURNS TRIGGER AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;"
+        ),
+        format!(
+            "{schema}\nCREATE OR REPLACE FUNCTION capture_fact() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$;"
+        ),
+        format!(
+            "{schema}\nCREATE OR REPLACE TRIGGER capture_items AFTER INSERT OR UPDATE ON items FOR EACH ROW WHEN (NEW.id=1) EXECUTE FUNCTION capture_fact();"
+        ),
+        schema.replace(
+            "FOR EACH ROW EXECUTE",
+            "FOR EACH ROW WHEN (NEW.id=1) EXECUTE",
+        ),
+        schema
+            .replace(
+                "INSERT INTO event_outbox",
+                "IF NEW.id=1 THEN INSERT INTO event_outbox",
+            )
+            .replace("RETURN NEW;", "END IF; RETURN NEW;"),
+        schema.replace("BEGIN", "BEGIN RETURN NEW;"),
+        schema.replace(
+            "INSERT INTO event_outbox(event_id,kind) VALUES(gen_random_uuid(),'items.changed');",
+            "PERFORM 'INSERT INTO event_outbox';",
+        ),
+        format!("-- {schema}").replace('\n', "\n-- "),
+    ] {
+        assert_eq!(
+            judge_schema_source(source, &invalid).unexcused.len(),
+            4,
+            "{invalid}"
+        );
+    }
+}
 
 fn judge_source(source: &str, allow: &str) -> Judgement {
     let funcs = scan_source(FIXTURE_FILE, "crates/x/boss-y", source).expect("the fixture parses");
@@ -1300,7 +1533,19 @@ fn every_database_write_stages_a_fact_or_is_named_on_the_allowlist() {
         .unwrap_or_else(|e| panic!("{ALLOWLIST} is readable: {e}"));
     let allow = parse_allowlist(&text)
         .unwrap_or_else(|errs| panic!("{ALLOWLIST} is malformed:\n  {}", errs.join("\n  ")));
-    let j = judge(&funcs, &allow);
+    let mut paths = std::fs::read_dir(root.join("infra/postgres/schema"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "sql"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    let schema = paths
+        .into_iter()
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trigger_facts = schema_trigger_facts(&schema);
+    let j = judge_with_trigger_facts(&funcs, &allow, &trigger_facts);
 
     // Controls: a walk that reads nothing, or a pattern that matches
     // nothing, would pass every write it never saw.

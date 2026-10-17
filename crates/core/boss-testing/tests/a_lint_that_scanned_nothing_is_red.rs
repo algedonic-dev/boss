@@ -101,6 +101,10 @@ const NOT_SCANNERS: &[(&str, &str)] = &[
         "self-test of the forge installer into a scratch root",
     ),
     (
+        "native-proof-evidence-is-adversarially-checked",
+        "self-test of native evidence readers against adversarial fixtures, plus an append-only branch-diff check on their versioned contracts",
+    ),
+    (
         "the-cluster-knows-it-is-working",
         "self-test of the cluster watchdog's decision table",
     ),

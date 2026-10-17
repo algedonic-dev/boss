@@ -397,6 +397,17 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
         }
         out
     };
+    // Resident requests do not expire with a client heartbeat or recency window.
+    let open_runs = crate::list_every::list_every(
+        state.jobs.as_ref(),
+        &JobFilter {
+            status: Some(JobStatus::Open),
+            ..gate_run(None)
+        },
+        MAX_LIMIT,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
     let gate_runs = {
         let mut out: Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)> =
             Vec::with_capacity(recent_runs.len() + held_runs.len());
@@ -406,7 +417,7 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
         // carries a hold too (128b5496) and is excluded from every lane
         // this set feeds, so its steps are not fetched: measured
         // 2026-09-15, 43 of the 44 held runs on record were train gates.
-        for job in recent_runs.into_iter().chain(
+        for job in recent_runs.into_iter().chain(open_runs).chain(
             held_runs
                 .into_iter()
                 .filter(|j| !crate::stranded::is_train_gate(&j.metadata)),
@@ -468,6 +479,21 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
     // reading of "not yet"). See [`converge_window`] for why the window
     // is read whole or not at all.
     let converges = converge_window(state, &scope).await.unwrap_or_default();
+    let mut gate_acceptances = Vec::new();
+    for (job, _) in &gate_runs {
+        if let Ok(Some(submission)) = crate::gate_reservation::submission(&job.metadata)
+            && let Ok(Some(receipt)) = state
+                .jobs
+                .conditional_job_metadata_receipt(
+                    &job.id,
+                    &submission.submitted_by,
+                    submission.command,
+                )
+                .await
+        {
+            gate_acceptances.push(receipt);
+        }
+    }
 
     // Every read that can fail QUIETLY states whether it answered: the
     // dock from the `Option` `dock_cars` already returns, the cadence
@@ -475,7 +501,7 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
     // the gate-runs are not here because a train read failing returns
     // 500 rather than an empty board (above) — the posture this seam
     // exists to extend to the rest.
-    let status = yard::build_status_for(
+    let mut status = yard::build_status_for(
         yard::YardInputs {
             open_trains: &open_trains,
             closed_trains: &closed_trains,
@@ -487,6 +513,7 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
             },
             policy: policy.as_ref(),
             gate_runs: &gate_runs,
+            gate_acceptances: &gate_acceptances,
             car_branches: &car_branches,
             settled_car_branches: &settled_car_branches,
             arrived_trains: &arrived_trains,
@@ -500,6 +527,43 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
             last_board: last_board_reading,
         },
     );
+    let mut supervision_firings = Vec::new();
+    let mut supervision_readable =
+        cadence_reading == yard::Reading::Read && firings == Firings::Read;
+    if supervision_readable {
+        match state.cadence.as_ref() {
+            Some(repo) => {
+                for rule in rules
+                    .iter()
+                    .filter(|r| crate::gate_queue_observation::participates(&r.verb))
+                {
+                    match repo.last_firing(&rule.name).await {
+                        Ok(Some(row)) => supervision_firings.push((rule.name.clone(), row)),
+                        Ok(None) => {}
+                        Err(_) => supervision_readable = false,
+                    }
+                }
+            }
+            None => supervision_readable = false,
+        }
+    }
+    status.gate_queue_supervision = crate::gate_queue_observation::project(
+        &rules,
+        &supervision_firings,
+        supervision_readable,
+        Some(now),
+    );
+    status.gate_queue_supervision["last_successful"] = match (
+        state.cadence.as_ref(),
+        cadence_reading == yard::Reading::Read && firings == Firings::Read,
+    ) {
+        (Some(repo), true) => {
+            crate::gate_queue_observation::history(repo.as_ref(), &rules, now, 50, 20).await
+        }
+        _ => {
+            serde_json::json!({"state":"unknown","reason":"cadence history is unreadable or withheld"})
+        }
+    };
     // The VERB the heartbeat rule runs (`reconcile`), read from its row.
     // This used to pass the rule's NAME, so `last_verb` said
     // `train-reconcile` — a label that was not the fact it named.

@@ -314,6 +314,13 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // again by the durable inbox's queue READ, not by an event, so
         // the loop ends at the board.
         ("jobs.reclaim_abandoned_step", vec!["jobs.step.updated"]),
+        // A held car's reviewer verdict asks the release door
+        // (0cfc57e6): a grant is the door's merge onto the car's review
+        // step, a refusal the rule's `auto_release` note on the same
+        // step — both `jobs.step.updated`, on which no rule this tree
+        // ships acts for an open step. The car then boards by the
+        // conductor's read, not by an event, so the loop ends here.
+        ("jobs.release_on_review", vec!["jobs.step.updated"]),
         ("gate.resolve", vec!["jobs.step.completed"]),
         ("packaging.allocate", vec!["jobs.step.completed"]),
         // The packet-loss census (migration 152): reads the whole

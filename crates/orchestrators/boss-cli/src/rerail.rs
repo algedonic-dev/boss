@@ -62,7 +62,7 @@ fn git(dir: &str, args: &[&str]) -> Result<String> {
 /// The car packet for `given` (branch or 8+ chars of id), plus its
 /// branch. Reads open ship-a-change packets the same way park does.
 pub(crate) async fn find_car(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     given: &str,
 ) -> Result<(Value, String)> {
     // Read EVERY open car, not just page one: a rerail target opened
@@ -231,7 +231,7 @@ fn origins_after(
 /// `old_branch == new_branch` is the refresh-in-place case: the branch
 /// write is a no-op and only the receipt and the skip move.
 async fn repoint(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     car_id: &str,
     new_branch: &str,
     receipt: &boss_jobs::car::Receipt,
@@ -906,7 +906,7 @@ fn standing_refusal(car: &Value) -> Option<String> {
 /// The car as it stands NOW, refused if it has left the dock. `finish`
 /// asks this before it repoints anything (b3c2bfb6, third instance).
 async fn car_still_at_the_dock(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     car: &Value,
 ) -> Result<Value> {
     let id = car
@@ -928,7 +928,7 @@ async fn car_still_at_the_dock(
 /// completes through the same code as the happy path — one definition
 /// of the transcription, which is where the hand-typed-sha trap lived.
 async fn finish(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     car: &Value,
     old_branch: &str,
     new_branch: &str,
@@ -1345,6 +1345,7 @@ pub async fn run(
         None,
         "boss-dev",
         true,
+        false,
         false,
         gate::ParkIntent::default(),
         None,

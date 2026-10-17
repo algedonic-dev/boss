@@ -114,6 +114,25 @@ function sidings(): ReadonlyArray<Siding> {
   return joinSidings(parseStationLoad(LOAD), parseStationFlow(FLOW));
 }
 
+describe('original packet membership flow', () => {
+  const packet = { station: 'loading-dock', basis: 'packet-membership-v1', arrived: 3, departed: 2, served: 0, unknown: [] };
+  test('packet departures determine net without manufacturing service', () => {
+    const flow = parseStationFlow({ data: [packet], window_hours: 24 });
+    expect(flow.rows[0]?.basis).toBe('packet-membership-v1');
+    const siding = joinSidings(parseStationLoad(LOAD), flow).find((s) => s.station === 'loading-dock')!;
+    expect(siding.flow).toMatchObject({ kind: 'counted', arrived: 3, departed: 2, served: 0, net: 1 });
+    expect(whyNotMoving(siding, 24)).toContain('2 departed');
+    expect(whyNotMoving(siding, 24)).not.toContain('Nothing left');
+  });
+  test('invalid counts, missing departures and unknown intervals cannot become counted flow', () => {
+    for (const invalid of [{ departed: undefined }, { arrived: -1 }, { served: 0.5 }, { unknown: [{ reason: 'original state missing' }] }, { basis: 'future-basis' }]) {
+      const flow = parseStationFlow({ data: [{ ...packet, ...invalid }] });
+      const siding = joinSidings(parseStationLoad(LOAD), flow).find((s) => s.station === 'loading-dock')!;
+      expect(siding.flow.kind).toBe('unavailable');
+    }
+  });
+});
+
 describe('parseStationLoad / parseStationFlow', () => {
   // Until 67825067 these parsed to NO ROWS, and no rows is what the
   // board paints as "Every watched station is clear." A body that is not
@@ -236,7 +255,7 @@ describe('joinSidings', () => {
     const admin = rows.find((s) => s.station === 'q.platform-admin.task');
     expect(admin?.depth).toBe(41);
     expect(admin?.oldestAgeDays).toBe(17);
-    expect(admin?.flow).toEqual({ kind: 'counted', arrived: 12, served: 0, net: 12 });
+    expect(admin?.flow).toEqual({ kind: 'counted', basis: 'step-events', departed: 0, arrived: 12, served: 0, net: 12 });
   });
 
   test('a station whose flow the log cannot be attributed to keeps its reason', () => {

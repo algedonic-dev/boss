@@ -85,6 +85,97 @@ const SHA_C: &str = "cccccccc3333333333333333333333333333cccc";
 const SHA_D: &str = "dddddddd4444444444444444444444444444dddd";
 
 #[test]
+fn compiler_receipt_is_copied_whole_from_the_verified_image_and_bound_to_its_binary() {
+    let case = Case::with_image(
+        "compiler-receipt",
+        Image {
+            compiler_receipt: true,
+            ..Image::default()
+        },
+    );
+    let original = std::fs::read(case.root.join("compiler-original.json")).unwrap();
+    let (exit, output) = case.run(SHA_A, &[]);
+    assert_eq!(exit, 0, "{output}");
+    assert_eq!(
+        std::fs::read(case.store.join(SHA_A).join("boss-inputs.json")).unwrap(),
+        original
+    );
+    assert_eq!(
+        std::fs::read_link(case.store.join("current")).unwrap(),
+        Path::new(SHA_A)
+    );
+    assert!(output.contains("compiler inputs: verified"), "{output}");
+}
+
+#[test]
+fn a_receipt_for_other_binary_bytes_cannot_qualify_reuse() {
+    let case = Case::with_image(
+        "compiler-mismatch",
+        Image {
+            compiler_receipt: true,
+            wrong_compiler_hash: true,
+            ..Image::default()
+        },
+    );
+    let (exit, output) = case.run(SHA_A, &[]);
+    assert_eq!(exit, 0, "the real legacy CLI still installs: {output}");
+    assert!(!case.store.join(SHA_A).join("boss-inputs.json").exists());
+    assert!(
+        case.store
+            .join(SHA_A)
+            .join("boss-inputs.invalid.json")
+            .exists()
+    );
+    assert!(output.contains("compiler inputs: unusable"), "{output}");
+}
+
+#[test]
+fn an_image_whiteout_removes_compiler_receipt_eligibility() {
+    let case = Case::with_image(
+        "compiler-whiteout",
+        Image {
+            compiler_receipt: true,
+            top_inputs_whiteout: true,
+            ..Image::default()
+        },
+    );
+    let (exit, output) = case.run(SHA_A, &[]);
+    assert_eq!(exit, 0, "{output}");
+    assert!(!case.store.join(SHA_A).join("boss-inputs.json").exists());
+    assert!(
+        output.contains("image deletes compiler receipt"),
+        "{output}"
+    );
+}
+
+#[test]
+fn compatible_source_reuses_the_existing_image_without_retagging_or_pulling() {
+    let case = Case::with_image(
+        "source-compatible",
+        Image {
+            compiler_receipt: true,
+            ..Image::default()
+        },
+    );
+    assert_eq!(case.run(SHA_A, &[]).0, 0);
+    let requests = std::fs::read(&case.curl_log).unwrap();
+    let (exit, output) = case.run(SHA_B, &[("STUB_IMAGE_COMPATIBLE", "yes".into())]);
+    assert_eq!(exit, 0, "{output}");
+    assert_eq!(
+        std::fs::read_link(case.store.join("current")).unwrap(),
+        Path::new(SHA_A)
+    );
+    assert!(!case.store.join(SHA_B).exists());
+    assert_eq!(
+        std::fs::read(&case.curl_log).unwrap(),
+        requests,
+        "no image pull is owed for qualified unchanged compiler inputs"
+    );
+    assert_eq!(case.summary("cli_sha"), SHA_A);
+    assert_eq!(case.summary("cli_compatible_source"), SHA_B);
+}
+
+#[test]
 fn selected_manifest_descriptor_size_must_match_before_installing() {
     let case = Case::with_image(
         "selected-manifest-size",
@@ -347,6 +438,49 @@ fn installed_control_config_is_resolved_from_its_published_inputs_without_activa
 }
 
 #[test]
+fn a_new_image_generation_uses_its_own_bootstrap_even_when_the_previous_reader_is_broken() {
+    assert!(tools(), "required installer fixture tools missing");
+    let case = Case::with_image(
+        "control-reader-recovery",
+        Image {
+            control_config: true,
+            ..Image::default()
+        },
+    );
+    let (exit, output) = case.run(SHA_A, &[]);
+    assert_eq!(exit, 0, "{output}");
+    // The local fixture publishes SHA_A's archive. Move its installed
+    // layout to the old name, whose reader deliberately refuses before
+    // inspecting any archive, then require a fresh verified SHA_A pull.
+    std::fs::rename(case.store.join(SHA_A), case.store.join(SHA_B)).unwrap();
+    std::fs::remove_file(case.store.join("current")).unwrap();
+    std::os::unix::fs::symlink(SHA_B, case.store.join("current")).unwrap();
+    let previous = case.store.join(SHA_B).join("dev-control");
+    std::fs::write(
+        &previous,
+        b"#!/bin/bash\necho old-reader-refused >&2\nexit 73\n",
+    )
+    .unwrap();
+    let (exit, output) = case.run(SHA_B, &[]);
+    assert_ne!(
+        exit, 0,
+        "warm old generation must expose its broken reader: {output}"
+    );
+    assert!(output.contains("old-reader-refused"), "{output}");
+    let (exit, output) = case.run(SHA_A, &[]);
+    assert_eq!(
+        exit, 0,
+        "new generation must install without warming the old reader: {output}"
+    );
+    assert_eq!(case.current().as_deref(), Some(SHA_A));
+    assert!(case.store.join(SHA_A).join("config.json").is_file());
+    assert!(
+        !case.dev_control().exists(),
+        "recovery cannot activate isolation"
+    );
+}
+
+#[test]
 fn resolved_control_configuration_is_immutable_and_a_warm_missing_config_is_prepared() {
     assert!(tools());
     let case = Case::with_image(
@@ -494,6 +628,9 @@ fn sha256_of(path: &Path) -> String {
 /// non-gzip media type.
 #[derive(Clone, Copy, Default)]
 struct Image {
+    compiler_receipt: bool,
+    wrong_compiler_hash: bool,
+    top_inputs_whiteout: bool,
     top_whiteout: bool,
     top_counter_whiteout: bool,
     no_counter: bool,
@@ -547,12 +684,28 @@ impl Case {
         create_dir(&base.join("usr/local/bin"));
         write_exec(
             &base.join("usr/local/bin/boss"),
-            "#!/bin/sh\necho \"boss 0.1.0 built from ${STUB_BOSS_SAYS:-${BOSS_BUILD_COMMIT:-unknown}}\"\n",
+            "#!/bin/sh\nif [ \"${STUB_IMAGE_COMPATIBLE:-}\" = yes ] && [ \"${1:-}\" = channels ] && [ \"${2:-}\" = --compatible-source ]; then\n printf '{\"schema\":1,\"compatible\":true,\"compiler_inputs_equal\":true,\"binary_image\":\"%s\",\"compatible_source\":\"%s\",\"delivery_evidence\":{\"arrived\":true,\"selection_ready\":true}}\\n' \"$BOSS_BUILD_COMMIT\" \"$3\"\n exit 0\nfi\necho \"boss 0.1.0 built from ${STUB_BOSS_SAYS:-${BOSS_BUILD_COMMIT:-unknown}}\"\n",
         );
         // The code-branch counter the codebase-metrics chore runs
         // (backlog c4d60110): a stub that prints its own name, so a test
         // can run the installed copy and know which file answered.
         let mut base_members = vec!["usr/local/bin/boss"];
+        if image.compiler_receipt {
+            let binary_hash = if image.wrong_compiler_hash {
+                "0".repeat(64)
+            } else {
+                sha256_of(&base.join("usr/local/bin/boss"))
+                    .trim_start_matches("sha256:")
+                    .to_owned()
+            };
+            write_file(&base.join("usr/local/bin/boss-inputs.json"),&serde_json::json!({"schema":1,"reusable":true,"binaries":{"boss":binary_hash},"files":{"infra/oss-quickstart/Dockerfile":{"sha256":"retained-recipe"}},"original_dep_info":{"boss":"full original dependencies\n"}}).to_string());
+            std::fs::copy(
+                base.join("usr/local/bin/boss-inputs.json"),
+                root.join("compiler-original.json"),
+            )
+            .unwrap();
+            base_members.push("usr/local/bin/boss-inputs.json");
+        }
         create_dir(&base.join("opt/boss"));
         write_file(
             &base.join("opt/boss/dev-control.tar"),
@@ -632,6 +785,8 @@ impl Case {
         let top = root.join("layer-top");
         let top_member = if image.top_whiteout {
             "usr/local/bin/.wh.boss"
+        } else if image.top_inputs_whiteout {
+            "usr/local/bin/.wh.boss-inputs.json"
         } else if image.top_counter_whiteout {
             "usr/local/bin/.wh.boss-leaked-policy"
         } else if image.bootstrap_whiteout {

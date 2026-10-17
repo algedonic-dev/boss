@@ -622,7 +622,7 @@ pub(crate) const EDIT_LEVEL_PATH: &str = "/api/tenant/edit-level";
 /// else is an error, because a door that cannot read the level must
 /// not open a run.
 pub(crate) async fn edit_level_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
 ) -> Result<Option<String>> {
     let url = format!("{base}{EDIT_LEVEL_PATH}");
@@ -1449,7 +1449,7 @@ pub(crate) fn in_flight_car_refusal(item_id: &str, cars: &[Value]) -> Option<Str
 /// go through. Returns the run and the prompt.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     repo: &Path,
     packet_ref: &str,
@@ -1476,7 +1476,7 @@ pub(crate) async fn dispatch_at(
 /// actor; starting the process is the caller's next act.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_to(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     repo: &Path,
     packet_ref: &str,
@@ -1507,7 +1507,7 @@ pub(crate) async fn dispatch_to(
 
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_to_with_content(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     repo: &Path,
     packet_ref: &str,
@@ -1731,7 +1731,7 @@ async fn dispatch_to_with_content(
     } else {
         format!("/api/jobs/{id}/steps/{step_id}/claim?{}", query.join("&"))
     };
-    api_at(Method::POST, claim_path, None)
+    let claim_receipt = api_at(Method::POST, claim_path, None)
         .await
         .with_context(|| match claimed_for {
             Some(nominee) => format!(
@@ -1739,7 +1739,10 @@ async fn dispatch_to_with_content(
                 &id[..8]
             ),
             None => format!("claiming `{slug}` on {} as {actor}", &id[..8]),
-        })?;
+        })?
+        .context(
+            "the claim door returned no receipt; the claimed step needs releasing before retry",
+        )?;
 
     // The brief, rendered ONCE: it is the prompt and the record. The
     // hook hands the prompt the agent was already given, which is the
@@ -1791,6 +1794,7 @@ async fn dispatch_to_with_content(
     let mut body = run_body(
         &id, &title, &slug, run_agent, &settings, host, &brief, owner,
     );
+    body["metadata"]["claim_receipt"] = claim_receipt;
     if let Some(p) = &plan {
         body["metadata"]["harness"] = json!(p.harness.id);
         body["metadata"]["dispatched_by"] = json!(actor);
@@ -2208,7 +2212,7 @@ fn open_unheld(job: &Value) -> impl Iterator<Item = &Value> {
 /// the normal case, not an error.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn next_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     repo: &Path,
     station: &str,
@@ -2727,7 +2731,7 @@ const EARLIER_REPORTS_PAGE: usize = 1000;
 /// whoever runs the reports. The transcript's own markers cut it first,
 /// when it has them (`transcript_usage::Slice::marked`, backlog 11a0998a).
 pub(crate) async fn transcript_slice_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     actor: &str,
     run_id: &str,
@@ -2796,7 +2800,7 @@ pub(crate) async fn transcript_slice_at(
 /// its `agent` signs for. The second is `Err` with the reason when the
 /// run, the registry or the roster cannot name one.
 pub(crate) async fn transcript_source_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     actor: &str,
     run_id: &str,
@@ -3387,7 +3391,7 @@ pub(crate) fn tenant_receipt_verdict(
 /// [`report_with_receipt_at`], so this exists only under test.
 #[cfg(test)]
 pub(crate) async fn report_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     run_ref: &str,
     report: &Report,
@@ -3401,7 +3405,7 @@ pub(crate) async fn report_at(
 /// [`report_at`] carrying a tenant run's receipt (6a34e9bc).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn report_with_receipt_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     run_ref: &str,
     report: &Report,
@@ -5403,6 +5407,15 @@ pub(crate) mod wire_tests {
 
     /// The HTTP loop every stub here shares: reads one request per
     /// connection, logs it, and answers with what `route` says.
+    ///
+    /// EACH CONNECTION IN A TASK OF ITS OWN, as the real jobs API serves
+    /// them (review fae63341, N2). It used to read one connection at a
+    /// time with no timeout, and a launch abandons its pid-receipt PATCH
+    /// once the child has exited — after the kernel has completed the
+    /// connect. The stub then read that connection for ever, the ending's
+    /// PATCH waited unaccepted behind it, and the test hung: 7 times in
+    /// about 100 module runs beside 6 other test binaries, and once on
+    /// main before this car added a test.
     async fn serve<F>(route: F) -> (String, Log)
     where
         F: Fn(&str, &str, &str, &Value) -> Answer + Send + Sync + 'static,
@@ -5414,56 +5427,60 @@ pub(crate) mod wire_tests {
             calls: Arc::new(Mutex::new(Vec::new())),
         };
         let l = log.clone();
+        let route = Arc::new(route);
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     break;
                 };
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 65536];
-                let mut want = None;
-                loop {
-                    match sock.read(&mut chunk).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                let (l, route) = (l.clone(), route.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 65536];
+                    let mut want = None;
+                    loop {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                        if want.is_none()
+                            && let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            want = Some(end + 4 + len);
+                        }
+                        if want.is_some_and(|w| buf.len() >= w) {
+                            break;
+                        }
                     }
-                    if want.is_none()
-                        && let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
-                    {
-                        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
-                        let len = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        want = Some(end + 4 + len);
-                    }
-                    if want.is_some_and(|w| buf.len() >= w) {
-                        break;
-                    }
-                }
-                let text = String::from_utf8_lossy(&buf).into_owned();
-                let mut words = text.split_whitespace();
-                let method = words.next().unwrap_or("GET").to_string();
-                let target = words.next().unwrap_or("/").to_string();
-                let body: Value = text
-                    .split("\r\n\r\n")
-                    .nth(1)
-                    .and_then(|b| serde_json::from_str(b).ok())
-                    .unwrap_or(Value::Null);
-                l.calls
-                    .lock()
-                    .unwrap()
-                    .push((method.clone(), target.clone(), body.clone()));
-                let path = target.split('?').next().unwrap_or("").to_string();
-                let (status, resp) = route(&method, &path, &target, &body);
-                let out = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                    let text = String::from_utf8_lossy(&buf).into_owned();
+                    let mut words = text.split_whitespace();
+                    let method = words.next().unwrap_or("GET").to_string();
+                    let target = words.next().unwrap_or("/").to_string();
+                    let body: Value = text
+                        .split("\r\n\r\n")
+                        .nth(1)
+                        .and_then(|b| serde_json::from_str(b).ok())
+                        .unwrap_or(Value::Null);
+                    l.calls
+                        .lock()
+                        .unwrap()
+                        .push((method.clone(), target.clone(), body.clone()));
+                    let path = target.split('?').next().unwrap_or("").to_string();
+                    let (status, resp) = route(&method, &path, &target, &body);
+                    let out = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
                      content-length: {}\r\nconnection: close\r\n\r\n{resp}",
-                    resp.len()
-                );
-                let _ = sock.write_all(out.as_bytes()).await;
-                let _ = sock.shutdown().await;
+                        resp.len()
+                    );
+                    let _ = sock.write_all(out.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
             }
         });
         (format!("http://{addr}"), log)
@@ -5549,7 +5566,14 @@ pub(crate) mod wire_tests {
                                 json!({ "error": "step already claimed or not claimable", "holder": "emp-someone", "status": "active" }).to_string(),
                             )
                         } else {
-                            ("200 OK", json!({ "status": "active" }).to_string())
+                            {
+                                let claimed_id = p.rsplit('/').nth(1).unwrap_or("");
+                                let mut receipt = packet.get("steps").and_then(Value::as_array)
+                                    .and_then(|steps| steps.iter().find(|step| step.get("id").and_then(Value::as_str) == Some(claimed_id)))
+                                    .cloned().unwrap_or_else(|| json!({"status": "active"}));
+                                receipt["status"] = json!("active");
+                                ("200 OK", receipt.to_string())
+                            }
                         }
                     }
                     ("POST", "/api/jobs") => {
@@ -6746,7 +6770,12 @@ pub(crate) mod wire_tests {
     #[tokio::test]
     async fn a_car_held_at_review_dispatches_a_reviewer_briefed_to_record_its_verdict() {
         let block = review_block();
-        let car = car_at_review(Some("adversarial review of a trust-boundary change"));
+        let mut car = car_at_review(Some("adversarial review of a trust-boundary change"));
+        car["steps"][1]["metadata"]["hold_sha"] = json!("a".repeat(40));
+        car["steps"][1]["metadata"]["supporting_record"] =
+            json!({"nested": ["keep", "every", "byte"]});
+        let mut expected_claim = car["steps"][1].clone();
+        expected_claim["status"] = json!("active");
         let (base, log) = stub(car.clone(), row_with_block(), false).await;
         let d = dispatch_at(
             &crate::sor_client::machine_client().unwrap(),
@@ -6784,6 +6813,10 @@ pub(crate) mod wire_tests {
             .expect("the run is filed")
             .2
             .clone();
+        assert_eq!(
+            filed["metadata"]["claim_receipt"], expected_claim,
+            "copy the claim door receipt in full, not a reconstructed head"
+        );
         assert_eq!(filed["kind"], RUN_KIND);
         assert_eq!(filed["metadata"]["step"], "review");
         assert_eq!(filed["metadata"]["effort"], block.effort.as_str());

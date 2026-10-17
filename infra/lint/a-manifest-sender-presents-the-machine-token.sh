@@ -72,6 +72,7 @@
 # handed its token directory, host list and sor.env by name. Nothing a
 # host holds is read: not its token, not its address.
 set -uo pipefail
+export BOSS_GATE_READERS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
 
 NAME="a-manifest-sender-presents-the-machine-token"
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1

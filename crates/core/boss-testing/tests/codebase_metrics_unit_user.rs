@@ -43,6 +43,34 @@ fn shell_default(script: &str, key: &str) -> String {
     }
 }
 
+/// Execute only the actual store assignment with its shared pure helper;
+/// parsing shell command substitution as text does not resolve its default.
+fn resolved_store(script: &str, custom: Option<&str>) -> String {
+    let assignment = script
+        .lines()
+        .find(|line| line.starts_with("STORE="))
+        .unwrap();
+    let mut command = std::process::Command::new("bash");
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HELPER", repo_root().join("infra/estate/cli-compatible.sh"))
+        .args([
+            "-c",
+            &format!(". \"$HELPER\" || exit 1\n{assignment}\nprintf '%s' \"$STORE\""),
+        ]);
+    if let Some(custom) = custom {
+        command.env("BOSS_CLI_STORE", custom);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
 /// THE COUNTER IS WHERE THE CHORE RUNS (backlog c4d60110). Every
 /// maintenance-codebase-metrics packet from 2026-09-17 to 2026-09-27 — 11
 /// of 11 — carried `registry.code_branches_on_kind: null`, "No
@@ -77,7 +105,11 @@ fn the_codebase_metrics_unit_names_the_counter_the_converge_installs() {
              paths the host has never had and files null",
         );
 
-    let store = shell_default(&installer, "STORE");
+    let store = resolved_store(&installer, None);
+    assert_eq!(
+        resolved_store(&installer, Some("/fixture/custom store")),
+        "/fixture/custom store"
+    );
     let member = shell_default(&installer, "COUNTER_MEMBER");
     let basename = member.rsplit('/').next().unwrap_or_default();
     assert_eq!(

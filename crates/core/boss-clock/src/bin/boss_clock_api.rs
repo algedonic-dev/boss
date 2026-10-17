@@ -90,9 +90,8 @@ async fn main() -> Result<()> {
     };
     info!(?mode, "boss-clock-api starting");
 
-    // Sim mode: prime the formula parameters from sim_clock so
-    // the formula stays continuous across restarts. Wall mode
-    // doesn't touch Postgres.
+    // Prime sim parameters; both persistent modes record their actual
+    // startup epoch before listening. No historical mode is inferred.
     let (params, pool) = match (mode, &cli.postgres_url) {
         (ClockMode::Sim, Some(url)) => {
             let pool = sqlx::postgres::PgPoolOptions::new()
@@ -161,13 +160,25 @@ async fn main() -> Result<()> {
             );
             (Arc::new(RwLock::new(None)), None)
         }
-        (ClockMode::Wall, _) => (Arc::new(RwLock::new(None)), None),
+        (ClockMode::Wall, Some(url)) => {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .connect(url)
+                .await
+                .with_context(|| "connecting wall-mode clock evidence to Postgres")?;
+            (Arc::new(RwLock::new(None)), Some(pool))
+        }
+        (ClockMode::Wall, None) => (Arc::new(RwLock::new(None)), None),
     };
 
-    // The machine gate states what it would refuse on the log whatever
-    // the clock's mode (design 21946380): wall mode keeps no pool of its
-    // own, so the gate's outbox takes a lazy one on the same URL, which
-    // opens nothing until the first fact.
+    if let Some(pool) = &pool {
+        boss_clock::postgres::record_mode(pool, mode)
+            .await
+            .with_context(|| "recording original clock startup mode and epoch")?;
+    }
+
+    // The machine gate uses the same persistent authority. Legacy
+    // nonpersistent source configurations retain its lazy outbox seam.
     // The actor-role report states its facts through the same outbox and
     // reads its window back through the same pool (backlog e0bdba74).
     let gate_pool = match (&pool, &cli.postgres_url) {
@@ -186,21 +197,8 @@ async fn main() -> Result<()> {
 
     let state = ClockApiState { mode, params, pool };
 
-    // Sim mode with a pool: the DB `sim_clock` row is the source of
-    // truth, and external processes (notably the demo-loop Reset in
-    // boss-jobs) rewind it with a direct SQL UPDATE that never goes
-    // through this service's write endpoints. Refresh the in-memory
-    // formula params from the DB on a short cadence so those external
-    // rewinds (and any DB-side pause/resume) show up in `/now` within
-    // a couple seconds instead of requiring a process restart.
-    if let Some(pool) = state.pool.clone() {
-        boss_clock::http::spawn_db_refresher(
-            pool,
-            Arc::clone(&state.params),
-            std::time::Duration::from_secs(2),
-        );
-        info!("sim_clock DB refresher running (2s cadence)");
-    }
+    // Persistent /now and ticks read the recorded authority directly;
+    // direct Jobs resets no longer wait for a polling cache to catch up.
 
     let roles = Arc::new(boss_policy_client::role_reader::SnapshotRoleReader::new(
         boss_policy_client::role_service::SNAPSHOT_MAX_AGE,

@@ -1403,7 +1403,7 @@ pub(crate) fn profile_on_step(job: Option<&Value>, row: Option<&Value>) -> Optio
 /// best-effort. Two readers now — the lane fallback above and
 /// [`protocol_section`] — so it is ONE call, not two (794e8d61).
 pub(crate) async fn active_row(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     job: &Value,
 ) -> Option<Value> {
     let kind = job.get("kind").and_then(Value::as_str)?;

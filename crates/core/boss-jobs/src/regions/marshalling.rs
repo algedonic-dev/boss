@@ -3,6 +3,19 @@
 
 use super::*;
 
+pub(super) fn unread_station_flow(station: &StationReading) -> Option<String> {
+    (!station.members.is_empty() && station.served.is_none()).then(|| {
+        format!(
+            "station {}: {} standing — {}",
+            station.name,
+            station.members.len(),
+            station
+                .flow_blind
+                .map_or("flow reading unavailable", |reason| reason.reason()),
+        )
+    })
+}
+
 /// MARSHALLING: packets standing at a station other than the dock,
 /// counted once each. The marshalling yard's grammar decides the
 /// state: a station over its WIP limit, or holding work that nothing
@@ -72,6 +85,10 @@ pub(super) fn marshalling(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
     let holding = stations.iter().filter(|s| !s.members.is_empty()).count();
     let n = distinct.len();
     let mut findings = Vec::new();
+    let unread = stations
+        .iter()
+        .filter_map(unread_station_flow)
+        .collect::<Vec<_>>();
     if !over.is_empty() {
         findings.push(Finding::new(
             bands::MARSHALLING_OVER_LIMIT,
@@ -92,6 +109,14 @@ pub(super) fn marshalling(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
             ),
         ));
     }
+    if !unread.is_empty() {
+        findings.push(Finding::new(
+            bands::UNREAD,
+            None,
+            String::new(),
+            unread.join("; "),
+        ));
+    }
     // Packets standing at stations that drain is the yard working —
     // clear (decision 1).
     let clear_why = if holding > 0 {
@@ -103,7 +128,15 @@ pub(super) fn marshalling(inputs: &RegionInputs<'_>, w: &Windows) -> Region {
     } else {
         "nothing waiting at any station".to_string()
     };
-    let settled = settle(findings, clear_why, inputs.now);
+    let mut settled = settle(findings, clear_why, inputs.now);
+    if !unread.is_empty()
+        && settled
+            .band
+            .as_ref()
+            .is_some_and(|band| band.id != bands::UNREAD.id)
+    {
+        settled.why = format!("{}; {}", settled.why, unread.join("; "));
+    }
     // THE KPI (decision 9): the oldest packet standing at a station, in
     // hours from its opening — of the members the partition left here.
     let oldest = stations
@@ -157,6 +190,83 @@ mod tests {
     use super::*;
     use crate::regions::fixtures::*;
 
+    #[test]
+    fn unread_required_station_flow_requires_action_with_its_exact_reason() {
+        let status = empty_status();
+        for reason in [
+            None,
+            Some(crate::station_flow::FlowBlind::JobMetadataClause),
+        ] {
+            let mut station = holding("q.platform-admin.task", &["packet"]);
+            station.served = None;
+            station.flow_blind = reason;
+            let stations = [station];
+            let out = regions(&inputs(
+                &status,
+                &[],
+                &[],
+                &[],
+                &[],
+                Some(&[]),
+                Some(&stations),
+            ));
+            let reading = by_name(&out, "marshalling");
+            assert_eq!(
+                reading.state,
+                RegionState::Troubled,
+                "required flow cannot be read as healthy: {reason:?}"
+            );
+            assert_eq!(
+                reading.count,
+                Some(1),
+                "the observed membership remains known"
+            );
+            assert!(reading.why.contains("q.platform-admin.task"));
+            assert!(
+                reading
+                    .why
+                    .contains(reason.map_or("unavailable", |reason| reason.reason()))
+            );
+            let input = inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&stations));
+            let summary = stuck(&input)
+                .into_iter()
+                .find(|third| third.third == "queue-management")
+                .unwrap();
+            assert_eq!(summary.unknown, vec![reading.why.clone()]);
+        }
+    }
+
+    #[test]
+    fn unread_flow_does_not_hide_an_observed_wip_fault() {
+        let status = empty_status();
+        let mut station = holding("q.platform-admin.task", &["packet"]);
+        station.served = None;
+        station.over_limit = true;
+        station.flow_blind = Some(crate::station_flow::FlowBlind::JobMetadataClause);
+        let stations = [station];
+        let out = regions(&inputs(
+            &status,
+            &[],
+            &[],
+            &[],
+            &[],
+            Some(&[]),
+            Some(&stations),
+        ));
+        let reading = by_name(&out, "marshalling");
+        assert_eq!(reading.state, RegionState::Troubled);
+        assert_eq!(
+            reading.band.as_ref().unwrap().id,
+            bands::MARSHALLING_OVER_LIMIT.id
+        );
+        assert!(reading.why.contains("WIP limit"));
+        assert!(
+            reading
+                .why
+                .contains(crate::station_flow::FlowBlind::JobMetadataClause.reason())
+        );
+    }
+
     /// Marshalling: packets counted once across stations; a station
     /// nothing leaves is trouble; served per day sums the countable
     /// stations.
@@ -168,6 +278,7 @@ mod tests {
                 over_limit: false,
                 members: vec!["p1".into(), "p2".into()],
                 served: Some(4),
+                flow_blind: None,
                 previous_served: Some(2),
                 opened: [("p1".to_string(), t("2026-09-18T12:00:00Z"))].into(),
             },
@@ -176,6 +287,7 @@ mod tests {
                 over_limit: false,
                 members: vec!["p2".into()],
                 served: Some(1),
+                flow_blind: None,
                 previous_served: Some(0),
                 opened: [("p2".to_string(), t("2026-09-19T06:00:00Z"))].into(),
             },
@@ -184,6 +296,7 @@ mod tests {
                 over_limit: false,
                 members: vec![],
                 served: None,
+                flow_blind: None,
                 previous_served: None,
                 opened: Default::default(),
             },

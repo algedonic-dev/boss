@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# root-tree.sh refresh | path | head | mark-good <dir> | status — the
+# root-tree.sh refresh | path | head | read-main | mark-good <dir> | status — the
 # tree ROOT EXECUTES FROM on the forge host: root's own, fetched by root
 # from the forge's own repository on local disk, and changed only by a
 # whole, verified generation.
@@ -177,6 +177,20 @@ source_repo() {
     # shellcheck source=infra/forge/forge-repo-path.sh
     . "$HERE/forge-repo-path.sh" || return 1
     printf '%s' "$FORGE_REPO"
+}
+
+# A fresh publication observation, through the SAME serving-side owner as
+# refresh. It neither fetches nor moves an accepted ref or generation: the
+# root-owned object store supplies local frozen objects, while this read says
+# what the serving repository names now. stdout is the native ls-remote answer.
+read_main() {
+    local src runas
+    src="$(source_repo)" || { echo "$ME: cannot derive the serving repository" >&2; return 1; }
+    [ -d "$src" ] || { echo "$ME: serving repository is unavailable at $src" >&2; return 1; }
+    runas="$(source_runas "$src")" || { echo "$ME: cannot read the serving repository's owner" >&2; return 1; }
+    timeout -k 5 "${ROOT_TREE_FETCH_TIMEOUT:-300}" env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        git -c core.hooksPath=/dev/null --git-dir="$STORE" \
+        ls-remote --upload-pack="${runas:+$runas }git upload-pack" -- "$src" "$REF"
 }
 
 # ── refresh ──────────────────────────────────────────────────────────
@@ -395,10 +409,11 @@ case "$MODE" in
     refresh) shift; refresh "$@" ;;
     path) tree_path ;;
     head) link_sha current && echo ;;
+    read-main) read_main ;;
     mark-good) mark_good "${2:-}" ;;
     status) status ;;
     *)
-        echo "usage: root-tree.sh refresh [--accept-rewind <sha>] | path | head | mark-good <dir> | status" >&2
+        echo "usage: root-tree.sh refresh [--accept-rewind <sha>] | path | head | read-main | mark-good <dir> | status" >&2
         exit 2
         ;;
 esac

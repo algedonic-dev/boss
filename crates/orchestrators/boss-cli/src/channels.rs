@@ -832,7 +832,7 @@ const DIRECTION_LINE: &str = "  direction: OUTWARD — work moving from core to 
 /// closed train that merged and closed on or after `since`. Paged on
 /// `total`, because a limit is a page and not a filter.
 async fn landed_tier_reading(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     since: chrono::NaiveDate,
 ) -> Result<TierReading> {
     let trains = crate::train::list_all_pages(|offset| {

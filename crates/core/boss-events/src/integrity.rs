@@ -407,13 +407,9 @@ pub async fn unregistered_kinds(pool: &PgPool) -> Result<Vec<String>, sqlx::Erro
 }
 
 async fn verify_chain(pool: &PgPool) -> Result<Vec<ChainBreak>, sqlx::Error> {
-    // The verifier reproduces the trigger's canonical hash. Must
-    // match `audit_log_compute_row_hash`'s encoding exactly — a
-    // mismatch here surfaces every row as a "chain break" even
-    // though the chain is fine, so any change to the trigger's
-    // encoding has to land here too. The encoding uses
-    // `convert_to(text, 'UTF8')`, not a `text::bytea` cast: the cast
-    // fails on payloads carrying `\n` / unicode escapes.
+    // The trigger and verifier call one SQL byte definition. NULL
+    // original_group preserves legacy links; new group completeness
+    // evidence is covered by the same chain, not an unhashed sidecar.
     let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
         "WITH chain AS (
              SELECT
@@ -424,11 +420,8 @@ async fn verify_chain(pool: &PgPool) -> Result<Vec<ChainBreak>, sqlx::Error> {
                          OVER (ORDER BY id)
                      ||
                      convert_to(
-                         COALESCE(event_id::text, '') || '|' ||
-                         COALESCE(timestamp::text, '') || '|' ||
-                         COALESCE(source, '')          || '|' ||
-                         COALESCE(kind, '')            || '|' ||
-                         COALESCE(payload::text, ''),
+                         audit_log_canonical(event_id, timestamp, source, kind,
+                                             payload, original_group),
                          'UTF8'
                      ),
                      'sha256'

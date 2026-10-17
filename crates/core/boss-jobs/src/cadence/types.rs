@@ -41,7 +41,8 @@ pub const OPEN_VERB_PREFIX: &str = "open:";
 /// beyond those — `cadence_rules_basis_check` and
 /// `cadence_rules_params_check` (202608282135) spelled once. A column in
 /// neither list must be absent for that basis; an INT column present
-/// must be above 0; and a calendar rule's `at_times` holds exactly one
+/// must be positive, except cooldown_minutes may be zero (no batching
+/// delay); and a calendar rule's `at_times` holds exactly one
 /// time-of-day (the cadence chooses the days, the time when on them).
 pub const BASIS_COLUMNS: [(&str, &[&str], &[&str]); 4] = [
     ("wall", &["every_minutes"], &[]),
@@ -121,9 +122,12 @@ pub fn check_rule(row: &CadenceRuleRow) -> Result<(), String> {
                 "cadence rule {name}: {column} is not a column of basis `{basis}` — leave it absent"
             ));
         }
-        if let Some(v) = value.filter(|v| *v <= 0) {
+        // A queue-depth rule may deliberately have no batching delay.
+        // Depth and interval still require a strictly positive value.
+        let minimum = if column == "cooldown_minutes" { 0 } else { 1 };
+        if let Some(v) = value.filter(|v| *v < minimum) {
             return Err(format!(
-                "cadence rule {name}: {column} must be above 0, got {v}"
+                "cadence rule {name}: {column} must be at least {minimum}, got {v}"
             ));
         }
     }
@@ -242,6 +246,10 @@ pub struct LastFiring {
     /// the board's decision from the cadence rows (`yard::boarding_hold`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board_decision: Option<crate::board_decision::BoardDecision>,
+    /// Whole optional subsystem observations from this firing. Absence is
+    /// unknown; readers must never borrow an older firing's success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observations: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A claim request. `fired_at` is supplied BY THE CALLER and bound as
@@ -277,6 +285,10 @@ pub struct FiringOutcome {
     /// the verb it ran. Absent for every other verb.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board_decision: Option<crate::board_decision::BoardDecision>,
+    /// Whole optional subsystem observations from this firing. Absence is
+    /// unknown; readers must never borrow an older firing's success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observations: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl FiringOutcome {
@@ -285,9 +297,32 @@ impl FiringOutcome {
     /// readers look for (`board_decision::FIRING_KEY`).
     pub fn detail_patch(&self) -> serde_json::Value {
         let mut patch = serde_json::json!({"rc": self.rc, "runtime_secs": self.runtime_secs});
+        if let Some(observations) = &self.observations {
+            patch["observations"] = serde_json::json!(observations);
+        }
         if let Some(d) = &self.board_decision {
             patch[crate::board_decision::FIRING_KEY] = serde_json::json!(d);
         }
         patch
+    }
+}
+
+#[cfg(test)]
+mod supervision_observation_tests {
+    use super::*;
+    #[test]
+    fn outcome_conserves_the_whole_optional_observation_object() {
+        let observation = serde_json::json!({"gate_queue":{"contract_version":1,
+            "state":"unknown","evidence":{"original":"complete evidence","items":[1,2,3]}}});
+        let wire = serde_json::json!({"rc":0,"runtime_secs":3,"observations":observation});
+        let outcome: FiringOutcome = serde_json::from_value(wire).unwrap();
+        assert_eq!(outcome.detail_patch()["observations"], observation);
+        let historical: FiringOutcome =
+            serde_json::from_value(serde_json::json!({"rc":0,"runtime_secs":1})).unwrap();
+        assert_eq!(
+            historical.detail_patch().get("observations"),
+            None,
+            "legacy outcomes preserve their original shape; adapters remove any prior observation"
+        );
     }
 }

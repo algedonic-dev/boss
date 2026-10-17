@@ -162,6 +162,12 @@ impl Drop for World {
 impl World {
     async fn new(allow: bool, mode: &'static str) -> Self {
         let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("fixture-token")).unwrap();
+        std::fs::write(
+            root.path().join("fixture-token/current"),
+            "synthetic-roster-fixture",
+        )
+        .unwrap();
         std::fs::write(root.path().join("native.jsonl"), NATIVE).unwrap();
         let jobs = Arc::new(InMemoryJobs::new());
         let workflows = Arc::new(InMemoryWorkflows::for_fixture());
@@ -252,7 +258,7 @@ impl World {
                 .env("BOSS_ACTOR", actor)
                 .env(
                     "BOSS_MACHINE_TOKEN_DIR",
-                    self.root.path().join("empty-token"),
+                    self.root.path().join("fixture-token"),
                 )
                 .kill_on_drop(true)
                 .output()

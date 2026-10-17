@@ -1,0 +1,382 @@
+{
+  "kind": "ship-a-change",
+  "version": 9,
+  "status": "active",
+  "label": "Ship a change",
+  "description": "One change, from declaring its boundary to merging it. The Subject is a `custom` Subject whose id is the branch, so \"what shipped here\" is a Subject-history question. The `scope` step is the point of the kind: it asks a person what the change contains and what it deliberately excludes BEFORE the work, which is the only moment that decision keeps a PR small. Counted on /system/flow, so a cadence target needs no second mechanism. OPERATOR EDIT 2026-08-27, deliberate and load-bearing: this sentence exists only to make this registry row DIFFER from infra/platform/workflows.toml. The bundle was authored FROM the live specs, so every row matched and nothing could distinguish \"the seeder left my edit alone\" from \"the seeder rewrote it with identical bytes\". If this sentence is still here after the boss pod has restarted, the seeder is insert-if-absent in production and an operator edit survives a boot - the arbiter for the ship-a-change car \"ship-a-change is registry data\" (b10b3b52). If it has vanished, that claim is false and the car must not be stamped proven. Safe to delete once the observation is recorded. EVERY STEP CARRIES ITS OWN PROCEDURE in metadata_defaults, so how the work is actually done travels with the packet rather than living in a document someone has to know about. That also makes the procedure versioned and measurable: /api/workflows/ship-a-change/terminal-report reports cycle time and outcomes per version, so a change to the procedure can be compared against the versions before it instead of argued about.",
+  "category": "platform",
+  "subject_kinds": [
+    "custom"
+  ],
+  "steps": [
+    {
+      "title": "opened",
+      "kind": "trigger",
+      "ready_when": "true",
+      "title_template": "Change started",
+      "sign_offs_required": [],
+      "fields": [],
+      "authority_role": null,
+      "metadata_defaults": {
+        "trigger_kind": "operator",
+        "trigger_name": "operator-starts-a-change"
+      }
+    },
+    {
+      "title": "scope",
+      "kind": "task",
+      "ready_when": "steps.opened.done",
+      "title_template": "Declare the boundary",
+      "sign_offs_required": [],
+      "fields": [
+        {
+          "name": "summary",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "excludes",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "completed_at",
+          "field_type": "date-time",
+          "required": false,
+          "filled_by": "executor"
+        }
+      ],
+      "authority_role": "platform-admin",
+      "metadata_defaults": {}
+    },
+    {
+      "title": "build",
+      "kind": "task",
+      "ready_when": "steps.scope.done",
+      "title_template": "Build it",
+      "sign_offs_required": [],
+      "fields": [
+        {
+          "name": "test",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "completed_at",
+          "field_type": "date-time",
+          "required": false,
+          "filled_by": "executor"
+        },
+        {
+          "name": "base",
+          "field_type": "string",
+          "required": false,
+          "filled_by": "executor"
+        }
+      ],
+      "authority_role": "platform-admin",
+      "metadata_defaults": {}
+    },
+    {
+      "title": "gate",
+      "kind": "task",
+      "ready_when": "steps.build.done",
+      "title_template": "Green, and observed working",
+      "sign_offs_required": [],
+      "fields": [
+        {
+          "name": "gates",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "verified",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "completed_at",
+          "field_type": "date-time",
+          "required": false,
+          "filled_by": "executor"
+        }
+      ],
+      "authority_role": "platform-admin",
+      "metadata_defaults": {}
+    },
+    {
+      "title": "review",
+      "kind": "task",
+      "ready_when": "steps.gate.done",
+      "title_template": "Open for review",
+      "sign_offs_required": [],
+      "fields": [
+        {
+          "name": "pr_url",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "completed_at",
+          "field_type": "date-time",
+          "required": false,
+          "filled_by": "executor"
+        }
+      ],
+      "authority_role": "platform-admin",
+      "agent": {
+        "profile": "reviewer",
+        "model": "opus-5-5",
+        "budget_usd": 3.0,
+        "effort": "high",
+        "executor_provenance": "advisory"
+      },
+      "metadata_defaults": {}
+    },
+    {
+      "title": "proven",
+      "kind": "task",
+      "ready_when": "steps.review.done AND job.metadata.merged = \"true\"",
+      "title_template": "Proven in prod",
+      "sign_offs_required": [],
+      "fields": [
+        {
+          "name": "verified",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "method",
+          "field_type": "browser|api|log",
+          "required": false,
+          "filled_by": "executor"
+        },
+        {
+          "name": "proof",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "completed_at",
+          "field_type": "date-time",
+          "required": false,
+          "filled_by": "executor"
+        }
+      ],
+      "authority_role": "platform-admin",
+      "metadata_defaults": {}
+    },
+    {
+      "title": "landed-review",
+      "kind": "task",
+      "ready_when": "steps.review.done AND job.metadata.merged = \"true\" AND NOT (steps.review.metadata.release.review > \"\") AND NOT (job.metadata.unlanded = \"true\")",
+      "title_template": "Reviewed after landing",
+      "sign_offs_required": [],
+      "fields": [
+        {
+          "name": "verdict",
+          "field_type": "clean|findings",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "findings",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "reviewed",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "completed_at",
+          "field_type": "date-time",
+          "required": false,
+          "filled_by": "executor"
+        }
+      ],
+      "authority_role": "platform-admin",
+      "agent": {
+        "profile": "reviewer",
+        "model": "opus-5-5",
+        "budget_usd": 3.0,
+        "effort": "medium",
+        "executor_provenance": "advisory"
+      },
+      "metadata_defaults": {}
+    },
+    {
+      "title": "merged",
+      "kind": "outcome",
+      "ready_when": "steps.proven.done AND (steps.landed-review.done OR steps.review.metadata.release.review > \"\")",
+      "terminal": {
+        "outcome": "merged"
+      },
+      "title_template": "Merged",
+      "sign_offs_required": [],
+      "fields": [],
+      "authority_role": null,
+      "metadata_defaults": {
+        "outcome_kind": "completed"
+      }
+    },
+    {
+      "title": "abandoned",
+      "kind": "outcome",
+      "ready_when": "steps.scope.done AND job.metadata.abandoned = \"true\"",
+      "terminal": {
+        "outcome": "abandoned"
+      },
+      "title_template": "Abandoned",
+      "sign_offs_required": [],
+      "fields": [],
+      "authority_role": null,
+      "metadata_defaults": {
+        "outcome_kind": "aborted"
+      }
+    },
+    {
+      "title": "settled",
+      "kind": "outcome",
+      "ready_when": "steps.build.done AND job.metadata.settled = \"true\"",
+      "terminal": {
+        "outcome": "settled"
+      },
+      "title_template": "Settled \u2014 done, with nothing to merge",
+      "sign_offs_required": [],
+      "fields": [],
+      "authority_role": null,
+      "metadata_defaults": {
+        "outcome_kind": "completed"
+      }
+    },
+    {
+      "title": "landed-twin",
+      "kind": "outcome",
+      "ready_when": "steps.build.done AND job.metadata.landed_twin = \"true\"",
+      "terminal": {
+        "outcome": "landed-twin"
+      },
+      "title_template": "Retired \u2014 its commits landed inside another car",
+      "sign_offs_required": [],
+      "fields": [
+        {
+          "name": "carried_by",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "evidence",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        }
+      ],
+      "authority_role": null,
+      "metadata_defaults": {
+        "outcome_kind": "completed"
+      }
+    },
+    {
+      "title": "disproved",
+      "kind": "outcome",
+      "ready_when": "steps.review.done AND job.metadata.merged = \"true\" AND job.metadata.disproved = \"true\"",
+      "terminal": {
+        "outcome": "disproved"
+      },
+      "title_template": "Disproved \u2014 it landed, and its claim was measured false",
+      "sign_offs_required": [],
+      "fields": [
+        {
+          "name": "verified",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "disproof",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "superseded_by",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "completed_at",
+          "field_type": "date-time",
+          "required": false,
+          "filled_by": "executor"
+        }
+      ],
+      "authority_role": null,
+      "metadata_defaults": {
+        "outcome_kind": "completed"
+      }
+    },
+    {
+      "title": "unlanded",
+      "kind": "outcome",
+      "ready_when": "steps.review.done AND job.metadata.merged = \"true\" AND job.metadata.unlanded = \"true\"",
+      "terminal": {
+        "outcome": "unlanded"
+      },
+      "title_template": "Unlanded \u2014 main lost its merge; a successor rides again",
+      "sign_offs_required": [],
+      "fields": [
+        {
+          "name": "merge_ref",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "evidence",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "superseded_by",
+          "field_type": "string",
+          "required": true,
+          "filled_by": "executor"
+        },
+        {
+          "name": "completed_at",
+          "field_type": "date-time",
+          "required": false,
+          "filled_by": "executor"
+        }
+      ],
+      "authority_role": null,
+      "metadata_defaults": {
+        "outcome_kind": "aborted"
+      }
+    }
+  ],
+  "metadata_schema": {},
+  "entitlements": {},
+  "metadata": {
+    "department": "it",
+    "owner_role": "platform-admin"
+  },
+  "owning_team": "platform",
+  "authoring_job_id": null,
+  "created_at": "2026-10-09T21:07:08.624720Z"
+}

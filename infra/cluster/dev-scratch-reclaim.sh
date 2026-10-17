@@ -910,14 +910,31 @@ landed_on_record() {
     record_car_landed "$branch" || rc=$?
     [ "$rc" = 1 ] || return "$rc"
 
-    rc=0
-    reply=$(sor_read "/api/jobs?kind=gate-run&limit=50&metadata=$(meta_query worktree "$path")") || rc=$?
-    if [ "$rc" -ne 0 ] || ! page_is_whole "$reply"; then
-        sor_unread "the gate-run read for $path" "$rc"
+    local readers evidence raw_query source_query
+    readers="$(dirname "$(readlink -f "$0")")/../lib"
+    if [ ! -r "$readers/jobs-pages.sh" ] || [ ! -r "$readers/immutable-metadata.jq" ]; then
+        sor_unread "the authoritative gate readers" 0
         return 2
     fi
-    mapfile -t runs < <(printf '%s' "$reply" | jq -r '[.data[].metadata.agent_run // empty] | unique[]' 2>/dev/null)
-    mapfile -t branches < <(printf '%s' "$reply" | jq -r --arg b "$branch" '[.data[].metadata.branch // empty | select(. != $b)] | unique[]' 2>/dev/null)
+    evidence=$(mktemp -d "${TMPDIR:-/tmp}/dev-reclaim-gates.XXXXXX") || { sor_unread "gate evidence storage" 0; return 2; }
+    . "$readers/jobs-pages.sh"
+    job_pages_get() { sor_read "/api/jobs?$1"; }
+    raw_query=$(meta_query worktree "$path")
+    source_query=$(jq -rn --arg path "$path" '{gate_submission:{source:{worktree:$path}}}|tojson|@uri')
+    if ! read_job_pages "kind=gate-run&metadata=$raw_query" "$evidence/legacy" >"$evidence/legacy.json" \
+        || ! read_job_pages "kind=gate-run&metadata=$source_query" "$evidence/canonical" >"$evidence/canonical.json" \
+        || ! jq -s -L "$readers" --arg path "$path" '
+            include "immutable-metadata";
+            add | group_by(.id) | map(. as $group | if all(.[]; . == $group[0]) then .[0] else error("gate changed between reads") end)
+            | map((.metadata | gate_source) as $source
+                | if $source.worktree != $path then error("gate index disagrees with checkout") else $source end)
+            ' "$evidence/legacy.json" "$evidence/canonical.json" >"$evidence/sources.json" 2>"$evidence/authority.stderr"; then
+        sor_unread "the complete authoritative gate-run read for $path (evidence $evidence)" 0
+        return 2
+    fi
+    log "worktree gate authority evidence: $evidence" >&2
+    mapfile -t runs < <(jq -r '[.[].agent_run // empty] | unique[]' "$evidence/sources.json")
+    mapfile -t branches < <(jq -r --arg b "$branch" '[.[].branch // empty | select(. != $b)] | unique[]' "$evidence/sources.json")
     for run in "${runs[@]}"; do
         # An id goes into a path: anything but a uuid's alphabet is not one.
         case ${run:-empty} in empty | *[!0-9A-Za-z-]*) continue ;; esac

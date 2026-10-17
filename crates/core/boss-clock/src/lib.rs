@@ -42,6 +42,7 @@
 #![forbid(unsafe_code)]
 
 pub mod http;
+pub mod mapping_history;
 pub mod types;
 
 #[cfg(feature = "postgres")]

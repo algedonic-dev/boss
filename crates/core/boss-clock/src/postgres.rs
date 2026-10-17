@@ -15,12 +15,14 @@
 //!   `/restart-epoch` call, persists the updated parameters so
 //!   a restart picks up where it left off.
 //!
-//! Production (wall mode) doesn't touch Postgres at all.
+//! Both modes record their original mode/epoch before listening. The
+//! schema trigger captures parameter changes from every database writer
+//! in that writer's transaction, including direct Jobs reset paths.
 
 use chrono::{DateTime, NaiveDate, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
-use crate::types::{BaselineProvenance, SimClockParams};
+use crate::types::{BaselineProvenance, ClockMode, ClockNow, SimClockParams};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClockStorageError {
@@ -28,6 +30,8 @@ pub enum ClockStorageError {
     Query(#[from] sqlx::Error),
     #[error("sim_clock row not found — apply the schema + seed before starting sim-mode clock-api")]
     NotSeeded,
+    #[error("original clock mapping unavailable: {0}")]
+    Mapping(String),
 }
 
 /// Read the seed baseline's provenance out of `sim_clock`.
@@ -55,6 +59,20 @@ pub async fn read_baseline(
 /// `NotSeeded` if the row doesn't exist so the bin can fall
 /// through to the env-var seed.
 pub async fn read_params(pool: &PgPool) -> Result<SimClockParams, ClockStorageError> {
+    let mut connection = pool.acquire().await?;
+    read_params_on(&mut connection, false).await
+}
+
+async fn read_params_on(
+    connection: &mut PgConnection,
+    for_update: bool,
+) -> Result<SimClockParams, ClockStorageError> {
+    let query = format!(
+        "SELECT epoch_start_date, epoch_end_date, warp_factor, \
+                wall_anchor, paused, paused_at, paused_offset_seconds, \
+                restart_in_progress FROM sim_clock WHERE id = 1{}",
+        if for_update { " FOR UPDATE" } else { "" }
+    );
     let row: Option<(
         NaiveDate,
         Option<NaiveDate>,
@@ -64,14 +82,7 @@ pub async fn read_params(pool: &PgPool) -> Result<SimClockParams, ClockStorageEr
         Option<DateTime<Utc>>,
         Option<f64>,
         bool,
-    )> = sqlx::query_as(
-        "SELECT epoch_start_date, epoch_end_date, warp_factor, \
-                wall_anchor, paused, paused_at, paused_offset_seconds, \
-                restart_in_progress \
-         FROM sim_clock WHERE id = 1",
-    )
-    .fetch_optional(pool)
-    .await?;
+    )> = sqlx::query_as(&query).fetch_optional(connection).await?;
 
     let (
         epoch_start,
@@ -103,6 +114,14 @@ pub async fn read_params(pool: &PgPool) -> Result<SimClockParams, ClockStorageEr
 /// Persist the formula parameters. UPSERT so a fresh DB without
 /// a sim_clock row still ends up with one.
 pub async fn write_params(pool: &PgPool, params: &SimClockParams) -> Result<(), ClockStorageError> {
+    let mut connection = pool.acquire().await?;
+    write_params_on(&mut connection, params).await
+}
+
+async fn write_params_on(
+    connection: &mut PgConnection,
+    params: &SimClockParams,
+) -> Result<(), ClockStorageError> {
     sqlx::query(
         "INSERT INTO sim_clock \
             (id, epoch_start_date, epoch_end_date, warp_factor, \
@@ -128,7 +147,85 @@ pub async fn write_params(pool: &PgPool, params: &SimClockParams) -> Result<(), 
     .bind(params.paused_at)
     .bind(params.paused_offset_seconds)
     .bind(params.restart_in_progress)
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
+/// Change the recorded authority before publishing a served mapping.
+/// The row lock also serializes direct Jobs writers; no cache rollback
+/// can accidentally undo a concurrent successful transition.
+pub async fn change_params<F>(
+    pool: &PgPool,
+    fallback: SimClockParams,
+    mutator: F,
+) -> Result<SimClockParams, ClockStorageError>
+where
+    F: FnOnce(&mut SimClockParams),
+{
+    let mut tx = pool.begin().await?;
+    let mode: Option<String> = sqlx::query_scalar("SELECT mode FROM clock_mapping_mode WHERE id=1")
+        .fetch_optional(&mut *tx)
+        .await?;
+    if mode.as_deref() != Some("sim") {
+        return Err(ClockStorageError::Mapping(
+            "sim writer has no matching original mode".into(),
+        ));
+    }
+    let mut params = match read_params_on(&mut tx, true).await {
+        Ok(params) => params,
+        Err(ClockStorageError::NotSeeded) => fallback,
+        Err(error) => return Err(error),
+    };
+    mutator(&mut params);
+    write_params_on(&mut tx, &params).await?;
+    tx.commit().await?;
+    Ok(params)
+}
+
+/// A real startup, including wall mode, records its mode and new epoch
+/// before opening its listener. No existing mode/history is backfilled.
+pub async fn record_mode(pool: &PgPool, mode: ClockMode) -> Result<(), ClockStorageError> {
+    sqlx::query(
+        "INSERT INTO clock_mapping_mode(id,mode,epoch) VALUES (1,$1,gen_random_uuid()) \
+        ON CONFLICT(id) DO UPDATE SET mode=EXCLUDED.mode,epoch=EXCLUDED.epoch",
+    )
+    .bind(match mode {
+        ClockMode::Wall => "wall",
+        ClockMode::Sim => "sim",
+    })
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Mode and formula come from one consistent native snapshot. A
+/// process with a stale/different environment mode cannot serve a
+/// second global timeline during a rolling restart.
+pub async fn authoritative_now(
+    pool: &PgPool,
+    expected_mode: ClockMode,
+) -> Result<ClockNow, ClockStorageError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let mode: Option<String> = sqlx::query_scalar("SELECT mode FROM clock_mapping_mode WHERE id=1")
+        .fetch_optional(&mut *tx)
+        .await?;
+    let expected = match expected_mode {
+        ClockMode::Wall => "wall",
+        ClockMode::Sim => "sim",
+    };
+    if mode.as_deref() != Some(expected) {
+        return Err(ClockStorageError::Mapping(
+            "process and original mode differ or mode is missing".into(),
+        ));
+    }
+    let now = match expected_mode {
+        ClockMode::Wall => ClockNow::wall(),
+        ClockMode::Sim => read_params_on(&mut tx, false).await?.now(),
+    };
+    tx.commit().await?;
+    Ok(now)
 }

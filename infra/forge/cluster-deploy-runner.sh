@@ -251,11 +251,13 @@ LAST=$(cat "$STAMP_FILE" 2>/dev/null || echo none)
 # which would stand in the way of the file David places next.
 . "$REPO/infra/estate/ops-credentials.sh"
 KUBECONFIG_PATH="${BOSS_FORGE_KUBECONFIG:-$(ops_kubeconfig)}"
-if [ ! -f "$KUBECONFIG_PATH" ] || [ -L "$KUBECONFIG_PATH" ]; then
-    STAGE="kubeconfig"
-    echo "cluster-deploy-runner: the admin kubeconfig $KUBECONFIG_PATH is not a file of its own (root material, placed by David; design 835c0c9c) — the cluster cannot be read or written; nothing built or rolled" >&2
-    exit 1
-fi
+require_cluster_credentials() {
+    if [ ! -f "$KUBECONFIG_PATH" ] || [ -L "$KUBECONFIG_PATH" ]; then
+        STAGE="kubeconfig"
+        echo "cluster-deploy-runner: the admin kubeconfig $KUBECONFIG_PATH is not a file of its own (root material, placed by David; design 835c0c9c) — the cluster cannot be read or written; nothing built or rolled" >&2
+        return 1
+    fi
+}
 # THE SYSTEM DAEMON, EXPLICITLY: whatever DOCKER_HOST the environment
 # carried, every docker below is root's own daemon.
 unset DOCKER_HOST
@@ -274,6 +276,7 @@ kubectl_seeing() { # DIR
 }
 
 if [ "$HEAD" = "$LAST" ]; then
+    require_cluster_credentials
     echo "cluster-deploy-runner: forge main unchanged ($HEAD)"
     run_summary_field unchanged "$HEAD"
     # THE NO-OP TICK OBSERVES THE CONNECTOR TOO (backlog 0b7804f3;
@@ -298,23 +301,12 @@ if [ "$HEAD" = "$LAST" ]; then
     # and nothing is recorded — a guessed map would be evidence the
     # retire verb reads. The connector read itself never fails a tick
     # (connector_status): the tunnel is not what a converge delivers.
-    STAGE="observe connector"
-    OBSERVE_DIR="$(mktemp -d -t cluster-deploy-observe.XXXXXX)"
-    "$REPO/infra/cluster/render-instance.sh" --all "$OBSERVE_DIR"
-    SOURCE_NS=$("$REPO/infra/cluster/render-instance.sh" --source)
-    KO=$(kubectl_seeing "$OBSERVE_DIR")
-    SKIPPED=$(instances_skipped_by_gate "$K" "$KO" "$SOURCE_NS" "$("$REPO/infra/cluster/render-instance.sh" --instances)" /manifests) || {
-        echo "cluster-deploy-runner: cannot tell which instances are skipped (rc=$?) — a Secret read the credential could not make; the connector is not observed on this tick" >&2
-        exit 1
-    }
-    observe_connector "$K" "$KO" "$SOURCE_NS" "/manifests/$SOURCE_NS/cloudflared.yaml" cloudflared "$SKIPPED" unchanged
+    observe_deployed_surfaces
     # And the tenant site, for the same reason (backlog e114238a): the
     # tenant's publish loop closes on the newest converge's record of
     # what the gateway serves, and a fact that exists only when a train
     # ships is the wrong shape for it. `get svc` is the one kubectl
     # read; the page itself is read over HTTP, never through the tunnel.
-    observe_sites "$K" "$("$REPO/infra/cluster/render-instance.sh" --instances)" "$SOURCE_NS" "$SKIPPED"
-    rm -rf "$OBSERVE_DIR"
     OUTCOME="converged=$HEAD (unchanged)"
     exit 0
 fi
@@ -352,6 +344,33 @@ if reason=$(converge_held "$HOLD_FILE"); then
     OUTCOME="converge_held=$reason"
     exit 0
 fi
+# Complete an eligible repository/registry delivery where it actually goes live.
+# This is before the image login/build/roll and after quarantine and operator
+# holds. Missing qualification retains the existing software route.
+STAGE="delivery channel"
+. "$REPO/infra/forge/delivery-stage.sh"
+. "$REPO/infra/estate/cli-compatible.sh"
+delivery_rc=0
+delivery_channel_stage "$REPO" "$HEAD_FULL" "$LAST" "$(cli_host_store)" \
+    "$REPO/infra/forge/root-tree.sh" || delivery_rc=$?
+case "$delivery_rc" in
+    0|75)
+        # Agent images retain their own input-equality publication protocol;
+        # skipping a core image does not drop its per-generation witness.
+        . "$REPO/infra/agent/publication-stage.sh"
+        STAGE="agent image publication"
+        agent_image_publication_stage "$REPO/infra/agent/publish-image.sh" "$HEAD_FULL" "$CONVERGE_STATE"
+        STAGE="data side observations"
+        observe_data_surfaces "$CONVERGE_STATE"
+        if [ "$delivery_rc" -eq 0 ]; then
+            OUTCOME="delivery_arrived=$HEAD_FULL (data; actual image remains $LAST)"
+        else
+            OUTCOME="delivery_pending=$HEAD_FULL (native publication/equality; actual image remains $LAST)"
+        fi
+        exit 0
+        ;;
+esac
+require_cluster_credentials
 echo "cluster-deploy-runner: forge main moved $LAST -> $HEAD; building"
 
 # THE PUSH LOGIN IS THE BROKER'S, AND IT IS THERE BEFORE ANYTHING IS
@@ -541,6 +560,20 @@ SOURCE_NS=$("$REPO/infra/cluster/render-instance.sh" --source)
 # The source instance's row — its name and its tenant source — read
 # off the same list every other instance is read from.
 SOURCE_NAME=""; SOURCE_TENANT_REPO=""; SOURCE_TENANT_REF=""; SOURCE_TENANT_DIR=""; SOURCE_SITE=""
+# 31d76e37: dev work growth belongs to its exact-plan approval, never to
+# converge. Preserve the current bounded request in the staged PVC only;
+# every Deployment/template byte is unchanged. A dark/denied read aborts,
+# an absent claim keeps the reviewed 40Gi bootstrap, and >64Gi refuses.
+STAGE="preserve dev work volume request"
+$K get pvc boss-dev-work -n boss-dev --ignore-not-found=true -o json --request-timeout=20s \
+    > "$APPLY_DIR/dev-work-claim.json"
+python3 "$REPO/infra/forge/dev-work-volume.py" --render-converge \
+    "$RENDER_DIR/$SOURCE_NS/boss-dev.yaml" "$APPLY_DIR/dev-work-claim.json"
+if [ -s "$APPLY_DIR/dev-work-claim.json" ]; then
+    run_summary_json dev_work_claim "$(cat "$APPLY_DIR/dev-work-claim.json")"
+else
+    run_summary_json dev_work_claim '{"absent":true,"bootstrap":"40Gi"}'
+fi
 # The deposit template is generic; the deployment's existing ConfigMap
 # and CronJob are its authoritative nonsecret inputs (877ad378). Resolve
 # both before image staging or ANY apply. Record immutable read identities
@@ -1293,3 +1326,9 @@ if [ -n "$drift_line" ] && [ "$drift_rc" -eq 0 ]; then
 else
     run_summary_field registry_drift "the phase exited $drift_rc; last said: ${drift_line:-nothing}"
 fi
+
+# Agent publication is a separate purpose after all core convergence checks.
+# Failure refuses agent readiness, and never undoes or blocks BOSS delivery.
+. "$REPO/infra/agent/publication-stage.sh"
+STAGE="agent image publication"
+agent_image_publication_stage "$REPO/infra/agent/publish-image.sh" "$HEAD_FULL" "$CONVERGE_STATE"

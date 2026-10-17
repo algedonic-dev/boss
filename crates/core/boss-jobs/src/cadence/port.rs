@@ -34,6 +34,20 @@ pub trait CadenceRepository: Send + Sync {
     /// The newest firing of `rule`, or `None` if it has never fired.
     async fn last_firing(&self, rule: &str) -> Result<Option<LastFiring>, CadenceError>;
 
+    /// Whole original records in descending (fired_at, firing_id) order.
+    /// Cursor is exclusive; unsupported adapters refuse rather than invent history.
+    async fn firing_history(
+        &self,
+        _rule: &str,
+        _observation_key: Option<&str>,
+        _before: Option<(DateTime<Utc>, String)>,
+        _limit: usize,
+    ) -> Result<Vec<NewFiring>, CadenceError> {
+        Err(CadenceError::Storage(
+            "firing history is unavailable".into(),
+        ))
+    }
+
     /// Claim a firing id. `Ok(true)` means this caller won the window
     /// and must run the verb; `Ok(false)` means someone else already
     /// holds it. Exactly-once rests on the `firing_id` primary key, so

@@ -48,7 +48,10 @@
 //!   `shed` (and `stale_proof`, whose wait a stale car is), `arrivals`,
 //!   `garage`, `receiving`, `marshalling`, `shop_floor`, `publish`;
 //! - `machinery` — the machines standing in each region, and the plant;
-//! - `stuck` — what is stuck, per third.
+//! - `stuck` — what is stuck, per third;
+//! - `automation` — who moved the work out of each region downstream of
+//!   the shop floor, a measure the handler hangs on after [`regions`]
+//!   (backlog 9ca41c08).
 //!
 //! Each file's tests sit beside its code; the rows they build a yard
 //! from are `fixtures`.
@@ -63,6 +66,7 @@ use crate::yard::{ConductorHealth, Reading, YardStatus};
 
 mod alone;
 mod arrivals;
+pub(crate) mod automation;
 mod dock;
 #[cfg(test)]
 mod fixtures;
@@ -89,6 +93,7 @@ pub(crate) use self::arrivals::released_awaiting_repair;
 use self::dock::dock;
 pub(crate) use self::dock::dock_edges;
 use self::garage::garage;
+pub(crate) use self::garage::recorded_review_wait;
 use self::gates::gates;
 pub(crate) use self::judging::{
     Instant, Windows, closed_at, count_split, find_step, meta_instant, opened_at, parse_instant,
@@ -117,8 +122,12 @@ use self::shed::shed;
 pub use self::shed::{SHED_PLACES, ShedPlace, shed_place, shed_station};
 pub use self::shop_floor::run_capacity;
 use self::shop_floor::shop_floor;
-pub use self::stale_proof::{NOT_YET_STARVED_HOURS, PROOF_STALE_HOURS};
-pub(crate) use self::stale_proof::{StaleProof, stale_proof};
+pub use self::stale_proof::{
+    NOT_YET_STARVED_HOURS, PROOF_STALE_HOURS, ProofWaitEvidence, RecordedProofWait,
+};
+pub(crate) use self::stale_proof::{
+    ProofFault, StaleProof, proof_fault, proof_opened_at, recorded_proof_wait, stale_proof,
+};
 pub(crate) use self::stuck::stuck_ids;
 pub use self::stuck::{THIRDS, ThirdStuck, stuck};
 pub use self::track::{
@@ -393,6 +402,8 @@ pub struct Region {
     #[serde(default)]
     pub unit: String,
     pub state: RegionState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waits: Vec<RecordedProofWait>,
     /// One sentence naming why the state is what it is. A verdict must
     /// name what failed (CLAUDE.md §Diagnosis).
     pub why: String,
@@ -525,6 +536,9 @@ pub struct StationReading {
     pub over_limit: bool,
     pub members: Vec<String>,
     pub served: Option<i64>,
+    /// The evaluator's original refusal, kept alongside an unavailable
+    /// count so the map does not discard the diagnosis (a4de1e72).
+    pub flow_blind: Option<crate::station_flow::FlowBlind>,
     pub previous_served: Option<i64>,
     /// When each member opened, where the record holds it — the
     /// marshalling KPI's age (design 62de32ae, decision 9). Keyed by
@@ -534,10 +548,16 @@ pub struct StationReading {
     pub opened: std::collections::BTreeMap<String, Instant>,
 }
 
+/// A separate outcome for each exact pinned protocol read. Missing data
+/// never discards an independently observed row or substitutes today's version.
+pub type PinnedProtocols = std::collections::BTreeMap<(String, i32), Result<WorkflowSpec, String>>;
+
 /// Everything [`regions`] reads, named — the same rows the yard status
 /// is built from, plus the windowed tails the trends need.
 #[derive(Debug, Clone)]
 pub struct RegionInputs<'a> {
+    /// Exact protocol versions of visible internal waits; never today's active row.
+    pub internal_protocols: Option<&'a PinnedProtocols>,
     /// The yard's judgements, built by `yard::build_status_for` from
     /// the same rows.
     pub status: &'a YardStatus,

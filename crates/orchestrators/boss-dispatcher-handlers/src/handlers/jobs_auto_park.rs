@@ -998,6 +998,16 @@ impl Handler for JobsAutoPark {
             &ctx.rule_name,
         )
         .await?;
+        let source = boss_jobs::gate_reservation::source_metadata(
+            gate_run.get("metadata").unwrap_or(&Value::Null),
+        )
+        .map_err(HandlerError::Permanent)?
+        .clone();
+        let gate_run = {
+            let mut projected = gate_run;
+            projected["metadata"] = source;
+            projected
+        };
 
         // A GREEN AFTER A RED AT THE SAME HEAD IS A FLAKE, and this is
         // the one actor that reads every green verdict, so it is where
@@ -1376,6 +1386,130 @@ impl Handler for JobsAutoPark {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn post_launch_raw_drift_cannot_replace_the_original_hold_probe_or_partial_answer() {
+        use axum::{
+            Json, Router,
+            extract::Request,
+            http::{Method, StatusCode},
+            response::IntoResponse,
+        };
+        let source = json!({"branch":"fix/x","sha":"deadbeef","park_summary":"original work",
+            "park_excludes":"original exclusions","park_test":"actual original tests","park_verified":"original observations",
+            "park_probe":"printf original-proof","park_expect":"original-proof","park_proof_event":"proof.original",
+            "park_partial_item":"11111111-1111-4111-8111-111111111111","hold":"original required review",
+            "agent_run":"22222222-2222-4222-8222-222222222222","worktree":"/scratch/original"});
+        let envelope = serde_json::to_value(boss_jobs::gate_reservation::Submission {
+            contract_version: 1,
+            command: uuid::Uuid::new_v4(),
+            submitted_by: "agent:fixture".into(),
+            supervisor: "automation:train-conductor".into(),
+            intent: boss_jobs::gate_reservation::LaunchIntent {
+                contract_version: 1,
+                packet: "gate-fixture".into(),
+                namespace: "fixture".into(),
+                name: "fixture-retained-job".into(),
+                head: "deadbeef".into(),
+                mode: "full".into(),
+                transition_generation: None,
+                file_id: "fixture-file".into(),
+                sha256: "a".repeat(64),
+                size_bytes: 1,
+            },
+            source: source.as_object().unwrap().clone(),
+        })
+        .unwrap();
+        let mut metadata = source.clone();
+        metadata["gate_submission"] = envelope.clone();
+        metadata["_immutable_metadata"] = json!({"gate_submission":envelope});
+        metadata["gate_launch_observation"] =
+            json!({"uid":"native-observed-before-drift","request_sha256":"frozen"});
+        metadata["park_summary"] = json!("later raw text");
+        metadata["park_probe"] = json!("printf wrong-proof");
+        metadata["park_expect"] = json!("wrong-proof");
+        metadata["hold"] = Value::Null;
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("park_partial_item");
+        metadata["park_backlog_item"] = json!("33333333-3333-4333-8333-333333333333");
+        let gate =
+            json!({"id":"gate-fixture","kind":"gate-run","status":"closed","metadata":metadata});
+        let car = json!({"id":"car-fixture","kind":"ship-a-change","status":"open","metadata":{"branch":"fix/x"},
+            "steps":[{"id":"review-fixture","spec_slug":"review","status":"ready","metadata":{}}]});
+        type Writes = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+        let writes: Writes = Arc::default();
+        let retained = writes.clone();
+        let app = Router::new().fallback(move |request: Request| {
+            let (gate, car, writes) = (gate.clone(), car.clone(), retained.clone());
+            async move {
+                let path = request.uri().path().to_string();
+                let query = request.uri().query().unwrap_or_default().to_string();
+                if request.method() == Method::GET {
+                    return if path == "/api/jobs/gate-fixture" {
+                        Json(gate).into_response()
+                    } else if path == "/api/jobs" {
+                        Json(if query.contains("status=closed") {
+                            json!({"data":[],"total":0})
+                        } else {
+                            json!({"data":[car],"total":1})
+                        })
+                        .into_response()
+                    } else {
+                        Json(json!({"id":"item","kind":"backlog-item","steps":[]})).into_response()
+                    };
+                }
+                let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                writes.lock().unwrap().push((path, body));
+                StatusCode::NO_CONTENT.into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let handler = JobsAutoPark::new(
+            base,
+            Arc::new(boss_core::platform_owner::Fixed("emp-owner".into())),
+        );
+        let ctx = InvocationContext {
+            rule_name: "jobs.auto-park".into(),
+            triggering_event_id: "evt-original-green".into(),
+            triggering_topic: "step.done.gate-verdict".into(),
+            event_timestamp: None,
+            event_payload: json!({"job_id":"gate-fixture","step_id":"verdict","kind":"gate-verdict","metadata":green_step_meta()}),
+        };
+        let result = handler.invoke(&[], &ctx).await;
+        server.abort();
+        result.unwrap();
+        let writes = writes.lock().unwrap();
+        eprintln!(
+            "actual post-launch auto-park writes {}",
+            serde_json::to_string(&*writes).unwrap()
+        );
+        let hold = writes
+            .iter()
+            .find(|(path, _)| path == "/api/jobs/car-fixture/steps/review-fixture/metadata")
+            .map(|(_, body)| body);
+        assert_eq!(
+            hold.and_then(|body| body.get("hold")),
+            Some(&json!("original required review"))
+        );
+        let patch = &writes
+            .iter()
+            .find(|(path, _)| path == "/api/jobs/car-fixture/metadata")
+            .unwrap()
+            .1;
+        assert_eq!(patch["proof_probe"], source["park_probe"]);
+        assert_eq!(patch["proof_expect"], source["park_expect"]);
+        assert_eq!(patch[car::PARTIAL_ITEM], source["park_partial_item"]);
+        assert_eq!(patch["agent_run"], source["agent_run"]);
+        assert!(patch.get(car::BACKLOG_ITEM).is_none_or(Value::is_null));
+        assert_eq!(patch["regate_receipt"], green_step_meta()["receipt"]);
+    }
 
     #[test]
     fn refresh_reconciles_a_later_partial_answer_without_losing_the_receipt() {

@@ -61,6 +61,53 @@ The explicit volume-plan reader opts in so its plan bytes remain apart
 from live-space diagnostics and its printed hash (backlog f3a09e07,
 parent 53c8cb72).
 
+The fixed dev-work planner keeps that same stream bound (1200f7a7).
+When its complete native gzip envelope is larger than 90,000 bytes, it
+attaches the originals to its own ops-request through `boss attach`,
+which verifies the stored bytes by reading them back. Stderr then holds
+one small `attached-native-v1` reference: request id, ordered file ids,
+counts and SHA-256 hashes. Each part is at most 1 MiB, the complete
+envelope at most 8 MiB, and decoded originals at most 32 MiB. It publishes
+no plan unless this record finishes; a failed attachment remains a
+refusal, with protected originals and uploader diagnostics retained on
+the forge under `/var/lib/boss/dev-work-evidence`. These attachments
+record evidence; they grant no resize authority. The actuator rides the
+same carrier: it patches only while the carrier still holds a readback
+and spreads its readbacks across the wait inside that bound (31d76e37).
+It refuses before writing unless the patch's own record and a readback
+both still fit. Once the patch is sent, every refusal reads `request
+stands; patch issued` and carries the receipt when one was proven, and
+over-bound originals are written under the forge directory above before
+the carrier refuses them (review b9075eb9).
+
+Save the complete ops-request JSON, and download each listed file through
+the existing `/api/files/<file_id>` reader into a local directory, naming
+each file by its id, then run:
+
+```
+python3 infra/forge/dev-work-volume.py --decode-evidence ops-request.json downloaded-parts <ops-request-uuid>
+```
+
+This offline consumer first verifies the actual closed, non-simulated
+forge planner request, its completed execute step and exit, and both
+complete original carrier stream counts and digests. It then verifies
+the one evidence document, ordered parts, entire compressed envelope,
+one bounded gzip member, request binding and every original native
+stdout/stderr count and digest. The result includes complete records,
+the refusal diagnostic and the verified carrier exit. A failed native
+plan remains diagnostic evidence with `plan_success=false`. An exit-zero
+proposal also needs its exact stdout hash in stderr and no failed native
+observation. A standalone reference is still readable but is marked
+`reference-only; ops carrier not verified` and never claims plan success.
+Missing, changed, partial, replayed or oversized evidence refuses.
+The offline packet parser reads at most 1 MiB and each carrier stream
+at most 128 KiB; these consumer safety bounds do not change the runner's
+capture policy.
+Decoder success establishes byte integrity, not resize authority.
+Neither the historical
+truncated request nor its hidden original refusal is recovered by this
+repair.
+
 ## Discovered remedies
 
 An approval verb may declare `discovery_remedies` with `finding_class`,

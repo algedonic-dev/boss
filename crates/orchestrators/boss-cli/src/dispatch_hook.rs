@@ -360,7 +360,7 @@ pub(crate) enum Outcome {
 /// through. `session` is the work-session packet, when the hook has one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn from_hook_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     repo: &Path,
     input: &Value,

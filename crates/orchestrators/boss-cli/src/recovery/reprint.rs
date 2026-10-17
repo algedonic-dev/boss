@@ -699,7 +699,7 @@ async fn one_pdf_on_the_step(
     // the content port refuses an unstamped `x-boss-user` once its gate
     // enforces, and this verb is a new sender, so it takes the door
     // every new one takes rather than joining the NOT_YET list.
-    let http = boss_core::machine_token::Client::build(reqwest::Client::builder())
+    let http = crate::sor_client::machine_client_with(reqwest::Client::builder())
         .context("a client for the file store")?;
     let list_url = format!(
         "{base}/api/files?target_kind={}&target_id={}",

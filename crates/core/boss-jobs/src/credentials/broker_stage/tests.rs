@@ -651,7 +651,7 @@ fn the_cluster_key_set_needs_its_pod_identity_and_its_trust_root_and_names_neith
 
 /// A listener that answers one connection with a perfectly good key set
 /// in plain HTTP, and hands back every byte the client sent it.
-fn plain_key_server() -> (u16, std::thread::JoinHandle<Vec<u8>>) {
+fn plain_key_server() -> (u16, std::thread::JoinHandle<std::io::Result<Vec<u8>>>) {
     use std::io::{Read as _, Write as _};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -662,14 +662,14 @@ fn plain_key_server() -> (u16, std::thread::JoinHandle<Vec<u8>>) {
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         let mut heard = vec![0u8; 16 * 1024];
-        let n = stream.read(&mut heard).unwrap_or(0);
+        let n = stream.read(&mut heard)?;
         heard.truncate(n);
         let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
             body.len()
         );
-        heard
+        Ok(heard)
     });
     (port, server)
 }
@@ -692,8 +692,14 @@ fn the_pod_token_never_crosses_a_connection_that_did_not_verify() {
         .err()
         .expect("a server the cluster CA did not certify holds no key set");
     assert!(!why.contains(POD_TOKEN), "{why}");
-    let heard = server.join().unwrap();
-    assert!(!heard.is_empty(), "the client dialled, and spoke TLS first");
+    let heard = server
+        .join()
+        .unwrap()
+        .unwrap_or_else(|error| panic!("fixture read failed: {error}; client refusal: {why}"));
+    assert!(
+        !heard.is_empty(),
+        "the client dialled, and spoke TLS first; client refusal: {why}"
+    );
     let heard = String::from_utf8_lossy(&heard).to_ascii_lowercase();
     assert!(
         !heard.contains(&POD_TOKEN.to_ascii_lowercase()) && !heard.contains("authorization"),

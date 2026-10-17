@@ -183,6 +183,34 @@ fn a_refresh_makes_a_whole_generation_and_then_names_it() {
 }
 
 #[test]
+fn a_publication_read_observes_the_serving_repository_without_refreshing_the_generation() {
+    let h = Host::new("publication-read");
+    let one = h.head();
+    assert_eq!(h.refresh().0, 0);
+    let generations = h.generations();
+    let two = h.land("publication.md");
+    let (rc, out) = h.run(&["read-main"]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(out, format!("{two}\trefs/heads/main\n"));
+    assert_eq!(h.link("current"), format!("gen/{one}"));
+    assert_eq!(h.generations(), generations);
+    assert_eq!(
+        git(
+            &h.tree.join("repo.git"),
+            &["rev-parse", "refs/boss/accepted"]
+        ),
+        one
+    );
+    std::fs::rename(&h.forge, h.dir.join("unavailable.git")).unwrap();
+    let (rc, out) = h.run(&["read-main"]);
+    assert_ne!(
+        rc, 0,
+        "a missing serving repository is unread, never a current-head answer: {out}"
+    );
+    assert_eq!(h.link("current"), format!("gen/{one}"));
+}
+
+#[test]
 fn a_fast_forward_moves_current_and_only_named_generations_stay() {
     let h = Host::new("ff");
     let one = h.head();

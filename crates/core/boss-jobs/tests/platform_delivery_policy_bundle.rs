@@ -95,13 +95,21 @@ async fn every_bundled_policy_is_publishable_at_its_declared_version() {
         .expect("the conductor's read")
         .expect("the published policy is served active");
     assert_eq!(
+        served
+            .channels
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the reviewed activation must publish enabled lighter channels"
+    );
+    assert_eq!(
         (
             served.version,
             served.ci_host_floor_gb,
             served.gate_max_concurrent,
             served.consist_budget_secs
         ),
-        (7, 40, 3, 120),
+        (9, 40, 3, 120),
         "the row the conductor reads is the row the bundle declares"
     );
 }

@@ -295,14 +295,27 @@ impl JobsApiAlarms {
     }
 }
 
+fn jobs_unreachable(error: reqwest::Error) -> String {
+    let cause = if error.is_timeout() {
+        "request timed out"
+    } else if error.is_connect() {
+        "connection failed"
+    } else {
+        "request failed"
+    };
+    // Keep the transport's cause chain, excluding the internal URL that
+    // must not enter the public alarm. A generic "unreachable" hid the
+    // distinction on gate873; the original request bound is unchanged.
+    format!("jobs unreachable: {cause} ({:?})", error.without_url())
+}
+
 #[async_trait]
 impl AlarmFiling for JobsApiAlarms {
     async fn open_finding_keys(&self) -> Result<BTreeSet<String>, String> {
-        // Fixed text on failure: reqwest's errors name the internal URL.
         let resp = crate::passkey::sign_as_gateway(self.http.get(dedup_url(&self.jobs_base)))
             .send()
             .await
-            .map_err(|_| "jobs unreachable".to_string())?;
+            .map_err(jobs_unreachable)?;
         if !resp.status().is_success() {
             return Err(format!("listing open packets answered {}", resp.status()));
         }
@@ -318,7 +331,7 @@ impl AlarmFiling for JobsApiAlarms {
             .json(body)
             .send()
             .await
-            .map_err(|_| "jobs unreachable — the alarm was not filed".to_string())?;
+            .map_err(|error| format!("{} — the alarm was not filed", jobs_unreachable(error)))?;
         if resp.status().is_success() {
             Ok(())
         } else {
@@ -613,6 +626,30 @@ pub(crate) mod tests {
                 "signed as the gateway"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn transport_refusals_name_the_cause_without_disclosing_the_internal_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new()
+            .fallback(|| async { std::future::pending::<axum::http::StatusCode>().await });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let adapter = JobsApiAlarms::new(base.clone()).unwrap();
+        let timeout = adapter.open_finding_keys().await.unwrap_err();
+        assert!(timeout.contains("request timed out"), "{timeout}");
+        assert!(!timeout.contains(&base), "{timeout}");
+        server.abort();
+
+        let dark = boss_testing::dark_port();
+        let adapter = JobsApiAlarms::new(dark.base.clone()).unwrap();
+        let refused = adapter
+            .file(&json!({"kind": "backlog-item"}))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("connection failed"), "{refused}");
+        assert!(refused.contains("the alarm was not filed"), "{refused}");
+        assert!(!refused.contains(&dark.base), "{refused}");
     }
 
     /// Review F3: a refusal is an error on both doors — a non-2xx filing

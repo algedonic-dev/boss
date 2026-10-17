@@ -53,6 +53,7 @@ use boss_dispatcher_handlers::handlers::{
     jobs_flight_overdue::JobsFlightOverdue,
     jobs_receipt_overdue::JobsReceiptOverdue,
     jobs_reclaim_abandoned_step::JobsReclaimAbandonedStep,
+    jobs_release_on_review::JobsReleaseOnReview,
     jobs_retract_matching::JobsRetractMatching,
     jobs_run_car_probes::JobsRunCarProbes,
     jobs_subjob_resolve::JobsSubjobResolve,
@@ -586,6 +587,12 @@ async fn main() -> Result<()> {
             // step, the value that means dead, the edge key and the
             // second bound all ride the rule row.
             handlers.register(JobsReclaimAbandonedStep::new(cfg.jobs_api_url.clone()));
+            // A held car's dispatched reviewer recording RELEASE asks the
+            // release door as the rule (design 393bdef6 Q1, backlog
+            // 0cfc57e6): the door's judge decides, and a refusal is
+            // recorded on the car's review step. Inert until the rule
+            // on jobs.job.updated names it.
+            handlers.register(JobsReleaseOnReview::new(cfg.jobs_api_url.clone()));
             // System-completes zero-duration, no-role markers
             // (trigger / outcome / milestone) the moment they go
             // Ready, so a Job flows past its structural checkpoints

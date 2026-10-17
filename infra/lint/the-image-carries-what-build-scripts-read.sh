@@ -70,7 +70,7 @@ build_stage_copies() {
         END { if (cargo) printf "%s", buf }
     ' "$DOCKERFILE"
 }
-BUILD_COPIES=$(build_stage_copies)
+BUILD_COPIES=$(build_stage_copies) || exit 3
 if [ -z "$BUILD_COPIES" ]; then
     echo "$NAME: no stage of $DOCKERFILE both runs cargo and COPYs anything — the build stage has moved and this lint no longer knows where rustc reads from" >&2
     exit 1
@@ -78,17 +78,35 @@ fi
 
 # Literal out-of-crate reaches, from both mechanisms, resolved to
 # repo-relative paths.
-reaches() {
-    {
-        find crates -name build.rs -print0 2>/dev/null \
-          | xargs -0 grep -ho '"\(\.\./\)\+[A-Za-z0-9_./-]*"' 2>/dev/null
-        grep -rho 'include_\(str\|bytes\)!("\(\.\./\)\+[A-Za-z0-9_./-]*")' crates 2>/dev/null \
-          | sed 's/.*("//; s/")$/"/; s/"$//'
-    } | tr -d '"' | sed 's|^\(\.\./\)*||' | grep -E '^[a-z]' | sort -u
+# grep's no-match status is an empty result; a failed reader is not.
+# Keep its diagnostic and propagate it before any clean verdict (c0d2e2aa).
+matches() {
+    local status
+    grep "$@"
+    status=$?
+    case "$status" in
+        0|1) return 0 ;;
+        *) return "$status" ;;
+    esac
 }
 
-sources=$(( $(find crates -name build.rs 2>/dev/null | wc -l) \
-          + $(grep -rl 'include_str!\|include_bytes!' crates 2>/dev/null | wc -l) ))
+reaches() {
+    {
+        find crates -name build.rs -print0 \
+          | while IFS= read -r -d '' source; do
+              matches -ho '"\(\.\./\)\+[A-Za-z0-9_./-]*"' "$source" || exit 3
+            done || return 3
+        # rustfmt puts long include literals on the next line. Scan a
+        # whole Rust file, not individual lines (c0d2e2aa, 2026-10-14),
+        # including whitespace and the optional trailing argument comma.
+        matches -Pzrho --include='*.rs' 'include_(?:str|bytes)!\s*\(\s*"(?:\.\./)+[A-Za-z0-9_./-]*"\s*,?\s*\)' crates \
+          | tr -d '\n' | tr '\0' '\n' | sed 's/^[^"]*"//; s/".*$//' || return 3
+    } | tr -d '"' | sed 's|^\(\.\./\)*||' | matches -E '^[a-z]' | sort -u
+}
+
+build_sources=$(find crates -name build.rs | wc -l) || exit 3
+include_sources=$(matches -rl 'include_str!\|include_bytes!' crates | wc -l) || exit 3
+sources=$((build_sources + include_sources))
 if [ "$sources" -eq 0 ]; then
     echo "$NAME: found no build.rs and no include_str! under crates/ — this lint refuses to pass by matching nothing" >&2
     exit 1
@@ -96,7 +114,8 @@ fi
 
 fail=0
 carried=0
-for path in $(reaches); do
+paths=$(reaches) || { echo "$NAME: build-time path reader failed; coverage is unknown" >&2; exit 3; }
+for path in $paths; do
     [ -e "$path" ] || continue          # not a real file in this tree
     carried=$((carried + 1))
     # The file itself, or ANY ancestor directory, being copied is
@@ -111,6 +130,9 @@ for path in $(reaches); do
         if grep -qE "^COPY[[:space:]]+${probe}[[:space:]]" <<< "$BUILD_COPIES"; then
             covered=1
             break
+        else
+            status=$?
+            [ "$status" -eq 1 ] || { echo "$NAME: COPY reader failed; coverage is unknown" >&2; exit 3; }
         fi
         probe="$(dirname "$probe")"
     done

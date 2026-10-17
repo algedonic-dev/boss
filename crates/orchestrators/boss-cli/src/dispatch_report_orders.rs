@@ -53,7 +53,7 @@ mod tests {
 
     struct Stack {
         base: String,
-        http: boss_core::machine_token::Client,
+        http: crate::machine_http::MachineClient,
         runs: Arc<InMemoryAgentRuns>,
     }
 
@@ -115,7 +115,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Stack {
             base: format!("http://{addr}"),
-            http: boss_dispatcher_handlers::handlers::common::api_client(),
+            http: crate::sor_client::machine_client().unwrap(),
             runs,
         }
     }
@@ -218,40 +218,46 @@ mod tests {
             let run = self.run(id).await;
             let reported = Self::step(&run, "reported");
             assert_eq!(reported["status"], "ready", "the green opens `reported`");
-            JobsCompleteStepFromRecord::with_client(self.http.clone(), &self.base)
-                .invoke(
-                    &rule_args(LANDING),
-                    &InvocationContext {
-                        event_timestamp: None,
-                        rule_name: LANDING.into(),
-                        triggering_event_id: "ev-ready".into(),
-                        triggering_topic: "step.ready.task".into(),
-                        event_payload: json!({
-                            "job_id": id, "step_id": reported["id"], "kind": "task",
-                            "workflow_kind": "agent-run", "spec_slug": "reported",
-                        }),
-                    },
-                )
-                .await
-                .expect("the landing rule fires");
+            JobsCompleteStepFromRecord::with_client(
+                boss_dispatcher_handlers::handlers::common::api_client(),
+                &self.base,
+            )
+            .invoke(
+                &rule_args(LANDING),
+                &InvocationContext {
+                    event_timestamp: None,
+                    rule_name: LANDING.into(),
+                    triggering_event_id: "ev-ready".into(),
+                    triggering_topic: "step.ready.task".into(),
+                    event_payload: json!({
+                        "job_id": id, "step_id": reported["id"], "kind": "task",
+                        "workflow_kind": "agent-run", "spec_slug": "reported",
+                    }),
+                },
+            )
+            .await
+            .expect("the landing rule fires");
         }
 
         /// The hourly tick of the unreported clock, three hours on.
         async fn tick(&self) {
             let at = (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339();
-            JobsAgeOutStep::with_client(self.http.clone(), &self.base)
-                .invoke(
-                    &rule_args(UNREPORTED),
-                    &InvocationContext {
-                        event_timestamp: None,
-                        rule_name: UNREPORTED.into(),
-                        triggering_event_id: "tick-1".into(),
-                        triggering_topic: "schedule".into(),
-                        event_payload: json!({ "_day": &at[..10], "_at": at }),
-                    },
-                )
-                .await
-                .expect("the clock ticks");
+            JobsAgeOutStep::with_client(
+                boss_dispatcher_handlers::handlers::common::api_client(),
+                &self.base,
+            )
+            .invoke(
+                &rule_args(UNREPORTED),
+                &InvocationContext {
+                    event_timestamp: None,
+                    rule_name: UNREPORTED.into(),
+                    triggering_event_id: "tick-1".into(),
+                    triggering_topic: "schedule".into(),
+                    event_payload: json!({ "_day": &at[..10], "_at": at }),
+                },
+            )
+            .await
+            .expect("the clock ticks");
         }
 
         async fn report(&self, id: &str, report: &Report) -> anyhow::Result<()> {

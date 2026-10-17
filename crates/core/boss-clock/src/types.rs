@@ -120,6 +120,12 @@ impl SimClockParams {
     /// Pure function of `self` + wall-clock now; safe to call on
     /// every request.
     pub fn now(&self) -> ClockNow {
+        self.at(Utc::now())
+    }
+
+    /// Evaluate the original formula at an explicit wall instant.
+    /// Historical membership uses this same definition as live reads.
+    pub fn at(&self, wall_instant: DateTime<Utc>) -> ClockNow {
         // While paused, sim-time is frozen at the instant the pause
         // began: clamp the wall reference to `paused_at`. Computing
         // the frozen instant directly from `paused_at` (rather than
@@ -129,7 +135,7 @@ impl SimClockParams {
         // under high warp factors as the floats rounded independently.
         let wall_now = match (self.paused, self.paused_at) {
             (true, Some(paused_at)) => paused_at,
-            _ => Utc::now(),
+            _ => wall_instant,
         };
         let wall_elapsed_secs =
             (wall_now - self.wall_anchor).num_milliseconds().max(0) as f64 / 1000.0;

@@ -500,7 +500,7 @@ pub(crate) fn judge_successor(twin: &Value, successor: &Value) -> Result<String,
 // merged`; every read that fails is a refusal, never a default.
 // ----------------------------------------------------------------------
 
-fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     let out = crate::git_auth::command()
         .arg("-C")
         .arg(repo)
@@ -680,7 +680,7 @@ fn with_differences(repo: &Path, judged: Vec<Carried>) -> Result<Vec<Carried>, S
 
 /// The forge's main, with its objects here — fetched once if the clone
 /// lags. The authority is the forge, read live (see `boss merged`).
-fn forge_main(repo: &Path) -> Result<String> {
+pub(crate) fn forge_main(repo: &Path) -> Result<String> {
     let line = git(repo, &["ls-remote", "origin", "refs/heads/main"]).map_err(|e| anyhow!(e))?;
     let main = line
         .split_whitespace()
@@ -948,7 +948,7 @@ fn evidence_of(r: &Retirement) -> &str {
     }
 }
 
-pub(crate) async fn read(http: &boss_core::machine_token::Client, id: &str) -> Result<Value> {
+pub(crate) async fn read(http: &crate::machine_http::MachineClient, id: &str) -> Result<Value> {
     read_via(&Http(http), id).await
 }
 
@@ -970,7 +970,7 @@ pub(crate) trait Door: Send + Sync {
 
 /// The operator's door: `crate::sor_client::api`, signed as the actor running
 /// the verb.
-pub(crate) struct Http<'a>(pub(crate) &'a boss_core::machine_token::Client);
+pub(crate) struct Http<'a>(pub(crate) &'a crate::machine_http::MachineClient);
 
 #[async_trait::async_trait]
 impl Door for Http<'_> {
@@ -1010,7 +1010,7 @@ pub(crate) async fn read_via(door: &dyn Door, id: &str) -> Result<Value> {
 /// Shared with `boss prove --disproved` (08664157), whose writes are the
 /// same three in the same order; `verb` is who prints the confirmation.
 pub(crate) async fn apply(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     id: &str,
     car_json: &Value,
     w: &car_retire::RetireWrites,

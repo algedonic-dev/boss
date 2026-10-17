@@ -871,9 +871,11 @@ crates_from_paths() {
 # check inheriting the gate's stdin), so the scanner must not commit it.
 # A fixed file argument closes it portably, where `xargs -r` would not
 # (BSD xargs has no -r).
+TREE_WIDE_FILE_PATTERN='^//! tree-wide pin( —|$)'
+
 file_input_index() {
     local path crate
-    find crates -name '*.rs' -print0 2>/dev/null | xargs -0 awk '
+    find crates -name '*.rs' -print0 2>/dev/null | xargs -0 awk -v global_marker="$TREE_WIDE_FILE_PATTERN" '
         # `a/b/../c` -> `a/c`, iteratively, with no realpath: GNU
         # realpath --relative-to does not exist on a Mac, and the Mac
         # gate and the runner must derive the same scope.
@@ -886,6 +888,7 @@ file_input_index() {
         }
         FNR == 1 {
             crate = ""
+            global_target = 0
             n = split(FILENAME, p, "/")
             if (n >= 4 && p[1] == "crates") {
                 crate = p[3]
@@ -896,6 +899,13 @@ file_input_index() {
             }
         }
         crate == "" { next }
+        # A declared top-level integration target already runs WHOLE
+        # in run_tree_wide_pins, even in lints-only auto mode. Making
+        # its inputs select the crate runs unrelated tests as well
+        # (271a2f6e: a decision-record fold paid 34 gate minutes).
+        # A function-level marker in src/ cannot exempt its module.
+        $0 ~ global_marker && intests && n == 5 { global_target = 1 }
+        global_target { next }
         /^[[:space:]]*\/\// { next }
         {
             rest = $0
@@ -1191,7 +1201,7 @@ path_shapes() {
 tree_wide_pins() {
     local f crate dir rel sel
     {
-        grep -lE '^//! tree-wide pin( —|$)' crates/*/*/tests/*.rs 2>/dev/null \
+        grep -lE "$TREE_WIDE_FILE_PATTERN" crates/*/*/tests/*.rs 2>/dev/null \
             | sed -n 's|^crates/[^/]*/\([^/]*\)/tests/\([^/]*\)\.rs$|\1 test:\2 \2|p'
         grep -rlE --include='*.rs' '^[[:space:]]*// tree-wide pin( —|$)' crates/*/*/src 2>/dev/null \
             | while read -r f; do
@@ -3331,6 +3341,29 @@ if [ "$LINT" -eq 1 ]; then
         echo ""
         echo "pre-flight: no crate implied by the tree — skipping clippy (nothing to compile)"
     fi
+    # THE TREE-WIDE PINS, EVERY ONE, WHATEVER THE TREE IMPLIES (backlog
+    # 2f0c722a). Protocol-retro adc3812b measured 19 of 61 failed W41
+    # car gates (31%) red on a standing source-scan pin the builder's
+    # change broke — `an_executable_is_written_by_write_exec`, the
+    # machine-token sender pins, `every_door_is_a_declared_control` —
+    # each answerable here in seconds with no database, each paid for
+    # with a full car gate and a re-gate. The set is the one every
+    # scoped gate owes, derived from the pins' own `tree-wide pin`
+    # headers by `tree_wide_pins` and run by the same
+    # `run_tree_wide_pins`, so no list of pins lives here (§9a) and the
+    # pre-flight runs the gate's own invocation. They are read-only
+    # scans and open no test database — held so by
+    # the_preflight_runs_the_tree_wide_pins.rs — so this stays safe on a
+    # pod whose 127.0.0.1 may be a forward to production.
+    TREE_WIDE=()
+    while read -r tw_crate tw_sel tw_test; do
+        [ -n "$tw_crate" ] && TREE_WIDE+=("${tw_crate} ${tw_sel} ${tw_test}")
+    done < <(tree_wide_pins)
+    if [ "${#TREE_WIDE[@]}" -gt 0 ]; then
+        echo ""
+        echo "pre-flight: ${#TREE_WIDE[@]} tree-wide pin(s), the set every scoped gate runs"
+        check "tree-wide pins" run_tree_wide_pins
+    fi
     echo ""
     note_uncommitted_modifications
     if [ "${#FAILED[@]}" -gt 0 ]; then
@@ -3428,11 +3461,13 @@ if [ "${#TREE_WIDE[@]}" -gt 0 ]; then
     check "tree-wide pins" run_tree_wide_pins
 fi
 
-# THE WEB SUITE. CI's web job runs typecheck + unit + build + the
-# mocked Playwright suite; before this gate ran svelte-check alone, so
-# a car could pass here and red the train on a check it never saw
-# (§9a: this block and ci.yml's web job are two copies of one
-# definition, kept in sync).
+# THE WEB SUITE. CI's web job runs unit + build + the mocked
+# Playwright suite; before this gate ran svelte-check alone, so a car
+# could pass here and red the train on a check it never saw (§9a: this
+# block and ci.yml's web job are two copies of one definition, kept in
+# sync). CI no longer runs the typecheck: svelte-check below runs on
+# every tree, the train's --auto gate included (backlog 81ee98b3; pinned
+# by gate_sh.rs the_forge_web_job_runs_only_what_the_train_gate_may_skip).
 #
 # FULL MODE RUNS IT UNCONDITIONALLY, matching CI — the full gate is the
 # authoritative one and must not be narrower than the train it feeds.
@@ -3459,10 +3494,11 @@ if [ "$AUTO" -eq 0 ] || [ "$(web_touched)" = "yes" ]; then
     # A clean install FIRST, with puppeteer's postinstall skipped. bun
     # aborts the WHOLE install on a failed postinstall, and puppeteer's
     # browser download is the flaky one — the exact reason ci.yml's web
-    # job and svelte-check.sh both set PUPPETEER_SKIP_DOWNLOAD. The
-    # gate-runner's run.sh does a best-effort warm-up install (|| true),
-    # so the suite cannot trust node_modules to be complete and does its
-    # own. Cached after the warm-up, so this is seconds, not minutes.
+    # job and svelte-check.sh both set PUPPETEER_SKIP_DOWNLOAD. This is
+    # the install the web checks run on, and the web-suite check below
+    # is the one build: the gate-runner's silenced warm-up of both is
+    # gone (backlog efd7f75c), so what they take and whether they fail
+    # are on the receipt (the_gate_builds_the_web_app_once.rs).
     check "web install" bash -c 'cd apps/web && PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile'
     # Resolve controls in the same toolchain/environment; runtime output remains
     # a separate observation rather than a configured worker count posing as one.

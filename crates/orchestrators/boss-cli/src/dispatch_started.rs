@@ -74,7 +74,7 @@ fn own_ready_nomination(job: &Value, actor: &str) -> Option<String> {
 }
 
 pub(crate) async fn started_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     base: &str,
     run: &str,
     actor: &str,

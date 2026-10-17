@@ -33,6 +33,9 @@ pub(crate) enum Work {
     /// Walk the dock and launch the re-gates it owes while the track is
     /// clear — `Conductor::refresh`.
     Refresh,
+    GateQueue,
+    /// Only the separately authorized retained assessment, never compute.
+    DrainRecoveryAssessments,
 }
 
 /// What each phase of the standing loop does, in order.
@@ -48,12 +51,27 @@ pub(crate) enum Work {
 ///
 /// `Preflight` returns before the table is read; `Cancel` is an
 /// operator's verb on one named train and is dispatched by name.
+/// Retained recovery rides the active reconcile cadence too (170440d8):
+/// its earlier Refresh-only entry stopped running when that cadence was
+/// retired. Keep ordinary diagnostic/native admission inside Refresh's
+/// clear-track fence; only evidence recovery follows train work here.
 pub(crate) fn loop_work(phase: &Phase) -> &'static [Work] {
     match phase {
-        Phase::Reconcile => &[Work::DrainPublishRequests, Work::Reconcile],
-        Phase::Board => &[Work::Board],
-        Phase::Run => &[Work::DrainPublishRequests, Work::Reconcile, Work::Board],
-        Phase::Refresh => &[Work::Refresh],
+        Phase::Reconcile => &[
+            Work::DrainPublishRequests,
+            Work::Reconcile,
+            Work::DrainRecoveryAssessments,
+            Work::GateQueue,
+        ],
+        Phase::Board => &[Work::Board, Work::GateQueue],
+        Phase::Run => &[
+            Work::DrainPublishRequests,
+            Work::Reconcile,
+            Work::Board,
+            Work::DrainRecoveryAssessments,
+            Work::GateQueue,
+        ],
+        Phase::Refresh => &[Work::Refresh, Work::GateQueue],
         Phase::Preflight | Phase::Cancel { .. } => &[],
     }
 }
@@ -329,11 +347,44 @@ pub async fn run(phase: Phase, dry: bool, now: DateTime<Utc>) -> Result<()> {
         return conductor.cancel(handle, reason).await;
     }
     for work in loop_work(&phase) {
-        match work {
-            Work::DrainPublishRequests => drain_publish_requests(&conductor, dry, now).await,
-            Work::Reconcile => conductor.reconcile(now).await?,
-            Work::Board => conductor.board(now).await?,
-            Work::Refresh => conductor.refresh().await?,
+        execute_work(&conductor, *work, dry, now).await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn execute_work(
+    conductor: &Conductor,
+    work: Work,
+    dry: bool,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    match work {
+        Work::DrainPublishRequests => drain_publish_requests(conductor, dry, now).await,
+        Work::Reconcile => conductor.reconcile(now).await?,
+        Work::Board => conductor.board(now).await?,
+        Work::Refresh => conductor.refresh().await?,
+        Work::DrainRecoveryAssessments => drain_recovery_assessments(conductor).await,
+        Work::GateQueue => {
+            let observation = if dry {
+                json!({"contract_version":1,"state":"unknown","reason":"dry run did not execute resident supervision"})
+            } else {
+                crate::gate::supervise_queue(
+                    &conductor.http,
+                    &conductor.cfg.jobs,
+                    std::path::Path::new(&conductor.cfg.clone),
+                    &conductor.cfg.gate_namespace,
+                    usize::try_from(conductor.policy.gate_max_concurrent)?,
+                    now,
+                )
+                .await
+            };
+            if let Err(error) =
+                crate::cadence::observations::handback(&json!({"gate_queue":observation}))
+            {
+                log(format!(
+                    "resident gate supervision handback failed; this firing remains UNKNOWN: {error:#}"
+                ));
+            }
         }
     }
     Ok(())
@@ -357,9 +408,87 @@ async fn drain_publish_requests(conductor: &Conductor, dry: bool, now: DateTime<
     }
 }
 
+async fn drain_recovery_assessments(conductor: &Conductor) {
+    if let Err(error) = super::diagnostic_adapter::drain_recovery_assessments(conductor).await {
+        log(format!(
+            "diagnostic recovery UNKNOWN (reconcile stands): {error:#}; assessment remains pending, no diagnostic pass recorded"
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_reconcile_cadence_reaches_evidence_recovery_without_refresh_or_boarding() {
+        let text = std::fs::read_to_string(
+            boss_testing::repo_root().join("infra/platform/cadence/train-reconcile.toml"),
+        )
+        .unwrap();
+        let bundle: toml::Value = toml::from_str(&text).unwrap();
+        let rules = bundle["cadence_rule"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["status"].as_str(), Some("active"));
+        assert_eq!(rules[0]["verb"].as_str(), Some("reconcile"));
+        for phase in [Phase::Reconcile, Phase::Run] {
+            let work = loop_work(&phase);
+            let train = work.iter().position(|w| *w == Work::Reconcile).unwrap();
+            let recovery = work
+                .iter()
+                .position(|w| *w == Work::DrainRecoveryAssessments)
+                .unwrap();
+            let queue = work.iter().position(|w| *w == Work::GateQueue).unwrap();
+            assert!(train < recovery && recovery < queue);
+            assert_eq!(
+                work.iter()
+                    .filter(|w| **w == Work::DrainRecoveryAssessments)
+                    .count(),
+                1
+            );
+        }
+        assert!(!loop_work(&Phase::Reconcile).contains(&Work::Board));
+        assert!(!loop_work(&Phase::Reconcile).contains(&Work::Refresh));
+    }
+
+    #[test]
+    fn supervision_reader_and_actual_entry_verbs_are_the_same_roster() {
+        for (verb, phase) in [
+            ("reconcile", Phase::Reconcile),
+            ("board", Phase::Board),
+            ("run", Phase::Run),
+            ("refresh", Phase::Refresh),
+            ("preflight", Phase::Preflight),
+        ] {
+            assert_eq!(
+                boss_jobs::gate_queue_observation::participates(verb),
+                loop_work(&phase)
+                    .iter()
+                    .any(|work| matches!(work, Work::GateQueue)),
+                "{verb}"
+            );
+        }
+    }
+
+    #[test]
+    fn resident_gate_queue_runs_after_the_existing_priority_work() {
+        for phase in [Phase::Reconcile, Phase::Board, Phase::Run, Phase::Refresh] {
+            let work = loop_work(&phase);
+            assert_eq!(
+                format!("{:?}", work.last().unwrap()),
+                "GateQueue",
+                "every existing standing cadence must service accepted durable requests after train/dock work"
+            );
+        }
+        assert!(loop_work(&Phase::Preflight).is_empty());
+        assert!(
+            loop_work(&Phase::Cancel {
+                handle: "one".into(),
+                reason: "operator judgement".into()
+            })
+            .is_empty()
+        );
+    }
 
     // ---------------------------------------------------------------
     // A cancel that cancelled nothing must not exit 0.
@@ -419,7 +548,10 @@ mod tests {
     /// behind the dock.
     #[test]
     fn a_refresh_walks_the_dock_and_never_waits_for_the_lock() {
-        assert_eq!(loop_work(&Phase::Refresh), &[Work::Refresh]);
+        assert_eq!(
+            loop_work(&Phase::Refresh),
+            &[Work::Refresh, Work::GateQueue]
+        );
         assert_eq!(lock_wait_budget(&Phase::Refresh), Duration::ZERO);
         assert_eq!(contended(&Phase::Refresh), Contended::Covered);
     }
@@ -448,18 +580,29 @@ mod tests {
     fn a_reconcile_tick_drains_publish_requests_before_it_looks_for_cars() {
         assert_eq!(
             loop_work(&Phase::Reconcile),
-            &[Work::DrainPublishRequests, Work::Reconcile],
+            &[
+                Work::DrainPublishRequests,
+                Work::Reconcile,
+                Work::DrainRecoveryAssessments,
+                Work::GateQueue,
+            ],
             "the 10-minute tick must push a filed branch before it reconciles"
         );
         assert_eq!(
             loop_work(&Phase::Run),
-            &[Work::DrainPublishRequests, Work::Reconcile, Work::Board],
+            &[
+                Work::DrainPublishRequests,
+                Work::Reconcile,
+                Work::Board,
+                Work::DrainRecoveryAssessments,
+                Work::GateQueue
+            ],
             "the window still drains first, then reconciles, then boards"
         );
         // A board has its own 60-second retry and must not queue
         // behind a forge push; preflight returns before the table is
         // read; cancel is an operator's verb on one named train.
-        assert_eq!(loop_work(&Phase::Board), &[Work::Board]);
+        assert_eq!(loop_work(&Phase::Board), &[Work::Board, Work::GateQueue]);
         assert!(loop_work(&Phase::Preflight).is_empty());
         let cancel = Phase::Cancel {
             handle: "t".into(),

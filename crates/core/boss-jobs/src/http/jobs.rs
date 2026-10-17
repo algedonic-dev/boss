@@ -35,6 +35,10 @@ pub(super) async fn list_step_types<R: JobsRepository + 'static, B: EventBus + '
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ListJobsQuery {
+    /// Inclusive absolute RFC3339 frontier over any step completion.
+    /// An invalid timestamp is refused by query deserialization; no
+    /// domain-clock or date-only fallback can answer this predicate.
+    step_completed_since: Option<chrono::DateTime<chrono::Utc>>,
     limit: Option<i64>,
     offset: Option<i64>,
     kind: Option<String>,
@@ -387,6 +391,7 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
     };
 
     let filter = JobFilter {
+        step_completed_since: q.step_completed_since,
         kind: q.kind,
         kinds,
         excluded_kinds,
@@ -1000,6 +1005,7 @@ pub(super) async fn jobs_live<R: JobsRepository + 'static, B: EventBus + 'static
 
     // Latest 12 open Jobs as a "what's running right now" feed.
     let filter = JobFilter {
+        step_completed_since: None,
         kind: None,
         kind_prefix: None,
         kinds: None,
@@ -1101,7 +1107,9 @@ fn default_materialize_steps() -> bool {
 /// everything else stays a 500.
 fn persist_error_response(e: impl std::fmt::Display) -> Response {
     let msg = e.to_string();
-    if msg.contains("job edge") && msg.contains("unresolvable") {
+    if msg.starts_with("immutable metadata refused:") {
+        (StatusCode::CONFLICT, msg).into_response()
+    } else if msg.contains("job edge") && msg.contains("unresolvable") {
         (StatusCode::BAD_REQUEST, edge_guidance(msg)).into_response()
     } else {
         (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
@@ -1842,6 +1850,16 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
         }
     }
 
+    if let Some(spec) = kind_spec.as_ref()
+        && let Err(why) = crate::metadata_immutability::validate_protocol(
+            &spec.metadata_schema,
+            &serde_json::json!({}),
+            &job.metadata,
+            None,
+        )
+    {
+        return (StatusCode::CONFLICT, why).into_response();
+    }
     let job_id = job.id;
 
     // Materialize the Workflow's steps BEFORE anything persists. Job
@@ -2666,6 +2684,12 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     }
     job.workflow_version = existing.workflow_version;
 
+    if let Some(refusal) =
+        refuse_immutable_protocol_write(&state, &existing, &job.metadata, None).await
+    {
+        return refusal;
+    }
+
     // The host a declared writer is judged against (review S2).
     if let Some(refusal) = refuse_host_move(&state, &existing, &job.metadata).await {
         return refusal;
@@ -2970,6 +2994,142 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
     CurrentUser(user): CurrentUser,
     Json(patch): Json<serde_json::Value>,
 ) -> Response {
+    patch_job_metadata_inner(state, id, user, patch, None).await
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct ConditionalReceiptQuery {
+    actor: String,
+}
+
+pub(super) async fn conditional_metadata_capability<
+    R: JobsRepository + 'static,
+    B: EventBus + 'static,
+>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    if let Err(refusal) = job_read_scope(&state, &user).await {
+        return refusal;
+    }
+    Json(serde_json::json!({"contract_version":2,"immutable_bindings":1,"pinned_immutable_fields":1,"guarded_bindings":1,"checked_pair_replay":1})).into_response()
+}
+
+/// A detached observer reads the original server timestamp/identity; it
+/// never reissues a conditional command to discover queue acceptance.
+pub(super) async fn read_conditional_metadata_receipt<
+    R: JobsRepository + 'static,
+    B: EventBus + 'static,
+>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Path((id, command)): Path<(String, uuid::Uuid)>,
+    Query(query): Query<ConditionalReceiptQuery>,
+) -> Response {
+    let scope = match job_read_scope(&state, &user).await {
+        Ok(scope) => scope,
+        Err(refusal) => return refusal,
+    };
+    let job = match readable_path_job(&state, &user, &scope, &id).await {
+        Ok(job) => job,
+        Err(refusal) => return refusal,
+    };
+    if command.is_nil() || query.actor.is_empty() || query.actor.len() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "original receipt requires actor and command identity",
+        )
+            .into_response();
+    }
+    match state
+        .jobs
+        .conditional_job_metadata_receipt(&job.id, &query.actor, command)
+        .await
+    {
+        Ok(Some(receipt))
+            if receipt.job_id == job.id
+                && receipt.actor == query.actor
+                && receipt.command.idempotency_key == command =>
+        {
+            Json(receipt).into_response()
+        }
+        Ok(Some(_)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "original receipt identity is inconsistent",
+        )
+            .into_response(),
+        Ok(None) => packet_not_found(),
+        Err(error) => persist_error_response(error),
+    }
+}
+
+pub(super) async fn conditional_job_metadata<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    Path(id): Path<String>,
+    CurrentUser(user): CurrentUser,
+    Json(command): Json<crate::conditional_metadata::Command>,
+) -> Response {
+    if let Err(why) = command.validate() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, why).into_response();
+    }
+    let patch = serde_json::Value::Object(command.patch.clone());
+    patch_job_metadata_inner(state, id, user, patch, Some(command)).await
+}
+
+async fn refuse_immutable_protocol_write<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &JobsApiState<R, B>,
+    existing: &Job,
+    after: &serde_json::Value,
+    command: Option<&crate::conditional_metadata::Command>,
+) -> Option<Response> {
+    let registry = match state.kind_registry.as_ref() {
+        Some(registry) => registry,
+        None if command.is_some_and(|command| {
+            !command.immutable_keys.is_empty() || !command.guarded_keys.is_empty()
+        }) =>
+        {
+            return Some(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "pinned protocol registry is required for metadata bindings",
+                )
+                    .into_response(),
+            );
+        }
+        None => return None,
+    };
+    let spec = match registry
+        .get_version(&existing.kind, existing.workflow_version)
+        .await
+    {
+        Ok(spec) => spec,
+        Err(error) => {
+            return Some(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("pinned metadata contract unavailable: {error}"),
+                )
+                    .into_response(),
+            );
+        }
+    };
+    crate::metadata_immutability::validate_protocol(
+        &spec.metadata_schema,
+        &existing.metadata,
+        after,
+        command,
+    )
+    .err()
+    .map(|why| (StatusCode::CONFLICT, why).into_response())
+}
+
+async fn patch_job_metadata_inner<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: Arc<JobsApiState<R, B>>,
+    id: String,
+    user: boss_policy_client::User,
+    patch: serde_json::Value,
+    conditional: Option<crate::conditional_metadata::Command>,
+) -> Response {
     let job_id = match resolve_path_job_id(&state, &id).await {
         Ok(job_id) => job_id,
         Err(refusal) => return refusal,
@@ -3020,6 +3180,35 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
         return (StatusCode::FORBIDDEN, "job is outside your scope").into_response();
     }
 
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    if let Some(command) = conditional.as_ref() {
+        match state
+            .jobs
+            .conditional_job_metadata_receipt(&job_id, &actor.to_string(), command.idempotency_key)
+            .await
+        {
+            Ok(Some(receipt))
+                if matches!(receipt.contract_version, 1 | 2)
+                    && receipt.job_id == job_id
+                    && receipt.actor == actor.to_string()
+                    && receipt.command == *command =>
+            {
+                return Json(receipt).into_response();
+            }
+            Ok(Some(_)) => {
+                return (
+                    StatusCode::CONFLICT,
+                    "conditional command identity already records different content",
+                )
+                    .into_response();
+            }
+            Ok(None) => {}
+            Err(error) => return persist_error_response(error),
+        }
+    }
+
     // Moving an arm or widening a split onto a version never published
     // is a publish (backlog ce8b7d66), judged on the row as this merge
     // would leave it: null removes, every other key overwrites. The
@@ -3041,6 +3230,16 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
             ..existing.clone()
         }
     };
+    if let Some(refusal) = refuse_immutable_protocol_write(
+        &state,
+        &existing,
+        &as_merged.metadata,
+        conditional.as_ref(),
+    )
+    .await
+    {
+        return refusal;
+    }
     // The host a declared writer is judged against (review S2), judged
     // on the same as-merged row.
     if let Some(refusal) = refuse_host_move(&state, &existing, &as_merged.metadata).await {
@@ -3113,9 +3312,6 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
         }
     }
 
-    let actor = user
-        .ambient_actor()
-        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     // Same enrichment as the PUT path: the packet's admission-fixed
     // flag — not the transport context — marks the event. The adapter
     // builds JOB_UPDATED from the post-merge row with this stamp and
@@ -3133,11 +3329,36 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
     // merges against the row as it stands — no decision here reads its
     // other keys, and the conductor's markers must not queue on it.
     let judged_on = (existing.kind == crate::experiments::EXPERIMENT_KIND).then_some(&existing);
-    let merged = match state
-        .jobs
-        .merge_job_metadata_at(&job_id, &patch, judged_on, &stamp)
-        .await
-    {
+    let mut receipt = None;
+    let mut applied = true;
+    let result = if let Some(command) = conditional.as_ref() {
+        // The shared validation above must not normalize a conditional
+        // command into a different request under the same idempotency key.
+        if command.patch != patch {
+            return (
+                StatusCode::CONFLICT,
+                "conditional patch normalized; re-read and submit the exact intended command",
+            )
+                .into_response();
+        }
+        state
+            .jobs
+            .conditional_job_metadata_decision_at(&job_id, command, judged_on, &stamp)
+            .await
+            .map(|outcome| {
+                applied = outcome.applied;
+                let record = outcome.receipt;
+                let job = record.job.clone();
+                receipt = Some(record);
+                job
+            })
+    } else {
+        state
+            .jobs
+            .merge_job_metadata_at(&job_id, &patch, judged_on, &stamp)
+            .await
+    };
+    let merged = match result {
         Ok(job) => job,
         Err(crate::port::JobsError::NotFound(_)) => {
             return (StatusCode::NOT_FOUND, "job not found").into_response();
@@ -3164,11 +3385,14 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
     // Same wake as the PUT: a metadata write can flip a metadata-gated
     // `ready_when` (ship-a-change's Merged outcome waits on
     // `job.metadata.merged`). Closed/cancelled Jobs stay untouched.
-    if merged.status == JobStatus::Open {
+    if applied && merged.status == JobStatus::Open {
         super::steps::reevaluate_and_persist(&state, &merged, &actor).await;
     }
 
-    StatusCode::NO_CONTENT.into_response()
+    match receipt {
+        Some(receipt) => Json(receipt).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
 }
 
 /// A move of one packet between two versions of its protocol, judged:

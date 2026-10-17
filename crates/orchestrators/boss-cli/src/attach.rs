@@ -215,7 +215,7 @@ pub(crate) struct Attached {
 /// tests go through, as `crate::sor_client::api_at_signed` is): a refused signature
 /// never reaches the socket.
 pub(crate) async fn attach_at(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     content_base: &str,
     target: &Target,
     path: &Path,

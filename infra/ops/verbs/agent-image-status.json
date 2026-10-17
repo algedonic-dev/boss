@@ -1,0 +1,18 @@
+{
+  "about": "READ-ONLY \u2014 verify one exact source generation of the native-agent image publisher. Reads the root-owned immutable image witness and complete retained originals, checks every blob and native executable witness, and prints the image-only record. Refuses missing, changed, linked or replaceable records; never emits a ready login/controller binding. The cluster converge publishes this separate image after core convergence and records agent_image_publication on its maintenance packet even on failure. No image build, push, login, launch or credential read occurs in this verb. Partial3869107c.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/agent/publish-image.sh",
+    "status",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "generation",
+      "pattern": "^[0-9a-f]{40}$"
+    }
+  ],
+  "timeout": 300
+}

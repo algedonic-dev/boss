@@ -143,6 +143,45 @@ class PublishedDoors(unittest.TestCase):
             self.assertEqual(env["BOSS_MACHINE_TOKEN_DIR"], "/fake-owned-control/machine")
             self.assertEqual(env["BOSS_MACHINE_TOKEN_HOSTS"], "control.invalid,read.invalid")
 
+    def test_the_trusted_cli_resolves_the_generations_own_kubectl_and_no_writable_one(self):
+        # Backlog 63d59f45 (isolation trial b3071bf4, 2026-10-17): with
+        # isolation on, `boss gate` launch, withdraw and every gate-Job
+        # read failed — the CLI runs `kubectl` by name, and this door's
+        # PATH was /usr/bin:/bin, while the pod's kubectl is in the
+        # group-writable /work/tools/bin. The generation already carries
+        # a hash-verified bin/kubectl (dev-build.py runs it by absolute
+        # path), so the trusted CLI must find exactly that one, and an
+        # inherited PATH entry — a writable tree — must never win.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "bin").mkdir()
+            (root / "infra/dev").mkdir(parents=True)
+            (root / "infra/dev/machine-token-dir").write_text("/fake-owned-control/machine\n")
+            (root / "infra/dev/sor-url").write_text("http://control.invalid:7900\n")
+            (root / "infra/dev/sor-read-url").write_text("http://read.invalid:7900\n")
+            (root / "artifact.json").write_text('{"commit":"' + "a" * 40 + '"}')
+            writable = root / "writable-tools"
+            writable.mkdir()
+            for directory in (root / "bin", writable):
+                kubectl = directory / "kubectl"
+                kubectl.write_text("#!/bin/bash\nexit 0\n")
+                kubectl.chmod(0o755)
+            # Resolves `kubectl` the way Command::new("kubectl") does: by
+            # searching the PATH the door handed the CLI.
+            boss = root / "bin/boss"
+            boss.write_text('#!/bin/bash\ncommand -v kubectl || echo "kubectl: not found"\n')
+            boss.chmod(0o755)
+            argv, env = self.mod.tool_plan(root, "boss", ["gate", "--withdraw"], {"HOME": str(root), "PATH": str(writable) + ":/usr/bin:/bin"})
+            self.assertEqual(argv[0], str(root / "bin/boss"))
+            self.assertEqual(env["PATH"].split(":"), [str(root / "bin"), "/usr/bin", "/bin"])
+            result = subprocess.run(argv, env=env, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.decode().strip(), str(root / "bin/kubectl"))
+        # Every other door keeps the minimal PATH: only the trusted CLI
+        # drives the cluster from this side.
+        _, env = self.mod.tool_plan(Path(self.STORE + "/generations/" + "a" * 40), "wt-cargo", [], {})
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+
     def test_cargo_web_and_candidate_cli_go_only_through_the_fixed_worker_controller(self):
         root = Path(self.STORE + "/generations/" + "a" * 40)
         for name in ("wt-cargo", "wt-web"):

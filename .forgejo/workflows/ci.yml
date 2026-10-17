@@ -13,12 +13,11 @@
 # fails every run at checkout with exitcode 127 before a line of the
 # gate executes.
 #
-# Deliberately split into two jobs. `fast` is fmt + clippy and returns in
-# under a minute on the Ryzen — that is the feedback loop you actually
-# live in. `test` carries the Postgres service and runs `infra/gate.sh`,
-# and is allowed to take as long as it takes. Reporting them separately
-# means a formatting slip is not hidden behind a ten-minute test run, and
-# the bottleneck is visible rather than averaged away.
+# Three jobs, in series: `build-image` (the runner image, from the
+# tree), `locomotive` (the host and image checks, in seconds), `web` (the
+# frontend checks the train's cluster gate may skip). The `fast` and
+# `test` jobs this paragraph used to describe were moved to that gate by
+# design 128b5496; see the note at the foot of this file.
 name: CI
 
 # THE PULL REQUEST ALONE. Until 2026-09-12 `push: branches: [main]` was
@@ -43,6 +42,117 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Frozen trusted-base eligibility, shared with deploy and the conductor. The
+  # cached tool image may be reused only when its baked recipe stamp agrees.
+  # A missing base, planner, policy or stamp chooses the existing image path.
+  # Bootstrap stays in the workflow trust boundary: a candidate helper cannot
+  # grant its own skip. Both inline copies are execution-tested and held equal
+  # by test_delivery_ci_workflow.py (review6600844d, urgent271a2f6e).
+  delivery-plan:
+    runs-on: docker
+    container:
+      image: 10.20.0.15:3000/david/boss-ci:rust1.96
+    outputs:
+      route: ${{ steps.plan.outputs.route }}
+    steps:
+      - name: Read the exact PR inputs from the forge
+        env:
+          FORGE_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -eu
+          git init -q .
+          git remote add origin "http://x-access-token:${FORGE_TOKEN}@10.20.0.15:3000/${GITHUB_REPOSITORY}.git"
+          git fetch -q origin "${GITHUB_SHA}" "${BASE_SHA}"
+          git checkout -q --force "${GITHUB_SHA}"
+      - name: Select and retain the complete delivery plan
+        id: plan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -eu
+          python3 -I - "$BASE_SHA" "$GITHUB_SHA" > delivery-plan.json <<'PY'
+          import json, re, subprocess, sys
+          base, head = sys.argv[1:]
+          try:
+              if not all(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", ref) for ref in (base, head)):
+                  raise ValueError("CI requires full frozen base/head identities")
+              source = subprocess.run(
+                  ["git", "show", base + ":infra/forge/delivery-ci.py"],
+                  check=True, capture_output=True, text=True).stdout
+              executed = subprocess.run(
+                  [sys.executable, "-I", "-", "--repo", ".", "--base", base,
+                   "--head", head, "--stamp", "/etc/boss-ci-stamp"],
+                  input=source, check=True, capture_output=True, text=True)
+              plan = json.loads(executed.stdout)
+              if not isinstance(plan, dict) or plan.get("schema") != 1 or plan.get("route") not in ("data", "software"):
+                  raise ValueError("trusted CI adapter returned an invalid plan")
+              if plan["route"] == "data" and (
+                  plan.get("base") != base or plan.get("head") != head
+                  or not isinstance(plan.get("obligations"), list) or not plan["obligations"]
+                  or not re.fullmatch(r"[0-9a-f]{64}", plan.get("ci_runner_recipe_sha256", ""))):
+                  raise ValueError("trusted CI adapter returned unbound lighter evidence")
+          except Exception as error:
+              stderr = getattr(error, "stderr", "")
+              plan = {"schema": 1, "route": "software", "obligations": [],
+                      "requested_base": base, "requested_head": head,
+                      "reason": "trusted base CI adapter unavailable: " + type(error).__name__ + ": " + str(error),
+                      "failure": {"kind": type(error).__name__, "message": str(error), "stderr": stderr}}
+          print(json.dumps(plan, sort_keys=True, separators=(",", ":")))
+          PY
+          cat delivery-plan.json
+          printf 'route=%s\n' "$(python3 -c 'import json; print(json.load(open("delivery-plan.json"))["route"])')" >> "$GITHUB_OUTPUT"
+
+  lighter-validation:
+    runs-on: docker
+    needs: [delivery-plan]
+    if: needs.delivery-plan.outputs.route == 'data'
+    container:
+      image: 10.20.0.15:3000/david/boss-ci:rust1.96
+    steps:
+      - name: Validate the frozen lighter tree with the matching tool image
+        env:
+          FORGE_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -eu
+          git init -q .
+          git remote add origin "http://x-access-token:${FORGE_TOKEN}@10.20.0.15:3000/${GITHUB_REPOSITORY}.git"
+          git fetch -q origin "${GITHUB_SHA}" "${BASE_SHA}"
+          git checkout -q --force "${GITHUB_SHA}"
+          python3 -I - "$BASE_SHA" "$GITHUB_SHA" > delivery-plan.json <<'PY'
+          import json, re, subprocess, sys
+          base, head = sys.argv[1:]
+          try:
+              if not all(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", ref) for ref in (base, head)):
+                  raise ValueError("CI requires full frozen base/head identities")
+              source = subprocess.run(
+                  ["git", "show", base + ":infra/forge/delivery-ci.py"],
+                  check=True, capture_output=True, text=True).stdout
+              executed = subprocess.run(
+                  [sys.executable, "-I", "-", "--repo", ".", "--base", base,
+                   "--head", head, "--stamp", "/etc/boss-ci-stamp"],
+                  input=source, check=True, capture_output=True, text=True)
+              plan = json.loads(executed.stdout)
+              if not isinstance(plan, dict) or plan.get("schema") != 1 or plan.get("route") not in ("data", "software"):
+                  raise ValueError("trusted CI adapter returned an invalid plan")
+              if plan["route"] == "data" and (
+                  plan.get("base") != base or plan.get("head") != head
+                  or not isinstance(plan.get("obligations"), list) or not plan["obligations"]
+                  or not re.fullmatch(r"[0-9a-f]{64}", plan.get("ci_runner_recipe_sha256", ""))):
+                  raise ValueError("trusted CI adapter returned unbound lighter evidence")
+          except Exception as error:
+              stderr = getattr(error, "stderr", "")
+              plan = {"schema": 1, "route": "software", "obligations": [],
+                      "requested_base": base, "requested_head": head,
+                      "reason": "trusted base CI adapter unavailable: " + type(error).__name__ + ": " + str(error),
+                      "failure": {"kind": type(error).__name__, "message": str(error), "stderr": stderr}}
+          print(json.dumps(plan, sort_keys=True, separators=(",", ":")))
+          PY
+          cat delivery-plan.json
+          python3 -c 'import json; assert json.load(open("delivery-plan.json"))["route"] == "data", "lighter inputs or cached runner changed"'
+          bash infra/gate.sh --quick
+
   # THE IMAGE IS BUILT BY THE PIPELINE, FROM THE TREE.
   #
   # Until 2026-08-16 the runner image was built by a person running
@@ -86,6 +196,8 @@ jobs:
   # this is a manifest ref, not a second copy of the image.
   build-image:
     runs-on: docker
+    needs: [delivery-plan]
+    if: needs.delivery-plan.outputs.route != 'data'
     container:
       # FROM THE FORGE, NOT gcr.io. This executor, and the two bases the
       # Dockerfile FROMs, are copies in our own registry, put there by
@@ -264,7 +376,8 @@ jobs:
   # image has been rebuilt from the tree only ever reports the lag.
   locomotive:
     runs-on: docker
-    needs: [build-image]
+    needs: [delivery-plan, build-image]
+    if: needs.delivery-plan.outputs.route != 'data'
     container:
       image: 10.20.0.15:3000/david/boss-ci:${{ github.sha }}
     steps:
@@ -283,7 +396,7 @@ jobs:
           git init -q .
           git remote add origin \
             "http://x-access-token:${FORGE_TOKEN}@10.20.0.15:3000/${GITHUB_REPOSITORY}.git"
-          git fetch -q --depth=1 origin "${GITHUB_REF}"
+          git fetch -q --depth=1 origin "${GITHUB_SHA}"
           git checkout -q --force FETCH_HEAD
 
       - name: Locomotive check
@@ -329,10 +442,28 @@ jobs:
   # because Playwright 1.61 refuses to start below 20 and that is not
   # something a job step can paper over.
   #
-  # Runs parallel to `test`, so it adds no wall-clock to a green train.
+  # IT RUNS IN SERIES, AND IT IS NOT FREE. This line used to say the job
+  # "runs parallel to `test`, so it adds no wall-clock" — there has been
+  # no `test` job since design 128b5496 (2026-09-13), and the graph is a
+  # chain: build-image -> locomotive -> web, on the forge's one runner
+  # slot, so every step here is track time on a train (backlog 81ee98b3).
+  #
+  # SO IT RUNS ONLY WHAT THE TRAIN'S GATE MAY SKIP. The conductor gates
+  # every train branch with `--auto` and merges none without that verdict
+  # (BOSS_TRAIN_GATE_REQUIRED=1). In `--auto`, gate.sh runs svelte-check
+  # on every tree, which is why this job has no Typecheck step any more.
+  # The rest of the gate's web phase runs only when the train touches
+  # apps/web, apps/simulator or libs/web-kit, while the specs also read
+  # files from infra/step-plugins, infra/estate, infra/postgres, examples/
+  # and docs/ (readFileSync, 2026-10-15) — so for a train that changes
+  # only those, the steps below are the only run of the web suite, and
+  # they stay.
+  # Pinned both ways by boss-testing's gate_sh.rs
+  # the_forge_web_job_runs_only_what_the_train_gate_may_skip.
   web:
     runs-on: docker
-    needs: [locomotive]
+    needs: [delivery-plan, locomotive]
+    if: needs.delivery-plan.outputs.route != 'data'
     container:
       image: 10.20.0.15:3000/david/boss-ci:${{ github.sha }}
     steps:
@@ -351,7 +482,7 @@ jobs:
           git init -q .
           git remote add origin \
             "http://x-access-token:${FORGE_TOKEN}@10.20.0.15:3000/${GITHUB_REPOSITORY}.git"
-          git fetch -q --depth=1 origin "${GITHUB_REF}"
+          git fetch -q --depth=1 origin "${GITHUB_SHA}"
           git checkout -q --force FETCH_HEAD
 
       - name: Install dependencies
@@ -362,10 +493,6 @@ jobs:
         # and the failure reads as a missing tool.
         working-directory: apps/web
         run: PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile
-
-      - name: Typecheck
-        working-directory: apps/web
-        run: bun run typecheck
 
       - name: web-kit unit tests
         # RUN FIRST, and from libs/web-kit, because the step below does

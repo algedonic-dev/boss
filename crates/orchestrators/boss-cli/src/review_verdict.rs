@@ -413,7 +413,11 @@ pub(crate) async fn record(
         short(str_at(&packet, "/id")),
         short(&head),
         if verdict == RELEASE {
-            format!("\n  the operator releases it: boss release {branch} --review {run_id}")
+            format!(
+                "\n  the release rule asks the release door on this verdict now (backlog \
+                 0cfc57e6); if the door refuses, the car's review step says why (auto_release) \
+                 and the operator releases it: boss release {branch} --review {run_id}"
+            )
         } else {
             String::new()
         }

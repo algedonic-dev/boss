@@ -58,6 +58,36 @@ fn rule_of(row: &PgRow) -> Result<CadenceRuleRow, CadenceError> {
 
 #[async_trait]
 impl CadenceRepository for PgCadence {
+    async fn firing_history(
+        &self,
+        rule: &str,
+        observation_key: Option<&str>,
+        before: Option<(DateTime<Utc>, String)>,
+        limit: usize,
+    ) -> Result<Vec<NewFiring>, CadenceError> {
+        if !(1..=500).contains(&limit) {
+            return Err(CadenceError::BadRequest(
+                "history limit must be between 1 and 500".into(),
+            ));
+        }
+        let rows = sqlx::query("SELECT firing_id, rule_name, verb, basis, fired_at, detail FROM cadence_firings WHERE rule_name = $1 AND ($2::timestamptz IS NULL OR (fired_at, firing_id COLLATE \"C\") < ($2, $3::text COLLATE \"C\")) AND ($5::text IS NULL OR (jsonb_typeof(detail->'observations') = 'object' AND detail->'observations' ? $5)) ORDER BY fired_at DESC, firing_id COLLATE \"C\" DESC LIMIT $4")
+            .bind(rule).bind(before.as_ref().map(|c| c.0)).bind(before.as_ref().map(|c| &c.1))
+            .bind(i64::try_from(limit).map_err(|e| CadenceError::BadRequest(e.to_string()))?)
+            .bind(observation_key)
+            .fetch_all(&self.pool).await.map_err(storage)?;
+        rows.iter()
+            .map(|row| {
+                Ok(NewFiring {
+                    firing_id: row.try_get("firing_id").map_err(storage)?,
+                    rule_name: row.try_get("rule_name").map_err(storage)?,
+                    verb: row.try_get("verb").map_err(storage)?,
+                    basis: row.try_get("basis").map_err(storage)?,
+                    fired_at: row.try_get("fired_at").map_err(storage)?,
+                    detail: row.try_get("detail").map_err(storage)?,
+                })
+            })
+            .collect()
+    }
     async fn active_rules(&self) -> Result<Vec<CadenceRuleRow>, CadenceError> {
         // "Name-ordered" is BYTE order (`COLLATE "C"`): the database's
         // locale ignores `-` at first level, so `suite-ab` served before
@@ -98,6 +128,12 @@ impl CadenceRepository for PgCadence {
                 firing_id: r.try_get("firing_id").map_err(storage)?,
                 fired_at: r.try_get("fired_at").map_err(storage)?,
                 rc: r.try_get("rc").map_err(storage)?,
+                observations: r
+                    .try_get::<serde_json::Value, _>("detail")
+                    .map_err(storage)?
+                    .get("observations")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned(),
                 board_decision: crate::board_decision::BoardDecision::of_detail(
                     &r.try_get::<serde_json::Value, _>("detail")
                         .map_err(storage)?,
@@ -137,7 +173,7 @@ impl CadenceRepository for PgCadence {
         firing_id: &str,
         outcome: &FiringOutcome,
     ) -> Result<(), CadenceError> {
-        sqlx::query("UPDATE cadence_firings SET detail = detail || $2 WHERE firing_id = $1")
+        sqlx::query("UPDATE cadence_firings SET detail = (detail - 'observations') || $2 WHERE firing_id = $1")
             .bind(firing_id)
             .bind(outcome.detail_patch())
             .execute(&self.pool)

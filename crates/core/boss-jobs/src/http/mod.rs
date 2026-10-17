@@ -32,6 +32,8 @@ mod census;
 mod flights;
 mod jobs;
 mod kinds;
+mod move_admission;
+mod move_corrections;
 mod moves;
 mod plugins;
 mod presence;
@@ -352,6 +354,26 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         // as a page after a seq and as a stream that resumes from one.
         .route("/api/yard/moves", get(yard_moves::<R, B>))
         .route("/api/yard/moves/stream", get(yard_moves_stream::<R, B>))
+        .route(
+            "/api/yard/moves/{seq}/diagnoses",
+            post(move_corrections::diagnosis::<R, B>),
+        )
+        .route(
+            "/api/yard/moves/{seq}/diagnoses/{diagnosis}/admission-observations",
+            post(move_admission::observe::<R, B>),
+        )
+        .route(
+            "/api/yard/moves/{seq}/diagnoses/{diagnosis}/admission-observations/{request}",
+            get(move_admission::get::<R, B>),
+        )
+        .route(
+            "/api/yard/moves/{seq}/corrections",
+            post(move_corrections::correction::<R, B>),
+        )
+        .route(
+            "/api/yard/moves/{seq}/withdrawals",
+            post(move_corrections::withdrawal::<R, B>),
+        )
         // THE ROUTES (design e765b3fc §2b, car R2): every line the map
         // may draw, derived from the protocols, the declared hand-offs
         // and the moves record — each with the sources that support it.
@@ -367,6 +389,18 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         // Top-level metadata merge — the atomic alternative to the
         // GET → spread → full PUT read-modify-write. `null` removes.
         .route("/api/jobs/{id}/metadata", patch(patch_job_metadata::<R, B>))
+        .route(
+            "/api/jobs/{id}/metadata/conditional",
+            post(conditional_job_metadata::<R, B>),
+        )
+        .route(
+            "/api/jobs/{id}/metadata/conditional/{command}",
+            get(read_conditional_metadata_receipt::<R, B>),
+        )
+        .route(
+            "/api/jobs/metadata/conditional-capability",
+            get(conditional_metadata_capability::<R, B>),
+        )
         // Move a packet to another version of its protocol (POST), or
         // preview the move without writing (GET) — design 7cf202a9.
         .route(

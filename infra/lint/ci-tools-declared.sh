@@ -65,6 +65,35 @@ declared=$(grep -vE '^\s*#|^\s*$' "$MANIFEST" | tr -d ' ')
 # block the second line's first word is an argument, not a command.
 invoked=$(
     awk -v want="$IMAGE" '
+        # Locate redirection syntax, not a printed/commented example of it.
+        # A quote-blind match can hide a real command until a later delimiter
+        # (review7a8). Quote state survives shell continuation lines.
+        function heredoc_operator(text, i, c, following, previous) {
+            for (i = 1; i <= length(text); i++) {
+                c = substr(text, i, 1)
+                following = substr(text, i + 1, 1)
+                if (shell_quote == "\047") {
+                    if (c == "\047") shell_quote = ""
+                    continue
+                }
+                if (c == "\\") { i++; continue }
+                if (shell_quote != "") {
+                    if (c == shell_quote) shell_quote = ""
+                    continue
+                }
+                if (c == "\047" || c == "\"" || c == "`") {
+                    shell_quote = c
+                    continue
+                }
+                previous = substr(text, i - 1, 1)
+                if (c == "#" && (i == 1 || previous ~ /[[:space:];|&()]/)) return 0
+                if (c == "<" && following == "<") {
+                    if (substr(text, i + 2, 1) == "<") { i += 2; continue }
+                    return i
+                }
+            }
+            return 0
+        }
         # A new job at two-space indent resets what we know.
         /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { injob = 1; image = ""; inblock = 0; next }
         /^[A-Za-z]/                       { injob = 0; image = ""; inblock = 0 }
@@ -85,7 +114,7 @@ invoked=$(
         # the repo up to the colon.
         index(image, want) != 1 { next }
         /^[[:space:]]*run:[[:space:]]*[|>]/ {
-            inblock = 1; cont = 0
+            inblock = 1; cont = 0; shell_quote = ""
             match($0, /^[[:space:]]*/); runindent = RLENGTH
             next
         }
@@ -103,6 +132,20 @@ invoked=$(
             if (RLENGTH <= runindent) { inblock = 0 }
             else {
                 line = $0; sub(/^[[:space:]]+/, "", line)
+                # Inline trusted CI bootstrap programs are stdin data, not
+                # shell commands. Resume at their terminator so a real tool
+                # immediately afterwards is still checked (review6600844d).
+                if (heredoc != "") {
+                    if (line == heredoc) heredoc = ""
+                    next
+                }
+                operator = heredoc_operator(line)
+                redirection = substr(line, operator)
+                if (operator && match(redirection, /^<<-?[[:space:]]*[\047"]?[A-Za-z_][A-Za-z0-9_]*[\047"]?/)) {
+                    heredoc = substr(redirection, RSTART, RLENGTH)
+                    sub(/^<<-?[[:space:]]*/, "", heredoc)
+                    gsub(/[\047"]/, "", heredoc)
+                }
                 was_cont = cont
                 cont = (line ~ /\\$/)
                 if (!was_cont) print line
@@ -112,6 +155,7 @@ invoked=$(
         /^[[:space:]]*run:[[:space:]]*[^|>]/ {
             line = $0; sub(/^[[:space:]]*run:[[:space:]]*/, "", line); print line
         }
+        END { if (heredoc != "") print "unterminated-heredoc" }
     ' "$WORKFLOW" |
     sed -E 's/^#.*//' |
     sed -E 's/^([A-Za-z_][A-Za-z0-9_]*=[^ ]*[[:space:]]+)+//' |

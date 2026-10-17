@@ -30,7 +30,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::{Stream, StreamExt};
 
-pub use boss_clock::types::ClockNow;
+pub use boss_clock::mapping_history;
+pub use boss_clock::types::{ClockMode, ClockNow, SimClockParams};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClockClientError {

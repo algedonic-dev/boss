@@ -533,7 +533,7 @@ pub(crate) fn read_exhibit(
 /// receipt copied, not retyped. The review surface checks what it
 /// fetches against that sha256 before it renders anything.
 pub(crate) async fn carry_exhibits(
-    http: &boss_core::machine_token::Client,
+    http: &crate::machine_http::MachineClient,
     content_base: &str,
     target: &crate::attach::Target,
     exhibits: &[Exhibit],
