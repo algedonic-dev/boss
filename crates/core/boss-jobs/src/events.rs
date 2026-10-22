@@ -54,6 +54,10 @@ pub const WORKFLOW_RETIRED: &str = "jobs.kind.retired";
 /// A draft row deleted before it ever went live (ebd7bb70): the
 /// armed-draft hazard removed, with the discard on the record.
 pub const WORKFLOW_DRAFT_DISCARDED: &str = "jobs.kind.draft_discarded";
+/// A draft that met traffic and lost was set `rejected` (backlog
+/// 50ded63d): kept for the packets pinned to it, never promotable.
+/// Payload is the rejected `WorkflowSpec`.
+pub const WORKFLOW_DRAFT_REJECTED: &str = "jobs.kind.draft_rejected";
 /// A draft StepPlugin row was appended to the registry (author
 /// saved, not live). Recorded by the registry adapter atomically
 /// with the step_plugins row; payload is the full `StepPluginSpec`.

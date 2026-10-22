@@ -91,6 +91,26 @@ pub(crate) struct Outcome {
     /// and the streams say. Sorted and deduplicated, as the runner's
     /// `sort -u` leaves it.
     pub missing_tools: Vec<String>,
+    /// How long the run took, under what bound, and which reads its time
+    /// went to ([`Timing`]); `None` for an outcome no probe run produced.
+    pub timing: Option<Timing>,
+}
+
+/// WHERE A RUN'S TIME WENT (backlog a32af300). Car 5159b6b6's probe was
+/// killed at 60 s three hours running and its attempt said only "killed
+/// at 60s timeout" beside an empty stdout: the record could not tell a
+/// slow system of record from a slow transport or the probe's own `jq`,
+/// so it was re-derived from the pod (the record: one read, 25-122 s).
+/// Measured by this process, never reported by the probe's text: the
+/// wall clock from launch to exit, the bound the run had, and each read
+/// the reader door forwarded ([`crate::probe_reader::ReadTiming`]) —
+/// empty where no door opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Timing {
+    pub elapsed_ms: u64,
+    /// `None`: no timeout at this door (the hand door, no reader door).
+    pub bound_s: Option<u64>,
+    pub reads: Vec<crate::probe_reader::ReadTiming>,
 }
 
 /// THE UNRUNNABLE PRELUDE (backlog 46f67333). Every probe's shell gets
@@ -237,6 +257,20 @@ pub(crate) const NO_NEW_PRIVS: [&str; 2] = ["setpriv", "--no-new-privs"];
 /// operator's HOME would hand the probe that operator's actor file.
 pub(crate) const UNATTENDED_INHERITS: [&str; 4] = ["PATH", "LANG", "LC_ALL", "TZ"];
 
+/// THE GIT CONFIGURATION A HOST-FREE RECHECK READS: the checkout's own,
+/// and nothing of this host's or this operator's (backlog 51587416).
+/// [`Shell::host_free`] sets both after the allow-list, so a value the
+/// operator exported cannot stand in. `safe.directory` lives only in
+/// the scopes these close, so a checkout this user does not own is
+/// refused by git there, measured 2026-10-18 on the pod (uid 65534
+/// reading a root-owned repository, HOME unset: "dubious ownership",
+/// exit 128), and with HOME unset and both closed a checkout this user
+/// owns reads as before (`git show`, `git grep`, `git rev-parse`).
+pub(crate) const HOST_FREE_GIT: [(&str, &str); 2] = [
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+];
+
 /// The name the door hands `path_prefix` to the probe's shell under; the
 /// [`PRELUDE`]'s first line moves it onto PATH and unsets it. Held equal
 /// to that line by `the_probe_bin_prefix_does_not_resolve_the_launch_words`,
@@ -267,29 +301,220 @@ fn resolvable_merge_ref(raw: &str) -> Option<&str> {
 /// merge is not in this checkout: the car's change has not converged
 /// here, and a probe that gets no instant says NOT YET rather than
 /// inventing one.
-fn converged_at(dir: &Path, merge_ref: &str) -> Option<String> {
-    let o = std::process::Command::new("git")
-        .args([
-            // The unattended door runs as root in the probe user's
-            // checkout, and git refuses a repository owned by somebody
-            // else ("dubious ownership") by answering nonzero rather
-            // than erroring loudly — which here would silently hand
-            // over NO instant and starve the probe the other way. This
-            // one command is a read; say so rather than find out.
-            "-c",
-            &format!("safe.directory={}", dir.display()),
-            "-C",
-            &dir.display().to_string(),
-            "show",
-            "-s",
-            "--format=%ct",
-            merge_ref,
-            "--",
-        ])
+///
+/// Read in `shell`'s own environment (backlog 51587416), so an instant a
+/// host-free recheck hands its probe comes from the repository that probe
+/// reads, not from one an operator's `GIT_DIR` names.
+fn converged_at(shell: &Shell, dir: &Path, merge_ref: &str) -> Option<String> {
+    let argv: Vec<String> = [
+        "git",
+        // The unattended door runs as root in the probe user's
+        // checkout, and git refuses a repository owned by somebody
+        // else ("dubious ownership") by answering nonzero rather
+        // than erroring loudly — which here would silently hand
+        // over NO instant and starve the probe the other way. This
+        // one command is a read; say so rather than find out.
+        "-c",
+        &format!("safe.directory={}", dir.display()),
+        "-C",
+        &dir.display().to_string(),
+        "show",
+        "-s",
+        "--format=%ct",
+        merge_ref,
+        "--",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    let o = shell
+        .command(&argv)
+        .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
     let ct = String::from_utf8_lossy(&o.stdout).trim().to_string();
     (o.status.success() && !ct.is_empty() && ct.chars().all(|c| c.is_ascii_digit())).then_some(ct)
+}
+
+/// The top level of the checkout the operator stands in, when its HEAD
+/// holds the car's merge — the witness that a git-object probe recorded
+/// on another host reads the same objects here (backlog da937eb3). A
+/// directory outside any repository, a repository git refuses, a
+/// checkout behind the merge, or a car with no merge on record each
+/// answer their own [`NoCheckout`], and the recheck keeps the
+/// recorded-host refusal and says which (backlog 70cb74d8).
+///
+/// WITNESSED IN THE PROBE'S OWN ENVIRONMENT (backlog 51587416): `shell`
+/// is the one the probe will run in, [`Shell::host_free`], so a
+/// `GIT_DIR` or `GIT_CONFIG_*` of the operator's cannot make the witness
+/// read one repository and the probe another — and a checkout git
+/// refuses there as of dubious ownership, which it does once this host's
+/// global `safe.directory` is out of reach, is refused HERE, as the
+/// recorded-host refusal, rather than as a probe that exits 128 and
+/// reads as decay.
+fn checkout_holding(merge_ref: Option<&str>, shell: &Shell) -> Result<String, NoCheckout> {
+    let merge_ref = merge_ref.ok_or(NoCheckout::NoMerge)?;
+    let git = |args: &[&str]| {
+        let argv: Vec<String> = std::iter::once("git")
+            .chain(args.iter().copied())
+            .map(str::to_string)
+            .collect();
+        let mut cmd = shell.command(&argv);
+        cmd.stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| NoCheckout::GitUnrunnable {
+                error: e.to_string(),
+            })
+    };
+    let top = git(&["rev-parse", "--show-toplevel"])?;
+    let root = String::from_utf8_lossy(&top.stdout).trim().to_string();
+    if !top.status.success() || root.is_empty() {
+        let dir = shell
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .map_or_else(|| ".".to_string(), |d| d.display().to_string());
+        return Err(rev_parse_refused(
+            dir,
+            top.status.code(),
+            &String::from_utf8_lossy(&top.stderr),
+        ));
+    }
+    let held = git(&[
+        "-C",
+        &root,
+        "merge-base",
+        "--is-ancestor",
+        merge_ref,
+        "HEAD",
+    ])?;
+    if held.status.success() {
+        return Ok(root);
+    }
+    Err(NoCheckout::NotHeld {
+        root,
+        merge: merge_ref.to_string(),
+        exit: held.status.code(),
+        stderr: first_line(&String::from_utf8_lossy(&held.stderr)),
+    })
+}
+
+/// WHY A GIT-OBJECT PROBE WAS NOT PLACED IN A CHECKOUT HERE (backlog
+/// 70cb74d8). The recheck answered every one of these with the same
+/// CANNOT RE-RUN HERE, whose last sentence listed them all — "this one
+/// runs something else, or reads through the shell, or there is no such
+/// checkout here" — so an operator could not tell a probe to rewrite
+/// from a directory to change (reviews 8d6976fa, da88bbff and 1042cf88
+/// of car afd61aa2). Each variant carries what decided it: the place
+/// the text left the grammar, or the directory git was asked about, its
+/// exit and the first line it printed on stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoCheckout {
+    /// The probe's text is outside the git-object grammar; the checkout
+    /// was never read.
+    Grammar(boss_jobs::probe::Refused),
+    /// The car records no merge commit, so no checkout can be shown to
+    /// hold it.
+    NoMerge,
+    /// `git` could not be started.
+    GitUnrunnable { error: String },
+    /// Git refused the repository at `dir` as one this user does not own
+    /// ("detected dubious ownership", exit 128). The witness runs in the
+    /// host-free shell, which reads no system or global git configuration
+    /// (51587416), so a `safe.directory` there does not reach it —
+    /// measured 2026-10-18 on the pod as uid 65534 reading a root-owned
+    /// checkout, and again 2026-10-19 by this car.
+    DubiousOwnership {
+        dir: String,
+        exit: Option<i32>,
+        stderr: String,
+    },
+    /// `dir` is in no checkout git will read: outside any repository, or
+    /// in one with no work tree.
+    NotInACheckout {
+        dir: String,
+        exit: Option<i32>,
+        stderr: String,
+    },
+    /// The checkout at `root` does not hold the car's merge: its HEAD is
+    /// behind it (exit 1), or the commit is not in it at all (exit 128).
+    NotHeld {
+        root: String,
+        merge: String,
+        exit: Option<i32>,
+        stderr: String,
+    },
+}
+
+/// `git rev-parse --show-toplevel` failed in `dir`: dubious ownership
+/// when git's message says so, and otherwise no checkout. The message is
+/// git's own (2.39 on the pod, measured 2026-10-19: "fatal: detected
+/// dubious ownership in repository at '<dir>'", exit 128), and a git
+/// that words it differently lands in [`NoCheckout::NotInACheckout`]
+/// with its stderr quoted — named less precisely, never silently.
+fn rev_parse_refused(dir: String, exit: Option<i32>, stderr: &str) -> NoCheckout {
+    let stderr = first_line(stderr);
+    if stderr.contains("dubious ownership") {
+        NoCheckout::DubiousOwnership { dir, exit, stderr }
+    } else {
+        NoCheckout::NotInACheckout { dir, exit, stderr }
+    }
+}
+
+/// The first non-empty line of what a command printed, trimmed.
+fn first_line(s: &str) -> String {
+    s.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `exit 128`, or how it ended without one, then `: <stderr>` when git
+/// printed anything.
+fn git_said(exit: Option<i32>, stderr: &str) -> String {
+    let ended = exit.map_or_else(|| "killed by a signal".to_string(), |n| format!("exit {n}"));
+    if stderr.is_empty() {
+        ended
+    } else {
+        format!("{ended}: {stderr}")
+    }
+}
+
+impl std::fmt::Display for NoCheckout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Grammar(r) => write!(f, "its text is outside the git-object grammar — {r}"),
+            Self::NoMerge => write!(
+                f,
+                "the car records no merge commit, so no checkout can be shown to hold it"
+            ),
+            Self::GitUnrunnable { error } => write!(f, "git could not be started: {error}"),
+            Self::DubiousOwnership { dir, exit, stderr } => write!(
+                f,
+                "git refuses {dir} as a repository this user does not own ({}). The recheck \
+                 reads no system or global git configuration (51587416), so a safe.directory \
+                 there does not reach it: run it from a checkout this user owns",
+                git_said(*exit, stderr)
+            ),
+            Self::NotInACheckout { dir, exit, stderr } => write!(
+                f,
+                "{dir} is in no checkout git will read (`git rev-parse --show-toplevel`, {}): \
+                 run it from one whose HEAD holds the car",
+                git_said(*exit, stderr)
+            ),
+            Self::NotHeld {
+                root,
+                merge,
+                exit,
+                stderr,
+            } => write!(
+                f,
+                "the checkout at {root} does not hold the car's merge {merge} (`git merge-base \
+                 --is-ancestor`, {}): bring it up to that commit, or run it from one that holds it",
+                git_said(*exit, stderr)
+            ),
+        }
+    }
 }
 
 impl Shell {
@@ -314,7 +539,7 @@ impl Shell {
         };
         self.env.push((CAR_MERGE_REF_VAR.into(), r.to_string()));
         let dir = self.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
-        if let Some(at) = converged_at(&dir, r) {
+        if let Some(at) = converged_at(&self, &dir, r) {
             self.env.push((CAR_CONVERGED_AT_VAR.into(), at));
         }
         self
@@ -336,6 +561,70 @@ impl Shell {
             inherit: None,
             reader: None,
         }
+    }
+
+    /// WHO A `boss` VERB IN THIS PROBE SIGNS AS — the `actor` an attempt
+    /// records beside `host` (backlog 371b0443).
+    pub(crate) fn probe_actor(&self) -> String {
+        self.probe_actor_with(crate::identity::caller)
+    }
+
+    /// [`Self::probe_actor`], with this process's own resolution passed
+    /// in so a test can name it. Read off how the shell is BUILT, the
+    /// CLI's own order (identity.rs): an actor the door sets by name
+    /// wins; a door that builds the environment from an allow-list
+    /// ([`UNATTENDED_INHERITS`]) hands on neither actor name, and the
+    /// account it drops to has `/nonexistent` for a home
+    /// (infra/forge/probe-account.sh), so no actor file either —
+    /// [`crate::identity::UNIDENTIFIED`]; and the hand door's probe
+    /// inherits this process whole, so it is whoever this process is.
+    pub(crate) fn probe_actor_with(
+        &self,
+        this_process: impl FnOnce() -> Option<crate::identity::Caller>,
+    ) -> String {
+        let set = self
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == crate::identity::ACTOR_ENV)
+            .map(|(_, v)| v.clone());
+        crate::identity::resolve_from(set, None)
+            .or_else(|| self.inherit.is_none().then(this_process).flatten())
+            .map_or_else(|| crate::identity::UNIDENTIFIED.to_string(), |c| c.id)
+    }
+
+    /// THE SHELL A PROBE PLACED BY ITS TEXT ALONE RUNS IN (backlog
+    /// 51587416). `--recheck` re-runs a probe recorded on another host
+    /// when its text reads only the system of record (c89a661e) or only
+    /// git objects at a named revision (da937eb3), and both judgements
+    /// are of the TEXT. The shell it ran in was still this one's
+    /// [`Shell::here`] — the operator's whole environment — so a
+    /// `GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n`, a
+    /// global gitconfig, or an exported function named `git` or
+    /// `boss-sor-read` changed what clean text read (measured on the pod
+    /// 2026-10-18: a recheck that answered HOLDS answered NOT YET with
+    /// `git` exported as a function).
+    ///
+    /// So the probe starts from the unattended door's own allow-list,
+    /// [`UNATTENDED_INHERITS`] — ONE list, so the two doors that run a
+    /// probe whose text was judged anywhere cannot drift apart — and git
+    /// reads only the checkout's own configuration ([`HOST_FREE_GIT`]).
+    /// Everything a probe is legitimately handed is set by name after
+    /// the list and so still reaches it: the system of record's address
+    /// and reader ([`Shell::with_probe_reader`]), the car's instant
+    /// ([`Shell::with_car_instant`]), the empty token directory and the
+    /// not-found channel (`execute_gated`). HOME is not on the list, as
+    /// it is not at the unattended door: here nothing drops to an
+    /// account, so it would be the operator's, and with it their actor
+    /// file and their global gitconfig.
+    pub(crate) fn host_free(mut self) -> Self {
+        self.inherit = Some(&UNATTENDED_INHERITS);
+        self.env.extend(
+            HOST_FREE_GIT
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        self
     }
 
     /// The argv the shell runs — `timeout`, `runuser`, [`NO_NEW_PRIVS`]
@@ -370,8 +659,9 @@ impl Shell {
     }
 
     /// The seconds this run is given. A door that is OPEN holds a
-    /// credential for one recorded command and lives 60 s, so the probe
-    /// behind it lives no longer; with no door the shell's own answer
+    /// credential for one recorded command and lives
+    /// [`crate::probe_reader::MAX_LIFETIME_SECS`], so the probe behind it
+    /// lives no longer; with no door the shell's own answer
     /// stands, which at the hand door is no timeout at all.
     ///
     /// The first cut clamped every shell that NAMED a reader, and every
@@ -696,6 +986,7 @@ pub(crate) fn environment_attempt_json(
     probe: &str,
     expect: Option<&str>,
     host: &str,
+    actor: &str,
     at: &str,
     cause: &str,
     prior: Option<&Value>,
@@ -705,9 +996,10 @@ pub(crate) fn environment_attempt_json(
         stdout: String::new(),
         stderr: String::new(),
         missing_tools: Vec::new(),
+        timing: None,
     };
     let why = environment_why(host, cause);
-    let mut a = attempt_json(probe, expect, &nothing, host, at, &why, prior);
+    let mut a = attempt_json(probe, expect, &nothing, host, actor, at, &why, prior);
     a["exit"] = Value::Null;
     a["environment"] = json!(true);
     a
@@ -741,6 +1033,7 @@ pub(crate) fn refusal_patch(
     probe: &str,
     expect: Option<&str>,
     host: &str,
+    actor: &str,
     at: &str,
     cause: &str,
 ) -> Value {
@@ -751,7 +1044,8 @@ pub(crate) fn refusal_patch(
         PROOF_ENVIRONMENT_REFUSAL: {"at": at, "host": host, "cause": cause},
     });
     if prior.is_none_or(boss_jobs::car::attempt_said_not_yet) {
-        patch["proof_attempt"] = environment_attempt_json(probe, expect, host, at, cause, prior);
+        patch["proof_attempt"] =
+            environment_attempt_json(probe, expect, host, actor, at, cause, prior);
     }
     patch
 }
@@ -1186,10 +1480,12 @@ fn execute_gated(
     // LAST, so nothing the shell set can name a token; the address its
     // door resolved stays, because reading the record is the probe's job.
     no_token.token_only(&mut cmd);
+    let began = std::time::Instant::now();
     let out = cmd
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| anyhow::anyhow!("could not run the probe ({}): {e}", argv[0]));
+    let elapsed_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
     let caught = channel
         .as_deref()
         .map(|c| {
@@ -1205,6 +1501,13 @@ fn execute_gated(
     // Asked while the door still stands, and before anything is made of
     // what the probe said.
     let unserved = reader.as_ref().map(|r| r.unserved()).unwrap_or_default();
+    // Likewise the door's read log, while it stands: a read the kill
+    // left unanswered is still in it, in flight (backlog a32af300).
+    let timing = Timing {
+        elapsed_ms,
+        bound_s: bound,
+        reads: reader.as_ref().map(|r| r.reads()).unwrap_or_default(),
+    };
     if let Some(cause) = unserved_read_refusal(&unserved, exit) {
         return Err(anyhow::Error::new(EnvironmentRefusal {
             cause,
@@ -1213,6 +1516,7 @@ fn execute_gated(
                 stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
                 missing_tools: missing_tools(&caught),
+                timing: Some(timing),
             }),
         }));
     }
@@ -1221,6 +1525,16 @@ fn execute_gated(
     // so where the probe's own last words are, as the forge's did.
     if let (Some(t), TIMEOUT_EXIT) = (bound, exit) {
         stderr.push_str(&format!("\n[boss prove: killed at {t}s timeout]\n"));
+        // ...and which read it was waiting on, where the reader door
+        // took one: the sentence car 5159b6b6's attempt was missing.
+        for read in timing.reads.iter().filter(|read| read.status.is_none()) {
+            stderr.push_str(&format!(
+                "[boss prove: still waiting on {} after {}.{:03}s]\n",
+                read.path,
+                read.ms / 1000,
+                read.ms % 1000
+            ));
+        }
         // The record says whose bound it was when it was not the one
         // this door asked for.
         if let Some(notice) = &clamped {
@@ -1232,6 +1546,7 @@ fn execute_gated(
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr,
         missing_tools: missing_tools(&caught),
+        timing: Some(timing),
     })
 }
 
@@ -1777,11 +2092,19 @@ pub(crate) fn unrunnable_why_unattended(
 /// the replace is the only moment the previous answer is still in hand.
 /// Anything else carries no streak — `null` and `0`, never an absent
 /// key, so the shape the yard reads is one shape.
+///
+/// `actor` is who a `boss` verb in the probe signed as
+/// ([`Shell::probe_actor`]), beside `host`: car f4cdf451's probe read
+/// FAILING because the forge ran as nobody what the builder rehearsed
+/// as itself, and the attempt named the host and not the actor (backlog
+/// 371b0443).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn attempt_json(
     probe: &str,
     expect: Option<&str>,
     o: &Outcome,
     host: &str,
+    actor: &str,
     at: &str,
     why: &str,
     prior: Option<&Value>,
@@ -1801,6 +2124,7 @@ pub(crate) fn attempt_json(
         "stdout": clip(&o.stdout),
         "stderr": clip(&o.stderr),
         "host": host,
+        "actor": actor,
         "probe": probe,
         "expect": expect,
         "why": why,
@@ -1809,6 +2133,23 @@ pub(crate) fn attempt_json(
         // disagree cannot be written from here.
         "not_yet": not_yet,
         "missing_tools": o.missing_tools,
+        // Where the run's time went (backlog a32af300): null and empty
+        // for an outcome no run produced, never an absent key.
+        "elapsed_ms": o.timing.as_ref().map(|t| t.elapsed_ms),
+        "bound_s": o.timing.as_ref().and_then(|t| t.bound_s),
+        "reads": o.timing.as_ref().map_or_else(Vec::new, |t| {
+            t.reads
+                .iter()
+                .map(|read| {
+                    json!({
+                        "path": read.path,
+                        "ms": read.ms,
+                        "status": read.status,
+                        "in_flight": read.status.is_none(),
+                    })
+                })
+                .collect()
+        }),
     })
 }
 
@@ -2100,6 +2441,26 @@ pub(crate) fn admit(probe: &str, from_car: bool) -> Admission {
             evidence = boss_jobs::probe::GIT_TIME_STRING_EVIDENCE,
         )
     });
+    // THE CALLER'S OWN QUEUE (backlog 371b0443) is refused only for a
+    // probe typed HERE: it is recorded and re-run later by somebody else
+    // (`--recheck`, the forge), who reads a different queue. A car's
+    // recorded probe has landed and cannot be re-parked, so it is named
+    // below instead, like the `cd` — and refusing it at the unattended
+    // door would trade a FAILING the attempt now explains (it names the
+    // actor) for a refusal on an ops-request nobody reads.
+    let own_queue = boss_jobs::probe::reads_the_callers_own_queue(probe);
+    let queue = own_queue.filter(|_| !from_car).map(|marker| {
+        format!(
+            "THE PROBE READS `{marker}` — the queue of whoever runs it, so what this verb \
+             would record is a fact about YOU, and `--recheck` and the forge re-run it as \
+             somebody else (the forge as {unidentified}).\n\n{evidence}\n\n\
+             `boss gate --park-probe` refuses this text too. If the claim really is about \
+             one named actor's queue and you are that actor, say so and it runs: \
+             {OVERRIDE_FLAG} '<reason>'. The reason is recorded in the proof.",
+            unidentified = crate::identity::UNIDENTIFIED,
+            evidence = boss_jobs::probe::CALLERS_OWN_QUEUE_EVIDENCE,
+        )
+    });
     let refusal = unidentified
         .map(|text| Refusal {
             rule: UNIDENTIFIED_RULE,
@@ -2110,8 +2471,23 @@ pub(crate) fn admit(probe: &str, from_car: bool) -> Admission {
                 rule: GIT_TIME_RULE,
                 text,
             })
+        })
+        .or_else(|| {
+            queue.map(|text| Refusal {
+                rule: boss_jobs::probe::CALLERS_OWN_QUEUE_RULE,
+                text,
+            })
         });
     let mut warnings: Vec<String> = Vec::new();
+    if from_car && let Some(marker) = own_queue {
+        warnings.push(format!(
+            "boss prove: NOTE — this car's recorded probe reads `{marker}`, the queue of \
+             whoever runs it: here it answers for you, and the forge runs it as {unidentified} \
+             (backlog 371b0443). `boss gate --park-probe` refuses this text; prove the car \
+             by hand with `--probe` and a probe every reader answers the same.",
+            unidentified = crate::identity::UNIDENTIFIED,
+        ));
+    }
     if from_car && let Some(tool) = boss_jobs::probe::needs_absent_tool(probe) {
         warnings.push(format!(
             "boss prove: NOTE — this car's recorded probe invokes `{tool}`, which the \
@@ -2145,6 +2521,51 @@ pub(crate) fn admit(probe: &str, from_car: bool) -> Admission {
     Admission { refusal, warnings }
 }
 
+/// [`admit`], and then the probe judged against the CLAIM it is about to
+/// be recorded as proof of (backlog 490acf06): `verified` naming an
+/// endpoint answer or a latency over a probe that reads only the tree.
+/// Refused for a probe typed here, as the gate refuses it, with the
+/// override every other rule here takes. A car's recorded probe has
+/// landed and cannot be re-parked, so it is named instead — the same
+/// split as the caller's own queue above — and the reader is told the
+/// claim stays NOT OBSERVED whatever this proof records.
+pub(crate) fn admit_against_claim(probe: &str, verified: &str, from_car: bool) -> Admission {
+    let admission = admit(probe, from_car);
+    let Some(words) = boss_jobs::probe::a_tree_read_under_a_production_claim(probe, verified)
+    else {
+        return admission;
+    };
+    if from_car {
+        let note = format!(
+            "boss prove: NOTE — this car's claim names a production behaviour (`{words}`) and \
+             its recorded probe reads only the converged tree, so what it records is a fact \
+             about the source; the claim itself stays NOT OBSERVED (backlog 490acf06). \
+             `boss gate --park-probe` refuses this pair; prove the car by hand with `--probe` \
+             reading the answer through the reader door, the bound asserted inside it."
+        );
+        return Admission {
+            refusal: admission.refusal,
+            warnings: admission.warnings.into_iter().chain([note]).collect(),
+        };
+    }
+    let claim = Refusal {
+        rule: boss_jobs::probe::PRODUCTION_CLAIM_RULE,
+        text: format!(
+            "THE CLAIM NAMES A PRODUCTION BEHAVIOUR (`{words}`) AND THE PROBE READS ONLY THE \
+             CONVERGED TREE — what this verb would record is a fact about the source, filed \
+             under a sentence about production that nothing observed.\n\n{evidence}\n\n\
+             `boss gate --park-probe` refuses this pair too. If the tree read really does \
+             observe the claim, say so and it runs: {OVERRIDE_FLAG} '<reason>'. The reason \
+             is recorded in the proof.",
+            evidence = boss_jobs::probe::PRODUCTION_CLAIM_EVIDENCE,
+        ),
+    };
+    Admission {
+        refusal: admission.refusal.or(Some(claim)),
+        warnings: admission.warnings,
+    }
+}
+
 /// What the UNATTENDED door refuses: everything [`admit`] refuses, and
 /// the gate-log-alone clearance that [`admit`] only warns of (review
 /// 4ce5ca85 N1, backlog ce72aea9).
@@ -2165,16 +2586,15 @@ pub(crate) fn unattended_refusal(car_id: &str, probe: &str) -> Option<Refusal> {
         Some(Refusal {
             rule: boss_jobs::probe::GATE_LOG_ALONE_RULE,
             text: format!(
-                "THE PROBE CLEARS A CALLER FROM THE GATE LOG ALONE — it counts `{kind}` facts \
-                 in the gate window's `.log.dirty` and never reads the live tally's \
-                 `.live[].snapshot.rows`, so a caller the running service had already tallied \
-                 passes whatever it sends, and this door has nobody to ask whether that is \
-                 the claim.\n\n{evidence}\n\n\
+                "THE PROBE {heading} — {reading}, and this door has nobody to ask whether \
+                 that is the claim.\n\n{evidence}\n\n\
                  The car has landed, so it is not re-parked: prove it by hand with a probe \
-                 that also reads the live rows —\n  {by_hand}\n\n\
+                 that also reads the live rows with their coverage —\n  {by_hand}\n\n\
                  If the claim is a PRESENCE — the gate DID state this caller, which the log \
                  answers correctly — run this same probe by hand, where it warns rather than \
                  refuses and a person reads which claim it makes:\n  {from_car}",
+                heading = boss_jobs::probe::gate_log_alone_heading(kind),
+                reading = boss_jobs::probe::gate_log_alone_reading(kind),
                 evidence = boss_jobs::probe::GATE_LOG_ALONE_EVIDENCE,
                 by_hand = boss_jobs::probe::hand_proof_command(car_id),
                 from_car = boss_jobs::probe::from_car_command(car_id),
@@ -2305,16 +2725,14 @@ pub(crate) fn shape_warnings(probe: &str) -> impl Iterator<Item = String> {
     });
     let log_alone = boss_jobs::probe::clears_a_caller_from_the_gate_log_alone(probe).map(|kind| {
         format!(
-            "THIS PROBE CLEARS A CALLER FROM THE GATE LOG ALONE — it counts `{kind}` facts in \
-             the gate window's `.log.dirty` and never reads the live tally's \
-             `.live[].snapshot.rows`. The log holds ONE such fact per caller key per process, \
-             so a caller the running service had already tallied before the cutoff writes no \
-             new fact after it, whatever it sends.\n  {evidence}\n  \
-             THIS SHAPE CAN FAIL OPEN: 'no fact since the cutoff' passes for a caller that \
+            "THIS PROBE {heading} — {reading}.\n  {evidence}\n  \
+             THIS SHAPE CAN FAIL OPEN: 'nothing since the cutoff' passes for a caller that \
              presented nothing. It is a warning and not a refusal only because the text \
              cannot tell that absence claim from a PRESENCE claim — the gate did state this \
-             caller — which the log answers correctly; if yours counts facts to conclude \
-             there are none, add the live reading before this gate starts.",
+             caller — which the reading answers correctly; if yours counts to conclude \
+             there are none, add the live reading with its coverage before this gate starts.",
+            heading = boss_jobs::probe::gate_log_alone_heading(kind),
+            reading = boss_jobs::probe::gate_log_alone_reading(kind),
             evidence = boss_jobs::probe::GATE_LOG_ALONE_EVIDENCE,
         )
     });
@@ -2563,13 +2981,27 @@ pub(crate) enum Rerunnable {
     /// Same host, and the directory is available.
     Here,
     /// Recorded somewhere else. Re-running here tests a different thing.
-    WrongHost { recorded: String, here: String },
-    /// The directory the probe assumed is gone.
-    MissingDir { cwd: String },
+    /// `checkout` says why a checkout here did not place it instead —
+    /// `None` only from [`rerunnable`], which never asks (70cb74d8).
+    WrongHost {
+        recorded: String,
+        here: String,
+        checkout: Option<NoCheckout>,
+    },
+    /// The directory the probe assumed is gone; `checkout` as above.
+    MissingDir {
+        cwd: String,
+        checkout: Option<NoCheckout>,
+    },
     /// The probe reads only the system of record through the sanctioned
     /// reader, so it means the same thing on any host, in any directory
     /// (backlog c89a661e).
     Anywhere,
+    /// The probe reads only git objects at literally named revisions
+    /// ([`boss_jobs::probe::reads_only_git_objects`]), and `root` is the
+    /// top level of a checkout here whose HEAD holds the car's merge —
+    /// so it re-runs there and means the same thing (backlog da937eb3).
+    AnyCheckout { root: String },
 }
 
 /// ABSENT CONTEXT IS NOT A MISMATCH. Proofs recorded before this change
@@ -2589,6 +3021,7 @@ pub(crate) fn rerunnable(
         return Rerunnable::WrongHost {
             recorded: rec.to_string(),
             here: here.to_string(),
+            checkout: None,
         };
     }
     if let Some(dir) = cwd.filter(|c| !c.is_empty())
@@ -2596,6 +3029,7 @@ pub(crate) fn rerunnable(
     {
         return Rerunnable::MissingDir {
             cwd: dir.to_string(),
+            checkout: None,
         };
     }
     Rerunnable::Here
@@ -2608,17 +3042,122 @@ pub(crate) fn rerunnable(
 /// (`with_probe_reader`, 18fee481) — the recorded-host rule was the
 /// only thing keeping a closed car's host-independent claim from being
 /// re-judged on the pod (c89a661e).
+///
+/// And in a checkout here, when its text reads nothing but git objects
+/// at literally named revisions
+/// ([`boss_jobs::probe::reads_only_git_objects`]) and the operator's
+/// checkout holds the car's merge: 12 of 12 W41 rechecks were refused
+/// for exactly such probes, 11 recorded on the workstation and one on a
+/// dev-pod name that no longer exists (da937eb3). The checkout is read
+/// only when the recorded context would otherwise refuse, and a refusal
+/// carries why neither placed it (backlog 70cb74d8).
 pub(crate) fn recheck_placement(
     probe: &str,
     recorded_host: Option<&str>,
     here: &str,
     cwd: Option<&str>,
     dir_exists: bool,
+    checkout_holding_the_car: impl FnOnce() -> Result<String, NoCheckout>,
 ) -> Rerunnable {
     if boss_jobs::probe::reads_only_the_sor(probe) {
         return Rerunnable::Anywhere;
     }
-    rerunnable(recorded_host, here, cwd, dir_exists)
+    let placed = rerunnable(recorded_host, here, cwd, dir_exists);
+    if !matches!(
+        placed,
+        Rerunnable::WrongHost { .. } | Rerunnable::MissingDir { .. }
+    ) {
+        return placed;
+    }
+    let why = match boss_jobs::probe::git_objects_only(probe) {
+        Err(refused) => NoCheckout::Grammar(refused),
+        Ok(()) => match checkout_holding_the_car() {
+            Ok(root) => return Rerunnable::AnyCheckout { root },
+            Err(why) => why,
+        },
+    };
+    match placed {
+        Rerunnable::WrongHost { recorded, here, .. } => Rerunnable::WrongHost {
+            recorded,
+            here,
+            checkout: Some(why),
+        },
+        Rerunnable::MissingDir { cwd, .. } => Rerunnable::MissingDir {
+            cwd,
+            checkout: Some(why),
+        },
+        other => other,
+    }
+}
+
+/// THE CANNOT RE-RUN HERE TEXT, for a placement that refuses; `None` for
+/// one that runs. Its last paragraph names the one reason a checkout here
+/// did not place the probe instead (backlog 70cb74d8), where it used to
+/// list every reason it might have been.
+pub(crate) fn cannot_rerun_here(placement: &Rerunnable, probe: &str) -> Option<String> {
+    let because = |checkout: &Option<NoCheckout>| match checkout {
+        Some(why) => format!("It was not re-run in a checkout here: {why}."),
+        None => "This one runs something else, or reads through the shell, or there is no \
+                 such checkout here."
+            .to_string(),
+    };
+    match placement {
+        Rerunnable::WrongHost {
+            recorded,
+            here,
+            checkout,
+        } => Some(format!(
+            "CANNOT RE-RUN HERE — this proof was recorded on {recorded}, and you are on \
+             {here}.\n  $ {probe}\n\n\
+             The claim has NOT been tested either way, which is a different fact from it \
+             having decayed. Reporting the two identically is how this instrument \
+             false-failed 3 times in 10 (66fd64c6) — probes reference paths, hostnames and \
+             services that exist on the host they were written for, so re-running one \
+             elsewhere tests something else and usually fails.\n  \
+             Re-run it on {recorded}, or, while the car is still open, re-prove it here \
+             with a probe that belongs to this host. A probe that reads ONLY the system \
+             of record through `{reader}` re-runs from any host on its own (c89a661e), \
+             and one that reads only git objects at a named revision (`git show \
+             HEAD:<path>`, `git grep <pattern> HEAD`) re-runs from any checkout whose HEAD \
+             holds the car's merge — run this from one (da937eb3). That second class \
+             is a small grammar: literal words only, with no variable, `$(…)`, `case`, \
+             `if` or loop.\n  {}",
+            because(checkout),
+            reader = boss_jobs::probe::SOR_READER,
+        )),
+        Rerunnable::MissingDir { cwd, checkout } => Some(format!(
+            "CANNOT RE-RUN HERE — this proof was recorded in {cwd}, which does not exist \
+             on this machine.\n  $ {probe}\n\n\
+             A probe that opens `git rev-parse HEAD` means nothing outside a repository. \
+             The claim has not been tested either way.{}",
+            checkout
+                .as_ref()
+                .map(|why| format!("\n  It was not re-run in a checkout here: {why}."))
+                .unwrap_or_default()
+        )),
+        Rerunnable::Here | Rerunnable::Anywhere | Rerunnable::AnyCheckout { .. } => None,
+    }
+}
+
+/// THE SHELL A `--recheck` RUNS ITS PROBE IN, by where it was placed.
+/// A host-free probe runs where the operator stands: the recorded
+/// directory belongs to the host that recorded it (c89a661e). A
+/// git-object probe runs at the top of the checkout that holds the car,
+/// where `HEAD:` and a pathspec mean what they meant on the recording
+/// host (da937eb3). Both of those placements stand on the probe's TEXT
+/// alone, so both run [`Shell::host_free`] (backlog 51587416).
+///
+/// A same-host recheck keeps the hand door's shell, the operator's whole
+/// environment: it re-runs where and as the proof was recorded, by hand,
+/// with that environment, and a probe recorded so may need it — an
+/// in-cluster `kubectl` finds its API server through
+/// `KUBERNETES_SERVICE_HOST`. Its claim never rested on the text.
+fn recheck_shell(placement: &Rerunnable, recorded_cwd: Option<&str>) -> Shell {
+    match placement {
+        Rerunnable::AnyCheckout { root } => Shell::here(Some(Path::new(root))).host_free(),
+        Rerunnable::Anywhere => Shell::here(None).host_free(),
+        _ => Shell::here(recorded_cwd.filter(|d| !d.is_empty()).map(Path::new)),
+    }
 }
 
 /// The matching core `find_car` and `boss job` share: a row matches by
@@ -3103,6 +3642,17 @@ fn probe_registration_patch(
     ) {
         bail!("{refusal}");
     }
+    // The registered probe proves `meaning` unattended, where nobody can
+    // argue an override, so the tree-read-under-a-production-claim pair
+    // is refused outright here (backlog 490acf06).
+    if let Some(words) = boss_jobs::probe::a_tree_read_under_a_production_claim(probe, meaning) {
+        bail!(
+            "--verified claims a production behaviour (`{words}`) and --probe reads only the \
+             converged tree (`{rule}`).\n\n{evidence}",
+            rule = boss_jobs::probe::PRODUCTION_CLAIM_RULE,
+            evidence = boss_jobs::probe::PRODUCTION_CLAIM_EVIDENCE,
+        );
+    }
     if let Some(tool) = boss_jobs::probe::needs_absent_tool(probe) {
         bail!("recorded probe needs {tool}, which the forge does not have");
     }
@@ -3285,7 +3835,8 @@ fn proven_writes(car_id: &str, step_id: &str, md: &Value) -> Vec<(reqwest::Metho
 //
 //   - the probe runs as ANOTHER USER (root drops to $BOSS_PROBE_USER)
 //     in the converged checkout ($BOSS_PROBE_DIR) under a timeout
-//     ($BOSS_PROBE_TIMEOUT, default 60 s) — `Shell::unattended`. On the
+//     ($BOSS_PROBE_TIMEOUT, default the reader door's lifetime,
+//     `probe_reader::MAX_LIFETIME_SECS`) — `Shell::unattended`. On the
 //     forge both are named by the drop-in infra/forge/probe-account.sh
 //     writes: the account boss-probe and its read-only view,
 //     /var/lib/boss/probe-view (backlog 703358ce). There is no default:
@@ -3401,7 +3952,9 @@ impl Shell {
             Some(t) => t.parse::<u64>().map_err(|_| {
                 anyhow::anyhow!("BOSS_PROBE_TIMEOUT={t:?} is not a number of seconds")
             })?,
-            None => 60,
+            // The door's own lifetime: one bound, never a second 60
+            // (backlog a32af300).
+            None => crate::probe_reader::MAX_LIFETIME_SECS,
         };
         Ok(Self {
             path_prefix: None,
@@ -3570,23 +4123,22 @@ pub(crate) fn admit_unattended(car: &Value) -> Admitted {
             .unwrap_or_else(|_| "proven by the probe the car recorded at park time".into())
     };
     let md = car.get("metadata");
-    let marked = |k: &str| md.and_then(|m| m.get(k)).and_then(Value::as_str) == Some("true");
     // THE MARKER IS NOT ENOUGH (review 9daaa7a9 F2). Any UPDATE_JOB
-    // holder can PATCH `proof_owed`, and nothing clears it when a car
+    // holder could PATCH `proof_owed`, and nothing clears it when a car
     // marked owed is later disproved, abandoned or unlanded — each of
     // which skips `proven` exactly as the landing close does. So an owed
-    // proof is run only for a car that is CLOSED, still LANDED by the one
-    // definition (`is_landed`, which reads `unlanded` where the bare
-    // `merged` string above cannot), and neither disproved nor abandoned.
-    let owed = md.is_some_and(boss_jobs::car::owes_proof)
-        && car.get("status").and_then(Value::as_str) == Some("closed")
-        && boss_jobs::car::is_landed(car)
-        && !marked("disproved")
-        && !marked("abandoned");
+    // proof is run, and a paid one stands, only for a car that is CLOSED,
+    // still LANDED by the one definition (`is_landed`, which reads
+    // `unlanded` where the bare `merged` string above cannot), and
+    // neither disproved nor abandoned — each mark read as `is_landed`
+    // reads its own, string or bool (backlog 82946cd9).
+    let fallen = skipped_cause(car);
+    let owed = md.is_some_and(boss_jobs::car::owes_proof) && fallen.is_none();
     let paid = md
         .and_then(|m| m.get(boss_jobs::car::PROOF_OWED))
         .and_then(Value::as_str)
-        == Some("paid");
+        == Some("paid")
+        && fallen.is_none();
     match step.get("status").and_then(Value::as_str).unwrap_or("") {
         "ready" | "active" => {}
         "completed" => return Admitted::AlreadyProven,
@@ -3594,6 +4146,8 @@ pub(crate) fn admit_unattended(car: &Value) -> Admitted {
         // repeat request — filed by hand, re-filed, or the hourly settle
         // of an unsettled one — answers as the step path's repeat does,
         // nothing to run, exit 0, never REFUSED with the wrong reason.
+        // Only while the car still stands: paid and LATER disproved is
+        // not "already proven" (backlog 82946cd9).
         "skipped" if paid => return Admitted::AlreadyProven,
         // THE OBLIGATION'S DOOR (b9005734, car 2). The landing close
         // skipped `proven`, and the marker — not the step — is what is
@@ -3605,9 +4159,21 @@ pub(crate) fn admit_unattended(car: &Value) -> Admitted {
                 verified: verified(),
             };
         }
+        // A skipped step is refused with ITS cause, never a guessed one:
+        // "skipped = abandoned" told an unlanded or disproved car it was
+        // abandoned (backlog 82946cd9).
+        "skipped" => {
+            let cause = fallen.unwrap_or(
+                "it owes no proof: proof_owed is not \"true\", so the step was skipped \
+                 without a debt (abandoned, or closed without one)",
+            );
+            return Admitted::Refused(format!(
+                "{short}'s proven step is \"skipped\" and nothing stands to run — {cause}"
+            ));
+        }
         other => {
             return Admitted::Refused(format!(
-                "{short}'s proven step is {other:?} (pending = not merged; skipped = abandoned)"
+                "{short}'s proven step is {other:?} (pending = not merged)"
             ));
         }
     }
@@ -3622,11 +4188,28 @@ pub(crate) fn admit_unattended(car: &Value) -> Admitted {
     }
 }
 
-/// The car metadata key an owed proof is paid under: the same record
-/// `proven` carries when completed (`verified`, `proof`, `completed_at`)
-/// plus `proven_by`, held on the car because its `proven` step was
-/// skipped by the landing close and a closed packet's steps are history.
-pub(crate) const OWED_PROOF: &str = "owed_proof";
+/// Why a car no longer STANDS to have its owed proof run or its payment
+/// honoured, by its own cause, or `None` when it does: closed, landed,
+/// neither disproved nor abandoned. Each mark is read by
+/// [`boss_jobs::car::is_marked`], the reading `is_landed` uses.
+fn skipped_cause(car: &Value) -> Option<&'static str> {
+    use boss_jobs::car::{is_landed, is_marked};
+    if is_marked(car, "disproved") {
+        Some("the car is disproved: its claim was judged false after it landed")
+    } else if is_marked(car, "abandoned") {
+        Some("the car is abandoned")
+    } else if !is_landed(car) {
+        Some("the car is unlanded: its change was taken back off main")
+    } else if car.get("status").and_then(Value::as_str) != Some("closed") {
+        Some("the car is not closed, so its skipped step is not the landing's")
+    } else {
+        None
+    }
+}
+
+/// The car metadata key an owed proof is paid under — spelled once, in
+/// core, beside the server rule that reserves it (backlog 82946cd9).
+pub(crate) use boss_jobs::car::OWED_PROOF;
 
 /// PURE: the one metadata PATCH that pays an owed proof — the proof on
 /// the car and the marker turned to `paid`, in ONE write, so no reader
@@ -3634,6 +4217,16 @@ pub(crate) const OWED_PROOF: &str = "owed_proof";
 /// reverse. `paid` (not a deleted key) because the obligation's reader
 /// asks `metadata_has=proof_owed`: a paid car stays findable as one
 /// that owed and was paid, and `owes_proof` answers false for it.
+///
+/// THE SERVER ADMITS IT ONLY FROM THE CREDENTIALED RUNNER ON A PROBE
+/// HOST (backlog 82946cd9, `boss_jobs::car::payment_refusal`): both job
+/// doors refuse this patch, 409, from any caller the credential door did
+/// not resolve to `runner:ops` on a host the run-car-probe verb runs on.
+/// So `run_unattended` sends it — and only it — presenting this host's
+/// runner credential ([`runner_credential`]). A credential it cannot
+/// read is said on stderr and the write goes without it: the server's
+/// 409 then refuses the payment loudly, never a payment anyone could
+/// have typed.
 pub(crate) fn owed_paid_patch(
     verified: &str,
     proof: &str,
@@ -3645,6 +4238,48 @@ pub(crate) fn owed_paid_patch(
         (boss_jobs::car::PROOF_OWED): "paid",
         (OWED_PROOF): paid,
     })
+}
+
+/// Where this host's ops-runner credential is read: the variable and
+/// default infra/ops/ops-runner.sh reads, held equal to that line by
+/// `the_payment_reads_the_runners_own_credential_file` (§9a).
+pub(crate) const RUNNER_CREDENTIAL_FILE_ENV: &str = "BOSS_RUNNER_CREDENTIAL_FILE";
+pub(crate) const RUNNER_CREDENTIAL_FILE_DEFAULT: &str = "/etc/boss/ops-runner.credential";
+
+/// PURE: the header a read of the runner credential file makes — the
+/// value as ops-runner.sh's `$(cat …)` reads it, trailing newlines
+/// dropped, marked sensitive so no Debug print carries it — or why not.
+/// A reason never quotes the value.
+pub(crate) fn runner_credential_header(
+    read: std::io::Result<String>,
+) -> std::result::Result<reqwest::header::HeaderValue, String> {
+    let raw = read.map_err(|e| format!("reading it failed: {e}"))?;
+    let value = raw.trim_end_matches('\n');
+    if value.is_empty() {
+        return Err("it is empty".into());
+    }
+    let mut header = reqwest::header::HeaderValue::from_str(value)
+        .map_err(|_| "it is not one header value".to_string())?;
+    header.set_sensitive(true);
+    Ok(header)
+}
+
+/// THIS HOST'S RUNNER CREDENTIAL, for the owed payment alone (backlog
+/// 82946cd9). The verb runs as a child of ops-runner.sh, as the runner's
+/// own account, so it reads the file the runner reads and presents what
+/// the runner presents: no one new can present it, because reading that
+/// root-only file is already all presenting it takes. It is read only
+/// after the probe has run (`run_unattended`), so the builder-authored
+/// probe never runs beside a process that holds it, and it rides only
+/// the payment — no other write this door makes is reserved to the
+/// runner. The error names the file and why, never the value.
+fn runner_credential() -> std::result::Result<reqwest::header::HeaderValue, String> {
+    let file = std::env::var(RUNNER_CREDENTIAL_FILE_ENV)
+        .ok()
+        .filter(|f| !f.trim().is_empty())
+        .unwrap_or_else(|| RUNNER_CREDENTIAL_FILE_DEFAULT.to_string());
+    runner_credential_header(std::fs::read_to_string(&file))
+        .map_err(|why| format!("the runner credential at {file} was NOT presented ({why})"))
 }
 
 /// The one line the ops-request's output leads its verdict with: the
@@ -3745,6 +4380,7 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
         unattended_ground(Shell::unattended()?, car_merge_ref(&car), &base);
     let at = now.to_rfc3339();
     let here = host();
+    let actor = shell.probe_actor();
     let o = match unverified.map_or_else(|| execute_with(&probe, &shell), not_run) {
         Ok(o) => o,
         // The host refused the probe's environment: recorded on the car
@@ -3759,7 +4395,7 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
             let wrote = record_refusal(
                 Door::Unattended,
                 false,
-                &refusal_patch(&car, &probe, Some(&expect), &here, &at, &cause),
+                &refusal_patch(&car, &probe, Some(&expect), &here, &actor, &at, &cause),
                 |patch| async move {
                     crate::sor_client::api(http, reqwest::Method::PATCH, &path, Some(patch))
                         .await
@@ -3796,15 +4432,38 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
                 owed_paid_patch(&verified, &proof, now),
             )],
         };
+        // Only the owed payment presents the runner credential, read
+        // here, after the probe has exited ([`runner_credential`]).
+        let runner = match &step_id {
+            Some(_) => None,
+            None => match runner_credential() {
+                Ok(credential) => Some(credential),
+                Err(why) => {
+                    eprintln!("boss prove: {why}; the jobs API refuses the payment without it");
+                    None
+                }
+            },
+        };
         for (method, path, body) in writes {
-            crate::sor_client::api(&http, method, &path, Some(body))
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "the probe passed but recording it on {short} failed — {e}; re-file \
-                         the ops-request or run boss prove {short} --from-car"
+            let wrote = match &runner {
+                Some(credential) => {
+                    crate::sor_client::api_presenting_runner(
+                        &http,
+                        method,
+                        &path,
+                        Some(body),
+                        credential,
                     )
-                })?;
+                    .await
+                }
+                None => crate::sor_client::api(&http, method, &path, Some(body)).await,
+            };
+            wrote.map_err(|e| {
+                anyhow::anyhow!(
+                    "the probe passed but recording it on {short} failed — {e}; re-file \
+                         the ops-request or run boss prove {short} --from-car"
+                )
+            })?;
         }
         println!(
             "boss prove: {}",
@@ -3831,7 +4490,7 @@ pub(crate) async fn run_unattended(car_id: &str, now: chrono::DateTime<chrono::U
         Verdict::Proven => unreachable!("handled above"),
     };
     let prior = car.pointer("/metadata/proof_attempt");
-    let attempt = attempt_json(&probe, Some(&expect), &o, &here, &at, &why, prior);
+    let attempt = attempt_json(&probe, Some(&expect), &o, &here, &actor, &at, &why, prior);
     let attempt = with_wait_observed(attempt, &car, &shell, prior, &at);
     crate::sor_client::api(
         &http,
@@ -3973,34 +4632,23 @@ pub(crate) async fn run(
             &here,
             rec.cwd.as_deref(),
             dir_exists,
+            || checkout_holding(car_merge_ref(car), &Shell::here(None).host_free()),
         );
+        if let Some(refusal) = cannot_rerun_here(&placement, &probe) {
+            bail!("{refusal}");
+        }
         match &placement {
-            Rerunnable::WrongHost { recorded, here } => bail!(
-                "CANNOT RE-RUN HERE — this proof was recorded on {recorded}, and you are on \
-                 {here}.\n  $ {probe}\n\n\
-                 The claim has NOT been tested either way, which is a different fact from it \
-                 having decayed. Reporting the two identically is how this instrument \
-                 false-failed 3 times in 10 (66fd64c6) — probes reference paths, hostnames and \
-                 services that exist on the host they were written for, so re-running one \
-                 elsewhere tests something else and usually fails.\n  \
-                 Re-run it on {recorded}, or, while the car is still open, re-prove it here \
-                 with a probe that belongs to this host. A probe that reads ONLY the system \
-                 of record through `{reader}` re-runs from any host on its own (c89a661e); \
-                 this one runs something else.",
-                reader = boss_jobs::probe::SOR_READER,
-            ),
-            Rerunnable::MissingDir { cwd } => bail!(
-                "CANNOT RE-RUN HERE — this proof was recorded in {cwd}, which does not exist \
-                 on this machine.\n  $ {probe}\n\n\
-                 A probe that opens `git rev-parse HEAD` means nothing outside a repository. \
-                 The claim has not been tested either way."
-            ),
             Rerunnable::Anywhere => println!(
                 "boss prove: this probe reads only the system of record through `{}`, so it \
                  re-runs here whatever host or directory recorded it",
                 boss_jobs::probe::SOR_READER
             ),
-            Rerunnable::Here => {}
+            Rerunnable::AnyCheckout { root } => println!(
+                "boss prove: this probe reads only git objects at a named revision, so it \
+                 re-runs in {root}, whose HEAD holds the car, whatever host or directory \
+                 recorded it"
+            ),
+            Rerunnable::Here | Rerunnable::WrongHost { .. } | Rerunnable::MissingDir { .. } => {}
         }
         // THE RULES APPLY TO A RE-RUN TOO, and this is the path that
         // most needs them: `--recheck` is the unattended re-run, so a
@@ -4039,14 +4687,9 @@ pub(crate) async fn run(
         // The recorded cwd, and the car's own converged instant read
         // there — a re-run compares against the same fixed cutoff the
         // unattended door hands over, or the claim means a different
-        // thing at each door (a92571a6).
-        // A host-free probe runs where the operator stands: the recorded
-        // directory belongs to the host that recorded it (c89a661e).
-        let cwd = rec
-            .cwd
-            .as_deref()
-            .filter(|d| !d.is_empty() && placement != Rerunnable::Anywhere);
-        let shell = Shell::here(cwd.map(Path::new))
+        // thing at each door (a92571a6). Where, and in what environment,
+        // the placement decides (`recheck_shell`).
+        let shell = recheck_shell(&placement, rec.cwd.as_deref())
             .with_probe_reader(tree.as_deref(), &base)
             .with_car_instant(car_merge_ref(car));
         // A record read on a host with no reader credential is refused
@@ -4164,7 +4807,7 @@ pub(crate) async fn run(
 
     // THE SAME RULES THE GATE APPLIES, AT THIS DOOR (23b2dffa), before
     // the probe runs and before anything is recorded.
-    let admission = admit(&probe, from_car);
+    let admission = admit_against_claim(&probe, &verified, from_car);
     for w in &admission.warnings {
         eprintln!("{w}");
     }
@@ -4236,6 +4879,7 @@ pub(crate) async fn run(
 
     println!("boss prove: {short}  $ {probe}");
     let at = now.to_rfc3339();
+    let actor = shell.probe_actor();
     let o = match execute_with(&probe, &shell) {
         Ok(o) => o,
         // Recorded on the car as the unattended door records it
@@ -4249,7 +4893,7 @@ pub(crate) async fn run(
             let wrote = record_refusal(
                 Door::Hand,
                 dry,
-                &refusal_patch(car, &probe, expect.as_deref(), &host(), &at, &cause),
+                &refusal_patch(car, &probe, expect.as_deref(), &host(), &actor, &at, &cause),
                 |patch| async move {
                     crate::sor_client::api(http, reqwest::Method::PATCH, &path, Some(patch))
                         .await
@@ -4288,7 +4932,16 @@ pub(crate) async fn run(
                 std::process::exit(UNRUNNABLE_EXIT);
             }
             let prior = car.pointer("/metadata/proof_attempt");
-            let attempt = attempt_json(&probe, expect.as_deref(), &o, &here, &at, &why, prior);
+            let attempt = attempt_json(
+                &probe,
+                expect.as_deref(),
+                &o,
+                &here,
+                &actor,
+                &at,
+                &why,
+                prior,
+            );
             crate::sor_client::api(
                 &http,
                 reqwest::Method::PATCH,
@@ -4322,7 +4975,16 @@ pub(crate) async fn run(
                 std::process::exit(NOT_YET_EXIT);
             }
             let prior = car.pointer("/metadata/proof_attempt");
-            let attempt = attempt_json(&probe, expect.as_deref(), &o, &here, &at, &why, prior);
+            let attempt = attempt_json(
+                &probe,
+                expect.as_deref(),
+                &o,
+                &here,
+                &actor,
+                &at,
+                &why,
+                prior,
+            );
             let attempt = with_wait_observed(attempt, car, &shell, prior, &at);
             crate::sor_client::api(
                 &http,
@@ -4485,6 +5147,7 @@ mod tests {
             stdout: stdout.into(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         }
     }
 
@@ -4503,6 +5166,7 @@ mod tests {
             stdout: "nope".into(),
             stderr: "boom".into(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         let e = judge(&o, None).unwrap_err().to_string();
         assert!(e.contains("exited 1"), "{e}");
@@ -4520,6 +5184,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         assert!(
             judge(&o, None).is_err(),
@@ -4545,6 +5210,7 @@ mod tests {
             stdout: String::new(),
             stderr: "MARKER present".into(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         assert!(
             judge(&o, Some("MARKER")).is_ok(),
@@ -5046,7 +5712,8 @@ mod tests {
             rerunnable(Some("mac-studio"), "boss-gcp", None, true),
             Rerunnable::WrongHost {
                 recorded: "mac-studio".into(),
-                here: "boss-gcp".into()
+                here: "boss-gcp".into(),
+                checkout: None,
             }
         );
     }
@@ -5058,7 +5725,8 @@ mod tests {
         assert_eq!(
             rerunnable(Some("h"), "h", Some("/var/lib/boss-train/repo"), false),
             Rerunnable::MissingDir {
-                cwd: "/var/lib/boss-train/repo".into()
+                cwd: "/var/lib/boss-train/repo".into(),
+                checkout: None,
             }
         );
     }
@@ -5098,23 +5766,316 @@ mod tests {
                 Some("david-asus-minipc"),
                 "boss-dev-0",
                 Some("/home/david/boss"),
-                false
+                false,
+                no_checkout,
             ),
             Rerunnable::Anywhere
         );
         assert_eq!(
             recheck_placement(
-                "git show HEAD:x | grep -q y && echo ok",
+                "ssh boss-gcp true && echo ok",
                 Some("david-asus-minipc"),
                 "boss-dev-0",
                 None,
-                true
+                true,
+                || Ok("/work/boss".into()),
             ),
             Rerunnable::WrongHost {
                 recorded: "david-asus-minipc".into(),
-                here: "boss-dev-0".into()
+                here: "boss-dev-0".into(),
+                checkout: Some(NoCheckout::Grammar(boss_jobs::probe::Refused::Command {
+                    command: "ssh boss-gcp true".into()
+                })),
             }
         );
+    }
+
+    fn no_checkout() -> Result<String, NoCheckout> {
+        Err(NoCheckout::NoMerge)
+    }
+
+    /// THE da937eb3 CASE. 12 of 12 sampled W41 rechecks answered CANNOT
+    /// RE-RUN HERE, recorded on `david-asus-minipc` or on a dev-pod name
+    /// that no longer exists, for probes that read only git objects at
+    /// `HEAD`. Such a probe re-runs in any checkout here whose HEAD holds
+    /// the car — in that checkout's top level, never the recorded cwd —
+    /// and without one it keeps the recorded-host refusal.
+    #[test]
+    fn a_probe_that_reads_only_git_objects_rechecks_in_a_checkout_that_holds_the_car() {
+        let tree_only = "git show HEAD:crates/x.rs | grep -F 'pub fn x(' > /dev/null && echo ok";
+        assert_eq!(
+            recheck_placement(
+                tree_only,
+                Some("boss-dev-7c64f98bb7-6trb6"),
+                "boss-dev-549f4b77f6-trdbp",
+                Some("/scratch/gone"),
+                false,
+                || Ok("/work/boss".into()),
+            ),
+            Rerunnable::AnyCheckout {
+                root: "/work/boss".into()
+            }
+        );
+        assert_eq!(
+            recheck_placement(
+                tree_only,
+                Some("david-asus-minipc"),
+                "boss-dev-0",
+                None,
+                true,
+                no_checkout,
+            ),
+            Rerunnable::WrongHost {
+                recorded: "david-asus-minipc".into(),
+                here: "boss-dev-0".into(),
+                checkout: Some(NoCheckout::NoMerge),
+            }
+        );
+        // The same host keeps re-running where it recorded, and never
+        // pays for the checkout read.
+        assert_eq!(
+            recheck_placement(tree_only, Some("h"), "h", Some("/tmp"), true, || {
+                panic!("a same-host recheck needs no other checkout")
+            }),
+            Rerunnable::Here
+        );
+    }
+
+    /// A REFUSED RECHECK SAYS WHICH CAUSE APPLIED (backlog 70cb74d8).
+    /// The text is judged first, and a text outside the grammar never
+    /// reads the checkout; a text inside it carries the witness's own
+    /// answer — on a recorded-host refusal and a missing-directory one
+    /// alike.
+    #[test]
+    fn a_refused_recheck_carries_why_no_checkout_placed_it() {
+        let refused = recheck_placement(
+            "git show HEAD:x | grep -q \"$HOME\"",
+            Some("david-asus-minipc"),
+            "boss-dev-0",
+            None,
+            true,
+            || panic!("a text outside the grammar never reads the checkout"),
+        );
+        assert_eq!(
+            refused,
+            Rerunnable::WrongHost {
+                recorded: "david-asus-minipc".into(),
+                here: "boss-dev-0".into(),
+                checkout: Some(NoCheckout::Grammar(boss_jobs::probe::Refused::Shell {
+                    at: 26,
+                    near: "\"$HOME\"".into(),
+                })),
+            }
+        );
+        let dubious = rev_parse_refused(
+            "/work/boss".into(),
+            Some(128),
+            "fatal: detected dubious ownership in repository at '/work/boss'\n",
+        );
+        assert_eq!(
+            recheck_placement(
+                "git show HEAD:x | grep -q y",
+                Some("h"),
+                "h",
+                Some("/scratch/gone"),
+                false,
+                || Err(dubious.clone()),
+            ),
+            Rerunnable::MissingDir {
+                cwd: "/scratch/gone".into(),
+                checkout: Some(dubious),
+            }
+        );
+    }
+
+    /// THE 51587416 CAUSE, by git's own words. A checkout this user does
+    /// not own is refused by git in the host-free shell, which reads no
+    /// global `safe.directory`. Measured on the pod 2026-10-19 with git
+    /// 2.39.5, uid 65534 reading a root-owned worktree under
+    /// `GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null`, exit 128 and
+    /// this stderr (no CAP_CHOWN here, so a test cannot plant the owner;
+    /// the message is the fixture). Any other rev-parse failure is no
+    /// checkout, and its own first line is kept.
+    #[test]
+    fn a_checkout_this_user_does_not_own_is_named_dubious_ownership() {
+        let stderr = "fatal: detected dubious ownership in repository at '/work/boss/x'\n\
+                      To add an exception for this directory, call:\n\n\
+                      \tgit config --global --add safe.directory /work/boss/x\n";
+        assert_eq!(
+            rev_parse_refused("/work/boss/x".into(), Some(128), stderr),
+            NoCheckout::DubiousOwnership {
+                dir: "/work/boss/x".into(),
+                exit: Some(128),
+                stderr: "fatal: detected dubious ownership in repository at '/work/boss/x'".into(),
+            }
+        );
+        assert_eq!(
+            rev_parse_refused(
+                "/srv/x".into(),
+                Some(128),
+                "fatal: not a git repository (or any of the parent directories): .git\n"
+            ),
+            NoCheckout::NotInACheckout {
+                dir: "/srv/x".into(),
+                exit: Some(128),
+                stderr: "fatal: not a git repository (or any of the parent directories): .git"
+                    .into(),
+            }
+        );
+    }
+
+    /// THE WITNESS NAMES EACH WAY IT REFUSES, run against real git in
+    /// the host-free shell the recheck uses: no merge on record, a
+    /// directory in no repository, a merge the checkout does not have,
+    /// and a merge its HEAD is not descended from — and the checkout
+    /// that holds the car is still placed.
+    #[test]
+    fn the_witness_names_each_way_a_checkout_is_refused() {
+        let dir = boss_testing::scratch::scratch_dir("prove-no-checkout");
+        let repo = dir.join("checkout");
+        let bare = dir.join("nowhere");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&bare).unwrap();
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .expect("git runs");
+            assert!(o.status.success(), "git {args:?}: {o:?}");
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let at = repo.display().to_string();
+        git(&["-C", &at, "init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("f"), "one").unwrap();
+        git(&["-C", &at, "add", "f"]);
+        git(&["-C", &at, "commit", "-q", "-m", "one"]);
+        let first = git(&["-C", &at, "rev-parse", "HEAD"]);
+        git(&["-C", &at, "checkout", "-q", "--orphan", "other"]);
+        git(&["-C", &at, "commit", "-q", "-m", "unrelated"]);
+        let top = git(&["-C", &at, "rev-parse", "--show-toplevel"]);
+        let shell = Shell::here(Some(&repo)).host_free();
+
+        assert_eq!(checkout_holding(None, &shell), Err(NoCheckout::NoMerge));
+
+        // Outside any repository: the ceiling stops git climbing out of
+        // the scratch root into whatever holds it.
+        let mut outside = Shell::here(Some(&bare)).host_free();
+        outside
+            .env
+            .push(("GIT_CEILING_DIRECTORIES".into(), dir.display().to_string()));
+        match checkout_holding(Some(&first), &outside) {
+            Err(NoCheckout::NotInACheckout { dir, exit, stderr }) => {
+                assert_eq!(dir, bare.display().to_string());
+                assert_eq!(exit, Some(128));
+                assert!(stderr.contains("not a git repository"), "{stderr}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A merge this checkout does not have at all.
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+        match checkout_holding(Some(absent), &shell) {
+            Err(NoCheckout::NotHeld {
+                root,
+                merge,
+                exit,
+                stderr,
+            }) => {
+                assert_eq!((root.as_str(), merge.as_str()), (top.as_str(), absent));
+                assert_eq!(exit, Some(128));
+                assert!(stderr.contains(absent), "{stderr}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A merge it has, which its HEAD does not descend from.
+        assert_eq!(
+            checkout_holding(Some(&first), &shell),
+            Err(NoCheckout::NotHeld {
+                root: top.clone(),
+                merge: first.clone(),
+                exit: Some(1),
+                stderr: String::new(),
+            })
+        );
+
+        // And the checkout that holds it is placed.
+        git(&["-C", &at, "checkout", "-q", "main"]);
+        assert_eq!(checkout_holding(Some(&first), &shell), Ok(top));
+    }
+
+    /// THE TEXT NAMES THE CAUSE THAT APPLIED, with its evidence, where it
+    /// used to list three it might have been (backlog 70cb74d8).
+    #[test]
+    fn the_cannot_rerun_here_text_names_the_cause_that_applied() {
+        let probe = "git show HEAD:x | grep -q y";
+        let wrong_host = |checkout| Rerunnable::WrongHost {
+            recorded: "david-asus-minipc".into(),
+            here: "boss-dev-0".into(),
+            checkout,
+        };
+        let text = |p: &Rerunnable| cannot_rerun_here(p, probe).expect("a refusal");
+        let generic = "or there is no such checkout here";
+
+        let dubious = text(&wrong_host(Some(rev_parse_refused(
+            "/work/boss/x".into(),
+            Some(128),
+            "fatal: detected dubious ownership in repository at '/work/boss/x'\n",
+        ))));
+        assert!(dubious.starts_with("CANNOT RE-RUN HERE"), "{dubious}");
+        assert!(
+            dubious.contains(
+                "It was not re-run in a checkout here: git refuses /work/boss/x as a repository \
+                 this user does not own (exit 128: fatal: detected dubious ownership"
+            ),
+            "{dubious}"
+        );
+        assert!(!dubious.contains(generic), "{dubious}");
+
+        let grammar = text(&wrong_host(Some(NoCheckout::Grammar(
+            boss_jobs::probe::Refused::Command {
+                command: "ssh boss-gcp true".into(),
+            },
+        ))));
+        assert!(grammar.contains("`ssh boss-gcp true`"), "{grammar}");
+
+        let behind = text(&wrong_host(Some(NoCheckout::NotHeld {
+            root: "/work/boss".into(),
+            merge: "abc1234".into(),
+            exit: Some(1),
+            stderr: String::new(),
+        })));
+        assert!(
+            behind.contains("/work/boss does not hold the car's merge abc1234")
+                && behind.contains("--is-ancestor`, exit 1)"),
+            "{behind}"
+        );
+
+        let outside = text(&Rerunnable::MissingDir {
+            cwd: "/scratch/gone".into(),
+            checkout: Some(NoCheckout::NotInACheckout {
+                dir: "/srv".into(),
+                exit: Some(128),
+                stderr: "fatal: not a git repository".into(),
+            }),
+        });
+        assert!(
+            outside.contains("/srv is in no checkout git will read")
+                && outside.contains("exit 128: fatal: not a git repository"),
+            "{outside}"
+        );
+
+        // From `rerunnable` alone nothing was asked, and the old sentence
+        // stands; a placement that runs has no refusal text.
+        assert!(text(&wrong_host(None)).contains(generic));
+        assert_eq!(cannot_rerun_here(&Rerunnable::Here, probe), None);
+        assert_eq!(cannot_rerun_here(&Rerunnable::Anywhere, probe), None);
     }
 
     #[test]
@@ -5134,6 +6095,7 @@ mod tests {
             stdout: "ok".into(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         let proof = proof_json(
             "echo ok",
@@ -5529,6 +6491,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         let first = proof_json(
             "old-probe",
@@ -5846,6 +6809,130 @@ mod tests {
         assert!(admit(probe, false).warnings.is_empty());
     }
 
+    /// A PROBE THAT READS THE CALLER'S OWN QUEUE (backlog 371b0443). A
+    /// probe typed at this door is recorded and re-run later by somebody
+    /// else, so it is refused like the gate refuses it, with the rule an
+    /// override records. A car's recorded probe has already landed, so
+    /// it is named rather than refused — the same split as the `cd`
+    /// rule above — and the attempt record says who ran it.
+    #[test]
+    fn a_probe_that_reads_the_callers_own_queue_is_refused_by_hand_and_named_from_a_car() {
+        let probe = "boss orient | grep -A3 'MY WORK' | grep -c \"urgent first, then oldest\"";
+        let hand = admit(probe, false);
+        let r = hand.refusal.expect("refused at the hand door");
+        assert_eq!(r.rule, boss_jobs::probe::CALLERS_OWN_QUEUE_RULE);
+        assert!(r.text.contains("MY WORK"), "{r}");
+        assert!(r.text.contains(OVERRIDE_FLAG), "{r}");
+        assert!(
+            r.text
+                .contains(boss_jobs::probe::CALLERS_OWN_QUEUE_EVIDENCE),
+            "{r}"
+        );
+        let car = admit(probe, true);
+        assert!(car.refusal.is_none(), "{:?}", car.refusal);
+        let w = car
+            .warnings
+            .iter()
+            .find(|w| w.contains("MY WORK"))
+            .expect("the queue read is named");
+        assert!(w.contains("boss gate --park-probe"), "{w}");
+    }
+
+    /// A TREE READ UNDER A PRODUCTION CLAIM (backlog 490acf06). Typed at
+    /// this door with `--verified` naming an endpoint answer or a latency,
+    /// a probe that only reads the tree is refused like the gate refuses
+    /// it, with the rule an override records. A car's recorded probe has
+    /// landed and cannot be re-parked, so it is named rather than
+    /// refused. A source claim over the same probe, and an observing
+    /// probe under the production claim, are both clean.
+    #[test]
+    fn a_tree_probe_under_a_production_claim_is_refused_by_hand_and_named_from_a_car() {
+        let probe = "git show HEAD:crates/core/boss-events/src/history_snapshot.rs | \
+                     grep -c 'sqlx::query_scalar(RELEVANT_COUNT_SQL)'";
+        let claim = "GET /api/stations/flow with the default basis answers in seconds.";
+        let hand = admit_against_claim(probe, claim, false);
+        let r = hand.refusal.expect("refused at the hand door");
+        assert_eq!(r.rule, boss_jobs::probe::PRODUCTION_CLAIM_RULE);
+        assert!(r.text.contains("/api/stations/flow"), "{r}");
+        assert!(r.text.contains(OVERRIDE_FLAG), "{r}");
+        assert!(
+            r.text.contains(boss_jobs::probe::PRODUCTION_CLAIM_EVIDENCE),
+            "{r}"
+        );
+        let car = admit_against_claim(probe, claim, true);
+        assert!(car.refusal.is_none(), "{:?}", car.refusal);
+        let w = car
+            .warnings
+            .iter()
+            .find(|w| w.contains("/api/stations/flow"))
+            .expect("the unobserved claim is named");
+        assert!(w.contains("NOT OBSERVED"), "{w}");
+        let source = admit_against_claim(probe, "history_snapshot.rs counts first.", false);
+        assert!(source.refusal.is_none(), "{:?}", source.refusal);
+        let observed = admit_against_claim(
+            "boss-sor-read /api/stations/flow | jq -e '.stations | length > 0' >/dev/null \
+             && echo flow:ok",
+            claim,
+            false,
+        );
+        assert!(
+            observed
+                .refusal
+                .as_ref()
+                .is_none_or(|r| r.rule != boss_jobs::probe::PRODUCTION_CLAIM_RULE),
+            "{:?}",
+            observed.refusal
+        );
+        // An earlier rule's refusal is kept: the claim rule only speaks
+        // when nothing before it did.
+        let own_queue = admit_against_claim(
+            "boss orient | grep -A3 'MY WORK' | grep -c ordered",
+            "MY WORK answers in 20 s",
+            false,
+        );
+        assert_eq!(
+            own_queue.refusal.map(|r| r.rule),
+            Some(boss_jobs::probe::CALLERS_OWN_QUEUE_RULE)
+        );
+    }
+
+    /// The registration door records a probe a landed car will be proven
+    /// by, unattended, so it refuses the tree-read-under-production-claim
+    /// pair outright: nobody is standing there to override it.
+    #[test]
+    fn registering_a_tree_probe_under_a_production_claim_is_refused() {
+        let car = json!({"id":"c0ffee12", "kind":"ship-a-change", "status":"open",
+            "metadata":{"merged":"true"},
+            "steps":[{"title":PROVEN,"status":"ready"}]});
+        let probe =
+            "git show HEAD:crates/core/boss-jobs/src/http/yard.rs | grep -c 'fn list_every('";
+        let e = probe_registration_patch(
+            &car,
+            probe,
+            "1",
+            "GET /api/yard/status lists every open pr-train",
+            "actor",
+            "time",
+            "registration-1",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("/api/yard/status"), "{e}");
+        assert!(e.contains(boss_jobs::probe::PRODUCTION_CLAIM_RULE), "{e}");
+        assert!(
+            probe_registration_patch(
+                &car,
+                probe,
+                "1",
+                "yard.rs pages the open trains with list_every",
+                "actor",
+                "time",
+                "registration-1",
+            )
+            .is_ok()
+        );
+    }
+
     /// A named read is not this rule's business, and a MENTION is not a
     /// read — the shared command-position scan is what keeps both legal.
     #[test]
@@ -6009,6 +7096,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         let d = failure_diagnosis("some-command --quiet", &o).expect("silence is diagnosable");
         assert!(
@@ -6031,6 +7119,7 @@ mod tests {
             stdout: "CLAIM FAILS for maintenance-backup (jq exit 5)".into(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         assert!(
             failure_diagnosis(
@@ -6067,6 +7156,7 @@ mod tests {
             stdout: "not yet: none\n".into(),
             stderr: stderr.into(),
             missing_tools: Vec::new(),
+            timing: None,
         }
     }
 
@@ -6210,6 +7300,7 @@ ugrep: warning: complete\": No such file or directory\n";
             stdout: "not yet: no disk-report request carrying for_sweep yet\n".into(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         assert!(failure_diagnosis(NULL_COUNT_PROBE, &o).is_none());
         let o = Outcome {
@@ -6217,6 +7308,7 @@ ugrep: warning: complete\": No such file or directory\n";
             stdout: String::new(),
             stderr: "curl: (7) Failed to connect\n".into(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         assert!(failure_diagnosis(NULL_COUNT_PROBE, &o).is_none());
     }
@@ -6334,6 +7426,7 @@ ugrep: warning: complete\": No such file or directory\n";
             stdout: "not yet: no disk-report request carrying for_sweep yet\n".into(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         let Verdict::NotYet { said } = verdict(NULL_COUNT_PROBE, &o, Some("sweep-measured:ok"))
         else {
@@ -6384,6 +7477,7 @@ ugrep: warning: complete\": No such file or directory\n";
             stdout: String::new(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         let Verdict::NotProven(e) = verdict("some-command --quiet", &o, Some("x:ok")) else {
             panic!("silence is a missing record, not a not-yet");
@@ -6403,6 +7497,7 @@ ugrep: warning: complete\": No such file or directory\n";
             stdout: "CLAIM FAILS (jq exit 5)\n".into(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         let Verdict::NotProven(e) = verdict("true", &red, Some("x:ok")) else {
             panic!("exit 1 is still a refusal");
@@ -6420,6 +7515,7 @@ ugrep: warning: complete\": No such file or directory\n";
             stdout: "\n  not yet: from stdout\nmore\n".into(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         assert_eq!(what_it_said(&o).as_deref(), Some("not yet: from stdout"));
         let o = Outcome {
@@ -6427,6 +7523,7 @@ ugrep: warning: complete\": No such file or directory\n";
             stdout: "not yet: from stdout\n".into(),
             stderr: "\ncurl: (7) refused\n".into(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         assert_eq!(what_it_said(&o).as_deref(), Some("curl: (7) refused"));
         let o = Outcome {
@@ -6434,6 +7531,7 @@ ugrep: warning: complete\": No such file or directory\n";
             stdout: "  \n".into(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         assert_eq!(what_it_said(&o), None);
     }
@@ -6570,7 +7668,7 @@ ugrep: warning: complete\": No such file or directory\n";
             !why.contains("CANNOT BE READ") && !why.contains("NOT PROVEN"),
             "the two verdicts about the claim must not appear: {why}"
         );
-        let a = attempt_json(&probe, Some("pods:ok"), &o, "pod-7", "now", &why, None);
+        let a = attempt_json(&probe, Some("pods:ok"), &o, "pod-7", "a", "now", &why, None);
         assert_eq!(a["unrunnable"], true);
         assert_eq!(a["missing_tools"], json!(["kubectl"]));
         assert_eq!(a["not_yet"], false);
@@ -6801,10 +7899,58 @@ ugrep: warning: complete\": No such file or directory\n";
         assert_eq!(o.exit, TIMEOUT_EXIT, "{o:?}");
         assert!(o.stderr.contains("killed at 1s timeout"), "{o:?}");
         assert!(!o.stdout.contains("never"));
+        // ...and how long it ran, under which bound (backlog a32af300):
+        // a kill at the bound is told apart from a fast false claim by
+        // the record, not by re-running it.
+        let timing = o.timing.expect("a run is timed");
+        assert_eq!(timing.bound_s, Some(1));
+        assert!(timing.elapsed_ms >= 1000, "{timing:?}");
+        assert_eq!(timing.reads, [], "no reader door, no reads logged");
         // Under the timeout the exit is the probe's own.
         let o = execute_with("echo fast:ok", &shell).expect("bash runs");
         assert_eq!(o.exit, 0);
         assert!(o.stdout.contains("fast:ok"));
+        assert!(o.timing.expect("a run is timed").elapsed_ms < 1000);
+        // The hand door is timed too, and says it had no bound.
+        let o = execute_with("true", &Shell::here(None)).expect("bash runs");
+        assert_eq!(o.timing.expect("a run is timed").bound_s, None);
+    }
+
+    /// THE VERB OUTLIVES THE PROBE IT RUNS (backlog a32af300; CLAUDE.md
+    /// §9a). The ops runner kills `run-car-probe` at the verb's own
+    /// `timeout`, and a kill there records NOTHING on the car — no
+    /// attempt, no elapsed time, the silence this item exists to end. So
+    /// the verb's bound holds the probe's bound, the KILL that follows
+    /// it, the door's vouch read and the verb's own reads and write
+    /// around them (9.3 s on ops-request f155b56c: 69.3 s for a probe
+    /// killed at 60) with room. And the unattended door's default bound
+    /// is the door's own lifetime, one constant, never a second 60.
+    #[test]
+    fn the_verb_outlives_the_probe_it_runs() {
+        let verb: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                boss_testing::repo_root().join("infra/ops/verbs/run-car-probe.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let verb_timeout = verb["timeout"]
+            .as_u64()
+            .expect("run-car-probe declares a timeout");
+        let probe = crate::probe_reader::MAX_LIFETIME_SECS;
+        assert!(
+            verb_timeout >= probe + KILL_AFTER_SECS + 30,
+            "run-car-probe's timeout ({verb_timeout}s) does not outlive its probe's bound \
+             ({probe}s) plus the kill and the verb's own reads"
+        );
+        let about = verb["about"].as_str().unwrap();
+        assert!(
+            about.contains(&format!("under a {probe} s timeout")),
+            "run-car-probe's about names the probe's bound: {probe} s"
+        );
+        // No host sets BOSS_PROBE_TIMEOUT (measured: nothing in the tree
+        // writes it), so the default is the bound every probe runs under.
+        assert_eq!(Shell::unattended().unwrap().timeout_secs, Some(probe));
     }
 
     /// THE PROBE'S ENVIRONMENT IS THE ONE IT WAS PROMISED and nothing
@@ -7171,6 +8317,55 @@ ugrep: warning: complete\": No such file or directory\n";
         );
     }
 
+    /// A KILLED PROBE NAMES THE READ ITS TIME WENT TO (backlog a32af300).
+    /// Car 5159b6b6's probe read the jobs API's health and then
+    /// `/api/yard/regions?window=24h`, which the system of record took
+    /// 25-122 s to answer; killed at the bound, the attempt said only
+    /// "killed at 60s timeout" beside an empty stdout. Through the
+    /// shipped `boss-sor-read` and a real door, against an upstream that
+    /// never answers the second read: the outcome carries the run's
+    /// elapsed time, its bound and both reads — the first answered, the
+    /// second in flight — and the kill note names the read in flight.
+    #[test]
+    fn a_killed_probe_names_the_read_in_flight_and_how_long_the_run_took() {
+        use crate::probe_reader::fixture;
+        let upstream = fixture::serve(|seen| {
+            axum::Router::new()
+                .route(
+                    "/api/yard/regions",
+                    axum::routing::get(std::future::pending::<http::StatusCode>),
+                )
+                .merge(fixture::recorder(seen))
+                .merge(fixture::accepts_route("reader.current"))
+        });
+        let held = tempfile::tempdir().unwrap();
+        let credential = fixture::credential(held.path(), fixture::VALUE, 0o600);
+        let mut shell = reader_shell(&upstream.base, &credential, "");
+        shell.timeout_secs = Some(2);
+        let o = execute_with(
+            "boss-sor-read /api/jobs/health >/dev/null || exit 43\n\
+             map=$(boss-sor-read '/api/yard/regions?window=24h')\n\
+             echo never",
+            &shell,
+        )
+        .expect("the probe ran");
+        assert_eq!(o.exit, TIMEOUT_EXIT, "{o:?}");
+        let timing = o.timing.as_ref().expect("a run is timed");
+        assert_eq!(timing.bound_s, Some(2), "{timing:?}");
+        assert!(timing.elapsed_ms >= 2000, "{timing:?}");
+        assert_eq!(timing.reads.len(), 2, "{timing:?}");
+        assert_eq!(timing.reads[0].path, "/api/jobs/health");
+        assert_eq!(timing.reads[0].status, Some(207));
+        assert_eq!(timing.reads[1].path, "/api/yard/regions?window=24h");
+        assert_eq!(timing.reads[1].status, None, "{timing:?}");
+        assert!(o.stderr.contains("killed at 2s timeout"), "{o:?}");
+        assert!(
+            o.stderr
+                .contains("still waiting on /api/yard/regions?window=24h after"),
+            "{o:?}"
+        );
+    }
+
     /// A shell at the hand door whose reader door would open on
     /// `credential`, whose port table is `ports` and nothing from the
     /// tree's, and whose probe finds the shipped `boss-sor-read`.
@@ -7318,7 +8513,15 @@ ugrep: warning: complete\": No such file or directory\n";
             assert!(why.starts_with("NOT YET: the probe's result was discarded"));
             assert!(!why.contains("did not run"), "{why}");
             // And on the car it is a not-yet the hourly recheck retries.
-            let patch = refusal_patch(&json!({"metadata": {}}), probe, None, "forge", "t", &cause);
+            let patch = refusal_patch(
+                &json!({"metadata": {}}),
+                probe,
+                None,
+                "forge",
+                "a",
+                "t",
+                &cause,
+            );
             assert!(boss_jobs::car::attempt_said_not_yet(
                 &patch["proof_attempt"]
             ));
@@ -7485,7 +8688,7 @@ ugrep: warning: complete\": No such file or directory\n";
         assert_eq!(reader.ports, "");
     }
 
-    /// F2 (review 0bd6a9c2). The 60 s cap belongs to an OPEN door. With
+    /// F2 (review 0bd6a9c2). The door-lifetime cap belongs to an OPEN door. With
     /// none, each door keeps what it asked for — the hand door no
     /// timeout at all, as its help says — and when a door does shorten
     /// what was asked, the shell says so rather than killing a rehearsed
@@ -7496,9 +8699,10 @@ ugrep: warning: complete\": No such file or directory\n";
             (None, false, None, false),
             (Some(120), false, Some(120), false),
             (Some(2), false, Some(2), false),
-            (None, true, Some(60), true),
-            (Some(120), true, Some(60), true),
-            (Some(60), true, Some(60), false),
+            (None, true, Some(180), true),
+            (Some(300), true, Some(180), true),
+            (Some(180), true, Some(180), false),
+            (Some(120), true, Some(120), false),
             (Some(2), true, Some(2), false),
         ] {
             let mut shell = Shell::here(None).with_probe_reader(None, "http://sor.invalid:7900");
@@ -7514,11 +8718,11 @@ ugrep: warning: complete\": No such file or directory\n";
         }
         let hand = Shell::here(None).with_probe_reader(None, "http://sor.invalid:7900");
         let notice = hand.clamp_notice(true).unwrap();
-        assert!(notice.contains("bounded at 60s"), "{notice}");
+        assert!(notice.contains("bounded at 180s"), "{notice}");
         assert!(notice.contains("asked for no timeout"), "{notice}");
         // Naming a reader bounds nothing by itself.
         assert_eq!(hand.command_line("true", false)[0], "bash");
-        assert_eq!(crate::probe_reader::MAX_LIFETIME_SECS, 60);
+        assert_eq!(crate::probe_reader::MAX_LIFETIME_SECS, 180);
     }
 
     /// THE CAR'S OWN CONVERGED INSTANT IS PART OF THAT PROMISE
@@ -7756,6 +8960,14 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             "{named}\nlive=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=1' | jq --arg cut \"$cut\" '[.live[] | select(.snapshot.mode != \"off\" and .snapshot.overflow == 0 and .snapshot.recording_since <= $cut) | .snapshot.rows[]] | length')"
         );
         assert!(unattended_refusal("c0ffee12", &both).is_none());
+        // And the live rows read ALONE, the tally's start never ordered
+        // against the cut (backlog 002f5f31), are refused like the log.
+        let live_only = "live=$(boss-sor-read '/api/events/gate-window?gate=machine-gate&hours=1' | jq --arg cut \"$cut\" '[.live[] | select(.snapshot.mode != \"off\" and .snapshot.overflow == 0) | .snapshot.rows[] | select(.user == \"automation:estate-observer\" and .presented == \"none\")] | length')";
+        let r = unattended_refusal("c0ffee12", live_only)
+            .unwrap_or_else(|| panic!("the unattended door must refuse: {live_only}"));
+        assert_eq!(r.rule, boss_jobs::probe::GATE_LOG_ALONE_RULE);
+        assert!(r.text.contains(boss_jobs::probe::LIVE_ROWS_ALONE), "{r}");
+        assert!(!r.text.contains("`.log.dirty`"), "{r}");
     }
 
     /// THE COMMANDS A REFUSAL PRINTS ARE COMMANDS THIS VERB TAKES (review
@@ -7885,6 +9097,202 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
         }
     }
 
+    /// The names a door sets on a probe by name, after any allow-list —
+    /// shared by every test that reads a probe's whole environment back.
+    const DOOR_SET: [&str; 8] = [
+        "BOSS_JOBS_URL",
+        "BOSS_SOR_USER",
+        "BOSS_SOR_PORTS",
+        "BOSS_PROBE_NOTFOUND",
+        crate::probe_reader::DOOR_ENV,
+        boss_core::machine_token::TOKEN_DIR_ENV,
+        boss_jobs::probe::CAR_MERGE_REF_VAR,
+        boss_jobs::probe::CAR_CONVERGED_AT_VAR,
+    ];
+    /// What bash exports of its own.
+    const BASH_OWN: [&str; 4] = ["PWD", "OLDPWD", "SHLVL", "_"];
+
+    /// A HOST-FREE RECHECK CANNOT SEE THE OPERATOR'S GIT ENVIRONMENT
+    /// (backlog 51587416, from review 2c318e8f's rework of da937eb3).
+    /// The git-object classifier admits a probe by its TEXT, and the text
+    /// was clean; the shell it ran in was the operator's whole
+    /// environment, so a `GIT_DIR`, a `GIT_CONFIG_*` or an exported
+    /// function named `git` changed what clean text read. Measured on the
+    /// pod before this: `boss prove afd61aa2 --recheck` answered HOLDS,
+    /// and NOT YET with `git` exported as a function, in the same
+    /// AnyCheckout placement. Proven by effect, as the allow-list is:
+    /// this binary re-run with all three planted, the probe, the witness
+    /// that places it and the instant it is handed each read at both
+    /// shells. The hand door's shell must still see the plant — or the
+    /// plant proves nothing.
+    #[test]
+    fn a_host_free_recheck_cannot_see_the_operators_git_environment() {
+        const INNER: &str = "BOSS_PROVE_HOST_FREE_INNER";
+        let probe = "printf 'SHOW=[%s] FN=[%s] ABBREV=[%s] AT=[%s]\\n' \
+                     \"$(git show HEAD:f 2>&1)\" \"$(type -t git)\" \
+                     \"$(git rev-parse --short HEAD 2>&1)\" \"${BOSS_CAR_CONVERGED_AT-}\"; \
+                     printf 'NAMES=%s\\n' \"$(compgen -e | sort | tr '\\n' ' ')\"";
+        if let Ok(repo) = std::env::var(INNER) {
+            let repo = PathBuf::from(repo);
+            let sha = std::env::var("BOSS_PROVE_HOST_FREE_SHA").unwrap();
+            for (door, shell) in [
+                ("here", Shell::here(Some(&repo))),
+                ("host-free", Shell::here(Some(&repo)).host_free()),
+            ] {
+                let witness = checkout_holding(Some(&sha), &shell).unwrap_or_default();
+                let shell = shell
+                    .with_probe_reader(None, "http://sor.invalid:7900")
+                    .with_car_instant(Some(&sha));
+                let o = execute_with(probe, &shell).unwrap();
+                for line in o.stdout.lines() {
+                    println!("{door}: WITNESS=[{witness}] {line}");
+                }
+            }
+            return;
+        }
+        let dir = boss_testing::scratch::scratch_dir("prove-host-free");
+        let repo = dir.join("checkout");
+        let decoy = dir.join("decoy.git");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_DATE", "@1700000000 +0000")
+                .env("GIT_COMMITTER_DATE", "@1700000000 +0000")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .expect("git runs");
+            assert!(o.status.success(), "git {args:?}: {o:?}");
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let at = repo.display().to_string();
+        git(&["-C", &at, "init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("f"), "the-checkout-holds-this").unwrap();
+        git(&["-C", &at, "add", "f"]);
+        git(&["-C", &at, "commit", "-q", "-m", "landed"]);
+        let sha = git(&["-C", &at, "rev-parse", "HEAD"]);
+        let top = git(&["-C", &at, "rev-parse", "--show-toplevel"]);
+        git(&["init", "-q", "--bare", &decoy.display().to_string()]);
+
+        let me = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(me)
+            .args([
+                "--exact",
+                "prove::tests::a_host_free_recheck_cannot_see_the_operators_git_environment",
+                "--nocapture",
+            ])
+            .env(INNER, &repo)
+            .env("BOSS_PROVE_HOST_FREE_SHA", &sha)
+            // The three plants the packet names: another repository, a
+            // command-line config, and a function shadowing the program.
+            .env("GIT_DIR", &decoy)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.abbrev")
+            .env("GIT_CONFIG_VALUE_0", "40")
+            .env("BASH_FUNC_git%%", "() {  echo PLANTED-FUNCTION\n}")
+            .output()
+            .unwrap();
+        let printed = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{printed}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let line = |door: &str, key: &str| -> String {
+            printed
+                .lines()
+                .filter_map(|l| l.strip_prefix(&format!("{door}: ")))
+                .find_map(|l| {
+                    l.split_once(&format!("{key}="))
+                        .map(|(_, rest)| rest.to_string())
+                })
+                .unwrap_or_else(|| panic!("no {door} {key}: {printed}"))
+        };
+        // The control: the hand door's shell sees every plant.
+        let here = line("here", "SHOW");
+        assert!(here.starts_with("[PLANTED-FUNCTION]"), "{printed}");
+        assert!(here.contains("FN=[function]"), "{printed}");
+        assert!(line("here", "WITNESS").starts_with("[]"), "{printed}");
+        assert!(line("here", "NAMES").contains("GIT_DIR"), "{printed}");
+
+        // The host-free shell sees none of them, and reads the checkout.
+        let free = line("host-free", "SHOW");
+        assert!(
+            free.starts_with("[the-checkout-holds-this] FN=[file] "),
+            "{printed}"
+        );
+        let abbrev = free
+            .split_once("ABBREV=[")
+            .and_then(|(_, r)| r.split_once(']'))
+            .map(|(a, _)| a.to_string())
+            .unwrap();
+        assert!(
+            sha.starts_with(&abbrev) && abbrev.len() < sha.len(),
+            "core.abbrev=40 from GIT_CONFIG_* must not reach it: {printed}"
+        );
+        assert!(free.contains("AT=[1700000000]"), "{printed}");
+        assert!(
+            line("host-free", "WITNESS").starts_with(&format!("[{top}]")),
+            "the witness reads the checkout the probe reads: {printed}"
+        );
+        let names: Vec<String> = line("host-free", "NAMES")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let git_pins: Vec<&str> = HOST_FREE_GIT.iter().map(|(k, _)| *k).collect();
+        for name in &names {
+            assert!(
+                UNATTENDED_INHERITS.contains(&name.as_str())
+                    || git_pins.contains(&name.as_str())
+                    || DOOR_SET.contains(&name.as_str())
+                    || BASH_OWN.contains(&name.as_str()),
+                "the host-free probe was handed {name}: {names:?}"
+            );
+        }
+        // What it legitimately reads still reaches it.
+        for name in [
+            "PATH",
+            "BOSS_JOBS_URL",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            boss_jobs::probe::CAR_CONVERGED_AT_VAR,
+            boss_core::machine_token::TOKEN_DIR_ENV,
+        ] {
+            assert!(names.iter().any(|n| n == name), "{name}: {names:?}");
+        }
+    }
+
+    /// The two placements that stand on a probe's text alone run host
+    /// free, from the one allow-list the unattended door uses; a
+    /// same-host recheck keeps the operator's shell, in the recorded
+    /// directory (backlog 51587416).
+    #[test]
+    fn only_the_host_free_placements_run_host_free() {
+        let free = |s: &Shell| {
+            s.inherit == Some(&UNATTENDED_INHERITS[..])
+                && HOST_FREE_GIT
+                    .iter()
+                    .all(|(k, v)| s.env.contains(&(k.to_string(), v.to_string())))
+        };
+        let any = recheck_shell(
+            &Rerunnable::AnyCheckout { root: "/r".into() },
+            Some("/gone"),
+        );
+        assert!(free(&any), "{any:?}");
+        assert_eq!(any.cwd.as_deref(), Some(Path::new("/r")));
+        let anywhere = recheck_shell(&Rerunnable::Anywhere, Some("/gone"));
+        assert!(free(&anywhere), "{anywhere:?}");
+        assert_eq!(anywhere.cwd, None);
+        let here = recheck_shell(&Rerunnable::Here, Some("/recorded"));
+        assert_eq!(here, Shell::here(Some(Path::new("/recorded"))));
+        assert_eq!(recheck_shell(&Rerunnable::Here, Some("")).cwd, None);
+    }
+
     /// THE UNATTENDED PROBE STARTS FROM AN ALLOW-LIST (backlog dda26693,
     /// review acab446c F8b, the environment half). The forge's ops runner
     /// carries the account's own names, the reader's, the host's id, the
@@ -7966,19 +9374,11 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
         let unattended = names("unattended");
         // What the door itself sets, what bash exports of its own, and
         // the allow-list: nothing else.
-        let door_set = [
-            "BOSS_JOBS_URL",
-            "BOSS_SOR_USER",
-            "BOSS_SOR_PORTS",
-            "BOSS_PROBE_NOTFOUND",
-            boss_core::machine_token::TOKEN_DIR_ENV,
-        ];
-        let bash_own = ["PWD", "OLDPWD", "SHLVL", "_"];
         for name in &unattended {
             assert!(
                 UNATTENDED_INHERITS.contains(&name.as_str())
-                    || door_set.contains(&name.as_str())
-                    || bash_own.contains(&name.as_str()),
+                    || DOOR_SET.contains(&name.as_str())
+                    || BASH_OWN.contains(&name.as_str()),
                 "the unattended probe was handed {name}, which is neither the door's own nor \
                  on the allow-list: {unattended:?}"
             );
@@ -8368,6 +9768,69 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
         ));
     }
 
+    /// THE SMALL FINDINGS OF BACKLOG 82946cd9 (reviews 9daaa7a9 and
+    /// e7bf6b14 on car c8ecf66a), each a wrong answer from the door:
+    /// (1) an owed car the standing guard refused was told "skipped =
+    /// abandoned" whatever the cause — an unlanded or disproved car read
+    /// as abandoned; (2) a car paid and LATER disproved answered "already
+    /// proven", exit 0, about a claim its own record now calls false;
+    /// (3) the disproved / abandoned markers were read as the STRING
+    /// "true" only, while `is_landed` reads a bool `true` as the same
+    /// mark, so a bool-disproved owed car was run.
+    #[test]
+    fn an_owed_car_the_door_refuses_is_told_its_own_cause() {
+        let car = |marker: &str, set: &[(&str, Value)]| {
+            let mut m = json!({"merged": "true", "proof_probe": "true && echo x:ok",
+                               "proof_expect": "x:ok", "summary": "the claim"});
+            m[boss_jobs::car::PROOF_OWED] = json!(marker);
+            for (k, v) in set {
+                m[*k] = v.clone();
+            }
+            json!({
+                "id": "aaaaaaaa-0000-4000-8000-000000000000", "kind": "ship-a-change",
+                "status": "closed", "metadata": m,
+                "steps": [{"id": "s-proven", "spec_slug": "proven", "title": PROVEN, "status": "skipped"}]
+            })
+        };
+        let refused = |c: &Value| match admit_unattended(c) {
+            Admitted::Refused(why) => why,
+            other => panic!("refused, not {other:?}"),
+        };
+        // (1) each cause by its own name, never another's.
+        let unlanded = refused(&car(
+            "true",
+            &[(boss_jobs::car_unland::UNLANDED_MARKER, json!("true"))],
+        ));
+        assert!(unlanded.contains("unlanded"), "{unlanded}");
+        assert!(!unlanded.contains("abandoned"), "{unlanded}");
+        let disproved = refused(&car("true", &[("disproved", json!("true"))]));
+        assert!(disproved.contains("disproved"), "{disproved}");
+        assert!(!disproved.contains("abandoned"), "{disproved}");
+        let mut open = car("true", &[]);
+        open["status"] = json!("open");
+        let open = refused(&open);
+        assert!(open.contains("not closed"), "{open}");
+        assert!(!open.contains("abandoned"), "{open}");
+        let abandoned = refused(&car("true", &[("abandoned", json!("true"))]));
+        assert!(abandoned.contains("abandoned"), "{abandoned}");
+        // (2) paid, then disproved: the payment no longer stands.
+        let paid_then_disproved = refused(&car("paid", &[("disproved", json!("true"))]));
+        assert!(
+            paid_then_disproved.contains("disproved"),
+            "{paid_then_disproved}"
+        );
+        // (3) a bool mark is the same mark.
+        for key in ["disproved", "abandoned"] {
+            let why = refused(&car("true", &[(key, json!(true))]));
+            assert!(why.contains(key), "{why}");
+        }
+        // CONTROL: an explicit false marks nothing, so the debt is run.
+        assert!(matches!(
+            admit_unattended(&car("true", &[("disproved", json!(false))])),
+            Admitted::Owed { .. }
+        ));
+    }
+
     /// PAYING IT: the proof lands on the CAR, never on its skipped step
     /// (a closed packet's steps are history), and the marker turns to
     /// `paid`, so the obligation stops asking and a reader sees what paid
@@ -8385,6 +9848,77 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
         assert_eq!(paid["proven_by"], PROVEN_BY);
         assert!(paid["completed_at"].as_str().is_some_and(|s| !s.is_empty()));
         assert!(!boss_jobs::car::owes_proof(&patch));
+    }
+
+    /// THE CREDENTIAL THE PAYMENT PRESENTS (backlog 82946cd9): what a
+    /// read of this host's runner credential file makes a header of —
+    /// the value as ops-runner.sh's `$(cat …)` reads it (trailing
+    /// newlines dropped), marked sensitive so no Debug print carries it —
+    /// and why not otherwise, never naming the value.
+    #[test]
+    fn the_runner_credential_is_one_sensitive_header_or_a_reason() {
+        let h = runner_credential_header(Ok("fixture-credential\n\n".into())).unwrap();
+        assert_eq!(h.to_str().unwrap(), "fixture-credential");
+        assert!(h.is_sensitive());
+        assert!(!format!("{h:?}").contains("fixture-credential"));
+
+        let empty = runner_credential_header(Ok("\n".into())).unwrap_err();
+        assert!(empty.contains("empty"), "{empty}");
+        let two = runner_credential_header(Ok("secret-one\nsecret-two\n".into())).unwrap_err();
+        assert!(two.contains("not one header value"), "{two}");
+        assert!(
+            !two.contains("secret"),
+            "a reason never carries the value: {two}"
+        );
+        let denied = runner_credential_header(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )))
+        .unwrap_err();
+        assert!(denied.contains("reading it failed"), "{denied}");
+    }
+
+    /// The file the payment reads its credential from IS the runner's:
+    /// the variable and default infra/ops/ops-runner.sh reads, so the
+    /// verb it runs presents what the runner itself presents (§9a: a
+    /// fact that lives twice gets an equality test).
+    #[test]
+    fn the_payment_reads_the_runners_own_credential_file() {
+        let runner =
+            std::fs::read_to_string(boss_testing::repo_root().join("infra/ops/ops-runner.sh"))
+                .unwrap();
+        let line = format!(
+            "RUNNER_CREDENTIAL_FILE=\"${{{RUNNER_CREDENTIAL_FILE_ENV}:-{RUNNER_CREDENTIAL_FILE_DEFAULT}}}\""
+        );
+        assert!(
+            runner.lines().any(|l| l.trim() == line),
+            "ops-runner.sh must read the credential as `{line}`"
+        );
+    }
+
+    /// WHERE THE CREDENTIAL RIDES, AND WHEN IT IS READ (backlog
+    /// 82946cd9). Only the owed payment presents it — the one write the
+    /// jobs API reserves to the runner — and it is read only after the
+    /// probe has run, so the builder-authored probe never runs in a
+    /// process that holds it. A source pin, because the order is the
+    /// property and run_unattended has no seam short of a forge host.
+    #[test]
+    fn only_the_owed_payment_presents_the_runner_credential_and_after_the_probe() {
+        let prod = include_str!("prove.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("");
+        let door = prod
+            .split("pub(crate) async fn run_unattended(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("run_unattended");
+        assert_eq!(door.matches("api_presenting_runner(").count(), 1, "{door}");
+        assert_eq!(prod.matches("api_presenting_runner(").count(), 1);
+        let ran = door.find("execute_with(").expect("the probe runs");
+        let read = door
+            .find("runner_credential()")
+            .expect("the credential is read");
+        assert!(ran < read, "the credential is read after the probe ran");
     }
 
     /// THE OUTPUT SHAPE THE PACKET'S READERS EXPECT: the verdict line
@@ -9309,6 +10843,7 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             "echo claim:ok",
             Some("claim:ok"),
             "forge",
+            "operator:unidentified",
             "2026-10-01T09:00:00Z",
             "making the empty token directory a child runs with: No space left on device",
             None,
@@ -9336,6 +10871,7 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             "echo claim:ok",
             Some("claim:ok"),
             "forge",
+            "operator:unidentified",
             "2026-10-01T10:00:00Z",
             "again",
             Some(&a),
@@ -9381,12 +10917,14 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             stdout: "nope".into(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         let red = attempt_json(
             "echo claim:ok",
             Some("claim:ok"),
             &failed,
             "forge",
+            "operator:unidentified",
             "2026-10-01T08:00:00Z",
             "FAILED: printed nope",
             None,
@@ -9398,6 +10936,7 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             "echo claim:ok",
             Some("claim:ok"),
             "forge",
+            "operator:unidentified",
             "2026-10-01T09:00:00Z",
             REFUSED_CAUSE,
         );
@@ -9432,6 +10971,7 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             "echo claim:ok",
             Some("claim:ok"),
             "forge",
+            "operator:unidentified",
             "2026-10-01T09:00:00Z",
             REFUSED_CAUSE,
         );
@@ -9458,7 +10998,7 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
         );
         // A `proof_attempt: null` is no prior either.
         let null = refused_car(Some(Value::Null));
-        let p = refusal_patch(&null, "echo claim:ok", None, "forge", "t", "c");
+        let p = refusal_patch(&null, "echo claim:ok", None, "forge", "a", "t", "c");
         assert!(p.get("proof_attempt").is_some(), "{p}");
     }
 
@@ -9472,6 +11012,7 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             "echo claim:ok",
             Some("claim:ok"),
             "forge",
+            "operator:unidentified",
             "2026-10-01T09:00:00Z",
             REFUSED_CAUSE,
         );
@@ -9481,6 +11022,7 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             "echo claim:ok",
             Some("claim:ok"),
             "forge",
+            "operator:unidentified",
             "2026-10-01T10:00:00Z",
             REFUSED_CAUSE,
         );
@@ -9503,7 +11045,15 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
     #[tokio::test]
     async fn the_recording_doors_hand_the_refusal_to_their_writer() {
         let car = refused_car(None);
-        let patch = refusal_patch(&car, "echo claim:ok", None, "forge", "t", REFUSED_CAUSE);
+        let patch = refusal_patch(
+            &car,
+            "echo claim:ok",
+            None,
+            "forge",
+            "a",
+            "t",
+            REFUSED_CAUSE,
+        );
         for (door, dry, writes) in [
             (Door::Unattended, false, true),
             (Door::Hand, false, true),
@@ -9552,8 +11102,18 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             stdout: "not yet: none\n".into(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
-        let a = attempt_json("true", Some("x:ok"), &o, "h", "now", "NOT YET: none", None);
+        let a = attempt_json(
+            "true",
+            Some("x:ok"),
+            &o,
+            "h",
+            "operator:unidentified",
+            "now",
+            "NOT YET: none",
+            None,
+        );
         let keys: std::collections::BTreeSet<&str> =
             a.as_object().unwrap().keys().map(String::as_str).collect();
         let want: std::collections::BTreeSet<&str> = [
@@ -9562,12 +11122,16 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             "stdout",
             "stderr",
             "host",
+            "actor",
             "probe",
             "expect",
             "why",
             "unrunnable",
             "not_yet",
             "missing_tools",
+            "elapsed_ms",
+            "bound_s",
+            "reads",
             boss_jobs::car::NOT_YET_SINCE,
             boss_jobs::car::NOT_YET_RUNS,
         ]
@@ -9576,6 +11140,103 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
         assert_eq!(keys, want);
         assert_eq!(a["not_yet"], true);
         assert_eq!(a["unrunnable"], false);
+        assert_eq!(a["actor"], "operator:unidentified");
+        // An outcome no run produced says so with nulls, never an absent
+        // key: one shape for every reader.
+        assert_eq!(a["elapsed_ms"], Value::Null);
+        assert_eq!(a["bound_s"], Value::Null);
+        assert_eq!(a["reads"], json!([]));
+    }
+
+    /// THE ATTEMPT SAYS HOW LONG THE RUN TOOK AND WHERE ITS TIME WENT
+    /// (backlog a32af300). The shape of car 5159b6b6's attempt at 14:00Z,
+    /// with what the run measured: killed at the bound, the health read
+    /// answered in a third of a second, the map read still waiting.
+    #[test]
+    fn the_attempt_records_the_runs_elapsed_time_bound_and_reads() {
+        use crate::probe_reader::ReadTiming;
+        let o = Outcome {
+            exit: TIMEOUT_EXIT,
+            stdout: String::new(),
+            stderr: "\n[boss prove: killed at 180s timeout]".into(),
+            missing_tools: Vec::new(),
+            timing: Some(Timing {
+                elapsed_ms: 180_412,
+                bound_s: Some(180),
+                reads: vec![
+                    ReadTiming {
+                        path: "/api/jobs/health".into(),
+                        ms: 315,
+                        status: Some(200),
+                    },
+                    ReadTiming {
+                        path: "/api/yard/regions?window=24h".into(),
+                        ms: 179_870,
+                        status: None,
+                    },
+                ],
+            }),
+        };
+        let a = attempt_json(
+            "true",
+            Some("x:ok"),
+            &o,
+            "forge",
+            "operator:unidentified",
+            "now",
+            "the probe exited 124",
+            None,
+        );
+        assert_eq!(a["elapsed_ms"], 180_412);
+        assert_eq!(a["bound_s"], 180);
+        assert_eq!(
+            a["reads"],
+            json!([
+                {"path": "/api/jobs/health", "ms": 315, "status": 200, "in_flight": false},
+                {"path": "/api/yard/regions?window=24h", "ms": 179_870, "status": null, "in_flight": true},
+            ])
+        );
+    }
+
+    /// WHO RAN THE PROBE (backlog 371b0443). The attempt names the host
+    /// and, since this item, the actor a `boss` verb in the probe signed
+    /// as — because car f4cdf451's FAILING was the forge reading as
+    /// nobody what the builder had rehearsed as itself, and the record
+    /// said where it ran but not as whom. The unattended door builds the
+    /// probe's environment and names no actor, so it reads as
+    /// unidentified whatever this process is; a door that sets one says
+    /// it; the hand door's probe inherits this process whole, so it is
+    /// whoever this process resolves to.
+    #[test]
+    fn the_attempt_names_the_actor_the_probe_ran_as() {
+        let unattended = Shell {
+            inherit: Some(&UNATTENDED_INHERITS),
+            strip: vec![
+                crate::identity::ACTOR_ENV.to_string(),
+                crate::identity::ACTOR_FILE_ENV.to_string(),
+            ],
+            ..Shell::here(None)
+        };
+        let me = || {
+            Some(crate::identity::Caller {
+                id: "agent-claude".into(),
+                source: crate::identity::Source::Env,
+            })
+        };
+        assert_eq!(
+            unattended.probe_actor_with(me),
+            crate::identity::UNIDENTIFIED
+        );
+        let named = Shell {
+            env: vec![(crate::identity::ACTOR_ENV.into(), "agent-x".into())],
+            ..unattended.clone()
+        };
+        assert_eq!(named.probe_actor_with(me), "agent-x");
+        assert_eq!(Shell::here(None).probe_actor_with(me), "agent-claude");
+        assert_eq!(
+            Shell::here(None).probe_actor_with(|| None),
+            crate::identity::UNIDENTIFIED
+        );
     }
 
     /// THE ATTEMPT CARRIES ITS NOT-YET STREAK (backlog adef5ddf). Both
@@ -9591,6 +11252,7 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             stdout: "not yet: none\n".into(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         let prior = json!({
             "at": "2026-09-23T06:00:00Z", "exit": 75, "not_yet": true, "probe": "true",
@@ -9601,6 +11263,7 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             Some("x:ok"),
             &o,
             "h",
+            "a",
             "2026-09-23T07:00:00Z",
             "NOT YET: none",
             Some(&prior),
@@ -9613,12 +11276,14 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             stdout: String::new(),
             stderr: "FAILED\n".into(),
             missing_tools: Vec::new(),
+            timing: None,
         };
         let a = attempt_json(
             "true",
             Some("x:ok"),
             &red,
             "h",
+            "a",
             "2026-09-23T07:00:00Z",
             "FAILED",
             Some(&prior),
@@ -9666,8 +11331,18 @@ case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally 
             stdout: "not yet: none\n".into(),
             stderr: String::new(),
             missing_tools: Vec::new(),
+            timing: None,
         };
-        let attempt = attempt_json("true", Some("x:ok"), &o, "h", "T1", "NOT YET: none", None);
+        let attempt = attempt_json(
+            "true",
+            Some("x:ok"),
+            &o,
+            "h",
+            "a",
+            "T1",
+            "NOT YET: none",
+            None,
+        );
         let car = |seen: &str| json!({"metadata": {"waits_on": boss_jobs::car::waits_on_value("an event", Some(seen))}});
         let shell = Shell::here(None);
 

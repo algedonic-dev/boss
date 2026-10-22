@@ -1375,6 +1375,7 @@ const GATED: &[(&str, &str)] = &[
     ("forge/forge-converge.sh", "forge"),
     ("forge/root-tree.sh", "forge"),
     ("forge/probe-account.sh", "forge"),
+    ("forge/netboot.sh", "forge"),
     ("forge/machine-token-deposit.sh", "forge"),
     ("forge/probe-reader-deposit.sh", "forge"),
     ("forge/registry-token-deposit.sh", "forge"),

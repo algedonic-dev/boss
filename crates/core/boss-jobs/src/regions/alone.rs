@@ -126,6 +126,41 @@ pub fn place_alone(
     now: Instant,
     window_hours: i64,
 ) -> Placed {
+    place_one(packet, family, stations, now, window_hours, false)
+}
+
+/// [`place_alone`], with the stations judged over the packet WHATEVER
+/// ITS FAMILY — as the live read judges them, over every open packet
+/// (backlog 15418f03). A merged car whose `landed-review` is ready is
+/// claimed by no region of a car's own (not the dock, not the garage,
+/// not the shed) and stands at the landed-review station, so the live
+/// partition places it in marshalling, and its review run is dispatched
+/// from there; [`place_alone`] asked the stations only of the inbound
+/// and stationed families and placed that car nowhere.
+///
+/// WHY A SIBLING, NOT AN EDIT TO [`place_alone`]: the frozen derivation
+/// (`crate::routes`) is the move-diagnosis model's content, and an
+/// answer changed under it would change the model under the same
+/// identifier (see `crate::routes_every_stand`'s module note). The
+/// live readers' dispatch origins take this one.
+pub fn place_alone_at_every_station(
+    packet: &(Job, Vec<Step>),
+    family: Family,
+    stations: &Stations,
+    now: Instant,
+    window_hours: i64,
+) -> Placed {
+    place_one(packet, family, stations, now, window_hours, true)
+}
+
+fn place_one(
+    packet: &(Job, Vec<Step>),
+    family: Family,
+    stations: &Stations,
+    now: Instant,
+    window_hours: i64,
+    every_family_at_stations: bool,
+) -> Placed {
     let (job, steps) = packet;
     let one = std::slice::from_ref(packet);
     let none: &[(Job, Vec<Step>)] = &[];
@@ -161,8 +196,9 @@ pub fn place_alone(
     );
     // The live stations are judged over the OPEN packets only (a station
     // predicate's universe), so a closed packet stands at none.
-    let at_stations: Vec<StationReading> = match family {
-        Family::Inbound | Family::Stationed if open => stations
+    let judged = every_family_at_stations || matches!(family, Family::Inbound | Family::Stationed);
+    let at_stations: Vec<StationReading> = if judged && open {
+        stations
             .others
             .iter()
             .filter(|(_, p)| p.matches(job, steps))
@@ -171,12 +207,14 @@ pub fn place_alone(
                 over_limit: false,
                 members: vec![job.id.to_string()],
                 served: None,
-                flow_blind: None,
+                flow_unread: None,
                 previous_served: None,
                 opened: Default::default(),
+                standing: Vec::new(),
             })
-            .collect(),
-        _ => Vec::new(),
+            .collect()
+    } else {
+        Vec::new()
     };
     let inputs = RegionInputs {
         internal_protocols: None,

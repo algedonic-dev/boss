@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 mod attach;
 mod automations;
 mod brief;
+mod browser_observation;
 mod built_from;
 mod bundle_lineage;
 mod cadence;
@@ -37,6 +38,7 @@ mod door_env;
 mod envelope;
 mod estate;
 mod events;
+mod experiment;
 mod freshness;
 mod gate;
 mod gate_retire;
@@ -85,6 +87,7 @@ mod roster;
 mod running;
 mod scratch_target;
 mod script;
+mod session_window;
 mod shared_checkout;
 mod sor_client;
 mod source_backfill;
@@ -97,9 +100,11 @@ mod tenant_stamp;
 mod top_board;
 mod train;
 mod train_gate;
+mod train_gate_reuse;
 mod transcript_profile;
 mod transcript_usage;
 mod trust_boundary;
+mod twin;
 mod upgrade;
 mod workflow;
 #[path = "../workflow_roster.rs"]
@@ -137,6 +142,8 @@ enum Commands {
     DevControlContract,
     #[command(flatten)]
     Roster(roster::Cmd),
+    #[command(flatten)]
+    Browser(browser_observation::Cmd),
     #[command(flatten)]
     Launch(launch::Cmd),
     /// Post-install health check — verifies Postgres, NATS, gateway,
@@ -246,10 +253,11 @@ enum Commands {
         // A reason explains a withdrawal and nothing else, so a branch
         // refuses one outright: clap's `requires` on the reason did not
         // fire beside `required_unless_present` (measured under 4.6).
-        // The successor of a retirement is refused the same way.
+        // The successor of a retirement, and a green's reason for one,
+        // are refused the same way.
         #[arg(
             required_unless_present_any = ["withdraw", "retire"],
-            conflicts_with_all = ["reason", "reason_file", "superseded_by"]
+            conflicts_with_all = ["reason", "reason_file", "superseded_by", "green_anyway"]
         )]
         branch: Option<String>,
         /// Retire a CLOSED gate-run no car ever claimed, because another
@@ -259,6 +267,12 @@ enum Commands {
         /// gate-run, and the garage stops drawing its branch. Measured
         /// 2026-10-17: 14 of 17 reds in the garage were superseded and
         /// no door could take them out (backlog c9c48222).
+        ///
+        /// A retirement launches nothing and files no car, so every
+        /// --park-* flag and --namespace is REFUSED beside it rather than
+        /// dropped in silence: an operator who typed one meant something
+        /// this verb would not do (F4 of review 10cfcb8b, backlog
+        /// 1fb357f4). A GREEN is refused unless --green-anyway says why.
         #[arg(
             long,
             value_name = "GATE-RUN",
@@ -266,13 +280,27 @@ enum Commands {
             conflicts_with_all = [
                 "branch", "withdraw", "reason", "reason_file", "wait", "submit", "mode",
                 "manifest", "rebase", "hold", "force_regate", "stale_base_anyway", "park_file",
+                "namespace", "park_summary", "park_excludes", "park_test", "park_verified",
+                "park_backlog_item", "park_partial_item", "park_no_item", "park_design",
+                "park_after", "park_also_answers", "park_probe", "park_probe_file",
+                "park_expect", "park_expect_file", "park_proof_event", "park_waits_on",
+                "park_waits_on_seen", "park_waits_on_owner", "park_waits_on_max_wait_hours",
             ]
         )]
         retire: Option<String>,
         /// The successor that landed (with --retire): its branch, 8+
-        /// characters of its car's id, or the merge sha that landed it.
+        /// characters of its car's id (enough to pick one car), or the
+        /// 7-40 hex sha of the commit that carries the red's work —
+        /// never a revision expression: `main`, `HEAD~N` and
+        /// `<branch>~N` name a commit on main whatever the red carried.
         #[arg(long, requires = "retire", value_name = "LANDED")]
         superseded_by: Option<String>,
+        /// Retire a GREEN (with --retire), saying why. A green no car
+        /// carries is stranded, not superseded, so it is refused without
+        /// this; the reason is recorded on the gate-run as
+        /// `green_anyway`.
+        #[arg(long, requires = "retire", value_name = "WHY")]
+        green_anyway: Option<String>,
         /// Withdraw a gate-run whose purpose is gone, before any runner
         /// pod exists: close it on the protocol's `withdrawn` terminal
         /// with the reason, deleting a queued Job whose pod never
@@ -520,7 +548,8 @@ enum Commands {
         /// default: a landed branch's next step is deletion, and a
         /// re-gate that inherits stale park intent files a twin car
         /// that boards an empty diff (610537b2). Never combines with
-        /// --park-*.
+        /// --park-*, nor with --mode auto on a head already ON main,
+        /// which has no diff for --auto to scope (7c833bd5).
         #[arg(long, value_name = "REASON")]
         force_regate: Option<String>,
         /// Gate a branch whose base is BEHIND origin/main, stating why
@@ -617,6 +646,13 @@ enum Commands {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// An operator session's own record — its work-session packet
+    /// (backlog 37e3295c). Grouped like `Job`: a new session verb lands
+    /// inside `SessionAction`.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
     /// The cadence registry's write verbs — retire a rule by name,
     /// publish a version from its bundle file (13d1fff3). The loop
     /// that RUNS the schedule is `boss train cadence`.
@@ -705,9 +741,11 @@ enum Commands {
         /// packet from the queue instead.
         #[arg(required_unless_present = "next")]
         packet: Option<String>,
-        /// THE DURABLE INBOX (design 8382bbb2): take the first piece of
-        /// waiting work at --station and dispatch that, instead of a
-        /// packet named here. The queue is the record, so the work
+        /// THE DURABLE INBOX (design 8382bbb2): take the first ready step
+        /// at --station, in its own order (priority, then age), that is
+        /// nominated to you (by any id the agents registry ties to you),
+        /// else the first one nobody holds, and dispatch
+        /// that instead of a packet named here (backlog 67d4344b). The queue is the record, so the work
         /// outlives whatever put it there — a dispatch that lived in a
         /// session orphaned fifteen runs when that session died on
         /// 2026-09-19.
@@ -1051,7 +1089,7 @@ enum Commands {
         /// the car's `proof_probe` / `proof_expect`) instead of one
         /// given here. `--verified` defaults to the car's summary.
         /// Runs HERE, on this box — as you, with no timeout unless a
-        /// reader door opens for it (60 s, and it says so) — but in
+        /// reader door opens for it (180 s, and it says so) — but in
         /// the environment the forge's own door builds: the sanctioned
         /// reader first on PATH and the read-scoped identity and port
         /// table exported, so the two doors run one text one way
@@ -1204,6 +1242,8 @@ enum Commands {
     #[command(flatten)]
     Events(events::Cmd),
     #[command(flatten)]
+    Experiment(experiment::Cmd),
+    #[command(flatten)]
     Ledger(ledger::Cmd),
     #[command(flatten)]
     Merged(merged::Cmd),
@@ -1321,8 +1361,18 @@ enum CarAction {
         /// The next observable check, as an RFC3339 time.
         #[arg(long)]
         next_check_at: Option<String>,
+        /// The kind of packet whose CLOSE the probe waits on (gate-run,
+        /// ops-request, ...). When one closes, the dispatcher re-runs the
+        /// car's recorded probe at once instead of at the next hourly
+        /// recheck (rule rerun-waiting-probes-on-their-declared-close).
+        #[arg(long)]
+        event_closes: Option<String>,
+        /// Narrow --event-closes to a closing packet whose title starts
+        /// with this (an ops-request's title leads with its verb).
+        #[arg(long, requires = "event_closes")]
+        event_title: Option<String>,
         /// Remove the declaration.
-        #[arg(long, conflicts_with_all = ["on", "seen", "owner", "max_wait_hours", "next_check_at"])]
+        #[arg(long, conflicts_with_all = ["on", "seen", "owner", "max_wait_hours", "next_check_at", "event_closes"])]
         clear: bool,
         /// Print the PATCH body without writing it.
         #[arg(long)]
@@ -1636,6 +1686,18 @@ enum WorkflowAction {
         /// The draft version to remove.
         version: i32,
     },
+    /// Reject a draft that met traffic and lost — an experiment's
+    /// candidate with packets pinned to it, which the discard refuses
+    /// (backlog 50ded63d). The row is kept for those packets and is
+    /// never published, so it no longer blocks `publish`. Refused while
+    /// an open experiment still splits onto it, for history, and for a
+    /// draft no packet ran (discard that one instead).
+    Reject {
+        /// Workflow kind, e.g. `agent-run`.
+        kind: String,
+        /// The draft version to reject.
+        version: i32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1656,6 +1718,48 @@ enum CadenceAction {
     Publish {
         /// The bundle file to publish.
         file: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Read or set a session's working window — the hours it works, as
+    /// data on its work-session packet rather than a line in its chat
+    /// (backlog 37e3295c). With no window flag it prints the window;
+    /// `--until`/`--hours`/`--open` set one (an extension is the same
+    /// write); `--close --handoff-file` closes it and leaves the handoff
+    /// on the packet. The session's prompt hook reads it back onto its
+    /// context every prompt, and `boss orient` lists every open
+    /// session's window.
+    Window {
+        /// The work-session packet (full uuid or 8+ characters). Omit it
+        /// to take the newest open work-session of `--actor`.
+        packet: Option<String>,
+        /// Whose open session: matched as its `actor` or `opened_by`.
+        /// Defaults to the actor running this.
+        #[arg(long)]
+        actor: Option<String>,
+        /// The instant the window ends, RFC3339.
+        #[arg(long)]
+        until: Option<String>,
+        /// The window ends this many hours from now — stored as the
+        /// instant, read from the clock at write time.
+        #[arg(long)]
+        hours: Option<f64>,
+        /// Open-ended: the session works until someone sets an end.
+        #[arg(long)]
+        open: bool,
+        /// Close the window; needs `--handoff-file`.
+        #[arg(long, requires = "handoff_file")]
+        close: bool,
+        /// What the closing session leaves for whoever reads next. A
+        /// file, so prose keeps its backticks (2376b89e).
+        #[arg(long, requires = "close")]
+        handoff_file: Option<std::path::PathBuf>,
+        /// Why the window is what it is — who asked, and when.
+        /// Single-quote it.
+        #[arg(long)]
+        why: Option<String>,
     },
 }
 
@@ -1788,6 +1892,24 @@ enum JobAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Move a packet's priority, with a reason, on the record (backlog
+    /// eb26059d): one narrow write (`PUT /api/jobs/{id}/priority`) that
+    /// sets the field and appends from/to/by/why/at to the packet's
+    /// `priority_changes` — never a whole-body PUT. Refused on a closed
+    /// packet; confirmed by reading it back.
+    Priority {
+        /// Full uuid, 8+ characters of the id, or the car's branch.
+        job: String,
+        /// emergency | urgent | standard | scheduled
+        priority: String,
+        /// Why it moves — recorded beside who moved it. Single-quote it.
+        #[arg(long, required_unless_present = "why_file")]
+        why: Option<String>,
+        /// The reason, read from this file — no shell between the bytes
+        /// and the record (2376b89e). Exclusive with --why.
+        #[arg(long, conflicts_with = "why")]
+        why_file: Option<std::path::PathBuf>,
+    },
     /// Write the `outcome` a CLOSED packet lost, re-derived from its
     /// completed declared terminal under the version it is pinned to —
     /// never typed, and never over a recorded one (228c9a7d: a racing
@@ -1836,6 +1958,7 @@ async fn main() -> Result<()> {
         }
         Commands::Launch(cmd) => launch::dispatch(cmd).await,
         Commands::Roster(cmd) => roster::dispatch(cmd).await,
+        Commands::Browser(cmd) => browser_observation::dispatch(cmd).await,
         Commands::Doctor => doctor::run_install().await,
         Commands::Emit { kind, payload } => cmd_emit(kind, payload).await,
         Commands::Upgrade => upgrade::run().await,
@@ -1975,6 +2098,8 @@ async fn main() -> Result<()> {
                 owner,
                 max_wait_hours,
                 next_check_at,
+                event_closes,
+                event_title,
                 clear,
                 dry_run,
             } => {
@@ -1985,6 +2110,10 @@ async fn main() -> Result<()> {
                     max_wait_hours,
                     next_check_at,
                     clean_window: None,
+                    event: event_closes.map(|closes| car::WaitEventFields {
+                        closes,
+                        title: event_title,
+                    }),
                 };
                 car::waits_on(&given, &fields, clear, dry_run).await
             }
@@ -2019,6 +2148,7 @@ async fn main() -> Result<()> {
                 dry_run,
             } => workflow::publish(&kind, &spec, dry_run).await,
             WorkflowAction::Discard { kind, version } => workflow::discard(&kind, version).await,
+            WorkflowAction::Reject { kind, version } => workflow::reject(&kind, version).await,
         },
         Commands::Ops {
             host,
@@ -2077,7 +2207,41 @@ async fn main() -> Result<()> {
                 job::convert(&job, to.as_deref(), dry_run).await
             }
             JobAction::Outcome { job, dry_run } => job::outcome(&job, dry_run).await,
+            JobAction::Priority {
+                job,
+                priority,
+                why,
+                why_file,
+            } => {
+                let why =
+                    crate::prose::text_or_file("--why", "--why-file", why, why_file.as_deref())?;
+                job::priority(&job, &priority, &why).await
+            }
         },
+        Commands::Session {
+            action:
+                SessionAction::Window {
+                    packet,
+                    actor,
+                    until,
+                    hours,
+                    open,
+                    close: _,
+                    handoff_file,
+                    why,
+                },
+        } => {
+            session_window::run(session_window::Args {
+                packet,
+                actor,
+                until,
+                hours,
+                open,
+                handoff_file,
+                why,
+            })
+            .await
+        }
         Commands::Orient { all } => orient::run(all).await,
         Commands::Brief { packet, profile } => brief::run(packet, profile).await,
         Commands::Dispatch {
@@ -2400,6 +2564,7 @@ async fn main() -> Result<()> {
         Commands::Gate {
             retire: Some(packet),
             superseded_by,
+            green_anyway,
             dry_run,
             ..
         } => {
@@ -2407,13 +2572,14 @@ async fn main() -> Result<()> {
             let by = superseded_by.ok_or_else(|| {
                 anyhow::anyhow!("boss gate --retire: --superseded-by <landed> is required")
             })?;
-            gate_retire::retire(&packet, &by, dry_run).await
+            gate_retire::retire(&packet, &by, green_anyway.as_deref(), dry_run).await
         }
         Commands::Gate {
             branch,
             withdraw: _,
             retire: _,
             superseded_by: _,
+            green_anyway: _,
             reason: _,
             reason_file: _,
             mode,
@@ -2487,6 +2653,7 @@ async fn main() -> Result<()> {
                     max_wait_hours: park_waits_on_max_wait_hours,
                     next_check_at: None,
                     clean_window: None,
+                    event: None,
                 }),
             };
             // clap requires the branch unless --withdraw is present, and
@@ -2561,6 +2728,7 @@ async fn main() -> Result<()> {
         Commands::Correct(cmd) => correct::dispatch(cmd).await,
         Commands::Credential(cmd) => credential::dispatch(cmd).await,
         Commands::Events(cmd) => events::dispatch(cmd).await,
+        Commands::Experiment(cmd) => experiment::dispatch(cmd, chrono::Utc::now).await,
         Commands::Ledger(cmd) => ledger::dispatch(cmd).await,
         Commands::Merged(cmd) => merged::dispatch(cmd),
         Commands::Receipt(cmd) => receipt::dispatch(cmd).await,
@@ -3102,6 +3270,68 @@ mod tests {
                 "{refused:?} must be refused"
             );
         }
+    }
+
+    /// A retirement launches nothing and files no car, so a park or
+    /// namespace flag beside it is REFUSED by name, never dropped in
+    /// silence (F4 of review 10cfcb8b, backlog 1fb357f4) — and
+    /// --namespace's default does not count as typing it. A green's
+    /// reason means nothing without the retirement it explains.
+    #[test]
+    fn a_retirement_refuses_the_park_and_namespace_flags_by_name() {
+        let retire = [
+            "boss",
+            "gate",
+            "--retire",
+            "02686d0a",
+            "--superseded-by",
+            "feat/x-2",
+        ];
+        Cli::try_parse_from(retire)
+            .unwrap_or_else(|e| panic!("the namespace default is not a conflict: {e}"));
+        Cli::try_parse_from(retire.iter().copied().chain(["--green-anyway", "why"]))
+            .unwrap_or_else(|e| panic!("a green retired on purpose parses: {e}"));
+        for (flag, value) in [
+            ("--namespace", "boss-dev"),
+            ("--park-summary", "s"),
+            ("--park-excludes", "e"),
+            ("--park-test", "t"),
+            ("--park-verified", "v"),
+            ("--park-backlog-item", "1fb357f4"),
+            ("--park-partial-item", "1fb357f4"),
+            ("--park-no-item", "why"),
+            ("--park-design", "d"),
+            ("--park-after", "c"),
+            ("--park-also-answers", "i"),
+            ("--park-probe", "true"),
+            ("--park-probe-file", "p.sh"),
+            ("--park-expect", "ok"),
+            ("--park-expect-file", "e.txt"),
+            ("--park-proof-event", "ev"),
+            ("--park-waits-on", "w"),
+            ("--park-waits-on-seen", "true"),
+            ("--park-waits-on-owner", "world"),
+            ("--park-waits-on-max-wait-hours", "4"),
+            ("--park-file", "park.toml"),
+        ] {
+            let e = Cli::try_parse_from(retire.iter().copied().chain([flag, value]))
+                .err()
+                .unwrap_or_else(|| panic!("--retire beside {flag} must be refused"));
+            assert_eq!(
+                e.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flag}: {e}"
+            );
+            let said = e.to_string();
+            assert!(
+                said.contains("--retire") && said.contains(flag),
+                "{flag}: the refusal names both flags: {said}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["boss", "gate", "feat/x", "--green-anyway", "why"]).is_err(),
+            "--green-anyway needs --retire"
+        );
     }
 
     /// The OPTIONAL prose flags get the same twin (backlog 6f1e9b99):

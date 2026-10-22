@@ -239,7 +239,12 @@
     <text x={m.at.x} y={m.at.y - 10} text-anchor="middle" class="more" data-motion-more={m.key}>+{m.n}</text>
   {/each}
   {#if feed === 'down' && onFeed === undefined}
-    <text x="12" y="22" class="feed-down" data-feed-down>the moves feed cannot be read — nothing drawn moving is live: {feedWhy}</text>
+    <!-- `load-failed` is the ONE failure marker every reader asserts on
+         (FAILURE_MARKER, tests/mocked/_routes.ts); `feed-down` keeps the
+         map's own ink. Until backlog aadbc1a3 this line carried only the
+         local name, so a failed moves feed under healthy sibling reads
+         was a failure nothing could find by the shared name. -->
+    <text x="12" y="22" class="feed-down load-failed" data-feed-down>the moves feed cannot be read — nothing drawn moving is live: {feedWhy}</text>
   {:else if awayNote !== null}
     <text x="12" y="22" class="away" data-away-note>{awayNote}</text>
   {/if}

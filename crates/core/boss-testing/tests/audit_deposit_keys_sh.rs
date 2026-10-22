@@ -217,8 +217,23 @@ impl Case {
     }
 
     fn run_with(&self, files: &[&Path], env: &[(&str, &str)]) -> (i32, String) {
+        self.run_args(&[], files, env)
+    }
+
+    /// The audit told which keys the prepare packets recorded: one
+    /// `--prepared-key <public key>` per key, then the files.
+    fn run_prepared(&self, prepared: &[&Key], files: &[&Path]) -> (i32, String) {
+        let args: Vec<String> = prepared
+            .iter()
+            .flat_map(|k| ["--prepared-key".to_string(), bare(k, "prepared")])
+            .collect();
+        self.run_args(&args, files, &[])
+    }
+
+    fn run_args(&self, args: &[String], files: &[&Path], env: &[(&str, &str)]) -> (i32, String) {
         let out = Command::new("bash")
             .arg(repo_root().join(SCRIPT))
+            .args(args)
             .args(files)
             .envs(env.iter().copied())
             .output()
@@ -567,6 +582,164 @@ fn a_root_door_spelled_another_way_is_still_a_root_door() {
     }
 }
 
+/// A PREPARED KEY IS JUDGED WHATEVER ITS COMMAND SAYS (backlog 77920d6a;
+/// review 728c6f76 of car 3cd92f7a). A receiver line was recognised only
+/// by the text of its forced command, and sshd hands that command to the
+/// account's shell, which reads quotes, escapes, variables and globs the
+/// text match does not. So each of these lines — the reviewer's shapes,
+/// alone in the file and WITHOUT restrict — runs the root door with a
+/// pty, forwarding and the account's ~/.ssh/rc open, and read clean. Told
+/// the key the prepare packet recorded, the audit judges the line by its
+/// key, and a command that is not the installers' spelling is a finding.
+#[test]
+fn a_prepared_key_is_judged_whatever_its_forced_command_says() {
+    let keys = Case::new("audit-deposit-keys-prepared-spelling");
+    let key = keygen(&keys.root, "machine-token-deposit-key", "ed25519");
+    for (name, cmd) in [
+        (
+            "quoted",
+            "exec sudo -n /usr/local/lib'exec'/boss/ops-credential-recv machine-token",
+        ),
+        (
+            "escaped",
+            "exec sudo -n /usr/local/libexec/bo\\ss/ops-credential-recv machine-token",
+        ),
+        (
+            "variable",
+            "L=libexec; exec sudo -n /usr/local/$L/boss/ops-credential-recv machine-token",
+        ),
+        (
+            "glob",
+            "exec sudo -n /usr/local/libexe?/boss/ops-credential-recv machine-token",
+        ),
+    ] {
+        let case = Case::new(&format!("audit-deposit-keys-prepared-spelling-{name}"));
+        let ak = case.file(
+            "authorized_keys",
+            &[format!(
+                "command=\"{cmd}\" {}",
+                bare(&key, "machine-token-deposit-key")
+            )],
+        );
+        let (rc, out) = case.run_prepared(&[&key], &[&ak]);
+        assert_eq!(
+            rc, 1,
+            "{name}: a line carrying a prepared deposit key is judged by its key:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("UNCONFINED {}:1", ak.display())) && out.contains("prepared"),
+            "{name}: the finding names the line and says the key is a prepared one:\n{out}"
+        );
+    }
+}
+
+/// The bare key ALONE — the case the twin rule could not reach, because
+/// there is no confined line to tie it to (backlog 77920d6a). The senders
+/// refuse it at the next push (no greeting), but until then whoever
+/// holds the key has the account's shell, and the audit read it as one
+/// of the owner's own login keys.
+#[test]
+fn a_prepared_key_on_a_bare_line_alone_is_a_finding() {
+    let case = Case::new("audit-deposit-keys-prepared-bare");
+    let keys = case.keys();
+    let ak = case.file(
+        "authorized_keys",
+        &[
+            bare(&keys.david, "david@laptop"),
+            bare(&keys.b, "machine-token-deposit-key"),
+        ],
+    );
+    let (rc, out) = case.run_prepared(&[&keys.b], &[&ak]);
+    assert_eq!(rc, 1, "a prepared key on a bare line opens a shell:\n{out}");
+    assert!(
+        out.contains(&format!("UNCONFINED {}:2", ak.display())) && out.contains("shell"),
+        "the finding names the bare line and what it opens:\n{out}"
+    );
+    assert!(
+        !out.contains(&format!("UNCONFINED {}:1", ak.display())),
+        "a key no prepare packet recorded is the owner's business, not a finding:\n{out}"
+    );
+}
+
+/// A bare twin of a prepared key beside its confined line is ONE finding
+/// on the bare line, not one from the key and another from the twin rule:
+/// the chore judge files one item per finding line (backlog d1b03874).
+#[test]
+fn a_prepared_bare_twin_is_named_once() {
+    let case = Case::new("audit-deposit-keys-prepared-twin");
+    let keys = case.keys();
+    let ak = case.file(
+        "authorized_keys",
+        &[
+            bare(&keys.b, "machine-token-deposit-key"),
+            machine_receiver(&keys.b),
+        ],
+    );
+    let (rc, out) = case.run_prepared(&[&keys.b], &[&ak]);
+    assert_eq!(rc, 1, "{out}");
+    assert_eq!(
+        out.lines()
+            .filter(|l| l.starts_with("deposit-key-audit: UNCONFINED "))
+            .count(),
+        1,
+        "one line, one finding:\n{out}"
+    );
+    assert!(
+        out.contains(&format!("UNCONFINED {}:1", ak.display())),
+        "{out}"
+    );
+}
+
+/// The three lines the tree prints, each key prepared, stay clean, and
+/// the verdict says how many prepared keys it judged by.
+#[test]
+fn the_lines_the_tree_prints_stay_clean_when_their_keys_are_prepared() {
+    let case = Case::new("audit-deposit-keys-prepared-clean");
+    let keys = case.keys();
+    let mut lines = vec![bare(&keys.david, "david@laptop")];
+    lines.extend(tree_lines(&keys));
+    let ak = case.file("authorized_keys", &lines);
+    let (rc, out) = case.run_prepared(&[&keys.a, &keys.b, &keys.c, &keys.b], &[&ak]);
+    assert_eq!(rc, 0, "{out}");
+    let verdict = out.lines().last().unwrap_or("");
+    assert!(
+        verdict.starts_with("deposit-key-audit: clean — 3 line(s)")
+            && verdict.contains("3 prepared deposit key(s)"),
+        "the verdict counts the receiver lines and the distinct prepared keys:\n{out}"
+    );
+}
+
+/// A prepared key the parser reads no key from leaves the audit unable
+/// to find the lines it was told to judge: UNVERIFIED, never clean. So is
+/// a --prepared-key with nothing after it, an option the audit does not
+/// know, and options with no file.
+#[test]
+fn a_prepared_key_that_cannot_be_read_is_unverified() {
+    let case = Case::new("audit-deposit-keys-prepared-unreadable");
+    let keys = case.keys();
+    let ak = case.file("authorized_keys", &tree_lines(&keys));
+    let akp = ak.to_str().unwrap().to_string();
+    let good = bare(&keys.b, "prepared");
+    for (name, args) in [
+        (
+            "not-a-key",
+            vec!["--prepared-key", "ssh-ed25519 AAAAnot-a-key", &akp],
+        ),
+        (
+            "two-keys",
+            vec!["--prepared-key", &format!("{good}\n{good}"), &akp],
+        ),
+        ("no-value", vec!["--prepared-key"]),
+        ("unknown-option", vec!["--prepared-keys", &good, &akp]),
+        ("no-file", vec!["--prepared-key", &good]),
+    ] {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let (rc, out) = case.run_args(&args, &[], &[]);
+        assert_eq!(rc, 2, "{name}: {out}");
+        assert!(out.contains("UNVERIFIED"), "{name}: {out}");
+    }
+}
+
 /// ONE KEY, SEVERAL SPELLINGS (review ee6589a9, B1', measured against a
 /// real `sshd -i`, OpenSSH 9.2p1). sshd decodes a blob and compares the
 /// KEY, so each of these bare twins — the same key to sshd, spelled as
@@ -867,6 +1040,621 @@ fn a_forced_command_naming_a_root_door_must_be_that_door_alone() {
             "{name}: {out}"
         );
     }
+}
+
+/// THE ONE sudo FLAG IS -n (backlog e85c4dbd; review 1fa0d093, N5).
+/// Every installer prints `exec sudo -n <door>`, and the shape check let
+/// sudo carry ANY run of flags, leaving sudoers alone to bound what they
+/// do: `-E` hands the receiver the caller's environment, `-s` and `-i`
+/// run it through a shell. A flag no installer prints is a finding.
+#[test]
+fn a_receiver_line_whose_sudo_carries_a_flag_but_n_is_a_finding() {
+    let keys = Case::new("audit-deposit-keys-sudo-flags");
+    let key = keygen(&keys.root, "machine-token-deposit-key", "ed25519");
+    for (name, sudo) in [
+        ("preserve-env", "sudo -E"),
+        ("joined", "sudo -nE"),
+        ("after-n", "sudo -n -E"),
+        ("shell", "sudo -n -s"),
+        ("login", "sudo -i"),
+    ] {
+        let case = Case::new(&format!("audit-deposit-keys-sudo-{name}"));
+        let ak = case.file(
+            "authorized_keys",
+            &[format!(
+                "command=\"exec {sudo} /usr/local/libexec/boss/ops-credential-recv machine-token\",restrict {}",
+                bare(&key, "machine-token-deposit-key")
+            )],
+        );
+        let (rc, out) = case.run(&[&ak]);
+        assert_eq!(
+            rc, 1,
+            "{name}: sudo with a flag no installer prints is a finding:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("UNCONFINED {}:1", ak.display())),
+            "{name}: {out}"
+        );
+    }
+}
+
+/// environment= ON A RECEIVER LINE IS A FINDING (backlog e85c4dbd; review
+/// 1fa0d093, N4). With PermitUserEnvironment it sets what the account's
+/// shell runs the forced command with — BASH_ENV alone has bash source a
+/// file of the line author's choosing before the receiver starts — and
+/// no installer prints one. A login key's own options stay its owner's.
+#[test]
+fn a_receiver_line_that_sets_environment_is_a_finding() {
+    let keys = Case::new("audit-deposit-keys-environment");
+    let key = keygen(&keys.root, "machine-token-deposit-key", "ed25519");
+    let cmd = "command=\"exec sudo -n /usr/local/libexec/boss/ops-credential-recv machine-token\"";
+    for (name, opts) in [
+        (
+            "after",
+            format!("{cmd},restrict,environment=\"BASH_ENV=/srv/x\""),
+        ),
+        (
+            "before",
+            format!("environment=\"LD_PRELOAD=/srv/x.so\",{cmd},restrict"),
+        ),
+        (
+            "case",
+            format!("{cmd},restrict,Environment=\"BASH_ENV=/srv/x\""),
+        ),
+    ] {
+        let case = Case::new(&format!("audit-deposit-keys-environment-{name}"));
+        let ak = case.file(
+            "authorized_keys",
+            &[format!(
+                "{opts} {}",
+                bare(&key, "machine-token-deposit-key")
+            )],
+        );
+        let (rc, out) = case.run(&[&ak]);
+        assert_eq!(
+            rc, 1,
+            "{name}: a receiver line that sets environment= is a finding:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("UNCONFINED {}:1", ak.display())) && out.contains("environment"),
+            "{name}: the finding names the line and the option:\n{out}"
+        );
+    }
+    // The control: the same option on the owner's login line, beside the
+    // three lines the tree prints, is not judged.
+    let case = Case::new("audit-deposit-keys-environment-login");
+    let keys = case.keys();
+    let mut lines = vec![format!(
+        "environment=\"EDITOR=vi\" {}",
+        bare(&keys.david, "david@laptop")
+    )];
+    lines.extend(tree_lines(&keys));
+    let ak = case.file("authorized_keys", &lines);
+    let (rc, out) = case.run(&[&ak]);
+    assert_eq!(
+        rc, 0,
+        "environment= on a login line is its owner's business:\n{out}"
+    );
+}
+
+/// The forced command a broker rule prepares its deposit key for, read
+/// from the rule row — the one definition the broker joins into the
+/// enroll step's `authorized_keys_line` (broker_transport_key.rs).
+fn rule_forced_command(rule: &str) -> String {
+    let path = format!("infra/dispatcher/rules/broker-prepares-the-{rule}-deposit-key.toml");
+    let row: toml::Value = toml::from_str(&read(&repo_root().join(&path))).unwrap();
+    row["rule"][0]["do"][0]["args"]["forced_command"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} declares its forced command"))
+        .trim_matches('"')
+        .to_string()
+}
+
+/// The line a prepare packet records for `key` under `rule`: its forced
+/// command joined to the key, as the broker joins it.
+fn prepared_line(rule: &str, key: &Key) -> String {
+    format!(
+        "command=\"{}\",restrict {}",
+        rule_forced_command(rule),
+        bare(key, rule)
+    )
+}
+
+/// The audit told each key AND the receiver it was prepared for: one
+/// `--prepared-key <authorized_keys_line>` per key, then the files.
+fn run_bound(case: &Case, bound: &[(&str, &Key)], files: &[&Path]) -> (i32, String) {
+    let args: Vec<String> = bound
+        .iter()
+        .flat_map(|(rule, key)| ["--prepared-key".to_string(), prepared_line(rule, key)])
+        .collect();
+    case.run_args(&args, files, &[])
+}
+
+/// A PREPARED KEY IS BOUND TO ITS OWN RECEIVER (backlog c422cf68). The
+/// audit judged a line carrying a prepared key by whether its command was
+/// SOME root door, so the runner's deposit key forced to the machine-token
+/// receiver — or the other way round — read clean, each line confined and
+/// restricted, while each key reached a root door it was never prepared
+/// or enrolled for. Told the line each key was prepared with, the audit
+/// judges the pair: one finding per line, naming both commands; the line
+/// that forces the key's own receiver beside it stays clean.
+#[test]
+fn a_prepared_key_forced_to_another_receiver_is_a_finding() {
+    let case = Case::new("audit-deposit-keys-prepared-crossed");
+    let keys = case.keys();
+    let runner_cmd = rule_forced_command("runner");
+    let machine_cmd = rule_forced_command("machine-token");
+    let ak = case.file(
+        "authorized_keys",
+        &[
+            bare(&keys.david, "david@laptop"),
+            format!(
+                "command=\"{machine_cmd}\",restrict {}",
+                bare(&keys.a, "runner-deposit-key")
+            ),
+            format!(
+                "command=\"{runner_cmd}\",restrict {}",
+                bare(&keys.b, "machine-token-deposit-key")
+            ),
+            prepared_line("machine-token", &keys.b),
+        ],
+    );
+    let (rc, out) = run_bound(
+        &case,
+        &[("runner", &keys.a), ("machine-token", &keys.b)],
+        &[&ak],
+    );
+    assert_eq!(
+        rc, 1,
+        "a deposit key behind another key's receiver reaches a door it was not prepared for:\n{out}"
+    );
+    for (n, forced, prepared) in [
+        (2, &machine_cmd, &runner_cmd),
+        (3, &runner_cmd, &machine_cmd),
+    ] {
+        let finding = out
+            .lines()
+            .find(|l| {
+                l.starts_with(&format!(
+                    "deposit-key-audit: UNCONFINED {}:{n} ",
+                    ak.display()
+                ))
+            })
+            .unwrap_or_else(|| panic!("line {n} is a finding:\n{out}"));
+        assert!(
+            finding.contains(&format!("forced to '{forced}'"))
+                && finding.contains(&format!("prepared for '{prepared}'")),
+            "line {n}'s finding names the receiver it forces and the one it was prepared for:\n{out}"
+        );
+    }
+    assert_eq!(
+        out.lines()
+            .filter(|l| l.starts_with("deposit-key-audit: UNCONFINED "))
+            .count(),
+        2,
+        "one finding per crossed line, none for the key's own receiver line or the login key:\n{out}"
+    );
+}
+
+/// Each key the broker rules prepare for boss-gcp, behind the receiver
+/// its own rule names, is clean, and the verdict says how many keys were
+/// judged against their receivers.
+#[test]
+fn each_prepared_key_behind_its_own_receiver_stays_clean() {
+    let case = Case::new("audit-deposit-keys-prepared-bound");
+    let keys = case.keys();
+    let bound = [
+        ("runner", &keys.a),
+        ("machine-token", &keys.b),
+        ("root-tree", &keys.c),
+    ];
+    let mut lines = vec![bare(&keys.david, "david@laptop")];
+    lines.extend(bound.iter().map(|(rule, key)| prepared_line(rule, key)));
+    let ak = case.file("authorized_keys", &lines);
+    let (rc, out) = run_bound(&case, &bound, &[&ak]);
+    assert_eq!(rc, 0, "{out}");
+    let verdict = out.lines().last().unwrap_or("");
+    assert!(
+        verdict.starts_with("deposit-key-audit: clean — 3 line(s)")
+            && verdict.contains("3 prepared deposit key(s) judged by fingerprint")
+            && verdict.contains("3 of them against the receiver each was prepared for"),
+        "the verdict counts the prepared keys and how many were bound to a receiver:\n{out}"
+    );
+}
+
+/// A prepared line that forces no command binds its key to nothing, and
+/// one key prepared for two receivers cannot be judged against either:
+/// both are UNVERIFIED, never a key judged by fingerprint alone.
+#[test]
+fn a_prepared_line_that_names_no_single_receiver_is_unverified() {
+    let case = Case::new("audit-deposit-keys-prepared-unbound");
+    let keys = case.keys();
+    let ak = case.file(
+        "authorized_keys",
+        &[prepared_line("machine-token", &keys.b)],
+    );
+    let akp = ak.to_str().unwrap().to_string();
+    for (name, values) in [
+        (
+            "no-command",
+            vec![format!("restrict {}", bare(&keys.b, "prepared"))],
+        ),
+        (
+            "two-receivers",
+            vec![
+                prepared_line("machine-token", &keys.b),
+                prepared_line("runner", &keys.b),
+            ],
+        ),
+    ] {
+        let mut args: Vec<String> = values
+            .into_iter()
+            .flat_map(|v| ["--prepared-key".to_string(), v])
+            .collect();
+        args.push(akp.clone());
+        let (rc, out) = case.run_args(&args, &[], &[]);
+        assert_eq!(rc, 2, "{name}: {out}");
+        assert!(out.contains("UNVERIFIED"), "{name}: {out}");
+    }
+}
+
+/// What `audit-deposit-keys.sh --keys-files-of <account>` prints, as
+/// (exit status, stdout, stderr), with `sshd` standing for sshd.
+fn keys_files_of(case: &Case, account: &str, sshd: &Path) -> (i32, String, String) {
+    let out = Command::new("bash")
+        .arg(repo_root().join(SCRIPT))
+        .args(["--keys-files-of", account])
+        .env("BOSS_DEPOSIT_AUDIT_SSHD", sshd)
+        .env("SSHD_ARGS", case.root.join("sshd.args"))
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A stand-in sshd that records its argv and prints `body` as its -T.
+fn sshd_stub(case: &Case, name: &str, body: &str, status: i32) -> PathBuf {
+    let stub = case.root.join(name);
+    write_exec(
+        &stub,
+        &format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" > \"$SSHD_ARGS\"\nprintf '%s' '{body}'\nexit {status}\n"
+        ),
+    );
+    stub
+}
+
+/// root's home, as the passwd database the script reads holds it.
+fn root_home() -> String {
+    let out = Command::new("getent")
+        .args(["passwd", "root"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .trim_end()
+        .split(':')
+        .nth(5)
+        .expect("getent passwd root names a home")
+        .to_string()
+}
+
+/// THE FILES ARE THE ONES sshd READS (backlog e85c4dbd; review dd8f18e0,
+/// N7). The converge handed the audit the default pair under the
+/// account's home, so a host whose sshd reads another AuthorizedKeysFile
+/// was audited on files sshd never opens and read clean. The audit now
+/// asks sshd: `sshd -T -C user=<account>` (Match blocks applied), each
+/// pattern expanded the way sshd expands it — %h, %u, %U and %%, a
+/// relative path under the home.
+#[test]
+fn the_files_audited_are_the_ones_sshd_reads_for_the_account() {
+    let case = Case::new("audit-deposit-keys-files-of");
+    let stub = sshd_stub(
+        &case,
+        "sshd",
+        "port 22\nauthorizedkeysfile .ssh/authorized_keys /etc/ssh/keys/%u %h/.ssh/k_%U /srv/100%%\nauthorizedkeyscommand none\n",
+        0,
+    );
+    let (rc, out, err) = keys_files_of(&case, "root", &stub);
+    assert_eq!(rc, 0, "{out}{err}");
+    let home = root_home();
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec![
+            "--accept-env".to_string(),
+            String::new(),
+            format!("{home}/.ssh/authorized_keys"),
+            "/etc/ssh/keys/root".to_string(),
+            format!("{home}/.ssh/k_0"),
+            "/srv/100%".to_string(),
+        ],
+        "the AcceptEnv sshd read (none here), then each AuthorizedKeysFile pattern, expanded as sshd expands it:\n{out}{err}"
+    );
+    let args = read(&case.root.join("sshd.args"));
+    assert!(
+        args.split_whitespace().any(|a| a == "-T") && args.contains("-C user=root"),
+        "sshd is asked for its configuration AS the account, so Match User applies: {args}"
+    );
+}
+
+/// No evidence is not a pass: a file list the audit cannot get from sshd
+/// is UNVERIFIED, and no path is printed for the converge to audit.
+#[test]
+fn files_sshd_cannot_name_are_unverified_never_the_default_pair() {
+    let case = Case::new("audit-deposit-keys-files-of-unverified");
+    let ok = "authorizedkeysfile .ssh/authorized_keys\n";
+    for (name, account, body, status) in [
+        (
+            "refuses",
+            "root",
+            "sshd: no hostkeys available -- exiting.\n",
+            1,
+        ),
+        ("no-line", "root", "port 22\n", 0),
+        ("none", "root", "authorizedkeysfile none\n", 0),
+        (
+            "unknown-token",
+            "root",
+            "authorizedkeysfile %h/.ssh/%x\n",
+            0,
+        ),
+        (
+            "trailing-percent",
+            "root",
+            "authorizedkeysfile /srv/keys%\n",
+            0,
+        ),
+        ("no-account", "no-such-account-e85c4dbd", ok, 0),
+    ] {
+        let stub = sshd_stub(&case, &format!("sshd-{name}"), body, status);
+        let (rc, out, err) = keys_files_of(&case, account, &stub);
+        assert_eq!(rc, 2, "{name}: {out}{err}");
+        assert!(
+            out.contains("UNVERIFIED") && !out.contains("authorized_keys\n"),
+            "{name}: one UNVERIFIED line on stdout and no file to audit:\n{out}{err}"
+        );
+    }
+    let (rc, out, err) = keys_files_of(&case, "root", &case.root.join("no-such-sshd"));
+    assert_eq!(rc, 2, "an absent sshd: {out}{err}");
+    assert!(out.contains("UNVERIFIED"), "{out}{err}");
+}
+
+/// The same read against a REAL sshd, where this host can run `sshd -T`:
+/// a Match User block naming the account moves its AuthorizedKeysFile,
+/// and the list follows it.
+#[test]
+fn a_real_sshd_match_block_moves_the_files_audited() {
+    let real = Path::new("/usr/sbin/sshd");
+    if !real.exists() {
+        eprintln!("NOT RUN: no /usr/sbin/sshd on this host; the stand-in cases above still run");
+        return;
+    }
+    let case = Case::new("audit-deposit-keys-files-of-real-sshd");
+    keygen(&case.root, "host-key", "ed25519");
+    let cfg = case.root.join("sshd_config");
+    write_file(
+        &cfg,
+        &format!(
+            "HostKey {}\nAuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2\nAcceptEnv LANG LC_*\nMatch User root\n    AuthorizedKeysFile /etc/ssh/deposit/%u\n",
+            case.root.join("host-key").display()
+        ),
+    );
+    let wrapper = case.root.join("sshd");
+    write_exec(
+        &wrapper,
+        &format!(
+            "#!/usr/bin/env bash\nexec {} -f {} \"$@\"\n",
+            real.display(),
+            cfg.display()
+        ),
+    );
+    let control = Command::new(&wrapper).arg("-T").output().unwrap();
+    if !control.status.success() {
+        eprintln!(
+            "NOT RUN: sshd -T refuses here ({}); the stand-in cases above still run",
+            String::from_utf8_lossy(&control.stderr).trim()
+        );
+        return;
+    }
+    let (rc, out, err) = keys_files_of(&case, "root", &wrapper);
+    assert_eq!(rc, 0, "{out}{err}");
+    assert_eq!(
+        out, "--accept-env\nLANG LC_*\n/etc/ssh/deposit/root\n",
+        "{err}"
+    );
+}
+
+/// ACCEPTENV IS READ WITH THE FILES (backlog 54104a05). A client asks
+/// sshd to set environment variables, and sshd sets each one its
+/// AcceptEnv admits — `restrict` does not close it — before handing a
+/// forced command to the account's shell. BASH_ENV admitted that way has
+/// bash run a command of the sender's choosing first, a third route to
+/// what `environment=` (with PermitUserEnvironment) already reaches. The
+/// patterns come from the same `sshd -T -C user=<account>` the files do,
+/// and `--keys-files-of` hands them over as the audit's own option,
+/// ahead of the files, however sshd spreads them over lines.
+#[test]
+fn the_accept_env_sshd_reads_rides_ahead_of_the_files() {
+    let case = Case::new("audit-deposit-keys-files-of-accept-env");
+    let stub = sshd_stub(
+        &case,
+        "sshd",
+        "acceptenv LANG\nacceptenv LC_* BASH_ENV\nauthorizedkeysfile /etc/ssh/keys/%u\n",
+        0,
+    );
+    let (rc, out, err) = keys_files_of(&case, "root", &stub);
+    assert_eq!(rc, 0, "{out}{err}");
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec!["--accept-env", "LANG LC_* BASH_ENV", "/etc/ssh/keys/root"],
+        "the AcceptEnv patterns, as one option, then the files:\n{out}{err}"
+    );
+}
+
+/// What the audit does with them. A receiver line beside an AcceptEnv
+/// that admits a name the account's shell reads before the receiver
+/// starts is a finding — one per admitting pattern, naming it, and
+/// naming no key and no count, because the chore judge keys a finding
+/// that names no key on its whole text (chore_file_reds.rs,
+/// finding_key) and the act is one edit to sshd's config. sshd matches
+/// `*` and `?` and nothing else, so `[B]ASH_ENV` is a literal name, not
+/// a glob that admits BASH_ENV. The owner's logins alone are not judged.
+#[test]
+fn an_accept_env_that_admits_a_shell_start_up_name_beside_a_receiver_is_a_finding() {
+    let case = Case::new("audit-deposit-keys-accept-env");
+    let keys = case.keys();
+    let ak = case.file("authorized_keys", &tree_lines(&keys));
+    let run = |patterns: &str, files: &[&Path]| {
+        case.run_args(
+            &["--accept-env".to_string(), patterns.to_string()],
+            files,
+            &[],
+        )
+    };
+    for patterns in ["", "LANG LC_*", "LANG LC_* [B]ASH_ENV", "TERM COLORTERM"] {
+        let (rc, out) = run(patterns, &[&ak]);
+        assert_eq!(
+            rc, 0,
+            "AcceptEnv '{patterns}' admits no shell start-up name:\n{out}"
+        );
+        assert!(
+            out.contains("AcceptEnv (") && out.contains("admits no name"),
+            "the clean verdict says AcceptEnv was read:\n{out}"
+        );
+    }
+    for (patterns, admitting) in [
+        ("LANG LC_* BASH_ENV", "BASH_ENV"),
+        ("*", "*"),
+        ("LANG BASH_*", "BASH_*"),
+        ("B?SH_ENV", "B?SH_ENV"),
+        ("ENV", "ENV"),
+        ("SHELLOPTS", "SHELLOPTS"),
+        ("BASH_FUNC_*", "BASH_FUNC_*"),
+        ("PATH", "PATH"),
+        ("LD_*", "LD_*"),
+    ] {
+        let (rc, out) = run(patterns, &[&ak]);
+        assert_eq!(
+            rc, 1,
+            "AcceptEnv '{patterns}' beside a receiver line is a finding:\n{out}"
+        );
+        let found: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("deposit-key-audit: UNCONFINED "))
+            .collect();
+        assert_eq!(found.len(), 1, "'{patterns}': exactly one finding:\n{out}");
+        let line = found[0];
+        assert!(
+            line.starts_with(&format!(
+                "deposit-key-audit: UNCONFINED sshd AcceptEnv {admitting} — "
+            )) && !line.contains("SHA256:"),
+            "'{patterns}': the finding names the pattern and no key:\n{out}"
+        );
+    }
+    // Stable text: a second receiver line changes nothing in the finding,
+    // so the item it files is not re-filed when the file grows.
+    let one = run("BASH_ENV", &[&ak]).1;
+    let mut more = tree_lines(&keys);
+    more.push(machine_receiver(&keygen(&case.root, "another", "ed25519")));
+    let ak2 = case.file("authorized_keys.more", &more);
+    let two = run("BASH_ENV", &[&ak2]).1;
+    let finding = |out: &str| {
+        out.lines()
+            .find(|l| l.starts_with("deposit-key-audit: UNCONFINED sshd AcceptEnv "))
+            .map(str::to_string)
+    };
+    assert!(finding(&one).is_some(), "{one}");
+    assert_eq!(finding(&one), finding(&two), "{one}\n{two}");
+    // Not handed the option, the audit says so rather than imply a read.
+    let (rc, out) = case.run(&[&ak]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("AcceptEnv was not read"), "{out}");
+    // The control: the owner's login keys alone are his business.
+    let login = case.file(
+        "authorized_keys.login",
+        &[bare(&keys.david, "david@laptop")],
+    );
+    let (rc, out) = run("*", &[&login]);
+    assert_eq!(
+        rc, 0,
+        "AcceptEnv beside no receiver line is not judged:\n{out}"
+    );
+}
+
+/// The converge audits what sshd names, not the default pair it used to
+/// assume: its file block, run with a stand-in sshd, hands the audit the
+/// list `--keys-files-of` printed, and an UNVERIFIED read leaves no file
+/// and carries its reason to the verdict.
+#[test]
+fn the_converge_audits_the_files_sshd_names() {
+    let converge = read(&repo_root().join("infra/gcp/boss-gcp-converge.sh"));
+    assert!(
+        !converge.contains("\"$ak_home/.ssh/authorized_keys\" \"$ak_home/.ssh/authorized_keys2\""),
+        "the converge must not assume sshd's default pair of files"
+    );
+    let start = converge
+        .find("ak_files=()")
+        .expect("the converge builds ak_files");
+    let end = converge[start..].find("alog=").unwrap() + start;
+    let case = Case::new("audit-deposit-keys-converge-files");
+    let good = sshd_stub(
+        &case,
+        "sshd-good",
+        "acceptenv LANG LC_*\nauthorizedkeysfile /etc/ssh/keys/%u .ssh/authorized_keys\n",
+        0,
+    );
+    let bad = sshd_stub(
+        &case,
+        "sshd-bad",
+        "sshd: no hostkeys available -- exiting.\n",
+        1,
+    );
+    let runner = case.root.join("files.sh");
+    write_exec(
+        &runner,
+        &format!(
+            "#!/bin/bash\nset -uo pipefail\nDEPOSIT_ACCOUNT=root\nOWNER=root\naudit_bound=60\n{}\nprintf 'file=%s\\n' \"${{ak_files[@]}}\"\nprintf 'why=%s\\n' \"${{ak_why:-}}\"\n",
+            &converge[start..end]
+        ),
+    );
+    for (stub, want_files) in [(&good, true), (&bad, false)] {
+        let out = Command::new("bash")
+            .arg(&runner)
+            .env_remove("BOSS_GCP_CONVERGE_AUTHORIZED_KEYS")
+            .env("BOSS_GCP_CONVERGE_INFRA", repo_root().join("infra"))
+            .env("BOSS_DEPOSIT_AUDIT_SSHD", stub)
+            .env("SSHD_ARGS", case.root.join("sshd.args"))
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        if want_files {
+            assert!(
+                text.contains("file=/etc/ssh/keys/root\n")
+                    && text.contains(&format!("file={}/.ssh/authorized_keys\n", root_home())),
+                "{text}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // The AcceptEnv sshd read reaches the audit as its own option,
+            // ahead of the files (backlog 54104a05).
+            assert!(
+                text.starts_with("file=--accept-env\nfile=LANG LC_*\nfile=/"),
+                "{text}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        } else {
+            assert!(
+                !text.contains("file=/") && text.contains("why=deposit-key-audit: UNVERIFIED"),
+                "{text}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    assert!(
+        converge.contains("echo \"${ak_why:-"),
+        "an empty file list writes the read's own UNVERIFIED line as the verdict"
+    );
 }
 
 #[test]

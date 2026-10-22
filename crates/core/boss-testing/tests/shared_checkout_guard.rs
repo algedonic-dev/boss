@@ -89,19 +89,35 @@ fn passed(command: &str) {
     assert_eq!(code, 0, "must pass {command:?}; stderr: {err}");
 }
 
-/// A path is judged AS WRITTEN, from the cwd the payload reports. Where
+/// A path is judged AS WRITTEN, from BOTH places the call may run. Where
 /// a bare relative path lands depends on the harness path, and the two
 /// measured disagree: on the production dispatch 916fe290 saw an isolated
 /// agent's Bash start in /work/boss, while review 0dc61dd6 (`claude -p`,
 /// 2.1.296) saw it start in the worktree and land a relative `sed -i`
-/// there. The hook cannot tell which it is under, so a bare relative
-/// write passes, and only a path that climbs out of the worktree into
-/// the shared checkout is refused (review finding 4, rework of 10d1567b).
+/// there. Until backlog 88553fea a bare relative write PASSED on that
+/// uncertainty, and on 2026-10-20 run 472b2b58's two mutation seds dirtied
+/// /work/boss through exactly that hole — re-measured the same day by
+/// builder run 7934069e, whose payload named its worktree while `pwd -P`
+/// printed /work/boss. So a write that lands in the shared checkout from
+/// EITHER base is refused; the way out (an absolute path, or a script that
+/// cds first) costs one retry, and the miss cost the pod its doors.
 #[test]
-fn a_relative_write_is_judged_from_the_reported_cwd() {
-    passed("sed -i 's/fn names_file/pub(crate) fn names_file/' crates/x/judged_red.rs");
-    passed("echo hi > notes.txt");
-    passed("cargo fmt -p boss-cli");
+fn a_bare_relative_write_is_judged_from_both_places_it_may_run() {
+    refused(
+        "sed -i 's/fn names_file/pub(crate) fn names_file/' crates/x/judged_red.rs",
+        "/work/boss/crates/x/judged_red.rs",
+    );
+    refused("perl -pi -e 's/a/b/' crates/x.rs", "/work/boss/crates/x.rs");
+    refused("echo hi > notes.txt", "/work/boss/notes.txt");
+    refused("printf x | tee crates/y.rs", "/work/boss/crates/y.rs");
+    refused("cargo fmt -p boss-cli", "/work/boss");
+    // A relative cd moves both bases, and lands in the shared checkout
+    // from the one the production path starts in.
+    refused("cd crates && sed -i s/a/b/ x.rs", "/work/boss/crates/x.rs");
+    // Once an ABSOLUTE cd has taken effect there is one base, and it is
+    // known: the same writes from inside the worktree pass.
+    passed(&format!("cd {WT}; sed -i s/a/b/ crates/x.rs"));
+    passed(&format!("cd {WT}; echo hi > notes.txt"));
     refused(
         "sed -i s/a/b/ ../../../crates/orchestrators/boss-cli/src/train/judged_red.rs",
         "/work/boss/crates/orchestrators/boss-cli/src/train/judged_red.rs",
@@ -111,6 +127,67 @@ fn a_relative_write_is_judged_from_the_reported_cwd() {
         "cp /tmp/a.rs ../../../crates/a.rs",
         "/work/boss/crates/a.rs",
     );
+}
+
+/// GIT THAT MOVES A TREE names its tree (backlog 88553fea). Measured from
+/// the /work/boss reflog on 2026-10-20: reviewer runs 2233667d and
+/// c1a5a342 ran `git checkout --detach <sha>` there, and run 2452d6ff
+/// switched it to its own branch `worktree-agent-adc4e55861d5bfd66` and
+/// left it there thirteen minutes — every pod door, being a symlink into
+/// /work/boss/infra/dev, ran another agent's branch meanwhile. Each was a
+/// bare git whose leading `cd <worktree> &&` the harness had dropped.
+/// The harness's own guard refuses `git -C /work/boss`; it does not see a
+/// bare git that RUNS there. So a git that moves HEAD, the index or the
+/// work tree is refused unless its tree is named as the caller's own
+/// worktree, and the refusal names that worktree and `git -C`.
+#[test]
+fn a_git_that_moves_a_tree_must_name_the_worktree() {
+    for cmd in [
+        "git checkout --detach 8a9fdecb",
+        "git switch worktree-agent-adc4e55861d5bfd66",
+        "git checkout -b fix/x origin/main",
+        "git reset --hard origin/main",
+        "git restore crates/x.rs",
+        "git stash",
+        "git stash push -u -m tag",
+        "git commit -F /tmp/s/commit-msg.txt",
+        "git -c core.pager=cat checkout main",
+        "env GIT_TRACE=0 git checkout main",
+        "git -C /work/boss checkout main",
+        "cd /work/boss; git switch main",
+        "git -C ../../.. reset --hard",
+        "git -C /work/boss/.claude/worktrees/agent-ffff00 checkout main",
+    ] {
+        let (code, err) = run_hook(&bash(cmd));
+        assert_eq!(code, 2, "must refuse {cmd:?}; stderr: {err}");
+        assert!(
+            err.contains(&format!("git -C {WT}")),
+            "the refusal for {cmd:?} names the caller's worktree and git -C: {err}"
+        );
+        assert!(
+            err.contains("88553fea"),
+            "the refusal for {cmd:?} names the packet it comes from: {err}"
+        );
+    }
+    // The tree named, by -C or by a cd that took effect: passes.
+    passed(&format!("git -C {WT} checkout -b fix/x origin/main"));
+    passed(&format!("git -C {WT} commit -F /tmp/s/commit-msg.txt"));
+    passed(&format!("git -C {WT}/crates restore x.rs"));
+    passed(&format!("cd {WT}; git stash push -u -m tag"));
+    // Git that moves no tree passes wherever it runs: reads, a fetch,
+    // and the two stash subcommands that only read.
+    for cmd in [
+        "git status",
+        "git log --oneline -3",
+        "git diff origin/main...HEAD",
+        "git show origin/main:infra/dev/boss-api",
+        "git fetch origin",
+        "git stash list",
+        "git stash show -p",
+        "git rev-parse HEAD",
+    ] {
+        passed(cmd);
+    }
 }
 
 /// The writers it reads, each refused on an absolute shared-checkout path.

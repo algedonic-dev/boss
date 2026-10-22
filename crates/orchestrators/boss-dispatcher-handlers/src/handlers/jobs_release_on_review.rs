@@ -48,6 +48,22 @@
 //!   value. A hold rewritten with the same text is the same hold to the
 //!   record. Recorded, like a refusal.
 //!
+//! TWO TRIGGERS, ONE ROAD (backlog 60993cda). The verdict's own write
+//! fired the rule only while the car was held at the head it read, so a
+//! verdict given BEFORE its hold — a reviewer reading a repair's head
+//! before the repair's gate finished, the car then re-held there by the
+//! green — was never asked again, and a person released the car on that
+//! same verdict (measured 2026-10-18: 4 such holds, 3 released by hand
+//! on that verdict, cars 048df940, 4a19d6a9 and c1c19d5e, 20 s to 8.5
+//! min after the hold). So a write of a held review step
+//! (`jobs.step.updated`, rule `release-a-held-car-when-its-review-hold-
+//! is-placed`) wakes the handler too: it reads the reviewer the step
+//! names and, when that run has a verdict on this car, takes exactly the
+//! road above. The hold wake records nothing when there is no verdict to
+//! ask about. The one thing it widens is the time check, and only for
+//! the write that bound the hold to the head the verdict read (see
+//! [`not_after_the_hold`]); the door's judge is unchanged.
+//!
 //! A REFUSAL IS RECORDED WHERE THE HOLD IS. The door's 409 sentence is
 //! written onto the car's review step as `auto_release` (`{review,
 //! outcome, why, by, at}`, `boss_jobs::car::AUTO_RELEASE`), beside the
@@ -56,9 +72,25 @@
 //! refusal by the same review is written once: a redelivery, or a later
 //! write to the run, finds it already there and writes nothing.
 //!
-//! Any other answer from the door is an error: 401/403/422 cannot change
-//! on redelivery (Permanent, dead-lettered and counted), the rest are
-//! retried.
+//! THE HOLD JUDGED IS THE HOLD ASKED ABOUT (review 792b871a N1). The
+//! placement check above is a judgement of the car as this handler READ
+//! it, and the door reads the car again at the POST; a person's `boss
+//! hold` landing in between keeps `hold_sha`, so the door judged that
+//! new hold good on the old verdict and lifted it. The ask now carries
+//! the hold this firing judged (`car_release::JudgedHold`, text and
+//! sha), and the door lifts that hold or refuses.
+//!
+//! A 409 IS RECORDED ONLY WHERE A HOLD STILL IS (review 792b871a N2).
+//! Two firings for one verdict both read the car held, and the second's
+//! 409 meets the first's release. The car is re-read on a 409: nothing
+//! held means the release is done, and nothing is recorded beside it.
+//!
+//! Any other answer from the door is an error. One that refuses for good
+//! (a 4xx but 408/429: 401, 403, 404, 422) is recorded beside the hold
+//! once, with its reason, AND returned Permanent, dead-lettered and
+//! counted (review 792b871a N3: a door 404 was retried, and no reason
+//! reached the car). The rest are retried and write nothing. A history
+//! read refused for good is recorded the same way.
 
 use super::common::{
     dispatcher_actor_header, dispatcher_reader_header, rows_or_refuse, sim_origin_value,
@@ -132,48 +164,77 @@ pub(crate) fn not_the_dispatched_reviewer(car: &Json, run: &str) -> Option<Strin
     }
 }
 
+/// When the hold a review step carries now was placed, and the head that
+/// SAME write bound it to, when it bound one ([`hold_placement`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Placement {
+    pub at: DateTime<Utc>,
+    /// `hold_sha` as the placing write left it, when that write is the one
+    /// that gave the step this head (it differs from the write before, or
+    /// the write is the first of the whole history) and it is still the
+    /// step's head. A review hold's writers put `hold` and `hold_sha` in
+    /// one body (the auto-park green, the rerail, the conductor's
+    /// re-judge); a hand `boss hold` writes `hold` alone and binds none
+    /// (backlog 60993cda).
+    pub binds: Option<String>,
+}
+
 /// PURE: when the hold the review step carries NOW was placed, read off
 /// the car's own history (`GET /api/jobs/{car}/events`, oldest first,
-/// each step write carrying the post-write row): the instant of the last
-/// write of `step` at which its `hold` took the value it holds now.
-/// `Err` says why that cannot be read — no write of the step in the
-/// window, a window full enough to start after the placing, or a history
-/// whose last write disagrees with the car the handler read.
+/// each step write carrying the post-write row): the last write of `step`
+/// at which its `hold` took the value it holds now, and the head that
+/// write bound ([`Placement::binds`]). `Err` says why that cannot be read
+/// — no write of the step in the window, a window full enough to start
+/// after the placing, or a history whose last write disagrees with the
+/// car the handler read.
 ///
 /// The record cannot tell a hold rewritten with the SAME text from the
 /// hold it replaced, so "placed" means "took its current reason".
-pub(crate) fn hold_placed_at(events: &Json, step: &Json) -> Result<DateTime<Utc>, String> {
+pub(crate) fn hold_placement(events: &Json, step: &Json) -> Result<Placement, String> {
     let step_id = str_at(step, "/id");
     let rows: Vec<Json> = rows_or_refuse(events, "the car's history")?;
     let full = rows.len() >= EVENTS_LIMIT;
-    let writes = rows.iter().filter_map(|e| {
-        (str_at(e, "/payload/step_id") == step_id)
-            .then(|| e.pointer("/payload/metadata").map(|md| (md.get("hold"), e)))
-            .flatten()
-    });
-    // (the hold as of the last write seen, when that hold took its value)
-    let (last, placed) = writes.fold((None, None), |(prev, placed), (hold, e)| match prev {
-        Some(p) if p == hold => (Some(hold), placed),
-        // The window's first write: its hold is placed HERE only when the
-        // window is the whole history; a full window may start after it.
-        None if full => (Some(hold), None),
-        _ => (Some(hold), Some(str_at(e, "/at"))),
-    });
-    if last != Some(step.pointer("/metadata/hold")) {
+    // (hold, hold_sha, the event) for each write of the step, oldest first.
+    let writes: Vec<(Option<&Json>, Option<&Json>, &Json)> = rows
+        .iter()
+        .filter(|e| str_at(e, "/payload/step_id") == step_id)
+        .filter_map(|e| {
+            e.pointer("/payload/metadata")
+                .map(|md| (md.get("hold"), md.get(boss_jobs::car::HOLD_SHA), e))
+        })
+        .collect();
+    let now = step.pointer("/metadata/hold");
+    if writes.last().map(|w| w.0) != Some(now) {
         return Err(format!(
             "the car's history carries no write of review step {} holding what it holds now",
             short(step_id)
         ));
     }
-    let placed = placed.ok_or_else(|| {
-        format!(
+    // The first write of the run of writes that hold what it holds now.
+    let i = writes.iter().rposition(|w| w.0 != now).map_or(0, |k| k + 1);
+    // The window's first write is the placing only when the window is
+    // the whole history; a full window may start after it.
+    if i == 0 && full {
+        return Err(format!(
             "the car's history is a full window of {EVENTS_LIMIT} rows that starts after review \
              step {}'s hold took its reason",
             short(step_id)
-        )
-    })?;
+        ));
+    }
+    let (_, sha, e) = writes[i];
+    let before = i.checked_sub(1).and_then(|k| writes[k].1);
+    let head = str_at(step, &format!("/metadata/{}", boss_jobs::car::HOLD_SHA));
+    let binds = sha
+        .and_then(Json::as_str)
+        .filter(|s| !s.trim().is_empty() && s.trim() == head)
+        .filter(|_| sha != before)
+        .map(|s| s.trim().to_string());
+    let placed = str_at(e, "/at");
     DateTime::parse_from_rfc3339(placed)
-        .map(|t| t.with_timezone(&Utc))
+        .map(|t| Placement {
+            at: t.with_timezone(&Utc),
+            binds,
+        })
         .map_err(|e| format!("the write that placed the hold is dated {placed:?}: {e}"))
 }
 
@@ -184,11 +245,21 @@ pub(crate) fn hold_placed_at(events: &Json, step: &Json) -> Result<DateTime<Utc>
 /// and a person's `boss hold` over a live review hold keeps `hold_sha`,
 /// so without this the door would lift a NEW hold on an OLD verdict.
 /// Either time unreadable is a reason too: nothing is asked on a guess.
-pub(crate) fn not_after_the_hold(payload: &Json, events: &Json, step: &Json) -> Option<String> {
-    let said = str_at(
-        payload,
-        &format!("/metadata/{}/at", car_release::REVIEW_KEY),
-    );
+///
+/// ONE VERDICT BEFORE ITS HOLD IS THAT HOLD'S (backlog 60993cda): when
+/// the write that placed the hold also bound it to the very head the
+/// verdict read ([`Placement::binds`] == `reviewed_sha`). That is a
+/// review hold for exactly that head — a gate's green holding the car
+/// for the review of what it gated — and the reviewer had already read
+/// it: measured 2026-10-18, 4 of the 21 verdicts that preceded a hold at
+/// their head, 3 of them then released by a person on that same verdict
+/// (cars 048df940, 4a19d6a9, c1c19d5e). A hand hold and a red-train hold
+/// bind no head, and a re-hold at the head already held binds no NEW one
+/// — the other 17 — so none of them is ever that.
+///
+/// `run` is the reviewer's agent-run as the jobs API serves it.
+pub(crate) fn not_after_the_hold(run: &Json, events: &Json, step: &Json) -> Option<String> {
+    let said = str_at(run, &format!("/metadata/{}/at", car_release::REVIEW_KEY));
     let verdict = match DateTime::parse_from_rfc3339(said) {
         Ok(t) => t.with_timezone(&Utc),
         Err(e) => {
@@ -199,8 +270,8 @@ pub(crate) fn not_after_the_hold(payload: &Json, events: &Json, step: &Json) -> 
             ));
         }
     };
-    let placed = match hold_placed_at(events, step) {
-        Ok(t) => t,
+    let placement = match hold_placement(events, step) {
+        Ok(p) => p,
         Err(why) => {
             return Some(format!(
                 "the time the hold now on the car was placed cannot be read ({why}), so the \
@@ -209,6 +280,14 @@ pub(crate) fn not_after_the_hold(payload: &Json, events: &Json, step: &Json) -> 
             ));
         }
     };
+    let read = str_at(
+        run,
+        &format!("/metadata/{}/reviewed_sha", car_release::REVIEW_KEY),
+    );
+    if !read.is_empty() && placement.binds.as_deref() == Some(read) {
+        return None;
+    }
+    let placed = placement.at;
     (verdict <= placed).then(|| {
         format!(
             "the verdict was recorded at {said}, not after the hold now on the car was placed \
@@ -281,13 +360,54 @@ impl JobsReleaseOnReview {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(HandlerError::Downstream(format!(
-                "PATCH {url} returned {status}: {text}"
-            )));
+            return Err(answered(
+                status,
+                format!("PATCH {url} returned {status}: {text}"),
+            ));
         }
         tracing::info!(rule = %ctx.rule_name, car = %str_at(car, "/id"), review, why,
             "jobs.release_on_review: left the car held, and recorded why on its review step");
         Ok(())
+    }
+
+    /// A refusal no redelivery can change (review 792b871a N3): written
+    /// beside the hold once, like any refusal, and still an error, so the
+    /// firing is dead-lettered and counted where every failed one is.
+    /// When the record itself cannot be written, both failures are said.
+    async fn record_permanent(
+        &self,
+        ctx: &InvocationContext,
+        car: &Json,
+        step: &Json,
+        review: &str,
+        why: String,
+    ) -> HandlerError {
+        match self.record_refusal(ctx, car, step, review, &why).await {
+            Ok(()) => HandlerError::Permanent(why),
+            Err(e) => HandlerError::Permanent(format!(
+                "{why}; and the refusal could not be recorded on the car: {e}"
+            )),
+        }
+    }
+}
+
+/// PURE: does an HTTP answer refuse for good? A 4xx says the request
+/// itself will not be granted however often it is sent — except 408 and
+/// 429, which ask for it again later. A 5xx is the server's, and may
+/// pass (review 792b871a N3: a door 404 was retried).
+pub(crate) fn refuses_for_good(status: reqwest::StatusCode) -> bool {
+    status.is_client_error()
+        && status != reqwest::StatusCode::REQUEST_TIMEOUT
+        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// The error an unsuccessful answer is: permanent when it refuses for
+/// good ([`refuses_for_good`]), retried otherwise.
+fn answered(status: reqwest::StatusCode, said: String) -> HandlerError {
+    if refuses_for_good(status) {
+        HandlerError::Permanent(said)
+    } else {
+        HandlerError::Downstream(said)
     }
 }
 
@@ -303,6 +423,9 @@ impl Handler for JobsReleaseOnReview {
         ctx: &InvocationContext,
     ) -> Result<(), HandlerError> {
         let p = &ctx.event_payload;
+        if ctx.triggering_topic == HOLD_TOPIC {
+            return self.on_review_step_write(ctx).await;
+        }
         let run = str_at(p, "/id");
         let car_id = str_at(p, &format!("/metadata/{}/car", car_release::REVIEW_KEY));
         if str_at(p, "/kind") != "agent-run" || run.is_empty() || car_id.is_empty() {
@@ -310,39 +433,109 @@ impl Handler for JobsReleaseOnReview {
             // names anything this rule could release.
             return Ok(());
         }
-        let base = self.jobs_base.trim_end_matches('/');
-        let car_url = format!("{base}/api/jobs/{car_id}");
+        let Some(car) = self.read(&format!("/api/jobs/{car_id}")).await? else {
+            return Ok(());
+        };
+        self.ask(ctx, &car, p).await
+    }
+}
+
+/// The topic of the SECOND trigger, `release-a-held-car-when-its-review-
+/// hold-is-placed` (backlog 60993cda): a write of a car's review step,
+/// whose payload is the step row rather than the reviewer's run.
+pub(crate) const HOLD_TOPIC: &str = "jobs.step.updated";
+
+impl JobsReleaseOnReview {
+    /// `GET {jobs}{path}` as the dispatcher's reader: the JSON, or `None`
+    /// for a 404 (the packet is gone). Anything else not 2xx is the error
+    /// [`answered`] makes of it: permanent when it refuses for good,
+    /// retried otherwise (review 792b871a N3).
+    async fn read(&self, path: &str) -> Result<Option<Json>, HandlerError> {
+        let url = format!("{}{path}", self.jobs_base.trim_end_matches('/'));
         let resp = self
             .client
-            .get(&car_url)
+            .get(&url)
             .header("x-boss-user", dispatcher_reader_header())
             .header("x-sim-origin", sim_origin_value())
             .send()
             .await
-            .map_err(|e| HandlerError::Downstream(format!("GET {car_url}: {e}")))?;
+            .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(());
+            return Ok(None);
         }
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(HandlerError::Downstream(format!(
-                "GET {car_url} returned {status}: {text}"
-            )));
+            return Err(answered(
+                status,
+                format!("GET {url} returned {status}: {text}"),
+            ));
         }
-        let car: Json = resp
-            .json()
+        resp.json()
             .await
-            .map_err(|e| HandlerError::Downstream(format!("GET {car_url} is not JSON: {e}")))?;
+            .map(Some)
+            .map_err(|e| HandlerError::Downstream(format!("GET {url} is not JSON: {e}")))
+    }
+
+    /// THE HOLD WAKE (backlog 60993cda). A verdict the dispatched reviewer
+    /// gave BEFORE the hold was placed fired the rule while there was no
+    /// hold, or a hold at another head, and nothing asked again: the car
+    /// waited for a person, who released it on that same verdict. So a
+    /// write of a held review step also wakes the rule, which reads the
+    /// reviewer the step names and, when that run has a verdict on THIS
+    /// car, asks exactly as the verdict's own write does. No verdict yet,
+    /// or one on another car: nothing to ask and nothing recorded — the
+    /// verdict's own write will fire the rule when it lands.
+    async fn on_review_step_write(&self, ctx: &InvocationContext) -> Result<(), HandlerError> {
+        let p = &ctx.event_payload;
+        let car_id = str_at(p, "/job_id");
+        if car_id.is_empty() {
+            return Ok(());
+        }
+        let Some(car) = self.read(&format!("/api/jobs/{car_id}")).await? else {
+            return Ok(());
+        };
         let Some(step) = held_review(&car) else {
             return Ok(());
         };
-        if let Some(why) = not_the_dispatched_reviewer(&car, run) {
-            return self.record_refusal(ctx, &car, step, run, &why).await;
+        // Only the car's own review step speaks for it; another step's
+        // slug is not this car's hold.
+        if str_at(step, "/id") != str_at(p, "/step_id") {
+            return Ok(());
+        }
+        let Some(reviewer) = car_release::dispatched_reviewer(&car) else {
+            return Ok(());
+        };
+        let Some(run) = self.read(&format!("/api/jobs/{reviewer}")).await? else {
+            return Ok(());
+        };
+        let names = str_at(&run, &format!("/metadata/{}/car", car_release::REVIEW_KEY));
+        if !names.eq_ignore_ascii_case(str_at(&car, "/id")) {
+            return Ok(());
+        }
+        self.ask(ctx, &car, &run).await
+    }
+
+    /// Ask the release door about `car` on `run`'s verdict, or record why
+    /// the rule does not — the one road both triggers take.
+    async fn ask(
+        &self,
+        ctx: &InvocationContext,
+        car: &Json,
+        run: &Json,
+    ) -> Result<(), HandlerError> {
+        let Some(step) = held_review(car) else {
+            return Ok(());
+        };
+        let car_id = str_at(car, "/id");
+        let review = str_at(run, "/id");
+        if let Some(why) = not_the_dispatched_reviewer(car, review) {
+            return self.record_refusal(ctx, car, step, review, &why).await;
         }
         // The verdict must postdate the hold it would lift (review
         // 3af8f7e2 N2), read off the car's own history.
-        let events_url = format!("{car_url}/events?limit={EVENTS_LIMIT}");
+        let base = self.jobs_base.trim_end_matches('/');
+        let events_url = format!("{base}/api/jobs/{car_id}/events?limit={EVENTS_LIMIT}");
         let resp = self
             .client
             .get(&events_url)
@@ -354,18 +547,28 @@ impl Handler for JobsReleaseOnReview {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(HandlerError::Downstream(format!(
-                "GET {events_url} returned {status}: {text}"
-            )));
+            let said = format!(
+                "the car's history could not be read (GET {events_url} returned {status}: \
+                 {text}), so the release rule cannot tell the verdict came after the hold"
+            );
+            if refuses_for_good(status) {
+                return Err(self.record_permanent(ctx, car, step, review, said).await);
+            }
+            return Err(HandlerError::Downstream(said));
         }
         let events: Json = resp
             .json()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {events_url} is not JSON: {e}")))?;
-        if let Some(why) = not_after_the_hold(p, &events, step) {
-            return self.record_refusal(ctx, &car, step, run, &why).await;
+        if let Some(why) = not_after_the_hold(run, &events, step) {
+            return self.record_refusal(ctx, car, step, review, &why).await;
         }
+        let run = review;
 
+        // The ask names the hold this firing judged, as it read the car
+        // (review 792b871a N1): the door lifts that hold or nothing, so a
+        // hold rewritten since this read — a person's `boss hold` keeps
+        // `hold_sha` — is refused rather than lifted on this verdict.
         let url = format!("{base}/api/jobs/{car_id}/release");
         let resp = self
             .client
@@ -373,7 +576,7 @@ impl Handler for JobsReleaseOnReview {
             .header("content-type", "application/json")
             .header("x-boss-user", dispatcher_actor_header(&ctx.rule_name))
             .header("x-sim-origin", sim_origin_value())
-            .json(&json!({ "review": run }))
+            .json(&json!({ "review": run, "hold": car_release::JudgedHold::of(car) }))
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("POST {url}: {e}")))?;
@@ -384,15 +587,29 @@ impl Handler for JobsReleaseOnReview {
                 "jobs.release_on_review: released the car on its reviewer's verdict");
             return Ok(());
         }
-        match status.as_u16() {
-            409 => self.record_refusal(ctx, &car, step, run, &text).await,
-            401 | 403 | 422 => Err(HandlerError::Permanent(format!(
-                "POST {url} returned {status}: {text}"
-            ))),
-            _ => Err(HandlerError::Downstream(format!(
-                "POST {url} returned {status}: {text}"
-            ))),
+        if status == reqwest::StatusCode::CONFLICT {
+            // A REFUSAL IS RECORDED WHERE THE HOLD IS — so read where it
+            // is now (review 792b871a N2). Two firings for one verdict
+            // both read the car held — and two wakes for one verdict, the
+            // verdict's write and the hold's (backlog 60993cda); the
+            // loser's 409 finds the winner's release, and nothing holds
+            // the car to record it beside.
+            let Some(now) = self.read(&format!("/api/jobs/{car_id}")).await? else {
+                return Ok(());
+            };
+            let Some(step) = held_review(&now) else {
+                tracing::info!(rule = %ctx.rule_name, car = car_id, review = run,
+                    "jobs.release_on_review: the door refused, and nothing holds the car now \
+                     (a racing firing released it); nothing to record");
+                return Ok(());
+            };
+            return self.record_refusal(ctx, &now, step, run, &text).await;
         }
+        let said = format!("the release door answered {status}: {text}");
+        if refuses_for_good(status) {
+            return Err(self.record_permanent(ctx, car, step, run, said).await);
+        }
+        Err(HandlerError::Downstream(format!("POST {url}: {said}")))
     }
 }
 
@@ -523,13 +740,29 @@ mod tests {
     }
 
     async fn api_with(car: Json, run: Json, door: Option<StatusCode>, events: Vec<Json>) -> Api {
+        api_racing(car, run, door, events, None).await
+    }
+
+    /// [`api_with`], with a write that lands on the review step BETWEEN
+    /// the handler's reads and its POST: `race` is merged into the step
+    /// as the history read is answered, the gap review 792b871a N1 named
+    /// (a person's `boss hold`, or a duplicate firing's release).
+    async fn api_racing(
+        car: Json,
+        run: Json,
+        door: Option<StatusCode>,
+        events: Vec<Json>,
+        race: Option<Json>,
+    ) -> Api {
         let events = Arc::new(json!({ "data": events }));
         let car = Arc::new(Mutex::new(car));
         let log: Arc<Mutex<Vec<(String, Json, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let race = Arc::new(Mutex::new(race));
         let (c, l, r, h) = (car.clone(), log.clone(), Arc::new(run), events);
         let app = Router::new().fallback(
             move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
                 let (car, log, run, history) = (c.clone(), l.clone(), r.clone(), h.clone());
+                let race = race.clone();
                 async move {
                     let who: Json = headers
                         .get("x-boss-user")
@@ -546,7 +779,16 @@ mod tests {
                     if method == Method::GET && uri.path() == car_path {
                         return axum::Json(car.lock().unwrap().clone()).into_response();
                     }
+                    // The reviewer's run, as the hold wake reads it.
+                    if method == Method::GET
+                        && uri.path() == format!("/api/jobs/{}", str_at(&run, "/id"))
+                    {
+                        return axum::Json((*run).clone()).into_response();
+                    }
                     if method == Method::GET && uri.path() == format!("{car_path}/events") {
+                        if let Some(write) = race.lock().unwrap().take() {
+                            merge(&mut car.lock().unwrap()["steps"][0]["metadata"], &write);
+                        }
                         return axum::Json((*history).clone()).into_response();
                     }
                     if method == Method::POST && uri.path() == format!("{car_path}/release") {
@@ -562,7 +804,16 @@ mod tests {
                         return match car_release::judge(&Advisory, &now, &run, &ask, &by, "t").await
                         {
                             Ok(g) => {
-                                merge(&mut car.lock().unwrap()["steps"][0]["metadata"], &g.patch);
+                                // The write's precondition, as the
+                                // adapter judges it under its lock.
+                                let md = &mut car.lock().unwrap()["steps"][0]["metadata"];
+                                let expect = g.expect.as_object().cloned().unwrap_or_default();
+                                if !boss_jobs::step_metadata_write::metadata_still_reads(
+                                    md, &expect,
+                                ) {
+                                    return (StatusCode::CONFLICT, "step changed").into_response();
+                                }
+                                merge(md, &g.patch);
                                 axum::Json(json!({"car": CAR, "head": g.head})).into_response()
                             }
                             Err(why) => (
@@ -615,6 +866,21 @@ mod tests {
     async fn fire(api: &Api, payload: Json) -> Result<(), HandlerError> {
         handler(api).invoke(&[], &ctx(payload)).await
     }
+
+    /// The SECOND trigger (backlog 60993cda): a write of the car's review
+    /// step, its payload the post-write step row as `jobs.step.updated`
+    /// carries it (`step_state_payload`), read off the car as it stands.
+    async fn fire_on_hold(api: &Api) -> Result<(), HandlerError> {
+        let md = api.review_md();
+        let row = json!({"id": STEP, "step_id": STEP, "job_id": CAR, "spec_slug": "review",
+                         "kind": "task", "status": "active", "metadata": md});
+        let mut c = ctx(row);
+        c.triggering_topic = HOLD_TOPIC.into();
+        handler(api).invoke(&[], &c).await
+    }
+
+    const GET_CAR: &str = "GET /api/jobs/c0ffee00-0000-4000-8000-000000000000";
+    const GET_REVIEWER: &str = "GET /api/jobs/5eed5eed-0000-4000-8000-000000000000";
 
     /// The refusal the door gave, as recorded on the review step.
     fn recorded(api: &Api) -> Json {
@@ -767,12 +1033,19 @@ mod tests {
         assert_eq!(api.sent(PATCH_REVIEW).len(), 1, "{:?}", api.requests());
     }
 
-    /// A door answer that cannot change on redelivery is permanent; an
-    /// unavailable door is retried. Neither writes anything.
+    /// A DOOR THAT WILL NOT JUDGE SAYS SO ON THE CAR (review 792b871a
+    /// N3). An answer that cannot change on redelivery — 401, 403, 404,
+    /// 422 — is permanent, and its reason is written beside the hold
+    /// ONCE, so the car's reader learns why the rule left it without a
+    /// dead-letter query; it is still an error, counted where every
+    /// failed firing is. A door 404 was retried before. An unavailable
+    /// door (5xx) is retried and writes nothing: it may yet answer.
     #[tokio::test]
-    async fn a_door_that_does_not_judge_is_an_error_not_a_record() {
+    async fn a_door_that_does_not_judge_is_an_error_recorded_once_on_the_car() {
         for (status, permanent) in [
+            (StatusCode::UNAUTHORIZED, true),
             (StatusCode::FORBIDDEN, true),
+            (StatusCode::NOT_FOUND, true),
             (StatusCode::UNPROCESSABLE_ENTITY, true),
             (StatusCode::INTERNAL_SERVER_ERROR, false),
         ] {
@@ -782,13 +1055,91 @@ mod tests {
                 Some(status),
             )
             .await;
-            let err = fire(&api, run(REVIEWER, H1, "release"))
-                .await
-                .expect_err("not a pass");
-            assert_eq!(err.is_permanent(), permanent, "{status}: {err}");
-            assert!(api.sent(PATCH_REVIEW).is_empty(), "{status}");
+            for _ in 0..2 {
+                let err = fire(&api, run(REVIEWER, H1, "release"))
+                    .await
+                    .expect_err("not a pass");
+                assert_eq!(err.is_permanent(), permanent, "{status}: {err}");
+            }
             still_held(&api);
+            if !permanent {
+                assert!(api.sent(PATCH_REVIEW).is_empty(), "{status}");
+                continue;
+            }
+            assert_eq!(api.sent(PATCH_REVIEW).len(), 1, "{status}: recorded once");
+            let rec = recorded(&api);
+            assert_eq!(rec["review"], json!(REVIEWER), "{rec}");
+            let why = str_at(&rec, "/why");
+            assert!(why.contains(&status.as_u16().to_string()), "{why}");
+            assert!(why.contains("the door answered so"), "{why}");
         }
+    }
+
+    /// THE HOLD THE RULE JUDGED IS THE ONLY HOLD THE DOOR LIFTS (review
+    /// 792b871a N1). The rule judges the hold's placement on the car as
+    /// it READ it; a person's `boss hold` landing before the POST keeps
+    /// `hold_sha`, so a door asked with the review alone judged the NEW
+    /// hold good on the OLD verdict and lifted it. The ask now carries
+    /// the hold the rule judged, text and sha, and the door refuses a
+    /// car that carries another. The refusal is recorded once, and the
+    /// person's hold stays.
+    #[tokio::test]
+    async fn a_hold_rewritten_between_the_read_and_the_post_is_not_lifted() {
+        let car = held_car(json!({}));
+        let hand = "David wants to read this one first";
+        let api = api_racing(
+            car.clone(),
+            run(REVIEWER, H1, "release"),
+            None,
+            placed_before_the_verdict(&car),
+            Some(json!({"hold": hand})),
+        )
+        .await;
+        fire(&api, run(REVIEWER, H1, "release"))
+            .await
+            .expect("recorded");
+        let md = api.review_md();
+        assert_eq!(md["hold"], json!(hand), "the person's hold stays: {md}");
+        assert!(md.get(boss_jobs::car::RELEASE).is_none(), "{md}");
+        let asked = api.sent(POST_RELEASE);
+        assert_eq!(asked.len(), 1, "{:?}", api.requests());
+        assert_eq!(
+            asked[0].0["hold"],
+            json!({"reason": "trust-boundary car (area policy)", "sha": H1}),
+            "the ask names the hold the rule judged"
+        );
+        let rec = recorded(&api);
+        assert_eq!(rec["outcome"], json!("refused"), "{rec}");
+        assert!(str_at(&rec, "/why").contains(hand), "{rec}");
+    }
+
+    /// A RACING DUPLICATE IS NOT A REFUSAL (review 792b871a N2). Two
+    /// firings for one verdict both read the car held; the first is
+    /// granted, and the second's 409 — the hold it judged is gone, the
+    /// car is released — is the release already done, not a reason the
+    /// rule left the car. Nothing is recorded beside the release.
+    #[tokio::test]
+    async fn a_racing_duplicate_is_not_recorded_as_a_refusal() {
+        let car = held_car(json!({}));
+        let first = json!({"hold": null, boss_jobs::car::RELEASE: {
+            "sha": H1, "review": REVIEWER, "verdict": "release",
+            "by": format!("automation:rule:{RULE}"), "at": "2026-10-16T19:05:01Z"}});
+        let api = api_racing(
+            car.clone(),
+            run(REVIEWER, H1, "release"),
+            None,
+            placed_before_the_verdict(&car),
+            Some(first),
+        )
+        .await;
+        fire(&api, run(REVIEWER, H1, "release"))
+            .await
+            .expect("the release is done; nothing to say");
+        assert_eq!(api.sent(POST_RELEASE).len(), 1, "{:?}", api.requests());
+        assert!(api.sent(PATCH_REVIEW).is_empty(), "{:?}", api.requests());
+        let md = api.review_md();
+        assert!(md.get(boss_jobs::car::AUTO_RELEASE).is_none(), "{md}");
+        assert_eq!(md[boss_jobs::car::RELEASE]["review"], json!(REVIEWER));
     }
 
     /// A HOLD PLACED AFTER THE VERDICT IS NOT LIFTED ON IT (review
@@ -816,6 +1167,10 @@ mod tests {
         report["metadata"]["report"] = json!("the review's report, written after its verdict");
         fire(&api, report.clone()).await.expect("recorded");
         fire(&api, report).await.expect("again");
+        // The hold wake (backlog 60993cda) reads the same verdict and
+        // leaves the hand hold alone for the same reason: it bound no
+        // head, so it is not the review hold the verdict judged.
+        fire_on_hold(&api).await.expect("the hold wake");
         assert!(api.sent(POST_RELEASE).is_empty(), "the door is not asked");
         let md = api.review_md();
         assert_eq!(md["hold"], json!(hand), "{md}");
@@ -835,12 +1190,12 @@ mod tests {
     fn a_history_with_no_data_array_is_refused_not_read_as_empty() {
         let car = held_car(json!({}));
         let step = &car["steps"][0];
-        let why = hold_placed_at(&json!({"error": "boom"}), step).expect_err("refused");
+        let why = hold_placement(&json!({"error": "boom"}), step).expect_err("refused");
         assert!(
             why.contains("the car's history answered no `data` array"),
             "{why}"
         );
-        let empty = hold_placed_at(&json!({"data": []}), step).expect_err("no write");
+        let empty = hold_placement(&json!({"data": []}), step).expect_err("no write");
         assert!(empty.contains("carries no write"), "{empty}");
     }
 
@@ -889,7 +1244,12 @@ mod tests {
             .expect("released");
         let asked = api.sent(POST_RELEASE);
         assert_eq!(asked.len(), 1, "{:?}", api.requests());
-        assert_eq!(asked[0].0, json!({"review": REVIEWER}), "no head, no run");
+        assert_eq!(
+            asked[0].0,
+            json!({"review": REVIEWER,
+                   "hold": {"reason": "trust-boundary car (area policy)", "sha": H1}}),
+            "the review and the hold it judged; no head, no run"
+        );
         assert_eq!(asked[0].1, format!("rule:{RULE}"));
         let md = api.review_md();
         assert!(md.get("hold").is_none(), "{md}");
@@ -906,5 +1266,183 @@ mod tests {
             .await
             .expect("a no-op");
         assert_eq!(api.sent(POST_RELEASE).len(), 1);
+    }
+
+    /// The review hold a gate's green places at `head`, with `reason`:
+    /// `hold` and `hold_sha` in ONE write (`jobs_auto_park`'s body, the
+    /// rerail's, the conductor's re-judge).
+    fn review_hold(reason: &str, head: &str) -> Json {
+        json!({"hold": reason, "hold_sha": head, "agent_run": REVIEWER})
+    }
+
+    /// THE GAP (backlog 60993cda, claim 3), in the shape car 048df940
+    /// had on 2026-10-16. The car stood held for review at its first
+    /// gate's head (H2, 18:00); its reviewer read the REPAIR's head H1
+    /// and gave RELEASE at 19:00, before the repair's gate finished — so
+    /// the door refused it then ("a review of another head") and the
+    /// refusal was recorded; at 19:30 the repair's green re-held the car
+    /// at H1, the head the verdict read. Nothing asked again, and the
+    /// car waited for a person, who released it on that same verdict
+    /// (measured: emp-david, 20 s after the hold). Now the hold's own
+    /// write wakes the rule, which reads the dispatched reviewer's
+    /// verdict and asks the door, signed as the rule.
+    #[tokio::test]
+    async fn a_verdict_given_before_its_review_hold_is_asked_when_the_hold_is_placed() {
+        let reason = "trust-boundary car (area policy)";
+        let car = held_car(json!({}));
+        let history = vec![
+            step_event("2026-10-16T18:00:00Z", review_hold(reason, H2)),
+            step_event("2026-10-16T19:30:00Z", review_hold(reason, H1)),
+        ];
+        let api = api_with(car, run(REVIEWER, H1, "release"), None, history).await;
+        fire_on_hold(&api).await.expect("released");
+        let asked = api.sent(POST_RELEASE);
+        assert_eq!(asked.len(), 1, "{:?}", api.requests());
+        assert_eq!(
+            asked[0].0,
+            json!({"review": REVIEWER, "hold": {"reason": reason, "sha": H1}}),
+            "the review and the hold it judged (review 792b871a N1), as the verdict's wake asks"
+        );
+        assert_eq!(asked[0].1, format!("rule:{RULE}"));
+        let md = api.review_md();
+        assert!(md.get("hold").is_none(), "{md}");
+        assert_eq!(md[boss_jobs::car::RELEASE]["sha"], json!(H1), "{md}");
+        assert_eq!(
+            md[boss_jobs::car::RELEASE]["by"],
+            json!(format!("automation:rule:{RULE}"))
+        );
+        // The release's own write wakes it again: nothing is held.
+        fire_on_hold(&api).await.expect("a no-op");
+        assert_eq!(api.sent(POST_RELEASE).len(), 1);
+    }
+
+    /// The same gap where the repair's green re-held the car with a NEW
+    /// reason (car 4a19d6a9, 2026-10-15: the verdict at 12:30, the gate's
+    /// `--hold` at 13:52 binding the head the verdict read, agent-codex's
+    /// hand release on that verdict at 13:54). The verdict predates the
+    /// hold's reason, but that write bound the hold to exactly the head
+    /// the verdict read, so it is the review hold the verdict judged:
+    /// asked, from either trigger.
+    #[tokio::test]
+    async fn a_review_hold_bound_to_the_head_a_verdict_read_is_that_verdicts() {
+        let fresh = "mutating-verb source car: fresh distinct exact-head adversarial review";
+        let earlier = review_hold("trust-boundary car (area policy)", H2);
+        let car = held_car(json!({"hold": fresh}));
+        let history = vec![
+            step_event("2026-10-16T18:00:00Z", earlier),
+            step_event("2026-10-16T19:30:00Z", review_hold(fresh, H1)),
+        ];
+        for wake in ["hold", "run"] {
+            let api = api_with(
+                car.clone(),
+                run(REVIEWER, H1, "release"),
+                None,
+                history.clone(),
+            )
+            .await;
+            match wake {
+                "hold" => fire_on_hold(&api).await,
+                _ => fire(&api, run(REVIEWER, H1, "release")).await,
+            }
+            .expect("released");
+            assert_eq!(api.sent(POST_RELEASE).len(), 1, "{wake}");
+            let md = api.review_md();
+            assert!(md.get("hold").is_none(), "{wake}: {md}");
+        }
+    }
+
+    /// A hold bound to a head the verdict did NOT read is not that
+    /// verdict's, whatever the door would say: the verdict predates it,
+    /// so it is left to a person and the reason recorded, once.
+    #[tokio::test]
+    async fn a_review_hold_bound_to_another_head_is_not_lifted_on_an_older_verdict() {
+        let reason = "trust-boundary car (area policy)";
+        let car = held_car(json!({"hold": "re-gated", "hold_sha": H2}));
+        let history = vec![
+            step_event("2026-10-16T18:00:00Z", review_hold(reason, H1)),
+            step_event("2026-10-16T19:30:00Z", review_hold("re-gated", H2)),
+        ];
+        let api = api_with(car, run(REVIEWER, H1, "release"), None, history).await;
+        fire_on_hold(&api).await.expect("recorded");
+        fire_on_hold(&api).await.expect("again");
+        assert!(api.sent(POST_RELEASE).is_empty(), "the door is not asked");
+        let why = str_at(&recorded(&api), "/why").to_string();
+        assert!(why.contains("not after the hold"), "{why}");
+        assert_eq!(api.sent(PATCH_REVIEW).len(), 1, "recorded once");
+    }
+
+    /// The hold wake asks only about a verdict the dispatched reviewer
+    /// has GIVEN on this car. A reviewer still working (no verdict), or
+    /// one whose verdict names another car, leaves nothing to ask and
+    /// nothing to record: the car reads exactly as it did.
+    #[tokio::test]
+    async fn the_hold_wake_asks_nothing_until_the_reviewer_has_a_verdict_on_this_car() {
+        let working = json!({"id": REVIEWER, "kind": "agent-run", "status": "open",
+                             "metadata": {}});
+        let mut elsewhere = run(REVIEWER, H1, "release");
+        elsewhere["metadata"]["review"]["car"] = json!(OTHER);
+        for reviewer in [working, elsewhere] {
+            let api = api(held_car(json!({})), reviewer.clone(), None).await;
+            fire_on_hold(&api).await.expect("a no-op");
+            assert_eq!(
+                api.requests(),
+                vec![GET_CAR.to_string(), GET_REVIEWER.to_string()],
+                "read the car and its reviewer, then nothing: {reviewer}"
+            );
+        }
+    }
+
+    /// The hold wake speaks for the car's REVIEW step only, and only
+    /// while it holds: another step's write, and a released car's, read
+    /// the car and stop.
+    #[tokio::test]
+    async fn the_hold_wake_reads_only_a_held_review_step() {
+        let other = api(held_car(json!({})), run(REVIEWER, H1, "release"), None).await;
+        let row = json!({"id": "another-step", "step_id": "another-step", "job_id": CAR,
+                         "spec_slug": "review", "metadata": other.review_md()});
+        let mut c = ctx(row);
+        c.triggering_topic = HOLD_TOPIC.into();
+        handler(&other).invoke(&[], &c).await.expect("a no-op");
+        let mut released = held_car(json!({}));
+        released["steps"][0]["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("hold");
+        let api2 = api(released, run(REVIEWER, H1, "release"), None).await;
+        fire_on_hold(&api2).await.expect("a no-op");
+        for a in [&other, &api2] {
+            assert_eq!(a.requests(), vec![GET_CAR.to_string()]);
+        }
+    }
+
+    /// PURE: the placing write is dated, and says which head it bound
+    /// when it bound one in the same write — and binds none when the
+    /// head was already the step's before it (a hand hold over a live
+    /// review hold), or when the step never named one.
+    #[test]
+    fn the_placing_write_says_which_head_it_bound() {
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        let car = held_car(json!({"hold": "new", "hold_sha": H1}));
+        let step = &car["steps"][0];
+        let bound = json!({"data": [
+            step_event("2026-10-16T18:00:00Z", review_hold("old", H2)),
+            step_event("2026-10-16T19:30:00Z", review_hold("new", H1)),
+        ]});
+        let p = hold_placement(&bound, step).expect("read");
+        assert_eq!(p.at, at("2026-10-16T19:30:00Z"));
+        assert_eq!(p.binds.as_deref(), Some(H1));
+        let kept = json!({"data": [
+            step_event("2026-10-16T18:00:00Z", review_hold("old", H1)),
+            step_event("2026-10-16T19:30:00Z", review_hold("new", H1)),
+        ]});
+        assert_eq!(hold_placement(&kept, step).expect("read").binds, None);
+        let first = json!({"data": [
+            step_event("2026-10-16T19:30:00Z", review_hold("new", H1)),
+        ]});
+        assert_eq!(
+            hold_placement(&first, step).expect("read").binds.as_deref(),
+            Some(H1),
+            "the whole history's first write binds what it carries"
+        );
     }
 }

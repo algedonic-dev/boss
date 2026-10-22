@@ -424,12 +424,18 @@ fi
 # claim can have run a write here, and so the only one a "claimed,
 # outcome unknown" record may name (security re-review, 2026-09-25).
 # `\z`, not `$`: Oniguruma reads `$` as "end, or before a final newline".
+# The credential door keeps exactly this id on a request it resolves to
+# THIS host, and rebinds any other to the account (backlog d16c2dae:
+# boss-jobs runner_credential::acting_id). Its tests run BOTH functions
+# below against the door, so a pid bound or a separator changed here
+# without the door turns that test red (backlog 043d15a2: the pid was
+# `[0-9]+` here and 1 to 10 digits there).
 mint_claimant() {
     printf '%s:%s:%s-%s' "$ACTOR" "$HOST_ID" "$(date -u +%Y%m%dT%H%M%SZ)" "$$"
 }
 is_runner_pass() {
     jq -rn --arg id "$1" --arg p "$ACTOR:$HOST_ID:" '
-        if ($id | startswith($p)) and ($id[($p | length):] | test("^[0-9]{8}T[0-9]{6}Z-[0-9]+\\z"))
+        if ($id | startswith($p)) and ($id[($p | length):] | test("^[0-9]{8}T[0-9]{6}Z-[0-9]{1,10}\\z"))
         then "yes" else "no" end'
 }
 

@@ -22,6 +22,7 @@
 
 use super::*;
 
+use crate::membership_replay::{FlowWindows, MapFlowReading};
 use crate::regions::{self, RegionInputs, RunnerHost, StationReading};
 use crate::yard;
 
@@ -76,8 +77,13 @@ pub(super) async fn yard_regions<R: JobsRepository + 'static, B: EventBus + 'sta
     // THE OBSERVED-UNDECLARED READING (design e765b3fc §2b; M1 read it,
     // R2 made it judge): every route the moves record saw taken in this
     // window, judged against the routes derived now from the protocols
-    // and the declared hand-offs. Wall clock, as the record stamps it. A
-    // failed read of either leaves the reading null and judges nothing —
+    // and the declared hand-offs. The window ends at this read's `now`,
+    // the injected clock's, as `/api/yard/moves` reads the same crossings
+    // (#1190) and as `with_undeclared` below already judged them: until
+    // backlog 5fb858ea it started at the machine's clock minus the
+    // window, so under a frozen test clock it read nothing once the real
+    // clock ran a window past the fixture. A failed read of either
+    // leaves the reading null and judges nothing —
     // never an empty list, which would say every move took a declared
     // route.
     //
@@ -96,15 +102,27 @@ pub(super) async fn yard_regions<R: JobsRepository + 'static, B: EventBus + 'sta
     // exactly as `/api/yard/moves` refuses such a caller its rows.
     //
     // The routes are derived ONCE for both readings that judge against
-    // them: this one and the automation reading below.
-    let routes = super::routes::derived(&state, None).await.ok();
-    let map = match state.yard_moves.as_ref() {
-        Some(_) if !rows.reads_every_packet => map,
-        Some(feed) => {
-            let since = boss_clock_client::wall_now() - chrono::Duration::hours(window_hours);
-            let crossings = feed.store.crossings(since).await.ok();
-            crate::moves::with_undeclared(map, crossings, routes.as_ref(), now)
+    // them: this one and the automation reading below. The crossings
+    // are read FIRST, because a dispatch among them may name a version
+    // its packet is pinned to, and the routes walk that version too
+    // (backlog df62a1eb).
+    let crossings = match state.yard_moves.as_ref() {
+        Some(feed) if rows.reads_every_packet => {
+            let since = now - chrono::Duration::hours(window_hours);
+            Some(feed.store.crossings(since).await.ok())
         }
+        _ => None,
+    };
+    let pinned = crate::routes_every_stand::pinned_versions(
+        crossings
+            .iter()
+            .flatten()
+            .flatten()
+            .map(|c| c.dispatch.as_ref()),
+    );
+    let routes = super::routes::derived(&state, None, &pinned).await.ok();
+    let map = match crossings {
+        Some(crossings) => crate::moves::with_undeclared(map, crossings, routes.as_ref(), now),
         None => map,
     };
     // WHO MOVED THE WORK (backlog 9ca41c08, design 393bdef6 car 1): per
@@ -129,7 +147,11 @@ pub(super) async fn yard_regions<R: JobsRepository + 'static, B: EventBus + 'sta
         .chain(&verdicts)
         .collect();
     let map = regions::automation::with_automation(map, routes.as_ref(), &stepped, &w);
-    Json(with_now(map, now)).into_response()
+    let mut v = with_now(map, now);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("flow_as_of".to_string(), serde_json::json!(rows.flow_as_of));
+    }
+    Json(v).into_response()
 }
 
 /// The steps of each gate-run that CLOSED in the current window — the
@@ -239,6 +261,10 @@ pub(super) struct MapRows {
     /// caller: a NARROWED scope gets its own packets in the rows above
     /// and nothing that would describe everyone else's.
     pub(super) reads_every_packet: bool,
+    /// When the flow reading the stations count from was taken — `None`
+    /// when none was read. Shared between map reads for its lifetime
+    /// (backlog b852ec37), so both read-models state it beside `now`.
+    pub(super) flow_as_of: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl MapRows {
@@ -350,6 +376,7 @@ pub(super) async fn read_map<R: JobsRepository + 'static, B: EventBus + 'static>
             outranking: Some(Vec::new()),
             reads_no_packets: true,
             reads_every_packet: false,
+            flow_as_of: None,
         });
     }
     // THE ESTATE'S OWN QUESTION (backlog 0964ba80): the registry's hosts
@@ -361,7 +388,33 @@ pub(super) async fn read_map<R: JobsRepository + 'static, B: EventBus + 'static>
     } else {
         EstateRead::Withheld
     };
-    read_map_as(state, user, scope, estate, now, window_hours).await
+    read_map_as(
+        state,
+        user,
+        scope,
+        estate,
+        now,
+        window_hours,
+        StationFlow::Counted,
+    )
+    .await
+}
+
+/// Whether a map read counts each station's flow — the membership
+/// snapshot, the one read of the map whose cost grows with the log
+/// (backlog 29f7e897; the step-flow cube until item ab09f1af, car 2).
+pub(super) enum StationFlow {
+    /// Counted, this window and the previous, from one snapshot: the
+    /// regions and borders reads, whose marshalling trend and judgement
+    /// read `served`.
+    Counted,
+    /// Not read: the mover's placement reads station MEMBERSHIP, which
+    /// comes from the open packets, and never `served`. Measured
+    /// 2026-10-19, its readings were about a third of the map's reads,
+    /// and each paid for two passes it discarded. Every station then
+    /// reads `served: None` with no reason named — a reading no page
+    /// draws, because no page reads the map this way.
+    NotRead,
 }
 
 /// Whether the map may draw the estate registry's hosts for a caller.
@@ -406,6 +459,7 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
     estate: EstateRead,
     now: chrono::DateTime<chrono::Utc>,
     window_hours: i64,
+    flow: StationFlow,
 ) -> Result<MapRows, Response> {
     // Whether this caller reads every packet — the one answer every read
     // below that is not scoped by packet is gated on, and the value
@@ -420,7 +474,24 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
     } else {
         super::yard::Firings::Withheld
     };
+    let mut lap = Lap::start();
+    // The stations' flow reading is STARTED here and joined where the
+    // stations are judged (backlog b852ec37), so a map read that must
+    // take one pays the longer of it and the rest of the pass rather
+    // than their sum — measured 2026-10-21, ~12 s of snapshot beside
+    // ~11 s of everything else. Only where a station registry is wired:
+    // without one no station is judged and no flow is read.
+    let flows = match flow {
+        StationFlow::Counted if state.stations.is_some() => Some(start_flows(
+            state.clone(),
+            user.clone(),
+            scope.clone(),
+            window_hours,
+        )),
+        _ => None,
+    };
     let read = read_yard(state, user, scope.clone(), firings, now).await?;
+    lap.mark("yard");
 
     // The tails reach back two windows: this one and the previous.
     let reach = (now - chrono::Duration::hours(2 * window_hours)).date_naive();
@@ -491,6 +562,7 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
             .filter(|j| j.status == JobStatus::Closed)
             .map(|j| (j, Vec::new())),
     );
+    lap.mark("closed_trains");
 
     // Cars: live OR closed within reach, in one read (`closed_since`
     // combines with `status` as OR), with steps — the shed is a step,
@@ -524,6 +596,7 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
     // stops promising a train the conductor will refuse.
     let predecessors =
         read_predecessors(state, &scope, &regions::declared_edges(&read.status, &cars)).await;
+    lap.mark("cars");
 
     // Gate-runs: rows only. `opened_at`, `closed_at` and `outcome` are
     // on the metadata, which is all the duration and the reds need.
@@ -551,6 +624,7 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
         super::stations::resolved_open_packets(state.as_ref(), scope.clone(), &active)
             .await
             .ok();
+    lap.mark("gate_runs_and_open_packets");
 
     // The receiving yard's inbound packets: the kinds come from the
     // workflow registry (`regions::inbound_kinds`, the receiving page's
@@ -574,12 +648,45 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
         },
         None => None,
     };
+    lap.mark("inbound");
 
     // The marshalling stations: every station but the dock (a region of
     // its own), bound to the caller as `/api/stations/load` binds them,
     // over the caller's open packets; and each station's counted flow in
-    // this window and the previous, from two cube reads. Unread → `None`.
-    let stations = marshalling_stations(state, user, open_packets.as_deref(), window_hours).await;
+    // this window and the previous, from one membership snapshot — or
+    // none, for a reader that places packets only (`flow`). Unread → `None`.
+    //
+    // Each standing step's wait is dated from its RECORDED ready flip —
+    // the queue-age read's exact rows, never its `updated_at` lower bound
+    // — so a station that served nothing can be judged on whether what
+    // stands there is still inside its declared bound (backlog 6254e602).
+    // A failed read keeps its error, so each standing step says the read
+    // failed rather than that the record holds no onset (backlog
+    // 35d29890: this read was `.ok()`, and blamed the record).
+    let ready = state
+        .jobs
+        .queue_age(&scope)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|row| row.exact)
+                .map(|row| (row.step_id.to_string(), row.since))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        })
+        .map_err(|e| e.to_string());
+    let stations = marshalling_stations(
+        state,
+        user,
+        open_packets.as_deref(),
+        ready.as_ref().map_err(String::as_str),
+        flows,
+    )
+    .await;
+    let (stations, flow_as_of) = match stations {
+        Some((readings, as_of)) => (Some(readings), as_of),
+        None => (None, None),
+    };
+    lap.mark("queue_age_and_stations");
 
     // THE RUNNERS' EVIDENCE (design d2154293, car 5). A runner leaves
     // no heartbeat this process can read — only the ops-requests it
@@ -621,6 +728,7 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
         .map(|h| h.id.clone())
         .collect();
     let ops_requests = newest_ops_requests(state, scope.clone(), reach, &host_ids).await;
+    lap.mark("runners");
 
     // THE SHOP FLOOR (backlog 94c6ffd0): the runs in flight and the
     // ones that closed within reach, the sessions that dispatched them,
@@ -666,17 +774,27 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
     // exactly what this region shows, and it outlives any window; the
     // page cap below is the only bound, and it is generous against a
     // DAILY cadence.
+    lap.mark("shop_floor");
     let publish_packets = read_publish_packets(state, scope.clone()).await;
 
     // WHAT OUTRANKS REGULAR ORDER (backlog 74569e94): narrowed in the
     // query, one priority at a time, every page of each.
     let outranking = read_outranking(state, scope.clone(), open_packets.as_deref(), &active).await;
+    lap.mark("publish_and_outranking");
 
+    // The open packets' pinned versions too: a step standing at a station
+    // is judged against the bound ITS packet's protocol declares, never
+    // today's active row (backlog 6254e602).
     let internal_protocols = read_internal_protocols(
         state.kind_registry.as_deref(),
-        cars.iter().map(|(job, _)| job).chain(gate_runs.iter()),
+        cars.iter()
+            .map(|(job, _)| job)
+            .chain(gate_runs.iter())
+            .chain(open_packets.iter().flatten().map(|(job, _)| job)),
     )
     .await;
+    lap.mark("protocols");
+    lap.report_if_slow();
     Ok(MapRows {
         internal_protocols,
         read,
@@ -697,7 +815,51 @@ pub(super) async fn read_map_as<R: JobsRepository + 'static, B: EventBus + 'stat
         outranking,
         reads_no_packets: matches!(scope, crate::port::JobScope::None),
         reads_every_packet,
+        flow_as_of,
     })
+}
+
+/// A map read slower than this names where its time went (backlog
+/// b852ec37): on 2026-10-21 regions and borders ran 127-187 s and the
+/// only way to find the cost was to time narrower endpoints from outside.
+/// Silent below it, so a healthy map logs nothing per tick.
+const SLOW_MAP_READ: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Each phase of one map pass and its elapsed milliseconds — the
+/// per-read profile the slow-read line carries.
+struct Lap {
+    started: std::time::Instant,
+    last: std::time::Instant,
+    phases: Vec<(&'static str, u128)>,
+}
+
+impl Lap {
+    fn start() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            started: now,
+            last: now,
+            phases: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        let now = std::time::Instant::now();
+        self.phases
+            .push((phase, now.duration_since(self.last).as_millis()));
+        self.last = now;
+    }
+
+    fn report_if_slow(&self) {
+        let total = self.started.elapsed();
+        if total >= SLOW_MAP_READ {
+            tracing::warn!(
+                total_ms = total.as_millis() as u64,
+                phases = ?self.phases,
+                "a yard map read was slow; phases name where its time went"
+            );
+        }
+    }
 }
 
 /// The open REAL packets whose priority outranks regular order
@@ -983,6 +1145,35 @@ pub(super) async fn read_open_runs<R: JobsRepository + 'static, B: EventBus + 's
     state: &JobsApiState<R, B>,
     scope: crate::port::JobScope,
 ) -> Option<(Vec<(Job, Vec<Step>)>, bool)> {
+    let (rows, whole) = list_open_runs(state, scope).await?;
+    Some((with_steps(state, rows).await?, whole))
+}
+
+/// The OPEN runs with their steps only when the page held every one —
+/// `None` for a cut page, as for a failed read — for a reader that
+/// judges nothing on a cut page (the caller's own queue). Wholeness is
+/// decided from the list's total BEFORE any run's steps are read
+/// (backlog 1927aca5, landed-review da21596d): reading them first cost
+/// one sequential read per run on the page, up to [`MAX_LIMIT`], on
+/// every `for=me` with an active row, to answer unread. The top board
+/// keeps [`read_open_runs`], since the shop floor draws a cut page too.
+pub(super) async fn read_whole_open_runs<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &JobsApiState<R, B>,
+    scope: crate::port::JobScope,
+) -> Option<Vec<(Job, Vec<Step>)>> {
+    let (rows, whole) = list_open_runs(state, scope).await?;
+    if !whole {
+        return None;
+    }
+    with_steps(state, rows).await
+}
+
+/// One page of the OPEN runs, and whether it held every one the filter
+/// matched.
+async fn list_open_runs<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &JobsApiState<R, B>,
+    scope: crate::port::JobScope,
+) -> Option<(Vec<Job>, bool)> {
     let open = JobFilter {
         kind: Some(crate::agent_budget::RUN_KIND.to_string()),
         status: Some(JobStatus::Open),
@@ -991,12 +1182,20 @@ pub(super) async fn read_open_runs<R: JobsRepository + 'static, B: EventBus + 's
     };
     let (rows, total) = state.jobs.list_jobs(&open, MAX_LIMIT, 0).await.ok()?;
     let whole = usize::try_from(total).is_ok_and(|t| t <= rows.len());
+    Some((rows, whole))
+}
+
+/// Each run with its steps; `None` when any steps read fails.
+async fn with_steps<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &JobsApiState<R, B>,
+    rows: Vec<Job>,
+) -> Option<Vec<(Job, Vec<Step>)>> {
     let mut out = Vec::with_capacity(rows.len());
     for job in rows {
         let steps = state.jobs.list_steps(&job.id).await.ok()?;
         out.push((job, steps));
     }
-    Some((out, whole))
+    Some(out)
 }
 
 /// The empty pass: every read answered, nothing in it.
@@ -1075,38 +1274,50 @@ async fn newest_ops_requests<R: JobsRepository + 'static, B: EventBus + 'static>
 /// the queue count (this read listed steps raw until backlog 6c06ef65,
 /// so the map drew the agent station 43 short). [`read_map`] reads them
 /// once and hands them here and to the inbound read.
+///
+/// `ready` is each outstanding step's RECORDED ready flip, by step id
+/// (the queue-age read's exact rows): the onset a standing step's wait
+/// is dated from. `Err` with the read's error when that read failed —
+/// every standing step is then undated, says so, and none can be shown
+/// to be inside its bound.
+///
+/// Beside the readings, the instant the flow reading they count from was
+/// taken — `None` when no flow was read. The reading is SHARED between
+/// map reads for its lifetime (backlog b852ec37, [`shared_flows`]), so
+/// it is not this read's `now`, and the payload says which it is.
 async fn marshalling_stations<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
     user: &boss_policy_client::User,
     packets: Option<&[(Job, Vec<Step>)]>,
-    window_hours: i64,
-) -> Option<Vec<StationReading>> {
+    ready: Result<&std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>>, &str>,
+    flows: Option<tokio::task::JoinHandle<Arc<MapFlowReading>>>,
+) -> Option<(Vec<StationReading>, Option<chrono::DateTime<chrono::Utc>>)> {
     let reg = state.stations.as_ref()?;
     let specs = effective_stations(state.as_ref(), reg).await.ok()?;
     let packets = packets?;
-    // The flow cube over two windows: the previous window's counts are
-    // the wider read minus the narrower. Wall clock, as the flow
-    // surface reads it — the window has to be the instant the log's
-    // `created_at` is written on, not the sim's day.
-    let wall = boss_clock_client::wall_now();
-    let window = chrono::Duration::hours(window_hours);
-    let cells_now = state.jobs.step_flow_cube(wall - window).await.ok()?;
-    let cells_both = state
-        .jobs
-        .step_flow_cube(wall - window - window)
-        .await
-        .ok()?;
-    Some(
+    let flows = match flows {
+        Some(reading) => Some(reading.await.unwrap_or_else(|e| {
+            // The task did not finish (it panicked): no reading, and
+            // every station says why rather than counting nothing.
+            Arc::new(MapFlowReading {
+                as_of: boss_clock_client::wall_now(),
+                windows: Err(format!("the flow reading did not finish: {e}")),
+            })
+        })),
+        None => None,
+    };
+    let flow_as_of = flows.as_ref().map(|f| f.as_of);
+    let readings = Some(
         specs
             .iter()
             .filter(|spec| spec.name != "loading-dock")
             .filter_map(|spec| {
                 let bound = spec.bind_self(self_id(user))?;
-                let standing: Vec<&Job> = packets
+                let packets_here: Vec<&(Job, Vec<Step>)> = packets
                     .iter()
                     .filter(|(job, steps)| bound.predicate.matches(job, steps))
-                    .map(|(job, _)| job)
                     .collect();
+                let standing: Vec<&Job> = packets_here.iter().map(|(job, _)| job).collect();
                 let members: Vec<String> = standing.iter().map(|job| job.id.to_string()).collect();
                 // The marshalling KPI's ages (design 62de32ae, decision 9),
                 // per member, so the partition can narrow them.
@@ -1117,24 +1328,199 @@ async fn marshalling_stations<R: JobsRepository + 'static, B: EventBus + 'static
                 let over_limit = bound
                     .wip_limit
                     .is_some_and(|l| members.len() as i64 > i64::from(l));
-                let flow = crate::station_flow::station_flow(&spec.predicate, &cells_now);
-                let flow_blind = flow.as_ref().err().copied();
-                let served = flow.ok().map(|f| f.served);
-                let served_both = crate::station_flow::station_flow(&spec.predicate, &cells_both)
-                    .ok()
-                    .map(|f| f.served);
+                let (served, flow_unread, previous_served) =
+                    match flows.as_ref().map(|f| &f.windows) {
+                        None => (None, None, None),
+                        Some(Err(refused)) => (None, Some(refused.clone()), None),
+                        Some(Ok(windows)) => station_served(windows, &spec.name),
+                    };
                 Some(StationReading {
                     name: bound.name.clone(),
                     over_limit,
                     members,
                     served,
-                    flow_blind,
-                    previous_served: served.zip(served_both).map(|(w, b)| b - w),
+                    flow_unread,
+                    previous_served,
                     opened,
+                    standing: standing_steps(&bound.predicate, &packets_here, ready),
                 })
             })
             .collect(),
-    )
+    );
+    readings.map(|r| (r, flow_as_of))
+}
+
+/// THE MAP COUNTS FLOW ON THE CONSERVED MEMBERSHIP BASIS (item ab09f1af,
+/// car 2), the reader `GET /api/stations/flow` answers by default: the
+/// original packet history folded from a witnessed cut (design c195e83e),
+/// bound to the caller and narrowed to the caller's scope. Until this car
+/// the map counted the step-events cube, which is blind by design to a
+/// predicate that binds the caller, names job tags or job metadata, or
+/// names no step — every published station of those shapes drew `?`.
+///
+/// ONE SNAPSHOT for both windows, replayed twice (`replay_windows`), so a
+/// crossing cannot land in the wider count alone and read as the previous
+/// window's (backlog 29f7e897). The reader's bounds are the flow
+/// surface's own; a read it refuses is that refusal, named on every
+/// station, never a count. When only the wider read is refused — it holds
+/// twice the window's rows — this window is read alone and the previous
+/// one is unread. Wall clock, as the flow surface reads it: the window
+/// is the instant the log's `created_at` is written on, not the sim's day.
+async fn membership_flows<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    user: &boss_policy_client::User,
+    scope: &crate::port::JobScope,
+    window_hours: i64,
+) -> MapFlowReading {
+    let wall = boss_clock_client::wall_now();
+    MapFlowReading {
+        as_of: wall,
+        windows: flow_windows(state, user, scope, window_hours, wall).await,
+    }
+}
+
+/// The map's flow reading, SHARED between map reads for its lifetime
+/// (backlog b852ec37, `crate::reading_cache`). Measured 2026-10-21 from
+/// the pod on a quiet API: the 48 h snapshot answered in 8.1-8.4 s and
+/// the 24 h retry in 3.5 s, both refused on the byte bound — about twelve
+/// seconds of every ~23 s regions and borders read, taken twice per map
+/// tick (each read took its own) and once per cancelled poll under load,
+/// when the same reads ran 127-187 s and the edge cut them at 100.
+///
+/// Keyed on everything the reading is a function of besides the log: the
+/// caller (a station's predicate may bind them), the translated scope and
+/// the window. A reading served is the one a read inside its lifetime
+/// took, with that read's `as_of` — never re-dated to this read's now.
+async fn shared_flows<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    user: &boss_policy_client::User,
+    scope: &crate::port::JobScope,
+    window_hours: i64,
+) -> Arc<MapFlowReading> {
+    let key = format!("{}\u{1f}{scope:?}\u{1f}{window_hours}", user.id);
+    state
+        .map_flows
+        .get_or_read(&key, || membership_flows(state, user, scope, window_hours))
+        .await
+}
+
+/// [`shared_flows`], started as a task of its own so the map pass runs
+/// beside it. A map read dropped mid-pass (its caller went away) leaves
+/// the task to finish and leave its reading for the next map read —
+/// at most one such read per key is ever in flight, which is the bound
+/// the pile-up of 2026-10-21 did not have.
+fn start_flows<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: Arc<JobsApiState<R, B>>,
+    user: boss_policy_client::User,
+    scope: crate::port::JobScope,
+    window_hours: i64,
+) -> tokio::task::JoinHandle<Arc<MapFlowReading>> {
+    tokio::spawn(async move { shared_flows(&state, &user, &scope, window_hours).await })
+}
+
+/// [`membership_flows`]' windows, ending at `wall`.
+async fn flow_windows<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    user: &boss_policy_client::User,
+    scope: &crate::port::JobScope,
+    window_hours: i64,
+    wall: chrono::DateTime<chrono::Utc>,
+) -> Result<FlowWindows, String> {
+    let window = chrono::Duration::hours(window_hours);
+    let read = |since| {
+        state.jobs.membership_snapshot(
+            since,
+            Some(user.id.clone()),
+            scope,
+            super::stations::MEMBERSHIP_ROW_BOUND,
+        )
+    };
+    let by_station = |reading: crate::membership_replay::MembershipReading| {
+        reading
+            .stations
+            .into_iter()
+            .map(|flow| (flow.station.clone(), flow))
+            .collect()
+    };
+    match read(wall - window - window).await {
+        Ok(input) => {
+            let [this, both] = crate::membership_replay::replay_windows(input, wall - window)?;
+            Ok(FlowWindows {
+                this: by_station(this),
+                both: Ok(by_station(both)),
+            })
+        }
+        Err(wider) => {
+            let input = read(wall - window).await.map_err(|e| e.to_string())?;
+            Ok(FlowWindows {
+                this: by_station(crate::membership_replay::replay(&input)),
+                both: Err(wider.to_string()),
+            })
+        }
+    }
+}
+
+/// One station's `(served, why unread, previous served)` from the two
+/// windows. A station the history holds no publication for is unread
+/// with the flow surface's own reason, never zero.
+fn station_served(windows: &FlowWindows, name: &str) -> (Option<i64>, Option<String>, Option<i64>) {
+    let Some(this) = windows.this.get(name) else {
+        return (
+            None,
+            Some(super::stations::NO_PUBLICATION_HISTORY.to_string()),
+            None,
+        );
+    };
+    let Some(served) = this.served.and_then(|n| i64::try_from(n).ok()) else {
+        return (None, this.unavailable_reason(), None);
+    };
+    let both = windows
+        .both
+        .as_ref()
+        .ok()
+        .and_then(|both| both.get(name)?.served)
+        .and_then(|n| i64::try_from(n).ok());
+    (Some(served), None, both.map(|both| both - served))
+}
+
+/// THE STEPS THAT PUT EACH PACKET AT A STATION (backlog 6254e602): every
+/// step of a member that satisfies the station's step clause — the same
+/// [`crate::station_queue::StepMatch::matches`] the membership asked, so
+/// the two cannot disagree — with its owner and its recorded onset. A
+/// station with no step clause names no step, and so none can qualify a
+/// wait there.
+fn standing_steps(
+    predicate: &crate::station_queue::StationPredicate,
+    packets: &[&(Job, Vec<Step>)],
+    ready: Result<&std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>>, &str>,
+) -> Vec<regions::StandingStep> {
+    let Some(clause) = predicate.step.as_ref() else {
+        return Vec::new();
+    };
+    packets
+        .iter()
+        .flat_map(|(job, steps)| {
+            steps
+                .iter()
+                .filter(|step| clause.matches(step))
+                .map(move |step| regions::StandingStep {
+                    packet: job.id.to_string(),
+                    kind: job.kind.clone(),
+                    version: job.workflow_version,
+                    title: job.title.clone(),
+                    step: step.spec_slug.clone(),
+                    assignee: step.assignee_id.clone(),
+                    role: step
+                        .metadata
+                        .get("authority_role")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    since: ready
+                        .map(|r| r.get(&step.id.to_string()).copied())
+                        .map_err(str::to_string),
+                })
+        })
+        .collect()
 }
 
 /// The map with the clock instant attached — the same `now` field the
@@ -1289,5 +1675,186 @@ mod pinned_protocol_tests {
             Some(2.0),
             "never substitute the active version"
         );
+    }
+}
+
+/// THE MOVER'S READING WITHOUT THE FLOW IS THE MOVER'S READING (backlog
+/// 29f7e897). The mover stopped paying for the flow read on the ground
+/// that placement reads station membership and never `served`; this
+/// holds that ground — the same rows read both ways place every packet
+/// identically — and pins what the counted read asks of the adapter.
+#[cfg(test)]
+mod station_flow_tests {
+    use super::*;
+    use crate::{InMemoryJobs, JobsRepository};
+    use boss_core::job::{Priority, StepStatus, Subject};
+    use boss_core::port::EventBus;
+    use boss_core::publisher::DomainPublisher;
+
+    fn task_station() -> crate::StationSpec {
+        let mut s = crate::StationSpec::draft(
+            "q.platform-admin.task",
+            "Ready tasks",
+            crate::StationKind::Constraint,
+            crate::station_queue::StationPredicate {
+                status: Some(JobStatus::Open),
+                step: Some(crate::station_queue::StepMatch {
+                    kind: Some("task".into()),
+                    status_in: vec![StepStatus::Ready],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            chrono::Utc::now(),
+        );
+        s.status = crate::registry::WorkflowStatus::Active;
+        s
+    }
+
+    fn packet(kind: &str, status: JobStatus) -> Job {
+        Job {
+            status,
+            ..Job::new(
+                kind,
+                Subject::new("custom", "bosspipeline"),
+                "a packet",
+                "emp-david",
+                Priority::Standard,
+                chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+            )
+        }
+    }
+
+    fn step(job: &Job, slug: &str, kind: &str, status: StepStatus) -> Step {
+        Step {
+            spec_slug: Some(slug.into()),
+            status,
+            ..Step::new(job.id, kind, slug, 0)
+        }
+    }
+
+    #[tokio::test]
+    async fn placing_packets_without_the_flow_places_them_where_the_counted_read_does() {
+        let jobs = Arc::new(InMemoryJobs::new());
+        let now = chrono::Utc::now();
+        let at = now - chrono::Duration::hours(72);
+        // A triaged backlog-item waiting on its build: marshalling's.
+        let item = packet("backlog-item", JobStatus::Open);
+        jobs.create_job_at(&item, at, &[]).await.unwrap();
+        let mut filed = step(&item, "filed", "trigger", StepStatus::Completed);
+        filed.kind = crate::regions::TRIGGER_STEP_KIND.into();
+        for s in [
+            filed,
+            step(&item, "triage", "task", StepStatus::Completed),
+            step(&item, "build", "task", StepStatus::Ready),
+        ] {
+            jobs.add_step_at(&s, at, &[]).await.unwrap();
+        }
+        // A closed packet whose task was served an hour ago.
+        let done = packet("backlog-item", JobStatus::Closed);
+        jobs.create_job_at(&done, at, &[]).await.unwrap();
+        let served = step(&done, "triage", "task", StepStatus::Completed);
+        jobs.add_step_at(&served, at, &[]).await.unwrap();
+        jobs.record_events(&[boss_core::event::Event::new(
+            "jobs",
+            "step.done.task",
+            serde_json::json!({ "job_id": done.id.to_string(), "step_id": served.id.to_string() }),
+            now - chrono::Duration::hours(1),
+        )])
+        .await
+        .unwrap();
+
+        let kinds = Arc::new(crate::registry::InMemoryWorkflows::for_fixture());
+        for spec in crate::registry::seedable_platform_workflows() {
+            kinds.seed(spec).unwrap();
+        }
+        let stations = Arc::new(crate::stations::InMemoryStations::new());
+        stations.seed(task_station()).unwrap();
+        let bus = boss_testing::RecordingEventBus::new();
+        let publisher = DomainPublisher::new(bus.clone() as Arc<dyn EventBus>, "jobs");
+        let state = Arc::new(JobsApiState {
+            stations: Some(stations),
+            kind_registry: Some(kinds.clone() as Arc<dyn crate::registry::WorkflowRegistry>),
+            ..JobsApiState::minimal(
+                jobs.clone(),
+                bus,
+                publisher,
+                Arc::new(boss_policy_client::FakePolicyClient::builder().build()),
+                Arc::new(boss_clock_client::WallClockClient),
+            )
+        });
+        let actor = boss_policy_client::User {
+            id: super::super::moves::MOVER_ACTOR.into(),
+            role: "automation".into(),
+            access_tier: boss_policy_client::AccessTier::User,
+            territory_account_ids: Vec::new(),
+            direct_report_ids: Vec::new(),
+            department: None,
+        };
+        let read = |flow| {
+            read_map_as(
+                &state,
+                &actor,
+                crate::port::JobScope::All,
+                EstateRead::Granted,
+                now,
+                regions::DEFAULT_WINDOW_HOURS,
+                flow,
+            )
+        };
+        let counted = read(StationFlow::Counted).await.ok().unwrap();
+        assert_eq!(
+            jobs.membership_reads(),
+            2,
+            "the wider window, refused here, then this window alone"
+        );
+        let placed = read(StationFlow::NotRead).await.ok().unwrap();
+        assert_eq!(jobs.membership_reads(), 2, "placement reads no flow");
+        assert_eq!(
+            jobs.flow_cube_passes(),
+            0,
+            "the map never reads the step-events cube"
+        );
+
+        let station = |rows: &MapRows| {
+            let stations = rows.stations.as_ref().unwrap();
+            stations
+                .iter()
+                .find(|s| s.name == "q.platform-admin.task")
+                .unwrap_or_else(|| panic!("no task station among {stations:?}"))
+                .clone()
+        };
+        // The in-memory adapter holds no native history, so the counted
+        // read is the reader's refusal, named; the placing read names
+        // nothing, because it asked nothing.
+        assert_eq!(station(&counted).served, None);
+        assert!(
+            station(&counted)
+                .flow_unread
+                .is_some_and(|why| why.contains("native membership history unavailable")),
+            "the counted read names the refusal: {:?}",
+            station(&counted)
+        );
+        assert_eq!(
+            station(&placed).served,
+            None,
+            "the placing read does not count"
+        );
+        assert_eq!(station(&placed).flow_unread, None);
+        assert_eq!(station(&counted).members, station(&placed).members);
+
+        let specs = kinds.list_active(None).await.unwrap();
+        let snapshot = |rows: &MapRows| {
+            crate::moves::Snapshot::of_with_registry(
+                &rows.inputs(now, regions::DEFAULT_WINDOW_HOURS),
+                &specs,
+            )
+        };
+        assert_eq!(
+            snapshot(&counted).place(&item.id.to_string()),
+            crate::moves::Where::At("marshalling"),
+            "the fixture places a packet in marshalling, or it proves nothing"
+        );
+        assert_eq!(snapshot(&placed), snapshot(&counted));
     }
 }

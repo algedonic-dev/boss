@@ -21,34 +21,50 @@ NON-isolated subagent of a session that itself works in a worktree (its
 cwd names no `agent-<its id>`) are never judged.
 
 WHERE A CALL RUNS IS NOT THE SAME ON EVERY HARNESS PATH, so it judges a
-path AS WRITTEN, from the cwd the payload reports. On the production
-dispatch 916fe290 measured (2026-10-09, run 171055b8) an isolated agent's
-Bash started in /work/boss and a leading `cd <worktree> &&` was dropped
+path AS WRITTEN, from BOTH places it may run. On the production dispatch
+916fe290 measured (2026-10-09, run 171055b8) an isolated agent's Bash
+started in /work/boss and a leading `cd <worktree> &&` was dropped
 before bash. Under `claude -p` review 0dc61dd6 measured (2026-10-10) it
 started in the worktree, a relative `sed -i` landed there, and the cd
 was stripped BEFORE this hook saw it. Nothing in the payload says which
-path it is on, so a bare relative target is not refused: where it lands
-is a base this hook cannot see.
+path it is on. Until backlog 88553fea a bare relative target therefore
+PASSED, and on 2026-10-20 that hole was the whole incident: two mutation
+seds (run 472b2b58) dirtied /work/boss, and three reviewers' bare `git
+checkout`/`git switch` moved it off main — once for thirteen minutes,
+while every pod door ran another agent's branch. Builder run 7934069e
+re-measured the production path the same day: its payload's cwd named
+its worktree while `pwd -P` printed /work/boss. So until a `cd` with an
+absolute target takes effect, a relative path is resolved from the
+reported cwd AND from <shared>, and refused if either lands in <shared>
+outside the worktree. On `claude -p` that refuses a write that would
+have landed safely; the way out is one retry, the miss cost the doors.
 
 WHAT IT REFUSES (exit 2, the reason on stderr for the model):
   * the shape the production path drops: a command that opens
     `cd <worktree> &&` (it fires only where the hook still sees the cd);
   * a write whose target, as written, lands in <shared> outside the
-    caller's OWN worktree — an absolute path, a `../` climbing out, or a
-    relative path after a `cd` that took effect — including another
-    agent's worktree and the worktrees directory itself: a redirection,
-    or a writer's file argument (sed -i, perl -i, tee, cp, mv, rm, touch,
-    truncate, mkdir, ln, install, chmod, patch, dd of=, cargo fmt);
+    caller's OWN worktree — an absolute path, a `../` climbing out, a
+    bare relative path (from <shared>, above), or a relative path after
+    a `cd` — including another agent's worktree and the worktrees
+    directory itself: a redirection, or a writer's file argument (sed
+    -i, perl -i, tee, cp, mv, rm, touch, truncate, mkdir, ln, install,
+    chmod, patch, dd of=, cargo fmt);
+  * a git that moves a tree — checkout, switch, reset, restore, stash
+    (but `stash list`/`show`), commit, merge, pull, rebase, cherry-pick,
+    revert, am, clean — whose tree (`-C`, after any `cd`) is not named
+    as the caller's own worktree (backlog 88553fea). The harness's own
+    guard refuses `git -C /work/boss`; it never saw a bare git that RAN
+    there;
   * Write / Edit / NotebookEdit on such a path.
 It parses text, so it is a net, not a proof. What it does NOT see, and
 passes: a target written through an expansion (`$VAR`, `$(...)`, a
-backtick), a bare relative target on the path that runs in <shared>, a
-script's body, `python -c`, `xargs`, `find -exec`, `curl -o`, `wget -O`,
-`awk -i inplace`, `rustfmt`, `tar -x`/`-C`, and cargo or bun writing
-into the cwd they run in (target/, Cargo.lock, node_modules). The list
-is not closed. Text it cannot parse refuses nothing — a guard that
-refuses because it cannot SEE is worse than the miss it prevents
-(shared_checkout.rs, 916fe290). Git is the harness's.
+backtick), a script's body, `python -c`, `xargs`, `find -exec`, `curl
+-o`, `wget -O`, `awk -i inplace`, `rustfmt`, `tar -x`/`-C`, git's
+`--git-dir`/`--work-tree`/`GIT_DIR`, and cargo or bun writing into the
+cwd they run in (target/, Cargo.lock, node_modules). The list is not
+closed. Text it cannot parse refuses nothing — a guard that refuses
+because it cannot SEE is worse than the miss it prevents
+(shared_checkout.rs, 916fe290).
 
 Pinned by crates/core/boss-testing/tests/shared_checkout_guard.rs.
 """
@@ -71,6 +87,10 @@ WRITERS = {
     "chmod": AFTER_FIRST, "chown": AFTER_FIRST, "chgrp": AFTER_FIRST,
 }
 OPTS_WITH_ARG = {"truncate": {"-s", "--size", "-r", "--reference"}, "install": {"-m", "-o", "-g"}}
+# git subcommands that move HEAD, the index or the work tree (88553fea).
+GIT_MOVERS = {"checkout", "switch", "reset", "restore", "stash", "commit", "merge", "pull",
+              "rebase", "cherry-pick", "revert", "am", "clean"}
+GIT_STASH_READS = {"list", "show"}
 
 
 def refuse(text):
@@ -132,6 +152,13 @@ def targets(words):
         if w.isdigit() and i + 1 < len(words) and words[i + 1] in REDIRECTS:
             i += 1
             continue
+        # An INPUT redirection and its source are read, never written: as
+        # a bare word `<` would land in a writer's arguments, and once a
+        # bare relative target is judged from <shared> (88553fea) `tee x
+        # < /dev/null` reads as a write of /work/boss/<.
+        if w and set(w) <= {"<"}:
+            i += 2
+            continue
         rest.append(w)
         i += 1
     while rest and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", rest[0]) or os.path.basename(rest[0]) in WRAPPERS):
@@ -139,6 +166,19 @@ def targets(words):
     if not rest:
         return "", written
     name, args = os.path.basename(rest[0]), rest[1:]
+    if name == "git":
+        # What a tree-moving git writes is the tree it runs in: `.`,
+        # joined with each -C in turn — so a bare one is judged from
+        # both bases like any other relative path (88553fea).
+        tree, i = ".", 0
+        while i < len(args) and args[i].startswith("-"):
+            if args[i] == "-C" and i + 1 < len(args):
+                tree = os.path.join(tree, args[i + 1])
+            i += 2 if args[i] in ("-C", "-c") else 1
+        sub = args[i] if i < len(args) else ""
+        if sub in GIT_MOVERS and not (sub == "stash" and args[i + 1:i + 2] and args[i + 1] in GIT_STASH_READS):
+            return f"git {sub}", written + [tree]
+        return name, written
     if name in ("cargo", "wt-cargo") and args[:1] == ["fmt"]:
         written.append(".")
     elif name in ("sed", "perl"):
@@ -237,25 +277,36 @@ def main():
         commands = simple_commands(lexed(command))
     except ValueError:
         return 0
-    # Judged from the cwd the payload reports — see WHERE A CALL RUNS.
-    base = cwd
+    # Judged from BOTH places the call may run — the cwd the payload
+    # reports and the shared checkout — until a cd names one; see WHERE A
+    # CALL RUNS. A cd with an absolute target collapses them to one.
+    bases = [cwd, shared]
     for n, (sep, words) in enumerate(commands):
         if words and words[0] == "cd":
             dest = words[1] if len(words) > 1 else os.path.expanduser("~")
-            target = os.path.normpath(os.path.join(base, dest))
+            target = os.path.normpath(os.path.join(cwd, dest))
             nxt = commands[n + 1][0] if n + 1 < len(commands) else ""
             if n == 0 and nxt == "&&" and target in (cwd, worktree):
                 refuse(f"shared-checkout guard (backlog 10d1567b): the harness drops a leading "
                        f"`cd {dest} &&`, so this command would run in {shared}, the shared checkout. "
                        f"{ways}")
-            base = target
+            bases = list(dict.fromkeys(os.path.normpath(os.path.join(b, dest)) for b in bases))
             continue
         name, written = targets(words)
         for path in written:
             if path.startswith("/dev/"):
                 continue
-            hit, full = into_shared(path, base)
-            if hit:
+            for base in bases:
+                hit, full = into_shared(path, base)
+                if not hit:
+                    continue
+                if name.startswith("git "):
+                    refuse(f"shared-checkout guard (backlog 88553fea): `{name}` would move {full}, "
+                           f"the shared checkout every pod door runs from (/work/tools/bin links into "
+                           f"its infra/dev), and not your worktree {worktree}: a bare git runs in "
+                           f"{shared} when the harness drops your cd. Name the tree: git -C {worktree} "
+                           f"{name[4:]} ... If {shared} is already off main, say so in your report; the "
+                           f"dev pod's reclaim pass returns a clean one to main hourly.")
                 refuse(f"shared-checkout guard (backlog 10d1567b): `{name or 'a redirection'}` would "
                        f"write {full}, in the shared checkout {shared} and outside your worktree "
                        f"{worktree}. {ways}")

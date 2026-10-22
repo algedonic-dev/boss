@@ -66,9 +66,12 @@ jq -r '.data.bucket' "$WORK/secret.json" | base64 -d > "$WORK/bucket" \
 # credential cache lives only in its bounded tmpfs; the archive streams through
 # bounded validators without a workspace copy. The container has no
 # database, recovery-kit or backup-volume mount and no Kubernetes credential.
+# It does mount the service-account key, so it keeps no container log
+# (backlog ff957587): what it prints streams to the runner through the
+# attach, and the daemon's json-file default never keeps a second copy.
 rc=0
 CONTAINER="boss-gcs-readback-${WORK##*.}"
-timeout -k 5 900 sudo -n docker run --rm --name "$CONTAINER" --read-only --memory=2g --pids-limit=128 \
+timeout -k 5 900 sudo -n docker run --rm --name "$CONTAINER" --log-driver=none --read-only --memory=2g --pids-limit=128 \
     --cap-drop=ALL --security-opt=no-new-privileges \
     --tmpfs /work:rw,nosuid,nodev,noexec,size=1g,mode=0700 \
     --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \

@@ -391,6 +391,17 @@ pub fn convertibility(from: &WorkflowSpec, to: &WorkflowSpec) -> Convertibility 
             continue;
         };
 
+        // A new typed judgment cannot become evidence of work already done.
+        // Unfinished rows acquire the target declaration through the repin.
+        let before = f.metadata_defaults.get("completion_contract");
+        let after = t.metadata_defaults.get("completion_contract");
+        if after.is_some() && before != after {
+            obstacles.push(Obstacle::step_if_done(
+                slug,
+                "completion evidence contract added or changed — completed work did not run under that judgment",
+            ));
+        }
+
         // A STEP'S KIND CARRIES A COMPLETION CONTRACT THIS FUNCTION
         // CANNOT SEE.
         //

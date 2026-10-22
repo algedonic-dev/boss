@@ -46,6 +46,92 @@ def observed_generation(generation):
     return generation.name
 
 
+# What the trusted session doors (boss, boss-api) take from the caller:
+# who signs and which agent run the verb is — the CLI's IDENTITY_ENV,
+# all three — then where the call goes. Backlog 19dbaab9 (2026-10-18,
+# first hour of isolation ON): this carried BOSS_ACTOR alone, so
+# BOSS_AGENT_RUN never arrived (no run could record --started, no
+# gate-run named the run that launched it) and BOSS_ACTOR_FILE fell
+# back to the shared $HOME/.config/boss/actor, another session's id.
+# The pin `the_published_door_carries_every_identity_name_the_cli_reads`
+# (boss-cli door_env.rs) holds this to IDENTITY_ENV.
+#
+# Then two names that are not identity but that the session's own verbs
+# read (backlog c02f30c5, found 2026-10-18 building 19dbaab9):
+# BOSS_SESSION_AGENT_DEFINITIONS, the snapshot behind dispatch's
+# unloaded-definitions refusal, without which that refusal passed every
+# call in silence; and BOSS_COMMIT_TRAILER, the attribution lines every
+# rendered brief carries. The same pin holds them to the CLI's
+# SESSION_DATA_ENV (door_env.rs). Neither reaches a worker plan.
+SESSION_ENV = (
+    "BOSS_ACTOR",
+    "BOSS_ACTOR_FILE",
+    "BOSS_AGENT_RUN",
+    "BOSS_COMMIT_TRAILER",
+    "BOSS_JOBS_URL",
+    "BOSS_SESSION_AGENT_DEFINITIONS",
+    "BOSS_SOR_SERVICE",
+    "BOSS_SOR_WAIT_SECONDS",
+)
+
+
+def shared_checkout_refusal(tool, inherited, cwd=None):
+    """wt-cargo's own shared-checkout guard (backlog 916fe290), at this door.
+
+    Backlog c02f30c5: with isolation on, wt-cargo forwards here BEFORE its
+    guard runs, the worker plan carries no BOSS_AGENT_RUN, and the
+    worker's source is not the shared shape — so the guard never fires.
+    The controller's cwd binding does not cover it: the shared checkout is
+    itself bound (the doors run from it, 7dd185c6), so a builder whose cd
+    never took builds that tree in a worker, silently. Shared is judged by
+    the shape wt-cargo judges with git rev-parse — a `.git` DIRECTORY (git
+    dir equal to common dir) with worktrees registered under it — read off
+    the filesystem, since this door runs no git. Returns the refusal, or
+    None when wt-cargo held would build.
+
+    Backlog 2e5429b6: the cwd is read HERE, and only for wt-cargo naming a
+    run — main() used to read it for every tool first, so a session whose
+    worktree was removed lost every boss and boss-api call to a
+    FileNotFoundError traceback. What cannot be read is a named refusal.
+    """
+    run = inherited.get("BOSS_AGENT_RUN", "")
+    if tool != "wt-cargo" or not run.strip():
+        return None
+    try:
+        here = Path(os.getcwd() if cwd is None else cwd)
+    except OSError as gone:
+        return (
+            "wt-cargo: REFUSED — BOSS_AGENT_RUN=" + run + " names an agent run, and this shell's "
+            "current directory no longer exists (" + str(gone) + "): the worktree it stood in was "
+            "removed, so there is no tree to build (backlog 2e5429b6). cd into the run's own "
+            "worktree from a script, then run wt-cargo again."
+        )
+    for tree in (here, *here.parents):
+        dotgit = tree / ".git"
+        if not os.path.lexists(dotgit):
+            continue
+        worktrees = dotgit / "worktrees"
+        try:
+            if not dotgit.is_dir() or not worktrees.is_dir() or not any(worktrees.iterdir()):
+                return None
+        except OSError as unreadable:
+            return (
+                "wt-cargo: REFUSED — BOSS_AGENT_RUN=" + run + " names an agent run, and "
+                + str(worktrees) + " cannot be read (" + str(unreadable) + "), so this door cannot "
+                "tell whether " + str(tree) + " is the SHARED checkout (backlog 2e5429b6). Run "
+                "wt-cargo from the run's own worktree."
+            )
+        return (
+            "wt-cargo: REFUSED — BOSS_AGENT_RUN=" + run + " names an agent run, and this shell is in "
+            + str(tree) + ", the SHARED checkout: the main checkout worktrees hang off and every door "
+            "on this host runs from, not a worktree of the run's own (backlog 916fe290; held at the "
+            "isolation door since c02f30c5, because the worker never sees the run). Run wt-cargo from "
+            "a script whose first lines are `cd <your worktree> || exit 1` and `pwd`. An operator "
+            "building this checkout on purpose unsets BOSS_AGENT_RUN."
+        )
+    return None
+
+
 def tool_plan(generation, tool, args, inherited):
     # A recorded probe's own writer supplies this channel even when it
     # cannot open a log. Refuse before clearing inherited markers or
@@ -74,7 +160,7 @@ def tool_plan(generation, tool, args, inherited):
         raise ValueError("unknown published control door")
     # These are the existing trusted actor's data arguments, not a
     # worker stamping service. The worker mounts none of these doors.
-    for key in ("BOSS_ACTOR", "BOSS_JOBS_URL", "BOSS_SOR_SERVICE", "BOSS_SOR_WAIT_SECONDS"):
+    for key in SESSION_ENV:
         if key in inherited:
             env[key] = inherited[key]
     if tool == "boss-api":
@@ -96,6 +182,8 @@ def tool_plan(generation, tool, args, inherited):
     # generation's bin/: owned, hash-checked by observed_generation on
     # every call, and holding only the two published binaries — the
     # same kubectl dev-build.py runs by absolute path. Nothing inherited.
+    # "Only" is checked, not assumed: validate_generation refuses a bin/
+    # holding any name the manifest does not list (backlog e17b0135).
     env["PATH"] = str(generation / "bin") + ":" + env["PATH"]
     return [str(generation / "bin/boss"), *args], env
 
@@ -110,6 +198,10 @@ def main():
         invoked, args = sys.argv[1], sys.argv[2:]
     else:
         args = sys.argv[1:]
+    refused = shared_checkout_refusal(invoked, os.environ)
+    if refused is not None:
+        print(refused, file=sys.stderr)
+        sys.exit(2)
     argv, env = tool_plan(generation, invoked, args, os.environ)
     os.execve(argv[0], argv, env)
 

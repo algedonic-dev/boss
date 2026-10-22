@@ -1,0 +1,65 @@
+# Accepted ec6fc29a: attended evidence and its explicit independent judgment
+# are separate steps. Neither is an existing boss prove execution receipt.
+[[workflow]]
+kind = "browser-renderer-observation"
+label = "Observe a browser renderer"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "A signed-in person explicitly observes exact published renderer bytes against a fixed synthetic suite, retains the full originals, then asks an independent executor to qualify that attended evidence. No session is exported and no car proof completes automatically. Each reload or new attempt uses a fresh packet."
+metadata = { department = "it", owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "filed"
+kind = "trigger"
+ready_when = "true"
+title_template = "Observation requested"
+metadata_defaults = { trigger_kind = "operator", trigger_name = "operator-requests-browser-observation" }
+
+[[workflow.step]]
+title = "observe"
+kind = "browser-observation"
+ready_when = "steps.filed.done"
+title_template = "Run and submit attended observations"
+authority_role = "platform-admin"
+# THE OBSERVATION IS THE SIGNER'S (rework of car b16e373d; review 8c30cbc7,
+# 2026-10-19). Its judgment once asked only that the record's actor be a
+# person — a shape test on an id the machine door takes as sent — so one
+# agent could write an all-pass observation as emp-david and qualify it.
+# `writer = "signer"` sends both metadata doors to the verified gateway
+# session the observer's own browser carries (boss_jobs::http::signer, the
+# door ops-request's decision uses), which needs a sign-off role to hold:
+# this one. The plugin stamps it with the same session after the record,
+# so the stamp's shape hash covers the observation it completes.
+sign_offs_required = ["platform-admin"]
+metadata_defaults = { car = "{metadata.car}", procedure = "Use your signed-in browser and explicitly run the fixed observations. Review the complete assertions and intercepted synthetic requests, then explicitly submit. The plugin retains full public renderer, suite and output attachments with readback, then writes the immutable observation original. Its actor/time/event come from that server record. Never export session material. Failure evidence remains evidence; client pass flags are not trusted execution. Another attempt gets a new packet; never replace an observation original." }
+[[workflow.step.fields]]
+name = "car"
+field_type = "string"
+required = true
+filled_by = "filer"
+[[workflow.step.fields]]
+name = "observation"
+field_type = "object"
+required = true
+writer = "signer"
+
+[[workflow.step]]
+title = "qualify"
+kind = "task"
+ready_when = "steps.observe.done"
+title_template = "Independently qualify the attended evidence"
+authority_role = "platform-admin"
+metadata_defaults = { completion_contract = "attended-browser-qualify-v1", procedure = "A different executor reviews the complete original renderer/suite bytes, exact car and suite bindings, every case assertion and synthetic transport record. Use boss browser qualify <this packet> --findings-file <review.md> --accept-attended. The typed adapter reads the immutable observation server record and attachment originals itself, refuses incomplete or mismatched evidence and self-review, records attended-browser-independent-review on its own immutable qualification original, then completes only this step. A terminal or client metadata flag alone is not a qualification: consumers must re-read both immutable originals and their exact linked event/digest. This assurance is an explicit independent judgment of an attended browser observation, never trusted remote execution and never a boss prove receipt. The car's existing proven step remains unpaid until its own approved qualification consumer accepts the record; never fill it by hand." }
+[[workflow.step.fields]]
+name = "qualification"
+field_type = "object"
+required = true
+
+[[workflow.step]]
+title = "qualified"
+kind = "outcome"
+ready_when = "steps.qualify.done"
+title_template = "Attended evidence reviewed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "qualified" }

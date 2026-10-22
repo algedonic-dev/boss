@@ -79,6 +79,36 @@ if [ "${1:-}" = "--print-ids" ]; then
 fi
 [ "$#" -gt 0 ] || die "give a command to run, or --print-ids"
 
+# THE COMMAND IS CANDIDATE CODE, AND GID 1500 READS THE MACHINE TOKEN
+# (backlog aeac17f0, reviewer run 355b595e, 2026-10-20). What runs below
+# is cargo test or infra/gate.sh from the tree under test, as the gate's
+# uid AND gid, and /etc/boss-doors/machine-token is 0440 root:1500 — so
+# with dev isolation on, this door handed the token to candidate code
+# without ever reading the selector the other candidate doors read. It
+# reads it now, before anything is bundled, the way run-while-held.sh,
+# wt-cargo, wt-web and the boss shim do (designs a68fc42a D1/D2, backlog
+# 1fddbe13): any selector refuses, and so does a store this caller
+# cannot read — the live store is root-owned 2700, so to uid 65534 the
+# selector is invisible whether or not isolation is on. The selector is
+# absent only when the nearest part of its path this caller can see is a
+# directory it may search; a store that does not exist at all (the gate
+# runner mounts no /work) is still the held state. There is no published
+# copy of this door to forward to: under isolation the route is the one a
+# fresh `boss brief <packet>` names. The store is spelled once, and
+# infra/dev/control-tools_test.py holds it equal to the other readers.
+dev_control=/work/tools/dev-control
+seen=$dev_control
+until [[ -e $seen || -L $seen ]]; do seen=${seen%/*}; seen=${seen:-/}; done
+if [[ -e $dev_control/enabled || -L $dev_control/enabled ]]; then
+    printf 'as-gate-uid: REFUSED — dev isolation is on here (%s exists), so this candidate command does not run as uid %s / gid %s beside this container'"'"'s credentials (design a68fc42a D2). Run boss brief <packet> again and use the route it names; never retry it locally. Why: %s.\n' \
+        "$dev_control/enabled" "$GATE_UID" "$GATE_GID" "$dev_control/activation.log" >&2
+    exit 75
+elif [[ ! -d $seen || ! -x $seen ]]; then
+    printf 'as-gate-uid: REFUSED — this caller (uid %s) cannot read the dev isolation store %s (%s is closed to it), so it cannot tell whether isolation is on, and this candidate command does not run as uid %s / gid %s beside this container'"'"'s credentials (design a68fc42a D2). Run it as the store'"'"'s owner, or through the route a fresh boss brief <packet> names; never retry it locally.\n' \
+        "$EUID" "$dev_control" "$seen" "$GATE_UID" "$GATE_GID" >&2
+    exit 75
+fi
+
 # A tracked change that is not in HEAD would not ride the bundle, and a
 # verification of a tree that is not the tree is worse than none.
 if ! git diff --quiet HEAD -- 2>/dev/null; then

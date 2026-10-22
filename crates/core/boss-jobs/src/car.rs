@@ -15,6 +15,35 @@
 
 use serde_json::{Value, json};
 
+pub fn select_receipt(job: &serde_json::Value) -> Option<serde_json::Value> {
+    job.pointer("/metadata/regate_receipt")
+        .filter(|v| !v.is_null())
+        .and_then(parse_receipt)
+        .or_else(|| {
+            // Field order is not a contract, so parse the gate step's
+            // receipt rather than scanning for it.
+            job.get("steps")
+                .and_then(|s| s.as_array())
+                .into_iter()
+                .flatten()
+                .find_map(|step| step.pointer("/metadata/receipt").and_then(parse_receipt))
+        })
+}
+
+/// A receipt is stored two ways: as a JSON STRING (the gate step, and a
+/// re-rail that copied that string verbatim into `regate_receipt`) or as
+/// an OBJECT (tooling that parsed before writing). Both are receipts —
+/// the same pair the boarding logic accepts (train.rs). Returns the
+/// receipt object, or None if the value is neither an object nor a string
+/// that parses to one.
+fn parse_receipt(v: &serde_json::Value) -> Option<serde_json::Value> {
+    match v {
+        serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+        obj @ serde_json::Value::Object(_) => Some(obj.clone()),
+        _ => None,
+    }
+}
+
 /// What a green gate-run packet says about a branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Receipt {
@@ -951,9 +980,147 @@ pub fn owned_wait(md: &Value) -> Option<OwnedWait> {
 /// `boss prove --from-car --unattended`); `owes_proof` is false for it.
 pub const PROOF_OWED: &str = "proof_owed";
 
+/// The car metadata key an owed proof is paid under: the same record
+/// `proven` carries when completed (`verified`, `proof`, `completed_at`)
+/// plus `proven_by`, held on the car because its `proven` step was
+/// skipped by the landing close and a closed packet's steps are history.
+/// Here rather than in the CLI that writes it, because the server now
+/// reserves it (backlog 82946cd9): one spelling for the writer and the
+/// door that judges it (CLAUDE.md §9a).
+pub const OWED_PROOF: &str = "owed_proof";
+
 /// Does this car owe its proof? Only under the one marker.
 pub fn owes_proof(md: &Value) -> bool {
     md.get(PROOF_OWED).and_then(Value::as_str) == Some("true")
+}
+
+/// The payment as a door READ it — both keys, `null` for an absent one —
+/// as the precondition its write carries into the store (backlog
+/// 87fe090d, review 7d92ec03 of car 5351793c). [`payment_moves`] judges
+/// a write against the row the door read; the merge lands on the row as
+/// it stands and the PUT saves a whole row, so a payment, a debt or an
+/// erasure committed between the two would be undone by a write judged
+/// harmless. The store refuses the write unless the row still reads so
+/// under its lock ([`crate::step_metadata_write::metadata_still_reads`]).
+/// Only these two keys: any other key written since changes nothing the
+/// judgement rests on, and the conductor's markers land on a car all day.
+pub fn payment_as_read(md: &Value) -> serde_json::Map<String, Value> {
+    [OWED_PROOF, PROOF_OWED]
+        .into_iter()
+        .map(|k| (k.to_owned(), md.get(k).cloned().unwrap_or(Value::Null)))
+        .collect()
+}
+
+/// WHO PAYS AN OWED PROOF (backlog 82946cd9, F3 of reviews 9daaa7a9 and
+/// e7bf6b14 on car c8ecf66a). The payment is one metadata write — the
+/// marker turned to `"paid"` beside the proof under [`OWED_PROOF`] — and
+/// until this rule any caller with Update on job could make it through
+/// either job door, indistinguishable from the forge's except by the
+/// audit actor: the self-asserted `x-boss-user` id every machine-door
+/// caller can type (the reason [`crate::field_writer`] never reads it).
+/// A forged `"paid"` drops the car out of the obligation's reader, so
+/// its probe is never run again, on a record that reads proven.
+///
+/// So the payment is reserved to the credentialed runner — the one
+/// identity the server resolves rather than believes
+/// ([`crate::runner_credential`]). These are the keys a write moves that
+/// only it may move: [`OWED_PROOF`] in any way (set, changed or erased),
+/// and [`PROOF_OWED`] in any way but one. Marking a debt — absent to
+/// `"true"` — stays open to every writer, because the landing that owes
+/// it is not the runner, and a forged mark admits nothing by itself:
+/// the forge door re-reads the car and runs only a closed, landed,
+/// undisproved one (review 9daaa7a9 F2). Erasing a debt, paying it,
+/// un-paying it or re-owing a paid one is the runner's. `null` reads as
+/// absent on both sides, so a merge-door `null` for a key the row does
+/// not hold changes nothing.
+pub fn payment_moves(old: &Value, new: &Value) -> Vec<&'static str> {
+    let at = |md: &Value, key: &str| md.get(key).filter(|v| !v.is_null()).cloned();
+    let mut moved = Vec::new();
+    if at(old, OWED_PROOF) != at(new, OWED_PROOF) {
+        moved.push(OWED_PROOF);
+    }
+    let (was, will) = (at(old, PROOF_OWED), at(new, PROOF_OWED));
+    let marks_a_debt = was.is_none() && will.as_ref().and_then(Value::as_str) == Some("true");
+    if was != will && !marks_a_debt {
+        moved.push(PROOF_OWED);
+    }
+    moved
+}
+
+/// The verb that pays an owed proof, compiled in so the hosts it runs on
+/// are READ rather than copied (CLAUDE.md §9a; backlog 82946cd9).
+const RUN_CAR_PROBE_VERB: &str = include_str!("../../../../infra/ops/verbs/run-car-probe.json");
+
+/// The hosts an owed proof may be paid from: the `hosts` the
+/// run-car-probe verb declares — the only verb that runs a car's probe,
+/// so the only place a payment can honestly come from. A verb file that
+/// does not parse answers no host, which refuses every payment rather
+/// than admitting any; the test beside [`payment_refusal`] pins it.
+pub fn payment_hosts() -> Vec<String> {
+    serde_json::from_str::<Value>(RUN_CAR_PROBE_VERB)
+        .ok()
+        .and_then(|verb| {
+            verb.get("hosts")?.as_array().map(|hosts| {
+                hosts
+                    .iter()
+                    .filter_map(|h| h.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Why `caller` may not move the payment keys, or `None` when it may:
+/// the [`crate::runner_credential::PRINCIPAL`] credential, presented
+/// from a host in [`payment_hosts`]. A car names no `host`, so the host
+/// binding [`crate::field_writer::admits`] applies to a packet is not
+/// asked of the car; the payment's own binding is asked instead.
+///
+/// HOST-BOUND (backlog 82946cd9, owed after car 5351793c): the runner
+/// credential resolves on every runner host — forge and boss-gcp both
+/// hold one since row E (2026-10-10) — and only the forge runs a car's
+/// probe. Admitting any runner host let a host that never ran the probe
+/// write the payment that says it passed. A credential that names no
+/// host is refused the same way: it names nothing to judge.
+pub fn payment_refusal(caller: Option<&crate::field_writer::CredentialedCaller>) -> Option<String> {
+    let host = caller.and_then(|c| c.host.as_deref());
+    if let Err(why) = crate::field_writer::admits(caller, crate::runner_credential::PRINCIPAL, host)
+    {
+        return Some(why);
+    }
+    let hosts = payment_hosts();
+    if host.is_some_and(|h| hosts.iter().any(|p| p == h)) {
+        return None;
+    }
+    let named = hosts
+        .iter()
+        .map(|h| format!("`{h}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "the presented credential is bound to host {}, and an owed proof is paid only from \
+         a host the run-car-probe verb runs on ({}; infra/ops/verbs/run-car-probe.json \
+         `hosts`)",
+        host.map_or_else(|| "none".to_string(), |h| format!("`{h}`")),
+        if named.is_empty() { "none" } else { &named },
+    ))
+}
+
+/// The `spec_slug` of the step an owed proof is the proof of.
+pub const PROVEN_STEP: &str = "proven";
+
+/// What the packet read hands beside a step for an owed proof's
+/// payment, or `None` (backlog 82946cd9, F4 of reviews 9daaa7a9 and
+/// e7bf6b14). A landing close SKIPS `proven`, and the runner pays the
+/// debt on the car, because a closed packet's steps are history — so a
+/// reader of the step saw it skipped and nothing pointing at the proof
+/// that paid it. The record under [`OWED_PROOF`], as stored, beside the
+/// [`PROVEN_STEP`] step only; every write of it is the credentialed
+/// runner's ([`payment_moves`]), so what is handed is the runner's.
+pub fn owed_proof_beside(md: &Value, step_slug: Option<&str>) -> Option<Value> {
+    (step_slug == Some(PROVEN_STEP))
+        .then(|| md.get(OWED_PROOF).filter(|v| !v.is_null()).cloned())
+        .flatten()
 }
 
 /// Inside `waits_on`: the event that settles the wait, declared so a
@@ -987,6 +1154,18 @@ impl WaitEvent {
                 .as_deref()
                 .is_none_or(|p| title.is_some_and(|t| t.starts_with(p)))
     }
+}
+
+/// A declared wait's event in the one shape [`wait_event`] reads — what
+/// `boss car waits-on --event-closes` and a park file's
+/// `[waits_on.event]` write (backlog 9e9db2ea). The title prefix is
+/// omitted, never nulled, when none is given.
+pub fn waits_on_event_value(closes: &str, title: Option<&str>) -> Value {
+    let mut e = json!({"closes": closes});
+    if let Some(t) = title {
+        e["title"] = json!(t);
+    }
+    e
 }
 
 /// The event a car's `waits_on` declares, or `None` — for no wait, a
@@ -1368,20 +1547,26 @@ pub fn open_car_for<'a>(cars: &'a [Value], branch: &str) -> Option<&'a Value> {
 /// could never ride again.
 pub fn is_landed(car: &Value) -> bool {
     let md = car.get("metadata");
-    let flag = |k: &str| match md.and_then(|m| m.get(k)) {
-        // The conductor writes the marker as the STRING "true"; a bool
-        // is accepted for the same meaning, and an explicit false is
-        // neither.
-        Some(Value::Bool(b)) => *b,
-        Some(Value::String(s)) => s == "true",
-        _ => false,
-    };
-    if flag(crate::car_unland::UNLANDED_MARKER) {
+    if is_marked(car, crate::car_unland::UNLANDED_MARKER) {
         return false;
     }
     let closed_merged = car.get("status").and_then(Value::as_str) == Some("closed")
         && md.and_then(|m| m.get("outcome")).and_then(Value::as_str) == Some("merged");
-    closed_merged || flag("merged")
+    closed_merged || is_marked(car, "merged")
+}
+
+/// Does this car carry the marker `key` in its metadata? The conductor
+/// writes a marker as the STRING "true"; a bool is accepted for the same
+/// meaning, and an explicit false is neither. ONE reading for every
+/// marker (backlog 82946cd9): the owed-proof door read `disproved` and
+/// `abandoned` as the string only while [`is_landed`] read both forms,
+/// so a bool-disproved owed car was run.
+pub fn is_marked(car: &Value, key: &str) -> bool {
+    match car.get("metadata").and_then(|m| m.get(key)) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s == "true",
+        _ => false,
+    }
 }
 
 /// The car that already landed `branch`, if one has — the question both
@@ -3677,6 +3862,84 @@ mod waits_on_tests {
         assert!(!owes_proof(&json!({ PROOF_OWED: true })));
         assert!(!owes_proof(&json!({ PROOF_OWED: "paid" })));
         assert!(!owes_proof(&json!({})));
+    }
+
+    /// THE PAYMENT IS THE RUNNER'S (backlog 82946cd9): every move of the
+    /// two keys but one — marking a debt the row does not hold — is a
+    /// move only the credentialed runner may make; `null` is absent on
+    /// both sides, and an unchanged row moves nothing.
+    #[test]
+    fn every_move_of_the_payment_but_marking_a_debt_is_the_runners() {
+        let owed = json!({ PROOF_OWED: "true" });
+        let paid = json!({ PROOF_OWED: "paid", OWED_PROOF: {"verified": "v"} });
+        assert!(
+            payment_moves(&json!({}), &owed).is_empty(),
+            "marking a debt"
+        );
+        assert!(payment_moves(&json!({ PROOF_OWED: null }), &owed).is_empty());
+        assert!(payment_moves(&paid, &paid).is_empty(), "an unchanged row");
+        assert!(payment_moves(&json!({}), &json!({ OWED_PROOF: null })).is_empty());
+        assert_eq!(payment_moves(&owed, &paid), [OWED_PROOF, PROOF_OWED]);
+        assert_eq!(
+            payment_moves(&owed, &json!({})),
+            [PROOF_OWED],
+            "erasing a debt"
+        );
+        assert_eq!(
+            payment_moves(&json!({}), &json!({ PROOF_OWED: "paid" })),
+            [PROOF_OWED]
+        );
+        assert_eq!(
+            payment_moves(&paid, &owed),
+            [OWED_PROOF, PROOF_OWED],
+            "re-owing"
+        );
+        let other = json!({ PROOF_OWED: "paid", OWED_PROOF: {"verified": "w"} });
+        assert_eq!(
+            payment_moves(&paid, &other),
+            [OWED_PROOF],
+            "a rewritten proof"
+        );
+    }
+
+    /// Only a credential the server resolved for `runner:ops` pays, and
+    /// only from a host the run-car-probe verb runs on (the host binding
+    /// still owed on 82946cd9): the boss-gcp runner holds the same
+    /// principal and runs no probe, and a host-less runner names no host
+    /// to judge. No credential, or another principal's, is refused with
+    /// the reason the refusal carries.
+    #[test]
+    fn only_the_runner_credential_pays_and_only_from_a_probe_host() {
+        use crate::field_writer::CredentialedCaller;
+        let runner = |host: Option<&str>| CredentialedCaller {
+            principal: crate::runner_credential::PRINCIPAL.into(),
+            actor_id: crate::runner_credential::ACTOR.into(),
+            host: host.map(str::to_string),
+        };
+        assert_eq!(payment_refusal(Some(&runner(Some("forge")))), None);
+        for elsewhere in [Some("boss-gcp"), None] {
+            let why = payment_refusal(Some(&runner(elsewhere))).unwrap_or_default();
+            assert!(
+                why.contains("run-car-probe") && why.contains("`forge`"),
+                "{elsewhere:?}: {why}"
+            );
+        }
+        let none = payment_refusal(None).unwrap_or_default();
+        assert!(none.contains("self-asserted"), "{none}");
+        let other = CredentialedCaller {
+            principal: "runner:other".into(),
+            ..runner(Some("forge"))
+        };
+        assert!(payment_refusal(Some(&other)).is_some());
+    }
+
+    /// The hosts a payment may come from are READ from the verb that
+    /// pays — infra/ops/verbs/run-car-probe.json's `hosts` — never a
+    /// copy (CLAUDE.md §9a); a verb file that stopped parsing would
+    /// answer no host and refuse every payment, so it is pinned here.
+    #[test]
+    fn the_payment_hosts_are_the_run_car_probe_verbs_own() {
+        assert_eq!(payment_hosts(), ["forge"]);
     }
 }
 

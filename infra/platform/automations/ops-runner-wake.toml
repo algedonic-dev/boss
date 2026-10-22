@@ -1,0 +1,11 @@
+# automation:ops-runner-wake — new with backlog ca6f40c2 (2026-10-19), so
+# no tally has seen it yet; registered from the tree.
+# Signs as audit-readonly today: infra/ops/ops-runner-wake.sh (through
+# sor_reader_header), on its one read — the events service's stream of
+# jobs.job.created. It writes nothing to the system of record; its one act
+# is starting the host's own boss-ops-runner.service.
+
+[[automation]]
+id = "automation:ops-runner-wake"
+role = "audit-readonly"
+description = "The ops runner's waker reading the stream of job creations, so a filed ops-request starts its host's runner at once rather than at the timer's next tick (infra/ops/ops-runner-wake.sh). Reads only."

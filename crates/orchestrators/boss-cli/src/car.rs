@@ -601,6 +601,21 @@ pub(crate) struct WaitsOnFields {
     pub max_wait_hours: Option<u32>,
     pub next_check_at: Option<String>,
     pub clean_window: Option<CleanWindowFields>,
+    /// The close the probe waits on, as a machine can match it —
+    /// `boss_jobs::car::WAITS_ON_EVENT`. When a packet of that kind
+    /// closes, the dispatcher re-runs the car's probe at once rather
+    /// than at the next hourly recheck (backlog 9e9db2ea).
+    pub event: Option<WaitEventFields>,
+}
+
+/// `waits_on.event`: the kind of packet whose close is the event, and
+/// optionally the start of its title — the fields
+/// `boss_jobs::car::WaitEvent` reads back.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WaitEventFields {
+    pub closes: String,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -629,8 +644,8 @@ impl WaitsOnFields {
     pub(crate) fn update(&self) -> Result<Value> {
         if self.is_empty() {
             bail!(
-                "nothing to declare: give --on, --seen, --owner, --max-wait-hours or --next-check-at \
-                 (or --clear to remove the declaration)"
+                "nothing to declare: give --on, --seen, --owner, --max-wait-hours, --next-check-at \
+                 or --event-closes (or --clear to remove the declaration)"
             );
         }
         let blank = |flag: &str, v: &Option<String>| -> Result<Option<String>> {
@@ -678,6 +693,22 @@ impl WaitsOnFields {
         if self.max_wait_hours == Some(0) {
             bail!("--max-wait-hours 0 is no patience at all: give a positive number of hours");
         }
+        // A blank `closes` keys the car to no close at all while reading
+        // as declared, so it is refused rather than written. A blank
+        // `title` is refused through `blank` like every other flag: it was
+        // dropped in silence, leaving a declaration every close of that
+        // kind fires (backlog 7838df7d, review 4890fdfd N1).
+        let event = match &self.event {
+            None => None,
+            Some(e) if e.closes.trim().is_empty() => bail!(
+                "--event-closes is empty: name the kind of packet whose close the probe waits \
+                 on (gate-run, ops-request, ...)"
+            ),
+            Some(e) => {
+                let title = blank("--event-title", &e.title)?;
+                Some(car::waits_on_event_value(e.closes.trim(), title.as_deref()))
+            }
+        };
         let mut m = serde_json::Map::new();
         let mut put = |k: &str, v: Option<Value>| {
             if let Some(v) = v {
@@ -699,6 +730,7 @@ impl WaitsOnFields {
             car::WAITS_ON_MAX_WAIT_HOURS,
             self.max_wait_hours.map(Value::from),
         );
+        put(car::WAITS_ON_EVENT, event);
         Ok(Value::Object(m))
     }
 }
@@ -751,6 +783,52 @@ mod tests {
             waits_on_body(None, &given(None, None), true).unwrap(),
             json!({"waits_on": null})
         );
+    }
+
+    /// THE EVENT A PROBE WAITS ON IS DECLARABLE (backlog 9e9db2ea). A
+    /// park file's `[waits_on.event]` table, or `boss car waits-on
+    /// --event-closes`, writes `waits_on.event` in the one shape
+    /// `boss_jobs::car::wait_event` reads — the shape the dispatcher's
+    /// declared-close rule matches a close against. Until then only a hand
+    /// metadata PATCH could write it, and no landed car carried one. A
+    /// blank `closes` is refused: an empty event would key the car to no
+    /// close at all while reading as declared.
+    #[test]
+    fn a_declared_event_is_written_in_the_shape_the_dispatcher_matches() {
+        let fields: WaitsOnFields = toml::from_str(
+            "on = 'a full gate closing after the converge'\nseen = 'true'\n\
+             [event]\ncloses = 'gate-run'\ntitle = 'gate main'\n",
+        )
+        .unwrap();
+        let body = waits_on_body(None, &fields, false).unwrap();
+        assert_eq!(
+            car::wait_event(&body),
+            Some(car::WaitEvent {
+                closes: "gate-run".into(),
+                title: Some("gate main".into())
+            })
+        );
+        let bare = WaitsOnFields {
+            event: Some(WaitEventFields {
+                closes: " ".into(),
+                title: None,
+            }),
+            ..given(Some("x"), Some("true"))
+        };
+        let err = waits_on_body(None, &bare, false).unwrap_err();
+        assert!(err.to_string().contains("closes"), "{err}");
+        // A blank title is refused like every other blank flag (backlog
+        // 7838df7d, review 4890fdfd N1): dropped in silence, it left a
+        // declaration that every close of that kind fires.
+        let blank_title = WaitsOnFields {
+            event: Some(WaitEventFields {
+                closes: "gate-run".into(),
+                title: Some("  ".into()),
+            }),
+            ..given(Some("x"), Some("true"))
+        };
+        let err = waits_on_body(None, &blank_title, false).unwrap_err();
+        assert!(err.to_string().contains("--event-title"), "{err}");
     }
 
     /// The fields a test hands the verb: `on` and `seen` as given.

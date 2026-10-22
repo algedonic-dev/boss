@@ -1912,6 +1912,62 @@ async fn a_day_of_arrivals_does_not_push_the_open_train_off_the_board() {
     assert_eq!(body["recent"].as_array().unwrap().len(), RECENT_LIMIT);
 }
 
+/// More open trains than one window must all be on the board.
+///
+/// The open read was split out of the windowed one (above) and its
+/// comment said the in-flight trains are "read whole", but it was still
+/// ONE `list_jobs(.., TRAIN_WINDOW, 0)` page whose total was dropped:
+/// past `TRAIN_WINDOW` open trains the rest fell off `trains` with no
+/// sign the population had been cut (backlog 5d96c12d — a source bound,
+/// not a measured estate). The control reads the same population
+/// straight from the repository, so the board is compared to the
+/// record rather than to a number retyped here. Red first: with the one
+/// page, `trains` holds exactly `TRAIN_WINDOW`.
+#[tokio::test]
+async fn every_open_train_is_on_the_board_past_one_window() {
+    use boss_jobs::yard::TRAIN_WINDOW;
+
+    let (app, jobs) = app_with(vec![depth_rule(), clock_rule()], vec![policy_row()]);
+    let now = t(NOW);
+
+    let open = TRAIN_WINDOW + 1;
+    for i in 0..open {
+        let train = job(
+            "pr-train",
+            &format!("77777777-7777-7777-7777-{i:012}"),
+            &format!("open train #{i}"),
+            JobStatus::Open,
+            json!({}),
+        );
+        jobs.create_job_at(&train, now, &[]).await.unwrap();
+    }
+
+    // Control: the record holds more open trains than one window, so a
+    // one-page read is a smaller answer than the population's.
+    let filter = boss_jobs::port::JobFilter {
+        kind: Some("pr-train".to_string()),
+        status: Some(JobStatus::Open),
+        ..Default::default()
+    };
+    let (page, total) = jobs.list_jobs(&filter, TRAIN_WINDOW, 0).await.unwrap();
+    assert_eq!((page.len() as i64, total), (TRAIN_WINDOW, open));
+
+    let (status, body) = get(&app, "operator").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let ids: std::collections::HashSet<&str> = body["trains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids.len() as i64,
+        total,
+        "every open train the record holds is on the board, not one window of them"
+    );
+}
+
 /// An arrived train as the conductor records one: the outcome stamped,
 /// the arrival report's timings, and the `closed_at` the server writes.
 /// `board_to_merge_s` and the merge→`closed_at` gap are the two legs the
@@ -2415,18 +2471,11 @@ async fn a_record_inside_the_window_is_not_reported_truncated() {
     assert_eq!(body["gate_runs_truncated"], false, "{body}");
 }
 
-/// The held read turns pages: a hold older than one page of newer holds
-/// is still read. The newer holds on the live record are the trains'
-/// own gate-runs (128b5496 stamps a `hold` on each), 43 of 44 on
-/// 2026-09-15 and accruing ~20 a day — so a one-page held read is the
-/// same defect on a longer fuse.
-#[tokio::test]
-async fn a_held_green_behind_a_page_of_train_holds_is_still_read() {
-    use boss_jobs::yard::HELD_RUN_PAGE;
-
-    let (app, jobs) = app_with(vec![depth_rule(), clock_rule()], vec![policy_row()]);
+/// A held gate-run and a page of newer TRAIN holds stacked on top of it,
+/// `newer` deep — the shape the live record has, where the train gates
+/// are the bulk of every hold.
+async fn seed_held_green_under_train_holds(jobs: &InMemoryJobs, newer: usize) -> Job {
     let now = t(NOW);
-
     let mut held = job(
         "gate-run",
         "77777777-7777-7777-7777-777777777777",
@@ -2449,10 +2498,7 @@ async fn a_held_green_behind_a_page_of_train_holds_is_still_read() {
     )
     .await
     .unwrap();
-
-    // One page of newer TRAIN gates plus one, each carrying the
-    // conductor's hold.
-    for i in 0..=HELD_RUN_PAGE {
+    for i in 0..newer {
         let train_gate = job(
             "gate-run",
             &format!("99999999-9999-9999-9999-{i:012}"),
@@ -2467,8 +2513,28 @@ async fn a_held_green_behind_a_page_of_train_holds_is_still_read() {
         );
         jobs.create_job_at(&train_gate, now, &[]).await.unwrap();
     }
+    held
+}
 
-    let (_, body) = get(&app, "operator").await;
+/// THE HELD READ HAS NO CAP (backlog 4e918604). It turned at most five
+/// pages of 400 and, past them, logged a warning and judged the yard
+/// from the 2000 rows it held: measured 2026-10-19, 2214 held gate-runs
+/// on record, the warning fired 176 times in 15 minutes — once per map
+/// read — and every region, border and the mover's reading judged held
+/// runs from 2000 of them. An absence judged from a capped page is a
+/// read that could not finish passed off as an empty one. 2001 newer
+/// holds is the old cap plus one, so the held green sits exactly where
+/// the capped read stopped looking. It replaces the one-page-plus-one
+/// pin that held the page turn while the cap stood: the newer holds are
+/// the trains' own gate-runs (128b5496 stamps a `hold` on each), so the
+/// page turn and the cap were the same defect on two fuses.
+#[tokio::test]
+async fn a_held_green_behind_more_holds_than_the_old_cap_is_still_read() {
+    let (app, jobs) = app_with(vec![depth_rule(), clock_rule()], vec![policy_row()]);
+    seed_held_green_under_train_holds(&jobs, 2001).await;
+
+    let (status, body) = get(&app, "operator").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let held_lane = body["held"].as_array().unwrap();
     assert_eq!(
         held_lane
@@ -2476,8 +2542,27 @@ async fn a_held_green_behind_a_page_of_train_holds_is_still_read() {
             .map(|h| h["branch"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vec!["feat/held-old"],
-        "the held green behind a page of train holds, and no train in the lane: {body}"
+        "the held green past 2000 newer holds is named: {body}"
     );
+}
+
+/// The other half of the same defect: a held page that FAILS mid-read
+/// was a `break` with the rows already read, so the yard answered 200
+/// from a partial held set. A held read that cannot finish fails the
+/// yard, naming why, as the open gate-run read beside it already did.
+#[tokio::test]
+async fn a_held_read_that_fails_past_its_first_page_fails_the_yard() {
+    let (app, jobs) = app_with(vec![depth_rule(), clock_rule()], vec![policy_row()]);
+    seed_held_green_under_train_holds(&jobs, 2001).await;
+    jobs.fail_jobs_list("gate-run", 1000);
+
+    let (status, text) = get_text(&app, "operator").await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a partial held set is not an answer: {text}"
+    );
+    assert!(text.contains("unreadable"), "says why: {text}");
 }
 
 /// The yard's answer as text — an error body is prose, and the test
@@ -2668,13 +2753,26 @@ async fn a_held_cars_row_carries_what_its_release_rests_on() {
             json!({ "branch": branch }),
         );
         jobs.create_job_at(&car, now, &[]).await.unwrap();
+        let mut review_md =
+            json!({ "hold": "trust-boundary car", "hold_sha": H1, "agent_run": run_id });
+        // The release rule's record of a door refusal, as
+        // `jobs_release_on_review::refusal_record` writes it (backlog
+        // 60993cda): the car it could not release says so on its row.
+        if branch == "feat/b" {
+            review_md[boss_jobs::car::AUTO_RELEASE] = json!({
+                "review": run_id, "outcome": "refused",
+                "why": "boss release: REFUSED — a review of another head is no review of this one",
+                "by": "automation:rule:release-a-held-car-on-its-reviewer-verdict",
+                "at": "2026-09-03T11:05:00+00:00",
+            });
+        }
         jobs.add_step_at(
             &step(
                 &car.id,
                 "review",
                 "Open for review",
                 StepStatus::Active,
-                json!({ "hold": "trust-boundary car", "hold_sha": H1, "agent_run": run_id }),
+                review_md,
             ),
             now,
             &[],
@@ -2732,6 +2830,32 @@ async fn a_held_cars_row_carries_what_its_release_rests_on() {
             .contains("launched unknown"),
         "{a}"
     );
+    // A TROUBLED PACKET LOOKS TROUBLED (backlog 60993cda): the car the
+    // release rule tried and failed to release carries the rule's record
+    // on its row; the car nobody tried carries none.
+    let held_row = |branch: &str| {
+        held.iter()
+            .find(|h| h["branch"] == branch)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    assert!(
+        held_row("feat/a").get("auto_release").is_none(),
+        "{}",
+        held_row("feat/a")
+    );
+    let tried = &held_row("feat/b")["auto_release"];
+    assert_eq!(tried["outcome"], "refused", "{tried}");
+    assert_eq!(tried["review"], "5eed5eed-0000-4000-8000-000000000002");
+    assert_eq!(
+        tried["by"],
+        "automation:rule:release-a-held-car-on-its-reviewer-verdict"
+    );
+    assert_eq!(tried["at"], "2026-09-03T11:05:00+00:00");
+    assert!(
+        tried["why"].as_str().unwrap().contains("another head"),
+        "{tried}"
+    );
     let b = row("feat/b");
     assert_eq!(b["releasable"], false, "{b}");
     assert_eq!(b["head_matches"], false, "{b}");
@@ -2747,7 +2871,8 @@ async fn a_held_cars_row_carries_what_its_release_rests_on() {
     // words, and a granted release still passes the merge door's write
     // gate: this caller reads every packet but holds no step update, so
     // it is refused there and the hold stays on.
-    let post = |car: &'static str, review: &'static str| {
+    // Each body names the hold the asker judged (review 792b871a N1).
+    let post = |car: &'static str, review: &'static str, hold: &'static str| {
         let app = app.clone();
         async move {
             let resp = app
@@ -2757,7 +2882,10 @@ async fn a_held_cars_row_carries_what_its_release_rests_on() {
                         .uri(format!("/api/jobs/{car}/release"))
                         .header("x-boss-user", user_header("operator"))
                         .header("content-type", "application/json")
-                        .body(Body::from(json!({ "review": review }).to_string()))
+                        .body(Body::from(
+                            json!({ "review": review, "hold": { "reason": hold, "sha": H1 } })
+                                .to_string(),
+                        ))
                         .unwrap(),
                 )
                 .await
@@ -2767,17 +2895,31 @@ async fn a_held_cars_row_carries_what_its_release_rests_on() {
             (status, String::from_utf8_lossy(&bytes).into_owned())
         }
     };
+    let shown = "trust-boundary car";
     let (status, text) = post(
         "44444444-4444-4444-4444-444444444444",
         "5eed5eed-0000-4000-8000-000000000002",
+        shown,
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{text}");
     assert!(text.starts_with("boss release: REFUSED — "), "{text}");
     assert!(text.contains("another head"), "{text}");
+    // A hold other than the one the car carries is refused before the
+    // write, naming both.
     let (status, text) = post(
         "22222222-2222-2222-2222-222222222222",
         "5eed5eed-0000-4000-8000-000000000001",
+        "an older reason",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{text}");
+    assert!(text.contains("\"an older reason\""), "{text}");
+    assert!(text.contains("\"trust-boundary car\""), "{text}");
+    let (status, text) = post(
+        "22222222-2222-2222-2222-222222222222",
+        "5eed5eed-0000-4000-8000-000000000001",
+        shown,
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{text}");

@@ -288,6 +288,62 @@ async fn only_unrecorded_entries_apply() {
     drop_db(&name);
 }
 
+/// Design c195e83e Q4 (2026-10-17): an index on a table that takes every
+/// write is built CONCURRENTLY, and Postgres refuses that inside a
+/// transaction block. Every other migration runs inside one with its
+/// bookkeeping row, so a file opts out by its first line, runs alone,
+/// and is recorded only after it succeeded. A failure records nothing,
+/// so the next run tries the file again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_no_transaction_migration_runs_alone_and_is_recorded_after_it_succeeds() {
+    let (name, url) = scratch_db().await;
+    let syn = Synthetic::new(&[
+        ("01-table.sql", "CREATE TABLE t1 (id int, doc jsonb);"),
+        (
+            "02-index.sql",
+            "-- migrate: no-transaction\n\
+             DROP INDEX CONCURRENTLY IF EXISTS t1_doc_id;\n\
+             CREATE INDEX CONCURRENTLY t1_doc_id ON t1 ((doc->>'id'));\n",
+        ),
+        ("03-after.sql", "CREATE TABLE t3 (id int);"),
+    ]);
+    assert_ok(
+        &run(&syn.script(), &[], &url),
+        "applying a no-transaction file",
+    );
+    let mut conn = connect(&url).await;
+    assert_eq!(
+        recorded(&mut conn).await,
+        vec!["01-table.sql", "02-index.sql", "03-after.sql"]
+    );
+    let valid: bool = sqlx::query_scalar(
+        "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+         WHERE c.relname='t1_doc_id'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("the concurrent index exists");
+    assert!(valid, "the concurrent build completed");
+
+    // A failing no-transaction file is not recorded, and the run stops.
+    syn.write(
+        "04-broken.sql",
+        "-- migrate: no-transaction\nCREATE INDEX CONCURRENTLY t1_broken ON t1 ((nope->>'id'));\n",
+    );
+    assert!(
+        !run(&syn.script(), &[], &url).status.success(),
+        "a failing no-transaction file fails the run"
+    );
+    assert_eq!(
+        recorded(&mut conn).await,
+        vec!["01-table.sql", "02-index.sql", "03-after.sql"],
+        "nothing is recorded for a no-transaction file that failed"
+    );
+
+    drop(conn);
+    drop_db(&name);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn baseline_records_without_running() {
     let (name, url) = scratch_db().await;

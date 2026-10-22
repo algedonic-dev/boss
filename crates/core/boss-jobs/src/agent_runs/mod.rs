@@ -69,6 +69,39 @@
 /// b91a2103) so a wholesale metadata write cannot erase it.
 pub const EDGE_KEY: &str = "agent_run";
 
+/// The metadata key on an `agent-run` recording HOW its packet was
+/// chosen (backlog c9dd306a): `{ "next": { station, position, of, pass,
+/// skipped } }` when `boss dispatch --next` took it off a station, or
+/// `{ "named": <packet id> }` when the caller named the packet.
+/// Measured 2026-10-19: six runs opened on standard items while five
+/// URGENT steps nominated to the same actor sat ready at the head of its
+/// station, and no run said whether the queue's walk chose its packet or
+/// a session picked it by hand — so a defect in the walk could not be
+/// told from an operator's choice. `boss dispatch` writes it; the board
+/// reads it back through [`selection`]. One spelling, here.
+pub const SELECTED_BY_KEY: &str = "selected_by";
+
+/// The word a run's [`SELECTED_BY_KEY`] says — `next` or `named` — and
+/// `None` for a run that records neither (every run filed before
+/// c9dd306a), which a reader prints as nothing rather than guessing.
+pub fn selection(metadata: &serde_json::Value) -> Option<&'static str> {
+    let selected = metadata.get(SELECTED_BY_KEY)?;
+    if selected
+        .get("next")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        Some("next")
+    } else if selected
+        .get("named")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|p| !p.is_empty())
+    {
+        Some("named")
+    } else {
+        None
+    }
+}
+
 /// Whether a claim hands a step to a DIFFERENT holder — the one case in
 /// which the claim clears [`EDGE_KEY`] (backlog 9562f6df).
 ///
@@ -151,6 +184,31 @@ pub use types::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// HOW A RUN'S PACKET WAS CHOSEN, AS ONE WORD (backlog c9dd306a):
+    /// the queue's walk, the caller's name, or — for a run filed before
+    /// the key existed, or one whose record is not either shape —
+    /// nothing, never a guess.
+    #[test]
+    fn a_run_says_whether_the_queue_or_its_caller_chose_the_packet() {
+        let next = serde_json::json!({ (SELECTED_BY_KEY): { "next": {
+            "station": "a.platform-admin.opus-5-5", "position": 3, "skipped": [] } } });
+        let named = serde_json::json!({ (SELECTED_BY_KEY): { "named": "c9dd306a" } });
+        assert_eq!(selection(&next), Some("next"));
+        assert_eq!(selection(&named), Some("named"));
+        assert_eq!(
+            selection(&serde_json::json!({ "packet": "c9dd306a" })),
+            None
+        );
+        assert_eq!(
+            selection(&serde_json::json!({ (SELECTED_BY_KEY): { "named": "" } })),
+            None
+        );
+        assert_eq!(
+            selection(&serde_json::json!({ (SELECTED_BY_KEY): "next" })),
+            None
+        );
+    }
 
     /// The three holders a claim can meet (9562f6df): nobody, the
     /// claimant under either spelling, and someone else.

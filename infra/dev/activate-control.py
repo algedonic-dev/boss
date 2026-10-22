@@ -226,6 +226,7 @@ def main():
     parser.add_argument("--cli-store", type=Path, default=Path("/work/tools/image-cli"))
     parser.add_argument("--store", type=Path, default=STORE)
     parser.add_argument("--prepared-config", type=Path)
+    parser.add_argument("--main", help="the commit the image store names current (an explicit activation's receipt is judged against it)")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--config", type=Path)
     mode.add_argument("--reactivate", action="store_true",
@@ -239,6 +240,14 @@ def main():
     elif args.reactivate:
         outcome = reactivate(archive, args.store, enabled, args.commit, prepared_config=args.prepared_config)
     else:
+        # Backlog b50b8953 (David, 2026-10-19): both flips that day failed
+        # first at a step a rehearsal reads — a Longhorn floor, a binding
+        # a nested worktree could not select. The operator's activation
+        # refuses, before it extracts or links anything, unless THIS
+        # commit's preflight receipt passed every check at the main the
+        # image store names now. Follow-main (--reactivate) needs none: it
+        # only keeps an activation already made current.
+        published_module("preflight-control").require_preflight(args.store, args.commit, args.main)
         config = published_module("dev-build").load_record(args.config)
         outcome = activate(archive, args.store, enabled, args.commit, config)
     if outcome == "off":

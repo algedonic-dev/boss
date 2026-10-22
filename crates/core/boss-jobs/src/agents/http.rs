@@ -735,6 +735,7 @@ mod tests {
             role: "platform-admin".into(),
             description: "the dispatcher".into(),
             signs_for: Some("automation:rule:".into()),
+            access_tier: None,
         };
         let stamp = boss_core::publisher::EventStamp::new(
             "jobs",

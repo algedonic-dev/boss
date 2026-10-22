@@ -88,6 +88,10 @@ export type StepField = {
   name: string;
   field_type: string;
   required?: boolean;
+  /// The one credential principal the step doors admit for this key
+  /// (`StepField::writer`, design f623e425); absent when any caller the
+  /// policy admits may write it. A surface offers no input for it.
+  writer?: string;
 };
 
 export type Step = {

@@ -206,6 +206,7 @@ mod tests {
             role: "platform-admin".into(),
             description: "x".into(),
             signs_for: signs_for.map(Into::into),
+            access_tier: None,
         }
     }
 

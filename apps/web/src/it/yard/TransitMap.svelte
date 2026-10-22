@@ -307,7 +307,6 @@
   .overview .board :global(.live text) { font-size: 30px; }
   .overview .board :global(.live .mark) { r: 10px; }
   .motion-source { margin: var(--s2) 0; color: var(--map-muted); font-size: 12px; overflow-wrap: anywhere; }
-  .motion-source.load-failed { color: var(--map-bad-ink); }
   .board text { fill: var(--map-ink); }
   .stn { font-size: 12px; font-weight: 600; }
   .sub { font-size: 10.5px; fill: var(--map-muted); }

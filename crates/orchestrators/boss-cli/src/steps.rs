@@ -1070,7 +1070,7 @@ impl Wire {
     /// id. Open only: every step these verbs write to is open, and the
     /// `--of` original a duplicate names is almost always open too — a
     /// closed one takes its full uuid, which the refusal says.
-    async fn resolve(&self, given: &str, kind: Option<&str>) -> Result<Value> {
+    pub(crate) async fn resolve(&self, given: &str, kind: Option<&str>) -> Result<Value> {
         let id = if crate::job::looks_like_uuid(given) {
             given.to_string()
         } else {
@@ -2118,7 +2118,9 @@ pub(crate) async fn complete(
 /// Where a hand-release's evidence lands on the freed step —
 /// deliberately not the clock rule's `reclaimed` (see the section
 /// header): a reader must be able to tell which one freed the step.
-pub(crate) const RELEASED_KEY: &str = "released";
+/// Core's constant since backlog ff0f0ff5, because the dispatcher now
+/// reads it too (`boss_jobs::step_release`): one spelling, two readers.
+pub(crate) const RELEASED_KEY: &str = boss_jobs::step_release::KEY;
 
 /// The status a claim moves a step from, and the one it moves back to
 /// — the pair `claim_step`'s CAS uses, so a release is a restoration
@@ -2170,6 +2172,11 @@ pub(crate) fn release_patch(step: &Value, why: &str, by: Option<&str>, at: &str)
         .pointer(&format!("/metadata/{}", boss_jobs::agent_runs::EDGE_KEY))
         .cloned()
         .unwrap_or(Value::Null);
+    // The holder it is taken FROM, which the dispatcher's capability
+    // pick leaves out while another agent serves the step's pair — else
+    // its hash of the step id re-nominates the step straight back to
+    // that holder (backlog ff0f0ff5).
+    let from = step.get("assignee_id").cloned().unwrap_or(Value::Null);
     let mut body = Map::new();
     body.insert(boss_jobs::agent_runs::EDGE_KEY.to_string(), Value::Null);
     body.insert(
@@ -2179,6 +2186,7 @@ pub(crate) fn release_patch(step: &Value, why: &str, by: Option<&str>, at: &str)
             "by": by.map(|b| json!(b)).unwrap_or(Value::Null),
             "at": at,
             "from_run": from_run,
+            boss_jobs::step_release::FROM: from,
         }),
     );
     Value::Object(body)
@@ -4956,6 +4964,19 @@ mod tests {
         assert_eq!(body[RELEASED_KEY]["from_run"], json!(HELD_RUN));
         assert_eq!(body[RELEASED_KEY]["by"], json!("emp-david"));
         assert_eq!(body[RELEASED_KEY]["at"], json!("2026-09-22T06:00:00Z"));
+        // The holder it was taken FROM — not `by`, the verb's caller —
+        // which the dispatcher's capability pick reads so the step does
+        // not hash straight back to it (backlog ff0f0ff5).
+        assert_eq!(
+            body[RELEASED_KEY][boss_jobs::step_release::FROM],
+            json!("agent-claude")
+        );
+        let md = json!({ RELEASED_KEY: body[RELEASED_KEY].clone() });
+        assert_eq!(
+            boss_jobs::step_release::released_from(&md),
+            Some("agent-claude"),
+            "the one reader the dispatcher uses reads what this verb writes"
+        );
         // A step with NO edge — the population this packet measured —
         // releases the same way, and the record says the edge was
         // missing rather than leaving the reader to wonder.

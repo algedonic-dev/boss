@@ -3398,9 +3398,19 @@ mod tests {
             include_str!("rerail.rs"),
             "async fn finish(",
             "crate::mutating_verb::review_hold_write(car, &reason, bound)",
-            // The call as a statement of `finish`'s body, however rustfmt
-            // wraps its arguments (the proof intent lengthened it, 79a17c7a).
-            &["\n    repoint(\n"],
+            // The hold's own send, and the repoint's — `finish` decides
+            // every write before it makes one, so `--dry-run` can stop
+            // between the two halves (backlog 1e9aeea9).
+            &[
+                ".context(\"holding the car for its review before repointing it\")",
+                "let (path, patch) = repoint;",
+            ],
+        );
+        order(
+            include_str!("rerail.rs"),
+            "async fn finish(",
+            ".context(\"holding the car for its review before repointing it\")",
+            &["let (path, patch) = repoint;"],
         );
         order(
             include_str!("park.rs"),

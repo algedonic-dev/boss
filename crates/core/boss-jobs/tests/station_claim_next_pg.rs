@@ -229,6 +229,7 @@ async fn fixture_with_ingress_time() -> (
             role: "worker".into(),
             description: "authenticated integration fixture".into(),
             signs_for: None,
+            access_tier: None,
         }],
         &owner_stamp,
     )

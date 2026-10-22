@@ -386,6 +386,35 @@ class ActivationFollowsMain(unittest.TestCase):
             self.assertIn(b"inert", result.stdout)
             self.assertFalse(enabled.is_symlink() or enabled.exists())
 
+    def test_an_explicit_activation_refuses_without_a_passing_preflight_receipt(self):
+        # Backlog b50b8953: two flips on 2026-10-19 each failed first at a
+        # step a rehearsal would have read. The operator's activation now
+        # reads the receipt `dev-control preflight` wrote, before anything.
+        preflight = module("preflight-control")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, enabled = self.store(root)
+            cli = root / "cli"
+            (cli / ("a" * 40)).mkdir(parents=True)
+            (cli / ("a" * 40) / "dev-control.tar").write_bytes(self.bundle(root, "a" * 40).read_bytes())
+            config = root / "config.json"
+            config.write_text(json.dumps(self.config))
+            argv = [sys.executable, "-I", str(Path(__file__).with_name("activate-control.py")), "a" * 40,
+                    "--cli-store", str(cli), "--store", str(store), "--config", str(config), "--main", "a" * 40]
+            checks = [{"check": n, "passed": n != "rehearsal-check-after-commit", "detail": "binding is stale"} for n in preflight.REQUIRED]
+            for receipt, named in ((None, b"dev-control preflight " + b"a" * 40),
+                                   ({"commit": "a" * 40, "main": "a" * 40, "checks": checks}, b"rehearsal-check-after-commit"),
+                                   ({"commit": "a" * 40, "main": "b" * 40, "checks": [dict(c, passed=True) for c in checks]}, b"main moved")):
+                if receipt is not None:
+                    preflight.write_receipt(store, receipt)
+                result = subprocess.run(argv, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(named, result.stderr)
+                self.assertFalse(enabled.is_symlink() or enabled.exists(), "a refused activation never writes the selector")
+                self.assertFalse((store / "generations").exists(), "nothing is extracted before the receipt is read")
+            result = subprocess.run(argv[:-2], capture_output=True)
+            self.assertNotEqual(result.returncode, 0, "an explicit activation names the main it was rehearsed at")
+
 
 if __name__ == "__main__":
     unittest.main()

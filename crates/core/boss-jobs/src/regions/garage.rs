@@ -76,7 +76,8 @@ pub(crate) fn recorded_review_wait(
             ));
         }
     };
-    if protocol.status == crate::registry::WorkflowStatus::Draft {
+    // A rejected row was never published either (backlog 50ded63d).
+    if !protocol.status.was_published() {
         return Err("pinned review protocol was not published".into());
     }
     let hours = protocol
@@ -417,6 +418,7 @@ mod tests {
             reason: "independent review".into(),
             kind: crate::yard::CarHoldKind::Operator,
             release: None,
+            auto_release: None,
         });
         let cars = vec![(car, steps)];
         let runs = vec![(run, vec![building])];

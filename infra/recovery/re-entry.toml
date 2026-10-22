@@ -293,13 +293,21 @@ with = { bastion = { file = "infra/estate/estate.toml", key = "node[id=boss-gcp]
 [[road.line]]
 prose = "Give the jump the bastion's own ssh user if it differs from your laptop's; the bastion road says that user is not held by the tree."
 
+# NO CONTAINER LOG (backlog ff957587, review faa40da8 of car 2afb79b4).
+# Every forge-side docker line on this sheet carries --log-driver=none
+# among docker's options: the forge's daemon defaults to json-file, so
+# the -it session below would otherwise be written, keystroke and answer,
+# to /var/lib/docker/containers/<id>/<id>-json.log, and a kubectl answer
+# of the other three with it. The attach stream is not the log driver;
+# the terminal is unchanged. a_kubectl_container_keeps_no_log.rs reads
+# every command = value here and refuses one without it.
 [[road.line]]
 label = "On the forge, open the workspace when both ssh doors are dark"
-command = "sudo docker run --rm -it --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc -n {namespace} exec -it deploy/{deployment} -c {container} -- {attach}"
+command = "sudo docker run --rm --log-driver=none -it --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc -n {namespace} exec -it deploy/{deployment} -c {container} -- {attach}"
 with = { image = { file = "infra/forge/cluster-deploy-runner.sh", pattern = '^K="docker run .* (alpine/k8s:\S+) kubectl ' }, ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, namespace = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = '^kind: Deployment\nmetadata:\n  name: \S+\n  namespace: (\S+)$' }, deployment = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = '^kind: Deployment\nmetadata:\n  name: (\S+)$' }, container = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = '^      containers:\n        - name: (\S+)$' }, attach = { file = "infra/cluster/manifests/boss-dev.yaml", pattern = "cat > (\\S+) <<'LS'$" } }
 
 [[road.line]]
-prose = "The forge has no kubectl of its own and the kubeconfig is root's alone, so the line above runs it under sudo inside the kubectl image the estate already uses."
+prose = "The forge has no kubectl of its own and the kubeconfig is root's alone, so the line above runs it under sudo inside the kubectl image the estate already uses. Keep its --log-driver=none: without it the docker daemon keeps the whole session, typed and printed, in a container log on the forge's disk."
 
 [[road.line]]
 not_tree_held = "the cluster API's virtual address as a key a reader can take. A later car of design 125d405d declares it (question 3)."
@@ -327,7 +335,7 @@ prose = "Roll to a NAMED last-known-good build, read from the stamp above, never
 
 [[road.line]]
 label = "If the break-glass policy refuses a roll it should allow, delete its binding, on the forge (its named rollback, design b08725c2)"
-command = "sudo docker run --rm --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc delete validatingadmissionpolicybinding {binding}"
+command = "sudo docker run --rm --log-driver=none --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc delete validatingadmissionpolicybinding {binding}"
 with = { image = { file = "infra/forge/cluster-deploy-runner.sh", pattern = '^K="docker run .* (alpine/k8s:\S+) kubectl ' }, ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, binding = { file = "infra/cluster/break-glass-deposit.sh", pattern = '^POLICY_BINDING="\$\{BOSS_DEPOSIT_POLICY_BINDING:-([^}]+)\}"$' } }
 
 [[road.line]]
@@ -376,12 +384,12 @@ pattern = '^pub const DEFAULT_MODE_FILE: &str = "([^"]+)";$'
 
 [[road.line]]
 label = "On the forge, the operating instance"
-command = "sudo docker run --rm --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc -n {namespace} patch configmap {configmap} --type merge -p {patch}"
+command = "sudo docker run --rm --log-driver=none --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc -n {namespace} patch configmap {configmap} --type merge -p {patch}"
 with = { image = { file = "infra/forge/cluster-deploy-runner.sh", pattern = '^K="docker run .* (alpine/k8s:\S+) kubectl ' }, ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, namespace = { file = "infra/cluster/instances.toml", key = "prod.namespace" }, configmap = { file = "infra/cluster/manifests/boss.yaml", pattern = '^#   kubectl -n \S+ patch configmap (\S+) --type merge -p \S+$' }, patch = { file = "infra/cluster/manifests/boss.yaml", pattern = '^#   kubectl -n \S+ patch configmap \S+ --type merge -p (\S+)$' } }
 
 [[road.line]]
 label = "On the forge, the playground"
-command = "sudo docker run --rm --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc -n {namespace} patch configmap {configmap} --type merge -p {patch}"
+command = "sudo docker run --rm --log-driver=none --network host -v {ops}/kubeconfig:/kc:ro {image} kubectl --kubeconfig=/kc -n {namespace} patch configmap {configmap} --type merge -p {patch}"
 with = { image = { file = "infra/forge/cluster-deploy-runner.sh", pattern = '^K="docker run .* (alpine/k8s:\S+) kubectl ' }, ops = { file = "infra/estate/install-cluster-operator.sh", pattern = '^BOSS_OPS_DIR="\$\{BOSS_OPS_DIR:-([^}]+)\}"$' }, namespace = { file = "infra/cluster/instances.toml", key = "playground.namespace" }, configmap = { file = "infra/cluster/manifests/boss.yaml", pattern = '^#   kubectl -n \S+ patch configmap (\S+) --type merge -p \S+$' }, patch = { file = "infra/cluster/manifests/boss.yaml", pattern = '^#   kubectl -n \S+ patch configmap \S+ --type merge -p (\S+)$' } }
 
 [[road.line]]

@@ -260,6 +260,38 @@ if [ -z "${BOSS_JOBS_URL:-}" ]; then
     exit 78   # EX_CONFIG — a configuration fault, not a run-time one.
 fi
 BASE="${BOSS_JOBS_URL}"
+
+# WHO ASKED FOR THIS RUN (backlog e4d51e12). The packet's trigger was
+# always the protocol's first — the timer — whoever started the unit: a
+# converge converge-on-merge asked for, 36 s after the merge, read
+# `systemd-timer` beside the safety net's no-op ticks, and a triage went
+# looking for a 10-minute delay that was not there. A unit started for
+# ops-requests names the inbox they were noted in (BOSS_WRAP_REQUESTS;
+# converge-now.sh writes it BEFORE it starts the unit, and the run takes
+# it after this script), and when it holds a request id the packet
+# names them as `ops_requests` and its trigger as `ops-request` — the
+# protocol's alternative trigger, which admission then fires instead of
+# the timer. Only a well-formed job id is a request; the file is only
+# read, never taken. A run systemd says a TIMER started (TRIGGER_UNIT,
+# set by systemd for a timer-activated unit) stays a timer run: the
+# request it finds arrived while an earlier run was active, and this run
+# answers it but was not started by it. Nothing here can stop the chore:
+# an unreadable inbox is a timer run.
+OPS_REQUESTS="[]" TRIGGER=""
+if [ -n "${BOSS_WRAP_REQUESTS:-}" ] && [ -r "$BOSS_WRAP_REQUESTS" ]; then
+    OPS_REQUESTS=$(jq -R -s -c '[split("\n")[]
+        | select(test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))]
+        | unique | .[:20]' "$BOSS_WRAP_REQUESTS" 2>/dev/null) || OPS_REQUESTS="[]"
+    [ -n "$OPS_REQUESTS" ] || OPS_REQUESTS="[]"
+fi
+if [ "$OPS_REQUESTS" != "[]" ]; then
+    case "${TRIGGER_UNIT:-}" in
+        *.timer) echo "boss-maintenance-wrap: $TRIGGER_UNIT started this run; it answers the ops-request(s) $OPS_REQUESTS left for it" ;;
+        *) TRIGGER="ops-request"
+           echo "boss-maintenance-wrap: this run was asked for by ops-request(s) $OPS_REQUESTS" ;;
+    esac
+fi
+
 BOSS_USER='{"id":"automation:maintenance-timer","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
 
 # Transport-retry curl (25e518c0): a deploy roll takes the API away
@@ -397,7 +429,8 @@ build_packet() {  # $1 = carry | hold, $2 = why the rows are held back
     jq -nR --arg kind "$KIND" --arg host "$HOST" --arg title "$LABEL — $(date +%F)" \
         --arg mode "$1" --arg because "${2:-}" --arg unmovable "$unmovable" \
         --argjson disk "$dropped_on_disk" --argjson unreadable "$unreadable" \
-        --argjson cap "$UNRECORDED_CAP" '
+        --argjson cap "$UNRECORDED_CAP" \
+        --argjson requests "$OPS_REQUESTS" --arg trigger "$TRIGGER" '
         # A line that is not a JSON object, is too long to be a row the
         # wrap wrote, or holds a NUL (a byte or \u0000) rides as its raw
         # text, capped at 500 characters with NULs removed.
@@ -424,6 +457,8 @@ build_packet() {  # $1 = carry | hold, $2 = why the rows are held back
             status: "open",
             metadata: ({chore: $kind}
                 + (if $host == "" then {} else {host: $host} end)
+                + (if ($requests | length) == 0 then {} else {ops_requests: $requests} end)
+                + (if $trigger == "" then {} else {trigger_name: $trigger} end)
                 + if $mode == "hold" then {unrecorded_runs_held_back: {rows: $n, because: $because[:500]}}
                   elif $n == 0 then {}
                   else {unrecorded_runs: $carried}

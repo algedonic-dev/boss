@@ -29,12 +29,31 @@ fn source_keys() -> Vec<String> {
     .collect()
 }
 
-pub(super) fn canonical_actor(http: &Doors<'_>, packet: &str) -> Result<String> {
+pub(super) async fn canonical_actor(http: &Doors<'_>, packet: &str) -> Result<String> {
     let actor = identity::apply(identity::signature_for(
         &reqwest::Method::POST,
         &format!("/api/jobs/{packet}/metadata/conditional"),
         http.caller.clone(),
     ))?;
+    let actor = if actor.contains('@') {
+        // The write middleware resolves logins through this same registry.
+        // An asserted email is not the actor its original receipt records.
+        let registry = api(http, reqwest::Method::GET, "/api/agents", None)
+            .await?
+            .context("canonical actor registry is unavailable")?;
+        let total = registry
+            .get("total")
+            .and_then(Value::as_u64)
+            .context("canonical actor registry lacks its full total")?;
+        let agents = rows(Some(registry))?;
+        if agents.len() as u64 != total {
+            bail!("canonical actor registry is incomplete");
+        }
+        crate::dispatch::resolve_agent(&agents, &actor)
+            .context("canonical actor is ambiguous or absent from the registry")?
+    } else {
+        actor
+    };
     Ok(match boss_policy_client::types::automation_slug(&actor) {
         Some(slug) => boss_core::actor::ActorId::Automation(slug.into()).to_string(),
         None => actor.parse::<boss_core::actor::ActorId>()?.to_string(),
@@ -63,6 +82,7 @@ pub(super) async fn submit_on(
     {
         bail!("prior native intent/attempt/settlement prevents a new durable submission");
     }
+    let actor = canonical_actor(http, &intent.packet).await?;
     let mut patch = overrides
         .as_object()
         .context("submission source patch is not an object")?
@@ -158,7 +178,7 @@ pub(super) async fn submit_on(
         if let Some(claim) = &original
             && !source_claim::same_actor(
                 http,
-                &canonical_actor(http, &intent.packet)?,
+                &actor,
                 claim["holder"]
                     .as_str()
                     .context("original source holder is unreadable")?,
@@ -190,7 +210,7 @@ pub(super) async fn submit_on(
     let submission = Submission {
         contract_version: 1,
         command,
-        submitted_by: canonical_actor(http, &intent.packet)?,
+        submitted_by: actor,
         supervisor: identity::CONDUCTOR.into(),
         intent: intent.clone(),
         source,
@@ -264,7 +284,7 @@ pub(super) async fn require_owner_on(
     }
     model::source_metadata(metadata).map_err(anyhow::Error::msg)?;
     let (submission, _) = original_on(http, packet).await?;
-    if canonical_actor(http, packet)? != submission.supervisor {
+    if canonical_actor(http, packet).await? != submission.supervisor {
         bail!("only the declared resident supervisor may originate or consume this native launch");
     }
     Ok(Some(submission))
@@ -276,7 +296,7 @@ pub(super) async fn launch_on(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<String> {
     let (submission, _receipt) = original_on(http, packet).await?;
-    if canonical_actor(http, packet)? != submission.supervisor {
+    if canonical_actor(http, packet).await? != submission.supervisor {
         bail!("only the declared resident supervisor may originate this launch");
     }
     let row = read_on(http, packet).await?;

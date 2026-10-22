@@ -65,6 +65,19 @@
 //! so an override points both at the same place); a symlink; a name
 //! not `target-*`. Each refusal is recorded, not swallowed.
 //!
+//! A REVIEWER RUN (backlog ff1d274f). A reviewer ships no car, so it
+//! never gates and never goes green: its report printed "kept … for the
+//! rescue", which was never true of it, and its target waited out the
+//! hourly pass's 12 h stale window — 179 `target-review-*` entries on
+//! 2026-10-18, about twelve finished dirs (~37 GB) on 2026-10-20. Its
+//! tree is named for the run by reviewer rule 2 (`review-<first 8 of
+//! your run id>`), so the target is `target-review-<first 8>` with no
+//! stamp or worktree list needed, and the run's end is `building`
+//! closing — delivered, refused or died — which rule 6 has it do before
+//! its report. So the report frees it then, under every guard below; a
+//! review still open keeps it and says so, and a run that died
+//! unreported is the stale pass's.
+//!
 //! WHAT IT KEEPS: A TARGET A BUILD HOLDS (backlog 94cd0c23, 0c18deed).
 //! A green is one car's, not the worktree's: run f24d896d's car C went
 //! green and freed 25.4 GiB while car A was building in the same tree;
@@ -109,6 +122,13 @@ const TARGET_PREFIX: &str = "target-";
 /// handback that came after it.
 pub(crate) const GREEN_BY: &str = "boss gate --wait, on its green";
 pub(crate) const REPORT_BY: &str = "boss dispatch --report";
+/// The profile whose runs review a car and ship none (backlog ff1d274f).
+const REVIEWER_PROFILE: &str = "reviewer";
+/// The tree a reviewer makes is named for its run, as reviewer rule 2
+/// prescribes — `review-<first 8 of your run id>` — so wt-cargo builds
+/// it into `target-review-<first 8>`. Pinned to the rules document by
+/// `the_review_target_is_the_one_wt_cargo_builds_for_the_prescribed_tree`.
+const REVIEW_TREE_PREFIX: &str = "review-";
 
 /// Where this box keeps worktree targets, and the one it must never
 /// touch, with the worktree list read at the CLI boundary.
@@ -174,6 +194,17 @@ fn builder_target(root: &Path, worktree: &Path) -> Option<PathBuf> {
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with(BUILDER_PREFIX));
     target_dir(root, worktree).filter(|_| is_builder)
+}
+
+/// A reviewer run's tree, by the name its rules give it — or `None`
+/// for any other run, or an id with no eight-character hex prefix.
+fn review_tree(run: &Value) -> Option<PathBuf> {
+    if run.pointer("/metadata/profile").and_then(Value::as_str) != Some(REVIEWER_PROFILE) {
+        return None;
+    }
+    let short: String = run.get("id")?.as_str()?.chars().take(8).collect();
+    (short.len() == 8 && short.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| PathBuf::from(format!("{REVIEW_TREE_PREFIX}{short}")))
 }
 
 fn not_a_builder(worktree: &Path, branch: &str) -> String {
@@ -250,12 +281,63 @@ pub(crate) enum Plan {
         branch: String,
         worktree: PathBuf,
         target: PathBuf,
+        /// Why the run is finished with it, for the line.
+        because: String,
     },
     Keep(String),
 }
 
+/// How the run's `building` closed — its `result` — or `None` while it
+/// is open.
+fn building_closed(run: &Value) -> Option<String> {
+    crate::envelope::steps(run)
+        .into_iter()
+        .find(|s| {
+            s.get("spec_slug").and_then(Value::as_str) == Some(crate::dispatch::BUILDING_SLUG)
+                && s.get("status").and_then(Value::as_str) == Some("completed")
+        })
+        .map(|s| {
+            s.pointer("/metadata/result")
+                .and_then(Value::as_str)
+                .unwrap_or("with no result")
+                .to_string()
+        })
+}
+
+/// A REVIEWER RUN NEVER GATES (backlog ff1d274f), so the green below
+/// never comes for it and its tree's target used to wait out the
+/// hourly pass's stale window — ~37 GB of finished ones on 2026-10-20 —
+/// while its report said a rescue needed it. Its `building` closing
+/// (delivered, refused, died) is the end of the review: nothing builds
+/// in that tree again, so the target goes. Before that it is reviewing.
+fn review_plan(run: &Value, tree: PathBuf, root: &Path) -> Plan {
+    let Some(result) = building_closed(run) else {
+        return Plan::Keep(
+            "a reviewer run's target is freed when its `building` closes, and this run's is \
+             still open — the review may still build in its tree; the next --report or the \
+             hourly stale-target pass frees it once idle"
+                .into(),
+        );
+    };
+    match target_dir(root, &tree) {
+        Some(target) => Plan::Free {
+            branch: crate::dispatch::run_branch(run)
+                .unwrap_or_else(|| "(none: a review ships no branch)".into()),
+            worktree: tree,
+            target,
+            because: format!(
+                "its review closed {result} — a review never gates, so no rescue needs it"
+            ),
+        },
+        None => Plan::Keep(format!("{} names no target", tree.display())),
+    }
+}
+
 /// The decision, from the run and the worktree list alone.
 pub(crate) fn plan(run: &Value, porcelain: Option<&str>, root: &Path) -> Plan {
+    if let Some(tree) = review_tree(run) {
+        return review_plan(run, tree, root);
+    }
     if !is_green(run) {
         return Plan::Keep(
             "the run is not green (`building` has not closed `gated`), so its target stays \
@@ -296,6 +378,7 @@ pub(crate) fn plan(run: &Value, porcelain: Option<&str>, root: &Path) -> Plan {
     let branch = branch.unwrap_or_else(|| "(no branch on the green)".into());
     match builder_target(root, &worktree) {
         Some(target) => Plan::Free {
+            because: format!("its gate green on {branch}"),
             branch,
             worktree,
             target,
@@ -513,6 +596,7 @@ pub(crate) fn settle(
             branch,
             worktree,
             target,
+            because,
         } => {
             let (line, rec) = free_and_record(
                 &branch,
@@ -522,6 +606,7 @@ pub(crate) fn settle(
                 &scratch.seed,
                 &at,
                 REPORT_BY,
+                &because,
             );
             (line, Some(rec))
         }
@@ -540,7 +625,16 @@ pub(crate) fn settle_at_green(
 ) -> (String, Value) {
     let at = stamp(now);
     match builder_target(root, worktree) {
-        Some(target) => free_and_record(branch, worktree, &target, root, seed, &at, GREEN_BY),
+        Some(target) => free_and_record(
+            branch,
+            worktree,
+            &target,
+            root,
+            seed,
+            &at,
+            GREEN_BY,
+            &format!("its gate green on {branch}"),
+        ),
         None => {
             let why = not_a_builder(worktree, branch);
             (
@@ -551,7 +645,9 @@ pub(crate) fn settle_at_green(
     }
 }
 
-/// Free one mapped target and say what happened, both ways.
+/// Free one mapped target and say what happened, both ways; `because`
+/// is why the run is finished with it.
+#[allow(clippy::too_many_arguments)]
 fn free_and_record(
     branch: &str,
     worktree: &Path,
@@ -560,6 +656,7 @@ fn free_and_record(
     seed: &Path,
     at: &str,
     by: &str,
+    because: &str,
 ) -> (String, Value) {
     let path = target.display().to_string();
     let base = json!({
@@ -579,8 +676,8 @@ fn free_and_record(
     match free(target, root, seed) {
         Freed::Removed { bytes, removed } => (
             format!(
-                "freed its scratch target {path} — {bytes} bytes ({}) as du counts them, its \
-                 gate green on {branch}",
+                "freed its scratch target {path} — {bytes} bytes ({}) as du counts them, \
+                 {because}",
                 gib(bytes)
             ),
             with(json!({
@@ -696,6 +793,7 @@ mod tests {
                 branch: "fix/x".into(),
                 worktree: PathBuf::from(format!("{wt}-mine")),
                 target: PathBuf::from("/scratch/target-agent-a1-mine"),
+                because: "its gate green on fix/x".into(),
             }
         );
 
@@ -828,6 +926,7 @@ mod tests {
                 branch: "fix/x".into(),
                 worktree: PathBuf::from("/work/boss/.claude/worktrees/agent-a9"),
                 target: PathBuf::from("/scratch/target-agent-a9"),
+                because: "its gate green on fix/x".into(),
             },
             "the stamp wins, no worktree list needed"
         );
@@ -1008,6 +1107,124 @@ mod tests {
             "{rec}"
         );
         assert!(seed.join("CACHEDIR.TAG").exists());
+    }
+
+    /// A reviewer run as `boss dispatch` files it: the profile on the
+    /// packet, and `building` in the state given.
+    fn review_run(status: &str, result: Option<&str>) -> Value {
+        let metadata = result.map_or_else(|| json!({}), |r| json!({ "result": r }));
+        json!({
+            "id": "fae63341-0000-4000-8000-000000000000",
+            "metadata": { "profile": "reviewer" },
+            "steps": [
+                { "spec_slug": "building", "status": status, "metadata": metadata },
+            ],
+        })
+    }
+
+    /// THE REVIEWER'S TARGET (backlog ff1d274f). A reviewer never
+    /// gates, so the green that frees a builder's target never comes
+    /// for it: 179 `target-review-*` entries stood on /scratch on
+    /// 2026-10-18 and about twelve finished ones (~37 GB) on 2026-10-20,
+    /// each waiting out the 12 h stale window while its report said it
+    /// was "kept for the rescue". A review run whose `building` has
+    /// closed — delivered or refused alike — is finished with its tree,
+    /// so its report frees `target-review-<first 8 of its id>`, and the
+    /// line says why without naming a gate.
+    #[test]
+    fn a_closed_review_runs_target_is_freed_at_its_report() {
+        let now = "2026-10-20T08:00:00Z".parse().unwrap();
+        for result in ["delivered", "refused"] {
+            let root = boss_testing::scratch_dir(&format!("scratch-target-review-{result}"));
+            let seed = root.join("target");
+            filled(&seed);
+            let target = root.join("target-review-fae63341");
+            filled(&target);
+            filled(&root.join("target-review-0a0b0c0d"));
+            let scratch = Scratch {
+                root: root.clone(),
+                seed: seed.clone(),
+                porcelain: None,
+            };
+            let (line, rec) = settle(&review_run("completed", Some(result)), &scratch, now);
+            let rec = rec.expect("a free is recorded");
+            assert!(!target.exists(), "{result}: {line}");
+            assert!(seed.join("CACHEDIR.TAG").exists(), "the seed stands");
+            assert!(
+                root.join("target-review-0a0b0c0d/CACHEDIR.TAG").exists(),
+                "another review's target stands"
+            );
+            assert!(
+                rec["freed_bytes"].as_u64().unwrap_or(0) >= 64 * 1024,
+                "{rec}"
+            );
+            assert_eq!(rec["path"], target.display().to_string());
+            assert_eq!(rec["by"], REPORT_BY);
+            assert!(line.contains("freed"), "{line}");
+            assert!(line.contains(result), "names how the run closed: {line}");
+            assert!(!line.contains("gate green"), "a review never gated: {line}");
+        }
+    }
+
+    /// A review still running keeps its tree's target, and its report
+    /// does not say a red gate's rescue needs it — a reviewer has no
+    /// gate, so that reason was never true of it (session B, 2026-10-20).
+    #[test]
+    fn an_open_review_run_keeps_its_target_without_naming_a_rescue() {
+        let root = boss_testing::scratch_dir("scratch-target-review-open");
+        let seed = root.join("target");
+        filled(&seed);
+        let target = root.join("target-review-fae63341");
+        filled(&target);
+        let scratch = Scratch {
+            root: root.clone(),
+            seed,
+            porcelain: None,
+        };
+        let now = "2026-10-20T08:00:00Z".parse().unwrap();
+        let (line, rec) = settle(&review_run("active", None), &scratch, now);
+        assert!(target.join("CACHEDIR.TAG").exists(), "{line}");
+        let kept = rec.expect("a keep is recorded")["kept"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(kept.contains("building"), "{kept}");
+        assert!(!kept.contains("rescue"), "{kept}");
+        assert!(!kept.contains("gate"), "{kept}");
+    }
+
+    /// The tree's name is the reviewer rules' and the target's is
+    /// wt-cargo's — two more spellings of facts that live elsewhere,
+    /// held equal to them here (CLAUDE.md §9a).
+    #[test]
+    fn the_review_target_is_the_one_wt_cargo_builds_for_the_prescribed_tree() {
+        let rules = std::fs::read_to_string(
+            boss_testing::repo_root().join("infra/platform/documents/reviewer-rules.md"),
+        )
+        .expect("the reviewer rules");
+        assert!(
+            rules.contains(&format!(
+                "<that directory>/{REVIEW_TREE_PREFIX}<first 8 of your run id>"
+            )),
+            "reviewer rule 2 names the tree `{REVIEW_TREE_PREFIX}<first 8 of your run id>`"
+        );
+        let helper = boss_testing::repo_root().join("infra/dev/wt-target-dir.sh");
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(r#". "$1" && wt_target_dir /scratch /session/scratchpad/run-fae63341/review-fae63341"#)
+            .arg("pin")
+            .arg(&helper)
+            .output()
+            .expect("bash runs");
+        assert!(out.status.success(), "{out:?}");
+        let shell = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let tree = review_tree(&review_run("completed", Some("delivered"))).expect("a review");
+        let ours = target_dir(Path::new("/scratch"), &tree).expect("a basename");
+        assert_eq!(ours.display().to_string(), shell);
+        // Any other profile has no review tree.
+        let mut builder = review_run("completed", Some("delivered"));
+        builder["metadata"]["profile"] = json!("builder");
+        assert_eq!(review_tree(&builder), None);
     }
 
     /// End to end over a temp root: the line names the bytes, the

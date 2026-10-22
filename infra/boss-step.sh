@@ -190,6 +190,43 @@ BOSS_USER="{\"id\":\"$ACTOR\",\"role\":\"platform-admin\",\"access_tier\":\"oper
 API_CURL="$(dirname "$0")/boss-api-curl.sh"
 [ -x "$API_CURL" ] || API_CURL=boss-api-curl.sh
 
+# EVERY REQUEST HAS A DEADLINE (backlog 81bc8c90). The helper's
+# BOSS_API_RETRY_DEADLINE bounds the re-sends of a REFUSED connect; it
+# cannot bound one call that connects and is never answered, and until
+# 2026-10-22 none of the three below carried --max-time: against a
+# listener that accepts and never answers the call never returned
+# (measured by review run ffb8efa0, killed at 90 s). Harmless in
+# ExecStopPost; inside an ExecStart it holds the unit to its
+# TimeoutStartSec — 90 minutes on the converge — and a oneshot then
+# blocks the next run, the one that would ship the fix. The wrap's twin
+# is BOSS_WRAP_MAX_TIME (re-review of 324597eb), and this matches its
+# 30 s. The connect is bounded inside it: a black-holed SoR answers 28
+# in at most 10 s, which the helper does not re-send. curl's 28 on
+# either is named below and is never a success. Pinned by
+# a_step_close_has_a_deadline.rs.
+MAX_TIME="${BOSS_STEP_MAX_TIME:-30}"
+# curl reads 0 as NO deadline, so zero (in any spelling) is refused too.
+if [ -z "$MAX_TIME" ] || [ -n "${MAX_TIME//[0-9]/}" ] || [ -z "${MAX_TIME//0/}" ]; then
+    echo "boss-step: BOSS_STEP_MAX_TIME='$MAX_TIME' is not a positive whole number of seconds — refusing rather than send a request with no deadline; '$STEP_TITLE' not recorded" >&2
+    exit 2
+fi
+MAX_TIME=$((10#$MAX_TIME))
+CONNECT_TIME=10
+[ "$MAX_TIME" -ge "$CONNECT_TIME" ] || CONNECT_TIME=$MAX_TIME
+# It stamps the machine token too, so every call carries both in one
+# place (the header file is made below, before the first call).
+api() {
+    "$API_CURL" --connect-timeout "$CONNECT_TIME" --max-time "$MAX_TIME" \
+        ${MT_HDR:+-H "$MT_HDR"} "$@"
+}
+# The phrase for a failed call: a timeout says so, by its deadline.
+unanswered() {
+    case "$1" in
+        28) echo "not answered within ${MAX_TIME}s (curl exit 28; BOSS_STEP_MAX_TIME)" ;;
+        *) echo "curl exit $1" ;;
+    esac
+}
+
 # Set the caller's cleanup before secret-header chains its own onto it.
 metadata_file=""
 trap '[ -z "$metadata_file" ] || rm -f "$metadata_file"' EXIT
@@ -208,10 +245,11 @@ fi
 . "$SECRET_LIB"
 machine_token_header MT_HDR "$BOSS_JOBS_URL"
 
-if ! jobs_json=$("$API_CURL" -fsS -H "x-boss-user: $BOSS_USER" \
-        ${MT_HDR:+-H "$MT_HDR"} \
-        "$BASE/api/jobs?kind=$WORKFLOW&status=open&limit=50&full=true" 2>/dev/null); then
-    echo "boss-step: jobs-api unreachable at $BASE — '$STEP_TITLE' not recorded" >&2
+rc=0
+jobs_json=$(api -fsS -H "x-boss-user: $BOSS_USER" \
+        "$BASE/api/jobs?kind=$WORKFLOW&status=open&limit=50&full=true" 2>/dev/null) || rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "boss-step: jobs-api unreachable at $BASE, $(unanswered "$rc") — '$STEP_TITLE' not recorded" >&2
     exit 1
 fi
 
@@ -332,22 +370,26 @@ step_id=$(printf '%s' "$step" | jq -r '.id')
 url="$BASE/api/jobs/$job_id/steps/$step_id"
 # The keys first: a result required at done is judged at the flip, so a
 # merge that did not land is not followed by one.
-if [ "$keys" != '{}' ] && ! merge_err=$("$API_CURL" -fsS -X PATCH -H "content-type: application/json" \
+rc=0
+if [ "$keys" != '{}' ]; then
+    merge_err=$(api -fsS -X PATCH -H "content-type: application/json" \
         -H "x-boss-user: $BOSS_USER" \
-        ${MT_HDR:+-H "$MT_HDR"} \
-        "${metadata_data[@]}" "$url/metadata" 2>&1 >/dev/null); then
-    echo "boss-step: metadata merge failed — $merge_err" >&2
+        "${metadata_data[@]}" "$url/metadata" 2>&1 >/dev/null) || rc=$?
+fi
+if [ "$rc" -ne 0 ]; then
+    echo "boss-step: metadata merge failed, $(unanswered "$rc") — $merge_err" >&2
     exit 1
 fi
 if [ "$METADATA_ONLY" = 1 ]; then
     echo "boss-step: recorded metadata on $WORKFLOW/$STEP_TITLE on ${job_id:0:8}; status unchanged"
     exit 0
 fi
-if ! put_err=$("$API_CURL" -fsS -X PUT -H "content-type: application/json" \
+rc=0
+put_err=$(api -fsS -X PUT -H "content-type: application/json" \
         -H "x-boss-user: $BOSS_USER" \
-        ${MT_HDR:+-H "$MT_HDR"} \
-        -d '{"status":"completed"}' "$url" 2>&1 >/dev/null); then
-    echo "boss-step: PUT failed — $put_err" >&2
+        -d '{"status":"completed"}' "$url" 2>&1 >/dev/null) || rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "boss-step: PUT failed, $(unanswered "$rc") — $put_err" >&2
     exit 1
 fi
 echo "boss-step: closed $WORKFLOW/$STEP_TITLE on ${job_id:0:8}"

@@ -466,7 +466,33 @@ async fn run_server<R: JobsRepository + 'static>(
     // dispatcher port, overridable the way the people URL is.
     let dispatcher_url =
         std::env::var("BOSS_DISPATCHER_URL").unwrap_or_else(|_| boss_ports::url("dispatcher"));
+    let mut completion_contracts = boss_jobs::completion_contract::Contracts::new();
+    if let Some(workflows) = &kind_registry {
+        let files = Arc::new(
+            boss_jobs::browser_qualification_adapter::HttpObservationFiles::new(
+                std::env::var("BOSS_CONTENT_URL").unwrap_or_else(|_| boss_ports::url("content")),
+            )?,
+        );
+        for (name, accepting) in [
+            ("attended-browser-qualify-v1", false),
+            ("attended-browser-accept-v1", true),
+        ] {
+            completion_contracts.insert(
+                name.into(),
+                Arc::new(
+                    boss_jobs::browser_qualification_adapter::BrowserQualification {
+                        jobs: jobs.clone(),
+                        workflows: workflows.clone(),
+                        agents: agents.clone(),
+                        files: files.clone(),
+                        accepting,
+                    },
+                ) as Arc<dyn boss_jobs::completion_contract::CompletionContract>,
+            );
+        }
+    }
     let state = JobsApiState {
+        completion_contracts,
         job_edges,
         stations,
         jobs,
@@ -493,6 +519,7 @@ async fn run_server<R: JobsRepository + 'static>(
         // every claim is admitted as before.
         dispatcher_firings,
         schema_ledger,
+        schema_read_timeout: boss_jobs::schema_level::READ_TIMEOUT,
         // Presence tickets verify HERE, with the gateway's own key read
         // from the file the gateway signs with (backlog 72fe3640): this
         // door is reachable without the gateway, so a header it did not
@@ -510,6 +537,9 @@ async fn run_server<R: JobsRepository + 'static>(
         // schedule read as the viewer.
         credentials: credentials.clone(),
         sensors: sensors.clone(),
+        map_flows: Arc::new(boss_jobs::reading_cache::ReadingCache::new(
+            boss_jobs::reading_cache::MAP_FLOW_LIFETIME,
+        )),
         dispatcher_schedule: Some(Arc::new(
             boss_jobs::dispatcher_schedule::ReqwestDispatcherSchedule::new(dispatcher_url.clone()),
         )),

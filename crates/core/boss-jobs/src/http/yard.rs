@@ -31,7 +31,7 @@ use crate::yard;
 
 // Gate-runs have a recency read and a separate held read. The car
 // cross-reference below reads every scoped car, including closed ones.
-use yard::{GATE_RUN_WINDOW, HELD_RUN_PAGE, HELD_RUN_PAGES};
+use yard::GATE_RUN_WINDOW;
 /// Keep closed trains from the last two weeks in the "recent" window —
 /// "recently arrived/cancelled", the tail the surface shows beside the
 /// in-flight trains.
@@ -160,12 +160,16 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
         None,
         Some((now - chrono::Duration::days(RECENT_TRAIN_DAYS)).date_naive()),
     );
-    let open_rows = match state
-        .jobs
-        .list_jobs(&in_flight, yard::TRAIN_WINDOW, 0)
+    // "Read whole" is the paged read to the total, not one page of it:
+    // until 5d96c12d this was `list_jobs(&in_flight, TRAIN_WINDOW, 0)`
+    // with the total dropped, so past TRAIN_WINDOW open trains the rest
+    // left `trains` with nothing saying the population was cut (pinned
+    // by `every_open_train_is_on_the_board_past_one_window`). A failed
+    // page still fails the request, as the single read did.
+    let open_rows = match crate::list_every::list_every(state.jobs.as_ref(), &in_flight, MAX_LIMIT)
         .await
     {
-        Ok((rows, _)) => rows,
+        Ok(rows) => rows,
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
     };
     let recent_rows = match state.jobs.list_jobs(&recent, yard::TRAIN_WINDOW, 0).await {
@@ -371,32 +375,27 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
         .await
         .unwrap_or_default();
     let gate_runs_truncated = gate_runs_total > GATE_RUN_WINDOW;
-    let held_runs = {
-        let filter = gate_run(Some("hold"));
-        let mut out = Vec::new();
-        for page in 0..HELD_RUN_PAGES {
-            let Ok((rows, total)) = state
-                .jobs
-                .list_jobs(&filter, HELD_RUN_PAGE, page * HELD_RUN_PAGE)
-                .await
-            else {
-                break;
-            };
-            let read = rows.len() as i64;
-            out.extend(rows);
-            if read < HELD_RUN_PAGE || (page + 1) * HELD_RUN_PAGE >= total {
-                break;
-            }
-            if page + 1 == HELD_RUN_PAGES {
-                tracing::warn!(
-                    total,
-                    read = out.len(),
-                    "yard: held gate-run read hit its page cap — older holds unread"
-                );
-            }
-        }
-        out
-    };
+    // EVERY held run, through the one paged-read door, and a page that
+    // fails fails the yard (backlog 4e918604). This read used to turn at
+    // most five pages of 400 and then warn and go on with what it held:
+    // measured 2026-10-19, 2214 held runs on record, the warning fired
+    // once per map read, and every region, border and the mover judged
+    // held runs from 2000 of them — and a failed page was a `break` that
+    // answered 200 from the rows already read. A read that cannot finish
+    // is not an empty one. Reading all of it costs fewer queries than
+    // the five 400-row pages did (three of 1000 for 2358 holds on
+    // 2026-10-20); the set's growth is the retire door's to bound
+    // (1fb357f4), not a cap's to hide.
+    let held_runs =
+        crate::list_every::list_every(state.jobs.as_ref(), &gate_run(Some("hold")), MAX_LIMIT)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("yard: the held gate-run read could not finish: {e}"),
+                )
+                    .into_response()
+            })?;
     // Resident requests do not expire with a client heartbeat or recency window.
     let open_runs = crate::list_every::list_every(
         state.jobs.as_ref(),

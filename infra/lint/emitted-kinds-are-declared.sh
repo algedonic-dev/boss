@@ -36,6 +36,26 @@
 # so far was a literal or a const, which is why the literal cover is
 # the one worth gating.
 #
+# KIND-FORWARDING HELPERS ARE DERIVED, NOT LISTED (backlog 7d05ded2,
+# 2026-10-19). Most emits go through a helper that takes the kind as
+# its first argument and hands it to `Event::new` —
+# boss-jobs' `events::workflow_registry_event(kind, actor, spec)` and
+# its station / step-plugin / cadence twins. The lint used to know only
+# three call NAMES, so the 14 registry.rs calls of that helper were
+# invisible and `jobs.kind.draft_discarded` was emitted undeclared from
+# ebd7bb70 on while this lint printed `ok`. A fourth name would be
+# walked around by the fifth helper, so the helpers are read off the
+# source instead: a function whose FIRST parameter is `kind: &str` and
+# whose body passes that `kind` as `Event::new`'s kind argument — or on
+# to another such function, to a fixed point — is a forwarder, and a
+# call to one emits its first argument. Pinned on fixture trees by
+# crates/core/boss-testing/tests/a_kind_sent_through_a_helper_is_still_emitted.rs.
+# Two limits of the derivation, each of which MISSES a helper (never a
+# false red), named here rather than discovered (review 738b2811): the
+# parameter must be spelled `kind` (an `event_kind: &str` is not read),
+# and the body is brace-matched without reading literals, so a `'}'` or
+# `"}"` before the Event::new call ends the body early.
+#
 # Enforcement shape mirrors the other infra/lint/*.sh checks: derive
 # both sets from their source of truth, exit 1 naming every offender.
 set -euo pipefail
@@ -108,22 +128,54 @@ kind_const_map() {
 }
 
 emitted() {
-    local mapfile
+    local mapfile fwdfile
     mapfile="$(mktemp)"
+    fwdfile="$(mktemp)"
     # Cleaned up at the end of this function, NOT by a RETURN trap: a
     # RETURN trap set here fires again when a later `.`-sourced file
     # finishes, with $mapfile out of scope and `set -u` aborting the
     # lint (measured in a-boot-check, 2026-09-18).
     kind_const_map > "$mapfile"
+    # Phase 1b: the kind-forwarding helpers, one name per line. The
+    # scan prints per-file facts (`D <fn>` passes its `kind` to
+    # Event::new, `C <fn> <callee>` passes it to <callee>); the fixed
+    # point is taken here, over EVERY file, because xargs may split the
+    # file list across several awk processes and a helper is usually
+    # called from a file other than the one defining it.
+    scan_crates forwarders /dev/null /dev/null \
+        | awk '
+            $1 == "D" { F[$2] = 1 }
+            $1 == "C" { E[++n] = $2 " " $3 }
+            END {
+                do {
+                    changed = 0
+                    for (i = 1; i <= n; i++) {
+                        split(E[i], p, " ")
+                        if (!(p[1] in F) && (p[2] in F)) { F[p[1]] = 1; changed = 1 }
+                    }
+                } while (changed)
+                for (k in F) print k
+            }' > "$fwdfile"
     # Phase 2: scan every non-test crate file, resolving const names
     # (`NAME<TAB>value`, read from mapfile) against the global map.
+    scan_crates emits "$mapfile" "$fwdfile" | sort -u
+    rm -f "$mapfile" "$fwdfile"
+}
+
+# scan_crates <mode> <mapfile> <fwdfile> — one awk program over every
+# non-test crate file, in one of two modes: `forwarders` prints the
+# per-file helper facts above, `emits` prints every kind emitted.
+scan_crates() {
     # shellcheck disable=SC2016
     find crates -name '*.rs' -not -path '*/tests/*' -print0 \
-        | xargs -0 awk -v mapfile="$mapfile" '
+        | xargs -0 awk -v mode="$1" -v mapfile="$2" -v fwdfile="$3" '
         BEGIN {
             while ((getline line < mapfile) > 0) {
                 split(line, a, "\t")
                 if (a[1] != "") CONST[a[1]] = a[2]
+            }
+            while ((getline line < fwdfile) > 0) {
+                if (line != "") FWD[line] = 1
             }
         }
         # --- accumulate one file at a time ---
@@ -131,10 +183,24 @@ emitted() {
         { buf = buf $0 "\n" }
         END { process() }
 
-        function process(   src) {
+        function process(   src, n) {
             src = strip_cfg_test(buf)
             # Flatten whitespace so multi-line calls match as one span.
             gsub(/[[:space:]]+/, " ", src)
+            if (mode == "forwarders") { derive(src); buf = ""; return }
+            # A call to a derived kind-forwarding helper emits its first
+            # argument. The leading class keeps `x_registry_event(` from
+            # matching a helper named `registry_event`; a path prefix
+            # (`crate::events::`) ends in `:`, which it accepts. The kind
+            # may be the ONLY argument — `audit(KIND)`, which rustfmt keeps
+            # on one line with no trailing comma — so the span ends at a
+            # comma OR the closing paren: derive() accepts a `kind: &str`
+            # that is the sole parameter, and a forwarder derived but never
+            # read here is the invisible helper this pass exists to close
+            # (review 738b2811, 2026-10-19).
+            for (n in FWD) {
+                scan(src, "(^|[^A-Za-z0-9_])" n " *\\( *(\"[^\"]+\"|[A-Za-z0-9_:]+) *[,)]")
+            }
             # NOTE: the patterns are passed as STRINGS, not /regex/
             # literals — a regex literal handed to a function is
             # evaluated as `($0 ~ /re/)` (a number), which silently
@@ -189,17 +255,17 @@ emitted() {
             return ""
         }
 
-        # The captured span always ends `… <kind-arg> ,` — the kind is
-        # the LAST argument before the trailing comma, whether the call
-        # is `.event(KIND,` (kind first) or `record(&mut tx, stamp, KIND,`
-        # (kind third). So drop the trailing comma and read the final
-        # token, not the first.
+        # The captured span always ends `… <kind-arg> ,` (or `… <kind-arg> )`
+        # for a one-argument forwarder) — the kind is the LAST argument
+        # before that delimiter, whether the call is `.event(KIND,` (kind
+        # first) or `record(&mut tx, stamp, KIND,` (kind third). So drop
+        # the delimiter and read the final token, not the first.
         function scan(s, re,   rest, a, kind) {
             rest = s
             while (match(rest, re)) {
                 a = substr(rest, RSTART, RLENGTH)
                 rest = substr(rest, RSTART + RLENGTH)
-                sub(/ *,[[:space:]]*$/, "", a)          # drop trailing comma
+                sub(/ *[,)][[:space:]]*$/, "", a)       # drop trailing , or )
                 if (match(a, /"[^"]+"$/)) {              # last arg is a literal
                     kind = resolve(substr(a, RSTART, RLENGTH))
                 } else if (match(a, /[A-Za-z0-9_:]+$/)) { # last arg is an ident/path
@@ -224,8 +290,44 @@ emitted() {
                 }
             }
         }
-    ' | sort -u
-    rm -f "$mapfile"
+
+        # A function whose FIRST parameter is `kind: &str` (any
+        # lifetime), with a body. Prints `D <name>` when the body hands
+        # `kind` to Event::new as its kind, and `C <name> <callee>` for
+        # every call in the body whose first argument is `kind`. A
+        # `self`-first method is not one: `.event(KIND,` is read above.
+        function derive(s,   rest, name, after, semi, open, depth, j, ch, body, b, c) {
+            rest = s
+            while (match(rest, "fn [a-z_][a-z0-9_]* *(<[^>(]*>)? *\\( *kind *: *& *([^ ,)]+ )?str *[,)]")) {
+                name = substr(rest, RSTART + 3, RLENGTH - 3)
+                sub(/[^a-z0-9_].*$/, "", name)
+                after = substr(rest, RSTART + RLENGTH)
+                rest = after
+                open = index(after, "{")
+                semi = index(after, ";")
+                if (open == 0 || (semi > 0 && semi < open)) continue   # no body
+                depth = 0
+                for (j = open; j <= length(after); j++) {
+                    ch = substr(after, j, 1)
+                    if (ch == "{") depth++
+                    else if (ch == "}") { depth--; if (depth == 0) break }
+                }
+                body = substr(after, open, j - open + 1)
+                # The source argument may itself be one flat call
+                # (`SOURCE.to_string()`, `self.source()`) and the kind may
+                # be converted on the way in (`kind.to_string()`): both
+                # were helpers this missed (review 738b2811, finding 2).
+                if (match(body, "Event::new\\( *[^,()]+(\\([^(),]*\\))? *, *kind(\\.(to_string|to_owned|into)\\(\\))? *[,)]")) print "D " name
+                b = body
+                while (match(b, "[A-Za-z_][A-Za-z0-9_]* *\\( *kind *[,)]")) {
+                    c = substr(b, RSTART, RLENGTH)
+                    b = substr(b, RSTART + RLENGTH)
+                    sub(/[^A-Za-z0-9_].*$/, "", c)
+                    print "C " name " " c
+                }
+            }
+        }
+    '
 }
 
 DECLARED="$(declared)"

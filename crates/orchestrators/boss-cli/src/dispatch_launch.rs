@@ -1988,13 +1988,7 @@ esac
                 receipt.get("launch_model_unrecorded").is_none(),
                 "{receipt}"
             );
-            let calls = log.calls.lock().unwrap();
-            let at = |want: &dyn Fn(&(String, String, Value)) -> bool| {
-                calls.iter().position(want).expect("the call was made")
-            };
-            let recorded = at(&|(m, p, _)| m == "POST" && p.ends_with("/metadata/records"));
-            let spawned = at(&|(m, _, b)| m == "PATCH" && b.get(PROCESS_KEY).is_some());
-            assert!(recorded < spawned, "recorded before the process existed");
+            the_model_was_recorded_before_the_process_existed(&log);
         }
 
         // (a) THE PROCESS: the argv `codex exec --help` spells, in the
@@ -3080,7 +3074,7 @@ esac
     }
 
     /// What a system of record in front of the launcher does with the
-    /// SECOND metadata write — the one that carries the pid, made right
+    /// pid receipt — the metadata write that carries the pid, made right
     /// after the spawn — once it has held it for a while.
     #[derive(Clone, Copy, PartialEq)]
     enum Held {
@@ -3093,36 +3087,74 @@ esac
         DeliveredLate,
     }
 
-    /// A system of record in front of `base` whose SECOND metadata write
-    /// is held for `hold` and then `held`. Every other request passes
-    /// through untouched.
+    /// Whether `seen` — the bytes a connection has sent so far — is the
+    /// whole of the pid receipt: a metadata PATCH on the run whose body
+    /// carries [`PROCESS_KEY`]. `None` while the request is not whole
+    /// yet, so the caller looks again.
+    fn is_the_pid_receipt(seen: &[u8]) -> Option<bool> {
+        let end = seen.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let head = String::from_utf8_lossy(&seen[..end]).to_ascii_lowercase();
+        let len = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let body = seen.get(end + 4..end + 4 + len)?;
+        let patch = seen.starts_with(format!("PATCH /api/jobs/{RUN}/metadata ").as_bytes());
+        Some(
+            patch
+                && serde_json::from_slice::<Value>(body)
+                    .is_ok_and(|b| b.get(PROCESS_KEY).is_some()),
+        )
+    }
+
+    /// A system of record in front of `base` whose pid receipt — the
+    /// metadata write carrying [`PROCESS_KEY`], made right after the
+    /// spawn — is held for `hold` and then `held`. Every other request
+    /// passes through untouched.
+    ///
+    /// EACH CONNECTION IN A TASK OF ITS OWN, LOOKED AT FOR A BOUNDED TIME
+    /// (review 34b016b6, B1). This accepted one connection at a time and
+    /// peeked each with no bound before accepting the next, so a pid
+    /// receipt connection that was open but had sent nothing — the turn
+    /// ended before hyper wrote the request, and the launch dropped it —
+    /// held the accept loop for good: the ending's PATCH was never
+    /// accepted and, on a client with no timeout, the test hung (1 of
+    /// 168 parallel module runs past 300 s; one idle connection hung it
+    /// every time). It also took "the second metadata PATCH" for the pid
+    /// receipt; the body is what says so. The stub behind it answers
+    /// `connection: close`, so one connection is one request.
     async fn stalling_the_pid_receipt(base: &str, hold: std::time::Duration, held: Held) -> String {
         let upstream = base.trim_start_matches("http://").to_string();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let receipt = format!("PATCH /api/jobs/{RUN}/metadata ");
         tokio::spawn(async move {
-            let mut receipts = 0;
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     break;
                 };
-                // The request line, looked at and left in the socket.
-                let mut head = [0u8; 256];
-                let mut seen = 0;
-                for _ in 0..400 {
-                    seen = sock.peek(&mut head).await.unwrap_or(0);
-                    if seen == 0 || head[..seen].contains(&b'\n') {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                if head[..seen].starts_with(receipt.as_bytes()) {
-                    receipts += 1;
-                }
-                let stall = receipts == 2 && head[..seen].starts_with(receipt.as_bytes());
                 let upstream = upstream.clone();
                 tokio::spawn(async move {
+                    // The request, looked at and left in the socket, for
+                    // at most two seconds: a connection that says nothing
+                    // in that time is passed through as it is.
+                    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                    let mut buf = vec![0u8; 65536];
+                    let mut stall = false;
+                    loop {
+                        let seen = match tokio::time::timeout_at(until, sock.peek(&mut buf)).await {
+                            Ok(Ok(n)) if n > 0 => n,
+                            _ => break,
+                        };
+                        if let Some(receipt) = is_the_pid_receipt(&buf[..seen]) {
+                            stall = receipt;
+                            break;
+                        }
+                        if tokio::time::Instant::now() >= until {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
                     if stall {
                         tokio::time::sleep(hold).await;
                         if held == Held::Dropped {
@@ -3136,6 +3168,76 @@ esac
             }
         });
         format!("http://{addr}")
+    }
+
+    /// Review 34b016b6, B1, the proof. A CONNECTION THAT SAYS NOTHING
+    /// HOLDS NOTHING BUT ITSELF. One idle connection opened to the proxy
+    /// first used to hang every request behind it; here it stays open
+    /// and silent through the whole launch, which still ends, and the
+    /// pid receipt is still the one held — known by its body.
+    #[tokio::test]
+    async fn an_idle_connection_to_the_stalling_proxy_holds_nothing_behind_it() {
+        let world = World::new("dispatch-launch-idle-connection", "ok", 20_000);
+        let (base, log, _run) =
+            keeping_stub(packet_without_projection(), reviewer_row(), live_agents()).await;
+        let d = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .unwrap();
+        let held =
+            stalling_the_pid_receipt(&base, std::time::Duration::from_secs(2), Held::Dropped).await;
+        let idle = tokio::net::TcpStream::connect(held.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            launch(&held, &world, &d),
+        )
+        .await
+        .expect("the launch ended while a silent connection sat on the proxy")
+        .expect("the stub finished a turn");
+        assert_eq!(receipt["status"], "exited", "{receipt}");
+        assert!(
+            !log.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, b)| b.get(PROCESS_KEY).is_some()),
+            "the pid receipt was held by its body, not by its place in line"
+        );
+        drop(idle);
+    }
+
+    /// The proxy's reading of a request: the pid receipt is the run's
+    /// metadata PATCH whose body carries [`PROCESS_KEY`] — not the other
+    /// metadata PATCHes, and not until its body has arrived.
+    #[test]
+    fn the_pid_receipt_is_known_by_its_body() {
+        let req = |path: &str, body: &str| {
+            format!(
+                "PATCH {path} HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let run = format!("/api/jobs/{RUN}/metadata");
+        let pid = format!(r#"{{"{PROCESS_KEY}":{{"pid":7,"pgid":7}}}}"#);
+        let whole = req(&run, &pid);
+        assert_eq!(is_the_pid_receipt(whole.as_bytes()), Some(true));
+        let ending = format!(r#"{{"{RECEIPT_KEY}":{{"status":"exited","pid":7}}}}"#);
+        assert_eq!(
+            is_the_pid_receipt(req(&run, &ending).as_bytes()),
+            Some(false)
+        );
+        let other = format!("/api/jobs/{PACKET}/metadata");
+        assert_eq!(
+            is_the_pid_receipt(req(&other, &pid).as_bytes()),
+            Some(false)
+        );
+        // Not whole yet: the head without its body, and half the body.
+        let cut = whole.len() - pid.len() / 2;
+        assert_eq!(is_the_pid_receipt(&whole.as_bytes()[..cut]), None);
+        let head_only = whole.find("\r\n\r\n").unwrap();
+        assert_eq!(is_the_pid_receipt(&whole.as_bytes()[..head_only]), None);
     }
 
     /// N18 (review b149c579). THE BOUND IS COUNTED FROM THE SPAWN,
@@ -3221,6 +3323,76 @@ esac
             "the held write was applied after the ending"
         );
         assert_eq!(later["steps"][2]["metadata"]["result"], "died");
+    }
+
+    /// What the launcher promises about the model it starts (backlog
+    /// e6b05dd6): the record is written before the process exists. The
+    /// mark of "the process exists" is EVERY write that knows its pid —
+    /// the pid receipt when it was answered, and always the ending, which
+    /// carries the pid because that receipt is not waited for (backlog
+    /// af54aae4: this asserted the pid receipt alone, a write the
+    /// launcher does not promise, and failed when it went unanswered).
+    fn the_model_was_recorded_before_the_process_existed(log: &crate::dispatch::wire_tests::Log) {
+        let calls = log.calls.lock().unwrap();
+        let recorded = calls
+            .iter()
+            .position(|(m, p, _)| m == "POST" && p.ends_with("/metadata/records"))
+            .expect("the model was recorded");
+        let knows_the_pid = |(m, _, b): &(String, String, Value)| {
+            m == "PATCH"
+                && (b.get(PROCESS_KEY).is_some()
+                    || b.pointer(&format!("/{RECEIPT_KEY}/pid"))
+                        .is_some_and(|pid| !pid.is_null()))
+        };
+        let after: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| knows_the_pid(call))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !after.is_empty(),
+            "the ending carries the pid, so some write knows it"
+        );
+        assert!(
+            after.iter().all(|&i| recorded < i),
+            "recorded before the process existed: the record is call {recorded}, writes \
+             knowing the pid are calls {after:?}"
+        );
+    }
+
+    /// Backlog af54aae4 (1). THE PID RECEIPT IS NOT WAITED FOR, SO A TEST
+    /// MAY NOT NEED IT. A turn that finishes before the pid receipt is
+    /// answered ends the wait without it (N18, B1 above), and the
+    /// ending carries the pid. The Codex test used that receipt as its
+    /// mark of "the process exists" and failed 2 of 144 module runs, six
+    /// binaries in parallel, at "the call was made" (measured on this
+    /// tree 2026-10-19; 2 of 288 in review 09e63624). Here the receipt
+    /// is held and never delivered, so the interleaving that was a
+    /// coin is the only one.
+    #[tokio::test]
+    async fn the_model_is_recorded_before_the_process_though_its_pid_receipt_never_lands() {
+        let world = World::new("dispatch-launch-receipt-unanswered", "ok", 20_000);
+        let (base, log, _run) =
+            keeping_stub(packet_without_projection(), reviewer_row(), live_agents()).await;
+        let d = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .unwrap();
+        let held =
+            stalling_the_pid_receipt(&base, std::time::Duration::from_secs(2), Held::Dropped).await;
+        let receipt = launch(&held, &world, &d)
+            .await
+            .expect("the stub finished a turn");
+        assert_eq!(receipt["status"], "exited", "{receipt}");
+        assert!(
+            !log.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, b)| b.get(PROCESS_KEY).is_some()),
+            "the fixture: the pid receipt never reached the record"
+        );
+        the_model_was_recorded_before_the_process_existed(&log);
     }
 
     /// N19 (review b149c579), the first half. A VERB WHOSE STDERR HAS
@@ -3458,5 +3630,148 @@ esac
         assert_eq!(filed["steps"][2]["assignee_id"], "agent-claude");
         assert!(!world.request.dir.exists());
         assert!(!world.home.join("capture/argv").exists());
+    }
+
+    /// A LAUNCH WHOSE BUILDING CANNOT BE PLACED ENDS ITS RUN AND RELEASES
+    /// ITS CLAIM (backlog f8bed383, residue N9 of review b149c579). The
+    /// verb refused — rightly, a launch must not start a process whose
+    /// run is not its own — and left the work step claimed FOR the
+    /// harness's actor, its run edge written, and the run open at
+    /// `briefed` with `building` PENDING, which no rule ages. Now the
+    /// run is ended on its `refused` terminal and the step handed back.
+    #[tokio::test]
+    async fn a_launch_whose_building_cannot_be_placed_ends_its_run_and_releases_its_claim() {
+        let world = World::new("dispatch-launch-unplaced", "ok", 20_000);
+        let (base, _log, packet, run) =
+            crate::dispatch::wire_tests::half_open_stub(reviewer_row(), |m, p, b| {
+                (m == "PUT" && p.ends_with("/steps/run-building") && b.get("assignee_id").is_some())
+                    .then(|| ("409 Conflict", json!({ "error": "refused" }).to_string()))
+            })
+            .await;
+        let err = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("nothing was launched"), "{text}");
+        assert!(
+            text.contains("ENDED") && text.contains("RELEASED"),
+            "{text}"
+        );
+        let packet = packet.lock().unwrap().clone();
+        crate::dispatch::wire_tests::assert_released(&packet);
+        crate::dispatch::wire_tests::assert_ended(
+            &run.lock().unwrap().clone().unwrap(),
+            "could not be placed with agent-codex",
+        );
+        assert!(!world.home.join("capture/argv").exists(), "no process ran");
+    }
+
+    /// For a LAUNCH the `briefed` refusals are the same half-open shape:
+    /// the prompt is printed, but the executor is the process this verb
+    /// would start, and it is never started on an Err — so nobody will
+    /// finish the run, and it is ended and its claim released too.
+    #[tokio::test]
+    async fn a_launchs_briefed_refusal_ends_its_run_and_releases_its_claim() {
+        let world = World::new("dispatch-launch-unbriefed", "ok", 20_000);
+        let (base, _log, packet, run) =
+            crate::dispatch::wire_tests::half_open_stub(reviewer_row(), |m, p, _| {
+                (m == "PATCH" && p.ends_with("/steps/run-briefed/metadata"))
+                    .then(|| ("204 No Content", String::new()))
+            })
+            .await;
+        let err = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("does not hold"), "{text}");
+        assert!(
+            text.contains("ENDED") && text.contains("RELEASED"),
+            "{text}"
+        );
+        crate::dispatch::wire_tests::assert_released(&packet.lock().unwrap());
+        crate::dispatch::wire_tests::assert_ended(
+            &run.lock().unwrap().clone().unwrap(),
+            "does not hold",
+        );
+        assert_no_advice_to_finish(
+            &text,
+            &run.lock().unwrap().clone().unwrap(),
+            &packet.lock().unwrap(),
+        );
+    }
+
+    /// The other `briefed` refusal, on a launch: the completion itself is
+    /// refused (not a race), the run is ended and its claim released —
+    /// and nothing it says or records tells the reader to finish it.
+    #[tokio::test]
+    async fn a_launchs_unstartable_briefed_ends_its_run_and_advises_no_finish() {
+        let world = World::new("dispatch-launch-unstartable", "ok", 20_000);
+        let (base, _log, packet, run) =
+            crate::dispatch::wire_tests::half_open_stub(reviewer_row(), |m, p, _| {
+                (m == "PUT" && p.ends_with("/steps/run-briefed"))
+                    .then(|| ("500 Internal Server Error", "the completion failed".into()))
+            })
+            .await;
+        let err = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("completing the run's briefed step"), "{text}");
+        assert!(
+            text.contains("ENDED") && text.contains("RELEASED"),
+            "{text}"
+        );
+        crate::dispatch::wire_tests::assert_released(&packet.lock().unwrap());
+        crate::dispatch::wire_tests::assert_ended(
+            &run.lock().unwrap().clone().unwrap(),
+            "completing the run's briefed step",
+        );
+        assert_no_advice_to_finish(
+            &text,
+            &run.lock().unwrap().clone().unwrap(),
+            &packet.lock().unwrap(),
+        );
+        assert!(!world.home.join("capture/argv").exists(), "no process ran");
+    }
+
+    /// A RUN THE VERB ENDED IS NOT ONE ANYBODY IS TOLD TO FINISH (backlog
+    /// f843a0c9, review a6a66af7 of car a8248f7a). The `briefed`
+    /// refusals' recovery — complete `briefed` on THIS run, do not
+    /// dispatch again — is right for a printed prompt, which keeps its
+    /// run open, and the opposite of what happened on a launch, whose run
+    /// is ended and step released. The verb's stderr, the run's
+    /// `ended_at_dispatch.why` and the work step's `released.why` each
+    /// carried it, the last with no disclaimer beside it.
+    fn assert_no_advice_to_finish(text: &str, run: &Value, packet: &Value) {
+        let whys = [
+            ("stderr", text),
+            (
+                "ended_at_dispatch.why",
+                run["metadata"]["ended_at_dispatch"]["why"]
+                    .as_str()
+                    .unwrap_or_default(),
+            ),
+            (
+                "released.why",
+                packet["steps"][1]["metadata"]["released"]["why"]
+                    .as_str()
+                    .unwrap_or_default(),
+            ),
+        ];
+        for (place, said) in whys {
+            assert!(!said.is_empty(), "{place} says nothing");
+            // The commands, as the advice spelled them; the API's own
+            // error naming the request that failed is a fact, not advice.
+            for advice in [
+                "--step briefed",
+                "boss-api PATCH",
+                "boss-api PUT",
+                "finish this run",
+                "Finish THIS run",
+                "do not dispatch again",
+            ] {
+                assert!(!said.contains(advice), "{place} says {advice:?}: {said}");
+            }
+        }
     }
 }

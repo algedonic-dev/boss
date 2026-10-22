@@ -39,6 +39,11 @@ const SCRIPT: &str = "infra/forge/node-converge.sh";
 /// `dry2-<ip>` what a dry run with one / two `--patch` flags prints
 /// (two falls back to one: an idempotent patch), `after-<ip>.yaml` the
 /// config an apply makes live, `dry-after-<ip>` the dry run once applied.
+/// `for-<ip>-<name>.patch` names one exact patch: its dry run prints
+/// `for-<ip>-<name>.dry<n>`, or, when `for-<ip>-<name>.refuse` exists,
+/// Talos REFUSES it saying that file (as w-1's whole declaration was
+/// refused live, ops-request fa6fd412). Every dry run's patch is appended
+/// to `dry-patches`, each followed by a `=====` line.
 /// Every `--patch=` value lands in `patch-arg`; an apply touches
 /// `applied-<ip>`. `ready-<node>` sets the Node's Ready status (default
 /// True), `renew-<node>` freezes its kubelet lease's renewTime (default:
@@ -101,12 +106,12 @@ if [ "$tool" = talosctl ]; then
         exit 0 ;;
     "patch machineconfig")
         shift 2
-        mode=""; dry=""; n=0
+        mode=""; dry=""; n=0; patch=""
         for a in "$@"; do
             case "$a" in
             --mode=*) mode="${a#--mode=}" ;;
             --dry-run) dry=1 ;;
-            --patch=*) n=$((n + 1)); printf '%s' "${a#--patch=}" > "$S/patch-arg" ;;
+            --patch=*) n=$((n + 1)); patch="${a#--patch=}"; printf '%s' "$patch" > "$S/patch-arg" ;;
             *) echo "stub: unexpected patch argument: $a" >&2; exit 2 ;;
             esac
         done
@@ -116,8 +121,22 @@ if [ "$tool" = talosctl ]; then
             exit 1
         fi
         if [ -n "$dry" ]; then
+            printf '%s\n=====\n' "$patch" >> "$S/dry-patches"
             f="$S/dry$n-$ip"
             [ -f "$f" ] || f="$S/dry1-$ip"
+            # A dry run of ONE particular patch (the narrowed one):
+            # for-<ip>-<name>.patch holds its exact text, and
+            # for-<ip>-<name>.dry<n> what Talos prints for it.
+            for p in "$S"/for-"$ip"-*.patch; do
+                [ -f "$p" ] || continue
+                printf '%s' "$patch" | cmp -s - "$p" || continue
+                if [ -f "${p%.patch}.refuse" ]; then
+                    cat "${p%.patch}.refuse" >&2
+                    exit 1
+                fi
+                f="${p%.patch}.dry$n"
+                [ -f "$f" ] || f="${p%.patch}.dry1"
+            done
             cat "$f" >&2
             exit 0
         fi
@@ -727,6 +746,270 @@ fn an_apply_the_node_never_took_is_not_an_effect() {
     no_credential(&out);
 }
 
+// ------------------------- the narrowed patch (9cf1673d, for 67e98635)
+
+/// w-1 as it stood on 2026-10-19: its declaration is the image-GC pair
+/// plus the gate-seed files entry, the files entry is live TWICE (the
+/// 2026-09-12 hand patches) and the GC pair is absent. Talos appends the
+/// files entry, so the whole declaration cannot be applied; its GC pair
+/// can. Returns the commit.
+fn w1_as_on_2026_10_19(n: &Node) -> String {
+    let sha = appending_declaration(n);
+    n.state("mc-10.20.0.14.yaml", &live_with_seed("", 2));
+    n.state("after-10.20.0.14.yaml", &live_with_seed(GC_LIVE, 2));
+    dry_for(n, "gc", GC_ONLY, &dry_run(NO_REBOOT, GC_DIFF), None);
+    sha
+}
+
+#[test]
+fn a_declaration_whose_list_entries_are_live_applies_only_its_entries_absent_live() {
+    // backlog 67e98635: w-1's Longhorn disk sat under its scheduling floor
+    // because the kubelet's image GC (default 85%) fires after Longhorn
+    // stops placing replicas (75% used). The pair that fixes it is two
+    // scalars, but w-1's declaration also carries list entries already
+    // live, so the whole file would add a third copy of the seed entry
+    // and the verb refused it (9cf1673d). It now applies the pair alone.
+    let n = Node::new("narrow-w1");
+    let sha = w1_as_on_2026_10_19(&n);
+    let (plan, hash) = n.plan("w-1", &sha);
+    for want in [
+        "narrowed",
+        "the 2 entries ABSENT live",
+        "machine.kubelet.extraConfig.imageGCHighThresholdPercent",
+        "DOUBLED    machine.files[/var/local/gate-seed/.declared-by-talos]",
+        GC_ONLY,
+        "+        extraConfig:",
+        "idempotent: yes",
+    ] {
+        assert!(plan.contains(want), "the plan says {want:?}:\n{plan}");
+    }
+    assert!(
+        !plan.contains("+    files:"),
+        "the files entry is not applied:\n{plan}"
+    );
+    no_credential(&plan);
+
+    let o = n.run(&["w-1", &sha, &hash], &[]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert_eq!(
+        n.read_state("patch-arg"),
+        GC_ONLY,
+        "the patch applied is the narrowed one, byte for byte"
+    );
+    let hits = effect_lines(&out);
+    assert_eq!(hits.len(), 1, "one effect line: {out}");
+    assert!(
+        hits[0].contains("w-1")
+            && hits[0].contains(&sha)
+            && hits[0].contains("the 2 entries it applied")
+            && hits[0].contains("as it did before"),
+        "{hits:?}"
+    );
+    no_credential(&out);
+}
+
+#[test]
+fn a_narrowed_apply_that_moved_an_entry_it_did_not_apply_is_not_an_effect() {
+    // The GC pair landed, and the seed entry went from two copies to
+    // three: the narrowed patch touched something it did not declare.
+    let n = Node::new("narrow-disturbed");
+    let sha = w1_as_on_2026_10_19(&n);
+    n.state("after-10.20.0.14.yaml", &live_with_seed(GC_LIVE, 3));
+    let (_, hash) = n.plan("w-1", &sha);
+    let o = n.run(&["w-1", &sha, &hash], &[]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(effect_lines(&out).is_empty(), "{out}");
+    assert!(out.contains("NOT proven"), "{out}");
+    assert!(
+        out.contains("machine.files[/var/local/gate-seed/.declared-by-talos]"),
+        "names the entry that moved: {out}"
+    );
+}
+
+#[test]
+fn a_drifted_entry_under_an_appending_patch_is_refused_not_narrowed_past() {
+    // A live GC pair with other values is DRIFT. Narrowing to the absent
+    // entries would leave it drifted and call the node converged, so the
+    // plan refuses, naming it, and applies nothing.
+    let n = Node::new("narrow-drift");
+    let sha = w1_as_on_2026_10_19(&n);
+    n.state(
+        "mc-10.20.0.14.yaml",
+        &live_with_seed(&GC_LIVE.replace("50", "85").replace("40", "80"), 1),
+    );
+    // Talos refuses the whole declaration, as it did live (fa6fd412): the
+    // drift is judged off the read, before any dry run is asked for.
+    whole_declaration_refused(&n);
+    let o = n.run(&["--plan", "w-1", &sha], &[]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(78), "{out}");
+    assert!(out.contains("DRIFT"), "{out}");
+    assert!(
+        out.contains("machine.kubelet.extraConfig.imageGCHighThresholdPercent"),
+        "{out}"
+    );
+    assert!(
+        n.read_state("dry-patches").is_empty(),
+        "a DRIFT refuses before any dry run: {}",
+        n.read_state("dry-patches")
+    );
+    assert!(!n.has("applied-10.20.0.14"));
+}
+
+// -------------- narrow FIRST on a partly-live node (backlog a3b1084f)
+
+/// What talosctl printed on 2026-10-19 for a dry run of w-1's WHOLE
+/// declaration, in full: ops-request fa6fd412's recorded output, with the
+/// line breaks its one-line FAILED message folded into spaces restored.
+/// Talos's merge appends the live files entry a second time, and a files
+/// change is not one it applies live — so it refuses in immediate mode
+/// (Talos's own name for --mode=no-reboot) and attaches the diff it would
+/// not apply. The FIRST line is talosctl's own, on stdout.
+const IMMEDIATE_MODE_REFUSAL: &str = "patched MachineConfigs.config.talos.dev/v1alpha1 at the node 10.20.0.14\n1 error occurred:\n\t* 10.20.0.14: rpc error: code = InvalidArgument desc = this config change can't be applied in immediate mode\ndiff: --- a\n+++ b\n@@ -56,6 +56,11 @@\n           permissions: 0o644\n           path: /var/local/gate-seed/.declared-by-talos\n           op: create\n+        - content: |\n+            local PV gate-seed-w-1 (infra/cluster/manifests/gate-seed-local.yaml) mounts this directory\n+          permissions: 0o644\n+          path: /var/local/gate-seed/.declared-by-talos\n+          op: create\n     registries:\n         mirrors:\n             10.20.0.15:3000:\n\n";
+
+/// The entry IMMEDIATE_MODE_REFUSAL's diff adds, as the refusal names it:
+/// a changed line of Talos's diff, its indentation folded.
+const IMMEDIATE_MODE_ENTRY: &str = "+ path: /var/local/gate-seed/.declared-by-talos";
+
+#[test]
+fn talos_own_immediate_mode_refusal_is_refused_as_a_reboot_naming_the_entry() {
+    // backlog 164d6ffe: Talos refuses a change it cannot apply live with
+    // "this config change can't be applied in immediate mode", which the
+    // matcher did not read as a no-reboot refusal (it knew only "without
+    // (a) reboot"), so fa6fd412's plan said the dry run "did not answer"
+    // and exited 1 — a verdict that did not name what failed. A fresh
+    // node dry-runs the whole declaration; Talos refuses it in those
+    // words, and the plan is REFUSED, naming the entry Talos's diff adds
+    // and none of its context.
+    let n = Node::new("immediate-mode");
+    let sha = appending_declaration(&n);
+    whole_declaration_refused(&n);
+    let o = n.run(&["--plan", "w-1", &sha], &[]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(78), "{out}");
+    assert!(!out.contains("did not answer"), "{out}");
+    assert!(out.contains("REBOOT"), "{out}");
+    assert!(
+        out.contains("can't be applied in immediate mode"),
+        "Talos's own words: {out}"
+    );
+    assert!(out.contains(IMMEDIATE_MODE_ENTRY), "names the entry: {out}");
+    assert!(
+        !out.contains("registries:"),
+        "a context line of Talos's diff is not the entry: {out}"
+    );
+    assert!(!n.has("applied-10.20.0.14"));
+    no_credential(&out);
+}
+
+#[test]
+fn an_apply_talos_refuses_in_immediate_mode_is_refused_naming_the_entry() {
+    // The apply judges Talos's words with the same matcher: a live state
+    // that moved between the plan and the act can still meet this refusal.
+    let n = Node::new("immediate-mode-apply");
+    let sha = n.head();
+    let (_, hash) = n.plan("w-1", &sha);
+    let o = n.run(
+        &["w-1", &sha, &hash],
+        &[("STUB_APPLY_FAIL", IMMEDIATE_MODE_REFUSAL)],
+    );
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(78), "{out}");
+    assert!(out.contains("nothing was applied"), "{out}");
+    assert!(!out.contains("cannot say"), "{out}");
+    assert!(out.contains(IMMEDIATE_MODE_ENTRY), "names the entry: {out}");
+}
+
+/// w-1's committed declaration, as the script hands it to `--patch`.
+fn whole_declaration(n: &Node) -> String {
+    std::fs::read_to_string(n.tree.join("infra/cluster/talos/patches/w-1.yaml"))
+        .expect("w-1 is declared")
+        .trim_end_matches('\n')
+        .to_string()
+}
+
+/// Talos refuses any dry run of w-1's whole declaration, as it did live.
+fn whole_declaration_refused(n: &Node) {
+    n.state("for-10.20.0.14-whole.patch", &whole_declaration(n));
+    n.state("for-10.20.0.14-whole.refuse", IMMEDIATE_MODE_REFUSAL);
+}
+
+#[test]
+fn a_partly_live_node_narrows_before_any_dry_run_of_the_whole_declaration() {
+    // backlog a3b1084f: the first live plan after 67e98635 landed
+    // (fa6fd412) dry-ran w-1's WHOLE declaration before narrowing, Talos
+    // refused it — its merge appends the live seed files entry, and a
+    // files change is not a no-reboot change — and the plan failed before
+    // the narrowed patch was built. With a declared entry live, the whole
+    // declaration is never dry-run: the plan narrows first.
+    let n = Node::new("narrow-first");
+    let sha = appending_declaration(&n);
+    n.state("mc-10.20.0.14.yaml", &live_with_seed("", 1));
+    n.state("after-10.20.0.14.yaml", &live_with_seed(GC_LIVE, 1));
+    dry_for(&n, "gc", GC_ONLY, &dry_run(NO_REBOOT, GC_DIFF), None);
+    whole_declaration_refused(&n);
+    let (plan, hash) = n.plan("w-1", &sha);
+    for want in [
+        "MATCH      machine.files[/var/local/gate-seed/.declared-by-talos]",
+        "ABSENT     machine.kubelet.extraConfig.imageGCHighThresholdPercent",
+        "ABSENT     machine.kubelet.extraConfig.imageGCLowThresholdPercent",
+        "narrowed",
+        "the 2 entries ABSENT live",
+        GC_ONLY,
+        NO_REBOOT,
+        "idempotent: yes",
+        "+        extraConfig:",
+        "+            imageGCLowThresholdPercent: 40",
+    ] {
+        assert!(plan.contains(want), "the plan says {want:?}:\n{plan}");
+    }
+    assert!(
+        !plan.contains("+    files:"),
+        "the files entry is not applied:\n{plan}"
+    );
+    let dried = n.read_state("dry-patches");
+    assert!(
+        !dried.contains("/var/local/gate-seed"),
+        "the whole declaration was dry-run:\n{dried}"
+    );
+    assert_eq!(
+        dried,
+        format!("{GC_ONLY}\n=====\n{GC_ONLY}\n=====\n"),
+        "exactly the narrowed patch's two dry runs (once, then twice)"
+    );
+    no_credential(&plan);
+
+    let o = n.run(&["w-1", &sha, &hash], &[]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert_eq!(n.read_state("patch-arg"), GC_ONLY, "{out}");
+    let hits = effect_lines(&out);
+    assert_eq!(hits.len(), 1, "one effect line: {out}");
+    assert!(hits[0].contains("the 2 entries it applied"), "{hits:?}");
+}
+
+#[test]
+fn a_fresh_node_still_dry_runs_the_whole_declaration() {
+    // Every entry ABSENT: there is no live entry for Talos to append a
+    // second copy of, so the whole declaration is dry-run and applied.
+    let n = Node::new("fresh-whole");
+    let sha = appending_declaration(&n);
+    let (plan, _) = n.plan("w-1", &sha);
+    assert!(!plan.contains("narrowed"), "{plan}");
+    assert!(
+        plan.contains("every entry it declares reads ABSENT live"),
+        "{plan}"
+    );
+    let whole = whole_declaration(&n);
+    assert_eq!(
+        n.read_state("dry-patches"),
+        format!("{whole}\n=====\n{whole}\n=====\n"),
+        "the whole declaration's two dry runs"
+    );
+}
+
 // ------------------------------------------- review 9cb9af67 (CHANGES)
 
 /// A declaration of the image-GC pair plus one files entry, and a patch
@@ -745,21 +1028,76 @@ fn appending_declaration(n: &Node) -> String {
     sha
 }
 
+/// The appending declaration's files entry alone, as check-declared.sh
+/// --absent re-emits it — what a narrowed plan applies when the image-GC
+/// pair is live and the file is not. No trailing newline: the script
+/// reads the fragment with `$(cat …)`, as it reads the declaration.
+const FILES_ONLY: &str = "machine:\n  files:\n    - content: |\n        x\n      permissions: 0o644\n      path: /var/local/gate-seed/.declared-by-talos\n      op: create";
+
+/// The image-GC pair alone, as --absent re-emits it from DECL.
+const GC_ONLY: &str = "machine:\n  kubelet:\n    extraConfig:\n      imageGCHighThresholdPercent: 50\n      imageGCLowThresholdPercent: 40";
+
+/// The gate-seed files entry as a live config carries it, `copies` times.
+fn live_seed(copies: usize) -> String {
+    let one = "            - content: |\n                x\n              permissions: 0o644\n              path: /var/local/gate-seed/.declared-by-talos\n              op: create\n";
+    format!("        files:\n{}", one.repeat(copies))
+}
+
+/// A live config carrying `extra` under the kubelet and the seed files
+/// entry `copies` times.
+fn live_with_seed(extra: &str, copies: usize) -> String {
+    live_config("w-1", extra).replace(
+        "        network:\n",
+        &format!("{}        network:\n", live_seed(copies)),
+    )
+}
+
+/// Tell the stub what Talos's dry run prints for one exact patch.
+fn dry_for(n: &Node, name: &str, patch: &str, once: &str, twice: Option<&str>) {
+    n.state(&format!("for-10.20.0.14-{name}.patch"), patch);
+    n.state(&format!("for-10.20.0.14-{name}.dry1"), once);
+    if let Some(twice) = twice {
+        n.state(&format!("for-10.20.0.14-{name}.dry2"), twice);
+    }
+}
+
 #[test]
-fn review_1_an_appending_patch_is_refused_when_any_declared_entry_of_any_class_is_live() {
+fn review_1_an_appending_patch_with_a_live_entry_applies_only_the_absent_ones() {
     // The image-GC pair is live (MATCH); only the files entry is ABSENT.
-    // The patch appends, so the plan may not say every entry is ABSENT.
+    // The patch appends, so the plan may not say every entry is ABSENT —
+    // and since 9cf1673d it does not refuse either: it narrows to the
+    // files entry, the one entry it can add once.
     let n = Node::new("rv1-any-class");
     let sha = appending_declaration(&n);
     n.state("mc-10.20.0.14.yaml", &live_config("w-1", GC_LIVE));
-    let o = n.run(&["--plan", "w-1", &sha], &[]);
-    let out = text(&o);
-    assert_eq!(o.status.code(), Some(78), "{out}");
-    assert!(
-        out.contains("machine.kubelet.extraConfig.imageGCHighThresholdPercent"),
-        "names the live entry of the extraConfig class: {out}"
+    let files_once = "--- a\n+++ b\n@@ -9,3 +9,5 @@\n         hostname: w-1\n+    files:\n+        - path: /var/local/gate-seed/.declared-by-talos\n";
+    let files_twice =
+        format!("{files_once}+        - path: /var/local/gate-seed/.declared-by-talos\n");
+    dry_for(
+        &n,
+        "files",
+        FILES_ONLY,
+        &dry_run(NO_REBOOT, files_once),
+        Some(&dry_run(NO_REBOOT, &files_twice)),
     );
-    assert!(!out.contains("ABSENT live, so this run adds"), "{out}");
+    let (plan, _) = n.plan("w-1", &sha);
+    assert!(plan.contains("narrowed"), "{plan}");
+    assert!(
+        plan.contains("machine.kubelet.extraConfig.imageGCHighThresholdPercent"),
+        "names the live entry it keeps: {plan}"
+    );
+    assert!(
+        plan.contains(FILES_ONLY),
+        "the patch applied is printed: {plan}"
+    );
+    assert!(
+        !plan.contains("every entry it declares reads ABSENT live"),
+        "the whole declaration is not called absent: {plan}"
+    );
+    assert!(
+        plan.contains("every entry it applies reads ABSENT live"),
+        "the narrowed patch is, and it says so: {plan}"
+    );
     // With nothing live, the plan renders and says so truthfully.
     n.state("mc-10.20.0.14.yaml", &live_config("w-1", ""));
     let (plan, _) = n.plan("w-1", &sha);

@@ -128,6 +128,9 @@ COPY infra/platform/automations/dispatcher.toml ./infra/platform/automations/dis
 # judges a tenant's sensor references offline, with no registry to ask
 # (b8d8c928).
 COPY infra/platform/workflows ./infra/platform/workflows
+# The attended qualifier compiles the fixed public asset/suite contract;
+# its owning equality tests read the same whole public bundle bytes.
+COPY infra/step-plugins ./infra/step-plugins
 # boss-jobs `include_str!`s the IT map's declared hand-offs — the one
 # file every rule, cadence and verb that turns one packet into another
 # declares its route in (design e765b3fc car R2) — so the routes it

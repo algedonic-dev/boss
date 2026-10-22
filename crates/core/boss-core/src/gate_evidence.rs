@@ -461,6 +461,25 @@ impl Said {
 /// the window reads as a break in the watch.
 const END_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long one attempt to write the end may take before it is
+/// abandoned and tried again. The end used to be ONE unbounded write,
+/// while the outbox's `pool.begin()` can wait sqlx's 30 s acquire
+/// timeout — past [`END_GRACE`], so a stalled acquire meant the watcher
+/// exited the process with no end on the log and no reason anywhere:
+/// five of ~108 rolls in 120 h, 0 dead letters (backlog 9f1e4063, run
+/// fed61605). An abandoned attempt is retried with the SAME event, so
+/// one that lands late is refused by the outbox's unique `event_id`
+/// rather than stated twice.
+const END_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long after SIGTERM the end may still be tried: the rest of
+/// [`END_GRACE`] is left for the losses stated after it and the exit.
+const END_BUDGET: std::time::Duration = END_GRACE.saturating_sub(std::time::Duration::from_secs(2));
+
+/// The pause before the end's first retry, doubling to [`END_RETRY_MAX`].
+const END_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(100);
+const END_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Spawned hand-offs in this process that have not yet stated their end.
 /// The LAST one to finish after SIGTERM exits the process: registering a
 /// SIGTERM listener replaces the signal's default (terminate), so the
@@ -644,6 +663,9 @@ impl Evidence {
     {
         tokio::pin!(shutdown);
         let mut closing = false;
+        // When SIGTERM reached this hand-off: the end's budget runs from
+        // here, because the drain spends the same grace.
+        let mut closing_at: Option<tokio::time::Instant> = None;
         loop {
             let event = if closing {
                 match rx.try_recv() {
@@ -664,6 +686,7 @@ impl Evidence {
                         // c49cb4e1, D2).
                         rx.close();
                         closing = true;
+                        closing_at.get_or_insert_with(tokio::time::Instant::now);
                         continue;
                     }
                 }
@@ -689,6 +712,7 @@ impl Evidence {
                             () = &mut shutdown => {
                                 rx.close();
                                 closing = true;
+                                closing_at.get_or_insert_with(tokio::time::Instant::now);
                             }
                         }
                         wait = (wait * 2).min(RETRY_MAX);
@@ -698,7 +722,8 @@ impl Evidence {
             self.state_losses(recorder.as_ref()).await;
         }
         self.state_losses(recorder.as_ref()).await;
-        self.end(recorder.as_ref()).await;
+        let since = closing_at.unwrap_or_else(tokio::time::Instant::now);
+        self.end(recorder.as_ref(), since + END_BUDGET).await;
         // A miss counted while the end was being written is stated
         // AFTER it, where it dirties the window: the end's `clean` was
         // true only of what it saw.
@@ -855,8 +880,13 @@ impl Evidence {
     }
 
     /// `recording_ended`: clean only when nothing this process stated is
-    /// missing from the log without a `facts_lost` saying so.
-    async fn end(&self, recorder: &dyn EventRecorder) {
+    /// missing from the log without a `facts_lost` saying so. Each
+    /// attempt is bounded by [`END_ATTEMPT`] and retried with backoff
+    /// until `deadline` (backlog 9f1e4063); the end always gets one whole
+    /// attempt, however much of the budget the drain spent. When none
+    /// lands, the reason — every attempt, how it ended, after how long —
+    /// is said at ERROR and kept as the health's `last_error`.
+    async fn end(&self, recorder: &dyn EventRecorder, deadline: tokio::time::Instant) {
         let health = self.health();
         let fact = self.event(
             Fact::RecordingEnded,
@@ -866,13 +896,56 @@ impl Evidence {
                 "clean": health.unstated == 0,
             }),
         );
-        if let Err(e) = recorder.record(&fact).await {
-            tracing::error!(
-                service = %self.inner.service,
-                error = %e,
-                "gate evidence: this process's end is NOT on the log, so its watch reads broken"
-            );
+        let began = tokio::time::Instant::now();
+        let deadline = deadline.max(began + END_ATTEMPT);
+        let mut tried: Vec<String> = Vec::new();
+        let mut wait = END_RETRY_FIRST;
+        loop {
+            let start = tokio::time::Instant::now();
+            let bound = END_ATTEMPT.min(deadline.saturating_duration_since(start));
+            let n = tried.len() + 1;
+            match tokio::time::timeout(bound, recorder.record(&fact)).await {
+                Ok(Ok(())) => {
+                    if !tried.is_empty() {
+                        tracing::warn!(
+                            service = %self.inner.service,
+                            gate = self.inner.gate.prefix(),
+                            "gate evidence: this process's end is on the log on attempt {n}, \
+                             {:?} after it was first tried: {}",
+                            began.elapsed(),
+                            tried.join("; ")
+                        );
+                    }
+                    return;
+                }
+                Ok(Err(e)) => tried.push(format!(
+                    "attempt {n} refused after {:?}: {e}",
+                    start.elapsed()
+                )),
+                Err(_) => tried.push(format!("attempt {n} timed out after {bound:?}")),
+            }
+            if tokio::time::Instant::now() + wait >= deadline {
+                break;
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(END_RETRY_MAX);
         }
+        let why = format!(
+            "this process's end is NOT on the log, so its watch reads broken: {} attempt(s) \
+             over {:?}, inside the {END_BUDGET:?} the end has after SIGTERM — {} (a timed-out \
+             attempt may still have landed; a later refusal for a duplicate event_id {} says it did)",
+            tried.len(),
+            began.elapsed(),
+            tried.join("; "),
+            fact.id
+        );
+        self.note_error(&why);
+        tracing::error!(
+            service = %self.inner.service,
+            gate = self.inner.gate.prefix(),
+            instance = %self.inner.instance,
+            "gate evidence: {why}"
+        );
     }
 
     /// State `fact` with `fields` (an object), stamped with this
@@ -1912,7 +1985,8 @@ mod tests {
     /// still queued is tried once and LOST, counted rather than dropped
     /// in silence, and the process's end cannot be stated — so the log
     /// shows a process with no clean end, which breaks the watch.
-    #[tokio::test]
+    // Paused: the end now retries a refusal for its whole budget.
+    #[tokio::test(start_paused = true)]
     async fn an_end_while_the_log_refuses_states_no_clean_end() {
         let (evidence, rx) = Evidence::channel(Gate::MachineGate, "jobs");
         let down = Flaky::failing(u64::MAX);
@@ -1925,6 +1999,105 @@ mod tests {
         let h = evidence.health();
         assert_eq!((h.lost, h.unstated), (2, 2), "{h:?}");
         assert!(down.took().is_empty(), "no end reached the log");
+    }
+
+    /// A recorder whose first `stall` writes never answer — the outbox's
+    /// `pool.begin()` waiting out sqlx's 30 s acquire timeout, past the
+    /// 10 s [`END_GRACE`] — and which takes every write after.
+    struct Stalls {
+        stall: AtomicU64,
+        took: Mutex<Vec<Event>>,
+    }
+
+    impl Stalls {
+        fn first(stall: u64) -> Arc<Self> {
+            Arc::new(Stalls {
+                stall: AtomicU64::new(stall),
+                took: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl EventRecorder for Stalls {
+        async fn record(&self, e: &Event) -> Result<(), String> {
+            if self.stall.load(Ordering::SeqCst) > 0 {
+                self.stall.fetch_sub(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
+            self.took.lock().unwrap().push(e.clone());
+            Ok(())
+        }
+    }
+
+    /// SIGTERM over `recorder`: how long, on the paused clock, the
+    /// hand-off took to finish, or `None` when it was still running at
+    /// [`END_GRACE`] — where the SIGTERM watcher exits the process.
+    async fn end_within_grace(
+        evidence: &Evidence,
+        rx: tokio::sync::mpsc::Receiver<Event>,
+        recorder: Arc<Stalls>,
+    ) -> Option<std::time::Duration> {
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let ev = evidence.clone();
+        let task = tokio::spawn(async move {
+            ev.run(rx, recorder as Arc<dyn EventRecorder>, async {
+                let _ = stopped.await;
+            })
+            .await
+        });
+        let t0 = tokio::time::Instant::now();
+        stop.send(()).unwrap();
+        match tokio::time::timeout(END_GRACE, task).await {
+            Ok(ended) => {
+                assert!(ended.unwrap(), "ended by its shutdown");
+                Some(t0.elapsed())
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Backlog 9f1e4063: five of ~108 rolls in 120 h dropped a gate's end
+    /// with no dead letter — written once, unbounded, while the outbox's
+    /// acquire can wait 30 s. One stalled attempt is now abandoned at its
+    /// bound and the end retried, inside the grace SIGTERM leaves.
+    #[tokio::test(start_paused = true)]
+    async fn an_end_whose_first_write_stalls_is_retried_and_stated() {
+        let (evidence, rx) = Evidence::channel(Gate::ActorRole, "jobs");
+        let stalls = Stalls::first(1);
+        let took = end_within_grace(&evidence, rx, Arc::clone(&stalls))
+            .await
+            .expect("the end is stated before the SIGTERM watcher exits the process");
+        assert!(took < END_GRACE, "{took:?}");
+        let ends = stalls.took.lock().unwrap().clone();
+        assert_eq!(
+            ends.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+            vec!["actor_role.recording_ended"],
+            "one end, on the retry"
+        );
+        assert_eq!(ends[0].payload["clean"], true, "nothing was lost");
+    }
+
+    /// The other half of 9f1e4063: a recorder that never answers inside
+    /// the grace states no end — never a clean one it could not write —
+    /// and the hand-off finishes before the watcher's exit, saying WHY:
+    /// every attempt, how it ended, and after how long.
+    #[tokio::test(start_paused = true)]
+    async fn an_end_that_stalls_past_the_grace_is_not_stated_and_says_why() {
+        let (evidence, rx) = Evidence::channel(Gate::MachineGate, "jobs");
+        let stalls = Stalls::first(u64::MAX);
+        let took = end_within_grace(&evidence, rx, Arc::clone(&stalls))
+            .await
+            .expect("the hand-off gives up inside the grace, so its reason is said");
+        assert!(took < END_GRACE, "{took:?}");
+        assert!(stalls.took.lock().unwrap().is_empty(), "no end on the log");
+        let why = evidence.health().last_error.unwrap_or_default();
+        assert!(why.contains("end is NOT on the log"), "{why}");
+        assert!(
+            why.contains(&format!("attempt 1 timed out after {END_ATTEMPT:?}")),
+            "{why}"
+        );
+        assert!(why.contains("attempt 2 timed out"), "{why}");
     }
 
     fn missed(service: &str, when: DateTime<Utc>) -> Event {

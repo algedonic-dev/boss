@@ -12,9 +12,22 @@ fi
 # published copy. A REFUSED selector (design a68fc42a D1) refuses a
 # candidate CLI (--built) with 75 and runs only the published image CLI
 # here — never a target build, not even for its version.
+#
+# A caller the store is closed to (root-owned 0700; uid 65534 under
+# infra/dev/as-gate-uid.sh) cannot see the selector either way: that is
+# the refused route too, never the held state (backlog 1fddbe13; the
+# reasoning is in infra/dev/run-while-held.sh).
 dev_control=/work/tools/dev-control
 dev_control_refused=""
-if [[ -e $dev_control/enabled || -L $dev_control/enabled ]]; then
+seen=$dev_control
+until [[ -e $seen || -L $seen ]]; do seen=${seen%/*}; seen=${seen:-/}; done
+if [[ ! -e $dev_control/enabled && ! -L $dev_control/enabled ]] && [[ ! -d $seen || ! -x $seen ]]; then
+    if [[ "${1:-}" == --built || -n "${BOSS_SHIM_BUILT:-}" ]]; then
+        echo "boss: REFUSED — this caller (uid $EUID) cannot read the dev isolation store $dev_control ($seen is closed to it), so it cannot tell whether isolation is on, and a candidate CLI does not run beside this container's credentials (design a68fc42a D1). boss without --built, and boss-api, still run." >&2
+        exit 75
+    fi
+    dev_control_refused=1
+elif [[ -e $dev_control/enabled || -L $dev_control/enabled ]]; then
     [[ "$(/usr/bin/readlink -- "$dev_control/enabled")" =~ ^"$dev_control"/generations/[0-9a-f]{40}$ ]] && exec "$dev_control/boss" "$@"
     if [[ "${1:-}" == --built || -n "${BOSS_SHIM_BUILT:-}" ]]; then
         echo "boss: REFUSED — dev isolation is on and its selector $dev_control/enabled names no activated generation, so a candidate CLI does not run beside this container's credentials (design a68fc42a D1). Why: $dev_control/activation.log. boss without --built, and boss-api, still run." >&2

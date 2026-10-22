@@ -166,7 +166,29 @@ export function outranksBoard(read: Remote<Regions>): Board<OutrankLine> {
 export type NeedsYou = Readonly<{
   rows: ReadonlyArray<AssignmentRow>;
   for: Readonly<{ ids: ReadonlyArray<string>; roles: ReadonlyArray<string> }>;
+  /** Why `rows` is NOT the viewer's whole queue, in words, or null when
+   *  it is (`cutOf`; backlog 97b5cf45). */
+  cut: string | null;
 }>;
+
+/** Why an assignments answer is not the whole queue, or null when it is
+ *  — the web twin of the CLI's `top_board::for_me_cut` (backlog
+ *  09074ada). The server says so in `truncated` and counts `total`
+ *  BEFORE its cut; a server older than that counted `total` after it,
+ *  so its answer is cut whenever its rows fill the page, or it sent no
+ *  count at all. The row used to count only the rows it got, so a cut
+ *  queue read as a complete, smaller one (backlog 97b5cf45). */
+function cutOf(o: Record<string, unknown>, shown: number): string | null {
+  const total = typeof o.total === 'number' && Number.isFinite(o.total) ? o.total : null;
+  const cut =
+    typeof o.truncated === 'boolean'
+      ? o.truncated || (total !== null && total > shown)
+      : shown >= NEEDS_YOU_LIMIT || total === null || total > shown;
+  if (!cut) return null;
+  return total !== null && total > shown
+    ? `${shown} of at least ${total} rows read — the answer was cut at its limit`
+    : `${shown} rows read and the answer was cut at its limit — how many more is unknown`;
+}
 
 /** The answer, or a throw. The `for` block is REQUIRED: a server older
  *  than car 1 ignores the unknown parameter and answers the no-selector
@@ -185,10 +207,16 @@ export function parseNeedsYou(raw: unknown): NeedsYou {
   return {
     rows: o.data as AssignmentRow[],
     for: { ids: whom.ids.map(String), roles: Array.isArray(whom.roles) ? whom.roles.map(String) : [] },
+    cut: cutOf(o, o.data.length),
   };
 }
 
-export const NEEDS_YOU_URL = '/api/jobs/assignments?for=me&limit=500';
+/** The page the row asks for. A server older than the `truncated` flag
+ *  counted `total` after its cut, so its answer is cut whenever its rows
+ *  fill this page (backlog 97b5cf45). */
+export const NEEDS_YOU_LIMIT = 500;
+
+export const NEEDS_YOU_URL = `/api/jobs/assignments?for=me&limit=${NEEDS_YOU_LIMIT}`;
 
 export type NeedLine = Readonly<{
   id: string;
@@ -217,10 +245,10 @@ const stepHref = (jobId: string, stepId: string): string =>
 export function needsYouBoard(
   needs: Remote<NeedsYou>,
   now: number,
-): Board<NeedLine, Readonly<{ whom: string }>> {
+): Board<NeedLine, Readonly<{ whom: string; cut: string | null }>> {
   if (needs.kind === 'loading') return { kind: 'unread', why: 'not read yet' };
   if (needs.kind === 'failed') return { kind: 'unread', why: `the read failed — ${needs.error}` };
-  const { rows, for: whom } = needs.data;
+  const { rows, for: whom, cut } = needs.data;
   const ids = new Set(whom.ids);
   // A role-matched step someone else already holds is theirs, not yours.
   const yours = rows.filter((r) => {
@@ -228,7 +256,15 @@ export function needsYouBoard(
     return (holder === null || ids.has(holder)) && (r.step.status === 'ready' || r.step.status === 'active');
   });
   const named = [...whom.ids, ...whom.roles].join(' · ');
-  if (yours.length === 0) return { kind: 'empty', count: { kind: 'zero' }, words: 'Nothing needs you.', whom: named };
+  // A cut answer's count is a floor — the rows read, not the queue — and
+  // wears the unknown band with the cut as its reason (backlog 97b5cf45).
+  const counted = (n: number): Figure =>
+    cut === null ? count(n, false) : { kind: 'floor', text: String(n), troubled: false, why: cut };
+  if (yours.length === 0) {
+    // None of the rows READ is yours; past a cut that is not "nothing".
+    const words = cut === null ? 'Nothing needs you.' : 'None of the rows read needs you, but the answer was cut — more may.';
+    return { kind: 'empty', count: counted(0), words, whom: named, cut };
+  }
   // Oldest first (5877860d q2: a list ordered by priority buries what has
   // waited longest), priority breaking ties; an undated row sorts last.
   const ordered = [...yours].sort((a, b) => {
@@ -252,7 +288,7 @@ export function needsYouBoard(
       agentTakes: r.step.agent_takes === true,
     };
   });
-  return { kind: 'rows', count: count(yours.length, false), lines, more: yours.length - lines.length, whom: named };
+  return { kind: 'rows', count: counted(yours.length), lines, more: yours.length - lines.length, whom: named, cut };
 }
 
 // ---------------------------------------------------------------------

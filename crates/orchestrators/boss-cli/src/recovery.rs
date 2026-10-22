@@ -2214,8 +2214,10 @@ mod tests {
         };
         assert_eq!(
             exec,
-            "sudo docker run --rm -it --network host -v /etc/boss-ops/kubeconfig:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc -n boss-dev exec -it deploy/boss-dev -c dev -- /work/dev-session.sh"
+            "sudo docker run --rm --log-driver=none -it --network host -v /etc/boss-ops/kubeconfig:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc -n boss-dev exec -it deploy/boss-dev -c dev -- /work/dev-session.sh"
         );
+        // ff957587: no container log, or the forge's json-file default
+        // keeps the whole recovery session on its disk.
         // R2-1: the admin credential is the forge's alone; the bastion's
         // is the scoped one, at the same path, on the next road.
         assert_eq!(fact(admin, "On the host"), &Value::Text("forge".into()));
@@ -2342,7 +2344,7 @@ mod tests {
                  '{{\"data\":{{\"policy-check\":\"report\"}}}}'"
             )
         };
-        let door = "sudo docker run --rm --network host -v /etc/boss-ops/kubeconfig:/kc:ro ";
+        let door = "sudo docker run --rm --log-driver=none --network host -v /etc/boss-ops/kubeconfig:/kc:ro ";
         for (label, ns) in [
             ("On the forge, the operating instance", "boss"),
             ("On the forge, the playground", "boss-playground"),
@@ -3496,7 +3498,7 @@ prose = "p"
             panic!("a command is one line")
         };
         assert!(
-            delete.starts_with("sudo docker run --rm --network host -v ")
+            delete.starts_with("sudo docker run --rm --log-driver=none --network host -v ")
                 && delete.contains("/kubeconfig:/kc:ro alpine/k8s:")
                 && delete.ends_with(&format!(
                     " kubectl --kubeconfig=/kc delete validatingadmissionpolicybinding {binding}"

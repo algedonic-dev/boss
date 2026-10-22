@@ -183,6 +183,24 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          sweep keyed by kind could watch.",
     ),
     (
+        "an-urgent-item-is-released-when-unrun-and-rescoped-when-long",
+        "runs `jobs.urgent_item_watch`, which releases an urgent item's build claimed with no \
+         open agent-run and no car in flight past its bound, and files one alarm per urgent \
+         item that has run for days without converging (backlog 9788e22d). On an hour with \
+         neither it produces NOTHING, and that zero is the healthy reading; what it files is an \
+         alarm keyed by item, not a packet of a kind a sweep could count, and what it releases \
+         goes back to a queue rather than becoming a packet.",
+    ),
+    (
+        "an-idle-actor-holding-urgent-nominations-is-alarmed",
+        "runs `jobs.idle_actor_watch`, which files one urgent backlog-item alarm per agent \
+         that holds a ready urgent nomination with no agent-run open and none moved inside \
+         its bound (backlog 861360bc), held by the alarm staying open. On a tick with every \
+         holder working it produces NOTHING, and that zero is the healthy reading; what it \
+         files is an alarm keyed by actor, not a packet of a kind a sweep could count. It is \
+         itself the watch on a stopped factory, which no event reports.",
+    ),
+    (
         "a-declared-worker-receipt-is-observed-every-five-minutes",
         "runs `jobs.receipt_overdue`, which files one urgent backlog-item alarm only when \
          a newly declared worker receipt is missing past its native dispatch bound, and \

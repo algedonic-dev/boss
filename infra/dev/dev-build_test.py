@@ -1,14 +1,64 @@
 """The dev controller forwards execution; it never runs worker programs."""
 import copy
 import base64
+import hashlib
 import json
 import os
 import importlib.util
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+
+
+GIB = 2 ** 30
+
+
+def longhorn_node(name, maximum_gib, available_gib, ready=True, allow=True, disk_allow=True, disk_eviction=False):
+    """One Longhorn v1beta2 Node with one disk, in the shape the API lists."""
+    def conditions(**kinds):
+        return [{"type": kind, "status": "True" if value else "False"} for kind, value in kinds.items()]
+    return {"metadata": {"name": name},
+            "spec": {"allowScheduling": allow, "evictionRequested": False,
+                     "disks": {"default-disk": {"allowScheduling": disk_allow, "evictionRequested": disk_eviction,
+                                                "path": "/var/lib/longhorn", "storageReserved": 0}}},
+            "status": {"conditions": conditions(Ready=ready, Schedulable=ready),
+                       "diskStatus": {"default-disk": {"storageMaximum": int(maximum_gib * GIB),
+                                                       "storageAvailable": int(available_gib * GIB),
+                                                       "storageScheduled": 0,
+                                                       "conditions": conditions(Ready=True, Schedulable=True)}}}}
+
+
+GIT_ENV = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@boss.invalid",
+           "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@boss.invalid"}
+
+
+def git(repo, *args):
+    """A fixture commit in a real repository, isolated from any user config."""
+    return subprocess.run([shutil.which("git"), "-C", str(repo), *args], env=GIT_ENV,
+                          capture_output=True, check=True).stdout.decode().strip()
+
+
+def host_git(argv, **kwargs):
+    """The controller's metadata read, with this host's git for its fixed path."""
+    return subprocess.run([shutil.which("git"), *argv[1:]], **kwargs)
+
+
+# Room for every launch a test makes that is not about the budget.
+ROOMY = [longhorn_node("w-1", 2000, 2000)]
+
+
+def longhorn_reply(argv, nodes=ROOMY, floor="25"):
+    """The fake reader's answer to the two Longhorn reads, or None."""
+    if argv[:2] == ["get", "nodes.longhorn.io"]:
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"items": nodes}).encode(), b"")
+    if argv[:3] == ["get", "settings.longhorn.io", "storage-minimal-available-percentage"]:
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"value": floor}).encode(), b"")
+    return None
 
 
 class ControllerContract(unittest.TestCase):
@@ -91,6 +141,52 @@ class ControllerContract(unittest.TestCase):
             mutate(job["spec"]["template"]["spec"]["initContainers"][0])
             self.assertIsNotNone(self.mod.worker_error(job))
 
+    def test_the_bootstrap_clone_carries_the_trunk_and_makes_no_setgid_directory(self):
+        # Backlog 12369ed7 (2026-10-22): the pre-flight run in a worker
+        # could never be green. Its clone held one fetched commit and no
+        # trunk ref, so five baseline lints refused on every branch; and
+        # the fsGroup volume root is setgid, which every directory made
+        # under it inherited, so mode pins read 02755 for the 0755 they
+        # set. The bootstrap itself runs here against a fixture forge,
+        # with /workspace and the token mount moved under a scratch root
+        # that is setgid the way the volume root is.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            forge, workspace, token = tmp / "forge", tmp / "workspace", tmp / "token"
+            forge.mkdir()
+            git(forge, "init", "-q", "-b", "main")
+            git(forge, "commit", "-q", "--allow-empty", "-m", "trunk base")
+            git(forge, "checkout", "-q", "-b", "car")
+            git(forge, "commit", "-q", "--allow-empty", "-m", "the car")
+            car = git(forge, "rev-parse", "car")
+            git(forge, "checkout", "-q", "main")
+            git(forge, "commit", "-q", "--allow-empty", "-m", "trunk moved on")
+            trunk = git(forge, "rev-parse", "main")
+            token.write_text("fixture\n")
+            workspace.mkdir()
+            os.chmod(workspace, 0o2775)
+            self.assertTrue(os.stat(workspace).st_mode & 0o2000, "the fixture root must be setgid, as the volume root is")
+            script = self.spec()["spec"]["template"]["spec"]["initContainers"][0]["command"][2]
+            script = script.replace("/bootstrap-forge/token", str(token)).replace("/workspace", str(workspace))
+            env = {"PATH": os.path.dirname(shutil.which("git")) + ":/usr/bin:/bin", "TMPDIR": str(tmp)}
+            ran = subprocess.run(["/bin/bash", "-c", script, "bootstrap", car, str(forge)],
+                                 env=env, capture_output=True)
+            self.assertEqual(ran.returncode, 0, ran.stderr.decode())
+            source = workspace / "source"
+            self.assertEqual(git(source, "rev-parse", "HEAD"), car, "the admitted commit is what is checked out")
+            self.assertEqual(git(source, "rev-parse", "refs/remotes/origin/main"), trunk, "the forge's main is the trunk")
+            # Read the way the lints read it, not only by name.
+            lib = Path(__file__).resolve().parent.parent / "lint/lib/trunk-ref.sh"
+            found = subprocess.run(["/bin/bash", "-c", '. "$0" && resolve_trunk_ref fixture', str(lib)],
+                                   cwd=source, env={**env, "HOME": str(tmp)}, capture_output=True)
+            self.assertEqual((found.returncode, found.stdout.decode().strip()), (0, "origin/main"), found.stderr.decode())
+            for made in ("bootstrap", "home", "cargo", "target", "cache", "tmp", "bin", "source"):
+                self.assertFalse(os.stat(workspace / made).st_mode & 0o2000, made + " kept the volume's setgid bit")
+            scratch = workspace / "tmp" / "a-test-scratch"
+            scratch.mkdir()
+            os.chmod(scratch, 0o755)
+            self.assertEqual(os.stat(scratch).st_mode & 0o7777, 0o755, "a test's 0755 directory reads 0755")
+
     def test_admission_defaults_do_not_invalidate_the_declared_boundary(self):
         job = self.spec()
         pod = job["spec"]["template"]["spec"]
@@ -98,6 +194,51 @@ class ControllerContract(unittest.TestCase):
         for container in pod["containers"] + pod["initContainers"]:
             container.update(terminationMessagePath="/dev/termination-log", terminationMessagePolicy="File")
         self.assertIsNone(self.mod.worker_error(job))
+
+    def test_every_bootstrap_the_factory_launches_is_an_admitted_one(self):
+        # Backlog 07df587a (2026-10-22): a bootstrap edit that is not
+        # admitted here leaves every live worker unrecognised the moment
+        # it lands. Keep the earlier digest beside the new one.
+        launched = self.spec()["spec"]["template"]["spec"]["initContainers"][0]["command"][2]
+        digest = hashlib.sha256(launched.encode()).hexdigest()
+        self.assertIn(digest, self.mod.ADMITTED_WORKER_BOOTSTRAPS,
+                      "the worker bootstrap changed: add %s to ADMITTED_WORKER_BOOTSTRAPS in "
+                      "infra/dev/dev-build.py and keep the earlier digest there" % digest)
+
+    def test_a_worker_launched_under_an_earlier_admitted_bootstrap_is_still_recognised(self):
+        # Backlog 07df587a (2026-10-22): a controller published with a
+        # changed bootstrap refused exec into every worker the previous
+        # one launched ("worker Job differs from recorded controller
+        # intent"), and a-deleted-manifest-leaves-no-object called them
+        # undeclared, until each was stopped. The earlier text is made
+        # here by appending a line: the shape is what the history holds.
+        job = self.spec()
+        init = job["spec"]["template"]["spec"]["initContainers"][0]
+        earlier = init["command"][2] + "# an earlier controller's bootstrap\n"
+        init["command"][2] = earlier
+        admitted = frozenset(getattr(self.mod, "ADMITTED_WORKER_BOOTSTRAPS", frozenset()))
+        before = getattr(self.mod, "ADMITTED_WORKER_BOOTSTRAPS", None)
+        self.mod.ADMITTED_WORKER_BOOTSTRAPS = admitted | {hashlib.sha256(earlier.encode()).hexdigest()}
+        try:
+            self.assertIsNone(self.mod.worker_error(job))
+            self.assertTrue(self.mod.native_job_matches(job))
+            self.assertTrue(self.mod.native_job_matches(job, copy.deepcopy(job)))
+            # The bootstrap is the only part that may be an earlier one:
+            # an admitted bootstrap does not admit a changed mount.
+            widened = copy.deepcopy(job)
+            widened["spec"]["template"]["spec"]["initContainers"][0]["volumeMounts"].append({"name": "forge-read", "mountPath": "/elsewhere"})
+            self.assertFalse(self.mod.native_job_matches(widened))
+            # Nor does a recorded intent under one admitted bootstrap
+            # vouch for a live Job under another.
+            self.assertFalse(self.mod.native_job_matches(self.spec(), copy.deepcopy(job)))
+        finally:
+            if before is None:
+                del self.mod.ADMITTED_WORKER_BOOTSTRAPS
+            else:
+                self.mod.ADMITTED_WORKER_BOOTSTRAPS = before
+        # A bootstrap nobody admitted is still refused.
+        self.assertIsNotNone(self.mod.worker_error(job))
+        self.assertFalse(self.mod.native_job_matches(job))
 
     def test_native_api_omits_false_host_namespaces_without_adding_authority(self):
         # Shape observed on the first native worker, 2026-10-14: these
@@ -370,6 +511,46 @@ class ControllerContract(unittest.TestCase):
             self.mod.worker_exec(session, ["cat"], b"x" * (16 * 1024 * 1024 + 1), lambda *args: calls.append(args))
         self.assertEqual(calls, [])
 
+    def worker_input_with_idle_open_stdin(self, verb, forward):
+        # Backlog c0a24b52 (2026-10-17 isolation trial): an agent shell
+        # holds stdin open and writes nothing, and `exec` waited for an
+        # EOF that never came until the caller's own timeout. The write
+        # end stays open in the child for the whole call, as there.
+        code = (
+            "import importlib.util, os, sys\n"
+            "spec = importlib.util.spec_from_file_location('dev_build', sys.argv[1])\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "read, write = os.pipe()\n"
+            "data = mod.worker_input(sys.argv[2], sys.argv[3] == 'forward', os.fdopen(read, 'rb'))\n"
+            "print(repr(data))\n"
+        )
+        return subprocess.run(
+            [sys.executable, "-I", "-c", code, self.mod.__file__, verb, "forward" if forward else "closed"],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=5, check=False)
+
+    def test_exec_with_an_open_idle_stdin_returns_without_reading_it(self):
+        for verb in ("exec", "exec-auto", "get"):
+            try:
+                result = self.worker_input_with_idle_open_stdin(verb, False)
+            except subprocess.TimeoutExpired:
+                self.fail(verb + " waited on an open, idle caller stdin")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b"b''\n", verb)
+
+    def test_caller_stdin_is_forwarded_only_when_asked_or_for_put(self):
+        stream = lambda: __import__("io").BytesIO(b"plain input")
+        self.assertEqual(self.mod.worker_input("exec", True, stream()), b"plain input")
+        self.assertEqual(self.mod.worker_input("exec-auto", True, stream()), b"plain input")
+        self.assertEqual(self.mod.worker_input("put", False, stream()), b"plain input")
+        self.assertEqual(self.mod.worker_input("exec", False, stream()), b"")
+        self.assertEqual(self.mod.worker_input("get", True, stream()), b"")
+        parser = self.mod.arguments()
+        self.assertTrue(parser.parse_args(["exec", "--stdin", "dev-build-1234567890abcdef", "--", "cat"]).stdin)
+        self.assertFalse(parser.parse_args(["exec", "dev-build-1234567890abcdef", "--", "cat"]).stdin)
+        self.assertTrue(parser.parse_args(["exec-auto", "--stdin", "--", "cat"]).stdin)
+        self.assertFalse(parser.parse_args(["exec-auto", "--", "cat"]).stdin)
+
     def test_auto_execution_maps_only_the_bound_source_and_keeps_argv_data(self):
         binding = {"local_root": "/scratch/wt/agent-car"}
         argv = self.mod.bound_argv(binding, "/scratch/wt/agent-car/apps/web", ["/scratch/wt/agent-car/target/debug/boss", "literal;touch /control"])
@@ -378,6 +559,72 @@ class ControllerContract(unittest.TestCase):
             self.mod.bound_argv(binding, "/work/home", ["bash"])
         with self.assertRaises(ValueError):
             self.mod.bound_argv(binding, "/scratch/wt/agent-car/../other", ["bash"])
+
+    def test_a_cwd_in_a_nested_working_tree_refuses_naming_its_own_binding(self):
+        # Backlog f7b43945 (2026-10-21, reviewer runs b52acf3f and
+        # 0e001103): with only the shared checkout bound, a worktree under
+        # its .claude/worktrees chose the checkout's binding as its nearest
+        # ancestor and was mapped to /workspace/source/.claude/worktrees/<n>,
+        # which the worker never holds (its source is the checkout's own
+        # commit), so env died with exit 125 before cargo started.
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "boss"
+            review = checkout / ".claude" / "worktrees" / "review-x"
+            (review / "crates").mkdir(parents=True)
+            (review / ".git").write_text("gitdir: %s\n" % (checkout / ".git" / "worktrees" / "review-x"))
+            (checkout / "apps" / "web").mkdir(parents=True)
+            binding = {"session": "dev-build-" + "a" * 16, "local_root": str(checkout)}
+            # A directory of the bound tree itself still maps.
+            self.assertEqual(self.mod.bound_argv(binding, str(checkout / "apps" / "web"), ["bash"]),
+                             ["/usr/bin/env", "-C", "/workspace/source/apps/web", "bash"])
+            for cwd in (review, review / "crates"):
+                with self.subTest(cwd=cwd):
+                    with self.assertRaisesRegex(ValueError, "the worker does not hold it") as refused:
+                        self.mod.bound_argv(binding, str(cwd), ["bash"])
+                    message = str(refused.exception)
+                    self.assertIn("dev-build start", message)
+                    self.assertIn("--local-root %s" % review, message)
+                    self.assertIn(binding["session"], message)
+                    self.assertIn("nothing executed", message)
+            # A program inside the nested tree, named from the bound tree,
+            # would map to the same absent path.
+            with self.assertRaisesRegex(ValueError, "--local-root %s" % review):
+                self.mod.bound_argv(binding, str(checkout), [str(review / "infra" / "dev" / "wt-cargo")])
+            # A nested clone (a .git directory, not a file) is another tree too.
+            clone = checkout / "vendor" / "clone"
+            (clone / ".git").mkdir(parents=True)
+            with self.assertRaisesRegex(ValueError, "--local-root %s" % clone):
+                self.mod.bound_argv(binding, str(clone), ["bash"])
+
+    def test_the_nearest_live_binding_owns_a_nested_worktree(self):
+        # Backlog 7dd185c6: the shared checkout /work/boss carries a binding
+        # for the doors run from it, and every Claude Code builder worktree
+        # nests under /work/boss/.claude/worktrees/<id>. The first isolated
+        # build after re-activation on 2026-10-19 was refused because both
+        # matched and the door demanded exactly one.
+        checkout = {"session": "dev-build-" + "a" * 16, "local_root": "/work/boss"}
+        nested = {"session": "dev-build-" + "b" * 16, "local_root": "/work/boss/.claude/worktrees/agent-x"}
+        other = {"session": "dev-build-" + "c" * 16, "local_root": "/work/wt/agent-y"}
+        never = lambda b: False
+        pick = self.mod.nearest_binding
+        self.assertIs(pick([checkout, nested, other], "/work/boss/.claude/worktrees/agent-x/crates", never), nested)
+        self.assertIs(pick([checkout, nested, other], "/work/boss/infra", never), checkout)
+        self.assertIs(pick([checkout, nested, other], "/work/wt/agent-y", never), other)
+        # Two live bindings on the SAME root are still ambiguous.
+        twin = dict(checkout, session="dev-build-" + "d" * 16)
+        with self.assertRaisesRegex(ValueError, "no unique controller-owned worker binding"):
+            pick([checkout, twin], "/work/boss/infra", never)
+        # No binding owns the source at all.
+        with self.assertRaisesRegex(ValueError, "no unique controller-owned worker binding"):
+            pick([checkout, nested], "/scratch/elsewhere", never)
+        # A retired checkout binding no longer counts against the nested one...
+        retired_checkout = lambda b: b is checkout
+        self.assertIs(pick([checkout, nested], "/work/boss/.claude/worktrees/agent-x", retired_checkout), nested)
+        self.assertIs(pick([checkout, nested], "/work/boss", lambda b: b is nested), checkout)
+        # ...but a retired NESTED binding never falls through to the parent
+        # checkout's worker, whose source does not hold the worktree.
+        with self.assertRaisesRegex(ValueError, "no unique controller-owned worker binding"):
+            pick([checkout, nested], "/work/boss/.claude/worktrees/agent-x", lambda b: b is nested)
 
     def test_stale_source_binding_refuses_before_any_worker_execution(self):
         session = self.mod.Session("dev-build-1234567890abcdef", "job-uid", "pod", "pod-uid", "container-id", "a" * 40)
@@ -389,6 +636,535 @@ class ControllerContract(unittest.TestCase):
         bad = dict(binding, source_head="b" * 40)
         with self.assertRaises(ValueError):
             self.mod.check_binding(bad, session, "a" * 40)
+
+    # Backlog ceea10b8, design ac162341 (Q1, David 2026-10-20): a builder's
+    # commit used to make the binding stale. A commit that DESCENDS from the
+    # synced head is now shipped through the put door, path by path, and
+    # the binding follows it; anything else still refuses, naming stop.
+    def worktree(self, tmp):
+        """A real git worktree at commit A, and a worker tree holding A."""
+        repo, worker = Path(tmp) / "wt", Path(tmp) / "worker"
+        git(repo.parent, "init", "-q", str(repo))
+        (repo / "crates/x/src").mkdir(parents=True)
+        (repo / "crates/x/src/lib.rs").write_bytes(b"pub fn a() {}\n")
+        (repo / "gone.txt").write_bytes(b"deleted by the commit\n")
+        (repo / "tool.sh").write_bytes(b"#!/bin/sh\necho one\n")
+        (repo / "tool.sh").chmod(0o755)
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "A")
+        admitted = git(repo, "rev-parse", "HEAD")
+        # The worker is what the published bootstrap leaves: a repository
+        # that fetched the admitted sha alone and checked it out detached
+        # (46b63903: its git is part of what a re-sync must carry).
+        git(worker.parent, "init", "-q", str(worker))
+        git(worker, "fetch", "-q", "--no-tags", str(repo), admitted)
+        git(worker, "checkout", "-q", "--detach", admitted)
+        return repo, worker, admitted
+
+    def follower(self, tmp, repo, worker, admitted, fail_on=None):
+        root = Path(tmp) / "workers"
+        root.mkdir(mode=0o700)
+        session = self.mod.Session("dev-build-1234567890abcdef", "job-uid", "pod", "pod-uid", "container-id", admitted)
+        binding = {"session": session.job, "local_root": str(repo), "source_head": admitted}
+        self.mod.save_record(root / (session.job + ".binding.json"), binding)
+        shipped = []
+
+        def ship(argv, stdin):
+            # The REAL worker script, on a directory standing in for
+            # /workspace/source: what it writes is what a worker would hold.
+            shipped.append(argv[4:])
+            if fail_on is not None and fail_on in argv:
+                return subprocess.CompletedProcess(argv, 1, b"", b"fixture transport failure")
+            local = [*argv]
+            local[3] = local[3].replace("/workspace/source", str(worker))
+            return subprocess.run(local, input=stdin, capture_output=True, check=False)
+
+        def local_git(args, stdin=None):
+            return self.mod.local_git(repo, args, lambda receipt: None, run=host_git, stdin=stdin)
+        return root, session, binding, ship, shipped, local_git
+
+    def test_a_commit_that_descends_from_the_synced_head_is_shipped_and_the_binding_follows_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, worker, a = self.worktree(tmp)
+            root, session, binding, ship, shipped, local_git = self.follower(tmp, repo, worker, a)
+            (repo / "crates/x/src/lib.rs").write_bytes(b"pub fn b() {}\n")
+            (repo / "crates/y").mkdir()
+            (repo / "crates/y/new.rs").write_bytes(b"// added by the commit\n")
+            (repo / "tool.sh").write_bytes(b"#!/bin/sh\necho two\n")
+            git(repo, "rm", "-q", "gone.txt")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", "B")
+            b = git(repo, "rev-parse", "HEAD")
+            before = (root / (session.job + ".binding.json")).read_bytes()
+
+            self.assertEqual(self.mod.resync(session, binding, a, b, root, local_git, ship), b)
+
+            self.assertEqual((worker / "crates/x/src/lib.rs").read_bytes(), b"pub fn b() {}\n")
+            self.assertEqual((worker / "crates/y/new.rs").read_bytes(), b"// added by the commit\n")
+            self.assertEqual((worker / "tool.sh").read_bytes(), b"#!/bin/sh\necho two\n")
+            self.assertTrue(os.access(worker / "tool.sh", os.X_OK), "an executable stays executable")
+            self.assertFalse((worker / "gone.txt").exists())
+            # A receipt per path: the sha256 the worker printed, or removed.
+            record = self.mod.load_record(root / (session.job + ".sync-" + a + ".json"))
+            self.assertEqual((record["admitted_head"], record["from"], record["synced_head"]), (a, a, b))
+            receipts = {r["path"]: r for r in record["paths"]}
+            self.assertEqual(set(receipts), {"crates/x/src/lib.rs", "crates/y/new.rs", "tool.sh", "gone.txt"})
+            self.assertEqual(receipts["crates/y/new.rs"]["sha256"], hashlib.sha256(b"// added by the commit\n").hexdigest())
+            self.assertEqual(receipts["gone.txt"]["result"], "removed")
+            # admitted_head stays the fetched sha: the binding is untouched,
+            # and the synced head is followed beside it.
+            self.assertEqual((root / (session.job + ".binding.json")).read_bytes(), before)
+            self.assertEqual(self.mod.followed_head(root, binding), b)
+            self.mod.check_binding(binding, session, b, self.mod.followed_head(root, binding))
+            with self.assertRaises(ValueError):
+                self.mod.check_binding(binding, session, a, self.mod.followed_head(root, binding))
+            # The next commit follows from B, not from the admitted sha.
+            (repo / "crates/y/new.rs").write_bytes(b"// changed again\n")
+            git(repo, "commit", "-q", "-am", "C")
+            c = git(repo, "rev-parse", "HEAD")
+            shipped.clear()
+            self.assertEqual(self.mod.resync(session, binding, b, c, root, local_git, ship), c)
+            # The changed path, then the worker's git HEAD (46b63903).
+            self.assertEqual(shipped, [["put", "crates/y/new.rs", "644"], [c]])
+            self.assertEqual(self.mod.followed_head(root, binding), c)
+            # An empty commit ships no path and still moves the binding.
+            git(repo, "commit", "-q", "--allow-empty", "-m", "D")
+            d = git(repo, "rev-parse", "HEAD")
+            shipped.clear()
+            self.assertEqual(self.mod.resync(session, binding, c, d, root, local_git, ship), d)
+            self.assertEqual((shipped, self.mod.followed_head(root, binding)), ([[d]], d))
+
+    # Backlog 46b63903 (2026-10-22, run 96f79210 on f7b43945): the put
+    # door carried every file and the record followed the commit, but the
+    # worker's git stayed at the admitted sha, so a probe rehearsal reading
+    # `git show HEAD:` through exec-auto read a tree the worker no longer
+    # held, and `git status` there called the builder's commit unstaged
+    # edits. The worker's HEAD is now the followed commit itself.
+    def test_a_re_sync_moves_the_workers_git_head_to_the_followed_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, worker, a = self.worktree(tmp)
+            root, session, binding, ship, shipped, local_git = self.follower(tmp, repo, worker, a)
+            (repo / "crates/x/src/lib.rs").write_bytes(b"pub fn b() {}\n")
+            git(repo, "commit", "-q", "-am", "B")
+            b = git(repo, "rev-parse", "HEAD")
+            self.assertEqual(self.mod.resync(session, binding, a, b, root, local_git, ship), b)
+            self.assertEqual(git(worker, "rev-parse", "HEAD"), b)
+            self.assertEqual(git(worker, "show", "HEAD:crates/x/src/lib.rs"), "pub fn b() {}")
+            self.assertEqual(git(worker, "status", "--porcelain"), "", "the commit is HEAD, not unstaged edits")
+            record = self.mod.load_record(root / (session.job + ".sync-" + a + ".json"))
+            self.assertEqual(record["git_head"]["head"], b)
+            # A worker re-synced before this fix holds B's files with its
+            # HEAD still at the admitted sha: the objects reach back to the
+            # admitted sha, which every worker fetched, so it follows too.
+            git(worker, "reset", "-q", "--mixed", a)
+            self.assertEqual(git(worker, "status", "--porcelain"), "M crates/x/src/lib.rs", "the old worker's shape")
+            (repo / "tool.sh").write_bytes(b"#!/bin/sh\necho three\n")
+            git(repo, "commit", "-q", "-am", "C")
+            c = git(repo, "rev-parse", "HEAD")
+            self.assertEqual(self.mod.resync(session, binding, b, c, root, local_git, ship), c)
+            self.assertEqual(git(worker, "rev-parse", "HEAD"), c)
+            self.assertEqual(git(worker, "status", "--porcelain"), "")
+            # An empty commit ships no path and still moves HEAD.
+            git(repo, "commit", "-q", "--allow-empty", "-m", "D")
+            d = git(repo, "rev-parse", "HEAD")
+            self.assertEqual(self.mod.resync(session, binding, c, d, root, local_git, ship), d)
+            self.assertEqual(git(worker, "rev-parse", "HEAD"), d)
+            for named in ("HEAD", "main", "-q", d[:12]):
+                with self.assertRaises(ValueError):
+                    self.mod.source_head_argv(named)
+
+    def test_objects_over_the_put_doors_bound_refuse_before_anything_ships(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, worker, a = self.worktree(tmp)
+            root, session, binding, ship, shipped, local_git = self.follower(tmp, repo, worker, a)
+            (repo / "noise.bin").write_bytes(os.urandom(90))
+            git(repo, "add", "noise.bin")
+            git(repo, "commit", "-q", "-m", "B")
+            b = git(repo, "rev-parse", "HEAD")
+            # The file fits the bound; the commit's objects around it do not.
+            limit, self.mod.SOURCE_LIMIT = self.mod.SOURCE_LIMIT, 100
+            try:
+                with self.assertRaises(ValueError) as refused:
+                    self.mod.resync(session, binding, a, b, root, local_git, ship)
+            finally:
+                self.mod.SOURCE_LIMIT = limit
+            self.assertIn("objects", str(refused.exception))
+            self.assertIn("dev-build stop " + session.job, str(refused.exception))
+            self.assertEqual(shipped, [])
+            self.assertEqual(git(worker, "rev-parse", "HEAD"), a)
+
+    def test_a_head_that_does_not_descend_from_the_synced_head_refuses_naming_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, worker, a = self.worktree(tmp)
+            root, session, binding, ship, shipped, local_git = self.follower(tmp, repo, worker, a)
+            (repo / "gone.txt").write_bytes(b"one line\n")
+            git(repo, "commit", "-q", "-am", "B")
+            b = git(repo, "rev-parse", "HEAD")
+            git(repo, "reset", "-q", "--hard", a)
+            (repo / "gone.txt").write_bytes(b"another line\n")
+            git(repo, "commit", "-q", "-am", "B'")
+            sibling = git(repo, "rev-parse", "HEAD")
+            self.assertEqual(self.mod.resync(session, binding, a, b, root, local_git, ship), b)
+            shipped.clear()
+            with self.assertRaises(ValueError) as refused:
+                self.mod.resync(session, binding, b, sibling, root, local_git, ship)
+            self.assertIn("does not descend", str(refused.exception))
+            self.assertIn("dev-build stop " + session.job, str(refused.exception))
+            self.assertEqual(shipped, [], "a refused re-sync ships nothing")
+            self.assertEqual(self.mod.followed_head(root, binding), b)
+
+    def test_a_symlink_submodule_mode_change_oversize_file_or_forbidden_path_refuses_before_anything_ships(self):
+        # Each stages its own change; the gitlink has no directory, so a
+        # blanket `add -A` after it would stage it away again.
+        def symlink(repo):
+            os.symlink("crates/x/src/lib.rs", repo / "link")
+            git(repo, "add", "link")
+        def submodule(repo):
+            git(repo, "update-index", "--add", "--cacheinfo", "160000," + "1" * 40 + ",vendored")
+        def mode_only(repo):
+            (repo / "gone.txt").chmod(0o755)
+            git(repo, "add", "gone.txt")
+        def oversize(repo):
+            (repo / "big.bin").write_bytes(b"x" * (16 * 1024 * 1024 + 1))
+            git(repo, "add", "big.bin")
+        def forbidden(repo):
+            (repo / ".cargo").mkdir()
+            (repo / ".cargo/config.toml").write_bytes(b"[build]\n")
+            git(repo, "add", ".cargo/config.toml")
+        cases = {"symlink": (symlink, "symlink"), "submodule": (submodule, "submodule"),
+                 "mode": (mode_only, "mode change"), "oversize": (oversize, "16 MiB"),
+                 "forbidden": (forbidden, ".cargo/config.toml")}
+        for case, (change, named) in cases.items():
+            with self.subTest(case), tempfile.TemporaryDirectory() as tmp:
+                repo, worker, a = self.worktree(tmp)
+                root, session, binding, ship, shipped, local_git = self.follower(tmp, repo, worker, a)
+                # A good path beside the bad one: nothing ships, not even it.
+                (repo / "crates/x/src/lib.rs").write_bytes(b"pub fn ok() {}\n")
+                git(repo, "add", "-A")
+                change(repo)
+                git(repo, "commit", "-q", "-m", case)
+                head = git(repo, "rev-parse", "HEAD")
+                with self.assertRaises(ValueError) as refused:
+                    self.mod.resync(session, binding, a, head, root, local_git, ship)
+                self.assertIn(named, str(refused.exception))
+                self.assertIn("dev-build stop " + session.job, str(refused.exception))
+                self.assertEqual(shipped, [])
+                self.assertEqual((worker / "crates/x/src/lib.rs").read_bytes(), b"pub fn a() {}\n")
+                self.assertEqual(self.mod.followed_head(root, binding), a)
+
+    def test_a_re_sync_that_fails_part_way_does_not_advance_and_a_retry_completes_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, worker, a = self.worktree(tmp)
+            root, session, binding, ship, shipped, local_git = self.follower(tmp, repo, worker, a, fail_on="tool.sh")
+            (repo / "crates/x/src/lib.rs").write_bytes(b"pub fn b() {}\n")
+            (repo / "tool.sh").write_bytes(b"#!/bin/sh\necho two\n")
+            git(repo, "commit", "-q", "-am", "B")
+            b = git(repo, "rev-parse", "HEAD")
+            with self.assertRaises(RuntimeError) as failed:
+                self.mod.resync(session, binding, a, b, root, local_git, ship)
+            self.assertIn("tool.sh", str(failed.exception))
+            # The receipt comes before the advance: no sync record, the
+            # binding still at A, and the intent names what was attempted.
+            self.assertEqual(self.mod.followed_head(root, binding), a)
+            self.assertFalse((root / (session.job + ".sync-" + a + ".json")).exists())
+            intents = [self.mod.load_record(p) for p in root.glob(session.job + ".resync-intent-*.json")]
+            self.assertEqual([(i["from"], i["to"]) for i in intents], [(a, b)])
+            # A head whose diff no longer covers the interrupted paths
+            # cannot say what the worker holds: refused, naming stop.
+            git(repo, "reset", "-q", "--hard", a)
+            (repo / "gone.txt").write_bytes(b"elsewhere\n")
+            git(repo, "commit", "-q", "-am", "B'")
+            other = git(repo, "rev-parse", "HEAD")
+            with self.assertRaises(ValueError) as refused:
+                self.mod.resync(session, binding, a, other, root, local_git, ship)
+            self.assertIn("interrupted", str(refused.exception))
+            self.assertIn("dev-build stop " + session.job, str(refused.exception))
+            # The retry on the same head re-ships every path and advances.
+            git(repo, "reset", "-q", "--hard", b)
+            def ok(argv, stdin):
+                local = [*argv]
+                local[3] = local[3].replace("/workspace/source", str(worker))
+                return subprocess.run(local, input=stdin, capture_output=True, check=False)
+            self.assertEqual(self.mod.resync(session, binding, a, b, root, local_git, ok), b)
+            self.assertEqual((worker / "tool.sh").read_bytes(), b"#!/bin/sh\necho two\n")
+            self.assertEqual(self.mod.followed_head(root, binding), b)
+
+    def caller_input_with_stdin(self, stdin, verb, *flags):
+        # The caller's real sys.stdin in a child: stdin=None in the code
+        # below CLOSES fd 0 there (preexec), which makes sys.stdin None,
+        # the shape `<&-` gives (backlog 267af53d).
+        code = (
+            "import importlib.util, sys\n"
+            "spec = importlib.util.spec_from_file_location('dev_build', sys.argv[1])\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "try:\n"
+            "    data = mod.caller_input(sys.argv[2], 'forward' in sys.argv[3:], sys.stdin, 'allow-empty' in sys.argv[3:])\n"
+            "except ValueError as error:\n"
+            "    print('REFUSED ' + str(error))\n"
+            "    sys.exit(75)\n"
+            "print(repr(data))\n"
+        )
+        closed = stdin is None
+        return subprocess.run(
+            [sys.executable, "-I", "-c", code, self.mod.__file__, verb, *flags],
+            stdin=subprocess.DEVNULL if closed else stdin, capture_output=True, timeout=5, check=False,
+            preexec_fn=(lambda: os.close(0)) if closed else None)
+
+    def test_a_put_with_no_input_refuses_and_sends_nothing(self):
+        # Backlog 06e994f7 (run df127edb, 2026-10-19): `put <s> <path>`
+        # without `< file` wrote an EMPTY file over a test, a script and
+        # a verb in one worker, each answering e3b0c442..., the sha256
+        # of nothing. Zero bytes is refused unless asked for by name.
+        result = self.caller_input_with_stdin(subprocess.DEVNULL, "put")
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertIn(b"zero bytes", result.stdout)
+        self.assertIn(b"< <file>", result.stdout)
+        self.assertIn(b"--allow-empty", result.stdout)
+        allowed = self.caller_input_with_stdin(subprocess.DEVNULL, "put", "allow-empty")
+        self.assertEqual(allowed.stdout, b"b''\n", allowed.stderr)
+        parser = self.mod.arguments()
+        self.assertTrue(parser.parse_args(["put", "--allow-empty", "dev-build-1234567890abcdef", "a.txt"]).allow_empty)
+        self.assertFalse(parser.parse_args(["put", "dev-build-1234567890abcdef", "a.txt"]).allow_empty)
+        with tempfile.TemporaryFile() as given:
+            given.write(b"the file")
+            given.seek(0)
+            self.assertEqual(self.caller_input_with_stdin(given, "put").stdout, b"b'the file'\n")
+
+    def test_a_put_from_a_terminal_refuses_before_reading(self):
+        class Terminal:
+            def isatty(self):
+                return True
+
+            def read(self, size=-1):
+                raise AssertionError("a terminal stdin was read")
+
+        class Stdin:
+            buffer = Terminal()
+
+        with self.assertRaisesRegex(ValueError, "terminal.*< <file>"):
+            self.mod.caller_input("put", False, Stdin(), False)
+
+    def test_a_closed_stdin_is_a_named_refusal_not_a_traceback(self):
+        # Backlog 267af53d (review 42ea788b): with fd 0 closed sys.stdin
+        # is None and `sys.stdin.buffer` raised an AttributeError the
+        # REFUSED handler does not catch, so every verb printed a trace.
+        for verb, flags in (("put", ()), ("put", ("allow-empty",)), ("exec", ("forward",))):
+            result = self.caller_input_with_stdin(None, verb, *flags)
+            self.assertEqual(result.returncode, 75, (verb, result.stderr))
+            self.assertIn(b"stdin is closed", result.stdout, verb)
+            self.assertNotIn(b"Traceback", result.stderr, verb)
+        for verb in ("exec", "exec-auto", "get"):
+            result = self.caller_input_with_stdin(None, verb)
+            self.assertEqual((result.returncode, result.stdout), (0, b"b''\n"), (verb, result.stderr))
+
+    def test_the_remove_operation_keeps_the_put_doors_path_rules_and_removes_only_a_regular_file(self):
+        for path in ("../control", ".git/config", "target/debug/boss", "apps/web/node_modules/x.js"):
+            with self.assertRaises(ValueError):
+                self.mod.source_file_argv("remove", path)
+        for mode in ("777", "4755", "../x"):
+            with self.assertRaises(ValueError):
+                self.mod.source_file_argv("put", "a.txt", mode)
+        with self.assertRaises(ValueError):
+            self.mod.source_file_argv("exec", "a.txt")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "dir/sub").mkdir(parents=True)
+            (root / "dir/file.txt").write_bytes(b"x")
+            os.symlink("file.txt", root / "dir/link")
+
+            def remove(path):
+                argv = self.mod.source_file_argv("remove", path)
+                argv[3] = argv[3].replace("/workspace/source", str(root))
+                return subprocess.run(argv, capture_output=True, check=False)
+            self.assertEqual(remove("dir/file.txt").stdout, b"removed\n")
+            self.assertFalse((root / "dir/file.txt").exists())
+            self.assertEqual(remove("dir/file.txt").stdout, b"absent\n")
+            self.assertEqual(remove("missing/dir/file.txt").stdout, b"absent\n")
+            self.assertNotEqual(remove("dir/sub").returncode, 0)
+            self.assertNotEqual(remove("dir/link").returncode, 0)
+            self.assertTrue((root / "dir/link").is_symlink(), "a symlink is never removed through the door")
+
+    # Review b831d89e of car de0ed3a1 (B1, probe P1): two exec-autos from
+    # one worktree with a commit between them each read the held head
+    # unlocked, so one recorded X to H2 while the other's put of f.txt at
+    # H1 landed after it; the record said H2, the worker held H1's bytes,
+    # and the next exec-auto at H2 ran without refusing.
+    def three_commits(self, tmp):
+        repo, worker, x = self.worktree(tmp)
+        (repo / "gone.txt").write_bytes(b"H1\n")
+        git(repo, "commit", "-q", "-am", "H1")
+        h1 = git(repo, "rev-parse", "HEAD")
+        (repo / "gone.txt").write_bytes(b"H2\n")
+        (repo / "crates/x/src/lib.rs").write_bytes(b"pub fn h2() {}\n")
+        git(repo, "commit", "-q", "-am", "H2")
+        return repo, worker, x, h1, git(repo, "rev-parse", "HEAD")
+
+    def test_two_exec_autos_from_one_worktree_take_turns_and_the_record_matches_the_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, worker, x, h1, h2 = self.three_commits(tmp)
+            root, session, binding, ship, shipped, local_git = self.follower(tmp, repo, worker, x)
+            a_shipping, release = threading.Event(), threading.Event()
+
+            def held_open(argv, stdin):
+                # exec-auto A stops inside its first put until released.
+                a_shipping.set()
+                release.wait(10)
+                return ship(argv, stdin)
+            results = {}
+
+            def run(name, head, through):
+                try:
+                    results[name] = self.mod.follow(session, binding, head, root, local_git, through)
+                except Exception as error:  # the test reads what each answered
+                    results[name] = error
+            a = threading.Thread(target=run, args=("A", h1, held_open))
+            a.start()
+            self.assertTrue(a_shipping.wait(10))
+            before = len(shipped)
+            b = threading.Thread(target=run, args=("B", h2, ship))
+            b.start()
+            b.join(0.5)
+            # B waits on A's lock: it has neither read the held head nor
+            # shipped a byte while A is part way through its re-sync.
+            self.assertTrue(b.is_alive(), "a second exec-auto must wait for the first one's re-sync")
+            self.assertEqual(len(shipped), before)
+            release.set()
+            a.join(10)
+            b.join(10)
+            self.assertEqual(results["A"], (x, h1))
+            # B read the head under the lock, after A recorded: H1 to H2.
+            self.assertEqual(results["B"], (h1, h2))
+            self.assertEqual(self.mod.followed_head(root, binding), h2)
+            self.assertEqual((worker / "gone.txt").read_bytes(), b"H2\n")
+            self.assertEqual((worker / "crates/x/src/lib.rs").read_bytes(), b"pub fn h2() {}\n")
+
+    def test_a_re_sync_that_loses_the_record_says_it_shipped_and_the_next_exec_auto_refuses(self):
+        # The unlocked race itself, run as P1 runs it: B whole inside A's
+        # first put. The lock keeps exec-auto out of it; if anything does
+        # reach it, the loser leaves an intent from the RECORDED head.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, worker, x, h1, h2 = self.three_commits(tmp)
+            root, session, binding, ship, shipped, local_git = self.follower(tmp, repo, worker, x)
+            first = {"yes": True}
+
+            def racing(argv, stdin):
+                if first.pop("yes", False):
+                    self.assertEqual(self.mod.resync(session, binding, x, h2, root, local_git, ship), h2)
+                return ship(argv, stdin)
+            with self.assertRaises(ValueError) as lost:
+                self.mod.resync(session, binding, x, h1, root, local_git, racing)
+            self.assertNotIn("nothing shipped", str(lost.exception))
+            self.assertIn("dev-build stop " + session.job, str(lost.exception))
+            self.assertEqual(self.mod.followed_head(root, binding), h2)
+            self.assertEqual((worker / "gone.txt").read_bytes(), b"H1\n", "the fixture reproduces P1")
+            # The record says H2 and the worker does not hold it: the next
+            # exec-auto at H2 refuses rather than build on that tree.
+            with self.assertRaises(ValueError) as refused:
+                self.mod.resync(session, binding, h2, h2, root, local_git, ship)
+            self.assertIn("interrupted", str(refused.exception))
+            self.assertIn("dev-build stop " + session.job, str(refused.exception))
+
+    def test_a_replace_ref_cannot_ship_bytes_the_commit_does_not_name(self):
+        # Review b831d89e N1 (probe P2): `git replace` in the worktree's
+        # repository made the re-sync ship another blob's bytes under a
+        # record naming the commit.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, worker, x = self.worktree(tmp)
+            root, session, binding, ship, shipped, local_git = self.follower(tmp, repo, worker, x)
+            (repo / "gone.txt").write_bytes(b"committed\n")
+            git(repo, "commit", "-q", "-am", "H")
+            h = git(repo, "rev-parse", "HEAD")
+            real = git(repo, "rev-parse", h + ":gone.txt")
+            (Path(tmp) / "other").write_bytes(b"not what the commit names\n")
+            other = git(repo, "hash-object", "-w", str(Path(tmp) / "other"))
+            git(repo, "replace", real, other)
+            self.assertEqual(self.mod.resync(session, binding, x, h, root, local_git, ship), h)
+            self.assertEqual((worker / "gone.txt").read_bytes(), b"committed\n")
+            record = self.mod.load_record(root / (session.job + ".sync-" + x + ".json"))
+            self.assertEqual(record["paths"][0]["sha256"], hashlib.sha256(b"committed\n").hexdigest())
+
+    def test_a_blob_whose_bytes_do_not_hash_to_its_id_stops_before_it_ships(self):
+        # The same check without trusting git's configuration: the bytes
+        # read for a blob id must be that id's bytes.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, worker, x = self.worktree(tmp)
+            root, session, binding, ship, shipped, _ = self.follower(tmp, repo, worker, x)
+            (repo / "gone.txt").write_bytes(b"committed\n")
+            git(repo, "commit", "-q", "-am", "H")
+            h = git(repo, "rev-parse", "HEAD")
+
+            def lying_git(args, stdin=None):
+                answer = self.mod.local_git(repo, args, lambda receipt: None, run=host_git, stdin=stdin)
+                if args[:2] == ["cat-file", "blob"]:
+                    return subprocess.CompletedProcess(answer.args, 0, b"other bytes\n", b"")
+                return answer
+            with self.assertRaises(RuntimeError) as stopped:
+                self.mod.resync(session, binding, x, h, root, lying_git, ship)
+            self.assertIn("gone.txt", str(stopped.exception))
+            self.assertEqual(shipped, [])
+            self.assertEqual(self.mod.followed_head(root, binding), x)
+
+    def test_a_commit_that_turns_a_directory_into_a_file_refuses_naming_stop(self):
+        # Review b831d89e N2 (probe P3): the put of d onto the directory d
+        # failed at os.replace on every retry while the message promised a
+        # retry would ship it, and the remove never deletes a directory, so
+        # no order of the two could succeed. Refused when planned.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, worker, x = self.worktree(tmp)
+            root, session, binding, ship, shipped, local_git = self.follower(tmp, repo, worker, x)
+            git(repo, "rm", "-q", "-r", "crates/x/src")
+            (repo / "crates/x").mkdir(parents=True, exist_ok=True)
+            (repo / "crates/x/src").write_bytes(b"now a file\n")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", "directory to file")
+            head = git(repo, "rev-parse", "HEAD")
+            with self.assertRaises(ValueError) as refused:
+                self.mod.resync(session, binding, x, head, root, local_git, ship)
+            self.assertIn("crates/x/src replaces a directory", str(refused.exception))
+            self.assertIn("dev-build stop " + session.job, str(refused.exception))
+            self.assertEqual(shipped, [])
+            self.assertEqual(self.mod.followed_head(root, binding), x)
+
+    def test_a_commit_that_turns_a_file_into_a_directory_is_shipped(self):
+        # The other direction already works and stays working: git lists
+        # the file's removal before the new directory's file, and the put
+        # door makes the directory once the file is gone.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, worker, x = self.worktree(tmp)
+            root, session, binding, ship, shipped, local_git = self.follower(tmp, repo, worker, x)
+            git(repo, "rm", "-q", "gone.txt")
+            (repo / "gone.txt").mkdir()
+            (repo / "gone.txt/inside.txt").write_bytes(b"now a directory\n")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", "file to directory")
+            head = git(repo, "rev-parse", "HEAD")
+            self.assertEqual(self.mod.resync(session, binding, x, head, root, local_git, ship), head)
+            self.assertEqual((worker / "gone.txt/inside.txt").read_bytes(), b"now a directory\n")
+
+    # Backlog 3165dc62 (2026-10-19): the refusal said only "stop the old
+    # session", naming neither the session nor the start that follows, and
+    # an operator who started a new one without stopping left the old
+    # binding LIVE. It names both verbs, exactly, in the order they work.
+    def test_a_stale_binding_names_the_stop_then_the_start_that_repair_it(self):
+        session = self.mod.Session("dev-build-57373249e9754af4", "job-uid", "pod", "pod-uid", "container-id", "a" * 40)
+        binding = {"session": session.job, "local_root": "/work/boss", "source_head": "a" * 40}
+        with self.assertRaises(ValueError) as raised:
+            self.mod.check_binding(binding, session, "c" * 40)
+        message = str(raised.exception)
+        self.assertTrue(message.startswith("source binding is stale"), message)
+        stop = message.index("`dev-build stop dev-build-57373249e9754af4`")
+        start = message.index("`dev-build start " + "c" * 40 + " --local-root /work/boss`")
+        self.assertLess(stop, start, "retire first, then admit the new source")
+        self.assertIn("a" * 40, message, "the head the session is bound to")
+        # Car de0ed3a1 split the check: a binding naming another worker is
+        # refused by same_worker, in the same named-verb words (merge of
+        # 7893b4c9, run 20302afe).
+        other = dict(binding, session="dev-build-ffffffffffffffff")
+        with self.assertRaises(ValueError) as raised:
+            self.mod.same_worker(other, session, "c" * 40)
+        self.assertIn("`dev-build stop dev-build-ffffffffffffffff`", str(raised.exception))
+        self.assertIn("`dev-build start " + "c" * 40 + " --local-root /work/boss`", str(raised.exception))
 
     def test_retirement_blocks_execution_and_preserves_unknown_outcome(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -405,9 +1181,115 @@ class ControllerContract(unittest.TestCase):
             self.assertEqual(calls, [(session.job, session.job_uid)])
             self.assertTrue(self.mod.retirement_requested(root, session.job))
             self.assertFalse((root / (session.job + ".retired.json")).exists())
-            with self.assertRaises((ValueError, FileExistsError)):
+            self.assertEqual(len(calls), 1, "one stop attempts the delete once; it never loops on its own")
+
+    # Backlog bc8db3ba (2026-10-18): the retire-intent was published with
+    # os.link before the delete, so after one failed delete every later
+    # `dev-build stop` refused with File exists and never reached the API.
+    # A retry is safe because the delete is conditioned on the Job's UID.
+    def test_a_failed_retirement_is_retried_by_the_next_stop_and_only_for_its_own_job(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = self.mod.Session("dev-build-1234567890abcdef", "known-job-uid", "pod", "pod-uid", "container-id", "a" * 40, "volume-uid")
+            calls = []
+            def delete(name, uid, record):
+                calls.append((name, uid))
+                record({"completion": "observed"})
+                if len(calls) == 1:
+                    raise RuntimeError("UID-conditioned Job retirement unavailable; outcome retained, no retry")
+                return {"kind": "Status", "status": "Success"}
+            with self.assertRaises(RuntimeError):
                 self.mod.retire_worker(session, root, delete)
-            self.assertEqual(len(calls), 1, "unknown retirement is never blindly retried")
+            intent = (root / (session.job + ".retire-intent.json")).read_bytes()
+            # The operator's handle for an unadmitted worker carries no pod.
+            handle = self.mod.Session(session.job, session.job_uid, "", "", "", "a" * 40, "volume-uid")
+            record = self.mod.retire_worker(handle, root, delete)
+            self.assertEqual(record["state"], "local execution retired")
+            self.assertEqual(calls, [(session.job, session.job_uid)] * 2, "the second stop attempts the UID-conditioned delete again")
+            self.assertEqual((root / (session.job + ".retire-intent.json")).read_bytes(), intent, "the first intent is kept, never replaced")
+            self.assertEqual(len(list(root.glob(session.job + ".lifecycle-*.json"))), 2, "each attempt keeps its own receipt")
+            self.assertEqual(self.mod.retire_worker(handle, root, delete), record, "a retired worker answers its record")
+            self.assertEqual(len(calls), 2, "a retired worker is not deleted again")
+            other = self.mod.Session(session.job, "replacement-uid", "", "", "", "a" * 40, "volume-uid")
+            with self.assertRaisesRegex(ValueError, "known-job-uid"):
+                self.mod.retire_worker(other, root, delete)
+            self.assertEqual(len(calls), 2, "an intent for another incarnation authorizes no delete")
+
+    # Backlog cae3b25b (2026-10-20): a delete that succeeded on the server
+    # but whose answer was lost leaves the intent on file; the retry then
+    # meets a 404, which refused as "refused by API" forever. A NotFound
+    # naming this Job, on a retry of an intent recorded for this same Job
+    # name and UID, is the retirement having happened.
+    def notfound(self, name):
+        return {"kind": "Status", "status": "Failure", "reason": "NotFound", "code": 404,
+                "details": {"name": name, "group": "batch", "kind": "jobs"}}
+
+    def test_a_retried_delete_that_finds_the_job_gone_records_it_retired_with_the_404(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = self.mod.Session("dev-build-1234567890abcdef", "known-job-uid", "", "", "", "a" * 40, "volume-uid")
+            calls = []
+            def delete(name, uid, record):
+                calls.append((name, uid))
+                record({"completion": "unproven" if len(calls) == 1 else "observed"})
+                if len(calls) == 1:
+                    raise RuntimeError("UID-conditioned Job retirement unavailable; outcome retained, no retry")
+                return self.notfound(name)
+            with self.assertRaises(RuntimeError):
+                self.mod.retire_worker(session, root, delete)
+            record = self.mod.retire_worker(session, root, delete)
+            self.assertEqual(record["state"], "local execution retired")
+            self.assertTrue(record["job_absent"])
+            self.assertFalse(record["job_delete_acknowledged"], "no delete was acknowledged; the 404 is the receipt")
+            self.assertEqual(record["job_absent_receipt"], self.notfound(session.job))
+            self.assertEqual(json.loads((root / (session.job + ".retired.json")).read_text()), record)
+            self.assertEqual(self.mod.retire_worker(session, root, delete), record, "a retired worker answers its record")
+            self.assertEqual(len(calls), 2, "a retired worker is not deleted again")
+
+    # Backlog 3165dc62 (2026-10-19), and review 82b47175's N1 on 678fd302:
+    # session dev-build-57373249e9754af4's Job was removed by its TTL or
+    # the 10-18 clean-up, so the FIRST stop met 404 and refused, and the
+    # stale-binding refusal sent the operator to that stop. A NotFound for
+    # this Job's name proves no Job of that name exists, so none with its
+    # UID (a same-name replacement answers 409 on the UID precondition,
+    # never 404). The choice is: this Job's NotFound retires it on ANY
+    # attempt, and the record says whether an earlier intent existed.
+    def test_a_first_stop_that_finds_the_job_gone_records_the_404_as_its_retirement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = self.mod.Session("dev-build-57373249e9754af4", "known-job-uid", "pod", "pod-uid", "container-id", "a" * 40, "volume-uid")
+            calls = []
+            def delete(name, uid, record):
+                calls.append((name, uid))
+                record({"completion": "observed", "http_status": 404})
+                return self.notfound(name)
+            record = self.mod.retire_worker(session, root, delete)
+            self.assertEqual(record["state"], "local execution retired")
+            self.assertTrue(record["job_absent"])
+            self.assertFalse(record["job_delete_acknowledged"], "no delete was acknowledged; the 404 is the receipt")
+            self.assertFalse(record["retried_intent"], "the record says no earlier stop asked")
+            self.assertEqual(record["job_absent_receipt"], self.notfound(session.job))
+            self.assertEqual(json.loads((root / (session.job + ".retired.json")).read_text()), record)
+            self.assertEqual(self.mod.retire_worker(session, root, delete), record, "a retired worker answers its record")
+            self.assertEqual(len(calls), 1, "a retired worker is not deleted again")
+
+    def test_a_404_for_another_name_or_not_a_batch_job_is_not_a_retirement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session = self.mod.Session("dev-build-1234567890abcdef", "known-job-uid", "", "", "", "a" * 40, "volume-uid")
+            # A NotFound for some other name proves nothing about this Job.
+            with self.assertRaisesRegex(RuntimeError, "execution stays disabled"):
+                self.mod.retire_worker(session, root, lambda name, uid, record: self.notfound("dev-build-ffffffffffffffff"))
+            self.assertTrue(self.mod.retirement_requested(root, session.job))
+            self.assertFalse((root / (session.job + ".retired.json")).exists())
+            # Review 82b47175 N2: the controller's check is the lifecycle
+            # client's own, so a NotFound naming this Job but not as a
+            # batch Job, or without code 404, retires nothing either.
+            for key, value in (("code", 410), ("details", {"name": session.job, "group": "", "kind": "pods"})):
+                answer = dict(self.notfound(session.job), **{key: value})
+                with self.assertRaisesRegex(RuntimeError, "execution stays disabled"):
+                    self.mod.retire_worker(session, root, lambda name, uid, record: answer)
+                self.assertFalse((root / (session.job + ".retired.json")).exists(), key)
 
     def test_public_probe_values_are_worker_argv_and_never_controller_environment(self):
         argv = self.mod.probe_argv(["printf", "literal;touch /control"], ["BOSS_JOBS_URL=http://probe.invalid:7900", "BOSS_CAR_CONVERGED_AT=example time"])
@@ -415,6 +1297,84 @@ class ControllerContract(unittest.TestCase):
         for entry in ("BASH_ENV=/candidate", "PATH=/candidate", "BOSS_ACTOR=admin", "BOSS_MACHINE_TOKEN=secret", "BOSS_JOBS_URL=bad\0value"):
             with self.assertRaises(ValueError):
                 self.mod.probe_argv(["true"], [entry])
+
+    def test_a_preflight_reader_is_handed_the_edit_level_the_controller_read_through_the_door(self):
+        # Backlog bc6afd15 (2026-10-18, run 46a922d6): `exec-auto -- /bin/bash
+        # infra/gate.sh --lint` refused with exit 2 before judging anything,
+        # because a-car-stays-under-the-edit-level asked the instance itself
+        # from a worker that has, by design, no route to it: HTTP 000. The
+        # controller holds the door; it reads the level once and hands it in.
+        root = "/work/boss/.claude/worktrees/agent-x"
+        reads = []
+        def door():
+            reads.append(1)
+            return subprocess.CompletedProcess([], 0, b'{"edit_level": null, "manifest": "tenant.toml"}\n', b"")
+        handed = ["BOSS_EDIT_LEVEL_ANSWER=" + json.dumps({"edit_level": None, "manifest": "tenant.toml"}, separators=(",", ":"), sort_keys=True)]
+        for cwd, argv in (
+            (root, ["/bin/bash", "infra/lint/a-car-stays-under-the-edit-level.sh"]),
+            (root, ["/bin/bash", "infra/gate.sh", "--lint"]),
+            (root, ["bash", "infra/gate.sh", "--quick"]),
+            (root, ["infra/gate.sh", "--lint"]),
+            (root + "/infra", ["/bin/bash", "lint/a-car-stays-under-the-edit-level.sh"]),
+            ("/work/home", ["/bin/bash", root + "/infra/lint/a-car-stays-under-the-edit-level.sh"]),
+        ):
+            self.assertEqual(self.mod.edit_level_hand_in(argv, cwd, root, [], door), handed, argv)
+        self.assertEqual(len(reads), 6, "one door read per reader execution")
+
+    def test_no_other_worker_program_is_handed_the_edit_level_or_costs_a_read(self):
+        # Exported to every exec, the answer would reach the suites that run
+        # this lint against a stub registry and be judged instead of the stub
+        # (the class gate-run 5d576fba went red on; gate.sh scopes it to the
+        # pre-flight for the same reason). So only the two readers get it.
+        root = "/work/boss/.claude/worktrees/agent-x"
+        def door():
+            raise AssertionError("no door read for a program that does not read the level")
+        for cwd, argv in (
+            (root, ["/bin/bash", "infra/gate.sh"]),
+            (root, ["/workspace/source/infra/dev/wt-cargo", "test", "-p", "boss-testing"]),
+            (root, ["/bin/bash", "infra/lint/another-lint.sh"]),
+            (root, ["/bin/bash", "/elsewhere/infra/lint/a-car-stays-under-the-edit-level.sh"]),
+            (root, ["/bin/bash", "-c", "infra/gate.sh --lint"]),
+            (root, ["/bin/bash"]),
+        ):
+            self.assertEqual(self.mod.edit_level_hand_in(argv, cwd, root, [], door), [], argv)
+        # A caller that names its own instance is answered by the lint, as
+        # gate.sh's door leaves a pre-flight that sets BOSS_JOBS_URL alone.
+        self.assertEqual(self.mod.edit_level_hand_in(["/bin/bash", "infra/gate.sh", "--lint"], root, root,
+                                                     ["BOSS_JOBS_URL=http://stub.invalid:7900"], door), [])
+
+    def test_a_door_that_cannot_answer_refuses_before_the_worker_runs(self):
+        # "Refuse loudly if the trusted read fails rather than letting the
+        # worker report 000": a failed or malformed read is a refusal that
+        # names the door, never a worker execution and never a guessed level.
+        root = "/work/boss/.claude/worktrees/agent-x"
+        argv = ["/bin/bash", "infra/gate.sh", "--lint"]
+        for result, said in (
+            (subprocess.CompletedProcess([], 7, b"", b"curl: (7) could not connect"), "exit 7.*could not connect"),
+            (subprocess.CompletedProcess([], 0, b"<html>gateway</html>", b""), "not the edit-level object"),
+            (subprocess.CompletedProcess([], 0, b'{"level": "core"}', b""), "not the edit-level object"),
+            (subprocess.CompletedProcess([], 0, b"", b""), "not the edit-level object"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "edit level.*" + said):
+                self.mod.edit_level_hand_in(argv, root, root, [], lambda: result)
+
+    def test_the_edit_level_is_read_through_the_generations_own_door_at_its_own_address(self):
+        calls = []
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0, b'{"edit_level":null}', b"")
+        os.environ["BOSS_JOBS_URL"] = "http://caller-chosen.invalid:7900"
+        try:
+            self.mod.door_read("/api/tenant/edit-level", run=run)
+        finally:
+            del os.environ["BOSS_JOBS_URL"]
+        generation = Path(self.mod.__file__).resolve().parents[2]
+        argv, kwargs = calls[0]
+        self.assertEqual(argv, ["/bin/bash", str(generation / "infra/dev/boss-api"), "GET", "/api/tenant/edit-level"])
+        self.assertNotIn("BOSS_JOBS_URL", kwargs["env"], "the token goes only to the door's own address")
+        self.assertEqual(kwargs["env"]["BOSS_SOR_WAIT_SECONDS"], "60")
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertLessEqual(kwargs["timeout"], 120)
 
     def test_probe_channel_is_only_an_existing_owned_parent_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -485,6 +1445,76 @@ class ControllerContract(unittest.TestCase):
             result = subprocess.run(read, capture_output=True, check=False)
             self.assertEqual(result.stdout, edited)
 
+    def test_a_hand_put_carries_the_bound_worktree_files_mode(self):
+        # Backlog de1ec6d1 (2026-10-22): a hand put named no mode, so an
+        # executable script put into a worker landed 644 and its test
+        # failed falsely until a chmod inside the worker. The mode is the
+        # bound worktree's own file's, the bit git records as 100755.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, local, worker = Path(tmp) / "control", Path(tmp) / "worktree", Path(tmp) / "worker"
+            root.mkdir()
+            (local / "infra/dev").mkdir(parents=True)
+            (worker / "infra/dev").mkdir(parents=True)
+            session = "dev-build-0123456789abcdef"
+            self.mod.save_record(root / (session + ".binding.json"), {"session": session, "local_root": str(local), "source_head": "0" * 40})
+            (local / "infra/dev/tool.sh").write_bytes(b"#!/bin/sh\n")
+            (local / "infra/dev/tool.sh").chmod(0o755)
+            (local / "infra/dev/notes.txt").write_bytes(b"notes\n")
+            (local / "infra/dev/notes.txt").chmod(0o644)
+            (local / "infra/dev/link.sh").symlink_to("tool.sh")
+            self.assertEqual(self.mod.hand_put_mode(root, session, "infra/dev/tool.sh"), "755")
+            self.assertEqual(self.mod.hand_put_mode(root, session, "infra/dev/notes.txt"), "644")
+            # Nothing to read the mode from: the door's old 644, unchanged.
+            self.assertIsNone(self.mod.hand_put_mode(root, session, "infra/dev/link.sh"))
+            self.assertIsNone(self.mod.hand_put_mode(root, session, "infra/dev/absent.sh"))
+            self.assertIsNone(self.mod.hand_put_mode(root, "dev-build-fedcba9876543210", "infra/dev/tool.sh"))
+            self.assertIsNone(self.mod.hand_put_mode(root, "../escape", "infra/dev/tool.sh"))
+            # Through the worker argv: a replaced executable stays one.
+            (worker / "infra/dev/tool.sh").write_bytes(b"old\n")
+            (worker / "infra/dev/tool.sh").chmod(0o755)
+            argv = self.mod.source_file_argv("put", "infra/dev/tool.sh", self.mod.hand_put_mode(root, session, "infra/dev/tool.sh"))
+            argv[3] = argv[3].replace("/workspace/source", str(worker))
+            result = subprocess.run(argv, input=b"#!/bin/sh\n", capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((worker / "infra/dev/tool.sh").stat().st_mode & 0o777, 0o755)
+
+    def test_a_hand_put_or_exec_by_id_runs_only_from_the_tree_bound_to_that_worker(self):
+        # Backlog f959a6b7 (2026-10-22, run dd16d27a): exec-auto from a
+        # builder worktree reached the shared checkout's worker, the one
+        # brief and dispatch read gate.sh --roster through. f7b43945 refuses
+        # that resolution; the hand doors named the worker BY ID and asked
+        # nothing of the caller's tree, so a builder anywhere could still
+        # put a file into (or exec in) the checkout's worker.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, checkout = Path(tmp) / "control", Path(tmp) / "boss"
+            builder = checkout / ".claude" / "worktrees" / "agent-x"
+            root.mkdir()
+            (checkout / "infra" / "dev").mkdir(parents=True)
+            (builder / "infra").mkdir(parents=True)
+            (builder / ".git").write_text("gitdir: %s\n" % (checkout / ".git" / "worktrees" / "agent-x"))
+            elsewhere = Path(tmp) / "wt" / "agent-y"
+            elsewhere.mkdir(parents=True)
+            session = "dev-build-0123456789abcdef"
+            binding = {"session": session, "local_root": str(checkout), "source_head": "0" * 40}
+            self.mod.save_record(root / (session + ".binding.json"), binding)
+            gate = self.mod.hand_door_binding
+            # The bound tree, and any directory of it, is the tree.
+            self.assertEqual(gate(root, session, str(checkout)), binding)
+            self.assertEqual(gate(root, session, str(checkout / "infra" / "dev")), binding)
+            # A worktree nested in it, or a tree beside it, is another tree.
+            for cwd in (builder, builder / "infra", elsewhere, Path(tmp)):
+                with self.subTest(cwd=cwd):
+                    with self.assertRaisesRegex(ValueError, "not the tree bound to worker %s" % session) as refused:
+                        gate(root, session, str(cwd))
+                    message = str(refused.exception)
+                    self.assertIn(str(cwd), message)
+                    self.assertIn(str(checkout), message)
+                    self.assertIn("--local-root", message)
+                    self.assertIn("nothing executed", message)
+            # A worker started with no binding has no tree to hold it to.
+            self.assertIsNone(gate(root, "dev-build-fedcba9876543210", str(elsewhere)))
+            self.assertIsNone(gate(root, "../escape", str(elsewhere)))
+
     def test_database_is_local_disposable_and_cannot_hold_control_credentials(self):
         job = self.spec()
         pod = job["spec"]["template"]["spec"]
@@ -533,22 +1563,539 @@ class ControllerContract(unittest.TestCase):
         calls = []
         def transport(argv, stdin=None):
             calls.append((argv, stdin))
+            if argv[:2] == ["get", "pvc"]:
+                return subprocess.CompletedProcess(argv, 0, b'{"items": []}', b"")
+            if longhorn_reply(argv):
+                return longhorn_reply(argv)
             return subprocess.CompletedProcess(argv, 28, b"returned bytes" * 10000, b"acknowledgment lost")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = {"worker_image": "registry.invalid/build@sha256:" + "b" * 64, "postgres_image": "registry.invalid/postgres@sha256:" + "c" * 64, "forge_url": "http://forge.invalid/owner/repo.git"}
             with self.assertRaises(RuntimeError):
                 self.mod.launch("a" * 40, config, root, transport=transport)
-            receipts = list(root.glob("*.launch-*.json"))
+            receipts = [json.loads(p.read_text()) for p in root.glob("*.launch-*.json")]
+            receipts = [r for r in receipts if r["argv"][0] == "create"]
             self.assertEqual(len(receipts), 1, "a failed launch owes full transport evidence")
-            import base64
-            import json
-            receipt = json.loads(receipts[0].read_text())
+            receipt = receipts[0]
             self.assertEqual(base64.b64decode(receipt["stdout_base64"]), b"returned bytes" * 10000)
             self.assertEqual(base64.b64decode(receipt["stderr_base64"]), b"acknowledgment lost")
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 4)
             self.assertEqual(receipt["exit"], 28)
-            self.assertEqual(json.loads(calls[0][1])["kind"], "PersistentVolumeClaim", "a token-bearing init must never start before private fresh storage is acknowledged")
+            self.assertEqual(json.loads(calls[3][1])["kind"], "PersistentVolumeClaim", "a token-bearing init must never start before private fresh storage is acknowledged")
+
+    # Backlog 2346fe79 (2026-10-18): nine workers in one burst each held a
+    # 150Gi volume, six failed with no readable cause, and two more could
+    # not place storage and sat in Init. The launch abandoned every one.
+    def config(self):
+        return {"worker_image": "registry.invalid/build@sha256:" + "b" * 64, "postgres_image": "registry.invalid/postgres@sha256:" + "c" * 64, "forge_url": "http://forge.invalid/owner/repo.git"}
+
+    def failing_launch(self, pod_status, events=(), log=b"", log_exit=0):
+        calls = []
+        objects = {}
+        def transport(argv, stdin=None):
+            calls.append(argv)
+            if argv[:2] == ["get", "pvc"]:
+                return subprocess.CompletedProcess(argv, 0, b'{"items": []}', b"")
+            if longhorn_reply(argv):
+                return longhorn_reply(argv)
+            if argv[0] == "create":
+                obj = json.loads(stdin)
+                obj["metadata"]["uid"] = "pvc-uid" if obj["kind"] == "PersistentVolumeClaim" else "job-uid"
+                objects[obj["kind"]] = obj
+                return subprocess.CompletedProcess(argv, 0, json.dumps(obj).encode(), b"")
+            if argv[0] == "patch":
+                volume = objects["PersistentVolumeClaim"]
+                volume["metadata"]["ownerReferences"] = json.loads(argv[argv.index("-p") + 1])[1]["value"]
+                return subprocess.CompletedProcess(argv, 0, json.dumps(volume).encode(), b"")
+            if argv[:2] == ["get", "events"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"items": list(events)}).encode(), b"")
+            if argv[0] == "logs":
+                return subprocess.CompletedProcess(argv, log_exit, log, b"" if log_exit == 0 else b"container is waiting to start")
+            job = objects["Job"]
+            pod = {"metadata": {"name": "bound-pod", "uid": "pod-uid", "labels": copy.deepcopy(job["spec"]["template"]["metadata"]["labels"]), "ownerReferences": [{"kind": "Job", "uid": "job-uid"}]},
+                   "spec": job["spec"]["template"]["spec"], "status": pod_status}
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"items": [pod]}).encode(), b"")
+        retired = []
+        def retire(session):
+            retired.append((session.job, session.job_uid, session.volume_uid))
+            return {"state": "local execution retired"}
+        return calls, transport, retired, retire
+
+    def run_failing_launch(self, root, transport, retire, clock=None):
+        from unittest.mock import patch
+        ticks = iter(clock or [])
+        monotonic = (lambda: next(ticks)) if clock else self.mod.time.monotonic
+        with patch.object(self.mod.time, "sleep", lambda _: None), patch.object(self.mod.time, "monotonic", monotonic):
+            with self.assertRaises(RuntimeError) as raised:
+                self.mod.launch("a" * 40, self.config(), root, transport=transport, retire=retire)
+        return str(raised.exception)
+
+    def test_worker_volume_is_bounded_and_launch_refuses_past_the_storage_budget(self):
+        held = [{"metadata": {"name": "dev-build-%016x" % i}} for i in range(self.mod.WORKER_VOLUME_LIMIT)]
+        held.append({"metadata": {"name": "boss-dev-work"}})
+        calls = []
+        def transport(argv, stdin=None):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"items": held}).encode(), b"")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(RuntimeError) as raised:
+                self.mod.launch("a" * 40, self.config(), Path(tmp), transport=transport)
+        self.assertIn("worker storage budget", str(raised.exception))
+        self.assertIn("dev-build-0000000000000005", str(raised.exception))
+        self.assertEqual([argv[0] for argv in calls], ["get"], "a refused budget creates nothing")
+        self.assertLessEqual(int(self.mod.WORKER_VOLUME.removesuffix("Gi")), 100)
+        self.assertLessEqual(int(self.mod.WORKER_VOLUME.removesuffix("Gi")) * self.mod.WORKER_VOLUME_LIMIT, 600)
+
+    # Backlog 8fb56e63 (2026-10-18): the budget above was a read followed
+    # by a create, so a burst of starts that all read before any created
+    # all passed it, and 2346fe79's incident WAS a burst. Here two starts
+    # face five held volumes and each reading start waits (up to a
+    # second) for the other to read the same list before it creates.
+    def test_two_interleaved_launches_against_five_held_volumes_admit_at_most_one(self):
+        import threading
+        held = [{"metadata": {"name": "dev-build-%016x" % i}} for i in range(self.mod.WORKER_VOLUME_LIMIT - 1)]
+        cluster = threading.Lock()
+        both_read = threading.Barrier(2, timeout=1)
+        created = []
+        def transport(argv, stdin=None):
+            if argv[:2] == ["get", "pvc"]:
+                with cluster:
+                    body = json.dumps({"items": list(held)}).encode()
+                try:
+                    both_read.wait()
+                except threading.BrokenBarrierError:
+                    pass
+                return subprocess.CompletedProcess(argv, 0, body, b"")
+            if longhorn_reply(argv):
+                return longhorn_reply(argv)
+            obj = json.loads(stdin)
+            if argv[0] == "create" and obj["kind"] == "PersistentVolumeClaim":
+                obj["metadata"]["uid"] = "pvc-uid-" + obj["metadata"]["name"]
+                with cluster:
+                    held.append(obj)
+                    created.append(obj["metadata"]["name"])
+                return subprocess.CompletedProcess(argv, 0, json.dumps(obj).encode(), b"")
+            # The Job is refused: what is under test ends at the volume.
+            return subprocess.CompletedProcess(argv, 1, b"", b"refused by the test")
+        refusals = []
+        def start(root):
+            try:
+                self.mod.launch("a" * 40, self.config(), root, transport=transport)
+            except RuntimeError as error:
+                refusals.append(str(error))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            starts = [threading.Thread(target=start, args=(root,)) for _ in range(2)]
+            for thread in starts:
+                thread.start()
+            for thread in starts:
+                thread.join(timeout=30)
+            self.assertFalse(any(thread.is_alive() for thread in starts), "a start never returned")
+        self.assertEqual(len(created), 1, "two starts against five held volumes created %s" % created)
+        self.assertEqual(len([r for r in refusals if "worker storage budget reached: 6 of 6" in r]), 1, refusals)
+
+    # Backlog a386866e (2026-10-19): the count above admitted six 100Gi
+    # volumes, but node-disk-usage w-1 (ca3c5881, 22:12Z) read 928.9 GiB
+    # capacity and 603.8 GiB available, and Longhorn keeps 25% free, so
+    # 371.6 GiB was placeable: three volumes. The fourth start would have
+    # been refused at Longhorn's floor, naming the floor and not the
+    # budget. The budget now reads the placeable space; the count stays
+    # as a ceiling.
+    def budget_launch(self, nodes, held_count, floor="25", longhorn_exit=0):
+        held = [{"metadata": {"name": "dev-build-%016x" % i}} for i in range(held_count)]
+        held.append({"metadata": {"name": "boss-dev-work"}})
+        calls = []
+        def transport(argv, stdin=None):
+            calls.append(argv)
+            if argv[:2] == ["get", "pvc"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"items": held}).encode(), b"")
+            reply = longhorn_reply(argv, nodes, floor)
+            if reply and longhorn_exit:
+                return subprocess.CompletedProcess(argv, longhorn_exit, b'{"items": []}', b"Error from server (Forbidden)")
+            if reply:
+                return reply
+            # The volume create is refused: what is under test ends there.
+            return subprocess.CompletedProcess(argv, 1, b"", b"refused by the test")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(RuntimeError) as raised:
+                self.mod.launch("a" * 40, self.config(), Path(tmp), transport=transport)
+        return str(raised.exception), [argv[0] for argv in calls]
+
+    def test_the_storage_budget_is_the_space_longhorn_can_place_not_a_count(self):
+        w1 = longhorn_node("w-1", 928.9, 603.8)
+        message, verbs = self.budget_launch([w1], 3)
+        self.assertIn("worker storage budget reached", message)
+        self.assertIn("w-1", message)
+        self.assertIn("371.6 GiB placeable", message)
+        self.assertIn(self.mod.WORKER_VOLUME, message)
+        self.assertNotIn("create", verbs, "a refused budget creates nothing")
+        # Two held leave room for a third: the start passes the budget and
+        # reaches the volume create, which this test refuses.
+        message, verbs = self.budget_launch([w1], 2)
+        self.assertIn("fresh private volume not acknowledged", message)
+        self.assertIn("create", verbs)
+        # w-2 rejoining with ~930 GiB placeable admits the fourth.
+        w2 = longhorn_node("w-2", 1240, 1240)
+        message, verbs = self.budget_launch([w1, w2], 3)
+        self.assertIn("fresh private volume not acknowledged", message)
+
+    def test_the_floor_is_read_from_longhorn_and_an_unread_budget_refuses(self):
+        w1 = longhorn_node("w-1", 928.9, 603.8)
+        # At a 10% floor, 510.9 GiB is placeable: five volumes, so three
+        # held admit a fourth. The floor is Longhorn's setting, not ours.
+        message, verbs = self.budget_launch([w1], 3, floor="10")
+        self.assertIn("fresh private volume not acknowledged", message)
+        # No evidence is not a pass: a forbidden read refuses the start.
+        message, verbs = self.budget_launch([w1], 0, longhorn_exit=1)
+        self.assertIn("worker storage budget cannot be measured", message)
+        self.assertNotIn("create", verbs)
+        message, verbs = self.budget_launch([w1], 0, floor="most")
+        self.assertIn("worker storage budget cannot be measured", message)
+        self.assertNotIn("create", verbs)
+
+    def test_only_disks_longhorn_may_place_on_count_toward_the_budget(self):
+        nodes = [longhorn_node("w-1", 928.9, 603.8),
+                 longhorn_node("w-2", 1000, 1000, ready=False),
+                 longhorn_node("w-3", 1000, 1000, allow=False),
+                 longhorn_node("w-4", 1000, 1000, disk_allow=False),
+                 longhorn_node("w-5", 1000, 1000, disk_eviction=True),
+                 longhorn_node("w-6", 1000, 100)]
+        disks = self.mod.placeable_disks(nodes, 25)
+        self.assertEqual([(d["node"], d["placeable"] // GIB) for d in disks], [("w-1", 371), ("w-6", 0)])
+        message, verbs = self.budget_launch(nodes[1:5], 0)
+        self.assertIn("worker storage budget reached", message)
+        self.assertIn("no disk", message)
+        self.assertNotIn("create", verbs)
+
+    def test_storage_that_cannot_be_placed_refuses_by_name_keeps_the_cause_and_retires(self):
+        status = {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "True"}],
+                  "initContainerStatuses": [{"name": "published-bootstrap", "restartCount": 0, "state": {"waiting": {"reason": "PodInitializing"}}}]}
+        event = {"reason": "FailedAttachVolume", "type": "Warning", "involvedObject": {"kind": "Pod", "name": "bound-pod"},
+                 "message": "AttachVolume.Attach failed for volume \"pvc-1\" : volume pvc-1 is not ready for workloads"}
+        calls, transport, retired, retire = self.failing_launch(status, [event], log_exit=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            message = self.run_failing_launch(root, transport, retire)
+            self.assertIn("storage cannot be placed", message)
+            self.assertIn("not ready for workloads", message)
+            failures = list(root.glob("dev-build-*.failure.json"))
+            self.assertEqual(len(failures), 1)
+            failure = self.mod.load_record(failures[0])
+            self.assertIn("not ready for workloads", failure["cause"])
+            self.assertEqual(failure["pod_status"], status)
+            self.assertEqual(failure["events"], [event])
+            self.assertEqual(retired, [(failure["name"], "job-uid", "pvc-uid")])
+            self.assertFalse((root / (failure["name"] + ".json")).exists(), "a failed launch admits no session")
+        self.assertLess(len([a for a in calls if a[:2] == ["get", "pods"]]), 20, "refused before the 300 s deadline")
+
+    def test_a_bootstrap_that_exits_keeps_its_log_and_exit_code_and_retires(self):
+        status = {"phase": "Failed", "initContainerStatuses": [{"name": "published-bootstrap", "restartCount": 0,
+                  "state": {"terminated": {"exitCode": 128, "reason": "Error"}}}]}
+        log = b"fatal: remote error: upload-pack: not our ref " + b"a" * 40 + b"\n"
+        calls, transport, retired, retire = self.failing_launch(status, log=log)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            message = self.run_failing_launch(root, transport, retire)
+            self.assertIn("published-bootstrap exited 128", message)
+            self.assertIn("not our ref", message)
+            failure = self.mod.load_record(next(root.glob("dev-build-*.failure.json")))
+            kept = self.mod.load_record(root / (failure["name"] + ".bootstrap-log.json"))
+            self.assertEqual(base64.b64decode(kept["bootstrap_log_base64"]), log)
+            self.assertEqual(kept["bootstrap_log_exit"], 0)
+            self.assertEqual(len(retired), 1)
+        self.assertIn(["logs", "bound-pod", "-c", "published-bootstrap", "--limit-bytes=65536"], calls)
+
+    def test_a_launch_deadline_names_the_last_observed_state_and_retires(self):
+        status = {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                  "message": "0/5 nodes are available: 2 Insufficient cpu."}]}
+        calls, transport, retired, retire = self.failing_launch(status)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            message = self.run_failing_launch(root, transport, retire, clock=[0, 1, 2, 400, 400, 400])
+            self.assertIn("unavailable after 300 seconds", message)
+            self.assertIn("Insufficient cpu", message)
+            self.assertEqual(len(retired), 1)
+            self.assertTrue(list(root.glob("dev-build-*.failure.json")))
+
+    # Backlog 3165dc62 (2026-10-19): the workers store held 1213
+    # launch-*.json receipts, 47 MB, from the 10-18 incident: a launch
+    # that waits writes one per 2 s poll, each carrying the whole pod
+    # list, and a stuck pod answers the same bytes every time. A repeat
+    # of a read's last answer is recorded as a pointer to the receipt
+    # that holds those bytes, so every poll stays on the record and a
+    # stuck launch stores its pod once.
+    def test_a_waiting_launch_stores_an_unchanged_answer_once_and_keeps_every_poll(self):
+        status = {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                  "message": "0/5 nodes are available: 2 Insufficient cpu."}]}
+        calls, transport, retired, retire = self.failing_launch(status)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.run_failing_launch(root, transport, retire, clock=[0] + [1] * 30 + [400] * 5)
+            polls = [a for a in calls if a[:2] == ["get", "pods"]]
+            self.assertEqual(len(polls), 30)
+            receipts = {p.name: self.mod.load_record(p) for p in root.glob("*.launch-*.json")}
+            pods = {n: r for n, r in receipts.items() if r["argv"][:2] == ["get", "pods"]}
+            self.assertEqual(len(pods), 30, "every poll keeps a receipt")
+            full = [n for n, r in pods.items() if "stdout_base64" in r]
+            self.assertEqual(len(full), 1, "an unchanged answer is stored once")
+            for name, receipt in pods.items():
+                if name in full:
+                    continue
+                self.assertEqual(receipt["unchanged_from"], full[0])
+                self.assertEqual((receipt["completion"], receipt["exit"]), ("observed", 0))
+            # Writes are never folded: the Job's creation stays whole.
+            creates = [r for r in receipts.values() if r["argv"][0] == "create"]
+            self.assertEqual(len(creates), 2)
+            self.assertTrue(all("stdout_base64" in r for r in creates))
+            self.assertLess(sum(p.stat().st_size for p in root.glob("*.launch-*.json")), 30 * 1024,
+                            "thirty polls of one stuck pod no longer store thirty pods")
+
+    def test_a_waiting_pod_is_named_only_at_the_deadline_and_by_its_most_specific_reason(self):
+        pulling = {"metadata": {"name": "p"}, "status": {"phase": "Pending",
+                   "conditions": [{"type": "Initialized", "status": "False", "reason": "ContainersNotInitialized", "message": "incomplete"}],
+                   "initContainerStatuses": [{"name": "published-bootstrap", "state": {"waiting": {"reason": "ImagePullBackOff", "message": "pull denied"}}}]}}
+        self.assertIsNone(self.mod.launch_failure(pulling, []))
+        self.assertEqual(self.mod.launch_failure(pulling, [], final=True), "published-bootstrap waiting: ImagePullBackOff pull denied")
+        started = {"metadata": {"name": "p"}, "status": {"phase": "Pending",
+                   "initContainerStatuses": [{"name": "published-bootstrap", "state": {"terminated": {"exitCode": 0}}}],
+                   "containerStatuses": [{"name": "worker", "state": {"running": {}}}]}}
+        self.assertIsNone(self.mod.launch_failure(started, []), "a bootstrap that succeeded is not a failure")
+        self.assertEqual(self.mod.launch_failure(None, [], final=True), "no worker Pod was created")
+
+    # Backlog 8fb56e63 (2026-10-18): events persist for an hour, so an
+    # attach warning from before the volume attached still sits beside a
+    # pod whose bootstrap is running; that pod's storage WAS placed.
+    def test_an_attach_warning_is_fatal_only_while_no_container_has_started(self):
+        event = {"reason": "FailedAttachVolume", "type": "Warning",
+                 "message": "AttachVolume.Attach failed for volume \"pvc-1\" : volume pvc-1 is not ready for workloads"}
+        def pod(*states):
+            return {"metadata": {"name": "p"}, "status": {"phase": "Pending",
+                    "initContainerStatuses": [{"name": "published-bootstrap", "state": states[0]}],
+                    "containerStatuses": [{"name": "worker", "state": state} for state in states[1:]]}}
+        waiting = {"waiting": {"reason": "PodInitializing"}}
+        self.assertIn("storage cannot be placed", self.mod.launch_failure(pod(waiting), [event]))
+        self.assertIsNone(self.mod.launch_failure(pod({"running": {}}), [event]), "a running bootstrap has its volume")
+        self.assertIsNone(self.mod.launch_failure(pod({"terminated": {"exitCode": 0}}, waiting), [event]), "a finished bootstrap had its volume")
+
+    def test_a_failed_retirement_still_keeps_and_reports_the_cause(self):
+        status = {"phase": "Failed", "initContainerStatuses": [{"name": "published-bootstrap", "restartCount": 0,
+                  "state": {"terminated": {"exitCode": 1, "reason": "Error"}}}]}
+        calls, transport, retired, _ = self.failing_launch(status)
+        def retire(session):
+            raise RuntimeError("UID-conditioned Job retirement refused by API")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            message = self.run_failing_launch(root, transport, retire)
+            self.assertIn("published-bootstrap exited 1", message)
+            self.assertIn("retirement refused by API", message)
+            self.assertTrue(list(root.glob("dev-build-*.failure.json")))
+
+    # Backlog bc8db3ba (2026-10-18), reproduced by review 68a60879 of car
+    # 83dbb962: a start whose self-retirement failed printed a cause and a
+    # path, and the `dev-build stop` it implied refused with File exists.
+    def test_a_refused_start_whose_retirement_failed_is_retired_by_stop(self):
+        status = {"phase": "Failed", "initContainerStatuses": [{"name": "published-bootstrap", "restartCount": 0,
+                  "state": {"terminated": {"exitCode": 128, "reason": "Error"}}}]}
+        calls, transport, _, _ = self.failing_launch(status)
+        deletes = []
+        def delete(name, uid, record):
+            deletes.append((name, uid))
+            record({"completion": "observed"})
+            if len(deletes) == 1:
+                raise RuntimeError("API unreachable")
+            return {"kind": "Status", "status": "Success"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            message = self.run_failing_launch(root, transport, lambda session: self.mod.retire_worker(session, root, delete))
+            name = next(root.glob("dev-build-*.intent.json")).name.removesuffix(".intent.json")
+            self.assertIn("API unreachable", message)
+            self.assertIn("`dev-build stop %s`" % name, message, "a start that could not retire names the handle")
+            session = self.mod.stoppable_session(name, root)
+            self.assertEqual(self.mod.retire_worker(session, root, delete)["state"], "local execution retired")
+            self.assertEqual(deletes, [(name, "job-uid")] * 2)
+
+    def test_every_refusal_after_the_job_is_acknowledged_names_the_session_and_keeps_the_cause(self):
+        waiting = {"phase": "Pending", "initContainerStatuses": [{"name": "published-bootstrap", "restartCount": 0, "state": {"waiting": {"reason": "PodInitializing"}}}]}
+        exited = {"phase": "Failed", "initContainerStatuses": [{"name": "published-bootstrap", "restartCount": 0, "state": {"terminated": {"exitCode": 128, "reason": "Error"}}}]}
+        def pods_read_fails(argv):
+            return subprocess.CompletedProcess(argv, 1, b"", b"connection refused") if argv[:2] == ["get", "pods"] else None
+        def two_pods(argv):
+            if argv[:2] == ["get", "pods"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"items": [{"metadata": {"name": "a"}}, {"metadata": {"name": "b"}}]}).encode(), b"")
+        def events_read_fails(argv):
+            return subprocess.CompletedProcess(argv, 1, b"", b"connection refused") if argv[:2] == ["get", "events"] else None
+        def logs_time_out(argv):
+            if argv[0] == "logs":
+                raise subprocess.TimeoutExpired(argv, 120, output=b"partial log")
+        modes = {"poll read": (waiting, pods_read_fails, "observation failed"),
+                 "multiple pods": (waiting, two_pods, "multiple Pods"),
+                 "events read": (waiting, events_read_fails, "observation failed"),
+                 "bootstrap log timeout": (exited, logs_time_out, "published-bootstrap exited 128")}
+        for mode, (status, fault, cause) in modes.items():
+            for retires in (False, True):
+                with self.subTest(mode=mode, retires=retires), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    _, inner, retired, succeed = self.failing_launch(status)
+                    def transport(argv, stdin=None, fault=fault, inner=inner):
+                        return fault(argv) or inner(argv, stdin)
+                    def fail(session):
+                        raise RuntimeError("API unreachable")
+                    message = self.run_failing_launch(root, transport, succeed if retires else fail)
+                    name = next(root.glob("dev-build-*.intent.json")).name.removesuffix(".intent.json")
+                    self.assertIn(name, message, "the refusal names its session")
+                    self.assertIn(cause, message)
+                    failure = self.mod.load_record(root / (name + ".failure.json"))
+                    self.assertIn(cause, failure["cause"], "the cause is kept before anything that can time out")
+                    if retires:
+                        self.assertEqual(retired, [(name, "job-uid", "pvc-uid")])
+                    else:
+                        self.assertIn("`dev-build stop %s`" % name, message)
+
+    def test_stop_finds_an_unadmitted_worker_by_its_acknowledged_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            name, _, calls, _ = self.recovery_fixture(root)
+            session = self.mod.stoppable_session(name, root)
+            self.assertEqual((session.job, session.job_uid, session.volume_uid, session.source_head), (name, "job-uid", "volume-uid", "a" * 40))
+            self.assertEqual(calls, [], "finding the record reads no cluster state")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            name, _, _, _ = self.recovery_fixture(root, acknowledged=False)
+            with self.assertRaisesRegex(ValueError, str(root)):
+                self.mod.stoppable_session(name, root)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            name, _, _, _ = self.recovery_fixture(root)
+            admitted = self.mod.Session(name, "admitted-uid", "pod", "pod-uid", "container-id", "a" * 40, "volume-uid")
+            self.mod.save_record(root / (name + ".json"), self.mod.asdict(admitted))
+            self.assertEqual(self.mod.stoppable_session(name, root), admitted, "an admitted session's own record wins")
+
+    # Backlog 86bd9fb8 (review ca8d3763 of car 559cfe13, 2026-10-19): a
+    # Job create that failed after the PVC create left a 100Gi volume with
+    # no owner. It counted toward WORKER_VOLUME_LIMIT, and the refusal
+    # that named it said `dev-build stop <name>` releases one, while stop
+    # refused it: no acknowledged Job. These pin the release.
+    def unowned_volume_cluster(self, job=None, owners=None, present=True):
+        """A cluster holding one unowned worker volume and, maybe, a Job."""
+        calls, state = [], {"volume": None}
+        def volume(name):
+            if state["volume"] is None:
+                state["volume"] = {"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                                   "metadata": {"name": name, "namespace": "boss-dev", "uid": "pvc-uid",
+                                                "resourceVersion": "7", "ownerReferences": owners or []}}
+            return state["volume"]
+        def transport(argv, stdin=None):
+            calls.append(argv)
+            if argv[:2] == ["get", "job"]:
+                self.assertIn("--ignore-not-found", argv)
+                return subprocess.CompletedProcess(argv, 0, json.dumps(job).encode() if job else b"", b"")
+            if argv[:2] == ["get", "pvc"]:
+                self.assertIn("--ignore-not-found", argv)
+                return subprocess.CompletedProcess(argv, 0, json.dumps(volume(argv[2])).encode() if present else b"", b"")
+            if argv[:2] == ["patch", "pvc"]:
+                patch = json.loads(argv[argv.index("-p") + 1])
+                self.assertEqual(patch[:2], [{"op": "test", "path": "/metadata/uid", "value": "pvc-uid"},
+                                             {"op": "test", "path": "/metadata/resourceVersion", "value": "7"}])
+                current = volume(argv[2])
+                current["metadata"]["ownerReferences"] = patch[2]["value"]
+                current["metadata"]["resourceVersion"] = "8"
+                return subprocess.CompletedProcess(argv, 0, json.dumps(current).encode(), b"")
+            self.fail("unexpected cluster call %s" % argv)
+        return calls, transport, state
+
+    def job_create_fails(self, argv, stdin=None):
+        if argv[:2] == ["get", "pvc"]:
+            return subprocess.CompletedProcess(argv, 0, b'{"items": []}', b"")
+        if longhorn_reply(argv):
+            return longhorn_reply(argv)
+        obj = json.loads(stdin)
+        if obj["kind"] == "Job":
+            return subprocess.CompletedProcess(argv, 1, b"", b"admission webhook denied the request")
+        obj["metadata"]["uid"] = "pvc-uid"
+        return subprocess.CompletedProcess(argv, 0, json.dumps(obj).encode(), b"")
+
+    def test_a_job_create_failure_leaves_a_volume_that_stop_releases(self):
+        def retire(session):
+            self.fail("a launch with no acknowledged Job has no Job to retire")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(RuntimeError) as raised:
+                self.mod.launch("a" * 40, self.config(), root, transport=self.job_create_fails, retire=retire)
+            name = next(root.glob("dev-build-*.intent.json")).name.removesuffix(".intent.json")
+            self.assertIn("`dev-build stop %s`" % name, str(raised.exception), "the refusal names the handle that releases the volume")
+            calls, cluster, state = self.unowned_volume_cluster()
+            released = self.mod.stop(name, root, retire, transport=cluster)
+            self.assertEqual(released["state"], "volume released to garbage collection")
+            self.assertTrue(released["volume_uid_acknowledged"])
+            owner = state["volume"]["metadata"]["ownerReferences"]
+            self.assertEqual(len(owner), 1)
+            self.assertEqual((owner[0]["apiVersion"], owner[0]["kind"], owner[0]["name"]), ("batch/v1", "Job", name))
+            self.assertNotIn(owner[0]["uid"], ("pvc-uid", ""), "the owner names a Job that was never created")
+            self.assertEqual([argv[:2] for argv in calls], [["get", "job"], ["get", "pvc"], ["patch", "pvc"]])
+            self.assertEqual(self.mod.load_record(root / (name + ".volume-released.json")), released)
+            self.assertEqual(self.mod.stop(name, root, retire, transport=cluster), released, "a second stop answers its record")
+            self.assertEqual(len(calls), 3)
+
+    def test_a_volume_release_whose_answer_was_lost_is_finished_by_the_next_stop(self):
+        def retire(session):
+            self.fail("no Job to retire")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(RuntimeError):
+                self.mod.launch("a" * 40, self.config(), root, transport=self.job_create_fails, retire=retire)
+            name = next(root.glob("dev-build-*.intent.json")).name.removesuffix(".intent.json")
+            calls, cluster, state = self.unowned_volume_cluster()
+            def lost(argv, stdin=None):
+                result = cluster(argv, stdin)
+                if argv[0] == "patch":
+                    raise subprocess.TimeoutExpired(argv, 120)
+                return result
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.mod.stop(name, root, retire, transport=lost)
+            released = self.mod.stop(name, root, retire, transport=cluster)
+            self.assertEqual(released["state"], "volume released to garbage collection")
+            self.assertEqual([argv[0] for argv in calls], ["get", "get", "patch", "get", "get"], "the release owner already on the volume is not patched twice")
+
+    def test_stop_refuses_to_release_a_volume_a_job_or_another_owner_holds(self):
+        def retire(session):
+            self.fail("no Job to retire")
+        cases = {"a Job of the name exists": ({"kind": "Job", "metadata": {"name": "x", "uid": "unacknowledged"}}, None, "Job"),
+                 "the volume has an owner": (None, [{"apiVersion": "batch/v1", "kind": "Job", "name": "x", "uid": "other"}], "owner")}
+        for case, (job, owners, said) in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                with self.assertRaises(RuntimeError):
+                    self.mod.launch("a" * 40, self.config(), root, transport=self.job_create_fails, retire=retire)
+                name = next(root.glob("dev-build-*.intent.json")).name.removesuffix(".intent.json")
+                calls, cluster, _ = self.unowned_volume_cluster(job=job, owners=owners)
+                with self.assertRaisesRegex(RuntimeError, said):
+                    self.mod.stop(name, root, retire, transport=cluster)
+                self.assertNotIn("patch", [argv[0] for argv in calls])
+                self.assertFalse((root / (name + ".volume-released.json")).exists())
+
+    def test_a_timed_out_volume_create_names_the_volume_and_stop_releases_what_it_left(self):
+        def retire(session):
+            self.fail("no Job to retire")
+        def pvc_create_times_out(argv, stdin=None):
+            if argv[0] == "create":
+                raise subprocess.TimeoutExpired(argv, 120, output=b"")
+            return self.job_create_fails(argv, stdin)
+        for present in (True, False):
+            with self.subTest(volume_left=present), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                with self.assertRaises(RuntimeError) as raised:
+                    self.mod.launch("a" * 40, self.config(), root, transport=pvc_create_times_out, retire=retire)
+                name = next(root.glob("dev-build-*.intent.json")).name.removesuffix(".intent.json")
+                self.assertIn("volume %s" % name, str(raised.exception), "a timed-out create names the volume it may have left")
+                self.assertIn("`dev-build stop %s`" % name, str(raised.exception))
+                calls, cluster, _ = self.unowned_volume_cluster(present=present)
+                released = self.mod.stop(name, root, retire, transport=cluster)
+                if present:
+                    self.assertEqual(released["state"], "volume released to garbage collection")
+                    self.assertFalse(released["volume_uid_acknowledged"], "the UID was observed, never acknowledged by the create")
+                else:
+                    self.assertEqual(released["state"], "no volume of this name exists; nothing held")
+                    self.assertEqual([argv[0] for argv in calls], ["get", "get"])
 
     def launch_transport(self, replacement=False):
         import json
@@ -556,6 +2103,10 @@ class ControllerContract(unittest.TestCase):
         objects = {}
         def transport(argv, stdin=None):
             calls.append(argv)
+            if argv[:2] == ["get", "pvc"]:
+                return subprocess.CompletedProcess(argv, 0, b'{"items": []}', b"")
+            if longhorn_reply(argv):
+                return longhorn_reply(argv)
             if argv[0] == "create":
                 obj = json.loads(stdin)
                 obj["metadata"]["uid"] = "pvc-uid" if obj["kind"] == "PersistentVolumeClaim" else "job-uid"
@@ -587,7 +2138,7 @@ class ControllerContract(unittest.TestCase):
             records = [p for p in root.glob("dev-build-*.json") if not any(tag in p.name for tag in (".intent", ".volume", ".launch-"))]
             self.assertEqual(len(records), 1)
             self.assertEqual(json.loads(records[0].read_text())["volume_uid"], "pvc-uid")
-            self.assertEqual([argv[0] for argv in calls], ["create", "create", "patch", "get"])
+            self.assertEqual([argv[0] for argv in calls], ["get", "get", "get", "create", "create", "patch", "get"])
 
     def test_replaced_volume_patch_refuses_before_worker_admission(self):
         calls, transport = self.launch_transport(replacement=True)
@@ -595,7 +2146,7 @@ class ControllerContract(unittest.TestCase):
             config = {"worker_image": "registry.invalid/build@sha256:" + "b" * 64, "postgres_image": "registry.invalid/postgres@sha256:" + "c" * 64, "forge_url": "http://forge.invalid/owner/repo.git"}
             with self.assertRaises(RuntimeError):
                 self.mod.launch("a" * 40, config, Path(tmp), transport=transport)
-            self.assertEqual([argv[0] for argv in calls], ["create", "create", "patch"])
+            self.assertEqual([argv[0] for argv in calls], ["get", "get", "get", "create", "create", "patch"])
 
     def test_a_receipt_fifo_is_refused_without_blocking_the_controller(self):
         import os

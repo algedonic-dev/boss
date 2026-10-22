@@ -14,6 +14,139 @@ pub const SUBMISSION: &str = "gate_submission";
 pub const FIRST_RECORD_FIELDS: [&str; 4] = [INTENT, OBSERVATION, "gate_orphan_claim", SUBMISSION];
 pub const TTL_SECONDS: i64 = 300;
 
+/// A remote alias read cannot authorize an immutable actor assertion. Bind
+/// each new record to the principal THIS request authenticated before commit.
+/// An existing attempt's later no-child evidence retains its original actor,
+/// and only that actor, authenticated now, may write it: checked against the
+/// stored actor alone, any principal with update scope could rewrite another
+/// actor's attempt while the record still named the original (backlog
+/// 59ce3050, review 421d6960 F1).
+///
+/// An attempt is judged on the command's own `expected` attempt, which is
+/// the value the compare-and-set holds the row to inside the transaction,
+/// never on a read taken before it (review 5426da05 N2) — so an attempt
+/// write must pin the attempt it continues or replaces, or its absence.
+/// A different id is a replacement: it must name the pinned attempt as
+/// its `previous`, and be FRESH, which [`refuse_a_written_attempt_id`]
+/// judges inside the repository's transaction rather than here.
+pub fn validate_actor_bindings(command: &Command, actor: &str) -> Result<(), String> {
+    for (key, field) in [
+        (SUBMISSION, "submitted_by"),
+        ("gate_orphan_claim", "actor"),
+        (ATTEMPT, "actor"),
+    ] {
+        let Some(value) = command.patch.get(key) else {
+            continue;
+        };
+        let continued = if key == ATTEMPT {
+            continued_attempt(command, value)?
+        } else {
+            None
+        };
+        let expected = match continued {
+            Some(stored) if stored.get(field).and_then(Value::as_str) != Some(actor) => None,
+            _ => Some(actor),
+        };
+        if expected.is_none() || value.get(field).and_then(Value::as_str) != expected {
+            return Err(format!(
+                "{key}.{field} must match its authenticated originating actor; no record was committed"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The pinned attempt `next` continues under the same id, `None` for a
+/// first or a replacement attempt, or the refusal of an attempt write the
+/// compare-and-set does not hold, or a replacement that does not name the
+/// attempt it replaces.
+fn continued_attempt<'a>(command: &'a Command, next: &Value) -> Result<Option<&'a Value>, String> {
+    let pinned = command.expected.get(ATTEMPT).ok_or_else(|| {
+        format!(
+            "{ATTEMPT} must be pinned in expected (the attempt it continues or replaces, or its absence); no record was committed"
+        )
+    })?;
+    let stored = pinned.present.then_some(&pinned.value);
+    let stored_id = stored.and_then(attempt_id);
+    let id = attempt_id(next)
+        .ok_or_else(|| format!("{ATTEMPT}.id must be a non-nil uuid; no record was committed"))?;
+    if stored_id == Some(id) {
+        return Ok(stored);
+    }
+    let previous = match next.get("previous") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(uuid_at(next, "previous").ok_or_else(|| {
+            format!("{ATTEMPT}.previous must be a non-nil uuid; no record was committed")
+        })?),
+    };
+    if previous != stored_id {
+        return Err(format!(
+            "{ATTEMPT}.previous must name the attempt it replaces ({}); no record was committed",
+            stored_id.map_or("none".into(), |id| id.to_string())
+        ));
+    }
+    Ok(None)
+}
+
+/// An id is a uuid, not its spelling: `X` upper-cased is still `X`.
+fn attempt_id(value: &Value) -> Option<Uuid> {
+    uuid_at(value, "id")
+}
+
+fn uuid_at(value: &Value, field: &str) -> Option<Uuid> {
+    value
+        .get(field)?
+        .as_str()
+        .and_then(|text| Uuid::parse_str(text).ok())
+        .filter(|id| !id.is_nil())
+}
+
+/// Refuse a gate attempt write whose id is not the pinned attempt's and
+/// was already written on this packet (`written`, from
+/// [`attempt_ids_written`]). Without freshness a replaced id could be
+/// posted back by a new caller and one attempt id would name two actors
+/// (backlog 0471152b).
+///
+/// The repository calls this under the packet's row lock, AFTER its
+/// replay check, with the history read in the same transaction (backlog
+/// 301b9060, review f6890829). Read before the lock, the history missed
+/// an id an accomplice committed in between, and a write pinned on the
+/// value the accomplice left next brought that id back (N1); and a
+/// concurrent duplicate of a write that did land was refused as "already
+/// written" instead of being handed its receipt (N2).
+pub fn refuse_a_written_attempt_id(
+    command: &Command,
+    written: &std::collections::BTreeSet<Uuid>,
+) -> Result<(), String> {
+    let Some(id) = command.patch.get(ATTEMPT).and_then(attempt_id) else {
+        return Ok(());
+    };
+    let pinned = command
+        .expected
+        .get(ATTEMPT)
+        .filter(|pinned| pinned.present)
+        .and_then(|pinned| attempt_id(&pinned.value));
+    if pinned == Some(id) || !written.contains(&id) {
+        return Ok(());
+    }
+    Err(format!(
+        "{ATTEMPT}.id {id} was already written on this packet; a replacement of the pinned attempt ({}) names a fresh id; no record was committed",
+        pinned.map_or("none".into(), |id| id.to_string())
+    ))
+}
+
+/// Every attempt id this packet's conditional door ever committed, read
+/// from the patches of its retained receipts — every actor's.
+pub fn attempt_ids_written(
+    receipts: &[crate::conditional_metadata::Receipt],
+) -> std::collections::BTreeSet<Uuid> {
+    receipts
+        .iter()
+        .filter_map(|receipt| receipt.command.patch.get(ATTEMPT))
+        .filter_map(attempt_id)
+        .collect()
+}
+
 /// The retained native request is data, not a reconstructed send permit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -369,6 +502,7 @@ pub fn consume(metadata: &Value, generation: Uuid) -> Result<Command, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     #[test]
     fn durable_owner_does_not_expire_with_its_submitter() {
         let first = renew(&json!({}), at("2026-10-15T12:00:00Z")).unwrap();
@@ -401,6 +535,183 @@ mod tests {
             job.metadata[key] = json!({"original":"another committed transition"});
             assert!(!consumed.matches(&job), "a stale consume crossed {key}");
         }
+    }
+
+    /// WHY (backlog 59ce3050, review 421d6960 F1). A same-id attempt
+    /// update was checked against the STORED actor only, so any principal
+    /// holding update_job on the packet could rewrite another actor's
+    /// attempt (not_started back to sending, say) while the record still
+    /// named the original actor: the write was misattributed. The update
+    /// must be made by the actor the record names, as authenticated now.
+    #[test]
+    fn a_same_id_attempt_update_is_bound_to_the_authenticated_actor_too() {
+        let id = Uuid::new_v4();
+        let stored = json!({"id": id, "actor": "agent-original", "state": "sending"});
+        let written = BTreeSet::from([id]);
+        let update = attempt_command(
+            Some(stored.clone()),
+            json!({"id": id, "actor": "agent-original", "state": "not_started"}),
+        );
+        assert_eq!(
+            validate_actor_bindings(&update, "agent-original"),
+            Ok(()),
+            "the owner's own no-child evidence still lands"
+        );
+        assert_eq!(
+            refuse_a_written_attempt_id(&update, &written),
+            Ok(()),
+            "continuing the pinned attempt's own id is not a reuse"
+        );
+        let refused = validate_actor_bindings(&update, "agent-other")
+            .expect_err("another principal rewrote an attempt that names agent-original");
+        assert!(refused.contains("gate_launch_attempt.actor"), "{refused}");
+        // Nor can the other principal relabel the attempt as its own.
+        let relabelled = attempt_command(
+            Some(stored),
+            json!({"id": id, "actor": "agent-other", "state": "not_started"}),
+        );
+        assert!(validate_actor_bindings(&relabelled, "agent-other").is_err());
+    }
+
+    /// WHY (backlog 0471152b, reviewer run 5426da05 of car b34f114c).
+    /// agent-other replaced attempt X (agent-fixture's) with Y naming
+    /// itself, then posted X back pinned on Y and got 200: X took the
+    /// "new id" branch and bound to the caller, so one attempt id named
+    /// two actors while any native-create evidence kept for X named the
+    /// first. An id this packet's door ever committed is not fresh, and
+    /// naming the stored attempt as `previous` does not make it so.
+    #[test]
+    fn a_replaced_attempt_id_posted_back_under_a_new_actor_is_refused() {
+        let (x, y) = (Uuid::new_v4(), Uuid::new_v4());
+        let written = BTreeSet::from([x, y]);
+        let stored_y =
+            json!({"id": y, "actor": "agent-other", "previous": x, "state": "not_started"});
+        for reposted in [
+            json!({"id": x, "actor": "agent-other", "state": "sending"}),
+            json!({"id": x, "actor": "agent-other", "previous": y, "state": "sending"}),
+            // An id is a uuid, not its spelling: the upper-case form of X
+            // is X, so it cannot pass as fresh either.
+            json!({"id": x.to_string().to_uppercase(), "actor": "agent-other",
+                   "previous": y, "state": "sending"}),
+        ] {
+            let command = attempt_command(Some(stored_y.clone()), reposted.clone());
+            let refused = refuse_a_written_attempt_id(&command, &written)
+                .expect_err("a replaced attempt id came back under a new actor");
+            // It names the reused id AND the pinned attempt it would have
+            // replaced (review f6890829 N3).
+            assert!(
+                refused.contains("gate_launch_attempt.id")
+                    && refused.contains(&x.to_string())
+                    && refused.contains(&y.to_string()),
+                "the refusal names the reused id and the pinned attempt: {refused}"
+            );
+        }
+        // The same packet's genuinely fresh replacement still lands.
+        let fresh = attempt_command(
+            Some(stored_y),
+            json!({"id": Uuid::new_v4(), "actor": "agent-other", "previous": y, "state": "sending"}),
+        );
+        assert_eq!(refuse_a_written_attempt_id(&fresh, &written), Ok(()));
+        assert_eq!(validate_actor_bindings(&fresh, "agent-other"), Ok(()));
+    }
+
+    /// A replacement names the attempt it replaces, so the row's chain is
+    /// a fact the server checked rather than a field it stored; a first
+    /// attempt names none.
+    #[test]
+    fn a_replacement_names_the_stored_attempt_as_its_previous() {
+        let y = Uuid::new_v4();
+        let stored = json!({"id": y, "actor": "agent-a", "state": "not_started"});
+        for previous in [Value::Null, json!(Uuid::new_v4())] {
+            let command = attempt_command(
+                Some(stored.clone()),
+                json!({"id": Uuid::new_v4(), "actor": "agent-a", "previous": previous}),
+            );
+            let refused = validate_actor_bindings(&command, "agent-a")
+                .expect_err("a replacement that does not name the stored attempt");
+            assert!(
+                refused.contains("gate_launch_attempt.previous"),
+                "{refused}"
+            );
+        }
+        let first = attempt_command(None, json!({"id": Uuid::new_v4(), "actor": "agent-a"}));
+        assert_eq!(validate_actor_bindings(&first, "agent-a"), Ok(()));
+        let orphaned = attempt_command(
+            None,
+            json!({"id": Uuid::new_v4(), "actor": "agent-a", "previous": y}),
+        );
+        assert!(validate_actor_bindings(&orphaned, "agent-a").is_err());
+    }
+
+    /// N2 of the same review: the actor check read the row BEFORE the
+    /// transaction while the compare-and-set compared inside it. The
+    /// check now judges the command's own `expected` attempt, which is
+    /// the value the compare-and-set holds the row to, so an attempt
+    /// write that pins no attempt (nor its absence) is refused.
+    #[test]
+    fn an_attempt_write_is_judged_on_the_value_its_compare_and_set_compares() {
+        let id = Uuid::new_v4();
+        let mut unpinned = attempt_command(None, json!({"id": id, "actor": "agent-a"}));
+        unpinned.expected.clear();
+        unpinned.expected.insert(
+            "other".into(),
+            Expected {
+                present: false,
+                value: Value::Null,
+            },
+        );
+        let refused = validate_actor_bindings(&unpinned, "agent-a")
+            .expect_err("an attempt write the compare-and-set does not hold");
+        assert!(refused.contains("expected"), "{refused}");
+        // The stored actor the check judges is the PINNED one: pinned on
+        // an attempt naming agent-a, agent-b's same-id write is refused
+        // whatever the row held when the handler read it.
+        let pinned = attempt_command(
+            Some(json!({"id": id, "actor": "agent-a", "state": "sending"})),
+            json!({"id": id, "actor": "agent-b", "state": "not_started"}),
+        );
+        assert!(validate_actor_bindings(&pinned, "agent-b").is_err());
+    }
+
+    fn attempt_command(stored: Option<Value>, next: Value) -> Command {
+        Command {
+            contract_version: 2,
+            idempotency_key: Uuid::new_v4(),
+            expected: std::collections::BTreeMap::from([(
+                ATTEMPT.to_owned(),
+                Expected {
+                    present: stored.is_some(),
+                    value: stored.unwrap_or(Value::Null),
+                },
+            )]),
+            patch: serde_json::Map::from_iter([(ATTEMPT.to_owned(), next)]),
+            immutable_keys: vec![],
+            guarded_keys: vec![],
+        }
+    }
+
+    #[test]
+    fn the_attempt_ids_written_are_read_from_every_receipt_patch() {
+        let (x, y) = (Uuid::new_v4(), Uuid::new_v4());
+        let receipt = |patch: Value| crate::conditional_metadata::Receipt {
+            contract_version: 2,
+            job_id: test_job().id,
+            actor: "agent-a".into(),
+            command: Command {
+                patch: serde_json::from_value(patch).unwrap(),
+                ..attempt_command(None, json!({}))
+            },
+            applied_at: chrono::Utc::now(),
+            event_id: Uuid::new_v4(),
+            receipt_event_id: None,
+            job: test_job(),
+        };
+        let receipts = [
+            receipt(json!({ATTEMPT: {"id": x}})),
+            receipt(json!({KEY: {"generation": Uuid::new_v4()}})),
+            receipt(json!({ATTEMPT: {"id": y.to_string().to_uppercase()}})),
+        ];
+        assert_eq!(attempt_ids_written(&receipts), BTreeSet::from([x, y]));
     }
 
     #[test]

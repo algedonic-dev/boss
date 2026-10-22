@@ -482,3 +482,19 @@ required = true
 name = "completed_at"
 field_type = "date-time"
 required = false
+
+# ec6fc29a: an explicit independent judgment of attended browser evidence
+# is a different terminal, not a string pretending to be boss prove output.
+# Appended so an open older car may convert explicitly without rewriting its
+# completed steps. Publishing alone never repins an in-flight packet.
+[[workflow.step]]
+title = "attended-qualified"
+kind = "outcome"
+ready_when = "steps.review.done AND job.metadata.merged = \"true\" AND job.metadata.attended_qualified = \"true\""
+title_template = "Qualified by independent attended browser review"
+terminal = { outcome = "attended-qualified" }
+metadata_defaults = { outcome_kind = "completed", qualification_contract = "attended-browser-v1", completion_contract = "attended-browser-accept-v1", records_before_claim = ["attended_qualification"], procedure = "Only boss browser accept <car> --observation <packet> --accept-attended writes this terminal. It re-reads the published pinned protocol, immutable observation and independent qualification records, exact source/suite bindings and whole attachment originals. A raw client pass flag or terminal status is no qualification. The immutable attended_qualification record names both original events/digests and the assurance actually accepted. The existing proven step and boss prove execution semantics remain unchanged; closure may skip its unpaid status but preserves all its evidence. Old cars need an explicit recorded conversion after this protocol is published; never invent this terminal on a pinned older version." }
+[[workflow.step.fields]]
+name = "attended_qualification"
+field_type = "object"
+required = true

@@ -157,6 +157,25 @@ pub fn authorized_keys_line(command: &str, public_key: &str) -> String {
     format!("command=\"{command}\",restrict {public_key}")
 }
 
+/// The public key a line from [`authorized_keys_line`] was joined from:
+/// its last two space-separated tokens, the key type and its blob, which
+/// that function appends after one space (backlog 54b5090f). None when
+/// the tail is not a key — fewer than two tokens, or a token that is
+/// empty or carries a quote or a control character, as the options half
+/// does. Only the shape is read here; whether it is THE key is the exact
+/// comparison with the stored pair, which this does not replace.
+fn public_key_of_line(line: &str) -> Option<&str> {
+    let mut tokens = line.rsplitn(3, ' ');
+    let blob = tokens.next()?;
+    let kind = tokens.next()?;
+    let is_token =
+        |token: &str| !token.is_empty() && !token.chars().any(|c| c == '"' || c.is_control());
+    if !is_token(kind) || !is_token(blob) {
+        return None;
+    }
+    line.get(line.len() - kind.len() - 1 - blob.len()..)
+}
+
 /// The registered broker executor prepares a public enrollment proposal.
 /// Receiver installation is a separate human step; this handler never
 /// completes it or records verified/revoked effects.
@@ -294,12 +313,40 @@ impl boss_dispatcher::rules::handler::Handler for CredentialPrepareSshDeposit {
             // proposal — storage lost after it is a failed replay — and
             // it is judged whole further down, against the line this
             // handler joins from the pair the Secret holds.
+            //
+            // AND THE KEY IT WAS JOINED FROM IS RECORDED IN IT (backlog
+            // 54b5090f, review N4 of car c1cdb202). The proposal is
+            // written BEFORE issue and install, so a broker stopped
+            // between the two leaves the line as the only record of the
+            // key: this branch counted it as recorded and took no key
+            // out of it, the stored pair was compared with nothing, and
+            // a pair replaced in that window became the line the passkey
+            // signs. The line ends with the key, so it is read from
+            // there and compared like every other recorded identity; a
+            // line whose tail is not a key refuses, nothing minted.
             if slug == "enroll"
                 && forced.is_some()
                 && public.is_none()
                 && step.metadata.contains_key("authorized_keys_line")
             {
                 recorded = true;
+                let public = step
+                    .metadata
+                    .get("authorized_keys_line")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(public_key_of_line)
+                    .ok_or_else(|| {
+                        HandlerError::Permanent(
+                            "recorded enrollment line does not end with a public key; nothing minted"
+                                .into(),
+                        )
+                    })?;
+                if recorded_public.is_some_and(|prior| prior != public) {
+                    return Err(HandlerError::Permanent(
+                        "recorded preparation public identities disagree; nothing minted".into(),
+                    ));
+                }
+                recorded_public = Some(public);
                 continue;
             }
             if step.status == "completed" || public.is_some() {

@@ -33,7 +33,25 @@ use std::time::Duration;
 
 pub(crate) const CREDENTIAL_ENV: &str = "BOSS_PROBE_READER_CREDENTIAL";
 pub(crate) const DOOR_ENV: &str = "BOSS_SOR_DOOR";
-pub(crate) const MAX_LIFETIME_SECS: u64 = 60;
+/// How long one door stands, and so the bound of the probe behind it
+/// (`prove::Shell::bound`) and of each read it forwards. 60 s until
+/// backlog a32af300 (2026-10-21): car 5159b6b6's probe reads
+/// `GET /api/yard/regions?window=24h`, and the system of record took
+/// 25 s to answer it unloaded and 60-122 s under the map's own polling
+/// (31 reads in 8 minutes, the gateway's `duration_ms`; 87.8 s and
+/// 138.4 s from the pod's door), so a TRUE claim was killed at 60 s
+/// three hours running and recorded as a failed attempt. 180 s holds the
+/// longest read measured with room; `run-car-probe.json`'s own timeout
+/// is pinned above it (`the_verb_outlives_the_probe_it_runs`).
+pub(crate) const MAX_LIFETIME_SECS: u64 = 180;
+
+/// How many of a probe's reads the door keeps the timing of: the most
+/// recent ones, because the read a killed probe's time went to is the
+/// last it made. A probe is program text a builder wrote; its record is
+/// bounded whatever it does.
+const MAX_LOGGED_READS: usize = 32;
+/// A logged path is cut here, for the same reason.
+const MAX_LOGGED_PATH: usize = 256;
 
 /// Where the reader credential is deposited on a host that proves.
 /// Nothing in the tree delivers it yet (the delivery chain is its own
@@ -126,8 +144,91 @@ pub(crate) struct Guard {
     directory: tempfile::TempDir,
     socket: PathBuf,
     unserved: Unserved,
+    reads: Reads,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     worker: Option<std::thread::JoinHandle<()>>,
+}
+
+/// ONE READ THE DOOR TOOK, AND WHERE ITS TIME WENT (backlog a32af300).
+/// A probe killed at its bound said only "killed at 60s timeout", with
+/// empty stdout: whether the time went to the system of record, to the
+/// transport or to the probe's own `jq` had to be re-derived from the
+/// pod, and the answer (the record, 25-122 s for one read) was a fact
+/// this door had held the whole time. Measured here, by root's door,
+/// not reported by the probe's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadTiming {
+    /// The path and query the probe asked for (never the host, which
+    /// is the door's), cut at [`MAX_LOGGED_PATH`].
+    pub path: String,
+    /// Milliseconds from the door taking the read to the status it
+    /// answered with — the upstream's headers, not its streamed body —
+    /// or, while still in flight, to the moment it was asked about.
+    pub ms: u64,
+    /// The status the door answered; `None` is a read still in flight
+    /// when the probe ended — the one a killed probe's time went to.
+    pub status: Option<u16>,
+}
+
+/// The door's read log: the last [`MAX_LOGGED_READS`] reads, each by a
+/// sequence number so an answer finds its own read after older ones are
+/// dropped. Shared like [`Unserved`]: the door's thread writes it, the
+/// guard reads it after the probe returns.
+type Reads = Arc<std::sync::Mutex<ReadLog>>;
+
+#[derive(Debug, Default)]
+struct ReadLog {
+    next: u64,
+    entries: std::collections::VecDeque<Logged>,
+}
+
+#[derive(Debug)]
+struct Logged {
+    seq: u64,
+    path: String,
+    began: std::time::Instant,
+    answered: Option<(u16, Duration)>,
+}
+
+impl ReadLog {
+    fn begin(&mut self, path: &str) -> u64 {
+        let seq = self.next;
+        self.next += 1;
+        let cut = path
+            .char_indices()
+            .nth(MAX_LOGGED_PATH)
+            .map_or(path.len(), |(i, _)| i);
+        self.entries.push_back(Logged {
+            seq,
+            path: path[..cut].to_string(),
+            began: std::time::Instant::now(),
+            answered: None,
+        });
+        while self.entries.len() > MAX_LOGGED_READS {
+            self.entries.pop_front();
+        }
+        seq
+    }
+
+    fn answer(&mut self, seq: u64, status: http::StatusCode) {
+        if let Some(read) = self.entries.iter_mut().find(|read| read.seq == seq) {
+            read.answered = Some((status.as_u16(), read.began.elapsed()));
+        }
+    }
+
+    fn timings(&self) -> Vec<ReadTiming> {
+        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        self.entries
+            .iter()
+            .map(|read| ReadTiming {
+                path: read.path.clone(),
+                ms: ms(read
+                    .answered
+                    .map_or_else(|| read.began.elapsed(), |(_, d)| d)),
+                status: read.answered.map(|(status, _)| status),
+            })
+            .collect()
+    }
 }
 
 /// The reads a standing door REFUSED because the port they named has a
@@ -558,6 +659,7 @@ impl Guard {
         let credential = read_credential(&config.credential, me)?;
         let forwarder = Arc::new(Forwarder::new(config, credential)?);
         let unserved = forwarder.unserved.clone();
+        let reads = forwarder.reads.clone();
         let recipient = user.map(uid_of).transpose()?;
         let (socket, listener) = bind_socket(directory.path(), recipient)?;
         listener.set_nonblocking(true)?;
@@ -610,6 +712,7 @@ impl Guard {
             directory,
             socket,
             unserved,
+            reads,
             stop: Some(stop),
             worker: Some(worker),
         };
@@ -639,6 +742,16 @@ impl Guard {
             .unwrap_or_default()
     }
 
+    /// Every read this door has taken that it still holds, oldest
+    /// first, timed as of now: asked while the door stands, so a read
+    /// the probe's kill left unanswered is still in the log, in flight.
+    pub(crate) fn reads(&self) -> Vec<ReadTiming> {
+        self.reads
+            .lock()
+            .map(|log| log.timings())
+            .unwrap_or_default()
+    }
+
     fn stop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -660,6 +773,7 @@ struct Forwarder {
     /// slot, the reason where it did not.
     vouched: tokio::sync::Mutex<BTreeMap<u16, Result<(), Unvouched>>>,
     unserved: Unserved,
+    reads: Reads,
 }
 
 impl Forwarder {
@@ -700,7 +814,9 @@ impl Forwarder {
         let client = boss_core::machine_token::Client::unstamped(
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(60)),
+                // No read outlives the door it came through; a fixed
+                // 60 here was a third copy of the bound (a32af300).
+                .timeout(Duration::from_secs(MAX_LIFETIME_SECS)),
         )?;
         Ok(Self {
             base,
@@ -710,6 +826,7 @@ impl Forwarder {
             client,
             vouched: tokio::sync::Mutex::new(BTreeMap::new()),
             unserved: Unserved::default(),
+            reads: Reads::default(),
         })
     }
 
@@ -843,7 +960,25 @@ impl Forwarder {
         ))?)
     }
 
+    /// Every read the door takes, logged and timed ([`ReadLog`]): begun
+    /// here, answered with the status [`Self::forward`] gave. A read
+    /// whose future is dropped — the probe killed, the door stopped —
+    /// is never answered, and stays in the log as in flight.
     async fn read(&self, request: axum::extract::Request) -> axum::response::Response {
+        let path = request
+            .uri()
+            .path_and_query()
+            .map_or("/", |p| p.as_str())
+            .to_string();
+        let seq = self.reads.lock().ok().map(|mut log| log.begin(&path));
+        let response = self.forward(request).await;
+        if let (Some(seq), Ok(mut log)) = (seq, self.reads.lock()) {
+            log.answer(seq, response.status());
+        }
+        response
+    }
+
+    async fn forward(&self, request: axum::extract::Request) -> axum::response::Response {
         use axum::response::IntoResponse;
         let target = match self.target(&request) {
             Ok(target) => target,
@@ -1549,7 +1684,7 @@ mod tests {
         let (ok, out) = fixture::curl(guard.socket(), &url, &[]);
         assert!(!ok, "the door outlived its bound: {out}");
         assert_eq!(upstream.seen.lock().unwrap().len(), 1);
-        assert_eq!(MAX_LIFETIME_SECS, 60);
+        assert_eq!(MAX_LIFETIME_SECS, 180);
     }
 
     /// F1: an upstream that answers with a redirect is handed back as
@@ -2283,7 +2418,7 @@ mod tests {
         let guard = guard.unwrap().unwrap();
         assert!(!left.exists(), "the next door left a dead one standing");
         assert!(guard.socket().exists(), "the sweep took the door just made");
-        assert_eq!(DEAD_DOOR_AFTER, Duration::from_secs(300));
+        assert_eq!(DEAD_DOOR_AFTER, Duration::from_secs(900));
     }
 
     #[test]
@@ -2437,5 +2572,125 @@ mod tests {
             "cancelled read is not a passing empty body"
         );
         server.abort();
+    }
+
+    /// WHERE A KILLED PROBE'S TIME WENT (backlog a32af300). Car
+    /// 5159b6b6's probe was killed at its bound three hours running with
+    /// empty stdout, and nothing on the record said which read it was
+    /// waiting on. The door times every read it takes — an answered one
+    /// with its status, and the one still waiting when it is asked with
+    /// no status at all, named by its path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_door_times_every_read_and_names_the_one_still_in_flight() {
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(Mutex::new(Some(entered)));
+        let app = axum::Router::new()
+            .route(
+                "/api/jobs/health",
+                axum::routing::get(|| async { (http::StatusCode::OK, "ok") }),
+            )
+            .route(
+                "/api/yard/regions",
+                axum::routing::get(move || {
+                    let entered = entered.clone();
+                    async move {
+                        if let Some(entered) = entered.lock().unwrap().take() {
+                            let _ = entered.send(());
+                        }
+                        std::future::pending::<http::StatusCode>().await
+                    }
+                }),
+            )
+            .merge(fixture::accepts_route("reader.current"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let fixture = tempfile::tempdir().unwrap();
+        let credential = fixture::credential(fixture.path(), "fixture-reader-token", 0o600);
+        let config = Config {
+            credential,
+            base: base.clone(),
+            ports: String::new(),
+            ports_from: None,
+        };
+        let guard = tokio::task::spawn_blocking(move || open(&config, None))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(guard.reads(), [], "a door that has taken no read logs none");
+        let socket = guard.socket().to_path_buf();
+        let health = format!("{base}/api/jobs/health");
+        let (ok, out) = tokio::task::spawn_blocking({
+            let socket = socket.clone();
+            move || fixture::curl(&socket, &health, &[])
+        })
+        .await
+        .unwrap();
+        assert!(ok && out.ends_with("200"), "{out}");
+        let mut command = tokio::process::Command::new("curl");
+        command
+            .args(["-sS", "--max-time", "5", "--unix-socket"])
+            .arg(&socket)
+            .arg(format!("{base}/api/yard/regions?window=24h"))
+            .kill_on_drop(true);
+        let reader = tokio::spawn(async move { command.output().await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(5), observed)
+            .await
+            .expect("upstream actually observed the read")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let reads = guard.reads();
+        assert_eq!(reads.len(), 2, "{reads:?}");
+        assert_eq!(reads[0].path, "/api/jobs/health");
+        assert_eq!(reads[0].status, Some(200));
+        assert_eq!(reads[1].path, "/api/yard/regions?window=24h");
+        assert_eq!(reads[1].status, None, "still in flight: {reads:?}");
+        assert!(reads[1].ms >= 300, "timed up to the asking: {reads:?}");
+        tokio::task::spawn_blocking(move || drop(guard))
+            .await
+            .unwrap();
+        let _ = reader.await;
+        server.abort();
+    }
+
+    /// THE LOG IS BOUNDED WHATEVER THE PROBE DOES: the newest reads are
+    /// kept, because the one a killed probe was waiting on is its last,
+    /// and a path is cut. An answer still finds its own read after older
+    /// ones have been dropped.
+    #[test]
+    fn the_read_log_keeps_the_newest_reads_and_cuts_a_long_path() {
+        let mut log = ReadLog::default();
+        let first = log.begin("/api/first");
+        for n in 0..MAX_LOGGED_READS {
+            let seq = log.begin(&format!("/api/{n}"));
+            log.answer(seq, http::StatusCode::OK);
+        }
+        log.answer(first, http::StatusCode::OK);
+        let last = log.begin(&format!("/api/{}", "x".repeat(4 * MAX_LOGGED_PATH)));
+        let reads = log.timings();
+        assert_eq!(reads.len(), MAX_LOGGED_READS);
+        assert!(reads.iter().all(|read| read.path != "/api/first"));
+        assert_eq!(reads[0].path, "/api/1");
+        assert_eq!(reads[0].status, Some(200));
+        let newest = reads.last().unwrap();
+        assert_eq!(newest.path.chars().count(), MAX_LOGGED_PATH);
+        assert_eq!(newest.status, None);
+        log.answer(last, http::StatusCode::BAD_GATEWAY);
+        assert_eq!(log.timings().last().unwrap().status, Some(502));
+    }
+
+    /// THE BOUND HOLDS A LIVE READ OF THE YARD (backlog a32af300). The
+    /// longest single read of `GET /api/yard/regions?window=24h` measured
+    /// on 2026-10-21 was 138.4 s from the pod's door (gateway server-side
+    /// 25-122 s); a door, and the probe behind it, that lives shorter
+    /// kills a true claim and records a failed attempt.
+    #[test]
+    fn the_door_outlives_the_longest_measured_live_read() {
+        const LONGEST_MEASURED_READ_SECS: u64 = 139;
+        const { assert!(MAX_LIFETIME_SECS > LONGEST_MEASURED_READ_SECS) };
+        assert_eq!(DEAD_DOOR_AFTER, Duration::from_secs(5 * MAX_LIFETIME_SECS));
     }
 }

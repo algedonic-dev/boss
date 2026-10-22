@@ -221,6 +221,11 @@ controls! {
     UPDATE_WORKFLOW: Update "workflow";
     PUBLISH_WORKFLOW: Publish "workflow";
     RETIRE_WORKFLOW: Retire "workflow";
+    /// Reading a workflow or station version never published, and
+    /// nothing else (backlog f21804d8, design 600c07d7): the read-only
+    /// fourth leg of `boss-jobs` http/kinds.rs `may_read_drafts`, beside
+    /// the three authoring verbs that already read a draft.
+    READ_WORKFLOW_DRAFT: Read "workflow-draft";
 }
 
 #[cfg(test)]
@@ -344,5 +349,7 @@ mod tests {
         assert_eq!(CREATE_CLASS.resource(), Resource::class());
         assert_eq!(UPDATE_STEP_ASSIGN.resource(), Resource::step_assign());
         assert_eq!(READ_POLICY_RULE.resource(), Resource::policy_rule());
+        assert_eq!(READ_WORKFLOW_DRAFT.action(), Action::Read);
+        assert_eq!(READ_WORKFLOW_DRAFT.resource(), Resource::workflow_draft());
     }
 }

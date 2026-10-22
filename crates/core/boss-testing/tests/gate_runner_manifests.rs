@@ -125,29 +125,41 @@ fn the_converge_and_the_hand_verb_build_the_same_script_keys() {
         Some("/gate/"),
     );
     let apply = configmap_keys(&read(APPLY), None);
-    let want: std::collections::BTreeSet<String> = ["bootstrap.sh", "run.sh"]
+    let want: std::collections::BTreeSet<String> = ["bootstrap.sh", "run.sh", "seed-refresh.sh"]
         .iter()
         .map(|k| k.to_string())
         .collect();
     assert_eq!(
         converge, want,
-        "the converge must write both the bootstrap and main's run.sh into {CONFIGMAP}"
+        "the converge must write the bootstrap, main's run.sh and the seed housekeeping \
+         (backlog 3e2c8ddc) into {CONFIGMAP}"
     );
     assert_eq!(
         apply, converge,
         "{APPLY} and the converge build {CONFIGMAP} with different keys — its --check would \
          answer for an object the converge never writes"
     );
+    // EVERY command the manifest runs from the ConfigMap: since 3e2c8ddc
+    // the gate's run.sh AND the seed-refresh container's seed-refresh.sh.
     let manifest = read(SHARED);
-    let execs = manifest
-        .split("/repo-script/")
-        .nth(1)
-        .and_then(|rest| rest.split('"').next())
-        .expect("the manifest's command runs a script from /repo-script");
-    assert!(
-        converge.contains(execs),
-        "{SHARED} execs /repo-script/{execs}, a key the converge does not write ({converge:?})"
+    let execs: Vec<&str> = manifest
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("command:"))
+        .filter_map(|l| l.split("/repo-script/").nth(1))
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert_eq!(
+        execs,
+        ["run.sh", "seed-refresh.sh"],
+        "the manifest's commands run the gate's script and the helper's from /repo-script"
     );
+    for key in execs {
+        assert!(
+            converge.contains(key),
+            "{SHARED} execs /repo-script/{key}, a key the converge does not write ({converge:?})"
+        );
+    }
     assert!(
         read("infra/gate-runner/bootstrap.sh").contains("/run.sh"),
         "the bootstrap's fallback is the ConfigMap's run.sh key"
@@ -226,6 +238,191 @@ fn pod_containers(text: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// The pod spec's containers as (section, name), in order: which list
+/// each is declared in is the whole of the judged-init layout.
+fn pod_sections(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut section = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if indent == 6 && trimmed.ends_with(':') {
+            section = trimmed.trim_end_matches(':').to_string();
+            continue;
+        }
+        if indent == 8
+            && matches!(section.as_str(), "containers" | "initContainers")
+            && let Some(name) = trimmed.strip_prefix("- name: ")
+        {
+            out.push((section.clone(), name.trim().to_string()));
+        }
+    }
+    out
+}
+
+/// The non-comment lines of a block, trimmed.
+fn code_lines(block: &str) -> Vec<&str> {
+    block
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
+/// THE GATE IS JUDGED IN AN INIT CONTAINER AND THE SEED IS REFRESHED
+/// AFTER IT (backlog 3e2c8ddc, with 82ffaff3; design b4bf8bba, both
+/// questions approved 2026-10-16). The conductor records a verdict only
+/// from a `gate` container that has ENDED, and the gate used to refresh
+/// the warm seed and empty its workspace before ending: a green waited
+/// 638 s for its own copy on gate-run 86dd2d48 and about eight minutes of
+/// `find -delete` in uninterruptible I/O on 4aad01a9. Car 39ee7932 taught
+/// every reader the layout; this pins the manifest that runs it.
+///
+/// FOUR FACTS TRAVEL TOGETHER, and each one alone is a defect: the Job's
+/// layout label (which finished Jobs owe a housekeeping record), the
+/// gate's GATE_LAYOUT (run.sh hands off instead of refreshing), `gate`
+/// as an init container (it ends on its verdict), and the `seed-refresh`
+/// container after it (someone takes the handoff). A handoff nobody takes
+/// leaves a workspace for the hour-idle sweep and the seed cold; a label
+/// without the helper owes a record nothing writes.
+#[test]
+fn the_gate_is_judged_in_an_init_container_and_the_seed_refreshed_after_it() {
+    let text = read(SHARED);
+    let job = text
+        .split("\n---")
+        .find(|d| d.contains("kind: Job"))
+        .expect("the runner manifest carries a Job");
+    // The label, on the Job's OWN metadata (the reader selects on Jobs),
+    // spelled as the conductor's reader spells it (§9a).
+    let reader = read("crates/orchestrators/boss-cli/src/train/carried_verdict.rs");
+    for constant in [
+        "LAYOUT_LABEL: &str = \"boss.dev/gate-layout\";",
+        "LAYOUT_JUDGED_INIT: &str = \"judged-init\";",
+    ] {
+        assert!(
+            reader.contains(constant),
+            "the conductor's reader no longer declares {constant}"
+        );
+    }
+    let job_metadata = job
+        .split("\nspec:")
+        .next()
+        .expect("the Job has metadata before its spec");
+    assert!(
+        code_lines(job_metadata).contains(&"boss.dev/gate-layout: judged-init"),
+        "{SHARED}: the Job must carry `boss.dev/gate-layout: judged-init` on its own \
+         metadata — the conductor owes a finished Job's housekeeping record only on it"
+    );
+
+    assert_eq!(
+        pod_sections(&text),
+        [
+            ("initContainers", "postgres"),
+            ("initContainers", "gate"),
+            ("containers", "seed-refresh"),
+        ]
+        .map(|(s, n)| (s.to_string(), n.to_string())),
+        "{SHARED}: the judged-init layout is postgres (the native sidecar), then `gate` as \
+         a one-shot init container, then `seed-refresh` as the only regular container. A \
+         regular container beside the gate would run DURING the checks, and a second one \
+         after it would be a second thing the pod waits on"
+    );
+    let containers = pod_containers(&text);
+    let block = |name: &str| {
+        containers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| b.clone())
+            .unwrap_or_else(|| panic!("{SHARED} has no container {name}"))
+    };
+    let (gate, helper) = (block("gate"), block("seed-refresh"));
+    let gate_code = code_lines(&gate);
+    let helper_code = code_lines(&helper);
+
+    // The gate: a ONE-SHOT init container. `restartPolicy: Always` would
+    // make it a sidecar the kubelet never waits for, and the helper would
+    // start beside the checks.
+    assert!(
+        !gate_code.iter().any(|l| l.starts_with("restartPolicy:")),
+        "{SHARED}: the gate must not declare a restartPolicy — Always makes it a sidecar"
+    );
+    for line in [
+        "- {name: GATE_LAYOUT, value: judged-init}",
+        "- {name: GATE_VERDICT_CARRIER, value: pod-log}",
+        "command: [\"bash\", \"/repo-script/run.sh\"]",
+    ] {
+        assert!(
+            gate_code.contains(&line),
+            "{SHARED}: the gate container must declare `{line}` — run.sh hands its seed to \
+             the helper only when it is the carried runner AND told this layout"
+        );
+    }
+
+    // The helper: main's script, nothing of the branch's, no credential.
+    for line in [
+        "command: [\"bash\", \"/repo-script/seed-refresh.sh\", \"maintain\"]",
+        "- {name: NATIVE_JOB_NAME, valueFrom: {fieldRef: {fieldPath: \"metadata.labels['batch.kubernetes.io/job-name']\"}}}",
+        "- {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}",
+        "- {name: GATE_SEED_MAINTENANCE_DEADLINE_SECS, value: \"900\"}",
+        "- {name: GATE_SEED_MAINTENANCE_GRACE_SECS, value: \"30\"}",
+        "imagePullPolicy: IfNotPresent",
+    ] {
+        assert!(
+            helper_code.contains(&line),
+            "{SHARED}: the seed-refresh container must declare `{line}`"
+        );
+    }
+    let image = |code: &[&str]| {
+        code.iter()
+            .find_map(|l| l.strip_prefix("image: "))
+            .map(str::to_string)
+    };
+    assert_eq!(
+        image(&helper_code),
+        image(&gate_code),
+        "the helper runs in the image the gate just ran in: its tools (flock, timeout, cp) \
+         are the ones the old layout's refresh used, and IfNotPresent finds it on the node"
+    );
+    let mounts: Vec<&str> = helper_code
+        .iter()
+        .copied()
+        .filter(|l| l.contains("mountPath:"))
+        .collect();
+    assert_eq!(
+        mounts,
+        [
+            "- {name: gate-disk, mountPath: /gate-seed, subPath: seed}",
+            "- {name: gate-disk, mountPath: /gate-target, subPathExpr: runs/$(POD_NAME)}",
+            "- {name: run-script, mountPath: /repo-script}",
+        ],
+        "{SHARED}: the helper mounts the seed, THIS pod's workspace and main's scripts — \
+         never /gate-runs (every run's workspace), the database or the forge token"
+    );
+    for absent in [
+        "forge-token",
+        "GATE_VERDICT_CARRIER",
+        "GATE_LAYOUT",
+        "/gate-runs",
+    ] {
+        assert!(
+            !helper_code.iter().any(|l| l.contains(absent)),
+            "{SHARED}: the seed-refresh container must not name {absent}"
+        );
+    }
+    let ids = |code: &[&str]| {
+        code.iter()
+            .filter(|l| l.starts_with("runAsUser:") || l.starts_with("runAsGroup:"))
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(&helper_code),
+        ids(&gate_code),
+        "the helper deletes what the gate wrote and writes the seed the next gate reads: \
+         the same uid and gid"
+    );
 }
 
 /// THE GATE MUST MEET THE RESTRICTED PROFILE, NOT WARN ABOUT IT.

@@ -184,6 +184,47 @@ pub(crate) async fn api_at_signed(
     payload: Option<Value>,
     signature: identity::Signature,
 ) -> Result<Option<Value>> {
+    api_at_signed_presenting(http, base, method, path, payload, signature, None).await
+}
+
+/// [`api`] presenting this host's ops-runner credential beside the
+/// machine token, in the header the jobs API's credential door resolves
+/// (`boss_jobs::runner_credential::HEADER`). ONE caller: the forge
+/// door's payment of an owed proof, the one write the server reserves
+/// to the credentialed runner (backlog 82946cd9). It rides the machine
+/// client, so it leaves only for a host the machine token may leave
+/// for, never through a proxy and never after a redirect.
+pub(crate) async fn api_presenting_runner(
+    http: &crate::machine_http::MachineClient,
+    method: reqwest::Method,
+    path: &str,
+    payload: Option<Value>,
+    credential: &reqwest::header::HeaderValue,
+) -> Result<Option<Value>> {
+    let signature = identity::signature_for(&method, path, identity::caller());
+    api_at_signed_presenting(
+        http,
+        &jobs_base()?,
+        method,
+        path,
+        payload,
+        signature,
+        Some(credential),
+    )
+    .await
+}
+
+/// [`api_at_signed`] with an optional runner credential — the seam the
+/// wire test reads the header through.
+pub(crate) async fn api_at_signed_presenting(
+    http: &crate::machine_http::MachineClient,
+    base: &str,
+    method: reqwest::Method,
+    path: &str,
+    payload: Option<Value>,
+    signature: identity::Signature,
+    runner: Option<&reqwest::header::HeaderValue>,
+) -> Result<Option<Value>> {
     let signer = identity::apply(signature)?;
     let user = identity::header(&signer);
     let url = format!("{base}{path}");
@@ -196,6 +237,12 @@ pub(crate) async fn api_at_signed(
             .request(method.clone(), &url)
             .header("x-boss-user", user.as_str())
             .header("content-type", "application/json");
+        let req = match runner {
+            Some(credential) => {
+                req.header(boss_jobs::runner_credential::HEADER, credential.clone())
+            }
+            None => req,
+        };
         match &payload {
             Some(p) => req.json(p),
             None => req,
@@ -620,6 +667,38 @@ pub(crate) mod stub {
         (format!("http://{addr}"), handle)
     }
 
+    /// Answer each of `answers` — a status line and a body — to one
+    /// connection, in order: a record that changes between reads, the
+    /// way a gate-run's `withdrawn` terminal completes a second or two
+    /// after its verdict (backlog 7905cb5d). The counter is how many
+    /// requests were read, so a test can say a reader stopped early.
+    pub(crate) async fn answers_in_order(
+        answers: Vec<(&'static str, String)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
+        tokio::spawn(async move {
+            for (status, body) in answers {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let _ = read_request(&mut sock).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), served)
+    }
+
     /// A one-shot `302` to `location`, its body echoing the whole target
     /// the way an HTML redirect page does — the shape Cloudflare Access
     /// answers `boss.algedonic.dev` with (backlog 2ee29275, F4).
@@ -907,6 +986,54 @@ mod signing_tests {
         assert!(
             !head.contains(crate::identity::CONDUCTOR),
             "an operator's write must not be signed as the train automation; head was:\n{head}"
+        );
+    }
+
+    /// Backlog 82946cd9, at the wire: the runner credential rides in the
+    /// header the jobs API's credential door reads, beside the signed
+    /// caller, only on the write that asks for it — the plain signed
+    /// door never carries one.
+    #[tokio::test]
+    async fn the_runner_credential_rides_only_the_write_that_presents_it() {
+        let header = boss_jobs::runner_credential::HEADER;
+        let mut credential = reqwest::header::HeaderValue::from_static("fixture-credential");
+        credential.set_sensitive(true);
+        let http = crate::sor_client::machine_client().unwrap();
+
+        let (base, stub) = one_request("{}").await;
+        api_at_signed_presenting(
+            &http,
+            &base,
+            reqwest::Method::PATCH,
+            "/api/jobs/x/metadata",
+            Some(json!({"proof_owed": "paid"})),
+            Signature::As("automation:ops-runner".into()),
+            Some(&credential),
+        )
+        .await
+        .expect("the stub answers 200");
+        let head = stub.await.unwrap().expect("the stub read a request");
+        assert!(
+            head.contains(&format!("{header}: fixture-credential")),
+            "the payment presents the credential; head was:\n{head}"
+        );
+        assert!(head.contains(r#""id":"automation:ops-runner""#), "{head}");
+
+        let (base, stub) = one_request("{}").await;
+        api_at_signed(
+            &http,
+            &base,
+            reqwest::Method::PATCH,
+            "/api/jobs/x/metadata",
+            Some(json!({"proof_attempt": {}})),
+            Signature::As("automation:ops-runner".into()),
+        )
+        .await
+        .expect("the stub answers 200");
+        let head = stub.await.unwrap().expect("the stub read a request");
+        assert!(
+            !head.to_ascii_lowercase().contains(header),
+            "a plain write carries no runner credential; head was:\n{head}"
         );
     }
 

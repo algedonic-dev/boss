@@ -194,6 +194,26 @@ impl BudgetDoor {
             .find(|a| a.id == actor_id))
     }
 
+    /// The agents row a CALLER's spelling names: the row with that id,
+    /// else the one row listing it among its aliases (a login that signs
+    /// as the agent). Two rows claiming one login name nobody, as the
+    /// CLI's `resolve_agent` already rules (review f7f0b689, N3). Unlike
+    /// [`Self::agent_row`], which reads a HOLDER by its stored id, this
+    /// answers which spellings are the caller itself (backlog 5487223c).
+    pub async fn caller_row(&self, spelling: &str) -> Result<Option<AgentRow>, BudgetDoorError> {
+        let rows = self.agents.list().await?;
+        if let Some(row) = rows.iter().find(|a| a.id == spelling) {
+            return Ok(Some(row.clone()));
+        }
+        let mut named = rows
+            .into_iter()
+            .filter(|a| a.aliases.iter().any(|l| l == spelling));
+        Ok(match (named.next(), named.next()) {
+            (Some(row), None) => Some(row),
+            _ => None,
+        })
+    }
+
     /// Reserve `budget_usd` of `row`'s hour, measured at `now`.
     pub async fn reserve(
         &self,

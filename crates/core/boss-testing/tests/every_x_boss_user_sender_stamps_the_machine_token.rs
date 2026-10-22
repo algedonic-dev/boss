@@ -34,6 +34,16 @@
 //! seen. The one gap closed by type rather than by this scan is the
 //! redirect: every stamping client refuses to follow one.
 //!
+//! WHAT IT SKIPS, AND THE PIN THAT MAKES THE SKIP SAFE. The walk skips
+//! every directory named `tests`, which is right for a crate's
+//! integration tests and right inside `src/` only while a `#[cfg(test)]`
+//! module is the one way in. The broker-stage car put the first file
+//! there (`credentials/http/tests/stage.rs`, by `#[path]`), and its
+//! review asked for a pin that it stays so (25fff647, F6; backlog
+//! 3ecb415b): [`every_file_under_a_src_tests_directory_is_reached_only_through_cfg_test`].
+//! Without it, production code in such a directory would be a sender
+//! this scan never reads.
+//!
 //! tree-wide pin — it scans a tree no changed-file map can attribute
 //! to this crate, so every scoped gate runs it whatever its scope
 //! (`tree_wide_pins` in infra/gate.sh; backlog c87ad472).
@@ -306,6 +316,307 @@ fn the_scan_sees_a_sender_and_not_a_reader() {
     assert!(
         found.iter().filter(|(_, _, s)| *s).count() >= 10,
         "the scan found under ten stamping senders — it is not reading the tree: {found:?}"
+    );
+}
+
+// ----- the `tests` directories under `src/` the walk skips (review of
+// 25fff647, F6; backlog 3ecb415b) -----
+//
+// WHAT IT DOES NOT HOLD, said so it is not assumed: a `#[path]` is
+// resolved against the declaring file's directory, which is rustc's rule
+// for a file's top-level items and not for one inside an inline module;
+// a `#[path]` on the `tests` module itself is not followed; and `benches`
+// directories, which the walk also skips, are not judged here.
+
+/// Every `.rs` under `dir`, nothing skipped but build output.
+fn every_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if p.file_name()
+                .is_some_and(|n| n == "target" || n == "node_modules")
+            {
+                continue;
+            }
+            every_rs(&p, out);
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            out.push(p);
+        }
+    }
+}
+
+/// The first directory named `tests` strictly below a `src` component
+/// of `path`, when there is one.
+fn src_tests_dir(path: &Path) -> Option<PathBuf> {
+    let mut under_src = false;
+    let mut at = PathBuf::new();
+    let parts: Vec<_> = path.components().collect();
+    for (i, part) in parts.iter().enumerate() {
+        at.push(part);
+        if under_src && part.as_os_str() == "tests" && i + 1 < parts.len() {
+            return Some(at);
+        }
+        under_src |= part.as_os_str() == "src";
+    }
+    None
+}
+
+/// `path` with `.` and `..` folded away, lexically.
+fn folded(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The `#[path = "…"]` value of every `mod` item in `source`, at any depth.
+fn path_mods(source: &str) -> Vec<String> {
+    struct Paths(Vec<String>);
+    impl<'ast> syn::visit::Visit<'ast> for Paths {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            for attr in item.attrs.iter().filter(|a| a.path().is_ident("path")) {
+                if let Ok(syn::MetaNameValue {
+                    value:
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(s),
+                            ..
+                        }),
+                    ..
+                }) = attr.meta.require_name_value()
+                {
+                    self.0.push(s.value());
+                }
+            }
+            syn::visit::visit_item_mod(self, item);
+        }
+    }
+    let file = syn::parse_file(source).unwrap_or_else(|e| panic!("not Rust: {e}"));
+    let mut found = Paths(Vec::new());
+    syn::visit::Visit::visit_file(&mut found, &file);
+    found.0
+}
+
+/// Does `source` declare, at its top level, a module named `tests` that
+/// takes its file from the module tree rather than from a `#[path]`?
+fn declares_tests(source: &str) -> bool {
+    let file = syn::parse_file(source).unwrap_or_else(|e| panic!("not Rust: {e}"));
+    file.items.iter().any(|item| {
+        matches!(item, syn::Item::Mod(m)
+            if m.ident == "tests" && !m.attrs.iter().any(|a| a.path().is_ident("path")))
+    })
+}
+
+/// Every `.rs` under a `src/**/tests/` directory below `root/crates`,
+/// sorted, with `None` when only a `#[cfg(test)]` module reaches it and
+/// `Some(why)` when production code does or no declaration can be read.
+/// "Production" is [`production_text`]: the declaration survives it.
+fn tests_dir_files(root: &Path) -> Vec<(String, Option<String>)> {
+    let mut files = Vec::new();
+    every_rs(&root.join("crates"), &mut files);
+    let rel = |p: &Path| {
+        p.strip_prefix(root)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    // Judged below the root, so a root whose own path holds a `src` or a
+    // `tests` component reads the same as any other.
+    let tests_dir = |p: &Path| src_tests_dir(p.strip_prefix(root).ok()?).map(|d| root.join(d));
+    let under_src = |p: &Path| {
+        p.strip_prefix(root)
+            .is_ok_and(|r| r.components().any(|c| c.as_os_str() == "src"))
+    };
+    let read = |p: &Path| -> (String, String) {
+        let raw = std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", rel(p)));
+        let prod = production_text(&raw)
+            .unwrap_or_else(|e| panic!("{} does not parse as Rust: {e}", rel(p)));
+        (raw, prod)
+    };
+    // Every `#[path]` a file outside such a directory declares: where it
+    // lands, who declares it, and whether production code does.
+    let mut by_path: Vec<(PathBuf, String, bool)> = Vec::new();
+    for p in files
+        .iter()
+        .filter(|p| under_src(p) && tests_dir(p).is_none())
+    {
+        let (raw, prod) = read(p);
+        let in_prod = path_mods(&prod);
+        let base = p.parent().unwrap_or(root);
+        for value in path_mods(&raw) {
+            let survives = in_prod.contains(&value);
+            by_path.push((folded(&base.join(&value)), rel(p), survives));
+        }
+    }
+    let mut out: Vec<(String, Option<String>)> = files
+        .iter()
+        .filter_map(|p| tests_dir(p).map(|dir| (p, dir)))
+        .map(|(p, dir)| {
+            let here = folded(p);
+            let reached: Vec<&(PathBuf, String, bool)> =
+                by_path.iter().filter(|(to, _, _)| *to == here).collect();
+            let why = if !reached.is_empty() {
+                reached
+                    .iter()
+                    .find(|(_, _, survives)| *survives)
+                    .map(|(_, from, _)| {
+                        format!("production code reaches it by a #[path] in {from}")
+                    })
+            } else {
+                let parent = dir.parent().unwrap_or(root);
+                let candidates: Vec<PathBuf> = [
+                    parent.with_extension("rs"),
+                    parent.join("mod.rs"),
+                    parent.join("lib.rs"),
+                    parent.join("main.rs"),
+                ]
+                .into_iter()
+                .filter(|c| c.is_file())
+                .collect();
+                let parents: Vec<(PathBuf, String, String)> = candidates
+                    .into_iter()
+                    .map(|c| {
+                        let (raw, prod) = read(&c);
+                        (c, raw, prod)
+                    })
+                    .collect();
+                if let Some((c, _, _)) = parents.iter().find(|(_, _, prod)| declares_tests(prod)) {
+                    Some(format!(
+                        "{} declares its `mod tests` without #[cfg(test)]",
+                        rel(c)
+                    ))
+                } else if parents.iter().any(|(_, raw, _)| declares_tests(raw)) {
+                    None
+                } else {
+                    Some(format!(
+                        "no `mod tests` declaration this pin can read reaches {} — an orphan, \
+                         or a shape it does not follow",
+                        rel(&dir)
+                    ))
+                }
+            };
+            (rel(p), why)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn every_file_under_a_src_tests_directory_is_reached_only_through_cfg_test() {
+    let found = tests_dir_files(&repo_root());
+    // Controls: three such files were on main when this landed (the
+    // broker-stage door's http/tests/stage.rs and the self-issued
+    // rotation's tests/reader.rs and tests/reader/window.rs); a check
+    // that found none would pass on any tree.
+    assert!(
+        found.len() >= 3,
+        "the check found under three files in src/**/tests/ — it is not reading the tree: \
+         {found:?}"
+    );
+    let reached: Vec<String> = found
+        .iter()
+        .filter_map(|(file, why)| why.as_ref().map(|why| format!("{file}: {why}")))
+        .collect();
+    assert!(
+        reached.is_empty(),
+        "every_x_boss_user_sender_stamps_the_machine_token skips every directory named \
+         `tests`, so a file under src/**/tests/ that production code can reach is a sender it \
+         never reads (review of 25fff647, F6). Reach these only through a #[cfg(test)] module, \
+         or move them out of the tests directory:\n  {}",
+        reached.join("\n  ")
+    );
+}
+
+#[test]
+fn the_tests_directory_check_refuses_a_production_reach_and_accepts_a_test_one() {
+    let fixture = boss_testing::scratch_dir("src-tests-dir-reach");
+    let write = |rel: &str, body: &str| {
+        let path = fixture.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+    };
+    write(
+        "crates/demo/src/lib.rs",
+        "#[cfg(test)]\nmod tests;\nmod open;\nmod gated;\n\
+         #[path = \"open/tests/leak.rs\"]\nmod leak;\n\
+         #[cfg(test)]\n#[path = \"open/tests/fine.rs\"]\nmod fine;\n",
+    );
+    write("crates/demo/src/tests.rs", "mod a;\n");
+    write("crates/demo/src/tests/a.rs", "fn t() {}\n");
+    write("crates/demo/src/open.rs", "mod tests;\n");
+    write("crates/demo/src/open/tests/b.rs", "fn t() {}\n");
+    write("crates/demo/src/open/tests/leak.rs", "fn t() {}\n");
+    write("crates/demo/src/open/tests/fine.rs", "fn t() {}\n");
+    write(
+        "crates/demo/src/gated.rs",
+        "#[cfg(test)]\nmod tests {\n    mod c;\n}\n",
+    );
+    write("crates/demo/src/gated/tests/c.rs", "fn t() {}\n");
+    write("crates/demo/src/orphan/tests/d.rs", "fn t() {}\n");
+    // A crate's own integration tests are not under src/ and not judged.
+    write("crates/demo/tests/e.rs", "fn t() {}\n");
+    let verdicts: Vec<(String, bool)> = tests_dir_files(&fixture)
+        .into_iter()
+        .map(|(file, why)| (file, why.is_none()))
+        .collect();
+    let expect = |rel: &str, test_only: bool| (format!("crates/demo/src/{rel}"), test_only);
+    assert_eq!(
+        verdicts,
+        vec![
+            expect("gated/tests/c.rs", true),
+            expect("open/tests/b.rs", false),
+            expect("open/tests/fine.rs", true),
+            expect("open/tests/leak.rs", false),
+            expect("orphan/tests/d.rs", false),
+            expect("tests/a.rs", true),
+        ]
+    );
+}
+
+/// The shape this check was asked for, read from the real files: the
+/// broker-stage door's `#[path]` into `http/tests/`. Gated it is test
+/// code; with its `#[cfg(test)]` dropped it is a production reach, and
+/// refused. The real tree cannot be mutated to show this: stage.rs needs
+/// test-only imports, so boss-jobs stops compiling before this runs.
+#[test]
+fn the_broker_stage_doors_path_into_a_tests_directory_is_refused_ungated() {
+    let root = repo_root();
+    let door = "crates/core/boss-jobs/src/credentials/http.rs";
+    let stage = "crates/core/boss-jobs/src/credentials/http/tests/stage.rs";
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    };
+    let source = read(door);
+    let declared = "#[path = \"http/tests/stage.rs\"]";
+    let gated = format!("#[cfg(test)]\n{declared}");
+    assert!(
+        source.contains(&gated),
+        "{door} no longer reaches stage.rs as `{gated}`; move this control to the shape it has"
+    );
+    let fixture = boss_testing::scratch_dir("src-tests-dir-real-path");
+    let write = |rel: &str, body: &str| {
+        let path = fixture.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+    };
+    write(stage, &read(stage));
+    write(door, &source);
+    assert_eq!(tests_dir_files(&fixture), vec![(stage.to_string(), None)]);
+    write(door, &source.replacen(&gated, declared, 1));
+    let found = tests_dir_files(&fixture);
+    assert!(
+        matches!(found.as_slice(), [(file, Some(why))] if file == stage && why.contains(door)),
+        "{found:?}"
     );
 }
 

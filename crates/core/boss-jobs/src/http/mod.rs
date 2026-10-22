@@ -85,6 +85,8 @@ const BULK_ASSIGNED_LIMIT: i64 = 50_000;
 /// Shared state for jobs API handlers.
 pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     pub jobs: Arc<R>,
+    /// Evidence adapters selected only by declarations on the pinned protocol.
+    pub completion_contracts: crate::completion_contract::Contracts,
     pub bus: Arc<B>,
     pub publisher: DomainPublisher,
     pub step_registry: Arc<StepRegistry>,
@@ -166,6 +168,12 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// `None` is a wiring without a database, where health reports no
     /// schema at all — absent, not `null`: nothing was tried.
     pub schema_ledger: Option<Arc<dyn crate::schema_level::SchemaLedger>>,
+    /// How long health waits for that ledger before answering `null`.
+    /// Every wiring sets [`crate::schema_level::READ_TIMEOUT`]; it is a
+    /// field only so a test whose subject is the ledger's ANSWER can
+    /// hand a backstop instead, and stop measuring the gate's database
+    /// load (f10419f9).
+    pub schema_read_timeout: std::time::Duration,
     /// The key presence tickets are verified with — the gateway's
     /// session key, read from the file it signs with (backlog 72fe3640).
     /// `None` grants presence to nothing: an `x-boss-presence` header is
@@ -190,6 +198,12 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// `GET /api/dispatcher/schedule`, read as the viewer. `None` → the
     /// scheduled rules show as unread on the board.
     pub dispatcher_schedule: Option<Arc<dyn crate::dispatcher_schedule::DispatcherSchedule>>,
+    /// THE MAP'S FLOW READING, shared between map reads for its lifetime
+    /// (backlog b852ec37): the regions and borders reads each took a
+    /// membership snapshot on every tick, 8-12 s apiece on a quiet API
+    /// and past the edge's 100 s under load. See `crate::reading_cache`.
+    pub map_flows:
+        Arc<crate::reading_cache::ReadingCache<crate::membership_replay::MapFlowReading>>,
 }
 
 impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
@@ -227,6 +241,7 @@ impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
     ) -> Self {
         Self {
             jobs,
+            completion_contracts: Default::default(),
             bus,
             publisher,
             step_registry: Arc::new(crate::step_registry::StepRegistry::v1()),
@@ -246,11 +261,15 @@ impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
             delivery: None,
             agent_budget: None,
             schema_ledger: None,
+            schema_read_timeout: crate::schema_level::READ_TIMEOUT,
             presence_key: None,
             yard_moves: None,
             credentials: None,
             sensors: None,
             dispatcher_schedule: None,
+            map_flows: Arc::new(crate::reading_cache::ReadingCache::new(
+                crate::reading_cache::MAP_FLOW_LIFETIME,
+            )),
         }
     }
 }
@@ -389,6 +408,9 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         // Top-level metadata merge — the atomic alternative to the
         // GET → spread → full PUT read-modify-write. `null` removes.
         .route("/api/jobs/{id}/metadata", patch(patch_job_metadata::<R, B>))
+        // Move ONE envelope field, with a reason, on the record — the
+        // narrow alternative to a full-body PUT (backlog eb26059d).
+        .route("/api/jobs/{id}/priority", put(set_job_priority::<R, B>))
         .route(
             "/api/jobs/{id}/metadata/conditional",
             post(conditional_job_metadata::<R, B>),
@@ -546,6 +568,11 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
             "/api/workflows/{kind}/versions/{version}",
             get(get_kind_version::<R, B>).delete(discard_kind_version::<R, B>),
         )
+        // A draft that met traffic and lost (backlog 50ded63d).
+        .route(
+            "/api/workflows/{kind}/versions/{version}/reject",
+            post(reject_kind_version::<R, B>),
+        )
         // Experiments Tier 1 (the network-experiments decision in docs/architecture-decisions.md):
         // the per-version terminal report — measurement of what
         // version pinning already records.
@@ -620,7 +647,7 @@ async fn health<R: JobsRepository, B: EventBus>(
     let capabilities = match state.schema_ledger.as_ref() {
         Some(ledger) => response
             .capabilities
-            .with_schema(crate::schema_level::read(ledger).await),
+            .with_schema(crate::schema_level::read_within(ledger, state.schema_read_timeout).await),
         None => response.capabilities,
     };
     Json(boss_core::startup::HealthResponse {

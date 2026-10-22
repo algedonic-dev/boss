@@ -63,8 +63,15 @@ pub(crate) async fn retain_at(
     if serde_json::to_vec(&body)?.len() > INLINE_BODY_BYTES {
         bail!("run metadata remains oversized after retaining its full brief; no run admitted");
     }
+    // A second dispatch of identical bytes holds the attachment the
+    // packet already has, read back and verified (backlog e5490f2e).
+    let held = if attached.reused {
+        "already held"
+    } else {
+        "retained"
+    };
     eprintln!(
-        "boss dispatch: full brief retained as attachment {} ({} bytes, sha256 {}); the run records the verified reference, not omitted prose",
+        "boss dispatch: full brief {held} as attachment {} ({} bytes, sha256 {}); the run records the verified reference, not omitted prose",
         reference.file_id, reference.size_bytes, reference.sha256
     );
     Ok(body)
@@ -239,6 +246,33 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    /// Backlog e5490f2e, the measured case: a second dispatch of the
+    /// same packet renders byte-identical brief bytes, and its retention
+    /// was refused `POST /api/files -> 409 <digest>` BEFORE run admission.
+    /// Through the real store it now holds the one verified attachment,
+    /// and each body still carries its own complete reference.
+    #[tokio::test]
+    async fn a_second_dispatch_of_identical_brief_bytes_holds_the_one_verified_attachment() {
+        let brief = "the same complete brief, rendered twice\n".repeat(30_000);
+        let http = crate::sor_client::machine_client().unwrap();
+        let base = crate::attach::tests::store().await;
+        let packet = "39d0b528-ff69-4cb8-ba82-408b641da66c";
+        let first = retain_at(&http, &base, "agent-test", packet, body(&brief))
+            .await
+            .unwrap();
+        let second = retain_at(&http, &base, "agent-test", packet, body(&brief))
+            .await
+            .expect("the identical retention is a verified reuse, not a 409");
+        assert_eq!(first["metadata"]["brief"], second["metadata"]["brief"]);
+        for held in [&first, &second] {
+            assert_eq!(
+                read_at(&http, &base, "agent-test", &held["metadata"]["brief"])
+                    .await
+                    .unwrap(),
+                brief
+            );
+        }
     }
     #[tokio::test]
     async fn an_unconfigured_store_and_its_existing_file_limit_refuse_without_reduction() {

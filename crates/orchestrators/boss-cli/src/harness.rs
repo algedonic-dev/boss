@@ -39,7 +39,9 @@ pub(crate) const ADAPTERS: [&str; 2] = ["claude-subagent", "codex-rollout"];
 
 /// Names a pass list may never carry: the launcher sets the first and
 /// last itself, from the harness's own row, and the file variable is the
-/// other way to name an actor.
+/// other way to name an actor. The same three are what the published
+/// dev-isolation door (`infra/dev/control-tools.py`) must hand the CLI
+/// (backlog 19dbaab9; pinned in `door_env.rs`).
 pub(crate) const IDENTITY_ENV: [&str; 3] = [
     crate::identity::ACTOR_ENV,
     crate::identity::ACTOR_FILE_ENV,
@@ -101,10 +103,24 @@ pub(crate) fn forbidden_env(name: &str) -> Option<&'static str> {
     // hooks — git reads, and naming members one at a time is how two
     // reviews each found more. GIT_AUTHOR_* and GIT_COMMITTER_* stay
     // passable: text a commit records, which runs nothing.
+    //
+    // cargo, rustup, npm's config, pip and Lua are PREFIXES for the same
+    // reason (re-review 702da60d, backlog 015ed327): cargo reads every
+    // config key from a CARGO_<KEY> variable — CARGO_BUILD_RUSTC_WRAPPER
+    // and CARGO_HOME (whose config.toml sets build.rustc-wrapper) were
+    // each measured running a named wrapper — rustup picks the toolchain
+    // whose binaries run from RUSTUP_TOOLCHAIN (a path is accepted) and
+    // RUSTUP_HOME, npm and pip read every option from npm_config_<key> and
+    // PIP_<OPTION> (script-shell names a program; a config file names an
+    // index whose packages build by running their own code), and every
+    // LUA_ variable is a start-up chunk or a module path.
     let git_identity = upper.starts_with("GIT_AUTHOR_") || upper.starts_with("GIT_COMMITTER_");
     if upper.starts_with("LD_")
         || upper.starts_with("DYLD_")
         || (upper.starts_with("GIT_") && !git_identity)
+        || ["CARGO_", "RUSTUP_", "NPM_CONFIG_", "PIP_", "LUA_"]
+            .iter()
+            .any(|p| upper.starts_with(p))
         || [
             // Shells.
             "BASH_ENV",
@@ -124,15 +140,30 @@ pub(crate) fn forbidden_env(name: &str) -> Option<&'static str> {
             "MANPAGER",
             "LESSOPEN",
             "LESSCLOSE",
-            // The compilers and wrappers cargo runs.
+            // cargo runs BROWSER for `cargo doc --open`.
+            "BROWSER",
+            // The compilers and wrappers cargo runs. CARGO and RUSTFMT
+            // are bare names the CARGO_ prefix cannot see: cargo-clippy
+            // and cargo-fmt run CARGO as cargo, cargo-fmt runs RUSTFMT
+            // as rustfmt (review dfd43fbd, backlog 91a545eb).
+            "CARGO",
+            "RUSTFMT",
             "RUSTC_WRAPPER",
             "RUSTC_WORKSPACE_WRAPPER",
             "RUSTFLAGS",
+            "RUSTC",
+            "RUSTDOC",
+            "RUSTDOCFLAGS",
             "CC",
             "CXX",
             // Configuration homes and library configs whose files name
             // programs to run or modules to load.
             "XDG_CONFIG_HOME",
+            "AWS_CONFIG_FILE",
+            "DOCKER_CONFIG",
+            "GNUPGHOME",
+            "GEM_HOME",
+            "GEM_PATH",
             "XDG_CONFIG_DIRS",
             "OPENSSL_CONF",
             "OPENSSL_MODULES",
@@ -158,6 +189,56 @@ pub(crate) fn forbidden_env(name: &str) -> Option<&'static str> {
     {
         return Some("makes the process load or run code its argv never names");
     }
+    // WHAT THE TOOLCHAIN AND THE cc CRATE READ (backlog 685ce87c,
+    // 2026-10-21). The list above grew one review at a time; the test
+    // `the_floor_judges_every_name_the_pinned_toolchain_carries` now reads
+    // the names out of cargo, cargo-clippy, cargo-fmt, clippy-driver and
+    // rustfmt themselves and fails on one this floor neither refuses nor
+    // passes with a written reason. Read off 1.96.1, the toolchain's own
+    // namespaces are refused as PREFIXES: RUSTC (RUSTC_BOOTSTRAP unlocks
+    // -Z codegen-backend, a library rustc loads; RUSTC_LINKER is the
+    // linker cc infers its compiler from), RUSTDOC, CLIPPY_ (clippy-driver
+    // appends CLIPPY_ARGS to rustc's command line, where -C linker= names
+    // a program), and cargo's and clippy's private channels __CARGO and
+    // __CLIPPY (__CARGO_FIX_PLZ makes cargo act as rustc's wrapper and
+    // rewrite source). CARGO, RUSTFMT and BROWSER are the bare programs
+    // cargo-clippy, cargo-fmt and `cargo doc --open` run (review dfd43fbd,
+    // item 91a545eb, whose car names the same three in the list above).
+    //
+    // cc is a library, so no binary carries its names: they are read from
+    // its source ([`CC_TOOLS`]) and pinned to the version Cargo.lock holds.
+    // Each tool or flag variable is refused bare, as NAME_<target>, and as
+    // HOST_NAME / TARGET_NAME — the four spellings cc 1.2.64's
+    // `target_envs` reads. CROSS_COMPILE is the compiler's program prefix,
+    // WASI_SDK_PATH the directory whose clang cc runs, SDKROOT, LIB and the
+    // two wasm sysroots name libraries linked into what it builds, and
+    // LDFLAGS carries -B and -fuse-ld= to the linker other build tools run.
+    let cc_name = upper
+        .strip_prefix("HOST_")
+        .or_else(|| upper.strip_prefix("TARGET_"))
+        .unwrap_or(&upper);
+    if ["RUSTC", "RUSTDOC", "CLIPPY_", "__CARGO", "__CLIPPY"]
+        .iter()
+        .any(|p| upper.starts_with(p))
+        || CC_TOOLS
+            .iter()
+            .any(|t| cc_name == *t || cc_name.starts_with(&format!("{t}_")))
+        || [
+            "CARGO",
+            "RUSTFMT",
+            "BROWSER",
+            "CROSS_COMPILE",
+            "WASI_SDK_PATH",
+            "WASI_SYSROOT",
+            "WASM_MUSL_SYSROOT",
+            "SDKROOT",
+            "LIB",
+            "LDFLAGS",
+        ]
+        .contains(&upper.as_str())
+    {
+        return Some("makes the process load or run code its argv never names");
+    }
     if ["TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL"]
         .iter()
         .any(|w| upper.contains(w))
@@ -166,6 +247,22 @@ pub(crate) fn forbidden_env(name: &str) -> Option<&'static str> {
     }
     None
 }
+
+/// The cc crate's tool and flag variables (cc 1.2.64, src/lib.rs: each
+/// `getenv_with_target_prefixes` and `envflags` call). Each names a
+/// program a build script runs or flags handed to one.
+pub(crate) const CC_TOOLS: [&str; 10] = [
+    "CC",
+    "CXX",
+    "AR",
+    "RANLIB",
+    "NVCC",
+    "CXXSTDLIB",
+    "CFLAGS",
+    "CXXFLAGS",
+    "ARFLAGS",
+    "RANLIBFLAGS",
+];
 
 /// Whose HOME a launched process gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -1073,8 +1170,150 @@ mod tests {
         }
     }
 
+    /// Re-review 702da60d of car d47c0edd (backlog 015ed327): the floor
+    /// above still passed CARGO_BUILD_RUSTC_WRAPPER and CARGO_HOME (whose
+    /// config.toml sets build.rustc-wrapper), and the reviewer measured
+    /// each running a named wrapper, 4 runs each against a control of 0.
+    /// cargo reads EVERY `[build]`, `[target]` and `[env]` config key from
+    /// a CARGO_<KEY> variable as well as from a file, and rustup chooses
+    /// the toolchain whose binaries run from RUSTUP_TOOLCHAIN (a path is
+    /// accepted) and RUSTUP_HOME — so both are closed as a PREFIX, the
+    /// same lesson git's prefix taught (b40dbff7), with RUSTC and RUSTDOC
+    /// (the compilers cargo runs) and RUSTDOCFLAGS (RUSTFLAGS' twin) by
+    /// name. The rest point a tool at a configuration file that names a
+    /// program to run or a module to load: AWS_CONFIG_FILE
+    /// (credential_process), DOCKER_CONFIG (credsStore helpers), GNUPGHOME
+    /// (gpg.conf and the agent programs it names), PIP_CONFIG_FILE and
+    /// every PIP_<option> beside it, NPM_CONFIG_USERCONFIG and every
+    /// npm_config_<key> beside it (script-shell names a program), GEM_HOME
+    /// and GEM_PATH (where rubygems loads from), and Lua's whole variable
+    /// family — LUA_INIT runs a chunk at start-up and LUA_PATH / LUA_CPATH
+    /// are module paths, each with versioned twins. KUBECONFIG stays
+    /// passable on purpose, as it does above; the dock hold reads it.
+    #[test]
+    fn a_pass_list_naming_a_cargo_or_rustup_setting_or_a_program_naming_config_is_refused() {
+        let text = std::fs::read_to_string(repo().join(DIR).join("codex-exec.toml")).unwrap();
+        for name in [
+            // The two the re-review measured.
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_HOME",
+            // cargo and rustup by prefix, not by name.
+            "CARGO_BUILD_RUSTC",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+            "CARGO_TARGET_DIR",
+            "RUSTUP_TOOLCHAIN",
+            "RUSTUP_HOME",
+            "cargo_home",
+            // The compilers cargo runs, by name.
+            "RUSTC",
+            "RUSTDOC",
+            "RUSTDOCFLAGS",
+            // Config files that name a program or a module.
+            "AWS_CONFIG_FILE",
+            "DOCKER_CONFIG",
+            "GNUPGHOME",
+            "PIP_CONFIG_FILE",
+            "PIP_INDEX_URL",
+            "NPM_CONFIG_USERCONFIG",
+            "NPM_CONFIG_SCRIPT_SHELL",
+            "npm_config_globalconfig",
+            "LUA_INIT",
+            "LUA_INIT_5_4",
+            "LUA_PATH",
+            "LUA_CPATH",
+            "GEM_HOME",
+            "GEM_PATH",
+        ] {
+            assert_eq!(
+                forbidden_env(name),
+                Some("makes the process load or run code its argv never names"),
+                "{name}"
+            );
+            let planted = text.replace("\"PATH\",", &format!("\"PATH\", \"{name}\","));
+            assert_ne!(planted, text, "the plant landed");
+            let refused =
+                Harness::parse("codex-exec", &planted).expect_err(&format!("{name} is refused"));
+            assert!(refused.contains(name), "{refused}");
+        }
+        // The prefixes are cargo's, rustup's, npm's config and pip's, not
+        // every name that starts with the same letters: these still pass.
+        for name in [
+            "KUBECONFIG",
+            "RUST_LOG",
+            "RUST_BACKTRACE",
+            "PIPENV_VENV_IN_PROJECT",
+            "NPM_PREFIX_DIR",
+            "AWS_REGION",
+            "DOCKER_HOST",
+            "PATH",
+        ] {
+            assert_eq!(forbidden_env(name), None, "{name}");
+        }
+    }
+
+    /// Review dfd43fbd of car cc571bcf (backlog 91a545eb, 2026-10-18):
+    /// the CARGO_ prefix needs its underscore, so a bare CARGO passed —
+    /// and cargo-clippy and cargo-fmt run whatever it names as cargo (4
+    /// of 4 runs each on the dev pod, 0 with it unset). Its siblings by
+    /// the same measure, read off the 1.96.1 toolchain's own binaries on
+    /// 2026-10-19: cargo-fmt runs RUSTFMT as rustfmt, and cargo runs
+    /// BROWSER for `cargo doc --open`. Each is a bare program name a
+    /// prefix test cannot see, so each is refused by name.
+    #[test]
+    fn a_pass_list_naming_bare_cargo_or_a_program_cargo_tools_run_is_refused() {
+        let text = std::fs::read_to_string(repo().join(DIR).join("codex-exec.toml")).unwrap();
+        for name in ["CARGO", "cargo", "RUSTFMT", "BROWSER"] {
+            assert_eq!(
+                forbidden_env(name),
+                Some("makes the process load or run code its argv never names"),
+                "{name}"
+            );
+            let planted = text.replace("\"PATH\",", &format!("\"PATH\", \"{name}\","));
+            assert_ne!(planted, text, "the plant landed");
+            let refused =
+                Harness::parse("codex-exec", &planted).expect_err(&format!("{name} is refused"));
+            assert!(refused.contains(name), "{refused}");
+        }
+        // Names that only START with these letters still pass.
+        for name in ["CARGOES", "RUSTFMT_LOG", "BROWSERS"] {
+            assert_eq!(forbidden_env(name), None, "{name}");
+        }
+    }
+
     /// N15: a roster directory that is a symlink is refused at the read —
     /// a file changed behind it would be under no path the hold names.
+    /// Two Claude accounts run on the dev pod (David, 2026-10-17: session
+    /// A coordinates as agent-claude, session B builds as agent-claude-b),
+    /// and `--report` finds a run's transcript only through the file that
+    /// signs as the run's agent. Until this pin every agent-claude-b run
+    /// landed unmetered ("no file under infra/platform/harnesses signs as
+    /// agent-claude-b") unless the operator passed `--transcript` by hand,
+    /// measured on runs 93784166 and d0651edc the night the account went
+    /// live. Both accounts are the same host tool reading the same
+    /// transcript layout under their own `CLAUDE_CONFIG_DIR`; only the
+    /// home differs.
+    #[test]
+    fn each_claude_account_has_a_host_tool_harness_reading_the_same_transcript_layout() {
+        let all = shipped();
+        let a = all
+            .iter()
+            .find(|h| h.actor == "agent-claude")
+            .expect("agent-claude's harness");
+        let b = all
+            .iter()
+            .find(|h| h.actor == "agent-claude-b")
+            .expect("a file under infra/platform/harnesses signs as agent-claude-b");
+        assert_eq!(b.launch, Launch::HostTool);
+        assert_eq!(b.transcript.adapter, a.transcript.adapter);
+        assert_eq!(b.transcript.home_env, a.transcript.home_env);
+        assert_eq!(b.transcript.glob, a.transcript.glob);
+        assert_ne!(
+            b.transcript.home_default, a.transcript.home_default,
+            "two accounts, two homes"
+        );
+    }
+
     #[test]
     fn a_roster_directory_that_is_a_symlink_is_refused() {
         let tree = boss_testing::scratch_dir("harness-symlinked-roster");
@@ -1315,5 +1554,285 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The toolchain binaries whose names [`forbidden_env`] is held to:
+    /// the programs a harness that builds this tree runs (backlog
+    /// 685ce87c).
+    const TOOLCHAIN_BINARIES: [&str; 5] = [
+        "cargo",
+        "cargo-clippy",
+        "cargo-fmt",
+        "clippy-driver",
+        "rustfmt",
+    ];
+
+    /// The toolchain's own namespaces. Inside a binary every string
+    /// literal sits beside the next with no separator, so the end of a
+    /// name cannot be read off the bytes — but its START can, wherever
+    /// one of these stems begins a word.
+    const TOOLCHAIN_STEMS: [&str; 9] = [
+        "CARGO", "RUSTC", "RUSTDOC", "RUSTFMT", "RUSTUP", "RUST_", "CLIPPY", "__CARGO", "__CLIPPY",
+    ];
+
+    /// Every stem-led word the 1.96.1 binaries carry that the floor
+    /// PASSES, and why. A word here is either a variable the toolchain
+    /// reads that names no code, or not a variable at all — a symbol, a
+    /// lint name, or literals that happen to abut. An entry no binary
+    /// carries any longer fails the test, so this cannot grow stale.
+    const TOOLCHAIN_PASSES: &[(&str, &str)] = &[
+        (
+            "RUST_LOG",
+            "a log filter; read by cargo and rustfmt, names no program",
+        ),
+        ("RUST_BACKTRACE", "whether a panic prints a backtrace"),
+        (
+            "RUST_LIB_BACKTRACE",
+            "whether an error captures a backtrace",
+        ),
+        ("RUST_MIN_STACK", "a thread's stack size in bytes"),
+        (
+            "RUST_FLAGS",
+            "read only to warn it is ignored: cargo's text is `ignoring environment variable`",
+        ),
+        (
+            "RUST_",
+            "not a variable: the tail of OpenSSL's X509_TRUST_ symbols, linked into cargo",
+        ),
+        (
+            "RUST_BACH",
+            "not a variable: RUST_BACKTRACE's first eight bytes as an instruction immediate",
+        ),
+        (
+            "RUSTFMT_H",
+            "not a variable: RUSTFMT_LOG's first eight bytes as an instruction immediate",
+        ),
+    ];
+
+    /// Every word in `bytes` that starts with a toolchain stem, read to
+    /// the end of its run of `[A-Z0-9_]`. A stem straight after an
+    /// underscore is inside a longer name (CARGO_PKG_RUST_VERSION) and
+    /// is that name's, not a word of its own.
+    fn stem_words(bytes: &[u8]) -> std::collections::BTreeSet<String> {
+        let in_name = |b: &u8| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_';
+        bytes
+            .split(|b| !in_name(b))
+            .flat_map(|run| {
+                (0..run.len())
+                    .filter(move |&i| {
+                        (i == 0 || run[i - 1] != b'_')
+                            && TOOLCHAIN_STEMS
+                                .iter()
+                                .any(|s| run[i..].starts_with(s.as_bytes()))
+                    })
+                    .map(move |i| String::from_utf8_lossy(&run[i..]).into_owned())
+            })
+            .collect()
+    }
+
+    /// The judgement a stem word gets: the longest name it can be read
+    /// as that the floor refuses or the pass table names. A name ends
+    /// where the word ends or where another stem word begins
+    /// (CARGORUSTC_WORKSPACE_WRAPPER is CARGO, then RUSTC_…) — never
+    /// anywhere else, which would let a refused CARGO stand for an unread
+    /// CARGOX, or the pass table's RUST_ for any RUST_ name at all.
+    fn judged(word: &str) -> Option<&str> {
+        (1..=word.len()).rev().find_map(|k| {
+            let name = &word[..k];
+            let ends = k == word.len() || TOOLCHAIN_STEMS.iter().any(|s| word[k..].starts_with(s));
+            (ends
+                && (forbidden_env(name).is_some()
+                    || TOOLCHAIN_PASSES.iter().any(|(n, _)| *n == name)))
+            .then_some(name)
+        })
+    }
+
+    /// THE FLOOR AGAINST THE TOOLCHAIN ITSELF (backlog 685ce87c,
+    /// 2026-10-21). The hand list above grew one review at a time — CARGO,
+    /// RUSTFMT and BROWSER were each found by a reviewer after the floor
+    /// had shipped without them (dfd43fbd). This reads the names out of
+    /// the pinned toolchain's own binaries and fails on any word in the
+    /// toolchain's namespaces that the floor neither refuses nor passes
+    /// with a written reason, so the next one fails here, not in a review.
+    ///
+    /// WHAT IT CANNOT SEE, said plainly: a name outside those namespaces
+    /// (BROWSER, HOME) is indistinguishable from the rest of a binary's
+    /// text, so those stay with the hand list and the dock hold; a stem
+    /// word that runs into a literal starting with `_` reads as one longer
+    /// name; and a name the compiler builds from eight-byte instruction
+    /// immediates shows only its first eight bytes (RUST_BACH, RUSTFMT_H),
+    /// which this then makes someone judge by hand.
+    #[test]
+    fn the_floor_judges_every_name_the_pinned_toolchain_carries() {
+        let bin = Path::new(env!("CARGO"))
+            .parent()
+            .expect("cargo lives in a directory");
+        let pinned = std::fs::read_to_string(repo().join("rust-toolchain.toml")).unwrap();
+        let channel = pinned
+            .lines()
+            .find_map(|l| l.strip_prefix("channel = \""))
+            .and_then(|l| l.strip_suffix('"'))
+            .expect("rust-toolchain.toml names a channel");
+        let version = std::process::Command::new(bin.join("rustc"))
+            .arg("--version")
+            .output()
+            .expect("the toolchain's rustc runs");
+        let version = String::from_utf8_lossy(&version.stdout).into_owned();
+        assert!(
+            version.starts_with(&format!("rustc {channel} ")),
+            "{} is not the pinned toolchain {channel}: {version}",
+            bin.display()
+        );
+        let mut unjudged = Vec::new();
+        let mut used = std::collections::BTreeSet::new();
+        for name in TOOLCHAIN_BINARIES {
+            let bytes = std::fs::read(bin.join(name))
+                .unwrap_or_else(|e| panic!("{} is unreadable: {e}", bin.join(name).display()));
+            let words = stem_words(&bytes);
+            assert!(
+                !words.is_empty(),
+                "{name}: no toolchain word read, so nothing was judged"
+            );
+            for word in words {
+                match judged(&word) {
+                    Some(n) => {
+                        used.insert(n.to_owned());
+                    }
+                    None => unjudged.push(format!("{name}: {word}")),
+                }
+            }
+        }
+        assert!(
+            unjudged.is_empty(),
+            "the floor neither refuses nor passes, with a reason in TOOLCHAIN_PASSES, \
+             these words the pinned toolchain carries:\n{}",
+            unjudged.join("\n")
+        );
+        for (name, why) in TOOLCHAIN_PASSES {
+            assert!(!why.is_empty(), "{name} passes with no reason");
+            assert_eq!(
+                forbidden_env(name),
+                None,
+                "{name} is in the pass table AND refused"
+            );
+            assert!(
+                used.contains(*name),
+                "{name} is in the pass table but no binary carries it any longer"
+            );
+        }
+    }
+
+    /// THE cc CRATE'S FAMILY (backlog 685ce87c, half 1). A build script
+    /// that uses cc runs the program CC, CXX, AR, RANLIB or NVCC names,
+    /// and hands the compiler and archiver CFLAGS, CXXFLAGS, ARFLAGS,
+    /// RANLIBFLAGS and CXXSTDLIB — where -fplugin=, -B<dir>, -wrapper and
+    /// a library name each name code. cc reads each under four spellings
+    /// (`target_envs`, cc 1.2.64 src/lib.rs): NAME_<target>, NAME_<target
+    /// with underscores>, HOST_NAME or TARGET_NAME, and NAME. Every one is
+    /// refused here, for two targets, and so are the program prefix
+    /// (CROSS_COMPILE), the directory whose clang cc runs (WASI_SDK_PATH),
+    /// the sysroots whose libraries it links, and LDFLAGS, which other
+    /// build tools hand the linker. What cc reads that names no code
+    /// passes, each with its reason.
+    #[test]
+    fn the_cc_crate_family_is_refused_under_every_spelling_it_reads() {
+        let text = std::fs::read_to_string(repo().join(DIR).join("codex-exec.toml")).unwrap();
+        let mut names: Vec<String> = [
+            "CROSS_COMPILE",
+            "WASI_SDK_PATH",
+            "WASI_SYSROOT",
+            "WASM_MUSL_SYSROOT",
+            "SDKROOT",
+            "LIB",
+            "LDFLAGS",
+            "CC_KNOWN_WRAPPER_CUSTOM",
+            "CC_SHELL_ESCAPED_FLAGS",
+            "CC_ENABLE_DEBUG_OUTPUT",
+            "CC_FORCE_DISABLE",
+            "RUSTC_LINKER",
+            "RUSTC_BOOTSTRAP",
+        ]
+        .map(String::from)
+        .to_vec();
+        for tool in CC_TOOLS {
+            for target in ["x86_64-unknown-linux-gnu", "wasm32-wasip1"] {
+                names.push(format!("{tool}_{}", target.replace(['-', '.'], "_")));
+            }
+            names.extend([
+                tool.to_owned(),
+                format!("HOST_{tool}"),
+                format!("TARGET_{tool}"),
+            ]);
+        }
+        for name in &names {
+            assert_eq!(
+                forbidden_env(name),
+                Some("makes the process load or run code its argv never names"),
+                "{name}"
+            );
+            let planted = text.replace("\"PATH\",", &format!("\"PATH\", \"{name}\","));
+            assert_ne!(planted, text, "the plant landed");
+            let refused =
+                Harness::parse("codex-exec", &planted).expect_err(&format!("{name} is refused"));
+            assert!(refused.contains(name.as_str()), "{refused}");
+        }
+        // The hyphenated spelling is not a plain name and never was.
+        assert_eq!(
+            forbidden_env("CC_x86_64-unknown-linux-gnu"),
+            Some("is not a plain variable name")
+        );
+        // What cc reads that names no code passes, and why.
+        for (name, _why) in [
+            ("TARGET", "cargo sets it for every build script it runs"),
+            ("HOST", "cargo sets it for every build script it runs"),
+            ("OPT_LEVEL", "cargo sets it for every build script it runs"),
+            ("DEBUG", "cargo sets it for every build script it runs"),
+            ("OUT_DIR", "cargo sets it for every build script it runs"),
+            ("NUM_JOBS", "cargo sets it for every build script it runs"),
+            (
+                "CRATE_CC_NO_DEFAULTS",
+                "drops cc's default flags; names nothing",
+            ),
+            ("MACOSX_DEPLOYMENT_TARGET", "an OS version number"),
+            ("IPHONEOS_DEPLOYMENT_TARGET", "an OS version number"),
+            (
+                "ZERO_AR_DATE",
+                "a timestamp switch cc sets on its own archiver",
+            ),
+            ("VSLANG", "the language of MSVC's messages"),
+            ("LC_ALL", "a locale"),
+            (
+                "PATH",
+                "every pass list's own; what it names is the account's",
+            ),
+            // Names that only start with a family's letters still pass.
+            ("CCACHE_DIR", "not cc's: no CC_ underscore"),
+            ("ARCH", "not cc's: no AR_ underscore"),
+            ("HOSTNAME", "not cc's: no HOST_ underscore"),
+        ] {
+            assert_eq!(forbidden_env(name), None, "{name}");
+        }
+    }
+
+    /// The cc names above were read from the source of the cc the tree
+    /// LOCKS, and a bump changes what a build script reads. So the
+    /// version they were read from is held equal to Cargo.lock's (CLAUDE.md
+    /// §9a): moving cc fails here until someone re-reads its
+    /// `target_envs` and `get_env` calls and says so by moving this.
+    #[test]
+    fn the_cc_names_were_read_from_the_cc_the_tree_locks() {
+        const CC_READ_FROM: &str = "1.2.64";
+        let lock = std::fs::read_to_string(repo().join("Cargo.lock")).unwrap();
+        let locked: Vec<&str> = lock
+            .split("[[package]]")
+            .filter(|p| p.lines().any(|l| l == "name = \"cc\""))
+            .filter_map(|p| p.lines().find_map(|l| l.strip_prefix("version = \"")))
+            .map(|v| v.trim_end_matches('"'))
+            .collect();
+        assert_eq!(
+            locked,
+            [CC_READ_FROM],
+            "Cargo.lock's cc moved: re-read its env names, then move CC_READ_FROM"
+        );
     }
 }

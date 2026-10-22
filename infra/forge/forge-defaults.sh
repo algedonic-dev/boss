@@ -98,7 +98,11 @@ forge_need() {
 #   last-build-failed  a head whose BUILD failed: retried, but the log
 #                      says which attempt this is
 #   requests           the ops-requests a `converge` asked for, answered
-#                      when the run ends (converge-now.sh writes it)
+#                      when the run ends (converge-now.sh writes it). The
+#                      unit names it too, as BOSS_WRAP_REQUESTS, so the
+#                      wrap's packet says which request started the run
+#                      (backlog e4d51e12); the two are held equal by
+#                      a_requested_converge_names_its_request.rs.
 #   tenants/           each repo-sourced instance's tenant checkout
 #   alert-spool/       what the converge's alert door kept, replayed by
 #                      the converge itself on every tick — the RUNNER's
@@ -116,6 +120,7 @@ STAMP_FILE="${BOSS_FORGE_LAST_BUILT:-$CONVERGE_STATE/last-built}"
 FAILED_FILE="${BOSS_FORGE_LAST_FAILED:-$CONVERGE_STATE/last-failed}"
 TENANTS_DIR="${BOSS_FORGE_TENANTS_DIR:-$CONVERGE_STATE/tenants}"
 CONVERGE_ALERT_SPOOL="$CONVERGE_STATE/alert-spool"
+CONVERGE_REQUESTS="$CONVERGE_STATE/requests"
 
 # THE REGISTRY PUSH LOGIN: the docker config the forge converge's
 # registry-token-deposit.sh writes from the broker-minted token (Secret

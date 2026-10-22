@@ -327,7 +327,9 @@ async fn the_record_conserves_raw_active_superseded_and_withdrawn_rows() {
     assert_eq!(after["undeclared"]["moves"], 0);
     assert_eq!(
         after["history"],
-        json!({"raw":1,"active":0,"superseded":1,"unknown":0})
+        // raw = active + superseded + unknown + superseded_mover: a row
+        // another mover wrote is its own count (backlog 3976779c).
+        json!({"raw":1,"active":0,"superseded":1,"unknown":0,"superseded_mover":0})
     );
     let (status, body) = post(
         app.clone(),

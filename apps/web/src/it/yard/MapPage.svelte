@@ -62,6 +62,7 @@
   import { MediaQuery } from 'svelte/reactivity';
   import PhoneStrip from './PhoneStrip.svelte';
   import { PHONE_QUERY } from './phone-strip';
+  import { mapRead, startMapPolling } from './map-polling';
 
   type Props = Readonly<{
     /** The Department Map's selection — `/it?at=<name>`. Absent, nothing
@@ -108,34 +109,36 @@
   let needs = $state<Remote<NeedsYou>>({ kind: 'loading' });
 
   onMount(() => {
-    let cancelled = false;
-    async function tick() {
-      // Four reads, concurrently — they are independent, and the map
-      // draws its stations even while the rails and routes are coming.
-      const [r, b, w, n] = await Promise.all([
-        fetchRegions(),
-        fetchBorders(),
-        fetchRoutes(),
-        fetchRemote(NEEDS_YOU_URL, parseNeedsYou),
-      ]);
-      if (cancelled) return;
-      regions = r;
-      borders = b;
-      routes = w;
-      needs = n;
-      readAt = Date.now();
-      if (b.kind === 'ready') bordersAt = readAt;
-      if (r.kind === 'ready') {
-        lastGood = { at: readAt };
-        successfulReads += 1;
-      }
-    }
-    void tick();
-    const t = setInterval(tick, 10_000);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-    };
+    // One read in flight per endpoint (452e507c, 909adf3b): a tick skips
+    // a read still out, so slow reads no longer stack into 524s; a slow
+    // read holds only itself and never renews another endpoint's time;
+    // a hidden tab adds no background reads. map-polling.ts says why.
+    return startMapPolling([
+      mapRead(fetchRegions, (r, at) => {
+        regions = r;
+        readAt = at;
+        if (r.kind === 'ready') {
+          lastGood = { at };
+          successfulReads += 1;
+        }
+      }),
+      mapRead(fetchBorders, (b, at) => {
+        borders = b;
+        if (b.kind === 'ready') bordersAt = at;
+      }),
+      mapRead(fetchRoutes, (w) => { routes = w; }),
+      mapRead(() => fetchRemote(NEEDS_YOU_URL, parseNeedsYou), (n) => { needs = n; }),
+    ], {
+      hidden: () => document.hidden,
+      every: (tick, ms) => {
+        const timer = setInterval(tick, ms);
+        return () => clearInterval(timer);
+      },
+      onVisibility: (tick) => {
+        document.addEventListener('visibilitychange', tick);
+        return () => document.removeEventListener('visibilitychange', tick);
+      },
+    });
   });
 
   const clock = (ms: number) =>
@@ -198,7 +201,9 @@
    *  newcomer loses nothing). panel.ts `STATION_BOARDS` is the table. */
   const WHERE =
     'Feedback and the IT backlog are in the Receiving station\'s panel (the backlog in Marshalling\'s too), the Crew Board in the Shop floor\'s, and yard status and the conductor\'s activity in the Track\'s, with the Dock\'s and the Garage\'s lanes in theirs.';
-  const figureText = (figure: Figure): string => figure.kind === 'zero' ? '0' : figure.kind === 'unread' ? 'unread' : figure.text;
+  // A floor — a count cut at its limit (backlog 97b5cf45) — reads `N+`.
+  const figureText = (figure: Figure): string =>
+    figure.kind === 'zero' ? '0' : figure.kind === 'unread' ? 'unread' : figure.kind === 'floor' ? `${figure.text}+` : figure.text;
   const urgent = $derived(outranksBoard(regions));
   const personal = $derived(needsYouBoard(needs, readAt ?? 0));
   const inspectionHref = $derived(picked.kind === 'station' ? regionHref(picked.name) : picked.kind === 'section' ? sectionHref(picked.from, picked.to) : '/it');

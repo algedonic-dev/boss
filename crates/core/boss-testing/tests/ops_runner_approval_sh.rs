@@ -1288,6 +1288,14 @@ fn the_shipped_approval_verbs_hold_the_contract_and_the_disk_verb_reaches_its_pl
             "plan-an-instance-volume-expansion",
         ),
         ("retire-ops-runner", "plan-retire-ops-runner"),
+        ("retire-volume-claim", "plan-a-volume-claim-retirement"),
+        ("add-longhorn-disk", "plan-a-longhorn-disk"),
+        ("remove-longhorn-disk", "plan-a-longhorn-disk-removal"),
+        (
+            "reregister-longhorn-disk",
+            "plan-a-longhorn-disk-reregistration",
+        ),
+        ("publish-tenant", "plan-a-tenant-publish"),
     ] {
         let w = read(write);
         let p = read(plan);

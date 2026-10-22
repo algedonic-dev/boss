@@ -156,11 +156,9 @@ pub fn copy_gate_sh(fixture: &Path) {
         std::fs::copy(&src, &dst)
             .unwrap_or_else(|e| panic!("carry {rel} into {}: {e}", fixture.display()));
         for line in text.lines() {
-            // `. infra/lint/lib/git-answer.sh || { … }`. A `#
-            // shellcheck source=` comment does not start with `. `,
-            // and a source of a VARIABLE path cannot be resolved from
-            // the text — the gate has none, and one added later would
-            // announce itself by failing here rather than silently.
+            // `. infra/lint/lib/git-answer.sh || { … }`. A source of a
+            // VARIABLE path cannot be resolved from that line; its
+            // `# shellcheck source=` directive can, below.
             // The runtime collector is invoked rather than sourced.
             // Read its literal path from the command itself; a second
             // roster of helper names would drift from the real gate.
@@ -174,6 +172,23 @@ pub fn copy_gate_sh(fixture: &Path) {
                     pending.push(sourced.to_string());
                 }
             }
+            // A VARIABLE source did arrive, and did not announce itself:
+            // wt-target-dir.sh reads `. "$env_file"` (pod-build.env,
+            // beside it), so a copied gate in a linked worktree had no
+            // bound and refused before its first check — silent only
+            // because no fixture was a linked worktree yet (backlog
+            // 9f7ee428). The file names what such a line sources in its
+            // own `# shellcheck source=` directive, so that is read too:
+            // repo-relative when it starts `infra/`, as gate.sh writes
+            // them, else relative to the file declaring it.
+            if let Some(declared) = command.strip_prefix("# shellcheck source=") {
+                let declared = declared.split_whitespace().next().unwrap_or_default();
+                if declared.starts_with("infra/") {
+                    pending.push(declared.to_string());
+                } else if !declared.is_empty() {
+                    pending.push(beside(&rel, declared));
+                }
+            }
         }
         carried.push(rel);
     }
@@ -182,6 +197,23 @@ pub fn copy_gate_sh(fixture: &Path) {
         "infra/gate.sh sourced nothing — either the gate stopped refusing without its helpers, \
          or this function stopped reading its source lines; both are worth knowing. Carried: {carried:?}"
     );
+}
+
+/// `declared`, a path relative to the directory holding the
+/// repo-relative file `rel`, as a repo-relative path with `..` folded.
+fn beside(rel: &str, declared: &str) -> String {
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    parts.pop();
+    for part in declared.split('/') {
+        match part {
+            "." | "" => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
 }
 
 /// The tunnel's ingress map as one line — `infra/cluster/

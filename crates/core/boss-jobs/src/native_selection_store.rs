@@ -1107,6 +1107,7 @@ mod tests {
                     role: "platform-admin".into(),
                     description: "native claim owning fixture".into(),
                     signs_for: None,
+                    access_tier: None,
                 }],
                 &stamp,
             )
@@ -1544,31 +1545,120 @@ mod tests {
             panic!("original replay must precede fresh owner retirement")
         };
         assert_eq!(receipt.json(), original);
-        // Even the replay read spends the original request's pool budget.
-        // Occupy every actual connection; a repository read must not silently
-        // add six seconds before it reaches the owner/deadline checks.
+        pool_exhaustion_is_cut_at_the_ingress_boundary(
+            &db,
+            &repo,
+            &stamp,
+            &context,
+            std::time::Duration::ZERO,
+        )
+        .await;
+    }
+    /// The standing control for f10419f9: the runtime thread is descheduled
+    /// past the whole ingress budget while the replay read waits on the
+    /// exhausted pool, as a loaded gate pod does to it. Under the old 5.8 s
+    /// wall bound this failed with the gates' own message (6.0003 s).
+    #[tokio::test]
+    async fn pool_exhaustion_is_cut_at_the_ingress_boundary_after_a_host_deschedule() {
+        let NativeClaimFixture {
+            db,
+            repo,
+            stamp,
+            context,
+            ..
+        } = native_claim_fixture().await;
+        pool_exhaustion_is_cut_at_the_ingress_boundary(
+            &db,
+            &repo,
+            &stamp,
+            &context,
+            crate::station_claim::SELECTION_PRE_COMMIT_BUDGET + std::time::Duration::from_secs(1),
+        )
+        .await;
+    }
+    /// Even the replay read spends its request's ingress budget. Occupy every
+    /// actual connection; a repository read must not silently add six seconds
+    /// before it reaches the owner/deadline checks.
+    ///
+    /// Until 2026-10-22 this released the pool after six real seconds and
+    /// judged the refusal by a 5.8 s wall bound from the call, so a loaded
+    /// gate pod that serviced the deadline timer late failed it on cars that
+    /// never touched this file (f10419f9). The pool is now held until the
+    /// verdict, and the cut is judged against the request's own ingress
+    /// boundary on a paused clock, as the slow-port HTTP test judges its own.
+    async fn pool_exhaustion_is_cut_at_the_ingress_boundary(
+        db: &boss_testing::TestDb,
+        repo: &crate::PgJobs,
+        stamp: &boss_core::publisher::EventStamp,
+        context: &crate::station_claim::SelectionContext,
+        deschedule: std::time::Duration,
+    ) {
+        use crate::JobsRepository;
         let mut held = Vec::new();
         for _ in 0..db.pool.options().get_max_connections() {
             held.push(db.pool.acquire().await.unwrap());
         }
-        let release = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-            drop(held);
-        });
-        let began = tokio::time::Instant::now();
-        let blocked = repo
-            .claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
-            .await;
-        let elapsed = began.elapsed();
-        release.await.unwrap();
-        assert!(
-            blocked.is_err(),
-            "pool exhaustion must refuse within the ingress budget"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_millis(5800),
-            "receipt lookup exceeded the ingress budget: {elapsed:?}"
-        );
+        // A request of its own, so the budget the read is judged against
+        // starts here rather than inside the fixture's earlier claims, which
+        // a contended gate PostgreSQL can make take the whole five seconds.
+        let mut observation = context.native_authority.as_deref().unwrap().clone();
+        observation.ingress = resolved_ingress().await;
+        let boundary = tokio::time::Instant::from_std(observation.ingress.started())
+            + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET;
+        let context = crate::station_claim::SelectionContext {
+            native_authority: Some(Arc::new(observation)),
+            ..context.clone()
+        };
+        let claim =
+            repo.claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], stamp, &[]);
+        tokio::pin!(claim);
+        // One poll parks the read on the exhausted pool. Ending here is a
+        // refusal only if the budget was already gone, which is still the
+        // contract and is judged below like any other.
+        let parked = tokio::select! {
+            biased;
+            result = &mut claim => Some(result),
+            () = std::future::ready(()) => None,
+        };
+        // A host deschedule of the runtime thread: real time the request has
+        // spent, which the paused clock below must not count a second time.
+        std::thread::sleep(deschedule);
+        let blocked = match parked {
+            Some(result) => result,
+            None => {
+                tokio::time::pause();
+                // tokio's timer wheel rounds a deadline up to its next
+                // millisecond, so 2 ms past the boundary the ingress cut has
+                // fired; a read waiting on the pool under a budget of its own
+                // (the 30 s acquire timeout, or six more seconds) is still
+                // waiting here.
+                tokio::time::advance(
+                    boundary.saturating_duration_since(tokio::time::Instant::now())
+                        + std::time::Duration::from_millis(2),
+                )
+                .await;
+                let verdict = tokio::select! {
+                    biased;
+                    result = &mut claim => result,
+                    () = std::future::ready(()) => panic!(
+                        "the replay read was still waiting on the pool 2 ms after its ingress boundary: it was given a budget of its own"
+                    ),
+                };
+                tokio::time::resume();
+                verdict
+            }
+        };
+        drop(held);
+        match blocked {
+            Err(JobsError::SelectionConflict(message)) => assert!(
+                message.contains("ingress deadline expired"),
+                "pool exhaustion must be refused by the ingress deadline: {message}"
+            ),
+            Err(other) => {
+                panic!("pool exhaustion must be refused by the ingress deadline, not: {other}")
+            }
+            Ok(_) => panic!("pool exhaustion must refuse within the ingress budget"),
+        }
     }
     #[tokio::test]
     async fn commit_completion_is_not_canceled_by_the_pre_dispatch_sql_budget() {
@@ -1607,6 +1697,54 @@ mod tests {
                 .unwrap()
                 .status,
             boss_core::job::StepStatus::Active
+        );
+    }
+    /// statement_timeout does not cancel COMMIT, but lock_timeout does
+    /// (measured by review run a0fd6902 on PostgreSQL 16): a deferred
+    /// trigger that waits on a lock past the remaining pre-commit budget
+    /// aborted the selection the design means to let complete (0325ca3e).
+    #[tokio::test]
+    async fn commit_lock_wait_is_not_canceled_by_the_pre_dispatch_lock_budget() {
+        use crate::JobsRepository;
+        let NativeClaimFixture {
+            db,
+            repo,
+            stamp,
+            context,
+            ..
+        } = native_claim_fixture().await;
+        sqlx::raw_sql("CREATE FUNCTION locked_native_receipt_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(325325); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER locked_native_receipt_commit AFTER INSERT ON station_claim_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION locked_native_receipt_commit()")
+            .execute(&db.pool).await.unwrap();
+        let mut holder = db.pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock(325325)")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let released = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            sqlx::query("SELECT pg_advisory_unlock(325325)")
+                .execute(&mut *holder)
+                .await
+                .unwrap();
+        });
+        let began = tokio::time::Instant::now();
+        let result = repo
+            .claim_station_head_at(&context, crate::runner_credential::ACTOR, &[], &stamp, &[])
+            .await;
+        released.await.unwrap();
+        let crate::station_claim::SelectionResult::Claimed { receipt, .. } = result.unwrap() else {
+            panic!("a COMMIT that waits on a lock past the budget must still commit")
+        };
+        assert!(
+            began.elapsed() >= std::time::Duration::from_secs(6),
+            "the actual COMMIT must wait on its deferred trigger's lock"
+        );
+        assert_eq!(
+            repo.station_claim_receipt(context.request_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            receipt
         );
     }
     #[tokio::test]
@@ -1944,6 +2082,7 @@ mod tests {
                     role: unrelated.into(),
                     description: unrelated.into(),
                     signs_for: None,
+                    access_tier: None,
                 }],
                 &stamp,
             )
@@ -2569,6 +2708,26 @@ mod tests {
         )
         .await;
     }
+    /// The standing control for f10419f9: the first request meets a
+    /// preparation slower than the whole budget and is refused before the
+    /// port, the second meets 3.5 s — more than the three seconds the old
+    /// two-second fixture wait left — and must still be cut at its own
+    /// original boundary.
+    #[tokio::test]
+    async fn native_http_slow_read_keeps_its_ingress_cut_when_preparation_is_contended() {
+        native_http_control_with_pause_delay(
+            true,
+            true,
+            false,
+            false,
+            NativeHttpAdversity::PreparationContention(vec![
+                crate::station_claim::SELECTION_PRE_COMMIT_BUDGET
+                    + std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(3500),
+            ]),
+        )
+        .await;
+    }
     #[tokio::test]
     async fn native_http_copies_actual_budget_query_inputs_and_keeps_over_budget_advisory() {
         native_http_control(true, false, true, false).await;
@@ -2605,7 +2764,23 @@ mod tests {
         ObserverPause(std::time::Duration),
         FixturePreparation(std::time::Duration),
         BudgetInputWait,
+        /// Extra waits, one per authenticated request in order, spent
+        /// after ingress and before the handler — where a contended
+        /// gate PostgreSQL spends them.
+        PreparationContention(Vec<std::time::Duration>),
     }
+    /// The real wait the slow-port fixture puts between ingress and the
+    /// handler, so a port handed a fresh budget would be cut at least
+    /// this much after the original boundary. It was two seconds until
+    /// 2026-10-22, judged against a 5.8 s wall bound; a loaded gate's
+    /// PostgreSQL then spent the other three before the port was reached,
+    /// on cars that never touched this file (gate 38307649, f10419f9).
+    /// The cut is now judged against the exact boundary on a paused
+    /// clock, where a quarter second discriminates as well as two did.
+    const PRE_PORT_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+    /// Requests the slow-port fixture sends before it names a preparation
+    /// that never reached the port. Each refused one is judged in full.
+    const PORT_ATTEMPTS: usize = 3;
     async fn native_http_control(
         external_allow: bool,
         slow_station: bool,
@@ -2701,13 +2876,36 @@ mod tests {
             )
         });
         let dir = boss_testing::scratch_dir("native-http-selection-ingress");
+        // The original ingress instant, as the authenticated request carried
+        // it past the credential door: the boundary the slow port is judged
+        // against, read rather than estimated from the observer's own clock.
+        let ingress_started = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
         let app = if slow_station {
+            let observed = ingress_started.clone();
+            let contention = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+                match &adversity {
+                    NativeHttpAdversity::PreparationContention(waits) => waits.clone(),
+                    _ => Vec::new(),
+                },
+            )));
             // Make an actual earlier preparation wait visible: the slow port
             // must inherit ingress's remaining budget, not receive five more.
             app.layer(axum::middleware::from_fn(
-                |request: axum::extract::Request, next: axum::middleware::Next| async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    next.run(request).await
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let observed = observed.clone();
+                    let contention = contention.clone();
+                    async move {
+                        let started = request
+                            .extensions()
+                            .get::<crate::station_claim::AuthenticatedSelectionIngress>()
+                            .map(crate::station_claim::AuthenticatedSelectionIngress::started);
+                        if started.is_some() {
+                            *observed.lock().unwrap() = started;
+                            let contended = contention.lock().unwrap().pop_front();
+                            tokio::time::sleep(PRE_PORT_GAP + contended.unwrap_or_default()).await;
+                        }
+                        next.run(request).await
+                    }
                 },
             ))
         } else {
@@ -2780,50 +2978,99 @@ mod tests {
         } else {
             None
         };
+        let claim = || {
+            app.clone().oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/stations/fixture/claim-next")
+                    .header(crate::runner_credential::HEADER, "native-http-fixture-key")
+                    .header("x-boss-user", serde_json::to_string(&user).unwrap())
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"request_id": context.request_id}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+        };
         let began = tokio::time::Instant::now();
-        let request = app.clone().oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/api/stations/fixture/claim-next")
-                .header(crate::runner_credential::HEADER, "native-http-fixture-key")
-                .header("x-boss-user", serde_json::to_string(&user).unwrap())
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({"request_id": context.request_id}).to_string(),
-                ))
-                .unwrap(),
-        );
-        tokio::pin!(request);
         let response = if slow_station {
-            tokio::select! {
-                result = &mut request => panic!(
-                    "native HTTP fixture ended before its slow port was exercised: {}",
-                    result.unwrap().status()
-                ),
-                () = slow_station_entered.notified() => {}
-            }
-            // Preparation has already spent real ingress time. Advancing
-            // another five seconds would test a freshly restarted budget.
+            // The production budget may run out before the slow port is
+            // reached: a contended gate PostgreSQL spent all of it there on
+            // gate 38307649 (f10419f9). That refusal is the contract, so it is
+            // judged in full; but only a request that reaches the port can
+            // judge the cut, so the fixture asks again rather than read the
+            // scheduler's delay as the port's defect.
+            let mut starved = Vec::new();
+            let mut request = loop {
+                let sent = tokio::time::Instant::now();
+                let mut request = Box::pin(claim());
+                tokio::select! {
+                    result = &mut request => {
+                        let response = result.unwrap();
+                        let status = response.status();
+                        let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+                        let body = String::from_utf8_lossy(&body).into_owned();
+                        assert!(
+                            status == axum::http::StatusCode::CONFLICT && body.contains("deadline"),
+                            "native HTTP fixture ended before its slow port was exercised, and not on its ingress deadline: {status}: {body}"
+                        );
+                        let repo = crate::PgJobs::new(db.pool.clone());
+                        assert_eq!(
+                            repo.get_step(&context.validated_step.id).await.unwrap().unwrap(),
+                            context.validated_step
+                        );
+                        assert!(repo.station_claim_receipt(context.request_id).await.unwrap().is_none());
+                        starved.push(sent.elapsed());
+                        assert!(
+                            starved.len() < PORT_ATTEMPTS,
+                            "every request spent its whole ingress budget before the slow port: {starved:?}"
+                        );
+                    },
+                    () = slow_station_entered.notified() => break request,
+                }
+            };
             if let NativeHttpAdversity::ObserverPause(delay) = adversity {
                 std::thread::sleep(delay);
             }
+            // Freeze the observer, then read how far the boundary is: a host
+            // deschedule before the pause (the variant above) is real ingress
+            // time already spent and must not be counted a second time.
             tokio::time::pause();
-            // Freeze the observer first: a host deschedule between reading
-            // remaining and pausing must not be counted a second time when
-            // the virtual clock advances to the original ingress boundary.
-            let remaining =
-                crate::station_claim::SELECTION_PRE_COMMIT_BUDGET.saturating_sub(began.elapsed());
-            tokio::time::advance(remaining).await;
-            request.await.unwrap()
+            let started = ingress_started
+                .lock()
+                .unwrap()
+                .expect("the authenticated request crossed the fixture's observer");
+            let boundary = tokio::time::Instant::from_std(started)
+                + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET;
+            // tokio's timer wheel rounds a deadline up to its next
+            // millisecond, so 2 ms past the boundary the original cut has
+            // fired; a port handed a fresh budget is cut PRE_PORT_GAP later
+            // at the earliest, and is still running here.
+            tokio::time::advance(
+                boundary.saturating_duration_since(tokio::time::Instant::now())
+                    + std::time::Duration::from_millis(2),
+            )
+            .await;
+            tokio::select! {
+                biased;
+                result = &mut request => result.unwrap(),
+                () = std::future::ready(()) => panic!(
+                    "the slow port read was still running 2 ms after the original ingress boundary: it was given a budget of its own"
+                ),
+            }
         } else if budget_blocker.is_some() {
+            let request = claim();
+            tokio::pin!(request);
             // Both the real HTTP request and PostgreSQL must be running;
             // observing a pending task alone does not establish its SQL wait.
             loop {
                 tokio::select! {
-                    result = &mut request => panic!(
-                        "native budget request ended before its SQL wait: {}",
-                        result.unwrap().status()
-                    ),
+                    result = &mut request => {
+                        let response = result.unwrap();
+                        let status = response.status();
+                        let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+                        panic!("native budget request ended before its SQL wait: {status}: {}", String::from_utf8_lossy(&body));
+                    },
                     waiting = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND relation = 'agent_runs'::regclass AND NOT granted)").fetch_one(&db.pool) => {
                         if waiting.unwrap() { break; }
                     }
@@ -2832,21 +3079,15 @@ mod tests {
             }
             request.await.unwrap()
         } else {
-            request.await.unwrap()
+            claim().await.unwrap()
         };
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 65536)
             .await
             .unwrap();
         if slow_station || budget_blocker.is_some() {
-            let elapsed = began.elapsed();
             if slow_station {
                 tokio::time::resume();
-                assert!(
-                    elapsed < std::time::Duration::from_millis(5800),
-                    "native preparation must cancel its real port read within original five seconds, elapsed {:?}",
-                    elapsed
-                );
             }
             if let Some(blocker) = budget_blocker.take() {
                 blocker.rollback().await.unwrap();
@@ -3513,6 +3754,7 @@ mod tests {
                     role: "platform-admin".into(),
                     description: "native authority owning fixture".into(),
                     signs_for: None,
+                    access_tier: None,
                 }],
                 &stamp,
             )
@@ -3804,6 +4046,7 @@ mod tests {
             role: "platform-admin".into(),
             description: "owning native selector control".into(),
             signs_for: None,
+            access_tier: None,
         };
         let writer_registry = registry.clone();
         let mut writer = tokio::spawn(async move {

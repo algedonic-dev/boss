@@ -83,7 +83,7 @@
   let released = $state<Readonly<Record<string, Readonly<{ ok: boolean; text: string }>>>>({});
 
   async function postRelease(h: HeldCar): Promise<Readonly<{ ok: boolean; text: string }>> {
-    const body = h.release ? releaseBody(h.release) : null;
+    const body = releaseBody(h);
     if (body === null) return { ok: false, text: 'no review run to release on' };
     try {
       const r = await fetch(`/api/jobs/${encodeURIComponent(h.id)}/release`, {
@@ -290,6 +290,15 @@
                   {#if d.safe_line}<div class="ys-safe">{d.safe_line}</div>{/if}
                   {#if d.model}<div class="ys-dim" class:ys-reds={d.model_differs}>model: {d.model}</div>{/if}
                   {#if !d.releasable && d.refusal}<div class="ys-dim">not releasable: {d.refusal}</div>{/if}
+                {/if}
+                <!-- THE RULE TRIED (backlog 60993cda): a held car the release
+                     rule asked about and the door refused carries the rule's
+                     own record, so it does not look like one nobody tried. -->
+                {#if h.auto_release}
+                  {@const a = h.auto_release}
+                  <div class="ys-mismatch ys-auto-release">
+                    release rule left it held{a.review ? ` on review ${shortSha(a.review)}` : ''}{a.at ? ` at ${a.at}` : ''}: {a.why}
+                  </div>
                 {/if}
               </td>
               <td class="ys-mono ys-reds">{redsCell(h.red_trains)}</td>

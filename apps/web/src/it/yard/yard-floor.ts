@@ -624,9 +624,9 @@ function stageOf(t: TrainRow): number {
 
 /** The ETA leg positions the locomotive only where the leg IS the
  *  stage: CI (the board→merge leg under way) and deploying (the
- *  merge→deploy leg). Awaiting merge sits at the merge signal — a green
- *  lamp says nothing about how close the merge is — and converging has
- *  an elapsed but no median, so it sits at its signal too. */
+ *  merge→converge leg). Awaiting merge sits at the merge signal — a green
+ *  lamp says nothing about how close the merge is — and converging shows
+ *  an elapsed, never a projection, so it sits at its signal too. */
 function progressOf(t: TrainRow, stage: number): number {
   if (t.eta.kind !== 'eta') return 0;
   return stage === 1 || stage === 3 ? t.eta.progress : 0;

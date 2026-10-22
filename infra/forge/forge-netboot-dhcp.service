@@ -1,0 +1,43 @@
+# Network boot from the forge, the PXE half (backlog ee31ab73):
+# dnsmasq in PROXY-DHCP mode on the forge's LAN address. The UniFi
+# gateway keeps every lease; this answers only PXE clients, with a boot
+# file and never an address, serves no DNS, and hands firmware PXE the
+# distro's iPXE over TFTP. infra/forge/netboot.sh carries the design.
+#
+# Install (forge host): NOT in install.sh's UNITS — that list is timer
+# pairs, and this is a daemon. `netboot.sh ensure`, which install.sh
+# runs on every converge tick, renders the config this reads from
+# infra/cluster/talos/netboot.toml, installs this file, and restarts the
+# unit only when the config or this file changed.
+#
+# ATTACK SURFACE, said for the reviewer: a root daemon listening for
+# broadcast DHCP and on TFTP (69/udp) on the LAN. dnsmasq drops to
+# nobody after binding; the TFTP root holds the two boot loaders and
+# nothing else; the config admits a fixed set of directives (the test in
+# crates/core/boss-testing/tests/netboot_sh.rs); this unit can write no
+# home, no /etc and no /usr.
+[Unit]
+Description=BOSS forge: network boot, proxy-DHCP and TFTP for PXE clients (no leases, no DNS)
+Wants=network-online.target
+After=network-online.target forge-netboot-http.service
+
+[Service]
+Type=simple
+# Refuse a config dnsmasq cannot read before it binds anything.
+ExecStartPre=/usr/sbin/dnsmasq --test --conf-file=/var/lib/boss/netboot/dnsmasq.conf
+# Every PXE exchange (log-dhcp in the config) to the journal: not -q.
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --log-facility=- --conf-file=/var/lib/boss/netboot/dnsmasq.conf
+Restart=on-failure
+RestartSec=10
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# Bind 67/69/4011 and answer DHCP, then become nobody.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_SETUID CAP_SETGID
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_PACKET
+InaccessiblePaths=-/etc/boss-ops -/etc/boss
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

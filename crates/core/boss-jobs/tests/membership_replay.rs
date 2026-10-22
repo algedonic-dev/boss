@@ -9,7 +9,7 @@ use boss_core::{
 };
 use boss_events::original_group::{GroupReference, OriginalGroup};
 use boss_jobs::{
-    membership_replay::{ReplayGroup, ReplayInput, replay},
+    membership_replay::{InitialState, ReplayGroup, ReplayInput, replay},
     move_diagnosis::HistoricalEvent,
     port::JobScope,
     stations::StationSpec,
@@ -76,6 +76,7 @@ fn input(groups: Vec<ReplayGroup>, since: i64, until: i64) -> ReplayInput {
         registry_prefix_complete: true,
         packet_prefix_complete: true,
         source_unavailable: vec![],
+        initial: InitialState::default(),
     }
 }
 fn population() -> Vec<StationSpec> {
@@ -830,6 +831,184 @@ fn interleaved_original_groups_cannot_guess_packet_state_order_from_relay_comple
     );
 }
 
+/// One original group whose rows sit at the named audit sequences, so a
+/// test can lay two transactions' rows across each other the way the
+/// relay copies two concurrent commits in outbox order.
+fn group_at(seqs: &[i64], at: i64, events: Vec<Event>) -> ReplayGroup {
+    let mut seq = 0;
+    let mut out = group(&mut seq, at, events);
+    for (row, at_seq) in out.rows.iter_mut().zip(seqs) {
+        row.seq = *at_seq;
+    }
+    let original = out.original.as_mut().unwrap();
+    original.audit_sequences = seqs.iter().map(|s| Some(*s)).collect();
+    out
+}
+
+/// A Step-carrying marker the dispatcher and the claim door write beside
+/// the Step row itself: it names the packet but carries no packet state.
+fn marker(job: &Job, step: &Step, at: i64) -> Event {
+    event(
+        "step.assigned.task",
+        json!({"job_id": job.id.to_string(), "step_id": step.id.to_string()}),
+        at,
+    )
+}
+
+/// The live shape of 2026-10-22 01:53:21Z and 17:58:47Z (backlog
+/// da9faa93): an agent run's first Step is auto-assigned by the
+/// dispatcher while `boss dispatch --started` claims its Building Step,
+/// two transactions on one packet whose rows the relay interleaved.
+/// The interleaved pair, with the 24 h window opening on the packet's
+/// admission at t(10). Answers the replay input and the station.
+fn interleaved_pair(
+    earlier: impl FnOnce(&mut Step, &mut Step) -> Vec<(bool, i64)>,
+    later: impl FnOnce(&mut Step, &mut Step) -> Vec<(bool, i64)>,
+) -> ReplayInput {
+    let spec = population()
+        .into_iter()
+        .find(|s| s.name == "q.platform-admin.task")
+        .unwrap();
+    let (job, mut first) = eligible(&spec);
+    let mut second = Step::new(job.id, "task", "Building", 1);
+    second.status = StepStatus::Pending;
+    second.metadata["authority_role"] = json!("platform-admin");
+    let mut seq = 1;
+    let mut groups = vec![
+        group(&mut seq, 0, registration(&spec, &job)),
+        group(
+            &mut seq,
+            10,
+            vec![
+                event(boss_jobs::events::JOB_CREATED, json!(job), 10),
+                event(boss_jobs::events::STEP_CREATED, json!(first), 10),
+                event(boss_jobs::events::STEP_CREATED, json!(second), 10),
+            ],
+        ),
+    ];
+    // Each closure edits the Steps its transaction writes and answers,
+    // per row in roster order, whether the row is the first Step's
+    // (true) or the second's (false) state, and its audit sequence. A
+    // row with sequence < 0 is a marker for the first Step.
+    let build = |rows: Vec<(bool, i64)>, at: i64, first: &Step, second: &Step| {
+        let seqs: Vec<i64> = rows.iter().map(|(_, s)| s.abs()).collect();
+        let events = rows
+            .iter()
+            .map(|(is_first, s)| {
+                if *s < 0 {
+                    marker(&job, first, at)
+                } else {
+                    let step = if *is_first { first } else { second };
+                    event(boss_jobs::events::STEP_UPDATED, json!(step), at)
+                }
+            })
+            .collect();
+        group_at(&seqs, at, events)
+    };
+    let rows = earlier(&mut first, &mut second);
+    groups.push(build(rows, 12, &first, &second));
+    let rows = later(&mut first, &mut second);
+    groups.push(build(rows, 13, &first, &second));
+    input(groups, 5, 20)
+}
+
+#[test]
+fn interleaved_writes_to_different_steps_that_no_order_can_tell_apart_still_count() {
+    // The dispatcher assigns the ready Step (rows 7 and 9); the claim
+    // door assigns the pending one (rows 8 and 10). Neither moves a
+    // status, so the packet stands at the station in every order the
+    // two commits could have taken: the count is established without
+    // the order.
+    let out = replay(&interleaved_pair(
+        |first, _| {
+            first.assignee_id = Some("agent-claude-b".into());
+            vec![(true, 7), (true, -9)]
+        },
+        |_, second| {
+            second.assignee_id = Some("agent-claude-b".into());
+            vec![(true, -8), (false, 10)]
+        },
+    ));
+    let station = &out.stations[0];
+    assert!(station.unknown.is_empty(), "{:?}", station.unknown);
+    assert_eq!(station.arrived, Some(1));
+    assert_eq!(station.departed, Some(0));
+}
+
+#[test]
+fn interleaved_writes_to_different_steps_whose_order_decides_a_crossing_stay_unknown() {
+    // One transaction completes the ready Step, the other readies the
+    // pending one. Completion first: the packet leaves, then returns.
+    // Readying first: it never leaves. The log cannot say which, so the
+    // count is not guessed.
+    let out = replay(&interleaved_pair(
+        |first, _| {
+            first.status = StepStatus::Completed;
+            vec![(true, 7), (true, -9)]
+        },
+        |_, second| {
+            second.status = StepStatus::Ready;
+            vec![(true, -8), (false, 10)]
+        },
+    ));
+    let station = &out.stations[0];
+    assert_eq!(station.arrived, None);
+    assert!(
+        station
+            .unknown
+            .iter()
+            .any(|u| u.reason.contains("interleav"))
+    );
+}
+
+#[test]
+fn a_step_both_groups_write_orders_them_when_the_later_write_follows_the_earlier_group() {
+    // The dispatcher assigns the Step (rows 7, 9); a rule completes the
+    // same Step (rows 8, 10). The rule's write of that Step row waited
+    // on the dispatcher's row lock, so it lands after the dispatcher's
+    // whole group (10 > 9): the dispatcher committed first. This is
+    // 2026-10-22 03:46:57Z, Step fb22090e (backlog da9faa93).
+    let out = replay(&interleaved_pair(
+        |first, _| {
+            first.assignee_id = Some("agent-claude".into());
+            vec![(true, 7), (true, -9)]
+        },
+        |first, _| {
+            first.status = StepStatus::Completed;
+            vec![(true, -8), (true, 10)]
+        },
+    ));
+    let station = &out.stations[0];
+    assert!(station.unknown.is_empty(), "{:?}", station.unknown);
+    assert_eq!(station.arrived, Some(1));
+    assert_eq!(station.departed, Some(1));
+    assert_eq!(station.served, Some(1));
+}
+
+#[test]
+fn a_step_written_inside_the_other_groups_span_has_no_lock_order_and_stays_unknown() {
+    // The same Step written at row 8, inside the other group's 7..9:
+    // no row lock explains that, so neither order is established.
+    let out = replay(&interleaved_pair(
+        |first, _| {
+            first.assignee_id = Some("agent-claude".into());
+            vec![(true, 7), (true, -9)]
+        },
+        |first, _| {
+            first.status = StepStatus::Completed;
+            vec![(true, 8), (true, -10)]
+        },
+    ));
+    let station = &out.stations[0];
+    assert_eq!(station.arrived, None);
+    assert!(
+        station
+            .unknown
+            .iter()
+            .any(|u| u.reason.contains("interleav"))
+    );
+}
+
 #[test]
 fn missing_original_step_creation_before_the_window_is_not_an_idle_zero() {
     let spec = population()
@@ -1263,4 +1442,291 @@ fn narrow_read_does_not_disclose_an_unrelated_private_group_refusal() {
         before, after,
         "scope cannot become a side channel through UNKNOWN"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The fold starts at a witnessed cut (design c195e83e, Q1-Q5 approved
+// 2026-10-17). Until then the reader folded every packet from genesis:
+// 1,235,314 rows against a 250,000-row bound, so every station read
+// UNKNOWN. These tests hand the replay ONLY a starting state (each
+// packet's latest original snapshot before the window) and the window's
+// own groups. Nothing before the cut is in the input, so a count here
+// can only come from the starting state.
+// ---------------------------------------------------------------------------
+
+/// A station of the native population with its predicate replaced by
+/// one shape under test. The row's other columns are a real station's.
+fn shaped(name: &str, predicate: serde_json::Value) -> StationSpec {
+    let mut row = serde_json::to_value(
+        population()
+            .into_iter()
+            .find(|s| s.name == "q.platform-admin.task")
+            .unwrap(),
+    )
+    .unwrap();
+    row["name"] = json!(name);
+    row["predicate"] = predicate;
+    row["terminal_window_days"] = serde_json::Value::Null;
+    serde_json::from_value(row).unwrap()
+}
+
+fn snapshot(seq: i64, at: i64, event: Event) -> HistoricalEvent {
+    HistoricalEvent {
+        seq,
+        created_at: Some(t(at)),
+        event,
+    }
+}
+
+/// One packet that is a member at the cut, leaves in the window and
+/// re-enters: two crossings and a re-entry, all counted from a starting
+/// state whose creation row is NOT in the input (Q3: the latest pre-cut
+/// snapshot is the witness). Read twice: the same originals answer the
+/// same flow, byte for byte.
+fn leaves_and_reenters_from_the_cut(
+    spec: StationSpec,
+    job: Job,
+    step: Option<Step>,
+    leave: impl Fn(&mut Job, &mut Option<Step>),
+    enter: impl Fn(&mut Job, &mut Option<Step>),
+) {
+    let name = spec.name.clone();
+    let mut seq = 1;
+    let published = group(&mut seq, 0, registration(&spec, &job));
+    // The starting state: UPDATE snapshots, not creations. A reader that
+    // still needed the creation row to admit a packet would refuse here.
+    let mut initial = vec![snapshot(
+        10,
+        3,
+        event(boss_jobs::events::JOB_UPDATED, json!(job), 3),
+    )];
+    if let Some(step) = &step {
+        initial.push(snapshot(
+            11,
+            3,
+            event(boss_jobs::events::STEP_UPDATED, json!(step), 3),
+        ));
+    }
+    let (mut job, mut step) = (job, step);
+    let mut seq = 20;
+    let mut window = Vec::new();
+    for (at, mv) in [
+        (12, &leave as &dyn Fn(&mut Job, &mut Option<Step>)),
+        (14, &enter),
+    ] {
+        mv(&mut job, &mut step);
+        let mut events = vec![event(boss_jobs::events::JOB_UPDATED, json!(job), at)];
+        if let Some(step) = &step {
+            events.push(event(boss_jobs::events::STEP_UPDATED, json!(step), at));
+        }
+        window.push(group(&mut seq, at, events));
+    }
+    let mut groups = vec![published];
+    groups.extend(window);
+    let mut read = input(groups, 5, 20);
+    read.initial = InitialState {
+        cut: 11,
+        rows: initial,
+        ..InitialState::default()
+    };
+    let first = replay(&read);
+    let flow = first.stations.iter().find(|f| f.station == name).unwrap();
+    assert_eq!(flow.arrived, Some(1), "{name}: {:?}", flow.unknown);
+    assert_eq!(flow.departed, Some(1), "{name}: {:?}", flow.unknown);
+    assert_eq!(flow.served, Some(0), "{name}");
+    let second = replay(&read);
+    assert_eq!(
+        serde_json::to_value(&first).unwrap(),
+        serde_json::to_value(&second).unwrap(),
+        "{name}: identical originals must answer an identical flow"
+    );
+}
+
+fn open_packet() -> Job {
+    let mut job = Job::new(
+        "fixture",
+        Subject::new("custom", "cut"),
+        "Member at the cut",
+        "alice",
+        Priority::Standard,
+        t(0).date_naive(),
+    );
+    job.status = JobStatus::Open;
+    job
+}
+
+#[test]
+fn a_self_bound_station_counts_crossings_from_the_cut() {
+    let spec = shaped(
+        "shape.bind-self",
+        json!({"status": "open", "step": {"assignee_id": "@me", "status_in": ["ready", "active"]}}),
+    );
+    assert!(spec.predicate.binds_self());
+    let job = open_packet();
+    let mut step = Step::new(job.id, "task", "Mine", 0);
+    step.status = StepStatus::Ready;
+    step.assignee_id = Some("alice".into());
+    leaves_and_reenters_from_the_cut(
+        spec,
+        job,
+        Some(step),
+        |_, s| s.as_mut().unwrap().assignee_id = Some("bob".into()),
+        |_, s| s.as_mut().unwrap().assignee_id = Some("alice".into()),
+    );
+}
+
+#[test]
+fn a_tags_any_station_counts_crossings_from_the_cut() {
+    let spec = shaped(
+        "shape.tags-any",
+        json!({"status": "open", "tags_any": ["hotfix", "urgent-lane"]}),
+    );
+    let mut job = open_packet();
+    job.tags = vec!["hotfix".into()];
+    leaves_and_reenters_from_the_cut(
+        spec,
+        job,
+        None,
+        |j, _| j.tags.clear(),
+        |j, _| j.tags = vec!["urgent-lane".into()],
+    );
+}
+
+#[test]
+fn a_metadata_present_station_counts_crossings_from_the_cut() {
+    let spec = shaped(
+        "shape.metadata-present",
+        json!({"status": "open", "metadata_present": ["branch"]}),
+    );
+    let mut job = open_packet();
+    job.metadata["branch"] = json!("feat/cut");
+    leaves_and_reenters_from_the_cut(
+        spec,
+        job,
+        None,
+        |j, _| j.metadata["branch"] = serde_json::Value::Null,
+        |j, _| j.metadata["branch"] = json!("feat/cut"),
+    );
+}
+
+#[test]
+fn a_metadata_absent_station_counts_crossings_from_the_cut() {
+    let spec = shaped(
+        "shape.metadata-absent",
+        json!({"status": "open", "metadata_absent": ["train"]}),
+    );
+    leaves_and_reenters_from_the_cut(
+        spec,
+        open_packet(),
+        None,
+        |j, _| j.metadata["train"] = json!("train-1"),
+        |j, _| {
+            j.metadata.as_object_mut().unwrap().remove("train");
+        },
+    );
+}
+
+#[test]
+fn a_metadata_equals_station_counts_crossings_from_the_cut() {
+    let spec = shaped(
+        "shape.metadata-equals",
+        json!({"status": "open", "metadata_equals": {"lane": "fast"}}),
+    );
+    let mut job = open_packet();
+    job.metadata["lane"] = json!("fast");
+    leaves_and_reenters_from_the_cut(
+        spec,
+        job,
+        None,
+        |j, _| j.metadata["lane"] = json!("slow"),
+        |j, _| j.metadata["lane"] = json!("fast"),
+    );
+}
+
+#[test]
+fn a_station_with_no_step_clause_counts_crossings_from_the_cut() {
+    let spec = shaped(
+        "shape.no-step",
+        json!({"kind": "fixture", "status": "open"}),
+    );
+    assert!(spec.predicate.step.is_none());
+    leaves_and_reenters_from_the_cut(
+        spec,
+        open_packet(),
+        None,
+        |j, _| {
+            j.status = JobStatus::Closed;
+            j.closed_on = Some(t(12).date_naive());
+        },
+        |j, _| {
+            j.status = JobStatus::Open;
+            j.closed_on = None;
+        },
+    );
+}
+
+/// Q3: a packet the current census names with neither a pre-cut snapshot
+/// nor an in-window creation is UNKNOWN, never an absent idle zero.
+#[test]
+fn a_census_packet_with_no_witness_at_the_cut_is_unknown_not_absent() {
+    let spec = shaped(
+        "shape.no-step",
+        json!({"kind": "fixture", "status": "open"}),
+    );
+    let job = open_packet();
+    let mut seq = 1;
+    let mut read = input(vec![group(&mut seq, 0, registration(&spec, &job))], 5, 20);
+    read.initial.unknown = [(
+        job.id.to_string(),
+        "no original snapshot before the cut and no creation in the window".to_string(),
+    )]
+    .into_iter()
+    .collect();
+    let out = replay(&read);
+    let flow = &out.stations[0];
+    assert_eq!(flow.arrived, None);
+    assert!(
+        flow.unknown
+            .iter()
+            .any(|u| u.reason.contains("no original snapshot before the cut")),
+        "{:?}",
+        flow.unknown
+    );
+}
+
+/// Q1 prunes a terminal packet only where no clock instant in the window
+/// can count it. Where the window's business clock is unknown, a pruned
+/// packet's expiry cannot be ruled out there, so the gap stays UNKNOWN on
+/// every terminal-window station exactly as a carried packet would make it.
+#[test]
+fn a_pruned_terminal_packet_keeps_the_clock_gap_unknown_on_terminal_stations() {
+    let spec = population()
+        .into_iter()
+        .find(|s| s.name == "design-decided")
+        .unwrap();
+    let (job, _) = eligible(&spec);
+    let mut seq = 1;
+    let mut read = input(vec![group(&mut seq, 0, registration(&spec, &job))], 5, 20);
+    let whole = read.clock.known[0].clone();
+    let mut before = whole.clone();
+    before.until = t(10);
+    let mut after = whole;
+    after.since = t(12);
+    read.clock.known = vec![before, after];
+    read.clock.unknown = vec![boss_clock_client::mapping_history::UnknownClockSpan {
+        since: t(10),
+        until: t(12),
+        reason: "clock activation is bounded by producer capture and audit insertion".into(),
+    }];
+    let quiet = replay(&read);
+    assert_eq!(
+        quiet.stations[0].arrived,
+        Some(0),
+        "with nothing pruned and nothing carried, a gap has no packet to hide"
+    );
+    read.initial.pruned_terminal = 1;
+    let pruned = replay(&read);
+    assert_eq!(pruned.stations[0].arrived, None, "{:?}", pruned.stations[0]);
+    assert_eq!(pruned.stations[0].unknown[0].since, t(10));
+    assert_eq!(pruned.stations[0].unknown[0].until, t(12));
 }

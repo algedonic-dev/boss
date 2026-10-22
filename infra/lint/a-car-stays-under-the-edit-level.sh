@@ -172,7 +172,7 @@ if [ -n "${BOSS_EDIT_LEVEL_ANSWER:-}" ]; then
 else
     echo "$LINT: no edit level was handed in (BOSS_EDIT_LEVEL_ANSWER is unset — a pre-flight, a hand run, or a launcher from before backlog 934ccad1) — reading $URL"
     command -v curl >/dev/null 2>&1 || skip "curl is not on this box"
-    code=$(lint_sor_read "$LINT" "the jobs API" "$URL" "$body")
+    code=$(lint_sor_read "$LINT" "the jobs API" "$URL" "$body" BOSS_JOBS_URL)
     ANSWERED="$URL"
 fi
 case "$code" in

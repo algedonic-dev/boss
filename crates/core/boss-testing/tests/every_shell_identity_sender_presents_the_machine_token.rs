@@ -775,6 +775,12 @@ const NOT_THE_ESTATE: &[Site] = &[
         "the kubectl download",
     ),
     site(
+        "infra/forge/netboot.sh",
+        "-o \"$tmp\" -- \"$url\"",
+        1,
+        "the Talos Image Factory download of the declared netboot kernel and initramfs (backlog ee31ab73); the estate token must never leave the estate",
+    ),
+    site(
         "infra/forge/journal-read.sh",
         "\"${BASE}/machine\"",
         1,
@@ -866,7 +872,7 @@ const NOT_THE_ESTATE: &[Site] = &[
     ),
     site(
         "infra/dev/dev-session.sh",
-        "claude) curl -fsSL https://claude.ai/install.sh | bash",
+        "claude) curl -q -fsSL https://claude.ai/install.sh | bash",
         1,
         "an agent CLI's installer",
     ),
@@ -894,7 +900,7 @@ const NOT_THE_ESTATE: &[Site] = &[
 const NOT_A_SEND: &[Site] = &[
     site(
         "infra/lib/curl-through-a-roll.sh",
-        "curl \"$@\" >&\"$write_fd\"",
+        "curl -q \"$@\" >&\"$write_fd\"",
         1,
         "the retry wrapper: it runs its caller's argv whole, and the header is judged on the caller's line",
     ),
@@ -906,7 +912,7 @@ const NOT_A_SEND: &[Site] = &[
     ),
     site(
         "infra/dev/dev-session.sh",
-        "echo \"curl -fsSL https://claude.ai/install.sh",
+        "echo \"curl -q -fsSL https://claude.ai/install.sh",
         1,
         "prose: the install command printed for a dry run",
     ),

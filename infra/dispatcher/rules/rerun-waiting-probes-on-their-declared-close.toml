@@ -1,0 +1,53 @@
+# A waiting probe re-runs when the close it declared fires (backlog
+# 9e9db2ea).
+#
+# THE MEASUREMENT. Filed 2026-10-17: 8 of 50 cars waited 6 to 474 minutes
+# after their train arrived for proof. Re-measured 2026-10-19 against the
+# 50 newest proven cars (`proven` completed_at minus the train's
+# `arrived` completed_at): 6 waited 24 to 315 minutes, every one on a
+# probe that said not-yet at arrival and was asked again only by
+# `recheck-failing-probes-hourly`. Four of the six were waiting for a
+# gate-run to CLOSE after the converge (a receipt timeline, a seed
+# record, a bound main gate); the others for a train departure and the
+# forge CLI install. The world had moved; nothing asked until the hour
+# turned.
+#
+# THE DECLARATION ALREADY EXISTED. `waits_on.event = {"closes": <kind>,
+# "title": <prefix>}` (`boss_jobs::car::wait_event`) is what an OWED
+# proof keys on (`rerun-owed-proofs-on-job-closed`, b9005734), but only a
+# closed car marked owed was ever matched against it, and no verb wrote
+# it. Since this car a builder declares it at park (`[waits_on.event]` in
+# the park file) or on a landed car (`boss car waits-on --event-closes
+# gate-run`), and this rule matches every close against the OPEN cars
+# that declared one: a car whose probe ran (`proof_attempt`), whose
+# `proven` is still open and whose declared event THIS close is, gets the
+# same forge ops-request the arrival rule files.
+#
+# THE HOURLY RECHECK STAYS. A watchdog must not depend on what it
+# watches (CLAUDE.md §Diagnosis): a car that declares nothing, a
+# redelivery lost, a close that came before the arrival run — the hourly
+# firing still asks every failing car. This rule only moves the common
+# case from "up to an hour" to "the minute the event lands".
+#
+# NO `when`, DELIBERATELY, for the reason the owed rule has none: which
+# close fires which car is per-car data. The price is one indexed read
+# per close (`kind=ship-a-change&status=open&metadata_has=waits_on`, 1 row
+# on 2026-10-19), and the request board is read only when a car matched.
+# The close of a request this handler filed is dropped before any read,
+# so a car keyed to ops-request closes cannot re-run on its own answer.
+[[rule]]
+name = "rerun-waiting-probes-on-their-declared-close"
+why = """
+A CROSS-PROTOCOL REACTOR: the close of a packet of ANY protocol (a
+gate-run, an ops-request, a train) re-runs the recorded probe of an open
+ship-a-change car that declared that close as the event its probe waits
+on, by filing the ops-request the forge answers. The match is per-car
+data, so no single Workflow `on` consequence can declare it. It adds no
+routing: ship-a-change still owns proven, and this only files the probe
+run sooner than the hourly recheck would (9e9db2ea: 6 of 50 cars proven
+24-315 min after arrival, measured 2026-10-19).
+"""
+on_event = "jobs.job.closed"
+[[rule.do]]
+handler = "jobs.run-car-probes"
+args = { scope = "\"declared\"" }

@@ -603,13 +603,39 @@ pub(crate) async fn jobs_where(
     filter: &str,
     rule_name: &str,
 ) -> Result<Vec<Value>, HandlerError> {
+    walk_jobs(client, jobs_base, filter, true, rule_name).await
+}
+
+/// The same paged walk with every listed step SLIM — no step
+/// `metadata` or `fields` — for a caller that reads only the packet's
+/// own keys and its steps' status, assignee and stamps. The open
+/// backlog was 672 packets on 2026-10-18, and 200 of them weighed
+/// 3.6 MB whole (9b473d4a); `jobs.urgent_item_watch` reads all of them
+/// hourly to find the few urgent ones, and reads a step's metadata only
+/// off the one packet it is about to write (backlog 9788e22d).
+pub(crate) async fn jobs_where_slim(
+    client: &boss_core::machine_token::Client,
+    jobs_base: &str,
+    filter: &str,
+    rule_name: &str,
+) -> Result<Vec<Value>, HandlerError> {
+    walk_jobs(client, jobs_base, filter, false, rule_name).await
+}
+
+async fn walk_jobs(
+    client: &boss_core::machine_token::Client,
+    jobs_base: &str,
+    filter: &str,
+    full: bool,
+    rule_name: &str,
+) -> Result<Vec<Value>, HandlerError> {
     const PAGE: usize = 500;
     let mut rows: Vec<Value> = Vec::new();
     loop {
         let body = get_json(
             client,
             &format!(
-                "{}/api/jobs?{filter}&full=true&limit={PAGE}&offset={}",
+                "{}/api/jobs?{filter}&full={full}&limit={PAGE}&offset={}",
                 jobs_base.trim_end_matches('/'),
                 rows.len()
             ),
@@ -1425,9 +1451,21 @@ mod lane_pin {
         // reaches its owner, stamped `PipelineFailure` by the fallback;
         // twenty-one since `machine.gate.asked.alarm` (backlog d653e090),
         // an ask from a caller nobody expects read off the machine gate's
-        // durable window, stamped `Telemetry` like the two beside it.
+        // durable window, stamped `Telemetry` like the two beside it;
+        // twenty-two since `maintenance.verdict.streak` (backlog
+        // ada4d019), a chore verdict held on N consecutive runs — boss-gcp's
+        // deposit-key audit reading unverified — stamped `Telemetry`, a
+        // reading integrated over time like the estate alarms;
+        // twenty-three since `jobs.urgent_item_watch` (backlog 9788e22d),
+        // an urgent item past its age bound with landed cars or many runs
+        // asked for a finish line, stamped `Telemetry` — a reading of the
+        // record, like the agent-step overdue alarm beside it;
+        // twenty-four since `jobs.idle_actor_watch` (backlog 861360bc),
+        // an actor holding ready urgent nominations with no run for its
+        // bound, stamped `Telemetry` — a reading of the record, like the
+        // urgent-item watch beside it.
         assert_eq!(
-            filings, 21,
+            filings, 24,
             "the number of machine filing sites changed. That is fine — but check the new \
              one stamps a lane, then update this count, which exists so a filing that \
              DISAPPEARS from the scan (a renamed key, a reshaped body) cannot read as \

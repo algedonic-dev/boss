@@ -8,7 +8,9 @@
 //! the viewer's queue with the agents registry's aliases and the roles
 //! they hold expanded on the server (Q2). This verb prints the SAME
 //! payloads, so the terminal and the page cannot disagree about what is
-//! urgent, whose it is, or when the next train boards.
+//! urgent, whose it is, or when the next train boards. One thing the
+//! terminal adds: a claim an open car carries prints as that car, in MY
+//! WORK's words, off the cars orient already reads (backlog e7f3ed8c).
 //!
 //! UNREAD IS SAID. A payload without the field (a server older than the
 //! design) or a read that failed prints as unread with the reason —
@@ -73,6 +75,19 @@ pub(crate) fn payload_now(map: &Value, fallback: DateTime<Utc>) -> DateTime<Utc>
 /// first value is whether the claim is stalled — the server's
 /// `StepRun::stalled`, read off the state it serialised.
 pub(crate) fn run_reading(run: &Value) -> (bool, String) {
+    let (stalled, words) = run_state_words(run);
+    // HOW THE RUN'S PACKET WAS CHOSEN (backlog c9dd306a): the server's
+    // `selected_by` word, under the run record's own key, so a reader
+    // knows a queue-order fault from an operator's pick and where the
+    // walk that chose it is written. A reading without it is unchanged.
+    match run.get("selected_by").and_then(Value::as_str) {
+        Some(word) if !word.is_empty() => (stalled, format!("{words}, selected_by {word}")),
+        _ => (stalled, words),
+    }
+}
+
+/// [`run_reading`] before the selection word: the state's own words.
+fn run_state_words(run: &Value) -> (bool, String) {
     let ago = |m: Option<i64>| m.map_or_else(|| "?".to_string(), span);
     match s(run, "state") {
         "building" => (false, format!("run {}", id8(s(run, "run")))),
@@ -113,6 +128,17 @@ pub(crate) fn stalled(row: &Value) -> bool {
     row_run(row).is_some_and(|run| run_reading(run).0)
 }
 
+/// A row's place in the drain order: emergency, then urgent, then the
+/// rest. NEEDS YOU and MY WORK both rank by it, the order `dispatch
+/// --next` takes work in.
+pub(crate) fn priority_rank(row: &Value) -> u8 {
+    match s(row, "priority") {
+        "emergency" => 0,
+        "urgent" => 1,
+        _ => 2,
+    }
+}
+
 /// `(inside)` with the row's run reading: inside the brackets when the
 /// claim is worked or unread, after them, loud, when it is stalled. No
 /// reading prints the brackets as they always were.
@@ -124,9 +150,38 @@ pub(crate) fn with_run(inside: &str, row: &Value) -> String {
     }
 }
 
+/// The packets an open car already carries, keyed by item id, each with
+/// the clause the car says — `orient::carried_items`, read once off the
+/// cars orient fetches and handed to every section that prints a claim.
+pub(crate) type Carried = std::collections::BTreeMap<String, String>;
+
+/// What a car says for this packet, where one carries it.
+///
+/// WHY (backlog e7f3ed8c). Measured 2026-10-10: most urgent items the
+/// board called `STALLED: claimed, nobody on it` (1e50e66b, dea2236f,
+/// 44b2087e, 167a877c, ce72aea9, 50708d76, dda26693, …) had a car parked
+/// HELD at the dock, waiting on an operator's review and release. Their
+/// runs had landed on the green and closed, so the server's reading was
+/// honestly `no-run` — and the board sent the reader to re-dispatch work
+/// that was waiting on a release. MY WORK already printed the car; this
+/// is the same answer read in OUTRANKS and NEEDS YOU, so a claim reads
+/// carried in every section or in none.
+fn car_for<'a>(carried: &'a Carried, packet: &str) -> Option<&'a str> {
+    carried.get(packet).map(String::as_str)
+}
+
+/// A header's count of the rows a car carries, beside its STALLED count,
+/// so a smaller stalled number says where the rest went.
+fn carried_tally(n: usize) -> String {
+    match n {
+        0 => String::new(),
+        n => format!(" — {n} carried by a car"),
+    }
+}
+
 /// OUTRANKS REGULAR ORDER — every open packet whose priority drains
 /// before standard, oldest first, where it stands.
-pub(crate) fn outranks_lines(map: &Value) -> Vec<String> {
+pub(crate) fn outranks_lines(map: &Value, carried: &Carried) -> Vec<String> {
     let rows = match map.get("outranks") {
         Some(Value::Array(rows)) => rows,
         _ => {
@@ -148,10 +203,13 @@ pub(crate) fn outranks_lines(map: &Value) -> Vec<String> {
             n => Some(format!("{n} {p}")),
         })
         .collect();
+    let car = |r: &Value| car_for(carried, s(r, "id"));
+    // A claim a car carries is the car's, not stalled (backlog e7f3ed8c).
     let stalled = rows
         .iter()
-        .filter(|r| r.get("at").is_some_and(stalled))
+        .filter(|r| car(r).is_none() && r.get("at").is_some_and(stalled))
         .count();
+    let carried_n = rows.iter().filter(|r| car(r).is_some()).count();
     let undispatchable = rows
         .iter()
         .filter(|r| {
@@ -161,7 +219,7 @@ pub(crate) fn outranks_lines(map: &Value) -> Vec<String> {
         })
         .count();
     let mut out = vec![format!(
-        "  OUTRANKS REGULAR ORDER — {} ({}), oldest first{}{}",
+        "  OUTRANKS REGULAR ORDER — {} ({}), oldest first{}{}{}",
         rows.len(),
         tally.join(", "),
         match stalled {
@@ -171,7 +229,8 @@ pub(crate) fn outranks_lines(map: &Value) -> Vec<String> {
         match undispatchable {
             0 => String::new(),
             n => format!(" — {n} UNDISPATCHABLE: ready, nothing can dispatch it"),
-        }
+        },
+        carried_tally(carried_n),
     )];
     for r in rows {
         let age = r
@@ -196,8 +255,11 @@ pub(crate) fn outranks_lines(map: &Value) -> Vec<String> {
                 // the server's reading of a ready step with no agent
                 // block that no person holds, naming the row to fix.
                 let dispatch = a.get("dispatch").filter(|d| d.is_object());
-                match row_run(a) {
-                    None => match dispatch {
+                // WHETHER A CAR CARRIES IT (backlog e7f3ed8c): the car's
+                // clause, MY WORK's words, wins over the run reading.
+                match (car(r), row_run(a)) {
+                    (Some(state), _) => format!("at {slug} ({status}, {who}) {state}"),
+                    (None, None) => match dispatch {
                         None => format!("at {slug} ({status}, {who})"),
                         Some(d) if s(d, "state") == "undispatchable" => format!(
                             "at {slug} ({status}, {who}) UNDISPATCHABLE: {} v{} declares no \
@@ -209,7 +271,9 @@ pub(crate) fn outranks_lines(map: &Value) -> Vec<String> {
                         ),
                         Some(_) => format!("at {slug} ({status}, {who}, dispatch unread)"),
                     },
-                    Some(_) => format!("at {slug} {}", with_run(&format!("{status}, {who}"), a)),
+                    (None, Some(_)) => {
+                        format!("at {slug} {}", with_run(&format!("{status}, {who}"), a))
+                    }
                 }
             }
             _ => "no workable step".to_string(),
@@ -228,7 +292,7 @@ pub(crate) fn outranks_lines(map: &Value) -> Vec<String> {
 /// NEEDS YOU — the viewer's queue from `assignments?for=me`: the count,
 /// whom it was read for, and the first few rows, urgent first then
 /// oldest. MY WORK, further down, lists every row.
-pub(crate) fn needs_you_lines(read: &Result<Value, String>) -> Vec<String> {
+pub(crate) fn needs_you_lines(read: &Result<Value, String>, carried: &Carried) -> Vec<String> {
     let body = match read {
         Err(why) => return vec![format!("  NEEDS YOU — unread: {why}")],
         Ok(body) => body,
@@ -245,20 +309,20 @@ pub(crate) fn needs_you_lines(read: &Result<Value, String>) -> Vec<String> {
             "  NEEDS YOU — nothing: no ready/active step is for {who}"
         )];
     }
-    let rank = |r: &Value| match s(r, "priority") {
-        "emergency" => 0,
-        "urgent" => 1,
-        _ => 2,
-    };
+    let rank = priority_rank;
+    let car = |r: &Value| car_for(carried, s(r, "job_id"));
+    // A claim a car carries is the car's, not stalled (backlog e7f3ed8c).
+    let stalled_here = |r: &Value| car(r).is_none() && stalled(r);
     let mut sorted = rows.clone();
     // Stable: the server's order (admission) survives within a rank, and
     // a stalled claim leads its rank (backlog e2519eca item 2) — it is
     // work the queue says is in hand and nobody is doing.
-    sorted.sort_by_key(|r| (rank(r), !stalled(r)));
+    sorted.sort_by_key(|r| (rank(r), !stalled_here(r)));
     let urgent = rows.iter().filter(|r| rank(r) < 2).count();
-    let stalled_n = rows.iter().filter(|r| stalled(r)).count();
+    let stalled_n = rows.iter().filter(|r| stalled_here(r)).count();
+    let carried_n = rows.iter().filter(|r| car(r).is_some()).count();
     let mut out = vec![format!(
-        "  NEEDS YOU — {} ready/active step(s) for {who}{}{}",
+        "  NEEDS YOU — {} ready/active step(s) for {who}{}{}{}",
         rows.len(),
         match urgent {
             0 => String::new(),
@@ -267,8 +331,16 @@ pub(crate) fn needs_you_lines(read: &Result<Value, String>) -> Vec<String> {
         match stalled_n {
             0 => String::new(),
             n => format!(" — {n} STALLED: claimed, nobody on it"),
-        }
+        },
+        carried_tally(carried_n),
     )];
+    // A cut queue says so beside its count (backlog 09074ada): the
+    // count above is the rows read, not the queue.
+    if let Some(why) = for_me_cut(body) {
+        out.push(format!(
+            "    CUT: {why}; the count above is not the whole queue"
+        ));
+    }
     for r in sorted.iter().take(NEEDS_YOU_ROWS) {
         let flag = match rank(r) {
             2 => String::new(),
@@ -282,7 +354,10 @@ pub(crate) fn needs_you_lines(read: &Result<Value, String>) -> Vec<String> {
                 .unwrap_or("?"),
             id8(s(r, "job_id")),
             clip(s(r, "job_title")),
-            with_run(&format!("since {}", s(r, "opened_on")), r),
+            match car(r) {
+                Some(state) => format!("(since {}) {state}", s(r, "opened_on")),
+                None => with_run(&format!("since {}", s(r, "opened_on")), r),
+            },
         ));
     }
     if rows.len() > NEEDS_YOU_ROWS {
@@ -329,6 +404,43 @@ pub(crate) fn for_ids(body: &Value) -> Vec<String> {
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect()
+}
+
+/// The page every `for=me` reader asks for: the server's `MAX_LIMIT`
+/// (boss-jobs http/mod.rs), so a cut answer is the server's ceiling and
+/// not a smaller page a reader chose.
+pub(crate) const FOR_ME_LIMIT: usize = 1000;
+
+/// The `for=me` read every reader makes: [`FOR_ME_LIMIT`] rows.
+pub(crate) fn for_me_path() -> String {
+    format!("/api/jobs/assignments?for=me&limit={FOR_ME_LIMIT}")
+}
+
+/// Why a `for=me` answer is NOT the caller's whole queue, or `None`
+/// when it is (backlog 09074ada). The server says so in `truncated` and
+/// counts `total` before its cut; a server older than that counted
+/// `total` after it, so its answer is cut whenever its rows reached the
+/// page. A reader that treats a cut answer as whole reports "none
+/// nominated" with the caller's newest nominations past the cut — the
+/// rows sort by admission, so those are exactly the ones dropped.
+pub(crate) fn for_me_cut(body: &Value) -> Option<String> {
+    let shown = body
+        .get("data")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let total = body.get("total").and_then(Value::as_u64);
+    let cut = match body.get("truncated").and_then(Value::as_bool) {
+        Some(flag) => flag || total.is_some_and(|t| t > shown as u64),
+        None => shown >= FOR_ME_LIMIT || total.is_none_or(|t| t > shown as u64),
+    };
+    cut.then(|| match total {
+        Some(t) if t > shown as u64 => {
+            format!("{shown} of at least {t} rows shown — the answer was cut at its limit")
+        }
+        _ => format!(
+            "{shown} rows shown and the answer was cut at its limit — how many more is unknown"
+        ),
+    })
 }
 
 /// A `for=me` answer, or why it is not one. A server older than the
@@ -443,7 +555,7 @@ mod tests {
             {"id": "e1e2e3e4-bbbb", "kind": "incident", "title": "SoR dark", "priority": "emergency",
              "age_minutes": 12, "at": null, "stations": null}
         ]});
-        let lines = outranks_lines(&map);
+        let lines = outranks_lines(&map, &Carried::new());
         assert_eq!(
             lines[0],
             "  OUTRANKS REGULAR ORDER — 2 (1 emergency, 1 urgent), oldest first"
@@ -457,12 +569,12 @@ mod tests {
             "    emergency incident e1e2e3e4 SoR dark — 12m, no workable step"
         );
         assert_eq!(
-            outranks_lines(&json!({"outranks": []})),
+            outranks_lines(&json!({"outranks": []}), &Carried::new()),
             vec!["  OUTRANKS REGULAR ORDER — nothing outranks regular order"]
         );
         // An older server, or a failed read: unread, never "nothing".
         for map in [json!({}), json!({"outranks": null})] {
-            let l = outranks_lines(&map);
+            let l = outranks_lines(&map, &Carried::new());
             assert!(l[0].contains("unread"), "{l:?}");
         }
     }
@@ -495,7 +607,7 @@ mod tests {
             row("66666666-ffff", json!({"state": "starting", "run": "0ccf6dab-4bd0", "age_minutes": 5, "expect_minutes": 15})),
             row("77777777-abab", json!({"state": "starting", "run": "1a2b3c4d-5e6f", "age_minutes": 0, "expect_minutes": 15})),
         ]});
-        let lines = outranks_lines(&map);
+        let lines = outranks_lines(&map, &Carried::new());
         assert_eq!(
             lines[0],
             "  OUTRANKS REGULAR ORDER — 7 (7 urgent), oldest first — 2 STALLED: claimed, nobody on it"
@@ -528,6 +640,37 @@ mod tests {
         );
     }
 
+    /// THE RUN LINE SAYS HOW ITS PACKET WAS CHOSEN (backlog c9dd306a):
+    /// the server's run reading carries `selected_by` — `next` for a run
+    /// `boss dispatch --next` took off a station, `named` for one whose
+    /// caller named the packet — and every state that names a run
+    /// prints it, under the run record's own key so the reader knows
+    /// where the walk is. A reading without it prints as before.
+    #[test]
+    fn a_run_line_names_whether_the_queue_or_the_caller_chose_it() {
+        let words = |run: Value| run_reading(&run).1;
+        assert_eq!(
+            words(json!({"state": "building", "run": "086d9793-92d8-402f", "selected_by": "next"})),
+            "run 086d9793, selected_by next"
+        );
+        assert_eq!(
+            words(
+                json!({"state": "starting", "run": "0ccf6dab-4bd0", "age_minutes": 5,
+                         "expect_minutes": 15, "selected_by": "named"})
+            ),
+            "run 0ccf6dab starting: briefed 5m ago, 15m allowed, selected_by named"
+        );
+        assert_eq!(
+            words(json!({"state": "never-started", "run": "f58a081d-4ce8",
+                         "age_minutes": 37 * 60, "selected_by": "next"})),
+            "STALLED: run f58a081d briefed 1d ago, never started, selected_by next"
+        );
+        assert_eq!(
+            words(json!({"state": "building", "run": "086d9793-92d8-402f"})),
+            "run 086d9793"
+        );
+    }
+
     /// A READY STEP NOTHING CAN DISPATCH SAYS SO (backlog e2519eca):
     /// ff309ce6 stood at `prove-delivery (ready, agent-claude)`, worded
     /// exactly like a step a dispatch would pick up, while `boss
@@ -553,7 +696,7 @@ mod tests {
             row("33333333-cccc", "build", "ready", Value::Null),
             claimed,
         ]});
-        let lines = outranks_lines(&map);
+        let lines = outranks_lines(&map, &Carried::new());
         assert_eq!(
             lines[0],
             "  OUTRANKS REGULAR ORDER — 4 (4 urgent), oldest first — 1 STALLED: claimed, \
@@ -606,7 +749,7 @@ mod tests {
                 "2026-09-26",
             )])
             .collect();
-        let lines = needs_you_lines(&Ok(for_me(json!(rows))));
+        let lines = needs_you_lines(&Ok(for_me(json!(rows))), &Carried::new());
         assert_eq!(
             lines[0],
             "  NEEDS YOU — 7 ready/active step(s) for claude@algedonic.dev (+ agent-claude) \
@@ -623,9 +766,9 @@ mod tests {
         assert_eq!(lines.len(), 1 + NEEDS_YOU_ROWS + 1, "{lines:#?}");
         assert!(lines.last().unwrap().contains("2 more"), "{lines:#?}");
 
-        let empty = needs_you_lines(&Ok(for_me(json!([]))));
+        let empty = needs_you_lines(&Ok(for_me(json!([]))), &Carried::new());
         assert!(empty[0].starts_with("  NEEDS YOU — nothing"), "{empty:?}");
-        let unread = needs_you_lines(&Err("HTTP 503".into()));
+        let unread = needs_you_lines(&Err("HTTP 503".into()), &Carried::new());
         assert_eq!(unread, vec!["  NEEDS YOU — unread: HTTP 503"]);
     }
 
@@ -655,7 +798,7 @@ mod tests {
                 json!({"state": "unread"}),
             ),
         ];
-        let lines = needs_you_lines(&Ok(for_me(json!(rows))));
+        let lines = needs_you_lines(&Ok(for_me(json!(rows))), &Carried::new());
         assert_eq!(
             lines,
             vec![
@@ -670,6 +813,84 @@ mod tests {
                     .to_string(),
                 "    urgent backlog-item triage 74569e94 waiting (since 2026-10-02)".to_string(),
                 "    backlog-item build 74569e94 dark (since 2026-10-04, run unread)".to_string(),
+            ]
+        );
+    }
+
+    /// A CLAIM A CAR CARRIES IS NOT STALLED (backlog e7f3ed8c). On
+    /// 2026-10-10 most urgent items the board called STALLED had a car
+    /// held at the dock: the run had landed on its green and closed, so
+    /// the server honestly answered `no-run`, and OUTRANKS and NEEDS YOU
+    /// sent the reader to re-dispatch work waiting on a release — while
+    /// MY WORK, one section down, named the car. Both sections now print
+    /// the car's clause in place of STALLED, count it apart from the
+    /// stalled claims, and do not lead with it; a claim no car carries
+    /// still reads STALLED, and with no cars read the board is unchanged.
+    #[test]
+    fn a_claim_a_car_carries_names_the_car_not_stalled() {
+        let held = "1e50e66b-aaaa";
+        let gone = "33333333-cccc";
+        let carried: Carried = [(
+            held.to_string(),
+            "HELD at the dock (car fix/held): awaiting review".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let board_row = |id: &str| {
+            json!({"id": id, "kind": "backlog-item", "title": "An item", "priority": "urgent",
+                   "age_minutes": 60,
+                   "at": {"slug": "build", "title": "Build", "status": "active",
+                          "assignee_id": "agent-claude", "run": {"state": "no-run"}},
+                   "stations": []})
+        };
+        let map = json!({"outranks": [board_row(held), board_row(gone)]});
+        let lines = outranks_lines(&map, &carried);
+        assert_eq!(
+            lines[0],
+            "  OUTRANKS REGULAR ORDER — 2 (2 urgent), oldest first — 1 STALLED: claimed, \
+             nobody on it — 1 carried by a car"
+        );
+        assert_eq!(
+            lines[1],
+            "    urgent backlog-item 1e50e66b An item — 1h, at build (active, agent-claude) \
+             HELD at the dock (car fix/held): awaiting review"
+        );
+        assert_eq!(
+            lines[2],
+            "    urgent backlog-item 33333333 An item — 1h, at build (active, agent-claude) \
+             STALLED: claimed, no open run"
+        );
+        // No cars read: the server's reading, as before.
+        assert!(
+            outranks_lines(&map, &Carried::new())[1].contains("STALLED"),
+            "{:?}",
+            outranks_lines(&map, &Carried::new())
+        );
+
+        let queue_row = |job: &str, title: &str, opened: &str| {
+            let mut r = step_row("urgent", "backlog-item", "build", title, opened);
+            r["job_id"] = json!(job);
+            r["run"] = json!({"state": "no-run"});
+            r
+        };
+        let rows = vec![
+            queue_row(held, "held", "2026-10-01"),
+            queue_row(gone, "gone", "2026-10-03"),
+        ];
+        let lines = needs_you_lines(&Ok(for_me(json!(rows))), &carried);
+        assert_eq!(
+            lines,
+            vec![
+                "  NEEDS YOU — 2 ready/active step(s) for claude@algedonic.dev (+ agent-claude) \
+                 or a role they hold (platform-admin), 2 outranking regular order — 1 STALLED: \
+                 claimed, nobody on it — 1 carried by a car"
+                    .to_string(),
+                "    urgent backlog-item build 33333333 gone (since 2026-10-03) STALLED: claimed, \
+                 no open run"
+                    .to_string(),
+                "    urgent backlog-item build 1e50e66b held (since 2026-10-01) HELD at the dock \
+                 (car fix/held): awaiting review"
+                    .to_string(),
             ]
         );
     }
@@ -724,5 +945,34 @@ mod tests {
             vec!["  NEXT UP — nothing scheduled or expected"]
         );
         assert!(next_up_lines(&json!({}), now())[0].contains("unread"));
+    }
+
+    /// A cut `for=me` answer is named as cut, by the server's flag or —
+    /// from a server older than it, whose total was counted after the
+    /// cut — by its rows reaching the page (backlog 09074ada).
+    #[test]
+    fn a_cut_for_me_answer_is_named_and_a_whole_one_is_not() {
+        let rows = |n: usize| json!(vec![json!({}); n]);
+        let whole = json!({ "data": rows(3), "total": 3, "truncated": false });
+        assert_eq!(for_me_cut(&whole), None);
+        let cut = json!({ "data": rows(3), "total": 5, "truncated": true });
+        assert!(for_me_cut(&cut).is_some_and(|w| w.contains("3 of at least 5")));
+        let lines = needs_you_lines(
+            &Ok(json!({
+                "for": { "ids": ["agent-claude"], "roles": [] },
+                "data": [{ "priority": "standard", "job_id": "j", "step": {} }],
+                "total": 2, "truncated": true,
+            })),
+            &Carried::new(),
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("CUT: 1 of at least 2")),
+            "{lines:?}"
+        );
+        // An older server: no flag, and the page full.
+        let old_full = json!({ "data": rows(FOR_ME_LIMIT), "total": FOR_ME_LIMIT });
+        assert!(for_me_cut(&old_full).is_some());
+        let old_short = json!({ "data": rows(3), "total": 3 });
+        assert_eq!(for_me_cut(&old_short), None);
     }
 }

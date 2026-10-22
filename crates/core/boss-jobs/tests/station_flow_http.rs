@@ -341,13 +341,40 @@ async fn the_envelope_names_its_own_window() {
 
 /// a4de1e72: the map must conserve the evaluator's original diagnosis,
 /// including an empty station. Missing flow is never a zero or idle.
+///
+/// The map reads the packet-membership basis (item ab09f1af, car 2), not
+/// the step-events cube, so the diagnosis it conserves is that reader's:
+/// a read the reader refuses — here an adapter that holds no native
+/// history, on the live instance a row or byte bound — is named on the
+/// station exactly as `GET /api/stations/flow` names it, and the cube's
+/// blind clause is not what the map says.
 #[tokio::test]
-async fn the_map_retains_the_exact_clause_that_refused_a_station_flow() {
+async fn the_map_names_the_membership_readers_refusal_never_the_cubes_clause() {
     let app = app().await;
     let original = flow(&app, "?window_hours=24").await;
-    let refused = row(&original, "test-dock");
+    let blind = row(&original, "test-dock")["unavailable_reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/stations/flow?window_hours=24")
+                .header("x-boss-user", user_header("emp-david", "operator"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let membership: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(membership["basis"], "packet-membership-v1");
+    let refused = row(&membership, "test-dock");
     let reason = refused["unavailable_reason"].as_str().unwrap();
     assert!(refused["served"].is_null());
+    assert_ne!(reason, blind, "the premise: two different readers");
 
     let response = app
         .oneshot(
@@ -370,8 +397,13 @@ async fn the_map_retains_the_exact_clause_that_refused_a_station_flow() {
         .find(|machine| machine["id"] == "station:test-dock")
         .expect("the same evaluated station is on the map");
     assert_eq!(machine["state"], "unknown");
+    let why = machine["why"].as_str().unwrap();
     assert!(
-        machine["why"].as_str().unwrap().contains(reason),
-        "the map discarded the original refusal: expected {reason:?}, got {machine}"
+        why.contains(reason),
+        "the map discarded the reader's refusal: expected {reason:?}, got {machine}"
+    );
+    assert!(
+        !why.contains(&blind),
+        "the map still reads the step-events cube: {machine}"
     );
 }

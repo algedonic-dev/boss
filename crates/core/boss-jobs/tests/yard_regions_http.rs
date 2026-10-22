@@ -121,6 +121,76 @@ fn task_station_row() -> boss_jobs::StationSpec {
     s
 }
 
+/// The native history the in-memory adapter keeps none of (item ab09f1af,
+/// car 2: the map counts flow on the packet-membership basis): the task
+/// station published a month ago and nothing since, so the membership
+/// reader counts a station that served NOTHING in either window — the
+/// case the not-draining judgement decides.
+fn quiet_history() -> boss_jobs::membership_replay::ReplayInput {
+    use boss_clock_client::ClockMode;
+    use boss_clock_client::mapping_history::{ClockMappingFact, ClockTimeline};
+    use boss_events::original_group::{GroupReference, OriginalGroup};
+    let now = Utc::now();
+    let published = now - chrono::Duration::days(30);
+    let until = now + chrono::Duration::hours(1);
+    let row = boss_jobs::move_diagnosis::HistoricalEvent {
+        seq: 2,
+        created_at: Some(published),
+        event: boss_core::event::Event::new(
+            "jobs",
+            boss_jobs::events::STATION_PUBLISHED,
+            json!(task_station_row()),
+            published,
+        ),
+    };
+    let ids = vec![row.event.id];
+    let original = OriginalGroup {
+        reference: GroupReference {
+            id: Uuid::new_v4(),
+            schema_version: 1,
+            event_count: 1,
+            member_hash: OriginalGroup::roster_hash(&ids),
+        },
+        event_ids: ids,
+        audit_sequences: vec![Some(row.seq)],
+        complete: true,
+    };
+    let clock = ClockMappingFact {
+        schema_version: 1,
+        revision: "clock".into(),
+        previous_revision: None,
+        epoch: Some("boot".into()),
+        mode: Some(ClockMode::Wall),
+        params: None,
+        captured_at: published - chrono::Duration::days(1),
+        audit_created_at: published - chrono::Duration::days(1),
+        seq: 1,
+        complete_group: true,
+    };
+    boss_jobs::membership_replay::ReplayInput {
+        groups: vec![boss_jobs::membership_replay::ReplayGroup {
+            original: Some(original),
+            rows: vec![row],
+        }],
+        since: published,
+        until,
+        audit_cutoff: 2,
+        actor: None,
+        scope: boss_jobs::port::JobScope::All,
+        currently_authorized: None,
+        clock: ClockTimeline::build(
+            &[clock],
+            Some("clock"),
+            published - chrono::Duration::days(1),
+            until,
+        ),
+        registry_prefix_complete: true,
+        packet_prefix_complete: true,
+        source_unavailable: vec![],
+        initial: Default::default(),
+    }
+}
+
 /// The app with the platform protocols in its workflow registry — so the
 /// inbound kinds can be named — and the task station beside the dock.
 fn app_with_intake() -> (axum::Router, Arc<InMemoryJobs>) {
@@ -132,9 +202,21 @@ fn app_with_intake() -> (axum::Router, Arc<InMemoryJobs>) {
 fn app_with_intake_and(
     agent_budget: Option<Arc<boss_jobs::agent_budget::BudgetDoor>>,
 ) -> (axum::Router, Arc<InMemoryJobs>) {
+    app_with_intake_seeding(agent_budget, Vec::new())
+}
+
+/// [`app_with_intake_and`] with further protocol rows in the registry —
+/// a protocol a test's packets are pinned to.
+fn app_with_intake_seeding(
+    agent_budget: Option<Arc<boss_jobs::agent_budget::BudgetDoor>>,
+    extra: Vec<boss_jobs::registry::WorkflowSpec>,
+) -> (axum::Router, Arc<InMemoryJobs>) {
     let jobs = Arc::new(InMemoryJobs::new());
     let kinds = Arc::new(boss_jobs::InMemoryWorkflows::for_fixture());
-    for spec in boss_jobs::registry::seedable_platform_workflows() {
+    for spec in boss_jobs::registry::seedable_platform_workflows()
+        .into_iter()
+        .chain(extra)
+    {
         kinds.seed(spec).expect("seed platform kind");
     }
     let policy_client: Arc<dyn PolicyClient> = Arc::new(
@@ -267,6 +349,131 @@ async fn a_packet_is_in_receiving_or_marshalling_and_never_both() {
     };
     assert_eq!(waiting("receiving", "marshalling"), 1);
     assert_eq!(waiting("marshalling", "shop-floor"), 1);
+}
+
+/// A STATION THAT SERVED NOTHING, JUDGED ON WHO OWNS WHAT STANDS THERE,
+/// END TO END (backlog 6254e602). Live on 2026-10-17 the region read
+/// troubled (not draining) on a station whose five steps waited on
+/// emp-david: red, for a wait on its named owner. Through the HTTP read —
+/// the packet's pinned protocol from the registry, the step's recorded
+/// ready flip from the queue-age read — a step an hour into the 24h its
+/// protocol declares is attention naming its owner; the same step two
+/// days old is past its bound and still troubled.
+#[tokio::test]
+async fn a_step_waiting_on_its_named_owner_reads_attention_inside_its_bound_and_troubled_past_it() {
+    let mut bounded = boss_jobs::registry::WorkflowSpec::platform_seed(
+        "bounded-question",
+        "A question with a declared bound",
+        // Not `platform`: a platform kind is inbound, and an inbound
+        // packet nothing has taken in is receiving's, not marshalling's.
+        "operations",
+        vec!["custom".into()],
+        vec![boss_jobs::registry::StepSpec {
+            title: "answer".into(),
+            duration_hours: Some(24.0),
+            ..Default::default()
+        }],
+    );
+    // The version the fixture's packets are pinned to.
+    bounded.version = 16;
+    for (ready_at, state) in [
+        ("2026-09-19T11:00:00Z", "attention"),
+        ("2026-09-17T11:00:00Z", "troubled"),
+    ] {
+        let (app, jobs) = app_with_intake_seeding(None, vec![bounded.clone()]);
+        jobs.answer_membership(quiet_history());
+        let id = Uuid::from_u128(0x6254_e602_0000_0000_0000_0000_0000_0001).to_string();
+        let packet = job(
+            "bounded-question",
+            &id,
+            "a question for David",
+            JobStatus::Open,
+            json!({}),
+        );
+        jobs.create_job_at(&packet, t(ready_at), &[]).await.unwrap();
+        let mut answer = step(
+            &packet.id,
+            "answer",
+            "answer",
+            StepStatus::Ready,
+            json!({"authority_role": "platform-admin"}),
+        );
+        answer.assignee_id = Some("emp-david".into());
+        jobs.add_step_at(&answer, t(ready_at), &[]).await.unwrap();
+        let (status, v) = get(&app, "operator", "/api/yard/regions").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let m = region(&v, "marshalling");
+        assert_eq!(m["count"], 1, "{m}");
+        assert_eq!(m["state"], state, "{m}");
+        let why = m["why"].as_str().unwrap_or_default();
+        assert!(
+            why.contains("q.platform-admin.task") && why.contains("emp-david"),
+            "the station and the owner are named: {m}"
+        );
+        if state == "troubled" {
+            assert!(why.contains("past its 24h bound"), "{m}");
+        }
+    }
+}
+
+/// A FAILED ONSET READ NAMES THE READ, NOT THE RECORD (backlog 35d29890,
+/// from landed-review 5e2e42aa of car ba03b95e). The handler read the
+/// queue-age rows with `.ok()`, so when that read failed every standing
+/// step said "its ready instant is not on the record" — the troubled
+/// verdict right, its stated cause wrong (CLAUDE.md, "a verdict must name
+/// what failed"). The same owned step an hour into its 24h bound, with
+/// the queue-age read failing, is troubled for THAT reason, the error
+/// carried through.
+#[tokio::test]
+async fn a_failed_queue_age_read_is_named_as_the_cause_not_the_record() {
+    let mut bounded = boss_jobs::registry::WorkflowSpec::platform_seed(
+        "bounded-question",
+        "A question with a declared bound",
+        "operations",
+        vec!["custom".into()],
+        vec![boss_jobs::registry::StepSpec {
+            title: "answer".into(),
+            duration_hours: Some(24.0),
+            ..Default::default()
+        }],
+    );
+    bounded.version = 16;
+    let ready_at = "2026-09-19T11:00:00Z";
+    let (app, jobs) = app_with_intake_seeding(None, vec![bounded]);
+    jobs.answer_membership(quiet_history());
+    let id = Uuid::from_u128(0x35d2_9890_0000_0000_0000_0000_0000_0001).to_string();
+    let packet = job(
+        "bounded-question",
+        &id,
+        "a question for David",
+        JobStatus::Open,
+        json!({}),
+    );
+    jobs.create_job_at(&packet, t(ready_at), &[]).await.unwrap();
+    let mut answer = step(
+        &packet.id,
+        "answer",
+        "answer",
+        StepStatus::Ready,
+        json!({"authority_role": "platform-admin"}),
+    );
+    answer.assignee_id = Some("emp-david".into());
+    jobs.add_step_at(&answer, t(ready_at), &[]).await.unwrap();
+    jobs.fail_queue_age();
+
+    let (status, v) = get(&app, "operator", "/api/yard/regions").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let m = region(&v, "marshalling");
+    assert_eq!(m["state"], "troubled", "{m}");
+    let why = m["why"].as_str().unwrap_or_default();
+    assert!(
+        why.contains("the queue-age read failed") && why.contains("injected by fail_queue_age"),
+        "the failed read and its error are named: {m}"
+    );
+    assert!(
+        !why.contains("not on the record"),
+        "a failed read does not blame the record: {m}"
+    );
 }
 
 /// RECEIVING READS PAST ITS PAGE (design 62de32ae decision 4): the

@@ -39,6 +39,33 @@ pub struct ReplayInput {
     pub packet_prefix_complete: bool,
     #[serde(default)]
     pub source_unavailable: Vec<Unavailable>,
+    /// Where the fold starts. Empty is genesis: every group is replayed
+    /// from the first row of the log, which is how this basis read until
+    /// design c195e83e (2026-10-17) measured it refusing every station.
+    #[serde(default)]
+    pub initial: InitialState,
+}
+/// The starting state of the fold, witnessed at the window cut (design
+/// c195e83e, Q1-Q3 approved 2026-10-17). The row and byte bounds stay;
+/// what changes is that the fold no longer starts at genesis.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InitialState {
+    /// The highest audit sequence folded into this state. Every row
+    /// above it, and every whole original group holding a row above it
+    /// (Q2), is replayed in `ReplayInput::groups` instead.
+    pub cut: i64,
+    /// Each carried packet's latest original snapshot at the cut: its
+    /// Job row, each Step's latest row (update, first record or claim
+    /// receipt), and a manifest claim's chunks. Q3: this snapshot is the
+    /// packet's creation witness; no creation row since genesis is read.
+    pub rows: Vec<HistoricalEvent>,
+    /// Packets the current census names that the originals cannot place
+    /// at the cut, each with its specific reason. UNKNOWN, never absent.
+    pub unknown: BTreeMap<String, String>,
+    /// Terminal packets left out under Q1: no instant of the window's
+    /// known clock can count them on any registered station. Only a
+    /// count survives, because an unknown clock span cannot rule one out.
+    pub pruned_terminal: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unavailable {
@@ -75,6 +102,18 @@ pub struct MembershipFlow {
     pub scope: JobScope,
 }
 impl MembershipFlow {
+    /// Why this flow has no count: every unknown span's reason, in order.
+    /// `None` when nothing is unknown. One spelling for every surface that
+    /// shows it — `GET /api/stations/flow` and the IT map (ab09f1af).
+    pub fn unavailable_reason(&self) -> Option<String> {
+        (!self.unknown.is_empty()).then(|| {
+            self.unknown
+                .iter()
+                .map(|u| u.reason.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+    }
     fn new(name: String, scope: &JobScope) -> Self {
         Self {
             station: name,
@@ -129,7 +168,7 @@ pub struct MembershipReading {
     pub audit_cutoff: i64,
     pub denied: bool,
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Packet {
     job: Option<Job>,
     steps: BTreeMap<String, Step>,
@@ -224,7 +263,12 @@ impl State {
                 continue;
             }
             let Some(job) = &packet.job else {
-                return Err("original first Job snapshot missing".into());
+                // A census packet with no witness at the cut carries its
+                // own reason (Q3); otherwise the first snapshot is missing.
+                return Err(packet
+                    .reason
+                    .clone()
+                    .unwrap_or("original first Job snapshot missing".into()));
             };
             if !input.scope.admits(job) {
                 continue;
@@ -270,12 +314,36 @@ impl State {
         }
         Ok(out)
     }
+    /// Fold one starting-state snapshot row (c195e83e). Unlike `apply`,
+    /// a snapshot is not a transition: an update without its creation
+    /// is the witness Q3 accepts, so no creation order is checked. A
+    /// packet first seen here is complete once its Job snapshot is held,
+    /// unless the census already named it UNKNOWN; one a replayed group
+    /// already placed keeps the completeness that group's evidence gave.
+    fn seed(&mut self, row: &HistoricalEvent) -> Result<(), String> {
+        match packet_fact(row)? {
+            Some(PacketFact::Job(job)) => {
+                let packet = self.packets.entry(job.id.to_string()).or_default();
+                if packet.job.is_none() {
+                    packet.complete = packet.reason.is_none();
+                }
+                packet.job = Some(job);
+            }
+            Some(PacketFact::Step(step)) => {
+                let packet = self.packets.entry(step.job_id.to_string()).or_default();
+                packet.steps.insert(step.id.to_string(), step);
+            }
+            None => {}
+        }
+        Ok(())
+    }
     fn apply(&mut self, row: &HistoricalEvent, complete: bool) -> Result<(), String> {
         let e = &row.event;
         match e.kind.as_str() {
             crate::events::JOB_CREATED | crate::events::JOB_UPDATED => {
-                let job: Job =
-                    serde_json::from_value(e.payload.clone()).map_err(|e| e.to_string())?;
+                let Some(PacketFact::Job(job)) = packet_fact(row)? else {
+                    return Err("original Job snapshot is not a Job".into());
+                };
                 let packet = self.packets.entry(job.id.to_string()).or_default();
                 if e.kind == crate::events::JOB_CREATED {
                     if packet.job.is_some() {
@@ -288,16 +356,33 @@ impl State {
                 packet.complete &= complete;
                 packet.job = Some(job);
             }
-            crate::events::STEP_CREATED | crate::events::STEP_UPDATED => {
-                let step: Step =
-                    serde_json::from_value(e.payload.clone()).map_err(|e| e.to_string())?;
+            crate::events::STEP_CREATED
+            | crate::events::STEP_UPDATED
+            | crate::events::STEP_FIRST_RECORDED
+            | crate::events::STATION_CLAIMED => {
+                let Some(PacketFact::Step(step)) = packet_fact(row)? else {
+                    return Err("original Step snapshot is not a Step".into());
+                };
                 let packet = self.packets.entry(step.job_id.to_string()).or_default();
                 let exists = packet.steps.contains_key(&step.id.to_string());
-                if (e.kind == crate::events::STEP_CREATED && exists)
-                    || (e.kind == crate::events::STEP_UPDATED && !exists)
-                {
+                let broken = match e.kind.as_str() {
+                    crate::events::STEP_CREATED if exists => {
+                        Some("duplicate or missing original Step creation")
+                    }
+                    crate::events::STEP_UPDATED if !exists => {
+                        Some("duplicate or missing original Step creation")
+                    }
+                    crate::events::STEP_FIRST_RECORDED if !exists => {
+                        Some("original Step creation missing before first record")
+                    }
+                    crate::events::STATION_CLAIMED if !exists => {
+                        Some("original Step creation missing before station claim")
+                    }
+                    _ => None,
+                };
+                if let Some(reason) = broken {
                     packet.complete = false;
-                    packet.reason = Some("duplicate or missing original Step creation".into());
+                    packet.reason = Some(reason.into());
                 }
                 packet.complete &= complete;
                 packet.steps.insert(step.id.to_string(), step);
@@ -346,54 +431,161 @@ impl State {
                 }
                 self.registry_at = row.created_at;
             }
-            crate::events::STEP_FIRST_RECORDED => {
-                let ev = boss_events::replay::ReplayEvent {
-                    audit_id: row.seq,
-                    event_id: e.id,
-                    kind: e.kind.clone(),
-                    ts: e.timestamp,
-                    payload: e.payload.clone(),
-                };
-                let (step, _) = crate::state_receipt::first_record(&ev)?;
-                let packet = self.packets.entry(step.job_id.to_string()).or_default();
-                if !packet.steps.contains_key(&step.id.to_string()) {
-                    packet.complete = false;
-                    packet.reason =
-                        Some("original Step creation missing before first record".into());
-                }
-                packet.complete &= complete;
-                packet.steps.insert(step.id.to_string(), step);
-            }
-            crate::events::STATION_CLAIMED => {
-                let ev = boss_events::replay::ReplayEvent {
-                    audit_id: row.seq,
-                    event_id: e.id,
-                    kind: e.kind.clone(),
-                    ts: e.timestamp,
-                    payload: e.payload.clone(),
-                };
-                let text = e
-                    .payload
-                    .get("receipt_json")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("original exact claim JSON missing")?;
-                let (step, _) = crate::state_receipt::station_claim(&ev, text)?;
-                let packet = self.packets.entry(step.job_id.to_string()).or_default();
-                if !packet.steps.contains_key(&step.id.to_string()) {
-                    packet.complete = false;
-                    packet.reason =
-                        Some("original Step creation missing before station claim".into());
-                }
-                packet.complete &= complete;
-                packet.steps.insert(step.id.to_string(), step);
-            }
             _ => {}
         }
         Ok(())
     }
 }
 
-fn packet_identity(row: &HistoricalEvent) -> Option<String> {
+/// The packet state one original row carries, read once for both the
+/// starting state and the replay so the two cannot parse a row apart.
+enum PacketFact {
+    Job(Job),
+    Step(Step),
+}
+
+fn packet_fact(row: &HistoricalEvent) -> Result<Option<PacketFact>, String> {
+    let e = &row.event;
+    let receipt_event = || boss_events::replay::ReplayEvent {
+        audit_id: row.seq,
+        event_id: e.id,
+        kind: e.kind.clone(),
+        ts: e.timestamp,
+        payload: e.payload.clone(),
+    };
+    Ok(match e.kind.as_str() {
+        crate::events::JOB_CREATED | crate::events::JOB_UPDATED => Some(PacketFact::Job(
+            serde_json::from_value(e.payload.clone()).map_err(|e| e.to_string())?,
+        )),
+        crate::events::STEP_CREATED | crate::events::STEP_UPDATED => Some(PacketFact::Step(
+            serde_json::from_value(e.payload.clone()).map_err(|e| e.to_string())?,
+        )),
+        crate::events::STEP_FIRST_RECORDED => Some(PacketFact::Step(
+            crate::state_receipt::first_record(&receipt_event())?.0,
+        )),
+        crate::events::STATION_CLAIMED => {
+            let text = e
+                .payload
+                .get("receipt_json")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("original exact claim JSON missing")?;
+            Some(PacketFact::Step(
+                crate::state_receipt::station_claim(&receipt_event(), text)?.0,
+            ))
+        }
+        _ => None,
+    })
+}
+
+/// Prepare the starting state (c195e83e): place the census verdicts,
+/// and restore each claim receipt kept as chunks from its own chunks,
+/// exactly as a replayed group restores it. Answers the rows to seed in
+/// audit order. A row that cannot be read makes its own packet UNKNOWN
+/// when its packet is known, and the whole read UNKNOWN when not.
+fn prepare_seed(state: &mut State, input: &ReplayInput) -> Result<Vec<HistoricalEvent>, String> {
+    let initial = &input.initial;
+    let mut rows: Vec<&HistoricalEvent> = initial.rows.iter().collect();
+    rows.sort_by_key(|r| r.seq);
+    let mut prepared = Vec::with_capacity(rows.len());
+    let mut chunks = BTreeMap::<String, Vec<boss_events::replay::ReplayEvent>>::new();
+    let as_replay = |r: &HistoricalEvent| boss_events::replay::ReplayEvent {
+        audit_id: r.seq,
+        event_id: r.event.id,
+        kind: r.event.kind.clone(),
+        ts: r.event.timestamp,
+        payload: r.event.payload.clone(),
+    };
+    // A census verdict is placed first: a later snapshot cannot make a
+    // packet the census already found unplaceable look complete.
+    for (id, reason) in &initial.unknown {
+        if input.scope != JobScope::All
+            && !input
+                .currently_authorized
+                .as_ref()
+                .is_some_and(|ids| ids.contains(id))
+        {
+            continue;
+        }
+        let packet = state.packets.entry(id.clone()).or_default();
+        packet.complete = false;
+        packet.reason = Some(reason.clone());
+    }
+    for row in rows {
+        if row.event.kind == crate::events::STATION_SELECTION_EVIDENCE {
+            let claim = row
+                .event
+                .payload
+                .get("claim_event_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            chunks.entry(claim).or_default().push(as_replay(row));
+            continue;
+        }
+        let mut row = row.clone();
+        if row.event.kind == crate::events::STATION_CLAIMED {
+            let mut events = chunks.remove(&row.event.id.to_string()).unwrap_or_default();
+            events.push(as_replay(&row));
+            match crate::selection_evidence::reconstruct(&events) {
+                Ok(restored) => {
+                    if let Some(restored) = restored.iter().find(|r| r.event_id == row.event.id) {
+                        row.event.payload = restored.payload.clone();
+                    }
+                }
+                Err(error) => {
+                    unreadable(state, input, &row, error.to_string())?;
+                    continue;
+                }
+            }
+        }
+        if visible_row(&row, input) {
+            prepared.push(row);
+        }
+    }
+    Ok(prepared)
+}
+
+/// Seed the prepared rows below `bound`. The replay calls this before
+/// each group, with that group's first audit sequence while the group
+/// lies wholly at or below the cut, so a registry or clock group whose
+/// transaction also wrote packet rows lands in audit order around the
+/// snapshots; and with no bound before the first group reaching past
+/// the cut, so the whole starting state precedes the window.
+fn seed_through(
+    state: &mut State,
+    input: &ReplayInput,
+    seeds: &mut std::iter::Peekable<std::vec::IntoIter<HistoricalEvent>>,
+    bound: i64,
+) -> Result<(), String> {
+    while let Some(row) = seeds.next_if(|row| row.seq < bound) {
+        if let Err(error) = state.seed(&row) {
+            unreadable(state, input, &row, error)?;
+        }
+    }
+    Ok(())
+}
+
+fn unreadable(
+    state: &mut State,
+    input: &ReplayInput,
+    row: &HistoricalEvent,
+    reason: String,
+) -> Result<(), String> {
+    // As in a replayed group: a narrow read cannot be refused by a row it
+    // could not see, or the refusal itself would disclose the row.
+    if !visible_row(row, input) {
+        return Ok(());
+    }
+    let Some(id) = packet_identity(row) else {
+        return Err(reason);
+    };
+    let packet = state.packets.entry(id).or_default();
+    packet.complete = false;
+    packet.reason = Some(reason);
+    Ok(())
+}
+
+pub(crate) fn packet_identity(row: &HistoricalEvent) -> Option<String> {
     if row.event.kind == crate::events::STATION_CLAIMED
         && let Some(value) = row
             .event
@@ -414,6 +606,300 @@ fn packet_identity(row: &HistoricalEvent) -> Option<String> {
         .or_else(|| row.event.payload.get("id"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
+}
+
+/// What one original group writes of packet state, per packet: each
+/// entity it writes (`job`, or `step:<id>`) and the group's first audit
+/// sequence for that entity. An entity the row does not let us name is
+/// `None`, and it is never proven disjoint from anything. Marker rows
+/// (`step.assigned.*`, `jobs.step.completed`, …) name a packet but carry
+/// no state the replay folds, so they write nothing here.
+type Writes = BTreeMap<String, BTreeMap<Option<String>, i64>>;
+
+fn state_writes(rows: &[HistoricalEvent], input: &ReplayInput) -> Writes {
+    let mut out = Writes::new();
+    for row in rows.iter().filter(|row| visible_row(row, input)) {
+        let payload = &row.event.payload;
+        let entity = match row.event.kind.as_str() {
+            crate::events::JOB_CREATED | crate::events::JOB_UPDATED => Some("job".to_owned()),
+            crate::events::STEP_CREATED | crate::events::STEP_UPDATED => payload
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| format!("step:{id}")),
+            crate::events::STEP_FIRST_RECORDED | crate::events::STATION_CLAIMED => {
+                match packet_fact(row) {
+                    Ok(Some(PacketFact::Step(step))) => Some(format!("step:{}", step.id)),
+                    _ => None,
+                }
+            }
+            _ => continue,
+        };
+        // A state row naming no packet fails to fold at all (`apply`),
+        // which refuses the whole read; it needs no order here.
+        let Some(packet) = packet_identity(row) else {
+            continue;
+        };
+        let first = out
+            .entry(packet)
+            .or_default()
+            .entry(entity)
+            .or_insert(row.seq);
+        *first = (*first).min(row.seq);
+    }
+    out
+}
+
+/// An earlier original group whose audit span a later one may overlap.
+struct Prior {
+    low: i64,
+    high: i64,
+    registry: bool,
+    writes: Writes,
+    at: DateTime<Utc>,
+    /// Each packet this group wrote, as it stood just before the group
+    /// was folded. Kept for the most recent `PRIOR_STATE_DEPTH` groups
+    /// only; an older group's is dropped, and an overlap that would need
+    /// it is refused rather than answered.
+    before: Option<BTreeMap<String, Option<Packet>>>,
+    /// Packets this group's position relative to an earlier group was
+    /// left unestablished for, because no order could change a count.
+    unordered: BTreeSet<String>,
+}
+
+/// How many recent groups keep the packet state from before them. The
+/// interleavings measured on 2026-10-22 span milliseconds — adjacent
+/// groups — so a few hundred is generous; the bound only keeps memory
+/// flat over a window of tens of thousands of groups.
+const PRIOR_STATE_DEPTH: usize = 256;
+
+/// How a later group stands to an earlier group whose audit span it
+/// overlaps (backlog da9faa93).
+enum Relation {
+    /// They write no packet in common, and neither is a registry group.
+    Unrelated,
+    /// They write a common packet, and some entity both write is first
+    /// written by the later group only after the earlier group's last
+    /// row. A Job or Step row is updated under its row lock, which is
+    /// held to commit, and its outbox row is inserted after the update
+    /// (the `OUTBOX (phase 2)` convention in `postgres.rs`). So the later
+    /// write waited on the earlier commit, and the relay, which copies
+    /// committed rows in outbox order, could only have placed it after
+    /// the earlier group's rows: the earlier group committed first, which
+    /// is the order the fold already applies.
+    Ordered(Vec<String>),
+    /// They write common packets, but only different entities of them:
+    /// nothing in the log says which committed first.
+    Unordered(Vec<String>),
+    /// A registry group, an entity both write with no lock order, or an
+    /// entity that cannot be named.
+    Refused,
+}
+
+fn relation(prior: &Prior, registry: bool, writes: &Writes) -> Relation {
+    if prior.registry || registry {
+        return Relation::Refused;
+    }
+    let shared: Vec<String> = writes
+        .keys()
+        .filter(|id| prior.writes.contains_key(*id))
+        .cloned()
+        .collect();
+    if shared.is_empty() {
+        return Relation::Unrelated;
+    }
+    let mut witnessed = false;
+    for id in &shared {
+        let (Some(earlier), Some(later)) = (prior.writes.get(id), writes.get(id)) else {
+            continue;
+        };
+        if earlier.contains_key(&None) || later.contains_key(&None) {
+            return Relation::Refused;
+        }
+        for (entity, first) in later {
+            if earlier.contains_key(entity) {
+                if *first > prior.high {
+                    witnessed = true;
+                } else {
+                    return Relation::Refused;
+                }
+            }
+        }
+    }
+    if witnessed {
+        Relation::Ordered(shared)
+    } else {
+        Relation::Unordered(shared)
+    }
+}
+
+/// `packet` with `rows` folded onto it, or None when a row does not fold.
+fn folded(
+    state: &mut State,
+    id: &str,
+    packet: Option<Packet>,
+    rows: &[&HistoricalEvent],
+) -> Option<Packet> {
+    if let Some(packet) = packet {
+        state.packets.insert(id.to_owned(), packet);
+    }
+    let applied = rows.iter().all(|row| state.apply(row, true).is_ok());
+    let out = state.packets.remove(id);
+    applied.then_some(out).flatten()
+}
+
+/// Whether every station holds packet `id` alike in each state two
+/// unordered transactions can leave it in, at both of their instants:
+/// before both (`before`), after the earlier alone (the fold's current
+/// state), after the later alone, and after both. Then no order of the
+/// two commits makes the packet cross any station, so the count is the
+/// same whichever committed first and needs no order (backlog da9faa93).
+/// Anything that cannot be evaluated answers false.
+fn order_cannot_matter(
+    state: &mut State,
+    input: &ReplayInput,
+    id: &str,
+    before: Option<Packet>,
+    rows: &[&HistoricalEvent],
+    instants: [DateTime<Utc>; 2],
+) -> bool {
+    let current = state.packets.remove(id);
+    let alone = folded(state, id, before.clone(), rows);
+    let both = folded(state, id, current.clone(), rows);
+    let mut verdict = alone.is_some() && both.is_some();
+    if verdict {
+        let only: BTreeSet<String> = [id.to_owned()].into_iter().collect();
+        let specs: Vec<StationSpec> = state
+            .station_cache
+            .values()
+            .map(|(spec, _)| spec.clone())
+            .collect();
+        let mut seen: Option<Vec<bool>> = None;
+        'states: for candidate in [before, current.clone(), alone, both] {
+            match candidate {
+                Some(packet) => state.packets.insert(id.to_owned(), packet),
+                None => state.packets.remove(id),
+            };
+            for at in instants {
+                let mut reading = Vec::with_capacity(specs.len());
+                for spec in &specs {
+                    match state.members_for(Some(spec), at, input, Some(&only)) {
+                        Ok(members) => reading.push(members.get(id).copied().unwrap_or(false)),
+                        Err(_) => {
+                            verdict = false;
+                            break 'states;
+                        }
+                    }
+                }
+                if *seen.get_or_insert_with(|| reading.clone()) != reading {
+                    verdict = false;
+                    break 'states;
+                }
+            }
+        }
+    }
+    match current {
+        Some(packet) => state.packets.insert(id.to_owned(), packet),
+        None => state.packets.remove(id),
+    };
+    verdict
+}
+
+/// The group being folded: its audit span, insertion instant, and
+/// whether it publishes or retires registry rows.
+struct Span {
+    first: i64,
+    end: i64,
+    at: DateTime<Utc>,
+    registry: bool,
+}
+
+/// Whether this group's place among the earlier groups its audit span
+/// overlaps is unestablished for packet state it writes, so the replay
+/// cannot fold it without guessing (backlog da9faa93).
+///
+/// Measured 2026-10-22: every window of the IT map was dark because two
+/// concurrent commits on one packet — the dispatcher auto-assigning an
+/// agent run's first Step while `boss dispatch --started` claims its
+/// Building Step, or a rule completing a Step the dispatcher had just
+/// assigned — reach the log interleaved, and any overlap sharing a packet
+/// identity was refused. Overlap alone says nothing about order. What
+/// can: a row lock (`Relation::Ordered`), or the fact that no order of
+/// the two could move the packet across any station
+/// (`order_cannot_matter`). One unordered earlier writer per packet is
+/// judged; two, or one whose own place was left open, are refused.
+/// Packets judged unordered are added to `unordered`.
+fn interleaves(
+    state: &mut State,
+    input: &ReplayInput,
+    priors: &[Prior],
+    span: Span,
+    writes: &Writes,
+    rows: &[&HistoricalEvent],
+    unordered: &mut BTreeSet<String>,
+) -> bool {
+    let start = priors.partition_point(|prior| prior.high < span.first);
+    let mut writers = BTreeMap::<String, usize>::new();
+    let mut open = BTreeMap::<String, usize>::new();
+    for (index, prior) in priors.iter().enumerate().skip(start) {
+        if span.first > prior.high || prior.low > span.end {
+            continue;
+        }
+        match relation(prior, span.registry, writes) {
+            Relation::Unrelated => {}
+            Relation::Refused => return true,
+            Relation::Ordered(shared) => {
+                for id in shared {
+                    *writers.entry(id).or_default() += 1;
+                }
+            }
+            // A starting-state snapshot may land between an earlier group
+            // at or below the cut and this one, so the state the fold holds
+            // is not that group's after-state: judge only window groups.
+            Relation::Unordered(_) if prior.low <= input.initial.cut => return true,
+            Relation::Unordered(shared) => {
+                for id in shared {
+                    *writers.entry(id.clone()).or_default() += 1;
+                    open.insert(id, index);
+                }
+            }
+        }
+    }
+    for (id, index) in open {
+        let prior = &priors[index];
+        if writers.get(&id) != Some(&1) || prior.unordered.contains(&id) {
+            return true;
+        }
+        let Some(before) = prior
+            .before
+            .as_ref()
+            .and_then(|before| before.get(&id))
+            .cloned()
+        else {
+            return true;
+        };
+        let own: Vec<&HistoricalEvent> = rows
+            .iter()
+            .copied()
+            .filter(|row| {
+                visible_row(row, input)
+                    && matches!(
+                        row.event.kind.as_str(),
+                        crate::events::JOB_CREATED
+                            | crate::events::JOB_UPDATED
+                            | crate::events::STEP_CREATED
+                            | crate::events::STEP_UPDATED
+                            | crate::events::STEP_FIRST_RECORDED
+                            | crate::events::STATION_CLAIMED
+                    )
+                    && packet_identity(row).as_deref() == Some(id.as_str())
+            })
+            .collect();
+        if !order_cannot_matter(state, input, &id, before, &own, [prior.at, span.at]) {
+            return true;
+        }
+        unordered.insert(id);
+    }
+    false
 }
 
 fn visible_row(row: &HistoricalEvent, input: &ReplayInput) -> bool {
@@ -482,6 +968,14 @@ fn accrue_expiry(
         let flow = flows
             .entry(name.clone())
             .or_insert_with(|| MembershipFlow::new(name.clone(), &input.scope));
+        // Q1 (c195e83e) pruned these because no KNOWN instant of the
+        // window can count them. An unknown span cannot rule that out,
+        // so it stays unknown here as a carried terminal packet keeps it.
+        if input.initial.pruned_terminal > 0 {
+            for gap in &input.clock.unknown {
+                flow.unknown_span(from.max(gap.since), to.min(gap.until), gap.reason.clone());
+            }
+        }
         for (id, packet) in &state.packets {
             if input.scope != JobScope::All
                 && !input
@@ -586,6 +1080,53 @@ fn check_initial_state(
     }
 }
 
+/// THIS WINDOW AND THE WIDER ONE, FROM ONE SNAPSHOT (item ab09f1af,
+/// car 2): `[from narrow, from input.since]`, both ending at the
+/// snapshot's own cut. The IT map draws a station's served count in this
+/// window and the previous one, the wider minus the narrower; two
+/// snapshots would be two cuts, and a crossing between them would land
+/// in the wider count alone and read as the PREVIOUS window's — the
+/// reason the step-events cube once counted its pair in one statement
+/// (backlog 29f7e897). The narrower replay folds the groups between the
+/// two openings as history before its window, as any replay folds what
+/// precedes its window. A narrower window that does not lie inside the
+/// snapshot's is refused, never answered short.
+/// Each station's packet-membership flow, by name, in this window and in
+/// the wider window ending with it (this plus the previous) — the IT
+/// map's flow reading (`http/regions.rs`, `membership_flows`).
+#[derive(Debug, Clone)]
+pub struct FlowWindows {
+    pub this: BTreeMap<String, MembershipFlow>,
+    /// The wider window, or why it could not be read — the previous
+    /// window is then unread, while this one still counts.
+    pub both: Result<BTreeMap<String, MembershipFlow>, String>,
+}
+
+/// The map's flow reading as it is shared between map reads (backlog
+/// b852ec37, `crate::reading_cache`): the windows, or why they could not
+/// be read, and the wall instant the windows END at — which a served
+/// reading states, because it is not the serving read's own now.
+#[derive(Debug, Clone)]
+pub struct MapFlowReading {
+    pub as_of: DateTime<Utc>,
+    pub windows: Result<FlowWindows, String>,
+}
+
+pub fn replay_windows(
+    mut input: ReplayInput,
+    narrow: DateTime<Utc>,
+) -> Result<[MembershipReading; 2], String> {
+    if narrow < input.since || narrow >= input.until {
+        return Err(format!(
+            "window opening {narrow} lies outside the snapshot's [{}, {})",
+            input.since, input.until
+        ));
+    }
+    let wide = replay(&input);
+    input.since = narrow;
+    Ok([replay(&input), wide])
+}
+
 pub fn replay(input: &ReplayInput) -> MembershipReading {
     let mut state = State::default();
     let mut flows = BTreeMap::<String, MembershipFlow>::new();
@@ -608,6 +1149,15 @@ pub fn replay(input: &ReplayInput) -> MembershipReading {
     } else {
         None
     };
+    let mut seeds = match prepare_seed(&mut state, input) {
+        Ok(rows) => rows,
+        Err(reason) => {
+            global_reason = global_reason.or(Some(reason));
+            vec![]
+        }
+    }
+    .into_iter()
+    .peekable();
     let mut seen = BTreeSet::new();
     let mut global_since = if global_reason.is_some() {
         input.since
@@ -618,8 +1168,18 @@ pub fn replay(input: &ReplayInput) -> MembershipReading {
     let mut last_at = input.since;
     let mut expiries = BTreeSet::new();
     let mut initial_checked = false;
-    let mut prior_ranges = Vec::<(i64, i64, BTreeSet<String>, bool)>::new();
+    let mut prior_ranges = Vec::<Prior>::new();
     for original_group in &input.groups {
+        let span = original_group.rows.iter().map(|r| r.seq);
+        let bound = if span.clone().max().unwrap_or(i64::MAX) > input.initial.cut {
+            i64::MAX
+        } else {
+            span.min().unwrap_or(i64::MAX)
+        };
+        if let Err(reason) = seed_through(&mut state, input, &mut seeds, bound) {
+            global_reason = Some(reason);
+            global_since = input.since;
+        }
         let mut reconstructed = original_group.clone();
         let mut rows: Vec<_> = original_group
             .rows
@@ -726,15 +1286,50 @@ pub fn replay(input: &ReplayInput) -> MembershipReading {
             .filter_map(packet_identity)
             .collect();
         let first = group.rows.iter().map(|r| r.seq).min().unwrap_or(end);
-        let possible = prior_ranges.partition_point(|(_, high, _, _)| *high < first);
-        let interleaved = prior_ranges[possible..]
-            .iter()
-            .any(|(low, high, ids, registry)| {
-                first <= *high
-                    && *low <= end
-                    && (registry_group || *registry || !affected.is_disjoint(ids))
-            });
-        prior_ranges.push((first, end, affected.clone(), registry_group));
+        let mut ordered = group.rows.iter().collect::<Vec<_>>();
+        if let Some(original) = &group.original {
+            ordered.sort_by_key(|row| original.event_ids.iter().position(|id| id == &row.event.id));
+            if original.complete
+                && (ordered.len() != original.event_ids.len()
+                    || ordered
+                        .iter()
+                        .any(|r| !original.event_ids.contains(&r.event.id)))
+            {
+                global_reason = Some("whole original group events are incomplete".into());
+            }
+        }
+        let writes = state_writes(&group.rows, input);
+        let mut unordered = BTreeSet::new();
+        let interleaved = interleaves(
+            &mut state,
+            input,
+            &prior_ranges,
+            Span {
+                first,
+                end,
+                at,
+                registry: registry_group,
+            },
+            &writes,
+            &ordered,
+            &mut unordered,
+        );
+        let before_group = writes
+            .keys()
+            .map(|id| (id.clone(), state.packets.get(id).cloned()))
+            .collect();
+        prior_ranges.push(Prior {
+            low: first,
+            high: end,
+            registry: registry_group,
+            writes,
+            at,
+            before: Some(before_group),
+            unordered,
+        });
+        if let Some(index) = prior_ranges.len().checked_sub(PRIOR_STATE_DEPTH + 1) {
+            prior_ranges[index].before = None;
+        }
         let only = if registry_group {
             None
         } else {
@@ -790,18 +1385,6 @@ pub fn replay(input: &ReplayInput) -> MembershipReading {
             })
             .collect();
         let mut registry_changed = false;
-        let mut ordered = group.rows.iter().collect::<Vec<_>>();
-        if let Some(original) = &group.original {
-            ordered.sort_by_key(|row| original.event_ids.iter().position(|id| id == &row.event.id));
-            if original.complete
-                && (ordered.len() != original.event_ids.len()
-                    || ordered
-                        .iter()
-                        .any(|r| !original.event_ids.contains(&r.event.id)))
-            {
-                global_reason = Some("whole original group events are incomplete".into());
-            }
-        }
         if interleaved {
             for id in &affected {
                 if let Some(packet) = state.packets.get_mut(id) {
@@ -960,6 +1543,10 @@ pub fn replay(input: &ReplayInput) -> MembershipReading {
                 }
             }
         }
+    }
+    if let Err(reason) = seed_through(&mut state, input, &mut seeds, i64::MAX) {
+        global_reason = Some(reason);
+        global_since = input.since;
     }
     if !initial_checked {
         check_initial_state(&state, input, &mut flows);

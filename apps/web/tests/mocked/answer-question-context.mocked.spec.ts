@@ -100,6 +100,21 @@ test('an already-recorded linked decision is not presented as another approval',
   await expect(page.getByRole('button', { name: 'Record the answer' })).toHaveCount(0);
 });
 
+// The flag as the system of record actually holds it: `boss design
+// --no-questions` writes the STRING "true" (design.rs, "the flag is always
+// written"), and design 195276f0 carried exactly that. A boolean-only
+// check read it as a design with questions and sent David to a review
+// that does not exist (backlog ac141c99).
+test('the recorded flag in its stored string shape reads as recorded too', async ({ page }) => {
+  await mount(page, { step: question({ question: 'Decide the alarm design', context_md: '' }), jobId: JOB }, {
+    [`/api/jobs/${JOB}`]: { body: linkedJob },
+    [`/api/jobs/${DESIGN}`]: { body: { title: 'Alarm meanings', metadata: { no_open_questions: 'true', questions: [], markdown: 'Red requires immediate action.' } } },
+  });
+  await expect(page.getByRole('heading', { name: 'No answer needed' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Review the linked design' })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'View decision' })).toHaveAttribute('href', `/ux/jobs/${DESIGN}`);
+});
+
 test('a linked design with a real open question directs the answer to its own review', async ({ page }) => {
   await mount(page, { step: question({ question: 'Decide the design', context_md: '' }), jobId: JOB }, {
     [`/api/jobs/${JOB}`]: { body: linkedJob },

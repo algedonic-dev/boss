@@ -58,6 +58,10 @@
 #     first so a line for it proves the container saw inside: without
 #     it the answer is the door's refusal, not two absences;
 #   - `--network none`, and the image ops_kubectl already pulls;
+#   - `--log-driver=none`: it mounts the whole credential directory, so
+#     it is held to the rule every credential-mounting container is
+#     (backlog ff957587) — what it prints, docker's refusals with it,
+#     is never also kept in the daemon's container log;
 #   - `sudo -n`, so a reader on a timer never waits at a prompt;
 #   - bounded twice, because this runs inside the forge's OWN host
 #     reading, the one the boarding check reads and the one a stalled
@@ -88,7 +92,7 @@ ops_credentials_state() {
     _oc_dir="${BOSS_OPS_DIR:-/etc/boss-ops}"
     _oc_door=""
     if [ -d "$_oc_dir" ] && [ ! -x "$_oc_dir" ]; then
-        _oc_door="$(timeout -k 5 "${BOSS_OPS_DOOR_TIMEOUT_S:-30}" sudo -n docker run --rm --network none \
+        _oc_door="$(timeout -k 5 "${BOSS_OPS_DOOR_TIMEOUT_S:-30}" sudo -n docker run --rm --log-driver=none --network none \
             --mount "type=bind,src=$_oc_dir,dst=/ops,readonly" alpine/k8s:1.33.3 \
             timeout 10 stat -c '%n %U:%G %a %u:%g' /ops/. /ops/talosconfig /ops/kubeconfig 2>&1)" || :
         if [ -z "$(printf '%s\n' "$_oc_door" | sed -n '/^\/ops\/\. /p')" ]; then

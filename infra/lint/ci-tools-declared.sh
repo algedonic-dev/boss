@@ -36,9 +36,9 @@ cd "$(dirname "$0")/../.." || exit 1
 
 WORKFLOW=".forgejo/workflows/ci.yml"
 # The image required-tools.txt describes, matched by REPO not tag. The
-# downstream jobs pin boss-ci:${{ github.sha }} (a per-commit tag, so
-# the runner cannot serve a stale image — see ci.yml's build-image
-# note); an exact `:rust1.96` here would then match no job and the
+# downstream jobs pin boss-ci:<stamp>, named by the image's own recipe
+# (a tag no runner can hold stale — see ci.yml's build-image note,
+# 399ee6c3); an exact `:rust1.96` here would then match no job and the
 # non-vacuity guard would fire on every run. The trailing colon keeps
 # boss-ci-cache (a --cache-repo, never a container image) out. Jobs on
 # any other image are out of scope and skipped.
@@ -109,9 +109,9 @@ invoked=$(
             line = $0; sub(/^[[:space:]]*image:[[:space:]]*/, "", line); image = line; next
         }
         # Only scrape once the job is known to use the image the
-        # manifest describes. Prefix, not equality: the tag is now
-        # per-commit (boss-ci:${{ github.sha }}), so the fixed part is
-        # the repo up to the colon.
+        # manifest describes. Prefix, not equality: the tag is the
+        # recipe stamp (boss-ci:<stamp>), so the fixed part is the repo
+        # up to the colon.
         index(image, want) != 1 { next }
         /^[[:space:]]*run:[[:space:]]*[|>]/ {
             inblock = 1; cont = 0; shell_quote = ""

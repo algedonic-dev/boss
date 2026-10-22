@@ -60,8 +60,11 @@ pub enum JobsError {
     /// the row as the patch would leave it; merged into a row another
     /// writer changed since, the decision would be about a row that
     /// never existed. Refused atomically with the row lock; nothing is
-    /// written or recorded, and the caller re-reads and re-sends.
-    #[error("job {id} changed since this merge was judged — nothing was written")]
+    /// written or recorded, and the caller re-reads and re-sends. The
+    /// same refusal answers a write whose `expect` precondition no longer
+    /// holds under the lock — a merge's or a whole-row save's (backlog
+    /// 87fe090d).
+    #[error("job {id} changed since this write was judged — nothing was written")]
     JobChanged { id: JobId },
     /// A whole-row step write was computed from a read of a version the
     /// row no longer is: another writer (the merge door, a claim, a
@@ -512,8 +515,31 @@ impl PinnedJobs {
         };
         format!(
             "{kind} v{version} cannot be discarded: {} {noun} pinned to it{named}, \
-             and a pinned packet runs the text it was admitted under",
+             and a pinned packet runs the text it was admitted under. A candidate \
+             that met traffic and lost is REJECTED instead — kept for those packets, \
+             never published: `boss workflow reject {kind} {version}`",
             self.count
+        )
+    }
+
+    /// The sentence a reject of a draft NO packet is pinned to refuses
+    /// with (backlog 50ded63d): it admitted nothing, so it is
+    /// pre-history and the discard removes it. One wording for both
+    /// adapters.
+    pub fn reject_needs_traffic(kind: &str, version: i32) -> String {
+        format!(
+            "{kind} v{version} cannot be rejected: no packet is pinned to it, so it met \
+             no traffic and is not history — discard it instead: `boss workflow discard \
+             {kind} {version}`"
+        )
+    }
+
+    /// The sentence a reject of a row that is not a draft refuses with.
+    /// A rejected row is not refused: rejecting it again is a no-op.
+    pub fn reject_history(kind: &str, version: i32, status: &str) -> String {
+        format!(
+            "{kind} v{version} is {status}, not a draft — an active or retired version \
+             is history; only a draft that met traffic can be rejected"
         )
     }
 }
@@ -1236,6 +1262,75 @@ pub trait JobsRepository: Send + Sync {
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError>;
 
+    /// [`Self::update_job_at`] with `expect`, a precondition on the row's
+    /// metadata judged under the same lock as the write
+    /// ([`crate::step_metadata_write::metadata_still_reads`]): a row that
+    /// no longer reads so is refused with [`JobsError::JobChanged`] and
+    /// nothing is written or recorded. The job PUT sends the owed-proof
+    /// payment it judged ([`crate::car::payment_as_read`]), so a payment,
+    /// debt or erasure committed after its read is not undone by a
+    /// whole-row save judged on the row before it (backlog 87fe090d). An
+    /// adapter that cannot judge it refuses it, as the step door's
+    /// guarded merge does.
+    async fn update_job_expecting_at(
+        &self,
+        job: &Job,
+        read: JobStatus,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
+        now: DateTime<Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError> {
+        if expect.is_some() {
+            return Err(JobsError::Storage(
+                "adapter cannot judge a metadata precondition under its write".into(),
+            ));
+        }
+        self.update_job_at(job, read, now, events).await
+    }
+
+    /// [`Self::merge_job_metadata_at`] with `expect`, judged as
+    /// [`Self::update_job_expecting_at`] judges it: narrower than
+    /// `judged_on` on purpose, because a key it does not name may move
+    /// freely under the merge (backlog 87fe090d).
+    async fn merge_job_metadata_expecting_at(
+        &self,
+        id: &JobId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        judged_on: Option<&Job>,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<Job, JobsError> {
+        if expect.is_some() {
+            return Err(JobsError::Storage(
+                "adapter cannot judge a metadata precondition under its write".into(),
+            ));
+        }
+        self.merge_job_metadata_at(id, patch, judged_on, stamp)
+            .await
+    }
+
+    /// Set the Job's `priority` to `to` and append the move to its
+    /// reserved `priority_changes` list ([`crate::priority`], backlog
+    /// eb26059d), in ONE write under the row's lock, recording the
+    /// JOB_UPDATED state event built from the post-write row. The
+    /// record's `from` is the stored priority at write time and its
+    /// `by` is the stamp's actor. A Closed or Cancelled row is refused
+    /// with [`JobsError::TerminalJob`]; a row already at `to` writes and
+    /// records nothing (`changed: false`). Touches no other envelope
+    /// field and no other metadata key.
+    async fn set_priority_at(
+        &self,
+        id: &JobId,
+        to: boss_core::job::Priority,
+        why: &str,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::priority::PriorityMove, JobsError> {
+        let _ = (id, to, why, stamp);
+        Err(JobsError::Storage(
+            "the priority door is unsupported by this adapter".into(),
+        ))
+    }
+
     /// Atomically test exact key presence/value, apply and retain the
     /// actor-bound idempotency receipt and full state event. A replay
     /// returns its ORIGINAL receipt even after the row moves.
@@ -1260,6 +1355,19 @@ pub trait JobsRepository: Send + Sync {
         let _ = (id, actor, command_id);
         Err(JobsError::Storage(
             "conditional metadata receipt lookup is unsupported by this adapter".into(),
+        ))
+    }
+
+    /// Every conditional receipt this packet retains, every actor's, in no
+    /// order: the history a gate attempt id is judged fresh against
+    /// (backlog 0471152b).
+    async fn conditional_job_metadata_receipts(
+        &self,
+        id: &JobId,
+    ) -> Result<Vec<crate::conditional_metadata::Receipt>, JobsError> {
+        let _ = id;
+        Err(JobsError::Storage(
+            "conditional metadata receipt history is unsupported by this adapter".into(),
         ))
     }
 
@@ -1690,16 +1798,30 @@ pub trait JobsRepository: Send + Sync {
 
     /// A signer guard is checked under the actual row/event writers, and again
     /// before Pg COMMIT dispatch. An adapter with no such owner refuses it.
+    ///
+    /// `expect` is a precondition on the row's metadata, judged under the
+    /// same lock as the write ([`crate::step_metadata_write::metadata_still_reads`]):
+    /// a row that no longer reads so is refused with
+    /// [`JobsError::StepChanged`] and nothing is written. The release door
+    /// sends the `hold` and `hold_sha` it judged, so a hold written between
+    /// its read and its write is not lifted (review 792b871a N1). An
+    /// adapter that cannot judge it refuses it, as it refuses a guard.
     async fn merge_step_metadata_guarded_at(
         &self,
         id: &StepId,
         patch: &serde_json::Map<String, serde_json::Value>,
         stamp: &boss_core::publisher::EventStamp,
         guard: Option<&crate::signer_write::SignerWriteGuard>,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<Step, JobsError> {
         if guard.is_some() {
             return Err(JobsError::Storage(
                 "adapter has no owning signer metadata guard".into(),
+            ));
+        }
+        if expect.is_some() {
+            return Err(JobsError::Storage(
+                "adapter cannot judge a metadata precondition under its write".into(),
             ));
         }
         self.merge_step_metadata_at(id, patch, stamp).await

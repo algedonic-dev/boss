@@ -25,6 +25,7 @@ export default class TimingsReporter implements Reporter {
     this.outputFile = options.outputFile;
   }
 
+  // web-suite-reads: none — names a spec relative to the cwd for the receipt; reads no file
   onTestEnd(test: TestCase, result: TestResult): void {
     const where = `${relative(process.cwd(), test.location.file)}:${test.location.line}`;
     appendTimings(this.outputFile, [timingLine(result.duration, 'mocked', result.status, `${where} › ${test.title}`)]);

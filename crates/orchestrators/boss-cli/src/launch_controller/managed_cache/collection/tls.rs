@@ -177,22 +177,38 @@ mod tests {
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        // Each half returns its own failure as text rather than panicking,
+        // so a red names both, client first (backlog 252491a8: gate 7f5e3cfd
+        // reported only the server's `tls handshake eof`, which is what a
+        // client that gave up mid-handshake looks like from this side).
         let server = tokio::spawn(
             async move {
-                let (socket, _) = listener.accept().await.unwrap();
-                let stream = acceptor.accept(socket).await.unwrap();
+                let (socket, _) = listener
+                    .accept()
+                    .await
+                    .map_err(|error| format!("tcp accept: {error}"))?;
+                let stream = acceptor
+                    .accept(socket)
+                    .await
+                    .map_err(|error| format!("tls accept: {error}"))?;
                 tracing::trace!("known positive TLS log control");
-                serve(stream, endpoint).await
+                serve(stream, endpoint)
+                    .await
+                    .map_err(|error| format!("serve: {error:?}"))
             }
             .with_subscriber(subscriber),
         );
         let certificate = reqwest::Certificate::from_pem(&ca).unwrap();
+        // A hang guard, not a latency bound: at 5 s this test failed whenever
+        // a loaded node paused the process across the request (252491a8,
+        // reproduced with a 7 s SIGSTOP). The gate's whole test step runs
+        // for minutes, so two minutes still ends a genuinely hung server.
         let client = reqwest::Client::builder()
             .no_proxy()
             .tls_built_in_root_certs(false)
             .add_root_certificate(certificate)
             .resolve("boss-managed-cache-collection.boss.svc", address)
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(120))
             .build()
             .unwrap();
         let response = client
@@ -209,9 +225,14 @@ mod tests {
             .body("synthetic private TLS cache")
             .send()
             .await;
-        let served = server.await.unwrap();
-        assert!(served.is_ok());
-        let response = response.unwrap();
+        let served = server.await.expect("the server task panicked");
+        let response = match (response, served) {
+            (Ok(response), Ok(())) => response,
+            (client, server) => panic!(
+                "client: {:?}; server: {server:?}",
+                client.map(|response| response.status())
+            ),
+        };
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let reply: serde_json::Value = response.json().await.unwrap();
         assert_eq!(reply["status"], "retained");

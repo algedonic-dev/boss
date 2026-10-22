@@ -89,6 +89,55 @@ pub struct AutomationActor {
     /// (`automation:rule:` for the dispatcher). `None` for most.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signs_for: Option<String>,
+    /// The read authority recorded for this exact id, or `None` — every
+    /// row until an owner records one (backlog f21804d8, design 600c07d7).
+    /// A role is not a tier: nothing infers this from `role`, from a
+    /// header or from a family's signer, and [`recorded_reader`] is the
+    /// only reader that turns it into an access tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_tier: Option<RecordedTier>,
+}
+
+/// The access tiers an automation row may RECORD (backlog f21804d8,
+/// design 600c07d7, decided 2026-10-17): Auditor, the existing read-only
+/// machinery tier, and nothing else. It admits the operator doors' READS
+/// (`crate::trust::can_read`) and none of their writes
+/// (`crate::trust::is_trusted` asks Operator), and it overrides no policy
+/// leg — every grant a read asks is still asked of the row's role. There
+/// is deliberately no Operator variant: an automation that writes keeps
+/// signing at the tier it is given today, and a recorded tier exists so a
+/// READ-ONLY observer can qualify without one. A bundle or a row naming
+/// any other value is refused, never read as no tier; the SQL CHECK on
+/// `automation_actors.access_tier` spells the same set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecordedTier {
+    Auditor,
+}
+
+impl RecordedTier {
+    /// The column's spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auditor => "auditor",
+        }
+    }
+
+    /// The column's spelling read back; `None` is a value this build
+    /// does not know, which the adapter refuses rather than drops.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "auditor" => Some(Self::Auditor),
+            _ => None,
+        }
+    }
+
+    /// The access tier the policy port judges.
+    pub const fn access_tier(self) -> boss_policy_client::AccessTier {
+        match self {
+            Self::Auditor => boss_policy_client::AccessTier::Auditor,
+        }
+    }
 }
 
 /// Whether `id` is `automation:<slug>` — the Rust spelling of the SQL
@@ -254,6 +303,122 @@ pub fn row_of_record<'a>(rows: &'a [AutomationActor], actor: &str) -> Option<&'a
     })
 }
 
+/// The policy caller an automation's RECORDED read authority makes, or
+/// why there is none (backlog f21804d8, design 600c07d7, decided
+/// 2026-10-17).
+///
+/// WHY. The movement observer (`automation:yard-mover`) must qualify
+/// for the complete native graph — job Read, estate Read, workflow Read,
+/// the draft read and an Operator-or-Auditor tier for the machinery
+/// reads (`crate::trust::can_read`). The registry recorded its role and
+/// no tier, and the only tier rule there was (`super::door::judge`)
+/// infers Operator for agent-shaped ids from a role, which is exactly
+/// the inference the design refuses for an automation. So the tier is a
+/// recorded field and this is its one reader. It answers ONLY:
+///
+/// - an exact `automation:<slug>` id — a family member (an id a signer's
+///   `signs_for` answers) is refused, because a recorded authority is
+///   the exact id's, never a prefix's;
+/// - whose row is present exactly once and valid;
+/// - and records a tier.
+///
+/// There is no tier input: what a caller says about itself, in a header
+/// or anywhere else, is not read. The role is the row's role, so every
+/// policy leg is still asked of it and an Auditor tier overrides none.
+pub fn recorded_reader(
+    rows: &[AutomationActor],
+    actor: &str,
+) -> Result<boss_policy_client::User, String> {
+    if !is_automation_id(actor) {
+        return Err(format!(
+            "{actor} is not an exact {AUTOMATION_PREFIX}<slug> id; a recorded read authority \
+             is an automation row's own, never a family member's, an agent's or a person's"
+        ));
+    }
+    let matching: Vec<&AutomationActor> = rows.iter().filter(|a| a.id == actor).collect();
+    let row = match matching.as_slice() {
+        [row] => *row,
+        [] => {
+            return Err(format!(
+                "{actor} has no automation registry row; a recorded read authority needs its \
+                 exact row"
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "{actor} has {} automation registry rows; refusing an ambiguous authority",
+                matching.len()
+            ));
+        }
+    };
+    validate_automation(row)?;
+    let tier = row.access_tier.ok_or_else(|| {
+        format!(
+            "{actor} (role {}) records no access tier; a role is not a tier, and none is \
+             inferred",
+            row.role
+        )
+    })?;
+    Ok(boss_policy_client::User {
+        id: row.id.clone(),
+        role: row.role.clone(),
+        access_tier: tier.access_tier(),
+        territory_account_ids: Vec::new(),
+        direct_report_ids: Vec::new(),
+        department: None,
+    })
+}
+
+/// [`recorded_reader`] again, for a caller already resolved once: the
+/// answer must be the SAME caller — id, role and tier — or it is
+/// refused. A long-running reader asks this before each phase of its
+/// I/O, so a row whose role changed, whose tier was revoked or which was
+/// removed since startup stops the reader instead of riding the
+/// startup's answer. A `prior` that was never this registry's answer (a
+/// tier the caller asserted) is refused the same way.
+pub fn recorded_reader_again(
+    rows: &[AutomationActor],
+    prior: &boss_policy_client::User,
+) -> Result<boss_policy_client::User, String> {
+    let current = recorded_reader(rows, &prior.id)?;
+    if current != *prior {
+        return Err(format!(
+            "{}'s recorded read authority changed since it was resolved (role {} at {:?}, now \
+             role {} at {:?}); refusing",
+            prior.id, prior.role, prior.access_tier, current.role, current.access_tier
+        ));
+    }
+    Ok(current)
+}
+
+/// [`recorded_reader`] over the registry port: a dark or failing
+/// registry is a refusal, never a default.
+pub async fn resolve_recorded_reader(
+    registry: &dyn super::AgentsRegistry,
+    actor: &str,
+) -> Result<boss_policy_client::User, String> {
+    let rows = registry
+        .list_automations()
+        .await
+        .map_err(|e| format!("automation registry unreadable; {actor} is not qualified: {e}"))?;
+    recorded_reader(&rows, actor)
+}
+
+/// [`recorded_reader_again`] over the registry port, failing closed the
+/// same way.
+pub async fn reresolve_recorded_reader(
+    registry: &dyn super::AgentsRegistry,
+    prior: &boss_policy_client::User,
+) -> Result<boss_policy_client::User, String> {
+    let rows = registry.list_automations().await.map_err(|e| {
+        format!(
+            "automation registry unreadable; {} is not qualified: {e}",
+            prior.id
+        )
+    })?;
+    recorded_reader_again(&rows, prior)
+}
+
 /// Every `automation:*` writer in `writers` (id → how many facts it
 /// wrote) that no row answers for, most prolific first, then by id.
 /// The report the registry exists to make: a new automation that
@@ -295,6 +460,10 @@ pub fn differs(held: &AutomationActor, declared: &AutomationActor) -> Vec<&'stat
         ("role", held.role != declared.role),
         ("description", held.description != declared.description),
         ("signs_for", held.signs_for != declared.signs_for),
+        // A recorded tier is an owner's act on the instance: a bundle
+        // that declares one never stamps it over a held row, and one
+        // that omits it never revokes it (design 600c07d7).
+        ("access_tier", held.access_tier != declared.access_tier),
     ]
     .into_iter()
     .filter_map(|(f, d)| d.then_some(f))
@@ -360,7 +529,156 @@ mod tests {
             role: "platform-admin".to_string(),
             description: "a test automation".to_string(),
             signs_for: signs_for.map(str::to_string),
+            access_tier: None,
         }
+    }
+
+    fn reader(id: &str, role: &str) -> AutomationActor {
+        AutomationActor {
+            role: role.to_string(),
+            access_tier: Some(RecordedTier::Auditor),
+            ..row(id, None)
+        }
+    }
+
+    /// THE RECORDED TIER IS THE EXACT ROW'S, AND NOTHING ELSE ANSWERS
+    /// (backlog f21804d8, design 600c07d7). The observer's own row, holding
+    /// its own role at the recorded tier, is a reader; a row with no tier,
+    /// no row, a FAMILY member of a tiered signer, an agent and a person
+    /// are refused — each by name, none with a default.
+    #[test]
+    fn only_an_exact_row_recording_a_tier_is_a_recorded_reader() {
+        use boss_policy_client::AccessTier;
+        let rows = vec![
+            reader("automation:yard-mover", "audit-readonly"),
+            row("automation:train-conductor", None),
+            AutomationActor {
+                access_tier: Some(RecordedTier::Auditor),
+                ..row("automation:dispatcher", Some("automation:rule:"))
+            },
+        ];
+        let got = recorded_reader(&rows, "automation:yard-mover").unwrap();
+        assert_eq!(got.id, "automation:yard-mover");
+        assert_eq!(
+            got.role, "audit-readonly",
+            "the row's role, not a wider one"
+        );
+        assert_eq!(got.access_tier, AccessTier::Auditor);
+        assert!(crate::trust::can_read(&got), "it reads the machinery");
+        assert!(!crate::trust::is_trusted(&got), "and writes none of it");
+
+        for (actor, says) in [
+            ("automation:train-conductor", "records no access tier"),
+            ("automation:absent", "no automation registry row"),
+            ("automation:rule:converge-on-merge", "exact"),
+            ("agent-claude", "exact"),
+            ("emp-david", "exact"),
+            ("automation:", "exact"),
+        ] {
+            let why = recorded_reader(&rows, actor).unwrap_err();
+            assert!(why.contains(says), "{actor}: {why}");
+        }
+        // Two rows for one id are an ambiguous authority, not the first.
+        let twice = [rows.clone(), vec![reader("automation:yard-mover", "x")]].concat();
+        assert!(
+            recorded_reader(&twice, "automation:yard-mover")
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+    }
+
+    /// A RESOLVED READER IS RE-ASKED, AND A CHANGE STOPS IT. The same
+    /// answer passes; a changed role, a revoked tier, a removed row, and a
+    /// prior the registry never gave — the caller's own claim of Operator,
+    /// or of a role the row does not hold — are each refused.
+    #[test]
+    fn a_reresolution_refuses_a_change_a_revocation_and_an_asserted_tier() {
+        use boss_policy_client::AccessTier;
+        let rows = vec![reader("automation:yard-mover", "audit-readonly")];
+        let prior = recorded_reader(&rows, "automation:yard-mover").unwrap();
+        assert_eq!(recorded_reader_again(&rows, &prior).unwrap(), prior);
+
+        let changed_role = vec![reader("automation:yard-mover", "platform-admin")];
+        assert!(
+            recorded_reader_again(&changed_role, &prior)
+                .unwrap_err()
+                .contains("changed")
+        );
+        let revoked = vec![row("automation:yard-mover", None)];
+        assert!(
+            recorded_reader_again(&revoked, &prior)
+                .unwrap_err()
+                .contains("no access tier")
+        );
+        assert!(
+            recorded_reader_again(&[], &prior)
+                .unwrap_err()
+                .contains("no automation registry row")
+        );
+        let asserted = boss_policy_client::User {
+            access_tier: AccessTier::Operator,
+            ..prior.clone()
+        };
+        assert!(
+            recorded_reader_again(&rows, &asserted)
+                .unwrap_err()
+                .contains("changed")
+        );
+        let borrowed_role = boss_policy_client::User {
+            role: "platform-admin".into(),
+            ..prior.clone()
+        };
+        assert!(recorded_reader_again(&rows, &borrowed_role).is_err());
+    }
+
+    /// A bundle may spell the one recordable tier and nothing else: an
+    /// Operator tier, or any word this build does not know, is refused,
+    /// never read as no tier.
+    #[test]
+    fn a_file_records_auditor_and_refuses_any_other_tier() {
+        let text = "[[automation]]\nid = \"automation:yard-mover\"\nrole = \"audit-readonly\"\n\
+                    description = \"the movement observer\"\naccess_tier = \"auditor\"\n";
+        let got = parse_automation_file(text, "yard-mover").unwrap();
+        assert_eq!(got.access_tier, Some(RecordedTier::Auditor));
+        for other in ["operator", "user", "Auditor", ""] {
+            let bad = text.replace("\"auditor\"", &format!("\"{other}\""));
+            assert!(
+                parse_automation_file(&bad, "yard-mover").is_err(),
+                "{other:?} is recorded"
+            );
+        }
+        assert_eq!(RecordedTier::parse("auditor"), Some(RecordedTier::Auditor));
+        assert_eq!(RecordedTier::parse("operator"), None);
+        assert_eq!(RecordedTier::Auditor.as_str(), "auditor");
+    }
+
+    /// The seed never stamps a tier over a held row and never revokes one:
+    /// a bundle and a held row that differ on it keep the held row, named.
+    #[test]
+    fn the_seed_keeps_a_held_tier_and_never_stamps_one() {
+        let held = vec![
+            row("automation:a", None),
+            reader("automation:b", "platform-admin"),
+        ];
+        let declared = vec![
+            reader("automation:a", "platform-admin"),
+            row("automation:b", None),
+        ];
+        let out = classify(&held, &declared);
+        assert!(out.inserted.is_empty() && out.present.is_empty());
+        assert_eq!(
+            out.kept,
+            [
+                KeptAutomation {
+                    id: "automation:a".into(),
+                    differs: vec!["access_tier"]
+                },
+                KeptAutomation {
+                    id: "automation:b".into(),
+                    differs: vec!["access_tier"]
+                },
+            ]
+        );
     }
 
     fn writers(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {

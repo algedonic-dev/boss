@@ -633,6 +633,55 @@ pub struct HeldCar {
     /// and on a payload from an older server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release: Option<crate::car_release::Decision>,
+    /// The release rule's own record of why it LEFT this car held — the
+    /// door's refusal as the door said it, written once on the review
+    /// step as [`crate::car::AUTO_RELEASE`] (backlog 60993cda). A held
+    /// car the rule tried and failed to release looked the same as one
+    /// nobody tried; "a troubled packet must look troubled". `None` when
+    /// the rule never refused this car, and on an older payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_release: Option<AutoRelease>,
+}
+
+/// The release rule's refusal record on a held car's review step
+/// (`{review, outcome, why, by, at}`, written by the dispatcher's
+/// `jobs.release_on_review`), as the yard's row carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoRelease {
+    /// The reviewer's run the rule asked about.
+    pub review: Option<String>,
+    /// `refused` — the only outcome the rule records.
+    pub outcome: Option<String>,
+    /// Why, in the door's (or the rule's) own words.
+    pub why: String,
+    /// The rule, as `automation:rule:<name>`.
+    pub by: Option<String>,
+    /// When the rule fired.
+    pub at: Option<String>,
+}
+
+/// The [`AutoRelease`] record on these steps' review step, when there is
+/// one. A record not in the rule's shape is still SHOWN, never dropped:
+/// its whole text becomes the `why`, so an unreadable note reads as one.
+pub fn car_auto_release(steps: &[Step]) -> Option<AutoRelease> {
+    let rec = find_step(steps, &REVIEW)?
+        .metadata
+        .get(crate::car::AUTO_RELEASE)
+        .filter(|v| !v.is_null())?;
+    let text = |k: &str| {
+        rec.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Some(AutoRelease {
+        review: text("review"),
+        outcome: text("outcome"),
+        why: text("why").unwrap_or_else(|| format!("an unreadable release-rule record: {rec}")),
+        by: text("by"),
+        at: text("at"),
+    })
 }
 
 /// The two brakes that hold a car on the dock ([`dock_lanes`]).
@@ -749,6 +798,7 @@ pub fn dock_lanes(dock_cars: &[(Job, Vec<Step>)]) -> (Vec<DockCar>, Vec<HeldCar>
                 reason,
                 kind,
                 release: None,
+                auto_release: car_auto_release(steps),
             }),
             None => parked.push(dock_car(job)),
         }
@@ -2168,11 +2218,15 @@ fn failed_line(steps: &[Step]) -> Option<String> {
 pub struct ActiveGate {
     pub branch: String,
     pub packet_id: String,
-    /// When the gate-run opened: the `opened_at` instant `boss gate`
-    /// stamps (RFC3339) when the packet carries one, else the row's
-    /// `opened_on` date (see [`opened_since`]). A string either way — a
-    /// reader that parses an instant gets the elapsed time a gate bay
-    /// needs; one that only knew the date keeps reading.
+    /// When the run began occupying its bay: its [`LAUNCHED_AT`] stamp
+    /// (its Job was created), else — a run with no launch stamp, filed
+    /// and started in one act — the `opened_at` instant `boss gate`
+    /// stamps (RFC3339), else the row's `opened_on` date (see
+    /// [`opened_since`]). A string either way — a reader that parses an
+    /// instant gets the elapsed time a gate bay needs; one that only knew
+    /// the date keeps reading. Never the filing of a run that waited in
+    /// line: on 2026-10-17 a bay read "since 16:37" for a gate launched
+    /// after 19:40 (backlog e6e72ee7); its wait is [`Self::queued_seconds`].
     pub since: String,
     /// True when this run has been "active" longer than a gate Job can
     /// physically live: it is not gating, it is a corpse holding a slot.
@@ -2457,9 +2511,17 @@ fn queued_gates(
             }
         })
         .collect();
+    // ONE LINE ACROSS BOTH OWNERS (backlog b56bfc29): by the instant
+    // each place was taken — a legacy `queued_at`, a resident's original
+    // acceptance — as the supervisor and a legacy waiter now both count
+    // it, and never every legacy place first. Compared as instants, not
+    // strings: the two owners write different fractional precisions. A
+    // resident whose acceptance cannot be read has no instant and goes
+    // last, unnumbered (`unknown_order` below).
     waiting.sort_by(|a, b| {
-        a.3.cmp(&b.3)
-            .then_with(|| a.0.cmp(&b.0))
+        let (ta, tb) = (parse_instant(&a.0), parse_instant(&b.0));
+        (ta.is_none(), ta)
+            .cmp(&(tb.is_none(), tb))
             .then_with(|| a.1.cmp(&b.1))
     });
     let unknown_order = waiting
@@ -2581,10 +2643,10 @@ fn opened_since(g: &Job) -> String {
 }
 
 /// The in-flight gates, sized to the policy's capacity. Active gate-runs
-/// (open, no verdict yet) are sorted by `since` then `branch` so slot
-/// assignment is deterministic — the same run lands in the same slot
-/// across polls. (`since` is a whole-second `Z` stamp or a date, so the
-/// string order is the time order.)
+/// (open, no verdict yet) are sorted by `since` — the launch, else the
+/// filing — then `branch` so slot assignment is deterministic — the same
+/// run lands in the same slot across polls. (`since` is an RFC3339 UTC
+/// stamp or a date, so the string order is the time order.)
 pub fn gates(
     gate_runs: &[(Job, Vec<Step>)],
     capacity: i32,
@@ -2627,7 +2689,10 @@ pub fn gates_with_acceptances(
             Some(ActiveGate {
                 branch: branch.to_string(),
                 packet_id: g.id.to_string(),
-                since: opened_since(g),
+                // The bay is occupied from its Job, never from the run's
+                // place in line (backlog e6e72ee7): the wait is
+                // `queued_seconds`, not the bay's age.
+                since: launched.map_or_else(|| opened_since(g), str::to_string),
                 stale: match (dead_before, started) {
                     (Some(cutoff), Some(at)) => at < cutoff,
                     _ => false,
@@ -3002,12 +3067,12 @@ pub struct YardStatus {
     pub sidings: Vec<landing::SidingCar>,
 }
 
-/// How many trains each of the handler's two train reads fetches: every
-/// in-flight train (a handful, bounded by policy) and the recent tail.
-/// Named here, beside `RECENT_LIMIT`, so the test that pins the window
-/// (`a_day_of_arrivals_does_not_push_the_open_train_off_the_board`)
-/// seeds exactly one window of arrivals rather than a second copy of
-/// this number (CLAUDE.md §9a).
+/// How many trains the handler's recent-tail read fetches. The in-flight
+/// read is NOT cut at it: it pages to the total (`list_every`), because
+/// one window of open trains with the total dropped hid the rest
+/// (backlog 5d96c12d). Named here, beside `RECENT_LIMIT`, so the tests
+/// that pin both reads seed exactly one window rather than a second
+/// copy of this number (CLAUDE.md §9a).
 pub const TRAIN_WINDOW: i64 = 60;
 
 /// How many gate-runs the handler's RECENCY read fetches — the slots,
@@ -3020,21 +3085,6 @@ pub const TRAIN_WINDOW: i64 = 60;
 /// last two days, so this window is about half a busy day — which is
 /// why a held green is read by its HOLD, never by its place in here.
 pub const GATE_RUN_WINDOW: i64 = 60;
-
-/// The HELD read's page and how many pages it will turn. Not a recency
-/// window — the filter is the hold itself (`metadata_has = "hold"`) —
-/// and the read follows `total` across pages rather than trusting one,
-/// because the newest page is exactly where a long-held green is NOT.
-/// Measured 2026-09-15: 44 gate-runs carry a `hold`, 43 of them train
-/// gates (128b5496 stamps one on every train's own run), accruing at
-/// the train cadence (~20/day) — so one page holds today's record ten
-/// times over and the cap is ~100 days of train gates away. Past it the
-/// read warns rather than pretends; the durable fix is a hold marker
-/// the train gate does not share, or a filter that can say "not a train
-/// gate". Public for the same reason `GATE_RUN_WINDOW` is: the test
-/// that pins the page turn seeds one page plus one.
-pub const HELD_RUN_PAGE: i64 = 400;
-pub const HELD_RUN_PAGES: i64 = 5;
 
 /// How many recent trains the status carries. Enough to read a trend in
 /// arrivals/cancellations without turning the surface into a history log
@@ -6212,11 +6262,57 @@ mod tests {
             Some(at("2026-09-28T02:44:00Z")),
         );
         let a = &g.active[0];
-        assert_eq!(a.since, "2026-09-28T01:44:00Z", "since stays the filing");
+        assert_eq!(
+            a.since, "2026-09-28T02:30:00Z",
+            "a bay is occupied from its launch, never from its place in line"
+        );
         assert_eq!(a.launched_at.as_deref(), Some("2026-09-28T02:30:00Z"));
         assert_eq!(a.queued_seconds, Some(46 * 60), "46 minutes in line");
         assert_eq!(a.running_seconds, Some(14 * 60), "14 minutes running");
         assert!(!a.troubled, "no measured median judges nothing");
+    }
+
+    /// A RUNNING BAY IS DATED FROM ITS LAUNCH (backlog e6e72ee7).
+    /// Measured live 2026-10-19 04:13Z: gate-run f34769a4 took its place
+    /// in line at 03:53:47Z, was filed 03:54:11Z and launched 04:09:22Z,
+    /// and /api/yard/regions labelled bay 3 "gating … since 03:54:11" —
+    /// fifteen minutes of queue read as fifteen minutes of gate. The
+    /// 2026-10-17 case was three hours. The line keeps the wait
+    /// (`queued_seconds`); the bay's `since` is the Job's start, and only
+    /// a run with no launch stamp falls back to its filing, the one
+    /// instant it has (exact for the conductor's train gates, which are
+    /// filed and launched in one act). An unparseable launch stamp is no
+    /// stamp. Slots order by the same instant.
+    #[test]
+    fn a_running_bay_is_dated_from_its_launch_never_its_place_in_line() {
+        let mut waited = gate_run_on("fix/waited", 2);
+        waited.metadata["opened_at"] = json!("2026-10-19T03:54:11.094382901+00:00");
+        waited.metadata[LAUNCHED_AT] = json!("2026-10-19T04:09:22Z");
+        let mut train = gate_run_on("train/20261019-0347", 2);
+        train.metadata["opened_at"] = json!("2026-10-19T03:50:21.360459300+00:00");
+        let mut garbled = gate_run_on("fix/garbled", 2);
+        garbled.metadata["opened_at"] = json!("2026-10-19T04:00:00Z");
+        garbled.metadata[LAUNCHED_AT] = json!("soon-ish");
+        let runs = vec![
+            (waited, vec![in_flight_step()]),
+            (train, vec![in_flight_step()]),
+            (garbled, vec![in_flight_step()]),
+        ];
+        let g = gates(&runs, 3, Some(at("2026-10-19T04:13:00Z")));
+        let by = |b: &str| g.active.iter().find(|a| a.branch == b).unwrap();
+        assert_eq!(by("fix/waited").since, "2026-10-19T04:09:22Z");
+        assert_eq!(by("fix/waited").queued_seconds, Some(15 * 60 + 10));
+        assert_eq!(by("fix/waited").running_seconds, Some(3 * 60 + 38));
+        assert_eq!(
+            by("train/20261019-0347").since,
+            "2026-10-19T03:50:21.360459300+00:00"
+        );
+        assert_eq!(by("fix/garbled").since, "2026-10-19T04:00:00Z");
+        let order: Vec<&str> = g.active.iter().map(|a| a.branch.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["train/20261019-0347", "fix/garbled", "fix/waited"]
+        );
     }
 
     /// A run with no launch stamp — filed before 2026-09-28 — is running
@@ -7983,6 +8079,36 @@ mod resident_queue_tests {
                 .queued
                 .iter()
                 .any(|q| q.waiting_seconds.is_none() && q.queued_at.is_empty())
+        );
+    }
+
+    /// Backlog b56bfc29. The yard drew every resident request behind
+    /// every legacy place, the same rule the resident supervisor counted
+    /// by — so resident dec70bf9, accepted 05:42:37Z on 2026-10-19,
+    /// rendered behind a legacy place taken an hour after it. One line
+    /// across both owners: a legacy place at its `queued_at`, a resident
+    /// one at its original acceptance, oldest first.
+    #[test]
+    fn the_line_interleaves_both_owners_by_when_each_place_was_taken() {
+        let (resident, receipt) = accepted("resident", "2026-10-19T05:42:37Z");
+        let legacy = |branch: &str, queued: &str| {
+            let (mut row, _) = accepted(branch, "2026-10-19T00:00:00Z");
+            row.metadata = json!({"branch": branch, QUEUED_AT: queued});
+            (row, vec![])
+        };
+        let rows = vec![
+            legacy("later-legacy", "2026-10-19T06:43:13Z"),
+            (resident, vec![]),
+            legacy("earlier-legacy", "2026-10-19T05:30:00Z"),
+        ];
+        let view =
+            gates_with_acceptances(&rows, 3, parse_instant("2026-10-19T06:50:00Z"), &[receipt]);
+        assert_eq!(
+            view.queued
+                .iter()
+                .map(|q| (q.branch.as_str(), q.position))
+                .collect::<Vec<_>>(),
+            vec![("earlier-legacy", 1), ("resident", 2), ("later-legacy", 3)]
         );
     }
 

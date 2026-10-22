@@ -449,6 +449,10 @@ async fn handle_event(
             decision_shaped,
             &role_candidates,
             step_model,
+            step_id,
+            step.metadata
+                .as_ref()
+                .and_then(boss_jobs::step_release::released_from),
         )
         .await
         {
@@ -648,7 +652,9 @@ fn executor_for(
 /// Fires only for a REAL, executable step that carries `agent_model`
 /// (car 1's projection of the block onto the packet) and a role among
 /// its candidates; the agent must be active, hold that role and run
-/// that model. Lowest id wins, so the pick is deterministic. `None` is
+/// that model. When several agents do, the configured strategy chooses
+/// among them by the step id (`Spread` live: a stable hash, so the pick
+/// is deterministic per step and shared across the agents). `None` is
 /// "this pick says nothing", and the caller falls through to
 /// `executor_for` — the env's single executor. Measured 2026-09-18 on
 /// the live registry: agent-claude holds `engineering-agent`, every
@@ -676,6 +682,9 @@ fn capability_executor(
     role_candidates: &[&str],
     step_model: Option<&str>,
     roster: &[Employee],
+    strategy: AssignmentStrategy,
+    step_id: &str,
+    released_from: Option<&str>,
 ) -> Option<String> {
     if partition.fails_closed() || decision_shaped {
         return None;
@@ -684,14 +693,41 @@ fn capability_executor(
     if model.is_empty() {
         return None;
     }
-    roster
+    // WHICH of several agents serving the pair (backlog 67d4344b). This
+    // took the lowest id, which was a rule about one agent per model:
+    // once agent-claude-b registered beside agent-claude on opus-5-5,
+    // every step either could run went to agent-claude, and a step
+    // released to the pool came straight back to it. The candidates are
+    // id-sorted and chosen by the configured strategy over the step id —
+    // the same rule `pick_employee` uses across a role's holders — so a
+    // step's pick replays identically and distinct steps spread.
+    let mut agents: Vec<&str> = roster
         .iter()
         .filter(|e| e.is_agent && e.status == "active")
         .filter(|e| role_candidates.contains(&e.role.as_str()))
         .filter(|e| e.models.iter().any(|m| m == model))
         .map(|e| e.id.as_str())
-        .min()
-        .map(str::to_string)
+        .collect();
+    agents.sort_unstable();
+    agents.dedup();
+    // NOT BACK TO THE HOLDER IT WAS RELEASED FROM (backlog ff0f0ff5).
+    // The hash above reads the step id alone, so a step `boss step
+    // release` handed back to the pool was re-nominated to the agent
+    // that had just released it, every time. The release records that
+    // holder on the step (`boss_jobs::step_release`), and while another
+    // agent serves the pair it is left out; alone on the pair it is
+    // still nominated, as before.
+    if let Some(from) = released_from
+        && agents.len() > 1
+    {
+        agents.retain(|id| *id != from);
+    }
+    if agents.is_empty() {
+        return None;
+    }
+    agents
+        .get(pick_index_for(strategy, step_id, agents.len()))
+        .map(|id| id.to_string())
 }
 
 /// `capability_executor` over the SAME TTL-cached roster the role pick
@@ -703,6 +739,8 @@ async fn capability_executor_for(
     decision_shaped: bool,
     role_candidates: &[&str],
     step_model: Option<&str>,
+    step_id: &str,
+    released_from: Option<&str>,
 ) -> Result<Option<String>> {
     let mut cache = ctx.roster.lock().await;
     if roster_is_stale(&cache) {
@@ -715,6 +753,9 @@ async fn capability_executor_for(
         role_candidates,
         step_model,
         &cache.employees,
+        ctx.strategy,
+        step_id,
+        released_from,
     ))
 }
 
@@ -1689,11 +1730,23 @@ mod tests {
         roster.push(agent("agent-haiku", "platform-admin", "haiku-4-5"));
         roster.push(agent("agent-eng", "engineering-agent", "opus-5[1m]"));
         let platform = ["platform-admin"];
+        // Under the legacy `LowestId` strategy; the spread across agents
+        // sharing a model is pinned by
+        // `agents_sharing_a_model_split_its_steps_between_them`.
         let pick = |partition, decision, roles: &[&str], model: Option<&str>| {
-            capability_executor(partition, decision, roles, model, &roster)
+            capability_executor(
+                partition,
+                decision,
+                roles,
+                model,
+                &roster,
+                AssignmentStrategy::LowestId,
+                "step-1",
+                None,
+            )
         };
-        // The case the rule exists for — and the lowest id wins, so the
-        // pick is deterministic across a roster of equals.
+        // The case the rule exists for — and under `LowestId` the lowest
+        // id wins, so the pick is deterministic across a roster of equals.
         assert_eq!(
             pick(Partition::Real, false, &platform, Some("opus-5[1m]")),
             Some("agent-claude".to_string())
@@ -1733,7 +1786,10 @@ mod tests {
                 false,
                 &platform,
                 Some("opus-5[1m]"),
-                &people_only
+                &people_only,
+                AssignmentStrategy::Spread,
+                "step-1",
+                None,
             ),
             None
         );
@@ -1748,9 +1804,153 @@ mod tests {
                 false,
                 &platform,
                 Some("opus-5[1m]"),
-                &retired
+                &retired,
+                AssignmentStrategy::Spread,
+                "step-1",
+                None,
             ),
             None
+        );
+    }
+
+    /// TWO AGENTS ON ONE MODEL SPLIT ITS WORK (backlog 67d4344b). The
+    /// pick took the lowest id, so when agent-claude-b registered beside
+    /// agent-claude (both `platform-admin`, both `opus-5-5`, read live
+    /// 2026-10-18) every step either could run went to agent-claude, a
+    /// step released to the pool was re-nominated to it within seconds
+    /// (car afd61aa2's review, 2026-10-17), and adding an executor added
+    /// no throughput without a hand nomination per step. Under the
+    /// configured `Spread` the pick is the same stable hash of the step
+    /// id the role pick uses: deterministic for one step, so a replay
+    /// nominates the same agent, and spread across distinct steps, so
+    /// each agent sharing the model gets a share. An agent on another
+    /// model is never among them.
+    #[test]
+    fn agents_sharing_a_model_split_its_steps_between_them() {
+        let agent = |id: &str, model: &str| super::Employee {
+            id: id.into(),
+            role: "platform-admin".into(),
+            status: "active".into(),
+            is_agent: true,
+            models: vec![model.into()],
+        };
+        let roster = vec![
+            agent("agent-claude", "opus-5-5"),
+            agent("agent-claude-b", "opus-5-5"),
+            agent("agent-codex", "gpt-6.1-sol"),
+        ];
+        let platform = ["platform-admin"];
+        let pick = |step_id: &str| {
+            capability_executor(
+                Partition::Real,
+                false,
+                &platform,
+                Some("opus-5-5"),
+                &roster,
+                AssignmentStrategy::Spread,
+                step_id,
+                None,
+            )
+        };
+        let mut hits: HashMap<String, usize> = HashMap::new();
+        for n in 0..400 {
+            let step_id = format!("00000000-0000-4000-8000-{n:012x}");
+            let first = pick(&step_id).expect("an agent runs the model");
+            assert_eq!(
+                pick(&step_id).as_deref(),
+                Some(first.as_str()),
+                "one step is always nominated to the same agent"
+            );
+            *hits.entry(first).or_default() += 1;
+        }
+        assert_eq!(
+            hits.keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["agent-claude", "agent-claude-b"].into_iter().collect(),
+            "both agents on the model get work, and the agent on another model none: {hits:?}"
+        );
+        for (agent, n) in &hits {
+            assert!(
+                (100..300).contains(n),
+                "{agent} took {n} of 400 — not a share of the model's work"
+            );
+        }
+    }
+
+    /// A STEP RELEASED TO THE POOL DOES NOT BOUNCE BACK TO ITS HOLDER
+    /// (backlog ff0f0ff5, review 7adb1d44 of car b2a077eb). `Spread`
+    /// hashes the step id alone, so before this a released step — ready,
+    /// unassigned, re-nominated on the next event — went straight back
+    /// to the agent that had just handed it back, every time. The
+    /// release now records `released.from`, and while another agent
+    /// serves the same `(role, model)` the pick leaves that one out. With
+    /// no other agent on the pair it is nominated as before: a release
+    /// is not a refusal of the only executor there is.
+    #[test]
+    fn a_released_step_is_not_renominated_to_the_agent_it_was_released_from() {
+        let agent = |id: &str, model: &str| super::Employee {
+            id: id.into(),
+            role: "platform-admin".into(),
+            status: "active".into(),
+            is_agent: true,
+            models: vec![model.into()],
+        };
+        let roster = vec![
+            agent("agent-claude", "opus-5-5"),
+            agent("agent-claude-b", "opus-5-5"),
+            agent("agent-codex", "gpt-6.1-sol"),
+        ];
+        let platform = ["platform-admin"];
+        let pick = |step_id: &str, roster: &[super::Employee], released: Option<&str>| {
+            capability_executor(
+                Partition::Real,
+                false,
+                &platform,
+                Some("opus-5-5"),
+                roster,
+                AssignmentStrategy::Spread,
+                step_id,
+                released,
+            )
+        };
+        // Both directions: a step whose Spread pick is each agent in turn.
+        for holder in ["agent-claude", "agent-claude-b"] {
+            let step_id = (0..400)
+                .map(|n| format!("00000000-0000-4000-8000-{n:012x}"))
+                .find(|s| pick(s, &roster, None).as_deref() == Some(holder))
+                .expect("Spread names each agent for some step");
+            let other = if holder == "agent-claude" {
+                "agent-claude-b"
+            } else {
+                "agent-claude"
+            };
+            assert_eq!(
+                pick(&step_id, &roster, Some(holder)).as_deref(),
+                Some(other),
+                "released from {holder}, the step goes to the other agent on the model"
+            );
+            // Released from someone who is not the hash pick: unchanged.
+            assert_eq!(
+                pick(&step_id, &roster, Some(other)).as_deref(),
+                Some(holder)
+            );
+            // Released from the ONLY agent serving the pair: still it.
+            let alone = vec![agent(holder, "opus-5-5")];
+            assert_eq!(
+                pick(&step_id, &alone, Some(holder)).as_deref(),
+                Some(holder),
+                "with no other agent on the pair the release is not a refusal"
+            );
+        }
+        // And the record is read off the step's metadata, as the event
+        // payload carries it, through the one reader.
+        let md = serde_json::json!({
+            "released": { "why": "w", "by": "agent-claude", "from": "agent-claude-b" }
+        });
+        assert_eq!(
+            boss_jobs::step_release::released_from(&md),
+            Some("agent-claude-b")
         );
     }
 
@@ -1793,7 +1993,16 @@ mod tests {
         // with the row holding the role the step is under — step 1 of
         // the retirement changes nothing here.
         assert_eq!(
-            capability_executor(Partition::Real, false, &platform, None, &roster),
+            capability_executor(
+                Partition::Real,
+                false,
+                &platform,
+                None,
+                &roster,
+                AssignmentStrategy::Spread,
+                "step-1",
+                None,
+            ),
             None
         );
         // ...and the env lane is what names the executor for it.

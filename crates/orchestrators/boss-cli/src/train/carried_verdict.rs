@@ -89,6 +89,19 @@
 //! conductor's clone), so a branch cut before the label landed renders
 //! none: its runner is handed no `GATE_VERDICT_CARRIER`, reports for
 //! itself as before, and is never touched here.
+//!
+//! WHICH CONTAINER IS THE GATE IS THE POD'S OWN SPEC'S TO SAY (backlog
+//! 3e2c8ddc; design b4bf8bba, approved 2026-10-16). On the judged-init
+//! layout `gate` is an INIT container and `seed-refresh` the regular one
+//! after it, so the gate ends on its verdict and is recorded while the
+//! helper still refreshes the seed and empties the workspace — the green
+//! that waited 638 s for its own copy (gate-run 86dd2d48) no longer waits.
+//! The reader takes `gate`'s end from the status list matching where the
+//! spec declares it, exactly once, and never from a container of that
+//! name in the other list. The helper's own end is a separate fact:
+//! once its Job has finished, [`maintenance_record`] reads it into the
+//! closed packet's `seed_maintenance` key, beside the verdict and never
+//! into it.
 
 use super::*;
 
@@ -170,6 +183,23 @@ pub(crate) const MAX_TERMINATION_BYTES: usize = 4096;
 /// The container of the gate pod whose end and message are read.
 const GATE_CONTAINER: &str = "gate";
 
+/// The Job label that says "the gate is an init container and the seed
+/// housekeeping a regular one after it" (design b4bf8bba), and its value.
+/// It only says which finished Jobs owe a [`maintenance_record`]; where
+/// the gate's end is read is decided by the pod's spec.
+pub(crate) const LAYOUT_LABEL: &str = "boss.dev/gate-layout";
+pub(crate) const LAYOUT_JUDGED_INIT: &str = "judged-init";
+
+/// The regular container that runs `infra/gate-runner/seed-refresh.sh
+/// maintain` after a green gate container on the judged-init layout.
+const HELPER_CONTAINER: &str = "seed-refresh";
+
+/// The gate-run metadata key the housekeeping record is written under.
+pub(crate) const SEED_MAINTENANCE_KEY: &str = "seed_maintenance";
+
+/// The helper's record line, as `seed-refresh.sh` writes it.
+const MAINTENANCE_PREFIX: &str = "gate-runner: seed-maintenance v1 ";
+
 const RECEIPT_PREFIX: &str = "gate-runner: receipt ";
 const TRAILER_PREFIX: &str = "gate-runner: receipt-end v1 ";
 
@@ -188,7 +218,10 @@ pub(crate) struct GateJob {
     pub created: String,
     /// Does it carry [`CARRIER_LABEL`]`=`[`CARRIER_POD_LOG`]?
     pub carrier: bool,
-    /// `None` while neither `succeeded` nor `failed` is set.
+    /// Does it carry [`LAYOUT_LABEL`]`=`[`LAYOUT_JUDGED_INIT`]?
+    pub judged_init: bool,
+    /// `None` while neither `succeeded` nor `failed` is set and the Job
+    /// is live by [`crate::gate::job_live`] (backlog db6bdb4f).
     pub finished: Option<Finished>,
 }
 
@@ -218,25 +251,19 @@ pub(crate) fn gate_jobs_from_json(list: &Value) -> Vec<GateJob> {
             let labels = j.pointer("/metadata/labels")?;
             let packet = labels.get("boss.dev/packet")?.as_str()?.to_string();
             let (succeeded, failed) = (count(j, "/status/succeeded"), count(j, "/status/failed"));
-            let finished = (succeeded > 0 || failed > 0).then(|| {
-                let cond = j
-                    .pointer("/status/conditions")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .find(|c| {
-                        matches!(
-                            c.get("type").and_then(Value::as_str),
-                            Some("Failed" | "Complete")
-                        )
-                    });
-                Finished {
-                    failed: failed > 0,
-                    reason: cond.map(|c| text(c, "/reason")).unwrap_or_default(),
-                    at: cond
-                        .map(|c| text(c, "/lastTransitionTime"))
-                        .unwrap_or_default(),
-                }
+            // A pod count OR the bay's own reading of the Job's end. The
+            // counts alone missed a Job that failed before any pod existed
+            // — DeadlineExceeded with `failed: 0` — and held its run open
+            // until the Job's TTL deleted it, a day late (backlog db6bdb4f).
+            let cond = crate::gate::terminal_condition(j);
+            let ended = succeeded > 0 || failed > 0 || !crate::gate::job_live(j);
+            let finished = ended.then(|| Finished {
+                failed: failed > 0
+                    || cond.and_then(|c| c.get("type")).and_then(Value::as_str) == Some("Failed"),
+                reason: cond.map(|c| text(c, "/reason")).unwrap_or_default(),
+                at: cond
+                    .map(|c| text(c, "/lastTransitionTime"))
+                    .unwrap_or_default(),
             });
             Some(GateJob {
                 name: text(j, "/metadata/name"),
@@ -244,6 +271,8 @@ pub(crate) fn gate_jobs_from_json(list: &Value) -> Vec<GateJob> {
                 packet,
                 created: text(j, "/metadata/creationTimestamp"),
                 carrier: labels.get(CARRIER_LABEL).and_then(Value::as_str) == Some(CARRIER_POD_LOG),
+                judged_init: labels.get(LAYOUT_LABEL).and_then(Value::as_str)
+                    == Some(LAYOUT_JUDGED_INIT),
                 finished,
             })
         })
@@ -264,19 +293,81 @@ pub(crate) struct GatePod {
     /// reason, as far as each is stated (`Failed, Evicted; gate waiting:
     /// PodInitializing`). Untrusted text, for a `lost` receipt.
     pub seen: String,
+    /// Does the pod's spec declare `gate` as an INIT container — the
+    /// judged-init layout (design b4bf8bba)?
+    pub judged_init: bool,
+    /// On that layout, the `seed-refresh` helper's end, once it has one.
+    pub maintenance: Option<Ended>,
+    /// The newest pod's resolved image per container (`imageID`, the
+    /// kubelet's, init containers included), for `recorded_by`. The
+    /// manifest names a tag pulled `Always`; this is which build ran
+    /// (design cdf626ac Q1). Empty where the cluster states none.
+    pub image_ids: std::collections::BTreeMap<String, String>,
 }
 
-/// How the `gate` container ended: the kubelet's own account.
+/// How a container ended: the kubelet's own account.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Ended {
     pub exit_code: i64,
     /// `Completed`, `Error`, `OOMKilled`, … — the kubelet's word.
     pub reason: String,
     /// RFC 3339, the kubelet's.
+    pub started_at: String,
+    /// RFC 3339, the kubelet's.
     pub finished_at: String,
-    /// The termination message: what `run.sh` wrote to
+    /// The termination message: what the container wrote to
     /// `/dev/termination-log`. Untrusted text, capped by the kubelet.
     pub message: String,
+}
+
+/// PURE: where the pod's own spec declares `gate` — the status list its
+/// end is read from — or why it declares no single one. Exactly once,
+/// in exactly one of the two lists: a `gate` in both, twice in one, or
+/// in neither has no end this recorder may read (design b4bf8bba: no
+/// falling back to a similarly named container).
+fn gate_status_list(pod: &Value) -> std::result::Result<(&'static str, bool), String> {
+    let declared = |p: &str| {
+        pod.pointer(p)
+            .and_then(Value::as_array)
+            .map(|cs| {
+                cs.iter()
+                    .filter(|c| c.get("name").and_then(Value::as_str) == Some(GATE_CONTAINER))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    match (
+        declared("/spec/containers"),
+        declared("/spec/initContainers"),
+    ) {
+        (1, 0) => Ok(("/status/containerStatuses", false)),
+        (0, 1) => Ok(("/status/initContainerStatuses", true)),
+        (0, 0) => Err("its spec declares no `gate` container".into()),
+        (r, i) => Err(format!(
+            "its spec declares `gate` {r} time(s) as a container and {i} as an init container"
+        )),
+    }
+}
+
+/// PURE: the ONE status named `name` in the list at `list`, `Ok(None)`
+/// while it has none, `Err` when it has more than one.
+fn one_status<'a>(
+    pod: &'a Value,
+    list: &str,
+    name: &str,
+) -> std::result::Result<Option<&'a Value>, String> {
+    let found: Vec<&Value> = pod
+        .pointer(list)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|c| c.get("name").and_then(Value::as_str) == Some(name))
+        .collect();
+    match found.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one)),
+        _ => Err(format!("its status lists `{name}` {} times", found.len())),
+    }
 }
 
 /// PURE: `kubectl get pods -l job-name=<job> -o json`, as facts. The
@@ -295,53 +386,69 @@ pub(crate) fn gate_pod_from_json(list: &Value) -> GatePod {
             .unwrap_or_default()
             .to_string()
     };
-    let newest = items
-        .iter()
-        .max_by_key(|p| text(p, "/metadata/creationTimestamp"));
-    let ended = newest.and_then(|pod| {
-        let gate = pod
-            .pointer("/status/containerStatuses")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .find(|c| c.get("name").and_then(Value::as_str) == Some(GATE_CONTAINER))?;
-        let t = gate.pointer("/state/terminated")?;
+    let end_of = |status: Option<&Value>| {
+        let t = status?.pointer("/state/terminated")?;
         Some(Ended {
             exit_code: t.get("exitCode").and_then(Value::as_i64).unwrap_or(-1),
             reason: text(t, "/reason"),
+            started_at: text(t, "/startedAt"),
             finished_at: text(t, "/finishedAt"),
             message: text(t, "/message"),
         })
-    });
-    let seen = newest
-        .map(|pod| {
-            let waiting = pod
-                .pointer("/status/containerStatuses")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .find(|c| c.get("name").and_then(Value::as_str) == Some(GATE_CONTAINER))
-                .map(|c| text(c, "/state/waiting/reason"))
-                .unwrap_or_default();
-            [
-                text(pod, "/status/phase"),
-                text(pod, "/status/reason"),
-                if waiting.is_empty() {
-                    String::new()
-                } else {
-                    format!("gate waiting: {waiting}")
-                },
-            ]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(", ")
-        })
+    };
+    let Some(pod) = items
+        .iter()
+        .max_by_key(|p| text(p, "/metadata/creationTimestamp"))
+    else {
+        return GatePod::default();
+    };
+    // The gate's status, from the list its spec names — or the reason
+    // there is none to read, said beside the pod's phase.
+    let (gate, judged_init, why) = match gate_status_list(pod) {
+        Ok((list, init)) => match one_status(pod, list, GATE_CONTAINER) {
+            Ok(status) => (status, init, String::new()),
+            Err(why) => (None, init, why),
+        },
+        Err(why) => (None, false, why),
+    };
+    let maintenance = if judged_init {
+        one_status(pod, "/status/containerStatuses", HELPER_CONTAINER)
+            .ok()
+            .and_then(end_of)
+    } else {
+        None
+    };
+    let waiting = gate
+        .map(|c| text(c, "/state/waiting/reason"))
         .unwrap_or_default();
+    let image_ids = ["/status/initContainerStatuses", "/status/containerStatuses"]
+        .iter()
+        .filter_map(|p| pod.pointer(p).and_then(Value::as_array))
+        .flatten()
+        .map(|c| (text(c, "/name"), text(c, "/imageID")))
+        .filter(|(name, id)| !name.is_empty() && !id.is_empty())
+        .collect();
+    let seen = [
+        text(pod, "/status/phase"),
+        text(pod, "/status/reason"),
+        if waiting.is_empty() {
+            String::new()
+        } else {
+            format!("gate waiting: {waiting}")
+        },
+        why,
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join(", ");
     GatePod {
         pods: items.len(),
-        ended,
+        ended: end_of(gate),
         seen,
+        judged_init,
+        maintenance,
+        image_ids,
     }
 }
 
@@ -696,6 +803,10 @@ pub(crate) enum Carried {
 /// recorded — a frame in a running pod's log is not a verdict yet. Ended,
 /// its termination message names the frame; no message, no verdict.
 /// `lost` is irreversible, so each `lost` waits the floor.
+///
+/// Test-only since backlog 301d6c3b: the recorders call [`judge_by`],
+/// which names which of them ran; this is that, as the reconcile pass.
+#[cfg(test)]
 pub(crate) fn judge(
     run: &Value,
     job: &GateJob,
@@ -703,6 +814,22 @@ pub(crate) fn judge(
     log: &str,
     namespace: &str,
     now: DateTime<Utc>,
+) -> Carried {
+    judge_by(run, job, pod, log, namespace, now, RECONCILE_RECORDER)
+}
+
+/// PURE: [`judge`], naming the recorder that ran it in the receipt's
+/// `recorded_by.recorder` — the reconcile pass or the gate-end watch
+/// (backlog 301d6c3b). The name is the only difference: both judge the
+/// same frame by the same rules.
+pub(crate) fn judge_by(
+    run: &Value,
+    job: &GateJob,
+    pod: &GatePod,
+    log: &str,
+    namespace: &str,
+    now: DateTime<Utc>,
+    recorder: &str,
 ) -> Carried {
     let observed_at = crate::sor_client::stamp(now);
     let lost = |found: String| match lost_floor(job, pod, now) {
@@ -787,7 +914,7 @@ pub(crate) fn judge(
     body.insert(
         "recorded_by".into(),
         json!({
-            "recorder": "boss train cadence (conductor reconcile)",
+            "recorder": recorder,
             "carrier": CARRIER_POD_LOG,
             // COPIED, NOT RETYPED — and from where. The verdict and every
             // field of the receipt are the runner's frame; nothing here
@@ -809,6 +936,9 @@ pub(crate) fn judge(
             "sha256": sha256,
             "launched_sha": launched,
             "head_matches_launch": head.map(|h| !launched.is_empty() && h == launched),
+            // Which build ran each container: the kubelet's resolved
+            // imageID, since the manifest names a tag (cdf626ac Q1).
+            "image_ids": pod.image_ids,
             "observed_at": observed_at,
         }),
     );
@@ -903,6 +1033,207 @@ fn lost_receipt(run: &Value, job: &GateJob, found: &str, namespace: &str) -> Str
     format!("{}{CUT}", &receipt[..end])
 }
 
+/// PURE: does this gate-run owe its housekeeping record, and from which
+/// Job? Only once its verdict is no longer owed (the record sits beside a
+/// verdict, never before one), only for the newest Job of the
+/// judged-init layout and only once that Job has FINISHED — the helper,
+/// the sidecar and the pod have all ended, so nothing it says can still
+/// change — and only while the packet does not already carry the key:
+/// written once, never over itself.
+pub(crate) fn maintenance_owed<'a>(run: &Value, jobs: &'a [GateJob]) -> Option<&'a GateJob> {
+    if run.get("kind").and_then(Value::as_str) != Some("gate-run") || verdict_owed(run).is_ok() {
+        return None;
+    }
+    if metadata_map(run).contains_key(SEED_MAINTENANCE_KEY) {
+        return None;
+    }
+    carrier_subject(jobs)
+        .ok()
+        .filter(|job| job.judged_init && job.finished.is_some())
+}
+
+/// PURE: the helper's record line, `seed-refresh.sh maintain`'s one
+/// line, as fields — or why it is not one. Every key once, only the keys
+/// the helper writes, each value in the small alphabet it writes them
+/// in, and the `job=` this Job's own name: the message is the helper's,
+/// and the helper runs main's script, but it is read as strictly as the
+/// gate's trailer is.
+fn maintenance_fields(message: &str, job: &str) -> std::result::Result<Map<String, Value>, String> {
+    const KEYS: [&str; 7] = [
+        "job",
+        "head",
+        "refresh",
+        "refresh_s",
+        "cleanup",
+        "cleanup_s",
+        "deadline_s",
+    ];
+    let line = message.trim_end_matches('\n');
+    if line.trim().is_empty() {
+        return Err("it left no record".into());
+    }
+    if line.lines().count() != 1 {
+        return Err("its record is not one line".into());
+    }
+    let Some(rest) = line.strip_prefix(MAINTENANCE_PREFIX) else {
+        return Err(format!(
+            "its record does not open `{}`",
+            MAINTENANCE_PREFIX.trim()
+        ));
+    };
+    let mut out = Map::new();
+    for field in rest.split(' ') {
+        let (key, value) = field
+            .split_once('=')
+            .ok_or_else(|| format!("its record holds a field with no value: {}", quoted(field)))?;
+        if !KEYS.contains(&key) {
+            return Err(format!("its record holds an unknown field {}", quoted(key)));
+        }
+        if out.contains_key(key) {
+            return Err(format!("its record states `{key}` twice"));
+        }
+        let numeric = key.ends_with("_s");
+        let shaped = !value.is_empty()
+            && value.len() <= 64
+            && value.chars().all(|c| {
+                if numeric {
+                    c.is_ascii_digit()
+                } else {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | ':')
+                }
+            });
+        if !shaped {
+            return Err(format!(
+                "its `{key}` is not of the helper's shape: {}",
+                quoted(value)
+            ));
+        }
+        let v = if numeric {
+            json!(value.parse::<u64>().unwrap_or(0))
+        } else {
+            json!(value)
+        };
+        out.insert(key.to_string(), v);
+    }
+    if let Some(missing) = KEYS.iter().find(|k| !out.contains_key(**k)) {
+        return Err(format!("its record does not state `{missing}`"));
+    }
+    if out.get("job").and_then(Value::as_str) != Some(job) {
+        return Err(format!(
+            "its record names Job {}, not {job}",
+            quoted(out.get("job").and_then(Value::as_str).unwrap_or(""))
+        ));
+    }
+    out.remove("job");
+    Ok(out)
+}
+
+/// PURE: the housekeeping record a finished judged-init Job leaves on its
+/// gate-run (backlog 3e2c8ddc; design b4bf8bba). A SEPARATE FACT from the
+/// verdict: written under [`SEED_MAINTENANCE_KEY`] on a packet whose
+/// verdict is already recorded, never into the receipt, and nothing in it
+/// can strike a car. Three states, none of them guessed:
+///   - `recorded` — the helper ended and its record line is whole: the
+///     refresh and cleanup outcomes and seconds as it measured them, the
+///     kubelet's start and end of the helper beside them, and
+///     `verdict_lead_s` — how long after the gate ended the helper did,
+///     which is how long the verdict no longer waited;
+///   - `not-run` — the gate container ended nonzero, so the helper never
+///     started and the gate emptied its own workspace;
+///   - `unknown` — anything else (the pod gone, the helper never ended,
+///     a record that is not whole), with why.
+pub(crate) fn maintenance_record(job: &GateJob, pod: &GatePod, now: DateTime<Utc>) -> Value {
+    let observed_at = crate::sor_client::stamp(now);
+    let gate_end = pod.ended.as_ref();
+    let mut record = json!({
+        "recorder": RECONCILE_RECORDER,
+        "job": job.name,
+        "job_uid": job.uid,
+        "gate_ended_at": gate_end.map(|e| e.finished_at.clone()),
+        "observed_at": observed_at,
+    });
+    let unknown = |mut record: Value, why: String| {
+        record["state"] = json!("unknown");
+        record["why"] = json!(why);
+        record
+    };
+    if pod.pods == 0 {
+        return unknown(
+            record,
+            "the Job has finished and its pod no longer exists, so the helper's end cannot be read"
+                .into(),
+        );
+    }
+    if !pod.judged_init {
+        return unknown(
+            record,
+            format!(
+                "the Job is labelled {LAYOUT_LABEL}={LAYOUT_JUDGED_INIT} but its pod does not \
+                 declare `gate` as an init container{}",
+                if pod.seen.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", quoted(&pod.seen))
+                }
+            ),
+        );
+    }
+    match gate_end {
+        Some(g) if g.exit_code != 0 => {
+            record["state"] = json!("not-run");
+            record["why"] = json!(format!(
+                "the gate container ended with exit code {}, so the helper never started; a \
+                 gate that is not green empties its own workspace and refreshes no seed",
+                g.exit_code
+            ));
+            return record;
+        }
+        Some(_) => {}
+        None => {
+            return unknown(
+                record,
+                "the gate container never reached `terminated`, so neither it nor the helper \
+                 can be dated"
+                    .into(),
+            );
+        }
+    }
+    let Some(helper) = &pod.maintenance else {
+        return unknown(
+            record,
+            format!("the `{HELPER_CONTAINER}` container never reached `terminated`"),
+        );
+    };
+    record["helper"] = json!({
+        "exit_code": helper.exit_code,
+        "ended": helper.reason,
+        "started_at": helper.started_at,
+        "finished_at": helper.finished_at,
+    });
+    let lead = gate_end.and_then(|g| {
+        let from = DateTime::parse_from_rfc3339(&g.finished_at).ok()?;
+        let to = DateTime::parse_from_rfc3339(&helper.finished_at).ok()?;
+        Some((to - from).num_seconds())
+    });
+    record["verdict_lead_s"] = json!(lead);
+    match maintenance_fields(&helper.message, &job.name) {
+        Ok(fields) => {
+            record["state"] = json!("recorded");
+            for (k, v) in fields {
+                record[k.as_str()] = v;
+            }
+            record
+        }
+        Err(why) => unknown(
+            record,
+            format!(
+                "the `{HELPER_CONTAINER}` container ended with exit code {} and {why}",
+                helper.exit_code
+            ),
+        ),
+    }
+}
+
 /// The cluster, as the recorder needs it — a port, so every decision is
 /// driven by a test and production is `kubectl` under the gates Role.
 /// Async, because both reads wait on the network and the pass runs
@@ -946,6 +1277,23 @@ pub(crate) struct Kubectl {
     pub bound: std::time::Duration,
 }
 
+async fn cluster_command_output(
+    mut command: tokio::process::Command,
+) -> std::io::Result<std::process::Output> {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    // fork/exec may itself wait on filesystem I/O. Keep that synchronous
+    // boundary off the executor whose timer bounds this read. If its waiter
+    // is dropped, the blocking task retains ownership; its eventual Child
+    // result is dropped with kill_on_drop rather than becoming an orphan.
+    let child = tokio::task::spawn_blocking(move || command.spawn())
+        .await
+        .map_err(std::io::Error::other)??;
+    child.wait_with_output().await
+}
+
 impl Default for Kubectl {
     fn default() -> Self {
         Self {
@@ -965,10 +1313,10 @@ impl Kubectl {
             .args(args)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
-        let out = match tokio::time::timeout(self.bound, cmd.output()).await {
+        let out = match tokio::time::timeout(self.bound, cluster_command_output(cmd)).await {
             Ok(out) => out.with_context(|| format!("running {} {what}", self.program))?,
             Err(_) => bail!(
-                "{} {what} did not answer within {}s and was killed",
+                "{} {what} did not answer within {}s; client cleanup remains owned",
                 self.program,
                 self.bound.as_secs_f32()
             ),
@@ -1341,10 +1689,10 @@ pub(crate) mod fixtures {
             ended: Some(Ended {
                 exit_code,
                 reason: reason.into(),
-                finished_at: String::new(),
                 message: message.into(),
+                ..Ended::default()
             }),
-            seen: String::new(),
+            ..GatePod::default()
         }
     }
 
@@ -1358,8 +1706,42 @@ pub(crate) mod fixtures {
     pub(crate) fn running() -> GatePod {
         GatePod {
             pods: 1,
-            ended: None,
             seen: "Running".into(),
+            ..GatePod::default()
+        }
+    }
+
+    /// The record line an honest `seed-refresh.sh maintain` leaves for
+    /// Job `job`.
+    pub(crate) fn maintenance_line(job: &str) -> String {
+        format!(
+            "{MAINTENANCE_PREFIX}job={job} head=26b7e3081a52923879dd07cda85c2f3f74e7abdf \
+             refresh=refreshed refresh_s=412 cleanup=done cleanup_s=37 deadline_s=900\n"
+        )
+    }
+
+    /// A judged-init pod: its gate init container ended green at 19:40,
+    /// and its helper ended at 19:47:29 on `helper_message` — or is still
+    /// running, when that is `None`.
+    pub(crate) fn judged(helper_message: Option<&str>) -> GatePod {
+        GatePod {
+            pods: 1,
+            ended: Some(Ended {
+                exit_code: 0,
+                reason: "Completed".into(),
+                started_at: "2026-10-06T19:01:00Z".into(),
+                finished_at: "2026-10-06T19:40:00Z".into(),
+                message: "the trailer".into(),
+            }),
+            judged_init: true,
+            maintenance: helper_message.map(|m| Ended {
+                exit_code: 0,
+                reason: "Completed".into(),
+                started_at: "2026-10-06T19:40:02Z".into(),
+                finished_at: "2026-10-06T19:47:29Z".into(),
+                message: m.into(),
+            }),
+            ..GatePod::default()
         }
     }
 }
@@ -1415,6 +1797,7 @@ mod tests {
             packet: "run-1".into(),
             created: "2026-10-06T19:00:00Z".into(),
             carrier: true,
+            judged_init: false,
             finished: finished.map(|failed| Finished {
                 failed,
                 reason: if failed {
@@ -1751,8 +2134,8 @@ mod tests {
     fn a_finished_job_whose_gate_container_never_ended_is_lost_not_still_running() {
         let never_ended = GatePod {
             pods: 1,
-            ended: None,
             seen: "Failed, Evicted, gate waiting: PodInitializing".into(),
+            ..GatePod::default()
         };
         let two_hours_on = at() + chrono::Duration::hours(2);
         let got = judge(
@@ -1802,19 +2185,37 @@ mod tests {
         assert!(why.contains("still running"), "{why}");
     }
 
+    /// The spec of a pod of the layout every manifest rendered before the
+    /// judged-init one: postgres the native sidecar, `gate` the container.
+    fn regular_spec() -> Value {
+        json!({"initContainers": [{"name": "postgres", "restartPolicy": "Always"}],
+               "containers": [{"name": "gate"}]})
+    }
+
+    /// The spec of a judged-init pod (design b4bf8bba): `gate` an init
+    /// container after the sidecar, `seed-refresh` the regular one.
+    fn judged_spec() -> Value {
+        json!({"initContainers": [{"name": "postgres", "restartPolicy": "Always"},
+                                  {"name": "gate"}],
+               "containers": [{"name": "seed-refresh"}]})
+    }
+
     #[test]
     fn the_pod_list_is_read_into_the_gate_containers_end() {
         let list = json!({"items": [
             {"metadata": {"name": "old", "creationTimestamp": "2026-10-06T19:00:00Z"},
+             "spec": regular_spec(),
              "status": {"containerStatuses": [{"name": "gate", "state": {"running": {}}}]}},
             {"metadata": {"name": "new", "creationTimestamp": "2026-10-06T19:05:00Z"},
+             "spec": {"initContainers": [{"name": "postgres"}],
+                      "containers": [{"name": "sidecar"}, {"name": "gate"}]},
              "status": {
                 "initContainerStatuses": [{"name": "postgres", "state": {"terminated":
                     {"exitCode": 0, "reason": "Completed", "message": "not the gate's"}}}],
                 "containerStatuses": [
                     {"name": "sidecar", "state": {"terminated": {"exitCode": 9, "message": "no"}}},
                     {"name": "gate", "state": {"terminated": {
-                        "exitCode": 1, "reason": "Error",
+                        "exitCode": 1, "reason": "Error", "startedAt": "2026-10-06T19:01:00Z",
                         "finishedAt": "2026-10-06T19:40:00Z", "message": "the trailer\n"}}}]}}
         ]});
         assert_eq!(
@@ -1824,31 +2225,269 @@ mod tests {
                 ended: Some(Ended {
                     exit_code: 1,
                     reason: "Error".into(),
+                    started_at: "2026-10-06T19:01:00Z".into(),
                     finished_at: "2026-10-06T19:40:00Z".into(),
                     message: "the trailer\n".into(),
                 }),
-                seen: String::new(),
+                ..GatePod::default()
             }
         );
         // A pod that failed before its gate container started: what the
         // cluster says of it, for the `lost` receipt.
-        let evicted = json!({"items": [{"metadata": {"name": "p"}, "status": {
-            "phase": "Failed", "reason": "Evicted",
+        let evicted = json!({"items": [{"metadata": {"name": "p"}, "spec": regular_spec(),
+            "status": {"phase": "Failed", "reason": "Evicted",
             "containerStatuses": [{"name": "gate", "state": {"waiting": {"reason": "PodInitializing"}}}]}}]});
         assert_eq!(
             gate_pod_from_json(&evicted),
             GatePod {
                 pods: 1,
-                ended: None,
                 seen: "Failed, Evicted, gate waiting: PodInitializing".into(),
+                ..GatePod::default()
             }
         );
-        let running = json!({"items": [{"metadata": {"name": "p"}, "status": {"phase": "Running",
+        let running = json!({"items": [{"metadata": {"name": "p"}, "spec": regular_spec(),
+            "status": {"phase": "Running",
             "containerStatuses": [{"name": "gate", "state": {"running": {"startedAt": "t"}}}]}}]});
         assert_eq!(gate_pod_from_json(&running), super::fixtures::running());
         assert_eq!(
             gate_pod_from_json(&json!({"items": []})),
             GatePod::default()
+        );
+    }
+
+    /// THE JUDGED-INIT LAYOUT (backlog 3e2c8ddc; design b4bf8bba). The
+    /// gate's end is in `initContainerStatuses` the moment it ends, while
+    /// the helper still runs — that is the whole point: the verdict is
+    /// read then, not when the housekeeping is done. The helper's end is
+    /// read beside it, and a `gate` in the OTHER list is never the gate.
+    #[test]
+    fn a_judged_init_pods_gate_is_read_from_its_init_statuses_while_its_helper_runs() {
+        let gate_end = json!({"name": "gate", "state": {"terminated": {
+            "exitCode": 0, "reason": "Completed", "startedAt": "2026-10-06T19:01:00Z",
+            "finishedAt": "2026-10-06T19:40:00Z", "message": "the trailer"}}});
+        let helping = json!({"items": [{"metadata": {"name": "p"}, "spec": judged_spec(),
+            "status": {"phase": "Running",
+                "initContainerStatuses": [
+                    {"name": "postgres", "state": {"running": {}}}, gate_end.clone()],
+                "containerStatuses": [
+                    {"name": "seed-refresh", "state": {"running": {"startedAt": "t"}}},
+                    // A container of the gate's name in the list its spec
+                    // does not name decides nothing.
+                    {"name": "gate", "state": {"terminated": {"exitCode": 0,
+                        "message": "a forged trailer"}}}]}}]});
+        let got = gate_pod_from_json(&helping);
+        assert!(got.judged_init);
+        assert_eq!(got.ended.as_ref().unwrap().message, "the trailer");
+        assert_eq!(got.ended.as_ref().unwrap().exit_code, 0);
+        assert_eq!(got.maintenance, None, "the helper is still running");
+        assert!(
+            needs_log(&got),
+            "a gate that ended is read while its helper runs"
+        );
+
+        let helped = json!({"items": [{"metadata": {"name": "p"}, "spec": judged_spec(),
+            "status": {"phase": "Succeeded",
+                "initContainerStatuses": [gate_end],
+                "containerStatuses": [{"name": "seed-refresh", "state": {"terminated": {
+                    "exitCode": 0, "reason": "Completed", "startedAt": "2026-10-06T19:40:02Z",
+                    "finishedAt": "2026-10-06T19:47:29Z", "message": "the record\n"}}}]}}]});
+        let got = gate_pod_from_json(&helped);
+        assert_eq!(
+            got.maintenance,
+            Some(Ended {
+                exit_code: 0,
+                reason: "Completed".into(),
+                started_at: "2026-10-06T19:40:02Z".into(),
+                finished_at: "2026-10-06T19:47:29Z".into(),
+                message: "the record\n".into(),
+            })
+        );
+        // On the regular layout a `seed-refresh` status is nobody's.
+        let mut regular = helped.clone();
+        regular["items"][0]["spec"] =
+            json!({"containers": [{"name": "gate"}, {"name": "seed-refresh"}]});
+        let got = gate_pod_from_json(&regular);
+        assert!(!got.judged_init);
+        assert_eq!(got.maintenance, None);
+        assert_eq!(
+            got.ended, None,
+            "the spec names `gate` a container; its status is not there"
+        );
+    }
+
+    /// A `gate` the spec declares twice, in both lists, or not at all, or
+    /// one its status list carries twice, has NO end: there is no one
+    /// container to take a verdict from, and a finished Job with no end
+    /// settles `lost`, never green (design b4bf8bba).
+    #[test]
+    fn a_gate_the_pod_does_not_declare_exactly_once_has_no_end() {
+        let ended =
+            json!({"name": "gate", "state": {"terminated": {"exitCode": 0, "message": "m"}}});
+        for (spec, why) in [
+            (
+                json!({"initContainers": [{"name": "gate"}], "containers": [{"name": "gate"}]}),
+                "1 time(s) as a container and 1 as an init container",
+            ),
+            (
+                json!({"containers": [{"name": "gate"}, {"name": "gate"}]}),
+                "2 time(s) as a container",
+            ),
+            (
+                json!({"containers": [{"name": "seed-refresh"}]}),
+                "declares no `gate`",
+            ),
+            (Value::Null, "declares no `gate`"),
+        ] {
+            let list = json!({"items": [{"metadata": {"name": "p"}, "spec": spec,
+                "status": {"phase": "Failed", "initContainerStatuses": [ended.clone()],
+                           "containerStatuses": [ended.clone()]}}]});
+            let got = gate_pod_from_json(&list);
+            assert_eq!(got.ended, None, "{why}");
+            assert!(got.seen.contains(why), "{why}: {}", got.seen);
+        }
+        let twice = json!({"items": [{"metadata": {"name": "p"}, "spec": regular_spec(),
+            "status": {"containerStatuses": [ended.clone(), ended]}}]});
+        let got = gate_pod_from_json(&twice);
+        assert_eq!(got.ended, None);
+        assert!(got.seen.contains("lists `gate` 2 times"), "{}", got.seen);
+    }
+
+    /// THE HOUSEKEEPING RECORD (backlog 3e2c8ddc). Written once, beside a
+    /// recorded verdict, from a FINISHED judged-init Job's helper: its own
+    /// outcomes and seconds, the kubelet's dates, and how long the verdict
+    /// no longer waited.
+    #[test]
+    fn a_finished_helper_leaves_its_housekeeping_beside_the_verdict() {
+        let job = GateJob {
+            judged_init: true,
+            ..job(Some(false))
+        };
+        let pod = fixtures::judged(Some(&fixtures::maintenance_line(JOB)));
+        let got = maintenance_record(&job, &pod, at());
+        assert_eq!(got["state"], "recorded", "{got:#}");
+        assert_eq!(got["refresh"], "refreshed");
+        assert_eq!(got["refresh_s"], 412);
+        assert_eq!(got["cleanup"], "done");
+        assert_eq!(got["cleanup_s"], 37);
+        assert_eq!(got["deadline_s"], 900);
+        assert_eq!(got["head"], "26b7e3081a52923879dd07cda85c2f3f74e7abdf");
+        assert_eq!(got["gate_ended_at"], "2026-10-06T19:40:00Z");
+        assert_eq!(got["helper"]["finished_at"], "2026-10-06T19:47:29Z");
+        assert_eq!(
+            got["verdict_lead_s"], 449,
+            "the helper ended 7 min 29 s after the gate: that is what the verdict no longer waits"
+        );
+        assert_eq!(got["job"], JOB);
+        assert!(
+            got.get("verdict").is_none(),
+            "the record never carries a verdict"
+        );
+    }
+
+    /// A gate that did not pass never starts the helper; a pod that is
+    /// gone, a helper that never ended, or a record that is not the
+    /// helper's whole line is UNKNOWN — never a skip, never a success.
+    #[test]
+    fn housekeeping_that_cannot_be_read_is_unknown_and_a_red_gate_ran_none() {
+        let job = GateJob {
+            judged_init: true,
+            ..job(Some(true))
+        };
+        let mut red = fixtures::judged(None);
+        red.ended.as_mut().unwrap().exit_code = 1;
+        let got = maintenance_record(&job, &red, at());
+        assert_eq!(got["state"], "not-run", "{got:#}");
+
+        let gone = GatePod::default();
+        assert_eq!(maintenance_record(&job, &gone, at())["state"], "unknown");
+        let never = fixtures::judged(None);
+        let got = maintenance_record(&job, &never, at());
+        assert_eq!(got["state"], "unknown");
+        assert!(
+            got["why"].as_str().unwrap().contains("never reached"),
+            "{got:#}"
+        );
+        let regular = fixtures::ended("");
+        let got = maintenance_record(&job, &regular, at());
+        assert_eq!(got["state"], "unknown");
+        assert!(
+            got["why"].as_str().unwrap().contains("init container"),
+            "{got:#}"
+        );
+
+        let line = fixtures::maintenance_line(JOB);
+        for (bad, why) in [
+            (line.replace(JOB, "gate-other-00000"), "names Job"),
+            (
+                line.replace("refresh_s=412", "refresh_s=4x2"),
+                "`refresh_s` is not",
+            ),
+            (
+                line.replace(" deadline_s=900", ""),
+                "does not state `deadline_s`",
+            ),
+            (
+                line.replace("cleanup=done", "cleanup=done cleanup=done"),
+                "twice",
+            ),
+            (
+                line.replace("cleanup=done", "verdict=green"),
+                "unknown field",
+            ),
+            (
+                line.replace("refresh=refreshed", "refresh=Refreshed;rm"),
+                "`refresh` is not",
+            ),
+            (format!("{line}{line}"), "not one line"),
+            ("".to_string(), "left no record"),
+            (
+                "gate-runner: receipt-end v1 job=x".to_string(),
+                "does not open",
+            ),
+        ] {
+            let got = maintenance_record(&job, &fixtures::judged(Some(&bad)), at());
+            assert_eq!(got["state"], "unknown", "{why}: {got:#}");
+            assert!(got["why"].as_str().unwrap().contains(why), "{why}: {got:#}");
+        }
+    }
+
+    /// Owed once: after the verdict, for the newest judged-init Job, once
+    /// it has finished, and never again once the packet carries the key.
+    #[test]
+    fn housekeeping_is_owed_once_after_the_verdict_by_a_finished_judged_job() {
+        let judged = GateJob {
+            judged_init: true,
+            ..job(Some(false))
+        };
+        let mut recorded = open_run();
+        recorded["steps"][0]["status"] = json!("completed");
+        recorded["steps"][0]["metadata"] = json!({"verdict": "green"});
+        recorded["status"] = json!("closed");
+        assert_eq!(
+            maintenance_owed(&recorded, std::slice::from_ref(&judged)).map(|j| j.name.as_str()),
+            Some(JOB)
+        );
+        assert!(
+            maintenance_owed(&open_run(), std::slice::from_ref(&judged)).is_none(),
+            "a verdict still owed comes first"
+        );
+        let running = GateJob {
+            finished: None,
+            ..judged.clone()
+        };
+        assert!(
+            maintenance_owed(&recorded, &[running]).is_none(),
+            "the helper may still run"
+        );
+        assert!(
+            maintenance_owed(&recorded, &[job(Some(false))]).is_none(),
+            "a regular-layout Job's housekeeping ran inside its gate"
+        );
+        let mut written = recorded.clone();
+        written["metadata"][SEED_MAINTENANCE_KEY] = json!({"state": "recorded"});
+        assert!(
+            maintenance_owed(&written, std::slice::from_ref(&judged)).is_none(),
+            "written once, never over itself"
         );
     }
 
@@ -1894,6 +2533,45 @@ mod tests {
             panic!("a log with no frame was read as one");
         };
         assert!(why.contains("not the runner's receipt trailer"), "{why}");
+    }
+
+    /// WHICH IMAGE RAN, from the kubelet (design cdf626ac Q1, backlog
+    /// bbc13a4e). The gate image is a tag pulled `Always`, so a receipt
+    /// that names only the manifest's tag cannot say which build judged
+    /// the tree. The newest pod's container statuses carry the resolved
+    /// `imageID` of every container, sidecars included; the recorder
+    /// writes them beside its other facts, never the runner.
+    #[test]
+    fn a_recorded_receipt_names_the_image_digest_each_container_ran() {
+        let gate = "registry.example/boss-ci@sha256:aaaa";
+        let pg = "registry.example/postgres@sha256:bbbb";
+        let list = json!({"items": [{"metadata": {"name": "p", "creationTimestamp": "t"},
+            "status": {
+                "initContainerStatuses": [{"name": "postgres", "imageID": pg,
+                    "state": {"running": {}}}],
+                "containerStatuses": [{"name": "gate", "imageID": gate, "state": {
+                    "terminated": {"exitCode": 0, "reason": "Completed", "message": "m"}}},
+                    {"name": "unpulled", "imageID": "", "state": {"waiting": {}}}]}}]});
+        let pod = gate_pod_from_json(&list);
+        assert_eq!(
+            pod.image_ids,
+            [("gate", gate), ("postgres", pg)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        );
+        let payload = json!({"verdict": "green", "head": HEAD}).to_string();
+        let log = framed(JOB, "green", &payload);
+        let mut ended_pod = ended_on(&first_trailer(&log), 0, "Completed");
+        ended_pod.image_ids = pod.image_ids.clone();
+        let Carried::Record { receipt, .. } =
+            judge(&open_run(), &job(None), &ended_pod, &log, "boss-dev", at())
+        else {
+            panic!("a complete frame is recorded");
+        };
+        let got: Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(got["recorded_by"]["image_ids"]["gate"], gate);
+        assert_eq!(got["recorded_by"]["image_ids"]["postgres"], pg);
     }
 
     /// The receipt is recorded on the packet the JOB names. What it says
@@ -2070,8 +2748,10 @@ mod tests {
                           "labels": {"app": "gate-runner", "boss.dev/packet": "p-a",
                                      "boss.dev/verdict-carrier": "pod-log"}},
              "status": {"failed": 1, "conditions": [
-                {"type": "FailureTarget", "reason": "BackoffLimitExceeded", "lastTransitionTime": "t0"},
-                {"type": "Failed", "reason": "BackoffLimitExceeded", "lastTransitionTime": "t1"}]}},
+                {"type": "FailureTarget", "status": "True", "reason": "BackoffLimitExceeded",
+                 "lastTransitionTime": "t0"},
+                {"type": "Failed", "status": "True", "reason": "BackoffLimitExceeded",
+                 "lastTransitionTime": "t1"}]}},
             {"metadata": {"name": "gate-b-22222", "uid": "u-b",
                           "creationTimestamp": "2026-10-06T19:05:00Z",
                           "labels": {"app": "gate-runner", "boss.dev/packet": "p-b"}},
@@ -2714,40 +3394,316 @@ mod tests {
         }
     }
 
+    // A spawned ticker is not evidence that it was polled. Establish that
+    // before dispatch; the virtual-clock control below separates runtime
+    // blocking from a busy host's wall-clock scheduling (native 439f192d).
+    async fn read_progress<F: std::future::Future>(read: F) -> (F::Output, usize) {
+        let started = std::time::Instant::now();
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = ticks.clone();
+        let (ready, first_poll) = tokio::sync::oneshot::channel();
+        let ticker = tokio::spawn(async move {
+            let mut ready = Some(ready);
+            loop {
+                let sleep = tokio::time::sleep(std::time::Duration::from_millis(20));
+                tokio::pin!(sleep);
+                std::future::poll_fn(|cx| {
+                    let result = std::future::Future::poll(sleep.as_mut(), cx);
+                    if let Some(ready) = ready.take() {
+                        eprintln!("ticker first poll at {:?}", started.elapsed());
+                        ready.send(()).unwrap();
+                    }
+                    result
+                })
+                .await;
+                t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        first_poll.await.unwrap();
+        tokio::pin!(read);
+        let mut first = true;
+        let value = std::future::poll_fn(|cx| {
+            if first {
+                first = false;
+                eprintln!("read first poll/child dispatch at {:?}", started.elapsed());
+            }
+            std::future::Future::poll(read.as_mut(), cx)
+        })
+        .await;
+        let count = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        eprintln!("read returned at {:?}, ticks={count}", started.elapsed());
+        ticker.abort();
+        (value, count)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn read_progress_rejects_a_blocking_process_wait() {
+        let (_dir, program) = stand_in("carried-verdict-blocking-control", "exec sleep 0.4");
+        let (_, ticks) = read_progress(async {
+            // This is the old synchronous process-wait shape. It must fail
+            // the same progress criterion even with Tokio's clock paused.
+            std::process::Command::new(program).output().unwrap()
+        })
+        .await;
+        assert_eq!(ticks, 0, "blocking control unexpectedly allowed progress");
+        assert!(ticks < 5, "the progress detector accepted a blocking wait");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_hung_cluster_read_allows_runtime_progress_on_a_virtual_clock() {
+        let (_dir, program) = stand_in("carried-verdict-virtual-hang", "exec sleep 60");
+        let k = Kubectl {
+            program,
+            bound: std::time::Duration::from_millis(400),
+        };
+        let (result, ticks) = read_progress(k.gate_jobs("boss-dev")).await;
+        let err = result.unwrap_err();
+        assert!(format!("{err:#}").contains("did not answer within"));
+        assert!(
+            ticks >= 5,
+            "runtime blocked during the real child read: {ticks} ticks"
+        );
+    }
+
+    /// The actual fork/exec handshake is held until the executor proves it
+    /// can respond. An independent observer releases it on refusal as well,
+    /// so the negative control cannot deadlock the test runner.
+    ///
+    /// Judged on the runtime's clock, not the machine's (f7b64505). Gate-run
+    /// 595ed42e (2026-10-21, a car touching neither this crate nor this
+    /// test) went red here with "the executor did not tick during the
+    /// actual read: 0": counting 20 ms wall-clock ticks inside a 400 ms
+    /// wall-clock bound measured how long the gate host left this thread
+    /// unscheduled, and one stall past the bound expires the ticker and the
+    /// timeout together. Paused, the clock holds still while the spawn is on
+    /// the blocking pool and moves only when the runtime is idle, so the
+    /// bound expires because the client hung and the ticks count what the
+    /// runtime did meanwhile — and the blocking-wait control above reads 0
+    /// on the same clock. The 600 ms stall below is that gate's
+    /// descheduling, planted: unpaused, it fails this test with "0". The
+    /// observer's wait is only the negative control's deadlock breaker,
+    /// never a measure: an executor blocked in the spawn never answers,
+    /// however long it is given, so it is generous rather than tight.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_exec_handshake_cannot_block_the_runtime_that_bounds_its_read() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (seen_child, mut seen_parent) = UnixStream::pair().unwrap();
+        let (release_child, mut release_parent) = UnixStream::pair().unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (pulse_tx, pulse_rx) = std::sync::mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            let mut byte = [0];
+            seen_parent.read_exact(&mut byte).unwrap();
+            let _ = entered_tx.send(());
+            let responded = pulse_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .is_ok();
+            release_parent.write_all(b"r").unwrap();
+            responded
+        });
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command.arg("60").kill_on_drop(true);
+        // SAFETY: only async-signal-safe read/write syscalls run between
+        // fork and exec. No allocator, runtime, lock or tracing call runs.
+        unsafe {
+            command.pre_exec(move || {
+                rustix::io::write(&seen_child, b"e")?;
+                let mut byte = [0];
+                if rustix::io::read(&release_child, &mut byte)? != 1 {
+                    return Err(std::io::Error::from_raw_os_error(5));
+                }
+                Ok(())
+            });
+        }
+        let ticks = std::sync::Arc::new(AtomicUsize::new(0));
+        let ticking = ticks.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let ticker = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            ticking.fetch_add(1, Ordering::SeqCst);
+            let _ = ready_tx.send(());
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                ticking.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        ready_rx.await.unwrap();
+        let baseline = ticks.load(Ordering::SeqCst);
+        let bound = std::time::Duration::from_millis(400);
+        let began = std::time::Instant::now();
+        let request = tokio::time::timeout(bound, cluster_command_output(command));
+        tokio::pin!(request);
+        let initial = futures::poll!(&mut request);
+        let first_poll = began.elapsed();
+        entered_rx.await.unwrap();
+        let _ = pulse_tx.send(());
+        // The thread goes unscheduled mid-read, as it did under that gate.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let result = match initial {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => request.await,
+        };
+        let operation_ticks = ticks.load(Ordering::SeqCst) - baseline;
+        ticker.abort();
+        let responded = observer.join().unwrap();
+        assert!(
+            result.is_err(),
+            "hanging client escaped its unchanged 0.4s bound"
+        );
+        assert!(
+            responded,
+            "actual exec handshake blocked the executor: first poll {first_poll:?}, operation ticks {operation_ticks}"
+        );
+        // No wall-clock bound on the first poll: it timed the host's
+        // scheduler too, and `responded` already refuses a first poll that
+        // ran the exec — that poll would hold this thread inside the
+        // handshake until the observer gave up. Its duration stays in the
+        // messages, as a diagnosis rather than a verdict.
+        assert!(
+            operation_ticks >= 5,
+            "the executor did not tick during the actual read: {operation_ticks}; first poll {first_poll:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_client_spawned_after_timeout_or_cancellation_is_still_killed_and_reaped() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        for cancelled in [false, true] {
+            let (seen_child, mut seen_parent) = UnixStream::pair().unwrap();
+            let (release_child, mut release_parent) = UnixStream::pair().unwrap();
+            let mut command = tokio::process::Command::new("/bin/sleep");
+            command.arg("60");
+            // SAFETY: getpid and pipe read/write are async-signal-safe;
+            // no allocation, mutex, runtime or tracing runs after fork.
+            unsafe {
+                command.pre_exec(move || {
+                    let pid = rustix::process::getpid().as_raw_pid().to_ne_bytes();
+                    rustix::io::write(&seen_child, &pid)?;
+                    let mut byte = [0];
+                    if rustix::io::read(&release_child, &mut byte)? != 1 {
+                        return Err(std::io::Error::from_raw_os_error(5));
+                    }
+                    Ok(())
+                });
+            }
+            let request = tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(400),
+                    cluster_command_output(command),
+                )
+                .await
+            });
+            let pid = tokio::task::spawn_blocking(move || {
+                let mut bytes = [0; 4];
+                seen_parent.read_exact(&mut bytes).unwrap();
+                i32::from_ne_bytes(bytes)
+            })
+            .await
+            .unwrap();
+            assert!(pid > 0);
+            let path = format!("/proc/{pid}");
+            assert!(tokio::fs::try_exists(&path).await.unwrap());
+            if cancelled {
+                request.abort();
+                assert!(request.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(
+                    request.await.unwrap().is_err(),
+                    "the 0.4s operation timed out"
+                );
+            }
+            // Its waiter has actually ended while fork/exec remains held.
+            // Releasing it must not leave the late-created client alive or
+            // zombie: /proc absence witnesses actual exit AND reaping.
+            assert!(tokio::fs::try_exists(&path).await.unwrap());
+            release_parent.write_all(b"r").unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while tokio::fs::try_exists(&path).await.unwrap() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("late client {pid} survived/remained zombie, cancelled={cancelled}")
+            });
+        }
+    }
+
     /// F5. A client that hangs is killed at the bound and reads as an
     /// error — and the wait is awaited, not blocked on: a timer on the
     /// same single-threaded runtime keeps firing while the read hangs.
     #[tokio::test(flavor = "current_thread")]
     async fn a_hung_cluster_read_is_killed_at_its_bound_and_does_not_block_the_runtime() {
-        let (_dir, program) = stand_in("carried-verdict-kubectl-hang", "exec sleep 60");
+        let (dir, program) = stand_in("carried-verdict-kubectl-hang", "exec sleep 60");
+        let child_started = dir.join("child-started");
+        boss_testing::write_exec(
+            std::path::Path::new(&program),
+            &format!(
+                "#!/bin/sh\nprintf started > '{}'; exec sleep 60\n",
+                child_started.display()
+            ),
+        );
         let k = Kubectl {
             program,
             bound: std::time::Duration::from_millis(400),
         };
         let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let t = ticks.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let ticker = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = ready_tx.send(());
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         });
+        ready_rx.await.unwrap();
+        let baseline = ticks.load(std::sync::atomic::Ordering::SeqCst);
         let started = std::time::Instant::now();
-        let err = k.gate_jobs("boss-dev").await.unwrap_err();
+        let request = k.gate_jobs("boss-dev");
+        tokio::pin!(request);
+        // Keep the first poll separate from asynchronous waiting. The
+        // independent exec-handshake control rejects synchronous spawning.
+        if let std::task::Poll::Ready(result) = futures::poll!(&mut request) {
+            panic!(
+                "hanging client ended on its first poll after {:?}: {result:?}",
+                started.elapsed()
+            );
+        }
+        let first_poll = started.elapsed();
+        let err = request.await.unwrap_err();
         let took = started.elapsed();
         ticker.abort();
+        let child_started_at =
+            std::fs::metadata(&child_started).and_then(|metadata| metadata.modified());
+        eprintln!("child-start marker at {child_started_at:?}, timeout at {took:?}");
+        assert!(child_started.exists(), "the stand-in child never started");
         assert!(
             format!("{err:#}").contains("did not answer within"),
             "{err:#}"
         );
         assert!(
             took < std::time::Duration::from_secs(10),
-            "a hung client held the pass {took:?}"
+            "a hung client held the pass {took:?}; first poll {first_poll:?}; asynchronous wait {:?}; ticker {}; error {err:#}",
+            took.saturating_sub(first_poll),
+            ticks
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .saturating_sub(baseline)
         );
         assert!(
-            ticks.load(std::sync::atomic::Ordering::SeqCst) >= 5,
-            "the runtime was blocked while the read hung ({} ticks)",
-            ticks.load(std::sync::atomic::Ordering::SeqCst)
+            ticks
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .saturating_sub(baseline)
+                >= 5,
+            "the runtime was blocked while the read hung ({} ticks); first poll {first_poll:?}; total {took:?}; error {err:#}",
+            ticks
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .saturating_sub(baseline)
         );
         let log_err = k.gate_log("boss-dev", "gate-x-1").await.unwrap_err();
         assert!(format!("{log_err:#}").contains("did not answer within"));
@@ -2834,7 +3790,7 @@ mod tests {
             None,
             "nothing to say while it works"
         );
-        let why = "kubectl did not answer within 30s and was killed";
+        let why = "kubectl did not answer within 30s; client cleanup remains owned";
         let first = cluster_read_line(&latch, Some(why), at()).expect("the first failure is said");
         assert!(
             first.contains("did not answer within 30s") && first.contains("said again every 60"),

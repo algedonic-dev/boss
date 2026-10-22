@@ -121,11 +121,23 @@ impl Fixture {
     /// value, or `None` for unset — the pod's own case, since nothing
     /// in its manifest sets one.
     fn bound(&self, cwd: &Path, jobs: Option<&str>) -> (i32, String, String) {
+        self.bound_with("bash", &repo_root().join(HELPER), cwd, jobs)
+    }
+
+    /// [`Fixture::bound`] under `shell`, sourcing the helper at `helper`
+    /// — a copy beside a pod-build.env of the test's choosing, or none.
+    fn bound_with(
+        &self,
+        shell: &str,
+        helper: &Path,
+        cwd: &Path,
+        jobs: Option<&str>,
+    ) -> (i32, String, String) {
         let script = format!(
             "set -u\n. '{}' || exit 2\nwt_bound_build_jobs || exit $?\necho \"jobs=${{CARGO_BUILD_JOBS:-unset}}\"\n",
-            repo_root().join(HELPER).display()
+            helper.display()
         );
-        let mut cmd = Command::new("bash");
+        let mut cmd = Command::new(shell);
         cmd.arg("-c")
             .arg(script)
             .current_dir(cwd)
@@ -134,12 +146,30 @@ impl Fixture {
             Some(j) => cmd.env("CARGO_BUILD_JOBS", j),
             None => cmd.env_remove("CARGO_BUILD_JOBS"),
         };
-        let out = cmd.output().expect("run the helper");
+        let out = cmd
+            .output()
+            .unwrap_or_else(|e| panic!("run the helper under {shell}: {e}"));
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
+    }
+
+    /// The helper copied into a dir of its own, beside a pod-build.env
+    /// holding `env` — or beside none at all, for `None` — so the
+    /// bound's two refusals can be driven without touching the tree's
+    /// own file. The helper finds the file beside ITSELF, which is why
+    /// the copy, not the env file alone, is what moves.
+    fn helper_beside(&self, env: Option<&str>) -> PathBuf {
+        let dir = self.root.join("helper");
+        boss_testing::create_dir(&dir);
+        let helper = dir.join("wt-target-dir.sh");
+        std::fs::copy(repo_root().join(HELPER), &helper).expect("copy the helper");
+        if let Some(body) = env {
+            boss_testing::write_file(&dir.join("pod-build.env"), body);
+        }
+        helper
     }
 }
 
@@ -220,6 +250,247 @@ fn a_width_already_chosen_is_kept() {
     assert_eq!(rc, 0, "{stdout}{stderr}");
     assert!(stdout.contains("jobs=2"), "{stdout}{stderr}");
     assert_eq!(stderr, "", "nothing was changed, so nothing is said");
+}
+
+/// A MISSING pod-build.env is called missing (backlog 9f7ee428, from
+/// review 9612e118 of car d7b90451, ask 1). The refusal said the file
+/// "sets no CARGO_BUILD_JOBS" whether it was absent or present and
+/// empty, while wt-cargo, which reads the same file, has always told
+/// the two apart — and the two have different repairs: a missing file
+/// is a checkout or a fixture that did not carry it, an empty one is an
+/// edit to the file itself.
+#[test]
+fn a_missing_pod_build_env_is_called_missing() {
+    let f = Fixture::new("jobs-missing-env");
+    let wt = f.worktree("agent-missing");
+    let helper = f.helper_beside(None);
+
+    let (rc, stdout, stderr) = f.bound_with("bash", &helper, &wt, None);
+    assert_eq!(
+        rc, 2,
+        "a linked worktree with no bound refuses: {stdout}{stderr}"
+    );
+    assert!(
+        stderr.contains("is missing"),
+        "the refusal names the file as missing: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("sets no CARGO_BUILD_JOBS"),
+        "a file that is not there sets nothing, and saying so sends the reader to edit it: {stderr:?}"
+    );
+    assert!(!stdout.contains("jobs="), "{stdout}");
+}
+
+/// The other refusal keeps its own words: the file is there and
+/// declares no bound.
+#[test]
+fn a_pod_build_env_that_declares_no_bound_says_so() {
+    let f = Fixture::new("jobs-empty-env");
+    let wt = f.worktree("agent-empty");
+    let helper = f.helper_beside(Some("# a bound used to live here\n"));
+
+    let (rc, stdout, stderr) = f.bound_with("bash", &helper, &wt, None);
+    assert_eq!(rc, 2, "{stdout}{stderr}");
+    assert!(stderr.contains("sets no CARGO_BUILD_JOBS"), "{stderr:?}");
+    assert!(!stderr.contains("is missing"), "{stderr:?}");
+}
+
+/// UNDER dash THE HELPER SAYS IT NEEDS bash (ask 4). It finds
+/// pod-build.env through `BASH_SOURCE`, which dash does not have: dash
+/// printed `Bad substitution`, read the file as `/pod-build.env`, and
+/// refused with the missing-bound text — a refusal naming a file that
+/// was never the one in question. Both of its callers are bash, so the
+/// helper refuses by name rather than guessing a path; a main checkout
+/// is still left alone, as it is under bash.
+#[test]
+fn under_dash_the_bound_says_it_needs_bash() {
+    let f = Fixture::new("jobs-dash");
+    let wt = f.worktree("agent-dash");
+
+    let (rc, stdout, stderr) = f.bound_with("dash", &repo_root().join(HELPER), &wt, None);
+    assert_eq!(rc, 2, "{stdout}{stderr}");
+    assert!(
+        stderr.contains("needs bash"),
+        "the refusal names the shell it needs: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("Bad substitution") && !stderr.contains("CARGO_BUILD_JOBS —"),
+        "dash must not reach the BASH_SOURCE read, nor refuse in the missing-bound words: {stderr:?}"
+    );
+
+    let (rc, stdout, stderr) = f.bound_with("dash", &repo_root().join(HELPER), &f.main, None);
+    assert_eq!(
+        rc, 0,
+        "a main checkout is inert under any shell: {stdout}{stderr}"
+    );
+    assert!(stdout.contains("jobs=unset"), "{stdout}{stderr}");
+}
+
+/// A bare tree holding this tree's gate.sh (and everything
+/// `copy_gate_sh` says it needs), committed, with a LINKED builder
+/// worktree of it — the one shape in which the gate bounds cargo. The
+/// fake `df` reports plenty at startup and trips at the next poll, the
+/// one before the first check, so no mode compiles anything (the trick
+/// a_quick_preflight_refuses_an_untracked_file.rs uses).
+struct LinkedGate {
+    dir: PathBuf,
+    wt: PathBuf,
+}
+
+impl LinkedGate {
+    fn new(label: &str) -> Self {
+        let dir = scratch_dir(&format!("wt-bound-gate-{label}"));
+        let main = dir.join("boss");
+        boss_testing::create_dir(&main.join("infra/lint/lib"));
+        boss_testing::copy_gate_sh(&main);
+        boss_testing::write_file(
+            &main.join("infra/lint/workspace-declares-what-it-runs.sh"),
+            "#!/usr/bin/env bash\nexit 0\n",
+        );
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["config", "user.email", "t@example.invalid"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-qm", "the gate under test"]);
+        let wt = dir.join("trees").join("agent-gate");
+        boss_testing::create_dir(&dir.join("trees"));
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent-gate",
+                wt.to_str().expect("utf8"),
+            ],
+        );
+        let counter = dir.join("df-calls");
+        boss_testing::write_exec(
+            &dir.join("df"),
+            &format!(
+                "#!/usr/bin/env bash\n\
+                 n=$(cat {c} 2>/dev/null || echo 0)\n\
+                 echo $((n+1)) > {c}\n\
+                 echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
+                 for _ in \"$@\"; do if [ \"$n\" -lt 1 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
+                 else echo '/dev/fake 1 1 1048576 99% /'; fi; done\n",
+                c = counter.display()
+            ),
+        );
+        Self { dir, wt }
+    }
+
+    fn run(&self, mode: &str) -> (i32, String, String) {
+        let _ = std::fs::remove_file(self.dir.join("df-calls"));
+        let out = Command::new("bash")
+            .arg(self.wt.join("infra/gate.sh"))
+            .arg(mode)
+            .current_dir(&self.wt)
+            .env("BOSS_GATE_DF_CMD", self.dir.join("df"))
+            .env("BOSS_GATE_MIN_FREE_GB", "12")
+            .env("BOSS_GATE_RECEIPT", self.dir.join("receipt.json"))
+            .env("BOSS_GATE_TRUNK", "HEAD")
+            .env("GIT_CEILING_DIRECTORIES", "")
+            // The pod's own case: nothing has chosen a width. Under
+            // wt-cargo or a gate runner these are set, and a set width
+            // is kept, which would hide everything asserted here.
+            .env_remove("CARGO_BUILD_JOBS")
+            .env_remove("WT_JOBS")
+            .env_remove("CARGO_TARGET_DIR")
+            .output()
+            .unwrap_or_else(|e| panic!("run gate.sh {mode} in {}: {e}", self.wt.display()));
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+}
+
+impl Drop for LinkedGate {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The bound's own announcement, as the helper prints it.
+const BOUND_LINE: &str = "jobs wide, the width wt-cargo builds it at";
+
+/// `copy_gate_sh` CARRIES THE FILE THE BOUND READS (ask 3). The helper
+/// sources pod-build.env through a variable, which the source-line walk
+/// cannot resolve, so a copied gate in a linked worktree had no bound to
+/// read and refused before its first check — a refusal about the
+/// fixture that a test would read as a verdict about the gate.
+#[test]
+fn a_copied_gate_carries_the_bound_its_helper_reads() {
+    let dir = scratch_dir("wt-bound-copy-gate");
+    boss_testing::copy_gate_sh(&dir);
+    let carried = std::fs::read_to_string(dir.join("infra/dev/pod-build.env"))
+        .unwrap_or_else(|e| panic!("copy_gate_sh did not carry infra/dev/pod-build.env: {e}"));
+    let ours = std::fs::read_to_string(repo_root().join("infra/dev/pod-build.env"))
+        .expect("infra/dev/pod-build.env");
+    assert_eq!(
+        carried, ours,
+        "the fixture's bound is this tree's, byte for byte"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE LISTINGS ANSWER BEFORE THE BOUND (ask 2). `--roster`,
+/// `--exclusions` and `--serial-lane` read no tree and run no cargo,
+/// and gate.sh's rule since backlog 13700f6f is that they answer before
+/// EVERY refusal. The bound ran at the top of the script, above that
+/// dispatch: in a linked worktree a listing printed a cargo width it
+/// would never use, and with the bound missing it refused the question.
+#[test]
+fn a_linked_worktrees_listings_answer_without_a_bound_and_state_none() {
+    let g = LinkedGate::new("listings");
+    std::fs::remove_file(g.wt.join("infra/dev/pod-build.env")).ok();
+    for mode in ["--roster", "--exclusions", "--serial-lane"] {
+        let (rc, stdout, stderr) = g.run(mode);
+        assert_eq!(
+            rc, 0,
+            "`gate.sh {mode}` is a listing and answers whatever the bound's state.\n{stdout}{stderr}"
+        );
+        assert!(
+            !stderr.contains(BOUND_LINE) && !stderr.contains("CARGO_BUILD_JOBS"),
+            "a listing runs no cargo, so it states no cargo width and refuses on none: {stderr:?}"
+        );
+    }
+}
+
+/// THE BOUND SPEAKS WHERE CARGO COMPILES, AND ONLY THERE. `--quick`
+/// compiles nothing — it says so in its own closing line — so it states
+/// no width; `--lint` runs clippy and the tree-wide pins, so it is
+/// bounded before them, as before.
+#[test]
+fn the_bound_is_stated_by_lint_and_not_by_quick() {
+    let g = LinkedGate::new("modes");
+
+    let (_, stdout, stderr) = g.run("--quick");
+    assert!(
+        stderr.contains("Refusing to continue before"),
+        "--quick must reach its first check for this to say anything:\n{stdout}{stderr}"
+    );
+    assert!(
+        !stderr.contains(BOUND_LINE),
+        "--quick runs no compiling cargo, so it states no cargo width: {stderr:?}"
+    );
+
+    let (_, stdout, stderr) = g.run("--lint");
+    assert!(
+        stderr.contains(BOUND_LINE) && stderr.contains("runs 4 jobs wide"),
+        "--lint's cargo is still bounded in a linked builder worktree:\n{stdout}{stderr}"
+    );
+    let bound_at = stderr.find(BOUND_LINE).expect("found above");
+    let trip_at = stderr
+        .find("Refusing to continue before")
+        .unwrap_or_else(|| panic!("--lint reached its first check:\n{stdout}{stderr}"));
+    assert!(
+        bound_at < trip_at,
+        "the bound is set before --lint's first check, not after it: {stderr:?}"
+    );
 }
 
 /// §9a — the builder width lives ONCE, in the helper: wt-cargo builds

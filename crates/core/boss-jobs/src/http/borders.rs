@@ -93,6 +93,9 @@ pub(super) async fn yard_borders<R: JobsRepository + 'static, B: EventBus + 'sta
         // The server's clock, so a client ages a last-fired time against
         // it rather than against the browser's.
         obj.insert("now".to_string(), serde_json::json!(now));
+        // When the stations' flow reading was taken, which a map read
+        // may be served from an earlier one (backlog b852ec37).
+        obj.insert("flow_as_of".to_string(), serde_json::json!(rows.flow_as_of));
     }
     Json(v).into_response()
 }

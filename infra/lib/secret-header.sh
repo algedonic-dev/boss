@@ -181,6 +181,17 @@ _secret_header_born() {
 #     not three plain fields, a host with no /proc: its pids mean nothing
 #     here, so only AGE judges it, and only past a day — the age of the
 #     NEWEST thing in it, the directory included.
+# CLOCK SKEW MOVES THAT DAY (backlog f85ebd8a, N-a of review 7c5ecf57).
+# Age is this host's clock now against mtimes some run wrote, so a dead
+# run's directory written while the clock stood AHEAD — a clock stepped
+# back since, or another container's, faster, on a shared volume — reads
+# as young, and waits until the clock has passed its newest file by a
+# day: removal postponed by the skew, the header on disk that long. The
+# reverse, a clock stepped FORWARD by more than a day, ages an unplaced
+# live sender's header early; the day is the margin that absorbs
+# ordinary skew, and a sender this namespace can place is judged by its
+# pid and birth, never by age. Held by
+# a_header_dated_ahead_of_the_clock_waits_rather_than_going.
 # Never a refusal and never a reason to stop: a caller that cannot sweep
 # sends exactly as it would have.
 _secret_header_sweep() {
@@ -565,7 +576,11 @@ machine_token_admits() {
 # re-spells an IPv6 zone id, on two rows the rule withholds.
 #
 # A `proxy =` line in a ~/.curlrc is not judged either: no shell
-# function can see what curl reads from its own config file.
+# function can see what curl reads from its own config file. A sender
+# keeps it out by not reading one — curl's -q, as its FIRST argument —
+# and every sender through infra/lib/curl-through-a-roll.sh does, the
+# dev pod's doors among them (backlog 2b1bf9b4: a group member may
+# create /work/home/.curlrc, root's HOME there).
 #
 # NO_PROXY IS NOT READ: matching it as curl does would be a second copy
 # of curl's rule, and a copy that admits where curl proxies sends the

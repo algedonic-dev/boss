@@ -784,13 +784,17 @@ export function itemAnswer(c: ArrivalCar): ItemAnswer | null {
   return null;
 }
 export type ArrivalSkip = Readonly<{ car_id_short: string | null; reason: string | null }>;
+/** The deploy leg ends at `converged`, the observed deploy. Reports
+ *  filed before backlog 4472781d carried `deployed_at` and
+ *  `merge_to_deploy_s` instead — the merge instant and a 0 — and are
+ *  deliberately not read: a fabricated zero is not a timing. */
 export type ArrivalTimings = Readonly<{
   boarded_at: string | null;
   merged_at: string | null;
-  deployed_at: string | null;
+  converged_at: string | null;
   arrived_at: string | null;
   board_to_merge_s: number | null;
-  merge_to_deploy_s: number | null;
+  merge_to_converge_s: number | null;
   total_s: number | null;
 }>;
 export type ArrivalReport = Readonly<{
@@ -818,10 +822,10 @@ function timings(v: unknown): ArrivalTimings | null {
   return {
     boarded_at: asText(t.boarded_at),
     merged_at: asText(t.merged_at),
-    deployed_at: asText(t.deployed_at),
+    converged_at: asText(t.converged_at),
     arrived_at: asText(t.arrived_at),
     board_to_merge_s: asNumber(t.board_to_merge_s),
-    merge_to_deploy_s: asNumber(t.merge_to_deploy_s),
+    merge_to_converge_s: asNumber(t.merge_to_converge_s),
     total_s: asNumber(t.total_s),
   };
 }
@@ -861,20 +865,20 @@ export function arrivalReport(j: WithSteps): ArrivalReport | null {
 // ETAs. The batching the train does is exactly the coordination cost an
 // ETA answers — but an estimate that looks like a promise is worse than
 // none. So: the numbers come from what recent trains ACTUALLY did
-// (median board→merge, median merge→deploy), a train with no started-at
+// (median board→merge, median merge→converge), a train with no started-at
 // evidence gets its phase and no time, and the chip always wears `~`.
 // ---------------------------------------------------------------------------
 
 export type ArrivalMedians = Readonly<{
   boardToMergeS: number | null;
-  mergeToDeployS: number | null;
+  mergeToConvergeS: number | null;
   /** How many arrivals contributed a usable leg — the estimate's basis. */
   samples: number;
 }>;
 
 export const NO_MEDIANS: ArrivalMedians = {
   boardToMergeS: null,
-  mergeToDeployS: null,
+  mergeToConvergeS: null,
   samples: 0,
 };
 
@@ -905,7 +909,7 @@ export function arrivalMedians(
   window: number = ARRIVAL_SAMPLE_WINDOW,
 ): ArrivalMedians {
   const boardToMerge: number[] = [];
-  const mergeToDeploy: number[] = [];
+  const mergeToConverge: number[] = [];
   let samples = 0;
   for (const j of arrived.slice(0, window)) {
     const t = arrivalReport(j)?.timings ?? null;
@@ -915,19 +919,23 @@ export function arrivalMedians(
         stampAt(step(j, 'pr', 'Open the batched PR')),
         stampAt(step(j, 'merged', 'Merged into main')),
       );
-    const md =
-      t?.merge_to_deploy_s ??
+    // To `converged`, never to `deployed`: the conductor stamps
+    // `deployed` in the same pass as `merged`, so that leg read 0 on
+    // every arrival and an ETA built on it left the converge wait out
+    // (backlog 4472781d).
+    const mc =
+      t?.merge_to_converge_s ??
       legSeconds(
         stampAt(step(j, 'merged', 'Merged into main')),
-        stampAt(step(j, 'deployed', 'Deployed to the playground')),
+        stampAt(step(j, 'converged', 'Cluster converged')),
       );
     if (bm !== null) boardToMerge.push(bm);
-    if (md !== null) mergeToDeploy.push(md);
-    if (bm !== null || md !== null) samples += 1;
+    if (mc !== null) mergeToConverge.push(mc);
+    if (bm !== null || mc !== null) samples += 1;
   }
   return {
     boardToMergeS: median(boardToMerge),
-    mergeToDeployS: median(mergeToDeploy),
+    mergeToConvergeS: median(mergeToConverge),
     samples,
   };
 }
@@ -974,7 +982,7 @@ export function trainEta(j: JobLite, medians: ArrivalMedians, nowMs: number): Et
   const phase = etaPhase(trainStatus(j), ciLamp(j));
   const phaseOnly: Eta = { kind: 'phase', phase };
   const basis = `median of last ${medians.samples} arrivals`;
-  const { boardToMergeS, mergeToDeployS } = medians;
+  const { boardToMergeS, mergeToConvergeS } = medians;
 
   // Remaining seconds on the leg under way, plus whatever legs follow.
   // `startedAt` is the evidence requirement: no stamp, no estimate —
@@ -990,25 +998,26 @@ export function trainEta(j: JobLite, medians: ArrivalMedians, nowMs: number): Et
     return { kind: 'eta', phase, atMs: nowMs + Math.round(left * 1000), basis, progress };
   };
 
-  // Converging renders an elapsed "converging for …", not an ETA: there
-  // is no merge→converge median in `medians`, and inventing a converge
-  // duration would read as a promise. The board reads `convergingSince`
-  // (carried on the row by `toTrainRow`) for the elapsed instead — the
+  // Converging renders an elapsed "converging for …", not an ETA: the
+  // merge→converge median prices the leg a train has not yet entered,
+  // and once it is converging the elapsed is the honest reading. The
+  // board reads `convergingSince` (carried on the row by `toTrainRow`)
+  // for the elapsed instead — the
   // same choice the server model makes (boss-jobs/src/yard.rs, which
   // surfaces convergence as elapsed time, never a projection).
   if (phase === 'converging') return phaseOnly;
 
   if (phase === 'ci' || phase === 'merging') {
-    if (boardToMergeS === null || mergeToDeployS === null) return phaseOnly;
+    if (boardToMergeS === null || mergeToConvergeS === null) return phaseOnly;
     return project(
       stampAt(step(j, 'pr', 'Open the batched PR')),
       boardToMergeS,
-      mergeToDeployS,
+      mergeToConvergeS,
     );
   }
   if (phase === 'deploying') {
-    if (mergeToDeployS === null) return phaseOnly;
-    return project(stampAt(step(j, 'merged', 'Merged into main')), mergeToDeployS, 0);
+    if (mergeToConvergeS === null) return phaseOnly;
+    return project(stampAt(step(j, 'merged', 'Merged into main')), mergeToConvergeS, 0);
   }
   return phaseOnly;
 }

@@ -542,6 +542,12 @@ async fn a_genuine_observation_after_invocation_start_can_qualify_initial_instal
         Progress::Promoted
     );
 }
+/// Catches a hang, never a slow runner: the gate has no per-test bound
+/// and its Job deadline is three hours. Measured 2026-10-21 (f357be08):
+/// the request takes 1-2 ms idle and 10.7-12.1 s with the test pinned at
+/// nice 19 to one CPU beside 24 busy loops (about 0.06% of that CPU), the
+/// starvation under which the old 5 s budget failed 4 runs of 4.
+const HANG_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(300);
 #[tokio::test]
 async fn the_issued_pair_serves_real_tls_only_under_its_own_public_trust() {
     use std::io::{Read, Write};
@@ -560,11 +566,14 @@ async fn the_issued_pair_serves_real_tls_only_under_its_own_public_trust() {
         let acceptor = builder.build();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        // No clock decides this exchange (backlog f357be08). Every wait
+        // below ends on an event the other side always produces: the
+        // client's request, its refusal alert, or its socket closing. The
+        // 5 s read timeout here and the 5 s client timeout below raced the
+        // runner instead: train 2026-10-21 17:43 went red on TimedOut at a
+        // loopback request that needs about a millisecond of CPU.
         let server = std::thread::spawn(move || {
             let (socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
             let Ok(mut stream) = acceptor.accept(socket) else {
                 return false;
             };
@@ -581,9 +590,10 @@ async fn the_issued_pair_serves_real_tls_only_under_its_own_public_trust() {
             .tls_built_in_root_certs(false)
             .add_root_certificate(reqwest::Certificate::from_pem(trust.as_bytes()).unwrap())
             .resolve(HOST, address)
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(HANG_BACKSTOP)
             .build()
             .unwrap();
+        let started = std::time::Instant::now();
         let result = client
             .get(format!("https://{HOST}:{}/", address.port()))
             .send()
@@ -591,12 +601,17 @@ async fn the_issued_pair_serves_real_tls_only_under_its_own_public_trust() {
         assert_eq!(
             result.is_ok(),
             accepted,
-            "TLS request with expected acceptance {accepted} failed: {:?}",
+            "TLS request with expected acceptance {accepted} failed after {:?}: {:?}",
+            started.elapsed(),
             result.as_ref().err()
         );
         if let Ok(response) = result {
             assert_eq!(response.status(), reqwest::StatusCode::OK);
         }
+        // A client that failed before connecting would leave the server in
+        // accept() forever; this connection releases it, and is never
+        // accepted when the client already was.
+        drop(std::net::TcpStream::connect(address));
         assert_eq!(server.join().unwrap(), accepted);
     }
 }

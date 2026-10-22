@@ -2,6 +2,7 @@
 # install-ops-runner.sh — ONE definition of how a host gets an ops
 # runner. Usage: install-ops-runner.sh <estate node id>
 #                install-ops-runner.sh --in-role
+#                install-ops-runner.sh --units
 #
 # Two hosts answer ops-request packets and both install the runner from
 # here: the forge, through infra/forge/install.sh (forge-converge, every
@@ -96,6 +97,31 @@ wants_runner() {
 if [ "${1:-}" = "--in-role" ]; then
     wants_runner
     exit $?
+fi
+
+# THE SECOND PREDICATE: does a runner host get the waker beside it? Not
+# under a tree helper — THE WAKER block below says why — and that is
+# the whole rule. Read by the install below and by `--units`.
+wants_waker() {
+    [ -z "${INSTALL_OPS_RUNNER_TREE_HELPER:-}" ]
+}
+
+# `--units`: every unit a host with BOSS_NODE_ROLES gets from this file,
+# under the INSTALL_OPS_RUNNER_TREE_HELPER its caller installs with, one
+# per line — nothing when it gets no runner — and exit 0. Reads only,
+# like `--in-role`. It exists for the host installers' `beyond-rows`
+# mode, which infra/estate/observe-units.sh watches (backlog 2eae38d4):
+# the waker landed on the forge on 2026-10-20 and that day's reading
+# carried it as `undeclared_units`, running and judged by nothing, so a
+# dead one would have shown only as ops-request queued_s drifting from
+# ~10 s back toward ~33 s while the timer kept every request moving. A
+# host that starts its runner through a tree helper (boss-gcp) gets no
+# waker, so it watches none.
+if [ "${1:-}" = "--units" ]; then
+    wants_runner || exit 0
+    printf '%s\n' boss-ops-runner.timer boss-ops-runner.service
+    if wants_waker; then printf '%s\n' boss-ops-runner-wake.service; fi
+    exit 0
 fi
 
 HOST="${1:?usage: install-ops-runner.sh <estate node id>}"
@@ -239,7 +265,9 @@ refuse() { # <what failed>
 # also waits while boss-ops-runner.service is mid-run, so the cut is
 # behind the pass that retired it, never under it. The timer file goes
 # LAST, so a removal that stops part-way leaves the timer file present
-# and the next tick finishes it. infra/gcp/uninstall-not-in-role.sh and
+# and the next tick finishes it. The waker's files go FIRST (backlog
+# ca6f40c2): it is PartOf= the timer, so the stop that retired the runner
+# already stopped it. infra/gcp/uninstall-not-in-role.sh and
 # its keep set stay untouched: the runner's whole lifecycle is here.
 #
 # The marker's path, the SAME line as in retire-ops-runner.sh, pinned
@@ -324,7 +352,7 @@ if ! wants_runner; then
                 ;;
         esac
         removed=""
-        for f in boss-ops-runner.service.d boss-ops-runner.service boss-ops-runner.timer; do
+        for f in boss-ops-runner-wake.service.d boss-ops-runner-wake.service boss-ops-runner.service.d boss-ops-runner.service boss-ops-runner.timer; do
             [ -e "$ETC/$f" ] || continue
             if ! rm -rf -- "${ETC:?}/$f"; then
                 echo "install-ops-runner: FAILED — $HOST's ops runner is $word ($why) and $ETC/$f could not be removed; removed so far: ${removed:-none}. The next converge tries again." >&2
@@ -339,7 +367,7 @@ if ! wants_runner; then
                  run_summary_field ops_runner "failed: $word ($why), removed $removed, daemon-reload failed"
                  exit 1; }
         left=""
-        for f in boss-ops-runner.service.d boss-ops-runner.service boss-ops-runner.timer; do
+        for f in boss-ops-runner-wake.service.d boss-ops-runner-wake.service boss-ops-runner.service.d boss-ops-runner.service boss-ops-runner.timer; do
             [ -e "$ETC/$f" ] && left="${left:+$left }$ETC/$f"
         done
         if [ -n "$left" ]; then
@@ -400,6 +428,49 @@ fi
     fi
 } >"$ETC/boss-ops-runner.service.d/$HOST.conf" \
     || refuse "could not write the $HOST drop-in, without which the runner has no HOST_ID and refuses every tick"
+
+# THE WAKER (backlog ca6f40c2): boss-ops-runner-wake.service starts a
+# pass the moment a request for this host is filed, where the timer alone
+# left it waiting out the minute's phase (median 33 s on the forge,
+# 2026-10-18/19). infra/ops/ops-runner-wake.sh says why its one act —
+# start the same runner the timer starts — cannot widen what runs. The
+# timer Wants= it and it is PartOf= the timer, so the `enable --now`
+# below brings it up and nothing here starts it: one switch for both.
+#
+# NOT UNDER A TREE HELPER. A runner started through one (boss-gcp's
+# gcp-root-launch.sh) runs under the root tree's SHARED lock until its
+# interpreter exits, and the tree's refresh needs that lock EXCLUSIVE
+# within 120 s. The runner exits within its pass; a waker never does, so
+# it would hold off every refresh of that tree. There the waker is not
+# installed — any left from before goes, so the timer's Wants= finds
+# nothing — and the packet says so; requests wait for the timer as before.
+# Its failure is not the runner's: a waker that did not land costs
+# seconds per request, never the door, so it is said on the packet and
+# never refused.
+WAKE_UNIT="boss-ops-runner-wake.service"
+if ! wants_waker; then
+    gone=""
+    for f in "$WAKE_UNIT.d" "$WAKE_UNIT"; do
+        [ -e "$ETC/$f" ] || continue
+        rm -rf -- "${ETC:?}/$f" && gone="${gone:+$gone }$ETC/$f"
+    done
+    wake_state="not installed: the runner starts through the tree helper $TREE_HELPER, which holds the tree's shared lock for the life of what it starts, and a waker never exits, so it would hold off every refresh; requests here wait for the timer${gone:+ (removed $gone)}"
+elif ! [ -f "$HERE/$WAKE_UNIT" ]; then
+    wake_state="failed: $HERE/$WAKE_UNIT is missing from the tree; requests here wait for the timer"
+elif ! install -m 0644 "$HERE/$WAKE_UNIT" "$ETC/$WAKE_UNIT" \
+    || ! install -d -m 0755 "$ETC/$WAKE_UNIT.d" \
+    || ! printf '[Service]\nEnvironment=HOST_ID=%s\nExecStart=\nExecStart=%s/infra/ops/ops-runner-wake.sh\n' \
+        "$HOST" "$REPO" >"$ETC/$WAKE_UNIT.d/$HOST.conf"; then
+    wake_state="failed: the waker's unit or its $HOST drop-in could not be written under $ETC; requests here wait for the timer"
+else
+    wake_state="installed: $WAKE_UNIT from $REPO, brought up by boss-ops-runner.timer"
+fi
+case "$wake_state" in
+    failed:*) echo "install-ops-runner: waker $wake_state" >&2
+              run_summary_note "install-ops-runner: the ops-request waker on $HOST $wake_state" ;;
+    *) echo "install-ops-runner: waker $wake_state" ;;
+esac
+run_summary_field ops_runner_wake "$wake_state"
 
 # THE UNDO OF A RETIREMENT IS THIS INSTALL (design a79a8067): the role is
 # declared again, so the runner comes back below, and the marker the

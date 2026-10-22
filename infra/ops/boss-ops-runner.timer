@@ -2,8 +2,21 @@
 # so the loop is minutes, not the estate observers' daily cadence.
 # systemd will not start the oneshot while a previous run is still
 # active, so overlapping polls cannot double-answer a packet.
+#
+# THIS TIMER IS THE NET, and it also brings up the waker (backlog
+# ca6f40c2): boss-ops-runner-wake.service starts a pass the moment a
+# request for this host is filed, so a request no longer waits out this
+# timer's phase (median 33 s on the forge, 2026-10-18/19). Wants= starts
+# it with the timer — at boot, and on every converge's `enable --now`,
+# which also restarts a waker that died — and the waker is PartOf= this
+# timer, so whatever stops the timer (retire-ops-runner's one act) stops
+# it too. A host that installs no waker (one whose runner starts through
+# a tree helper — see install-ops-runner.sh) has nothing for Wants= to
+# find, which systemd skips. The cadence below is unchanged and owes the
+# waker nothing; the stall alarm counts in it (RUNNER_CADENCE_S).
 [Unit]
 Description=BOSS ops-request runner poll (about every minute)
+Wants=boss-ops-runner-wake.service
 
 [Timer]
 OnBootSec=2min

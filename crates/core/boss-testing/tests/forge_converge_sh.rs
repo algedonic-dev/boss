@@ -881,6 +881,22 @@ fn a_red_from_boss_gcps_runner_push_leaves_a_line_for_the_judge() {
         .unwrap_or_else(|| panic!("no `output` on the packet: {s}"));
     assert_eq!(output, RED, "{s}");
 
+    // THE WHOLE LINE, HOWEVER LONG (backlog 3f7d5f23, (e)). The copy was
+    // cut at 600 characters, and the sender's key-unconfined line runs
+    // 738-797: the filed item lost the forced command to place and the
+    // closing "No credential byte was sent." The sender bounds every
+    // part it did not write itself, so the line is copied as it is.
+    let long = format!(
+        "RED runner-credential-send/key-unconfined refused: this key reaches a shell on boss-gcp. {}it forces: exec sudo -n /usr/local/libexec/boss/runner-delivery/infra/gcp/runner-credential-recv.sh. No credential byte was sent.",
+        "REMOVE THAT LINE NOW, then place the whole line. ".repeat(14)
+    );
+    assert!(long.len() > 800, "{}", long.len());
+    let c = Converge::new("gcp-runner-red-long");
+    push_says(&c, &long, 1);
+    let out = c.cmd().output().expect("forge-converge.sh runs");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(c.summary()["output"].as_str(), Some(long.as_str()));
+
     // Not yet passes by itself: nothing for the judge.
     let c = Converge::new("gcp-runner-not-yet");
     push_says(

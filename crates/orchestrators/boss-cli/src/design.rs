@@ -213,13 +213,17 @@ pub(crate) fn design_job_body(
 /// and it lived on the other packet — so it rendered as a statement,
 /// and if the operator decided it first the design went unread (David,
 /// bug 4f6019d7: "There is no question, just a statement"). Prose a
-/// person reads, so the short id.
+/// person reads, so the short id — and the design's own packet page as
+/// the place to decide it, which carries its review: the question used
+/// to say `/it/design`, the generic list, and on 25022367 the design it
+/// named never reached that list (backlog ac141c99). The full id rides
+/// only inside that path.
 pub(crate) fn feedback_question(design_title: &str, design_id: &str) -> String {
     let short = &design_id[..8.min(design_id.len())];
     format!(
-        "Decide design '{design_title}' ({short}) at /it/design — deciding it completes this \
-         step: approved when its questions are all decided, and the build goes ahead as the \
-         design proposes."
+        "Decide design '{design_title}' ({short}) at /ux/jobs/{design_id} — answering its \
+         questions there completes this step: approved when they are all decided, and the \
+         build goes ahead as the design proposes."
     )
 }
 
@@ -388,13 +392,41 @@ pub(crate) fn answerable(packet: &Value) -> std::result::Result<DesignRoute, Str
 /// The draft-design completion, in order: `design_id` through the merge
 /// door, then the status-only flip. Merge FIRST — a step's
 /// required-at-done fields are judged when it flips to completed.
+/// The draft disposition that says the design filed for it asks no
+/// question (backlog ac141c99). The answered packet's `design-review`
+/// reads its negative and `build` its positive, so a design that records
+/// its decisions sends no one a decision with nothing in it.
+pub(crate) const RECORDED: &str = "recorded";
+
+/// Is this draft completed `recorded`? Only for a design that asks no
+/// question, and only onto a draft whose contract declares the value:
+/// a packet pinned to an earlier version refuses it at completion, and
+/// that would leave the draft open behind a design already filed. Read
+/// off the step's own `fields`, which the jobs API serves beside it.
+pub(crate) fn draft_records(draft: &Value, no_questions: bool) -> bool {
+    no_questions
+        && draft
+            .get("fields")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|f| f.get("name").and_then(Value::as_str) == Some("disposition"))
+            .filter_map(|f| f.get("field_type").and_then(Value::as_str))
+            .any(|t| t.split('|').any(|v| v.trim() == RECORDED))
+}
+
 pub(crate) fn draft_done_writes(
     feedback: &str,
     draft_step: &str,
     design_id: &str,
+    recorded: bool,
 ) -> [StepWrite; 2] {
+    let mut md = json!({ "design_id": design_id });
+    if recorded {
+        md["disposition"] = json!(RECORDED);
+    }
     [
-        step_merge(feedback, draft_step, json!({ "design_id": design_id })),
+        step_merge(feedback, draft_step, md),
         step_flip(feedback, draft_step),
     ]
 }
@@ -780,29 +812,39 @@ pub async fn run(
                 &feedback[..8]
             );
         } else if let Some(review) = &route.review {
-            let sid = review
-                .get("id")
-                .and_then(Value::as_str)
-                .context("the answered packet's design-review step has no id")?;
-            let (method, path, md) = feedback_question_write(feedback, sid, &title, &id);
-            api(&http, method, &path, Some(md)).await.with_context(|| {
-                format!(
-                    "writing the question onto {}'s design-review (the design {short} is filed \
-                 and carries the edge; only the question is missing)",
-                    &feedback[..8]
-                )
-            })?;
+            // A design that asks no question is RECORDED on a draft that
+            // declares it (ac141c99): the review below is then skipped by
+            // the packet's own route, so no question is written onto a
+            // step no one will ever be handed.
+            let recorded = route
+                .draft
+                .as_ref()
+                .is_some_and(|d| draft_records(d, no_questions));
+            if !recorded {
+                let sid = review
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .context("the answered packet's design-review step has no id")?;
+                let (method, path, md) = feedback_question_write(feedback, sid, &title, &id);
+                api(&http, method, &path, Some(md)).await.with_context(|| {
+                    format!(
+                        "writing the question onto {}'s design-review (the design {short} is \
+                         filed and carries the edge; only the question is missing)",
+                        &feedback[..8]
+                    )
+                })?;
+            }
             // The draft step is done BY THIS VERB, carrying the id it just
             // got back (f90ca046): the record is copied from the filing,
             // never retyped, and completing it is what opens the review —
             // which by now already asks its question, so it is never ready
-            // and empty.
+            // and empty — or, recorded, what opens the build.
             if let Some(draft) = &route.draft {
                 let did = draft
                     .get("id")
                     .and_then(Value::as_str)
                     .context("the answered packet's draft-design step has no id")?;
-                for (method, path, body) in draft_done_writes(feedback, did, &id) {
+                for (method, path, body) in draft_done_writes(feedback, did, &id, recorded) {
                     api(&http, method, &path, Some(body))
                         .await
                         .with_context(|| {
@@ -815,11 +857,32 @@ pub async fn run(
                         })?;
                 }
             }
-            println!(
-                "boss design: {short} answers {} — its design-review now asks for this design, \
-             and deciding the design completes it",
-                &feedback[..8]
-            );
+            if recorded {
+                println!(
+                    "boss design: {short} answers {} — it asks no question, so the draft is \
+                     recorded `{RECORDED}`: no review opens for anyone, and the build goes \
+                     ahead as the design decides",
+                    &feedback[..8]
+                );
+            } else {
+                println!(
+                    "boss design: {short} answers {} — its design-review now asks for this \
+                     design at /ux/jobs/{id}, and deciding the design completes it",
+                    &feedback[..8]
+                );
+                // Said, not hidden: a packet pinned to a version before
+                // ac141c99 cannot take `recorded`, so its review opens
+                // for a person on a design with nothing to decide, and
+                // closes when this design's fold publishes it.
+                if no_questions {
+                    println!(
+                        "boss design: {}'s draft declares no `{RECORDED}` (an earlier version), \
+                         so its design-review opens for a person and closes when {short} is \
+                         folded",
+                        &feedback[..8]
+                    );
+                }
+            }
         }
     }
 
@@ -1104,10 +1167,87 @@ mod tests {
             q.contains("completes this step"),
             "and says that deciding the design is what completes it: {q}"
         );
+        // WHERE to decide it is the design's own packet page, which
+        // carries its review — never the generic list (backlog
+        // ac141c99: "Decide design 195276f0 at /it/design" sent David to
+        // a station the design never reached). The full id rides only
+        // inside the path, which a person follows rather than reads.
         assert!(
-            !q.contains("c6bd173e-3dc9"),
-            "the short id, not the full one — this is prose a person reads"
+            q.contains("/ux/jobs/c6bd173e-3dc9-426f-8fff-866a3b2a6117 "),
+            "the question names the design's own page: {q}"
         );
+        assert!(
+            !q.contains("/it/design"),
+            "and not the generic design list: {q}"
+        );
+        assert_eq!(
+            q.matches("c6bd173e-3dc9").count(),
+            1,
+            "the full id appears once, in the path; the prose names the short one: {q}"
+        );
+    }
+
+    /// A draft is RECORDED — `disposition = "recorded"` — only when the
+    /// design asks no question AND the answered packet's draft declares
+    /// the value (backlog ac141c99). A packet pinned to a version before
+    /// it would refuse the value at completion, which would leave the
+    /// filed design's draft open; so an undeclared draft is completed
+    /// exactly as before, and the verb says what that means.
+    #[test]
+    fn a_draft_is_recorded_only_for_a_design_with_no_questions_on_a_draft_that_declares_it() {
+        let declares = json!({ "id": "s-draft", "fields": [
+            { "name": "design_id", "field_type": "string", "required": true },
+            { "name": "disposition", "field_type": "duplicate|filed|recorded", "required": false },
+        ]});
+        let earlier = json!({ "id": "s-draft", "fields": [
+            { "name": "design_id", "field_type": "string", "required": true },
+            { "name": "disposition", "field_type": "duplicate|filed", "required": false },
+        ]});
+        let bare = json!({ "id": "s-draft" });
+        assert!(draft_records(&declares, true));
+        assert!(
+            !draft_records(&declares, false),
+            "a design with questions is reviewed"
+        );
+        assert!(
+            !draft_records(&earlier, true),
+            "an earlier version cannot take it"
+        );
+        assert!(
+            !draft_records(&bare, true),
+            "a step with no contract cannot either"
+        );
+    }
+
+    /// The value the verb writes is the value the protocol reads: every
+    /// bundled Workflow with a design route declares it on its draft
+    /// (CLAUDE.md 9a — a fact that lives twice gets an equality test).
+    #[test]
+    fn every_bundled_draft_declares_the_recorded_disposition_the_verb_writes() {
+        let bundle =
+            boss_jobs::seed_loader::load_workflows(boss_jobs::registry::platform_bundle_path())
+                .expect("the platform bundle parses");
+        let drafts: Vec<_> = bundle
+            .iter()
+            .filter_map(|w| {
+                w.steps
+                    .iter()
+                    .find(|s| s.title == "draft-design")
+                    .map(|s| (w.kind.clone(), s))
+            })
+            .collect();
+        assert!(
+            drafts.len() >= 2,
+            "backlog-item and user-feedback both carry a design route"
+        );
+        for (kind, draft) in drafts {
+            let step = json!({ "fields": draft.fields });
+            assert!(
+                draft_records(&step, true),
+                "{kind}.draft-design must declare disposition `{RECORDED}`: {:#?}",
+                draft.fields
+            );
+        }
     }
 
     fn packet(steps: Vec<Value>) -> Value {
@@ -1319,7 +1459,12 @@ mod tests {
     /// carries no `metadata`, so it can drop no stored key.
     #[test]
     fn the_draft_merges_the_filed_id_then_flips_the_status_alone() {
-        let writes = draft_done_writes("fb-1", "s-draft", "5fc71f03-db4f-4be2-9839-484ccf29781a");
+        let writes = draft_done_writes(
+            "fb-1",
+            "s-draft",
+            "5fc71f03-db4f-4be2-9839-484ccf29781a",
+            false,
+        );
         assert_eq!(writes.len(), 2, "one merge, one flip: {writes:?}");
         let (method, path, body) = &writes[0];
         assert_eq!(*method, reqwest::Method::PATCH);
@@ -1332,6 +1477,27 @@ mod tests {
         assert_eq!(*method, reqwest::Method::PUT);
         assert_eq!(path, "/api/jobs/fb-1/steps/s-draft");
         assert_eq!(body, &json!({ "status": "completed" }));
+    }
+
+    /// A RECORDED draft carries its disposition in the same merge as
+    /// the id, so the flip that follows is judged on both — and the
+    /// item's `design-review` never opens for anyone (ac141c99).
+    #[test]
+    fn a_recorded_draft_merges_its_disposition_with_the_id() {
+        let writes = draft_done_writes(
+            "fb-1",
+            "s-draft",
+            "195276f0-a14b-4c17-b236-736a89ee7df5",
+            true,
+        );
+        assert_eq!(
+            writes[0].2,
+            json!({
+                "design_id": "195276f0-a14b-4c17-b236-736a89ee7df5",
+                "disposition": "recorded",
+            })
+        );
+        assert_eq!(writes[1].2, json!({ "status": "completed" }));
     }
 
     /// The questions are mirrored onto the design's own review step

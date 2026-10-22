@@ -235,6 +235,33 @@ test('EMPTY: each row says so in words — an answer, not a blank', async ({ pag
   await expect(page.locator(`${HUD} [data-fig="unread"]`)).toHaveCount(0);
 });
 
+// Backlog 97b5cf45: the server says when the queue it answered was cut
+// (`truncated`, `total` counted before the cut — 09074ada). The row drew
+// the rows it got as a plain count, so a cut queue read as a complete,
+// smaller one. A cut count is a floor, and the cut is said in words.
+test('CUT: a truncated answer counts a floor and says it was cut — never a whole, smaller queue', async ({ page }) => {
+  await board(page, regions(), (r) => json(r, { ...NEEDS, total: 9, truncated: true }));
+  await page.goto('/it');
+  const needs = row(page, 'needs-you');
+  await expect(needs.locator('li[data-need]')).toHaveCount(2);
+  const floor = needs.locator('.hud-count [data-fig="floor"]');
+  await expect(floor).toHaveText('2?');
+  await expect(floor).toHaveAttribute('title', '2 of at least 9 rows read — the answer was cut at its limit');
+  await expect(needs.locator('.hud-count [data-fig="value"]')).toHaveCount(0);
+  await expect(needs.locator('[data-cut]')).toHaveText('cut: 2 of at least 9 rows read — the answer was cut at its limit');
+  // The transit overview's one-line summary says the count is a floor, too.
+  await page.goto('/it?view=overview');
+  await expect(page.locator('details.map-context summary')).toContainText('Needs you: 2+ ·');
+});
+
+test('WHOLE: an untruncated answer draws a plain count and no cut', async ({ page }) => {
+  await board(page, regions(), (r) => json(r, { ...NEEDS, truncated: false }));
+  await page.goto('/it');
+  const needs = row(page, 'needs-you');
+  await expect(needs.locator('.hud-count [data-fig="value"]')).toHaveText('2');
+  await expect(needs.locator('[data-cut]')).toHaveCount(0);
+});
+
 test('UNREAD, an older server: absent fields and an ignored for=me are unread with the reason — never empty', async ({ page }) => {
   // What a server without cars 1 and 3 answers: no `outranks`, no
   // `next_up`, and an assignments list with no `for` block, because it

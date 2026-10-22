@@ -445,8 +445,11 @@ pub(crate) async fn release(
     let branch = branch_of(&packet)?.to_string();
     let head = forge(&format!("refs/heads/{branch}"))?;
     let main = forge("refs/heads/main")?;
+    // The hold this verb read is the one it asks to lift: the door
+    // refuses a car whose hold was rewritten since (review 792b871a N1).
     let mut ask = json!({
         "review": review.trim(),
+        "hold": boss_jobs::car_release::JudgedHold::of(&packet),
         "head": head,
         "main_sha": main,
         "agent_shell": releaser.agent_shell,

@@ -84,13 +84,16 @@ pub mod origin;
 pub mod orphan_steps;
 pub mod outranks;
 pub mod owned_wait_queue;
+pub mod pick;
 pub mod plugin_version_repair;
 pub mod policy_glue;
 pub mod port;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod priority;
 pub mod probe;
 pub mod protocol_conversion;
+pub mod reading_cache;
 #[cfg(feature = "postgres")]
 pub mod rebuild;
 pub mod records_before_claim;
@@ -100,6 +103,7 @@ pub mod regions;
 pub mod registry;
 pub mod repin;
 pub mod routes;
+pub mod routes_every_stand;
 pub mod runner_credential;
 pub mod scheduling;
 pub mod schema_level;
@@ -116,6 +120,7 @@ pub mod station_reach;
 pub mod station_seed;
 pub mod stations;
 pub mod step_metadata_write;
+pub mod step_release;
 pub mod stranded;
 pub mod thirds;
 pub mod trust;
@@ -164,3 +169,8 @@ pub use step_plugins::{InMemoryStepPlugins, StepPluginError, StepPluginRegistry,
 pub mod conditional_completion;
 
 pub mod state_receipt;
+
+pub mod browser_qualification;
+pub mod completion_contract;
+
+pub mod browser_qualification_adapter;

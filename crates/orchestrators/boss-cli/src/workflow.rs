@@ -52,6 +52,25 @@ pub(crate) fn blocking_draft(versions: &[Value], ours: Option<i32>) -> Option<i3
         .find(|v| Some(*v) != ours)
 }
 
+/// What `publish` says when a draft that is not its own is sitting in
+/// the registry. It names both resolutions and picks NEITHER: which one
+/// applies depends on whether packets are pinned to the draft, and the
+/// verb that removes or rejects it says so itself (backlog 50ded63d —
+/// the sentence used to name only the discard, which a pinned draft
+/// refuses, so the operator was sent to a door that does not open).
+pub(crate) fn blocking_draft_refusal(kind: &str, stale: i32) -> String {
+    format!(
+        "a draft of {kind} v{stale} is already sitting in the registry, and publish \
+         promotes WHATEVER DRAFT EXISTS — it takes no body and cannot be told which \
+         one.\n  Publishing now would put v{stale} live instead of your spec. That is \
+         exactly how ship-a-change went from v19 to v16 in production for four \
+         minutes.\n  Resolve it first: `boss workflow discard {kind} {stale}` removes a \
+         draft no packet ran; when packets are pinned to it (an experiment's candidate) \
+         the discard refuses, and `boss workflow reject {kind} {stale}` keeps it for them \
+         and takes it out of publish's way for good."
+    )
+}
+
 /// Did the publish put live what we meant to put live?
 ///
 /// Compares the version AND the step titles, because a version number
@@ -126,7 +145,7 @@ pub(crate) fn confirm(active: &Value, want_version: i32, want_titles: &[String])
 /// hand back in usable form. Carrying them forward is four of the steps
 /// this verb replaces, and forgetting one is the 422 that left the
 /// stale draft armed.
-fn carry_forward(spec: &mut Value, active: Option<&Value>) {
+pub(crate) fn carry_forward(spec: &mut Value, active: Option<&Value>) {
     let obj = match spec.as_object_mut() {
         Some(o) => o,
         None => return,
@@ -151,7 +170,7 @@ fn carry_forward(spec: &mut Value, active: Option<&Value>) {
         .or_insert_with(|| Value::String("platform".into()));
 }
 
-fn titles(spec: &Value) -> Vec<String> {
+pub(crate) fn titles(spec: &Value) -> Vec<String> {
     spec.get("steps")
         .and_then(Value::as_array)
         .map(|ss| {
@@ -195,6 +214,53 @@ pub async fn discard(kind: &str, version: i32) -> Result<()> {
     Ok(())
 }
 
+/// The status `version` holds in a version list, if it is there.
+fn status_of(versions: &[Value], version: i32) -> Option<&str> {
+    versions
+        .iter()
+        .find(|v| v.get("version").and_then(Value::as_i64) == Some(i64::from(version)))
+        .and_then(|v| v.get("status"))
+        .and_then(Value::as_str)
+}
+
+/// Reject a draft that met traffic and lost (backlog 50ded63d), then
+/// confirm it reads `rejected` — a 204 is a claim; the read-back is the
+/// fact. Every refusal is the server's, passed through as it said it:
+/// an experiment still splitting onto the version, history, a typo, or
+/// a draft no packet ran (which the discard removes instead).
+pub async fn reject(kind: &str, version: i32) -> Result<()> {
+    let http = crate::sor_client::machine_client()?;
+    crate::sor_client::api(
+        &http,
+        reqwest::Method::POST,
+        &format!("/api/workflows/{kind}/versions/{version}/reject"),
+        None,
+    )
+    .await?;
+    let versions = crate::train::rows(
+        crate::sor_client::api(
+            &http,
+            reqwest::Method::GET,
+            &format!("/api/workflows/{kind}/versions"),
+            None,
+        )
+        .await?,
+    )?;
+    match status_of(&versions, version) {
+        Some("rejected") => {}
+        other => bail!(
+            "the reject answered but {kind} v{version} reads {} in the version list — \
+             refusing to call that rejected",
+            other.unwrap_or("absent")
+        ),
+    }
+    println!(
+        "boss workflow: {kind} v{version} rejected — kept for the packets pinned to it, \
+         never published; confirmed by reading the version list back"
+    );
+    Ok(())
+}
+
 /// Pick `kind` out of a parsed workflow bundle, as the JSON body the
 /// draft endpoint takes. Pure, so the choice is testable without a
 /// bundle on disk: a bundle that lacks the kind is a refusal naming
@@ -234,7 +300,7 @@ pub(crate) fn spec_from_bundle(
 /// `owning_team = "platform"` is a claim, and it is sent (review
 /// 679220b5 F1): the loader refuses any other value there, so what the
 /// row says is what the stamp said.
-fn load_spec(kind: &str, path: &std::path::Path) -> Result<Value> {
+pub(crate) fn load_spec(kind: &str, path: &std::path::Path) -> Result<Value> {
     if path.is_dir() || path.extension().and_then(|e| e.to_str()) == Some("toml") {
         let owner = bundle_owner(path)?;
         let specs = boss_jobs::seed_loader::load_workflows_with_owning_team(
@@ -427,7 +493,7 @@ fn holds_checkout(path: &std::path::Path) -> Option<std::path::PathBuf> {
 /// when no checkout is around to ask — a JSON spec published from a
 /// directory that is not a checkout — which the caller says rather than
 /// reading as "not held".
-fn read_drift_hold(kind: &str, path: &std::path::Path) -> Option<DriftHold> {
+pub(crate) fn read_drift_hold(kind: &str, path: &std::path::Path) -> Option<DriftHold> {
     drift_hold_in(&holds_checkout(path)?, kind)
 }
 
@@ -519,13 +585,7 @@ pub async fn publish(kind: &str, path: &std::path::Path, dry: bool) -> Result<()
         .await?,
     )?;
     if let Some(stale) = blocking_draft(&versions, None) {
-        bail!(
-            "a draft of {kind} v{stale} is already sitting in the registry, and publish \
-             promotes WHATEVER DRAFT EXISTS — it takes no body and cannot be told which \
-             one.\n  Publishing now would put v{stale} live instead of your spec. That is \
-             exactly how ship-a-change went from v19 to v16 in production for four \
-             minutes.\n  Discard it first: `boss workflow discard {kind} {stale}`."
-        );
+        bail!("{}", blocking_draft_refusal(kind, stale));
     }
 
     // Lint before persisting — the same check the publish path enforces.
@@ -811,6 +871,36 @@ mod tests {
     fn a_clean_registry_has_no_blocker() {
         let versions = vec![json!({"version": 30, "status": "active"})];
         assert_eq!(blocking_draft(&versions, None), None);
+    }
+
+    /// Backlog 50ded63d. A candidate that met traffic and lost is kept
+    /// as `rejected` — history its pinned packets still run — and the
+    /// server's publish never promotes it, so it blocks nothing here.
+    /// Before the status existed it stayed a draft forever (its pins
+    /// forbid the discard) and this guard refused every later publish.
+    #[test]
+    fn a_rejected_candidate_is_not_a_blocker() {
+        let versions = vec![
+            json!({"version": 10, "status": "active"}),
+            json!({"version": 11, "status": "rejected"}),
+        ];
+        assert_eq!(blocking_draft(&versions, None), None);
+    }
+
+    /// The refusal names BOTH resolutions, because the first one it
+    /// named — the discard — is itself refused when a packet is pinned
+    /// to the draft, and that refusal is where the kind used to stop.
+    #[test]
+    fn the_blocking_draft_refusal_names_the_discard_and_the_reject() {
+        let said = blocking_draft_refusal("agent-run", 11);
+        for needle in [
+            "agent-run v11",
+            "boss workflow discard agent-run 11",
+            "boss workflow reject agent-run 11",
+            "pinned",
+        ] {
+            assert!(said.contains(needle), "expected `{needle}` in:\n{said}");
+        }
     }
 
     /// A bundle path publishes the row of the kind asked for, rendered

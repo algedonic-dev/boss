@@ -305,7 +305,7 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
                         let before=crate::postgres::get_job_on(&mut *conn,&job.id).await
                             .map_err(|error|error.to_string())?.ok_or("conditional state lacks its preceding Job")?;
                         let schema:Option<serde_json::Value>=if receipt.command.guarded_keys.is_empty() && receipt.command.immutable_keys.is_empty(){None}else{
-                            sqlx::query_scalar("SELECT metadata_schema FROM workflows WHERE kind=$1 AND version=$2 AND status <> 'draft'")
+                            sqlx::query_scalar("SELECT metadata_schema FROM workflows WHERE kind=$1 AND version=$2 AND status IN ('active','retired')")
                                 .bind(&before.kind).bind(before.workflow_version).fetch_optional(&mut *conn).await.map_err(|error|error.to_string())?
                         };
                         conditional_pairs.lock().map_err(|_|"conditional pair index unavailable")?

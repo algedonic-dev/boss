@@ -408,6 +408,44 @@ fn the_drain_prompt_names_its_verbs_and_cannot_be_read_as_a_flag() {
     }
 }
 
+/// The drain keeps its state on packets, never in agent memory (backlog
+/// 38db9ebe, 2026-10-18). Until this car the prompt told a cold session
+/// to read MEMORY.md and its READ FIRST overnight entry, to take its
+/// owed post-land acts from that entry, and to append a line to it on
+/// every wake — the session-state class the decision record deletes
+/// outright ("Agent memory and the record", design a5368918), and the
+/// opposite of David's 2026-10-09 rule that handoff state lives on the
+/// item packets and the work-session packet. A memory file is
+/// unversioned, outside the log and mutable in place; the next session
+/// inherits it only if it happens to load the same file. So the prompt
+/// names no memory at all, and names the packet doors instead: the
+/// work-session list it reads the last handoff from, the `handoff_`
+/// keys, and the metadata merge door it writes them through.
+#[test]
+fn the_drain_keeps_its_state_on_packets_not_in_memory() {
+    let p = drain_prompt();
+    let memory: Vec<&str> = p
+        .lines()
+        .filter(|l| l.to_lowercase().contains("memory"))
+        .collect();
+    assert!(
+        memory.is_empty(),
+        "drain.md reads or writes agent memory; session state lives on packets:\n{}",
+        memory.join("\n")
+    );
+    for needle in [
+        "kind=work-session",
+        "handoff_",
+        "PATCH /api/jobs/",
+        "/metadata",
+    ] {
+        assert!(
+            p.contains(needle),
+            "drain.md no longer names `{needle}`: the packet door its state goes through"
+        );
+    }
+}
+
 /// The drain's post-land acts name `boss workflow publish` for a row a
 /// car changed — and the hand publish is the ONE door a hold does not
 /// bind (infra/platform/workflow-holds/README.md). A session resuming

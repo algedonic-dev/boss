@@ -68,8 +68,9 @@ pub struct At {
     /// WHETHER ANYTHING CAN DISPATCH IT (backlog e2519eca): for a READY
     /// step, [`Dispatch::Undispatchable`] when nothing can hand it to
     /// anyone. `None` for an active step (whose question is its run),
-    /// for a step that carries an agent block, and for one a person
-    /// holds.
+    /// for a step that carries an agent block, for one a person holds,
+    /// and for an unclaimed one a person's queue awaits — `human_only`,
+    /// or routed to a role or station (backlog d2d59ba2).
     #[serde(default)]
     pub dispatch: Option<Dispatch>,
 }
@@ -111,7 +112,14 @@ pub enum Dispatch {
 pub enum StepRun {
     /// An open run names this packet and step and its `building` step
     /// has started.
-    Building { run: String },
+    Building {
+        run: String,
+        /// How the run's packet was chosen — `next` or `named`, off the
+        /// run's [`crate::agent_runs::SELECTED_BY_KEY`] (backlog
+        /// c9dd306a) — and absent for a run that records neither.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_by: Option<String>,
+    },
     /// An open run names it, its `building` step has not started, and
     /// the run is still inside the bound its protocol declares for the
     /// worker's own start receipt (backlog 57326714): `boss dispatch`
@@ -123,13 +131,22 @@ pub enum StepRun {
         run: String,
         age_minutes: i64,
         expect_minutes: i64,
+        /// As on [`StepRun::Building`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_by: Option<String>,
     },
     /// An open run names it, and its `building` step never started:
     /// dispatched, never launched (agent-run f58a081d, open 37h with
     /// nothing after its brief) — past its declared start bound, or
     /// declaring none. `age_minutes` is the run's own age at the
     /// server's `now`.
-    NeverStarted { run: String, age_minutes: i64 },
+    NeverStarted {
+        run: String,
+        age_minutes: i64,
+        /// As on [`StepRun::Building`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_by: Option<String>,
+    },
     /// No open run names it: the claim outlived whatever made it. A run
     /// is matched on `metadata.packet` and `metadata.step`, which `boss
     /// dispatch` writes; a hand-filed run spelling neither (28ab195a
@@ -276,6 +293,17 @@ fn at(steps: &[Step]) -> Option<(At, &Step)> {
 /// will. With neither, nothing will — whether nobody holds it or an
 /// agent does, since an agent reaches a step without a block only by a
 /// session's hand.
+///
+/// NOBODY HOLDING IT IS NOT NOBODY AWAITING IT (backlog d2d59ba2,
+/// landed-review e7b07edf finding 1). An unclaimed step that is
+/// `human_only`, or that names a role or a station, is a person's work
+/// waiting on that queue — incident.toml's `review` is all three of
+/// unclaimed, platform-admin and human-only, and was counted
+/// UNDISPATCHABLE and told to add an agent block its own `human_only`
+/// forbids. Only a step that names no audience at all is one nothing
+/// will reach. Once an AGENT holds a role-routed step without a block,
+/// the role has routed it somewhere no dispatch can follow, so that
+/// shape still says so.
 fn dispatch(job: &Job, step: &Step, agents: Option<&Agents>) -> Option<Dispatch> {
     if step.status != StepStatus::Ready || crate::agent_spec::projected(&step.metadata).is_some() {
         return None;
@@ -285,12 +313,29 @@ fn dispatch(job: &Job, step: &Step, agents: Option<&Agents>) -> Option<Dispatch>
         version: job.workflow_version,
     };
     match (step.assignee_id.as_deref(), agents) {
+        (None, _) if awaits_a_person(&step.metadata) => None,
         (None, _) => Some(undispatchable),
         (Some(_), None) => Some(Dispatch::Unread),
         (Some(who), Some(agents)) if agents.contains(who) => Some(undispatchable),
         // A person holds it.
         (Some(_), Some(_)) => None,
     }
+}
+
+/// Whether an unclaimed step's metadata routes it to a person's queue:
+/// it is `human_only`, or carries a non-empty `authority_role` or
+/// `station` — the keys an audience projects onto the packet
+/// ([`crate::audience::selectors_for`]).
+fn awaits_a_person(metadata: &serde_json::Value) -> bool {
+    let names = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|v| !v.trim().is_empty())
+    };
+    crate::human_only::declared(metadata)
+        || names(crate::audience::AUTHORITY_ROLE_KEY)
+        || names(crate::audience::STATION_KEY)
 }
 
 /// The run on a claimed step of `packet`: judged only for an ACTIVE
@@ -313,7 +358,11 @@ pub fn claim_run(
     if step.status != StepStatus::Active {
         return None;
     }
-    let (Some(runs), Some(agents)) = (runs, agents) else {
+    // WHO HOLDS IT BEFORE WHETHER THE RUNS WERE READ (backlog 1927aca5,
+    // landed-review da21596d). A narrowed `for=me` read knows the agents
+    // and withholds only the runs; asking for the runs first read a
+    // person's own claim as "run unread", though no run is ever on one.
+    let Some(agents) = agents else {
         return Some(StepRun::Unread);
     };
     if !step
@@ -323,6 +372,9 @@ pub fn claim_run(
     {
         return None;
     }
+    let Some(runs) = runs else {
+        return Some(StepRun::Unread);
+    };
     // A step with no spec slug cannot be dispatched, so no run names it.
     let slug = step.spec_slug.as_deref();
     let md = |j: &Job, k: &str| {
@@ -363,13 +415,17 @@ pub fn claim_run(
 /// first fire, not fifteen minutes before it.
 fn reading(run: &Job, steps: &[Step], now: chrono::DateTime<chrono::Utc>) -> StepRun {
     let id = run.id.to_string();
+    let selected_by = crate::agent_runs::selection(&run.metadata).map(str::to_string);
     let building = || {
         steps
             .iter()
             .filter(|s| s.spec_slug.as_deref() == Some("building"))
     };
     if building().any(|s| matches!(s.status, StepStatus::Active | StepStatus::Completed)) {
-        return StepRun::Building { run: id };
+        return StepRun::Building {
+            run: id,
+            selected_by,
+        };
     }
     let age = now - admitted_at(run);
     match building().find_map(start_bound) {
@@ -382,11 +438,13 @@ fn reading(run: &Job, steps: &[Step], now: chrono::DateTime<chrono::Utc>) -> Ste
                 run: id,
                 age_minutes: age.num_minutes(),
                 expect_minutes,
+                selected_by,
             }
         }
         _ => StepRun::NeverStarted {
             run: id,
             age_minutes: age.num_minutes(),
+            selected_by,
         },
     }
 }
@@ -674,7 +732,8 @@ mod tests {
         assert_eq!(
             run_of("building"),
             Some(StepRun::Building {
-                run: live.0.id.to_string()
+                run: live.0.id.to_string(),
+                selected_by: None,
             })
         );
         assert_eq!(
@@ -682,6 +741,7 @@ mod tests {
             Some(StepRun::NeverStarted {
                 run: never.0.id.to_string(),
                 age_minutes: 37 * 60,
+                selected_by: None,
             })
         );
         assert_eq!(run_of("gone"), Some(StepRun::NoRun));
@@ -702,6 +762,76 @@ mod tests {
             json!({ "state": "never-started", "run": never.0.id.to_string(), "age_minutes": 37 * 60 })
         );
         assert_eq!(wire("human")["at"]["run"], serde_json::Value::Null);
+    }
+
+    /// THE RUN READING SAYS HOW ITS PACKET WAS CHOSEN (backlog
+    /// c9dd306a): a run `boss dispatch --next` took off a station reads
+    /// `next`, one whose caller named the packet reads `named`, in every
+    /// state that names a run — and a run filed before the record
+    /// existed carries no word on the wire at all, never a guess.
+    #[test]
+    fn a_run_reading_carries_how_its_packet_was_selected() {
+        let bound = json!({ (crate::agent_budget::WORKER_START_EXPECTATION): { "schema": 1, "minutes": 15 } });
+        let by_queue = held("by-queue", "build", StepStatus::Active, "agent-claude");
+        let by_name = held("by-name", "build", StepStatus::Active, "agent-claude");
+        let unrecorded = held("unrecorded", "build", StepStatus::Active, "agent-claude");
+        let mut queued = run(
+            &by_queue.0,
+            "build",
+            "2026-09-27T11:00:00Z",
+            StepStatus::Active,
+        );
+        queued.0.metadata[crate::agent_runs::SELECTED_BY_KEY] =
+            json!({ "next": { "station": "a.platform-admin.opus-5-5", "position": 1 } });
+        let mut named = run(
+            &by_name.0,
+            "build",
+            "2026-09-27T11:55:00Z",
+            StepStatus::Ready,
+        );
+        named.0.metadata[crate::agent_runs::SELECTED_BY_KEY] =
+            json!({ "named": by_name.0.id.to_string() });
+        for s in named
+            .1
+            .iter_mut()
+            .filter(|s| s.spec_slug.as_deref() == Some("building"))
+        {
+            s.metadata = bound.clone();
+        }
+        let old = run(
+            &unrecorded.0,
+            "build",
+            "2026-09-27T11:00:00Z",
+            StepStatus::Active,
+        );
+        let open = vec![queued.clone(), named.clone(), old.clone()];
+        let agents: std::collections::BTreeSet<String> =
+            std::iter::once("agent-claude".to_string()).collect();
+        let board = outranks(
+            &[by_queue, by_name, unrecorded],
+            Some(&[]),
+            Some(Runs { open: &open }),
+            Some(&agents),
+            t(NOW),
+        );
+        let wire = |title: &str| {
+            serde_json::to_value(board.iter().find(|o| o.title == title).unwrap()).unwrap()["at"]
+                ["run"]
+                .clone()
+        };
+        assert_eq!(
+            wire("by-queue"),
+            json!({ "state": "building", "run": queued.0.id.to_string(), "selected_by": "next" })
+        );
+        assert_eq!(
+            wire("by-name"),
+            json!({ "state": "starting", "run": named.0.id.to_string(), "age_minutes": 5,
+                    "expect_minutes": 15, "selected_by": "named" })
+        );
+        assert_eq!(
+            wire("unrecorded"),
+            json!({ "state": "building", "run": old.0.id.to_string() })
+        );
     }
 
     /// A RUN STILL INSIDE ITS OWN START BOUND IS STARTING, NOT STALLED
@@ -773,6 +903,7 @@ mod tests {
                 run: five.0.id.to_string(),
                 age_minutes: 5,
                 expect_minutes: 15,
+                selected_by: None,
             }
         );
         assert!(!run_of("fresh").stalled());
@@ -781,6 +912,7 @@ mod tests {
             StepRun::NeverStarted {
                 run: sixteen.0.id.to_string(),
                 age_minutes: 16,
+                selected_by: None,
             }
         );
         assert!(run_of("late").stalled());
@@ -789,6 +921,7 @@ mod tests {
             StepRun::NeverStarted {
                 run: old_style.0.id.to_string(),
                 age_minutes: 1,
+                selected_by: None,
             }
         );
         assert_eq!(
@@ -797,6 +930,7 @@ mod tests {
                 run: again.0.id.to_string(),
                 age_minutes: 2,
                 expect_minutes: 15,
+                selected_by: None,
             }
         );
         let wire = serde_json::to_value(run_of("fresh")).unwrap();
@@ -822,6 +956,31 @@ mod tests {
         };
         assert_eq!(run_of("active"), Some(StepRun::Unread));
         assert_eq!(run_of("ready"), None);
+    }
+
+    /// A PERSON'S CLAIM HAS NO RUN, READ OR NOT (backlog 1927aca5,
+    /// landed-review da21596d of car 181a77e3). Under
+    /// `assignments?for=me` for a narrowed caller the agents registry IS
+    /// read and only the runs are withheld, and the predicate answered
+    /// Unread before it asked who held the step — so a `self`-scoped
+    /// person's own active claim read "run unread" in NEEDS YOU and MY
+    /// WORK, a claim no run can ever be on. With the agents known, a
+    /// person's claim is no reading at all; an agent's is still unread
+    /// without the runs, and with no registry every holder still is.
+    #[test]
+    fn a_persons_claim_reads_no_run_even_when_the_runs_were_not_read() {
+        let agents: Agents = std::iter::once("agent-claude".to_string()).collect();
+        let (person, mine) = held("person", "build", StepStatus::Active, "emp-david");
+        let (agent, theirs) = held("agent", "build", StepStatus::Active, "agent-claude");
+        let read = |job: &Job, step: &Step, agents: Option<&Agents>| {
+            claim_run(&job.id.to_string(), step, None, agents, t(NOW))
+        };
+        assert_eq!(read(&person, &mine[0], Some(&agents)), None);
+        assert_eq!(
+            read(&agent, &theirs[0], Some(&agents)),
+            Some(StepRun::Unread)
+        );
+        assert_eq!(read(&person, &mine[0], None), Some(StepRun::Unread));
     }
 
     /// A READY STEP NOTHING CAN DISPATCH SAYS SO (backlog e2519eca,
@@ -882,5 +1041,74 @@ mod tests {
         assert_eq!(dispatch_of(&unread, "person"), Some(Dispatch::Unread));
         assert_eq!(dispatch_of(&unread, "nobody"), row);
         assert_eq!(dispatch_of(&unread, "funded"), None);
+    }
+
+    /// AN UNCLAIMED STEP A PERSON OR A ROLE AWAITS IS NOT UNDISPATCHABLE
+    /// (backlog d2d59ba2, landed-review e7b07edf finding 1). Read off
+    /// incident.toml's `review`: no holder, `authority_role =
+    /// "platform-admin"` and `human_only = true` — the board counted it
+    /// UNDISPATCHABLE and told it to add an agent block, which its own
+    /// `human_only` forbids (the publish lint refuses that block). One
+    /// packet per shape the item names: human-only, role-routed,
+    /// station-routed; and two controls — a step that names no audience
+    /// at all (still undispatchable), and a role-routed step an AGENT
+    /// holds with no block (still undispatchable: the role routed it to
+    /// someone who cannot be dispatched onto it).
+    #[test]
+    fn an_unclaimed_step_a_person_or_a_role_awaits_is_not_undispatchable() {
+        let unclaimed = |title: &str, metadata: serde_json::Value| {
+            let mut p = held(title, "review", StepStatus::Ready, "x");
+            p.1[0].assignee_id = None;
+            p.1[0].metadata = metadata;
+            p
+        };
+        let incident = unclaimed(
+            "incident",
+            json!({ "authority_role": "platform-admin", "human_only": true }),
+        );
+        let person_only = unclaimed("person-only", json!({ "human_only": "true" }));
+        let role = unclaimed("role", json!({ "authority_role": "platform-admin" }));
+        let station = unclaimed("station", json!({ "station": "design-review" }));
+        let nobody = unclaimed("nobody", json!({}));
+        let blank = unclaimed(
+            "blank",
+            json!({ "authority_role": "", "human_only": false }),
+        );
+        let mut agent_role = held("agent-role", "review", StepStatus::Ready, "agent-claude");
+        agent_role.1[0].metadata = json!({ "authority_role": "platform-admin" });
+        let packets = vec![
+            incident,
+            person_only,
+            role,
+            station,
+            nobody,
+            blank,
+            agent_role,
+        ];
+        let agents: Agents = ["agent-claude".to_string()].into_iter().collect();
+        let row = Some(Dispatch::Undispatchable {
+            kind: "backlog-item".into(),
+            version: 1,
+        });
+        let dispatch_of = |board: &[Outrank], title: &str| {
+            board
+                .iter()
+                .find(|o| o.title == title)
+                .and_then(|o| o.at.as_ref())
+                .expect("a workable step")
+                .dispatch
+                .clone()
+        };
+        for registry in [Some(&agents), None] {
+            let board = outranks(&packets, Some(&[]), None, registry, t(NOW));
+            assert_eq!(dispatch_of(&board, "incident"), None);
+            assert_eq!(dispatch_of(&board, "person-only"), None);
+            assert_eq!(dispatch_of(&board, "role"), None);
+            assert_eq!(dispatch_of(&board, "station"), None);
+            assert_eq!(dispatch_of(&board, "nobody"), row);
+            assert_eq!(dispatch_of(&board, "blank"), row);
+        }
+        let board = outranks(&packets, Some(&[]), None, Some(&agents), t(NOW));
+        assert_eq!(dispatch_of(&board, "agent-role"), row);
     }
 }

@@ -25,6 +25,7 @@ import { TRANSIT_KEY } from '../../src/it/yard/transit-choice';
 import { TERRITORIES } from '../../src/it/yard/world';
 import { BORDERS, routesPayload } from '../fixtures/yard';
 import { YARD_BORDERS, YARD_REGIONS, YARD_ROUTES, installSmokeMocks } from './_smokeMocks';
+import { FAILURE_MARKER } from './_routes';
 
 const FLIGHTS = /\/api\/flights\/mine(\?|$)/;
 const STREAM = /\/api\/yard\/moves\/stream(\?|$)/;
@@ -220,6 +221,49 @@ test('a feed that cannot be read is said on the map, never drawn as a quiet yard
   await expect(g).toHaveAttribute('data-feed', 'down');
   await expect(g.locator('[data-feed-down]')).toContainText('403');
   await expect(g.locator('[data-feed-down]')).toContainText('this caller may read none');
+  // The line wears the ONE failure marker (`FAILURE_MARKER`, _routes.ts)
+  // beside its own words (backlog aadbc1a3): with every sibling read
+  // healthy, the moves feed's line is the only failure on the page, so a
+  // reader that asserts on the shared name finds exactly it.
+  await expect(g.locator('[data-feed-down]')).toHaveClass(/\bload-failed\b/);
+  await expect(page.locator(FAILURE_MARKER)).toHaveCount(1);
+  await expect(page.locator(`${FAILURE_MARKER}[data-feed-down]`)).toHaveCount(1);
+});
+
+test('a live feed paints no failure marker', async ({ page }) => {
+  await mocks(page, LIVE, [move(1)]);
+  await page.goto('/it');
+  const g = live(page);
+  await expect(g).toHaveAttribute('data-feed', 'live');
+  await expect(g.locator('[data-dot]')).toHaveCount(1);
+  await expect(g.locator('[data-feed-down]')).toHaveCount(0);
+  await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
+});
+
+test('a feed that recovers takes its failure marker away', async ({ page }) => {
+  await holdClock(page, new Date(NOW));
+  await installSmokeMocks(page);
+  await page.route(FLIGHTS, (r) => json(r, { flights: LIVE }));
+  await page.route(YARD_REGIONS, (r) => json(r, regions()));
+  await page.route(YARD_BORDERS, (r) => json(r, borders()));
+  await page.route(YARD_ROUTES, (r) => json(r, routesPayload()));
+  await page.route(STREAM, (r) => r.fulfill({ status: 503, body: 'the moves record is not wired on this jobs API' }));
+  // The first read of the record refuses; the next, ten seconds on, answers.
+  let reads = 0;
+  await page.route(MOVES, (r) => {
+    reads += 1;
+    return reads === 1
+      ? r.fulfill({ status: 503, body: 'the moves record is not wired on this jobs API' })
+      : json(r, { moves: [], latest_seq: 7 });
+  });
+  await page.goto('/it');
+  const g = live(page);
+  await expect(g).toHaveAttribute('data-feed', 'down');
+  await expect(page.locator(`${FAILURE_MARKER}[data-feed-down]`)).toHaveCount(1);
+  await page.clock.runFor(10_000);
+  await expect(g).toHaveAttribute('data-feed', 'polling');
+  await expect(g.locator('[data-feed-down]')).toHaveCount(0);
+  await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
 });
 
 // THE CROSSING TIME (David 2026-09-27: "maybe give me a few radio

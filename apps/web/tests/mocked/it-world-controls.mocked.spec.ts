@@ -47,7 +47,7 @@ import { isPageWrite } from './_smokeMocks';
 //                   design e765b3fc: "Department Map", below
 //   gap 5 b5b921ce  18 dead style rules in WorldMap.svelte — no
 //                   behaviour a browser can see; the deletion is its car
-//   gap 6 909adf3b  the 10 s poll has no in-flight guard — CURRENT, below
+//   gap 6 909adf3b  overlapping reads — fixed and pinned below
 //   gap 7 cf7ad2f2  8 of the 10 doors land off the catalog — ANSWERED
 //                   by car N1 of design e765b3fc: each door selects its
 //                   region on /it, below
@@ -60,6 +60,7 @@ import { YARD_BORDERS, YARD_REGIONS, installSmokeMocks } from './_smokeMocks';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
 import { TERRITORIES } from '../../src/it/yard/world';
 import { BORDERS } from '../fixtures/yard';
+import { holdClock, responseBarrier } from './_clock';
 
 const json = (r: Route, b: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) });
@@ -459,8 +460,8 @@ test('a regions read that fails after a good one keeps none of its values, and t
   await expect(hud.locator('a[data-machine]')).toHaveCount(0);
 });
 
-test('CURRENT, gap 6 (909adf3b): the 10 s poll fires again while the last read is still in flight', async ({ page }) => {
-  await page.clock.install({ time: new Date('2026-09-25T06:00:00Z') });
+test('909adf3b: multiple ticks cannot overlap a pending regions read', async ({ page }) => {
+  await holdClock(page, new Date('2026-09-25T06:00:00Z'));
   await installSmokeMocks(page);
   const pending: Route[] = [];
   await page.route(YARD_REGIONS, (r) => {
@@ -468,21 +469,52 @@ test('CURRENT, gap 6 (909adf3b): the 10 s poll fires again while the last read i
   });
   await page.route(YARD_BORDERS, (r) => json(r, borders()));
   await page.goto('/it');
-  // Counted from what goto left, never from zero: an installed clock
-  // still runs on real time, so on a starved runner the page's own 10 s
-  // poll had already sent a second read before the count was taken (ten
-  // real seconds held after goto: expected 1, received 2), and the
-  // "exactly one more" below then saw three (backlog 3027f808).
-  await expect.poll(() => pending.length).toBeGreaterThan(0);
-  const before = pending.length;
-  await expect(page.locator('.yard-empty')).toHaveText('Reading the regions…');
-  // Ten seconds on, the first answer has still not come: today another
-  // read goes out beside it, and whichever lands LAST is drawn — an
-  // older answer can overwrite a newer one. Gap 6 skips a tick while
-  // one is in flight; its car flips this to "stays at before".
-  await page.clock.runFor(10_000);
-  await expect.poll(() => pending.length).toBeGreaterThan(before);
-  for (const r of pending) await json(r, regions()).catch(() => {});
+  try {
+    await expect.poll(() => pending.length).toBe(1);
+    await expect(page.locator('.yard-empty')).toHaveText('Reading the regions…');
+    await page.clock.runFor(30_000);
+    expect(pending.length).toBe(1);
+    const first = pending.shift();
+    if (first === undefined) throw new Error('regions request never arrived');
+    await json(first, regions());
+    await expect(page.locator(`${SVG} .territory`)).toHaveCount(TERRITORIES.length);
+    await page.clock.runFor(10_000);
+    await expect.poll(() => pending.length).toBe(1);
+  } finally {
+    for (const r of pending) await json(r, regions()).catch(() => {});
+  }
+});
+
+test('909adf3b: slow borders do not hold the map or renew the regions observation time', async ({ page }) => {
+  await holdClock(page, new Date('2026-09-25T06:00:00Z'));
+  await installSmokeMocks(page);
+  const rail = responseBarrier();
+  const region = responseBarrier();
+  let regionReads = 0;
+  await page.route(YARD_REGIONS, async (r) => {
+    if (++regionReads > 1) await region.wait();
+    await json(r, regions());
+  });
+  await page.route(YARD_BORDERS, async (r) => {
+    await rail.wait();
+    await json(r, borders());
+  });
+  try {
+    await page.goto('/it');
+    await rail.arrived;
+    await expect(page.locator(`${SVG} .territory`)).toHaveCount(TERRITORIES.length);
+    await expect(page.locator(`${HUD} .hud-age`)).toHaveText('read 0s ago');
+    await page.clock.runFor(20_000);
+    await region.arrived;
+    const answered = page.waitForResponse((r) => r.url().endsWith('/api/yard/borders'));
+    rail.release();
+    await (await answered).finished();
+    await expect(page.locator(`${WORLD} .rail`).first()).toBeVisible();
+    await expect(page.locator(`${HUD} .hud-age`)).toHaveText('read 20s ago');
+  } finally {
+    rail.release();
+    region.release();
+  }
 });
 
 // ---------------------------------------------------------------------
