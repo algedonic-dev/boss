@@ -71,5 +71,4 @@
   .scope { margin-top: var(--s4); }
   .source { display: flex; gap: var(--s3); justify-content: space-between; align-items: center; flex-wrap: wrap; font-size: 12px; }
   button { padding: var(--s2); background: var(--map-surface); color: var(--map-ink); border: 1px solid var(--map-rule); border-radius: var(--radius); cursor: pointer; }
-  .load-failed { color: var(--map-bad-ink); }
 </style>

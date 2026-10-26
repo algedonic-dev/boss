@@ -382,8 +382,13 @@ macro_rules! needs_jq {
 /// tree (so the code under test is this tree's, never a stale copy), and
 /// nothing else. A script written there exists in no other checkout.
 fn runner_checkout(root: &Path) -> PathBuf {
+    runner_checkout_at(root.join("checkout"))
+}
+
+/// `runner_checkout`, at a directory of the case's choosing — a
+/// generation of a root-tree-shaped fixture, say.
+fn runner_checkout_at(checkout: PathBuf) -> PathBuf {
     use std::os::unix::fs::symlink;
-    let checkout = root.join("checkout");
     std::fs::create_dir_all(checkout.join("infra/ops")).unwrap();
     for linked in [
         "infra/ops/ops-runner.sh",
@@ -487,6 +492,79 @@ fn a_relative_argv0_resolves_against_the_runners_own_checkout() {
             f.display()
         );
     }
+}
+
+/// ONE PASS RUNS ONE GENERATION (backlog 1dde630c, review a8b752d4 N2).
+/// On the forge the runner starts as
+/// `/var/lib/boss/tree/current/infra/ops/ops-runner.sh`, and `current`
+/// is a link root-tree.sh moves with one rename whenever main moves. The
+/// runner used to name its checkout through that link on every use —
+/// `$(dirname "$0")`, a logical `pwd` — so a pass that loaded its
+/// allowlist and libraries from one generation could exec a verb's
+/// script from the next: a plan read under one commit, executed under
+/// another. It now resolves its own directory ONCE, physically, before
+/// anything else, and every path of the pass is derived from that.
+///
+/// The fixture is the forge's shape: `tree/gen/A` and `tree/gen/B`, each
+/// a runner checkout whose probe prints its own generation, `tree/current`
+/// -> `gen/A`, and a `curl` that moves `current` to `gen/B` on its first
+/// call — after the pass has started, before the verb runs.
+#[test]
+fn a_pass_runs_the_generation_it_started_in_when_current_moves_mid_pass() {
+    needs_jq!();
+    use std::os::unix::fs::symlink;
+    let root = scratch("one-generation-per-pass");
+    stub_sor(&root);
+    let tree = root.join("tree");
+    for g in ["A", "B"] {
+        let generation = runner_checkout_at(tree.join("gen").join(g));
+        write_exec(
+            &generation.join("infra/ops/which-generation.sh"),
+            &format!("#!/bin/sh\necho 'which-generation: ran generation {g}'\n"),
+        );
+    }
+    let current = tree.join("current");
+    symlink("gen/A", &current).unwrap();
+    // The stub SoR, behind a curl that moves `current` first, once.
+    let bin = root.join("bin");
+    std::fs::rename(bin.join("curl"), bin.join("curl-sor")).unwrap();
+    write_exec(
+        &bin.join("curl"),
+        &format!(
+            "#!/bin/sh\n\
+             if [ ! -e '{flipped}' ]; then : > '{flipped}'; ln -sfn gen/B '{current}'; fi\n\
+             exec '{sor}' \"$@\"\n",
+            flipped = root.join("flipped").display(),
+            current = current.display(),
+            sor = bin.join("curl-sor").display(),
+        ),
+    );
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "probe",
+            r#"{"about": "prints the generation its script came from", "hosts": ["forge"],
+                "argv": ["infra/ops/which-generation.sh"], "params": []}"#,
+        )],
+    );
+    packet(&root, "probe", "[]");
+    let (out, payload) = run_from(&current, &root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert!(
+        root.join("flipped").exists(),
+        "the fixture never moved current, so it tested nothing: {md} / {out}"
+    );
+    assert_eq!(
+        std::fs::read_link(&current).unwrap(),
+        PathBuf::from("gen/B"),
+        "current was not moved to gen/B mid-pass: {out}"
+    );
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    let output = md["output"].as_str().unwrap_or("");
+    assert!(
+        output.contains("which-generation: ran generation A"),
+        "the pass started in generation A and executed a verb out of another one: {md} / {out}"
+    );
 }
 
 /// The allowed literal reaches the verb: `publish-github-pr --check` is
@@ -3475,4 +3553,88 @@ fn a_verb_that_declares_no_read_back_says_so_on_every_clean_run() {
     );
     assert_eq!(md["effect"], serde_json::Value::Null, "{md}");
     assert_eq!(md["effect_unproven"], serde_json::Value::Null, "{md}");
+}
+
+/// The native preview remains capped; the fixed reader publishes the exact
+/// original through the file door before the runner records query success.
+#[test]
+fn membership_observation_retains_large_body_beyond_the_native_preview() {
+    let root = scratch("membership-original-attachment");
+    stub_sor(&root);
+    let source = repo_root();
+    let forge = root.join("infra/forge");
+    let lib = root.join("infra/lib");
+    std::fs::create_dir_all(&forge).unwrap();
+    std::fs::create_dir_all(&lib).unwrap();
+    for name in [
+        "read-membership-starting-state.sh",
+        "membership-observation-retain.py",
+    ] {
+        std::fs::copy(source.join("infra/forge").join(name), forge.join(name)).unwrap();
+    }
+    write_exec(
+        &lib.join("sor.sh"),
+        "sor_require() { export BOSS_JOBS_URL=http://fixture.invalid; }\nsor_reader_header() { printf fixture-reader; }\n",
+    );
+    write_exec(
+        &lib.join("secret-header.sh"),
+        "machine_token_header() { printf -v \"$1\" fixture-token; }\nsecret_header_close() { :; }\n",
+    );
+    std::fs::rename(root.join("bin/curl"), root.join("bin/runner-curl")).unwrap();
+    write_exec(
+        &root.join("bin/curl"),
+        "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in */api/jobs/membership-starting-state-observation) cat \"$ORIGINAL_BODY\"; printf 'original diagnostic\\n' >&2; exit 0;; esac; done\nexec \"$(dirname \"$0\")/runner-curl\" \"$@\"\n",
+    );
+    write_exec(
+        &root.join("bin/boss"),
+        "#!/bin/sh\n[ \"$1\" = attach ] || exit 78\n[ \"$2\" = aaaaaaaa-0000-4000-8000-000000000000 ] || exit 78\ncp \"$3\" \"$ATTACHED/$(basename \"$3\")\"\n",
+    );
+    let attached = root.join("attached");
+    std::fs::create_dir(&attached).unwrap();
+    let body = root.join("body.json");
+    let raw = format!("{{\"plan\":\"{}\"}}", "0123456789abcdef".repeat(28000));
+    std::fs::write(&body, &raw).unwrap();
+    let verb = forge.join("read-membership-starting-state.sh");
+    // The checked-in script is invoked by bash just as the installed executable.
+    let launcher = root.join("read.sh");
+    write_exec(
+        &launcher,
+        &format!("#!/bin/sh\nexec bash '{}'\n", verb.display()),
+    );
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "read-membership-starting-state",
+            &format!(
+                r#"{{"about":"READ-ONLY fixed observation","hosts":["forge"],"argv":["{}"],"params":[],"capture":"separate-streams","timeout":250}}"#,
+                launcher.display()
+            ),
+        )],
+    );
+    packet(&root, "read-membership-starting-state", "[]");
+    let (out, payload) = run(
+        &root,
+        &verbs,
+        &[
+            ("ORIGINAL_BODY", body.display().to_string()),
+            ("ATTACHED", attached.display().to_string()),
+        ],
+    );
+    let md = payload.unwrap_or_else(|| panic!("no receipt: {out}"));
+    assert_eq!(md["exit_code"], "0", "{md}");
+    assert_eq!(md["streams"]["stdout"]["bytes"], raw.len(), "{md}");
+    assert_eq!(md["streams"]["stdout"]["retained_bytes"], 102400, "{md}");
+    assert_eq!(md["streams"]["stdout"]["complete"], false, "{md}");
+    assert_eq!(
+        std::fs::read(attached.join("stdout")).unwrap(),
+        raw.as_bytes()
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(attached.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["request_id"],
+        "aaaaaaaa-0000-4000-8000-000000000000"
+    );
+    assert_eq!(manifest["original_query_exit"], 0);
+    assert_eq!(manifest["stdout"]["bytes"], raw.len());
 }

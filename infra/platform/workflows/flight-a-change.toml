@@ -132,7 +132,7 @@ kind = "task"
 ready_when = "steps.observe.done"
 title_template = "Widen {subject.id} to everyone"
 authority_role = "platform-admin"
-metadata_defaults = { flight_state = "on-for-all", human_only = true, procedure = "Optional. Completing this step turns the flight on for EVERYONE on this instance. It is a person's sign-off while one person runs the company (David, 2026-09-24); leave it when the audience already is everyone who matters." }
+metadata_defaults = { human_presentation = { ask = "Decide whether this trial should reach everyone", why_person = "Expanding a trial to everyone requires a person's authorization.", action = "Review the trial and authorize expansion", after = "Completing this optional action turns the trial on for everyone on this instance.", evidence = "current-step" }, flight_state = "on-for-all", human_only = true, procedure = "Optional. Completing this step turns the flight on for EVERYONE on this instance. It is a person's sign-off while one person runs the company (David, 2026-09-24); leave it when the audience already is everyone who matters." }
 fields = [
   { name = "why", field_type = "string", required = true },
 ]
@@ -179,7 +179,7 @@ kind = "task"
 ready_when = "steps.observe.done OR steps.widen.done OR steps.reobserve.done"
 title_template = "Decide {subject.id}: promote or pull"
 authority_role = "platform-admin"
-metadata_defaults = { human_only = true, procedure = "Read the hypothesis, the signal and the reading (and the extension's, if there was one), then decide. `promote` keeps the new path: the cleanup car deletes the flag and the old path. `pull` keeps the old path: the cleanup car deletes the flag and the new one. `decision` says why, against the signal stated at filing." }
+metadata_defaults = { human_presentation = { ask = "Decide whether to keep or withdraw this trial", why_person = "A person must judge the recorded results against the original hypothesis.", action = "Review results and record your decision", after = "An agent removes the unused code path in a separately proved change.", evidence = "current-step" }, human_only = true, procedure = "Read the hypothesis, the signal and the reading (and the extension's, if there was one), then decide. `promote` keeps the new path: the cleanup car deletes the flag and the old path. `pull` keeps the old path: the cleanup car deletes the flag and the new one. `decision` says why, against the signal stated at filing." }
 fields = [
   { name = "verdict", field_type = "promote|pull", required = true },
   { name = "decision", field_type = "string", required = true },

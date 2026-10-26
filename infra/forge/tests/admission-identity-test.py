@@ -243,6 +243,9 @@ else:
             self.assertIn("--read-only", invocation)
             self.assertIn("--pull=never", invocation,
                           "the credential-free read must refuse an evicted image instead of pulling")
+            # Backlog ff957587: docker's own option, so before the image.
+            self.assertLess(invocation.index("--log-driver=none"), invocation.index(report["image_id"]),
+                            "a container handed host files keeps no daemon log")
             joined = " ".join(invocation)
             for forbidden in ["dst=/tc", "dst=/kc", "--network host", " pull ", " create "]:
                 self.assertNotIn(forbidden, joined)

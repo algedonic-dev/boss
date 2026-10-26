@@ -200,6 +200,22 @@ pub fn patch_is_noop(stored: &Value, patch: &Map<String, Value>) -> bool {
         })
 }
 
+/// PURE: does `stored` still read as `expect` on every key `expect`
+/// names? A `null` expected value is "absent, or null". The precondition
+/// a write computed from a read of a few keys carries into the adapter,
+/// which judges it under the row's lock in the write's own transaction
+/// ([`crate::port::JobsRepository::merge_step_metadata_guarded_at`]): the
+/// release door lifts the hold it judged or nothing (review 792b871a N1).
+/// Narrower than the row version on purpose — an unrelated key written
+/// since the read changes nothing the write rests on.
+pub fn metadata_still_reads(stored: &Value, expect: &Map<String, Value>) -> bool {
+    let stored = stored.as_object();
+    expect.iter().all(|(k, v)| {
+        let held = stored.and_then(|s| s.get(k)).unwrap_or(&Value::Null);
+        held == v
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +223,28 @@ mod tests {
 
     fn obj(v: Value) -> Map<String, Value> {
         v.as_object().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_precondition_reads_only_the_keys_it_names_and_null_as_absent() {
+        let stored = json!({"hold": "x", "hold_sha": "h1", "note": "anything", "gone": null});
+        let as_read = obj(json!({"hold": "x", "hold_sha": "h1", "never": null, "gone": null}));
+        assert!(metadata_still_reads(&stored, &as_read));
+        for moved in [
+            json!({"hold": "y"}),
+            json!({"hold_sha": "h2"}),
+            json!({"hold": null}),
+            json!({"never": "now"}),
+        ] {
+            assert!(
+                !metadata_still_reads(&stored, &obj(moved.clone())),
+                "{moved}"
+            );
+        }
+        assert!(metadata_still_reads(
+            &json!(null),
+            &obj(json!({"hold": null}))
+        ));
     }
 
     #[test]

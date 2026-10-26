@@ -20,6 +20,12 @@
 #       `missing` when this checkout carries no pair). This is what the
 #       lints and the estate unit observer read instead of scraping a
 #       shell array.
+#   ./infra/gcp/install-units.sh beyond-rows
+#       every unit `units` installs that is not a row's pair, one per
+#       line — today the ops-request runner's, asked of
+#       infra/ops/install-ops-runner.sh --units under the tree helper
+#       `units` starts it through, so no waker (backlog 2eae38d4). Reads
+#       only; the estate unit observer watches these beside the rows.
 #
 # WHY THIS FILE EXISTS (2026-09-18, backlog e109bd71, design 42277636).
 # These two modes were the ~310 live lines of infra/deploy-services.sh, a
@@ -41,12 +47,12 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 units|roster|rows" >&2
+    echo "usage: $0 units|roster|rows|beyond-rows" >&2
     exit 2
 }
 MODE="${1:-}"
 case "$MODE" in
-    units|roster|rows) ;;
+    units|roster|rows|beyond-rows) ;;
     *) usage ;;
 esac
 
@@ -155,7 +161,24 @@ stem_in_role() { # <stem> <roster>
     grep -qxF "$1" <<<"$2"
 }
 
+# NATIVE ADOPTION: the `units` mode below installs from the accepted root
+# tree, and starts the ops runner through its launcher, exactly when this
+# holds — on the host always, a legacy fixture root never. One predicate
+# for that block and for `beyond-rows`, so whether this host's runner has
+# a waker is asked the way it is installed (backlog 2eae38d4).
+ROOT_LAUNCHER="${BOSS_GCP_PREPARED_DIR:-/var/lib/boss/gcp-root-prepared}/bootstrap/infra/gcp/gcp-root-launch.sh"
+native_root_tree() {
+    [ -n "${BOSS_GCP_ACCEPTED_SHA:-}" ] || [ "$TIMER_ETC" = /etc/systemd/system ]
+}
+
 case "$MODE" in
+    beyond-rows)
+        helper=""
+        if native_root_tree; then helper="$ROOT_LAUNCHER"; fi
+        INSTALL_OPS_RUNNER_TREE_HELPER="$helper" \
+            bash "$REPO_ROOT/infra/ops/install-ops-runner.sh" --units || exit 78
+        exit 0
+        ;;
     rows)
         for stem in $ALL_STEMS; do
             echo "$stem:$(unit_dir "$stem")"
@@ -212,7 +235,7 @@ echo "==> install timer units from $REPO_ROOT (files only: no build, no schema, 
 # Native adoption requires the accepted preparation before the FIRST unit write.
 # Legacy fixture roots still exercise the ordinary roster without a live tree.
 ROOT_UNITS=
-if [ -n "${BOSS_GCP_ACCEPTED_SHA:-}" ] || [ "$TIMER_ETC" = /etc/systemd/system ]; then
+if native_root_tree; then
     [[ "${BOSS_GCP_ACCEPTED_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || { echo 'install-units: REFUSED — no accepted root generation; units unchanged' >&2; exit 78; }
     ROOT_UNITS="${BOSS_GCP_PREPARED_DIR:-/var/lib/boss/gcp-root-prepared}/units"
     [ -d "$ROOT_UNITS" ] && [ ! -L "$ROOT_UNITS" ] \
@@ -258,7 +281,7 @@ if [ -n "$ROOT_UNITS" ]; then
     install -m 0644 "$REPO_ROOT/infra/gcp/boss-gcp-converge.service" "$TIMER_ETC/boss-gcp-converge.service"
     INSTALL_OPS_RUNNER_REPO="${BOSS_GCP_ROOT_TREE:-/var/lib/boss/gcp-tree}/current" \
         INSTALL_OPS_RUNNER_CHECKOUT="${BOSS_GCP_DEPOSIT_CHECKOUT:-/opt/boss}" \
-        INSTALL_OPS_RUNNER_TREE_HELPER="${BOSS_GCP_PREPARED_DIR:-/var/lib/boss/gcp-root-prepared}/bootstrap/infra/gcp/gcp-root-launch.sh" \
+        INSTALL_OPS_RUNNER_TREE_HELPER="$ROOT_LAUNCHER" \
         INSTALL_ETC="$TIMER_ETC" INSTALL_SYSTEMCTL="$TIMER_SYSTEMCTL" \
         bash "$REPO_ROOT/infra/ops/install-ops-runner.sh" boss-gcp
 fi
@@ -329,7 +352,7 @@ for stem in $ALL_STEMS; do
     elif [ -n "$ROOT_UNITS" ]; then
         # Remaining callers hold the same generation lock too; a direct
         # current/script path could be pruned midway through a sourced read.
-        launcher="${BOSS_GCP_PREPARED_DIR:-/var/lib/boss/gcp-root-prepared}/bootstrap/infra/gcp/gcp-root-launch.sh"
+        launcher="$ROOT_LAUNCHER"
         sed -E "s@^(Exec[^=]*=)(-?)/opt/boss/(infra/[A-Za-z0-9_./-]+[.]sh)([[:space:]]|$)@\\1\\2$launcher run \\3\\4@" "$svc_src" > "${TIMER_ETC}/${stem}.service"
         chmod 0644 "${TIMER_ETC}/${stem}.service"
     else

@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use boss_jobs::http::{JobsApiState, router_shared, run_mover};
+use boss_jobs::http::{JobsApiState, router_shared, run_map_warmer, run_mover};
+
+#[path = "boss_jobs_api/database_diagnostics.rs"]
+mod database_diagnostics;
 use boss_jobs::jobs_config::JobsApiConfig;
 use boss_jobs::port::JobsRepository;
 use boss_nats::NatsEventBus;
@@ -365,6 +368,7 @@ async fn run_server<R: JobsRepository + 'static>(
     // and reads its window back from this pool's audit_log (e0bdba74).
     role_pool: &sqlx::PgPool,
 ) -> Result<()> {
+    let process_shutdown = boss_core::gate_evidence::ShutdownGuard::hold();
     // Start axum HTTP server.
     let step_registry = Arc::new(boss_jobs::step_registry::StepRegistry::v1());
     info!(
@@ -466,7 +470,44 @@ async fn run_server<R: JobsRepository + 'static>(
     // dispatcher port, overridable the way the people URL is.
     let dispatcher_url =
         std::env::var("BOSS_DISPATCHER_URL").unwrap_or_else(|_| boss_ports::url("dispatcher"));
+    let mut completion_contracts = boss_jobs::completion_contract::Contracts::new();
+    if let Some(workflows) = &kind_registry {
+        let files = Arc::new(
+            boss_jobs::browser_qualification_adapter::HttpObservationFiles::new(
+                std::env::var("BOSS_CONTENT_URL").unwrap_or_else(|_| boss_ports::url("content")),
+            )?,
+        );
+        for (name, accepting) in [
+            ("attended-browser-qualify-v1", false),
+            ("attended-browser-accept-v1", true),
+        ] {
+            completion_contracts.insert(
+                name.into(),
+                Arc::new(
+                    boss_jobs::browser_qualification_adapter::BrowserQualification {
+                        jobs: jobs.clone(),
+                        workflows: workflows.clone(),
+                        agents: agents.clone(),
+                        files: files.clone(),
+                        accepting,
+                    },
+                ) as Arc<dyn boss_jobs::completion_contract::CompletionContract>,
+            );
+        }
+    }
+    let membership_projection = Arc::new(
+        boss_jobs::membership_projection_service::MembershipProjectionService::new(
+            jobs.clone(),
+            Arc::new(
+                boss_jobs::membership_projection_pg::PgMembershipProjection::new(role_pool.clone()),
+            ),
+            Arc::new(boss_clock_client::WallClockClient),
+        ),
+    );
+    let membership_observation_owner =
+        Arc::new(boss_jobs::membership_observation_service::MembershipObservationOwner::new());
     let state = JobsApiState {
+        completion_contracts,
         job_edges,
         stations,
         jobs,
@@ -493,6 +534,7 @@ async fn run_server<R: JobsRepository + 'static>(
         // every claim is admitted as before.
         dispatcher_firings,
         schema_ledger,
+        schema_read_timeout: boss_jobs::schema_level::READ_TIMEOUT,
         // Presence tickets verify HERE, with the gateway's own key read
         // from the file the gateway signs with (backlog 72fe3640): this
         // door is reachable without the gateway, so a header it did not
@@ -510,6 +552,12 @@ async fn run_server<R: JobsRepository + 'static>(
         // schedule read as the viewer.
         credentials: credentials.clone(),
         sensors: sensors.clone(),
+        map_readings: Arc::new(boss_jobs::http::MapReadings::new()),
+        membership_observation_owner: membership_observation_owner.clone(),
+        membership_projection: Some(membership_projection.clone()),
+        map_flows: Arc::new(boss_jobs::reading_cache::ReadingCache::new(
+            boss_jobs::reading_cache::MAP_FLOW_LIFETIME,
+        )),
         dispatcher_schedule: Some(Arc::new(
             boss_jobs::dispatcher_schedule::ReqwestDispatcherSchedule::new(dispatcher_url.clone()),
         )),
@@ -526,6 +574,9 @@ async fn run_server<R: JobsRepository + 'static>(
     // audit log's head once a second (design e765b3fc §3). It stops when
     // the server does.
     tokio::spawn(run_mover(state.clone(), cancel_rx.clone()));
+    tokio::spawn(run_map_warmer(state.clone(), cancel_rx.clone()));
+    let projection_task = tokio::spawn(membership_projection.run(cancel_rx.clone()));
+    info!("yard map warmer started for authorized default and active readers");
     info!("yard mover started: /api/yard/moves and /api/yard/moves/stream");
     let scheduling_role_guards = state.role_guards.clone();
     let mut app = router_shared(state);
@@ -682,10 +733,7 @@ async fn run_server<R: JobsRepository + 'static>(
         boss_jobs::agents::LoginDoor::new(agents, door_publisher)
             .judging_rows_by_the_mounted_word(),
     );
-    let app = app.layer(axum::middleware::from_fn_with_state(
-        door,
-        boss_jobs::agents::resolve_login,
-    ));
+    let app = database_diagnostics::mount_with_login(app, role_pool.clone(), door);
     info!("login door mounted: agent logins resolve through actor_aliases (window open)");
     // The credential door (design f623e425 Q1, option A; backlog
     // 6c9183de): a runner that PRESENTS its host's credential is known to
@@ -747,22 +795,20 @@ async fn run_server<R: JobsRepository + 'static>(
         }
     });
 
-    let interrupt = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!(%error, "jobs interrupt signal unavailable");
-            std::future::pending::<()>().await;
-        }
-    };
-    // Gate evidence owns process termination; this path owns interrupts.
-    interrupt.await;
+    process_shutdown.requested().await;
     info!("shutdown signal received");
     let _ = cancel_tx.send(true);
+    membership_observation_owner.shutdown().await;
     role_refresh
         .await
         .context("joining jobs actor-role refresh")??;
 
     let _ = http_task.await;
+    projection_task
+        .await
+        .context("joining owned membership projection updater")?;
     info!("boss-jobs-api shut down cleanly");
+    process_shutdown.finish().await;
     Ok(())
 }
 

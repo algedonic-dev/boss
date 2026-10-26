@@ -15,7 +15,10 @@
 # (bc7cac00). The name was the last contended resource left.
 # Files not yet recorded in schema_migrations are applied in order, each
 # in one transaction WITH its bookkeeping row — so a re-run never
-# re-applies, and a failed migration leaves nothing behind. A schema
+# re-applies, and a failed migration leaves nothing behind. The one
+# exception is a file whose FIRST LINE is `-- migrate: no-transaction`:
+# it runs alone, outside a transaction, and is recorded after it
+# succeeds (a CONCURRENTLY index build cannot run inside one). A schema
 # change is a NEW file, never an edit to an applied one (expand/contract:
 # see docs/design/schema-migrations.md). Dropping a file in the directory
 # is the whole act of adding a migration; there is no list to update.
@@ -163,6 +166,18 @@ for f in "${ENTRIES[@]}"; do
     if $BASELINE; then
         q "INSERT INTO schema_migrations (id, checksum) VALUES ('$f', '$sum')" >/dev/null
         echo "baselined $f"
+    elif [ "$(head -n 1 "$DIR/$f")" = "-- migrate: no-transaction" ]; then
+        # A file that cannot run in a transaction block (CREATE INDEX
+        # CONCURRENTLY on a table that takes every write; design
+        # c195e83e Q4) runs ALONE, each statement committing as psql
+        # sends it, and is recorded only after the whole file succeeded.
+        # A failure records nothing, so the next run tries it again —
+        # which is why such a file must be safe to re-run from any point
+        # it can stop at. TestDb reads the same first line.
+        "${PSQL[@]}" -X -q -v ON_ERROR_STOP=1 < "$DIR/$f" \
+            || fail "applying $f (no-transaction) failed — it is not recorded and runs again next time"
+        q "INSERT INTO schema_migrations (id, checksum) VALUES ('$f', '$sum')" >/dev/null
+        echo "applied $f (no-transaction)"
     else
         {
             echo "BEGIN;"

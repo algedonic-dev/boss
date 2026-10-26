@@ -5,6 +5,7 @@
     "workflow": "maintenance-backup",
     "step": "run",
     "cronjob": "boss-pg-backup",
-    "actor": "automation:boss-step"
+    "actor": "automation:boss-step",
+    "alarm_failed": true
   }
 ]

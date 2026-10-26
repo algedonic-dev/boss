@@ -1,0 +1,241 @@
+# ---------------------------------------------------------------------------
+# node-maintenance-window — taking ONE cluster node down for hands-on
+# work (a disk, a part, a move) and bringing it back, as a protocol
+# rather than a sequence of commands someone remembers.
+#
+# WHY IT IS A PROTOCOL. The w-1 second-NVMe window of 2026-09-30 was run
+# with talosctl by hand (design 8457c07b), and the verbs it asked for
+# exist now — node-status, cordon-node, plan-a-node-shutdown,
+# shutdown-node, uncordon-node, node-disk-usage — each an ops-request
+# the forge runs, the destructive one signed by a passkey. What did not
+# exist was the ORDER, and the evidence each step owes before the next
+# is allowed. On 2026-10-19 David asked, with a third 1 TB disk in hand
+# for w-2: "can I just bring w-2 offline, or do we need to stop
+# anything first?" The answer was in five reads across the estate
+# (every volume on w-2 had two more replicas on the control planes; the
+# drain policy was Longhorn's default, which blocks only on a last
+# replica; the pods were daemonsets), and nothing had asked them. David:
+# "I don't want to be running manual command line scripts anymore." A
+# protocol asks, in order, and keeps the answers.
+#
+# THE SHAPE FOLLOWS replace-a-disk and join-a-node: measure before you
+# act, hold the work aimed at the node, one bounded act at a time, and
+# verify more than once afterwards. Every write here is an ops-request
+# packet on the forge; this packet records the request ids, so the
+# evidence is the forge's own readback (receipt copied, not retyped).
+#
+# THE STEP THIS PROTOCOL EXISTS FOR IS `measure`. A node can be drained
+# only if nothing on it is the last copy of anything: Longhorn's
+# node-drain-policy (block-if-contains-last-replica by default) refuses
+# the drain otherwise, and a forced shutdown past it loses data. The
+# node-status verb answers exactly "what would hold a drain" — the
+# cordon state, every condition, the live drain policy, the volumes whose
+# only replica is here, the pods a passkey would be evicting. The step
+# records those answers as fields, so a window that would lose a last
+# replica is refused at `measure`, not discovered at `power-off`.
+#
+# `quiesce` names what the node does for the pipeline before it goes
+# dark. On w-1 that is the gate volume (every gate runs there, design
+# 8457c07b) and the dev pod; on w-2 today it is nothing but daemonsets
+# and reschedulable controllers. The conductor fails open on a dark
+# host's observation (it boards anyway), so whatever a node carries is
+# held here by name, with the release action, before the cordon.
+#
+# `power-off` is the one destructive act. It is NOT this packet's
+# sign-off: shutdown-node declares requires_approval with
+# plan-a-node-shutdown as its plan verb, so the ops-request's own
+# approve step carries the rendered plan and the passkey (design
+# 17835005). This step records that request and its approval; it does
+# not duplicate the ceremony (presence only where it adds security,
+# design 1ce67f7e).
+#
+# `hands-on` is the human act with the lid off. It records the device's
+# STABLE identity (by-id path or serial), never its kernel name, for the
+# same reason replace-a-disk does: adding a disk renumbers the kernel's
+# devices.
+#
+# `declare-capacity` is where a new disk becomes capacity: a Talos
+# UserVolumeConfig in infra/cluster/talos/patches/<node>.yaml applied
+# through node-converge, and the Longhorn disk declaration that backlog
+# 493a02b6 is building a door for. Until that door exists the step
+# records what was declared and what still waits, and the packet closes
+# on what is real, not on what was intended.
+# ---------------------------------------------------------------------------
+
+[[workflow]]
+kind = "node-maintenance-window"
+label = "Node maintenance window"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+metadata = { department = "it" }
+description = "Taking one cluster node down for hands-on work and bringing it back, in the order the estate's own doors demand: measure what would hold a drain, hold the work the node carries, cordon, render the shutdown plan, power off under a passkey-signed plan, do the hands-on act, verify the node rejoined and its replicas are whole, uncordon, prove real work runs there again, and declare any new capacity. Every act is an ops-request on the forge; this packet keeps the request ids as its evidence."
+
+[[workflow.step]]
+title = "opened"
+kind = "trigger"
+ready_when = "true"
+title_template = "Node maintenance window: {metadata.node}"
+authority_role = "platform-admin"
+
+[[workflow.step]]
+title = "measure"
+kind = "task"
+ready_when = "steps.opened.done"
+title_template = "What would hold a drain of {metadata.node}"
+authority_role = "platform-admin"
+metadata_defaults = { procedure = "File `boss ops forge node-status <node> --wait` and `boss ops forge node-disk-usage <node> --wait` and record their packet ids in `measured_via`. `holds_drain` is the verb's own answer: the live node-drain-policy and whether anything on the node would block a drain under it. `last_replica_volumes` names every volume whose ONLY replica is on this node, or `none` — a window with any such volume stops here until a replica is placed elsewhere (set-volume-replicas / move-volume-replica). `pods_present` names the pods a drain would evict that are not daemonsets, and where each can reschedule. Read, do not reason: a node that looks idle on the yard can hold the one copy of a volume." }
+fields = [
+  { name = "measured_via", field_type = "string", required = true },
+  { name = "holds_drain", field_type = "string", required = true },
+  { name = "last_replica_volumes", field_type = "string", required = true },
+  { name = "pods_present", field_type = "string", required = true },
+]
+
+[[workflow.step]]
+title = "quiesce"
+kind = "task"
+ready_when = "steps.measure.done AND steps.measure.metadata.last_replica_volumes = \"none\""
+title_template = "Hold the work {metadata.node} carries"
+authority_role = "platform-admin"
+metadata_defaults = { procedure = "Name what the pipeline runs on this node and hold it before the cordon: on w-1 the gate volume (every gate runs there) and the dev pod; on a node that carries only daemonsets and reschedulable controllers, `held` is `nothing: <what was checked>`. `expected_dark` says what will read as down while the node is off, so an alarm filed in the window is read as expected rather than diagnosed. `release_action` is the exact step that lifts the hold afterwards, named now so it cannot be forgotten later." }
+fields = [
+  { name = "held", field_type = "string", required = true },
+  { name = "expected_dark", field_type = "string", required = true },
+  { name = "release_action", field_type = "string", required = true },
+]
+
+[[workflow.step]]
+title = "cordon"
+kind = "task"
+ready_when = "steps.quiesce.done"
+title_template = "Cordon {metadata.node}"
+authority_role = "platform-admin"
+metadata_defaults = { procedure = "File `boss ops forge cordon-node <node> --wait` (no approval: it stops new scheduling and reads spec.unschedulable back). Record the packet id and the verb's readback line verbatim in `unschedulable_read_back`; it must say true. Nothing is evicted by a cordon; running pods finish where they are." }
+fields = [
+  { name = "cordon_request", field_type = "string", required = true },
+  { name = "unschedulable_read_back", field_type = "string", required = true },
+]
+
+[[workflow.step]]
+title = "plan"
+kind = "task"
+ready_when = "steps.cordon.done"
+title_template = "Render the shutdown plan for {metadata.node}"
+authority_role = "platform-admin"
+metadata_defaults = { procedure = "File `boss ops forge plan-a-node-shutdown <node> --wait`. It refuses an uncordoned node and prints the one command the write would run, the Node uid, its cordon and Ready condition, and `plan-sha256:` on stderr. Record the packet id and the hash. `drain_would_block` restates, from the plan, whether Talos's graceful drain can complete (never --force: the write cordons and drains through the eviction API before it powers off)." }
+fields = [
+  { name = "plan_request", field_type = "string", required = true },
+  { name = "plan_sha256", field_type = "string", required = true },
+  { name = "drain_would_block", field_type = "string", required = true },
+]
+
+[[workflow.step]]
+title = "power-off"
+kind = "task"
+ready_when = "steps.plan.done"
+title_template = "Power off {metadata.node} under the signed plan"
+authority_role = "platform-admin"
+metadata_defaults = { procedure = "File `boss ops forge shutdown-node <node> <plan_sha256>`. The runner renders plan-a-node-shutdown onto that request's approve step; a platform-admin signs it with a passkey on the website (presence, bound to the plan bytes, single-use, under ten minutes old) and only then does the host run `talosctl shutdown`. Record the request id, who approved it (from the request's approve step, not from memory) and when the Node went NotReady (`boss ops forge node-status <node>`)." }
+fields = [
+  { name = "shutdown_request", field_type = "string", required = true },
+  { name = "approved_by", field_type = "string", required = true },
+  { name = "powered_off_at", field_type = "string", required = true },
+]
+
+[[workflow.step]]
+title = "hands-on"
+kind = "task"
+ready_when = "steps.power-off.done"
+title_template = "The hands-on act on {metadata.node}"
+authority_role = "platform-admin"
+metadata_defaults = { procedure = "The physical act, in the operator's words: what was installed, removed or moved. `device_identity` is the new device's STABLE identity (its /dev/disk/by-id/ name or serial, read after boot with `boss ops forge talos-get <node> disks`), never a kernel name, or `none` when nothing was added. `powered_on_at` is when the box came back, from the clock." }
+fields = [
+  { name = "act", field_type = "string", required = true },
+  { name = "device_identity", field_type = "string", required = true },
+  { name = "powered_on_at", field_type = "string", required = true },
+]
+
+[[workflow.step]]
+title = "verify-rejoin"
+kind = "task"
+ready_when = "steps.hands-on.done"
+title_template = "{metadata.node} rejoined and its replicas are whole"
+authority_role = "platform-admin"
+metadata_defaults = { procedure = "File `boss ops forge node-status <node> --wait` (Ready true, still cordoned) and `boss ops forge node-disk-usage <node> --wait` (every Longhorn replica on the node listed healthy again, none rebuilding or faulted). Record both packet ids. A node that is Ready with a degraded replica is not back; wait for the rebuild and read again." }
+fields = [
+  { name = "node_status_request", field_type = "string", required = true },
+  { name = "ready", field_type = "string", required = true },
+  { name = "replicas", field_type = "string", required = true },
+]
+
+[[workflow.step]]
+title = "uncordon"
+kind = "task"
+ready_when = "steps.verify-rejoin.done"
+title_template = "Uncordon {metadata.node}"
+authority_role = "platform-admin"
+metadata_defaults = { procedure = "File `boss ops forge uncordon-node <node> --wait`. Record the packet id and the readback line (spec.unschedulable unset or false). Then perform `release_action` from `quiesce` and say so in `released`." }
+fields = [
+  { name = "uncordon_request", field_type = "string", required = true },
+  { name = "schedulable_read_back", field_type = "string", required = true },
+  { name = "released", field_type = "string", required = true },
+]
+
+[[workflow.step]]
+title = "verify-work"
+kind = "task"
+ready_when = "steps.uncordon.done"
+title_template = "Real work ran on {metadata.node} again"
+authority_role = "platform-admin"
+metadata_defaults = { procedure = "Name a workload that scheduled on the node after the uncordon and ran to completion, and the read that shows it (a pod on the node by `boss ops forge node-disk-usage <node>`, a gate or worker Job that succeeded there). Component health is not system health: a Ready node nothing has run on is a belief." }
+fields = [
+  { name = "workload", field_type = "string", required = true },
+  { name = "evidence", field_type = "string", required = true },
+]
+
+[[workflow.step]]
+title = "declare-capacity"
+kind = "task"
+ready_when = "steps.verify-work.done AND steps.hands-on.metadata.device_identity != \"none\""
+title_template = "The new device on {metadata.node} is declared capacity"
+authority_role = "platform-admin"
+metadata_defaults = { procedure = "A new disk is capacity only once the tree declares it and the cluster uses it. `declared_in` names the car that adds the UserVolumeConfig to infra/cluster/talos/patches/<node>.yaml and the node-converge request that applied it (its plan signed by a passkey). `consumer` names what now uses the volume: the Longhorn disk declaration (the door of backlog 493a02b6, or the item id while that door is unbuilt), a local PV, or `none yet` with the item that owes it. `capacity_read` is the `boss ops forge node-disk-usage <node>` packet whose longhorn disks line lists the new disk, or the reason it cannot yet." }
+fields = [
+  { name = "declared_in", field_type = "string", required = true },
+  { name = "consumer", field_type = "string", required = true },
+  { name = "capacity_read", field_type = "string", required = true },
+]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.verify-work.done AND (steps.declare-capacity.done OR steps.hands-on.metadata.device_identity = \"none\")"
+title_template = "Window closed: {metadata.node}"
+authority_role = "platform-admin"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }
+
+[[workflow.step]]
+title = "aborted"
+kind = "outcome"
+ready_when = "steps.cordon.done"
+title_template = "Window aborted: {metadata.node}"
+authority_role = "platform-admin"
+metadata_defaults = { outcome_kind = "withdrawn", procedure = "A window that stops after the cordon leaves the node unschedulable: record the `boss ops forge uncordon-node <node>` request that lifted it, and the release of whatever `quiesce` held, before this closes." }
+terminal = { outcome = "aborted" }
+fields = [
+  { name = "reason", field_type = "string", required = true },
+  { name = "uncordon_request", field_type = "string", required = true },
+  { name = "released", field_type = "string", required = true },
+]
+
+[[workflow.step]]
+title = "not-needed"
+kind = "outcome"
+ready_when = "steps.measure.done"
+title_template = "No window: {metadata.node}"
+authority_role = "platform-admin"
+metadata_defaults = { outcome_kind = "withdrawn" }
+terminal = { outcome = "not-needed" }
+fields = [{ name = "reason", field_type = "string", required = true }]

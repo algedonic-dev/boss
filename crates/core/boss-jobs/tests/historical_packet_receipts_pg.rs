@@ -175,6 +175,58 @@ async fn membership_snapshot_freezes_native_clock_head_cut_and_current_policy_bi
     );
 }
 
+/// f5d2a8f5 (2026-10-17): on production the default flow basis held a
+/// REPEATABLE READ transaction for 16+ minutes to reach a refusal that
+/// was fixed before the scan began. Scope All matched 1.2M history rows
+/// against a 250k bound, yet the bound was judged only by a COUNT over
+/// the whole outer history query, which cannot use an index for its
+/// group-sibling arm. The relevant rows are a subset of that outer
+/// answer, so a relevant set over the bound is the same refusal, and it
+/// can be read without the full scan. The fixture hides `source`, a
+/// column only the full-history statements read: any of them that runs
+/// fails on it, while the relevant-set count never reads it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_over_bound_membership_history_is_refused_before_the_full_scan() {
+    let db = TestDb::new().await;
+    let repo = PgJobs::new(db.pool.clone());
+    let mut tx = db.pool.begin().await.unwrap();
+    for _ in 0..3 {
+        let admission = Event::new(
+            "jobs",
+            boss_jobs::events::JOB_CREATED,
+            json!({"id": JobId::new()}),
+            chrono::Utc::now(),
+        );
+        record_event_in_tx(&mut tx, &admission).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+    let bus: Arc<dyn EventBus> = RecordingEventBus::new();
+    drain_outbox_once(&db.pool, &bus, 100).await.unwrap();
+    sqlx::query("ALTER TABLE audit_log RENAME COLUMN source TO source_withheld")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let since = chrono::Utc::now() - chrono::Duration::hours(1);
+    let all = boss_jobs::port::JobScope::All;
+    let over = repo
+        .membership_snapshot(since, None, &all, 2)
+        .await
+        .expect_err("three admissions cannot fit a bound of two")
+        .to_string();
+    assert!(
+        over.contains("exceeds row bound"),
+        "an over-bound relevant set must be refused before any full-history statement runs: {over}"
+    );
+    // Control: within the bound the full history IS read, and the hidden
+    // column refuses it — so the fixture can see a full scan when one runs.
+    let under = repo
+        .membership_snapshot(since, None, &all, 4096)
+        .await
+        .expect_err("the full history statement reads the hidden column")
+        .to_string();
+    assert!(under.contains("source"), "{under}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn native_http_membership_counts_packet_metadata_crossings_without_ready_done_markers() {
     native_http_metadata_crossings(false).await;

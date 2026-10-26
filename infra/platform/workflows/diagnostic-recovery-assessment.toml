@@ -6,7 +6,14 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Assess the decided retained preparation from original evidence without repeating compute or changing the original diagnostic."
-metadata = { department = "it", owner_role = "platform-admin", diagnostic_executor = "automation:train-conductor", diagnostic_recovery_assessment = "v1" }
+metadata = { department = "it", owner_role = "platform-admin" }
+# Backlog 97170186: the conductor's queue selects on these job markers,
+# and v1 declared them only in `metadata` above, which describes and
+# never reaches a packet — so 28e96fbc was admitted invisible. Admission
+# now refuses a packet without them, or with any other request than the
+# decided original. Pinned to the queue's own definition by
+# diagnostic_adapter's admission_tests.
+metadata_schema = { required_values = { diagnostic_executor = "automation:train-conductor", diagnostic_recovery_assessment = "v1", request = { original_request = "688b4f42-9e65-4f58-aaf7-53c841113cd0" } } }
 
 [[workflow.step]]
 title = "filed"

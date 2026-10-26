@@ -28,7 +28,7 @@ fn run(dir: &Path, account: &str, keys: &Path, real_user: bool, bound: u32) -> O
     write_exec(
         &runner,
         &format!(
-            "#!/bin/bash\nset -uo pipefail\naudit_bound=$BOUND\nDEPOSIT_ACCOUNT=$ACCOUNT\nak_files=(\"$KEYS\")\nalog=$LOG\narc=0\n{}\nprintf 'audit-exit=%s\\n' \"$arc\"\ncat \"$alog\"\nexit \"$arc\"\n",
+            "#!/bin/bash\nset -uo pipefail\naudit_bound=$BOUND\nDEPOSIT_ACCOUNT=$ACCOUNT\nak_files=(\"$KEYS\")\nprepared_args=()\nalog=$LOG\narc=0\n{}\nprintf 'audit-exit=%s\\n' \"$arc\"\ncat \"$alog\"\nexit \"$arc\"\n",
             transport()
         ),
     );

@@ -1038,6 +1038,32 @@ mod rejection_count_controls {
             self.calls.lock().unwrap().push("update_job_at");
             self.inner.update_job_at(job, read, now, events).await
         }
+        async fn update_job_expecting_at(
+            &self,
+            job: &Job,
+            read: JobStatus,
+            expect: Option<&serde_json::Map<String, serde_json::Value>>,
+            now: DateTime<Utc>,
+            events: &[boss_core::event::Event],
+        ) -> Result<(), JobsError> {
+            self.calls.lock().unwrap().push("update_job_at");
+            self.inner
+                .update_job_expecting_at(job, read, expect, now, events)
+                .await
+        }
+        async fn merge_job_metadata_expecting_at(
+            &self,
+            id: &JobId,
+            patch: &serde_json::Map<String, serde_json::Value>,
+            judged_on: Option<&Job>,
+            expect: Option<&serde_json::Map<String, serde_json::Value>>,
+            stamp: &boss_core::publisher::EventStamp,
+        ) -> Result<Job, JobsError> {
+            self.calls.lock().unwrap().push("merge_job_metadata_at");
+            self.inner
+                .merge_job_metadata_expecting_at(id, patch, judged_on, expect, stamp)
+                .await
+        }
         async fn merge_job_metadata_at(
             &self,
             id: &JobId,
@@ -1071,6 +1097,20 @@ mod rejection_count_controls {
         ) -> Result<(Job, usize), JobsError> {
             self.calls.lock().unwrap().push("append_step_correction_at");
             self.inner.append_step_correction_at(id, entry, stamp).await
+        }
+        async fn append_input_classification_at(
+            &self,
+            id: &JobId,
+            entry: &serde_json::Value,
+            stamp: &boss_core::publisher::EventStamp,
+        ) -> Result<(Job, usize), JobsError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("append_input_classification_at");
+            self.inner
+                .append_input_classification_at(id, entry, stamp)
+                .await
         }
         async fn list_estate_nodes(&self) -> Result<Vec<EstateNode>, JobsError> {
             self.calls.lock().unwrap().push("list_estate_nodes");

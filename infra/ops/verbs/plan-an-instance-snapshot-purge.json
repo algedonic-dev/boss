@@ -1,0 +1,11 @@
+{
+  "about": "READ-ONLY plan for one instance's attached healthy Longhorn V1 volume, qualified per-volume and per-engine to v1.11.3. Resolves exact PVC UID to PV CSI identity to Longhorn UID/engine/complete replicas; requires complete native snapshot and backup inventories and a fresh engine snapshotList response. Freezes the system/already-removed snapshot roster and retained user/backup recovery points, not live volume-head byte counters. Refuses backup-bound purge candidates, backup Jobs/Job-owned Pods, active or unknown backup/rebuild/restore/migration/purge and unhealthy replicas. This makes no deletion, attachment, resize, retention change or reclaim guarantee. Its exact stdout bytes are what David's separate passkey approval signs. The purge is volume-wide and fresh reads are not a cross-resource lock. Ordinary application Pods may remain online. Original bounded native receipts are retained on the ops request.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/instance-snapshot-purge.sh", "--plan", "{1}", "{2}"],
+  "params": [
+    {"name": "namespace", "pattern": "^[a-z][a-z0-9-]{0,62}$"},
+    {"name": "pvc", "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"}
+  ],
+  "timeout": 480,
+  "capture": "separate-streams"
+}

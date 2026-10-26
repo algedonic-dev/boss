@@ -159,6 +159,8 @@
   {:else}
     <div class="hud-board" data-state={b.kind}>
       <div class="line hud-count">{@render fig(b.count)}<span class="hud-sub">for {b.whom}</span></div>
+      <!-- A cut answer says so in words beside its floor (backlog 97b5cf45). -->
+      {#if b.cut !== null}<div class="line hud-sub" data-cut>cut: {b.cut}</div>{/if}
       {#if b.kind === 'empty'}
         <p class="hud-words">{b.words}</p>
       {:else}

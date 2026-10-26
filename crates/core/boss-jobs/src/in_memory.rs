@@ -34,6 +34,9 @@ pub struct InMemoryJobs {
     /// 82448947).
     step_plugins: Option<std::sync::Arc<dyn crate::step_plugins::StepPluginRegistry>>,
     workflows: Option<std::sync::Arc<dyn crate::registry::WorkflowRegistry>>,
+    #[cfg(test)]
+    pub(crate) projection_source_gate:
+        Mutex<Option<std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>>>,
 }
 
 #[derive(Default)]
@@ -71,15 +74,42 @@ struct State {
     /// Packets whose steps read fails, set by
     /// [`InMemoryJobs::fail_steps_read`].
     unreadable_steps: BTreeSet<String>,
+    /// How many times each packet's steps were read, failed reads
+    /// included, for [`InMemoryJobs::steps_reads`].
+    steps_reads: HashMap<String, usize>,
+    /// How many passes over the log the flow cube has made, for
+    /// [`InMemoryJobs::flow_cube_passes`].
+    flow_cube_passes: usize,
+    /// How many times the membership reader was asked, for
+    /// [`InMemoryJobs::membership_reads`].
+    membership_reads: usize,
+    /// The native history a test hands the membership reader, set by
+    /// [`InMemoryJobs::answer_membership`]. Unset, the reader refuses.
+    membership_answer: Option<crate::membership_replay::ReplayInput>,
     /// Packets whose close write fails, set by
     /// [`InMemoryJobs::fail_job_close`].
     unclosable_jobs: BTreeSet<String>,
     /// Packets whose own row read fails, set by
     /// [`InMemoryJobs::fail_job_read`].
     unreadable_jobs: BTreeSet<String>,
+    /// How many more steps reads of a packet answer before every later
+    /// one fails, set by [`InMemoryJobs::fail_steps_read_after`].
+    steps_reads_left: HashMap<String, usize>,
+    /// How many more row reads of a packet answer before every later
+    /// one fails, set by [`InMemoryJobs::fail_job_read_after`].
+    job_reads_left: HashMap<String, usize>,
+    /// How many times each packet's own row was read, failed reads
+    /// included, for [`InMemoryJobs::job_reads`].
+    job_reads: HashMap<String, usize>,
+    /// Steps whose judged writes fail, and how, set by
+    /// [`InMemoryJobs::fault_step_write`].
+    step_write_faults: HashMap<String, StepWriteFault>,
     /// Kind/offset list reads that fail, set by
     /// [`InMemoryJobs::fail_jobs_list`].
     unreadable_job_pages: BTreeSet<(String, i64)>,
+    /// Whether the queue-age read fails, set by
+    /// [`InMemoryJobs::fail_queue_age`].
+    unreadable_queue_age: bool,
     /// Packets the next `get_job` does not see yet, set by
     /// [`InMemoryJobs::miss_next_job_read`].
     unseen_once: BTreeSet<String>,
@@ -88,7 +118,7 @@ struct State {
     merge_after_read: HashMap<String, serde_json::Map<String, serde_json::Value>>,
     /// Changes that land just before a step's next judged write, set by
     /// [`InMemoryJobs::change_before_next_judged_write`].
-    change_before_write: HashMap<String, StepChange>,
+    change_before_write: HashMap<String, std::collections::VecDeque<StepChange>>,
     /// Changes that land on a job row the moment it is next read, set
     /// by [`InMemoryJobs::change_job_after_next_read`].
     job_change_after_read: HashMap<String, JobChange>,
@@ -100,13 +130,33 @@ struct State {
     discarded_versions: std::collections::HashSet<(String, i32)>,
 }
 
+/// How a step's judged writes fail, set by
+/// [`InMemoryJobs::fault_step_write`] — the three ways the skip a
+/// packet's end owes each of its open steps could not land, each of
+/// which the skip only logged while its caller closed the packet anyway
+/// (backlog 0887d2a9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepWriteFault {
+    /// Every judged write of the step is refused with a storage error.
+    Refused,
+    /// Every judged write answers that another writer moved the row
+    /// since it was read, and writes nothing — a row that keeps moving
+    /// under every retry the writer has.
+    KeepsMoving,
+    /// As [`StepWriteFault::KeepsMoving`], and the re-read the writer
+    /// then takes of the step fails with a storage error.
+    MovedThenUnreadable,
+}
+
 /// A change another writer lands on a step row (test hook).
 type StepChange = Box<dyn FnOnce(&mut Step) + Send>;
 /// A change another writer lands on a job row (test hook).
 type JobChange = Box<dyn FnOnce(&mut Job) + Send>;
 
-fn verify_memory_deadline(deadline: std::time::Instant) -> Result<(), JobsError> {
-    if std::time::Instant::now() >= deadline {
+/// The ingress deadline is read on tokio's clock, as every reader of it is
+/// (f10419f9, review a0fd6902).
+fn verify_memory_deadline(deadline: tokio::time::Instant) -> Result<(), JobsError> {
+    if tokio::time::Instant::now() >= deadline {
         Err(JobsError::SelectionConflict(
             "selection ingress deadline expired before commit dispatch".into(),
         ))
@@ -115,9 +165,9 @@ fn verify_memory_deadline(deadline: std::time::Instant) -> Result<(), JobsError>
     }
 }
 
-async fn retry_memory_owners(deadline: std::time::Instant) -> Result<(), JobsError> {
+async fn retry_memory_owners(deadline: tokio::time::Instant) -> Result<(), JobsError> {
     let remaining = deadline
-        .checked_duration_since(std::time::Instant::now())
+        .checked_duration_since(tokio::time::Instant::now())
         .ok_or_else(|| {
             JobsError::SelectionConflict(
                 "selection ingress deadline expired during owner acquisition".into(),
@@ -199,8 +249,7 @@ impl InMemoryJobs {
                 ),
             },
         ));
-        let deadline =
-            observation.ingress.started() + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET;
+        let deadline = observation.ingress.deadline();
         let mut predicted = context.validated_step.clone();
         predicted.assignee_id = Some(actor.to_owned());
         if crate::calendar_hook::start_request(&predicted, actor)
@@ -251,7 +300,7 @@ impl InMemoryJobs {
         displaceable: &[String],
         stamp: &boss_core::publisher::EventStamp,
         events: &[boss_core::event::Event],
-        deadline: std::time::Instant,
+        deadline: tokio::time::Instant,
     ) -> Result<Option<crate::station_claim::SelectionResult>, JobsError> {
         use crate::station_claim::SelectionResult;
         verify_memory_deadline(deadline)?;
@@ -731,12 +780,25 @@ impl InMemoryJobs {
                     "pinned metadata declaration unavailable: {error}"
                 ))
             })?;
-        if spec.status == crate::registry::WorkflowStatus::Draft {
+        if !spec.status.was_published() {
             return Err(JobsError::ImmutableMetadata(
-                "draft workflow cannot authorize metadata binding".into(),
+                "unpublished workflow cannot authorize metadata binding".into(),
             ));
         }
         Ok(Some((job.kind, job.workflow_version, spec.metadata_schema)))
+    }
+
+    /// The packets pinned to `(kind, version)`, counted and spending
+    /// nothing — what a reject asks (backlog 50ded63d). Called under
+    /// the registry's rows hold, as the discard's spend is. `None` is a
+    /// poisoned store, which the caller refuses rather than reads as 0.
+    pub(crate) fn workflow_version_pins(
+        &self,
+        kind: &str,
+        version: i32,
+    ) -> Option<crate::port::PinnedJobs> {
+        let state = self.inner.lock().ok()?;
+        Some(pinned_to_workflow_locked(&state, kind, version))
     }
 
     /// The discard's half of the admission/discard ordering (backlog
@@ -823,12 +885,136 @@ impl InMemoryJobs {
         }
     }
 
+    /// How many times this packet's steps have been read, failed reads
+    /// included. It exists so a reader that must NOT read steps is
+    /// testable: a cut page of open runs reads as unread whether or not
+    /// its steps were fetched first, so only the count tells a reader
+    /// that discards the page before reading it from one that reads
+    /// every run's steps and then discards them (backlog 1927aca5).
+    pub fn steps_reads(&self, job_id: &JobId) -> usize {
+        self.inner
+            .lock()
+            .map(|state| {
+                state
+                    .steps_reads
+                    .get(&job_key(job_id))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+
+    /// How many passes over the log the step-events flow cube has made —
+    /// one per statement the Pg adapter would run. It exists so a
+    /// reader's FREQUENCY is testable (backlog 29f7e897): since item
+    /// ab09f1af's car 2 it pins that the IT map never reads the cube.
+    pub fn flow_cube_passes(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|state| state.flow_cube_passes)
+            .unwrap_or(0)
+    }
+
+    /// How many times the packet-membership reader was asked — one per
+    /// snapshot transaction the Pg adapter would open. The counts a
+    /// surface draws cannot tell one read from two, or a mover that
+    /// discards the flow from one that never reads it; this can.
+    pub fn membership_reads(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|state| state.membership_reads)
+            .unwrap_or(0)
+    }
+
+    /// Hand the membership reader a native history to answer with: this
+    /// adapter keeps none of its own, so a surface test that needs a
+    /// COUNTED flow (a station that served nothing, say) supplies the
+    /// originals the Pg adapter would have read. Each read answers it
+    /// with the window the caller asked for; one that does not precede
+    /// the history's own cut is refused, as the Pg reader refuses it.
+    pub fn answer_membership(&self, history: crate::membership_replay::ReplayInput) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.membership_answer = Some(history);
+        }
+    }
+
     /// Restore step reads after an injected temporary storage failure.
     /// A retry test must recover the same store, not build a fresh one.
     pub fn restore_steps_read(&self, job_id: &JobId) {
         if let Ok(mut state) = self.inner.lock() {
             state.unreadable_steps.remove(&job_key(job_id));
+            state.steps_reads_left.remove(&job_key(job_id));
         }
+    }
+
+    /// Let the next `reads` steps reads of this packet answer, and fail
+    /// every one after them with a storage error until
+    /// [`InMemoryJobs::restore_steps_read`]. The counted twin of
+    /// [`InMemoryJobs::fail_steps_read`], which fails the FIRST read: a
+    /// step write reads its packet's steps several times — the readiness
+    /// pass first, then the declared-terminal close, then the catch-all
+    /// — so only a counted failure reaches a read behind the first, and
+    /// the terminal close's read answered a failure by closing the
+    /// packet with its open steps left open (backlog 140e7984).
+    pub fn fail_steps_read_after(&self, job_id: &JobId, reads: usize) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.steps_reads_left.insert(job_key(job_id), reads);
+        }
+    }
+
+    /// Let the next `reads` row reads of this packet answer, and fail
+    /// every one after them with a storage error until
+    /// [`InMemoryJobs::restore_job_read`]. The counted twin of
+    /// [`InMemoryJobs::fail_job_read`], for the same reason as
+    /// [`InMemoryJobs::fail_steps_read_after`]: the settle's catch-all
+    /// reads the packet after the step write has read it already, and
+    /// read a failure there as "nothing to close" (backlog 140e7984).
+    pub fn fail_job_read_after(&self, job_id: &JobId, reads: usize) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.job_reads_left.insert(job_key(job_id), reads);
+        }
+    }
+
+    /// Restore row reads after [`InMemoryJobs::fail_job_read`] or
+    /// [`InMemoryJobs::fail_job_read_after`], so a test can send the
+    /// retry a failed read's 500 asks for against the same store.
+    pub fn restore_job_read(&self, job_id: &JobId) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.unreadable_jobs.remove(&job_key(job_id));
+            state.job_reads_left.remove(&job_key(job_id));
+        }
+    }
+
+    /// Make every later judged write of this STEP fail as `fault` says,
+    /// until [`InMemoryJobs::restore_step_write`]. Judged writes are the
+    /// version-checked ones (`update_step_if_unchanged_at`) — the write
+    /// a packet's end skips each open step through — so a test can fail
+    /// one step's skip while every other write lands: the terminal close
+    /// and the job door's end each logged a skip that did not land and
+    /// closed the packet around the step anyway (backlog 0887d2a9).
+    pub fn fault_step_write(&self, step_id: &StepId, fault: StepWriteFault) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.step_write_faults.insert(step_key(step_id), fault);
+        }
+    }
+
+    /// Restore a step's writes after [`InMemoryJobs::fault_step_write`],
+    /// so a test can send the retry a refused skip's 500 asks for
+    /// against the same store.
+    pub fn restore_step_write(&self, step_id: &StepId) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.step_write_faults.remove(&step_key(step_id));
+        }
+    }
+
+    /// How many times this packet's own row has been read, failed reads
+    /// included — what a sweep over [`InMemoryJobs::fail_job_read_after`]
+    /// counts its positions from.
+    pub fn job_reads(&self, job_id: &JobId) -> usize {
+        self.inner
+            .lock()
+            .map(|state| state.job_reads.get(&job_key(job_id)).copied().unwrap_or(0))
+            .unwrap_or(0)
     }
 
     /// Make every later `close_job_at` of this packet fail with a
@@ -839,6 +1025,15 @@ impl InMemoryJobs {
     pub fn fail_job_close(&self, job_id: &JobId) {
         if let Ok(mut state) = self.inner.lock() {
             state.unclosable_jobs.insert(job_key(job_id));
+        }
+    }
+
+    /// Restore closes after [`InMemoryJobs::fail_job_close`], so a test
+    /// can send the retry a failed close's 500 asks for against the same
+    /// store (backlog 657c9200).
+    pub fn restore_job_close(&self, job_id: &JobId) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.unclosable_jobs.remove(&job_key(job_id));
         }
     }
 
@@ -860,6 +1055,17 @@ impl InMemoryJobs {
     pub fn fail_jobs_list(&self, kind: &str, offset: i64) {
         if let Ok(mut state) = self.inner.lock() {
             state.unreadable_job_pages.insert((kind.into(), offset));
+        }
+    }
+
+    /// Make every later `queue_age` read fail with a storage error, so a
+    /// reader's answer to onsets it could not read is testable: the map
+    /// read it with `.ok()`, so a failed read told every standing step
+    /// its ready instant was not on the record — blaming the record for
+    /// a read that failed (backlog 35d29890).
+    pub fn fail_queue_age(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.unreadable_queue_age = true;
         }
     }
 
@@ -928,7 +1134,18 @@ impl InMemoryJobs {
         if let Ok(mut state) = self.inner.lock() {
             state
                 .change_before_write
-                .insert(step_key(step_id), Box::new(change));
+                .insert(step_key(step_id), [Box::new(change) as StepChange].into());
+        }
+    }
+
+    /// A bounded sequence of real competing row writes, each interrupted
+    /// before its own settle. Unlike a synthetic `StepChanged`, every
+    /// refusal comes from the adapter's actual version comparison.
+    pub fn changes_before_judged_writes(&self, step_id: &StepId, changes: Vec<StepChange>) {
+        if let Ok(mut state) = self.inner.lock() {
+            state
+                .change_before_write
+                .insert(step_key(step_id), changes.into());
         }
     }
 
@@ -950,7 +1167,23 @@ impl InMemoryJobs {
             .map_err(|_| JobsError::Storage("event log unavailable".into()))?;
         let key = step_key(&step.id);
         if read.is_some()
-            && let Some(change) = state.change_before_write.remove(&key)
+            && let Some(fault) = state.step_write_faults.get(&key)
+        {
+            return Err(match fault {
+                StepWriteFault::Refused => JobsError::Storage(format!(
+                    "step {} unwritable (injected by fault_step_write)",
+                    step.id
+                )),
+                StepWriteFault::KeepsMoving | StepWriteFault::MovedThenUnreadable => {
+                    JobsError::StepChanged { id: step.id }
+                }
+            });
+        }
+        if read.is_some()
+            && let Some(change) = state
+                .change_before_write
+                .get_mut(&key)
+                .and_then(|changes| changes.pop_front())
             && let Some(row) = state.steps.get_mut(&key)
         {
             // Another writer's write: it moves the version as any does.
@@ -1272,7 +1505,7 @@ impl JobsRepository for InMemoryJobs {
             .native_selection
             .as_ref()
             .ok_or_else(|| JobsError::Storage("native memory owners unavailable".into()))?;
-        let deadline = ingress.started() + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET;
+        let deadline = ingress.deadline();
         loop {
             verify_memory_deadline(deadline)?;
             let result = store.try_read(ingress, |user, scope| {
@@ -1321,7 +1554,7 @@ impl JobsRepository for InMemoryJobs {
             .native_selection
             .as_ref()
             .ok_or_else(|| JobsError::Storage("native memory owners unavailable".into()))?;
-        let deadline = ingress.started() + crate::station_claim::SELECTION_PRE_COMMIT_BUDGET;
+        let deadline = ingress.deadline();
         loop {
             verify_memory_deadline(deadline)?;
             if let Some(observation) =
@@ -1440,10 +1673,19 @@ impl JobsRepository for InMemoryJobs {
 
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError> {
         let mut state = self.inner.lock().expect("poisoned");
+        *state.job_reads.entry(job_key(id)).or_default() += 1;
         if state.unreadable_jobs.contains(&job_key(id)) {
             return Err(JobsError::Storage(format!(
                 "job {id} unreadable (injected by fail_job_read)"
             )));
+        }
+        if let Some(left) = state.job_reads_left.get_mut(&job_key(id)) {
+            if *left == 0 {
+                return Err(JobsError::Storage(format!(
+                    "job {id} unreadable (injected by fail_job_read_after)"
+                )));
+            }
+            *left -= 1;
         }
         if state.unseen_once.remove(&job_key(id)) {
             return Ok(None);
@@ -1475,6 +1717,18 @@ impl JobsRepository for InMemoryJobs {
         &self,
         job: &Job,
         read: JobStatus,
+        now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError> {
+        self.update_job_expecting_at(job, read, None, now, events)
+            .await
+    }
+
+    async fn update_job_expecting_at(
+        &self,
+        job: &Job,
+        read: JobStatus,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
         _now: chrono::DateTime<chrono::Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
@@ -1485,6 +1739,13 @@ impl JobsRepository for InMemoryJobs {
             let Some(existing) = state.jobs.get(&key) else {
                 return Err(JobsError::NotFound(job.id));
             };
+            // The writer's precondition, judged under the same lock as
+            // the write (backlog 87fe090d) — the Pg adapter's FOR UPDATE.
+            if let Some(expect) = expect
+                && !crate::step_metadata_write::metadata_still_reads(&existing.metadata, expect)
+            {
+                return Err(JobsError::JobChanged { id: job.id });
+            }
             crate::metadata_immutability::preserve(&existing.metadata, &job.metadata, false)
                 .map_err(JobsError::ImmutableMetadata)?;
             if let Some((kind, version, schema)) = declaration {
@@ -1547,6 +1808,23 @@ impl JobsRepository for InMemoryJobs {
             .cloned())
     }
 
+    async fn conditional_job_metadata_receipts(
+        &self,
+        id: &JobId,
+    ) -> Result<Vec<crate::conditional_metadata::Receipt>, JobsError> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("conditional state lock poisoned".into()))?;
+        let job = job_key(id);
+        Ok(state
+            .conditional_receipts
+            .iter()
+            .filter(|((packet, _, _), _)| *packet == job)
+            .map(|(_, receipt)| receipt.clone())
+            .collect())
+    }
+
     async fn conditional_job_metadata_decision_at(
         &self,
         id: &JobId,
@@ -1590,9 +1868,9 @@ impl JobsRepository for InMemoryJobs {
                         "pinned first-binding declaration unavailable: {error}"
                     ))
                 })?;
-            if spec.status == crate::registry::WorkflowStatus::Draft {
+            if !spec.status.was_published() {
                 return Err(JobsError::ImmutableMetadata(
-                    "draft workflow cannot authorize first binding".into(),
+                    "unpublished workflow cannot authorize first binding".into(),
                 ));
             }
             Some((
@@ -1631,6 +1909,22 @@ impl JobsRepository for InMemoryJobs {
         {
             return Err(JobsError::JobChanged { id: *id });
         }
+        // Freshness judged inside the same state lock as the write, as
+        // the transactional adapter judges it under its row lock (backlog
+        // 301b9060).
+        if command.patch.contains_key(crate::gate_reservation::ATTEMPT) {
+            let receipts: Vec<_> = state
+                .conditional_receipts
+                .iter()
+                .filter(|((packet, _, _), _)| *packet == job_key(id))
+                .map(|(_, receipt)| receipt.clone())
+                .collect();
+            crate::gate_reservation::refuse_a_written_attempt_id(
+                command,
+                &crate::gate_reservation::attempt_ids_written(&receipts),
+            )
+            .map_err(JobsError::ImmutableMetadata)?;
+        }
         let job = command.apply(current)?;
         if let Some((kind, version, schema)) = declaration {
             if current.kind != kind || current.workflow_version != version {
@@ -1664,6 +1958,18 @@ impl JobsRepository for InMemoryJobs {
         judged_on: Option<&Job>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Job, JobsError> {
+        self.merge_job_metadata_expecting_at(id, patch, judged_on, None, stamp)
+            .await
+    }
+
+    async fn merge_job_metadata_expecting_at(
+        &self,
+        id: &JobId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        judged_on: Option<&Job>,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<Job, JobsError> {
         // Mirror the Pg adapter: merge under the lock against the row
         // as it stands, null removes, no envelope field moves, and the
         // JOB_UPDATED event is built from the post-merge row. A merge
@@ -1693,6 +1999,12 @@ impl JobsRepository for InMemoryJobs {
             {
                 return Err(JobsError::JobChanged { id: *id });
             }
+            // The writer's precondition, under the same lock (87fe090d).
+            if let Some(expect) = expect
+                && !crate::step_metadata_write::metadata_still_reads(&job.metadata, expect)
+            {
+                return Err(JobsError::JobChanged { id: *id });
+            }
             let mut md = match &job.metadata {
                 serde_json::Value::Object(m) => m.clone(),
                 _ => serde_json::Map::new(),
@@ -1713,6 +2025,74 @@ impl JobsRepository for InMemoryJobs {
         );
         self.record_all(&[event]);
         Ok(merged)
+    }
+
+    async fn set_priority_at(
+        &self,
+        id: &JobId,
+        to: boss_core::job::Priority,
+        why: &str,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<crate::priority::PriorityMove, JobsError> {
+        // Mirror the Pg adapter: judged and written under one lock,
+        // against the row as it stands; a finished row refuses, a row
+        // already at `to` writes nothing (backlog eb26059d).
+        let declaration = self.metadata_declaration(id).await?;
+        let (moved, from) = {
+            let mut state = self.inner.lock().expect("poisoned");
+            let Some(job) = state.jobs.get_mut(&job_key(id)) else {
+                return Err(JobsError::NotFound(*id));
+            };
+            if matches!(job.status, JobStatus::Closed | JobStatus::Cancelled) {
+                return Err(JobsError::TerminalJob {
+                    id: *id,
+                    status: format!("{:?}", job.status).to_lowercase(),
+                });
+            }
+            let from = job.priority;
+            if from == to {
+                return Ok(crate::priority::PriorityMove {
+                    job: job.clone(),
+                    from,
+                    changed: false,
+                });
+            }
+            let entry =
+                crate::priority::record(from, to, &stamp.actor().to_string(), why, stamp.timestamp);
+            let patch = crate::priority::appended(&job.metadata, entry)
+                .map_err(JobsError::ImmutableMetadata)?;
+            crate::metadata_immutability::patch(&job.metadata, &patch)
+                .map_err(JobsError::ImmutableMetadata)?;
+            if let Some((kind, version, schema)) = declaration {
+                if job.kind != kind || job.workflow_version != version {
+                    return Err(JobsError::JobChanged { id: *id });
+                }
+                crate::metadata_immutability::validate_protocol_patch(
+                    &schema,
+                    &job.metadata,
+                    &patch,
+                )
+                .map_err(JobsError::ImmutableMetadata)?;
+            }
+            let mut md = match &job.metadata {
+                serde_json::Value::Object(m) => m.clone(),
+                _ => serde_json::Map::new(),
+            };
+            md.extend(patch);
+            job.metadata = serde_json::Value::Object(md);
+            job.priority = to;
+            (job.clone(), from)
+        };
+        let event = stamp.event(
+            crate::events::JOB_UPDATED,
+            serde_json::to_value(&moved).unwrap_or_default(),
+        );
+        self.record_all(&[event]);
+        Ok(crate::priority::PriorityMove {
+            job: moved,
+            from,
+            changed: true,
+        })
     }
 
     async fn close_job_at(
@@ -1798,6 +2178,33 @@ impl JobsRepository for InMemoryJobs {
             crate::corrections::corrected_payload(&id.to_string(), entry, index),
         );
         self.record_all(&[updated, corrected]);
+        Ok((job, index))
+    }
+
+    async fn append_input_classification_at(
+        &self,
+        id: &JobId,
+        entry: &serde_json::Value,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(Job, usize), JobsError> {
+        let (job, index) = {
+            let mut state = self.inner.lock().expect("poisoned");
+            let Some(job) = state.jobs.get_mut(&job_key(id)) else {
+                return Err(JobsError::NotFound(*id));
+            };
+            let (md, index) = crate::execution_inputs::appended(&job.metadata, entry);
+            job.metadata = md;
+            (job.clone(), index)
+        };
+        let updated = stamp.event(
+            crate::events::JOB_UPDATED,
+            serde_json::to_value(&job).unwrap_or_default(),
+        );
+        let classified = stamp.event(
+            crate::events::JOB_INPUT_CLASSIFIED,
+            crate::execution_inputs::classified_payload(&id.to_string(), entry, index),
+        );
+        self.record_all(&[updated, classified]);
         Ok((job, index))
     }
 
@@ -1969,11 +2376,10 @@ impl JobsRepository for InMemoryJobs {
         //
         // DISTINCT on the step id, matching the SQL: a step re-promoted
         // to ready records a second event and is still one obligation.
-        let state = self.inner.lock().expect("poisoned");
-        let mut cube: HashMap<
-            (String, String, String, String),
-            (BTreeSet<String>, BTreeSet<String>),
-        > = HashMap::new();
+        type Cube = HashMap<(String, String, String, String), (BTreeSet<String>, BTreeSet<String>)>;
+        let mut state = self.inner.lock().expect("poisoned");
+        state.flow_cube_passes += 1;
+        let mut cube: Cube = Default::default();
         for event in self.recorded_events() {
             if event.timestamp <= since {
                 continue;
@@ -2024,6 +2430,191 @@ impl JobsRepository for InMemoryJobs {
                 },
             )
             .collect())
+    }
+
+    /// This adapter holds no native audit history, so the membership
+    /// reader refuses here exactly as the port's default does, unless a
+    /// test handed it one ([`InMemoryJobs::answer_membership`]) — and
+    /// every ask is counted, so a test can pin how often a surface asks
+    /// (backlog 29f7e897: the IT map's flow read is the one read whose
+    /// cost grows with the log; [`InMemoryJobs::membership_reads`]).
+    async fn membership_snapshot(
+        &self,
+        since: DateTime<Utc>,
+        actor: Option<String>,
+        scope: &crate::port::JobScope,
+        _limit: i64,
+    ) -> Result<crate::membership_replay::ReplayInput, JobsError> {
+        let mut state = self.inner.lock().expect("poisoned");
+        state.membership_reads += 1;
+        let Some(history) = state.membership_answer.clone() else {
+            return Err(JobsError::Storage(
+                "native membership history unavailable".into(),
+            ));
+        };
+        if since >= history.until {
+            return Err(JobsError::Storage(
+                "membership window must precede its native snapshot".into(),
+            ));
+        }
+        Ok(crate::membership_replay::ReplayInput {
+            since,
+            actor,
+            scope: scope.clone(),
+            ..history
+        })
+    }
+
+    async fn membership_census(
+        &self,
+        scope: &crate::port::JobScope,
+        limit: i64,
+    ) -> Result<Option<BTreeSet<String>>, JobsError> {
+        if *scope == crate::port::JobScope::All {
+            return Ok(None);
+        }
+        if *scope == crate::port::JobScope::None || !(1..=1_000_000).contains(&limit) {
+            return Err(JobsError::Storage(
+                "invalid native membership census scope or bound".into(),
+            ));
+        }
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| JobsError::Storage("in-memory membership census lock poisoned".into()))?;
+        let ids: BTreeSet<_> = state
+            .jobs
+            .values()
+            .filter(|job| scope.admits(job))
+            .map(|job| job.id.to_string())
+            .collect();
+        if ids.len() as i64 > limit {
+            return Err(JobsError::Storage(
+                "current authorized packet census exceeds bound".into(),
+            ));
+        }
+        Ok(Some(ids))
+    }
+
+    async fn membership_projection_source_with_budget(
+        &self,
+        since: DateTime<Utc>,
+        actor: Option<String>,
+        scope: &crate::port::JobScope,
+        previous: Option<crate::membership_projection::ProjectionCursor>,
+        limit: i64,
+        budget: std::sync::Arc<crate::membership_replay::ReplayBudget>,
+    ) -> Result<crate::membership_projection::ProjectionSource, JobsError> {
+        budget.check().map_err(JobsError::Storage)?;
+        let source = self.membership_projection_source(since, actor, scope, previous, limit);
+        tokio::pin!(source);
+        // This adapter owns no external SQL or spawned work. Dropping its
+        // pending test read releases all of its resources synchronously.
+        let mut checks = tokio::time::interval(std::time::Duration::from_millis(10));
+        loop {
+            tokio::select! {
+                result = &mut source => {
+                    budget.check().map_err(JobsError::Storage)?;
+                    return result;
+                }
+                _ = checks.tick() => budget.check().map_err(JobsError::Storage)?,
+            }
+        }
+    }
+
+    async fn membership_projection_source(
+        &self,
+        since: DateTime<Utc>,
+        actor: Option<String>,
+        scope: &crate::port::JobScope,
+        previous: Option<crate::membership_projection::ProjectionCursor>,
+        limit: i64,
+    ) -> Result<crate::membership_projection::ProjectionSource, JobsError> {
+        #[cfg(test)]
+        {
+            let gate = self.projection_source_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.0.notify_one();
+                gate.1.notified().await;
+            }
+        }
+        // This adapter has no original database. Tests explicitly supply a
+        // complete witness through answer_membership; it is never invented.
+        let mut history = self.membership_snapshot(since, actor, scope, limit).await?;
+        history.currently_authorized = self.membership_census(scope, limit).await?;
+        let mut input = history.clone();
+        let mut replacement_ids = BTreeSet::new();
+        if let Some(previous) = previous {
+            if let (Some(current), Some(old)) = (
+                &history.currently_authorized,
+                &previous.currently_authorized,
+            ) {
+                replacement_ids.extend(current.difference(old).cloned());
+            }
+            input.since = previous.until;
+            input.initial = crate::membership_replay::InitialState::default();
+            input
+                .groups
+                .retain(|group| group.rows.iter().any(|row| row.seq > previous.audit_cutoff));
+            for group in &input.groups {
+                if group
+                    .rows
+                    .iter()
+                    .any(|row| row.created_at.is_none_or(|at| at < previous.until))
+                {
+                    replacement_ids.extend(
+                        group
+                            .rows
+                            .iter()
+                            .filter_map(crate::membership_replay::packet_identity)
+                            .filter(|id| {
+                                history
+                                    .currently_authorized
+                                    .as_ref()
+                                    .is_none_or(|ids| ids.contains(id))
+                            }),
+                    );
+                }
+            }
+            loop {
+                let before = replacement_ids.len();
+                for group in &input.groups {
+                    if group
+                        .rows
+                        .iter()
+                        .filter_map(crate::membership_replay::packet_identity)
+                        .any(|id| replacement_ids.contains(&id))
+                    {
+                        replacement_ids.extend(
+                            group
+                                .rows
+                                .iter()
+                                .filter_map(crate::membership_replay::packet_identity)
+                                .filter(|id| {
+                                    history
+                                        .currently_authorized
+                                        .as_ref()
+                                        .is_none_or(|ids| ids.contains(id))
+                                }),
+                        );
+                    }
+                }
+                if replacement_ids.len() == before {
+                    break;
+                }
+            }
+        }
+        let replacement_history = if replacement_ids.is_empty() {
+            None
+        } else {
+            history.currently_authorized = Some(replacement_ids.clone());
+            Some(history)
+        };
+        Ok(crate::membership_projection::ProjectionSource {
+            input,
+            replacement_history,
+            replacement_ids,
+        })
     }
 
     async fn historical_events(
@@ -2395,6 +2986,11 @@ impl JobsRepository for InMemoryJobs {
     ) -> Result<Option<(Step, StepVersion)>, JobsError> {
         let mut state = self.inner.lock().expect("poisoned");
         let key = step_key(id);
+        if state.step_write_faults.get(&key) == Some(&StepWriteFault::MovedThenUnreadable) {
+            return Err(JobsError::Storage(format!(
+                "step {id} unreadable (injected by fault_step_write)"
+            )));
+        }
         let read = state
             .steps
             .get(&key)
@@ -2553,7 +3149,7 @@ impl JobsRepository for InMemoryJobs {
         patch: &serde_json::Map<String, serde_json::Value>,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Step, JobsError> {
-        self.merge_step_metadata_guarded_at(id, patch, stamp, None)
+        self.merge_step_metadata_guarded_at(id, patch, stamp, None, None)
             .await
     }
     async fn merge_step_metadata_guarded_at(
@@ -2562,6 +3158,7 @@ impl JobsRepository for InMemoryJobs {
         patch: &serde_json::Map<String, serde_json::Value>,
         stamp: &boss_core::publisher::EventStamp,
         guard: Option<&crate::signer_write::SignerWriteGuard>,
+        expect: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<Step, JobsError> {
         // Mirror the Pg adapter: merge under the lock against the row
         // as it stands, null removes, no other field moves, a terminal
@@ -2594,6 +3191,14 @@ impl JobsRepository for InMemoryJobs {
             let Some(step) = state.steps.get_mut(&key) else {
                 return Err(JobsError::StepNotFound(*id));
             };
+            // The caller's precondition, under the same lock as the
+            // write (review 792b871a N1), and before the terminal check,
+            // in the Pg adapter's order.
+            if let Some(expect) = expect
+                && !crate::step_metadata_write::metadata_still_reads(&step.metadata, expect)
+            {
+                return Err(JobsError::StepChanged { id: *id });
+            }
             if matches!(step.status, StepStatus::Completed | StepStatus::Skipped) {
                 return Err(JobsError::TerminalStep {
                     id: *id,
@@ -2758,12 +3363,21 @@ impl JobsRepository for InMemoryJobs {
         &self,
         job_id: &JobId,
     ) -> Result<Vec<(Step, StepVersion)>, JobsError> {
-        let state = self.inner.lock().expect("poisoned");
+        let mut state = self.inner.lock().expect("poisoned");
         let job_key = job_id.to_string();
+        *state.steps_reads.entry(job_key.clone()).or_default() += 1;
         if state.unreadable_steps.contains(&job_key) {
             return Err(JobsError::Storage(format!(
                 "steps of job {job_key} unreadable (injected by fail_steps_read)"
             )));
+        }
+        if let Some(left) = state.steps_reads_left.get_mut(&job_key) {
+            if *left == 0 {
+                return Err(JobsError::Storage(format!(
+                    "steps of job {job_key} unreadable (injected by fail_steps_read_after)"
+                )));
+            }
+            *left -= 1;
         }
         let mut steps: Vec<(Step, StepVersion)> = state
             .steps
@@ -2788,6 +3402,11 @@ impl JobsRepository for InMemoryJobs {
             ..Default::default()
         };
         let state = self.inner.lock().expect("poisoned");
+        if state.unreadable_queue_age {
+            return Err(JobsError::Storage(
+                "queue-age rows unreadable (injected by fail_queue_age)".into(),
+            ));
+        }
         let mut rows: Vec<crate::port::QueueAgeRow> = state
             .steps
             .values()
@@ -3074,6 +3693,72 @@ mod tests {
 
     use super::*;
     use crate::port::DepartmentFilter;
+
+    /// A MERGE WITH A PRECONDITION LANDS ONLY ON THE ROW IT WAS JUDGED
+    /// ON (review 792b871a N1). The release door judges a car, then
+    /// writes `{hold: null, release}`; a hold rewritten between that read
+    /// and the write must not be lifted. The precondition (`hold`,
+    /// `hold_sha` as read) is judged under the same lock as the write: a
+    /// row that no longer reads so is refused as `StepChanged`, with
+    /// neither row nor event written; an unrelated key written since
+    /// does not refuse it. The Pg half:
+    /// `tests/a_release_lifts_only_the_hold_it_read_pg.rs`.
+    #[tokio::test]
+    async fn a_merge_with_a_precondition_lands_only_on_the_row_it_read() {
+        let repo = InMemoryJobs::new();
+        let job = Job::new(
+            "ship-a-change",
+            Subject::new("custom", "car"),
+            "A held car",
+            "automation:test",
+            Priority::Standard,
+            test_date(),
+        );
+        repo.create_job(&job).await.unwrap();
+        let mut step = Step::new(job.id, "task", "Open for review", 0);
+        step.metadata = serde_json::json!({"hold": "trust-boundary car", "hold_sha": "h1"});
+        repo.add_step(&step).await.unwrap();
+        let stamp = boss_core::publisher::EventStamp::new(
+            "jobs",
+            boss_core::actor::ActorId::Automation("test".into()),
+        );
+        let obj = |v: serde_json::Value| v.as_object().cloned().unwrap();
+        let as_read = obj(serde_json::json!({"hold": "trust-boundary car", "hold_sha": "h1"}));
+        let release = obj(serde_json::json!({"hold": null, "release": {"sha": "h1"}}));
+
+        // A person's `boss hold` lands after the read, keeping the head.
+        let hand = obj(serde_json::json!({"hold": "David reads it first"}));
+        repo.merge_step_metadata_at(&step.id, &hand, &stamp)
+            .await
+            .unwrap();
+        let before = repo.recorded_events().len();
+        let refused = repo
+            .merge_step_metadata_guarded_at(&step.id, &release, &stamp, None, Some(&as_read))
+            .await;
+        assert!(
+            matches!(refused, Err(JobsError::StepChanged { .. })),
+            "{refused:?}"
+        );
+        let now = repo.get_step(&step.id).await.unwrap().unwrap();
+        assert_eq!(now.metadata["hold"], "David reads it first", "not lifted");
+        assert!(now.metadata.get("release").is_none(), "nothing written");
+        assert_eq!(repo.recorded_events().len(), before, "no event");
+
+        // Judged on the row as it stands, with an unrelated key written
+        // since, the same write lands.
+        let note = obj(serde_json::json!({"note": "unrelated"}));
+        repo.merge_step_metadata_at(&step.id, &note, &stamp)
+            .await
+            .unwrap();
+        let as_read_now =
+            obj(serde_json::json!({"hold": "David reads it first", "hold_sha": "h1"}));
+        let landed = repo
+            .merge_step_metadata_guarded_at(&step.id, &release, &stamp, None, Some(&as_read_now))
+            .await
+            .expect("lands on the row it read");
+        assert!(landed.metadata.get("hold").is_none(), "{}", landed.metadata);
+        assert_eq!(landed.metadata["release"]["sha"], "h1");
+    }
 
     #[tokio::test]
     async fn first_record_admission_cannot_expose_rows_without_their_events() {

@@ -1,6 +1,8 @@
 #!/bin/sh
 # observe-lib — post an observation, or keep it until the system of
-# record can take it. Sourced by observe-host.sh; exercised under stubs
+# record can take it. Sourced by observe-host.sh and the host observers
+# beside it, and by observe-units.sh for observe_post_bound and the token
+# reader alone (it posts through its own curl); exercised under stubs
 # by infra/lint/the-observer-retains-and-replays.sh on every gate.
 #
 # WHY. The estate observers report THROUGH the jobs API, so when the
@@ -52,6 +54,29 @@ SPOOL_MAX="${SPOOL_MAX:-200}"
 # exactly as it did before, unstamped.
 if [ -r "$(dirname "$0")/../lib/secret-header.sh" ]; then . "$(dirname "$0")/../lib/secret-header.sh"; fi
 
+# observe_post_bound — set OBSERVE_POST_MAX_TIME to the bound a post may
+# take, in whole seconds, before curl is handed it.
+#
+# A TIME BOUND (backlog df38075a, F1 of review a92c0b94). The observers'
+# curls had none, and every observer unit is a oneshot, whose start
+# timeout systemd leaves OFF unless the unit sets one: a system of record
+# that accepts and never answers held the tick, the timer behind it, and
+# the token's header file for as long as it liked. Curl exit 28 is
+# "failed" to every caller. A value that is not a number is not handed
+# to curl, and nor is 0, which curl reads as no bound at all.
+#
+# THE ONE DEFINITION for both posts (backlog f85ebd8a, N-c of review
+# 7c5ecf57): post_observation below, and observe-units.sh's own curl,
+# which sources this file for it. The rule was spelled in each until
+# 2026-10-17, held equal by a test and not collapsed (CLAUDE.md §9a);
+# a_killed_sender_leaves_no_header_behind.rs now refuses a second
+# spelling under infra/.
+observe_post_bound() {
+    case "${OBSERVE_POST_MAX_TIME:-}" in
+        '' | *[!0-9]* | 0*) OBSERVE_POST_MAX_TIME=60 ;;
+    esac
+}
+
 # post_observation JSON — POST to $JOBS_API/api/estate/observation.
 # Prints "jobs api: <code> <body>" on an answer. Returns 0 only on 202.
 #
@@ -64,17 +89,9 @@ post_observation() {
     if command -v machine_token_header >/dev/null 2>&1; then
         machine_token_header OBSERVE_MT_HDR "$JOBS_API" || OBSERVE_MT_HDR=""
     fi
-    # A TIME BOUND (backlog df38075a, F1 of review a92c0b94). This curl
-    # had none, and every observer unit is a oneshot, whose start timeout
-    # systemd leaves OFF unless the unit sets one: a system of record
-    # that accepts and never answers held the tick, the timer behind it,
-    # and the token's header file for as long as it liked. Curl exit 28
-    # is "failed" to every caller, so the reading is spooled as for any
-    # other outage. Whole seconds; a value that is not a number is not
-    # handed to curl, and nor is 0, which curl reads as no bound at all.
-    case "${OBSERVE_POST_MAX_TIME:-}" in
-        '' | *[!0-9]* | 0*) OBSERVE_POST_MAX_TIME=60 ;;
-    esac
+    # The time bound (observe_post_bound, above). A post that runs out of
+    # it fails, so the reading is spooled as for any other outage.
+    observe_post_bound
     resp=$(printf '%s' "$1" | curl -s -w '\n%{http_code}' \
       --connect-timeout 10 --max-time "$OBSERVE_POST_MAX_TIME" \
       -X POST -H 'content-type: application/json' \

@@ -200,7 +200,7 @@ authority_role = "platform-admin"
 # effort, because every car that waits here waits for exactly the
 # review a medium read would wave through.
 agent = { profile = "reviewer", model = "opus-5-5", budget_usd = 3, effort = "high" }
-metadata_defaults = { procedure = "Left ready for the conductor. It completes this when the car boards, recording the train's PR — cars do not open their own PRs, a train opens one for the batch. A car left behind gets a skip_reason on its metadata; if the branch legitimately moved, re-gate and put the fresh receipt in metadata.regate_receipt rather than abandoning the packet, which loses its history." }
+metadata_defaults = { procedure = "Left ready for the conductor. It completes this when the car boards, recording the train's PR — cars do not open their own PRs, a train opens one for the batch. A car left behind gets a skip_reason on its metadata; if the branch legitimately moved, re-gate and put the fresh receipt in metadata.regate_receipt rather than abandoning the packet, which loses its history. A HELD car's wait lives on THIS step as door-written metadata, never in a dated key on the car: `hold` says why it stands (boss hold --reason), `releaser` names who its release waits on (boss hold --releaser), and the `release` record its door writes says whose review released it and who gave the release (boss release --review). These values are read-only context, not executor fields; use their doors to change a hold or release." }
 [[workflow.step.fields]]
 name = "pr_url"
 field_type = "string"
@@ -209,6 +209,11 @@ required = true
 name = "completed_at"
 field_type = "date-time"
 required = false
+# Door-owned hold/releaser/release/hold_sha stay UNDECLARED (5101e080):
+# their existing readers accept heterogeneous markers, including hold:false.
+# Declaring strings rejects a legal released car at completion and turns
+# these values into editable generic answers. The procedure names the doors;
+# the generic surface retains their metadata as read-only context.
 
 [[workflow.step]]
 title = "proven"
@@ -482,3 +487,19 @@ required = true
 name = "completed_at"
 field_type = "date-time"
 required = false
+
+# ec6fc29a: an explicit independent judgment of attended browser evidence
+# is a different terminal, not a string pretending to be boss prove output.
+# Appended so an open older car may convert explicitly without rewriting its
+# completed steps. Publishing alone never repins an in-flight packet.
+[[workflow.step]]
+title = "attended-qualified"
+kind = "outcome"
+ready_when = "steps.review.done AND job.metadata.merged = \"true\" AND job.metadata.attended_qualified = \"true\""
+title_template = "Qualified by independent attended browser review"
+terminal = { outcome = "attended-qualified" }
+metadata_defaults = { outcome_kind = "completed", qualification_contract = "attended-browser-v1", completion_contract = "attended-browser-accept-v1", records_before_claim = ["attended_qualification"], procedure = "Only boss browser accept <car> --observation <packet> --accept-attended writes this terminal. It re-reads the published pinned protocol, immutable observation and independent qualification records, exact source/suite bindings and whole attachment originals. A raw client pass flag or terminal status is no qualification. The immutable attended_qualification record names both original events/digests and the assurance actually accepted. The existing proven step and boss prove execution semantics remain unchanged; closure may skip its unpaid status but preserves all its evidence. Old cars need an explicit recorded conversion after this protocol is published; never invent this terminal on a pinned older version." }
+[[workflow.step.fields]]
+name = "attended_qualification"
+field_type = "object"
+required = true

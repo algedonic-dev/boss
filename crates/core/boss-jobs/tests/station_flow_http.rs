@@ -27,6 +27,8 @@ use boss_core::job::{Job, JobId, JobStatus, Priority, Step, StepId, StepStatus, 
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
 use boss_jobs::http::{JobsApiState, router};
+use boss_jobs::membership_projection::InMemoryMembershipProjection;
+use boss_jobs::membership_projection_service::MembershipProjectionService;
 use boss_jobs::station_queue::{StationPredicate, StepMatch};
 use boss_jobs::{InMemoryJobs, InMemoryStations, JobsRepository, StationKind, StationSpec};
 use boss_policy_client::types::{AccessTier, User};
@@ -172,6 +174,10 @@ fn step_event(kind: &str, step_id: &str, at: DateTime<Utc>) -> Event {
 }
 
 async fn app() -> axum::Router {
+    app_with_projection().await.0
+}
+
+async fn app_with_projection() -> (axum::Router, Arc<MembershipProjectionService>) {
     let jobs = Arc::new(InMemoryJobs::new());
     let stations = Arc::new(InMemoryStations::new());
     for spec in [constraint_station(), dock_station(), quiet_station()] {
@@ -211,8 +217,14 @@ async fn app() -> axum::Router {
     .await
     .expect("events record");
 
+    let projection = Arc::new(MembershipProjectionService::new(
+        jobs.clone(),
+        Arc::new(InMemoryMembershipProjection::new()),
+        Arc::new(boss_clock_client::WallClockClient),
+    ));
     let state = JobsApiState {
         stations: Some(stations),
+        membership_projection: Some(projection.clone()),
         ..JobsApiState::minimal(
             jobs,
             bus,
@@ -231,7 +243,7 @@ async fn app() -> axum::Router {
             )),
         )
     };
-    router(state)
+    (router(state), projection)
 }
 
 async fn flow(app: &axum::Router, query: &str) -> serde_json::Value {
@@ -339,15 +351,91 @@ async fn the_envelope_names_its_own_window() {
     );
 }
 
-/// a4de1e72: the map must conserve the evaluator's original diagnosis,
-/// including an empty station. Missing flow is never a zero or idle.
+/// A refused independent refresh retains the membership reader's
+/// diagnosis on both read surfaces. Neither the cube's
+/// blindness nor an invented zero is a completed membership reading.
 #[tokio::test]
-async fn the_map_retains_the_exact_clause_that_refused_a_station_flow() {
-    let app = app().await;
+async fn a_refused_independent_flow_names_its_cause_on_the_map_and_flow_door() {
+    let (app, projection) = app_with_projection().await;
     let original = flow(&app, "?window_hours=24").await;
-    let refused = row(&original, "test-dock");
+    let blind = row(&original, "test-dock")["unavailable_reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/stations/flow?window_hours=24")
+                .header("x-boss-user", user_header("emp-david", "operator"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let membership: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(membership["basis"], "packet-membership-v1");
+    let refused = row(&membership, "test-dock");
     let reason = refused["unavailable_reason"].as_str().unwrap();
+    let refresh_reason = format!("48-hour history: {reason}; 24-hour history: {reason}");
     assert!(refused["served"].is_null());
+    assert_ne!(reason, blind, "the premise: two different readers");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/yard/flow?window=24h")
+                .header("x-boss-user", user_header("emp-david", "operator"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let pending: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(pending["state"], "pending");
+    assert!(pending["as_of"].is_null());
+    // The first cold read only queues work. Start the same owned updater
+    // production uses, and retain its task through the observed refusal.
+    let (cancel, cancellation) = tokio::sync::watch::channel(false);
+    let updater = tokio::spawn(projection.run(cancellation));
+    let unread = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/yard/flow?window=24h")
+                        .header("x-boss-user", user_header("emp-david", "operator"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let flow: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if status == StatusCode::OK {
+                assert_eq!(flow["state"], "unread", "{flow}");
+                break flow;
+            }
+            assert_eq!(status, StatusCode::ACCEPTED, "{flow}");
+            assert_eq!(flow["state"], "pending", "{flow}");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    cancel.send(true).unwrap();
+    updater.await.unwrap();
+    let unread =
+        unread.expect("the independent refresh must expose its refusal instead of staying pending");
+    assert_eq!(unread["why"], refresh_reason, "{unread}");
+    assert!(unread["as_of"].is_null(), "{unread}");
+    assert_eq!(unread["window_hours"], 24, "{unread}");
 
     let response = app
         .oneshot(
@@ -362,6 +450,10 @@ async fn the_map_retains_the_exact_clause_that_refused_a_station_flow() {
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let map: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        map["flow_as_of"].is_null(),
+        "a refusal is not a reading: {map}"
+    );
     let machine = map["regions"]
         .as_array()
         .unwrap()
@@ -370,8 +462,14 @@ async fn the_map_retains_the_exact_clause_that_refused_a_station_flow() {
         .find(|machine| machine["id"] == "station:test-dock")
         .expect("the same evaluated station is on the map");
     assert_eq!(machine["state"], "unknown");
+    let why = machine["why"].as_str().unwrap();
+    assert_eq!(
+        why,
+        format!("0 standing — {refresh_reason}"),
+        "the map must retain the original refusal: {machine}"
+    );
     assert!(
-        machine["why"].as_str().unwrap().contains(reason),
-        "the map discarded the original refusal: expected {reason:?}, got {machine}"
+        !why.contains(&blind),
+        "the map still reads the step-events cube: {machine}"
     );
 }

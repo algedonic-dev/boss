@@ -51,7 +51,10 @@
 #   * its StorageClass is Longhorn's (driver.longhorn.io) and says
 #     allowVolumeExpansion: true;
 #   * the Longhorn volume behind it is this claim's, its spec.size is the
-#     claim's capacity, and its robustness is healthy;
+#     claim's capacity, and it is attached/healthy or detached with every
+#     declared replica healthy, active and able to run on its ready disk/node;
+#     detached growth additionally refuses unfinished Jobs or live Pods using
+#     the claim, read again immediately before the approved patch (0dd921b4);
 #   * the size is whole GiB, LARGER than the capacity now (grows only —
 #     Kubernetes refuses a shrink, and this verb never asks), at most
 #     twice it, and at most CEILING_GIB below. Raising the ceiling is a
@@ -106,8 +109,8 @@
 # BOSS_EXPAND_WAIT_S (default 600, inside the verb's 900 s timeout so the
 # verdict is this script's, not the runner's kill): the claim's
 # status.capacity.storage and conditions, and the Longhorn volume's
-# spec.size and robustness. Only when the capacity AND spec.size read the
-# new size in bytes is the line the verb file declares as `effect`
+# spec.size and health. Only when capacity AND spec.size read the new size
+# and attached health or the full detached replica proof holds is `effect`
 # printed. A stall exits 1 saying the claim is NOT proven, naming what it
 # read — FileSystemResizePending is the kubelet's half not done yet — and
 # the request stands.
@@ -151,6 +154,34 @@ JQ_BYTES='def bytes: tostring
       else .[0] | (.n | tonumber) * ({"": 1, "Ki": 1024, "Mi": 1048576, "Gi": 1073741824,
             "Ti": 1099511627776, "Pi": 1125899906842624, "k": 1000, "M": 1000000,
             "G": 1000000000, "T": 1000000000000, "P": 1000000000000000}[.u // ""]) end;'
+
+# A stopped replica is normal for an offline volume, not evidence of damage.
+# Healthy timestamps alone are insufficient: count every declared replica,
+# exclude failed/inactive/deleting/error rows, and prove its node/disk can run
+# it. One definition is used at admission, just before patch, and read-back.
+DETACHED_HEALTH_JQ='
+def detached_health($v; $replicas; $nodes):
+    [$replicas[] | select(.spec.volumeName == $v.metadata.name)] as $mine
+    | ($v.spec.numberOfReplicas) as $expected
+    | ($expected | type == "number" and . > 0 and . == floor)
+      and ($mine | length == $expected)
+      and ($v | lh_deleting | not)
+      and $v.status.state == "detached"
+      and ($v.status.currentNodeID // "") == ""
+      and ($v.spec.nodeID // "") == ""
+      and ([$v.status.robustness] | all(. == "unknown" or . == "healthy"))
+      and all($mine[];
+          . as $r
+          | lh_healthy
+            and (.spec.nodeID | type == "string" and length > 0)
+            and (.spec.diskID | type == "string" and length > 0)
+            and (.status.currentState == "stopped" or .status.currentState == "running")
+            and ([lh_disks($nodes)[]
+                  | select(.node == $r.spec.nodeID and .uuid == $r.spec.diskID
+                      and .node_why == [] and .why == [])] | length == 1)
+            and ([$nodes[] | select(.metadata.name == $r.spec.nodeID)
+                  | .status.diskStatus | to_entries[] | select(.value.diskUUID == $r.spec.diskID)
+                  | .value.conditions | lh_cond("Ready")] == ["True"]));'
 
 refuse() { echo "$ME: REFUSED — $*" >&2; exit 78; }
 fail() { echo "$ME: FAILED — $*" >&2; exit 1; }
@@ -266,6 +297,65 @@ read_list() {
         lh_whole_list "$WORK/$2" "$kind" "$LH" \
             || unread "$1 is not exactly one complete list with unique named objects"
     fi
+}
+
+detached_proven() {
+    lh_one_object "$WORK/vol.json" Volume "$VOL" "$LH" \
+        && lh_whole_list "$WORK/replicas.json" Replica "$LH" \
+        && lh_whole_list "$WORK/lhnodes.json" Node "$LH" \
+        && jq_doc_file "$WORK/vol.json" && jq_doc_file "$WORK/replicas.json" && jq_doc_file "$WORK/lhnodes.json" \
+        && jq -e -n --arg ns "$NS" --arg claim "$PVC" --slurpfile v "$WORK/vol.json" \
+            --slurpfile r "$WORK/replicas.json" --slurpfile n "$WORK/lhnodes.json" \
+            "$LONGHORN_LEDGER_JQ$DETACHED_HEALTH_JQ"'
+            $v[0].status.kubernetesStatus.namespace == $ns
+            and $v[0].status.kubernetesStatus.pvcName == $claim
+            and detached_health($v[0]; $r[0].items; $n[0].items)' >/dev/null 2>&1
+}
+
+# An accepted patch cannot become a pre-write refusal. Retain an unread
+# health observation and let the bounded read-back retry it.
+readback_list() {
+    local resource="$1" file="$2" kind="$3"
+    # shellcheck disable=SC2086
+    if ! $K get "$resource" -n "$LH" -o json --request-timeout=30s > "$WORK/$file" 2> "$WORK/$file.err"; then
+        health_error="unread $resource: $(tr '\n' ' ' < "$WORK/$file.err" | cut -c1-200)"
+        return 1
+    fi
+    if ! jq_doc_file "$WORK/$file" || ! lh_whole_list "$WORK/$file" "$kind" "$LH"; then
+        health_error="unread $resource: response is not one complete named list"
+        return 1
+    fi
+}
+
+# Complete namespace inventories, never a label guess about backup names. A
+# newly admitted Job may have active=0 before its first Pod, and a terminating
+# Pod can still mount a claim: both hold it until a terminal fact is present.
+detached_claim_idle() {
+    local resource kind file held
+    for resource in pods jobs; do
+        kind=Job
+        [ "$resource" != pods ] || kind=Pod
+        file="$WORK/claim-$resource.json"
+        # shellcheck disable=SC2086
+        if ! $K get "$resource" -n "$NS" -o json --request-timeout=20s > "$file" 2> "$file.err"; then
+            unread "detached claim users ($resource): $(cat "$file.err")"
+        fi
+        lh_whole_list "$file" "$kind" "$NS" \
+            || unread "detached claim users ($resource) are not one complete, uniquely named native list"
+        held="$(jq -r --arg claim "$PVC" --arg resource "$resource" '
+            def uses($spec): any(($spec.volumes // [])[];
+                .persistentVolumeClaim.claimName == $claim);
+            def terminal: any((.status.conditions // [])[];
+                (.type == "Complete" or .type == "Failed") and .status == "True");
+            .items[] | select(
+                if $resource == "jobs" then
+                    uses(.spec.template.spec)
+                    and (((.status.active // 0) > 0) or (terminal | not))
+                else uses(.spec) and (.status.phase != "Succeeded" and .status.phase != "Failed") end)
+            | .metadata.name' "$file" 2> "$WORK/users.err")" \
+            || unread "detached claim users ($resource) could not be judged: $(cat "$WORK/users.err")"
+        [ -z "$held" ] || refuse "detached claim $NS/$PVC is held by unfinished $resource: $held — nothing was patched"
+    done
 }
 
 # Discovery must not choose an argument from ambiguous identities or rounded
@@ -430,8 +520,16 @@ render() {
     case "$size" in '' | *[!0-9]*) unread "Longhorn volume $VOL reports no spec.size ('$size')" ;; esac
     [ "$size" = "$cap_b" ] \
         || refuse "Longhorn volume $VOL has spec.size $size and $NS/$PVC a capacity of $cap_b bytes — the two disagree, so an expansion is half done; read it before asking for another"
-    [ "$(q .robustness)" = healthy ] \
-        || refuse "Longhorn volume $VOL reads robustness $(q .robustness) (state $(q .state)) — only a healthy volume grows: $(q '.replicas | join("; ")')"
+    DETACHED=0
+    if [ "$(q .state)" = detached ]; then
+        detached_proven \
+            || refuse "detached replica health for $VOL is not proven for every declared replica and its ready node/disk: $(q '.replicas | join("; ")')"
+        detached_claim_idle
+        DETACHED=1
+    else
+        [ "$(q .state)" = attached ] && [ "$(q .robustness)" = healthy ] \
+            || refuse "Longhorn volume $VOL reads robustness $(q .robustness) (state $(q .state)) — only attached healthy or proven healthy detached volumes grow: $(q '.replicas | join("; ")')"
+    fi
     if [ "$DISCOVERY" -eq 0 ]; then
         [ "$WANT_B" -gt "$cap_b" ] \
             || refuse "$NS/$PVC is $CUR_CAP ($cap_b bytes) and $SIZE would not grow it — this verb grows only"
@@ -493,13 +591,16 @@ render() {
         echo "volume: $VOL"
         echo "state: $(q .state)"
         echo "robustness: $(q .robustness)"
+        if [ "$DETACHED" -eq 1 ]; then
+            echo "detached health: every declared replica is healthy and active on a ready node/disk; no unfinished Job or live Pod uses $NS/$PVC; re-checked immediately before patch"
+        fi
         echo "size: $CUR_CAP ($cap_b bytes) -> $SIZE ($WANT_B bytes), +$((WANT_B - cap_b)) bytes"
         echo "bounds: grows only; at most 2x the size now (${twice}Gi); the ceiling ${CEILING_GIB}Gi (CEILING_GIB in infra/forge/expand-instance-volume.sh)"
         echo "longhorn settings: storage-over-provisioning-percentage $(q .opct), storage-minimal-available-percentage $(q .mpct) (each disk's live storageAvailable is held to it on stderr, not signed)"
         echo "the largest size the replica disks' ledgers admit is ${fit_gib}Gi; physical space is re-checked before any write"
         echo "the largest size one run grants is ${grant}Gi"
-        echo "command: kubectl patch pvc $PVC -n $NS --type=json — test that spec.resources.requests.storage is still $CUR_REQ, replace it with $SIZE; the one field this writes. Longhorn's admission webhook sums every replica's disk again; the CSI resizer grows the volume, then the kubelet the filesystem."
-        echo "read-back: until status.capacity.storage reads $WANT_B bytes and Longhorn volume $VOL reads spec.size $WANT_B."
+        echo "command: kubectl patch pvc $PVC -n $NS --type=json — test that spec.volumeName is still $VOL and spec.resources.requests.storage is still $CUR_REQ, replace storage with $SIZE; the one field this writes. Longhorn's admission webhook sums every replica's disk again; the CSI resizer grows the volume, then the kubelet the filesystem."
+        echo "read-back: until status.capacity.storage reads $WANT_B bytes and Longhorn volume $VOL reads spec.size $WANT_B, with attached healthy or fully proved detached replica health."
         echo
         echo "== replicas of $VOL ($(q '.replicas | length')) =="
         q '.replicas[]'
@@ -534,10 +635,20 @@ cat "$WORK/plan"
 echo
 echo "$ME: plan $APPROVED still holds — growing $NS/$PVC from $CUR_REQ to $SIZE"
 
-PATCH="$(jq -cn --arg cur "$CUR_REQ" --arg new "$SIZE" \
-    '[{op: "test", path: "/spec/resources/requests/storage", value: $cur},
+PATCH="$(jq -cn --arg cur "$CUR_REQ" --arg new "$SIZE" --arg volume "$VOL" \
+    '[{op: "test", path: "/spec/volumeName", value: $volume},
+      {op: "test", path: "/spec/resources/requests/storage", value: $cur},
       {op: "replace", path: "/spec/resources/requests/storage", value: $new}]')" \
     || fail "could not build the patch — nothing was written"
+if [ "$DETACHED" -eq 1 ]; then
+    # Approval is not a lock on the backup cadence. Do not reuse the render's
+    # idle/health reading after its arithmetic and signed-plan comparison.
+    read_obj unread vol.json volumes.longhorn.io "$VOL" -n "$LH"
+    read_list replicas.longhorn.io replicas.json
+    read_list nodes.longhorn.io lhnodes.json
+    detached_proven || refuse "detached replica health changed before the approved patch of $NS/$PVC"
+    detached_claim_idle
+fi
 # shellcheck disable=SC2086 # K is one line the door prints to be word-split
 if ! $K patch pvc "$PVC" -n "$NS" --type=json -p "$PATCH" --request-timeout=20s \
         > "$WORK/patch.out" 2> "$WORK/patch.err"; then
@@ -556,6 +667,8 @@ while :; do
     conds="not read"
     lsize="not read"
     rob="not read"
+    health=no
+    health_error="none"
     # shellcheck disable=SC2086
     if $K get pvc "$PVC" -n "$NS" -o json --request-timeout=20s > "$WORK/back.json" 2> "$WORK/back.err" \
         && jq_doc_file "$WORK/back.json"; then
@@ -571,17 +684,29 @@ while :; do
         && jq_doc_file "$WORK/vback.json"; then
         lsize="$(jq -r '.spec.size // "unreported"' "$WORK/vback.json")"
         rob="$(jq -r '.status.robustness // "unreported"' "$WORK/vback.json")"
+        volume_state="$(jq -r '.status.state // "unreported"' "$WORK/vback.json")"
+        if [ "$volume_state" = attached ] && [ "$rob" = healthy ]; then
+            health=yes
+        elif [ "$volume_state" = detached ]; then
+            cp "$WORK/vback.json" "$WORK/vol.json"
+            if readback_list replicas.longhorn.io replicas.json Replica \
+                && readback_list nodes.longhorn.io lhnodes.json Node \
+                && detached_proven; then
+                health=yes
+            fi
+        fi
     else
         lsize="unread: $(tr '\n' ' ' < "$WORK/vback.err" | cut -c1-200)"
         rob="unread"
     fi
     elapsed=$(($(date -u +%s) - start))
-    if [ "$cap_b" = "$WANT_B" ] && [ "$lsize" = "$WANT_B" ]; then
+    if [ "$cap_b" = "$WANT_B" ] && [ "$lsize" = "$WANT_B" ] && [ "$health" = yes ]; then
+        echo "$ME: read-back volume health proved: $volume_state; detached volumes require every declared healthy active replica on its ready node/disk"
         echo "$ME: $NS/$PVC is ${WANT_GIB}Gi — read back: status.capacity.storage $cap ($cap_b bytes), Longhorn volume $VOL spec.size $lsize, robustness $rob (after ${elapsed}s)"
         exit 0
     fi
     if [ "$elapsed" -ge "$WAIT_S" ]; then
-        fail "the API server accepted spec.resources.requests.storage=$SIZE for $NS/$PVC, and after ${elapsed}s it is NOT proven: status.capacity.storage $cap, spec.resources.requests.storage $req, conditions $conds; Longhorn volume $VOL spec.size $lsize, robustness $rob. The request stands — FileSystemResizePending is the kubelet's half not done yet; read it again with plan-an-instance-volume-expansion, whose refusal names a stalled expansion"
+        fail "the API server accepted spec.resources.requests.storage=$SIZE for $NS/$PVC, and after ${elapsed}s it is NOT proven: status.capacity.storage $cap, spec.resources.requests.storage $req, conditions $conds; Longhorn volume $VOL spec.size $lsize, robustness $rob, health proved $health, health observation $health_error. The request stands — FileSystemResizePending is the kubelet's half not done yet; read it again with plan-an-instance-volume-expansion, whose refusal names a stalled expansion"
     fi
     sleep "$POLL_S"
 done

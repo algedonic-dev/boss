@@ -1,0 +1,16 @@
+[[rule]]
+name = "pending-readiness-every-five-minutes"
+why = """
+A writer can commit a step and stop before evaluating its dependents.
+No subsequent business event is guaranteed to arrive: c3f47cde and
+c7445f1c stayed pending for hours until an unrelated metadata write.
+The clock is the recovery trigger, not a new routing policy: the jobs
+service reevaluates each open packet against its own pinned protocol,
+using the existing conditional write and promotion events. A partial
+inventory, unreadable protocol or refused promotion fails this firing
+and retries; no business work is rerun.
+"""
+version = 1
+schedule = { cadence = "every-5-minutes", anchor_date = "2026-10-24" }
+[[rule.do]]
+handler = "jobs.reconcile-readiness"

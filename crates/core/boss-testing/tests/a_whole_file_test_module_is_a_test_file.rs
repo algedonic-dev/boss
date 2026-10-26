@@ -172,4 +172,10 @@ fn no_wallclock_proves_the_whole_file_shape_on_every_invocation() {
         text.contains("whole-file test module"),
         "the self-test must say it covered the whole-file shape:\n{text}"
     );
+    // The same self-test proves the wall-clock window pass (backlog
+    // 5fb858ea) on its fixture, and says so for the same reason.
+    assert!(
+        text.contains("the window pass names wall_now() arithmetic"),
+        "the self-test must say it covered the wall-clock window pass:\n{text}"
+    );
 }

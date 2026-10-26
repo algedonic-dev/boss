@@ -48,6 +48,12 @@
 // answers the question that actually matters — is the server on that
 // port serving THIS tree — and refuses to reuse anything else. Under CI
 // it refuses unconditionally. See src/dev-tree.ts.
+//
+// AND WHOSE LIFETIME. The server this file starts (mocked mode) is
+// stopped by stopDevServer() the moment this run's Playwright exits, so
+// it is never lent: a second run in the same tree that borrowed it lost
+// it mid-suite (backlog 14ab6f08). chooseTarget reuses only a standing,
+// non-mocked `bun run dev`, which no run stops.
 import { MOCKED_FLAG, isMissSummary, missRefusal } from '../src/dev-mocked';
 import { waitForReadyLine } from '../src/dev-ready';
 import { DEFAULT_PORT, chooseTarget } from '../src/dev-tree';

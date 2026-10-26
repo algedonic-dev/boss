@@ -85,7 +85,9 @@
   let anchorDate = $state('');
   let businessCalendar = $state('');
   let whenExpr = $state('');
-  let delay = $state('');
+  // A delay the seed row stored, shown read-only — never edited or sent
+  // (backlog 677e332f; see the note where the input used to be).
+  let storedDelay = $state<string | null>(null);
   let doRows = $state<DoRow[]>([{ handler: '', args: [] }]);
 
   // --- Action / validation feedback ------------------------------------
@@ -115,7 +117,7 @@
     anchorDate = form.anchor_date;
     businessCalendar = form.business_calendar;
     whenExpr = form.when;
-    delay = form.delay;
+    storedDelay = v.delay ?? null;
     doRows = form.do.map((d) => ({ handler: d.handler, args: d.args.map((a) => ({ ...a })) }));
     if (doRows.length === 0) doRows = [{ handler: '', args: [] }];
   }
@@ -209,7 +211,6 @@
       anchor_date: anchorDate,
       business_calendar: businessCalendar,
       when: whenExpr,
-      delay,
       do: doRows,
     });
   }
@@ -578,18 +579,20 @@
               style="padding:6px; font-size:13px; width:100%"
             />
           </div>
-          <div>
-            <div style="font-size:12px; color:var(--static); margin-bottom:2px">
-              Delay <span style="color:var(--static)"> — optional; defers the side-effects (e.g. 5m, 1h)</span>
+          <!-- No Delay input (backlog 677e332f): authoring::validate refuses
+               every rule that declares a delay, because nothing executes
+               one until design f1d66249's durable delayed admission is
+               built (car 4c706c5d, item 84a010cb). A row that stored one
+               says so here, read-only; the draft built from it sends none.
+               The car that builds delayed admission brings the input back. -->
+          {#if storedDelay !== null}
+            <div class="stored-delay" style="font-size:12px; color:var(--static)">
+              Delay <span class="mono">{storedDelay}</span>
+              — stored on the version this form was seeded from; delays are not supported yet
+              (nothing executes one), so the server refuses any rule that declares one and a
+              draft saved here carries none.
             </div>
-            <input
-              bind:value={delay}
-              aria-label="Delay"
-              placeholder=""
-              class="mono"
-              style="padding:6px; font-size:13px; width:240px"
-            />
-          </div>
+          {/if}
         </div>
       </Section>
 

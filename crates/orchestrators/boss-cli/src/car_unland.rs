@@ -515,11 +515,11 @@ pub(crate) mod tests {
         let root = boss_testing::scratch::scratch_dir("unland-auth");
         git_in(&root, &["init", "-q"]);
         let auth = crate::git_auth::ForgeAuth {
-            key: "http.http://forge.test/.extraHeader".to_string(),
+            forge: "http://forge.test/".to_string(),
             value: "Authorization: token t".to_string(),
         };
         let out = git_command(&root, Some(&auth))
-            .args(["config", "--get", &auth.key])
+            .args(["config", "--get", &auth.header_key()])
             .output()
             .unwrap();
         assert!(

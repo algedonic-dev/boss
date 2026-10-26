@@ -551,9 +551,12 @@ fn a_volume_that_is_not_wholly_healthy_or_that_longhorn_would_trim_is_refused() 
             |c| {
                 let mut v = c.get(&format!("vol-{VOL}.json"));
                 v["status"]["state"] = json!("detached");
+                // The native node binding remains: this is not a proved
+                // healthy detached volume and must still be refused.
+                assert_eq!(v["status"]["currentNodeID"], "cp-1");
                 c.put(&format!("vol-{VOL}.json"), v);
             },
-            "not attached",
+            "detached replica health",
         ),
         (
             "node-eviction",
@@ -605,12 +608,18 @@ fn a_volume_that_is_not_wholly_healthy_or_that_longhorn_would_trim_is_refused() 
         change(&c);
         let (code, words) = c.nothing_proposed(&[]);
         assert_eq!(code, Some(78), "{name}: {words}");
+        let diagnosis = if name == "detached" {
+            // Unproved detached health now stops the growth read before
+            // the no-growth fallback can ask for a replica move.
+            format!("detached replica health for {VOL} is not proven")
+        } else {
+            "no replica move is proposed for boss/pgdata-postgres-0".to_string()
+        };
         assert!(
-            words.contains("no replica move is proposed for boss/pgdata-postgres-0")
-                && words.contains(want),
+            words.contains(&diagnosis) && words.contains(want),
             "{name} says {want:?}: {words}"
         );
-        assert!(c.asked_the_move_read(), "{name}");
+        assert_eq!(c.asked_the_move_read(), name != "detached", "{name}");
     }
     // A volume Longhorn itself reads degraded never reaches the move read:
     // the growth read refuses it first, as it always did.
@@ -620,7 +629,11 @@ fn a_volume_that_is_not_wholly_healthy_or_that_longhorn_would_trim_is_refused() 
     c.put(&format!("vol-{VOL}.json"), v);
     let (code, words) = c.nothing_proposed(&[]);
     assert_eq!(code, Some(78), "{words}");
-    assert!(words.contains("only a healthy volume grows"), "{words}");
+    assert!(
+        words.contains("robustness degraded (state attached)")
+            && words.contains("only attached healthy or proven healthy detached volumes grow"),
+        "{words}"
+    );
     assert!(!c.asked_the_move_read());
 }
 

@@ -65,7 +65,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The lanes an invariant can be filed under, and a profile's document
@@ -298,6 +298,12 @@ pub(crate) fn cargo_jobs(env_file: &str) -> Option<String> {
 /// builder works in, and the ceiling a bare `cargo` drives to.
 pub(crate) const DEV_MANIFEST: &str = "infra/cluster/manifests/boss-dev.yaml";
 
+/// The door a HELD brief's local commands run through (backlog 9a37d9d8,
+/// 2026-10-18): it reads the isolation selector again when the builder
+/// RUNS the line, and refuses (exit 75) once one exists, because the
+/// brief's own reading is as old as the brief.
+pub(crate) const HELD_DOOR: &str = "infra/dev/run-while-held.sh";
+
 /// The resource limits the dev container declares, verbatim — the
 /// cgroup a builder is actually inside (backlog 28fc3a39, 2026-09-22).
 ///
@@ -357,6 +363,37 @@ fn published_worker_door(door_env: &str) -> Option<String> {
         .filter(|store| store.starts_with('/') && !store.contains(char::is_whitespace))
         .map(|store| format!("{store}/dev-build"))
 }
+
+/// Whether a candidate door's own CODE reads the isolation store `store`
+/// and refuses (exit 75) both on a selector and on a store its caller
+/// cannot read — the shape b5255c16 gave wt-cargo, wt-web,
+/// run-while-held.sh and the `boss` shim (backlog 1fddbe13), and the one
+/// aeac17f0 gives `as-gate-uid.sh`. Comments are skipped: every one of
+/// those files EXPLAINS the store in prose, and an explanation refuses
+/// nothing (the chown pin below learned that the other way round).
+pub(crate) fn refuses_on_the_isolation_store(script: &str, store: &str) -> bool {
+    let code: Vec<&str> = script
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    let has = |needle: &str| code.iter().any(|l| l.contains(needle));
+    code.contains(&format!("dev_control={store}").as_str())
+        && has("$dev_control/enabled")
+        && has("cannot read the dev isolation store")
+        && has("exit 75")
+}
+
+/// The doors that refuse a caller the isolation store is closed to, by
+/// file and by the spelling a builder types (backlog 1fddbe13): uid
+/// 65534 is such a caller on the dev pod, so each refuses when run
+/// through `as-gate-uid.sh`, held or not.
+const STORE_CLOSED_DOORS: [(&str, &str); 4] = [
+    ("infra/dev/wt-cargo", "wt-cargo"),
+    ("infra/dev/wt-web", "wt-web"),
+    (HELD_DOOR, HELD_DOOR),
+    ("infra/dev/boss", "boss --built"),
+];
 
 /// The phases a full gate runs, in the order their `check` calls appear
 /// in `infra/gate.sh`, deduplicated.
@@ -467,6 +504,52 @@ pub(crate) fn preflight_door(claude_md: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// What the pre-flight costs, as the `Before pushing` entry measured it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreflightCost {
+    pub(crate) secs: u32,
+    /// The date of the measurement, `YYYY-MM-DD`: the last parenthesised
+    /// date ahead of the figure in the entry.
+    pub(crate) measured_on: String,
+}
+
+/// The pre-flight's measured cost, read out of CLAUDE.md §Doors'
+/// `Before pushing` entry (backlog 07ad55b3, 2026-10-19).
+///
+/// The brief used to type "seconds against the ~11 minutes a gate
+/// costs" under a heading claiming it was read out of this entry; the
+/// entry moved to minutes when 1c03eeb0 measured `--lint` at 509-695 s,
+/// and every builder brief went on saying seconds. The figure lives in
+/// the entry — `` `--lint` took <n> s ``, after its date — and only
+/// there; the prose wraps, so the entry is read with its whitespace
+/// collapsed. `None` when the entry records no measurement: the brief
+/// then refuses rather than print one of its own.
+pub(crate) fn preflight_cost(claude_md: &str) -> Option<PreflightCost> {
+    let entry = claude_md
+        .split("- **Before pushing")
+        .nth(1)?
+        .split("\n\n- **")
+        .next()?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (before, after) = entry.split_once("`--lint` took ")?;
+    let secs = after.split_once(" s")?.0.parse().ok()?;
+    let is_date = |d: &str| {
+        d.len() == 10
+            && d.char_indices().all(|(i, c)| match i {
+                4 | 7 => c == '-',
+                _ => c.is_ascii_digit(),
+            })
+    };
+    let measured_on = before
+        .rsplit('(')
+        .filter_map(|chunk| chunk.get(..10))
+        .find(|d| is_date(d))?
+        .to_string();
+    Some(PreflightCost { secs, measured_on })
+}
+
 fn read(repo: &Path, rel: &str) -> Result<String> {
     std::fs::read_to_string(repo.join(rel)).with_context(|| format!("reading {rel}"))
 }
@@ -475,6 +558,16 @@ fn read(repo: &Path, rel: &str) -> Result<String> {
 /// else, so there is exactly one place in this repo that turns them into
 /// sentences.
 pub(crate) fn invariants(repo: &Path) -> Result<Vec<Invariant>> {
+    invariants_with(repo, crate::door_env::dev_child_route)
+}
+
+/// The invariants with dev isolation read by `isolation` at the store the
+/// tree declares. Live, that is the child door's own selector reading;
+/// a test hands each state in, so no assertion depends on this host.
+pub(crate) fn invariants_with(
+    repo: &Path,
+    isolation: impl Fn(&Path) -> crate::door_env::DevChild,
+) -> Result<Vec<Invariant>> {
     let manifest = "infra/gate-runner/gate-runner.yaml";
     let env_file = "infra/dev/pod-build.env";
     let method = "infra/dev/as-gate-uid.sh";
@@ -503,6 +596,74 @@ pub(crate) fn invariants(repo: &Path) -> Result<Vec<Invariant>> {
     }
     let lints = preflight_lint_count(repo)?;
 
+    // WHAT THE UID DOOR MEETS UNDER ISOLATION (backlog aeac17f0,
+    // 2026-10-21), read out of each door's own code rather than said.
+    // The command it runs is candidate code as gid 1500, which reads the
+    // machine token, so the door's own refusal is printed only once its
+    // code carries one; and the doors that refuse a caller the store is
+    // closed to refuse uid 65534 HELD or not, which the method's own
+    // example spelling (`wt-cargo`) walks straight into.
+    let child_door = "crates/orchestrators/boss-cli/src/door_env.rs";
+    let store = published_worker_door(&read(repo, child_door)?)
+        .with_context(|| format!("{child_door} does not declare the dev control store"))?
+        .trim_end_matches("/dev-build")
+        .to_string();
+    let mut verify_lines = vec![
+        format!("{method} <your command>"),
+        format!("The gate runs as uid {uid} / gid {gid}, so a check that reads git or file"),
+        "ownership answers differently there. This script is the METHOD, not a".into(),
+        "requirement to re-derive: there is no CAP_CHOWN on this pod, so it has".into(),
+        format!("uid {uid} CREATE the workspace (bundle -> fetch) and prints what it did."),
+        "Quote its last line in a receipt's `verified` field.".into(),
+    ];
+    // The METHOD is this script; the two NUMBERS are the manifest's,
+    // which is where the script's own awk pass reads them from.
+    // Attributing them to the script would pin them to its prose —
+    // `65534` appears there four times, all in comments, and `1500` not
+    // at all (d334116c).
+    let mut verify_readings = vec![
+        Reading::read(manifest, uid.to_string()),
+        Reading::read(manifest, gid.to_string()),
+    ];
+    let method_src = read(repo, method)?;
+    if refuses_on_the_isolation_store(&method_src, &store) {
+        verify_lines.extend([
+            "What it runs is candidate code as that gid, beside this container's".into(),
+            format!("credentials, so it reads {store} first and refuses (exit 75)"),
+            "while dev isolation is on or when its caller cannot read that store: a".into(),
+            "stop, never a retry.".into(),
+        ]);
+        verify_readings.push(Reading::read(method, store.clone()));
+    }
+    let mut closed: Vec<&str> = Vec::new();
+    for (file, spelling) in STORE_CLOSED_DOORS {
+        if refuses_on_the_isolation_store(&read(repo, file)?, &store) {
+            closed.push(spelling);
+            verify_readings.push(Reading::read(file, store.clone()));
+        }
+    }
+    // Bare cargo is bounded there only because the script sources the
+    // bound itself; without that the advice would be the unbounded
+    // cargo the `cargo jobs` invariant forbids.
+    if let Some((first, rest)) = closed.split_first()
+        && method_src.contains(env_file)
+    {
+        verify_readings.push(Reading::read(method, env_file));
+        let named = match rest.split_last() {
+            Some((last, middle)) => format!(
+                "{first}{} and {last}",
+                middle.iter().map(|d| format!(", {d}")).collect::<String>()
+            ),
+            None => first.to_string(),
+        };
+        verify_lines.extend([
+            format!("Give it the command bare — it sources {env_file} itself:"),
+            format!("{named} refuse (exit 75)"),
+            format!("as uid {uid}, held or not, because {store} is closed to it,"),
+            format!("so `{method} {first} …` refuses too."),
+        ]);
+    }
+
     let mut out = vec![
         Invariant {
             name: "cargo jobs",
@@ -529,27 +690,9 @@ pub(crate) fn invariants(repo: &Path) -> Result<Vec<Invariant>> {
         Invariant {
             name: "verify as the gate",
             authority: method.to_string(),
-            lines: vec![
-                format!("{method} <your command>"),
-                format!(
-                    "The gate runs as uid {uid} / gid {gid}, so a check that reads git or file"
-                ),
-                "ownership answers differently there. This script is the METHOD, not a".into(),
-                "requirement to re-derive: there is no CAP_CHOWN on this pod, so it has".into(),
-                format!("uid {uid} CREATE the workspace (bundle -> fetch) and prints what it did."),
-                "Quote its last line in a receipt's `verified` field.".into(),
-            ],
+            lines: verify_lines,
             lanes: vec![LANE_CAR],
-            // The METHOD is this script; the two NUMBERS are the
-            // manifest's, which is where the script's own awk pass
-            // reads them from. Attributing them to the script would
-            // pin them to its prose — `65534` appears there four
-            // times, all in comments, and `1500` not at all
-            // (d334116c).
-            grounding: Grounding::Derived(vec![
-                Reading::read(manifest, uid.to_string()),
-                Reading::read(manifest, gid.to_string()),
-            ]),
+            grounding: Grounding::Derived(verify_readings),
         },
         Invariant {
             name: "gate uid / gid",
@@ -744,8 +887,16 @@ pub(crate) fn invariants(repo: &Path) -> Result<Vec<Invariant>> {
     // to `--lint`; the copy is read here instead, so the rules can
     // quote it.
     let doors = "CLAUDE.md";
-    let door = preflight_door(&read(repo, doors)?)
+    let doors_text = read(repo, doors)?;
+    let door = preflight_door(&doors_text)
         .with_context(|| format!("{doors} §Doors does not carry a `Before pushing` door"))?;
+    let cost = preflight_cost(&doors_text).with_context(|| {
+        format!(
+            "{doors} §Doors' `Before pushing` entry records no `--lint` took <n> s \
+             measurement after a dated parenthesis, and the brief prints no figure of its \
+             own (backlog 07ad55b3)"
+        )
+    })?;
     let child_door = "crates/orchestrators/boss-cli/src/door_env.rs";
     let worker = published_worker_door(&read(repo, child_door)?)
         .with_context(|| format!("{child_door} does not declare the dev control store"))?;
@@ -756,51 +907,184 @@ pub(crate) fn invariants(repo: &Path) -> Result<Vec<Invariant>> {
     {
         bail!("{controller} does not carry the published worker execution door");
     }
-    out.push(Invariant {
-        name: "worker execution",
-        authority: controller.to_string(),
-        lines: vec![
-            format!("{worker} exec-auto -- <worker argv>"),
-            "Use only after separately authorized activation and a controller-owned worker binding.".into(),
-            "This source preparation grants no activation; activation remains held until its owner lifts it.".into(),
+    // WHICH ROUTE IS LIVE (backlog 5008a6c9, 2026-10-15). The controller
+    // path is a link into `<store>/enabled`; while activation is held
+    // that selector is absent and the link exits 127, so naming it as
+    // THE pre-flight sent two builders to a dead door and left them to
+    // improvise the local run the brief never named. The selector is
+    // read the way the child door reads it, and the brief names only a
+    // route that runs — or, for a selector that is there and wrong, a
+    // stop, because every child of this CLI refuses then.
+    let store = worker.trim_end_matches("/dev-build");
+    let selector = format!("{store}/enabled");
+    let route = isolation(Path::new(store));
+    // MAIN'S DOOR, BY ABSOLUTE PATH (backlog 6d2e2653, review run
+    // 012c8dcf of car 03ce794b, 2026-10-19). Spelled relative, the held
+    // line ran the builder's worktree's own copy: a branch that edits or
+    // breaks the door ran its edit, and a worktree cut before the door
+    // landed had none, so the line exited 127 and nothing here said why —
+    // inviting the bare run the door exists to refuse (5008a6c9). wt-cargo
+    // and wt-web are main's copies through /work/tools/bin links; this is
+    // the same door, named through the main checkout git says this tree
+    // hangs off, so no host path is typed here.
+    let main = crate::shared_checkout::read(repo)
+        .map(|c| c.main_toplevel())
+        .unwrap_or_else(|| repo.to_path_buf());
+    let main = main.display();
+    let held_door = format!("{main}/{HELD_DOOR}");
+    let (worker_head, preflight_head): (Vec<String>, Vec<String>) = match &route {
+        crate::door_env::DevChild::Forward(_) => (
+            vec![
+                format!("{worker} exec-auto -- <worker argv>"),
+                format!("ACTIVATED here: {selector} names a generation, so this is the route."),
+                "Use only with a controller-owned worker binding.".into(),
+            ],
+            vec![
+                // ONE PLAIN COMMAND (65cea113): a trailing `; echo $?`
+                // made the line a list, which a worktree-isolated
+                // builder's harness refuses to run; the exit code it
+                // echoed is the command's own, and the harness reports
+                // that.
+                format!(
+                    "{worker} exec-auto -- /bin/bash {door} > <your scratch dir>/preflight.log 2>&1"
+                ),
+                format!("ACTIVATED here ({selector} names a generation): this routes every"),
+                "candidate lint and clippy into the worker.".into(),
+            ],
+        ),
+        // HELD IS A READING AS OLD AS THIS BRIEF (backlog 9a37d9d8,
+        // 2026-10-18). The builder runs these lines minutes to an hour
+        // after the render, and a bare `/bin/bash {door}` re-reads
+        // nothing: an activation in between ran candidate lints beside
+        // credentials, green and silent. So the local line goes through
+        // HELD_DOOR, which reads the selector again when it runs — and the
+        // hold is what its owner lifts, BY activating (9a37d9d8 (a)).
+        crate::door_env::DevChild::Local => (
+            vec![
+                format!("HELD here: {selector} does not exist, so {worker} is a link"),
+                "to nothing and exits 127. Do not run it; it is not a door while held.".into(),
+                "Run candidate checks locally, each from a script that cds into your worktree,"
+                    .into(),
+                "and call the result source preparation in your report, never isolation proof."
+                    .into(),
+                "The hold is lifted only by its owner, by activating isolation; a brief rendered"
+                    .into(),
+                "after that names the controller. wt-cargo, wt-web and".into(),
+                format!("{held_door} read {selector} again when they run and refuse"),
+                "(exit 75) once it exists: then render this brief again, never retry locally."
+                    .into(),
+            ],
+            vec![
+                format!("/bin/bash {held_door} {door} > <your scratch dir>/preflight.log 2>&1"),
+                format!("HELD when rendered ({selector} did not exist): run it LOCALLY, from a"),
+                "script that cds into your worktree. The door is the main checkout's copy, by"
+                    .into(),
+                format!("absolute path into {main}, so an edit on your branch is not the door"),
+                "that runs; the command it runs is still your worktree's. The door re-reads".into(),
+                "the selector when it runs and refuses with exit 75 if isolation was activated"
+                    .into(),
+                format!("since; exit 127 means {main} carries no door. Either is a stop to"),
+                "report, never a reason to run the pre-flight bare. A local pre-flight is".into(),
+                "source preparation only, never isolation proof; say so in your report.".into(),
+            ],
+        ),
+        crate::door_env::DevChild::Refuse(why) => (
+            vec![
+                format!("STOP: dev isolation is on and {why}."),
+                "Every candidate child refuses (design a68fc42a D1), and a local run is what the"
+                    .into(),
+                format!("selector exists to forbid. Run nothing candidate; report {selector}."),
+            ],
+            vec![
+                "STOP: the pre-flight has no route here (see the worker execution invariant):"
+                    .into(),
+                format!("dev isolation is on and {why}."),
+                format!("Neither the controller nor a local {door} may run until it is repaired."),
+            ],
+        ),
+    };
+    let mut worker_lines = worker_head;
+    // How to use the controller is said only where there is one to use.
+    if matches!(route, crate::door_env::DevChild::Forward(_)) {
+        worker_lines.extend::<[String; 7]>([
             "Run candidate pre-flight and direct interpreters through this published controller;".into(),
             "the controller maps the worktree cwd to the worker and refuses a missing or changed binding.".into(),
-            "Never run the candidate infra/dev/dev-build.py in the credential-bearing container.".into(),
-            "Transfer changed files and rehearsals through the published put/get doors; host scratch paths".into(),
+            "Transfer changed files and rehearsals through the published put/get doors (the file goes on".into(),
+            "stdin: put <session> <path> < <file>, and zero bytes are refused); host scratch paths".into(),
             "are not worker paths. Preserve returned output and exit status in the trusted run record.".into(),
             "Pure source probes run in the worker; probes reading the system of record stay on the".into(),
             "forge probe account under the approved network fence, never a worker credential or proxy.".into(),
-            "The first dispatched builder's actual worker receipt and the full runtime READ/USE matrix".into(),
-            "remain owed. Printed commands and source GREEN do not establish either.".into(),
-        ],
+        ]);
+    }
+    worker_lines.extend([
+        "Never run the candidate infra/dev/dev-build.py in the credential-bearing container."
+            .into(),
+        "The first dispatched builder's actual worker receipt and the full runtime READ/USE matrix"
+            .into(),
+        "remain owed. Printed commands and source GREEN do not establish either.".into(),
+        format!("(isolation state read live from {selector} when this brief was rendered)"),
+    ]);
+    // A reading is claimed only where it is printed: held or refused,
+    // the controller's verb is deliberately not on the page.
+    let mut worker_readings = vec![Reading::read(child_door, store)];
+    if matches!(route, crate::door_env::DevChild::Forward(_)) {
+        worker_readings.push(Reading::read(controller, "exec-auto"));
+    }
+    // Held, the door named must read the SAME store this render read, or
+    // its run-time re-reading watches a different selector.
+    let held = matches!(route, crate::door_env::DevChild::Local);
+    if held {
+        worker_readings.push(Reading::read(HELD_DOOR, store));
+    }
+    out.push(Invariant {
+        name: "worker execution",
+        authority: controller.to_string(),
+        lines: worker_lines,
         lanes: vec![LANE_CAR],
-        grounding: Grounding::Derived(vec![
-            Reading::read(child_door, worker.trim_end_matches("/dev-build")),
-            Reading::read(controller, "exec-auto"),
-        ]),
+        grounding: Grounding::Derived(worker_readings),
     });
+    let mut preflight_lines = preflight_head;
+    // Refused, no command was printed, so there is no exit status to
+    // echo (9a37d9d8 (b)): the two lines spoke of a command withheld.
+    if !matches!(route, crate::door_env::DevChild::Refuse(_)) {
+        preflight_lines.extend::<[String; 2]>([
+            "Its exit status is the verdict — the tool reports it; in a shell, run".into(),
+            "echo $? as the NEXT command, never chained to this one on the same line.".into(),
+        ]);
+    }
+    // THE COST IS THE ENTRY'S MEASUREMENT (backlog 07ad55b3): it was
+    // typed here as "seconds against the ~11 minutes a gate costs" and
+    // stayed seconds after the entry moved to minutes. The number is the
+    // whole of what it says about cost: the first fix framed it as
+    // "minutes, not seconds", a unit typed here that went on saying
+    // minutes when review e207853d edited the entry to 45 s.
+    preflight_lines.extend::<[String; 7]>([
+        "The `Before pushing` door of CLAUDE.md §Doors, read out of that entry:".into(),
+        "fmt and every build-free lint PLUS workspace clippy when the tree implies".into(),
+        "a crate PLUS every declared tree-wide pin. That entry measured it".into(),
+        format!(
+            "taking {} s on {}. It is not a gate —",
+            cost.secs, cost.measured_on
+        ),
+        "the build and the suites stay unproven — and it is judged by its EXIT CODE,".into(),
+        "never by its last line: a pipe through tail succeeds while the run fails,".into(),
+        "and an && chain behind one pushed a red car (2026-09-20).".into(),
+    ]);
     out.push(Invariant {
         name: "pre-flight",
         authority: doors.to_string(),
-        lines: vec![
-            // ONE PLAIN COMMAND (65cea113): a trailing `; echo $?`
-            // made the line a list, which a worktree-isolated builder's
-            // harness refuses to run; the exit code it echoed is the
-            // command's own, and the harness reports that.
-            format!("{worker} exec-auto -- /bin/bash {door} > <your scratch dir>/preflight.log 2>&1"),
-            "After authorized activation, this routes every candidate lint and clippy into the worker.".into(),
-            "While activation is held, existing local checks are source preparation only, never isolation proof.".into(),
-            "Its exit status is the verdict — the tool reports it; in a shell, run".into(),
-            "echo $? as the NEXT command, never chained to this one on the same line.".into(),
-            "The `Before pushing` door of CLAUDE.md §Doors, read out of that entry:".into(),
-            "the whole build-free pre-flight PLUS clippy scoped to the crates this tree".into(),
-            "changed, seconds against the ~11 minutes a gate costs. It is not a gate —".into(),
-            "the build and the suites stay unproven — and it is judged by its EXIT CODE,".into(),
-            "never by its last line: a pipe through tail succeeds while the run fails,".into(),
-            "and an && chain behind one pushed a red car (2026-09-20).".into(),
-        ],
+        lines: preflight_lines,
         lanes: vec![LANE_CAR],
-        grounding: Grounding::Derived(vec![Reading::read(doors, door.clone())]),
+        grounding: Grounding::Derived(
+            [
+                Reading::read(doors, door.clone()),
+                Reading::read(doors, format!("{} s", cost.secs)),
+                Reading::read(doors, cost.measured_on.clone()),
+            ]
+            .into_iter()
+            .chain(held.then(|| Reading::read(HELD_DOOR, store)))
+            .collect(),
+        ),
     });
 
     out.sort_by_key(|i| i.name);
@@ -924,10 +1208,41 @@ pub(crate) fn block(inv: &Invariant) -> Vec<String> {
 /// defect — it is what sent two briefs to memory for the rest of the
 /// sentence and got the packet's own class wrong. Keys are sorted so two
 /// reads of one packet print in the same order.
-pub(crate) fn packet_section(job: &Value) -> String {
+///
+/// `at` is the step this brief is FOR — [`selected_step`]'s answer — and
+/// never re-derived here (backlog 4661a4a6): a packet can be at two
+/// steps, and the position line must name the one the reader holds.
+///
+/// The legacy whole-packet rendering, which every caller now reaches
+/// through [`render_for`]; kept by name for the tests that pin it.
+#[cfg(test)]
+pub(crate) fn packet_section(job: &Value, at: Option<&Value>) -> String {
+    packet_section_for(job, at, None)
+}
+
+/// [`packet_section`], with the values a bounded START lists in THE
+/// ORIGINALS instead of printing (design e72dc7c9). `None` is the legacy
+/// whole-packet rendering, byte for byte. With a set, every block still
+/// names how many keys it holds and says how many are listed, so a reader
+/// can see that a value exists and where to read it — nothing is dropped,
+/// only moved to the manifest the contract binds.
+pub(crate) fn packet_section_for(
+    job: &Value,
+    at: Option<&Value>,
+    listed: Option<&BTreeSet<String>>,
+) -> String {
     let g = |k: &str| job.get(k).and_then(Value::as_str).unwrap_or("-");
+    let heading = match listed {
+        None => "== THE PACKET — verbatim from the system of record, not summarised ==",
+        Some(_) => {
+            "== THE PACKET — its REQUIRED inputs verbatim from the system of record \
+             (execution-inputs/v1); the values it lists instead are in THE ORIGINALS, after \
+             THE RUN =="
+        }
+    };
+    let keep = |pointer: String| listed.is_none_or(|l| !l.contains(&pointer));
     let mut out = format!(
-        "== THE PACKET — verbatim from the system of record, not summarised ==\n\n\
+        "{heading}\n\n\
          {}\n{}   kind {}   status {}   priority {}   opened {}\n",
         crate::envelope::job_title(job).unwrap_or("-"),
         crate::envelope::job_id(job).unwrap_or("-"),
@@ -936,7 +1251,7 @@ pub(crate) fn packet_section(job: &Value) -> String {
         g("priority"),
         g("opened_on"),
     );
-    match now_step(job) {
+    match at {
         // THE STEP IS NAMED THE WAY THE SURFACE NAMES IT (c8faa7f3).
         // This line used to print the `spec_slug` alone — "now at:
         // measure (ready)" — and there is no step TITLED measure: the
@@ -966,8 +1281,21 @@ pub(crate) fn packet_section(job: &Value) -> String {
         None => out.push_str("now at: no ready or active step\n"),
     }
 
-    let md = sorted_metadata(job);
-    out.push_str(&format!("\nmetadata ({} key(s)), in full:\n", md.len()));
+    let all = sorted_metadata(job);
+    // In a bounded START the classifications are rendered where they act,
+    // in THE ORIGINALS (`execution_inputs::leaves` says why).
+    let md: BTreeMap<String, Value> = all
+        .iter()
+        .filter(|(k, _)| {
+            keep(boss_jobs::execution_inputs::Source::Job { key: (*k).clone() }.pointer())
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    out.push_str(&format!(
+        "\nmetadata ({} key(s)), {}:\n",
+        all.len(),
+        listed_phrase(all.len(), md.len(), listed.is_some())
+    ));
     out.push_str(&key_blocks(&md));
 
     // EVERY COMPLETED STEP'S METADATA, IN FULL (backlog 3cdad35a,
@@ -987,9 +1315,25 @@ pub(crate) fn packet_section(job: &Value) -> String {
     {
         let l = crate::envelope::step_line(step);
         let s = |k: &str| step.get(k).and_then(Value::as_str);
-        let md = sorted_metadata(step);
+        let all = sorted_metadata(step);
+        // The slug a pointer names this step by — the same reader the
+        // contract's own addressing uses (spec_slug, else the id).
+        let slug = s("spec_slug").or_else(|| s("id")).unwrap_or_default();
+        let md: BTreeMap<String, Value> = all
+            .iter()
+            .filter(|(k, _)| {
+                keep(
+                    boss_jobs::execution_inputs::Source::Step {
+                        slug: slug.to_string(),
+                        key: (*k).clone(),
+                    }
+                    .pointer(),
+                )
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         out.push_str(&format!(
-            "\ncompleted step `{}` — {}, kind {}{}{}, metadata ({} key(s)), in full:\n",
+            "\ncompleted step `{}` — {}, kind {}{}{}, metadata ({} key(s)), {}:\n",
             l.slug,
             l.title,
             l.kind,
@@ -999,7 +1343,8 @@ pub(crate) fn packet_section(job: &Value) -> String {
             s("completed_at")
                 .map(|t| format!(" at {t}"))
                 .unwrap_or_default(),
-            md.len(),
+            all.len(),
+            listed_phrase(all.len(), md.len(), listed.is_some()),
         ));
         // Each correction the server handed this step, printed under
         // the field it corrects (design 4105b020): the original stays
@@ -1013,6 +1358,19 @@ pub(crate) fn packet_section(job: &Value) -> String {
         out.push_str(&key_blocks_corrected(&md, &corrections));
     }
     out
+}
+
+/// How a metadata block's header says what it prints: `in full` for the
+/// legacy rendering, and for a bounded one how many keys are printed and
+/// how many are listed in THE ORIGINALS.
+fn listed_phrase(all: usize, printed: usize, bounded: bool) -> String {
+    if !bounded {
+        return "in full".to_string();
+    }
+    match all - printed {
+        0 => "every one printed in full".to_string(),
+        n => format!("{printed} printed in full, {n} listed in THE ORIGINALS"),
+    }
 }
 
 /// [`key_blocks`], with each key followed by the corrections that name
@@ -1165,6 +1523,39 @@ pub(crate) fn now_step(job: &Value) -> Option<&Value> {
         .find(|s| crate::envelope::step_line(s).now)
 }
 
+/// THE STEP A BRIEF IS FOR — the one every section that names a step
+/// reads (backlog 4661a4a6, measured by landed review 06b3f635 on cost
+/// car b58e8c36, 2026-10-11). `selector` is the step the caller already
+/// chose: `boss dispatch --step <slug>` claims THAT step and files the
+/// run under it. Every section used to re-derive the step as
+/// [`now_step`] — the FIRST open one — so a car at `proven` and
+/// `landed-review` claimed `landed-review` for the reviewer and printed
+/// THE STEP "Proven in prod", with `proof` and `verified` required, in
+/// the same START. With no selector (`boss brief <packet>`) it is
+/// [`now_step`], exactly as before. A selector the packet does not
+/// carry is refused rather than answered with another step: the brief
+/// is the contract the reader works to, and one naming the wrong step
+/// is worse than none.
+pub(crate) fn selected_step<'a>(
+    job: &'a Value,
+    selector: Option<&str>,
+) -> Result<Option<&'a Value>> {
+    let Some(slug) = selector else {
+        return Ok(now_step(job));
+    };
+    crate::envelope::steps(job)
+        .into_iter()
+        .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some(slug))
+        .map(Some)
+        .with_context(|| {
+            format!(
+                "packet {} has no step `{slug}` to brief — refusing to print another step's \
+                 specification in its place",
+                crate::envelope::job_id(job).unwrap_or("?")
+            )
+        })
+}
+
 /// The keys of a step's metadata that are NOT its specification: the
 /// agent block (the run section already states model, budget and
 /// effort) and the two the `now at` line already printed.
@@ -1187,8 +1578,10 @@ fn not_the_spec(key: &str) -> bool {
 /// is guessed to want one: a `build` step that carries only its agent
 /// block has nothing to show and prints nothing, which is why a
 /// builder's brief is unchanged by this.
-pub(crate) fn step_section(job: &Value) -> Option<String> {
-    let step = now_step(job)?;
+///
+/// `step` is [`selected_step`]'s answer, handed in rather than found
+/// here (4661a4a6).
+pub(crate) fn step_section(step: &Value) -> Option<String> {
     let l = crate::envelope::step_line(step);
     let fields: Vec<&Value> = step
         .get("fields")
@@ -1235,11 +1628,10 @@ pub(crate) fn step_section(job: &Value) -> Option<String> {
     Some(out)
 }
 
-/// The stored `procedure` on the step the packet is AT, with the slug
+/// The stored `procedure` on the step the brief is FOR, with the slug
 /// it belongs to — the text [`step_section`] renders as the executor's
 /// specification.
-fn stored_procedure(job: &Value) -> Option<(String, String)> {
-    let step = now_step(job)?;
+fn stored_procedure(step: &Value) -> Option<(String, String)> {
     let text = step
         .get("metadata")?
         .get(PROCEDURE_KEY)?
@@ -1290,7 +1682,13 @@ const PROCEDURE_KEY: &str = "procedure";
 /// authored default expands at materialisation, so the two strings can
 /// differ without the protocol having moved. Naming the two versions
 /// is what makes the difference checkable by hand.
-pub(crate) fn protocol_section(job: &Value, active: Option<&Value>) -> Option<String> {
+/// `at` is the step the brief is FOR ([`selected_step`]), so the
+/// procedure it dates is the one THE STEP section prints (4661a4a6).
+pub(crate) fn protocol_section(
+    job: &Value,
+    at: Option<&Value>,
+    active: Option<&Value>,
+) -> Option<String> {
     let pinned = job.get("workflow_version").and_then(Value::as_i64)?;
     let kind = job.get("kind").and_then(Value::as_str).unwrap_or("-");
     let mut out = String::from(
@@ -1322,7 +1720,7 @@ pub(crate) fn protocol_section(job: &Value, active: Option<&Value>) -> Option<St
          they were admitted under.\n",
         if behind == 1 { "version" } else { "versions" }
     ));
-    if let Some((slug, stored)) = stored_procedure(job) {
+    if let Some((slug, stored)) = at.and_then(stored_procedure) {
         match active.and_then(|r| authored_procedure(r, &slug)) {
             Some(authored) if authored == stored => out.push_str(&format!(
                 "The `{slug}` procedure below is the v{pinned} text and v{current}'s text for \
@@ -1438,19 +1836,48 @@ pub(crate) async fn active_row(
 /// session's own commit trailer, when it supplied one
 /// (`documents::TRAILER_ENV`, backlog 89d1572c) — read at the verb's
 /// edge, so this renderer stays a function of its arguments.
+///
+/// `step` is the step the caller SELECTED — `boss dispatch` passes the
+/// slug it claimed, `boss brief` passes none — and it is resolved ONCE
+/// here, by [`selected_step`], so the position line, THE PROTOCOL's
+/// procedure, THE STEP and the profile the caller resolved from that
+/// same step cannot name two different steps (backlog 4661a4a6).
 pub(crate) fn render_with(
     repo: &Path,
     job: Option<&Value>,
+    step: Option<&str>,
     profile: &str,
     active: Option<&Value>,
     trailer: Option<&str>,
     prior: Option<&crate::prior_work::PriorWork>,
+    repair: Option<&crate::dispatch::Repair>,
+) -> Result<String> {
+    render_for(
+        repo, job, step, profile, active, trailer, prior, repair, None,
+    )
+}
+
+/// [`render_with`], with the values a bounded START lists rather than
+/// prints (`crate::start_inputs`, design e72dc7c9). The ONE renderer
+/// still: every other section is the legacy brief's, so the two contracts
+/// cannot drift apart in anything but which packet values they print.
+pub(crate) fn render_for(
+    repo: &Path,
+    job: Option<&Value>,
+    step: Option<&str>,
+    profile: &str,
+    active: Option<&Value>,
+    trailer: Option<&str>,
+    prior: Option<&crate::prior_work::PriorWork>,
+    repair: Option<&crate::dispatch::Repair>,
+    listed: Option<&BTreeSet<String>>,
 ) -> Result<String> {
     let invs = invariants(repo)?;
     let lane = crate::documents::lane(repo, profile)?;
     let mut out = String::new();
     if let Some(job) = job {
-        out.push_str(&packet_section(job));
+        let at = selected_step(job, step)?;
+        out.push_str(&packet_section_for(job, at, listed));
         out.push('\n');
         // DIRECTLY UNDER THE PACKET (backlog 486dde37): whether its car
         // is gated held is a fact of the packet, and the builder meets it
@@ -1463,17 +1890,23 @@ pub(crate) fn render_with(
                 out.push('\n');
             }
         }
+        // A repair run meets the car it repairs, and the findings it
+        // answers, before anything telling it how to build (99b7ae76).
+        if let Some(r) = repair {
+            out.push_str(&crate::dispatch::repair_section(r));
+            out.push('\n');
+        }
         if let Some(named) = prior.and_then(crate::prior_work::section) {
             out.push_str(&named);
             out.push('\n');
         }
         // ABOVE the specification it dates (794e8d61): a reader meets
         // the age of the prose before the prose.
-        if let Some(protocol) = protocol_section(job, active) {
+        if let Some(protocol) = protocol_section(job, at, active) {
             out.push_str(&protocol);
             out.push('\n');
         }
-        if let Some(step) = step_section(job) {
+        if let Some(step) = at.and_then(step_section) {
             out.push_str(&step);
             out.push('\n');
         }
@@ -1551,10 +1984,14 @@ pub async fn run(packet_ref: Option<String>, profile_override: Option<String>) -
         render_with(
             &repo,
             job.as_ref(),
+            // No selector: a hand-run brief is the packet's one open
+            // step, as the profile above was resolved from (4661a4a6).
+            None,
             &profile,
             active.as_ref(),
             crate::documents::supplied_trailer().as_deref(),
             prior.as_ref(),
+            None,
         )?
     );
     Ok(())
@@ -1575,7 +2012,7 @@ mod tests {
         active: Option<&Value>,
         trailer: Option<&str>,
     ) -> Result<String> {
-        render_with(repo, job, profile, active, trailer, None)
+        render_with(repo, job, None, profile, active, trailer, None, None)
     }
     use serde_json::json;
 
@@ -1854,9 +2291,22 @@ printf 'a-lint.sh\nb-lint.sh\nc-lint.sh\n'
     /// the uid wrong in all ten); an unchecked label re-opens it.
     #[test]
     fn every_derived_invariant_can_show_its_reading_in_the_file_it_names() {
-        let invs = invariants(&repo()).expect("the invariants derive from this tree");
+        // In every isolation state, not only this host's (5008a6c9): the
+        // worker invariant prints a different page for each.
+        use crate::door_env::DevChild;
+        for route in [
+            DevChild::Local,
+            DevChild::Forward(PathBuf::from("/work/tools/dev-control/dev-build")),
+            DevChild::Refuse("a refused selector".into()),
+        ] {
+            let invs = invariants_with(&repo(), |_| route.clone()).expect("derive");
+            derived_readings_are_printed_and_sourced(&invs);
+        }
+    }
+
+    fn derived_readings_are_printed_and_sourced(invs: &[Invariant]) {
         let mut derived = 0;
-        for inv in &invs {
+        for inv in invs {
             let Grounding::Derived(readings) = &inv.grounding else {
                 continue;
             };
@@ -2043,6 +2493,104 @@ printf 'a-lint.sh\nb-lint.sh\nc-lint.sh\n'
         );
     }
 
+    /// THE UID DOOR'S TWO REFUSALS ARE ON THE PAGE (backlog aeac17f0,
+    /// 2026-10-21). Measured on origin/main 2dc1b5bc: `verify as the
+    /// gate` told a builder to run `as-gate-uid.sh <your command>` and
+    /// said nothing of dev isolation, while b5255c16 had already made
+    /// wt-cargo, wt-web, run-while-held.sh and `boss --built` refuse 75
+    /// to any caller the store is closed to — uid 65534 among them, so
+    /// the natural `as-gate-uid.sh wt-cargo test …` refuses even while
+    /// isolation is HELD, and the brief sent the builder there.
+    #[test]
+    fn verify_as_the_gate_says_the_selector_doors_refuse_its_uid() {
+        let invs = invariants(&repo()).expect("the invariants derive");
+        let inv = invs
+            .iter()
+            .find(|i| i.name == "verify as the gate")
+            .expect("a verify-as-the-gate invariant");
+        let lines = inv.lines.join("\n");
+        let manifest = std::fs::read_to_string(repo().join("infra/gate-runner/gate-runner.yaml"))
+            .expect("the manifest");
+        let (uid, _) = gate_ids(&manifest).expect("the ids");
+        for door in ["wt-cargo", "wt-web", HELD_DOOR, "boss --built"] {
+            assert!(
+                lines.contains(door),
+                "the uid door does not name {door}, which refuses its uid: {lines}"
+            );
+        }
+        assert!(
+            lines.contains(&format!("as uid {uid}")) && lines.contains("exit 75"),
+            "the uid door does not say what uid {uid} meets there: {lines}"
+        );
+        assert!(
+            lines.contains("as-gate-uid.sh wt-cargo"),
+            "the uid door does not name the spelling that refuses: {lines}"
+        );
+        // Each door it names is one whose own code refuses so, and the
+        // store is attributed to that door rather than typed.
+        let Grounding::Derived(readings) = &inv.grounding else {
+            panic!("verify as the gate is derived");
+        };
+        for file in [
+            "infra/dev/wt-cargo",
+            "infra/dev/wt-web",
+            HELD_DOOR,
+            "infra/dev/boss",
+        ] {
+            assert!(
+                readings.iter().any(|r| r.from == file),
+                "{file} is named as refusing and nothing was read out of it: {readings:?}"
+            );
+        }
+    }
+
+    /// The uid door's OWN refusal is printed only when its own code
+    /// carries it (aeac17f0): the brief reads the script rather than
+    /// promising what a car not yet landed will make true, so the line
+    /// cannot run ahead of the file in either landing order.
+    #[test]
+    fn the_uid_door_says_it_refuses_under_isolation_only_when_its_code_does() {
+        let store = "/work/tools/dev-control";
+        let refusing = "dev_control=/work/tools/dev-control\n\
+             if [[ -e $dev_control/enabled ]]; then\n    exit 75\n\
+             elif [[ ! -x $seen ]]; then\n    \
+             printf 'uid %s cannot read the dev isolation store %s'\n    exit 75\nfi\n";
+        assert!(refuses_on_the_isolation_store(refusing, store));
+        // The door as origin/main carried it: no selector read at all.
+        assert!(!refuses_on_the_isolation_store(
+            "set -uo pipefail\nas env HOME=x \"$@\"\n",
+            store
+        ));
+        // Prose is not code: a comment naming the store refuses nothing.
+        let commented = refusing
+            .lines()
+            .map(|l| format!("# {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!refuses_on_the_isolation_store(&commented, store));
+        // Another store is not this one.
+        assert!(!refuses_on_the_isolation_store(refusing, "/elsewhere"));
+
+        // And on this tree the line follows the file.
+        let script = std::fs::read_to_string(repo().join("infra/dev/as-gate-uid.sh"))
+            .expect("the method script");
+        let invs = invariants(&repo()).expect("the invariants derive");
+        let inv = invs
+            .iter()
+            .find(|i| i.name == "verify as the gate")
+            .expect("a verify-as-the-gate invariant");
+        let says = inv
+            .lines
+            .iter()
+            .any(|l| l.contains("while dev isolation is on"));
+        assert_eq!(
+            says,
+            refuses_on_the_isolation_store(&script, store),
+            "the brief's claim about the uid door must follow the door's code: {:?}",
+            inv.lines
+        );
+    }
+
     #[test]
     fn the_packet_half_prints_metadata_in_full_and_does_not_curate_keys() {
         // Longer than any terminal. A fitted value is the defect: it is
@@ -2070,7 +2618,7 @@ printf 'a-lint.sh\nb-lint.sh\nc-lint.sh\n'
                 "title": "Measure the claim, choose a route",
             }],
         });
-        let out = packet_section(&job);
+        let out = packet_section(&job, now_step(&job));
         assert!(
             out.contains(&long),
             "a metadata value must not be truncated"
@@ -2113,7 +2661,7 @@ printf 'a-lint.sh\nb-lint.sh\nc-lint.sh\n'
                 },
             }],
         });
-        let out = packet_section(&job);
+        let out = packet_section(&job, now_step(&job));
         assert!(
             out.contains(&format!(
                 "E1 — Warm palette — {} bytes — sha256 {digest}",
@@ -2177,7 +2725,7 @@ printf 'a-lint.sh\nb-lint.sh\nc-lint.sh\n'
                   "metadata": { "agent_run": "run-of-the-reader" } },
             ],
         });
-        let out = packet_section(&job);
+        let out = packet_section(&job, now_step(&job));
         // Every key of every completed step, untruncated, lines kept.
         assert!(out.contains(&long), "{out}");
         assert!(out.contains("    second line of evidence\n"), "{out}");
@@ -2233,7 +2781,7 @@ printf 'a-lint.sh\nb-lint.sh\nc-lint.sh\n'
                   ] },
             ],
         });
-        let out = packet_section(&job);
+        let out = packet_section(&job, now_step(&job));
         let original = out.find(damaged).expect("the original is printed");
         let first = out
             .find("correction [0]")
@@ -2270,7 +2818,7 @@ printf 'a-lint.sh\nb-lint.sh\nc-lint.sh\n'
     #[test]
     fn a_multiline_metadata_value_keeps_its_lines() {
         let job = json!({"metadata": {"claim": "first line\nsecond line"}});
-        let out = packet_section(&job);
+        let out = packet_section(&job, now_step(&job));
         assert!(out.contains("    first line\n    second line\n"), "{out}");
     }
 
@@ -2507,7 +3055,9 @@ printf 'a-lint.sh\nb-lint.sh\nc-lint.sh\n'
     #[test]
     fn the_step_half_carries_the_procedure_and_the_fields_required_at_done() {
         let job = a_step_with_a_specification();
-        let out = step_section(&job).expect("a step with a procedure has a section");
+        let out = now_step(&job)
+            .and_then(step_section)
+            .expect("a step with a procedure has a section");
         assert!(out.contains("Read the PAGE and the DEPARTMENT"), "{out}");
         assert!(out.contains("Count what you list."), "{out}");
         assert!(out.contains("controls_md"), "{out}");
@@ -2531,9 +3081,93 @@ printf 'a-lint.sh\nb-lint.sh\nc-lint.sh\n'
                               "authority_role": "platform-admin" },
             }],
         });
-        assert_eq!(step_section(&build), None);
+        assert_eq!(now_step(&build).and_then(step_section), None);
         let rendered = render(&repo(), Some(&build), "builder", None, None).expect("renders");
         assert!(!rendered.contains("== THE STEP"), "{rendered}");
+    }
+
+    /// THE SELECTOR IS THE STEP EVERY SECTION READS (backlog 4661a4a6).
+    /// A packet at two open steps, briefed for the second: the position
+    /// line, THE PROTOCOL's dated procedure and THE STEP all name it.
+    /// With no selector the brief is the first open step, as `boss brief`
+    /// always was, and a selector the packet does not carry is refused
+    /// rather than answered with another step.
+    #[test]
+    fn a_selected_step_is_the_one_every_section_prints() {
+        let step = |slug: &str, title: &str, procedure: &str| {
+            json!({
+                "spec_slug": slug, "kind": "task", "status": "ready", "title": title,
+                "fields": [{ "name": format!("{slug}_field"), "field_type": "string",
+                             "required": true, "filled_by": "executor" }],
+                "metadata": { "procedure": procedure },
+            })
+        };
+        let job = json!({
+            "id": "4661a4a6-0000-0000-0000-000000000000",
+            "kind": "ship-a-change",
+            "workflow_version": 2,
+            "steps": [
+                step("proven", "Proven in prod", "FIRST-PROCEDURE"),
+                step("landed-review", "Reviewed after landing", "SECOND-PROCEDURE"),
+            ],
+        });
+        let row = json!({ "version": 3, "steps": [
+            { "title": "landed-review", "metadata_defaults": { "procedure": "SECOND-PROCEDURE" } },
+        ]});
+
+        let chosen = render_with(
+            &repo(),
+            Some(&job),
+            Some("landed-review"),
+            "reviewer",
+            Some(&row),
+            None,
+            None,
+            None,
+        )
+        .expect("renders");
+        assert!(
+            chosen.contains("now at: Reviewed after landing\n        step `landed-review`"),
+            "{chosen}"
+        );
+        assert!(
+            chosen.contains("Reviewed after landing — step `landed-review`, kind task"),
+            "{chosen}"
+        );
+        assert!(chosen.contains("landed-review_field"), "{chosen}");
+        assert!(chosen.contains("SECOND-PROCEDURE"), "{chosen}");
+        assert!(
+            chosen.contains("The `landed-review` procedure below"),
+            "THE PROTOCOL dates the selected step's procedure: {chosen}"
+        );
+        for other in ["Proven in prod", "proven_field", "FIRST-PROCEDURE"] {
+            assert!(!chosen.contains(other), "{other} leaked: {chosen}");
+        }
+
+        // No selector: the first open step, unchanged.
+        let default = render(&repo(), Some(&job), "builder", None, None).expect("renders");
+        assert!(
+            default.contains("Proven in prod — step `proven`, kind task"),
+            "{default}"
+        );
+        assert!(!default.contains("SECOND-PROCEDURE"), "{default}");
+
+        // A selector the packet does not carry: refused, naming it.
+        let err = render_with(
+            &repo(),
+            Some(&job),
+            Some("landed-reveiw"),
+            "reviewer",
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("has no step `landed-reveiw` to brief"),
+            "{err:#}"
+        );
     }
 
     /// THE ONE LINE IT DID RENDER WAS WRONG TWICE (c8faa7f3). It read
@@ -2545,7 +3179,8 @@ printf 'a-lint.sh\nb-lint.sh\nc-lint.sh\n'
     /// re-read); this is the naming half.
     #[test]
     fn the_now_at_line_names_the_step_the_way_a_surface_names_it() {
-        let out = packet_section(&a_step_with_a_specification());
+        let job = a_step_with_a_specification();
+        let out = packet_section(&job, now_step(&job));
         assert!(
             out.contains("now at: Inventory the page and the department's needs"),
             "{out}"
@@ -2778,6 +3413,7 @@ tenant_repo = \"acme/no-ref\"
         // over-reports, so the verdict is the comparison.
         let out = protocol_section(
             &job,
+            now_step(&job),
             Some(&active_row(3, "Read the PAGE, then COMPLETE it.")),
         )
         .expect("a packet with a pinned version has a protocol section");
@@ -2790,6 +3426,7 @@ tenant_repo = \"acme/no-ref\"
         // a bare version line would call stale.
         let same = protocol_section(
             &job,
+            now_step(&job),
             Some(&active_row(3, "Read the PAGE and the DEPARTMENT.")),
         )
         .expect("section");
@@ -2799,6 +3436,7 @@ tenant_repo = \"acme/no-ref\"
         // PINNED TO THE CURRENT VERSION: nothing is lagging.
         let current = protocol_section(
             &job,
+            now_step(&job),
             Some(&active_row(2, "Read the PAGE and the DEPARTMENT.")),
         )
         .expect("section");
@@ -2807,13 +3445,16 @@ tenant_repo = \"acme/no-ref\"
         // THE ROW COULD NOT BE READ. The pin is still a fact and is
         // still printed; what is NOT known is said rather than assumed
         // — a brief that silently claims currency is the defect.
-        let unread = protocol_section(&job, None).expect("section");
+        let unread = protocol_section(&job, now_step(&job), None).expect("section");
         assert!(unread.contains("page-audit v2"), "{unread}");
         assert!(unread.contains("not read"), "{unread}");
         assert!(!unread.contains("is current"), "{unread}");
 
         // A packet with no pinned version prints no claim about one.
-        assert_eq!(protocol_section(&json!({"kind": "page-audit"}), None), None);
+        assert_eq!(
+            protocol_section(&json!({"kind": "page-audit"}), None, None),
+            None
+        );
     }
 
     /// The section rides in the brief, ABOVE the specification it
@@ -2869,24 +3510,145 @@ tenant_repo = \"acme/no-ref\"
     /// vouching for a tree it did not read.
     #[test]
     fn a_builder_brief_routes_candidate_checks_through_the_published_worker() {
-        let rendered = render(&repo(), None, "builder", None, None).expect("renders");
+        let invs = invariants_with(&repo(), |store| {
+            crate::door_env::DevChild::Forward(store.join("dev-build"))
+        })
+        .expect("the invariants derive from this tree");
+        let preflight = block_of(&invs, "pre-flight");
         assert!(
-            rendered.contains(
+            preflight.starts_with(
                 "/work/tools/dev-control/dev-build exec-auto -- /bin/bash infra/gate.sh --lint"
             ),
-            "the pre-flight must name the published controller, not run candidate lints beside credentials: {rendered}"
+            "an ACTIVATED pre-flight must name the published controller, not run candidate lints beside credentials: {preflight}"
         );
+        let worker = block_of(&invs, "worker execution");
         for required in [
             "direct interpreters",
             "Never run the candidate infra/dev/dev-build.py",
-            "activation remains held",
             "first dispatched builder",
         ] {
+            assert!(worker.contains(required), "missing {required}: {worker}");
+        }
+    }
+
+    /// THE DOOR THE BRIEF NAMES MUST EXIST (backlog 5008a6c9,
+    /// 2026-10-15). With activation held, `/work/tools/dev-control/
+    /// enabled` does not exist and `dev-build` is a link into it, so the
+    /// pre-flight the brief named exited 127 — measured again by the
+    /// builder of this car, 2026-10-18 — and two builders fell back to a
+    /// local run the brief had not named. Held, the brief names the
+    /// route that works and says what it proves; it names no command
+    /// that cannot run.
+    #[test]
+    fn a_held_isolation_names_the_local_preflight_and_no_dead_door() {
+        let invs = invariants_with(&repo(), |_| crate::door_env::DevChild::Local)
+            .expect("the invariants derive from this tree");
+        let preflight = block_of(&invs, "pre-flight");
+        // Through the door that reads the selector again when it RUNS
+        // (backlog 9a37d9d8): this render's reading is minutes to an hour
+        // old by then, and a bare `/bin/bash infra/gate.sh` would run the
+        // candidate lints beside credentials if activation came between.
+        // MAIN'S door, by absolute path (backlog 6d2e2653, review run
+        // 012c8dcf): spelled relative, the builder's worktree ran its own
+        // copy — a branch editing the door ran its edit, and a worktree
+        // cut before the door landed had none and exited 127 unexplained.
+        let main = crate::shared_checkout::read(&repo())
+            .expect("git reads this tree")
+            .main_toplevel();
+        let door = main.join(HELD_DOOR);
+        assert!(door.is_absolute(), "{}", door.display());
+        assert!(
+            preflight.starts_with(&format!(
+                "/bin/bash {} infra/gate.sh --lint > <your scratch dir>/",
+                door.display()
+            )),
+            "held, the pre-flight's first line is the local run through MAIN's held door: {preflight}"
+        );
+        assert!(
+            preflight.contains("127") && preflight.contains(&main.display().to_string()),
+            "held, the pre-flight says what a missing door means and whose checkout it is: {preflight}"
+        );
+        assert!(
+            preflight.contains("exit 75"),
+            "held, the pre-flight says what the door does once activated: {preflight}"
+        );
+        // The HOLD is what its owner lifts; activation is what lifting
+        // it is (9a37d9d8 (a)) — the old line said the opposite.
+        let worker = block_of(&invs, "worker execution");
+        assert!(!worker.contains("Activation is lifted"), "{worker}");
+        assert!(worker.contains(HELD_DOOR), "{worker}");
+        for inv in ["pre-flight", "worker execution"] {
+            let text = block_of(&invs, inv);
             assert!(
-                rendered.contains(required),
-                "missing {required}: {rendered}"
+                !text.contains("exec-auto --"),
+                "held, the {inv} invariant names a controller command that exits 127: {text}"
+            );
+            assert!(
+                text.contains("HELD"),
+                "{inv} does not say it is held: {text}"
+            );
+            assert!(
+                text.contains("/work/tools/dev-control/enabled"),
+                "{inv} does not name the selector it read: {text}"
             );
         }
+        assert!(
+            block_of(&invs, "pre-flight").contains("source preparation"),
+            "held, a local pre-flight must say it is not isolation proof"
+        );
+    }
+
+    /// A selector that is there and wrong is neither route: every child
+    /// of this CLI refuses (design a68fc42a D1), so the brief says stop
+    /// rather than printing a command that will refuse or a local run
+    /// the rules forbid.
+    #[test]
+    fn a_refused_selector_names_a_stop_and_no_command() {
+        let invs = invariants_with(&repo(), |_| {
+            crate::door_env::DevChild::Refuse("its selector names /elsewhere".into())
+        })
+        .expect("the invariants derive from this tree");
+        for inv in ["pre-flight", "worker execution"] {
+            let text = block_of(&invs, inv);
+            assert!(text.starts_with("STOP"), "{inv}: {text}");
+            assert!(
+                text.contains("its selector names /elsewhere"),
+                "{inv}: {text}"
+            );
+            assert!(!text.contains("exec-auto --"), "{inv}: {text}");
+        }
+        // Nothing was printed to run, so nothing has an exit status to
+        // echo (9a37d9d8 (b)).
+        let preflight = block_of(&invs, "pre-flight");
+        assert!(!preflight.contains("echo $?"), "{preflight}");
+        assert!(!preflight.contains("NEXT command"), "{preflight}");
+    }
+
+    /// The live render reads the same selector the child door reads, at
+    /// the store the tree declares — not a second opinion of its own.
+    #[test]
+    fn the_rendered_isolation_is_the_child_doors_own_reading() {
+        let live = invariants(&repo()).expect("the invariants derive from this tree");
+        let store = published_worker_door(
+            &std::fs::read_to_string(repo().join("crates/orchestrators/boss-cli/src/door_env.rs"))
+                .expect("door_env.rs"),
+        )
+        .expect("the store is declared");
+        let observed =
+            crate::door_env::dev_child_route(Path::new(store.trim_end_matches("/dev-build")));
+        let chosen = invariants_with(&repo(), |_| observed.clone()).expect("derive");
+        assert_eq!(
+            block_of(&live, "pre-flight"),
+            block_of(&chosen, "pre-flight")
+        );
+    }
+
+    fn block_of(invs: &[Invariant], name: &str) -> String {
+        invs.iter()
+            .find(|i| i.name == name)
+            .unwrap_or_else(|| panic!("no {name:?} invariant"))
+            .lines
+            .join("\n")
     }
 
     #[test]
@@ -2936,6 +3698,88 @@ tenant_repo = \"acme/no-ref\"
         );
     }
 
+    /// THE COST IS READ, NOT TYPED (backlog 07ad55b3, 2026-10-19). The
+    /// pre-flight invariant said "clippy scoped to the crates this tree
+    /// changed, seconds against the ~11 minutes a gate costs" under a
+    /// heading claiming it was read out of CLAUDE.md's `Before pushing`
+    /// entry — but the sentence was typed into this file, and after
+    /// 1c03eeb0 measured `--lint` at 509-695 s the entry said minutes
+    /// while every builder brief still said seconds. The figure the
+    /// brief prints is now the entry's own measurement, so the two
+    /// cannot disagree. Checked against a reading of CLAUDE.md made
+    /// HERE, independently of `preflight_cost`, so a parser that
+    /// answered with a constant would fail too.
+    ///
+    /// A GATE RUNS THIS WHATEVER THE CAR CHANGED (review e207853d,
+    /// 2026-10-20). `invariants` refuses to render every lane's brief
+    /// when the entry records no measurement, and a CLAUDE.md-only car
+    /// selects no crate: the file-input index skips a slash-less literal
+    /// and `path_shapes` maps no rule for it, so the docs edit that
+    /// re-measures `--lint` in other words gated green and would have
+    /// stopped dispatch. Declared, this test is the canary every scoped
+    /// gate and `--lint` run on the live CLAUDE.md.
+    ///
+    /// AND IT CHARACTERISES THE COST BY THE NUMBER ALONE. The first fix
+    /// printed "minutes, not seconds: that entry measured `--lint` at
+    /// <n> s" — a unit typed here under "read out of that entry", which
+    /// went on saying minutes when the review edited the entry to 45 s.
+    // tree-wide pin — it reads CLAUDE.md, which no changed-file map attributes to boss-cli
+    #[test]
+    fn the_preflight_cost_is_the_measurement_the_doors_entry_records() {
+        let claude = std::fs::read_to_string(repo().join("CLAUDE.md")).expect("CLAUDE.md");
+        let entry: String = claude
+            .split("- **Before pushing")
+            .nth(1)
+            .and_then(|e| e.split("\n\n- **").next())
+            .expect("CLAUDE.md §Doors carries a `Before pushing` entry")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let secs = entry
+            .split("`--lint` took ")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .expect("the `Before pushing` entry records what `--lint` took");
+        let block = block_of(
+            &invariants(&repo()).expect("the invariants derive from this tree"),
+            "pre-flight",
+        );
+        assert!(
+            block.contains(&format!("{secs} s")),
+            "CLAUDE.md's `Before pushing` entry measured `--lint` at {secs} s and the \
+             brief's pre-flight invariant does not print it:\n{block}"
+        );
+        let lower = block.to_lowercase();
+        for typed in ["second", "minute"] {
+            assert!(
+                !lower.contains(typed),
+                "the pre-flight invariant types a duration of its own ({typed:?}) beside the \
+                 entry's {secs} s; only the entry's measurement may say what `--lint` \
+                 costs (review e207853d):\n{block}"
+            );
+        }
+    }
+
+    /// The parse follows the source: change the entry's number and the
+    /// reading changes with it; take the measurement out and it reads
+    /// nothing, so the brief refuses rather than print a figure of its own.
+    #[test]
+    fn the_preflight_cost_parse_follows_the_entry() {
+        let entry = "- **Before pushing — `infra/gate.sh --lint`.** on the pod\n  \
+                     (2027-01-02, backlog x) `--lint`\n  took 999 s for a change.\n\n- **Next";
+        assert_eq!(
+            preflight_cost(entry),
+            Some(PreflightCost {
+                secs: 999,
+                measured_on: "2027-01-02".into()
+            })
+        );
+        assert_eq!(
+            preflight_cost("- **Before pushing — `infra/gate.sh --lint`.** fast.\n\n- **Next"),
+            None
+        );
+    }
+
     /// ONE ORDER, AND IT CHECKS BEFORE IT PUSHES (backlog e30ac196,
     /// 2026-09-28). The brief carried a typed `order` invariant —
     /// "cargo fmt -> COMMIT AND PUSH -> then any optional local check",
@@ -2951,7 +3795,10 @@ tenant_repo = \"acme/no-ref\"
     fn a_builder_brief_names_no_push_before_its_preflight() {
         let claude = std::fs::read_to_string(repo().join("CLAUDE.md")).expect("CLAUDE.md");
         let door = preflight_door(&claude).expect("CLAUDE.md §Doors carries the pre-flight door");
-        let preflight = format!("bash {door}");
+        // The door and its redirect, which every route that prints a
+        // command spells — activated behind the controller, held behind
+        // the held door (9a37d9d8) — so this holds whichever this host is.
+        let preflight = format!("{door} > <your scratch dir>");
         let out = render(&repo(), None, "builder", None, None).expect("renders");
         let at = out
             .find(&preflight)

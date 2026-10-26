@@ -214,7 +214,24 @@ if [ -z "${BOSS_JOBS_URL:-}" ]; then
 fi
 BASE="$BOSS_JOBS_URL"
 
-VERBS_DIR="${OPS_VERBS_DIR:-$(dirname "$0")/verbs}"
+# THIS PASS'S OWN DIRECTORY, RESOLVED ONCE AND PHYSICALLY (backlog
+# 1dde630c, review a8b752d4 N2). On the forge the unit starts this file
+# as /var/lib/boss/tree/current/infra/ops/ops-runner.sh, and `current`
+# is a link root-tree.sh moves with one rename whenever main moves. Every
+# path below used to go through `$(dirname "$0")` — through the link, at
+# the moment of use — so a pass could read its allowlist and libraries
+# from one generation and exec a verb's script out of the next. `pwd -P`
+# names the generation itself, gen/<sha>, which is never written again,
+# so the allowlist, both libraries and every verb script of this pass
+# come from the tree the pass started in. On the DIRECTORY, not
+# `readlink -f "$0"`: a checkout that links this file in from elsewhere
+# (the test fixtures do) is still the checkout it was started from.
+RUNNER_DIR="$(cd "$(dirname "$0")" && pwd -P)" || {
+    echo "ops-runner: cannot resolve the directory $(dirname "$0") this runner was started from — refusing to run" >&2
+    exit 78
+}
+
+VERBS_DIR="${OPS_VERBS_DIR:-$RUNNER_DIR/verbs}"
 # THE CHECKOUT THIS RUNNER IS PART OF. A verb's script is named in its
 # verb file RELATIVE to the repo (infra/forge/disk-report.sh) and resolved
 # here, against the checkout the runner itself runs from — never an
@@ -224,7 +241,7 @@ VERBS_DIR="${OPS_VERBS_DIR:-$(dirname "$0")/verbs}"
 # file — two lints, the test harness — substituted that prefix for its
 # own: one assumption in four places (66077f9c, CLAUDE.md §9a). A bare
 # command (systemctl, df) stays a bare command, resolved on PATH.
-OPS_REPO_ROOT="${OPS_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+OPS_REPO_ROOT="${OPS_REPO_ROOT:-$(cd "$RUNNER_DIR/../.." && pwd -P)}"
 OPS_TIMEOUT="${OPS_TIMEOUT:-30}"
 OPS_OUTPUT_CAP="${OPS_OUTPUT_CAP:-102400}"
 # A STEP WRITE THE SYSTEM OF RECORD DID NOT ANSWER IS TRIED AGAIN (the
@@ -257,7 +274,7 @@ trap 'rm -rf "$workdir"' EXIT
 # the fault named by the assembler on stderr), never a partial
 # allowlist that refuses every packet as "unknown verb".
 VERBS_FILE="$workdir/allowlist.json"
-if ! sh "$(dirname "$0")/verbs-allowlist.sh" "$VERBS_DIR" > "$VERBS_FILE"; then
+if ! sh "$RUNNER_DIR/verbs-allowlist.sh" "$VERBS_DIR" > "$VERBS_FILE"; then
     echo "ops-runner: allowlist directory $VERBS_DIR could not be loaded — refusing to run" >&2
     exit 78
 fi
@@ -305,7 +322,7 @@ APPROVAL_SKEW_S=60
 # Checked BEFORE the `.`: under /bin/sh (dash) a `.` of a missing file
 # is a special-builtin error that ends the shell with its own message,
 # not this one.
-SHAPE_LIB="$(dirname "$0")/../lib/step-shape.sh"
+SHAPE_LIB="$RUNNER_DIR/../lib/step-shape.sh"
 if [ ! -r "$SHAPE_LIB" ]; then
     echo "ops-runner: $SHAPE_LIB is missing — without the shape hash no approval can be verified; refusing to run" >&2
     exit 78
@@ -322,7 +339,7 @@ fi
 # after the EXIT trap above (the helper chains its cleanup in front of
 # it), because the writes below run inside $(…). Checked before the `.`
 # for the reason SHAPE_LIB is.
-SECRET_LIB="$(dirname "$0")/../lib/secret-header.sh"
+SECRET_LIB="$RUNNER_DIR/../lib/secret-header.sh"
 if [ ! -r "$SECRET_LIB" ]; then
     echo "ops-runner: $SECRET_LIB is missing — the machine token would have to ride in curl's command line; refusing to run" >&2
     exit 78
@@ -424,12 +441,18 @@ fi
 # claim can have run a write here, and so the only one a "claimed,
 # outcome unknown" record may name (security re-review, 2026-09-25).
 # `\z`, not `$`: Oniguruma reads `$` as "end, or before a final newline".
+# The credential door keeps exactly this id on a request it resolves to
+# THIS host, and rebinds any other to the account (backlog d16c2dae:
+# boss-jobs runner_credential::acting_id). Its tests run BOTH functions
+# below against the door, so a pid bound or a separator changed here
+# without the door turns that test red (backlog 043d15a2: the pid was
+# `[0-9]+` here and 1 to 10 digits there).
 mint_claimant() {
     printf '%s:%s:%s-%s' "$ACTOR" "$HOST_ID" "$(date -u +%Y%m%dT%H%M%SZ)" "$$"
 }
 is_runner_pass() {
     jq -rn --arg id "$1" --arg p "$ACTOR:$HOST_ID:" '
-        if ($id | startswith($p)) and ($id[($p | length):] | test("^[0-9]{8}T[0-9]{6}Z-[0-9]+\\z"))
+        if ($id | startswith($p)) and ($id[($p | length):] | test("^[0-9]{8}T[0-9]{6}Z-[0-9]{1,10}\\z"))
         then "yes" else "no" end'
 }
 

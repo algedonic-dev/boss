@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 #[cfg(test)]
+mod admission_tests;
+#[cfg(test)]
 mod artifact_tests;
 mod artifacts;
 mod recovery;
@@ -40,31 +42,49 @@ enum Selection {
     RecoveryAssessment,
 }
 
+/// What the conductor's diagnostic queue can see, defined ONCE (backlog
+/// 97170186). The drain's server filter, its client-side recheck and the
+/// selected packet's recheck all read these markers, and the published
+/// diagnostic-recovery-assessment contract declares the recovery set as
+/// `metadata_schema.required_values`, which admission enforces — pinned
+/// equal by admission_tests, because the queue's half is the conductor's
+/// own identity in code and the contract's half is registry data (§9a).
+/// Before, the contract only described them, so a packet admitted
+/// without them (28e96fbc) sat invisible until a hand PATCH.
+pub(super) fn queue_markers(recovery: bool) -> Value {
+    if recovery {
+        json!({"diagnostic_executor":ACTOR,"diagnostic_recovery_assessment":"v1"})
+    } else {
+        json!({"diagnostic_executor":ACTOR})
+    }
+}
+
+pub(super) fn carries_markers(job: &Value, markers: &Value) -> bool {
+    markers.as_object().is_some_and(|markers| {
+        markers
+            .iter()
+            .all(|(key, value)| job["metadata"][key] == *value)
+    })
+}
+
+/// The queue's read, exactly as the drain sends it.
+pub(super) fn queue_path(markers: &Value, status: &str, offset: usize) -> String {
+    let markers = markers.to_string();
+    let filter = percent_encoding::utf8_percent_encode(&markers, crate::job::QUERY_VALUE);
+    format!("/api/jobs?status={status}&metadata={filter}&limit={PAGE_LIMIT}&offset={offset}")
+}
+
 async fn drain_scope(conductor: &Conductor, scope: DrainScope) -> Result<()> {
-    let filter = percent_encoding::utf8_percent_encode(
-        &json!({"diagnostic_executor":ACTOR}).to_string(),
-        crate::job::QUERY_VALUE,
-    )
-    .to_string();
+    let markers = queue_markers(false);
     let requests = list_all_pages(|offset| {
-        let filter = &filter;
-        async move {
-            conductor
-                .api(
-                    Method::GET,
-                    &format!(
-                        "/api/jobs?status=open&metadata={filter}&limit={PAGE_LIMIT}&offset={offset}"
-                    ),
-                    None,
-                )
-                .await
-        }
+        let path = queue_path(&markers, "open", offset);
+        async move { conductor.api(Method::GET, &path, None).await }
     })
     .await?;
     let mut ours: Vec<Value> = requests
         .into_iter()
         .filter(|job| {
-            job["metadata"]["diagnostic_executor"] == ACTOR
+            carries_markers(job, &markers)
                 && find_step(job, "execute").is_some_and(|step| !step_done(Some(step)))
         })
         .collect();
@@ -90,36 +110,35 @@ async fn drain_scope(conductor: &Conductor, scope: DrainScope) -> Result<()> {
         // Markers select candidates; the whole pinned protocol and its exact
         // decided authority are still validated by recovery::advance. Never
         // hydrate or claim an ordinary request on an occupied track.
+        let recovery = queue_markers(true);
         let assessments = ours
             .into_iter()
-            .filter(|job| job["metadata"]["diagnostic_recovery_assessment"] == "v1")
+            .filter(|job| carries_markers(job, &recovery))
             .collect();
         return advance_requests(assessments, |selected, _| {
             advance_selected(conductor, selected, Selection::RecoveryAssessment)
         })
         .await;
     }
-    let filter = percent_encoding::utf8_percent_encode(
-        &json!({"diagnostic_executor":ACTOR,"diagnostic_recovery_assessment":"v1"}).to_string(),
-        crate::job::QUERY_VALUE,
-    )
-    .to_string();
+    let recovery = queue_markers(true);
     let completed = if ours.iter().any(|job| {
         job["kind"] == "diagnostic-request"
             && job["workflow_version"] == 2
             && find_step(job, "execute").is_some_and(|step| step["status"] == "active")
     }) {
-        list_all_pages(|offset|{let filter=&filter;async move {
-        conductor.api(Method::GET,&format!("/api/jobs?status=closed&metadata={filter}&limit={PAGE_LIMIT}&offset={offset}"),None).await
-        }}).await?
+        list_all_pages(|offset| {
+            let path = queue_path(&recovery, "closed", offset);
+            async move { conductor.api(Method::GET, &path, None).await }
+        })
+        .await?
     } else {
         Vec::new()
     };
     let mut assessed = std::collections::BTreeSet::new();
-    for candidate in completed.iter().filter(|job| {
-        job["metadata"]["diagnostic_recovery_assessment"] == "v1"
-            && job["metadata"]["diagnostic_executor"] == ACTOR
-    }) {
+    for candidate in completed
+        .iter()
+        .filter(|job| carries_markers(job, &recovery))
+    {
         match recovery::covered_original(conductor, candidate).await {
             Ok(original) => {
                 assessed.insert(original);
@@ -201,7 +220,7 @@ async fn advance_selected(
             .as_i64()
             .filter(|version| *version > 0)
             .is_none()
-        || job["metadata"]["diagnostic_executor"] != ACTOR
+        || !carries_markers(&job, &queue_markers(false))
         || job["status"] != "open"
     {
         bail!("diagnostic selected packet identity, protocol or executor changed");
@@ -227,7 +246,7 @@ async fn advance_selected(
     let may_launch = match selection {
         Selection::Ordinary { may_launch } => may_launch,
         Selection::RecoveryAssessment => {
-            if job["metadata"]["diagnostic_recovery_assessment"] != "v1" || !recovery {
+            if !carries_markers(&job, &queue_markers(true)) || !recovery {
                 bail!("occupied-track recovery selection has no registered assessment handler");
             }
             false
@@ -584,7 +603,8 @@ impl Door for NativeDoor<'_> {
             serde_json::from_value(protocol.clone())?;
         if published.kind != kind
             || i64::from(published.version) != version
-            || published.status == boss_jobs::registry::WorkflowStatus::Draft
+            // A rejected row was never published either (50ded63d).
+            || !published.status.was_published()
         {
             bail!("diagnostic pinned published protocol identity differs");
         }
@@ -991,6 +1011,16 @@ mod tests {
     use super::*;
     use boss_jobs::JobsRepository;
     use std::sync::Arc;
+
+    /// How long a fixture here waits on something it does not judge — two
+    /// owning calls settling, a re-executed test binary reaching the forge
+    /// stub — before it names a hang. A backstop, never the subject: train
+    /// and car gates on 2026-10-22 went red at the old fifteen and thirty
+    /// seconds on cars that never touched this file (gates 9b3ced66 and
+    /// bae2e406), because work done while three gates share the test phase
+    /// is slow, not wrong (f10419f9). What each test judges is in its
+    /// assertions.
+    const FIXTURE_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(300);
 
     // The list and detail are served by the owning jobs router. Faults
     // affect only the selected detail response, before any controller effect.
@@ -1604,14 +1634,20 @@ mod tests {
             dispositions: &dispositions,
             effects: &effects,
         };
-        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let (first, second) = tokio::time::timeout(FIXTURE_BACKSTOP, async {
             tokio::join!(
                 advance(&port, original.attempt),
                 advance(&port, original.attempt)
             )
         })
         .await
-        .expect("both owning first-record calls must settle");
+        .unwrap_or_else(|_| {
+            panic!(
+                "both owning first-record calls must settle; after {FIXTURE_BACKSTOP:?} the dispositions were {:?} and the effects {}",
+                dispositions.lock().unwrap(),
+                effects.load(std::sync::atomic::Ordering::SeqCst)
+            )
+        });
         assert!(
             first.is_ok() && second.is_ok(),
             "{:?} {:?}",
@@ -1772,6 +1808,7 @@ mod tests {
     async fn diagnostic_fetch_uses_published_auth_and_keeps_refusal_originals() {
         use std::io::{Read, Write};
         if let Ok(root) = std::env::var("BOSS_DIAGNOSTIC_AUTH_FIXTURE") {
+            boss_testing::reexec::ready();
             let root = std::path::Path::new(&root);
             let mut conductor = Conductor::diagnostic_fixture(&root.join("clone"));
             conductor.cfg.fork_url = std::env::var("BOSS_TRAIN_FORGE_URL").unwrap();
@@ -1831,14 +1868,23 @@ mod tests {
                 std::fs::write(&token, "ordinary-fixed-fixture-token").unwrap();
             }
             let backend_root = root.path().to_path_buf();
+            // The fixture waits for the child's fetch for as long as the
+            // child lives, not for a clock: its 30 s used to start before
+            // the spawn, so the exec of this whole debug binary on a loaded gate
+            // pod was charged to the fetch and redded gate 5fc86d87 on
+            // correct code (backlog 7e30ddb0). The child's own work is
+            // bounded below, from its `ready()`.
+            let child_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let gone = child_gone.clone();
             let server = std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                 loop {
+                    // Read BEFORE the accept: a child that ended had
+                    // already connected, so its request is in the backlog
+                    // and this accept still takes it.
+                    let ended = gone.load(std::sync::atomic::Ordering::SeqCst);
                     match listener.accept() {
                         Ok((mut socket, _)) => {
-                            socket
-                                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                                .unwrap();
+                            socket.set_read_timeout(Some(FIXTURE_BACKSTOP)).unwrap();
                             let mut request = Vec::new();
                             while !request.ends_with(b"\r\n\r\n") {
                                 let mut byte = [0];
@@ -1872,10 +1918,7 @@ mod tests {
                             return true;
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(
-                                std::time::Instant::now() < deadline,
-                                "fixture request absent"
-                            );
+                            assert!(!ended, "fixture request absent: the child ended without it");
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
                         Err(error) => panic!("{error}"),
@@ -1884,17 +1927,33 @@ mod tests {
             });
             // A child process owns the complete fixture environment; parallel tests
             // cannot race credential variables or accidentally read mounted tokens.
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "train::diagnostic_adapter::tests::diagnostic_fetch_uses_published_auth_and_keeps_refusal_originals", "--nocapture"])
-                .env_clear().env("PATH", std::env::var_os("PATH").unwrap())
-                .env("HOME", root.path()).env("GIT_CONFIG_NOSYSTEM", "1")
+            let mut child = boss_testing::reexec::ReExec::new(
+                "train::diagnostic_adapter::tests::diagnostic_fetch_uses_published_auth_and_keeps_refusal_originals",
+            );
+            child
+                .command()
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .env("HOME", root.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .env("BOSS_DIAGNOSTIC_AUTH_FIXTURE", root.path())
                 .env("BOSS_TRAIN_FORGE_TOKEN_FILE", token)
-                .env("BOSS_TRAIN_FORGE_URL", &url)
-                .output().unwrap();
-            let observed_auth = server.join().unwrap();
-            assert!(output.status.success(), "child fixture failed");
+                .env("BOSS_TRAIN_FORGE_URL", &url);
+            let output = child.spawn().finish(std::time::Duration::from_secs(30));
+            child_gone.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Joined before the child's verdict is read, so a server that
+            // saw no request does not hide what the child said.
+            let served = server.join();
+            assert!(
+                output.succeeded(),
+                "child fixture failed (start {:?}, work {:?}): {}\n{}",
+                output.start,
+                output.work,
+                output.stdout,
+                output.stderr
+            );
+            let observed_auth = served.unwrap();
             let originals =
                 super::super::diagnostic_journal::originals(&root.path().join("journal")).unwrap();
             assert_eq!(

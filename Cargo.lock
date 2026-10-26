@@ -924,6 +924,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "boss-testing",
  "chrono",
  "hex",
  "hmac 0.13.0",
@@ -1252,6 +1253,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "yaml_serde",
 ]
 
 [[package]]

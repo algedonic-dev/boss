@@ -39,6 +39,18 @@ blocking = ["reqwest/blocking"]
 proptest = "1"
 tower = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Test-only, for `tests/a_sigterm_ends_a_gated_process.rs`: it re-runs
+# its own test binary, and `boss_testing::reexec` is the one definition
+# of how such a child is waited for — start judged by liveness under a
+# named ceiling, work timed from the child's `ready()` (backlog 7e30ddb0,
+# review 12a4ee82 B1: the inline copy here had lost the ceiling).
+# boss-testing depends on boss-core in turn; cargo admits the cycle for
+# a dev-only edge, and an integration test links the one boss-core lib
+# both sides name. The lib's own `#[cfg(test)]` units do not use it.
+boss-testing = { path = "../boss-testing" }
+# The paused clock: gate evidence's end is bounded inside END_GRACE,
+# and its tests run that grace without waiting it out (backlog 9f1e4063).
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

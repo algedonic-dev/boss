@@ -44,6 +44,26 @@ required-features = ["postgres"]
 name = "conditional_binding_authority"
 required-features = ["postgres"]
 
+[[test]]
+name = "a_packets_priority_moves_through_its_own_door_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_map_reads_the_membership_flow_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "flow_snapshot_deadline_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "membership_projection_store_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "the_step_batch_reads_each_packet_once_pg"
+required-features = ["postgres"]
+
 [dependencies]
 boss-clock-client = { path = "../boss-clock-client" }
 boss-ports = { path = "../boss-ports" }
@@ -79,6 +99,8 @@ base64 = "0.22"
 anyhow = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
+# Read the reviewed ConfigMap semantically, including quoted/aliased YAML.
+yaml_serde = "0.10"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
@@ -194,6 +216,10 @@ name = "job_metadata_patch_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "an_owed_proof_payment_is_judged_under_the_row_lock_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "repin_writes_the_move_whole_pg"
 required-features = ["postgres"]
 
@@ -247,6 +273,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "a_created_step_replays_at_its_plugin_version_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_lost_gate_handback_sent_twice_is_one_item_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -319,6 +349,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "a_stale_step_write_erases_nothing_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_release_lifts_only_the_hold_it_read_pg"
 required-features = ["postgres"]
 
 [[test]]
@@ -503,6 +537,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "the_health_reads_the_schema_ledger_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "a_database_pool_observation_never_waits_for_the_pool"
 required-features = ["postgres"]
 
 [[test]]

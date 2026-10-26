@@ -68,6 +68,10 @@ const CHAIN_READERS: &[(&str, &str)] = &[
 
 /// Every file allowed to read the `x-sim-origin` header, and why.
 const HEADER_READERS: &[(&str, &str)] = &[
+    (
+        "crates/orchestrators/boss-dispatcher-handlers/src/handlers/jobs_idle_actor_watch/wire_tests.rs",
+        "cfg(test)-only real HTTP receiver verifies immutable wait-record requests carry provenance; never authorizes production requests (9216ffa2)",
+    ),
     ("crates/core/boss-core/src/sim_origin.rs", "the definition"),
     (
         "crates/core/boss-policy-client/src/lib.rs",

@@ -10,6 +10,7 @@ pub mod audit;
 pub mod break_glass;
 pub mod break_glass_alarm;
 pub mod elevation;
+pub mod flights_inline;
 pub mod local_auth;
 #[cfg(test)]
 pub(crate) mod login_doubles;

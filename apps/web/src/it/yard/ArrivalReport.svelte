@@ -99,10 +99,10 @@
       <div class="ar-timings">
         <div><span>boarded</span><span class="ar-num">{instant(t.boarded_at)}</span></div>
         <div><span>merged</span><span class="ar-num">{instant(t.merged_at)}</span></div>
-        <div><span>deployed</span><span class="ar-num">{instant(t.deployed_at)}</span></div>
+        <div><span>converged</span><span class="ar-num">{instant(t.converged_at)}</span></div>
         <div><span>arrived</span><span class="ar-num">{instant(t.arrived_at)}</span></div>
         <div><span>board → merge</span><span class="ar-num">{dur(t.board_to_merge_s)}</span></div>
-        <div><span>merge → deploy</span><span class="ar-num">{dur(t.merge_to_deploy_s)}</span></div>
+        <div><span>merge → converge</span><span class="ar-num">{dur(t.merge_to_converge_s)}</span></div>
         <div><span>total</span><span class="ar-num">{dur(t.total_s)}</span></div>
       </div>
     {/if}

@@ -396,7 +396,17 @@ fn deployed_generation(summary: &str) -> Option<&str> {
 /// already been completed, the work was done. If none of the named
 /// steps is open AND the packet still has some OTHER step open, the
 /// link pointed somewhere the obligation cannot act.
-fn noop_reason(target: &serde_json::Value, allowed: &[&str]) -> Option<String> {
+///
+/// A COUNTERPART THE PACKET ALREADY TOOK IN is not a dead link either
+/// (backlog ac141c99). A design that asks no question is recorded on
+/// the answered item's draft — `design_id` names it, `disposition =
+/// "recorded"` — and the item's own route skips `design-review` and
+/// opens `build` at filing. When that design publishes, the backstop
+/// rule finds no review and the build open; the packet's completed
+/// draft already names this very design, so the route answered it and
+/// silence is right. Read off any completed step's top-level values,
+/// not off a named key: what the packet recorded is the fact.
+fn noop_reason(target: &serde_json::Value, allowed: &[&str], closing_id: &str) -> Option<String> {
     let named: Vec<&serde_json::Value> = allowed
         .iter()
         .filter_map(|slug| step_by_slug(target, slug))
@@ -422,6 +432,21 @@ fn noop_reason(target: &serde_json::Value, allowed: &[&str]) -> Option<String> {
         .iter()
         .any(|s| s.get("status").and_then(|v| v.as_str()) == Some("completed"))
     {
+        return None;
+    }
+
+    // The packet's own route already took this counterpart in: a
+    // completed step records its id (see above).
+    let recorded_here = target
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("completed"))
+        .filter_map(|s| s.get("metadata").and_then(|m| m.as_object()))
+        .flat_map(|m| m.values())
+        .any(|v| v.as_str() == Some(closing_id));
+    if recorded_here {
         return None;
     }
 
@@ -793,7 +818,54 @@ impl JobsCompleteLinkedStep {
         let answer = &close.answer;
         let args = close.args;
 
+        // The rule may require evidence on the linked packet before an
+        // external step can deliver it. Reuse the rule expression language;
+        // protocol/profile names remain registry data, never handler branches.
+        let target_when = match arg(args, "target_when") {
+            None => None,
+            Some(Value::String(source)) if !source.trim().is_empty() => Some(
+                boss_dispatcher::rules::expr::parse(source)
+                    .map_err(|error| HandlerError::Permanent(format!("target_when: {error}")))?,
+            ),
+            _ => {
+                return Err(HandlerError::Permanent(
+                    "target_when must be a nonempty expression".into(),
+                ));
+            }
+        };
         let target = self.get_job(target_id, &ctx.rule_name).await?;
+        if let Some(predicate) = target_when {
+            let decision = {
+                let context = boss_dispatcher::rules::expr::Context {
+                    payload: &target,
+                    helpers: &boss_dispatcher::rules::expr::NoHelpers,
+                };
+                boss_dispatcher::rules::expr::eval(&predicate, &context)
+                    .map_err(|error| HandlerError::Permanent(format!("target_when: {error}")))?
+            };
+            match decision {
+                Value::Bool(true) => {}
+                Value::Bool(false) => {
+                    // A withheld delivery is evidence too. Reuse the
+                    // deduplicated metadata note, rather than leave a
+                    // run open with no explanation (f87641ae N2).
+                    self.note_noop(
+                        target_id,
+                        "packet",
+                        closing_id,
+                        "not delivered: target_when evidence predicate is false",
+                        &ctx.rule_name,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(HandlerError::Permanent(
+                        "target_when must return a boolean".into(),
+                    ));
+                }
+            }
+        }
 
         // GUARD 1 — a packet that already reached a terminal is
         // untouched. Its filer got their answer from whatever closed
@@ -902,7 +974,7 @@ impl JobsCompleteLinkedStep {
                     // Silent on a redelivery; loud when the link
                     // pointed at a packet this obligation cannot act
                     // on. See `noop_reason`.
-                    if let Some(why) = noop_reason(&target, allowed) {
+                    if let Some(why) = noop_reason(&target, allowed, closing_id) {
                         tracing::warn!(
                             rule = %ctx.rule_name,
                             car = %closing_id,
@@ -3479,19 +3551,139 @@ mod tests {
 
     /// The rule row `agent-run-delivers-when-its-step-is-done` carries.
     fn delivery_args() -> Vec<(String, Value)> {
-        vec![
-            ("link".to_string(), Value::String("agent_run".into())),
-            ("link_from".to_string(), Value::String("step".into())),
-            ("steps".to_string(), Value::String("building".into())),
+        let source = std::fs::read_to_string(
+            boss_testing::repo_root()
+                .join("infra/dispatcher/rules/agent-run-delivers-when-its-step-is-done.toml"),
+        )
+        .unwrap();
+        let row: toml::Value = toml::from_str(&source).unwrap();
+        row["rule"][0]["do"][0]["args"]
+            .as_table()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| {
+                let expression =
+                    boss_dispatcher::rules::expr::parse(value.as_str().unwrap()).unwrap();
+                let value = boss_dispatcher::rules::expr::eval(
+                    &expression,
+                    &boss_dispatcher::rules::expr::Context {
+                        payload: &serde_json::Value::Null,
+                        helpers: &boss_dispatcher::rules::expr::NoHelpers,
+                    },
+                )
+                .unwrap();
+                (key.clone(), value)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_external_step_completion_cannot_deliver_a_verdictless_reviewer() {
+        let mut reviewer = run("active");
+        reviewer["metadata"]["profile"] = json!("reviewer");
+        reviewer["metadata"]["step"] = json!("review");
+        let (base, puts, patches) =
+            mock_jobs(vec![executing_packet(json!({"agent_run":RUN})), reviewer]).await;
+        let h = JobsCompleteLinkedStep::with_client(
+            crate::handlers::common::api_client(),
+            base,
+            test_owner(),
+        );
+        let args = delivery_args();
+        h.invoke(&args, &step_ctx(step_done_marker(json!({"agent_run":RUN}))))
+            .await
+            .expect("an unpaid obligation remains open");
+        assert!(puts.lock().unwrap().is_empty(), "no invented delivery");
+        let notes = patches.lock().unwrap();
+        assert_eq!(notes.len(), 1, "an unpaid verdict must leave a diagnostic");
+        assert!(
+            notes[0].1["obligation_noop"]["why"]
+                .as_str()
+                .unwrap()
+                .contains("target_when")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_delivery_rule_keeps_real_verdicts_and_ordinary_builders() {
+        let valid = json!({"verdict":"release","car":PACKET,
+            "reviewed_sha":"a".repeat(40),"at":"2026-10-24T17:00:00Z"});
+        let mut changes = valid.clone();
+        changes["verdict"] = json!("changes");
+        let mut mismatches = Vec::new();
+        for (profile, step, review, delivered) in [
+            ("builder", "build", serde_json::Value::Null, true),
+            ("analyst", "measure", serde_json::Value::Null, true),
+            ("tenant-reviewer", "review", serde_json::Value::Null, true),
+            ("analyst", "review", serde_json::Value::Null, true),
+            ("reviewer", "landed-review", serde_json::Value::Null, true),
+            ("reviewer", "review", valid.clone(), true),
+            ("reviewer", "review", changes, true),
+            ("reviewer", "review", json!({"verdict":"looks fine"}), false),
+            ("reviewer", "review", json!({"verdict":"release"}), false),
             (
-                "evidence_key".to_string(),
-                Value::String("delivered".into()),
+                "reviewer",
+                "review",
+                json!({"verdict":"release","car":"another","reviewed_sha":"a".repeat(40),"at":"now"}),
+                false,
             ),
-            (
-                "done_metadata".to_string(),
-                Value::String(r#"{"result": "delivered"}"#.into()),
-            ),
-        ]
+        ] {
+            let mut target = run("active");
+            target["metadata"]["profile"] = json!(profile);
+            target["metadata"]["step"] = json!(step);
+            target["metadata"]["review"] = review;
+            let (base, puts, _) =
+                mock_jobs(vec![executing_packet(json!({"agent_run":RUN})), target]).await;
+            let handler = JobsCompleteLinkedStep::with_client(
+                crate::handlers::common::api_client(),
+                base,
+                test_owner(),
+            );
+            handler
+                .invoke(
+                    &delivery_args(),
+                    &step_ctx(step_done_marker(json!({"agent_run":RUN}))),
+                )
+                .await
+                .expect("valid rule data");
+            let actual = puts.lock().unwrap().len();
+            if actual != usize::from(delivered) {
+                mismatches.push((profile, step, actual, delivered));
+            }
+        }
+        assert!(mismatches.is_empty(), "delivery mismatches: {mismatches:?}");
+    }
+
+    #[tokio::test]
+    async fn malformed_target_predicates_never_complete_the_linked_step() {
+        for predicate in [
+            Value::Int(1),
+            Value::String("".into()),
+            Value::String("metadata.".into()),
+            Value::String("1".into()),
+        ] {
+            let (base, puts, patches) = mock_jobs(vec![
+                executing_packet(json!({"agent_run":RUN})),
+                run("active"),
+            ])
+            .await;
+            let handler = JobsCompleteLinkedStep::with_client(
+                crate::handlers::common::api_client(),
+                base,
+                test_owner(),
+            );
+            let mut args = delivery_args();
+            args.retain(|(key, _)| key != "target_when");
+            args.push(("target_when".into(), predicate));
+            assert!(
+                handler
+                    .invoke(&args, &step_ctx(step_done_marker(json!({"agent_run":RUN}))))
+                    .await
+                    .is_err()
+            );
+            assert!(puts.lock().unwrap().is_empty());
+            assert!(patches.lock().unwrap().is_empty());
+        }
     }
 
     fn step_ctx(payload: serde_json::Value) -> InvocationContext {
@@ -3830,6 +4022,32 @@ mod noop_reason_tests {
     use serde_json::json;
 
     const ALLOWED: [&str; 3] = ["investigate", "design-review", "build"];
+    /// The closing packet — a car, or a design — the obligation follows.
+    const CAR: &str = "c4a1c0de-0000-4000-8000-000000000001";
+
+    /// A design that asks no question is RECORDED on the item's draft
+    /// (backlog ac141c99): the item's own route skips `design-review`
+    /// and opens `build` at filing. When that design later publishes,
+    /// the backstop rule finds no review to complete and the build
+    /// open — and that is not a dead link: the packet already took this
+    /// design in, on the completed draft that names it. Saying "most
+    /// often because nobody has triaged it yet" there, on both packets,
+    /// would be a confident wrong note.
+    #[test]
+    fn a_counterpart_the_packet_already_recorded_says_nothing() {
+        let item = json!({ "steps": [
+            { "spec_slug": "draft-design", "status": "completed",
+              "metadata": { "design_id": CAR, "disposition": "recorded" } },
+            { "spec_slug": "design-review", "status": "skipped", "metadata": {} },
+            { "spec_slug": "build", "status": "ready", "metadata": {} },
+        ]});
+        assert_eq!(noop_reason(&item, &["design-review"], CAR), None);
+        // The control: a DIFFERENT design reaching the same packet is
+        // one it never took in, and that is still said out loud.
+        let other = "d1ffe4e7-0000-4000-8000-000000000002";
+        let why = noop_reason(&item, &["design-review"], other).expect("reported");
+        assert!(why.contains("build"), "{why}");
+    }
 
     fn packet(steps: &[(&str, &str)]) -> serde_json::Value {
         json!({
@@ -3849,6 +4067,7 @@ mod noop_reason_tests {
         let why = noop_reason(
             &packet(&[("triage", "ready"), ("build", "pending")]),
             &ALLOWED,
+            CAR,
         )
         .expect("reported");
         assert!(why.contains("triage"), "{why}");
@@ -3864,7 +4083,8 @@ mod noop_reason_tests {
         assert_eq!(
             noop_reason(
                 &packet(&[("triage", "completed"), ("build", "completed")]),
-                &ALLOWED
+                &ALLOWED,
+                CAR
             ),
             None
         );
@@ -3877,7 +4097,8 @@ mod noop_reason_tests {
         assert_eq!(
             noop_reason(
                 &packet(&[("triage", "pending"), ("build", "pending")]),
-                &ALLOWED
+                &ALLOWED,
+                CAR
             ),
             None
         );
@@ -3890,14 +4111,18 @@ mod noop_reason_tests {
     fn an_actionable_packet_is_not_reported_as_a_noop() {
         // `build` is open and named — the caller completes it, so this
         // must not claim there was nothing to do.
-        assert_eq!(noop_reason(&packet(&[("build", "ready")]), &ALLOWED), None);
+        assert_eq!(
+            noop_reason(&packet(&[("build", "ready")]), &ALLOWED, CAR),
+            None
+        );
         // Even alongside another open step, which is the shape that
         // first tripped this: `triage` open is not evidence of a dead
         // link when `build` is open too.
         assert_eq!(
             noop_reason(
                 &packet(&[("triage", "ready"), ("build", "ready")]),
-                &ALLOWED
+                &ALLOWED,
+                CAR
             ),
             None
         );
@@ -3905,7 +4130,8 @@ mod noop_reason_tests {
 
     #[test]
     fn the_message_names_what_the_obligation_can_complete() {
-        let why = noop_reason(&packet(&[("needs-info", "active")]), &ALLOWED).expect("reported");
+        let why =
+            noop_reason(&packet(&[("needs-info", "active")]), &ALLOWED, CAR).expect("reported");
         for slug in ALLOWED {
             assert!(why.contains(slug), "{why} is missing {slug}");
         }

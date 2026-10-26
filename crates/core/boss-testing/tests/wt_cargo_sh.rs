@@ -20,6 +20,8 @@
 //!   * `WT_JOBS` wins over either;
 //!   * the reflink seed is attempted only when the seed exists —
 //!     otherwise the per-worktree dir starts cold, and says so;
+//!   * the default seed is `wt_target_dir` of the main checkout the
+//!     worktree hangs off, the dir its own builds warm (backlog b6bbe177);
 //!   * the seed lands in a sibling `.seeding` dir and is renamed into
 //!     place only once whole (backlog 08782b71): a copy that dies
 //!     part-way leaves no half target for the next run to believe warm;
@@ -547,6 +549,84 @@ fn a_run_in_the_shared_checkout_is_refused_and_its_own_worktree_is_not() {
     assert_eq!(
         rc, 0,
         "a subdirectory of the run's own worktree builds: {out}"
+    );
+}
+
+/// THE DEFAULT SEED IS THE SHARED CHECKOUT'S OWN TARGET (backlog
+/// b6bbe177, 2026-10-20). The seed used to be a typed `/scratch/target`,
+/// and on the dev pod nothing had written that dir for weeks: the shared
+/// checkout's builds land in the dir `wt_target_dir` names for it,
+/// `/scratch/target-boss` (4.6 GB that day). So every builder and
+/// reviewer target started cold — minutes and 8-18 GB a run, ~30 runs
+/// that night. The default is now that same helper asked about the main
+/// checkout this worktree hangs off, so the two names cannot drift; the
+/// expected path here is the helper's own answer, not a retyped one.
+/// `WT_SEED` is removed — the default is what is under test — and the
+/// floor pass is handed that seed as its primary, so it never takes the
+/// warm dir as an idle sibling.
+#[test]
+fn the_default_seed_is_wt_target_dir_of_the_shared_checkout() {
+    let f = Fixture::new("default-seed");
+    let main = f.worktree("boss");
+    git(&main, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    let own = f.root.join("trees").join("agent-feedface");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            own.to_str().expect("utf-8"),
+        ],
+    );
+    let helper = Command::new("bash")
+        .arg("-c")
+        .arg(". \"$1\" && wt_target_dir \"$2\" \"$3\"")
+        .arg("wt-target-dir")
+        .arg(repo_root().join("infra/dev/wt-target-dir.sh"))
+        .arg(f.targets())
+        .arg(&main)
+        .output()
+        .expect("source wt-target-dir.sh");
+    assert!(helper.status.success(), "wt_target_dir: {helper:?}");
+    let shared_target = PathBuf::from(String::from_utf8_lossy(&helper.stdout).trim());
+    assert_eq!(
+        shared_target,
+        f.targets().join("target-boss"),
+        "the helper names the shared checkout's dir by its basename"
+    );
+    boss_testing::create_dir(&shared_target);
+
+    let out = f
+        .command(&own, &f.root.join("unused"), &[], &["check"])
+        .env_remove("WT_SEED")
+        .output()
+        .expect("run wt-cargo");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let own_target = f.targets().join("target-agent-feedface");
+    assert!(
+        out.contains(&format!(
+            "seeded {} from {} by reflink",
+            own_target.display(),
+            shared_target.display()
+        )),
+        "with no WT_SEED a worktree seeds from the shared checkout's own target: {out}"
+    );
+    let cp = f.cp_calls();
+    assert!(
+        cp.contains(&format!("--reflink=always {} ", shared_target.display())),
+        "the reflink copy reads the shared checkout's target: {cp:?}"
+    );
+    assert!(
+        f.reclaim_calls()
+            .contains(&format!("primary={}", shared_target.display())),
+        "the floor pass is handed the warm seed as its primary: {}",
+        f.reclaim_calls()
     );
 }
 

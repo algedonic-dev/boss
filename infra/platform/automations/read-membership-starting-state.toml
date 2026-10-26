@@ -1,0 +1,4 @@
+[[automation]]
+id = "automation:read-membership-starting-state"
+role = "audit-readonly"
+description = 'The fixed read-membership-starting-state observation reading the protected policy-scoped membership query report (infra/forge/read-membership-starting-state.sh). Reads only; no arbitrary SQL or parameters.'

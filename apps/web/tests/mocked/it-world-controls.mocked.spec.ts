@@ -16,7 +16,7 @@ import { isPageWrite } from './_smokeMocks';
 // THE INVENTORY, measured on origin/main 507d2308 on 2026-09-25 (the
 // measure step read a9028721; since then the plant strip landed with
 // car E, and publish's door with 594ffe96):
-//   links     10 territory doors (WorldMap `a.territory`), plus one HUD
+//   links     10 territory doors (WorldMap `a[data-station]`), plus one HUD
 //                link per failed-or-unjudged machine (`a[data-machine]`);
 //                since car N1 of design e765b3fc each SELECTS its region
 //                (`/it?at=<name>`), and the selection's panel adds two:
@@ -47,7 +47,7 @@ import { isPageWrite } from './_smokeMocks';
 //                   design e765b3fc: "Department Map", below
 //   gap 5 b5b921ce  18 dead style rules in WorldMap.svelte — no
 //                   behaviour a browser can see; the deletion is its car
-//   gap 6 909adf3b  the 10 s poll has no in-flight guard — CURRENT, below
+//   gap 6 909adf3b  overlapping reads — fixed and pinned below
 //   gap 7 cf7ad2f2  8 of the 10 doors land off the catalog — ANSWERED
 //                   by car N1 of design e765b3fc: each door selects its
 //                   region on /it, below
@@ -60,12 +60,13 @@ import { YARD_BORDERS, YARD_REGIONS, installSmokeMocks } from './_smokeMocks';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
 import { TERRITORIES } from '../../src/it/yard/world';
 import { BORDERS } from '../fixtures/yard';
+import { holdClock, responseBarrier } from './_clock';
 
 const json = (r: Route, b: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(b) });
 
-const WORLD = 'section.yard[aria-label="the IT world map"]';
-const SVG = `${WORLD} > svg`;
+const WORLD = 'section.transit';
+const SVG = `${WORLD} svg[role="group"]`;
 const HUD = '[data-hud]';
 
 const trend = (current: number | null, previous: number | null) => ({
@@ -133,7 +134,7 @@ const CATALOGUED = new Set(Object.values(ROUTE_CATALOG).map((e) => e.path));
 test('gap 4 (f9850601) answered: the page says its words, and is named one way — "Department Map", as its row is', async ({ page }) => {
   await mocks(page);
   await page.goto('/it');
-  await expect(page.locator(`${SVG} .territory`)).toHaveCount(TERRITORIES.length);
+  await expect(page.locator(`${SVG} [data-station]`)).toHaveCount(TERRITORIES.length);
 
   // The header, verbatim. It answered to "Train Yard" (the row), "The IT
   // world" (the title) and "IT · Forge line" (the eyebrow) until car N1
@@ -146,7 +147,7 @@ test('gap 4 (f9850601) answered: the page says its words, and is named one way �
   // Car N3 of the same design added where the boards of the retired
   // pages live now, so a reader who knew the old tab finds it.
   await expect(page.locator('.exec-header p')).toHaveText(
-    'The territories along the packet flow, and the borders between them carrying what crosses, what waits and the machine that moves it. Select a territory to open its detail below the map. ' +
+    'The network as a transit monitor: each region a station on its line, each border a section of track with what waits on it, and the alarms board beside it. Select a station or a section to open its detail below the map. ' +
       'Feedback and the IT backlog are in the Receiving station\'s panel (the backlog in Marshalling\'s too), the Crew Board in the Shop floor\'s, and yard status and the conductor\'s activity in the Track\'s, with the Dock\'s and the Garage\'s lanes in theirs.',
   );
 
@@ -160,7 +161,7 @@ test('gap 4 (f9850601) answered: the page says its words, and is named one way �
 
   // The world's own label, and the line under it: the window, and when
   // it was read.
-  await expect(page.locator(`${SVG}`)).toHaveAttribute('aria-label', 'the IT world: the territories along the packet flow');
+  await expect(page.locator(`${SVG}`)).toHaveAttribute('aria-label', 'the IT network as a transit map: stations on their lines, the traffic on every section');
   await expect(page.locator('.yard-flow')).toHaveText(/window 24h against the 24h before · read \d{1,2}:\d\d/);
   // Nothing on the default page is a failure line.
   await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
@@ -173,11 +174,11 @@ test('gap 4 (f9850601) answered: the page says its words, and is named one way �
 test('every territory door selects its own region under the map, and back returns to the bare map', async ({ page }) => {
   await mocks(page);
   await page.goto('/it');
-  const territories = page.locator(`${SVG} .territory`);
+  const territories = page.locator(`${SVG} [data-station]`);
   await expect(territories).toHaveCount(TERRITORIES.length);
 
   for (const { name } of TERRITORIES) {
-    const door = page.locator(`${SVG} .territory[data-region="${name}"]`);
+    const door = page.locator(`${SVG} [data-station="${name}"]`);
     await expect(door).toHaveAttribute('href', `/it?at=${name}`);
     await door.click();
     await expect(page).toHaveURL(new RegExp(`/it\\?at=${name}$`));
@@ -201,9 +202,9 @@ test('gap 7 (cf7ad2f2) answered: every one of the ten doors lands on the catalog
   await page.goto('/it');
   // evaluateAll does not wait: read the doors once the map is drawn, or
   // an early read answers "no doors" (measured red once, car N2's run).
-  await expect(page.locator(`${SVG} .territory`)).toHaveCount(TERRITORIES.length);
+  await expect(page.locator(`${SVG} [data-station]`)).toHaveCount(TERRITORIES.length);
   const hrefs = await page
-    .locator(`${SVG} .territory`)
+    .locator(`${SVG} [data-station]`)
     .evaluateAll((els) => els.map((el) => el.getAttribute('href') ?? ''));
   expect(hrefs).toHaveLength(TERRITORIES.length);
   const paths = hrefs.map((h) => new URL(h, 'http://boss.test').pathname);
@@ -235,10 +236,10 @@ test('every listed machine in the HUD selects its own region on the map, and bac
     await expect(page.locator('section[data-map-panel]')).toHaveAttribute('data-selection', region);
     // The frame stands over the selection: the same links, the map whole.
     await expect(page.locator(`${HUD} a[data-machine]`)).toHaveCount(3);
-    await expect(page.locator(`${SVG} .territory`)).toHaveCount(TERRITORIES.length);
+    await expect(page.locator(`${SVG} [data-station]`)).toHaveCount(TERRITORIES.length);
     await page.goBack();
     await expect(page).toHaveURL(/\/it$/);
-    await expect(page.locator(`${SVG} .territory`)).toHaveCount(TERRITORIES.length);
+    await expect(page.locator(`${SVG} [data-station]`)).toHaveCount(TERRITORIES.length);
   }
 });
 
@@ -259,86 +260,6 @@ test('a machine block with nothing failed or unjudged lists no link and prints i
 // THE BUTTONS — ten crossings and the panel's close
 // ---------------------------------------------------------------------
 
-test('each of the ten crossings opens its own panel under the map', async ({ page }) => {
-  await mocks(page);
-  await page.goto('/it');
-  const crossings = page.locator(`${SVG} .crossing[role="button"]`);
-  await expect(crossings).toHaveCount(BORDERS.length);
-  for (const { from, to } of BORDERS) {
-    const key = `${from}→${to}`;
-    const crossing = page.locator(`${SVG} .crossing[data-crossing="${key}"]`);
-    // What the button promises a screen reader: the rail, its state
-    // and why, and that it opens the crossing.
-    const label = (await crossing.getAttribute('aria-label')) ?? '';
-    expect(label.startsWith(`${from} → ${to} · clear — ${key} is quiet. `)).toBe(true);
-    expect(label.endsWith('. Open the crossing.')).toBe(true);
-    await crossing.click();
-    const panel = page.locator('.crossing-panel');
-    await expect(panel).toHaveCount(1);
-    await expect(panel).toHaveAttribute('data-panel', key);
-    await expect(panel).toHaveAttribute('aria-label', `the crossing ${key}`);
-    await expect(panel.locator('.crossing-title')).toHaveText(`${from} → ${to}`);
-    await expect(panel.locator('.crossing-why')).toHaveText(`${key} is quiet`);
-    await expect(panel).toContainText(`a packet crossed ${from} to ${to}`);
-    await expect(crossing).toHaveAttribute('aria-expanded', 'true');
-  }
-});
-
-test('a crossing opens on Enter, closes on Space, and Escape closes it', async ({ page }) => {
-  await mocks(page);
-  await page.goto('/it');
-  const key = 'dock→track';
-  const crossing = page.locator(`${SVG} .crossing[data-crossing="${key}"]`);
-  const panel = page.locator(`.crossing-panel[data-panel="${key}"]`);
-  await expect(crossing).toHaveAttribute('tabindex', '0');
-  await expect(crossing).toHaveAttribute('aria-expanded', 'false');
-
-  await crossing.focus();
-  await page.keyboard.press('Enter');
-  await expect(panel).toBeVisible();
-  await expect(crossing).toHaveAttribute('aria-expanded', 'true');
-
-  // Space toggles it shut, and does not scroll the page under the reader.
-  const scrolled = await page.evaluate(() => window.scrollY);
-  await page.keyboard.press(' ');
-  await expect(page.locator('.crossing-panel')).toHaveCount(0);
-  await expect(crossing).toHaveAttribute('aria-expanded', 'false');
-  expect(await page.evaluate(() => window.scrollY)).toBe(scrolled);
-
-  await page.keyboard.press(' ');
-  await expect(panel).toBeVisible();
-  await page.keyboard.press('Escape');
-  await expect(page.locator('.crossing-panel')).toHaveCount(0);
-  await expect(crossing).toHaveAttribute('aria-expanded', 'false');
-
-  // Escape on a closed crossing leaves it closed rather than opening it.
-  await page.keyboard.press('Escape');
-  await expect(page.locator('.crossing-panel')).toHaveCount(0);
-});
-
-test('the panel\'s close button says what it closes and closes it', async ({ page }) => {
-  await mocks(page);
-  await page.goto('/it');
-  const key = 'gates→dock';
-  const crossing = page.locator(`${SVG} .crossing[data-crossing="${key}"]`);
-  await crossing.click();
-  const panel = page.locator(`.crossing-panel[data-panel="${key}"]`);
-  await expect(panel).toBeVisible();
-  const close = panel.locator('button.crossing-close');
-  await expect(close).toHaveText('close');
-  await expect(close).toHaveAttribute('aria-label', 'close the crossing');
-  await close.click();
-  await expect(page.locator('.crossing-panel')).toHaveCount(0);
-  await expect(crossing).toHaveAttribute('aria-expanded', 'false');
-  // And the next click opens it again — the close left no state behind.
-  await crossing.click();
-  await expect(panel).toBeVisible();
-});
-
-// ---------------------------------------------------------------------
-// THE READS — loading, empty, malformed, failed after a good one, the poll
-// ---------------------------------------------------------------------
-
 test('while the regions are being read the page says so, and the HUD says it is reading', async ({ page }) => {
   await installSmokeMocks(page);
   let release: () => void = () => {};
@@ -355,51 +276,8 @@ test('while the regions are being read the page says so, and the HUD says it is 
   await expect(page.locator(`${SVG}`)).toHaveCount(0);
   await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
   release();
-  await expect(page.locator(`${SVG} .territory`)).toHaveCount(TERRITORIES.length);
+  await expect(page.locator(`${SVG} [data-station]`)).toHaveCount(TERRITORIES.length);
   await expect(page.getByText('Reading the regions…')).toHaveCount(0);
-});
-
-test('an empty backend paints every region at zero and every rail with nothing waiting — no failure line, and no unread figure drawn as a zero', async ({ page }) => {
-  // The suite's empty leg (_smokeMocks): one clear region per territory
-  // with a count of 0 and no samples, one quiet rail per hop, and no
-  // thirds, machine block or plant — the shape an older server sends.
-  await installSmokeMocks(page);
-  await page.goto('/it');
-  const territories = page.locator(`${SVG} .territory`);
-  await expect(territories).toHaveCount(TERRITORIES.length);
-  await expect(page.locator(`${SVG} .territory[data-state="clear"]`)).toHaveCount(TERRITORIES.length);
-  await expect(page.locator(`${SVG} .territory[data-region="dock"] text.count`)).toHaveText('0');
-  await expect(page.locator(`${SVG} .crossing[data-waiting="0"]`)).toHaveCount(BORDERS.length);
-  await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
-  // No plant sent is no strip — not an estate with nothing running.
-  await expect(page.locator('section[aria-label="the plant — machinery serving every region"]')).toHaveCount(0);
-  // The HUD's read landed, but the server sent no board fields and no
-  // machine count: every figure is the unread `?`, never a 0, and says why.
-  const hud = page.locator(HUD);
-  await expect(hud).toHaveAttribute('data-read', 'ok');
-  await expect(hud.locator('.hud-row')).toHaveCount(4);
-  await expect(hud.locator('[data-fig="value"], [data-fig="zero"], [data-fig="floor"]')).toHaveCount(0);
-  await expect(hud.locator('.hud-row[data-row="outranks"] [data-fig="unread"]')).toHaveAttribute(
-    'title', 'this server does not send what outranks regular order (it predates design ea906603)',
-  );
-  await expect(hud.locator('[data-machines] [data-fig="unread"]').first()).toHaveAttribute('title', 'the server sends no machine count');
-});
-
-test('a server that answers no regions and no borders draws every territory unread and no rail — never a clear world', async ({ page }) => {
-  await installSmokeMocks(page);
-  await page.route(YARD_REGIONS, (r) => json(r, regions({ regions: [] })));
-  await page.route(YARD_BORDERS, (r) => json(r, borders({ borders: [] })));
-  await page.goto('/it');
-  await expect(page.locator(`${SVG} .territory`)).toHaveCount(TERRITORIES.length);
-  // An answered-but-absent region is troubled and says so; it is never
-  // drawn as the clear one an empty payload would otherwise suggest.
-  await expect(page.locator(`${SVG} .territory[data-state="troubled"]`)).toHaveCount(TERRITORIES.length);
-  const dock = page.locator(`${SVG} .territory[data-region="dock"]`);
-  await expect(dock.locator('text.count')).toHaveText('no reading');
-  await expect(dock.locator('title')).toHaveText('dock · troubled — the server answered no reading for this region');
-  // A rail is a border the server answered (car R3 of design e765b3fc):
-  // an answer with none draws none, rather than a rail the page made up.
-  await expect(page.locator(`${SVG} .crossing`)).toHaveCount(0);
 });
 
 test('a regions answer in the wrong shape is a failed read, said in the failure line — never an empty map', async ({ page }) => {
@@ -422,8 +300,8 @@ test('a borders answer in the wrong shape is said, and the territories still pai
   await page.route(YARD_BORDERS, (r) => json(r, []));
   await page.goto('/it');
   await expect(page.locator(`.yard-empty${FAILURE_MARKER}`)).toContainText('The borders cannot be read — ');
-  await expect(page.locator(`${SVG} .territory`)).toHaveCount(TERRITORIES.length);
-  await expect(page.locator(`${SVG} .crossing`)).toHaveCount(0);
+  await expect(page.locator(`${SVG} [data-station]`)).toHaveCount(TERRITORIES.length);
+  await expect(page.locator(`${SVG} [data-section][data-ground="unknown"]`)).not.toHaveCount(0);
 });
 
 test('a regions read that fails after a good one keeps none of its values, and the HUD names both times', async ({ page }) => {
@@ -434,14 +312,14 @@ test('a regions read that fails after a good one keeps none of its values, and t
   // nowhere else (backlog 3027f808). An installed clock still runs on
   // real time, so on a starved runner the page's own 10 s poll fired
   // before the good read was asserted and the map was already gone: ten
-  // real seconds held after goto failed it every time (.territory,
+  // real seconds held after goto failed it every time ([data-station],
   // expected 10, received 0).
   let n = 0;
   const held: Route[] = [];
   await page.route(YARD_REGIONS, (r) => (++n === 1 ? json(r, regions()) : void held.push(r)));
   await page.route(YARD_BORDERS, (r) => json(r, borders()));
   await page.goto('/it');
-  await expect(page.locator(`${SVG} .territory`)).toHaveCount(TERRITORIES.length);
+  await expect(page.locator(`${SVG} [data-station]`)).toHaveCount(TERRITORIES.length);
   await expect(page.locator(`${HUD} [data-fig="value"]`).first()).toBeVisible();
 
   await page.clock.runFor(10_000);
@@ -459,8 +337,8 @@ test('a regions read that fails after a good one keeps none of its values, and t
   await expect(hud.locator('a[data-machine]')).toHaveCount(0);
 });
 
-test('CURRENT, gap 6 (909adf3b): the 10 s poll fires again while the last read is still in flight', async ({ page }) => {
-  await page.clock.install({ time: new Date('2026-09-25T06:00:00Z') });
+test('909adf3b: multiple ticks cannot overlap a pending regions read', async ({ page }) => {
+  await holdClock(page, new Date('2026-09-25T06:00:00Z'));
   await installSmokeMocks(page);
   const pending: Route[] = [];
   await page.route(YARD_REGIONS, (r) => {
@@ -468,40 +346,57 @@ test('CURRENT, gap 6 (909adf3b): the 10 s poll fires again while the last read i
   });
   await page.route(YARD_BORDERS, (r) => json(r, borders()));
   await page.goto('/it');
-  // Counted from what goto left, never from zero: an installed clock
-  // still runs on real time, so on a starved runner the page's own 10 s
-  // poll had already sent a second read before the count was taken (ten
-  // real seconds held after goto: expected 1, received 2), and the
-  // "exactly one more" below then saw three (backlog 3027f808).
-  await expect.poll(() => pending.length).toBeGreaterThan(0);
-  const before = pending.length;
-  await expect(page.locator('.yard-empty')).toHaveText('Reading the regions…');
-  // Ten seconds on, the first answer has still not come: today another
-  // read goes out beside it, and whichever lands LAST is drawn — an
-  // older answer can overwrite a newer one. Gap 6 skips a tick while
-  // one is in flight; its car flips this to "stays at before".
-  await page.clock.runFor(10_000);
-  await expect.poll(() => pending.length).toBeGreaterThan(before);
-  for (const r of pending) await json(r, regions()).catch(() => {});
+  try {
+    await expect.poll(() => pending.length).toBe(1);
+    await expect(page.locator('.yard-empty')).toHaveText('Reading the regions…');
+    await page.clock.runFor(30_000);
+    expect(pending.length).toBe(1);
+    const first = pending.shift();
+    if (first === undefined) throw new Error('regions request never arrived');
+    await json(first, regions());
+    await expect(page.locator(`${SVG} [data-station]`)).toHaveCount(TERRITORIES.length);
+    await page.clock.runFor(10_000);
+    await expect.poll(() => pending.length).toBe(1);
+  } finally {
+    for (const r of pending) await json(r, regions()).catch(() => {});
+  }
+});
+
+test('909adf3b: slow borders do not hold the map or renew the regions observation time', async ({ page }) => {
+  await holdClock(page, new Date('2026-09-25T06:00:00Z'));
+  await installSmokeMocks(page);
+  const rail = responseBarrier();
+  const region = responseBarrier();
+  let regionReads = 0;
+  await page.route(YARD_REGIONS, async (r) => {
+    if (++regionReads > 1) await region.wait();
+    await json(r, regions());
+  });
+  await page.route(YARD_BORDERS, async (r) => {
+    await rail.wait();
+    await json(r, borders());
+  });
+  try {
+    await page.goto('/it');
+    await rail.arrived;
+    await expect(page.locator(`${SVG} [data-station]`)).toHaveCount(TERRITORIES.length);
+    await expect(page.locator(`${HUD} .hud-age`)).toHaveText('read 0s ago');
+    await page.clock.runFor(20_000);
+    await region.arrived;
+    const answered = page.waitForResponse((r) => r.url().endsWith('/api/yard/borders'));
+    rail.release();
+    await (await answered).finished();
+    await expect(page.locator(`${WORLD} path.section[data-section]`).first()).toBeAttached();
+    await expect(page.locator(`${HUD} .hud-age`)).toHaveText('read 20s ago');
+  } finally {
+    rail.release();
+    region.release();
+  }
 });
 
 // ---------------------------------------------------------------------
 // WHAT THE PAGE PRINTS WITHOUT A CONTROL — and what it does not
 // ---------------------------------------------------------------------
-
-test('a region or a border the layout does not know is named at the foot of the map, never dropped', async ({ page }) => {
-  await installSmokeMocks(page);
-  const base = regions();
-  const rails = borders();
-  await page.route(YARD_REGIONS, (r) =>
-    json(r, { ...base, regions: [...base.regions, { name: 'moon', count: 1, state: 'clear', why: 'a newer server', trend: trend(1, 1) }] }));
-  await page.route(YARD_BORDERS, (r) =>
-    json(r, { ...rails, borders: [...rails.borders, { ...rails.borders[0], from: 'shed', to: 'moon' }] }));
-  await page.goto('/it');
-  await expect(page.locator(`${SVG} .territory`)).toHaveCount(TERRITORIES.length);
-  await expect(page.locator(`${SVG} text`, { hasText: 'not on the map:' })).toHaveText('not on the map: moon');
-  await expect(page.locator(`${SVG} text`, { hasText: 'no rail drawn for:' })).toHaveText('no rail drawn for: shed→moon');
-});
 
 test('CURRENT, gap 2 (cb40ba2b): the HUD carries no incident figure and no door to /it/operate', async ({ page }) => {
   await mocks(page);
@@ -515,37 +410,6 @@ test('CURRENT, gap 2 (cb40ba2b): the HUD carries no incident figure and no door 
   await expect(hud.locator('a[href="/it/operate"]')).toHaveCount(0);
 });
 
-// A REAL crash, pinned as CURRENT until gap 8's car lands — so the
-// suite's page-error guard (_test.ts, backlog 9045a570) is told it by
-// name. When that car flips this test the throw stops, the declaration
-// then matches nothing and fails, and it goes with the flip.
-test.describe('CURRENT gap 8', () => {
-  test.use({ expectedPageErrors: [{ name: 'CURRENT gap 8 (8c7c2f4b): twin machine ids crash WorldMap', pattern: /each_key_duplicate/ }] });
-  test('CURRENT, gap 8 (8c7c2f4b): a world that cannot be drawn leaves no failure line', async ({ page }) => {
-    // The shape that blanked the shop floor on 2026-09-24 (846ab934): two
-    // machines with ONE id in one territory, which WorldMap keys its
-    // machinery by. RegionMap has a boundary that names the crash; the
-    // world does not. Gap 8 wraps WorldMap and HudFrame in the same
-    // boundary, and its car flips this to one `load-failed` line naming
-    // the error.
-    await installSmokeMocks(page);
-    const base = regions();
-    const twin = { id: 'bay:1', name: 'bay 1', state: 'running', why: 'a gate is running' };
-    await page.route(YARD_REGIONS, (r) =>
-      json(r, {
-        ...base,
-        regions: base.regions.map((g) => (g.name === 'gates' ? { ...g, machines: [twin, { ...twin }] } : g)),
-      }));
-    await page.route(YARD_BORDERS, (r) => json(r, borders()));
-    const errors: string[] = [];
-    page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto('/it');
-    await expect.poll(() => errors.join('\n')).toMatch(/each_key_duplicate|duplicate key/i);
-    await expect(page.locator(`.territory[data-region="gates"] [data-machine="bay:1"]`)).toHaveCount(0);
-    await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
-  });
-});
-
 // ---------------------------------------------------------------------
 // THE WRITES — none
 // ---------------------------------------------------------------------
@@ -553,31 +417,35 @@ test.describe('CURRENT gap 8', () => {
 /// The one non-GET every route sends: the shell's route-open record
 /// (shell/surface-opens.ts). It is the chrome's write, not this page's.
 
-test('the page writes nothing: every control on it is a read or a view change', async ({ page }) => {
+
+test('section keyboard navigation and its close link preserve the map without page writes', async ({ page }) => {
   const writes: string[] = [];
   page.on('request', (req: Request) => {
     const path = new URL(req.url()).pathname;
-    if (req.method() !== 'GET' && path.startsWith('/api/') && isPageWrite(req.method(), path)) {
-      writes.push(`${req.method()} ${path}`);
-    }
+    if (req.method() !== 'GET' && path.startsWith('/api/') && isPageWrite(req.method(), path)) writes.push(path);
   });
   await mocks(page);
   await page.goto('/it');
-  await expect(page.locator(`${SVG} .territory`)).toHaveCount(TERRITORIES.length);
-  const crossing = page.locator(`${SVG} .crossing[data-crossing="dock→track"]`);
-  await crossing.click();
-  await page.locator('.crossing-panel button.crossing-close').click();
-  await crossing.focus();
-  await page.keyboard.press('Enter');
-  await page.keyboard.press('Escape');
-  await page.locator(`${SVG} .territory[data-region="shed"]`).click();
-  await expect(page).toHaveURL(/\/it\?at=shed$/);
-  await page.locator('section[data-map-panel] a[data-close]').click();
+  const section = page.locator('[data-section-link="gates→dock"]');
+  await section.focus();
+  await section.press('Enter');
+  const panel = page.locator('[data-map-panel]');
+  await expect(panel).toHaveAttribute('data-selection', 'gates->dock');
+  await expect(panel).toContainText('gates→dock is quiet');
+  await panel.locator('a[data-close]').click();
+  await expect(panel).toHaveCount(0);
   await expect(page).toHaveURL(/\/it$/);
-  await page.locator(`${SVG} .territory[data-region="shed"]`).click();
-  await expect(page).toHaveURL(/\/it\?at=shed$/);
-  await page.goBack();
-  await expect(page).toHaveURL(/\/it$/);
-  await expect(page.locator(`${SVG} .territory`)).toHaveCount(TERRITORIES.length);
+  await expect(page.locator(`${SVG} [data-station]`)).toHaveCount(TERRITORIES.length);
   expect(writes).toEqual([]);
+});
+
+test('empty and absent region readings remain distinct on the transit map', async ({ page }) => {
+  await installSmokeMocks(page);
+  await page.goto('/it?at=dock');
+  await expect(page.locator('[data-map-panel] .panel-figure')).toHaveText('0');
+  await expect(page.locator('[data-station="dock"]')).toHaveAttribute('data-state', 'clear');
+  await page.route(YARD_REGIONS, (r) => json(r, regions({ regions: [] })));
+  await page.reload();
+  await expect(page.locator('[data-station="dock"]')).toHaveAttribute('data-state', 'troubled');
+  await expect(page.locator('[data-alarm="dock"]')).toContainText('no reading');
 });

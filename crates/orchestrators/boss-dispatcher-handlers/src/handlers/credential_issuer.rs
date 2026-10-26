@@ -858,6 +858,24 @@ impl KubeSecretStore {
 /// dispatch for every co-fired rule.
 pub struct Unconfigured(pub String);
 
+impl Unconfigured {
+    /// The fallback for a broker client the dispatcher could not BUILD at
+    /// boot — the forge admin client, the in-cluster k8s client — said as
+    /// an ERROR the moment it is taken (backlog 3107bfb1, review a2172ed3
+    /// of car 01872c8e). Until then the binary registered Unconfigured in
+    /// silence and booted green, and the first anyone heard of a broker
+    /// that could not rotate was a rotation dead-lettering on its packet.
+    /// An unset root token is not this: that is a deployment without the
+    /// broker, and it stays a quiet `Unconfigured(..)`.
+    pub fn at_boot(why: String) -> Arc<Self> {
+        tracing::error!(
+            reason = %why,
+            "credential broker client unavailable at boot: every rotation it serves will dead-letter"
+        );
+        Arc::new(Self(why))
+    }
+}
+
 #[async_trait]
 impl ForgeTokenIssuer for Unconfigured {
     async fn list_tokens(&self, _u: &str) -> Result<Vec<TokenInfo>, String> {
@@ -2845,6 +2863,34 @@ mod forgejo_tests {
             .await
             .expect_err("unconfigured");
         assert_eq!(err, "broker unconfigured");
+    }
+
+    /// Backlog 3107bfb1 (review a2172ed3 of car 01872c8e): a broker
+    /// client the dispatcher could not BUILD — the forge admin client, the
+    /// in-cluster k8s client — fell back to Unconfigured in silence, and
+    /// the first anyone heard of it was a rotation dead-lettering, days
+    /// later. Every such fallback in the binary goes through
+    /// [`Unconfigured::at_boot`], which says so as an error the moment it
+    /// happens; an `Unconfigured` built straight from an error value is the
+    /// silent shape, named here by line.
+    #[test]
+    fn every_broker_client_the_dispatcher_could_not_build_is_said_at_boot() {
+        let bin = include_str!("../bin/boss_dispatcher.rs");
+        let silent: Vec<String> = bin
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("Arc::new(Unconfigured(format!("))
+            .map(|(i, l)| format!("boss_dispatcher.rs:{}: {}", i + 1, l.trim()))
+            .collect();
+        assert!(
+            silent.is_empty(),
+            "a broker client that could not be built falls back to Unconfigured \
+             without saying so — use Unconfigured::at_boot:\n{}",
+            silent.join("\n")
+        );
+        // Control: the binary does reach for the fallback at all, so an
+        // empty list above is a judgement and not a file that moved.
+        assert!(bin.contains("Unconfigured::at_boot("), "the fallback moved");
     }
 }
 

@@ -63,7 +63,9 @@
 //! exactly one trigger: a red train that judged its cars owes a re-gate to
 //! the cars it released whose files meet the failure (`owed_by`) — to all
 //! of them when the red named no path — and records it on the car
-//! (`REGATE_OWED`). Only a car carrying that marker is judged here; every
+//! (`REGATE_OWED`). Only a car carrying that marker — or, since backlog
+//! 028ddab6, a GATE-STALE car, cut from a main older than main's newest
+//! change to what a gate runs (`GATE_INPUTS`, below) — is judged here; every
 //! other car whose receipt vouches for its head boards as gated. And the
 //! board never waits on a re-gate: the departure hold that waited for the
 //! dock's round is gone with the round.
@@ -212,6 +214,122 @@ pub(crate) fn read_base(clone: &str, head: &str) -> Result<Option<BaseReading>> 
     }))
 }
 
+// ---------------------------------------------------------------------------
+// A CAR GATED ON AN OLD GATE IS GATE-STALE (backlog 028ddab6)
+//
+// A gate runs the GATED tree's own `infra/gate.sh` and `infra/lint/`
+// (infra/gate-runner/run.sh), under the runner main last converged. So a
+// green vouches for the checks the car's BASE had, not the checks main has
+// now. Measured 2026-10-20: car 3b227d91 was gated on 946d84462 (the 10-18
+// 12:53 train); train #1256 (791874d3b) then added the 'web unit' check to
+// gate.sh, which fails on that car's ci.yml; the car boarded train 7474e3e0
+// on its old green and the train's forge CI went red on what the car gate
+// never ran. Its own files were nowhere near gate.sh, so the file rule
+// above (`touched_by_main`) could not see it, and no red train owed it a
+// re-gate.
+//
+// So a second trigger sits beside `regate_owed`: a car whose head does not
+// carry main's NEWEST commit to a gate input is judged gate-stale and goes
+// through the same re-gate a car main moved into does — replayed onto main,
+// re-gated with its park intent, bounded once per main move, held on a
+// refused replay. Its cost is one `git log -1` per dock walk and one
+// `merge-base --is-ancestor` per car: the newest gate change is on main, so
+// it is an ancestor of the car's head exactly when it is an ancestor of the
+// car's base. Every way the READ fails boards the car as gated, loudly, by
+// the module's rule above.
+// ---------------------------------------------------------------------------
+
+/// What a gate runs, read off main: the gate itself, the runner that runs
+/// it, and the lints it runs first.
+pub(crate) const GATE_INPUTS: [&str; 3] = ["infra/gate.sh", "infra/gate-runner", "infra/lint"];
+
+/// Main's newest commit to a gate input, and the inputs it moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GateChange {
+    pub commit: String,
+    pub files: Vec<String>,
+}
+
+/// PURE: `git log -1 --format=%H --name-only` as a gate change — the sha,
+/// then the files. Empty output is a main that never changed a gate input.
+pub(crate) fn parse_gate_change(out: &str) -> Option<GateChange> {
+    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    let commit = lines.next()?.to_string();
+    Some(GateChange {
+        commit,
+        files: lines.map(str::to_string).collect(),
+    })
+}
+
+/// Read main's newest gate change out of the clone — once per dock walk.
+pub(crate) fn read_gate_change(clone: &str) -> Result<Option<GateChange>> {
+    let mut args = vec![
+        "git",
+        "-C",
+        clone,
+        "log",
+        "-1",
+        "--format=%H",
+        "--name-only",
+        "origin/main",
+        "--",
+    ];
+    args.extend(GATE_INPUTS);
+    Ok(parse_gate_change(&stdout_str(&sh(&args)?)))
+}
+
+/// Is the car at `head` gate-stale — cut from a main older than `gate`?
+/// An error when git gives no answer, which the caller boards through.
+pub(crate) fn gate_stale(clone: &str, gate: &GateChange, head: &str) -> Result<bool> {
+    let out = sh_unchecked(&[
+        "git",
+        "-C",
+        clone,
+        "merge-base",
+        "--is-ancestor",
+        &gate.commit,
+        head,
+    ])?;
+    match crate::freshness::base_from_is_ancestor_code(out.status.code()) {
+        crate::freshness::Base::Current => Ok(false),
+        crate::freshness::Base::Behind => Ok(true),
+        crate::freshness::Base::Unanswered => bail!(
+            "git merge-base --is-ancestor gave no answer for gate change {} and head {}",
+            short(&gate.commit),
+            short(head)
+        ),
+    }
+}
+
+/// PURE: the dock's judgement of a gate-stale car. It is TOUCHED by the
+/// gate inputs main moved, whatever its own files, and re-gated at most
+/// once per main move — `judge`'s bound.
+pub(crate) fn judge_gate_stale(
+    reading: Option<&BaseReading>,
+    stamp: Option<&RegateStamp>,
+    gate: &GateChange,
+) -> DockBase {
+    let Some(r) = reading else {
+        return DockBase::Current;
+    };
+    DockBase::Touched {
+        touched: gate.files.clone(),
+        launch: stamp.is_none_or(|s| s.main != r.main),
+    }
+}
+
+/// The skip reason for a gate-stale car: what moved, where, and then what
+/// the dock did about it (`then`, the re-gate's own reason).
+pub(crate) fn gate_stale_reason(gate: &GateChange, base: &str, then: &str) -> String {
+    format!(
+        "GATE-STALE: gated on {}, and main has since changed what a gate runs — {} in {}; a \
+         car rides only on a gate that ran the checks main has (backlog 028ddab6). {then}",
+        short(base),
+        sample(&gate.files, gate.files.len()),
+        short(&gate.commit),
+    )
+}
+
 /// A dock re-gate as the car records it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RegateStamp {
@@ -320,7 +438,8 @@ impl RegateStamp {
             "touched_count": self.touched_count,
             "reds": self.reds,
             "at": at.to_rfc3339(),
-            "why": "backlog 969a1092: main moved into this car's files after its gate",
+            "why": "backlog 969a1092: main moved into this car's files after its gate (or, \
+                    028ddab6, into what a gate runs)",
         });
         // The flake relation rides only on the launch that has one.
         if !self.regate_of.is_empty() {
@@ -1857,5 +1976,68 @@ mod tests {
         ));
         // An unreadable head is an error the caller boards through.
         assert!(read_base(c, "0000000000000000000000000000000000000000").is_err());
+    }
+
+    // -- a car gated on an old gate is gate-stale (backlog 028ddab6) -------
+
+    /// `git log -1 --format=%H --name-only` prints the sha, a blank line,
+    /// and the gate inputs that commit moved; no output is a main that has
+    /// never changed one.
+    #[test]
+    fn main_s_newest_gate_change_is_read_with_the_files_it_moved() {
+        assert_eq!(
+            parse_gate_change("791874d3b\n\ninfra/gate.sh\ninfra/lint/web-unit.sh\n"),
+            Some(GateChange {
+                commit: "791874d3b".into(),
+                files: paths(&["infra/gate.sh", "infra/lint/web-unit.sh"]),
+            })
+        );
+        assert_eq!(parse_gate_change(""), None);
+        assert_eq!(parse_gate_change("\n\n"), None);
+    }
+
+    /// A gate-stale car is held on the gate inputs main moved, whatever
+    /// its own files — car 3b227d91 changed ci.yml, which no rule of
+    /// `touched_by_main` reaches from infra/gate.sh — and the bound is the
+    /// dock's one: at most one re-gate per main move.
+    #[test]
+    fn a_gate_stale_car_is_touched_by_the_gate_change_and_bounded_per_main() {
+        let gate = GateChange {
+            commit: "791874d3b".into(),
+            files: paths(&["infra/gate.sh"]),
+        };
+        let r = BaseReading {
+            main: "m2".into(),
+            base: "946d8446".into(),
+            car_files: paths(&[".forgejo/workflows/ci.yml"]),
+            main_files: paths(&["infra/gate.sh", "docs/x.md"]),
+        };
+        assert_eq!(
+            judge(Some(&r), None),
+            DockBase::Untouched { main_changed: 2 },
+            "control: the file rule alone boards it"
+        );
+        assert_eq!(
+            judge_gate_stale(Some(&r), None, &gate),
+            DockBase::Touched {
+                touched: paths(&["infra/gate.sh"]),
+                launch: true,
+            }
+        );
+        let spent = RegateStamp::for_main("m2", &[]);
+        assert!(matches!(
+            judge_gate_stale(Some(&r), Some(&spent), &gate),
+            DockBase::Touched { launch: false, .. }
+        ));
+        let reason = gate_stale_reason(&gate, &r.base, "waiting for a gate slot");
+        for want in [
+            "GATE-STALE",
+            "946d8446",
+            "infra/gate.sh",
+            "791874d3",
+            "slot",
+        ] {
+            assert!(reason.contains(want), "{want} in {reason}");
+        }
     }
 }

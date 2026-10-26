@@ -175,8 +175,8 @@ address = "10.20.0.16"
 role = "talos-worker"
 cpu = 4
 memory_gb = 15
-disk_gb = 110
-notes = "Utility worker (boss.dev/purpose=utility). Joined 2026-08-25 and went unrecorded for five days. Smallest node in the estate after boss-gcp."
+disk_gb = 929
+notes = "Utility worker (boss.dev/purpose=utility). Joined 2026-08-25 and went unrecorded for five days. One drive bay: its 1 TB disk replaced the system disk on 2026-10-19 (join-a-node 829f75a8); disk_gb is the nodefs measured 2026-10-21 (929 GiB, backlog 36d2c484), up from 110."
 
 [[node]]
 id = "forge"

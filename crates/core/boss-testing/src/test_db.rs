@@ -453,6 +453,63 @@ fn schema_sql(without: &[&str]) -> String {
         .join("\n")
 }
 
+/// The first line of a migration that cannot run inside a transaction
+/// block — `CREATE INDEX CONCURRENTLY` on a table that takes every write
+/// (design c195e83e Q4, 2026-10-17). `migrate.sh` reads the same line.
+const NO_TRANSACTION: &str = "-- migrate: no-transaction";
+
+/// The schema as the template build sends it: consecutive ordinary
+/// files joined into one batch exactly as before, and each statement of
+/// a no-transaction file as a batch of its own. A batch of several
+/// statements is an implicit transaction in Postgres, which a
+/// CONCURRENTLY statement refuses, so it has to arrive alone. Such a
+/// file holds plain statements only: a dollar-quoted body may contain a
+/// `;` this split cannot see, so it is refused rather than mis-split.
+fn schema_batches<'a>(files: impl Iterator<Item = &'a str>) -> Result<Vec<String>, String> {
+    let mut batches = Vec::new();
+    let mut ordinary = Vec::new();
+    for sql in files {
+        if sql.lines().next() != Some(NO_TRANSACTION) {
+            ordinary.push(sql);
+            continue;
+        }
+        if sql.contains("$$") {
+            return Err(format!(
+                "a `{NO_TRANSACTION}` migration holds plain statements only, and this one \
+                 has a dollar-quoted body:\n{sql}"
+            ));
+        }
+        if !ordinary.is_empty() {
+            batches.push(std::mem::take(&mut ordinary).join("\n"));
+        }
+        let code = sql
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        batches.extend(
+            code.split(';')
+                .map(str::trim)
+                .filter(|statement| !statement.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    if !ordinary.is_empty() {
+        batches.push(ordinary.join("\n"));
+    }
+    Ok(batches)
+}
+
+fn schema_load(without: &[&str]) -> Vec<String> {
+    schema_batches(
+        SCHEMA_FILES
+            .iter()
+            .filter(|(name, _)| !without.iter().any(|w| name.contains(w)))
+            .map(|(_, sql)| *sql),
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
+}
+
 /// Serializes the TEMPLATE BUILD across concurrent test processes,
 /// because the schema creates a cluster-global role. See
 /// [`ensure_template`].
@@ -542,8 +599,8 @@ impl TestDb {
 
         // The schema is loaded ONCE, into a template, and every test
         // database after that is a copy of it. See `ensure_template`.
-        let schema = schema_sql(without);
-        let template = schema_fingerprint(&schema);
+        let template = schema_fingerprint(&schema_sql(without));
+        let schema = schema_load(without);
         ensure_template(&mut admin, &admin_url, &admin_opts, &schema, &template).await;
 
         // Retried, because the failure here is usually not about this
@@ -905,7 +962,7 @@ async fn ensure_template(
     admin: &mut PgConnection,
     admin_url: &str,
     admin_opts: &PgConnectOptions,
-    schema: &str,
+    schema: &[String],
     template: &str,
 ) {
     if database_exists(admin, template).await {
@@ -951,7 +1008,7 @@ async fn ensure_template(
 async fn build_template(
     admin: &mut PgConnection,
     admin_opts: &PgConnectOptions,
-    schema: &str,
+    schema: &[String],
     template: &str,
 ) -> Result<(), sqlx::Error> {
     let suffix = Uuid::new_v4().simple().to_string();
@@ -985,7 +1042,15 @@ async fn build_template(
             .max_connections(1)
             .connect_with(admin_opts.clone().database(&building))
             .await?;
-        let loaded = sqlx::raw_sql(schema).execute(&pool).await;
+        // In order, one batch at a time: a no-transaction migration's
+        // statements arrive alone (see `schema_batches`).
+        let mut loaded = Ok(());
+        for batch in schema {
+            if let Err(e) = sqlx::raw_sql(batch).execute(&pool).await {
+                loaded = Err(e);
+                break;
+            }
+        }
         pool.close().await;
         loaded?;
     }
@@ -1752,5 +1817,47 @@ mod transient_tests {
     fn a_query_that_is_simply_wrong_is_not_retried() {
         assert!(!is_transient(&sqlx::Error::RowNotFound));
         assert!(!is_transient(&sqlx::Error::ColumnNotFound("nope".into())));
+    }
+}
+
+#[cfg(test)]
+mod no_transaction_batches {
+    use super::*;
+
+    /// c195e83e Q4: a CONCURRENTLY statement inside a multi-statement
+    /// batch is refused by Postgres, so it must reach the server alone,
+    /// while every ordinary file still loads in one batch as before.
+    #[test]
+    fn a_no_transaction_file_arrives_one_statement_at_a_time() {
+        let files = [
+            "CREATE TABLE a (id int);",
+            "CREATE TABLE b (id int);",
+            "-- migrate: no-transaction\n-- why; with a semicolon in prose\n\
+             DROP INDEX CONCURRENTLY IF EXISTS b_id;\n\
+             CREATE INDEX CONCURRENTLY b_id\n    ON b (id);\n",
+            "CREATE TABLE c (id int);",
+        ];
+        assert_eq!(
+            schema_batches(files.into_iter()).unwrap(),
+            vec![
+                "CREATE TABLE a (id int);\nCREATE TABLE b (id int);".to_string(),
+                "DROP INDEX CONCURRENTLY IF EXISTS b_id".to_string(),
+                "CREATE INDEX CONCURRENTLY b_id\n    ON b (id)".to_string(),
+                "CREATE TABLE c (id int);".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dollar_quoted_body_cannot_be_split_and_is_refused() {
+        let files = ["-- migrate: no-transaction\nDO $$ BEGIN PERFORM 1; END $$;\n"];
+        assert!(schema_batches(files.into_iter()).is_err());
+    }
+
+    /// The marker counts only as the FIRST line, as migrate.sh reads it.
+    #[test]
+    fn a_marker_below_the_first_line_is_an_ordinary_file() {
+        let files = ["CREATE TABLE a (id int);\n-- migrate: no-transaction\n"];
+        assert_eq!(schema_batches(files.into_iter()).unwrap().len(), 1);
     }
 }

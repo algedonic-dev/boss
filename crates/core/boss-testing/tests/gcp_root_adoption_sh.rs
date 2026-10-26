@@ -287,9 +287,14 @@ fn partial_preparation_keeps_units_and_complete_preparation_migrates_doors_first
     );
     write_file(
         &source.join("infra/estate/roles.toml"),
-        "[always]\nunits = [\"boss-gcp-converge\", \"boss-codebase-metrics\", \"boss-estate-observe-host\"]\n",
+        "[always]\nunits = [\"boss-gcp-converge\", \"boss-codebase-metrics\", \"boss-estate-observe-host\", \"boss-surface-usage\"]\n",
     );
     for ext in ["service", "timer"] {
+        std::fs::copy(
+            repo_root().join(format!("infra/boss-surface-usage.{ext}")),
+            source.join(format!("infra/boss-surface-usage.{ext}")),
+        )
+        .unwrap();
         std::fs::copy(
             repo_root().join(format!("infra/boss-codebase-metrics.{ext}")),
             source.join(format!("infra/boss-codebase-metrics.{ext}")),
@@ -365,4 +370,23 @@ fn partial_preparation_keeps_units_and_complete_preparation_migrates_doors_first
         "{observer}"
     );
     assert!(!observer.contains("ExecStart=/opt/boss"));
+    // The prepared root unit wins over the legacy source. Check what the
+    // installer actually wrote: a legacy-only retry fix never reaches this path.
+    let surface = std::fs::read_to_string(etc.join("boss-surface-usage.service")).unwrap();
+    assert_eq!(
+        surface,
+        std::fs::read_to_string(units.join("boss-surface-usage.service")).unwrap()
+    );
+    for unit in [
+        surface,
+        std::fs::read_to_string(source.join("infra/boss-surface-usage.service")).unwrap(),
+    ] {
+        assert_eq!(
+            unit.lines()
+                .filter(|line| line.starts_with("Environment=BOSS_WRAP_OPEN_RETRY="))
+                .collect::<Vec<_>>(),
+            ["Environment=BOSS_WRAP_OPEN_RETRY=3"],
+            "both installation paths must opt into the same bounded packet recovery: {unit}"
+        );
+    }
 }

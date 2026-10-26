@@ -1,0 +1,8 @@
+{
+  "about": "READ-ONLY fixed 24-hour membership starting-state query observation, policy-scoped to the actual signed reader. The response carries bounded phase timings and native plans, never packet payloads or arbitrary SQL. The complete report is capped at 1 MiB; refusals remain named. No arguments, credentials, grants, mutations or flow-readiness verdict are supplied by this operation.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/read-membership-starting-state.sh"],
+  "params": [],
+  "capture": "separate-streams",
+  "timeout": 250
+}

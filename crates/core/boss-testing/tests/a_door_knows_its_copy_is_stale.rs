@@ -220,11 +220,35 @@ impl Pod {
         git(&self.checkout, &["reset", "-q", "--hard", &self.main]);
     }
 
+    /// Hang a linked worktree off the checkout, on a branch of its own —
+    /// what makes a checkout THE shared one: on the pod every agent's
+    /// worktree under /work/boss/.claude/worktrees is one of these.
+    fn link_a_worktree(&self) -> PathBuf {
+        let wt = self.root.join("agent-wt");
+        git(
+            &self.checkout,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "worktree-agent-wt",
+                wt.to_str().expect("utf8"),
+            ],
+        );
+        wt
+    }
+
     /// Run a door THROUGH THE SYMLINK, from a cwd that is not the
     /// door's checkout (a builder's worktree is another one).
     fn run(&self, door: &str, args: &[&str], env: &[(&str, &str)]) -> Run {
+        self.run_at(&self.bin.join(door), door, args, env)
+    }
+
+    /// `run`, for a door at any path — a linked worktree's own copy.
+    fn run_at(&self, path: &Path, door: &str, args: &[&str], env: &[(&str, &str)]) -> Run {
         let _ = std::fs::remove_file(&self.argv);
-        let mut cmd = Command::new(self.bin.join(door));
+        let mut cmd = Command::new(path);
         // wt-cargo and wt-web answer about the worktree they are RUN
         // in and refuse outside one; the checkout is the only git
         // worktree this fixture has.
@@ -435,6 +459,148 @@ fn a_checkout_on_origin_main_says_nothing_at_all() {
         pod.curl_ran(),
         "the write did not reach curl: {}",
         write.stderr
+    );
+}
+
+/// THE SHARED CHECKOUT OFF MAIN IS A DOOR NOT THE TREE'S (backlog
+/// 88553fea). Measured from the /work/boss reflog on 2026-10-20: reviewer
+/// runs detached it twice (17:40Z at 8a9fdecb, 19:03Z at dcb010de), and
+/// run 2452d6ff switched it to its own branch and left it there from
+/// 19:04 to 19:17Z, while every door on the pod — each a symlink into
+/// its infra/dev — ran that branch's copy. This helper judged only
+/// "behind origin/main", so a checkout DETACHED AT origin/main, or on a
+/// branch with a commit of its own, was silent. The two shapes, each
+/// with origin/main exactly where HEAD is so the old question says
+/// nothing: a read answers under a WARNING naming the shape, and a write
+/// is REFUSED before curl.
+#[test]
+fn a_shared_checkout_moved_off_main_warns_a_read_and_refuses_a_write() {
+    for (shape, says) in [
+        ("detached", "detached at".to_string()),
+        (
+            "branch",
+            "on branch worktree-agent-adc4e55861d5bfd66".to_string(),
+        ),
+    ] {
+        let pod = Pod::new(&format!("off-main-{shape}"));
+        pod.fast_forward();
+        pod.link_a_worktree();
+        if shape == "detached" {
+            git(&pod.checkout, &["checkout", "-q", "--detach", &pod.main]);
+        } else {
+            git(
+                &pod.checkout,
+                &["checkout", "-q", "-b", "worktree-agent-adc4e55861d5bfd66"],
+            );
+        }
+        let read = pod.run("boss-api", &["GET", "/api/jobs"], &[]);
+        assert_eq!(
+            read.code, 0,
+            "an off-main READ still answers: {}",
+            read.stderr
+        );
+        assert!(
+            pod.curl_ran(),
+            "the read did not reach curl: {}",
+            read.stderr
+        );
+        let e = &read.stderr;
+        assert!(
+            e.contains("WARNING") && e.contains("not on main"),
+            "a shared checkout {shape} off main answered without a warning — every door ran \
+             another tree's copy for thirteen minutes this way: {e}"
+        );
+        assert!(
+            e.contains(&says) && e.contains(&pod.main[..8]),
+            "the warning does not say where HEAD stands ({says}, {}): {e}",
+            &pod.main[..8]
+        );
+        assert!(
+            e.contains(&format!("git -C {} switch main", pod.checkout.display()))
+                && e.contains("88553fea"),
+            "the warning does not carry the command that repairs it and its packet: {e}"
+        );
+
+        let body = pod.root.join("body.json");
+        write_file(&body, "{}\n");
+        let write = pod.run(
+            "boss-api",
+            &["POST", "/api/jobs", body.to_str().unwrap()],
+            &[],
+        );
+        assert_eq!(
+            write.code, 78,
+            "an off-main ({shape}) write exited {}: {}",
+            write.code, write.stderr
+        );
+        assert!(
+            !pod.curl_ran(),
+            "the off-main write reached curl before being refused: {}",
+            write.stderr
+        );
+        assert!(
+            write.stderr.contains("REFUSED") && write.stderr.contains("not on main"),
+            "the refusal does not say what it refused and why: {}",
+            write.stderr
+        );
+        // The building doors warn and proceed, as they do for a stale copy.
+        let shim = pod.run("boss", &["--version"], &[]);
+        assert!(
+            shim.stderr.contains("WARNING") && shim.stderr.contains("not on main"),
+            "the shim ran from an off-main shared checkout without saying so: {}",
+            shim.stderr
+        );
+        assert_ne!(shim.code, 78, "{}", shim.stderr);
+    }
+}
+
+/// What "the shared checkout" means, so nothing else warns. A checkout
+/// off main is judged only when it is the PRIMARY worktree and others
+/// hang off it — the pod's shape. Two neighbours stay silent: the gate's
+/// own clone, which runs `git checkout -B <car branch>` and has no linked
+/// worktree (and runs every door pin, so a warning there would be one on
+/// every car); and a builder's LINKED worktree on its own branch, which
+/// is a developer working.
+#[test]
+fn a_clone_on_a_branch_and_a_linked_worktree_are_not_the_shared_checkout() {
+    let pod = Pod::new("gate-clone");
+    pod.fast_forward();
+    git(&pod.checkout, &["checkout", "-q", "-B", "fix/a-car"]);
+    let run = pod.run("boss-api", &["GET", "/api/jobs"], &[]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(
+        !run.stderr.contains("WARNING"),
+        "a lone clone on a car branch — the gate's — warned: {}",
+        run.stderr
+    );
+
+    let pod = Pod::new("linked-worktree");
+    pod.fast_forward();
+    let wt = pod.link_a_worktree();
+    let body = pod.root.join("body.json");
+    write_file(&body, "{}\n");
+    let run = pod.run_at(
+        &wt.join("infra/dev/boss-api"),
+        "boss-api",
+        &["POST", "/api/jobs", body.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(
+        run.code, 0,
+        "a linked worktree's own door, on its own branch, was refused: {}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("WARNING") && !run.stderr.contains("REFUSED"),
+        "a linked worktree's own door spoke about its branch: {}",
+        run.stderr
+    );
+    // …and the shared checkout it hangs off, back on main, is silent.
+    let run = pod.run("boss-api", &["GET", "/api/jobs"], &[]);
+    assert!(
+        !run.stderr.contains("WARNING"),
+        "a shared checkout on main warned: {}",
+        run.stderr
     );
 }
 

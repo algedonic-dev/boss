@@ -548,6 +548,9 @@ printf 'User=%s\nDynamicUser=no\nLoadState=loaded\nActiveState=inactive\nExecSta
     let cli = h.dir.join("image-installer");
     write_exec(&cli, "#!/bin/sh\nexit 0\n");
     let summary = h.dir.join("summary.json");
+    // The generation the last ok tick converged (backlog 4870d6a8): a
+    // host seam in root mode, so a run that left it real is refused.
+    let converged = h.dir.join("gcp-converged");
     let convergence = Command::new("bash")
         .arg(prepared.join("bootstrap/infra/gcp/gcp-root-launch.sh"))
         .arg("converge")
@@ -571,6 +574,7 @@ printf 'User=%s\nDynamicUser=no\nLoadState=loaded\nActiveState=inactive\nExecSta
             h.dir.join("absent-keys"),
         )
         .env("BOSS_RUN_SUMMARY_FILE", &summary)
+        .env("BOSS_GCP_CONVERGED_FILE", &converged)
         .env("RECEIVER_LOG", h.dir.join("receiver-log"))
         .output()
         .unwrap();
@@ -586,6 +590,13 @@ printf 'User=%s\nDynamicUser=no\nLoadState=loaded\nActiveState=inactive\nExecSta
         accepted.file_name().unwrap().to_str().unwrap()
     );
     assert_eq!(facts["converge_remote"], "protected-root");
+    // No record yet: the move is from an unknown generation, which
+    // differs from converge_sha, and the ok tick records what it converged.
+    assert_eq!(facts["converge_from"], "");
+    assert_eq!(
+        std::fs::read_to_string(&converged).unwrap().trim(),
+        accepted.file_name().unwrap().to_str().unwrap()
+    );
     let runner =
         std::fs::read_to_string(etc.join("boss-ops-runner.service.d/boss-gcp.conf")).unwrap();
     assert!(runner.contains("/bootstrap/infra/gcp/gcp-root-launch.sh run infra/ops/ops-runner.sh"));

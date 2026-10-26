@@ -42,6 +42,16 @@ fn receipt(job: &Value, run: &str, actor: &str, owned: Option<&str>) -> Result<V
     // not the actor assigned to this step. The signed caller must own the step.
     let expected =
         expectation(job).context("this legacy or unmarked run declares no worker receipt")?;
+    // A BOUNDED START's receipt (design e72dc7c9): the worker states it
+    // read this exact START and every mandatory original of this exact
+    // manifest — both digests ride the receipt, and nothing about the
+    // available originals does.
+    if expected.get("schema").and_then(Value::as_u64)
+        == Some(boss_jobs::execution_inputs::START_SCHEMA)
+    {
+        return boss_jobs::execution_inputs::start_receipt(expected, run, actor)
+            .context("the bounded START expectation is incomplete; no worker receipt written");
+    }
     if expected.get("schema").and_then(Value::as_u64) != Some(1)
         || expected
             .get("minutes")
@@ -73,12 +83,35 @@ fn own_ready_nomination(job: &Value, actor: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(test)]
 pub(crate) async fn started_at(
     http: &crate::machine_http::MachineClient,
     base: &str,
     run: &str,
     actor: &str,
     owned: Option<&str>,
+) -> Result<()> {
+    started_with_worker_at(
+        http,
+        base,
+        run,
+        actor,
+        owned,
+        None,
+        &crate::dispatch_worker::Published,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn started_with_worker_at(
+    http: &crate::machine_http::MachineClient,
+    base: &str,
+    run: &str,
+    actor: &str,
+    owned: Option<&str>,
+    local_root: Option<&std::path::Path>,
+    workers: &dyn crate::dispatch_worker::Workers,
 ) -> Result<()> {
     let registry = crate::sor_client::api_at_signed(
         http,
@@ -128,6 +161,20 @@ pub(crate) async fn started_at(
     let mut before = api(reqwest::Method::GET, None)
         .await?
         .context("own run read returned no body")?;
+    if local_root.is_none() && crate::door_env::isolation_forwards() {
+        let profile = before
+            .pointer("/metadata/profile")
+            .and_then(Value::as_str)
+            .context("own run names no execution profile")?;
+        let repo = crate::brief::repo_root()?;
+        if crate::dispatch::Isolation::for_profile(&repo, profile)?
+            == crate::dispatch::Isolation::Worktree
+        {
+            bail!(
+                "source builder START requires --local-root <your own worktree>; no worker acknowledgment written"
+            );
+        }
+    }
     // THE WORKER TAKES ITS OWN NOMINATION (backlog 2f7b8c00, 2026-10-07).
     // Nothing in the protocol claimed a run's Building: dispatch claims
     // the SOURCE step, the dispatcher service nominates Building, and the
@@ -164,14 +211,35 @@ pub(crate) async fn started_at(
     }
     let expected = receipt(&before, run, registered, owned)?;
     let before = before.get("data").unwrap_or(&before);
+    // A controller refusal is not a worker acknowledgment. Its durable
+    // run ownership makes a retry after a failed API write adopt, not allocate.
+    let worker = match local_root {
+        Some(root) => workers.ensure(run, root).await?,
+        None => None,
+    };
+    let mut patch = serde_json::Map::new();
+    if let Some(worker) = &worker {
+        match before.pointer(&format!("/metadata/{}", crate::dispatch_worker::KEY)) {
+            Some(existing) if existing != worker => {
+                bail!("own run already records another worker binding")
+            }
+            Some(_) => {}
+            None => {
+                patch.insert(crate::dispatch_worker::KEY.into(), worker.clone());
+            }
+        }
+    }
     match before.get("metadata").and_then(|m| m.get(RECEIPT_KEY)) {
         Some(existing) if existing != &expected => {
             bail!("own run already carries a different or unsupported worker receipt")
         }
         Some(_) => {}
         None => {
-            api(reqwest::Method::PATCH, Some(json!({RECEIPT_KEY:expected}))).await?;
+            patch.insert(RECEIPT_KEY.into(), expected.clone());
         }
+    }
+    if !patch.is_empty() {
+        api(reqwest::Method::PATCH, Some(Value::Object(patch))).await?;
     }
     let after = api(reqwest::Method::GET, None)
         .await?
@@ -183,11 +251,16 @@ pub(crate) async fn started_at(
     if after.get("metadata").and_then(|m| m.get(RECEIPT_KEY)) != Some(&expected) {
         bail!("worker receipt did not read back; no acknowledgment is claimed");
     }
+    if let Some(worker) = &worker
+        && after.pointer(&format!("/metadata/{}", crate::dispatch_worker::KEY)) != Some(worker)
+    {
+        bail!("worker binding did not read back; controller retains this run's worker for retry");
+    }
     println!("worker receipt recorded for {run} as {registered}, signed by {actor}");
     Ok(())
 }
 
-pub(crate) async fn started(run: String) -> Result<()> {
+pub(crate) async fn started(run: String, local_root: Option<std::path::PathBuf>) -> Result<()> {
     // This is deliberately not a prefix resolver: own-run identity is exact.
     let id = uuid::Uuid::parse_str(&run).context("--started requires the full native run UUID")?;
     if id.to_string() != run {
@@ -195,12 +268,14 @@ pub(crate) async fn started(run: String) -> Result<()> {
     }
     let actor = crate::identity::sign(&reqwest::Method::PATCH, "/api/jobs")?;
     let owned = std::env::var("BOSS_AGENT_RUN").ok();
-    started_at(
+    started_with_worker_at(
         &crate::sor_client::machine_client()?,
         &crate::sor_client::resolve_jobs_base(None)?,
         &run,
         &actor,
         owned.as_deref(),
+        local_root.as_deref(),
+        &crate::dispatch_worker::Published,
     )
     .await
 }
@@ -245,6 +320,29 @@ mod tests {
         assert!(receipt(&job, "own-run", "agent-codex", Some("own-run")).is_err());
         job = active();
         job["steps"][0]["metadata"] = json!({});
+        assert!(receipt(&job, "own-run", "agent-codex", Some("own-run")).is_err());
+    }
+
+    /// A bounded START's run (design e72dc7c9) asks for the receipt that
+    /// names its exact START and manifest; an incomplete expectation is
+    /// refused rather than acknowledged as a whole-START receipt.
+    #[test]
+    fn a_bounded_run_receipt_names_its_start_and_manifest_digests() {
+        let mut job = active();
+        let expected =
+            boss_jobs::execution_inputs::start_expectation("the START", &json!([{"n": 1}]), 15);
+        job["steps"][0]["metadata"]["worker_start_expectation"] = expected.clone();
+        let r = receipt(&job, "own-run", "agent-codex", Some("own-run")).unwrap();
+        assert_eq!(r["schema"], 3);
+        assert_eq!(r["start_sha256"], expected["start_sha256"]);
+        assert_eq!(r["manifest_sha256"], expected["manifest_sha256"]);
+        assert!(boss_jobs::execution_inputs::start_receipt_matches(
+            &expected,
+            &r,
+            "own-run",
+            "agent-codex"
+        ));
+        job["steps"][0]["metadata"]["worker_start_expectation"]["start_bytes"] = json!(0);
         assert!(receipt(&job, "own-run", "agent-codex", Some("own-run")).is_err());
     }
 
@@ -345,6 +443,112 @@ mod tests {
         assert_eq!(s.0["steps"][0]["status"], "active");
     }
 
+    struct Worker {
+        refused: bool,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dispatch_worker::Workers for Worker {
+        async fn ensure(&self, run: &str, root: &std::path::Path) -> Result<Option<Value>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{run}:{}", root.display()));
+            if self.refused {
+                bail!(
+                    "storage budget: full allocation refusal; retained worker dev-build-0123456789abcdef"
+                );
+            }
+            Ok(Some(
+                json!({"run":run,"session":"dev-build-0123456789abcdef","local_root":root}),
+            ))
+        }
+        async fn stop(&self, _: &str) -> Result<Option<Value>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn allocation_refusal_is_kept_whole_and_acknowledges_no_start() {
+        let (base, state) = stub(false, false).await;
+        let worker = Worker {
+            refused: true,
+            calls: Default::default(),
+        };
+        let error = started_with_worker_at(
+            &crate::sor_client::machine_client().unwrap(),
+            &base,
+            "own-run",
+            "agent-codex",
+            Some("own-run"),
+            Some(std::path::Path::new("/source")),
+            &worker,
+        )
+        .await
+        .expect_err("no worker, no acknowledgment");
+        assert!(
+            format!("{error:#}")
+                .contains("full allocation refusal; retained worker dev-build-0123456789abcdef")
+        );
+        assert!(state.lock().unwrap().1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bound_start_records_controller_identity_and_retries_one_receipt() {
+        let (base, state) = stub(false, false).await;
+        let worker = Worker {
+            refused: false,
+            calls: Default::default(),
+        };
+        for _ in 0..2 {
+            started_with_worker_at(
+                &crate::sor_client::machine_client().unwrap(),
+                &base,
+                "own-run",
+                "agent-codex",
+                Some("own-run"),
+                Some(std::path::Path::new("/source")),
+                &worker,
+            )
+            .await
+            .unwrap();
+        }
+        let state = state.lock().unwrap();
+        assert_eq!(state.1.len(), 1);
+        assert_eq!(
+            state.0["metadata"][crate::dispatch_worker::KEY]["session"],
+            "dev-build-0123456789abcdef"
+        );
+        assert!(state.0["metadata"][RECEIPT_KEY].is_object());
+    }
+
+    #[tokio::test]
+    async fn a_retirement_receipt_is_copied_not_recast_as_physical_gc() {
+        for lost in [false, true] {
+            let (base, state) = stub(lost, false).await;
+            let receipt = json!({"run":"own-run","retirement":{"state":"local execution retired",
+                "job_delete_acknowledged":true,"job_deletion_complete":false}});
+            let result = crate::dispatch_worker::record_retirement_at(
+                &crate::sor_client::machine_client().unwrap(),
+                &base,
+                "own-run",
+                "agent-codex",
+                receipt.clone(),
+            )
+            .await;
+            if lost {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    state.lock().unwrap().0["metadata"][crate::dispatch_worker::RETIREMENT_KEY],
+                    receipt
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_lost_receipt_or_concurrent_close_is_never_reported_as_acknowledged() {
         let client = crate::sor_client::machine_client().unwrap();
@@ -370,6 +574,21 @@ mod tests {
     fn started_is_a_separate_clap_mode_and_cannot_override_dispatch_settings() {
         use clap::Parser;
         assert!(crate::Cli::try_parse_from(["boss", "dispatch", "own-run", "--started"]).is_ok());
+        assert!(
+            crate::Cli::try_parse_from([
+                "boss",
+                "dispatch",
+                "own-run",
+                "--started",
+                "--local-root",
+                "/tree"
+            ])
+            .is_ok()
+        );
+        assert!(
+            crate::Cli::try_parse_from(["boss", "dispatch", "own-run", "--local-root", "/tree"])
+                .is_err()
+        );
         for flag in ["--from-hook", "--next", "--force"] {
             assert!(
                 crate::Cli::try_parse_from(["boss", "dispatch", "own-run", "--started", flag])

@@ -1,0 +1,64 @@
+# infra/cluster/talos/netboot.toml — THE ONE Talos image a blank node
+# network-boots from the forge into maintenance mode (backlog ee31ab73).
+#
+# WHY THIS FILE EXISTS. On 2026-10-19 w-2 was reinstalled on a new 1 TB
+# disk and looped on PXE for want of boot media: nothing on the LAN
+# answered PXE, and the schematic and version the cluster's nodes install
+# lived only in ~/talos-homelab/v2/base-worker.yaml on David's
+# workstation (machine.install.image). The forge — managed, on the same
+# L2 as every node, already the image trust root — now answers PXE
+# (infra/forge/netboot.sh), and this file is what it boots.
+#
+# THE PAIR. David supplied it at 2026-10-19T18:17Z from that template's
+# machine.install.image line, recorded on the packet as install_image.
+# The netboot kernel and initramfs for the pair are the Image Factory's
+#   https://factory.talos.dev/image/<schematic>/<version>/kernel-amd64
+#   https://factory.talos.dev/image/<schematic>/<version>/initramfs-amd64.xz
+# mirrored onto the forge at converge time and served ONLY when their
+# sha256 is the one below — a byte the factory changes is refused, never
+# served (netboot.sh `mirror`, and the server checks again at start).
+#
+# THE SHAS were measured 2026-10-19T19:48Z by agent-claude-b from the
+# dev pod, downloading each file twice — once from factory.talos.dev and
+# once from pxe.factory.talos.dev, the host the factory's own iPXE script
+# names — and the two answers agreed (kernel 20,455,424 bytes; initramfs
+# 86,754,031 bytes).
+#
+# THE ARGS are the Image Factory's own PXE script for the pair,
+#   https://pxe.factory.talos.dev/pxe/<schematic>/<version>/metal-amd64
+# its `kernel` line less the URL, verbatim, read the same day. The
+# rendered script adds one, initrd=, and netboot.sh says why.
+#
+# CHANGING THE VERSION is an edit to this file: the three values move
+# together (a new version is new bytes), measured the way the lines above
+# say, and the next forge converge mirrors, verifies and serves the new
+# pair. The schematic is spelled here and nowhere else in the tree — a
+# test holds it to that (crates/core/boss-testing/tests/netboot_sh.rs);
+# the version also names the talosctl client elsewhere, which is a
+# different fact.
+#
+# SCOPE STOPS AT MAINTENANCE MODE. The booted node joins nothing and
+# installs nothing: apply-config stays the operator's talosctl act with
+# the cluster's secrets, which never live in this tree.
+#
+# WHO IS ANSWERED — netboot_macs (review bcff47dd N1, backlog 8cf6faf7).
+# The forge answers PXE ONLY for the NICs listed here: lowercase,
+# colon-separated, one space between (`aa:bb:cc:dd:ee:ff 11:22:...`).
+# Every other machine on the LAN gets no answer at all — dnsmasq ignores
+# it, and the iPXE script exits to the next boot device if it ever got
+# there another way — so an installed node (cp-1..3, w-1, the forge)
+# whose firmware tries the network before its disk still boots its disk.
+# EMPTY ANSWERS NOBODY, which is the safe resting state.
+#
+# A NODE IS LISTED ONLY WHILE IT IS BEING JOINED: the join-a-node measure
+# step adds its MAC, read off the machine itself (the PXE ROM's banner,
+# its firmware setup, or the UniFi client list), and the same join takes
+# it out once the node boots from its installed disk — a listed node
+# with network-first boot order would boot maintenance again.
+#
+schematic = "613e1592b2da41ae5e265e8789429f22e121aab91cb4deb6bc3c0b6262961245"
+version = "v1.13.8"
+kernel_sha256 = "15b3590feed7a0c876dcffaa884522f31e172e4f07529731eca71713d0581ecd"
+initramfs_sha256 = "46e35d07e694aaa07a399441d21bed498e529d51d6f8264bf3a81d7b0afef865"
+kernel_args = "talos.platform=metal console=tty0 init_on_alloc=1 slab_nomerge pti=on consoleblank=0 nvme_core.io_timeout=4294967295 printk.devkmsg=on selinux=1 module.sig_enforce=1 proc_mem.force_override=never"
+netboot_macs = ""

@@ -940,6 +940,10 @@ pub fn safe_line(run: &Value) -> Option<String> {
 pub struct ReleaseAsk {
     /// The reviewer's agent-run, as a full id.
     pub review: String,
+    /// The hold the asker judged, as it read the car ([`JudgedHold::of`]).
+    /// REQUIRED: the door lifts only this hold, and refuses a car that
+    /// carries another (review 792b871a N1, [`judged_hold_stands`]).
+    pub hold: JudgedHold,
     /// The car head the release is given at, read by the caller from the
     /// forge. When it is absent, the head the hold was placed at
     /// (`hold_sha`) is used.
@@ -958,14 +962,89 @@ pub struct ReleaseAsk {
     pub agent_shell: bool,
 }
 
+/// THE HOLD A RELEASE WAS ASKED ABOUT (review 792b871a N1). Every asker
+/// judges a car as it READ it — the release rule judges when the hold
+/// was placed against the verdict, the yard shows the row a person
+/// clicks, `boss release` reads the packet — and the door reads the car
+/// again when the POST arrives. A `boss hold` landing in between keeps
+/// `hold_sha` (a hand hold over a review hold is still a review hold),
+/// so a door asked with the review alone judged the NEW hold good on the
+/// OLD verdict and lifted it. The ask now names the hold it judged, and
+/// the door lifts that hold or nothing.
+///
+/// `reason` is the hold as every reader shows it
+/// ([`crate::stranded::hold_reason`]: trimmed, a bare `true` read "no
+/// reason recorded"), and `None` when the asker read no hold; `sha` is
+/// the head it was placed at ([`hold_sha`]). A hold rewritten with the
+/// same text at the same head is the same hold to the record — the
+/// release rule's own placement read says so too — so it is not refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgedHold {
+    pub reason: Option<String>,
+    pub sha: Option<String>,
+}
+
+impl JudgedHold {
+    /// The hold `car` carries on its review step, as the door compares
+    /// it. The one reader every asker sends and the door judges with.
+    pub fn of(car: &Value) -> Self {
+        let md = review_step(car)
+            .and_then(|s| s.get("metadata"))
+            .unwrap_or(&Value::Null);
+        Self {
+            reason: crate::stranded::hold_reason(md),
+            sha: hold_sha(car).map(str::to_string),
+        }
+    }
+
+    fn normal(&self) -> (Option<&str>, Option<&str>) {
+        (normal(&self.reason), normal(&self.sha))
+    }
+}
+
+/// A judged-hold field as compared: trimmed, and empty read as none.
+fn normal(v: &Option<String>) -> Option<&str> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// PURE: refuse unless the hold `car` carries now is the hold the asker
+/// judged ([`JudgedHold`], review 792b871a N1). Nothing is written on a
+/// refusal; the road is to judge the car as it stands and ask again.
+pub fn judged_hold_stands(car: &Value, asked: &JudgedHold) -> Result<(), String> {
+    let now = JudgedHold::of(car);
+    if now.normal() == asked.normal() {
+        return Ok(());
+    }
+    let say = |h: &JudgedHold| match h.normal() {
+        (None, _) => "no hold".to_string(),
+        (Some(r), None) => format!("the hold {r:?} at no head"),
+        (Some(r), Some(sha)) => format!("the hold {r:?} at {}", short(sha)),
+    };
+    Err(format!(
+        "car {}'s review step carries {} now, and this release was asked about {} — the hold \
+         changed after the asker read the car, so the verdict it rests on never judged what \
+         holds the car now (review 792b871a N1). Nothing was written. Read the car again and \
+         judge the hold it carries.",
+        short(str_at(car, "/id")),
+        say(&now),
+        say(asked),
+    ))
+}
+
 /// A release the rule grants: the review step it is written on, and the
 /// one merge body that writes the record and lifts the hold in one act.
+/// `expect` is the review step's `hold` and `hold_sha` exactly as the
+/// judge read them: the write lands only while the row still carries
+/// them, judged under the row's lock, so a hold written between the
+/// door's read and its write is not lifted either.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Granted {
     pub step_id: String,
     pub head: String,
     pub record: Value,
     pub patch: Value,
+    pub expect: Value,
 }
 
 /// THE RULE, as the door asks it: may `ask` release `car` on `run`'s
@@ -1002,10 +1081,12 @@ pub async fn judge(
         .ok_or_else(|| unbound(car, step))?
         .to_string();
     released_already(car, step, &head, review)?;
+    judged_hold_stands(car, &ask.hold)?;
     let executor = read_executor_eligibility(reader, run, car, &head)
         .await
         .map_err(|e| format!("pinned executor eligibility refused: {e:#}"))?;
     vouches_with_executor(run, car, &head, &executor)?;
+    let source = crate::release_window::judge_source_window(reader, car, run, &head, at).await?;
     let main = ask
         .main_sha
         .as_deref()
@@ -1018,17 +1099,25 @@ pub async fn judge(
     if let Some(binding) = executor.record_binding() {
         rec["executor_binding"] = binding;
     }
+    rec["review_source"] = source;
     rec[REVIEWER_MODEL_KEY] = reviewer_model(run, &launch_record(reader, run).await);
     if let Some(r) = ask.run.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
         rec["run"] = json!(r);
     }
     rec["agent_shell"] = json!(ask.agent_shell);
     let patch = json!({ "hold": Value::Null, crate::car::RELEASE: rec.clone() });
+    let md = step.get("metadata").unwrap_or(&Value::Null);
+    let as_read = |k: &str| md.get(k).cloned().unwrap_or(Value::Null);
+    let expect = json!({
+        "hold": as_read("hold"),
+        crate::car::HOLD_SHA: as_read(crate::car::HOLD_SHA),
+    });
     Ok(Granted {
         step_id: str_at(step, "/id").to_string(),
         head,
         record: rec,
         patch,
+        expect,
     })
 }
 
@@ -1174,6 +1263,7 @@ pub async fn decision(
     reader: &impl ExecutorRecordReader,
     car: &Value,
     run: Result<&Value, String>,
+    at: &str,
 ) -> Decision {
     let review = dispatched_reviewer(car).map(str::to_string);
     let head = hold_sha(car).map(str::to_string);
@@ -1188,11 +1278,15 @@ pub async fn decision(
         ),
         (Some(_), Err(why)) => (None, None, None, Value::Null, Err(why)),
         (Some(id), Ok(run)) => {
+            // The row judges the hold it shows; its control sends the
+            // same one back, so a hold rewritten before the click is
+            // refused at the door (review 792b871a N1).
             let ask = ReleaseAsk {
                 review: id.clone(),
+                hold: JudgedHold::of(car),
                 ..ReleaseAsk::default()
             };
-            let outcome = judge(reader, car, run, &ask, "", "").await.map(|_| ());
+            let outcome = judge(reader, car, run, &ask, "", at).await.map(|_| ());
             (
                 opt(str_at(run, &format!("/metadata/{REVIEW_KEY}/verdict"))),
                 opt(str_at(run, &format!("/metadata/{REVIEW_KEY}/reviewed_sha"))),
@@ -1271,6 +1365,185 @@ mod tests {
         ) -> Result<Option<crate::first_record::FirstRecord>> {
             Ok(None)
         }
+    }
+
+    struct SourceFixture<'a, R> {
+        reader: &'a R,
+        record: crate::first_record::FirstRecord,
+    }
+    #[async_trait::async_trait]
+    impl<R: ExecutorRecordReader> ExecutorRecordReader for SourceFixture<'_, R> {
+        async fn protocol_version(&self, kind: &str, version: i64) -> Result<Option<Value>> {
+            self.reader.protocol_version(kind, version).await
+        }
+        async fn executor_original(
+            &self,
+            job: uuid::Uuid,
+            step: uuid::Uuid,
+            key: &str,
+        ) -> Result<Option<crate::first_record::FirstRecord>> {
+            if key == crate::release_window::SOURCE_KEY {
+                return Ok(Some(self.record.clone()));
+            }
+            self.reader.executor_original(job, step, key).await
+        }
+    }
+    fn attested_source(
+        car: &Value,
+        run: &Value,
+        head: &str,
+    ) -> (Value, crate::first_record::FirstRecord) {
+        let mut run = run.clone();
+        if !steps(&run).iter().any(|s| s["spec_slug"] == BUILDING_SLUG) {
+            run["steps"] = json!([{"id":BUILDING,"spec_slug":BUILDING_SLUG}]);
+        }
+        let building = steps(&run)
+            .into_iter()
+            .find(|s| s["spec_slug"] == BUILDING_SLUG)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let record = crate::first_record::FirstRecord::new(
+            boss_core::job::JobId::from_uuid(run["id"].as_str().unwrap().parse().unwrap()),
+            boss_core::job::StepId::from_uuid(building),
+            crate::release_window::SOURCE_KEY,
+            &json!({"car":car["id"],"head":head,"main":H1,"base":H1,"path":crate::release_window::MANIFEST_PATH,"mode":"100644","base_mode":"100644","base_manifest":"kind: ConfigMap\nmetadata:\n  name: boss-machine-gate\ndata:\n  mode: report\n","manifest":"kind: ConfigMap\nmetadata:\n  name: boss-machine-gate\ndata:\n  mode: report\n","diff":""}),
+            &boss_core::publisher::EventStamp::new(
+                "test",
+                boss_core::actor::ActorId::automation("review"),
+            ),
+            uuid::Uuid::from_u128(78),
+        );
+        if run
+            .pointer("/metadata/review")
+            .is_some_and(Value::is_object)
+        {
+            run["metadata"]["review"]["source_binding"] =
+                json!({"digest":record.digest,"event_id":record.event_id});
+        }
+        (run, record)
+    }
+    async fn decision(
+        reader: &impl ExecutorRecordReader,
+        car: &Value,
+        run: Result<&Value, String>,
+    ) -> Decision {
+        let Ok(run) = run else {
+            return super::decision(reader, car, run, "t").await;
+        };
+        let (run, record) = attested_source(car, run, hold_sha(car).unwrap_or(H1));
+        super::decision(&SourceFixture { reader, record }, car, Ok(&run), "t").await
+    }
+
+    /// [`super::judge`] asked by a caller that read `car` as it stands:
+    /// the ask names the hold the car carries ([`JudgedHold::of`]), as
+    /// every live asker's does. Every test of another rule asks this way;
+    /// the tests of the hold rule itself call [`super::judge`] with the
+    /// hold they mean.
+    async fn judge(
+        reader: &impl ExecutorRecordReader,
+        car: &Value,
+        run: &Value,
+        ask: &ReleaseAsk,
+        by: &str,
+        at: &str,
+    ) -> Result<Granted, String> {
+        let ask = ReleaseAsk {
+            hold: JudgedHold::of(car),
+            ..ask.clone()
+        };
+        let (run, record) = attested_source(
+            car,
+            run,
+            ask.head.as_deref().or_else(|| hold_sha(car)).unwrap_or(H1),
+        );
+        super::judge(&SourceFixture { reader, record }, car, &run, &ask, by, at).await
+    }
+
+    /// THE DOOR LIFTS ONLY THE HOLD ITS ASKER JUDGED (review 792b871a
+    /// N1). A hold rewritten after the asker read the car — another
+    /// reason at the same head (a person's `boss hold` keeps `hold_sha`),
+    /// the same reason at another head, or no hold at all — is refused,
+    /// naming both; the hold as read is granted, and the grant carries
+    /// what it read so the write is judged against it too.
+    #[tokio::test]
+    async fn a_release_lifts_only_the_hold_its_asker_judged() {
+        let run = reviewer(review_at(
+            H1,
+            RELEASE,
+            "SAFE TO RELEASE WITHOUT DAVID: yes.",
+        ));
+        let car = held_car();
+        let (run, record) = attested_source(&car, &run, H1);
+        let reader = SourceFixture {
+            reader: &Advisory,
+            record,
+        };
+        let as_read = ReleaseAsk {
+            review: REVIEWER.into(),
+            hold: JudgedHold::of(&car),
+            ..ReleaseAsk::default()
+        };
+        assert_eq!(
+            as_read.hold,
+            JudgedHold {
+                reason: Some("area policy".into()),
+                sha: Some(H1.into())
+            }
+        );
+        let granted = super::judge(&reader, &car, &run, &as_read, "d", "t")
+            .await
+            .expect("the hold as read is granted");
+        assert_eq!(
+            granted.expect,
+            json!({"hold": "area policy", "hold_sha": H1}),
+            "the write is judged against the hold as read"
+        );
+        let rewrite = |hold: Value, sha: Value| {
+            let mut c = held_car();
+            c["steps"][0]["metadata"]["hold"] = hold;
+            c["steps"][0]["metadata"]["hold_sha"] = sha;
+            c
+        };
+        for (now, says) in [
+            (
+                rewrite(json!("David reads it first"), json!(H1)),
+                "\"David reads it first\"",
+            ),
+            (rewrite(json!("area policy"), json!(H2)), "at 22222222"),
+            (rewrite(Value::Null, json!(H1)), "carries no hold now"),
+        ] {
+            let why = super::judge(&reader, &now, &run, &as_read, "d", "t")
+                .await
+                .expect_err("another hold is not lifted");
+            assert!(why.contains(says), "{says}: {why}");
+            assert!(why.contains("\"area policy\" at 11111111"), "{why}");
+            assert!(why.contains("Nothing was written"), "{why}");
+        }
+        // The same hold, as every reader shows it, is the same hold.
+        let spaced = rewrite(json!("  area policy "), json!(H1));
+        super::judge(&reader, &spaced, &run, &as_read, "d", "t")
+            .await
+            .expect("same text, same head");
+    }
+
+    /// The hold is REQUIRED on the wire: a body that names only the
+    /// review is not a release body (422 at the door), so no asker can
+    /// lift whatever hold happens to be there.
+    #[test]
+    fn a_release_body_without_the_hold_it_judged_is_not_one() {
+        let bare: Result<ReleaseAsk, _> = serde_json::from_value(json!({"review": REVIEWER}));
+        assert!(
+            bare.expect_err("refused").to_string().contains("hold"),
+            "names the missing field"
+        );
+        let full: ReleaseAsk = serde_json::from_value(
+            json!({"review": REVIEWER, "hold": {"reason": "x", "sha": null}}),
+        )
+        .expect("a body");
+        assert_eq!(full.hold.reason.as_deref(), Some("x"));
     }
 
     fn ask(head: Option<&str>) -> ReleaseAsk {

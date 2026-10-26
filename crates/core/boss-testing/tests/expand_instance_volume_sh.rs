@@ -70,6 +70,13 @@ while [ $# -gt 0 ]; do
     case "$1" in --kubeconfig=/kc) shift; break ;; esac
     shift
 done
+if [ "$1" = get ] && [ "$2" = "${STUB_LIST_AFTER_PATCH:-none}" ] && [ -f "$S/accepted-patch" ]; then
+    case "${STUB_LIST_MODE:-error}" in
+    once) if [ ! -f "$S/list-failed" ]; then touch "$S/list-failed"; echo 'etcd timeout after accepted patch' >&2; exit 1; fi ;;
+    malformed) echo 'not JSON after accepted patch'; exit 0 ;;
+    *) echo 'etcd timeout after accepted patch' >&2; exit 1 ;;
+    esac
+fi
 [ "$1" = get ] && [ "$2" = "${STUB_EMPTY:-}" ] && exit 0
 if [ -n "${STUB_FORBIDDEN:-}" ]; then
     echo "Error from server (Forbidden): $2 is forbidden: User \"boss-ops\" cannot get resource \"$2\"" >&2
@@ -86,13 +93,29 @@ case "$1 $2" in
 "get storageclass")
     f="$S/sc-$3.json"; [ -f "$f" ] || notfound storageclasses.storage.k8s.io "$3"; cat "$f"; exit 0 ;;
 "get volumes.longhorn.io")
-    f="$S/vol-$3.json"; [ -f "$f" ] || notfound volumes.longhorn.io "$3"; cat "$f"; exit 0 ;;
+    f="$S/vol-$3.json"; [ -f "$f" ] || notfound volumes.longhorn.io "$3"
+    count=$(cat "$S/vol-reads" 2>/dev/null || echo 0)
+    count=$((count + 1)); echo "$count" > "$S/vol-reads"
+    if [ "$count" = "${STUB_REBIND_ON_VOL_READ:-never}" ]; then
+        jq '.status.kubernetesStatus.pvcName="someone-else"' "$f"
+    else cat "$f"; fi
+    exit 0 ;;
 "get settings.longhorn.io")
     f="$S/setting-$3.json"; [ -f "$f" ] || notfound settings.longhorn.io "$3"; cat "$f"; exit 0 ;;
 "get replicas.longhorn.io")
     printf '{"apiVersion":"v1","kind":"List","items":%s}\n' "$(cat "$S/replicas.json")"; exit 0 ;;
 "get nodes.longhorn.io")
     printf '{"apiVersion":"v1","kind":"List","items":%s}\n' "$(cat "$S/lhnodes.json")"; exit 0 ;;
+"get jobs")
+    count=$(cat "$S/job-reads" 2>/dev/null || echo 0)
+    count=$((count + 1)); echo "$count" > "$S/job-reads"
+    if [ "$count" = "${STUB_BUSY_ON_JOBS_READ:-never}" ]; then
+        cat "$S/busy-jobs.json"
+    else
+        cat "$S/jobs.json"
+    fi
+    exit 0 ;;
+"get pods") cat "$S/pods.json"; exit 0 ;;
 "patch pvc")
     name="$3"; f="$S/pvc-$ns-$name.json"; p=""
     while [ $# -gt 0 ]; do [ "$1" = -p ] && p="$2"; shift; done
@@ -101,6 +124,12 @@ case "$1 $2" in
     new=$(printf '%s' "$p" | jq -r '.[] | select(.op == "replace" and .path == "/spec/resources/requests/storage") | .value')
     cur=$(jq -r '.spec.resources.requests.storage' "$f")
     [ -n "$want" ] && [ "$want" = "$cur" ] || { echo "The request is invalid: the test operation failed" >&2; exit 1; }
+    if [ -n "${STUB_REBIND_ON_PATCH:-}" ]; then
+        jq '.spec.volumeName="pvc-rebound"' "$f" > "$f.new" && mv "$f.new" "$f"
+    fi
+    binding=$(printf '%s' "$p" | jq -r '.[] | select(.op == "test" and .path == "/spec/volumeName") | .value')
+    [ -z "$binding" ] || [ "$binding" = "$(jq -r '.spec.volumeName' "$f")" ] || { echo 'The request is invalid: volume binding test failed' >&2; exit 1; }
+    touch "$S/accepted-patch"
     jq --arg n "$new" '.spec.resources.requests.storage = $n' "$f" > "$f.new" && mv "$f.new" "$f"
     bytes=$(( ${new%Gi} * 1073741824 ))
     vol=$(jq -r '.spec.volumeName' "$f")
@@ -113,6 +142,12 @@ case "$1 $2" in
         jq --arg b "$bytes" '.spec.size = $b' "$S/vol-$vol.json" > "$S/vol.new" && mv "$S/vol.new" "$S/vol-$vol.json"
         jq --arg n "$new" '.status.capacity.storage = $n' "$f" > "$f.new" && mv "$f.new" "$f" ;;
     esac
+    if [ -n "${STUB_AFTER_ROBUSTNESS:-}" ]; then
+        jq --arg r "$STUB_AFTER_ROBUSTNESS" '.status.state="attached" | .status.robustness=$r' "$S/vol-$vol.json" > "$S/vol.new" && mv "$S/vol.new" "$S/vol-$vol.json"
+    fi
+    if [ -n "${STUB_FAIL_REPLICA_ON_PATCH:-}" ]; then
+        jq '.[0].spec.failedAt="2026-10-24T15:00:00Z"' "$S/replicas.json" > "$S/reps.new" && mv "$S/reps.new" "$S/replicas.json"
+    fi
     echo "persistentvolumeclaim/$name patched"; exit 0 ;;
 esac
 echo "stub: unexpected kubectl call: $*" >&2
@@ -385,6 +420,256 @@ fn text(o: &Output) -> String {
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)
     )
+}
+
+fn detached_cluster(name: &str) -> Cluster {
+    let c = Cluster::new(name);
+    let mut v = volume(20, "unknown");
+    v["status"]["state"] = json!("detached");
+    v["status"]["currentNodeID"] = json!("");
+    c.put(&format!("vol-{VOL}.json"), v);
+    let mut reps = c.get("replicas.json");
+    for r in reps.as_array_mut().expect("replicas") {
+        r["spec"]["active"] = json!(true);
+        r["spec"]["desireState"] = json!("stopped");
+        r["status"]["currentState"] = json!("stopped");
+    }
+    c.replicas(reps);
+    c.put(
+        "jobs.json",
+        json!({"apiVersion":"v1","kind":"List","items":[]}),
+    );
+    c.put(
+        "pods.json",
+        json!({"apiVersion":"v1","kind":"List","items":[]}),
+    );
+    c.put("busy-jobs.json", json!({"apiVersion":"v1","kind":"List","items":[{
+        "apiVersion":"batch/v1","kind":"Job","metadata":{"name":"backup-now","namespace":NS},
+        "spec":{"template":{"spec":{"volumes":[{"name":"backup","persistentVolumeClaim":{"claimName":PVC}}]}}},
+        "status":{"active":1}
+    }]}));
+    c
+}
+
+#[test]
+fn detached_healthy_stopped_replicas_admit_a_plan_discovery_and_verified_growth() {
+    let c = detached_cluster("eiv-detached-good");
+    let (plan, hash) = c.plan("30Gi");
+    assert!(plan.contains("detached"), "{plan}");
+    let discovery = c.run(&["--plan-largest", NS, PVC], &[]);
+    assert!(discovery.status.success(), "{}", text(&discovery));
+    assert!(!c.patched());
+    let o = c.run(&[NS, PVC, "30Gi", &hash], &[]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(c.pvc_now()["status"]["capacity"]["storage"], "30Gi");
+    assert_eq!(effect_lines(&text(&o)).len(), 1, "{}", text(&o));
+}
+
+#[test]
+fn detached_growth_requires_every_declared_replica_to_be_running_capable() {
+    for problem in [
+        "failed",
+        "inactive",
+        "deleting",
+        "unhealthy",
+        "error",
+        "missing",
+        "node-unready",
+        "disk-unready",
+    ] {
+        let c = detached_cluster(&format!("eiv-detached-{problem}"));
+        let mut reps = c.get("replicas.json");
+        match problem {
+            "failed" => reps[0]["spec"]["failedAt"] = json!("2026-10-24T14:00:00Z"),
+            "inactive" => reps[0]["spec"]["active"] = json!(false),
+            "deleting" => reps[0]["metadata"]["deletionTimestamp"] = json!("2026-10-24T14:00:00Z"),
+            "unhealthy" => reps[0]["spec"]["healthyAt"] = json!(""),
+            "error" => reps[0]["status"]["currentState"] = json!("error"),
+            "missing" => {
+                reps.as_array_mut().expect("replicas").remove(0);
+            }
+            "node-unready" | "disk-unready" => {
+                let mut nodes = c.get("lhnodes.json");
+                if problem == "node-unready" {
+                    nodes[0]["status"]["conditions"][0]["status"] = json!("False");
+                } else {
+                    nodes[0]["status"]["diskStatus"]["default-disk-cp-1"]["conditions"][0]["status"] =
+                        json!("False");
+                }
+                c.nodes(nodes);
+            }
+            _ => unreachable!(),
+        }
+        c.replicas(reps);
+        let out = c.refused("30Gi");
+        assert!(out.contains("detached replica health"), "{problem}: {out}");
+    }
+}
+
+#[test]
+fn detached_growth_refuses_a_backup_that_starts_after_the_plan_render() {
+    let c = detached_cluster("eiv-detached-job-race");
+    let (_, hash) = c.plan("30Gi");
+    std::fs::remove_file(c.dir.join("state/job-reads")).expect("reset fixture read count");
+    let o = c.run(
+        &[NS, PVC, "30Gi", &hash],
+        &[("STUB_BUSY_ON_JOBS_READ", "2")],
+    );
+    assert_eq!(o.status.code(), Some(78), "{}", text(&o));
+    assert!(text(&o).contains("backup-now"), "{}", text(&o));
+    assert!(!c.patched(), "{:?}", c.calls());
+}
+
+#[test]
+fn detached_growth_rechecks_the_volume_binding_immediately_before_patch() {
+    let c = detached_cluster("eiv-detached-rebind");
+    let (_, hash) = c.plan("30Gi");
+    std::fs::remove_file(c.dir.join("state/vol-reads")).expect("reset fixture read count");
+    let o = c.run(
+        &[NS, PVC, "30Gi", &hash],
+        &[("STUB_REBIND_ON_VOL_READ", "2")],
+    );
+    assert_eq!(o.status.code(), Some(78), "{}", text(&o));
+    assert!(
+        text(&o).contains("before the approved patch"),
+        "{}",
+        text(&o)
+    );
+    assert!(!c.patched(), "{:?}", c.calls());
+}
+
+#[test]
+fn detached_growth_refuses_incomplete_or_unread_claim_users() {
+    for resource in ["jobs", "pods"] {
+        let c = detached_cluster(&format!("eiv-detached-empty-{resource}"));
+        let o = c.run(&["--plan", NS, PVC, "30Gi"], &[("STUB_EMPTY", resource)]);
+        assert!(!o.status.success(), "{}", text(&o));
+        assert!(text(&o).contains("CANNOT ANSWER"), "{}", text(&o));
+        assert!(!c.patched());
+    }
+}
+
+#[test]
+fn detached_claim_users_require_complete_inventories_and_distinguish_terminal_work() {
+    let c = detached_cluster("eiv-detached-users");
+    let mut jobs = c.get("busy-jobs.json");
+    jobs["items"][0]["status"] =
+        json!({"active":0,"conditions":[{"type":"Complete","status":"True"}]});
+    c.put("jobs.json", jobs.clone());
+    c.plan("30Gi");
+
+    // A pending Job counts before its first Pod or active counter exists.
+    jobs["items"][0]["status"] = json!({});
+    c.put("jobs.json", jobs.clone());
+    assert!(c.refused("30Gi").contains("backup-now"));
+
+    c.put(
+        "jobs.json",
+        json!({"apiVersion":"v1","kind":"List","items":[]}),
+    );
+    let mut pods = json!({"apiVersion":"v1","kind":"List","items":[{
+        "apiVersion":"v1","kind":"Pod","metadata":{"name":"backup-pod","namespace":NS},
+        "spec":{"volumes":[{"name":"backup","persistentVolumeClaim":{"claimName":PVC}}]},
+        "status":{"phase":"Running"}
+    }]});
+    c.put("pods.json", pods.clone());
+    assert!(c.refused("30Gi").contains("backup-pod"));
+    pods["items"][0]["status"]["phase"] = json!("Succeeded");
+    c.put("pods.json", pods);
+    c.plan("30Gi");
+
+    for incomplete in [
+        json!({"apiVersion":"v1","kind":"List","metadata":{"continue":"next"},"items":[]}),
+        json!({"apiVersion":"v1","kind":"List","items":[jobs["items"][0].clone(),jobs["items"][0].clone()]}),
+    ] {
+        c.put("jobs.json", incomplete);
+        let o = c.run(&["--plan", NS, PVC, "30Gi"], &[]);
+        assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+        assert!(text(&o).contains("CANNOT ANSWER"), "{}", text(&o));
+        assert!(!c.patched());
+    }
+}
+
+#[test]
+fn detached_growth_does_not_claim_a_degraded_or_failed_replica_readback() {
+    for env in [
+        [("STUB_AFTER_ROBUSTNESS", "degraded")],
+        [("STUB_FAIL_REPLICA_ON_PATCH", "1")],
+    ] {
+        let c = detached_cluster("eiv-detached-bad-readback");
+        let (_, hash) = c.plan("30Gi");
+        let o = c.run(
+            &[NS, PVC, "30Gi", &hash],
+            &[env[0], ("BOSS_EXPAND_WAIT_S", "0")],
+        );
+        assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+        assert!(
+            c.patched(),
+            "the approved patch happened before failed readback"
+        );
+        assert!(effect_lines(&text(&o)).is_empty(), "{}", text(&o));
+        assert!(text(&o).contains("NOT proven"), "{}", text(&o));
+    }
+}
+
+#[test]
+fn detached_readback_retains_an_accepted_write_across_unread_lists() {
+    for resource in ["replicas.longhorn.io", "nodes.longhorn.io"] {
+        for mode in ["error", "malformed", "once"] {
+            let c = detached_cluster("eiv-readback-unread-list");
+            let (_, hash) = c.plan("30Gi");
+            let o = c.run(
+                &[NS, PVC, "30Gi", &hash],
+                &[
+                    ("STUB_LIST_AFTER_PATCH", resource),
+                    ("STUB_LIST_MODE", mode),
+                ],
+            );
+            let out = text(&o);
+            assert!(c.dir.join("state/accepted-patch").exists(), "{out}");
+            assert!(!out.contains("nothing was written"), "{out}");
+            assert!(!out.contains("nothing was patched"), "{out}");
+            if mode == "once" {
+                assert!(o.status.success(), "a transient read recovers: {out}");
+                assert!(!effect_lines(&out).is_empty(), "{out}");
+            } else {
+                assert_eq!(o.status.code(), Some(1), "{out}");
+                assert!(out.contains("NOT proven"), "{out}");
+                assert!(out.contains("unread"), "{out}");
+                assert!(effect_lines(&out).is_empty(), "{out}");
+                assert!(
+                    c.calls()
+                        .iter()
+                        .filter(|v| v.starts_with(&format!("get {resource} ")))
+                        .count()
+                        >= 4,
+                    "bounded poll must retry: {:?}",
+                    c.calls()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_resize_patch_tests_the_approved_volume_binding_atomically() {
+    for detached in [false, true] {
+        let c = if detached {
+            detached_cluster("eiv-binding-cas")
+        } else {
+            Cluster::new("eiv-binding-cas")
+        };
+        let (_, hash) = c.plan("30Gi");
+        let o = c.run(&[NS, PVC, "30Gi", &hash], &[("STUB_REBIND_ON_PATCH", "1")]);
+        let out = text(&o);
+        assert_eq!(o.status.code(), Some(1), "{out}");
+        assert!(
+            !c.dir.join("state/accepted-patch").exists(),
+            "rebound claim must not grow: {out}"
+        );
+        assert!(out.contains("volume binding test failed"), "{out}");
+        assert!(effect_lines(&out).is_empty(), "{out}");
+    }
 }
 
 fn verb(name: &str) -> Value {

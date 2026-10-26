@@ -64,6 +64,15 @@ async fn the_bundle_lands_once_at_the_role_its_callers_assert_and_a_narrowed_row
         other.is_empty(),
         "a row holds a role the bundle has never spelled: {other:?}"
     );
+    // And records no tier (backlog f21804d8): the column is a mechanism,
+    // and recording one is an owner's act with its own review — no
+    // bundle row carries one until that act is made.
+    let tiered: Vec<_> = rows
+        .iter()
+        .filter(|a| a.access_tier.is_some())
+        .map(|a| &a.id)
+        .collect();
+    assert!(tiered.is_empty(), "a bundle row records a tier: {tiered:?}");
     // The family rows stay with their signers, where car 1 put them.
     let families: Vec<_> = rows
         .iter()
@@ -178,6 +187,122 @@ async fn the_schema_refuses_a_family_member_a_bad_prefix_and_a_shared_family() {
         .expect("a well-shaped row lands");
 }
 
+/// A RECORDED TIER ROUND-TRIPS, THE SCHEMA ADMITS ONLY AUDITOR, AND THE
+/// RESOLVER READS IT FROM THE ROW (backlog f21804d8, design 600c07d7).
+/// A row inserted with `auditor` reads back with it, its fact carries it,
+/// and the resolver over the real adapter makes an Auditor reader of the
+/// row's own role. `operator` and any other word are refused by the
+/// database itself. The seed never stamps a tier over a held row nor
+/// revokes one. A revocation in the instance stops a re-resolution; a
+/// value the CHECK did not cover (the constraint dropped, as a future
+/// schema might) is refused by the adapter rather than read as no tier.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_tier_round_trips_and_only_auditor_is_recordable() {
+    use boss_jobs::agents::{RecordedTier, reresolve_recorded_reader, resolve_recorded_reader};
+    use boss_policy_client::AccessTier;
+    let db = TestDb::new().await;
+    let pg = PgAgents::new(db.pool.clone());
+    let observer = boss_jobs::agents::AutomationActor {
+        id: "automation:yard-mover".into(),
+        role: "audit-readonly".into(),
+        description: "the movement observer".into(),
+        signs_for: None,
+        access_tier: Some(RecordedTier::Auditor),
+    };
+    let untiered = boss_jobs::agents::AutomationActor {
+        id: "automation:gate-runner".into(),
+        access_tier: None,
+        ..observer.clone()
+    };
+    let out = pg
+        .declare_automations(&[observer.clone(), untiered.clone()], &stamp())
+        .await
+        .expect("declares");
+    assert_eq!(out.inserted.len(), 2, "{out}");
+    assert_eq!(
+        pg.list_automations().await.unwrap(),
+        vec![untiered.clone(), observer.clone()]
+    );
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM event_outbox WHERE kind = $1 AND payload->>'id' = $2",
+    )
+    .bind(AUTOMATION_DECLARED)
+    .bind("automation:yard-mover")
+    .fetch_one(&db.pool)
+    .await
+    .expect("the declared fact");
+    assert_eq!(payload["access_tier"], "auditor", "{payload}");
+
+    let reader = resolve_recorded_reader(&pg, "automation:yard-mover")
+        .await
+        .expect("the recorded reader");
+    assert_eq!(reader.role, "audit-readonly");
+    assert_eq!(reader.access_tier, AccessTier::Auditor);
+    let why = resolve_recorded_reader(&pg, "automation:gate-runner")
+        .await
+        .unwrap_err();
+    assert!(why.contains("records no access tier"), "{why}");
+
+    // The database refuses every tier but auditor.
+    for bad in ["operator", "user", "Auditor", ""] {
+        let refused = sqlx::query(
+            "INSERT INTO automation_actors (id, role, description, access_tier) \
+             VALUES ('automation:x', 'audit-readonly', 'x', $1)",
+        )
+        .bind(bad)
+        .execute(&db.pool)
+        .await;
+        assert!(refused.is_err(), "{bad:?} must be refused");
+    }
+
+    // The seed keeps the instance's tier both ways, naming it.
+    let flipped = [
+        boss_jobs::agents::AutomationActor {
+            access_tier: None,
+            ..observer.clone()
+        },
+        boss_jobs::agents::AutomationActor {
+            access_tier: Some(RecordedTier::Auditor),
+            ..untiered.clone()
+        },
+    ];
+    let kept = pg.declare_automations(&flipped, &stamp()).await.unwrap();
+    assert_eq!(kept.kept.len(), 2, "{kept}");
+    assert!(kept.kept.iter().all(|k| k.differs == ["access_tier"]));
+    assert_eq!(
+        pg.list_automations().await.unwrap(),
+        vec![untiered, observer],
+        "the instance is the truth"
+    );
+
+    // A revocation in the instance stops the reader on its next ask.
+    sqlx::query("UPDATE automation_actors SET access_tier = NULL WHERE id = $1")
+        .bind("automation:yard-mover")
+        .execute(&db.pool)
+        .await
+        .expect("revoke");
+    let why = reresolve_recorded_reader(&pg, &reader).await.unwrap_err();
+    assert!(why.contains("records no access tier"), "{why}");
+
+    // A value outside the set this build knows is refused, not dropped.
+    sqlx::query(
+        "ALTER TABLE automation_actors DROP CONSTRAINT automation_actors_access_tier_check",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("drop the CHECK for the adapter's own refusal");
+    sqlx::query("UPDATE automation_actors SET access_tier = 'operator' WHERE id = $1")
+        .bind("automation:yard-mover")
+        .execute(&db.pool)
+        .await
+        .expect("an unknown value");
+    let why = pg.list_automations().await.unwrap_err().to_string();
+    assert!(
+        why.contains("automation:yard-mover") && why.contains("operator"),
+        "{why}"
+    );
+}
+
 /// The in-memory double refuses what the schema refuses and lands what
 /// it lands — the adapters agree on the bundle and on a shared family.
 #[tokio::test(flavor = "multi_thread")]
@@ -198,6 +323,7 @@ async fn the_adapters_agree_on_the_bundle() {
         role: "platform-admin".into(),
         description: "claims the rule family".into(),
         signs_for: Some("automation:rule:".into()),
+        access_tier: None,
     }];
     assert!(pg.declare_automations(&stolen, &stamp()).await.is_err());
     assert!(mem.declare_automations(&stolen, &stamp()).await.is_err());

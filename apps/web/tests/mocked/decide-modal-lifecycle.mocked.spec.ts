@@ -29,6 +29,7 @@ const step = (status: string) => ({
 
 const row = () => ({
   job_id: JOB_ID, job_title: 'Feedback on /ux/jobs', due_on: null,
+  opened_on: new Date(Date.now() - 20 * 86_400_000).toISOString().slice(0, 10),
   workflow: 'user-feedback', subject_kind: 'custom', subject_id: '/ux/jobs',
   priority: 'standard', simulated: false, tags: [],
   step: { ...step('active'), completion: 'human', decision_shaped: true },
@@ -40,7 +41,7 @@ const json = (r: Route, b: unknown, status = 200) =>
 /// The stateful world: an active decision step; completing it flips
 /// the state; the job GET can be told to fail N times.
 function world() {
-  return { completed: false, jobGetFailures: 0 };
+  return { completed: false, jobGetFailures: 0, human: false, legacy: false };
 }
 
 async function mocks(page: Page, w: ReturnType<typeof world>) {
@@ -51,8 +52,12 @@ async function mocks(page: Page, w: ReturnType<typeof world>) {
   await servePeopleRows(page, [EMP]);
   await page.route(/\/api\/session$/, (r) =>
     json(r, { username: 'david', employee_id: 'emp-david', role: 'platform-admin' }));
+  const metadata = () => w.human ? { human_only: true, ...(w.legacy ? {} : { human_presentation: {
+    ask: 'Authorize this exact receiver', why_person: 'Your passkey authorizes this receiver only',
+    action: 'Inspect and authorize', after: 'The authorized delivery can proceed', evidence: 'current-step',
+  } }) } : {};
   await page.route(/\/api\/jobs\/assignments/, (r) =>
-    json(r, { data: w.completed ? [] : [row()] }));
+    json(r, { data: w.completed ? [] : [{ ...row(), step: { ...row().step, metadata: metadata() } }] }));
   await page.route(new RegExp(`/api/jobs/${JOB_ID}$`), (r) => {
     if (w.jobGetFailures > 0) {
       w.jobGetFailures -= 1;
@@ -62,7 +67,7 @@ async function mocks(page: Page, w: ReturnType<typeof world>) {
       id: JOB_ID, kind: 'user-feedback', title: 'Feedback on /ux/jobs',
       status: 'open', subject: { subject_kind: 'custom', id: '/ux/jobs' },
       owner_id: 'emp-david', metadata: {},
-      steps: [step(w.completed ? 'completed' : 'active')],
+      steps: [{ ...step(w.completed ? 'completed' : 'active'), metadata: metadata() }],
     });
   });
   await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/${STEP_ID}$`), (r) => {
@@ -70,6 +75,43 @@ async function mocks(page: Page, w: ReturnType<typeof world>) {
     return json(r, step(w.completed ? 'completed' : 'active'));
   });
 }
+
+test('a declared human ask keeps the packet and step titles in My Day and the modal', async ({ page }) => {
+  const w = world(); w.human = true;
+  await mocks(page, w);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'Authorize this exact receiver' })).toBeVisible();
+  await expect(page.getByText('Your passkey authorizes this receiver only')).toBeVisible();
+  await expect(page.getByText('Feedback on /ux/jobs', { exact: true })).toBeVisible();
+  await expect(page.getByText('Decide the design', { exact: true })).toBeVisible();
+  const verdictRow = page.locator('.myday-verdict-row');
+  await expect(verdictRow.locator('.myday-age')).toHaveText(/open 20 d/i);
+  await expect(verdictRow.locator('.myday-age')).toHaveAttribute('data-band', 'stale');
+  await expect(verdictRow.locator('.myday-claim-btn')).toHaveText('Decide');
+  await page.getByRole('button', { name: 'Inspect and authorize' }).click();
+  const modal = page.locator('.dm');
+  await expect(modal.getByRole('heading', { name: 'Decide the design', level: 2, exact: true })).toBeVisible();
+  await expect(modal.getByText('Feedback on /ux/jobs', { exact: true })).toBeVisible();
+  await expect(modal.getByRole('heading', { name: 'Authorize this exact receiver', exact: true })).toHaveCount(1);
+  await expect(modal.locator('.step-generic')).toBeVisible();
+  await expect(modal.getByRole('link', { name: 'Read the evidence and full instructions' })).toHaveAttribute('href', new RegExp(STEP_ID));
+});
+
+test('a human request without presentation keeps the legacy packet card and real modal titles', async ({ page }) => {
+  const w = world(); w.human = true; w.legacy = true;
+  await mocks(page, w);
+  await page.goto('/');
+  const card = page.locator('.myday-verdict-row .packet');
+  await expect(card).toContainText('Feedback on /ux/jobs');
+  await expect(card).toContainText('Decide the design');
+  await expect(page.getByText('Instructions for you are unavailable', { exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Decide', exact: true }).click();
+  const modal = page.locator('.dm');
+  await expect(modal.getByRole('heading', { name: 'Decide the design', level: 2, exact: true })).toBeVisible();
+  await expect(modal.getByText('Feedback on /ux/jobs', { exact: true })).toBeVisible();
+  await expect(modal.locator('.human-ask')).toHaveCount(0);
+  await expect(modal.locator('.step-generic')).toBeVisible();
+});
 
 test('a decide whose reload blips does not poison the modal, and the row still leaves', async ({ page }) => {
   const w = world();

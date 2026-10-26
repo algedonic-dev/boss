@@ -72,6 +72,31 @@
 //! An unreadable or incomplete linked roster refuses before any writes.
 //! Report prose alone proves neither an active gate nor success.
 //!
+//! A valid native launch INSIDE the bound is movement whatever its
+//! verdict (d4c0cd2d, finish line 2026-10-18): its `started_step` stamp
+//! is the server's, so the bound runs from it as from a completed step,
+//! and a red gate launched an hour ago is not four hours of silence.
+//! Past the bound only the verdict speaks, as above. The bound is not
+//! widened, and the evidence is the same asserted `agent_run` link an
+//! open gate already relies on to protect a run for as long as it stays
+//! open — this grants strictly less than that, and no new identity.
+//!
+//! A linked packet WAITING for its launch carries no launch metadata
+//! yet, and `queued_formats` declares what it carries instead (18ad59b9,
+//! 2026-10-21): the resident gate queue completes a gate's `launched`
+//! trigger on admission and stamps `queued_at`, and only the launch
+//! writes `launched_at`. Such a place protects its run while it and its
+//! live step are open, as an open launched gate does past the bound, and
+//! never otherwise. Without it, six builder runs died in one night with
+//! their places still queued, and every one of those places became
+//! unlaunchable.
+//!
+//! The link counts only when the linked packet was BORN with it
+//! (aaf5cafa): its `jobs.job.created` event, the first row of its own
+//! history, must carry the link it carries now. A link PATCHed on later
+//! — by hand, or by `boss gate` reusing an open packet — still serves
+//! lineage and landing, and proves no progress. See `born_linked`.
+//!
 //! ## The record an ending posts (backlog b5a3a174)
 //!
 //! A run aged out as `unreported` shipped its work and cost something,
@@ -121,6 +146,12 @@ struct LinkedProgress {
     live_step: String,
     success_step: String,
     metadata_formats: std::collections::BTreeMap<String, ProgressFormat>,
+    /// The typed metadata of a linked packet WAITING for its launch — a
+    /// place in line (18ad59b9). Read in place of `metadata_formats` and
+    /// only while the packet and its `live_step` are open; see `protects`.
+    /// Absent, a packet without launch metadata proves nothing, as before.
+    #[serde(default)]
+    queued_formats: Option<std::collections::BTreeMap<String, ProgressFormat>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -153,8 +184,10 @@ impl LinkedProgress {
         ]
         .iter()
         .any(|s| s.trim().is_empty() || s.contains(['&', '?', '=']))
-            || guard.metadata_formats.is_empty()
-            || guard.metadata_formats.keys().any(|s| s.trim().is_empty())
+            || [Some(&guard.metadata_formats), guard.queued_formats.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|formats| formats.is_empty() || formats.keys().any(|s| s.trim().is_empty()))
         {
             return Err(HandlerError::Permanent(
                 "linked progress requires named kind, link, steps and metadata formats".into(),
@@ -250,6 +283,7 @@ impl LinkedProgress {
         source: &serde_json::Value,
         linked: &[serde_json::Value],
         now: DateTime<Utc>,
+        bound: f64,
     ) -> bool {
         let Some((j, at)) = self.latest(source, linked, now).ok().flatten() else {
             return false;
@@ -257,32 +291,62 @@ impl LinkedProgress {
         if last_moved(source, None).is_none_or(|since| at < since) {
             return false;
         }
-        let valid_metadata = self.metadata_formats.iter().all(|(key, format)| {
-            let Some(text) = j
-                .get("metadata")
-                .and_then(|m| m.get(key))
-                .and_then(serde_json::Value::as_str)
-            else {
-                return false;
-            };
-            match format {
-                ProgressFormat::Nonblank => !text.trim().is_empty(),
-                ProgressFormat::GitSha => {
-                    text.len() == 40 && text.bytes().all(|c| c.is_ascii_hexdigit())
+        let holds = |formats: &std::collections::BTreeMap<String, ProgressFormat>| {
+            formats.iter().all(|(key, format)| {
+                let Some(text) = j
+                    .get("metadata")
+                    .and_then(|m| m.get(key))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    return false;
+                };
+                match format {
+                    ProgressFormat::Nonblank => !text.trim().is_empty(),
+                    ProgressFormat::GitSha => {
+                        text.len() == 40 && text.bytes().all(|c| c.is_ascii_hexdigit())
+                    }
+                    ProgressFormat::Timestamp => {
+                        // CLI seconds and the server microsecond stamp can
+                        // arrive in either order. Ordering uses the server
+                        // stamp alone; this field proves only its format.
+                        DateTime::parse_from_rfc3339(text).is_ok_and(|t| t <= now)
+                    }
                 }
-                ProgressFormat::Timestamp => {
-                    // CLI seconds and the server microsecond stamp can
-                    // arrive in either order. Ordering uses the server
-                    // stamp alone; this field proves only its format.
-                    DateTime::parse_from_rfc3339(text).is_ok_and(|t| t <= now)
-                }
-            }
-        });
-        if !valid_metadata {
-            return false;
+            })
+        };
+        let live = || {
+            j.get("status").and_then(serde_json::Value::as_str) == Some("open")
+                && step_by_slug(j, &self.live_step).is_some_and(is_open)
+        };
+        if !holds(&self.metadata_formats) {
+            // A PLACE IN LINE IS WORK IN FLIGHT (18ad59b9, 2026-10-21).
+            // The resident queue admits a gate (its `started_step`
+            // completes on admission) and launches it later, so a
+            // waiting place carries its queue stamp and no launch
+            // metadata. Read as no launch, the hourly tick closed runs
+            // 9dfd3c78, c59144bd, 856da6b9, 6ac9e5df, 28d555c7 and
+            // efb5c230 as `died` while their places sat open, and each
+            // place was then unlaunchable. The place keeps its run alive
+            // exactly as long as it is open and unjudged, the protection
+            // an open launched gate already has past the bound, and no
+            // longer: it is not movement inside the bound, and a closed
+            // place — withdrawn, refused, or launched and judged — speaks
+            // only through the launch arm. The link is the same born
+            // link (`born_linked`), so nothing new can vouch for a run.
+            return self.queued_formats.as_ref().is_some_and(holds) && live();
+        }
+        // A LAUNCH INSIDE THE BOUND IS MOVEMENT (d4c0cd2d, finish line
+        // 2026-10-18), whatever its verdict: `at` is the server's own
+        // stamp on the linked `started_step`, so the run moved then, and
+        // the bound runs from it exactly as from a completed step. A red
+        // gate launched an hour ago is not four hours of silence; one
+        // launched past the bound earns nothing, so a newer failure
+        // still beats an older open gate once its own hours are up.
+        if ((now - at).num_seconds() as f64 / 3600.0) < bound {
+            return true;
         }
         match j.get("status").and_then(serde_json::Value::as_str) {
-            Some("open") => step_by_slug(j, &self.live_step).is_some_and(is_open),
+            Some("open") => live(),
             Some("closed") => step_by_slug(j, &self.success_step).is_some_and(|s| {
                 s.get("status").and_then(serde_json::Value::as_str) == Some("completed")
                     && s.get("completed_at")
@@ -355,6 +419,75 @@ impl LinkedProgress {
                 return Ok(rows);
             }
         }
+    }
+
+    /// THE LINK MUST BE AS OLD AS THE LINKED PACKET (backlog aaf5cafa).
+    /// `metadata.<link>` is a merging PATCH any actor with update scope
+    /// can write, so a link read off the packet as it stands now says
+    /// only that SOMEONE bound it: measured by run f62d4d8f, any live
+    /// gate launched after a silent run last moved, bound to it later,
+    /// deferred that run's death exactly as one its own shell launched.
+    /// The create body is the launcher's word — `boss gate` puts the run
+    /// there — and the packet's own history opens on it, so a linked
+    /// packet counts here only when its `jobs.job.created` event carried
+    /// the link it carries now. A later binding still serves lineage, the
+    /// landing rule and metering; it proves no progress.
+    ///
+    /// Only packets linked to a `sources` id are read, one history each.
+    /// A history that does not open on the birth (the API answers the
+    /// newest rows, at most 1000) cannot say what the create body held,
+    /// so that packet counts for nothing — a keep-alive is the claim that
+    /// must be proven, and an unread birth is not one. A failed read is
+    /// a refusal, before any write, like the roster's.
+    async fn born_linked(
+        &self,
+        handler: &JobsAgeOutStep,
+        rule: &str,
+        linked: Vec<serde_json::Value>,
+        sources: &std::collections::HashSet<&str>,
+    ) -> Result<Vec<serde_json::Value>, HandlerError> {
+        let mut kept = Vec::new();
+        for job in linked {
+            let Some(link) = job
+                .get("metadata")
+                .and_then(|m| m.get(&self.link))
+                .and_then(serde_json::Value::as_str)
+                .filter(|l| sources.contains(l))
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let id = job
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let what = format!("linked progress GET /api/jobs/{id}/events");
+            let history = get_json(
+                &handler.client,
+                &format!("{}/api/jobs/{id}/events?limit=1000", handler.base()),
+                rule,
+            )
+            .await?;
+            let events: Vec<serde_json::Value> =
+                rows_or_refuse(&history, &what).map_err(HandlerError::Downstream)?;
+            let born_with = events
+                .first()
+                .filter(|e| {
+                    e.get("kind").and_then(serde_json::Value::as_str)
+                        == Some(boss_jobs::events::JOB_CREATED)
+                })
+                .and_then(|e| e.pointer("/payload/metadata"))
+                .and_then(|m| m.get(&self.link))
+                .and_then(serde_json::Value::as_str);
+            if born_with == Some(link.as_str()) {
+                kept.push(job);
+            } else {
+                tracing::warn!(rule = %rule, packet = %id, source = %link,
+                    "`{}` was not in the linked packet's create body — a later binding proves no progress",
+                    self.link);
+            }
+        }
+        Ok(kept)
     }
 }
 
@@ -509,15 +642,26 @@ impl Handler for JobsAgeOutStep {
         let candidates = open_jobs_of_kind(&self.client, self.base(), kind, &ctx.rule_name).await?;
         // A failed/partial read is not absence. Read before any writes
         // so an unavailable linked roster cannot produce a false death.
+        let judged = |source: &&serde_json::Value| {
+            step_by_slug(source, step_slug).is_some_and(is_open)
+                && silent_hours(source, since_key, now).is_some_and(|hours| hours >= bound)
+        };
         let linked = match &linked_progress {
-            Some(guard) => guard.read(self, &ctx.rule_name).await?,
+            Some(guard) => {
+                let sources = candidates
+                    .iter()
+                    .filter(judged)
+                    .filter_map(|s| s.get("id").and_then(serde_json::Value::as_str))
+                    .collect();
+                let roster = guard.read(self, &ctx.rule_name).await?;
+                guard
+                    .born_linked(self, &ctx.rule_name, roster, &sources)
+                    .await?
+            }
             None => Vec::new(),
         };
         if let Some(guard) = &linked_progress {
-            for source in candidates.iter().filter(|source| {
-                step_by_slug(source, step_slug).is_some_and(is_open)
-                    && silent_hours(source, since_key, now).is_some_and(|hours| hours >= bound)
-            }) {
+            for source in candidates.iter().filter(judged) {
                 // A future server stamp or tied latest launches are
                 // unknown ordering, not licence to choose a verdict.
                 guard.latest(source, &linked, now)?;
@@ -559,7 +703,7 @@ impl Handler for JobsAgeOutStep {
             }
             if linked_progress
                 .as_ref()
-                .is_some_and(|guard| guard.protects(job, &linked, now))
+                .is_some_and(|guard| guard.protects(job, &linked, now, bound))
             {
                 tracing::info!(rule = %ctx.rule_name, packet = %job_id,
                     "linked obligation proves progress — silence verdict deferred");
@@ -712,6 +856,7 @@ mod tests {
         let list_jobs = by_id.clone();
         let put_jobs = by_id.clone();
         let merge_jobs = by_id.clone();
+        let history_jobs = by_id.clone();
         let put_log = puts.clone();
         let merge_log = puts.clone();
         let post_log = puts.clone();
@@ -745,6 +890,26 @@ mod tests {
                             .cloned()
                             .collect();
                         Json(json!({ "data": rows, "total": rows.len() }))
+                    }
+                }),
+            )
+            // The packet's own history (aaf5cafa): a fixture born with
+            // the metadata it holds now, unless it names another birth
+            // under `TEST_HISTORY` — the shape of a later PATCH.
+            .route(
+                "/api/jobs/{id}/events",
+                get(move |Path(id): Path<String>| {
+                    let by_id = history_jobs.clone();
+                    async move {
+                        match by_id.lock().unwrap().get(&id) {
+                            None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                            Some(j) => Json(
+                                j.get(TEST_HISTORY)
+                                    .cloned()
+                                    .unwrap_or_else(|| history(j["metadata"].clone())),
+                            )
+                            .into_response(),
+                        }
                     }
                 }),
             )
@@ -1195,10 +1360,24 @@ mod tests {
             Value::String(json!({
                 "kind": "gate-run", "link": "agent_run", "live_step": "record-verdict",
                 "started_step": "launched", "success_step": "green",
-                "metadata_formats": {"branch": "nonblank", "sha": "git-sha", "launched_at": "timestamp"}
+                "metadata_formats": {"branch": "nonblank", "sha": "git-sha", "launched_at": "timestamp"},
+                "queued_formats": {"branch": "nonblank", "sha": "git-sha", "queued_at": "timestamp"}
             }).to_string()),
         ));
         a
+    }
+
+    /// A gate-run holding a PLACE IN LINE, the shape the resident queue
+    /// leaves (18ad59b9, gate-run d2ff5542 at 2026-10-21T07:00Z): its
+    /// `launched` trigger completed at `registered` — the trigger fires on
+    /// admission, before any wait — its verdict open, `queued_at` the
+    /// place it took, and no `launched_at`, because no Job exists yet.
+    fn queued_gate(id: &str, run_id: &str, registered: &str, queued_at: &str) -> serde_json::Value {
+        let mut g = linked_gate(id, run_id, registered, "open");
+        let md = g["metadata"].as_object_mut().unwrap();
+        md.remove("launched_at");
+        md.insert("queued_at".into(), json!(queued_at));
+        g
     }
 
     fn linked_gate(id: &str, run_id: &str, at: &str, status: &str) -> serde_json::Value {
@@ -1211,6 +1390,134 @@ mod tests {
                 { "id": "verdict", "spec_slug": "record-verdict", "status": if status == "open" { "ready" } else { "completed" } }
             ]
         })
+    }
+
+    /// The fixture key `mock_jobs` answers a packet's history from, in
+    /// place of a birth with the metadata the fixture holds now.
+    const TEST_HISTORY: &str = "_test_history";
+
+    /// `GET /api/jobs/{id}/events` as the jobs API answers it: oldest
+    /// first, opening on the packet's birth with `born_with` as the
+    /// metadata its create body carried, then a later write.
+    fn history(born_with: serde_json::Value) -> serde_json::Value {
+        json!({ "data": [
+            { "kind": "jobs.job.created", "payload": { "metadata": born_with } },
+            { "kind": "jobs.job.updated", "payload": { "metadata": {} } },
+        ]})
+    }
+
+    /// THE LINK MUST BE AS OLD AS THE GATE (backlog aaf5cafa). Measured
+    /// by builder run f62d4d8f on cab692d2: the guard matched any gate
+    /// whose metadata NOW names the run, and `agent_run` is a merging
+    /// PATCH anyone with update scope can write — so a live gate launched
+    /// after a silent run last moved, bound to it by hand, deferred its
+    /// death exactly as one its own shell launched. Only the create body
+    /// the gate was born with is the launcher's word. Each of these
+    /// gates is live and launched an hour ago, inside the bound, so only
+    /// WHEN its link was written decides; the last run is the control.
+    #[tokio::test]
+    async fn a_link_written_after_the_gates_birth_proves_no_progress() {
+        const OTHER: &str = "44444444-4444-4444-4444-444444444444";
+        const BORN: &str = "55555555-5555-5555-5555-555555555555";
+        let at = "2026-09-18T05:00:00Z";
+        let unlinked = |id: &str, run_id: &str, born: Option<&str>| {
+            let mut g = linked_gate(id, run_id, at, "open");
+            let mut birth = g["metadata"].clone();
+            match born {
+                Some(r) => birth["agent_run"] = json!(r),
+                None => {
+                    birth.as_object_mut().unwrap().remove("agent_run");
+                }
+            }
+            g[TEST_HISTORY] = history(birth);
+            g
+        };
+        // A history that does not reach the birth (the API keeps the
+        // newest rows) cannot say what the create body held.
+        let mut unreached = linked_gate("unreached", AGELESS, at, "open");
+        unreached[TEST_HISTORY] = json!({ "data": [
+            { "kind": "jobs.job.updated", "payload": { "metadata": unreached["metadata"].clone() } },
+        ]});
+        let (base, puts) = mock_jobs(vec![
+            run(SILENT, Some("2026-09-18T00:00:00Z"), None),
+            run(FRESH, Some("2026-09-18T00:00:00Z"), None),
+            run(AGELESS, Some("2026-09-18T00:00:00Z"), None),
+            run(BORN, Some("2026-09-18T00:00:00Z"), None),
+            unlinked("hand-bound", SILENT, None),
+            unlinked("rebound", FRESH, Some(OTHER)),
+            unreached,
+            linked_gate("born", BORN, at, "open"),
+        ])
+        .await;
+        let h = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
+        h.invoke(&linked_guard_args(), &ctx(tick("2026-09-18T06:00:00Z")))
+            .await
+            .unwrap();
+        let written = puts.lock().unwrap().clone();
+        let closed: std::collections::BTreeSet<_> =
+            written.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert!(
+            closed.contains(SILENT),
+            "a gate born unlinked and bound later spares nobody: {written:?}"
+        );
+        assert!(
+            closed.contains(FRESH),
+            "a gate born for another run and rebound spares nobody: {written:?}"
+        );
+        assert!(
+            closed.contains(AGELESS),
+            "a gate whose birth cannot be read spares nobody: {written:?}"
+        );
+        assert!(
+            !closed.contains(BORN),
+            "a gate born with the link is the run's own launch: {written:?}"
+        );
+    }
+
+    /// THE FINISH LINE of d4c0cd2d (set 2026-10-18): a run whose gate
+    /// LAUNCHED inside the bound is not closed by the silence rule, even
+    /// when that gate has already gone red — the launch is a server
+    /// stamp that the run moved — and a truly silent run still is.
+    /// Native 4c48a75b died at 4.45 h measured from `briefed`, because
+    /// only a LIVE or GREEN linked gate counted and a failed one was
+    /// silence however recent.
+    #[tokio::test]
+    async fn a_gate_launched_inside_the_bound_is_movement_and_a_silent_run_still_dies() {
+        let mut red = linked_gate("red", SILENT, "2026-09-18T05:00:00Z", "closed");
+        red["steps"].as_array_mut().unwrap().push(json!({
+            "spec_slug": "green", "status": "skipped", "completed_at": null
+        }));
+        let mut stale_red = linked_gate("stale", AGELESS, "2026-09-18T01:00:00Z", "closed");
+        stale_red["steps"].as_array_mut().unwrap().push(json!({
+            "spec_slug": "green", "status": "skipped", "completed_at": null
+        }));
+        let (base, puts) = mock_jobs(vec![
+            run(SILENT, Some("2026-09-18T00:00:00Z"), None),
+            run(FRESH, Some("2026-09-18T00:00:00Z"), None),
+            run(AGELESS, Some("2026-09-18T00:00:00Z"), None),
+            red,
+            stale_red,
+        ])
+        .await;
+        let h = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
+        h.invoke(&linked_guard_args(), &ctx(tick("2026-09-18T06:00:00Z")))
+            .await
+            .unwrap();
+        let written = puts.lock().unwrap().clone();
+        let closed: std::collections::BTreeSet<_> =
+            written.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert!(
+            !closed.contains(SILENT),
+            "a gate launched 1 h ago is movement, red or not: {written:?}"
+        );
+        assert!(
+            closed.contains(FRESH),
+            "a run with no gate, silent 6 h, still dies: {written:?}"
+        );
+        assert!(
+            closed.contains(AGELESS),
+            "a run whose only launch is 5 h old still dies: {written:?}"
+        );
     }
 
     #[tokio::test]
@@ -1236,6 +1543,137 @@ mod tests {
         assert!(written.iter().all(|(id, _, _)| id == FRESH), "{written:?}");
     }
 
+    /// A RUN WHOSE GATE WAITS IN LINE IS NOT SILENT (18ad59b9). Measured
+    /// 2026-10-21: run 9dfd3c78 was briefed at 02:59:31Z, re-gated at
+    /// 05:15:38Z, and its resident place d2ff5542 was still queued and
+    /// alive when the 07:00Z tick closed the run as `died` — the guard
+    /// demanded a native `launched_at` that a place in line does not have
+    /// yet, so a builder that had done everything asked of it was read as
+    /// four hours of silence, and its place became unlaunchable. The same
+    /// shape took five runs at 00:00Z. The place keeps its run alive for
+    /// as long as it stays open — at 07:00Z and still at 10:00Z, when even
+    /// its registration is past the bound — and the controls still die:
+    /// a place withdrawn, and an "open place" whose queue stamp is blank.
+    #[tokio::test]
+    async fn a_gate_waiting_in_line_is_work_in_flight_and_its_run_is_not_silent() {
+        let waiting = queued_gate(
+            "d2ff5542",
+            SILENT,
+            "2026-10-21T05:15:38.713106Z",
+            "2026-10-21T05:15:24Z",
+        );
+        let mut withdrawn = queued_gate(
+            "withdrawn",
+            FRESH,
+            "2026-10-21T00:00:00Z",
+            "2026-10-21T00:00:00Z",
+        );
+        withdrawn["status"] = json!("closed");
+        withdrawn["steps"][1]["status"] = json!("completed");
+        withdrawn["steps"].as_array_mut().unwrap().push(json!({
+            "spec_slug": "green", "status": "skipped", "completed_at": null
+        }));
+        let blank = queued_gate("blank", AGELESS, "2026-10-21T00:00:00Z", "");
+        for at in ["2026-10-21T07:00:00Z", "2026-10-21T10:00:00Z"] {
+            let (base, puts) = mock_jobs(vec![
+                run(SILENT, Some("2026-10-21T02:59:31.049892Z"), None),
+                run(FRESH, Some("2026-10-20T23:00:00Z"), None),
+                run(AGELESS, Some("2026-10-20T23:00:00Z"), None),
+                waiting.clone(),
+                withdrawn.clone(),
+                blank.clone(),
+            ])
+            .await;
+            let h = JobsAgeOutStep::with_client(crate::handlers::common::api_client(), &base);
+            h.invoke(&linked_guard_args(), &ctx(tick(at)))
+                .await
+                .unwrap();
+            let written = puts.lock().unwrap().clone();
+            let closed: std::collections::BTreeSet<_> =
+                written.iter().map(|(id, _, _)| id.as_str()).collect();
+            assert!(
+                !closed.contains(SILENT),
+                "a run whose place is queued and open is not silent at {at}: {written:?}"
+            );
+            assert!(
+                closed.contains(FRESH),
+                "a withdrawn place keeps nobody alive at {at}: {written:?}"
+            );
+            assert!(
+                closed.contains(AGELESS),
+                "a blank queue stamp is no place at {at}: {written:?}"
+            );
+        }
+    }
+
+    /// The queued arm's evidence, one defect at a time: each still dies
+    /// past the bound, where only a live place can speak, and the clean
+    /// place is the control that it does not.
+    #[test]
+    fn a_place_in_line_protects_only_while_open_and_well_formed() {
+        let guard = LinkedProgress::from_args(&linked_guard_args())
+            .unwrap()
+            .unwrap();
+        let source = run(SILENT, Some("2026-10-21T00:00:00Z"), None);
+        let now = DateTime::parse_from_rfc3339("2026-10-21T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        const BOUND: f64 = 4.0;
+        let place = queued_gate("g", SILENT, "2026-10-21T01:00:00Z", "2026-10-21T01:00:00Z");
+        assert!(guard.protects(&source, std::slice::from_ref(&place), now, BOUND));
+        for (pointer, value) in [
+            ("/metadata/agent_run", json!(FRESH)),
+            ("/metadata/queued_at", json!("")),
+            ("/metadata/queued_at", json!("not-a-time")),
+            ("/metadata/queued_at", json!("2026-10-21T11:00:00Z")),
+            ("/metadata/branch", json!(" ")),
+            ("/metadata/sha", json!("not-a-frozen-sha")),
+            ("/steps/0/status", json!("pending")),
+            ("/steps/1/status", json!("completed")),
+            ("/status", json!("closed")),
+        ] {
+            let mut bad = place.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                !guard.protects(&source, &[bad], now, BOUND),
+                "a place with {pointer} wrong keeps nobody alive"
+            );
+        }
+        // A guard that declares no queued arm reads a place in line as
+        // it always did: no launch, no protection.
+        let mut no_arm = linked_guard_args();
+        no_arm.pop();
+        no_arm.push((
+            "unless_linked_job_proves_progress".into(),
+            Value::String(json!({
+                "kind": "gate-run", "link": "agent_run", "live_step": "record-verdict",
+                "started_step": "launched", "success_step": "green",
+                "metadata_formats": {"branch": "nonblank", "sha": "git-sha", "launched_at": "timestamp"}
+            }).to_string()),
+        ));
+        let launched_only = LinkedProgress::from_args(&no_arm).unwrap().unwrap();
+        assert!(!launched_only.protects(&source, &[place], now, BOUND));
+        for bad in [json!({}), json!({" ": "nonblank"})] {
+            let mut args = linked_guard_args();
+            let Some((_, Value::String(text))) = args.pop() else {
+                panic!("guard JSON string");
+            };
+            let mut guard: serde_json::Value = serde_json::from_str(&text).unwrap();
+            guard["queued_formats"] = bad.clone();
+            args.push((
+                "unless_linked_job_proves_progress".into(),
+                Value::String(guard.to_string()),
+            ));
+            assert!(
+                matches!(
+                    LinkedProgress::from_args(&args),
+                    Err(HandlerError::Permanent(_))
+                ),
+                "queued_formats {bad} is refused as permanent"
+            );
+        }
+    }
+
     #[test]
     fn linked_progress_requires_native_launch_and_uses_the_latest_verdict() {
         let guard = LinkedProgress::from_args(&linked_guard_args())
@@ -1245,22 +1683,31 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-09-18T06:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
+        // Every launch here is older than PAST, so only the verdict
+        // speaks; BOUND is the live rule's, where a launch inside it is
+        // movement whatever its verdict (d4c0cd2d).
+        const PAST: f64 = 0.5;
+        const BOUND: f64 = 4.0;
         let live = linked_gate("g", SILENT, "2026-09-18T04:00:00Z", "open");
-        assert!(guard.protects(&source, std::slice::from_ref(&live), now));
+        assert!(guard.protects(&source, std::slice::from_ref(&live), now, PAST));
         let mut green = linked_gate("newer", SILENT, "2026-09-18T05:00:00Z", "closed");
         green["steps"].as_array_mut().unwrap().push(json!({
             "spec_slug":"green", "status":"completed", "completed_at":"2026-09-18T05:30:00Z"
         }));
         assert!(
-            guard.protects(&source, &[live.clone(), green.clone()], now),
+            guard.protects(&source, &[live.clone(), green.clone()], now, PAST),
             "success pending settlement is not death"
         );
         green["steps"][2]["status"] = json!("skipped");
         assert!(
-            !guard.protects(&source, &[live.clone(), green], now),
-            "newer failed launch beats older open one"
+            !guard.protects(&source, &[live.clone(), green.clone()], now, PAST),
+            "newer failed launch beats older open one once its hours are up"
         );
-        assert!(!guard.protects(&source, &[], now));
+        assert!(
+            guard.protects(&source, &[live.clone(), green], now, BOUND),
+            "a failed launch an hour old is still movement inside the bound"
+        );
+        assert!(!guard.protects(&source, &[], now, BOUND));
         for (pointer, value) in [
             ("/metadata/agent_run", json!(FRESH)),
             ("/kind", json!("unrelated-kind")),
@@ -1278,8 +1725,16 @@ mod tests {
             let mut bad = live.clone();
             *bad.pointer_mut(pointer).unwrap() = value;
             assert!(
-                !guard.protects(&source, &[bad], now),
+                !guard.protects(&source, std::slice::from_ref(&bad), now, PAST),
                 "invalid evidence at {pointer}"
+            );
+            // A verdict-only change leaves a valid native launch, which
+            // is movement inside the bound; bad EVIDENCE never is.
+            let verdict_only = matches!(pointer, "/steps/1/status" | "/status");
+            assert_eq!(
+                guard.protects(&source, &[bad], now, BOUND),
+                verdict_only,
+                "inside the bound at {pointer}"
             );
         }
     }
@@ -1327,6 +1782,13 @@ mod tests {
                     json!({"data":unrelated,"total":501}),
                 ),
                 ("/api/jobs?kind=gate-run&offset=500", tail),
+                (
+                    "/api/jobs/last/events",
+                    history(
+                        linked_gate("last", SILENT, "2026-09-18T05:00:00Z", "open")["metadata"]
+                            .clone(),
+                    ),
+                ),
             ])
             .await;
             let handler =
@@ -1430,7 +1892,7 @@ mod tests {
         let mut gate = linked_gate("g", SILENT, "2026-09-18T05:00:00.880636Z", "open");
         gate["metadata"]["launched_at"] = json!("2026-09-18T05:00:00Z");
         assert!(
-            guard.protects(&source, &[gate], now),
+            guard.protects(&source, &[gate], now, 0.5),
             "CLI seconds may precede the server microsecond stamp"
         );
     }
@@ -1440,6 +1902,8 @@ mod tests {
         let source = run(SILENT, Some("2026-09-18T00:00:00Z"), None);
         let live = linked_gate("a", SILENT, "2026-09-18T05:00:00Z", "open");
         let failed = linked_gate("b", SILENT, "2026-09-18T05:00:00Z", "closed");
+        // Both born linked, so the tie — not an unread birth — refuses.
+        let born = history(live["metadata"].clone());
         for gates in [vec![live.clone(), failed.clone()], vec![failed, live]] {
             let stub = crate::handlers::listing_stub::serve(vec![
                 (
@@ -1447,6 +1911,8 @@ mod tests {
                     json!({"data":[source.clone()],"total":1}),
                 ),
                 ("/api/jobs?kind=gate-run", json!({"data":gates,"total":2})),
+                ("/api/jobs/a/events", born.clone()),
+                ("/api/jobs/b/events", born.clone()),
             ])
             .await;
             let handler =
@@ -1455,7 +1921,7 @@ mod tests {
                 handler
                     .invoke(&linked_guard_args(), &ctx(tick("2026-09-18T06:00:00Z")))
                     .await,
-                Err(HandlerError::Downstream(_))
+                Err(HandlerError::Downstream(why)) if why.contains("ambiguous")
             ));
             assert!(stub.writes().is_empty());
         }

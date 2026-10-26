@@ -11,8 +11,87 @@
 //! here by step name (CLAUDE.md §9a — a fact that lives twice gets an
 //! equality test).
 
+use boss_jobs::corrections::CORRECTIONS_KEY;
 use boss_jobs::registry::{WorkflowSpec, platform_bundle_path};
 use boss_jobs::seed_loader::load_workflows;
+
+/// The collect step's procedure text.
+fn collect_procedure() -> String {
+    bundled("department-retro")
+        .steps
+        .iter()
+        .find(|s| s.title == "collect")
+        .expect("a collect step")
+        .metadata_defaults["procedure"]
+        .as_str()
+        .expect("collect carries a procedure")
+        .to_string()
+}
+
+/// THE RETRO COUNTS CORRECTIONS UNDER THE KEY THE DOOR WRITES (backlog
+/// 4fd40048). One fact, one spelling (CLAUDE.md §9a): the key
+/// `boss correct` appends to is [`CORRECTIONS_KEY`], and the procedure
+/// that counts them is held to that constant, not to a word typed
+/// beside it. Measured 2026-10-19 on the live jobs API, IT, the week
+/// closed: `metadata_has=correction` answered 0, `metadata_has=corrections`
+/// 26, a key nothing carries 0 — every department retro run on v8 and
+/// v9 of this row read its week's corrections as none.
+#[test]
+fn the_collect_procedure_counts_corrections_under_the_key_boss_correct_writes() {
+    let procedure = collect_procedure();
+    let door = "metadata_has=";
+    let keys: Vec<&str> = procedure
+        .match_indices(door)
+        .map(|(at, _)| {
+            let rest = &procedure[at + door.len()..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            &rest[..end]
+        })
+        .collect();
+    assert!(
+        keys.contains(&CORRECTIONS_KEY),
+        "collect counts `{door}{CORRECTIONS_KEY}`, the reserved list `boss correct` \
+         appends to; it asks for {keys:?}"
+    );
+    let strays: Vec<&&str> = keys
+        .iter()
+        .filter(|k| k.starts_with("correction") && **k != CORRECTIONS_KEY)
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "collect counts corrections under {strays:?}, which `boss correct` never writes"
+    );
+}
+
+/// The agent-runs doors read `since` as a timestamp: a bare
+/// `YYYY-MM-DD` is a 400 ("since: premature end of input", measured
+/// 2026-10-19), and <window start> is defined as that bare day. So
+/// every agent-runs `since=` placeholder says RFC 3339 (backlog
+/// 4fd40048's second note).
+#[test]
+fn every_agent_runs_since_in_collect_is_rfc_3339() {
+    let procedure = collect_procedure();
+    let mut read = 0usize;
+    for (at, _) in procedure.match_indices("/api/agent-runs") {
+        let rest = &procedure[at..];
+        let Some(q) = rest.find("since=<") else {
+            continue;
+        };
+        // Only this door's own query: stop at the first space.
+        if rest[..q].contains(' ') {
+            continue;
+        }
+        let placeholder = &rest[q..rest[q..].find('>').map_or(rest.len(), |e| q + e)];
+        read += 1;
+        assert!(
+            placeholder.contains("RFC 3339"),
+            "an agent-runs read takes `{placeholder}>`, which the door refuses with a 400"
+        );
+    }
+    assert!(read >= 2, "collect reads the profiles AND the run listing");
+}
 
 #[test]
 fn the_it_retro_reads_the_whole_simplification_window_and_its_coverage() {

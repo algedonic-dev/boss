@@ -265,6 +265,105 @@ fn a_dated_final_native_sample_survives_pod_gc_and_keeps_its_provenance() {
 }
 
 #[test]
+fn failed_scheduled_producer_survives_an_unavailable_native_sample() {
+    let w = World::new("mounted-failed-producer");
+    let mut failed = attempt();
+    failed["metadata"]["ownerReferences"][0]["uid"] = json!("cron-uid");
+    failed["status"] = json!({"failed":1,"conditions":[{"type":"Failed","status":"True","reason":"BackoffLimitExceeded","message":"dump failed"}]});
+    write_file(&w.dir.join("sources.json"), &json!([{"namespace":"boss", "claim":"boss-backups", "workflow":"maintenance-backup", "step":"run", "cronjob":"boss-pg-backup", "actor":"automation:boss-step", "alarm_failed":true}]).to_string());
+    write_file(
+        &w.dir.join("jobs.json"),
+        &json!({"metadata":{"continue":""},"items":[failed]}).to_string(),
+    );
+    let (v, _) = w.reader(json!({"total":0,"data":[]}), 200);
+    assert_eq!(v["scheduled_job"]["state"], "failed", "{v}");
+    assert_eq!(v["scheduled_job"]["job_uid"], "job-uid");
+    assert_eq!(v["scheduled_job"]["cronjob_uid"], "cron-uid");
+    assert_eq!(v["scheduled_job"]["reason"], "BackoffLimitExceeded");
+    assert!(v["free_bytes"].is_null());
+}
+
+#[test]
+fn only_an_unambiguous_newer_complete_attempt_clears_a_scheduled_failure() {
+    let mut failed = attempt();
+    failed["metadata"]["ownerReferences"][0]["uid"] = json!("cron-uid");
+    failed["status"] = json!({"failed":1,"conditions":[{"type":"Failed","status":"True","reason":"BackoffLimitExceeded"}]});
+    let mut newer = failed.clone();
+    newer["metadata"]["uid"] = json!("new-job-uid");
+    newer["metadata"]["name"] = json!("boss-pg-backup-new");
+    newer["metadata"]["creationTimestamp"] = json!(dated(-300));
+    newer["status"] = json!({"active":1});
+    let mut cases = vec![("running", json!([failed.clone(), newer.clone()]), "failed")];
+    newer["status"] = json!({"succeeded":1,"conditions":[{"type":"Complete","status":"True"}]});
+    cases.push((
+        "complete",
+        json!([failed.clone(), newer.clone()]),
+        "succeeded",
+    ));
+    for (tag, path, bad) in [
+        (
+            "owner",
+            "/metadata/ownerReferences/0/uid",
+            json!("different-cron"),
+        ),
+        ("namespace", "/metadata/namespace", json!("other")),
+        ("uid", "/metadata/uid", json!("")),
+        ("future", "/metadata/creationTimestamp", json!(dated(300))),
+        (
+            "tie",
+            "/metadata/creationTimestamp",
+            failed["metadata"]["creationTimestamp"].clone(),
+        ),
+        ("malformed", "/status/conditions", json!("unread")),
+        ("false-complete", "/status/succeeded", json!(0)),
+        ("active-terminal", "/status/active", json!(1)),
+    ] {
+        let mut broken = newer.clone();
+        if path == "/status/active" {
+            broken["status"]["active"] = bad;
+        } else {
+            *broken.pointer_mut(path).unwrap() = bad;
+        }
+        cases.push((tag, json!([failed.clone(), broken]), "unread"));
+    }
+    for (tag, attempts, expected) in cases {
+        let w = World::new(&format!("scheduled-{tag}"));
+        write_file(&w.dir.join("sources.json"), &json!([{"namespace":"boss", "claim":"boss-backups", "workflow":"maintenance-backup", "step":"run", "cronjob":"boss-pg-backup", "actor":"automation:boss-step", "alarm_failed":true}]).to_string());
+        write_file(
+            &w.dir.join("jobs.json"),
+            &json!({"metadata":{"continue":""},"items":attempts}).to_string(),
+        );
+        let (v, _) = w.reader(json!({"total":0,"data":[]}), 200);
+        assert_eq!(v["scheduled_job"]["state"], expected, "{tag}: {v}");
+    }
+}
+
+#[test]
+fn empty_malformed_and_multiple_native_job_documents_are_unread_not_healthy() {
+    for (raw, original_reason) in [
+        ("", "native Job inventory must be one entire document"),
+        ("not-json", "parse error"),
+        (
+            "{}\n{}\n",
+            "native Job inventory must be one entire document",
+        ),
+    ] {
+        let w = World::new("scheduled-invalid-inventory");
+        write_file(&w.dir.join("sources.json"), &json!([{"namespace":"boss", "claim":"boss-backups", "workflow":"maintenance-backup", "step":"run", "cronjob":"boss-pg-backup", "actor":"automation:boss-step", "alarm_failed":true}]).to_string());
+        write_file(&w.dir.join("jobs.json"), raw);
+        let (v, _) = w.reader(json!({"total":0,"data":[]}), 200);
+        assert_eq!(v["scheduled_job"]["state"], "unread", "{raw:?}: {v}");
+        assert!(
+            v["scheduled_job"]["why"]
+                .as_str()
+                .unwrap()
+                .contains(original_reason),
+            "the original inventory refusal must survive a later missing sample: {v}"
+        );
+    }
+}
+
+#[test]
 fn low_or_zero_available_space_is_still_a_measurement_for_the_existing_floor() {
     for free in [0, GIB] {
         let w = World::new(&format!("mounted-low-{free}"));

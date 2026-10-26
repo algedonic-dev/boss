@@ -1,7 +1,9 @@
 //! Serialization and hashing share the original ingress deadline, including large scalars.
+//! It is read on tokio's clock, the one every deadline reader reads (f10419f9).
 use crate::port::JobsError;
 use sha2::{Digest, Sha256};
-use std::{io::Write, time::Instant};
+use std::io::Write;
+use tokio::time::Instant;
 
 pub(crate) fn check(deadline: Option<Instant>) -> Result<(), JobsError> {
     if deadline.is_some_and(|end| Instant::now() >= end) {

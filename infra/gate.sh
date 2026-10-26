@@ -130,15 +130,10 @@ export CARGO_INCREMENTAL=0
 }
 wt_isolate_target_dir
 
-# AND IT MUST NOT RUN WIDER THAN THE WORKTREE'S BUILDS (backlog
-# 9ecd12ea, ask 3). In a linked worktree — a builder's on the dev pod —
-# `--lint`'s workspace clippy ran at cargo's default, one job per NODE
-# CPU (32 there) against a 32Gi container that every builder shares; the
-# memory watch saw it hold ten clippy-drivers at once, where wt-cargo
-# allows four. The helper bounds it to wt-cargo's width and says so; a
-# main checkout (the gate runner, CI) keeps its full width. A missing
-# bound is refused, as wt-cargo refuses one.
-wt_bound_build_jobs || exit $?
+# The helper above also bounds a linked worktree's cargo WIDTH
+# (`wt_bound_build_jobs`), but that call waits for the first mode that
+# compiles — below `--quick`, which compiles nothing — so the listings
+# and the pre-flight answer before it (backlog 9f7ee428).
 
 # THE GATE'S GIT READS MUST WORK FOR WHATEVER UID THE GATE RUNS AS.
 #
@@ -522,29 +517,144 @@ case "${gate_min_free_gb:-empty}" in
         ;;
 esac
 
-# The free-space reader, overridable ONLY so the poll itself can be
-# tested — a fake that shrinks across calls is a faithful model of the
-# incident, and there is no other way to prove re-evaluation without
-# actually filling a disk.
-gate_avail_gb() {
-    local kb
-    kb="$(${BOSS_GATE_DF_CMD:-df -Pk .} 2>/dev/null | awk 'NR==2 {print $4}')"
-    if [ -z "${kb}" ]; then
-        echo "gate: could not read free space for $(pwd) — refusing rather than guessing." >&2
-        exit 2
+# WHERE THE RUN WRITES, not where it was started (backlog 878e5a0f).
+# Until 2026-10-19 the floor read `df -Pk .` — the CHECKOUT's volume —
+# in every mode. Measured 2026-10-17 ~23:00Z by builder run e4eee763: a
+# linked worktree's checkout sat on /work (84% full, 6 GB free) while
+# wt-cargo puts its cargo target on /scratch (248 GB free), where
+# `--lint`'s clippy writes; `--lint` refused with "6GB free, need 12GB"
+# before any check ran, and the builder shipped its car without the
+# pre-flight this door exists for. The same hour a worktree under /tmp
+# was not refused, so the verdict followed where the worktree lived
+# rather than where the build writes, and run e205c820 measured the same
+# line refusing `--quick`, which compiles nothing.
+#
+# So each MODE names the volumes it writes and the floor judges each:
+#   - the lint roster's scratch, TMPDIR: every mode runs the roster;
+#   - the cargo target, CARGO_TARGET_DIR or ./target: `--lint` and the
+#     gate, the modes that compile. Read AFTER wt_isolate_target_dir
+#     above, so a linked worktree is judged on the dir it will build in;
+#   - the checkout: the gate alone, whose web install and builds write
+#     into it. `--lint` and `--quick` write nothing there worth a floor.
+# On the gate pod the checkout and the target are both on /gate-target
+# (infra/gate-runner/run.sh), so its answer is the one it always gave,
+# plus /tmp, which its tests write too; in forge CI and any lone clone
+# ./target is inside the checkout, the same volume as before.
+gate_floor_volumes() {
+    printf '%s\t%s\n' "${TMPDIR:-/tmp}" "the lint roster's scratch (TMPDIR)"
+    [ "$QUICK" -eq 1 ] && return 0
+    printf '%s\t%s\n' "${CARGO_TARGET_DIR:-target}" "the cargo target"
+    [ "$LINT" -eq 1 ] && return 0
+    printf '%s\t%s\n' "$(pwd)" "the checkout"
+}
+
+# The nearest existing ancestor: a cold worktree's target dir does not
+# exist until its first build, and df answers only for a path that does.
+gate_existing_path() {
+    local p="$1"
+    while [ ! -e "$p" ] && [ "$p" != / ] && [ "$p" != . ]; do
+        p="$(dirname "$p")"
+    done
+    printf '%s\n' "$p"
+}
+
+# One `<GB free>\t<mount>\t<what writes there>` line per volume, from ONE
+# df over every path — one call per poll, as before, so a fake that
+# shrinks across calls still models the incident call for call.
+#
+# ALL OR NOTHING (backlog 8a08c00d). df answers one row per path it can
+# read, in order, and for a path it cannot it prints its complaint on
+# stderr and NO row — measured on the dev pod 2026-10-21: `df -Pk /tmp
+# /tmp /nonexistent-x /work` printed three rows for four paths and exited
+# 1. Until then a short answer passed the floor on the rows that came
+# back, each labelled with every writer, so the output claimed volumes
+# were measured that were not, and df's stderr — the only copy of which
+# path failed and why — went to /dev/null. Now a row short is an EMPTY
+# report, which every reader takes as unmeasured, and df's stderr
+# reaches the log.
+#
+# The df is overridable ONLY so the poll itself can be tested — a fake
+# that shrinks across calls is a faithful model of the incident, and
+# there is no other way to prove re-evaluation without actually filling
+# a disk. The seam is handed the paths too, so a fake answers per path,
+# one row each, as df does (the_disk_floor_measures_where_the_run_writes.rs,
+# a_volume_df_did_not_answer_refuses_the_floor.rs).
+gate_free_report() {
+    local paths=() whats=() path what rows i=0 line
+    while IFS=$'\t' read -r path what; do
+        paths+=("$(gate_existing_path "$path")")
+        whats+=("${what}: ${path}")
+    done < <(gate_floor_volumes)
+    rows="$(${BOSS_GATE_DF_CMD:-df -Pk} "${paths[@]}" \
+        | awk 'NR > 1 && $4 ~ /^[0-9]+$/ {print int($4 / 1024 / 1024) "\t" $6}')"
+    [ -n "$rows" ] || return 0
+    [ "$(printf '%s\n' "$rows" | wc -l)" -eq "${#paths[@]}" ] || return 0
+    while IFS= read -r line; do
+        printf '%s\t%s\n' "$line" "${whats[$i]}"
+        i=$((i + 1))
+    done <<< "$rows"
+}
+
+# The volumes df gave no row for, as `<path>\t<what writes there>`, asked
+# one path at a time — which only a refusal pays for. A short combined
+# answer cannot say which row it dropped: a row names the MOUNT, not the
+# path asked, and two writers can share a mount. stderr is dropped HERE
+# only because the combined call above already printed df's complaint.
+gate_unanswered_volumes() {
+    local path what
+    while IFS=$'\t' read -r path what; do
+        if [ -z "$(${BOSS_GATE_DF_CMD:-df -Pk} "$(gate_existing_path "$path")" 2>/dev/null \
+            | awk 'NR > 1 && $4 ~ /^[0-9]+$/')" ]; then
+            printf '%s\t%s\n' "$path" "$what"
+        fi
+    done < <(gate_floor_volumes)
+}
+
+# The lowest free GB across a report — the volume that binds.
+gate_report_lowest() {
+    printf '%s\n' "$1" | awk -F'\t' 'NF && (!seen || $1 + 0 < min + 0) {seen = 1; min = $1; low = $0} END {print low}'
+}
+
+# A volume this run writes that df did not answer for is refused like
+# one under the floor, and on the receipt the same way: the run has not
+# measured it, and a floor judged on the volumes that did answer is a
+# guess (backlog 8a08c00d). Before, this refusal named every path and
+# none in particular, and mid-run it left no receipt at all.
+gate_refuse_unmeasured() {
+    local when="$1" missing
+    missing="$(gate_unanswered_volumes)"
+    # Every path answered when asked alone: the combined call came back
+    # short and cannot say which row it dropped, so none stands measured.
+    [ -n "$missing" ] || missing="$(gate_floor_volumes)"
+    echo "gate: could not read free space for every volume this run writes — refusing ${when} rather than guessing." >&2
+    echo "  df gave no row for:" >&2
+    printf '%s\n' "$missing" | awk -F'\t' '{printf "    %s — %s\n", $1, $2}' >&2
+    GATE_REFUSAL="no free space read (${when}) for $(printf '%s\n' "$missing" | awk -F'\t' '{printf "%s%s, %s", sep, $1, $2; sep = "; "}')"
+    if declare -F write_receipt >/dev/null 2>&1; then
+        write_receipt "refused"
     fi
-    echo $((kb / 1024 / 1024))
+    exit 2
 }
 
 # `when` is "to start" or "to continue" — the distinction matters when
 # reading a log: the second means the run itself ate the headroom.
 require_headroom() {
-    local when="$1" avail
-    avail="$(gate_avail_gb)" || exit 2
+    local when="$1" report lowest avail
+    report="$(gate_free_report)"
+    if [ -z "${report}" ]; then
+        gate_refuse_unmeasured "$when"
+    fi
+    lowest="$(gate_report_lowest "$report")"
+    avail="$(printf '%s\n' "$lowest" | cut -f1)"
     if [ "${avail}" -ge "${gate_min_free_gb}" ]; then
         return 0
     fi
     echo "gate: ${avail}GB free, need ${gate_min_free_gb}GB. Refusing ${when}." >&2
+    # Every volume measured, so the reader sees which one refused and
+    # that the others were fine (backlog 878e5a0f: the refusal named no
+    # volume, and the target's 248 GB was found only by asking again).
+    echo "  measured where this run writes:" >&2
+    printf '%s\n' "$report" | awk -F'\t' '{printf "    %sGB free on %s — %s\n", $1, $2, $3}' >&2
     echo "  A build that fills this volume does not fail cleanly — it wedges the" >&2
     echo "  shell, and on 2026-08-16 it stopped even \`df\` from running." >&2
     echo "  remediation: drop target/ dirs from landed worktrees —" >&2
@@ -567,7 +677,8 @@ require_headroom() {
     # reader that only knows green/failed must not silently round this
     # to either. Written before exiting so the reason survives the
     # process.
-    GATE_REFUSAL="${avail}GB free, need ${gate_min_free_gb}GB (${when})"
+    # The binding volume rides AFTER the words readers already match on.
+    GATE_REFUSAL="${avail}GB free, need ${gate_min_free_gb}GB (${when}) on $(printf '%s\n' "$lowest" | cut -f2), $(printf '%s\n' "$lowest" | cut -f3)"
     # The startup call happens before `write_receipt` and GATE_RECEIPT
     # exist — nothing has run yet, so there is no receipt to write and
     # the exit code is the whole signal. The mid-run calls (one before
@@ -1198,19 +1309,26 @@ path_shapes() {
 #
 # Prints `<crate> <selector> <name>` per line: `test:<file>` for a whole
 # tests/ file (the name is the file), `lib` or `bin:<name>` for one test.
+#
+# BOTH MARKERS ARE SPELLED ONCE, AS VARIABLES (backlog 1c03eeb0). The
+# guard that holds every declared pin free of a test database
+# (the_preflight_runs_the_tree_wide_pins.rs) reads TREE_WIDE_FILE_PATTERN
+# and this one out of this file, so it finds the pins by the pattern
+# that runs them and cannot drift to a second spelling (CLAUDE.md §9a).
+TREE_WIDE_TEST_PATTERN='^[[:space:]]*// tree-wide pin( —|$)'
 tree_wide_pins() {
     local f crate dir rel sel
     {
         grep -lE "$TREE_WIDE_FILE_PATTERN" crates/*/*/tests/*.rs 2>/dev/null \
             | sed -n 's|^crates/[^/]*/\([^/]*\)/tests/\([^/]*\)\.rs$|\1 test:\2 \2|p'
-        grep -rlE --include='*.rs' '^[[:space:]]*// tree-wide pin( —|$)' crates/*/*/src 2>/dev/null \
+        grep -rlE --include='*.rs' "$TREE_WIDE_TEST_PATTERN" crates/*/*/src 2>/dev/null \
             | while read -r f; do
                 crate=$(printf '%s\n' "$f" | cut -d/ -f3)
                 dir=$(printf '%s\n' "$f" | cut -d/ -f1-3)
                 rel=${f#"$dir"/src/}
                 sel=$(tree_wide_target "$dir" "$rel")
-                awk -v pre="${crate} ${sel} " '
-                    /^[[:space:]]*\/\/ tree-wide pin( —|$)/ { want = 1; next }
+                awk -v pre="${crate} ${sel} " -v marker="$TREE_WIDE_TEST_PATTERN" '
+                    $0 ~ marker { want = 1; next }
                     want && $0 !~ /^[[:space:]]*\/\// && match($0, /fn [A-Za-z0-9_]+/) {
                         print pre substr($0, RSTART + 3, RLENGTH - 3)
                         want = 0
@@ -1263,44 +1381,125 @@ tree_wide_unreported() { # <log> <name>...
     done
 }
 
-# Run the records in TREE_WIDE: per crate, its whole tests/ files in one
-# cargo run, then each unit-test binary once with its pins as filters.
-# The output is captured and printed whole — a filtered run has to be
-# READ to know it ran anything.
+# Run the records in TREE_WIDE: BUILD each crate's pins in one
+# `cargo test --no-run`, then RUN them several at a time — one `cargo
+# test` per tests/ file, and one per unit-test binary with its pins as
+# filters. Every run's output is captured and printed whole, in order,
+# once all have ended — a filtered run has to be READ to know it ran
+# anything.
+#
+# SEVERAL AT A TIME (backlog 19347752). Run one after another, the pins
+# were the slowest check a scoped gate or `--lint` paid for nothing:
+# measured on the dev pod 2026-10-18, 64 pins took 276 s warm (573 s
+# cold) and all but ~2 s of the warm run was the binaries' own time, a
+# handful of ~30 s scans and dozens of short ones. The floor is the
+# slowest single pin. Each run is still `cargo test` — cargo starts the
+# binary in its package root with its own environment and prints its
+# own `to rerun pass` line, and a fresh target costs it a fingerprint
+# check, not a build: concurrent `cargo test`s over a built target do
+# not wait on each other's lock (two ~30 s pins together: 34 s).
+#
+# THE WIDTH is CARGO_BUILD_JOBS — the gate's cgroup CPU quota
+# (infra/gate-runner/run.sh), wt-cargo's bound in a linked worktree
+# (wt_bound_build_jobs) — and 1, cargo's serial order, where it is
+# unset. Not infra/cargo-test-wide.sh's quarter-capped-at-four: that cap
+# protects the shared Postgres sidecar, and no pin opens a test database
+# (the_preflight_runs_the_tree_wide_pins.rs holds them to it), so CPU is
+# the only thing the width spends.
+#
+# A RUN THAT LEFT NO STATUS FAILED. The worker writes its status last
+# and by rename, as the lint roster's does; a run with no `.done` was
+# killed or could not record one, and no evidence is not a pass.
+# shellcheck disable=SC2016 # expanded by the worker's bash, not here
+TREE_WIDE_WORKER='
+dir=$1 at=$2 argv=()
+while IFS= read -r -d "" a; do argv+=("$a"); done < "$dir/$at.argv"
+cargo "${argv[@]}" < /dev/null > "$dir/$at.log" 2>&1
+status=$?
+printf "%s %s\n" "$status" "$SECONDS" > "$dir/$at.part" && mv "$dir/$at.part" "$dir/$at.done"
+'
 run_tree_wide_pins() {
-    local rc=0 crate rec c sel name target log missing
-    local -a files names
+    local rc=0 crate rec c sel name target dir at=0 i width status took sum=0 t0=$SECONDS missing
+    local -a sels targets names labels filters
+    width=${CARGO_BUILD_JOBS:-1}
+    case ${width:-empty} in empty|*[!0-9]*|0) width=1 ;; esac
+    dir="$(mktemp -d)" || { echo "gate.sh: tree-wide pins cannot make a temp dir" >&2; return 1; }
     for crate in $(printf '%s\n' "${TREE_WIDE[@]}" | cut -d' ' -f1 | sort -u); do
-        files=()
+        sels=()
+        targets=()
         for rec in "${TREE_WIDE[@]}"; do
             read -r c sel name <<< "$rec"
             [ "$c" = "$crate" ] || continue
-            case "$sel" in test:*) files+=(--test "${sel#test:}") ;; esac
+            case "$sel" in test:*) sels+=(--test "${sel#test:}"); continue ;; esac
+            case " ${targets[*]:-} " in *" $sel "*) continue ;; esac
+            targets+=("$sel")
+            if [ "$sel" = lib ]; then sels+=(--lib); else sels+=(--bin "${sel#bin:}"); fi
         done
-        if [ "${#files[@]}" -gt 0 ]; then
-            cargo test -p "$crate" "${files[@]}" --all-features --no-fail-fast || rc=1
+        # `--no-fail-fast` here keeps compiling the crate's other pins
+        # past one that does not compile, so its error hides none of
+        # theirs (gate_sh's every_cargo_test_the_gate_runs_carries_no_fail_fast).
+        if ! cargo test -p "$crate" "${sels[@]}" --all-features --no-fail-fast --no-run; then
+            echo "gate: tree-wide pins in ${crate} did not build, so none of them ran: $(printf '%s\n' "${TREE_WIDE[@]}" | awk -v c="$crate" '$1 == c { printf "%s ", $3 }')" >&2
+            rc=1
+            continue
         fi
-        for target in $(printf '%s\n' "${TREE_WIDE[@]}" | awk -v c="$crate" '$1 == c && $2 !~ /^test:/ { print $2 }' | sort -u); do
+        # The unit-test binaries first: one is often the longest run
+        # (boss-dispatcher-handlers' lib, ~27 s), so it starts early.
+        for target in ${targets[@]+"${targets[@]}"}; do
             names=()
             for rec in "${TREE_WIDE[@]}"; do
                 read -r c sel name <<< "$rec"
                 if [ "$c" = "$crate" ] && [ "$sel" = "$target" ]; then names+=("$name"); fi
             done
-            log="$(mktemp)" || { echo "gate.sh: tree-wide pins cannot make a temp file" >&2; return 1; }
-            if [ "$target" = "lib" ]; then
-                cargo test -p "$crate" --lib --all-features --no-fail-fast -- "${names[@]}" > "$log" 2>&1 || rc=1
+            at=$((at + 1))
+            if [ "$target" = lib ]; then
+                printf '%s\0' test -p "$crate" --lib --all-features -- "${names[@]}" > "$dir/$at.argv"
             else
-                cargo test -p "$crate" --bin "${target#bin:}" --all-features --no-fail-fast -- "${names[@]}" > "$log" 2>&1 || rc=1
+                printf '%s\0' test -p "$crate" --bin "${target#bin:}" --all-features -- "${names[@]}" > "$dir/$at.argv"
             fi
-            cat "$log"
-            missing=$(tree_wide_unreported "$log" "${names[@]}")
-            rm -f "$log"
-            if [ -n "$missing" ]; then
-                echo "gate: tree-wide pin(s) in ${crate} (${target}) not seen passing: $(echo "$missing" | tr '\n' ' ')— each failed above or matched no test, and a filter that matches nothing tested nothing" >&2
-                rc=1
-            fi
+            labels[at]="${names[*]} (${crate} ${target})"
+            filters[at]="${names[*]}"
+        done
+        for rec in "${TREE_WIDE[@]}"; do
+            read -r c sel name <<< "$rec"
+            [ "$c" = "$crate" ] || continue
+            case "$sel" in test:*) ;; *) continue ;; esac
+            at=$((at + 1))
+            printf '%s\0' test -p "$crate" --test "${sel#test:}" --all-features > "$dir/$at.argv"
+            labels[at]="${name} (${crate} ${sel})"
+            filters[at]=""
         done
     done
+    if [ "$at" -gt 0 ]; then
+        # GNU and BSD xargs both take -0, -n and -P; it is never handed
+        # an empty list, on which GNU would run the worker once.
+        for ((i = 1; i <= at; i++)); do printf '%s\0' "$i"; done \
+            | xargs -0 -n 1 -P "$width" bash -c "$TREE_WIDE_WORKER" tree-wide-worker "$dir"
+    fi
+    for ((i = 1; i <= at; i++)); do
+        echo "gate: tree-wide pin run ${i}/${at}: cargo $(tr '\0' ' ' < "$dir/$i.argv")"
+        cat "$dir/$i.log" 2>/dev/null
+        if [ ! -f "$dir/$i.done" ]; then
+            echo "gate: tree-wide pin ${labels[i]} failed: its run left no status — killed, or the record could not be written, and a run that did not finish is not a pass" >&2
+            rc=1
+            continue
+        fi
+        read -r status took < "$dir/$i.done"
+        sum=$((sum + took))
+        if [ "$status" != 0 ]; then
+            echo "gate: tree-wide pin ${labels[i]} failed (exit ${status}) — its output is above" >&2
+            rc=1
+        elif [ -n "${filters[i]}" ]; then
+            # shellcheck disable=SC2086 # the names are words by construction
+            missing=$(tree_wide_unreported "$dir/$i.log" ${filters[i]})
+            if [ -n "$missing" ]; then
+                echo "gate: tree-wide pin(s) ${labels[i]} not seen passing: $(echo "$missing" | tr '\n' ' ')— each failed above or matched no test, and a filter that matches nothing tested nothing" >&2
+                rc=1
+            fi
+        fi
+    done
+    rm -rf "$dir"
+    echo "gate: tree-wide pins: ${at} run(s), ${width} at a time, in $((SECONDS - t0))s with the build; their own times sum to ${sum}s (what one at a time would cost)"
     return "$rc"
 }
 
@@ -1571,7 +1770,10 @@ scope_self_test() {
     # execute it. The argument-bearing remedy contract (53c8cb72) also
     # runs the runner's pure decide function from boss-dispatcher-handlers.
     # Derived, not listed — this case records every current reader.
-    _case "a script three crates read implies all three" "boss-dispatcher-handlers boss-jobs boss-testing" \
+    # boss-cli joined on 2026-10-20 (backlog 82946cd9): its prove.rs pin
+    # holds the owed payment's credential file equal to the runner's
+    # `RUNNER_CREDENTIAL_FILE=` line, so editing the runner can redden it.
+    _case "a script four crates read implies all four" "boss-cli boss-dispatcher-handlers boss-jobs boss-testing" \
         "infra/ops/ops-runner.sh"
     _case "docs outside design/ imply no crate" "" "docs/invariants/x.toml" "README.md"
     # …unless a crate READS it. gate_sh.rs asserts this runbook tells a
@@ -2338,6 +2540,21 @@ write_receipt() {
         done
         estate_json="\"estate\": {\"declared\": \"${declared}\", \"live_not_run\": [${live}]},"
     fi
+    # The floor's reading, volume by volume (backlog 8a08c00d). `free_gb`
+    # is the binding volume's — the lowest, as before — and `free_gb_on`
+    # names it, because since the floor judged several volumes (878e5a0f)
+    # the bare number was a minimum over volumes a reader could not tell
+    # apart: on the gate pod the smaller of /gate-target and the node's
+    # /tmp. Null, never a guess, when a volume went unmeasured.
+    local floor_report floor_low free_gb_json=null free_on_json=null free_volumes_json
+    floor_report="$(gate_free_report)"
+    if [ -n "${floor_report}" ]; then
+        floor_low="$(gate_report_lowest "$floor_report")"
+        free_gb_json="$(printf '%s\n' "$floor_low" | cut -f1)"
+        free_on_json="\"$(printf '%s\n' "$floor_low" | cut -f2 | tr -d '"\\')\""
+    fi
+    free_volumes_json="$(printf '%s\n' "$floor_report" | tr -d '"\\' \
+        | awk -F'\t' 'NF >= 3 {printf "%s{\"free_gb\": %s, \"mount\": \"%s\", \"writes\": \"%s\"}", sep, $1, $2, $3; sep = ", "}')"
     cat > "${GATE_RECEIPT}" <<RECEIPT
 {
   ${refusal_json}
@@ -2349,7 +2566,9 @@ write_receipt() {
   "dirty": $( [ -n "$(git status --porcelain 2>/dev/null)" ] && echo true || echo false ),
   "host": "$(hostname 2>/dev/null || echo unknown)",
   "ci": ${in_ci},
-  "free_gb": $(gate_avail_gb),
+  "free_gb": ${free_gb_json},
+  "free_gb_on": ${free_on_json},
+  "free_volumes": [${free_volumes_json}],
   "web_timings": $(web_timings_json),
   "test_binaries": $(test_binaries_json),
   "runtime_evidence": $(runtime_evidence_report),
@@ -2915,8 +3134,9 @@ check_stdin_self_test() {
     # ate one of those readings would move the refusal that test expects
     # — which is exactly what it did on the first attempt, turning a
     # green receipt-timing test red. The self-test is about stdin; it must
-    # leave the poll's own fixture untouched.
-    printf '#!/usr/bin/env bash\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "/dev/check-self-test 1 1 943718400 1%% /"\n' \
+    # leave the poll's own fixture untouched. One row per path it is
+    # handed, as df answers: a row short is a refusal (backlog 8a08c00d).
+    printf '#!/usr/bin/env bash\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\nfor _ in "$@"; do echo "/dev/check-self-test 1 1 943718400 1%% /"; done\n' \
         > "$tmp/df"
     chmod +x "$tmp/df"
     saved_ran=(${RAN+"${RAN[@]}"})
@@ -3274,6 +3494,31 @@ if [ "$QUICK" -eq 1 ]; then
     exit 0
 fi
 
+# AND IT MUST NOT RUN WIDER THAN THE WORKTREE'S BUILDS (backlog
+# 9ecd12ea, ask 3). In a linked worktree — a builder's on the dev pod —
+# `--lint`'s workspace clippy ran at cargo's default, one job per NODE
+# CPU (32 there) against a 32Gi container that every builder shares; the
+# memory watch saw it hold ten clippy-drivers at once, where wt-cargo
+# allows four. The helper bounds it to wt-cargo's width and says so; a
+# main checkout (the gate runner, CI) keeps its full width. A missing
+# bound is refused, as wt-cargo refuses one.
+#
+# HERE, below the listings and `--quick`, above every cargo that
+# compiles (backlog 9f7ee428, from review 9612e118 of car d7b90451). It
+# sat at the top of the script until then, above the listings dispatch
+# whose rule (13700f6f) is that a listing answers before every refusal:
+# `--roster` in a linked worktree printed a width no cargo would use,
+# and with pod-build.env missing it refused the question. `--lint`'s
+# clippy and tree-wide pins and every gate phase below this line are the
+# cargo it bounds; `cargo metadata` above reads a manifest and compiles
+# nothing. A refusal here is the disk floor's shape — an infrastructure
+# refusal on the receipt, never a verdict on the branch.
+if ! wt_bound_build_jobs; then
+    GATE_REFUSAL="no cargo bound for this linked worktree (infra/dev/pod-build.env; backlog 9ecd12ea)"
+    write_receipt "refused"
+    exit 2
+fi
+
 # `--lint` is `--quick` plus the one compiled check that pays for
 # itself. It exists because of a measured waste: on 2026-08-28 a car
 # went red on `clippy` alone, costing a gate and a re-gate — about 22
@@ -3461,13 +3706,14 @@ if [ "${#TREE_WIDE[@]}" -gt 0 ]; then
     check "tree-wide pins" run_tree_wide_pins
 fi
 
-# THE WEB SUITE. CI's web job runs unit + build + the mocked
-# Playwright suite; before this gate ran svelte-check alone, so a car
-# could pass here and red the train on a check it never saw (§9a: this
-# block and ci.yml's web job are two copies of one definition, kept in
-# sync). CI no longer runs the typecheck: svelte-check below runs on
-# every tree, the train's --auto gate included (backlog 81ee98b3; pinned
-# by gate_sh.rs the_forge_web_job_runs_only_what_the_train_gate_may_skip).
+# THE WEB SUITE. Unit + build + the mocked Playwright suite; before
+# this gate ran svelte-check alone, so a car could pass here and red the
+# train on a check only CI's web job ran. That job is no longer a second
+# copy of this block: svelte-check below runs on every tree, the train's
+# --auto gate included, so CI runs no typecheck; and CI runs the rest
+# only on a train that changes its runner image's recipe, the one thing
+# this gate's image cannot prove (backlog 81ee98b3). Which lane pays for
+# each of apps/web's checks is read by apps/web's web-ci-coverage.ts.
 #
 # FULL MODE RUNS IT UNCONDITIONALLY, matching CI — the full gate is the
 # authoritative one and must not be narrower than the train it feeds.
@@ -3475,53 +3721,68 @@ fi
 # which is exactly why `boss gate` runs full mode, skipped the suite,
 # and let mocked-spec reds through: trains #160 (route crawl missed the
 # estate page) and #161 (~35 specs after the IT consolidation moved
-# surfaces) both died that way — ade5d82b. --auto keeps the old
-# scoping, because a docs or Rust car iterating locally should not pay
-# the suite unless it touched the web; CI and the full gate are the
-# unconditional backstops. The browser is baked into boss-ci at
-# /opt/ms-playwright (the keystone), so this needs no run-time download
-# — the gate-runner points PLAYWRIGHT_BROWSERS_PATH there.
+# surfaces) both died that way — ade5d82b. The browser is baked into
+# boss-ci at /opt/ms-playwright (the keystone), so this needs no
+# run-time download — the gate-runner points PLAYWRIGHT_BROWSERS_PATH
+# there.
+#
+# WHAT --auto RUNS (backlog a244c6e7, 2026-10-19). The unit suites run
+# on EVERY tree: web install, web-kit unit, the simulator and apps/web's
+# test:unit take ~21 s together (dev pod, the gate's own 4-wide runner),
+# and they read far outside the web trees — ci.yml, Rust handlers,
+# workflows, seeds — so no list of paths could say when to skip them.
+# The build and the mocked suite take minutes (257-425 s for the
+# web-suite check in the 2026-10-18 receipts), so --auto runs them only
+# when the car changes something they read, and what they read is
+# DERIVED from their own files by apps/web/scripts/web-suite-reads.ts:
+# apps/web and the workspace packages it depends on, the install's
+# inputs, and every relative path their code names outside those trees.
+# Until then web_touched grepped for three directories while the specs
+# read infra/step-plugins, infra/estate and docs/, so a step-plugin car
+# was green without the specs that render it, and the forge's web job on
+# the train was their first run. A derivation that cannot answer (no
+# bun, a file whose reads it cannot see) answers yes: the suite runs.
+# Pinned by an_auto_gate_runs_the_web_suite_on_what_it_reads.rs.
 web_touched() {
-    if changed_paths | grep -qE '^(apps/web|apps/simulator|libs/web-kit)/'; then echo yes; else echo no; fi
+    local answer
+    answer=$(changed_paths | (cd apps/web && bun scripts/web-suite-reads.ts --touched)) || answer=""
+    case "$answer" in
+        yes|no) echo "$answer" ;;
+        *) echo "gate: web-suite-reads gave no answer, so the web suite runs" >&2; echo yes ;;
+    esac
 }
-simulator_touched() {
-    if changed_paths | grep -qE '^(apps/simulator|libs/web-kit)/'; then echo yes; else echo no; fi
-}
-if [ "$AUTO" -eq 0 ] || [ "$(web_touched)" = "yes" ]; then
-    # Every web check below appends what it took (see "web timings").
-    web_timings_begin
+# Every web check below appends what it took (see "web timings").
+web_timings_begin
 
-    # A clean install FIRST, with puppeteer's postinstall skipped. bun
-    # aborts the WHOLE install on a failed postinstall, and puppeteer's
-    # browser download is the flaky one — the exact reason ci.yml's web
-    # job and svelte-check.sh both set PUPPETEER_SKIP_DOWNLOAD. This is
-    # the install the web checks run on, and the web-suite check below
-    # is the one build: the gate-runner's silenced warm-up of both is
-    # gone (backlog efd7f75c), so what they take and whether they fail
-    # are on the receipt (the_gate_builds_the_web_app_once.rs).
-    check "web install" bash -c 'cd apps/web && PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile'
+# A clean install FIRST, with puppeteer's postinstall skipped. bun
+# aborts the WHOLE install on a failed postinstall, and puppeteer's
+# browser download is the flaky one — the exact reason ci.yml's web
+# job and svelte-check.sh both set PUPPETEER_SKIP_DOWNLOAD. This is
+# the install the web checks run on, and the web-suite check below
+# is the one build: the gate-runner's silenced warm-up of both is
+# gone (backlog efd7f75c), so what they take and whether they fail
+# are on the receipt (the_gate_builds_the_web_app_once.rs).
+check "web install" bash -c 'cd apps/web && PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile'
+# web-kit FIRST: its 7 test files existed for weeks and ran in no
+# job at all - not here, not in ci.yml. One of them could not even
+# load, because it imported a module whose top-level `$state` made
+# it unloadable outside the Svelte compiler; the rest silently
+# protected nothing. A test nothing runs is not a test.
+check "web-kit unit" bash -c 'cd libs/web-kit && bun run test:unit'
+# THE SIMULATOR (backlog 5796d7ea, 2026-09-26). web_touched opened
+# the web phase on an apps/simulator change and then ran nothing of
+# it: no typecheck, no unit test, no build here, in ci.yml or anywhere
+# else, so a broken simulator was green. Measured clean the day it
+# was added (0 errors, 6 tests, a 4-file bundle, ~7 s warm), so no
+# baseline. It was scoped in --auto to its own tree and web-kit until
+# a244c6e7 measured it at 6 s and ran it on every tree.
+check "simulator (typecheck+unit+build)" bash -c 'cd apps/simulator && bun run typecheck && bun run test:unit && bun run build'
+if [ "$AUTO" -eq 0 ] || [ "$(web_touched)" = "yes" ]; then
     # Resolve controls in the same toolchain/environment; runtime output remains
     # a separate observation rather than a configured worker count posing as one.
     (cd apps/web && bun -e 'import config from "./playwright.mocked.config.ts"; console.log(JSON.stringify({workers:config.workers,retries:config.retries}));') \
         > "${BOSS_GATE_RUNTIME_EVIDENCE}.browser-config" 2> "${BOSS_GATE_RUNTIME_EVIDENCE}.browser-config-error" \
         || printf '%s\n' browser-config >> "${BOSS_GATE_RUNTIME_EVIDENCE}.failed"
-    # web-kit FIRST: its 7 test files existed for weeks and ran in no
-    # job at all - not here, not in ci.yml. One of them could not even
-    # load, because it imported a module whose top-level `$state` made
-    # it unloadable outside the Svelte compiler; the rest silently
-    # protected nothing. A test nothing runs is not a test.
-    check "web-kit unit" bash -c 'cd libs/web-kit && bun run test:unit'
-    # THE SIMULATOR (backlog 5796d7ea, 2026-09-26). web_touched opened
-    # this phase on an apps/simulator change and then ran nothing of it:
-    # no typecheck, no unit test, no build here, in ci.yml or anywhere
-    # else, so a broken simulator was green. Measured clean the day it
-    # was added (0 errors, 6 tests, a 4-file bundle, ~7 s warm), so no
-    # baseline. Scoped in --auto to what it reads — its own tree and
-    # web-kit, its one workspace dependency — so an apps/web car does
-    # not pay for it; full mode runs it like the rest of the phase.
-    if [ "$AUTO" -eq 0 ] || [ "$(simulator_touched)" = "yes" ]; then
-        check "simulator (typecheck+unit+build)" bash -c 'cd apps/simulator && bun run typecheck && bun run test:unit && bun run build'
-    fi
     # The check's own output, teed, so the keeper can read Playwright's
     # roll-up of failed specs (see "web evidence"; backlog a766e20d).
     web_out="$(mktemp)" || web_out=""
@@ -3535,6 +3796,11 @@ if [ "$AUTO" -eq 0 ] || [ "$(web_touched)" = "yes" ]; then
     if [ "$CHECK_STATUS" -ne 0 ] && [ -n "$web_since" ]; then keep_error_context "web-suite (unit+build+mocked)" "$web_since" "$web_out"; fi
     [ -z "$web_since" ] || rm -f "$web_since"
     [ -z "$web_out" ] || rm -f "$web_out"
+else
+    # apps/web's unit files, which the web-suite check above opens with:
+    # a car that skips the browser still has them judged (a244c6e7),
+    # gate-matches-ci.test.ts and estate.test.ts among them.
+    check "web unit" bash -c 'cd apps/web && bun run test:unit'
 fi
 
 run_preflight

@@ -421,32 +421,39 @@ env -i PATH="$PATH" bash -n "$dob" || fail "delete-orphan-object.sh does not par
 env -i PATH="$PATH" bash -n "$der" || fail "undeclared-objects.sh does not parse"
 grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$dob")" && fail "delete-orphan-object.sh reads \$HOME (the ops runner has none)"
 grep -qE '\$HOME' <<<"$(grep -vE '^\s*#' "$der")" && fail "undeclared-objects.sh reads \$HOME (the ops runner has none)"
-# EVERY git CALL IN THE VERB GOES THROUGH THE OWNER.
+# EVERY git CALL IN THE VERB READS ROOT'S OWN STORE (backlog 1dde630c).
 #
-# The ops-runner executes verbs as root and the forge checkout belongs to a
-# user, and git refuses to READ across that boundary ("dubious ownership",
-# 2.35.2+) as firmly as a root WRITE would leave root-owned objects behind.
-# A bare `git -C "$TREE"` is therefore a command that fails on every real
-# invocation while passing every test here, because a fixture is owned by
-# whoever runs the gate — measured, on ops-request c9877f75, 2026-09-10.
-# Structural, for the same reason boss-gcp-converges-itself.sh §2b is: the
-# runuser branch cannot be exercised without a second account.
-bare=$(grep -nE '(^|[^_"])git -C "\$TREE"' "$dob" || true)
-[ -z "$bare" ] || fail "delete-orphan-object.sh calls git outside as_owner:
-$bare
-    Root cannot even READ a checkout it does not own; wrap it:
-      as_owner \"git -C '\$TREE' <args>\""
-grep -q 'as_owner()' "$dob" || fail "delete-orphan-object.sh has no as_owner — its git reads cannot be running as the checkout's owner"
-grep -q 'stat -c %U' "$dob" || fail "delete-orphan-object.sh does not read the owner off the directory (hardcoding an account silently corrupts a host that moves the checkout)"
-grep -q 'UNKNOWN' "$dob" || fail "delete-orphan-object.sh does not handle stat's UNKNOWN (no passwd entry for the owning uid), so it would fall back to reading git as the caller"
+# The verb runs as root and derives what it may delete from a tree. That
+# tree is a generation of root's tree, proved against root's bare store
+# beside it (bound 2 in the script), never a checkout an account can edit
+# under root — the defect review a8b752d4 N6 named. So its one git
+# invocation is store_git's: root's store, no account's config, no system
+# config, no hook. A second `git ` call, a `git -C` into a tree, or a
+# store_git that lost its isolation is how a checkout's config or hooks
+# would come back into a root run; and the ownership and write-permission
+# checks on the layout are what make "root's tree" true of a path. All
+# structural here: a second uid cannot be fixtured in the gate, and
+# delete_orphan_object_sh.rs exercises everything else.
+dob_git=$(grep -vE '^\s*#' "$dob" | grep -nE '(^|[^-[:alnum:]_.])git[[:space:]]' || true)
+[ "$(printf '%s\n' "$dob_git" | grep -c .)" = 1 ] \
+    && grep -qF 'git -c core.hooksPath=/dev/null --git-dir="$STORE" --work-tree="$TREE"' <<<"$dob_git" \
+    || fail "delete-orphan-object.sh must call git exactly once, inside store_git, against root's store:
+$dob_git"
+grep -qF 'GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_INDEX_FILE="$TMP/index"' "$dob" \
+    || fail "delete-orphan-object.sh's store_git no longer isolates git from every account's config, the system's, and the store's own index"
+grep -qF 'stat -c %u' "$dob" && grep -qF -- '-perm /0022' "$dob" \
+    || fail "delete-orphan-object.sh no longer checks that root's tree is this uid's and writable by nobody else — another account could rewrite the declaration set under the run"
+grep -qF 'BOSS_OPS_CHECKOUT' <<<"$(grep -vE '^\s*#' "$dob")" \
+    && fail "delete-orphan-object.sh reads BOSS_OPS_CHECKOUT — the checkout its owner can edit is no declaration set for root (backlog 1dde630c)"
 # And the derivation needs none of this, which is only true while it makes
-# no git call and writes nothing under the checkout. Pin both, because the
+# no git call and writes nothing under the tree. Pin both, because the
 # day either changes it acquires the same defect silently.
 der_git=$(grep -vE '^\s*#' "$der" | grep -nE '(^|[^-[:alnum:]_.])git[[:space:]]' || true)
 [ -z "$der_git" ] || fail "undeclared-objects.sh now calls git:
 $der_git
-    It runs as root under the ops-runner against a user-owned checkout, so a
-    git call there needs the same as_owner drop delete-orphan-object.sh uses."
+    It runs as root under the ops-runner against the tree it is handed, and
+    delete-orphan-object.sh has already proved that tree against root's
+    store; a git call of its own would read whatever repository it finds."
 der_writes=$(grep -nE '>[[:space:]]*"?\$(TREE|DIR)' "$der" || true)
 [ -z "$der_writes" ] || fail "undeclared-objects.sh writes under the checkout:
 $der_writes

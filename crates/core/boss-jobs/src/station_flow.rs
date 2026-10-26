@@ -2,6 +2,12 @@
 //! The default packet-membership basis is [`crate::membership_replay`];
 //! eligible Steps and packet crossings are different units.
 //!
+//! ITS ONE READER is `GET /api/stations/flow?basis=step-events`. The IT
+//! map read it too, until item ab09f1af's car 2 (2026-10-20) moved the
+//! marshalling region onto the membership basis: every station of the
+//! shapes below drew `?` there, while the membership reader could count
+//! them. The map's two-window pass over this cube went with it.
+//!
 //! `GET /api/stations/load` already answers depth and the age of the
 //! oldest packet, and its own header says why that is not enough:
 //! *"Depth is close to meaningless without a drain rate — ten role

@@ -573,6 +573,11 @@ fn a_generated_start_line_on_a_home_is_on_the_roster() {
 /// purpose: (script, variable, why root's tree is the right one).
 const WORKS_ON_ROOTS_TREE: &[(&str, &str, &str)] = &[
     (
+        "infra/forge/delete-orphan-object.sh",
+        "TREE",
+        "derives what root may delete from the tree's FILES, so it reads only a generation of root's tree and proves it against root's store; the checkout is a tree its owner can edit under root (backlog 1dde630c)",
+    ),
+    (
         "infra/forge/retire-example-reference-rows.sh",
         "TREE",
         "reads infra/cluster/instances.toml and examples/ as FILES, with no git: root's tree is the converged main itself, which the checkout only approximates",

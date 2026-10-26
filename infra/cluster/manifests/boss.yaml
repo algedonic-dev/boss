@@ -114,7 +114,23 @@ spec:
           # blows past PG's default max_connections=100 and makes services
           # fail-closed mid-startup. 400 is the one setting; the compose
           # file's postgres carries the same.
-          args: ["postgres", "-c", "max_connections=400"]
+          # A rolled-away client must not leave its query running for hours
+          # (bbf242ed). Poll closed sockets during queries every ten seconds;
+          # explicit TCP probes also detect a peer lost without a FIN. These
+          # are disconnect defaults, not an application statement timeout.
+          # Changing these pod arguments rolls this single database instance.
+          args:
+            - postgres
+            - -c
+            - max_connections=400
+            - -c
+            - client_connection_check_interval=10s
+            - -c
+            - tcp_keepalives_idle=60
+            - -c
+            - tcp_keepalives_interval=10
+            - -c
+            - tcp_keepalives_count=3
           env:
             - {name: POSTGRES_USER, value: boss}
             - {name: POSTGRES_DB, value: boss}
@@ -240,15 +256,24 @@ spec:
 # method, route — and served at /api/machine-gate/misses to a caller
 # holding the token. That tally is how enforcement is earned: a window
 # of zero misses, read (operator decision (4) on 2710c8fc). NOTHING IS
-# REFUSED in this mode. `enforce` is row C of decision b08725c2, its
-# own car, after a 72-hour clean window, on a Pacific-hours train;
-# crates/core/boss-testing/tests/the_machine_gate_reports_and_refuses_nothing.rs
-# refuses `enforce` for THIS key anywhere under this directory until
-# then — the policy check's flip below did not carry it.
+# REFUSED in that mode.
 #
-# Rendered per instance, so the playground reports too. It holds no
-# token (the broker writes only boss and boss-dev), so every request it
-# serves is a miss — admitted, and bounded by the tally's key cap.
+# `enforce`, since row C's car (decision b08725c2; backlog 2710c8fc):
+# what `report` tallied is REFUSED 401, naming the header and the mode.
+# A request at a service port that presents no accepted token is no
+# longer believed about who sent it, so an x-boss-user claiming
+# platform-admin from the LAN or the mesh buys nothing. The gateway is
+# not gated (it strips x-boss-user at its edge and stamps the token on
+# what it forwards); OPTIONS and each binary's exact health paths stay
+# exempt. With NO readable token a gate in `enforce` degrades to
+# `report` and says so at error level — it never refuses everything.
+# crates/core/boss-testing/tests/the_machine_gate_reports_and_refuses_nothing.rs
+# holds `enforce` for THIS key to the one line below, and its way back
+# beside it.
+#
+# Rendered per instance. The playground holds no token (the broker
+# writes only boss and boss-dev), so its gates run degraded: admitted,
+# tallied, and said at error level, exactly as before this flip.
 #
 # THE POLICY CHECK'S MODE, the second key (F7 of backlog b8e75382, row
 # D of design b08725c2; boss_policy::check_mode). The same reader, the
@@ -307,7 +332,23 @@ metadata:
   name: boss-machine-gate
   namespace: boss
 data:
-  mode: report
+  # THE MACHINE GATE'S WORD (row C of decision b08725c2; backlog
+  # 2710c8fc). WHAT A MISFIRE COSTS: a caller the window never saw (a
+  # weekly cadence, a host script) is refused 401 at every port it calls
+  # until it stamps the token or this word goes back. THE WAY BACK
+  # passes neither the jobs API nor the forge nor the conductor — David's
+  # admin kubeconfig over the LAN kube road:
+  #   kubectl -n boss patch configmap boss-machine-gate --type merge -p '{"data":{"mode":"report"}}'
+  # Every gate re-reads it within kubelet's refresh plus five seconds,
+  # with no pod roll, and logs "LEFT enforce". The next converge
+  # re-applies this file, so land the revert car (this line back to
+  # `report`, with the pin named above) behind the patch.
+  #
+  # BEFORE THIS LINE DEPARTS, AND AFTER IT LANDS, the window is read by
+  # a machine (design 21946380, decision 4; 26 hours, David 2026-10-17):
+  #   boss-api GET '/api/events/gate-window?gate=machine-gate&hours=26' > window.json
+  #   bash infra/ops/gate-window-is-clean.sh machine-gate 26 < window.json
+  mode: enforce
   policy-check: enforce
   # abf9eeae precursor, classes only. No enforcement or 72h readiness.
   actor-role: report

@@ -215,3 +215,30 @@ fn a_hand_run_with_its_own_units_makes_no_undeclared_claim() {
         "a hand list is not the declaration, so nothing outside it is undeclared: {node}"
     );
 }
+
+/// boss-gcp runs an ops-request runner and deliberately NO waker (backlog
+/// 2eae38d4): its runner starts through the root tree's launcher, which
+/// holds the tree's shared lock for the life of what it starts, and a
+/// waker never exits — so `install-ops-runner.sh` installs none there.
+/// The observer asks the same predicate, so it watches the runner's pair
+/// and not a waker that would read not-found every five minutes.
+#[test]
+fn boss_gcp_watches_its_runner_and_no_waker_it_never_installs() {
+    let host = Host::new("no-waker");
+    let run = host.observe(&[("STUB_LIST", "clean")]);
+    assert_eq!(run.rc, 0, "{}", run.text);
+    let node = host.node();
+    let watched: Vec<&str> = node["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|u| u["unit"].as_str())
+        .collect();
+    for runner in ["boss-ops-runner.timer", "boss-ops-runner.service"] {
+        assert!(watched.contains(&runner), "{runner}: {node}");
+    }
+    assert!(
+        !watched.contains(&"boss-ops-runner-wake.service"),
+        "boss-gcp installs no waker, so it must not watch one: {node}"
+    );
+}

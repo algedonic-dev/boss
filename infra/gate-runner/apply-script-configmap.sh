@@ -32,13 +32,16 @@
 # this by hand is a repair, and --check is its everyday use. SINCE
 # e3100bc8 the ConfigMap holds TWO keys — `bootstrap.sh`, which fetches
 # and execs the run.sh of the sha being gated, and `run.sh`, main's copy
-# it falls back to — and --check compares both. The key set is pinned
-# equal to the converge's by gate_runner_manifests.rs.
+# it falls back to — and --check compares both. SINCE 3e2c8ddc a THIRD,
+# `seed-refresh.sh`: the seed housekeeping both layouts run, and the whole
+# of the judged-init layout's helper container (design b4bf8bba). The key
+# set is pinned equal to the converge's by gate_runner_manifests.rs.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 SCRIPT=infra/gate-runner/run.sh
 BOOTSTRAP=infra/gate-runner/bootstrap.sh
+SEED_REFRESH=infra/gate-runner/seed-refresh.sh
 NAME=gate-runner-script
 
 CHECK=0
@@ -48,13 +51,14 @@ if [ "${1:-}" = "--check" ]; then
 fi
 NAMESPACE="${1:-boss-dev}"
 
-for f in "$SCRIPT" "$BOOTSTRAP"; do
+for f in "$SCRIPT" "$BOOTSTRAP" "$SEED_REFRESH"; do
     [ -f "$f" ] || { echo "apply-script-configmap: $f not found" >&2; exit 1; }
 done
 
 rendered=$(kubectl -n "$NAMESPACE" create configmap "$NAME" \
     --from-file="run.sh=$SCRIPT" \
     --from-file="bootstrap.sh=$BOOTSTRAP" \
+    --from-file="seed-refresh.sh=$SEED_REFRESH" \
     --dry-run=client -o yaml)
 
 if [ "$CHECK" = "1" ]; then
@@ -62,7 +66,7 @@ if [ "$CHECK" = "1" ]; then
     # carries metadata (creationTimestamp, resourceVersion) that differs
     # every time and would report drift on an identical script.
     drift=0
-    for pair in "run.sh=$SCRIPT" "bootstrap.sh=$BOOTSTRAP"; do
+    for pair in "run.sh=$SCRIPT" "bootstrap.sh=$BOOTSTRAP" "seed-refresh.sh=$SEED_REFRESH"; do
         key=${pair%%=*} file=${pair#*=}
         live=$(kubectl -n "$NAMESPACE" get configmap "$NAME" -o jsonpath="{.data.${key//./\\.}}" 2>/dev/null || true)
         if [ -z "$live" ]; then
@@ -90,4 +94,4 @@ if [ "$CHECK" = "1" ]; then
 fi
 
 printf '%s\n' "$rendered" | kubectl apply -f -
-echo "apply-script-configmap: $NAME in $NAMESPACE now matches $SCRIPT and $BOOTSTRAP"
+echo "apply-script-configmap: $NAME in $NAMESPACE now matches $SCRIPT, $BOOTSTRAP and $SEED_REFRESH"

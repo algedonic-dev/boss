@@ -260,6 +260,8 @@ host_seam BOSS_GCP_CONVERGE_SOR_ENV /etc/boss/sor.env
 host_seam BOSS_JOURNALD_CONF_DIR
 host_seam BOSS_JOURNALD_SYSTEMCTL
 host_seam INSTALL_TALOSCTL 1
+# The protected-root branch's record of the generation it last converged.
+[ "$ROOT_MODE" = 0 ] || host_seam BOSS_GCP_CONVERGED_FILE /var/lib/boss/gcp-converged
 if [ -z "${BOSS_GCP_CONVERGE_CLI_INSTALLER:-}" ]; then
     host_seam BOSS_CLI_STORE
     host_seam BOSS_CLI_LINK
@@ -316,7 +318,31 @@ if { [ -z "${BOSS_GCP_CONVERGE_INSTALLER:-}" ] && [ "${INSTALL_ETC:-/etc/systemd
 fi
 else
     REMOTE=protected-root
-    before=$(basename -- "$REPO"); after=$before
+    after=$(basename -- "$REPO")
+    # WHAT THIS HOST LAST CONVERGED, read off its own record (backlog
+    # 4870d6a8). The launcher refreshes `current` BEFORE this script runs,
+    # so the generation it moved from is gone by the time we look, and
+    # until 2026-10-22 this branch said `before=$after` — converge_from
+    # equal to converge_sha on every tick, measured on six live runs while
+    # the generation moved under them. The rule that files publish-drift
+    # (check-publish-drift-on-boss-gcp-converge-moved) keys on the two
+    # differing, so it never fired, and three workflow kinds sat behind
+    # their files until a conductor published them by hand. So the move
+    # is measured against the generation the last OK tick finished on,
+    # written by record_converged below: a tick that fails after a move
+    # leaves the record where it was, and the next ok tick still reports
+    # the move. No record (the first tick after this landed, or a record
+    # that does not read as a sha) is converge_from="", which differs —
+    # one `--check`, a read, rather than a move nobody is told about.
+    CONVERGED_FILE="${BOSS_GCP_CONVERGED_FILE:-/var/lib/boss/gcp-converged}"
+    before=""
+    if [ -e "$CONVERGED_FILE" ]; then
+        read -r before <"$CONVERGED_FILE" || true
+        if ! [[ "$before" =~ ^[0-9a-f]{40,64}$ ]]; then
+            echo "boss-gcp-converge: $CONVERGED_FILE does not hold a sha (${before:0:20}) — reporting the move as from an unknown generation" >&2
+            before=""
+        fi
+    fi
     # Refresh the recovery closure only FROM this authenticated generation.
     BOSS_GCP_PREP_SOURCE="$REPO/infra" bash "$REPO/infra/gcp/adopt-root-tree.sh" bootstrap "$deposit_user"
     bash "$PREP/bootstrap/infra/gcp/prepare-root-tree.sh" units "$after"
@@ -325,6 +351,8 @@ fi
 
 if [ "$before" = "$after" ]; then
     echo "boss-gcp-converge: $REMOTE/main unchanged at ${after:0:8} — converging units anyway"
+elif [ -z "$before" ]; then
+    echo "boss-gcp-converge: no converged generation recorded at $CONVERGED_FILE — converging ${after:0:8} from $REMOTE/main as a move"
 else
     echo "boss-gcp-converge: ${before:0:8} -> ${after:0:8} from $REMOTE/main"
 fi
@@ -463,10 +491,17 @@ fi
 # (infra/gcp/audit-deposit-keys.sh says why each matters).
 #
 # The account is the checkout's owner, which is the account both
-# installers write the sudoers rules for; its files are sshd's default
-# pair. BOSS_GCP_CONVERGE_AUTHORIZED_KEYS names other files, so a test
-# never reads the home of whoever runs it. Every role reads it: a
-# deposit line is a root door whether or not this tick installed one.
+# installers write the sudoers rules for; its files are the ones sshd
+# names for it, read as root from `sshd -T` by the audit's
+# --keys-files-of — not the default pair, which a host whose sshd reads
+# another AuthorizedKeysFile never opens (backlog e85c4dbd) — and a list
+# that cannot be read is UNVERIFIED. The same read prints sshd's
+# AcceptEnv for the account as `--accept-env <patterns>` ahead of the
+# files, so ak_files is handed to the audit whole, as its arguments
+# (backlog 54104a05). BOSS_GCP_CONVERGE_AUTHORIZED_KEYS
+# names other files, so a test never reads the home of whoever runs it.
+# Every role reads it: a deposit line is a root door whether or not this
+# tick installed one.
 #
 # A FINDING IS ALARMED FROM THE PACKET; THE TICK STILL CONVERGES. A
 # finding is the account's file, not this loop's work, so it never reds
@@ -506,27 +541,64 @@ audit_bound="${BOSS_GCP_DEPOSIT_AUDIT_BOUND_S:-60}"
 DEPOSIT_ACCOUNT="${BOSS_GCP_DEPOSIT_USER:-$OWNER}"
 case "$audit_bound" in '' | *[!0-9]*) audit_bound=60 ;; esac
 ak_files=()
+ak_why=""
 if [ -n "${BOSS_GCP_CONVERGE_AUTHORIZED_KEYS:-}" ]; then
     read -r -a ak_files <<< "$BOSS_GCP_CONVERGE_AUTHORIZED_KEYS"
+elif ak_list="$(timeout -k 5 "$audit_bound" bash "${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")/..}/gcp/audit-deposit-keys.sh" --keys-files-of "$DEPOSIT_ACCOUNT")"; then
+    [ -z "$ak_list" ] || mapfile -t ak_files <<< "$ak_list"
 else
-ak_home="$(getent passwd "$DEPOSIT_ACCOUNT" | cut -d: -f6 || true)"
-    [ -z "$ak_home" ] || ak_files=("$ak_home/.ssh/authorized_keys" "$ak_home/.ssh/authorized_keys2")
+    ak_why="$ak_list"
 fi
 alog="$(mktemp -t boss-gcp-converge-keys.XXXXXX)"
 arc=0
+# THE KEYS THE PREPARE PACKETS RECORDED, judged by fingerprint on every
+# line that carries one, whatever its command says (backlog 77920d6a;
+# review 728c6f76 of car 3cd92f7a). Recognised by text alone, a door
+# spelled through the shell — `lib'exec'`, `bo\ss`, `$L`, `libexe?` —
+# with no restrict read clean while sshd granted a pty and forwarding,
+# and the deposit key placed bare with no confined twin read as one of
+# the owner's own logins. prepared-deposit-keys.sh reads each public
+# key off its prepare packet, as root and before the uid drop (it
+# presents the machine token); infra/gcp/prepared-deposit-keys.sh says
+# which packets and why none at all is a refusal.
+#
+# BEFORE THE FILES, every call (backlog 26173f40): the audit reads its
+# options up to the first file, and one placed after a file is read as
+# an absent file, so the set would read clean with the key unjudged.
+#
+# A READ THAT FAILS IS UNVERIFIED, NEVER A TEXT-ONLY CLEAN. The audit
+# still runs over the files without the keys, so a finding it reaches
+# by text still stands; a clean it reaches that way is not a clean, and
+# the packet says UNVERIFIED, naming the read.
+prepared_args=()
+pk_why=""
+pk_rc=0
+pk_list="$(timeout -k 5 "$audit_bound" bash "${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")/..}/gcp/prepared-deposit-keys.sh")" || pk_rc=$?
+if [ "$pk_rc" -eq 0 ]; then
+    while IFS= read -r pk; do
+        [ -z "$pk" ] || prepared_args+=(--prepared-key "$pk")
+    done <<< "$pk_list"
+fi
+if [ "${#prepared_args[@]}" -eq 0 ]; then
+    case "$pk_list" in
+        "deposit-key-audit: UNVERIFIED"*) pk_why="${pk_list%%$'\n'*}" ;;
+        *) pk_why="deposit-key-audit: UNVERIFIED — the prepared deposit keys could not be read (status $pk_rc), so a line carrying one is judged by its text alone" ;;
+    esac
+    echo "  deposit keys: $pk_why"
+fi
 audit_script="${BOSS_GCP_CONVERGE_INFRA:-$(dirname "$0")/..}/gcp/audit-deposit-keys.sh"
 if [ "${#ak_files[@]}" -eq 0 ]; then
-    echo "deposit-key-audit: UNVERIFIED — the home of $OWNER, the deposit account, could not be read" >"$alog"
+    echo "${ak_why:-deposit-key-audit: UNVERIFIED — the files sshd reads the keys of $DEPOSIT_ACCOUNT from could not be named}" >"$alog"
     arc=2
 elif [ "$(id -un)" = "$DEPOSIT_ACCOUNT" ]; then
-    timeout -k 5 "$audit_bound" bash -s -- "${ak_files[@]}" >"$alog" 2>&1 < "$audit_script" || arc=$?
+    timeout -k 5 "$audit_bound" bash -s -- "${prepared_args[@]}" "${ak_files[@]}" >"$alog" 2>&1 < "$audit_script" || arc=$?
 else
     # The accepted generation is root-only (4d7465d2). Root opens its
     # immutable code before dropping uid; the account still reads its own
     # key files, and neither the generation nor root's read authority is
     # handed to it. The inner timeout still owns the descendant session.
     timeout -k 5 "$((audit_bound + 10))" runuser -u "$DEPOSIT_ACCOUNT" -- \
-        timeout -k 5 "$audit_bound" bash -s -- "${ak_files[@]}" >"$alog" 2>&1 < "$audit_script" || arc=$?
+        timeout -k 5 "$audit_bound" bash -s -- "${prepared_args[@]}" "${ak_files[@]}" >"$alog" 2>&1 < "$audit_script" || arc=$?
 fi
 sed 's/^/  deposit keys: /' "$alog"
 averdict="$(tail -n 1 "$alog")"
@@ -535,16 +607,28 @@ averdict="$(tail -n 1 "$alog")"
 # finding with someone else's last line on it.
 case "$arc:$averdict" in
     "0:deposit-key-audit: clean"*)
-        run_summary_field deposit_key_audit "$averdict"
-        run_summary_field deposit_key_verdict clean
+        if [ -n "$pk_why" ]; then
+            run_summary_field deposit_key_audit "UNVERIFIED: $pk_why; over the files without them the audit read: $averdict"
+            run_summary_field deposit_key_verdict unverified
+        else
+            run_summary_field deposit_key_audit "$averdict"
+            run_summary_field deposit_key_verdict clean
+        fi
         ;;
     "1:deposit-key-audit: "[0-9]*" finding(s) in"*)
         run_summary_field deposit_key_audit "UNCONFINED: $averdict"
         run_summary_field deposit_key_verdict unconfined
         areds=""
+        # A finding is a line the audit OPENS with its finding mark, never
+        # one that merely says the word: its verdict line ends "each
+        # UNCONFINED line above names the line to act on", and read as a
+        # finding it carried one more RED line than there were findings,
+        # naming no key, which the chore judge keys on its whole text and
+        # re-filed each time the count or the file list in it changed
+        # (backlog 54104a05).
         while IFS= read -r aline; do
             case "$aline" in
-                *" UNCONFINED "*)
+                "deposit-key-audit: UNCONFINED "*)
                     run_summary_note "$aline"
                     areds+="${areds:+$'\n'}RED boss-gcp-converge/deposit-key-unconfined refused: $(printf '%s' "$aline" | cut -c1-600)"
                     ;;
@@ -632,7 +716,24 @@ finish() { # <exit status the CLI step would have had>
         echo "boss-gcp-converge: exiting $jrc — the journal cap failed earlier this tick" >&2
         exit "$jrc"
     fi
+    [ "$1" -ne 0 ] || record_converged
     exit "$1"
+}
+# THE GENERATION THIS TICK CONVERGED, for the next tick's converge_from
+# (backlog 4870d6a8; read near the top of the protected-root branch).
+# Only on the way out of an OK tick, so the record is what the packet's
+# result=ok vouched for. A record that cannot be written is said, not
+# fatal: the next ok tick reports this move again, which costs one more
+# publish-drift --check (a read), never a publish.
+record_converged() {
+    [ "$ROOT_MODE" = 1 ] || return 0
+    local tmpf="$CONVERGED_FILE.$$"
+    if printf '%s\n' "$after" >"$tmpf" 2>/dev/null && mv -f -- "$tmpf" "$CONVERGED_FILE"; then
+        return 0
+    fi
+    rm -f -- "$tmpf"
+    echo "boss-gcp-converge: could not record ${after:0:8} as converged at $CONVERGED_FILE — the next ok tick reports this move again" >&2
+    run_summary_note "converged generation not recorded at $CONVERGED_FILE — the next ok tick reports the move from ${before:-an unknown generation} again"
 }
 
 # THE CLI, FROM THE IMAGE AT THE SHA JUST CONVERGED TO. After the units

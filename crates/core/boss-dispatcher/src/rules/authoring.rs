@@ -29,6 +29,13 @@
 //! What `Rule::from_raw` does NOT check: handler NAMES. Those pass through
 //! as opaque strings and resolve at dispatch, where an unknown one is a
 //! loud `DispatchError::UnknownHandler` rather than a silent no-op.
+//!
+//! What [`validate`] checks that `Rule::from_raw` does not: a `delay`.
+//! The runtime stores one and never acts on it, so the validator refuses
+//! every rule declaring one (backlog 84a010cb) rather than publish a
+//! timing claim the dispatcher would break on the first matching event —
+//! a malformed or unsupported one with its reason (`delayed.rs`), a
+//! supported one as not executed yet.
 
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -147,6 +154,27 @@ pub fn validate(raw: &RawRule) -> Result<(), RegistryError> {
         return Err(RegistryError::NotAFamilyMember {
             rule: raw.name.clone(),
             family: RULE_FAMILY.to_string(),
+        });
+    }
+    // Fail closed on timing nothing executes (backlog 84a010cb): the
+    // matcher drops `delay` and the runner fires at once, so any
+    // spelling — well-formed or not — is refused here, the one validator
+    // every write edge and `boss tenant check` share, until design
+    // f1d66249's durable delayed admission exists to keep the claim.
+    // A declaration that contract would refuse anyway is named for
+    // what is wrong with it (car 1 of its finish line, delayed.rs);
+    // only a supported one is refused as not executed yet.
+    if let Some(delay) = &raw.delay {
+        if let Err(reason) = super::delayed::DelayedDeclaration::from_raw(raw) {
+            return Err(RegistryError::MalformedDelay {
+                rule: raw.name.clone(),
+                delay: delay.clone(),
+                reason,
+            });
+        }
+        return Err(RegistryError::UnsupportedDelay {
+            rule: raw.name.clone(),
+            delay: delay.clone(),
         });
     }
     Rule::from_raw(raw.clone()).map(|_| ())
@@ -536,6 +564,114 @@ mod tests {
              fails, the check landed and this test should be replaced by its \
              positive form"
         );
+    }
+
+    /// A `delay` is a timing claim nothing executes (backlog 84a010cb):
+    /// `Rule` stores it, `match_event` builds a `MatchedRule` without it,
+    /// and the runner dispatches the handlers on the triggering event —
+    /// so a "seven days after an unanswered inquiry" rule fired at once.
+    /// The decided contract (design f1d66249) is a durable
+    /// `delayed-admission` packet, not built yet, and says any car before
+    /// it fails CLOSED for unsupported timing. So every spelling is
+    /// refused at the one validator the draft, the dry run, the publish,
+    /// the boot seed and `boss tenant check` share — a well-formed
+    /// duration and a malformed one alike, because neither would run.
+    /// The rule shape is the packet's own measured example: the dry run
+    /// answered ok for an inquiry rule carrying `delay = "7d"`.
+    ///
+    /// Car 1 of the finish line (typed declaration, `delayed.rs`) splits
+    /// the refusal in two, both fail-closed: a declaration the contract
+    /// SUPPORTS is refused as not executed yet (`UnsupportedDelay`), and
+    /// one it never will — malformed, zero, periodic — is refused with
+    /// its own reason (`MalformedDelay`), so the author is not told to
+    /// wait for a car that will still refuse the rule.
+    #[test]
+    fn a_declared_delay_is_refused_because_nothing_executes_it() {
+        let inquiry = |delay: &str| {
+            let mut event = version(
+                "follow-up-an-unanswered-inquiry",
+                Some("jobs.job.opened"),
+                "jobs.spawn",
+            );
+            event.delay = Some(delay.into());
+            event
+        };
+        let names_it = |err: &RegistryError, delay: &str| {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("follow-up-an-unanswered-inquiry"),
+                "names the rule: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("{delay:?}")),
+                "names the delay: {msg}"
+            );
+            assert!(msg.contains("84a010cb"), "names where it is tracked: {msg}");
+        };
+        for delay in ["7d", "604800s", "168h", "5m"] {
+            let err = validate(&inquiry(delay).to_raw()).expect_err("a delay must be refused");
+            assert!(
+                matches!(err, RegistryError::UnsupportedDelay { .. }),
+                "well-formed {delay:?} refused as not executed yet: {err}"
+            );
+            names_it(&err, delay);
+        }
+        for delay in ["0", "", "seven days", "0d", "-7d", "1.5d"] {
+            let err = validate(&inquiry(delay).to_raw()).expect_err("a delay must be refused");
+            assert!(
+                matches!(err, RegistryError::MalformedDelay { .. }),
+                "malformed {delay:?} refused with its reason: {err}"
+            );
+            names_it(&err, delay);
+        }
+        for delay in ["7d", "0", "seven days"] {
+            let mut scheduled = version("nightly", None, "jobs.spawn");
+            scheduled.schedule = Some(RawSchedule {
+                cadence: Cadence::parse("daily").unwrap(),
+                anchor_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                business_calendar: None,
+            });
+            scheduled.delay = Some(delay.into());
+            assert!(
+                matches!(
+                    validate(&scheduled.to_raw()),
+                    Err(RegistryError::MalformedDelay {
+                        reason: crate::rules::delayed::DelayRefusal::Periodic,
+                        ..
+                    })
+                ),
+                "a periodic rule with {delay:?} is refused as periodic"
+            );
+        }
+        // Several effects, or an effect other than jobs.spawn, on a
+        // well-formed delay: refused for the shape, not the timing.
+        let mut two = inquiry("7d");
+        two.do_steps.push(two.do_steps[0].clone());
+        assert!(matches!(
+            validate(&two.to_raw()),
+            Err(RegistryError::MalformedDelay {
+                reason: crate::rules::delayed::DelayRefusal::EffectCount { count: 2 },
+                ..
+            })
+        ));
+        let mut other = inquiry("7d");
+        other.do_steps[0].handler = "assign_step".into();
+        assert!(matches!(
+            validate(&other.to_raw()),
+            Err(RegistryError::MalformedDelay {
+                reason: crate::rules::delayed::DelayRefusal::UnsupportedHandler { .. },
+                ..
+            })
+        ));
+
+        // Positive control: the same rule with no delay is an ordinary
+        // immediate rule and still validates.
+        let immediate = version(
+            "follow-up-an-unanswered-inquiry",
+            Some("jobs.job.opened"),
+            "jobs.spawn",
+        );
+        assert!(validate(&immediate.to_raw()).is_ok());
     }
 
     /// Neither trigger set is the XOR violation `from_raw` exists to

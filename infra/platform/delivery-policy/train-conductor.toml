@@ -98,6 +98,25 @@
 # (a_gate_requests_what_the_new_layout_uses_and_the_bays_fit) only
 # gets easier: 4 x 40 + 154 = 314 of 789 GiB.
 #
+# Version 10 (backlog e1943ef0, 2026-10-19): gate_queue_owner legacy ->
+# resident, bumped from the LIVE newest (v9, read off
+# /api/delivery/policy/train-conductor at 2026-10-19 04:5xZ; versions/10
+# answered null). Under legacy a queued gate's place in line lived in the
+# `boss gate --wait` process that heartbeat it: a builder cut off by a
+# tool call's ten-minute limit, or killed with its session, lost the
+# place, and that packet records the hand recoveries one by one
+# (observed_queue_recurrence_*, queue_recurrence_*). Resident makes every
+# `boss gate`, with or without --wait, an immutable submission the
+# conductor's supervisor launches in acceptance order; --wait is a pure
+# reader that any process can re-attach (`boss gate <gate-run> --wait`).
+# What was measured before the flip: the one earlier durable submission
+# (0e7a03d7, 2026-10-16) died of two defects since fixed, its submitter
+# recorded under a login alias (bb81467a) and its FULL Job refused for
+# the empty GATE_MODE the server drops (0c77e4db; live full gates
+# 3328a09f and e1269dde bind since); the end-to-end check is
+# a_killed_bare_waiter_keeps_its_place_and_a_new_reader_gets_the_verdict
+# in boss-cli. Every other column is v9's.
+#
 # The compiled fallback in delivery_policy.rs is held equal to this
 # file by `the_bundle_equals_the_compiled_fallback` (boss-cli): the
 # conductor runs on these numbers whether or not the registry answers,
@@ -108,7 +127,7 @@
 
 [[delivery_policy]]
 name = "train-conductor"
-version = 9
+version = 10
 status = "active"
 # THE HOLD: red trains a car may be released from before boarding
 # leaves it behind until a human looks.
@@ -133,8 +152,11 @@ ci_host_floor_gb = 40
 # number the CLI obeys and the number the yard draws as slots. Three
 # since v7, until the untrimmed gate drive is fixed and four is
 # measured under load (see the header).
-gate_queue_owner = 'legacy'
 gate_max_concurrent = 3
+# WHO HOLDS A QUEUED GATE'S PLACE: `resident` since v10 — the gate-run
+# packet, launched by the conductor's supervisor — not the waiter
+# process (`legacy`). See the v10 note in the header.
+gate_queue_owner = 'resident'
 
 # Version 8: one frozen plan selects image need and completion evidence in CI,
 # deploy and the conductor. Review and publishing authority remain independent

@@ -1545,6 +1545,116 @@ fn a_template_with_no_literal_label_declares_nothing() {
     assert_eq!(rc, 3, "{all}");
 }
 
+/// Where the gate's bay claims are made, relative to the tree root — the
+/// file the derivation reads their label and name shape out of.
+const BAY_SOURCE: &str = "crates/orchestrators/boss-cli/src/gate/reservation/bay.rs";
+
+/// A case whose tree holds the gate template and the REAL bay.rs, copied
+/// in: the derivation must read the claim's label and name off the code
+/// that makes them, so renaming either constant there either keeps
+/// declaring the claims or refuses — it never answers with the claims
+/// silently undeclared.
+fn bay_case(name: &str) -> Case {
+    let c = Case::new(name, &[]);
+    std::fs::write(
+        c.tree.join("infra/gate-runner/gate-runner.yaml"),
+        format!("{}\n", gate_template()),
+    )
+    .unwrap();
+    c
+}
+
+fn install_bay_source(tree: &Path, body: &str) {
+    let dest = tree.join(BAY_SOURCE);
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::write(dest, body).unwrap();
+}
+
+/// THE BAY CLAIMS ARE DECLARED BY THE CODE THAT MAKES THEM (backlog
+/// 7b3b1263). Car ac8d3157 made a bay a NAMED suspended Job,
+/// `gate-bay-<i>`, created by whichever launcher takes it and never
+/// deleted, with no manifest row and no ownerReference. From 2026-10-18
+/// every dev-pod pre-flight read red on `a-deleted-manifest-leaves-no-object`
+/// alone — "3 live object(s) that no manifest declares: Job/gate-bay-0,
+/// Job/gate-bay-1, Job/gate-bay-2 (ns boss-dev)" — three builders in forty
+/// minutes, each judging the check by hand.
+///
+/// The claims live beside the gate Jobs (the gate template's namespace)
+/// and carry bay.rs's `CLAIM_APP` label and `CLAIM_PREFIX`<index> name, so
+/// a live Job with both is the tree's. A Job copying only the label is
+/// still a finding: the code makes no claim of any other name.
+#[test]
+fn the_gate_bay_claims_are_declared_by_the_code_that_makes_them() {
+    let c = bay_case("gate-bay-claims");
+    for i in 0..3 {
+        c.add_live_labelled(
+            "Job",
+            "boss-dev",
+            &format!("gate-bay-{i}"),
+            &format!("app=gate-bay-claim,boss.dev/packet=p-{i}"),
+        );
+    }
+    c.add_live_labelled("Job", "boss-dev", "gate-bay-spare", "app=gate-bay-claim");
+    c.add_live("Job", "boss-dev", "seed-dir-probe-2", "");
+
+    // The control, on the same fixture: a tree without the reservation
+    // code is the tree before ac8d3157, and the claims are the packet's
+    // three findings.
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    for i in 0..3 {
+        assert!(
+            stdout.contains(&format!("Job\tboss-dev\tgate-bay-{i}\n")),
+            "the control must reproduce the packet's finding:\n{all}"
+        );
+    }
+
+    std::fs::copy(repo_root().join(BAY_SOURCE), {
+        let dest = c.tree.join(BAY_SOURCE);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        dest
+    })
+    .unwrap();
+    let (rc, stdout, all) = c.run(&["--list"]);
+    assert_eq!(rc, 0, "{all}");
+    assert_eq!(
+        stdout, "Job\tboss-dev\tgate-bay-spare\nJob\tboss-dev\tseed-dir-probe-2\n",
+        "the bay claims are the reservation code's; a label without the bay name is not:\n{all}"
+    );
+
+    let (rc, _, all) = c.run(&["--check", "Job/boss-dev/gate-bay-1"]);
+    assert_eq!(rc, 3, "a bay claim is declared: {all}");
+    names_all(
+        &all,
+        &[BAY_SOURCE, "app=gate-bay-claim"],
+        "the refusal names the code that makes the claim and its label",
+    );
+    let (rc, stdout, all) = c.run(&["--check", "Job/boss-dev/gate-bay-spare"]);
+    assert_eq!(rc, 0, "a copied label alone declares nothing: {all}");
+    assert_eq!(stdout.trim(), "undeclared\tJob\tboss-dev\tgate-bay-spare");
+}
+
+/// A reservation source whose claim label cannot be read is NOT a tree
+/// without claims: the live bays would read as undeclared and, at the far
+/// end of `delete-orphan-object`, deletable — a gate's bay taken out from
+/// under it. So it is CANNOT ANSWER, naming the file, like a renderer
+/// whose RENDERS line cannot be read.
+#[test]
+fn a_bay_source_whose_claim_cannot_be_read_is_cannot_answer() {
+    let c = bay_case("gate-bay-unreadable");
+    c.add_live_labelled("Job", "boss-dev", "gate-bay-0", "app=gate-bay-claim");
+    install_bay_source(
+        &c.tree,
+        "pub(crate) const CLAIM_APP: &str = concat!(\"gate-\", \"bay-claim\");\npub(crate) const CLAIM_PREFIX: &str = \"gate-bay-\";\n",
+    );
+    for args in [&["--list"][..], &["--check", "Job/boss-dev/gate-bay-0"][..]] {
+        let (rc, stdout, all) = c.run(args);
+        assert_eq!(rc, CANNOT_ANSWER, "{args:?}: {all}");
+        assert_eq!(stdout, "", "{args:?}: a refusal leaves no answer: {all}");
+        names_all(&all, &[BAY_SOURCE, "CLAIM_APP"], "the refusal");
+    }
+}
+
 #[test]
 fn check_still_says_not_live_for_an_object_that_is_absent() {
     let c = Case::new("absent", &[]);

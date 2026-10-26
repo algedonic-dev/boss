@@ -55,7 +55,9 @@ pub(crate) const KEY_RUN: &str = "train_gate_run";
 /// for a bay from it (`regions::train_gate_wait_since`, 19227ca8).
 pub(crate) const KEY_LAUNCHED_AT: &str = boss_jobs::regions::TRAIN_GATE_LAUNCHED_AT;
 pub(crate) const KEY_RELAUNCHES: &str = "train_gate_relaunches";
-pub(crate) const KEY_REFUSALS: &str = "train_gate_refusals";
+/// ONE spelling, in boss-jobs: a relaunch's wait is dated from the
+/// latest refusal's `at` (`regions::train_gate_wait_since`, a2ace778).
+pub(crate) const KEY_REFUSALS: &str = boss_jobs::regions::TRAIN_GATE_REFUSALS;
 pub(crate) const KEY_LAUNCH_FAILURES: &str = "train_gate_launch_failures";
 /// ONE spelling, in boss-jobs, because the yard's regions read judges a
 /// train troubled by it (design 0524fc95).
@@ -72,11 +74,27 @@ pub(crate) const KEY_WAIT_REASON: &str = boss_jobs::regions::TRAIN_GATE_WAIT_REA
 /// any other reason. Its own key because the wait reason above carries
 /// every launch fault, and a fault is no claim on a bay (backlog
 /// 82071657); `gate::trains_waiting` counts it only while the conductor
-/// is alive to honour it.
-pub(crate) const KEY_BOUND_WAIT: &str = "train_gate_bound_wait";
+/// is alive to honour it. ONE spelling, in boss-jobs: the yard's regions
+/// read settles a train's wait for a bay by this key and no other
+/// (`regions::train_gate_unfiled`, review a2ace778).
+pub(crate) const KEY_BOUND_WAIT: &str = boss_jobs::regions::TRAIN_GATE_BOUND_WAIT;
 
-/// Launch attempts the conductor makes (one per reconcile pass, a minute
-/// apart) before a gate it cannot file is read as unavailable.
+/// Consecutive reconcile passes an UNJUDGED train's PR read has failed —
+/// cleared by the first read that answers. `train_gate` runs only after
+/// that read, so a PR the forge no longer answers for left the train's
+/// place standing until the stall rule (backlog 6af0c269); the count is
+/// what lets a flake keep the place and a dead read give it up.
+pub(crate) const KEY_PR_READ_FAILURES: &str = "train_pr_read_failures";
+
+/// Failed PR reads in a row after which an unjudged train gives up its
+/// place in the gate line. One pass is two minutes (train-reconcile's
+/// `every_minutes = 2`), so three take about four to six, and the LAN
+/// resolver stalls for seconds every few minutes, so one failure is a
+/// flake.
+pub(crate) const MAX_PR_READ_FAILURES: u32 = 3;
+
+/// Launch attempts the conductor makes (one per reconcile pass, two
+/// minutes apart) before a gate it cannot file is read as unavailable.
 pub(crate) const MAX_LAUNCH_FAILURES: u32 = 3;
 
 /// Whether a train may merge on CI alone when its gate cannot be filed
@@ -124,6 +142,16 @@ pub(crate) fn standing(gate_run: &Value) -> Standing {
             .and_then(Value::as_str)
             .unwrap_or(NO_REASON)
             .to_string();
+        return Standing::Refused(why);
+    }
+    // NO EVIDENCE IS NOT A RED (backlog 06c452f2). run.sh records
+    // `failed` over an `unreadable` receipt when gate.sh left none — an
+    // empty consist refused before any check, a runner that died first.
+    // Nothing about the consist was judged, so it takes the refusal's
+    // path (wait, file again, aborted unstruck once the relaunches are
+    // spent) and never the red path that strikes every car aboard, as
+    // gate-run df02648a's train did on 2026-10-18.
+    if let Some(why) = receipt.as_ref().and_then(unreadable_because) {
         return Standing::Refused(why);
     }
     match md.and_then(|m| m.get("verdict")).and_then(Value::as_str) {
@@ -215,6 +243,75 @@ pub(crate) fn fails_excerpt(gate_run: &Value) -> Vec<(String, String)> {
         .flatten()
         .filter_map(|(check, text)| text.as_str().map(|t| (check.clone(), t.to_string())))
         .collect()
+}
+
+/// PURE: why a gate-run judged NOTHING about the tree — its receipt's own
+/// sentence — or `None` for a receipt that judged it (a green, a red that
+/// names its `fails`) or no receipt yet. Gate-run df02648a (2026-10-18)
+/// refused an empty diff before any check ran; run.sh wrote no
+/// receipt.json, so the recorded receipt read `verdict: unreadable` with
+/// the reason in `error` and no `fails`, and its train's red alert said
+/// "check names unavailable" (backlog 81408a81). No evidence is not a
+/// pass, and it is not a named failure either: this is what the alert
+/// says instead.
+pub(crate) fn no_verdict(gate_run: &Value) -> Option<String> {
+    let r = receipt(gate_run)?;
+    let said = |key: &str| {
+        r.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let fails = r
+        .get("fails")
+        .and_then(Value::as_array)
+        .is_some_and(|f| !f.is_empty());
+    match r.get("verdict").and_then(Value::as_str) {
+        Some("refused") => Some(format!(
+            "the gate refused: {}",
+            said("refused_because")
+                .or_else(|| said("error"))
+                .unwrap_or("it names no reason")
+        )),
+        Some("unreadable") => unreadable_because(&r),
+        Some("green") => None,
+        _ if fails => None,
+        _ => said("error").map(|e| format!("the gate's receipt names no failing check: {e}")),
+    }
+}
+
+/// PURE: the sentence a receipt run.sh wrote as `verdict: unreadable`
+/// carries — its `error`, or that it names none — and `None` for any
+/// other receipt. One spelling for `standing`'s refusal and the alert's
+/// `no_verdict`, so the two cannot describe the same run differently.
+fn unreadable_because(r: &Value) -> Option<String> {
+    if r.get("verdict").and_then(Value::as_str) != Some("unreadable") {
+        return None;
+    }
+    let error = r
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("it names no error");
+    Some(format!("the gate's receipt is unreadable: {error}"))
+}
+
+/// PURE: was this gate-run a red the conductor STRUCK cars on before
+/// backlog 06c452f2 — its step's own word `failed` over an unreadable
+/// receipt? `standing` reads that shape as a refusal now, so it strikes
+/// no one; `boss release` still has to accept it as the red a strike
+/// already on a car was laid for, since those are the strikes most owed
+/// a release.
+pub(crate) fn unreadable_red(gate_run: &Value) -> bool {
+    verdict_metadata(gate_run)
+        .and_then(|m| m.get("verdict"))
+        .and_then(Value::as_str)
+        == Some("failed")
+        && receipt(gate_run)
+            .as_ref()
+            .and_then(unreadable_because)
+            .is_some()
 }
 
 /// PURE: the train's verdict from CI's (`green|pending|failing|aborted`,
@@ -339,6 +436,48 @@ pub(crate) fn launch_failure_line(why: &str, failures: u32, required: bool) -> S
     format!("train gate not filed this pass ({why}) — {count}; {next}")
 }
 
+/// PURE: what one PR read leaves on an UNJUDGED train (backlog
+/// 6af0c269). `failed` is the read's error, `None` when it answered.
+/// An answer forgets any failed reads before it. A failure counts only
+/// while the train holds a place in the gate line — nothing else here
+/// is owed to a builder — and the `MAX_PR_READ_FAILURES`th in a row gives
+/// the place up and says why in the wait reason, so the train reads
+/// troubled rather than waiting at the bound. Empty when nothing
+/// changes: past the bound, or with no place, a failed read writes
+/// nothing, and a dead PR is not an audit event per pass.
+pub(crate) fn pr_read_writes(train: &Value, failed: Option<&str>) -> Vec<(&'static str, Value)> {
+    let md = |k: &str| {
+        train
+            .pointer(&format!("/metadata/{k}"))
+            .filter(|v| !v.is_null())
+    };
+    let Some(why) = failed else {
+        return match md(KEY_PR_READ_FAILURES) {
+            Some(_) => vec![(KEY_PR_READ_FAILURES, Value::Null)],
+            None => vec![],
+        };
+    };
+    if md(KEY_BOUND_WAIT).is_none() {
+        return vec![];
+    }
+    let failures = md(KEY_PR_READ_FAILURES)
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32
+        + 1;
+    let mut kv = vec![(KEY_PR_READ_FAILURES, json!(failures))];
+    if failures >= MAX_PR_READ_FAILURES {
+        kv.push((KEY_BOUND_WAIT, Value::Null));
+        kv.push((
+            KEY_WAIT_REASON,
+            json!(format!(
+                "the train's PR could not be read {failures} passes running ({why}); \
+                 it gives up its place in the gate line until a read answers"
+            )),
+        ));
+    }
+    kv
+}
+
 /// The one line the conductor logs and stamps when it reads the gate.
 pub(crate) fn describe(gate: Option<&Standing>, relaunches: u32) -> String {
     match gate {
@@ -385,9 +524,87 @@ pub(crate) fn describe(gate: Option<&Standing>, relaunches: u32) -> String {
     }
 }
 
+/// The receipt train gate-run df02648a-1875-4e4c-92f8-401ba8e6433b
+/// recorded on 2026-10-18 (train b0e4ba33, an empty consist), verbatim
+/// from its `record-verdict` step, whose own word was `failed`. Shared
+/// with `strike_release`'s tests, which must still clear a strike the
+/// conductor laid on exactly this before backlog 06c452f2.
+#[cfg(test)]
+pub(crate) const DF02648A_RECEIPT: &str = r#"{"clone":{"fetches":1,"s":3},"error":"[Errno 2] No such file or directory: '/gate-target/receipt.json'","head":"bc2d73129624866bd40a6e2615447e5ea916b3f4","recorded_by":{"bytes":1280,"carrier":"pod-log","copied_from":"the receipt frame in the pod log of Job gate-df02648a18754e4c92f8401ba8e6433b that its gate container's termination message names","ended":"Error","ended_at":"2026-10-18T23:00:36Z","exit_code":1,"head_matches_launch":true,"job":"gate-df02648a18754e4c92f8401ba8e6433b","job_uid":"6d55f918-55d3-4d50-b576-c66d00255119","launched_sha":"bc2d73129624866bd40a6e2615447e5ea916b3f4","observed_at":"2026-10-18T23:02:54Z","recorder":"boss train cadence (conductor reconcile)","sha256":"05e8531d2bd531d5c9c4d46f7c84f40db3454b95aead58e56062daaeeca97493"},"runner_sha256":"72725806d13de70981eae939355033da606f9a2d6f4b6c18394ac0656adb9af7","runner_source":"configmap","runtime_evidence":{"collection_errors":["runner ended before source collector was available"],"state":"unavailable"},"seed_order":{"clone_oldest_source":"2026-10-18T22:56:51.152+00:00","margin_s":1610.416,"order":"clone-newer","seed_newest_artifact":"2026-10-18T22:30:00.736+00:00"},"timeline":{"ended_at":"2026-10-18T22:59:19.423Z","method":"date -u at each phase boundary of infra/gate-runner/run.sh, to the millisecond; a phase's s runs to the next mark","phases":[{"at":"2026-10-18T22:52:14.180Z","phase":"prepare","s":0.031},{"at":"2026-10-18T22:52:14.211Z","outcome":"seeded","phase":"seed-copy","s":273.978,"seed_head":"e831cc3958121094047390631d8eb686a652c8c0"},{"at":"2026-10-18T22:56:48.189Z","phase":"tree","s":3.463},{"at":"2026-10-18T22:56:51.652Z","phase":"seed-order","s":59.847},{"at":"2026-10-18T22:57:51.499Z","phase":"environment","s":18.427},{"at":"2026-10-18T22:58:09.926Z","phase":"checks","s":69.497}],"runner_started_at":"2026-10-18T22:52:14.180Z","setup_s":355.746},"verdict":"unreadable"}"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backlog 6af0c269: a failed PR read is counted only against a
+    /// place a builder is owed — a train bound to a run, or waiting on a
+    /// fault, holds none, and its failed reads write nothing.
+    #[test]
+    fn a_failed_pr_read_without_a_place_writes_nothing() {
+        let bound_to_a_run = json!({"metadata": {KEY_RUN: "g1"}});
+        assert!(pr_read_writes(&bound_to_a_run, Some("HTTP 404")).is_empty());
+        let faulted = json!({"metadata": {KEY_WAIT_REASON: "kubectl missing"}});
+        assert!(pr_read_writes(&faulted, Some("HTTP 404")).is_empty());
+        // Control: the same read against a place is counted.
+        let placed = json!({"metadata": {KEY_BOUND_WAIT: "at the bound"}});
+        assert_eq!(
+            pr_read_writes(&placed, Some("HTTP 404")),
+            vec![(KEY_PR_READ_FAILURES, json!(1))]
+        );
+        // And an answer with nothing counted writes nothing either.
+        assert!(pr_read_writes(&placed, None).is_empty());
+    }
+
+    /// NO EVIDENCE STRIKES NO CAR (backlog 06c452f2). Gate-run df02648a
+    /// recorded `failed` over a receipt that said `unreadable`: run.sh
+    /// found no receipt.json, so nothing about the consist was judged.
+    /// Read as Failed it made the train `failing`, and the red path
+    /// struck every car aboard — two strikes hold a car until a human
+    /// looks, the 2026-08-22 shape. It is a refusal: the train waits, the
+    /// gate is filed again, and when the relaunches are spent the train
+    /// reads aborted with its cars released unstruck.
+    #[test]
+    fn an_unreadable_receipt_is_a_refusal_and_strikes_no_car() {
+        let mut g = run(Some("failed"), None);
+        g["steps"][1]["metadata"]["receipt"] = json!(DF02648A_RECEIPT);
+        let s = standing(&g);
+        assert_eq!(
+            s,
+            Standing::Refused(
+                "the gate's receipt is unreadable: [Errno 2] No such file or directory: \
+                 '/gate-target/receipt.json'"
+                    .into()
+            )
+        );
+        assert!(wants_relaunch(&s, 0));
+        for ci in ["green", "pending"] {
+            let v = combined_verdict(ci, Some(&s), 0, true);
+            assert_eq!(v, "pending", "ci {ci}");
+            assert!(!crate::train::verdict_strikes_cars(v, None), "ci {ci}");
+        }
+        let spent = combined_verdict("green", Some(&s), MAX_RELAUNCHES, true);
+        assert_eq!(spent, "aborted");
+        assert!(!crate::train::verdict_strikes_cars(spent, None));
+        // Silence is a refusal too, never a red: an unreadable receipt
+        // that names no error still judged nothing.
+        let mut bare = run(Some("failed"), None);
+        bare["steps"][1]["metadata"]["receipt"] = json!(r#"{"verdict":"unreadable"}"#);
+        assert_eq!(
+            standing(&bare),
+            Standing::Refused("the gate's receipt is unreadable: it names no error".into())
+        );
+        // The control: a receipt that judged the tree and named its
+        // failure is still a red, and still strikes.
+        let red = run(
+            Some("failed"),
+            Some(json!({"verdict": "failed", "fails": ["test: x - FAILED"]})),
+        );
+        assert_eq!(standing(&red), Standing::Failed);
+        assert!(crate::train::verdict_strikes_cars(
+            combined_verdict("green", Some(&standing(&red)), 0, true),
+            None
+        ));
+    }
 
     /// TRAIN #361, 2026-09-14 17:10Z (backlog 6f18390b). The ci step was
     /// judged `failing` at 17:00 — CI green, gate RED — and ten minutes
@@ -711,5 +928,55 @@ mod tests {
         assert!(d.contains("no disk") && d.contains("1 of 3"), "{d}");
         let d = describe(Some(&Standing::Lost), MAX_RELAUNCHES);
         assert!(d.contains("aborted"), "{d}");
+    }
+
+    /// A RECEIPT THAT JUDGED NOTHING SAYS WHY (backlog 81408a81). Train
+    /// gate-run df02648a (2026-10-18): the gate refused an empty diff
+    /// before any check ran, run.sh wrote no receipt.json, and the
+    /// recorder's receipt read `verdict: unreadable` with the reason in
+    /// `error` — and no `fails`. The red alert reads only `fails`, so it
+    /// titled itself "CI failed: check names unavailable" while CI was
+    /// green. This is the receipt's own sentence, verbatim from that run.
+    #[test]
+    fn a_receipt_that_judged_nothing_names_its_error() {
+        let unreadable = run(
+            Some("failed"),
+            Some(json!({"verdict": "unreadable",
+                "error": "[Errno 2] No such file or directory: '/gate-target/receipt.json'",
+                "head": "bc2d73129624866bd40a6e2615447e5ea916b3f4"})),
+        );
+        assert_eq!(
+            no_verdict(&unreadable).as_deref(),
+            Some(
+                "the gate's receipt is unreadable: [Errno 2] No such file or directory: \
+                 '/gate-target/receipt.json'"
+            )
+        );
+        let refused = run(
+            Some("refused"),
+            Some(json!({"verdict": "refused", "refused_because": "disk floor: 61GB free"})),
+        );
+        assert_eq!(
+            no_verdict(&refused).as_deref(),
+            Some("the gate refused: disk floor: 61GB free")
+        );
+        // Silence is refused like failure: an unreadable receipt with no
+        // error still says it judged nothing.
+        assert_eq!(
+            no_verdict(&run(Some("failed"), Some(json!({"verdict": "unreadable"})))).as_deref(),
+            Some("the gate's receipt is unreadable: it names no error")
+        );
+        // A receipt that judged the tree is not this: a red with fails, a
+        // green, a run with no receipt yet.
+        let red = run(
+            Some("failed"),
+            Some(json!({"verdict": "failed", "fails": ["test: x - FAILED"]})),
+        );
+        assert_eq!(no_verdict(&red), None);
+        assert_eq!(
+            no_verdict(&run(Some("green"), Some(json!({"verdict": "green"})))),
+            None
+        );
+        assert_eq!(no_verdict(&run(None, None)), None);
     }
 }

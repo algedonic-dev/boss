@@ -644,7 +644,7 @@ esac
 units_held_now="" gcp_runner_line="" summary_unread=""
 if [ -n "${BOSS_RUN_SUMMARY_FILE:-}" ] && [ -s "$BOSS_RUN_SUMMARY_FILE" ]; then
     units_held_now="$(jq -r '.units_held // empty' "$BOSS_RUN_SUMMARY_FILE" 2>/dev/null | tr '\n' ' ')" || summary_unread=1
-    gcp_runner_line="$(jq -r '(.runner_credential_boss_gcp // "") | split("\n")[0] // "" | .[0:600]' "$BOSS_RUN_SUMMARY_FILE" 2>/dev/null)" || summary_unread=1
+    gcp_runner_line="$(jq -r '(.runner_credential_boss_gcp // "") | split("\n")[0] // ""' "$BOSS_RUN_SUMMARY_FILE" 2>/dev/null)" || summary_unread=1
 fi
 if [ -n "$summary_unread" ]; then
     echo "forge-converge: this run's summary at $BOSS_RUN_SUMMARY_FILE could not be read for units_held or runner_credential_boss_gcp — no RED line is left for either this tick" >&2
@@ -657,8 +657,15 @@ fi
 # refuses, a receiver its converge never replaced. Each stands until a
 # person acts, and it reached only `runner_credential_boss_gcp`, which the
 # judge does not read. The sender already prints it in the judge's shape,
-# on its own route (`RED runner-credential-send/<kind> refused: …`), so
-# its line is copied whole; a `not yet` is not one.
+# on its own route (`RED runner-credential-send/<kind> refused: …`), and
+# so does the push for its own standing failures — a missing pin, an
+# unreadable or lost deposit key, a refused enrollment
+# (`RED runner-credential-push/<route> <kind>: …`, backlog 3f7d5f23) — so
+# its line is copied whole; a `not yet` or a `failed:` is not one. WHOLE:
+# it was cut at 600 characters, and the key-unconfined line runs 738-797,
+# so the filed item lost the forced command to place and "No credential
+# byte was sent." (3f7d5f23, (e)). The sender bounds every part of the
+# line it did not write itself.
 case "$gcp_runner_line" in
     "RED "*)
         reds="${reds:+$reds

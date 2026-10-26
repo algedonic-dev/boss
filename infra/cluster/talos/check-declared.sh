@@ -71,7 +71,21 @@
 #         class this check reads or outside EXTRA_CONFIG_KEYS, each
 #         printed as UNREAD, or a user volume whose diskSelector is not in
 #         the allowlist grammar (SELECTOR_TERM), printed as REFUSED;
+#       4 (--absent only) no declared entry is ABSENT live, so there is
+#         no narrowed patch; stdout is empty;
 #      78 python3 is not on this box.
+#
+# --absent <node> [live] (backlog 9cf1673d, built for 67e98635): the same
+# comparison, and instead of verdict lines it prints the DECLARATION
+# NARROWED to the entries that read ABSENT live — a declaration of its
+# own, re-emitted in canonical form from the DECLARED values (never a
+# live one), exit 0 — or nothing, exit 4. Talos's merge appends list
+# entries it cannot key, so a declaration whose list entries are live
+# cannot be re-applied whole (w-1: its seed file entry, mount, mirror and
+# gate volume are live); node-converge applies this narrowed patch
+# instead. A DRIFT or DOUBLED entry is not absent and is not printed: the
+# caller decides what a drift under an appending patch means. Read lines
+# and the UNVERIFIED warning go to stderr, so stdout is the patch alone.
 #
 # PARSING. The gate image and this pod carry python3 and no PyYAML
 # (infra/forge/boss-ci/required-tools.txt lists python3 alone), so the
@@ -93,6 +107,7 @@ set -u
 usage() {
     echo "usage: $0 <node> [live-machineconfig.yaml]   (stdin when no file)" >&2
     echo "       $0 --only-read-classes <node>          (the declaration alone; no live input)" >&2
+    echo "       $0 --absent <node> [live.yaml]         (print the declaration narrowed to its entries ABSENT live)" >&2
     echo "  declarations: \${BOSS_TALOS_PATCHES:-<beside this script>/patches}/<node>.yaml" >&2
     exit 2
 }
@@ -112,6 +127,10 @@ if [ "${1:-}" = "--only-read-classes" ]; then
     mode=classes
     shift
     [ $# -eq 1 ] || usage
+elif [ "${1:-}" = "--absent" ]; then
+    mode=absent
+    shift
+    [ $# -eq 1 ] || [ $# -eq 2 ] || usage
 fi
 
 node="${1:-}"
@@ -642,11 +661,22 @@ def norm(v):
 
 
 findings = []  # (verdict, text)
+# Every declared entry that reads ABSENT, as (path, key, declared value):
+# path the class's key path, key the list's key value or the map's key
+# (None for a whole user-volume document). --absent prints these.
+absent = []
 
 
 def say(verdict, text):
     findings.append((verdict, text))
-    print(f"{verdict:<10} {text}")
+    if mode != "absent":
+        print(f"{verdict:<10} {text}")
+
+
+def note(text):
+    """A line that is not a verdict: stdout when comparing, stderr under
+    --absent, whose stdout is the narrowed patch and nothing else."""
+    print(text, file=sys.stderr if mode == "absent" else sys.stdout)
 
 
 def keyed_list(cfg, path, key):
@@ -677,6 +707,7 @@ def compare_list(name, dec, live, key, undeclared_when):
         label = f"{name}[{k}]"
         if not copies:
             say("ABSENT", f"{label}  declared, not live: {show(d)}")
+            absent.append((name, k, d))
             continue
         if len(copies) > 1:
             say("DOUBLED", f"{label}  live has {len(copies)} copies of a declared entry (declared once)")
@@ -700,6 +731,7 @@ def compare_map(name, dec, live, undeclared_when):
         label = f"{name}.{k}" if not isinstance(d, dict) else f"{name}[{k}]"
         if k not in live_map:
             say("ABSENT", f"{label}  declared, not live: {show(d)}")
+            absent.append((name, k, d))
         elif norm(live_map[k]) != norm(d):
             say("DRIFT", f"{label}  declared {show(d)}  live {show(live_map[k])}")
         else:
@@ -724,6 +756,7 @@ def compare_user_volumes(dec_docs, live_docs):
         copies = [it for kk, it in live_items if kk == k]
         if not copies:
             say("ABSENT", f"{label}  declared, not live: {show(d)}")
+            absent.append((None, None, d))
             continue
         if len(copies) > 1:
             say("DOUBLED", f"{label}  live has {len(copies)} copies of a declared document (declared once)")
@@ -905,7 +938,7 @@ hostname = get(live, "machine", "network", "hostname")
 if hostname is not None and str(hostname) != node:
     print(f"check-declared: the live config says hostname {hostname!r}; asked to check {node!r} — refusing to compare another node's config", file=sys.stderr)
     sys.exit(2)
-print(f"read       machineconfig id={rid or '(raw)'} ({len(configs)} config document(s) in input; hostname {hostname or '(unset)'}) against {declared_path}")
+note(f"read       machineconfig id={rid or '(raw)'} ({len(configs)} config document(s) in input; hostname {hostname or '(unset)'}) against {declared_path}")
 # THE NODE IS UNVERIFIED without a hostname (review a79746c6, finding 7).
 # The stored config (`talosctl read /system/state/config.yaml`) carries
 # no `node:` field, and a declaration names neither address nor machine
@@ -916,7 +949,7 @@ print(f"read       machineconfig id={rid or '(raw)'} ({len(configs)} config docu
 # than letting a wrong node's MATCH read as this one's.
 unverified = hostname is None
 if unverified:
-    print(f"UNVERIFIED the live config names no machine.network.hostname — nothing here proves it is {node}'s; confirm the -n address before trusting any verdict below")
+    note(f"UNVERIFIED the live config names no machine.network.hostname — nothing here proves it is {node}'s; confirm the -n address before trusting any verdict below")
 
 try:
     compare_list(FILES, dec, live, "path", lambda p: p.startswith("/var/local/"))
@@ -931,6 +964,44 @@ except Unsupported as e:
 counts = {v: 0 for v in ("MATCH", "DRIFT", "ABSENT", "DOUBLED", "UNDECLARED")}
 for v, _ in findings:
     counts[v] += 1
+
+if mode == "absent":
+    # The narrowed patch: each ABSENT entry under its own class path, in
+    # the order the comparison met them, a list entry as one item of its
+    # list, a map entry as its key, a user volume as its own document.
+    # Built from the DECLARED value `d`, never a live one, and emitted by
+    # the one canonical writer above, so the patch is itself a canonical
+    # declaration node-converge can judge and read back like any other.
+    if not absent:
+        print(f"check-declared: {node}: no declared entry is ABSENT live ({counts['MATCH']} match, {counts['DRIFT']} drift, {counts['DOUBLED']} doubled) — there is no narrowed patch", file=sys.stderr)
+        sys.exit(4)
+    frag = {}
+    volumes = []
+    for path, key, d in absent:
+        if path is None:
+            volumes.append(d)
+            continue
+        *parents, leaf = path.split(".")
+        at = frag
+        for p in parents:
+            at = at.setdefault(p, {})
+        if path in (FILES, MOUNTS):
+            at.setdefault(leaf, []).append(d)
+        else:
+            at.setdefault(leaf, {})[key] = d
+    out = []
+    try:
+        if frag:
+            _emit_map(frag, 0, out)
+        for v in volumes:
+            if out:
+                out.append("---")
+            _emit_map(v, 0, out)
+    except NotCanonical as e:
+        print(f"check-declared: {node}: the narrowed patch has no canonical form — {e}", file=sys.stderr)
+        sys.exit(2)
+    print("\n".join(out))
+    sys.exit(0)
 hard = counts["DRIFT"] + counts["ABSENT"] + counts["DOUBLED"]
 verdict = "every declared entry matches" if hard == 0 else f"{hard} finding(s) against the declaration"
 if unverified:

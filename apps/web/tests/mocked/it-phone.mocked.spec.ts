@@ -165,7 +165,7 @@ test('on a phone the world is a strip: one row per region in flow order, under t
   const strip = page.locator('section.strip');
   await expect(strip.locator('.strip-row')).toHaveCount(REGIONS.regions.length);
   // The SVG world is not drawn at all — not shrunk, not hidden.
-  await expect(page.locator('section.yard svg')).toHaveCount(0);
+  await expect(page.locator('section.transit svg[role="group"]')).toHaveCount(0);
 
   const thirds = strip.locator('.strip-third');
   expect(await thirds.evaluateAll((els) => els.map((el) => el.getAttribute('data-third')))).toEqual(
@@ -234,7 +234,7 @@ test('at desktop width the world is the SVG, and no strip is drawn', async ({ pa
   await page.setViewportSize({ width: 1440, height: 900 });
   await mocks(page);
   await page.goto('/it');
-  await expect(page.locator('section.yard svg')).toHaveCount(1);
+  await expect(page.locator('section.transit svg[role="group"]')).toHaveCount(1);
   await expect(page.locator('section.strip')).toHaveCount(0);
   // The sidebar still stands beside the page.
   const sidebar = (await page.locator('.shell-sidebar').boundingBox())!;

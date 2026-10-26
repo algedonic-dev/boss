@@ -1,0 +1,15 @@
+{
+  "about": "MUTATING — publishes an instance's tenant main into its live registries through the machine door (`boss tenant publish . --door <SoR> [--take <registries>]`, signed as the seed identity), the act David ran by hand on 2026-09-25 (departments) and 2026-09-26 (classes); backlog 1610115d, filed from the 2026-10-18 command-line-gap inventory (David 2026-10-18: manually running any ops command is a BOSS coverage gap). Authorised per run by David's passkey over the rendered plan, in the shape of design 17835005 (decided by David 2026-09-21): it declares requires_approval and names plan-a-tenant-publish as its plan_verb, so the runner renders the plan (same instance, same take) onto the request's approve step and hands the script sha256 of the SIGNED plan as plan_sha256. The script re-renders the plan — tenant main's sha and tree, the CLI build, the check, the dry-run AND the live registries read back through `boss tenant export`, row by row with each file's live digest — and refuses unless the bytes still hash to the approved plan, so a tenant main that moved or a live row edited since the approval publishes nothing. Bounded by construction (infra/forge/publish-tenant.sh): the repo and ref are the instance's own from infra/cluster/instances.toml, never a parameter; the door is BOSS_JOBS_URL from /etc/boss/sor.env, with no fallback, and an instance outside the system of record's namespace is refused; the take names are judged by the CLI's own parser, and a take of a registry the export does not read (departments, today) is refused because the plan could not show what it overwrites; nothing is deleted (every door is insert-if-absent unless taken). Its read-back is a second export through the door after the publish: the effect line names the declared rows that converged on the tree, those that still differ and how many of those a take did not converge, and a row that was the tree's before the publish and is not after is FAILED. Not this verb: committing the export back into the tenant repo (the next car of 1610115d).",
+  "hosts": ["forge"],
+  "requires_approval": true,
+  "plan_verb": "plan-a-tenant-publish",
+  "approvers": ["emp-david"],
+  "argv": ["infra/forge/publish-tenant.sh", "{1}", "{2}", "{3}"],
+  "params": [
+    { "name": "instance", "pattern": "^[a-z][a-z0-9-]{0,30}$" },
+    { "name": "take", "pattern": "^[a-z]+(,[a-z]+){0,15}$" },
+    { "name": "plan_sha256", "pattern": "^[0-9a-f]{64}$" }
+  ],
+  "timeout": 600,
+  "effect": "^publish-tenant: .+ published into .+ — read back through the door: [0-9]+ declared row\\(s\\) converged on the tree"
+}

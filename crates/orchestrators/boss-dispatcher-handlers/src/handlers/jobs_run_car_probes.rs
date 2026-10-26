@@ -228,13 +228,12 @@ fn ship_refusal(car_id: &str, probe: &str, expect: Option<&str>) -> Option<Value
         (
             boss_jobs::probe::GATE_LOG_ALONE_RULE,
             format!(
-                "THE PROBE WAS NOT RUN: it clears a caller by counting `{kind}` facts in the \
-                 machine gate's log and never reads the live tally's `snapshot.rows`, so a \
-                 caller the running process had already tallied passes whatever it sent. \
-                 {evidence}",
+                "THE PROBE WAS NOT RUN: it {heading} — {reading}. {evidence}",
+                heading = boss_jobs::probe::gate_log_alone_heading(kind).to_lowercase(),
+                reading = boss_jobs::probe::gate_log_alone_reading(kind),
                 evidence = boss_jobs::probe::GATE_LOG_ALONE_EVIDENCE,
             ),
-            "a probe that also reads the live rows (the jq above)".to_string(),
+            "a probe that also reads the live rows with their coverage (the jq above)".to_string(),
         )
     } else {
         let token = boss_jobs::probe::reads_git_time_with_an_offset(probe)?;
@@ -296,11 +295,22 @@ fn ship_refusal(car_id: &str, probe: &str, expect: Option<&str>) -> Option<Value
 /// `proven` was skipped by the landing, so neither scope above can
 /// reach them: the owed proof is an obligation keyed to its event, and
 /// this is the obligation firing.
+///
+/// `Declared`: the close marker again, asking after every OPEN landed car
+/// whose probe ran and said not-yet (a `proof_attempt`, `proven` still
+/// open) and that declared THIS close as the event it waits on (backlog
+/// 9e9db2ea, rule `rerun-waiting-probes-on-their-declared-close`). The
+/// owed obligation, before the car closes: measured 2026-10-19, 6 of the
+/// 50 newest proven cars were proven 24 to 315 minutes after arrival
+/// because only the hourly `Failing` firing would ask again — four of
+/// them waiting for a gate-run to close after the converge. `Failing`
+/// stays as the safety net for a car that declares nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Scope<'a> {
     Train(&'a str),
     Failing,
     Owed(&'a Value),
+    Declared(&'a Value),
 }
 
 impl Scope<'_> {
@@ -314,12 +324,20 @@ impl Scope<'_> {
                     && car::owes_proof(m)
                     && car::wait_event(m).is_some_and(|e| e.fired_by(closed))
             }
+            Scope::Declared(closed) => {
+                let m = car.get("metadata").unwrap_or(&Value::Null);
+                !closes_a_probe_request(closed)
+                    && m.get("proof_attempt").is_some()
+                    && car::wait_event(m).is_some_and(|e| e.fired_by(closed))
+            }
         }
     }
     fn train_of(&self, car: &Value) -> String {
         match self {
             Scope::Train(t) => t.to_string(),
-            Scope::Failing | Scope::Owed(_) => md(car, "train").unwrap_or("").to_string(),
+            Scope::Failing | Scope::Owed(_) | Scope::Declared(_) => {
+                md(car, "train").unwrap_or("").to_string()
+            }
         }
     }
     /// Is the car's `proven` step one this scope may ask about? Open for
@@ -335,7 +353,9 @@ impl Scope<'_> {
     /// The packet whose close fired an owed run, for the request's reader.
     fn event_packet(&self) -> Option<&str> {
         match self {
-            Scope::Owed(closed) => closed.get("id").and_then(Value::as_str),
+            Scope::Owed(closed) | Scope::Declared(closed) => {
+                closed.get("id").and_then(Value::as_str)
+            }
             _ => None,
         }
     }
@@ -474,9 +494,10 @@ impl Handler for JobsRunCarProbes {
         let scope = match boss_dispatcher::rules::handler::arg_string(args, "scope") {
             Ok("failing") => Scope::Failing,
             Ok("owed") => Scope::Owed(&ctx.event_payload),
+            Ok("declared") => Scope::Declared(&ctx.event_payload),
             Ok(other) => {
                 return Err(HandlerError::Permanent(format!(
-                    "jobs.run-car-probes: scope must be \"failing\" or \"owed\" (or absent for the arrival rule), not {other:?}"
+                    "jobs.run-car-probes: scope must be \"failing\", \"owed\" or \"declared\" (or absent for the arrival rule), not {other:?}"
                 )));
             }
             Err(HandlerError::MissingArg(_)) => match arrived_train(&ctx.event_payload) {
@@ -502,6 +523,28 @@ impl Handler for JobsRunCarProbes {
                 )
                 .await?
             }
+            // A waiting car is OPEN and carries a declared wait: the same
+            // one indexed read per close, narrowed to the open cars that
+            // declare one (1 on 2026-10-19). When none of them declared
+            // THIS close, the firing ends before it reads the request
+            // board — almost every close.
+            Scope::Declared(closed) if closes_a_probe_request(closed) => return Ok(()),
+            Scope::Declared(_) => {
+                let cars = jobs_where(
+                    &self.client,
+                    self.base(),
+                    &format!(
+                        "kind=ship-a-change&status=open&metadata_has={}",
+                        car::WAITS_ON
+                    ),
+                    &ctx.rule_name,
+                )
+                .await?;
+                if !cars.iter().any(|c| scope.admits(c)) {
+                    return Ok(());
+                }
+                cars
+            }
             _ => self.all_open("ship-a-change", &ctx.rule_name).await?,
         };
         let open_requests = self.all_open("ops-request", &ctx.rule_name).await?;
@@ -518,24 +561,39 @@ impl Handler for JobsRunCarProbes {
         // the car, beside the attempts the forge runner writes — a
         // refusal only a journal knows about is indistinguishable from
         // a rule that never ran (CLAUDE.md §Diagnosis).
+        //
+        // EVERY WRITE IN THIS FIRING IS ATTEMPTED, THEN THE FAILURES ARE
+        // NAMED TOGETHER (backlog 8b76fab9, the shape a2aff635 gave the
+        // re-sends below). A `?` in either of these loops let the first
+        // car whose write failed — a 5xx, a rollout gap, a 422 on one
+        // malformed car — end the firing: every car after it went
+        // unwritten and the hourly re-send never ran.
+        let mut failed: Vec<(String, HandlerError)> = Vec::new();
         for (car_id, attempt) in &arrival.refusals {
-            write_json(
+            if let Err(e) = write_json(
                 &self.client,
                 reqwest::Method::PATCH,
                 &format!("{}/api/jobs/{car_id}/metadata", self.base()),
                 &json!({"proof_attempt": attempt}),
                 &ctx.rule_name,
             )
-            .await?;
+            .await
+            {
+                failed.push((format!("refusal on car {car_id}"), e));
+            }
         }
         for body in &arrival.requests {
-            post_json(
+            if let Err(e) = post_json(
                 &self.client,
                 &format!("{}/api/jobs", self.base()),
                 body,
                 &ctx.rule_name,
             )
-            .await?;
+            .await
+            {
+                let car_id = body.pointer("/metadata/car").and_then(Value::as_str);
+                failed.push((format!("request for car {}", car_id.unwrap_or("?")), e));
+            }
         }
         // AN ANSWERED REQUEST LEFT OPEN IS SETTLED, NOT JUST STEPPED
         // AROUND (backlog 17bf6f3e). Ignoring it above lets its car be
@@ -549,20 +607,56 @@ impl Handler for JobsRunCarProbes {
         // retries and then dead-letters under its rule's name — a
         // request that cannot close is loud here, never a quiet hold on
         // its car.
+        //
+        // EVERY RE-SEND IS ATTEMPTED, THEN THE FAILURES ARE NAMED
+        // TOGETHER (backlog a2aff635, landed-review fc7b75f6 finding 2).
+        // A `?` inside this loop let the first request that cannot settle
+        // — its pinned version will not resolve (500), it sits outside
+        // the dispatcher's scope (404) — end the firing, so it
+        // dead-lettered hourly AND every answered-but-open request after
+        // it was never re-sent at all: one stuck packet held the rest.
         if matches!(scope, Scope::Failing) {
             for (request, execute) in unsettled_requests(&open_requests) {
-                write_json(
+                if let Err(e) = write_json(
                     &self.client,
                     reqwest::Method::PUT,
                     &format!("{}/api/jobs/{request}/steps/{execute}", self.base()),
                     &json!({"status": "completed"}),
                     &ctx.rule_name,
                 )
-                .await?;
+                .await
+                {
+                    failed.push((format!("re-send of request {request}"), e));
+                }
             }
         }
-        Ok(())
+        resend_verdict(failed)
     }
+}
+
+/// PURE: the firing's verdict over the writes that failed — refusals,
+/// requests and re-sends alike — `Ok` when none did, else ONE error
+/// naming each and why. Permanent only when every failure is: a
+/// retryable one among them earns the firing its redelivery. A
+/// redelivery repeats the writes that succeeded: a refusal PATCH merges
+/// the same key, a re-send to a completed step writes nothing, and a
+/// filed request reads as already asked on the next pass.
+fn resend_verdict(failed: Vec<(String, HandlerError)>) -> Result<(), HandlerError> {
+    if failed.is_empty() {
+        return Ok(());
+    }
+    let permanent = failed.iter().all(|(_, e)| e.is_permanent());
+    let named = failed
+        .iter()
+        .map(|(what, e)| format!("{what}: {e}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let why = format!("{} write(s) could not be made: {named}", failed.len());
+    Err(if permanent {
+        HandlerError::Permanent(why)
+    } else {
+        HandlerError::Downstream(why)
+    })
 }
 
 #[cfg(test)]
@@ -872,6 +966,15 @@ mod tests {
                        | select((.at | sub(\"\\\\.[0-9]+Z$\"; \"Z\") | fromdate) > ($s + 1800))] \
                        | length')\n\
                        [ \"$n\" -eq 0 ] || { echo \"FAILED: $n tokenless reads\"; exit 1; }";
+        // The live rows with NO log read and no start of the tally read
+        // (backlog 002f5f31): a tally a train restarted after the cut
+        // clears the caller just the same, and it used to meet no rule.
+        let live_only = "live=$(boss-sor-read \"/api/events/gate-window?gate=machine-gate&hours=$hours\" \
+                         | jq -r --arg from \"$jf\" '[.live[] | select(.snapshot.mode != \"off\" and \
+                         .snapshot.overflow == 0) | .snapshot.rows[] | select(.user == \
+                         \"automation:gate-runner\" and .presented == \"none\" and .last_seen > \
+                         $from)] | length')\n\
+                         [ \"$live\" -eq 0 ] && echo cleared";
         let cars = [
             car(
                 "log-only",
@@ -891,6 +994,12 @@ mod tests {
                 json!({"proof_probe": no_kind, "proof_expect": "cleared"}),
                 "ready",
             ),
+            car(
+                "live-only",
+                "t1",
+                json!({"proof_probe": live_only, "proof_expect": "cleared"}),
+                "ready",
+            ),
         ];
         let got = probe_requests(Scope::Train("t1"), &cars, &[], "r", "ev", "jobs.job.closed");
         let shipped: Vec<&str> = got
@@ -904,14 +1013,24 @@ mod tests {
             "only the probe that also reads the live tally may reach the forge"
         );
         let refused: Vec<&str> = got.refusals.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(refused, vec!["log-only", "no-kind"]);
+        assert_eq!(refused, vec!["log-only", "no-kind", "live-only"]);
         for (id, attempt) in &got.refusals {
             assert_eq!(attempt["refused"], boss_jobs::probe::GATE_LOG_ALONE_RULE);
             assert_eq!(attempt["unrunnable"], false);
             let why = attempt["why"].as_str().unwrap_or_default();
+            // What was read is named as it was read: the fact kind for a
+            // log count, the live rows for a live-only reading — and both
+            // name the coverage the rows needed (002f5f31 item 2).
+            let read = if id == "live-only" {
+                boss_jobs::probe::LIVE_ROWS_ALONE
+            } else {
+                "machine_gate.would_refuse"
+            };
             assert!(
-                why.contains("machine_gate.would_refuse") && why.contains("snapshot.rows"),
-                "the attempt must name the fact kind and the live rows to read: {attempt}"
+                why.contains(read)
+                    && why.contains("snapshot.rows")
+                    && why.contains("`recording_since` compared with the cut"),
+                "the attempt must name what was read and the live rows to read whole: {attempt}"
             );
             // N3 of review 4ce5ca85: every car this door sees has LANDED,
             // so "re-park" names an act nobody can take. The refusal
@@ -1067,6 +1186,100 @@ mod tests {
         assert_eq!(got.requests.len(), 2);
     }
 
+    /// A LANDED, OPEN car whose probe ran and said not-yet, declaring the
+    /// close it waits on (backlog 9e9db2ea): `proven` still ready, a
+    /// `proof_attempt` on the car, and a `waits_on.event`.
+    fn waiting_car(id: &str, event: Value) -> Value {
+        let mut m = probed();
+        m["proof_attempt"] = json!({"exit": "75", "stdout": "not yet: no gate closed since"});
+        m[car::WAITS_ON] = json!({"on": "a full gate closing after the converge",
+                                  "seen": "true", car::WAITS_ON_EVENT: event});
+        car(id, "t1", m, "ready")
+    }
+
+    /// THE DECLARED CLOSE RE-RUNS A WAITING PROBE (backlog 9e9db2ea).
+    /// Measured 2026-10-19 over the 50 newest proven cars: 6 were proven
+    /// 24 to 315 minutes after their train arrived, every one on a probe
+    /// that said not-yet at arrival and waited for the hourly recheck —
+    /// four of them for a gate-run to close after the converge. The close
+    /// the car declared fires its probe again at once; the request names
+    /// the packet whose close fired it and is neither a recheck nor owed.
+    #[test]
+    fn the_declared_close_reruns_a_landed_cars_waiting_probe() {
+        let cars = [waiting_car("w1", json!({"closes": "gate-run"}))];
+        let event = closed("g7", "gate-run", "gate main@abc123", "main");
+        let got = probe_requests(
+            Scope::Declared(&event),
+            &cars,
+            &[],
+            "rerun-waiting-probes-on-their-declared-close",
+            "ev",
+            "jobs.job.closed",
+        );
+        assert_eq!(got.requests.len(), 1, "{got:?}");
+        let md = &got.requests[0]["metadata"];
+        assert_eq!(md["car"], "w1");
+        assert_eq!(md["train"], "t1");
+        assert_eq!(md["event_packet"], "g7");
+        assert_eq!(md["recheck"], false);
+        assert_eq!(md["owed"], false);
+    }
+
+    /// Everything the declared scope must leave alone: a close that is
+    /// not the declared one; a car whose probe never ran (not landed, or
+    /// its train has not arrived — the arrival rule runs it first); a car
+    /// already proven; a car that declares no machine event; a car with a
+    /// request already open; and the close of one of OUR requests, which
+    /// would loop a car keyed to ops-request closes on its own answer.
+    #[test]
+    fn the_declared_scope_asks_only_a_waiting_car_on_its_own_event() {
+        let gate = json!({"closes": "gate-run"});
+        let mut never_ran = waiting_car("never-ran", gate.clone());
+        never_ran["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("proof_attempt");
+        let mut proven = waiting_car("proven", gate.clone());
+        proven["steps"][0]["status"] = json!("completed");
+        // `proven` not yet reached: the declared scope asks only a car
+        // whose `proven` is ready or active. Without this row, loosening
+        // it to the owed scope's "anything but completed" survived
+        // mutation (backlog 7838df7d, review 4890fdfd N5).
+        let mut pending = waiting_car("pending", gate.clone());
+        pending["steps"][0]["status"] = json!("pending");
+        let mut undeclared = waiting_car("undeclared", gate.clone());
+        undeclared["metadata"][car::WAITS_ON]
+            .as_object_mut()
+            .unwrap()
+            .remove(car::WAITS_ON_EVENT);
+        let cars = [
+            waiting_car("w1", gate.clone()),
+            never_ran,
+            proven,
+            pending,
+            undeclared,
+            waiting_car("asked", gate),
+        ];
+        let open = [request("r1", VERB, "asked", "ready")];
+        let fire = |e: &Value| {
+            probe_requests(Scope::Declared(e), &cars, &open, "r", "ev", "t")
+                .requests
+                .iter()
+                .map(|r| r["metadata"]["car"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fire(&closed("g1", "gate-run", "gate", "main")), vec!["w1"]);
+        assert!(fire(&closed("p1", "pr-train", "train", "main")).is_empty());
+        let ops = [waiting_car("o", json!({"closes": "ops-request"}))];
+        let own = closed("p2", "ops-request", &format!("{REQUEST_TITLE}Car o"), "o");
+        assert!(
+            probe_requests(Scope::Declared(&own), &ops, &[], "r", "ev", "t")
+                .requests
+                .is_empty(),
+            "a probe request's close must not re-run a waiting probe"
+        );
+    }
+
     /// The request's title is built from the one prefix the loop guard
     /// reads, so the two cannot drift apart (CLAUDE.md §9a).
     #[test]
@@ -1155,5 +1368,275 @@ mod tests {
                 ("r2".to_string(), "r2-execute".to_string()),
             ]
         );
+    }
+
+    /// BACKLOG a2aff635 (landed-review fc7b75f6, finding 2). The hourly
+    /// re-send stopped at the first request that could not settle, so
+    /// one packet whose pinned version will not resolve (500) or that
+    /// sits outside the dispatcher's scope (404) dead-lettered every
+    /// firing AND kept every answered request after it open. Three
+    /// answered requests against a stub board: the first and third
+    /// refuse, the middle one settles. Every re-send is attempted, and
+    /// the one error names both refusals and not the request that
+    /// settled.
+    #[tokio::test]
+    async fn one_request_that_cannot_settle_does_not_stop_the_re_sends_after_it() {
+        use axum::Router;
+        use axum::http::{Method, StatusCode, Uri};
+        use axum::response::IntoResponse;
+        use std::sync::Mutex;
+
+        let board = Arc::new(json!({
+            "data": [
+                request("r1", VERB, "c1", "completed"),
+                request("r2", VERB, "c2", "completed"),
+                request("r3", "disk-report", "", "completed"),
+            ],
+            "total": 3,
+        }));
+        let puts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let (b, p) = (board.clone(), puts.clone());
+        let app = Router::new().fallback(move |method: Method, uri: Uri| {
+            let (board, puts) = (b.clone(), p.clone());
+            async move {
+                let query = uri.query().unwrap_or("");
+                if method == Method::GET && uri.path() == "/api/jobs" {
+                    return if query.contains("kind=ops-request") {
+                        axum::Json((*board).clone()).into_response()
+                    } else {
+                        axum::Json(json!({"data": [], "total": 0})).into_response()
+                    };
+                }
+                if method == Method::PUT {
+                    let path = uri.path().to_string();
+                    puts.lock().unwrap().push(path.clone());
+                    return match path.as_str() {
+                        "/api/jobs/r1/steps/r1-execute" => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "pinned version v3 not found",
+                        )
+                            .into_response(),
+                        "/api/jobs/r3/steps/r3-execute" => {
+                            (StatusCode::NOT_FOUND, "not in scope").into_response()
+                        }
+                        _ => axum::Json(json!({})).into_response(),
+                    };
+                }
+                StatusCode::NOT_FOUND.into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let handler = JobsRunCarProbes::new(format!("http://{addr}"));
+        let args = [(
+            "scope".to_string(),
+            boss_dispatcher::rules::expr::Value::String("failing".into()),
+        )];
+        let ctx = InvocationContext {
+            rule_name: "recheck-failing-probes-hourly".into(),
+            triggering_event_id: "ev".into(),
+            triggering_topic: "clock.tick".into(),
+            event_payload: json!({}),
+            event_timestamp: None,
+        };
+        let err = handler
+            .invoke(&args, &ctx)
+            .await
+            .expect_err("two re-sends refused, so the firing fails");
+
+        assert_eq!(
+            *puts.lock().unwrap(),
+            vec![
+                "/api/jobs/r1/steps/r1-execute",
+                "/api/jobs/r2/steps/r2-execute",
+                "/api/jobs/r3/steps/r3-execute",
+            ],
+            "every answered request is re-sent, the ones after a refusal included"
+        );
+        let said = err.to_string();
+        assert!(
+            said.contains("r1") && said.contains("r3") && !said.contains("r2"),
+            "the one error names each request that failed, and only those: {said}"
+        );
+        assert!(
+            !err.is_permanent(),
+            "a 500 among the failures keeps the firing retryable: {said}"
+        );
+    }
+
+    /// A stub board for the write loops: GET answers `cars` for the
+    /// ship-a-change walk and `requests` for the ops-request walk; every
+    /// write is recorded as `"<METHOD> <car or path>"` (a POST by the car
+    /// its body names), and a write whose record is in `refuse` answers
+    /// 500. Returns the base URL and the record.
+    async fn write_board(
+        cars: Vec<Value>,
+        requests: Vec<Value>,
+        refuse: &'static [&'static str],
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::Router;
+        use axum::http::{Method, StatusCode, Uri};
+        use axum::response::IntoResponse;
+        use std::sync::Mutex;
+
+        let (cars, requests) = (Arc::new(cars), Arc::new(requests));
+        let writes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let w = writes.clone();
+        let app = Router::new().fallback(move |method: Method, uri: Uri, body: String| {
+            let (cars, requests, writes) = (cars.clone(), requests.clone(), w.clone());
+            async move {
+                let query = uri.query().unwrap_or("");
+                if method == Method::GET && uri.path() == "/api/jobs" {
+                    let rows = if query.contains("kind=ship-a-change") {
+                        (*cars).clone()
+                    } else if query.contains("kind=ops-request") {
+                        (*requests).clone()
+                    } else {
+                        Vec::new()
+                    };
+                    let total = rows.len();
+                    return axum::Json(json!({"data": rows, "total": total})).into_response();
+                }
+                let record = if method == Method::POST {
+                    let sent: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    format!("POST {}", sent["metadata"]["car"].as_str().unwrap_or("?"))
+                } else {
+                    format!("{method} {}", uri.path())
+                };
+                writes.lock().unwrap().push(record.clone());
+                if refuse.contains(&record.as_str()) {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "rollout gap").into_response();
+                }
+                axum::Json(json!({})).into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), writes)
+    }
+
+    fn hourly_ctx() -> InvocationContext {
+        InvocationContext {
+            rule_name: "recheck-failing-probes-hourly".into(),
+            triggering_event_id: "ev".into(),
+            triggering_topic: "clock.tick".into(),
+            event_payload: json!({}),
+            event_timestamp: None,
+        }
+    }
+
+    fn failing_scope() -> [(String, boss_dispatcher::rules::expr::Value); 1] {
+        [(
+            "scope".to_string(),
+            boss_dispatcher::rules::expr::Value::String("failing".into()),
+        )]
+    }
+
+    /// ONE CAR'S REFUSAL THAT CANNOT BE WRITTEN DOES NOT STOP THE OTHERS
+    /// (backlog 8b76fab9). The refusal PATCH sat behind a `?` in its
+    /// loop, so the first car whose write failed — a 5xx, a rollout gap —
+    /// ended the firing: every car after it went unrecorded, and the
+    /// hourly re-send below never ran. Three refused cars, the first
+    /// PATCH answers 500: all three are written, the answered request is
+    /// still re-sent, and the one error names car c1 alone.
+    #[tokio::test]
+    async fn one_refusal_that_cannot_be_written_does_not_stop_the_cars_after_it() {
+        let refused = || {
+            json!({
+                "proof_probe": "curl -fsS $BOSS_JOBS_URL/api/jobs?kind=gate-run | grep -q c0ffee",
+                "proof_expect": "c0ffee",
+                "proof_attempt": {"exit": "1", "why": "printed nothing"},
+            })
+        };
+        let cars = ["c1", "c2", "c3"]
+            .map(|id| car(id, "t1", refused(), "ready"))
+            .to_vec();
+        let (base, writes) = write_board(
+            cars,
+            vec![request("r9", VERB, "c9", "completed")],
+            &["PATCH /api/jobs/c1/metadata"],
+        )
+        .await;
+        let err = JobsRunCarProbes::new(base)
+            .invoke(&failing_scope(), &hourly_ctx())
+            .await
+            .expect_err("car c1's refusal could not be written");
+
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                "PATCH /api/jobs/c1/metadata",
+                "PATCH /api/jobs/c2/metadata",
+                "PATCH /api/jobs/c3/metadata",
+                "PUT /api/jobs/r9/steps/r9-execute",
+            ],
+            "every refusal is written and the re-send still runs"
+        );
+        let said = err.to_string();
+        assert!(
+            said.contains("c1") && !said.contains("c2") && !said.contains("c3"),
+            "the error names the car whose write failed, and only it: {said}"
+        );
+        assert!(!err.is_permanent(), "a 500 is retryable: {said}");
+    }
+
+    /// The same for the request POST (backlog 8b76fab9): car c1's
+    /// ops-request cannot be filed, and cars c2 and c3 still get theirs.
+    #[tokio::test]
+    async fn one_request_that_cannot_be_filed_does_not_stop_the_cars_after_it() {
+        let failed = || {
+            let mut p = probed();
+            p["proof_attempt"] = json!({"exit": "1", "why": "printed nothing"});
+            p
+        };
+        let cars = ["c1", "c2", "c3"]
+            .map(|id| car(id, "t1", failed(), "ready"))
+            .to_vec();
+        let (base, writes) = write_board(
+            cars,
+            vec![request("r9", VERB, "c9", "completed")],
+            &["POST c1"],
+        )
+        .await;
+        let err = JobsRunCarProbes::new(base)
+            .invoke(&failing_scope(), &hourly_ctx())
+            .await
+            .expect_err("car c1's request could not be filed");
+
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![
+                "POST c1",
+                "POST c2",
+                "POST c3",
+                "PUT /api/jobs/r9/steps/r9-execute",
+            ],
+            "every request is filed and the re-send still runs"
+        );
+        let said = err.to_string();
+        assert!(
+            said.contains("c1") && !said.contains("c2") && !said.contains("c3"),
+            "the error names the car whose request failed, and only it: {said}"
+        );
+        assert!(!err.is_permanent(), "a 500 is retryable: {said}");
+    }
+
+    /// The verdict's other two arms: nothing failed is `Ok`, and a set
+    /// of failures that are ALL permanent (422s) stays permanent, as the
+    /// first one alone was under the old `?`.
+    #[test]
+    fn the_re_send_verdict_is_ok_when_none_failed_and_permanent_only_when_all_were() {
+        assert!(resend_verdict(Vec::new()).is_ok());
+        let all_permanent = resend_verdict(vec![
+            ("r1".into(), HandlerError::Permanent("422".into())),
+            ("r2".into(), HandlerError::Permanent("422".into())),
+        ])
+        .expect_err("two failures");
+        assert!(all_permanent.is_permanent(), "{all_permanent}");
+        let said = all_permanent.to_string();
+        assert!(said.contains("r1: ") && said.contains("r2: "), "{said}");
     }
 }

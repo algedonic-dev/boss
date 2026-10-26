@@ -195,20 +195,85 @@ impl Claim {
     }
 
     pub fn confirm(self, receipt: &Receipt) -> Result<SendPermit> {
-        if receipt.contract_version != 2
-            || receipt.command != self.command
-            || receipt.actor != self.attempt.actor
-            || receipt.job_id.to_string() != self.intent.packet
-            || receipt.event_id.is_nil()
-            || receipt.receipt_event_id.is_none_or(|id| id.is_nil())
-            || receipt.job.metadata.get(KEY) != Some(&serde_json::to_value(&self.attempt)?)
-            || receipt.job.metadata.get(model::INTENT) != Some(&serde_json::to_value(&self.intent)?)
-        {
-            bail!("native claim receipt does not confirm this uninterrupted unsent invocation");
+        let failed = self.unconfirmed(receipt)?;
+        if !failed.is_empty() {
+            bail!(
+                "native claim receipt does not confirm this uninterrupted unsent invocation — {}",
+                failed.join("; ")
+            );
         }
         Ok(SendPermit {
             attempt: self.attempt,
         })
+    }
+
+    /// Every predicate of [`Self::confirm`] the receipt fails, each named
+    /// with both of its values. The predicates are unchanged; only the
+    /// refusal now says which (backlog 870dbfe4: nine gate-runs died here
+    /// on 2026-10-18 with a refusal naming none of the eight, and the
+    /// alias-vs-canonical actor cause was re-derived from the events).
+    fn unconfirmed(&self, receipt: &Receipt) -> Result<Vec<String>> {
+        let mut failed = Vec::new();
+        if receipt.contract_version != 2 {
+            failed.push(format!(
+                "contract_version: the receipt is v{}, this claim requires v2",
+                receipt.contract_version
+            ));
+        }
+        if receipt.command != self.command {
+            failed.push(format!(
+                "command: the receipt applied command {} and this invocation sent {}{}",
+                receipt.command.idempotency_key,
+                self.command.idempotency_key,
+                if receipt.command.idempotency_key == self.command.idempotency_key {
+                    " with a different body"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if receipt.actor != self.attempt.actor {
+            failed.push(format!(
+                "actor: the server recorded this write as {:?} while the attempt claims {:?}",
+                receipt.actor, self.attempt.actor
+            ));
+        }
+        if receipt.job_id.to_string() != self.intent.packet {
+            failed.push(format!(
+                "packet: the receipt is for {} and this claim is for {}",
+                receipt.job_id, self.intent.packet
+            ));
+        }
+        if receipt.event_id.is_nil() {
+            failed.push("event_id: the receipt names no state event".into());
+        }
+        if receipt.receipt_event_id.is_none_or(|id| id.is_nil()) {
+            failed.push("receipt_event_id: the receipt names no receipt event".into());
+        }
+        if receipt.job.metadata.get(KEY) != Some(&serde_json::to_value(&self.attempt)?) {
+            failed.push(format!(
+                "{KEY}: the committed record {} and this invocation's is {}",
+                receipt
+                    .job
+                    .metadata
+                    .get(KEY)
+                    .map_or("carries none".into(), |value| format!("is {value}")),
+                serde_json::to_value(&self.attempt)?
+            ));
+        }
+        if receipt.job.metadata.get(model::INTENT) != Some(&serde_json::to_value(&self.intent)?) {
+            failed.push(format!(
+                "{}: the committed record {} and this invocation's is {}",
+                model::INTENT,
+                receipt
+                    .job
+                    .metadata
+                    .get(model::INTENT)
+                    .map_or("carries none".into(), |value| format!("is {value}")),
+                serde_json::to_value(&self.intent)?
+            ));
+        }
+        Ok(failed)
     }
 }
 
@@ -247,4 +312,148 @@ pub(super) fn no_child_command(
         immutable_keys: vec![],
         guarded_keys: vec![],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boss_core::job::{Job, JobId, Priority, Subject};
+
+    const PACKET: &str = "66194934-4ce9-417e-ad10-ab52604c8dbc";
+
+    fn intent() -> LaunchIntent {
+        LaunchIntent {
+            contract_version: 1,
+            packet: PACKET.into(),
+            namespace: "boss-dev".into(),
+            name: "gate-661949344ce9417ead10ab52604c8dbc".into(),
+            head: "67ebef47fdd8e40313b0f33c78f27a61bf664470".into(),
+            mode: "--auto".into(),
+            transition_generation: None,
+            file_id: "9ad52d0c-0bb5-485b-a59b-fca7101b45a2".into(),
+            sha256: "2d5f0f3297d1d7fe678f44f444ae3e6dfca346e757e9726927f024810880f44f".into(),
+            size_bytes: 4560,
+        }
+    }
+
+    /// A queued packet: its reservation, nothing native yet.
+    fn queued() -> Value {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-18T16:13:58Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        Value::Object(model::renew(&json!({}), now).unwrap().patch)
+    }
+
+    /// The receipt the jobs API returns for `claim`'s exact command,
+    /// written as `actor` — the post-state carrying the patch it applied.
+    fn committed(claim: &Claim, actor: &str) -> Receipt {
+        let mut metadata = queued();
+        for (key, value) in &claim.command().patch {
+            metadata[key] = value.clone();
+        }
+        let mut job = Job::new(
+            "gate-run",
+            Subject::new("custom", "test"),
+            "test",
+            "test",
+            Priority::Standard,
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap(),
+        )
+        .with_id(JobId::from_uuid(Uuid::parse_str(PACKET).unwrap()));
+        job.metadata = metadata;
+        Receipt {
+            contract_version: 2,
+            job_id: job.id,
+            actor: actor.into(),
+            command: claim.command().clone(),
+            applied_at: chrono::Utc::now(),
+            event_id: Uuid::new_v4(),
+            receipt_event_id: Some(Uuid::new_v4()),
+            job,
+        }
+    }
+
+    fn refusal(claim: Claim, receipt: &Receipt) -> String {
+        match claim.confirm(receipt) {
+            Ok(_) => panic!("a receipt that differs from the claim granted a send permit"),
+            Err(error) => format!("{error:#}"),
+        }
+    }
+
+    #[test]
+    fn an_exact_receipt_still_grants_the_one_permit() {
+        let claim = Claim::originate(&queued(), &intent(), "agent-claude-b".into()).unwrap();
+        let receipt = committed(&claim, "agent-claude-b");
+        assert!(claim.confirm(&receipt).is_ok());
+    }
+
+    /// WHY (backlog 870dbfe4). On 2026-10-18 nine gate-runs died at this
+    /// refusal and its text named no predicate of the eight, so the cause
+    /// — the attempt signed with the login alias `claude-b@algedonic.dev`
+    /// while the server recorded the canonical `agent-claude-b` — was
+    /// re-derived by hand from the packet's events, and on 2026-10-17 a
+    /// second session could not tell which predicate failed when actors
+    /// matched. The refusal now names each failed predicate with both of
+    /// its values, and nothing it did not compare.
+    #[test]
+    fn a_refused_receipt_names_the_actor_it_was_written_as_and_the_actor_claimed() {
+        let claim =
+            Claim::originate(&queued(), &intent(), "claude-b@algedonic.dev".into()).unwrap();
+        let receipt = committed(&claim, "agent-claude-b");
+        let why = refusal(claim, &receipt);
+        assert!(
+            why.starts_with(
+                "native claim receipt does not confirm this uninterrupted unsent invocation"
+            ),
+            "the refusal keeps the sentence every reader already searches for: {why}"
+        );
+        assert!(
+            why.contains("actor")
+                && why.contains("\"agent-claude-b\"")
+                && why.contains("\"claude-b@algedonic.dev\""),
+            "the actor predicate and BOTH of its values are named: {why}"
+        );
+        for unfailed in [
+            "contract_version",
+            "command",
+            "packet",
+            "event",
+            KEY,
+            model::INTENT,
+        ] {
+            assert!(
+                !why.contains(unfailed),
+                "{unfailed} did not fail and is not named: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_other_failed_predicate_is_named_too() {
+        let cases: [(&str, fn(&mut Receipt)); 6] = [
+            ("contract_version", |r| r.contract_version = 1),
+            ("command", |r| r.command.idempotency_key = Uuid::new_v4()),
+            ("packet", |r| r.job_id = JobId::new()),
+            ("event_id", |r| r.event_id = Uuid::nil()),
+            ("receipt_event_id", |r| r.receipt_event_id = None),
+            (KEY, |r| {
+                r.job.metadata.as_object_mut().unwrap().remove(KEY);
+            }),
+        ];
+        for (predicate, break_it) in cases {
+            let claim = Claim::originate(&queued(), &intent(), "agent-claude-b".into()).unwrap();
+            let mut receipt = committed(&claim, "agent-claude-b");
+            break_it(&mut receipt);
+            let why = refusal(claim, &receipt);
+            assert!(
+                why.contains(&format!("{predicate}:")),
+                "{predicate} failed and is named: {why}"
+            );
+        }
+        let claim = Claim::originate(&queued(), &intent(), "agent-claude-b".into()).unwrap();
+        let mut receipt = committed(&claim, "agent-claude-b");
+        receipt.job.metadata[model::INTENT]["head"] = json!("0".repeat(40));
+        let why = refusal(claim, &receipt);
+        assert!(why.contains(&format!("{}:", model::INTENT)), "{why}");
+    }
 }

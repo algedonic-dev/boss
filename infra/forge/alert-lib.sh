@@ -202,6 +202,58 @@ alert_count() { [ -d "$ALERT_SPOOL" ] || { echo 0; return; }; ls -1 "$ALERT_SPOO
 # times, moved aside under $ALERT_SPOOL/refused/ (see alert_replay).
 alert_refused_count() { [ -d "$ALERT_SPOOL/refused" ] || { echo 0; return; }; ls -1 "$ALERT_SPOOL/refused" 2>/dev/null | grep -c '\.json$'; }
 
+# alert_spool_trusted — 0 when ALERT_SPOOL is a spool only this account
+# could have written; otherwise 1, with a refusal naming the path.
+#
+# A REPLAY PRESENTS THE CALLER'S CREDENTIAL WITH EVERY BODY IT READS
+# (backlog 46c18d11, from re-review 8c585a24 of car 1d368d6c). The
+# watchdog runs as root and alert_replay POSTs each *.json with the
+# estate machine token, while ALERT_SPOOL's default is a name under
+# /var/tmp: a run started without its unit environment replayed
+# whatever another local account had created there, as root. So the
+# replay first refuses a spool that is a symbolic link, is not a
+# directory, belongs to another uid, is writable by group or other, or
+# sits in a parent another account can change (writable by group or
+# other without the sticky bit, or owned by neither this uid nor root:
+# such a parent lets its owner swap the spool between this check and
+# the read). Nothing is read, filed, moved or removed on a refusal — a
+# planted body and a real kept alert look alike from here, and either
+# may be the one copy of what it says. The units keep theirs under a
+# 0700 StateDirectory, which passes; /var/tmp is sticky, so a spool
+# this account made there passes too, and one another account made
+# first does not.
+alert_spool_trusted() {
+    local spool="$ALERT_SPOOL" parent euid st own mode why=""
+    euid=$(id -u)
+    parent=$(dirname -- "$spool")
+    if [ -L "$spool" ]; then
+        why="it is a symbolic link"
+    elif [ ! -d "$spool" ]; then
+        why="it is not a directory"
+    elif ! st=$(stat -c '%u %a' -- "$spool" 2> /dev/null); then
+        why="its owner and mode cannot be read"
+    else
+        own=${st%% *}; mode=$((8#${st#* }))
+        if [ "$own" != "$euid" ]; then
+            why="it belongs to uid $own, not uid $euid"
+        elif [ $((mode & 8#022)) -ne 0 ]; then
+            why="it is writable by group or other (mode $(printf '%o' "$mode"))"
+        elif ! st=$(stat -L -c '%u %a' -- "$parent" 2> /dev/null); then
+            why="its parent $parent cannot be read"
+        else
+            own=${st%% *}; mode=$((8#${st#* }))
+            if [ "$own" != "$euid" ] && [ "$own" != 0 ]; then
+                why="its parent $parent belongs to uid $own"
+            elif [ $((mode & 8#022)) -ne 0 ] && [ $((mode & 8#1000)) -eq 0 ]; then
+                why="its parent $parent is writable by group or other without the sticky bit (mode $(printf '%o' "$mode"))"
+            fi
+        fi
+    fi
+    [ -z "$why" ] && return 0
+    echo "alert: REFUSED to replay $spool — $why. A replay presents this account's credential with every body there, so the spool must be a real directory owned by uid $euid that no other account can write or swap. Each unit sets ALERT_SPOOL under its own 0700 StateDirectory; a run without that environment falls back to /var/tmp/boss-alert-spool. Nothing was read, filed, moved or removed." >&2
+    return 1
+}
+
 # alert TITLE DETAIL — raise an alert: journal it, file it, or keep it.
 alert() {
     alert_machine_headers
@@ -210,7 +262,9 @@ alert() {
     if alert_post "$body"; then
         echo "alert: filed as a packet for the platform owner" >&2
     else
-        mkdir -p "$ALERT_SPOOL"
+        # 0700 whatever the umask: a spool this lib makes must pass
+        # alert_spool_trusted, or the alert it keeps is never filed.
+        mkdir -p -m 0700 "$ALERT_SPOOL"
         # Unique per alert even within one second and one process
         # (two alerts in a burst must not overwrite each other).
         printf '%s' "$body" > "$ALERT_SPOOL/$(date -u +%Y-%m-%dT%H:%M:%SZ)-$$-$(( ALERT_SEQ=${ALERT_SEQ:-0}+1 ))-$RANDOM.json"
@@ -247,6 +301,7 @@ ALERT_REFUSALS_MAX="${ALERT_REFUSALS_MAX:-5}"
 alert_replay() {
     local n f tries k next now
     n=$(alert_count); [ "$n" -gt 0 ] || return 0
+    alert_spool_trusted || return 1
     alert_machine_headers
     echo "alert: filing $n kept alert(s), oldest first" >&2
     now=$(date -u +%s)

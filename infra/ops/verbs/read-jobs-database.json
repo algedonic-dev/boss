@@ -1,0 +1,8 @@
+{
+  "about": "READ-ONLY fixed database statistics and passive IO accounting, bound to actual postgres Pod/container, StatefulSet, PVC, PV and Longhorn volume UIDs. Two bounded samples preserve full native stdout/stderr in an attached observation. No query text, arbitrary SQL, new credentials or grants. Pool snapshots are read separately through /api/jobs/database-observation; missing waiter/latency measurements are not zero. This observation does not establish a production stall cause or a latency-window pass.",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/read-jobs-database.sh"],
+  "params": [],
+  "capture": "separate-streams",
+  "timeout": 190
+}

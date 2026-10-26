@@ -117,6 +117,19 @@ impl Resource {
     pub fn workflow() -> Self {
         Self::new("workflow")
     }
+    /// Reading an unpublished draft — a workflow or station version
+    /// never published — WITHOUT any authoring verb (backlog f21804d8,
+    /// design 600c07d7, decided 2026-10-17). Until then a draft was read
+    /// only by who may author one, so a read-only observer that captures
+    /// the complete graph could qualify only by being granted Create,
+    /// Update or Publish on `workflow`. Deliberately not a shipped
+    /// resource: the read-only roles (the auditor's, which an audit-opted
+    /// guest also carries) would inherit it, and a draft is an author's
+    /// workspace. The deploy superuser holds it in `default_rules`; an
+    /// install grants a named observer role as a policy row.
+    pub fn workflow_draft() -> Self {
+        Self::new("workflow-draft")
+    }
     /// Raw audit-log rows, wherever they are surfaced as results —
     /// global search, a View over `events`, any future reader.
     ///

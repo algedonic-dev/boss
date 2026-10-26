@@ -1,0 +1,4 @@
+[[automation]]
+id = "automation:read-jobs-database"
+role = "audit-readonly"
+description = 'The fixed read-jobs-database observation reading the protected serving pool target (infra/forge/read-jobs-database.sh). Reads only.'

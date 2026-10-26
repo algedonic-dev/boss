@@ -15,10 +15,27 @@ ready_when = "true"
 title_template = "Timer fired"
 metadata_defaults = { trigger_kind = "periodic", trigger_name = "systemd-timer" }
 
+# THE RUN AN OPS-REQUEST ASKED FOR (backlog e4d51e12). The `converge`
+# verb (converge-now.sh — converge-on-merge's ops-request, or a hand
+# `converge`) leaves the request's id in the converge's inbox and then
+# starts the unit; the wrap reads the inbox from ExecStartPre and names
+# this trigger (`metadata.trigger_name = "ops-request"`, the ids as
+# `ops_requests`), so admission fires it and skips the timer. Until
+# 2026-10-20 every merge-started run read `systemd-timer`, beside the
+# no-op ticks of the safety net (measured on run 73832267 across 191
+# trains). `scheduled` stays FIRST: a packet that names no trigger
+# fires the first one, and that is the timer.
+[[workflow.step]]
+title = "requested"
+kind = "trigger"
+ready_when = "true"
+title_template = "A converge was requested"
+metadata_defaults = { trigger_kind = "counterparty", trigger_name = "ops-request" }
+
 [[workflow.step]]
 title = "run"
 kind = "task"
-ready_when = "steps.scheduled.done"
+ready_when = "steps.scheduled.done OR steps.requested.done"
 title_template = "Run to completion"
 # The step is the automation's and says so (backlog 4f909642,
 # 2026-09-18): born assigned to the actor boss-step.sh signs as, so the

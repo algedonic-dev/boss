@@ -108,8 +108,10 @@ mod tests {
 
     /// A scratch root this uid and process own outright — and the one
     /// copy of `boss_testing::scratch` in the tree, because
-    /// `boss-testing` depends on `boss-core` and the dev-dependency
-    /// would be a cycle. The duplication is of a technique, not of a
+    /// `boss-testing` depends on `boss-core`: the crate's integration
+    /// tests take it as a dev-dependency (backlog 7e30ddb0), but a unit
+    /// test here would link a second `boss-core` beside the one under
+    /// test. The duplication is of a technique, not of a
     /// shared fact: the two roots must each be unique, never equal to
     /// one another, so there is nothing for an equality test to pin
     /// (CLAUDE.md §9a). Why both the uid and the pid, and why the

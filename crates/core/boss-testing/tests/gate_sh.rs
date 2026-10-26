@@ -27,7 +27,14 @@
 //!
 //! Every test names the offending entry when it fails.
 
-use boss_testing::repo_root;
+use boss_testing::{TREE_WIDE_FILE_PATTERN, repo_root, tree_wide_pattern};
+
+/// A `tests/` file's tree-wide marker, as infra/gate.sh runs the pins by
+/// it — read, never spelled here (backlog 07ad55b3).
+fn tree_wide_file_marker() -> regex::Regex {
+    regex::Regex::new(&tree_wide_pattern(TREE_WIDE_FILE_PATTERN))
+        .expect("TREE_WIDE_FILE_PATTERN in infra/gate.sh is a regex")
+}
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
@@ -208,45 +215,427 @@ fn the_forge_workflow_carries_no_second_definition_of_the_gate() {
 /// (train/conductor.rs `render_job(.., "--auto")`) and merges no train
 /// without that verdict (`BOSS_TRAIN_GATE_REQUIRED=1`). In `--auto`,
 /// gate.sh runs `svelte-check` on every tree — a top-level `check`, no
-/// condition around it — so a `bun run typecheck` in the workflow is the
-/// same check run twice, serially, after the image build. The rest of
-/// the web phase (web-kit unit, unit, build, mocked) sits behind
-/// `web_touched`, which reads only apps/web, apps/simulator and
-/// libs/web-kit while the specs also read files from infra/step-plugins,
-/// infra/estate, infra/postgres, examples/ and docs/: a train that changes
-/// only those is judged by the forge's run of them and by nothing else. So
-/// those STAY, and this pin holds both halves — drop one from the
-/// workflow while the gate still scopes it, and this goes red.
+/// condition around it — so a typecheck in the workflow is the same
+/// check run twice, serially, after the image build. The rest of the web
+/// phase sat behind `web_touched`, which read only apps/web,
+/// apps/simulator and libs/web-kit while the specs also read files from
+/// infra/step-plugins, infra/estate and docs/: a train that changed only
+/// those was judged by the forge's run of them and by nothing else. Since
+/// a244c6e7 the unit suites run on every tree and `web_touched` is derived
+/// from what the build and mocked specs read (web-suite-reads.ts), so on
+/// the same tree the kept steps below are the train gate's checks run a
+/// second time, in series.
+///
+/// SO THEY RUN ONLY ON A NEW RUNNER RECIPE (the rest of 81ee98b3,
+/// 2026-10-20). They are not deleted, because one thing differs between
+/// the lanes: the forge job runs in the image built from the train's own
+/// infra/forge/boss-ci/, while the cluster gate runs the boss-ci:rust1.96
+/// it pulled at launch. On a train that changes that recipe, the forge's
+/// run is the only proof that the new image still runs bun, the browser
+/// and the suite; on every other train it proves nothing the gate did not.
+/// So each kept step must be present, unguarded by anything else, and
+/// guarded by exactly [`ON_A_NEW_RECIPE`] — deleted, it loses the one
+/// proof; unguarded, it is the serial duplicate again. The recipe step's
+/// answer is pinned by EXECUTING it, in
+/// the_forge_web_job_runs_on_a_new_recipe.rs, and that the gate lane pays
+/// for what these steps no longer run is web-ci-coverage.ts's question.
+///
+/// It did not, at first (backlog 25a20d02, measured by mutation in
+/// review run 57a5c8d6): `run: bun run test:unit` is spelled twice in the
+/// workflow, so deleting apps/web's Unit tests step left the web-kit one
+/// to satisfy it; wrapping the svelte-check line in an `if … fi` left a
+/// line that still STARTED with the check; and a step spelled
+/// `bunx svelte-check` passed the no-duplicate half. So each kept step
+/// is now matched by its directory as well as its command, and by its
+/// guard (none but the recipe's since 81ee98b3 closed);
+/// the check must sit outside every `if … fi`; and a duplicate is any
+/// invocation of svelte-check, by name or through a package.json script
+/// that reaches it. `the_forge_web_job_pin_refuses_what_its_review_measured`
+/// replays those mutations so the pin cannot weaken back silently.
 #[test]
 fn the_forge_web_job_runs_only_what_the_train_gate_may_skip() {
     let ci = forge_workflow();
     let gate = read("infra/gate.sh");
+    let web_package = read("apps/web/package.json");
+    if let Err(why) = svelte_check_runs_at_top_level(&gate) {
+        panic!(
+            "infra/gate.sh no longer runs svelte-check unconditionally ({why}) — the forge's \
+             web job dropped its typecheck because the train's --auto gate always ran it \
+             (81ee98b3); put the typecheck back in .forgejo/workflows/ci.yml or the check \
+             back at top level"
+        );
+    }
+    let duplicates = typecheck_invocations(&ci, &web_package);
     assert!(
-        gate.lines()
-            .any(|l| l.starts_with("check \"svelte-check\"")),
-        "infra/gate.sh no longer runs svelte-check unconditionally — the forge's web job \
-         dropped its typecheck because the train's --auto gate always ran it (81ee98b3); \
-         put the typecheck back in .forgejo/workflows/ci.yml or the check back at top level"
+        duplicates.is_empty(),
+        ".forgejo/workflows/ci.yml runs svelte-check again — the train's gate runs it on the \
+         identical tree on every train, so this is a serial duplicate: {duplicates:?}"
     );
+    let off = kept_web_steps_off_the_recipe(&ci);
     assert!(
-        !ci.contains("run: bun run typecheck"),
-        ".forgejo/workflows/ci.yml runs `bun run typecheck` again — the train's gate runs \
-         svelte-check on the identical tree on every train, so this is a serial duplicate"
+        off.is_empty(),
+        ".forgejo/workflows/ci.yml's web job: {off:?} — each kept step runs only when the \
+         train changes infra/forge/boss-ci/ (`if: {ON_A_NEW_RECIPE}`, after the unguarded \
+         `recipe` step): deleted, nothing proves a new runner image still runs the web suite; \
+         unguarded, it re-runs the train gate's checks in series on every train (81ee98b3)"
     );
-    assert!(
-        gate.contains("if [ \"$AUTO\" -eq 0 ] || [ \"$(web_touched)\" = \"yes\" ]; then"),
-        "gate.sh's web phase is no longer scoped by web_touched in --auto — if the train's \
-         gate now runs it on every tree, the forge's web job is a duplicate and can go"
-    );
-    for kept in [
-        "run: bun run test:unit",
-        "run: bun run build",
-        "run: bun run test:mocked",
-    ] {
+}
+
+/// The guard on every kept step: the `recipe` step's answer, so that
+/// anything but an explicit `no` (a failed read included) runs them.
+const ON_A_NEW_RECIPE: &str = "steps.recipe.outputs.changed != 'no'";
+
+/// The steps the forge's web job keeps, as (working-directory, run).
+/// The directory is half the identity: `bun run test:unit` is two
+/// different suites in libs/web-kit and apps/web. The install is here
+/// because, guarded or not, it is minutes of a fresh container's track
+/// time spent on steps that will not run.
+const KEPT_WEB_STEPS: [(&str, &str); 5] = [
+    (
+        "apps/web",
+        "PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile",
+    ),
+    ("libs/web-kit", "bun run test:unit"),
+    ("apps/web", "bun run test:unit"),
+    ("apps/web", "bun run build"),
+    ("apps/web", "bun run test:mocked"),
+];
+
+/// One step of a workflow job, as much of it as the pin reads: its id,
+/// where it runs, its one-line `run:`, its `if:`, and whether a failure
+/// would not count (`continue-on-error: true`).
+#[derive(Debug, Default)]
+struct WorkflowStep {
+    id: Option<String>,
+    working_directory: Option<String>,
+    run: Option<String>,
+    condition: Option<String>,
+    tolerated: bool,
+}
+
+/// The steps of job `job` in a workflow, read line by line: the job runs
+/// from its `  <job>:` key to the next two-space key, and a step starts
+/// at each `- ` item. Enough YAML for this file's shape, and no more.
+fn job_steps(ci: &str, job: &str) -> Vec<WorkflowStep> {
+    let header = format!("  {job}:");
+    let next_key = |l: &&str| {
+        let bare = l.trim_start_matches(' ');
+        let indent = l.len() - bare.len();
+        indent <= 2 && !bare.is_empty() && !bare.starts_with('#')
+    };
+    ci.lines()
+        .skip_while(|l| *l != header)
+        .skip(1)
+        .take_while(|l| !next_key(l))
+        .map(str::trim)
+        .fold(Vec::new(), |mut steps: Vec<WorkflowStep>, line| {
+            let field = match line.strip_prefix("- ") {
+                Some(rest) => {
+                    steps.push(WorkflowStep::default());
+                    rest
+                }
+                None => line,
+            };
+            if let Some(step) = steps.last_mut() {
+                let value = |key: &str| field.strip_prefix(key).map(|v| v.trim().to_string());
+                if let Some(dir) = value("working-directory:") {
+                    step.working_directory = Some(dir);
+                } else if let Some(run) = value("run:") {
+                    step.run = Some(run);
+                } else if let Some(id) = value("id:") {
+                    step.id = Some(id);
+                } else if let Some(condition) = value("if:") {
+                    step.condition = Some(condition);
+                } else if value("continue-on-error:").as_deref() == Some("true") {
+                    step.tolerated = true;
+                }
+            }
+            steps
+        })
+}
+
+/// What is wrong with the web job's kept steps, one entry per fault:
+/// the `recipe` step missing, guarded, tolerated or after a kept step,
+/// and each kept step that is absent from its own directory or not
+/// guarded by exactly [`ON_A_NEW_RECIPE`] (with a failure that counts).
+fn kept_web_steps_off_the_recipe(ci: &str) -> Vec<String> {
+    let steps = job_steps(ci, "web");
+    let recipe = steps.iter().position(|s| s.id.as_deref() == Some("recipe"));
+    let recipe_faults = match recipe.map(|at| (at, &steps[at])) {
+        None => vec!["no step with `id: recipe`".to_string()],
+        Some((_, s)) if s.condition.is_some() || s.tolerated => {
+            vec!["the recipe step is itself conditional or failure-tolerant".to_string()]
+        }
+        Some(_) => Vec::new(),
+    };
+    let kept_faults = KEPT_WEB_STEPS.iter().filter_map(|(dir, run)| {
+        let found = steps.iter().enumerate().find(|(_, s)| {
+            s.working_directory.as_deref() == Some(*dir) && s.run.as_deref() == Some(*run)
+        });
+        match found {
+            None => Some(format!("{dir}: {run} is gone")),
+            Some((_, s)) if s.condition.as_deref() != Some(ON_A_NEW_RECIPE) || s.tolerated => {
+                Some(format!(
+                    "{dir}: {run} runs on `{}`{}",
+                    s.condition.as_deref().unwrap_or("every train"),
+                    if s.tolerated {
+                        ", failure tolerated"
+                    } else {
+                        ""
+                    }
+                ))
+            }
+            Some((at, _)) if recipe.is_some_and(|r| r > at) => {
+                Some(format!("{dir}: {run} runs before the recipe step answers"))
+            }
+            Some(_) => None,
+        }
+    });
+    recipe_faults.into_iter().chain(kept_faults).collect()
+}
+
+/// Whether gate.sh's `check "svelte-check"` runs on every tree: written
+/// at column 0, outside every `if … fi`, and not the tail of a command
+/// continued from the line above (`&&`, `||`, `|`, `\`).
+///
+/// The `if`/`fi` depth is counted over the whole script, skipping
+/// comments and heredoc bodies, and must come back to zero at the end:
+/// a count that does not balance is a script this reader cannot follow,
+/// and it says so rather than answering (a pin that guesses is how this
+/// one first passed a wrapped check).
+fn svelte_check_runs_at_top_level(gate: &str) -> Result<(), String> {
+    fn starts_with_word(text: &str, word: &str) -> bool {
+        text.strip_prefix(word)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', ';', ')', '|', '>', '&']))
+    }
+    fn heredoc_tag(line: &str) -> Option<String> {
+        let at = line.find("<<")?;
+        let rest = &line[at + 2..];
+        if rest.starts_with('<') {
+            return None; // a here-string, `<<<`, has no body
+        }
+        let tag: String = rest
+            .trim_start_matches('-')
+            .trim_start()
+            .trim_start_matches(['\'', '"'])
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        (!tag.is_empty()).then_some(tag)
+    }
+    struct Walk {
+        depth: i64,
+        heredoc: Option<String>,
+        continued: bool,
+        found: Option<(usize, i64, bool)>,
+    }
+    let walk = gate.lines().enumerate().try_fold(
+        Walk {
+            depth: 0,
+            heredoc: None,
+            continued: false,
+            found: None,
+        },
+        |mut w, (n, line)| {
+            if let Some(tag) = &w.heredoc {
+                if line.trim() == tag {
+                    w.heredoc = None;
+                }
+                return Ok(w);
+            }
+            let code = line.trim();
+            if code.is_empty() || code.starts_with('#') {
+                return Ok(w);
+            }
+            if line.starts_with("check \"svelte-check\"") {
+                w.found = Some((n + 1, w.depth, w.continued));
+            }
+            // A shell `if` opens; awk's `if (` inside a quoted program does
+            // not (gate.sh carries ten). A `fi` token closes wherever it
+            // sits: alone, after `else …;`, or ending a one-line `if`.
+            let opens = starts_with_word(code, "if") && !code.starts_with("if (");
+            let closes = code
+                .split([' ', '\t', ';'])
+                .any(|token| token == "fi" || token == "fi)");
+            w.depth += i64::from(opens) - i64::from(closes);
+            if w.depth < 0 {
+                return Err(format!("a `fi` at line {} closes no `if`", n + 1));
+            }
+            w.heredoc = heredoc_tag(code);
+            w.continued = ["&&", "||", "|", "\\"].iter().any(|c| code.ends_with(c));
+            Ok(w)
+        },
+    )?;
+    if walk.depth != 0 {
+        return Err(format!(
+            "its if/fi do not balance (depth {} at the end), so where the check sits cannot be read",
+            walk.depth
+        ));
+    }
+    match walk.found {
+        None => Err("no line starts with `check \"svelte-check\"`".into()),
+        Some((n, depth, _)) if depth > 0 => Err(format!("line {n} sits inside {depth} if/fi")),
+        Some((n, _, true)) => Err(format!("line {n} continues a command from the line above")),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Every line of the workflow that runs svelte-check, in any spelling:
+/// the tool by name (`bunx svelte-check`, `bun x svelte-check`), or a
+/// `run <script>` of any apps/web package.json script that reaches it —
+/// `typecheck` directly, `gate` through `bun run typecheck`. Comment
+/// lines are prose, not invocations.
+fn typecheck_invocations(ci: &str, web_package: &str) -> Vec<String> {
+    let package: serde_json::Value =
+        serde_json::from_str(web_package).expect("apps/web/package.json is JSON");
+    let scripts: Vec<(String, String)> = package["scripts"]
+        .as_object()
+        .expect("apps/web/package.json has scripts")
+        .iter()
+        .map(|(name, cmd)| (name.clone(), cmd.as_str().unwrap_or_default().to_string()))
+        .collect();
+    let runs = |cmd: &str, name: &str| {
+        cmd.match_indices(&format!("run {name}")).any(|(at, m)| {
+            let before = cmd[..at].chars().next_back();
+            let after = cmd[at + m.len()..].chars().next();
+            before.is_none_or(char::is_whitespace)
+                && after.is_none_or(|c| !(c.is_ascii_alphanumeric() || ":-_".contains(c)))
+        })
+    };
+    // The scripts that reach svelte-check, to a fixed point: a script
+    // that runs one of them reaches it too.
+    let mut reach: Vec<String> = Vec::new();
+    loop {
+        let more: Vec<String> = scripts
+            .iter()
+            .filter(|(name, cmd)| {
+                !reach.contains(name)
+                    && (cmd.contains("svelte-check") || reach.iter().any(|r| runs(cmd, r)))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        reach.extend(more);
+    }
+    ci.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter(|l| l.contains("svelte-check") || reach.iter().any(|r| runs(l, r)))
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+/// The three mutations review run 57a5c8d6 made to the real files, each
+/// of which the first version of the pin above let through (backlog
+/// 25a20d02), plus the guard a kept step could hide behind. Each one
+/// must be refused, and the real files must not be — a mutation that no
+/// longer applies to the file fails here by name rather than passing.
+#[test]
+fn the_forge_web_job_pin_refuses_what_its_review_measured() {
+    let ci = forge_workflow();
+    let gate = read("infra/gate.sh");
+    let web_package = read("apps/web/package.json");
+    let mutate = |text: &str, from: &str, to: &str| {
         assert!(
-            ci.contains(kept),
-            ".forgejo/workflows/ci.yml lost `{kept}` — the train's --auto gate skips the web \
-             phase on a train that touches no web path, so the forge's run is the only one"
+            text.contains(from),
+            "the mutation's anchor is gone from the file — update the mutation: {from:?}"
+        );
+        text.replacen(from, to, 1)
+    };
+
+    assert_eq!(svelte_check_runs_at_top_level(&gate), Ok(()));
+    assert_eq!(
+        typecheck_invocations(&ci, &web_package),
+        Vec::<String>::new()
+    );
+    assert_eq!(kept_web_steps_off_the_recipe(&ci), Vec::<String>::new());
+
+    let guard = format!("        if: {ON_A_NEW_RECIPE}\n");
+    let unit = format!(
+        "      - name: Unit tests\n{guard}        working-directory: apps/web\n        run: bun run test:unit\n"
+    );
+    assert_eq!(
+        kept_web_steps_off_the_recipe(&mutate(&ci, &unit, "")),
+        vec!["apps/web: bun run test:unit is gone".to_string()],
+        "deleting apps/web's Unit tests step must be seen although web-kit's step runs the same command"
+    );
+
+    // The recipe guard is the ONLY condition a kept step may carry: an
+    // `if: false` never runs it, and no guard runs it on every train.
+    let build = "      - name: Build\n";
+    let guarded_build = format!("{build}{guard}");
+    for (to, says) in [
+        (format!("{build}        if: false\n"), "runs on `false`"),
+        (build.to_string(), "runs on `every train`"),
+        (
+            format!("{guarded_build}        continue-on-error: true\n"),
+            "failure tolerated",
+        ),
+    ] {
+        let off = kept_web_steps_off_the_recipe(&mutate(&ci, &guarded_build, &to));
+        assert!(
+            off.len() == 1
+                && off[0].starts_with("apps/web: bun run build")
+                && off[0].contains(says),
+            "a kept step whose guard is {to:?} must be refused for it: {off:?}"
+        );
+    }
+
+    // The recipe step answers first, and answers unconditionally.
+    let recipe = "        id: recipe\n";
+    assert_eq!(
+        kept_web_steps_off_the_recipe(&mutate(&ci, recipe, "        id: other\n")),
+        vec!["no step with `id: recipe`".to_string()]
+    );
+    assert_eq!(
+        kept_web_steps_off_the_recipe(&mutate(
+            &ci,
+            recipe,
+            &format!("{recipe}        if: false\n")
+        )),
+        vec!["the recipe step is itself conditional or failure-tolerant".to_string()]
+    );
+
+    let line = gate
+        .lines()
+        .find(|l| l.starts_with("check \"svelte-check\""))
+        .expect("gate.sh carries the svelte-check line");
+    let wrapped = mutate(
+        &gate,
+        line,
+        &format!("if [ \"$AUTO\" -eq 0 ]; then\n{line}\nfi"),
+    );
+    // Refused for its own reason, not because the walk lost count.
+    let refusal = |script: &str| {
+        svelte_check_runs_at_top_level(script)
+            .err()
+            .unwrap_or_default()
+    };
+    assert!(
+        refusal(&wrapped).contains("sits inside 1 if/fi"),
+        "svelte-check wrapped in an if/fi must not read as unconditional: {:?}",
+        refusal(&wrapped)
+    );
+    let chained = mutate(&gate, line, &format!("[ \"$AUTO\" -eq 0 ] &&\n{line}"));
+    assert!(
+        refusal(&chained).contains("continues a command"),
+        "svelte-check behind a continued && must not read as unconditional: {:?}",
+        refusal(&chained)
+    );
+
+    for spelling in [
+        "bunx svelte-check --tsconfig ./tsconfig.json",
+        "bun run typecheck",
+        "bun run gate",
+    ] {
+        let step = format!(
+            "      - name: Typecheck\n        working-directory: apps/web\n        run: {spelling}\n{build}"
+        );
+        assert_eq!(
+            typecheck_invocations(&mutate(&ci, build, &step), &web_package).len(),
+            1,
+            "a CI step running `{spelling}` re-runs the gate's svelte-check"
         );
     }
 }
@@ -626,8 +1015,8 @@ fn the_gate_rechecks_headroom_as_the_run_proceeds() {
              n=$(cat {c} 2>/dev/null || echo 0)\n\
              echo $((n+1)) > {c}\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             if [ \"$n\" -eq 0 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
-             else echo '/dev/fake 1 1 1048576 99% /'; fi\n",
+             for _ in \"$@\"; do if [ \"$n\" -eq 0 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
+             else echo '/dev/fake 1 1 1048576 99% /'; fi; done\n",
             c = counter.display()
         ),
     );
@@ -1038,8 +1427,8 @@ fn the_receipt_times_every_check() {
              n=$(cat {c} 2>/dev/null || echo 0)\n\
              echo $((n+1)) > {c}\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             if [ \"$n\" -lt 2 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
-             else echo '/dev/fake 1 1 1048576 99% /'; fi\n",
+             for _ in \"$@\"; do if [ \"$n\" -lt 2 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
+             else echo '/dev/fake 1 1 1048576 99% /'; fi; done\n",
             c = counter.display()
         ),
     );
@@ -1170,8 +1559,8 @@ fn auto_scope_of(label: &str, touch: &[&str]) -> (String, serde_json::Value) {
              n=$(cat {c} 2>/dev/null || echo 0)\n\
              echo $((n+1)) > {c}\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             if [ \"$n\" -lt 1 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
-             else echo '/dev/fake 1 1 1048576 99% /'; fi\n",
+             for _ in \"$@\"; do if [ \"$n\" -lt 1 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
+             else echo '/dev/fake 1 1 1048576 99% /'; fi; done\n",
             c = counter.display()
         ),
     );
@@ -1504,15 +1893,14 @@ fn a_document_read_only_by_tree_wide_pins_does_not_select_the_whole_crate() {
         !scope_of(&receipt).iter().any(|c| c == "boss-testing"),
         "tree-wide document readers must remain checked without selecting all boss-testing: {stdout}"
     );
+    let marker = tree_wide_file_marker();
     for pin in [
         "the_vsm_mapping_outlives_its_code",
         "a_retired_crate_is_superseded_not_dead",
     ] {
         let source = read(&format!("crates/core/boss-testing/tests/{pin}.rs"));
         assert!(
-            source
-                .lines()
-                .any(|line| line.starts_with("//! tree-wide pin —")),
+            source.lines().any(|line| marker.is_match(line)),
             "{pin} must remain an actual declared tree-wide target"
         );
     }
@@ -1886,6 +2274,32 @@ fn a_web_only_car_runs_the_dispatcher_cascade_pin() {
     );
 }
 
+/// …and so does the brief's reading of CLAUDE.md (review e207853d,
+/// 2026-10-20). boss-cli renders every builder brief's pre-flight
+/// invariant from CLAUDE.md's `Before pushing` entry and refuses to
+/// render ANY lane's brief when that entry records no measurement. A
+/// CLAUDE.md-only car selects no crate — the name has no slash for the
+/// file-input index and no shape line maps it — so the docs edit that
+/// re-words the measurement gated green and would have stopped dispatch.
+#[test]
+fn a_claude_md_only_car_runs_the_briefs_reading_of_it() {
+    let (stdout, receipt) = auto_scope_of("gate-auto-tree-wide-claude-md", &["CLAUDE.md"]);
+    assert!(
+        !scope_of(&receipt).iter().any(|c| c == "boss-cli"),
+        "the fixture is a CLAUDE.md-only car, whose derived scope must NOT already hold \
+         boss-cli — else this proves nothing.\nstdout: {stdout}"
+    );
+    let line = tree_wide_line(&stdout).unwrap_or_else(|| {
+        panic!(
+            "a CLAUDE.md-only --auto gate must name the tree-wide pins it runs.\nstdout: {stdout}"
+        )
+    });
+    assert!(
+        line.contains("the_preflight_cost_is_the_measurement_the_doors_entry_records"),
+        "the brief's reading of CLAUDE.md must run on every scoped gate: {line}"
+    );
+}
+
 /// A single test named as a cargo FILTER can match nothing — a test
 /// renamed, a module moved from the binary to the library — and a
 /// filtered run that matched nothing is a green run that tested nothing.
@@ -2013,7 +2427,7 @@ impl LevelTree {
             &t.dir.join("df"),
             "#!/usr/bin/env bash\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             echo '/dev/fake 1 1 943718400 1% /'\n",
+             for _ in \"$@\"; do echo '/dev/fake 1 1 943718400 1% /'; done\n",
         );
         t
     }
@@ -2567,7 +2981,7 @@ impl RosterTree {
             &dir.join("df"),
             "#!/usr/bin/env bash\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             echo '/dev/fake 1 1 943718400 1% /'\n",
+             for _ in \"$@\"; do echo '/dev/fake 1 1 943718400 1% /'; done\n",
         );
         boss_testing::create_dir(&dir.join("shared"));
         for args in [
@@ -2813,7 +3227,7 @@ fn a_nested_gate_leaves_the_outer_test_summary_and_claims_only_its_own_run() {
              avail=943718400\n\
              [ \"$n\" -eq 0 ] || avail=1024\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             echo \"/dev/fake 1 1 $avail 1% /\"\n",
+             for _ in \"$@\"; do echo \"/dev/fake 1 1 $avail 1% /\"; done\n",
             calls = calls.display()
         ),
     );
@@ -3152,7 +3566,7 @@ fn the_live_registry_comparisons_are_out_of_the_gate_and_say_why() {
     let tree_half = "crates/core/boss-testing/tests/a_lint_that_reads_the_api_waits_out_a_roll.rs";
     let text = read(tree_half);
     assert!(
-        text.lines().any(|l| l.starts_with("//! tree-wide pin")),
+        text.lines().any(|l| tree_wide_file_marker().is_match(l)),
         "{tree_half} is no longer a tree-wide pin, so a scoped gate may skip it — and with \
          both live comparisons out of the roster, nothing else runs their tree halves on \
          every gate"

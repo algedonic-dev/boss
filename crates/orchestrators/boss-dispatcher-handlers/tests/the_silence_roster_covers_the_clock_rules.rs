@@ -72,6 +72,14 @@ const SWEEP_RULE: &str = "cadence-silence-sweep-daily";
 /// an entry here would be an exemption with nothing to exempt.
 const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
     (
+        "pending-readiness-every-five-minutes",
+        "runs `jobs.reconcile-readiness`, which reevaluates existing packets under their \
+         pinned protocols and emits the existing step promotion events. It opens no packet, \
+         and a healthy pass may promote ZERO steps. A packet-count silence sweep cannot \
+         measure this rule: the work it repairs was opened by other actors and workflows, \
+         not by its five-minute clock (backlog 45479130).",
+    ),
+    (
         "network-census-daily",
         "runs `network.census`, which records an observation and spawns no packet. \
          `kind=network-census` has total=0 and always will — a rule that produces no \
@@ -181,6 +189,24 @@ const SPAWNS_NOTHING_ON_PURPOSE: &[(&str, &str)] = &[
          step it produces NOTHING, and that zero is the healthy reading. The packets it \
          touches are of every kind an agent block appears on, so there is no one kind a \
          sweep keyed by kind could watch.",
+    ),
+    (
+        "an-urgent-item-is-released-when-unrun-and-rescoped-when-long",
+        "runs `jobs.urgent_item_watch`, which releases an urgent item's build claimed with no \
+         open agent-run and no car in flight past its bound, and files one alarm per urgent \
+         item that has run for days without converging (backlog 9788e22d). On an hour with \
+         neither it produces NOTHING, and that zero is the healthy reading; what it files is an \
+         alarm keyed by item, not a packet of a kind a sweep could count, and what it releases \
+         goes back to a queue rather than becoming a packet.",
+    ),
+    (
+        "an-idle-actor-holding-urgent-nominations-is-alarmed",
+        "runs `jobs.idle_actor_watch`, which files one urgent backlog-item alarm per agent \
+         that holds a ready urgent nomination with no agent-run open and none moved inside \
+         its bound (backlog 861360bc), held by the alarm staying open. On a tick with every \
+         holder working it produces NOTHING, and that zero is the healthy reading; what it \
+         files is an alarm keyed by actor, not a packet of a kind a sweep could count. It is \
+         itself the watch on a stopped factory, which no event reports.",
     ),
     (
         "a-declared-worker-receipt-is-observed-every-five-minutes",

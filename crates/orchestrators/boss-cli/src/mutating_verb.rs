@@ -1564,7 +1564,29 @@ pub(crate) fn review_hold_write(
     reason: &str,
     head: Option<&str>,
 ) -> Result<Option<(String, Value)>, String> {
-    Ok(car_hold_write(car, reason)?.map(|(path, mut body)| {
+    let write = match car_hold_write(car, reason)? {
+        Some(write) => Some(write),
+        None => {
+            // afc5147c: a green repair refreshes the held head, while
+            // the existing reason remains the reason for the brake.
+            if head.is_none() || boss_jobs::car_release::hold_sha(car) == head {
+                return Ok(None);
+            }
+            let review = crate::steps::holdable(car)?;
+            let car_id = car.get("id").and_then(Value::as_str).unwrap_or_default();
+            let step_id = review.get("id").and_then(Value::as_str).unwrap_or_default();
+            if car_id.is_empty() || step_id.is_empty() {
+                return Err("the car or its review step carries no id to write the hold to".into());
+            }
+            let md = review.get("metadata").unwrap_or(&Value::Null);
+            let existing = boss_jobs::stranded::hold_reason(md).unwrap_or_else(|| reason.into());
+            Some((
+                format!("/api/jobs/{car_id}/steps/{step_id}/metadata"),
+                crate::steps::hold_patch(md, &existing),
+            ))
+        }
+    };
+    Ok(write.map(|(path, mut body)| {
         if let Some(head) = head {
             body[HOLD_SHA] = Value::String(head.to_string());
         }
@@ -2031,6 +2053,18 @@ mod tests {
     }
 
     #[test]
+    fn a_green_refresh_moves_an_existing_hold_to_the_repaired_head() {
+        let held = car(review("ready", json!({"hold":"area policy", HOLD_SHA:H1})));
+        let (_, body) = review_hold_write(&held, "new reason", Some(H2))
+            .unwrap()
+            .expect("the green refresh must move the held head");
+        assert_eq!(body, json!({"hold":"area policy", HOLD_SHA:H2}));
+        let mut refreshed = held;
+        refreshed["steps"][0]["metadata"] = body;
+        assert_eq!(boss_jobs::car_release::hold_sha(&refreshed), Some(H2));
+    }
+
+    #[test]
     fn the_dock_hold_records_the_head_it_judged_in_the_same_write() {
         let (path, body) =
             review_hold_write(&car(review("ready", json!({}))), "touches x", Some(H1))
@@ -2043,7 +2077,7 @@ mod tests {
         assert_eq!(body, json!({"hold": "touches x", HOLD_SHA: H1}));
         assert_eq!(
             review_hold_write(
-                &car(review("ready", json!({"hold": "area policy"}))),
+                &car(review("ready", json!({"hold": "area policy", HOLD_SHA:H1}))),
                 "r",
                 Some(H1)
             ),
@@ -3398,9 +3432,19 @@ mod tests {
             include_str!("rerail.rs"),
             "async fn finish(",
             "crate::mutating_verb::review_hold_write(car, &reason, bound)",
-            // The call as a statement of `finish`'s body, however rustfmt
-            // wraps its arguments (the proof intent lengthened it, 79a17c7a).
-            &["\n    repoint(\n"],
+            // The hold's own send, and the repoint's — `finish` decides
+            // every write before it makes one, so `--dry-run` can stop
+            // between the two halves (backlog 1e9aeea9).
+            &[
+                ".context(\"holding the car for its review before repointing it\")",
+                "let (path, patch) = repoint;",
+            ],
+        );
+        order(
+            include_str!("rerail.rs"),
+            "async fn finish(",
+            ".context(\"holding the car for its review before repointing it\")",
+            &["let (path, patch) = repoint;"],
         );
         order(
             include_str!("park.rs"),

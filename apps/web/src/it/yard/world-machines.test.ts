@@ -1,6 +1,4 @@
 import { describe, expect, it } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { parseRegions, type Machine, type MachineState } from './regions';
 import { territoryOf } from './world';
 import {
@@ -129,24 +127,5 @@ describe('machineryStrip — every machine the read answers is drawn', () => {
     expect(machineTitle(w)).toBe('conductor · not in your policy scope — withheld: scope');
     expect(machineryLabel([w])).toBe('1 machine: 1 withheld');
     expect(machineOrder([w, machine({ id: 'z', state: 'idle' })]).map((m) => m.id)).toEqual(['z', 'conductor']);
-  });
-});
-
-describe('the map draws what the strip places', () => {
-  const src = readFileSync(join(import.meta.dir, 'WorldMap.svelte'), 'utf8');
-
-  it('renders a glyph per placed machine, with the overflow counted', () => {
-    expect(src).toContain('machineryStrip');
-    expect(src).toContain('data-machine=');
-    expect(src).toContain('machinery.hidden');
-  });
-
-  it('gives every state of the closed set a class of its own — no state falls through to idle', () => {
-    for (const state of STATES) {
-      expect(src, `the glyph styles ${state}`).toContain(`.glyph.${state}`);
-    }
-    // Unknown is a different SHAPE, not a different shade: the dashed
-    // housing and the mark are what tell it from idle at world scale.
-    expect(src).toContain('stroke-dasharray');
   });
 });

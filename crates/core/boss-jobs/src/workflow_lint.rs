@@ -104,6 +104,12 @@ pub fn validate_workflow(spec: &WorkflowSpec, registry: &StepRegistry) -> Vec<Wo
         check_metadata_defaults_values(spec, step, registry, &mut errs);
         check_item_keys_name_an_array(spec, step, &mut errs);
         check_covers_names_an_array_on_the_same_step(spec, step, &mut errs);
+        if crate::human_only::declared(&step.metadata_defaults)
+            && let Err(why) =
+                crate::human_presentation::HumanPresentation::read(&step.metadata_defaults)
+        {
+            errs.push(err(spec, &step.title, why));
+        }
     }
     // Phases 1–3 — viability of the predicate graph.
     check_viability(spec, registry, &mut errs);
@@ -1706,6 +1712,36 @@ mod tests {
         assert!(errs[0].reason.contains("f5ebd2e1"), "{}", errs[0].reason);
     }
 
+    #[test]
+    fn human_presentation_is_required_by_the_canonical_declaration() {
+        for flag in [json!(true), json!(" TRUE ")] {
+            let mut spec = viable_spec("human-presentation");
+            spec.steps[1].metadata_defaults = json!({"human_only": flag});
+            let errors = validate_workflow(&spec, &StepRegistry::v1());
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.reason.contains("human_presentation")),
+                "{errors:?}"
+            );
+            let presentation = json!({"ask":"Approve this change", "why_person":"Your authorization is required", "action":"Review and sign", "after":"The change can proceed", "evidence":"current-step"});
+            spec.steps[1].metadata_defaults["human_presentation"] = presentation.clone();
+            assert!(gate_active(&spec).is_ok());
+            for field in ["ask", "why_person", "action", "after", "evidence"] {
+                for invalid in [json!(null), json!("  "), json!(27)] {
+                    spec.steps[1].metadata_defaults["human_presentation"] = presentation.clone();
+                    spec.steps[1].metadata_defaults["human_presentation"][field] = invalid;
+                    assert!(gate_active(&spec).is_err(), "{field}");
+                }
+            }
+            spec.steps[1].metadata_defaults["human_presentation"] = presentation;
+            spec.steps[1].metadata_defaults["human_presentation"]["evidence"] =
+                json!("javascript:alert(1)");
+            assert!(gate_active(&spec).is_err());
+        }
+        assert!(gate_active(&viable_spec("not-declared-human")).is_ok());
+    }
+
     // Phase 8 — an agent block names a priced model and a positive
     // budget (c87fb59b car 1, 028891cf).
     fn with_agent(agent: crate::agent_spec::AgentSpec) -> WorkflowSpec {
@@ -1775,7 +1811,11 @@ mod tests {
     fn an_agent_block_on_a_human_only_step_is_refused() {
         let reg = StepRegistry::v1();
         let mut spec = with_agent(builder());
-        spec.steps[1].metadata_defaults = json!({ "human_only": true });
+        let human = json!({ "human_only": true, "human_presentation": {
+            "ask":"Review this request", "why_person":"Independent authorization",
+            "action":"Review and sign", "after":"Work may proceed", "evidence":"current-step"
+        }});
+        spec.steps[1].metadata_defaults = human.clone();
         let errs = validate_workflow(&spec, &reg);
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].reason.contains("human_only"), "{}", errs[0].reason);
@@ -1785,7 +1825,8 @@ mod tests {
         spec.steps[1].metadata_defaults = json!({ "human_only": false });
         assert!(validate_workflow(&spec, &reg).is_empty());
         // Both spellings the live registry carries.
-        spec.steps[1].metadata_defaults = json!({ "human_only": "true" });
+        spec.steps[1].metadata_defaults = human;
+        spec.steps[1].metadata_defaults["human_only"] = json!("true");
         assert_eq!(validate_workflow(&spec, &reg).len(), 1);
     }
 

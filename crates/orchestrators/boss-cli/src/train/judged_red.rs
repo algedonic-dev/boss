@@ -362,14 +362,172 @@ pub(crate) fn cars_to_hold(
 /// `boss hold` writes, so `boss release` takes it off. It says which
 /// train, which check, which file, and what to do, because the next
 /// reader is whoever is rebuilding the car.
-pub(crate) fn judged_red_hold_reason(train_id: &str, named: &[String], files: &[String]) -> String {
+///
+/// `files` empty means the car was named as the ONLY car aboard
+/// ([`culprit_cars`]) rather than by a file, and the reason says so.
+/// `failure_line` is the verdict's first failing line
+/// ([`first_failure_line`]), so the rebuilder reads what failed without
+/// opening the train (b4a95f47).
+pub(crate) fn judged_red_hold_reason(
+    train_id: &str,
+    named: &[String],
+    files: &[String],
+    failure_line: Option<&str>,
+) -> String {
+    let why = if files.is_empty() {
+        "as the only car aboard".to_string()
+    } else {
+        format!(
+            "in {}, a file only this car changed in that consist",
+            files.join(", ")
+        )
+    };
+    let line = failure_line
+        .map(|l| format!(" — first failing line: {l}"))
+        .unwrap_or_default();
     format!(
-        "held by the conductor: train {} was judged red ({}) in {}, a file only this car changed \
-         in that consist — rebuild it on current main, re-gate, then `boss release` it (a2d4d842)",
+        "held by the conductor: train {} was judged red ({}) {why}{line} — rebuild it on current \
+         main, re-gate, then `boss release` it (a2d4d842, b4a95f47)",
         id8(train_id),
         named.join(", "),
-        files.join(", ")
     )
+}
+
+/// The forge's failing checks when forge CI ALONE has judged the train
+/// red — the half [`judged_red_checks`] cannot judge (backlog b4a95f47).
+/// A red forge settles the verdict on its own (`combined_verdict`), the
+/// `ci` step is judged in that pass, and a judged train never launches
+/// its gate — so a train whose gate was not filed before the forge went
+/// red (train 496122a0: the cluster at its gate bound) waits for a half
+/// that will never speak, and only the six-hour stall rule released it.
+/// Some only when:
+///
+/// - the train has not merged;
+/// - the forge's verdict is `failing`;
+/// - the train gate has NOT finished (`Failed`/`Green` is the
+///   both-halves rule's to judge, with the gate's receipt to locate by);
+/// - no failing forge check declares a refusal;
+/// - the forge names at least one failing check.
+///
+/// This judges the red; it does not name a culprit. The conductor
+/// cancels on it only when [`culprit_cars`] names one, and a red that
+/// names none keeps today's path: the alert, then the stall rule.
+pub(crate) fn forge_judged_red_checks(
+    train: &Value,
+    forge_verdict: &str,
+    gate: Option<&Standing>,
+    rollup: Option<&Value>,
+) -> Option<Vec<String>> {
+    if step_done(find_step(train, "merged", "Merged into main"))
+        || forge_verdict != "failing"
+        || matches!(gate, Some(Standing::Failed) | Some(Standing::Green))
+        || any_failing_check_refused(rollup)
+    {
+        return None;
+    }
+    let named: Vec<String> = failing_checks(rollup)
+        .into_iter()
+        .filter(|c| c != "unnamed check")
+        .collect();
+    (!named.is_empty()).then_some(named)
+}
+
+/// The cars a judged red names as its culprit: each car that alone
+/// changed a file the verdict locates ([`cars_to_hold`]) — or, when no
+/// file names one and exactly ONE car is aboard, that car with no files.
+/// A train is its cars on a main that was green when they boarded, so a
+/// sole car is the one change the red can be about (train 496122a0: the
+/// failing test read ci.yml, which the car changed, while the log
+/// located only the test, which nobody did). Two or more cars and no
+/// file is no culprit; an empty list is no culprit.
+///
+/// `car_files` MUST be the whole consist — every id in the train's
+/// `boarded_jobs`, open or not — never the cars still open for it: a car
+/// closed mid-ride is still in the tree that was judged, and dropping it
+/// made the other car read as the only one aboard (review 38f094c5).
+pub(crate) fn culprit_cars(
+    located: &[String],
+    car_files: &[(String, Vec<String>)],
+) -> Vec<(String, Vec<String>)> {
+    let held = cars_to_hold(located, car_files);
+    match car_files {
+        [(sole, _)] if held.is_empty() => vec![(sole.clone(), Vec::new())],
+        _ => held,
+    }
+}
+
+/// The `cancelled` step's reason for a forge-judged red with a named
+/// culprit — None when [`culprit_cars`] named nobody, which is the
+/// multi-car red that pages and waits as before. It says which checks,
+/// which car and why that car, and which wait it did not take.
+///
+/// It is written BEFORE the best-effort hold runs, and on whichever pass
+/// names the culprit — the first after the verdict or a later one — so
+/// it states the decision, never that the hold landed or which pass it
+/// was: the culprit's own review step records whether it was held
+/// (review 38f094c5).
+pub(crate) fn forge_culprit_cancel_reason(
+    named: &[String],
+    culprits: &[(String, Vec<String>)],
+    stall_hours: i64,
+) -> Option<String> {
+    if culprits.is_empty() {
+        return None;
+    }
+    let who: Vec<String> = culprits
+        .iter()
+        .map(|(car, files)| {
+            if files.is_empty() {
+                format!("car {}, the only car aboard", id8(car))
+            } else {
+                format!("car {}, which alone changed {}", id8(car), files.join(", "))
+            }
+        })
+        .collect();
+    Some(format!(
+        "judged red on forge CI: {} failed and names its culprit ({}) — cancelled on the \
+         reconcile that named it, without waiting for the train gate (a train judged on CI \
+         alone launches none) or the {stall_hours}h stall rule (b4a95f47); the conductor holds \
+         the culprit if it is still open for this train (its review step records whether the \
+         hold was written) and releases every other car to board a later train",
+        named.join(", "),
+        who.join("; ")
+    ))
+}
+
+/// The bound on [`first_failure_line`]: one line of a hold reason, not a
+/// log.
+pub(crate) const FAILURE_LINE_BYTES: usize = 240;
+
+/// The verdict's first failing LINE, for a hold reason: in the first
+/// failing forge check's log tail, the first line (timestamp and colour
+/// off) that starts `error`/`Error` or carries a failure marker
+/// (`FAILURE_MARKERS`), prefixed with its check; failing that, the gate
+/// receipt's first `fails` line, which already names its check. Bounded
+/// to [`FAILURE_LINE_BYTES`]. None when neither half recorded a line.
+pub(crate) fn first_failure_line(rollup: Option<&Value>, gate_fails: &[String]) -> Option<String> {
+    let forge = failing_check_logs(rollup)
+        .into_iter()
+        .find_map(|(check, tail)| {
+            tail.lines()
+                .map(clean_log_line)
+                .find(|l| {
+                    l.starts_with("error")
+                        || l.starts_with("Error")
+                        || FAILURE_MARKERS.iter().any(|m| l.contains(m))
+                })
+                .map(|l| format!("{check}: {l}"))
+        });
+    let mut line = forge.or_else(|| gate_fails.first().cloned())?;
+    if line.len() > FAILURE_LINE_BYTES {
+        let mut cut = FAILURE_LINE_BYTES;
+        while !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        line.truncate(cut);
+        line.push('…');
+    }
+    Some(line)
 }
 
 #[cfg(test)]
@@ -903,11 +1061,262 @@ error: test failed, to rerun pass `-p boss-testing --test the_sim_bypass_has_one
             F7BD_ID,
             &["CI / web (pull_request)".into(), "svelte-check".into()],
             &["apps/web/src/it/yard/phone-strip.test.ts".into()],
+            None,
         );
         for want in [
             "f7bd1e9d",
             "CI / web (pull_request)",
             "apps/web/src/it/yard/phone-strip.test.ts",
+            "boss release",
+        ] {
+            assert!(r.contains(want), "hold reason lacks {want:?}: {r}");
+        }
+    }
+
+    // -- a forge red whose culprit the conductor can name (b4a95f47) -------
+    //
+    // Train 496122a0 (2026-10-18 17:53Z): ONE car aboard, 10cb67a3
+    // (feat/tag-the-ci-runner-image-by-its-content-stamp-2), red on a
+    // named `CI / web` while its train gate was never filed — the cluster
+    // was at its gate bound, and a train judged on CI alone launches no
+    // gate after — so `judged_red_checks` waited for a half that would
+    // never speak and the train held the one track ~95 minutes, five
+    // released urgent cars behind it, until an operator cancelled it by
+    // hand. The rollup entry is the record's own: its log tail as the
+    // train's `ci` step stamped it, trimmed, never retyped. The failing
+    // test reads ci.yml, which the car changed; the log locates the
+    // test, which no car changed — so the file rule alone names nobody.
+
+    const T4961_ID: &str = "496122a0-1aa0-4188-8946-4cebb83f6122";
+    const T4961_CAR: &str = "10cb67a3-70fa-4a6a-96e3-c2dd13c00a65";
+
+    fn t4961_rollup() -> Value {
+        json!([
+            {"context": "CI / delivery-plan (pull_request)", "conclusion": "SUCCESS", "description": ""},
+            {"context": "CI / build-image (pull_request)", "conclusion": "SUCCESS", "description": ""},
+            {"context": "CI / locomotive (pull_request)", "conclusion": "SUCCESS", "description": ""},
+            {"context": "CI / web (pull_request)", "conclusion": "FAILURE", "description": "",
+             "log_tail": "…(the failure, with context, 8 more further down)\n\
+        2026-10-18T17:53:00.1733544Z error: expect(received).toEqual(expected)\n\
+        2026-10-18T17:53:00.1733620Z \n\
+        2026-10-18T17:53:00.1733701Z - []\n\
+        2026-10-18T17:53:00.1733772Z + [\n\
+        2026-10-18T17:53:00.1733859Z +   \"forge web job is absent, conditional, failure-tolerant or unreadable\",\n\
+        2026-10-18T17:53:00.1733949Z + ]\n\
+        2026-10-18T17:53:00.1734023Z \n\
+        2026-10-18T17:53:00.1734322Z       at <anonymous> (/workspace/david/boss/apps/web/src/shell/gate-matches-ci.test.ts:58:34)\n\
+        2026-10-18T17:53:00.1735184Z (fail) web coverage across both required train lanes > current and assembled residual forge shapes cover the local gate [0.44ms]"}
+        ])
+    }
+
+    /// What car 10cb67a3 changed, off the train's delivery plan.
+    fn t4961_car_files() -> Vec<(String, Vec<String>)> {
+        vec![(
+            T4961_CAR.to_string(),
+            vec![
+                ".forgejo/workflows/ci.yml".to_string(),
+                "crates/core/boss-testing/tests/lighter_ci.rs".to_string(),
+                "crates/core/boss-testing/tests/the_ci_image_is_named_by_its_recipe.rs".to_string(),
+                "docs/architecture-decisions.md".to_string(),
+                "infra/forge/prune-ci-images.lib.sh".to_string(),
+                "infra/lint/ci-tools-declared.sh".to_string(),
+            ],
+        )]
+    }
+
+    #[test]
+    fn train_496122a0_forge_red_with_no_gate_is_judged_on_the_forge_alone() {
+        let rollup = t4961_rollup();
+        let train = train(T4961_ID, "ready");
+        assert_eq!(
+            judged_red_checks(&train, "failing", None, Some(&rollup), &[]),
+            None,
+            "control: the both-halves rule waits for a gate that was never filed"
+        );
+        for gate in [
+            None,
+            Some(Standing::Pending),
+            Some(Standing::Lost),
+            Some(Standing::Refused("disk floor".into())),
+            Some(Standing::Unavailable("no kubectl".into())),
+        ] {
+            assert_eq!(
+                forge_judged_red_checks(&train, "failing", gate.as_ref(), Some(&rollup)),
+                Some(vec!["CI / web (pull_request)".to_string()]),
+                "gate {gate:?}: the forge has spoken red and named its check"
+            );
+        }
+    }
+
+    #[test]
+    fn the_forge_alone_judges_only_a_named_unrefused_unmerged_red_the_gate_has_not_judged() {
+        let rollup = t4961_rollup();
+        let open = train(T4961_ID, "ready");
+        // A finished gate is the both-halves rule's to judge.
+        for gate in [Standing::Failed, Standing::Green] {
+            assert_eq!(
+                forge_judged_red_checks(&open, "failing", Some(&gate), Some(&rollup)),
+                None,
+                "{gate:?}"
+            );
+        }
+        for verdict in ["green", "pending", "aborted"] {
+            assert_eq!(
+                forge_judged_red_checks(&open, verdict, None, Some(&rollup)),
+                None,
+                "{verdict}"
+            );
+        }
+        assert_eq!(
+            forge_judged_red_checks(
+                &train(T4961_ID, "completed"),
+                "failing",
+                None,
+                Some(&rollup)
+            ),
+            None,
+            "a merged train is never judged"
+        );
+        let refused = json!([
+            {"context": "CI / locomotive", "conclusion": "FAILURE", "description": "refused: disk floor"}
+        ]);
+        assert_eq!(
+            forge_judged_red_checks(&open, "failing", None, Some(&refused)),
+            None,
+            "infrastructure is not a verdict"
+        );
+        let unnamed = json!([{"conclusion": "FAILURE"}]);
+        assert_eq!(
+            forge_judged_red_checks(&open, "failing", None, Some(&unnamed)),
+            None,
+            "a red that names nothing is not judged"
+        );
+    }
+
+    #[test]
+    fn train_496122a0_names_its_only_car_as_the_culprit() {
+        let rollup = t4961_rollup();
+        let located = verdict_located_files(&[], &[], Some(&rollup));
+        assert!(
+            cars_to_hold(&located, &t4961_car_files()).is_empty(),
+            "control: the log locates no file the car changed: {located:?}"
+        );
+        let culprits = culprit_cars(&located, &t4961_car_files());
+        assert_eq!(culprits, vec![(T4961_CAR.to_string(), Vec::new())]);
+        let reason =
+            forge_culprit_cancel_reason(&["CI / web (pull_request)".to_string()], &culprits, 6)
+                .expect("a named culprit cancels");
+        for want in [
+            "CI / web (pull_request)",
+            "10cb67a3",
+            "only car aboard",
+            "b4a95f47",
+            "6h",
+        ] {
+            assert!(
+                reason.contains(want),
+                "cancel reason lacks {want:?}: {reason}"
+            );
+        }
+        // Review 38f094c5: the reason is written BEFORE the best-effort
+        // hold runs, and on whichever pass names the culprit — so it may
+        // claim neither a hold that has landed nor the first reconcile.
+        for never in ["culprit is held", "first reconcile"] {
+            assert!(
+                !reason.contains(never),
+                "cancel reason claims {never:?}: {reason}"
+            );
+        }
+    }
+
+    /// The other half of the acceptance: a multi-car forge red that no
+    /// file pins on one car names no culprit, so nothing is cancelled
+    /// early — it pages as today and the stall rule stays its backstop.
+    #[test]
+    fn a_multi_car_forge_red_with_no_culprit_cancels_nothing_early() {
+        let rollup = t4961_rollup();
+        let located = verdict_located_files(&[], &[], Some(&rollup));
+        let mut two = t4961_car_files();
+        two.push((
+            "eed1f6a0-a7ea-4884-9819-a1fe2d6b009b".to_string(),
+            vec!["infra/cluster/dev-memory-watch.sh".to_string()],
+        ));
+        let culprits = culprit_cars(&located, &two);
+        assert!(culprits.is_empty(), "{culprits:?}");
+        assert_eq!(
+            forge_culprit_cancel_reason(&["CI / web (pull_request)".to_string()], &culprits, 6),
+            None
+        );
+        assert!(
+            culprit_cars(&located, &[]).is_empty(),
+            "no car read is no culprit"
+        );
+    }
+
+    /// A multi-car forge red whose log locates a file only one car
+    /// changed names THAT car, as the gate's located rule always has.
+    #[test]
+    fn a_multi_car_forge_red_located_in_one_cars_file_names_that_car() {
+        let rollup = f7bd_rollup();
+        let located = verdict_located_files(&[], &[], Some(&rollup));
+        let culprits = culprit_cars(&located, &f7bd_car_files());
+        assert_eq!(
+            culprits,
+            vec![(
+                "6c7c75f7-4f34-4f5f-87c0-3737e92a66ed".to_string(),
+                vec!["apps/web/src/it/yard/phone-strip.test.ts".to_string()]
+            )]
+        );
+        let reason =
+            forge_culprit_cancel_reason(&["CI / web (pull_request)".to_string()], &culprits, 6)
+                .expect("named");
+        assert!(
+            reason.contains("6c7c75f7") && reason.contains("phone-strip.test.ts"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn the_failure_line_is_the_first_failing_line_of_the_failing_check() {
+        assert_eq!(
+            first_failure_line(Some(&t4961_rollup()), &[]).as_deref(),
+            Some("CI / web (pull_request): error: expect(received).toEqual(expected)")
+        );
+        assert_eq!(
+            first_failure_line(Some(&f7bd_rollup()), &[]).as_deref(),
+            Some(
+                "CI / web (pull_request): Error: Conversion of type '{ thirds: { third: string; regions: string[]; }[]; }' may be a mistake"
+            )
+        );
+        // No forge log: the gate receipt's first `fails` line is the line.
+        assert_eq!(
+            first_failure_line(None, &f7bd_gate_fails()).as_deref(),
+            Some(f7bd_gate_fails()[0].as_str())
+        );
+        assert_eq!(first_failure_line(None, &[]), None);
+        let long = vec![format!("test: {}", "x".repeat(2000))];
+        let line = first_failure_line(None, &long).expect("a line");
+        assert!(
+            line.len() <= FAILURE_LINE_BYTES + '…'.len_utf8(),
+            "{}",
+            line.len()
+        );
+    }
+
+    #[test]
+    fn a_sole_cars_hold_names_the_check_and_the_failing_line() {
+        let line = first_failure_line(Some(&t4961_rollup()), &[]);
+        let r = judged_red_hold_reason(
+            T4961_ID,
+            &["CI / web (pull_request)".into()],
+            &[],
+            line.as_deref(),
+        );
+        for want in [
+            "496122a0",
+            "CI / web (pull_request)",
+            "only car aboard",
+            "error: expect(received).toEqual(expected)",
             "boss release",
         ] {
             assert!(r.contains(want), "hold reason lacks {want:?}: {r}");

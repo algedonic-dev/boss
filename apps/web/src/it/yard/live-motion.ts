@@ -1,5 +1,5 @@
 // REAL PACKETS MOVING ON THE MAP — the rules (design e765b3fc §3, car M2
-// on feedback 84cba7e2; behind the flight `it-map-live`). David,
+// on feedback 84cba7e2; promoted on 2026-10-23). David,
 // 2026-09-25: "visualize the actual jobs/cars moving as the animation
 // rather than a representative ... a ping and a slow-mo transit between
 // the stations to show the jobs moving."

@@ -21,7 +21,8 @@
 // unmeasured rate gets its own density band so it cannot be mistaken
 // for an empty rail.
 
-import { fetchRemote, type Remote } from '../../data/remote';
+import type { Remote } from '../../data/remote';
+import { fetchMapReading } from './map-reading';
 import { NOT_IN_SCOPE } from '../../policy/withheld';
 import type { RegionState, Trend } from './regions';
 import { parseRecordedWait, type RecordedWait } from './waits';
@@ -180,7 +181,7 @@ export function parseBorders(raw: unknown): Borders {
 }
 
 export async function fetchBorders(): Promise<Remote<Borders>> {
-  return fetchRemote('/api/yard/borders', parseBorders);
+  return fetchMapReading('/api/yard/borders', parseBorders);
 }
 
 // ---------------------------------------------------------------------

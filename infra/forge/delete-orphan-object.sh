@@ -39,13 +39,15 @@
 #   1. THE ARGUMENT'S SHAPE. `<Kind>/<namespace>/<name>`, the same
 #      pattern the allowlist validated, checked again here so the bound
 #      does not depend on one layer (the run-car-probe convention).
-#   2. A COMMITTED DECLARATION SET. The manifests directory must be
-#      clean in git. An uncommitted edit — a rename in progress, a local
-#      experiment — means the tree that proves the object undeclared is
-#      not a tree anyone reviewed. This is the answer to "what if a
-#      manifest is mid-rename": a rename that is not committed is not a
-#      declaration set, and a rename that IS committed has removed the
-#      old name on purpose.
+#   2. A DECLARATION SET THAT IS A COMMIT. The tree read is a generation
+#      of root's own tree (infra/forge/root-tree.sh), proved against the
+#      store beside it to be its commit, byte for byte, and nothing else.
+#      An edit nobody committed — a rename in progress, a local
+#      experiment, a symlink — means the tree that proves the object
+#      undeclared is not a tree anyone reviewed. This is the answer to
+#      "what if a manifest is mid-rename": a rename that is not committed
+#      is not a declaration set, and a rename that IS committed has
+#      removed the old name on purpose.
 #   3. THE DERIVATION. `undeclared-objects.sh --check` must say
 #      undeclared. It refuses, by name, for a declared object, a
 #      namespace the tree does not own, a kind the tree declares nothing
@@ -78,14 +80,18 @@
 #
 # ENV
 #   BOSS_CLUSTER_TREE  the tree whose manifests are the declaration set
-#                      (default: the runner's BOSS_OPS_CHECKOUT, else the
-#                      repository this script lives in — the forge's
-#                      runner executes root's tree, which has no .git to
-#                      read, so its drop-in hands the checkout; backlog
-#                      a604a35b). A test seam; a packet cannot set it,
+#                      (default: the tree this script lives in — on the
+#                      forge, the generation of root's tree the runner
+#                      started from). Whatever it names must be a
+#                      generation, <tree>/gen/<sha> beside <tree>/repo.git
+#                      (bound 2). A test seam; a packet cannot set it,
 #                      because the ops-runner passes no packet-supplied
 #                      environment — only an argv built from the
-#                      allowlist.
+#                      allowlist. BOSS_OPS_CHECKOUT, the checkout the
+#                      forge's runner hands its git verbs, is deliberately
+#                      NOT read: until backlog 1dde630c it was this
+#                      default, and its owner could edit what root then
+#                      derived its authority from.
 #   BOSS_KUBECTL       see undeclared-objects.sh; resolved there, once.
 #   KUBECONFIG         a credential that can read the managed namespaces
 #                      and delete in them. Under the ops-runner there is
@@ -98,10 +104,13 @@ ME="delete-orphan-object"
 say() { echo "$ME: $*" >&2; }
 refuse() { say "REFUSED — $*"; exit 2; }
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$SELF_DIR/.." && cd .. && pwd)"
+# Physical, once: started as /var/lib/boss/tree/current/..., this names
+# the generation itself, which a move of `current` cannot change under
+# the run (the ops runner resolves its own directory the same way).
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO="$(cd "$SELF_DIR/../.." && pwd -P)"
 DERIVE="$REPO/infra/cluster/undeclared-objects.sh"
-TREE="${BOSS_CLUSTER_TREE:-${BOSS_OPS_CHECKOUT:-$REPO}}"
+TREE="${BOSS_CLUSTER_TREE:-$REPO}"
 MANIFEST_REL="infra/cluster/manifests"
 
 # --- bound 1: the argument's shape -----------------------------------------
@@ -131,78 +140,95 @@ fi
 TMP=$(mktemp -d) || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
-# --- EVERY git CALL RUNS AS THE CHECKOUT'S OWNER, READS INCLUDED -----------
+# --- bound 2: the declaration set is a verified generation of root's tree --
 #
-# Measured on the forge, 2026-09-10 (ops-request c9877f75): the first live
-# run through the audited door refused with "/home/david/boss is not a git
-# checkout". It is one — forge-converge.sh fetches into it every tick. What
-# failed is that the ops-runner executes verbs AS ROOT, and since git
-# 2.35.2 a repository owned by somebody else is "dubious ownership" and
-# every command refuses. So a bound that was correct was also
-# unsatisfiable, and the only thing that could satisfy it was a human.
+# THE DEFECT (backlog 1dde630c, review a8b752d4 N6). This verb runs as
+# root. Its declaration set used to be a CHECKOUT — on the forge the one
+# the runner hands its git verbs, which its owner can edit — and the only
+# proof that the set was reviewed content was `git status` over
+# $MANIFEST_REL. The derivation reads more than the manifests:
+# instances.toml and the renderer's RENDERS line (the per-instance
+# exemption), infra/gate-runner/*.yaml, the consist worker's job.json, the
+# dev and isolation declarations. Any of them could be edited uncommitted,
+# or replaced by a symlink root then followed — and an uncommitted
+# instances.toml that moved the instance out of `boss` made the ConfigMap
+# the converge renders and mounts there read as undeclared, and deletable.
 #
-# Two reasons to drop, and the read is only the first: root git WRITES in a
-# user-owned clone leave root-owned objects that break the owner's later
-# pulls (forge-converge.sh says so eight lines from where it avoids it).
-# This script only reads, but silencing the ownership check with
-# safe.directory would buy the read at the price of making that second
-# hazard reachable by the next edit. Drop instead.
+# Root's own tree is the answer that already exists (infra/forge/root-
+# tree.sh, design c98c79aa): one root-owned export per commit main named,
+# gen/<sha>, beside root's own bare store, repo.git, never written again.
+# So the tree must BE such a generation — its name a commit, its
+# `.boss-tree-sha` saying the same, the store beside it — every directory
+# of the layout this uid's and writable by nobody else, and then it is
+# PROVED to be that commit against the store: every tracked path matches
+# its blob (content, mode and type, so a symlink or an exec bit is a
+# difference) and nothing but `.boss-tree-sha` is present that the commit
+# does not carry. Any difference is a refusal naming the path, before the
+# derivation reads a byte.
 #
-# The helper is infra/gcp/boss-gcp-converge.sh's `as_owner`, for the same
-# hazard on the same shape of host; the invocation is the probe runner's
-# non-login `runuser -u <user> --` with an explicit HOME
-# (the shape the retired run-car-probe.sh used), because these are reads that need no credential
-# helper and a login shell's profile output would be captured as part of a
-# `rev-parse`. The owner is READ OFF THE DIRECTORY, never hardcoded, so a
-# host that lands the checkout under a different account does not silently
-# start failing — or, worse, corrupting.
+# Root's git in root's store needs no privilege drop, which is why the
+# as_owner drop this block replaced is gone: it existed because root
+# cannot read a clone it does not own ("dubious ownership", ops-request
+# c9877f75), and this verb no longer reads a clone. The store is read the
+# way root-tree.sh reads it — no account's config, no system config, no
+# hook — through an index of this run's own, so nothing in the store is
+# written.
 case "$TREE" in
     *[[:space:]\'\"]*) refuse "the tree path \`$TREE\` contains whitespace or a quote; name one without" ;;
 esac
 [ -d "$TREE" ] || refuse "the tree $TREE does not exist, so there is no declaration set to read"
-OWNER="${BOSS_CLUSTER_TREE_OWNER:-$(stat -c %U "$TREE" 2>/dev/null)}"
-OWNER_UID="$(stat -c %u "$TREE" 2>/dev/null)"
-# `stat -c %U` prints UNKNOWN when no passwd entry exists for the owning
-# uid — a sibling car learned that the hard way. Proceeding would run git
-# as the caller again, which is the defect this block exists for, so
-# refuse and name what could not be resolved.
-if [ -z "$OWNER" ] || [ "$OWNER" = "UNKNOWN" ]; then
-    refuse "cannot resolve the owner of $TREE (stat says '${OWNER:-}', uid ${OWNER_UID:-?}) — no passwd entry, so there is no account to read git as"
+TREE="$(cd "$TREE" && pwd -P)" || refuse "cannot resolve the tree $TREE"
+SHA="${TREE##*/}"
+GEN_DIR="${TREE%/*}"
+ROOT_TREE="${GEN_DIR%/*}"
+STORE="$ROOT_TREE/repo.git"
+if ! [[ "$SHA" =~ ^[0-9a-f]{40,64}$ ]] || [ "${GEN_DIR##*/}" != gen ] || [ ! -d "$STORE" ]; then
+    say "REFUSED — $TREE is not a generation of root's tree: <tree>/gen/<sha> with <tree>/repo.git"
+    say "  beside it (infra/forge/root-tree.sh). A checkout, however clean, is a tree its owner can"
+    say "  edit between this check and the derivation's read, so it is no declaration set for root."
+    exit 2
 fi
-if ! id -u "$OWNER" >/dev/null 2>&1; then
-    refuse "the owner of $TREE is '$OWNER' (uid ${OWNER_UID:-?}), which is not an account on this host — refusing to read its git as $(id -un)"
-fi
-OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"
-as_owner() { # <command string>
-    if [ "$(id -un)" = "$OWNER" ]; then
-        bash -c "$1"
-    else
-        runuser -u "$OWNER" -- env HOME="${OWNER_HOME:-/}" PATH="$PATH" bash -c "$1"
-    fi
+[ "$(cat -- "$TREE/.boss-tree-sha" 2>/dev/null)" = "$SHA" ] \
+    || refuse "$TREE/.boss-tree-sha does not say it is ${SHA:0:12} — not a generation root-tree.sh made"
+ME_UID="$(id -u)"
+for d in "$ROOT_TREE" "$GEN_DIR" "$TREE" "$STORE"; do
+    owner_uid="$(stat -c %u -- "$d" 2>/dev/null)"
+    { [ "$owner_uid" = "$ME_UID" ] && [ ! -L "$d" ]; } \
+        || refuse "$d is owned by uid ${owner_uid:-unknown}, not this uid ($ME_UID), or is a symlink — another account could rewrite the declaration set under this run"
+    [ -z "$(find "$d" -maxdepth 0 -perm /0022 2>/dev/null)" ] \
+        || refuse "$d is writable by its group or by anyone ($(stat -c %A -- "$d")) — another account could rewrite the declaration set under this run"
+done
+store_git() {
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_INDEX_FILE="$TMP/index" \
+        git -c core.hooksPath=/dev/null --git-dir="$STORE" --work-tree="$TREE" "$@"
 }
-
-# --- bound 2: a committed declaration set ----------------------------------
-if ! as_owner "git -C '$TREE' rev-parse --git-dir" >/dev/null 2>"$TMP/git.err"; then
-    say "REFUSED — cannot read $TREE as a git checkout (read as '$OWNER'), so the declaration set"
-    say "  is not reviewable content. git said:"
-    sed 's/^/    /' "$TMP/git.err" >&2
-    say "  If that mentions dubious ownership, the read did NOT drop to the owner — which is"
-    say "  the defect ops-request c9877f75 found, and what as_owner in this script prevents."
+store_git cat-file -e "$SHA^{commit}" 2>"$TMP/git.err" \
+    || refuse "the store $STORE does not hold the commit ${SHA:0:12} this generation names, so nothing proves what it is: $(tr '\n' ' ' <"$TMP/git.err")"
+store_git read-tree "$SHA" 2>"$TMP/git.err" \
+    || refuse "cannot read the commit ${SHA:0:12} out of $STORE: $(tr '\n' ' ' <"$TMP/git.err")"
+# Hashes every tracked file against its blob; a path that differs stays
+# unrefreshed and is listed below. Its own exit says only that some did.
+store_git update-index -q --refresh >/dev/null 2>&1
+store_git diff-files --name-only >"$TMP/differs" 2>"$TMP/git.err" \
+    || refuse "cannot compare $TREE with its commit: $(tr '\n' ' ' <"$TMP/git.err")"
+store_git ls-files --others >"$TMP/others" 2>"$TMP/git.err" \
+    || refuse "cannot list what $TREE holds beyond its commit: $(tr '\n' ' ' <"$TMP/git.err")"
+# grep's 1 is "nothing else is there"; only a 2 is a read that failed.
+extra="$(grep -vxF .boss-tree-sha "$TMP/others")" || [ $? -eq 1 ] \
+    || refuse "cannot read the list of what $TREE holds beyond its commit"
+if [ -s "$TMP/differs" ] || [ -n "$extra" ]; then
+    say "REFUSED — $TREE is not the commit ${SHA:0:12} it says it is, so the tree that would prove"
+    say "  this object undeclared is not one anybody reviewed. Differs from the commit:"
+    sed 's/^/    /' "$TMP/differs" >&2
+    [ -z "$extra" ] || { say "  Not in the commit at all:"; printf '%s\n' "$extra" | sed 's/^/    /' >&2; }
+    say "  A proved generation must remain unchanged after export; these paths differ from its record."
     exit 2
 fi
-dirty=$(as_owner "git -C '$TREE' status --porcelain -- '$MANIFEST_REL'" 2>/dev/null)
-if [ -n "$dirty" ]; then
-    say "REFUSED — $MANIFEST_REL has uncommitted changes, so the tree that would prove this object"
-    say "  undeclared is not one anybody reviewed. A rename in progress is exactly this state:"
-    printf '    %s\n' "$dirty" >&2
-    say "  Commit or discard them, then ask again."
-    exit 2
-fi
-# Read once, reported twice: the sha the declaration set came from.
-HEAD_SHA=$(as_owner "git -C '$TREE' rev-parse --short HEAD" 2>/dev/null)
+# Read once, reported twice: the commit the declaration set came from.
+HEAD_SHA="${SHA:0:12}"
 
 # --- bound 3: the derivation -----------------------------------------------
-say "deriving authority from $MANIFEST_REL at ${HEAD_SHA:-?} (owner $OWNER) via ${DERIVE#"$REPO"/}"
+say "deriving authority from $MANIFEST_REL at $HEAD_SHA (root's generation $TREE, proved against $STORE) via ${DERIVE#"$REPO"/}"
 BOSS_CLUSTER_TREE="$TREE" "$DERIVE" --check "$TARGET" >"$TMP/check.out" 2>"$TMP/check.err"
 rc=$?
 # The derivation's own words, always — on every path. A refusal whose

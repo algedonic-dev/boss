@@ -1286,8 +1286,14 @@ fn in_roots_tree_the_kit_readers_rule_names_the_forge_user_not_the_trees_owner()
     );
     assert_eq!(
         read(&i.dir.join("libexec/recovery-kit-read")),
-        read(&i.tree.join("current/infra/forge/recovery-kit-read.sh")),
-        "the reader root runs is the tree's"
+        format!(
+            "#!/bin/bash\n{}{}",
+            read(&i.tree.join("current/infra/lib/secret-header.sh")),
+            read(&i.tree.join("current/infra/forge/recovery-kit-read.sh"))
+                .strip_prefix("#!/bin/bash\n")
+                .unwrap()
+        ),
+        "the root reader contains exactly the generation's canonical helper and reader"
     );
     // The packet says who holds the rule, read back off the rule.
     let summary: serde_json::Value =

@@ -829,10 +829,10 @@ const REPORT = {
   timings: {
     boarded_at: '2026-08-13T08:50:00Z',
     merged_at: '2026-08-13T09:15:00Z',
-    deployed_at: '2026-08-13T09:22:00Z',
+    converged_at: '2026-08-13T09:22:00Z',
     arrived_at: '2026-08-13T09:24:00Z',
     board_to_merge_s: 1500,
-    merge_to_deploy_s: 420,
+    merge_to_converge_s: 420,
     total_s: 2040,
   },
 };
@@ -910,29 +910,31 @@ describe('arrivalReport', () => {
 // ---------------------------------------------------------------------------
 
 describe('arrivalMedians', () => {
-  const leg = (id: string, pr: string, merged: string, deployed: string): JobLite =>
+  const leg = (id: string, pr: string, merged: string, converged: string): JobLite =>
     train({
       id,
       status: 'closed',
       metadata: { outcome: 'arrived' },
-      steps: [at('pr', pr), at('merged', merged), at('deployed', deployed)],
+      // `deployed` carries the merge instant, as on every live train
+      // (backlog 4472781d): the leg must be read off `converged`.
+      steps: [at('pr', pr), at('merged', merged), at('deployed', merged), at('converged', converged)],
     });
 
   test('fewer than two usable samples is a no-estimate state', () => {
     expect(arrivalMedians([])).toEqual({
       boardToMergeS: null,
-      mergeToDeployS: null,
+      mergeToConvergeS: null,
       samples: 0,
     });
     const one = leg('a', '2026-08-13T09:00:00Z', '2026-08-13T09:30:00Z', '2026-08-13T09:40:00Z');
     expect(arrivalMedians([one])).toEqual({
       boardToMergeS: null,
-      mergeToDeployS: null,
+      mergeToConvergeS: null,
       samples: 1,
     });
     // Timestamps the conductor never stamped are not samples.
     const blind = train({ id: 'b', status: 'closed', metadata: { outcome: 'arrived' },
-      steps: [s('pr', 'completed'), s('merged', 'completed'), s('deployed', 'completed')] });
+      steps: [s('pr', 'completed'), s('merged', 'completed'), s('converged', 'completed')] });
     expect(arrivalMedians([one, blind]).boardToMergeS).toBeNull();
   });
 
@@ -942,7 +944,7 @@ describe('arrivalMedians', () => {
       leg('b', '2026-08-12T09:00:00Z', '2026-08-12T09:10:00Z', '2026-08-12T09:20:00Z'), // 600 / 600
       leg('c', '2026-08-11T09:00:00Z', '2026-08-11T09:20:00Z', '2026-08-11T09:35:00Z'), // 1200 / 900
     ]);
-    expect(m).toEqual({ boardToMergeS: 1200, mergeToDeployS: 600, samples: 3 });
+    expect(m).toEqual({ boardToMergeS: 1200, mergeToConvergeS: 600, samples: 3 });
     // Even counts average the two middles.
     expect(
       arrivalMedians([
@@ -960,15 +962,43 @@ describe('arrivalMedians', () => {
         metadata: { outcome: 'arrived' },
         steps: [
           s('arrived', 'completed', {
-            arrival_report: { timings: { board_to_merge_s: bm, merge_to_deploy_s: md } },
+            arrival_report: { timings: { board_to_merge_s: bm, merge_to_converge_s: md } },
           }),
         ],
       });
     expect(arrivalMedians([reported('a', 900, 200), reported('b', 1100, 400)])).toEqual({
       boardToMergeS: 1000,
-      mergeToDeployS: 300,
+      mergeToConvergeS: 300,
       samples: 2,
     });
+  });
+
+  // Reports filed before backlog 4472781d carry `merge_to_deploy_s`,
+  // which was 0 (or a 1 s stamp skew) on every arrived train: the
+  // conductor stamps `deployed` in the same pass as `merged`. That zero
+  // is not a leg. An old report is timed off its `converged` stamp
+  // instead, the instant the deploy was observed.
+  test('a report’s merge-instant deploy zero is never read as the leg', () => {
+    const old = (id: string, merged: string, converged: string): JobLite =>
+      train({
+        id,
+        status: 'closed',
+        metadata: { outcome: 'arrived' },
+        steps: [
+          at('merged', merged),
+          at('deployed', merged),
+          at('converged', converged),
+          s('arrived', 'completed', {
+            arrival_report: { timings: { board_to_merge_s: 900, merge_to_deploy_s: 0 } },
+          }),
+        ],
+      });
+    expect(
+      arrivalMedians([
+        old('a', '2026-10-21T06:54:50Z', '2026-10-21T06:58:25Z'), // 215
+        old('b', '2026-10-21T05:56:29Z', '2026-10-21T06:04:20Z'), // 471
+      ]).mergeToConvergeS,
+    ).toBe(343);
   });
 
   test('only the last N arrivals count', () => {
@@ -977,7 +1007,7 @@ describe('arrivalMedians', () => {
     );
     const ancient = leg('old', '2026-01-01T09:00:00Z', '2026-01-01T19:00:00Z', '2026-01-02T09:00:00Z');
     const m = arrivalMedians([...recent, ancient], 5);
-    expect(m).toEqual({ boardToMergeS: 600, mergeToDeployS: 300, samples: 5 });
+    expect(m).toEqual({ boardToMergeS: 600, mergeToConvergeS: 300, samples: 5 });
   });
 });
 
@@ -995,7 +1025,7 @@ describe('etaPhase', () => {
 });
 
 describe('trainEta', () => {
-  const M = { boardToMergeS: 1800, mergeToDeployS: 600, samples: 4 } as const;
+  const M = { boardToMergeS: 1800, mergeToConvergeS: 600, samples: 4 } as const;
   const now = Date.parse('2026-08-13T09:00:00Z');
 
   test('a boarded train: the rest of the board→merge leg plus the deploy leg', () => {
@@ -1012,7 +1042,7 @@ describe('trainEta', () => {
     });
   });
 
-  test('a departed train rides the merge→deploy median alone, clamped at now', () => {
+  test('a departed train rides the merge→converge median alone, clamped at now', () => {
     const t = train({
       steps: [
         at('pr', '2026-08-13T08:00:00Z'),
@@ -1075,7 +1105,8 @@ describe('the yard wires ETAs onto trains in flight', () => {
         steps: [
           at('pr', `${d}T08:00:00Z`),
           at('merged', `${d}T08:30:00Z`),
-          at('deployed', `${d}T08:40:00Z`),
+          at('deployed', `${d}T08:30:00Z`),
+          at('converged', `${d}T08:40:00Z`),
           at('arrived', `${d}T08:41:00Z`),
         ],
       }),
@@ -1086,7 +1117,7 @@ describe('the yard wires ETAs onto trains in flight', () => {
     });
     const now = Date.parse('2026-08-13T09:10:00Z');
     const y = assembleYard([flying, ...arrivals], [], null, now);
-    // medians: board→merge 1800, merge→deploy 600; 600s elapsed.
+    // medians: board→merge 1800, merge→converge 600; 600s elapsed.
     expect(y.inFlight[0]?.eta).toEqual({
       kind: 'eta',
       phase: 'merging',
@@ -1753,8 +1784,34 @@ describe('TrainRow reads the train gate off the train and its ci step', () => {
       none,
       false,
     ).gate;
-    expect(g).toEqual({ run: '0123456789abcdef', line: null, forge: null, fallback: null, wait_reason: null, wait_since: null, relaunches: 1 });
+    expect(g).toEqual({
+      run: '0123456789abcdef',
+      line: null,
+      forge: null,
+      fallback: null,
+      wait_reason: null,
+      bound_wait: null,
+      wait_since: null,
+      relaunches: 1,
+    });
     expect(g && trainGateLabel(g)).toBe('forge pending · gate running (01234567) · relaunched 1×');
+  });
+
+  // ae37ab73 / edf2146e-shaped record (review 0e73d943): the native
+  // CREATE was uncertain, but the conductor already bound its run.
+  test('a filed gate is not an unfiled launch when CREATE was uncertain', () => {
+    const run = '815e87cb';
+    const why = `native Job at the immutable name does not match the recorded launch (gate-run ${run} was filed first; inspect its recorded outcome)`;
+    for (const recorded of [
+      train({ metadata: { train_gate_run: run, train_gate_wait_reason: why }, steps: [s('ci', 'ready')] }),
+      train({ metadata: { train_gate_wait_reason: why }, steps: [s('ci', 'ready', { train_gate_run: run })] }),
+    ]) {
+      const g = toTrainRow(recorded, none, false).gate;
+      expect(g?.run).toBe(run);
+      expect(g?.wait_reason).toBe(why);
+      expect(g && trainGateTroubled(g)).toBe(false);
+      expect(g && trainGateLabel(g)).toContain('gate running (815e87cb)');
+    }
   });
 
   test('once judged, the ci step carries both halves in the conductor words', () => {
@@ -1828,7 +1885,7 @@ describe('TrainRow reads the train gate off the train and its ci step', () => {
     const why = 'the cluster is at its gate bound (3 running of 3: a, b, c) — the train holds the first place';
     const g = toTrainRow(
       train({
-        metadata: { train_gate_wait_reason: why, train_gate_launched_at: '2026-10-10T11:50:00Z' },
+        metadata: { train_gate_wait_reason: why, train_gate_bound_wait: why, train_gate_launched_at: '2026-10-10T11:50:00Z' },
         steps: [s('pr', 'completed', { completed_at: '2026-10-10T11:40:00Z' }), s('ci', 'ready')],
       }),
       none,
@@ -1843,7 +1900,7 @@ describe('TrainRow reads the train gate off the train and its ci step', () => {
     // A first wait, never launched, is dated from the PR's opening.
     const first = toTrainRow(
       train({
-        metadata: { train_gate_wait_reason: why },
+        metadata: { train_gate_wait_reason: why, train_gate_bound_wait: why },
         steps: [s('pr', 'completed', { completed_at: '2026-10-10T11:40:00Z' }), s('ci', 'ready')],
       }),
       none,
@@ -1851,6 +1908,85 @@ describe('TrainRow reads the train gate off the train and its ci step', () => {
     ).gate;
     expect(first?.wait_since).toBe('2026-10-10T11:40:00Z');
     expect(first && trainGateTroubled(first, at('2026-10-10T11:53:00Z'))).toBe(true);
+  });
+
+  // Review a2ace778 of car 1585a455, finding 1: the conductor writes the
+  // wait reason on EVERY failed launch (a manifest that does not render,
+  // kubectl, RBAC) and the place in line only when the bound refused it
+  // (backlog 82071657). Only the place settles; a failed launch is
+  // trouble at once, however recent the launch — track.rs
+  // `train_gate_unfiled` reads the same keys in the same order.
+  test('a failed launch is trouble at once; only the place in line at the bound settles', () => {
+    const at = (iso: string): number => Date.parse(iso);
+    const fault = 'rendering the runner manifest: No such file or directory';
+    const broken = toTrainRow(
+      train({
+        metadata: { train_gate_wait_reason: fault, train_gate_launch_failures: 1, train_gate_launched_at: '2026-10-10T11:59:00Z' },
+        steps: [s('pr', 'completed', { completed_at: '2026-10-10T11:40:00Z' }), s('ci', 'ready')],
+      }),
+      none,
+      false,
+    ).gate;
+    expect(broken?.bound_wait).toBeNull();
+    expect(broken && trainGateTroubled(broken, at('2026-10-10T12:00:00Z'))).toBe(true);
+    const bound = 'the cluster is at its gate bound (3 running of 3: a, b, c)';
+    const waiting = toTrainRow(
+      train({
+        metadata: { train_gate_wait_reason: bound, train_gate_bound_wait: bound, train_gate_launched_at: '2026-10-10T11:59:00Z' },
+        steps: [s('pr', 'completed', { completed_at: '2026-10-10T11:40:00Z' }), s('ci', 'ready')],
+      }),
+      none,
+      false,
+    ).gate;
+    expect(waiting && trainGateTroubled(waiting, at('2026-10-10T12:00:00Z'))).toBe(false);
+  });
+
+  // Finding 2: a gate-run that ended without a usable verdict is appended
+  // to `train_gate_refusals` with its `at`, and the train holds its place
+  // for the relaunch — with no wait reason, the refusal pass writes none.
+  // The wait is dated from the refusal, not from the launch before it.
+  test('a relaunch after a refusal is read as waiting, dated from the refusal', () => {
+    const at = (iso: string): number => Date.parse(iso);
+    const place = 'gate-run 0123abcd ended without a usable verdict; the train holds the first place in the gate line for its relaunch';
+    const g = toTrainRow(
+      train({
+        metadata: {
+          train_gate_bound_wait: place,
+          train_gate_relaunches: 2,
+          train_gate_launched_at: '2026-10-10T11:20:00Z',
+          train_gate_refusals: [
+            { gate_run: '0123abcd', why: 'the Job ended', at: '2026-10-10T11:40:00Z' },
+            { gate_run: '4567ef01', why: 'the Job ended', at: '2026-10-10T11:57:00Z' },
+            { gate_run: 'garbled', at: 'yesterday' },
+          ],
+        },
+        steps: [s('pr', 'completed', { completed_at: '2026-10-10T11:01:00Z' }), s('ci', 'ready')],
+      }),
+      none,
+      false,
+    ).gate;
+    expect(g?.bound_wait).toBe(place);
+    expect(g?.wait_since).toBe('2026-10-10T11:57:00Z');
+    expect(g && trainGateLabel(g)).toBe(`forge pending · gate waiting: ${place}`);
+    expect(g && trainGateTroubled(g, at('2026-10-10T12:00:00Z'))).toBe(false);
+    expect(g && trainGateTroubled(g, at('2026-10-10T12:07:00Z'))).toBe(true);
+  });
+
+  // Finding 3: track.rs `step_done_at` dates nothing from a step that is
+  // not completed, and `parse_instant` reads RFC3339 only; Date.parse
+  // reads a bare date too. The wait is dated by the Rust's two rules.
+  test('a wait is dated only from a completed step and an RFC3339 stamp', () => {
+    const why = 'the cluster is at its gate bound (3 running of 3: a, b, c)';
+    const g = toTrainRow(
+      train({
+        metadata: { train_gate_wait_reason: why, train_gate_bound_wait: why, train_gate_launched_at: '2026-10-10' },
+        steps: [s('pr', 'active', { completed_at: '2026-10-10T11:40:00Z' }), s('ci', 'ready')],
+      }),
+      none,
+      false,
+    ).gate;
+    expect(g?.wait_since).toBeNull();
+    expect(g && trainGateTroubled(g, Date.parse('2026-10-10T11:41:00Z'))).toBe(true);
   });
 
   test('once the gate is filed the conductor nulls the reason and the train is running, not waiting', () => {

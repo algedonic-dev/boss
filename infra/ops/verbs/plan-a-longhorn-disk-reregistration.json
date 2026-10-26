@@ -1,0 +1,18 @@
+{
+  "about": "READ-ONLY: renders what `reregister-longhorn-disk` WOULD do to re-register ONE worker's Longhorn DEFAULT disk whose record no longer matches the disk under it, and does nothing (infra/forge/reregister-longhorn-disk.sh --plan <node>; backlog 36d2c484, read 2026-10-21T23:45Z: w-2's default-disk-080400000000 at /var/lib/longhorn reads Ready=False DiskFilesystemChanged, storageMaximum 0, on a 929 GiB filesystem with 886 free, because the record's diskUUID predates the 1 TB disk that replaced the system disk, and the longhorn-disk doors act only on u-<volume> at /var/mnt/<volume>). It runs every bound the write runs — the node is one the estate registry declares, not retired, as a talos-worker with one IPv4 address, and the cluster agrees on its address and carries no control-plane label; the node's Longhorn node reads Ready=True and holds exactly one disk at /var/lib/longhorn, named default-disk-<hex> (derived, never named by the packet, so no u-<volume> disk can be reached); Longhorn reads that disk Ready=False with reason DiskFilesystemChanged; /var/lib/longhorn/longhorn-disk.cfg, read from the node through the forge's ops_talosctl door (talosctl read), names a diskUUID that is NOT the record's; and the record holds NOTHING by four readings over BOTH UUIDs — no replicas.longhorn.io whose diskID is either UUID or whose node and diskPath are the disk's, no scheduledReplica or scheduledBackingImage in Longhorn's diskStatus for it, storageScheduled 0, and no backingimages.longhorn.io keeping a file on either UUID — and then prints the plan: the node, its address, role and Node uid, the Longhorn node's disks now (spec only), the record with Longhorn's reason and its diskUUID, the diskUUID on the disk, what it holds (nothing), the three compare-and-set patches (allowScheduling false and a second read of the holdings, the removal and a wait for Longhorn to drop the stale status, then the same record added back schedulable) and the read-back. No clock and no live free space in the bytes (storageAvailable rides stderr); its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Every read goes through the forge's ops_kubectl and ops_talosctl doors; a read that could not look is CANNOT ANSWER (exit 1), never a plan. Any refusal renders no plan (exit 78). Timeout 300: the registry read (15 s), a bounded first pull of the door's image (120 s), the Node, Longhorn node, replica and backing-image reads (20-30 s each) and one talosctl read (20 s).",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/reregister-longhorn-disk.sh",
+    "--plan",
+    "{1}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    }
+  ],
+  "timeout": 300
+}

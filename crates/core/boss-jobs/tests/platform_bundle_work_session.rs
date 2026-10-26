@@ -147,3 +147,49 @@ fn the_silence_bound_is_twice_the_active_steps_duration_and_reads_the_heartbeat(
         "jobs.age_out_step reads the tick's `_at`, which only a sub-day cadence carries"
     );
 }
+
+/// THE WORKING WINDOW IS PACKET DATA (backlog 37e3295c). On 2026-10-18
+/// and again on 2026-10-19 a factory session was told a number of hours
+/// in chat, honoured it literally, and went idle with urgent
+/// nominations ready — 80 minutes lost the first time, 48 the second —
+/// because the window, its end and who could extend it lived only in
+/// two transcripts. The protocol now declares it: one `window` object,
+/// written by `boss session window`, whose `state` says open-ended, an
+/// `until` instant, or closed — and a close carries its handoff, so the
+/// other session reads why and when from the packet, not from a chat.
+#[test]
+fn the_schema_declares_the_working_window_and_its_close() {
+    let session = bundled("work-session");
+    let window = &session.metadata_schema["properties"]["window"];
+    assert_eq!(window["type"], "object", "{window}");
+    let states: Vec<&str> = window["properties"]["state"]["enum"]
+        .as_array()
+        .expect("state is an enum")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(states, vec!["open", "until", "closed"]);
+    for key in [
+        "until",
+        "set_by",
+        "set_at",
+        "why",
+        "closed_at",
+        "closed_by",
+        "handoff",
+    ] {
+        assert!(
+            window["properties"].get(key).is_some(),
+            "window declares {key}"
+        );
+    }
+    assert_eq!(
+        window["required"],
+        serde_json::json!(["state"]),
+        "a window always says which of the three it is"
+    );
+    // Not required on the packet: the SessionStart hook files it before
+    // anyone has set a window, and an absent window reads open-ended.
+    let required = session.metadata_schema["required"].to_string();
+    assert!(!required.contains("window"), "{required}");
+}

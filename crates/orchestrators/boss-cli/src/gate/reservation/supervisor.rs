@@ -7,6 +7,11 @@ pub(super) struct Report {
     pub observed: Vec<String>,
     pub retained: Vec<Value>,
     pub reads: Vec<Value>,
+    /// Requests this pass closed because it PROVED they will never
+    /// launch, each with the cause and the evidence it read (backlog
+    /// 5db91d0e, 48b1b7b4). Never a request waiting for a bay, never an
+    /// UNKNOWN.
+    pub settled: Vec<Value>,
 }
 
 async fn pages(http: &Doors<'_>, query: &str, report: &mut Report) -> Result<Vec<Value>> {
@@ -18,7 +23,11 @@ async fn pages(http: &Doors<'_>, query: &str, report: &mut Report) -> Result<Vec
         let page = api(http, reqwest::Method::GET, &path, None)
             .await?
             .context("queue list returned no document")?;
-        report.reads.push(json!({"path":path,"reply":page}));
+        // Its digest, not the page: the report rides the cadence outcome
+        // POST, and whole pages made it 6.3 MB live (e1943ef0).
+        let mut read = read_digest("queue-list-page", &page);
+        read["path"] = json!(path);
+        report.reads.push(read);
         let count = page
             .get("total")
             .and_then(Value::as_u64)
@@ -55,6 +64,31 @@ async fn pages(http: &Doors<'_>, query: &str, report: &mut Report) -> Result<Vec
     bail!("queue list exceeded the bounded complete-read budget; no truncated list is usable")
 }
 
+/// A rule's last firing as the pass keeps it: the three fields the
+/// liveness decision reads (`rule_keeps_claims`: `firing_id`, `fired_at`,
+/// `rc`) and the size and digest of the whole reply — never the reply.
+///
+/// WHY (backlog 443023a4). The train-reconcile firing carries this pass's
+/// own previous observation, so a whole copy embedded the previous report,
+/// which embedded the one before it: with a train waiting and a submission
+/// queued every pass grew by one pass, and the live firing reached
+/// 6,654,578 bytes at 07:34Z on 2026-10-19 — past the outcome door's
+/// 2 MiB, so every pass recorded `gate_queue` unknown (413) and left a
+/// file that size in the conductor's temp dir. A never-fired rule (`null`)
+/// is recorded as null: absence is a reading, not a digest.
+fn firing_digest(operation: &str, reply: Option<&Value>) -> Value {
+    match reply {
+        None | Some(Value::Null) => json!({"operation":operation,"reply":null}),
+        Some(reply) => {
+            let mut read = read_digest(operation, reply);
+            for key in ["firing_id", "fired_at", "rc"] {
+                read[key] = reply.get(key).cloned().unwrap_or(Value::Null);
+            }
+            read
+        }
+    }
+}
+
 async fn exact_branch(
     http: &Doors<'_>,
     checkout: &Path,
@@ -68,16 +102,21 @@ async fn exact_branch(
     }
     let reference = format!("refs/heads/{branch}");
     let mut command = crate::git_auth::command();
+    // The forge's own HEAD rides the same read as its CONTROL (backlog
+    // 5db91d0e): a branch missing from an answer that also lacks HEAD is
+    // a wrong or empty target speaking, not a deleted branch.
     command
         .current_dir(checkout)
-        .args(["ls-remote", "origin", reference.as_str()]);
+        .args(["ls-remote", "origin", "HEAD", reference.as_str()]);
     let output = tokio::process::Command::from(command)
         .kill_on_drop(true)
         .output()
         .await?;
     let artifact=retain(http,packet,&serde_json::to_vec(&json!({"operation":"gate-queue-exact-branch",
         "reference":reference,"status":output.status.code(),"stdout":output.stdout,"stderr":output.stderr}))?).await?;
-    report.reads.push(json!({"operation":"gate-queue-exact-branch","file_id":artifact.file_id,"sha256":artifact.sha256,"size_bytes":artifact.size_bytes}));
+    let evidence = json!({"operation":"gate-queue-exact-branch","reference":reference,
+        "file_id":artifact.file_id,"sha256":artifact.sha256,"size_bytes":artifact.size_bytes});
+    report.reads.push(evidence.clone());
     if !output.status.success() {
         bail!(
             "exact source branch read failed: {}",
@@ -85,35 +124,154 @@ async fn exact_branch(
         );
     }
     let text = std::str::from_utf8(&output.stdout)?;
-    let fields: Vec<_> = text.split_whitespace().collect();
-    if fields != [head, reference.as_str()] {
-        bail!(
-            "source branch moved or is absent; immutable request is retained without following its tip"
-        );
-    }
-    Ok(())
+    let because = match branch_answer(text, &reference, head) {
+        BranchAnswer::AtHead => return Ok(()),
+        BranchAnswer::Unknown(why) => bail!(
+            "source branch answer is UNKNOWN ({why}); immutable request is retained, not settled"
+        ),
+        BranchAnswer::Moved(tip) => format!(
+            "{branch} moved to {tip} after this request was accepted at {head}; a resident \
+             request never follows its tip, so it can never launch"
+        ),
+        BranchAnswer::Absent => format!(
+            "{branch} is absent from the forge (its HEAD answered on the same read) after \
+             this request was accepted at {head}, so it can never launch"
+        ),
+    };
+    Err(NeverLaunches { because, evidence }.into())
 }
 
-fn live(job: &Value) -> bool {
-    let terminal = job
-        .pointer("/status/conditions")
-        .and_then(Value::as_array)
-        .is_some_and(|conditions| {
-            conditions.iter().any(|condition| {
-                condition.get("status").and_then(Value::as_str) == Some("True")
-                    && matches!(
-                        condition.get("type").and_then(Value::as_str),
-                        Some("Complete" | "Failed")
-                    )
-            })
-        });
-    let active = job
-        .pointer("/status/active")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    // Pod counters do not terminate a Job: retries can still create a
-    // runner. Only a terminal Job condition frees its physical bay.
-    active > 0 || !terminal
+/// A refusal the pass PROVED permanent, with the read that proved it
+/// (backlog 5db91d0e). Three build one: a positive forge answer, a
+/// source head that disagrees with the immutable request, and a car
+/// already green at the request's exact head (backlog 48b1b7b4). Every
+/// other refusal stays a plain error and its request is retained.
+#[derive(Debug)]
+struct NeverLaunches {
+    because: String,
+    evidence: Value,
+}
+impl std::fmt::Display for NeverLaunches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "never launches: {}", self.because)
+    }
+}
+impl std::error::Error for NeverLaunches {}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BranchAnswer {
+    AtHead,
+    /// The branch carries another head — the tip it moved to.
+    Moved(String),
+    /// The branch is not listed, and the forge's HEAD is.
+    Absent,
+    Unknown(String),
+}
+
+/// PURE: what one `ls-remote origin HEAD <reference>` answer says of the
+/// accepted `head`. Absence counts only beside the control (`HEAD`
+/// listed on the same read), because a wrong or empty remote answers an
+/// empty list with exit 0 rather than an error.
+fn branch_answer(text: &str, reference: &str, head: &str) -> BranchAnswer {
+    let mut control = false;
+    let mut tips = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let [sha, name] = fields[..] else {
+            return BranchAnswer::Unknown(format!("unparsed line {line:?}"));
+        };
+        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return BranchAnswer::Unknown(format!("unparsed object name {sha:?}"));
+        }
+        match name {
+            "HEAD" => control = true,
+            n if n == reference => tips.push(sha),
+            _ => {}
+        }
+    }
+    match tips[..] {
+        [tip] if tip == head => BranchAnswer::AtHead,
+        [tip] => BranchAnswer::Moved(tip.to_owned()),
+        [] if control => BranchAnswer::Absent,
+        [] => {
+            BranchAnswer::Unknown("the forge listed neither the branch nor its own HEAD".to_owned())
+        }
+        _ => BranchAnswer::Unknown("the branch was listed more than once".to_owned()),
+    }
+}
+
+/// Close a request this pass proved will never launch: the guarded
+/// negative claim first (`settlement::claim_on`, which refuses a packet
+/// that may have a native Job or a possibly effective send), then the
+/// verdict through the same two writes `boss gate --withdraw` takes. A
+/// claim an earlier pass committed is the decision of record, so a
+/// settle interrupted between the claim and the verdict resumes with
+/// that receipt rather than a second one the immutable claim refuses.
+async fn settle_never_launches(
+    http: &Doors<'_>,
+    packet: &str,
+    namespace: &str,
+    never: &NeverLaunches,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Value> {
+    let row = read_on(http, packet).await?;
+    if let Some(why) = withdraw_refusal(packet, &row) {
+        bail!(why);
+    }
+    let prior = row
+        .pointer("/metadata/gate_orphan_claim/verdict_receipt")
+        .filter(|r| r.get("settled_by").and_then(Value::as_str) == Some(SETTLED_BY));
+    let receipt = match prior {
+        Some(prior) => prior.clone(),
+        None => {
+            let mut receipt = withdrawal_receipt(&never.because, None);
+            receipt["settled_by"] = json!(SETTLED_BY);
+            receipt["evidence"] = never.evidence.clone();
+            receipt
+        }
+    };
+    settlement::claim_on(http, packet, namespace, &receipt, now).await?;
+    let step_id = crate::train::find_step(&row, "record-verdict", "Record the receipt")
+        .and_then(|s| s.get("id"))
+        .and_then(Value::as_str)
+        .context("gate-run has no verdict step")?;
+    for (method, path, body) in verdict_writes(packet, step_id, &receipt)? {
+        api(http, method, &path, Some(body)).await?;
+    }
+    Ok(receipt)
+}
+
+/// Who a supervisor settle names as its writer, in the receipt itself.
+const SETTLED_BY: &str = "resident-supervisor";
+
+/// A source run that has FINISHED is a refusal as permanent as a moved
+/// branch: the supervisor launches only under the exact OPEN run, and a
+/// closed packet never reopens (backlog 36352452). Measured 2026-10-21
+/// (backlog 599aed02): seven places accepted under builder runs the hourly
+/// clock later closed as `died` were retained on every pass for eleven
+/// hours with "original source run is not the exact open agent-run",
+/// holding their places while newer gates launched. Every other source
+/// refusal is returned as it came and its request is retained.
+fn source_run_ended(error: anyhow::Error) -> anyhow::Error {
+    let Some(ended) = error.downcast_ref::<source_claim::SourceRunEnded>() else {
+        return error;
+    };
+    let outcome = ended
+        .outcome
+        .as_deref()
+        .map(|o| format!(" with outcome {o}"))
+        .unwrap_or_default();
+    NeverLaunches {
+        because: format!(
+            "source run {} is {}{outcome}; a resident request launches only under its exact \
+             open agent-run and a closed run never reopens, so it can never launch — re-gate \
+             the head from a live run",
+            ended.run, ended.status
+        ),
+        evidence: json!({"operation":"original-source-run","run":ended.run,
+            "status":ended.status,"outcome":ended.outcome,"read":ended.read}),
+    }
+    .into()
 }
 
 pub(super) async fn observation_on(
@@ -175,7 +333,12 @@ async fn pass_inner(
             .context("gate packet lacks identity")?;
         match submission::original_on(http,packet).await {
             Ok((submission,receipt))=>{
-                report.reads.push(json!({"operation":"original-submission-acceptance","packet":packet,"receipt":receipt}));
+                // The acceptance's identity and the receipt's digest; the
+                // receipt itself carries the whole job (e1943ef0).
+                report.reads.push(json!({"operation":"original-submission-acceptance","packet":packet,
+                    "command":submission.command,"applied_at":receipt.applied_at,"actor":receipt.actor,
+                    "event_id":receipt.event_id,
+                    "receipt":read_digest("acceptance-receipt",&serde_json::to_value(&receipt)?)}));
                 if submission.intent.namespace!=namespace {report.retained.push(json!({"packet":packet,"reason":"submission belongs to a different namespace"}));continue;}
                 accepted.push((receipt.applied_at,packet.to_owned(),submission));
             }
@@ -210,7 +373,7 @@ async fn pass_inner(
         .await?;
         report
             .reads
-            .push(json!({"operation":"train-priority-liveness","reply":firing}));
+            .push(firing_digest("train-priority-liveness", firing.as_ref()));
         let firing: Option<boss_jobs::cadence::LastFiring> =
             firing.map(serde_json::from_value).transpose()?;
         trains_waiting(&trains, firing.as_ref(), now, QUEUE_PLACE_TTL_SECS)
@@ -227,15 +390,19 @@ async fn pass_inner(
         .await?;
         report
             .reads
-            .push(json!({"operation":"dock-priority-liveness","reply":firing}));
+            .push(firing_digest("dock-priority-liveness", firing.as_ref()));
         let firing: Option<boss_jobs::cadence::LastFiring> =
             firing.map(serde_json::from_value).transpose()?;
         dock_waiting(&cars, firing.as_ref(), now, QUEUE_PLACE_TTL_SECS)
             .map_err(anyhow::Error::msg)?;
     }
     let census = native_census_on(http, namespace, "app=gate-runner", anchor).await?;
-    report.reads.push(json!({"operation":"native-capacity-census","file_id":census.artifact.file_id,
-        "sha256":census.artifact.sha256,"size_bytes":census.artifact.size_bytes,"list":census.list}));
+    // The retained artifact names the census; the list is not copied in
+    // here again (e1943ef0).
+    report.reads.push(
+        json!({"operation":"native-capacity-census","file_id":census.artifact.file_id,
+        "sha256":census.artifact.sha256,"size_bytes":census.artifact.size_bytes}),
+    );
     let native = census.list["items"]
         .as_array()
         .context("native census lost items")?;
@@ -244,7 +411,12 @@ async fn pass_inner(
     }) {
         bail!("native capacity census returned a Job outside its declared selector");
     }
-    let mut occupied = native.iter().filter(|job| live(job)).count();
+    // The bay's own liveness rule (backlog ac8d3157), so the supervisor's
+    // count and the reservation that guards its create cannot disagree.
+    let mut occupied = native
+        .iter()
+        .filter(|job| super::bay::job_live(job))
+        .count();
     // A possibly sent invocation still owns one admission even when a
     // current list cannot prove whether its delayed create will arrive.
     for row in &gates {
@@ -289,12 +461,34 @@ async fn pass_inner(
         .filter(|row| row.pointer("/metadata/gate_submission").is_none())
         .cloned()
         .collect();
-    let ahead = train_claims.len() + dock + queue_order(&legacy, now, QUEUE_PLACE_TTL_SECS).len();
-    for (_, packet, submission) in accepted {
+    // ONE LINE, BOTH OWNERS (backlog b56bfc29): a legacy place is ahead
+    // of a resident request only when it was taken before that request's
+    // original acceptance — the comparison a legacy waiter makes the
+    // other way round (`mixed_line`). Counting the whole legacy line
+    // ahead of every resident let gates queued later take freed bays.
+    let legacy = queue_places(&legacy, now, QUEUE_PLACE_TTL_SECS);
+    for (accepted_at, packet, submission) in accepted {
+        let ahead = train_claims.len() + dock + places_taken_before(&legacy, accepted_at, &packet);
         let attempt: Result<bool> = async {
             let current = read_on(http, &packet).await?;
-            if let Some(why) = launch_target_refusal(&packet, &current) {
-                bail!(why);
+            let head = submission.intent.head.as_str();
+            match off_packet(&packet, &current, head)? {
+                None => {}
+                Some(OffPacket::Refused(why)) => bail!(why),
+                // Both halves are immutable, so this never changes:
+                // settled like a moved branch (backlog 48b1b7b4).
+                Some(OffPacket::HeadDisagrees { source }) => {
+                    return Err(NeverLaunches {
+                        because: format!(
+                            "source head {} disagrees with the immutable request's head {head}; \
+                             both were written once at acceptance, so it can never launch",
+                            source.as_deref().unwrap_or("(none)")
+                        ),
+                        evidence: json!({"operation":"immutable-submission","packet":packet,
+                            "command":submission.command,"source_sha":source,"intent_head":head}),
+                    }
+                    .into());
+                }
             }
             let source =
                 model::source_metadata(current.get("metadata").context("gate lost metadata")?)
@@ -303,9 +497,6 @@ async fn pass_inner(
                 .get("branch")
                 .and_then(Value::as_str)
                 .context("durable source lacks branch")?;
-            if source.get("sha").and_then(Value::as_str) != Some(submission.intent.head.as_str()) {
-                bail!("source head disagrees with immutable native request");
-            }
             if let Some(name) = existing_on(http, namespace, &packet).await? {
                 report.observed.push(packet.clone());
                 report
@@ -313,7 +504,9 @@ async fn pass_inner(
                     .push(json!({"operation":"observed-native","packet":packet,"name":name}));
                 return Ok(false);
             }
-            source_claim::verify(http, source, &submission.submitted_by, &mut report.reads).await?;
+            source_claim::verify(http, source, &submission.submitted_by, &mut report.reads)
+                .await
+                .map_err(source_run_ended)?;
             exact_branch(
                 http,
                 checkout,
@@ -333,7 +526,25 @@ async fn pass_inner(
                 GatedGuard::Forced(note) => report
                     .reads
                     .push(json!({"operation":"original-force-regate","packet":packet,"note":note})),
-                GatedGuard::Refuse(reason) => bail!(reason),
+                // A car already green at this exact head leaves the
+                // request nothing to decide — the withdrawal the guard's
+                // own message prescribes — so it is settled with the car
+                // that vouches, not retained (backlog 48b1b7b4).
+                GatedGuard::Refuse(reason) => {
+                    let Some(vouch) = vouching_car(branch, head, &cars) else {
+                        bail!(reason);
+                    };
+                    return Err(NeverLaunches {
+                        because: format!(
+                            "{branch}@{head} is already green and car {} ({}) carries it; \
+                             this request has nothing left to decide, so it never launches",
+                            vouch.car, vouch.where_it_is
+                        ),
+                        evidence: json!({"operation":"gated-car-guard","packet":packet,
+                            "car":vouch.car,"head":vouch.head,"where":vouch.where_it_is}),
+                    }
+                    .into());
+                }
             }
             if !admits(occupied, ahead, max, Requester::Car) {
                 return Ok(false);
@@ -348,10 +559,72 @@ async fn pass_inner(
                 occupied += 1;
             }
             Ok(false) => {}
-            Err(error) => report
-                .retained
-                .push(json!({"packet":packet,"reason":format!("{error:#}")})),
+            // PROVED never to launch: settled here, by the pass that read
+            // the proof, with the cause and the evidence on the packet
+            // (backlog 5db91d0e). Before this it was retained on every
+            // pass, forever — the conductor's clock no longer settles a
+            // resident still in line (b56bfc29) — holding its place
+            // ahead of later waiters until someone withdrew it by hand.
+            // A settle that cannot complete is retained, never guessed.
+            Err(error) => match error.downcast_ref::<NeverLaunches>() {
+                Some(never) => {
+                    match settle_never_launches(http, &packet, namespace, never, now).await {
+                        Ok(receipt) => report.settled.push(json!({"packet":packet,
+                            "verdict":WITHDRAWN_VERDICT,"because":never.because,"receipt":receipt})),
+                        Err(settle) => report.retained.push(json!({"packet":packet,
+                            "reason":format!("{error:#}; the settle was not completed: {settle:#}")})),
+                    }
+                }
+                None => report
+                    .retained
+                    .push(json!({"packet":packet,"reason":format!("{error:#}")})),
+            },
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REF: &str = "refs/heads/fix/x";
+    const HEAD: &str = "097e370a27a0c773cf1ce015e242215ee200f8ec";
+    const TIP: &str = "1111111111111111111111111111111111111111";
+
+    /// Backlog 5db91d0e: only a positive answer is permanent. A moved
+    /// tip is; a missing branch is only beside the forge's own HEAD on
+    /// the same read; silence, a malformed line or a doubled ref holds.
+    #[test]
+    fn only_a_positive_forge_answer_proves_a_request_will_never_launch() {
+        let at = |lines: &[(&str, &str)]| {
+            let text: String = lines.iter().map(|(s, r)| format!("{s}\t{r}\n")).collect();
+            branch_answer(&text, REF, HEAD)
+        };
+        assert_eq!(at(&[(TIP, "HEAD"), (HEAD, REF)]), BranchAnswer::AtHead);
+        assert_eq!(at(&[(HEAD, REF)]), BranchAnswer::AtHead);
+        assert_eq!(
+            at(&[(HEAD, "HEAD"), (TIP, REF)]),
+            BranchAnswer::Moved(TIP.into())
+        );
+        assert_eq!(at(&[(TIP, "HEAD")]), BranchAnswer::Absent);
+        assert!(matches!(at(&[]), BranchAnswer::Unknown(_)));
+        // A ref that only ends like HEAD is not the forge's HEAD.
+        assert!(matches!(
+            at(&[(TIP, "refs/remotes/origin/HEAD")]),
+            BranchAnswer::Unknown(_)
+        ));
+        assert!(matches!(
+            at(&[(TIP, "HEAD"), (HEAD, REF), (TIP, REF)]),
+            BranchAnswer::Unknown(_)
+        ));
+        assert!(matches!(
+            branch_answer("not-a-sha\tHEAD\n", REF, HEAD),
+            BranchAnswer::Unknown(_)
+        ));
+        assert!(matches!(
+            branch_answer(&format!("{TIP}\n"), REF, HEAD),
+            BranchAnswer::Unknown(_)
+        ));
+    }
 }

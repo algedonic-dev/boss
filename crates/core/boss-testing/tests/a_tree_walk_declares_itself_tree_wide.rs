@@ -34,12 +34,21 @@
 //! to this crate, so every scoped gate runs it whatever its scope
 //! (`tree_wide_pins` in infra/gate.sh; backlog c87ad472).
 
-use boss_testing::repo_root;
+use boss_testing::{TREE_WIDE_FILE_PATTERN, TREE_WIDE_TEST_PATTERN, repo_root, tree_wide_pattern};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 /// The top-level trees whose files no scoped gate maps back to a test
 /// that reads them.
 const TREES: [&str; 4] = ["infra", "crates", "apps", "libs"];
+
+/// The two markers as infra/gate.sh runs the pins by them.
+static MARKERS: LazyLock<[regex::Regex; 2]> = LazyLock::new(|| {
+    [TREE_WIDE_FILE_PATTERN, TREE_WIDE_TEST_PATTERN].map(|name| {
+        regex::Regex::new(&tree_wide_pattern(name))
+            .unwrap_or_else(|e| panic!("{name} in infra/gate.sh is not a regex: {e}"))
+    })
+});
 
 /// Where the opt-out's reason starts.
 const OPT_OUT: &str = "// not a tree-wide pin:";
@@ -87,12 +96,11 @@ fn classify(text: &str) -> Verdict {
     }
     // The marker is the whole line or the marker and an em dash, the
     // shape gate.sh's `tree_wide_pins` reads — a sentence that begins
-    // with its words is prose (backlog 18e58c96).
-    let is_marker = |rest: Option<&str>| rest.is_some_and(|r| r.is_empty() || r.starts_with(" —"));
-    let marked = text.lines().any(|l| {
-        is_marker(l.strip_prefix("//! tree-wide pin"))
-            || is_marker(l.trim_start().strip_prefix("// tree-wide pin"))
-    });
+    // with its words is prose (backlog 18e58c96). Matched by the gate's
+    // own patterns, never a copy (backlog 07ad55b3).
+    let marked = text
+        .lines()
+        .any(|l| MARKERS.iter().any(|marker| marker.is_match(l)));
     if marked {
         return Verdict::Marked;
     }
@@ -235,6 +243,108 @@ fn every_test_that_walks_a_top_level_tree_declares_itself_tree_wide() {
          `// tree-wide pin — <why>` on the line above one test under src/, and every scoped \
          gate runs it (`tree_wide_pins` in infra/gate.sh); or, if its verdict cannot change \
          with a file outside its crate, `{OPT_OUT} <why>`.\n  {}",
+        offences.join("\n  ")
+    );
+}
+
+/// The marker texts the gate's two patterns match, derived from the
+/// patterns themselves so this file spells neither.
+fn marker_texts() -> Vec<String> {
+    [TREE_WIDE_FILE_PATTERN, TREE_WIDE_TEST_PATTERN]
+        .iter()
+        .map(|name| {
+            tree_wide_pattern(name)
+                .trim_start_matches('^')
+                .replace("[[:space:]]*", "")
+                .replace("( —|$)", "")
+        })
+        .collect()
+}
+
+/// Each place in `line` where a string literal that opens with a marker
+/// is used as a VALUE — a method or function argument, `.starts_with("…`,
+/// or an initializer, `= "…` — the shape of a reader that matches the
+/// marker by a copy of its own. A macro argument (`format!("…`) or a
+/// literal alone on its line is fixture text a test PLANTS, not a reader.
+fn respellings(line: &str, markers: &[String]) -> usize {
+    if line.trim_start().starts_with("//") {
+        return 0;
+    }
+    line.match_indices('"')
+        .filter(|(at, _)| {
+            let opened = line[at + 1..].trim_start();
+            if !markers.iter().any(|m| opened.starts_with(m.as_str())) {
+                return false;
+            }
+            let before = line[..*at].trim_end();
+            before.ends_with('=')
+                || before.strip_suffix('(').is_some_and(|b| {
+                    b.chars()
+                        .last()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                })
+        })
+        .count()
+}
+
+/// THE MARKER LIVES ONCE (backlog 07ad55b3, 2026-10-19). infra/gate.sh
+/// spells each tree-wide marker as a pattern and runs the pins by it;
+/// gate_sh.rs and this file each matched it with literals of their
+/// own, so a marker change would have left them reading the old shape
+/// (CLAUDE.md §9a). They read `boss_testing::tree_wide_pattern` now,
+/// and a fourth copy is refused here, by file and line.
+#[test]
+fn the_tree_wide_marker_is_read_from_the_gate_never_spelled() {
+    let markers = marker_texts();
+    assert_eq!(
+        markers.len(),
+        2,
+        "the gate declares a tests/ and a src/ marker"
+    );
+    // The control: the detector sees the shapes it exists to refuse,
+    // and passes the fixture shapes tests plant.
+    for m in &markers {
+        assert_eq!(respellings(&format!("l.starts_with(\"{m}\")"), &markers), 1);
+        assert_eq!(
+            respellings(&format!("l.trim_start().strip_prefix(\"{m}\")"), &markers),
+            1
+        );
+        assert_eq!(
+            respellings(&format!("const M: &str = \"{m}\";"), &markers),
+            1
+        );
+        assert_eq!(
+            respellings(&format!("classify(&format!(\"{m} — x\"))"), &markers),
+            0
+        );
+        assert_eq!(
+            respellings(&format!("    \"{m} — it scans\\n\","), &markers),
+            0
+        );
+    }
+    let root = repo_root();
+    let offences: Vec<String> = test_sources(&root)
+        .iter()
+        .flat_map(|path| {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("{} is readable: {e}", path.display()));
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            text.lines()
+                .enumerate()
+                .filter(|(_, l)| respellings(l, &markers) > 0)
+                .map(|(n, l)| format!("{rel}:{}: {}", n + 1, l.trim()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        offences.is_empty(),
+        "a test matches the tree-wide pin marker with a copy of its own; read it with \
+         `boss_testing::tree_wide_pattern(TREE_WIDE_FILE_PATTERN | TREE_WIDE_TEST_PATTERN)`, \
+         the pattern infra/gate.sh runs the pins by (CLAUDE.md §9a; backlog 07ad55b3):\n  {}",
         offences.join("\n  ")
     );
 }

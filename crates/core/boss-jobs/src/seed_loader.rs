@@ -1893,6 +1893,98 @@ ready_when = "true"
     }
 
     #[test]
+    fn a_released_car_review_accepts_the_existing_unmarked_hold_shapes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infra/platform/workflows");
+        let rows = load_workflows(root.join("ship-a-change.toml")).unwrap();
+        let review = rows[0]
+            .steps
+            .iter()
+            .find(|step| step.title == crate::car::REVIEW_SLUG)
+            .unwrap();
+        for hold in [
+            serde_json::json!(false),
+            serde_json::Value::Null,
+            serde_json::json!(""),
+        ] {
+            let metadata =
+                serde_json::json!({"pr_url": "https://forge.invalid/pulls/1", "hold": hold});
+            assert!(crate::stranded::hold_reason(&metadata).is_none());
+            assert!(
+                crate::step_registry::StepRegistry::validate_authored_fields(
+                    &review.fields,
+                    &metadata
+                )
+                .is_ok(),
+                "a boardable released car must complete review with its existing hold marker: {metadata}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_review_completion_keeps_person_releaser_marks_as_context() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infra/platform/workflows");
+        let rows = load_workflows(root.join("ship-a-change.toml")).unwrap();
+        let review = rows[0]
+            .steps
+            .iter()
+            .find(|step| step.title == crate::car::REVIEW_SLUG)
+            .unwrap();
+        for releaser in [
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::json!(7),
+            serde_json::json!(["operator"]),
+            serde_json::json!({"operator": "person"}),
+        ] {
+            let metadata = serde_json::json!({"pr_url": "https://forge.invalid/pulls/1", "releaser": releaser});
+            assert!(
+                crate::step_registry::StepRegistry::validate_authored_fields(
+                    &review.fields,
+                    &metadata
+                )
+                .is_ok(),
+                "door-owned reservation context must not wedge a person's completed release: {metadata}"
+            );
+        }
+    }
+
+    /// The wait is door-owned context, not an executor answer (5101e080).
+    /// Declaring these heterogeneous markers as strings rejects a released
+    /// hold:false when the conductor closes the car and invites a generic
+    /// field editor to bypass the hold door's head-binding cleanup.
+    #[test]
+    fn the_car_review_step_keeps_door_written_waits_out_of_executor_fields() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infra/platform/workflows");
+        let rows = load_workflows(root.join("ship-a-change.toml")).unwrap();
+        let review = rows[0]
+            .steps
+            .iter()
+            .find(|step| step.title == crate::car::REVIEW_SLUG)
+            .expect("ship-a-change has a review step");
+        let hold_body = crate::car::hold_body(&serde_json::json!({}), "why");
+        assert_eq!(hold_body, serde_json::json!({"hold": "why"}));
+        for name in hold_body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .chain([
+                crate::car::RELEASER,
+                crate::car::HOLD_SHA,
+                crate::car::RELEASE,
+            ])
+        {
+            assert!(
+                !review.fields.iter().any(|field| field.name == name),
+                "door-written `{name}` must remain context rather than an editable executor field"
+            );
+        }
+    }
+
+    #[test]
     fn a_row_can_author_its_metadata_schema_and_entitlements() {
         let text = r#"
 [[workflow]]

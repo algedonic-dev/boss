@@ -128,12 +128,22 @@ async fn persist_original_verdict(
     building: uuid::Uuid,
     value: &Value,
 ) -> Result<boss_jobs::first_record::FirstRecord> {
+    persist_original_review_record(wire, native, building, ORIGINAL_VERDICT_KEY, value).await
+}
+
+async fn persist_original_review_record(
+    wire: &Wire,
+    native: uuid::Uuid,
+    building: uuid::Uuid,
+    key: &str,
+    value: &Value,
+) -> Result<boss_jobs::first_record::FirstRecord> {
     use boss_jobs::first_record::FirstRecordResult;
     let response = wire
         .call(
             reqwest::Method::POST,
             &format!("/api/jobs/{native}/steps/{building}/metadata/records"),
-            Some(json!({"key":ORIGINAL_VERDICT_KEY,"value":value,"expected_absence":true})),
+            Some(json!({"key":key,"value":value,"expected_absence":true})),
         )
         .await?
         .context("the immutable verdict write returned no record")?;
@@ -143,7 +153,7 @@ async fn persist_original_verdict(
         FirstRecordResult::Recorded(record) | FirstRecordResult::Replayed(record) => record,
         _ => bail!("the immutable verdict write refused; no mutable verdict was projected"),
     };
-    immutable_record_resource(&original, native, building, ORIGINAL_VERDICT_KEY)?;
+    immutable_record_resource(&original, native, building, key)?;
     use sha2::{Digest, Sha256};
     let scalar: Value = serde_json::from_str(&original.value_json)
         .context("the immutable verdict scalar is unreadable")?;
@@ -319,10 +329,142 @@ pub(crate) fn forge_sha(refname: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("the forge holds no {refname}"))
 }
 
+/// Source bytes are read from immutable tree objects, never the worktree or
+/// a caller's flag. Freezing the main and merge-base here prevents a later
+/// main movement from changing what this review's diff says.
+async fn read_review_source_in(
+    repo: &std::path::Path,
+    car: &str,
+    head: &str,
+    main: &str,
+) -> Result<Value> {
+    for sha in [head, main] {
+        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("review source requires full immutable commit ids, got {sha:?}");
+        }
+    }
+    let read = |args: Vec<String>| async move {
+        let out = tokio::process::Command::new("git")
+            .current_dir(repo)
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(&args)
+            .output()
+            .await
+            .context("reading reviewed source with git")?;
+        if !out.status.success() {
+            bail!(
+                "review source git {} refused: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        String::from_utf8(out.stdout).context("reviewed source diff is not UTF-8")
+    };
+    let base = read(vec!["merge-base".into(), main.into(), head.into()])
+        .await?
+        .trim()
+        .to_string();
+    if base.len() != 40 || !base.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("review source has no immutable merge-base");
+    }
+    let mut source = json!({"car":car,"head":head,"main":main,"base":base,
+        "path":boss_jobs::release_window::MANIFEST_PATH});
+    for (contents, mode_key, sha) in [
+        ("manifest", "mode", head),
+        ("base_manifest", "base_mode", base.as_str()),
+    ] {
+        let mode = read(vec![
+            "ls-tree".into(),
+            "--format=%(objectmode)".into(),
+            sha.into(),
+            "--".into(),
+            boss_jobs::release_window::MANIFEST_PATH.into(),
+        ])
+        .await?
+        .trim()
+        .to_string();
+        if mode.is_empty() {
+            source[mode_key] = json!("absent");
+            source[contents] = Value::Null;
+        } else {
+            if !matches!(mode.as_str(), "100644" | "100755") {
+                bail!("the {contents} is not a regular source blob (mode {mode:?})");
+            }
+            source[mode_key] = json!(mode);
+            source[contents] = json!(
+                read(vec![
+                    "show".into(),
+                    format!("{sha}:{}", boss_jobs::release_window::MANIFEST_PATH)
+                ])
+                .await?
+            );
+        }
+    }
+    source["diff"] = json!(
+        read(vec![
+            "diff".into(),
+            "--no-ext-diff".into(),
+            "--no-textconv".into(),
+            "--no-renames".into(),
+            "--unified=3".into(),
+            base,
+            head.into(),
+            "--".into(),
+            boss_jobs::release_window::MANIFEST_PATH.into()
+        ])
+        .await?
+    );
+    Ok(source)
+}
+
+async fn capture_review_source(
+    repo: &std::path::Path,
+    car: &str,
+    head: &str,
+    main: &str,
+) -> Result<Value> {
+    let fetched = tokio::process::Command::new("git")
+        .current_dir(repo)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "fetch",
+            "--no-tags",
+            "origin",
+            head,
+            main,
+        ])
+        .output()
+        .await
+        .context("fetching the immutable reviewed head and main")?;
+    if !fetched.status.success() {
+        bail!(
+            "review source fetch refused: {}",
+            String::from_utf8_lossy(&fetched.stderr)
+        );
+    }
+    read_review_source_in(repo, car, head, main).await
+}
+
 /// `boss review <car> --verdict <v>`: record the verdict of the run this
 /// shell is (`BOSS_AGENT_RUN`) on that run's own packet, at the car's
 /// forge head. `forge` reads a ref's sha (the live one is [`forge_sha`]).
 pub(crate) async fn record(
+    wire: &Wire,
+    car: &str,
+    verdict: &str,
+    findings: &str,
+    run: Option<&str>,
+    forge: impl Fn(&str) -> Result<String>,
+) -> Result<()> {
+    let repo = std::env::current_dir().context("reading review repository directory")?;
+    record_in(&repo, wire, car, verdict, findings, run, forge).await
+}
+
+/// The repository is explicit so concurrent workflow fixtures exercise the
+/// same fetch and original-record path without changing process-wide cwd.
+pub(crate) async fn record_in(
+    repo: &std::path::Path,
     wire: &Wire,
     car: &str,
     verdict: &str,
@@ -367,8 +509,32 @@ pub(crate) async fn record(
     let branch = branch_of(&packet)?;
     let head = forge(&format!("refs/heads/{branch}"))?;
     let executor = read_executor_eligibility(wire, &run_packet, &packet, &head).await.context("boss review: FORMAL executor eligibility refused; advisory findings remain reportable on the run")?;
+    let main = forge("refs/heads/main")?;
+    let source = capture_review_source(repo, str_at(&packet, "/id"), &head, &main).await?;
+    let building = run_packet["steps"]
+        .as_array()
+        .and_then(|steps| {
+            steps
+                .iter()
+                .find(|s| s["spec_slug"] == boss_jobs::car_release::BUILDING_SLUG)
+        })
+        .and_then(|s| s["id"].as_str())
+        .and_then(|s| s.parse().ok())
+        .context(
+            "boss review: this run has no Building step on which to preserve its original source",
+        )?;
+    let source_record = persist_original_review_record(
+        wire,
+        run_id.parse()?,
+        building,
+        boss_jobs::release_window::SOURCE_KEY,
+        &source,
+    )
+    .await?;
     let at = crate::sor_client::stamp(boss_clock_client::wall_now());
     let mut rec = review_record(&packet, &head, verdict, findings.trim(), &at);
+    rec["source_binding"] =
+        json!({"digest":source_record.digest,"event_id":source_record.event_id});
     if let Some(binding) = executor.record_binding() {
         rec["executor_binding"] = binding;
     }
@@ -445,8 +611,11 @@ pub(crate) async fn release(
     let branch = branch_of(&packet)?.to_string();
     let head = forge(&format!("refs/heads/{branch}"))?;
     let main = forge("refs/heads/main")?;
+    // The hold this verb read is the one it asks to lift: the door
+    // refuses a car whose hold was rewritten since (review 792b871a N1).
     let mut ask = json!({
         "review": review.trim(),
+        "hold": boss_jobs::car_release::JudgedHold::of(&packet),
         "head": head,
         "main_sha": main,
         "agent_shell": releaser.agent_shell,
@@ -485,8 +654,180 @@ pub(crate) async fn release(
 }
 
 #[cfg(test)]
+pub(crate) struct ReviewSourceRepo {
+    dir: tempfile::TempDir,
+    pub main: String,
+    pub head: String,
+    pub moved: String,
+}
+
+#[cfg(test)]
+impl ReviewSourceRepo {
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        let manifest = dir.path().join(boss_jobs::release_window::MANIFEST_PATH);
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest,
+            "kind: ConfigMap\nmetadata:\n  name: boss-machine-gate\ndata:\n  mode: report\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "Report machine observations"]);
+        let main = git(&["rev-parse", "HEAD"]);
+        std::fs::write(dir.path().join("reviewed.txt"), "reviewed source\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "Change reviewed source"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        std::fs::write(dir.path().join("reviewed.txt"), "later source\n").unwrap();
+        git(&["commit", "-qam", "Move beyond the reviewed head"]);
+        let moved = git(&["rev-parse", "HEAD"]);
+        git(&["remote", "add", "origin", dir.path().to_str().unwrap()]);
+        Self {
+            dir,
+            main,
+            head,
+            moved,
+        }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+
+    pub fn forge(&self, reference: &str) -> Result<String> {
+        Ok(if reference == "refs/heads/main" {
+            &self.main
+        } else {
+            &self.head
+        }
+        .clone())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_source_attestation_copies_the_exact_reviewed_diff_and_frozen_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "An ordinary repository without a stack manifest",
+        ]);
+        let empty = git(&["rev-parse", "HEAD"]);
+        let absent = read_review_source_in(dir.path(), CAR, &empty, &empty)
+            .await
+            .unwrap();
+        assert_eq!(absent["mode"], "absent");
+        assert_eq!(absent["base_mode"], "absent");
+        assert!(absent["manifest"].is_null());
+        assert!(absent["base_manifest"].is_null());
+        let file = dir.path().join(boss_jobs::release_window::MANIFEST_PATH);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            "kind: ConfigMap\nmetadata:\n  name: boss-machine-gate\ndata:\n  mode: report\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "Report"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(
+            &file,
+            "kind: ConfigMap\nmetadata:\n  name: boss-machine-gate\ndata:\n  mode: enforce\n",
+        )
+        .unwrap();
+        git(&["commit", "-qam", "Enforce"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        let source = read_review_source_in(dir.path(), CAR, &head, &base)
+            .await
+            .unwrap();
+        assert_eq!(source["head"], head);
+        assert_eq!(source["base"], base);
+        assert_eq!(source["main"], base);
+        assert_eq!(source["car"], CAR);
+        let diff = source["diff"].as_str().unwrap();
+        assert!(diff.contains("-  mode: report"));
+        assert!(diff.contains("+  mode: enforce"));
+        assert_eq!(
+            boss_jobs::release_window::machine_gate_mode(source["manifest"].as_str().unwrap())
+                .unwrap(),
+            boss_core::machine_gate::Mode::Enforce
+        );
+        std::fs::write(&file, "data:\n  mode: off\n").unwrap();
+        assert_eq!(
+            source,
+            read_review_source_in(dir.path(), CAR, &head, &base)
+                .await
+                .unwrap(),
+            "uncommitted bytes cannot change reviewed source"
+        );
+        assert!(
+            read_review_source_in(dir.path(), CAR, "not-a-head", &base)
+                .await
+                .is_err()
+        );
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink("elsewhere.yaml", &file).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "A manifest must not be a symlink"]);
+        let linked = git(&["rev-parse", "HEAD"]);
+        assert!(
+            read_review_source_in(dir.path(), CAR, &linked, &base)
+                .await
+                .is_err()
+        );
+    }
 
     const CAR: &str = "c0ffee00-0000-4000-8000-000000000000";
     const BUILDER: &str = "b0b0b0b0-0000-4000-8000-000000000000";

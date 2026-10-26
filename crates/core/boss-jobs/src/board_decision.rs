@@ -61,6 +61,18 @@ pub enum NoDeparture {
     /// no longer re-gated, can never depart until a person clears it
     /// (d3320278).
     HeldOnEdges { cars: String, needs_human: String },
+    /// The assembled consist's tree IS main's tree: every boarded car's
+    /// work is already on main (backlog 81408a81). No PR, no gate — the
+    /// gate refuses an empty diff, and trains b0e4ba33 and 13cfa6ca
+    /// (2026-10-18) read that refusal as a RED and held the track until a
+    /// hand cancelled them. Each car the machine proved carried is
+    /// `retired` through its `landed-twin` terminal; a car it could not
+    /// retire is `left` on the dock, each with its reason.
+    EmptyConsist {
+        main: String,
+        retired: String,
+        left: String,
+    },
 }
 
 /// Will this refusal still be here on the next window, unchanged?
@@ -104,6 +116,9 @@ pub fn refusal_persists(refusal: &NoDeparture) -> bool {
         | NoDeparture::NothingParked
         | NoDeparture::HostShort { .. } => false,
         NoDeparture::HeldOnEdges { needs_human, .. } => !needs_human.is_empty(),
+        // Every car retired clears itself; a car left on the dock boards
+        // again next window onto the same empty consist (81408a81).
+        NoDeparture::EmptyConsist { left, .. } => !left.is_empty(),
         NoDeparture::AllConflicted { .. } | NoDeparture::ConsistRefused { .. } => true,
     }
 }
@@ -145,6 +160,26 @@ pub fn no_departure_line(refusal: &NoDeparture) -> String {
              is not re-gated again at its head, so this window will refuse identically until \
              someone clears it — each car's own skip_reason names which."
         ),
+        NoDeparture::EmptyConsist {
+            main,
+            retired,
+            left,
+        } => {
+            let retired = if retired.is_empty() { "none" } else { retired };
+            let left = if left.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " A HUMAN IS NEEDED for {left} — it boards again onto the same empty \
+                     consist until someone retires it or gives it work main lacks."
+                )
+            };
+            format!(
+                "no train departed — the assembled consist adds nothing to main {main}: its \
+                 tree is main's own. No train packet opened, no PR, no gate, no CI spent; \
+                 retired as landed twins: {retired}.{left}"
+            )
+        }
     }
 }
 
@@ -172,7 +207,8 @@ impl From<&NoDeparture> for BoardDecision {
             | NoDeparture::ConsistRefused { .. } => BoardDecision::Held { reason },
             NoDeparture::NothingParked
             | NoDeparture::AllConflicted { .. }
-            | NoDeparture::HeldOnEdges { .. } => BoardDecision::NoBoardableCar { reason },
+            | NoDeparture::HeldOnEdges { .. }
+            | NoDeparture::EmptyConsist { .. } => BoardDecision::NoBoardableCar { reason },
         }
     }
 }
@@ -237,7 +273,58 @@ mod tests {
                 cars: "aaaaaaaa, cccccccc".into(),
                 needs_human: "cccccccc".into(),
             },
+            NoDeparture::EmptyConsist {
+                main: "e2ee2f8ff".into(),
+                retired: "faa27ef3 (fix/a)".into(),
+                left: String::new(),
+            },
         ]
+    }
+
+    /// AN EMPTY CONSIST DEPARTS NOTHING (backlog 81408a81). Trains
+    /// b0e4ba33 and 13cfa6ca (2026-10-18) each carried one car whose work
+    /// was already on main; the conductor opened the PR, launched the
+    /// gate, the gate refused an empty diff, and the train read RED and
+    /// held the track until a hand cancelled it. The refusal says the
+    /// consist adds nothing, which cars it retired as landed twins, and
+    /// that nothing was opened — and it stalls (pages) only for a car it
+    /// could NOT retire, because that car boards again next window and
+    /// the board refuses identically until a person acts.
+    #[test]
+    fn an_empty_consist_departs_nothing_and_stalls_only_on_a_car_it_could_not_retire() {
+        let all = NoDeparture::EmptyConsist {
+            main: "e2ee2f8ff".into(),
+            retired: "faa27ef3 (fix/a-full-gate-binds-its-dropped-empty-mode-2)".into(),
+            left: String::new(),
+        };
+        let line = no_departure_line(&all);
+        for said in [
+            "no train departed",
+            "adds nothing to main e2ee2f8ff",
+            "retired as landed twins: faa27ef3",
+            "No train packet opened, no PR, no gate",
+        ] {
+            assert!(line.contains(said), "{said:?} missing from: {line}");
+        }
+        assert!(!line.contains("HUMAN"), "{line}");
+        assert!(!refusal_persists(&all), "every car retired: self-cleared");
+        assert!(matches!(
+            BoardDecision::from(&all),
+            BoardDecision::NoBoardableCar { .. }
+        ));
+
+        let stuck = NoDeparture::EmptyConsist {
+            main: "e2ee2f8ff".into(),
+            retired: String::new(),
+            left: "363c2d7d (fix/b): its work is not provably on main".into(),
+        };
+        let line = no_departure_line(&stuck);
+        assert!(line.contains("retired as landed twins: none"), "{line}");
+        assert!(
+            line.contains("A HUMAN IS NEEDED for 363c2d7d (fix/b): its work"),
+            "{line}"
+        );
+        assert!(refusal_persists(&stuck));
     }
 
     /// Every refusal becomes a decision that REFUSES, and its sentence is

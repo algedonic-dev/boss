@@ -204,8 +204,10 @@ def host():
     need(len(str(binary_path)) <= 256 and re.fullmatch(r"/[A-Za-z0-9._/-]+", str(binary_path)),
          "operator_binary_unavailable")
     binary = snapshot(binary_path, 256 * 1024 * 1024)
-    argv = ["sudo", "-n", "docker", "run", "--pull=never", "--rm", "--network", "none",
-            "--memory", "256m", "--memory-swap", "256m", "--pids-limit", "64",
+    # --log-driver=none: a container handed host files keeps no daemon log of
+    # what it prints (backlog ff957587, a_kubectl_container_keeps_no_log.rs).
+    argv = ["sudo", "-n", "docker", "run", "--pull=never", "--rm", "--log-driver=none",
+            "--network", "none", "--memory", "256m", "--memory-swap", "256m", "--pids-limit", "64",
             "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--ulimit", "core=0", "--tmpfs", "/tmp:rw,noexec,nosuid,size=8m",
             "--env", "BOSS_READER_IMAGE_ID=" + immutable,

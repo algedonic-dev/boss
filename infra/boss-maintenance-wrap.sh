@@ -6,10 +6,11 @@
 #   e.g. ./infra/boss-maintenance-wrap.sh maintenance-backup "Nightly backup"
 #
 # Called from the timer service's ExecStartPre. If an open Job of the
-# kind exists (yesterday's run FAILED and nobody closed it), reuse it:
-# today's successful run completing it is the recovery, and the pile
+# kind exists with an unfinished run, reuse it:
+# today's run completing it is the recovery, and the pile
 # staying at one open Job per chore keeps boss-step's single-open
-# contract intact. Otherwise spawn today's Job.
+# contract intact. A finished run is settled with its original facts
+# before a distinct packet is filed for today's work.
 #
 # The visibility contract, stated once: the timer is the EXECUTOR,
 # the Job is the VISIBILITY. ExecStopPost → boss-step.sh records the
@@ -260,6 +261,38 @@ if [ -z "${BOSS_JOBS_URL:-}" ]; then
     exit 78   # EX_CONFIG — a configuration fault, not a run-time one.
 fi
 BASE="${BOSS_JOBS_URL}"
+
+# WHO ASKED FOR THIS RUN (backlog e4d51e12). The packet's trigger was
+# always the protocol's first — the timer — whoever started the unit: a
+# converge converge-on-merge asked for, 36 s after the merge, read
+# `systemd-timer` beside the safety net's no-op ticks, and a triage went
+# looking for a 10-minute delay that was not there. A unit started for
+# ops-requests names the inbox they were noted in (BOSS_WRAP_REQUESTS;
+# converge-now.sh writes it BEFORE it starts the unit, and the run takes
+# it after this script), and when it holds a request id the packet
+# names them as `ops_requests` and its trigger as `ops-request` — the
+# protocol's alternative trigger, which admission then fires instead of
+# the timer. Only a well-formed job id is a request; the file is only
+# read, never taken. A run systemd says a TIMER started (TRIGGER_UNIT,
+# set by systemd for a timer-activated unit) stays a timer run: the
+# request it finds arrived while an earlier run was active, and this run
+# answers it but was not started by it. Nothing here can stop the chore:
+# an unreadable inbox is a timer run.
+OPS_REQUESTS="[]" TRIGGER=""
+if [ -n "${BOSS_WRAP_REQUESTS:-}" ] && [ -r "$BOSS_WRAP_REQUESTS" ]; then
+    OPS_REQUESTS=$(jq -R -s -c '[split("\n")[]
+        | select(test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))]
+        | unique | .[:20]' "$BOSS_WRAP_REQUESTS" 2>/dev/null) || OPS_REQUESTS="[]"
+    [ -n "$OPS_REQUESTS" ] || OPS_REQUESTS="[]"
+fi
+if [ "$OPS_REQUESTS" != "[]" ]; then
+    case "${TRIGGER_UNIT:-}" in
+        *.timer) echo "boss-maintenance-wrap: $TRIGGER_UNIT started this run; it answers the ops-request(s) $OPS_REQUESTS left for it" ;;
+        *) TRIGGER="ops-request"
+           echo "boss-maintenance-wrap: this run was asked for by ops-request(s) $OPS_REQUESTS" ;;
+    esac
+fi
+
 BOSS_USER='{"id":"automation:maintenance-timer","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
 
 # Transport-retry curl (25e518c0): a deploy roll takes the API away
@@ -297,10 +330,30 @@ machine_token_header MT_HDR "$BOSS_JOBS_URL" \
 # from 259 pod addresses, read at the time as chores missing a mount.
 # Pinned by a_chore_stamps_every_request_it_sends.rs, which drives a
 # whole run and reads each request.
-reply=""; rc=0
-reply=$("$API_CURL" -fsS --max-time "$MAX_TIME" -H "x-boss-user: $BOSS_USER" \
-    ${MT_HDR:+-H "$MT_HDR"} \
-    "$BASE/api/jobs?kind=$KIND&status=open&limit=50" 2>"${curl_err:-/dev/stderr}") || rc=$?
+# Opt-in retry is local to this invocation; other cadence bodies and attempts
+# remain unchanged. Three bounded reads fit the surface unit's ten-minute cap.
+OPEN_ATTEMPTS="${BOSS_WRAP_OPEN_RETRY:-1}"
+case "$OPEN_ATTEMPTS" in 1|2|3) ;; *) run_unrecorded 'invalid packet-open attempt bound' ;; esac
+if [ "$OPEN_ATTEMPTS" -gt 1 ]; then
+    # The outer retries replace, rather than multiply, the transport's
+    # default 150-second rollout window. Keep smaller fixture bounds.
+    retry_window="${BOSS_API_RETRY_DEADLINE:-30}"
+    case "$retry_window" in ''|*[!0-9]*) run_unrecorded 'invalid transport retry bound' ;; esac
+    [ "$retry_window" -le 30 ] || retry_window=30
+    export BOSS_API_RETRY_DEADLINE="$retry_window"
+fi
+OPEN_WAIT="${BOSS_WRAP_OPEN_RETRY_WAIT:-2}"
+case "$OPEN_WAIT" in 0|1|2) ;; *) run_unrecorded 'invalid packet-open retry wait' ;; esac
+reply=""; rc=0; attempt=0
+while [ "$attempt" -lt "$OPEN_ATTEMPTS" ]; do
+    attempt=$((attempt + 1)); rc=0
+    reply=$("$API_CURL" -fsS --max-time "$MAX_TIME" -H "x-boss-user: $BOSS_USER" \
+        ${MT_HDR:+-H "$MT_HDR"} \
+        "$BASE/api/jobs?kind=$KIND&status=open&limit=50" 2>"${curl_err:-/dev/stderr}") || rc=$?
+    [ "$rc" -ne 0 ] || break
+    cat "$curl_err" >&2
+    [ "$attempt" -ge "$OPEN_ATTEMPTS" ] || sleep "$OPEN_WAIT"
+done
 if [ "$rc" -ne 0 ]; then
     run_unrecorded "the jobs API at $BASE did not answer the open-packet read (curl exit $rc)"
 fi
@@ -316,8 +369,45 @@ open_count=$(printf '%s' "$reply" | jq --arg host "$HOST" '
     || run_unrecorded "the jobs API at $BASE answered the open-packet read in a shape this script cannot read, so no packet is spawned (it could be a duplicate)"
 
 if [ "$open_count" != "0" ]; then
-    echo "boss-maintenance-wrap: open $KIND Job exists${HOST:+ for $HOST} — this run will complete it (recovery)"
-    exit 0
+    # A completed run is immutable, not a place for today's output.
+    # Its status write may have committed before readiness settled
+    # (a8f8dbc3). Retry that exact status through the existing settle
+    # door, then require closure before admitting this invocation.
+    previous=$(printf '%s' "$reply" | jq -c --arg host "$HOST" '
+        [.data[] | select((.metadata.host // "") as $h | $h == $host or $h == "")]
+        | if length == 1 then .[0] else null end')
+    finished=$(printf '%s' "$previous" | jq -c '
+        (.steps // []) | map(select(.spec_slug == "run" and (.status == "completed" or .status == "skipped"))) | .[0] // null')
+    if [ "$finished" != null ]; then
+        . "$(dirname "$0")/lib/jq.sh"
+        previous_id=$(printf '%s' "$previous" | jq -r .id)
+        finished_id=$(printf '%s' "$finished" | jq -r .id)
+        status_body=$(printf '%s' "$finished" | jq -c '{status}')
+        if ! "$API_CURL" -fsS --max-time "$MAX_TIME" -X PUT -H "x-boss-user: $BOSS_USER" \
+            ${MT_HDR:+-H "$MT_HDR"} -H 'Content-Type: application/json' \
+            -d "$status_body" "$BASE/api/jobs/$previous_id/steps/$finished_id"; then
+            run_unrecorded "previous finished packet $previous_id could not settle; current invocation is not recorded"
+        fi
+        settled=0
+        # Outcome markers are completed by the dispatcher, independently
+        # of the readiness PUT. Measured dispatcher lag reached 52.6s
+        # (A review459f153d); cover that tail without inventing closure.
+        for ((attempt=1; attempt<=60; attempt++)); do
+            if ! previous=$("$API_CURL" -fsS --max-time "$MAX_TIME" -H "x-boss-user: $BOSS_USER" \
+                ${MT_HDR:+-H "$MT_HDR"} "$BASE/api/jobs/$previous_id"); then
+                run_unrecorded "previous finished packet $previous_id closure unread; current invocation is not recorded"
+            fi
+            if jq_doc_text "$previous" && printf '%s' "$previous" | jq -e --arg id "$previous_id" '.id == $id and .status == "closed"' >/dev/null; then
+                settled=1; break
+            fi
+            [ "$attempt" = 60 ] || sleep 1
+        done
+        [ "$settled" = 1 ] || run_unrecorded "previous finished packet $previous_id still unsettled; current invocation is not recorded"
+        echo "boss-maintenance-wrap: settled previous finished packet $previous_id; filing this invocation separately"
+    else
+        echo "boss-maintenance-wrap: open $KIND Job exists${HOST:+ for $HOST} — this run will complete it (recovery)"
+        exit 0
+    fi
 fi
 
 # TODAY'S PACKET IS BUILT IN A FILE AND SENT FROM IT. Nothing of variable
@@ -397,7 +487,8 @@ build_packet() {  # $1 = carry | hold, $2 = why the rows are held back
     jq -nR --arg kind "$KIND" --arg host "$HOST" --arg title "$LABEL — $(date +%F)" \
         --arg mode "$1" --arg because "${2:-}" --arg unmovable "$unmovable" \
         --argjson disk "$dropped_on_disk" --argjson unreadable "$unreadable" \
-        --argjson cap "$UNRECORDED_CAP" '
+        --argjson cap "$UNRECORDED_CAP" \
+        --argjson requests "$OPS_REQUESTS" --arg trigger "$TRIGGER" '
         # A line that is not a JSON object, is too long to be a row the
         # wrap wrote, or holds a NUL (a byte or \u0000) rides as its raw
         # text, capped at 500 characters with NULs removed.
@@ -424,6 +515,8 @@ build_packet() {  # $1 = carry | hold, $2 = why the rows are held back
             status: "open",
             metadata: ({chore: $kind}
                 + (if $host == "" then {} else {host: $host} end)
+                + (if ($requests | length) == 0 then {} else {ops_requests: $requests} end)
+                + (if $trigger == "" then {} else {trigger_name: $trigger} end)
                 + if $mode == "hold" then {unrecorded_runs_held_back: {rows: $n, because: $because[:500]}}
                   elif $n == 0 then {}
                   else {unrecorded_runs: $carried}
@@ -452,13 +545,87 @@ answered() { grep -qE 'returned error: [0-9]{3}' "$curl_err"; }
 build_packet carry \
     || run_unrecorded "today's packet could not be built, so nothing was sent and every kept row stays in the ledger"
 [ -s "$payload" ] || run_unrecorded "today's packet was built EMPTY, so nothing was sent and every kept row stays in the ledger"
+# A caller UUID belongs to one exact body, retained for this invocation.
+# Unknown POST acknowledgement is resolved by reading that UUID, never by
+# minting another packet or changing the body under the same identity.
+packet_id=""
+admission_owner=""
+if [ "$OPEN_ATTEMPTS" -gt 1 ]; then
+    # shellcheck source=infra/lib/jq.sh
+    . "$(dirname "$0")/lib/jq.sh"
+    packet_id=$(cat /proc/sys/kernel/random/uuid) \
+        || run_unrecorded 'could not allocate a stable packet identity'
+    # This caller chooses no human owner. Use its existing automation
+    # identity: owner_resolution::kept_as_sent always resolves that shape,
+    # even when the roster is unavailable. A human-shaped bootstrap id
+    # might instead be kept on one tenant and replaced on another.
+    jq_doc_text "$BOSS_USER" \
+        || run_unrecorded 'could not read the admission actor identity'
+    admission_owner=$(printf '%s' "$BOSS_USER" | jq -er '.id | strings | select(startswith("automation:"))') \
+        || run_unrecorded 'could not identify the server-resolved admission owner'
+    jq --arg id "$packet_id" --arg owner "$admission_owner" \
+        '. + {id: $id, owner_id: $owner}' "$payload" >"$payload.with-id" \
+        || run_unrecorded 'could not bind the packet identity to its body'
+    mv "$payload.with-id" "$payload"
+    if [ -n "${INVOCATION_ID:-}" ]; then
+        case "$INVOCATION_ID" in *[!0-9a-f]*|'') run_unrecorded 'invalid systemd invocation identity' ;; esac
+        [ "${#INVOCATION_ID}" -eq 32 ] || run_unrecorded 'invalid systemd invocation identity length'
+        jq --arg invocation "$INVOCATION_ID" '.metadata.unit_invocation_id = $invocation' \
+            "$payload" >"$payload.invocation" || run_unrecorded 'could not bind systemd invocation'
+        mv "$payload.invocation" "$payload"
+    fi
+fi
 carrying="${CLAIM:+1}"
 rc=0
 post_packet "$carrying" || rc=$?
+if [ -n "$packet_id" ]; then
+    post_attempt=1
+    while [ "$rc" -ne 0 ]; do
+        # A client refusal is final. A server/transport failure can have
+        # committed; read the exact identity before considering any retry.
+        if grep -qE 'returned error: 4[0-9]{2}' "$curl_err"; then break; fi
+        cat "$curl_err" >&2
+        readback="$work/readback.json"
+        read_rc=0
+        read_status=$("$API_CURL" -sS --max-time "$MAX_TIME" \
+            -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} \
+            -o "$readback" -w '%{http_code}' "$BASE/api/jobs/$packet_id" \
+            2>"$curl_err") || read_rc=$?
+        if [ "$read_rc" -eq 0 ] && [ "$read_status" = 200 ] \
+            && jq_doc_file "$readback" \
+            && jq -e --arg owner "$admission_owner" --slurpfile sent "$payload" '
+                . as $actual
+                | ($actual.owner_id | type == "string" and length > 0)
+                  and ($actual.status | IN("draft", "open", "closed", "cancelled"))
+                  and ($sent[0] | to_entries | all(.[];
+                  . as $field | if .key == "metadata" then
+                    (.value | to_entries | all(.[]; $actual.metadata[.key] == .value))
+                  # Match native admission equality: this explicit
+                  # automation owner is server-resolved; status belongs
+                  # to the protocol. Every caller-controlled field stays
+                  # exact, including any owner not sent as that sentinel.
+                  elif .key == "status" or (.key == "owner_id" and .value == $owner) then true
+                  else $actual[$field.key] == $field.value end))' "$readback" >/dev/null; then
+            rc=0
+            break
+        fi
+        if [ "$read_rc" -eq 0 ] && [ "$read_status" = 404 ]; then
+            # Definite absence permits the SAME caller id and SAME body.
+            # Three admissions and three readbacks at most, never a new id.
+            [ "$post_attempt" -lt "$OPEN_ATTEMPTS" ] || break
+            sleep "$OPEN_WAIT"
+            post_attempt=$((post_attempt + 1)); rc=0
+            post_packet "$carrying" || rc=$?
+        else
+            run_unrecorded 'packet create acknowledgement is unread or differs; no duplicate was sent' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        fi
+    done
+fi
 # A 4xx while carrying rows may be a row the API never accepts. The
 # packet goes once more WITHOUT them and says it held them back; the rows
 # stay in the ledger unchanged either way, bounded by LEDGER_MAX alone.
-if [ "$rc" -ne 0 ] && [ -n "$carrying" ] && grep -qE 'returned error: 4[0-9]{2}' "$curl_err"; then
+if [ "$rc" -ne 0 ] && [ -z "$packet_id" ] && [ -n "$carrying" ] && grep -qE 'returned error: 4[0-9]{2}' "$curl_err"; then
     refused=$(grep -v '^[[:space:]]*$' "$curl_err" | tail -n 1) || refused="curl exit $rc"
     cat "$curl_err" >&2
     echo "boss-maintenance-wrap: the jobs API refused today's packet while it carried the kept rows ($refused) — sending it once more without them; they stay in the ledger" >&2
@@ -472,7 +639,8 @@ if [ "$rc" -ne 0 ]; then
     # answer) say the packet did not land. Any other exit may follow a
     # POST the SoR committed. POST /api/jobs does answer a create whose
     # caller-chosen id names an identical packet with 200
-    # already_admitted (558396ff), but the wrap sends no id today: the
+    # already_admitted (558396ff). The default wrap sends no id; the
+    # opt-in path above resolves retries only within this invocation. The
     # next run's packet is not the same body (a new title date, and the
     # rows it carries change with every miss), so a key would need the id
     # and the body kept with the claim across runs. Until then the rows

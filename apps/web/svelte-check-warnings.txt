@@ -21,7 +21,7 @@
 1	src/shipping/ShippingPage.svelte
 1	src/shop/ShopProductPage.svelte
 1	src/steps/ApprovalSurface.svelte
-5	src/steps/GenericSurface.svelte
+4	src/steps/GenericSurface.svelte
 1	src/steps/HandoffSurface.svelte
 3	src/steps/InspectionSurface.svelte
 5	src/steps/IntakeSurface.svelte

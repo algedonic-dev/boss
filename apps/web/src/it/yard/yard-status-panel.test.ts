@@ -46,6 +46,23 @@ describe('the yard status panel draws the held-cars lane', () => {
     expect(markup).toContain('releasableHeld(s.held_cars)');
   });
 
+  // Backlog 60993cda: a held car the release rule tried and the door
+  // refused shows the rule's own record on its row, in the troubled
+  // tone, beside the decision — and whether or not one was stated.
+  it('shows the release rule’s refusal record on the held row', () => {
+    const lane = markup.slice(markup.indexOf('{#each s.held_cars as'));
+    const row = lane.slice(0, lane.indexOf('{/each}'));
+    expect(row).toContain('{#if h.auto_release}');
+    for (const cell of ['a.why', 'a.review', 'a.at']) {
+      expect(row, `the rule's record shows ${cell}`).toContain(cell);
+    }
+    const at = row.indexOf('{#if h.auto_release}');
+    expect(row.slice(at, at + 400)).toContain('ys-mismatch');
+    // Outside the decision's own {#if d === null} … {/if}: a row with no
+    // stated decision still says the rule tried.
+    expect(at).toBeGreaterThan(row.indexOf('d.refusal'));
+  });
+
   // Review 4822764d N1: the one confirmation Release-all asks lists, for
   // each car, the hold's reason and the reviewer's SAFE line, and marks a
   // car whose reviewer wrote "no" — it showed only branch, review and

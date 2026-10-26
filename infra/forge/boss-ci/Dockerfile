@@ -24,9 +24,11 @@
 # the workspace's node_modules or invoke the script that drives it — so
 # the web app's types went unchecked by CI entirely while every Rust
 # lint was enforced. Copied from the official image rather than curl'd
-# into a shell: a pinned tag is reproducible and reviewable, and the
-# installer script wants unzip and writes to $HOME, neither of which
-# this image should acquire for one binary.
+# into a shell: the installer script wants unzip and writes to $HOME,
+# neither of which this image should acquire for one binary. The TAG
+# below floats (1.3-slim); what pins the bun is the mirror copying it
+# from one digest and the revision check near the end of this file
+# (backlog e30098d3).
 #
 # Bases come from the forge mirror (infra/forge/mirror-base-images.sh),
 # never a public registry: a new external base goes on that list FIRST.
@@ -105,6 +107,20 @@ RUN rustup component add rustfmt clippy
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 RUN bunx playwright@1.61.0 install --with-deps chromium \
  && rm -rf /var/lib/apt/lists/*
+
+# ONE BUN, CHECKED WHERE IT IS USED (backlog e30098d3, review 2f67531c).
+# The gate's bun install cache is shared on the seed volume, and the
+# argument that a concurrent or killed install cannot leave a torn
+# package there is bun's own rename discipline, read in bun-v1.3.14's
+# source (infra/gate-runner/run.sh, the download caches block). So the
+# image refuses any bun but that one, by `bun --revision` (version +
+# commit), rather than trusting the forge tag above to still serve it:
+# the mirror copies it from one digest, but a tag is only a name. LAST,
+# so adding it invalidated no cached layer above (the browser bake and
+# its apt run were not re-run for a check).
+# Moving to another bun is this line, the mirror's digest and a re-read
+# of that cache argument against the new source, in one car.
+RUN got="$(bun --revision)" && [ "$got" = "1.3.14+0d9b296af" ] || { echo "boss-ci: the bun stage gave bun '$got', not the revision pinned on this line" >&2; exit 1; }
 
 # Provenance stamp: sha256(Dockerfile + required-tools.txt). The
 # locomotive CI job recomputes the same hash from its checkout and goes

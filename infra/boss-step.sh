@@ -24,9 +24,9 @@
 #   build because no Job is open would be the tail wagging the dog.
 # - More than one open Job → exit 1. Guessing which to close is worse
 #   than stopping.
-# - Step already terminal → NO-OP, exit 0. Re-running a deploy inside
-#   one regen must not fail: idempotence is the contract of a step's
-#   status.
+# - Step already terminal → retry its unchanged status to settle the
+#   open packet. Identical evidence is idempotent; different evidence
+#   is retained in the log and refused, never silently discarded.
 #
 # Metadata is MERGED, never replaced — by the server. The keys go
 # through the step merge door (`PATCH .../steps/{id}/metadata`), then a
@@ -54,10 +54,20 @@ fi
 WORKFLOW="$1"; shift
 STEP_TITLE="$1"; shift
 
+# Host identity added below is not evidence of another invocation. An
+# explicit result/output/summary is: it must survive a missing packet,
+# including one whose predecessor closed but whose read-back was lost.
+RECORDING_INPUT=0
+if [ "$#" -gt 0 ] || [ -n "${SERVICE_RESULT:-}${BOSS_RUN_SUMMARY_FILE:-}${BOSS_STEP_OUTPUT_FILE:-}" ]; then
+    RECORDING_INPUT=1
+fi
+
 # A mounted reading may be recorded before the operation ends (075d81f7).
 # The same merge door, with no status transition or synthesized verdict.
 METADATA_ONLY="${BOSS_STEP_METADATA_ONLY:-0}"
 case "$METADATA_ONLY" in 0|1) ;; *) echo 'boss-step: BOSS_STEP_METADATA_ONLY must be 0 or 1' >&2; exit 2 ;; esac
+REQUIRE_RECORD="${BOSS_STEP_REQUIRE_RECORD:-0}"
+case "$REQUIRE_RECORD" in 0|1) ;; *) echo 'boss-step: BOSS_STEP_REQUIRE_RECORD must be 0 or 1' >&2; exit 2 ;; esac
 
 # A VERDICT FOR THE RUN THAT JUST ENDED. systemd hands every
 # ExecStopPost= process $SERVICE_RESULT (success / exit-code / timeout /
@@ -110,6 +120,15 @@ fi
 # for.
 SUMMARY_JSON=""
 if [ -n "${BOSS_RUN_SUMMARY_FILE:-}" ]; then
+    # Required recording acknowledges the producer's object, never the
+    # legacy summary_absent fallback. Leave refused evidence for retry.
+    if [ "$REQUIRE_RECORD" = 1 ]; then
+        . "$(dirname "$0")/lib/jq.sh"
+        if ! jq_doc_file "$BOSS_RUN_SUMMARY_FILE" || ! jq -e -s 'length == 1 and (.[0] | type == "object")' "$BOSS_RUN_SUMMARY_FILE" >/dev/null 2>&1; then
+            echo 'boss-step: required summary is missing, empty or not one JSON object; nothing acknowledged' >&2
+            exit 1
+        fi
+    fi
     if [ ! -s "$BOSS_RUN_SUMMARY_FILE" ]; then
         SUMMARY_JSON=$(jq -nc --arg f "$BOSS_RUN_SUMMARY_FILE" \
             '{summary_absent: ($f + " was not written by this run")}')
@@ -143,6 +162,10 @@ fi
 
 # The lint's self-test reads the pairs this run would record, and stops.
 if [ -n "${BOSS_STEP_DRY_RUN:-}" ]; then
+    if [ "$REQUIRE_RECORD" = 1 ]; then
+        echo 'boss-step: a dry run cannot acknowledge a required record' >&2
+        exit 1
+    fi
     [ -n "$SUMMARY_JSON" ] && printf 'run-summary=%s\n' "$SUMMARY_JSON"
     printf '%s\n' "$@"
     exit 0
@@ -190,6 +213,43 @@ BOSS_USER="{\"id\":\"$ACTOR\",\"role\":\"platform-admin\",\"access_tier\":\"oper
 API_CURL="$(dirname "$0")/boss-api-curl.sh"
 [ -x "$API_CURL" ] || API_CURL=boss-api-curl.sh
 
+# EVERY REQUEST HAS A DEADLINE (backlog 81bc8c90). The helper's
+# BOSS_API_RETRY_DEADLINE bounds the re-sends of a REFUSED connect; it
+# cannot bound one call that connects and is never answered, and until
+# 2026-10-22 none of the three below carried --max-time: against a
+# listener that accepts and never answers the call never returned
+# (measured by review run ffb8efa0, killed at 90 s). Harmless in
+# ExecStopPost; inside an ExecStart it holds the unit to its
+# TimeoutStartSec — 90 minutes on the converge — and a oneshot then
+# blocks the next run, the one that would ship the fix. The wrap's twin
+# is BOSS_WRAP_MAX_TIME (re-review of 324597eb), and this matches its
+# 30 s. The connect is bounded inside it: a black-holed SoR answers 28
+# in at most 10 s, which the helper does not re-send. curl's 28 on
+# either is named below and is never a success. Pinned by
+# a_step_close_has_a_deadline.rs.
+MAX_TIME="${BOSS_STEP_MAX_TIME:-30}"
+# curl reads 0 as NO deadline, so zero (in any spelling) is refused too.
+if [ -z "$MAX_TIME" ] || [ -n "${MAX_TIME//[0-9]/}" ] || [ -z "${MAX_TIME//0/}" ]; then
+    echo "boss-step: BOSS_STEP_MAX_TIME='$MAX_TIME' is not a positive whole number of seconds — refusing rather than send a request with no deadline; '$STEP_TITLE' not recorded" >&2
+    exit 2
+fi
+MAX_TIME=$((10#$MAX_TIME))
+CONNECT_TIME=10
+[ "$MAX_TIME" -ge "$CONNECT_TIME" ] || CONNECT_TIME=$MAX_TIME
+# It stamps the machine token too, so every call carries both in one
+# place (the header file is made below, before the first call).
+api() {
+    "$API_CURL" --connect-timeout "$CONNECT_TIME" --max-time "$MAX_TIME" \
+        ${MT_HDR:+-H "$MT_HDR"} "$@"
+}
+# The phrase for a failed call: a timeout says so, by its deadline.
+unanswered() {
+    case "$1" in
+        28) echo "not answered within ${MAX_TIME}s (curl exit 28; BOSS_STEP_MAX_TIME)" ;;
+        *) echo "curl exit $1" ;;
+    esac
+}
+
 # Set the caller's cleanup before secret-header chains its own onto it.
 metadata_file=""
 trap '[ -z "$metadata_file" ] || rm -f "$metadata_file"' EXIT
@@ -208,10 +268,11 @@ fi
 . "$SECRET_LIB"
 machine_token_header MT_HDR "$BOSS_JOBS_URL"
 
-if ! jobs_json=$("$API_CURL" -fsS -H "x-boss-user: $BOSS_USER" \
-        ${MT_HDR:+-H "$MT_HDR"} \
-        "$BASE/api/jobs?kind=$WORKFLOW&status=open&limit=50&full=true" 2>/dev/null); then
-    echo "boss-step: jobs-api unreachable at $BASE — '$STEP_TITLE' not recorded" >&2
+rc=0
+jobs_json=$(api -fsS -H "x-boss-user: $BOSS_USER" \
+        "$BASE/api/jobs?kind=$WORKFLOW&status=open&limit=50&full=true" 2>/dev/null) || rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "boss-step: jobs-api unreachable at $BASE, $(unanswered "$rc") — '$STEP_TITLE' not recorded" >&2
     exit 1
 fi
 
@@ -232,8 +293,21 @@ open_jobs=$(printf '%s' "$jobs_json" | jq --arg host "$HOST" '
 open_count=$(printf '%s' "$open_jobs" | jq 'length')
 
 if [ "$open_count" -eq 0 ]; then
+    if [ "$RECORDING_INPUT" = 1 ]; then
+        echo "boss-step: no open $WORKFLOW Job — current evidence is not recorded; full facts follow:" >&2
+        [ -z "$SUMMARY_JSON" ] || printf '%s\n' "$SUMMARY_JSON" >&2
+        [ "$#" -eq 0 ] || printf '%s\n' "$@" >&2
+        if [ -n "${BOSS_STEP_OUTPUT_FILE:-}" ]; then
+            if [ -r "$BOSS_STEP_OUTPUT_FILE" ]; then
+                cat "$BOSS_STEP_OUTPUT_FILE" >&2
+            else
+                echo "boss-step: current output file unreadable: $BOSS_STEP_OUTPUT_FILE" >&2
+            fi
+        fi
+        exit 1
+    fi
     echo "boss-step: no open $WORKFLOW Job — nothing to record" >&2
-    [ "$METADATA_ONLY" = 0 ] || exit 1
+    [ "$METADATA_ONLY" = 0 ] && [ "$REQUIRE_RECORD" = 0 ] || exit 1
     exit 0
 fi
 if [ "$open_count" -gt 1 ]; then
@@ -272,11 +346,6 @@ if [ "$METADATA_ONLY" = 1 ]; then
         exit 1
     fi
 fi
-if [ "$step_status" = "completed" ] || [ "$step_status" = "skipped" ]; then
-    echo "boss-step: $STEP_TITLE already $step_status — no-op" >&2
-    exit 0
-fi
-
 # Only the keys this run writes. The run summary merges DEEP onto what
 # the step holds (`*`), so each of its top-level keys is sent as that
 # deep merge; the merge door itself merges top-level keys only.
@@ -284,8 +353,12 @@ merged='{}'
 # The run's own facts go under the caller's explicit pairs: a verdict the
 # unit line states wins over one a script left in a file.
 if [ -n "$SUMMARY_JSON" ]; then
-    merged=$(printf '%s' "$step" | jq --argjson s "$SUMMARY_JSON" '
-        ((.metadata // {}) * $s) | with_entries(select(.key as $k | $s | has($k)))')
+    # A file-backed summary may exceed Linux's per-argument bound. Keep
+    # both documents on stdin; deep merge and explicit-pair precedence
+    # are unchanged (b11c5e91 worktree coverage).
+    merged=$(printf '%s\n%s\n' "$step" "$SUMMARY_JSON" | jq -s '
+        .[0] as $step | .[1] as $s |
+        (($step.metadata // {}) * $s) | with_entries(select(.key as $k | $s | has($k)))')
 fi
 for pair in "$@"; do
     case "$pair" in
@@ -305,16 +378,21 @@ if [ "$METADATA_ONLY" = 1 ] && [ "$keys" = '{}' ]; then
     exit 1
 fi
 metadata_data=(-d "$keys")
-if [ -n "${BOSS_STEP_OUTPUT_FILE:-}" ]; then
+if [ -n "$SUMMARY_JSON" ] || [ -n "${BOSS_STEP_OUTPUT_FILE:-}" ]; then
     # The break-glass chore needs its complete observed refusal, even past
     # Linux's 128 KiB per-argument limit (review a432c7be, d40eddc0).
     # Neither jq nor curl sees the bytes in argv; both read a private file.
-    if [ ! -f "$BOSS_STEP_OUTPUT_FILE" ] || [ ! -r "$BOSS_STEP_OUTPUT_FILE" ]; then
+    if [ -n "${BOSS_STEP_OUTPUT_FILE:-}" ] && { [ ! -f "$BOSS_STEP_OUTPUT_FILE" ] || [ ! -r "$BOSS_STEP_OUTPUT_FILE" ]; }; then
         echo "boss-step: output file is not readable: $BOSS_STEP_OUTPUT_FILE — no metadata recorded" >&2
         exit 1
     fi
     metadata_file=$(mktemp "${TMPDIR:-/tmp}/boss-step-output.XXXXXX")
-    if ! printf '%s' "$keys" | jq -c --rawfile output "$BOSS_STEP_OUTPUT_FILE" '. + {output: $output}' > "$metadata_file"; then
+    if [ -n "${BOSS_STEP_OUTPUT_FILE:-}" ]; then
+        printf '%s' "$keys" | jq -c --rawfile output "$BOSS_STEP_OUTPUT_FILE" '. + {output: $output}' > "$metadata_file"
+    else
+        printf '%s\n' "$keys" > "$metadata_file"
+    fi
+    if [ ! -s "$metadata_file" ]; then
         echo 'boss-step: could not read the complete output into metadata — no metadata recorded' >&2
         exit 1
     fi
@@ -330,24 +408,62 @@ if [ -n "${BOSS_STEP_OUTPUT_FILE:-}" ]; then
 fi
 step_id=$(printf '%s' "$step" | jq -r '.id')
 url="$BASE/api/jobs/$job_id/steps/$step_id"
+if [ "$step_status" = completed ] || [ "$step_status" = skipped ]; then
+    # Retry only the finished status, never its immutable evidence. The
+    # server settles an open packet on this idempotent re-send. New facts
+    # belong to a new invocation, not to its completed predecessor.
+    if [ -n "$metadata_file" ]; then
+        same=$(printf '%s' "$step" | jq --slurpfile patch "$metadata_file" '
+            .metadata as $old | all($patch[0] | to_entries[]; $old[.key] == .value)')
+    else
+        same=$(printf '%s' "$step" | jq --argjson patch "$keys" '
+            .metadata as $old | all($patch | to_entries[]; $old[.key] == .value)')
+    fi
+    status_body=$(printf '%s' "$step" | jq -c '{status}')
+    retain_unrecorded_evidence() {
+        echo 'boss-step: full current evidence not recorded follows:' >&2
+        if [ -n "$metadata_file" ]; then
+            cat "$metadata_file" >&2
+        else
+            printf '%s\n' "$keys" >&2
+        fi
+    }
+    if ! api -fsS -X PUT -H 'content-type: application/json' -H "x-boss-user: $BOSS_USER" \
+        -d "$status_body" "$url"; then
+        echo "boss-step: finished step settlement failed; current evidence is not recorded" >&2
+        retain_unrecorded_evidence
+        exit 1
+    fi
+    if [ "$same" != true ] || [ "$REQUIRE_RECORD" = 1 ]; then
+        echo "boss-step: $STEP_TITLE is $step_status; current evidence is not acknowledged — a fresh invocation packet is required" >&2
+        retain_unrecorded_evidence
+        exit 1
+    fi
+    echo "boss-step: retried unchanged $step_status step $STEP_TITLE; original evidence retained"
+    exit 0
+fi
 # The keys first: a result required at done is judged at the flip, so a
 # merge that did not land is not followed by one.
-if [ "$keys" != '{}' ] && ! merge_err=$("$API_CURL" -fsS -X PATCH -H "content-type: application/json" \
+rc=0
+if [ "$keys" != '{}' ]; then
+    merge_err=$(api -fsS -X PATCH -H "content-type: application/json" \
         -H "x-boss-user: $BOSS_USER" \
-        ${MT_HDR:+-H "$MT_HDR"} \
-        "${metadata_data[@]}" "$url/metadata" 2>&1 >/dev/null); then
-    echo "boss-step: metadata merge failed — $merge_err" >&2
+        "${metadata_data[@]}" "$url/metadata" 2>&1 >/dev/null) || rc=$?
+fi
+if [ "$rc" -ne 0 ]; then
+    echo "boss-step: metadata merge failed, $(unanswered "$rc") — $merge_err" >&2
     exit 1
 fi
 if [ "$METADATA_ONLY" = 1 ]; then
     echo "boss-step: recorded metadata on $WORKFLOW/$STEP_TITLE on ${job_id:0:8}; status unchanged"
     exit 0
 fi
-if ! put_err=$("$API_CURL" -fsS -X PUT -H "content-type: application/json" \
+rc=0
+put_err=$(api -fsS -X PUT -H "content-type: application/json" \
         -H "x-boss-user: $BOSS_USER" \
-        ${MT_HDR:+-H "$MT_HDR"} \
-        -d '{"status":"completed"}' "$url" 2>&1 >/dev/null); then
-    echo "boss-step: PUT failed — $put_err" >&2
+        -d '{"status":"completed"}' "$url" 2>&1 >/dev/null) || rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "boss-step: PUT failed, $(unanswered "$rc") — $put_err" >&2
     exit 1
 fi
 echo "boss-step: closed $WORKFLOW/$STEP_TITLE on ${job_id:0:8}"

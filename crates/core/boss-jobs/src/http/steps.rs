@@ -365,6 +365,24 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
             .into_response();
     }
 
+    if matches!(step.status, StepStatus::Completed | StepStatus::Skipped) {
+        let job = match state.jobs.get_job(&step.job_id).await {
+            Ok(Some(job)) => job,
+            _ => return (StatusCode::CONFLICT, "completion parent unavailable").into_response(),
+        };
+        if let Err(why) = crate::completion_contract::validate(
+            state.kind_registry.as_ref(),
+            &state.completion_contracts,
+            &job,
+            &step,
+            &user,
+        )
+        .await
+        {
+            return contract_refusal(&job, &why);
+        }
+    }
+
     // Schema validation runs only when the step is being marked done —
     // required fields represent what must be true for the work to count
     // as complete, not what must be true for it to exist. A brand-new
@@ -546,12 +564,18 @@ async fn dispatch_workflow_publish(
     // this spec again and retired the other packet's newer version. This
     // packet's publish happened once, and a later one superseding it does
     // not undo that; the re-send is answered with the row it wrote.
+    //
+    // A ROW THAT WAS PUBLISHED, NOT ONE THAT IS NOT A DRAFT (backlog
+    // 50ded63d, the review of car e3c4a326, B1). A rejected row is a
+    // draft that met traffic and lost: it was never published, so a
+    // re-send that took it for this packet's publish completed the step
+    // with no version live.
     let authored_here = Some(*job_id.inner().as_uuid());
     if !insert_if_absent
         && let Ok(versions) = registry.list_versions(&spec.kind).await
         && let Some(own) = versions.into_iter().rev().find(|row| {
             row.authoring_job_id == authored_here
-                && row.status != crate::registry::WorkflowStatus::Draft
+                && row.status.was_published()
                 && *row == published_as(&spec, row)
         })
     {
@@ -1202,6 +1226,55 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
         return (StatusCode::NOT_FOUND, "step not on this job").into_response();
     }
 
+    // A delayed matchmaking event must not replace newer operator intent.
+    // This judgment shares the final row-version CAS with the assignment:
+    // a nomination merged after this read invalidates the write too.
+    // Defer the refusal until the packet's scope has been authorized below.
+    let assignment_refusal = || {
+        if old.status == StepStatus::Ready
+            && body
+                .get("automatic_assignment")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && let Some(target) = body.get("assignee_id").and_then(serde_json::Value::as_str)
+        {
+            let requested = old.metadata.get("nomination_requested");
+            let requested_actor = requested
+                .and_then(|v| v.get("assignee_id"))
+                .and_then(serde_json::Value::as_str);
+            let date = |v: Option<&serde_json::Value>| {
+                v.and_then(serde_json::Value::as_str)
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            };
+            let requested_at = date(requested.and_then(|v| v.get("at")));
+            let released_at = date(
+                old.metadata
+                    .get(crate::step_release::KEY)
+                    .and_then(|v| v.get("at")),
+            );
+            let intent_stands = requested_actor.is_some_and(|id| !id.trim().is_empty())
+                && match (requested_at, released_at) {
+                    (Some(requested), Some(released)) => requested >= released,
+                    _ => true,
+                };
+            if old
+                .assignee_id
+                .as_deref()
+                .is_some_and(|holder| !holder.trim().is_empty() && holder != target)
+                || (intent_stands && requested_actor != Some(target))
+            {
+                return Some((StatusCode::CONFLICT, Json(serde_json::json!({
+                "code":crate::step_release::AUTOMATIC_ASSIGNMENT_SUPERSEDED,
+                "error":"automatic assignment cannot replace the current holder or a newer explicit nomination",
+                "step_id":step_id.to_string(),
+                "holder":old.assignee_id,
+                "nomination_requested":requested
+            }))).into_response());
+            }
+        }
+        None
+    };
+
     // The parent packet, fetched ONCE: the event stamp inherits its
     // partition, the step.done / step.assigned markers read
     // its Subject identity, and the re-evaluator runs against it.
@@ -1236,6 +1309,10 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
     // write that must not be able to make itself admissible.
     if !step_writable_reported(&state, &user, &scope, parent_job.as_ref(), &old) {
         return step_not_found();
+    }
+
+    if let Some(refusal) = assignment_refusal() {
+        return refusal;
     }
 
     // A credential proves the executor; policy still grants authority.
@@ -1750,10 +1827,20 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
         // closer derives — so the 6b23d135 race above now ends with the
         // outcome recorded by whichever closer lands first. A closed
         // packet's re-send still writes and records nothing.
+        //
+        // EITHER FINISHED STATUS, NOT ONLY COMPLETED (backlog 657c9200,
+        // landed-review fc7b75f6 of car f705c864). This branch is
+        // reached only for a step stored completed or skipped (the
+        // freeze above is `is_terminal`), and it settled only the first:
+        // a skip whose settle failed was told to send the same request
+        // again, and that retry answered 204 having run neither the pass
+        // nor the all-steps-terminal catch-all close a skipped last step
+        // owes its packet. Every step write that can fail its settle now
+        // has a retry that runs it: a finished step's re-send here, and
+        // an unfinished step's re-send, which never reaches this branch,
+        // by being written and settled like any other write.
         if step == old {
-            if old.status == StepStatus::Completed
-                && let Some(job) = parent_job.as_ref().filter(|j| j.status == JobStatus::Open)
-            {
+            if let Some(job) = parent_job.as_ref().filter(|j| j.status == JobStatus::Open) {
                 let actor = match executor {
                     Some(c) => match c.actor_id.parse() {
                         Ok(actor) => actor,
@@ -1988,6 +2075,23 @@ async fn update_step_with_condition<R: JobsRepository + 'static, B: EventBus + '
             })),
         )
             .into_response();
+    }
+
+    if matches!(step.status, StepStatus::Completed | StepStatus::Skipped) {
+        let Some(job) = parent_job.as_ref() else {
+            return (StatusCode::CONFLICT, "completion parent unavailable").into_response();
+        };
+        if let Err(why) = crate::completion_contract::validate(
+            state.kind_registry.as_ref(),
+            &state.completion_contracts,
+            job,
+            &step,
+            &user,
+        )
+        .await
+        {
+            return contract_refusal(job, &why);
+        }
     }
 
     // Validate metadata only when the step is done (see add_step for
@@ -2842,7 +2946,8 @@ enum Settling {
     /// completed: a declared terminal's flip closes the packet with its
     /// outcome. The STORED `sort_order`, never the body's (b433bdf3).
     Wrote { sort_order: i32, completed: bool },
-    /// An unchanged re-send of a COMPLETED step on a packet still open:
+    /// An unchanged re-send of a FINISHED step — completed or skipped
+    /// (backlog 657c9200) — on a packet still open:
     /// nothing about the step moves, but the packet may never have been
     /// settled after the write it repeats (backlog 17bf6f3e) — so the
     /// readiness pass runs again, and any declared terminal already
@@ -2898,7 +3003,19 @@ async fn settle_after_step_write<R: JobsRepository + 'static, B: EventBus + 'sta
         // re-evaluator. On a re-send, the terminal is whichever
         // declared terminal the packet has already completed — the one
         // rule every closer derives it by (`completed_terminal_outcome`).
-        if let Ok(spec) = reg.get_version(&job.kind, job.workflow_version).await {
+        //
+        // A registry that could not answer is refused, never read as "no
+        // terminal" (backlog 0887d2a9): this was `if let Ok(..)`, and a
+        // failed read answered 204 with the declared terminal completed
+        // and the packet open. Only NotFound — a kind with no protocol —
+        // means there is no terminal to close on, as the readiness pass
+        // above reads it.
+        let pinned = match reg.get_version(&job.kind, job.workflow_version).await {
+            Ok(spec) => Some(spec),
+            Err(crate::registry::WorkflowError::NotFound(_)) => None,
+            Err(e) => return Err(settle_not_read(job_id, &pinned_protocol(job), &e)),
+        };
+        if let Some(spec) = pinned {
             let resent_steps = match settling {
                 Settling::Resent => Some(state.jobs.list_steps(job_id).await.map_err(|e| {
                     readiness_not_run(job_id, &format!("reading the steps failed: {e}"))
@@ -2933,150 +3050,180 @@ async fn settle_after_step_write<R: JobsRepository + 'static, B: EventBus + 'sta
     // state (Completed / Skipped) closes here even when no *declared*
     // terminal step fired (the declared-terminal close above already
     // handled that case and left the Job Closed, so this no-ops then).
-    if let Ok(steps) = state.jobs.list_steps(job_id).await {
-        let new_status = compute_job_status(&steps);
-        if let Ok(Some(mut job)) = state.jobs.get_job(job_id).await
-            && job.status != new_status
-            && job.status != JobStatus::Cancelled
-            && job.status != JobStatus::Draft
-            // A Closed Job is terminal — never reopen / re-transition it
-            // (the declared-terminal close above may have already closed
-            // it, force-skipping a still-pending sign-off step).
-            && job.status != JobStatus::Closed
-        {
-            let old_status = job.status;
-            job.status = new_status;
-            if new_status == JobStatus::Closed {
-                // Same business-date contract as step.completed_on:
-                // the closing transition is the step we just wrote, so
-                // its completed_on (a date on the authoritative — sim-
-                // aware — calendar) is the right anchor for the Job's
-                // closed_on too. Falls through to the authoritative
-                // clock's date only if the step somehow lacks one.
-                let job_now = boss_clock_client::now_from(&state.clock).await;
-                job.closed_on = closing_date.or(Some(job_now.date_naive()));
-                stamp_close_instant(&mut job, &job_now);
-                // A catch-all close that FOLLOWS a completed declared
-                // terminal names that terminal's outcome. Two completers
-                // of one marker (a verb's PUT and the dispatcher's
-                // `complete-marker-on-step-ready`) race here: the second
-                // reads the terminal completed and the rest skipped while
-                // the first's close is not yet written, closes the Job
-                // itself, and its whole-row write landed last — so car
-                // 6b23d135 closed through `disproved` with no outcome
-                // (228c9a7d). Deriving it here makes both writers say
-                // the same thing, whichever lands last.
-                if let Some(reg) = &state.kind_registry
-                    && let Ok(spec) = reg.get_version(&job.kind, job.workflow_version).await
-                    && let Some(outcome) = spec.completed_terminal_outcome(
-                        steps
-                            .iter()
-                            .map(|s| (s.sort_order, s.status == StepStatus::Completed)),
-                    )
-                    && let serde_json::Value::Object(map) = &mut job.metadata
-                {
-                    map.insert("outcome".to_string(), outcome.into());
-                }
-            }
-            // OUTBOX (phase 2): the state event (full row state for
-            // the rebuild) + status markers record in the SAME
-            // transaction as the auto-transition. The actor is
-            // inherited from the step transition that triggered it:
-            // the operator (or sim slug) who flipped the terminal
-            // step is the responsible CPU for the resulting Job
-            // state change too.
-            let close_stamp = state
-                .publisher
-                .stamp_with_actor(actor.clone())
-                .await
-                .with_partition(job.partition);
-            // `compute_job_status` answers only Open or Closed, and an
-            // Open Job is the only one that reaches here, so this
-            // transition is always a close — and it goes through the
-            // close door, never a whole-row write (backlog 29a7ea09:
-            // on car 6b23d135 this site wrote back a copy read before
-            // the terminal close committed, and erased its outcome).
-            // The adapter builds the state event from the post-close
-            // row; these markers are built from that row too.
-            let markers = |job: &Job| {
-                vec![
-                    close_stamp.event(
-                        events::JOB_STATUS_CHANGED,
-                        serde_json::json!({
-                            "id": job.id.to_string(),
-                            "old_status": old_status,
-                            "new_status": new_status,
-                        }),
-                    ),
-                    close_stamp.event(
-                        events::JOB_CLOSED,
-                        serde_json::json!({
-                            "id": job.id.to_string(),
-                            "closed_on": job.closed_on,
-                            // ALWAYS present, on all three emit sites,
-                            // defaulting null — the dispatcher's expr
-                            // binder makes an ABSENT identifier a
-                            // PredicateFailed → Retry → dead-letter storm
-                            // rather than a quiet false, so a rule gating
-                            // on `kind` / `outcome` needs the keys on every
-                            // close, not just the ones that have an answer.
-                            // (The `notify_on_done` field on step.done,
-                            // migration 106, is the same contract.) A
-                            // catch-all close carries no declared outcome,
-                            // so `outcome` is null here unless a terminal
-                            // already stamped one.
-                            "kind": job.kind,
-                            "outcome": job.metadata.get("outcome"),
-                            // What closed, in words. A rule that SPAWNS off
-                            // a close has to title the new packet, and the
-                            // only titles available to it are a literal or
-                            // an identifier from this payload — the arg
-                            // language has no concatenation. Without this
-                            // key, `title = "title"` binds nothing and the
-                            // whole event dead-letters (see below); with a
-                            // literal instead, every spawned packet is
-                            // named identically and the board cannot tell
-                            // them apart.
-                            "title": job.title,
-                            // WHAT the closed packet was about. A recurring
-                            // sweep names its target here
-                            // (`stale-build-caches`), and that is the only
-                            // stable identity a spawning rule can dedupe
-                            // on: the sweep's `id` differs every firing and
-                            // its `title` is templated per target, so two
-                            // days of the same finding are indistinguishable
-                            // without this. Present on all three sites for
-                            // the same reason `kind` and `title` are.
-                            "subject_id": boss_core::primitives::Subject::id(&job.subject),
-                            // D7: same delegate-subjob back-link as the
-                            // terminal-close path, so a child Job that
-                            // closes via the all-steps-terminal catch-all
-                            // (no declared `outcome` step) still triggers
-                            // the parent resolve. Null when absent.
-                            "parent_step_id": job.metadata.get("parent_step_id"),
-                        }),
-                    ),
-                ]
+    //
+    // A steps read the store could not answer is refused, never read as
+    // "nothing to close" (backlog de9b48de): this was `if let Ok(..)`,
+    // and a failed read answered 204 over a packet left open with every
+    // step terminal. The 500 asks for the same request again, and that
+    // re-send settles the packet ([`Settling::Resent`]).
+    //
+    // The packet read below is refused the same way (backlog 140e7984):
+    // it was `if let Ok(Some(..))`, so a failed read was the same 204
+    // over the same unclosed packet.
+    let steps = state
+        .jobs
+        .list_steps(job_id)
+        .await
+        .map_err(|e| settle_not_read(job_id, "the steps", &e))?;
+    let new_status = compute_job_status(&steps);
+    let read = state
+        .jobs
+        .get_job(job_id)
+        .await
+        .map_err(|e| settle_not_read(job_id, "the row", &e))?;
+    if let Some(mut job) = read
+        && job.status != new_status
+        && job.status != JobStatus::Cancelled
+        && job.status != JobStatus::Draft
+        // A Closed Job is terminal — never reopen / re-transition it
+        // (the declared-terminal close above may have already closed
+        // it, force-skipping a still-pending sign-off step).
+        && job.status != JobStatus::Closed
+    {
+        let old_status = job.status;
+        job.status = new_status;
+        if new_status == JobStatus::Closed {
+            // Same business-date contract as step.completed_on:
+            // the closing transition is the step we just wrote, so
+            // its completed_on (a date on the authoritative — sim-
+            // aware — calendar) is the right anchor for the Job's
+            // closed_on too. Falls through to the authoritative
+            // clock's date only if the step somehow lacks one.
+            let job_now = boss_clock_client::now_from(&state.clock).await;
+            job.closed_on = closing_date.or(Some(job_now.date_naive()));
+            stamp_close_instant(&mut job, &job_now);
+            // A catch-all close that FOLLOWS a completed declared
+            // terminal names that terminal's outcome. Two completers
+            // of one marker (a verb's PUT and the dispatcher's
+            // `complete-marker-on-step-ready`) race here: the second
+            // reads the terminal completed and the rest skipped while
+            // the first's close is not yet written, closes the Job
+            // itself, and its whole-row write landed last — so car
+            // 6b23d135 closed through `disproved` with no outcome
+            // (228c9a7d). Deriving it here makes both writers say
+            // the same thing, whichever lands last.
+            //
+            // A registry that could not answer is refused before the
+            // close (backlog 0887d2a9): under `if let Ok(..)` a failed
+            // read closed the packet with no outcome although its
+            // terminal had completed. NotFound has no terminal to name.
+            let pinned = match &state.kind_registry {
+                None => None,
+                Some(reg) => match reg.get_version(&job.kind, job.workflow_version).await {
+                    Ok(spec) => Some(spec),
+                    Err(crate::registry::WorkflowError::NotFound(_)) => None,
+                    Err(e) => return Err(settle_not_read(job_id, &pinned_protocol(&job), &e)),
+                },
             };
-            // A close that loses the compare-and-set (another closer
-            // got there first) writes nothing and is not a failure; a
-            // close the store REFUSED is, and it is answered, never
-            // dropped: this site discarded it with `let _ =` and said
-            // 204 over a packet left open with every step terminal.
-            let closed_on = job.closed_on.unwrap_or_else(|| now.date_naive());
-            if let Err(e) = state
-                .jobs
-                .close_job_at(
-                    job_id,
-                    closed_on,
-                    &close_owned_fields(&job),
-                    &close_stamp,
-                    &markers,
+            if let Some(outcome) = pinned.as_ref().and_then(|spec| {
+                spec.completed_terminal_outcome(
+                    steps
+                        .iter()
+                        .map(|s| (s.sort_order, s.status == StepStatus::Completed)),
                 )
-                .await
+            }) && let serde_json::Value::Object(map) = &mut job.metadata
             {
-                return Err(close_not_written(job_id, &e));
+                map.insert("outcome".to_string(), outcome.into());
             }
+        }
+        // OUTBOX (phase 2): the state event (full row state for
+        // the rebuild) + status markers record in the SAME
+        // transaction as the auto-transition. The actor is
+        // inherited from the step transition that triggered it:
+        // the operator (or sim slug) who flipped the terminal
+        // step is the responsible CPU for the resulting Job
+        // state change too.
+        let close_stamp = state
+            .publisher
+            .stamp_with_actor(actor.clone())
+            .await
+            .with_partition(job.partition);
+        // `compute_job_status` answers only Open or Closed, and an
+        // Open Job is the only one that reaches here, so this
+        // transition is always a close — and it goes through the
+        // close door, never a whole-row write (backlog 29a7ea09:
+        // on car 6b23d135 this site wrote back a copy read before
+        // the terminal close committed, and erased its outcome).
+        // The adapter builds the state event from the post-close
+        // row; these markers are built from that row too.
+        let markers = |job: &Job| {
+            vec![
+                close_stamp.event(
+                    events::JOB_STATUS_CHANGED,
+                    serde_json::json!({
+                        "id": job.id.to_string(),
+                        "old_status": old_status,
+                        "new_status": new_status,
+                    }),
+                ),
+                close_stamp.event(
+                    events::JOB_CLOSED,
+                    serde_json::json!({
+                        "id": job.id.to_string(),
+                        "closed_on": job.closed_on,
+                        // ALWAYS present, on all three emit sites,
+                        // defaulting null — the dispatcher's expr
+                        // binder makes an ABSENT identifier a
+                        // PredicateFailed → Retry → dead-letter storm
+                        // rather than a quiet false, so a rule gating
+                        // on `kind` / `outcome` needs the keys on every
+                        // close, not just the ones that have an answer.
+                        // (The `notify_on_done` field on step.done,
+                        // migration 106, is the same contract.) A
+                        // catch-all close carries no declared outcome,
+                        // so `outcome` is null here unless a terminal
+                        // already stamped one.
+                        "kind": job.kind,
+                        "outcome": job.metadata.get("outcome"),
+                        // What closed, in words. A rule that SPAWNS off
+                        // a close has to title the new packet, and the
+                        // only titles available to it are a literal or
+                        // an identifier from this payload — the arg
+                        // language has no concatenation. Without this
+                        // key, `title = "title"` binds nothing and the
+                        // whole event dead-letters (see below); with a
+                        // literal instead, every spawned packet is
+                        // named identically and the board cannot tell
+                        // them apart.
+                        "title": job.title,
+                        // WHAT the closed packet was about. A recurring
+                        // sweep names its target here
+                        // (`stale-build-caches`), and that is the only
+                        // stable identity a spawning rule can dedupe
+                        // on: the sweep's `id` differs every firing and
+                        // its `title` is templated per target, so two
+                        // days of the same finding are indistinguishable
+                        // without this. Present on all three sites for
+                        // the same reason `kind` and `title` are.
+                        "subject_id": boss_core::primitives::Subject::id(&job.subject),
+                        // D7: same delegate-subjob back-link as the
+                        // terminal-close path, so a child Job that
+                        // closes via the all-steps-terminal catch-all
+                        // (no declared `outcome` step) still triggers
+                        // the parent resolve. Null when absent.
+                        "parent_step_id": job.metadata.get("parent_step_id"),
+                    }),
+                ),
+            ]
+        };
+        // A close that loses the compare-and-set (another closer
+        // got there first) writes nothing and is not a failure; a
+        // close the store REFUSED is, and it is answered, never
+        // dropped: this site discarded it with `let _ =` and said
+        // 204 over a packet left open with every step terminal.
+        let closed_on = job.closed_on.unwrap_or_else(|| now.date_naive());
+        if let Err(e) = state
+            .jobs
+            .close_job_at(
+                job_id,
+                closed_on,
+                &close_owned_fields(&job),
+                &close_stamp,
+                &markers,
+            )
+            .await
+        {
+            return Err(close_not_written(job_id, &e));
         }
     }
     Ok(())
@@ -3094,6 +3241,62 @@ fn readiness_not_run(job_id: &boss_core::job::JobId, why: &str) -> Response {
         format!(
             "the step was written, but the readiness pass over job {job_id} did not complete \
              ({why}); send the same request again — a re-send re-runs it"
+        ),
+    )
+        .into_response()
+}
+
+/// The answer to a step write whose settle could not read what the
+/// all-steps-terminal close judges — the packet's steps (backlog
+/// de9b48de) or its row (backlog 140e7984): a 500 naming the packet and
+/// the read, saying the step itself was written, and naming the repair
+/// — the same request again, a re-send that settles the packet once the
+/// read answers. Each used to be a 204. The pinned protocol's read, by
+/// the declared-terminal close and by the catch-all's outcome, is
+/// refused here too (backlog 0887d2a9).
+fn settle_not_read(
+    job_id: &boss_core::job::JobId,
+    what: &str,
+    e: &dyn std::fmt::Display,
+) -> Response {
+    tracing::error!(job_id = %job_id, read = what, error = %e, "step written, but its packet could not be read to settle it");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!(
+            "the step was written, but reading {what} of job {job_id} to settle it failed \
+             ({e}); send the same request again — a re-send settles it"
+        ),
+    )
+        .into_response()
+}
+
+/// The read [`settle_not_read`] names when the packet's pinned protocol
+/// could not be read: which protocol, at which version.
+fn pinned_protocol(job: &Job) -> String {
+    format!("its pinned protocol {} v{}", job.kind, job.workflow_version)
+}
+
+/// The answer to a completion its contract did not admit. A contract that
+/// was read and refused is the 409 it always was. One whose pinned protocol
+/// (or, at a close, steps) could not be read judged nothing: a 500 naming
+/// the packet and the read, saying nothing was written, and naming the
+/// repair — the same request again (review 5e15da5b F1; review 8c30cbc7 N2).
+/// Both completion doors and the whole-job close answer through here.
+pub(super) fn contract_refusal(job: &Job, why: &anyhow::Error) -> Response {
+    let Some(unread) = crate::completion_contract::unread(why) else {
+        return (StatusCode::CONFLICT, format!("completion contract: {why}")).into_response();
+    };
+    let what = match unread {
+        crate::completion_contract::Unread::Protocol(_) => pinned_protocol(job),
+        crate::completion_contract::Unread::Steps(_) => "its steps".to_owned(),
+    };
+    tracing::error!(job_id = %job.id, read = %what, error = %unread, "completion contract could not read the packet");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!(
+            "nothing was written: reading {what} of job {} to judge its completion contract \
+             failed ({unread}); send the same request again",
+            job.id
         ),
     )
         .into_response()
@@ -3719,6 +3922,36 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
     headers: axum::http::HeaderMap,
     Json(patch): Json<serde_json::Value>,
 ) -> Response {
+    patch_step_metadata_expecting(
+        State(state),
+        Path((id, step_id_str)),
+        CurrentUser(user),
+        caller,
+        headers,
+        Json(patch),
+        None,
+    )
+    .await
+}
+
+/// [`patch_step_metadata`], with a precondition the adapter judges
+/// under the write's own row lock: the merge lands only while the step's
+/// metadata still reads as `expect` on every key it names, and is refused
+/// as the step race (409 `step_changed`) otherwise. Not on the wire — the
+/// release door calls it with the hold it judged (review 792b871a N1),
+/// so every check this door makes still stands in front of that write.
+pub(super) async fn patch_step_metadata_expecting<
+    R: JobsRepository + 'static,
+    B: EventBus + 'static,
+>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    Path((id, step_id_str)): Path<(String, String)>,
+    CurrentUser(user): CurrentUser,
+    caller: Option<axum::Extension<crate::field_writer::CredentialedCaller>>,
+    headers: axum::http::HeaderMap,
+    Json(patch): Json<serde_json::Value>,
+    expect: Option<serde_json::Map<String, serde_json::Value>>,
+) -> Response {
     let job_id = match parse_job_id(&id) {
         Some(id) => id,
         None => return (StatusCode::BAD_REQUEST, "invalid job id").into_response(),
@@ -3868,7 +4101,7 @@ pub(super) async fn patch_step_metadata<R: JobsRepository + 'static, B: EventBus
     // a void the log could lose, which the rebuild now depends on.
     match state
         .jobs
-        .merge_step_metadata_guarded_at(&step_id, &patch, &stamp,guard.as_ref())
+        .merge_step_metadata_guarded_at(&step_id, &patch, &stamp, guard.as_ref(), expect.as_ref())
         .await
     {
         Ok(_) => {}
@@ -4358,9 +4591,19 @@ pub(super) async fn claim_step_with_selection<
         // names its logins. A registry that cannot answer lists the id
         // alone — the claim is then judged as it was before this line,
         // never wider.
+        //
+        // AND THE CALLER'S REGISTERED ID WHEN IT SIGNS AS A LOGIN (backlog
+        // 5487223c, part 3): the row was found by id alone, so a
+        // coordinator signing as `claude@algedonic.dev` got no row, and a
+        // step nominated to `agent-claude` — the id a nomination stores —
+        // was refused as held by someone else when the launch claimed it
+        // for the harness. The row the login names is the caller's own,
+        // in its other spelling.
         let caller_logins = match state.agent_budget.as_ref() {
-            Some(door) => match prepare_selection!(preparation, door.agent_row(&user.id)) {
-                Ok(row) => row.map(|r| r.aliases).unwrap_or_default(),
+            Some(door) => match prepare_selection!(preparation, door.caller_row(&user.id)) {
+                Ok(row) => row
+                    .map(|r| std::iter::once(r.id).chain(r.aliases).collect())
+                    .unwrap_or_default(),
                 Err(e) => {
                     tracing::warn!(
                         actor = %user.id,
@@ -5258,13 +5501,22 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
 /// terminal in between needs no skip and records none, where the write
 /// used to answer Ok over it while its `skipped` event was recorded
 /// for a row that stayed completed. Bounded: a row that keeps moving
-/// is left open and logged, which the catch-all close sees next pass.
-pub(super) async fn skip_open_step<R: JobsRepository + 'static, B: EventBus + 'static>(
+/// is left open.
+///
+/// A step it LEFT OPEN is the `Err`, naming the step and why (backlog
+/// 0887d2a9). This returned nothing, and its doc said the catch-all
+/// close "sees next pass" — but both callers close the packet whatever
+/// the skip did, and the catch-all never judges a closed packet, so no
+/// next pass came: a refused skip write, a re-read that failed, or three
+/// attempts that kept losing were a warning in a log and a CLOSED packet
+/// with an open step behind a success answer. Callers go through
+/// [`skip_open_steps`], which refuses the end instead.
+async fn skip_open_step<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
     job_id: &boss_core::job::JobId,
     read: (Step, crate::port::StepVersion),
     terminal_stamp: &boss_core::publisher::EventStamp,
-) {
+) -> Result<(), String> {
     const ATTEMPTS: usize = 3;
     let (mut s, mut version) = read;
     for _ in 0..ATTEMPTS {
@@ -5272,7 +5524,7 @@ pub(super) async fn skip_open_step<R: JobsRepository + 'static, B: EventBus + 's
             s.status,
             StepStatus::Pending | StepStatus::Ready | StepStatus::Active
         ) {
-            return;
+            return Ok(());
         }
         let old = s.clone();
         s.status = StepStatus::Skipped;
@@ -5295,30 +5547,73 @@ pub(super) async fn skip_open_step<R: JobsRepository + 'static, B: EventBus + 's
                     &terminal_stamp.actor().to_string(),
                 )
                 .await;
-                return;
+                return Ok(());
             }
             Err(crate::port::JobsError::StepChanged { .. }) => {
                 match state.jobs.get_step_versioned(&s.id).await {
                     Ok(Some(fresh)) => (s, version) = fresh,
-                    _ => break,
+                    Ok(None) => {
+                        return Err(left_open(
+                            job_id,
+                            &s,
+                            "it moved and then could not be found",
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(left_open(
+                            job_id,
+                            &s,
+                            &format!("it moved and reading it again failed ({e})"),
+                        ));
+                    }
                 }
             }
             Err(e) => {
-                tracing::warn!(
-                    job_id = %job_id,
-                    step_id = %s.id,
-                    error = %e,
-                    "terminal close: failed to skip non-terminal step",
-                );
-                return;
+                return Err(left_open(
+                    job_id,
+                    &s,
+                    &format!("the skip write failed ({e})"),
+                ));
             }
         }
     }
-    tracing::warn!(
-        job_id = %job_id,
-        step_id = %s.id,
-        "terminal close: step kept changing under the skip — left open",
-    );
+    Err(left_open(
+        job_id,
+        &s,
+        &format!("it kept changing under {ATTEMPTS} attempts to skip it"),
+    ))
+}
+
+/// Why [`skip_open_step`] left `step` open, in words that name it —
+/// logged here, and returned for the refusal that names it to the caller.
+fn left_open(job_id: &boss_core::job::JobId, step: &Step, why: &str) -> String {
+    tracing::error!(job_id = %job_id, step_id = %step.id, why, "a packet's end could not skip its open step");
+    format!("step {} ({}) was left open: {why}", step.id, step.title)
+}
+
+/// Skip every still-open step of a packet that is ending, through
+/// [`skip_open_step`], and answer `Err` naming EVERY step left open
+/// (backlog 0887d2a9). Each step is attempted, so a re-send has only
+/// the ones named left to skip. The one loop both ends share — the
+/// declared-terminal close, which refuses its close on `Err`, and the
+/// job door's close/cancel, which refuses its answer.
+pub(super) async fn skip_open_steps<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    job_id: &boss_core::job::JobId,
+    steps: Vec<(Step, crate::port::StepVersion)>,
+    terminal_stamp: &boss_core::publisher::EventStamp,
+) -> Result<(), String> {
+    let mut left = Vec::new();
+    for read in steps {
+        if let Err(why) = skip_open_step(state, job_id, read, terminal_stamp).await {
+            left.push(why);
+        }
+    }
+    if left.is_empty() {
+        Ok(())
+    } else {
+        Err(left.join("; "))
+    }
 }
 
 /// The one id a claim's `claimed_for` names (the review of car
@@ -5574,11 +5869,29 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
 
     // Skip every still-non-terminal step. The Job is closing on its
     // terminal outcome; any Pending/Ready/Active step is now moot.
-    if let Ok(steps) = state.jobs.list_steps_versioned(job_id).await {
-        for read in steps {
-            skip_open_step(state, job_id, read, &terminal_stamp).await;
-        }
-    }
+    //
+    // A steps read the store could not answer stops the close (backlog
+    // 140e7984): this was `if let Ok(..)`, so a failed read skipped
+    // nothing and the close below went ahead — a CLOSED packet with its
+    // open steps still open, which no re-send can repair, because a
+    // re-send finds the packet closed and stops above. Refused here, the
+    // packet stays open and the re-send its 500 asks for closes it whole.
+    let steps = state.jobs.list_steps_versioned(job_id).await.map_err(|e| {
+        crate::port::JobsError::Storage(format!(
+            "reading its steps to skip the open ones failed, so it was not closed: {e}"
+        ))
+    })?;
+    // A step the skip left open stops the close the same way (backlog
+    // 0887d2a9): the skip used to log and return, and the close below
+    // went ahead around the step it named.
+    skip_open_steps(state, job_id, steps, &terminal_stamp)
+        .await
+        .map_err(|left| {
+            crate::port::JobsError::Storage(format!(
+                "{left}, so it was not closed; send the same request again — a re-send \
+                 skips it and closes the packet"
+            ))
+        })?;
 
     let old_status = job.status;
     job.status = JobStatus::Closed;
@@ -5715,8 +6028,8 @@ pub(super) async fn reevaluate_and_persist<R: JobsRepository + 'static, B: Event
 ///
 /// An `Err` is a pass that could not read what it judges (the pinned
 /// version, the steps) or could not persist a promotion it computed. A
-/// pass still raced at its bound is `Ok`: another writer is moving the
-/// packet, and that writer's own pass judges it next.
+/// pass still raced at its bound is also an error: the competing writer
+/// may itself stop after committing its row, before running its settle.
 ///
 /// The step PUT answers an `Err` as a 500 rather than the 204 it used to
 /// give (backlog 17bf6f3e). A failed steps read here was a bare `return
@@ -5757,9 +6070,9 @@ pub(super) async fn reevaluate_reported<R: JobsRepository + 'static, B: EventBus
             }
             tracing::warn!(
                 job_id = %job.id,
-                "re-eval: steps kept changing under the promotion — left for the next pass",
+                "re-eval: steps kept changing under the promotion — readiness unsettled, caller must retry",
             );
-            Ok(())
+            Err("steps kept changing under the promotion; readiness is not settled".into())
         }
         Err(crate::registry::WorkflowError::NotFound(_)) => {
             // No active spec (ad-hoc / registry-less kind): nothing to

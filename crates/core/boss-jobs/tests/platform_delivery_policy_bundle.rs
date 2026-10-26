@@ -102,14 +102,17 @@ async fn every_bundled_policy_is_publishable_at_its_declared_version() {
         Some(true),
         "the reviewed activation must publish enabled lighter channels"
     );
+    // v10 (backlog e1943ef0): a queued gate's place belongs to its
+    // packet, launched by the resident supervisor, not to a waiter.
     assert_eq!(
         (
             served.version,
             served.ci_host_floor_gb,
             served.gate_max_concurrent,
-            served.consist_budget_secs
+            served.consist_budget_secs,
+            served.gate_queue_owner.as_str()
         ),
-        (9, 40, 3, 120),
+        (10, 40, 3, 120, "resident"),
         "the row the conductor reads is the row the bundle declares"
     );
 }

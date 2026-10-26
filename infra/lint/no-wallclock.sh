@@ -31,6 +31,11 @@
 #      allowlist: what a handler writes is about the event, tick or
 #      day that fired it. The third pass, "Dispatcher-handler clock
 #      pass", below.
+#   4. A WINDOW IS NOT CUT FROM THE WALL CLOCK (backlog 5fb858ea).
+#      `wall_now()` is sanctioned as a STAMP, so the Rust pass lets it
+#      through anywhere — including `wall_now() - Duration::hours(h)`,
+#      which is a window, not a stamp. The fourth pass, "Wall-clock
+#      window pass", below.
 #
 # Allowlist: only these paths may call Utc::now()
 #   * crates/core/boss-clock/         (the clock-api itself —
@@ -429,6 +434,100 @@ handler_clock_violations() {
   done <<<"$raw"
 }
 
+# ============================================================
+# Wall-clock window pass (backlog 5fb858ea)
+# ============================================================
+#
+# `wall_now()` is the sanctioned spelling of a record STAMP, which is why
+# the Rust pass above lets it through anywhere. Arithmetic on it is never
+# a stamp: `wall_now() - Duration::hours(h)` is the start of a WINDOW, and
+# a window belongs to the injected clock (`now_from(&state.clock)`), where
+# a frozen test clock and a SIM deployment can see it. On 2026-10-15
+# `/api/yard/moves` cut its window that way while its tests froze the
+# injected clock; once the real clock ran 24 h past the fixture
+# (17:02:53Z) every gate that ran boss-jobs went red, 7 of 7 plus train
+# 71a1e432, until #1190 moved it. The same expression still sat in the
+# routes and regions reads of the same record.
+#
+# A HIT is a production `wall_now()` that is an operand of `+` or `-`,
+# on either side, after any method chain (`wall_now().timestamp() + 60`),
+# on its own line or with the operator leading the next one (rustfmt's
+# wrap); or the receiver or argument of chrono's arithmetic methods
+# (`checked_add_*`, `checked_sub_*`, `signed_duration_since`). A
+# comparison (`expires_at <= wall_now().timestamp()`) is not arithmetic
+# and is not a hit. It is a line pattern: `let t = wall_now();` then
+# `t - d` escapes it, and so does `Utc::now() - d` in a file the Rust
+# pass allows — say so when you reach for either.
+#
+# Allowlist: a real-time window that is correct, one file per entry, with
+# its reason — held to lib/allowlist.sh's two rules like the lists above.
+# The bar: the window is judged against the machine's own time and never
+# against a record, a fixture, or anything a SIM clock dates (a token's
+# expiry sent to a third party is the shape). Empty at introduction:
+# every production hit then was the defect.
+WALL_WINDOW_ALLOWED=()
+wall_window_allow_used=""
+
+is_wall_window_allowed() {
+  local file="$1" allowed
+  for allowed in "${WALL_WINDOW_ALLOWED[@]}"; do
+    if [[ "$file" == "$allowed" ]]; then
+      wall_window_allow_used="$wall_window_allow_used"$'\n'"$allowed"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# wall_window_lines <file>: prints `file:line:code` for every line of
+# <file> where `wall_now()` takes part in arithmetic (the HIT above),
+# comment lines excluded. Whether the line is production is the caller's.
+wall_window_lines() {
+  awk -v f="$1" '
+    function arith(s) {
+      return s ~ /(^|[^A-Za-z0-9_])wall_now\(\)(\.[A-Za-z_]+\([^()]*\))*[[:space:]]*[-+]([^=>]|$)/ \
+        || s ~ /[-+][[:space:]]*([A-Za-z_]+::)*wall_now\(\)/ \
+        || s ~ /(^|[^A-Za-z0-9_])wall_now\(\)\.(checked_(add|sub)_[a-z]+|signed_duration_since)\(/ \
+        || s ~ /(checked_(add|sub)_[a-z]+|signed_duration_since)\(([A-Za-z_]+::)*wall_now\(\)/
+    }
+    { line[NR] = $0 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        s = line[i]
+        if (s ~ /^[[:space:]]*\/\//) continue
+        if (s !~ /(^|[^A-Za-z0-9_])wall_now\(\)/) continue
+        hit = arith(s)
+        if (!hit && s ~ /wall_now\(\)(\.[A-Za-z_]+\([^()]*\))*[[:space:]]*$/ \
+            && (i + 1) in line && line[i + 1] ~ /^[[:space:]]*[-+]([^=>]|$)/) hit = 1
+        if (hit) print f ":" i ":" s
+      }
+    }' "$1"
+}
+
+# wall_window_violations <src-root>: sets `wall_window_hits` to every
+# production hit under <src-root> no allowlist entry excuses, one
+# `file:line:code` per element. Globals rather than printing, for the
+# same subshell reason as handler_clock_violations.
+wall_window_hits=()
+wall_window_violations() {
+  local files file raw line rest lineno
+  wall_window_hits=()
+  files=$(grep -rlE --include='*.rs' '\bwall_now\(\)' "$1" || true)
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    is_test_file "$file" && continue
+    raw=$(wall_window_lines "$file")
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      rest="${line#*:}"
+      lineno="${rest%%:*}"
+      [ "$(in_cfg_test_item "$file" "$lineno")" = "test" ] && continue
+      is_wall_window_allowed "$file" && continue
+      wall_window_hits+=("$line")
+    done <<<"$raw"
+  done <<<"$files"
+}
+
 # --self-test: the classifier against a fixture carrying both shapes
 # that used to swallow a file. Runs without touching the tree.
 if [ "${1:-}" = "--self-test" ]; then
@@ -516,8 +615,47 @@ FIXTURE
     echo "  where it should name exactly lines 2 and 4 of the fixture"
     st_fail=1
   fi
+  # The window pass (backlog 5fb858ea): wall_now() as an operand of + or
+  # -, either side, wrapped onto the next line, or through chrono's
+  # arithmetic methods, is named; a comparison, a bare stamp, prose, the
+  # injected clock's window, the function's own `->` and a #[cfg(test)]
+  # item are not.
+  mkdir -p "$whole/window"
+  printf '%s\n' \
+    'fn window(c: &Arc<dyn ClockClient>, h: i64) {' \
+    '    let since = boss_clock_client::wall_now() - chrono::Duration::hours(h);' \
+    '    let wrapped =' \
+    '        boss_clock_client::wall_now()' \
+    '            - chrono::Duration::hours(h);' \
+    '    let exp = wall_now().timestamp() + 60;' \
+    '    let age = then.signed_duration_since(boss_clock_client::wall_now());' \
+    '    let left = deadline - wall_now();' \
+    '    let fresh = expires_at <= boss_clock_client::wall_now().timestamp();' \
+    '    let at = boss_clock_client::wall_now();' \
+    '    // wall_now() - Duration::hours(h) is prose' \
+    '    let ok = boss_clock_client::now_from(c).await - chrono::Duration::hours(h);' \
+    '}' \
+    'pub fn wall_now() -> chrono::DateTime<Utc> {' \
+    '    Utc::now()' \
+    '}' \
+    '#[cfg(test)]' \
+    'mod tests {' \
+    '    fn t() { let _ = boss_clock_client::wall_now() - chrono::Duration::minutes(1); }' \
+    '}' >"$whole/window/fixture.rs"
+  wall_window_violations "$whole/window"
+  got_lines=()
+  for hit in "${wall_window_hits[@]}"; do
+    rest="${hit#*:}"
+    got_lines+=("${rest%%:*}")
+  done
+  if [ "${got_lines[*]}" != "2 4 6 7 8" ]; then
+    echo "self-test FAIL: the window pass named line(s) '${got_lines[*]}' of the fixture:"
+    printf '    %s\n' "${wall_window_hits[@]}"
+    echo "  where it should name exactly lines 2 4 6 7 8"
+    st_fail=1
+  fi
   if [ "$st_fail" -eq 0 ]; then
-    echo "no-wallclock --self-test: ok (cfg(test) exemption is bounded to the item; a whole-file test module is exempt by its parent's declaration; the handler pass names a production wall_now/now_from and nothing else)"
+    echo "no-wallclock --self-test: ok (cfg(test) exemption is bounded to the item; a whole-file test module is exempt by its parent's declaration; the handler pass names a production wall_now/now_from and nothing else; the window pass names wall_now() arithmetic and no comparison or stamp)"
     exit 0
   fi
   echo "no-wallclock --self-test: FAILED — the cfg(test) exemption is leaking past the item it applies to, or misreads a whole-file test module."
@@ -555,10 +693,10 @@ while IFS= read -r line; do
   fi
 done <<<"$hits"
 
-# The Rust and SQL passes walk every Rust file under crates/, the handler
+# The Rust, SQL and window passes walk every Rust file under crates/, the handler
 # pass one crate of them (and refuses its own zero below); zero means the tree
 # moved, not that nothing stamps wallclock.
-lint_scanned "$LINT" "$(find crates -type f -name '*.rs' | wc -l | tr -d ' ')" "Rust file(s) under crates/ (all three passes)"
+lint_scanned "$LINT" "$(find crates -type f -name '*.rs' | wc -l | tr -d ' ')" "Rust file(s) under crates/ (all four passes)"
 
 if [ "$violations" -eq 0 ]; then
   echo "no-wallclock (Rust): clean"
@@ -784,10 +922,29 @@ else
   echo "no-wallclock (dispatcher handlers): clean"
 fi
 
-total=$((violations + sql_violations + handler_violations))
+# The window pass (see its definition above), over the same Rust files
+# the Rust pass read.
+allowlist_paths_exist "$LINT" "${WALL_WINDOW_ALLOWED[@]}"
+wall_window_violations crates
+window_violations=${#wall_window_hits[@]}
+if [ "$window_violations" -gt 0 ]; then
+  echo "no-wallclock (wall-clock windows): $window_violations violation(s) — a window or a deadline is cut from wall_now(), the record-stamp clock:"
+  echo
+  printf '  %s\n' "${wall_window_hits[@]}"
+  echo
+  echo "Fix: cut it from the injected clock — \`boss_clock_client::now_from(&state.clock).await\`"
+  echo "minus the Duration, or a \`now\` the handler already read from it. A real-time"
+  echo "window that is correct goes on WALL_WINDOW_ALLOWED with its reason."
+  echo "Why: backlog 5fb858ea (every boss-jobs gate red on 2026-10-15; fixed by #1190)."
+else
+  echo "no-wallclock (wall-clock windows): clean"
+fi
+
+total=$((violations + sql_violations + handler_violations + window_violations))
 if [ "$total" -gt 0 ]; then
   exit 1
 fi
 allowlist_entries_used "$LINT" "$allow_used" "${ALLOWED_PREFIXES[@]}" "${ALLOWED_FILES[@]}"
 allowlist_entries_used "$LINT" "$handler_allow_used" "${HANDLER_CLOCK_ALLOWED[@]}"
+allowlist_entries_used "$LINT" "$wall_window_allow_used" "${WALL_WINDOW_ALLOWED[@]}"
 exit 0

@@ -215,6 +215,14 @@ pub struct AuthenticatedSelectionIngress {
     principal: String,
     host: Option<String>,
     mode: boss_core::machine_gate::RequestModeObservation,
+    /// The pre-commit budget this request runs under, carried with its
+    /// ingress so every reader of the deadline takes the same one. A
+    /// credential-resolved request always carries
+    /// `SELECTION_PRE_COMMIT_BUDGET`; only a unit test can state another
+    /// (`with_budget`), because 37 native-selection tests that judged an
+    /// answer were measuring the gate's database contention against the
+    /// production five seconds instead (f10419f9, gate bb1fbbde).
+    budget: std::time::Duration,
 }
 impl AuthenticatedSelectionIngress {
     pub(crate) fn from_credential(
@@ -226,7 +234,15 @@ impl AuthenticatedSelectionIngress {
             principal: caller.principal.clone(),
             host: caller.host.clone(),
             mode,
+            budget: SELECTION_PRE_COMMIT_BUDGET,
         }
+    }
+    /// A test's own budget for the same admitted request: its origin stays
+    /// the original ingress, only the length is the test's (f10419f9).
+    #[cfg(test)]
+    pub(crate) fn with_budget(mut self, budget: std::time::Duration) -> Self {
+        self.budget = budget;
+        self
     }
     pub fn actor_id(&self) -> &str {
         &self.actor_id
@@ -234,12 +250,22 @@ impl AuthenticatedSelectionIngress {
     pub fn started(&self) -> std::time::Instant {
         self.mode.started()
     }
+    /// The one absolute pre-commit deadline: ingress plus its budget, on
+    /// tokio's clock. Every reader of the deadline compares it with
+    /// `tokio::time::Instant::now()`, so all of them read ONE clock. Review
+    /// a0fd6902 measured why that matters: as a `std::time::Instant`, a
+    /// post-COMMIT check against the std clock survived the commit test,
+    /// which can expire only the clock it moves (f10419f9). In production
+    /// the two clocks are the same clock.
+    pub fn deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::from_std(self.started()) + self.budget
+    }
     /// Cancel only read-only HTTP preparation, never mutation or COMMIT.
     pub(crate) async fn prepare<T>(
         &self,
         read: impl std::future::Future<Output = T>,
     ) -> Result<T, JobsError> {
-        let deadline = tokio::time::Instant::from_std(self.started()) + SELECTION_PRE_COMMIT_BUDGET;
+        let deadline = self.deadline();
         if tokio::time::Instant::now() >= deadline {
             return Err(JobsError::SelectionConflict(
                 "selection ingress deadline expired during preparation".into(),
@@ -253,7 +279,7 @@ impl AuthenticatedSelectionIngress {
     }
     pub fn observation(&self) -> Value {
         serde_json::json!({"actor_id": self.actor_id, "principal": self.principal, "host": self.host,
-            "machine_mode": self.mode.mode().name(), "pre_dispatch_budget_ms": SELECTION_PRE_COMMIT_BUDGET.as_millis(),
+            "machine_mode": self.mode.mode().name(), "pre_dispatch_budget_ms": self.budget.as_millis(),
             "source": "server-resolved credential and machine gate ingress observation"})
     }
 }
@@ -272,7 +298,7 @@ impl SelectionReceipt {
     }
     fn from_value_before(
         value: Value,
-        deadline: Option<std::time::Instant>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<Self, JobsError> {
         validate_owner_copy_before(&value, deadline)?;
         let json = crate::selection_serialization::json(&value, deadline)?;
@@ -368,7 +394,7 @@ fn validate_owner_copy(value: &Value) -> Result<(), JobsError> {
 }
 fn validate_owner_copy_before(
     value: &Value,
-    deadline: Option<std::time::Instant>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<(), JobsError> {
     match (
         value.get("owner_consumption"),
@@ -1160,7 +1186,7 @@ impl SelectionContext {
         let deadline = self
             .native_authority
             .as_ref()
-            .map(|observation| observation.ingress.started() + SELECTION_PRE_COMMIT_BUDGET);
+            .map(|observation| observation.ingress.deadline());
         let (original, mut event) = self.record(actor, stamp, claimed)?;
         let mut value = original.value().clone();
         value["owner_consumption_hash"] = serde_json::json!(
@@ -1211,7 +1237,7 @@ impl SelectionContext {
         let deadline = self
             .native_authority
             .as_ref()
-            .map(|observation| observation.ingress.started() + SELECTION_PRE_COMMIT_BUDGET);
+            .map(|observation| observation.ingress.deadline());
         let receipt = SelectionReceipt::from_value_before(receipt, deadline)?;
         event.payload["receipt_json"] = serde_json::json!(receipt.json());
         Ok((receipt, event))

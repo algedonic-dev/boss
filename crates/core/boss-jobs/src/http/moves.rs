@@ -142,19 +142,32 @@ pub(super) async fn yard_moves<R: JobsRepository + 'static, B: EventBus + 'stati
             let dispositions: Vec<_> = moves
                 .iter()
                 .map(|row| {
-                    let status = match crate::move_diagnosis::active(&corrections, row) {
-                        Ok(Some(id)) => {
+                    // The disposition `history` counts and the band reads
+                    // (backlog 3976779c): a row another mover wrote is its
+                    // own status, never `active`.
+                    use crate::moves::Disposition;
+                    let status = match Disposition::of(&corrections, row) {
+                        Disposition::Superseded(id) => {
                             serde_json::json!({"status":"superseded","correction_id":id})
                         }
-                        Ok(None) => serde_json::json!({"status":"active"}),
-                        Err(why) => serde_json::json!({"status":"unknown","why":why}),
+                        Disposition::SupersededMover(version) => serde_json::json!({
+                            "status": "superseded-mover",
+                            "mover_version": version,
+                        }),
+                        Disposition::Active => serde_json::json!({"status":"active"}),
+                        Disposition::Unknown(why) => {
+                            serde_json::json!({"status":"unknown","why":why})
+                        }
                     };
                     serde_json::json!({"original_seq":row.seq,"disposition":status})
                 })
                 .collect();
             // Judged against the routes derived now (car R2). Routes that
             // cannot be derived leave the reading null, never empty.
-            let undeclared = super::routes::derived(&state, Some(&crossings))
+            let pinned = crate::routes_every_stand::pinned_versions(
+                crossings.iter().map(|c| c.dispatch.as_ref()),
+            );
+            let undeclared = super::routes::derived(&state, Some(&crossings), &pinned)
                 .await
                 .ok()
                 .map(|routes| routes.undeclared());
@@ -173,6 +186,10 @@ pub(super) async fn yard_moves<R: JobsRepository + 'static, B: EventBus + 'stati
                     // The one mover whose rows the band counts (backlog
                     // c8d22e63); each row names its own `mover_version`.
                     "mover_version": crate::moves::mover_version(),
+                    // The build that computed it (review 4c89fc8e N3): a
+                    // hash alone names no source; null when the build
+                    // was not stamped.
+                    "mover_build": boss_core::startup::build_commit(),
                 },
                 "mover": feed.status(),
             }))
@@ -286,7 +303,9 @@ async fn judge<R: JobsRepository + 'static, B: EventBus + 'static>(
     if found.is_empty() {
         return found;
     }
-    match super::routes::derived(state, None).await {
+    let pinned =
+        crate::routes_every_stand::pinned_versions(found.iter().map(|m| m.dispatch.as_ref()));
+    match super::routes::derived(state, None, &pinned).await {
         Ok(routes) => crate::moves::judged(found, &routes),
         Err(_) => found,
     }
@@ -448,6 +467,9 @@ pub async fn run_mover<R: JobsRepository + 'static, B: EventBus + 'static>(
             super::regions::EstateRead::Granted,
             now,
             crate::regions::DEFAULT_WINDOW_HOURS,
+            // Placement reads station membership, never the flow
+            // (backlog 29f7e897).
+            super::regions::StationFlow::NotRead,
         )
         .await
         {

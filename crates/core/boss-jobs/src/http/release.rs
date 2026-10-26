@@ -14,6 +14,16 @@
 //! that is not one, and the merge door's own answer when it refuses the
 //! write.
 //!
+//! THE HOLD IT LIFTS IS THE HOLD THAT WAS JUDGED (review 792b871a N1).
+//! The body names the hold its asker read (`hold: {reason, sha}`,
+//! required); the judge refuses a car carrying another, and the write
+//! carries the hold the judge read as a precondition the adapter checks
+//! under the row's lock. A hold written at any point after the asker
+//! read the car is therefore refused, never lifted, whether it landed
+//! before the POST (the rule's read-then-ask gap, the yard's poll) or
+//! between this door's read and its write. (The same text at the same
+//! head is the same hold to the record, and is not refused.)
+//!
 //! Policy: the packet read scope to read the car and the review run,
 //! then the merge door's `(Update, step)` gate on the write. The `by` on
 //! the record is the request's authenticated caller, in the spelling its
@@ -128,8 +138,15 @@ pub(super) async fn with_release_decisions<R: JobsRepository + 'static, B: Event
                 Err(_) => Err("the reviewer's run could not be read".to_string()),
             },
         };
-        held.release =
-            Some(car_release::decision(&reader, &car, run.as_ref().map_err(Clone::clone)).await);
+        held.release = Some(
+            car_release::decision(
+                &reader,
+                &car,
+                run.as_ref().map_err(Clone::clone),
+                &crate::car::stamp(boss_clock_client::wall_now()),
+            )
+            .await,
+        );
     }
     status
 }
@@ -152,6 +169,34 @@ fn refused(why: impl Into<String>) -> Response {
     (StatusCode::CONFLICT, why.into()).into_response()
 }
 
+/// The merge door's answer to the release write, as the release door
+/// says it. The step race (409 `step_changed`) here means the review
+/// step moved between the judge's read and the write — under the
+/// precondition the door sends, its hold — so it is the rule's refusal
+/// in the rule's words, and nothing was written. Every other answer is
+/// passed on as the merge door gave it.
+async fn hold_moved_refusal(written: Response, car: boss_core::job::JobId) -> Response {
+    if written.status() != StatusCode::CONFLICT {
+        return written;
+    }
+    let (parts, body) = written.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 64 * 1024).await else {
+        return (parts.status, "the merge door's refusal could not be read").into_response();
+    };
+    let race = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .is_ok_and(|b| crate::step_metadata_write::is_step_race(&b));
+    if race {
+        return refused(format!(
+            "boss release: REFUSED — car {}'s review step changed while this release was being \
+             written, so the hold it carries now is not the hold that was judged (review \
+             792b871a N1). Nothing was written. Read the car again and judge the hold it \
+             carries.",
+            car.to_string().chars().take(8).collect::<String>()
+        ));
+    }
+    Response::from_parts(parts, axum::body::Body::from(bytes))
+}
+
 pub(super) async fn release_car<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     Path(id): Path<String>,
@@ -165,7 +210,11 @@ pub(super) async fn release_car<R: JobsRepository + 'static, B: EventBus + 'stat
         Err(e) => {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("a release body is {{review, head?, main_sha?, run?, agent_shell?}}: {e}"),
+                format!(
+                    "a release body is {{review, hold: {{reason, sha}}, head?, main_sha?, run?, \
+                     agent_shell?}} — `hold` is the hold the asker judged, as it read the car: \
+                     {e}"
+                ),
             )
                 .into_response();
         }
@@ -214,17 +263,22 @@ pub(super) async fn release_car<R: JobsRepository + 'static, B: EventBus + 'stat
         Err(why) if why.starts_with("boss release:") => return refused(why),
         Err(why) => return refused(format!("boss release: REFUSED — {why}")),
     };
-    let written = patch_step_metadata(
+    // The write lands only while the review step still carries the hold
+    // the judge read (review 792b871a N1): the asker's hold was compared
+    // with this read, and this read is compared with the row under the
+    // write's own lock, so no hold written in between is lifted.
+    let written = patch_step_metadata_expecting(
         State(state.clone()),
         Path((car_id.to_string(), granted.step_id.clone())),
         CurrentUser(user),
         caller,
         headers,
         Json(granted.patch.clone()),
+        granted.expect.as_object().cloned(),
     )
     .await;
     if !written.status().is_success() {
-        return written;
+        return hold_moved_refusal(written, car_id).await;
     }
     // Read back, as the CLI did: an answered write that does not read as
     // released is a failure, said aloud.
@@ -275,6 +329,48 @@ mod tests {
     fn user(id: &str) -> boss_policy_client::User {
         serde_json::from_value(serde_json::json!({"id": id, "role": "platform-admin"}))
             .expect("a user")
+    }
+
+    async fn said(r: Response) -> (StatusCode, String) {
+        let status = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), 64 * 1024)
+            .await
+            .expect("a body");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// THE DOOR'S OWN READ-TO-WRITE GAP (review 792b871a N1). The write
+    /// carries the hold the judge read as a precondition; when the merge
+    /// door answers the step race, the review step moved after the
+    /// judgement, and the release door says so in the rule's words —
+    /// nothing was written. Any other answer passes through as given.
+    #[tokio::test]
+    async fn a_step_race_on_the_release_write_is_the_rules_refusal() {
+        let car = boss_core::job::JobId::from_uuid(
+            uuid::Uuid::parse_str("c0ffee00-0000-4000-8000-000000000000").unwrap(),
+        );
+        let race = (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": crate::step_metadata_write::STEP_CHANGED_ERROR,
+                "code": crate::step_metadata_write::STEP_CHANGED_CODE,
+            })),
+        )
+            .into_response();
+        let (status, text) = said(hold_moved_refusal(race, car).await).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            text.starts_with("boss release: REFUSED — car c0ffee00"),
+            "{text}"
+        );
+        assert!(text.contains("Nothing was written"), "{text}");
+        for (status, body) in [
+            (StatusCode::CONFLICT, "step is terminal"),
+            (StatusCode::FORBIDDEN, "no grant"),
+        ] {
+            let (s, t) = said(hold_moved_refusal((status, body).into_response(), car).await).await;
+            assert_eq!((s, t.as_str()), (status, body));
+        }
     }
 
     /// WHO IS CREDITED (backlog 0cfc57e6). A dispatcher rule calls with

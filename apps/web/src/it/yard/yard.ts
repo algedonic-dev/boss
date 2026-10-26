@@ -784,13 +784,17 @@ export function itemAnswer(c: ArrivalCar): ItemAnswer | null {
   return null;
 }
 export type ArrivalSkip = Readonly<{ car_id_short: string | null; reason: string | null }>;
+/** The deploy leg ends at `converged`, the observed deploy. Reports
+ *  filed before backlog 4472781d carried `deployed_at` and
+ *  `merge_to_deploy_s` instead — the merge instant and a 0 — and are
+ *  deliberately not read: a fabricated zero is not a timing. */
 export type ArrivalTimings = Readonly<{
   boarded_at: string | null;
   merged_at: string | null;
-  deployed_at: string | null;
+  converged_at: string | null;
   arrived_at: string | null;
   board_to_merge_s: number | null;
-  merge_to_deploy_s: number | null;
+  merge_to_converge_s: number | null;
   total_s: number | null;
 }>;
 export type ArrivalReport = Readonly<{
@@ -818,10 +822,10 @@ function timings(v: unknown): ArrivalTimings | null {
   return {
     boarded_at: asText(t.boarded_at),
     merged_at: asText(t.merged_at),
-    deployed_at: asText(t.deployed_at),
+    converged_at: asText(t.converged_at),
     arrived_at: asText(t.arrived_at),
     board_to_merge_s: asNumber(t.board_to_merge_s),
-    merge_to_deploy_s: asNumber(t.merge_to_deploy_s),
+    merge_to_converge_s: asNumber(t.merge_to_converge_s),
     total_s: asNumber(t.total_s),
   };
 }
@@ -861,20 +865,20 @@ export function arrivalReport(j: WithSteps): ArrivalReport | null {
 // ETAs. The batching the train does is exactly the coordination cost an
 // ETA answers — but an estimate that looks like a promise is worse than
 // none. So: the numbers come from what recent trains ACTUALLY did
-// (median board→merge, median merge→deploy), a train with no started-at
+// (median board→merge, median merge→converge), a train with no started-at
 // evidence gets its phase and no time, and the chip always wears `~`.
 // ---------------------------------------------------------------------------
 
 export type ArrivalMedians = Readonly<{
   boardToMergeS: number | null;
-  mergeToDeployS: number | null;
+  mergeToConvergeS: number | null;
   /** How many arrivals contributed a usable leg — the estimate's basis. */
   samples: number;
 }>;
 
 export const NO_MEDIANS: ArrivalMedians = {
   boardToMergeS: null,
-  mergeToDeployS: null,
+  mergeToConvergeS: null,
   samples: 0,
 };
 
@@ -905,7 +909,7 @@ export function arrivalMedians(
   window: number = ARRIVAL_SAMPLE_WINDOW,
 ): ArrivalMedians {
   const boardToMerge: number[] = [];
-  const mergeToDeploy: number[] = [];
+  const mergeToConverge: number[] = [];
   let samples = 0;
   for (const j of arrived.slice(0, window)) {
     const t = arrivalReport(j)?.timings ?? null;
@@ -915,19 +919,23 @@ export function arrivalMedians(
         stampAt(step(j, 'pr', 'Open the batched PR')),
         stampAt(step(j, 'merged', 'Merged into main')),
       );
-    const md =
-      t?.merge_to_deploy_s ??
+    // To `converged`, never to `deployed`: the conductor stamps
+    // `deployed` in the same pass as `merged`, so that leg read 0 on
+    // every arrival and an ETA built on it left the converge wait out
+    // (backlog 4472781d).
+    const mc =
+      t?.merge_to_converge_s ??
       legSeconds(
         stampAt(step(j, 'merged', 'Merged into main')),
-        stampAt(step(j, 'deployed', 'Deployed to the playground')),
+        stampAt(step(j, 'converged', 'Cluster converged')),
       );
     if (bm !== null) boardToMerge.push(bm);
-    if (md !== null) mergeToDeploy.push(md);
-    if (bm !== null || md !== null) samples += 1;
+    if (mc !== null) mergeToConverge.push(mc);
+    if (bm !== null || mc !== null) samples += 1;
   }
   return {
     boardToMergeS: median(boardToMerge),
-    mergeToDeployS: median(mergeToDeploy),
+    mergeToConvergeS: median(mergeToConverge),
     samples,
   };
 }
@@ -974,7 +982,7 @@ export function trainEta(j: JobLite, medians: ArrivalMedians, nowMs: number): Et
   const phase = etaPhase(trainStatus(j), ciLamp(j));
   const phaseOnly: Eta = { kind: 'phase', phase };
   const basis = `median of last ${medians.samples} arrivals`;
-  const { boardToMergeS, mergeToDeployS } = medians;
+  const { boardToMergeS, mergeToConvergeS } = medians;
 
   // Remaining seconds on the leg under way, plus whatever legs follow.
   // `startedAt` is the evidence requirement: no stamp, no estimate —
@@ -990,25 +998,26 @@ export function trainEta(j: JobLite, medians: ArrivalMedians, nowMs: number): Et
     return { kind: 'eta', phase, atMs: nowMs + Math.round(left * 1000), basis, progress };
   };
 
-  // Converging renders an elapsed "converging for …", not an ETA: there
-  // is no merge→converge median in `medians`, and inventing a converge
-  // duration would read as a promise. The board reads `convergingSince`
-  // (carried on the row by `toTrainRow`) for the elapsed instead — the
+  // Converging renders an elapsed "converging for …", not an ETA: the
+  // merge→converge median prices the leg a train has not yet entered,
+  // and once it is converging the elapsed is the honest reading. The
+  // board reads `convergingSince` (carried on the row by `toTrainRow`)
+  // for the elapsed instead — the
   // same choice the server model makes (boss-jobs/src/yard.rs, which
   // surfaces convergence as elapsed time, never a projection).
   if (phase === 'converging') return phaseOnly;
 
   if (phase === 'ci' || phase === 'merging') {
-    if (boardToMergeS === null || mergeToDeployS === null) return phaseOnly;
+    if (boardToMergeS === null || mergeToConvergeS === null) return phaseOnly;
     return project(
       stampAt(step(j, 'pr', 'Open the batched PR')),
       boardToMergeS,
-      mergeToDeployS,
+      mergeToConvergeS,
     );
   }
   if (phase === 'deploying') {
-    if (mergeToDeployS === null) return phaseOnly;
-    return project(stampAt(step(j, 'merged', 'Merged into main')), mergeToDeployS, 0);
+    if (mergeToConvergeS === null) return phaseOnly;
+    return project(stampAt(step(j, 'merged', 'Merged into main')), mergeToConvergeS, 0);
   }
   return phaseOnly;
 }
@@ -1194,17 +1203,26 @@ function readCancelRefused(j: JobLite): boolean {
  *  when the gate could not be filed and CI alone judged the train, and
  *  WHY the gate is not filed yet while the conductor keeps trying (the
  *  bound line naming the running gates; nulled the pass it is filed).
- *  Every field is a packet field; nothing is derived. */
+ *  Every field but `wait_since` is a packet field, read verbatim. */
 export type TrainGateReading = Readonly<{
   run: string | null;
   line: string | null;
   forge: string | null;
   fallback: string | null;
+  /** Written on EVERY failed launch — the bound, a manifest that does not
+   *  render, kubectl, RBAC. */
   wait_reason: string | null;
-  /** When the wait for a bay began, as the record holds it: the later of
-   *  the PR's opening and the last gate launch (track.rs
-   *  `train_gate_wait_since`, the same two facts). Null when neither is
-   *  recorded — then a wait is trouble at once, never guessed short. */
+  /** The train's place in the gate line (`train_gate_bound_wait`): set
+   *  only by the bound refusal or a gate-run owed a relaunch (backlog
+   *  82071657), and the ONE marker a wait for a bay is read by. A wait
+   *  reason without it is a launch that failed (review a2ace778). */
+  bound_wait: string | null;
+  /** When the wait for a bay began, as the record holds it: the latest
+   *  of the PR's opening, the last gate launch and the last refusal
+   *  (track.rs `train_gate_wait_since`, the same three facts, read by its
+   *  two rules: a completed step only, an RFC3339 stamp only). Null when
+   *  none is recorded — then a wait is trouble at once, never guessed
+   *  short. */
   wait_since: string | null;
   relaunches: number;
 }>;
@@ -1222,7 +1240,9 @@ export function readTrainGate(j: JobLite): TrainGateReading | null {
     train_gate_run?: unknown;
     train_gate_fallback?: unknown;
     train_gate_wait_reason?: unknown;
+    train_gate_bound_wait?: unknown;
     train_gate_launched_at?: unknown;
+    train_gate_refusals?: unknown;
     train_gate_relaunches?: unknown;
   };
   const ci = (step(j, 'ci', 'CI verdict')?.metadata ?? {}) as {
@@ -1236,20 +1256,39 @@ export function readTrainGate(j: JobLite): TrainGateReading | null {
   const forge = text(ci.forge_result);
   const fallback = text(md.train_gate_fallback);
   const wait_reason = text(md.train_gate_wait_reason);
+  const bound_wait = text(md.train_gate_bound_wait);
   const relaunches = typeof md.train_gate_relaunches === 'number' ? md.train_gate_relaunches : 0;
-  if (run === null && line === null && forge === null && fallback === null && wait_reason === null) return null;
-  const wait_since = laterStamp(stampAt(step(j, 'pr', 'Open the batched PR')), text(md.train_gate_launched_at));
-  return { run, line, forge, fallback, wait_reason, wait_since, relaunches };
+  if (run === null && line === null && forge === null && fallback === null && wait_reason === null && bound_wait === null) {
+    return null;
+  }
+  const pr = step(j, 'pr', 'Open the batched PR');
+  const refusals = Array.isArray(md.train_gate_refusals) ? (md.train_gate_refusals as unknown[]) : [];
+  const wait_since = latestStamp([
+    completed(pr) ? stampAt(pr) : null,
+    text(md.train_gate_launched_at),
+    ...refusals.map(r => text((r as { at?: unknown } | null)?.at)),
+  ]);
+  return { run, line, forge, fallback, wait_reason, bound_wait, wait_since, relaunches };
 }
 
-/** The later of two instants, either of which may be absent or
- *  unparseable; null when neither reads. */
-function laterStamp(a: string | null, b: string | null): string | null {
-  const ms = (x: string | null): number => (x === null ? Number.NaN : Date.parse(x));
-  const [am, bm] = [ms(a), ms(b)];
-  if (Number.isNaN(am)) return Number.isNaN(bm) ? null : b;
-  if (Number.isNaN(bm)) return a;
-  return bm > am ? b : a;
+/** The shape track.rs `parse_instant` (chrono's `parse_from_rfc3339`)
+ *  accepts, and no other: Date.parse alone also reads a bare date as
+ *  midnight, so the two sides dated one wait differently (review
+ *  a2ace778, finding 3). */
+const RFC3339 = /^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$/;
+
+function rfc3339Ms(x: string | null): number {
+  return x !== null && RFC3339.test(x) ? Date.parse(x.toUpperCase()) : Number.NaN;
+}
+
+/** The latest of these instants that reads as RFC3339, verbatim; null
+ *  when none does. */
+function latestStamp(xs: readonly (string | null)[]): string | null {
+  return xs.reduce<string | null>((best, x) => {
+    const ms = rfc3339Ms(x);
+    if (Number.isNaN(ms)) return best;
+    return best === null || ms > rfc3339Ms(best) ? x : best;
+  }, null);
 }
 
 /** The verdict row's one line: both halves, in words the conductor
@@ -1261,22 +1300,27 @@ export function trainGateLabel(g: TrainGateReading): string {
   const forge = g.forge ? `forge ${g.forge}` : 'forge pending';
   if (g.fallback) return `${forge} · gate UNAVAILABLE — CI alone judged this train`;
   if (g.line) return `${forge} · ${g.line.replace(/^train gate: /, 'gate ')}`;
-  if (g.wait_reason) return `${forge} · gate waiting: ${g.wait_reason}`;
+  const waiting = g.wait_reason ?? g.bound_wait;
+  // An uncertain CREATE retains a reason beside its already-filed run.
+  // Keep a real bound wait, but do not describe that running gate as waiting.
+  if (waiting && (g.run === null || g.bound_wait !== null)) return `${forge} · gate waiting: ${waiting}`;
   if (g.run) return `${forge} · gate running (${g.run.slice(0, 8)})${g.relaunches > 0 ? ` · relaunched ${g.relaunches}×` : ''}`;
   return forge;
 }
 
 /** Whether the verdict row wears the yard's trouble style: a gate that
- *  could not be filed (fallback) at once; one still waiting for a bay
- *  (wait_reason) once the wait has held TRAIN_GATE_WAIT_MINUTES — a
- *  short wait is the train holding the first place in line, the normal
- *  path since 1e787fc2 (19227ca8). A troubled packet must look
- *  troubled; a wait with no onset on record is trouble at once. Ported
- *  to track.rs `train_gate_troubled`, which judges by the same number. */
+ *  could not be filed (fallback) at once; one holding its place in line
+ *  for a bay (bound_wait) once the wait has held TRAIN_GATE_WAIT_MINUTES
+ *  — a short wait is the normal path since 1e787fc2 (19227ca8); any
+ *  other failed launch (wait_reason with no place or bound run) at once, because no
+ *  bay that frees will file it (review a2ace778). A troubled packet must
+ *  look troubled; a wait with no onset on record is trouble at once.
+ *  track.rs `train_gate_unfiled` reads the same keys in the same order,
+ *  and its region settles the wait by the same number. */
 export function trainGateTroubled(g: TrainGateReading, nowMs: number = Date.now()): boolean {
   if (g.fallback !== null) return true;
-  if (g.wait_reason === null) return false;
-  const since = g.wait_since === null ? Number.NaN : Date.parse(g.wait_since);
+  if (g.bound_wait === null) return g.wait_reason !== null && g.run === null;
+  const since = g.wait_since === null ? Number.NaN : rfc3339Ms(g.wait_since);
   if (Number.isNaN(since)) return true;
   return nowMs - since >= TRAIN_GATE_WAIT_MINUTES * 60_000;
 }

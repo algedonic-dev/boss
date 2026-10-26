@@ -23,6 +23,7 @@ import { MERMAID_ENTRY, MERMAID_ROUTE } from './it/mermaidUrl';
 const CHUNKS = 'chunks/mermaid.esm.min';
 
 /** The installed mermaid package's dist/ directory. */
+// web-suite-reads: none — resolves the installed mermaid package; the install's inputs are judged as reads already
 function mermaidDist(): string {
   return dirname(Bun.resolveSync('mermaid', import.meta.dir));
 }

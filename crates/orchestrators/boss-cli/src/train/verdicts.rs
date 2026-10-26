@@ -150,7 +150,8 @@ pub(crate) fn squash_message(consist: &[Value]) -> String {
 /// Everything derives from evidence the job record already holds:
 /// the boarded cars (consist), the board-time skips the train
 /// recorded (left_behind), the deployed generation, and the timings
-/// the conductor's own `completed_at` stamps make derivable. Missing
+/// the conductor's own `completed_at` stamps make derivable — the
+/// deploy leg ending at `converged`, the observed deploy. Missing
 /// evidence reads as null, never a guess — `arrived_at` stays null
 /// until whatever completes the outcome step stamps a time, and no
 /// CI round count appears because the record does not carry one.
@@ -173,7 +174,12 @@ pub(crate) fn arrival_report(train: &Value, boarded_cars: &[Value]) -> Value {
         .filter(|s| !s.is_empty());
     let boarded = step_stamp(train, "collect", "Collect what is ready to board");
     let merged = step_stamp(train, "merged", "Merged into main");
-    let deployed = step_stamp(train, "deployed", "Deployed to the playground");
+    // The deploy leg ends where the deploy was OBSERVED, at `converged`
+    // — not at `deployed`, which the conductor stamps in the same pass
+    // as `merged` because it deploys nothing (NO_PLAYGROUND_DEPLOY_EVIDENCE).
+    // Timed off `deployed`, the leg read 0 s on every arrived train
+    // (backlog 4472781d), so no deploy stamp is reported at all.
+    let converged = step_stamp(train, "converged", "Cluster converged");
     let arrived = step_stamp(train, "arrived", "Train arrived");
     let mut report = json!({
         "consist": consist,
@@ -182,10 +188,10 @@ pub(crate) fn arrival_report(train: &Value, boarded_cars: &[Value]) -> Value {
         "timings": {
             "boarded_at": boarded,
             "merged_at": merged,
-            "deployed_at": deployed,
+            "converged_at": converged,
             "arrived_at": arrived,
             "board_to_merge_s": secs_between(parse_stamp(boarded), parse_stamp(merged)),
-            "merge_to_deploy_s": secs_between(parse_stamp(merged), parse_stamp(deployed)),
+            "merge_to_converge_s": secs_between(parse_stamp(merged), parse_stamp(converged)),
             "total_s": secs_between(parse_stamp(boarded), parse_stamp(arrived)),
         },
     });
@@ -1414,16 +1420,34 @@ mod tests {
             json!("2026-08-13T06:05:00Z")
         );
         assert_eq!(
-            report["timings"]["deployed_at"],
-            json!("2026-08-13T06:12:00Z")
+            report["timings"]["converged_at"],
+            json!("2026-08-13T06:17:00Z")
         );
         assert_eq!(
             report["timings"]["arrived_at"],
             json!("2026-08-13T06:20:00Z")
         );
         assert_eq!(report["timings"]["board_to_merge_s"], json!(300));
-        assert_eq!(report["timings"]["merge_to_deploy_s"], json!(420));
+        assert_eq!(report["timings"]["merge_to_converge_s"], json!(720));
         assert_eq!(report["timings"]["total_s"], json!(1200));
+    }
+
+    // THE DEPLOY LEG IS THE OBSERVED ONE (backlog 4472781d). The
+    // conductor completes `deployed` in the same reconcile pass as
+    // `merged` — it deploys nothing; the cluster converges on forge
+    // main — so `merge_to_deploy_s` was 0 (or a 1 s stamp skew) on
+    // every arrived train: measured 2026-10-21 on the five newest,
+    // 0/0/0/1/0, while `converged` stamped 215-587 s after the merge.
+    // The report published a fabricated zero as a measured leg. It now
+    // times merge → converged, the instant the deploy was OBSERVED, and
+    // carries no deploy stamp at all.
+    #[test]
+    fn the_arrival_report_times_the_observed_converge_not_the_merge_instant_deploy() {
+        let report = arrival_report(&arrived_train(), &boarded_cars());
+        let timings = report["timings"].as_object().expect("timings");
+        assert!(!timings.contains_key("deployed_at"), "{report}");
+        assert!(!timings.contains_key("merge_to_deploy_s"), "{report}");
+        assert_eq!(report["timings"]["merge_to_converge_s"], json!(720));
     }
 
     // The squash commit's body IS the consist (backlog f252cb1c,
@@ -1535,7 +1559,8 @@ mod tests {
         assert_eq!(report["timings"]["boarded_at"], Value::Null);
         assert_eq!(report["timings"]["arrived_at"], Value::Null);
         assert_eq!(report["timings"]["board_to_merge_s"], Value::Null);
-        assert_eq!(report["timings"]["merge_to_deploy_s"], Value::Null);
+        assert_eq!(report["timings"]["converged_at"], Value::Null);
+        assert_eq!(report["timings"]["merge_to_converge_s"], Value::Null);
         assert_eq!(report["timings"]["total_s"], Value::Null);
     }
 
