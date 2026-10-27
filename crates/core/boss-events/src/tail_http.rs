@@ -438,16 +438,46 @@ pub struct StepFlowRow {
 /// have to come from the projection. DISTINCT on the step id, because
 /// a step re-promoted to ready records a second event and is still one
 /// obligation.
+///
+/// ITS ONE READER is `GET /api/stations/flow?basis=step-events`. The IT
+/// map counted this cube over two windows in one statement (backlog
+/// 29f7e897) until item ab09f1af's car 2 (2026-10-20) moved it onto the
+/// packet-membership basis; the two-window statement went with it.
 pub async fn step_flow_cube(
     pool: &PgPool,
     since: DateTime<Utc>,
 ) -> Result<Vec<StepFlowRow>, String> {
-    sqlx::query_as::<_, StepFlowRow>(
-        "WITH win AS (
-             SELECT payload->>'step_id' AS sid,
+    sqlx::query_as::<_, StepFlowRow>(STEP_FLOW_CUBE_SQL)
+        .bind(since)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The statement [`step_flow_cube`] runs, `$1` the window's opening
+/// instant — public so its plan can be pinned against a real database
+/// (boss-jobs `station_flow_pg`).
+///
+/// THE WINDOW'S STEP ID IS READ AS A UUID, so `steps` is probed by its
+/// primary key once per window row. It was joined as
+/// `s.id::text = sid` until backlog 17959b76 (2026-10-17), and no index
+/// can answer a cast of the key: every execution read, joined and sorted
+/// every step and job however short the window — measured live at ~25
+/// executions a minute, up to 51.9 s each, beside stalled job reads and
+/// COMMITs. Only the canonical spelling is cast — the one
+/// `s.id::text` produces — and anything else becomes NULL and joins
+/// nothing, so an upper-case or malformed id in the log counts nothing
+/// and refuses nothing, exactly as under the text join (a bare `::uuid`
+/// would fail the whole read on one malformed payload). `CASE` because
+/// it is the one construct that orders the test before the cast.
+pub const STEP_FLOW_CUBE_SQL: &str = "WITH win AS (
+             SELECT CASE WHEN payload->>'step_id'
+                              ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                         THEN (payload->>'step_id')::uuid
+                    END AS sid,
                     kind LIKE 'step.ready.%' AS is_arrival
              FROM audit_log
-             WHERE created_at > $1
+             WHERE created_at > $1::timestamptz
                AND (kind LIKE 'step.ready.%' OR kind LIKE 'step.done.%')
                AND payload->>'step_id' IS NOT NULL
          )
@@ -458,15 +488,9 @@ pub async fn step_flow_cube(
                 COUNT(DISTINCT win.sid) FILTER (WHERE win.is_arrival)::BIGINT AS arrived,
                 COUNT(DISTINCT win.sid) FILTER (WHERE NOT win.is_arrival)::BIGINT AS served
          FROM win
-         JOIN steps s ON s.id::text = win.sid
+         JOIN steps s ON s.id = win.sid
          JOIN jobs j ON j.id = s.job_id
-         GROUP BY 1, 2, 3, 4",
-    )
-    .bind(since)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())
-}
+         GROUP BY 1, 2, 3, 4";
 
 /// The log's head: its highest id, 0 on an empty log. The one read the
 /// yard's mover (boss-jobs `moves`, design e765b3fc §3) takes on a quiet

@@ -69,8 +69,11 @@ fn the_seed_copy_precedes_the_clone() {
     let seed_call = only_line(&lines, "seed_target call", |l| {
         l.contains("seed_target") && !l.contains("seed_target()")
     });
-    let clone = only_line(&lines, "git clone", |l| {
-        l.trim_start().starts_with("git clone")
+    // Since a531f508 the clone is `git init` and one fetch: the init is
+    // the first touch of the workspace's repository, so nothing the
+    // clone writes can precede it.
+    let clone = only_line(&lines, "git init of the workspace repository", |l| {
+        l.trim_start().starts_with("git init") && l.contains("/gate-target/repo")
     });
     let checkout = only_line(&lines, "branch checkout", |l| {
         l.trim_start().starts_with("git checkout -B")
@@ -80,7 +83,7 @@ fn the_seed_copy_precedes_the_clone() {
     });
     assert!(
         seed_call < clone,
-        "the seed copy must run BEFORE `git clone` (line {seed_call} vs {clone} of the executed \
+        "the seed copy must run BEFORE the clone's `git init` (line {seed_call} vs {clone} of the executed \
          lines): after it, a reader blocked on the shared flock copies a seed refreshed after its \
          clone, and an artifact newer than a source file reads fresh to cargo (646c0ade)"
     );

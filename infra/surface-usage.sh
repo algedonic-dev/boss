@@ -360,6 +360,20 @@ file_row() {
     # fields.
     local body
     body=$(printf '%s' "$row" | jq '{measured: .measured, coverage: .coverage}')
+    # The reading can land on an unfinished packet from an older run.
+    # Bind this PATCH to the collector's invocation, preserving the packet's
+    # creation identity rather than treating it as evidence of this reading.
+    if [ -n "${INVOCATION_ID:-}" ]; then
+        case "$INVOCATION_ID" in
+            *[!0-9a-f]*) echo "$NAME: invalid reading invocation identity; nothing filed" >&2; printf '%s\n' "$row" >&2; exit 1 ;;
+        esac
+        [ "${#INVOCATION_ID}" -eq 32 ] || {
+            echo "$NAME: malformed reading invocation identity; nothing filed" >&2
+            printf '%s\n' "$row" >&2
+            exit 1
+        }
+        body=$(printf '%s' "$body" | jq --arg invocation "$INVOCATION_ID" '. + {reading_invocation_id: $invocation}')
+    fi
     api PATCH "/api/jobs/$job_id/metadata" "$body" >/dev/null || {
         echo "$NAME: filing the reading onto ${job_id:0:8} failed. It is below rather than lost." >&2
         printf '%s\n' "$row" >&2

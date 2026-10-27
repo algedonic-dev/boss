@@ -62,6 +62,18 @@ fn printed_run_sh() -> String {
         .join("\n")
 }
 
+/// seed-refresh.sh with comment lines dropped: since backlog 3e2c8ddc the
+/// refresh lives there, ONE definition both layouts run — in the gate
+/// container on the old layout, in the helper container after it on the
+/// judged-init one (design b4bf8bba).
+fn printed_seed_refresh_sh() -> String {
+    read("infra/gate-runner/seed-refresh.sh")
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The Job document out of the multi-doc manifest.
 fn job_doc() -> String {
     manifest()
@@ -195,17 +207,26 @@ fn the_workspace_is_per_run_and_shares_the_seeds_filesystem() {
         .map(str::trim)
         .filter(|l| l.starts_with(&format!("- {{name: {seed},")) && l.contains("mountPath:"))
         .collect();
+    // ARGUED, 3e2c8ddc (design b4bf8bba): the seed-refresh container
+    // after the gate mounts the claim twice more, and neither is a new
+    // shared mount — the seed, which every gate already shares under its
+    // lock, and THIS pod's own workspace (the same `runs/$(POD_NAME)` the
+    // gate wrote, and the helper refreshes from and empties). Not
+    // /gate-runs: the exception stays the gate's alone.
     assert_eq!(
         claim_mounts,
         vec![
             "- {name: gate-disk, mountPath: /gate-seed, subPath: seed}",
             "- {name: gate-disk, mountPath: /gate-target, subPathExpr: runs/$(POD_NAME)}",
             "- {name: gate-disk, mountPath: /gate-runs, subPath: runs}",
+            "- {name: gate-disk, mountPath: /gate-seed, subPath: seed}",
+            "- {name: gate-disk, mountPath: /gate-target, subPathExpr: runs/$(POD_NAME)}",
         ],
-        "the gate claim is mounted exactly three ways: the shared seed, this pod's own \
-         workspace, and /gate-runs — the ONE known exception to per-pod isolation \
-         (review 0b9c02f1 F2, structural fix 5e77f216). A new shared mount must be \
-         argued here, not added silently."
+        "the gate claim is mounted exactly three ways in the gate: the shared seed, this \
+         pod's own workspace, and /gate-runs — the ONE known exception to per-pod isolation \
+         (review 0b9c02f1 F2, structural fix 5e77f216) — and the first two again in the \
+         seed-refresh container after it. A new shared mount must be argued here, not added \
+         silently."
     );
 }
 
@@ -713,7 +734,10 @@ fn a_run_holds_its_liveness_lock_and_empties_its_workspace_at_exit() {
     let lock = sh
         .find("flock -s 8")
         .expect("run.sh holds a shared lock on /gate-target/.alive for its life");
-    let clone = sh.find("git clone").expect("run.sh clones");
+    // The clone begins at `git init` since a531f508 (init + one fetch).
+    let clone = sh
+        .find("git init -q /gate-target/repo")
+        .expect("run.sh makes its own repository");
     assert!(lock < clone, "the lock is taken before any work");
     assert!(
         sh.contains("exec 8>>/gate-target/.alive"),
@@ -833,7 +857,7 @@ fn seed_copy_and_refresh_take_opposite_locks() {
          a reader racing the refresher is not"
     );
     assert!(
-        sh.contains("flock -x -n"),
+        printed_seed_refresh_sh().contains("flock -x -n 9"),
         "the refresh must hold an EXCLUSIVE lock and skip when busy (-n): \
          refreshing is best-effort housekeeping, blocking a verdict is not its job"
     );
@@ -844,7 +868,7 @@ fn seed_copy_and_refresh_take_opposite_locks() {
 /// seed — the next gate runs cold, slow and correct — never a torn one.
 #[test]
 fn the_refresh_stages_then_renames_so_death_leaves_cold_not_torn() {
-    let sh = printed_run_sh();
+    let sh = printed_seed_refresh_sh();
     assert!(
         sh.contains("target.partial"),
         "the refresh must copy into a staging dir, not into the live seed path"
@@ -867,7 +891,7 @@ fn the_refresh_stages_then_renames_so_death_leaves_cold_not_torn() {
 fn the_seed_refreshes_only_on_a_green_near_tip_run() {
     let sh = printed_run_sh();
     assert!(
-        sh.contains(r#"[ "$VERDICT" = "green" ]"#),
+        sh.contains(r#"if [ "$VERDICT" != green ]; then echo "skip not-green"; return 0; fi"#),
         "the refresh must be gated on the verdict being green"
     );
     assert!(
@@ -888,18 +912,30 @@ fn the_seed_refreshes_only_on_a_green_near_tip_run() {
 #[test]
 fn the_seed_is_copied_by_reflink_from_a_local_volume_on_the_build_node() {
     let sh = run_sh();
-    let seeding = sh
-        .lines()
-        .filter(|l| l.contains("cp -a") && l.contains("$SEED/target/."))
-        .count();
-    let refreshing = sh
-        .lines()
-        .filter(|l| l.contains("cp -a") && l.contains("$SEED/target.partial"))
-        .count();
-    assert_eq!(seeding, 1, "one seeding copy in run.sh");
-    assert_eq!(refreshing, 1, "one refresh copy in run.sh");
+    let helper = read("infra/gate-runner/seed-refresh.sh");
+    let copies = |text: &str, to: &str| {
+        text.lines()
+            .filter(|l| l.contains("cp -a") && l.contains(to))
+            .count()
+    };
+    assert_eq!(
+        copies(&sh, "$SEED/target/."),
+        1,
+        "one seeding copy in run.sh"
+    );
+    assert_eq!(
+        copies(&helper, "$SEED/target.partial"),
+        1,
+        "one refresh copy, in seed-refresh.sh"
+    );
+    assert_eq!(
+        copies(&sh, "$SEED/target.partial"),
+        0,
+        "no second refresh copy in run.sh — the refresh lives once (backlog 3e2c8ddc)"
+    );
     for l in sh
         .lines()
+        .chain(helper.lines())
         .filter(|l| l.contains("cp -a") && l.contains("$SEED/target"))
     {
         assert!(

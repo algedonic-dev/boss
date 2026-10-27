@@ -43,6 +43,7 @@ pub mod dock_red;
 pub mod escalation;
 pub mod estate_seed;
 pub mod events;
+pub mod execution_inputs;
 pub mod executor_attestation;
 pub mod experiments;
 pub mod field_writer;
@@ -54,6 +55,7 @@ pub mod gate_queue_observation;
 pub mod gate_reservation;
 pub mod http;
 pub mod human_only;
+pub mod human_presentation;
 pub mod in_memory;
 pub mod job_edges;
 pub mod job_outcome;
@@ -65,6 +67,12 @@ pub mod lost_gate;
 pub mod me;
 #[cfg(feature = "postgres")]
 mod membership_history_pg;
+pub mod membership_observation;
+pub mod membership_observation_service;
+pub mod membership_projection;
+#[cfg(feature = "postgres")]
+pub mod membership_projection_pg;
+pub mod membership_projection_service;
 pub mod membership_replay;
 pub mod memory_selection_store;
 pub mod metadata_containment;
@@ -84,13 +92,16 @@ pub mod origin;
 pub mod orphan_steps;
 pub mod outranks;
 pub mod owned_wait_queue;
+pub mod pick;
 pub mod plugin_version_repair;
 pub mod policy_glue;
 pub mod port;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod priority;
 pub mod probe;
 pub mod protocol_conversion;
+pub mod reading_cache;
 #[cfg(feature = "postgres")]
 pub mod rebuild;
 pub mod records_before_claim;
@@ -98,8 +109,10 @@ pub mod refusals;
 pub mod region_states;
 pub mod regions;
 pub mod registry;
+pub mod release_window;
 pub mod repin;
 pub mod routes;
+pub mod routes_every_stand;
 pub mod runner_credential;
 pub mod scheduling;
 pub mod schema_level;
@@ -116,6 +129,7 @@ pub mod station_reach;
 pub mod station_seed;
 pub mod stations;
 pub mod step_metadata_write;
+pub mod step_release;
 pub mod stranded;
 pub mod thirds;
 pub mod trust;
@@ -164,3 +178,8 @@ pub use step_plugins::{InMemoryStepPlugins, StepPluginError, StepPluginRegistry,
 pub mod conditional_completion;
 
 pub mod state_receipt;
+
+pub mod browser_qualification;
+pub mod completion_contract;
+
+pub mod browser_qualification_adapter;

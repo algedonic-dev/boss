@@ -345,6 +345,10 @@ pub(crate) struct RedTrainAlert {
     pub(crate) title: String,
     pub(crate) failing: Vec<String>,
     pub(crate) refused: bool,
+    /// Why the train GATE judged nothing — its receipt's own sentence
+    /// (`train_gate::no_verdict`) — when that, and no named check, is the
+    /// red (backlog 81408a81).
+    pub(crate) gate_error: Option<String>,
     /// `(check, log_tail)` for each failing check whose log the forge
     /// resolved — empty when none could be fetched, which is a missing
     /// attachment, never an error (observability is best-effort). When
@@ -369,6 +373,7 @@ pub(crate) fn red_train_alert(
     rollup: Option<&Value>,
     gate_fails: &[String],
     gate_excerpt: &[(String, String)],
+    gate_no_verdict: Option<&str>,
 ) -> Option<RedTrainAlert> {
     if live_verdict != "failing" {
         return None;
@@ -399,6 +404,28 @@ pub(crate) fn red_train_alert(
         );
     }
     let id = train.get("id").and_then(Value::as_str).unwrap_or("");
+    // A GATE THAT JUDGED NOTHING (backlog 81408a81): no forge check
+    // failed and the gate's receipt names none, but it says why it gave no
+    // verdict. Alert 228c21e0 read "CI failed: check names unavailable"
+    // for exactly this while CI was green; the receipt's `error` is the
+    // name, and the title says it was a refusal, not a consist red.
+    let gate_error = failing
+        .is_empty()
+        .then_some(gate_no_verdict)
+        .flatten()
+        .map(str::to_string);
+    if let Some(error) = &gate_error {
+        return Some(RedTrainAlert {
+            title: format!(
+                "Red train {} — train gate REFUSED, no verdict on the consist: {error}",
+                id8(id)
+            ),
+            failing,
+            refused: true,
+            gate_error,
+            logs,
+        });
+    }
     let named = if failing.is_empty() {
         "check names unavailable".to_string()
     } else {
@@ -418,6 +445,7 @@ pub(crate) fn red_train_alert(
         title,
         failing,
         refused,
+        gate_error: None,
         logs,
     })
 }
@@ -445,6 +473,7 @@ pub(crate) fn red_train_alert_body(tid: &str, alert: &RedTrainAlert, owner: &str
             "train_alert": tid,
             "failing_checks": alert.failing,
             "refused": alert.refused,
+            "gate_error": alert.gate_error,
             // The failing job's log tail — or, for a red train gate,
             // the gate receipt's excerpt of each failed check — so the
             // alert names not just WHICH check failed but WHY: no
@@ -486,6 +515,7 @@ mod red_train_alert_tests {
             title: "Red train abcd1234 — CI failed: CI / web".into(),
             failing: vec!["CI / web".into()],
             refused: false,
+            gate_error: None,
             logs: vec![],
         };
         let b = red_train_alert_body("abcd1234-0000-0000-0000-000000000000", &alert, "emp-owner");
@@ -600,6 +630,7 @@ mod red_train_alert_tests {
             ]))),
             &[],
             &[],
+            None,
         )
         .expect("a red train alerts");
         assert_eq!(r.failing, vec!["CI / test".to_string()]);
@@ -631,8 +662,15 @@ mod red_train_alert_tests {
              assertion `left == right` failed: the host declares legacy-stack"
                 .to_string(),
         )];
-        let r = red_train_alert(&train(false), "failing", Some(&green_ci), &fails, &excerpt)
-            .expect("a red gate is a red train");
+        let r = red_train_alert(
+            &train(false),
+            "failing",
+            Some(&green_ci),
+            &fails,
+            &excerpt,
+            None,
+        )
+        .expect("a red gate is a red train");
         assert_eq!(r.failing, fails);
         assert!(!r.refused);
         assert_eq!(
@@ -668,6 +706,7 @@ mod red_train_alert_tests {
             )),
             &fails,
             &excerpt,
+            None,
         )
         .unwrap();
         assert_eq!(both.failing, vec!["CI / web".to_string()]);
@@ -682,13 +721,13 @@ mod red_train_alert_tests {
 
     #[test]
     fn a_green_or_pending_verdict_is_no_alert() {
-        assert!(red_train_alert(&train(false), "green", None, &[], &[]).is_none());
-        assert!(red_train_alert(&train(false), "pending", None, &[], &[]).is_none());
+        assert!(red_train_alert(&train(false), "green", None, &[], &[], None).is_none());
+        assert!(red_train_alert(&train(false), "pending", None, &[], &[], None).is_none());
     }
 
     #[test]
     fn a_merged_train_is_no_alert_whatever_the_verdict() {
-        assert!(red_train_alert(&train(true), "failing", None, &[], &[]).is_none());
+        assert!(red_train_alert(&train(true), "failing", None, &[], &[], None).is_none());
     }
 
     #[test]
@@ -715,6 +754,7 @@ mod red_train_alert_tests {
             ]))),
             &[],
             &[],
+            None,
         )
         .expect("a refusal still alerts");
         assert!(r.refused);
@@ -722,6 +762,76 @@ mod red_train_alert_tests {
             r.title.to_lowercase().contains("refused"),
             "title says refused: {}",
             r.title
+        );
+    }
+
+    /// A GATE THAT JUDGED NOTHING IS A REFUSAL, NOT A CONSIST RED (backlog
+    /// 81408a81). Red alert 228c21e0 (2026-10-18), for train b0e4ba33:
+    /// forge CI green on every check, the train gate refused an empty
+    /// diff before any check ran, its receipt read `unreadable` with the
+    /// reason in `error` — and the alert, reading only `fails`, titled
+    /// itself "CI failed: check names unavailable". The receipt's own
+    /// sentence names it, and the title says what it was.
+    #[test]
+    fn a_gate_that_judged_nothing_is_announced_as_a_refusal_naming_its_error() {
+        let green_ci = rollup(json!([
+            {"context": "CI / build-image", "conclusion": "SUCCESS"},
+            {"context": "CI / web", "conclusion": "SUCCESS"}
+        ]));
+        let error = "the gate's receipt is unreadable: [Errno 2] No such file or directory: \
+                     '/gate-target/receipt.json'";
+        let r = red_train_alert(
+            &train(false),
+            "failing",
+            Some(&green_ci),
+            &[],
+            &[],
+            Some(error),
+        )
+        .expect("the train still reads failing, so it still announces itself");
+        assert!(r.refused, "a gate that judged nothing is a refusal");
+        assert!(
+            !r.title.contains("check names unavailable") && !r.title.contains("CI failed"),
+            "{}",
+            r.title
+        );
+        assert!(
+            r.title.contains("train gate REFUSED") && r.title.contains("no verdict on the consist"),
+            "{}",
+            r.title
+        );
+        assert!(r.title.contains("receipt.json"), "{}", r.title);
+        let body = red_train_alert_body("e799e241-aaaa-bbbb-cccc-000000000000", &r, "emp-owner");
+        assert_eq!(body["metadata"]["gate_error"], error);
+        assert_eq!(body["metadata"]["refused"], true);
+
+        // A gate red that NAMES its checks keeps its title; the forge's own
+        // red keeps CI's — the no-verdict reading never overrides a name.
+        let named = red_train_alert(
+            &train(false),
+            "failing",
+            Some(&green_ci),
+            &["test: x - FAILED".to_string()],
+            &[],
+            Some(error),
+        )
+        .unwrap();
+        assert!(named.title.contains("train gate failed"), "{}", named.title);
+        let forge = red_train_alert(
+            &train(false),
+            "failing",
+            Some(&rollup(
+                json!([{"context": "CI / web", "conclusion": "FAILURE"}]),
+            )),
+            &[],
+            &[],
+            Some(error),
+        )
+        .unwrap();
+        assert!(
+            forge.title.contains("CI failed: CI / web"),
+            "{}",
+            forge.title
         );
     }
 }
@@ -1070,7 +1180,7 @@ mod red_verdict_log_tests {
             "steps": [{"metadata": {"spec_slug": "merged"}, "title": "Merged into main", "status": "pending"}]
         });
         let rollup = json!([{"context": "CI / test", "conclusion": "FAILURE"}]);
-        let alert = red_train_alert(&train, "failing", Some(&rollup), &[], &[])
+        let alert = red_train_alert(&train, "failing", Some(&rollup), &[], &[], None)
             .expect("still an alert without a log");
         assert_eq!(alert.failing, vec!["CI / test".to_string()]);
         assert!(alert.logs.is_empty(), "no attachment, not an error");
@@ -1092,7 +1202,7 @@ mod red_verdict_log_tests {
         let rollup = json!([
             {"context": "CI / test", "conclusion": "FAILURE", "log_tail": "assertion failed at line 9"}
         ]);
-        let alert = red_train_alert(&train, "failing", Some(&rollup), &[], &[]).unwrap();
+        let alert = red_train_alert(&train, "failing", Some(&rollup), &[], &[], None).unwrap();
         assert_eq!(alert.logs.len(), 1);
         let body =
             red_train_alert_body("abcd1234-0000-0000-0000-000000000000", &alert, "emp-owner");

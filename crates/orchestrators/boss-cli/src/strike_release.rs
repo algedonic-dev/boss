@@ -121,6 +121,8 @@ pub(crate) fn judge(gate_run: &Value, train: Option<&Value>, car_id: &str) -> Re
     }
     match crate::train_gate::standing(gate_run) {
         crate::train_gate::Standing::Failed => {}
+        // Struck before backlog 06c452f2 made this shape a refusal.
+        crate::train_gate::Standing::Refused(_) if crate::train_gate::unreadable_red(gate_run) => {}
         crate::train_gate::Standing::Green => {
             checked_combined_failure(gate_run, train).map_err(|why| {
                 format!("is not red — GREEN gate lacks checked combined failure: {why}")
@@ -409,6 +411,19 @@ mod tests {
         assert!(green.unwrap_err().contains("not red"));
         let lost = judge(&gate_run("lost", Some(TRAIN)), Some(&train(&[CAR])), CAR);
         assert!(lost.unwrap_err().contains("not red"));
+        // A strike laid on a `failed` step over an UNREADABLE receipt —
+        // gate-run df02648a's, verbatim — is one the conductor laid
+        // before backlog 06c452f2 made that shape a refusal. It is the
+        // strike most owed a release, so it still counts.
+        let mut unreadable = gate_run("failed", Some(TRAIN));
+        unreadable["steps"][0]["metadata"]["receipt"] = json!(crate::train_gate::DF02648A_RECEIPT);
+        assert_eq!(judge(&unreadable, Some(&train(&[CAR])), CAR), Ok(()));
+        // A plain refusal never struck anyone, and still does not count.
+        let mut refused = gate_run("failed", Some(TRAIN));
+        refused["steps"][0]["metadata"]["receipt"] =
+            json!(r#"{"verdict":"refused","refused_because":"disk floor"}"#);
+        let refused = judge(&refused, Some(&train(&[CAR])), CAR);
+        assert!(refused.unwrap_err().contains("not red"));
         let own_gate = judge(&gate_run("failed", None), None, CAR);
         assert!(own_gate.unwrap_err().contains("gates no train"));
         let elsewhere = judge(

@@ -671,6 +671,17 @@ const DEFAULT_FLOW_WINDOW_HOURS: i64 = 24;
 /// the cost of a wide one is a wider scan; this caps it.
 const MAX_FLOW_WINDOW_HOURS: i64 = 720;
 
+/// The row bound every packet-membership read is given — this surface's
+/// and the IT map's (item ab09f1af, car 2), so the two cannot disagree
+/// about which window the reader refuses. The byte bound is the reader's
+/// own (`membership_history_pg`).
+pub(super) const MEMBERSHIP_ROW_BOUND: i64 = 250_000;
+
+/// The reason a station the original history holds no publication for
+/// reads unavailable — on this surface and on the map alike.
+pub(super) const NO_PUBLICATION_HISTORY: &str =
+    "original applicable station publication history unavailable";
+
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct FlowQuery {
     window_hours: Option<i64>,
@@ -740,7 +751,7 @@ pub(super) async fn stations_flow<R: JobsRepository + 'static, B: EventBus + 'st
         let scope = JobScope::from_predicate(&user, &predicate);
         let source = state
             .jobs
-            .membership_snapshot(since, Some(user.id.clone()), &scope, 250_000)
+            .membership_snapshot(since, Some(user.id.clone()), &scope, MEMBERSHIP_ROW_BOUND)
             .await;
         let mut rows = BTreeMap::<String, serde_json::Value>::new();
         let mut clock_coverage = serde_json::Value::Null;
@@ -761,17 +772,7 @@ pub(super) async fn stations_flow<R: JobsRepository + 'static, B: EventBus + 'st
                             .zip(flow.departed)
                             .map(|(a, d)| i128::from(a) - i128::from(d))
                     );
-                    value["unavailable_reason"] = serde_json::json!(if flow.unknown.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            flow.unknown
-                                .iter()
-                                .map(|u| u.reason.as_str())
-                                .collect::<Vec<_>>()
-                                .join("; "),
-                        )
-                    });
+                    value["unavailable_reason"] = serde_json::json!(flow.unavailable_reason());
                     rows.insert(flow.station, value);
                 }
                 (input.until, Some(input.audit_cutoff), None)
@@ -780,7 +781,7 @@ pub(super) async fn stations_flow<R: JobsRepository + 'static, B: EventBus + 'st
         };
         for spec in &stations {
             let value=rows.entry(spec.name.clone()).or_insert_with(||{
-                let reason=failure.clone().unwrap_or_else(||"original applicable station publication history unavailable".into());
+                let reason=failure.clone().unwrap_or_else(||NO_PUBLICATION_HISTORY.into());
                 serde_json::json!({"station":spec.name,"basis":"packet-membership-v1","arrived":null,"departed":null,"served":null,"net":null,
                     "known_arrived":0,"known_departed":0,"known_served":0,"covered":[],"versions":[],"scope":scope,
                     "caller_binding":if spec.predicate.binds_self(){Some(user.id.clone())}else{None},

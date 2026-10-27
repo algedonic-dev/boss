@@ -110,6 +110,18 @@ use crate::sor_client::{all_open_cars, api, api_at, jobs_base, stamp};
 // refuses rather than reading as an empty yard. See `train::rows`.
 use crate::train::rows;
 mod reservation;
+pub(crate) use reservation::bay::NoGateBay;
+/// The one reading of "the cluster ended this gate Job" (backlog db6bdb4f):
+/// the bay frees on it and the conductor's recorder reads a Job finished on it.
+pub(crate) use reservation::bay::{job_live, terminal_condition};
+
+/// PURE: whether a launch error is the bay reservation's refusal — the
+/// bound reached at the moment of the create, a place in the line rather
+/// than a fault (backlog ac8d3157).
+pub(crate) fn no_gate_bay(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| cause.downcast_ref::<NoGateBay>().is_some())
+}
 
 pub(crate) async fn guard_conductor_settlement(
     http: &crate::machine_http::MachineClient,
@@ -152,6 +164,37 @@ pub(crate) async fn launch_controlled(
 ) -> Result<String> {
     reservation::launch_for_conductor(http, jobs, packet, namespace, head, mode, manifest, now)
         .await
+}
+
+/// The car gate's side of the train-gate reuse comparison (backlog
+/// bbc13a4e): the exact request bytes a gate-run's launch intent names,
+/// verified against its sha256 and size.
+pub(crate) async fn retained_launch_request(
+    http: &crate::machine_http::MachineClient,
+    jobs: &str,
+    intent: &Value,
+) -> Result<Vec<u8>> {
+    reservation::retained_request_for_conductor(http, jobs, intent).await
+}
+
+/// The train gate's side: the request [`launch_controlled`] would submit
+/// for this manifest and head, rendered by the same native path and never
+/// sent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn preview_launch_request(
+    http: &crate::machine_http::MachineClient,
+    jobs: &str,
+    packet: &str,
+    namespace: &str,
+    branch: &str,
+    head: &str,
+    mode: &str,
+    manifest: &str,
+) -> Result<Vec<u8>> {
+    reservation::preview_request_for_conductor(
+        http, jobs, packet, namespace, branch, head, mode, manifest,
+    )
+    .await
 }
 
 /// The COMPILED fallback for how many gates run at once — the last
@@ -848,6 +891,19 @@ pub(crate) fn queue_order(
     now: chrono::DateTime<chrono::Utc>,
     ttl_secs: i64,
 ) -> Vec<String> {
+    queue_places(open, now, ttl_secs)
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect()
+}
+
+/// [`queue_order`] with the instant each place was taken — the legacy
+/// half of the one line both owners share ([`mixed_line`]).
+pub(crate) fn queue_places(
+    open: &[Value],
+    now: chrono::DateTime<chrono::Utc>,
+    ttl_secs: i64,
+) -> Vec<(chrono::DateTime<chrono::Utc>, String)> {
     let mut places: Vec<(chrono::DateTime<chrono::Utc>, String)> = open
         .iter()
         .filter_map(|j| {
@@ -877,7 +933,40 @@ pub(crate) fn queue_order(
     // By instant, then id: two places taken in the same second still
     // order the same way for every reader.
     places.sort();
-    places.into_iter().map(|(_, id)| id).collect()
+    places
+}
+
+/// THE ONE LINE ACROSS BOTH OWNERS (backlog b56bfc29): legacy places at
+/// the `queued_at` their waiter took ([`queue_places`]), resident places
+/// at their original acceptance (`reservation::resident_places`), merged
+/// oldest first, id breaking a tie. Until this, each owner read only its
+/// own half: a legacy waiter filtered every resident place out and took
+/// a freed bay ahead of it, and the resident supervisor counted every
+/// legacy place ahead of every resident one — so resident dec70bf9,
+/// accepted 05:42:37Z on 2026-10-19, waited while gates queued after it
+/// launched. Both sides read this order: the waiter's position in it,
+/// and the supervisor's [`places_taken_before`] a resident acceptance.
+pub(crate) fn mixed_line(
+    legacy: &[(chrono::DateTime<chrono::Utc>, String)],
+    resident: &[(chrono::DateTime<chrono::Utc>, String)],
+) -> Vec<String> {
+    let mut line: Vec<_> = legacy.iter().chain(resident).cloned().collect();
+    line.sort();
+    line.into_iter().map(|(_, id)| id).collect()
+}
+
+/// How many of `places` stand before the place `(at, id)` in
+/// [`mixed_line`]'s order — the same comparison, so the supervisor and a
+/// legacy waiter can never each count the other ahead.
+pub(crate) fn places_taken_before(
+    places: &[(chrono::DateTime<chrono::Utc>, String)],
+    at: chrono::DateTime<chrono::Utc>,
+    id: &str,
+) -> usize {
+    places
+        .iter()
+        .filter(|(taken, other)| (taken, other.as_str()) < (&at, id))
+        .count()
 }
 
 /// How many places are ahead of this caller, given the line and the
@@ -940,7 +1029,10 @@ pub(crate) const fn may_launch(live: usize, claims: usize, max: usize, position:
 /// the same TTL as a builder's place, so the line never waits on a ghost.
 /// A refresh held by a train on the track still fires, so the held pass
 /// deletes the claims itself (`Conductor::refresh`): that train's merge
-/// is about to replace the main they wait on.
+/// is about to replace the main they wait on. It keeps ONE (backlog
+/// 6990037a), so one bay stays free for the dock's first clear walk —
+/// with none kept, builders took every bay that freed while trains ran
+/// back to back, and the dock launched nothing for three hours.
 pub(crate) const DOCK_WAITING: &str = "regate_waiting";
 
 /// The cadence rule that walks the dock every two minutes — the one
@@ -1070,10 +1162,30 @@ pub(crate) fn queued_line(
     )
 }
 
+/// `now` carried forward by the monotonic time elapsed since it was
+/// minted. `now` is minted once at the CLI boundary (the no-wallclock
+/// lint's rule), so a verb that runs for an hour dates everything it
+/// writes or judges late in that hour from here — handed the bare `now`,
+/// a claim taken after the verb started reads as younger than zero and
+/// never ages out (backlog fc788e84).
+pub(crate) fn carried_forward(
+    now: chrono::DateTime<chrono::Utc>,
+    elapsed: std::time::Duration,
+) -> chrono::DateTime<chrono::Utc> {
+    now + chrono::Duration::from_std(elapsed).unwrap_or_else(|_| chrono::Duration::zero())
+}
+
 /// Take (or retake) a place: the ordering key and the first heartbeat
 /// written together, so a place is never ordered without being held.
-pub(crate) fn queue_place_patch(now: chrono::DateTime<chrono::Utc>) -> Value {
-    json!({ QUEUED_AT: stamp(now), QUEUE_HEARTBEAT_AT: stamp(now) })
+/// Two instants, because a waiter that returns to the line after losing
+/// a bay keeps the place it joined at (`place`) but is holding it NOW
+/// (`beat`) — a beat dated from its first stamp read as abandoned to
+/// every other reader of the line (backlog fc788e84).
+pub(crate) fn queue_place_patch(
+    place: chrono::DateTime<chrono::Utc>,
+    beat: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    json!({ QUEUED_AT: stamp(place), QUEUE_HEARTBEAT_AT: stamp(beat) })
 }
 
 /// Release the place. `null` DELETES the key on a metadata PATCH, and
@@ -1705,9 +1817,21 @@ impl ParkIntent {
         match &self.probe {
             None => Vec::new(),
             Some(probe) => crate::prove::shape_warnings(probe)
-                .map(|w| format!("boss gate: --park-probe {w}"))
+                .map(|w| format!("{LAUNCH_WARNING_LEAD}--park-probe {w}"))
                 .collect(),
         }
+    }
+
+    /// A BARE-NUMBER `--park-expect`, said at the door (421b3032) with
+    /// the lead every launch warning carries — `boss prove`'s own text,
+    /// minus its speaker, because this line is `boss gate`'s.
+    pub fn expect_warning(&self) -> Option<String> {
+        let w = self
+            .expect
+            .as_deref()
+            .and_then(crate::prove::bare_number_warning)?;
+        let w = w.strip_prefix("boss prove: ").unwrap_or(&w);
+        Some(format!("{LAUNCH_WARNING_LEAD}--park-expect {w}"))
     }
 
     /// THE SHAPE ONLY THE TREE CAN SHOW, said on a `--park-probe`
@@ -1721,7 +1845,7 @@ impl ParkIntent {
         self.probe
             .as_deref()
             .and_then(|probe| crate::prove::prose_only_warning(probe, at, read))
-            .map(|w| format!("boss gate: --park-probe {w}"))
+            .map(|w| format!("{LAUNCH_WARNING_LEAD}--park-probe {w}"))
             .into_iter()
             .collect()
     }
@@ -1843,6 +1967,46 @@ impl ParkIntent {
                 reader_role = identity::READER_ROLE
             );
         }
+        // THE OTHER HALF OF THE SAME FACT (backlog 371b0443): the forge
+        // runs a recorded probe as nobody, so a probe that reads the
+        // caller's own queue rehearses as the builder and answers as
+        // nobody. Refused here, where re-parking is free.
+        if let Some(probe) = &self.probe
+            && let Some(marker) = boss_jobs::probe::reads_the_callers_own_queue(probe)
+        {
+            anyhow::bail!(
+                "--park-probe reads `{marker}` — the queue of WHOEVER RUNS IT, so its answer \
+                 depends on WHO RUNS IT, not on the change.\n\n\
+                 You rehearsed it as yourself. The forge runs a recorded probe with NO actor in \
+                 its env (a `boss` read goes out as {unidentified}), so the same text there \
+                 reads a different queue — usually an empty one.\n\n\
+                 {evidence}\n\n\
+                 The rule is boss_jobs::probe::reads_the_callers_own_queue (`{rule}`), and \
+                 `boss prove --probe` refuses the same text.",
+                unidentified = identity::UNIDENTIFIED,
+                evidence = boss_jobs::probe::CALLERS_OWN_QUEUE_EVIDENCE,
+                rule = boss_jobs::probe::CALLERS_OWN_QUEUE_RULE,
+            );
+        }
+        // A PROOF IS THE ARTIFACT THAT OBSERVES THE CLAIM (backlog
+        // 490acf06): the probe is judged against the sentence it will be
+        // recorded as proof of, here, where re-parking is free.
+        if let (Some(probe), Some(verified)) = (&self.probe, &self.verified)
+            && let Some(words) =
+                boss_jobs::probe::a_tree_read_under_a_production_claim(probe, verified)
+        {
+            anyhow::bail!(
+                "--park-verified claims a production behaviour (`{words}`), and --park-probe \
+                 reads only the converged tree — so the proof this car would record is a fact \
+                 about the source, filed under a sentence about production that nothing \
+                 observed.\n\n\
+                 {evidence}\n\n\
+                 The rule is boss_jobs::probe::a_tree_read_under_a_production_claim (`{rule}`), \
+                 and `boss prove --probe` refuses the same pair.",
+                evidence = boss_jobs::probe::PRODUCTION_CLAIM_EVIDENCE,
+                rule = boss_jobs::probe::PRODUCTION_CLAIM_RULE,
+            );
+        }
         if let Some(probe) = &self.probe
             && let Some(client) = probe_reads_the_sor_unidentified(probe)
         {
@@ -1901,18 +2065,18 @@ impl ParkIntent {
             && let Some(kind) = boss_jobs::probe::clears_a_caller_from_the_gate_log_alone(probe)
         {
             anyhow::bail!(
-                "--park-probe CLEARS A CALLER FROM THE GATE LOG ALONE — it counts `{kind}` \
-                 facts in the gate window's `.log.dirty` and never reads the live tally's \
-                 `.live[].snapshot.rows`, so a caller the running service had already \
-                 tallied passes whatever it sends.\n\n\
+                "--park-probe {heading} — {reading}.\n\n\
                  {evidence}\n\n\
                  The unattended door refuses this text under the rule `{rule}`, so a car \
                  parked with it would never be proven by the machine; this refusal says so \
-                 while re-parking is still free. Add the live reading above and gate again.\n\n\
+                 while re-parking is still free. Add the live reading above, with its \
+                 coverage, and gate again.\n\n\
                  If the claim is a PRESENCE — the gate DID state this caller, which the log \
                  answers correctly — park the car with --park-proof-event '<the fact that \
                  proves it>' instead, and once it lands prove it by hand: \
                  {by_hand}",
+                heading = boss_jobs::probe::gate_log_alone_heading(kind),
+                reading = boss_jobs::probe::gate_log_alone_reading(kind),
                 evidence = boss_jobs::probe::GATE_LOG_ALONE_EVIDENCE,
                 rule = boss_jobs::probe::GATE_LOG_ALONE_RULE,
                 by_hand = boss_jobs::probe::hand_proof_command("<car>"),
@@ -2402,6 +2566,24 @@ pub(crate) fn with_worktree(patch: Option<Value>, toplevel: Option<String>) -> O
     Some(patch)
 }
 
+/// A created gate-run's body with the run's fields (`agent_run`,
+/// `worktree`) in its metadata — the packet is BORN naming its run
+/// (backlog aaf5cafa). The silence clock's progress guard
+/// (`jobs.age_out_step`, `born_linked`) counts a gate as its run's work
+/// only when the `jobs.job.created` event carried the link: the later
+/// metadata PATCH below goes through the same door a hand binding uses,
+/// so it says only that someone bound it. A hand gate (no run) is
+/// unchanged.
+pub(crate) fn born_with_run(mut body: Value, agent_run: Option<&Value>) -> Value {
+    if let (Some(md), Some(fields)) = (
+        body.get_mut("metadata").and_then(Value::as_object_mut),
+        agent_run.and_then(Value::as_object),
+    ) {
+        md.extend(fields.clone());
+    }
+    body
+}
+
 /// This checkout's top level, as git reports it — the worktree `boss
 /// gate` runs in. `None` when git cannot say.
 fn launch_toplevel() -> Option<String> {
@@ -2574,6 +2756,12 @@ pub(crate) struct Landing {
     /// `car <id8> merged as <ref> on train <id8>` from the landed car —
     /// the name the operator needs to find where the change went.
     pub landed_as: Option<String>,
+    /// The head IS on main (an ancestor of it), so the branch adds no
+    /// commit over its merge-base — exactly the tree gate.sh's `--auto`
+    /// refuses as "no change at all against origin/main". A squash- or
+    /// content-landed branch still has commits over its merge-base and
+    /// so still has a diff to scope (backlog 7c833bd5).
+    pub on_main: bool,
 }
 
 /// PURE: has THIS head's content already landed on main?
@@ -2622,6 +2810,7 @@ pub(crate) fn landing(
     Some(Landing {
         how: how.to_string(),
         landed_as,
+        on_main: matches!(v, Verdict::Merged(How::Ancestor)),
     })
 }
 
@@ -2648,12 +2837,23 @@ pub(crate) enum LandedGuard {
 /// `--park-*` on a landed branch has no purpose at all and is refused
 /// outright. A landed branch's next step is deletion, and the refusal
 /// says so.
+///
+/// NOR CAN A FORCED `--mode auto` GATE A HEAD ALREADY ON MAIN (backlog
+/// 7c833bd5). `mode` is the normalised runner argument. gate.sh's
+/// `--auto` scopes to the diff over the merge-base with origin/main, and
+/// a head that is an ancestor of main has none, so the runner can only
+/// answer "--auto found no change at all" — after the run has held a
+/// bay (gate-run 14415eee, 2026-10-20, head bb75debe = main's head).
+/// Both facts are known here, so the pairing is refused before a packet
+/// is filed; a full gate of the same head still runs, since it checks a
+/// tree rather than a diff.
 pub(crate) fn landed_guard(
     branch: &str,
     sha: &str,
     landing: Option<&Landing>,
     force_reason: Option<&str>,
     park: &ParkIntent,
+    mode: &str,
 ) -> LandedGuard {
     let Some(l) = landing else {
         return LandedGuard::Proceed;
@@ -2678,6 +2878,16 @@ pub(crate) fn landed_guard(
             "boss gate: REFUSED — {branch}@{short} already landed on main ({}{landed_as}), \
              and --force-regate cannot carry park intent: a landed branch has nothing to \
              park, and a car for it is a twin. Drop the --park-* flags.",
+            l.how
+        )),
+        Some(_) if l.on_main && mode == "--auto" => LandedGuard::Refuse(format!(
+            "boss gate: REFUSED — {branch}@{short} is already on main ({}{landed_as}), \
+             and --force-regate with --mode auto cannot gate it: the runner's --auto \
+             scopes to the diff over origin/main, finds no change at all, and refuses — \
+             after holding a bay (gate-run 14415eee waited 32 min for that, backlog \
+             7c833bd5).\n  \
+             To check this tree anyway, omit --mode for a full gate; otherwise delete the \
+             branch: git push origin --delete {branch}",
             l.how
         )),
         Some(reason) => LandedGuard::Forced(format!(
@@ -2793,6 +3003,7 @@ pub(crate) fn vouching_car(branch: &str, sha: &str, cars: &[Value]) -> Option<Vo
         // The head was resolved by the caller, so the ref is readable by
         // construction; `standing` needs to know that to answer at all.
         remote_readable: true,
+        remote_said: None,
         verdict: receipt
             .get("verdict")
             .and_then(Value::as_str)
@@ -2853,6 +3064,22 @@ pub(crate) fn withdraw_refusal(packet: &str, job: &Value) -> Option<String> {
              what happened, and a withdrawal would not replace it"
         ));
     }
+    // Nothing to stand down, and — since a4a527d1 — nothing holding the
+    // branch either: `reusable_packet` skips this run, so the refusal
+    // names the re-gate that is admitted rather than leaving the car
+    // with two refusals and no door.
+    if let Some(said) = unjudged_verdict(job) {
+        let branch = job
+            .pointer("/metadata/branch")
+            .and_then(Value::as_str)
+            .unwrap_or("<branch>");
+        return Some(format!(
+            "boss gate --withdraw: gate-run {packet} has already recorded its verdict \
+             ({said}), which judged nothing about the branch — there is nothing to stand \
+             down, and nothing holds the branch: `boss gate {branch}` files a fresh run \
+             beside it, and this packet closes on its own `{said}` outcome"
+        ));
+    }
     let verdict = crate::train::find_step(job, "record-verdict", "Record the receipt");
     if crate::train::step_done(verdict) {
         let said = verdict
@@ -2886,8 +3113,8 @@ pub(crate) fn withdraw_refusal(packet: &str, job: &Value) -> Option<String> {
             "boss gate --withdraw: gate-run {packet} was admitted under a gate-run version \
              whose verdict cannot say `withdrawn` (its step declares the enum it was filed \
              with), so the write would be refused after half of it landed. Nothing was \
-             written. Gate-runs filed after `boss workflow publish gate-run` (v3) can be \
-             withdrawn; this one closes by its runner, or `lost` by the orphan settle."
+             written. A gate-run whose verdict step declares the word can be withdrawn; \
+             this one closes by its runner, or `lost` by the orphan settle."
         ));
     }
     None
@@ -2911,6 +3138,152 @@ pub(crate) fn admits_withdrawn(job: &Value) -> bool {
         .find(|f| f.get("name").and_then(Value::as_str) == Some("verdict"))
         .and_then(|f| f.get("field_type").and_then(Value::as_str))
         .is_none_or(|ty| ty.split('|').any(|w| w.trim() == WITHDRAWN_VERDICT))
+}
+
+/// What one read of a gate-run shows AFTER its `withdrawn` verdict
+/// writes were accepted (backlog 7905cb5d).
+///
+/// FOUR STATES, BECAUSE THE DOOR USED TO HAVE TWO. It read the packet
+/// once, straight after the writes, and called anything not `closed` a
+/// protocol with no terminal, advising `boss workflow publish gate-run`
+/// (v3). Measured on gate-runs 106a584e, 40aed194, 7e8088d1, 5286a359
+/// and 80f7d03b: each was pinned to v6–v8, each carried the terminal,
+/// and each closed 1.4–1.9 s after its verdict step completed — the
+/// `withdrawn` outcome step completes after the verdict, not with it.
+/// A recorded withdrawal waiting on that is not a missing terminal.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum WithdrawalReadback {
+    /// The packet is closed: the withdrawal is done.
+    Closed,
+    /// The verdict reads `withdrawn` and the packet carries its
+    /// `withdrawn` outcome step, not completed yet: closure pending.
+    ClosurePending { version: Option<i64> },
+    /// The verdict reads `withdrawn` and the packet carries NO
+    /// `withdrawn` outcome step: the protocol it is pinned to cannot
+    /// close it on that word. Outcome steps are put on a packet at
+    /// admission, so no later read changes this.
+    MissingTerminal { version: Option<i64> },
+    /// The read does not show the verdict step completed `withdrawn`
+    /// (or shows no verdict step at all) — nothing can be judged from it.
+    VerdictNotRead,
+}
+
+/// PURE: classify one read-back of a withdrawn gate-run.
+pub(crate) fn withdrawal_readback(job: &Value) -> WithdrawalReadback {
+    if job.get("status").and_then(Value::as_str) == Some("closed") {
+        return WithdrawalReadback::Closed;
+    }
+    let verdict = crate::train::find_step(job, "record-verdict", "Record the receipt");
+    let recorded = crate::train::step_done(verdict)
+        && verdict
+            .and_then(|s| s.pointer("/metadata/verdict"))
+            .and_then(Value::as_str)
+            == Some(WITHDRAWN_VERDICT);
+    if !recorded {
+        return WithdrawalReadback::VerdictNotRead;
+    }
+    let version = job.get("workflow_version").and_then(Value::as_i64);
+    let terminal = job
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|s| {
+            s.get("spec_slug").and_then(Value::as_str) == Some(WITHDRAWN_VERDICT)
+                || s.pointer("/metadata/outcome_kind").and_then(Value::as_str)
+                    == Some(WITHDRAWN_VERDICT)
+        });
+    if terminal {
+        WithdrawalReadback::ClosurePending { version }
+    } else {
+        WithdrawalReadback::MissingTerminal { version }
+    }
+}
+
+/// PURE: what the door says when its last read-back is not `Closed` —
+/// `None` when it is. `last` is the last read's classification, or the
+/// error that read returned, whole; `reads` is how many reads were made.
+///
+/// Only [`WithdrawalReadback::MissingTerminal`] names a terminal, and it
+/// names the version the packet IS pinned to. None of them advises a
+/// publish: a publish moves no in-flight packet (CLAUDE.md §Jobs), so
+/// it could not have closed one, and the advice sent a coordinator to a
+/// version two behind the one the packet already ran.
+pub(crate) fn withdrawal_readback_refusal(
+    short: &str,
+    packet: &str,
+    last: &std::result::Result<WithdrawalReadback, String>,
+    reads: u32,
+) -> Option<String> {
+    let pinned = |v: &Option<i64>| match v {
+        Some(n) => format!("gate-run v{n}"),
+        None => "the gate-run version it is pinned to (the read did not say which)".into(),
+    };
+    let reread = format!("re-read it with `boss-api GET /api/jobs/{packet}`");
+    match last {
+        Ok(WithdrawalReadback::Closed) => None,
+        Ok(WithdrawalReadback::ClosurePending { version }) => Some(format!(
+            "gate-run {short} recorded `withdrawn`, and the packet carries the `withdrawn` \
+             outcome step of {}, but after {reads} read(s) that step had not completed — \
+             closure PENDING, not refused. Nothing more is owed from this door; {reread}.",
+            pinned(version)
+        )),
+        Ok(WithdrawalReadback::MissingTerminal { version }) => Some(format!(
+            "gate-run {short} recorded `withdrawn`, but {} put no `withdrawn` outcome step \
+             on this packet, so nothing on it can close on that word. The verdict step reads \
+             as written; {reread}.",
+            pinned(version)
+        )),
+        Ok(WithdrawalReadback::VerdictNotRead) => Some(format!(
+            "gate-run {short}: the verdict writes were accepted, but {reads} read(s) did not \
+             show the verdict step completed `withdrawn` — UNKNOWN; {reread}."
+        )),
+        Err(e) => Some(format!(
+            "gate-run {short}: the verdict writes were accepted, but the last of {reads} \
+             read(s) failed — UNKNOWN, not refused: {e}. {reread}."
+        )),
+    }
+}
+
+/// How many reads a withdrawal makes of its packet, and how far apart,
+/// before it reports a closure still pending. The measured lag from the
+/// verdict step completing to the `withdrawn` terminal completing was
+/// 1.39 s and 1.95 s (gate-runs 80f7d03b, 5286a359, 2026-10-17); thirty
+/// reads a second apart is fifteen times the longer.
+const WITHDRAW_READBACK_READS: u32 = 30;
+const WITHDRAW_READBACK_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Read the withdrawn packet back through the jobs API at `base` until
+/// it is [`WithdrawalReadback::Closed`] or
+/// [`WithdrawalReadback::MissingTerminal`] (neither can change), or
+/// `reads` reads have been made. Returns the last observation — a
+/// failed read stays its error, never a classification — and how many
+/// reads were made.
+pub(crate) async fn read_back_withdrawal(
+    http: &crate::machine_http::MachineClient,
+    base: &str,
+    packet: &str,
+    reads: u32,
+    every: std::time::Duration,
+) -> (std::result::Result<WithdrawalReadback, String>, u32) {
+    let path = format!("/api/jobs/{packet}");
+    let mut last = Err("no read was made".to_string());
+    for n in 1..=reads.max(1) {
+        last = match api_at(http, base, reqwest::Method::GET, &path, None).await {
+            Ok(Some(job)) => Ok(withdrawal_readback(&job)),
+            Ok(None) => Err(format!("GET {path} returned no body")),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        if matches!(
+            last,
+            Ok(WithdrawalReadback::Closed | WithdrawalReadback::MissingTerminal { .. })
+        ) || n >= reads
+        {
+            return (last, n);
+        }
+        tokio::time::sleep(every).await;
+    }
+    (last, reads.max(1))
 }
 
 /// PURE: the refusal once any runner pod exists for the packet's Jobs,
@@ -3300,6 +3673,14 @@ async fn close_refused(http: &crate::machine_http::MachineClient, packet: &str, 
 /// whether a crate exists, and it already refuses a `-p` set that does
 /// not cover what the tree changed; re-deciding that here would be a
 /// second definition to drift from (CLAUDE.md §9a).
+/// How a launch intent records a FULL gate: the empty runner argument is
+/// spelled out, so the record never reads as a missing value. ONE
+/// constant for the writer (`reservation::execution_mode`) and the reader
+/// that requires a full car green (`train_gate_reuse::assess`): the first
+/// cut of that reader required "" and so could never qualify a real car
+/// (backlog bbc13a4e, measured 2026-10-19).
+pub(crate) const RECORDED_FULL_MODE: &str = "full";
+
 pub(crate) fn normalize_mode(mode: &str) -> Result<String> {
     let m = mode.trim();
     match m {
@@ -3366,6 +3747,25 @@ pub(crate) fn truth_patch(recorded: &str, gated: Option<&str>) -> Option<Value> 
     })
 }
 
+/// The first words of every warning `boss gate` prints about a park
+/// intent (backlog 39fd6363). The probe advisories are capitalised and
+/// print before the launch line, and run bfeec18c read one as a refusal
+/// and launched a second time while the first launch was still running.
+/// A warning says what it is before it says anything else.
+pub(crate) const LAUNCH_WARNING_LEAD: &str = "boss gate: WARNING (launching anyway): ";
+
+/// What a launch says when the head it is about to file for gained an
+/// open gate-run while it was being prepared — a second launch of the
+/// same branch@sha (backlog 39fd6363: 6f84f4f2 and 2c0cc70a, filed
+/// 0.93 s apart). It follows that run instead of filing another.
+pub(crate) fn second_launch_line(id: &str, branch: &str, sha: &str) -> String {
+    format!(
+        "boss gate: gate-run {id} was filed for {branch}@{sha} while this launch was being \
+         prepared — not filing a second one for the same head. Follow it with \
+         `boss gate {id} --wait`."
+    )
+}
+
 /// The gate-run packet for this exact branch and sha, if one is already
 /// open.
 ///
@@ -3374,6 +3774,14 @@ pub(crate) fn truth_patch(recorded: &str, gated: Option<&str>) -> Option<Value> 
 /// of "one packet per run" turns that into a permanent orphan.
 pub(crate) fn reusable_packet(open: &[Value], branch: &str, sha: &str) -> Option<String> {
     open.iter()
+        // A RUN THAT RECORDED A VERDICT JUDGING NOTHING IS SPENT (backlog
+        // a4a527d1). Its packet stays open only until the marker rule
+        // completes its outcome step — 116 s for gate-run 90e7a8d8 on
+        // 2026-10-21, unbounded with the dispatcher down — and reusing it
+        // in that window refused every re-gate of the branch while
+        // `--withdraw` refused it too. It holds no request a re-gate could
+        // reattach to, so the re-gate files a fresh run beside it.
+        .filter(|j| unjudged_verdict(j).is_none())
         .find(|j| {
             let md = j.get("metadata").and_then(Value::as_object);
             let m = |k: &str| {
@@ -3400,35 +3808,292 @@ pub(crate) fn reusable_packet(open: &[Value], branch: &str, sha: &str) -> Option
         .map(str::to_string)
 }
 
-/// `git ls-remote` the branch so the packet records a real head.
-///
-/// Falls back to the symbolic `origin/<branch>` rather than failing:
-/// the runner resolves the branch itself, and a missing sha degrades
-/// the packet's record without stopping the gate. It is warned about,
-/// because a receipt is worth much less when nobody can say which tree
-/// it vouched for.
-pub(crate) fn resolve_sha(branch: &str) -> String {
-    let out = crate::git_auth::command()
-        .args(["ls-remote", "origin", &format!("refs/heads/{branch}")])
-        .output();
-    if let Some(sha) = out.ok().filter(|o| o.status.success()).and_then(|o| {
-        String::from_utf8_lossy(&o.stdout)
-            .split_whitespace()
-            .next()
-            .filter(|s| s.len() >= 7)
-            .map(str::to_string)
-    }) {
-        return sha;
+/// The verdicts a gate-run can record without judging the tree: the
+/// environment died (`lost`), the infrastructure refused before any
+/// check ran (`refused`), or the run was stood down before it ran
+/// (`withdrawn`) — each outcome step in gate-run.toml says so in its
+/// title. None of them is a red against the branch.
+pub(crate) const UNJUDGED_VERDICTS: [&str; 3] = ["lost", "refused", "withdrawn"];
+
+/// The verdict this gate-run has RECORDED — its verdict step completed —
+/// when that verdict is one of [`UNJUDGED_VERDICTS`]. A verdict merged
+/// onto a step not yet completed is not recorded: its writer has not
+/// finished, and the packet still owns its request.
+pub(crate) fn unjudged_verdict(packet: &Value) -> Option<&str> {
+    let step = crate::train::find_step(packet, "record-verdict", "Record the receipt");
+    if !crate::train::step_done(step) {
+        return None;
     }
+    step?
+        .pointer("/metadata/verdict")
+        .and_then(Value::as_str)
+        .filter(|v| UNJUDGED_VERDICTS.contains(v))
+}
+
+/// What the forge (`origin`, as seen from `repo`) answered about
+/// `refs/heads/<branch>` — a head, a clean absence, or no answer — read
+/// by the one reading `boss receipt` uses (`receipt::read_lookup`).
+pub(crate) fn look_up_forge_branch_in(repo: &Path, branch: &str) -> crate::receipt::BranchLookup {
+    let refname = format!("refs/heads/{branch}");
+    let ran = crate::git_auth::command()
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-remote", "origin", &refname])
+        .output();
+    crate::receipt::read_lookup(
+        &format!("git -C {} ls-remote origin {refname}", repo.display()),
+        &refname,
+        ran,
+    )
+}
+
+/// The forge as a refusal names it: `origin` and its URL, with any
+/// credential in the URL's userinfo left out — the sentence is printed
+/// to a terminal and quoted in transcripts. Just `origin` when the URL
+/// cannot be read.
+pub(crate) fn forge_named_in(repo: &Path) -> String {
+    crate::git_auth::command()
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|u| !u.is_empty())
+        .map_or_else(
+            || "origin".to_string(),
+            |u| format!("origin ({})", without_userinfo(&u)),
+        )
+}
+
+/// `scheme://user:pass@host/path` → `scheme://host/path`; anything
+/// without a `scheme://…@` authority is returned as given. The authority
+/// ends at the first `/`, `?` or `#` (RFC 3986 §3.2), so an `@` after a
+/// query or fragment is not read as userinfo: `http://a?@b/` connects to
+/// `a`, and reading it as `b` would let a forge comparison be steered
+/// (backlog 0ddc437f).
+fn without_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => url.to_string(),
+    }
+}
+
+/// The file that spells the estate's forge (`forge_url`), read from the
+/// launch tree as the runner manifest is (backlog 0ddc437f).
+pub(crate) const ESTATE_FILE: &str = "infra/estate/estate.toml";
+
+/// `forge_url` out of the estate file's text, read as TOML so a key that
+/// merely begins with the name is not taken for it. None when absent,
+/// empty or unparseable.
+pub(crate) fn estate_forge_url(estate_toml: &str) -> Option<String> {
+    toml::from_str::<toml::Table>(estate_toml)
+        .ok()?
+        .get("forge_url")?
+        .as_str()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether `url`, credential stripped, is the forge or a repository under
+/// it. The match ends at a `/` boundary, so a port or host that only
+/// BEGINS with the forge's (`:30001`, `:3000.mirror…`) is not the forge.
+fn on_the_forge(url: &str, forge: &str) -> bool {
+    let url = without_userinfo(url.trim());
+    let forge = without_userinfo(forge.trim());
+    let forge = forge.trim_end_matches('/');
+    !forge.is_empty() && (url == forge || url.starts_with(&format!("{forge}/")))
+}
+
+/// The refusal for a launch whose working directory's `origin` is not the
+/// estate's forge — or None when it is (backlog 0ddc437f).
+///
+/// WHY. The runner fetches every gated branch from the forge (FORGE_URL in
+/// infra/gate-runner/run.sh, held under `forge_url` by
+/// `the_runners_forge_is_under_the_estate_forge`), while this verb
+/// resolves the branch with `ls-remote origin` in the directory it is run
+/// from. A clone whose origin is a mirror, the conductor's working clone
+/// or a local path that HAS the branch therefore launched with no warning,
+/// the runner's fetch failed and the run was recorded lost — and the
+/// absent-branch refusal's `git push origin` advice pushed to the same
+/// wrong place. Both the fetch and the push url are judged: `git push
+/// origin` follows the push url. No origin, or no forge to compare it
+/// with (`forge` is `Err` with the reason), is refused rather than
+/// trusted, because then nothing says the runner can fetch the branch.
+pub(crate) fn origin_refusal(
+    fetch: Option<&str>,
+    push: Option<&str>,
+    forge: Result<&str, &str>,
+) -> Option<String> {
+    let forge = match forge {
+        Ok(forge) => forge,
+        Err(why) => {
+            return Some(format!(
+                "boss gate: REFUSED — the estate's forge could not be read from {ESTATE_FILE} \
+                 ({why}), so whether this working directory's origin is the host the runner \
+                 fetches from cannot be judged (backlog 0ddc437f).\n  Gate from the root of a \
+                 checkout of the forge, whose {ESTATE_FILE} spells forge_url. Nothing was filed \
+                 and no bay was taken."
+            ));
+        }
+    };
+    let forge_shown = without_userinfo(forge.trim());
+    let Some(fetch) = fetch.map(str::trim).filter(|u| !u.is_empty()) else {
+        return Some(format!(
+            "boss gate: REFUSED — this working directory has no origin remote git can read, \
+             and the runner fetches every gated branch from the forge, {forge_shown} \
+             (forge_url in {ESTATE_FILE}); nothing says the branch is there (backlog \
+             0ddc437f).\n  Gate from a clone of the forge: `git remote add origin <the \
+             repository under {forge_shown}>`, push the branch to it, then gate again. \
+             Nothing was filed and no bay was taken."
+        ));
+    };
+    // `git remote get-url --push` answers the fetch url when no push url
+    // is set, so an unread push url is judged as the fetch url.
+    let push = push
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .unwrap_or(fetch);
+    if on_the_forge(fetch, forge) && on_the_forge(push, forge) {
+        return None;
+    }
+    let (fetch_shown, push_shown) = (without_userinfo(fetch), without_userinfo(push));
+    let origin = if fetch_shown == push_shown {
+        format!("origin is {fetch_shown}")
+    } else {
+        format!("origin fetches from {fetch_shown} and pushes to {push_shown}")
+    };
+    Some(format!(
+        "boss gate: REFUSED — this working directory's origin is not the estate's forge. \
+         {origin}; the runner fetches every gated branch from the forge, {forge_shown} \
+         (forge_url in {ESTATE_FILE}), so a branch resolved through this origin can launch \
+         onto a runner whose fetch fails, and the run is recorded lost (backlog 0ddc437f).\n  \
+         Gate from a clone of the forge, or point this one at it — `git remote set-url origin \
+         <the repository under {forge_shown}>` (and `git remote set-url --push origin` if a \
+         push url is set) — push the branch there, then gate again. Nothing was filed and no \
+         bay was taken."
+    ))
+}
+
+/// [`origin_refusal`] read where a launch reads it: `repo`'s own estate
+/// file and its own `origin`, fetch and push url.
+pub(crate) fn forge_origin_refusal_in(repo: &Path) -> Option<String> {
+    let path = repo.join(ESTATE_FILE);
+    let forge = match std::fs::read_to_string(&path) {
+        Ok(text) => estate_forge_url(&text).ok_or_else(|| {
+            format!(
+                "{} spells no forge_url a TOML reader can find",
+                path.display()
+            )
+        }),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    };
+    let url = |push: bool| {
+        let mut cmd = crate::git_auth::command();
+        cmd.arg("-C").arg(repo).args(["remote", "get-url"]);
+        if push {
+            cmd.arg("--push");
+        }
+        cmd.arg("origin")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|u| !u.is_empty())
+    };
+    let (fetch, push) = (url(false), url(true));
+    origin_refusal(
+        fetch.as_deref(),
+        push.as_deref(),
+        forge.as_deref().map_err(String::as_str),
+    )
+}
+
+/// The head a launch records, judged from one forge lookup — or the
+/// refusal (backlog ec0ca63d).
+///
+/// THREE ANSWERS, NOT TWO. Until this, any lookup without a head fell
+/// back to the symbolic `origin/<branch>` "rather than failing". That
+/// fallback was written for a forge that could not be READ, and it also
+/// swallowed a forge that was read and does not HAVE the branch: gate-run
+/// 16a97558 (2026-10-11) launched on a branch that had never been pushed,
+/// its runner's fetch printed "couldn't find remote ref", and it was
+/// recorded `lost` — a submission error filed as an infrastructure death,
+/// in the lost count the estate reads. So:
+///
+/// - a head → launch at it (`Ok`, no note);
+/// - answered, no such head → REFUSED, naming the branch, the forge and
+///   the push that is missing — nothing is filed, no bay is taken;
+/// - no answer (forge unreachable, no `origin`) → the symbolic fallback is
+///   kept, because "cannot read" is not "absent" and a forge blip must not
+///   stop every launch — with a note saying which of the two happened and
+///   git's own reason.
+pub(crate) fn launch_head(
+    branch: &str,
+    forge: &str,
+    lookup: &crate::receipt::BranchLookup,
+) -> Result<(String, Option<String>), String> {
+    if let Some(head) = lookup.head.as_deref().filter(|h| !h.is_empty()) {
+        return Ok((head.to_string(), None));
+    }
+    if lookup.readable {
+        return Err(format!(
+            "boss gate: REFUSED — the forge has no branch {branch}. {forge} answered \
+             `git ls-remote` successfully and carries no refs/heads/{branch}, so a runner \
+             launched now could only fail its fetch and be recorded lost (backlog \
+             ec0ca63d; only that exact ref counts — a glob or a tail match is not the \
+             branch the runner fetches, 78d7a0c1).\n  The push is missing: `git push \
+             origin HEAD:{branch}` from the worktree that holds the commit — origin there is the forge, held to forge_url in \
+             {ESTATE_FILE} before this lookup (0ddc437f) — then gate again. Nothing was filed \
+             and no bay was taken."
+        ));
+    }
+    Ok((
+        format!("origin/{branch}"),
+        Some(format!(
+            "boss gate: the forge could not be READ for {branch} (not an absence: {forge} \
+             gave no answer — {}) — recording the symbolic ref origin/{branch}. The runner \
+             resolves the branch itself; the receipt will not name a head.",
+            lookup.said.as_deref().unwrap_or("no reason given")
+        )),
+    ))
+}
+
+/// `git ls-remote` the branch so a record carries a real head — for the
+/// verbs that READ a car's head (`boss park`, `boss rerail --finish`),
+/// which keep the symbolic `origin/<branch>` fallback for any lookup
+/// without a head and say which kind it was. `boss gate`'s launch does
+/// not come through here: it refuses an absent branch (`launch_head`).
+pub(crate) fn resolve_sha(branch: &str) -> String {
+    let here = Path::new(".");
+    let lookup = look_up_forge_branch_in(here, branch);
+    if let Some(head) = lookup.head.clone().filter(|h| !h.is_empty()) {
+        return head;
+    }
+    let forge = forge_named_in(here);
+    let why = if lookup.readable {
+        format!("{forge} answered and carries no refs/heads/{branch} — was it pushed?")
+    } else {
+        format!(
+            "{forge} could not be read: {}",
+            lookup.said.as_deref().unwrap_or("no reason given")
+        )
+    };
     eprintln!(
-        "boss gate: could not resolve {branch} via `git ls-remote origin` — recording the \
-         symbolic ref. The receipt will not name a head."
+        "boss gate: could not resolve {branch} on the forge ({why}) — recording the \
+         symbolic ref origin/{branch}. The receipt will not name a head."
     );
     format!("origin/{branch}")
 }
 
 pub(crate) fn kubectl(namespace: &str) -> std::process::Command {
-    let mut c = std::process::Command::new("kubectl");
+    let mut c = std::process::Command::new(crate::door_env::kubectl_program());
     c.args(["-n", namespace]);
     c
 }
@@ -3524,7 +4189,10 @@ fn job_pod_count(namespace: &str, job: &str) -> Result<usize> {
 /// cluster re-read until no Job carries the packet, because a delete's
 /// exit status is a claim and the absence is the effect; only then is
 /// the verdict written, through the same two writes every verdict takes
-/// ([`write_verdict`]); and the packet is read back closed.
+/// ([`write_verdict`]); and the packet is read back until it closes
+/// ([`read_back_withdrawal`]) — a closure still pending, a read that
+/// failed, and a packet with no `withdrawn` terminal each say which they
+/// are ([`withdrawal_readback_refusal`], backlog 7905cb5d).
 ///
 /// A WAITER STILL HOLDING THE PLACE is not stranded by this: its next
 /// poll finds the packet gone from the line, re-reads it, and stops on
@@ -3622,38 +4290,36 @@ pub async fn withdraw(
              written; the record says what the cluster says"
         );
     }
+    // The refusal is the server's own words, kept whole under this line.
+    // It advises no publish: the step's declared enum was read before any
+    // write (`withdraw_refusal`), and a publish moves no in-flight packet
+    // (backlog 7905cb5d).
     write_verdict(&http, &packet, &receipt)
         .await
         .with_context(|| {
             format!(
-                "the verdict write was refused. If the refusal names `withdrawn` as not allowed, \
-             the live gate-run protocol predates the terminal: it lands with `boss workflow \
-             publish gate-run` (v3, backlog 8d7d0a2b). Gate-run {short} is still open."
+                "the verdict write was refused — gate-run {short} was not closed by this door; \
+                 re-read it with `boss-api GET /api/jobs/{packet}` before acting"
             )
         })?;
-    let back = api(
+    // READ UNTIL IT CLOSES, not once (backlog 7905cb5d): the `withdrawn`
+    // outcome step completes a second or two AFTER the verdict step, so
+    // a read straight after the write sees the packet open.
+    let (last, reads) = read_back_withdrawal(
         &http,
-        reqwest::Method::GET,
-        &format!("/api/jobs/{packet}"),
-        None,
+        &jobs_base()?,
+        &packet,
+        WITHDRAW_READBACK_READS,
+        WITHDRAW_READBACK_EVERY,
     )
-    .await?
-    .ok_or_else(|| anyhow!("gate-run {packet} read-back returned no body"))?;
-    let status = back
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("?")
-        .to_string();
-    println!(
-        "boss gate: WITHDRAWN  (packet {short}, {branch}) — status {status}; because {because}"
-    );
-    if status != "closed" {
-        bail!(
-            "gate-run {short} recorded `withdrawn` but reads back {status}, not closed — the \
-             live protocol has no terminal for the word yet (`boss workflow publish \
-             gate-run`, v3)"
-        );
+    .await;
+    if let Some(why) = withdrawal_readback_refusal(short, &packet, &last, reads) {
+        bail!("{why}");
     }
+    println!(
+        "boss gate: WITHDRAWN  (packet {short}, {branch}) — status closed after {reads} \
+         read(s); because {because}"
+    );
     Ok(())
 }
 
@@ -3717,11 +4383,7 @@ pub async fn run(
     // arrival, so it never passes through `boss prove`'s own
     // warning. Say it here instead, while the flag is still being
     // typed (421b3032).
-    if let Some(w) = park
-        .expect
-        .as_deref()
-        .and_then(crate::prove::bare_number_warning)
-    {
+    if let Some(w) = park.expect_warning() {
         eprintln!("{w}");
     }
     // And the SHAPE warnings on the probe itself, said here for the
@@ -3758,6 +4420,41 @@ pub async fn run(
     if let Some(w) = no_run_warning(!park.is_empty(), agent_run.as_ref()) {
         eprintln!("{w}");
     }
+    // A BRANCH THE FORGE DOES NOT HAVE IS NOT GATED (backlog ec0ca63d).
+    // One `ls-remote`, read before the system of record is asked anything:
+    // a branch never pushed is refused here, before a packet is filed or
+    // reused and before a bay is taken, rather than launched onto a
+    // runner whose fetch can only fail and is recorded `lost`. A forge
+    // that cannot be READ keeps the symbolic fallback, said as such. The
+    // base read below (`freshness::observe`) fetches the same branch, and
+    // now only ever fetches one the forge just said it has.
+    //
+    // "The forge" is `origin` of this directory only once origin IS the
+    // estate's forge (backlog 0ddc437f): a mirror, the conductor's clone
+    // or a local path holding the branch would answer the lookup below
+    // and launch a runner that fetches from the forge and fails. Judged
+    // first, before the lookup, the packet and the bay.
+    if let Some(why) = forge_origin_refusal_in(Path::new(".")) {
+        bail!("{why}");
+    }
+    let mut sha = {
+        let here = Path::new(".");
+        let lookup = look_up_forge_branch_in(here, branch);
+        let forge = if lookup.head.is_some() {
+            String::new()
+        } else {
+            forge_named_in(here)
+        };
+        match launch_head(branch, &forge, &lookup) {
+            Ok((sha, note)) => {
+                if let Some(note) = note {
+                    eprintln!("{note}");
+                }
+                sha
+            }
+            Err(why) => bail!("{why}"),
+        }
+    };
     let http = crate::sor_client::machine_client()?;
     let ownership_policy = if dry {
         None
@@ -3900,7 +4597,6 @@ pub async fn run(
     // Fetched here, before the packet, so a bad env override refuses
     // without side effects — the policy read never fails, it falls back.
     let max = max_concurrent(&http).await?;
-    let mut sha = resolve_sha(branch);
     // Read against the tip just resolved, which is the tree the car
     // carries; a sha this clone does not have reads as nothing, and the
     // warning is simply not said (8ac42ee5).
@@ -3917,6 +4613,7 @@ pub async fn run(
         landed.as_ref(),
         force_regate.as_deref(),
         &park,
+        &mode,
     ) {
         LandedGuard::Proceed => {}
         LandedGuard::Forced(note) => println!("{note}"),
@@ -4288,6 +4985,32 @@ pub async fn run(
                 println!("boss gate: DRY would file a gate-run packet for {branch}@{sha}");
                 "dry-run-packet".to_string()
             } else {
+                // A SECOND LAUNCH FOR THIS HEAD ATTACHES (backlog 39fd6363).
+                // `reuse` was decided off a read taken before the rebase,
+                // the guards and admission — several round trips ago — so
+                // a launch of the same branch@sha started in that window
+                // read the same empty answer, and both filed: 6f84f4f2
+                // and 2c0cc70a, 0.93 s apart. Read again here, as the last
+                // read before the POST, and follow a run filed meanwhile
+                // rather than spend a second bay. This narrows the window
+                // to one round trip; it does not close it.
+                let filed_meanwhile = rows(
+                    api(
+                        &http,
+                        reqwest::Method::GET,
+                        "/api/jobs?kind=gate-run&status=open&limit=100&full=true",
+                        None,
+                    )
+                    .await?,
+                )?;
+                if let Some(id) = reusable_packet(&filed_meanwhile, branch, &sha) {
+                    println!("{}", second_launch_line(&id, branch, &sha));
+                    return if wait {
+                        reservation::observe(&http, &id).await
+                    } else {
+                        Ok(())
+                    };
+                }
                 let owner = crate::owner::for_filing_at(&jobs_base()?).await;
                 let mut body = gate_run_body(
                     branch,
@@ -4303,6 +5026,7 @@ pub async fn run(
                 if let Some(md) = body.get_mut("metadata").and_then(Value::as_object_mut) {
                     md.extend(crate::channels::tier_stamps_for(branch));
                 }
+                let body = born_with_run(body, agent_run.as_ref());
                 let created = api(&http, reqwest::Method::POST, "/api/jobs", Some(body)).await?;
                 created
                     .as_ref()
@@ -4444,7 +5168,11 @@ pub async fn run(
     // `backlog_item` rides). A merging PATCH like the base and the
     // re-gate relationship, and BEST EFFORT for the same reason: this
     // is a record — the run is completed by hand if it is lost — and
-    // losing it to a rolling SoR must not cost the gate.
+    // losing it to a rolling SoR must not cost the gate. On a packet this
+    // call created it restates the create body (`born_with_run`); on a
+    // REUSED packet it is the only binding, and since aaf5cafa that lands
+    // the run on green but does not count as the run's progress against
+    // the silence clock — only a birth does.
     if let Some(patch) = agent_run.clone().filter(|_| !dry) {
         match api(
             &http,
@@ -4543,95 +5271,128 @@ pub async fn run(
     // retry loop five builders wrote by hand on 2026-09-08, with the
     // order kept by the system of record rather than by whoever polled
     // first, and with no way to outlive the session that made it.
-    if queued && !dry {
-        if let Err(e) = api(
-            &http,
-            reqwest::Method::PATCH,
-            &format!("/api/jobs/{packet}/metadata"),
-            Some(queue_place_patch(now)),
-        )
-        .await
-        .context("taking a place in the gate queue")
-        {
-            if should_close_on_park_failure(reused, dry) {
-                close_refused(&http, &packet, &format!("{e:#}")).await;
+    //
+    // A LOOP, because the bay is taken only at the create (backlog
+    // ac8d3157): admission read a free bay, and another launcher may take
+    // it in the seconds before this one's Job exists. A `--wait` gate that
+    // loses that race takes its place in the line again — the oldest in
+    // it, by its first stamp — rather than failing the builder; a gate
+    // without `--wait` is refused, as it is at the bound.
+    //
+    // ONE CLOCK FOR THE WAIT AND THE CLAIM (backlog fc788e84). Every pass
+    // dates what it writes and judges from `now` carried forward by this
+    // verb's own monotonic time, never the bare `now`: a waiter handed its
+    // start time read a claim another launcher took after it began as
+    // younger than zero, so a claim that never got its gate Job held the
+    // bay for as long as the waiter lived, and a second pass's heartbeat
+    // was stamped as old as the first. The place keeps its first stamp —
+    // `now` — so the line still orders it by when it joined.
+    let mut queued = queued;
+    let created = loop {
+        if queued && !dry {
+            let waited_from = carried_forward(now, verb_started.elapsed());
+            if let Err(e) = api(
+                &http,
+                reqwest::Method::PATCH,
+                &format!("/api/jobs/{packet}/metadata"),
+                Some(queue_place_patch(now, waited_from)),
+            )
+            .await
+            .context("taking a place in the gate queue")
+            {
+                if should_close_on_park_failure(reused, dry) {
+                    close_refused(&http, &packet, &format!("{e:#}")).await;
+                }
+                return Err(e);
             }
-            return Err(e);
+            println!("{}", queued_line(&packet, branch, ahead, ahead + 1, max));
+            if let Slot::Gating(name) =
+                wait_for_slot(&http, &packet, branch, namespace, max, waited_from).await?
+            {
+                println!("boss gate: packet {packet} was launched as {name} while it waited");
+                return wait_for_verdict(&http, &packet, namespace, &name, now).await;
+            }
         }
-        println!("{}", queued_line(&packet, branch, ahead, ahead + 1, max));
-        if let Slot::Gating(name) =
-            wait_for_slot(&http, &packet, branch, namespace, max, now).await?
-        {
-            println!("boss gate: packet {packet} was launched as {name} while it waited");
-            return wait_for_verdict(&http, &packet, namespace, &name, now).await;
+        // The place is spent the moment a Job exists, and a run still
+        // marked queued would be missing from the yard's gate bays and
+        // listed by orient as abandoned. Cleared BEFORE the Job is created:
+        // a failure here costs nothing (the place is still held, the packet
+        // still reusable), where a failure after it would hide a running
+        // gate. Owed by a reused packet too, whoever queued it (33e49b7d).
+        if let Some(release) = launch_queue_release(queued, reused).filter(|_| !dry) {
+            api(
+                &http,
+                reqwest::Method::PATCH,
+                &format!("/api/jobs/{packet}/metadata"),
+                Some(release),
+            )
+            .await
+            .context("releasing the queue place before launching")?;
         }
-    }
-    // The place is spent the moment a Job exists, and a run still
-    // marked queued would be missing from the yard's gate bays and
-    // listed by orient as abandoned. Cleared BEFORE the Job is created:
-    // a failure here costs nothing (the place is still held, the packet
-    // still reusable), where a failure after it would hide a running
-    // gate. Owed by a reused packet too, whoever queued it (33e49b7d).
-    if let Some(release) = launch_queue_release(queued, reused).filter(|_| !dry) {
-        api(
+
+        let job = render_job(&manifest_text, branch, &packet, &mode)?;
+
+        if dry {
+            if queued {
+                println!(
+                    "boss gate: DRY the node is at the bound — this would QUEUE at place {} of {}",
+                    ahead + 1,
+                    ahead + 1
+                );
+            }
+            println!("boss gate: DRY would create a Job for {branch} (packet {packet})");
+            return Ok(());
+        }
+
+        // THE PACKET IS STILL OURS TO LAUNCH ONTO — re-read, not assumed
+        // (b24e29cb item 1). The `launching_at` stamp above narrows the
+        // conductor's orphan settle but cannot close it: a reconcile that
+        // judged this packet before the stamp landed still writes `lost`, and
+        // nothing makes that write and this create one act (76d41004). Read
+        // here, as late as the create allows, that write has already landed,
+        // so it is seen rather than raced. FAILS CLOSED: a packet this verb
+        // cannot read is not launched onto blind — the one it just filed is
+        // closed as refused, a reused one stays for the next invocation.
+        let target = api(
             &http,
-            reqwest::Method::PATCH,
-            &format!("/api/jobs/{packet}/metadata"),
-            Some(release),
+            reqwest::Method::GET,
+            &format!("/api/jobs/{packet}"),
+            None,
         )
         .await
-        .context("releasing the queue place before launching")?;
-    }
-
-    let job = render_job(&manifest_text, branch, &packet, &mode)?;
-
-    if dry {
-        if queued {
-            println!(
-                "boss gate: DRY the node is at the bound — this would QUEUE at place {} of {}",
-                ahead + 1,
-                ahead + 1
-            );
+        .and_then(|v| v.context("the jobs api returned no body for the gate-run packet"))
+        .context("re-reading the gate-run packet before creating its Job");
+        let refusal = match &target {
+            Ok(job) => launch_target_refusal(&packet, job),
+            Err(e) => Some(format!("{e:#}")),
+        };
+        if let Some(why) = refusal {
+            if target.is_err() && should_close_on_park_failure(reused, dry) {
+                close_refused(&http, &packet, &why).await;
+            }
+            bail!("{why}");
         }
-        println!("boss gate: DRY would create a Job for {branch} (packet {packet})");
-        return Ok(());
-    }
 
-    // THE PACKET IS STILL OURS TO LAUNCH ONTO — re-read, not assumed
-    // (b24e29cb item 1). The `launching_at` stamp above narrows the
-    // conductor's orphan settle but cannot close it: a reconcile that
-    // judged this packet before the stamp landed still writes `lost`, and
-    // nothing makes that write and this create one act (76d41004). Read
-    // here, as late as the create allows, that write has already landed,
-    // so it is seen rather than raced. FAILS CLOSED: a packet this verb
-    // cannot read is not launched onto blind — the one it just filed is
-    // closed as refused, a reused one stays for the next invocation.
-    let target = api(
-        &http,
-        reqwest::Method::GET,
-        &format!("/api/jobs/{packet}"),
-        None,
-    )
-    .await
-    .and_then(|v| v.context("the jobs api returned no body for the gate-run packet"))
-    .context("re-reading the gate-run packet before creating its Job");
-    let refusal = match &target {
-        Ok(job) => launch_target_refusal(&packet, job),
-        Err(e) => Some(format!("{e:#}")),
+        // The instance's edit level, read here by the holder of the token
+        // and handed to the Job, so the pod that runs the branch makes no
+        // request for it (backlog 934ccad1).
+        let job = hand_edit_level(&job, edit_level_answer(&http).await.as_ref());
+
+        let claimed_at = carried_forward(now, verb_started.elapsed());
+        match reservation::launch(&http, &packet, namespace, &sha, &mode, &job, claimed_at).await {
+            Ok(created) => break created,
+            Err(e) if wait && no_gate_bay(&e) => {
+                println!("boss gate: {e:#} — back to the line, holding the place it had");
+                queued = true;
+            }
+            Err(e) => {
+                if no_gate_bay(&e) && should_close_on_park_failure(reused, dry) {
+                    close_refused(&http, &packet, &format!("{e:#}")).await;
+                }
+                return Err(e);
+            }
+        }
     };
-    if let Some(why) = refusal {
-        if target.is_err() && should_close_on_park_failure(reused, dry) {
-            close_refused(&http, &packet, &why).await;
-        }
-        bail!("{why}");
-    }
-
-    // The instance's edit level, read here by the holder of the token
-    // and handed to the Job, so the pod that runs the branch makes no
-    // request for it (backlog 934ccad1).
-    let job = hand_edit_level(&job, edit_level_answer(&http).await.as_ref());
-
-    let created = reservation::launch(&http, &packet, namespace, &sha, &mode, &job, now).await?;
     println!("boss gate: {created}");
     println!("boss gate: packet {packet}  branch {branch}@{sha}");
     // THE RUN BEGINS NOW, and the packet says so (backlog 4d088a7e): the
@@ -4978,7 +5739,7 @@ pub(crate) fn silent_packet_verdict(job_finished: bool, job_failed: bool) -> Opt
              record its verdict (exit 75 — the `gate-runner: UNREPORTED verdict=…` line), \
              and the code may well have passed. The workspace was per-run and died with the \
              pod, so the surviving copy of the receipt is the pod log — `kubectl logs \
-             job/<job>` (the `gate-runner: receipt` line), kept for a day after the Job \
+             job/<job> -c gate` (the `gate-runner: receipt` line), kept for a day after the Job \
              ends. Read it rather than re-running 40 minutes of gate on the assumption this \
              was a failure."
                 .to_string(),
@@ -4986,7 +5747,7 @@ pub(crate) fn silent_packet_verdict(job_finished: bool, job_failed: bool) -> Opt
     }
     Some(
         "the gate Job finished but the packet never reported a verdict.\n           The run completed and echoed its receipt to stdout before reporting, so \
-         `kubectl logs job/<job>` (the `gate-runner: receipt` line) holds the answer; \
+         `kubectl logs job/<job> -c gate` (the `gate-runner: receipt` line) holds the answer; \
          the reporting call is what went missing."
             .to_string(),
     )
@@ -5586,7 +6347,11 @@ async fn wait_for_slot(
         if let Some(name) = existing_gate_for_packet(namespace, packet)? {
             return Ok(Slot::Gating(name));
         }
-        let order = queue_order(&open, at, QUEUE_PLACE_TTL_SECS);
+        // ONE LINE, BOTH OWNERS (backlog b56bfc29): a resident place
+        // accepted before this one is ahead of it, at the instant the
+        // resident supervisor orders by.
+        let residents = reservation::resident_places(http, &open, namespace).await?;
+        let order = mixed_line(&queue_places(&open, at, QUEUE_PLACE_TTL_SECS), &residents);
         let live = running_gates(namespace)?;
         // The dock's claims go before the whole line (design 42279fb2
         // D3). Said once each time the count changes, so a place that
@@ -5686,7 +6451,7 @@ async fn wait_for_slot(
                     http,
                     reqwest::Method::PATCH,
                     &format!("/api/jobs/{packet}/metadata"),
-                    Some(queue_place_patch(at)),
+                    Some(queue_place_patch(at, at)),
                 )
                 .await?;
                 reported = None;
@@ -5867,6 +6632,363 @@ fn job_names(table: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// A forge (a repository with one commit on `main`) and a clone of it
+    /// whose `origin` is that forge — no network: the forge is a path.
+    /// Returns the clone, the forge's path and main's head.
+    fn forge_and_clone(name: &str) -> (std::path::PathBuf, String, String) {
+        let root = boss_testing::scratch::scratch_dir(name);
+        let forge = root.join("forge");
+        let clone = root.join("clone");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let f = forge.to_str().unwrap();
+        git(&["init", "-q", "-b", "main", f]);
+        git(&[
+            "-C",
+            f,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "t",
+        ]);
+        let head = git(&["-C", f, "rev-parse", "HEAD"]);
+        git(&["clone", "-q", f, clone.to_str().unwrap()]);
+        (clone, f.to_string(), head)
+    }
+
+    /// Backlog ec0ca63d. Gate-run 16a97558 (2026-10-11) was launched on a
+    /// branch never pushed: `resolve_sha` read the forge's clean "no such
+    /// head" as a failed lookup, recorded the symbolic `origin/<branch>`,
+    /// and the runner died on "couldn't find remote ref" — recorded LOST.
+    /// A forge that ANSWERED without the branch now refuses the launch,
+    /// naming the branch, the forge and the missing push.
+    #[test]
+    fn a_branch_the_forge_does_not_have_is_refused_at_launch() {
+        let (clone, forge_path, _) = forge_and_clone("gate-forge-absent");
+        let branch = "fix/ec0ca63d-never-pushed";
+        let lookup = look_up_forge_branch_in(&clone, branch);
+        assert!(lookup.readable, "the forge answered: {lookup:?}");
+        assert_eq!(lookup.head, None);
+        let forge = forge_named_in(&clone);
+        assert!(forge.contains(&forge_path), "names the forge: {forge}");
+        let why = launch_head(branch, &forge, &lookup).expect_err("an absent branch is refused");
+        assert!(why.contains("REFUSED"), "{why}");
+        assert!(why.contains(&format!("no branch {branch}")), "{why}");
+        assert!(why.contains(&forge_path), "names the forge it asked: {why}");
+        assert!(
+            why.contains(&format!("git push origin HEAD:{branch}")),
+            "names the push that is missing: {why}"
+        );
+    }
+
+    /// Backlog 78d7a0c1 (reviewer run db548695 of car 23b6cb6a). `git
+    /// ls-remote origin refs/heads/<name>` matches the pattern as a glob
+    /// and against a ref's TAIL, so on a forge holding `fix/real-one` and
+    /// `other/refs/heads/ghost` the names `fix/real-*` and `ghost` both
+    /// came back with a head and launched; the runner fetches
+    /// `refs/heads/<name>` exactly and the run was recorded lost. Neither
+    /// is the forge's branch, so each is refused at launch like any
+    /// branch the forge lacks — before a packet is filed (the ordering is
+    /// pinned by `run_judges_the_launch_head_before_any_sor_client`).
+    #[test]
+    fn a_glob_or_tail_matched_name_is_refused_at_launch() {
+        let (clone, forge_path, head) = forge_and_clone("gate-forge-exact");
+        for branch in ["fix/real-one", "other/refs/heads/ghost"] {
+            let ok = std::process::Command::new("git")
+                .args(["-C", &forge_path, "branch", branch])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git branch {branch}");
+        }
+        for name in ["fix/real-*", "ghost"] {
+            let lookup = look_up_forge_branch_in(&clone, name);
+            assert!(lookup.readable, "the forge answered: {lookup:?}");
+            let why = launch_head(name, &forge_named_in(&clone), &lookup)
+                .expect_err("a name that is not the forge's branch is refused");
+            assert!(why.contains(&format!("no branch {name}")), "{why}");
+        }
+        let lookup = look_up_forge_branch_in(&clone, "fix/real-one");
+        assert_eq!(
+            launch_head("fix/real-one", "origin", &lookup),
+            Ok((head, None)),
+            "the exact name still launches"
+        );
+    }
+
+    /// The refusal above only protects a launch that consults it, before
+    /// anything is filed: putting `let mut sha = resolve_sha(branch);`
+    /// back into `run` kept every other test and the probe green
+    /// (backlog 78d7a0c1). So `run`'s submission path judges the head
+    /// through `launch_head` BEFORE its first system-of-record client —
+    /// the earlier client is the packet-handle reader, which returns.
+    #[test]
+    fn run_judges_the_launch_head_before_any_sor_client() {
+        let src = include_str!("gate.rs");
+        let body = &src[src.find("pub async fn run(").expect("fn run")..];
+        // `\x7d` is the closing brace at column 0 that ends `run`, spelled
+        // escaped: a bare one in a literal unbalances the brace count the
+        // no-wallclock lint uses to bound this `#[cfg(test)]` module.
+        let body = &body[..body.find("\n\x7d\n").expect("end of fn run")];
+        let reader = "return reservation::observe(&http, branch).await;";
+        let submission = &body[body.find(reader).expect("the packet-handle reader")..];
+        let judged = submission
+            .find("launch_head(branch,")
+            .expect("run judges the head through launch_head");
+        let client = submission
+            .find("crate::sor_client::machine_client()")
+            .expect("the submission's client");
+        assert!(judged < client, "launch_head precedes the first SoR client");
+        assert!(
+            !body.contains("resolve_sha("),
+            "the launch does not take the fallback reader"
+        );
+    }
+
+    /// THE CONTROL: a branch the forge carries launches at its head, with
+    /// nothing said.
+    #[test]
+    fn a_branch_the_forge_has_launches_at_its_head() {
+        let (clone, _, head) = forge_and_clone("gate-forge-present");
+        let lookup = look_up_forge_branch_in(&clone, "main");
+        assert_eq!(launch_head("main", "origin", &lookup), Ok((head, None)));
+    }
+
+    /// A forge that cannot be READ is not a forge without the branch: the
+    /// symbolic fallback stays (a forge blip must not stop every launch),
+    /// and the note says it was unreadable and carries git's own reason.
+    #[test]
+    fn an_unreadable_forge_keeps_the_symbolic_fallback_and_says_which() {
+        let (clone, forge_path, _) = forge_and_clone("gate-forge-unreadable");
+        let gone = format!("{forge_path}-gone");
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&clone)
+            .args(["remote", "set-url", "origin", &gone])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let lookup = look_up_forge_branch_in(&clone, "fix/x");
+        assert!(!lookup.readable, "{lookup:?}");
+        let said = lookup.said.clone().expect("git's reason is carried");
+        let forge = forge_named_in(&clone);
+        let (sha, note) = launch_head("fix/x", &forge, &lookup).expect("not refused");
+        assert_eq!(sha, "origin/fix/x");
+        let note = note.expect("the fallback is said");
+        assert!(note.contains("could not be READ"), "{note}");
+        assert!(note.contains("not an absence"), "{note}");
+        assert!(note.contains(&said), "carries git's reason: {note}");
+        assert!(note.contains(&gone), "names the forge it asked: {note}");
+    }
+
+    /// The refusal is printed and quoted in transcripts, so a credential
+    /// in the remote URL's userinfo never rides in it.
+    #[test]
+    fn a_forge_is_named_without_its_credentials() {
+        assert_eq!(
+            // `user:pass` is the no-secrets lint's own stand-in for a
+            // URL's userinfo shape; a literal value here would be refused.
+            without_userinfo("http://user:pass@10.20.0.15:3000/david/boss.git"),
+            "http://10.20.0.15:3000/david/boss.git"
+        );
+        assert_eq!(
+            without_userinfo("http://10.20.0.15:3000/david/boss.git"),
+            "http://10.20.0.15:3000/david/boss.git"
+        );
+        assert_eq!(without_userinfo("/srv/forge"), "/srv/forge");
+        assert_eq!(
+            without_userinfo("git@host:david/boss.git"),
+            "git@host:david/boss.git"
+        );
+    }
+
+    /// Backlog 0ddc437f (review db548695 of car 23b6cb6a). The runner
+    /// fetches every gated branch from the forge, but the launch asked
+    /// `origin` of the working directory — so a clone whose origin is a
+    /// mirror, the conductor's working clone or a local path that HAS the
+    /// branch launched a gate whose fetch could only fail. An origin that
+    /// is not the estate's forge is refused, naming both.
+    #[test]
+    fn an_origin_that_is_not_the_estate_forge_is_refused_naming_both() {
+        let forge = "http://forge.example.test:3000";
+        // The forge's own repository, with or without a credential in it.
+        for ok in [
+            "http://forge.example.test:3000/david/boss.git",
+            // `user:pass` is the no-secrets lint's stand-in for userinfo.
+            "http://user:pass@forge.example.test:3000/david/boss.git",
+            "http://forge.example.test:3000/",
+        ] {
+            assert_eq!(origin_refusal(Some(ok), Some(ok), Ok(forge)), None, "{ok}");
+        }
+        for (origin, shape) in [
+            ("http://mirror.example.test/david/boss.git", "a mirror"),
+            ("/work/boss", "a local path"),
+            (
+                "git@forge.example.test:david/boss.git",
+                "the forge's host by another transport",
+            ),
+            (
+                "http://forge.example.test:30001/david/boss.git",
+                "a port that only begins with the forge's",
+            ),
+            (
+                "http://forge.example.test:3000.mirror.example.test/david/boss.git",
+                "a host that only begins with the forge's",
+            ),
+            (
+                "http://mirror.example.test?@forge.example.test:3000/david/boss.git",
+                "the forge after a query, where git connects to the mirror",
+            ),
+            (
+                "http://mirror.example.test#@forge.example.test:3000/david/boss.git",
+                "the forge after a fragment, where git connects to the mirror",
+            ),
+        ] {
+            let why = origin_refusal(Some(origin), Some(origin), Ok(forge))
+                .unwrap_or_else(|| panic!("{shape} is refused: {origin}"));
+            assert!(why.contains("REFUSED"), "{shape}: {why}");
+            assert!(why.contains(forge), "names the forge: {why}");
+            assert!(
+                why.contains(&without_userinfo(origin)),
+                "names the origin: {why}"
+            );
+            assert!(
+                why.contains(ESTATE_FILE),
+                "names where the forge is read: {why}"
+            );
+            assert!(why.contains("Nothing was filed"), "{why}");
+        }
+    }
+
+    /// The refusal is printed and quoted in transcripts: the origin's
+    /// credential never rides in it.
+    #[test]
+    fn the_origin_refusal_carries_no_credential() {
+        let origin = "http://user:pass@mirror.example.test/david/boss.git";
+        let why = origin_refusal(
+            Some(origin),
+            Some(origin),
+            Ok("http://forge.example.test:3000"),
+        )
+        .expect("a mirror is refused");
+        assert!(!why.contains("user:pass"), "{why}");
+        assert!(
+            why.contains("http://mirror.example.test/david/boss.git"),
+            "{why}"
+        );
+    }
+
+    /// `git push origin` follows the PUSH url, so an origin that fetches
+    /// from the forge and pushes to a mirror would send the refusal's own
+    /// advice to the wrong host.
+    #[test]
+    fn an_origin_that_pushes_somewhere_else_is_refused() {
+        let fetch = "http://forge.example.test:3000/david/boss.git";
+        let push = "http://mirror.example.test/david/boss.git";
+        let why = origin_refusal(
+            Some(fetch),
+            Some(push),
+            Ok("http://forge.example.test:3000"),
+        )
+        .expect("a push url off the forge is refused");
+        assert!(why.contains(push), "{why}");
+    }
+
+    /// No origin, or no forge to compare it with, is refused rather than
+    /// trusted: either way nothing says the runner can fetch the branch.
+    #[test]
+    fn no_origin_or_no_estate_forge_is_refused_not_trusted() {
+        let why = origin_refusal(None, None, Ok("http://forge.example.test:3000"))
+            .expect("no origin is refused");
+        assert!(why.contains("no origin"), "{why}");
+        let fetch = "http://forge.example.test:3000/david/boss.git";
+        let why = origin_refusal(Some(fetch), Some(fetch), Err("it spells no forge_url"))
+            .expect("an unknown forge is refused");
+        assert!(why.contains("it spells no forge_url"), "{why}");
+        assert!(why.contains(ESTATE_FILE), "{why}");
+    }
+
+    /// `forge_url` is read as TOML, so a neighbouring key that merely
+    /// begins with the name is not mistaken for it.
+    #[test]
+    fn the_estate_forge_is_the_forge_url_key_and_nothing_else() {
+        assert_eq!(
+            estate_forge_url("forge_url = \"http://forge.example.test:3000\"\n"),
+            Some("http://forge.example.test:3000".to_string())
+        );
+        assert_eq!(estate_forge_url("forge_url_old = \"http://old\"\n"), None);
+        assert_eq!(estate_forge_url("forge_url = \"\"\n"), None);
+        assert_eq!(estate_forge_url("forge_url = ["), None);
+    }
+
+    /// THE FACT THAT LIVES TWICE (CLAUDE.md 9a). The runner's FORGE_URL
+    /// default is spelled in run.sh and bootstrap.sh, the forge in
+    /// estate.toml; if they part, every launch is refused or every runner
+    /// fetches from a host the launch never asked. Held equal here.
+    #[test]
+    fn the_runners_forge_is_under_the_estate_forge() {
+        let root = boss_testing::repo_root();
+        let estate = std::fs::read_to_string(root.join(ESTATE_FILE)).unwrap();
+        let forge = estate_forge_url(&estate).expect("estate.toml spells forge_url");
+        for script in ["infra/gate-runner/run.sh", "infra/gate-runner/bootstrap.sh"] {
+            let text = std::fs::read_to_string(root.join(script)).unwrap();
+            let default = text
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("FORGE_URL=\"${FORGE_URL:-"))
+                .and_then(|rest| rest.strip_suffix("}\""))
+                .unwrap_or_else(|| panic!("{script} spells a FORGE_URL default"));
+            assert_eq!(
+                origin_refusal(Some(default), Some(default), Ok(&forge)),
+                None,
+                "{script}'s FORGE_URL default {default} is not under {ESTATE_FILE}'s forge_url {forge}"
+            );
+        }
+    }
+
+    /// The same judgement read where a launch reads it: the working
+    /// directory's own `origin` (fetch and push url) and its own
+    /// estate file. The control first — an estate naming the clone's real
+    /// origin launches — then the estate's forge moved elsewhere, then no
+    /// estate file at all.
+    #[test]
+    fn a_clone_whose_origin_is_not_its_estate_forge_is_refused() {
+        let (clone, forge_path, _) = forge_and_clone("gate-origin-not-the-forge");
+        let estate = clone.join(ESTATE_FILE);
+        std::fs::create_dir_all(estate.parent().unwrap()).unwrap();
+        std::fs::write(&estate, format!("forge_url = \"{forge_path}\"\n")).unwrap();
+        assert_eq!(
+            forge_origin_refusal_in(&clone),
+            None,
+            "the control launches"
+        );
+        std::fs::write(&estate, "forge_url = \"http://forge.example.test:3000\"\n").unwrap();
+        let why = forge_origin_refusal_in(&clone).expect("an origin off the forge is refused");
+        assert!(why.contains(&forge_path), "names the origin: {why}");
+        assert!(
+            why.contains("http://forge.example.test:3000"),
+            "names the forge: {why}"
+        );
+        std::fs::remove_file(&estate).unwrap();
+        let why = forge_origin_refusal_in(&clone).expect("no estate file is refused");
+        assert!(why.contains(ESTATE_FILE), "{why}");
+    }
+
     /// Backlog b24e29cb item 1. The conductor settles an orphan with no
     /// atomic claim on the packet, so a reused packet can be closed
     /// `lost` in the gap between this verb's `launching_at` stamp and its
@@ -5952,9 +7074,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("{needle:?} is not in fn run"))
         };
         let refused = at("reservation::launch(&http, &packet,");
+        // Only a created Job leaves the launch loop; every refusal returns
+        // or, for a lost bay under --wait, goes back to the line (ac8d3157).
         assert!(
             body[refused..].starts_with(
-                "reservation::launch(&http, &packet, namespace, &sha, &mode, &job, now).await?;"
+                "reservation::launch(&http, &packet, namespace, &sha, &mode, &job, claimed_at).await {\n            Ok(created) => break created,"
             ),
             "a failed protected sender must return before the launched stamp"
         );
@@ -5962,6 +7086,45 @@ mod tests {
         let waited = at("wait_for_verdict(&http, &packet, namespace, &job_name, now)");
         assert!(refused < stamped, "only a created Job is stamped launched");
         assert!(stamped < waited, "and it is stamped before the wait");
+    }
+
+    /// ONE CLOCK FOR THE WAIT AND THE CLAIM (backlog fc788e84). The launch
+    /// loop handed `reservation::launch` and every `wait_for_slot` the
+    /// verb's ORIGINAL `now`, so a claim another launcher took after this
+    /// waiter started read as negative age and never crossed its grace,
+    /// and a second wait's heartbeat was stamped as old as the first.
+    /// Every clock the loop hands on is `now` carried forward by the
+    /// verb's own monotonic time — read off the loop itself, because the
+    /// call sites are where the frozen clock lived. The claim it frees is
+    /// pinned in `bay`'s tests.
+    #[test]
+    fn the_launch_loop_waits_and_claims_on_the_clock_it_has_reached() {
+        let src = include_str!("gate.rs");
+        let start = src
+            .find("    let created = loop {")
+            .expect("the launch loop");
+        let end = start + src[start..].find("\n    };\n").expect("its end");
+        let body = &src[start..end];
+        for call in [
+            "let waited_from = carried_forward(now, verb_started.elapsed());",
+            "Some(queue_place_patch(now, waited_from)),",
+            "wait_for_slot(&http, &packet, branch, namespace, max, waited_from).await?",
+            "let claimed_at = carried_forward(now, verb_started.elapsed());\n        match reservation::launch(&http, &packet, namespace, &sha, &mode, &job, claimed_at).await {",
+        ] {
+            assert!(
+                body.contains(call),
+                "the loop does not carry its clock: {call:?}"
+            );
+        }
+        assert!(
+            !body.contains("&job, now)") && !body.contains("max, now)"),
+            "a frozen clock is still handed on in the launch loop"
+        );
+        let base = at("2026-10-19T01:00:00Z");
+        assert_eq!(
+            carried_forward(base, std::time::Duration::from_secs(661)),
+            at("2026-10-19T01:11:01Z")
+        );
     }
 
     /// A PARK-INTENT GATE ON A TRUST-BOUNDARY ITEM CARRIES --hold (backlog
@@ -6424,6 +7587,7 @@ mod tests {
             Some(&l),
             None,
             &ParkIntent::default(),
+            "",
         ) {
             LandedGuard::Refuse(why) => {
                 assert!(why.contains("fix/boot@a56b4a9"), "{why}");
@@ -6447,13 +7611,85 @@ mod tests {
             Some(&l),
             Some("closing dead gate-run 57f49a80"),
             &ParkIntent::default(),
+            "",
         ) {
             LandedGuard::Forced(note) => assert!(note.contains("57f49a80"), "{note}"),
             other => panic!("a reasoned force gates: {other:?}"),
         }
-        match landed_guard("fix/boot", "a56b4a9", Some(&l), Some("why"), &park_full()) {
+        match landed_guard(
+            "fix/boot",
+            "a56b4a9",
+            Some(&l),
+            Some("why"),
+            &park_full(),
+            "",
+        ) {
             LandedGuard::Refuse(why) => assert!(why.contains("twin"), "{why}"),
             other => panic!("park intent on a landed branch is a twin: {other:?}"),
+        }
+    }
+
+    /// A HEAD ALREADY ON MAIN CANNOT BE AUTO-GATED (backlog 7c833bd5).
+    /// Gate-run 14415eee: `--force-regate` with `--mode auto` on a branch
+    /// whose head WAS main's head (bb75debe), so the runner's `--auto`
+    /// found no change against origin/main and refused — after the run
+    /// had held a bay. Both facts are in hand at launch, so the pairing
+    /// is refused here, before a packet is filed; a full gate (no
+    /// `--mode`) of the same head still runs, because it checks a tree
+    /// rather than a diff.
+    #[test]
+    fn a_forced_auto_gate_of_a_head_already_on_main_is_refused_at_launch() {
+        let on_main = landing(
+            &crate::merged::Verdict::Merged(crate::merged::How::Ancestor),
+            &[],
+            "proof/an-alias-signed-gate-launches-live",
+            "bb75debe702673f698dc09d15b246e3983b93ff6",
+        )
+        .expect("an ancestor of main is a landing");
+        match landed_guard(
+            "proof/an-alias-signed-gate-launches-live",
+            "bb75debe702673f698dc09d15b246e3983b93ff6",
+            Some(&on_main),
+            Some("prove the alias-signed launch"),
+            &ParkIntent::default(),
+            "--auto",
+        ) {
+            LandedGuard::Refuse(why) => {
+                assert!(why.contains("@bb75deb"), "names the head: {why}");
+                assert!(why.contains("--mode auto"), "names the pairing: {why}");
+                assert!(
+                    why.contains("no change"),
+                    "says what the runner does: {why}"
+                );
+                assert!(why.contains("omit --mode"), "names the full gate: {why}");
+            }
+            other => panic!("--force-regate --mode auto on main's head must refuse: {other:?}"),
+        }
+        // The same head gated in full is still the operator's call.
+        match landed_guard(
+            "proof/an-alias-signed-gate-launches-live",
+            "bb75debe702673f698dc09d15b246e3983b93ff6",
+            Some(&on_main),
+            Some("prove the alias-signed launch"),
+            &ParkIntent::default(),
+            "",
+        ) {
+            LandedGuard::Forced(note) => assert!(note.contains("alias-signed"), "{note}"),
+            other => panic!("a full forced gate of main's head proceeds: {other:?}"),
+        }
+        // A squash-landed branch still carries commits over its merge-base,
+        // so the runner's --auto has a diff to scope: it is not refused.
+        let squashed = landed_by_content();
+        match landed_guard(
+            "fix/boot",
+            "a56b4a9deadbeef",
+            Some(&squashed),
+            Some("closing dead gate-run 57f49a80"),
+            &ParkIntent::default(),
+            "--auto",
+        ) {
+            LandedGuard::Forced(note) => assert!(note.contains("57f49a80"), "{note}"),
+            other => panic!("a squash-landed branch still has a diff to auto-gate: {other:?}"),
         }
     }
 
@@ -6672,6 +7908,22 @@ mod tests {
             assert!(why.contains(word), "{why}");
             assert!(why.contains("8c2f644a"), "names the packet: {why}");
         }
+        // A RECORDED VERDICT THAT JUDGED NOTHING is still not withdrawn
+        // — there is nothing to stand down — but the refusal names the
+        // door that IS open: a fresh gate of the branch (a4a527d1).
+        let mut lost = withdrawable_run("open", "completed");
+        lost["steps"][0]["metadata"]["verdict"] = json!("lost");
+        let why = withdraw_refusal("8c2f644a", &lost).expect("a recorded lost is not withdrawn");
+        assert!(why.contains("already recorded"), "{why}");
+        assert!(why.contains("judged nothing"), "{why}");
+        assert!(
+            why.contains(&format!("boss gate {TWIN_BRANCH}")),
+            "names the re-gate that is admitted: {why}"
+        );
+        let mut green = withdrawable_run("open", "completed");
+        green["steps"][0]["metadata"]["verdict"] = json!("green");
+        let why = withdraw_refusal("8c2f644a", &green).expect("a recorded green is not withdrawn");
+        assert!(!why.contains("judged nothing"), "{why}");
         let mut car = withdrawable_run("open", "ready");
         car["kind"] = json!("ship-a-change");
         let why = withdraw_refusal("8c2f644a", &car).expect("a car is not a gate-run");
@@ -6697,7 +7949,10 @@ mod tests {
         assert!(!admits_withdrawn(&v2));
         let why = withdraw_refusal("8c2f644a", &v2).expect("v2 refuses");
         assert!(why.contains("Nothing was written"), "{why}");
-        assert!(why.contains("boss workflow publish gate-run"), "{why}");
+        // No publish advice and no dated version (backlog 847566e6): a
+        // publish moves no in-flight packet, so it cannot help this one.
+        assert!(why.contains("verdict step declares the word"), "{why}");
+        assert!(!why.contains("publish") && !why.contains("(v3)"), "{why}");
         let v3 = with_fields("green|failed|lost|refused|withdrawn");
         assert!(admits_withdrawn(&v3));
         assert_eq!(withdraw_refusal("8c2f644a", &v3), None);
@@ -6775,6 +8030,123 @@ mod tests {
         let why = launch_target_refusal("pkt-8c2f644a", &run).expect("closed refuses");
         assert!(why.contains("WITHDRAWN"), "{why}");
         assert!(!why.contains("re-run"), "{why}");
+    }
+
+    /// A gate-run as read back AFTER the verdict writes were accepted:
+    /// its verdict step in `verdict_status` saying `withdrawn`, and the
+    /// `withdrawn` outcome step in `terminal` — or absent, when the
+    /// protocol it is pinned to put none on the packet. Pinned v7, the
+    /// shape gate-run 7e8088d1 read back closed under (backlog 7905cb5d).
+    fn withdrawal_read(status: &str, verdict_status: &str, terminal: Option<&str>) -> Value {
+        let mut run = withdrawable_run(status, verdict_status);
+        run["workflow_version"] = json!(7);
+        run["steps"][0]["metadata"]["verdict"] = json!(WITHDRAWN_VERDICT);
+        if let Some(t) = terminal {
+            run["steps"].as_array_mut().unwrap().push(json!({
+                "id": "s-w", "spec_slug": "withdrawn", "kind": "outcome",
+                "title": "Gate withdrawn before it ran — it judged nothing",
+                "status": t, "metadata": {"outcome_kind": "withdrawn"}
+            }));
+        }
+        run
+    }
+
+    /// RECORDED, CLOSURE PENDING, IS NOT A MISSING TERMINAL (backlog
+    /// 7905cb5d). Measured four times: the verdict step completes, the
+    /// `withdrawn` outcome step completes 1.4–1.9 s later, and the packet
+    /// closes with it — so the read that follows the write at once sees
+    /// it OPEN. That read used to answer exit 1 and "the live protocol
+    /// has no terminal ... publish gate-run v3" against packets pinned to
+    /// v6, v7 and v8, each of which carried the terminal.
+    #[test]
+    fn a_recorded_withdrawal_whose_terminal_has_not_completed_reads_pending() {
+        for t in ["pending", "ready", "active"] {
+            let read = withdrawal_readback(&withdrawal_read("open", "completed", Some(t)));
+            assert_eq!(
+                read,
+                WithdrawalReadback::ClosurePending { version: Some(7) },
+                "{t}"
+            );
+        }
+        let why = withdrawal_readback_refusal(
+            "8c2f644a",
+            "8c2f644a-1b71-4a5a-bb46-cb2f340d59d4",
+            &Ok(WithdrawalReadback::ClosurePending { version: Some(7) }),
+            30,
+        )
+        .expect("pending at the deadline is not a verified close");
+        assert!(why.contains("PENDING"), "{why}");
+        assert!(
+            why.contains("gate-run v7"),
+            "names the pinned version: {why}"
+        );
+        assert!(why.contains("30 read"), "says how long it looked: {why}");
+        assert!(
+            why.contains("GET /api/jobs/8c2f644a-1b71-4a5a-bb46-cb2f340d59d4"),
+            "names the read that settles it: {why}"
+        );
+        for invented in ["publish", "v3", "no terminal"] {
+            assert!(!why.contains(invented), "{invented}: {why}");
+        }
+    }
+
+    /// THE ACTUAL MISSING TERMINAL — the control. A packet whose pinned
+    /// protocol put no `withdrawn` outcome step on it can never close on
+    /// the word, however long the read waits, and says so naming the
+    /// version it IS pinned to. It advises no publish: a publish moves no
+    /// in-flight packet (CLAUDE.md §Jobs), so it cannot be the fix.
+    #[test]
+    fn a_packet_without_a_withdrawn_terminal_reads_missing_and_advises_no_publish() {
+        let read = withdrawal_readback(&withdrawal_read("open", "completed", None));
+        assert_eq!(
+            read,
+            WithdrawalReadback::MissingTerminal { version: Some(7) }
+        );
+        let why = withdrawal_readback_refusal("8c2f644a", "8c2f644a-full", &Ok(read), 1)
+            .expect("a missing terminal refuses");
+        assert!(why.contains("gate-run v7"), "{why}");
+        assert!(why.contains("no `withdrawn` outcome step"), "{why}");
+        assert!(!why.contains("publish"), "{why}");
+        assert!(!why.contains("v3"), "{why}");
+    }
+
+    /// CLOSED IS THE ONLY PASS, and the verdict step not yet showing what
+    /// was written, a read that does not show the steps, and a read that
+    /// failed are each UNKNOWN — never a missing terminal.
+    #[test]
+    fn only_a_closed_read_passes_and_the_rest_stay_unknown() {
+        let closed =
+            withdrawal_readback(&withdrawal_read("closed", "completed", Some("completed")));
+        assert_eq!(closed, WithdrawalReadback::Closed);
+        assert_eq!(
+            withdrawal_readback_refusal("8c2f644a", "p", &Ok(closed), 3),
+            None
+        );
+        let unread = withdrawal_readback(&withdrawal_read("open", "ready", Some("pending")));
+        assert_eq!(unread, WithdrawalReadback::VerdictNotRead);
+        let stepless = withdrawal_readback(&json!({"status": "open", "workflow_version": 7}));
+        assert_eq!(stepless, WithdrawalReadback::VerdictNotRead);
+        for last in [
+            Ok(unread),
+            Err("jobs api GET /api/jobs/p -> 503 Service Unavailable".to_string()),
+        ] {
+            let why = withdrawal_readback_refusal("8c2f644a", "p", &last, 30)
+                .expect("not a verified close");
+            assert!(why.contains("UNKNOWN"), "{why}");
+            assert!(!why.contains("terminal"), "{why}");
+            assert!(!why.contains("publish"), "{why}");
+        }
+        let why = withdrawal_readback_refusal(
+            "8c2f644a",
+            "p",
+            &Err("jobs api GET /api/jobs/p -> 503 Service Unavailable".to_string()),
+            30,
+        )
+        .unwrap();
+        assert!(
+            why.contains("503 Service Unavailable"),
+            "keeps the error whole: {why}"
+        );
     }
 
     /// A BARE RE-GATE OF A PARKED CAR'S BRANCH SAYS IT WILL NOT REFRESH
@@ -6859,7 +8231,14 @@ mod tests {
     #[test]
     fn an_unlanded_branch_proceeds_even_when_forced() {
         assert_eq!(
-            landed_guard("feat/new", "abc1234", None, Some("why"), &park_full()),
+            landed_guard(
+                "feat/new",
+                "abc1234",
+                None,
+                Some("why"),
+                &park_full(),
+                "--auto"
+            ),
             LandedGuard::Proceed
         );
     }
@@ -6993,6 +8372,7 @@ mod tests {
             max_wait_hours: Some(336),
             next_check_at: None,
             clean_window: None,
+            event: None,
         };
         assert!(p.require_complete().is_ok());
         assert_eq!(
@@ -7141,6 +8521,105 @@ mod tests {
         assert!(e.contains("BOSS_ACTOR"), "{e}");
         assert!(e.contains("does not act"), "{e}");
         assert!(e.contains("host-absent-tools.txt"), "{e}");
+    }
+
+    /// A PROBE MUST ANSWER THE SAME FOR EVERY READER (backlog 371b0443).
+    /// Car f4cdf451's probe, verbatim, and the other two sections the
+    /// item names: each is refused at park time with the reason (whose
+    /// queue it reads, and who the forge is) and the actor-independent
+    /// shape to write instead. The tree read that replaced it by hand
+    /// is complete.
+    #[test]
+    fn a_park_probe_that_reads_the_callers_own_queue_is_refused() {
+        for (probe, marker) in [
+            (
+                "boss orient | grep -A3 'MY WORK' | grep -c \"urgent first, then oldest\"",
+                "MY WORK",
+            ),
+            ("boss orient | grep -c 'NEEDS YOU — nothing'", "NEEDS YOU"),
+            ("boss dispatch --next --dry | grep -c ready", "--next"),
+        ] {
+            let mut p = park_full();
+            p.probe = Some(probe.into());
+            p.expect = Some("1".into());
+            let e = p.require_complete().unwrap_err().to_string();
+            assert!(e.contains(marker), "{probe}: {e}");
+            assert!(e.contains("WHO RUNS IT"), "{probe}: {e}");
+            assert!(e.contains("NO actor"), "{probe}: {e}");
+            assert!(e.contains("git show HEAD:"), "{probe}: {e}");
+            assert!(e.contains("a section every actor sees"), "{probe}: {e}");
+            assert!(
+                e.contains(boss_jobs::probe::CALLERS_OWN_QUEUE_RULE),
+                "{probe}: {e}"
+            );
+        }
+        let mut p = park_full();
+        p.probe = Some(
+            "git show HEAD:crates/orchestrators/boss-cli/src/orient.rs | grep -c 'urgent \
+             first, then oldest'"
+                .into(),
+        );
+        p.expect = Some("1".into());
+        assert!(p.require_complete().is_ok(), "{:?}", p.require_complete());
+    }
+
+    /// A TREE READ CANNOT PROVE A PRODUCTION CLAIM (backlog 490acf06).
+    /// A park whose verified names an endpoint answer or a latency in ms
+    /// or seconds, over a probe that only runs `git show` and filters,
+    /// is refused at the one moment re-parking is free, naming the words
+    /// it found and both honest shapes: observe it through the reader
+    /// with the bound asserted inside, or say the source claim the probe
+    /// actually reads. The same probe under a source claim, and an
+    /// observing probe under the production claim, both park.
+    #[test]
+    fn a_park_whose_tree_probe_cannot_see_its_production_claim_is_refused() {
+        let tree = "git show HEAD:crates/core/boss-events/src/history_snapshot.rs | \
+                    grep -c 'sqlx::query_scalar(RELEVANT_COUNT_SQL)'";
+        for (verified, words) in [
+            (
+                "GET /api/stations/flow with the default basis answers in seconds.",
+                "/api/stations/flow",
+            ),
+            ("Station-flow reads come back under 20 s.", "20 s"),
+            ("The regions read answers in 790 ms.", "790 ms"),
+        ] {
+            let mut p = park_full();
+            p.verified = Some(verified.into());
+            p.probe = Some(tree.into());
+            p.expect = Some("1".into());
+            let e = p.require_complete().unwrap_err().to_string();
+            assert!(e.contains(words), "{verified}: {e}");
+            assert!(e.contains("only the converged tree"), "{verified}: {e}");
+            assert!(e.contains("boss-sor-read"), "{verified}: {e}");
+            assert!(e.contains("INSIDE the probe"), "{verified}: {e}");
+            assert!(e.contains("SAY WHAT THE PROBE READS"), "{verified}: {e}");
+            assert!(
+                e.contains(boss_jobs::probe::PRODUCTION_CLAIM_RULE),
+                "{verified}: {e}"
+            );
+        }
+        let mut source = park_full();
+        source.verified = Some("history_snapshot.rs counts the relevant set first.".into());
+        source.probe = Some(tree.into());
+        source.expect = Some("1".into());
+        assert!(
+            source.require_complete().is_ok(),
+            "{:?}",
+            source.require_complete()
+        );
+        let mut observed = park_full();
+        observed.verified = Some("GET /api/stations/flow answers in 20 s.".into());
+        observed.probe = Some(
+            "boss-sor-read /api/stations/flow | jq -e '.stations | length > 0' >/dev/null \
+             && echo flow:ok"
+                .into(),
+        );
+        observed.expect = Some("flow:ok".into());
+        assert!(
+            observed.require_complete().is_ok(),
+            "{:?}",
+            observed.require_complete()
+        );
     }
 
     /// A RECORDED PROBE DOES NOT `cd` (backlog 4bb6797c). The measured
@@ -7322,6 +8801,27 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
             "{:?}",
             fixed.probe_warnings()
         );
+        // The live rows ALONE, without the start of the tally compared
+        // with the cut (backlog 002f5f31), are refused too, and named as
+        // what they are — no log was read, so none is blamed.
+        let mut live_only = park_full();
+        live_only.probe = Some(
+            r#"live=$(boss-sor-read "/api/events/gate-window?gate=machine-gate&hours=$hours" | jq -r --argjson cut "$cut" '([ .live[]? | select(.service == "jobs") ] | first) as $j | if $j == null or $j.snapshot.overflow != 0 or $j.snapshot.mode == "off" then "unreadable" else ([ $j.snapshot.rows[] | select(.user == "automation:discover-admission-source" and .presented == "none") ] | length | tostring) end')
+case ${live:-empty} in unreadable|empty|*[!0-9]*) echo 'not yet: the live tally could not be read whole'; exit 75;; esac
+"#
+            .into(),
+        );
+        live_only.expect = Some("claim:ok".into());
+        let e = live_only.require_complete().unwrap_err().to_string();
+        assert!(
+            e.starts_with(&format!(
+                "--park-probe {}",
+                boss_jobs::probe::gate_log_alone_heading(boss_jobs::probe::LIVE_ROWS_ALONE)
+            )),
+            "{e}"
+        );
+        assert!(!e.contains("`.log.dirty`"), "{e}");
+        assert!(e.contains(boss_jobs::probe::GATE_LOG_ALONE_RULE), "{e}");
     }
 
     /// A PROBE THAT PINS BYTES IS REFUSED AT PARK (backlog 2770eba8):
@@ -7396,6 +8896,82 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
         );
     }
 
+    /// A LAUNCH WARNING SAYS IT IS NOT A REFUSAL IN ITS FIRST WORDS
+    /// (backlog 39fd6363). Run bfeec18c read a capitalised probe advisory,
+    /// printed before the launch line, as a refusal and launched again
+    /// while the first launch was still running — a second gate-run for
+    /// the same head one second later. Every warning `boss gate` prints
+    /// about the park intent leads with the same plain words.
+    #[test]
+    fn every_park_warning_leads_with_launching_anyway() {
+        let mut p = park_full();
+        p.probe = Some("boss-sor-read /api/jobs/x | jq -e .ok || exit 75".into());
+        p.expect = Some("3".into());
+        let probe = p.probe_warnings();
+        assert!(!probe.is_empty(), "the bare || exit is still said");
+        let expect = p.expect_warning().expect("a bare number is still said");
+        let tip = |_: &str| Some("// zoomBoxOf\n".to_string());
+        p.probe = Some(
+            "c=$(git show HEAD:a.ts | grep -c zoomBoxOf || true); [ \"$c\" -eq 0 ] && echo gone:ok"
+                .into(),
+        );
+        let tree = p.tree_warnings("abc1234", tip);
+        assert!(!tree.is_empty(), "the comment-only grep is still said");
+        for w in probe.iter().chain(tree.iter()).chain([&expect]) {
+            assert!(w.starts_with(LAUNCH_WARNING_LEAD), "{w}");
+            assert!(!w.contains("boss prove:"), "one speaker per line: {w}");
+        }
+        assert_eq!(
+            LAUNCH_WARNING_LEAD,
+            "boss gate: WARNING (launching anyway): "
+        );
+        // And the verb prints exactly these, not the unled text.
+        let src = include_str!("gate.rs");
+        let start = src.find("pub async fn run(").expect("fn run");
+        let body = &src[start..];
+        assert!(body.contains("if let Some(w) = park.expect_warning() {"));
+        assert!(
+            !body[..body.find("\nasync fn wait_for_verdict(").unwrap()]
+                .contains(".and_then(crate::prove::bare_number_warning)")
+        );
+    }
+
+    /// A SECOND LAUNCH FOR ONE HEAD ATTACHES, IT DOES NOT FILE (backlog
+    /// 39fd6363). Gate-runs 6f84f4f2 (09:32:29.25Z) and 2c0cc70a
+    /// (09:32:30.18Z) were filed for one branch@sha because reuse was
+    /// decided off a read taken before the other launch's POST, hundreds
+    /// of lines and several round trips earlier. The open list is read
+    /// again immediately before the POST, so a launch that filed in the
+    /// meantime is found and followed — the measured pair, 0.93 s apart,
+    /// falls inside that window.
+    #[test]
+    fn a_launch_rereads_the_open_runs_immediately_before_filing() {
+        let src = include_str!("gate.rs");
+        let start = src.find("pub async fn run(").expect("fn run");
+        let end = start
+            + src[start..]
+                .find("\nasync fn wait_for_verdict(")
+                .expect("the fn after run");
+        let body = &src[start..end];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} is not in fn run"))
+        };
+        let admitted = at("let queued = match admission(");
+        let reread = at("reusable_packet(&filed_meanwhile, branch, &sha)");
+        let post = at("reqwest::Method::POST, \"/api/jobs\"");
+        assert!(
+            admitted < reread,
+            "the re-read is the last read before filing"
+        );
+        assert!(reread < post, "the re-read precedes the POST");
+        let line = second_launch_line("6f84f4f2-aaaa", "fix/x", "4123437a0738");
+        assert!(line.contains("6f84f4f2-aaaa"), "{line}");
+        assert!(line.contains("fix/x@4123437a0738"), "{line}");
+        assert!(line.contains("not filing a second"), "{line}");
+        assert!(line.contains("boss gate 6f84f4f2-aaaa --wait"), "{line}");
+    }
+
     /// A REMOVAL PROBE DEFEATED BY THE CAR'S OWN COMMENT, said at the
     /// door where it is typed (backlog 8ac42ee5). The warning names the
     /// file, the tip it read, and the comment line that answered, and it
@@ -7415,7 +8991,10 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
                 .then(|| "export const a = 1;\n// the camera (zoomBoxOf) is gone\n".to_string())
         };
         let said = p.tree_warnings("abc1234", tip).join("\n");
-        assert!(said.starts_with("boss gate: --park-probe"), "{said}");
+        assert!(
+            said.starts_with("boss gate: WARNING (launching anyway): --park-probe"),
+            "{said}"
+        );
         assert!(said.contains("src/region.ts at abc1234"), "{said}");
         assert!(
             said.contains("src/region.ts:2: // the camera (zoomBoxOf) is gone"),
@@ -8599,6 +10178,38 @@ if [ "$live" -gt 0 ]; then echo "FAILED: $live row(s)"; exit 1; fi
             queue_order(&open, now, QUEUE_PLACE_TTL_SECS),
             vec!["patient".to_string()]
         );
+    }
+
+    /// Backlog b56bfc29. One line across both owners: a legacy place
+    /// and a resident place stand in the order they were taken, and the
+    /// supervisor's count ([`places_taken_before`]) and the waiter's
+    /// position (in [`mixed_line`]) agree — so neither owner counts the
+    /// other ahead of itself while the other does the same, which would
+    /// hold a free bay between them.
+    #[test]
+    fn both_owners_read_one_line_ordered_by_when_each_place_was_taken() {
+        let resident = vec![(at("2026-10-19T05:42:37Z"), "dec70bf9".to_string())];
+        for (legacy_at, legacy_first) in [
+            ("2026-10-19T06:43:13Z", false),
+            ("2026-10-19T05:30:00Z", true),
+        ] {
+            let legacy = vec![(at(legacy_at), "53c9eda3".to_string())];
+            let line = mixed_line(&legacy, &resident);
+            let ahead_of_resident = places_taken_before(&legacy, resident[0].0, "dec70bf9");
+            let ahead_of_legacy = places_taken_before(&resident, legacy[0].0, "53c9eda3");
+            if legacy_first {
+                assert_eq!(line, vec!["53c9eda3", "dec70bf9"]);
+                assert_eq!((ahead_of_resident, ahead_of_legacy), (1, 0));
+            } else {
+                assert_eq!(line, vec!["dec70bf9", "53c9eda3"]);
+                assert_eq!((ahead_of_resident, ahead_of_legacy), (0, 1));
+            }
+        }
+        // The same instant: the id decides, the same way for both.
+        let tie = vec![(at("2026-10-19T05:42:37Z"), "00000000".to_string())];
+        assert_eq!(mixed_line(&tie, &resident), vec!["00000000", "dec70bf9"]);
+        assert_eq!(places_taken_before(&tie, resident[0].0, "dec70bf9"), 1);
+        assert_eq!(places_taken_before(&resident, tie[0].0, "00000000"), 0);
     }
 
     /// A stamp that does not parse is no stamp — the place is not
@@ -9850,6 +11461,60 @@ kind: Job\n\
         assert_eq!(receipt_head(&json!({"id": "x"})), None);
     }
 
+    /// A VERDICT THAT JUDGED NOTHING HOLDS NO BRANCH (backlog a4a527d1).
+    /// Gate-run 90e7a8d8 recorded `lost` at 09:23:57Z on 2026-10-21 (its
+    /// runner could not fetch from the forge) and stayed OPEN until the
+    /// marker rule completed its `lost` outcome at 09:26:00Z, 116 s after
+    /// that step went ready. In between, the requested sha keyed reuse,
+    /// so every re-gate with park flags was refused as "already owns the
+    /// immutable request" — and `--withdraw` refused too. A recorded
+    /// lost, refused or withdrawn verdict spent its request without
+    /// judging the tree: it is nothing to reattach to, and a re-gate
+    /// files a fresh run. A recorded green or failed IS still reused, so
+    /// `boss gate <branch> --wait` reattaches and reads that verdict.
+    #[test]
+    fn a_recorded_verdict_that_judged_nothing_is_not_reused() {
+        let run = |verdict: &str, status: &str| {
+            json!({
+                "id": "dddddddd-4444",
+                "metadata": {"branch": "fix/x", "sha": "deadbeef"},
+                "steps": [{
+                    "spec_slug": "record-verdict", "status": status,
+                    "metadata": {"verdict": verdict,
+                                 "receipt": "runner died before a receipt: could not fetch"}
+                }]
+            })
+        };
+        for unjudged in ["lost", "refused", "withdrawn"] {
+            assert_eq!(
+                reusable_packet(&[run(unjudged, "completed")], "fix/x", "deadbeef"),
+                None,
+                "a recorded {unjudged} judged nothing and holds no request"
+            );
+        }
+        for judged in ["green", "failed"] {
+            assert_eq!(
+                reusable_packet(&[run(judged, "completed")], "fix/x", "deadbeef").as_deref(),
+                Some("dddddddd-4444"),
+                "a recorded {judged} is reattached to, to read it"
+            );
+        }
+        // Merged but not yet completed is not RECORDED: the writer has
+        // not finished, so the packet still owns its request.
+        assert_eq!(
+            reusable_packet(&[run("lost", "ready")], "fix/x", "deadbeef").as_deref(),
+            Some("dddddddd-4444")
+        );
+        // The fresh run filed beside the spent one is the one a second
+        // `boss gate <branch> --wait` reattaches to.
+        let fresh = json!({"id": "eeeeeeee-5555",
+                           "metadata": {"branch": "fix/x", "sha": "deadbeef"}});
+        assert_eq!(
+            reusable_packet(&[run("lost", "completed"), fresh], "fix/x", "deadbeef").as_deref(),
+            Some("eeeeeeee-5555")
+        );
+    }
+
     /// THE CORRECTION THE PACKET IS OWED (410bf724): requested X, gated
     /// Y — `sha` takes the truth, the request survives as provenance.
     #[test]
@@ -10598,6 +12263,36 @@ mod agent_run_tests {
         assert_eq!(WORKTREE_KEY, "worktree");
     }
 
+    /// A run's gate is BORN naming its run (backlog aaf5cafa): the
+    /// silence clock's progress guard counts a gate only when its create
+    /// body carried `agent_run`, because a later PATCH is a binding
+    /// anyone can write. So the run and its worktree ride the create
+    /// body, and a hand gate's body names neither.
+    #[test]
+    fn a_runs_gate_is_born_naming_its_run() {
+        let wt = "/work/boss/.claude/worktrees/agent-a9";
+        let run = with_worktree(agent_run_patch(Some(RUN.into())).unwrap(), Some(wt.into()));
+        let body = born_with_run(
+            gate_run_body("fix/x", "abc", "m.yaml", None, "emp-x"),
+            run.as_ref(),
+        );
+        assert_eq!(body["metadata"]["agent_run"], RUN);
+        assert_eq!(body["metadata"]["worktree"], wt);
+        assert_eq!(body["metadata"]["branch"], "fix/x", "the body is kept");
+        let hand = born_with_run(gate_run_body("fix/x", "abc", "m.yaml", None, "emp-x"), None);
+        assert_eq!(hand, gate_run_body("fix/x", "abc", "m.yaml", None, "emp-x"));
+        // The created packet's body passes through it before the POST.
+        let src = include_str!("gate.rs");
+        let body = &src[src.find("pub async fn run(").expect("fn run")..];
+        let born = body
+            .find("born_with_run(")
+            .expect("run births with the run");
+        let post = body
+            .find("api(&http, reqwest::Method::POST, \"/api/jobs\", Some(body))")
+            .expect("the create");
+        assert!(born < post, "the run is in the body before it is POSTed");
+    }
+
     /// What the waiter frees on its green is read off the GATE-RUN — the
     /// run's edge and the stamped worktree — never off this process's
     /// cwd. Either missing, nothing is freed.
@@ -10765,5 +12460,90 @@ mod regate_tests {
             started.elapsed() >= crate::train::ROLL_WAIT.window,
             "a dark SoR is waited out before the stamp is given up"
         );
+    }
+
+    /// The packet a withdrawal reads back, OPEN with its verdict recorded
+    /// and the `withdrawn` terminal in `terminal`, or CLOSED once it
+    /// completed — gate-run 80f7d03b's shape, one read apart.
+    fn read_after_withdraw(status: &str, terminal: Option<&str>) -> String {
+        let mut steps = vec![
+            json!({"spec_slug": "record-verdict", "title": "Record the receipt",
+                                    "status": "completed", "metadata": {"verdict": "withdrawn"}}),
+        ];
+        if let Some(t) = terminal {
+            steps.push(
+                json!({"spec_slug": "withdrawn", "kind": "outcome", "status": t,
+                              "metadata": {"outcome_kind": "withdrawn"}}),
+            );
+        }
+        json!({"id": "80f7d03b-a080-41d9-9dfd-87efeca6b34a", "kind": "gate-run",
+               "status": status, "workflow_version": 8, "steps": steps})
+        .to_string()
+    }
+
+    /// THE DELAYED TERMINAL, OVER THE WIRE (backlog 7905cb5d). The record
+    /// answers OPEN twice — verdict recorded, terminal not yet completed —
+    /// and CLOSED on the third read. The read-back waits it out and
+    /// reports the close; the one-read door it replaces answered the
+    /// first OPEN with exit 1 and a v3 publish nobody needed.
+    #[tokio::test]
+    async fn a_withdrawal_whose_terminal_lands_late_is_read_back_closed() {
+        use crate::sor_client::stub::answers_in_order;
+        let (base, served) = answers_in_order(vec![
+            ("200 OK", read_after_withdraw("open", Some("ready"))),
+            ("200 OK", read_after_withdraw("open", Some("ready"))),
+            ("200 OK", read_after_withdraw("closed", Some("completed"))),
+        ])
+        .await;
+        let http = crate::sor_client::machine_client().unwrap();
+        let (last, reads) =
+            read_back_withdrawal(&http, &base, "80f7d03b", 10, std::time::Duration::ZERO).await;
+        assert_eq!(last, Ok(WithdrawalReadback::Closed));
+        assert_eq!(reads, 3, "stops on the close, does not spend the budget");
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// A MISSING TERMINAL IS JUDGED ON THE FIRST READ, not waited out:
+    /// the outcome steps are put on the packet at admission, so no later
+    /// read can grow one.
+    #[tokio::test]
+    async fn a_missing_terminal_is_reported_without_waiting_out_the_budget() {
+        use crate::sor_client::stub::answers_in_order;
+        let (base, served) =
+            answers_in_order(vec![("200 OK", read_after_withdraw("open", None))]).await;
+        let http = crate::sor_client::machine_client().unwrap();
+        let (last, reads) =
+            read_back_withdrawal(&http, &base, "80f7d03b", 10, std::time::Duration::ZERO).await;
+        assert_eq!(
+            last,
+            Ok(WithdrawalReadback::MissingTerminal { version: Some(8) })
+        );
+        assert_eq!(reads, 1);
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A READ THAT FAILS STAYS UNKNOWN: two refused reads leave the last
+    /// error as the observation, whole, and no readback is invented.
+    #[tokio::test]
+    async fn a_failing_read_back_stays_unknown_and_keeps_its_error() {
+        use crate::sor_client::stub::answers_in_order;
+        let (base, _served) = answers_in_order(vec![
+            (
+                "503 Service Unavailable",
+                r#"{"error":"draining"}"#.to_string(),
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"error":"draining"}"#.to_string(),
+            ),
+        ])
+        .await;
+        let http = crate::sor_client::machine_client().unwrap();
+        let (last, reads) =
+            read_back_withdrawal(&http, &base, "80f7d03b", 2, std::time::Duration::ZERO).await;
+        assert_eq!(reads, 2);
+        let err = last.expect_err("a failed read is not a readback");
+        assert!(err.contains("503"), "{err}");
+        assert!(err.contains("draining"), "the server's own words: {err}");
     }
 }

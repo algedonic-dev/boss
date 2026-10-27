@@ -1069,6 +1069,12 @@ any time; widening to everyone and the verdict are David's** while he
 is the only human user, to revisit when a second joins. Not decided:
 percentage rollouts (with one human there is nobody to randomise) and a
 flight carrying a value (a value is a registry row).
+**IT map graduation, 2026-10-23.** David promoted both `it-map-transit`
+(flight `54c04706`) and `it-map-live` (flight `71c4d42e`): the desktop
+Department Map always renders the transit monitor with recorded packet
+motion, the phone keeps its strip, and the viewer keeps their crossing
+time choice. The WorldMap and rate-replay rendering paths are retired.
+
 Built, 2026-09-24: car 1 (#637) is `boss_jobs::flights` behind `GET
 /api/flights/mine`, the gateway's inline, web-kit's
 `flights.svelte.ts`, `infra/platform/workflows/flight-a-change.toml`
@@ -1296,6 +1302,105 @@ narrow/denied scope and incomplete originals. The same originals must
 replay deterministically. Preflight, gates, independent review and deployed
 full-window evidence remain owed. No history is rewritten, move cleared,
 alarm demoted or new private read authority granted by this fold.
+
+**The replay is bounded by a witnessed cut, not by a raised bound.** Design
+`c195e83e-26a8-454f-a8e1-5eb3f4bd3727`, its five questions approved as
+proposed on 2026-10-17, repairs the first reader of this basis without
+changing what it proves. Measured that day, scope All folded the whole
+history from genesis: 1,235,314 matching rows against a 250,000-row bound,
+growing about 50k a day, so the answer was fixed before the scan began
+(every station UNKNOWN) and the read held a REPEATABLE READ transaction on
+production for over sixteen minutes. A bound that grows with the log is not
+a bound, so the row and byte bounds stay and the fold starts at a cut: an
+initial state from each packet's latest original snapshot before the
+window, then the window's own original groups. The predicates, the cutoffs
+the reader reports and specific UNKNOWN for a missing original are
+unchanged. Five rules make the cut safe:
+
+- **Census at the cut.** A packet is left out of the initial state only when
+  it is terminal AND its last original snapshot is older than the largest
+  `terminal_window` any registered station declares, read from the live
+  station registry at evaluation time and never a constant, so no generic
+  predicate can still count it. Everything else is carried.
+- **A group that straddles the cut belongs wholly after it.** Its pre-cut
+  rows fold into the initial state and the group then replays in full,
+  because the group is the atomicity witness and splitting it loses the
+  witness. The partial-relay rule is unchanged: a group incomplete on
+  either side leaves its interval UNKNOWN.
+- **Creation evidence without a prefix scan.** A packet that exists at the
+  cut is witnessed by its latest pre-cut original snapshot, read through
+  the `audit_original_packet_identity` index, not by scanning every
+  creation row since genesis. A packet with neither a pre-cut snapshot nor
+  an in-window creation row is UNKNOWN, not absent.
+- **An expression index on `original_group->>'id'`.** The history read's
+  outer group match gets one, built by a `CREATE INDEX CONCURRENTLY`
+  migration on the ordinary schema path and accepted as a one-time
+  converge cost on the 4 GB immutable table. The migration refuses to run
+  inside a transaction, so it cannot be batched with others.
+- **Group reads in batches.** Original groups are read 500 group ids at a
+  time (a named constant) rather than one query per group, with the same
+  per-group completeness check on each batch and a test that a batch
+  boundary never changes a verdict.
+
+The early refusal (`f5d2a8f5`), which refuses before the scan when the
+relevant set alone exceeds the bound, ships first and independently: it
+ends the production transaction and changes no semantics, but it does not
+make the basis answer. This fold delivers no reader; urgent
+`ab09f1af-a6ba-4ce9-ab49-97184d1ded48` stays open until the bounded replay
+is built, gated, reviewed and observed answering a full deployed window.
+
+**A projection may prove an outcome without declaring the clock known.**
+An additive, auditable witness may establish that station membership is
+constant over **every activation allowed by conserved original facts**.
+It proves the projection outcome, not a clock revision, epoch, transition
+instant or business date. `UnknownClockSpan` and `ClockTimeline::date_at`
+keep their existing refusal, including between two WALL originals whose
+business dates agree. Capture is not activation. Startup still records its
+original epoch; short gaps and matching endpoint dates are not coverage.
+
+For each gap and original station version, partition at every original
+packet and registry change. Evaluate the shared `StationPredicate` and
+authorization first. For a Closed/Cancelled packet with original close
+date C and terminal-window days D, the existing predicate is
+`(date - C).num_days() <= D`. A conservative witness requires every
+possible original date in a partition to be at most C+D, or every such
+date to be at least C+D+1. Disagreement, a possible crossing, unavailable
+formulas or incomplete originals leave the outcome **UNKNOWN**. Draft,
+live and missing-close-date behavior remains the existing predicate's.
+
+The candidate roster must cover all activations consistent with complete
+original revision lineage, grouped rows, native head, epochs, modes and
+parameters. Two adjacent models are not an exhaustive roster when
+intervals overlap or revisions are missing. Use shared clock semantics
+for half-open boundaries, supported ranges, rounding, pause and positive
+warp/reset cases. An initial implementation may refuse cases it cannot
+prove complete; precision is optional, soundness is mandatory.
+
+Pruned packets require a conserved station-specific witness covering
+every relevant pruned packet and possible original model **at the same
+cut**. The scalar `pruned_terminal` count proves neither station
+predicates nor close-date bounds. Without the original census/bounds or
+equivalent conserved evidence, preserve UNKNOWN and the ambiguous-pruned
+regression. Mutable current state, resurrected payloads, invented retained
+dates and another reader's identity cannot substitute for that witness.
+
+This decision permits the witness, not partial generations:
+`verify_fold` still refuses a generation with any unknown station. It
+authorizes no producer change, arbitrary SQL, expanded history query,
+permission, identity, fuel, deadline, window or memory bound. A separately
+admitted builder must establish what existing bounded ports conserve; a
+missing witness returns for a separately reviewed evidence-production
+design. The measured seventeen-gap capture lacks adjacent original
+formulas and pruned witnesses, so this decision certifies none of its
+outcomes. Implementation, independent review, machine-run deployed proof
+and the original healthy-flow/three-caller acceptance remain owed.
+
+Decision history: design `16fadf07-b35d-46dc-b886-1fed10870077`, Q1 and Q2
+approved as proposed by David on 2026-10-26, extends the evidence contract
+above while preserving designs `aa0f88c1` and `c195e83e`. The decision and
+its original evidence remain on that packet. This fold records the
+approved contract; it does not deliver the witness or close urgent
+`6bc062b1-8d49-464f-abe1-6912c7d25fa3`.
 
 ### Station alarms state the action the factory needs
 
@@ -1968,7 +2073,10 @@ cannot witness is not yet data. The build plan is
 (`3613f0af`, Departments `86f32b7d`) needs follow-up work seven days after
 an unanswered inquiry; its tenant companion `aecd8740` remains open.
 Current rule parsing stores `delay` but matching drops it before effects.
-Accepting the syntax is not scheduling. No in-memory sleep, immediate or
+Accepting the syntax is not scheduling, so until this contract is built
+the shared rule validator (`authoring::validate`: draft, dry run, publish,
+boot seed, `boss tenant check`) refuses every rule declaring a `delay`,
+well-formed or not — the first car fails closed. No in-memory sleep, immediate or
 manual reminder, source-age reset, or Sales-specific core branch satisfies
 this contract.
 
@@ -4804,7 +4912,12 @@ the image's baked stamp disagrees with the tree, and a floating tag was
 once served stale from the runner's cache (`6aa603ef`) — so
 `build-image` keeps pushing `boss-ci:<sha>` (about a minute, layers
 cached) and the disk cost it carries is the bigger forge disk's to
-absorb. The double run went first (`fix/a-train-is-tested-once`,
+absorb. *Superseded 2026-10-18 (backlog `399ee6c3`):* 780 trains in
+09-17..10-15 each pushed and pulled a 3.48 GB image while the forge's
+disk floor stayed a named reason trains are rate-limited, and the tag
+is now `boss-ci:<stamp>` — the recipe hash the
+locomotive already checks, which no runner can hold stale — built only
+when the registry does not already serve it under `:rust1.96` too. The double run went first (`fix/a-train-is-tested-once`,
 2026-09-12: `pull_request` alone); the two hours of unconverged trains
 on 2026-09-13 taught that a tag in the mirror *list* is a declaration
 and the registry holding it is the fact, which the converge now closes
@@ -5329,6 +5442,10 @@ backlog packets the design spawned):
   `20260918063829` deletes the seeded rows wherever nothing references
   them. Measured: the instance rows a fresh install boots with (seven
   nodes, eight service instances, their roles, eight credentials) → none.
+  Explicit positive estate `disk_gb` is the narrow exception to
+  `e187198f`'s insert-if-absent default: it refreshes a kept node from
+  the tree; omitted capacity and other existing fields stay kept, and
+  missing roles remain append-only (item `c426bc8a`).
 - **H9 — the lint declares its own consist skip** (train #447,
   2026-09-18, item `6fa15484`). Which lints the consist check leaves
   out lived five times, and nothing held `gate.sh`'s copy equal to the
@@ -6133,3 +6250,98 @@ This amendment proves no installed grant, producer, TLS endpoint,
 credential/provider effect, enrollment or native READ/USE acceptance.
 Urgent `3869107c-1ff5-462e-ae24-9b11dfc37d97` remains open, and the
 existing isolation hold remains in force.
+
+## A dev worker follows its worktree's committed head
+
+David answered Q1 YES on design-doc
+`ac162341-3767-489b-876f-49246faa8a14` on 2026-10-20 at 17:04:24 UTC,
+answering backlog `ceea10b8-fcef-443d-9cd0-59d3af0a61a2`, the last flip
+gate for dev isolation `b3071bf4`. A dev-isolation worker is admitted on
+one exact commit, fetched by its init container, and until this decision
+every `exec-auto` refused once the bound worktree's `HEAD` moved off that
+sha. Builder rule 4's own order (commit, then pre-flight) therefore
+tripped it on every first commit, and the activation receipt's
+`rehearsal-check-after-commit` could not go green, so isolation could
+not be activated through its own door. The decided reading: the binding
+follows the worktree's committed head through the put door. The
+worker exists to run candidate code away from credentials, so its
+content was never the trusted part; the put door already carries
+builder-chosen bytes into it with no binding change. A re-sync writes
+the same bytes through the same door, with no new credential, no new
+network path from the worker and a receipt per file. What changes is
+the meaning of the binding record: it attests the local commit whose
+committed content the worker was synced to, with the fetched sha kept
+beside it. The rules:
+
+- `admitted_head` is the sha the init container fetched and never
+  changes for the session's life. `synced_head` is the local commit the
+  worker was last synced to; it starts equal to `admitted_head`, and
+  `check_binding` compares the bound worktree's `HEAD` to `synced_head`.
+- On a moved `HEAD`, `exec-auto` reads locally and metadata-only, as
+  `source_head` does, `git diff --name-status --no-renames
+  <synced_head>..HEAD`, and requires `synced_head` to be an ancestor of
+  `HEAD`.
+- It refuses before writing anything, naming stop and re-admit as the
+  way on, when the head does not descend from `synced_head` (a rebase or
+  a reset onto another line), or any changed path is a symlink, a
+  submodule, a mode-only change, a path the put door's own rules forbid,
+  or a file over the put door's 16 MiB bound.
+- Added and modified files go through the existing put code path;
+  deleted files go through a new `remove` worker operation with the same
+  path rules and the same directory-fd walk as put. That operation is
+  the only new worker-side code; the worker gains no credential, route
+  or authority.
+- Each path gets a re-sync receipt (the sha256 put already prints, or
+  `removed`), and `synced_head` advances only after every path has one.
+  The re-sync never commits in the worker, whose own `HEAD` stays the
+  admitted sha.
+
+Decided from the frame beside Q1, because each widens nothing. The
+worker's clone carries the forge's main as `forge/main`: the init fetch
+adds `+refs/heads/main:refs/remotes/forge/main`, same container, token
+and forge, so `infra/lint/lib/trunk-ref.sh` (which tries `forge/main`
+first) and the trunk-relative pins run in the worker as in the gate,
+with no hand-set `BOSS_TRUNK_REF`. The brief's worker-execution
+invariant states the lifecycle, derived from the controller rather than
+retyped: admit only a head the forge has; a commit re-syncs on the next
+`exec-auto`; a rebase or a non-file change needs stop and re-admit.
+Builder rule 4's wording follows it. Refusing an unpushed head before a
+pod is created stays with `457ac1e2`, which owns that refusal. This
+answers the per-commit cost design `a68fc42a` named as its gap (e) and
+left undecided; that design's own fold of D1-D3 is not made here.
+
+The cars, in order: `forge/main` in the bootstrap, with a dev-build test
+that the rendered init command carries the refspec; the `remove`
+operation and the re-sync in `exec-auto`, test first, which flips the
+`rehearsal-check-after-commit` pin in `preflight-control_test.py` from
+"stale is named" to "the second build after a commit passes", with a
+test for each refusal above and for receipt-before-advance; then the
+brief's invariant lines and builder rule 4, pinned by the brief tests.
+This fold builds none of them and activates nothing. Backlog `ceea10b8`
+and `b3071bf4` stay open, and the existing isolation hold remains in
+force until isolation is activated through its own receipt.
+
+## Reserved car releases (6fa9c790 Q1, 2026-10-26)
+
+A car's review-step `releaser` mark reserves release for that exact actor
+and unique aliases of the registry row whose ID is that reservation.
+An agent listing a person's ID as its alias gains no authority over that
+person's reservation; naming an alias does not delegate back to its row.
+Deleting or changing an existing reservation on a held review is judged
+against the current reservation before the write, through both the CLI
+and server metadata door. Placing a new reservation remains open.
+Every other person,
+agent or automation is refused at the shared release judge, with no
+metadata or event written. The guarded write compares the raw reservation
+under the review row's lock, so a reservation placed or changed after
+judgment refuses the old write. A malformed reservation fails closed. Exact
+named identity needs no alias lookup; missing, unavailable or ambiguous
+registry evidence cannot grant an alias release. An absent reservation
+keeps the ordinary review-based release contract.
+
+The yard judges release for its signed-in viewer and uses the same door
+as the CLI. A person's own shell or the yard's Release button attributes
+the act to that person; a command typed into an agent's shell signs as
+the agent and gains no authority from who typed it. The intended release
+of car `10f1b77a` stands. This supersedes the automation-only reservation
+rule in `393bdef6` Q1; it adds no passkey requirement or other permission.

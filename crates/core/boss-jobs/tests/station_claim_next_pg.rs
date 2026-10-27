@@ -229,6 +229,7 @@ async fn fixture_with_ingress_time() -> (
             role: "worker".into(),
             description: "authenticated integration fixture".into(),
             signs_for: None,
+            access_tier: None,
         }],
         &owner_stamp,
     )
@@ -653,9 +654,32 @@ async fn original_receipt_replay_requires_current_read_scope_for_every_copied_jo
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn selection_commits_the_owned_step_and_replays_the_same_server_receipt() {
-    let (db, repo, context, store) = fixture().await;
+    struct ResumeClock;
+    impl Drop for ResumeClock {
+        fn drop(&mut self) {
+            tokio::time::resume();
+        }
+    }
+    tokio::time::pause();
+    let _clock = ResumeClock;
+    // Real PostgreSQL I/O must not make Tokio auto-advance to the request's
+    // timer. This companion is a scoped future, not a task that can escape.
+    tokio::select! {
+        () = selection_receipt_answer_under_controlled_clock() => {},
+        () = async { loop { tokio::task::yield_now().await; } } => unreachable!(),
+    }
+}
+
+async fn selection_receipt_answer_under_controlled_clock() {
+    let (db, repo, context, store, ingress_started) = fixture_with_ingress_time().await;
+    // Ingress stores std::Instant; enforcement converts that origin to Tokio's
+    // clock. Align once after setup, then let this answer test own elapsed time.
+    let logical_ingress = tokio::time::Instant::from_std(ingress_started);
+    tokio::time::advance(logical_ingress.saturating_duration_since(tokio::time::Instant::now()))
+        .await;
+    assert_eq!(tokio::time::Instant::now(), logical_ingress);
     let step = context.validated_step.clone();
     let stamp = boss_core::publisher::EventStamp::new(
         "jobs",
@@ -788,6 +812,13 @@ async fn selection_commits_the_owned_step_and_replays_the_same_server_receipt() 
         serde_json::to_vec(&original).unwrap(),
         serde_json::to_vec(&receipt).unwrap()
     );
+    // A controlled host gap reproduces the old ingress being spent by later
+    // receipt assertions (09145add); this is not a performance upper bound.
+    std::thread::sleep(
+        boss_jobs::station_claim::SELECTION_PRE_COMMIT_BUDGET
+            + std::time::Duration::from_millis(25),
+    );
+    assert!(ingress_started.elapsed() >= boss_jobs::station_claim::SELECTION_PRE_COMMIT_BUDGET);
     let repeated = restarted
         .claim_station_head_at(&context, ACTOR, &[], &stamp, &[])
         .await
@@ -814,6 +845,33 @@ async fn selection_commits_the_owned_step_and_replays_the_same_server_receipt() 
             .await,
         Err(boss_jobs::port::JobsError::SelectionConflict(_))
     ));
+    assert_eq!(tokio::time::Instant::now(), logical_ingress);
+    tokio::time::advance(
+        boss_jobs::station_claim::SELECTION_PRE_COMMIT_BUDGET + std::time::Duration::from_millis(2),
+    )
+    .await;
+    assert!(matches!(
+        restarted
+            .claim_station_head_at(&context, ACTOR, &[], &stamp, &[])
+            .await,
+        Err(boss_jobs::port::JobsError::SelectionConflict(message))
+            if message == "selection ingress deadline expired before commit dispatch"
+    ));
+    // A new authenticated request may replay the same idempotency UUID. The
+    // expired request above must never receive this new request's lifetime.
+    let fresh_context = SelectionContext {
+        native_authority: Some(prepared(&restarted, context.request_id).await),
+        ..context.clone()
+    };
+    let SelectionResult::Replayed(fresh_copy) = restarted
+        .claim_station_head_at(&fresh_context, ACTOR, &[], &stamp, &[])
+        .await
+        .unwrap()
+    else {
+        panic!("fresh ingress must copy the original receipt")
+    };
+    assert_eq!(fresh_context.request_id, context.request_id);
+    assert_eq!(fresh_copy.json().as_bytes(), receipt.json().as_bytes());
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_claim_receipts")
         .fetch_one(&db.pool)
         .await

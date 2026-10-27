@@ -27,7 +27,10 @@
 //!     sender's and stands; the unit walk follows a sender run as a child
 //!     and reads `RuntimeDirectory=` only from `[Service]`, reset and all;
 //!     the unit observer's own POST carries the same bound; and the forge
-//!     converge closes the reader's directory before it replaces its trap.
+//!     converge closes the reader's directory before it replaces its trap;
+//!   * since review 7c5ecf57 (N-a, N-c; backlog f85ebd8a): a header dated
+//!     ahead of the clock waits rather than going, and the post's bound
+//!     is one rule in observe-lib.sh that both posts call.
 //!
 //! tree-wide pin — it walks every unit file under infra/, which no
 //! changed-file map attributes to this crate: a unit added anywhere that
@@ -588,6 +591,50 @@ fn the_sweep_removes_only_what_it_can_show_is_dead() {
             "{shell}: the count is said: {err}"
         );
         assert!(!err.contains(SECRET), "{shell}: never the value: {err}");
+    }
+}
+
+/// CLOCK SKEW POSTPONES, IT NEVER HASTENS (backlog f85ebd8a, N-a of
+/// review 7c5ecf57). Age is read off THIS host's clock against the mtimes
+/// a run left, so a dead run's directory written while the clock stood
+/// ahead — a clock stepped back since, or another container's on a
+/// shared volume — reads as young until the clock has passed its newest
+/// file by a day. The sweep's comment now says so; this holds that it is
+/// a postponement and not a removal, beside the control that the same
+/// unplaced, dead directory dated two days BACK does go.
+#[test]
+fn a_header_dated_ahead_of_the_clock_waits_rather_than_going() {
+    for shell in ["bash", "dash"] {
+        let f = Fixture::new(&format!("skew-{shell}"));
+        let ahead = plant(&f.tmp, "ahead", None);
+        let mut paths = vec![ahead.join("TOKEN_HDR"), ahead.clone()];
+        paths.sort();
+        for p in &paths {
+            let ok = Command::new("touch")
+                .args(["-h", "-d", "2 days"])
+                .arg(p)
+                .status()
+                .expect("run touch")
+                .success();
+            assert!(ok, "touch -d on {}", p.display());
+        }
+        let behind = plant(&f.tmp, "behind", None);
+        age_by_two_days(&behind);
+
+        let out = f
+            .lib_driver(shell, "sweeper", SEND)
+            .output()
+            .expect("run the sweeper");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{shell}: {err}");
+        assert!(
+            !behind.exists() && err.contains("removed 1 header directory"),
+            "{shell}: the control — the same dead, unplaced directory two days old goes: {err}"
+        );
+        assert!(
+            ahead.exists(),
+            "{shell}: one dated two days ahead of the clock waits for it: {err}"
+        );
     }
 }
 
@@ -1447,6 +1494,74 @@ const SYSTEMCTL: &str = "#!/bin/sh\n\
         show) printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nResult=success\\nExecMainStatus=0\\nType=oneshot\\n' ;;\n\
     esac\n\
     exit 0\n";
+
+/// THE RULE IS SPELLED ONCE (backlog f85ebd8a, N-c of review 7c5ecf57).
+/// The test below holds the two posts to the same BEHAVIOUR; this holds
+/// them to one DEFINITION. Until this car the bound's rule was written out
+/// twice — in observe-lib.sh `post_observation` and again before the unit
+/// observer's own curl — pinned equal by behaviour and not collapsed
+/// (CLAUDE.md §9a: collapse if you can). It lives in observe-lib.sh's
+/// `observe_post_bound`, which both posts call: a second spelling under
+/// infra/, or a unit observer that stops calling it, turns this red.
+#[test]
+fn the_posts_bound_rule_is_spelled_once() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    files_ending(&root.join("infra"), ".sh", &mut files);
+    files.sort();
+    let spelled: Vec<String> = files
+        .iter()
+        .flat_map(|p| {
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .into_owned();
+            live_lines(p)
+                .into_iter()
+                .filter(|l| {
+                    l.contains("case \"${OBSERVE_POST_MAX_TIME")
+                        || l.contains(" OBSERVE_POST_MAX_TIME=")
+                        || l.starts_with("OBSERVE_POST_MAX_TIME=")
+                })
+                .map(move |l| format!("{rel}: {l}"))
+        })
+        .collect();
+    assert_eq!(
+        spelled.len(),
+        2,
+        "the bound's rule is one `case` and one default, both in {OBSERVE_LIB}: {spelled:#?}"
+    );
+    assert!(
+        spelled.iter().all(|l| l.starts_with(OBSERVE_LIB)),
+        "the bound's rule is spelled outside {OBSERVE_LIB}: {spelled:#?}"
+    );
+
+    let lib = live_lines(&root.join(OBSERVE_LIB));
+    assert!(
+        lib.iter().any(|l| l.starts_with("observe_post_bound()")),
+        "{OBSERVE_LIB} defines observe_post_bound"
+    );
+    for (rel, lines) in [
+        (OBSERVE_LIB, lib.clone()),
+        (OBSERVE_UNITS, live_lines(&root.join(OBSERVE_UNITS))),
+    ] {
+        let call = lines.iter().position(|l| l == "observe_post_bound");
+        let curl = lines
+            .iter()
+            .position(|l| l.contains("--max-time \"$OBSERVE_POST_MAX_TIME\""));
+        assert!(
+            matches!((call, curl), (Some(c), Some(u)) if c < u),
+            "{rel}: calls observe_post_bound ({call:?}) before the curl that reads the bound ({curl:?})"
+        );
+    }
+    assert!(
+        live_lines(&root.join(OBSERVE_UNITS))
+            .iter()
+            .any(|l| l == ". \"$(dirname \"$0\")/observe-lib.sh\""),
+        "{OBSERVE_UNITS} sources {OBSERVE_LIB} from beside itself, as observe-host.sh does"
+    );
+}
 
 /// The bound a unit actually runs with: a whole number of seconds, small
 /// against the fifteen-minute cadence, and a value that is not a number

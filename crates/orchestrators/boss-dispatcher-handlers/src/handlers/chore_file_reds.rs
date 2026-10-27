@@ -27,6 +27,21 @@
 //! - `no_red_failure_route` — optional bounded route key for ONE item
 //!   when a failed close has no shaped RED line. Undeclared rules keep
 //!   the original no-item behavior (backlog e4a9a9b3).
+//! - `one_item_per` — optional, `route` (undeclared) or `finding`. Under
+//!   `finding` step 4 keys each item on its RED line rather than its
+//!   route (`red_finding`), for a chore whose findings all print under
+//!   one route and each name a different line to act on: the boss-gcp
+//!   deposit key audit, whose second unconfined line while the first
+//!   line's item was open was named nowhere (backlog d1b03874). A finding
+//!   is keyed on the key fingerprint it names, not its line or its prose
+//!   ([`finding_key`], backlog 52534a15), and each tick is judged WHOLE:
+//!   an open item whose finding it still prints is given the current
+//!   words, and one it no longer prints is closed `stale` — or told, if a
+//!   person has acted on it.
+//! - `clean_field` / `clean_value` — optional, together, only under
+//!   `finding`: the run-step word that says the chore found nothing, so a
+//!   tick with no RED line closes every finding item of this rule
+//!   (52534a15). Undeclared, a tick with no RED line closes nothing.
 //!
 //! Which chore kind and which outcome ride the rule's `when`; this
 //! handler reads whatever closed and finds RED lines or does not.
@@ -70,6 +85,9 @@
 //!    a fix is a new fact, the same posture `estate.alarm` takes. File
 //!    one backlog-item per remaining route, carrying the route, the
 //!    kind(s), the error text copied not retyped and the design id.
+//!    A rule declaring `one_item_per = "finding"` dedups the same way
+//!    on each distinct RED line instead, so a second line under an
+//!    open route is its own item and a repeat of a line files nothing.
 //! 5. Every item's `source` is `{kind: packet, id: <chore id>}` — the
 //!    structured shape `boss job file --source` records and the
 //!    receiving yard groups by (`boss_jobs::origin`), so one night's
@@ -82,16 +100,23 @@
 //!    of night it was without a reader re-deriving it from the lines.
 
 use super::common::{
-    api_client, get_json, open_jobs_of_kind, owner_for_filing, row_or_refuse, write_json,
+    RECOVERED_AT, api_client, complete_step, get_json, open_jobs_of_kind, owner_for_filing,
+    recovery_note, row_or_refuse, withdrawal_fields, write_json,
 };
 use super::jobs_complete_linked_step::step_by_slug;
 use super::ops_judge::JUDGED;
+use super::verdict_streak::{ADMITTED_AT, Recovery, withdrawal};
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, arg_string};
 use boss_jobs::channels::InputChannel;
+use boss_jobs::opened_by::OPENED_BY_KEY;
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::sync::Arc;
+
+/// The handler's registered name, and the `cleared_by` its closes carry.
+const HANDLER: &str = "maintenance.chore.file_reds";
 
 /// The line shape the crawl prints per red surface
 /// (apps/web/tests/live/playground-crawl.spec.ts, pinned by
@@ -100,6 +125,10 @@ pub(crate) const RED_PREFIX: &str = "RED ";
 /// The dedup key a filed item carries — the route, and nothing else,
 /// because "dedup by route while one is open" is the whole rule.
 pub(crate) const RED_ROUTE: &str = "red_route";
+/// The dedup key a finding-level item carries beside its route (rule arg
+/// `one_item_per = "finding"`, backlog d1b03874): the RED line without
+/// its `RED ` prefix — `<route> <kind>: <error>`, copied not retyped.
+pub(crate) const RED_FINDING: &str = "red_finding";
 /// The dedup key a shared-cause item carries instead of a route.
 pub(crate) const RED_CAUSE: &str = "red_cause";
 /// The routes a shared-cause item lists, in the order the crawl printed.
@@ -369,6 +398,266 @@ pub(crate) fn item_body(
     })
 }
 
+/// PURE: the key fingerprint a finding's error text names first —
+/// `SHA256:<base64>`, the form `ssh-keygen -l` prints and the boss-gcp
+/// deposit key audit names every key by (infra/gcp/audit-deposit-keys.sh,
+/// "A KEY IS WHAT ssh-keygen READS, COMPARED BY FINGERPRINT"). Every
+/// finding that names a key names it before the forced command or the
+/// comment it quotes, so the first one is the key the line is about.
+pub(crate) fn key_fingerprint(error: &str) -> Option<&str> {
+    const MARK: &str = "SHA256:";
+    error.match_indices(MARK).find_map(|(at, _)| {
+        let tail = &error[at + MARK.len()..];
+        let len = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='))
+            .unwrap_or(tail.len());
+        (len > 0).then(|| &error[at..at + MARK.len() + len])
+    })
+}
+
+/// PURE: the dedup key one finding carries under `one_item_per =
+/// "finding"` (d1b03874).
+///
+/// THE KEY, NOT THE LINE (backlog 52534a15). It was the whole RED line,
+/// and the audit leads every line with `<file>:<line>` and follows it with
+/// prose: removing an EARLIER line of authorized_keys shifted every later
+/// finding's number, and any car rewording the audit (26173f40's did)
+/// changed every finding's text — each re-filed beside its stale item. A
+/// finding that names a key fingerprint is keyed on the route, the kind and
+/// that fingerprint: the class is what the chore printed it under, the
+/// identity is the key, and neither moves when a line above it is removed
+/// or the sentence is rewritten. Two lines carrying ONE key are one item,
+/// because the act is one — re-place that key's authorized_keys_line whole
+/// — and the item carries every line it names ([`RED_ERROR`]). A finding
+/// that names no key (a line sshd's parser reads nothing from) has no
+/// identity but its line, so it keeps the whole line; a shift re-files it,
+/// and the stale one closes on the same tick.
+pub(crate) fn finding_key(route: &str, kind: &str, error: &str) -> String {
+    match key_fingerprint(error) {
+        Some(fp) => format!("{route} {kind}: key {fp}"),
+        None => format!("{route} {kind}: {error}"),
+    }
+}
+
+/// The error text an item carries — every line of its finding, copied.
+pub(crate) const RED_ERROR: &str = "red_error";
+
+/// PURE: the finding key an open item stands for, re-derived from what it
+/// carries. An item filed under rule v2 carries its whole RED line; read
+/// back through [`red_routes`] and [`finding_key`] it is the fingerprint
+/// key, so the first tick after v3 neither re-files it nor closes it.
+pub(crate) fn item_finding_key(item: &serde_json::Value) -> Option<String> {
+    let stored = item.get("metadata")?.get(RED_FINDING)?.as_str()?;
+    Some(
+        red_routes(&format!("{RED_PREFIX}{stored}"))
+            .first()
+            .and_then(|r| {
+                r.findings
+                    .first()
+                    .map(|(kind, error)| finding_key(&r.route, kind, error))
+            })
+            .unwrap_or_else(|| stored.to_string()),
+    )
+}
+
+/// PURE: an item already told its finding cleared ([`recovery_note`]).
+/// It no longer stands for the finding: a recurrence files anew, the
+/// posture `maintenance.verdict.streak` takes (backlog 3ff17da3).
+fn told_recovered(item: &serde_json::Value) -> bool {
+    item.get("metadata")
+        .and_then(|m| m.get(RECOVERED_AT))
+        .is_some_and(|v| !v.is_null())
+}
+
+/// PURE: the findings already carried by an open backlog-item that still
+/// stands for its finding.
+pub(crate) fn open_findings(open_jobs: &[serde_json::Value]) -> Vec<String> {
+    open_jobs
+        .iter()
+        .filter(|j| !told_recovered(j))
+        .filter_map(item_finding_key)
+        .collect()
+}
+
+/// PURE: the keys an item this judge files under `one_item_per =
+/// "finding"` carries while nobody has written on it — read off
+/// [`finding_item_body`] rather than listed a second time, plus the two
+/// admission stamps (CLAUDE.md §9a).
+fn finding_own_keys(ctx: &InvocationContext) -> BTreeSet<String> {
+    let body = finding_item_body("r", "k", "e", "c", "", "", "", "", "", ctx);
+    body["metadata"]
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.keys().cloned())
+        .chain([ADMITTED_AT.to_string(), OPENED_BY_KEY.to_string()])
+        .collect()
+}
+
+/// PURE: what a tick that no longer prints an item's finding does to it.
+///
+/// ONLY ITS OWN ITEM: one this rule filed (`reporter`), keyed on a
+/// finding, not already told it cleared, and whose key is not among
+/// `present` — the keys this tick printed (none, on a clean one).
+/// ONLY A LATER TICK: the tick opened after the item was filed, so a
+/// redelivered old tick judges nothing. Then the shared judgement: closed
+/// `stale` while nobody has acted on it, told otherwise
+/// ([`verdict_streak::withdrawal`]).
+fn cleared(
+    item: &serde_json::Value,
+    rule: &str,
+    present: &[String],
+    tick_opened_at: &str,
+    own: &BTreeSet<String>,
+) -> Recovery {
+    let reporter = item
+        .get("metadata")
+        .and_then(|m| m.get("reporter"))
+        .and_then(|v| v.as_str());
+    let Some(key) = item_finding_key(item) else {
+        return Recovery::Leave;
+    };
+    if reporter != Some(rule) || told_recovered(item) || present.contains(&key) {
+        return Recovery::Leave;
+    }
+    let at = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok();
+    match (at(tick_opened_at), at(str_field(item, "opened_at"))) {
+        (Some(tick), Some(filed)) if tick > filed => withdrawal(item, own),
+        _ => Recovery::Leave,
+    }
+}
+
+/// PURE: the backlog-item one finding becomes under `one_item_per =
+/// "finding"`: the route item's body for that one line, plus the line as
+/// its dedup key, and a title that carries the start of the error — the
+/// boss-gcp audit leads it with the file:line to remove, so two items
+/// under one route read apart on the board (backlog d1b03874).
+pub(crate) fn finding_item_body(
+    route: &str,
+    kind: &str,
+    error: &str,
+    chore_id: &str,
+    chore_kind: &str,
+    chore_title: &str,
+    design: &str,
+    area: &str,
+    owner: &str,
+    ctx: &InvocationContext,
+) -> serde_json::Value {
+    let red = RedRoute {
+        route: route.to_string(),
+        findings: vec![(kind.to_string(), error.to_string())],
+    };
+    let mut body = item_body(
+        &red,
+        chore_id,
+        chore_kind,
+        chore_title,
+        design,
+        area,
+        owner,
+        ctx,
+    );
+    let head: String = error.chars().take(140).collect();
+    let more = if head.len() < error.len() { "…" } else { "" };
+    let short = &chore_id[..chore_id.len().min(8)];
+    body["title"] = json!(format!("{chore_title} red: {route} {kind}: {head}{more}"));
+    body["metadata"][RED_FINDING] = json!(finding_key(route, kind, error));
+    body["metadata"]["detail"] = json!(format!(
+        "Filed by {} (backlog d1b03874, design {design}): the {chore_kind} packet {short} \
+         recorded this finding on its own RED line: {kind}: {error}. One item per distinct \
+         finding while it is open, because the rule declares one_item_per = finding: a \
+         different line under the same route files its own item, and this same line again \
+         files nothing until this item closes. The chore's run step holds the whole excerpt.",
+        ctx.rule_name
+    ));
+    body
+}
+
+/// PURE: one tick's findings, one per KEY in first-seen order — the key,
+/// the first line's route, kind and error (the item's title and detail),
+/// and EVERY line under that key as `kind: error`, joined, which is what
+/// the item carries as [`RED_ERROR`]. A key on two lines is one finding
+/// naming both (backlog 52534a15).
+pub(crate) fn finding_lines(reds: &[RedRoute]) -> Vec<(String, &str, &str, &str, String)> {
+    let mut out: Vec<(String, &str, &str, &str, Vec<String>)> = Vec::new();
+    for red in reds {
+        for (kind, error) in &red.findings {
+            let key = finding_key(&red.route, kind, error);
+            let line = format!("{kind}: {error}");
+            match out.iter_mut().find(|(k, ..)| *k == key) {
+                Some((.., lines)) => {
+                    if !lines.contains(&line) {
+                        lines.push(line);
+                    }
+                }
+                None => out.push((key, &red.route, kind, error, vec![line])),
+            }
+        }
+    }
+    out.into_iter()
+        .map(|(key, route, kind, error, lines)| (key, route, kind, error, lines.join(" | ")))
+        .collect()
+}
+
+/// What one judgement did to the finding items it no longer prints.
+#[derive(Debug, Default)]
+pub(crate) struct Cleared {
+    closed: Vec<String>,
+    told: Vec<String>,
+}
+
+impl Cleared {
+    fn is_empty(&self) -> bool {
+        self.closed.is_empty() && self.told.is_empty()
+    }
+
+    /// The judged note's words: how many, and which, by short id.
+    fn text(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.closed.is_empty() {
+            parts.push(format!(
+                "closed {} backlog-item(s) stale, the finding no longer printed [{}]",
+                self.closed.len(),
+                self.closed.join(", ")
+            ));
+        }
+        if !self.told.is_empty() {
+            parts.push(format!(
+                "told {} backlog-item(s) their finding cleared, left open for whoever acted on \
+                 them [{}]",
+                self.told.len(),
+                self.told.join(", ")
+            ));
+        }
+        parts.join("; ")
+    }
+}
+
+/// PURE: the evidence a cleared finding's close cites — the tick by id
+/// and kind, what it read, and the finding's key and last-known words,
+/// copied from the item.
+fn cleared_evidence(
+    chore: &serde_json::Value,
+    step: &str,
+    item: &serde_json::Value,
+    reading: &str,
+) -> String {
+    let key = item_finding_key(item).unwrap_or_default();
+    let words = item
+        .get("metadata")
+        .and_then(|m| m.get(RED_ERROR))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let id = str_field(chore, "id");
+    format!(
+        "Tick {} ({}) completed its `{step}` step and {reading}: the finding this item was \
+         filed for — {key} — is no longer printed. Its last words, copied: {words}. A recurrence \
+         files a new item rather than reopening this one (backlog 52534a15).",
+        &id[..id.len().min(8)],
+        str_field(chore, "kind"),
+    )
+}
+
 pub struct ChoreFileReds {
     client: boss_core::machine_token::Client,
     jobs_base: String,
@@ -431,6 +720,116 @@ impl ChoreFileReds {
             rule,
         )
         .await
+    }
+
+    /// Each open item still standing for a finding this tick printed is
+    /// given the finding's words as they stand now, when they differ: a
+    /// removed earlier line moves the number the item tells David to
+    /// remove, and an item naming the old number names the wrong line.
+    /// [`RED_ERROR`] is the judge's own key, so the write is not someone
+    /// acting on the item.
+    async fn refresh_findings(
+        &self,
+        open: &[serde_json::Value],
+        candidates: &[(String, serde_json::Value)],
+        rule: &str,
+    ) -> Result<(), HandlerError> {
+        for item in open.iter().filter(|j| !told_recovered(j)) {
+            let Some(key) = item_finding_key(item) else {
+                continue;
+            };
+            let Some((_, body)) = candidates.iter().find(|(k, _)| *k == key) else {
+                continue;
+            };
+            let now = &body["metadata"][RED_ERROR];
+            if item.get("metadata").and_then(|m| m.get(RED_ERROR)) == Some(now) {
+                continue;
+            }
+            write_json(
+                &self.client,
+                reqwest::Method::PATCH,
+                &format!(
+                    "{}/api/jobs/{}/metadata",
+                    self.base(),
+                    str_field(item, "id")
+                ),
+                &json!({ RED_ERROR: now }),
+                rule,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The finding items of this rule that `chore` — a later tick — no
+    /// longer prints (`present` holds the keys it did), each closed or
+    /// told by [`cleared`]. Written BEFORE the chore's judged note, so a
+    /// delivery that failed between retries the items rather than
+    /// skipping them; idempotent, since a closed item is no longer open
+    /// and a told one carries [`RECOVERED_AT`].
+    async fn clear_findings(
+        &self,
+        chore: &serde_json::Value,
+        step: &str,
+        open: &[serde_json::Value],
+        present: &[String],
+        reading: &str,
+        ctx: &InvocationContext,
+    ) -> Result<Cleared, HandlerError> {
+        let rule = ctx.rule_name.as_str();
+        let own = finding_own_keys(ctx);
+        let tick_opened_at = str_field(chore, "opened_at");
+        let mut done = Cleared::default();
+        for item in open {
+            let decision = cleared(item, rule, present, tick_opened_at, &own);
+            if decision == Recovery::Leave {
+                continue;
+            }
+            let item_id = str_field(item, "id");
+            let short = &item_id[..item_id.len().min(8)];
+            let evidence = cleared_evidence(chore, step, item, reading);
+            // When the finding cleared: the tick's own step stamp, else
+            // the instant the event fired — never this process's clock.
+            let at = match step_by_slug(chore, step)
+                .and_then(|s| s.get("completed_at"))
+                .and_then(|v| v.as_str())
+            {
+                Some(at) => at.to_string(),
+                None => ctx.firing_instant()?.to_rfc3339(),
+            };
+            match decision {
+                Recovery::Close { step_id } => {
+                    complete_step(
+                        &self.client,
+                        self.base(),
+                        item_id,
+                        &step_id,
+                        withdrawal_fields(&evidence, HANDLER, &at),
+                        rule,
+                    )
+                    .await?;
+                    done.closed.push(short.to_string());
+                }
+                Recovery::Note { why_open } => {
+                    write_json(
+                        &self.client,
+                        reqwest::Method::PATCH,
+                        &format!("{}/api/jobs/{item_id}/metadata", self.base()),
+                        &serde_json::Value::Object(recovery_note(
+                            &evidence, HANDLER, &at, &why_open,
+                        )),
+                        rule,
+                    )
+                    .await?;
+                    done.told.push(short.to_string());
+                }
+                Recovery::Leave => {}
+            }
+        }
+        if !done.is_empty() {
+            tracing::info!(rule = %rule, chore = %str_field(chore, "id"), "finding items cleared: {}", done.text());
+        }
+        Ok(done)
     }
 
     /// A declared failed check still reaches its owner when it crashed
@@ -503,7 +902,7 @@ fn str_field<'a>(job: &'a serde_json::Value, key: &str) -> &'a str {
 #[async_trait]
 impl Handler for ChoreFileReds {
     fn name(&self) -> &'static str {
-        "maintenance.chore.file_reds"
+        HANDLER
     }
 
     async fn invoke(
@@ -522,6 +921,43 @@ impl Handler for ChoreFileReds {
             Some(route)
         } else {
             None
+        };
+        // Undeclared, an item per ROUTE, as every crawl-shaped rule wants;
+        // `finding` is for a chore whose RED lines all share one route and
+        // each name a different thing to act on (backlog d1b03874).
+        let per_finding = if args.iter().any(|(k, _)| k == "one_item_per") {
+            match arg_string(args, "one_item_per")? {
+                "route" => false,
+                "finding" => true,
+                other => {
+                    return Err(HandlerError::Permanent(format!(
+                        "one_item_per must be \"route\" or \"finding\", not {other:?}"
+                    )));
+                }
+            }
+        } else {
+            false
+        };
+        // The run-step word that says the chore found NOTHING, so a tick
+        // with no RED line may close this rule's finding items (backlog
+        // 52534a15). Both or neither; only under `finding`, whose items
+        // are each one finding a later tick can stop printing.
+        let clean = match (
+            args.iter().any(|(k, _)| k == "clean_field"),
+            args.iter().any(|(k, _)| k == "clean_value"),
+        ) {
+            (false, false) => None,
+            (true, true) if per_finding => Some((
+                arg_string(args, "clean_field")?,
+                arg_string(args, "clean_value")?,
+            )),
+            _ => {
+                return Err(HandlerError::Permanent(
+                    "clean_field and clean_value are declared together, and only with \
+                     one_item_per = \"finding\""
+                        .into(),
+                ));
+            }
         };
         let rule = ctx.rule_name.as_str();
 
@@ -560,6 +996,35 @@ impl Handler for ChoreFileReds {
             .unwrap_or("");
         let reds = red_routes(output);
         if reds.is_empty() {
+            // A CLEAN TICK closes what it no longer prints — everything of
+            // this rule's — and writes nothing when there is nothing to
+            // close: 47 clean ticks a day are not 47 notes (52534a15).
+            if let Some((field, value)) = clean {
+                let word = step_by_slug(&chore, step)
+                    .and_then(|s| s.get("metadata"))
+                    .and_then(|m| m.get(field))
+                    .and_then(|v| v.as_str());
+                if word == Some(value) {
+                    let open =
+                        open_jobs_of_kind(&self.client, self.base(), "backlog-item", rule).await?;
+                    let reading = format!("reads {field}={value} and prints no finding");
+                    let done = self
+                        .clear_findings(&chore, step, &open, &[], &reading, ctx)
+                        .await?;
+                    if done.is_empty() {
+                        return Ok(());
+                    }
+                    return self
+                        .annotate(
+                            chore_id,
+                            json!({
+                                JUDGED: format!("{rule}: this tick {reading}; {}", done.text()),
+                            }),
+                            rule,
+                        )
+                        .await;
+                }
+            }
             if let Some(route) = fallback.filter(|_| {
                 ctx.event_payload.get("outcome").and_then(|v| v.as_str()) == Some("failed")
             }) {
@@ -605,6 +1070,29 @@ impl Handler for ChoreFileReds {
                     );
                     (cause_verdict(&cause, reds.len()), true, vec![(cause, body)])
                 }
+                None if per_finding => (
+                    routes_verdict(reds.len()),
+                    false,
+                    finding_lines(&reds)
+                        .into_iter()
+                        .map(|(key, route, kind, error, all)| {
+                            let mut body = finding_item_body(
+                                route,
+                                kind,
+                                error,
+                                chore_id,
+                                chore_kind,
+                                chore_title,
+                                design,
+                                area,
+                                &owner,
+                                ctx,
+                            );
+                            body["metadata"][RED_ERROR] = json!(all);
+                            (key, body)
+                        })
+                        .collect(),
+                ),
                 None => (
                     routes_verdict(reds.len()),
                     false,
@@ -627,6 +1115,8 @@ impl Handler for ChoreFileReds {
             };
         let already = if shared {
             open_causes(&open)
+        } else if per_finding {
+            open_findings(&open)
         } else {
             open_routes(&open)
         };
@@ -634,6 +1124,11 @@ impl Handler for ChoreFileReds {
         let mut filed: Vec<(String, String)> = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
         for (key, body) in &candidates {
+            // A line printed twice on one tick is one finding, so a key
+            // this pass already filed or skipped is not judged again.
+            if filed.iter().any(|(k, _)| k == key) || skipped.contains(key) {
+                continue;
+            }
             if already.iter().any(|k| k == key) {
                 skipped.push(key.clone());
                 continue;
@@ -647,6 +1142,30 @@ impl Handler for ChoreFileReds {
             .await?;
             filed.push((key.clone(), id));
         }
+
+        // 5b. Under `finding`, the tick is a whole judgement of the file:
+        //     an open item whose finding it still prints is told the
+        //     finding's words as they stand now (the line it names may
+        //     have moved), and one whose finding it no longer prints is
+        //     closed, or told (backlog 52534a15).
+        let cleared_text = if per_finding && !shared {
+            let present: Vec<String> = candidates.iter().map(|(k, _)| k.clone()).collect();
+            self.refresh_findings(&open, &candidates, rule).await?;
+            let reading = format!(
+                "prints {} finding(s), none of them this item's",
+                present.len()
+            );
+            let done = self
+                .clear_findings(&chore, step, &open, &present, &reading, ctx)
+                .await?;
+            if done.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", done.text())
+            }
+        } else {
+            String::new()
+        };
 
         // 6. The note on the judged chore, with its verdict.
         let filed_ids: Vec<&str> = filed.iter().map(|(_, id)| id.as_str()).collect();
@@ -664,7 +1183,7 @@ impl Handler for ChoreFileReds {
             json!({
                 JUDGED: format!(
                     "{rule}: {verdict} — {} red route(s) on step `{step}`{shape}; filed {} \
-                     backlog-item(s) [{}]; already open [{}]",
+                     backlog-item(s) [{}]; already open [{}]{cleared_text}",
                     reds.len(),
                     filed.len(),
                     filed_text.join(", "),
@@ -755,21 +1274,51 @@ mod tests {
     }
 
     type Writes = Arc<Mutex<Vec<(String, String, serde_json::Value)>>>;
+    type Rows = Arc<Mutex<HashMap<String, serde_json::Value>>>;
+
+    /// When the jobs API admits every row `POST /api/jobs` mints: one
+    /// minute after the newest row it holds, so an item is filed after
+    /// the tick that filed it and before the tick a test adds next.
+    fn admitted_at(map: &HashMap<String, serde_json::Value>) -> String {
+        let newest = map
+            .values()
+            .filter_map(|j| j["opened_at"].as_str())
+            .filter_map(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .max()
+            .unwrap_or_else(|| {
+                chrono::DateTime::parse_from_rfc3339("2026-10-19T00:00:00+00:00").unwrap()
+            });
+        (newest + chrono::Duration::minutes(1)).to_rfc3339()
+    }
+
+    async fn mock_jobs(jobs: Vec<serde_json::Value>) -> (String, Writes) {
+        let (base, writes, _) = mock_jobs_rows(jobs).await;
+        (base, writes)
+    }
 
     /// Stand-in for jobs-api, the shape `ops_judge`'s tests use: `GET
     /// /api/jobs/{id}` serves one, `GET /api/jobs?kind=&status=open`
     /// lists the open ones, `POST /api/jobs` mints an id and keeps the
-    /// row open, `PATCH /api/jobs/{id}/metadata` merges — so a second
-    /// delivery reads what the first wrote.
-    async fn mock_jobs(jobs: Vec<serde_json::Value>) -> (String, Writes) {
+    /// row open — admitted as the API admits it, with `opened_at`, the
+    /// two admission stamps and a ready `triage` — `PATCH
+    /// /api/jobs/{id}/metadata` merges, and the step merge door plus the
+    /// completion PUT close an item whose `triage` completes `stale` — so
+    /// a second delivery reads what the first wrote.
+    async fn mock_jobs_rows(jobs: Vec<serde_json::Value>) -> (String, Writes, Rows) {
         let writes: Writes = Arc::new(Mutex::new(Vec::new()));
-        let by_id: Arc<Mutex<HashMap<String, serde_json::Value>>> = Arc::new(Mutex::new(
+        let by_id: Rows = Arc::new(Mutex::new(
             jobs.into_iter()
                 .map(|j| (j["id"].as_str().unwrap_or_default().to_string(), j))
                 .collect(),
         ));
         let (g, l, pj, pm) = (by_id.clone(), by_id.clone(), by_id.clone(), by_id.clone());
-        let (wj, wm) = (writes.clone(), writes.clone());
+        let (sm, sp, rows) = (by_id.clone(), by_id.clone(), by_id.clone());
+        let (wj, wm, wsm, wsp) = (
+            writes.clone(),
+            writes.clone(),
+            writes.clone(),
+            writes.clone(),
+        );
         let app = Router::new()
             .route(
                 "/api/jobs/{id}",
@@ -812,8 +1361,16 @@ mod tests {
                             .push(("POST".into(), "/api/jobs".into(), body.clone()));
                         let mut map = by_id.lock().unwrap();
                         let id = format!("f0000000-0000-0000-0000-{:012}", map.len() + 1);
+                        let at = admitted_at(&map);
                         let mut row = body;
                         row["id"] = json!(id);
+                        row["opened_at"] = json!(at);
+                        row["metadata"]["opened_at"] = json!(at);
+                        row["metadata"]["opened_by"] = json!("automation:rule:test");
+                        row["steps"] = json!([
+                            { "id": format!("{id}-filed"), "spec_slug": "filed", "status": "completed", "metadata": {} },
+                            { "id": format!("{id}-triage"), "spec_slug": "triage", "status": "ready", "metadata": {} },
+                        ]);
                         map.insert(id.clone(), row);
                         (axum::http::StatusCode::CREATED, Json(json!({ "id": id })))
                     }
@@ -842,11 +1399,69 @@ mod tests {
                         }
                     },
                 ),
+            )
+            .route(
+                "/api/jobs/{id}/steps/{sid}/metadata",
+                axum::routing::patch(
+                    move |Path((id, sid)): Path<(String, String)>,
+                          Json(body): Json<serde_json::Value>| {
+                        let (w, by_id) = (wsm.clone(), sm.clone());
+                        async move {
+                            w.lock().unwrap().push((
+                                "PATCH".into(),
+                                format!("/api/jobs/{id}/steps/{sid}/metadata"),
+                                body.clone(),
+                            ));
+                            let mut map = by_id.lock().unwrap();
+                            let step = map
+                                .get_mut(&id)
+                                .and_then(|j| j["steps"].as_array_mut())
+                                .and_then(|s| s.iter_mut().find(|s| s["id"] == json!(sid)));
+                            if let (Some(step), Some(b)) = (step, body.as_object()) {
+                                for (k, v) in b {
+                                    step["metadata"][k] = v.clone();
+                                }
+                            }
+                            axum::http::StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/api/jobs/{id}/steps/{sid}",
+                axum::routing::put(
+                    move |Path((id, sid)): Path<(String, String)>,
+                          Json(body): Json<serde_json::Value>| {
+                        let (w, by_id) = (wsp.clone(), sp.clone());
+                        async move {
+                            w.lock().unwrap().push((
+                                "PUT".into(),
+                                format!("/api/jobs/{id}/steps/{sid}"),
+                                body.clone(),
+                            ));
+                            let mut map = by_id.lock().unwrap();
+                            if let Some(job) = map.get_mut(&id) {
+                                let stale = job["steps"]
+                                    .as_array_mut()
+                                    .and_then(|s| s.iter_mut().find(|s| s["id"] == json!(sid)))
+                                    .map(|step| {
+                                        step["status"] = body["status"].clone();
+                                        step["metadata"]["disposition"] == json!("stale")
+                                    })
+                                    .unwrap_or(false);
+                                if stale && body["status"] == json!("completed") {
+                                    job["status"] = json!("closed");
+                                }
+                            }
+                            axum::http::StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{addr}"), writes)
+        (format!("http://{addr}"), writes, rows)
     }
 
     fn handler(base: String) -> Arc<ChoreFileReds> {
@@ -1064,6 +1679,513 @@ mod tests {
         assert_eq!(filed[0]["metadata"]["area"], "credentials");
         assert_eq!(filed[0]["metadata"]["source"], source_of_chore(CRAWL));
         assert_eq!(filed[0]["owner_id"], "emp-owner");
+    }
+
+    /// A SECOND LINE WHILE THE FIRST IS OPEN IS NAMED (backlog d1b03874).
+    /// Every deposit key finding prints under ONE route, so a judge that
+    /// dedups by route alone filed the first converge's line and then
+    /// nothing for a different line found while that item was open: the
+    /// open item named one line of two, and removing a line is David's
+    /// hand act, done from what the item says. The authored rule declares
+    /// `one_item_per = "finding"`, so each distinct RED line is its own
+    /// item: tick 1 finds line 1, tick 2 finds line 1 AND a new line 4,
+    /// tick 3 is line 1 again — two items, each naming its own line, and
+    /// the repeat (and a redelivery) files nothing.
+    #[tokio::test]
+    async fn the_authored_deposit_key_rule_names_a_second_line_found_while_the_first_is_open() {
+        use boss_dispatcher::rules::{
+            expr::NoHelpers,
+            handler::{HandlerRegistry, dispatch},
+            registry::{Registry, match_event},
+        };
+        const RULE_FILE: &str = "file-backlog-items-on-boss-gcp-deposit-key-unconfined";
+        const TICK2: &str = "33333333-3333-3333-3333-333333333335";
+        const TICK3: &str = "33333333-3333-3333-3333-333333333336";
+        let rule = std::fs::read_to_string(
+            boss_testing::repo_root().join(format!("infra/dispatcher/rules/{RULE_FILE}.toml")),
+        )
+        .unwrap();
+        let registry = Registry::from_toml(&rule).unwrap();
+        let line1 = "RED boss-gcp-converge/deposit-key-unconfined refused: deposit-key-audit: \
+                     UNCONFINED /home/david/.ssh/authorized_keys:1 — the key ssh-ed25519 \
+                     SHA256:aaaa is also on this line with NO forced command";
+        let line4 = "RED boss-gcp-converge/deposit-key-unconfined refused: deposit-key-audit: \
+                     UNCONFINED /home/david/.ssh/authorized_keys:4 — the key ssh-ed25519 \
+                     SHA256:bbbb is forced to the receiver WITHOUT restrict";
+        let both = format!("{line1}\n{line4}");
+        let tick = |id: &str, red: &str| {
+            let mut job = crawl(red);
+            job["id"] = json!(id);
+            job["kind"] = json!("maintenance-boss-gcp-converge");
+            job["title"] = json!("boss-gcp adopts its own units");
+            job["steps"][1]["metadata"] = json!({
+                "result": "ok", "deposit_key_verdict": "unconfined", "output": red,
+            });
+            job
+        };
+        let (base, writes) = mock_jobs(vec![
+            tick(CRAWL, line1),
+            tick(TICK2, &both),
+            tick(TICK3, line1),
+        ])
+        .await;
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(handler(base));
+        for (id, red) in [
+            (CRAWL, line1),
+            (CRAWL, line1),
+            (TICK2, both.as_str()),
+            (TICK3, line1),
+        ] {
+            let payload = json!({
+                "job_id": id, "step_id": "c-run", "kind": "task",
+                "subject_kind": "custom", "subject_id": "infra/maintenance-boss-gcp-converge",
+                "workflow_kind": "maintenance-boss-gcp-converge",
+                "completed_on": "2026-10-18", "notify_on_done": false, "spec_slug": "run",
+                "metadata": {"result": "ok", "deposit_key_verdict": "unconfined", "output": red},
+            });
+            let matched = match_event(&registry, "step.done.task", &payload, &NoHelpers).matched;
+            assert_eq!(matched.len(), 1);
+            let result = dispatch(
+                &matched,
+                &handlers,
+                "event-step",
+                "step.done.task",
+                &payload,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(result[0].outcome.is_ok(), "{result:?}");
+        }
+        let w = writes.lock().unwrap().clone();
+        let filed = posts(&w);
+        assert_eq!(
+            filed.len(),
+            2,
+            "two distinct lines are two open items; a repeat and a redelivery file nothing: {w:?}"
+        );
+        for (item, fp, at) in [
+            (&filed[0], "SHA256:aaaa", "authorized_keys:1"),
+            (&filed[1], "SHA256:bbbb", "authorized_keys:4"),
+        ] {
+            // Keyed on the key it names, not the line (backlog 52534a15).
+            assert_eq!(
+                item["metadata"][RED_FINDING],
+                format!("boss-gcp-converge/deposit-key-unconfined refused: key {fp}")
+            );
+            assert_eq!(
+                item["metadata"][RED_ROUTE],
+                "boss-gcp-converge/deposit-key-unconfined"
+            );
+            assert!(
+                item["title"].as_str().unwrap().contains(at),
+                "the title names the line to act on: {item}"
+            );
+            assert!(
+                item["metadata"]["red_error"].as_str().unwrap().contains(at),
+                "{item}"
+            );
+            assert_eq!(item["metadata"]["area"], "credentials");
+        }
+        assert_eq!(filed[1]["metadata"]["source"], source_of_chore(TICK2));
+        let judged: Vec<&str> = w
+            .iter()
+            .filter(|(m, _, _)| m == "PATCH")
+            .filter_map(|(_, _, b)| b[JUDGED].as_str())
+            .collect();
+        assert_eq!(judged.len(), 3, "each tick judged once: {judged:?}");
+        assert!(
+            judged[2].contains("filed 0 backlog-item(s)"),
+            "the repeat of line 1 files nothing and says so: {}",
+            judged[2]
+        );
+    }
+
+    // -- a finding is its KEY, and a judgement that drops it closes it ---
+    // (backlog 52534a15)
+
+    const DEPOSIT_RULE: &str = "file-backlog-items-on-boss-gcp-deposit-key-unconfined";
+    const FP_A: &str = "SHA256:Q8OBmag8TG5aAaAaAaAaAaAaAaAaAaAaAaAaAaA";
+    const FP_B: &str = "SHA256:bBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBbBb";
+
+    /// One `UNCONFINED` RED line as boss-gcp-converge.sh prints it, for the
+    /// key `fp` at `authorized_keys:<n>`, with `why` as the audit's prose.
+    fn deposit_red(n: u32, fp: &str, why: &str) -> String {
+        format!(
+            "RED boss-gcp-converge/deposit-key-unconfined refused: deposit-key-audit: \
+             UNCONFINED /home/david/.ssh/authorized_keys:{n} — the key ED25519 {fp} {why}"
+        )
+    }
+
+    /// A converge tick as its packet reads back: the verdict word and
+    /// `output` on a completed `run` step, opened at `opened_at`.
+    fn deposit_tick(id: &str, opened_at: &str, verdict: &str, output: &str) -> serde_json::Value {
+        let mut job = crawl(output);
+        job["id"] = json!(id);
+        job["kind"] = json!("maintenance-boss-gcp-converge");
+        job["title"] = json!("boss-gcp adopts its own units");
+        job["status"] = json!("open");
+        job["opened_at"] = json!(opened_at);
+        job["steps"][1]["completed_at"] = json!(opened_at);
+        job["steps"][1]["metadata"] = json!({
+            "result": "ok", "deposit_key_verdict": verdict, "output": output,
+        });
+        job
+    }
+
+    /// Deliver `id`'s `run` marker through the AUTHORED rule file, as the
+    /// dispatcher would; `false` when the rule does not select it.
+    async fn deliver_deposit(base: &str, id: &str, verdict: &str, output: &str) -> bool {
+        use boss_dispatcher::rules::{
+            expr::NoHelpers,
+            handler::{HandlerRegistry, dispatch},
+            registry::{Registry, match_event},
+        };
+        let rule = std::fs::read_to_string(
+            boss_testing::repo_root().join(format!("infra/dispatcher/rules/{DEPOSIT_RULE}.toml")),
+        )
+        .unwrap();
+        let registry = Registry::from_toml(&rule).unwrap();
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(handler(base.to_string()));
+        let payload = json!({
+            "job_id": id, "step_id": "c-run", "kind": "task",
+            "subject_kind": "custom", "subject_id": "infra/maintenance-boss-gcp-converge",
+            "workflow_kind": "maintenance-boss-gcp-converge",
+            "completed_on": "2026-10-19", "notify_on_done": false, "spec_slug": "run",
+            "metadata": {"result": "ok", "deposit_key_verdict": verdict, "output": output},
+        });
+        let matched = match_event(&registry, "step.done.task", &payload, &NoHelpers).matched;
+        if matched.is_empty() {
+            return false;
+        }
+        let result = dispatch(
+            &matched,
+            &handlers,
+            "event-step",
+            "step.done.task",
+            &payload,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result[0].outcome.is_ok(), "{result:?}");
+        true
+    }
+
+    fn item_rows(rows: &Rows) -> Vec<serde_json::Value> {
+        let mut items: Vec<serde_json::Value> = rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|j| j["kind"] == "backlog-item")
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        items
+    }
+
+    /// The fingerprint is read off the error as ssh-keygen prints it, up to
+    /// the first character a base64 fingerprint cannot hold; a finding that
+    /// names no key keeps its whole line as its key.
+    #[test]
+    fn a_finding_is_keyed_on_the_first_fingerprint_it_names() {
+        let e = format!("UNCONFINED /h/a:9 — the key ED25519 {FP_A} (me@x), forced to 'SHA256:zz'");
+        assert_eq!(key_fingerprint(&e), Some(FP_A));
+        assert_eq!(
+            key_fingerprint("the key ED25519 SHA256:abc/+=, then"),
+            Some("SHA256:abc/+=")
+        );
+        assert_eq!(key_fingerprint("reads no key from this line"), None);
+        assert_eq!(key_fingerprint("SHA256: nothing after"), None);
+        assert_eq!(finding_key("r", "k", &e), format!("r k: key {FP_A}"));
+        assert_eq!(finding_key("r", "k", "no key here"), "r k: no key here");
+    }
+
+    const T1: &str = "44444444-0000-0000-0000-000000000001";
+    const T2: &str = "44444444-0000-0000-0000-000000000002";
+    const T3: &str = "44444444-0000-0000-0000-000000000003";
+
+    /// (1) A SHIFTED LINE IS THE SAME FINDING. David removes an earlier
+    /// line of authorized_keys, so key A's finding moves from line 4 to
+    /// line 3: the open item still matches — nothing is filed beside it —
+    /// and it now names line 3, the line to act on.
+    #[tokio::test]
+    async fn a_shifted_line_keeps_matching_its_open_item_and_names_the_new_line() {
+        let why = "is forced to the receiver WITHOUT restrict.";
+        let (at4, at3) = (deposit_red(4, FP_A, why), deposit_red(3, FP_A, why));
+        let (base, writes, rows) = mock_jobs_rows(vec![deposit_tick(
+            T1,
+            "2026-10-19T06:00:00+00:00",
+            "unconfined",
+            &at4,
+        )])
+        .await;
+        assert!(deliver_deposit(&base, T1, "unconfined", &at4).await);
+        rows.lock().unwrap().insert(
+            T2.into(),
+            deposit_tick(T2, "2026-10-19T06:30:00+00:00", "unconfined", &at3),
+        );
+        assert!(deliver_deposit(&base, T2, "unconfined", &at3).await);
+        let w = writes.lock().unwrap().clone();
+        assert_eq!(
+            posts(&w).len(),
+            1,
+            "a shifted line files nothing beside its item: {w:?}"
+        );
+        let items = item_rows(&rows);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0]["status"], "open",
+            "the finding still stands: {}",
+            items[0]
+        );
+        assert_eq!(
+            items[0]["metadata"][RED_FINDING],
+            format!("boss-gcp-converge/deposit-key-unconfined refused: key {FP_A}"),
+            "keyed on the key's fingerprint, never on file:line"
+        );
+        let error = items[0]["metadata"]["red_error"].as_str().unwrap();
+        assert!(
+            error.contains("authorized_keys:3") && !error.contains("authorized_keys:4"),
+            "the item names the line as it stands now: {error}"
+        );
+    }
+
+    /// (2) A REWORDED FINDING IS THE SAME FINDING. A later audit prints
+    /// key A's finding in new prose (a car rewrote the text): it does not
+    /// re-file beside the stale item.
+    #[tokio::test]
+    async fn a_reworded_finding_does_not_refile_beside_its_open_item() {
+        let old = deposit_red(4, FP_A, "is forced to the receiver WITHOUT restrict.");
+        let new = deposit_red(
+            4,
+            FP_A,
+            "is forced to '/usr/local/libexec/boss/x' WITHOUT restrict, so sshd also gives it a pty.",
+        );
+        let (base, writes, rows) = mock_jobs_rows(vec![deposit_tick(
+            T1,
+            "2026-10-19T06:00:00+00:00",
+            "unconfined",
+            &old,
+        )])
+        .await;
+        assert!(deliver_deposit(&base, T1, "unconfined", &old).await);
+        rows.lock().unwrap().insert(
+            T2.into(),
+            deposit_tick(T2, "2026-10-19T06:30:00+00:00", "unconfined", &new),
+        );
+        assert!(deliver_deposit(&base, T2, "unconfined", &new).await);
+        let w = writes.lock().unwrap().clone();
+        assert_eq!(
+            posts(&w).len(),
+            1,
+            "a reworded finding is not a new one: {w:?}"
+        );
+        let items = item_rows(&rows);
+        assert_eq!(items[0]["status"], "open");
+        assert!(
+            items[0]["metadata"]["red_error"]
+                .as_str()
+                .unwrap()
+                .contains("so sshd also gives it a pty"),
+            "the item carries the audit's current words: {}",
+            items[0]
+        );
+    }
+
+    /// An item filed under rule v2 carries the whole RED line as its key;
+    /// it is the same finding as the fingerprint key, so the first tick
+    /// after this lands neither re-files it nor closes it.
+    #[tokio::test]
+    async fn an_item_keyed_on_the_whole_line_matches_its_fingerprint() {
+        let line = deposit_red(4, FP_A, "is forced to the receiver WITHOUT restrict.");
+        let (base, writes, rows) = mock_jobs_rows(vec![deposit_tick(
+            T1,
+            "2026-10-19T06:00:00+00:00",
+            "unconfined",
+            &line,
+        )])
+        .await;
+        assert!(deliver_deposit(&base, T1, "unconfined", &line).await);
+        // Rewrite the filed item's key to the v2 shape.
+        let id = item_rows(&rows)[0]["id"].as_str().unwrap().to_string();
+        rows.lock().unwrap().get_mut(&id).unwrap()["metadata"][RED_FINDING] =
+            json!(line.strip_prefix(RED_PREFIX).unwrap());
+        let shifted = deposit_red(3, FP_A, "is forced to the receiver WITHOUT restrict.");
+        rows.lock().unwrap().insert(
+            T2.into(),
+            deposit_tick(T2, "2026-10-19T06:30:00+00:00", "unconfined", &shifted),
+        );
+        assert!(deliver_deposit(&base, T2, "unconfined", &shifted).await);
+        let w = writes.lock().unwrap().clone();
+        assert_eq!(posts(&w).len(), 1, "{w:?}");
+        assert_eq!(item_rows(&rows)[0]["status"], "open");
+    }
+
+    /// (3) A CLEARED FINDING CLOSES ITS ITEM. Tick 2 prints key B only — a
+    /// changed judgement: key A's item closes `stale` at triage, citing
+    /// the tick that stopped printing it, and B files. Tick 3 reads
+    /// `clean`: B's item closes too. Each close is the judge's own act,
+    /// recorded with the reading that cleared it.
+    #[tokio::test]
+    async fn a_cleared_finding_closes_its_item_citing_the_tick_that_dropped_it() {
+        let a = deposit_red(4, FP_A, "is forced to the receiver WITHOUT restrict.");
+        let b = deposit_red(
+            7,
+            FP_B,
+            "is a prepared deposit key on a line with NO forced command.",
+        );
+        let (base, writes, rows) = mock_jobs_rows(vec![deposit_tick(
+            T1,
+            "2026-10-19T06:00:00+00:00",
+            "unconfined",
+            &a,
+        )])
+        .await;
+        assert!(deliver_deposit(&base, T1, "unconfined", &a).await);
+        rows.lock().unwrap().insert(
+            T2.into(),
+            deposit_tick(T2, "2026-10-19T06:30:00+00:00", "unconfined", &b),
+        );
+        assert!(deliver_deposit(&base, T2, "unconfined", &b).await);
+        let items = item_rows(&rows);
+        assert_eq!(items.len(), 2, "{items:?}");
+        let (item_a, item_b) = (&items[0], &items[1]);
+        assert_eq!(
+            item_a["status"], "closed",
+            "A is no longer printed: {item_a}"
+        );
+        let triage = item_a["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["spec_slug"] == "triage")
+            .unwrap();
+        assert_eq!(triage["metadata"]["disposition"], "stale");
+        assert_eq!(
+            triage["metadata"]["cleared_by"],
+            "maintenance.chore.file_reds"
+        );
+        let evidence = triage["metadata"]["evidence"].as_str().unwrap();
+        assert!(
+            evidence.contains(&T2[..8]) && evidence.contains(FP_A),
+            "the close names the tick and the key: {evidence}"
+        );
+        assert_eq!(
+            triage["metadata"]["recovered_at"],
+            "2026-10-19T06:30:00+00:00"
+        );
+        assert_eq!(item_b["status"], "open");
+
+        // A clean tick: B closes; a redelivery writes nothing more.
+        rows.lock().unwrap().insert(
+            T3.into(),
+            deposit_tick(T3, "2026-10-19T07:00:00+00:00", "clean", ""),
+        );
+        assert!(deliver_deposit(&base, T3, "clean", "").await);
+        let before = writes.lock().unwrap().len();
+        assert!(deliver_deposit(&base, T3, "clean", "").await);
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            before,
+            "a redelivery is a no-op"
+        );
+        assert!(
+            item_rows(&rows).iter().all(|i| i["status"] == "closed"),
+            "{:?}",
+            item_rows(&rows)
+        );
+        let note = rows.lock().unwrap()[T3]["metadata"][JUDGED]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            note.contains("closed 1"),
+            "the clean tick says what it closed: {note}"
+        );
+    }
+
+    /// An UNVERIFIED tick is no evidence either way: the rule does not
+    /// hand it over, so nothing closes. A clean tick older than the item
+    /// (a redelivery from before it was filed) closes nothing; and an
+    /// item a person has written on is told, never closed from under them.
+    #[tokio::test]
+    async fn unverified_older_or_touched_closes_nothing() {
+        let a = deposit_red(4, FP_A, "is forced to the receiver WITHOUT restrict.");
+        let (base, writes, rows) = mock_jobs_rows(vec![
+            deposit_tick(T1, "2026-10-19T06:00:00+00:00", "unconfined", &a),
+            deposit_tick(T2, "2026-10-19T05:00:00+00:00", "clean", ""),
+        ])
+        .await;
+        assert!(deliver_deposit(&base, T1, "unconfined", &a).await);
+        assert!(
+            !deliver_deposit(&base, T1, "unverified", "").await,
+            "the rule does not select an unverified tick"
+        );
+        assert!(deliver_deposit(&base, T2, "clean", "").await);
+        assert_eq!(
+            item_rows(&rows)[0]["status"],
+            "open",
+            "an older tick closes nothing"
+        );
+        let id = item_rows(&rows)[0]["id"].as_str().unwrap().to_string();
+        rows.lock().unwrap().get_mut(&id).unwrap()["metadata"]["owner_note"] =
+            json!("removing it tonight");
+        rows.lock().unwrap().insert(
+            T3.into(),
+            deposit_tick(T3, "2026-10-19T07:00:00+00:00", "clean", ""),
+        );
+        assert!(deliver_deposit(&base, T3, "clean", "").await);
+        let item = &item_rows(&rows)[0];
+        assert_eq!(
+            item["status"], "open",
+            "a person's item is told, not closed: {item}"
+        );
+        assert!(
+            item["metadata"]["recovery"]
+                .as_str()
+                .unwrap_or("")
+                .contains("RECOVERED")
+        );
+        let _ = writes;
+    }
+
+    /// The crawl keeps one item per ROUTE: a route already open files
+    /// nothing even when tonight's error text differs (ac3270c7), and an
+    /// unknown `one_item_per` is a rule mistake, refused permanently.
+    #[tokio::test]
+    async fn one_item_per_defaults_to_the_route_and_refuses_an_unknown_value() {
+        let (base, writes) = mock_jobs(vec![
+            crawl(RED_OUTPUT),
+            open_item("old", "/it/registry/dispatcher"),
+        ])
+        .await;
+        let h = handler(base);
+        h.invoke(&args(), &ctx()).await.unwrap();
+        let filed = posts(&writes.lock().unwrap());
+        assert_eq!(filed.len(), 1, "{filed:?}");
+        assert_eq!(filed[0]["metadata"][RED_ROUTE], "/ux/catalog/models/m-1");
+        assert!(filed[0]["metadata"].get(RED_FINDING).is_none());
+        let mut a = args();
+        a.push(("one_item_per".into(), Value::String("line".into())));
+        assert!(h.invoke(&a, &ctx()).await.unwrap_err().is_permanent());
+    }
+
+    /// Two identical finding lines on one tick are one finding, one item.
+    #[tokio::test]
+    async fn one_item_per_finding_files_a_repeated_line_on_one_tick_once() {
+        let (base, writes) = mock_jobs(vec![crawl(RED_OUTPUT)]).await;
+        let mut a = args();
+        a.push(("one_item_per".into(), Value::String("finding".into())));
+        handler(base).invoke(&a, &ctx()).await.unwrap();
+        let filed = posts(&writes.lock().unwrap());
+        assert_eq!(
+            filed.len(),
+            2,
+            "the dispatcher route printed one error twice, so two distinct findings: {filed:?}"
+        );
     }
 
     #[tokio::test]

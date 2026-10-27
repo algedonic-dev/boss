@@ -202,9 +202,10 @@
     loadManifest();
     // THE VIEWER'S FLIGHTS (design c4c2a607). The gateway inlines them
     // into index.html, so a page it served already knows; a page it did
-    // not (the dev server, a gateway whose flights read failed) asks the
-    // same endpoint once. A failed read leaves every flight off.
-    if (flights.on === null) void loadFlights();
+    // not (the dev server, a gateway whose flights read failed) retries
+    // the same endpoint. Unknown stays OFF until an answer is readable.
+    const flightsRead = new AbortController();
+    if (flights.on === null) void loadFlights(flightsRead.signal);
     loadStepTypeRegistry();
     loadClasses('employee');
     loadDepartments();
@@ -212,7 +213,10 @@
       parsed = parseRoute(window.location.pathname, window.location.search);
     };
     window.addEventListener('popstate', onPop);
-    return () => window.removeEventListener('popstate', onPop);
+    return () => {
+      flightsRead.abort();
+      window.removeEventListener('popstate', onPop);
+    };
   });
 
   // Which sidebar section highlights. The route->section map lives in
@@ -447,6 +451,9 @@
     {:else if route.kind === 'companyMap'}
       <CompanyMap />
     {:else if route.kind === 'systemYard'}
+      {#if flights.on === null}
+        <p role="status" data-flights-unread data-retrying={flights.retrying}>Flights unread, retrying</p>
+      {/if}
       <!-- THE DEPARTMENT MAP (design e765b3fc): the map on top and the
            selection's panel below it. A selection is a query on this one
            route, so the map is mounted once and never torn down by a

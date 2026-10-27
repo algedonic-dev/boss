@@ -9,7 +9,7 @@ use boss_core::{
 };
 use boss_events::original_group::{GroupReference, OriginalGroup};
 use boss_jobs::{
-    membership_replay::{ReplayGroup, ReplayInput, replay},
+    membership_replay::{InitialState, ReplayGroup, ReplayInput, replay},
     move_diagnosis::HistoricalEvent,
     port::JobScope,
     stations::StationSpec,
@@ -17,6 +17,649 @@ use boss_jobs::{
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::json;
 use uuid::Uuid;
+
+mod projection_tests {
+    use super::*;
+    use boss_jobs::membership_replay::projection::{MembershipProjection, ProjectionBinding};
+
+    #[cfg(feature = "postgres")]
+    mod scale {
+        use super::*;
+        include!("support/membership_projection_scale.rs");
+    }
+
+    #[test]
+    fn global_scope_targeted_history_does_not_parse_unselected_packet_payloads() {
+        let (mut groups, _, job, mut seq) = fixture();
+        let denied = Uuid::new_v4().to_string();
+        groups.push(group(
+            &mut seq,
+            15,
+            vec![event(
+                boss_jobs::events::JOB_UPDATED,
+                json!({"id": denied, "deliberately": "not a valid Job"}),
+                15,
+            )],
+        ));
+        let full = cut(groups.clone(), 5, 20, "alice");
+        assert!(MembershipProjection::rebuild(&full).is_err());
+        let mut selected = cut(groups.clone(), 5, 20, "alice");
+        selected.currently_authorized = Some([job.id.to_string()].into_iter().collect());
+        let selected = MembershipProjection::rebuild(&selected);
+        assert!(
+            selected.is_ok(),
+            "an unselected packet cannot poison targeted history"
+        );
+        groups
+            .last_mut()
+            .unwrap()
+            .original
+            .as_mut()
+            .unwrap()
+            .complete = false;
+        let mut denied_incomplete = cut(groups, 5, 20, "alice");
+        denied_incomplete.currently_authorized = Some([job.id.to_string()].into_iter().collect());
+        assert!(
+            MembershipProjection::rebuild(&denied_incomplete).is_ok(),
+            "an incomplete wholly denied group has the same visibility as a narrow read"
+        );
+    }
+
+    #[test]
+    fn targeted_packet_catchup_replaces_its_history_without_rereading_unchanged_packets() {
+        let (base, next, job, _) = fixture();
+        let first = cut(base.clone(), 5, 20, "alice");
+        let mut projection = MembershipProjection::rebuild(&first).unwrap();
+        let mut late = next.clone();
+        late.rows[0].created_at = Some(t(15));
+        late.rows[0].event.timestamp = t(15);
+        let mut all = base.clone();
+        all.push(late.clone());
+        let delta = cut(vec![late], 20, 40, "alice");
+        let donor = cut(all.clone(), 5, 40, "alice");
+        projection
+            .reconcile(
+                &delta,
+                Some(&donor),
+                &[job.id.to_string()].into_iter().collect(),
+            )
+            .unwrap();
+        let oracle = cut(all, 5, 40, "alice");
+        assert_eq!(
+            serde_json::to_value(
+                projection
+                    .read(t(5), &ProjectionBinding::from_input(&oracle))
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(replay(&oracle)).unwrap()
+        );
+    }
+
+    #[test]
+    fn removing_authorization_removes_historical_facts_and_failed_catchup_is_atomic() {
+        let (base, _, job, _) = fixture();
+        let mut first = cut(base.clone(), 5, 20, "alice");
+        first.currently_authorized = Some([job.id.to_string()].into_iter().collect());
+        let mut projection = MembershipProjection::rebuild(&first).unwrap();
+        let before = serde_json::to_value(&projection).unwrap();
+        let mut delta = cut(vec![], 20, 40, "alice");
+        delta.audit_cutoff = first.audit_cutoff;
+        delta.currently_authorized = Some(Default::default());
+        let mut incomplete = cut(base.clone(), 5, 40, "alice");
+        incomplete.registry_prefix_complete = false;
+        assert!(
+            projection
+                .reconcile(
+                    &delta,
+                    Some(&incomplete),
+                    &[job.id.to_string()].into_iter().collect()
+                )
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&projection).unwrap(), before);
+        projection
+            .reconcile(&delta, None, &Default::default())
+            .unwrap();
+        let mut oracle = cut(base, 5, 40, "alice");
+        oracle.currently_authorized = Some(Default::default());
+        assert_eq!(
+            serde_json::to_value(
+                projection
+                    .read(t(5), &ProjectionBinding::from_input(&oracle))
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(replay(&oracle)).unwrap()
+        );
+    }
+
+    #[test]
+    fn targeted_generation_cannot_be_promoted_to_unrestricted_history_without_a_rebuild() {
+        let (base, _, job, _) = fixture();
+        let mut selected = cut(base, 5, 20, "alice");
+        selected.currently_authorized = Some([job.id.to_string()].into_iter().collect());
+        let mut projection = MembershipProjection::rebuild(&selected).unwrap();
+        let before = serde_json::to_value(&projection).unwrap();
+        let mut unrestricted = cut(vec![], 20, 40, "alice");
+        unrestricted.audit_cutoff = selected.audit_cutoff;
+        assert!(
+            projection
+                .reconcile(&unrestricted, None, &Default::default())
+                .is_err(),
+            "an unrestricted census has no witness for previously excluded packets"
+        );
+        assert_eq!(serde_json::to_value(projection).unwrap(), before);
+    }
+
+    #[test]
+    fn cancelled_targeted_catchup_preserves_the_last_committed_generation() {
+        use boss_jobs::membership_replay::ReplayBudget;
+        use std::sync::{Arc, atomic::AtomicBool};
+        let (base, next, job, _) = fixture();
+        let mut projection =
+            MembershipProjection::rebuild(&cut(base.clone(), 5, 20, "alice")).unwrap();
+        let before = serde_json::to_value(&projection).unwrap();
+        let delta = cut(vec![next.clone()], 20, 40, "alice");
+        let mut all = base;
+        all.push(next);
+        let donor = cut(all, 5, 40, "alice");
+        let budget = ReplayBudget::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            Arc::new(AtomicBool::new(true)),
+            usize::MAX,
+        );
+        let refusal = projection
+            .reconcile_checked(
+                &delta,
+                Some(&donor),
+                &[job.id.to_string()].into_iter().collect(),
+                &budget,
+            )
+            .unwrap_err();
+        assert!(refusal.to_string().contains("cancel"));
+        assert_eq!(serde_json::to_value(projection).unwrap(), before);
+    }
+
+    fn cut(groups: Vec<ReplayGroup>, since: i64, until: i64, actor: &str) -> ReplayInput {
+        let cutoff = groups
+            .iter()
+            .flat_map(|g| &g.rows)
+            .map(|r| r.seq)
+            .max()
+            .unwrap_or(0);
+        let mut value = input(groups, since, until);
+        value.audit_cutoff = cutoff;
+        value.actor = Some(actor.into());
+        value
+    }
+
+    fn fixture() -> (Vec<ReplayGroup>, ReplayGroup, Job, i64) {
+        let mut spec = population()
+            .into_iter()
+            .find(|s| s.name == "q.platform-admin.task")
+            .unwrap();
+        spec.predicate.step.as_mut().unwrap().assignee_id = Some("@me".into());
+        let (mut job, mut step) = eligible(&spec);
+        step.assignee_id = Some("alice".into());
+        job.metadata["obsolete"] = json!("old payload must not survive in the checkpoint");
+        let mut seq = 1;
+        let mut groups = vec![
+            group(&mut seq, 0, registration(&spec, &job)),
+            group(
+                &mut seq,
+                10,
+                vec![
+                    event(boss_jobs::events::JOB_CREATED, json!(job), 10),
+                    event(boss_jobs::events::STEP_CREATED, json!(step), 10),
+                ],
+            ),
+        ];
+        job.metadata.as_object_mut().unwrap().remove("obsolete");
+        groups.push(group(
+            &mut seq,
+            12,
+            vec![event(boss_jobs::events::JOB_UPDATED, json!(job), 12)],
+        ));
+        step.status = StepStatus::Completed;
+        let next = group(
+            &mut seq,
+            25,
+            vec![event(boss_jobs::events::STEP_UPDATED, json!(step), 25)],
+        );
+        (groups, next, job, seq)
+    }
+
+    fn empty_projection_input(since: i64, until: i64) -> ReplayInput {
+        let mut value = cut(vec![], since, until, "empty-model@caller.invalid");
+        value.audit_cutoff = 1;
+        value
+    }
+
+    #[test]
+    fn projection_refuses_missing_source_prefixes_without_any_station() {
+        let complete = empty_projection_input(5, 20);
+        let mut missing = complete.clone();
+        missing.registry_prefix_complete = false;
+        let registry_refused = MembershipProjection::rebuild(&missing).is_err();
+        missing = complete;
+        missing.packet_prefix_complete = false;
+        let packet_refused = MembershipProjection::rebuild(&missing).is_err();
+        assert!(
+            registry_refused && packet_refused,
+            "missing prefixes must refuse even with zero stations: registry={registry_refused}, packet={packet_refused}"
+        );
+    }
+
+    #[test]
+    fn projection_refuses_an_empty_delta_source_gap_without_mutating_the_checkpoint() {
+        use boss_jobs::membership_replay::Unavailable;
+        let mut projection = MembershipProjection::rebuild(&empty_projection_input(5, 20)).unwrap();
+        let before = serde_json::to_value(&projection).unwrap();
+        let mut delta = empty_projection_input(20, 40);
+        delta.source_unavailable.push(Unavailable {
+            since: t(25),
+            until: t(30),
+            reason: "original native source is missing".into(),
+        });
+        assert!(
+            projection.advance(&delta).is_err(),
+            "zero stations cannot erase original source refusal"
+        );
+        assert_eq!(serde_json::to_value(&projection).unwrap(), before);
+    }
+
+    #[test]
+    fn projection_refuses_later_source_gaps_in_retained_history() {
+        use boss_jobs::membership_replay::Unavailable;
+        let mut projection = MembershipProjection::rebuild(&empty_projection_input(5, 20)).unwrap();
+        let before = serde_json::to_value(&projection).unwrap();
+        let mut delta = empty_projection_input(20, 40);
+        delta.source_unavailable.push(Unavailable {
+            since: t(10),
+            until: t(15),
+            reason: "later evidence disproves retained source completeness".into(),
+        });
+        assert!(
+            projection.advance(&delta).is_err(),
+            "a later cut cannot certify retained history its own evidence disproves"
+        );
+        assert_eq!(serde_json::to_value(&projection).unwrap(), before);
+    }
+
+    #[test]
+    fn projection_accepts_a_witnessed_empty_model_and_ignores_only_outside_gaps() {
+        use boss_jobs::membership_replay::Unavailable;
+        let mut complete = empty_projection_input(5, 20);
+        complete.source_unavailable.push(Unavailable {
+            since: t(100),
+            until: t(110),
+            reason: "outside requested history".into(),
+        });
+        let mut projection = MembershipProjection::rebuild(&complete).unwrap();
+        let delta = empty_projection_input(20, 40);
+        assert_eq!(projection.advance(&delta).unwrap().source_rows, 0);
+        let expected = empty_projection_input(5, 40);
+        assert_eq!(
+            serde_json::to_value(
+                projection
+                    .read(t(5), &ProjectionBinding::from_input(&expected))
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(replay(&expected)).unwrap()
+        );
+    }
+    #[test]
+    fn projection_appends_only_delta_and_reads_a_moving_window_like_full_replay() {
+        let (base, next, _, _) = fixture();
+        for actor in ["alice", "bob", "arbitrary+caller@elsewhere.invalid"] {
+            let original = cut(base.clone(), 5, 20, actor);
+            let mut projection = MembershipProjection::rebuild(&original).unwrap();
+            let checkpoint = serde_json::to_string(&projection).unwrap();
+            assert!(!checkpoint.contains("old payload must not survive"));
+            projection = serde_json::from_str(&checkpoint).unwrap();
+            let delta = cut(vec![next.clone()], 20, 40, actor);
+            let stats = projection.advance(&delta).unwrap();
+            assert_eq!(
+                stats.source_rows, 1,
+                "an advance must not reread prior event payloads"
+            );
+            let mut all = base.clone();
+            all.push(next.clone());
+            for since in [5, 20] {
+                let expected_input = cut(all.clone(), since, 40, actor);
+                let expected = replay(&expected_input);
+                let actual = projection
+                    .read(t(since), &ProjectionBinding::from_input(&expected_input))
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(actual).unwrap(),
+                    serde_json::to_value(expected).unwrap(),
+                    "{actor} since{since}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn projection_never_reuses_another_caller_scope_or_authorized_census() {
+        let (base, _, _, _) = fixture();
+        let original = cut(base, 5, 20, "alice");
+        let projection = MembershipProjection::rebuild(&original).unwrap();
+        for changed in [
+            ProjectionBinding {
+                actor: Some("ALICE".into()),
+                ..ProjectionBinding::from_input(&original)
+            },
+            ProjectionBinding {
+                scope: JobScope::OwnerIs("alice".into()),
+                ..ProjectionBinding::from_input(&original)
+            },
+            ProjectionBinding {
+                currently_authorized: Some(Default::default()),
+                ..ProjectionBinding::from_input(&original)
+            },
+        ] {
+            assert!(projection.read(t(5), &changed).is_err());
+        }
+        assert!(
+            projection
+                .read(t(4), &ProjectionBinding::from_input(&original))
+                .is_err(),
+            "history before the witnessed projection is unavailable"
+        );
+    }
+
+    #[test]
+    fn projection_refuses_incomplete_or_backdated_advances_without_mutating_its_checkpoint() {
+        let (base, next, _, _) = fixture();
+        let mut projection =
+            MembershipProjection::rebuild(&cut(base.clone(), 5, 20, "alice")).unwrap();
+        let checkpoint = serde_json::to_value(&projection).unwrap();
+        let mut incomplete = next.clone();
+        incomplete.original.as_mut().unwrap().complete = false;
+        let mut all = base.clone();
+        all.push(incomplete.clone());
+        assert!(
+            replay(&cut(all, 5, 40, "alice"))
+                .stations
+                .iter()
+                .any(|s| !s.unknown.is_empty())
+        );
+        assert!(
+            projection
+                .advance(&cut(vec![incomplete], 20, 40, "alice"))
+                .is_err()
+        );
+        let mut backdated = next;
+        for row in &mut backdated.rows {
+            row.created_at = Some(t(15));
+        }
+        assert!(
+            projection
+                .advance(&cut(vec![backdated], 20, 40, "alice"))
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&projection).unwrap(), checkpoint);
+    }
+
+    #[test]
+    fn projection_rebuilds_for_later_registry_evidence_but_not_backdated_event_time() {
+        let (base, mut next, job, mut seq) = fixture();
+        let mut projection =
+            MembershipProjection::rebuild(&cut(base.clone(), 5, 20, "alice")).unwrap();
+        // Event time is not the immutable insertion instant. A late relay
+        // carrying an older event timestamp remains a legitimate delta.
+        next.rows[0].event.timestamp = t(1);
+        let delta = cut(vec![next.clone()], 20, 40, "alice");
+        projection.advance(&delta).unwrap();
+        let mut all = base.clone();
+        all.push(next);
+        let oracle = cut(all, 5, 40, "alice");
+        assert_eq!(
+            serde_json::to_value(
+                projection
+                    .read(t(5), &ProjectionBinding::from_input(&oracle))
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(replay(&oracle)).unwrap()
+        );
+
+        let spec = population()
+            .into_iter()
+            .find(|s| s.name == "q.platform-admin.task")
+            .unwrap();
+        let publication = group(&mut seq, 45, registration(&spec, &job));
+        let before = serde_json::to_value(&projection).unwrap();
+        assert!(
+            projection
+                .advance(&cut(vec![publication], 40, 50, "alice"))
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&projection).unwrap(), before);
+    }
+
+    #[test]
+    fn projection_clock_expiry_matches_the_oracle_without_rereading_source() {
+        let spec = population()
+            .into_iter()
+            .find(|s| s.name == "design-decided")
+            .unwrap();
+        let (mut job, step) = eligible(&spec);
+        job.status = JobStatus::Closed;
+        job.closed_on = Some(t(0).date_naive());
+        let expiry = job
+            .closed_on
+            .unwrap()
+            .checked_add_days(chrono::Days::new(
+                u64::from(spec.terminal_window_days.unwrap()) + 1,
+            ))
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let seconds = (expiry - t(0)).num_seconds();
+        let mut seq = 1;
+        let groups = vec![
+            group(&mut seq, 0, registration(&spec, &job)),
+            group(
+                &mut seq,
+                10,
+                vec![
+                    event(boss_jobs::events::JOB_CREATED, json!(job), 10),
+                    event(boss_jobs::events::STEP_CREATED, json!(step), 10),
+                ],
+            ),
+        ];
+        let base = cut(groups.clone(), seconds - 20, seconds - 1, "alice");
+        let mut projection = MembershipProjection::rebuild(&base).unwrap();
+        let mut delta = cut(vec![], seconds - 1, seconds + 10, "alice");
+        delta.audit_cutoff = base.audit_cutoff;
+        assert_eq!(projection.advance(&delta).unwrap().source_rows, 0);
+        let oracle = cut(groups, seconds - 20, seconds + 10, "alice");
+        assert_eq!(
+            serde_json::to_value(
+                projection
+                    .read(oracle.since, &ProjectionBinding::from_input(&oracle))
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(replay(&oracle)).unwrap()
+        );
+        let mut changed_clock = cut(vec![], seconds + 10, seconds + 20, "alice");
+        changed_clock.audit_cutoff = base.audit_cutoff;
+        changed_clock.clock.known[0].revision = "different-original-revision".into();
+        assert!(projection.advance(&changed_clock).is_err());
+    }
+
+    #[test]
+    fn projection_preserves_original_interleaving_refusals_and_cut_boundaries() {
+        let mut whole = interleaved_pair(
+            |first, _| {
+                first.status = StepStatus::Completed;
+                vec![(true, 7), (true, -9)]
+            },
+            |_, second| {
+                second.status = StepStatus::Ready;
+                vec![(true, -8), (false, 10)]
+            },
+        );
+        whole.audit_cutoff = 10;
+        let mut base = whole.clone();
+        let later = base.groups.split_off(2);
+        base.until = t(11);
+        base.audit_cutoff = base
+            .groups
+            .iter()
+            .flat_map(|g| &g.rows)
+            .map(|r| r.seq)
+            .max()
+            .unwrap();
+        let mut projection = MembershipProjection::rebuild(&base).unwrap();
+        let before = serde_json::to_value(&projection).unwrap();
+        let mut delta = whole.clone();
+        delta.since = t(11);
+        delta.groups = later;
+        assert!(
+            replay(&whole)
+                .stations
+                .iter()
+                .any(|flow| !flow.unknown.is_empty())
+        );
+        match projection.advance(&delta) {
+            Err(boss_jobs::membership_replay::projection::ProjectionRefusal::Unread(reading)) => {
+                assert!(
+                    reading
+                        .stations
+                        .iter()
+                        .any(|flow| flow.unknown.iter().any(|u| u.reason.contains("interleav")))
+                );
+            }
+            other => panic!("must preserve the original interleaving refusal: {other:?}"),
+        }
+        assert_eq!(serde_json::to_value(&projection).unwrap(), before);
+        // A group whose first row is already behind the checkpoint must
+        // never be replayed as a fresh complete transaction.
+        delta.groups[0].rows[0].seq = base.audit_cutoff;
+        assert!(projection.advance(&delta).is_err());
+    }
+
+    fn population_groups(
+        admission: i64,
+        update_start: i64,
+        updates: usize,
+    ) -> (Vec<ReplayGroup>, Vec<Job>, i64) {
+        let spec = population()
+            .into_iter()
+            .find(|s| s.name == "q.platform-admin.task")
+            .unwrap();
+        let mut seq = 1;
+        let mut groups = Vec::new();
+        let mut jobs = Vec::new();
+        for station in population() {
+            let (job, _) = eligible(&station);
+            groups.push(group(&mut seq, 0, registration(&station, &job)));
+        }
+        for _ in 0..1000 {
+            let (job, step) = eligible(&spec);
+            let mut events = vec![event(boss_jobs::events::JOB_CREATED, json!(job), admission)];
+            events.push(event(
+                boss_jobs::events::STEP_CREATED,
+                json!(step),
+                admission,
+            ));
+            for order in 1..5 {
+                let mut extra = Step::new(job.id, "task", "Another step", order);
+                extra.status = StepStatus::Pending;
+                events.push(event(
+                    boss_jobs::events::STEP_CREATED,
+                    json!(extra),
+                    admission,
+                ));
+            }
+            groups.push(group(&mut seq, admission, events));
+            jobs.push(job);
+        }
+        for index in 0..updates {
+            let job = &mut jobs[index % 1000];
+            job.metadata["measurement"] = json!(index);
+            groups.push(group(
+                &mut seq,
+                update_start + index as i64,
+                vec![event(
+                    boss_jobs::events::JOB_UPDATED,
+                    json!(job),
+                    update_start + index as i64,
+                )],
+            ));
+        }
+        (groups, jobs, seq)
+    }
+
+    #[test]
+    #[ignore = "explicit optimized synthetic incremental measurement"]
+    fn projection_measures_bounded_reads_after_seventy_thousand_original_groups() {
+        use std::time::Instant;
+        let (mut groups, mut jobs, mut seq) = population_groups(10, 20, 70_000);
+        let base = cut(
+            groups.clone(),
+            5,
+            70_021,
+            "arbitrary+measurement@caller.invalid",
+        );
+        let started = Instant::now();
+        let mut projection = MembershipProjection::rebuild(&base).unwrap();
+        let rebuild_ms = started.elapsed().as_millis();
+        let bytes = serde_json::to_vec(&projection).unwrap().len();
+        jobs[0].metadata["measurement"] = json!("last delta");
+        let next = group(
+            &mut seq,
+            70_022,
+            vec![event(
+                boss_jobs::events::JOB_UPDATED,
+                json!(jobs[0]),
+                70_022,
+            )],
+        );
+        let delta = cut(
+            vec![next.clone()],
+            70_021,
+            70_023,
+            "arbitrary+measurement@caller.invalid",
+        );
+        let started = Instant::now();
+        let stats = projection.advance(&delta).unwrap();
+        let advance_ms = started.elapsed().as_millis();
+        groups.push(next);
+        let oracle_input = cut(groups, 5, 70_023, "arbitrary+measurement@caller.invalid");
+        let started = Instant::now();
+        let actual = projection
+            .read(t(5), &ProjectionBinding::from_input(&oracle_input))
+            .unwrap();
+        let read_us = started.elapsed().as_micros();
+        let started = Instant::now();
+        let expected = replay(&oracle_input);
+        let replay_ms = started.elapsed().as_millis();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert_eq!(stats.source_rows, 1);
+        println!(
+            "SYNTHETIC profile={} stations=19 packets=1000 steps=5000 update_groups=70000 source_rows={} checkpoint_bytes={bytes} facts={} rebuild_ms={rebuild_ms} advance_rows={} advance_ms={advance_ms} read_us={read_us} full_replay_ms={replay_ms}; no PostgreSQL or live latency claim",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "optimized"
+            },
+            base.groups.iter().map(|g| g.rows.len()).sum::<usize>(),
+            projection.facts().len(),
+            stats.source_rows
+        );
+    }
+}
 
 fn t(s: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_760_000_000 + s, 0).unwrap()
@@ -76,6 +719,7 @@ fn input(groups: Vec<ReplayGroup>, since: i64, until: i64) -> ReplayInput {
         registry_prefix_complete: true,
         packet_prefix_complete: true,
         source_unavailable: vec![],
+        initial: InitialState::default(),
     }
 }
 fn population() -> Vec<StationSpec> {
@@ -830,6 +1474,184 @@ fn interleaved_original_groups_cannot_guess_packet_state_order_from_relay_comple
     );
 }
 
+/// One original group whose rows sit at the named audit sequences, so a
+/// test can lay two transactions' rows across each other the way the
+/// relay copies two concurrent commits in outbox order.
+fn group_at(seqs: &[i64], at: i64, events: Vec<Event>) -> ReplayGroup {
+    let mut seq = 0;
+    let mut out = group(&mut seq, at, events);
+    for (row, at_seq) in out.rows.iter_mut().zip(seqs) {
+        row.seq = *at_seq;
+    }
+    let original = out.original.as_mut().unwrap();
+    original.audit_sequences = seqs.iter().map(|s| Some(*s)).collect();
+    out
+}
+
+/// A Step-carrying marker the dispatcher and the claim door write beside
+/// the Step row itself: it names the packet but carries no packet state.
+fn marker(job: &Job, step: &Step, at: i64) -> Event {
+    event(
+        "step.assigned.task",
+        json!({"job_id": job.id.to_string(), "step_id": step.id.to_string()}),
+        at,
+    )
+}
+
+/// The live shape of 2026-10-22 01:53:21Z and 17:58:47Z (backlog
+/// da9faa93): an agent run's first Step is auto-assigned by the
+/// dispatcher while `boss dispatch --started` claims its Building Step,
+/// two transactions on one packet whose rows the relay interleaved.
+/// The interleaved pair, with the 24 h window opening on the packet's
+/// admission at t(10). Answers the replay input and the station.
+fn interleaved_pair(
+    earlier: impl FnOnce(&mut Step, &mut Step) -> Vec<(bool, i64)>,
+    later: impl FnOnce(&mut Step, &mut Step) -> Vec<(bool, i64)>,
+) -> ReplayInput {
+    let spec = population()
+        .into_iter()
+        .find(|s| s.name == "q.platform-admin.task")
+        .unwrap();
+    let (job, mut first) = eligible(&spec);
+    let mut second = Step::new(job.id, "task", "Building", 1);
+    second.status = StepStatus::Pending;
+    second.metadata["authority_role"] = json!("platform-admin");
+    let mut seq = 1;
+    let mut groups = vec![
+        group(&mut seq, 0, registration(&spec, &job)),
+        group(
+            &mut seq,
+            10,
+            vec![
+                event(boss_jobs::events::JOB_CREATED, json!(job), 10),
+                event(boss_jobs::events::STEP_CREATED, json!(first), 10),
+                event(boss_jobs::events::STEP_CREATED, json!(second), 10),
+            ],
+        ),
+    ];
+    // Each closure edits the Steps its transaction writes and answers,
+    // per row in roster order, whether the row is the first Step's
+    // (true) or the second's (false) state, and its audit sequence. A
+    // row with sequence < 0 is a marker for the first Step.
+    let build = |rows: Vec<(bool, i64)>, at: i64, first: &Step, second: &Step| {
+        let seqs: Vec<i64> = rows.iter().map(|(_, s)| s.abs()).collect();
+        let events = rows
+            .iter()
+            .map(|(is_first, s)| {
+                if *s < 0 {
+                    marker(&job, first, at)
+                } else {
+                    let step = if *is_first { first } else { second };
+                    event(boss_jobs::events::STEP_UPDATED, json!(step), at)
+                }
+            })
+            .collect();
+        group_at(&seqs, at, events)
+    };
+    let rows = earlier(&mut first, &mut second);
+    groups.push(build(rows, 12, &first, &second));
+    let rows = later(&mut first, &mut second);
+    groups.push(build(rows, 13, &first, &second));
+    input(groups, 5, 20)
+}
+
+#[test]
+fn interleaved_writes_to_different_steps_that_no_order_can_tell_apart_still_count() {
+    // The dispatcher assigns the ready Step (rows 7 and 9); the claim
+    // door assigns the pending one (rows 8 and 10). Neither moves a
+    // status, so the packet stands at the station in every order the
+    // two commits could have taken: the count is established without
+    // the order.
+    let out = replay(&interleaved_pair(
+        |first, _| {
+            first.assignee_id = Some("agent-claude-b".into());
+            vec![(true, 7), (true, -9)]
+        },
+        |_, second| {
+            second.assignee_id = Some("agent-claude-b".into());
+            vec![(true, -8), (false, 10)]
+        },
+    ));
+    let station = &out.stations[0];
+    assert!(station.unknown.is_empty(), "{:?}", station.unknown);
+    assert_eq!(station.arrived, Some(1));
+    assert_eq!(station.departed, Some(0));
+}
+
+#[test]
+fn interleaved_writes_to_different_steps_whose_order_decides_a_crossing_stay_unknown() {
+    // One transaction completes the ready Step, the other readies the
+    // pending one. Completion first: the packet leaves, then returns.
+    // Readying first: it never leaves. The log cannot say which, so the
+    // count is not guessed.
+    let out = replay(&interleaved_pair(
+        |first, _| {
+            first.status = StepStatus::Completed;
+            vec![(true, 7), (true, -9)]
+        },
+        |_, second| {
+            second.status = StepStatus::Ready;
+            vec![(true, -8), (false, 10)]
+        },
+    ));
+    let station = &out.stations[0];
+    assert_eq!(station.arrived, None);
+    assert!(
+        station
+            .unknown
+            .iter()
+            .any(|u| u.reason.contains("interleav"))
+    );
+}
+
+#[test]
+fn a_step_both_groups_write_orders_them_when_the_later_write_follows_the_earlier_group() {
+    // The dispatcher assigns the Step (rows 7, 9); a rule completes the
+    // same Step (rows 8, 10). The rule's write of that Step row waited
+    // on the dispatcher's row lock, so it lands after the dispatcher's
+    // whole group (10 > 9): the dispatcher committed first. This is
+    // 2026-10-22 03:46:57Z, Step fb22090e (backlog da9faa93).
+    let out = replay(&interleaved_pair(
+        |first, _| {
+            first.assignee_id = Some("agent-claude".into());
+            vec![(true, 7), (true, -9)]
+        },
+        |first, _| {
+            first.status = StepStatus::Completed;
+            vec![(true, -8), (true, 10)]
+        },
+    ));
+    let station = &out.stations[0];
+    assert!(station.unknown.is_empty(), "{:?}", station.unknown);
+    assert_eq!(station.arrived, Some(1));
+    assert_eq!(station.departed, Some(1));
+    assert_eq!(station.served, Some(1));
+}
+
+#[test]
+fn a_step_written_inside_the_other_groups_span_has_no_lock_order_and_stays_unknown() {
+    // The same Step written at row 8, inside the other group's 7..9:
+    // no row lock explains that, so neither order is established.
+    let out = replay(&interleaved_pair(
+        |first, _| {
+            first.assignee_id = Some("agent-claude".into());
+            vec![(true, 7), (true, -9)]
+        },
+        |first, _| {
+            first.status = StepStatus::Completed;
+            vec![(true, 8), (true, -10)]
+        },
+    ));
+    let station = &out.stations[0];
+    assert_eq!(station.arrived, None);
+    assert!(
+        station
+            .unknown
+            .iter()
+            .any(|u| u.reason.contains("interleav"))
+    );
+}
+
 #[test]
 fn missing_original_step_creation_before_the_window_is_not_an_idle_zero() {
     let spec = population()
@@ -1263,4 +2085,634 @@ fn narrow_read_does_not_disclose_an_unrelated_private_group_refusal() {
         before, after,
         "scope cannot become a side channel through UNKNOWN"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The fold starts at a witnessed cut (design c195e83e, Q1-Q5 approved
+// 2026-10-17). Until then the reader folded every packet from genesis:
+// 1,235,314 rows against a 250,000-row bound, so every station read
+// UNKNOWN. These tests hand the replay ONLY a starting state (each
+// packet's latest original snapshot before the window) and the window's
+// own groups. Nothing before the cut is in the input, so a count here
+// can only come from the starting state.
+// ---------------------------------------------------------------------------
+
+/// A station of the native population with its predicate replaced by
+/// one shape under test. The row's other columns are a real station's.
+fn shaped(name: &str, predicate: serde_json::Value) -> StationSpec {
+    let mut row = serde_json::to_value(
+        population()
+            .into_iter()
+            .find(|s| s.name == "q.platform-admin.task")
+            .unwrap(),
+    )
+    .unwrap();
+    row["name"] = json!(name);
+    row["predicate"] = predicate;
+    row["terminal_window_days"] = serde_json::Value::Null;
+    serde_json::from_value(row).unwrap()
+}
+
+fn snapshot(seq: i64, at: i64, event: Event) -> HistoricalEvent {
+    HistoricalEvent {
+        seq,
+        created_at: Some(t(at)),
+        event,
+    }
+}
+
+/// One packet that is a member at the cut, leaves in the window and
+/// re-enters: two crossings and a re-entry, all counted from a starting
+/// state whose creation row is NOT in the input (Q3: the latest pre-cut
+/// snapshot is the witness). Read twice: the same originals answer the
+/// same flow, byte for byte.
+fn leaves_and_reenters_from_the_cut(
+    spec: StationSpec,
+    job: Job,
+    step: Option<Step>,
+    leave: impl Fn(&mut Job, &mut Option<Step>),
+    enter: impl Fn(&mut Job, &mut Option<Step>),
+) {
+    let name = spec.name.clone();
+    let mut seq = 1;
+    let published = group(&mut seq, 0, registration(&spec, &job));
+    // The starting state: UPDATE snapshots, not creations. A reader that
+    // still needed the creation row to admit a packet would refuse here.
+    let mut initial = vec![snapshot(
+        10,
+        3,
+        event(boss_jobs::events::JOB_UPDATED, json!(job), 3),
+    )];
+    if let Some(step) = &step {
+        initial.push(snapshot(
+            11,
+            3,
+            event(boss_jobs::events::STEP_UPDATED, json!(step), 3),
+        ));
+    }
+    let (mut job, mut step) = (job, step);
+    let mut seq = 20;
+    let mut window = Vec::new();
+    for (at, mv) in [
+        (12, &leave as &dyn Fn(&mut Job, &mut Option<Step>)),
+        (14, &enter),
+    ] {
+        mv(&mut job, &mut step);
+        let mut events = vec![event(boss_jobs::events::JOB_UPDATED, json!(job), at)];
+        if let Some(step) = &step {
+            events.push(event(boss_jobs::events::STEP_UPDATED, json!(step), at));
+        }
+        window.push(group(&mut seq, at, events));
+    }
+    let mut groups = vec![published];
+    groups.extend(window);
+    let mut read = input(groups, 5, 20);
+    read.initial = InitialState {
+        cut: 11,
+        rows: initial,
+        ..InitialState::default()
+    };
+    let first = replay(&read);
+    let flow = first.stations.iter().find(|f| f.station == name).unwrap();
+    assert_eq!(flow.arrived, Some(1), "{name}: {:?}", flow.unknown);
+    assert_eq!(flow.departed, Some(1), "{name}: {:?}", flow.unknown);
+    assert_eq!(flow.served, Some(0), "{name}");
+    let second = replay(&read);
+    assert_eq!(
+        serde_json::to_value(&first).unwrap(),
+        serde_json::to_value(&second).unwrap(),
+        "{name}: identical originals must answer an identical flow"
+    );
+}
+
+fn open_packet() -> Job {
+    let mut job = Job::new(
+        "fixture",
+        Subject::new("custom", "cut"),
+        "Member at the cut",
+        "alice",
+        Priority::Standard,
+        t(0).date_naive(),
+    );
+    job.status = JobStatus::Open;
+    job
+}
+
+#[test]
+fn a_self_bound_station_counts_crossings_from_the_cut() {
+    let spec = shaped(
+        "shape.bind-self",
+        json!({"status": "open", "step": {"assignee_id": "@me", "status_in": ["ready", "active"]}}),
+    );
+    assert!(spec.predicate.binds_self());
+    let job = open_packet();
+    let mut step = Step::new(job.id, "task", "Mine", 0);
+    step.status = StepStatus::Ready;
+    step.assignee_id = Some("alice".into());
+    leaves_and_reenters_from_the_cut(
+        spec,
+        job,
+        Some(step),
+        |_, s| s.as_mut().unwrap().assignee_id = Some("bob".into()),
+        |_, s| s.as_mut().unwrap().assignee_id = Some("alice".into()),
+    );
+}
+
+#[test]
+fn a_tags_any_station_counts_crossings_from_the_cut() {
+    let spec = shaped(
+        "shape.tags-any",
+        json!({"status": "open", "tags_any": ["hotfix", "urgent-lane"]}),
+    );
+    let mut job = open_packet();
+    job.tags = vec!["hotfix".into()];
+    leaves_and_reenters_from_the_cut(
+        spec,
+        job,
+        None,
+        |j, _| j.tags.clear(),
+        |j, _| j.tags = vec!["urgent-lane".into()],
+    );
+}
+
+#[test]
+fn a_metadata_present_station_counts_crossings_from_the_cut() {
+    let spec = shaped(
+        "shape.metadata-present",
+        json!({"status": "open", "metadata_present": ["branch"]}),
+    );
+    let mut job = open_packet();
+    job.metadata["branch"] = json!("feat/cut");
+    leaves_and_reenters_from_the_cut(
+        spec,
+        job,
+        None,
+        |j, _| j.metadata["branch"] = serde_json::Value::Null,
+        |j, _| j.metadata["branch"] = json!("feat/cut"),
+    );
+}
+
+#[test]
+fn a_metadata_absent_station_counts_crossings_from_the_cut() {
+    let spec = shaped(
+        "shape.metadata-absent",
+        json!({"status": "open", "metadata_absent": ["train"]}),
+    );
+    leaves_and_reenters_from_the_cut(
+        spec,
+        open_packet(),
+        None,
+        |j, _| j.metadata["train"] = json!("train-1"),
+        |j, _| {
+            j.metadata.as_object_mut().unwrap().remove("train");
+        },
+    );
+}
+
+#[test]
+fn a_metadata_equals_station_counts_crossings_from_the_cut() {
+    let spec = shaped(
+        "shape.metadata-equals",
+        json!({"status": "open", "metadata_equals": {"lane": "fast"}}),
+    );
+    let mut job = open_packet();
+    job.metadata["lane"] = json!("fast");
+    leaves_and_reenters_from_the_cut(
+        spec,
+        job,
+        None,
+        |j, _| j.metadata["lane"] = json!("slow"),
+        |j, _| j.metadata["lane"] = json!("fast"),
+    );
+}
+
+#[test]
+fn a_station_with_no_step_clause_counts_crossings_from_the_cut() {
+    let spec = shaped(
+        "shape.no-step",
+        json!({"kind": "fixture", "status": "open"}),
+    );
+    assert!(spec.predicate.step.is_none());
+    leaves_and_reenters_from_the_cut(
+        spec,
+        open_packet(),
+        None,
+        |j, _| {
+            j.status = JobStatus::Closed;
+            j.closed_on = Some(t(12).date_naive());
+        },
+        |j, _| {
+            j.status = JobStatus::Open;
+            j.closed_on = None;
+        },
+    );
+}
+
+/// Q3: a packet the current census names with neither a pre-cut snapshot
+/// nor an in-window creation is UNKNOWN, never an absent idle zero.
+#[test]
+fn a_census_packet_with_no_witness_at_the_cut_is_unknown_not_absent() {
+    let spec = shaped(
+        "shape.no-step",
+        json!({"kind": "fixture", "status": "open"}),
+    );
+    let job = open_packet();
+    let mut seq = 1;
+    let mut read = input(vec![group(&mut seq, 0, registration(&spec, &job))], 5, 20);
+    read.initial.unknown = [(
+        job.id.to_string(),
+        "no original snapshot before the cut and no creation in the window".to_string(),
+    )]
+    .into_iter()
+    .collect();
+    let out = replay(&read);
+    let flow = &out.stations[0];
+    assert_eq!(flow.arrived, None);
+    assert!(
+        flow.unknown
+            .iter()
+            .any(|u| u.reason.contains("no original snapshot before the cut")),
+        "{:?}",
+        flow.unknown
+    );
+}
+
+/// Q1 prunes a terminal packet only where no clock instant in the window
+/// can count it. Where the window's business clock is unknown, a pruned
+/// packet's expiry cannot be ruled out there, so the gap stays UNKNOWN on
+/// every terminal-window station exactly as a carried packet would make it.
+#[test]
+fn a_pruned_terminal_packet_keeps_the_clock_gap_unknown_on_terminal_stations() {
+    let spec = population()
+        .into_iter()
+        .find(|s| s.name == "design-decided")
+        .unwrap();
+    let (job, _) = eligible(&spec);
+    let mut seq = 1;
+    let mut read = input(vec![group(&mut seq, 0, registration(&spec, &job))], 5, 20);
+    let whole = read.clock.known[0].clone();
+    let mut before = whole.clone();
+    before.until = t(10);
+    let mut after = whole;
+    after.since = t(12);
+    read.clock.known = vec![before, after];
+    read.clock.unknown = vec![boss_clock_client::mapping_history::UnknownClockSpan {
+        since: t(10),
+        until: t(12),
+        reason: "clock activation is bounded by producer capture and audit insertion".into(),
+    }];
+    let quiet = replay(&read);
+    assert_eq!(
+        quiet.stations[0].arrived,
+        Some(0),
+        "with nothing pruned and nothing carried, a gap has no packet to hide"
+    );
+    read.initial.pruned_terminal = 1;
+    let pruned = replay(&read);
+    assert_eq!(pruned.stations[0].arrived, None, "{:?}", pruned.stations[0]);
+    assert_eq!(pruned.stations[0].unknown[0].since, t(10));
+    assert_eq!(pruned.stations[0].unknown[0].until, t(12));
+}
+
+#[test]
+fn complete_original_wall_models_prove_retained_and_expired_terminal_outcomes() {
+    let spec = population()
+        .into_iter()
+        .find(|s| s.name == "design-decided")
+        .unwrap();
+    for age in [0, 30] {
+        let (mut job, original_step) = eligible(&spec);
+        job.status = JobStatus::Closed;
+        job.closed_on = Some(t(0).date_naive() - chrono::Duration::days(age));
+        let mut seq = 1;
+        let mut published = registration(&spec, &job);
+        published.push(event(boss_jobs::events::JOB_CREATED, json!(job), 0));
+        published.push(event(
+            boss_jobs::events::STEP_CREATED,
+            json!(original_step),
+            0,
+        ));
+        let groups = vec![
+            group(&mut seq, 0, published),
+            group(
+                &mut seq,
+                11,
+                vec![event(boss_jobs::events::JOB_UPDATED, json!(job), 11)],
+            ),
+        ];
+        let mut read = input(groups, 5, 20);
+        let a = ClockMappingFact {
+            schema_version: 1,
+            revision: "a".into(),
+            previous_revision: None,
+            epoch: Some("first".into()),
+            mode: Some(ClockMode::Wall),
+            params: None,
+            captured_at: t(-100),
+            audit_created_at: t(-99),
+            seq: 1,
+            complete_group: true,
+        };
+        let b = ClockMappingFact {
+            revision: "b".into(),
+            previous_revision: Some("a".into()),
+            epoch: Some("second".into()),
+            captured_at: t(10),
+            audit_created_at: t(12),
+            seq: 2,
+            ..a.clone()
+        };
+        read.clock = ClockTimeline::build(&[a, b], Some("b"), t(-100), t(20));
+        assert!(
+            read.clock.date_at(t(11)).is_err(),
+            "same-WALL activation stays unknown"
+        );
+        let flow = replay(&read);
+        assert!(
+            flow.stations[0].unknown.is_empty(),
+            "age{age}: {:?}",
+            flow.stations[0].unknown
+        );
+        assert_eq!(flow.stations[0].arrived, Some(0));
+        assert_eq!(flow.stations[0].departed, Some(0));
+        assert!(
+            boss_jobs::membership_replay::projection::MembershipProjection::rebuild(&read).is_ok()
+        );
+        let projection =
+            boss_jobs::membership_replay::projection::MembershipProjection::rebuild(&read).unwrap();
+        let encoded = serde_json::to_value(&projection).unwrap();
+        let restored: boss_jobs::membership_replay::projection::MembershipProjection =
+            serde_json::from_value(encoded).unwrap();
+        let binding =
+            boss_jobs::membership_replay::projection::ProjectionBinding::from_input(&read);
+        assert_eq!(
+            serde_json::to_value(restored.read(read.since, &binding).unwrap()).unwrap(),
+            serde_json::to_value(&flow).unwrap()
+        );
+        // A persisted witness must remain valid across an ordinary later
+        // cut without borrowing a different caller or a rewritten past model.
+        let mut advanced = restored;
+        let originals: Vec<ClockMappingFact> = serde_json::from_value(
+            serde_json::to_value(&read.clock).unwrap()["outcome_originals"]["facts"].clone(),
+        )
+        .unwrap();
+        let mut delta = read.clone();
+        delta.since = read.until;
+        delta.until = t(30);
+        delta.groups.clear();
+        delta.clock = ClockTimeline::build(&originals, Some("b"), t(-100), delta.until);
+        advanced.advance(&delta).unwrap();
+        let mut expected = read.clone();
+        expected.until = delta.until;
+        expected.clock = delta.clock.clone();
+        let later_binding =
+            boss_jobs::membership_replay::projection::ProjectionBinding::from_input(&expected);
+        assert_eq!(
+            serde_json::to_value(advanced.read(read.since, &later_binding).unwrap()).unwrap(),
+            serde_json::to_value(replay(&expected)).unwrap()
+        );
+        read.initial.pruned_terminal = 1;
+        assert!(
+            !replay(&read).stations[0].unknown.is_empty(),
+            "a pruned scalar is no witness"
+        );
+    }
+}
+
+#[test]
+fn a_possible_expiry_crossing_keeps_the_entire_generation_unknown() {
+    let spec = population()
+        .into_iter()
+        .find(|s| s.name == "design-decided")
+        .unwrap();
+    let (mut job, step) = eligible(&spec);
+    job.status = JobStatus::Closed;
+    let midnight = (t(0).date_naive() + chrono::Duration::days(1))
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    job.closed_on = Some(
+        midnight.date_naive()
+            - chrono::Duration::days(i64::from(spec.terminal_window_days.unwrap()) + 1),
+    );
+    let offset = (midnight - t(0)).num_seconds();
+    let mut seq = 1;
+    let mut events = registration(&spec, &job);
+    events.push(event(boss_jobs::events::JOB_CREATED, json!(job), 0));
+    events.push(event(boss_jobs::events::STEP_CREATED, json!(step), 0));
+    let mut read = input(vec![group(&mut seq, 0, events)], offset - 10, offset + 10);
+    let first = ClockMappingFact {
+        schema_version: 1,
+        revision: "first".into(),
+        previous_revision: None,
+        epoch: Some("one".into()),
+        mode: Some(ClockMode::Wall),
+        params: None,
+        captured_at: t(-100),
+        audit_created_at: t(-99),
+        seq: 1,
+        complete_group: true,
+    };
+    let next = ClockMappingFact {
+        revision: "next".into(),
+        previous_revision: Some("first".into()),
+        epoch: Some("two".into()),
+        captured_at: midnight - chrono::Duration::seconds(2),
+        audit_created_at: midnight + chrono::Duration::seconds(2),
+        seq: 2,
+        ..first.clone()
+    };
+    read.clock = ClockTimeline::build(&[first, next], Some("next"), t(-100), read.until);
+    let result = replay(&read);
+    assert!(!result.stations[0].unknown.is_empty());
+    assert!(result.stations[0].arrived.is_none());
+    assert!(
+        boss_jobs::membership_replay::projection::MembershipProjection::rebuild(&read).is_err(),
+        "the complete-generation guard remains mandatory"
+    );
+}
+
+// The landed reviewer reproduced this exact packet/clock shape (bd16fc12).
+// Keep a real complete original transaction rather than a synthetic flow row.
+fn expiry_gap_input(start_offset: i64, end_offset: i64) -> ReplayInput {
+    expiry_gap_input_micros(start_offset * 1_000_000, end_offset * 1_000_000)
+}
+
+fn expiry_gap_input_micros(start_offset: i64, end_offset: i64) -> ReplayInput {
+    let spec = population()
+        .into_iter()
+        .find(|s| s.name == "design-decided")
+        .unwrap();
+    let (mut job, step) = eligible(&spec);
+    job.status = JobStatus::Closed;
+    let midnight = (t(0).date_naive() + chrono::Duration::days(1))
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    job.closed_on = Some(
+        midnight.date_naive()
+            - chrono::Duration::days(i64::from(spec.terminal_window_days.unwrap()) + 1),
+    );
+    let offset = (midnight - t(0)).num_seconds();
+    let mut seq = 1;
+    let mut events = registration(&spec, &job);
+    events.push(event(boss_jobs::events::JOB_CREATED, json!(job), 0));
+    events.push(event(boss_jobs::events::STEP_CREATED, json!(step), 0));
+    let mut read = input(vec![group(&mut seq, 0, events)], offset - 10, offset + 10);
+    let first = ClockMappingFact {
+        schema_version: 1,
+        revision: "first".into(),
+        previous_revision: None,
+        epoch: Some("one".into()),
+        mode: Some(ClockMode::Wall),
+        params: None,
+        captured_at: t(-100),
+        audit_created_at: t(-99),
+        seq: 1,
+        complete_group: true,
+    };
+    let next = ClockMappingFact {
+        revision: "next".into(),
+        previous_revision: Some("first".into()),
+        epoch: Some("two".into()),
+        captured_at: midnight + chrono::Duration::microseconds(start_offset),
+        audit_created_at: midnight + chrono::Duration::microseconds(end_offset),
+        seq: 2,
+        ..first.clone()
+    };
+    read.clock = ClockTimeline::build(&[first, next], Some("next"), t(-100), read.until);
+    read
+}
+
+fn assert_expiry_gap_edge_unknown(start: i64, end: i64) {
+    let read = expiry_gap_input(start, end);
+    let result = replay(&read);
+    let flow = &result.stations[0];
+    assert_eq!(flow.departed, None, "gap {start}..{end}: {flow:?}");
+    assert!(!flow.unknown.is_empty());
+    assert!(
+        boss_jobs::membership_replay::projection::MembershipProjection::rebuild(&read).is_err(),
+        "a boundary ambiguity cannot become a wholly KNOWN checkpoint"
+    );
+    let midnight = read.since + chrono::Duration::seconds(10);
+    assert!(
+        read.clock
+            .date_at(midnight + chrono::Duration::seconds(start))
+            .is_err(),
+        "outcome evidence must not make date_at KNOWN"
+    );
+}
+
+#[test]
+fn terminal_expiry_at_the_gap_exclusive_end_is_unknown() {
+    assert_expiry_gap_edge_unknown(-2, 0);
+}
+
+#[test]
+fn terminal_expiry_at_the_gap_inclusive_start_is_unknown() {
+    assert_expiry_gap_edge_unknown(0, 2);
+}
+
+#[test]
+fn terminal_expiry_away_from_the_gap_is_still_counted_once() {
+    for (start, end) in [(5, 7), (-7, -5), (20, 22)] {
+        let read = expiry_gap_input(start, end);
+        let result = replay(&read);
+        assert_eq!(
+            result.stations[0].departed,
+            Some(1),
+            "{start}..{end}: {:?}",
+            result.stations[0]
+        );
+        assert!(result.stations[0].unknown.is_empty());
+    }
+}
+
+#[test]
+fn terminal_expiry_gap_edges_keep_original_microsecond_precision() {
+    for (start, end) in [(-1, 0), (0, 1)] {
+        let read = expiry_gap_input_micros(start, end);
+        let result = replay(&read);
+        assert_eq!(
+            result.stations[0].departed, None,
+            "{start}..{end}: {:?}",
+            result.stations[0]
+        );
+        assert!(!result.stations[0].unknown.is_empty());
+    }
+    for (start, end) in [(-2, -1), (1, 2)] {
+        let read = expiry_gap_input_micros(start, end);
+        let result = replay(&read);
+        assert_eq!(
+            result.stations[0].departed,
+            Some(1),
+            "{start}..{end}: {:?}",
+            result.stations[0]
+        );
+        assert!(result.stations[0].unknown.is_empty());
+    }
+}
+
+#[test]
+fn terminal_expiry_at_the_exclusive_query_end_is_not_a_departure() {
+    let mut read = expiry_gap_input(-2, 0);
+    read.until = read.since + chrono::Duration::seconds(10);
+    let result = replay(&read);
+    assert_eq!(result.stations[0].departed, Some(0));
+    assert!(result.stations[0].unknown.is_empty());
+}
+
+#[test]
+#[ignore = "explicit production-volume replay diagnosis, run by the builder"]
+fn production_replay_scaling_measurement() {
+    for count in [2_000, 8_000, 30_000] {
+        for complete_registry in [false, true] {
+            let spec = population()
+                .into_iter()
+                .find(|s| s.name == "a.platform-admin.opus-5-5")
+                .unwrap();
+            let (mut job, mut step) = eligible(&spec);
+            let mut seq = 1;
+            let mut initial = registration(&spec, &job);
+            if !complete_registry {
+                initial.retain(|e| e.kind != boss_jobs::events::WORKFLOW_PUBLISHED);
+            }
+            initial.push(event(boss_jobs::events::JOB_CREATED, json!(job), 0));
+            initial.push(event(boss_jobs::events::STEP_CREATED, json!(step), 0));
+            let mut groups = vec![group(&mut seq, 0, initial)];
+            for n in 0..count {
+                let at = n as i64 + 1;
+                job.title = format!("Update {n}");
+                step.status = if n % 2 == 0 {
+                    StepStatus::Completed
+                } else {
+                    StepStatus::Ready
+                };
+                groups.push(group(
+                    &mut seq,
+                    at,
+                    vec![
+                        event(boss_jobs::events::STEP_UPDATED, json!(step), at),
+                        event(boss_jobs::events::JOB_UPDATED, json!(job), at),
+                    ],
+                ));
+            }
+            let mut read = input(groups, 0, count as i64 + 2);
+            read.audit_cutoff = seq;
+            let started = std::time::Instant::now();
+            let out = replay(&read);
+            eprintln!(
+                "replay diagnosis groups={count} complete_registry={complete_registry} elapsed_ms={} unknown={:?}",
+                started.elapsed().as_millis(),
+                out.stations
+                    .iter()
+                    .map(|s| (
+                        &s.station,
+                        s.unknown.len(),
+                        s.unknown.first().map(|u| &u.reason)
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }

@@ -1,0 +1,23 @@
+{
+  "about": "READ-ONLY: renders what `add-longhorn-disk` WOULD do to make ONE node's declared Talos user volume a Longhorn disk, and does nothing (infra/forge/longhorn-disk.sh --plan <node> <volume>; backlog 493a02b6, measured 2026-10-19 while planning w-2's third 1 TB disk: node-converge mounts a UserVolumeConfig at /var/mnt/<name> and no door then declared that mount to Longhorn). It runs every bound the write runs — the node is one the estate registry declares, not retired, as a talos-worker with one IPv4 address, and the cluster agrees on its address and carries no control-plane label; infra/cluster/talos/patches/<node>.yaml (the tree this host converged to) names exactly one UserVolumeConfig called <volume> and passes check-declared.sh --only-read-classes, whose allowlist demands a diskSelector with exactly one !system_disk; Talos's volumestatus u-<volume> reads ready, mounted at /var/mnt/<volume>, on a disk that is not the disk EPHEMERAL lives on (the system disk, read in the same run); no PersistentVolume and no pod on the node mounts /var/mnt/<volume> or anything under it (so w-1's gate volume, the gate's local PV gate-w-1 and the trim pod's hostPath, is refused by what uses it); the node's Longhorn node reads Ready=True and holds no disk named u-<volume> and none whose path is that mount, under it or over it — and then prints the plan: the node, its address, role and Node uid, the UserVolumeConfig as declared, what Talos reads of the volume and the system disk, the Longhorn node's disks now (spec only), the disk to add (untagged, schedulable, storageReserved 0, diskType filesystem), what placement that opens (any volume's replica may land on it by Longhorn's rules; no node's eligibility changes), the one compare-and-set patch, and the read-back. No clock and no live free space in the bytes (storageAvailable rides stderr); its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Every read goes through the forge's ops_kubectl and ops_talosctl doors; a read that could not look is CANNOT ANSWER (exit 1), never a plan. Any refusal renders no plan (exit 78). Timeout 300: the registry read (15 s), a bounded first pull of the door's image (120 s), the Node, PV, pod and Longhorn reads (20-30 s each) and two talosctl reads (20 s each).",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/longhorn-disk.sh",
+    "--plan",
+    "{1}",
+    "{2}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "volume",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"
+    }
+  ],
+  "timeout": 300
+}

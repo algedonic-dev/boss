@@ -6,7 +6,9 @@ exists (backlog ea83db08). The pod rolled: the previous session, its
 `/loop`, and every builder it had launched are gone. Nobody is watching.
 Your job is to keep the BOSS queues draining until David is back, under
 his standing order: work every agent-workable queue on your own, and
-stop only when none is left (memory `boss-autonomous-drain`).
+stop only when none is left. Everything you inherit and everything you
+hand on lives on packets, read and written through the jobs API —
+never in a local file the next session may not load (backlog 38db9ebe).
 
 ## 1. Orient, every wake
 
@@ -16,8 +18,15 @@ stop only when none is left (memory `boss-autonomous-drain`).
    THE QUEUE, STRANDED, FRESHNESS, DOCK, SHED, MY WORK, and the
    shop-floor line of REGIONS (runs in flight, and finished runs not
    yet reported).
-3. Read MEMORY.md and the entry it marks READ FIRST (the newest
-   `overnight-<date>` file). It lists what is owed and what is held.
+3. Read the last handoff from the record:
+   `boss-api GET '/api/jobs?kind=work-session&limit=10' > <file>` lists
+   sessions newest first (compare the rows to `.total`). Yours is the
+   open one carrying your actor and the latest `started_at`; the one
+   before it holds the previous session's `handoff_<YYYYMMDD>…`
+   metadata keys — what is owed, what is held, and what was in flight.
+   Each item a handoff names carries its own `handoff_<date>` key: read
+   that packet now before acting on it, because the handoff is a
+   summary and the packet is the state.
 
 ## 2. Close what the roll left open
 
@@ -55,9 +64,9 @@ than building it again.
 2. For each free slot, take the oldest buildable item. Prefer the
    consolidation and 1.0.0 work. Check it is not already on main, parked
    or in flight.
-3. Answer its open questions yourself from the company frame (memory
-   `answer-audit-questions-from-the-company-frame`: one person plus
-   agents, running a hosting business on the OSS release). Record the
+3. Answer its open questions yourself from the company frame (one
+   person plus agents, running a hosting business on the OSS release,
+   as `boss design` states it). Record the
    answer on the item as `decided_<YYYY_MM_DD>` metadata with
    `boss-api PATCH /api/jobs/<id>/metadata <body.json>`. Only strategy,
    trust and security, credentials, money and brand go to David.
@@ -68,7 +77,8 @@ than building it again.
 
 ## 5. After each landing
 
-Do the post-land acts the memory entry lists as owed: `boss fold` for
+Do the post-land acts the landed car's item and the last handoff name
+as owed: `boss fold` for
 answered designs whose fold car landed, `boss workflow publish <name>`
 for protocol rows a car changed — NEVER for a kind that is HELD: run
 `python3 infra/gcp/workflow-holds.py <checkout>` first, on a checkout
@@ -80,7 +90,9 @@ nothing yet). A kind the reader prints as `held` (by a file under
 a `writer` or an `executor`) goes live only at a person's deliberate
 publish, never a draining session's; if that reader exits non-zero,
 publish nothing and say so — and `boss prove <car> --from-car` for
-landed cars the SHED names. Record each in the memory entry.
+landed cars the SHED names. Record each on the item it answers as a
+`handoff_<YYYYMMDD>` key, with
+`boss-api PATCH /api/jobs/<id>/metadata <body.json>`.
 
 ## 6. Never
 
@@ -94,6 +106,10 @@ a step assigned to David.
 
 Run this drain under `/loop` with dynamic pacing (ScheduleWakeup): wake
 in 20 to 30 minutes when there is nothing to do, and sooner while a gate
-or train you are waiting on is due. On every wake, append one line to
-the overnight memory entry: the `date -u` time, what landed, what you
-dispatched, and what is waiting on David. Then go back to step 1.
+or train you are waiting on is due. On every wake, write one key onto
+your own work-session packet, `handoff_<YYYYMMDD>_<HHMM>Z` from the
+`date -u` reading, holding what landed, what you dispatched, what is
+held and on whom, and what is waiting on David, with
+`boss-api PATCH /api/jobs/<your session>/metadata <body.json>`. A new
+key every wake: the merge replaces a key whole, so reusing one would
+erase the wake before it. Then go back to step 1.

@@ -1,0 +1,15 @@
+[[step_plugin]]
+kind = "browser-observation"
+version = 1
+status = "active"
+label = "Observe a renderer"
+description = "Explicit attended observation of a published renderer binding. Runs fixed synthetic cases in an opaque sandbox, retains full public assets and output, and records actor-attributed evidence without completing a car proof."
+category = "coordination"
+frontend_url = "browser-observation.js"
+owning_team = "platform"
+
+[step_plugin.metadata_schema]
+type = "object"
+
+[step_plugin.metadata_schema.properties.observation]
+type = "object"

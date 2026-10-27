@@ -1102,6 +1102,92 @@ pub async fn convert(job_ref: &str, to: Option<&str>, dry_run: bool) -> Result<(
     Ok(())
 }
 
+/// The priority word as the API spells it, or the refusal naming the
+/// vocabulary — the one the jobs API deserializes, read off the type.
+pub(crate) fn parse_priority(word: &str) -> Result<boss_core::job::Priority> {
+    serde_json::from_value(json!(word.trim())).map_err(|_| {
+        anyhow!("{word:?} is not a priority — one of emergency, urgent, standard, scheduled")
+    })
+}
+
+/// PURE: what `boss job priority` reports, judged against the packet
+/// read back AFTER the door answered — never against the answer alone.
+/// Fails unless the packet holds the priority asked for and, when the
+/// door says it moved, the last `priority_changes` record is the one it
+/// answered, carrying this reason.
+pub(crate) fn confirm_priority(
+    answer: &Value,
+    after: &Value,
+    asked: boss_core::job::Priority,
+    why: &str,
+) -> std::result::Result<String, String> {
+    let id = after.get("id").and_then(Value::as_str).unwrap_or("?");
+    let asked = boss_jobs::priority::word(asked);
+    let holds = after.get("priority").and_then(Value::as_str).unwrap_or("?");
+    if holds != asked {
+        return Err(format!(
+            "the door answered but packet {id} reads priority {holds}, not {asked}"
+        ));
+    }
+    if answer.get("changed") != Some(&json!(true)) {
+        return Ok(format!(
+            "boss job priority: {id} is already {asked} — nothing written, confirmed by reading it back"
+        ));
+    }
+    let last = after
+        .pointer(&format!(
+            "/metadata/{}",
+            boss_jobs::priority::PRIORITY_CHANGES_KEY
+        ))
+        .and_then(Value::as_array)
+        .and_then(|l| l.last());
+    match last {
+        Some(r) if Some(r) == answer.get("record") && r.get("why") == Some(&json!(why)) => {
+            Ok(format!(
+                "boss job priority: {id} {} -> {asked}, by {}, why: {why} — confirmed by reading it back",
+                r.get("from").and_then(Value::as_str).unwrap_or("?"),
+                r.get("by").and_then(Value::as_str).unwrap_or("?"),
+            ))
+        }
+        _ => Err(format!(
+            "the door answered a move but packet {id}'s last priority record is {} — \
+             not the record it answered",
+            last.map_or_else(|| "absent".to_string(), Value::to_string)
+        )),
+    }
+}
+
+/// `boss job priority <packet> <level> --why` — move one field, with a
+/// reason, through the narrow door (backlog eb26059d), then read the
+/// packet back and judge it there. A closed packet is refused by the
+/// door (409) and the refusal is printed as it came.
+pub async fn priority(job_ref: &str, level: &str, why: &str) -> Result<()> {
+    let asked = parse_priority(level)?;
+    // The door records the reason trimmed; judge the read-back by it.
+    let why = why.trim();
+    let http = crate::sor_client::machine_client()?;
+    let id = fetch_and_resolve(&http, job_ref).await?;
+    let answer = crate::sor_client::api(
+        &http,
+        reqwest::Method::PUT,
+        &format!("/api/jobs/{id}/priority"),
+        Some(json!({ "priority": boss_jobs::priority::word(asked), "why": why })),
+    )
+    .await?
+    .context("the priority door answered no body")?;
+    let after = crate::sor_client::api(
+        &http,
+        reqwest::Method::GET,
+        &format!("/api/jobs/{id}"),
+        None,
+    )
+    .await?
+    .context("could not read the packet back")?;
+    let said = confirm_priority(&answer, &after, asked, why).map_err(|e| anyhow!(e))?;
+    println!("{said}");
+    Ok(())
+}
+
 /// PURE: the `outcome` a CLOSED packet's metadata owes — derived from
 /// its completed declared terminal under the version it is pinned to,
 /// by the one rule every close uses
@@ -1236,6 +1322,62 @@ pub async fn outcome(job_ref: &str, dry_run: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// eb26059d: `boss job priority` takes the API's own words and
+    /// refuses any other before a request is made, naming the four.
+    #[test]
+    fn a_priority_word_is_the_apis_or_refused_by_name() {
+        use boss_core::job::Priority;
+        assert_eq!(super::parse_priority("urgent").unwrap(), Priority::Urgent);
+        assert_eq!(
+            super::parse_priority(" emergency ").unwrap(),
+            Priority::Emergency
+        );
+        let err = super::parse_priority("high").unwrap_err().to_string();
+        assert!(
+            err.contains("emergency, urgent, standard, scheduled"),
+            "{err}"
+        );
+    }
+
+    /// eb26059d: the verb's report is judged on the packet READ BACK. A
+    /// move confirms only when the packet holds the priority and its last
+    /// record is the one the door answered, with this reason; a no-op
+    /// says nothing was written; a packet that does not hold what the
+    /// door said fails, naming what it holds.
+    #[test]
+    fn a_priority_move_is_confirmed_by_the_packet_not_the_answer() {
+        use boss_core::job::Priority;
+        use serde_json::json;
+        let record = json!({"from": "standard", "to": "urgent", "by": "agent-claude-b",
+                            "why": "blocked", "at": "2026-10-20T08:00:00+00:00"});
+        let answer = json!({"changed": true, "from": "standard", "priority": "urgent",
+                            "record": record});
+        let after = json!({"id": "eb26059d", "priority": "urgent",
+                           "metadata": {"priority_changes": [record]}});
+        let said = super::confirm_priority(&answer, &after, Priority::Urgent, "blocked").unwrap();
+        assert!(
+            said.contains("standard -> urgent, by agent-claude-b, why: blocked"),
+            "{said}"
+        );
+
+        let noop = json!({"changed": false, "from": "urgent", "priority": "urgent"});
+        let said = super::confirm_priority(&noop, &after, Priority::Urgent, "x").unwrap();
+        assert!(said.contains("already urgent"), "{said}");
+
+        let unmoved = json!({"id": "eb26059d", "priority": "standard", "metadata": {}});
+        let err =
+            super::confirm_priority(&answer, &unmoved, Priority::Urgent, "blocked").unwrap_err();
+        assert!(err.contains("reads priority standard"), "{err}");
+
+        let unrecorded = json!({"id": "eb26059d", "priority": "urgent", "metadata": {}});
+        let err =
+            super::confirm_priority(&answer, &unrecorded, Priority::Urgent, "blocked").unwrap_err();
+        assert!(err.contains("absent"), "{err}");
+
+        let other_reason = super::confirm_priority(&answer, &after, Priority::Urgent, "other");
+        assert!(other_reason.is_err(), "{other_reason:?}");
+    }
+
     /// 228c9a7d: the outcome a closed packet owes is its completed
     /// terminal's — 6b23d135's shape — and nothing else is written: an
     /// open packet, a close with no completed terminal, and a recorded
@@ -1994,8 +2136,10 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn a_human_alone_releases_a_review_held_car_through_the_three_verbs() {
             const BUILDER: &str = "b0b0b0b0-0000-4000-8000-000000000000";
+            let source = crate::review_verdict::ReviewSourceRepo::new();
+            let forge = |r: &str| source.forge(r);
             let (base, jobs) = serve().await;
-            a_held_car_at_the_dock(&jobs, BUILDER).await;
+            a_held_car_at_the_dock(&jobs, BUILDER, &source.head).await;
             let wire = crate::steps::Wire::at(
                 base,
                 Some(crate::identity::Caller {
@@ -2008,9 +2152,17 @@ mod tests {
             // 1. `boss job file --kind agent-run --title '…'`
             let run = a_review_run_filed_by(&wire).await;
             // 2. `BOSS_AGENT_RUN=<run> boss review feat/held --verdict release`
-            crate::review_verdict::record(&wire, "feat/held", "release", "", Some(&run), forge)
-                .await
-                .expect("a human records a verdict on the run they opened");
+            crate::review_verdict::record_in(
+                source.path(),
+                &wire,
+                "feat/held",
+                "release",
+                "",
+                Some(&run),
+                forge,
+            )
+            .await
+            .expect("a human records a verdict on the run they opened");
             // 3. `boss release feat/held --review <run>`
             crate::review_verdict::release(
                 &wire,
@@ -2032,16 +2184,16 @@ mod tests {
                 panic!("a release at the head it reviewed proves nothing further")
             };
             assert_eq!(
-                crate::mutating_verb::dock(&after, HEAD, never, unasked),
+                crate::mutating_verb::dock(&after, &source.head, never, unasked),
                 crate::mutating_verb::Dock::Check {
                     review: run.clone(),
-                    reviewed: HEAD.into(),
+                    reviewed: source.head.clone(),
                     carry: None,
                 }
             );
             let run_packet = wire.packet(&run).await.expect("the run");
             assert_eq!(
-                crate::review_verdict::vouches(&run_packet, &after, HEAD),
+                crate::review_verdict::vouches(&run_packet, &after, &source.head),
                 Ok(()),
                 "the dock's check passes a run a human opened: {run_packet}"
             );
@@ -2060,8 +2212,10 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn a_release_records_the_reviewers_declared_and_observed_model() {
             const BUILDER: &str = "b0b0b0b0-0000-4000-8000-000000000000";
+            let source = crate::review_verdict::ReviewSourceRepo::new();
+            let forge = |r: &str| source.forge(r);
             let (base, jobs) = serve().await;
-            a_held_car_at_the_dock(&jobs, BUILDER).await;
+            a_held_car_at_the_dock(&jobs, BUILDER, &source.head).await;
             let wire = crate::steps::Wire::at(
                 base,
                 Some(crate::identity::Caller {
@@ -2078,9 +2232,17 @@ mod tests {
             )
             .await
             .expect("the run's report, as --report writes it");
-            crate::review_verdict::record(&wire, "feat/held", "release", "", Some(&run), forge)
-                .await
-                .expect("the verdict");
+            crate::review_verdict::record_in(
+                source.path(),
+                &wire,
+                "feat/held",
+                "release",
+                "",
+                Some(&run),
+                forge,
+            )
+            .await
+            .expect("the verdict");
             crate::review_verdict::release(
                 &wire,
                 "feat/held",
@@ -2125,8 +2287,10 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         async fn a_human_who_gated_the_car_in_his_own_run_releases_it_from_outside_that_run() {
             const HIS_GATING_RUN: &str = "da71d000-0000-4000-8000-000000000000";
+            let source = crate::review_verdict::ReviewSourceRepo::new();
+            let forge = |r: &str| source.forge(r);
             let (base, jobs) = serve().await;
-            a_held_car_at_the_dock(&jobs, HIS_GATING_RUN).await;
+            a_held_car_at_the_dock(&jobs, HIS_GATING_RUN, &source.head).await;
             let wire = crate::steps::Wire::at(
                 base,
                 Some(crate::identity::Caller {
@@ -2136,9 +2300,17 @@ mod tests {
             )
             .unwrap();
             let run = a_review_run_filed_by(&wire).await;
-            crate::review_verdict::record(&wire, "feat/held", "release", "", Some(&run), forge)
-                .await
-                .expect("his review is a run other than the one that gated the car");
+            crate::review_verdict::record_in(
+                source.path(),
+                &wire,
+                "feat/held",
+                "release",
+                "",
+                Some(&run),
+                forge,
+            )
+            .await
+            .expect("his review is a run other than the one that gated the car");
 
             // Step 3 from the shell that still exports his gating run.
             let refused = crate::review_verdict::release(
@@ -2180,13 +2352,6 @@ mod tests {
 
         const HUMAN: &str = "emp-david";
         const CAR: &str = "c0ffee00-0000-4000-8000-00000000ca25";
-        const HEAD: &str = "1111111111111111111111111111111111111111";
-        const MAIN: &str = "2222222222222222222222222222222222222222";
-
-        fn forge(r: &str) -> anyhow::Result<String> {
-            Ok(if r == "refs/heads/main" { MAIN } else { HEAD }.to_string())
-        }
-
         /// `boss job file --kind agent-run`, as the wire's signer: the
         /// review run of the human road, its full id read off the report.
         async fn a_review_run_filed_by(wire: &crate::steps::Wire) -> String {
@@ -2217,7 +2382,7 @@ mod tests {
 
         /// The car at the dock: gated green by `builder`, its review held
         /// for a finding at HEAD.
-        async fn a_held_car_at_the_dock(jobs: &InMemoryJobs, builder: &str) {
+        async fn a_held_car_at_the_dock(jobs: &InMemoryJobs, builder: &str, head: &str) {
             let mut car = boss_core::job::Job::new(
                 "ship-a-change",
                 boss_core::job::Subject::new("custom", "bosspipeline"),
@@ -2242,7 +2407,7 @@ mod tests {
                 step(
                     "review",
                     "ready",
-                    json!({"hold": "touches an ops verb", boss_jobs::car::HOLD_SHA: HEAD}),
+                    json!({"hold": "touches an ops verb", boss_jobs::car::HOLD_SHA: head}),
                 ),
             ];
             let stamp = boss_core::publisher::EventStamp::new(

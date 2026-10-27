@@ -2,7 +2,7 @@
   // THE DEPARTMENT MAP — the /it landing (design e765b3fc; David,
   // 2026-09-25: "the operating map sits at the top always and clicking
   // stations or lines pulls up detail below"). The map on top — the
-  // transit map under its flight, the world map without it, the strip on
+  // transit map for every viewer, the strip on
   // a phone — and, below it, the panel of whatever `/it?at=<name>`
   // selects (regions.ts `regionHref`): a station or a section of track.
   // A selection is a query on this one route, so the map is mounted once
@@ -42,12 +42,11 @@
   import { hasPlatforms } from './world-interior';
   import { fetchBorders, type Borders } from './borders';
   import { fetchRoutes, type Routes } from './routes';
+  import { fetchFlow, type Flow } from './flow';
   import { NEEDS_YOU_URL, parseNeedsYou, outranksBoard, needsYouBoard, type Figure, type LastGood, type NeedsYou } from './hud';
   import { presentationHref } from './map-navigation';
   import HudFrame from './HudFrame.svelte';
-  import WorldMap from './WorldMap.svelte';
   import TransitMap from './TransitMap.svelte';
-  import { flightOn } from '@boss/web-kit/session/flights.svelte';
   import PlantStrip from './PlantStrip.svelte';
   import FloorDeck from './FloorDeck.svelte';
   import StationBoundary from './StationBoundary.svelte';
@@ -62,6 +61,7 @@
   import { MediaQuery } from 'svelte/reactivity';
   import PhoneStrip from './PhoneStrip.svelte';
   import { PHONE_QUERY } from './phone-strip';
+  import { mapRead, startMapPolling } from './map-polling';
 
   type Props = Readonly<{
     /** The Department Map's selection — `/it?at=<name>`. Absent, nothing
@@ -77,26 +77,17 @@
    *  mounted, never both hidden by CSS — a hidden world would still be
    *  read, counted and crawled as if it were on the screen. */
   const phone = new MediaQuery(PHONE_QUERY);
-  /** THE TRANSIT MONITOR (design 16091dfb, Q2 decided 2026-09-25):
-   *  behind its flight, on for David first. Off — and for every viewer
-   *  the flight does not list — the world map is the map; the phone
-   *  keeps its strip either way. The real moves (flight `it-map-live`,
-   *  design e765b3fc car M2) ride the transit map, so that flight
-   *  draws it too — and the world map's rate-replay tokens are never
-   *  shown under it. */
-  const transit = $derived(overview || flightOn('it-map-transit') || flightOn('it-map-live'));
+  // Both map flights were promoted by David, 2026-10-23 (54c04706,
+  // 71c4d42e): the transit monitor and recorded moves are the default.
 
   let regions = $state<Remote<Regions>>({ kind: 'loading' });
   let borders = $state<Remote<Borders>>({ kind: 'loading' });
+  let flow = $state<Remote<Flow>>({ kind: 'loading' });
   /** The routes the map draws (design e765b3fc, car R3): every section,
    *  exit and entry is one the server serves, derived from the
    *  protocols — the page holds no edge of its own. */
   let routes = $state<Remote<Routes>>({ kind: 'loading' });
   let readAt = $state<number | null>(null);
-  /** When the rails were last read WELL — the moving map's held clocks
-   *  count on from it, and it greys past three missed reads (design
-   *  31bade8f decision 6). */
-  let bordersAt = $state<number | null>(null);
   /** The newest regions read that succeeded, and when — the HUD's
    *  "last good HH:MMZ" when a later read fails (design 00774ca8
    *  decision 5). Its VALUES are never drawn once a newer read failed. */
@@ -108,34 +99,36 @@
   let needs = $state<Remote<NeedsYou>>({ kind: 'loading' });
 
   onMount(() => {
-    let cancelled = false;
-    async function tick() {
-      // Four reads, concurrently — they are independent, and the map
-      // draws its stations even while the rails and routes are coming.
-      const [r, b, w, n] = await Promise.all([
-        fetchRegions(),
-        fetchBorders(),
-        fetchRoutes(),
-        fetchRemote(NEEDS_YOU_URL, parseNeedsYou),
-      ]);
-      if (cancelled) return;
-      regions = r;
-      borders = b;
-      routes = w;
-      needs = n;
-      readAt = Date.now();
-      if (b.kind === 'ready') bordersAt = readAt;
-      if (r.kind === 'ready') {
-        lastGood = { at: readAt };
-        successfulReads += 1;
-      }
-    }
-    void tick();
-    const t = setInterval(tick, 10_000);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-    };
+    // One read in flight per endpoint (452e507c, 909adf3b): a tick skips
+    // a read still out, so slow reads no longer stack into 524s; a slow
+    // read holds only itself and never renews another endpoint's time;
+    // a hidden tab adds no background reads. map-polling.ts says why.
+    return startMapPolling([
+      mapRead(fetchRegions, (r, at) => {
+        regions = r;
+        readAt = at;
+        if (r.kind === 'ready') {
+          lastGood = { at };
+          successfulReads += 1;
+        }
+      }),
+      mapRead(fetchBorders, (b) => {
+        borders = b;
+      }),
+      mapRead(fetchRoutes, (w) => { routes = w; }),
+      mapRead(fetchFlow, (f) => { flow = f; }),
+      mapRead(() => fetchRemote(NEEDS_YOU_URL, parseNeedsYou), (n) => { needs = n; }),
+    ], {
+      hidden: () => document.hidden,
+      every: (tick, ms) => {
+        const timer = setInterval(tick, ms);
+        return () => clearInterval(timer);
+      },
+      onVisibility: (tick) => {
+        document.addEventListener('visibilitychange', tick);
+        return () => document.removeEventListener('visibilitychange', tick);
+      },
+    });
   });
 
   const clock = (ms: number) =>
@@ -198,7 +191,9 @@
    *  newcomer loses nothing). panel.ts `STATION_BOARDS` is the table. */
   const WHERE =
     'Feedback and the IT backlog are in the Receiving station\'s panel (the backlog in Marshalling\'s too), the Crew Board in the Shop floor\'s, and yard status and the conductor\'s activity in the Track\'s, with the Dock\'s and the Garage\'s lanes in theirs.';
-  const figureText = (figure: Figure): string => figure.kind === 'zero' ? '0' : figure.kind === 'unread' ? 'unread' : figure.text;
+  // A floor — a count cut at its limit (backlog 97b5cf45) — reads `N+`.
+  const figureText = (figure: Figure): string =>
+    figure.kind === 'zero' ? '0' : figure.kind === 'unread' ? 'unread' : figure.kind === 'floor' ? `${figure.text}+` : figure.text;
   const urgent = $derived(outranksBoard(regions));
   const personal = $derived(needsYouBoard(needs, readAt ?? 0));
   const inspectionHref = $derived(picked.kind === 'station' ? regionHref(picked.name) : picked.kind === 'section' ? sectionHref(picked.from, picked.to) : '/it');
@@ -212,9 +207,8 @@
   <PageHeader
     eyebrow="IT"
     title={overview ? 'IT · Transit map' : 'Department Map'}
-    subtitle={overview ? 'Follow recorded work. Select a station or route to orient, then open its detailed board.' : (transit
-      ? 'The network as a transit monitor: each region a station on its line, each border a section of track with what waits on it, and the alarms board beside it. Select a station or a section to open its detail below the map. '
-      : 'The territories along the packet flow, and the borders between them carrying what crosses, what waits and the machine that moves it. Select a territory to open its detail below the map. ') + WHERE}
+    subtitle={overview ? 'Follow recorded work. Select a station or route to orient, then open its detailed board.' :
+      'The network as a transit monitor: each region a station on its line, each border a section of track with what waits on it, and the alarms board beside it. Select a station or a section to open its detail below the map. ' + WHERE}
   />
 
   <!-- THE TOP BOARD (design ea906603) in the HUD frame (design
@@ -230,6 +224,24 @@
   {:else}
     <HudFrame read={regions} {readAt} {lastGood} {needs} />
   {/if}
+
+  <p class="flow-reading" class:load-failed={flow.kind === 'failed'} role="status"
+    data-flow-state={flow.kind === 'ready' ? flow.data.state : flow.kind}>
+    {#if flow.kind === 'loading'}
+      Reading flow counts…
+    {:else if flow.kind === 'failed'}
+      Flow counts unread — {flow.error}
+    {:else if flow.data.state === 'pending'}
+      Flow counts pending
+    {:else if flow.data.state === 'unread'}
+      Flow counts unread — {flow.data.why}
+    {:else if flow.data.state === 'withheld'}
+      Flow counts withheld — {flow.data.why}
+    {:else}
+      Flow counts read at <time datetime={flow.data.as_of}>{flow.data.as_of}</time>
+      {#if flow.data.why !== null} · last refresh failed — {flow.data.why}{/if}
+    {/if}
+  </p>
 
   {#if regions.kind === 'loading'}
     <div class="yard-empty">Reading the regions…</div>
@@ -273,7 +285,7 @@
         <PhoneStrip
           regions={regions.data}
           borders={borders.kind === 'ready' ? borders.data : null} {overview} />
-      {:else if transit}
+      {:else}
         <!-- The same two reads, drawn as a transit map (design 16091dfb):
              stations, sections and the alarms board, with the selection
              marked on it (design e765b3fc, car N2). -->
@@ -282,11 +294,6 @@
           routes={routes.kind === 'ready' ? routes.data : null}
           borders={borders.kind === 'ready' ? borders.data : null}
           selected={markOf(picked)} {overview} />
-      {:else}
-        <WorldMap
-          regions={regions.data}
-          borders={borders.kind === 'ready' ? borders.data : null}
-          {bordersAt} />
       {/if}
     </div>
     {#if !phone.current && !overview}
@@ -373,7 +380,7 @@
     <!-- A failed routes read is said where the routes are drawn (car R3):
          the transit map's stations still stand, and no section is guessed
          in its place. -->
-    {#if routes.kind === 'failed' && transit && !phone.current}
+    {#if routes.kind === 'failed' && !phone.current}
       <div class="yard-empty load-failed" data-routes-failed>The routes cannot be read — {routes.error}</div>
     {/if}
     <div class="yard-flow">
@@ -435,6 +442,7 @@
 {/snippet}
 
 <style>
+  .flow-reading { margin: 0 0 12px; font-size: 12px; color: var(--map-muted); }
   .company-back { display: inline-block; margin-bottom: var(--s2); color: var(--map-ink); font-size: 13px; }
   .map-context { margin-bottom: var(--s3); color: var(--map-muted); font-size: 13px; }
   .map-context summary { cursor: pointer; }
@@ -454,7 +462,7 @@
     letter-spacing: var(--ls-nav); color: var(--map-muted);
     border-top: 1px solid var(--map-rule); margin-top: 28px; padding-top: 12px; }
   /* The selection's panel — a departure-board plate under the map, in the
-     crossing panel's grammar (WorldMap.svelte): a hairline frame, a mono
+     crossing panel's grammar: a hairline frame, a mono
      uppercase head with the state's lamp, the figure large beneath. */
   .map-panel { margin-top: var(--s3); border: 1px solid var(--map-rule-strong);
     border-top-width: 3px; background: var(--map-surface); padding: var(--s2) var(--s3) var(--s3);

@@ -19,8 +19,11 @@
 # WHAT IT KEEPS. Every BOSS_DEV_MEMORY_INTERVAL_S seconds, one sample
 # file under WORK_MOUNT/telemetry/dev-memory/ring/: per container of the
 # pod, the process count and the summed resident and anonymous memory;
-# then the BOSS_DEV_MEMORY_TOP largest processes in the pod by resident
-# size, each with its container, pid, name and command line. The ring
+# per container and process NAME, the same three and the parents they
+# ran under, so a count of compilers is a count and not a lower bound
+# (backlog 893ce2b0), with the parent of each crowd named by its command
+# line; then the BOSS_DEV_MEMORY_TOP largest processes in the pod by
+# resident size, each with its container, pid, name and command line. The ring
 # holds the newest BOSS_DEV_MEMORY_RING samples (240 at 15 s: an hour,
 # about a megabyte). It lives on the PVC because the PVC is what a
 # container kill leaves standing. This is telemetry, so it stays out of
@@ -89,8 +92,9 @@
 # (backlog 36b1aa00). An alert the
 # API REFUSES backs off and is moved aside at the fifth refusal, so it
 # cannot hold the ones behind it. The spool keeps its newest 48 and
-# counts what it drops, alert-refused/ its newest 20, kills/ its newest
-# five, seen/ a week of gone pods, watch.log a megabyte.
+# counts what it drops, alert-refused/ its newest 20, kills/ the newest
+# five rings no open item names plus up to twenty that one does (see
+# `prune_kills`), seen/ a week of gone pods, watch.log a megabyte.
 #
 # HOW A READER KNOWS IT IS RUNNING. `--state` prints the loop's pid and
 # generation, the newest sample's age, the alerts kept, refused and
@@ -104,7 +108,8 @@
 #   dev-memory-watch.sh --state    the watch's state, key=value lines
 #   dev-memory-watch.sh --acknowledge
 #                                  a person has read the refused and
-#                                  dropped alerts: keep them aside, zero
+#                                  dropped alerts and the retired frozen
+#                                  rings: keep them aside, zero
 #                                  the counts, and say so on the next
 #                                  reclaim packet (see `acknowledge`)
 #   dev-memory-watch.sh --recorded <acknowledgement>...
@@ -132,7 +137,15 @@ WATCHED="${BOSS_DEV_MEMORY_CONTAINER:-dev}"
 SA_DIR="${BOSS_K8S_SA_DIR:-/var/run/secrets/kubernetes.io/serviceaccount}"
 POD="${BOSS_POD_NAME:-$(hostname)}"
 # Frozen rings kept: five kills is days of history at a megabyte each.
+# These are the rings no open item names; the ones an item names are
+# bounded apart, below.
 KILLS_KEEP=5
+# Rings an item not yet read closed holds, at most (about 20 MB), how
+# often one such item is read, and how many retirement lines are kept
+# (backlog 0143612a; see `prune_kills`).
+KILLS_HELD_MAX=20
+HELD_CHECK_S=3600
+RETIRED_LOG_KEEP=200
 # The longest a tick waits on the cluster API before it samples; also
 # what --ensure's wait for a first sample is sized from.
 POD_READ_MAX_S=8
@@ -360,6 +373,8 @@ own_binding() {
 #   container  <name> procs=N rss_kib=N anon_kib=N restarts=N limit=X
 #   cgroup     <name> current=… peak=… max=… oom_kill=… | unreadable …
 #   memory-stat <name> <kernel-category>=<bytes|unknown> …
+#   command    <container> <comm> procs=N rss_kib=N anon_kib=N parents=<comm>[<pid>]x<n>,…
+#   parent     <container> <pid> <comm> <cmdline>   (see by_command)
 #   proc       <rss_kib> <anon_kib> <container> <pid> <comm> <cmdline>
 # rss is statm's resident pages, anon is resident minus shared.
 git_phase_snapshot() {
@@ -373,8 +388,55 @@ git_phase_snapshot() {
     fi
 }
 
+# EVERY PROCESS, COUNTED BY ITS NAME (backlog 893ce2b0). The proc lines
+# keep only the TOP largest, so measured 2026-10-10 07:48:04Z the widest
+# sample held at least ten clippy-drivers under one workspace cargo
+# check — "at least", because a 32-wide clippy showed at most fifteen.
+# From the rows sample() writes, into $TMP/commands one `command` line
+# per container and name, largest first within the container: how many
+# ran, their summed resident and anonymous memory, and the parents they
+# ran under, `<name>[<pid>]x<n>` most first (`?` for a parent the table
+# does not hold, `-` for a parent stat would not give), PARENTS_KEEP of
+# them and `+<n>` for the rest. Into $TMP/parents, for the commands that
+# ran more than once, each listed parent the table holds — the cargo a
+# crowd of compilers ran from — PARENT_LINES_KEEP of them, largest crowd
+# first; sample() names each with its command line, in the ring only.
+PARENTS_KEEP=4
+PARENT_LINES_KEEP=8
+by_command() {
+    # One row per container, name and parent; then folded per name.
+    awk -F'\t' '{ k = $3 "\t" $6 "\t" $5; n[k]++; rss[k] += $1; anon[k] += $2 }
+        END { for (k in n) printf "%s\t%d\t%d\t%d\n", k, n[k], rss[k], anon[k] }' "$TMP/rows" \
+        | sort -t $'\t' -k1,1 -k2,2 -k4,4nr -k3,3n \
+        | awk -F'\t' -v keep="$PARENTS_KEEP" '
+            function flush() {
+                if (cur == "") return
+                if (more) parents = parents ",+" more
+                printf "%s\t%d\t%d\t%d\t%s\t%s\n", cur, procs, rss, anon, parents, held
+            }
+            FILENAME == ARGV[1] { who[$4] = $6; where[$4] = $3; next }
+            { k = $1 "\t" $2
+              if (k != cur) { flush(); cur = k; procs = 0; rss = 0; anon = 0; listed = 0; more = 0; parents = ""; held = "" }
+              procs += $4; rss += $5; anon += $6
+              if (listed >= keep) { more++; next }
+              listed++
+              if ($3 == "-") p = "-"
+              else p = (($3 in who) ? who[$3] : "?") "[" $3 "]"
+              parents = parents (parents == "" ? "" : ",") p "x" $4
+              if ($3 in who) held = held " " $3 "," where[$3] "," who[$3] }
+            END { flush() }' "$TMP/rows" - \
+        | sort -t $'\t' -k1,1 -k4,4nr -k2,2 > "$TMP/by-name"
+    awk -F'\t' '{ printf "command\t%s\t%s\tprocs=%d\trss_kib=%d\tanon_kib=%d\tparents=%s\n", $1, $2, $3, $4, $5, $6 }' \
+        "$TMP/by-name" > "$TMP/commands"
+    awk -F'\t' '$3 >= 2 { n = split($7, h, " "); for (i = 1; i <= n; i++) print $4 "\t" h[i] }' "$TMP/by-name" \
+        | sort -t $'\t' -k1,1nr \
+        | awk -F'\t' -v keep="$PARENT_LINES_KEEP" '{ split($2, f, ",") }
+            !(f[1] in seen) && shown < keep { seen[f[1]] = 1; shown++; print $1 "\t" f[1] "\t" f[2] "\t" f[3] }' \
+        > "$TMP/parents"
+}
+
 sample() {
-    local epoch at page_kb p res shr cg pid c comm cmd out
+    local epoch at page_kb p res shr cg pid c comm cmd out st
     epoch=$(date -u +%s)
     at=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ)
     page_kb=$(( $(getconf PAGESIZE 2>/dev/null || echo 4096) / 1024 ))
@@ -392,7 +454,21 @@ sample() {
         esac
         read -r _ res shr _ 2> /dev/null < "$p/statm" || continue
         case "${res:-0}" in '' | *[!0-9]* | 0) continue ;; esac
-        printf '%s\t%s\t%s\t%s\n' "$res" "${shr:-0}" "${p##*/}" "${cg##*/}"
+        # Every process's name and parent, for the by-name counts
+        # (backlog 893ce2b0). The parent is the field after the state in
+        # stat, and the state follows the LAST `) `: a process names
+        # itself, `) S 1 (` included, so the whole file is read (a name
+        # may hold a newline too) and cut at the last one. Unreadable or
+        # malformed is `-`, never a guess. Builtins only — this runs for
+        # every process every tick.
+        st=""
+        IFS= read -r -d '' st 2> /dev/null < "$p/stat" || true
+        st="${st##*) }"; st="${st#* }"; st="${st%% *}"
+        case "${st:-empty}" in empty | *[!0-9]*) st=- ;; esac
+        comm=""
+        IFS= read -r comm 2> /dev/null < "$p/comm" || true
+        comm="${comm:0:15}"; comm="${comm//[!A-Za-z0-9._:\/+-]/?}"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$res" "${shr:-0}" "${p##*/}" "${cg##*/}" "$st" "${comm:-?}"
     done > "$TMP/procs"
     own_binding
     # A process in this script's own container shows an empty root
@@ -401,9 +477,10 @@ sample() {
     awk -F'\t' -v kb="$page_kb" -v own="$OWN_NAME" '
         FILENAME == ARGV[1] { name[$2] = $1; count[$2]++; next }
         { c = (count[$4] == 1) ? name[$4] : ($4 == "" ? own : substr($4, 1, 12))
-          printf "%d\t%d\t%s\t%s\n", $1 * kb, ($1 - $2) * kb, c, $3 }' \
+          printf "%d\t%d\t%s\t%s\t%s\t%s\n", $1 * kb, ($1 - $2) * kb, c, $3, $5, $6 }' \
         "$TMP/containers" "$TMP/procs" > "$TMP/rows"
     sort -rn -k1,1 "$TMP/rows" > "$TMP/sorted"
+    by_command
     out="$TMP/sample"
     {
         printf 'at\t%s\t%s\t%s\t%s\n' "$at" "$epoch" "$POD" "$INTERVAL"
@@ -422,9 +499,12 @@ sample() {
             pid=$(awk -F'\t' -v c="$c" '$3 == c {print $4; exit}' "$TMP/rows")
             [ -z "$pid" ] || cgroup_line "$c" "$pid"
         done
-        head -n "$TOP" "$TMP/sorted" | while IFS=$'\t' read -r res shr c pid; do
-            comm=""
-            IFS= read -r comm 2> /dev/null < "$PROC_ROOT/$pid/comm" || true
+        cat "$TMP/commands"
+        while IFS=$'\t' read -r _ pid c comm; do
+            cmd=$(tr '\0\t\n' '   ' 2> /dev/null < "$PROC_ROOT/$pid/cmdline" | cut -c1-600 | scrub)
+            printf 'parent\t%s\t%s\t%s\t%s\n' "$c" "$pid" "$comm" "$cmd"
+        done < "$TMP/parents"
+        head -n "$TOP" "$TMP/sorted" | while IFS=$'\t' read -r res shr c pid _ comm; do
             # The scrub runs over the command line ALONE, and it is the
             # last field. Until the delta review of car 7849553a (N1)
             # the whole record went through it, and its `bearer` rule
@@ -488,6 +568,20 @@ describe_sample() {
             pid = ($5 ~ /^[0-9]+$/) ? $5 : "?"
             top = top sprintf(" | %d MiB %s[%s]", $2 / 1024, comm, pid)
         }
+        # How many ran by name, with the parents they ran under (backlog
+        # 893ce2b0): names, counts and pids only, each held to its class
+        # here too. The command lines of those parents stay in the ring.
+        $1 == "command" && $2 == name && named < 5 {
+            named++
+            split($4, a, "="); split($5, b, "=")
+            comm = substr($3, 1, 15)
+            gsub(/[^A-Za-z0-9._:\/+-]/, "?", comm)
+            if (comm == "") comm = "?"
+            under = $7; sub(/^parents=/, "", under)
+            gsub(/[^]A-Za-z0-9._:\/+?,[-]/, "?", under)
+            byname = byname sprintf("%s%s %s %.1f GiB under %s", byname == "" ? " " : " | ",
+                (a[2] ~ /^[0-9]+$/) ? a[2] : "?", comm, b[2] / 1048576, substr(under, 1, 120))
+        }
         END {
             if (!bound) {
                 printf "container binding unknown; no bound process measurements for %s", name
@@ -499,6 +593,7 @@ describe_sample() {
             if (stats != "") printf "; memory.stat%s", stats
             if (top != "") printf "; largest processes in it by resident size:%s", top
             else printf "; none of its processes is among the largest in the pod in this sample"
+            if (byname != "") printf "; processes by name, largest first:%s", byname
         }' "$f"
 }
 
@@ -512,18 +607,148 @@ frozen_dir() {
 }
 
 # Freeze the ring, whole: the alert is a reduction, and a reduction made
-# before the record is stored discards the only copy.
+# before the record is stored discards the only copy. `prune_kills`
+# bounds kills/ once the pass has said which rings an item names.
+FROZE=""
 freeze_ring() {
-    local frozen="$1" f
+    local frozen="$1"
     [ ! -d "$frozen" ] || return 0
     mkdir -p "$DIR/kills" "$DIR/ring" || return 1
     rm -rf "$frozen.copying"
     cp -a "$DIR/ring" "$frozen.copying" || return 1
     git_phase_snapshot --archive > "$frozen.copying/git-phases.json" || return 1
     mv "$frozen.copying" "$frozen" || return 1
-    ls -1tr "$DIR/kills" | all_but_newest "$KILLS_KEEP" | while read -r f; do
-        rm -rf "${DIR:?}/kills/$f"
+    FROZE=1
+}
+
+# A RING AN OPEN ITEM NAMES IS THAT ITEM'S (backlog 0143612a). Measured
+# 2026-10-14 on alert item 89675645: the frozen_ring it names — the
+# whole ring from before an Oct 12 kill, the copy its detail is a
+# reduction of — was gone while the item was still open, because this
+# bound kept the newest five kill directories and removed the rest
+# unconditionally, and a container in a restart loop freezes a ring for
+# EVERY restart while the window files one item for many. Restarts
+# nobody itemised rotated away the one ring an open item named.
+#
+# So a ring has `<ring>.incident` beside it from the moment an alert
+# naming it is kept: `pending` until the alert is filed, then `item <id>
+# <epoch last read>` (file_kept_alerts), and `check_held_ring` turns it
+# into `<ring>.released` once that item reads closed or cancelled.
+# BESIDE the ring, never in it: the rotation orders rings by their
+# directory's mtime, which `cp -a` froze, and a marker written inside
+# would make a ring read newer every time it was touched. A ring with no
+# `.incident` — released, or a restart counted into another item — is
+# in the rotation of KILLS_KEEP, as every ring was. A held ring is not,
+# and what bounds the volume instead is KILLS_HELD_MAX: past it the
+# OLDEST held ring is retired, and a retirement is never silent — a line
+# in kills-retired.log naming the ring and what held it, and a count
+# that `--state` carries and the reclaim pass raises as a problem until
+# a person runs --acknowledge. An item that cannot be read (a dark API,
+# a refused read, an alert never filed) keeps its ring held, so the
+# bound and its record are the only way one leaves.
+kills_oldest_first() {
+    local f
+    ls -1tr "$DIR/kills" | while read -r f; do
+        case "$f" in *.copying | *.incident | *.released) continue ;; esac
+        [ -d "$DIR/kills/$f" ] || continue
+        if [ -f "$DIR/kills/$f.incident" ]; then
+            [ "$1" != held ] || printf '%s\n' "$f"
+        else
+            [ "$1" = held ] || printf '%s\n' "$f"
+        fi
     done
+}
+prune_kills() {
+    local f line m
+    [ -d "$DIR/kills" ] || return 0
+    kills_oldest_first free | all_but_newest "$KILLS_KEEP" | while read -r f; do
+        rm -rf "${DIR:?}/kills/$f" "$DIR/kills/$f.released"
+    done
+    kills_oldest_first held | all_but_newest "$KILLS_HELD_MAX" | while read -r f; do
+        line=""
+        read -r line 2> /dev/null < "$DIR/kills/$f.incident" || true
+        line=$(printf '%s' "$line" | tr -cd '\40-\176' | cut -c1-200)
+        printf '%s retired %s (%s): more than %s frozen rings were held by items not yet read closed\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$f" "${line:-unreadable}" "$KILLS_HELD_MAX" >> "$DIR/kills-retired.log"
+        count_one "$DIR/kills-retired"
+        rm -rf "${DIR:?}/kills/$f" "$DIR/kills/$f.incident"
+        log "RETIRED frozen ring $f, held by ${line:-unreadable}: more than $KILLS_HELD_MAX rings were held" >&2
+    done
+    # A marker whose ring is gone holds nothing.
+    for m in "$DIR"/kills/*.incident "$DIR"/kills/*.released; do
+        [ -f "$m" ] || continue
+        [ -d "${m%.*}" ] || rm -f "$m"
+    done
+    if [ -f "$DIR/kills-retired.log" ] && [ "$(wc -l < "$DIR/kills-retired.log")" -gt "$RETIRED_LOG_KEEP" ]; then
+        tail -n "$RETIRED_LOG_KEEP" "$DIR/kills-retired.log" > "$DIR/kills-retired.log.writing" \
+            && mv "$DIR/kills-retired.log.writing" "$DIR/kills-retired.log"
+    fi
+    return 0
+}
+
+# One held ring whose item is due a read, read: at most one request a
+# tick, and each item at most once every HELD_CHECK_S. Only an answer
+# that IS the packet and says closed or cancelled releases the ring;
+# anything else — no answer, a refusal, a 404 a narrower scope can give,
+# a body without a status — is not evidence that the incident ended
+# (an unreadable answer is not an empty one), so the ring stays held and
+# the item is asked again in an hour.
+check_held_ring() {
+    local m d kind id checked now url hdr="" code status
+    now=$(date -u +%s)
+    for m in "$DIR"/kills/*.incident; do
+        [ -f "$m" ] || continue
+        d="${m%.incident}"
+        [ -d "$d" ] || continue
+        kind=""; id=""; checked=""
+        read -r kind id checked 2> /dev/null < "$m" || true
+        [ "$kind" = item ] || continue
+        case "${id:-empty}" in empty | *[!A-Za-z0-9-]*) continue ;; esac
+        case "${checked:-empty}" in empty | *[!0-9]*) checked=0 ;; esac
+        [ $((now - checked)) -ge "$HELD_CHECK_S" ] || continue
+        url="${BOSS_JOBS_URL:-$(head -n1 "$HERE/../dev/sor-url" 2> /dev/null || true)}"
+        if [ -z "$url" ] || [ ! -r "$HERE/../forge/alert-lib.sh" ]; then return 0; fi
+        load_alert_lib "$url"
+        if declare -F machine_token_header > /dev/null; then
+            machine_token_header hdr "$url" || hdr=""
+        fi
+        code=$(curl -s -o "$TMP/held-item" -w '%{http_code}' --max-time 5 \
+            ${hdr:+-H "$hdr"} -H "x-boss-user: $ALERT_USER" "$url/api/jobs/$id") || code=000
+        status=""
+        if [ "$code" = 200 ] && jq_doc_file "$TMP/held-item"; then
+            status=$(jq -r '.status // empty' "$TMP/held-item" 2> /dev/null) || status=""
+        fi
+        case "$status" in
+            closed | cancelled)
+                printf 'item %s %s %s\n' "$id" "$status" "$now" > "$d.released" && rm -f "$m"
+                echo "frozen ring ${d##*/} released: item $id is $status" >&2
+                ;;
+            *)
+                printf 'item %s %s\n' "$id" "$now" > "$m"
+                ;;
+        esac
+        return 0
+    done
+    return 0
+}
+
+# The item a 201 answered is the one the filed alert's ring is held by.
+# The ring is named by the body's own frozen_ring, and only a directory
+# under kills/ is written to.
+link_incident() {
+    local body="$1" answer="$2" ring id
+    ring=$(jq -r '.metadata.frozen_ring // empty' "$body" 2> /dev/null) || ring=""
+    case "$ring" in "$DIR/kills/"*) ;; *) return 0 ;; esac
+    case "${ring#"$DIR/kills/"}" in '' | *[!A-Za-z0-9._-]*) return 0 ;; esac
+    [ -d "$ring" ] || return 0
+    id=$(jq -r '.id // empty' "$answer" 2> /dev/null) || id=""
+    case "${id:-empty}" in
+        empty | *[!A-Za-z0-9-]*)
+            echo "alert filed, and its answer named no item: ring ${ring##*/} stays held as pending" >&2
+            return 0
+            ;;
+    esac
+    printf 'item %s %s\n' "$id" "$(date -u +%s)" > "$ring.incident"
 }
 
 # Keep the alert for one restart in the spool; `file_kept_alerts` sends
@@ -624,6 +849,9 @@ keep_restart_alert() {
                     finished_at: $finished, restart_count: $count, restarts_in_this_item: $since,
                     frozen_ring: $frozen}}' > "$out.writing" \
         && mv "$out.writing" "$out" || { rm -f "$out.writing"; return 1; }
+    # From here the ring is this alert's incident's (see `prune_kills`):
+    # pending until the alert is filed and the answer names its item.
+    [ ! -d "$frozen" ] || [ -f "$frozen.incident" ] || printf 'pending\n' > "$frozen.incident"
     echo "ALERT kept for sending: $title" >&2
     # The spool's bound. One item per container per window keeps it far
     # under this; past it the OLDEST go, counted, because the newest
@@ -715,6 +943,7 @@ file_kept_alerts() {
         fi
         case "$code" in
             201)
+                link_incident "$f" "$TMP/alert-answer"
                 rm -f "$f" "$tries"
                 echo "alert filed: ${f##*/}" >&2
                 ;;
@@ -788,6 +1017,9 @@ check_restarts() {
             printf '%s %s %s\n' "$count" "$now" "$frozen_n" > "$seenf"
         fi
     done < "$TMP/containers"
+    # After the alerts are kept, so a ring frozen for one is already
+    # marked held when the bound is applied.
+    [ -z "$FROZE" ] || prune_kills
     # State for pods that are gone: a week is longer than any question
     # about one.
     find "$DIR/seen" -type f ! -name "$uid.*" -mtime +7 -delete 2> /dev/null || true
@@ -827,6 +1059,7 @@ tick() {
     # check_restarts above only keeps; it asks the network nothing.
     sample || { log "could not write a sample under $DIR/ring" >&2; file_kept_alerts; return 1; }
     file_kept_alerts
+    check_held_ring
 }
 
 # Is <pid> a running loop of this script? The REAL /proc, whatever
@@ -973,19 +1206,36 @@ state() {
     # past which the reclaim pass raises it (HELD_AFTER_S above).
     printf 'memory_watch_alerts_oldest_kept_age_s=%s\n' "$(oldest_kept_age)"
     printf 'memory_watch_alerts_held_after_s=%s\n' "$HELD_AFTER_S"
+    # Frozen rings an item not yet read closed holds, and how many were
+    # retired past KILLS_HELD_MAX since the last acknowledgement — each
+    # named in kills-retired.log (backlog 0143612a, `prune_kills`).
+    local held=0 retired=0 m
+    for m in "$DIR"/kills/*.incident; do
+        [ ! -d "${m%.incident}" ] || held=$((held + 1))
+    done
+    if [ -r "$DIR/kills-retired" ]; then read -r retired < "$DIR/kills-retired" || retired=0; fi
+    case "${retired:-empty}" in empty | *[!0-9]*) retired=0 ;; esac
+    printf 'memory_watch_rings_held=%s\n' "$held"
+    printf 'memory_watch_rings_retired=%s\n' "$retired"
     printf 'memory_watch_ensure=%s\n' "$(printf '%s' "$said" | tr -cd '\40-\176' | cut -c1-400)"
     # Where all of the above lives, so the packet that counts a refused
     # alert also says where to read it.
     printf 'memory_watch_dir=%s\n' "$DIR"
     # Acknowledgements no packet has carried yet: their names (what
     # --recorded takes back) and what each one says.
-    local stamps="" said_acks="" d line
+    # Only a name --recorded would take back is listed (review 1cd6b7a1,
+    # finding 3; backlog 8aff9d6b): a hand-made folder whose name held a
+    # newline added a key=value line of its own to the packet.
+    local stamps="" said_acks="" d name line
     for d in "$DIR"/acknowledged/*/; do
         [ -f "$d/unrecorded" ] || continue
+        name="${d%/}"
+        name="${name##*/}"
+        case "$name" in '' | *[!A-Za-z0-9-]*) continue ;; esac
         line=""
         read -r line 2> /dev/null < "$d/record" || true
-        stamps="${stamps:+$stamps }$(basename "$d")"
-        said_acks="${said_acks:+$said_acks; }$(basename "$d") $line"
+        stamps="${stamps:+$stamps }$name"
+        said_acks="${said_acks:+$said_acks; }$name $line"
     done
     printf 'memory_watch_acknowledgements=%s\n' "$stamps"
     printf 'memory_watch_acknowledged=%s\n' "$(printf '%s' "$said_acks" | tr -cd '\40-\176' | cut -c1-400)"
@@ -1007,34 +1257,87 @@ state() {
 # actor file — the same rule every `boss` verb signs by.
 ACK_KEEP=20
 acknowledge() {
-    local refused dropped=0 stamp dest who f
+    local refused dropped=0 dropped_said stamp dest who f when moved=0
     mkdir -p "$DIR" || return 1
     # Under the tick's lock: a tick moves a body INTO alert-refused/.
     if command -v flock > /dev/null 2>&1 && { exec 8>> "$DIR/.tick.lock"; } 2> /dev/null; then
         flock -w 60 8 || { log "a tick held the lock for 60 s — nothing acknowledged" >&2; return 1; }
     fi
     refused=$(ls -1 "$DIR/alert-refused" 2> /dev/null | grep -c '\.json$')
+    # The count is read exactly as --state reads it, and anything --state
+    # would print as other than zero is something to acknowledge — the
+    # reclaim pass's own test (review 1cd6b7a1, finding 1; backlog
+    # 8aff9d6b). This verb read a count that is not a number as 0 and
+    # said there was nothing to acknowledge, while the reclaim flagged it
+    # every hour: the verb could not clear the problem it is named in.
     if [ -r "$DIR/alerts-dropped" ]; then read -r dropped < "$DIR/alerts-dropped" || dropped=0; fi
-    case "${dropped:-empty}" in empty | *[!0-9]*) dropped=0 ;; esac
-    if [ "${refused:-0}" -eq 0 ] && [ "$dropped" -eq 0 ]; then
-        log "nothing to acknowledge: no refused alert under $DIR/alert-refused and none dropped"
-        return 0
-    fi
+    dropped="${dropped:-0}"
+    case "$dropped" in
+        *[!0-9]*) dropped_said="a dropped count that is not a number, kept as it was" ;;
+        *) dropped_said="$dropped dropped" ;;
+    esac
+    # And frozen rings retired while an item held them (backlog
+    # 0143612a): the count is cleared, the names move with the record.
+    # Read as --state reads it, which prints a garbled count as 0.
+    local retired=0
+    if [ -r "$DIR/kills-retired" ]; then read -r retired < "$DIR/kills-retired" || retired=0; fi
+    case "${retired:-empty}" in empty | *[!0-9]*) retired=0 ;; esac
+    case "${refused:-0}$dropped$retired" in
+        *[!0]*) ;;
+        *)
+            log "nothing to acknowledge: no refused alert under $DIR/alert-refused, none dropped and no frozen ring retired"
+            return 0
+            ;;
+    esac
     who="${BOSS_ACTOR:-$(head -n1 "${HOME:-/nonexistent}/.config/boss/actor" 2> /dev/null)}"
     who=$(printf '%s' "${who:-unidentified}" | tr -cd 'A-Za-z0-9@._:-')
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    when=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     dest="$DIR/acknowledged/$stamp"
     [ ! -e "$dest" ] || dest="$dest-$$"
     mkdir -p "$dest" || return 1
+    # The mark BEFORE the first move (review 1cd6b7a1, finding 2): the
+    # bodies were moved first, so a move that failed part-way left a
+    # folder holding them with neither record nor mark — absent from
+    # --state, and deleted by the ACK_KEEP bound below on a later
+    # acknowledgement, the one copy of each kill alert with it. Marked,
+    # it stays named on --state and the bound never takes it; a stop
+    # says in its record what was moved and what was not, and what was
+    # not is still counted where it was, so the problem stays raised.
+    : > "$dest/unrecorded" || { rmdir "$dest" 2> /dev/null; return 1; }
     for f in "$DIR/alert-refused"/*; do
         [ -e "$f" ] || continue
-        mv "$f" "$dest/" || return 1
+        if ! mv "$f" "$dest/"; then
+            printf 'acknowledgement %s by %s stopped part-way: %s of %s refused moved here, the rest still in alert-refused/, the dropped count not touched\n' \
+                "$when" "$who" "$moved" "$refused" > "$dest/record"
+            log "acknowledgement by $who stopped part-way: $moved of $refused refused alert(s) moved to $dest, the rest still in $DIR/alert-refused" >&2
+            return 1
+        fi
+        case "$f" in *.json) moved=$((moved + 1)) ;; esac
     done
-    printf '%s\n' "$dropped" > "$dest/dropped" && rm -f "$DIR/alerts-dropped"
-    printf 'acknowledged %s by %s: %s refused kept here, %s dropped\n' \
-        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$refused" "$dropped" > "$dest/record"
-    : > "$dest/unrecorded"
-    log "acknowledged by $who: $refused refused alert(s) kept at $dest, $dropped dropped — the next reclaim packet carries it"
+    # Moved, not retyped: a count that is not a number is kept as it was.
+    if [ -e "$DIR/alerts-dropped" ]; then
+        if ! mv "$DIR/alerts-dropped" "$dest/dropped"; then
+            printf 'acknowledgement %s by %s stopped part-way: %s of %s refused moved here, the dropped count still at alerts-dropped\n' \
+                "$when" "$who" "$moved" "$refused" > "$dest/record"
+            log "acknowledgement by $who stopped part-way: the dropped count could not be moved to $dest" >&2
+            return 1
+        fi
+    else
+        printf '0\n' > "$dest/dropped"
+    fi
+    # The retired rings' names, under the same mark: a stop here says so
+    # in the record, and the retired count stays where --state reads it.
+    if [ -f "$DIR/kills-retired.log" ] && ! mv "$DIR/kills-retired.log" "$dest/"; then
+        printf 'acknowledgement %s by %s stopped part-way: %s of %s refused and the dropped count moved here, the retired rings still named in kills-retired.log\n' \
+            "$when" "$who" "$moved" "$refused" > "$dest/record"
+        log "acknowledgement by $who stopped part-way: kills-retired.log could not be moved to $dest" >&2
+        return 1
+    fi
+    printf '%s\n' "$retired" > "$dest/kills-retired" && rm -f "$DIR/kills-retired"
+    printf 'acknowledged %s by %s: %s refused kept here, %s, %s frozen ring(s) retired\n' \
+        "$when" "$who" "$refused" "$dropped_said" "$retired" > "$dest/record"
+    log "acknowledged by $who: $refused refused alert(s) kept at $dest, $dropped_said, $retired frozen ring(s) retired — the next reclaim packet carries it"
     # The bound: the newest ACK_KEEP, never one no packet has carried.
     ls -1 "$DIR/acknowledged" | sort | all_but_newest "$ACK_KEEP" | while read -r f; do
         [ -f "$DIR/acknowledged/$f/unrecorded" ] || rm -rf "${DIR:?}/acknowledged/$f"

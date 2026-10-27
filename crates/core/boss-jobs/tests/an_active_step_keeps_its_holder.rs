@@ -187,6 +187,133 @@ async fn stored(jobs: &InMemoryJobs) -> Step {
         .expect("step exists")
 }
 
+#[tokio::test]
+async fn a_stale_automatic_pick_cannot_overwrite_a_newer_explicit_nomination() {
+    let (app, jobs) = seed(StepStatus::Ready, None).await;
+    let (status, body) = send(&app, "PATCH", &format!("/api/jobs/{JOB}/steps/{STEP}/metadata"), CLAIMANT,
+        r#"{"released":{"at":"2026-10-23T01:00:00Z","from":"old-agent"},"nomination_requested":{"at":"2026-10-23T01:00:01Z","assignee_id":"emp-claimant"}}"#).await;
+    assert!(status.is_success(), "{status}: {body}");
+    let (status, body) = put_step(&app, CLAIMANT, r#"{"assignee_id":"emp-claimant"}"#).await;
+    assert!(status.is_success(), "{status}: {body}");
+    let (status, body) = put_step(
+        &app,
+        "svc-dispatcher",
+        r#"{"assignee_id":"agent-dispatcher-pick","automatic_assignment":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["code"],
+        boss_jobs::step_release::AUTOMATIC_ASSIGNMENT_SUPERSEDED
+    );
+    assert_eq!(stored(&jobs).await.assignee_id.as_deref(), Some(CLAIMANT));
+}
+
+#[tokio::test]
+async fn a_nomination_merged_during_the_pick_survives_its_redelivery() {
+    let (app, jobs) = seed(StepStatus::Ready, None).await;
+    jobs.merge_after_next_read(&StepId::from_uuid(Uuid::parse_str(STEP).unwrap()),
+        serde_json::json!({"nomination_requested":{"assignee_id":CLAIMANT,"at":"2026-10-23T01:00:01Z"}}).as_object().unwrap().clone());
+    let body = r#"{"assignee_id":"agent-dispatcher-pick","automatic_assignment":true}"#;
+    let (status, _) = put_step(&app, "svc-dispatcher", body).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the concurrent merge wins the row CAS"
+    );
+    let (status, why) = put_step(&app, "svc-dispatcher", body).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "redelivery must preserve intent: {why}"
+    );
+    assert_eq!(stored(&jobs).await.assignee_id, None);
+}
+
+#[tokio::test]
+async fn automatic_assignment_compares_instants_and_preserves_same_target_retries() {
+    for (requested, released, expected) in [
+        (
+            "2026-10-23T01:00:01Z",
+            "2026-10-23T02:00:00+01:00",
+            StatusCode::CONFLICT,
+        ),
+        (
+            "2026-10-23T01:00:00Z",
+            "2026-10-23T01:00:01Z",
+            StatusCode::NO_CONTENT,
+        ),
+        ("unread", "2026-10-23T01:00:01Z", StatusCode::CONFLICT),
+    ] {
+        let (app, jobs) = seed(StepStatus::Ready, None).await;
+        let metadata = serde_json::json!({"released":{"at":released},"nomination_requested":{"at":requested,"assignee_id":CLAIMANT}});
+        let (status, body) = send(
+            &app,
+            "PATCH",
+            &format!("/api/jobs/{JOB}/steps/{STEP}/metadata"),
+            CLAIMANT,
+            &metadata.to_string(),
+        )
+        .await;
+        assert!(status.is_success(), "{body}");
+        let (status, body) = put_step(
+            &app,
+            "automation:dispatcher",
+            r#"{"assignee_id":"agent-dispatcher-pick","automatic_assignment":true}"#,
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+        if expected == StatusCode::CONFLICT {
+            let (status, body) = put_step(
+                &app,
+                "automation:dispatcher",
+                r#"{"assignee_id":"emp-claimant","automatic_assignment":true}"#,
+            )
+            .await;
+            assert!(status.is_success(), "same-target retry: {body}");
+            assert_eq!(stored(&jobs).await.assignee_id.as_deref(), Some(CLAIMANT));
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_explicit_dispatcher_handler_assignment_is_not_an_automatic_pick() {
+    let (app, jobs) = seed(StepStatus::Ready, None).await;
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &format!("/api/jobs/{JOB}/steps/{STEP}/metadata"),
+        CLAIMANT,
+        r#"{"nomination_requested":{"assignee_id":"emp-other","at":"2026-10-23T01:00:01Z"}}"#,
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let (status, body) = put_step(
+        &app,
+        "automation:dispatcher",
+        r#"{"assignee_id":"emp-claimant"}"#,
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "explicit handler intent is not matchmaking: {body}"
+    );
+    assert_eq!(stored(&jobs).await.assignee_id.as_deref(), Some(CLAIMANT));
+}
+
+#[tokio::test]
+async fn a_legacy_blank_holder_does_not_supersede_an_automatic_pick() {
+    let (app, jobs) = seed(StepStatus::Ready, Some("  ")).await;
+    let (status, body) = put_step(
+        &app,
+        "automation:dispatcher",
+        r#"{"assignee_id":"emp-claimant","automatic_assignment":true}"#,
+    )
+    .await;
+    assert!(status.is_success(), "a blank holder names nobody: {body}");
+    assert_eq!(stored(&jobs).await.assignee_id.as_deref(), Some(CLAIMANT));
+}
+
 /// THE BUG, in the shape the redelivery has: a claim wins, then the
 /// dispatcher's bare nomination PUT arrives and reads the fresh row.
 #[tokio::test]

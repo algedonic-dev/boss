@@ -207,6 +207,9 @@ enum Fail {
     /// SoR is in the day it is switched on. That is a good backup.
     EmptyStore,
     SampleCapture,
+    LatestSymlink,
+    LatestTargetSymlink,
+    RetentionRead,
 }
 
 impl Fail {
@@ -220,6 +223,9 @@ impl Fail {
             Fail::NoStore => "no-store",
             Fail::EmptyStore => "empty-store",
             Fail::SampleCapture => "sample",
+            Fail::LatestSymlink => "latest-symlink",
+            Fail::LatestTargetSymlink => "latest-target-symlink",
+            Fail::RetentionRead => "retention-read",
         }
     }
 }
@@ -233,6 +239,8 @@ struct PodRun {
     /// What the run left on the backups volume: each file's name, and
     /// for a `.tar.gz` the entries `tar -tzf` lists in it.
     backups: Vec<(String, Vec<String>)>,
+    latest: Option<String>,
+    protected_unchanged: bool,
 }
 
 impl PodRun {
@@ -337,6 +345,15 @@ fn run_pod(tag: &str, fail: Fail) -> PodRun {
 /// mtime set that far back, so a retention `find -mtime` judges it the
 /// way it judges a real night's file.
 fn run_pod_seeded(tag: &str, fail: Fail, seed: &[(&str, u64)]) -> PodRun {
+    run_pod_seeded_with_latest(tag, fail, seed, seed.iter().map(|(name, _)| *name).max())
+}
+
+fn run_pod_seeded_with_latest(
+    tag: &str,
+    fail: Fail,
+    seed: &[(&str, u64)],
+    latest: Option<&str>,
+) -> PodRun {
     let yaml = manifest();
     // No thread id in the path: `ThreadId(3)` puts parentheses in a
     // directory name the container scripts then have to quote. Each
@@ -350,6 +367,23 @@ fn run_pod_seeded(tag: &str, fail: Fail, seed: &[(&str, u64)]) -> PodRun {
     for (name, hours) in seed {
         let path = dir.join("backup").join(name);
         scratch::write_file(&path, "an earlier night's file\n");
+        if Some(*name) == latest {
+            let plain = dir.join("tmp/verified-dump.sql");
+            scratch::write_file(
+                &plain,
+                "-- PostgreSQL database dump\n-- PostgreSQL database dump complete\n",
+            );
+            let out = std::fs::File::create(&path).unwrap();
+            assert!(
+                Command::new("gzip")
+                    .arg("-c")
+                    .arg(&plain)
+                    .stdout(out)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
         std::fs::File::options()
             .write(true)
             .open(&path)
@@ -359,6 +393,27 @@ fn run_pod_seeded(tag: &str, fail: Fail, seed: &[(&str, u64)]) -> PodRun {
                 )
             })
             .unwrap_or_else(|e| panic!("dating {}: {e}", path.display()));
+    }
+    if let Some(name) = latest {
+        scratch::write_file(
+            &dir.join("backup/.latest"),
+            &format!("{}/backup/{name}\n", dir.display()),
+        );
+        match fail {
+            Fail::LatestSymlink => {
+                let original = dir.join("backup/.latest");
+                let saved = dir.join("tmp/latest-original");
+                std::fs::rename(&original, &saved).unwrap();
+                std::os::unix::fs::symlink(saved, original).unwrap();
+            }
+            Fail::LatestTargetSymlink => {
+                let original = dir.join("backup").join(name);
+                let saved = dir.join("tmp/latest-dump-original");
+                std::fs::rename(&original, &saved).unwrap();
+                std::os::unix::fs::symlink(saved, original).unwrap();
+            }
+            _ => {}
+        }
     }
     // The file store, laid out the way LocalDiskStorage writes it:
     // `sha256/<hex>` under the root. Two objects, so a count that is
@@ -382,6 +437,29 @@ fn run_pod_seeded(tag: &str, fail: Fail, seed: &[(&str, u64)]) -> PodRun {
 
     // ---- what the images provide and this host does not
     let bin = dir.join("bin");
+    scratch::write_file(
+        &dir.join("tmp/find-partial"),
+        &format!(
+            "{}\n",
+            seed.iter()
+                .take(seed.len().saturating_sub(1))
+                .map(|(name, _)| format!("{}/backup/{name}", dir.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    );
+    scratch::write_exec(
+        &bin.join("find"),
+        "#!/usr/bin/env bash\n\
+         if [ \"$BOSS_TEST_FAIL\" = retention-read ] && [ \"${1:-}\" = \"$BOSS_TEST_BACKUP\" ] && [ \"${2:-}\" = -maxdepth ]; then\n\
+           cat \"$BOSS_TEST_PARTIAL_FIND\"\n\
+           echo 'retention inventory deliberately unread' >&2\n\
+           exit 42\n\
+         fi\n\
+         PATH=$BOSS_TEST_REAL_PATH\n\
+         export PATH\n\
+         exec find \"$@\"\n",
+    );
     // The retired boss-gcp leg (backlog 4bf7bdd1) installed openssh-client
     // with apk and shipped over ssh. Both stay as RECORDING shims, so a
     // ship that came back would be seen in the sequence rather than fail
@@ -398,6 +476,7 @@ fn run_pod_seeded(tag: &str, fail: Fail, seed: &[(&str, u64)]) -> PodRun {
         &bin.join("pg_dump"),
         "#!/usr/bin/env bash\n\
          echo \"exec:pg_dump\" >> \"$BOSS_TEST_SEQ\"\n\
+         echo \"dump-existing:$(find \"$BOSS_TEST_BACKUP\" -maxdepth 1 -type f -name 'boss-*.sql.gz' | wc -l)\" >> \"$BOSS_TEST_SEQ\"\n\
          echo '-- PostgreSQL database dump'\n\
          echo 'CREATE TABLE audit_log ();'\n\
          if [ \"$BOSS_TEST_FAIL\" = \"dump\" ]; then exit 1; fi\n\
@@ -451,6 +530,14 @@ fn run_pod_seeded(tag: &str, fail: Fail, seed: &[(&str, u64)]) -> PodRun {
          if [ \"$BOSS_TEST_FAIL\" = sample ]; then echo 'sample recording failed' >&2; exit 1; fi\nexit 0\n",
     );
 
+    let protected_original = latest.and_then(|name| {
+        let path = dir.join("backup").join(name);
+        Some((
+            path.clone(),
+            std::fs::read(&path).ok()?,
+            std::fs::read(dir.join("backup/.latest")).ok()?,
+        ))
+    });
     // ---- run the containers
     let mut ran: Vec<(String, i32)> = Vec::new();
     let mut log = String::new();
@@ -486,6 +573,12 @@ fn run_pod_seeded(tag: &str, fail: Fail, seed: &[(&str, u64)]) -> PodRun {
                 .env("BOSS_JOBS_URL", "http://boss-jobs-internal.test:7900")
                 .env("BOSS_TEST_SEQ", &seq)
                 .env("BOSS_TEST_FAIL", fail.tag())
+                .env("BOSS_TEST_BACKUP", dir.join("backup"))
+                .env("BOSS_TEST_PARTIAL_FIND", dir.join("tmp/find-partial"))
+                .env(
+                    "BOSS_TEST_REAL_PATH",
+                    std::env::var("PATH").unwrap_or_default(),
+                )
                 .env("DATABASE_URL", "postgres://stub/boss")
                 .output()
                 .expect("bash runs the container script");
@@ -533,16 +626,240 @@ fn run_pod_seeded(tag: &str, fail: Fail, seed: &[(&str, u64)]) -> PodRun {
         })
         .unwrap_or_default();
     backups.sort();
+    let latest = std::fs::read_to_string(dir.join("backup/.latest")).ok();
+    let protected_unchanged = protected_original
+        .as_ref()
+        .is_some_and(|(path, body, marker)| {
+            std::fs::read(path).ok().as_deref() == Some(body.as_slice())
+                && std::fs::read(dir.join("backup/.latest")).ok().as_deref()
+                    == Some(marker.as_slice())
+        });
     let _ = std::fs::remove_dir_all(&dir);
     PodRun {
         ran,
         seq: seq_lines,
         log,
         backups,
+        latest,
+        protected_unchanged,
     }
 }
 
 // --------------------------------------------------------------- tests
+
+#[test]
+fn pruning_reserves_room_before_dump_even_when_all_previous_dumps_are_recent() {
+    let r = run_pod_seeded(
+        "prune-before-dump",
+        Fail::Nothing,
+        &[
+            ("boss-20261026-010000.sql.gz", 0),
+            ("boss-20261026-020000.sql.gz", 0),
+            ("boss-20261026-030000.sql.gz", 0),
+            ("boss-20261026-040000.sql.gz", 0),
+        ],
+    );
+    assert!(r.succeeded(), "{}", r.log);
+    // The new file is staged outside the final dump roster: only two
+    // older candidates may share the volume when pg_dump starts.
+    assert!(
+        r.seq.iter().any(|line| line.trim() == "dump-existing:2"),
+        "prune must reserve the next dump's slot BEFORE pg_dump, irrespective of age: {:?}\n{}",
+        r.seq,
+        r.log
+    );
+    for kept in ["boss-20261026-030000.sql.gz", "boss-20261026-040000.sql.gz"] {
+        assert!(r.backups.iter().any(|(name, _)| name == kept));
+    }
+    for gone in ["boss-20261026-010000.sql.gz", "boss-20261026-020000.sql.gz"] {
+        assert!(!r.backups.iter().any(|(name, _)| name == gone));
+        assert!(r.log.contains(gone), "deletion must remain visible");
+    }
+}
+
+#[test]
+fn a_failed_retry_cannot_prune_the_only_verified_dump_for_newer_failed_files() {
+    let good = "boss-20261024-091000.sql.gz";
+    let r = run_pod_seeded_with_latest(
+        "preserve-last-good",
+        Fail::DumpTruncated,
+        &[
+            (good, 49),
+            ("boss-20261025-091000.sql.gz", 25),
+            ("boss-20261026-091000.sql.gz", 1),
+        ],
+        Some(good),
+    );
+    assert!(!r.succeeded());
+    assert!(
+        r.backups.iter().any(|(name, _)| name == good),
+        "only verified backup was pruned: {:?}\n{}",
+        r.backups,
+        r.log
+    );
+    assert_eq!(
+        r.backups
+            .iter()
+            .filter(|(name, _)| name.ends_with(".sql.gz"))
+            .count(),
+        2,
+        "failed retry must remove only its own unfinished output, retain the protected backup and one prior candidate: {:?}\n{}",
+        r.backups,
+        r.log
+    );
+    assert!(!r.ran_container("offsite-gcs"));
+    assert!(!r.ran_container("close-packet"));
+    assert!(
+        r.protected_unchanged,
+        "the original verified dump and marker bytes must survive failure"
+    );
+    assert!(
+        r.latest
+            .as_deref()
+            .is_some_and(|path| path.trim().ends_with(good))
+    );
+    assert!(
+        !r.backups.iter().any(|(name, _)| name.contains(".partial.")),
+        "own unfinished output must be removed: {:?}",
+        r.backups
+    );
+}
+
+#[test]
+fn existing_dumps_without_a_verified_latest_marker_are_not_pruned_by_guess() {
+    let r = run_pod_seeded_with_latest(
+        "missing-last-good",
+        Fail::Nothing,
+        &[
+            ("boss-20261024-091000.sql.gz", 49),
+            ("boss-20261025-091000.sql.gz", 25),
+            ("boss-20261026-091000.sql.gz", 1),
+        ],
+        None,
+    );
+    assert!(
+        !r.succeeded(),
+        "missing last-good evidence must refuse before deleting: {}",
+        r.log
+    );
+    assert!(r.position("exec:pg_dump").is_none());
+    assert_eq!(
+        r.backups
+            .iter()
+            .filter(|(name, _)| name.ends_with(".sql.gz"))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn invalid_or_missing_last_good_targets_refuse_before_any_deletion() {
+    for marker in [
+        "boss-missing.sql.gz",
+        "../outside.sql.gz",
+        "boss-missing.sql.gz\nsecond-line",
+    ] {
+        let r = run_pod_seeded_with_latest(
+            "bad-last-good",
+            Fail::Nothing,
+            &[
+                ("boss-20261024-091000.sql.gz", 49),
+                ("boss-20261025-091000.sql.gz", 25),
+                ("boss-20261026-091000.sql.gz", 1),
+            ],
+            Some(marker),
+        );
+        assert!(!r.succeeded(), "{marker}: {}", r.log);
+        assert!(r.position("exec:pg_dump").is_none(), "{marker}: {}", r.log);
+        assert_eq!(
+            r.backups
+                .iter()
+                .filter(|(name, _)| name.ends_with(".sql.gz"))
+                .count(),
+            3,
+            "{marker}: {}",
+            r.log
+        );
+    }
+}
+
+#[test]
+fn last_good_marker_and_target_symlinks_refuse_without_pruning() {
+    for fail in [Fail::LatestSymlink, Fail::LatestTargetSymlink] {
+        let good = "boss-20261024-091000.sql.gz";
+        let r = run_pod_seeded_with_latest(
+            "symlink-last-good",
+            fail,
+            &[
+                (good, 49),
+                ("boss-20261025-091000.sql.gz", 25),
+                ("boss-20261026-091000.sql.gz", 1),
+            ],
+            Some(good),
+        );
+        assert!(!r.succeeded(), "{}", r.log);
+        assert!(r.position("exec:pg_dump").is_none());
+        assert_eq!(
+            r.backups
+                .iter()
+                .filter(|(name, _)| name.ends_with(".sql.gz"))
+                .count(),
+            3,
+            "{}",
+            r.log
+        );
+    }
+}
+
+#[test]
+fn partial_failed_retention_inventory_never_prunes_or_starts_a_dump() {
+    let good = "boss-20261024-091000.sql.gz";
+    let r = run_pod_seeded_with_latest(
+        "partial-retention-read",
+        Fail::RetentionRead,
+        &[
+            (good, 49),
+            ("boss-20261023-091000.sql.gz", 73),
+            ("boss-20261025-091000.sql.gz", 25),
+            ("boss-20261026-091000.sql.gz", 1),
+        ],
+        Some(good),
+    );
+    assert!(
+        !r.succeeded(),
+        "an unread inventory must stop before mutation: {:?}\n{:?}\n{}",
+        r.seq,
+        r.backups,
+        r.log
+    );
+    assert!(
+        r.log.contains("retention inventory deliberately unread"),
+        "{}",
+        r.log
+    );
+    assert!(r.position("exec:pg_dump").is_none(), "{:?}", r.seq);
+    assert_eq!(
+        r.backups
+            .iter()
+            .filter(|(name, _)| name.ends_with(".sql.gz"))
+            .count(),
+        4,
+        "{:?}\n{}",
+        r.backups,
+        r.log
+    );
+    assert!(
+        r.latest
+            .as_deref()
+            .is_some_and(|path| path.trim().ends_with(good))
+    );
+    assert!(!r.ran_container("offsite-gcs"));
+    assert!(!r.ran_container("close-packet"));
+    assert!(
+        r.protected_unchanged,
+        "unread retention must preserve original dump and marker bytes"
+    );
+}
 
 #[test]
 fn mounted_samples_surround_backup_work_and_never_finish_a_failed_leg() {

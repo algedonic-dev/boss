@@ -18,7 +18,9 @@ use boss_core::publish::PublishMode;
 use boss_core::publisher::EventStamp;
 use sqlx::PgPool;
 
-use super::automations::{AutomationActor, AutomationsSeedOutcome, classify, validate_all};
+use super::automations::{
+    AutomationActor, AutomationsSeedOutcome, RecordedTier, classify, validate_all,
+};
 use super::port::{
     AgentsError, AgentsRegistry, automation_declared_event, declared_event, updated_event,
 };
@@ -58,7 +60,7 @@ impl PgAgents {
                 .map_err(storage)?;
         Ok((
             rows.into_iter().map(|row| to_row(row, &aliases)).collect(),
-            automations.into_iter().map(AutomationActor::from).collect(),
+            to_automations(automations)?,
         ))
     }
 }
@@ -311,7 +313,7 @@ impl AgentsRegistry for PgAgents {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(storage)?;
-        Ok(rows.into_iter().map(AutomationActor::from).collect())
+        to_automations(rows)
     }
 
     async fn declare_automations(
@@ -328,7 +330,7 @@ impl AgentsRegistry for PgAgents {
             .fetch_all(&mut *tx)
             .await
             .map_err(storage)?;
-        let held: Vec<AutomationActor> = held.into_iter().map(AutomationActor::from).collect();
+        let held = to_automations(held)?;
         let mut outcome = classify(&held, declared);
         let absent = std::mem::take(&mut outcome.inserted);
         for d in declared.iter().filter(|d| absent.contains(&d.id)) {
@@ -337,13 +339,14 @@ impl AgentsRegistry for PgAgents {
             // row once; only the run whose INSERT landed records it,
             // and the other counts the row as present.
             let landed = sqlx::query(
-                "INSERT INTO automation_actors (id, role, description, signs_for) \
-                 VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING",
+                "INSERT INTO automation_actors (id, role, description, signs_for, access_tier) \
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
             )
             .bind(&d.id)
             .bind(&d.role)
             .bind(&d.description)
             .bind(&d.signs_for)
+            .bind(d.access_tier.map(RecordedTier::as_str))
             .execute(&mut *tx)
             .await
             .map_err(storage)?
@@ -365,7 +368,8 @@ impl AgentsRegistry for PgAgents {
     }
 }
 
-const SELECT_AUTOMATIONS: &str = "SELECT id, role, description, signs_for FROM automation_actors";
+const SELECT_AUTOMATIONS: &str =
+    "SELECT id, role, description, signs_for, access_tier FROM automation_actors";
 
 #[derive(sqlx::FromRow)]
 struct AutomationDbRow {
@@ -373,15 +377,36 @@ struct AutomationDbRow {
     role: String,
     description: String,
     signs_for: Option<String>,
+    access_tier: Option<String>,
 }
 
-impl From<AutomationDbRow> for AutomationActor {
-    fn from(r: AutomationDbRow) -> Self {
-        AutomationActor {
+impl TryFrom<AutomationDbRow> for AutomationActor {
+    type Error = AgentsError;
+
+    /// A tier this build cannot name is refused, never read as no tier
+    /// (backlog f21804d8): the column's CHECK admits only `auditor`, so
+    /// another value is a schema this adapter does not know.
+    fn try_from(r: AutomationDbRow) -> Result<Self, AgentsError> {
+        let access_tier = match r.access_tier.as_deref() {
+            None => None,
+            Some(text) => Some(RecordedTier::parse(text).ok_or_else(|| {
+                AgentsError::Storage(format!(
+                    "automation_actors row {} records access_tier {text:?}, which this build \
+                     does not know; refusing the registry read rather than dropping it",
+                    r.id
+                ))
+            })?),
+        };
+        Ok(AutomationActor {
             id: r.id,
             role: r.role,
             description: r.description,
             signs_for: r.signs_for,
-        }
+            access_tier,
+        })
     }
+}
+
+fn to_automations(rows: Vec<AutomationDbRow>) -> Result<Vec<AutomationActor>, AgentsError> {
+    rows.into_iter().map(AutomationActor::try_from).collect()
 }

@@ -13,7 +13,7 @@ pub(super) async fn same_actor(
     let registry = api(http, reqwest::Method::GET, "/api/agents", None)
         .await?
         .context("source holder aliases are unreadable")?;
-    reads.push(json!({"operation":"source-holder-registry","reply":registry}));
+    reads.push(read_digest("source-holder-registry", &registry));
     let total = registry
         .get("total")
         .and_then(Value::as_u64)
@@ -48,6 +48,34 @@ fn active_holder(step: &Value) -> Result<&str> {
         .context("source claim has no current holder")
 }
 
+/// The source run read back as the exact agent-run, FINISHED: closed or
+/// cancelled, which never reopens (backlog 36352452). Every reader still
+/// refuses it with the sentence it always had; the type lets the resident
+/// supervisor tell this permanent refusal from a transient one and settle
+/// the request instead of retaining it every pass (backlog 599aed02).
+#[derive(Debug)]
+pub(super) struct SourceRunEnded {
+    pub run: String,
+    pub status: String,
+    pub outcome: Option<String>,
+    /// The digest of the run row the refusal was read from.
+    pub read: Value,
+}
+impl std::fmt::Display for SourceRunEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "original source run is not the exact open agent-run: {} is {}",
+            self.run, self.status
+        )?;
+        match &self.outcome {
+            Some(outcome) => write!(f, " (outcome {outcome})"),
+            None => Ok(()),
+        }
+    }
+}
+impl std::error::Error for SourceRunEnded {}
+
 pub(super) async fn read_claim(
     http: &Doors<'_>,
     source: &Value,
@@ -61,11 +89,24 @@ pub(super) async fn read_claim(
         .filter(|s| s.len() == 36 && Uuid::parse_str(s).is_ok())
         .context("original source run is not a full declared identity")?;
     let row = read_on(http, run).await?;
-    reads.push(json!({"operation":"original-source-run","reply":row}));
-    if row.get("id").and_then(Value::as_str) != Some(run)
-        || row.get("kind").and_then(Value::as_str) != Some("agent-run")
-        || row.get("status").and_then(Value::as_str) != Some("open")
-    {
+    let read = read_digest("original-source-run", &row);
+    reads.push(read.clone());
+    let exact = row.get("id").and_then(Value::as_str) == Some(run)
+        && row.get("kind").and_then(Value::as_str) == Some("agent-run");
+    let status = row.get("status").and_then(Value::as_str);
+    if exact && matches!(status, Some("closed" | "cancelled")) {
+        return Err(SourceRunEnded {
+            run: run.to_owned(),
+            status: status.unwrap_or_default().to_owned(),
+            outcome: row
+                .pointer("/metadata/outcome")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            read,
+        }
+        .into());
+    }
+    if !exact || status != Some("open") {
         bail!("original source run is not the exact open agent-run");
     }
     let packet = row
@@ -118,7 +159,7 @@ pub(super) async fn read_claim(
         }
     }
     let parent = read_on(http, packet).await?;
-    reads.push(json!({"operation":"original-source-parent","reply":parent}));
+    reads.push(read_digest("original-source-parent", &parent));
     if parent.get("id").and_then(Value::as_str) != Some(packet)
         || parent.get("status").and_then(Value::as_str) != Some("open")
     {

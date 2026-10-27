@@ -12,6 +12,7 @@ import hashlib
 import time
 import types
 import unittest.mock
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location('dev_work_volume', ROOT / 'infra/forge/dev-work-volume.py')
@@ -125,6 +126,46 @@ def calls(directory):
 
 
 class Planning(unittest.TestCase):
+    def setUp(self):
+        # Admission arithmetic uses the real shared checker. Its production
+        # ten-second deadline has a separate, deterministic boundary test below;
+        # scheduler delay while starting bash/jq is not an arithmetic result.
+        real = MODULE.subprocess
+        checker = ['bash', str(ROOT/'infra/lib/check-longhorn-expansion.sh')]
+        def semantic_run(argv, **kwargs):
+            if argv == checker:
+                self.assertEqual(kwargs['timeout'], 10)
+                kwargs = dict(kwargs, timeout=None)
+            return real.run(argv, **kwargs)
+        proxy = types.SimpleNamespace(**{name: getattr(real, name) for name in dir(real)})
+        proxy.run = semantic_run
+        patch = unittest.mock.patch.object(MODULE, 'subprocess', proxy)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_checker_deadline_is_ten_seconds_and_refuses_before_any_patch(self):
+        seen = []
+        writes = []
+        def timed_out(argv, **kwargs):
+            self.assertEqual(argv, ['bash', str(ROOT/'infra/lib/check-longhorn-expansion.sh')])
+            self.assertEqual(set(kwargs), {'input', 'text', 'capture_output', 'timeout', 'check'})
+            self.assertEqual((kwargs['text'], kwargs['capture_output'], kwargs['timeout'], kwargs['check']),
+                             (True, True, 10, False))
+            ledger = json.loads(kwargs['input'])
+            self.assertEqual(ledger['growth'], 24 * GIB)
+            self.assertEqual(ledger['volume'], inputs()['volume'])
+            seen.append(ledger)
+            raise subprocess.TimeoutExpired(argv, 10, output='partial ledger', stderr='checker pending')
+        proxy = types.SimpleNamespace(**{name: getattr(subprocess, name) for name in dir(subprocess)})
+        proxy.run = timed_out
+        with unittest.mock.patch.object(MODULE, 'subprocess', proxy), \
+                self.assertRaises(subprocess.TimeoutExpired) as failure:
+            MODULE.execute(lambda: inputs(), writes.append, '64Gi', 'a'*64)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(writes, [])
+        self.assertEqual(failure.exception.output, 'partial ledger')
+        self.assertEqual(failure.exception.stderr, 'checker pending')
+
     def test_docker_hub_qualified_longhorn_references_keep_original_signed_evidence(self):
         for engine_qualified in (False, True):
             for plugin_qualified in (False, True):

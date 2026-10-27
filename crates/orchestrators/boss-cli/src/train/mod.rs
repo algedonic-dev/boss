@@ -98,10 +98,13 @@ mod diagnostics;
 #[cfg(test)]
 mod diagnostics_tests;
 pub(crate) mod dock_regate;
+mod empty_consist;
 mod entry;
 mod forge;
+mod gate_watch;
 mod jobs_api;
 mod judged_red;
+mod lost_sweep;
 mod merge_lost;
 mod orphan;
 mod preflight;
@@ -117,8 +120,10 @@ use conductor::*;
 pub(crate) use consist::*;
 pub(crate) use entry::*;
 pub(crate) use forge::*;
+pub(crate) use gate_watch::*;
 pub(crate) use jobs_api::*;
 pub(crate) use judged_red::*;
+pub(crate) use lost_sweep::*;
 pub(crate) use merge_lost::*;
 pub(crate) use orphan::*;
 pub(crate) use preflight::*;
@@ -283,6 +288,11 @@ struct Config {
     /// alone, stamped (`train_gate::REQUIRED_ENV` — off until car 3 of
     /// 128b5496 stops CI running the Rust checks).
     gate_required: bool,
+    /// BOSS_TRAIN_GATE_REUSE: whether a one-car train whose tree and
+    /// environment equal its car's FULL green carries that gate-run
+    /// instead of filing its own (design cdf626ac Q1). Off unless set;
+    /// `train_gate_reuse` says what each mode does.
+    gate_reuse: crate::train_gate_reuse::Mode,
     dry: bool,
 }
 
@@ -366,6 +376,14 @@ impl Config {
                 crate::train_gate::DEFAULT_NAMESPACE,
             ),
             gate_required: std::env::var(crate::train_gate::REQUIRED_ENV).as_deref() == Ok("1"),
+            gate_reuse: {
+                let raw = std::env::var(crate::train_gate_reuse::MODE_ENV).ok();
+                let (mode, warning) = crate::train_gate_reuse::mode_from(raw.as_deref());
+                if let Some(w) = warning {
+                    log(w);
+                }
+                mode
+            },
             gh_repo,
             home,
             dry,
@@ -533,11 +551,18 @@ mod test_support {
                               "merge_ref": "abc1234def56"}},
                 {"spec_slug": "deployed", "title": "Deployed to the playground",
                  "status": "completed",
-                 "metadata": {"completed_at": "2026-08-13T06:12:00Z",
+                 // The merge instant, as on every live train: the
+                 // conductor stamps `deployed` in the same pass as
+                 // `merged` (backlog 4472781d).
+                 "metadata": {"completed_at": "2026-08-13T06:05:00Z",
                               "deployed": "main@abc1234; 0 applied; services: prod; web: deployed"}},
                 {"spec_slug": "arrived", "title": "Train arrived",
                  "status": "completed",
                  "metadata": {"completed_at": "2026-08-13T06:20:00Z"}},
+                // Last, so the indices above stay what other tests poke.
+                {"spec_slug": "converged", "title": "Cluster converged",
+                 "status": "completed",
+                 "metadata": {"completed_at": "2026-08-13T06:17:00Z"}},
             ],
         })
     }

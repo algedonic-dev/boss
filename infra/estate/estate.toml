@@ -99,8 +99,9 @@ assignment = { packet = "b018a106-a324-4d7a-a2b3-755df63ff8a3", step = "0e8a8ae8
 # THE MACHINES — the estate's nodes and their roles, declared here and
 # published on every pod start by the launcher (`boss estate declare`,
 # infra/seed-estate.sh) through POST /api/estate/nodes/batch,
-# insert-if-absent: a node already there is kept as it is, a role not
-# yet on it is added (backlog ee368d0c, design 42277636 first wave).
+# inserts new nodes, refreshes an explicit disk_gb on kept nodes, and
+# appends missing roles; other existing fields are kept (ee368d0c,
+# design 42277636 first wave; capacity refresh c426bc8a).
 # Until 2026-09-18 these rows were schema migrations
 # (144-estate-subjects, 202608301900, 202609120300, 202609121800), so
 # every fresh database — an adopter's included — booted declaring this
@@ -175,8 +176,8 @@ address = "10.20.0.16"
 role = "talos-worker"
 cpu = 4
 memory_gb = 15
-disk_gb = 110
-notes = "Utility worker (boss.dev/purpose=utility). Joined 2026-08-25 and went unrecorded for five days. Smallest node in the estate after boss-gcp."
+disk_gb = 929
+notes = "Utility worker (boss.dev/purpose=utility). Joined 2026-08-25 and went unrecorded for five days. One drive bay: its 1 TB disk replaced the system disk on 2026-10-19 (join-a-node 829f75a8); disk_gb is the nodefs measured 2026-10-21 (929 GiB, backlog 36d2c484), up from 110."
 
 [[node]]
 id = "forge"

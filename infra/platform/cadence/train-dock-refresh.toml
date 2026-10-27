@@ -29,9 +29,17 @@
 # WHY TWO MINUTES. At this rule's introduction train-reconcile was ten, most of
 # a gate (median 13.9 min for a dock re-gate that day) spent waiting to
 # launch. Two re-asks well inside a gate slot's turnover without contending
-# for the conductor's lock more than the 60-second board already does; a
-# refresh that finds the lock held leaves at once and the next window
-# re-asks.
+# for the conductor's lock more than the 60-second board already does.
+#
+# THE LOCK. A refresh that finds the lock held WAITS up to 60 s for it
+# (`REFRESH_LOCK_WAIT` in boss-cli's train/entry.rs), then runs its pass;
+# only a holder that outlasts the wait sends it away, with a line naming
+# the wait. It was born leaving at once, and that starved it: this rule
+# fires at :00 of even minutes, the minute board at :00 of every minute,
+# the board wins and holds the lock 2-5 s, and on 2026-10-20 13:26-14:02Z
+# nineteen refreshes in a row on a clear track ran no pass (backlog
+# d846e0c8). A comment, not a column: the wait is the verb's, so this row
+# is unchanged.
 #
 # `wall` basis: fires every `every_minutes` on the wall clock, the window
 # stamp a pure function of (rule, window) so a restarted loop cannot
@@ -41,9 +49,16 @@
 # (`GET /api/cadence/rules/<name>/versions`), not just this file.
 # ---------------------------------------------------------------------------
 
+# VERSION 2 (2026-10-20, backlog f268e0a8). The live registry carried v1
+# as RETIRED since 2026-09-25 22:16Z with no recorded reason while this
+# file still declared it active, so between departures nothing launched
+# the re-gates the dock owes; on 2026-10-20 the four GATE-STALE cars waited
+# three hours for a bay and no train boarded 11:21-13:30Z (backlog
+# c260b810, duplicate of f268e0a8). The rule is unchanged; the bump is what
+# `boss cadence publish` needs to put a live active version back.
 [[cadence_rule]]
 name = "train-dock-refresh"
-version = 1
+version = 2
 status = "active"
 verb = "refresh"
 basis = "wall"

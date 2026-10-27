@@ -549,6 +549,11 @@ fn build_router(
             "/api/yard/regions",
             axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
+        // Flow refresh is independent of the map's current-state reads.
+        .route(
+            "/api/yard/flow",
+            axum::routing::get(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
         // The map's RAILS (design d2154293 car 2): what crosses each
         // border, what waits at it and which machine moves it. Same
         // upstream, same page, and routed here at the same time as the

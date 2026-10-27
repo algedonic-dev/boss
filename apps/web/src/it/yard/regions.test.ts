@@ -241,6 +241,44 @@ describe('countText — what is here, against its bound when it has one', () => 
   });
 });
 
+// Backlog d43c0be2 (folding in 19227ca8 part 1): the gates region carries
+// two figures beside its bays — `waiting`, the line (357fe1da), and
+// `judged`, a train whose own gate has spoken (bce67f09) — and count +
+// waiting + judged is what the partition places there. The card drew only
+// the bays, so a full line and a judged train both read as an empty gate.
+describe('the gates card draws the line and the judged beside the bays (d43c0be2)', () => {
+  const gates = (over: Record<string, unknown>) => ({
+    ...PAYLOAD,
+    regions: [{ ...PAYLOAD.regions[1], unit: 'bays in use', bound_kind: 'capacity', ...over }],
+  });
+
+  it('parses both figures the server sends, and reads an absent one as absent — never 0', () => {
+    const r = parseRegions(gates({ count: 0, waiting: 2, judged: 1 })).regions[0]!;
+    expect(r.waiting).toBe(2);
+    expect(r.judged).toBe(1);
+    const old = parseRegions(gates({ count: 0 })).regions[0]!;
+    expect(old.waiting).toBeUndefined();
+    expect(old.judged).toBeUndefined();
+  });
+
+  it('a train judged at the gates is drawn, not read as an empty gate', () => {
+    // Measured shape: "0 bays in use, 1 waiting" — the train whose gate
+    // had spoken — until bce67f09 gave it its own figure.
+    const r = parseRegions(gates({ count: 0, bound: 3, judged: 1 })).regions[0]!;
+    expect(countText(r)).toBe('0 / 3 bays in use · 1 judged');
+  });
+
+  it('the line stands beside full bays and is never summed into them', () => {
+    const r = parseRegions(gates({ count: 3, bound: 3, waiting: 2, judged: 1 })).regions[0]!;
+    expect(countText(r)).toBe('3 / 3 bays in use · 2 waiting · 1 judged');
+  });
+
+  it('a region with neither figure reads exactly as before', () => {
+    expect(countText(parseRegions(gates({ count: 1, bound: 3 })).regions[0]!)).toBe('1 / 3 bays in use');
+    expect(countText(parseRegions(gates({ count: null, waiting: 2 })).regions[0]!)).toBe('no reading');
+  });
+});
+
 describe('trendText — this window against the previous, in the unit', () => {
   it('prints both halves with the unit and the sample counts', () => {
     expect(trendText(trend())).toBe('4.3 vs 3 hours · n=6 / 5');

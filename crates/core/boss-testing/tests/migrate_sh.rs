@@ -288,6 +288,134 @@ async fn only_unrecorded_entries_apply() {
     drop_db(&name);
 }
 
+/// 6bc062b1: exercise the exact production migration and retry path.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_window_cut_index_migration_repairs_an_invalid_build_without_touching_other_indexes() {
+    let migration = fs::read_dir(real_schema_dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.to_string_lossy()
+                .ends_with("-a-window-cut-order-check-is-covered.sql")
+        })
+        .expect("the window cut covering-index migration exists");
+    let sql = fs::read_to_string(migration).unwrap();
+    let (name, url) = scratch_db().await;
+    let syn = Synthetic::new(&[(
+        "01-table.sql",
+        "CREATE TABLE audit_log (id bigint PRIMARY KEY, created_at timestamptz NOT NULL); CREATE INDEX unrelated_audit_index ON audit_log (created_at DESC);\n",
+    )]);
+    assert_ok(
+        &run(&syn.script(), &[], &url),
+        "creating the recorded fixture schema",
+    );
+    let mut conn = connect(&url).await;
+    // A failed concurrent unique build leaves a real INVALID index.
+    conn.execute("INSERT INTO audit_log VALUES (1,now()),(2,now())")
+        .await
+        .unwrap();
+    assert!(
+        conn.execute("CREATE UNIQUE INDEX CONCURRENTLY audit_log_created_at_id ON audit_log ((1))")
+            .await
+            .is_err()
+    );
+    let valid: bool = sqlx::query_scalar(
+        "SELECT indisvalid FROM pg_index WHERE indexrelid='audit_log_created_at_id'::regclass",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert!(!valid);
+    let unrelated: i64 =
+        sqlx::query_scalar("SELECT 'unrelated_audit_index'::regclass::oid::bigint")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    syn.write("02-cover.sql", &sql);
+    assert_ok(
+        &run(&syn.script(), &[], &url),
+        "repairing the invalid covering index",
+    );
+    let (definition, valid): (String, bool) = sqlx::query_as("SELECT pg_get_indexdef(indexrelid),indisvalid FROM pg_index WHERE indexrelid='audit_log_created_at_id'::regclass")
+        .fetch_one(&mut conn).await.unwrap();
+    assert!(
+        valid && definition.ends_with("USING btree (created_at, id)"),
+        "{definition}"
+    );
+    let unchanged: i64 =
+        sqlx::query_scalar("SELECT 'unrelated_audit_index'::regclass::oid::bigint")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(unrelated, unchanged);
+    assert_eq!(
+        recorded(&mut conn).await,
+        vec!["01-table.sql", "02-cover.sql"]
+    );
+    assert_ok(
+        &run(&syn.script(), &[], &url),
+        "replaying the recorded migration",
+    );
+    drop(conn);
+    drop_db(&name);
+}
+
+/// Design c195e83e Q4 (2026-10-17): an index on a table that takes every
+/// write is built CONCURRENTLY, and Postgres refuses that inside a
+/// transaction block. Every other migration runs inside one with its
+/// bookkeeping row, so a file opts out by its first line, runs alone,
+/// and is recorded only after it succeeded. A failure records nothing,
+/// so the next run tries the file again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_no_transaction_migration_runs_alone_and_is_recorded_after_it_succeeds() {
+    let (name, url) = scratch_db().await;
+    let syn = Synthetic::new(&[
+        ("01-table.sql", "CREATE TABLE t1 (id int, doc jsonb);"),
+        (
+            "02-index.sql",
+            "-- migrate: no-transaction\n\
+             DROP INDEX CONCURRENTLY IF EXISTS t1_doc_id;\n\
+             CREATE INDEX CONCURRENTLY t1_doc_id ON t1 ((doc->>'id'));\n",
+        ),
+        ("03-after.sql", "CREATE TABLE t3 (id int);"),
+    ]);
+    assert_ok(
+        &run(&syn.script(), &[], &url),
+        "applying a no-transaction file",
+    );
+    let mut conn = connect(&url).await;
+    assert_eq!(
+        recorded(&mut conn).await,
+        vec!["01-table.sql", "02-index.sql", "03-after.sql"]
+    );
+    let valid: bool = sqlx::query_scalar(
+        "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+         WHERE c.relname='t1_doc_id'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("the concurrent index exists");
+    assert!(valid, "the concurrent build completed");
+
+    // A failing no-transaction file is not recorded, and the run stops.
+    syn.write(
+        "04-broken.sql",
+        "-- migrate: no-transaction\nCREATE INDEX CONCURRENTLY t1_broken ON t1 ((nope->>'id'));\n",
+    );
+    assert!(
+        !run(&syn.script(), &[], &url).status.success(),
+        "a failing no-transaction file fails the run"
+    );
+    assert_eq!(
+        recorded(&mut conn).await,
+        vec!["01-table.sql", "02-index.sql", "03-after.sql"],
+        "nothing is recorded for a no-transaction file that failed"
+    );
+
+    drop(conn);
+    drop_db(&name);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn baseline_records_without_running() {
     let (name, url) = scratch_db().await;

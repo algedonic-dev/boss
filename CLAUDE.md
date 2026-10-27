@@ -881,7 +881,13 @@ a door that stops being true is a defect worth a car.
   line names the three slowest lints) PLUS workspace clippy when the tree
   implies a crate, including dependent test targets, PLUS every declared
   tree-wide pin — the database-free source scans every scoped gate runs,
-  which were 19 of 61 failed W41 car gates (2f0c722a). Warm leaf edits reuse
+  which were 19 of 61 failed W41 car gates (2f0c722a). **The pins make it
+  minutes, not seconds**: on a warm worktree target on the dev pod
+  (2026-10-18, backlog 1c03eeb0) `--lint` took 561 s for a boss-testing
+  change — 47 s of fmt and lints, 123 s of workspace clippy, 387 s for the
+  64 pins run one crate at a time (19347752 runs them in parallel) — so a
+  change that implies no crate still pays about seven and a half minutes.
+  Warm leaf edits reuse
   cached dependents; a core-type edit pays for the workspace check that
   catches literals in other crates (4669e9d7, design caa2acc9). Neither is
   a gate, and both say so: the build and the suites
@@ -889,9 +895,15 @@ a door that stops being true is a defect worth a car.
   of cluster time to learn that `cargo fmt` had been run on one crate and
   not another, and `--quick` alone cost two more gates to clippy errors
   `--lint` would have caught — the second of them on 2026-09-21, by a
-  session that had read this line (`410e21e2`). Reach for `--quick` only
-  where nothing compiles: a docs, infra or `apps/` change maps to no
-  crate, and `--lint` says so and skips clippy anyway.
+  session that had read this line (`410e21e2`). Reach for `--quick` alone
+  for a docs-only change: it implies no crate, so `--lint` would add the
+  pins and nothing else, and a pin reads prose rarely (one is
+  the_vsm_mapping_outlives_its_code, on docs/architecture-decisions.md;
+  a docs car's own gate still runs every pin). A change under `infra/` or
+  `apps/` that implies no crate is the opposite case and runs `--lint`:
+  the pins are the checks that read those trees — 55 of the 60 tests/
+  pins name `infra`, and the web-fetch and mirror-URL pins read
+  apps/web/src.
 
 - **Briefing a builder — `boss brief <packet>`.** The packet verbatim
   from the system of record, plus the invariants *derived* from the files

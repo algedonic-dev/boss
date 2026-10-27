@@ -247,6 +247,37 @@ pub(crate) fn refusal(missing: &[String]) -> Value {
     })
 }
 
+/// PURE: the hook's answer when the snapshot's NAME never arrived at a
+/// `boss` reached through the published isolation door (backlog
+/// c02f30c5) — `None` when there is nothing to refuse. `agent-start.sh`
+/// exports [`crate::dispatch::SESSION_DEFINITIONS_ENV`] on every call,
+/// so its absence there means the door dropped it, and passing would
+/// leave the unloaded-definitions refusal above silently not running.
+/// Only a call that would be DISPATCHED is checked, as the snapshot
+/// itself is; without isolation an absent name is a hand-run verb, and
+/// that unknown still passes.
+pub(crate) fn lost_snapshot_refusal(input: &Value, named: bool, isolated: bool) -> Option<Value> {
+    if named || !isolated || !matches!(parse(input), Parsed::Packet { .. }) {
+        return None;
+    }
+    let name = crate::dispatch::SESSION_DEFINITIONS_ENV;
+    Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": format!(
+                "boss dispatch: {name} did not arrive, and dev isolation is on, so this `boss` \
+                 was reached through the published door (infra/dev/control-tools.py), which \
+                 hands on only the names it lists. The hook sets {name} on every call, so the \
+                 activated generation dropped it, and without it this door cannot tell whether \
+                 the session loaded the definition it is about to name (backlog c02f30c5). \
+                 Nothing was claimed and no run was filed. Activate a generation whose door \
+                 carries {name}, then dispatch this packet."
+            ),
+        }
+    }))
+}
+
 /// How the Agent tool call reaches the harness, as the launch record
 /// names it.
 const VIA_AGENT_TOOL: &str = "the Agent tool call the PreToolUse hook handed back";
@@ -532,6 +563,22 @@ pub async fn run(session: String) -> Result<()> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map(std::path::PathBuf::from);
+    // ...unless the name was lost behind the isolation door (c02f30c5):
+    // then "unknown" is a dropped name, and refusing is the only way the
+    // refusal above is still running.
+    if let Some(deny) = lost_snapshot_refusal(
+        &input,
+        definitions.is_some(),
+        crate::door_env::isolation_forwards(),
+    ) {
+        eprintln!(
+            "boss dispatch --from-hook: {} did not arrive behind the isolation door — refused, \
+             nothing claimed and no run filed (backlog c02f30c5)",
+            crate::dispatch::SESSION_DEFINITIONS_ENV
+        );
+        print!("{deny}");
+        return Ok(());
+    }
     from_hook_at(
         &crate::sor_client::machine_client()?,
         &base,
@@ -689,6 +736,44 @@ mod tests {
             why.contains("nothing was claimed") || why.contains("Nothing was claimed"),
             "{why}"
         );
+    }
+
+    /// Backlog c02f30c5 (found 2026-10-18 building 19dbaab9). The hook
+    /// names the snapshot on EVERY call (`agent-start.sh` exports it
+    /// unconditionally), so a dispatch that arrives without the name lost
+    /// it in transit — and with isolation on, the hook's `boss` IS the
+    /// published door, which dropped it. "Unknown is never a refusal" was
+    /// written for a door that carried the name; behind one that lost it,
+    /// passing meant the unloaded-definitions refusal never ran at all.
+    /// So: refused, before the claim, saying which name and why. Without
+    /// isolation — a hand-run verb — the unknown still passes.
+    #[test]
+    fn a_snapshot_name_lost_behind_the_isolation_door_is_refused_not_passed() {
+        let packet = call(&format!("Packet: {PACKET}"));
+        let deny = lost_snapshot_refusal(&packet, false, true)
+            .expect("a packet dispatched behind the door with no snapshot name is refused");
+        let hs = &deny["hookSpecificOutput"];
+        assert_eq!(hs["hookEventName"], "PreToolUse");
+        assert_eq!(hs["permissionDecision"], "deny");
+        let why = hs["permissionDecisionReason"].as_str().expect("a reason");
+        for needed in [
+            crate::dispatch::SESSION_DEFINITIONS_ENV,
+            "infra/dev/control-tools.py",
+            "c02f30c5",
+            "Nothing was claimed",
+        ] {
+            assert!(why.contains(needed), "{needed}: {why}");
+        }
+        // The name arrived: the snapshot check itself judges the call.
+        assert_eq!(lost_snapshot_refusal(&packet, true, true), None);
+        // No isolation: nothing is known, and an unknown still passes.
+        assert_eq!(lost_snapshot_refusal(&packet, false, false), None);
+        // Only a dispatch is checked against the snapshot; an untracked
+        // call or a pasted run is never refused for it.
+        let untracked = call("Find where the yard reads gate-runs.");
+        assert_eq!(lost_snapshot_refusal(&untracked, false, true), None);
+        let pasted = call(&format!("Your run is agent-run {RUN}."));
+        assert_eq!(lost_snapshot_refusal(&pasted, false, true), None);
     }
 
     #[test]

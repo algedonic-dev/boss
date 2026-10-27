@@ -284,14 +284,43 @@ fn w1_as_found() -> Live {
 }
 
 /// w-1 as its declaration says it should be once David has applied the
-/// gate volume (52ea56ac) and removed the doubled seed file entry. No
-/// /var/mnt/gate kubelet mount: review a79746c6 withdrew it.
+/// gate volume (52ea56ac), the image-GC pair (67e98635) and removed the
+/// doubled seed file entry. No /var/mnt/gate kubelet mount: review
+/// a79746c6 withdrew it.
 fn w1_as_declared() -> Live {
     Live {
         seed_file_copies: 1,
+        image_gc: Some((50, 40)),
         gate_volume: Some(GATE_SELECTOR),
         ..w1_as_found()
     }
+}
+
+/// w-1 as it stood on 2026-10-19 when its Longhorn disk fell under the
+/// scheduling floor (backlog 67e98635): the gate volume applied, the
+/// seed file entry still doubled as far as anything has read, and NO
+/// image-GC pair, so the kubelet ran its 85% default.
+fn w1_before_the_gc_pair() -> Live {
+    Live {
+        gate_volume: Some(GATE_SELECTOR),
+        ..w1_as_found()
+    }
+}
+
+/// The image-GC pair a declaration carries, read off its text.
+fn gc_pair(body: &str, node: &str) -> (u32, u32) {
+    let pct = |key: &str| -> u32 {
+        let prefix = format!("{key}: ");
+        body.lines()
+            .find_map(|l| l.trim().strip_prefix(prefix.as_str()))
+            .unwrap_or_else(|| panic!("{node}.yaml declares {key}:\n{body}"))
+            .parse()
+            .unwrap()
+    };
+    (
+        pct("imageGCHighThresholdPercent"),
+        pct("imageGCLowThresholdPercent"),
+    )
 }
 
 fn run(args: &[&str], stdin: &str, patches: Option<&Path>, path_env: Option<&Path>) -> Output {
@@ -380,8 +409,8 @@ fn w1_deduped_equals_the_declaration_and_exits_0() {
     );
     assert_eq!(
         lines_with(&out, "MATCH").len(),
-        4,
-        "file, the seed mount, mirror, the gate volume:\n{t}"
+        6,
+        "file, the seed mount, the two GC keys, mirror, the gate volume:\n{t}"
     );
     assert!(
         t.contains("MATCH      UserVolumeConfig[gate]"),
@@ -401,7 +430,7 @@ fn the_stored_config_reads_like_the_resource_and_finds_the_gate_volume() {
     let out = run(&["w-1"], &raw_config(&w1_as_declared()), None, None);
     let t = text(&out);
     assert_eq!(code(&out), 0, "{t}");
-    assert_eq!(lines_with(&out, "MATCH").len(), 4, "{t}");
+    assert_eq!(lines_with(&out, "MATCH").len(), 6, "{t}");
     assert!(t.contains("MATCH      UserVolumeConfig[gate]"), "{t}");
     assert!(t.contains("id=(raw)"), "says which document it read:\n{t}");
 }
@@ -424,7 +453,7 @@ fn before_the_apply_the_gate_volume_reads_absent() {
             .any(|l| l.contains("UserVolumeConfig[gate]") && l.contains("500u * GB")),
         "ABSENT prints the declared document:\n{t}"
     );
-    assert_eq!(lines_with(&out, "MATCH").len(), 3, "{t}");
+    assert_eq!(lines_with(&out, "MATCH").len(), 5, "{t}");
     assert_eq!(code(&out), 1, "{t}");
 }
 
@@ -639,6 +668,188 @@ fn w2_declares_an_image_gc_pair_that_fires_before_longhorns_floor() {
         undeclared.len() == 1 && undeclared[0].contains("10.20.0.15:3000"),
         "the live mirror is reported, never failed:\n{t}"
     );
+}
+
+/// w-1's Longhorn disk fell under its scheduling floor on 2026-10-19
+/// (backlog 67e98635; ops-request c4331d4a, node-disk-usage w-1 at
+/// 14:56Z): 231.2 GiB available of 928.9 against Longhorn's 25%
+/// minimal-available floor of 232.2, imagefs 535.2 GiB used, and no
+/// image-GC pair declared, so the kubelet's default 85% line lay past
+/// Longhorn's 75%-used refusal and never fired. Every new worker volume
+/// provisioned and never got a replica. The pair is w-2's and cp-1's —
+/// the one that holds w-2 at 44.6% used today (ops-request 9984007c) —
+/// and the check reads it ABSENT on w-1 as it stands, MATCH once applied.
+#[test]
+fn w1_declares_an_image_gc_pair_that_fires_before_longhorns_floor() {
+    let body = std::fs::read_to_string(patches_dir().join("w-1.yaml")).unwrap();
+    let (high, low) = gc_pair(&body, "w-1");
+    assert!(high < 75, "GC starts at {high}% used, past Longhorn's 75%");
+    assert!(low < high, "GC frees to {low}%, below its {high}% start");
+    let w2 = std::fs::read_to_string(patches_dir().join("w-2.yaml")).unwrap();
+    assert_eq!(
+        (high, low),
+        gc_pair(&w2, "w-2"),
+        "one worker pair, not a third"
+    );
+
+    let out = run(
+        &["w-1"],
+        &live_yaml("10.20.0.14", &w1_before_the_gc_pair()),
+        None,
+        None,
+    );
+    let t = text(&out);
+    let absent = lines_with(&out, "ABSENT");
+    assert_eq!(absent.len(), 2, "both GC keys, nothing else:\n{t}");
+    assert!(
+        absent.iter().all(|l| l.contains("imageGC")),
+        "only the GC pair is absent:\n{t}"
+    );
+    let out = run(
+        &["w-1"],
+        &live_yaml("10.20.0.14", &w1_as_declared()),
+        None,
+        None,
+    );
+    assert_eq!(code(&out), 0, "applied and de-duplicated: {}", text(&out));
+}
+
+/// THE NARROWED PATCH (backlog 9cf1673d's first half, built for
+/// 67e98635). Talos's merge appends list entries it cannot key, so a
+/// declaration whose list entries are already live cannot be re-applied
+/// whole — w-1's, the node whose Longhorn floor stopped dev isolation.
+/// `--absent` prints the declaration narrowed to the entries ABSENT live,
+/// re-emitted in canonical form from the DECLARED values (never a live
+/// one), and node-converge applies exactly that.
+#[test]
+fn absent_prints_only_the_declared_entries_absent_live_in_canonical_form() {
+    // w-1's own declaration against w-1 as it stood: the doubled seed
+    // file, the mount, the mirror and the gate volume are live; the
+    // GC pair is what is missing, and the whole of what is printed.
+    let out = run(
+        &["--absent", "w-1"],
+        &live_yaml("10.20.0.14", &w1_before_the_gc_pair()),
+        None,
+        None,
+    );
+    let t = text(&out);
+    assert_eq!(code(&out), 0, "{t}");
+    let body = std::fs::read_to_string(patches_dir().join("w-1.yaml")).unwrap();
+    let (high, low) = gc_pair(&body, "w-1");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "machine:\n  kubelet:\n    extraConfig:\n      imageGCHighThresholdPercent: {high}\n      imageGCLowThresholdPercent: {low}\n"
+        ),
+        "exactly the absent entries, canonical:\n{t}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .all(|l| l.starts_with("read ")),
+        "stderr carries the read line and no verdict: {t}"
+    );
+
+    // Several classes absent at once, a user volume among them: each is
+    // printed under its own path, the volume as its own document, and
+    // the printed fragment is itself a canonical declaration.
+    let live = Live {
+        hostname: Some("w-1"),
+        mirror: true,
+        ..Live::default()
+    };
+    let out = run(
+        &["--absent", "w-1"],
+        &live_yaml("10.20.0.14", &live),
+        None,
+        None,
+    );
+    let t = text(&out);
+    assert_eq!(code(&out), 0, "{t}");
+    let frag = String::from_utf8_lossy(&out.stdout).to_string();
+    for want in [
+        "  files:\n    - content: |\n",
+        "      path: /var/local/gate-seed/.declared-by-talos\n",
+        "    extraMounts:\n      - destination: /var/local/gate-seed\n",
+        "    extraConfig:\n      imageGCHighThresholdPercent: ",
+        "\n---\napiVersion: v1alpha1\nkind: UserVolumeConfig\nname: gate\n",
+    ] {
+        assert!(
+            frag.contains(want),
+            "the fragment carries {want:?}:\n{frag}"
+        );
+    }
+    assert!(
+        !frag.contains("10.20.0.15:3000"),
+        "the live mirror is not re-applied:\n{frag}"
+    );
+    assert!(
+        !frag.contains("REDACTED") && !frag.contains("hostname"),
+        "no live value:\n{frag}"
+    );
+    let dir = scratch("absent-fragment");
+    let patches = dir.join("patches");
+    std::fs::create_dir_all(&patches).unwrap();
+    std::fs::write(patches.join("w-1.yaml"), &frag).unwrap();
+    let classes = run(&["--only-read-classes", "w-1"], "", Some(&patches), None);
+    assert_eq!(
+        code(&classes),
+        0,
+        "the fragment is a declaration a converge may apply: {}",
+        text(&classes)
+    );
+    let narrowed = run(
+        &["w-1"],
+        &live_yaml("10.20.0.14", &live),
+        Some(&patches),
+        None,
+    );
+    assert!(
+        lines_with(&narrowed, "MATCH").is_empty() && lines_with(&narrowed, "ABSENT").len() == 5,
+        "read against the same node, every entry of the fragment is ABSENT: {}",
+        text(&narrowed)
+    );
+
+    // Nothing absent — every entry live, the seed file still doubled:
+    // nothing to narrow to, said, and nothing printed.
+    let none = run(
+        &["--absent", "w-1"],
+        &live_yaml(
+            "10.20.0.14",
+            &Live {
+                seed_file_copies: 2,
+                ..w1_as_declared()
+            },
+        ),
+        None,
+        None,
+    );
+    assert_eq!(code(&none), 4, "{}", text(&none));
+    assert!(none.stdout.is_empty(), "{}", text(&none));
+    assert!(text(&none).contains("ABSENT"), "says why: {}", text(&none));
+
+    // A DRIFT is not absent: it is left out, and the caller decides.
+    let drifted = Live {
+        image_gc: Some((85, 80)),
+        ..w1_before_the_gc_pair()
+    };
+    let out = run(
+        &["--absent", "w-1"],
+        &live_yaml("10.20.0.14", &drifted),
+        None,
+        None,
+    );
+    assert_eq!(code(&out), 4, "{}", text(&out));
+
+    // Another node's config is refused, as the comparison refuses it.
+    let out = run(
+        &["--absent", "w-2"],
+        &live_yaml("10.20.0.14", &w1_as_found()),
+        None,
+        None,
+    );
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert!(out.stdout.is_empty(), "{}", text(&out));
 }
 
 #[test]

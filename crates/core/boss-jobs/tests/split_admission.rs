@@ -319,6 +319,42 @@ async fn a_missing_arm_version_fails_safe_to_the_active_version() {
     );
 }
 
+/// Backlog 50ded63d, the review of car e3c4a326 (B2, M1). A candidate
+/// that lost its experiment is REJECTED and admits nothing more, even
+/// while an experiment packet still names it: `get_version` serves the
+/// rejected row, so without the fail-safe arm a packet hashed to the
+/// candidate was pinned onto the rejected protocol and stamped with
+/// the arm. It admits exactly as if no experiment existed.
+#[tokio::test]
+async fn a_rejected_candidate_admits_under_the_active_version_unstamped() {
+    let (app, jobs) = app_with(
+        vec![experiment(serde_json::json!(100))],
+        vec![
+            spec(2, WorkflowStatus::Active),
+            spec(3, WorkflowStatus::Rejected),
+        ],
+    )
+    .await;
+
+    let job = packet();
+    create(&app, &job).await;
+
+    let stored = jobs.get_job(&job.id).await.unwrap().expect("stored");
+    assert_eq!(
+        stored.workflow_version, 2,
+        "a rejected version is never a packet's protocol again"
+    );
+    assert!(
+        stored.metadata.get("experiment_arm").is_none(),
+        "a packet that did not run under an arm carries no stamp"
+    );
+    let steps = jobs.list_steps(&job.id).await.unwrap();
+    assert!(
+        steps.iter().all(|s| s.title != "Candidate-only work"),
+        "the steps come from the active spec, not the rejected one"
+    );
+}
+
 #[tokio::test]
 async fn the_stamped_arm_and_the_pinned_version_agree_at_an_even_split() {
     // At split=50 the coin is the packet's own id — unpredictable per

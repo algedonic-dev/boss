@@ -850,6 +850,33 @@ pub enum RegistryError {
          `:`-separated segments of letters, digits and `-`, none empty"
     )]
     NotAFamilyMember { rule: String, family: String },
+    /// A rule declaring a `delay` (backlog 84a010cb). The field parses
+    /// and is stored, but nothing executes it: the matcher drops it and
+    /// the runner dispatches at once, so accepting it would publish a
+    /// timing claim the system does not keep. Refused until the durable
+    /// delayed-admission contract (design f1d66249) is built.
+    #[error(
+        "rule {rule:?} declares delay {delay:?}, which is refused: no delayed admission is \
+         implemented, and the dispatcher would run its handlers immediately on the triggering \
+         event (backlog 84a010cb, design f1d66249) — remove the delay"
+    )]
+    UnsupportedDelay { rule: String, delay: String },
+    /// A rule declaring a `delay` the delayed-admission contract would
+    /// refuse even once it executes (backlog 84a010cb, car 1 of design
+    /// f1d66249's finish line): malformed, zero, signed or overflowing,
+    /// or a shape it does not support — periodic, several effects, a
+    /// handler other than `jobs.spawn`. Named apart from
+    /// [`Self::UnsupportedDelay`] so the author learns the declaration
+    /// itself is wrong, not merely early.
+    #[error(
+        "rule {rule:?} declares delay {delay:?}, which is refused: {reason} (backlog 84a010cb, \
+         design f1d66249)"
+    )]
+    MalformedDelay {
+        rule: String,
+        delay: String,
+        reason: super::delayed::DelayRefusal,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +919,23 @@ pub fn match_event(
             continue;
         };
         if !pattern.matches(topic) {
+            continue;
+        }
+        // A delayed rule never fires at match time (backlog 84a010cb).
+        // `authoring::validate` refuses a `delay`, but an active row is
+        // loaded through `Rule::from_raw`, which does not call it — and
+        // matching used to drop the delay and hand the runner its
+        // handlers on the triggering event. Until the durable admission
+        // contract (design f1d66249) executes the delay, refuse the rule
+        // loudly here, before its predicate, so nothing fires.
+        if let Some(delay) = &rule.delay {
+            skipped.push(SkippedRule {
+                rule: rule.name.clone(),
+                err: MatchError::UnsupportedDelay {
+                    rule: rule.name.clone(),
+                    delay: delay.clone(),
+                },
+            });
             continue;
         }
         if let Some(when) = &rule.when {
@@ -1042,6 +1086,13 @@ pub enum MatchError {
         arg: String,
         err: expr::EvalError,
     },
+    /// A rule declaring a `delay` reached the matcher (backlog 84a010cb):
+    /// nothing executes the delay yet, so it is refused, never fired.
+    #[error(
+        "rule {rule:?} declares delay {delay:?}, which nothing executes: refused and not fired \
+         (backlog 84a010cb, design f1d66249) — remove the delay"
+    )]
+    UnsupportedDelay { rule: String, delay: String },
 }
 
 // ---------------------------------------------------------------------------

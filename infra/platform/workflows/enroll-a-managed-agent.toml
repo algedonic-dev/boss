@@ -17,7 +17,7 @@ title_template = "Authorize dedicated access for the approved account"
 authority_role = "platform-admin"
 assurance_required = "presence"
 sign_offs_required = ["platform-admin"]
-metadata_defaults = { human_only = true, credential = "{metadata.credential}", expected_principal = "{metadata.expected_principal}", procedure = "Your passkey signs the public credential and expected principal identifiers filed from the accepted decision. The approved account is already selected; do not choose another one here. No password, code, token, auth cache, provider URL or confirmation material belongs here. Private confirmation requires the authenticated broker transport; this scope does not install a login or activate a worker." }
+metadata_defaults = { human_presentation = { ask = "Authorize dedicated access for the approved account", why_person = "Your passkey must authorize the named account and credential.", action = "Inspect and authorize the account", after = "Approval permits private setup only; it does not install a login or activate a worker.", evidence = "current-step" }, human_only = true, credential = "{metadata.credential}", expected_principal = "{metadata.expected_principal}", procedure = "Your passkey signs the public credential and expected principal identifiers filed from the accepted decision. The approved account is already selected; do not choose another one here. No password, code, token, auth cache, provider URL or confirmation material belongs here. Private confirmation requires the authenticated broker transport; this scope does not install a login or activate a worker." }
 fields = [
   { name = "credential", field_type = "non-empty-string", required = true, filled_by = "filer" },
   { name = "expected_principal", field_type = "non-empty-string", required = true, filled_by = "filer" },
@@ -30,7 +30,7 @@ kind = "private-enrollment"
 ready_when = "steps.scope.done AND steps.scope.metadata.decision = \"approved\""
 title_template = "Confirm dedicated access privately"
 authority_role = "platform-admin"
-metadata_defaults = { human_only = true, written_by = "rule:private-enrollment-broker", procedure = "Private setup is unavailable until the authenticated broker adapter is installed. Do not paste provider material or use generic job metadata as its transport. Only the broker's original opaque consent receipt can complete this step; the surface has no manual receipt or completion input." }
+metadata_defaults = { human_presentation = { ask = "Confirm dedicated access privately when the broker is available", why_person = "Provider consent must stay in the authenticated private broker, never in this request.", action = "Read the private setup instructions", after = "Setup remains unavailable until the broker adapter exists; only its original receipt can advance this request.", evidence = "current-step" }, human_only = true, written_by = "rule:private-enrollment-broker", procedure = "Private setup is unavailable until the authenticated broker adapter is installed. Do not paste provider material or use generic job metadata as its transport. Only the broker's original opaque consent receipt can complete this step; the surface has no manual receipt or completion input." }
 fields = [{ name = "broker_receipt_id", field_type = "non-empty-string", required = true }]
 
 [[workflow.step]]

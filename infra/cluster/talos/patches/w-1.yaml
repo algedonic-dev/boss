@@ -61,6 +61,26 @@ machine:
       # pod decides whether that suffices. If it does not, the entry
       # comes back in a car of its own, beside the gate's refusal to run
       # on EPHEMERAL (infra/gate-runner/run.sh).
+    # THE IMAGE-GC PAIR (backlog 67e98635), declared to be APPLIED, not as
+    # found. Read 2026-10-19 14:56Z by node-disk-usage (ops-request
+    # c4331d4a): nodefs 928.9 GiB, 231.2 available; imagefs used 535.2
+    # GiB, nearly all of it boss-ci images no container uses (the Node
+    # lists only its 50 newest; one per train). Longhorn's default disk
+    # is /var/lib/longhorn on this same filesystem, and Longhorn stops
+    # placing replicas on it below 25% available (232.2 GiB) — while the
+    # kubelet, with no pair declared, collects images only at its default
+    # 85% used. Between 75% and 85% nothing reclaims and no volume can be
+    # placed: every dev-build worker's volume provisioned and never got a
+    # replica. At 50% used the kubelet removes images no container uses,
+    # least recently used first, down to 40%; it never removes one a
+    # running container uses, and the cost is a re-pull from the forge on
+    # the LAN. The pair is w-2's (666e0570) and cp-1/cp-3's: it holds w-2
+    # at 44.6% used (ops-request 9984007c, the same morning). It reaches
+    # w-1 through node-converge's NARROWED patch (9cf1673d): the list
+    # entries above are live, so only the entries ABSENT live are applied.
+    extraConfig:
+      imageGCHighThresholdPercent: 50
+      imageGCLowThresholdPercent: 40
   # Every image the cluster runs is pulled through the forge's registry
   # (infra/forge; plain http on the LAN).
   registries:

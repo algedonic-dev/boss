@@ -20,6 +20,10 @@ events-api = ["bin"]
 name = "stream_order_pg"
 required-features = ["postgres"]
 
+[[test]]
+name = "history_snapshot_stream_pg"
+required-features = ["postgres"]
+
 [dependencies]
 boss-core = { path = "../boss-core" }
 boss-policy-client = { path = "../boss-policy-client" }

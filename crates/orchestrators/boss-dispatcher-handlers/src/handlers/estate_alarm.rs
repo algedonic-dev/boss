@@ -323,7 +323,7 @@ fn entries<'a>(comparison: &'a Value, field: &str) -> impl Iterator<Item = &'a V
 /// ([`hard_findings`]) and by recovery's evidence test ([`evaluated`]),
 /// so a class cannot be raisable without the recovery knowing where its
 /// evaluation is recorded (backlog c11bfb77).
-pub(super) const HARD_CLASSES: [(&str, &str); 7] = [
+pub(super) const HARD_CLASSES: [(&str, &str); 8] = [
     ("not_ready", "not_ready"),
     ("declared_not_observed", "gone"),
     // The host scope's disk floor (49a8d842): a machine below the
@@ -352,6 +352,9 @@ pub(super) const HARD_CLASSES: [(&str, &str); 7] = [
     // said no. Keyed host + unit: the same unit sick on two hosts is
     // two conditions.
     ("units_unhealthy", "unit_unhealthy"),
+    // A declared producer's native failed Job is independent of its
+    // mounted filesystem figures and of any maintenance packet opener.
+    ("scheduled_job_failed", "scheduled_job_failed"),
 ];
 
 /// The classes a comparator can be BLIND to, as `(the findings field
@@ -365,9 +368,10 @@ pub(super) const HARD_CLASSES: [(&str, &str); 7] = [
 /// gap, as an empty list. Raised as `blind:<hard field>/<id>`; recovery
 /// reads the hard field's `evaluated` list, so the two names must agree
 /// (pinned by `every_blind_class_blinds_a_hard_class`).
-pub(super) const BLIND_CLASSES: [(&str, &str); 2] = [
+pub(super) const BLIND_CLASSES: [(&str, &str); 3] = [
     ("ops_credentials_unmeasured", "ops_credentials_absent"),
     ("disk_unmeasured", "disk_tight"),
+    ("scheduled_job_unmeasured", "scheduled_job_failed"),
 ];
 
 /// The prefix of a blind class's keys (`blind:<hard field>/<id>`).
@@ -2318,6 +2322,57 @@ mod per_host_series_tests {
     }
 
     #[tokio::test]
+    async fn failed_scheduled_backup_files_an_urgent_packet_from_native_comparisons() {
+        for (field, key) in [
+            (
+                "scheduled_job_failed",
+                "scheduled_job_failed:boss/boss-pg-backup",
+            ),
+            (
+                "scheduled_job_unmeasured",
+                "blind:scheduled_job_failed/boss/boss-pg-backup",
+            ),
+        ] {
+            let now = Utc::now();
+            let rows: Vec<Value> = (0..3).map(|i| {
+            let mut row = volumes_row(now - chrono::Duration::minutes(15 * i), 20.0);
+            row["payload"]["findings"]["disk_unmeasured"] = json!([]);
+            row["payload"]["findings"][field] = json!([{"id":"boss/boss-pg-backup", "job_uid":"failed-uid", "cronjob_uid":"cron-uid", "reason":"BackoffLimitExceeded"}]);
+            row["payload"]["evaluated"]["scheduled_job_failed"] = if field == "scheduled_job_failed" { json!(["boss/boss-pg-backup"]) } else { json!([]) };
+            row
+        }).collect();
+            let stub = serve(vec![
+                (
+                    "/api/estate/comparisons?scope=instance-volumes",
+                    json!({"data":rows,"total":3}),
+                ),
+                ("/api/estate/comparisons", empty_listing()),
+                ("/api/estate/observations", empty_listing()),
+                ("/api/jobs", empty_listing()),
+            ])
+            .await;
+            handler(stub.base.clone())
+                .invoke(&[], &firing_at(rows[0]["payload"].clone(), now))
+                .await
+                .unwrap();
+            let posts: Vec<Value> = stub
+                .sent()
+                .into_iter()
+                .filter(|(path, _)| path == "POST /api/jobs")
+                .map(|(_, body)| body)
+                .collect();
+            assert_eq!(posts.len(), 1, "{posts:?}");
+            assert_eq!(posts[0]["priority"], "urgent");
+            assert!(posts[0].to_string().contains("failed-uid"));
+            assert!(
+                raised(&stub).contains(&key.to_string()),
+                "{:?}",
+                raised(&stub)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_volume_under_its_floor_on_three_comparisons_files_disk_tight_for_its_claim() {
         let now = Utc::now();
         let rows: Vec<Value> = (0..3)
@@ -2362,7 +2417,7 @@ mod per_host_series_tests {
         for named in [
             "pgdata-postgres-0",
             "pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56",
-            "requests.storage",
+            "plan-an-instance-volume-expansion",
         ] {
             assert!(
                 detail.contains(named),

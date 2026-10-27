@@ -502,12 +502,14 @@ describe('the gate QUEUE lane — runs waiting for a bay', () => {
   // carry it; the floor draws it at the head of the line, and the queued
   // runs stand behind it.
   test('a train waiting for a bay stands at the head of the gate line', () => {
+    const bound = 'the cluster is at its gate bound (1 running of 1: g1) — the train holds the first place';
     const waitGate = {
       run: null,
       line: null,
       forge: null,
       fallback: null,
-      wait_reason: 'the cluster is at its gate bound (1 running of 1: g1) — the train holds the first place',
+      wait_reason: bound,
+      bound_wait: bound,
       wait_since: '2026-09-07T23:17:00Z',
       relaunches: 0,
     };
@@ -539,10 +541,34 @@ describe('the gate QUEUE lane — runs waiting for a bay', () => {
     expect(s.machines.queue.label).toBe('train first · 2 waiting · supervision unknown · next owner unknown');
     // A train whose gate is already filed, or judged by CI alone, is not
     // waiting in line.
-    const filed = trainRow('t2', 'DEPARTED', { gate: { ...waitGate, run: 'abcdef0123', wait_reason: null } });
+    const filed = trainRow('t2', 'DEPARTED', { gate: { ...waitGate, run: 'abcdef0123', wait_reason: null, bound_wait: null } });
     const s2 = scene(yardOf({ inFlight: [filed] }), statusOf(), NOW);
     expect(s2.wagons.find(w => w.id === 't2')).toBeUndefined();
     expect(s2.machines.queue.label).toBe('clear · supervision unknown');
+  });
+
+  // Review a2ace778 of car 1585a455: the conductor writes the wait reason
+  // on EVERY failed launch and the place in line (`train_gate_bound_wait`)
+  // only when the bound refused it (backlog 82071657). A launch that
+  // failed for any other reason holds no place, so it is not drawn at
+  // the head of the line or counted in it; a train owed a relaunch after
+  // a refusal carries the place alone, and is.
+  test('only a train holding its place in line stands in it; a failed launch does not', () => {
+    const fault = 'rendering the runner manifest: No such file or directory';
+    const failing = trainRow('t3', 'DEPARTED', {
+      gate: { run: null, line: null, forge: null, fallback: null, wait_reason: fault, bound_wait: null, wait_since: null, relaunches: 0 },
+    });
+    const s = scene(yardOf({ inFlight: [failing] }), statusOf(), NOW);
+    expect(s.wagons.find(w => w.id === 't3')).toBeUndefined();
+    expect(s.machines.queue).toMatchObject({ count: 0 });
+    const place = 'gate-run 0123abcd ended without a usable verdict; the train holds the first place in the gate line for its relaunch';
+    const relaunch = trainRow('t4', 'DEPARTED', {
+      gate: { run: null, line: null, forge: null, fallback: null, wait_reason: null, bound_wait: place, wait_since: '2026-09-07T23:17:00Z', relaunches: 1 },
+    });
+    const s2 = scene(yardOf({ inFlight: [relaunch] }), statusOf(), NOW);
+    expect(wagon(s2, 't4')).toMatchObject({ station: 'gate-queue', slot: 0, kind: 'train-gate' });
+    expect(wagon(s2, 't4').status).toContain(place);
+    expect(s2.machines.queue).toMatchObject({ count: 1 });
   });
 
   test('the departure board places a queued car before the bays', () => {

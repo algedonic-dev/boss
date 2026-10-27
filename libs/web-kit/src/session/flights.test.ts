@@ -17,6 +17,13 @@ describe('flightsFromAnswer — the answer the gateway inlines or the read retur
     expect(flightIsOn(on, 'something-else')).toBe(false);
   });
 
+  test('an empty list is a readable OFF answer, not an unread answer to retry', () => {
+    const on = flightsFromAnswer({ flights: [] });
+    expect(on).not.toBeNull();
+    expect(flightIsOn(on, 'it-map-transit')).toBe(false);
+    expect(flightIsOn(on, 'it-map-live')).toBe(false);
+  });
+
   test('anything that is not the answer is no answer, and no answer is every code off', () => {
     for (const raw of [undefined, null, 'it-map-motion', ['it-map-motion'], {}, { flights: 'x' }, { flights: ['x', 1] }]) {
       expect(flightsFromAnswer(raw)).toBeNull();

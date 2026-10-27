@@ -42,11 +42,10 @@
 # weighs recovery_kit_written as that person's word, and its `proof`
 # field says so.
 #
-# The machine token: the jobs API's machine gate is `off` today; once it
-# enforces, these PATCHes need the token the other forge writers pass
-# through infra/lib/secret-header.sh, which this reader cannot source.
-# Until then a refused record is exit 5 on --written and a journal line on
-# --stream — loud, never silent (review finding 9).
+# The installer embeds infra/lib/secret-header.sh into the root-owned
+# artifact. Both API calls use its mounted machine-token reader and host
+# rule, without sourcing anything at runtime. A refused record is exit 5
+# on --written and a journal line on --stream — loud, never silent.
 #
 # ENV is honoured for the tests only in practice: sudo's env_reset (set
 # explicitly for this command in the sudoers file) strips all of it.
@@ -94,6 +93,16 @@ jobs_url() { sed -n 's/^BOSS_JOBS_URL=//p' "$SOR_ENV" 2>/dev/null | sed -n 1p; }
 
 BOSS_USER_HDR='{"id":"automation:recovery-kit","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
 
+# Initialize in the parent shell, before any $(patch_request ...): the
+# shared helper's private header file and EXIT cleanup belong to this run.
+MT_HDR=''
+prepare_api_header() {
+    local url
+    url="$(jobs_url)"
+    [ -n "$url" ] || return 0
+    machine_token_header MT_HDR "$url" || say 'could not prepare the machine-token header; the packet record may be refused'
+}
+
 # patch_request <json body> — PATCH the cutting request's metadata; prints
 # the HTTP code (or `none`). Never touches stdout's stream: callers
 # capture it.
@@ -103,7 +112,7 @@ patch_request() {
     url="$(jobs_url)"
     [[ "$req" =~ $UUID_RE ]] || { echo "no-request"; return; }
     [ -n "$url" ] || { echo "no-url"; return; }
-    curl -sS -m 10 -o /dev/null -w '%{http_code}' -X PATCH \
+    curl -q -sS -m 10 -o /dev/null -w '%{http_code}' -X PATCH ${MT_HDR:+-H "$MT_HDR"} \
         -H "content-type: application/json" -H "x-boss-user: $BOSS_USER_HDR" \
         --data-binary "$1" "$url/api/jobs/$req/metadata" 2>/dev/null || echo "none"
 }
@@ -148,13 +157,14 @@ case "$mode" in
         kit_here "${1:-}"
         [ "$(sha256sum "$DIR/kit.tar" 2>/dev/null | cut -d' ' -f1)" = "$(manifest_tar_sha)" ] \
             || die 1 "kit.tar no longer hashes to the MANIFEST's tar_sha256 — nothing streamed. Cut a new kit"
+        prepare_api_header
         log_line "streamed kit $1"
         # Best effort, BEFORE the stream and off stdout: a list read and
         # re-written, so every pull is on the packet, not only the last.
         at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         req="$(state request)"; url="$(jobs_url)"
         if [[ "$req" =~ $UUID_RE ]] && [ -n "$url" ]; then
-            prior="$(curl -sS -m 10 -H "x-boss-user: $BOSS_USER_HDR" "$url/api/jobs/$req" 2>/dev/null \
+            prior="$(curl -q -sS -m 10 ${MT_HDR:+-H "$MT_HDR"} -H "x-boss-user: $BOSS_USER_HDR" "$url/api/jobs/$req" 2>/dev/null \
                 | jq -c '.metadata.recovery_kit_streamed // [] | if type == "array" then . else [] end' 2>/dev/null)"
             [ -n "$prior" ] || prior='[]'
             body="$(jq -n -c --argjson p "$prior" --arg v "$1" --arg at "$at" --arg who "$(caller)" \
@@ -172,6 +182,7 @@ case "$mode" in
         want="$(manifest_tar_sha)"
         [ "$read_back" = "$want" ] \
             || die 1 "the writing machine read back $read_back and kit $version is $want — the stick does NOT hold this kit"
+        prepare_api_header
         complete="$(state complete)"; missing="$(state missing)"
         log_line "wrote kit $version (read back $read_back from the stick; complete=$complete missing=${missing:-none})"
         at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

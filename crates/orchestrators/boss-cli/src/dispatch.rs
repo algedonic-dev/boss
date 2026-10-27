@@ -116,7 +116,9 @@
 //! target on the dev pod scratch, recording the bytes on the run as
 //! `scratch_target` ([`crate::scratch_target`], backlog 4e17c49d); a run
 //! that is not green keeps it for the rescue, and a target the gate's
-//! waiter already freed at the green keeps that record (a3355e14).
+//! waiter already freed at the green keeps that record (a3355e14). A
+//! reviewer run never gates, so its tree's target is freed once its
+//! `building` closes instead (backlog ff1d274f).
 
 use anyhow::{Context, Result, bail};
 use boss_jobs::agent_runs::{PricingBasis, TokenUsage};
@@ -294,11 +296,173 @@ pub(crate) fn pinned_skew_refusal(job: &Value, step: &Value, row: &Value) -> Opt
 /// finding F4). So the publish is named ONLY when the tree's holds were
 /// read and say the kind is open; held, unreadable and not read each
 /// name the row and say why no publish follows.
-pub(crate) fn no_block_refusal_in(repo: &Path, kind: &str, slug: &str) -> String {
-    no_block_refusal(
-        kind,
-        slug,
-        crate::workflow::drift_hold_in(repo, kind).as_ref(),
+///
+/// And the row it names must be one THIS TREE carries (backlog
+/// f4696e6c). A delivered tenant's kind — `receive-a-sponsorship`,
+/// owning_team `algedonic`, authored in the repo instances.toml names as
+/// `tenant_repo` — has no file under infra/platform/workflows, and the
+/// lint the-live-protocols-are-the-authored-protocols refuses this tree
+/// one. The refusal named that absent file and the platform publish
+/// anyway, and on 2026-10-19 a nomination and a builder run (ea48b00a)
+/// went to finding nothing here to change.
+///
+/// The wording is chosen from the RECORD, the row's `owning_team`
+/// (`owner`, when the row was read), and not from the file's absence
+/// alone (review 7a7fa1c8 of car 8a15613c, F1): a kind can be authored in
+/// this tree outside infra/platform/workflows — `repair-a-train` is
+/// written by the migration 132-repair-a-train.sql, owning_team
+/// `platform`, with no file there and no agent block on any step — and
+/// absence alone sent it toward the tenant repo, the same misdirection
+/// pointed the other way. So: a platform-owned row keeps the platform
+/// wording, whose file is the lint's named home for it (said to be
+/// absent, and named as the file to create, when it is); only a row owned
+/// by someone else, with no file here, gets [`tenant_kind_refusal`]; and
+/// a row that was not read, or a file whose presence could not be
+/// checked, is said rather than guessed ([`unknown_author_refusal`]).
+pub(crate) fn no_block_refusal_in(
+    repo: &Path,
+    kind: &str,
+    slug: &str,
+    owner: Option<&str>,
+) -> String {
+    let platform = || {
+        no_block_refusal(
+            kind,
+            slug,
+            crate::workflow::drift_hold_in(repo, kind).as_ref(),
+        )
+    };
+    let path = platform_row_path(kind);
+    // try_exists, not is_file: an I/O error is not an absence (F3).
+    let present = repo.join(&path).try_exists();
+    if owner == Some(PLATFORM_TEAM) {
+        return match present {
+            Ok(false) => format!(
+                "{}. This checkout carries no {path} yet: {kind} is the platform's (written \
+                 elsewhere in this tree, e.g. by a migration), and that file is where a platform \
+                 row is authored — create it from the live row (`boss-api GET \
+                 /api/workflows/{kind}`) with the block added",
+                platform()
+            ),
+            _ => platform(),
+        };
+    }
+    let sources = || {
+        std::fs::read_to_string(repo.join(crate::brief::INSTANCES))
+            .map(|body| crate::brief::tenant_sources(&body))
+            .map_err(|e| format!("{} could not be read: {e}", crate::brief::INSTANCES))
+    };
+    match (present, owner) {
+        (Ok(true), _) => platform(),
+        (Ok(false), Some(owner)) => tenant_kind_refusal(kind, slug, Some(owner), sources()),
+        (Ok(false), None) => unknown_author_refusal(
+            kind,
+            slug,
+            format!(
+                "its Workflow row was not read, so its owning_team is not known, and this \
+                 checkout carries no {path}"
+            ),
+            sources(),
+        ),
+        (Err(e), _) => unknown_author_refusal(
+            kind,
+            slug,
+            format!("whether this checkout carries {path} could not be read ({e})"),
+            sources(),
+        ),
+    }
+}
+
+/// The `owning_team` of every row this tree authors (all 75 files under
+/// infra/platform/workflows on 2026-10-22, and the migration-written
+/// repair-a-train).
+const PLATFORM_TEAM: &str = "platform";
+
+/// What instances.toml says about where tenants are authored, as one
+/// clause: the repos, or why none can be named. With more than one repo
+/// it says that which one authors `kind` is not recorded here (F3).
+fn tenant_repos_said(
+    kind: &str,
+    sources: std::result::Result<Vec<crate::brief::TenantSource>, String>,
+) -> String {
+    use crate::brief::INSTANCES;
+    match sources {
+        Ok(s) if !s.is_empty() => {
+            let named: Vec<String> = s
+                .iter()
+                .map(|t| format!("{} ([{}] tenant_repo)", t.repo, t.instance))
+                .collect();
+            let which = if named.len() > 1 {
+                format!(" (which of them authors {kind} is not recorded in this tree)")
+            } else {
+                String::new()
+            };
+            format!(
+                "{INSTANCES} delivers tenants from {}{which}",
+                named.join(", ")
+            )
+        }
+        Ok(_) => format!(
+            "{INSTANCES} names no tenant_repo, so where {kind} is authored cannot be read from \
+             this tree"
+        ),
+        Err(said) => said,
+    }
+}
+
+/// [`no_block_refusal_in`]'s wording when who authors the row cannot be
+/// told from here: both homes are named, each with its condition, and
+/// neither is chosen for the reader.
+fn unknown_author_refusal(
+    kind: &str,
+    slug: &str,
+    why: String,
+    sources: std::result::Result<Vec<crate::brief::TenantSource>, String>,
+) -> String {
+    let repos = tenant_repos_said(kind, sources);
+    format!(
+        "step `{slug}` of {kind} declares no agent block, so nothing says which model, at what \
+         effort, under what spend — and who authors {kind} cannot be told here: {why}. Read its \
+         owning_team (`boss-api GET /api/workflows/{kind}`): if it is `{PLATFORM_TEAM}`, add \
+         `{BLOCK_EXAMPLE}` to that step in {path}; if it is a tenant's, add it in the tenant \
+         repo's own Workflow row ({repos}), through a packet carrying metadata.{TENANT_REPO_KEY}",
+        path = platform_row_path(kind),
+    )
+}
+
+/// Where this tree authors a platform kind's Workflow row.
+fn platform_row_path(kind: &str) -> String {
+    format!("infra/platform/workflows/{kind}.toml")
+}
+
+/// The block a refusal asks for, in the row's own syntax.
+const BLOCK_EXAMPLE: &str =
+    "agent = { profile = \"builder\", model = \"opus-5-5\", budget_usd = 5, effort = \"high\" }";
+
+/// [`no_block_refusal_in`]'s wording for a row owned by someone other
+/// than the platform that this tree carries no file for: the repos
+/// instances.toml delivers tenants from, and the tenant lane — a packet
+/// carrying `metadata.tenant_repo` is briefed as
+/// [`TENANT_BUILDER_PROFILE`] by the venue door. The platform file is
+/// named only as ABSENT, never as the place to add the block, and the
+/// platform publish is not named at all. An instances file that cannot
+/// be read is said, not read as naming no repo.
+pub(crate) fn tenant_kind_refusal(
+    kind: &str,
+    slug: &str,
+    owner: Option<&str>,
+    sources: std::result::Result<Vec<crate::brief::TenantSource>, String>,
+) -> String {
+    let owner = owner.map_or_else(String::new, |o| format!(" (owning_team {o})"));
+    let repos = tenant_repos_said(kind, sources);
+    format!(
+        "step `{slug}` of {kind} declares no agent block, so nothing says which model, at what \
+         effort, under what spend — and this tree carries no {path} to add one to: {kind}{owner} \
+         is authored outside it, and no publish from here is its door. {repos}. Add `{BLOCK_EXAMPLE}` \
+         to that step in the tenant repo's own Workflow row, through a packet carrying \
+         metadata.{TENANT_REPO_KEY}, which `boss dispatch` briefs as `{TENANT_BUILDER_PROFILE}` \
+         in the tenant lane",
+        path = platform_row_path(kind),
     )
 }
 
@@ -326,9 +490,9 @@ pub(crate) fn no_block_refusal(
     };
     format!(
         "step `{slug}` of {kind} declares no agent block, so nothing says which model, at \
-         what effort, under what spend — add `agent = {{ profile = \"builder\", model = \
-         \"opus-5-5\", budget_usd = 5, effort = \"high\" }}` to that step in its Workflow \
-         row (infra/platform/workflows/{kind}.toml{then}"
+         what effort, under what spend — add `{BLOCK_EXAMPLE}` to that step in its Workflow \
+         row ({path}{then}",
+        path = platform_row_path(kind),
     )
 }
 
@@ -764,42 +928,99 @@ pub(crate) const BRIEFED_ATTEMPTS: usize = 2;
 /// a bound still holds, because a race that never ends is not a race.
 pub(crate) const BRIEFED_COMPLETE_ATTEMPTS: usize = 4;
 
+/// What a refusal inside [`hand_over`] leaves of the run it filed — ONE
+/// answer, read by the refusal that is written and by the caller that
+/// acts on it (backlog f843a0c9). Before, the caller decided to end the
+/// run while the `briefed` refusals, written without that answer, still
+/// told the reader to finish it, and `end_unhanded_run` persisted that
+/// advice as the run's `ended_at_dispatch.why` and the step's
+/// `released.why` — a record saying the opposite of what happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunAfterRefusal {
+    /// The run stays open to be finished: a printed prompt names it (a
+    /// fresh dispatch would orphan it, e381689d / deba68e8), or a handed
+    /// prompt is already an agent's.
+    KeptToFinish,
+    /// The verb ends the run and releases its claim
+    /// ([`end_unhanded_run`]): no executor holds the prompt — a printed
+    /// dispatch that has not printed it yet, or a launch, whose executor
+    /// is the process this verb starts only on success.
+    Ended,
+}
+
+/// Which [`RunAfterRefusal`] a refusal in [`hand_over`] leaves, from
+/// where the brief came from, whether the prompt reached stdout, and
+/// whether this is a launch (backlog f8bed383).
+pub(crate) fn run_after_refusal(
+    source: BriefSource<'_>,
+    printed: bool,
+    launching: bool,
+) -> RunAfterRefusal {
+    if matches!(source, BriefSource::Rendered) && (!printed || launching) {
+        RunAfterRefusal::Ended
+    } else {
+        RunAfterRefusal::KeptToFinish
+    }
+}
+
 /// The refusal when `briefed`'s field does not read back after
 /// [`BRIEFED_ATTEMPTS`] writes that each answered success. It names the
-/// run, the step, what the step holds instead, and the two writes that
-/// finish THIS run — the prompt already printed names this run's id, so
-/// a fresh dispatch would orphan it. `briefed` is left open: the
-/// completion was not sent.
+/// run, the step and what the step holds instead. `briefed` is left
+/// open: the completion was not sent. A run KEPT to finish is also told
+/// the two writes that finish THIS run — the prompt already printed
+/// names this run's id, so a fresh dispatch would orphan it; a run the
+/// verb ENDS is told nothing to finish (backlog f843a0c9).
 pub(crate) fn briefed_unheld_refusal(
     run_id: &str,
     briefed_id: &str,
     writes: &Value,
     report: &str,
+    after: RunAfterRefusal,
 ) -> String {
-    format!(
+    let refused = format!(
         "run {} is filed and its step claimed, but its `briefed` step does not hold \
          prompt_bytes after {BRIEFED_ATTEMPTS} writes that each answered success — refusing \
-         to complete it over a record it does not hold (backlog e381689d):\n{report}\
-         `briefed` is left open. To finish this run, record the field and then the status:\n  \
-         boss-api PATCH /api/jobs/{run_id}/steps/{briefed_id}/metadata  body {writes}\n  \
-         boss-api PUT /api/jobs/{run_id}/steps/{briefed_id}  body {{\"status\":\"completed\"}}",
+         to complete it over a record it does not hold (backlog e381689d):\n{report}",
         &run_id[..8.min(run_id.len())],
-    )
+    );
+    match after {
+        RunAfterRefusal::KeptToFinish => format!(
+            "{refused}`briefed` is left open. To finish this run, record the field and then the \
+             status:\n  \
+             boss-api PATCH /api/jobs/{run_id}/steps/{briefed_id}/metadata  body {writes}\n  \
+             boss-api PUT /api/jobs/{run_id}/steps/{briefed_id}  body {{\"status\":\"completed\"}}"
+        ),
+        RunAfterRefusal::Ended => {
+            format!("{refused}`briefed` was not completed, so no executor could start the run")
+        }
+    }
 }
 
-/// The context on a `briefed` completion that did not land: the prompt
-/// is printed and names this run, but `building` opens only when
-/// `briefed` completes, so the executor's `--started` will be refused.
-/// Said loudly, with the one command that finishes THIS run (backlog
-/// deba68e8 — on ea76e79f the coordinator had to work it out by hand).
-pub(crate) fn briefed_not_startable(run_id: &str, prompt_bytes: usize, attempts: usize) -> String {
-    format!(
-        "completing the run's briefed step (after {attempts} attempt(s)): run {run_id} is NOT \
-         startable — its prompt is printed but `briefed` is still open, so the executor's \
-         `--started` will be refused. Finish THIS run (do not dispatch again; the printed \
-         prompt names it):\n  boss step complete {run_id} --step briefed --field \
-         prompt_bytes={prompt_bytes}"
-    )
+/// The context on a `briefed` completion that did not land: `building`
+/// opens only when `briefed` completes, so the executor's `--started`
+/// would be refused. A run KEPT to finish — its printed prompt names it —
+/// is told loudly, with the one command that finishes THIS run (backlog
+/// deba68e8 — on ea76e79f the coordinator had to work it out by hand); a
+/// run the verb ENDS is told nothing to finish (backlog f843a0c9).
+pub(crate) fn briefed_not_startable(
+    run_id: &str,
+    prompt_bytes: usize,
+    attempts: usize,
+    after: RunAfterRefusal,
+) -> String {
+    match after {
+        RunAfterRefusal::KeptToFinish => format!(
+            "completing the run's briefed step (after {attempts} attempt(s)): run {run_id} is \
+             NOT startable — its prompt is printed but `briefed` is still open, so the \
+             executor's `--started` will be refused. Finish THIS run (do not dispatch again; the \
+             printed prompt names it):\n  boss step complete {run_id} --step briefed --field \
+             prompt_bytes={prompt_bytes}"
+        ),
+        RunAfterRefusal::Ended => format!(
+            "completing the run's briefed step (after {attempts} attempt(s)): run {run_id}'s \
+             `briefed` did not complete, so no executor could start the run"
+        ),
+    }
 }
 
 /// The test stubs' step merge door, as the jobs API's: `body`'s keys land
@@ -971,7 +1192,7 @@ fn hook_definition_compatibility(repo: &Path, settings: &Settings) -> Result<()>
 /// spends a run on a verdict nothing waits for and holds a step the
 /// conductor is about to complete, so the step is refused before the
 /// claim unless its hold marker is set — read by
-/// `boss_jobs::stranded::hold_reason`, the one definition the dock and
+/// `boss_jobs::stranded::marked`, the one definition the dock and
 /// the loading-dock station share.
 ///
 /// WHERE IT POINTS (backlog c851ed24, review fe7b1b1e F4). Since option
@@ -986,7 +1207,7 @@ pub(crate) fn unheld_review_refusal(kind: &str, slug: &str, step: &Value) -> Opt
     }
     let held = step
         .get("metadata")
-        .and_then(boss_jobs::stranded::hold_reason)
+        .and_then(|metadata| boss_jobs::stranded::marked(metadata, "hold"))
         .is_some();
     (!held).then(|| {
         format!(
@@ -1000,6 +1221,130 @@ pub(crate) fn unheld_review_refusal(kind: &str, slug: &str, step: &Value) -> Opt
             boss_jobs::car::LANDED_REVIEW_SLUG
         )
     })
+}
+
+/// A review the car's head already holds: the run its review step was
+/// last dispatched to, the head it read — which is the head the hold
+/// still stands at — and what it decided there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Decided {
+    pub review: String,
+    pub head: String,
+    pub verdict: String,
+    pub findings: String,
+}
+
+impl Decided {
+    /// What a forced re-review records on its run: the review it
+    /// overrides. The findings stay on that run, the one place they are
+    /// written.
+    fn record(&self) -> Value {
+        json!({ "review": self.review, "head": self.head, "verdict": self.verdict })
+    }
+}
+
+/// PURE: has `car`'s review already been DECIDED at the head its hold
+/// stands at, by `run` — the reviewer its review step names? (backlog
+/// 80d1c8f5). Measured 2026-10-18: review a0c2fb5f asked for CHANGES on
+/// car d94dbcc9 at head 215460a2, and a second reviewer, f47ce7de, was
+/// dispatched at that same head and spent ~123k tokens confirming the
+/// same blocking finding; nothing in the verb refused it.
+///
+/// The facts are the ones the repair door reads, from the one predicate
+/// both doors share ([`review_of_this_car`]): the run is the step's
+/// newest `agent_run`, an agent-run that did not build the car, opened on
+/// this car's review when it says where it was opened, recording a
+/// verdict OF THIS CAR — here, at exactly the hold's head. The auto-park
+/// handler moves the hold's head on every held re-gate, so a repaired car
+/// stands at a head no reviewer has read and is `None` here: a moved head
+/// is a fresh review. Any fact that fails is `None` — the dispatch
+/// proceeds as before, because this door only refuses a review that is
+/// provably already done.
+///
+/// A RELEASE is decided only while it is still OWED: when the review step
+/// already records a release by this same review, that release was spent
+/// and the hold over it was placed after it — the conductor's failed
+/// boarding check re-holds the car at the release head asking for a
+/// fresh review — so this is `None` and the fresh review is admitted
+/// (review b01eec95 B1). Refusing it named `boss release --review` for a
+/// release the release door refuses (`released_already`), and the two
+/// doors pointed at each other. The id compares without case, as that
+/// door's does. A CHANGES verdict never writes a release, so it needs no
+/// such guard.
+pub(crate) fn review_already_decided(car: &Value, run: &Value) -> Option<Decided> {
+    use boss_jobs::car_release as cr;
+    fn s<'a>(v: &'a Value, p: &str) -> &'a str {
+        v.pointer(p).and_then(Value::as_str).unwrap_or("").trim()
+    }
+    // Repair may read an earlier standing verdict (6ba6bb80), but this
+    // door judges only the reviewer the step most recently named.
+    if cr::dispatched_reviewer(car)? != s(run, "/id") {
+        return None;
+    }
+    let recorded = review_of_this_car(car, run).ok()?;
+    let run_id = s(run, "/id");
+    let verdict = s(recorded, "/verdict");
+    let head = cr::hold_sha(car)?;
+    let spent = verdict == cr::RELEASE
+        && crate::review_verdict::release_on(car)
+            .is_some_and(|r| r.review.trim().eq_ignore_ascii_case(run_id));
+    (cr::VERDICTS.contains(&verdict) && s(recorded, "/reviewed_sha") == head && !spent).then(|| {
+        Decided {
+            review: run_id.to_string(),
+            head: head.to_string(),
+            verdict: verdict.to_string(),
+            findings: s(recorded, "/findings").to_string(),
+        }
+    })
+}
+
+/// The refusal for a review dispatched at a head [`review_already_decided`]
+/// found decided: which review, at which head, and what is owed instead —
+/// runnable as printed: the repair dispatch names the car's own item and
+/// the re-gate's `--hold` carries the hold's own reason, since `boss gate
+/// --hold` takes one (review b01eec95 N1).
+pub(crate) fn decided_review_refusal(car: &Value, d: &Decided) -> String {
+    let at = |p: &str| car.pointer(p).and_then(Value::as_str).unwrap_or("").trim();
+    let car_id = at("/id");
+    let car_short = &car_id[..car_id.len().min(8)];
+    let head = &d.head[..d.head.len().min(12)];
+    let owed = if d.verdict == boss_jobs::car_release::RELEASE {
+        format!(
+            "It RELEASED the car there, so the review is decided and what is owed is the \
+             release: `boss release {car_short} --review {}`.",
+            d.review
+        )
+    } else {
+        let item = at(&format!("/metadata/{}", boss_jobs::car::BACKLOG_ITEM));
+        let repair = if item.is_empty() {
+            "`boss dispatch <the item this car answers>`".to_string()
+        } else {
+            format!("`boss dispatch {}`", &item[..item.len().min(8)])
+        };
+        let reason = boss_jobs::car_release::review_step(car)
+            .and_then(|s| s.pointer("/metadata/hold"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .unwrap_or("<what it waits for>");
+        format!(
+            "It asked for CHANGES there, and the rework it asked for is:\n\n{}\n\n  \
+             Repair the car on its own branch ({repair} dispatches the repair) and re-gate it \
+             with its park flags and --hold '{}'; the moved head is a fresh review.",
+            d.findings,
+            reason.replace('\'', r"'\''")
+        )
+    };
+    format!(
+        "car {car_short}'s review is already decided at its head {head}: review run {} judged \
+         {:?} at exactly the head the hold stands at, and the head has not moved, so a reviewer \
+         dispatched now re-judges the same tree (backlog 80d1c8f5).\n  {owed}\n  To review this \
+         head again anyway, `boss dispatch {car_short} --step {} --force`, which records the \
+         override on the run as `rereview`; nothing claimed, nothing filed",
+        d.review,
+        d.verdict,
+        boss_jobs::car::REVIEW_SLUG
+    )
 }
 
 /// Whether a run gets a git worktree of its own — decided by the LANE
@@ -1422,12 +1767,19 @@ pub(crate) fn landed_work_refusal(item_id: &str, cars: &[Value]) -> Option<Strin
 /// or aboard a train, and a second run builds it again. A car that
 /// closed without merging (abandoned) carries nothing, and a landed one
 /// is the landed door's, whose refusal names the proof to run.
-pub(crate) fn in_flight_car_refusal(item_id: &str, cars: &[Value]) -> Option<String> {
-    let car = cars.iter().find(|c| {
+///
+/// This finds the car; [`in_flight_refusal_of`] words the refusal, which
+/// the dispatch gives only when that car is not owed a repair
+/// ([`repair_owed`], backlog 99b7ae76).
+fn in_flight_car<'a>(item_id: &str, cars: &'a [Value]) -> Option<&'a Value> {
+    cars.iter().find(|c| {
         c.pointer("/metadata/backlog_item").and_then(Value::as_str) == Some(item_id)
             && c.get("status").and_then(Value::as_str) == Some("open")
             && !boss_jobs::car::is_landed(c)
-    })?;
+    })
+}
+
+fn in_flight_refusal_of(item_id: &str, car: &Value) -> String {
     let branch = car
         .pointer("/metadata/branch")
         .and_then(Value::as_str)
@@ -1435,14 +1787,447 @@ pub(crate) fn in_flight_car_refusal(item_id: &str, cars: &[Value]) -> Option<Str
     let full = car.get("id").and_then(Value::as_str).unwrap_or("?");
     let id = &full[..full.len().min(8)];
     let item = &item_id[..item_id.len().min(8)];
-    Some(format!(
+    format!(
         "this packet's fix is ALREADY A CAR: {id} ({branch}) is open — gated green and parked \
          or aboard a train, since a car is filed only on a green.\n  \
          Dispatching it spends an agent run building the same fix again (5cb6530a). Let that \
          car land; its proof closes this packet.\n    \
          boss dispatch {item} --force\n      \
          if the packet asks for MORE than that car carries, say so and build the rest"
-    ))
+    )
+}
+
+/// A REPAIR, NOT A DUPLICATE (backlog 99b7ae76). The car a review sent
+/// back: which car, on which branch, at which head, by which review run,
+/// and what that review found. The in-flight door admits a dispatch
+/// carrying one; the brief prints it and the run records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Repair {
+    pub car: String,
+    pub branch: String,
+    /// The head the hold was placed at, which is the head the review read.
+    pub head: String,
+    /// The review run whose verdict was `changes`.
+    pub review: String,
+    pub findings: String,
+}
+
+impl Repair {
+    /// What the run packet records of it. The findings stay on the review
+    /// run, the one place they are written; the brief prints them.
+    fn record(&self) -> Value {
+        json!({ "car": self.car, "branch": self.branch, "head": self.head,
+                "review": self.review })
+    }
+}
+
+/// PURE: is `car` owed a repair on the strength of `run`'s review? The
+/// in-flight door refused every open car alike, so a car whose
+/// adversarial review returned `changes` — which cannot board until it is
+/// repaired on its own branch — was answered "let that car land", and the
+/// only road to the repair was `--force`, which also skips the duplicate
+/// guard (measured 2026-10-16 on car ff1b7a35, review fae63341, backlog
+/// 99b7ae76).
+///
+/// It reads the run the review step was DISPATCHED to — the newest, since
+/// each dispatch writes the step's `agent_run` over the last — or an
+/// earlier run opened on that step when it carries the newest verdict
+/// ([`newest_verdict_run`], backlog 6ba6bb80), and the head
+/// the hold was placed at, which the auto-park handler moves on every
+/// held re-gate. So a review of an older head means the repair is
+/// already in and owes a review, not another build. `Ok` only when every
+/// fact holds; each refusal names the fact that failed. The verdict is
+/// read, not executor-verified as a release must be: what it admits is a
+/// run on a car that stays held until a release, never the boarding —
+/// so a car a release already freed is owed nothing (backlog 291a65bf),
+/// while one whose hold was cleared with no release is held again at the
+/// dock and still owed its repair (review b67deef0 F1).
+pub(crate) fn repair_owed(car: &Value, run: &Value) -> Result<Repair, String> {
+    use boss_jobs::car_release as cr;
+    fn s<'a>(v: &'a Value, p: &str) -> &'a str {
+        v.pointer(p).and_then(Value::as_str).unwrap_or("").trim()
+    }
+    let car_id = s(car, "/id");
+    let short = |id: &str| id[..id.len().min(8)].to_string();
+    let step = cr::holdable(car)?;
+    // A RELEASED CAR IS OWED NOTHING (backlog 291a65bf). The release door
+    // writes `hold: null` and a `release` record, and keeps `hold_sha`
+    // and the step's `agent_run`, so every fact below can still hold on a
+    // car it already freed — over a newer `changes` verdict when `boss
+    // release --review` named an earlier reviewer. A repair pushed there
+    // pulls a boardable car back to gated-then-changed.
+    //
+    // KEYED ON THE RELEASE RECORD, NOT ON A MISSING HOLD (review b67deef0
+    // F1). A review hold cleared bare — a bare `boss release`, a raw
+    // metadata PATCH — leaves the same `hold: null` beside `hold_sha` and
+    // no release, and `mutating_verb::dock` holds that car again at the
+    // same head; its `changes` verdict still stands, so its repair is
+    // still owed. The dock reads the release record first, and so does
+    // this. The hold is read by `stranded::marked`, the definition
+    // the dock's holds and the release door's `JudgedHold` share.
+    let held = step
+        .get("metadata")
+        .and_then(|metadata| boss_jobs::stranded::marked(metadata, "hold"))
+        .is_some();
+    if let (false, Some(release)) = (held, crate::review_verdict::release_on(car)) {
+        return Err(format!(
+            "car {}'s review step carries no hold — the release at {} naming review run {} \
+             lifted it (its hold_sha is kept), so the dock boards the car on that release and \
+             no repair is owed",
+            short(car_id),
+            short(release.sha),
+            short(release.review)
+        ));
+    }
+    let recorded = review_of_this_car(car, run)?;
+    let run_id = s(run, "/id");
+    let verdict = s(recorded, "/verdict");
+    if verdict != "changes" {
+        return Err(format!(
+            "review run {}'s verdict is {verdict:?}, not \"changes\"",
+            short(run_id)
+        ));
+    }
+    let head = cr::hold_sha(car).ok_or_else(|| {
+        format!(
+            "car {}'s hold records no head, so a review cannot be placed on it",
+            short(car_id)
+        )
+    })?;
+    let reviewed = s(recorded, "/reviewed_sha");
+    if reviewed != head {
+        return Err(format!(
+            "review run {} asked for changes at {}, and the car's hold now stands at {} — the \
+             repair is in and owes a review, not another build",
+            short(run_id),
+            short(reviewed),
+            short(head)
+        ));
+    }
+    Ok(Repair {
+        car: car_id.to_string(),
+        branch: cr::branch_of(car)
+            .map_err(|e| format!("{e:#}"))?
+            .to_string(),
+        head: head.to_string(),
+        review: run_id.to_string(),
+        findings: s(recorded, "/findings").to_string(),
+    })
+}
+
+/// PURE: the review `run` recorded OF `car`, when `run` is the reviewer
+/// `car`'s review step was last dispatched to, or an earlier run carrying
+/// its newest verdict — the facts the repair door
+/// ([`repair_owed`]) and the decided-review door
+/// ([`review_already_decided`]) both stand on, written once so the two
+/// cannot drift (review b01eec95 N2; CLAUDE.md §9a): the run is the step's
+/// newest `agent_run` or an earlier review of this car, an agent-run that
+/// did not build the car, opened on
+/// this car's review when it says where it was opened, and recording a
+/// review whose `car` is this car. Each refusal names the fact that failed.
+fn review_of_this_car<'a>(car: &Value, run: &'a Value) -> Result<&'a Value, String> {
+    use boss_jobs::car_release as cr;
+    fn s<'a>(v: &'a Value, p: &str) -> &'a str {
+        v.pointer(p).and_then(Value::as_str).unwrap_or("").trim()
+    }
+    let car_id = s(car, "/id");
+    let short = |id: &str| id[..id.len().min(8)].to_string();
+    let review = cr::dispatched_reviewer(car).ok_or_else(|| {
+        format!(
+            "no reviewer has been dispatched to car {}'s review step yet",
+            short(car_id)
+        )
+    })?;
+    let run_id = s(run, "/id");
+    // An EARLIER review run is judged when it carries the newest verdict
+    // (backlog 6ba6bb80) — then it must say it was opened on this car;
+    // the check below holds it to the review step.
+    if run_id != review && s(run, "/metadata/packet") != car_id {
+        return Err(format!(
+            "the run read is {}, which was not opened on car {}'s review, and its review step \
+             names {}",
+            short(run_id),
+            short(car_id),
+            short(review)
+        ));
+    }
+    if s(run, "/kind") != "agent-run" {
+        return Err(format!("{} is not an agent-run", short(run_id)));
+    }
+    if cr::builder_run(car) == Some(run_id) {
+        return Err(format!(
+            "run {} built car {} — the builder's review is no review",
+            short(run_id),
+            short(car_id)
+        ));
+    }
+    let opened_on = s(run, "/metadata/packet");
+    if !opened_on.is_empty()
+        && (opened_on != car_id || s(run, "/metadata/step") != boss_jobs::car::REVIEW_SLUG)
+    {
+        return Err(format!(
+            "run {} was opened on {} `{}`, not on car {}'s review",
+            short(run_id),
+            short(opened_on),
+            s(run, "/metadata/step"),
+            short(car_id)
+        ));
+    }
+    let key = format!("/metadata/{}", cr::REVIEW_KEY);
+    let recorded = run.pointer(&key).ok_or_else(|| {
+        format!(
+            "review run {} records no verdict yet (boss review)",
+            short(run_id)
+        )
+    })?;
+    // PRESENT BUT NOT AN OBJECT is refused as malformed, never read as
+    // "no verdict" (review 3335b3aa B1): `newest_verdict_run` judges such
+    // a run in place of an older verdict, so this is where it must stop.
+    if !recorded.is_object() {
+        return Err(format!(
+            "review run {} records a malformed review record ({recorded}) — refused, not read \
+             as a verdict",
+            short(run_id)
+        ));
+    }
+    if s(recorded, "/car") != car_id {
+        return Err(format!(
+            "run {}'s review is of car {}, not {}",
+            short(run_id),
+            short(s(recorded, "/car")),
+            short(car_id)
+        ));
+    }
+    Ok(recorded)
+}
+
+/// Every agent run opened on `car_id`'s review step — the step's
+/// `agent_run` names only the newest (backlog 6ba6bb80).
+pub(crate) fn review_runs_query(car_id: &str) -> String {
+    let doc = json!({ "packet": car_id, "step": boss_jobs::car::REVIEW_SLUG }).to_string();
+    format!(
+        "/api/jobs?kind=agent-run&metadata={}&limit=200",
+        percent_encoding::utf8_percent_encode(&doc, crate::job::QUERY_VALUE)
+    )
+}
+
+/// PURE: the review run a repair is judged on — the newest by
+/// `opened_at` of the runs opened on `car_id`'s review step that CARRY
+/// a verdict (backlog 6ba6bb80). Measured 2026-10-21: seven held cars
+/// had a newer review run that closed `refused` with no verdict, and
+/// reading only the newest run let that refusal mask the standing
+/// `changes` at the same head. A run with no review key is skipped
+/// however new it is; `None` when no run carries one. A run whose key
+/// is PRESENT counts whatever its shape, so a malformed record is the
+/// one judged — and refused by [`repair_owed`] — rather than skipped
+/// for an older verdict (review 3335b3aa B1: skipping it failed open
+/// where main refused). Ordered by the run's `opened_at`, not the
+/// record's own `at`: the step is claimed by one run at a time, so
+/// overlapping runs are rare (review 3335b3aa N1).
+pub(crate) fn newest_verdict_run<'a>(car_id: &str, runs: &'a [Value]) -> Option<&'a Value> {
+    let at = |r: &Value| {
+        r.get("opened_at")
+            .and_then(Value::as_str)
+            .and_then(|t| t.parse::<chrono::DateTime<chrono::Utc>>().ok())
+    };
+    runs.iter()
+        .filter(|r| {
+            r.pointer("/metadata/packet").and_then(Value::as_str) == Some(car_id)
+                && r.pointer("/metadata/step").and_then(Value::as_str)
+                    == Some(boss_jobs::car::REVIEW_SLUG)
+                && r.pointer(&format!("/metadata/{}", boss_jobs::car_release::REVIEW_KEY))
+                    .is_some()
+        })
+        .max_by_key(|r| at(r))
+}
+
+/// What the repair read ([`read_repair`]) learned of the open car naming
+/// a packet. THREE outcomes, not two (review 097cb662 B1): a read that
+/// failed and a judgement that no repair is owed were one `Err(String)`
+/// until 2026-10-20, so the callers that are quiet on "not owed" — a
+/// forced dispatch, a hand-run brief — were just as quiet when nothing
+/// had been judged at all, and a builder repaired blind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepairRead {
+    /// A review asked for changes at the head the hold stands at.
+    Owed(Repair),
+    /// The car and its reviewer were read, and no repair is owed: the
+    /// fact that failed ([`repair_owed`]).
+    NotOwed(String),
+    /// A read the judgement needs failed, naming that read: nothing was
+    /// judged, so nothing is known about a repair.
+    Unread(String),
+}
+
+/// Read the car in full (a list row carries no step metadata) and the
+/// newest verdict-bearing run, then judge them ([`repair_owed`]). Failed
+/// or incomplete reads are Unread; only the completed judgement can
+/// establish NotOwed (review024e1227).
+async fn read_repair<F, Fut>(car_id: &str, fetch: F) -> RepairRead
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
+    let read = |path: String| {
+        let fut = fetch(path.clone());
+        async move {
+            fut.await
+                .map_err(|e| format!("{path} could not be read ({e:#})"))?
+                .ok_or_else(|| format!("{path} answered no body"))
+        }
+    };
+    let car = match read(format!("/api/jobs/{car_id}")).await {
+        Ok(car) => car,
+        Err(why) => return RepairRead::Unread(why),
+    };
+    let review = boss_jobs::car_release::dispatched_reviewer(&car)
+        .unwrap_or_default()
+        .to_string();
+    let run = if review.is_empty() {
+        Value::Null
+    } else {
+        let query = review_runs_query(car_id);
+        let listing = match read(query.clone()).await {
+            Ok(listing) => listing,
+            Err(why) => return RepairRead::Unread(why),
+        };
+        let Some(runs) = listing.get("data").and_then(Value::as_array) else {
+            return RepairRead::Unread(format!("{query} answered no rows"));
+        };
+        let total = listing.get("total").and_then(Value::as_u64);
+        if total != Some(runs.len() as u64) {
+            return RepairRead::Unread(format!(
+                "{query} answered {} rows of {} — the newest verdict cannot be judged from part \
+                 of the review runs",
+                runs.len(),
+                total.map_or("no total".to_string(), |t| t.to_string())
+            ));
+        }
+        let judged = newest_verdict_run(car_id, runs)
+            .and_then(|r| r.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or(&review);
+        match read(format!("/api/jobs/{judged}")).await {
+            Ok(run) => run,
+            Err(why) => return RepairRead::Unread(why),
+        }
+    };
+    match repair_owed(&car, &run) {
+        Ok(r) => RepairRead::Owed(r),
+        Err(not) => RepairRead::NotOwed(not),
+    }
+}
+
+/// The line a caller that admits an unjudged car SAYS (review 097cb662
+/// B1): the car, the read that failed, and what the brief therefore
+/// lacks. Both `boss dispatch --force` and `boss brief` print it.
+pub(crate) fn unread_repair_line(car: &Value, why: &str) -> String {
+    let id = car.get("id").and_then(Value::as_str).unwrap_or("?");
+    format!(
+        "car {} names this packet, and whether it is owed a repair was NOT judged: {why} — \
+         so this brief carries no REPAIR section (f2b4385a)",
+        &id[..id.len().min(8)]
+    )
+}
+
+/// What the cars naming a packet say about it: the list as the server
+/// serves it, and the open, unmerged car among them with what its
+/// repair read learned ([`read_repair`]).
+pub(crate) struct ItemCars {
+    pub cars: Vec<Value>,
+    pub in_flight: Option<(Value, RepairRead)>,
+}
+
+/// THE IN-FLIGHT DOOR'S VERDICT on the open car naming `item_id`: the
+/// repair the run is briefed with, and the line said on stderr — or, as
+/// `Err`, the refusal. Unforced, a car not owed a repair and a car whose
+/// repair could not be read are both refused (99b7ae76). Forced, both
+/// are admitted with no repair; only the UNREAD one is said, because
+/// nothing was judged there, while "not owed" stays quiet (f2b4385a's
+/// excludes; review 097cb662 B1).
+pub(crate) fn in_flight_door(
+    item_id: &str,
+    in_flight: Option<(Value, RepairRead)>,
+    force: bool,
+) -> std::result::Result<(Option<Repair>, Option<String>), String> {
+    match in_flight {
+        None => Ok((None, None)),
+        Some((_, RepairRead::Owed(r))) => {
+            let said = format!(
+                "boss dispatch: car {} ({}) is held, and review run {} asked for changes at its \
+                 head {} — dispatched as that car's REPAIR on its own branch, not a second \
+                 build (99b7ae76)",
+                &r.car[..r.car.len().min(8)],
+                r.branch,
+                &r.review[..r.review.len().min(8)],
+                &r.head[..r.head.len().min(12)]
+            );
+            Ok((Some(r), Some(said)))
+        }
+        Some((car, RepairRead::NotOwed(not) | RepairRead::Unread(not))) if !force => Err(format!(
+            "{}\n  not a repair: {not}. A car whose review asked for changes at the head it \
+             stands at is dispatched as its repair without --force (99b7ae76).",
+            in_flight_refusal_of(item_id, &car)
+        )),
+        Some((_, RepairRead::NotOwed(_))) => Ok((None, None)),
+        Some((car, RepairRead::Unread(why))) => Ok((
+            None,
+            Some(format!(
+                "boss dispatch --force: {}",
+                unread_repair_line(&car, &why)
+            )),
+        )),
+    }
+}
+
+/// THE ONE REPAIR READ (backlog f2b4385a). Both `boss dispatch` and
+/// `boss brief` call it, so a car a review sent back with changes is
+/// named in every brief its packet gets. Until then the read sat inside
+/// the dispatch's `if !force`, and `boss brief` passed no repair at all:
+/// a forced or hand-briefed builder was told nothing of the car, its head
+/// or the findings, and session B wrote them into a prompt by hand on
+/// 2026-10-20 (399ee6c3). The verdict is the CALLER's: the dispatch
+/// refuses a car not owed a repair unless forced; the brief names none.
+pub(crate) async fn read_item_cars<F, Fut>(item_id: &str, fetch: F) -> Result<ItemCars>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
+    let cars = fetch(cars_for_item_query(item_id))
+        .await
+        .and_then(crate::train::rows)?;
+    let in_flight = match in_flight_car(item_id, &cars) {
+        Some(car) => {
+            let car_id = car.get("id").and_then(Value::as_str).unwrap_or_default();
+            Some((car.clone(), read_repair(car_id, &fetch).await))
+        }
+        None => None,
+    };
+    Ok(ItemCars { cars, in_flight })
+}
+
+/// The brief's section for a repair run, placed under the packet.
+pub(crate) fn repair_section(r: &Repair) -> String {
+    let car = &r.car[..r.car.len().min(8)];
+    format!(
+        "== REPAIR — this packet's car came back from review with CHANGES; repair it on its \
+         own branch ==\n\n\
+         car:     {}\n\
+         branch:  {}\n\
+         head:    {}   (the head the hold stands at, and the head the review read)\n\
+         review:  agent-run {}\n\n\
+         The review's findings, verbatim from that run:\n\n{}\n\n\
+         This run REPAIRS car {car}; it does not build the fix again (backlog 99b7ae76). So \
+         rule 1's branch-from-origin/main does not apply: fetch, then check out the car's \
+         branch at the forge, `git -C <your worktree> checkout -b {} origin/{}`, and confirm \
+         its head is the head above. If it is not, the branch moved after the review: build \
+         nothing and report what you found. Commit the repair on top, push it as a \
+         fast-forward, and gate the new head with the same park flags and the `--hold` the \
+         TRUST BOUNDARY section prints when there is one, so the green refreshes this car in \
+         place; `boss gate --rebase` carries main in. Answer every blocking finding, and say \
+         in the report which commit answers which.\n",
+        r.car, r.branch, r.head, r.review, r.findings, r.branch, r.branch
+    )
 }
 
 /// The whole verb against an explicit base — the seam the wire tests
@@ -1454,7 +2239,7 @@ pub(crate) async fn dispatch_at(
     repo: &Path,
     packet_ref: &str,
     step_slug: Option<&str>,
-    station: Option<&str>,
+    pulled: Option<&Pulled<'_>>,
     over: &Overrides,
     force: bool,
     actor: &str,
@@ -1462,9 +2247,11 @@ pub(crate) async fn dispatch_at(
     host: &str,
     source: BriefSource<'_>,
 ) -> Result<Dispatched> {
+    // No `--force-standard` here: the queue (`--next`) and the hook take
+    // no why, so the urgent-first door is judged plainly on this seam.
     dispatch_to(
-        http, base, repo, packet_ref, step_slug, station, over, force, actor, owner, host, source,
-        None,
+        http, base, repo, packet_ref, step_slug, pulled, over, force, None, actor, owner, host,
+        source, None,
     )
     .await
 }
@@ -1484,14 +2271,20 @@ pub(crate) async fn dispatch_to(
     // The station the claim PULLS FROM, when this dispatch came out
     // of a queue (`--next`). Named on the claim, so the door checks
     // membership and capability against the queue the work was taken
-    // from — a dispatch that names no station keeps today's claim.
-    station: Option<&str>,
+    // from — a dispatch that names no station keeps today's claim. It
+    // carries the walk that chose the packet, which the run records
+    // (backlog c9dd306a); none means the caller named the packet.
+    pulled: Option<&Pulled<'_>>,
     over: &Overrides,
     // Dispatch this packet even though a car carrying its fix has
     // already landed — the operator saying "the packet asks for more
     // than that car carried". `--next` never sets it: the queue is
     // exactly where nobody is reading each choice.
     force: bool,
+    // `--force-standard --why`: take this STANDARD step although the
+    // caller holds ready urgent work, with the why recorded on the
+    // packet and the run before the claim (backlog 90bff1f3).
+    force_standard: Option<&str>,
     actor: &str,
     owner: &str,
     host: &str,
@@ -1499,8 +2292,21 @@ pub(crate) async fn dispatch_to(
     launch: Option<&crate::dispatch_launch::Request>,
 ) -> Result<Dispatched> {
     dispatch_to_with_content(
-        http, base, repo, packet_ref, step_slug, station, over, force, actor, owner, host, source,
-        launch, None,
+        http,
+        base,
+        repo,
+        packet_ref,
+        step_slug,
+        pulled,
+        over,
+        force,
+        force_standard,
+        actor,
+        owner,
+        host,
+        source,
+        launch,
+        None,
     )
     .await
 }
@@ -1512,9 +2318,10 @@ async fn dispatch_to_with_content(
     repo: &Path,
     packet_ref: &str,
     step_slug: Option<&str>,
-    station: Option<&str>,
+    pulled: Option<&Pulled<'_>>,
     over: &Overrides,
     force: bool,
+    force_standard: Option<&str>,
     actor: &str,
     owner: &str,
     host: &str,
@@ -1523,6 +2330,7 @@ async fn dispatch_to_with_content(
     content_base: Option<&str>,
 ) -> Result<Dispatched> {
     use reqwest::Method;
+    let station = pulled.map(|p| p.station);
 
     // Every call signed as the actor the verb resolved: the run is
     // theirs, and so is the claim.
@@ -1575,8 +2383,57 @@ async fn dispatch_to_with_content(
     if let Some(why) = discarded_stdout_refusal() {
         bail!("{why}");
     }
+    if kind == boss_jobs::regions::CAR_KIND && slug == boss_jobs::car::REVIEW_SLUG {
+        crate::steps::Wire::at(
+            base.to_string(),
+            Some(crate::identity::Caller {
+                id: actor.to_string(),
+                source: crate::identity::Source::Env,
+            }),
+        )?
+        .refuse_collected_car(&job, "boss dispatch --step review")
+        .await?;
+    }
     if let Some(why) = unheld_review_refusal(&kind, &slug, step) {
         bail!("{why}");
+    }
+
+    // THE DECIDED-REVIEW DOOR (backlog 80d1c8f5): a held car's review
+    // whose last reviewer already recorded a verdict at the head the
+    // hold stands at is refused before the claim — a second reviewer
+    // there re-judges an unmoved tree. `--force` re-reviews it on the
+    // record. Best-effort on the READ only, like the landed-work door
+    // below: an unreadable prior run is SAID and the dispatch proceeds.
+    let mut rereview = None;
+    if kind == boss_jobs::regions::CAR_KIND
+        && slug == boss_jobs::car::REVIEW_SLUG
+        && let Some(prior) = boss_jobs::car_release::dispatched_reviewer(&job)
+    {
+        match api_at(Method::GET, format!("/api/jobs/{prior}"), None).await {
+            Ok(Some(run)) => {
+                if let Some(d) = review_already_decided(&job, &run) {
+                    if !force {
+                        bail!("{}", decided_review_refusal(&job, &d));
+                    }
+                    eprintln!(
+                        "boss dispatch: review run {} already judged {:?} at head {} — \
+                         re-reviewed on --force, recorded on the run as `rereview` (80d1c8f5)",
+                        &d.review[..d.review.len().min(8)],
+                        d.verdict,
+                        &d.head[..d.head.len().min(12)]
+                    );
+                    rereview = Some(d);
+                }
+            }
+            Ok(None) => eprintln!(
+                "boss dispatch: the review step's last run {prior} answered no body — the \
+                 decided-review door is not judged for this dispatch"
+            ),
+            Err(e) => eprintln!(
+                "boss dispatch: could not read the review step's last run {prior} ({e:#}) — \
+                 the decided-review door is not judged for this dispatch"
+            ),
+        }
     }
 
     // THE LANDED-WORK DOOR (a7837d81): a packet a merged car already
@@ -1591,22 +2448,105 @@ async fn dispatch_to_with_content(
     // page) used to read as "no car names this packet" through the old
     // empty-reading rows helper, which is a clean door that never looked
     // (backlog 7b7e0529).
-    if !force {
-        match api_at(Method::GET, cars_for_item_query(&id), None)
-            .await
-            .and_then(crate::train::rows)
-        {
-            Ok(cars) => {
-                if let Some(why) =
-                    landed_work_refusal(&id, &cars).or_else(|| in_flight_car_refusal(&id, &cars))
-                {
-                    bail!("{why}");
-                }
+    //
+    // A REPAIR IS NOT A DUPLICATE (backlog 99b7ae76): an open car whose
+    // newest review asked for changes at the head it stands at cannot
+    // land without a repair on its own branch, so the in-flight door
+    // admits the dispatch as that repair instead of refusing it, and the
+    // brief and the run carry the car, head, review and findings. Any
+    // other open car is refused as before, now saying why it is not one.
+    //
+    // `--force` SKIPS THE REFUSALS, NEVER THE READ (backlog f2b4385a):
+    // the whole block used to sit under `if !force`, so a forced dispatch
+    // onto a car owed a repair briefed the builder without the car, its
+    // head or the findings. The repair is judged by the one read `boss
+    // brief` also calls ([`read_item_cars`]), forced or not.
+    let mut repair = None;
+    match read_item_cars(&id, |path| api_at(Method::GET, path, None)).await {
+        Ok(read) => {
+            if !force && let Some(why) = landed_work_refusal(&id, &read.cars) {
+                bail!("{why}");
             }
-            Err(e) => eprintln!(
-                "boss dispatch: could not read the cars that name {id} ({e:#}) — the \
-                 landed-work door is not judged for this dispatch"
-            ),
+            // A failed car or reviewer read is NOT "not owed" (review
+            // 097cb662 B1): forced, it is said, never swallowed.
+            let (owed, said) = in_flight_door(&id, read.in_flight, force)
+                .map_err(|why| anyhow::anyhow!("{why}"))?;
+            if let Some(line) = said {
+                eprintln!("{line}");
+            }
+            repair = owed;
+        }
+        Err(e) => eprintln!(
+            "boss dispatch: could not read the cars that name {id} ({e:#}) — neither the \
+             landed-work door nor a repair is judged for this dispatch"
+        ),
+    }
+
+    // THE URGENT-FIRST DOOR (backlog 90bff1f3): a STANDARD step is
+    // refused, before the claim, while the caller holds ready urgent work
+    // it could start instead — `crate::urgent_first` says what counts and
+    // why. Judged on a rendered dispatch only (the verb and `--next`): a
+    // dispatch the PreToolUse hook makes cannot refuse, since the hook
+    // exits 0 whatever this answers. `--force-standard` passes it, and
+    // its why is written to the packet just before the claim — after the
+    // doors below that can still refuse (review e22dd1c6) — so the
+    // override exists only with its record; a write that fails refuses.
+    // A car is judged at its item's rank when that is better (F1).
+    let mut urgent_override = None;
+    if matches!(source, BriefSource::Rendered) {
+        use crate::urgent_first::{self as uf, Verdict};
+        let get = |path: String| api_at(Method::GET, path, None);
+        let verdict = match uf::rank(&get, &job).await {
+            Ok(rank) if rank < 2 => {
+                if force_standard.is_some() {
+                    eprintln!(
+                        "boss dispatch: {} is {} work — --force-standard overrides nothing and \
+                         records nothing",
+                        &id[..8],
+                        uf::word(rank)
+                    );
+                }
+                None
+            }
+            Ok(_) => Some(uf::judge(&get, &id).await),
+            Err(why) => Some(Verdict::Unread(format!("the rank of {}: {why}", &id[..8]))),
+        };
+        if let Some(verdict) = verdict {
+            match (&verdict, force_standard) {
+                (Verdict::Clear, None) => {}
+                (Verdict::Clear, Some(_)) => eprintln!(
+                    "boss dispatch: nothing urgent is ready for you — --force-standard \
+                     overrides nothing and records nothing"
+                ),
+                (Verdict::Unread(why), _) => eprintln!(
+                    "boss dispatch: the urgent-first door could not judge this dispatch ({why}) \
+                     — admitted unjudged (90bff1f3)"
+                ),
+                (
+                    Verdict::Holding {
+                        who,
+                        urgent,
+                        skipped,
+                    },
+                    None,
+                ) => bail!(
+                    "{}",
+                    uf::refusal(
+                        &id,
+                        &slug,
+                        who,
+                        urgent,
+                        skipped,
+                        boss_clock_client::wall_now()
+                    )
+                ),
+                (Verdict::Holding { .. }, Some(_)) => {}
+            }
+            if let Some(why) = force_standard
+                && !matches!(verdict, Verdict::Clear)
+            {
+                urgent_override = Some(uf::note(&slug, actor, why, &verdict));
+            }
         }
     }
 
@@ -1646,7 +2586,13 @@ async fn dispatch_to_with_content(
                 let why = row
                     .as_ref()
                     .and_then(|r| pinned_skew_refusal(&job, step, r))
-                    .unwrap_or_else(|| no_block_refusal_in(repo, &kind, &slug));
+                    .unwrap_or_else(|| {
+                        let owner = row
+                            .as_ref()
+                            .and_then(|r| r.get("owning_team"))
+                            .and_then(Value::as_str);
+                        no_block_refusal_in(repo, &kind, &slug, owner)
+                    });
                 anyhow::anyhow!("{why}")
             })?;
             (block, row)
@@ -1693,6 +2639,35 @@ async fn dispatch_to_with_content(
     // for it, else the actor running this verb, as before.
     let run_agent = plan.as_ref().map_or(actor, |p| p.harness.actor.as_str());
 
+    // THE URGENT-FIRST OVERRIDE'S RECORD, written here, after every door
+    // above that can still refuse (the block, the venue, the launch plan)
+    // and just before the claim — it was written before them, so a
+    // dispatch they refused left a note for an override that never took
+    // effect (review e22dd1c6). The note says it precedes the claim.
+    if let Some(record) = &urgent_override {
+        use crate::urgent_first as uf;
+        api_at(
+            Method::PATCH,
+            format!("/api/jobs/{id}/metadata"),
+            Some(json!({ uf::NOTE_KEY: record })),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "recording --force-standard's why on {} — refused: an override is taken only \
+                 with its record, and nothing is claimed",
+                &id[..8]
+            )
+        })?;
+        eprintln!(
+            "boss dispatch: URGENT FIRST overridden for `{slug}` on {} — the why is on its `{}` \
+             and will ride the run as `{}`",
+            &id[..8],
+            uf::NOTE_KEY,
+            uf::RUN_KEY
+        );
+    }
+
     // CLAIM FIRST. A step someone else holds is a refusal naming the
     // holder, and it must come before anything is filed. The ONE door:
     // it runs the station's capability gate when a station is named
@@ -1714,7 +2689,9 @@ async fn dispatch_to_with_content(
     // None), so a queue-pulled launch would be refused there, loudly. It
     // takes a READY step from the coordinator's nomination, never an
     // ACTIVE one: a step the coordinator already holds is refused 409
-    // naming it, nothing filed, and the hand-over is a release first.
+    // naming it, nothing filed, and the hand-over is a release first —
+    // which the refusal now names when the holder is the caller
+    // ([`release_first`], backlog 5487223c).
     let mut query: Vec<String> = Vec::new();
     if let Some(s) = station {
         query.push(format!("station={s}"));
@@ -1731,7 +2708,7 @@ async fn dispatch_to_with_content(
     } else {
         format!("/api/jobs/{id}/steps/{step_id}/claim?{}", query.join("&"))
     };
-    let claim_receipt = api_at(Method::POST, claim_path, None)
+    let claimed = api_at(Method::POST, claim_path, None)
         .await
         .with_context(|| match claimed_for {
             Some(nominee) => format!(
@@ -1739,10 +2716,42 @@ async fn dispatch_to_with_content(
                 &id[..8]
             ),
             None => format!("claiming `{slug}` on {} as {actor}", &id[..8]),
-        })?
-        .context(
-            "the claim door returned no receipt; the claimed step needs releasing before retry",
-        )?;
+        });
+    // THE CALLER'S OWN ACTIVE HOLD NAMES THE RELEASE (backlog 5487223c):
+    // the 409 named the holder and stopped there. When that holder is
+    // the caller, the refusal says the one way through. The registry is
+    // read only on this path, and only to recognise the caller's other
+    // spelling; an unreadable registry leaves the refusal as it was.
+    let claimed = match claimed {
+        Err(e) => match claim_refusal(&e) {
+            Some((holder, status)) if status == "active" => {
+                let agents = if holder == actor {
+                    Vec::new()
+                } else {
+                    api_at(Method::GET, "/api/agents".to_string(), None)
+                        .await
+                        .ok()
+                        .and_then(|b| crate::train::rows(b).ok())
+                        .unwrap_or_default()
+                };
+                if holder_is_caller(&holder, actor, &agents) {
+                    // The run edge on the step this dispatch read before
+                    // its claim (backlog f80d8024).
+                    let run = step
+                        .pointer(&format!("/metadata/{}", boss_jobs::agent_runs::EDGE_KEY))
+                        .and_then(Value::as_str);
+                    Err(e.context(release_first(&id[..8], &slug, &holder, run)))
+                } else {
+                    Err(e)
+                }
+            }
+            _ => Err(e),
+        },
+        ok => ok,
+    };
+    let claim_receipt = claimed?.context(
+        "the claim door returned no receipt; the claimed step needs releasing before retry",
+    )?;
 
     // The brief, rendered ONCE: it is the prompt and the record. The
     // hook hands the prompt the agent was already given, which is the
@@ -1754,18 +2763,43 @@ async fn dispatch_to_with_content(
     // already made `active` — a status one write out of date on every
     // dispatch there has ever been. The claim is the door's effect, so
     // the brief reads it back rather than assuming it.
+    //
+    // AND READ AS BYTES (design e72dc7c9): a packet whose pinned protocol
+    // declares the bounded contract retains this exact response as its
+    // snapshot, so the bytes are kept before anything parses them. One
+    // read either way — the legacy brief is rendered from the same parse.
+    let needs_releasing = || {
+        format!(
+            "claimed `{slug}` on {} — the step is held by {} and needs releasing, and no run \
+             was admitted",
+            &id[..8],
+            claimed_for.unwrap_or(actor)
+        )
+    };
+    let mut bounded: Option<BoundedInputs> = None;
     let brief = match source {
         BriefSource::Rendered => {
-            let claimed = api_at(Method::GET, format!("/api/jobs/{id}"), None)
-                .await?
-                .with_context(|| {
-                    format!(
-                        "claimed `{slug}` on {} and then could not read the packet back to \
-                         brief from — the step is held by {} and needs releasing",
-                        &id[..8],
-                        claimed_for.unwrap_or(actor)
-                    )
-                })?;
+            let raw = crate::sor_client::api_bytes_at_signed(
+                http,
+                base,
+                &format!("/api/jobs/{id}"),
+                crate::identity::Signature::As(actor.to_string()),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "claimed `{slug}` on {} and then could not read the packet back to \
+                     brief from — the step is held by {} and needs releasing",
+                    &id[..8],
+                    claimed_for.unwrap_or(actor)
+                )
+            })?;
+            let claimed: Value = serde_json::from_slice(&raw).with_context(|| {
+                format!(
+                    "the packet read back after the claim is not JSON — {}",
+                    needs_releasing()
+                )
+            })?;
             // The active Workflow row, so the brief can date the
             // procedure it is about to hand the agent (794e8d61) —
             // the copy the block already read when there is one, else
@@ -1779,14 +2813,57 @@ async fn dispatch_to_with_content(
                     .ok()
                     .flatten(),
             };
-            crate::brief::render_with(
+            let trailer = crate::documents::supplied_trailer();
+            // THE STEP THE CLAIM NAMES (backlog 4661a4a6): the slug
+            // chosen above, never re-derived as the packet's first open
+            // step — a car at `proven` and `landed-review` claimed the
+            // review and briefed the proof.
+            let legacy = crate::brief::render_with(
                 repo,
                 Some(&claimed),
+                Some(&slug),
                 &settings.profile,
                 active.as_ref(),
-                crate::documents::supplied_trailer().as_deref(),
+                trailer.as_deref(),
                 prior.as_ref(),
-            )?
+                repair.as_ref(),
+            )?;
+            // WHICH CONTRACT (design e72dc7c9): the one the packet's PINNED
+            // Workflow version declares. Declaring none is the legacy
+            // whole START, exactly as before; a malformed declaration is a
+            // refusal, never a quiet fallback.
+            let declared = crate::start_inputs::declared_for(&claimed, active.as_ref(), |path| {
+                api_at(Method::GET, path, None)
+            })
+            .await
+            .with_context(needs_releasing)?;
+            match declared {
+                None => legacy,
+                Some((declared, version)) => {
+                    let eval = boss_jobs::execution_inputs::evaluate(&claimed, &declared);
+                    let head = crate::brief::render_for(
+                        repo,
+                        Some(&claimed),
+                        Some(&slug),
+                        &settings.profile,
+                        active.as_ref(),
+                        trailer.as_deref(),
+                        prior.as_ref(),
+                        repair.as_ref(),
+                        Some(&crate::start_inputs::listed(&eval)),
+                    )?;
+                    bounded = Some(BoundedInputs {
+                        snapshot: String::from_utf8(raw).with_context(|| {
+                            format!("the packet snapshot is not UTF-8 — {}", needs_releasing())
+                        })?,
+                        declared,
+                        version,
+                        eval,
+                        legacy,
+                    });
+                    head
+                }
+            }
         }
         BriefSource::Handed { prompt, .. } => prompt.to_string(),
     };
@@ -1795,6 +2872,20 @@ async fn dispatch_to_with_content(
         &id, &title, &slug, run_agent, &settings, host, &brief, owner,
     );
     body["metadata"]["claim_receipt"] = claim_receipt;
+    if let Some(record) = urgent_override {
+        body["metadata"][crate::urgent_first::RUN_KEY] = record;
+    }
+    body["metadata"][boss_jobs::agent_runs::SELECTED_BY_KEY] = selected_by(pulled, &id);
+    if let Some(r) = &repair {
+        body["metadata"]["repair"] = r.record();
+    }
+    if let Some(d) = &rereview {
+        body["metadata"]["rereview"] = d.record();
+    }
+    // Who the claim door says holds the step, for the release below.
+    let holder = body["metadata"]["claim_receipt"]["assignee_id"]
+        .as_str()
+        .map(str::to_string);
     if let Some(p) = &plan {
         body["metadata"]["harness"] = json!(p.harness.id);
         body["metadata"]["dispatched_by"] = json!(actor);
@@ -1818,6 +2909,57 @@ async fn dispatch_to_with_content(
         Some(base) => base.to_string(),
         None => crate::tenant_publish::service_on_door(base, "content")?,
     };
+    // Read, never fatal: a lane that will not read has already been
+    // refused by the rendered brief, and a handed prompt's dispatch is
+    // not stopped over a control the caller can still set by hand.
+    let isolation = Isolation::for_profile(repo, &settings.profile).ok();
+
+    // A BOUNDED START IS COMPLETE BEFORE IT IS ADMITTED (design e72dc7c9).
+    // Both whole originals — the packet GET's bytes and the full legacy
+    // brief — are retained first, through the verified attachment door;
+    // the run's id is chosen here so the START can carry its own-run
+    // section and its manifest, and the brief the run records IS the START
+    // the worker is handed, byte for byte. Over the bound it is refused,
+    // naming what is too large, with nothing admitted.
+    let admitted_start = match &bounded {
+        None => None,
+        Some(b) => {
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let snapshot =
+                crate::dispatch_brief::retain_text_at(http, &content, actor, &id, &b.snapshot)
+                    .await
+                    .with_context(|| {
+                        format!("retaining the packet snapshot — {}", needs_releasing())
+                    })?;
+            let legacy =
+                crate::dispatch_brief::retain_text_at(http, &content, actor, &id, &b.legacy)
+                    .await
+                    .with_context(|| {
+                        format!("retaining the legacy brief — {}", needs_releasing())
+                    })?;
+            let record = crate::start_inputs::record(
+                &kind,
+                b.version,
+                &b.declared,
+                &b.eval,
+                snapshot,
+                legacy,
+            );
+            let start = format!(
+                "{brief}\n{}{}{}",
+                run_section(&run_id, &settings, isolation),
+                crate::start_inputs::receipt_line(&run_id, worker_root_suffix(isolation)),
+                crate::start_inputs::originals_section(&run_id, &record)
+            );
+            if let Some(why) = crate::start_inputs::bound_refusal(&start, &b.eval, &record) {
+                bail!("{why}\n{}", needs_releasing());
+            }
+            body["id"] = json!(run_id);
+            body["metadata"]["brief"] = json!(start);
+            body["metadata"][crate::start_inputs::RUN_KEY] = record.clone();
+            Some((run_id, start, record))
+        }
+    };
     let body = crate::dispatch_brief::retain_at(http, &content, actor, &id, body).await?;
     let created = api_at(Method::POST, "/api/jobs".to_string(), Some(body))
         .await?
@@ -1829,6 +2971,115 @@ async fn dispatch_to_with_content(
         .and_then(Value::as_str)
         .context("the run's create returned no id — refusing to call that dispatched")?
         .to_string();
+    if let Some((chosen, ..)) = &admitted_start
+        && chosen != &run_id
+    {
+        bail!(
+            "the run was admitted as {run_id}, not the {chosen} its bounded START names — it is \
+             not startable under that START; {}",
+            needs_releasing()
+        );
+    }
+
+    // THE HALF-OPEN WINDOW (backlog f8bed383, residue N9 of review
+    // b149c579). From here until the prompt is handed over, every refusal
+    // in [`hand_over`] used to return with the work step claimed and this
+    // run open at `briefed`, `building` PENDING behind it — and nothing
+    // ends that run: the silence clock ages only an OPEN building, no
+    // rule ages `briefed`, and the reclaim waits for `building = died`.
+    // So each such refusal now ends the run on its `refused` terminal and
+    // releases the claim ([`end_unhanded_run`]) — exactly when no
+    // executor holds the prompt: a printed dispatch that has not printed
+    // it yet, or a launch, whose executor is the process this verb starts
+    // only on success. A
+    // printed prompt names this run, so a refusal after it keeps the run
+    // to be finished (e381689d, deba68e8); a handed prompt is already an
+    // agent's, whose hook goes on whatever this verb answers.
+    let mut printed = false;
+    let handed = hand_over(
+        &api_at,
+        http,
+        base,
+        repo,
+        actor,
+        &id,
+        &step_id,
+        &slug,
+        &run_id,
+        plan.as_deref(),
+        &settings,
+        &brief,
+        admitted_start.as_ref(),
+        source,
+        &mut printed,
+    )
+    .await;
+    let (prompt, building_assignee, isolation) = match handed {
+        Ok(handed) => handed,
+        Err(e) if run_after_refusal(source, printed, plan.is_some()) == RunAfterRefusal::Ended => {
+            return Err(end_unhanded_run(
+                &api_at,
+                Unhanded {
+                    packet: &id,
+                    step_id: &step_id,
+                    slug: &slug,
+                    holder: holder.as_deref(),
+                    run_id: &run_id,
+                    by: actor,
+                },
+                e,
+            )
+            .await);
+        }
+        Err(e) => return Err(e),
+    };
+    eprintln!(
+        "boss dispatch: run {} open for `{slug}` on {} — {} bytes of prompt printed, \
+         building as {run_agent} on {host}",
+        &run_id[..8.min(run_id.len())],
+        &id[..8],
+        prompt.len()
+    );
+    Ok(Dispatched {
+        run_id,
+        prompt,
+        subagent_type: definition_in(repo, &settings),
+        isolation,
+        building_assignee,
+        settings,
+        plan,
+    })
+}
+
+/// THE HAND-OVER: everything from the run's edge to `briefed` completed,
+/// split out of [`dispatch_to_with_content`] so that a refusal anywhere
+/// in it is answered in ONE place (backlog f8bed383). `printed` says
+/// whether the prompt reached stdout before it refused. Returns the
+/// prompt, the run's building assignee, and the isolation it was read
+/// under.
+#[allow(clippy::too_many_arguments)]
+async fn hand_over<F, Fut>(
+    api_at: &F,
+    http: &crate::machine_http::MachineClient,
+    base: &str,
+    repo: &Path,
+    actor: &str,
+    id: &str,
+    step_id: &str,
+    slug: &str,
+    run_id: &str,
+    plan: Option<&crate::dispatch_launch::Plan>,
+    settings: &Settings,
+    brief: &str,
+    admitted_start: Option<&(String, String, Value)>,
+    source: BriefSource<'_>,
+    printed: &mut bool,
+) -> Result<(String, Option<String>, Option<Isolation>)>
+where
+    F: Fn(reqwest::Method, String, Option<Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
+    use reqwest::Method;
 
     // THE EDGE (backlog dd6d44b7). The claimed step now SAYS which run
     // is executing it. Nothing on a packet said so before: the run
@@ -1843,12 +3094,13 @@ async fn dispatch_to_with_content(
     //
     // Written before the prompt is printed, and fatal if it fails: a
     // run whose step carries no edge is one that can never be
-    // delivered, and handing over the prompt anyway would leave the
-    // operator holding a run the silence clock will age out as died.
+    // delivered. No clock would have aged it either — its `building`
+    // never opens — so the refusal ends the run and releases the step
+    // (the half-open window above).
     api_at(
         Method::PATCH,
         format!("/api/jobs/{id}/steps/{step_id}/metadata"),
-        Some(executing_run_patch(&run_id)),
+        Some(executing_run_patch(run_id)),
     )
     .await
     .with_context(|| {
@@ -1874,6 +3126,15 @@ async fn dispatch_to_with_content(
         .and_then(Value::as_str)
         .context("the briefed step has no id")?
         .to_string();
+
+    // A BOUNDED RUN'S RECORD ROUND-TRIPS BEFORE ITS START IS OFFERED
+    // (design e72dc7c9), and its building step then asks for the receipt
+    // that names this exact START and manifest — schema 3, which a CLI
+    // that cannot state that refuses rather than acknowledging a START it
+    // never offered.
+    if let Some((_, start, record)) = admitted_start {
+        bind_bounded_start(api_at, run_id, &run, start, record).await?;
+    }
 
     // THE RUN'S BUILDING BELONGS TO THE RUN'S AGENT (2f7b8c00). Placed
     // now, while `building` is still PENDING behind `briefed`, so it is
@@ -1907,7 +3168,7 @@ async fn dispatch_to_with_content(
     };
     let building_assignee = match nominee {
         Some(nominee) => {
-            match nominate_building(&api_at, &run_id, &run, &nominee).await {
+            match nominate_building(&api_at, run_id, &run, &nominee).await {
                 Ok(()) => Some(nominee),
                 // A launch must not start a process whose run is not its
                 // own; a printed prompt goes on as it always did.
@@ -1935,14 +3196,23 @@ async fn dispatch_to_with_content(
     // refused by the rendered brief, and a handed prompt's dispatch is
     // not stopped over a control the caller can still set by hand.
     let isolation = Isolation::for_profile(repo, &settings.profile).ok();
-    let mut prompt = format!("{brief}\n{}", run_section(&run_id, &settings, isolation));
-    if crate::dispatch_started::expectation(&run).is_some() {
-        prompt.push_str(&format!(
-            "\nWorker receipt: after reading this ENTIRE START, run `BOSS_AGENT_RUN={run_id} boss dispatch {run_id} --started`. When your own run's building step is READY and assigned to your running actor, the command first takes it through the claim door, which makes it ACTIVE; it then records the own-run receipt through the audited metadata merge door. It carries no timestamp and claims neither physical execution nor delivery. A coordinator claim, host or session cannot substitute; if the command refuses because the step is assigned to another actor or to nobody, report that blocker to the coordinator and claim nothing. Only this newly admitted declaration opts in; never repin an older run to add it.\n"
-        ));
-    }
+    let prompt = match admitted_start {
+        // The bounded START is the record, already whole.
+        Some((_, start, _)) => start.clone(),
+        None => {
+            let mut prompt = format!("{brief}\n{}", run_section(run_id, settings, isolation));
+            if crate::dispatch_started::expectation(&run).is_some() {
+                let worker_root = worker_root_suffix(isolation);
+                prompt.push_str(&format!(
+                    "\nWorker receipt: after reading this ENTIRE START, run `BOSS_AGENT_RUN={run_id} boss dispatch {run_id} --started{worker_root}`. When your own run's building step is READY and assigned to your running actor, the command first takes it through the claim door, which makes it ACTIVE; it then records the own-run receipt through the audited metadata merge door. With --local-root, activated isolation binds or adopts one worker for this run before acknowledging START, and --report retires that recorded worker. A refused allocation is a stop, never a local fallback. Source reviewers use the same --local-root door from their own worktree before running candidate checks. It carries no timestamp and claims neither physical execution nor delivery. A coordinator claim, host or session cannot substitute; if the command refuses because the step is assigned to another actor or to nobody, report that blocker to the coordinator and claim nothing. Only this newly admitted declaration opts in; never repin an older run to add it.\n"
+                ));
+            }
+            prompt
+        }
+    };
     if matches!(source, BriefSource::Rendered) {
         print!("{prompt}");
+        *printed = true;
     }
     // A 2xx IS A CLAIM; THE READ-BACK IS THE FACT (backlog e381689d).
     // On run 6b6fe011 (2026-09-25) this merge answered 204, a concurrent
@@ -1981,10 +3251,11 @@ async fn dispatch_to_with_content(
     }
     if let Some(report) = unheld {
         bail!(briefed_unheld_refusal(
-            &run_id,
+            run_id,
             &briefed_id,
             &writes,
-            &report
+            &report,
+            run_after_refusal(source, *printed, plan.is_some()),
         ));
     }
     // The completion races the same dispatcher writes the merge did
@@ -2009,7 +3280,12 @@ async fn dispatch_to_with_content(
             Ok(_) => break,
             Err(e) if lost_the_step_race(&e) && attempt < BRIEFED_COMPLETE_ATTEMPTS => e,
             Err(e) => {
-                return Err(e.context(briefed_not_startable(&run_id, prompt.len(), attempt)));
+                return Err(e.context(briefed_not_startable(
+                    run_id,
+                    prompt.len(),
+                    attempt,
+                    run_after_refusal(source, *printed, plan.is_some()),
+                )));
             }
         };
         attempt += 1;
@@ -2043,22 +3319,7 @@ async fn dispatch_to_with_content(
             .context("recording prompt_bytes again after a lost completion race")?;
         }
     }
-    eprintln!(
-        "boss dispatch: run {} open for `{slug}` on {} — {} bytes of prompt printed, \
-         building as {run_agent} on {host}",
-        &run_id[..8.min(run_id.len())],
-        &id[..8],
-        prompt.len()
-    );
-    Ok(Dispatched {
-        run_id,
-        prompt,
-        subagent_type: definition_in(repo, &settings),
-        isolation,
-        building_assignee,
-        settings,
-        plan,
-    })
+    Ok((prompt, building_assignee, isolation))
 }
 
 /// Place a run's `building` step with `nominee` through the step PUT's
@@ -2137,6 +3398,357 @@ where
     }
 }
 
+/// What the rendered arm hands admission when the packet's pinned
+/// protocol declares execution-inputs/v1 (design e72dc7c9): the snapshot's
+/// exact text, the complete legacy brief, and the evaluation the bounded
+/// packet section was rendered from.
+struct BoundedInputs {
+    snapshot: String,
+    legacy: String,
+    declared: boss_jobs::execution_inputs::Declaration,
+    version: i64,
+    eval: boss_jobs::execution_inputs::Evaluation,
+}
+
+/// The minutes a bounded run's worker has for its receipt: the bound its
+/// building step already declares, else the agent-run row's 15.
+const BOUNDED_START_MINUTES: i64 = 15;
+
+fn worker_root_suffix(isolation: Option<Isolation>) -> &'static str {
+    if isolation == Some(Isolation::Worktree) {
+        " --local-root \"$PWD\""
+    } else {
+        ""
+    }
+}
+
+/// Check that the filed run holds EXACTLY the bounded START and record it
+/// was sent with, then put the schema-3 start expectation on its building
+/// step and read that back. Any miss is a refusal naming the run, which is
+/// filed and NOT startable: no prompt is offered over a record it does not
+/// hold (design e72dc7c9 — the manifest round-trips before the prompt).
+async fn bind_bounded_start<F, Fut>(
+    api_at: &F,
+    run_id: &str,
+    run: &Value,
+    start: &str,
+    record: &Value,
+) -> Result<()>
+where
+    F: Fn(reqwest::Method, String, Option<Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
+    let not_startable = |what: &str| {
+        format!(
+            "run {run_id} is filed but NOT startable under its bounded START: {what}. Its \
+             prompt is not offered; dispatch reports its unhanded-run cleanup outcome below"
+        )
+    };
+    let md = run.get("data").unwrap_or(run).get("metadata");
+    if md.and_then(|m| m.get("brief")).and_then(Value::as_str) != Some(start)
+        || md.and_then(|m| m.get(crate::start_inputs::RUN_KEY)) != Some(record)
+    {
+        bail!(not_startable(
+            "its recorded brief or manifest does not read back exactly as sent"
+        ));
+    }
+    let building = |job: &Value| {
+        crate::envelope::steps(job)
+            .into_iter()
+            .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some(BUILDING_SLUG))
+            .cloned()
+    };
+    let step = building(run).with_context(|| not_startable("it has no building step"))?;
+    let sid = step
+        .get("id")
+        .and_then(Value::as_str)
+        .with_context(|| not_startable("its building step has no id"))?;
+    let minutes = step
+        .get("metadata")
+        .and_then(|m| m.get(crate::dispatch_started::EXPECTATION_KEY))
+        .and_then(|e| e.get("minutes"))
+        .and_then(Value::as_i64)
+        .filter(|m| *m > 0)
+        .unwrap_or(BOUNDED_START_MINUTES);
+    let expectation =
+        boss_jobs::execution_inputs::start_expectation(start, &record["manifest"], minutes);
+    api_at(
+        reqwest::Method::PATCH,
+        format!("/api/jobs/{run_id}/steps/{sid}/metadata"),
+        Some(json!({ (crate::dispatch_started::EXPECTATION_KEY): expectation })),
+    )
+    .await
+    .with_context(|| not_startable("its building step's start expectation was not written"))?;
+    let after = api_at(reqwest::Method::GET, format!("/api/jobs/{run_id}"), None)
+        .await?
+        .with_context(|| not_startable("it would not read back"))?;
+    let held = building(&after)
+        .and_then(|s| s.get("metadata").cloned())
+        .and_then(|m| m.get(crate::dispatch_started::EXPECTATION_KEY).cloned());
+    if held.as_ref() != Some(&expectation) {
+        bail!(not_startable(
+            "its building step does not hold the schema-3 start expectation written to it"
+        ));
+    }
+    Ok(())
+}
+
+/// The run-packet key a run ended at dispatch carries: why, by whom,
+/// when (backlog f8bed383).
+pub(crate) const ENDED_AT_DISPATCH_KEY: &str = "ended_at_dispatch";
+
+/// The agent-run terminal a run nobody was handed is ended on: an
+/// aborted outcome, which the step PUT completes from any open state
+/// (fd0f92ae) — `building` cannot be, behind a `briefed` never done.
+const REFUSED_SLUG: &str = "refused";
+
+/// What a refused hand-over left half-open: the claimed work step and
+/// the run filed for it.
+pub(crate) struct Unhanded<'a> {
+    pub packet: &'a str,
+    pub step_id: &'a str,
+    pub slug: &'a str,
+    /// The holder the claim door's receipt named, when it named one.
+    pub holder: Option<&'a str>,
+    pub run_id: &'a str,
+    /// The actor running the verb, who signs the end and the release.
+    pub by: &'a str,
+}
+
+/// THE RUN NOBODY WAS HANDED IS ENDED, AND ITS CLAIM RELEASED (backlog
+/// f8bed383, residue N9 of review b149c579). Called on a refusal after
+/// the run is filed and before any executor holds its prompt. The
+/// review called the old answer "left open for the silence clock"; it was
+/// worse, because no clock reaches it — `agent-run-dies-when-building-
+/// is-silent` ages only an OPEN building, nothing ages `briefed`, and
+/// `an-abandoned-step-is-reclaimed-when-its-run-died` waits for `died`.
+/// That rule's own header names the hand this is: "`refused` is written
+/// by a hand, and the hand that writes it is present and can release the
+/// step in the same breath." The verb is that hand.
+///
+/// Two acts, each read back, and each tried whatever the other answered,
+/// because either alone is less wrong than neither: the reason onto the
+/// run's packet and its `refused` terminal completed; then the work step
+/// released the way `boss step release` does it — edge cleared and
+/// evidence written through the merge door, then `ready` and nobody's —
+/// but only while it is still the claim this dispatch made (active, the
+/// receipt's holder, no other run's edge). The refusal is returned with what was done, or with the
+/// command that finishes each act that did not read back: the cause is
+/// often the jobs API itself, and a cleanup that failed silently would
+/// be the same silence one level down.
+async fn end_unhanded_run<F, Fut>(
+    api_at: &F,
+    left: Unhanded<'_>,
+    cause: anyhow::Error,
+) -> anyhow::Error
+where
+    F: Fn(reqwest::Method, String, Option<Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
+    let run_short = &left.run_id[..8.min(left.run_id.len())];
+    let packet_short = &left.packet[..8.min(left.packet.len())];
+    let why = format!(
+        "boss dispatch filed run {run_short} for `{}` and refused before any executor held its \
+         prompt: {cause:#}",
+        left.slug
+    );
+    let at = boss_clock_client::wall_now().to_rfc3339();
+    let ended = end_run_refused(api_at, &left, &why, &at).await;
+    let released = release_unhanded_claim(api_at, &left, &why, &at).await;
+    let said = match (&ended, &released) {
+        (Ok(()), Ok(Released::Done)) => format!(
+            "nothing was handed over, and nothing is left half-open: run {run_short} is ENDED on \
+             its `{REFUSED_SLUG}` terminal and `{}` on {packet_short} is RELEASED — ready, \
+             nobody's, its run edge cleared — each read back (backlog f8bed383). No command \
+             below that finishes or releases this run by hand is owed; dispatch the packet again \
+             once the cause is fixed",
+            left.slug
+        ),
+        _ => {
+            let mut owed = Vec::new();
+            match &ended {
+                Ok(()) => owed.push(format!("run {run_short} is ENDED `{REFUSED_SLUG}`")),
+                Err(e) => owed.push(format!(
+                    "run {run_short} is NOT ended by this verb ({e}) — while it reads open, end \
+                     it: boss step complete {} --step {REFUSED_SLUG}",
+                    left.run_id
+                )),
+            }
+            match &released {
+                Ok(Released::Done) => {
+                    owed.push(format!("`{}` on {packet_short} is RELEASED", left.slug))
+                }
+                // Not this dispatch's claim any more: another hand moved
+                // it, and freeing it is not this verb's to do.
+                Ok(Released::LeftAsFound(why)) => owed.push(format!(
+                    "`{}` on {packet_short} is left as found ({why})",
+                    left.slug
+                )),
+                Err(e) => owed.push(format!(
+                    "`{}` on {packet_short} is NOT released ({e}) — release it: boss step \
+                     release {packet_short} --step {} --why 'its run {run_short} was refused at \
+                     dispatch'",
+                    left.slug, left.slug
+                )),
+            }
+            format!(
+                "nothing was handed over, and ending what was filed did not all read back \
+                 (backlog f8bed383): {}",
+                owed.join("; ")
+            )
+        }
+    };
+    cause.context(said)
+}
+
+/// The run's half: the reason on its packet, then its `refused`
+/// terminal completed, read back.
+async fn end_run_refused<F, Fut>(
+    api_at: &F,
+    left: &Unhanded<'_>,
+    why: &str,
+    at: &str,
+) -> Result<(), String>
+where
+    F: Fn(reqwest::Method, String, Option<Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
+    let run_id = left.run_id;
+    api_at(
+        reqwest::Method::PATCH,
+        format!("/api/jobs/{run_id}/metadata"),
+        Some(json!({ ENDED_AT_DISPATCH_KEY: { "why": why, "by": left.by, "at": at } })),
+    )
+    .await
+    .map_err(|e| format!("recording why failed: {e:#}"))?;
+    let terminal = |run: &Value| {
+        crate::envelope::steps(run)
+            .into_iter()
+            .find(|s| s.get("spec_slug").and_then(Value::as_str) == Some(REFUSED_SLUG))
+            .cloned()
+    };
+    let read = || async {
+        api_at(reqwest::Method::GET, format!("/api/jobs/{run_id}"), None)
+            .await
+            .map_err(|e| format!("the run read failed: {e:#}"))?
+            .ok_or_else(|| "the run read returned no body".to_string())
+    };
+    let run = read().await?;
+    let step = terminal(&run).ok_or_else(|| format!("the run has no `{REFUSED_SLUG}` step"))?;
+    let status = step.get("status").and_then(Value::as_str).unwrap_or("?");
+    if !matches!(status, "pending" | "ready" | "active") {
+        return Err(format!("its `{REFUSED_SLUG}` terminal is already {status}"));
+    }
+    let sid = step
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("its `{REFUSED_SLUG}` step has no id"))?;
+    api_at(
+        reqwest::Method::PUT,
+        format!("/api/jobs/{run_id}/steps/{sid}"),
+        Some(completed()),
+    )
+    .await
+    .map_err(|e| format!("completing `{REFUSED_SLUG}` failed: {e:#}"))?;
+    let after = read().await?;
+    let done = terminal(&after)
+        .is_some_and(|s| s.get("status").and_then(Value::as_str) == Some("completed"));
+    let recorded = after
+        .pointer(&format!("/metadata/{ENDED_AT_DISPATCH_KEY}/why"))
+        .and_then(Value::as_str)
+        == Some(why);
+    match (done, recorded) {
+        (true, true) => Ok(()),
+        (false, _) => Err(format!(
+            "the completion answered success and `{REFUSED_SLUG}` does not read back completed"
+        )),
+        (true, false) => Err(format!(
+            "`{REFUSED_SLUG}` reads back completed, and the run does not hold \
+             `{ENDED_AT_DISPATCH_KEY}` saying why"
+        )),
+    }
+}
+
+/// What the work step's half did: released it, or found it no longer
+/// this dispatch's claim and left it as found (the reason why).
+#[derive(Debug, PartialEq)]
+enum Released {
+    Done,
+    LeftAsFound(String),
+}
+
+/// The work step's half: released the way `boss step release` releases
+/// it (`crate::steps`), and only while it is still THIS dispatch's claim
+/// — a step another hand moved since is left exactly as found.
+async fn release_unhanded_claim<F, Fut>(
+    api_at: &F,
+    left: &Unhanded<'_>,
+    why: &str,
+    at: &str,
+) -> Result<Released, String>
+where
+    F: Fn(reqwest::Method, String, Option<Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Value>>>,
+{
+    let (packet, sid) = (left.packet, left.step_id);
+    let read = || async {
+        api_at(reqwest::Method::GET, format!("/api/jobs/{packet}"), None)
+            .await
+            .map_err(|e| format!("the packet read failed: {e:#}"))?
+            .ok_or_else(|| "the packet read returned no body".to_string())
+    };
+    let find = |job: &Value| {
+        crate::envelope::steps(job)
+            .into_iter()
+            .find(|s| s.get("id").and_then(Value::as_str) == Some(sid))
+            .cloned()
+            .ok_or_else(|| "the step is no longer on the packet".to_string())
+    };
+    let step = find(&read().await?)?;
+    let status = step.get("status").and_then(Value::as_str).unwrap_or("?");
+    let held_by = step.get("assignee_id").and_then(Value::as_str);
+    let edge = step
+        .pointer(&format!("/metadata/{}", boss_jobs::agent_runs::EDGE_KEY))
+        .and_then(Value::as_str);
+    if status != "active" {
+        return Ok(Released::LeftAsFound(format!(
+            "it is {status}, not the claim this dispatch made"
+        )));
+    }
+    if let Some(h) = left.holder
+        && held_by != Some(h)
+    {
+        return Ok(Released::LeftAsFound(format!(
+            "it is held by {}, and the claim was {h}'s",
+            held_by.unwrap_or("nobody")
+        )));
+    }
+    if let Some(other) = edge.filter(|r| *r != left.run_id) {
+        return Ok(Released::LeftAsFound(format!(
+            "it names run {other}, not this one"
+        )));
+    }
+    let mut patch = crate::steps::release_patch(&step, why, Some(left.by), at);
+    // The run it came from, whether or not the edge was ever written.
+    patch[crate::steps::RELEASED_KEY]["from_run"] = json!(left.run_id);
+    api_at(
+        reqwest::Method::PATCH,
+        format!("/api/jobs/{packet}/steps/{sid}/metadata"),
+        Some(patch),
+    )
+    .await
+    .map_err(|e| format!("clearing the edge failed: {e:#}"))?;
+    api_at(
+        reqwest::Method::PUT,
+        format!("/api/jobs/{packet}/steps/{sid}"),
+        Some(crate::steps::release_status()),
+    )
+    .await
+    .map_err(|e| format!("handing it back failed: {e:#}"))?;
+    crate::steps::confirm_released(&find(&read().await?)?, why)?;
+    Ok(Released::Done)
+}
+
 /// Is this refused write the step race — the one refusal a status-only
 /// completion answers by sending itself once more? Judged on the JSON
 /// body the jobs API answered with (`crate::sor_client::api_at_signed` carries it
@@ -2183,7 +3795,8 @@ fn lost_the_step_race(e: &anyhow::Error) -> bool {
 // resolve a queue that does not exist and answer "nothing waiting"
 // instead of erroring — the wrong-target shape CLAUDE.md warns about.
 
-/// The step an inbox hands out: ready, nobody's, and declaring an
+/// The step an inbox hands out once the caller's own nominations
+/// ([`nominated_step`]) are exhausted: ready, nobody's, and declaring an
 /// agent block — through [`settings_for`], the packet's projection
 /// else `row`'s step (the kind's ACTIVE row). That is exactly what made
 /// the packet a member of an `a.<role>.<model>` station since backlog
@@ -2207,9 +3820,138 @@ fn open_unheld(job: &Value) -> impl Iterator<Item = &Value> {
     })
 }
 
-/// Take the first piece of waiting work at `station` and dispatch it.
-/// `Ok(None)` is an empty inbox — a runner asking again in a minute is
-/// the normal case, not an error.
+/// The step an inbox hands its CALLER ahead of unassigned work: ready,
+/// nominated to one of `me` (the ids the server's `for=me` expands the
+/// caller to), and declaring an agent block exactly as [`waiting_step`]
+/// requires. A nomination is the dispatcher saying whose inbox a step is
+/// in, so it is the caller's to take — the claim door admits a re-claim
+/// by the holder (backlog 67d4344b).
+pub(crate) fn nominated_step<'a>(
+    job: &'a Value,
+    row: Option<&Value>,
+    me: &'a [String],
+) -> Option<&'a Value> {
+    open_nominated(job, me).find(|s| settings_for(s, row).is_some())
+}
+
+/// Ready steps nominated to one of `me` — the candidates
+/// [`nominated_step`] judges.
+fn open_nominated<'a>(job: &'a Value, me: &'a [String]) -> impl Iterator<Item = &'a Value> {
+    crate::envelope::steps(job).into_iter().filter(move |s| {
+        s.get("status").and_then(Value::as_str) == Some("ready")
+            && s.get("assignee_id")
+                .and_then(Value::as_str)
+                .is_some_and(|holder| me.iter().any(|m| m == holder))
+    })
+}
+
+/// The packets a `for=me` answer shows a READY step nominated to one of
+/// its own ids — the caller's inbox, as the server read it. Its rows also
+/// carry steps the caller's ROLES reach, held by others or by nobody, so
+/// the holder is compared rather than the row's presence trusted.
+fn nominated_packets(for_me: &Value, me: &[String]) -> std::collections::HashSet<String> {
+    for_me
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| {
+            let step = row.get("step");
+            step.and_then(|s| s.get("status")).and_then(Value::as_str) == Some("ready")
+                && step
+                    .and_then(|s| s.get("assignee_id"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|holder| me.iter().any(|m| m == holder))
+        })
+        .filter_map(|row| row.get("job_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Where a `--next` dispatch took its packet from (backlog c9dd306a):
+/// the station the claim pulls from, and the walk that chose the packet,
+/// written onto the run as `selected_by.next` ([`selected_by`]). A
+/// dispatch with none was NAMED by its caller.
+#[derive(Debug, Clone)]
+pub(crate) struct Pulled<'a> {
+    pub station: &'a str,
+    /// `{ station, position, of, pass, skipped }` — see [`next_at`].
+    pub walk: Value,
+}
+
+/// The run's [`boss_jobs::agent_runs::SELECTED_BY_KEY`]: the walk when
+/// the queue chose the packet, else the packet the caller named (the id
+/// its reference resolved to). Every run carries one or the other, so
+/// a queue-order fault can be told from an operator's choice off the
+/// run itself (backlog c9dd306a).
+pub(crate) fn selected_by(pulled: Option<&Pulled<'_>>, packet: &str) -> Value {
+    match pulled {
+        Some(p) => json!({ "next": p.walk }),
+        None => json!({ "named": packet }),
+    }
+}
+
+/// What the inbox's walk saw on a packet it passed over, in the pass
+/// (`nominated`, or `unheld`) that passed it: each READY or ACTIVE step,
+/// its holder, and why that pass did not take it (backlog c9dd306a) —
+/// `active` (somebody is on it), `held by <id>` (another's), `refused:
+/// declares no agent block` (a candidate of this pass that nothing could
+/// launch), or a nomination of the caller's met by the unassigned pass,
+/// which the nominated pass never took — the 2026-10-19 shape, whose
+/// cause the run could not show. A packet with nothing open says so with
+/// an empty list rather than an invented reason.
+pub(crate) fn walked_past(
+    job: &Value,
+    row: Option<&Value>,
+    me: &[String],
+    nominated: bool,
+) -> Value {
+    let steps: Vec<Value> = crate::envelope::steps(job)
+        .into_iter()
+        .filter_map(|s| {
+            let status = s
+                .get("status")
+                .and_then(Value::as_str)
+                .filter(|st| *st == "ready" || *st == "active")?;
+            let holder = s.get("assignee_id").and_then(Value::as_str);
+            let callers = holder.is_some_and(|h| me.iter().any(|m| m == h));
+            let candidate = match nominated {
+                true => callers,
+                false => holder.is_none(),
+            };
+            let why = match holder {
+                _ if status == "active" => "active".to_string(),
+                _ if candidate && settings_for(s, row).is_none() => {
+                    "refused: declares no agent block".to_string()
+                }
+                // Unreachable for a packet the walk passed over (it
+                // would have been taken), and said rather than hidden.
+                _ if candidate => "takeable".to_string(),
+                Some(_) if callers => {
+                    "nominated to the caller, not taken by the nominated pass".to_string()
+                }
+                Some(h) => format!("held by {h}"),
+                None => "held by nobody: the unheld pass judges it".to_string(),
+            };
+            Some(json!({
+                "step": s.get("spec_slug"),
+                "status": status,
+                "assignee": holder,
+                "why": why,
+            }))
+        })
+        .collect();
+    json!({
+        "packet": crate::envelope::job_id(job),
+        "pass": if nominated { "nominated" } else { "unheld" },
+        "steps": steps,
+    })
+}
+
+/// Take the caller's first nominated step at `station`, else the first
+/// piece of waiting work nobody holds, and dispatch it. `Ok(None)` is an
+/// empty inbox — a runner asking again in a minute is the normal case,
+/// not an error.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn next_at(
     http: &crate::machine_http::MachineClient,
@@ -2244,13 +3986,84 @@ pub(crate) async fn next_at(
         })
         .unwrap_or_default();
 
+    if members.is_empty() {
+        eprintln!(
+            "boss dispatch --next: {station} holds no packets — nothing claimed, nothing filed"
+        );
+        return Ok(None);
+    }
+
+    // THE CALLER'S OWN NOMINATIONS FIRST (backlog 67d4344b). The
+    // dispatcher nominates every ready agent step to an agent serving its
+    // (role, model), so a station's ready steps are almost all somebody's:
+    // measured 2026-10-17, 64 of the first 80 in a.platform-admin.opus-5-5
+    // were agent-claude's and none was unassigned, and an inbox that took
+    // only steps nobody held handed agent-claude-b nothing — and
+    // agent-claude nothing either, its own queue full. Whose a nomination
+    // is comes from the server's `for=me` expansion of the caller (design
+    // ea906603 Q2: one copy of the alias rule), never from comparing the
+    // signing spelling here. The packet read below still decides; this
+    // only orders the walk: the caller's nominations in the queue's own
+    // discipline (priority, then age), then every member for work nobody
+    // holds, as before.
+    let for_me =
+        crate::top_board::for_me_answer(api_at(Method::GET, crate::top_board::for_me_path()).await)
+            .map_err(|e| {
+                anyhow::anyhow!("{e} — reading whose nominations {actor} may take first")
+            })?;
+    let me = crate::top_board::for_ids(&for_me);
+    // A CUT ANSWER IS NOT THE INBOX (backlog 09074ada). Its rows sort by
+    // admission and stop at the limit, so the caller's newest
+    // nominations are the ones it drops; read as whole, the walk took
+    // older or unassigned work first and, with none, said "none
+    // nominated". Cut, every member is walked as a possible nomination,
+    // judged off its own packet against the ids the answer names.
+    let cut = crate::top_board::for_me_cut(&for_me);
+    let mine = match &cut {
+        None => Some(nominated_packets(&for_me, &me)),
+        Some(why) => {
+            eprintln!(
+                "boss dispatch --next: the for=me read was cut ({why}); walking every packet \
+                 in {station} for a nomination to {}",
+                me.join("/")
+            );
+            None
+        }
+    };
+    let walk: Vec<(&String, bool)> = members
+        .iter()
+        .filter(|id| mine.as_ref().is_none_or(|m| m.contains(*id)))
+        .map(|id| (id, true))
+        .chain(members.iter().map(|id| (id, false)))
+        .collect();
+
+    let mut jobs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     let mut rows: std::collections::BTreeMap<String, Option<Value>> =
         std::collections::BTreeMap::new();
-    for id in &members {
-        let job = api_at(Method::GET, format!("/api/jobs/{id}"))
-            .await?
-            .with_context(|| format!("packet {} read returned no body", &id[..8.min(id.len())]))?;
-        // The kind's row is read only when a ready, unheld step cannot
+    // Every packet the walk passes over, with each open step's reason
+    // ([`walked_past`]), for the run the pick files (backlog c9dd306a).
+    let mut skipped: Vec<Value> = Vec::new();
+    for (id, nominated) in walk {
+        if !jobs.contains_key(id) {
+            let read = api_at(Method::GET, format!("/api/jobs/{id}"))
+                .await?
+                .with_context(|| {
+                    format!("packet {} read returned no body", &id[..8.min(id.len())])
+                })?;
+            jobs.insert(id.clone(), read);
+        }
+        let Some(job) = jobs.get(id) else {
+            continue;
+        };
+        let pick = |row: Option<&Value>| match nominated {
+            true => nominated_step(job, row, &me),
+            false => waiting_step(job, row),
+        };
+        let candidates = match nominated {
+            true => open_nominated(job, &me).next().is_some(),
+            false => open_unheld(job).next().is_some(),
+        };
+        // The kind's row is read only when a candidate step cannot
         // answer alone — the same laziness `dispatch_at` keeps — and
         // once per kind, however many of its packets the queue holds.
         let kind = job
@@ -2258,17 +4071,15 @@ pub(crate) async fn next_at(
             .and_then(Value::as_str)
             .unwrap_or("?")
             .to_string();
-        if waiting_step(&job, None).is_none()
-            && open_unheld(&job).next().is_some()
-            && !rows.contains_key(&kind)
-        {
+        if pick(None).is_none() && candidates && !rows.contains_key(&kind) {
             let row = api_at(Method::GET, format!("/api/workflows/{kind}"))
                 .await
                 .with_context(|| format!("reading the {kind} Workflow row for its agent block"))?;
             rows.insert(kind.clone(), row);
         }
         let row = rows.get(&kind).and_then(Option::as_ref);
-        let Some(step) = waiting_step(&job, row) else {
+        let Some(step) = pick(row) else {
+            skipped.push(walked_past(job, row, &me, nominated));
             continue;
         };
         let slug = step
@@ -2276,10 +4087,32 @@ pub(crate) async fn next_at(
             .and_then(Value::as_str)
             .context("a waiting step with no spec_slug")?
             .to_string();
+        let whose = match step.get("assignee_id").and_then(Value::as_str) {
+            Some(holder) => format!("nominated to {holder}"),
+            None => "held by nobody".to_string(),
+        };
+        // THE SELECTION IS THE RECORD (backlog c9dd306a): where the
+        // packet stood in the queue (1-based, in the queue's own
+        // discipline), which pass took it, and what the walk passed
+        // over — written onto the run, not only printed here.
+        let position = members.iter().position(|m| m == id).map(|i| i + 1);
+        let mut walk = json!({
+            "station": station,
+            "position": position,
+            "of": members.len(),
+            "pass": if nominated { "nominated" } else { "unheld" },
+            "skipped": skipped,
+        });
+        if let Some(why) = &cut {
+            walk["for_me_cut"] = json!(why);
+        }
         eprintln!(
-            "boss dispatch --next: {station} holds {} packet(s); taking {} `{slug}`",
+            "boss dispatch --next: {station} holds {} packet(s); taking {} `{slug}`, {whose} \
+             (position {}, walked past {})",
             members.len(),
-            &id[..8.min(id.len())]
+            &id[..8.min(id.len())],
+            position.map_or_else(|| "?".to_string(), |p| p.to_string()),
+            walk["skipped"].as_array().map_or(0, Vec::len),
         );
         return dispatch_at(
             http,
@@ -2287,7 +4120,7 @@ pub(crate) async fn next_at(
             repo,
             id,
             Some(&slug),
-            Some(station),
+            Some(&Pulled { station, walk }),
             over,
             // Never forced from the queue: the landed-work refusal is
             // most valuable exactly where nobody reads each choice.
@@ -2302,9 +4135,10 @@ pub(crate) async fn next_at(
     }
 
     eprintln!(
-        "boss dispatch --next: {station} holds {} packet(s), none of them waiting for an \
-         executor — nothing claimed, nothing filed",
-        members.len()
+        "boss dispatch --next: {station} holds {} packet(s), none of them nominated to {} or \
+         held by nobody — nothing claimed, nothing filed",
+        members.len(),
+        me.join("/")
     );
     Ok(None)
 }
@@ -2531,6 +4365,77 @@ pub(crate) fn resolve_agent(agents: &[Value], login: &str) -> Option<String> {
     match named.next() {
         Some(_) => None,
         None => id_of(first),
+    }
+}
+
+/// The claim door's 409, read back off the error it became: the holder
+/// it named and the status it found (`boss_jobs::active_holder`'s body,
+/// which the signed door quotes after `-> 409 Conflict: `). Nothing for
+/// any other failure, or a 409 that names no holder.
+pub(crate) fn claim_refusal(err: &anyhow::Error) -> Option<(String, String)> {
+    const MARK: &str = "-> 409 Conflict: ";
+    err.chain().find_map(|cause| {
+        let text = cause.to_string();
+        let (_, rest) = text.split_once(MARK)?;
+        // The body is the first JSON value; the door may print its ways
+        // out on the lines after it.
+        let body: Value = serde_json::Deserializer::from_str(rest)
+            .into_iter::<Value>()
+            .next()?
+            .ok()?;
+        let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::to_string);
+        Some((field("holder")?, field("status")?))
+    })
+}
+
+/// Whether the 409's `holder` is the caller: the spelling it signs as,
+/// or — through the agents registry — the same registered agent in its
+/// other spelling. The claim door stores an agent's registered id for
+/// its own claimant, so a coordinator signing as its login holds the
+/// step as its id (backlog 5487223c).
+pub(crate) fn holder_is_caller(holder: &str, caller: &str, agents: &[Value]) -> bool {
+    holder == caller
+        || resolve_agent(agents, caller).is_some_and(|me| Some(me) == resolve_agent(agents, holder))
+}
+
+/// The hand-over a claim refused on the caller's OWN active hold needs
+/// (backlog 5487223c, part 1). A claim takes only a READY step, so a
+/// step the caller already claimed — then dispatched, or launched for
+/// another harness — must be released first; until this, only a code
+/// comment said so.
+///
+/// THE RUN ON THE STEP IS NAMED BEFORE THE RELEASE (backlog f80d8024,
+/// review 96d0f631). A plain `boss dispatch` claims the step AND writes
+/// its run's id on it as `agent_run`, so that is the usual way a caller
+/// comes to hold one ACTIVE. Releasing clears the edge and leaves the
+/// run open until a silence rule settles it, and if its agent is still
+/// working the next dispatch puts two executors on one step — which is
+/// why `boss step release` says to read the run first. `run` is that
+/// edge, off the step the dispatch already read; nothing is fetched.
+fn release_first(packet: &str, slug: &str, holder: &str, run: Option<&str>) -> String {
+    let release = format!(
+        "boss step release {packet} --step {slug} --why '<why it is handed on>', then dispatch \
+         it again"
+    );
+    match run {
+        Some(run) => {
+            // The read names the FULL id; the short form is for reading
+            // (backlog 0a76509e). `boss job get` resolves a short id only
+            // among the newest open packets, so an old run — exactly the
+            // stale case where a release is right — answered no match.
+            let short = run.get(..8).unwrap_or(run);
+            format!(
+                "`{slug}` on {packet} is ACTIVE and held by you ({holder}), and run {short} is on \
+                 it — read it first: boss job get {run}. A release clears that edge and leaves \
+                 the run open, and while its agent still works a second dispatch puts two \
+                 executors on one step. Only once that run is finished or dead, hand the step \
+                 back: {release}"
+            )
+        }
+        None => format!(
+            "`{slug}` on {packet} is ACTIVE and held by you ({holder}) — a claim takes only a \
+             ready step, so hand it back first: {release}"
+        ),
     }
 }
 
@@ -3843,7 +5748,14 @@ pub async fn report(
         &actor,
         now,
     )
-    .await
+    .await?;
+    if let Some(retirement) =
+        crate::dispatch_worker::Workers::stop(&crate::dispatch_worker::Published, &run_id).await?
+    {
+        crate::dispatch_worker::record_retirement_at(&http, &base, &run_id, &actor, retirement)
+            .await?;
+    }
+    Ok(())
 }
 
 pub async fn run(
@@ -3853,6 +5765,9 @@ pub async fn run(
     budget: Option<f64>,
     effort: Option<String>,
     force: bool,
+    // `--force-standard`'s why (backlog 90bff1f3), already read from
+    // `--why` or `--why-file`.
+    force_standard: Option<String>,
     // `--launch`: start the harness the step's model names, in the
     // directory given, and stay until it ends (`crate::dispatch_launch`).
     launch: Option<crate::dispatch_launch::Request>,
@@ -3888,6 +5803,7 @@ pub async fn run(
         None,
         &over,
         force,
+        force_standard.as_deref(),
         &actor,
         &owner,
         &host,
@@ -4171,6 +6087,9 @@ mod tests {
     #[test]
     fn a_packet_whose_fix_is_already_an_open_car_is_refused_with_the_car_named() {
         let item = "28dcc735-0000-0000-0000-000000000000";
+        let in_flight_car_refusal = |item: &str, cars: &[Value]| {
+            in_flight_car(item, cars).map(|car| in_flight_refusal_of(item, car))
+        };
         let parked = json!({
             "id": "fc92b86a-0000-0000-0000-000000000000",
             "status": "open",
@@ -4207,6 +6126,218 @@ mod tests {
             "metadata": { "backlog_item": "aaaaaaaa-0000-0000-0000-000000000000", "branch": "fix/someone-elses" },
         });
         assert_eq!(in_flight_car_refusal(item, &[other]), None);
+    }
+
+    /// A CAR WHOSE REVIEW ASKED FOR CHANGES IS OWED A REPAIR, NOT A
+    /// REFUSAL (backlog 99b7ae76). Measured 2026-10-16: car ff1b7a35 stood
+    /// held at the dock, its adversarial review run fae63341 recorded
+    /// `changes` (B1, a ref-lock race), and `boss dispatch 62ebae10`
+    /// refused with "let that car land" — a car that cannot land without
+    /// the repair. The judgement reads the same record the yard's held-car
+    /// row reads: the run the review step was dispatched to, and the head
+    /// the hold was placed at. Every other shape stays a refusal, each
+    /// naming the fact that failed.
+    #[test]
+    fn a_held_car_whose_review_asked_for_changes_at_its_head_is_owed_a_repair() {
+        const CAR: &str = "ff1b7a35-0000-4000-8000-000000000000";
+        const BUILDER: &str = "2f8f0316-0000-4000-8000-000000000000";
+        const REVIEWER: &str = "fae63341-0000-4000-8000-000000000000";
+        let (h1, h2) = ("1".repeat(40), "2".repeat(40));
+        let car = |status: &str, review_md: Value| {
+            json!({
+                "id": CAR, "kind": "ship-a-change", "status": "open",
+                "metadata": { "backlog_item": "62ebae10-0000-4000-8000-000000000000",
+                              "branch": "fix/the-launch-base", "agent_run": BUILDER },
+                "steps": [{ "id": "s-review", "spec_slug": boss_jobs::car::REVIEW_SLUG,
+                            "title": boss_jobs::car::REVIEW, "status": status,
+                            "metadata": review_md }],
+            })
+        };
+        let held = car(
+            "ready",
+            json!({ "hold": "trust-boundary car", "hold_sha": h1, "agent_run": REVIEWER }),
+        );
+        let reviewer = |id: &str, verdict: &str, sha: &str| {
+            json!({
+                "id": id, "kind": "agent-run",
+                "metadata": {
+                    "packet": CAR, "step": boss_jobs::car::REVIEW_SLUG,
+                    "review": crate::review_verdict::review_record(
+                        &held, sha, verdict, "B1: the ref lock races the fetch", "t"),
+                },
+            })
+        };
+
+        assert_eq!(
+            repair_owed(&held, &reviewer(REVIEWER, "changes", &h1)),
+            Ok(Repair {
+                car: CAR.into(),
+                branch: "fix/the-launch-base".into(),
+                head: h1.clone(),
+                review: REVIEWER.into(),
+                findings: "B1: the ref lock races the fetch".into(),
+            })
+        );
+
+        // afc5147c: a second CHANGES at the refreshed green is repair
+        // work at H2, read through the same held-head definition as release.
+        let mut refreshed = held.clone();
+        let (_, patch) = crate::mutating_verb::review_hold_write(&held, "new reason", Some(&h2))
+            .unwrap()
+            .expect("the green refresh moves the existing hold");
+        for (key, value) in patch.as_object().unwrap() {
+            refreshed["steps"][0]["metadata"][key] = value.clone();
+        }
+        assert_eq!(
+            repair_owed(&refreshed, &reviewer(REVIEWER, "changes", &h2)).map(|r| r.head),
+            Ok(h2.clone())
+        );
+
+        let refused = |car: &Value, run: Value, want: &str| {
+            let why = repair_owed(car, &run).expect_err(want);
+            assert!(why.contains(want), "{want:?} in {why}");
+        };
+        // A release is no request for changes.
+        refused(&held, reviewer(REVIEWER, "release", &h1), "\"release\"");
+        // Changes asked of another head: the repair may already be in,
+        // and what it owes is a review of the new head, not another build.
+        refused(&held, reviewer(REVIEWER, "changes", &h2), "22222222");
+        // The run read must be the one the review step names, or one
+        // opened on this car's review (an earlier run carrying the newest
+        // verdict, backlog 6ba6bb80) — a run saying neither is refused.
+        let mut unnamed = reviewer("0ther000-0000-4000-8000-000000000000", "changes", &h1);
+        unnamed["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("packet");
+        refused(&held, unnamed, "0ther000");
+        assert_eq!(
+            repair_owed(
+                &held,
+                &reviewer("0ther000-0000-4000-8000-000000000000", "changes", &h1)
+            )
+            .map(|r| r.review),
+            Ok("0ther000-0000-4000-8000-000000000000".to_string()),
+            "an earlier run opened on this car's review is judged on its own verdict"
+        );
+        // The builder's own run is no review.
+        let by_builder = car(
+            "ready",
+            json!({ "hold": "x", "hold_sha": h1, "agent_run": BUILDER }),
+        );
+        refused(&by_builder, reviewer(BUILDER, "changes", &h1), "built");
+        // A run opened on another car's review vouches for no other.
+        let mut elsewhere = reviewer(REVIEWER, "changes", &h1);
+        elsewhere["metadata"]["packet"] = json!("e1sewhe1-0000-4000-8000-000000000000");
+        refused(&held, elsewhere.clone(), "opened on");
+        // A run that is not an agent-run, and a review of another car.
+        let mut not_a_run = reviewer(REVIEWER, "changes", &h1);
+        not_a_run["kind"] = json!("ship-a-change");
+        refused(&held, not_a_run.clone(), "not an agent-run");
+        let mut of_another = reviewer(REVIEWER, "changes", &h1);
+        of_another["metadata"]["review"]["car"] = json!("an0ther0-0000-4000-8000-000000000000");
+        refused(&held, of_another.clone(), "an0ther0");
+        // The decided-review door (80d1c8f5) stands on the same predicate
+        // (`review_of_this_car`, review b01eec95 N2): each shape the repair
+        // door refuses for want of a review OF THIS CAR decides nothing.
+        assert!(review_already_decided(&held, &reviewer(REVIEWER, "changes", &h1)).is_some());
+        for (car, run) in [
+            (
+                &held,
+                reviewer("0ther000-0000-4000-8000-000000000000", "changes", &h1),
+            ),
+            (&by_builder, reviewer(BUILDER, "changes", &h1)),
+            (&held, elsewhere),
+            (&held, not_a_run),
+            (&held, of_another),
+        ] {
+            assert_eq!(review_already_decided(car, &run), None, "{run}");
+        }
+        // No reviewer yet, no head on the hold, or a car past the dock.
+        refused(
+            &car("ready", json!({ "hold": "x", "hold_sha": h1 })),
+            reviewer(REVIEWER, "changes", &h1),
+            "no reviewer",
+        );
+        refused(
+            &car("ready", json!({ "hold": "x", "agent_run": REVIEWER })),
+            reviewer(REVIEWER, "changes", &h1),
+            "records no head",
+        );
+        // A car a release already freed (backlog 291a65bf): the release
+        // patch writes `hold: null` and a `release` record, and KEEPS
+        // `hold_sha`, so the review step still names a reviewer whose
+        // `changes` verdict read that head. Reviewer B released at h1, a
+        // later reviewer A asked for changes at h1, and `boss release
+        // <car> --review B` freed it — the car is boardable, and a repair
+        // pushed onto it would pull it back to gated-then-changed. The
+        // refusal names the release that freed it.
+        const RELEASER: &str = "b0a7d0e5-0000-4000-8000-000000000000";
+        let release = json!({ "sha": h1, "review": RELEASER, "verdict": "release" });
+        let dock_reads = |c: &Value| {
+            crate::mutating_verb::dock(
+                c,
+                &h1,
+                || panic!("a car carrying a review hold_sha is not judged"),
+                |_, _| panic!("no replay to prove"),
+            )
+        };
+        // A review hold CLEARED BARE — `hold` gone and NO release record,
+        // which is what a bare `boss release` or a raw metadata PATCH
+        // leaves (review b67deef0 F1) — is no release: the dock holds it
+        // again at the same head ("cleared with no release naming a
+        // review"), so the repair the `changes` verdict asked for is
+        // still owed. Absence of a hold is not a release; only the
+        // release record is.
+        for cleared in [
+            json!({ "hold": null, "hold_sha": h1, "agent_run": REVIEWER }),
+            json!({ "hold_sha": h1, "agent_run": REVIEWER }),
+            json!({ "hold": "  ", "hold_sha": h1, "agent_run": REVIEWER }),
+        ] {
+            let bare = car("ready", cleared);
+            assert!(
+                matches!(dock_reads(&bare), crate::mutating_verb::Dock::Hold { .. }),
+                "the dock holds a bare-cleared review hold again"
+            );
+            assert_eq!(
+                repair_owed(&bare, &reviewer(REVIEWER, "changes", &h1))
+                    .map(|r| r.head)
+                    .as_deref(),
+                Ok(h1.as_str()),
+                "a bare-cleared hold is still owed its repair"
+            );
+        }
+        // Released: `hold` null (the release patch), absent, and blank,
+        // each beside the release record.
+        for hold in [Some(Value::Null), None, Some(json!("  "))] {
+            let mut md = json!({ "hold_sha": h1, "agent_run": REVIEWER,
+                                 boss_jobs::car::RELEASE: release.clone() });
+            if let Some(hold) = hold {
+                md["hold"] = hold;
+            }
+            let freed = car("ready", md);
+            let why = repair_owed(&freed, &reviewer(REVIEWER, "changes", &h1))
+                .expect_err("a released car is owed no repair");
+            assert!(why.contains("carries no hold"), "{why}");
+            assert!(
+                why.contains("b0a7d0e5"),
+                "names the release's review: {why}"
+            );
+            assert!(why.contains("11111111"), "names the release's head: {why}");
+            // The dock agrees: it checks that release, and holds nothing.
+            assert!(
+                matches!(dock_reads(&freed), crate::mutating_verb::Dock::Check { .. }),
+                "the dock boards a released car on its release"
+            );
+        }
+        refused(
+            &car(
+                "completed",
+                json!({ "hold_sha": h1, "agent_run": REVIEWER }),
+            ),
+            reviewer(REVIEWER, "changes", &h1),
+            "completed",
+        );
     }
 
     #[test]
@@ -4350,6 +6481,16 @@ mod tests {
             if let Some(body) = reader {
                 boss_testing::write_file(&root.join("infra/gcp/workflow-holds.py"), body);
             }
+            // The rows the refusal names, as this tree carries them: a
+            // kind with no file here is worded from its owning_team
+            // (f4696e6c, review 7a7fa1c8; tested below).
+            std::fs::create_dir_all(root.join("infra/platform/workflows")).unwrap();
+            for kind in ["ops-request", "backlog-item"] {
+                boss_testing::write_file(
+                    &root.join(format!("infra/platform/workflows/{kind}.toml")),
+                    &format!("kind = \"{kind}\"\n"),
+                );
+            }
             root
         };
         let held = checkout(
@@ -4358,28 +6499,225 @@ mod tests {
                 "print('held\\tops-request\\tdeclared in a file\\tturns on a refusal\\tbacklog 6c9183de')\n",
             ),
         );
-        let why = no_block_refusal_in(&held, "ops-request", "approve");
+        let why = no_block_refusal_in(&held, "ops-request", "approve", None);
         assert!(
             why.contains("HELD") && why.contains("turns on a refusal"),
             "{why}"
         );
         assert!(!why.contains("boss workflow publish"), "{why}");
         // The same tree, a kind it does not hold: the fix is named whole.
-        let why = no_block_refusal_in(&held, "backlog-item", "build");
+        let why = no_block_refusal_in(&held, "backlog-item", "build", None);
         assert!(why.contains("boss workflow publish backlog-item"), "{why}");
 
         let broken = checkout("broken", Some("import sys\nsys.exit(3)\n"));
-        let why = no_block_refusal_in(&broken, "backlog-item", "build");
+        let why = no_block_refusal_in(&broken, "backlog-item", "build", None);
         assert!(
             !why.contains("boss workflow publish") && why.contains("could not be read"),
             "{why}"
         );
 
         let bare = checkout("bare", None);
-        let why = no_block_refusal_in(&bare, "backlog-item", "build");
+        let why = no_block_refusal_in(&bare, "backlog-item", "build", None);
         assert!(
             !why.contains("boss workflow publish") && why.contains("was not read"),
             "{why}"
+        );
+    }
+
+    /// A delivered tenant's kind has no file in this tree to add a block
+    /// to (backlog f4696e6c): the refusal named
+    /// `infra/platform/workflows/receive-a-sponsorship.toml` and `boss
+    /// workflow publish` for a row authored in david/algedonic-llc, and a
+    /// nomination plus a builder run went to finding nothing here to
+    /// change (run ea48b00a). Planted in the shape the tree has on main:
+    /// instances.toml's [prod] names the tenant repo, the platform
+    /// directory carries the platform's kinds and not the tenant's, and
+    /// the holds reader holds nothing — so the old wording would have
+    /// named the publish whole.
+    #[test]
+    fn a_kind_this_tree_does_not_author_is_refused_toward_its_tenant_repo() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: needs python3");
+            return;
+        }
+        let root = boss_testing::scratch_dir("dispatch-refusal-tenant-kind");
+        for dir in ["infra/gcp", "infra/platform/workflows", "infra/cluster"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        boss_testing::write_file(&root.join("infra/gcp/workflow-holds.py"), "pass\n");
+        boss_testing::write_file(
+            &root.join("infra/platform/workflows/backlog-item.toml"),
+            "kind = \"backlog-item\"\n",
+        );
+        boss_testing::write_file(
+            &root.join(crate::brief::INSTANCES),
+            "source = \"prod\"\n\n[prod]\nnamespace = \"boss\"\ntenant_repo = \
+             \"david/algedonic-llc\"\ntenant_ref = \"main\"\n\n[playground]\nnamespace = \
+             \"boss-playground\"\ntenant_dir = \"examples/brewery\"\n",
+        );
+
+        // The tenant's kind: no file here, so the file is named only as
+        // absent — never as the place to add the block — and the publish
+        // is not named; the repo and the lane that builds in it are.
+        let why = no_block_refusal_in(
+            &root,
+            "receive-a-sponsorship",
+            "recognize",
+            Some("algedonic"),
+        );
+        assert!(
+            !why.contains("infra/platform/workflows/receive-a-sponsorship.toml)")
+                && !why.contains("boss workflow publish"),
+            "{why}"
+        );
+        for needle in [
+            "step `recognize` of receive-a-sponsorship declares no agent block",
+            "agent = {",
+            "carries no infra/platform/workflows/receive-a-sponsorship.toml",
+            "receive-a-sponsorship (owning_team algedonic) is authored outside it",
+            "david/algedonic-llc ([prod] tenant_repo)",
+            "infra/cluster/instances.toml",
+            "metadata.tenant_repo",
+            "tenant-builder",
+        ] {
+            assert!(why.contains(needle), "`{needle}` in: {why}");
+        }
+        // An instances file that cannot be read is SAID, never read as
+        // naming no repo.
+        let bare = boss_testing::scratch_dir("dispatch-refusal-tenant-kind-bare");
+        let why = no_block_refusal_in(
+            &bare,
+            "receive-a-sponsorship",
+            "recognize",
+            Some("algedonic"),
+        );
+        assert!(
+            why.contains("infra/cluster/instances.toml could not be read")
+                && !why.contains("boss workflow publish"),
+            "{why}"
+        );
+
+        // A row that was not read: its owner is SAID unknown, both homes
+        // are named with their conditions, and neither the publish nor
+        // the tenant-builder lane is chosen for the reader (review
+        // 7a7fa1c8: an owner that was not read is said, not guessed).
+        let why = no_block_refusal_in(&root, "receive-a-sponsorship", "recognize", None);
+        assert!(
+            !why.contains("boss workflow publish")
+                && !why.contains("tenant-builder")
+                && !why.contains("is authored outside it"),
+            "{why}"
+        );
+        for needle in [
+            "who authors receive-a-sponsorship cannot be told here",
+            "its Workflow row was not read",
+            "if it is `platform`, add",
+            "infra/platform/workflows/receive-a-sponsorship.toml",
+            "david/algedonic-llc ([prod] tenant_repo)",
+            "metadata.tenant_repo",
+        ] {
+            assert!(why.contains(needle), "`{needle}` in: {why}");
+        }
+
+        // The same tree, a kind it does author: the fix is named whole,
+        // as before.
+        let why = no_block_refusal_in(&root, "backlog-item", "build", Some("platform"));
+        assert!(
+            why.contains("infra/platform/workflows/backlog-item.toml")
+                && why.contains("boss workflow publish backlog-item")
+                && !why.contains("tenant-builder"),
+            "{why}"
+        );
+    }
+
+    /// A platform kind this tree authors OUTSIDE infra/platform/workflows
+    /// keeps the platform wording (review 7a7fa1c8 of car 8a15613c, F1).
+    /// `repair-a-train` is written by the migration 132-repair-a-train.sql,
+    /// live with owning_team `platform`, no file under
+    /// infra/platform/workflows and no agent block on any of its six
+    /// steps; at 9e61b8647 file absence alone sent its refusal to
+    /// david/algedonic-llc and the tenant-builder lane, beside its own
+    /// `(owning_team platform)`. Planted the same way as the tenant case
+    /// above, so the only difference between the two is the owner.
+    #[test]
+    fn a_platform_kind_with_no_file_here_is_not_sent_to_the_tenant_repo() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: needs python3");
+            return;
+        }
+        let root = boss_testing::scratch_dir("dispatch-refusal-platform-no-file");
+        for dir in ["infra/gcp", "infra/platform/workflows", "infra/cluster"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        boss_testing::write_file(&root.join("infra/gcp/workflow-holds.py"), "pass\n");
+        boss_testing::write_file(
+            &root.join(crate::brief::INSTANCES),
+            "source = \"prod\"\n\n[prod]\nnamespace = \"boss\"\ntenant_repo = \
+             \"david/algedonic-llc\"\ntenant_ref = \"main\"\n",
+        );
+
+        let why = no_block_refusal_in(&root, "repair-a-train", "diagnose", Some("platform"));
+        for absent in [
+            "david/algedonic-llc",
+            "tenant-builder",
+            "tenant_repo",
+            "authored outside it",
+            "tenant repo",
+        ] {
+            assert!(!why.contains(absent), "`{absent}` must not be in: {why}");
+        }
+        for needle in [
+            "step `diagnose` of repair-a-train declares no agent block",
+            "agent = {",
+            "in its Workflow row (infra/platform/workflows/repair-a-train.toml",
+            "This checkout carries no infra/platform/workflows/repair-a-train.toml yet",
+            "repair-a-train is the platform's",
+        ] {
+            assert!(why.contains(needle), "`{needle}` in: {why}");
+        }
+    }
+
+    /// With more than one tenant repo, the refusal says which authors the
+    /// kind is not recorded here rather than letting a list read as an
+    /// answer (review 7a7fa1c8, F3).
+    #[test]
+    fn several_tenant_repos_are_named_as_not_telling_which_authors_the_kind() {
+        let source = |instance: &str, repo: &str| crate::brief::TenantSource {
+            instance: instance.to_string(),
+            repo: repo.to_string(),
+            reference: "main".to_string(),
+        };
+        let one = tenant_kind_refusal(
+            "receive-a-sponsorship",
+            "recognize",
+            Some("algedonic"),
+            Ok(vec![source("prod", "david/algedonic-llc")]),
+        );
+        assert!(!one.contains("is not recorded in this tree"), "{one}");
+        let two = tenant_kind_refusal(
+            "receive-a-sponsorship",
+            "recognize",
+            Some("algedonic"),
+            Ok(vec![
+                source("prod", "david/algedonic-llc"),
+                source("other", "acme/tenant"),
+            ]),
+        );
+        assert!(
+            two.contains(
+                "david/algedonic-llc ([prod] tenant_repo), acme/tenant ([other] tenant_repo)"
+            ) && two.contains(
+                "which of them authors receive-a-sponsorship is not recorded in this tree"
+            ),
+            "{two}"
         );
     }
 
@@ -5538,6 +7876,29 @@ pub(crate) mod wire_tests {
         raced: usize,
         won_by_another: bool,
     ) -> (String, Log) {
+        stub_racing_with_trains(
+            packet,
+            row,
+            claim_conflict,
+            level,
+            lost,
+            raced,
+            won_by_another,
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn stub_racing_with_trains(
+        packet: Value,
+        row: Value,
+        claim_conflict: bool,
+        level: Option<Option<&'static str>>,
+        lost: usize,
+        raced: usize,
+        won_by_another: bool,
+        trains: Vec<Value>,
+    ) -> (String, Log) {
         let run: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
         let lost = Arc::new(Mutex::new(lost));
         let raced = Arc::new(Mutex::new(raced));
@@ -5555,6 +7916,9 @@ pub(crate) mod wire_tests {
                     },
                     // The landed-work read (a7837d81): no car names
                     // this packet, so nothing is refused here.
+                    ("GET", "/api/jobs") if target.contains("kind=pr-train") => {
+                        ("200 OK", json!({"data":trains,"total":trains.len()}).to_string())
+                    }
                     ("GET", "/api/jobs") => {
                         ("200 OK", json!({ "data": [], "total": 0 }).to_string())
                     }
@@ -5826,6 +8190,40 @@ pub(crate) mod wire_tests {
         }
     }
 
+    /// A NAMED PACKET IS RECORDED AS NAMED (backlog c9dd306a): a run
+    /// whose caller named its packet says so, with the packet the name
+    /// resolved to, so it is never mistaken for one the queue chose.
+    #[tokio::test]
+    async fn a_run_whose_caller_named_the_packet_records_it_as_named() {
+        let (base, _log, run) =
+            keeping_stub(packet_without_projection(), row_with_block(), live_agents()).await;
+        dispatch_at(
+            &crate::sor_client::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "boss-dev-0",
+            BriefSource::Handed {
+                prompt: "p",
+                session: None,
+            },
+        )
+        .await
+        .unwrap();
+        let run = run.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            run["metadata"][boss_jobs::agent_runs::SELECTED_BY_KEY],
+            json!({ "named": PACKET }),
+            "{run}"
+        );
+    }
+
     /// ONE ALIAS ON TWO ROWS NAMES NOBODY (review f7f0b689, N3). The
     /// resolver took the first row an alias matched, so a dispatch placed
     /// the run's Building with whichever row sorted first.
@@ -5915,6 +8313,433 @@ pub(crate) mod wire_tests {
         );
     }
 
+    /// What [`half_open_stub`] sends in place of a write it would keep:
+    /// asked first of every request, and an answer it gives is sent with
+    /// NOTHING stored — a failure, or a write that answered and was lost.
+    pub(crate) type Fault = fn(&str, &str, &Value) -> Option<(&'static str, String)>;
+
+    fn step_mut<'a>(job: &'a mut Value, sid: &str) -> Option<&'a mut Value> {
+        job["steps"]
+            .as_array_mut()?
+            .iter_mut()
+            .find(|s| s["id"] == sid)
+    }
+
+    /// The merge door's semantics: each key lands, a null deletes.
+    fn merge_into(target: &mut Value, body: &Value) {
+        if let (Some(md), Some(sent)) = (target.as_object_mut(), body.as_object()) {
+            for (k, v) in sent {
+                if v.is_null() {
+                    md.remove(k);
+                } else {
+                    md.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+
+    /// The step PUT's status-and-assignee body, as stored.
+    fn put_into(step: &mut Value, body: &Value) {
+        for key in ["status", "assignee_id"] {
+            if let Some(v) = body.get(key) {
+                step[key] = v.clone();
+            }
+        }
+    }
+
+    /// THE HALF-OPEN WINDOW's jobs API (backlog f8bed383). A
+    /// [`keeping_stub`] that keeps the PACKET too — its claim (holder:
+    /// the `claimed_for` nominee, else the dispatching login's registered
+    /// id), its merge door and its step PUT — and files a run carrying
+    /// the `refused` terminal the agent-run row declares. Completing that
+    /// terminal closes the run and skips every step still open, as the
+    /// jobs API's abort-from-any-state does (fd0f92ae). Returns the base,
+    /// the log, the packet and the run.
+    pub(crate) async fn half_open_stub(
+        row: Value,
+        fault: Fault,
+    ) -> (String, Log, Arc<Mutex<Value>>, Arc<Mutex<Option<Value>>>) {
+        let packet = Arc::new(Mutex::new(packet_without_projection()));
+        let run: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let (kept, filed_run) = (packet.clone(), run.clone());
+        let agents = live_agents();
+        let (base, log) = serve(move |method, path, target, body| {
+            if let Some(answer) = fault(method, path, body) {
+                return answer;
+            }
+            let packet_step = format!("/api/jobs/{PACKET}/steps/");
+            let run_step = format!("/api/jobs/{RUN}/steps/");
+            match (method, path) {
+                ("GET", "/api/agents") => ("200 OK", agents.to_string()),
+                ("GET", "/api/tenant/edit-level") => {
+                    ("200 OK", json!({ "edit_level": null }).to_string())
+                }
+                ("GET", "/api/jobs") => ("200 OK", json!({ "data": [], "total": 0 }).to_string()),
+                ("GET", "/api/workflows/backlog-item") => ("200 OK", row.to_string()),
+                ("GET", p) if p == format!("/api/jobs/{PACKET}") => {
+                    ("200 OK", kept.lock().unwrap().to_string())
+                }
+                ("POST", p) if p.starts_with(&packet_step) && p.ends_with("/claim") => {
+                    let sid = p[packet_step.len()..].trim_end_matches("/claim");
+                    let holder = target
+                        .split_once("claimed_for=")
+                        .map_or("agent-claude", |(_, v)| v.split('&').next().unwrap_or(""));
+                    let mut guard = kept.lock().unwrap();
+                    match step_mut(&mut guard, sid).filter(|s| s["status"] == "ready") {
+                        Some(s) => {
+                            s["status"] = json!("active");
+                            s["assignee_id"] = json!(holder);
+                            ("200 OK", s.to_string())
+                        }
+                        None => ("409 Conflict", json!({ "error": "not claimable" }).to_string()),
+                    }
+                }
+                ("PATCH", p) if p.starts_with(&packet_step) => {
+                    let sid = p[packet_step.len()..].trim_end_matches("/metadata");
+                    if let Some(s) = step_mut(&mut kept.lock().unwrap(), sid) {
+                        merge_into(&mut s["metadata"], body);
+                    }
+                    ("204 No Content", String::new())
+                }
+                ("PUT", p) if p.starts_with(&packet_step) => {
+                    if body.get("metadata").is_some() {
+                        return run_step_put(body);
+                    }
+                    if let Some(s) = step_mut(&mut kept.lock().unwrap(), &p[packet_step.len()..]) {
+                        put_into(s, body);
+                    }
+                    ("204 No Content", String::new())
+                }
+                ("POST", "/api/jobs") => {
+                    let mut filed = body.clone();
+                    filed["id"] = json!(RUN);
+                    filed["status"] = json!("open");
+                    filed["steps"] = json!([
+                        { "id": "run-claimed", "spec_slug": "claimed", "status": "completed", "metadata": {} },
+                        { "id": "run-briefed", "spec_slug": "briefed", "status": "ready",
+                          "metadata": { "authority_role": "platform-admin" } },
+                        { "id": "run-building", "spec_slug": "building", "status": "pending",
+                          "metadata": { "authority_role": "platform-admin" } },
+                        { "id": "run-refused", "spec_slug": "refused", "status": "pending",
+                          "metadata": { "outcome_kind": "aborted" } },
+                    ]);
+                    *filed_run.lock().unwrap() = Some(filed);
+                    ("201 Created", json!({ "id": RUN }).to_string())
+                }
+                ("GET", p) if p == format!("/api/jobs/{RUN}") => {
+                    match filed_run.lock().unwrap().clone() {
+                        Some(r) => ("200 OK", r.to_string()),
+                        None => ("404 Not Found", "no such job".into()),
+                    }
+                }
+                ("PATCH", p) if p == format!("/api/jobs/{RUN}/metadata") => {
+                    if let Some(filed) = filed_run.lock().unwrap().as_mut() {
+                        merge_into(&mut filed["metadata"], body);
+                    }
+                    ("204 No Content", String::new())
+                }
+                ("PATCH", p) if p.starts_with(&run_step) => {
+                    stub_merge(&filed_run, RUN, p, body);
+                    ("204 No Content", String::new())
+                }
+                ("PUT", p) if p.starts_with(&run_step) => {
+                    if body.get("metadata").is_some() {
+                        return run_step_put(body);
+                    }
+                    let sid = &p[run_step.len()..];
+                    let mut guard = filed_run.lock().unwrap();
+                    let Some(filed) = guard.as_mut() else {
+                        return ("404 Not Found", "no such job".into());
+                    };
+                    if let Some(s) = step_mut(filed, sid) {
+                        put_into(s, body);
+                    }
+                    if body["status"] == "completed" {
+                        let steps = filed["steps"].as_array_mut().unwrap();
+                        match sid {
+                            "run-briefed" => {
+                                for s in steps.iter_mut().filter(|s| s["id"] == "run-building") {
+                                    s["status"] = json!("ready");
+                                }
+                            }
+                            "run-refused" => {
+                                for s in steps.iter_mut().filter(|s| {
+                                    matches!(s["status"].as_str(), Some("pending" | "ready" | "active"))
+                                }) {
+                                    s["status"] = json!("skipped");
+                                }
+                                filed["status"] = json!("closed");
+                            }
+                            _ => {}
+                        }
+                    }
+                    ("204 No Content", String::new())
+                }
+                _ => ("404 Not Found", format!("unstubbed {method} {target}")),
+            }
+        })
+        .await;
+        (base, log, packet, run)
+    }
+
+    /// The run a refused hand-over left: ENDED on its `refused` terminal,
+    /// the reason on its own packet, nothing opened past `briefed`.
+    pub(crate) fn assert_ended(run: &Value, cause: &str) {
+        let step = |slug: &str| {
+            crate::envelope::steps(run)
+                .into_iter()
+                .find(|s| s["spec_slug"] == slug)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(step("refused")["status"], "completed", "{run:#}");
+        assert_eq!(run["status"], "closed", "{run:#}");
+        assert_ne!(step("briefed")["status"], "completed", "never briefed");
+        assert_ne!(step("building")["status"], "completed", "never built");
+        let why = run["metadata"]["ended_at_dispatch"]["why"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(why.contains(cause), "the run says why: {why:?}");
+    }
+
+    /// The work step a refused hand-over left: READY, nobody's, no run
+    /// edge, and the release on the record naming the run it came from.
+    pub(crate) fn assert_released(packet: &Value) {
+        let step = &packet["steps"][1];
+        assert_eq!(step["status"], "ready", "{step:#}");
+        assert!(step["assignee_id"].as_str().is_none(), "{step:#}");
+        assert!(step["metadata"].get("agent_run").is_none(), "{step:#}");
+        assert_eq!(step["metadata"]["released"]["from_run"], RUN, "{step:#}");
+        assert!(
+            step["metadata"]["released"]["why"]
+                .as_str()
+                .is_some_and(|w| !w.is_empty()),
+            "{step:#}"
+        );
+    }
+
+    async fn dispatch_rendered(base: &str) -> Result<Dispatched> {
+        dispatch_at(
+            &crate::sor_client::machine_client().unwrap(),
+            base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "boss-dev-0",
+            BriefSource::Rendered,
+        )
+        .await
+    }
+
+    /// A RUN NOBODY WAS HANDED IS ENDED, AND ITS CLAIM RELEASED (backlog
+    /// f8bed383, residue N9 of review b149c579). Between the run's create
+    /// and its prompt, every refusal returned Err and left the work step
+    /// claimed and the run open at `briefed`, with `building` PENDING —
+    /// and no rule ages a pending `building` or a `briefed` (the silence
+    /// clock reads only an open one), so the machine never ended either.
+    /// Measured here on a printed-prompt dispatch, through the run-edge
+    /// write: the same shape as the launch's building placement.
+    #[tokio::test]
+    async fn a_run_whose_edge_cannot_be_written_is_ended_and_its_claim_released() {
+        let (base, _log, packet, run) = half_open_stub(row_with_block(), |m, p, b| {
+            (m == "PATCH" && p.ends_with("/steps/s-build/metadata") && b.get("released").is_none())
+                .then(|| ("500 Internal Server Error", "the edge write failed".into()))
+        })
+        .await;
+        let err = dispatch_rendered(&base).await.expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("writing the run edge"),
+            "the cause stands: {text}"
+        );
+        assert!(
+            text.contains("ENDED") && text.contains("RELEASED"),
+            "{text}"
+        );
+        assert_ended(
+            &run.lock().unwrap().clone().unwrap(),
+            "writing the run edge",
+        );
+        assert_released(&packet.lock().unwrap());
+    }
+
+    /// A PROMPT ALREADY PRINTED KEEPS ITS RUN TO BE FINISHED. A printed
+    /// dispatch's `briefed` refusals come AFTER the prompt is out, and it
+    /// names this run, so their recovery is to finish THIS run (e381689d,
+    /// deba68e8) — ending it would leave a printed prompt naming a closed
+    /// run. Nothing is ended or released there.
+    #[tokio::test]
+    async fn a_printed_prompts_briefed_refusal_leaves_the_run_to_be_finished() {
+        let (base, _log, packet, run) = half_open_stub(row_with_block(), |m, p, _| {
+            (m == "PATCH" && p.ends_with("/steps/run-briefed/metadata"))
+                .then(|| ("204 No Content", String::new()))
+        })
+        .await;
+        let err = dispatch_rendered(&base).await.expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("does not hold"), "{text}");
+        assert!(!text.contains("ENDED"), "{text}");
+        // Kept to finish, so told how (backlog f843a0c9: only an ENDED
+        // run loses this advice).
+        assert!(
+            text.contains("To finish this run") && text.contains("boss-api PUT"),
+            "{text}"
+        );
+        let run = run.lock().unwrap().clone().unwrap();
+        assert_eq!(run["steps"][3]["status"], "pending", "not ended: {run:#}");
+        let packet = packet.lock().unwrap().clone();
+        assert_eq!(packet["steps"][1]["status"], "active", "still claimed");
+        assert_eq!(packet["steps"][1]["metadata"]["agent_run"], RUN);
+    }
+
+    /// A HANDED PROMPT'S REFUSAL ENDS NOTHING AND RELEASES NOTHING
+    /// (backlog 0f4e332e, review a6a66af7 of car a8248f7a). The cleanup
+    /// above is guarded by `BriefSource::Rendered`: a handed prompt is
+    /// already an agent's, whose hook lets the Agent call go ahead
+    /// whatever this verb answers, so releasing the step here could hand
+    /// it to a second builder while a live agent works it — the double
+    /// build the reclaim rule warns of. Dropping that half of the guard
+    /// left all 160 dispatch tests green; this is the pin. The same
+    /// refusal as the Rendered test above (the run-edge write fails), on
+    /// the Handed path: the cause stands, the run stays open with its
+    /// `refused` terminal unreached, and the work step stays ACTIVE with
+    /// the holder its claim gave it. Design 63639424 decides what the
+    /// hook path SHOULD do; the car that lands it updates this pin.
+    #[tokio::test]
+    async fn a_handed_prompts_refusal_neither_ends_the_run_nor_releases_the_claim() {
+        let (base, _log, packet, run) = half_open_stub(row_with_block(), |m, p, b| {
+            (m == "PATCH" && p.ends_with("/steps/s-build/metadata") && b.get("released").is_none())
+                .then(|| ("500 Internal Server Error", "the edge write failed".into()))
+        })
+        .await;
+        let err = dispatch_at(
+            &crate::sor_client::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "boss-dev-0",
+            BriefSource::Handed {
+                prompt: "p",
+                session: None,
+            },
+        )
+        .await
+        .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("writing the run edge"),
+            "the cause stands: {text}"
+        );
+        assert!(
+            !text.contains("ENDED") && !text.contains("RELEASED"),
+            "{text}"
+        );
+        let run = run.lock().unwrap().clone().unwrap();
+        assert_eq!(run["status"], "open", "not ended: {run:#}");
+        assert_eq!(run["steps"][3]["status"], "pending", "not ended: {run:#}");
+        let packet = packet.lock().unwrap().clone();
+        let step = &packet["steps"][1];
+        assert_eq!(step["status"], "active", "still claimed: {step:#}");
+        assert_eq!(step["assignee_id"], "agent-claude", "its holder: {step:#}");
+        assert!(step["metadata"].get("released").is_none(), "{step:#}");
+    }
+
+    /// A HAND-OVER THAT CANNOT BE UNDONE SAYS WHAT IS LEFT, BY COMMAND.
+    /// The cause of the refusal is often the jobs API itself, so the
+    /// writes that end the run and release the step can fail too: each
+    /// that did not read back is named with the command that finishes it.
+    #[tokio::test]
+    async fn an_end_and_release_that_fail_name_the_commands_left_by_hand() {
+        let (base, _log, packet, run) = half_open_stub(row_with_block(), |m, p, b| {
+            let edge = m == "PATCH"
+                && p.ends_with("/steps/s-build/metadata")
+                && b.get("released").is_none();
+            let end = m == "PUT" && p.ends_with("/steps/run-refused");
+            let release = m == "PUT" && p.ends_with("/steps/s-build");
+            (edge || end || release).then(|| ("500 Internal Server Error", "unavailable".into()))
+        })
+        .await;
+        let err = dispatch_rendered(&base).await.expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&format!("boss step complete {RUN} --step refused")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "boss step release {} --step build --why",
+                &PACKET[..8]
+            )),
+            "{text}"
+        );
+        assert_eq!(
+            run.lock().unwrap().clone().unwrap()["status"],
+            "open",
+            "the stub kept nothing it refused"
+        );
+        assert_eq!(packet.lock().unwrap()["steps"][1]["status"], "active");
+    }
+
+    /// A STEP ANOTHER HAND MOVED IS LEFT AS FOUND. The release frees only
+    /// the claim this dispatch made — active, the receipt's holder, no
+    /// other run's edge — because freeing anyone else's is the double
+    /// build the reclaim rule's header warns of. Nothing is written.
+    #[tokio::test]
+    async fn a_step_another_hand_moved_is_left_as_found() {
+        let left = Unhanded {
+            packet: PACKET,
+            step_id: "s-build",
+            slug: "build",
+            holder: Some("agent-codex"),
+            run_id: RUN,
+            by: "claude@algedonic.dev",
+        };
+        for (step, said) in [
+            (
+                json!({ "status": "active", "assignee_id": "emp-someone", "metadata": {} }),
+                "held by emp-someone",
+            ),
+            (
+                json!({ "status": "active", "assignee_id": "agent-codex",
+                        "metadata": { "agent_run": "another-run" } }),
+                "names run another-run",
+            ),
+            (json!({ "status": "ready", "metadata": {} }), "it is ready"),
+        ] {
+            let mut step = step;
+            step["id"] = json!("s-build");
+            let packet = json!({ "id": PACKET, "steps": [step] });
+            let writes = Arc::new(Mutex::new(0usize));
+            let counted = writes.clone();
+            let api = move |m: reqwest::Method, _: String, _: Option<Value>| {
+                let (counted, packet) = (counted.clone(), packet.clone());
+                async move {
+                    if m != reqwest::Method::GET {
+                        *counted.lock().unwrap() += 1;
+                    }
+                    Ok(Some(packet))
+                }
+            };
+            let got = release_unhanded_claim(&api, &left, "why", "at").await;
+            assert!(
+                matches!(&got, Ok(Released::LeftAsFound(w)) if w.contains(said)),
+                "{said}: {got:?}"
+            );
+            assert_eq!(*writes.lock().unwrap(), 0, "{said}: nothing written");
+        }
+    }
+
     pub(crate) fn repo() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
@@ -5951,6 +8776,173 @@ pub(crate) mod wire_tests {
                   "agent": { "profile": "builder", "model": "opus-5[1m]", "budget_usd": 5, "effort": "high" } },
             ],
         })
+    }
+
+    /// A landed car at TWO open steps, in the order the forge files them:
+    /// `proven` first, then `landed-review` — the shape landed review
+    /// 06b3f635 met on cost car b58e8c36 (backlog 4661a4a6). Each step
+    /// carries its own title, fields, procedure and projected block, so a
+    /// brief that names one and prints the other is visible in every
+    /// section a reader works from.
+    fn a_landed_car_at_proven_and_landed_review() -> Value {
+        json!({
+            "id": PACKET,
+            "kind": boss_jobs::regions::CAR_KIND,
+            "title": "Cost source car",
+            "status": "open",
+            "priority": "standard",
+            "opened_on": "2026-10-11",
+            "metadata": { "merged": "true" },
+            "steps": [
+                { "id": "s-review", "spec_slug": "review", "status": "completed", "metadata": {} },
+                { "id": "s-proven", "spec_slug": "proven", "kind": "task", "status": "ready",
+                  "title": "Proven in prod",
+                  "fields": [
+                      { "name": "verified", "field_type": "string", "required": true, "filled_by": "executor" },
+                      { "name": "proof", "field_type": "string", "required": true, "filled_by": "executor" },
+                  ],
+                  "metadata": {
+                      "authority_role": "platform-admin",
+                      "procedure": "PROVEN-PROCEDURE: observe the change working in PRODUCTION.",
+                      "agent_profile": "analyst", "agent_model": "opus-5-5",
+                      "agent_budget_usd": 2.0, "agent_effort": "medium",
+                  } },
+                { "id": "s-landed-review", "spec_slug": "landed-review", "kind": "task", "status": "ready",
+                  "title": "Reviewed after landing",
+                  "fields": [
+                      { "name": "verdict", "field_type": "clean|findings", "required": true, "filled_by": "executor" },
+                      { "name": "findings", "field_type": "string", "required": true, "filled_by": "executor" },
+                      { "name": "reviewed", "field_type": "string", "required": true, "filled_by": "executor" },
+                  ],
+                  "metadata": {
+                      "authority_role": "platform-admin",
+                      "procedure": "LANDED-REVIEW-PROCEDURE: an independent review of a change that LANDED.",
+                      "agent_profile": "reviewer", "agent_model": "opus-5-5",
+                      "agent_budget_usd": 3.0, "agent_effort": "medium",
+                  } },
+            ],
+        })
+    }
+
+    /// THE BRIEF PRINTS THE STEP THE DISPATCH SELECTED (backlog
+    /// 4661a4a6, measured by landed review 06b3f635, 2026-10-11).
+    /// `boss dispatch <car> --step landed-review` claimed exactly
+    /// `landed-review` and filed the run with `step=landed-review`, and
+    /// the START it printed carried THE STEP "Proven in prod" with
+    /// `proof` and `verified` required — because the renderer re-derived
+    /// the step as the FIRST open one, which was `proven`. The reviewer
+    /// was handed one step's contract and a claim on another. Every half
+    /// of the brief that names a step — the position line, the
+    /// specification, its fields and procedure, and the rules' profile —
+    /// is now the step the claim names.
+    #[tokio::test]
+    async fn an_explicit_step_is_the_step_the_brief_prints() {
+        let (base, log) = stub(a_landed_car_at_proven_and_landed_review(), json!({}), false).await;
+        let prompt = dispatch_at(
+            &crate::sor_client::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            Some("landed-review"),
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "boss-dev-0",
+            BriefSource::Rendered,
+        )
+        .await
+        .expect("dispatches")
+        .prompt;
+
+        let calls = log.calls.lock().unwrap().clone();
+        let claims: Vec<String> = calls
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p.contains("/claim"))
+            .map(|(_, p, _)| p.split('?').next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            claims,
+            vec![format!("/api/jobs/{PACKET}/steps/s-landed-review/claim")],
+            "the claim is the selected step's"
+        );
+        let filed = calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+            .map(|(_, _, b)| b.clone())
+            .expect("the run is filed");
+        assert_eq!(filed["metadata"]["step"], "landed-review");
+        assert_eq!(filed["metadata"]["profile"], "reviewer");
+
+        // The position line.
+        assert!(
+            prompt.contains(
+                "now at: Reviewed after landing\n        step `landed-review`, kind task"
+            ),
+            "the position is the selected step: {prompt}"
+        );
+        // The specification: title, slug, kind, fields, procedure.
+        assert!(
+            prompt.contains(
+                "== THE STEP — its own specification, verbatim from the step ==\n\n\
+                 Reviewed after landing — step `landed-review`, kind task"
+            ),
+            "THE STEP is the selected step: {prompt}"
+        );
+        for field in [
+            "verdict   clean|findings   REQUIRED",
+            "findings   string   REQUIRED",
+            "reviewed   string   REQUIRED",
+        ] {
+            assert!(prompt.contains(field), "carries {field}: {prompt}");
+        }
+        assert!(prompt.contains("LANDED-REVIEW-PROCEDURE"), "{prompt}");
+        // The rules are the selected step's profile's.
+        assert!(
+            prompt.contains("== THE RULES — profile `reviewer`"),
+            "the rules are the reviewer's: {prompt}"
+        );
+        // And nothing of the earlier open step's contract.
+        for other in [
+            "Proven in prod",
+            "step `proven`",
+            "PROVEN-PROCEDURE",
+            "proof   string",
+            "verified   string",
+        ] {
+            assert!(
+                !prompt.contains(other),
+                "the earlier ready step leaks into the brief ({other}): {prompt}"
+            );
+        }
+    }
+
+    /// The control: a selector naming no step of the packet is refused
+    /// BEFORE the claim — nothing claimed, nothing filed — and is never
+    /// answered by briefing whichever step is open first.
+    #[tokio::test]
+    async fn an_unknown_step_selector_is_refused_before_anything_is_claimed() {
+        let (base, log) = stub(a_landed_car_at_proven_and_landed_review(), json!({}), false).await;
+        let err = dispatch_at(
+            &crate::sor_client::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            Some("landed-reveiw"),
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "boss-dev-0",
+            BriefSource::Rendered,
+        )
+        .await
+        .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("has no step `landed-reveiw`"), "{text}");
+        assert_eq!(writes_of(&log), 0, "nothing claimed, nothing filed");
     }
 
     #[tokio::test]
@@ -6030,6 +9022,9 @@ pub(crate) mod wire_tests {
                 // a packet a merged car already names is refused while
                 // nothing has been claimed and nothing filed.
                 ("GET".to_string(), "/api/jobs".to_string()),
+                // The urgent-first read (90bff1f3), BEFORE the claim:
+                // the caller's own queue, one read for a standard step.
+                ("GET".to_string(), "/api/jobs/assignments".to_string()),
                 // What is already named (17bcc877): partial, closing and
                 // also-answer cars are all read while nothing is held.
                 ("GET".to_string(), "/api/jobs".to_string()),
@@ -6169,6 +9164,7 @@ pub(crate) mod wire_tests {
             None,
             &Overrides::default(),
             false,
+            None,
             &actor,
             "emp-david",
             "boss-dev-0",
@@ -6282,6 +9278,474 @@ pub(crate) mod wire_tests {
             BriefSource::Rendered,
         )
         .await
+    }
+
+    // ---- URGENT FIRST (backlog 90bff1f3) ------------------------------
+
+    const URGENT: &str = "c1d16aa6-5a1e-4c3b-9d2e-0000000000a1";
+
+    /// An urgent backlog-item, open, its build READY and nominated to the
+    /// dispatching actor's registry id — the shape of the five builds of
+    /// 2026-10-19/20, as agent-claude's own `for=me` answer showed seven
+    /// such rows on 2026-10-20 (status ready, assignee its id, no run).
+    fn urgent_packet(metadata: Value) -> Value {
+        json!({
+            "id": URGENT, "kind": "backlog-item", "title": "An urgent build nobody started",
+            "status": "open", "priority": "urgent", "opened_on": "2026-10-19",
+            "metadata": metadata,
+            "steps": [
+                { "id": "u-triage", "spec_slug": "triage", "status": "completed",
+                  "completed_at": "2026-10-20T09:00:00Z", "metadata": {} },
+                { "id": "u-build", "spec_slug": "build", "status": "ready",
+                  "assignee_id": "agent-claude",
+                  "metadata": { "authority_role": "platform-admin" } },
+            ],
+        })
+    }
+
+    /// The caller's queue as `assignments?for=me` answers it: rows, and
+    /// the ids and roles it was read for.
+    fn queue_of(rows: Vec<Value>) -> Value {
+        let n = rows.len();
+        json!({
+            "data": rows, "total": n,
+            "for": { "ids": ["claude@algedonic.dev", "agent-claude"], "roles": ["platform-admin"] },
+        })
+    }
+
+    fn urgent_row(status: &str) -> Value {
+        json!({ "job_id": URGENT, "job_title": "An urgent build nobody started",
+                "workflow": "backlog-item", "priority": "urgent", "opened_on": "2026-10-19",
+                "step": { "id": "u-build", "spec_slug": "build", "status": status,
+                          "assignee_id": "agent-claude", "metadata": {} } })
+    }
+
+    /// A jobs API serving a whole RENDERED dispatch of PACKET (standard)
+    /// and the urgent-first door's reads: the caller's queue, the urgent
+    /// packet, the open runs and cars that name it, and a station `s`
+    /// holding PACKET for `--next`.
+    async fn urgent_stub(
+        queue: Value,
+        urgent: Value,
+        runs: Vec<Value>,
+        cars: Vec<Value>,
+    ) -> (String, Log) {
+        urgent_stub_at(
+            packet_without_projection(),
+            vec![],
+            queue,
+            urgent,
+            runs,
+            cars,
+        )
+        .await
+    }
+
+    /// [`urgent_stub`] with PACKET served as `target`, and each of
+    /// `others` served at its own id — a car and its item.
+    async fn urgent_stub_at(
+        target: Value,
+        others: Vec<Value>,
+        queue: Value,
+        urgent: Value,
+        runs: Vec<Value>,
+        cars: Vec<Value>,
+    ) -> (String, Log) {
+        let run: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let page = |rows: &Vec<Value>| json!({ "data": rows, "total": rows.len() }).to_string();
+        let (runs, cars) = (page(&runs), page(&cars));
+        let other = move |p: &str| {
+            others
+                .iter()
+                .find(|o| p == format!("/api/jobs/{}", o["id"].as_str().unwrap_or("?")))
+                .map(Value::to_string)
+        };
+        serve(move |method, path, target_path, body| match (method, path) {
+            ("GET", p) if p == format!("/api/jobs/{PACKET}") => ("200 OK", target.to_string()),
+            ("GET", p) if p == format!("/api/jobs/{URGENT}") => ("200 OK", urgent.to_string()),
+            ("GET", p) if other(p).is_some() => ("200 OK", other(p).unwrap_or_default()),
+            ("GET", "/api/jobs/assignments") => ("200 OK", queue.to_string()),
+            ("GET", "/api/tenant/edit-level") => {
+                ("200 OK", json!({ "edit_level": null }).to_string())
+            }
+            ("GET", "/api/jobs") if target_path.contains("kind=agent-run") => {
+                ("200 OK", runs.clone())
+            }
+            ("GET", "/api/jobs") if target_path.contains("kind=ship-a-change") => {
+                ("200 OK", cars.clone())
+            }
+            ("GET", "/api/jobs") => ("200 OK", json!({ "data": [], "total": 0 }).to_string()),
+            ("GET", "/api/workflows/backlog-item") => ("200 OK", row_with_block().to_string()),
+            ("GET", "/api/stations/s/queue") => (
+                "200 OK",
+                json!({ "data": [{ "id": PACKET }], "total": 1 }).to_string(),
+            ),
+            ("POST", p) if p.ends_with("/claim") => (
+                "200 OK",
+                json!({ "status": "active", "assignee_id": "claude@algedonic.dev" }).to_string(),
+            ),
+            ("POST", "/api/jobs") => {
+                let mut filed = body.clone();
+                filed["id"] = json!(RUN);
+                filed["steps"] = json!([
+                    { "id": "run-claimed", "spec_slug": "claimed", "status": "completed", "metadata": {} },
+                    { "id": "run-briefed", "spec_slug": "briefed", "status": "ready",
+                      "metadata": { "authority_role": "platform-admin" } },
+                    { "id": "run-building", "spec_slug": "building", "status": "pending", "metadata": {} },
+                ]);
+                *run.lock().unwrap() = Some(filed);
+                ("201 Created", json!({ "id": RUN }).to_string())
+            }
+            ("GET", p) if p == format!("/api/jobs/{RUN}") => match run.lock().unwrap().clone() {
+                Some(r) => ("200 OK", r.to_string()),
+                None => ("404 Not Found", "no such job".into()),
+            },
+            ("PUT", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => run_step_put(body),
+            ("PATCH", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => {
+                stub_merge(&run, RUN, p, body);
+                ("204 No Content", String::new())
+            }
+            ("PATCH", p) if p.starts_with(&format!("/api/jobs/{PACKET}/")) => {
+                ("204 No Content", String::new())
+            }
+            _ => ("404 Not Found", format!("unstubbed {method} {target_path}")),
+        })
+        .await
+    }
+
+    /// `boss dispatch PACKET` with `--force-standard --why <why>`.
+    async fn dispatch_forced(base: &str, why: &str) -> Result<Dispatched> {
+        super::dispatch_to(
+            &crate::sor_client::machine_client().unwrap(),
+            base,
+            &repo(),
+            PACKET,
+            None,
+            None,
+            &Overrides::default(),
+            false,
+            Some(why),
+            "claude@algedonic.dev",
+            "emp-david",
+            "boss-dev-0",
+            BriefSource::Rendered,
+            None,
+        )
+        .await
+    }
+
+    fn wrote(log: &Log) -> Vec<(String, String)> {
+        log.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _, _)| m != "GET")
+            .map(|(m, p, _)| (m.clone(), p.clone()))
+            .collect()
+    }
+
+    /// THE DEFECT, REFUSED (backlog 90bff1f3). Measured 2026-10-19/20:
+    /// agent-claude-b dispatched ~32 standard builds while five urgent
+    /// builds assigned to it sat READY with no run. A standard dispatch
+    /// by an actor holding one is refused before anything is claimed or
+    /// filed, naming the urgent step, the command that starts it, and
+    /// the escape.
+    #[tokio::test]
+    async fn a_standard_dispatch_is_refused_while_your_urgent_build_is_ready() {
+        let (base, log) = urgent_stub(
+            queue_of(vec![urgent_row("ready")]),
+            urgent_packet(json!({})),
+            vec![],
+            vec![],
+        )
+        .await;
+        let err = dispatch_to(&base).await.expect_err("refused");
+        let why = format!("{err:#}");
+        assert!(why.contains("URGENT FIRST"), "{why}");
+        assert!(why.contains(&URGENT[..8]), "names the urgent step: {why}");
+        assert!(
+            why.contains(&format!("boss dispatch {} --step build", &URGENT[..8])),
+            "the command for the first: {why}"
+        );
+        assert!(
+            why.contains(&format!(
+                "boss dispatch {} --step build --force-standard --why '",
+                &PACKET[..8]
+            )),
+            "the escape: {why}"
+        );
+        assert_eq!(wrote(&log), Vec::new(), "nothing claimed, filed or written");
+    }
+
+    /// AND FROM THE QUEUE: `--next` taking a standard step nobody holds
+    /// while the caller's urgent build waits is refused the same way —
+    /// the urgent step need not be in that station at all.
+    #[tokio::test]
+    async fn dispatch_next_is_refused_the_same_way() {
+        let (base, log) = urgent_stub(
+            queue_of(vec![urgent_row("ready")]),
+            urgent_packet(json!({})),
+            vec![],
+            vec![],
+        )
+        .await;
+        let err = next_at(
+            &crate::sor_client::machine_client().unwrap(),
+            &base,
+            &repo(),
+            "s",
+            &Overrides::default(),
+            "claude@algedonic.dev",
+            "emp-david",
+            "boss-dev-0",
+        )
+        .await
+        .expect_err("refused");
+        let why = format!("{err:#}");
+        assert!(
+            why.contains(&format!("boss dispatch {} --step build", &URGENT[..8])),
+            "{why}"
+        );
+        assert_eq!(wrote(&log), Vec::new(), "nothing claimed, filed or written");
+    }
+
+    /// THE ESCAPE IS ON THE RECORD. `--force-standard --why` admits the
+    /// dispatch, and the why is written to the standard packet's
+    /// `dispatch_note` BEFORE the claim, and rides the run.
+    #[tokio::test]
+    async fn force_standard_admits_and_puts_the_why_on_the_packet_and_the_run() {
+        let (base, log) = urgent_stub(
+            queue_of(vec![urgent_row("ready")]),
+            urgent_packet(json!({})),
+            vec![],
+            vec![],
+        )
+        .await;
+        let why = "the deploy window for this fix closes at 17:00Z";
+        dispatch_forced(&base, why).await.expect("admitted");
+        let calls = log.calls.lock().unwrap().clone();
+        let at = |want: &dyn Fn(&(String, String, Value)) -> bool| {
+            calls.iter().position(want).expect("the call was made")
+        };
+        let noted = at(&|(m, p, _)| m == "PATCH" && *p == format!("/api/jobs/{PACKET}/metadata"));
+        let claimed = at(&|(m, p, _)| m == "POST" && p.ends_with("/claim"));
+        assert!(noted < claimed, "the why is recorded before the claim");
+        let note = &calls[noted].2[crate::urgent_first::NOTE_KEY];
+        assert_eq!(note["kind"], crate::urgent_first::NOTE_KIND);
+        assert_eq!(note["why"], why);
+        assert_eq!(note["by"], "claude@algedonic.dev");
+        assert_eq!(note["step"], "build");
+        assert_eq!(note["overrode"][0]["packet"], URGENT);
+        let filed = &calls[at(&|(m, p, _)| m == "POST" && p == "/api/jobs")].2;
+        assert_eq!(
+            filed["metadata"][crate::urgent_first::RUN_KEY],
+            *note,
+            "the run carries the same record"
+        );
+    }
+
+    /// A REFUSED DISPATCH LEAVES NO NOTE (review e22dd1c6). The note was
+    /// written at the urgent-first door, before the block read, the venue
+    /// door and the launch plan, so a dispatch one of them refused left a
+    /// `dispatch_note` for an override that never took effect. Here the
+    /// packet's kind has no Workflow row to read a block from.
+    #[tokio::test]
+    async fn a_forced_dispatch_a_later_door_refuses_leaves_no_note() {
+        let mut target = packet_without_projection();
+        target["kind"] = json!("a-kind-with-no-row");
+        let (base, log) = urgent_stub_at(
+            target,
+            vec![],
+            queue_of(vec![urgent_row("ready")]),
+            urgent_packet(json!({})),
+            vec![],
+            vec![],
+        )
+        .await;
+        dispatch_forced(&base, "the deploy window closes at 17:00Z")
+            .await
+            .expect_err("no agent block: refused");
+        assert_eq!(wrote(&log), Vec::new(), "no note, no claim, no run");
+    }
+
+    /// AS TODAY when nothing urgent is the caller's to start: an urgent
+    /// step already ACTIVE (being worked), and an empty queue.
+    #[tokio::test]
+    async fn with_no_ready_urgent_step_the_dispatch_is_admitted_as_today() {
+        for queue in [queue_of(vec![urgent_row("active")]), queue_of(vec![])] {
+            let (base, log) = urgent_stub(queue, urgent_packet(json!({})), vec![], vec![]).await;
+            dispatch_to(&base).await.expect("admitted");
+            assert!(
+                !wrote(&log)
+                    .iter()
+                    .any(|(_, p)| *p == format!("/api/jobs/{PACKET}/metadata")),
+                "no note without an override"
+            );
+        }
+    }
+
+    /// WHAT IS NOT STARTABLE DOES NOT REFUSE: an urgent step an open
+    /// agent-run already names, a packet waiting on a design (the
+    /// `waiting_on` edge a design-review rides), and an item a car parked
+    /// HELD at the dock carries.
+    #[tokio::test]
+    async fn urgent_work_a_run_a_design_or_a_held_car_holds_does_not_refuse() {
+        let run = json!({ "id": RUN, "kind": "agent-run", "status": "open",
+                          "metadata": { "packet": URGENT, "step": "build" } });
+        // Parked HELD: at its review step, ready, carrying the `hold`
+        // `boss gate --hold` writes — the shape `orient::dock_hold` reads.
+        let car = json!({ "id": "e7f3ed8c-0000-4000-8000-0000000000ca", "kind": "ship-a-change",
+                          "status": "open",
+                          "steps": [{ "id": "c-review", "spec_slug": "review", "title": "Open for review",
+                                      "status": "ready",
+                                      "metadata": { "hold": "trust-boundary car: waits for its review" } }],
+                          "metadata": { "backlog_item": URGENT, "branch": "fix/the-urgent-build" } });
+        let design = json!({ "waiting_on": "9f1d0c2a-0000-4000-8000-00000000d351" });
+        for (said, packet, runs, cars) in [
+            ("an open run", urgent_packet(json!({})), vec![run], vec![]),
+            ("a design", urgent_packet(design), vec![], vec![]),
+            ("a held car", urgent_packet(json!({})), vec![], vec![car]),
+        ] {
+            let (base, _) =
+                urgent_stub(queue_of(vec![urgent_row("ready")]), packet, runs, cars).await;
+            dispatch_to(&base)
+                .await
+                .unwrap_or_else(|e| panic!("{said}: admitted, got {e:#}"));
+        }
+    }
+
+    /// The urgent item a car carries — not URGENT, whose build is the
+    /// caller's other ready urgent step.
+    const URGENT_ITEM: &str = "90bff1f3-134e-4cb5-a5fd-0000000000b2";
+
+    fn urgent_item() -> Value {
+        let mut item = urgent_packet(json!({}));
+        item["id"] = json!(URGENT_ITEM);
+        item
+    }
+
+    /// A car of `item` at its review step, READY for the caller and HELD
+    /// for that review, filed `standard` as every car is (boss-jobs
+    /// car.rs) — the shape of car 97f72427 at its review, 2026-10-20.
+    fn held_car(id: &str, item: &str) -> Value {
+        json!({
+            "id": id, "kind": boss_jobs::regions::CAR_KIND,
+            "title": "The urgent item's car", "status": "open", "priority": "standard",
+            "opened_on": "2026-10-20",
+            "metadata": { "backlog_item": item, "branch": "fix/the-urgent-item" },
+            "steps": [{ "id": "c-review", "spec_slug": "review", "kind": "task",
+                        "title": "Open for review", "status": "ready",
+                        "assignee_id": "agent-claude",
+                        "metadata": { "hold": "trust-boundary car: waits for its review",
+                                      "authority_role": "platform-admin",
+                                      "agent_profile": "reviewer", "agent_model": "opus-5-5",
+                                      "agent_budget_usd": 3.0, "agent_effort": "medium" } }],
+        })
+    }
+
+    /// F1 OF REVIEW e22dd1c6, THE REVIEWER'S SCENARIO. The door read
+    /// urgency off the dispatched packet's own priority, and every car is
+    /// filed standard, so an actor holding a ready urgent build was
+    /// REFUSED the review of an urgent item's held car — the one dispatch
+    /// a trust-boundary hold on urgent work waits for — unless it wrote a
+    /// note calling that review standard. A car ranks as its item: the
+    /// review is urgent work, admitted, and no note is written.
+    #[tokio::test]
+    async fn the_review_of_an_urgent_items_car_is_urgent_work_and_admitted() {
+        let (base, log) = urgent_stub_at(
+            held_car(PACKET, URGENT_ITEM),
+            vec![urgent_item()],
+            queue_of(vec![urgent_row("ready")]),
+            urgent_packet(json!({})),
+            vec![],
+            vec![],
+        )
+        .await;
+        dispatch_at(
+            &crate::sor_client::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            Some("review"),
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "boss-dev-0",
+            BriefSource::Rendered,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the urgent item's review is admitted, got {e:#}"));
+        assert!(
+            !wrote(&log)
+                .iter()
+                .any(|(_, p)| *p == format!("/api/jobs/{PACKET}/metadata")),
+            "no dispatch_note: nothing was overridden"
+        );
+    }
+
+    /// F1, the other half: that held review is urgent work the caller
+    /// could start, so a STANDARD dispatch while it waits is refused the
+    /// same way, naming the car's review.
+    #[tokio::test]
+    async fn a_ready_held_review_of_an_urgent_items_car_refuses_standard_work() {
+        let car = "e7f3ed8c-0000-4000-8000-0000000000cb";
+        let row = json!({ "job_id": car, "job_title": "The urgent item's car",
+                          "workflow": boss_jobs::regions::CAR_KIND, "priority": "standard",
+                          "opened_on": "2026-10-20",
+                          "step": { "id": "c-review", "spec_slug": "review", "status": "ready",
+                                    "assignee_id": "agent-claude", "metadata": {} } });
+        let (base, log) = urgent_stub_at(
+            packet_without_projection(),
+            vec![held_car(car, URGENT_ITEM), urgent_item()],
+            queue_of(vec![row]),
+            urgent_packet(json!({})),
+            vec![],
+            vec![],
+        )
+        .await;
+        let err = dispatch_to(&base).await.expect_err("refused");
+        let why = format!("{err:#}");
+        assert!(why.contains("URGENT FIRST"), "{why}");
+        assert!(
+            why.contains(&format!("boss dispatch {} --step review", &car[..8])),
+            "names the car's review: {why}"
+        );
+        assert_eq!(wrote(&log), Vec::new(), "nothing claimed, filed or written");
+    }
+
+    #[tokio::test]
+    async fn your_own_held_car_does_not_refuse_a_standard_dispatch() {
+        let car = "e7f3ed8c-0000-4000-8000-0000000000cb";
+        let builder = "b011de00-0000-4000-8000-000000000001";
+        let row = json!({"job_id":car, "workflow":boss_jobs::regions::CAR_KIND,
+            "priority":"standard", "step":{"id":"c-review", "spec_slug":"review",
+                "status":"ready", "assignee_id":"agent-claude"}});
+        let mut own = held_car(car, URGENT_ITEM);
+        own["metadata"]["agent_run"] = json!(builder);
+        let (base, log) = urgent_stub_at(
+            packet_without_projection(),
+            vec![
+                own,
+                urgent_item(),
+                json!({"id":builder,"kind":"agent-run",
+                "status":"closed", "metadata":{"agent":"agent-claude"}}),
+            ],
+            queue_of(vec![row]),
+            urgent_packet(json!({})),
+            vec![],
+            vec![],
+        )
+        .await;
+        dispatch_to(&base)
+            .await
+            .expect("the builder cannot review its own car");
+        assert!(
+            !wrote(&log)
+                .iter()
+                .any(|(_, p)| *p == format!("/api/jobs/{PACKET}/metadata"))
+        );
     }
 
     /// Run 6b6fe011, 2026-09-25 (backlog e381689d): the merge answered
@@ -6521,6 +9985,12 @@ pub(crate) mod wire_tests {
         boss_testing::write_file(
             &checkout.join("infra/gcp/workflow-holds.py"),
             "print('held\\tbacklog-item\\tdeclared in a file\\tturns on a refusal\\tbacklog 6c9183de')\n",
+        );
+        // The row the refusal names, as this tree carries it (f4696e6c).
+        std::fs::create_dir_all(checkout.join("infra/platform/workflows")).unwrap();
+        boss_testing::write_file(
+            &checkout.join("infra/platform/workflows/backlog-item.toml"),
+            "kind = \"backlog-item\"\n",
         );
         let row_without = json!({
             "kind": "backlog-item",
@@ -6887,6 +10357,42 @@ pub(crate) mod wire_tests {
     /// for, and holds a step the conductor is about to complete. So the
     /// refusal comes before the claim, and names why.
     #[tokio::test]
+    async fn a_review_aboard_an_open_train_is_refused_before_the_claim() {
+        let train_id = "01234567-1234-4234-8234-012345678901";
+        let trains = vec![json!({"id":train_id,"kind":"pr-train","status":"open",
+            "metadata":{"boarded_jobs":[PACKET]}})];
+        let (base, log) = stub_racing_with_trains(
+            car_at_review(Some("too late")),
+            row_with_block(),
+            false,
+            Some(None),
+            0,
+            0,
+            false,
+            trains,
+        )
+        .await;
+        let error = dispatch_at(
+            &crate::sor_client::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            Some("review"),
+            None,
+            &Overrides::default(),
+            false,
+            "claude@algedonic.dev",
+            "emp-david",
+            "h",
+            BriefSource::Rendered,
+        )
+        .await
+        .expect_err("aboard review is refused");
+        assert!(format!("{error:#}").contains(train_id), "{error:#}");
+        assert_eq!(writes_of(&log), 0);
+    }
+
+    #[tokio::test]
     async fn a_review_step_with_no_hold_is_refused_before_the_claim() {
         let (base, log) = stub(car_at_review(None), row_with_block(), false).await;
         let err = dispatch_at(
@@ -6909,6 +10415,235 @@ pub(crate) mod wire_tests {
         assert!(text.contains("no hold"), "{text}");
         assert!(text.contains("nothing claimed, nothing filed"), "{text}");
         assert_eq!(writes_of(&log), 0, "nothing claimed, nothing filed");
+    }
+
+    /// The reviewer a car's review step was LAST dispatched to.
+    const PRIOR_REVIEWER: &str = "a0c2fb5f-0000-4000-8000-0000000000a0";
+
+    /// A held car at `review` whose step names [`PRIOR_REVIEWER`], which
+    /// recorded `verdict` at `reviewed`; the hold stands at `"1" * 40`.
+    async fn decided_car_stub(verdict: &'static str, reviewed: String) -> (String, Log) {
+        let car = car_at_review(Some("adversarial review of a trust-boundary change"));
+        decided_car_stub_for(car, verdict, reviewed).await
+    }
+
+    /// [`decided_car_stub`] over a car the caller shaped first.
+    async fn decided_car_stub_for(
+        mut car: Value,
+        verdict: &'static str,
+        reviewed: String,
+    ) -> (String, Log) {
+        car["steps"][1]["metadata"]["hold_sha"] = json!("1".repeat(40));
+        car["steps"][1]["metadata"]["agent_run"] = json!(PRIOR_REVIEWER);
+        let prior = json!({
+            "id": PRIOR_REVIEWER, "kind": "agent-run", "status": "closed",
+            "metadata": {
+                "packet": PACKET, "step": "review",
+                "review": crate::review_verdict::review_record(
+                    &car, &reviewed, verdict,
+                    "B1 (blocking): rebase onto main keeping census_api.", "t"),
+            },
+        });
+        let row = row_with_block();
+        let run: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        serve(move |method, path, target, body| match (method, path) {
+            ("GET", p) if p == format!("/api/jobs/{PACKET}") => ("200 OK", car.to_string()),
+            ("GET", p) if p == format!("/api/jobs/{PRIOR_REVIEWER}") => {
+                ("200 OK", prior.to_string())
+            }
+            ("GET", "/api/tenant/edit-level") => (
+                "200 OK",
+                json!({ "edit_level": Value::Null, "manifest": "t.toml" }).to_string(),
+            ),
+            ("GET", "/api/jobs") => ("200 OK", json!({ "data": [], "total": 0 }).to_string()),
+            ("GET", p) if p.starts_with("/api/workflows/") => ("200 OK", row.to_string()),
+            ("POST", p) if p.ends_with("/claim") => {
+                ("200 OK", json!({ "status": "active" }).to_string())
+            }
+            ("POST", "/api/jobs") => {
+                let mut filed = body.clone();
+                filed["id"] = json!(RUN);
+                filed["steps"] = json!([
+                    { "id": "run-briefed", "spec_slug": "briefed", "status": "ready",
+                      "metadata": { "authority_role": "platform-admin" } },
+                ]);
+                *run.lock().unwrap() = Some(filed);
+                ("201 Created", json!({ "id": RUN }).to_string())
+            }
+            ("GET", p) if p == format!("/api/jobs/{RUN}") => match run.lock().unwrap().clone() {
+                Some(r) => ("200 OK", r.to_string()),
+                None => ("404 Not Found", "no such job".into()),
+            },
+            ("PUT", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => run_step_put(body),
+            ("PATCH", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => {
+                stub_merge(&run, RUN, p, body);
+                ("204 No Content", String::new())
+            }
+            ("PATCH", p) if p.starts_with(&format!("/api/jobs/{PACKET}/steps/")) => {
+                ("204 No Content", String::new())
+            }
+            _ => ("404 Not Found", format!("unstubbed {method} {target}")),
+        })
+        .await
+    }
+
+    async fn dispatch_review(base: &str, force: bool) -> Result<Dispatched> {
+        dispatch_at(
+            &crate::sor_client::machine_client().unwrap(),
+            base,
+            &repo(),
+            PACKET,
+            Some("review"),
+            None,
+            &Overrides::default(),
+            force,
+            "claude@algedonic.dev",
+            "emp-david",
+            "h",
+            BriefSource::Rendered,
+        )
+        .await
+    }
+
+    /// A REVIEW ALREADY JUDGED AT AN UNMOVED HEAD IS NOT DISPATCHED AGAIN
+    /// (backlog 80d1c8f5). Measured 2026-10-18: review run a0c2fb5f had
+    /// asked for CHANGES on car d94dbcc9 at head 215460a2, and `boss
+    /// dispatch <car> --step review` opened run f47ce7de at that same
+    /// head, which spent ~123k tokens confirming the same blocking
+    /// finding. Refused before the claim, naming the review, its head and
+    /// the rework it asked for; a RELEASE at the head is decided too, and
+    /// names the release that is owed instead.
+    #[tokio::test]
+    async fn a_review_dispatch_at_a_head_its_last_review_already_judged_is_refused() {
+        for (verdict, owed) in [
+            (
+                "changes",
+                "B1 (blocking): rebase onto main keeping census_api.",
+            ),
+            ("release", "boss release"),
+        ] {
+            let (base, log) = decided_car_stub(verdict, "1".repeat(40)).await;
+            let err = dispatch_review(&base, false)
+                .await
+                .expect_err("a decided head is refused");
+            let text = format!("{err:#}");
+            for want in [
+                PRIOR_REVIEWER,
+                "11111111",
+                owed,
+                "--force",
+                "nothing claimed",
+            ] {
+                assert!(text.contains(want), "{verdict}: {want:?} in {text}");
+            }
+            assert_eq!(
+                writes_of(&log),
+                0,
+                "{verdict}: nothing claimed, nothing filed"
+            );
+        }
+    }
+
+    /// …and a MOVED head is a fresh review: the repair re-gated the car,
+    /// the hold now stands at a head no reviewer has read, so the
+    /// dispatch is admitted as before and records no override.
+    #[tokio::test]
+    async fn a_review_dispatch_at_a_moved_head_is_admitted() {
+        let (base, log) = decided_car_stub("changes", "2".repeat(40)).await;
+        dispatch_review(&base, false)
+            .await
+            .expect("a head the last review did not read is reviewed afresh");
+        let calls = log.calls.lock().unwrap().clone();
+        let filed = calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+            .map(|(_, _, b)| b.clone())
+            .expect("the run is filed");
+        assert!(filed["metadata"].get("rereview").is_none(), "{filed}");
+    }
+
+    /// `--force` re-reviews a decided head ON THE RECORD: the run packet
+    /// names the review it overrides, its verdict and the head.
+    #[tokio::test]
+    async fn a_forced_review_of_a_decided_head_records_the_override() {
+        let (base, log) = decided_car_stub("changes", "1".repeat(40)).await;
+        dispatch_review(&base, true)
+            .await
+            .expect("forced past the decided head");
+        let calls = log.calls.lock().unwrap().clone();
+        let filed = calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+            .map(|(_, _, b)| b.clone())
+            .expect("the run is filed");
+        assert_eq!(
+            filed["metadata"]["rereview"],
+            json!({ "review": PRIOR_REVIEWER, "head": "1".repeat(40), "verdict": "changes" })
+        );
+    }
+
+    /// A RELEASE ALREADY SPENT IS NOT A RELEASE OWED (review b01eec95 B1).
+    /// The conductor's own road (car_release.rs, re-review 6c1788dc B2,
+    /// pinned there by
+    /// a_fresh_review_after_a_failed_boarding_check_at_the_release_head_releases):
+    /// review run R released the car at H, the boarding check then failed
+    /// at H, and the conductor re-held the car AT H asking for "boss
+    /// review, then boss release --review" while the step still names R as
+    /// its `agent_run`. The release door refuses R's release again
+    /// (`released_already`), so this door must admit the fresh review —
+    /// refusing it named a release the release door refuses, and the two
+    /// doors pointed at each other until `--force` recorded a misleading
+    /// `rereview`. The id compares without case, as `released_already`'s
+    /// does.
+    #[tokio::test]
+    async fn a_fresh_review_after_a_failed_boarding_check_at_the_release_head_is_admitted() {
+        for named_as in [PRIOR_REVIEWER.to_string(), PRIOR_REVIEWER.to_uppercase()] {
+            let h = "1".repeat(40);
+            let mut car = car_at_review(Some(
+                "conductor re-judge at 111111111111: its release names review run a0c2fb5f, \
+                 which does not vouch for this head (executor); boss review, then boss release \
+                 --review",
+            ));
+            car["steps"][1]["metadata"][boss_jobs::car::RELEASE] = json!({
+                "sha": h, "review": named_as, "by": "emp-david", "at": "t0",
+            });
+            let (base, log) = decided_car_stub_for(car, "release", h).await;
+            if let Err(e) = dispatch_review(&base, false).await {
+                panic!("{named_as}: refused the conductor's own road: {e:#}");
+            }
+            let calls = log.calls.lock().unwrap().clone();
+            let filed = calls
+                .iter()
+                .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+                .map(|(_, _, b)| b.clone())
+                .expect("the run is filed");
+            assert!(filed["metadata"].get("rereview").is_none(), "{filed}");
+        }
+    }
+
+    /// The CHANGES refusal is runnable as printed (review b01eec95 N1): it
+    /// names the car's own item for the repair dispatch, and the `--hold`
+    /// it asks the re-gate for carries the hold's own reason, since `boss
+    /// gate --hold` takes one.
+    #[tokio::test]
+    async fn a_changes_refusal_names_the_item_and_the_hold_reason() {
+        let mut car = car_at_review(Some("adversarial review of a trust-boundary change"));
+        car["metadata"][boss_jobs::car::BACKLOG_ITEM] =
+            json!("80d1c8f5-8e6c-470e-9828-a34ddd8ebb40");
+        let (base, _log) = decided_car_stub_for(car, "changes", "1".repeat(40)).await;
+        let text = format!(
+            "{:#}",
+            dispatch_review(&base, false)
+                .await
+                .expect_err("a decided head is refused")
+        );
+        for want in [
+            "boss dispatch 80d1c8f5",
+            "--hold 'adversarial review of a trust-boundary change'",
+        ] {
+            assert!(text.contains(want), "{want:?} in {text}");
+        }
+        assert!(!text.contains("<its item>"), "{text}");
     }
 
     /// THE REFUSAL POINTS WHERE OPTION A POINTS (backlog c851ed24, review
@@ -6937,6 +10672,42 @@ pub(crate) mod wire_tests {
             "no longer advises the hold coordinator rule 3 retired: {why}"
         );
         assert!(why.contains("nothing claimed, nothing filed"), "{why}");
+    }
+
+    #[test]
+    fn malformed_review_gate_envelope_does_not_refuse_an_owed_adversarial_review() {
+        for poison in [json!({}), json!(null)] {
+            let mut held = car_at_review(Some("David only"));
+            assert!(unheld_review_refusal("ship-a-change", "review", &held["steps"][1]).is_none());
+            held["steps"][1]["metadata"]["gate_submission"] = poison;
+            assert!(
+                unheld_review_refusal("ship-a-change", "review", &held["steps"][1]).is_none(),
+                "a raw held car still owes its review"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_review_gate_envelope_does_not_hide_a_reheld_cars_owed_repair() {
+        let head = "1".repeat(40);
+        let reviewer = "fae63341-0000-4000-8000-000000000000";
+        for poison in [json!({}), json!(null)] {
+            let mut held = car_at_review(Some("David only"));
+            held["steps"][1]["metadata"]["hold_sha"] = json!(head);
+            held["steps"][1]["metadata"]["agent_run"] = json!(reviewer);
+            held["steps"][1]["metadata"][boss_jobs::car::RELEASE] =
+                json!({"sha":head,"review":"another-review"});
+            let run = json!({"id":reviewer,"kind":"agent-run","metadata":{"packet":held["id"],"step":"review","review":crate::review_verdict::review_record(&held,&head,"changes","repair this head","t")}});
+            assert!(
+                repair_owed(&held, &run).is_ok(),
+                "valid held repair fixture"
+            );
+            held["steps"][1]["metadata"]["gate_submission"] = poison;
+            assert!(
+                repair_owed(&held, &run).is_ok(),
+                "malformed envelope does not free a reheld car"
+            );
+        }
     }
 
     /// A repo no instance serves has nowhere to land — tenant main is
@@ -7461,6 +11232,174 @@ pub(crate) mod wire_tests {
             .iter()
             .any(|(m, p, _)| m == "POST" && p == "/api/jobs");
         assert!(!filed, "no run for a step this actor does not hold");
+        assert!(
+            !text.contains("boss step release"),
+            "someone else's hold is not the caller's to release: {text}"
+        );
+    }
+
+    /// A STEP THE CALLER ITSELF HOLDS ACTIVE NAMES THE RELEASE (backlog
+    /// 5487223c, part 1; review d20a3b4c of car bcbabd38). The claim door
+    /// takes a READY step from the coordinator's nomination and never an
+    /// ACTIVE one, so `boss dispatch --launch` onto a step the coordinator
+    /// has already claimed is refused 409 naming the coordinator as the
+    /// holder — and the hand-over, a release first, was said only in a
+    /// code comment. The refusal now says it, with the command.
+    #[tokio::test]
+    async fn a_step_the_caller_holds_active_is_refused_naming_the_release() {
+        let (base, log) = stub(packet_without_projection(), row_with_block(), true).await;
+        let err = dispatch_at(
+            &crate::sor_client::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            Some("build"),
+            None,
+            &Overrides::default(),
+            false,
+            // The stub's 409 names `emp-someone` as the holder: here that
+            // is the caller.
+            "emp-someone",
+            "emp-david",
+            "h",
+            BriefSource::Rendered,
+        )
+        .await
+        .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("claiming `build`"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "boss step release {} --step build --why",
+                &PACKET[..8]
+            )),
+            "{text}"
+        );
+        let filed = log
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(m, p, _)| m == "POST" && p == "/api/jobs");
+        assert!(!filed, "still nothing filed");
+        assert!(
+            !text.contains("boss job get"),
+            "a step with no run on it names no run to read: {text}"
+        );
+    }
+
+    /// THE RELEASE HINT NAMES THE RUN ON THE STEP (backlog f80d8024;
+    /// review 96d0f631 of car 135a4668). The usual way a caller comes to
+    /// hold a step ACTIVE is a plain `boss dispatch`, which claims it AND
+    /// files a run whose id it writes on the step as `agent_run`. A hint
+    /// that says only "release, then dispatch again" sends the caller to
+    /// clear that edge — orphaning the run until a silence rule settles
+    /// it, and, if its agent is still working, putting two executors on
+    /// one step: the case `boss step release`'s own doc says to read the
+    /// run first for. The refusal names the run and the read.
+    #[tokio::test]
+    async fn a_held_step_with_a_run_on_it_names_the_run_before_the_release() {
+        const ON_STEP: &str = "7c4e1a92-5d3b-4f0e-9a61-0b8d2e4f6a13";
+        let mut packet = packet_without_projection();
+        packet["steps"][1]["status"] = json!("active");
+        packet["steps"][1]["assignee_id"] = json!("emp-someone");
+        packet["steps"][1]["metadata"]["agent_run"] = json!(ON_STEP);
+        let (base, log) = stub(packet, row_with_block(), true).await;
+        let err = dispatch_at(
+            &crate::sor_client::machine_client().unwrap(),
+            &base,
+            &repo(),
+            PACKET,
+            Some("build"),
+            None,
+            &Overrides::default(),
+            false,
+            "emp-someone",
+            "emp-david",
+            "h",
+            BriefSource::Rendered,
+        )
+        .await
+        .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&format!("run {} is on it", &ON_STEP[..8])),
+            "{text}"
+        );
+        // The read names the FULL id (backlog 0a76509e): `boss job get`
+        // resolves a short id only among the newest open packets, so an
+        // old run — the stale case where releasing is right — would
+        // answer no match. The short form stays in the prose for reading.
+        assert!(
+            text.contains(&format!("read it first: boss job get {ON_STEP}.")),
+            "{text}"
+        );
+        assert!(text.contains("two executors on one step"), "{text}");
+        // The release is still named — after the read, never instead of it.
+        let read_at = text.find("boss job get").unwrap();
+        let release_at = text
+            .find(&format!(
+                "boss step release {} --step build --why",
+                &PACKET[..8]
+            ))
+            .expect(&text);
+        assert!(read_at < release_at, "the read comes first: {text}");
+        let filed = log
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(m, p, _)| m == "POST" && p == "/api/jobs");
+        assert!(!filed, "still nothing filed");
+    }
+
+    /// Who is "the caller" in the 409's holder: the login it signs as,
+    /// or the registered id that login is an alias of — the claim door
+    /// stores the id for its own claimant, so a coordinator signing as
+    /// `claude@algedonic.dev` holds the step as `agent-claude`.
+    #[test]
+    fn the_holder_is_the_caller_in_either_spelling() {
+        let agents = live_agents();
+        let rows = agents["data"].as_array().unwrap();
+        assert!(holder_is_caller("agent-claude", "agent-claude", &[]));
+        assert!(holder_is_caller(
+            "agent-claude",
+            "claude@algedonic.dev",
+            rows
+        ));
+        assert!(holder_is_caller(
+            "claude@algedonic.dev",
+            "agent-claude",
+            rows
+        ));
+        assert!(!holder_is_caller(
+            "agent-codex",
+            "claude@algedonic.dev",
+            rows
+        ));
+        assert!(!holder_is_caller(
+            "agent-claude",
+            "claude@algedonic.dev",
+            &[]
+        ));
+    }
+
+    /// The 409's holder and status, read off the refusal the claim
+    /// returned; nothing for any other failure.
+    #[test]
+    fn the_claim_refusal_names_its_holder() {
+        let refused = anyhow::anyhow!(
+            "jobs api POST /api/jobs/x/steps/y/claim -> 409 Conflict: {}",
+            json!({"error": "step already claimed or not claimable", "holder": "agent-claude",
+                   "status": "active", "retryable": false})
+        )
+        .context("claiming `build` on 5487223c as agent-claude FOR agent-codex");
+        assert_eq!(
+            claim_refusal(&refused),
+            Some(("agent-claude".to_string(), "active".to_string()))
+        );
+        let other = anyhow::anyhow!("jobs api POST /x -> 403 Forbidden: {{\"holder\":\"a\"}}");
+        assert_eq!(claim_refusal(&other), None);
     }
 
     /// A packet whose fix a MERGED car already carries is refused
@@ -7613,11 +11552,13 @@ pub(crate) mod wire_tests {
                 .any(|(m, p, _)| m == "POST" && p == "/api/jobs"),
             "the run is filed: {calls:?}"
         );
+        // Forced, the cars are still READ — a car owed a repair is
+        // briefed as one (f2b4385a) — and only the refusal is skipped.
         assert!(
-            !calls
+            calls
                 .iter()
                 .any(|(m, p, _)| m == "GET" && p == &cars_for_item_query(PACKET)),
-            "--force skips the refusal read, not the full closing-car evidence read: {calls:?}"
+            "--force skips the refusal, never the read that judges a repair: {calls:?}"
         );
         assert!(
             calls.iter().any(|(m, p, _)| {
@@ -7625,6 +11566,613 @@ pub(crate) mod wire_tests {
             }),
             "forced dispatch still briefs the closing car's evidence: {calls:?}"
         );
+    }
+
+    const HELD_CAR: &str = "ff1b7a35-ed93-4cb9-a1b8-d24050c21836";
+    const CAR_REVIEWER: &str = "fae63341-0c72-4d81-9e44-368f51d2a3ed";
+
+    /// The stub for a packet whose fix is an OPEN car held at the dock,
+    /// reviewed by [`CAR_REVIEWER`] with `verdict` at `reviewed`, while
+    /// the hold stands at head `1…1`. The list read answers the car the
+    /// way the list serves it — no step metadata — so the door must read
+    /// the car itself to find its review.
+    async fn held_car_stub(verdict: &'static str, reviewed: String) -> (String, Log) {
+        held_car_stub_config(verdict, reviewed, Vec::new(), None, None).await
+    }
+
+    async fn held_car_stub_runs(
+        verdict: &'static str,
+        reviewed: String,
+        later: Vec<Value>,
+    ) -> (String, Log) {
+        held_car_stub_config(verdict, reviewed, later, None, None).await
+    }
+
+    async fn held_car_stub_failing(
+        verdict: &'static str,
+        reviewed: String,
+        fail: Option<String>,
+    ) -> (String, Log) {
+        held_car_stub_config(verdict, reviewed, Vec::new(), fail, None).await
+    }
+
+    // Later verdicts and failed reads share the same real HTTP fixture.
+    async fn held_car_stub_config(
+        verdict: &'static str,
+        reviewed: String,
+        later: Vec<Value>,
+        fail: Option<String>,
+        listing: Option<Value>,
+    ) -> (String, Log) {
+        let row = row_with_block();
+        let packet = packet_without_projection();
+        let head = "1".repeat(40);
+        let listed = json!({
+            "id": HELD_CAR, "kind": "ship-a-change", "status": "open",
+            "metadata": { "backlog_item": PACKET,
+                          "branch": "fix/dispatch-launch-bases-the-worktree-on-fetched-origin-main",
+                          "agent_run": "2f8f0316-3078-47bc-ac53-b93115e6c9dc" },
+        });
+        let mut car = listed.clone();
+        let named = later
+            .last()
+            .and_then(|r| r.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or(CAR_REVIEWER)
+            .to_string();
+        car["steps"] = json!([{
+            "id": "car-review", "spec_slug": "review", "title": boss_jobs::car::REVIEW,
+            "status": "ready",
+            "metadata": { "hold": "trust-boundary car (area mutating-verb)",
+                          "hold_sha": head, "agent_run": named },
+        }]);
+        let reviewer = json!({
+            "id": CAR_REVIEWER, "kind": "agent-run", "status": "closed",
+            "opened_at": "2026-10-20T02:25:23.187018Z",
+            "metadata": {
+                "packet": HELD_CAR, "step": "review",
+                "review": crate::review_verdict::review_record(
+                    &car, &reviewed, verdict,
+                    "B1 (blocking): the private ref lock races a concurrent fetch.", "t"),
+            },
+        });
+        let runs: Vec<Value> = std::iter::once(reviewer).chain(later).collect();
+        let run: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        serve(move |method, path, target, body| match (method, path) {
+            ("GET", _) if fail.as_deref() == Some(target) => (
+                "500 Internal Server Error",
+                "connection reset by peer".to_string(),
+            ),
+            ("GET", p) if p == format!("/api/jobs/{PACKET}") => ("200 OK", packet.to_string()),
+            ("GET", p) if p == format!("/api/jobs/{HELD_CAR}") => ("200 OK", car.to_string()),
+            ("GET", "/api/jobs") if target == review_runs_query(HELD_CAR) => (
+                "200 OK",
+                listing
+                    .clone()
+                    .unwrap_or_else(|| json!({ "data": runs.clone(), "total": runs.len() }))
+                    .to_string(),
+            ),
+            ("GET", p)
+                if runs
+                    .iter()
+                    .any(|r| p == format!("/api/jobs/{}", r["id"].as_str().unwrap())) =>
+            {
+                let r = runs
+                    .iter()
+                    .find(|r| p == format!("/api/jobs/{}", r["id"].as_str().unwrap()))
+                    .unwrap();
+                ("200 OK", r.to_string())
+            }
+            ("GET", "/api/tenant/edit-level") => (
+                "200 OK",
+                json!({ "edit_level": Value::Null, "manifest": "t.toml" }).to_string(),
+            ),
+            ("GET", "/api/jobs") if target.contains("backlog_item") => (
+                "200 OK",
+                json!({ "data": [listed.clone()], "total": 1 }).to_string(),
+            ),
+            ("GET", "/api/jobs") => ("200 OK", json!({ "data": [], "total": 0 }).to_string()),
+            ("GET", "/api/workflows/backlog-item") => ("200 OK", row.to_string()),
+            ("POST", p) if p.ends_with("/claim") => {
+                ("200 OK", json!({ "status": "active" }).to_string())
+            }
+            ("POST", "/api/jobs") => {
+                let mut filed = body.clone();
+                filed["id"] = json!(RUN);
+                filed["steps"] = json!([
+                    { "id": "run-briefed", "spec_slug": "briefed", "status": "ready",
+                      "metadata": { "authority_role": "platform-admin" } },
+                ]);
+                *run.lock().unwrap() = Some(filed);
+                ("201 Created", json!({ "id": RUN }).to_string())
+            }
+            ("GET", p) if p == format!("/api/jobs/{RUN}") => match run.lock().unwrap().clone() {
+                Some(r) => ("200 OK", r.to_string()),
+                None => ("404 Not Found", "no such job".into()),
+            },
+            ("PUT", p) if p.starts_with(&format!("/api/jobs/{RUN}/steps/")) => run_step_put(body),
+            ("PATCH", p) if p.contains("/steps/") => {
+                stub_merge(&run, RUN, p, body);
+                ("204 No Content", String::new())
+            }
+            _ => ("404 Not Found", format!("unstubbed {method} {target}")),
+        })
+        .await
+    }
+
+    async fn dispatch_held(base: &str) -> Result<Dispatched> {
+        dispatch_held_forced(base, false).await
+    }
+
+    async fn dispatch_held_forced(base: &str, force: bool) -> Result<Dispatched> {
+        dispatch_at(
+            &crate::sor_client::machine_client().unwrap(),
+            base,
+            &repo(),
+            PACKET,
+            Some("build"),
+            None,
+            &Overrides::default(),
+            force,
+            "claude@algedonic.dev",
+            "emp-david",
+            "h",
+            BriefSource::Rendered,
+        )
+        .await
+    }
+
+    /// THE REPAIR ROAD (backlog 99b7ae76). Measured 2026-10-16: car
+    /// ff1b7a35 stood held, review run fae63341 recorded `changes` at its
+    /// head, and `boss dispatch 62ebae10` refused with "let that car
+    /// land" — leaving `--force`, which also skips the duplicate guard.
+    /// Now the dispatch is ADMITTED, without `--force`, as a repair of
+    /// that car: the brief names the car, its branch, the head the review
+    /// read, the review run and its findings verbatim, and the run packet
+    /// records which car it repairs. Both reads happen before the claim.
+    #[tokio::test]
+    async fn a_car_whose_review_asked_for_changes_is_dispatched_as_its_repair() {
+        let (base, log) = held_car_stub("changes", "1".repeat(40)).await;
+        let prompt = dispatch_held(&base)
+            .await
+            .expect("a changes verdict at the car's head is a repair, not a duplicate")
+            .prompt;
+
+        let repair = prompt.find("== REPAIR").expect("the repair section");
+        let packet = prompt.find("== THE PACKET").expect("the packet");
+        let invariants = prompt.find("== THE INVARIANTS").expect("the invariants");
+        assert!(packet < repair && repair < invariants, "{prompt}");
+        for want in [
+            HELD_CAR,
+            "fix/dispatch-launch-bases-the-worktree-on-fetched-origin-main",
+            &"1".repeat(40),
+            CAR_REVIEWER,
+            "B1 (blocking): the private ref lock races a concurrent fetch.",
+            "--hold",
+        ] {
+            assert!(prompt.contains(want), "{want:?} in the brief:\n{prompt}");
+        }
+
+        let calls = log.calls.lock().unwrap().clone();
+        let at = |p: &str| {
+            calls
+                .iter()
+                .position(|(m, path, _)| m == "GET" && path == p)
+                .unwrap_or_else(|| panic!("{p} read: {calls:?}"))
+        };
+        let claim = calls
+            .iter()
+            .position(|(_, p, _)| p.ends_with("/claim"))
+            .expect("claimed");
+        assert!(at(&format!("/api/jobs/{HELD_CAR}")) < claim, "{calls:?}");
+        assert!(
+            at(&format!("/api/jobs/{CAR_REVIEWER}")) < claim,
+            "{calls:?}"
+        );
+        let filed = calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+            .map(|(_, _, b)| b.clone())
+            .expect("the run is filed");
+        assert_eq!(
+            filed["metadata"]["repair"],
+            json!({
+                "car": HELD_CAR,
+                "branch": "fix/dispatch-launch-bases-the-worktree-on-fetched-origin-main",
+                "head": "1".repeat(40),
+                "review": CAR_REVIEWER,
+            })
+        );
+    }
+
+    /// …and only then. A held car whose review RELEASED it, or asked for
+    /// changes of an older head (the repair is in; it owes a review), is
+    /// still the in-flight door's refusal — now saying why it is not a
+    /// repair — and nothing is claimed or filed.
+    #[tokio::test]
+    async fn a_car_not_owed_a_repair_is_still_refused_saying_why() {
+        for (verdict, reviewed, why) in [
+            ("release", "1".repeat(40), "\"release\""),
+            ("changes", "2".repeat(40), "22222222"),
+        ] {
+            let (base, log) = held_car_stub(verdict, reviewed).await;
+            let err = dispatch_held(&base).await.expect_err("refused");
+            let text = format!("{err:#}");
+            assert!(text.contains("ALREADY A CAR"), "{text}");
+            assert!(text.contains("not a repair"), "{text}");
+            assert!(text.contains(why), "{why:?} in {text}");
+            let calls = log.calls.lock().unwrap().clone();
+            assert!(
+                !calls
+                    .iter()
+                    .any(|(m, p, _)| p.ends_with("/claim") || (m == "POST" && p == "/api/jobs")),
+                "nothing claimed and nothing filed: {calls:?}"
+            );
+        }
+    }
+
+    /// A REVIEW RUN WITH NO VERDICT NEITHER MASKS ONE NOR STANDS IN FOR
+    /// ONE (backlog 6ba6bb80). Measured 2026-10-21: car ad9f940a stood
+    /// held at 462ff162, review run e207853d had asked for changes AT
+    /// that head, and a later review run 5e571078 — opened on the same
+    /// step, so the step's `agent_run` now named it — closed `refused`
+    /// with no verdict. The dispatch read only the run the step names,
+    /// found no verdict, and refused the repair as a duplicate build;
+    /// seven held cars were masked that way at once. The newest run that
+    /// CARRIES a verdict is the one judged — so the standing `changes` is
+    /// a repair, and a `release` recorded after it still frees the car.
+    #[tokio::test]
+    async fn a_verdictless_review_run_does_not_mask_the_standing_verdict() {
+        let refused_run = |id: &str, at: &str| {
+            json!({
+                "id": id, "kind": "agent-run", "status": "closed", "opened_at": at,
+                "metadata": { "packet": HELD_CAR, "step": "review", "outcome": "refused" },
+            })
+        };
+        const MASK: &str = "5e571078-dcf0-4f61-84fd-235f8828bcd8";
+        let (base, log) = held_car_stub_runs(
+            "changes",
+            "1".repeat(40),
+            vec![refused_run(MASK, "2026-10-21T19:44:54.529670Z")],
+        )
+        .await;
+        let dispatched = dispatch_held(&base)
+            .await
+            .expect("the standing changes verdict is a repair, under a verdict-less run");
+        assert!(
+            dispatched.prompt.contains("== REPAIR"),
+            "{}",
+            dispatched.prompt
+        );
+        let calls = log.calls.lock().unwrap().clone();
+        let filed = calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+            .map(|(_, _, b)| b.clone())
+            .expect("the run is filed");
+        assert_eq!(
+            filed["metadata"]["repair"]["review"],
+            json!(CAR_REVIEWER),
+            "the repair names the run that carries the verdict, not the newest run"
+        );
+
+        // A RELEASE recorded after the changes still frees the car, even
+        // with a verdict-less run newer than both: it is the newest run
+        // carrying a verdict, and a release asks for no repair.
+        const RELEASER: &str = "b0a7d0e5-6ba6-4bb8-8000-000000000000";
+        let mut release = refused_run(RELEASER, "2026-10-21T20:00:00Z");
+        release["metadata"]["outcome"] = json!("landed");
+        release["metadata"][crate::review_verdict::REVIEW_KEY] =
+            crate::review_verdict::review_record(
+                &json!({ "id": HELD_CAR,
+                         "metadata": { "branch":
+                             "fix/dispatch-launch-bases-the-worktree-on-fetched-origin-main" } }),
+                &"1".repeat(40),
+                crate::review_verdict::RELEASE,
+                "clean",
+                "t",
+            );
+        let (base, log) = held_car_stub_runs(
+            "changes",
+            "1".repeat(40),
+            vec![release, refused_run(MASK, "2026-10-21T21:00:00Z")],
+        )
+        .await;
+        let text = format!("{:#}", dispatch_held(&base).await.expect_err("released"));
+        assert!(text.contains("not a repair"), "{text}");
+        assert!(text.contains("\"release\""), "{text}");
+        assert!(text.contains("b0a7d0e5"), "names the releasing run: {text}");
+        let calls = log.calls.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|(m, p, _)| p.ends_with("/claim") || (m == "POST" && p == "/api/jobs")),
+            "nothing claimed and nothing filed: {calls:?}"
+        );
+
+        // A MALFORMED RECORD REFUSES; IT NEVER READS AS NO VERDICT
+        // (review 3335b3aa B1). A newer run whose `review` key is present
+        // but not an object — here the string "release" — must not be
+        // skipped for the older `changes` at the head: that admitted a
+        // REPAIR where origin/main refused the same input. It is the run
+        // judged, and the refusal names it and calls its record malformed.
+        const MALFORMED: &str = "ma1f0rmd-6ba6-4bb8-8000-000000000000";
+        let mut garbled = refused_run(MALFORMED, "2026-10-21T21:00:00Z");
+        garbled["metadata"][crate::review_verdict::REVIEW_KEY] = json!("release");
+        let (base, log) = held_car_stub_runs("changes", "1".repeat(40), vec![garbled]).await;
+        let text = format!(
+            "{:#}",
+            dispatch_held(&base)
+                .await
+                .expect_err("a malformed newer record refuses the repair")
+        );
+        assert!(text.contains("not a repair"), "{text}");
+        assert!(text.contains("malformed"), "{text}");
+        assert!(text.contains("ma1f0rmd"), "names the malformed run: {text}");
+        let calls = log.calls.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|(m, p, _)| p.ends_with("/claim") || (m == "POST" && p == "/api/jobs")),
+            "nothing claimed and nothing filed: {calls:?}"
+        );
+    }
+
+    /// PURE: which review run is judged. Only a run opened on THIS car's
+    /// review step and carrying a verdict counts, and the newest of those
+    /// by `opened_at` wins; a verdict-less run is skipped however new.
+    #[test]
+    fn the_judged_review_run_is_the_newest_that_carries_a_verdict() {
+        const CAR: &str = "ad9f940a-b436-4e68-8383-e9716a0bfb88";
+        let run = |id: &str, at: &str, packet: &str, verdict: Option<&str>| {
+            let mut r = json!({ "id": id, "kind": "agent-run", "opened_at": at,
+                                "metadata": { "packet": packet, "step": "review" } });
+            if let Some(v) = verdict {
+                r["metadata"]["review"] = json!({ "car": packet, "verdict": v });
+            }
+            r
+        };
+        let runs = [
+            run(
+                "e207853d",
+                "2026-10-20T02:25:23.187018Z",
+                CAR,
+                Some("changes"),
+            ),
+            run("5e571078", "2026-10-21T19:44:54.529670Z", CAR, None),
+            run(
+                "0e1sewhe",
+                "2026-10-21T20:00:00Z",
+                "e1sewhe1",
+                Some("release"),
+            ),
+            run("01der000", "2026-10-19T00:00:00Z", CAR, Some("release")),
+        ];
+        let id = |r: Option<&Value>| r.and_then(|r| r["id"].as_str()).map(str::to_string);
+        assert_eq!(id(newest_verdict_run(CAR, &runs)), Some("e207853d".into()));
+        assert_eq!(id(newest_verdict_run(CAR, &runs[1..2])), None);
+        assert_eq!(id(newest_verdict_run(CAR, &[])), None);
+
+        // A PRESENT review key is a verdict to judge whatever its shape
+        // (review 3335b3aa B1): a newer run whose record is a string, an
+        // array, a number or null is chosen over the older `changes`, so
+        // `repair_owed` refuses it as malformed instead of the older
+        // verdict being admitted in its place.
+        for malformed in [json!("release"), json!(["changes"]), json!(7), Value::Null] {
+            let mut newer = run("ma1f0rmd", "2026-10-21T21:00:00Z", CAR, None);
+            newer["metadata"]["review"] = malformed.clone();
+            let with = [runs[0].clone(), newer];
+            assert_eq!(
+                id(newest_verdict_run(CAR, &with)),
+                Some("ma1f0rmd".into()),
+                "a present {malformed} record is judged, not skipped"
+            );
+        }
+    }
+
+    /// `--force` SKIPS THE REFUSAL, NEVER THE SECTION (backlog f2b4385a).
+    /// Measured on origin/main 2026-10-19: the in-flight door's whole
+    /// block sat under `if !force`, so a forced dispatch onto a packet
+    /// whose held car a review sent back with changes never read that
+    /// review, and the builder was briefed without the car, the head or
+    /// the findings — it built the repair blind. Session B forced exactly
+    /// that on 399ee6c3 on 2026-10-20 and wrote the repair context into
+    /// the prompt by hand. Forced, the repair is read and briefed the same
+    /// as unforced.
+    #[tokio::test]
+    async fn a_forced_dispatch_onto_a_car_owed_a_repair_still_briefs_the_repair() {
+        let (base, log) = held_car_stub("changes", "1".repeat(40)).await;
+        let prompt = dispatch_held_forced(&base, true)
+            .await
+            .expect("forced, and a repair")
+            .prompt;
+        let repair = prompt
+            .find("== REPAIR")
+            .expect("the repair section, forced");
+        let invariants = prompt.find("== THE INVARIANTS").expect("the invariants");
+        assert!(repair < invariants, "{prompt}");
+        for want in [
+            HELD_CAR,
+            &"1".repeat(40),
+            CAR_REVIEWER,
+            "B1 (blocking): the private ref lock races a concurrent fetch.",
+        ] {
+            assert!(prompt.contains(want), "{want:?} in the brief:\n{prompt}");
+        }
+        let calls = log.calls.lock().unwrap().clone();
+        let filed = calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+            .map(|(_, _, b)| b.clone())
+            .expect("the run is filed");
+        assert_eq!(filed["metadata"]["repair"]["car"], json!(HELD_CAR));
+    }
+
+    /// …and a forced dispatch onto an open car NOT owed a repair is still
+    /// admitted — `--force` is the operator's "build the rest" — with no
+    /// REPAIR section, because there is no repair to name.
+    #[tokio::test]
+    async fn a_forced_dispatch_onto_a_car_not_owed_a_repair_is_admitted_without_one() {
+        let (base, log) = held_car_stub("release", "1".repeat(40)).await;
+        let prompt = dispatch_held_forced(&base, true)
+            .await
+            .expect("--force skips the in-flight refusal")
+            .prompt;
+        assert!(!prompt.contains("== REPAIR"), "{prompt}");
+        let calls = log.calls.lock().unwrap().clone();
+        let filed = calls
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+            .map(|(_, _, b)| b.clone())
+            .expect("the run is filed");
+        assert!(filed["metadata"].get("repair").is_none(), "{filed}");
+    }
+
+    /// A FAILED READ IS NOT "NOT OWED" (backlog f2b4385a, review 097cb662
+    /// B1). Measured on car 291c03be at 4123437a: when the cars list
+    /// answered and the read of the car, or of its reviewer, then failed,
+    /// `read_repair` returned the same `Err(String)` a "not owed"
+    /// judgement does, and the forced arm `Some(_) | None => {}` dropped
+    /// both — the run was filed with no `metadata.repair`, the builder got
+    /// no REPAIR section, and nothing said why. The read now has three
+    /// outcomes; unforced, both failures still refuse; forced, an unread
+    /// car is SAID, naming the car and the read, while a car not owed a
+    /// repair stays quiet as the car's excludes ask.
+    #[tokio::test]
+    async fn a_dispatch_tells_an_unread_car_from_one_not_owed_a_repair() {
+        for failed in [
+            format!("/api/jobs/{HELD_CAR}"),
+            format!("/api/jobs/{CAR_REVIEWER}"),
+        ] {
+            // The read itself: Unread, naming the path, never NotOwed.
+            let (base, _log) =
+                held_car_stub_failing("changes", "1".repeat(40), Some(failed.clone())).await;
+            let http = crate::sor_client::machine_client().unwrap();
+            let read = read_item_cars(PACKET, |path| {
+                let (http, base) = (&http, base.as_str());
+                async move {
+                    crate::sor_client::api_at(http, base, reqwest::Method::GET, &path, None).await
+                }
+            })
+            .await
+            .expect("the cars list answered");
+            let (car, judged) = read.in_flight.expect("the held car is in flight");
+            match &judged {
+                RepairRead::Unread(why) => assert!(why.contains(&failed), "{why}"),
+                other => panic!("a failed read of {failed} judged as {other:?}"),
+            }
+
+            // Unforced: refused, saying the read failed.
+            let err = dispatch_held(&base).await.expect_err("refused unforced");
+            let text = format!("{err:#}");
+            assert!(text.contains("ALREADY A CAR"), "{text}");
+            assert!(text.contains("could not be read"), "{text}");
+
+            // Forced: admitted with no repair, and the door SAYS so.
+            let (repair, said) =
+                in_flight_door(PACKET, Some((car, judged)), true).expect("forced is admitted");
+            assert_eq!(repair, None);
+            let said = said.expect("an unread repair is said, not swallowed");
+            for want in [&HELD_CAR[..8], failed.as_str(), "no REPAIR section"] {
+                assert!(said.contains(want), "{want:?} in {said}");
+            }
+            let (base, log) =
+                held_car_stub_failing("changes", "1".repeat(40), Some(failed.clone())).await;
+            let prompt = dispatch_held_forced(&base, true)
+                .await
+                .expect("--force skips the refusal")
+                .prompt;
+            assert!(!prompt.contains("== REPAIR"), "{prompt}");
+            let calls = log.calls.lock().unwrap().clone();
+            let filed = calls
+                .iter()
+                .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+                .map(|(_, _, b)| b.clone())
+                .expect("the run is filed");
+            assert!(filed["metadata"].get("repair").is_none(), "{filed}");
+        }
+
+        // A car read in full and judged not owed: forced, admitted and
+        // QUIET; unforced, refused as before.
+        let (base, _log) = held_car_stub("release", "1".repeat(40)).await;
+        let http = crate::sor_client::machine_client().unwrap();
+        let read =
+            read_item_cars(PACKET, |path| {
+                let (http, base) = (&http, base.as_str());
+                async move {
+                    crate::sor_client::api_at(http, base, reqwest::Method::GET, &path, None).await
+                }
+            })
+            .await
+            .expect("the cars list answered");
+        let (car, judged) = read.in_flight.expect("the held car is in flight");
+        assert!(matches!(judged, RepairRead::NotOwed(_)), "{judged:?}");
+        assert!(in_flight_door(PACKET, Some((car.clone(), judged.clone())), false).is_err());
+        assert_eq!(
+            in_flight_door(PACKET, Some((car, judged)), true),
+            Ok((None, None))
+        );
+        assert_eq!(in_flight_door(PACKET, None, false), Ok((None, None)));
+    }
+
+    /// A failed or partial review listing is no judgement, even when
+    /// the car's pointer still names a readable CHANGES run (024e1227).
+    #[tokio::test]
+    async fn repair_listing_failures_are_unread_in_both_briefing_doors() {
+        let query = review_runs_query(HELD_CAR);
+        let cases = [
+            ("transport", Some(query.clone()), None),
+            ("shape", None, Some(json!({ "data": {}, "total": 1 }))),
+            ("partial", None, Some(json!({ "data": [], "total": 1 }))),
+            ("missing total", None, Some(json!({ "data": [] }))),
+        ];
+        let mut failures = Vec::new();
+        for (label, fail, listing) in cases {
+            let (base, _) =
+                held_car_stub_config("changes", "1".repeat(40), Vec::new(), fail, listing).await;
+            let http = crate::sor_client::machine_client().unwrap();
+            let fetch = |path: String| {
+                let (http, base) = (&http, base.as_str());
+                async move {
+                    crate::sor_client::api_at(http, base, reqwest::Method::GET, &path, None).await
+                }
+            };
+            let read = read_item_cars(PACKET, &fetch)
+                .await
+                .expect("cars list answered");
+            let (car, judged) = read.in_flight.expect("held car");
+            println!("{label} actual repair read: {judged:?}");
+            if !matches!(&judged, RepairRead::Unread(why) if why.contains(&query)) {
+                failures.push(format!(
+                    "{label}: listing failure was not Unread: {judged:?}"
+                ));
+            }
+            let unforced = in_flight_door(PACKET, Some((car.clone(), judged.clone())), false);
+            if !matches!(unforced, Err(ref why) if why.contains(&query)) {
+                failures.push(format!(
+                    "{label}: unforced did not refuse the unread listing"
+                ));
+            }
+            let forced = in_flight_door(PACKET, Some((car, judged)), true).unwrap();
+            if forced.0.is_some()
+                || !forced
+                    .1
+                    .as_deref()
+                    .is_some_and(|why| why.contains(&query) && why.contains("no REPAIR section"))
+            {
+                failures.push(format!(
+                    "{label}: forced did not say why no repair was judged"
+                ));
+            }
+            let brief = crate::brief::repair_for(&json!({ "id": PACKET }), &fetch).await;
+            if !matches!(brief, Err(ref why) if why.contains(&query) && why.contains("no REPAIR section"))
+            {
+                failures.push(format!(
+                    "{label}: hand brief did not say the unread listing"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// WHAT IS ALREADY NAMED reaches the one who spends the run (backlog
@@ -8579,6 +13127,65 @@ pub(crate) mod wire_tests {
         /// Admitted before its kind declared an agent block: its step
         /// carries the role and no `agent_` key (backlog 51aef4dd).
         const PINNED: &str = "44444444-0000-4000-8000-000000000004";
+        /// Ready and nominated to the caller — spelled by the login the
+        /// agents registry ties to `agent-claude`, so only the server's
+        /// expansion of `for=me` can recognise it as the caller's.
+        const MINE: &str = "55555555-0000-4000-8000-000000000005";
+        /// Ready and nominated to another agent on the same model.
+        const THEIRS: &str = "66666666-0000-4000-8000-000000000006";
+
+        fn nominated_packet(id: &str, step: &str, holder: &str) -> Value {
+            json!({
+                "id": id, "kind": "backlog-item", "title": format!("Nominated to {holder}"),
+                "status": "open", "priority": "standard", "opened_on": "2026-10-17",
+                "metadata": { "detail": "The dispatcher nominated it." },
+                "steps": [
+                    { "id": step, "spec_slug": "build", "status": "ready", "title": "Build",
+                      "assignee_id": holder, "metadata": agent_metadata() },
+                ],
+            })
+        }
+
+        fn mine_packet() -> Value {
+            nominated_packet(MINE, "m-build", "claude@algedonic.dev")
+        }
+
+        fn theirs_packet() -> Value {
+            nominated_packet(THEIRS, "t-build", "agent-claude-b")
+        }
+
+        /// `GET /api/jobs/assignments?for=me` as the server answers it
+        /// for agent-claude: its `for` block names the caller and every
+        /// alias, and its rows are every open step of the packets that
+        /// the caller OR its role could take — nominated to it,
+        /// nominated elsewhere under the role, and unassigned alike.
+        fn for_me() -> Value {
+            let rows: Vec<Value> = [
+                held_packet(),
+                waiting_packet(),
+                pinned_packet(),
+                mine_packet(),
+                theirs_packet(),
+            ]
+            .iter()
+            .flat_map(|job| {
+                let id = job["id"].clone();
+                job["steps"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|s| s["status"] == "ready" || s["status"] == "active")
+                    .map(move |s| json!({ "job_id": id, "step": s }))
+            })
+            .collect();
+            json!({
+                "for": { "ids": ["agent-claude", "claude@algedonic.dev"],
+                         "roles": ["platform-admin"] },
+                "total": rows.len(),
+                "data": rows,
+            })
+        }
 
         fn pinned_packet() -> Value {
             json!({
@@ -8631,6 +13238,11 @@ pub(crate) mod wire_tests {
         /// The station queue, the packets it names, and the usual
         /// dispatch wire behind them.
         async fn inbox_stub(members: Vec<Value>) -> (String, Log) {
+            inbox_stub_answering(members, for_me()).await
+        }
+
+        /// [`inbox_stub`] whose `for=me` read answers `assignments`.
+        async fn inbox_stub_answering(members: Vec<Value>, assignments: Value) -> (String, Log) {
             let queue = json!({
                 "station": STATION, "kind": "constraint", "total": members.len(),
                 "discipline": ["priority", "age"], "data": members,
@@ -8651,6 +13263,13 @@ pub(crate) mod wire_tests {
                     ("GET", p) if p == format!("/api/jobs/{PINNED}") => {
                         ("200 OK", pinned_packet().to_string())
                     }
+                    ("GET", p) if p == format!("/api/jobs/{MINE}") => {
+                        ("200 OK", mine_packet().to_string())
+                    }
+                    ("GET", p) if p == format!("/api/jobs/{THEIRS}") => {
+                        ("200 OK", theirs_packet().to_string())
+                    }
+                    ("GET", "/api/jobs/assignments") => ("200 OK", assignments.to_string()),
                     ("GET", "/api/tenant/edit-level") => (
                         "200 OK",
                         json!({ "edit_level": Value::Null, "manifest": "t.toml" }).to_string(),
@@ -8692,7 +13311,8 @@ pub(crate) mod wire_tests {
                     // does — one code path, one door.
                     ("PATCH", p)
                         if p.starts_with(&format!("/api/jobs/{WAITING}/steps/"))
-                            || p.starts_with(&format!("/api/jobs/{PINNED}/steps/")) =>
+                            || p.starts_with(&format!("/api/jobs/{PINNED}/steps/"))
+                            || p.starts_with(&format!("/api/jobs/{MINE}/steps/")) =>
                     {
                         ("204 No Content", String::new())
                     }
@@ -8763,6 +13383,100 @@ pub(crate) mod wire_tests {
             assert!(
                 dispatched.prompt.contains(&INBOX_RUN[..8]),
                 "the prompt carries the run the record now holds"
+            );
+        }
+
+        /// THE SELECTION IS THE RECORD (backlog c9dd306a). Measured
+        /// 2026-10-19: six runs agent-claude-b opened on standard items
+        /// while five URGENT steps nominated to it sat ready at the head
+        /// of its station carried the brief, the claim receipt and the
+        /// session, and nothing saying whether `--next` chose the packet
+        /// or the caller named it — so the conductor could not tell a
+        /// defect in the walk from a session picking by hand. A run
+        /// taken off the queue now says so: the station, where in it the
+        /// packet stood, which pass of the walk took it, and every packet
+        /// the walk passed over with each open step's reason.
+        #[tokio::test]
+        async fn a_run_taken_off_the_queue_records_the_station_and_the_walk() {
+            let (base, log) = inbox_stub(vec![
+                json!({ "id": HELD }),
+                json!({ "id": THEIRS }),
+                json!({ "id": WAITING }),
+            ])
+            .await;
+            take_next(&base)
+                .await
+                .expect("dispatches")
+                .expect("took one");
+            let calls = log.calls.lock().unwrap().clone();
+            let filed = calls
+                .iter()
+                .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+                .map(|(_, _, b)| b.clone())
+                .expect("a run is filed");
+            let next = &filed["metadata"][boss_jobs::agent_runs::SELECTED_BY_KEY]["next"];
+            assert_eq!(next["station"], STATION, "{filed}");
+            assert_eq!(next["position"], 3, "the third packet in the queue");
+            assert_eq!(next["of"], 3);
+            assert_eq!(
+                next["pass"], "unheld",
+                "no nomination of the caller's stands in the station"
+            );
+            assert_eq!(
+                next["skipped"],
+                json!([
+                    { "packet": HELD, "pass": "unheld", "steps": [
+                        { "step": "build", "status": "active",
+                          "assignee": "agent-someone", "why": "active" } ] },
+                    { "packet": THEIRS, "pass": "unheld", "steps": [
+                        { "step": "build", "status": "ready",
+                          "assignee": "agent-claude-b", "why": "held by agent-claude-b" } ] },
+                ]),
+                "every packet the walk passed over, and why"
+            );
+            assert!(
+                filed["metadata"][boss_jobs::agent_runs::SELECTED_BY_KEY]
+                    .get("named")
+                    .is_none(),
+                "one shape or the other, never both: {filed}"
+            );
+        }
+
+        /// A nomination the walk passed over says why, in the pass that
+        /// passed it: a ready step nominated to the caller that declares
+        /// no agent block (nothing the queue could launch) is REFUSED,
+        /// and a nomination the `for=me` read never listed reads, in
+        /// the unassigned pass, as the caller's own and untaken — the
+        /// shape of the 2026-10-19 urgent steps, which is exactly what
+        /// the record exists to make visible.
+        #[test]
+        fn a_walked_past_nomination_names_its_reason() {
+            let me = vec![
+                "agent-claude".to_string(),
+                "claude@algedonic.dev".to_string(),
+            ];
+            let mut blockless = mine_packet();
+            blockless["steps"][0]["metadata"] = json!({ "authority_role": "platform-admin" });
+            assert_eq!(
+                walked_past(&blockless, None, &me, true),
+                json!({ "packet": MINE, "pass": "nominated", "steps": [
+                    { "step": "build", "status": "ready", "assignee": "claude@algedonic.dev",
+                      "why": "refused: declares no agent block" } ] })
+            );
+            assert_eq!(
+                walked_past(&mine_packet(), None, &me, false)["steps"][0]["why"],
+                "nominated to the caller, not taken by the nominated pass"
+            );
+            assert_eq!(
+                walked_past(&pinned_packet(), None, &me, false)["steps"][0]["why"],
+                "refused: declares no agent block"
+            );
+            let mut done = waiting_packet();
+            done["steps"][1]["status"] = json!("completed");
+            assert_eq!(
+                walked_past(&done, None, &me, false),
+                json!({ "packet": WAITING, "pass": "unheld", "steps": [] }),
+                "nothing open is an empty list, not an invented reason"
             );
         }
 
@@ -8870,6 +13584,827 @@ pub(crate) mod wire_tests {
                     "/api/jobs/{PINNED}/steps/p-build/claim?station={STATION}"
                 )]
             );
+        }
+
+        fn claims(log: &Log) -> Vec<String> {
+            log.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, p, _)| m == "POST" && p.contains("/claim"))
+                .map(|(_, p, _)| p.clone())
+                .collect()
+        }
+
+        /// THE CALLER'S OWN NOMINATIONS COME FIRST (backlog 67d4344b).
+        /// Measured 2026-10-17: in `a.platform-admin.opus-5-5`, 64 of
+        /// the first 80 packets had their ready step nominated to
+        /// agent-claude and none was unassigned, so `--next` — which
+        /// took only steps nobody held — answered agent-claude-b's
+        /// inbox with nothing, and answered agent-claude's with nothing
+        /// too, although its own queue was full. A step the dispatcher
+        /// nominated to the caller is the caller's inbox; it is taken
+        /// ahead of unassigned work standing earlier in the queue, and
+        /// it is recognised by every id the server's `for=me` expands
+        /// the caller to (here the login, not the registered id).
+        #[tokio::test]
+        async fn the_inbox_takes_the_callers_nomination_before_unassigned_work() {
+            let (base, log) = inbox_stub(vec![
+                json!({ "id": WAITING }),
+                json!({ "id": THEIRS }),
+                json!({ "id": MINE }),
+            ])
+            .await;
+            let dispatched = take_next(&base)
+                .await
+                .expect("dispatches")
+                .expect("took one");
+            assert_eq!(
+                claims(&log),
+                vec![format!(
+                    "/api/jobs/{MINE}/steps/m-build/claim?station={STATION}"
+                )],
+                "the caller's nomination, not the unassigned head of the queue"
+            );
+            let calls = log.calls.lock().unwrap().clone();
+            let filed = calls
+                .iter()
+                .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+                .map(|(_, _, b)| b.clone())
+                .expect("a run is filed");
+            assert_eq!(filed["metadata"]["packet"], MINE);
+            assert_eq!(dispatched.run_id, INBOX_RUN);
+        }
+
+        /// ...THEN UNASSIGNED WORK, and never another agent's. With no
+        /// nomination of the caller's in the station, the head of the
+        /// unassigned work is taken, as before; a step nominated to
+        /// another agent on the same model is that agent's inbox, and
+        /// alone it is an empty answer, not a race.
+        #[tokio::test]
+        async fn without_a_nomination_of_its_own_the_inbox_takes_unassigned_work_only() {
+            let (base, log) =
+                inbox_stub(vec![json!({ "id": THEIRS }), json!({ "id": WAITING })]).await;
+            take_next(&base)
+                .await
+                .expect("dispatches")
+                .expect("took one");
+            assert_eq!(
+                claims(&log),
+                vec![format!(
+                    "/api/jobs/{WAITING}/steps/w-build/claim?station={STATION}"
+                )]
+            );
+
+            let (base, log) = inbox_stub(vec![json!({ "id": THEIRS })]).await;
+            assert!(take_next(&base).await.expect("reads the queue").is_none());
+            assert!(
+                !log.calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(m, _, _)| m == "POST"),
+                "another agent's nomination is not raced for"
+            );
+        }
+
+        /// A CUT `for=me` ANSWER IS NOT THE CALLER'S WHOLE INBOX (backlog
+        /// 09074ada). The server's rows sort by admission and stop at
+        /// its limit, so the caller's NEWEST nominations are the ones a
+        /// cut drops — measured 2026-10-18, agent-claude at 733 of the
+        /// 1000-row ceiling. Here the answer is cut before MINE's row:
+        /// read as whole, `--next` took the unassigned head ahead of the
+        /// nomination, and with no unassigned work said "none of them
+        /// nominated" — a false empty answer. A cut answer makes it walk
+        /// every member against the ids the answer names.
+        #[tokio::test]
+        async fn a_cut_for_me_answer_still_takes_the_nomination_past_the_cut() {
+            let mut cut = for_me();
+            let rows: Vec<Value> = cut["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["job_id"] != MINE)
+                .cloned()
+                .collect();
+            cut["total"] = json!(rows.len() + 1);
+            cut["truncated"] = json!(true);
+            cut["data"] = json!(rows);
+
+            let (base, log) = inbox_stub_answering(
+                vec![json!({ "id": WAITING }), json!({ "id": MINE })],
+                cut.clone(),
+            )
+            .await;
+            take_next(&base)
+                .await
+                .expect("dispatches")
+                .expect("took one");
+            assert_eq!(
+                claims(&log),
+                vec![format!(
+                    "/api/jobs/{MINE}/steps/m-build/claim?station={STATION}"
+                )],
+                "the nomination past the cut, not the unassigned head"
+            );
+
+            let (base, _) = inbox_stub_answering(vec![json!({ "id": MINE })], cut).await;
+            assert!(
+                take_next(&base).await.expect("dispatches").is_some(),
+                "never 'none nominated' while the caller's nomination stands in the station"
+            );
+        }
+    }
+
+    /// THE BOUNDED START, end to end (design e72dc7c9, backlog 40f0436c),
+    /// on a packet STRUCTURALLY IDENTICAL to the one that measured the
+    /// defect. `NATIVE_*` is the shape of backlog 2710c8fc as retained on
+    /// 2026-10-16 (coordinator/2710c8fc-421.json, 968,905 bytes — the parent
+    /// of runs f08a8483 and 266f06e8): its 64 job-metadata keys with their
+    /// JSON kind and exact value size in UTF-8 bytes, the 836,752-byte Oct 11
+    /// observation in its real position, and its 11 steps with their
+    /// statuses and every key's size. The VALUES are sanitized filler and
+    /// every unprotected key is renamed, so this proves the shape, not the
+    /// content: the private original is replayed by the ignored acceptance
+    /// test below, in an authorized run, never checked in.
+    mod bounded_start {
+        use super::*;
+        use boss_jobs::execution_inputs as ei;
+
+        const NATIVE_JOB_KEYS: [(&str, bool, usize); 64] = [
+            ("annotation_01", false, 1797),
+            ("annotation_02", false, 986),
+            ("annotation_03", false, 604),
+            ("annotation_04", false, 1325),
+            ("annotation_05", true, 626),
+            ("history_06", true, 1112),
+            ("observation_20261011", true, 836752),
+            ("history_07", true, 1595),
+            ("history_08", true, 750),
+            ("history_09", true, 596),
+            ("history_10", true, 4816),
+            ("history_11", true, 597),
+            ("history_12", true, 1815),
+            ("history_13", true, 1603),
+            ("decided_2026-09-25_draft", false, 754),
+            ("decided_2026-10-05_c395e62c", true, 614),
+            ("decided_2026_09_25_david", false, 842),
+            ("decided_2026_09_25_operator", false, 791),
+            ("description", false, 803),
+            ("history_14", true, 13045),
+            ("annotation_15", false, 258),
+            ("input_channel", false, 14),
+            ("annotation_16", true, 1351),
+            ("annotation_17", true, 1163),
+            ("annotation_18", true, 826),
+            ("annotation_19", true, 1273),
+            ("annotation_20", true, 630),
+            ("history_21", true, 2466),
+            ("history_22", true, 6496),
+            ("history_23", true, 666),
+            ("history_24", true, 1744),
+            ("history_25", true, 1768),
+            ("history_26", true, 1098),
+            ("annotation_27", true, 912),
+            ("annotation_28", true, 1814),
+            ("annotation_29", false, 1581),
+            ("annotation_30", true, 364),
+            ("annotation_31", true, 7767),
+            ("opened_at", false, 35),
+            ("history_32", true, 1297),
+            ("annotation_33", false, 305),
+            ("annotation_34", false, 5865),
+            ("annotation_35", false, 821),
+            ("annotation_36", true, 576),
+            ("annotation_37", false, 1083),
+            ("annotation_38", false, 1168),
+            ("annotation_39", true, 3203),
+            ("annotation_40", false, 1683),
+            ("annotation_41", false, 724),
+            ("annotation_42", false, 557),
+            ("annotation_43", false, 927),
+            ("annotation_44", false, 1211),
+            ("annotation_45", true, 1214),
+            ("history_46", true, 8293),
+            ("annotation_47", false, 905),
+            ("source", true, 111),
+            ("annotation_48", false, 8),
+            ("annotation_49", true, 540),
+            ("annotation_50", true, 449),
+            ("annotation_51", true, 997),
+            ("trust_boundary", true, 332),
+            ("history_52", true, 551),
+            ("history_53", true, 738),
+            ("history_54", true, 1371),
+        ];
+
+        type Keys = &'static [(&'static str, bool, usize)];
+        const NATIVE_STEPS: [(&str, &str, Keys); 11] = [
+            (
+                "filed",
+                "completed",
+                &[("trigger_kind", false, 8), ("trigger_name", false, 23)],
+            ),
+            (
+                "triage",
+                "completed",
+                &[
+                    ("agent_budget_usd", true, 3),
+                    ("agent_effort", false, 6),
+                    ("agent_model", false, 10),
+                    ("agent_profile", false, 7),
+                    ("agent_run", false, 36),
+                    ("audience", true, 25),
+                    ("authority_role", false, 14),
+                    ("disposition", false, 6),
+                    ("evidence", false, 8400),
+                    ("procedure", false, 4106),
+                ],
+            ),
+            (
+                "measure",
+                "skipped",
+                &[
+                    ("agent_budget_usd", true, 3),
+                    ("agent_effort", false, 6),
+                    ("agent_model", false, 10),
+                    ("agent_profile", false, 7),
+                    ("authority_role", false, 14),
+                    ("procedure", false, 2521),
+                ],
+            ),
+            (
+                "draft-design",
+                "completed",
+                &[
+                    ("agent_budget_usd", true, 3),
+                    ("agent_effort", false, 6),
+                    ("agent_model", false, 10),
+                    ("agent_profile", false, 7),
+                    ("agent_run", false, 36),
+                    ("audience", true, 25),
+                    ("authority_role", false, 14),
+                    ("design_id", false, 36),
+                    ("procedure", false, 2169),
+                ],
+            ),
+            (
+                "design-review",
+                "completed",
+                &[
+                    ("accepted_as_proposed", true, 5),
+                    ("answer", false, 216),
+                    ("audience", true, 25),
+                    ("authority_role", false, 14),
+                    ("decided_by", true, 331),
+                    ("question", false, 254),
+                    ("verdict", false, 8),
+                ],
+            ),
+            (
+                "build",
+                "active",
+                &[
+                    ("agent_budget_usd", true, 3),
+                    ("agent_effort", false, 4),
+                    ("agent_model", false, 10),
+                    ("agent_profile", false, 7),
+                    ("agent_run", false, 36),
+                    ("authority_role", false, 14),
+                    ("nomination_requested", true, 250),
+                    ("released", true, 347),
+                ],
+            ),
+            (
+                "prove-delivery",
+                "pending",
+                &[
+                    ("audience", true, 25),
+                    ("authority_role", false, 14),
+                    ("procedure", false, 551),
+                ],
+            ),
+            ("duplicate", "pending", &[("outcome_kind", false, 9)]),
+            ("stale", "pending", &[("outcome_kind", false, 9)]),
+            ("declined", "pending", &[("outcome_kind", false, 7)]),
+            ("closed", "pending", &[("outcome_kind", false, 9)]),
+        ];
+
+        /// A value of exactly `size` bytes as `value_bytes` counts them: a
+        /// string of that many bytes, or a JSON object whose compact form
+        /// is that long (each fixture key names its own filler, so no two
+        /// values hash alike). Strings end with a marker line so a test can
+        /// tell a printed value from a listed one.
+        fn filler(name: &str, json: bool, size: usize) -> Value {
+            let marker = format!("<{name}>");
+            if !json {
+                let body = size.saturating_sub(marker.len());
+                return Value::String(format!("{}{marker}", "s".repeat(body)));
+            }
+            // {"m":"<marker>","r":"…"} — 15 bytes of punctuation and keys.
+            let overhead = r#"{"m":"","r":""}"#.len() + marker.len();
+            let body = size.saturating_sub(overhead);
+            json!({ "m": marker, "r": "j".repeat(body) })
+        }
+
+        fn native_packet() -> Value {
+            let mut md = serde_json::Map::new();
+            for (name, json, size) in NATIVE_JOB_KEYS {
+                md.insert(name.into(), filler(name, json, size));
+            }
+            md.insert(
+                "trust_boundary".into(),
+                json!({ "area": "machine-door", "reason": "r".repeat(280) }),
+            );
+            let steps: Vec<Value> = NATIVE_STEPS
+                .iter()
+                .map(|(slug, status, keys)| {
+                    let mut m = serde_json::Map::new();
+                    for (name, json, size) in keys.iter() {
+                        m.insert(
+                            (*name).into(),
+                            filler(&format!("{slug}.{name}"), *json, *size),
+                        );
+                    }
+                    if *slug == "build" {
+                        // The executing step's own block is real data, not
+                        // filler: dispatch reads it.
+                        for (k, v) in [
+                            ("authority_role", json!("platform-admin")),
+                            ("agent_profile", json!("builder")),
+                            ("agent_model", json!("opus-5[1m]")),
+                            ("agent_effort", json!("high")),
+                            ("agent_budget_usd", json!(5)),
+                        ] {
+                            m.insert(k.into(), v);
+                        }
+                    }
+                    let mut step = json!({ "id": format!("s-{slug}"), "spec_slug": slug,
+                        "status": status, "title": slug, "metadata": m });
+                    if *slug == "build" {
+                        // The real build step's predicate reads two steps.
+                        step["blocked_by"] = json!(["s-triage", "s-design-review"]);
+                    }
+                    step
+                })
+                .collect();
+            json!({
+                "id": PACKET, "kind": "backlog-item", "workflow_version": 7,
+                "title": "The LAN machine door trusts what a caller sends",
+                "status": "open", "priority": "urgent", "opened_on": "2026-09-24",
+                "metadata": md, "steps": steps,
+            })
+        }
+
+        /// What an operator holding publish on workflow records through
+        /// `boss classify`, built by the door's own rule
+        /// (`execution_inputs::entry_for`) over the packet as it stands.
+        fn classified(mut packet: Value, names: &[&str]) -> Value {
+            for name in names {
+                let pointer = ei::Source::Job {
+                    key: (*name).into(),
+                }
+                .pointer();
+                let value = ei::resolve(&packet, &pointer).unwrap().clone();
+                let req = ei::ClassificationRequest {
+                    pointer: Some(pointer),
+                    sha256: Some(ei::sha256_hex(&ei::value_bytes(&value))),
+                    class: Some("available_historical".into()),
+                    purpose: Some("a coordinator observation from an earlier window".into()),
+                    reason: Some("superseded by the current repair; retained verbatim".into()),
+                };
+                let entry = ei::entry_for(&packet, &req, "emp-david", "2026-10-18T00:00:00Z")
+                    .unwrap_or_else(|e| panic!("{name}: {}", e.message()));
+                let (md, _) = ei::appended(&packet["metadata"], &entry);
+                packet["metadata"] = md;
+            }
+            packet
+        }
+
+        fn history_names() -> Vec<&'static str> {
+            NATIVE_JOB_KEYS
+                .iter()
+                .map(|(n, _, _)| *n)
+                .filter(|n| n.starts_with("history_") || *n == "observation_20261011")
+                .collect()
+        }
+
+        fn declaring_row() -> Value {
+            let mut row = row_with_block();
+            row["metadata"] = json!({ "execution_inputs": { "contract": ei::CONTRACT } });
+            row
+        }
+
+        /// A jobs API that KEEPS the run it is sent, under the id the body
+        /// chose (a bounded dispatch names its run before admission).
+        async fn bounded_stub(
+            packet: Value,
+            row: Value,
+        ) -> (String, Log, Arc<Mutex<Option<Value>>>) {
+            let run: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+            let held = run.clone();
+            let (base, log) = serve(move |method, path, _target, body| {
+                let run_id = held
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|r| r["id"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                let on_run = !run_id.is_empty() && path.starts_with(&format!("/api/jobs/{run_id}"));
+                match (method, path) {
+                    ("GET", p) if p == format!("/api/jobs/{PACKET}") => {
+                        ("200 OK", packet.to_string())
+                    }
+                    ("GET", "/api/tenant/edit-level") => (
+                        "200 OK",
+                        json!({ "edit_level": null, "manifest": "m" }).to_string(),
+                    ),
+                    ("GET", "/api/jobs") => {
+                        ("200 OK", json!({ "data": [], "total": 0 }).to_string())
+                    }
+                    ("GET", "/api/workflows/backlog-item") => ("200 OK", row.to_string()),
+                    ("POST", p) if p.ends_with("/claim") => {
+                        ("200 OK", json!({ "status": "active" }).to_string())
+                    }
+                    ("POST", "/api/jobs") => {
+                        let mut filed = body.clone();
+                        // A legacy dispatch names no id; the server picks one.
+                        if filed.get("id").is_none_or(Value::is_null) {
+                            filed["id"] = json!(RUN);
+                        }
+                        filed["steps"] = json!([
+                            { "id": "run-claimed", "spec_slug": "claimed", "status": "completed", "metadata": {} },
+                            { "id": "run-briefed", "spec_slug": "briefed", "status": "ready", "metadata": {} },
+                            { "id": "run-building", "spec_slug": "building", "status": "pending",
+                              "metadata": { "worker_start_expectation": { "schema": 1, "minutes": 15 } } },
+                        ]);
+                        let id = filed["id"].clone();
+                        *held.lock().unwrap() = Some(filed);
+                        ("201 Created", json!({ "id": id }).to_string())
+                    }
+                    ("GET", p) if on_run && p == format!("/api/jobs/{run_id}") => (
+                        "200 OK",
+                        held.lock().unwrap().clone().unwrap_or(Value::Null).to_string(),
+                    ),
+                    ("PATCH", p) if on_run && p.contains("/steps/") => {
+                        stub_merge(&held, &run_id, p, body);
+                        ("204 No Content", String::new())
+                    }
+                    ("PUT", p) if on_run && p.contains("/steps/") => run_step_put(body),
+                    ("PATCH", p) if p.starts_with(&format!("/api/jobs/{PACKET}/steps/")) => {
+                        ("204 No Content", String::new())
+                    }
+                    _ => ("404 Not Found", format!("unstubbed {method} {path}")),
+                }
+            })
+            .await;
+            (base, log, run)
+        }
+
+        async fn dispatch_bounded(base: &str, content: &str) -> Result<Dispatched> {
+            dispatch_to_with_content(
+                &crate::sor_client::machine_client().unwrap(),
+                base,
+                &repo(),
+                PACKET,
+                None,
+                None,
+                &Overrides::default(),
+                false,
+                None,
+                "claude@algedonic.dev",
+                "emp-david",
+                "boss-dev-0",
+                BriefSource::Rendered,
+                None,
+                Some(content),
+            )
+            .await
+        }
+
+        fn filed(log: &Log) -> Option<Value> {
+            log.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(m, p, _)| m == "POST" && p == "/api/jobs")
+                .map(|c| c.2.clone())
+        }
+
+        #[tokio::test]
+        async fn a_bounded_start_lists_its_complete_classification_record_as_mandatory() {
+            let packet = classified(native_packet(), &history_names());
+            let (base, log, _) = bounded_stub(packet.clone(), declaring_row()).await;
+            let content = crate::attach::tests::store().await;
+            let dispatched = dispatch_bounded(&base, &content).await.unwrap();
+            let filed = filed(&log).unwrap();
+            let record = filed["metadata"]["execution_inputs"]["manifest"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["pointer"] == "/metadata/input_classifications")
+                .expect("the complete audit record must be a named original");
+            assert_eq!(record["class"], "mandatory_original");
+            let (original, account) = crate::start_inputs::original_at(
+                &crate::sor_client::machine_client().unwrap(),
+                &base,
+                &content,
+                "agent-claude-b",
+                &dispatched.run_id,
+                &crate::start_inputs::Which::Entry(record["n"].as_u64().unwrap()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                original.as_bytes(),
+                ei::value_bytes(&packet["metadata"][ei::CLASSIFICATIONS_KEY]).as_slice()
+            );
+            assert!(account.contains("matches the run's manifest"));
+        }
+
+        #[tokio::test]
+        async fn an_unhanded_bounded_record_refusal_does_not_prescribe_manual_cleanup() {
+            let err = super::super::bind_bounded_start(
+                &|_, _, _| async { Ok(None) },
+                RUN,
+                &json!({"metadata": {}}),
+                "expected start",
+                &json!({}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(!err.contains("finish or cancel this run"), "{err}");
+            assert!(err.contains("unhanded-run cleanup"), "{err}");
+        }
+
+        /// THE ACCEPTANCE THE DESIGN ASKS FOR, on the native shape: the
+        /// START is bounded and complete, the large observation is
+        /// conserved and retrievable byte for byte, and the receipt the run
+        /// asks for names this START and this manifest.
+        #[tokio::test]
+        async fn the_native_shaped_packet_yields_a_bounded_complete_start_and_conserves_everything()
+        {
+            let packet = classified(native_packet(), &history_names());
+            let (base, log, run) = bounded_stub(packet.clone(), declaring_row()).await;
+            let content = crate::attach::tests::store().await;
+            let dispatched = dispatch_bounded(&base, &content).await.expect("dispatches");
+            let start = &dispatched.prompt;
+
+            assert!(
+                start.contains("--started --local-root \"$PWD\""),
+                "worktree bounded START must bind its source worker: {start}"
+            );
+
+            assert!(
+                start.len() <= ei::START_BYTES,
+                "the bounded START is {} bytes",
+                start.len()
+            );
+            // Every required current input, printed: the item's scope, its
+            // decisions, the trust boundary, what the build's predicate
+            // reads (triage and design-review), the step's own block, and
+            // the annotations nobody classified.
+            for marker in [
+                "<description>",
+                "<decided_2026-09-25_draft>",
+                "<decided_2026_09_25_operator>",
+                "<triage.evidence>",
+                "<triage.procedure>",
+                "<design-review.answer>",
+                "<annotation_34>",
+                "machine-door",
+            ] {
+                assert!(start.contains(marker), "required {marker} is printed");
+            }
+            for name in history_names() {
+                assert!(
+                    !start.contains(&format!("<{name}>")),
+                    "{name} is listed, not printed"
+                );
+            }
+            // Rules and own-run precede the inventory of originals.
+            let run_id = dispatched.run_id.clone();
+            let rules = start.find("# Builder rules").expect("the rules");
+            let own = start.find("== THE RUN ==").expect("the own-run section");
+            let originals = start.find("== THE ORIGINALS").expect("the manifest");
+            assert!(rules < own && own < originals, "rules, run, then originals");
+            assert!(start.contains(&format!("boss dispatch {run_id} --original 1")));
+            assert!(start.contains("NOT claimed read"));
+
+            // The run records exactly the START and its manifest.
+            let filed = filed(&log).expect("the run is filed");
+            assert_eq!(filed["id"], json!(run_id));
+            assert_eq!(filed["metadata"]["brief"], json!(start));
+            let record = &filed["metadata"]["execution_inputs"];
+            let manifest = record["manifest"].as_array().unwrap();
+            assert_eq!(
+                manifest.len(),
+                history_names().len() + 1,
+                "history plus its mandatory classification record"
+            );
+            assert_eq!(
+                record["workflow"],
+                json!({"kind": "backlog-item", "version": 7})
+            );
+
+            // Its building step asks for the schema-3 receipt naming both.
+            let stored = run.lock().unwrap().clone().unwrap();
+            let expectation = &stored["steps"][2]["metadata"]["worker_start_expectation"];
+            assert!(ei::start_expectation_valid(expectation), "{expectation}");
+            assert_eq!(
+                expectation["start_sha256"],
+                json!(ei::sha256_hex(start.as_bytes()))
+            );
+            assert_eq!(expectation["manifest_sha256"], record["manifest_sha256"]);
+
+            // Conservation: the large observation, the whole snapshot and
+            // the complete legacy brief all read back verified.
+            let http = crate::sor_client::machine_client().unwrap();
+            let big = manifest
+                .iter()
+                .find(|e| e["pointer"] == "/metadata/observation_20261011")
+                .expect("the observation is listed");
+            assert_eq!(big["size_bytes"], 836752);
+            let n = big["n"].as_u64().unwrap();
+            let (text, account) = crate::start_inputs::original_at(
+                &http,
+                &base,
+                &content,
+                "agent-claude-b",
+                &run_id,
+                &crate::start_inputs::Which::Entry(n),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                text.as_bytes(),
+                ei::value_bytes(&packet["metadata"]["observation_20261011"]).as_slice()
+            );
+            assert!(account.contains("matches the run's manifest"), "{account}");
+            let (snapshot, _) = crate::start_inputs::original_at(
+                &http,
+                &base,
+                &content,
+                "agent-claude-b",
+                &run_id,
+                &crate::start_inputs::Which::Snapshot,
+            )
+            .await
+            .unwrap();
+            assert_eq!(snapshot, packet.to_string(), "the GET's bytes, as answered");
+            let (legacy, _) = crate::start_inputs::original_at(
+                &http,
+                &base,
+                &content,
+                "agent-claude-b",
+                &run_id,
+                &crate::start_inputs::Which::Legacy,
+            )
+            .await
+            .unwrap();
+            assert!(
+                legacy.len() > 900_000,
+                "the whole legacy brief: {}",
+                legacy.len()
+            );
+            assert!(legacy.contains("<observation_20261011>"));
+            assert!(legacy.contains("== THE PACKET — verbatim from the system of record"));
+        }
+
+        /// UNCLASSIFIED IS REQUIRED, AND REQUIRED IS NEVER CLIPPED: the
+        /// same packet with nothing classified is refused before anything
+        /// is filed, naming the observation and its exact size.
+        #[tokio::test]
+        async fn an_unclassified_native_packet_is_refused_naming_what_is_too_large() {
+            let (base, log, _) = bounded_stub(native_packet(), declaring_row()).await;
+            let content = crate::attach::tests::store().await;
+            let err = format!("{:#}", dispatch_bounded(&base, &content).await.unwrap_err());
+            assert!(err.contains("refusing rather than clipping"), "{err}");
+            assert!(
+                err.contains("/metadata/observation_20261011 — 836752 bytes"),
+                "{err}"
+            );
+            assert!(err.contains("needs releasing"), "{err}");
+            assert!(filed(&log).is_none(), "no run admitted");
+        }
+
+        /// A classification binds the VALUE: after the value changes it is
+        /// not applied, the value is printed in full again, and the START
+        /// says which classification stopped applying.
+        #[tokio::test]
+        async fn a_changed_value_is_printed_again_and_its_classification_named() {
+            let mut packet = classified(native_packet(), &history_names());
+            packet["metadata"]["history_08"]["r"] = json!("changed after it was classified");
+            let (base, _, _) = bounded_stub(packet, declaring_row()).await;
+            let content = crate::attach::tests::store().await;
+            let start = dispatch_bounded(&base, &content).await.unwrap().prompt;
+            assert!(start.contains("<history_08>"), "printed again");
+            assert!(start.contains("CLASSIFICATIONS NOT APPLIED"), "said");
+            assert!(start.contains("/metadata/history_08 is not applied"));
+        }
+
+        /// A malformed declaration on the pinned row refuses; it never
+        /// becomes a quiet legacy START or a bounded one that hides
+        /// anything.
+        #[tokio::test]
+        async fn a_malformed_declaration_refuses_before_any_run() {
+            let mut row = declaring_row();
+            row["metadata"]["execution_inputs"]["selectors"] = json!([{ "pointer": "/title",
+                "class": "available_historical", "purpose": "p" }]);
+            let (base, log, _) = bounded_stub(native_packet(), row).await;
+            let content = crate::attach::tests::store().await;
+            let err = format!("{:#}", dispatch_bounded(&base, &content).await.unwrap_err());
+            assert!(err.contains("not a classifiable pointer"), "{err}");
+            assert!(filed(&log).is_none());
+        }
+
+        /// A row that declares nothing keeps the legacy whole START, byte
+        /// for byte the renderer's: no snapshot, no manifest, no schema 3.
+        #[tokio::test]
+        async fn an_undeclaring_row_keeps_the_legacy_whole_start() {
+            let packet = classified(native_packet(), &history_names());
+            let (base, log, run) = bounded_stub(packet, row_with_block()).await;
+            let content = crate::attach::tests::store().await;
+            let dispatched = dispatch_bounded(&base, &content).await.unwrap();
+            assert!(dispatched.prompt.contains("<observation_20261011>"));
+            assert!(!dispatched.prompt.contains("== THE ORIGINALS"));
+            let filed = filed(&log).unwrap();
+            assert!(filed["metadata"].get("execution_inputs").is_none());
+            let stored = run.lock().unwrap().clone().unwrap();
+            assert_eq!(
+                stored["steps"][2]["metadata"]["worker_start_expectation"]["schema"],
+                1
+            );
+        }
+
+        /// THE PRIVATE ACCEPTANCE (design e72dc7c9): the ACTUAL retained
+        /// 2710c8fc packet — the parent whose dispatches measured 999,176
+        /// (f08a8483) and 1,000,373 (266f06e8) byte briefs — replayed
+        /// through the same renderer. Ignored in CI because the original is
+        /// private; run it in an authorized session with
+        /// `BOSS_START_ACCEPTANCE_PACKET=<path to the retained JSON>`. It
+        /// FAILS without the variable: an acceptance that silently passes
+        /// when its evidence is absent is not one. The classification below
+        /// is this acceptance's own operator act over that packet's
+        /// historical coordinator observations, never code that knows them.
+        #[tokio::test]
+        #[ignore = "replays a private native original; set BOSS_START_ACCEPTANCE_PACKET"]
+        async fn the_actual_native_packet_replays_bounded_and_conserved() {
+            let path = std::env::var("BOSS_START_ACCEPTANCE_PACKET")
+                .expect("BOSS_START_ACCEPTANCE_PACKET names the retained native packet");
+            let raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let mut packet = raw.get("data").cloned().unwrap_or(raw);
+            let real_id = packet["id"].clone();
+            packet["id"] = json!(PACKET);
+            for step in packet["steps"].as_array_mut().unwrap() {
+                if step["status"] == "active" {
+                    step["metadata"]["agent_profile"] = json!("builder");
+                }
+            }
+            let historical: Vec<String> = packet["metadata"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|k| {
+                    k.starts_with("coordinator_")
+                        || k.starts_with("lan_window_recheck_")
+                        || k.starts_with("urgent_capacity_coverage_")
+                        || k.starts_with("session_lan_window_")
+                        || k.starts_with("overnight_coordination_")
+                        || k.starts_with("finish_ledger_")
+                })
+                .cloned()
+                .collect();
+            let names: Vec<&str> = historical.iter().map(String::as_str).collect();
+            let packet = classified(packet, &names);
+            packet["workflow_version"].as_i64().expect("pinned");
+            let mut row = declaring_row();
+            row["version"] = packet["workflow_version"].clone();
+            let (base, _, _) = bounded_stub(packet.clone(), row).await;
+            let content = crate::attach::tests::store().await;
+            let dispatched = dispatch_bounded(&base, &content).await.expect("dispatches");
+            let legacy = crate::brief::render_with(
+                &repo(),
+                Some(&packet),
+                None,
+                "builder",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            println!(
+                "acceptance: packet {real_id}, {} historical values classified; legacy brief {} \
+                 bytes; bounded START {} bytes (bound {})",
+                names.len(),
+                legacy.len(),
+                dispatched.prompt.len(),
+                ei::START_BYTES
+            );
+            assert!(dispatched.prompt.len() <= ei::START_BYTES);
+            assert!(legacy.len() > 900_000);
         }
     }
 }

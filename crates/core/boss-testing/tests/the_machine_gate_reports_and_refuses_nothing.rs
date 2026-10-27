@@ -11,12 +11,24 @@
 //! enforcement is earned — a clean window, read, never a belief
 //! (operator decision (4) on 2710c8fc).
 //!
-//! THE MACHINE GATE REFUSES NOTHING, and this file is what holds that
-//! line:
+//! ROW C, THE ENFORCE FLIP (decision b08725c2; backlog 2710c8fc, its
+//! finish line of 2026-10-18) leaves the roster and the mounts below as
+//! they were and changes one word: `mode` is now `enforce`, on ONE plain line of
+//! ConfigMap `boss-machine-gate` and nowhere else in any manifest, in any
+//! shape, with its kubectl way back written beside it and pinned here,
+//! exactly as row D's `policy-check` is. A request at a service port that
+//! presents no accepted token is refused 401/403 — the LAN door stops
+//! believing an `x-boss-user` nobody proved. The file keeps its name
+//! because eight files cite it; what it now holds is the line below.
+//! The window David chose for it is 26 hours of clean report (decision
+//! 2026-10-17 on 2710c8fc), read by a machine before release, never an
+//! eye; the car is gated HELD and released only on that read.
 //!
-//!   * its mode is `report` and no manifest says `enforce` for it
-//!     anywhere. Enforcement is row C of decision b08725c2 — its own car,
-//!     after a 72-hour clean window, on a Pacific-hours train;
+//! THE MACHINE GATE'S LINE, held here:
+//!
+//!   * its mode is `enforce` on the one ConfigMap line, its way back
+//!     (`report`, by the LAN kube road, no pod roll) beside it, and no
+//!     other manifest spells `enforce` for it in any shape;
 //!   * both mounts are `optional: true`. A Secret the broker has not
 //!     filled, or a ConfigMap an apply has not reached, mounts EMPTY:
 //!     no token is a gate with no slots and a caller that sends none, no
@@ -35,12 +47,10 @@
 //! place: the plain `policy-check: enforce` line of that ConfigMap, and
 //! nowhere else in any manifest, in any shape. Its rollback road, the
 //! kubectl patch over the LAN kube road, is written beside the key and
-//! pinned here. THE MACHINE GATE'S HALF IS NOT LOOSENED BY IT: `mode`
-//! is still `report`, and `enforce` for it is still refused everywhere,
-//! the ConfigMap included — so until row C lands, the policy check's
-//! service arm is bounded by an ASSERTED `automation:` id, not a proven
-//! one (boss-policy-client `is_sim_identity`: "HOW THAT IS PROVEN TODAY:
-//! it is not").
+//! pinned here. Until row C, the policy check's service arm was bounded
+//! by an ASSERTED `automation:` id, not a proven one (boss-policy-client
+//! `is_sim_identity`); with `mode: enforce` no id reaches it at all
+//! without the estate token.
 //!
 //! WHO HOLDS THE TOKEN is a roster, pinned here, with the reason each
 //! workload is on it or deliberately off it. The token lets its holder
@@ -69,9 +79,15 @@
 //! (/etc/boss-train), so the class of exposure is not new; `report`
 //! grants a token-holder nothing it did not have; and the broker's
 //! rotation before enforcement retires any value read in the meantime.
-//! Before the enforce car, each needs a decision on the record (the
-//! consist lints out of the token-holding container, or the risk
-//! accepted), recorded as `before_enforce` on backlog 2710c8fc.
+//! Before the enforce car, each needed a decision on the record
+//! (`before_enforce` on backlog 2710c8fc), and each was answered by
+//! moving the code, not by accepting the risk: the assembled tree's
+//! exclusions and lints run in a private Job with no credential mount
+//! (car 50cbfb7a, feat/isolate-assembled-consist-execution), and the dev
+//! pod's builds — bun install, build.rs, every candidate binary — run in
+//! an uncredentialed worker pod (b3071bf4, closed completed 2026-10-22).
+//! The rotation that retires what was read before those landed is a
+//! release condition of the enforce car, not something this file can see.
 //!
 //! THE DEV POD'S COPY (backlog 1876bbdb, INFO-5) is mounted, in the
 //! container agents run in, at the one
@@ -156,14 +172,16 @@ const HOLDERS: &[(&str, &str)] = &[
         "the train conductor writes the record all day through the boss CLI — and runs the \
          assembled train tree's gate.sh and lints as uid 1500, which reads the mount; bounded \
          because it already holds the forge write token, report grants nothing, and a rotation \
-         before enforce retires what was read (decision owed: before_enforce on 2710c8fc)",
+         before enforce retires what was read (before_enforce on 2710c8fc, answered by car \
+         50cbfb7a: the assembled tree's lints now run in a private Job with no credential)",
     ),
     (
         "boss-dev.yaml",
         "the dev pod's doors, boss-api and the boss shim — at the doors' own directory; the \
          session runs as uid 0 with bun install and build.rs, which can read it; bounded \
          because it already holds the forge write token, report grants nothing, and a rotation \
-         before enforce retires what was read (decision owed: before_enforce on 2710c8fc). And \
+         before enforce retires what was read (before_enforce on 2710c8fc, answered by \
+         b3071bf4: builds run in an uncredentialed worker pod). And \
          the reclaim sidecar, at the default directory, for its maintenance packet and its \
          reads of the record (David, design-doc c8502e17 `reclaim-sidecar`, 2026-10-07)",
     ),
@@ -253,21 +271,20 @@ fn mode_config_map(boss: &str) -> &str {
 }
 
 #[test]
-fn the_machine_gate_reports_and_only_the_policy_check_enforces() {
+fn the_machine_gate_and_the_policy_check_each_enforce_on_one_line() {
     let all = manifests();
     let doc = mode_config_map(&all["boss.yaml"]);
     let [gate, check] = mode_keys();
-    for (key, want, why) in [
+    for (key, why) in [
         (
             gate,
-            "report",
-            "what the machine gate would refuse is admitted and tallied (design 6805c764 car 4); \
-             its `enforce` is row C of decision b08725c2, its own car, after a 72-hour clean \
-             window, on a Pacific-hours train — NOT the policy check's car",
+            "row C of decision b08725c2 (backlog 2710c8fc): a service port refuses a request \
+             that presents no accepted machine token, so the LAN door no longer believes an \
+             x-boss-user nobody proved. The way back is the word `report` on this line, by the \
+             kubectl road written beside it",
         ),
         (
             check,
-            "enforce",
             "row D of decision b08725c2 (F7 of backlog b8e75382): an unsigned check and a \
              service whose Read on policy-rule has lapsed are refused. The way back is the \
              word `report` on this line, by the kubectl road written above it",
@@ -277,26 +294,25 @@ fn the_machine_gate_reports_and_only_the_policy_check_enforces() {
             .filter_map(|l| l.trim().strip_prefix(&format!("{key}:")))
             .map(|v| v.trim().trim_matches('"'))
             .collect();
-        assert_eq!(modes, [want], "{CONFIG_MAP}'s `{key}` is `{want}`: {why}");
+        assert_eq!(
+            modes,
+            ["enforce"],
+            "{CONFIG_MAP}'s `{key}` is `enforce`: {why}"
+        );
     }
     for (name, text) in &all {
-        let lines: Vec<&str> = live_lines(text).collect();
-        if let Some(line) = sets_enforce(&lines, &[gate]) {
-            panic!(
-                "{name}: `{line}` — no manifest sets the MACHINE gate to enforce: that is row \
-                 C's car, and row D's flip of `{check}` does not carry it"
-            );
-        }
-        // The policy check's `enforce` lives on ONE line, counted above:
-        // the plain key of the ConfigMap. Any other spelling, in this
-        // file or another, is a second fact the rollback would miss.
+        // Each `enforce` lives on ONE line, counted above: the plain key
+        // of the ConfigMap. Any other spelling, in this file or another,
+        // is a second fact the rollback would miss.
         let outside = text.replace(doc, "");
         let lines: Vec<&str> = live_lines(&outside).collect();
-        if let Some(line) = sets_enforce(&lines, &[check]) {
-            panic!(
-                "{name}: `{line}` — `{check}: enforce` is spelled once, in ConfigMap \
-                 {CONFIG_MAP}, where its rollback road names it"
-            );
+        for key in [gate, check] {
+            if let Some(line) = sets_enforce(&lines, &[key]) {
+                panic!(
+                    "{name}: `{line}` — `{key}: enforce` is spelled once, in ConfigMap \
+                     {CONFIG_MAP}, where its rollback road names it"
+                );
+            }
         }
         for env in [
             "BOSS_MACHINE_GATE_MODE_FILE",
@@ -311,26 +327,33 @@ fn the_machine_gate_reports_and_only_the_policy_check_enforces() {
     }
 }
 
-/// Checklist F4 of backlog b8e75382: the rollback of the policy check's
-/// enforce flip needs a road that passes neither the jobs API nor the
-/// forge, because its misfire refuses every signed-in write. The road is
-/// written beside the ConfigMap, and names that ConfigMap and that key,
-/// so it cannot drift from what it rolls back.
+/// Checklist F4 of backlog b8e75382: the rollback of an enforce flip
+/// needs a road that passes neither the jobs API nor the forge, because
+/// its misfire refuses the callers that would carry a fix. The road is
+/// written in the ConfigMap's own document and names that ConfigMap and
+/// its key, so it cannot drift from what it rolls back — one road per
+/// word: the policy check's (row D) and the machine gate's (row C, backlog
+/// 2710c8fc), whose misfire refuses every caller the window missed.
 #[test]
-fn the_policy_checks_way_back_is_written_beside_its_key() {
+fn each_enforce_words_way_back_is_written_beside_its_key() {
     let all = manifests();
     let doc = mode_config_map(&all["boss.yaml"]);
-    let key = mode_keys()[1];
-    let road = doc
-        .lines()
-        .find(|l| l.trim_start().starts_with("#") && l.contains("kubectl"))
-        .unwrap_or_else(|| panic!("{CONFIG_MAP} carries its rollback road as a kubectl line"));
-    for part in [
-        "-n boss".to_string(),
-        format!("patch configmap {CONFIG_MAP}"),
-        format!("\"{key}\":\"report\""),
-    ] {
-        assert!(road.contains(&part), "the road names {part}: {road}");
+    for key in mode_keys() {
+        let want = format!("\"{key}\":\"report\"");
+        let road = doc
+            .lines()
+            .find(|l| l.trim_start().starts_with('#') && l.contains("kubectl") && l.contains(&want))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{CONFIG_MAP} carries the way back for `{key}` as a kubectl line naming {want}"
+                )
+            });
+        for part in [
+            "-n boss".to_string(),
+            format!("patch configmap {CONFIG_MAP}"),
+        ] {
+            assert!(road.contains(&part), "the road names {part}: {road}");
+        }
     }
 }
 

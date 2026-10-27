@@ -690,8 +690,20 @@ describe('the failed read is a red rail', () => {
     expect(decl(RAIL, 'font-style')).toBe('normal');
   });
 
-  it('is the only rule that draws the marker', () => {
-    expect([...rules.keys()].filter((s) => /\.load-failed\b/.test(s))).toEqual([RAIL]);
+  // A component's <style> is a rule too (backlog dfca9fd3). Svelte
+  // scopes `.a.load-failed` to `.a.load-failed.svelte-x`, three classes,
+  // which outranks the rail's `:root body` pair and takes its ink back —
+  // TransitMap set the motion line's failure in the map's red and
+  // FleetPage its notes in amber, a failure dressed as a warning, while
+  // this check read styles.css alone and passed. So every component's
+  // own rules are read too, named by file, and the rail stays the one.
+  it('is the only rule that draws the marker, in styles.css or any component', () => {
+    const scoped = svelteFiles.flatMap(([file]) =>
+      [...componentRules(file).keys()]
+        .filter((s) => /\.load-failed\b/.test(s))
+        .map((s) => `${file}: ${s}`),
+    );
+    expect([...[...rules.keys()].filter((s) => /\.load-failed\b/.test(s)), ...scoped]).toEqual([RAIL]);
   });
 
   it('no failure repaints its words inline', () => {

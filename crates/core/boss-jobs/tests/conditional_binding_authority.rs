@@ -121,6 +121,42 @@ async fn binding_contract(jobs: &dyn JobsRepository) {
             .unwrap(),
         original
     );
+
+    // THE HISTORY a gate attempt id is judged fresh against (backlog
+    // 0471152b): every receipt this packet retains, every actor's, and
+    // no other packet's.
+    let other = EventStamp::new("jobs", ActorId::Automation("other".into()));
+    let third: boss_jobs::conditional_metadata::Command = serde_json::from_value(json!({"contract_version":2,"idempotency_key":uuid::Uuid::new_v4(),
+        "expected":{"attempt":{"present":true,"value":{"state":"not_started"}}},"patch":{"attempt":{"state":"sending","by":"other"}}})).unwrap();
+    jobs.conditional_job_metadata_at(&job.id, &third, None, &other)
+        .await
+        .unwrap();
+    let mut elsewhere = job.clone();
+    elsewhere.id = boss_core::job::JobId::from_uuid(uuid::Uuid::new_v4());
+    jobs.create_job(&elsewhere).await.unwrap();
+    let unrelated: boss_jobs::conditional_metadata::Command = serde_json::from_value(
+        json!({"contract_version":2,"idempotency_key":uuid::Uuid::new_v4(),
+        "expected":{"ordinary":{"present":true,"value":true}},"patch":{"ordinary":false}}),
+    )
+    .unwrap();
+    jobs.conditional_job_metadata_at(&elsewhere.id, &unrelated, None, &stamp)
+        .await
+        .unwrap();
+    let mut history: Vec<_> = jobs
+        .conditional_job_metadata_receipts(&job.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|receipt| (receipt.actor, receipt.command.idempotency_key))
+        .collect();
+    history.sort();
+    let mut want = vec![
+        (stamp.actor().to_string(), command.idempotency_key),
+        (stamp.actor().to_string(), next.idempotency_key),
+        (other.actor().to_string(), third.idempotency_key),
+    ];
+    want.sort();
+    assert_eq!(history, want);
 }
 
 #[tokio::test]
@@ -427,4 +463,136 @@ async fn a_repository_cannot_first_bind_an_undeclared_guard_without_a_registry()
         "persistence must refuse a first binding without the exact pinned declaration: {result:?}"
     );
     assert_eq!(jobs.get_job(&job.id).await.unwrap().unwrap(), job);
+}
+
+/// A gate attempt write: `next` pinned on `pinned` (None pins absence).
+fn attempt_write(
+    pinned: Option<serde_json::Value>,
+    next: serde_json::Value,
+) -> boss_jobs::conditional_metadata::Command {
+    let key = boss_jobs::gate_reservation::ATTEMPT;
+    let expected = match pinned {
+        Some(value) => json!({"present": true, "value": value}),
+        None => json!({"present": false}),
+    };
+    serde_json::from_value(
+        json!({"contract_version":2,"idempotency_key":uuid::Uuid::new_v4(),
+        "expected":{key: expected},"patch":{key: next}}),
+    )
+    .unwrap()
+}
+
+/// WHY (backlog 301b9060, review f6890829 N1/N2 of car 4814539f). The
+/// door judged a gate attempt id fresh against a history it read BEFORE
+/// the row lock, so a write pinned on a value that did not exist yet
+/// could read a history missing W, wait while an accomplice (or itself)
+/// committed W and then V naming W, and land W a second time once its
+/// compare-and-set on V came true. Raced here for real: the colliding
+/// write retries against the chain until the chain is done. W is
+/// admitted exactly once whichever way the race falls, because the
+/// repository judges freshness under its own row lock; and a replay of
+/// the write that DID land W still returns its original receipt, because
+/// the replay is judged before freshness (N2: a concurrent duplicate got
+/// "already written" instead of its receipt).
+async fn a_colliding_attempt_id_is_admitted_once(jobs: &dyn JobsRepository) {
+    let key = boss_jobs::gate_reservation::ATTEMPT;
+    let mut job = Job::new(
+        "gate-run",
+        Subject::new("custom", "fixture"),
+        "Collide",
+        "agent-test",
+        Priority::Standard,
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 22).unwrap(),
+    );
+    job.status = JobStatus::Open;
+    jobs.create_job(&job).await.unwrap();
+    let accomplice = EventStamp::new("jobs", ActorId::Automation("accomplice".into()));
+    let racer = EventStamp::new("jobs", ActorId::Automation("racer".into()));
+    let (u, w, v) = (
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    );
+    let at_u = json!({"id": u, "actor": "accomplice", "state": "not_started"});
+    let at_w = json!({"id": w, "actor": "accomplice", "previous": u, "state": "not_started"});
+    let at_v = json!({"id": v, "actor": "accomplice", "previous": w, "state": "not_started"});
+    jobs.conditional_job_metadata_at(
+        &job.id,
+        &attempt_write(None, at_u.clone()),
+        None,
+        &accomplice,
+    )
+    .await
+    .unwrap();
+    // The racer pins the value the chain WILL leave and writes W back.
+    let colliding = attempt_write(
+        Some(at_v.clone()),
+        json!({"id": w, "actor": "racer", "previous": v, "state": "sending"}),
+    );
+    let to_w = attempt_write(Some(at_u), at_w.clone());
+    let to_v = attempt_write(Some(at_w.clone()), at_v.clone());
+    let chain_done = std::sync::atomic::AtomicBool::new(false);
+    let chain = async {
+        jobs.conditional_job_metadata_at(&job.id, &to_w, None, &accomplice)
+            .await
+            .unwrap();
+        jobs.conditional_job_metadata_at(&job.id, &to_v, None, &accomplice)
+            .await
+            .unwrap();
+        chain_done.store(true, std::sync::atomic::Ordering::SeqCst);
+    };
+    let race = async {
+        loop {
+            let done = chain_done.load(std::sync::atomic::Ordering::SeqCst);
+            match jobs
+                .conditional_job_metadata_decision_at(&job.id, &colliding, None, &racer)
+                .await
+            {
+                Err(boss_jobs::JobsError::JobChanged { .. }) if !done => {
+                    tokio::task::yield_now().await
+                }
+                settled => return settled,
+            }
+        }
+    };
+    let ((), raced) = tokio::join!(chain, race);
+    let refusal = raced
+        .map(|outcome| outcome.receipt)
+        .expect_err("W was admitted a second time")
+        .to_string();
+    assert!(
+        refusal.contains(&format!("{key}.id {w}")) && refusal.contains(&v.to_string()),
+        "the refusal names the reused id and the pinned attempt: {refusal}"
+    );
+    let ids_written: Vec<_> = jobs
+        .conditional_job_metadata_receipts(&job.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|receipt| receipt.command.patch.get(key).cloned())
+        .filter(|attempt| attempt["id"] == json!(w))
+        .collect();
+    assert_eq!(ids_written, vec![at_w], "W was admitted exactly once");
+    assert_eq!(
+        jobs.get_job(&job.id).await.unwrap().unwrap().metadata[key],
+        at_v,
+        "the refused write left the row as the chain did"
+    );
+    let replay = jobs
+        .conditional_job_metadata_decision_at(&job.id, &to_w, None, &accomplice)
+        .await
+        .expect("a replay of the write that landed W returns its receipt");
+    assert!(!replay.applied);
+    assert_eq!(replay.receipt.command, to_w);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_admits_a_colliding_attempt_id_once() {
+    a_colliding_attempt_id_is_admitted_once(&InMemoryJobs::new()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_admits_a_colliding_attempt_id_once_under_its_row_lock() {
+    let db = boss_testing::TestDb::new().await;
+    a_colliding_attempt_id_is_admitted_once(&boss_jobs::PgJobs::new(db.pool.clone())).await;
 }

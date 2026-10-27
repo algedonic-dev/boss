@@ -84,9 +84,18 @@ export const RELEASE = { status: 'ready', assignee_id: null } as const;
 export const AGENT_RUN_EDGE = 'agent_run';
 
 /// Where a hand-release's evidence lands on the freed step, the key
-/// `boss step release` writes — `boss-cli` `steps::RELEASED_KEY`,
-/// pinned equal to it by holder.test.ts (CLAUDE.md §9a).
+/// `boss step release` writes — `boss_jobs::step_release::KEY`, which
+/// the CLI's `steps::RELEASED_KEY` is, pinned equal to it by
+/// holder.test.ts (CLAUDE.md §9a).
 export const RELEASED_KEY = 'released';
+
+/// The field of that stamp naming the holder the step was taken from —
+/// `boss_jobs::step_release::FROM`, pinned the same way. The
+/// dispatcher's capability pick reads it and leaves that agent out
+/// while another serves the step's (role, model); without it the
+/// pick's hash of the step id re-nominates the step straight back to
+/// the holder that released it (backlog ff0f0ff5).
+export const RELEASED_FROM = 'from';
 
 /// What a release writes through the merge door before the status
 /// write — `release_patch` in boss-cli/src/steps.rs, key for key:
@@ -99,19 +108,27 @@ export const RELEASED_KEY = 'released';
 ///   car 675f1858, #1). The merge door deletes a missing key quietly,
 ///   so the unconditional null costs nothing. The PUT cannot clear a
 ///   key; only the merge door's `null` can.
-/// - `released` — `{why, by, at, from_run}`: a hand-release is
+/// - `released` — `{why, by, at, from_run, from}`: a hand-release is
 ///   testimony, and the reason is the whole artifact it leaves (#2).
 ///   `from_run` is the run the snapshot named, or null; the null above
-///   clears whatever the server holds either way.
+///   clears whatever the server holds either way. `from` is the holder
+///   the snapshot named ([`RELEASED_FROM`]).
 export function releaseMetadata(
   metadata: Readonly<Record<string, unknown>>,
   why: string,
   by: string | null,
   at: string,
+  from: string | null,
 ): Record<string, unknown> {
   return {
     [AGENT_RUN_EDGE]: null,
-    [RELEASED_KEY]: { why: why.trim(), by, at, from_run: metadata[AGENT_RUN_EDGE] ?? null },
+    [RELEASED_KEY]: {
+      why: why.trim(),
+      by,
+      at,
+      from_run: metadata[AGENT_RUN_EDGE] ?? null,
+      [RELEASED_FROM]: from,
+    },
   };
 }
 

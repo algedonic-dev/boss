@@ -20,14 +20,10 @@ import { join } from 'node:path';
  *  is an edit to the `--map-*` block rather than to these files. */
 const MAP_FILES = [
   'MapPage.svelte',
-  'WorldMap.svelte',
   // 'RegionMap.svelte' and 'RegionFloor.svelte' retired with the floor
   // pages (design e765b3fc, car N3).
   // The HUD frame above the map (design 00774ca8): the same palette.
   'HudFrame.svelte',
-  // The motion layer over the world (design 31bade8f, car M2): its canvas
-  // reads the same tokens rather than naming a colour of its own.
-  'MotionLayer.svelte',
   // The transit monitor (design 16091dfb, flight it-map-transit): its
   // lines are --map-line-* tokens, its rings the map's own states.
   'TransitMap.svelte',

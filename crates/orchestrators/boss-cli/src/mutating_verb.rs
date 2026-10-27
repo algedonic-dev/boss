@@ -28,7 +28,7 @@
 //! - `boss park`: refused, naming the two doors above (`park.rs`).
 //!
 //! The hold is the one the dock already honours (`metadata.hold` on the
-//! car's review step, read by `stranded::hold_reason` in the conductor,
+//! car's review step, read by `stranded::marked` in the conductor,
 //! the loading-dock row and `boss orient`), and `boss release` clears it.
 //!
 //! WHAT IS COVERED, on each side of the change, over-approximated so it
@@ -1327,7 +1327,7 @@ pub(crate) fn gate_hold(
 pub(crate) fn car_hold_write(car: &Value, reason: &str) -> Result<Option<(String, Value)>, String> {
     let review = crate::steps::holdable(car)?;
     let review_md = review.get("metadata").unwrap_or(&Value::Null);
-    if boss_jobs::stranded::hold_reason(review_md).is_some() {
+    if boss_jobs::stranded::marked(review_md, "hold").is_some() {
         return Ok(None);
     }
     let car_id = car.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -1564,7 +1564,29 @@ pub(crate) fn review_hold_write(
     reason: &str,
     head: Option<&str>,
 ) -> Result<Option<(String, Value)>, String> {
-    Ok(car_hold_write(car, reason)?.map(|(path, mut body)| {
+    let write = match car_hold_write(car, reason)? {
+        Some(write) => Some(write),
+        None => {
+            // afc5147c: a green repair refreshes the held head, while
+            // the existing reason remains the reason for the brake.
+            if head.is_none() || boss_jobs::car_release::hold_sha(car) == head {
+                return Ok(None);
+            }
+            let review = crate::steps::holdable(car)?;
+            let car_id = car.get("id").and_then(Value::as_str).unwrap_or_default();
+            let step_id = review.get("id").and_then(Value::as_str).unwrap_or_default();
+            if car_id.is_empty() || step_id.is_empty() {
+                return Err("the car or its review step carries no id to write the hold to".into());
+            }
+            let md = review.get("metadata").unwrap_or(&Value::Null);
+            let existing = boss_jobs::stranded::marked(md, "hold").unwrap_or_else(|| reason.into());
+            Some((
+                format!("/api/jobs/{car_id}/steps/{step_id}/metadata"),
+                crate::steps::hold_patch(md, &existing),
+            ))
+        }
+    };
+    Ok(write.map(|(path, mut body)| {
         if let Some(head) = head {
             body[HOLD_SHA] = Value::String(head.to_string());
         }
@@ -1686,7 +1708,7 @@ mod tests {
             "/api/jobs/c0ffee00-0000-0000-0000-000000000000/steps/5e5e5e5e/metadata"
         );
         assert_eq!(
-            boss_jobs::stranded::hold_reason(&body).as_deref(),
+            boss_jobs::stranded::marked(&body, "hold").as_deref(),
             Some("touches x"),
             "the shape every dock reader reads"
         );
@@ -1706,6 +1728,34 @@ mod tests {
     }
 
     const H1: &str = "1111111111111111111111111111111111111111";
+    #[test]
+    fn malformed_gate_envelope_does_not_replace_a_reserved_hand_hold() {
+        for poison in [json!({}), json!(null)] {
+            let held = car(review(
+                "ready",
+                json!({"hold":"David only","releaser":"emp-david","gate_submission":poison}),
+            ));
+            assert_eq!(car_hold_write(&held, "conductor hold"), Ok(None));
+        }
+    }
+
+    #[test]
+    fn malformed_gate_envelope_preserves_the_original_reason_when_refreshing_a_hold() {
+        for poison in [json!({}), json!(null)] {
+            let held = car(review(
+                "ready",
+                json!({"hold":"David only","releaser":"emp-david","gate_submission":poison}),
+            ));
+            let (_, patch) = review_hold_write(&held, "conductor hold", Some(H1))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                patch["hold"], "David only",
+                "head refresh must preserve the raw operator reason"
+            );
+            assert_eq!(patch[HOLD_SHA], H1);
+        }
+    }
     const H2: &str = "2222222222222222222222222222222222222222";
 
     const REVIEWER: &str = "5eed5eed-0000-4000-8000-000000000000";
@@ -2031,6 +2081,18 @@ mod tests {
     }
 
     #[test]
+    fn a_green_refresh_moves_an_existing_hold_to_the_repaired_head() {
+        let held = car(review("ready", json!({"hold":"area policy", HOLD_SHA:H1})));
+        let (_, body) = review_hold_write(&held, "new reason", Some(H2))
+            .unwrap()
+            .expect("the green refresh must move the held head");
+        assert_eq!(body, json!({"hold":"area policy", HOLD_SHA:H2}));
+        let mut refreshed = held;
+        refreshed["steps"][0]["metadata"] = body;
+        assert_eq!(boss_jobs::car_release::hold_sha(&refreshed), Some(H2));
+    }
+
+    #[test]
     fn the_dock_hold_records_the_head_it_judged_in_the_same_write() {
         let (path, body) =
             review_hold_write(&car(review("ready", json!({}))), "touches x", Some(H1))
@@ -2043,7 +2105,7 @@ mod tests {
         assert_eq!(body, json!({"hold": "touches x", HOLD_SHA: H1}));
         assert_eq!(
             review_hold_write(
-                &car(review("ready", json!({"hold": "area policy"}))),
+                &car(review("ready", json!({"hold": "area policy", HOLD_SHA:H1}))),
                 "r",
                 Some(H1)
             ),
@@ -3398,9 +3460,19 @@ mod tests {
             include_str!("rerail.rs"),
             "async fn finish(",
             "crate::mutating_verb::review_hold_write(car, &reason, bound)",
-            // The call as a statement of `finish`'s body, however rustfmt
-            // wraps its arguments (the proof intent lengthened it, 79a17c7a).
-            &["\n    repoint(\n"],
+            // The hold's own send, and the repoint's — `finish` decides
+            // every write before it makes one, so `--dry-run` can stop
+            // between the two halves (backlog 1e9aeea9).
+            &[
+                ".context(\"holding the car for its review before repointing it\")",
+                "let (path, patch) = repoint;",
+            ],
+        );
+        order(
+            include_str!("rerail.rs"),
+            "async fn finish(",
+            ".context(\"holding the car for its review before repointing it\")",
+            &["let (path, patch) = repoint;"],
         );
         order(
             include_str!("park.rs"),

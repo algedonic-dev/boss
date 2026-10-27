@@ -624,9 +624,9 @@ function stageOf(t: TrainRow): number {
 
 /** The ETA leg positions the locomotive only where the leg IS the
  *  stage: CI (the board→merge leg under way) and deploying (the
- *  merge→deploy leg). Awaiting merge sits at the merge signal — a green
- *  lamp says nothing about how close the merge is — and converging has
- *  an elapsed but no median, so it sits at its signal too. */
+ *  merge→converge leg). Awaiting merge sits at the merge signal — a green
+ *  lamp says nothing about how close the merge is — and converging shows
+ *  an elapsed, never a projection, so it sits at its signal too. */
 function progressOf(t: TrainRow, stage: number): number {
   if (t.eta.kind !== 'eta') return 0;
   return stage === 1 || stage === 3 ? t.eta.progress : 0;
@@ -984,11 +984,15 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
   // carry it — drawn here, ahead of every queued run, as the train-gate
   // wagon it becomes once filed. Neutral like the rest of the line: the
   // verdict row says when the wait has held long enough to be trouble.
+  // Read by the place itself (`bound_wait`), not the wait reason, which
+  // the conductor writes on every failed launch: a fault holds no place
+  // in the line (backlog 82071657, review a2ace778). No train is placed
+  // before this lane — locomotives are not wagons — so every one in the
+  // list is drawn, and the lane's count below is the wagons placed here.
   const trainsFirst = yard.inFlight.filter(
-    t => t.gate != null && t.gate.wait_reason !== null && t.gate.run === null && t.gate.fallback === null,
+    t => t.gate != null && t.gate.bound_wait !== null && t.gate.run === null && t.gate.fallback === null,
   );
   trainsFirst.forEach((t, i) => {
-    if (claimedIds.has(t.id)) return;
     place({
       id: t.id,
       tag: 'train gate',
@@ -1002,7 +1006,7 @@ export function scene(yard: YardState, status: YardStatus | null, nowMs: number,
       trainId: t.id,
       tone: 'static',
       lamp: 'off',
-      status: `waiting · first in line for the next bay · ${t.gate?.wait_reason ?? ''}`,
+      status: `waiting · first in line for the next bay · ${t.gate?.bound_wait ?? ''}`,
       since: t.gate?.wait_since ?? null,
     });
   });

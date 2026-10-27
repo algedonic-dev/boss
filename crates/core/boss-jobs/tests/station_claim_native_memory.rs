@@ -74,15 +74,114 @@ struct Fixture {
     stamp: boss_core::publisher::EventStamp,
 }
 
+/// Admit a fresh authenticated ingress for the fixture's own request and
+/// prepare its native authority. `admitted_at` follows it, because the
+/// production budget runs from the ingress, not from the claim.
+async fn admit(f: &mut Fixture) -> Result<(), JobsError> {
+    let proof = ingress().await;
+    f.admitted_at = proof.started();
+    let observation = f
+        .repo
+        .prepare_native_selection(proof, f.context.request_id, &f.context.station.name)
+        .await?
+        .expect("native memory owners prepare an observation");
+    f.context.native_authority = Some(Arc::new(observation));
+    Ok(())
+}
+
+/// Admissions an answer test spends before a run of deadline refusals is
+/// its verdict rather than the load's.
+const ANSWER_ADMISSIONS: u32 = 3;
+
+/// Every owner a refused claim must leave as it found it.
+#[derive(Debug, PartialEq)]
+struct Owners {
+    events: serde_json::Value,
+    step: Option<Step>,
+    receipt: Option<String>,
+    calendar: Option<serde_json::Value>,
+}
+
+impl Owners {
+    async fn read(f: &Fixture) -> Self {
+        Self {
+            events: serde_json::to_value(f.repo.recorded_events()).unwrap(),
+            step: f.repo.get_step(&f.step.id).await.unwrap(),
+            receipt: f
+                .repo
+                .station_claim_receipt(f.context.request_id)
+                .await
+                .unwrap()
+                .map(|receipt| receipt.json().to_owned()),
+            calendar: f.calendar.as_ref().map(|calendar| {
+                serde_json::json!([
+                    calendar.active_count(),
+                    serde_json::to_value(calendar.recorded_events()).unwrap()
+                ])
+            }),
+        }
+    }
+}
+
+/// Claim for a test whose subject is the ANSWER — what a claim records,
+/// or what it replays — and not the ingress deadline (cb503277). The
+/// budget stays the production five seconds, read on the std clock the
+/// memory owners read it on; a test that moved only tokio's clock would
+/// miss that reader (car 4f6ec932's review, B1). A thread stalled past it
+/// is refused before commit dispatch, which is the system working: red
+/// train d1251135's gate ran this binary in 21.5 s against 6 s on an idle
+/// pod, with three gates on one node, and this file's calendar answer
+/// lost its five seconds there on a tree no car had changed it on.
+/// So a deadline refusal is JUDGED, never unwrapped: the deadline really
+/// passed and the refused attempt left every owner as it found it; then
+/// the same request is admitted afresh, as its client would retry it. A
+/// deadline refusal before the deadline, a refusal of any other kind, or
+/// one on every admission is still this test's failure.
+async fn claim_answer(f: &mut Fixture) -> Result<SelectionResult, JobsError> {
+    let mut admission = 1;
+    loop {
+        let before = Owners::read(f).await;
+        let admitted = if admission == 1 {
+            Ok(())
+        } else {
+            admit(f).await
+        };
+        let attempt = match admitted {
+            Ok(()) => {
+                f.repo
+                    .claim_station_head_at(&f.context, "automation:ops-runner", &[], &f.stamp, &[])
+                    .await
+            }
+            Err(refusal) => Err(refusal),
+        };
+        match attempt {
+            Err(JobsError::SelectionConflict(reason))
+                if reason.contains("deadline expired") && admission < ANSWER_ADMISSIONS =>
+            {
+                assert!(
+                    std::time::Instant::now()
+                        >= f.admitted_at + boss_jobs::station_claim::SELECTION_PRE_COMMIT_BUDGET,
+                    "a deadline refusal before its deadline is a defect, not load: {reason}"
+                );
+                assert_eq!(
+                    Owners::read(f).await,
+                    before,
+                    "a deadline refusal must leave every owner as it found it: {reason}"
+                );
+                eprintln!(
+                    "admission {admission} refused at its ingress deadline ({reason}); admitting afresh"
+                );
+                admission += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 #[tokio::test]
 async fn complete_native_memory_population_is_copied_not_omitted() {
-    let f = fixture().await;
-    let SelectionResult::Claimed { receipt, .. } = f
-        .repo
-        .claim_station_head_at(&f.context, "automation:ops-runner", &[], &f.stamp, &[])
-        .await
-        .unwrap()
-    else {
+    let mut f = fixture().await;
+    let SelectionResult::Claimed { receipt, .. } = claim_answer(&mut f).await.unwrap() else {
         panic!("unchanged owners must claim")
     };
     let population = receipt
@@ -409,6 +508,7 @@ async fn an_actual_automation_row_prepares_without_becoming_an_agent_candidate()
                 role: "worker".into(),
                 description: "actual separate automation owner".into(),
                 signs_for: Some("automation:ops-runner:".into()),
+                access_tier: None,
             }],
             &stamp,
         )
@@ -486,6 +586,7 @@ async fn fixture_with_actor(
                     role: "worker".into(),
                     description: "separate automation owner".into(),
                     signs_for: Some("automation:ops-runner:".into()),
+                    access_tier: None,
                 }],
                 &stamp,
             )
@@ -616,21 +717,12 @@ async fn fixture_with_actor(
 
 #[tokio::test]
 async fn a_real_automation_owner_is_conserved_through_claim_and_original_replay() {
-    let f = fixture_with_actor(None, true).await;
-    let SelectionResult::Claimed { receipt, .. } = f
-        .repo
-        .claim_station_head_at(&f.context, "automation:ops-runner", &[], &f.stamp, &[])
-        .await
-        .unwrap()
-    else {
+    let mut f = fixture_with_actor(None, true).await;
+    let SelectionResult::Claimed { receipt, .. } = claim_answer(&mut f).await.unwrap() else {
         panic!("automation must claim");
     };
     assert!(f.agents.list().await.unwrap().is_empty());
-    let original = f
-        .repo
-        .claim_station_head_at(&f.context, "automation:ops-runner", &[], &f.stamp, &[])
-        .await
-        .unwrap();
+    let original = claim_answer(&mut f).await.unwrap();
     let SelectionResult::Replayed(replayed) = original else {
         panic!("original");
     };
@@ -652,12 +744,7 @@ async fn an_unobserved_historical_budget_is_copied_as_unknown_never_zero() {
         .await
         .unwrap();
     f.context.validated_step = f.step.clone();
-    let SelectionResult::Claimed { receipt, .. } = f
-        .repo
-        .claim_station_head_at(&f.context, "automation:ops-runner", &[], &f.stamp, &[])
-        .await
-        .unwrap()
-    else {
+    let SelectionResult::Claimed { receipt, .. } = claim_answer(&mut f).await.unwrap() else {
         panic!("claim");
     };
     let value = serde_json::to_value(receipt).unwrap();
@@ -877,13 +964,7 @@ async fn scheduled_fixture() -> Fixture {
         .await
         .unwrap();
     f.context.validated_step = f.step.clone();
-    f.context.native_authority = Some(Arc::new(
-        f.repo
-            .prepare_native_selection(ingress().await, f.context.request_id, "fixture")
-            .await
-            .unwrap()
-            .unwrap(),
-    ));
+    admit(&mut f).await.unwrap();
     f
 }
 
@@ -906,27 +987,22 @@ fn calendar_request(f: &Fixture, reason_ref: String) -> boss_core::calendar::Res
 
 #[tokio::test]
 async fn existing_own_hold_is_retained_without_a_second_calendar_fact() {
-    let f = scheduled_fixture().await;
-    let calendar = f.calendar.as_ref().unwrap();
+    let mut f = scheduled_fixture().await;
+    let calendar = f.calendar.clone().unwrap();
     let id = boss_calendar::CalendarClient::reserve_at(
-        &**calendar,
+        &*calendar,
         calendar_request(&f, f.step.id.to_string()),
         f.stamp.timestamp,
         &f.stamp,
     )
     .await
     .unwrap();
-    let original = boss_calendar::CalendarClient::get(&**calendar, id)
+    let original = boss_calendar::CalendarClient::get(&*calendar, id)
         .await
         .unwrap()
         .unwrap();
     let calendar_events = serde_json::to_value(calendar.recorded_events()).unwrap();
-    let SelectionResult::Claimed { receipt, .. } = f
-        .repo
-        .claim_station_head_at(&f.context, "automation:ops-runner", &[], &f.stamp, &[])
-        .await
-        .unwrap()
-    else {
+    let SelectionResult::Claimed { receipt, .. } = claim_answer(&mut f).await.unwrap() else {
         panic!("claim");
     };
     assert_eq!(calendar.active_count(), 1);
@@ -1085,12 +1161,8 @@ async fn a_real_actor_writer_wait_cancels_before_any_memory_effect() {
 
 #[tokio::test]
 async fn actual_authenticated_memory_claim_commits_and_replays_one_record() {
-    let f = fixture().await;
-    let result = f
-        .repo
-        .claim_station_head_at(&f.context, "automation:ops-runner", &[], &f.stamp, &[])
-        .await
-        .unwrap();
+    let mut f = fixture().await;
+    let result = claim_answer(&mut f).await.unwrap();
     let SelectionResult::Claimed { step, receipt } = result else {
         panic!("new claim");
     };
@@ -1102,11 +1174,7 @@ async fn actual_authenticated_memory_claim_commits_and_replays_one_record() {
         Some("automation:ops-runner")
     );
     let events = serde_json::to_value(f.repo.recorded_events()).unwrap();
-    let replay = f
-        .repo
-        .claim_station_head_at(&f.context, "automation:ops-runner", &[], &f.stamp, &[])
-        .await
-        .unwrap();
+    let replay = claim_answer(&mut f).await.unwrap();
     assert!(
         matches!(replay, SelectionResult::Replayed(original) if original.json() == receipt.json())
     );
@@ -1210,6 +1278,22 @@ async fn a_scheduled_postclaim_assignee_requires_a_real_calendar_owner() {
 
 #[tokio::test]
 async fn a_real_memory_calendar_joins_the_stored_assignee_and_one_fact() {
+    calendar_join(std::time::Duration::ZERO).await;
+}
+
+/// The same answer, with the test's thread stalled past the production
+/// ingress budget before its first claim — what red train d1251135's
+/// gate did to the test above, under three gates on one node (cb503277).
+#[tokio::test]
+async fn a_real_memory_calendar_join_survives_a_stall_past_its_ingress_budget() {
+    calendar_join(
+        boss_jobs::station_claim::SELECTION_PRE_COMMIT_BUDGET
+            + std::time::Duration::from_millis(100),
+    )
+    .await;
+}
+
+async fn calendar_join(stall: std::time::Duration) {
     let mut f = fixture_with_calendar(Some(Arc::new(boss_calendar::InMemoryCalendar::new()))).await;
     let control = boss_policy_client::controls::CREATE_SCHEDULE;
     boss_policy_client::PolicyRepository::upsert_rule(
@@ -1234,19 +1318,9 @@ async fn a_real_memory_calendar_joins_the_stored_assignee_and_one_fact() {
         .await
         .unwrap();
     f.context.validated_step = f.step.clone();
-    f.context.native_authority = Some(Arc::new(
-        f.repo
-            .prepare_native_selection(ingress().await, f.context.request_id, "fixture")
-            .await
-            .unwrap()
-            .unwrap(),
-    ));
-    let SelectionResult::Claimed { step, receipt } = f
-        .repo
-        .claim_station_head_at(&f.context, "automation:ops-runner", &[], &f.stamp, &[])
-        .await
-        .unwrap()
-    else {
+    admit(&mut f).await.unwrap();
+    std::thread::sleep(stall);
+    let SelectionResult::Claimed { step, receipt } = claim_answer(&mut f).await.unwrap() else {
         panic!("new claim");
     };
     assert_eq!(step.assignee_id.as_deref(), Some("automation:ops-runner"));
@@ -1296,13 +1370,8 @@ async fn matching_owner_configuration_does_not_bind_a_different_jobs_state() {
 
 #[tokio::test]
 async fn original_replay_survives_update_retirement_but_not_read_retirement() {
-    let f = fixture().await;
-    let SelectionResult::Claimed { receipt, .. } = f
-        .repo
-        .claim_station_head_at(&f.context, "automation:ops-runner", &[], &f.stamp, &[])
-        .await
-        .unwrap()
-    else {
+    let mut f = fixture().await;
+    let SelectionResult::Claimed { receipt, .. } = claim_answer(&mut f).await.unwrap() else {
         panic!("new claim");
     };
     let events = serde_json::to_value(f.repo.recorded_events()).unwrap();

@@ -22,8 +22,9 @@
 //! lanes — this reads that decision off [`YardStatus`] rather than
 //! deciding again. The two predicates the yard decided only on the
 //! client are ported here ONCE and pinned against the TypeScript by a
-//! test: the train-gate wait (`train_gate_wait_reason` /
-//! `train_gate_fallback`, `yard.ts::trainGateTroubled`) and the
+//! test: the train-gate wait (`train_gate_bound_wait` /
+//! `train_gate_fallback`, and `train_gate_wait_reason` for a launch with
+//! no bound run, `yard.ts::trainGateTroubled`) and the
 //! receiving yard's age bands and pipeline set (`receiving.ts`).
 //!
 //! NO NUMBER THIS SURFACE MAKES UP. A region whose input could not be
@@ -87,6 +88,7 @@ mod track;
 
 pub use self::alone::{
     CAR_KIND, Family, GATE_RUN_KIND, Stations, TRAIN_KIND, family_of, place_alone,
+    place_alone_at_every_station,
 };
 use self::arrivals::arrivals;
 pub(crate) use self::arrivals::released_awaiting_repair;
@@ -131,8 +133,9 @@ pub(crate) use self::stale_proof::{
 pub(crate) use self::stuck::stuck_ids;
 pub use self::stuck::{THIRDS, ThirdStuck, stuck};
 pub use self::track::{
-    TRAIN_GATE_FALLBACK, TRAIN_GATE_LAUNCHED_AT, TRAIN_GATE_WAIT_MINUTES, TRAIN_GATE_WAIT_REASON,
-    train_gate_troubled, train_gate_wait_since,
+    GateUnfiled, TRAIN_GATE_BOUND_WAIT, TRAIN_GATE_FALLBACK, TRAIN_GATE_LAUNCHED_AT,
+    TRAIN_GATE_REFUSALS, TRAIN_GATE_WAIT_MINUTES, TRAIN_GATE_WAIT_REASON, train_gate_unfiled,
+    train_gate_wait_since,
 };
 use self::track::{track, train_findings};
 
@@ -528,17 +531,21 @@ pub struct Regions {
 /// One station of the marshalling yard, as the handler read it:
 /// depth and the open packets standing there (for a distinct count
 /// across stations — a packet can match two predicates), and the
-/// counted flow in each window, `None` where the cube is blind to the
-/// station's predicate (`crate::station_flow::FlowBlind`).
+/// counted flow in each window on the packet-membership basis
+/// (`crate::membership_replay`), `None` where that reader could not count
+/// it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StationReading {
     pub name: String,
     pub over_limit: bool,
     pub members: Vec<String>,
     pub served: Option<i64>,
-    /// The evaluator's original refusal, kept alongside an unavailable
-    /// count so the map does not discard the diagnosis (a4de1e72).
-    pub flow_blind: Option<crate::station_flow::FlowBlind>,
+    /// The membership reader's own reason, kept alongside an unavailable
+    /// count so the map does not discard the diagnosis (a4de1e72): the
+    /// read it refused (a row or byte bound), or the station's unknown
+    /// spans. Until item ab09f1af's car 2 this held the step-events
+    /// cube's blind clause, which named a shape and never a count.
+    pub flow_unread: Option<String>,
     pub previous_served: Option<i64>,
     /// When each member opened, where the record holds it — the
     /// marshalling KPI's age (design 62de32ae, decision 9). Keyed by
@@ -546,6 +553,44 @@ pub struct StationReading {
     /// partition ([`marshalling_view`]) narrows `members` to what is
     /// marshalling's, and the oldest of what REMAINS is the number.
     pub opened: std::collections::BTreeMap<String, Instant>,
+    /// The steps that put each member here — every step of a member that
+    /// satisfies the station's step clause — with who owns each and since
+    /// when it has waited (backlog 6254e602). A station that served
+    /// nothing in the window is judged on these: a step waiting on its
+    /// named owner inside the bound its pinned protocol declares is a
+    /// qualified wait (attention), and anything else is not draining
+    /// (troubled). Empty for a station with no step clause, which then
+    /// has nothing that could qualify a wait.
+    pub standing: Vec<StandingStep>,
+}
+
+/// ONE STEP STANDING AT A STATION, as the not-draining judgement reads
+/// it (backlog 6254e602). Only facts the record holds: the owner is the
+/// step's assignee, else the role its audience names; the onset is the
+/// recorded ready flip, never a lower bound standing in for one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandingStep {
+    /// The packet's id — a member of the station.
+    pub packet: String,
+    /// The packet's protocol and the version it is pinned to, which is
+    /// where the step's declared bound is read.
+    pub kind: String,
+    pub version: i32,
+    /// The packet's title, so a sentence names it by protocol and title.
+    pub title: String,
+    /// The step's spec slug — the protocol's name for it.
+    pub step: Option<String>,
+    pub assignee: Option<String>,
+    /// The step's audience role (`authority_role`, surfaced into its
+    /// metadata at materialisation).
+    pub role: Option<String>,
+    /// The recorded instant the step became ready. `Ok(None)` where the
+    /// record holds only an `updated_at` lower bound, or none at all;
+    /// `Err` with the error where the queue-age read that carries the
+    /// onsets failed — a failed read is not an absent record, and the
+    /// sentence that judges the step must say which it was (backlog
+    /// 35d29890).
+    pub since: Result<Option<Instant>, String>,
 }
 
 /// A separate outcome for each exact pinned protocol read. Missing data

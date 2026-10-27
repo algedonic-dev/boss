@@ -36,7 +36,14 @@
 // tests at the bottom) so it can only shrink.
 
 import { test, expect, type Page, type Request } from './_test';
-import { DEPARTMENTS_ENDPOINT, EMPLOYEE_DETAIL, SHELL_ENDPOINTS, installSmokeMocks } from './_smokeMocks';
+import {
+  DEPARTMENTS_ENDPOINT,
+  EMPLOYEE_DETAIL,
+  SHELL_ENDPOINTS,
+  YARD_REGIONS,
+  YARD_ROUTES,
+  installSmokeMocks,
+} from './_smokeMocks';
 import { FAILURE_MARKER, ROUTES } from './_routes';
 import { nextFrame } from './_helpers';
 import { scaled } from '../../src/dev-load';
@@ -153,6 +160,34 @@ const ALSO_BROKEN: ReadonlyMap<string, ReadonlyArray<RegExp>> = new Map([
 const SIGNED_IN: ReadonlySet<string> = new Set([ '/', '/ux/me', '/ux/inbox', '/ux/calendar/me']);
 const SIGNED_IN_PROBE = { username: 'ceo', employee_id: 'emp-001', role: 'ceo' };
 
+/// THE ARMS A FLIGHT MOUNTS (backlog dfca9fd3). The outage breaks
+/// /api/flights/mine like any page read, so every flight is OFF on every
+/// route above, and what a flight alone mounts was crawled by nothing.
+/// /it with `it-map-live` on mounts LiveMotion WITHOUT onFeed, which
+/// draws its own feed-down line on the map — and that line carried no
+/// marker for as long as it existed (car aadbc1a3 gave it one; this
+/// holds it). Each arm names the flights it turns on, the reads it keeps
+/// up so the flight's surface mounts at all (the moves are drawn only
+/// on a map whose regions and routes were read — a failed regions read
+/// is the page's whole answer), and the failure line the flight adds,
+/// which must be on the page AND wear the marker. A marker count cannot
+/// hold that line: the page's other failed reads draw markers of their
+/// own, so a feed line without one would still leave the route marked.
+type FlightArm = Readonly<{
+  route: string;
+  flights: ReadonlyArray<string>;
+  keptUp: ReadonlyArray<RegExp>;
+  owns: string;
+}>;
+const FLIGHT_ARMS: ReadonlyArray<FlightArm> = [
+  { route: '/it', flights: ['it-map-live'], keptUp: [YARD_REGIONS, YARD_ROUTES], owns: '[data-feed-down]' },
+];
+const FLIGHTS_MINE = /\/api\/flights\/mine(\?|$)/;
+
+/// One stop of a crawl: a route, and the flight arm it is opened under.
+type Stop = Readonly<{ route: string; arm?: FlightArm }>;
+const label = (s: Stop): string => (s.arm ? `${s.route} (flight ${s.arm.flights.join(', ')})` : s.route);
+
 /// How late a route's OWN read is issued — the manual-page fix's figure
 /// (0eda772f), three times the quiet window the crawl used to settle on.
 const LATE_READ_MS = 750;
@@ -192,11 +227,18 @@ async function issueOwnReadsLate(page: Page): Promise<void> {
 /// precedence, and falls back to the healthy fixtures for HEALTHY —
 /// except the reads ALSO_BROKEN names for the route being crawled, which
 /// `current` answers at the moment each request is made.
-async function installOutage(page: Page, current: () => string): Promise<void> {
+async function installOutage(page: Page, current: () => string, arm: () => FlightArm | undefined): Promise<void> {
   await installSmokeMocks(page);
   await issueOwnReadsLate(page);
   await page.route('**/api/**', async (route) => {
     const url = route.request().url();
+    const flight = arm();
+    if (flight !== undefined) {
+      if (FLIGHTS_MINE.test(url)) {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ flights: flight.flights }) });
+      }
+      if (flight.keptUp.some((re) => re.test(url))) return route.fallback();
+    }
     if (SIGNED_IN.has(current())) {
       if (/\/api\/session$/.test(url)) {
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(SIGNED_IN_PROBE) });
@@ -217,7 +259,15 @@ async function installOutage(page: Page, current: () => string): Promise<void> {
 /// `bare` is every marker on the route NOT drawn as the failed read's red
 /// rail (backlog 6f471ff6, car 3), as its computed left edge — so a page
 /// whose own class takes the rail back is named here, by route.
-type Seen = { route: string; markers: number; shell: boolean; bare: string[] };
+/// `owned` is a flight arm's own failure line: how many the page drew,
+/// and how many of them wear no marker (null off a flight arm).
+type Seen = {
+  route: string;
+  markers: number;
+  shell: boolean;
+  bare: string[];
+  owned: { selector: string; found: number; unmarked: number } | null;
+};
 
 /// The rail as a browser computes it: 8px of the troubled plate's red
 /// (#C8283D, --troubled).
@@ -299,13 +349,16 @@ type Await = 'marker' | 'quiet';
 /// One shared page, one navigation per route — same rationale as
 /// route-smoke: the browser keeps the on-the-fly bundle warm, and a full
 /// goto wipes the previous route's JS state, so there is no effect bleed.
-async function crawl(page: Page, routes: ReadonlyArray<string>, until: Await): Promise<Seen[]> {
+async function crawl(page: Page, stops: ReadonlyArray<Stop>, until: Await): Promise<Seen[]> {
   let current = '';
-  await installOutage(page, () => current);
+  let arm: FlightArm | undefined;
+  await installOutage(page, () => current, () => arm);
   const reads = watchReads(page);
   const seen: Seen[] = [];
-  for (const route of routes) {
+  for (const stop of stops) {
+    const route = stop.route;
     current = route;
+    arm = stop.arm;
     let shell = false;
     for (let attempt = 1; attempt <= 2 && !shell; attempt++) {
       try {
@@ -327,6 +380,15 @@ async function crawl(page: Page, routes: ReadonlyArray<string>, until: Await): P
         .waitFor({ state: 'attached', timeout: SETTLE_BUDGET_MS })
         .catch(() => undefined);
     }
+    // An arm's own line comes after its feed gives up — wait for it the
+    // same way, or the count below reads a feed still connecting.
+    if (shell && stop.arm !== undefined) {
+      await page
+        .locator(stop.arm.owns)
+        .first()
+        .waitFor({ state: 'attached', timeout: SETTLE_BUDGET_MS })
+        .catch(() => undefined);
+    }
     // Let onMount's reads be ANSWERED and the failure branch render.
     if (shell) await settle(page, reads);
     const markers = shell ? await page.locator(FAILURE_MARKER).count() : 0;
@@ -338,7 +400,19 @@ async function crawl(page: Page, routes: ReadonlyArray<string>, until: Await): P
           }),
         )
       : [];
-    seen.push({ route, markers, shell, bare: edges.filter((e) => e !== RAIL) });
+    const owned =
+      shell && stop.arm !== undefined
+        ? {
+            selector: stop.arm.owns,
+            ...(await page
+              .locator(stop.arm.owns)
+              .evaluateAll(
+                (els, marker) => ({ found: els.length, unmarked: els.filter((e) => !e.matches(marker)).length }),
+                FAILURE_MARKER,
+              )),
+          }
+        : null;
+    seen.push({ route: label(stop), markers, shell, bare: edges.filter((e) => e !== RAIL), owned });
   }
   return seen;
 }
@@ -346,7 +420,10 @@ async function crawl(page: Page, routes: ReadonlyArray<string>, until: Await): P
 test.describe('the outage crawl — a surface cannot render a falsehood', () => {
   test('every asserted surface says a read failed when every read fails', async ({ page }) => {
     test.setTimeout(600_000);
-    const asserted = ROUTES.filter((r) => !SILENT.has(r));
+    const asserted: ReadonlyArray<Stop> = [
+      ...ROUTES.filter((r) => !SILENT.has(r)).map((route) => ({ route })),
+      ...FLIGHT_ARMS.map((arm) => ({ route: arm.route, arm })),
+    ];
     const seen = await crawl(page, asserted, 'marker');
 
     const mute = seen.filter((s) => s.markers === 0);
@@ -367,11 +444,24 @@ test.describe('the outage crawl — a surface cannot render a falsehood', () => 
       `These surfaces show ${FAILURE_MARKER} without the ${RAIL} rail — ` +
         `a page rule outranks the marker's (styles.css, the failed read).`,
     ).toEqual([]);
+
+    // What a flight mounts says its failure in the same name: the arm's
+    // own line is drawn, and every copy of it wears the marker.
+    const disowned = seen.flatMap((s) =>
+      s.owned !== null && (s.owned.found === 0 || s.owned.unmarked > 0)
+        ? [`${s.route}: ${s.owned.selector} drawn ${s.owned.found}, ${s.owned.unmarked} without ${FAILURE_MARKER}`]
+        : [],
+    );
+    expect(
+      disowned.sort(),
+      `A flight arm's own failure line is missing or wears no ${FAILURE_MARKER} — ` +
+        `the page's other markers cannot stand in for it (FLIGHT_ARMS).`,
+    ).toEqual([]);
   });
 
   test('no surface on the SILENT list has quietly started reporting its failures', async ({ page }) => {
     test.setTimeout(600_000);
-    const silent = ROUTES.filter((r) => SILENT.has(r));
+    const silent = ROUTES.filter((r) => SILENT.has(r)).map((route) => ({ route }));
     const seen = await crawl(page, silent, 'quiet');
 
     const fixed = seen.filter((s) => s.markers > 0);
@@ -403,6 +493,16 @@ test.describe('the outage crawl — a surface cannot render a falsehood', () => 
       'a signed-in session on a route no crawl visits, or on a SILENT one the ' +
         'first test never asserts, signs in for nothing — drop it, fix the ' +
         'path, or take the route off SILENT',
+    ).toEqual([]);
+  });
+
+  test('every flight arm opens a crawled, asserted route', async () => {
+    const crawled = new Set(ROUTES);
+    const idle = FLIGHT_ARMS.map((a) => a.route).filter((r) => !crawled.has(r) || SILENT.has(r)).sort();
+    expect(
+      idle,
+      'a flight arm on a route no crawl visits, or on a SILENT one, holds a ' +
+        'surface nothing else opens — fix the path or take the route off SILENT',
     ).toEqual([]);
   });
 

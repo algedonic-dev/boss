@@ -130,3 +130,7 @@ required-features = ["postgres"]
 
 [lints]
 workspace = true
+
+[[test]]
+name = "postgres_client_disconnect_pg"
+required-features = ["postgres"]

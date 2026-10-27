@@ -103,9 +103,14 @@ cli_of() {
   esac
 }
 
+# -q FIRST on the installer's curl (backlog 2b1bf9b4): this menu runs as
+# root with HOME=/work/home, which group 1500 may create a .curlrc in,
+# and what that curl fetches is piped into bash as root. Only as curl's
+# first argument does -q skip the curlrc; the_doors_read_no_curlrc.rs
+# holds every curl under infra/dev to it.
 install_hint() {
   case $1 in
-    claude) echo "curl -fsSL https://claude.ai/install.sh | HOME=$HOME bash" ;;
+    claude) echo "curl -q -fsSL https://claude.ai/install.sh | HOME=$HOME bash" ;;
     codex) echo "npm i -g --prefix $HOME/.local @openai/codex" ;;
     gemini) echo "npm i -g --prefix $HOME/.local @google/gemini-cli" ;;
   esac
@@ -113,7 +118,7 @@ install_hint() {
 
 run_install() {
   case $1 in
-    claude) curl -fsSL https://claude.ai/install.sh | bash ;;
+    claude) curl -q -fsSL https://claude.ai/install.sh | bash ;;
     codex) npm i -g --prefix "$HOME/.local" @openai/codex ;;
     gemini) npm i -g --prefix "$HOME/.local" @google/gemini-cli ;;
   esac

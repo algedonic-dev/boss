@@ -1,0 +1,16 @@
+{
+  "about": "MUTATING — ONE fixed snapshotPurge action through the forge's trusted Kubernetes service-proxy door. No user snapshot, backup or head deletion, retention setting change, auto-attachment or arbitrary API/path/arguments. Requires David's per-run passkey approval of plan-an-instance-snapshot-purge; re-renders exact stable identity/roster bytes and independently rechecks immediately before acting. Only an instance Bound PVC mapped through exact PV CSI binding to an attached healthy V1 volume and running engine v1.11.3 with the complete healthy RW replica set is admitted. Refuses incomplete/unknown inventories, backup-bound candidates, unfinished claim Jobs/live Job-owned Pods and active/unknown backup/rebuild/restore/migration/purge. Ordinary non-Job application Pods may remain. Fresh reads are not a cross-resource lock. Requires a witnessed post-action in-progress then complete/error-free result for EVERY expected native replica URL; an old success, missing status, timeout or successful Job alone is not proof. A fast purge whose in-progress phase was not observed stays NOT proven. Reports purge completion only; physical free space and the estate floor must be read independently. No summed logical snapshot size is a capacity promise. Originals are retained on the ops request even on failure.",
+  "hosts": ["forge"],
+  "requires_approval": true,
+  "plan_verb": "plan-an-instance-snapshot-purge",
+  "approvers": ["emp-david"],
+  "argv": ["infra/forge/instance-snapshot-purge.sh", "{1}", "{2}", "{3}"],
+  "params": [
+    {"name": "namespace", "pattern": "^[a-z][a-z0-9-]{0,62}$"},
+    {"name": "pvc", "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"},
+    {"name": "plan_sha256", "pattern": "^[0-9a-f]{64}$"}
+  ],
+  "timeout": 1200,
+  "effect": "^instance-snapshot-purge: per-replica purge complete; capacity recovery not yet proven$",
+  "capture": "separate-streams"
+}

@@ -15,7 +15,9 @@
 #
 # Three jobs, in series: `build-image` (the runner image, from the
 # tree), `locomotive` (the host and image checks, in seconds), `web` (the
-# frontend checks the train's cluster gate may skip). The `fast` and
+# frontend suite in that image, run only on a train that changes its
+# recipe; on every other, the train's cluster gate is the frontend's
+# only judge). The `fast` and
 # `test` jobs this paragraph used to describe were moved to that gate by
 # design 128b5496; see the note at the foot of this file.
 name: CI
@@ -54,6 +56,8 @@ jobs:
       image: 10.20.0.15:3000/david/boss-ci:rust1.96
     outputs:
       route: ${{ steps.plan.outputs.route }}
+      # The runner image's NAME — see build-image's note below.
+      ci_stamp: ${{ steps.stamp.outputs.ci_stamp }}
     steps:
       - name: Read the exact PR inputs from the forge
         env:
@@ -102,6 +106,21 @@ jobs:
           PY
           cat delivery-plan.json
           printf 'route=%s\n' "$(python3 -c 'import json; print(json.load(open("delivery-plan.json"))["route"])')" >> "$GITHUB_OUTPUT"
+      - name: Name the runner image by its recipe
+        # sha256(Dockerfile + required-tools.txt) at this head: the stamp
+        # the Dockerfile bakes into /etc/boss-ci-stamp and locomotive.sh
+        # recomputes, here so build-image (which has no checkout) and the
+        # jobs that run in the image read one name. Held equal to
+        # locomotive's own line by boss-testing's
+        # the_ci_image_is_named_by_its_recipe. It is this job's ONLY
+        # output writer besides `plan`, and the web suite's reader of this
+        # file (apps/web/src/shell/web-ci-coverage.ts) admits it as this
+        # exact text and no other: a second writer here could forge the
+        # route that skips web (train 7474e3e0 went red on that reader).
+        id: stamp
+        run: |
+          set -eu
+          python3 -I -c 'import hashlib; print("ci_stamp=" + hashlib.sha256(b"".join(open("infra/forge/boss-ci/" + n, "rb").read() for n in ("Dockerfile", "required-tools.txt"))).hexdigest())' >> "$GITHUB_OUTPUT"
 
   lighter-validation:
     runs-on: docker
@@ -184,16 +203,32 @@ jobs:
   # /etc/boss-train/forge.token is NOT it — that one is repo-scoped and
   # the package registry rejects it (verified: 401 on a blob upload).
   #
-  # TAGGED BY COMMIT, NOT JUST :rust1.96. The downstream jobs pin
-  # boss-ci:${{ github.sha }} — the exact image THIS run produced —
-  # because a floating :rust1.96 is served from the runner's local
-  # cache, and that cache lagged the registry: build-image pushed a
-  # fresh image but locomotive ran the runner's stale one, whose stamp
-  # no longer matched the tree, redding the browser-bake keystone with
-  # build-image green and locomotive red (6aa603ef). A per-commit tag
-  # cannot be served stale — the runner has never seen it, so it pulls
-  # the one build-image just pushed. Layers dedupe in the registry, so
-  # this is a manifest ref, not a second copy of the image.
+  # TAGGED BY RECIPE, NOT BY COMMIT, AND BUILT ONCE PER RECIPE (backlog
+  # 399ee6c3). The downstream jobs pin boss-ci:<stamp>, the stamp
+  # delivery-plan names, and never a floating :rust1.96: that tag is
+  # served from the runner's local cache, and the cache lagged the
+  # registry — build-image pushed a fresh image but locomotive ran the
+  # runner's stale one, whose stamp no longer matched the tree (6aa603ef).
+  # From then until 2026-10-18 the pin was boss-ci:<commit sha>, which
+  # cannot be stale because no runner has seen it — and which is a
+  # new 3.48 GB image for every train: 780 of them in 09-17..10-15, each
+  # pushed to the registry and pulled into the system daemon whose disk
+  # floor rate-limits the trains, while the recipe changed seven times in
+  # two months. A STAMP TAG cannot be stale either, in the one way that
+  # matters: whatever a runner holds under boss-ci:<stamp> was built from
+  # that recipe, and locomotive.sh still checks the baked stamp against
+  # the tree, so a wrong image is a named red, never a quiet pass.
+  #
+  # So the build is SKIPPED when the registry already serves the stamp
+  # AND :rust1.96 serves the same manifest. The second half is the
+  # floating tag's own healing: a train whose recipe was built and then
+  # went red leaves :rust1.96 (the gate runner's, the dev pod's and the
+  # lighter route's image) on a recipe main does not carry, and the next
+  # train's rebuild has always put it back. Any registry read that fails
+  # builds, as every train did before — a minute, never a red. The read
+  # is anonymous (the package is public; ci-image-report.sh reads it the
+  # same way), so the package token never rides in its argv. Pinned by executing
+  # this block in boss-testing's the_ci_image_is_named_by_its_recipe.
   build-image:
     runs-on: docker
     needs: [delivery-plan]
@@ -231,6 +266,9 @@ jobs:
           # the documented knob; the alternative is terminating TLS in
           # front of Forgejo, which is a bigger change than this job.
           GIT_PULL_METHOD: http
+          # The image's name: sha256(Dockerfile + required-tools.txt) at
+          # this head, from delivery-plan (this container has no checkout).
+          CI_STAMP: ${{ needs.delivery-plan.outputs.ci_stamp }}
         run: |
           set -eu
           [ -n "${TOKEN:-}" ] || {
@@ -241,6 +279,43 @@ jobs:
             echo "  infra/forge/boss-ci/ — which is the stamp working, not a bug."
             exit 1
           }
+          # An empty or misshapen stamp names no image locomotive could
+          # pull; say so here, not as a pull error two jobs later.
+          case "${CI_STAMP:-}" in
+            *[!0-9a-f]*|'') stamp_ok=0 ;;
+            *) stamp_ok=1 ;;
+          esac
+          if [ "$stamp_ok" -ne 1 ] || [ "${#CI_STAMP}" -ne 64 ]; then
+            echo "build-image: CI_STAMP '${CI_STAMP:-}' is not a sha256 — delivery-plan's"
+            echo "  'Name the runner image by its recipe' step did not name the image."
+            exit 1
+          fi
+          # ALREADY BUILT? See the note above the job. Every failed read
+          # leaves a side empty, and an empty side builds.
+          REG=10.20.0.15:3000
+          ACCEPT='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json'
+          bearer="$(wget -q -O - "http://${REG}/v2/token?service=container_registry&scope=repository:david/boss-ci:pull" 2>/dev/null \
+            | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p')" || bearer=""
+          want=""; have=""
+          if [ -n "$bearer" ]; then
+            want="$(wget -q -O - --header "Accept: ${ACCEPT}" --header "Authorization: Bearer ${bearer}" \
+              "http://${REG}/v2/david/boss-ci/manifests/${CI_STAMP}" 2>/dev/null)" || want=""
+            have="$(wget -q -O - --header "Accept: ${ACCEPT}" --header "Authorization: Bearer ${bearer}" \
+              "http://${REG}/v2/david/boss-ci/manifests/rust1.96" 2>/dev/null)" || have=""
+          fi
+          if [ -n "$want" ] && [ "$want" = "$have" ]; then
+            echo "build-image: ${REG}/david/boss-ci:${CI_STAMP} is in the registry and :rust1.96 serves"
+            echo "  the same manifest — this recipe is built; nothing to build."
+            echo "  locomotive and web run in boss-ci:${CI_STAMP}."
+            exit 0
+          fi
+          if [ -z "$bearer" ]; then
+            echo "build-image: building — the registry handed out no pull token, so whether boss-ci:${CI_STAMP} exists is unknown."
+          elif [ -z "$want" ]; then
+            echo "build-image: building — boss-ci:${CI_STAMP} is not in the registry (a new recipe, or an unreadable manifest)."
+          else
+            echo "build-image: building — :rust1.96 serves another recipe than boss-ci:${CI_STAMP}; the rebuild moves it back."
+          fi
           printf '{"auths":{"10.20.0.15:3000":{"auth":"%s"}}}' \
             "$(printf 'david:%s' "$TOKEN" | base64 | tr -d '\n')" \
             > /kaniko/.docker/config.json
@@ -306,7 +381,7 @@ jobs:
                 --context-sub-path infra/forge/boss-ci \
                 --dockerfile Dockerfile \
                 --destination 10.20.0.15:3000/david/boss-ci:rust1.96 \
-                --destination "10.20.0.15:3000/david/boss-ci:${GITHUB_SHA}" \
+                --destination "10.20.0.15:3000/david/boss-ci:${CI_STAMP}" \
                 --insecure --skip-tls-verify \
                 --cache=true \
                 --cache-repo 10.20.0.15:3000/david/boss-ci-cache 2>&1)"
@@ -379,7 +454,7 @@ jobs:
     needs: [delivery-plan, build-image]
     if: needs.delivery-plan.outputs.route != 'data'
     container:
-      image: 10.20.0.15:3000/david/boss-ci:${{ github.sha }}
+      image: 10.20.0.15:3000/david/boss-ci:${{ needs.delivery-plan.outputs.ci_stamp }}
     steps:
       - name: Check out from the forge, not github.com
         # actions/checkout is a JavaScript action the runner pulls from
@@ -448,24 +523,34 @@ jobs:
   # chain: build-image -> locomotive -> web, on the forge's one runner
   # slot, so every step here is track time on a train (backlog 81ee98b3).
   #
-  # SO IT RUNS ONLY WHAT THE TRAIN'S GATE MAY SKIP. The conductor gates
+  # SO IT RUNS ONLY WHAT THE TRAIN'S GATE CANNOT. The conductor gates
   # every train branch with `--auto` and merges none without that verdict
   # (BOSS_TRAIN_GATE_REQUIRED=1). In `--auto`, gate.sh runs svelte-check
-  # on every tree, which is why this job has no Typecheck step any more.
-  # The rest of the gate's web phase runs only when the train touches
-  # apps/web, apps/simulator or libs/web-kit, while the specs also read
-  # files from infra/step-plugins, infra/estate, infra/postgres, examples/
-  # and docs/ (readFileSync, 2026-10-15) — so for a train that changes
-  # only those, the steps below are the only run of the web suite, and
-  # they stay.
-  # Pinned both ways by boss-testing's gate_sh.rs
-  # the_forge_web_job_runs_only_what_the_train_gate_may_skip.
+  # and every web unit suite on every tree, and the build and mocked suite
+  # whenever the train changes a file they read — derived from their own
+  # files by apps/web/scripts/web-suite-reads.ts (a244c6e7). On the same
+  # assembled tree, the steps below were those checks run a second time.
+  #
+  # What the gate cannot prove is THIS image. It runs the
+  # boss-ci:rust1.96 it pulled at launch, built from the recipe main
+  # carries; this job runs in the image build-image made from the train's
+  # own infra/forge/boss-ci/. So the `recipe` step compares that
+  # directory at the PR's base and head, and the steps after it run only
+  # when it changed — or when the step could not tell, which answers
+  # `yes`, as every train ran them before (backlog 81ee98b3, 2026-10-20).
+  # The job itself stays, always green when it skips, so the `CI / web`
+  # context the conductor and the yard read still reports.
+  # Pinned by boss-testing's gate_sh.rs
+  # the_forge_web_job_runs_only_what_the_train_gate_may_skip (the guard
+  # on each step), the_forge_web_job_runs_on_a_new_recipe.rs (the step's
+  # answer, executed), and apps/web's gate-matches-ci.test.ts (that the
+  # train gate's lane pays for what these steps no longer run).
   web:
     runs-on: docker
     needs: [delivery-plan, locomotive]
     if: needs.delivery-plan.outputs.route != 'data'
     container:
-      image: 10.20.0.15:3000/david/boss-ci:${{ github.sha }}
+      image: 10.20.0.15:3000/david/boss-ci:${{ needs.delivery-plan.outputs.ci_stamp }}
     steps:
       - name: Check out from the forge, not github.com
         # actions/checkout is a JavaScript action the runner pulls from
@@ -485,37 +570,59 @@ jobs:
           git fetch -q --depth=1 origin "${GITHUB_SHA}"
           git checkout -q --force FETCH_HEAD
 
+      - name: Does this train change the runner image's recipe?
+        # infra/forge/boss-ci/ at the PR's base against this head, as two
+        # trees: no history is needed past the one commit the base fetch
+        # brings. It answers `no` only when the base is fetched, carries
+        # the directory, and differs from this head nowhere in it; any
+        # read that fails falls through to `yes` — the steps below run —
+        # with git's own error left in this log.
+        id: recipe
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -u
+          if [ -n "${BASE_SHA:-}" ] && git fetch -q --depth=1 origin "${BASE_SHA}" \
+            && git rev-parse -q --verify "${BASE_SHA}:infra/forge/boss-ci" \
+            && git diff --quiet "${BASE_SHA}" HEAD -- infra/forge/boss-ci; then
+            echo "web: infra/forge/boss-ci is the same at the base ${BASE_SHA} and here, so changed=no"
+            printf 'changed=no\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "web: infra/forge/boss-ci changed since the base '${BASE_SHA:-}', or could not be compared, so changed=yes"
+          printf 'changed=yes\n' >> "$GITHUB_OUTPUT"
+
       - name: Install dependencies
         # PUPPETEER_SKIP_DOWNLOAD for the same reason svelte-check.sh
         # sets it: boss-web depends on puppeteer, whose postinstall
         # browser download fails in this container, and bun aborts the
         # WHOLE install on a failed postinstall — so nothing installs
         # and the failure reads as a missing tool.
+        if: steps.recipe.outputs.changed != 'no'
         working-directory: apps/web
         run: PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile
 
       - name: web-kit unit tests
-        # RUN FIRST, and from libs/web-kit, because the step below does
-        # NOT cover it: this job sets `working-directory: apps/web` and
-        # `test:unit` there runs apps/web's own src/ and scripts/.
-        # web-kit's 7 test files were executed by NO ci job at all, and
-        # `infra/gate.sh` only reaches them on an `--auto` gate, so a
-        # full gate skipped them too (feedback 80be8359). A test nothing
-        # runs is not a test.
+        # From libs/web-kit, because apps/web's `test:unit` below runs
+        # apps/web's own src/ and scripts/, not these. web-kit's 7 test
+        # files were once executed by no job at all (feedback 80be8359);
+        # the train gate runs them on every tree now (a244c6e7), and here
+        # they prove a new recipe (see the note above the job).
         #
         # No extra install: `libs/*` is a workspace member, so the root
         # `bun install` above already resolved it, and these tests need
-        # only `bun:test` — no browser, no Playwright. 56 assertions in
-        # ~130ms, which is why this runs unconditionally rather than
-        # being scoped to web-touching changes like the mocked suite.
+        # only `bun:test` — no browser, no Playwright.
+        if: steps.recipe.outputs.changed != 'no'
         working-directory: libs/web-kit
         run: bun run test:unit
 
       - name: Unit tests
+        if: steps.recipe.outputs.changed != 'no'
         working-directory: apps/web
         run: bun run test:unit
 
       - name: Build
+        if: steps.recipe.outputs.changed != 'no'
         working-directory: apps/web
         run: bun run build
 
@@ -536,6 +643,7 @@ jobs:
         # remove; the suite finds the baked browser through the
         # image's own env. Moving the pin in package.json means
         # moving it in the Dockerfile in the same car.
+        if: steps.recipe.outputs.changed != 'no'
         working-directory: apps/web
         run: bun run test:mocked
 

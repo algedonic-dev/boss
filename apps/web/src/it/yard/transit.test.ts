@@ -8,8 +8,6 @@ import { sectionsOf } from './route-layout';
 import {
   LINE_TOKEN,
   MAX_BLOCKS,
-  MAX_PERIOD_S,
-  MIN_TRAVEL_S,
   STATIONS,
   TRANSIT_VIEW,
   alarmsOf,
@@ -18,7 +16,6 @@ import {
   sectionGround,
   stationCount,
   stationLabel,
-  trainsOf,
   waitingBlocks,
 } from './transit';
 
@@ -169,44 +166,6 @@ describe('waiting blocks stand on the approach to the station they wait to enter
     expect(waitingBlocks(s, border('a', 'b', { waiting: 0 }))).toEqual({ blocks: [], more: null });
     expect(waitingBlocks(s, border('a', 'b', { waiting: null }))).toEqual({ blocks: [], more: null });
     expect(waitingBlocks(s, undefined)).toEqual({ blocks: [], more: null });
-  });
-});
-
-describe('the moving block is the real crossing rate, replayed ×60', () => {
-  const rate = (current: number | null) => ({ metric: 'c', unit: 'd', current, previous: null, samples: 0, previous_samples: 0 });
-
-  it('departs once per 1440/rate seconds of screen time', () => {
-    // 205/day: one every 421 s real, 7.02 s on screen at ×60.
-    const t = trainsOf(border('a', 'b', { rate: rate(205) }), false)!;
-    expect(t.begins).toEqual([0]);
-    expect(t.dur).toBeCloseTo(1440 / 205, 5);
-  });
-
-  it('a section faster than one block can cross runs several, staggered, so departures still keep the rate', () => {
-    // 2400/day: one every 0.6 s on screen, under the shortest crossing.
-    const t = trainsOf(border('a', 'b', { rate: rate(2400) }), false)!;
-    const period = 1440 / 2400;
-    expect(t.dur).toBeGreaterThanOrEqual(MIN_TRAVEL_S);
-    expect(t.dur / t.begins.length).toBeCloseTo(period, 5);
-    expect(t.begins.length).toBeGreaterThan(1);
-    t.begins.forEach((b, i) => expect(b + i * period).toBeCloseTo(0, 9));
-  });
-
-  it('draws no train slower than one in MAX_PERIOD_S — the headway says it instead', () => {
-    expect(trainsOf(border('a', 'b', { rate: rate(1440 / (MAX_PERIOD_S + 1)) }), false)).toBeNull();
-    expect(trainsOf(border('a', 'b', { rate: rate(1440 / MAX_PERIOD_S) }), false)).not.toBeNull();
-  });
-
-  it('moves nothing on a held, unknown, unread or empty section', () => {
-    expect(trainsOf(border('a', 'b', { flowing: false }), false)).toBeNull();
-    expect(trainsOf(border('a', 'b', { flowing: null }), false)).toBeNull();
-    expect(trainsOf(border('a', 'b', { rate: rate(null) }), false)).toBeNull();
-    expect(trainsOf(border('a', 'b', { rate: rate(0) }), false)).toBeNull();
-    expect(trainsOf(undefined, false)).toBeNull();
-  });
-
-  it('moves nothing under reduced motion', () => {
-    expect(trainsOf(border('a', 'b'), true)).toBeNull();
   });
 });
 

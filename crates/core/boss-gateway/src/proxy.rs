@@ -474,6 +474,90 @@ mod tests {
         assert!(!is_blocked_request_header("cookie"));
         assert!(!is_blocked_request_header("content-type"));
     }
+
+    /// The upstream the forward below reaches: a real listener on
+    /// loopback that answers with the estate-token header it received,
+    /// or `(none)`.
+    async fn recording_upstream() -> String {
+        let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            headers
+                .get(machine_token::HEADER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("(none)")
+                .to_string()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        url
+    }
+
+    /// One session-gated `GET /api/things/1` through the gateway as main()
+    /// assembles it — the edge stamp in front, `handle` behind, the
+    /// reverse-proxy client finished as main() finishes it — forwarded
+    /// over a real socket to `upstream`. The inbound request carries a
+    /// FORGED token, which the edge must not let through.
+    async fn forward_through_handle(upstream: &str, token: Option<&str>) -> String {
+        use tower::ServiceExt;
+        const KEY: &[u8] = b"proxy-forward-test-key-0123456789";
+        let config: &'static ProxyConfig = Box::leak(Box::new(ProxyConfig::new("things")));
+        config.upstream.set(upstream.to_string()).unwrap();
+        let state = Arc::new(AppState {
+            session_key: KEY.to_vec(),
+            proxy_client: boss_gateway::machine_client::finish(reqwest::Client::builder()).unwrap(),
+            perf: Arc::new(crate::perf::PerfCollector::new()),
+            machine_token: Arc::new(machine_token::Source::fixed(token.map(String::from))),
+            machine: boss_gateway::machine_client::MachineClient::unstamped(
+                reqwest::Client::builder(),
+            )
+            .unwrap(),
+        });
+        let app = axum::Router::new()
+            .route(
+                "/api/things/{*rest}",
+                axum::routing::any(move |s, r| handle(s, r, config)),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::role_headers::inject_role_headers,
+            ))
+            .with_state(state);
+        let mut session = Session::new("real@example.com", 3600);
+        session.employee_id = Some("emp-001".to_string());
+        let req = axum::http::Request::builder()
+            .uri("/api/things/1")
+            .header(
+                header::COOKIE,
+                format!("{}={}", session::COOKIE_NAME, session.encode(KEY)),
+            )
+            .header(machine_token::HEADER, "forged-by-the-client")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "the forward did not arrive");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Backlog 3107bfb1 (review a2172ed3 of car 01872c8e): the forward
+    /// stamp was pinned only against a test double that re-implements
+    /// [`forward_to_upstream`] (role_headers.rs `gateway_forwarding_to`),
+    /// so a forward that dropped or never set the header — `forward`'s
+    /// header filter, the restamp's place in the order — would pass every
+    /// test while each service's enforcing gate refused the gateway. This
+    /// drives `handle` itself to a real upstream.
+    #[tokio::test]
+    async fn a_real_forward_carries_the_estate_token_to_its_upstream() {
+        const TOKEN: &str = "estate-token-under-test-forward";
+        let upstream = recording_upstream().await;
+        assert_eq!(forward_through_handle(&upstream, Some(TOKEN)).await, TOKEN);
+        // Control: a gateway holding no token forwards none — so the value
+        // above is the gateway's stamp, and the client's forged header
+        // reached the upstream on neither leg.
+        assert_eq!(forward_through_handle(&upstream, None).await, "(none)");
+    }
 }
 
 #[cfg(test)]

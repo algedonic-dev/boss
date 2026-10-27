@@ -96,10 +96,15 @@ const SPENT_MARKERS: [&str; 4] = [
 /// RELEASED hold is written `hold: false`, so any rule built on "the
 /// key is missing or null" reads a released car as held forever.
 pub fn marked(md: &Value, key: &str) -> Option<String> {
-    match md.get(key) {
-        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
-        Some(Value::Bool(true)) => Some("no reason recorded".to_string()),
-        Some(Value::Number(_)) => Some("no reason recorded".to_string()),
+    md.get(key).and_then(marked_value)
+}
+
+/// The same marker judgment for a borrowed value in a pending metadata patch.
+pub fn marked_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Value::Bool(true) => Some("no reason recorded".to_string()),
+        Value::Number(_) => Some("no reason recorded".to_string()),
         _ => None,
     }
 }
@@ -115,6 +120,8 @@ pub fn spent_reason(gate_run_metadata: &Value) -> Option<&'static str> {
 /// The operator's hold reason, if the gate-run carries one. `true` with
 /// no text reads "no reason recorded" — the same words the web approach
 /// lens uses.
+/// This reads a gate-run envelope. A car review step has no such envelope:
+/// read its raw hold with [`marked`] instead.
 pub fn hold_reason(gate_run_metadata: &Value) -> Option<String> {
     marked(
         crate::gate_reservation::source_metadata(gate_run_metadata).ok()?,

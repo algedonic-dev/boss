@@ -457,10 +457,15 @@ pub(super) mod tests {
     pub(crate) struct FakeProvider {
         key: rsa::RsaPrivateKey,
         old: String,
-        new: String,
         before: String,
         after: String,
-        response: Vec<u8>,
+        /// None answers the refresh the way a real issuer does: a
+        /// replacement minted at the moment of the refresh, recorded in
+        /// `minted`. A fixed body is for the refusal cases, never the
+        /// qualifying one, because `attempt` judges a replacement's `iat`
+        /// against the refresh it answers (backlog 252491a8).
+        response: Option<Vec<u8>>,
+        minted: Mutex<Option<String>>,
         failed: bool,
         calls: Mutex<Vec<String>>,
     }
@@ -489,14 +494,24 @@ pub(super) mod tests {
             assert_eq!(refresh, "SYNTHETIC_OLD_REFRESH");
             self.calls.lock().unwrap().push("refresh".into());
             if self.failed {
-                Err(CacheError::Unavailable)
-            } else {
-                Ok(PrivateResponse {
-                    status: 200,
-                    complete: true,
-                    body: self.response.clone(),
-                })
+                return Err(CacheError::Unavailable);
             }
+            let body = match &self.response {
+                Some(body) => body.clone(),
+                None => {
+                    let id_token = signed(
+                        &self.key,
+                        &claims(boss_clock_client::wall_now().timestamp(), "replacement"),
+                    );
+                    *self.minted.lock().unwrap() = Some(id_token.clone());
+                    serde_json::to_vec(&json!({"id_token":id_token,"access_token":"SYNTHETIC_NEW_ACCESS", "refresh_token":"SYNTHETIC_NEW_REFRESH"})).unwrap()
+                }
+            };
+            Ok(PrivateResponse {
+                status: 200,
+                complete: true,
+                body,
+            })
         }
     }
     struct Ledger {
@@ -558,8 +573,6 @@ pub(super) mod tests {
         let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let now = boss_clock_client::wall_now().timestamp();
         let old = signed(&key, &claims(now - 30, "original"));
-        let new = signed(&key, &claims(now, "replacement"));
-        let response = serde_json::to_vec(&json!({"id_token":new,"access_token":"SYNTHETIC_NEW_ACCESS", "refresh_token":"SYNTHETIC_NEW_REFRESH"})).unwrap();
         (
             Expected {
                 run: uuid::Uuid::new_v4().to_string(),
@@ -570,10 +583,10 @@ pub(super) mod tests {
             FakeProvider {
                 key,
                 old: old.clone(),
-                new,
                 before: "synthetic-subject".into(),
                 after: "synthetic-subject".into(),
-                response,
+                response: None,
+                minted: Mutex::new(None),
                 failed: false,
                 calls: Mutex::new(vec![]),
             },
@@ -602,7 +615,10 @@ pub(super) mod tests {
         assert_eq!(proof.subject, expected.subject);
         let replaced: Value = serde_json::from_slice(&proof.replacement).unwrap();
         assert_eq!(replaced["tokens"]["refresh_token"], "SYNTHETIC_NEW_REFRESH");
-        assert_eq!(replaced["tokens"]["id_token"], provider.new);
+        assert_eq!(
+            replaced["tokens"]["id_token"].as_str(),
+            provider.minted.lock().unwrap().as_deref()
+        );
         assert_eq!(
             ledger.records.iter().map(|r| r.0).collect::<Vec<_>>(),
             [
@@ -615,6 +631,24 @@ pub(super) mod tests {
             ]
         );
         assert!(!ledger.quarantined);
+    }
+    /// Backlog 252491a8: gate 7f5e3cfd went red at files.rs:756 with
+    /// InvalidBinding because this fixture minted the replacement id_token
+    /// when the FIXTURE was built, and a loaded node paused the test for
+    /// longer than the 5 s grace `attempt` allows between the refresh
+    /// intent and the replacement's `iat`. A real issuer mints at refresh
+    /// time, so the fake does too. 6 s is the smallest pause that crosses
+    /// the grace whatever the second boundaries (`iat` and `began` are
+    /// whole seconds), so this is red on the old fixture every time.
+    #[tokio::test]
+    async fn a_pause_between_fixture_and_refresh_still_qualifies_a_fresh_replacement() {
+        let (expected, provider, mut ledger) = fixture();
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        assert_eq!(
+            renew(&expected, &provider, &mut ledger).await.err(),
+            None,
+            "a pause before the refresh is not a refusal"
+        );
     }
     #[tokio::test]
     async fn scope_refusal_precedes_every_private_read_or_provider_effect() {
@@ -633,25 +667,67 @@ pub(super) mod tests {
         provider.before = expected.subject.clone();
         let mut foreign = claims(boss_clock_client::wall_now().timestamp(), "foreign");
         foreign["sub"] = json!("foreign-refresh-subject");
-        provider.response = serde_json::to_vec(&json!({"id_token":signed(&provider.key,&foreign),"access_token":"SYNTHETIC_NEW_ACCESS", "refresh_token":"SYNTHETIC_NEW_REFRESH"})).unwrap();
+        let response = serde_json::to_vec(&json!({"id_token":signed(&provider.key,&foreign),"access_token":"SYNTHETIC_NEW_ACCESS", "refresh_token":"SYNTHETIC_NEW_REFRESH"})).unwrap();
+        provider.response = Some(response.clone());
         assert!(renew(&expected, &provider, &mut ledger).await.is_err());
         assert!(ledger.quarantined);
         assert!(ledger.records.iter().any(|r| r.0 == "refresh-response"
             && serde_json::from_slice::<Value>(&r.1).unwrap()["body_base64"]
-                == base64::engine::general_purpose::STANDARD.encode(&provider.response)));
+                == base64::engine::general_purpose::STANDARD.encode(&response)));
     }
     #[tokio::test]
     async fn incomplete_or_old_refresh_responses_never_qualify() {
         let (expected, mut provider, mut ledger) = fixture();
+        let new = signed(
+            &provider.key,
+            &claims(boss_clock_client::wall_now().timestamp(), "replacement"),
+        );
         for response in [
             json!({}),
             json!({"id_token":provider.old,"access_token":"SYNTHETIC_NEW_ACCESS", "refresh_token":"SYNTHETIC_NEW_REFRESH"}),
-            json!({"id_token":provider.new,"access_token":"SYNTHETIC_NEW_ACCESS", "refresh_token":"SYNTHETIC_OLD_REFRESH"}),
+            json!({"id_token":new,"access_token":"SYNTHETIC_NEW_ACCESS", "refresh_token":"SYNTHETIC_OLD_REFRESH"}),
         ] {
-            provider.response = serde_json::to_vec(&response).unwrap();
+            provider.response = Some(serde_json::to_vec(&response).unwrap());
             assert!(renew(&expected, &provider, &mut ledger).await.is_err());
             assert!(ledger.quarantined);
         }
+    }
+    /// Backlog f12a6717: the case above sends the ORIGINAL id_token as its
+    /// stale one, so the equality check refuses it first and the 5 s
+    /// freshness guard was never the reason anything failed; disabling that
+    /// guard left all 61 managed_cache tests green (review of car 50893346).
+    /// This replacement is distinct in all three tokens and correctly signed
+    /// by the trusted key, so `identity` accepts it (asserted, so the test
+    /// names its own cause) and only its `iat`, 60 s before the refresh
+    /// intent, can refuse it, after the response is retained and before
+    /// the new access token is ever presented.
+    #[tokio::test]
+    async fn a_distinct_signed_replacement_issued_before_the_refresh_never_qualifies() {
+        let (expected, mut provider, mut ledger) = fixture();
+        let now = boss_clock_client::wall_now().timestamp();
+        let stale = signed(&provider.key, &claims(now - 60, "replacement"));
+        assert_ne!(stale, provider.old);
+        assert_eq!(
+            identity(&stale, &provider.keys().await.unwrap(), &expected, now),
+            Ok(now - 60),
+            "the stale replacement must pass every identity check, or this test pins the wrong refusal"
+        );
+        provider.response = Some(serde_json::to_vec(&json!({"id_token":stale,"access_token":"SYNTHETIC_NEW_ACCESS", "refresh_token":"SYNTHETIC_NEW_REFRESH"})).unwrap());
+        assert_eq!(
+            renew(&expected, &provider, &mut ledger).await.err(),
+            Some(CacheError::InvalidBinding)
+        );
+        assert!(ledger.quarantined);
+        assert_eq!(
+            ledger.records.iter().map(|r| r.0).collect::<Vec<_>>(),
+            [
+                "original",
+                "access-before",
+                "refresh-intent",
+                "refresh-response"
+            ],
+            "refused on the replacement's age: retained, never presented"
+        );
     }
     #[tokio::test]
     async fn committed_write_error_or_uncertain_refresh_keeps_the_stream_unavailable() {
@@ -703,7 +779,7 @@ pub(super) mod tests {
             b"private non-JSON failure".to_vec(),
             vec![b'x'; RESPONSE_LIMIT + 1],
         ] {
-            provider.response = body;
+            provider.response = Some(body);
             assert!(renew(&expected, &provider, &mut ledger).await.is_err());
         }
         assert!(ledger.quarantined);

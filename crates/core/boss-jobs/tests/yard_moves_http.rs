@@ -53,8 +53,9 @@ fn user(role: &str) -> String {
     .expect("a User always serialises")
 }
 
-/// A move made a minute ago, so it is inside every window.
+/// A move made a minute before `now`, so it is inside every window.
 fn moved(
+    now: chrono::DateTime<chrono::Utc>,
     n: u128,
     packet: &str,
     from: Option<&str>,
@@ -63,7 +64,7 @@ fn moved(
 ) -> Move {
     Move {
         dispatch: None,
-        at: boss_clock_client::wall_now() - chrono::Duration::minutes(1),
+        at: now - chrono::Duration::minutes(1),
         packet: packet.into(),
         kind: "ship-a-change".into(),
         label: format!("fix/{packet}"),
@@ -87,6 +88,31 @@ async fn app(wired: bool) -> axum::Router {
 /// `registries`: the tree's protocols and stations wired, so the routes
 /// can be derived.
 async fn app_with(wired: bool, registries: bool) -> axum::Router {
+    app_on(
+        wired,
+        registries,
+        Arc::new(boss_clock_client::WallClockClient),
+        false,
+    )
+    .await
+}
+
+/// The same app on a given clock, with the record's moves made a minute
+/// before what that clock says now. `superseded_mover`: the record also
+/// holds seq 6, a `shed -> arrivals` misreading written by a mover this
+/// build superseded (backlog 3976779c).
+async fn app_on(
+    wired: bool,
+    registries: bool,
+    clock: Arc<dyn boss_clock_client::ClockClient>,
+    superseded_mover: bool,
+) -> axum::Router {
+    let now = boss_clock_client::now_from(&clock).await;
+    let moved = |n: u128,
+                 packet: &'static str,
+                 from: Option<&'static str>,
+                 to: Option<&'static str>,
+                 declared: Option<bool>| moved(now, n, packet, from, to, declared);
     let jobs = Arc::new(InMemoryJobs::new());
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
@@ -119,6 +145,14 @@ async fn app_with(wired: bool, registries: bool) -> axum::Router {
             ])
             .await
             .unwrap();
+        if superseded_mover {
+            store
+                .record_by(
+                    Some("yard-mover-v1:superseded"),
+                    &[moved(6, "car-5", Some("shed"), Some("arrivals"), None)],
+                )
+                .unwrap();
+        }
         Some(Arc::new(MovesFeed::new(store)))
     } else {
         None
@@ -151,7 +185,7 @@ async fn app_with(wired: bool, registries: bool) -> axum::Router {
             bus,
             DomainPublisher::new(bus_dyn, "jobs"),
             policy,
-            Arc::new(boss_clock_client::WallClockClient),
+            clock,
         )
     })
 }
@@ -212,6 +246,55 @@ async fn the_page_is_the_record_after_a_seq_with_the_undrawn_routes_it_took() {
     assert_eq!(
         body["mover"]["state"], "starting",
         "the mover says what it is doing"
+    );
+}
+
+/// ONE DEFINITION OF AN ACTIVE MOVE (backlog 3976779c, from review
+/// 4c89fc8e N1). After the mover-version stamp (c8d22e63) the band
+/// counted only the current mover's rows while this read's
+/// `dispositions` and `history.active` still called a superseded
+/// mover's row active, so after every deploy that touched the mover the
+/// two answers disagreed. A superseded mover's row is its own
+/// disposition and its own count, the raw total is conserved, and what
+/// the band counts is exactly `active` plus `unknown`.
+#[tokio::test]
+async fn a_superseded_movers_row_is_its_own_disposition_and_the_band_counts_only_active() {
+    let app = app_on(
+        true,
+        true,
+        Arc::new(boss_clock_client::WallClockClient),
+        true,
+    )
+    .await;
+    let (status, body) = get(app, "/api/yard/moves", "operator").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let disposition = |seq: i64| {
+        body["dispositions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["original_seq"] == seq)
+            .unwrap()["disposition"]
+            .clone()
+    };
+    assert_eq!(disposition(5)["status"], "active", "{body}");
+    assert_eq!(disposition(6)["status"], "superseded-mover", "{body}");
+    assert_eq!(
+        disposition(6)["mover_version"],
+        "yard-mover-v1:superseded",
+        "it names the mover that wrote it"
+    );
+    let history = &body["history"];
+    assert_eq!(history["raw"], 6, "the raw total is conserved: {history}");
+    assert_eq!(history["active"], 5, "{history}");
+    assert_eq!(history["superseded_mover"], 1, "{history}");
+    // The band's crossings are the active rows: seq 4 and 5 are the two
+    // undeclared shed -> arrivals among them, and seq 6 is not counted.
+    assert_eq!(body["undeclared"]["moves"], 2, "{body}");
+    // N3: the version links the build it came from.
+    assert!(
+        body["undeclared"].get("mover_build").is_some(),
+        "the version names its build (null only when unstamped): {body}"
     );
 }
 
@@ -499,5 +582,72 @@ async fn the_routes_read_serves_every_route_with_its_sources() {
     assert!(
         body.as_str().unwrap().contains("workflow registry"),
         "{body}"
+    );
+}
+
+/// THE WINDOW IS THE INJECTED CLOCK'S, NOT THE MACHINE'S (backlog
+/// 5fb858ea). On 2026-10-15 `/api/yard/moves` computed its window as
+/// the real clock minus `window_hours` while its tests froze the
+/// injected clock; once the real clock ran a full window past the
+/// fixture's instant, every gate that ran boss-jobs went red until
+/// #1190 moved that read to `now_from(&state.clock)`. The routes read
+/// and the regions read take the SAME `crossings(since)` from the same
+/// record, and both still anchored it to the real clock. Pinned here
+/// on a clock frozen weeks in the past with the record's moves a minute
+/// before it: anchored to the machine, the window starts after every
+/// move and both readings come back empty.
+#[tokio::test]
+async fn the_routes_and_regions_windows_are_read_on_the_injected_clock() {
+    let frozen = chrono::DateTime::parse_from_rfc3339("2026-09-26T03:18:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let clock: Arc<dyn boss_clock_client::ClockClient> = Arc::new(
+        boss_clock_client::FixedClockClient::new(boss_clock_client::ClockNow {
+            now: frozen,
+            simulated: false,
+            epoch_start: None,
+            epoch_end: None,
+            paused: false,
+            restart_in_progress: false,
+            warp_factor: None,
+        }),
+    );
+
+    let (status, routes) = get(
+        app_on(true, true, clock.clone(), false).await,
+        "/api/yard/routes",
+        "operator",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{routes}");
+    let undrawn = routes["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["from"] == "shed" && r["to"] == "arrivals")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        undrawn["sources"][0]["moves"], 2,
+        "the routes read counted the frozen window's moves: {undrawn}"
+    );
+
+    let (status, regions) = get(
+        app_on(true, true, clock, false).await,
+        "/api/yard/regions",
+        "operator",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{regions}");
+    let arrivals = regions["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "arrivals")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        arrivals["undeclared"][0]["moves"], 2,
+        "the regions read counted the frozen window's moves: {arrivals}"
     );
 }

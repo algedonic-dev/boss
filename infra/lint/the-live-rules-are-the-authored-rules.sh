@@ -192,7 +192,7 @@ command -v python3 >/dev/null 2>&1 || skip "python3 is not on this box"
 
 body=$(mktemp) || exit 1
 trap 'rm -f "$body"' EXIT
-code=$(lint_sor_read the-live-rules-are-the-authored-rules "the dispatcher" "$URL" "$body")
+code=$(lint_sor_read the-live-rules-are-the-authored-rules "the dispatcher" "$URL" "$body" BOSS_DISPATCHER_URL)
 # 000 is curl's "never got an answer" — no route, refused, timed out.
 [ "$code" = "200" ] || skip "$URL answered HTTP $code"
 

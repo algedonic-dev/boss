@@ -170,11 +170,16 @@ struct EmployeeRow {
     status: Option<String>,
 }
 
+/// The production roster read's whole-request bound. Named so a test can
+/// state a fixture delay RELATIVE to it rather than retype the number
+/// (f10419f9).
+pub const ROSTER_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl ReqwestRosterLookup {
     pub fn new(people_base: impl Into<String>) -> Self {
         Self {
             client: boss_core::machine_token::Client::build(
-                reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)),
+                reqwest::Client::builder().timeout(ROSTER_TIMEOUT),
             )
             .expect("reqwest client"),
             people_base: people_base.into(),
@@ -414,22 +419,38 @@ mod tests {
             "/api/people",
             axum::routing::get(move |headers: axum::http::HeaderMap| {
                 assert!(headers.get(boss_core::machine_token::HEADER).is_none());
-                seen.fetch_add(1, Ordering::SeqCst);
+                let first = seen.fetch_add(1, Ordering::SeqCst) == 0;
                 let rows = served.lock().unwrap().clone();
-                async move { axum::Json(serde_json::Value::Array(rows)) }
+                async move {
+                    // The control for f10419f9: the first answer arrives
+                    // AFTER the production bound. Gate 516946b3 went red
+                    // here with "TimedOut after 14.8 s" against this
+                    // in-process stub, because the read carried a
+                    // wall-clock deadline that a loaded gate pod's
+                    // scheduler, not the code, decided. The subject is the
+                    // cache; the read waits on the fixture's answer.
+                    if first {
+                        tokio::time::sleep(ROSTER_TIMEOUT + Duration::from_secs(1)).await;
+                    }
+                    axum::Json(serde_json::Value::Array(rows))
+                }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        // This cache fixture exercises real HTTP with the production five-second
-        // timeout, but must never read or transmit the estate's mounted token.
+        // This cache fixture exercises real HTTP, but must never read or
+        // transmit the estate's mounted token. It carries NO request
+        // timeout: the stub shares this test's one runtime thread, so a
+        // wall-clock bound here measured the gate pod's scheduler rather
+        // than the cache, and nothing in this test asserts the production
+        // `ROSTER_TIMEOUT` (f10419f9). It cannot hang instead: a handler
+        // that panics drops its connection and a server that ends refuses
+        // the next one, both of which the read reports as an error.
         let roster = ReqwestRosterLookup {
-            client: boss_core::machine_token::Client::unstamped(
-                reqwest::Client::builder().timeout(Duration::from_secs(5)),
-            )
-            .unwrap(),
+            client: boss_core::machine_token::Client::unstamped(reqwest::Client::builder())
+                .unwrap(),
             people_base: base,
             cache: Mutex::new(HashMap::new()),
             ttl: Duration::from_secs(60),

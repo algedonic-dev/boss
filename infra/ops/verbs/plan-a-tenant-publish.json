@@ -1,0 +1,10 @@
+{
+  "about": "READ-ONLY: renders what `publish-tenant` WOULD publish from an instance's tenant main into its live registries, and writes nothing (infra/forge/publish-tenant.sh --plan; backlog 1610115d — David ran `boss tenant publish --take` by hand on 2026-09-25 and 2026-09-26). The tenant repo and ref are the instance's own tenant_repo / tenant_ref from infra/cluster/instances.toml, never a parameter, read from the forge's own repository on disk (the converge's tenant_checkout); the instance must live in the namespace the system of record's door reaches (infra/estate/estate.toml sor_cluster_url). The plan names tenant main's sha and tree, the CLI build's sha256, the take and the file each taken registry overwrites, the `boss tenant check` verdict, the publish's own --dry-run, and THE LIVE REGISTRIES AS THEY STAND: `boss tenant export` through the machine door into a copy of the tree, compared ROW BY ROW (infra/forge/tenant-rows.py — comments, key and row order and layout are not differences): per file, the declared rows the same live, differing, or not live, a count of the live rows the tree does not declare, and the file's live digest; for a taken registry each row it overwrites field by field, a - line the tree and a + line the instance now. A file the export has no read of is named NOT READ, and a take of one is refused. A tree that does not PASS or a take the CLI refuses is exit 78, not a plan; a live read that fails is exit 1, never a plan without it. Only each CLI's stdout is in the bytes, never its timestamped stderr log; no clock, no run id and no path; its sha256 rides stderr as `plan-sha256:`, and that hash is what a passkey signs (design 17835005 q1).",
+  "hosts": ["forge"],
+  "argv": ["infra/forge/publish-tenant.sh", "--plan", "{1}", "{2}"],
+  "params": [
+    { "name": "instance", "pattern": "^[a-z][a-z0-9-]{0,30}$" },
+    { "name": "take", "pattern": "^[a-z]+(,[a-z]+){0,15}$" }
+  ],
+  "timeout": 300
+}

@@ -24,7 +24,7 @@ pub(crate) fn conserve_before(
     receipt: &SelectionReceipt,
     mut claim: Event,
     stamp: &EventStamp,
-    deadline: Option<std::time::Instant>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Vec<Event>, JobsError> {
     if receipt["version"] != 2
         || claim.kind != crate::events::STATION_CLAIMED

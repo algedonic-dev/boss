@@ -546,17 +546,14 @@ fn the_plan_names_the_replica_its_target_disk_and_the_webhook_headroom() {
          disabled; no eviction requested"
             .to_string(),
         format!("twice the volume (64424509440 bytes): {W1_DISK}"),
-        // The disk the webhook named, by its own arithmetic: 755 MB.
         format!(
             "disk {W2_DISK} (default-disk-fd0100000000 on w-2): 1 replica(s) of this volume; \
-             ProvisionedLimit (117656518656 - 35296955596) x 100% = 82359563060; \
-             storageScheduled 81604378624; room 755184436 bytes"
+             SHORT: does not admit growth to twice the volume (64424509440 bytes)"
         ),
-        "SHORT: admits growth of 755184436 bytes".to_string(),
         format!("disk {W1_DISK} (nvme1 on w-1): TARGET"),
-        "headroom 1030792151040 bytes >= 2 x 32212254720 = 64424509440".to_string(),
+        "admits ledger headroom for twice the volume (64424509440 bytes)".to_string(),
         format!(
-            "disk {CP3_DISK} (default-disk-cp3 on cp-3): not a target — node cp-3 holds a replica of this volume"
+            "disk {CP3_DISK} (default-disk-cp3 on cp-3): not a target"
         ),
         "after: every replica's disk admits growth to twice the volume".to_string(),
         "live: each target passes Longhorn v1.11.3's placement test, \
@@ -577,6 +574,15 @@ fn the_plan_names_the_replica_its_target_disk_and_the_webhook_headroom() {
         l.calls()
     );
     assert!(effect_lines(&plan).is_empty(), "{plan}");
+    let rendered = l.run(&["--plan", VOL, REP], &[]);
+    let diagnostic = String::from_utf8_lossy(&rendered.stderr);
+    assert!(diagnostic.contains(&format!(
+        "disk {CP3_DISK} (default-disk-cp3 on cp-3): not a target — node cp-3 holds a replica of this volume"
+    )));
+    assert!(!plan.contains("holds a replica of this volume"));
+    assert!(diagnostic.contains("storageScheduled 81604378624; room 755184436 bytes"));
+    assert!(!plan.contains("storageScheduled"));
+    assert!(!plan.contains("admits up to"));
 
     // Deterministic, and blind to live free space: a busy disk's
     // storageAvailable moves every second, and a plan that signed it
@@ -602,6 +608,140 @@ fn the_plan_names_the_replica_its_target_disk_and_the_webhook_headroom() {
     v["status"]["actualSize"] = json!(25 * GIB);
     l.volume(v);
     assert_eq!(l.plan().1, hash, "nor is the volume's actualSize");
+}
+
+#[test]
+fn unrelated_scheduling_preserves_the_signed_decision() {
+    let l = Longhorn::new("mvr-stable-ledger");
+    let original = l.plan();
+    let mut nodes = l.read_state("lhnodes.json");
+    let disk = &mut nodes[3]["status"]["diskStatus"]["nvme1"];
+    let scheduled = disk["storageScheduled"].as_u64().unwrap();
+    disk["storageScheduled"] = json!(scheduled + 5 * GIB);
+    l.nodes(nodes);
+    assert_eq!(
+        l.plan(),
+        original,
+        "an unrelated allocation changes no target or headroom decision"
+    );
+    assert!(l.writes().is_empty());
+}
+
+#[test]
+fn a_non_target_schedulable_reason_is_live_not_signed() {
+    for (index, disk_name) in [(0, "default-disk-cp1"), (4, "default-disk-fd0100000000")] {
+        let l = Longhorn::new(&format!("mvr-non-target-reason-{index}"));
+        let original = l.plan();
+        let mut nodes = l.read_state("lhnodes.json");
+        nodes[index]["status"]["diskStatus"][disk_name]["conditions"][1]["status"] = json!("False");
+        l.nodes(nodes);
+        let changed = l.run(&["--plan", VOL, REP], &[]);
+        assert!(changed.status.success(), "{}", text(&changed));
+        assert_eq!(
+            l.plan(),
+            original,
+            "an occupied node remains a non-target when its Schedulable reason changes"
+        );
+        assert!(
+            String::from_utf8_lossy(&changed.stderr).contains("Schedulable is False"),
+            "the live reason remains visible: {}",
+            text(&changed)
+        );
+        assert!(l.writes().is_empty());
+    }
+}
+
+#[test]
+fn a_target_schedulable_change_invalidates_the_signed_plan_without_writes() {
+    let l = Longhorn::new("mvr-target-schedulable-reason");
+    let mut nodes = l.read_state("lhnodes.json");
+    nodes.as_array_mut().unwrap().push(lh_node(
+        "w-3",
+        &[disk(
+            "spare",
+            "11111111-2222-3333-4444-555555555555",
+            1800 * GIB,
+            540 * GIB,
+            300 * GIB,
+        )],
+    ));
+    l.nodes(nodes.clone());
+    let (_, original_hash) = l.plan();
+    nodes[3]["status"]["diskStatus"]["nvme1"]["conditions"][1]["status"] = json!("False");
+    l.nodes(nodes);
+    assert_ne!(l.plan().1, original_hash, "the actual target set changed");
+    let changed = l.run(&[VOL, REP, &original_hash], &[]);
+    assert_eq!(changed.status.code(), Some(78), "{}", text(&changed));
+    assert!(text(&changed).contains("not the approved plan"));
+    assert!(l.writes().is_empty());
+}
+
+#[test]
+fn no_schedulable_target_refuses_before_any_write() {
+    let l = Longhorn::new("mvr-no-schedulable-target");
+    let (_, original_hash) = l.plan();
+    let mut nodes = l.read_state("lhnodes.json");
+    nodes[3]["status"]["diskStatus"]["nvme1"]["conditions"][1]["status"] = json!("False");
+    l.nodes(nodes);
+    let reason = l.refused(&[VOL, REP, &original_hash], &[]);
+    assert!(
+        reason.contains("no disk on a node without a replica"),
+        "{reason}"
+    );
+    assert!(reason.contains("Schedulable is False"), "{reason}");
+}
+
+#[test]
+fn raw_remaining_and_source_ledgers_and_engine_location_are_unsigned() {
+    for index in [0, 2, 3, 4] {
+        let l = Longhorn::new(&format!("mvr-stable-disk-{index}"));
+        let original = l.plan();
+        let mut nodes = l.read_state("lhnodes.json");
+        let disks = nodes[index]["status"]["diskStatus"]
+            .as_object_mut()
+            .unwrap();
+        let disk = disks.values_mut().next().unwrap();
+        let scheduled = disk["storageScheduled"].as_u64().unwrap();
+        disk["storageScheduled"] = json!(scheduled + 1024 * 1024);
+        l.nodes(nodes);
+        let mut v = l.volume_now();
+        v["status"]["currentNodeID"] = json!("cp-3");
+        l.volume(v);
+        assert_eq!(l.plan(), original, "unchanged disk {index} judgment");
+        let o = l.run(&["--plan", VOL, REP], &[]);
+        let diagnostic = String::from_utf8_lossy(&o.stderr);
+        assert!(diagnostic.contains(&(scheduled + 1024 * 1024).to_string()));
+        assert!(diagnostic.contains("attached engine on cp-3"));
+        assert!(l.writes().is_empty());
+    }
+}
+
+#[test]
+fn changed_ledger_decisions_still_refuse_the_approved_plan_without_writes() {
+    let l = Longhorn::new("mvr-remaining-decision");
+    let (_, hash) = l.plan();
+    let mut nodes = l.read_state("lhnodes.json");
+    nodes[0]["status"]["diskStatus"]["default-disk-cp1"]["storageScheduled"] =
+        json!((500 - 150 - 20) * GIB);
+    l.nodes(nodes);
+    assert_ne!(
+        l.plan().1,
+        hash,
+        "remaining disk changed from admitting to SHORT"
+    );
+    let o = l.run(&[VOL, REP, &hash], &[]);
+    assert_eq!(o.status.code(), Some(78), "{}", text(&o));
+    assert!(l.writes().is_empty());
+
+    let l = Longhorn::new("mvr-target-decision");
+    let (_, hash) = l.plan();
+    let mut nodes = l.read_state("lhnodes.json");
+    nodes[3]["status"]["diskStatus"]["nvme1"]["storageScheduled"] = json!((1800 - 540 - 59) * GIB);
+    l.nodes(nodes);
+    let o = l.run(&[VOL, REP, &hash], &[]);
+    assert_eq!(o.status.code(), Some(78), "{}", text(&o));
+    assert!(text(&o).contains("without ledger headroom for twice"));
+    assert!(l.writes().is_empty());
 }
 
 #[test]
@@ -748,9 +888,15 @@ fn a_target_disk_that_would_fail_the_webhook_is_refused() {
     l.nodes(nodes(&[w1_disk(), second]));
     let (p, _) = l.plan();
     assert!(
-        p.contains("0f0f0f0f-1111-4222-8333-444444444444 (nvme2 on w-1): not a target — disk: allowScheduling is false"),
+        p.contains("0f0f0f0f-1111-4222-8333-444444444444 (nvme2 on w-1): not a target"),
         "{p}"
     );
+    let rendered = l.run(&plan, &[]);
+    assert!(rendered.status.success(), "{}", text(&rendered));
+    assert!(String::from_utf8_lossy(&rendered.stderr).contains(
+        "0f0f0f0f-1111-4222-8333-444444444444 (nvme2 on w-1): not a target — disk: allowScheduling is false"
+    ));
+    assert!(!p.contains("allowScheduling is false"));
 
     // No room for the replica at all, and no other node: nothing to move to.
     let mut full = w1_disk();
@@ -1094,8 +1240,7 @@ fn the_write_raises_waits_lowers_then_deletes_and_reads_the_effect_back() {
 fn the_write_refuses_a_hash_that_is_not_todays_plan_and_a_second_run() {
     let l = Longhorn::new("mvr-drift");
     let (_, hash) = l.plan();
-    // The ledger moved after the plan was signed: another volume
-    // scheduled on w-1.
+    // Another volume schedules on w-1 without changing any judgment.
     let mut w1 = w1_disk();
     w1.scheduled += 5 * GIB;
     l.nodes(json!([
@@ -1105,18 +1250,20 @@ fn the_write_refuses_a_hash_that_is_not_todays_plan_and_a_second_run() {
         lh_node("w-1", &[w1]),
         lh_node("w-2", &[w2_disk()]),
     ]));
-    // Refused with today's plan printed beside it, so the operator sees
-    // what moved — and nothing written.
-    for bad in [hash.clone(), "0".repeat(64)] {
-        let o = l.run(&[VOL, REP, &bad], &[]);
-        let out = text(&o);
-        assert_eq!(o.status.code(), Some(78), "{out}");
-        assert!(out.contains(&bad), "names the approved hash: {out}");
-        assert!(l.writes().is_empty(), "{:?}", l.writes());
-    }
+    assert_eq!(
+        l.plan().1,
+        hash,
+        "safe ledger drift keeps the approval bound"
+    );
+    // A foreign hash still refuses with nothing written.
+    let bad = "0".repeat(64);
+    let o = l.run(&[VOL, REP, &bad], &[]);
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(78), "{out}");
+    assert!(out.contains(&bad), "names the approved hash: {out}");
+    assert!(l.writes().is_empty(), "{:?}", l.writes());
 
     // Applied once, the approval is spent: the replica is gone.
-    let (_, hash) = l.plan();
     let o = l.run(&[VOL, REP, &hash], &[]);
     assert!(o.status.success(), "{}", text(&o));
     let o = l.run(&[VOL, REP, &hash], &[]);

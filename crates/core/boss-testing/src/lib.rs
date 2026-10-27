@@ -23,6 +23,8 @@
 //!   regex. It lives here because this crate already holds the tests
 //!   that read the repository AS AN ARTEFACT (`gate_sh.rs`,
 //!   `codebase_metrics_sh.rs`) rather than any service's behaviour.
+//! - `reexec`, the one way a test re-runs its own binary as a child and
+//!   bounds only the child's work, never its start (backlog 7e30ddb0)
 //! - `adapters_agree!`, one body of assertions run against every adapter
 //!   of a port, one test per (case, adapter) — see `adapter_suite`
 //!   (design 3036296f, mechanism C)
@@ -41,6 +43,7 @@ pub mod production_source;
 pub mod proxy;
 pub mod rbac;
 pub mod recording_bus;
+pub mod reexec;
 pub mod request;
 pub mod scratch;
 #[cfg(feature = "postgres")]
@@ -59,6 +62,6 @@ pub use scratch::{copy_exec, create_dir, scratch_dir, scratch_path, write_exec, 
 #[cfg(feature = "postgres")]
 pub use test_db::TestDb;
 pub use tree::{
-    LINT_LIB_DIRS, copy_gate_sh, copy_lint_libs, dispatcher_rules_dir, repo_root, tree_match,
-    tunnel_ingress_summary,
+    LINT_LIB_DIRS, TREE_WIDE_FILE_PATTERN, TREE_WIDE_TEST_PATTERN, copy_gate_sh, copy_lint_libs,
+    dispatcher_rules_dir, repo_root, tree_match, tree_wide_pattern, tunnel_ingress_summary,
 };

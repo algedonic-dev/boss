@@ -830,6 +830,44 @@ fn a_credential_that_can_roll_only_images_is_deposited_and_the_receipt_is_read_b
     j.assert_nothing_leaked(&out);
 }
 
+/// EVERY RUN THAT HOLDS A KEY NAMES IT, WHOLE, ON ITS OWN PACKET (backlog
+/// 403d9d7e). The break-glass deposit key has no prepare packet — this Job
+/// mints it — so the boss-gcp converge reads the line this run prints
+/// (infra/gcp/prepared-deposit-keys.sh) to judge the key by its
+/// fingerprint, bound to the kubeconfig receiver, as it judges every
+/// prepared key. Printed before anything is verified, so a refused run
+/// records it too; the public half only — the private half is held by
+/// assert_nothing_leaked.
+#[test]
+fn every_run_holding_a_key_records_the_line_boss_gcp_holds_it_by() {
+    let want = format!(
+        "{} {}",
+        job_forced_line(),
+        MOUNTED_PUBLIC.trim_end_matches('\n')
+    );
+    let ok = Job::new("names-key-ok");
+    let (rc, out) = ok.run();
+    assert_eq!(rc, 0, "{out}");
+    let refused = Job::new("names-key-refused");
+    refused.set("cani-get-secrets", "yes");
+    let (rc_refused, out_refused) = refused.run();
+    assert_eq!(rc_refused, 1, "{out_refused}");
+    for (name, out, job) in [("ok", &out, &ok), ("refused", &out_refused, &refused)] {
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains(&want)).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "{name}: one line carries the deposit key's whole authorized_keys line:\n{out}"
+        );
+        assert!(
+            lines[0].starts_with("break-glass-deposit: ") && lines[0].ends_with(&want),
+            "{name}: a plain record line, ending with the line itself — never a RED line, which would file an item every day: {}",
+            lines[0]
+        );
+        job.assert_nothing_leaked(out);
+    }
+}
+
 #[test]
 fn a_policy_bound_to_deny_that_still_accepts_every_patch_is_never_deposited() {
     // The binding says Deny and the patches land anyway: the policy does

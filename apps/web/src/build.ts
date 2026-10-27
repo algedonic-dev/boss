@@ -48,6 +48,7 @@ await rm(OUT, { recursive: true, force: true });
 // playground that was a 2026-07-01 binary missing `campaigns` and
 // `customers` — two services behind, and no amount of rebuilding
 // converged.
+// web-suite-reads: none — target/ is a build product, and src/_generated/ports.ts is in this tree (no-snapshot-arrays holds it to crates/core/boss-ports)
 function findBossPortsList(): string {
   const repoRoot = pathJoin(import.meta.dir, '..', '..', '..');
   const inTarget = pathJoin(repoRoot, 'target', 'release', 'boss-ports-list');

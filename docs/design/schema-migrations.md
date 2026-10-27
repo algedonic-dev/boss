@@ -15,6 +15,13 @@ that order, each in one transaction **with** its bookkeeping row —
 a failure keeps nothing, a re-run re-applies nothing, and an
 up-to-date database is a no-op.
 
+- A file whose FIRST LINE is `-- migrate: no-transaction` is the one
+  exception: it runs alone, outside a transaction, and is recorded only
+  after it succeeded — for `CREATE INDEX CONCURRENTLY` on a table that
+  takes every write, which Postgres refuses inside a transaction block
+  (design c195e83e Q4). Such a file must be safe to re-run from any
+  point it can stop at, and holds plain statements only: TestDb sends
+  them one at a time and refuses a dollar-quoted body it cannot split.
 - `--baseline` records every current entry without running it. It
   exists for databases that predate the runner (their tables already
   exist) and is needed exactly once per such deployment. A database

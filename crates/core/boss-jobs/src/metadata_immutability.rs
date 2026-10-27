@@ -109,6 +109,29 @@ pub fn validate_protocol(
     after: &Value,
     command: Option<&crate::conditional_metadata::Command>,
 ) -> Result<(), String> {
+    // `required_values` (backlog 97170186): exact top-level values the
+    // pinned protocol's packets carry from admission on — the markers
+    // an executor's queue selects on. Workflow-level `metadata` only
+    // describes; this is the declaration admission enforces. A
+    // recovery assessment admitted without its markers sat invisible
+    // to the conductor until a hand PATCH (28e96fbc, 2026-10-16). Every
+    // write is checked, not only the first, so no later write can
+    // make a routed packet unroutable either.
+    if let Some(required) = schema.get("required_values") {
+        let required = required
+            .as_object()
+            .ok_or("required_values must be an object of field values")?;
+        for (key, value) in required {
+            if key.is_empty() || key == KEY || key == GUARDED_KEY {
+                return Err("required_values contains an invalid field name".into());
+            }
+            if after.get(key) != Some(value) {
+                return Err(format!(
+                    "{key} must be {value} under the packet's pinned protocol"
+                ));
+            }
+        }
+    }
     let declarations = match schema.get("guarded_fields") {
         None => vec![],
         Some(fields) => {
@@ -583,5 +606,45 @@ mod tests {
         assert!(validate_protocol(&schema, &before, &after, Some(&stale)).is_err());
         assert!(validate_protocol(&schema, &before, &before, None).is_ok());
         assert!(validate_protocol(&json!({}), &before, &after, None).is_ok());
+    }
+
+    /// Backlog 97170186: a recovery assessment was admitted without the
+    /// markers its executor's queue selects on, and sat invisible until
+    /// a hand PATCH. A pinned protocol's `required_values` are refused
+    /// absent or different at admission (before = {}) and on every
+    /// later write, so a packet cannot be born or made unroutable.
+    #[test]
+    fn required_values_refuse_an_absent_or_different_value_on_every_write() {
+        let schema = json!({"required_values":{"executor":"automation:x","marker":"v1"}});
+        let routed = json!({"executor":"automation:x","marker":"v1","free":1});
+        assert!(validate_protocol(&schema, &json!({}), &routed, None).is_ok());
+        for (key, value) in [
+            ("executor", None),
+            ("executor", Some(json!("automation:y"))),
+            ("marker", None),
+            ("marker", Some(json!("v2"))),
+            ("marker", Some(Value::Null)),
+        ] {
+            let mut after = routed.clone();
+            match value {
+                Some(value) => after[key] = value,
+                None => {
+                    after.as_object_mut().unwrap().remove(key);
+                }
+            }
+            let refusal = validate_protocol(&schema, &json!({}), &after, None).unwrap_err();
+            assert!(refusal.contains(key), "{refusal}");
+            assert!(validate_protocol(&schema, &routed, &after, None).is_err());
+        }
+        let mut patch = Map::new();
+        patch.insert("executor".into(), Value::Null);
+        assert!(validate_protocol_patch(&schema, &routed, &patch).is_err());
+        assert!(validate_protocol(&json!({}), &json!({}), &json!({}), None).is_ok());
+        for malformed in [
+            json!({"required_values":["executor"]}),
+            json!({"required_values":{"":1}}),
+        ] {
+            assert!(validate_protocol(&malformed, &json!({}), &routed, None).is_err());
+        }
     }
 }

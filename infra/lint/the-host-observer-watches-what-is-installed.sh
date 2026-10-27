@@ -51,6 +51,12 @@
 #      on 2026-09-22/23 boss-ops-runner was red every minute on a host
 #      whose observer posted a clean reading every five, and post-mortem
 #      3c3b202c found no estate record of it at all (backlog bf362f25)
+#   10. the ops-runner waker is watched where it is installed — on a
+#      runner host whose runner starts through no tree helper (the forge)
+#      — and not on boss-gcp, whose runner starts through the root tree's
+#      launcher and so gets none; the forge's network-boot daemons are
+#      watched too. On 2026-10-20 the forge's reading carried the waker as
+#      undeclared_units, running and judged by nothing (backlog 2eae38d4)
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
@@ -343,11 +349,42 @@ for ext in timer service; do
 $forge_roster"
     forge_want=$((forge_want + 1))
 done
+
+# 10. THE WAKER WHERE IT RUNS, AND NOT WHERE IT DOES NOT (backlog
+#     2eae38d4). The forge starts its runner through no tree helper, so
+#     install-ops-runner.sh installs the waker beside it, and network boot
+#     installs its two daemons whatever the roles: each is watched there.
+#     boss-gcp starts its runner through the root tree's launcher, so it
+#     has no waker and must not watch one (a not-found reading forever).
+#     The names are written here, not asked of the modes the observer
+#     reads, so a mode that printed a shorter list is caught.
+forge_role_roster="$(env -u UNITS -u HOST_ID -u JOBS_API OBSERVE_UNITS_INSTALLER="$forge_installer" \
+    BOSS_NODE_ROLES="cluster-operator" bash "$observer" --roster 2>&1)" \
+    || fail "observe-units.sh --roster with the forge's installer under roles 'cluster-operator' exited non-zero:
+$forge_role_roster"
+for u in boss-ops-runner-wake.service forge-netboot-dhcp.service forge-netboot-http.service; do
+    grep -qx "$u" <<<"$forge_roster" \
+        || fail "$u is installed on the forge and its observer does not watch it — on 2026-10-20
+    the waker rode the forge's reading as undeclared_units, judged by nothing (backlog 2eae38d4):
+$forge_roster"
+    forge_want=$((forge_want + 1))
+done
+! grep -qx 'boss-ops-runner-wake.service' <<<"$forge_role_roster" \
+    || fail "boss-ops-runner-wake.service is watched on a forge outside the ops-runner role, which
+    installs no runner and so no waker:
+$forge_role_roster"
+for r in "$roster" "$runner_roster"; do
+    ! grep -qx 'boss-ops-runner-wake.service' <<<"$r" \
+        || fail "boss-gcp's roster watches boss-ops-runner-wake.service, which boss-gcp never installs:
+    its runner starts through the root tree's launcher, which a waker that never exits would
+    hold off every refresh of (infra/ops/install-ops-runner.sh, THE WAKER). Roster was:
+$r"
+done
 forge_got=$(printf '%s\n' "$forge_roster" | sed '/^$/d' | wc -l | tr -d ' ')
 [ "$forge_got" -eq "$forge_want" ] \
     || fail "the forge's roster carries $forge_got units but $forge_want install there:
 $forge_roster"
 
 lint_scanned the-host-observer-watches-what-is-installed "$got" "unit(s) derived from the installer's roles.toml rows"
-echo "the-host-observer-watches-what-is-installed: ok — the host-units roster is derived from the installer's roles.toml rows ($got units, both halves of $((got / 2)) pairs, $n_excl justified exclusions), boss-ml-inference-batch.timer among them, the unit file holds no second copy, an unreadable source refuses with EX_CONFIG instead of answering a smaller question, under roles '$roles' the roster is the installer's in-role set ($role_got units), the ops-request runner is watched exactly where install-ops-runner.sh --in-role installs one, and the forge watches its own installer's units ($forge_got, forge-converge.service among them)"
+echo "the-host-observer-watches-what-is-installed: ok — the host-units roster is derived from the installer's roles.toml rows ($got units, both halves of $((got / 2)) pairs, $n_excl justified exclusions), boss-ml-inference-batch.timer among them, the unit file holds no second copy, an unreadable source refuses with EX_CONFIG instead of answering a smaller question, under roles '$roles' the roster is the installer's in-role set ($role_got units), the ops-request runner is watched exactly where install-ops-runner.sh --in-role installs one, and the forge watches its own installer's units ($forge_got, forge-converge.service, the ops-runner waker and both network-boot daemons among them) while boss-gcp watches no waker it never installs"
 exit 0

@@ -15,7 +15,7 @@ ready_when = "true"
 title_template = "Authorize the bounded installation read"
 authority_role = "platform-admin"
 audience = { role = "platform-admin" }
-metadata_defaults = { human_only = true, installation_diagnostic = "scope", procedure = "Authorize a public GET of this declared GitHub App installation. Supply the expected account login explicitly; an optional numeric account id adds a separate equality assertion. App id comes from the issuer-owned root; installation id comes from the declaration or issuer default. This does not authorize token minting, permission changes or retrying publication." }
+metadata_defaults = { human_presentation = { ask = "Authorize a read of this GitHub installation's permissions", why_person = "A person must authorize the exact account and the reason for this diagnostic read.", action = "Name the account and authorize the read", after = "The broker records public permissions only; nothing is minted, granted, installed, or published.", evidence = "current-step" }, human_only = true, installation_diagnostic = "scope", procedure = "Authorize a public GET of this declared GitHub App installation. Supply the expected account login explicitly; an optional numeric account id adds a separate equality assertion. App id comes from the issuer-owned root; installation id comes from the declaration or issuer default. This does not authorize token minting, permission changes or retrying publication." }
 fields = [
     { name = "credential", field_type = "non-empty-string", required = true },
     { name = "expected_account_login", field_type = "non-empty-string", required = true },

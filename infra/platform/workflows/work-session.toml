@@ -34,6 +34,19 @@
 # open sessions and their runs into crews — sessions as crews, runs as
 # the cars they are building.
 #
+# THE WORKING WINDOW (backlog 37e3295c). How long a session works was
+# a chat line: on 2026-10-18 and 2026-10-19 a factory session was told
+# "6 hours" / "the next 8 hours", honoured it literally, and idled with
+# urgent nominations ready until a human noticed — 80 and 48 minutes.
+# The window is now `metadata.window`: open-ended, `until` an instant,
+# or closed with a handoff. `boss session window` is the one writer (the
+# conductor's, or David's, extension is a write to the packet); the
+# UserPromptSubmit hook reads it back onto the session's context on
+# every prompt, and `boss orient` lists every open session's window, so
+# the other session reads it from the record. A close goes through the
+# metadata merge door, whose `jobs.job.updated` event carries the closed
+# window and its handoff into the audit log.
+#
 # `ended` is REQUIRED and enum-checked on `active`, so a session cannot
 # close without saying whether a hook or the clock closed it. Every
 # hook exits 0 whatever the system of record answers: visibility is
@@ -48,7 +61,7 @@ subject_kinds = ["custom"]
 owning_team = "platform"
 description = "One operator's Claude Code session, as a packet: opened by the SessionStart hook, kept alive by a heartbeat on every prompt (last_active_at and prompt_count, never the prompt text), ended by the SessionEnd hook or by the clock when it goes silent past twice the active step's duration. Runs dispatched from the session link back to it by metadata.session on each agent-run. The shop floor of the operator surface — sessions as crews, runs as the cars they are building."
 metadata = { department = "it", owner_role = "platform-admin" }
-metadata_schema = { type = "object", required = ["actor", "host", "started_at"], properties = { actor = { type = "string", description = "The actor id the session signs as (BOSS_ACTOR)." }, host = { type = "string" }, cwd = { type = "string" }, started_at = { type = "string", description = "RFC3339, written by the SessionStart hook." }, session_id = { type = "string", description = "Claude Code's own session id, so a resumed session finds its packet." }, source = { type = "string", description = "startup | resume | clear | compact — SessionStart's own word." }, last_active_at = { type = "string", description = "The heartbeat: RFC3339 of the last prompt, written by UserPromptSubmit." }, prompt_count = { type = "number" }, untracked_runs = { type = "number", description = "Agent-tool calls the dispatch hook could parse no packet from — counted, never refused." }, ended_at = { type = "string" }, end_reason = { type = "string", description = "SessionEnd's own reason word." } } }
+metadata_schema = { type = "object", required = ["actor", "host", "started_at"], properties = { actor = { type = "string", description = "The actor id the session signs as (BOSS_ACTOR)." }, host = { type = "string" }, cwd = { type = "string" }, started_at = { type = "string", description = "RFC3339, written by the SessionStart hook." }, session_id = { type = "string", description = "Claude Code's own session id, so a resumed session finds its packet." }, source = { type = "string", description = "startup | resume | clear | compact — SessionStart's own word." }, last_active_at = { type = "string", description = "The heartbeat: RFC3339 of the last prompt, written by UserPromptSubmit." }, prompt_count = { type = "number" }, untracked_runs = { type = "number", description = "Agent-tool calls the dispatch hook could parse no packet from — counted, never refused." }, ended_at = { type = "string" }, end_reason = { type = "string", description = "SessionEnd's own reason word." }, window = { type = "object", required = ["state"], description = "The working window the session honours, written by `boss session window` and read back onto the session's context on every prompt. Absent reads open-ended: a number of hours said in chat does not end a session.", properties = { state = { type = "string", enum = ["open", "until", "closed"] }, until = { type = "string", description = "RFC3339: the instant the window ends, when state is until." }, set_by = { type = "string" }, set_at = { type = "string" }, why = { type = "string" }, closed_at = { type = "string" }, closed_by = { type = "string" }, handoff = { type = "string", description = "What the closing session leaves for whoever reads next — required by the verb on a close." } } } } }
 
 [[workflow.step]]
 title = "opened"

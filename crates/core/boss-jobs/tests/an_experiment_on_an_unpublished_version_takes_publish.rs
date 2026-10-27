@@ -261,6 +261,28 @@ async fn a_retired_arm_takes_publish_too() {
     assert_eq!(status, StatusCode::CREATED, "a publisher may: {body}");
 }
 
+/// Backlog 50ded63d, the review of car e3c4a326 (B2, M2). A REJECTED
+/// candidate lost its experiment and is never published, so no
+/// authority puts a split onto it again — Publish included. Refused 409
+/// with the version named, and nothing is admitted.
+#[tokio::test]
+async fn no_one_may_open_an_experiment_on_a_rejected_version() {
+    let kinds = seeded();
+    kinds.seed(spec(4, WorkflowStatus::Rejected)).unwrap();
+    let (app, jobs) = app_over(kinds);
+    let e = experiment(2, 4, 50);
+    let (status, body) = open(&app, &publisher(), &e).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("\"rejected_version\":4"),
+        "names the version: {body}"
+    );
+    assert!(
+        jobs.get_job(&e.id).await.unwrap().is_none(),
+        "a refused admission writes nothing"
+    );
+}
+
 /// A split whose arms are both the live protocol puts nothing new in
 /// force, so it asks nothing beyond the job write.
 #[tokio::test]
@@ -349,7 +371,7 @@ async fn the_metadata_patch_refuses_a_row_that_moved_under_its_judgement() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(
-        body.contains("changed since this merge was judged"),
+        body.contains("changed since this write was judged"),
         "says what happened: {body}"
     );
     assert!(
@@ -464,6 +486,15 @@ impl WorkflowRegistry for OneRowUnreadable {
         now: DateTime<Utc>,
     ) -> Result<(), WorkflowError> {
         self.inner.discard_draft(kind, version, actor, now).await
+    }
+    async fn reject_draft(
+        &self,
+        kind: &str,
+        version: i32,
+        actor: &ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<(), WorkflowError> {
+        self.inner.reject_draft(kind, version, actor, now).await
     }
     async fn publish_authored(
         &self,

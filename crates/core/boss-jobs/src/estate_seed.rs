@@ -31,12 +31,7 @@ pub fn parse_estate_toml(text: &str) -> Result<Vec<EstateNodeInput>, String> {
     for n in &file.node {
         validate_estate_node(n)?;
     }
-    let mut seen = std::collections::BTreeSet::new();
-    for n in &file.node {
-        if !seen.insert(&n.id) {
-            return Err(format!("node {} is declared twice", n.id));
-        }
-    }
+    crate::port::validate_estate_node_ids(&file.node)?;
     Ok(file.node)
 }
 

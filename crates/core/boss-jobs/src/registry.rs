@@ -30,6 +30,13 @@ pub enum WorkflowStatus {
     Draft,
     Active,
     Retired,
+    /// A draft that met traffic and lost (backlog 50ded63d): an
+    /// experiment admitted packets to it, so it cannot be discarded —
+    /// they run its text — and it must never go live. Kept as history,
+    /// served by `get_version` like any row, and invisible to `publish`,
+    /// which promotes only a `Draft`. Workflow rows only: the other
+    /// registries sharing this enum keep a three-word CHECK.
+    Rejected,
 }
 
 impl WorkflowStatus {
@@ -38,7 +45,18 @@ impl WorkflowStatus {
             Self::Draft => "draft",
             Self::Active => "active",
             Self::Retired => "retired",
+            Self::Rejected => "rejected",
         }
+    }
+
+    /// Did this row ever pass the publish gate? Active and retired
+    /// rows did; a draft never has, and a rejected row is a draft that
+    /// never will (backlog 50ded63d). Every reader asking "was this
+    /// version published" asks here, so a rejected row answers exactly
+    /// as the draft it was — the live write path and a later replay
+    /// read the same answer for a row that changed status in between.
+    pub fn was_published(&self) -> bool {
+        matches!(self, Self::Active | Self::Retired)
     }
 }
 
@@ -49,6 +67,7 @@ impl std::str::FromStr for WorkflowStatus {
             "draft" => Ok(Self::Draft),
             "active" => Ok(Self::Active),
             "retired" => Ok(Self::Retired),
+            "rejected" => Ok(Self::Rejected),
             other => Err(format!("unknown job kind status: {other}")),
         }
     }
@@ -1958,6 +1977,33 @@ pub trait WorkflowRegistry: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<(), WorkflowError>;
 
+    /// Set a DRAFT that met traffic and lost to `Rejected` (backlog
+    /// 50ded63d). The discard refuses a draft a packet is pinned to,
+    /// rightly — the packet runs that text — so before this an
+    /// experiment's losing candidate stayed a draft forever: publish
+    /// would promote it (it takes the newest draft and no body), and
+    /// `boss workflow publish` refused every later spec because a
+    /// draft that was not its own existed. A rejected row keeps its
+    /// text and its number, is served by `get_version`, and is never
+    /// promoted: `publish` takes only a `Draft`.
+    ///
+    /// For that case and no other. An active or retired row is history
+    /// and refuses `Conflict`; a missing row is `NotFound`; a draft no
+    /// packet is pinned to admitted nothing and refuses `Conflict`
+    /// naming the discard, its resolution — so `rejected` always means
+    /// "packets ran it and it lost", never a guess at an author's
+    /// intent. Rejecting a rejected row is a silent no-op, like a
+    /// second retire. Records `jobs.kind.draft_rejected` (payload =
+    /// the rejected spec) iff a row flipped. Pins are counted under
+    /// the same hold the flip takes, as the discard counts them.
+    async fn reject_draft(
+        &self,
+        kind: &str,
+        version: i32,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<(), WorkflowError>;
+
     /// Look up the active spec and materialize its step DAG against
     /// the given subject. Default impl fetches + delegates to the
     /// pure `materialize_steps` helper; adapters can override if a
@@ -2216,6 +2262,12 @@ pub struct InMemoryWorkflows {
     /// count and spend happen under that store's lock, which is what
     /// orders them against an admission (backlog ce8b7d66, part 4).
     packets: Option<Arc<crate::in_memory::InMemoryJobs>>,
+    /// How many times each kind's `get_version` was read, failed reads
+    /// included, for [`InMemoryWorkflows::version_reads`].
+    version_reads: Arc<Mutex<HashMap<String, usize>>>,
+    /// How many more `get_version` reads of a kind answer before every
+    /// later one fails, set by [`InMemoryWorkflows::fail_version_read_after`].
+    version_reads_left: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl Default for InMemoryWorkflows {
@@ -2242,7 +2294,43 @@ impl InMemoryWorkflows {
             discarded_high_water: Arc::new(Mutex::new(HashMap::new())),
             packets: None,
             publication_coverage: PublicationCoverage::Unconfigured,
+            version_reads: Arc::new(Mutex::new(HashMap::new())),
+            version_reads_left: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Let the next `reads` `get_version` reads of `kind` answer, and
+    /// fail every one after them with a storage error until
+    /// [`InMemoryWorkflows::restore_version_read`] — the registry twin
+    /// of `InMemoryJobs::fail_steps_read_after`. A step write reads its
+    /// packet's pinned version more than once (the readiness pass, the
+    /// declared-terminal close, the catch-all's outcome), and the two
+    /// reads behind the first read a failure as "no terminal" and "no
+    /// outcome" (backlog 0887d2a9), so only a counted failure reaches
+    /// them.
+    pub fn fail_version_read_after(&self, kind: &str, reads: usize) {
+        if let Ok(mut left) = self.version_reads_left.lock() {
+            left.insert(kind.to_string(), reads);
+        }
+    }
+
+    /// Restore `get_version` reads of `kind` after
+    /// [`InMemoryWorkflows::fail_version_read_after`].
+    pub fn restore_version_read(&self, kind: &str) {
+        if let Ok(mut left) = self.version_reads_left.lock() {
+            left.remove(kind);
+        }
+    }
+
+    /// How many times `kind`'s versions have been read through
+    /// `get_version`, failed reads included — what a sweep over
+    /// [`InMemoryWorkflows::fail_version_read_after`] counts its
+    /// positions from.
+    pub fn version_reads(&self, kind: &str) -> usize {
+        self.version_reads
+            .lock()
+            .map(|reads| reads.get(kind).copied().unwrap_or(0))
+            .unwrap_or(0)
     }
 
     /// Explicit unjudged fixture setup, never an operational API adapter.
@@ -2462,6 +2550,19 @@ impl WorkflowRegistry for InMemoryWorkflows {
     }
 
     async fn get_version(&self, kind: &str, version: i32) -> Result<WorkflowSpec, WorkflowError> {
+        if let Ok(mut reads) = self.version_reads.lock() {
+            *reads.entry(kind.to_string()).or_default() += 1;
+        }
+        if let Ok(mut left) = self.version_reads_left.lock()
+            && let Some(n) = left.get_mut(kind)
+        {
+            if *n == 0 {
+                return Err(WorkflowError::Storage(format!(
+                    "{kind}@v{version} unreadable (injected by fail_version_read_after)"
+                )));
+            }
+            *n -= 1;
+        }
         let rows = self.rows.lock().unwrap();
         rows.get(&(kind.to_string(), version))
             .cloned()
@@ -2664,6 +2765,63 @@ impl WorkflowRegistry for InMemoryWorkflows {
             crate::events::WORKFLOW_DRAFT_DISCARDED,
             actor,
             &spec,
+        ));
+        Ok(())
+    }
+
+    async fn reject_draft(
+        &self,
+        kind: &str,
+        version: i32,
+        actor: &boss_core::actor::ActorId,
+        _now: DateTime<Utc>,
+    ) -> Result<(), WorkflowError> {
+        // One hold over judge, count and flip, as the discard takes it
+        // (rows, then jobs). Nothing here awaits.
+        let mut rows = self
+            .rows
+            .lock()
+            .map_err(|_| WorkflowError::Storage("workflow row lock is poisoned".into()))?;
+        let key = (kind.to_string(), version);
+        let Some(status) = rows.get(&key).map(|r| r.status) else {
+            return Err(WorkflowError::NotFound(format!("{kind} v{version}")));
+        };
+        match status {
+            WorkflowStatus::Rejected => return Ok(()),
+            WorkflowStatus::Draft => {}
+            other => {
+                return Err(WorkflowError::Conflict(
+                    crate::port::PinnedJobs::reject_history(kind, version, other.as_str()),
+                ));
+            }
+        }
+        // No packets handed to this adapter is a world where nothing is
+        // pinned (`with_packets`), so every reject there refuses.
+        let pinned = match &self.packets {
+            Some(p) => {
+                p.workflow_version_pins(kind, version)
+                    .ok_or_else(|| {
+                        WorkflowError::Storage("the jobs store lock is poisoned".into())
+                    })?
+                    .count
+            }
+            None => 0,
+        };
+        if pinned == 0 {
+            return Err(WorkflowError::Conflict(
+                crate::port::PinnedJobs::reject_needs_traffic(kind, version),
+            ));
+        }
+        let Some(row) = rows.get_mut(&key) else {
+            return Err(WorkflowError::NotFound(format!("{kind} v{version}")));
+        };
+        row.status = WorkflowStatus::Rejected;
+        let rejected = row.clone();
+        drop(rows);
+        self.record(crate::events::workflow_registry_event(
+            crate::events::WORKFLOW_DRAFT_REJECTED,
+            actor,
+            &rejected,
         ));
         Ok(())
     }
@@ -3604,6 +3762,97 @@ mod pg {
 
             let event = crate::events::workflow_registry_event(
                 crate::events::WORKFLOW_DRAFT_DISCARDED,
+                actor,
+                &spec,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(WorkflowError::Storage)?;
+
+            tx.commit()
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            Ok(())
+        }
+
+        async fn reject_draft(
+            &self,
+            kind: &str,
+            version: i32,
+            actor: &boss_core::actor::ActorId,
+            _now: DateTime<Utc>,
+        ) -> Result<(), WorkflowError> {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
+            // The discard's order: the table fence publication takes,
+            // then the row. A publish waiting behind this reads the row
+            // rejected and finds nothing to promote; one ahead of it
+            // leaves the row active, and this refuses it as history.
+            publication_fence(&mut tx).await?;
+            let found: Option<Row> = sqlx::query_as(
+                "SELECT kind, version, status, label, description, category,
+                        subject_kinds, steps, metadata_schema, entitlements, metadata,
+                        on_complete_create, owning_team, authoring_job_id, created_at
+                 FROM workflows
+                 WHERE kind = $1 AND version = $2
+                 FOR UPDATE",
+            )
+            .bind(kind)
+            .bind(version)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            let Some(row) = found else {
+                return Err(WorkflowError::NotFound(format!("{kind} v{version}")));
+            };
+            let mut spec = row_to_spec(row)?;
+            match spec.status {
+                // Idempotent — nothing to do, so nothing to record.
+                WorkflowStatus::Rejected => return Ok(()),
+                WorkflowStatus::Draft => {}
+                other => {
+                    return Err(WorkflowError::Conflict(
+                        crate::port::PinnedJobs::reject_history(kind, version, other.as_str()),
+                    ));
+                }
+            }
+
+            // Counted inside this transaction, under the row lock an
+            // admission's `FOR KEY SHARE` waits on, as the discard's
+            // count is (backlog ce8b7d66, part 4).
+            let pinned = crate::postgres::pinned_to_workflow(&mut *tx, kind, version)
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            if pinned.count == 0 {
+                return Err(WorkflowError::Conflict(
+                    crate::port::PinnedJobs::reject_needs_traffic(kind, version),
+                ));
+            }
+
+            let flipped = sqlx::query(
+                "UPDATE workflows SET status = 'rejected'
+                 WHERE kind = $1 AND version = $2 AND status = 'draft'",
+            )
+            .bind(kind)
+            .bind(version)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            if flipped.rows_affected() != 1 {
+                // Unreachable under the row lock; refused rather than
+                // recorded, as the discard's and the publish's are.
+                return Err(WorkflowError::Conflict(format!(
+                    "{kind} v{version} was not a draft when the reject reached it"
+                )));
+            }
+            spec.status = WorkflowStatus::Rejected;
+
+            let event = crate::events::workflow_registry_event(
+                crate::events::WORKFLOW_DRAFT_REJECTED,
                 actor,
                 &spec,
             );
@@ -7521,6 +7770,54 @@ mod tests {
         );
         assert_eq!(retired[0].payload["kind"], "repair");
         assert_eq!(retired[0].payload["status"], "retired");
+    }
+
+    /// Backlog 50ded63d: a rejection is on the record once, carrying
+    /// the row it rejected; a second reject touches nothing and records
+    /// nothing, as a second retire does.
+    #[tokio::test]
+    async fn reject_records_once_and_stays_silent_when_already_rejected() {
+        let jobs = Arc::new(crate::in_memory::InMemoryJobs::new());
+        let reg = InMemoryWorkflows::for_fixture().with_packets(jobs.clone());
+        let actor = test_actor();
+        let d = reg
+            .create_draft(seed_spec("repair"), &actor, Utc::now())
+            .await
+            .unwrap();
+        let mut pinned = boss_core::job::Job::new(
+            "repair",
+            Subject::new("account", "acct-1"),
+            "a candidate packet",
+            "emp-1",
+            boss_core::job::Priority::Standard,
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap(),
+        )
+        .with_workflow_version(d.version);
+        pinned.status = boss_core::job::JobStatus::Open;
+        crate::port::JobsRepository::create_job(jobs.as_ref(), &pinned)
+            .await
+            .unwrap();
+
+        reg.reject_draft("repair", d.version, &actor, Utc::now())
+            .await
+            .unwrap();
+        reg.reject_draft("repair", d.version, &actor, Utc::now())
+            .await
+            .unwrap();
+
+        let rejected: Vec<_> = reg
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == crate::events::WORKFLOW_DRAFT_REJECTED)
+            .collect();
+        assert_eq!(
+            rejected.len(),
+            1,
+            "an idempotent reject must not record a second event"
+        );
+        assert_eq!(rejected[0].payload["kind"], "repair");
+        assert_eq!(rejected[0].payload["version"], d.version);
+        assert_eq!(rejected[0].payload["status"], "rejected");
     }
 
     #[tokio::test]

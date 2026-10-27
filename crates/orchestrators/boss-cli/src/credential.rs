@@ -94,7 +94,7 @@ fn run_cmd(mut cmd: Command, what: &str) -> Result<String> {
 }
 
 fn read_secret_via_kubectl() -> Result<String> {
-    let mut cmd = Command::new("kubectl");
+    let mut cmd = Command::new(crate::door_env::kubectl_program());
     cmd.args([
         "get",
         "secret",

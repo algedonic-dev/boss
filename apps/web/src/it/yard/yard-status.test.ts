@@ -170,6 +170,8 @@ describe('parseYardStatus', () => {
         reason: 'no reason recorded',
         // An older server states no release decision: none, not "no".
         release: null,
+        // ...and no release-rule record: nobody tried, not "it failed".
+        auto_release: null,
       },
     ]);
     expect(parseYardStatus({}).held_cars).toEqual([]);
@@ -211,11 +213,44 @@ describe('parseYardStatus', () => {
     expect(s.held_cars[2]!.release!.releasable).toBe(false);
     expect(s.held_cars[3]!.release).toBeNull();
     expect(releasableHeld(s.held_cars).map(h => h.id)).toEqual(['a']);
-    // The body names the review and nothing else: no head, no actor.
-    expect(releaseBody(a)).toEqual({ review: '5eed5eed-0000-4000-8000-000000000001' });
-    expect(releaseBody({ ...a, review: null })).toBeNull();
+    // The body names the review and the hold the row SHOWED, its reason
+    // and the head it was placed at (review 792b871a N1: the door lifts
+    // that hold or refuses); no head to judge at, no actor.
+    const shown = s.held_cars[0]!;
+    expect(releaseBody(shown)).toEqual({
+      review: '5eed5eed-0000-4000-8000-000000000001',
+      hold: { reason: 'trust', sha: '1111111111111111111111111111111111111111' },
+    });
+    expect(releaseBody({ ...shown, release: { ...a, review: null } })).toBeNull();
+    expect(releaseBody(s.held_cars[3]!)).toBeNull();
     expect(shortSha(a.reviewed_sha)).toBe('11111111');
     expect(shortSha(null)).toBe('—');
+  });
+
+  // THE RULE TRIED (backlog 60993cda). The release rule's record of a
+  // door refusal rides on the held row as the server states it, so a car
+  // the rule tried and failed to release does not read like one nobody
+  // tried. A record with no readable `why` is still shown, said as
+  // unreadable; no record is `null`.
+  test('a held row carries the release rule’s refusal record when it has one', () => {
+    const row = { id: 'c', title: 'T', branch: 'fix/x', parked_since: '2026-10-09', reason: 'trust' };
+    const rec = {
+      review: '5eed5eed-0000-4000-8000-000000000001',
+      outcome: 'refused',
+      why: 'boss release: REFUSED — run 5eed5eed’s verdict is "changes", not "release"',
+      by: 'automation:rule:release-a-held-car-on-its-reviewer-verdict',
+      at: '2026-10-18T15:59:53.395667+00:00',
+    };
+    const s = parseYardStatus({
+      held_cars: [
+        { ...row, id: 'a', auto_release: rec },
+        { ...row, id: 'b', auto_release: { outcome: 'refused' } },
+        { ...row, id: 'c' },
+      ],
+    });
+    expect(s.held_cars[0]!.auto_release).toEqual(rec);
+    expect(s.held_cars[1]!.auto_release!.why).toBe('an unreadable release-rule record');
+    expect(s.held_cars[2]!.auto_release).toBeNull();
   });
 
   // Review 4822764d N1: the Release-all confirmation lists every car's

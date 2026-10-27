@@ -35,7 +35,7 @@
   import { sectionHref } from './regions';
   import { exitNames } from './routes';
   import type { Band, FanBranch, Section } from './route-layout';
-  import { sectionGround, stationLabel, trainsOf, waitingBlocks } from './transit';
+  import { sectionGround, stationLabel, waitingBlocks } from './transit';
   import { safeLinkHref } from '@boss/web-kit/links';
   import { presentationHref } from './map-navigation';
 
@@ -45,7 +45,6 @@
     /** Each section's border reading, by its key — its rate, its queue,
      *  whether it flows. A section with none reads "no reading". */
     borders: ReadonlyMap<string, Border>;
-    reduced: boolean;
     /** The exits band the fans stand in (route-layout.ts `layFans`),
      *  null when no exit is served; `width` is the drawing's. */
     band?: Band | null;
@@ -53,13 +52,9 @@
     height?: number;
     /** The selected section's key, marked with a casing; null for none. */
     selected: string | null;
-    /** The real moves ride these sections (flight `it-map-live`, car M2
-     *  of design e765b3fc): the rate-replay blocks are then off, so no
-     *  crossing is drawn twice, once as a picture of it. */
-    live?: boolean;
     overview?: boolean;
   }>;
-  let { sections, borders, reduced, selected, live = false, overview = false, band = null, width = 0, height = 0 }: Props = $props();
+  let { sections, borders, selected, overview = false, band = null, width = 0, height = 0 }: Props = $props();
 
   const track = $derived(sections.filter((s) => s.kind === 'section'));
   const ramps = $derived(sections.filter((s) => s.kind !== 'section'));
@@ -139,7 +134,6 @@
     {@const b = borders.get(s.key)}
     {@const ground = sectionGround(b)}
     {@const waiting = waitingBlocks(s, b)}
-    {@const trains = live ? null : trainsOf(b, reduced)}
     {@const href = presentationHref(sectionHref(from, to), overview)}
     {@const isSelected = selected === s.key}
     <a class="section-link" class:context-muted={overview && selected !== null && selected !== s.key && selected !== from && selected !== to} href={safeLinkHref(href)} data-section-link={s.key} data-selected={isSelected ? 'true' : undefined}
@@ -166,14 +160,6 @@
     {/each}
     {#if waiting.more !== null}
       <text x={waiting.more.at.x - 8} y={waiting.more.at.y - 7} text-anchor="end" class="more" data-more={s.key}>+{waiting.more.n}</text>
-    {/if}
-    {#if trains !== null}
-      {#each trains.begins as begin, i (i)}
-        <rect x="-7" y="-4" width="14" height="8" rx="2" class="train line-{s.line}" data-train={s.key}>
-          <animateMotion dur="{trains.dur.toFixed(3)}s" begin="{begin.toFixed(3)}s" repeatCount="indefinite"
-            path={s.d} rotate="auto" />
-        </rect>
-      {/each}
     {/if}
   {/each}
 </g>
@@ -233,6 +219,5 @@
   .section-link:focus-visible .section, .section-link:hover .section { stroke-width: 11; }
 
   .waiting { fill: var(--map-ink); }
-  .train { fill: var(--map-surface); stroke-width: 2; }
   text.more { font-family: var(--font-mono); font-size: 9.5px; fill: var(--map-muted); font-variant-numeric: tabular-nums; }
 </style>

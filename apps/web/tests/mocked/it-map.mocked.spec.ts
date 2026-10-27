@@ -153,102 +153,15 @@ async function mocks(page: Page): Promise<void> {
   await page.route(YARD_BORDERS, (r) => json(r, BORDERS_PAYLOAD));
 }
 
-test('the world paints a territory per region in one SVG, along the flow, with the count and the trend inside each', async ({ page }) => {
-  await mocks(page);
-  await page.goto('/it');
-
-  const svg = page.locator('section.yard svg');
-  await expect(svg).toHaveCount(1);
-  const territories = svg.locator('.territory');
-  await expect(territories).toHaveCount(TERRITORIES.length);
-  const names = await territories.evaluateAll((els) => els.map((el) => el.getAttribute('data-region')));
-  expect(new Set(names)).toEqual(new Set(TERRITORIES.map((t) => t.name)));
-  // The flow reads left to right in the order a car walks it (design
-  // 62de32ae decision 3): gated BEFORE it parks on the dock.
-  const xOf = async (name: string) =>
-    Number(await svg.locator(`.territory[data-region="${name}"] rect`).first().getAttribute('x'));
-  const line = ['receiving', 'marshalling', 'shop-floor', 'gates', 'dock', 'track', 'arrivals', 'shed'];
-  const xs = await Promise.all(line.map(xOf));
-  expect([...xs].sort((a, b) => a - b)).toEqual(xs);
-  // The borders are drawn: one rail per declared hop, the garage fed by both gates and track.
-  await expect(svg.locator('[data-border="shop-floor→gates"]')).toHaveCount(1);
-  await expect(svg.locator('[data-border="gates→dock"]')).toHaveCount(1);
-  await expect(svg.locator('[data-border="dock→track"]')).toHaveCount(1);
-  await expect(svg.locator('[data-border="gates→garage"]')).toHaveCount(1);
-  await expect(svg.locator('[data-border="track→garage"]')).toHaveCount(1);
-
-  // The count over its bound, the state, the trend in its unit — inside the outline.
-  const dock = svg.locator('.territory[data-region="dock"]');
-  await expect(dock).toContainText('3 / 5');
-  await expect(dock).toContainText('clear');
-  await expect(dock).toContainText('dock wait');
-  await expect(dock).toContainText('4.3 vs 3 hours');
-  // A half nobody measured is a dash, never a zero.
-  await expect(svg.locator('.territory[data-region="track"]')).toContainText('— vs 14 minutes');
-  // An unread region prints no number at all.
-  await expect(svg.locator('.territory[data-region="marshalling"]')).toContainText('no reading');
-});
-
-test('a troubled territory looks troubled where it is and carries its why', async ({ page }) => {
-  expect(REGIONS.regions.map((r) => r.name).sort()).toEqual([...REGION_NAMES].sort());
-  await mocks(page);
-  await page.goto('/it');
-
-  const svg = page.locator('section.yard svg');
-  await expect(svg.locator('.territory[data-state="troubled"]')).toHaveCount(2);
-  const gates = svg.locator('.territory[data-region="gates"]');
-  await expect(gates).toHaveAttribute('data-state', 'troubled');
-  // The yard's own trouble strokes — the outline and the lamp — and
-  // the reason printed inside the outline: a verdict must name what
-  // failed. The whole why rides the title.
-  await expect(gates.locator('rect.shed.err')).toHaveCount(1);
-  await expect(gates.locator('.lamp.err')).toHaveCount(1);
-  await expect(gates.locator('text.why')).toContainText('1 bay holds a corpse');
-  await expect(gates.locator('title')).toHaveText(/1 bay holds a corpse — a gate-run past its own deadline/);
-  // A clear territory carries none of that.
-  const dock = svg.locator('.territory[data-region="dock"]');
-  await expect(dock.locator('text.why')).toHaveCount(0);
-  await expect(dock.locator('rect.shed.err')).toHaveCount(0);
-  await expect(dock.locator('.lamp.ok')).toHaveCount(1);
-  // Attention wears the warn stroke.
-  await expect(svg.locator('.territory[data-region="shed"] rect.shed.warn')).toHaveCount(1);
-});
-
-test('a state that is not clear says how long it has held and names the band that decided it', async ({ page }) => {
-  await mocks(page);
-  await page.goto('/it');
-  const receiving = page.locator('section.yard svg .territory[data-region="receiving"]');
-  await expect(receiving).toHaveAttribute('data-state', 'attention');
-  await expect(receiving.locator('text.state')).toHaveText('attention for 36h');
-  // The band against its number, where the state is — not in a legend.
-  // (wrapped over tspans, so read line by line)
-  await expect(receiving.locator('text.why.warn tspan').first()).toHaveText('oldest 5d > the');
-  await expect(receiving.locator('text.why.warn tspan').nth(1)).toHaveText('3-day triage band');
-  // The KPI in its unit, as the server wrote it.
-  await expect(receiving.locator('text.kpi tspan').first()).toHaveText('oldest untriaged 5');
-  await expect(receiving.locator('text.kpi tspan').nth(1)).toHaveText('days');
-  // The hover carries the count in its unit and the whole band.
-  await expect(receiving.locator('title').first()).toContainText(
-    'receiving · 4 packets standing · attention for 36h [oldest 5d > the 3-day triage band]',
-  );
-});
-
-// ONE DOOR PER REGION (backlog 594ffe96): the world map sent its
-// publish territory to /it/yard — the TRACK's page — because its link
-// function knew nine regions, while the transit map linked the same
-// region to /it/yard/publish. Every territory, as rendered, selects
-// its own region (design e765b3fc, car N1: `/it?at=<name>`), and
-// publish's selection opens publish's panel — not the track's. The floor
-// pages retired with car N3, so the panel is the whole answer.
 test('every territory selects its own region, and publish opens publish — not the track', async ({ page }) => {
   await mocks(page);
   await page.goto('/it');
-  const svg = page.locator('section.yard svg');
-  await expect(svg.locator('.territory')).toHaveCount(TERRITORIES.length);
+  const svg = page.locator('section.transit svg[role="group"]');
+  await expect(svg.locator('[data-station]')).toHaveCount(TERRITORIES.length);
   for (const t of TERRITORIES) {
-    await expect(svg.locator(`.territory[data-region="${t.name}"]`)).toHaveAttribute('href', `/it?at=${t.name}`);
+    await expect(svg.locator(`[data-station="${t.name}"]`)).toHaveAttribute('href', `/it?at=${t.name}`);
   }
-  await svg.locator('.territory[data-region="publish"]').click();
+  await svg.locator('[data-station="publish"]').click();
   await expect(page).toHaveURL(/\/it\?at=publish$/);
   await expect(page.locator('section[data-map-panel]')).toHaveAttribute('data-selection', 'publish');
   await expect(page.locator('section[data-map-panel] .panel-title')).toHaveText('Publish');
@@ -259,14 +172,15 @@ test('every territory selects its own region, and publish opens publish — not 
 test('a territory click selects it, and its panel carries the floor with the region\'s state and why at its head', async ({ page }) => {
   await mocks(page);
   await page.goto('/it');
-  const svg = page.locator('section.yard svg');
-  await expect(svg.locator('.territory')).toHaveCount(TERRITORIES.length);
+  const svg = page.locator('section.transit svg[role="group"]');
+  await expect(svg.locator('[data-station]')).toHaveCount(TERRITORIES.length);
 
   // A troubled yard region: selected on the map, its panel carries the
   // map's own state, and the floor in it opens on the gates' entity
   // panel headed by the same verdict — the floor cannot contradict the
   // map. It is IN the panel since car N3 retired the floor pages.
-  await svg.locator('.territory[data-region="gates"]').click();
+  // The pulse changes its link bounds; click the stable painted door.
+  await svg.locator('[data-station="gates"] circle.ring').click();
   await expect(page).toHaveURL(/\/it\?at=gates$/);
   await expect(page.locator('section[data-map-panel]')).toHaveAttribute('data-state', 'troubled');
   await expect(page.locator('section[data-map-panel] a[data-floor]')).toHaveCount(0);
@@ -278,7 +192,7 @@ test('a territory click selects it, and its panel carries the floor with the reg
   await expect(head.locator('.yard-lamp-dot.err')).toHaveCount(1);
 
   // A clear region's floor says so at its head, too.
-  await page.locator('section.yard svg .territory[data-region="dock"]').click();
+  await page.locator('section.transit svg[role="group"] [data-station="dock"]').click();
   await expect(page).toHaveURL(/\/it\?at=dock$/);
   await expect(page.locator('.yard-panel-h', { hasText: 'Entity · loading dock' })).toBeVisible();
   await expect(page.locator('.yard-region-head')).toContainText('dock · clear — 3 cars parked');
@@ -286,13 +200,13 @@ test('a territory click selects it, and its panel carries the floor with the reg
   // Back returns to the previous selection — it is on the history.
   await page.goBack();
   await expect(page).toHaveURL(/\/it\?at=gates$/);
-  await expect(page.locator('section.yard svg .territory')).toHaveCount(TERRITORIES.length);
+  await expect(page.locator('section.transit svg[role="group"] [data-station]')).toHaveCount(TERRITORIES.length);
 
   // A region whose floor is a QUEUE BOARD. Its page retired on car 4
   // of design d2154293: its selection opens its board in the panel like
   // every other floor.
   await page.goto('/it');
-  await page.locator('section.yard svg .territory[data-region="receiving"]').click();
+  await page.locator('section.transit svg[role="group"] [data-station="receiving"]').click();
   await expect(page).toHaveURL(/\/it\?at=receiving$/);
   await expect(page.locator('section[data-map-panel] .ry-root')).toHaveCount(1);
 });
@@ -312,7 +226,7 @@ test('the HUD frame stands above the map, four rows, the machine cell the server
   await expect(hud.locator('.hud-age')).toHaveText(/^read \d+s ago$/);
   // Above the map: the frame comes first on the page.
   const hudTop = (await hud.boundingBox())!.y;
-  const mapTop = (await page.locator('section.yard svg').boundingBox())!.y;
+  const mapTop = (await page.locator('section.transit svg[role="group"]').boundingBox())!.y;
   expect(hudTop).toBeLessThan(mapTop);
 
   const rows = hud.locator('.hud-row');
@@ -361,119 +275,7 @@ test('a regions read that fails is said, never drawn as a clear world', async ({
   );
   await page.goto('/it');
   await expect(page.locator('.load-failed')).toContainText('The regions cannot be read');
-  await expect(page.locator('.territory')).toHaveCount(0);
-});
-
-test('a border carries its traffic, what waits on it and the machine that moves it', async ({ page }) => {
-  await mocks(page);
-  await page.goto('/it');
-  const svg = page.locator('section.yard svg');
-  // One crossing token per declared rail.
-  await expect(svg.locator('.crossing')).toHaveCount(BORDERS.length);
-
-  // The boarding rail: three waiting, a heavy traffic band from the
-  // measured rate, and the machine's lamp lit because IT declared the
-  // cadence it has been silent past.
-  const boarding = svg.locator('.crossing[data-crossing="dock→track"]');
-  await expect(boarding).toHaveAttribute('data-state', 'troubled');
-  await expect(boarding).toHaveAttribute('data-waiting', '3');
-  await expect(boarding.locator('text.token-count')).toHaveText('3');
-  await expect(boarding.locator('text.rate')).toHaveText('24/d');
-  await expect(boarding.locator('.machine-lamp.err')).toHaveCount(1);
-  await expect(svg.locator('[data-traffic="dock→track"]')).toHaveAttribute('data-density', 'heavy');
-  // BORDERS ARE DRAWN, NOT TOOLTIPPED (design 62de32ae decision 6): the
-  // machine's name and its status are WRITTEN on the rail, with no
-  // hover title standing in for them.
-  await expect(boarding.locator('text.machine-name')).toHaveText(['train-board-on-dock-', 'depth']);
-  await expect(boarding.locator('text.machine-status')).toHaveText('SILENT 180m');
-  await expect(boarding.locator('title')).toHaveCount(0);
-  // And the rail is as wide as its rate: 24 a day draws wider than 2.
-  const widthOf = async (key: string) =>
-    Number(await svg.locator(`path.rail[data-rail="${key}"]`).getAttribute('data-width'));
-  expect(await widthOf('dock→track')).toBeGreaterThan(await widthOf('gates→dock'));
-
-  // A click opens the crossing INLINE, under the map: everything the
-  // rail knows, where it can be read, touched and screenshotted.
-  await expect(page.locator('.crossing-panel')).toHaveCount(0);
-  await boarding.click();
-  const panel = page.locator('.crossing-panel[data-panel="dock→track"]');
-  await expect(panel).toBeVisible();
-  await expect(boarding).toHaveAttribute('aria-expanded', 'true');
-  await expect(panel).toContainText('a car boarded a train');
-  await expect(panel).toContainText('24 vs 18 /day');
-  await expect(panel).toContainText('fix/a-car — parked, waiting for the boarding depth');
-  await expect(panel).toContainText('train-board-on-dock-depth · SILENT 180m');
-  await expect(panel).toContainText('its own firing in cadence_firings');
-  await expect(panel).toContainText('2026-09-19 04:00 UTC · 1h ago');
-  // Three wait and the server listed one: the panel says so rather
-  // than under-reporting the queue.
-  await expect(panel).toContainText('+2 more waiting, not listed');
-  // Another rail's click swaps the panel; the same rail's closes it.
-  await svg.locator('.crossing[data-crossing="gates→dock"]').click();
-  await expect(page.locator('.crossing-panel[data-panel="gates→dock"]')).toBeVisible();
-  await expect(panel).toHaveCount(0);
-  await svg.locator('.crossing[data-crossing="gates→dock"]').click();
-  await expect(page.locator('.crossing-panel')).toHaveCount(0);
-
-  // The client-side sum of these rails is retired (design 00774ca8
-  // decision 10): the whole-system figures are the HUD frame's.
-  await expect(page.locator('.yard-flow', { hasText: 'crossings in' })).toHaveCount(0);
-});
-
-// Backlog bd506215: a narrowed scope is refused the machines' firing
-// records (`machines_withheld`, 0964ba80); the border's machine says so
-// in `why`. The rail used to write "no firing recorded" under a broken
-// "cannot tell" lamp — a finding about the machine made of a refusal.
-test('a machine whose firing record is withheld by policy scope reads not in your policy scope, on a whole neutral lamp', async ({ page }) => {
-  const withheld = {
-    ...BORDERS_PAYLOAD,
-    borders: BORDERS_PAYLOAD.borders.map((b) =>
-      b.from === 'dock' && b.to === 'track'
-        ? {
-            ...b,
-            machine: { name: 'train-board-on-dock-depth', kind: 'cadence', last_fired: null,
-              silent_for_minutes: null, expected_every_minutes: null, silent: null,
-              why: "the firing record is withheld: this caller's policy scope does not read every packet",
-              // The server's flag is what the rail reads (1805bac0).
-              withheld: true },
-          }
-        : b,
-    ),
-  };
-  await installSmokeMocks(page);
-  const json = (r: Route, b: unknown) =>
-    r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(b) });
-  await page.route(YARD_REGIONS, (r) => json(r, REGIONS));
-  await page.route(YARD_BORDERS, (r) => json(r, withheld));
-  await page.goto('/it');
-  const boarding = page.locator('section.yard svg .crossing[data-crossing="dock→track"]');
-  await expect(boarding.locator('text.machine-status')).toHaveText('not in your policy scope');
-  await expect(boarding.locator('.machine-lamp.scope')).toHaveCount(1);
-  await expect(boarding.locator('.machine-lamp.unknown, .machine-lamp.err')).toHaveCount(0);
-});
-
-test('a border the server could not measure reads unknown, never zero', async ({ page }) => {
-  await mocks(page);
-  await page.goto('/it');
-  const svg = page.locator('section.yard svg');
-  const blind = svg.locator('.crossing[data-crossing="receiving→marshalling"]');
-  await expect(blind).toHaveAttribute('data-waiting', 'unknown');
-  // The token prints `?` and the rate prints `?` — no zero anywhere on
-  // the rail, and the traffic band is its own, not the empty one.
-  await expect(blind.locator('text.token-count')).toHaveText('?');
-  await expect(blind.locator('text.rate')).toHaveText('?');
-  await expect(svg.locator('[data-traffic="receiving→marshalling"]')).toHaveAttribute(
-    'data-density',
-    'unknown',
-  );
-  // Opened, the crossing says the same: no reading, and which read
-  // failed — never a zero.
-  await blind.click();
-  const panel = page.locator('.crossing-panel[data-panel="receiving→marshalling"]');
-  await expect(panel).toContainText('the workflow registry that names the inbound kinds could not be read');
-  await expect(panel.locator('dd').nth(1)).toHaveText('no reading');
-  await expect(panel).toContainText('waiting: no reading');
-  await expect(panel).toContainText('nothing crossed in the two windows read');
+  await expect(page.locator('[data-station]')).toHaveCount(0);
 });
 
 test('a borders read that fails is said, and the territories still paint', async ({ page }) => {
@@ -490,8 +292,8 @@ test('a borders read that fails is said, and the territories still paint', async
   // border the server answered (car R3 of design e765b3fc), so with the
   // read out none is drawn — the failure line says why, and no rail is
   // guessed in its place.
-  await expect(page.locator('section.yard svg .territory')).toHaveCount(TERRITORIES.length);
-  await expect(page.locator('section.yard svg .crossing')).toHaveCount(0);
+  await expect(page.locator('section.transit svg[role="group"] [data-station]')).toHaveCount(TERRITORIES.length);
+  await expect(page.locator('section.transit svg[role="group"] [data-section][data-ground="unknown"]')).not.toHaveCount(0);
 });
 
 // An older server remains an unread source, never a healthy zero.
@@ -502,10 +304,34 @@ test('a partial regions payload retains missing Sensors once with the desktop un
     thirds: REGIONS.thirds.map((third) => ({ ...third, regions: third.regions.filter((name) => name !== 'sensors') })),
   }) }));
   await page.goto('/it');
-  const sensors = page.locator('section.yard svg .territory[data-region="sensors"]');
+  const sensors = page.locator('section.transit svg[role="group"] [data-station="sensors"]');
   await expect(sensors).toHaveCount(1);
   await expect(sensors).toHaveAttribute('data-state', 'troubled');
-  await expect(sensors.locator('text.count')).toHaveText('no reading');
-  await expect(sensors.locator('title').first()).toContainText('the server answered no reading for this region');
-  await expect(page.locator('section.yard svg .territory')).toHaveCount(REGION_NAMES.length);
+  await expect(sensors.locator('title').first()).toContainText('no reading');
+  await expect(page.locator('section.transit svg[role="group"] [data-station]')).toHaveCount(REGION_NAMES.length);
+});
+
+test('withheld firing evidence stays a scope refusal in the section panel', async ({ page }) => {
+  await mocks(page);
+  await page.route(YARD_BORDERS, (r) => r.fulfill({ json: {
+    ...BORDERS_PAYLOAD,
+    borders: BORDERS_PAYLOAD.borders.map((b) => b.from === 'dock' && b.to === 'track' ? {
+      ...b,
+      machine: { ...(typeof b.machine === 'object' && b.machine !== null ? b.machine : {}), withheld: true, last_fired: null, silent: null,
+        why: 'the firing record is withheld from this caller' },
+    } : b),
+  } }));
+  await page.goto('/it?at=dock-%3Etrack');
+  const machines = page.locator('[data-map-panel] [data-field="machines"]');
+  await expect(machines).toContainText('not in your policy scope');
+  await expect(machines).toContainText('the firing record is withheld from this caller');
+});
+
+test('an unread section keeps its reason and never becomes a zero in the panel', async ({ page }) => {
+  await mocks(page);
+  await page.goto('/it?at=receiving-%3Emarshalling');
+  const panel = page.locator('[data-map-panel]');
+  await expect(panel.locator('[data-field="rate"]')).toContainText('no reading');
+  await expect(panel.locator('[data-field="waiting"]')).toContainText('waiting: no reading');
+  await expect(panel).toContainText('the workflow registry that names the inbound kinds could not be read');
 });

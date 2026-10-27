@@ -1,6 +1,6 @@
-//! THE TRACK: trains in transit — and the train-gate wait, one of the
-//! two client-side predicates ported here once (`yard.ts::
-//! trainGateTroubled`) and pinned against the TypeScript.
+//! THE TRACK: trains in transit — and the train-gate wait, read off the
+//! same markers and the same hold as `yard.ts::trainGateTroubled`, which
+//! the tests below pin against the TypeScript.
 
 use super::*;
 
@@ -19,6 +19,21 @@ pub const TRAIN_GATE_FALLBACK: &str = "train_gate_fallback";
 /// names this constant), and a relaunched train's wait is dated from it.
 pub const TRAIN_GATE_LAUNCHED_AT: &str = "train_gate_launched_at";
 
+/// The train's PLACE in the gate line (design 1e787fc2): set only by the
+/// bound refusal, or by a gate-run that ended owed a relaunch, and
+/// cleared by every other launch outcome (backlog 82071657). The
+/// conductor writes it (`boss-cli/src/train_gate.rs::KEY_BOUND_WAIT`
+/// names this constant); it is the one marker a wait for a bay is read
+/// by, because [`TRAIN_GATE_WAIT_REASON`] is written on EVERY failed
+/// launch (review a2ace778 of car 1585a455).
+pub const TRAIN_GATE_BOUND_WAIT: &str = "train_gate_bound_wait";
+
+/// Each gate-run that ended without a usable verdict, `{gate_run, why,
+/// at}`, appended by the conductor as it owes the train a relaunch
+/// (`boss-cli/src/train_gate.rs::KEY_REFUSALS` names this constant). A
+/// relaunch's wait is dated from the latest `at` (review a2ace778).
+pub const TRAIN_GATE_REFUSALS: &str = "train_gate_refusals";
+
 /// HOW LONG A TRAIN MAY WAIT FOR A BAY BEFORE THE WAIT IS TROUBLE — ONE
 /// number, the waiting band's own hold (backlog 19227ca8). Since design
 /// 1e787fc2 (0f4224bc, train #1051) a train at a full bound holds the
@@ -30,44 +45,67 @@ pub const TRAIN_GATE_LAUNCHED_AT: &str = "train_gate_launched_at";
 pub const TRAIN_GATE_WAIT_MINUTES: i64 = bands::TRACK_GATE_WAITING.hold_minutes;
 
 /// WHEN A TRAIN BEGAN WAITING FOR ITS GATE, from what the record holds:
-/// the later of its PR opening (the `pr` step, when the conductor first
-/// asks for a gate) and its last gate launch (a relaunch after a lost or
-/// refused run waits again). The marker itself carries no stamp, so this
-/// is a LOWER bound on the true onset — it can only say a wait began
-/// earlier than it did, never hide one. `None` when neither is recorded.
-/// `yard.ts::readTrainGate`'s `wait_since` reads the same two facts.
+/// the latest of its PR opening (the `pr` step, when the conductor first
+/// asks for a gate), its last gate launch, and its last refusal (a
+/// gate-run that ended without a usable verdict owes the train a
+/// relaunch, and the wait for it begins there — dated from the launch
+/// before, a one-minute wait read as trouble at once, review a2ace778).
+/// The marker itself carries no stamp, so this is a LOWER bound on the
+/// true onset — it can only say a wait began earlier than it did, never
+/// hide one. `None` when none is recorded. Only a COMPLETED step and an
+/// RFC3339 stamp count; `yard.ts::readTrainGate`'s `wait_since` reads the
+/// same three facts by the same two rules.
 pub fn train_gate_wait_since(md: &Value, steps: &[Step]) -> Option<chrono::DateTime<chrono::Utc>> {
     let pr = step_done_at(find_step(steps, "pr", "Open the batched PR"));
     let launched = meta_instant(md, TRAIN_GATE_LAUNCHED_AT);
-    pr.max(launched)
+    let refused = md
+        .get(TRAIN_GATE_REFUSALS)
+        .and_then(Value::as_array)
+        .and_then(|rs| rs.iter().filter_map(|r| meta_instant(r, "at")).max());
+    pr.max(launched).max(refused)
 }
 
-/// `yard.ts::trainGateTroubled`, ported: a train whose gate could not
-/// be filed (fallback) wears the yard's trouble style at once; one
-/// still waiting for a bay (wait reason) wears it only once the wait
-/// has held [`TRAIN_GATE_WAIT_MINUTES`] — and at once when the record
-/// holds no onset, as `settle` states a condition with none. A blank
-/// string is no marker, as `readTrainGate`'s `text()` reads it.
-pub fn train_gate_troubled(
-    md: &Value,
-    waiting_since: Option<chrono::DateTime<chrono::Utc>>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    if !md_str(md, TRAIN_GATE_FALLBACK).is_empty() {
-        return true;
+/// WHY A TRAIN'S GATE IS NOT FILED, as its markers say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateUnfiled {
+    /// The gate could not be filed and CI alone judged the train.
+    Fallback,
+    /// The train holds its place in the gate line ([`TRAIN_GATE_BOUND_WAIT`]).
+    AtBound,
+    /// A launch failed for any other reason.
+    LaunchFailing,
+}
+
+/// [`GateUnfiled`], read off a train's metadata, in that order: the
+/// fallback outranks everything; the place in line ([`TRAIN_GATE_BOUND_WAIT`])
+/// is the ONE marker of a wait for a bay; a wait reason with no place or
+/// bound run is a launch that failed for some other reason. An uncertain
+/// CREATE retains its reason beside the run already filed, so that reason
+/// alone cannot say the gate is unfiled (review 0e73d943). Keyed on the reason alone,
+/// as it was, every failed launch read as a wait (review a2ace778 of car
+/// 1585a455). A blank string is no marker, as `readTrainGate`'s `text()`
+/// reads it; `yard.ts::trainGateTroubled` reads the same three in the
+/// same order.
+pub fn train_gate_unfiled(md: &Value) -> Option<GateUnfiled> {
+    let said = |k: &str| !md_str(md, k).is_empty();
+    if said(TRAIN_GATE_FALLBACK) {
+        Some(GateUnfiled::Fallback)
+    } else if said(TRAIN_GATE_BOUND_WAIT) {
+        Some(GateUnfiled::AtBound)
+    } else if said(TRAIN_GATE_WAIT_REASON) && !said("train_gate_run") {
+        Some(GateUnfiled::LaunchFailing)
+    } else {
+        None
     }
-    if md_str(md, TRAIN_GATE_WAIT_REASON).is_empty() {
-        return false;
-    }
-    waiting_since.is_none_or(|s| (now - s).num_minutes() >= TRAIN_GATE_WAIT_MINUTES)
 }
 
 /// WHAT A TRAIN'S OWN TROUBLE SAYS, judged in the region the train
 /// STANDS in (design e765b3fc §2a, car R1): a block the yard names
 /// (`TrainStatus::block` — a red PR, a deploy refusal, a converge
 /// overdue, a stall past the policy), a train judged by CI alone, a
-/// train gate the conductor is still retrying against the bound
-/// ([`train_gate_troubled`]). A red PR is a train at the gates, a deploy
+/// train gate whose launch is failing, a train gate the conductor is
+/// still retrying against the bound ([`train_gate_unfiled`] tells the
+/// last three apart). A red PR is a train at the gates, a deploy
 /// refusal one on the track; a troubled packet must look troubled where
 /// it is drawn, not in the region it used to be counted in.
 pub(super) fn train_findings(
@@ -88,14 +126,20 @@ pub(super) fn train_findings(
         .collect();
     // Every train still waiting for a bay, with when its wait began: the
     // finding carries the OLDEST onset, so `settle` holds it for the
-    // band's period — the same [`TRAIN_GATE_WAIT_MINUTES`] the one-train
-    // predicate [`train_gate_troubled`] judges by — and a wait inside it
-    // is said as `settling`, not drawn (backlog 19227ca8). One train
+    // band's period — the same [`TRAIN_GATE_WAIT_MINUTES`] the yard's
+    // `trainGateTroubled` judges by — and a wait inside it is said as
+    // `settling`, not drawn (backlog 19227ca8). This settle is the ONE
+    // place the Rust side judges that hold: the one-train port of the
+    // predicate it replaced had no production caller (review a2ace778,
+    // finding 4) and was deleted rather than kept beside it. One train
     // whose onset the record does not hold makes the onset unknown,
     // stated at once rather than guessed.
-    let gate_waits: Vec<(&str, Option<Instant>)> = trains
-        .iter()
-        .filter(|(j, _)| !md_str(&j.metadata, TRAIN_GATE_WAIT_REASON).is_empty())
+    let unfiled = |want: GateUnfiled| {
+        trains
+            .iter()
+            .filter(move |(j, _)| train_gate_unfiled(&j.metadata) == Some(want))
+    };
+    let waiting: Vec<(&str, Option<Instant>)> = unfiled(GateUnfiled::AtBound)
         .map(|(j, s)| (j.title.as_str(), train_gate_wait_since(&j.metadata, s)))
         .collect();
     let mut findings = Vec::new();
@@ -119,12 +163,10 @@ pub(super) fn train_findings(
             format!("blocked: {}", blocked.join(", ")),
         ));
     }
-    // The two gate markers, split by what they mean (decision 1): CI
-    // alone judged the train — degraded, ours — is trouble; a gate the
+    // The gate markers, split by what they mean (decision 1): CI alone
+    // judged the train — degraded, ours — is trouble; a gate the
     // conductor is still retrying against the bound is a wait to watch.
-    let fallback: Vec<&str> = trains
-        .iter()
-        .filter(|(j, _)| !md_str(&j.metadata, TRAIN_GATE_FALLBACK).is_empty())
+    let fallback: Vec<&str> = unfiled(GateUnfiled::Fallback)
         .map(|(j, _)| j.title.as_str())
         .collect();
     if !fallback.is_empty() {
@@ -138,10 +180,28 @@ pub(super) fn train_findings(
             ),
         ));
     }
-    let waiting: Vec<(&str, Option<Instant>)> = gate_waits
-        .into_iter()
-        .filter(|(t, _)| !fallback.contains(t))
+    // A launch that failed for any reason but the bound holds no place in
+    // the line and waits for nothing a bay will bring, so it settles for
+    // nothing: trouble the pass it is recorded (review a2ace778 of car
+    // 1585a455 — keyed on the reason, a missing manifest read `settling`
+    // for ten minutes).
+    let failing: Vec<String> = unfiled(GateUnfiled::LaunchFailing)
+        .map(|(j, _)| {
+            format!(
+                "{} ({})",
+                j.title,
+                md_str(&j.metadata, TRAIN_GATE_WAIT_REASON)
+            )
+        })
         .collect();
+    if !failing.is_empty() {
+        findings.push(Finding::new(
+            bands::TRACK_GATE_LAUNCH_FAILING,
+            None,
+            String::new(),
+            format!("gate cannot be filed: {}", failing.join(", ")),
+        ));
+    }
     if !waiting.is_empty() {
         let since = waiting
             .iter()
@@ -356,10 +416,14 @@ mod tests {
             track.why
         );
 
-        // CI still pending, and the conductor waiting to file the gate.
+        // CI still pending, and the conductor waiting to file the gate:
+        // the bound refusal writes both keys (conductor.rs).
         let waiting = under_test(
             "train #471",
-            json!({ TRAIN_GATE_WAIT_REASON: "bound: 3 running" }),
+            json!({
+                TRAIN_GATE_WAIT_REASON: "bound: 3 running",
+                TRAIN_GATE_BOUND_WAIT: "bound: 3 running",
+            }),
             StepStatus::Ready,
         );
         let out = read(std::slice::from_ref(&waiting), &[]);
@@ -387,16 +451,163 @@ mod tests {
         assert_eq!(gates.state, RegionState::Troubled, "{}", gates.why);
         assert!(gates.why.contains("judged by CI alone"), "{}", gates.why);
         // A blank marker is no marker (yard.ts `text()`).
-        assert!(!train_gate_troubled(
-            &json!({ TRAIN_GATE_WAIT_REASON: "" }),
-            None,
-            t(NOW)
-        ));
-        assert!(train_gate_troubled(
-            &json!({ TRAIN_GATE_FALLBACK: "CI alone" }),
-            Some(t(NOW)),
-            t(NOW)
-        ));
+        assert_eq!(
+            train_gate_unfiled(&json!({
+                TRAIN_GATE_WAIT_REASON: "",
+                TRAIN_GATE_BOUND_WAIT: "",
+            })),
+            None
+        );
+        assert_eq!(
+            train_gate_unfiled(&json!({
+                TRAIN_GATE_FALLBACK: "CI alone",
+                TRAIN_GATE_BOUND_WAIT: "bound",
+            })),
+            Some(GateUnfiled::Fallback)
+        );
+    }
+
+    /// An uncertain native CREATE can leave its reason beside the run
+    /// the conductor already bound (ae37ab73 / edf2146e, review 0e73d943).
+    /// A diagnostic about that CREATE is not an unfiled gate.
+    #[test]
+    fn a_filed_gate_is_not_an_unfiled_launch_when_create_was_uncertain() {
+        let run = "815e87cb";
+        let why = format!(
+            "native Job at the immutable name does not match the recorded launch \
+             (gate-run {run} was filed first; inspect its recorded outcome)"
+        );
+        let filed = under_test(
+            "train with an uncertain CREATE",
+            json!({
+                "train_gate_run": run,
+                TRAIN_GATE_WAIT_REASON: why,
+            }),
+            StepStatus::Ready,
+        );
+        assert_eq!(train_gate_unfiled(&filed.0.metadata), None);
+        let out = read(std::slice::from_ref(&filed), &[]);
+        let gates = by_name(&out, "gates");
+        assert_ne!(
+            gates.band.as_ref().map(|band| band.id.as_str()),
+            Some("track-gate-launch-failing"),
+            "{}",
+            gates.why
+        );
+        assert!(!gates.why.contains("gate cannot be filed"), "{}", gates.why);
+        assert_eq!(md_str(&filed.0.metadata, TRAIN_GATE_WAIT_REASON), why);
+    }
+
+    /// ONLY THE BOUND REFUSAL SETTLES (review a2ace778 of car 1585a455,
+    /// finding 1). The conductor writes `train_gate_wait_reason` on EVERY
+    /// failed launch — a manifest that does not render, kubectl, RBAC, a
+    /// recovery hold — and `train_gate_bound_wait` only when the bound
+    /// refused it (backlog 82071657). Keyed on the reason, a broken launch
+    /// read `settling` for ten minutes; keyed on the place in line, it is
+    /// trouble the pass it happens, however recent the launch.
+    #[test]
+    fn a_failed_launch_is_trouble_at_once_and_only_the_bound_refusal_settles() {
+        let fault = "rendering the runner manifest: /opt/boss/infra/gate-runner/gate-runner.yaml: \
+                     No such file or directory";
+        let broken = under_test(
+            "train #476",
+            json!({
+                TRAIN_GATE_WAIT_REASON: fault,
+                "train_gate_launch_failures": 1,
+                TRAIN_GATE_LAUNCHED_AT: "2026-09-19T11:59:00Z",
+            }),
+            StepStatus::Ready,
+        );
+        assert_eq!(
+            train_gate_unfiled(&broken.0.metadata),
+            Some(GateUnfiled::LaunchFailing)
+        );
+        let out = read(std::slice::from_ref(&broken), &[]);
+        let gates = by_name(&out, "gates");
+        assert_eq!(gates.state, RegionState::Troubled, "{}", gates.why);
+        assert_eq!(
+            gates.band.as_ref().map(|b| b.id.as_str()),
+            Some("track-gate-launch-failing")
+        );
+        assert!(
+            gates
+                .why
+                .contains(&format!("gate cannot be filed: train #476 ({fault})")),
+            "{}",
+            gates.why
+        );
+        assert!(!gates.why.contains("settling"), "{}", gates.why);
+
+        // The same minute-old launch refused at the bound: settling.
+        let why = "the cluster is at its gate bound (3 running of 3: a, b, c)";
+        let mut at_bound = broken;
+        at_bound.0.metadata = json!({
+            TRAIN_GATE_WAIT_REASON: why,
+            TRAIN_GATE_BOUND_WAIT: why,
+            TRAIN_GATE_LAUNCHED_AT: "2026-09-19T11:59:00Z",
+        });
+        assert_eq!(
+            train_gate_unfiled(&at_bound.0.metadata),
+            Some(GateUnfiled::AtBound)
+        );
+        let out = read(std::slice::from_ref(&at_bound), &[]);
+        let gates = by_name(&out, "gates");
+        assert_eq!(gates.state, RegionState::Clear, "{}", gates.why);
+        assert!(gates.why.contains("settling"), "{}", gates.why);
+    }
+
+    /// A RELAUNCH WAITS FROM ITS REFUSAL (review a2ace778, finding 2).
+    /// A gate-run that ends without a usable verdict is recorded in
+    /// `train_gate_refusals` with its `at`, and the train takes the first
+    /// place in line for its relaunch. Dated from the PREVIOUS launch, a
+    /// one-minute wait after a refusal read as trouble at once; the
+    /// refusal is part of the record, so the wait is dated from it too.
+    #[test]
+    fn a_relaunch_after_a_refusal_is_dated_from_the_refusal() {
+        let why = "gate-run 0123abcd ended without a usable verdict (the Job ended without a \
+                   verdict); the train holds the first place in the gate line for its relaunch";
+        let mut relaunch = under_test("train #477", json!({}), StepStatus::Ready);
+        relaunch.0.metadata = json!({
+            TRAIN_GATE_BOUND_WAIT: why,
+            TRAIN_GATE_LAUNCHED_AT: "2026-09-19T11:20:00Z",
+            TRAIN_GATE_REFUSALS: [
+                { "gate_run": "0123abcd", "why": "the Job ended", "at": "2026-09-19T11:40:00Z" },
+                { "gate_run": "4567ef01", "why": "the Job ended", "at": "2026-09-19T11:57:00Z" },
+                { "gate_run": "garbled", "at": "yesterday" },
+            ],
+        });
+        assert_eq!(
+            train_gate_wait_since(&relaunch.0.metadata, &relaunch.1),
+            Some(t("2026-09-19T11:57:00Z"))
+        );
+        // The place in line alone — the refusal pass writes no reason —
+        // is a wait in the line, not a train with nothing to say.
+        let out = read(std::slice::from_ref(&relaunch), &[]);
+        let gates = by_name(&out, "gates");
+        assert_eq!(gates.state, RegionState::Clear, "{}", gates.why);
+        assert!(
+            gates
+                .why
+                .contains("settling: gate not filed yet: train #477 — held 3m of the 10m"),
+            "{}",
+            gates.why
+        );
+    }
+
+    /// A STEP NOT DONE DATES NOTHING, and a stamp is RFC3339 or nothing
+    /// (review a2ace778, finding 3): `step_done_at` reads only a
+    /// completed step, and `parse_instant` only RFC3339 — the yard's
+    /// `readTrainGate` is held to both by the TypeScript's own test.
+    #[test]
+    fn a_wait_is_dated_only_from_a_completed_step_and_a_strict_stamp() {
+        let mut train = under_test("train #478", json!({}), StepStatus::Ready);
+        for s in &mut train.1 {
+            if s.spec_slug.as_deref() == Some("pr") {
+                s.status = StepStatus::Active;
+            }
+        }
+        train.0.metadata = json!({ TRAIN_GATE_LAUNCHED_AT: "2026-09-19" });
+        assert_eq!(train_gate_wait_since(&train.0.metadata, &train.1), None);
     }
 
     /// A TRAIN BRIEFLY WAITING FOR A BAY IS NOT TROUBLE (backlog
@@ -411,17 +622,18 @@ mod tests {
     fn a_train_briefly_waiting_for_a_bay_is_settling_not_trouble() {
         let why = "the cluster is at its gate bound (3 running of 3: a, b, c) — the train \
                    holds the first place in the gate line and takes the next bay that frees";
-        let md = json!({ TRAIN_GATE_WAIT_REASON: why });
-        // The PR opened 11:01; at 11:05 the wait has held 4 minutes.
-        let mut short = under_test("train #475", md.clone(), StepStatus::Ready);
-        let now = t("2026-09-19T11:05:00Z");
+        let md = json!({ TRAIN_GATE_WAIT_REASON: why, TRAIN_GATE_BOUND_WAIT: why });
+        // The PR opened 11:01, and at NOW (12:00) the wait has held 59
+        // minutes: past the hold, a wait to watch.
+        let mut short = under_test("train #475", md, StepStatus::Ready);
         let since = train_gate_wait_since(&short.0.metadata, &short.1);
         assert_eq!(since, Some(t("2026-09-19T11:01:00Z")));
-        assert!(!train_gate_troubled(&md, since, now));
-        assert!(train_gate_troubled(&md, since, t("2026-09-19T11:11:00Z")));
+        let out = read(std::slice::from_ref(&short), &[]);
+        assert_eq!(by_name(&out, "gates").state, RegionState::Attention);
         // A relaunch waits again: dated from the last launch, the later.
         short.0.metadata = json!({
             TRAIN_GATE_WAIT_REASON: why,
+            TRAIN_GATE_BOUND_WAIT: why,
             TRAIN_GATE_LAUNCHED_AT: "2026-09-19T11:56:00Z",
         });
         let out = read(std::slice::from_ref(&short), &[]);
@@ -445,10 +657,16 @@ mod tests {
             )),
             "yard.ts::TRAIN_GATE_WAIT_MINUTES drifted from track.rs::TRAIN_GATE_WAIT_MINUTES"
         );
-        assert!(
-            yard.contains(&format!("md.{TRAIN_GATE_LAUNCHED_AT}")),
-            "yard.ts no longer dates a wait from {TRAIN_GATE_LAUNCHED_AT}"
-        );
+        for key in [
+            TRAIN_GATE_LAUNCHED_AT,
+            TRAIN_GATE_REFUSALS,
+            TRAIN_GATE_BOUND_WAIT,
+        ] {
+            assert!(
+                yard.contains(&format!("md.{key}")),
+                "yard.ts no longer reads {key}, which this region judges a train gate's wait by"
+            );
+        }
     }
 
     /// THE TRACK HOLDS MERGED TRAINS IN TRANSIT, and carries no capacity

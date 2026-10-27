@@ -9,11 +9,27 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA="$(cd "$HERE/.." && pwd)"
 . "$INFRA/lib/jq.sh"
 DEST="${BOSS_GCP_ROOT_TREE_TOKEN:-/etc/boss/root-tree/forge.token}"
+# EVERY REFUSAL AND EVERY FAILURE NAMES ITS OWN CHECK, AND A FAILURE SAYS
+# WHETHER THE TOKEN WAS REPLACED (backlog fd4fbe49, from review run
+# e5d18320 of car 7b2daccc, which repaired runner-credential-recv.sh the
+# same way). The fail line said only "delivery not acknowledged", yet the
+# directory sync and everything after it run once the rename has
+# installed the new forge token, so an installed but unacknowledged host
+# read like one where nothing changed; and `document`, `staging` and
+# `repository-authentication` each answered for two checks. INSTALLED
+# flips at the rename, the one act that replaces the file, and
+# gcp_root_tree_token_recv_sh.rs holds every call to a word of its own.
+# A reason is a fixed word from this file, plus an HTTP status where the
+# check is an answer — never a byte of the envelope.
 refuse() { echo "root-tree-token-recv: refused ($1); installed credential unchanged" >&2; exit 78; }
-fail() { echo "root-tree-token-recv: failed ($1); delivery not acknowledged" >&2; exit 1; }
+INSTALLED='installed credential unchanged'
+fail() { echo "root-tree-token-recv: failed ($1); $INSTALLED; delivery not acknowledged" >&2; exit 1; }
+# http_status — CODE as the digits curl wrote, or `none` when no answer came.
+CODE=""
+http_status() { local c="${CODE//[!0-9]/}"; printf '%s' "${c:-none}"; }
 [ "$#" -eq 0 ] || refuse arguments
 umask 077
-WORK="$(mktemp -d)" || fail staging
+WORK="$(mktemp -d)" || fail workdir
 TMP=""
 cleanup() { rm -rf "$WORK"; [ -z "$TMP" ] || rm -f "$TMP"; }
 trap cleanup EXIT
@@ -21,8 +37,8 @@ trap cleanup EXIT
 printf '%s\n' 'root-tree-token-recv: boss-gcp: ready for one envelope'
 timeout 10s head -c 8193 > "$WORK/input" || refuse unread
 [ "$(stat -c %s "$WORK/input")" -le 8192 ] || refuse oversize
-jq_doc_file "$WORK/input" || refuse document
-jq -s -e 'length == 1' "$WORK/input" >/dev/null 2>&1 || refuse document
+jq_doc_file "$WORK/input" || refuse envelope-not-a-document
+jq -s -e 'length == 1' "$WORK/input" >/dev/null 2>&1 || refuse not-one-document
 jq -n --stream -e 'reduce inputs as $r ([]; if ($r|length)==2 then .+[$r[0]] else . end) | group_by(.) | all(length == 1)' "$WORK/input" >/dev/null 2>&1 || refuse duplicate-key
 jq -e '
   def uuid: type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
@@ -58,7 +74,7 @@ while :; do
     [ "$CURSOR" != / ] || break
     CURSOR="$(dirname "$CURSOR")"
 done
-TMP="$(mktemp "$DIR/.forge.token.XXXXXX")" || fail staging
+TMP="$(mktemp "$DIR/.forge.token.XXXXXX")" || fail staging-file
 jq -jr .value "$WORK/input" > "$TMP" 2>/dev/null || refuse value
 chmod 0600 "$TMP" || fail staging-mode
 # A public git read may succeed without presenting any credential. Require
@@ -70,8 +86,8 @@ secret_header FORGE_HEADER "Authorization: token $VALUE" || fail authentication-
 unset VALUE
 CODE="$(curl --noproxy '*' --max-time 30 --max-redirs 0 --proto '=http,https' \
     -sS -H "$FORGE_HEADER" -o "$WORK/repository" -w '%{http_code}' \
-    "$BOSS_FORGE_URL/api/v1/repos/david/boss" 2> "$WORK/auth-error")" || fail repository-authentication
-[ "$CODE" = 200 ] || fail repository-authentication
+    "$BOSS_FORGE_URL/api/v1/repos/david/boss" 2> "$WORK/auth-error")" || fail repository-unreachable
+[ "$CODE" = 200 ] || fail "repository-authentication-http-$(http_status)"
 jq -s -e 'length == 1 and .[0].full_name == "david/boss"' \
     "$WORK/repository" >/dev/null 2>&1 || fail repository-identity
 # Prove the exact staged file through the existing target-restricting helper.
@@ -88,11 +104,15 @@ grep -Eq '^[0-9a-f]{40}[[:space:]]refs/heads/main$' "$WORK/refs" || fail reposit
 sync -f "$TMP" || fail file-sync
 mv -fT "$TMP" "$DEST" || fail installation
 TMP=""
+INSTALLED='the delivered credential IS installed'
 sync -f "$DIR" || fail directory-sync
 # Sender compares this value-free receipt to its bound Secret and re-reads
 # that Secret before the shared Forgejo delivered-step door may record it.
-DIGEST="$(sha256sum "$DEST")"
+# Each of these ran bare under set -e, so a failure here ended the
+# receiver with the token installed and no line at all (fd4fbe49).
+DIGEST="$(sha256sum "$DEST")" || fail installed-digest
 DIGEST="${DIGEST%% *}"
-LENGTH="$(stat -c %s "$DEST")"
+LENGTH="$(stat -c %s "$DEST")" || fail installed-length
 jq -c --arg digest "$DIGEST" --argjson length "$LENGTH" \
-    'del(.value) + {installed:true,value_sha256:$digest,value_length:$length}' "$WORK/input"
+    'del(.value) + {installed:true,value_sha256:$digest,value_length:$length}' "$WORK/input" \
+    || fail receipt-unwritten

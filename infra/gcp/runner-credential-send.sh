@@ -287,6 +287,18 @@ if [ "$MODE" = verify ]; then
         || red receiver "boss-gcp's receiver greeted and was handed no byte, and did not refuse the empty envelope in its own words (ssh exit $src: $(why)) — the program behind the key is not the receiver this tree installs"
     EFFECT="Verified by effect at $NOW by the forge's runner credential sender (infra/gcp/runner-credential-send.sh, run by forge-converge through infra/forge/runner-credential-push.sh). With the transport key this packet prepared (its public half is the one on the completed install step), against boss-gcp's pinned host key, the account $ACCOUNT at $HOST answered first with the runner receiver's greeting '$GREETING', was handed no byte, and refused the empty envelope in the receiver's own words ('$EMPTY_REFUSAL', exit 65). Nothing was delivered: Secret boss/ops-runner-credential stages no boss-gcp.next."
 else
+    # GREETED, SENT, AND REFUSED IN ITS OWN WORDS (backlog 3f7d5f23, (c);
+    # review 34f8448c of car 2c628718). The receiver checked the envelope
+    # and refused it (exit 65, `refused (<check>)`): every pass sends the
+    # same envelope and meets the same refusal until a person reads which
+    # check refused, so it is RED on its own route — as a plain `fail` it
+    # redded every converge and filed nothing. The receiver names a fixed
+    # check word and never a byte of the envelope. Any other end (a
+    # transport that dropped, a receiver that failed after a refusal it
+    # did not name) stays a failure the next pass may clear.
+    if [ "$src" -eq 65 ] && grep -q '^runner-credential-recv: refused (' "$WORK/ssh-error"; then
+        red envelope-refused "boss-gcp's receiver greeted, was sent the envelope for rotation packet $JOB, and refused it in its own words ($(why)); boss-gcp holds the runner credential it held, and every pass sends the same envelope until a person reads that refusal"
+    fi
     [ "$src" -eq 0 ] || fail "the receiver greeted, was sent the envelope, and did not end cleanly (ssh exit $src): $(why)"
     # The greeting is the first line; the receipt is everything after it.
     jq_doc_file "$WORK/receipt" || fail 'the receiver answered with no single receipt'

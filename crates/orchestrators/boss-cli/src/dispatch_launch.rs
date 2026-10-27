@@ -1057,6 +1057,36 @@ pub(crate) async fn run_at(
     request: &Request,
     env: &(dyn Fn(&str) -> Option<OsString> + Sync),
 ) -> Result<Value> {
+    run_with_workers_at(
+        http,
+        base,
+        repo,
+        actor,
+        run_id,
+        prompt,
+        settings,
+        plan,
+        request,
+        env,
+        &crate::dispatch_worker::Published,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_with_workers_at(
+    http: &crate::machine_http::MachineClient,
+    base: &str,
+    repo: &Path,
+    actor: &str,
+    run_id: &str,
+    prompt: &str,
+    settings: &crate::dispatch::Settings,
+    plan: &Plan,
+    request: &Request,
+    env: &(dyn Fn(&str) -> Option<OsString> + Sync),
+    workers: &dyn crate::dispatch_worker::Workers,
+) -> Result<Value> {
     if plan.harness.launch == crate::harness::Launch::Cluster {
         return crate::launch_cluster::launch_at(
             http, base, actor, run_id, prompt, settings, plan, request,
@@ -1091,7 +1121,7 @@ pub(crate) async fn run_at(
         Ok(stops) => stops,
         Err(e) => {
             ending.spawn_error = Some(format!("the verb could not listen for its own stop: {e}"));
-            return finish(&api, run_id, receipt, &ending, None, settings).await;
+            return finish(&api, run_id, receipt, &ending, None, settings, workers).await;
         }
     };
     let prepared: Result<(PathBuf, PathBuf, PathBuf, PathBuf)> = async {
@@ -1165,9 +1195,36 @@ pub(crate) async fn run_at(
         Ok(p) => p,
         Err(e) => {
             ending.spawn_error = Some(format!("{e:#}"));
-            return finish(&api, run_id, receipt, &ending, None, settings).await;
+            return finish(&api, run_id, receipt, &ending, None, settings, workers).await;
         }
     };
+    // Only a profile whose lane builds source needs a worker. A read-only
+    // launch remains usable when the worker allocation is full.
+    let worker = match crate::dispatch::Isolation::for_profile(repo, &settings.profile) {
+        Ok(crate::dispatch::Isolation::Worktree) => workers.ensure(run_id, &worktree).await,
+        Ok(crate::dispatch::Isolation::Shared) => Ok(None),
+        Err(error) => Err(error),
+    };
+    match worker {
+        Ok(Some(worker)) => {
+            receipt[crate::dispatch_worker::KEY] = worker.clone();
+            if let Err(error) = api(
+                reqwest::Method::PATCH,
+                format!("/api/jobs/{run_id}/metadata"),
+                Some(json!({crate::dispatch_worker::KEY:worker})),
+            )
+            .await
+            {
+                ending.spawn_error = Some(format!("recording run worker ownership: {error:#}"));
+                return finish(&api, run_id, receipt, &ending, None, settings, workers).await;
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            ending.spawn_error = Some(format!("{error:#}"));
+            return finish(&api, run_id, receipt, &ending, None, settings, workers).await;
+        }
+    }
     let argv = plan
         .harness
         .argv_for(&settings.model, &settings.effort, &plan.sandbox, &last);
@@ -1214,7 +1271,7 @@ pub(crate) async fn run_at(
         Ok(o) => o,
         Err(e) => {
             ending.spawn_error = Some(format!("{e:#}"));
-            return finish(&api, run_id, receipt, &ending, None, settings).await;
+            return finish(&api, run_id, receipt, &ending, None, settings, workers).await;
         }
     };
     // THE MODEL IT STARTS, AS A FIRST RECORD, BEFORE THE PROCESS EXISTS
@@ -1273,7 +1330,7 @@ pub(crate) async fn run_at(
         Ok(c) => c,
         Err(e) => {
             ending.spawn_error = Some(e.to_string());
-            return finish(&api, run_id, receipt, &ending, None, settings).await;
+            return finish(&api, run_id, receipt, &ending, None, settings, workers).await;
         }
     };
     // Read before any wait: a reaped child no longer answers its id.
@@ -1484,6 +1541,7 @@ pub(crate) async fn run_at(
         &ending,
         Some((&plan.harness, env)),
         settings,
+        workers,
     )
     .await
 }
@@ -1499,12 +1557,21 @@ async fn finish<F, Fut>(
         &(dyn Fn(&str) -> Option<OsString> + Sync),
     )>,
     settings: &crate::dispatch::Settings,
+    workers: &dyn crate::dispatch_worker::Workers,
 ) -> Result<Value>
 where
     F: Fn(reqwest::Method, String, Option<Value>) -> Fut,
     Fut: std::future::Future<Output = Result<Option<Value>>>,
 {
     let short = &run_id[..8.min(run_id.len())];
+    let retirement = match workers.stop(run_id).await {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            receipt["worker_retirement_error"] = json!(format!("{error:#}"));
+            eprintln!("boss dispatch: run {run_id} worker retirement REFUSED: {error:#}");
+            None
+        }
+    };
     let (transcript, observed) = match observed_from {
         Some((harness, env)) => observe(harness, env, ending.native.runtime.as_deref()),
         None => (None, Err("the process never started".to_string())),
@@ -1542,10 +1609,14 @@ where
         )
         .await;
     }
+    let mut metadata = json!({ RECEIPT_KEY: receipt.clone() });
+    if let Some(retirement) = retirement {
+        metadata[crate::dispatch_worker::RETIREMENT_KEY] = retirement;
+    }
     let recorded = api(
         reqwest::Method::PATCH,
         format!("/api/jobs/{run_id}/metadata"),
-        Some(json!({ RECEIPT_KEY: receipt.clone() })),
+        Some(metadata),
     )
     .await;
     say!("boss dispatch: run {short} — {line}");
@@ -1897,10 +1968,20 @@ esac
         model: Option<&str>,
         row_profile_launch: bool,
     ) -> Result<crate::dispatch::Dispatched> {
+        dispatch_in(base, world, &repo(), model, row_profile_launch).await
+    }
+
+    async fn dispatch_in(
+        base: &str,
+        world: &World,
+        source: &Path,
+        model: Option<&str>,
+        row_profile_launch: bool,
+    ) -> Result<crate::dispatch::Dispatched> {
         dispatch_to(
             &crate::sor_client::machine_client().unwrap(),
             base,
-            &repo(),
+            source,
             PACKET,
             None,
             None,
@@ -1909,6 +1990,7 @@ esac
                 ..Overrides::default()
             },
             false,
+            None,
             "claude@algedonic.dev",
             "emp-david",
             "boss-dev-0",
@@ -1932,6 +2014,191 @@ esac
             &world.coordinator_env(),
         )
         .await
+    }
+
+    struct WorkerFixture {
+        refused: bool,
+        captured_argv: PathBuf,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dispatch_worker::Workers for WorkerFixture {
+        async fn ensure(&self, run: &str, root: &Path) -> Result<Option<Value>> {
+            assert!(
+                !self.captured_argv.exists(),
+                "bind before the harness starts"
+            );
+            assert!(
+                root.join(".git").is_file(),
+                "bind after the worktree exists"
+            );
+            self.calls.lock().unwrap().push("ensure".into());
+            if self.refused {
+                bail!("full allocation refusal: retained dev-build-0123456789abcdef");
+            }
+            Ok(Some(
+                json!({"run":run,"session":"dev-build-0123456789abcdef","local_root":root}),
+            ))
+        }
+        async fn stop(&self, _: &str) -> Result<Option<Value>> {
+            self.calls.lock().unwrap().push("stop".into());
+            Ok(Some(
+                json!({"state":"local execution retired","job_delete_acknowledged":true,"job_deletion_complete":false}),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_launch_binds_before_spawn_and_retires_on_both_exit_and_refusal() {
+        for refused in [false, true] {
+            let world = World::new(&format!("dispatch-run-worker-{refused}"), "ok", 20_000);
+            // The deployed Codex row deliberately refuses builders. This
+            // fixture owns a different, committed roster for its stub CLI;
+            // no production sandbox row is widened to exercise allocation.
+            let planning = world.root.join("planning");
+            git(
+                &world.root,
+                &[
+                    "clone",
+                    "-q",
+                    "--shared",
+                    repo().to_str().unwrap(),
+                    planning.to_str().unwrap(),
+                ],
+            );
+            git(
+                &planning,
+                &["config", "user.email", "fixture@example.invalid"],
+            );
+            git(&planning, &["config", "user.name", "Fixture"]);
+            let roster = planning.join(crate::harness::DIR).join("codex-exec.toml");
+            let original = std::fs::read_to_string(&roster).unwrap();
+            assert!(!original.contains("builder ="));
+            std::fs::write(
+                &roster,
+                original.replace("[sandbox]\n", "[sandbox]\nbuilder = \"workspace-write\"\n"),
+            )
+            .unwrap();
+            git(
+                &planning,
+                &["add", "infra/platform/harnesses/codex-exec.toml"],
+            );
+            git(
+                &planning,
+                &["commit", "-qm", "Register the fixture builder sandbox"],
+            );
+            git(
+                &planning,
+                &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            );
+            roster_is_mains(&planning).unwrap();
+            let rules = world.source.join(crate::documents::path_for("builder"));
+            std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
+            std::fs::copy(planning.join(crate::documents::path_for("builder")), rules).unwrap();
+            let mut row = reviewer_row();
+            row["steps"][1]["agent"]["profile"] = json!("builder");
+            let (base, _, run) =
+                keeping_stub(packet_without_projection(), row, live_agents()).await;
+            let d = dispatch_in(&base, &world, &planning, Some("gpt-6.1-sol"), true)
+                .await
+                .unwrap();
+            let workers = WorkerFixture {
+                refused,
+                captured_argv: world.home.join("capture/argv"),
+                calls: Default::default(),
+            };
+            let result = run_with_workers_at(
+                &crate::sor_client::machine_client().unwrap(),
+                &base,
+                &world.source,
+                "claude@algedonic.dev",
+                &d.run_id,
+                &d.prompt,
+                &d.settings,
+                d.plan.as_ref().unwrap(),
+                &world.request,
+                &world.coordinator_env(),
+                &workers,
+            )
+            .await;
+            if refused {
+                let why = format!("{:#}", result.expect_err("no worker, no harness"));
+                assert!(
+                    why.contains("full allocation refusal: retained dev-build-0123456789abcdef"),
+                    "{why}"
+                );
+                assert!(!world.home.join("capture/argv").exists());
+            } else {
+                let receipt = result.unwrap();
+                assert!(world.home.join("capture/argv").is_file());
+                assert_eq!(
+                    run.lock().unwrap().as_ref().unwrap()["metadata"]["profile"],
+                    "builder"
+                );
+                assert_eq!(
+                    run.lock().unwrap().as_ref().unwrap()["metadata"]["agent"],
+                    "agent-codex"
+                );
+                assert_eq!(
+                    receipt[crate::dispatch_worker::KEY]["session"],
+                    "dev-build-0123456789abcdef"
+                );
+                assert_eq!(
+                    run.lock().unwrap().as_ref().unwrap()["metadata"][crate::dispatch_worker::KEY]
+                        ["run"],
+                    d.run_id
+                );
+                assert_eq!(
+                    run.lock().unwrap().as_ref().unwrap()["metadata"]
+                        [crate::dispatch_worker::RETIREMENT_KEY]["job_deletion_complete"],
+                    false
+                );
+            }
+            assert_eq!(*workers.calls.lock().unwrap(), ["ensure", "stop"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_launches_do_not_allocate_even_when_workers_are_full() {
+        for profile in ["reviewer", "analyst"] {
+            let world = World::new(&format!("dispatch-read-only-{profile}"), "ok", 20_000);
+            let rules = world.source.join(crate::documents::path_for(profile));
+            std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
+            std::fs::copy(repo().join(crate::documents::path_for(profile)), rules).unwrap();
+            let mut row = reviewer_row();
+            row["steps"][1]["agent"]["profile"] = json!(profile);
+            let (base, _, _) = keeping_stub(packet_without_projection(), row, live_agents()).await;
+            let d = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+                .await
+                .unwrap();
+            let workers = WorkerFixture {
+                refused: true,
+                captured_argv: world.home.join("capture/argv"),
+                calls: Default::default(),
+            };
+            let receipt = run_with_workers_at(
+                &crate::sor_client::machine_client().unwrap(),
+                &base,
+                &world.source,
+                "claude@algedonic.dev",
+                &d.run_id,
+                &d.prompt,
+                &d.settings,
+                d.plan.as_ref().unwrap(),
+                &world.request,
+                &world.coordinator_env(),
+                &workers,
+            )
+            .await
+            .unwrap();
+            assert!(
+                world.home.join("capture/argv").is_file(),
+                "{profile} did not launch"
+            );
+            assert!(receipt.get(crate::dispatch_worker::KEY).is_none());
+            assert_eq!(*workers.calls.lock().unwrap(), ["stop"], "{profile}");
+        }
     }
 
     /// (a), (b), (c) and (d) of backlog 2f7b8c00 on ONE dispatched step,
@@ -1988,13 +2255,7 @@ esac
                 receipt.get("launch_model_unrecorded").is_none(),
                 "{receipt}"
             );
-            let calls = log.calls.lock().unwrap();
-            let at = |want: &dyn Fn(&(String, String, Value)) -> bool| {
-                calls.iter().position(want).expect("the call was made")
-            };
-            let recorded = at(&|(m, p, _)| m == "POST" && p.ends_with("/metadata/records"));
-            let spawned = at(&|(m, _, b)| m == "PATCH" && b.get(PROCESS_KEY).is_some());
-            assert!(recorded < spawned, "recorded before the process existed");
+            the_model_was_recorded_before_the_process_existed(&log);
         }
 
         // (a) THE PROCESS: the argv `codex exec --help` spells, in the
@@ -2765,16 +3026,20 @@ esac
         let Some(tell) = std::env::var_os(HELPER).map(PathBuf::from) else {
             return;
         };
+        boss_testing::reexec::ready();
+        std::fs::write(tell.join("phase"), "fixture setup").unwrap();
         let mut world = World::new("dispatch-launch-verb", "hang", 60_000);
         world.request.grace = std::time::Duration::from_millis(500);
         // This process IS the verb: it takes its own stop, as the verb does.
         world.request.heed_stops = true;
         let (base, log, run) =
             keeping_stub(packet_without_projection(), reviewer_row(), live_agents()).await;
+        std::fs::write(tell.join("phase"), "fixture dispatch").unwrap();
         let d = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
             .await
             .unwrap();
         std::fs::write(tell.join("root"), world.root.to_str().unwrap()).unwrap();
+        std::fs::write(tell.join("phase"), "harness launch").unwrap();
         let out = launch(&base, &world, &d).await;
         let ended = json!({
             "error": out.err().map(|e| format!("{e:#}")),
@@ -2800,37 +3065,142 @@ esac
         tell: PathBuf,
         stderr: Stdio,
     ) -> (std::process::Child, PathBuf, PathBuf) {
-        let verb = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "dispatch_launch::tests::the_verb_in_its_own_process",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+        let mut verb = boss_testing::reexec::ReExec::new(
+            "dispatch_launch::tests::the_verb_in_its_own_process",
+        );
+        verb.command()
+            .arg("--test-threads=1")
             .env(HELPER, &tell)
             // A file, not /dev/null: dispatch refuses to print a prompt
             // into nothing (d268b260).
             .stdout(Stdio::from(
                 std::fs::File::create(tell.join("stdout")).unwrap(),
             ))
-            .stderr(stderr)
-            .spawn()
-            .unwrap();
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let root = loop {
-            assert!(
-                std::time::Instant::now() < until,
-                "the verb never launched its stub"
+            .stderr(stderr);
+        let mut verb = verb.spawn();
+        // The minute is the verb's, from its `ready()`: the start of this
+        // debug binary under gate load is the host's (backlog 7e30ddb0).
+        if let Err(status) = verb.ready() {
+            panic!(
+                "the verb ended ({status}) before it started: {}",
+                verb_readiness_evidence(&tell)
             );
+        }
+        let mut verb = verb.into_child();
+        let root = await_verb_stub(&mut verb, &tell, std::time::Duration::from_secs(60))
+            .unwrap_or_else(|why| panic!("{why}"));
+        (verb, tell, root)
+    }
+
+    fn await_verb_stub(
+        verb: &mut std::process::Child,
+        tell: &Path,
+        bound: std::time::Duration,
+    ) -> Result<PathBuf, String> {
+        let until = std::time::Instant::now() + bound;
+        loop {
+            if let Some(status) = verb.try_wait().map_err(|why| why.to_string())? {
+                return Err(format!(
+                    "the verb exited ({status}) before its stub was ready: {}",
+                    verb_readiness_evidence(tell)
+                ));
+            }
+            if std::time::Instant::now() >= until {
+                // Readiness failure must leave neither an unowned verb
+                // nor diagnostics stranded in its private fixture. The
+                // original work bound and the later kill assertions stay
+                // unchanged; this says which phase failed (96f3d50c).
+                let killed = verb.kill();
+                let reaped = verb.wait();
+                return Err(format!(
+                    "the verb's {bound:?} work watchdog expired before its stub was ready; \
+                     kill={killed:?}, reap={reaped:?}: {}",
+                    verb_readiness_evidence(tell)
+                ));
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
             if let Ok(root) = std::fs::read_to_string(tell.join("root")) {
                 let root = PathBuf::from(root);
                 if root.join("home/capture/spinning").is_file() {
-                    break root;
+                    return Ok(root);
                 }
             }
-        };
-        (verb, tell, root)
+        }
+    }
+
+    fn verb_readiness_evidence(tell: &Path) -> String {
+        ["phase", "root", "stdout", "stderr", "ended"]
+            .map(|name| match std::fs::read_to_string(tell.join(name)) {
+                Ok(text) => format!("{name}: {text}"),
+                Err(why) => format!("{name}: unread ({why})"),
+            })
+            .join("\n")
+    }
+
+    #[test]
+    fn stub_readiness_reports_an_early_exit_with_original_diagnostics() {
+        let tell = boss_testing::scratch_dir("dispatch-launch-readiness-exit");
+        std::fs::write(tell.join("phase"), "fixture dispatch").unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "printf 'original stdout'; printf 'original stderr' >&2; exit 7",
+            ])
+            .stdout(std::fs::File::create(tell.join("stdout")).unwrap())
+            .stderr(std::fs::File::create(tell.join("stderr")).unwrap())
+            .spawn()
+            .unwrap();
+        let result = await_verb_stub(&mut child, &tell, std::time::Duration::from_secs(30));
+        let _ = child.kill();
+        let _ = child.wait();
+        let why = result.unwrap_err();
+        for expected in [
+            "exited",
+            "7",
+            "fixture dispatch",
+            "original stdout",
+            "original stderr",
+        ] {
+            assert!(why.contains(expected), "missing {expected}: {why}");
+        }
+    }
+
+    #[test]
+    fn stub_readiness_reaps_a_live_verb_at_its_work_watchdog() {
+        let tell = boss_testing::scratch_dir("dispatch-launch-readiness-hang");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let result = await_verb_stub(&mut child, &tell, std::time::Duration::from_millis(100));
+        let reaped = child.try_wait().unwrap().is_some();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(result.unwrap_err().contains("work watchdog"));
+        assert!(reaped, "the failed readiness wait retained a live verb");
+    }
+
+    #[test]
+    fn stub_readiness_waits_for_a_delayed_acknowledgment() {
+        let tell = boss_testing::scratch_dir("dispatch-launch-readiness-delayed");
+        let root = tell.join("fixture");
+        let ready_root = root.clone();
+        let ready_tell = tell.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            std::fs::create_dir_all(ready_root.join("home/capture")).unwrap();
+            std::fs::write(ready_tell.join("root"), ready_root.to_str().unwrap()).unwrap();
+            std::fs::write(ready_root.join("home/capture/spinning"), "yes").unwrap();
+        });
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let result = await_verb_stub(&mut child, &tell, std::time::Duration::from_secs(30));
+        let _ = child.kill();
+        let _ = child.wait();
+        writer.join().unwrap();
+        assert_eq!(result.unwrap(), root);
     }
 
     /// Is `pid` gone within `wait`? When it is not, it is KILLED here
@@ -3080,7 +3450,7 @@ esac
     }
 
     /// What a system of record in front of the launcher does with the
-    /// SECOND metadata write — the one that carries the pid, made right
+    /// pid receipt — the metadata write that carries the pid, made right
     /// after the spawn — once it has held it for a while.
     #[derive(Clone, Copy, PartialEq)]
     enum Held {
@@ -3093,36 +3463,74 @@ esac
         DeliveredLate,
     }
 
-    /// A system of record in front of `base` whose SECOND metadata write
-    /// is held for `hold` and then `held`. Every other request passes
-    /// through untouched.
+    /// Whether `seen` — the bytes a connection has sent so far — is the
+    /// whole of the pid receipt: a metadata PATCH on the run whose body
+    /// carries [`PROCESS_KEY`]. `None` while the request is not whole
+    /// yet, so the caller looks again.
+    fn is_the_pid_receipt(seen: &[u8]) -> Option<bool> {
+        let end = seen.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let head = String::from_utf8_lossy(&seen[..end]).to_ascii_lowercase();
+        let len = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let body = seen.get(end + 4..end + 4 + len)?;
+        let patch = seen.starts_with(format!("PATCH /api/jobs/{RUN}/metadata ").as_bytes());
+        Some(
+            patch
+                && serde_json::from_slice::<Value>(body)
+                    .is_ok_and(|b| b.get(PROCESS_KEY).is_some()),
+        )
+    }
+
+    /// A system of record in front of `base` whose pid receipt — the
+    /// metadata write carrying [`PROCESS_KEY`], made right after the
+    /// spawn — is held for `hold` and then `held`. Every other request
+    /// passes through untouched.
+    ///
+    /// EACH CONNECTION IN A TASK OF ITS OWN, LOOKED AT FOR A BOUNDED TIME
+    /// (review 34b016b6, B1). This accepted one connection at a time and
+    /// peeked each with no bound before accepting the next, so a pid
+    /// receipt connection that was open but had sent nothing — the turn
+    /// ended before hyper wrote the request, and the launch dropped it —
+    /// held the accept loop for good: the ending's PATCH was never
+    /// accepted and, on a client with no timeout, the test hung (1 of
+    /// 168 parallel module runs past 300 s; one idle connection hung it
+    /// every time). It also took "the second metadata PATCH" for the pid
+    /// receipt; the body is what says so. The stub behind it answers
+    /// `connection: close`, so one connection is one request.
     async fn stalling_the_pid_receipt(base: &str, hold: std::time::Duration, held: Held) -> String {
         let upstream = base.trim_start_matches("http://").to_string();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let receipt = format!("PATCH /api/jobs/{RUN}/metadata ");
         tokio::spawn(async move {
-            let mut receipts = 0;
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     break;
                 };
-                // The request line, looked at and left in the socket.
-                let mut head = [0u8; 256];
-                let mut seen = 0;
-                for _ in 0..400 {
-                    seen = sock.peek(&mut head).await.unwrap_or(0);
-                    if seen == 0 || head[..seen].contains(&b'\n') {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                if head[..seen].starts_with(receipt.as_bytes()) {
-                    receipts += 1;
-                }
-                let stall = receipts == 2 && head[..seen].starts_with(receipt.as_bytes());
                 let upstream = upstream.clone();
                 tokio::spawn(async move {
+                    // The request, looked at and left in the socket, for
+                    // at most two seconds: a connection that says nothing
+                    // in that time is passed through as it is.
+                    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                    let mut buf = vec![0u8; 65536];
+                    let mut stall = false;
+                    loop {
+                        let seen = match tokio::time::timeout_at(until, sock.peek(&mut buf)).await {
+                            Ok(Ok(n)) if n > 0 => n,
+                            _ => break,
+                        };
+                        if let Some(receipt) = is_the_pid_receipt(&buf[..seen]) {
+                            stall = receipt;
+                            break;
+                        }
+                        if tokio::time::Instant::now() >= until {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
                     if stall {
                         tokio::time::sleep(hold).await;
                         if held == Held::Dropped {
@@ -3136,6 +3544,76 @@ esac
             }
         });
         format!("http://{addr}")
+    }
+
+    /// Review 34b016b6, B1, the proof. A CONNECTION THAT SAYS NOTHING
+    /// HOLDS NOTHING BUT ITSELF. One idle connection opened to the proxy
+    /// first used to hang every request behind it; here it stays open
+    /// and silent through the whole launch, which still ends, and the
+    /// pid receipt is still the one held — known by its body.
+    #[tokio::test]
+    async fn an_idle_connection_to_the_stalling_proxy_holds_nothing_behind_it() {
+        let world = World::new("dispatch-launch-idle-connection", "ok", 20_000);
+        let (base, log, _run) =
+            keeping_stub(packet_without_projection(), reviewer_row(), live_agents()).await;
+        let d = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .unwrap();
+        let held =
+            stalling_the_pid_receipt(&base, std::time::Duration::from_secs(2), Held::Dropped).await;
+        let idle = tokio::net::TcpStream::connect(held.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            launch(&held, &world, &d),
+        )
+        .await
+        .expect("the launch ended while a silent connection sat on the proxy")
+        .expect("the stub finished a turn");
+        assert_eq!(receipt["status"], "exited", "{receipt}");
+        assert!(
+            !log.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, b)| b.get(PROCESS_KEY).is_some()),
+            "the pid receipt was held by its body, not by its place in line"
+        );
+        drop(idle);
+    }
+
+    /// The proxy's reading of a request: the pid receipt is the run's
+    /// metadata PATCH whose body carries [`PROCESS_KEY`] — not the other
+    /// metadata PATCHes, and not until its body has arrived.
+    #[test]
+    fn the_pid_receipt_is_known_by_its_body() {
+        let req = |path: &str, body: &str| {
+            format!(
+                "PATCH {path} HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let run = format!("/api/jobs/{RUN}/metadata");
+        let pid = format!(r#"{{"{PROCESS_KEY}":{{"pid":7,"pgid":7}}}}"#);
+        let whole = req(&run, &pid);
+        assert_eq!(is_the_pid_receipt(whole.as_bytes()), Some(true));
+        let ending = format!(r#"{{"{RECEIPT_KEY}":{{"status":"exited","pid":7}}}}"#);
+        assert_eq!(
+            is_the_pid_receipt(req(&run, &ending).as_bytes()),
+            Some(false)
+        );
+        let other = format!("/api/jobs/{PACKET}/metadata");
+        assert_eq!(
+            is_the_pid_receipt(req(&other, &pid).as_bytes()),
+            Some(false)
+        );
+        // Not whole yet: the head without its body, and half the body.
+        let cut = whole.len() - pid.len() / 2;
+        assert_eq!(is_the_pid_receipt(&whole.as_bytes()[..cut]), None);
+        let head_only = whole.find("\r\n\r\n").unwrap();
+        assert_eq!(is_the_pid_receipt(&whole.as_bytes()[..head_only]), None);
     }
 
     /// N18 (review b149c579). THE BOUND IS COUNTED FROM THE SPAWN,
@@ -3221,6 +3699,76 @@ esac
             "the held write was applied after the ending"
         );
         assert_eq!(later["steps"][2]["metadata"]["result"], "died");
+    }
+
+    /// What the launcher promises about the model it starts (backlog
+    /// e6b05dd6): the record is written before the process exists. The
+    /// mark of "the process exists" is EVERY write that knows its pid —
+    /// the pid receipt when it was answered, and always the ending, which
+    /// carries the pid because that receipt is not waited for (backlog
+    /// af54aae4: this asserted the pid receipt alone, a write the
+    /// launcher does not promise, and failed when it went unanswered).
+    fn the_model_was_recorded_before_the_process_existed(log: &crate::dispatch::wire_tests::Log) {
+        let calls = log.calls.lock().unwrap();
+        let recorded = calls
+            .iter()
+            .position(|(m, p, _)| m == "POST" && p.ends_with("/metadata/records"))
+            .expect("the model was recorded");
+        let knows_the_pid = |(m, _, b): &(String, String, Value)| {
+            m == "PATCH"
+                && (b.get(PROCESS_KEY).is_some()
+                    || b.pointer(&format!("/{RECEIPT_KEY}/pid"))
+                        .is_some_and(|pid| !pid.is_null()))
+        };
+        let after: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| knows_the_pid(call))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !after.is_empty(),
+            "the ending carries the pid, so some write knows it"
+        );
+        assert!(
+            after.iter().all(|&i| recorded < i),
+            "recorded before the process existed: the record is call {recorded}, writes \
+             knowing the pid are calls {after:?}"
+        );
+    }
+
+    /// Backlog af54aae4 (1). THE PID RECEIPT IS NOT WAITED FOR, SO A TEST
+    /// MAY NOT NEED IT. A turn that finishes before the pid receipt is
+    /// answered ends the wait without it (N18, B1 above), and the
+    /// ending carries the pid. The Codex test used that receipt as its
+    /// mark of "the process exists" and failed 2 of 144 module runs, six
+    /// binaries in parallel, at "the call was made" (measured on this
+    /// tree 2026-10-19; 2 of 288 in review 09e63624). Here the receipt
+    /// is held and never delivered, so the interleaving that was a
+    /// coin is the only one.
+    #[tokio::test]
+    async fn the_model_is_recorded_before_the_process_though_its_pid_receipt_never_lands() {
+        let world = World::new("dispatch-launch-receipt-unanswered", "ok", 20_000);
+        let (base, log, _run) =
+            keeping_stub(packet_without_projection(), reviewer_row(), live_agents()).await;
+        let d = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .unwrap();
+        let held =
+            stalling_the_pid_receipt(&base, std::time::Duration::from_secs(2), Held::Dropped).await;
+        let receipt = launch(&held, &world, &d)
+            .await
+            .expect("the stub finished a turn");
+        assert_eq!(receipt["status"], "exited", "{receipt}");
+        assert!(
+            !log.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, b)| b.get(PROCESS_KEY).is_some()),
+            "the fixture: the pid receipt never reached the record"
+        );
+        the_model_was_recorded_before_the_process_existed(&log);
     }
 
     /// N19 (review b149c579), the first half. A VERB WHOSE STDERR HAS
@@ -3458,5 +4006,148 @@ esac
         assert_eq!(filed["steps"][2]["assignee_id"], "agent-claude");
         assert!(!world.request.dir.exists());
         assert!(!world.home.join("capture/argv").exists());
+    }
+
+    /// A LAUNCH WHOSE BUILDING CANNOT BE PLACED ENDS ITS RUN AND RELEASES
+    /// ITS CLAIM (backlog f8bed383, residue N9 of review b149c579). The
+    /// verb refused — rightly, a launch must not start a process whose
+    /// run is not its own — and left the work step claimed FOR the
+    /// harness's actor, its run edge written, and the run open at
+    /// `briefed` with `building` PENDING, which no rule ages. Now the
+    /// run is ended on its `refused` terminal and the step handed back.
+    #[tokio::test]
+    async fn a_launch_whose_building_cannot_be_placed_ends_its_run_and_releases_its_claim() {
+        let world = World::new("dispatch-launch-unplaced", "ok", 20_000);
+        let (base, _log, packet, run) =
+            crate::dispatch::wire_tests::half_open_stub(reviewer_row(), |m, p, b| {
+                (m == "PUT" && p.ends_with("/steps/run-building") && b.get("assignee_id").is_some())
+                    .then(|| ("409 Conflict", json!({ "error": "refused" }).to_string()))
+            })
+            .await;
+        let err = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("nothing was launched"), "{text}");
+        assert!(
+            text.contains("ENDED") && text.contains("RELEASED"),
+            "{text}"
+        );
+        let packet = packet.lock().unwrap().clone();
+        crate::dispatch::wire_tests::assert_released(&packet);
+        crate::dispatch::wire_tests::assert_ended(
+            &run.lock().unwrap().clone().unwrap(),
+            "could not be placed with agent-codex",
+        );
+        assert!(!world.home.join("capture/argv").exists(), "no process ran");
+    }
+
+    /// For a LAUNCH the `briefed` refusals are the same half-open shape:
+    /// the prompt is printed, but the executor is the process this verb
+    /// would start, and it is never started on an Err — so nobody will
+    /// finish the run, and it is ended and its claim released too.
+    #[tokio::test]
+    async fn a_launchs_briefed_refusal_ends_its_run_and_releases_its_claim() {
+        let world = World::new("dispatch-launch-unbriefed", "ok", 20_000);
+        let (base, _log, packet, run) =
+            crate::dispatch::wire_tests::half_open_stub(reviewer_row(), |m, p, _| {
+                (m == "PATCH" && p.ends_with("/steps/run-briefed/metadata"))
+                    .then(|| ("204 No Content", String::new()))
+            })
+            .await;
+        let err = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("does not hold"), "{text}");
+        assert!(
+            text.contains("ENDED") && text.contains("RELEASED"),
+            "{text}"
+        );
+        crate::dispatch::wire_tests::assert_released(&packet.lock().unwrap());
+        crate::dispatch::wire_tests::assert_ended(
+            &run.lock().unwrap().clone().unwrap(),
+            "does not hold",
+        );
+        assert_no_advice_to_finish(
+            &text,
+            &run.lock().unwrap().clone().unwrap(),
+            &packet.lock().unwrap(),
+        );
+    }
+
+    /// The other `briefed` refusal, on a launch: the completion itself is
+    /// refused (not a race), the run is ended and its claim released —
+    /// and nothing it says or records tells the reader to finish it.
+    #[tokio::test]
+    async fn a_launchs_unstartable_briefed_ends_its_run_and_advises_no_finish() {
+        let world = World::new("dispatch-launch-unstartable", "ok", 20_000);
+        let (base, _log, packet, run) =
+            crate::dispatch::wire_tests::half_open_stub(reviewer_row(), |m, p, _| {
+                (m == "PUT" && p.ends_with("/steps/run-briefed"))
+                    .then(|| ("500 Internal Server Error", "the completion failed".into()))
+            })
+            .await;
+        let err = dispatch(&base, &world, Some("gpt-6.1-sol"), true)
+            .await
+            .expect_err("refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("completing the run's briefed step"), "{text}");
+        assert!(
+            text.contains("ENDED") && text.contains("RELEASED"),
+            "{text}"
+        );
+        crate::dispatch::wire_tests::assert_released(&packet.lock().unwrap());
+        crate::dispatch::wire_tests::assert_ended(
+            &run.lock().unwrap().clone().unwrap(),
+            "completing the run's briefed step",
+        );
+        assert_no_advice_to_finish(
+            &text,
+            &run.lock().unwrap().clone().unwrap(),
+            &packet.lock().unwrap(),
+        );
+        assert!(!world.home.join("capture/argv").exists(), "no process ran");
+    }
+
+    /// A RUN THE VERB ENDED IS NOT ONE ANYBODY IS TOLD TO FINISH (backlog
+    /// f843a0c9, review a6a66af7 of car a8248f7a). The `briefed`
+    /// refusals' recovery — complete `briefed` on THIS run, do not
+    /// dispatch again — is right for a printed prompt, which keeps its
+    /// run open, and the opposite of what happened on a launch, whose run
+    /// is ended and step released. The verb's stderr, the run's
+    /// `ended_at_dispatch.why` and the work step's `released.why` each
+    /// carried it, the last with no disclaimer beside it.
+    fn assert_no_advice_to_finish(text: &str, run: &Value, packet: &Value) {
+        let whys = [
+            ("stderr", text),
+            (
+                "ended_at_dispatch.why",
+                run["metadata"]["ended_at_dispatch"]["why"]
+                    .as_str()
+                    .unwrap_or_default(),
+            ),
+            (
+                "released.why",
+                packet["steps"][1]["metadata"]["released"]["why"]
+                    .as_str()
+                    .unwrap_or_default(),
+            ),
+        ];
+        for (place, said) in whys {
+            assert!(!said.is_empty(), "{place} says nothing");
+            // The commands, as the advice spelled them; the API's own
+            // error naming the request that failed is a fact, not advice.
+            for advice in [
+                "--step briefed",
+                "boss-api PATCH",
+                "boss-api PUT",
+                "finish this run",
+                "Finish THIS run",
+                "do not dispatch again",
+            ] {
+                assert!(!said.contains(advice), "{place} says {advice:?}: {said}");
+            }
+        }
     }
 }

@@ -3417,7 +3417,7 @@ mod held_park_tests {
         // Read back by the ONE definition of the marker — the function the
         // conductor's `parked_ready`, the dock row and orient all call.
         assert_eq!(
-            boss_jobs::stranded::hold_reason(&body).as_deref(),
+            boss_jobs::stranded::marked(&body, "hold").as_deref(),
             Some(REASON)
         );
         assert_eq!(
@@ -3433,6 +3433,14 @@ mod held_park_tests {
         let mut parked = fresh_car();
         parked["steps"][3]["status"] = json!("ready");
         assert!(hold_write(&parked, &inputs).unwrap().is_some());
+        // afc5147c: a green refresh must move an existing hold, too.
+        parked["steps"][3]["metadata"] = json!({"hold":"old reason", car::HOLD_SHA:"old-head"});
+        let (_, refreshed) = hold_write(&parked, &inputs).unwrap().unwrap();
+        parked["steps"][3]["metadata"] = refreshed;
+        assert_eq!(
+            boss_jobs::car_release::hold_sha(&parked),
+            Some(inputs.receipt.head.as_str())
+        );
     }
 
     /// A gate whose hold is only an UNREAD diff (no --hold, the judge

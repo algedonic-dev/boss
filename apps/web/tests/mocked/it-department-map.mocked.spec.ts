@@ -49,7 +49,7 @@ async function mocks(page: Page): Promise<void> {
   await page.route(YARD_BORDERS, (r) => json(r, { window_hours: 24, now: REGIONS.now, borders: [] }));
 }
 
-const MAP = 'section.yard svg';
+const MAP = 'section.transit svg[role="group"]';
 const PANEL = 'section[data-map-panel]';
 
 /** Signed in as the live roster's operator: platform-admin, whose Class
@@ -112,7 +112,7 @@ test('?at=gates opens the gates panel below the map, with its one number and its
   await expect(panel).toHaveAttribute('data-state', 'clear');
   await expect(panel.locator('.panel-state')).toHaveText('clear');
   // BELOW the map, which is still drawn whole on top.
-  await expect(page.locator(`${MAP} .territory`)).toHaveCount(TERRITORIES.length);
+  await expect(page.locator(`${MAP} [data-station]`)).toHaveCount(TERRITORIES.length);
   const mapBox = (await page.locator(MAP).boundingBox())!;
   const panelBox = (await panel.boundingBox())!;
   expect(panelBox.y).toBeGreaterThanOrEqual(mapBox.y + mapBox.height);
@@ -128,7 +128,7 @@ test('a click on a station selects it and keeps the map on top; close deselects'
   const node = await page.locator(MAP).elementHandle();
   expect(node).not.toBeNull();
 
-  await page.locator(`${MAP} .territory[data-region="dock"]`).click();
+  await page.locator(`${MAP} [data-station="dock"]`).click();
   await expect(page).toHaveURL(/\/it\?at=dock$/);
   await expect(page.locator(PANEL)).toHaveAttribute('data-selection', 'dock');
   await expect(page.locator(`${PANEL} [data-figure]`)).toHaveText('6 cars parked');
@@ -136,7 +136,7 @@ test('a click on a station selects it and keeps the map on top; close deselects'
   expect(await node!.evaluate((el) => el.isConnected)).toBe(true);
 
   // A second station moves the selection without a new map either.
-  await page.locator(`${MAP} .territory[data-region="gates"]`).click();
+  await page.locator(`${MAP} [data-station="gates"]`).click();
   await expect(page).toHaveURL(/\/it\?at=gates$/);
   await expect(page.locator(PANEL)).toHaveAttribute('data-selection', 'gates');
   expect(await node!.evaluate((el) => el.isConnected)).toBe(true);

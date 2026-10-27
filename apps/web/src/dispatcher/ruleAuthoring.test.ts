@@ -9,6 +9,7 @@ import {
   liveSource,
   type RuleForm,
   type RuleVersion,
+  validateRule,
 } from './ruleAuthoring';
 
 const realFetch = globalThis.fetch;
@@ -108,7 +109,6 @@ const eventForm = (over: Partial<RuleForm> = {}): RuleForm => ({
   anchor_date: '',
   business_calendar: '',
   when: '',
-  delay: '',
   do: [],
   ...over,
 });
@@ -153,12 +153,11 @@ describe('the trigger is an event OR a schedule, exactly one', () => {
   });
 
   test('an event rule seeds an event form with every schedule field empty', () => {
-    const form = formFromVersion(row({ on_event: 'step.done.*', when: 'kind = "x"', delay: '5m' }));
+    const form = formFromVersion(row({ on_event: 'step.done.*', when: 'kind = "x"' }));
     expect(form.trigger).toBe('event');
     expect(form.on_event).toBe('step.done.*');
     expect([form.cadence, form.anchor_date, form.business_calendar]).toEqual(['', '', '']);
     expect(form.when).toBe('kind = "x"');
-    expect(form.delay).toBe('5m');
   });
 
   test('a seeded schedule form builds a spec that keeps its schedule and names no topic', () => {
@@ -232,14 +231,41 @@ describe('the draft carries the source of the rule it versions', () => {
   });
 });
 
+// backlog 677e332f (review of car 4c706c5d, item 84a010cb): the server's
+// authoring::validate refuses EVERY rule that declares a delay — nothing
+// executes one until design f1d66249's durable delayed admission lands —
+// while the editor still offered the field and sent whatever was typed.
+// The draft now never carries the key, even when the row it was seeded
+// from stored one; a stored delay stays read-only on the versions list.
+describe('the editor sends no delay the server would refuse', () => {
+  test('a form seeded from a row that stored a delay builds a spec with no delay key', () => {
+    const spec = buildRuleSpec(formFromVersion(row({ on_event: 'inquiry.received', delay: '7d' })));
+    expect('delay' in spec).toBe(false);
+    expect(JSON.parse(JSON.stringify(spec))).not.toHaveProperty('delay');
+  });
+
+  test('createDraft and validateRule put no delay on the wire', async () => {
+    const bodies: unknown[] = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify(row()), { status: 201 });
+    }) as unknown as typeof fetch;
+    const spec = buildRuleSpec(formFromVersion(row({ on_event: 'a.b', delay: '5m' })));
+    await createDraft(spec, null);
+    await validateRule(spec);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).not.toHaveProperty('delay');
+    expect(bodies[1]).not.toHaveProperty('delay');
+  });
+});
+
 describe('buildRuleSpec', () => {
-  test('trims fields, drops empty handlers + arg keys, nulls empty when/delay', () => {
+  test('trims fields, drops empty handlers + arg keys, nulls an empty when', () => {
     const form: RuleForm = {
       ...eventForm(),
       name: '  spawn-restock ',
       on_event: ' inventory.parts.consumed ',
       when: '  ',
-      delay: '',
       do: [
         {
           handler: ' jobs.spawn ',
@@ -255,16 +281,12 @@ describe('buildRuleSpec', () => {
     expect(spec.name).toBe('spawn-restock');
     expect(spec.on_event).toBe('inventory.parts.consumed');
     expect(spec.when).toBeNull();
-    expect(spec.delay).toBeNull();
     expect(spec.do).toEqual([{ handler: 'jobs.spawn', args: { kind: '"restock"' } }]);
   });
 
-  test('keeps non-empty when/delay (trimmed) and an empty do list', () => {
-    const spec = buildRuleSpec(
-      eventForm({ on_event: 'step.done.*', when: ' on_hand <= 0 ', delay: ' 5m ' }),
-    );
+  test('keeps a non-empty when (trimmed) and an empty do list', () => {
+    const spec = buildRuleSpec(eventForm({ on_event: 'step.done.*', when: ' on_hand <= 0 ' }));
     expect(spec.when).toBe('on_hand <= 0');
-    expect(spec.delay).toBe('5m');
     expect(spec.do).toEqual([]);
   });
 

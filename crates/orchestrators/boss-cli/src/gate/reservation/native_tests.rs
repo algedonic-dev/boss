@@ -16,6 +16,14 @@ use std::sync::{
 use tokio::sync::{Mutex, Notify};
 
 const FIXTURE_HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+/// How long the suite waits on an isolated worker (this test binary,
+/// re-executed) to reach a barrier or to exit. A backstop against a hang,
+/// never the subject: train gates on 2026-10-21/22 panicked "bounded
+/// isolated worker" at the old thirty seconds on cars that never touched
+/// this file, because a child process started while three gates share the
+/// test phase is slow, not wrong (f10419f9). A test whose subject is a
+/// deadline keeps its own bound beside it.
+const WORKER_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(300);
 fn fixture_manifest(packet: &str, mode: &str) -> String {
     let source = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../infra/gate-runner/gate-runner.yaml"),
@@ -71,6 +79,7 @@ fn qualification_doors<'a>(
 #[test]
 #[ignore = "subprocess entry; invoked only with an isolated qualification input"]
 fn isolated_native_worker() {
+    boss_testing::reexec::ready();
     let path = std::env::var("BOSS_GATE_QUALIFICATION_INPUT").expect("explicit fixture input");
     let input: Input = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -80,13 +89,38 @@ fn isolated_native_worker() {
                 .unwrap();
         let doors = qualification_doors(&client, &input);
         let now = model::instant("2026-10-15T13:00:00Z").unwrap();
-        if input.operation == "ordinary" || input.operation == "ordinary-submit" {
+        // `boss gate <packet> --wait` from a process that never saw the
+        // submission: the reattach the item's check names (e1943ef0).
+        if input.operation == "reattach" {
+            crate::gate::run(
+                &input.packet,
+                None,
+                None,
+                "fixture",
+                true,
+                false,
+                false,
+                ParkIntent::default(),
+                None,
+                None,
+                false,
+                None,
+                now,
+            )
+            .await
+            .unwrap();
+            return;
+        }
+        if matches!(
+            input.operation.as_str(),
+            "ordinary" | "ordinary-submit" | "ordinary-wait"
+        ) {
             crate::gate::run(
                 "fixture",
                 None,
                 input.manifest.as_ref().map(PathBuf::from),
                 "fixture",
-                false,
+                input.operation == "ordinary-wait",
                 input.operation == "ordinary-submit",
                 false,
                 ParkIntent::default(),
@@ -191,6 +225,14 @@ struct Native {
     release: Notify,
     finished: Notify,
     requests: Mutex<Vec<String>>,
+    // The bay claims (backlog ac8d3157), kept apart from `jobs` so every
+    // count of gate Jobs above still counts gate Jobs only; their requests
+    // are logged with a `BAY ` prefix for the same reason.
+    bays: Mutex<std::collections::BTreeMap<String, Value>>,
+    // What `/api/cadence/rules/{rule}/last-firing` answers — the firing the
+    // cadence door would hand back, observations and all (backlog
+    // 443023a4). `None` answers null: the rule never fired.
+    last_firing: Mutex<Option<Value>>,
 }
 #[derive(Clone)]
 struct Execution {
@@ -249,12 +291,10 @@ async fn execute_current_runner(execution: &Execution, job: &Value) -> Value {
         ),
     )
     .unwrap();
-    let gate = job["spec"]["template"]["spec"]["containers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|container| container["name"] == "gate")
-        .unwrap();
+    // The executor the binder bound, in whichever list the pod declares
+    // it: an init container on the judged-init layout (3e2c8ddc).
+    let gate = job.pointer(&super::gate_executor(job).unwrap()).unwrap();
+    assert_eq!(gate["name"], "gate", "the bound executor is the gate");
     assert_eq!(
         gate["command"],
         json!(["bash", "/repo-script/run.sh"]),
@@ -307,6 +347,17 @@ async fn acceptance_barrier(native: &Arc<Native>) {
 /// it absent, as the server defaults it. Every image the gate manifest
 /// names carries a non-latest tag, so an absent pull policy defaults to
 /// IfNotPresent; the assertion keeps that premise honest.
+///
+/// AND IT DROPS AN EMPTY ENV VALUE (backlog e1943ef0, 0c77e4db). An
+/// EnvVar's `value` is omitempty, so the server stores a full gate's
+/// `{"name":"GATE_MODE","value":""}` as `{"name":"GATE_MODE"}`. Measured
+/// on the live full gate 3328a09f (2026-10-19T04:40:59Z): its retained
+/// request and the Job read back at launch differ at exactly the sites
+/// above plus `initContainers/1/env/2/value ""` dropped. Until this line
+/// the fixture kept the empty value, so every durable FULL submission
+/// here bound trivially while the only durable submission on the record
+/// (0e7a03d7) had its launch refused as "does not match the complete
+/// recorded request" for exactly this.
 fn admit_with_server_defaults(job: &mut Value) {
     job["metadata"]["generation"] = json!(1);
     for collection in ["initContainers", "containers"] {
@@ -333,6 +384,9 @@ fn admit_with_server_defaults(job: &mut Value) {
                 .into_iter()
                 .flatten()
             {
+                if entry.get("value") == Some(&json!("")) {
+                    entry.as_object_mut().unwrap().remove("value");
+                }
                 if let Some(field) = entry
                     .pointer_mut("/valueFrom/fieldRef")
                     .and_then(Value::as_object_mut)
@@ -344,15 +398,102 @@ fn admit_with_server_defaults(job: &mut Value) {
     }
 }
 
+/// A stored Job as the real API LISTS it: a typed list's items carry no
+/// `kind` or `apiVersion` — they live once, on the list. This fixture
+/// listed them whole, so the census's per-item kind check passed here and
+/// refused every non-empty census live (backlog d561255c, 2026-10-20).
+fn as_listed(job: &Value) -> Value {
+    let mut item = job.clone();
+    if let Some(fields) = item.as_object_mut() {
+        fields.remove("kind");
+        fields.remove("apiVersion");
+    }
+    item
+}
+
 fn status(code: StatusCode, reason: &str) -> Response {
     (code,Json(json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":reason,"message":reason,"code":code.as_u16()}))).into_response()
 }
+/// The bay reservation's own reads and writes (backlog ac8d3157): the
+/// claim list, a claim CREATE, a UID-preconditioned claim DELETE, and the
+/// runner pod list. Names are unique as the real server keeps them, and a
+/// claim is stamped with the real clock, as the server stamps it.
+async fn bay_api(state: &Native, method: &Method, uri: &Uri, body: &Bytes) -> Option<Response> {
+    let base = "/apis/batch/v1/namespaces/fixture/jobs";
+    let path = uri.path();
+    let claim_list = path == base
+        && *method == Method::GET
+        && uri
+            .query()
+            .is_some_and(|q| q.contains("app%3Dgate-bay-claim"));
+    let claim_post = path == base
+        && *method == Method::POST
+        && serde_json::from_slice::<Value>(body)
+            .ok()
+            .is_some_and(|j| j.pointer("/metadata/labels/app") == Some(&json!(bay::CLAIM_APP)));
+    let claim_delete = *method == Method::DELETE
+        && path
+            .strip_prefix(&format!("{base}/"))
+            .is_some_and(|name| name.starts_with(bay::CLAIM_PREFIX));
+    let pods = *method == Method::GET && path == "/api/v1/namespaces/fixture/pods";
+    if !(claim_list || claim_post || claim_delete || pods) {
+        return None;
+    }
+    state
+        .requests
+        .lock()
+        .await
+        .push(format!("BAY {method} {uri}"));
+    if pods {
+        return Some(Json(json!({"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"1"},"items":[]})).into_response());
+    }
+    let mut bays = state.bays.lock().await;
+    if claim_list {
+        let items: Vec<Value> = bays.values().map(as_listed).collect();
+        return Some(Json(json!({"apiVersion":"batch/v1","kind":"JobList","metadata":{"resourceVersion":"1"},"items":items})).into_response());
+    }
+    if claim_post {
+        let mut claim: Value = serde_json::from_slice(body).unwrap();
+        let name = claim["metadata"]["name"].as_str().unwrap().to_owned();
+        if bays.contains_key(&name) {
+            return Some(status(StatusCode::CONFLICT, "AlreadyExists"));
+        }
+        claim["metadata"]["uid"] = json!(Uuid::new_v4());
+        claim["metadata"]["creationTimestamp"] = json!(chrono::Utc::now().to_rfc3339());
+        bays.insert(name, claim.clone());
+        return Some((StatusCode::CREATED, Json(claim)).into_response());
+    }
+    let name = path.rsplit('/').next().unwrap_or_default();
+    let wanted = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|options| options.pointer("/preconditions/uid").cloned());
+    match bays.get(name) {
+        None => Some(status(StatusCode::NOT_FOUND, "NotFound")),
+        Some(claim)
+            if wanted
+                .as_ref()
+                .is_some_and(|uid| claim["metadata"]["uid"] != *uid) =>
+        {
+            Some(status(StatusCode::CONFLICT, "Conflict"))
+        }
+        Some(_) => {
+            bays.remove(name);
+            Some(
+                Json(json!({"kind":"Status","apiVersion":"v1","status":"Success"})).into_response(),
+            )
+        }
+    }
+}
+
 async fn native_api(
     State(state): State<Arc<Native>>,
     method: Method,
     uri: Uri,
     body: Bytes,
 ) -> Response {
+    if let Some(answer) = bay_api(&state, &method, &uri, &body).await {
+        return answer;
+    }
     let path = uri.path();
     state.requests.lock().await.push(format!("{method} {uri}"));
     match path {
@@ -396,7 +537,7 @@ async fn native_api(
                         == Some(*value)
                 })
             })
-            .cloned()
+            .map(as_listed)
             .collect::<Vec<_>>();
         return Json(json!({"apiVersion":"batch/v1","kind":"JobList","metadata":{"resourceVersion":"1"},"items":items})).into_response();
     }
@@ -555,6 +696,10 @@ async fn claim_reply_fault(
             4 => value["gate_queue_owner"] = json!("unrecognized"),
             6 => value["gate_max_concurrent"] = json!(0),
             7 => value["gate_queue_owner"] = json!("resident"),
+            // Which owner the bundle declares is a policy decision that
+            // moves (e1943ef0); a control that needs the legacy owner
+            // names it, never inherits it.
+            8 => value["gate_queue_owner"] = json!("legacy"),
             _ => {}
         }
         return axum::response::Response::from_parts(
@@ -603,11 +748,24 @@ async fn claim_reply_fault(
     }
     response
 }
+/// The login a registered agent signs in with; the jobs API's login door
+/// resolves it to that agent's canonical id before any write is judged.
+const FIXTURE_ALIAS: &str = "builder@example.invalid";
+
 impl Fixture {
     async fn new() -> Self {
         Self::configured(None, false).await
     }
+    /// The jobs API behind the REAL login door, with `agent-test`
+    /// registered under [`FIXTURE_ALIAS`] — the live shape in which a
+    /// gate signed as an alias meets a receipt naming the canonical id.
+    async fn aliased() -> Self {
+        Self::configured_with(None, false, true).await
+    }
     async fn configured(schema: Option<Value>, for_cli: bool) -> Self {
+        Self::configured_with(schema, for_cli, false).await
+    }
+    async fn configured_with(schema: Option<Value>, for_cli: bool, login: bool) -> Self {
         use boss_jobs::registry::InMemoryWorkflows;
         // Hold both declared service ports on a unique loopback address.
         // This exercises live door address derivation without a shared
@@ -672,7 +830,12 @@ impl Fixture {
             boss_jobs::seed_loader::load_workflows(boss_jobs::registry::platform_bundle_path())
                 .unwrap()
                 .into_iter()
-                .filter(|row| matches!(row.kind.as_str(), "agent-run" | "backlog-item"))
+                .filter(|row| {
+                    matches!(
+                        row.kind.as_str(),
+                        "agent-run" | "backlog-item" | "pr-train" | "ship-a-change"
+                    )
+                })
         {
             registry.seed(protocol).unwrap();
         }
@@ -706,14 +869,56 @@ impl Fixture {
             },
         ]));
         state.delivery = Some(delivery.clone());
-        let jobs_app = boss_jobs::http::router(state)
-            .merge(boss_jobs::delivery::http::router(
-                boss_jobs::delivery::http::DeliveryPolicyApiState { repo: delivery },
-            ))
-            .layer(axum::middleware::from_fn_with_state(
-                native.clone(),
-                claim_reply_fault,
+        let jobs_app = boss_jobs::http::router(state).merge(boss_jobs::delivery::http::router(
+            boss_jobs::delivery::http::DeliveryPolicyApiState { repo: delivery },
+        ));
+        let jobs_app = if login {
+            let agents = Arc::new(
+                boss_jobs::agents::InMemoryAgents::new().with_agent("agent-test", [FIXTURE_ALIAS]),
+            );
+            let door = Arc::new(boss_jobs::agents::LoginDoor::new(
+                agents.clone(),
+                boss_core::publisher::DomainPublisher::new(
+                    boss_testing::RecordingEventBus::new(),
+                    "jobs",
+                ),
             ));
+            jobs_app
+                .merge(boss_jobs::agents::http::router(
+                    boss_jobs::agents::http::AgentsApiState {
+                        registry: agents,
+                        classes: None,
+                        departments: None,
+                    },
+                ))
+                .layer(axum::middleware::from_fn_with_state(
+                    door,
+                    boss_jobs::agents::resolve_login,
+                ))
+        } else {
+            jobs_app
+        };
+        let firing = native.clone();
+        let jobs_app = jobs_app.route(
+            "/api/cadence/rules/{rule}/last-firing",
+            axum::routing::get(move || {
+                let native = firing.clone();
+                async move {
+                    Json(
+                        native
+                            .last_firing
+                            .lock()
+                            .await
+                            .clone()
+                            .unwrap_or(Value::Null),
+                    )
+                }
+            }),
+        );
+        let jobs_app = jobs_app.layer(axum::middleware::from_fn_with_state(
+            native.clone(),
+            claim_reply_fault,
+        ));
         let (jobs, jobs_server, content_listener) = if let Some((jobs, content)) = listeners {
             let base = format!("http://{}", jobs.local_addr().unwrap());
             (
@@ -796,6 +1001,11 @@ impl Fixture {
         git(&["commit", "--allow-empty", "-m", "Unlanded fixture source"]);
         git(&["remote", "add", "origin", checkout.to_str().unwrap()]);
         git(&["fetch", "origin"]);
+        // The launch refuses an origin that is not its estate's forge
+        // (backlog 0ddc437f); this fixture's forge IS its own checkout.
+        let estate = checkout.join(crate::gate::ESTATE_FILE);
+        std::fs::create_dir_all(estate.parent().unwrap()).unwrap();
+        std::fs::write(&estate, format!("forge_url = \"{}\"\n", checkout.display())).unwrap();
         let manifest = checkout.join("gate-runner.yaml");
         let source = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -853,6 +1063,9 @@ impl Fixture {
                 .env("BOSS_JOBS_URL", &configuration.jobs)
                 .env("BOSS_ACTOR", "agent-test")
                 .env_remove("BOSS_AGENT_RUN")
+                // The wrapper below is found by name; a door's absolute
+                // kubectl would bypass it (7ed1251a).
+                .env_remove(crate::door_env::DOOR_KUBECTL_ENV)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_TERMINAL_PROMPT", "0")
@@ -878,16 +1091,42 @@ impl Fixture {
                 format!("{}:{}", tools.display(), std::env::var("PATH").unwrap()),
             );
         }
+        self.ready_file(label).arm(&mut command);
         tokio::process::Command::from(command)
             .kill_on_drop(true)
             .spawn()
             .unwrap()
     }
+    fn ready_file(&self, label: &str) -> boss_testing::reexec::Ready {
+        boss_testing::reexec::Ready::at(self._files.path().join(format!("{label}.ready")))
+    }
+    /// Wait for the worker's `reexec::ready()`. Every bound on a worker
+    /// in this file starts here, never at its spawn: the start of this
+    /// whole debug binary on a loaded gate pod is the host's, and
+    /// counting it redded gates on correct code — "bounded isolated
+    /// worker: Elapsed" and "worker did not reach the controlled native
+    /// acceptance barrier", gate 00cb53a9 on 2026-10-20 (backlog
+    /// 7e30ddb0). A worker that ends before it starts is left to the
+    /// caller's own wait to report.
+    async fn started(&self, child: &mut tokio::process::Child, label: &str) {
+        let _ = self.ready_file(label).wait_async(child).await;
+    }
     async fn finish(&self, mut child: tokio::process::Child, label: &str) -> bool {
-        let status = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait())
-            .await
-            .expect("bounded isolated worker")
-            .unwrap();
+        self.started(&mut child, label).await;
+        let Ok(status) = tokio::time::timeout(WORKER_BACKSTOP, child.wait()).await else {
+            // A hang is named only after what the worker printed is kept:
+            // its stdout and stderr die with the fixture's scratch dir.
+            if let Some(pid) = child.id() {
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{pid}")])
+                    .status()
+                    .await;
+            }
+            self.record_child(label, &format!("no exit within {WORKER_BACKSTOP:?}"))
+                .await;
+            panic!("isolated worker {label} did not exit within {WORKER_BACKSTOP:?}");
+        };
+        let status = status.unwrap();
         self.record_child(label, &status.to_string()).await;
         status.success()
     }
@@ -1086,6 +1325,53 @@ async fn a_prepared_full_request_cannot_attach_to_a_competing_auto_request() {
     assert_eq!(fixture.native.accepted.load(Ordering::SeqCst), 1);
 }
 
+/// WHY (backlog 59ce3050, review 421d6960 F2; the live failure is item
+/// 870dbfe4). On 2026-10-18 gates launched with BOSS_ACTOR set to the login
+/// alias wedged at `sending`: the attempt recorded the alias while the
+/// server's receipt named the canonical agent, so `confirm` refused the
+/// one send permit. The alias fix was proven for submissions only; this
+/// drives the exact site — `create_on`, through `Claim::confirm`, to the
+/// native create — as an alias caller behind the real login door.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_alias_caller_claims_confirms_and_sends_through_create_on() {
+    let fixture = Fixture::aliased().await;
+    let client =
+        crate::machine_http::MachineClient::unstamped(reqwest::Client::builder().no_proxy())
+            .unwrap();
+    let mut doors = qualification_doors(&client, &fixture.input);
+    doors.caller = Some(identity::Caller {
+        id: FIXTURE_ALIAS.into(),
+        source: identity::Source::Env,
+    });
+    let now = model::instant("2026-10-15T13:00:00Z").unwrap();
+    renew_on(&doors, &fixture.input.packet, now).await.unwrap();
+    let manifest = fixture_manifest(&fixture.input.packet, "");
+    let (intent, bytes) = prepare_on(
+        &doors,
+        &fixture.input.packet,
+        "fixture",
+        FIXTURE_HEAD,
+        "full",
+        &manifest,
+    )
+    .await
+    .unwrap();
+    let created = create_on(&doors, &intent, &bytes, now).await;
+    fixture.record_artifacts("alias-create").await;
+    let metadata = fixture.metadata().await;
+    assert!(
+        created.is_ok(),
+        "an alias caller's own claim was refused: {created:?}; metadata {metadata}"
+    );
+    assert_eq!(fixture.native.accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        metadata[model::ATTEMPT]["actor"],
+        "agent-test",
+        "the attempt names the canonical actor the receipt names, never the alias"
+    );
+    assert!(model::read(&metadata).unwrap().unwrap().consumed);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_packet_census_conserves_complete_json_before_any_send() {
     let fixture = Fixture::new().await;
@@ -1259,6 +1545,287 @@ async fn resident_pass_launches_an_accepted_packet_after_its_submitter_has_left(
         original, receipt,
         "a cadence pass cannot reset accepted order or replace the original request"
     );
+}
+
+/// What one resident pass and one legacy waiter each read of a single
+/// line: an accepted resident request and a live legacy place taken
+/// `legacy_after` from the resident's original acceptance, at a bound of
+/// one bay. Returns the pass's launches, the resident packet, its
+/// acceptance instant, and the resident places the waiter reads after
+/// the pass.
+async fn resident_beside_a_legacy_place(
+    legacy_after: chrono::Duration,
+) -> (
+    Vec<String>,
+    String,
+    chrono::DateTime<chrono::Utc>,
+    Vec<(chrono::DateTime<chrono::Utc>, String)>,
+) {
+    let fixture = Fixture::new().await;
+    let checkout = fixture._files.path().join("mixed-line-clone");
+    std::fs::create_dir(&checkout).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&checkout)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "--initial-branch=fixture"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&[
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "Fixture",
+    ]);
+    git(&["remote", "add", "origin", checkout.to_str().unwrap()]);
+    let head = git(&["rev-parse", "HEAD"]);
+    let original = fixture
+        .repo
+        .get_job(&boss_core::job::JobId::from_uuid(
+            Uuid::parse_str(&fixture.input.packet).unwrap(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let client =
+        crate::machine_http::MachineClient::unstamped(reqwest::Client::builder().no_proxy())
+            .unwrap();
+    let doors = qualification_doors(&client, &fixture.input);
+    let now = model::instant("2026-10-16T13:00:00Z").unwrap();
+    let packet = fixture.input.packet.clone();
+    renew_on(&doors, &packet, now).await.unwrap();
+    api(
+        &doors,
+        reqwest::Method::PATCH,
+        &format!("/api/jobs/{packet}/metadata"),
+        Some(json!({"sha":head})),
+    )
+    .await
+    .unwrap();
+    let (intent, _) = prepare_on(
+        &doors,
+        &packet,
+        "fixture",
+        &head,
+        "full",
+        &fixture_manifest(&packet, ""),
+    )
+    .await
+    .unwrap();
+    let receipt = submission::submit_on(
+        &doors,
+        &intent,
+        &json!({"branch":"fixture","sha":head,"worktree":"fixture-original-checkout"}),
+    )
+    .await
+    .unwrap();
+    // A legacy waiter's place: its own `queued_at`, and a beat inside
+    // the TTL at the instant the pass reads the line.
+    let mut legacy = original.clone();
+    legacy.id = boss_core::job::JobId::from_uuid(Uuid::new_v4());
+    legacy.metadata = json!({"branch":"legacy","sha":head,
+        "queued_at": stamp(receipt.applied_at + legacy_after),
+        "queue_heartbeat_at": stamp(now)});
+    fixture.repo.create_job(&legacy).await.unwrap();
+    let mut input = fixture.input.clone();
+    input.operation = "supervise".into();
+    let resident = qualification_doors(&client, &input);
+    let report = supervisor::pass_on(&resident, &checkout, "fixture", 1, now)
+        .await
+        .unwrap();
+    fixture.record_artifacts("mixed-line").await;
+    // The rows a legacy waiter polls, and the resident places it reads.
+    let open = rows(
+        api(
+            &doors,
+            reqwest::Method::GET,
+            "/api/jobs?kind=gate-run&status=open&limit=100",
+            None,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let residents = resident_places_on(&doors, &open, "fixture").await.unwrap();
+    (report.launched, packet, receipt.applied_at, residents)
+}
+
+/// Backlog b56bfc29. Resident dec70bf9 was accepted at 05:42:37Z on
+/// 2026-10-19 and still waited at 06:50Z while legacy gates took freed
+/// bays: the pass counted EVERY live legacy place ahead of every
+/// resident request, whenever that place was taken. A legacy place taken
+/// after the resident's acceptance is behind it; one taken before is
+/// ahead. One line, both owners, ordered by when each place was taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_legacy_place_taken_after_a_resident_acceptance_does_not_overtake_it() {
+    let (launched, packet, _, residents) =
+        resident_beside_a_legacy_place(chrono::Duration::seconds(5)).await;
+    assert_eq!(
+        launched,
+        vec![packet],
+        "a legacy place taken after the acceptance is not ahead of it"
+    );
+    assert!(
+        residents.is_empty(),
+        "a launched resident holds a bay, not a place: {residents:?}"
+    );
+    let (launched, packet, applied_at, residents) =
+        resident_beside_a_legacy_place(-chrono::Duration::seconds(5)).await;
+    assert!(
+        launched.is_empty(),
+        "a legacy place taken before the acceptance keeps the bay: {launched:?}"
+    );
+    // The other half of one line: the legacy waiter reads the waiting
+    // resident at its original acceptance — the instant the pass orders
+    // it by — so the two owners can never each count the other ahead and
+    // hold one free bay between them.
+    assert_eq!(residents, vec![(applied_at, packet)]);
+}
+
+/// Backlog 443023a4 (reviewer run 26423804 of car 05fde6de). The cadence
+/// records each pass's observation on the train-reconcile firing, and
+/// while a train waits the NEXT pass reads that firing for the train's
+/// liveness. Kept whole, the read was the previous report, which held the
+/// read before it: every pass carried every earlier one, and the live
+/// firing reached 6,654,578 bytes at 07:34Z on 2026-10-19, past the
+/// outcome door's 2 MiB, so each pass recorded `gate_queue` unknown (413).
+/// A queued submission and a waiting train, three passes: the report
+/// keeps the firing's identity and digest, so its size does not climb.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_waiting_trains_liveness_read_keeps_the_report_bounded_across_passes() {
+    let fixture = Fixture::new().await;
+    let checkout = fixture._files.path().join("waiting-train-clone");
+    std::fs::create_dir(&checkout).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&checkout)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "--initial-branch=fixture"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&[
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "Fixture",
+    ]);
+    git(&["remote", "add", "origin", checkout.to_str().unwrap()]);
+    let head = git(&["rev-parse", "HEAD"]);
+    let client =
+        crate::machine_http::MachineClient::unstamped(reqwest::Client::builder().no_proxy())
+            .unwrap();
+    let doors = qualification_doors(&client, &fixture.input);
+    let now = model::instant("2026-10-16T13:00:00Z").unwrap();
+    let packet = fixture.input.packet.clone();
+    renew_on(&doors, &packet, now).await.unwrap();
+    api(
+        &doors,
+        reqwest::Method::PATCH,
+        &format!("/api/jobs/{packet}/metadata"),
+        Some(json!({"sha":head})),
+    )
+    .await
+    .unwrap();
+    let (intent, _) = prepare_on(
+        &doors,
+        &packet,
+        "fixture",
+        &head,
+        "full",
+        &fixture_manifest(&packet, ""),
+    )
+    .await
+    .unwrap();
+    submission::submit_on(
+        &doors,
+        &intent,
+        &json!({"branch":"fixture","sha":head,"worktree":"fixture-original-checkout"}),
+    )
+    .await
+    .unwrap();
+    // A train waiting for a bay: its bound wait stated, no gate of its own.
+    let mut train = boss_core::job::Job::new(
+        "pr-train",
+        boss_core::job::Subject::new("custom", "fixture"),
+        "Fixture train",
+        "agent-test",
+        boss_core::job::Priority::Standard,
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 16).unwrap(),
+    );
+    train.status = boss_core::job::JobStatus::Open;
+    train.metadata = json!({ crate::train_gate::KEY_BOUND_WAIT: "every bay is occupied" });
+    fixture.repo.create_job(&train).await.unwrap();
+    *fixture.native.last_firing.lock().await = Some(json!({
+        "firing_id":"cadence:train-reconcile:2026-10-16T12:59Z",
+        "fired_at":"2026-10-16T12:59:00Z","rc":0}));
+    let mut input = fixture.input.clone();
+    input.operation = "supervise".into();
+    let resident = qualification_doors(&client, &input);
+    let mut sizes = Vec::new();
+    let mut reads = Vec::new();
+    for pass in 0..3 {
+        let at = now + chrono::Duration::minutes(2 * pass);
+        let observation = supervisor::observation_on(&resident, &checkout, "fixture", 1, at).await;
+        assert_eq!(observation["state"], "completed", "{observation}");
+        assert_eq!(
+            observation["report"]["launched"],
+            json!([]),
+            "the waiting train holds the one bay, so the submission stays queued"
+        );
+        let liveness = observation["report"]["reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|read| read["operation"] == "train-priority-liveness")
+            .cloned()
+            .expect("a waiting train's liveness is read");
+        let previous = fixture.native.last_firing.lock().await.clone().unwrap();
+        reads.push((liveness, previous));
+        sizes.push(serde_json::to_vec(&observation).unwrap().len());
+        // The cadence records this pass's observation on its own firing,
+        // which is the firing the next pass reads.
+        *fixture.native.last_firing.lock().await = Some(json!({
+            "firing_id":format!("cadence:train-reconcile:pass-{pass}"),
+            "fired_at":at,"rc":0,"observations":{"gate_queue":observation}}));
+    }
+    // A digest's own length varies by a few digits; a copied firing adds
+    // the whole previous report.
+    assert!(
+        sizes.iter().all(|size| *size <= sizes[0] + 64),
+        "the pass report grew with each firing it read: {sizes:?}"
+    );
+    // What the decision read, stated; the rest named by its digest.
+    for (liveness, previous) in reads {
+        for key in ["firing_id", "fired_at", "rc"] {
+            assert_eq!(liveness[key], previous[key], "{key} of {liveness}");
+        }
+        assert_eq!(
+            liveness["bytes"],
+            json!(serde_json::to_vec(&previous).unwrap().len())
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1505,6 +2072,9 @@ printf '{{"head":"%s","marker":"{marker}","args":"%s"}}\n' "$(git rev-parse HEAD
         "-m",
         "Accepted tree",
     ]);
+    // The runner's one fetch carries the trunk with the gated commit
+    // (backlog a531f508), so the forge this stands in for has a main.
+    git(&["branch", "main"]);
     let head = git(&["rev-parse", "HEAD"]);
     let client =
         crate::machine_http::MachineClient::unstamped(reqwest::Client::builder().no_proxy())
@@ -1552,13 +2122,11 @@ printf '{{"head":"%s","marker":"{marker}","args":"%s"}}\n' "$(git rev-parse HEAD
     fixture.native.behavior.store(4, Ordering::SeqCst);
     let mut input = fixture.input.clone();
     input.operation = "supervise".into();
-    let child = fixture.spawn_input("execution-bound", &input);
-    tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        fixture.native.reached.notified(),
-    )
-    .await
-    .unwrap();
+    let mut child = fixture.spawn_input("execution-bound", &input);
+    fixture.started(&mut child, "execution-bound").await;
+    tokio::time::timeout(WORKER_BACKSTOP, fixture.native.reached.notified())
+        .await
+        .unwrap();
     write_gate("moved");
     git(&["add", "infra/gate.sh"]);
     git(&[
@@ -1676,12 +2244,10 @@ async fn killed_submission_observer_can_only_read_while_resident_launches_later(
     input.operation = "submit".into();
     let mut child = fixture.spawn_input("lost-submission-reply", &input);
     let pid = child.id().unwrap();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        fixture.native.reached.notified(),
-    )
-    .await
-    .unwrap();
+    fixture.started(&mut child, "lost-submission-reply").await;
+    tokio::time::timeout(WORKER_BACKSTOP, fixture.native.reached.notified())
+        .await
+        .unwrap();
     let accepted = fixture.metadata().await;
     assert!(accepted.get("gate_submission").is_some());
     assert!(accepted.get(attempt::KEY).is_none());
@@ -1703,12 +2269,9 @@ async fn killed_submission_observer_can_only_read_while_resident_launches_later(
         )
         .await;
     fixture.native.release.notify_one();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        fixture.native.finished.notified(),
-    )
-    .await
-    .unwrap();
+    tokio::time::timeout(WORKER_BACKSTOP, fixture.native.finished.notified())
+        .await
+        .unwrap();
     let before = fixture.native.jobs_requests.lock().await.len();
     input.operation = "observe".into();
     assert!(
@@ -1740,6 +2303,202 @@ async fn killed_submission_observer_can_only_read_while_resident_launches_later(
         fixture.metadata().await["gate_submission"],
         accepted["gate_submission"]
     );
+}
+
+/// The finished gate Jobs a live namespace keeps for a day after each
+/// verdict: measured 2026-10-19 in boss-dev, 126 of them, whose raw
+/// `app=gate-runner` census was 5,376,991 bytes (~42 KB a Job, nearly
+/// all of it the pod template).
+async fn retained_finished_gate_jobs(native: &Native, count: usize) {
+    let mut jobs = native.jobs.lock().await;
+    for index in 0..count {
+        let name = format!("gate-finished-{index:04}");
+        jobs.insert(
+            name.clone(),
+            json!({
+            "apiVersion":"batch/v1","kind":"Job",
+            "metadata":{"name":name,"namespace":"fixture","uid":Uuid::new_v4(),
+                "resourceVersion":"1","creationTimestamp":"2026-10-15T11:00:00Z",
+                "labels":{"app":"gate-runner","boss.dev/packet":Uuid::new_v4()}},
+            "spec":{"template":{"spec":{"containers":[{"name":"gate",
+                "image":"fixture.invalid/gate:1","args":["x".repeat(40_000)]}]}}},
+            "status":{"succeeded":1,"conditions":[{"type":"Complete","status":"True"}]}}),
+        );
+    }
+}
+
+/// THE ITEM'S CHECK, END TO END, UNDER THE BUNDLED POLICY, IN A
+/// NAMESPACE SHAPED LIKE THE LIVE ONE (backlog e1943ef0, finish line
+/// 2026-10-18 amended 03:51Z). A bare `boss gate <branch> --wait` — no
+/// `--submit`, the command every builder runs — must leave a place the
+/// PACKET owns: kill its waiter while the gate is queued, let the
+/// resident supervisor launch it against a server that admits the Job
+/// the way the live one does (empty GATE_MODE dropped, the 0e7a03d7
+/// failure), record the verdict, and a NEW process running `boss gate
+/// <packet> --wait` reads that verdict by reading alone.
+///
+/// RED on 569668040 for the reason the live reproduction found
+/// (gate-run dec70bf9, 2026-10-19 05:42Z): with the day's finished gate
+/// Jobs in the namespace, the pass's capacity census retained the whole
+/// raw list, over the file store's 2,097,152-byte upload bound, and every
+/// pass ended UNKNOWN before admission. And the pass report, which the
+/// conductor posts to the cadence outcome door (axum's 2 MiB default),
+/// carried every read whole: 6.3 MB, refused 413, live.
+///
+/// AND RED on bb75debe7 under the bundle's own row (policy fault 0, no
+/// owner forced): v9 says `legacy`, so the bare wait files no submission
+/// and its place lives only in the process this test kills. That is the
+/// proof that the bundle's row, not a flag or a fixture override, makes a
+/// bare wait packet-owned (review fcfaae49, finding 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_killed_bare_waiter_keeps_its_place_and_a_new_reader_gets_the_verdict() {
+    use std::os::unix::process::ExitStatusExt;
+    let fixture = Fixture::configured(None, true).await;
+    fixture.native.defaults.store(1, Ordering::SeqCst);
+    fixture.native.policy_fault.store(0, Ordering::SeqCst);
+    retained_finished_gate_jobs(&fixture.native, 130).await;
+    let client =
+        crate::machine_http::MachineClient::unstamped(reqwest::Client::builder().no_proxy())
+            .unwrap();
+    let mut input = fixture.ordinary_input("ordinary-wait");
+    let doors = qualification_doors(&client, &input);
+    let mut waiter = fixture.spawn_input("bare-wait", &input);
+    let pid = waiter.id().unwrap();
+    fixture.started(&mut waiter, "bare-wait").await;
+    // The waiter's own submission, read off the system of record, never
+    // inferred from the process: bounded, then the process is killed.
+    let mut packet = None;
+    for _ in 0..150 {
+        let rows = api(
+            &doors,
+            reqwest::Method::GET,
+            "/api/jobs?kind=gate-run&status=open&full=true&limit=50",
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        packet = rows["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row.pointer("/metadata/gate_submission").is_some())
+            .and_then(|row| row["id"].as_str())
+            .map(str::to_owned);
+        if packet.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(
+        tokio::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    let exit = waiter.wait().await.unwrap();
+    fixture
+        .record_child("bare-wait", &format!("{exit}; signal={:?}", exit.signal()))
+        .await;
+    let packet = packet.expect(
+        "a bare `boss gate --wait` under a resident policy commits a packet-owned submission",
+    );
+    assert_eq!(
+        exit.signal(),
+        Some(9),
+        "the waiter was killed, not finished"
+    );
+    assert_eq!(
+        fixture.native.accepted.load(Ordering::SeqCst),
+        0,
+        "the killed waiter launched nothing: the place is the packet's"
+    );
+    let id = boss_core::job::JobId::from_uuid(Uuid::parse_str(&packet).unwrap());
+    let submitted = fixture.repo.get_job(&id).await.unwrap().unwrap();
+    assert_eq!(
+        submitted.metadata["gate_submission"]["source"]["gate_queue_selection"], "resident-default",
+        "the policy, not a flag, made it packet-owned"
+    );
+    assert_eq!(
+        submitted.metadata["gate_submission"]["intent"]["mode"],
+        "full"
+    );
+
+    // The conductor's next pass, the waiter long gone.
+    let mut resident_input = input.clone();
+    resident_input.operation = "supervise".into();
+    let resident = qualification_doors(&client, &resident_input);
+    let checkout = PathBuf::from(input.checkout.clone().unwrap());
+    let report = supervisor::pass_on(
+        &resident,
+        &checkout,
+        "fixture",
+        1,
+        model::instant("2026-10-15T13:05:00Z").unwrap(),
+    )
+    .await
+    .unwrap();
+    let observed = serde_json::to_vec(&report).unwrap().len();
+    assert_eq!(report.launched, vec![packet.clone()], "{report:?}");
+    // The report rides the cadence outcome POST; keep it an order of
+    // magnitude inside the 2 MiB that door accepts.
+    assert!(
+        observed < 200 * 1024,
+        "the pass report is {observed} bytes: a read is recorded as its digest, not its reply"
+    );
+    assert_eq!(fixture.native.accepted.load(Ordering::SeqCst), 1);
+    let launched = fixture.repo.get_job(&id).await.unwrap().unwrap();
+    assert_eq!(
+        launched.metadata[model::OBSERVATION]["request_sha256"],
+        submitted.metadata["gate_submission"]["intent"]["sha256"],
+        "the server-defaulted FULL Job binds to the one immutable request"
+    );
+
+    // The recorder's write: the verdict lands on the packet's own step,
+    // through the judged door every service step writer uses.
+    let (mut verdict, read) = fixture
+        .repo
+        .list_steps_versioned(&id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(step, _)| step.spec_slug.as_deref() == Some("record-verdict"))
+        .expect("the filed gate-run carries its record-verdict step");
+    verdict.metadata["verdict"] = json!("green");
+    verdict.status = boss_core::job::StepStatus::Completed;
+    fixture
+        .repo
+        .update_step_if_unchanged_at(&verdict, read, chrono::Utc::now(), &[])
+        .await
+        .unwrap();
+
+    // A NEW process, holding nothing but the packet id.
+    let before = fixture.native.jobs_requests.lock().await.len();
+    input.operation = "reattach".into();
+    input.packet = packet.clone();
+    assert!(
+        fixture
+            .finish(fixture.spawn_input("reattach", &input), "reattach")
+            .await,
+        "the reattached reader exits 0 on a green verdict"
+    );
+    let printed = std::fs::read_to_string(fixture._files.path().join("reattach.stdout")).unwrap();
+    assert!(
+        printed.contains(&format!(
+            "boss gate: green  (packet {}, fixture)",
+            &packet[..8]
+        )),
+        "{printed}"
+    );
+    assert!(
+        fixture.native.jobs_requests.lock().await[before..]
+            .iter()
+            .all(|request| request.starts_with("GET ")),
+        "the reattached reader only reads: it cannot renew, adopt or relaunch"
+    );
+    assert_eq!(fixture.native.accepted.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1869,17 +2628,47 @@ async fn accepted_native_create_with_failed_reply_is_confirmed_by_exact_read() {
     assert_eq!(fixture.native.accepted.load(Ordering::SeqCst), 1);
 }
 
+/// WHY (backlog d777b20a). `gate_max_concurrent` moved 3->4->3->4->3
+/// between 2026-09-28 and 10-07, and green car gates went from a median
+/// 6.0 to 34.6 minutes, but a gate-run carried neither the bound it was
+/// admitted under nor the policy version that set it: the bay and its
+/// bound went to the launcher's stderr only. A launched gate now records
+/// the bay it took and the bound in force, beside `launched_at`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launched_gate_records_the_bay_and_the_bound_it_was_admitted_under() {
+    let fixture = Fixture::new().await;
+    assert!(fixture.finish(fixture.spawn("one"), "one").await);
+    let metadata = fixture.metadata().await;
+    assert!(model::read(&metadata).unwrap().unwrap().consumed);
+    let policy = boss_jobs::seed_loader::load_delivery_policies(
+        boss_jobs::delivery_policy_seed::platform_delivery_policy_path(),
+    )
+    .unwrap()
+    .into_iter()
+    .find(|row| row.row.name == "train-conductor")
+    .unwrap()
+    .row;
+    assert_eq!(
+        metadata["gate_bay"],
+        json!({
+            "bay": "gate-bay-0",
+            "bound": policy.gate_max_concurrent,
+            "policy_bound": policy.gate_max_concurrent,
+            "delivery_policy": {"name": "train-conductor", "version": policy.version},
+        }),
+        "the gate-run names its bay and the bound in force: {metadata:#}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn accepted_native_create_with_parent_deadline_is_confirmed_without_resending() {
     let fixture = Fixture::new().await;
     fixture.native.behavior.store(4, Ordering::SeqCst);
     let mut child = fixture.spawn("parent-deadline");
-    tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        fixture.native.reached.notified(),
-    )
-    .await
-    .unwrap();
+    fixture.started(&mut child, "parent-deadline").await;
+    tokio::time::timeout(WORKER_BACKSTOP, fixture.native.reached.notified())
+        .await
+        .unwrap();
     let accepted = fixture.native.jobs.lock().await.clone();
     assert_eq!(fixture.native.accepted.load(Ordering::SeqCst), 1);
     // Use the actual production 45-second parent bound and real client.
@@ -1931,12 +2720,10 @@ async fn killed_launcher(phase: u8, replacement: bool, disappear: bool) {
     fixture.native.behavior.store(phase, Ordering::SeqCst);
     let mut child = fixture.spawn("killed");
     let pid = child.id().unwrap();
-    if tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        fixture.native.reached.notified(),
-    )
-    .await
-    .is_err()
+    fixture.started(&mut child, "killed").await;
+    if tokio::time::timeout(WORKER_BACKSTOP, fixture.native.reached.notified())
+        .await
+        .is_err()
     {
         let _ = tokio::process::Command::new("kill")
             .args(["-KILL", "--", &format!("-{pid}")])
@@ -1996,12 +2783,9 @@ async fn killed_launcher(phase: u8, replacement: bool, disappear: bool) {
         .record_child("killed", &format!("{exit}; signal={:?}", exit.signal()))
         .await;
     fixture.native.release.notify_one();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        fixture.native.finished.notified(),
-    )
-    .await
-    .unwrap();
+    tokio::time::timeout(WORKER_BACKSTOP, fixture.native.finished.notified())
+        .await
+        .unwrap();
     let outcome = fixture.native.barrier_outcome.load(Ordering::SeqCst);
     assert!(
         matches!(outcome, 1 | 2),
@@ -2109,13 +2893,11 @@ async fn accepted_unrecorded_then_deleted_native_job_cannot_be_recreated() {
 async fn an_old_live_transition_cannot_consume_a_replacement_after_native_acceptance() {
     let fixture = Fixture::new().await;
     fixture.native.behavior.store(4, Ordering::SeqCst);
-    let child = fixture.spawn("old-live");
-    tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        fixture.native.reached.notified(),
-    )
-    .await
-    .unwrap();
+    let mut child = fixture.spawn("old-live");
+    fixture.started(&mut child, "old-live").await;
+    tokio::time::timeout(WORKER_BACKSTOP, fixture.native.reached.notified())
+        .await
+        .unwrap();
     let before = fixture.metadata().await;
     let native = fixture.native.jobs.lock().await.clone();
     assert_eq!(native.len(), 1);
@@ -2380,9 +3162,12 @@ async fn actual_conductor_cannot_demote_an_unknown_train_priority_read_to_no_tra
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordinary_cli_commits_resident_default_and_explicit_staged_submissions_without_sending() {
-    for (operation, owner, selection) in [
-        ("ordinary", 7, "resident-default"),
-        ("ordinary-submit", 0, "explicit-submit"),
+    // Fault 0 is the bundle's own row, resident since v10 (e1943ef0); 7
+    // forces resident and 8 forces legacy, so each owner is named here.
+    for (operation, owner, selection, expected) in [
+        ("ordinary", 0, "resident-default", "resident"),
+        ("ordinary", 7, "resident-default", "resident"),
+        ("ordinary-submit", 8, "explicit-submit", "legacy"),
     ] {
         let fixture = Fixture::configured(None, true).await;
         let input = fixture.ordinary_input(operation);
@@ -2421,11 +3206,50 @@ async fn ordinary_cli_commits_resident_default_and_explicit_staged_submissions_w
         let (submission, receipt) = submission::original_on(&doors, packet).await.unwrap();
         assert_eq!(submission.source["gate_queue_selection"], selection);
         assert_eq!(
-            submission.source["gate_queue_policy"]["gate_queue_owner"],
-            if owner == 7 { "resident" } else { "legacy" }
+            submission.source["gate_queue_policy"]["gate_queue_owner"], expected,
+            "fault {owner}"
         );
         assert_eq!(receipt.job_id.to_string(), packet);
     }
+}
+
+/// Backlog 0ddc437f, through the actual verb: a working directory whose
+/// origin is not the estate's forge is refused BEFORE any packet is filed
+/// — the jobs API hears nothing and no native Job is posted. The control
+/// is every other ordinary test here, whose estate names the checkout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_origin_that_is_not_the_estate_forge_is_refused_before_any_packet() {
+    let fixture = Fixture::configured(None, true).await;
+    let input = fixture.ordinary_input("ordinary");
+    let checkout = PathBuf::from(input.checkout.clone().unwrap());
+    let forge = "http://forge.example.test:3000";
+    std::fs::write(
+        checkout.join(crate::gate::ESTATE_FILE),
+        format!("forge_url = \"{forge}\"\n"),
+    )
+    .unwrap();
+    let jobs_before = fixture.native.jobs_requests.lock().await.len();
+    let native_before = native_posts(&fixture.native.requests.lock().await);
+    let ok = fixture
+        .finish(
+            fixture.spawn_input("not-the-forge", &input),
+            "not-the-forge",
+        )
+        .await;
+    let said = std::fs::read_to_string(fixture._files.path().join("not-the-forge.stderr")).unwrap();
+    assert!(!ok, "refused: {said}");
+    assert!(said.contains("REFUSED"), "{said}");
+    assert!(said.contains(forge), "names the forge: {said}");
+    assert!(
+        said.contains(&checkout.display().to_string()),
+        "names the origin: {said}"
+    );
+    let heard = fixture.native.jobs_requests.lock().await[jobs_before..].to_vec();
+    assert!(heard.is_empty(), "nothing reached the jobs API: {heard:?}");
+    assert_eq!(
+        native_posts(&fixture.native.requests.lock().await),
+        native_before
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2442,7 +3266,9 @@ async fn ordinary_cli_rollout_skew_is_visible_and_legacy_runs_only_after_complet
     let skew_diag =
         std::fs::read_to_string(fixture._files.path().join("ordinary-skew.stderr")).unwrap();
     let before = fixture.native.accepted.load(Ordering::SeqCst);
-    fixture.native.policy_fault.store(0, Ordering::SeqCst);
+    // A complete row that DECLARES legacy, named rather than inherited
+    // from the bundle (e1943ef0).
+    fixture.native.policy_fault.store(8, Ordering::SeqCst);
     let legacy_ok = fixture
         .finish(
             fixture.spawn_input("ordinary-legacy", &input),
@@ -2477,7 +3303,9 @@ async fn conductor_rollout_skew_is_visible_and_legacy_runs_only_after_complete_p
     let skew_diag =
         std::fs::read_to_string(fixture._files.path().join("conductor-skew.stderr")).unwrap();
     let before = fixture.native.accepted.load(Ordering::SeqCst);
-    fixture.native.policy_fault.store(0, Ordering::SeqCst);
+    // A complete row that DECLARES legacy, named rather than inherited
+    // from the bundle (e1943ef0).
+    fixture.native.policy_fault.store(8, Ordering::SeqCst);
     let legacy_ok = fixture
         .finish(
             fixture.spawn_input("conductor-legacy", &input),
@@ -2499,7 +3327,9 @@ async fn actual_writers_refuse_unknown_policy_and_legacy_submit_without_native_s
     for operation in ["ordinary", "conductor"] {
         let fixture = Fixture::configured(Some(json!({})), true).await;
         let mut input = fixture.ordinary_input(operation);
-        for fault in [1, 2, 3, 4, 5, 6, 7] {
+        // 0 is the bundle's own row: resident since v10 (e1943ef0), so a
+        // legacy-pinned packet refuses under it exactly as under 7.
+        for fault in [0, 1, 2, 3, 4, 5, 6, 7] {
             fixture.native.policy_fault.store(fault, Ordering::SeqCst);
             let label = format!("{operation}-policy-{fault}");
             assert!(
@@ -2511,7 +3341,7 @@ async fn actual_writers_refuse_unknown_policy_and_legacy_submit_without_native_s
             assert_eq!(fixture.native.accepted.load(Ordering::SeqCst), 0);
         }
         if operation == "ordinary" {
-            fixture.native.policy_fault.store(0, Ordering::SeqCst);
+            fixture.native.policy_fault.store(8, Ordering::SeqCst);
             input.operation = "ordinary-submit".into();
             assert!(
                 !fixture
@@ -2753,7 +3583,13 @@ async fn resident_policy_snapshot_is_the_complete_original_resolved_policy() {
         "source must retain the whole original resolved row, including adjacent policy data"
     );
     assert_eq!(source["gate_queue_selection"], "explicit-submit");
-    fixture.native.policy_fault.store(7, Ordering::SeqCst);
+    // A later active row with a different owner than the one accepted.
+    let other = if original["gate_queue_owner"] == "resident" {
+        8
+    } else {
+        7
+    };
+    fixture.native.policy_fault.store(other, Ordering::SeqCst);
     let (accepted, again) = submission::original_on(&doors, &fixture.input.packet)
         .await
         .unwrap();
@@ -2858,6 +3694,14 @@ async fn declared_source_claim_is_revalidated_without_requiring_a_live_model() {
     ] {
         let fixture = Fixture::new().await;
         let (run, parent) = fixture.source_claim(fault).await;
+        // A parent item the size real urgent items reach: e1943ef0 itself
+        // carried 62 metadata keys when its builder's durable submission
+        // (dec70bf9) recorded it whole, making a 499 KB gate packet whose
+        // guarded withdrawal event (995,839 bytes) the bus bound refused.
+        let parent_id = boss_core::job::JobId::from_uuid(Uuid::parse_str(&parent).unwrap());
+        let mut bulky = fixture.repo.get_job(&parent_id).await.unwrap().unwrap();
+        bulky.metadata["history"] = json!("x".repeat(300_000));
+        fixture.repo.update_job(&bulky).await.unwrap();
         let client =
             crate::machine_http::MachineClient::unstamped(reqwest::Client::builder().no_proxy())
                 .unwrap();
@@ -2884,6 +3728,24 @@ async fn declared_source_claim_is_revalidated_without_requiring_a_live_model() {
             assert_eq!(
                 receipt.job.metadata[model::SUBMISSION]["source"]["gate_source_claim"]["run"],
                 run
+            );
+            // Each read is recorded as what was read and the digest of
+            // its exact reply, never the reply: the system of record keeps
+            // the history, and a copy makes every later guarded write on
+            // this packet carry the parent item twice over.
+            let reads = receipt.job.metadata[model::SUBMISSION]["source"]["gate_source_reads"]
+                .as_array()
+                .unwrap()
+                .clone();
+            assert!(!reads.is_empty());
+            for read in &reads {
+                assert!(read.get("reply").is_none(), "{read}");
+                assert_eq!(read["sha256"].as_str().unwrap().len(), 64, "{read}");
+            }
+            let packet_bytes = serde_json::to_vec(&receipt.job.metadata).unwrap().len();
+            assert!(
+                packet_bytes < 100 * 1024,
+                "the submitted gate packet is {packet_bytes} bytes beside a 300 KB parent"
             );
         } else {
             assert!(
@@ -3026,6 +3888,150 @@ async fn immutable_submission_cannot_borrow_another_workers_own_run() {
     assert!(fixture.metadata().await.get(model::SUBMISSION).is_none());
 }
 
+/// One resident request accepted under an open source run, then one half
+/// of its source claim finished: `"run"` closes the agent-run with the
+/// outcome `died` (the hourly silence clock's terminal), `"parent"`
+/// closes the item the run builds. Returns the fixture, the run's id and
+/// one supervisor pass's report.
+async fn a_resident_whose_source_finished(half: &str) -> (Fixture, String, supervisor::Report) {
+    use boss_core::job::{JobId, JobStatus, Step, StepStatus};
+    let fixture = Fixture::new().await;
+    let id = JobId::from_uuid(Uuid::parse_str(&fixture.input.packet).unwrap());
+    let mut verdict = Step::new(id, "gate-verdict", "Record the receipt", 1);
+    verdict.spec_slug = Some("record-verdict".into());
+    verdict.status = StepStatus::Ready;
+    fixture.repo.add_step(&verdict).await.unwrap();
+    let (run, parent) = fixture.source_claim("").await;
+    let client =
+        crate::machine_http::MachineClient::unstamped(reqwest::Client::builder().no_proxy())
+            .unwrap();
+    let doors = qualification_doors(&client, &fixture.input);
+    let now = model::instant("2026-10-16T13:00:00Z").unwrap();
+    renew_on(&doors, &fixture.input.packet, now).await.unwrap();
+    let (intent, _) = prepare_on(
+        &doors,
+        &fixture.input.packet,
+        "fixture",
+        FIXTURE_HEAD,
+        "full",
+        &fixture_manifest(&fixture.input.packet, ""),
+    )
+    .await
+    .unwrap();
+    submission::submit_on(&doors, &intent, &json!({"agent_run":run}))
+        .await
+        .unwrap();
+    let finished =
+        JobId::from_uuid(Uuid::parse_str(if half == "run" { &run } else { &parent }).unwrap());
+    let mut row = fixture.repo.get_job(&finished).await.unwrap().unwrap();
+    row.status = JobStatus::Closed;
+    if half == "run" {
+        row.metadata["outcome"] = json!("died");
+    }
+    fixture.repo.update_job(&row).await.unwrap();
+    let mut input = fixture.input.clone();
+    input.operation = "supervise".into();
+    let resident = qualification_doors(&client, &input);
+    // The forge is never read for either half: the source claim is
+    // judged first, so no checkout stands behind this path.
+    let checkout = fixture._files.path().join("never-read-clone");
+    let report = supervisor::pass_on(&resident, &checkout, "fixture", 1, now)
+        .await
+        .unwrap();
+    fixture
+        .record_artifacts(&format!("source-{half}-finished"))
+        .await;
+    (fixture, run, report)
+}
+
+/// Backlog 599aed02. Seven resident places sat unlaunched for eleven
+/// hours on 2026-10-21 while newer gates launched around them: each was
+/// accepted under a builder's agent-run that the hourly clock then closed
+/// as `died`, and the supervisor launches only under the EXACT OPEN run,
+/// so every pass retained each one with "original source run is not the
+/// exact open agent-run" — forever, since a closed packet never reopens
+/// (backlog 36352452), and nothing settled it. A closed source run is as
+/// permanent as a moved branch (5db91d0e), so the pass settles it ONCE on
+/// `withdrawn`, naming the run, its status and its outcome, so the yard
+/// and the owner read why and the head can be re-gated from a live run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resident_whose_source_run_closed_is_settled_naming_the_run() {
+    let (fixture, run, report) = a_resident_whose_source_finished("run").await;
+    let packet = fixture.input.packet.clone();
+    assert!(report.launched.is_empty(), "{report:?}");
+    assert_eq!(fixture.native.accepted.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        report
+            .settled
+            .iter()
+            .map(|s| s["packet"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec![packet.as_str()],
+        "settled once, by the pass that read the closed run: {report:?}"
+    );
+    let step = verdict_step(&fixture).await;
+    assert_eq!(step["status"], "completed", "{step}");
+    assert_eq!(step["metadata"]["verdict"], "withdrawn", "{step}");
+    let receipt: Value =
+        serde_json::from_str(step["metadata"]["receipt"].as_str().unwrap()).unwrap();
+    let because = receipt["withdrawn_because"].as_str().unwrap_or_default();
+    for named in [run.as_str(), "closed", "died", "re-gate"] {
+        assert!(because.contains(named), "{named} missing from {because}");
+    }
+    assert_eq!(receipt["settled_by"], "resident-supervisor", "{receipt}");
+    assert_eq!(receipt["evidence"]["operation"], "original-source-run");
+    assert_eq!(receipt["evidence"]["run"], run.as_str(), "{receipt}");
+    assert_eq!(receipt["evidence"]["status"], "closed", "{receipt}");
+    assert_eq!(
+        receipt["evidence"]["read"]["sha256"].as_str().map(str::len),
+        Some(64)
+    );
+    assert_eq!(
+        fixture.metadata().await["gate_orphan_claim"]["verdict_receipt"],
+        receipt
+    );
+    // The next pass finds it settled and settles nothing again.
+    let client =
+        crate::machine_http::MachineClient::unstamped(reqwest::Client::builder().no_proxy())
+            .unwrap();
+    let mut input = fixture.input.clone();
+    input.operation = "supervise".into();
+    let resident = qualification_doors(&client, &input);
+    let again = supervisor::pass_on(
+        &resident,
+        &fixture._files.path().join("never-read-clone"),
+        "fixture",
+        1,
+        model::instant("2026-10-16T13:01:00Z").unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(again.settled.is_empty(), "{again:?}");
+    assert!(again.launched.is_empty(), "{again:?}");
+    assert_eq!(verdict_step(&fixture).await, step);
+}
+
+/// The control, and the scope: only the source RUN's own terminal settles
+/// here. A closed parent item with its run still open is retained with
+/// its reason, as before, and nothing is withdrawn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resident_whose_parent_closed_under_an_open_run_is_retained() {
+    let (fixture, _, report) = a_resident_whose_source_finished("parent").await;
+    assert!(report.launched.is_empty(), "{report:?}");
+    assert!(report.settled.is_empty(), "{report:?}");
+    assert!(
+        report.retained.iter().any(|r| {
+            r["packet"] == fixture.input.packet.as_str()
+                && r["reason"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("original source parent is no longer open"))
+        }),
+        "{report:?}"
+    );
+    assert_eq!(verdict_step(&fixture).await["status"], "ready");
+    assert!(fixture.metadata().await.get("gate_orphan_claim").is_none());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn existing_native_object_cannot_borrow_missing_protected_intent_observation_or_attempt() {
     for field in [model::INTENT, model::OBSERVATION, attempt::KEY] {
@@ -3159,4 +4165,433 @@ async fn only_exact_server_defaults_consume_the_original_intent() {
     assert!(metadata.get(model::OBSERVATION).is_none());
     assert_eq!(fixture.native.accepted.load(Ordering::SeqCst), 1);
     assert_eq!(native_posts(&fixture.native.requests.lock().await), 1);
+}
+
+/// What the forge answers, after acceptance, for the branch a resident
+/// request names (backlog 5db91d0e).
+#[derive(Clone, Copy, Debug)]
+enum Forge {
+    /// The branch still carries the accepted head.
+    Unmoved,
+    /// A commit pushed after acceptance: the tip is another head.
+    Moved,
+    /// The branch deleted, the forge's HEAD still answering.
+    Deleted,
+    /// A remote that answers nothing at all — not even a HEAD — so its
+    /// silence cannot be told from a wrong or empty target.
+    Silent,
+    /// A remote the read cannot reach.
+    Unreachable,
+}
+
+/// What else stands beside a resident request when the pass reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Beside {
+    Nothing,
+    /// A live legacy place taken before its acceptance holds the one bay.
+    BayTaken,
+    /// Its immutable source names another head than its immutable
+    /// request (backlog 48b1b7b4).
+    SourceNamesAnotherHead,
+    /// An open car already carries a current green for this exact head
+    /// (backlog 48b1b7b4).
+    CarVouches,
+    /// Its verdict step was completed after acceptance while the packet
+    /// stayed open — a settle interrupted between its two writes
+    /// (backlog 48b1b7b4).
+    VerdictRecorded,
+}
+
+/// One accepted resident request, its forge answering as `forge` says,
+/// and `beside` it what that names. Returns the fixture, the packet's
+/// conductor doors' pass report, and the checkout the pass reads.
+async fn a_resident_request_whose_forge_answers(
+    forge: Forge,
+    beside: Beside,
+) -> (Fixture, supervisor::Report, PathBuf) {
+    let fixture = Fixture::new().await;
+    let id = boss_core::job::JobId::from_uuid(Uuid::parse_str(&fixture.input.packet).unwrap());
+    // The step a verdict lands on, as a filed gate-run carries it.
+    let mut verdict = boss_core::job::Step::new(id, "gate-verdict", "Record the receipt", 1);
+    verdict.spec_slug = Some("record-verdict".into());
+    verdict.status = boss_core::job::StepStatus::Ready;
+    fixture.repo.add_step(&verdict).await.unwrap();
+    let checkout = fixture._files.path().join("forge-answer-clone");
+    std::fs::create_dir(&checkout).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&checkout)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "--initial-branch=fixture"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["config", "user.name", "Fixture"]);
+    let commit = |message: &str| {
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            message,
+        ])
+    };
+    commit("Accepted source");
+    git(&["remote", "add", "origin", checkout.to_str().unwrap()]);
+    let head = git(&["rev-parse", "HEAD"]);
+    let client =
+        crate::machine_http::MachineClient::unstamped(reqwest::Client::builder().no_proxy())
+            .unwrap();
+    let doors = qualification_doors(&client, &fixture.input);
+    let now = model::instant("2026-10-16T13:00:00Z").unwrap();
+    let packet = fixture.input.packet.clone();
+    renew_on(&doors, &packet, now).await.unwrap();
+    api(
+        &doors,
+        reqwest::Method::PATCH,
+        &format!("/api/jobs/{packet}/metadata"),
+        Some(json!({"sha":head})),
+    )
+    .await
+    .unwrap();
+    let (intent, _) = prepare_on(
+        &doors,
+        &packet,
+        "fixture",
+        &head,
+        "full",
+        &fixture_manifest(&packet, ""),
+    )
+    .await
+    .unwrap();
+    // The source's head is the request's, unless the case is that it is
+    // not: both are written once, in the one immutable submission.
+    let source_sha = if beside == Beside::SourceNamesAnotherHead {
+        "2222222222222222222222222222222222222222".to_owned()
+    } else {
+        head.clone()
+    };
+    let receipt = submission::submit_on(
+        &doors,
+        &intent,
+        &json!({"branch":"fixture","sha":source_sha,"worktree":"fixture-original-checkout"}),
+    )
+    .await
+    .unwrap();
+    match forge {
+        Forge::Unmoved => {}
+        Forge::Moved => {
+            commit("Pushed after acceptance");
+        }
+        Forge::Deleted => {
+            git(&["checkout", "-b", "main"]);
+            git(&["branch", "-D", "fixture"]);
+        }
+        Forge::Silent => {
+            let empty = fixture._files.path().join("empty-remote.git");
+            std::fs::create_dir(&empty).unwrap();
+            let out = std::process::Command::new("git")
+                .current_dir(&empty)
+                .args(["init", "--bare"])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            git(&["remote", "set-url", "origin", empty.to_str().unwrap()]);
+        }
+        Forge::Unreachable => {
+            let gone = fixture._files.path().join("no-such-remote");
+            git(&["remote", "set-url", "origin", gone.to_str().unwrap()]);
+        }
+    }
+    match beside {
+        Beside::Nothing | Beside::SourceNamesAnotherHead => {}
+        Beside::BayTaken => {
+            // A live legacy place taken BEFORE the acceptance: ahead of the
+            // resident under every line rule, so the one bay is its.
+            let mut legacy = fixture.repo.get_job(&id).await.unwrap().unwrap();
+            legacy.id = boss_core::job::JobId::from_uuid(Uuid::new_v4());
+            legacy.metadata = json!({"branch":"legacy","sha":head,
+                "queued_at": stamp(receipt.applied_at - chrono::Duration::seconds(5)),
+                "queue_heartbeat_at": stamp(now)});
+            fixture.repo.create_job(&legacy).await.unwrap();
+        }
+        Beside::CarVouches => {
+            // A car aboard a train, its receipt green at the accepted head:
+            // the request has nothing left to decide.
+            let mut car = fixture.repo.get_job(&id).await.unwrap().unwrap();
+            car.id = boss_core::job::JobId::from_uuid(Uuid::new_v4());
+            car.kind = "ship-a-change".into();
+            car.metadata = json!({"branch":"fixture","train":Uuid::new_v4().to_string(),
+                "regate_receipt":{"verdict":"green","head":head,"mode":"full"}});
+            fixture.repo.create_job(&car).await.unwrap();
+        }
+        Beside::VerdictRecorded => {
+            let (mut step, read) = fixture
+                .repo
+                .get_step_versioned(&verdict.id)
+                .await
+                .unwrap()
+                .unwrap();
+            step.status = boss_core::job::StepStatus::Completed;
+            fixture
+                .repo
+                .update_step_if_unchanged_at(&step, read, now, &[])
+                .await
+                .unwrap();
+        }
+    }
+    let mut input = fixture.input.clone();
+    input.operation = "supervise".into();
+    let resident = qualification_doors(&client, &input);
+    let report = supervisor::pass_on(&resident, &checkout, "fixture", 1, now)
+        .await
+        .unwrap();
+    fixture.record_artifacts(&format!("{forge:?}")).await;
+    (fixture, report, checkout)
+}
+
+/// The packet's verdict step as a reader of the jobs API sees it.
+async fn verdict_step(fixture: &Fixture) -> Value {
+    let client =
+        crate::machine_http::MachineClient::unstamped(reqwest::Client::builder().no_proxy())
+            .unwrap();
+    let doors = qualification_doors(&client, &fixture.input);
+    let job = read_on(&doors, &fixture.input.packet).await.unwrap();
+    crate::train::find_step(&job, "record-verdict", "Record the receipt")
+        .cloned()
+        .expect("the gate-run carries its verdict step")
+}
+
+/// Backlog 5db91d0e. A resident request whose branch moved (or was
+/// deleted) after acceptance names a head the branch will never carry
+/// again, and the supervisor refused it on every pass, forever: the
+/// conductor's dead-gate clock no longer settles a resident still in line
+/// (b56bfc29), so it held its place ahead of later waiters until someone
+/// withdrew it by hand. The supervisor settles it itself, ONCE, on the
+/// protocol's `withdrawn` terminal, naming the cause and the retained
+/// forge read that proved it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resident_the_supervisor_will_never_launch_is_settled_once_with_its_cause() {
+    for (forge, cause) in [(Forge::Moved, "moved"), (Forge::Deleted, "absent")] {
+        let (fixture, report, checkout) =
+            a_resident_request_whose_forge_answers(forge, Beside::Nothing).await;
+        let packet = fixture.input.packet.clone();
+        assert!(report.launched.is_empty(), "{forge:?}: {report:?}");
+        assert_eq!(fixture.native.accepted.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            report
+                .settled
+                .iter()
+                .map(|s| s["packet"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec![packet.as_str()],
+            "{forge:?}: settled once, by the pass that proved it: {report:?}"
+        );
+        let step = verdict_step(&fixture).await;
+        assert_eq!(step["status"], "completed", "{forge:?}: {step}");
+        assert_eq!(
+            step["metadata"]["verdict"], "withdrawn",
+            "{forge:?}: {step}"
+        );
+        let receipt: Value =
+            serde_json::from_str(step["metadata"]["receipt"].as_str().unwrap()).unwrap();
+        let because = receipt["withdrawn_because"].as_str().unwrap_or_default();
+        assert!(because.contains(cause), "{forge:?}: {because}");
+        assert_eq!(receipt["settled_by"], "resident-supervisor", "{receipt}");
+        // The evidence is the forge read itself, retained on the packet.
+        assert_eq!(
+            receipt["evidence"]["operation"], "gate-queue-exact-branch",
+            "{receipt}"
+        );
+        assert!(receipt["evidence"]["file_id"].is_string(), "{receipt}");
+        assert_eq!(report.settled[0]["receipt"], receipt);
+        // The guarded negative claim binds the same decision.
+        assert_eq!(
+            fixture.metadata().await["gate_orphan_claim"]["verdict_receipt"],
+            receipt
+        );
+        // The next pass finds it settled and settles nothing again.
+        let client =
+            crate::machine_http::MachineClient::unstamped(reqwest::Client::builder().no_proxy())
+                .unwrap();
+        let mut input = fixture.input.clone();
+        input.operation = "supervise".into();
+        let resident = qualification_doors(&client, &input);
+        let again = supervisor::pass_on(
+            &resident,
+            &checkout,
+            "fixture",
+            1,
+            model::instant("2026-10-16T13:01:00Z").unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(again.settled.is_empty(), "{forge:?}: {again:?}");
+        assert!(again.launched.is_empty(), "{forge:?}: {again:?}");
+        assert_eq!(verdict_step(&fixture).await, step);
+    }
+}
+
+/// The control: a resident request whose branch is exactly where it was
+/// accepted, waiting only because the one bay is taken, is a place in the
+/// line — never settled, never retained as a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resident_waiting_for_a_bay_is_not_settled() {
+    let (fixture, report, _) =
+        a_resident_request_whose_forge_answers(Forge::Unmoved, Beside::BayTaken).await;
+    assert!(report.launched.is_empty(), "{report:?}");
+    assert!(report.settled.is_empty(), "{report:?}");
+    assert!(
+        !report
+            .retained
+            .iter()
+            .any(|r| r["packet"] == fixture.input.packet.as_str()),
+        "{report:?}"
+    );
+    assert_eq!(verdict_step(&fixture).await["status"], "ready");
+    assert!(fixture.metadata().await.get("gate_orphan_claim").is_none());
+    assert_eq!(
+        waiter_places(&fixture).await,
+        vec![fixture.input.packet.clone()],
+        "a request waiting only for a bay keeps its place in a legacy waiter's line"
+    );
+}
+
+/// The resident places a legacy waiter reads after the pass, as it
+/// polls them (`wait_for_slot`).
+async fn waiter_places(fixture: &Fixture) -> Vec<String> {
+    let client =
+        crate::machine_http::MachineClient::unstamped(reqwest::Client::builder().no_proxy())
+            .unwrap();
+    let doors = qualification_doors(&client, &fixture.input);
+    let open = rows(
+        api(
+            &doors,
+            reqwest::Method::GET,
+            "/api/jobs?kind=gate-run&status=open&limit=100",
+            None,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    resident_places_on(&doors, &open, "fixture")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, packet)| packet)
+        .collect()
+}
+
+/// Backlog 48b1b7b4. After 5db91d0e the supervisor settled a resident
+/// only when the forge proved its branch moved or gone; every OTHER
+/// refusal was retained, and a legacy waiter still counted the request
+/// ahead of itself, with no clock to settle it — a bay lost to a request
+/// that would never launch, until someone withdrew it by hand. Two are as
+/// permanent as a moved branch, and each is settled once with its cause
+/// and the read that proved it: a source head that disagrees with the
+/// request (both immutable), and a car already green at this exact head
+/// (the withdrawal `gated_car_guard` itself prescribes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_permanent_refusal_is_settled_with_its_cause_and_holds_no_place() {
+    for (beside, cause, operation) in [
+        (
+            Beside::SourceNamesAnotherHead,
+            "disagrees",
+            "immutable-submission",
+        ),
+        (Beside::CarVouches, "already green", "gated-car-guard"),
+    ] {
+        let (fixture, report, _) =
+            a_resident_request_whose_forge_answers(Forge::Unmoved, beside).await;
+        let packet = fixture.input.packet.clone();
+        assert!(report.launched.is_empty(), "{beside:?}: {report:?}");
+        assert_eq!(fixture.native.accepted.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            report
+                .settled
+                .iter()
+                .map(|s| s["packet"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec![packet.as_str()],
+            "{beside:?}: settled by the pass that read the refusal: {report:?}"
+        );
+        let step = verdict_step(&fixture).await;
+        assert_eq!(step["metadata"]["verdict"], "withdrawn", "{beside:?}");
+        let receipt: Value =
+            serde_json::from_str(step["metadata"]["receipt"].as_str().unwrap()).unwrap();
+        let because = receipt["withdrawn_because"].as_str().unwrap_or_default();
+        assert!(because.contains(cause), "{beside:?}: {because}");
+        assert_eq!(receipt["settled_by"], "resident-supervisor", "{receipt}");
+        assert_eq!(receipt["evidence"]["operation"], operation, "{receipt}");
+        assert!(
+            waiter_places(&fixture).await.is_empty(),
+            "{beside:?}: a settled request holds no place"
+        );
+    }
+}
+
+/// Backlog 48b1b7b4. A packet whose verdict is already recorded cannot be
+/// withdrawn (`withdraw_refusal`), so the supervisor retains it; but the
+/// supervisor will never launch it either, so a legacy waiter must not
+/// count it ahead of itself. The waiter reads the same refusal the
+/// supervisor reads off the packet, so the two cannot disagree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resident_the_supervisor_refuses_off_its_packet_holds_no_place() {
+    let (fixture, report, _) =
+        a_resident_request_whose_forge_answers(Forge::Unmoved, Beside::VerdictRecorded).await;
+    assert!(report.launched.is_empty(), "{report:?}");
+    assert!(report.settled.is_empty(), "{report:?}");
+    assert!(
+        report
+            .retained
+            .iter()
+            .any(|r| r["packet"] == fixture.input.packet.as_str()),
+        "{report:?}"
+    );
+    assert!(
+        waiter_places(&fixture).await.is_empty(),
+        "a request the supervisor will not launch holds no place"
+    );
+}
+
+/// UNKNOWN holds. A forge read that fails, and one that answers nothing
+/// at all — not the branch and not the forge's own HEAD, which is how a
+/// wrong or empty target answers — prove nothing about the branch, so
+/// the request is retained with the reason and nothing is settled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_forge_answer_holds_the_request_unsettled() {
+    for (forge, reason) in [
+        (Forge::Unreachable, "exact source branch read failed"),
+        (Forge::Silent, "neither the branch nor its own HEAD"),
+    ] {
+        let (fixture, report, _) =
+            a_resident_request_whose_forge_answers(forge, Beside::Nothing).await;
+        assert!(report.launched.is_empty(), "{forge:?}: {report:?}");
+        assert!(report.settled.is_empty(), "{forge:?}: {report:?}");
+        assert!(
+            report.retained.iter().any(|r| {
+                r["packet"] == fixture.input.packet.as_str()
+                    && r["reason"].as_str().is_some_and(|s| s.contains(reason))
+            }),
+            "{forge:?}: an UNKNOWN is retained, with its reason: {report:?}"
+        );
+        assert_eq!(verdict_step(&fixture).await["status"], "ready", "{forge:?}");
+        assert!(fixture.metadata().await.get("gate_orphan_claim").is_none());
+        // UNKNOWN is not never: the next pass may launch it, so a legacy
+        // waiter still counts it (backlog 48b1b7b4).
+        assert_eq!(
+            waiter_places(&fixture).await,
+            vec![fixture.input.packet.clone()],
+            "{forge:?}"
+        );
+    }
 }

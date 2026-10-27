@@ -8,7 +8,7 @@ test('the transit map has no exit ramps and scrolls away to give the shop floor 
     status: 200, contentType: 'application/json', body: JSON.stringify({ flights: ['it-map-transit'] }),
   }));
   await page.goto('/it');
-  const map = page.locator('[data-transit]');
+  const map = page.locator('section.transit[data-transit]');
   await expect(map).toBeVisible();
   await expect(map.locator('[data-ramp="exit"], [data-exits-band], [data-key-exit]')).toHaveCount(0);
   await expect(page.locator('[data-map-pin]')).toHaveAttribute('data-map-pin', 'scrolls');

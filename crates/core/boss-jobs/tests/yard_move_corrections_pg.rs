@@ -137,11 +137,12 @@ async fn postgres_and_memory_conserve_corrected_withdrawn_and_genuine_originals(
         let since = original.r#move.at - chrono::Duration::seconds(1);
         assert_eq!(
             store.correction_conservation(since).await.unwrap(),
-            move_diagnosis::Conservation {
+            boss_jobs::moves::History {
                 raw: 1,
                 active: 0,
                 superseded: 1,
-                unknown: 0
+                unknown: 0,
+                superseded_mover: 0,
             }
         );
         assert!(store.crossings(since).await.unwrap().is_empty());
@@ -170,11 +171,12 @@ async fn postgres_and_memory_conserve_corrected_withdrawn_and_genuine_originals(
         );
         assert_eq!(
             store.correction_conservation(since).await.unwrap(),
-            move_diagnosis::Conservation {
+            boss_jobs::moves::History {
                 raw: 1,
                 active: 1,
                 superseded: 0,
-                unknown: 0
+                unknown: 0,
+                superseded_mover: 0,
             }
         );
     }

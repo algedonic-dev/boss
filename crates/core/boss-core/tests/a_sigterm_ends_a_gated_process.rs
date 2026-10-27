@@ -11,16 +11,15 @@
 //! test binary as a child (the case named in `CHILD`), sends it a real
 //! SIGTERM, and reads its exit and what its recorder printed.
 
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use boss_core::event::Event;
 use boss_core::gate_evidence::{Evidence, Fact, Gate};
 use boss_core::port::EventRecorder;
+use boss_testing::reexec::{self, ReExec};
 use serde_json::json;
 
 /// The env var that makes this binary the child, naming its case.
@@ -49,7 +48,11 @@ impl EventRecorder for Panicking {
 }
 
 /// The child: a hand-off over `recorder`, one fact, then idle until
-/// SIGTERM. Prints `ready` once the fact has been handed over.
+/// SIGTERM. Says `reexec::ready()` once the fact has been handed over —
+/// NOT as its first line, because the parent may signal it only once
+/// the listener is registered. So the hand-off here is judged with the
+/// child's start, by `START_CEILING`: a hand-off wedged before it is a
+/// red with a sentence, never a hang (review 12a4ee82, B1).
 fn child(recorder: Arc<dyn EventRecorder>) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async move {
@@ -58,49 +61,46 @@ fn child(recorder: Arc<dyn EventRecorder>) {
         // Time for the task to take the fact (or to die on it), and for
         // the watcher thread to register its listener.
         tokio::time::sleep(Duration::from_millis(800)).await;
-        println!("ready");
+        reexec::ready();
         tokio::time::sleep(Duration::from_secs(60)).await;
         println!("still alive");
     });
 }
 
+/// How long the child has to exit once SIGTERMed before it is killed
+/// and the case reds: the kubelet's own grace before SIGKILL. The cases
+/// assert far less (5 s); this only keeps a child that ignores SIGTERM
+/// from holding the test to its 60 s idle.
+const SIGTERM_GRACE: Duration = Duration::from_secs(30);
+
 /// Run `case` as a child, SIGTERM it once it is ready, and answer how
 /// long it took to exit, its exit code, and every line it printed.
+///
+/// Through `boss_testing::reexec`, the one definition of this wait
+/// (backlog 7e30ddb0): the start — this whole test binary's exec and
+/// page-in, then the hand-off before `ready()` — is judged by liveness
+/// under `reexec::START_CEILING`, never by a clock that a loaded host's
+/// start can outrun. The bound this test exists for, SIGTERM to exit,
+/// starts after. Review 12a4ee82 B1: an inline copy here had dropped
+/// the ceiling, so a hand-off wedged before `ready` hung the test.
 fn terminate(case: &str, test: &str) -> (Duration, Option<i32>, Vec<String>) {
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture", "--test-threads=1"])
-        .env(CHILD, case)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let out = child.stdout.take().unwrap();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(out).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    let mut lines = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !lines.iter().any(|l: &String| l.ends_with("ready")) {
-        let line = rx
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or_else(|_| panic!("the child never got ready: {lines:?}"));
-        lines.push(line);
+    let mut re = ReExec::new(test);
+    re.command().arg("--test-threads=1").env(CHILD, case);
+    let mut run = re.spawn();
+    if run.ready().is_err() {
+        let done = run.finish(Duration::ZERO);
+        panic!("the child ended before it got ready: {done:?}");
     }
     let sent = Instant::now();
     let status = Command::new("sh")
-        .args(["-c", &format!("kill -TERM {}", child.id())])
+        .args(["-c", &format!("kill -TERM {}", run.child().id())])
         .status()
         .unwrap();
     assert!(status.success(), "kill -TERM failed");
-    let exit = child.wait().unwrap();
+    let done = run.finish(SIGTERM_GRACE);
     let took = sent.elapsed();
-    lines.extend(rx.try_iter());
-    (took, exit.code(), lines)
+    let lines = done.stdout.lines().map(str::to_string).collect();
+    (took, done.status.and_then(|s| s.code()), lines)
 }
 
 /// A healthy hand-off at SIGTERM drains what it holds, states a clean

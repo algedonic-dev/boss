@@ -151,7 +151,7 @@ test('the board stands above the map with four rows, and the three-thirds rows a
   await expect(hud).not.toContainText('Queue management');
   // Above the map.
   const hudTop = (await hud.boundingBox())!.y;
-  const mapTop = (await page.locator('section.yard svg').boundingBox())!.y;
+  const mapTop = (await page.locator('section.transit svg[role="group"]').boundingBox())!.y;
   expect(hudTop).toBeLessThan(mapTop);
   await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
 });
@@ -233,6 +233,33 @@ test('EMPTY: each row says so in words — an answer, not a blank', async ({ pag
   await expect(row(page, 'next-up').locator('[data-state="empty"] .hud-words')).toHaveText('Nothing is due ahead.');
   await expect(row(page, 'machines').locator('.hud-machine-line [data-fig]')).toHaveText(['0', '0', '5']);
   await expect(page.locator(`${HUD} [data-fig="unread"]`)).toHaveCount(0);
+});
+
+// Backlog 97b5cf45: the server says when the queue it answered was cut
+// (`truncated`, `total` counted before the cut — 09074ada). The row drew
+// the rows it got as a plain count, so a cut queue read as a complete,
+// smaller one. A cut count is a floor, and the cut is said in words.
+test('CUT: a truncated answer counts a floor and says it was cut — never a whole, smaller queue', async ({ page }) => {
+  await board(page, regions(), (r) => json(r, { ...NEEDS, total: 9, truncated: true }));
+  await page.goto('/it');
+  const needs = row(page, 'needs-you');
+  await expect(needs.locator('li[data-need]')).toHaveCount(2);
+  const floor = needs.locator('.hud-count [data-fig="floor"]');
+  await expect(floor).toHaveText('2?');
+  await expect(floor).toHaveAttribute('title', '2 of at least 9 rows read — the answer was cut at its limit');
+  await expect(needs.locator('.hud-count [data-fig="value"]')).toHaveCount(0);
+  await expect(needs.locator('[data-cut]')).toHaveText('cut: 2 of at least 9 rows read — the answer was cut at its limit');
+  // The transit overview's one-line summary says the count is a floor, too.
+  await page.goto('/it?view=overview');
+  await expect(page.locator('details.map-context summary')).toContainText('Needs you: 2+ ·');
+});
+
+test('WHOLE: an untruncated answer draws a plain count and no cut', async ({ page }) => {
+  await board(page, regions(), (r) => json(r, { ...NEEDS, truncated: false }));
+  await page.goto('/it');
+  const needs = row(page, 'needs-you');
+  await expect(needs.locator('.hud-count [data-fig="value"]')).toHaveText('2');
+  await expect(needs.locator('[data-cut]')).toHaveCount(0);
 });
 
 test('UNREAD, an older server: absent fields and an ignored for=me are unread with the reason — never empty', async ({ page }) => {

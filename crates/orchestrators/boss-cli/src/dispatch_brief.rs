@@ -32,12 +32,58 @@ pub(crate) async fn retain_at(
     }
     let brief = body["metadata"]["brief"]
         .as_str()
-        .context("run has no complete inline brief")?;
+        .context("run has no complete inline brief")?
+        .to_string();
+    let (reference, reused) = retain_text_held_at(http, content_base, actor, packet, &brief)
+        .await
+        .context("retaining the entire dispatch brief before run admission")?;
+    body["metadata"]["brief"] = reference.clone();
+    if serde_json::to_vec(&body)?.len() > INLINE_BODY_BYTES {
+        bail!("run metadata remains oversized after retaining its full brief; no run admitted");
+    }
+    // A second dispatch of identical bytes holds the attachment the
+    // packet already has, read back and verified (backlog e5490f2e).
+    let held = if reused { "already held" } else { "retained" };
+    eprintln!(
+        "boss dispatch: full brief {held} as attachment {} ({} bytes, sha256 {}); the run records the verified reference, not omitted prose",
+        reference["file_id"].as_str().unwrap_or("?"),
+        reference["size_bytes"],
+        reference["sha256"].as_str().unwrap_or("?")
+    );
+    Ok(body)
+}
+
+/// Retain `text` WHOLE as a verified attachment on `packet` and return the
+/// immutable reference [`read_at`] verifies — the one door every original a
+/// run records goes through: an oversized brief, and a bounded START's
+/// packet snapshot and legacy brief (design e72dc7c9).
+pub(crate) async fn retain_text_at(
+    http: &crate::machine_http::MachineClient,
+    content_base: &str,
+    actor: &str,
+    packet: &str,
+    text: &str,
+) -> Result<Value> {
+    Ok(retain_text_held_at(http, content_base, actor, packet, text)
+        .await?
+        .0)
+}
+
+/// [`retain_text_at`], also saying whether the file store already held
+/// these exact bytes on `packet` (backlog e5490f2e) rather than storing
+/// them anew.
+async fn retain_text_held_at(
+    http: &crate::machine_http::MachineClient,
+    content_base: &str,
+    actor: &str,
+    packet: &str,
+    text: &str,
+) -> Result<(Value, bool)> {
     let mut file = tempfile::Builder::new()
         .prefix("boss-dispatch-brief-")
         .suffix(".txt")
         .tempfile()?;
-    file.write_all(brief.as_bytes())?;
+    file.write_all(text.as_bytes())?;
     file.flush()?;
     let attached = crate::attach::attach_at(
         http,
@@ -50,24 +96,27 @@ pub(crate) async fn retain_at(
         file.path(),
         crate::identity::Signature::As(actor.to_string()),
     )
-    .await
-    .context("retaining the entire dispatch brief before run admission")?;
-    let reference = BriefFile {
+    .await?;
+    if attached.size_bytes != text.len() as u64
+        || attached.sha256 != hex::encode(Sha256::digest(text.as_bytes()))
+    {
+        bail!(
+            "the file store recorded {} bytes, sha256 {} for an original of {} bytes — not the \
+             bytes sent; no run admitted",
+            attached.size_bytes,
+            attached.sha256,
+            text.len()
+        );
+    }
+    let reused = attached.reused;
+    let reference = serde_json::to_value(BriefFile {
         kind: "attachment".into(),
         file_id: attached.file_id,
         sha256: attached.sha256,
         size_bytes: attached.size_bytes,
         encoding: "utf-8".into(),
-    };
-    body["metadata"]["brief"] = serde_json::to_value(&reference)?;
-    if serde_json::to_vec(&body)?.len() > INLINE_BODY_BYTES {
-        bail!("run metadata remains oversized after retaining its full brief; no run admitted");
-    }
-    eprintln!(
-        "boss dispatch: full brief retained as attachment {} ({} bytes, sha256 {}); the run records the verified reference, not omitted prose",
-        reference.file_id, reference.size_bytes, reference.sha256
-    );
-    Ok(body)
+    })?;
+    Ok((reference, reused))
 }
 
 /// A native executor accepts the original string or a verified complete
@@ -239,6 +288,33 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    /// Backlog e5490f2e, the measured case: a second dispatch of the
+    /// same packet renders byte-identical brief bytes, and its retention
+    /// was refused `POST /api/files -> 409 <digest>` BEFORE run admission.
+    /// Through the real store it now holds the one verified attachment,
+    /// and each body still carries its own complete reference.
+    #[tokio::test]
+    async fn a_second_dispatch_of_identical_brief_bytes_holds_the_one_verified_attachment() {
+        let brief = "the same complete brief, rendered twice\n".repeat(30_000);
+        let http = crate::sor_client::machine_client().unwrap();
+        let base = crate::attach::tests::store().await;
+        let packet = "39d0b528-ff69-4cb8-ba82-408b641da66c";
+        let first = retain_at(&http, &base, "agent-test", packet, body(&brief))
+            .await
+            .unwrap();
+        let second = retain_at(&http, &base, "agent-test", packet, body(&brief))
+            .await
+            .expect("the identical retention is a verified reuse, not a 409");
+        assert_eq!(first["metadata"]["brief"], second["metadata"]["brief"]);
+        for held in [&first, &second] {
+            assert_eq!(
+                read_at(&http, &base, "agent-test", &held["metadata"]["brief"])
+                    .await
+                    .unwrap(),
+                brief
+            );
+        }
     }
     #[tokio::test]
     async fn an_unconfigured_store_and_its_existing_file_limit_refuse_without_reduction() {
