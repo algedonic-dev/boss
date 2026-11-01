@@ -182,6 +182,16 @@ pub const STUCK_AT_CAPACITY: Band = band(
     "its capacity, nothing leaving past 4× the out-route's mean gap",
     0,
 );
+/// ABOVE ITS CAPACITY: more in the region than its bound admits — a bound
+/// that did not hold, not a region doing its job (backlog ac8d3157: four
+/// gates in three bays drew as `full` for 31 minutes on 2026-10-17).
+pub const OVER_CAPACITY: Band = band(
+    "over-capacity",
+    "*",
+    Troubled,
+    "more in use than its capacity admits",
+    0,
+);
 
 // --- gates ------------------------------------------------------------
 
@@ -240,8 +250,21 @@ pub const TRACK_GATE_FALLBACK: Band = band(
     "a train judged by CI alone",
     0,
 );
+/// A train gate the conductor tried to file and could not, for any
+/// reason but the bound (a manifest that does not render, kubectl, RBAC,
+/// an unresolved recovery): the train holds no place in the gate line, so
+/// no bay that frees will file it, and the fault is ours the pass it is
+/// recorded — no hold (review a2ace778 of car 1585a455).
+pub const TRACK_GATE_LAUNCH_FAILING: Band = band(
+    "track-gate-launch-failing",
+    "*",
+    Troubled,
+    "a train gate the conductor cannot file",
+    0,
+);
 /// The conductor has not filed a train's gate yet (the bound was full on
-/// its last launch). It retries every pass, a minute apart, and clears
+/// its last launch, or a gate-run ended owed a relaunch: the train's
+/// `train_gate_bound_wait`). It retries every pass, a minute apart, and clears
 /// the marker the pass it files — so a wait of a few passes is the bound
 /// working, and ten minutes of it is worth a look. The wait is dated
 /// from the record (`regions::train_gate_wait_since`), so this hold is
@@ -421,12 +444,26 @@ pub const MARSHALLING_OVER_LIMIT: Band = band(
     "a station's WIP limit",
     0,
 );
-/// A station holding work that nothing left in the whole window.
+/// A station holding work that nothing left in the whole window, and
+/// some of it is not a qualified wait: a step with no owner, past its
+/// declared bound, or whose bound or onset the record does not hold.
 pub const MARSHALLING_NOT_DRAINING: Band = band(
     "marshalling-not-draining",
     "marshalling",
     Troubled,
     "a station that served nothing in the window",
+    0,
+);
+/// A station that served nothing in the window, every step standing
+/// there waiting on its named owner inside the bound its pinned protocol
+/// declares (backlog 6254e602, design 5da17ace): an understood wait, worth
+/// watching, and no immediate action — so not red. Past the bound it is
+/// [`MARSHALLING_NOT_DRAINING`] again.
+pub const MARSHALLING_OWNED_WAIT: Band = band(
+    "marshalling-owned-wait",
+    "marshalling",
+    Attention,
+    "a station whose steps wait on their named owners inside their declared bounds",
     0,
 );
 
@@ -562,6 +599,7 @@ pub const BANDS: &[Band] = &[
     MACHINE_FAILED,
     FULL,
     STUCK_AT_CAPACITY,
+    OVER_CAPACITY,
     DOCK_CANNOT_BOARD,
     DOCK_EDGE_NEVER_CLEARS,
     GATES_LINE_LONG,
@@ -569,6 +607,7 @@ pub const BANDS: &[Band] = &[
     GATES_RUN_LONG,
     TRACK_BLOCKED,
     TRACK_GATE_FALLBACK,
+    TRACK_GATE_LAUNCH_FAILING,
     TRACK_GATE_WAITING,
     SHED_UNPROVEN,
     SHED_FAILING,
@@ -591,6 +630,7 @@ pub const BANDS: &[Band] = &[
     RECEIVING_STALE,
     MARSHALLING_OVER_LIMIT,
     MARSHALLING_NOT_DRAINING,
+    MARSHALLING_OWNED_WAIT,
     SHOP_FLOOR_UNREPORTED,
     PUBLISH_UNJUDGED_RED,
     PUBLISH_PR_RED,
@@ -785,6 +825,7 @@ pub struct OutRail {
 ///     [`STILL_AFTER_GAPS`] mean gaps. Held since it filled.
 ///   * troubled, [`STUCK_AT_CAPACITY`]: past them. Held since the quiet
 ///     ran out; at once where the record dates neither end.
+///   * troubled, [`OVER_CAPACITY`]: more than the bound, at once.
 ///   * troubled, [`UNREAD`]: an out-rail whose crossings could not be
 ///     read — whether it moves cannot be told, and a bound reached with
 ///     no evidence of motion is not drawn as a good state.
@@ -802,6 +843,19 @@ pub fn at_capacity(
 ) -> Option<Finding> {
     if bound == 0 || count < bound {
         return None;
+    }
+    // Past the bound the rule has one answer, whatever the out-route does:
+    // the bound did not hold (backlog ac8d3157). Never the good state.
+    if count > bound {
+        return Some(Finding::new(
+            OVER_CAPACITY,
+            None,
+            format!("{} over", count - bound),
+            format!(
+                "{what} — {} over its capacity of {bound}: a bound that did not hold",
+                count - bound
+            ),
+        ));
     }
     let names = || {
         rails
@@ -1080,6 +1134,42 @@ mod tests {
         assert_eq!(at_capacity(2, 3, "2 of 3", None, &rails, 24, t(NOW)), None);
         // A bound of nothing bounds nothing (an undeclared cap is not 0).
         assert_eq!(at_capacity(0, 0, "0", None, &rails, 24, t(NOW)), None);
+    }
+
+    /// ABOVE ITS BOUND IS NOT FULL (backlog ac8d3157). Four gates ran in
+    /// three bays for 31 minutes on 2026-10-17 and the region drew it as
+    /// the good state, "full and moving", because the rule read `>=` as
+    /// one case. A bound that did not hold is trouble whatever the
+    /// out-route does, at once, and the sentence says by how many.
+    #[test]
+    fn above_its_bound_a_capacity_region_is_troubled_not_full() {
+        let moving = hourly("2026-09-24T11:50:00Z");
+        let f = at_capacity(
+            4,
+            3,
+            "4 of 3 bays in use",
+            Some(t("2026-09-24T11:20:00Z")),
+            &moving,
+            24,
+            t(NOW),
+        )
+        .expect("judged");
+        assert_eq!(f.band.id, OVER_CAPACITY.id);
+        let s = settle(vec![f], "4 of 3 bays in use".into(), t(NOW));
+        assert_eq!(s.state, RegionState::Troubled, "{}", s.why);
+        assert!(s.why.contains("1 over its capacity of 3"), "{}", s.why);
+        // The pin: whatever the count, nothing past the bound reads as a
+        // good state, and nothing at or under it reads as this band.
+        for count in 0..=6 {
+            let f = at_capacity(count, 3, "n of 3", None, &moving, 24, t(NOW));
+            let over = f.as_ref().is_some_and(|f| f.band.id == OVER_CAPACITY.id);
+            assert_eq!(over, count > 3, "{count}: {f:?}");
+            if f.as_ref()
+                .is_some_and(|f| f.band.state != RegionState::Troubled)
+            {
+                assert!(count <= 3, "{count} in use of 3 drew as {f:?}");
+            }
+        }
     }
 
     /// FULL: at the bound, and a verdict landed ten minutes ago — well

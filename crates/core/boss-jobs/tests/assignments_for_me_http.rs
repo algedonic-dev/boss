@@ -442,6 +442,144 @@ async fn an_active_claim_in_my_queue_names_its_run_or_says_it_has_none() {
     );
 }
 
+/// One open urgent item whose `build` step `who` holds ACTIVE.
+async fn claimed_item(jobs: &InMemoryJobs, title: &str, who: &str) -> Job {
+    let item = Job {
+        id: JobId::new(),
+        status: JobStatus::Open,
+        metadata: json!({}),
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "s"),
+            title,
+            who,
+            Priority::Urgent,
+            NaiveDate::from_ymd_opt(2026, 10, 9).unwrap(),
+        )
+    };
+    jobs.create_job_at(&item, t("2026-10-09T00:00:00Z"), &[])
+        .await
+        .unwrap();
+    let mut build = Step::new(item.id, "task", "Build", 0);
+    build.id = StepId::new();
+    build.spec_slug = Some("build".into());
+    build.assignee_id = Some(who.into());
+    build.status = StepStatus::Active;
+    jobs.add_step_at(&build, t("2026-10-09T00:00:00Z"), &[])
+        .await
+        .unwrap();
+    item
+}
+
+/// The `run` a titled row of a queue read carries, if any.
+fn run_on(v: &Value, title: &str) -> Option<Value> {
+    v["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no data in {v}"))
+        .iter()
+        .find(|r| r["job_title"] == title)
+        .unwrap_or_else(|| panic!("{title} in the queue: {v}"))
+        .get("run")
+        .cloned()
+}
+
+/// A PERSON'S OWN CLAIM CARRIES NO RUN, EVEN WHEN THE RUNS WERE NOT READ
+/// (backlog 1927aca5, landed-review da21596d of car 181a77e3). A
+/// `self`-scoped caller cannot read the runs whole, but the agents
+/// registry IS read, so it is known that a person holds the step — and
+/// a person's claim never has a run. It read `unread`, which `boss
+/// orient` prints in NEEDS YOU and MY WORK as a run nobody could read.
+#[tokio::test]
+async fn a_persons_own_claim_carries_no_run_under_a_narrowed_scope() {
+    let (app, jobs) = app(registry());
+    claimed_item(&jobs, "mine", "emp-sam").await;
+    let (status, v) = get(
+        &app,
+        "/api/jobs/assignments?for=me",
+        Some(user_header("emp-sam", "sales")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(run_on(&v, "mine"), None, "a person's claim has no run: {v}");
+}
+
+/// A CUT PAGE OF RUNS IS DISCARDED BEFORE ITS STEPS ARE READ (backlog
+/// 1927aca5, landed-review da21596d finding 2). The queue judges a
+/// claim only on a WHOLE read of the open runs, and the read fetched
+/// every run's steps — up to a page of them, one sequential read each —
+/// and only then dropped the page as cut, so past a page of open runs
+/// every `for=me` with an active row paid a thousand reads to answer
+/// `unread`. Measured here on the answer AND on the store: the claim
+/// still reads `unread`, and no run's steps were read for it. The
+/// in-memory store answers the assignments query itself by scanning
+/// every open packet's steps (the port's default; Postgres is one
+/// JOIN), so the measure is against a CONTROL — an open packet that is
+/// not a run, which only that scan reads: each run's steps are read no
+/// more often than the control's.
+#[tokio::test]
+async fn a_cut_page_of_runs_reads_unread_without_reading_any_runs_steps() {
+    let (app, jobs) = app(registry());
+    let item = claimed_item(&jobs, "claimed", AGENT).await;
+    let control = Job {
+        id: JobId::new(),
+        status: JobStatus::Open,
+        metadata: json!({}),
+        ..Job::new(
+            "backlog-item",
+            Subject::new("custom", "c"),
+            "control",
+            "emp-david",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 10, 9).unwrap(),
+        )
+    };
+    jobs.create_job_at(&control, t("2026-10-09T00:00:00Z"), &[])
+        .await
+        .unwrap();
+    let mut runs = Vec::new();
+    // One more than the page the read takes (`MAX_LIMIT`, 1000).
+    for n in 0..1001 {
+        let run = Job {
+            id: JobId::new(),
+            status: JobStatus::Open,
+            metadata: json!({ "packet": item.id.to_string(), "step": "build" }),
+            ..Job::new(
+                "agent-run",
+                Subject::new("custom", "r"),
+                format!("builder run {n}"),
+                AGENT,
+                Priority::Standard,
+                NaiveDate::from_ymd_opt(2026, 10, 9).unwrap(),
+            )
+        };
+        jobs.create_job_at(&run, t("2026-10-09T00:00:00Z"), &[])
+            .await
+            .unwrap();
+        runs.push(run.id);
+    }
+    // Only the request's reads count, not admission's.
+    let before: Vec<usize> = runs.iter().map(|id| jobs.steps_reads(id)).collect();
+    let control_before = jobs.steps_reads(&control.id);
+    let (status, v) = get(
+        &app,
+        "/api/jobs/assignments?for=me",
+        Some(user_header(AGENT, "platform-admin")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(run_on(&v, "claimed"), Some(json!({ "state": "unread" })));
+    let scanned = jobs.steps_reads(&control.id) - control_before;
+    let over: usize = runs
+        .iter()
+        .zip(before)
+        .filter(|(id, was)| jobs.steps_reads(id) - was > scanned)
+        .count();
+    assert_eq!(
+        over, 0,
+        "runs whose steps were read for a page that was then discarded"
+    );
+}
+
 #[tokio::test]
 async fn an_unknown_for_or_one_beside_a_selector_is_refused() {
     let (app, _) = app(registry());
@@ -455,4 +593,88 @@ async fn an_unknown_for_or_one_beside_a_selector_is_refused() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+}
+
+/// Five packets, one ready step each: three nominated to the agent's id
+/// opened first, then two nominated to its alias opened LAST — the
+/// newest nominations, which sort past any cut (backlog 09074ada).
+async fn seed_past_the_cut(jobs: &InMemoryJobs) {
+    let nominations = [
+        (AGENT, "2026-10-01"),
+        (AGENT, "2026-10-02"),
+        (AGENT, "2026-10-03"),
+        (ALIAS, "2026-10-04"),
+        (ALIAS, "2026-10-05"),
+    ];
+    for (n, (who, day)) in nominations.into_iter().enumerate() {
+        let opened = NaiveDate::parse_from_str(day, "%Y-%m-%d").unwrap();
+        let job = Job {
+            id: JobId::new(),
+            status: JobStatus::Open,
+            metadata: json!({}),
+            ..Job::new(
+                "backlog-item",
+                Subject::new("custom", "s"),
+                format!("nomination {n}"),
+                "emp-david",
+                Priority::Standard,
+                opened,
+            )
+        };
+        let at = t(&format!("{day}T00:00:00Z"));
+        jobs.create_job_at(&job, at, &[]).await.unwrap();
+        let mut s = Step::new(job.id, "task", format!("nomination {n}"), 0);
+        s.id = StepId::new();
+        s.spec_slug = Some("build".into());
+        s.assignee_id = Some(who.to_string());
+        s.status = StepStatus::Ready;
+        jobs.add_step_at(&s, at, &[]).await.unwrap();
+    }
+}
+
+/// A for=me answer cut at its limit SAYS it was cut (backlog 09074ada).
+/// Until then `total` was counted after the cut, so three rows of five
+/// answered `total: 3` — indistinguishable from a whole queue — and the
+/// alias's two newest nominations simply were not there. `boss dispatch
+/// --next` read that as the caller's whole inbox and reported "none
+/// nominated" past 1000 rows. The total is now counted before the cut,
+/// and `truncated` names a cut answer; a whole answer says false.
+#[tokio::test]
+async fn a_for_me_answer_cut_at_its_limit_says_it_was_cut() {
+    let (app, jobs) = app(registry());
+    seed_past_the_cut(&jobs).await;
+    let who = || Some(user_header(AGENT, "platform-admin"));
+
+    let (status, cut) = get(&app, "/api/jobs/assignments?for=me&limit=3", who()).await;
+    assert_eq!(status, StatusCode::OK, "{cut}");
+    assert_eq!(cut["data"].as_array().map(Vec::len), Some(3), "{cut}");
+    assert_eq!(
+        titles(&cut),
+        ["nomination 0", "nomination 1", "nomination 2"],
+        "the oldest three survive the cut: {cut}"
+    );
+    assert_eq!(cut["total"], 5, "total counted before the cut: {cut}");
+    assert_eq!(cut["truncated"], true, "a cut answer says so: {cut}");
+
+    // A cut on ONE spelling's own read is a cut too: the agent's id
+    // holds three rows, so at limit=2 that read alone was full.
+    let (_, one) = get(&app, "/api/jobs/assignments?for=me&limit=2", who()).await;
+    assert_eq!(one["truncated"], true, "{one}");
+    assert!(
+        one["total"].as_u64().is_some_and(|t| t > 2),
+        "a cut total is never the rows handed back: {one}"
+    );
+
+    // Controls: exactly at the limit and above it, the answer is whole.
+    for limit in [5, 10] {
+        let (_, whole) = get(
+            &app,
+            &format!("/api/jobs/assignments?for=me&limit={limit}"),
+            who(),
+        )
+        .await;
+        assert_eq!(whole["data"].as_array().map(Vec::len), Some(5), "{whole}");
+        assert_eq!(whole["total"], 5, "{whole}");
+        assert_eq!(whole["truncated"], false, "limit={limit}: {whole}");
+    }
 }

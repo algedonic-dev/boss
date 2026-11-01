@@ -31,7 +31,7 @@ use crate::yard;
 
 // Gate-runs have a recency read and a separate held read. The car
 // cross-reference below reads every scoped car, including closed ones.
-use yard::{GATE_RUN_WINDOW, HELD_RUN_PAGE, HELD_RUN_PAGES};
+use yard::GATE_RUN_WINDOW;
 /// Keep closed trains from the last two weeks in the "recent" window —
 /// "recently arrived/cancelled", the tail the surface shows beside the
 /// in-flight trains.
@@ -106,7 +106,7 @@ pub(super) struct YardRead {
     pub health: yard::ConductorHealth,
     pub gate_runs_truncated: bool,
     /// Open pr-trains with their steps — the train-gate wait
-    /// (`regions::train_gate_troubled`) is a fact on the job's metadata
+    /// (`regions::train_gate_unfiled`) is a fact on the job's metadata
     /// that the status does not carry.
     pub open_trains: Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)>,
 }
@@ -160,12 +160,16 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
         None,
         Some((now - chrono::Duration::days(RECENT_TRAIN_DAYS)).date_naive()),
     );
-    let open_rows = match state
-        .jobs
-        .list_jobs(&in_flight, yard::TRAIN_WINDOW, 0)
+    // "Read whole" is the paged read to the total, not one page of it:
+    // until 5d96c12d this was `list_jobs(&in_flight, TRAIN_WINDOW, 0)`
+    // with the total dropped, so past TRAIN_WINDOW open trains the rest
+    // left `trains` with nothing saying the population was cut (pinned
+    // by `every_open_train_is_on_the_board_past_one_window`). A failed
+    // page still fails the request, as the single read did.
+    let open_rows = match crate::list_every::list_every(state.jobs.as_ref(), &in_flight, MAX_LIMIT)
         .await
     {
-        Ok((rows, _)) => rows,
+        Ok(rows) => rows,
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
     };
     let recent_rows = match state.jobs.list_jobs(&recent, yard::TRAIN_WINDOW, 0).await {
@@ -186,29 +190,48 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
     // is a fact about the steps — not holding the track, so a read
     // failure reported the track CLEAR (31783deb). The steps are not a
     // garnish on a train row; they are what the row means.
-    let mut open_trains: Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)> = Vec::new();
-    for job in open_rows {
-        let steps = match state.jobs.list_steps(&job.id).await {
-            Ok(steps) => steps,
-            Err(e) => {
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response());
-            }
-        };
-        open_trains.push((job, steps));
-    }
-    let mut closed_trains: Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)> = Vec::new();
-    for job in recent_rows
+    let recent_rows: Vec<_> = recent_rows
         .into_iter()
         .filter(|j| j.status != JobStatus::Open)
-    {
-        let steps = match state.jobs.list_steps(&job.id).await {
+        .collect();
+    // The selected recent tail can hold sixty trains (d9b39685). Attach
+    // their steps in one storage read, preserving both lists' own order;
+    // more round trips must not be the price of retaining every phase.
+    let ids: Vec<_> = open_rows.iter().chain(&recent_rows).map(|j| j.id).collect();
+    let mut occurrences = std::collections::HashMap::<_, usize>::new();
+    for id in &ids {
+        *occurrences.entry(*id).or_default() += 1;
+    }
+    let steps = if ids.is_empty() {
+        Vec::new()
+    } else {
+        match state.jobs.list_steps_for_jobs(&ids).await {
             Ok(steps) => steps,
             Err(e) => {
                 return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response());
             }
-        };
-        closed_trains.push((job, steps));
+        }
+    };
+    let mut by_train = std::collections::HashMap::<_, Vec<_>>::new();
+    for step in steps {
+        by_train.entry(step.job_id).or_default().push(step);
     }
+    // A train may close between the separate lists and occur in both.
+    // Clone only repeated associations; the last use owns the original.
+    let mut attach = |job: boss_core::job::Job| {
+        let repeated = occurrences.get_mut(&job.id).is_some_and(|left| {
+            *left -= 1;
+            *left > 0
+        });
+        let steps = if repeated {
+            by_train.get(&job.id).cloned().unwrap_or_default()
+        } else {
+            by_train.remove(&job.id).unwrap_or_default()
+        };
+        (job, steps)
+    };
+    let open_trains: Vec<_> = open_rows.into_iter().map(&mut attach).collect();
+    let closed_trains: Vec<_> = recent_rows.into_iter().map(attach).collect();
 
     // Every scoped car, including closed ones: absence from this set
     // means a gate never became a car, not that its car fell out of a
@@ -371,32 +394,27 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
         .await
         .unwrap_or_default();
     let gate_runs_truncated = gate_runs_total > GATE_RUN_WINDOW;
-    let held_runs = {
-        let filter = gate_run(Some("hold"));
-        let mut out = Vec::new();
-        for page in 0..HELD_RUN_PAGES {
-            let Ok((rows, total)) = state
-                .jobs
-                .list_jobs(&filter, HELD_RUN_PAGE, page * HELD_RUN_PAGE)
-                .await
-            else {
-                break;
-            };
-            let read = rows.len() as i64;
-            out.extend(rows);
-            if read < HELD_RUN_PAGE || (page + 1) * HELD_RUN_PAGE >= total {
-                break;
-            }
-            if page + 1 == HELD_RUN_PAGES {
-                tracing::warn!(
-                    total,
-                    read = out.len(),
-                    "yard: held gate-run read hit its page cap — older holds unread"
-                );
-            }
-        }
-        out
-    };
+    // EVERY held run, through the one paged-read door, and a page that
+    // fails fails the yard (backlog 4e918604). This read used to turn at
+    // most five pages of 400 and then warn and go on with what it held:
+    // measured 2026-10-19, 2214 held runs on record, the warning fired
+    // once per map read, and every region, border and the mover judged
+    // held runs from 2000 of them — and a failed page was a `break` that
+    // answered 200 from the rows already read. A read that cannot finish
+    // is not an empty one. Reading all of it costs fewer queries than
+    // the five 400-row pages did (three of 1000 for 2358 holds on
+    // 2026-10-20); the set's growth is the retire door's to bound
+    // (1fb357f4), not a cap's to hide.
+    let held_runs =
+        crate::list_every::list_every(state.jobs.as_ref(), &gate_run(Some("hold")), MAX_LIMIT)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("yard: the held gate-run read could not finish: {e}"),
+                )
+                    .into_response()
+            })?;
     // Resident requests do not expire with a client heartbeat or recency window.
     let open_runs = crate::list_every::list_every(
         state.jobs.as_ref(),
@@ -409,7 +427,7 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
     let gate_runs = {
-        let mut out: Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)> =
+        let mut rows: Vec<boss_core::job::Job> =
             Vec::with_capacity(recent_runs.len() + held_runs.len());
         // The recency page first, so `held_greens`' first-seen-wins
         // de-dup keeps the order the page already had; a held run the
@@ -422,7 +440,7 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
                 .into_iter()
                 .filter(|j| !crate::stranded::is_train_gate(&j.metadata)),
         ) {
-            if out.iter().any(|(seen, _)| seen.id == job.id) {
+            if rows.iter().any(|seen| seen.id == job.id) {
                 continue;
             }
             // A failed steps read FAILS the request, as it does for the
@@ -430,13 +448,19 @@ pub(super) async fn read_yard<R: JobsRepository + 'static, B: EventBus + 'static
             // ARE its verdict. Read as empty, a green run had no green,
             // and its stranded car fell out of the stranded lane with a
             // 200 (backlog f6c97006).
-            let steps = match state.jobs.list_steps(&job.id).await {
-                Ok(steps) => steps,
-                Err(e) => return Err(steps_unreadable(&job.id, &e)),
-            };
-            out.push((job, steps));
+            rows.push(job);
         }
-        out
+        // Preserve the selected first-seen population and its ordering,
+        // without paying a database round trip for each retained run.
+        rows_with_steps(state.jobs.as_ref(), rows)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("yard: gate-run step batch could not be read: {e}"),
+                )
+                    .into_response()
+            })?
     };
 
     // The arrived population the in-flight ETA is measured against — a
@@ -626,7 +650,7 @@ async fn converge_window<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &JobsApiState<R, B>,
     scope: &crate::port::JobScope,
 ) -> Option<Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)>> {
-    let mut out: Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)> = Vec::new();
+    let mut selected = Vec::new();
     for kind in
         std::iter::once(crate::landing::CLUSTER_CONVERGE).chain(crate::landing::HOST_CONVERGES)
     {
@@ -640,12 +664,35 @@ async fn converge_window<R: JobsRepository + 'static, B: EventBus + 'static>(
             .list_jobs(&filter, crate::landing::CONVERGE_WINDOW, 0)
             .await
             .ok()?;
-        for job in rows {
-            let steps = state.jobs.list_steps(&job.id).await.ok()?;
-            out.push((job, steps));
-        }
+        selected.extend(rows);
     }
-    Some(out)
+    // One failure still withholds the entire multi-host window. A partial
+    // successful host list must never read as complete converge evidence.
+    rows_with_steps(state.jobs.as_ref(), selected).await.ok()
+}
+
+/// Attach all original ordered steps to an already selected population.
+/// Selection, scope and page bounds belong to the callers; the batch port
+/// only replaces their per-packet storage round trips (d9b39685).
+async fn rows_with_steps<R: JobsRepository>(
+    jobs: &R,
+    rows: Vec<boss_core::job::Job>,
+) -> Result<Vec<(boss_core::job::Job, Vec<boss_core::job::Step>)>, crate::JobsError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<_> = rows.iter().map(|job| job.id).collect();
+    let mut by_job = std::collections::HashMap::<_, Vec<_>>::new();
+    for step in jobs.list_steps_for_jobs(&ids).await? {
+        by_job.entry(step.job_id).or_default().push(step);
+    }
+    Ok(rows
+        .into_iter()
+        .map(|job| {
+            let steps = by_job.remove(&job.id).unwrap_or_default();
+            (job, steps)
+        })
+        .collect())
 }
 
 /// One board rule's newest firing, by the read the conductor makes
@@ -703,13 +750,12 @@ async fn dock_cars<R: JobsRepository + 'static, B: EventBus + 'static>(
             crate::list_every::list_every(state.jobs.as_ref(), &filter, MAX_LIMIT).await
         {
             let mut members = Vec::new();
-            for job in jobs {
+            for (job, steps) in rows_with_steps(state.jobs.as_ref(), jobs).await.ok()? {
                 // A failed steps read makes the dock UNREAD, which is
                 // what this `Option` is for. Defaulted to no steps it
                 // made a HELD car look unheld — boardable — which is the
                 // permissive answer and the one lane this read exists to
                 // get right.
-                let steps = state.jobs.list_steps(&job.id).await.ok()?;
                 if yard::on_the_dock(&spec.predicate, &job, &steps) {
                     members.push((job, steps));
                 }

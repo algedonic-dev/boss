@@ -594,6 +594,112 @@ Error: src/it/yard/yard.svelte:12:3 Type 'string' is not assignable to 'number'
     );
 }
 
+/// One crate's compile error, in the shape rustc prints it: the coded
+/// `error[E0308]:` line, its `-->` location, the source frame, and
+/// cargo's `could not compile` summary last. The site is red train
+/// 1042cc8a's (2026-10-19): an E0308 in boss-cli's identity_tests.rs.
+fn rustc_e0308(krate: &str, path: &str, line: u32) -> String {
+    format!(
+        "    Checking {krate} v0.1.0 (/gate/src/crates/{krate})
+error[E0308]: mismatched types
+   --> {path}:{line}:9
+    |
+{line} |         Some(\"x\"),
+    |         ^^^^^^^^^ expected `&str`, found `Option<&str>`
+    |
+    = note: expected reference `&str`
+                    found enum `Option<&'static str>`
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `{krate}` (lib test) due to 1 previous error
+"
+    )
+}
+
+/// A coded rustc error is the cause; `could not compile` is cargo's
+/// summary of it. Red train 1042cc8a's alarm read `clippy: … 1 error
+/// line(s), first 1: … error: could not compile boss-cli … due to 1
+/// previous error`, and the E0308 with its file and line was only in
+/// the log tail (backlog 6e2709ab): RE_ERROR's `\b` after the optional
+/// `[E0308]` group could never match, because `]` then `:` are two
+/// non-word characters, so every coded error was dropped and the
+/// summary was the one error line left. A verdict must name what failed.
+#[test]
+fn a_compile_red_quotes_the_coded_rustc_error_and_its_location() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let path = "crates/orchestrators/boss-cli/src/gate/reservation/identity_tests.rs";
+    let log = format!(
+        "::group::gate: clippy\n{}::endgroup::\n",
+        rustc_e0308("boss-cli", path, 157)
+    );
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"clippy\",\"result\":\"fail\"}"),
+        &log,
+    );
+    let fails = got.fails().expect("fails is present");
+    let joined = fails.join("\n");
+
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let first = fails
+        .iter()
+        .find(|e| e.contains(": | "))
+        .unwrap_or_else(|| panic!("no quoted error line at all:\n{joined}"));
+    assert!(
+        first.contains(&format!("error[E0308]: mismatched types ({path}:157:9)")),
+        "the FIRST quoted line must be the coded error with its location, not cargo's \
+         summary:\n{joined}"
+    );
+}
+
+/// Ranking, not only matching: when several crates fail, cargo
+/// interleaves each crate's errors with its `could not compile` line,
+/// and PER_CHECK quotes only the first five. Three crates is six lines;
+/// in log order the third crate's real error is the one cut, and two
+/// summaries that name no cause are quoted in its place. Summaries go
+/// last, so every cause is quoted before any summary of one.
+#[test]
+fn every_crates_cause_is_quoted_before_any_could_not_compile_summary() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let mut log = String::from("::group::gate: build\n");
+    for (krate, line) in [("boss-a", 11), ("boss-b", 22), ("boss-c", 33)] {
+        log.push_str(&rustc_e0308(
+            krate,
+            &format!("crates/{krate}/src/lib.rs"),
+            line,
+        ));
+    }
+    log.push_str("::endgroup::\n");
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"build\",\"result\":\"fail\"}"),
+        &log,
+    );
+    let joined = got.fails_joined();
+
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    for loc in [
+        "crates/boss-a/src/lib.rs:11:9",
+        "crates/boss-b/src/lib.rs:22:9",
+        "crates/boss-c/src/lib.rs:33:9",
+    ] {
+        assert!(
+            joined.contains(&format!("error[E0308]: mismatched types ({loc})")),
+            "every crate's coded error must be quoted, {loc} is missing:\n{joined}"
+        );
+    }
+    let first_summary = joined.find("could not compile").unwrap_or(usize::MAX);
+    let last_cause = joined.rfind("error[E0308]").unwrap_or(0);
+    assert!(
+        last_cause < first_summary,
+        "no `could not compile` summary may be quoted ahead of a cause:\n{joined}"
+    );
+}
+
 /// THE THIRD FAILURE, one level deeper again (backlog 5708cbd5). Train
 /// #361's red gate (2026-09-14) recorded `test: the_real_run_refuses…
 /// - FAILED, with no panic line for it in this check's output` — the

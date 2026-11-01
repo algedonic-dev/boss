@@ -8,8 +8,9 @@ here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/../lib/secret-header.sh"
 [[ $# == 3 ]] || exit 2
 namespace=$1 claim=$2 volume=$3
+scheduled=null
 blind() {
-    jq -nc --arg reason "$1" '{capacity_bytes:null,used_bytes:null,free_bytes:null,unread:("mounted sample: " + $reason)}'
+    jq -nc --arg reason "$1" --argjson scheduled "$scheduled" '{capacity_bytes:null,used_bytes:null,free_bytes:null,unread:("mounted sample: " + $reason)} + if $scheduled == null then {} else {scheduled_job:($scheduled | if .state == "unread" and .why == null then .why = $reason else . end)} end'
     exit 0
 }
 for name in "$namespace" "$claim"; do
@@ -25,6 +26,9 @@ if ! source=$(jq -cse --arg ns "$namespace" --arg claim "$claim" '
 fi
 workflow=$(printf '%s' "$source" | jq -r '.workflow // empty')
 [[ "$workflow" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || blind 'malformed declared workflow'
+if [[ $(printf '%s' "$source" | jq -r '.alarm_failed // false') == true ]]; then
+    scheduled=$(jq -nc --argjson source "$source" '{id:($source.namespace + "/" + $source.cronjob),state:"unread",why:null}')
+fi
 [[ -n "${JOBS_API:-}" ]] || blind 'the system of record is not configured'
 # One definition: the declared maintenance interval, not another TTL
 # copied into this registry or a global nightly assumption.
@@ -36,19 +40,29 @@ days=$(((10#$minutes + 1439) / 1440 + 1))
 work=$(mktemp -d) || blind 'cannot prepare a bounded reader workspace'
 trap 'rm -rf "$work"' EXIT
 machine_token_header MT_HDR "$JOBS_API" || blind 'cannot prepare the existing machine header'
+now=$(date -u +%s)
+# This existing native inventory also judges declared producer failures.
+# Read it before the sample's API dependency: a failed init may never
+# have opened or completed its maintenance packet.
+if ! $(ops_kubectl) get jobs -n "$namespace" -o json --request-timeout=20s > "$work/attempts.json" 2> "$work/kube.err"; then
+    blind "the native Kubernetes attempt read failed: $(tr '\n' ' ' < "$work/kube.err" | cut -c1-200)"
+fi
+if [[ $(printf '%s' "$source" | jq -r '.alarm_failed // false') == true ]]; then
+    if ! scheduled=$(jq -sce --argjson source "$source" --argjson now "$now" \
+        -f "$here/scheduled-job-outcome.jq" "$work/attempts.json" 2> "$work/outcome.err"); then
+        scheduled=$(jq -nc --arg id "$namespace/$(printf '%s' "$source" | jq -r '.cronjob')" \
+            --arg why "$(cat "$work/outcome.err")" '{id:$id,state:"unread",why:$why}')
+    fi
+fi
 user='{"id":"automation:estate-observer-host","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
 if ! curl -fsS --connect-timeout 5 --max-time 15 --max-filesize 4194304 \
     -H "x-boss-user: $user" ${MT_HDR:+-H "$MT_HDR"} \
     "$JOBS_API/api/jobs?kind=$workflow&partition=real&closed_within=$days&limit=500&full=true" > "$work/native.json" 2> "$work/read.err"; then
     blind "the signed native job read failed: $(tr '\n' ' ' < "$work/read.err" | cut -c1-200)"
 fi
-if ! $(ops_kubectl) get jobs -n "$namespace" -o json --request-timeout=20s > "$work/attempts.json" 2> "$work/kube.err"; then
-    blind "the native Kubernetes attempt read failed: $(tr '\n' ' ' < "$work/kube.err" | cut -c1-200)"
-fi
-now=$(date -u +%s)
 if ! jq -nce --slurpfile native "$work/native.json" --slurpfile attempts "$work/attempts.json" \
     --argjson source "$source" --arg namespace "$namespace" --arg claim "$claim" --arg volume "$volume" \
     --argjson max_age "$max_age" --argjson now "$now" -f "$here/volume-sample.jq" > "$work/accepted.json" 2> "$work/accept.err"; then
     blind "$(tr '\n' ' ' < "$work/accept.err" | cut -c1-300)"
 fi
-cat "$work/accepted.json"
+jq -c --argjson scheduled "$scheduled" '. + if $scheduled == null then {} else {scheduled_job:$scheduled} end' "$work/accepted.json"

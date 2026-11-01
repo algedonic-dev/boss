@@ -1,0 +1,115 @@
+# artifact-lifecycle.toml — the versioned retention policy for agent
+# session and evidence files on the dev pod's /work volume (backlog
+# 25022367, design 195276f0, approved by David 2026-10-17).
+#
+# WHY THIS EXISTS. /work reached 96% with 1.7 GiB free on 2026-10-16
+# while the hourly reclaim (dev-scratch-reclaim.sh) correctly kept 486
+# dirty, locked or unreferenced worktrees: it has a lifecycle for
+# worktrees and cargo targets and NONE for the files agents leave behind.
+# Measured that day: ~14 GiB of Codex scratch, ~3.9 GiB of Codex session
+# records and ~4 GiB of Claude project records, and no record of which of
+# those bytes were active work, evidence an open incident still needed,
+# or transcripts a harness would read back. A lifecycle that cannot say
+# that cannot be trusted to move anything.
+#
+# VERSION 1 WAS INVENTORY ONLY (car 1c0b822f, 2026-10-18): the families,
+# where each lives (relative to the work mount, never absolute), who can
+# resolve a question about it, and what its readers are measured to
+# need — and the dry run (dev-artifact-inventory.py, run by the hourly
+# pass) accounting every byte by family, unit and the reason it is
+# retained.
+#
+# VERSION 2 ADDS THE COMPLETION JOIN AND THE ARCHIVE ACTION (the second
+# car of design 195276f0). `completion = "agent-run"` reads, for each
+# unit whose path names a `run-<8 hex>` directory, that agent run from
+# the system of record: only a run CLOSED with its report recorded, and
+# named by no open packet (an incident, a gate, an item still quoting the
+# evidence), is complete — never age, a filename or a quiet process
+# table. `action = "archive"` lets the hourly pass compress such files
+# losslessly, behind an fsynced manifest and a decoded-hash check, and
+# release the plain copy; `--restore PATH` gives a reader its literal
+# path back. The loader refuses an action on a family whose reader is
+# not `plain-path` (a transcript store's readers are unmeasured, so it
+# is never archived), an action without a join, an action without its
+# per-pass byte budget, and any action but `archive` (no expiry or
+# deletion is built).
+#
+# THIS FILE GRANTS NO ACTION. The join runs, so the hourly dry run names
+# its candidates and their bytes; nothing is archived until a car adds
+# `action = "archive"` and `archive_budget_mb` to a family. That car is
+# the activation: it follows native acceptance of a separately authorized
+# bounded pass (design 195276f0, "Activation of any mutating pass follows
+# exact-head review and native acceptance").
+#
+# OWNER AND DOOR. The policy's owner is the platform-admin role. It
+# changes only as a car through the train, and because the item that
+# introduced it is a trust-boundary item (area mutating-verb), a change
+# that adds an action is held for an adversarial review before it boards.
+#
+# FIELDS, every one required, nothing else allowed:
+#   name          kebab-case, unique
+#   root          relative to the work mount; no `..`, not absolute, and
+#                 no family's root inside another's (a byte is counted
+#                 once). A root, or any directory on the way to it, that
+#                 is a symbolic link is refused, never followed.
+#   owner         the actor who can resolve an unknown or a retained
+#                 question about this family; named on every refusal
+#   unit_depth    path components under root that make one unit of
+#                 ownership (a run directory, a day, a session)
+#   settle_hours  a file changed more recently than this is active work.
+#                 Age is necessary and never sufficient: an older file is
+#                 still retained until a record proves it complete.
+#   reader        `plain-path` — its consumers open the literal path, so a
+#                 later archive must restore it atomically before use —
+#                 or `unmeasured` — its readers have not been measured,
+#                 so no archived form is known to be readable by them
+#   reader_evidence  the measurement `reader` rests on
+# and, in version 2 only, optional:
+#   completion    `agent-run` — the join above; absent, nothing is ever
+#                 proven complete and every settled file is retained
+#   action        `archive` — needs reader `plain-path` and a completion
+#   archive_budget_mb  logical bytes one pass may archive in the family;
+#                 required with an action, refused without one
+version = 2
+
+# The coordinator's and builders' working files. The one reader
+# measured: a historical coordinator snapshot archived and restored on
+# 2026-10-16 was read back by the coordinator's own json.load from its
+# plain path (item 25022367, manual_archive_restore_control_20261016_760).
+# Unit = a coordinator window and the run directory inside it. Joined:
+# measured 2026-10-19, 388 run-<8 hex> directories, 144 of them matching
+# a closed agent run among the newest 500; a unit naming no run (a
+# window's own files, a coordinator's state) stays owner-unjoined.
+[[family]]
+name = "codex-scratch"
+root = "home/.codex/scratch"
+owner = "agent-codex"
+unit_depth = 2
+settle_hours = 24
+reader = "plain-path"
+reader_evidence = "2026-10-16 control: native-1532.json archived, restored and read by json.load from its plain path; consumers open literal paths"
+completion = "agent-run"
+
+# Codex harness session records, one directory per day.
+[[family]]
+name = "codex-sessions"
+root = "home/.codex/sessions"
+owner = "agent-codex"
+unit_depth = 3
+settle_hours = 24
+reader = "unmeasured"
+reader_evidence = "the Codex harness's resume and history readers have not been measured"
+
+# Claude Code project records: each session's transcript and, beside it,
+# its subagents' transcripts — the metering record boss dispatch reads.
+# /work/home/.claude-b/projects is a symbolic link to this directory and
+# is deliberately NOT a family of its own: it would count these bytes
+# twice, and a linked root is refused anyway.
+[[family]]
+name = "claude-projects"
+root = "home/.claude/projects"
+owner = "agent-claude"
+unit_depth = 2
+settle_hours = 24
+reader = "unmeasured"
+reader_evidence = "Claude Code session resume and the run-transcript meter read these files; neither reader has been measured against an archived form"

@@ -208,7 +208,11 @@ impl DeliveryPolicy {
             skip_reason_file_budget: COMPILED_SKIP_REASON_FILE_BUDGET,
             blip_cause_budget: COMPILED_BLIP_CAUSE_BUDGET,
             ci_host_floor_gb: COMPILED_CI_HOST_FLOOR_GB,
-            gate_queue_resident: false,
+            // The bundle's owner since v10 (backlog e1943ef0), held equal
+            // by `the_bundle_equals_the_compiled_fallback`. Informational
+            // here: `boss gate` reads the owner from the registry only and
+            // refuses rather than fall back (gate/reservation/staging.rs).
+            gate_queue_resident: true,
             gate_max_concurrent: COMPILED_GATE_MAX_CONCURRENT,
             channels: Value::Null,
         }

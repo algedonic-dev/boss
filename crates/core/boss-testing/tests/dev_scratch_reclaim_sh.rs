@@ -18,6 +18,174 @@ use boss_testing::{repo_root, without_proxy};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[test]
+fn a_terminal_run_retires_its_worker_and_publishes_the_exact_receipt() {
+    use std::os::unix::fs::symlink;
+    let root = boss_testing::scratch_dir("boss-dsr-terminal-worker");
+    let _guard = Scratch(root.clone());
+    let _yard = Yard::new(&root);
+    let store = root.join("work/tools/dev-control");
+    boss_testing::create_dir(&store);
+    let generation = "a".repeat(40);
+    symlink(
+        store.join("generations").join(&generation),
+        store.join("enabled"),
+    )
+    .unwrap();
+    let calls = root.join("worker-calls");
+    boss_testing::write_exec(
+        &store.join("dev-build"),
+        &format!(
+            r#"#!/bin/bash
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+owned-runs) [ "${{STUB_WORKER_EMPTY_INVENTORY:-0}}" != 1 ] || exit 0; echo '{{"runs":[{{"run":"11111111-1111-4111-8111-111111111111"}},{{"run":"22222222-2222-4222-8222-222222222222"}}],"next":""}}' ;;
+stop-run) [ "${{STUB_WORKER_EMPTY_STOP:-0}}" != 1 ] || exit 0; echo '{{"run":"11111111-1111-4111-8111-111111111111","session":"dev-build-1234567890abcdef","retirement":{{"native":"unaltered-receipt","job_delete_acknowledged":true,"job_deletion_complete":false}}}}' ;;
+*) exit 75 ;;
+esac
+"#,
+            calls.display()
+        ),
+    );
+    // The API transport is real shell I/O; only its response is a fixture.
+    let bin = stub_curl(&root);
+    std::fs::rename(bin.join("curl"), bin.join("fallback-curl")).unwrap();
+    boss_testing::write_exec(
+        &bin.join("curl"),
+        &format!(
+            r#"#!/bin/bash
+url=; method=GET; body=
+for ((i=1;i<=$#;i++)); do
+  a=${{!i}}
+  case "$a" in -X) j=$((i+1)); method=${{!j}} ;; --data-binary) j=$((i+1)); body=${{!j}} ;; http*) url=$a ;; esac
+done
+case "$url" in
+*/11111111-1111-4111-8111-111111111111/metadata)
+  [ "${{STUB_WORKER_PATCH_REFUSED:-0}}" != 1 ] || exit 22
+  printf '%s\n' PATCH >> '{patches}'
+  case "$body" in @*) cat "${{body#@}}" ;; *) printf '%s' "$body" ;; esac > '{saved}'; echo '{{}}' ;;
+*/11111111-1111-4111-8111-111111111111)
+  [ "${{STUB_WORKER_EMPTY_READ:-0}}" != 1 ] || exit 0
+  [ "${{STUB_WORKER_READ_REFUSED:-0}}" != 1 ] || exit 22
+  [ "${{STUB_WORKER_MALFORMED:-0}}" != 1 ] || {{ echo '{{broken'; exit 0; }}
+  jq -nc --arg pad "${{STUB_WORKER_PADDING:-0}}" --arg id "${{STUB_WORKER_ID:-11111111-1111-4111-8111-111111111111}}" --arg stamp "${{STUB_WORKER_STAMP-2026-10-23T00:00:00Z}}" --arg status "${{STUB_WORKER_STATUS:-closed}}" --arg kind "${{STUB_WORKER_KIND:-agent-run}}" --slurpfile m '{saved}' '{{id:$id,kind:$kind,status:$status,metadata:({{outcome:"died",closed_at:$stamp}} + ($m[0] // {{}}))}} | if $pad == "1" then .metadata.padding=("x" * 200000) else . end' ;;
+*/22222222-2222-4222-8222-222222222222) echo '{{"id":"22222222-2222-4222-8222-222222222222","kind":"agent-run","status":"open","metadata":{{}}}}' ;;
+*) exec '{fallback}' "$@" ;;
+esac
+"#,
+            saved = root.join("retirement.json").display(),
+            patches = root.join("patches").display(),
+            fallback = bin.join("fallback-curl").display()
+        ),
+    );
+    boss_testing::write_file(&root.join("retirement.json"), "{}");
+    // command_with installs its normal transport; retain our dedicated wrapper afterwards.
+    let wrapper = std::fs::read(bin.join("curl")).unwrap();
+    let mut command = command_with(&root, &[], &[]);
+    std::fs::write(bin.join("curl"), &wrapper).unwrap();
+    let out = command.output().unwrap();
+    let text = say(&out);
+    assert!(out.status.success(), "{text}");
+    let calls = std::fs::read_to_string(calls).unwrap_or_default();
+    assert!(
+        calls.contains("stop-run 11111111-1111-4111-8111-111111111111"),
+        "closed run worker was not retired: {calls}\n{text}"
+    );
+    assert!(
+        !calls.contains("stop-run 22222222"),
+        "an active run was stopped"
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("retirement.json")).unwrap()).unwrap();
+    assert_eq!(
+        saved["worker_retirement"]["retirement"]["native"],
+        "unaltered-receipt"
+    );
+    let again = |extra: &[(&str, &str)]| {
+        let mut command = command_with(&root, &[], extra);
+        std::fs::write(bin.join("curl"), &wrapper).unwrap();
+        command.output().unwrap()
+    };
+    for variable in [
+        "STUB_WORKER_EMPTY_INVENTORY",
+        "STUB_WORKER_EMPTY_READ",
+        "STUB_WORKER_EMPTY_STOP",
+    ] {
+        let out = again(&[(variable, "1")]);
+        assert!(
+            !out.status.success(),
+            "empty successful transport {variable} must refuse\n{}",
+            say(&out)
+        );
+    }
+    let out = again(&[]);
+    assert!(out.status.success(), "{}", say(&out));
+    assert_eq!(
+        std::fs::read_to_string(root.join("patches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "published receipt is not written twice"
+    );
+    let calls_before = std::fs::read_to_string(root.join("worker-calls")).unwrap();
+    for extra in [
+        vec![("STUB_WORKER_READ_REFUSED", "1")],
+        vec![("STUB_WORKER_STATUS", "open")],
+        vec![("STUB_WORKER_KIND", "backlog-item")],
+        vec![("STUB_WORKER_ID", "99999999-9999-4999-8999-999999999999")],
+        vec![("STUB_WORKER_STAMP", "")],
+        vec![("STUB_WORKER_MALFORMED", "1")],
+    ] {
+        let _out = again(&extra);
+        let after = std::fs::read_to_string(root.join("worker-calls")).unwrap();
+        assert_eq!(
+            after.matches("stop-run").count(),
+            calls_before.matches("stop-run").count(),
+            "unread/open/wrong-kind evidence cannot stop a worker"
+        );
+    }
+    boss_testing::write_file(&root.join("retirement.json"), "{}");
+    let out = again(&[("STUB_WORKER_PATCH_REFUSED", "1")]);
+    assert!(
+        !out.status.success(),
+        "publication failure must remain loud\n{}",
+        say(&out)
+    );
+    assert!(say(&out).contains("publication/readback unpaid"));
+    let out = again(&[]);
+    assert!(out.status.success(), "{}", say(&out));
+    let recovered: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("retirement.json")).unwrap()).unwrap();
+    assert_eq!(
+        recovered["worker_retirement"], saved["worker_retirement"],
+        "retry publishes the original whole receipt"
+    );
+    boss_testing::write_file(
+        &root.join("retirement.json"),
+        "{\"worker_retirement\":{\"session\":\"another-worker\"}}",
+    );
+    let out = again(&[]);
+    assert!(
+        !out.status.success(),
+        "a conflicting historical receipt must not be replaced\n{}",
+        say(&out)
+    );
+    let conflict: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("retirement.json")).unwrap()).unwrap();
+    assert_eq!(conflict["worker_retirement"]["session"], "another-worker");
+    boss_testing::write_file(&root.join("retirement.json"), "{}");
+    let out = again(&[("STUB_WORKER_PADDING", "1")]);
+    assert!(
+        out.status.success(),
+        "a run over the single-argument bound still publishes its exact receipt\n{}",
+        say(&out)
+    );
+    let large: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("retirement.json")).unwrap()).unwrap();
+    assert_eq!(large["worker_retirement"], saved["worker_retirement"]);
+}
+
 /// Removes its directory on drop, so a panicking test leaves nothing.
 struct Scratch(PathBuf);
 impl Drop for Scratch {
@@ -107,11 +275,16 @@ fn stub_curl(root: &Path) -> PathBuf {
             // gate-runs launched from a worktree, the cars on a branch
             // (both narrowed by `metadata=`), and an agent-run by id.
             // Answered from the JSON document at STUB_RECORD —
-            // `{gate_runs: [...], cars: [...], runs: {id: status}}`,
+            // `{gate_runs: [...], cars: [...], runs: {id: status},
+            // closed_at: {id: rfc3339}}`,
             // empty when unset — filtered by the same containment the
             // real list applies; STUB_RECORD_RC fails every one of
             // them (7: nothing answered; 22: an error answered).
-            "    *kind=gate-run*metadata=* | *kind=ship-a-change*metadata=* | */api/jobs/run*)\n",
+            // `metadata_has=<key>` answers the gate-runs carrying that
+            // top-level key, as `metadata ? $n` does (backlog 7c9715b6);
+            // STUB_SUBMITTED_RC fails that read alone, saying on stderr
+            // what curl -fsS says of an error that answered.
+            "    *kind=gate-run*metadata=* | *kind=gate-run*metadata_has=* | *kind=ship-a-change*metadata=* | */api/jobs/run*)\n",
             "        if [ -n \"${STUB_RECORD_RC:-}\" ]; then exit \"$STUB_RECORD_RC\"; fi\n",
             "        rec=$(cat \"${STUB_RECORD:-/dev/null}\" 2>/dev/null); [ -n \"$rec\" ] || rec='{}'\n",
             "        case \"$url\" in\n",
@@ -119,9 +292,27 @@ fn stub_curl(root: &Path) -> PathBuf {
             "                id=${url##*/api/jobs/}\n",
             "                jq -c --arg id \"$id\" '(.runs[$id] // \"open\") as $s\n",
             "                    | {id: $id, kind: \"agent-run\", status: $s,\n",
-            "                       metadata: {outcome: (if $s == \"closed\" then \"landed\" else null end)}}' <<<\"$rec\" ;;\n",
+            // `closed_at` from the record's own `closed_at: {id: time}`
+            // map, null when absent (backlog 3a84cbf5).
+            "                       metadata: {outcome: (if $s == \"closed\" then \"landed\" else null end),\n",
+            "                                  closed_at: (.closed_at[$id] // null)}}' <<<\"$rec\" ;;\n",
+            "            *metadata_has=*)\n",
+            "                if [ -n \"${STUB_SUBMITTED_RC:-}\" ]; then\n",
+            "                    echo 'curl: (22) The requested URL returned error: 503' >&2; exit \"$STUB_SUBMITTED_RC\"; fi\n",
+            "                k=${url##*metadata_has=}; k=${k%%&*}\n",
+            "                jq -c --arg k \"$k\" '\n",
+            "                    [(.gate_runs // [])[] | select(has($k))]\n",
+            "                    | {total: length, data: [.[] | {id: (.id // \"packet\"), status: (.status // \"open\"),\n",
+            "                                                    metadata: del(.id, .status)}]}' <<<\"$rec\" ;;\n",
             "            *)\n",
             "                m=${url##*metadata=}; m=${m%%&*}; m=$(printf '%b' \"${m//%/\\\\x}\")\n",
+            // The server binds a FLAT object of string values and answers
+            // anything else 400 (boss_jobs::metadata_containment). A stub
+            // that matched a nested document by jq's `contains` answered
+            // the query the real API refused on every pass for six days
+            // (backlog 7c9715b6), so it refuses the same way.
+            "                if ! jq -e 'type == \"object\" and all(.[]; type == \"string\")' <<<\"$m\" >/dev/null 2>&1; then\n",
+            "                    echo 'curl: (22) The requested URL returned error: 400' >&2; exit 22; fi\n",
             "                case \"$url\" in *kind=gate-run*) c=gate_runs ;; *) c=cars ;; esac\n",
             "                jq -c --argjson m \"$m\" --arg c \"$c\" '\n",
             "                    [(.[$c] // [])[] | select(contains($m))]\n",
@@ -139,12 +330,12 @@ fn stub_curl(root: &Path) -> PathBuf {
             "        exit 0 ;;\n",
             "esac\n",
             "case \"$method\" in\n",
-            "    POST) touch \"$STUB_LOG.opened\"; echo '{\"id\":\"job-1\"}' ;;\n",
+            "    POST) [ -z \"${STUB_WRAP_RC:-}\" ] || exit \"$STUB_WRAP_RC\"; touch \"$STUB_LOG.opened\"; echo '{\"id\":\"job-1\"}' ;;\n",
             // The step PUT carries the status alone (backlog e39a9d2a):
             // a metadata body is refused, as the server's end state
             // refuses it; the keys ride the merge door's PATCH.
             "    PUT) case \"$body\" in *'\"metadata\"'*) exit 22 ;; esac; echo '{}' ;;\n",
-            "    PATCH) echo '{}' ;;\n",
+            "    PATCH) [ -z \"${STUB_METADATA_RC:-}\" ] || exit \"$STUB_METADATA_RC\"; echo '{}' ;;\n",
             "    GET) if [ -e \"$STUB_LOG.opened\" ]; then\n",
             "             echo '{\"data\":[{\"id\":\"job-1\",\"status\":\"open\",\"steps\":[",
             "{\"id\":\"step-run\",\"spec_slug\":\"run\",\"status\":\"ready\",\"metadata\":{}}]}]}'\n",
@@ -181,6 +372,7 @@ fn stub_git(root: &Path) -> PathBuf {
         &format!(
             concat!(
                 "#!/usr/bin/env bash\n",
+                "if [ -n \"${{STUB_GIT_TRACE:-}}\" ]; then printf '%s\\t' \"$@\" >> \"$STUB_GIT_TRACE\"; printf '\\n' >> \"$STUB_GIT_TRACE\"; fi\n",
                 "for a in \"$@\"; do\n",
                 "    if [ \"$a\" = ls-remote ]; then\n",
                 "        printf '%s\\n' \"$*\" >> \"$STUB_LS_REMOTE\"\n",
@@ -207,9 +399,24 @@ fn run(scratch: &Path, extra: &[(&str, &str)]) -> Output {
 
 /// `run`, with arguments after the script (a mode such as `--cli`).
 fn run_with(scratch: &Path, args: &[&str], extra: &[(&str, &str)]) -> Output {
+    command_with(scratch, args, extra)
+        .output()
+        .expect("run dev-scratch-reclaim.sh")
+}
+
+/// The command `run_with` runs, unrun — for a test that must REMOVE a
+/// knob the fixture sets, such as the floor share it pins to 0.
+fn command_with(scratch: &Path, args: &[&str], extra: &[(&str, &str)]) -> Command {
     let bin = stub_curl(scratch);
     stub_git(scratch);
     stub_df(&bin);
+    // The fixture's two directories model mounts, just as stub_df does.
+    // Production requires the real kernel mount boundary before holding
+    // descendants; tests must not chmod the worker's own shared parents.
+    boss_testing::write_exec(
+        &bin.join("mountpoint"),
+        "#!/bin/bash\nlast=${!#}\n[ \"$last\" != \"${STUB_REFUSED_MOUNT:-}\" ] || exit 1\n[ \"$last\" != \"${STUB_NESTED_MOUNT:-}\" ] || exit 0\ncase \"$last\" in \"$WORK_MOUNT\"|\"$SCRATCH_MOUNT\") exit 0;; *) exit 1;; esac\n",
+    );
     let installer = stub_installer(scratch);
     let mut cmd = Command::new("bash");
     without_proxy(&mut cmd);
@@ -224,6 +431,10 @@ fn run_with(scratch: &Path, args: &[&str], extra: &[(&str, &str)]) -> Output {
         .env("WORK_MOUNT", scratch.join("work"))
         .env("REPO_DIR", scratch.join("work").join("repo"))
         .env("WORKTREES_DIR", scratch.join("work").join("wt"))
+        // Not the script's default (3h since backlog b4112350): the
+        // floor tests date targets 1-5h old to order an LRU, and the age
+        // pass must not be what takes them. The default has its own pin,
+        // `with_no_knob_set_the_grace_and_the_stale_target_age_are_three_hours`.
         .env("BOSS_STALE_TARGET_H", "12")
         // The floor is a share of the REAL filesystem the fixture sits
         // on, so a nearly full test host would fire it and reclaim the
@@ -254,6 +465,11 @@ fn run_with(scratch: &Path, args: &[&str], extra: &[(&str, &str)]) -> Output {
         // whichever pod these tests run in.
         .env("BOSS_DEV_MEMORY_WATCH", "off")
         .env("BOSS_K8S_SA_DIR", scratch.join("no-service-account"))
+        // The artifact inventory (backlog 25022367) is a dry run of the
+        // fixture's own work mount; off unless a test asks, so a test of
+        // another leg reads only that leg's output.
+        .env("BOSS_ARTIFACT_INVENTORY", "off")
+        .env_remove("BOSS_ARTIFACT_INVENTORY_DIR")
         .env(
             "PATH",
             format!(
@@ -265,7 +481,7 @@ fn run_with(scratch: &Path, args: &[&str], extra: &[(&str, &str)]) -> Output {
     for (k, v) in extra {
         cmd.env(k, v);
     }
-    cmd.output().expect("run dev-scratch-reclaim.sh")
+    cmd
 }
 
 /// What the stub curl saw, one `METHOD URL BODY` line per call.
@@ -884,7 +1100,7 @@ fn a_repo_wide_reflog_rewrite_is_not_activity_in_every_worktree() {
     let text = say(&out);
     assert!(
         !landed.exists(),
-        "landed, idle 30h against a 12h grace: a gc's reflog rewrite is not activity\n{text}"
+        "landed, idle 30h against a 3h grace: a gc's reflog rewrite is not activity\n{text}"
     );
     assert!(
         !abandoned.exists(),
@@ -1345,6 +1561,789 @@ fn an_index_refresh_on_a_clean_tree_is_not_activity() {
 }
 
 // ---------------------------------------------------------------------
+// A WORKTREE'S TOP AND ITS .git FILE ARE HELD, AND PAIRED (backlog
+// 0cc54611, review finding F1 of run d6747820, 2026-10-22). A linked
+// worktree's `.git` is a FILE naming the admin entry git reads for that
+// tree, and `git -C <tree>` follows it wherever it points. Measured on
+// the pod by run 73c1e68a (stat only): 18 of 221 such files root:1500
+// at 0664, in 18 tree directories at 2775, so a group member could
+// rewrite one, or rename its own over it. The fixtures below are mode
+// and pairing states only: a 2775 top and a 0664 .git file, a .git file
+// naming a path that does not exist, and one naming ANOTHER tree's
+// admin entry — nothing is planted for git to run.
+// ---------------------------------------------------------------------
+
+/// The admin entry git keeps for `tree` under the checkout's .git.
+fn admin_entry(tree: &Path) -> PathBuf {
+    PathBuf::from(git(tree, 0, &["rev-parse", "--absolute-git-dir"]))
+}
+
+#[test]
+fn reclaim_status_never_reads_a_staged_gitlinks_git_file() {
+    let root = boss_testing::scratch_dir("boss-dsr-gitlink-hook");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let tree = yard.worktree("agent-gitlink", Some("feat/gitlink"), 60);
+    let sub = tree.join("sub");
+    boss_testing::create_dir(&sub);
+    git(&sub, 60, &["init", "-q"]);
+    boss_testing::write_file(&sub.join("seed"), "submodule\n");
+    git(&sub, 60, &["add", "."]);
+    git(&sub, 60, &["commit", "-q", "-m", "submodule"]);
+    let sub_head = git(&sub, 60, &["rev-parse", "HEAD"]);
+    git(
+        &tree,
+        60,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            &sub_head,
+            "sub",
+        ],
+    );
+    let planted = root.join("planted-gitdir");
+    std::fs::rename(sub.join(".git"), &planted).expect("move submodule gitdir outside tree");
+    boss_testing::write_file(
+        &sub.join(".git"),
+        &format!("gitdir: {}\n", planted.display()),
+    );
+    let marker = root.join("hook-ran");
+    let hook = root.join("marker-hook");
+    boss_testing::write_file(&hook, &format!("#!/bin/sh\ntouch '{}'\n", marker.display()));
+    chmod_checkout(&hook, 0o755);
+    git(
+        &root,
+        0,
+        &[
+            "--git-dir",
+            planted.to_str().expect("utf8"),
+            "config",
+            "core.fsmonitor",
+            hook.to_str().expect("utf8"),
+        ],
+    );
+    let admin = admin_entry(&tree);
+    // Control: even the admin-directed form follows a gitlink's nested
+    // .git file without the flag. The marker is the only hook effect.
+    git(
+        &root,
+        0,
+        &[
+            "--git-dir",
+            admin.to_str().expect("utf8"),
+            "--work-tree",
+            tree.to_str().expect("utf8"),
+            "status",
+            "--porcelain",
+        ],
+    );
+    assert!(
+        marker.exists(),
+        "control must execute the nested gitdir's hook"
+    );
+    std::fs::remove_file(&marker).expect("clear control marker");
+    for entry in ["HEAD", "index", "logs/HEAD"] {
+        touch_at(&admin.join(entry), 60);
+    }
+    touch_at(&tree, 60);
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert!(
+        !marker.exists(),
+        "reclaim must not run a nested gitdir's hook\n{text}"
+    );
+    assert!(
+        tree.exists(),
+        "a staged gitlink is uncommitted work, kept\n{text}"
+    );
+}
+
+#[test]
+fn every_pass_holds_each_worktrees_top_and_git_file_by_owner_and_still_judges_it() {
+    let root = boss_testing::scratch_dir("boss-dsr-wt-held");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    // Landed, clean, idle: the pass removes it once it is held and paired.
+    let gone = yard.worktree("agent-gone", Some("feat/gone"), 30);
+    yard.land("feat/gone");
+    // In use: kept, and held.
+    let live = yard.worktree("agent-live", Some("feat/live"), 1);
+    boss_testing::create_dir(&live.join("dist"));
+    for tree in [&gone, &live] {
+        chmod_checkout(tree, 0o2775);
+        chmod_checkout(&tree.join(".git"), 0o664);
+    }
+    chmod_checkout(&live.join("dist"), 0o2775);
+    chmod_checkout(&live.join("work.txt"), 0o664);
+    touch_at(&gone, 30);
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(
+        checkout_mode(&live),
+        0o2755,
+        "the tree's top loses group and other write and keeps setgid\n{text}"
+    );
+    assert_eq!(
+        checkout_mode(&live.join(".git")),
+        0o644,
+        "its .git file is held by its owner\n{text}"
+    );
+    for (p, m) in [(live.join("dist"), 0o2775), (live.join("work.txt"), 0o664)] {
+        assert_eq!(
+            checkout_mode(&p),
+            m,
+            "a tree's contents are a builder's to write: {} left as it was\n{text}",
+            p.display()
+        );
+    }
+    assert!(
+        !gone.exists(),
+        "a held tree paired with its admin entry is still judged: landed, clean, idle, removed\n{text}"
+    );
+    assert!(live.exists(), "a tree in use is kept\n{text}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let top = format!("took group and other write off {}", live.display());
+    let file = format!("{}/.git (was 664)", live.display());
+    assert!(
+        stdout.contains(&top) && stdout.contains(&file),
+        "each entry it held is named with the mode it had\n{text}"
+    );
+}
+
+#[test]
+fn a_worktree_whose_git_file_names_no_admin_entry_naming_it_back_is_red_and_skipped() {
+    let root = boss_testing::scratch_dir("boss-dsr-wt-unpaired");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    // Three abandoned trees the pass would remove (never pushed, idle
+    // past the unpushed window) and one in use whose entry is borrowed.
+    let missing = yard.worktree("agent-missing", Some("feat/missing"), 60);
+    let crossed = yard.worktree("agent-crossed", Some("feat/crossed"), 60);
+    let paired = yard.worktree("agent-paired", Some("feat/paired"), 60);
+    let other = yard.worktree("agent-other", Some("feat/other"), 1);
+    let nowhere = root.join("nowhere-at-all");
+    std::fs::write(
+        missing.join(".git"),
+        format!("gitdir: {}\n", nowhere.display()),
+    )
+    .expect("point .git at a path that does not exist");
+    std::fs::write(
+        crossed.join(".git"),
+        format!("gitdir: {}\n", admin_entry(&other).display()),
+    )
+    .expect("point .git at another tree's admin entry");
+    for tree in [&missing, &crossed] {
+        touch_at(tree, 60);
+    }
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unpaired .git file reds the pass\n{text}"
+    );
+    assert!(
+        missing.exists() && crossed.exists(),
+        "a tree whose .git file is not paired is skipped, never judged\n{text}"
+    );
+    assert!(
+        !paired.exists(),
+        "control: the same tree, paired, is removed — the fixture is strong enough\n{text}"
+    );
+    assert!(
+        other.exists(),
+        "the tree whose entry was named is untouched\n{text}"
+    );
+
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .rfind(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the pass records itself\n{log}\n{text}"));
+    let output = recorded_output(put);
+    for tree in [&missing, &crossed] {
+        assert!(
+            output.lines().any(|l| l
+                .starts_with("RED dev-scratch-reclaim/worktree-git-unpaired problem: ")
+                && l.contains(&format!("{}/.git", tree.display()))),
+            "the packet names {} as unpaired\n{output}",
+            tree.display()
+        );
+    }
+    assert!(
+        !output.contains("nowhere-at-all") && !text.contains("nowhere-at-all"),
+        "what the .git file says is never printed, only its path\n{output}\n{text}"
+    );
+}
+
+#[test]
+fn absent_and_unseen_registrations_are_counted_without_git_or_permanent_red() {
+    let root = boss_testing::scratch_dir("boss-dsr-unseen-hold");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let inside = yard.worktree("agent-inside", Some("feat/inside"), 1);
+    chmod_checkout(&inside, 0o775);
+    let gone = yard.worktree("agent-gone", Some("feat/gone"), 1);
+    git(&yard.repo, 1, &["worktree", "lock", gone.to_str().unwrap()]);
+    std::fs::remove_dir_all(&gone).unwrap();
+    let source = yard.worktree("agent-unseen", Some("feat/unseen"), 1);
+    // The fixture's whole scratch root is SCRATCH_MOUNT, so use a
+    // second root to reproduce the sidecar's view of /tmp honestly.
+    let overlay = boss_testing::scratch_dir("boss-dsr-unseen-hold-overlay");
+    let _overlay_guard = Scratch(overlay.clone());
+    let unseen = overlay.join("outside-visible-mounts");
+    git(
+        &yard.repo,
+        1,
+        &[
+            "worktree",
+            "move",
+            source.to_str().unwrap(),
+            unseen.to_str().unwrap(),
+        ],
+    );
+    git(
+        &yard.repo,
+        1,
+        &["worktree", "lock", unseen.to_str().unwrap()],
+    );
+    let trace = root.join("per-tree-git.txt");
+    let out = command_with(&root, &[], &[])
+        .env("STUB_GIT_TRACE", &trace)
+        .output()
+        .unwrap();
+    let text = say(&out);
+    assert!(
+        out.status.success(),
+        "absent/unseen never become permanent RED: {text}"
+    );
+    let calls = std::fs::read_to_string(trace).unwrap();
+    assert!(!calls.contains(gone.to_str().unwrap()), "{calls}");
+    assert!(!calls.contains(unseen.to_str().unwrap()), "{calls}");
+    let log = curl_log(&root);
+    let put = log.lines().rfind(|l| is_run_step_merge(l)).unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(put.splitn(3, ' ').nth(2).unwrap()).unwrap();
+    assert_eq!(metadata["worktree_hold_complete"], true);
+    for (path, state) in [(&gone, "absent"), (&unseen, "unseen"), (&inside, "held")] {
+        assert!(
+            metadata["worktree_hold_inventory"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["path"] == path.to_str().unwrap()
+                    && r["state"] == state
+                    && r["git_admitted"] == (state == "held")),
+            "{metadata}"
+        );
+    }
+}
+
+#[test]
+fn registered_worktrees_outside_the_legacy_root_are_held_with_their_rename_boundary() {
+    let root = boss_testing::scratch_dir("boss-dsr-registry-hold");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let tree = yard.worktree("agent-registry", Some("feat/registry"), 1);
+    let parent = root.join("work").join("registered");
+    boss_testing::create_dir(&parent);
+    chmod_checkout(&parent, 0o2775);
+    let moved = parent.join("agent-registry");
+    git(
+        &yard.repo,
+        1,
+        &[
+            "worktree",
+            "move",
+            tree.to_str().unwrap(),
+            moved.to_str().unwrap(),
+        ],
+    );
+    chmod_checkout(&moved, 0o2775);
+    chmod_checkout(&moved.join(".git"), 0o664);
+    chmod_checkout(&moved.join("work.txt"), 0o664);
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert!(out.status.success(), "{text}\n{}", curl_log(&root));
+    assert_eq!(
+        checkout_mode(&moved.join(".git")),
+        0o644,
+        "the trusted registry, not the legacy root glob, defines coverage\n{text}"
+    );
+    assert_eq!(checkout_mode(&moved), 0o2755, "{text}");
+    assert_eq!(
+        checkout_mode(&parent),
+        0o3775,
+        "the owner adds sticky without removing shared creation or setgid\n{text}"
+    );
+    assert_eq!(
+        checkout_mode(&moved.join("work.txt")),
+        0o664,
+        "source contents stay writable\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .rfind(|l| is_run_step_merge(l))
+        .expect("coverage is recorded even when no tree is removed");
+    let metadata: serde_json::Value =
+        serde_json::from_str(put.splitn(3, ' ').nth(2).unwrap()).unwrap();
+    let coverage = &metadata["worktree_hold_inventory"];
+    assert!(
+        coverage
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["path"] == moved.to_str().unwrap() && r["state"] == "held"),
+        "{coverage}"
+    );
+}
+
+#[test]
+fn a_chmod_success_without_a_sticky_parent_does_not_admit_the_tree() {
+    let root = boss_testing::scratch_dir("boss-dsr-sticky-refusal");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let tree = yard.worktree("agent-no-sticky", Some("feat/no-sticky"), 60);
+    yard.land("feat/no-sticky");
+    let parent = root.join("work/no-sticky");
+    boss_testing::create_dir(&parent);
+    let moved = parent.join("agent-no-sticky");
+    git(
+        &yard.repo,
+        60,
+        &[
+            "worktree",
+            "move",
+            tree.to_str().unwrap(),
+            moved.to_str().unwrap(),
+        ],
+    );
+    chmod_checkout(&parent, 0o2775);
+    let mut cmd = command_with(&root, &[], &[]);
+    boss_testing::write_exec(
+        &root.join("bin/chmod"),
+        "#!/bin/bash\nlast=${!#}\nif [ \"$last\" = \"$STUB_STICKY_PARENT\" ]; then exit 0; fi\nexec /usr/bin/chmod \"$@\"\n",
+    );
+    let trace = root.join("per-tree-git.txt");
+    cmd.env("STUB_STICKY_PARENT", &parent)
+        .env("STUB_GIT_TRACE", &trace);
+    let out = cmd.output().unwrap();
+    let text = say(&out);
+    assert!(
+        moved.exists(),
+        "chmod's exit alone is no receipt that the rename boundary changed\n{text}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the unchanged boundary is named as a problem\n{text}"
+    );
+    let calls = std::fs::read_to_string(trace).unwrap();
+    assert!(
+        !calls.contains(moved.to_str().unwrap()),
+        "no Git in an unheld tree\n{calls}\n{text}"
+    );
+}
+
+#[test]
+fn every_registry_entry_is_accounted_even_when_absent_or_unreadable() {
+    let root = boss_testing::scratch_dir("boss-dsr-registry-inventory");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let live = yard.worktree("agent-present", Some("feat/present"), 1);
+    let missing = yard.worktree("agent-absent", Some("feat/absent"), 60);
+    std::fs::remove_dir_all(&missing).unwrap();
+    let invalid = yard.repo.join(".git/worktrees/invalid/gitdir");
+    boss_testing::create_dir(invalid.parent().unwrap());
+    boss_testing::write_file(&invalid, "a planted target that must never be printed\n");
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an invalid registration is an explicit unknown\n{text}"
+    );
+    let keys = run_step_keys(&root, &text);
+    let encoded = serde_json::to_string(&keys["worktree_hold_inventory"]).unwrap();
+    let rows = &keys["worktree_hold_inventory"];
+    let rows = rows.as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "every trusted admin entry has one record: {rows:?}"
+    );
+    assert_eq!(keys["worktree_hold_total"], 3);
+    assert_eq!(keys["worktree_hold_held"], 1);
+    assert!(
+        rows.iter()
+            .any(|r| r["path"] == live.to_str().unwrap() && r["state"] == "held")
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r["path"] == missing.to_str().unwrap() && r["state"] == "absent")
+    );
+    assert!(rows.iter().any(
+        |r| r["admin"] == invalid.parent().unwrap().to_str().unwrap()
+            && r["state"] == "invalid-registration"
+    ));
+    let inventory = root.join("recorded-inventory.json");
+    std::fs::write(&inventory, encoded).unwrap();
+    let hash = Command::new("sha256sum").arg(&inventory).output().unwrap();
+    let hash = String::from_utf8(hash.stdout).unwrap();
+    assert_eq!(
+        keys["worktree_hold_sha256"],
+        hash.split_whitespace().next().unwrap()
+    );
+    assert!(!curl_log(&root).contains("a planted target that must never be printed"));
+}
+
+#[test]
+fn unknown_or_nested_mounts_never_admit_registered_worktrees() {
+    for nested in [false, true] {
+        let root = boss_testing::scratch_dir("boss-dsr-mount-refusal");
+        let _guard = Scratch(root.clone());
+        let yard = Yard::new(&root);
+        let tree = yard.worktree("agent-mount", Some("feat/mount"), 60);
+        yard.land("feat/mount");
+        let trace = root.join("per-tree-git.txt");
+        let mut cmd = command_with(&root, &[], &[]);
+        cmd.env("STUB_GIT_TRACE", &trace);
+        if nested {
+            cmd.env("STUB_NESTED_MOUNT", root.join("work/wt"));
+        } else {
+            cmd.env("STUB_REFUSED_MOUNT", root.join("work"));
+        }
+        let out = cmd.output().unwrap();
+        let text = say(&out);
+        assert_eq!(out.status.code(), Some(1), "{text}");
+        assert!(
+            tree.exists(),
+            "unproven mount boundary retains the tree\n{text}"
+        );
+        let calls = std::fs::read_to_string(trace).unwrap();
+        assert!(!calls.contains(tree.to_str().unwrap()), "{calls}\n{text}");
+        assert!(
+            recorded_output(&run_step_put(&root, &text)).contains(if nested {
+                "undeclared nested mount"
+            } else {
+                "verified declared"
+            }),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_linked_admin_registry_is_not_a_trusted_membership_source() {
+    let root = boss_testing::scratch_dir("boss-dsr-admin-link");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let tree = yard.worktree("agent-linked-admin", Some("feat/linked-admin"), 1);
+    let registry = yard.repo.join(".git/worktrees");
+    let outside = root.join("unheld-admin-registry");
+    std::fs::rename(&registry, &outside).unwrap();
+    chmod_checkout(&outside, 0o2777);
+    std::os::unix::fs::symlink(&outside, &registry).unwrap();
+    let trace = root.join("per-tree-git.txt");
+    let out = command_with(&root, &[], &[])
+        .env("STUB_GIT_TRACE", &trace)
+        .output()
+        .unwrap();
+    let text = say(&out);
+    let calls = std::fs::read_to_string(trace).unwrap();
+    assert!(
+        !calls.contains(tree.to_str().unwrap()),
+        "a linked registry cannot authorize per-tree Git\n{calls}\n{text}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(tree.exists(), "{text}");
+    assert!(
+        recorded_output(&run_step_put(&root, &text)).contains("registry"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_truncated_registry_enumeration_cannot_claim_complete_coverage() {
+    assert_registry_enumeration_is_incomplete("truncate");
+}
+
+#[test]
+fn a_failed_registry_enumeration_with_full_output_cannot_claim_complete_coverage() {
+    assert_registry_enumeration_is_incomplete("fail-full");
+}
+
+fn assert_registry_enumeration_is_incomplete(mode: &str) {
+    let root = boss_testing::scratch_dir("boss-dsr-partial-registry");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    for name in ["agent-first", "agent-second"] {
+        let tree = yard.worktree(name, Some(&format!("feat/{name}")), 1);
+        chmod_checkout(&tree, 0o775);
+    }
+    let mut cmd = command_with(&root, &[], &[]);
+    boss_testing::write_exec(
+        &root.join("bin/sort"),
+        r#"#!/bin/bash
+set -eu
+if [ "$*" != '-z' ]; then exec /usr/bin/sort "$@"; fi
+if [ "$STUB_REGISTRY_SORT" = truncate ]; then
+    IFS= read -r -d '' first
+    printf '%s\0' "$first"
+    cat >/dev/null
+else
+    /usr/bin/sort "$@"
+    printf '%s\n' 'fixture original registry sort error' >&2
+    exit 17
+fi
+"#,
+    );
+    let out = cmd.env("STUB_REGISTRY_SORT", mode).output().unwrap();
+    let text = say(&out);
+    let log = curl_log(&root);
+    let put = log.lines().rfind(|l| is_run_step_merge(l)).unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(put.splitn(3, ' ').nth(2).unwrap()).unwrap();
+    assert_eq!(
+        metadata["worktree_hold_complete"], false,
+        "a failed or partial enumeration must not claim full inventory: {metadata}\n{text}"
+    );
+    assert_eq!(
+        metadata["worktree_hold_total"],
+        if mode == "truncate" { 1 } else { 2 }
+    );
+    assert_eq!(
+        metadata["worktree_hold_held"],
+        metadata["worktree_hold_total"]
+    );
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        metadata["output"]
+            .as_str()
+            .unwrap()
+            .contains("worktree-inventory-incomplete"),
+        "{metadata}"
+    );
+    if mode == "fail-full" {
+        assert!(
+            text.contains("fixture original registry sort error"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn failed_publication_keeps_full_named_refusals_in_the_journal_without_temp_leaks() {
+    let root = boss_testing::scratch_dir("boss-dsr-refusal-journal");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let tree = yard.worktree("agent-refused", Some("feat/refused"), 1);
+    std::fs::write(tree.join(".git"), "not a paired gitdir\n").unwrap();
+    let temporary = root.join("record-temporaries");
+    boss_testing::create_dir(&temporary);
+    let out = command_with(&root, &[], &[("STUB_METADATA_RC", "22")])
+        .env("TMPDIR", &temporary)
+        .output()
+        .unwrap();
+    let text = say(&out);
+    assert!(!out.status.success());
+    assert!(
+        text.contains("RED dev-scratch-reclaim/worktree-git-unpaired problem:"),
+        "the failed sender's only full problem copy must survive in its journal: {text}"
+    );
+    assert!(text.contains(tree.to_str().unwrap()), "{text}");
+    assert_eq!(std::fs::read_dir(temporary).unwrap().count(), 0);
+    assert!(
+        yard.repo
+            .join(".git/boss-worktree-hold-pending.json")
+            .exists()
+    );
+}
+
+#[test]
+fn an_unpublished_whole_inventory_is_retained_and_retried_on_an_idle_pass() {
+    for refusal in ["STUB_METADATA_RC", "STUB_WRAP_RC"] {
+        let root = boss_testing::scratch_dir("boss-dsr-hold-pending");
+        let _guard = Scratch(root.clone());
+        let yard = Yard::new(&root);
+        let tree = yard.worktree("agent-pending", Some("feat/pending"), 1);
+        chmod_checkout(&tree.join(".git"), 0o664);
+        let temporary = root.join("record-temporaries");
+        boss_testing::create_dir(&temporary);
+        let first = command_with(&root, &[], &[(refusal, "22")])
+            .env("TMPDIR", &temporary)
+            .output()
+            .unwrap();
+        let pending = yard.repo.join(".git/boss-worktree-hold-pending.json");
+        assert!(
+            pending.is_file(),
+            "the metadata refusal retains the full observation\n{}",
+            say(&first)
+        );
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&pending).unwrap()).unwrap();
+        assert_eq!(original["worktree_hold_state"], "observed");
+        assert_eq!(original["worktree_hold_held"], 1);
+        assert_eq!(
+            std::fs::read_dir(&temporary).unwrap().count(),
+            0,
+            "failed publication retains only the durable inventory, not unbounded temp files"
+        );
+        let first_log = curl_log(&root);
+        assert!(
+            !first_log
+                .lines()
+                .any(|l| l.starts_with("PUT ") && l.contains("/steps/")),
+            "a refused metadata merge never completes the step\n{first_log}"
+        );
+        std::fs::remove_file(root.join("curl-log.txt")).unwrap();
+        let second = run(&root, &[]);
+        let text = say(&second);
+        assert!(second.status.success(), "{text}");
+        assert!(
+            !pending.exists(),
+            "only successful publication clears the retained inventory\n{text}"
+        );
+        let recorded = run_step_keys(&root, &text);
+        assert_eq!(
+            recorded["worktree_hold_inventory"],
+            original["worktree_hold_inventory"]
+        );
+        assert_eq!(
+            recorded["worktree_hold_sha256"],
+            original["worktree_hold_sha256"]
+        );
+    }
+}
+
+/// Registry membership is necessary, not sufficient: a linked ancestor
+/// keeps a tree outside the positive admission set in both passes.
+#[test]
+fn both_reclaim_passes_run_no_git_in_registered_trees_the_hold_did_not_pair() {
+    for floor in [false, true] {
+        let root = boss_testing::scratch_dir("boss-dsr-positive-hold");
+        let _guard = Scratch(root.clone());
+        let yard = Yard::new(&root);
+        let held = yard.worktree("agent-held", Some("feat/held"), 60);
+        yard.land("feat/held");
+        git(&yard.repo, 60, &["merge", "-q", "--ff-only", "feat/held"]);
+        let mut outside = Vec::new();
+        for (name, parent) in [
+            ("agent-work", root.join("work/unsafe-work")),
+            ("agent-scratch", root.join("unsafe-scratch")),
+        ] {
+            boss_testing::create_dir(&parent);
+            let tree = yard.worktree(name, Some(&format!("feat/{name}")), 60);
+            yard.land(&format!("feat/{name}"));
+            git(
+                &yard.repo,
+                60,
+                &["merge", "-q", "--ff-only", &format!("feat/{name}")],
+            );
+            let moved = parent.join(name);
+            git(
+                &yard.repo,
+                60,
+                &[
+                    "worktree",
+                    "move",
+                    tree.to_str().unwrap(),
+                    moved.to_str().unwrap(),
+                ],
+            );
+            chmod_checkout(&moved, 0o2775);
+            chmod_checkout(&moved.join(".git"), 0o664);
+            touch_at(&moved, 60);
+            let aside = parent.with_extension("aside");
+            std::fs::rename(&parent, &aside).unwrap();
+            std::os::unix::fs::symlink(&aside, &parent).unwrap();
+            outside.push(moved);
+        }
+        let trace = root.join("per-tree-git.txt");
+        let mut cmd = command_with(&root, &[], &[]);
+        cmd.env("STUB_GIT_TRACE", &trace);
+        if floor {
+            // Keep the hourly pass inside its grace, leaving removal to
+            // the floor pass. Both still have to refuse unheld trees.
+            cmd.env("BOSS_LIVE_TARGET_MIN", "100000")
+                .env("STUB_DF_WORK_GB", under_the_work_floor());
+        }
+        let out = cmd.output().expect("run reclaim");
+        let text = say(&out);
+        if floor {
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "the fixed low-space fixture remains below its floor\n{text}"
+            );
+            assert!(text.contains("WORK FLOOR UNMET"), "{text}");
+        } else {
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "unsafe ancestors are named problems\n{text}"
+            );
+        }
+        assert!(
+            !held.exists(),
+            "held, paired control is reclaimed, floor={floor}\n{text}"
+        );
+        let calls = std::fs::read_to_string(&trace).expect("git trace");
+        for tree in outside {
+            assert!(tree.exists(), "unheld tree survives, floor={floor}\n{text}");
+            assert!(
+                !calls.contains(tree.to_str().unwrap()),
+                "no git judges or removes unheld tree {}\n{calls}\n{text}",
+                tree.display()
+            );
+            assert!(
+                text.contains(tree.to_str().unwrap()) && text.contains("not held and paired"),
+                "skip reason names the unheld tree\n{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_absent_legacy_hold_root_does_not_hide_the_trusted_registry() {
+    let root = boss_testing::scratch_dir("boss-dsr-no-hold");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let tree = yard.worktree("agent-unheld", Some("feat/unheld"), 60);
+    yard.land("feat/unheld");
+    let trace = root.join("per-tree-git.txt");
+    let out = command_with(&root, &[], &[])
+        .env("WORKTREES_DIR", root.join("missing-hold-root"))
+        .env("STUB_GIT_TRACE", &trace)
+        .env("STUB_DF_WORK_GB", under_the_work_floor())
+        .output()
+        .expect("run without a hold root");
+    let text = say(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the fixed low-space fixture remains below its floor\n{text}"
+    );
+    assert!(text.contains("WORK FLOOR UNMET"), "{text}");
+    assert!(
+        !tree.exists(),
+        "the trusted registry still admits and reclaims a safe tree\n{text}"
+    );
+    let calls = std::fs::read_to_string(trace).expect("git trace");
+    assert!(
+        calls.contains(tree.to_str().unwrap()),
+        "the positively held registered tree is still judged\n{calls}\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------
 // THE CLI LEG (backlog c35eda6c, retro 27fad542, 2026-09-18): the pod's
 // `boss` is the tree's by construction. Each pass takes the CLI at
 // origin/main out of the cluster image with the estate's installer
@@ -1557,6 +2556,10 @@ fn a_refused_missing_or_behind_dev_isolation_selector_is_a_problem_every_pass() 
 
     boss_testing::create_dir(&store);
     boss_testing::create_dir(&cli);
+    boss_testing::write_exec(
+        &store.join("dev-build"),
+        "#!/bin/sh\nprintf '%s\\n' '{\"runs\":[],\"next\":\"\"}'\n",
+    );
     symlink(&x, cli.join("current")).unwrap();
     symlink(store.join("generations").join(&x), store.join("enabled")).unwrap();
     let out = run(&root, &[]);
@@ -1875,17 +2878,28 @@ fn a_system_of_record_that_cannot_be_read_does_not_hold_the_fast_forward() {
     );
 }
 
+/// A DIVERGED checkout is left as it is and NAMED (review e5607585,
+/// finding 2b). A commit of its own on main is never this pass's to
+/// rewind — but it is not a checkout that forgot to pull either, and
+/// door-freshness.sh declines to judge one, so until this a diverged
+/// /work/boss was a log line every hour while every door ran a tree
+/// origin/main does not hold. The review reproduced the route: a
+/// builder call whose cd the harness dropped, writing a file and running
+/// `git commit -am` from a script, leaves exactly this. The packet names
+/// the head, origin/main, and what the checkout carries that main does
+/// not, like the off-main problems beside it.
 #[test]
 fn a_checkout_that_is_not_plainly_behind_on_main_is_left_alone() {
     let root = boss_testing::scratch_dir("boss-dsr-ff-diverged");
     let _guard = Scratch(root.clone());
     let yard = behind_by_one(&root);
-    // A commit of its own on main: this checkout has diverged, which is
-    // a developer's doing and not a checkout that forgot to pull — the
-    // same line door-freshness.sh draws when it declines to judge.
     boss_testing::write_file(&yard.repo.join("local.txt"), "mine\n");
     git(&yard.repo, 0, &["add", "."]);
-    git(&yard.repo, 0, &["commit", "-q", "-m", "local"]);
+    git(
+        &yard.repo,
+        0,
+        &["commit", "-q", "-m", "a stray local commit"],
+    );
     let before = head_sha(&yard.repo);
 
     let out = run(&root, &[]);
@@ -1896,14 +2910,172 @@ fn a_checkout_that_is_not_plainly_behind_on_main_is_left_alone() {
         "a diverged checkout is never rewound or merged\n{text}"
     );
     assert!(
-        curl_log(&root).is_empty(),
-        "and the system of record is not asked about a tree that cannot move\n{}\n{text}",
-        curl_log(&root)
-    );
-    assert!(
         String::from_utf8_lossy(&out.stdout).contains("fast-forward skipped")
             && String::from_utf8_lossy(&out.stdout).contains("diverged"),
-        "the pass names what it found instead\n{text}"
+        "the pass names what it found\n{text}"
+    );
+    assert_eq!(out.status.code(), Some(1), "and reds the pass\n{text}");
+    let keys = run_step_keys(&root, &text);
+    assert_eq!(keys["ff_result"], "diverged", "{keys}\n{text}");
+    let output = keys["output"].as_str().unwrap_or("");
+    assert!(
+        output.lines().any(|l| l
+            .starts_with("RED dev-scratch-reclaim/checkout-diverged problem: ")
+            && l.contains(&before[..8])
+            && l.contains("a stray local commit")),
+        "the packet names the problem, the head and the commit it carries: {keys}\n{text}"
+    );
+}
+
+/// The run step's keys as the pass wrote them, from the merge door's body.
+fn run_step_keys(root: &Path, text: &str) -> serde_json::Value {
+    let log = curl_log(root);
+    let put = log
+        .lines()
+        .find(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
+    serde_json::from_str(put.split_once("/metadata ").map(|(_, b)| b).unwrap_or("{}"))
+        .unwrap_or_else(|e| panic!("the run step body is JSON ({e}): {put}"))
+}
+
+/// THE CHECKOUT GOES BACK TO MAIN (backlog 88553fea). Measured from the
+/// /work/boss reflog on 2026-10-20: three reviewer runs moved the shared
+/// checkout off main — detached at 8a9fdecb, detached at dcb010de, and
+/// onto branch `worktree-agent-adc4e55861d5bfd66` for thirteen minutes —
+/// each through a bare git whose `cd <worktree> &&` the harness dropped,
+/// and every pod door ran that tree meanwhile. This pass used to say "a
+/// checkout somebody moved is theirs to move back" and skip it; nobody
+/// whose it was knew they had moved it, and the operator put it back by
+/// hand. Now a CLEAN checkout off main goes back to main (and is then
+/// fast-forwarded like any other), and the packet records the reflog
+/// entry that moved it, so the next reader sees which run did it without
+/// reading the reflog by hand.
+#[test]
+fn a_clean_checkout_moved_off_main_is_returned_and_the_packet_names_the_move() {
+    for (shape, moved) in [
+        ("branch", "to worktree-agent-adc4e55861d5bfd66"),
+        ("detached", "checkout: moving from main to"),
+    ] {
+        let root = boss_testing::scratch_dir(&format!("boss-dsr-off-main-{shape}"));
+        let _guard = Scratch(root.clone());
+        let yard = behind_by_one(&root);
+        let main = yard.origin_main();
+        if shape == "branch" {
+            git(
+                &yard.repo,
+                0,
+                &["checkout", "-q", "-b", "worktree-agent-adc4e55861d5bfd66"],
+            );
+        } else {
+            git(&yard.repo, 0, &["checkout", "-q", "--detach", "HEAD"]);
+        }
+
+        let out = run(&root, &[]);
+        let text = say(&out);
+        assert_eq!(
+            git(&yard.repo, 0, &["symbolic-ref", "--short", "HEAD"]),
+            "main",
+            "a clean checkout {shape} off main is returned to main\n{text}"
+        );
+        assert_eq!(
+            head_sha(&yard.repo),
+            main,
+            "and then fast-forwarded like any checkout on main\n{text}"
+        );
+        assert!(out.status.success(), "a return is the pass working\n{text}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("returned") && stdout.contains(moved),
+            "the pass says it returned the checkout and from what\n{text}"
+        );
+        // A return is an ACT, unlike a routine fast-forward: somebody moved
+        // the tree every door runs from, and the record is where that is
+        // read. The packet carries the reflog entry it found.
+        let keys = run_step_keys(&root, &text);
+        let from = keys["ff_returned_from"].as_str().unwrap_or("");
+        assert!(
+            from.contains("HEAD@{") && from.contains(moved),
+            "the packet names the reflog entry that moved the checkout ({moved}): {keys}\n{text}"
+        );
+        assert_eq!(keys["ff_result"], "ok", "{keys}\n{text}");
+    }
+}
+
+/// A DIRTY checkout off main is somebody's work in progress — or a stray
+/// edit nobody owns — and switching under it could carry the edit onto
+/// main or refuse halfway. So it is left exactly as it is, and NAMED: a
+/// problem on the packet, with the branch and the files, because every
+/// door still runs that tree until someone looks.
+#[test]
+fn a_dirty_checkout_off_main_is_left_alone_and_named() {
+    let root = boss_testing::scratch_dir("boss-dsr-off-main-dirty");
+    let _guard = Scratch(root.clone());
+    let yard = behind_by_one(&root);
+    git(
+        &yard.repo,
+        0,
+        &["checkout", "-q", "-b", "worktree-agent-dirty"],
+    );
+    let before = head_sha(&yard.repo);
+    boss_testing::write_file(&yard.repo.join("README"), "a stray edit\n");
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert_eq!(
+        git(&yard.repo, 0, &["symbolic-ref", "--short", "HEAD"]),
+        "worktree-agent-dirty",
+        "a dirty checkout is never switched\n{text}"
+    );
+    assert_eq!(head_sha(&yard.repo), before, "{text}");
+    assert_eq!(
+        std::fs::read_to_string(yard.repo.join("README")).expect("read README"),
+        "a stray edit\n",
+        "and its edit is untouched\n{text}"
+    );
+    assert_eq!(out.status.code(), Some(1), "and reds the pass\n{text}");
+    let keys = run_step_keys(&root, &text);
+    let output = keys["output"].as_str().unwrap_or("");
+    assert!(
+        output.contains("RED dev-scratch-reclaim/checkout-off-main problem: ")
+            && output.contains("worktree-agent-dirty")
+            && output.contains("README"),
+        "the packet names the problem, the branch and the dirty file: {keys}\n{text}"
+    );
+}
+
+/// A detached commit no branch holds is a commit of its own — the same
+/// line the diverged rule draws — and switching away would leave it only
+/// in the reflog. Clean or not, it is left as it is and named.
+#[test]
+fn a_detached_commit_no_branch_holds_is_left_alone_and_named() {
+    let root = boss_testing::scratch_dir("boss-dsr-off-main-orphan");
+    let _guard = Scratch(root.clone());
+    let yard = behind_by_one(&root);
+    git(&yard.repo, 0, &["checkout", "-q", "--detach", "HEAD"]);
+    boss_testing::write_file(&yard.repo.join("orphan.txt"), "mine\n");
+    git(&yard.repo, 0, &["add", "."]);
+    git(
+        &yard.repo,
+        0,
+        &["commit", "-q", "-m", "a commit on a detached head"],
+    );
+    let before = head_sha(&yard.repo);
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert_eq!(
+        head_sha(&yard.repo),
+        before,
+        "a detached commit is never left behind\n{text}"
+    );
+    assert_eq!(out.status.code(), Some(1), "and reds the pass\n{text}");
+    let keys = run_step_keys(&root, &text);
+    assert!(
+        keys["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("RED dev-scratch-reclaim/checkout-off-main problem: "),
+        "the packet names it: {keys}\n{text}"
     );
 }
 
@@ -1966,6 +3138,631 @@ fn a_fast_forward_git_refuses_is_loud_and_lands_on_the_packet() {
         put.contains("work.txt"),
         "and it NAMES THE FILE — without that the reader has an exit code and a sha, and \
          must go to the host's journal to learn which path refused\n{put}\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// THE SHARED CHECKOUT IS HELD BY ITS OWNER (backlog c19ee02b; measured
+// on the pod 2026-10-21 05:00Z by run bf97aae8). /work/boss and every
+// directory in it outside the worktrees were drwxrwsr-x root:1500 with
+// no sticky bit, and 6,762 files were group- or other-writable, among
+// them infra/dev/sor-url (where the doors and this pass send the machine
+// token) and .git/config. Every builder under as-gate-uid is group 1500,
+// so it could rename a door aside and plant its own, rewrite git's
+// config or drop a hook beside it, and root — this pass, every door,
+// every session's git — would run what it left. The hourly pass is the
+// versioned owner of these modes: it takes group and other write off the
+// checkout and everything in it except the worktrees' own contents,
+// which builders write in, and names what it cannot hold.
+// ---------------------------------------------------------------------
+
+fn checkout_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+fn chmod_checkout(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    // mode-bits-ok: the fixture checkout, given the modes the pod's fsGroup left it
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .unwrap_or_else(|e| panic!("chmod {mode:o} {}: {e}", path.display()));
+}
+
+/// The pod's checkout as it stood on 2026-10-21, one train behind main:
+/// the work mount sticky (the doors' tree holds that, backlog 3db83d0d),
+/// and below it the paths root runs or reads group-writable — a door,
+/// the token's address, git's config and hooks, a node_modules file
+/// other-writable, the harness's worktrees directory — plus one worktree
+/// under it whose own contents a builder writes in. Returns the yard,
+/// the paths the pass must hold, and the worktree contents it must not
+/// touch with the mode each must keep.
+fn shared_checkout(root: &Path) -> (Yard, Vec<PathBuf>, Vec<(PathBuf, u32)>) {
+    let yard = behind_by_one(root);
+    let repo = yard.repo.clone();
+    let wt = repo.join(".claude/worktrees/agent-builder");
+    git(
+        &repo,
+        1,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            wt.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    boss_testing::create_dir(&repo.join("infra/dev"));
+    boss_testing::create_dir(&repo.join("node_modules/pkg"));
+    boss_testing::create_dir(&wt.join("apps/web/dist"));
+    boss_testing::write_exec(&repo.join("infra/dev/boss"), "#!/bin/sh\n");
+    boss_testing::write_file(&repo.join("infra/dev/sor-url"), "http://sor.test:7900\n");
+    boss_testing::write_file(&repo.join("node_modules/pkg/index.js"), "x\n");
+    boss_testing::write_file(&wt.join("apps/web/dist/index.html"), "x\n");
+    boss_testing::create_dir(&repo.join(".git/hooks"));
+    std::os::unix::fs::symlink("boss", repo.join("infra/dev/boss-link")).expect("door link");
+    // The fixture's own infra/ — named through its child, so the pin
+    // that hunts a walk of the real top-level tree does not mistake it
+    // for one.
+    let infra = repo
+        .join("infra/dev")
+        .parent()
+        .expect("infra")
+        .to_path_buf();
+    let held: Vec<(PathBuf, u32)> = vec![
+        (repo.clone(), 0o2775),
+        (infra, 0o2775),
+        (repo.join("infra/dev"), 0o2775),
+        (repo.join("infra/dev/boss"), 0o775),
+        (repo.join("infra/dev/sor-url"), 0o664),
+        (repo.join(".git"), 0o2775),
+        (repo.join(".git/config"), 0o664),
+        (repo.join(".git/hooks"), 0o2775),
+        (repo.join("node_modules/pkg/index.js"), 0o666),
+        (repo.join(".claude"), 0o2775),
+        (repo.join(".claude/worktrees"), 0o2775),
+        // A tree's TOP is held too, so no group member renames its own
+        // file over the tree's .git (backlog 0cc54611).
+        (wt.clone(), 0o2775),
+    ];
+    let kept: Vec<(PathBuf, u32)> = vec![
+        (wt.join("apps/web/dist"), 0o2775),
+        (wt.join("apps/web/dist/index.html"), 0o664),
+    ];
+    for (p, m) in held.iter().chain(kept.iter()) {
+        chmod_checkout(p, *m);
+    }
+    chmod_checkout(&root.join("work"), 0o3775);
+    (yard, held.into_iter().map(|(p, _)| p).collect(), kept)
+}
+
+/// The pass with the worktrees where the pod keeps them, inside the
+/// checkout, rather than the fixture's default beside it.
+fn run_in_shared_checkout(root: &Path) -> Output {
+    let wts = root.join("work/repo/.claude/worktrees");
+    run(root, &[("WORKTREES_DIR", wts.to_str().expect("utf8"))])
+}
+
+#[test]
+fn every_pass_takes_group_and_other_write_off_the_shared_checkout_but_not_its_worktrees() {
+    let root = boss_testing::scratch_dir("boss-dsr-checkout-held");
+    let _guard = Scratch(root.clone());
+    let (yard, held, kept) = shared_checkout(&root);
+    let before: Vec<u32> = held.iter().map(|p| checkout_mode(p)).collect();
+    let main = yard.origin_main();
+
+    let out = run_in_shared_checkout(&root);
+    let text = say(&out);
+    assert!(out.status.success(), "{text}");
+    for (p, was) in held.iter().zip(before) {
+        let now = checkout_mode(p);
+        assert_eq!(
+            now & 0o022,
+            0,
+            "{} is {now:o}: a group member could still replace what root runs\n{text}",
+            p.display()
+        );
+        assert_eq!(
+            now,
+            was & !0o022,
+            "{} keeps setgid, its owner's bits and everyone's read ({was:o} -> {now:o})\n{text}",
+            p.display()
+        );
+    }
+    for (p, m) in &kept {
+        assert_eq!(
+            checkout_mode(p),
+            *m,
+            "a worktree's own contents are a builder's to write: {} left as it was\n{text}",
+            p.display()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("shared checkout: held, re-held"),
+        "the pass says it held the checkout and how many entries it re-held\n{text}"
+    );
+    assert!(
+        stdout.contains("took group and other write off")
+            && stdout.contains("infra/dev/sor-url (was 664)"),
+        "each entry it held is named with the mode it had\n{text}"
+    );
+
+    // git's own writes still land in the held tree: the pass's own
+    // fast-forward above, and the owner's commit and new worktree below.
+    assert_eq!(
+        head_sha(&yard.repo),
+        main,
+        "the fast-forward ran in the held checkout\n{text}"
+    );
+    boss_testing::write_file(&yard.repo.join("after.txt"), "after\n");
+    git(&yard.repo, 0, &["add", "after.txt"]);
+    git(&yard.repo, 0, &["commit", "-q", "-m", "after the hold"]);
+    // Landed, so the second pass below finds the checkout current: a
+    // commit origin/main does not hold is a diverged checkout, which is
+    // now a problem of its own (review e5607585, finding 2b).
+    yard.land("main");
+    let fresh = yard.repo.join(".claude/worktrees/agent-fresh");
+    git(
+        &yard.repo,
+        0,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/fresh",
+            fresh.to_str().expect("utf8"),
+            "main",
+        ],
+    );
+    assert!(
+        fresh.join("README").exists(),
+        "a worktree is still creatable in the held checkout"
+    );
+
+    // Nothing to hold the second time, and the pass says so.
+    let out = run_in_shared_checkout(&root);
+    let text = say(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("shared checkout: held ("),
+        "a held checkout is held, with nothing re-held\n{text}"
+    );
+}
+
+/// What a group member leaves after moving the real checkout aside
+/// through a work mount that is not yet sticky: a link where the
+/// checkout was. The pass follows no link to hold what it points at
+/// (that tree could be anyone's) and names it instead.
+#[test]
+fn a_checkout_replaced_by_a_link_is_a_problem_the_packet_names() {
+    let root = boss_testing::scratch_dir("boss-dsr-checkout-link");
+    let _guard = Scratch(root.clone());
+    let (yard, _held, _kept) = shared_checkout(&root);
+    let real = root.join("work/repo-real");
+    std::fs::rename(&yard.repo, &real).expect("move the checkout aside");
+    std::os::unix::fs::symlink(&real, &yard.repo).expect("leave a link in its place");
+
+    let out = run_in_shared_checkout(&root);
+    let text = say(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a checkout that is a link reds the pass\n{text}"
+    );
+    assert_eq!(
+        checkout_mode(&real),
+        0o2775,
+        "the pass holds nothing through the link\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .find(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the pass records itself\n{log}\n{text}"));
+    let output = recorded_output(put);
+    assert!(
+        output.lines().any(
+            |l| l.starts_with("RED dev-scratch-reclaim/checkout-open problem: ")
+                && l.contains("work/repo is not a directory")
+        ),
+        "the packet names the checkout and why it cannot be held\n{output}"
+    );
+    assert!(
+        put.contains("\"checkout\":\"OPEN: "),
+        "and the checkout's state says it is not held\n{put}"
+    );
+}
+
+/// NO CLIENT CONFIG IN THE DEV HOME (backlog 2b1bf9b4, review 4ceac0c8).
+/// /work/home is root's HOME on the pod and group 1500 may create files
+/// in it; curl reads a `.curlrc` there, wget a `.wgetrc`, and curl, wget
+/// and git a `.netrc`, none with an ownership check. The doors pass `-q`
+/// now, so the planted file is no longer read by them; nothing in the
+/// estate writes any of the three, so ONE existing is the finding itself,
+/// named by path every pass — and a home without them names nothing.
+#[test]
+fn a_curlrc_netrc_or_wgetrc_in_the_dev_home_is_a_red_problem() {
+    let root = boss_testing::scratch_dir("boss-dsr-home-client-config");
+    let _guard = Scratch(root.clone());
+    let _yard = Yard::new(&root);
+    let home = root.join("work/home");
+    boss_testing::create_dir(&home);
+    for name in [".curlrc", ".netrc", ".wgetrc"] {
+        boss_testing::write_file(&home.join(name), "# a fixture, planted\n");
+    }
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    let put = run_step_put(&root, &text);
+    let output = recorded_output(&put);
+    let red: Vec<&str> = output
+        .lines()
+        .filter(|l| l.starts_with("RED dev-scratch-reclaim/home-client-config problem: "))
+        .collect();
+    assert_eq!(
+        red.len(),
+        1,
+        "one RED line names the home's client config\n{output}\n{text}"
+    );
+    for name in [".curlrc", ".netrc", ".wgetrc"] {
+        assert!(
+            red[0].contains(&format!("{name} (uid ")),
+            "{name} is named with its owner\n{output}"
+        );
+    }
+
+    // A home that holds none of them names nothing.
+    for name in [".curlrc", ".netrc", ".wgetrc"] {
+        std::fs::remove_file(home.join(name)).expect("remove the fixture");
+    }
+    let _ = std::fs::remove_file(root.join("curl-log.txt"));
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert!(
+        !curl_log(&root).contains("home-client-config"),
+        "a home without a client config files no problem for it\n{text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("dev home's client config: none"),
+        "and the pass says it looked\n{text}"
+    );
+}
+
+/// THE DEV HOME'S GIT CONFIG IS HELD BY ITS OWNER (backlog aa1f7d7c).
+/// /work/home/.gitconfig was root:1500 0664 on the pod, so a group member
+/// could set a credential helper, core.fsmonitor, core.sshCommand or an
+/// include, and root's git — HOME=/work/home — would run it. The pass
+/// takes group and other write off it every hour, as its owner; one it
+/// cannot hold — a link, another uid's — is the RED home-client-config
+/// line. Its contents are never read.
+#[test]
+fn the_dev_homes_gitconfig_is_held_by_its_owner_and_named_when_it_cannot_be() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode_of = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .expect("stat the fixture")
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    let root = boss_testing::scratch_dir("boss-dsr-home-gitconfig");
+    let _guard = Scratch(root.clone());
+    let _yard = Yard::new(&root);
+    let home = root.join("work/home");
+    boss_testing::create_dir(&home);
+    let config = home.join(".gitconfig");
+    boss_testing::write_file(&config, "# a fixture git config\n");
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o664))
+        .expect("open the fixture to the group");
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert_eq!(
+        mode_of(&config),
+        0o644,
+        "group and other write come off the dev home's git config\n{text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&format!(
+            "root's git config: took group and other write off {}",
+            config.display()
+        )),
+        "the pass says what it held\n{text}"
+    );
+    assert!(
+        !curl_log(&root).contains("home-client-config"),
+        "a config the pass could hold is held, not a problem\n{text}"
+    );
+
+    // Held already: nothing to hold, and the pass says so.
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains(&format!("root's git config: held ({}", config.display())),
+        "{text}"
+    );
+
+    // A link where the config belongs — what a member leaves after
+    // moving the real one aside — is named, and nothing is held through it.
+    let aside = root.join("work/planted-gitconfig");
+    std::fs::rename(&config, &aside).expect("move the config aside");
+    std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o664))
+        .expect("open the moved config");
+    std::os::unix::fs::symlink(&aside, &config).expect("leave a link in its place");
+    let _ = std::fs::remove_file(root.join("curl-log.txt"));
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert_eq!(
+        mode_of(&aside),
+        0o664,
+        "the pass holds nothing through a link\n{text}"
+    );
+    let put = run_step_put(&root, &text);
+    let output = recorded_output(&put);
+    assert!(
+        output.lines().any(|l| l
+            .starts_with("RED dev-scratch-reclaim/home-client-config problem: ")
+            && l.contains(".gitconfig (")
+            && l.contains("symbolic link")),
+        "the link is named on the packet\n{output}\n{text}"
+    );
+}
+
+/// The one global git config the dev container's git reads, read from
+/// the manifest that sets it: `GIT_CONFIG_GLOBAL` in the dev container's
+/// env (infra/cluster/manifests/boss-dev.yaml), returned as the path
+/// under /work, the mount the reclaim sidecar shares.
+fn container_git_config_global_under_work() -> String {
+    let text = std::fs::read_to_string(repo_root().join("infra/cluster/manifests/boss-dev.yaml"))
+        .expect("read boss-dev.yaml");
+    let values: Vec<String> = text
+        .lines()
+        .filter(|l| l.contains("name: GIT_CONFIG_GLOBAL,"))
+        .map(|l| {
+            l.split_once("value:")
+                .map(|(_, v)| v.trim().trim_end_matches('}').trim().trim_matches('"'))
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    assert!(
+        !values.is_empty() && values.iter().all(|v| v == &values[0]),
+        "boss-dev.yaml sets GIT_CONFIG_GLOBAL to one value: {values:?}"
+    );
+    let rest = values[0].strip_prefix("/work/").unwrap_or_else(|| {
+        panic!(
+            "GIT_CONFIG_GLOBAL={} is not under /work, the mount the reclaim \
+             sidecar shares with the dev container, so the pass cannot hold \
+             it: move the hold with it (backlog aa1f7d7c)",
+            values[0]
+        )
+    });
+    rest.to_string()
+}
+
+/// ROOT'S GIT READS /work/.gitconfig, NOT THE HOME'S (backlog aa1f7d7c;
+/// review ef57ab2e of car 335ace12, 2026-10-22). The dev container sets
+/// GIT_CONFIG_GLOBAL, and with it set git ignores $HOME/.gitconfig: the
+/// file every kubectl exec and every process in the container's tree
+/// reads was root:1500 0664 and held by nothing. The fixture is planted
+/// where the MANIFEST says the variable points — not where the script
+/// says — so a manifest that moves it fails here rather than leaving the
+/// pass holding the old file (CLAUDE.md 9a). $HOME/.config/git/config,
+/// git's other global, is held the same way. A link at either is named
+/// on the RED line by its full path, and nothing is held through it.
+/// Red before: e9802b62 held $DEV_HOME/.gitconfig alone, so both
+/// fixtures stayed 0664.
+#[test]
+fn the_container_git_config_global_is_held_by_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode_of = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .expect("stat the fixture")
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    let root = boss_testing::scratch_dir("boss-dsr-container-gitconfig");
+    let _guard = Scratch(root.clone());
+    let _yard = Yard::new(&root);
+    let global = root
+        .join("work")
+        .join(container_git_config_global_under_work());
+    let xdg = root.join("work/home/.config/git/config");
+    for p in [&global, &xdg] {
+        boss_testing::create_dir(p.parent().expect("a parent"));
+        boss_testing::write_file(p, "# a fixture git config\n");
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o664))
+            .expect("open the fixture to the group");
+    }
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    for p in [&global, &xdg] {
+        assert_eq!(
+            mode_of(p),
+            0o644,
+            "group and other write come off {}\n{text}",
+            p.display()
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&format!(
+                "root's git config: took group and other write off {}",
+                p.display()
+            )),
+            "the pass names {} as held\n{text}",
+            p.display()
+        );
+    }
+    assert!(
+        !curl_log(&root).contains("home-client-config"),
+        "configs the pass could hold are held, not a problem\n{text}"
+    );
+
+    // A link where the container's global config belongs is named by its
+    // full path, and nothing is held through it.
+    let aside = root.join("work/planted-global-gitconfig");
+    std::fs::rename(&global, &aside).expect("move the config aside");
+    std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o664))
+        .expect("open the moved config");
+    std::os::unix::fs::symlink(&aside, &global).expect("leave a link in its place");
+    let _ = std::fs::remove_file(root.join("curl-log.txt"));
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert_eq!(
+        mode_of(&aside),
+        0o664,
+        "the pass holds nothing through a link\n{text}"
+    );
+    let put = run_step_put(&root, &text);
+    let output = recorded_output(&put);
+    assert!(
+        output.lines().any(|l| l
+            .starts_with("RED dev-scratch-reclaim/home-client-config problem: ")
+            && l.contains(&format!("{} (", global.display()))
+            && l.contains("symbolic link")),
+        "the link is named on the packet by its full path\n{output}\n{text}"
+    );
+}
+
+/// `argv` as uid 65534 — the gate's uid, read from
+/// infra/gate-runner/gate-runner.yaml by infra/dev/as-gate-uid.sh, which
+/// drops the same way — in group `gid` and no other: a member of the
+/// checkout's group that does not own it, which is what every builder is
+/// to the pod's root:1500 checkout.
+fn as_a_member_of_the_checkouts_group(gid: u32, argv: &[&str]) -> Output {
+    Command::new("setpriv")
+        .args(["--reuid=65534", &format!("--regid={gid}"), "--clear-groups"])
+        .arg("--")
+        .args(argv)
+        .output()
+        .expect("setpriv")
+}
+
+/// The finding itself, reproduced and then refused: a uid in the
+/// checkout's group that does not own it replaces a door, rewrites the
+/// token's address and git's config and drops a hook, until the pass has
+/// held the checkout; then it can do none of that, a builder's worktree
+/// stays writable to it, and the hook it planted is a problem by name.
+///
+/// The pod has no CAP_CHOWN, so the fixture cannot be staged in group
+/// 1500 as the pod's is; it keeps the group root created it with, and
+/// the uid drops into THAT group. The kernel's rule is the same for any
+/// group. Root is needed to drop to another uid at all, which the gate
+/// (uid 65534) is not: there the test says NOT RUN on stderr and the
+/// mode pins above are the gate's evidence.
+#[test]
+fn a_group_member_cannot_replace_what_root_runs_from_the_checkout_once_the_pass_holds_it() {
+    use std::os::unix::fs::MetadataExt;
+    let uid = Command::new("id").arg("-u").output().expect("id -u");
+    if String::from_utf8_lossy(&uid.stdout).trim() != "0" {
+        eprintln!(
+            "NOT RUN: dropping to another uid needs root; the mode pins above cover the gate"
+        );
+        return;
+    }
+    let root = boss_testing::scratch_dir("boss-dsr-checkout-member");
+    let _guard = Scratch(root.clone());
+    let (yard, _held, kept) = shared_checkout(&root);
+    chmod_checkout(&root, 0o755);
+    let repo = yard.repo.clone();
+    let gid = std::fs::metadata(&repo).expect("stat repo").gid();
+    let s = |p: &Path| p.to_str().expect("utf8").to_string();
+    let door = s(&repo.join("infra/dev/boss"));
+    let aside = s(&repo.join("infra/dev/boss.aside"));
+    let sor_url = s(&repo.join("infra/dev/sor-url"));
+    let config = s(&repo.join(".git/config"));
+    let hook = s(&repo.join(".git/hooks/post-merge"));
+    let in_worktree = s(&kept[0].0.join("bundle.js"));
+    let as_member = |what: &str, argv: &[&str]| {
+        (
+            what.to_string(),
+            as_a_member_of_the_checkouts_group(gid, argv),
+        )
+    };
+    let append = "printf x >> \"$1\"";
+
+    // The finding, reproduced on the unheld checkout.
+    for (what, out) in [
+        as_member(
+            "rename a door aside",
+            &["mv", "-T", door.as_str(), aside.as_str()],
+        ),
+        as_member("and back", &["mv", "-T", aside.as_str(), door.as_str()]),
+        as_member(
+            "rewrite the token's address",
+            &["sh", "-c", append, "sh", sor_url.as_str()],
+        ),
+        as_member(
+            "rewrite git's config",
+            &["sh", "-c", append, "sh", config.as_str()],
+        ),
+        as_member("drop a hook root's git runs", &["touch", hook.as_str()]),
+    ] {
+        assert!(
+            out.status.success(),
+            "control: a group member can {what} before the pass\n{}",
+            say(&out)
+        );
+    }
+
+    // The pass holds every mode it owns, and cannot hold the hook it
+    // does not (the sidecar has no CAP_CHOWN): a problem, by name.
+    let out = run_in_shared_checkout(&root);
+    let text = say(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a foreign entry in the checkout reds the pass\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .rfind(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the pass records itself\n{log}\n{text}"));
+    let output = recorded_output(put);
+    assert!(
+        output.lines().any(
+            |l| l.starts_with("RED dev-scratch-reclaim/checkout-open problem: ")
+                && l.contains(".git/hooks/post-merge is owned by uid 65534")
+        ),
+        "the packet names the planted hook and its owner\n{output}"
+    );
+    std::fs::remove_file(&hook).expect("the owner of .git/hooks removes the planted hook");
+
+    for (what, out) in [
+        as_member(
+            "rename a door aside",
+            &["mv", "-T", door.as_str(), aside.as_str()],
+        ),
+        as_member(
+            "rewrite the token's address",
+            &["sh", "-c", append, "sh", sor_url.as_str()],
+        ),
+        as_member(
+            "rewrite git's config",
+            &["sh", "-c", append, "sh", config.as_str()],
+        ),
+        as_member("drop a hook root's git runs", &["touch", hook.as_str()]),
+    ] {
+        assert!(
+            !out.status.success(),
+            "a group member could {what} after the pass held the checkout\n{}",
+            say(&out)
+        );
+    }
+    let (what, out) = as_member("build in a worktree", &["touch", in_worktree.as_str()]);
+    assert!(
+        out.status.success(),
+        "a group member can still {what}: the worktrees' contents are left as they were\n{}",
+        say(&out)
     );
 }
 
@@ -2131,6 +3928,74 @@ fn a_floor_share_that_is_not_a_percentage_is_refused() {
     }
 }
 
+/// UNSET, THE SCRATCH FLOOR IS THE RULE infra/build-floor.env DEFINES
+/// (backlog 4cc39798, 2026-10-20). The script spelled its own 25% —
+/// Longhorn's refusal line exactly, under the estate's 27.5% disk_tight
+/// — so on w-1 the pass logged "251GB free >= 232GB floor" with the
+/// alarm three readings old. The order of the two floors is pinned in
+/// the_build_floor_lives_once.rs; this drives the script with the knob
+/// REMOVED, in the band that order is about — 2.5 GB under the file's
+/// floor, above the old 25% — on two disks, one for each term of the
+/// rule: on 100 GB the capped headroom share is the higher (the estate's
+/// 35% rules there), on 1000 GB the plain share is (Longhorn's 27.5%
+/// rules there, as on w-1).
+#[test]
+fn unset_the_scratch_floor_is_the_rule_the_build_floor_file_defines() {
+    let pct = build_floor("SCRATCH_RECLAIM_FLOOR_PCT");
+    let headroom_pct = build_floor("SCRATCH_RECLAIM_HEADROOM_PCT");
+    let ceiling = build_floor("SCRATCH_RECLAIM_HEADROOM_CEILING_GB");
+    let rule = format!("{pct}%, or {headroom_pct}% up to {ceiling}GB");
+    for (disk_gb, headroom_rules) in [(100_u64, true), (1000, false)] {
+        let share = disk_gb * pct / 100;
+        let headroom = (disk_gb * headroom_pct / 100).min(ceiling);
+        assert_eq!(
+            headroom > share,
+            headroom_rules,
+            "on {disk_gb} GB the fixture expects the {} term to rule ({rule})",
+            if headroom_rules { "headroom" } else { "share" }
+        );
+        let floor = share.max(headroom);
+        assert!(
+            floor >= disk_gb / 4 + 3,
+            "the fixture's band needs a floor above the old 25% on {disk_gb} GB"
+        );
+        let root = boss_testing::scratch_dir("boss-dsr-floor-from-file");
+        let _guard = Scratch(root.clone());
+        boss_testing::create_dir(&root.join("work").join("wt"));
+        boss_testing::create_dir(&root.join("work").join("repo"));
+        let bin = stub_curl(&root);
+        stub_df(&bin);
+        let primary = target_dir(&root, "target", 0);
+        let idle = sized_target(&root, "target-idle-2h", 2, 5);
+        // Free is 2.5 GB under the floor, and the 5 MiB (= 5 GB, see
+        // stub_df) idle target meets it.
+        let cap = du_kb(&root) + floor * 1024 - 2 * 1024 - 512;
+        let mut cmd = command_with(
+            &root,
+            &["--scratch-floor"],
+            &[
+                ("STUB_DF_SCRATCH", root.to_str().expect("utf-8 path")),
+                ("STUB_DF_CAP_KB", &cap.to_string()),
+                ("STUB_DF_SIZE_GB", &disk_gb.to_string()),
+            ],
+        );
+        cmd.env_remove("BOSS_SCRATCH_FLOOR_PCT");
+        let out = cmd.output().expect("run dev-scratch-reclaim.sh");
+        let text = say(&out);
+        assert_eq!(out.status.code(), Some(0), "{text}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&format!("{floor}GB floor ({rule})")),
+            "on {disk_gb} GB the pass applies the infra/build-floor.env rule ({rule}), \
+             {floor} GB\n{text}"
+        );
+        assert!(
+            !idle.exists(),
+            "under the file's floor the idle sibling is taken\n{text}"
+        );
+        assert!(primary.exists(), "the primary is never removed\n{text}");
+    }
+}
+
 // ---------------------------------------------------------------------
 // THE FLOOR FOLLOWS THE BUILD (backlog 3f2a08ab, 2026-09-24).
 // ---------------------------------------------------------------------
@@ -2223,7 +4088,7 @@ fn above_the_floor_the_scratch_floor_mode_is_silent_and_takes_nothing() {
     boss_testing::create_dir(&root.join("work").join("wt"));
     boss_testing::create_dir(&root.join("work").join("repo"));
     let primary = target_dir(&root, "target", 0);
-    // Stale by the hourly pass's 12h — it would take this one. The
+    // Stale by the fixture's 12h — the hourly pass would take it. The
     // floor mode is not the age pass and must leave it alone.
     let stale = target_dir(&root, "target-landed-yesterday", 30);
     let out = run_with(&root, &["--scratch-floor"], &[]);
@@ -2457,6 +4322,43 @@ fn a_kill_alert_the_watch_holds_past_its_bound_is_a_problem_of_the_hourly_pass()
     assert_eq!(out.status.code(), Some(1), "{text}");
 }
 
+/// Backlog 0143612a. A frozen ring an open item names is kept past the
+/// rotation of the rest, up to a bound; past it the watch retires the
+/// oldest and counts it (dev_memory_watch_sh.rs holds that half). A
+/// count that rides only a packet nobody files is the silence this
+/// replaces, so a retirement is a problem of the hourly pass until a
+/// person acknowledges it.
+#[test]
+fn a_frozen_ring_retired_while_its_item_was_open_is_a_problem_of_the_hourly_pass() {
+    let root = boss_testing::scratch_dir("boss-dsr-memory-retired");
+    let _guard = Scratch(root.clone());
+    boss_testing::create_dir(&root.join("work").join("wt"));
+    boss_testing::create_dir(&root.join("work").join("repo"));
+    target_dir(&root, "target", 0);
+    let on = [("BOSS_DEV_MEMORY_WATCH", "on")];
+    let watch_dir = root.join("work").join("telemetry").join("dev-memory");
+    boss_testing::create_dir(&watch_dir);
+    boss_testing::write_file(&watch_dir.join("kills-retired"), "1\n");
+    boss_testing::write_file(
+        &watch_dir.join("kills-retired.log"),
+        "2026-10-18T00:00:00Z retired dev-x (item i-1 1): more than 20 held\n",
+    );
+    let out = run(&root, &on);
+    let text = say(&out);
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .rfind(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the pass records itself\n{log}\n{text}"));
+    assert!(
+        put.contains("\"problems\":\"2\"")
+            && put.contains("dev-scratch-reclaim/memory-watch-rings-retired problem")
+            && put.contains("\"memory_watch_rings_retired\":\"1\""),
+        "a retired ring is a problem of its own\n{put}\n{text}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{text}");
+}
+
 // ---------------------------------------------------------------------
 // THE /work FLOOR IS THE GATE'S FLOOR PLUS A MARGIN (backlog 99ce8744).
 // ---------------------------------------------------------------------
@@ -2519,7 +4421,7 @@ fn the_work_floor_is_the_gates_floor_plus_the_margin_and_the_retired_knob_moves_
 }
 
 /// Under the /work floor a LANDED worktree waits only the live window
-/// the floor's target pass keeps (BOSS_LIVE_TARGET_MIN), not the 12h
+/// the floor's target pass keeps (BOSS_LIVE_TARGET_MIN), not the 3h
 /// grace — "the grace yields to the floor, as it already does for
 /// targets". A freshly cut tree (its head still on origin/main, so it
 /// reads as landed) is inside the live window and is kept.
@@ -2552,7 +4454,7 @@ fn under_the_work_floor_a_landed_worktree_waits_only_the_live_window() {
         if under {
             assert!(
                 !landed.exists(),
-                "under the /work floor a landed tree idle 2h goes — the 12h grace yields\n{text}"
+                "under the /work floor a landed tree idle 2h goes — the 3h grace yields\n{text}"
             );
             assert!(
                 String::from_utf8_lossy(&out.stdout).contains("under the /work floor"),
@@ -2561,12 +4463,47 @@ fn under_the_work_floor_a_landed_worktree_waits_only_the_live_window() {
         } else {
             assert!(
                 landed.exists(),
-                "above the floor a landed tree keeps its 12h grace\n{text}"
+                "above the floor a landed tree keeps its 3h grace\n{text}"
             );
         }
         assert!(
             fresh.exists(),
             "a tree cut minutes ago is inside the live window, floor or not\n{text}"
+        );
+    }
+}
+
+/// THE GRACE IS THREE HOURS (backlog b4112350). Measured 2026-10-22
+/// 00:05Z on the pod: /scratch, w-1's only Longhorn disk, held 369 GiB in
+/// 35 live build targets, each tied to a worktree the 12h grace kept
+/// after its run closed, and Longhorn could place 88 GiB there — under
+/// one 100 GiB worker volume, so dev isolation admitted one builder.
+/// With NEITHER knob set, a landed tree and a sibling target idle 4h are
+/// taken and ones idle 2h are kept: this pins the script's default, which
+/// every other test here overrides or never reaches.
+#[test]
+fn with_no_knob_set_the_grace_and_the_stale_target_age_are_three_hours() {
+    for (idle_h, due) in [(2, false), (4, true)] {
+        let root = boss_testing::scratch_dir("boss-dsr-three-hours");
+        let _guard = Scratch(root.clone());
+        let yard = Yard::new(&root);
+        let landed = yard.worktree("agent-landed", Some("feat/landed"), idle_h);
+        yard.land("feat/landed");
+        let sibling = target_dir(&root, "target-landed-earlier", idle_h);
+        let mut cmd = command_with(&root, &[], &[]);
+        cmd.env_remove("BOSS_WORKTREE_GRACE_H")
+            .env_remove("BOSS_STALE_TARGET_H");
+        let out = cmd.output().expect("run dev-scratch-reclaim.sh");
+        let text = say(&out);
+        assert_eq!(
+            landed.exists(),
+            !due,
+            "a landed, clean tree idle {idle_h}h against the default 3h grace\n{text}"
+        );
+        assert_eq!(
+            sibling.exists(),
+            !due,
+            "a sibling target idle {idle_h}h against the default 3h stale age\n{text}"
         );
     }
 }
@@ -2668,7 +4605,7 @@ fn a_worktree_whose_work_landed_by_a_rebase_and_a_squash_is_landed_and_unlanded_
         } else {
             assert!(
                 trained.exists() && squashed.exists(),
-                "above the floor a tree landed by content keeps the 12h grace, as one \
+                "above the floor a tree landed by content keeps the 3h grace, as one \
                  landed by sha does\n{text}"
             );
         }
@@ -2894,7 +4831,7 @@ fn a_system_of_record_that_cannot_be_read_keeps_every_unpushed_worktree() {
 /// MERGED, or which launched a gate for a car that merged under another
 /// branch name, is landed on record, and under the /work floor waits only
 /// the live window. A landed tree inside the live window is still kept,
-/// and is not even asked about; above the floor the 12h grace holds.
+/// and is not even asked about; above the floor the 3h grace holds.
 #[test]
 fn a_worktree_whose_run_finished_or_whose_car_merged_on_record_is_landed() {
     for under in [true, false] {
@@ -2962,7 +4899,7 @@ fn a_worktree_whose_run_finished_or_whose_car_merged_on_record_is_landed() {
         } else {
             assert!(
                 run_done.exists() && car_merged.exists() && via_gate.exists(),
-                "above the floor a tree landed on record keeps the 12h grace\n{text}"
+                "above the floor a tree landed on record keeps the 3h grace\n{text}"
             );
             assert!(
                 !curl_log(&root).contains("metadata="),
@@ -2971,6 +4908,229 @@ fn a_worktree_whose_run_finished_or_whose_car_merged_on_record_is_landed() {
             );
         }
     }
+}
+
+/// An RFC 3339 instant `hours_ago`, in the shape the system of record
+/// stamps `metadata.closed_at` (nanoseconds and an offset).
+fn instant_hours_ago(hours_ago: u64) -> String {
+    let at = format!("@{}", unix_now() - hours_ago * 3600);
+    let out = Command::new("date")
+        .args(["-u", "-d", &at, "+%Y-%m-%dT%H:%M:%S.123456789+00:00"])
+        .output()
+        .expect("run date");
+    assert!(out.status.success(), "date -d {at}");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A HARNESS LOCK OUTLIVES ITS AGENT (backlog 3a84cbf5). The Claude
+/// harness locks every agent worktree `claude agent agent-<id> (pid N
+/// start T)` with the pid of the OPERATOR'S session, not the agent's, so
+/// the lock reads live for as long as that session lives, however long
+/// ago the agent handed back. Measured 2026-10-21 16:15Z on the pod: 116
+/// such locks, every one naming one of two live sessions; 97 of those
+/// trees had gated, and every agent-run that gated from each was closed
+/// (9.1 GB), while /work sat at its 18 GB floor and the pass reported
+/// `kept 536`. The record is the owner the lock cannot name: a harness
+/// lock is RELEASED when every agent-run whose gate-run launched from
+/// the tree is closed, each at least WORKTREE_GRACE_H ago, and git has
+/// been quiet in the tree as long — the grace is NOT shortened under the
+/// floor, because the session the lock names is alive and could resume
+/// the agent. Released, the tree is judged like any other: dirty keeps
+/// it, and its lock stays on unless it is removed. Every refusal is here:
+/// an open run, one open run among closed ones, a close inside the grace,
+/// no gate-run at all, a closed run with no close time, a tree with
+/// recent git activity, and a lock that is not the harness's shape.
+#[test]
+fn a_harness_lock_whose_every_gated_run_closed_past_the_grace_is_released() {
+    let root = boss_testing::scratch_dir("boss-dsr-harness-released");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let lock = |name: &str| format!("claude agent {name} (pid 355 start 95092646)");
+    // Unpushed, idle 20h: past the 3h grace, inside the 48h unpushed
+    // window, so only the record can make any of them due. Every id is
+    // alphanumeric after `agent-`, as the harness writes it and as
+    // HARNESS_LOCK_SHAPE requires: a hyphenated id is refused on its
+    // shape before any guard runs, and three refusals here once passed
+    // for that reason alone — deleting the closed_at grace or releasing
+    // a never-gated tree left this test green (review 48211da3).
+    let names = [
+        "agent-done",
+        "agent-dirty",
+        "agent-open",
+        "agent-mixed",
+        "agent-recentclose",
+        "agent-nogate",
+        "agent-noclosedat",
+        "agent-human",
+    ];
+    let trees: Vec<PathBuf> = names
+        .iter()
+        .map(|n| yard.worktree(n, Some(&format!("worktree-{n}")), 20))
+        .collect();
+    // Its run closed long ago, but git moved in it 2h ago.
+    let busy = yard.worktree("agent-busy", Some("worktree-agent-busy"), 2);
+    for (name, tree) in names.iter().zip(&trees) {
+        if *name == "agent-human" {
+            harness_lock(&yard, tree, "operator: bisecting, leave it");
+        } else {
+            harness_lock(&yard, tree, &lock(name));
+        }
+    }
+    harness_lock(&yard, &busy, &lock("agent-busy"));
+    let [
+        done,
+        done_dirty,
+        open,
+        mixed,
+        recent,
+        no_gate,
+        no_closed_at,
+        human,
+    ] = [0, 1, 2, 3, 4, 5, 6, 7].map(|i| trees[i].clone());
+    dirty(&done_dirty, 20);
+    let gate = |tree: &Path, run: &str| serde_json::json!({"id": format!("g-{run}"), "worktree": path_str(tree), "branch": "fix/x", "agent_run": run});
+    // Closed 4h ago: past the 3h grace (backlog b4112350; 15h while the
+    // grace was 12h), so this test fails if the default grows back. The
+    // close inside the grace stays at 2h.
+    let long_ago = instant_hours_ago(4);
+    write_record(
+        &root,
+        serde_json::json!({
+            "gate_runs": [
+                gate(&done, "run0done"),
+                gate(&done_dirty, "run0drty"),
+                gate(&open, "run0open"),
+                gate(&mixed, "run0mix1"),
+                gate(&mixed, "run0mix2"),
+                gate(&recent, "run0rcnt"),
+                gate(&no_closed_at, "run0noat"),
+                gate(&human, "run0humn"),
+                gate(&busy, "run0busy"),
+            ],
+            "runs": {
+                "run0done": "closed", "run0drty": "closed", "run0open": "open",
+                "run0mix1": "closed", "run0mix2": "open", "run0rcnt": "closed",
+                "run0noat": "closed", "run0humn": "closed", "run0busy": "closed",
+            },
+            "closed_at": {
+                "run0done": long_ago, "run0drty": long_ago, "run0mix1": long_ago,
+                "run0rcnt": instant_hours_ago(2), "run0humn": long_ago,
+                "run0busy": long_ago,
+            },
+        }),
+    );
+    // pid 355 is alive with the start every lock recorded: by the
+    // process table alone, every lock here is live.
+    let proc_root = fake_proc(&root, "pause", &[(355, "claude", 95092646)]);
+
+    // Under the /work floor, where a landed tree waits only 30 minutes:
+    // a released lock still waits the full grace.
+    let out = run(
+        &root,
+        &[
+            ("PROC_ROOT", proc_root.to_str().expect("utf8")),
+            ("STUB_DF_WORK_GB", &under_the_work_floor()),
+        ],
+    );
+    let text = say(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !done.exists(),
+        "every run that gated from it closed past the grace, quiet, clean: released and removed\n{text}"
+    );
+    for (tree, why) in [
+        (&open, "its run is open"),
+        (&mixed, "one of its runs is open"),
+        (&recent, "its run closed inside the grace"),
+        (
+            &no_gate,
+            "no gate-run names it, so the record names no owner",
+        ),
+        (
+            &no_closed_at,
+            "a closed run with no close time cannot say how long ago",
+        ),
+        (
+            &human,
+            "a lock that is not the harness's shape is never judged",
+        ),
+        (&busy, "git moved in it inside the grace"),
+    ] {
+        assert!(tree.exists(), "{} is kept: {why}\n{text}", tree.display());
+    }
+    assert!(
+        done_dirty.exists() && stdout.contains("agent-dirty (2 dirty"),
+        "a released lock only opens the judgement: a dirty tree is kept and named\n{text}"
+    );
+    let listed = git(&yard.repo, 0, &["worktree", "list", "--porcelain"]);
+    assert!(
+        listed.contains(&lock("agent-dirty")),
+        "a released tree the pass KEEPS keeps its lock\n{listed}\n{text}"
+    );
+    assert!(
+        stdout.lines().any(|l| l.contains("agent-done:")
+            && l.contains("every agent-run that gated from this worktree")),
+        "the release names the record that made it\n{text}"
+    );
+    let put = run_step_put(&root, &text);
+    assert!(
+        put.contains("\"worktrees_released_locks\":\"2\"")
+            && put.contains("\"worktrees_released_lock_names\":\"agent-dirty, agent-done\"")
+            && put.contains("\"worktrees_kept_locked\":\"7\""),
+        "the packet counts and names the released locks apart from the live ones\n{put}\n{text}"
+    );
+}
+
+/// The release FAILS CLOSED: a record that cannot be read releases no
+/// harness lock, says so, and is asked once a pass. The tree surviving
+/// is not the proof — it is unpushed, so the landed judgement's own
+/// latch keeps it even when the lock is wrongly released — so the
+/// packet's counters are: nothing released, the one lock kept (review
+/// 48211da3, B2).
+#[test]
+fn a_record_that_cannot_be_read_releases_no_harness_lock() {
+    let root = boss_testing::scratch_dir("boss-dsr-harness-dark");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let tree = yard.worktree("agent-done", Some("worktree-agent-done"), 20);
+    harness_lock(
+        &yard,
+        &tree,
+        "claude agent agent-done (pid 355 start 95092646)",
+    );
+    let gone = abandoned_tree(&yard);
+    write_record(
+        &root,
+        serde_json::json!({
+            "gate_runs": [{"worktree": path_str(&tree), "branch": "fix/x", "agent_run": "run0done"}],
+            "runs": {"run0done": "closed"},
+            "closed_at": {"run0done": instant_hours_ago(15)},
+        }),
+    );
+    let proc_root = fake_proc(&root, "pause", &[(355, "claude", 95092646)]);
+    let out = run(
+        &root,
+        &[
+            ("PROC_ROOT", proc_root.to_str().expect("utf8")),
+            ("STUB_RECORD_RC", "7"),
+        ],
+    );
+    let text = say(&out);
+    assert!(tree.exists(), "an unread record releases nothing\n{text}");
+    assert!(
+        !gone.exists(),
+        "and the rest of the pass still runs\n{text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("could not be read"),
+        "the dark read is said out loud\n{text}"
+    );
+    let put = run_step_put(&root, &text);
+    assert!(
+        put.contains("\"worktrees_released_locks\":\"0\"")
+            && put.contains("\"worktrees_kept_locked\":\"1\""),
+        "the lock itself is what keeps it, not the unpushed branch\n{put}\n{text}"
+    );
 }
 
 /// A worktree this pass cannot SEE is not a worktree that is gone
@@ -3262,6 +5422,322 @@ fn recorded_output(put: &str) -> String {
         .ok()
         .and_then(|v| v.get("output").and_then(|o| o.as_str()).map(str::to_string))
         .unwrap_or_else(|| panic!("the run step carries an `output` string\n{put}"))
+}
+
+// ---------------------------------------------------------------------
+// THE DEV HOME'S KUBE CONFIG IS HELD BY ITS OWNER (backlog 5ebc7a6d;
+// measured by run c38afb80 on the pod 2026-10-19, and again 2026-10-21).
+// /work/home/.kube/config was 0664 root:1500 under /work/home/.kube and
+// /work/home, both 2775 root:1500 with no sticky bit. Every builder
+// under as-gate-uid is group 1500, so it could rewrite the file — or,
+// as the review of 6d7b418b noted, rename .kube aside and plant its own
+// — and kubectl would send the dev session's ServiceAccount token to
+// whatever server the planted file names. The hourly pass holds
+// /work/home sticky, .kube and its config private to the uid that owns
+// them, and names every other credential-adjacent path under the home a
+// group or other may write.
+// ---------------------------------------------------------------------
+
+fn home_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+fn chmod_home(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    // mode-bits-ok: the fixture home, given the modes the pod's fsGroup and umask left it
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .unwrap_or_else(|e| panic!("chmod {mode:o} {}: {e}", path.display()));
+}
+
+/// The dev home as the pod held it on 2026-10-19: /work/home and
+/// /work/home/.kube 2775, the config 0664, kubectl's cache 2770.
+fn dev_home(root: &Path) -> PathBuf {
+    let home = root.join("work").join("home");
+    boss_testing::create_dir(&home.join(".kube/cache/discovery"));
+    boss_testing::write_file(&home.join(".kube/config"), "apiVersion: v1\nkind: Config\n");
+    // The work mount above it as the doors' tree's pass leaves it
+    // (backlog 3db83d0d): sticky, so the home cannot be moved aside.
+    for (p, m) in [
+        (root.join("work"), 0o3775),
+        (home.clone(), 0o2775),
+        (home.join(".kube"), 0o2775),
+        (home.join(".kube/config"), 0o664),
+        (home.join(".kube/cache"), 0o2770),
+    ] {
+        chmod_home(&p, m);
+    }
+    home
+}
+
+#[test]
+fn every_pass_holds_the_dev_homes_kube_config_private_to_its_owner() {
+    let root = boss_testing::scratch_dir("boss-dsr-home-kube");
+    let _guard = Scratch(root.clone());
+    let _yard = Yard::new(&root);
+    let home = dev_home(&root);
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(
+        home_mode(&home.join(".kube")) & 0o077,
+        0,
+        "no group or other may enter, list or rename inside .kube\n{text}"
+    );
+    assert_eq!(
+        home_mode(&home.join(".kube/config")) & 0o077,
+        0,
+        "no group or other may read or rewrite the kube config\n{text}"
+    );
+    assert_eq!(
+        home_mode(&home.join(".kube/config")) & 0o600,
+        0o600,
+        "its owner still reads and writes it\n{text}"
+    );
+    let h = home_mode(&home);
+    assert_ne!(
+        h & 0o1000,
+        0,
+        "the home is sticky, so .kube cannot be renamed aside ({h:o})\n{text}"
+    );
+    assert_eq!(
+        h & 0o2070,
+        0o2070,
+        "the home keeps group rwx and setgid: its own mode is a separate decision ({h:o})\n{text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("dev home's kube config: held"),
+        "the pass says what it holds\n{text}"
+    );
+    assert!(
+        !curl_log(&root).contains("POST "),
+        "holding modes is not reclaiming: a pass that only held files no packet\n{}",
+        curl_log(&root)
+    );
+
+    // A link in place of the config is not a file this pass can hold: it
+    // names it, every pass, and the packet carries the state.
+    std::fs::remove_file(home.join(".kube/config")).expect("drop the config");
+    std::os::unix::fs::symlink("/elsewhere/config", home.join(".kube/config"))
+        .expect("plant a link");
+    chmod_home(&home.join(".kube"), 0o2775);
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a kube config that is a link reds the pass\n{text}"
+    );
+    assert_eq!(
+        home_mode(&home.join(".kube")) & 0o077,
+        0,
+        ".kube held again\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .rfind(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the pass records itself\n{log}\n{text}"));
+    let output = recorded_output(put);
+    assert!(
+        output.lines().any(
+            |l| l.starts_with("RED dev-scratch-reclaim/home-kube-open problem: ")
+                && l.contains(".kube/config is a link")
+        ),
+        "the packet names the link\n{output}"
+    );
+    assert!(
+        put.contains("\"home_kube\":\"OPEN"),
+        "and the kube config's state says it is not held\n{put}"
+    );
+}
+
+#[test]
+fn a_credential_adjacent_path_a_group_may_write_is_named_on_the_packet() {
+    let root = boss_testing::scratch_dir("boss-dsr-home-creds");
+    let _guard = Scratch(root.clone());
+    let _yard = Yard::new(&root);
+    let home = dev_home(&root);
+    // Open, as the pod's were on 2026-10-21: the actor every verb signs
+    // as, in a group-writable directory; an agent's session credential,
+    // 0600 itself but in a directory a group member may rename it out of.
+    for d in [".config/boss", ".claude", ".ssh", ".codex"] {
+        boss_testing::create_dir(&home.join(d));
+    }
+    boss_testing::write_file(&home.join(".config/boss/actor"), "agent-x\n");
+    boss_testing::write_file(&home.join(".claude/.credentials.json"), "{}");
+    // Private: a key directory, and a token beside no writable parent.
+    boss_testing::write_file(&home.join(".ssh/id_ed25519"), "k");
+    boss_testing::write_file(&home.join(".codex/auth.json"), "{}");
+    for (p, m) in [
+        // Start open; main's worktree guard holds this ancestor before
+        // the credential audit, so it must not remain a reported risk.
+        (root.join("work"), 0o2775),
+        (home.join(".config"), 0o2770),
+        (home.join(".config/boss"), 0o2775),
+        (home.join(".config/boss/actor"), 0o664),
+        (home.join(".claude"), 0o2775),
+        (home.join(".claude/.credentials.json"), 0o600),
+        (home.join(".ssh"), 0o700),
+        (home.join(".ssh/id_ed25519"), 0o600),
+        (home.join(".codex"), 0o2755),
+        (home.join(".codex/auth.json"), 0o600),
+    ] {
+        chmod_home(&p, m);
+    }
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an open credential-adjacent path reds the pass\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .rfind(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the pass records itself\n{log}\n{text}"));
+    let output = recorded_output(put);
+    let red = output
+        .lines()
+        .find(|l| l.starts_with("RED dev-scratch-reclaim/home-credentials-open problem: "))
+        .unwrap_or_else(|| panic!("the packet names the open paths\n{output}"));
+    for open in [
+        ".config/boss/actor (664)",
+        ".config/boss (2775)",
+        ".config (2770)",
+        ".claude (2775)",
+    ] {
+        assert!(red.contains(open), "{open} is named\n{red}");
+    }
+    for private in [".ssh", ".codex", ".kube"] {
+        assert!(!red.contains(private), "{private} is not named\n{red}");
+    }
+    assert_ne!(
+        home_mode(&root.join("work")) & 0o1000,
+        0,
+        "main's worktree guard holds the writable ancestor before the audit\n{text}"
+    );
+    assert!(
+        !red.contains("not sticky"),
+        "an ancestor held by this pass must not be reported open\n{red}"
+    );
+    assert_eq!(
+        home_mode(&home.join(".config/boss/actor")),
+        0o664,
+        "the audit names; it changes no mode it was not asked to hold\n{text}"
+    );
+    assert!(
+        put.contains("\"home_kube\":\"held, re-held 3 this pass\""),
+        "the kube config's hold rides the same packet\n{put}"
+    );
+    assert!(
+        put.contains("\"home_credentials\":\"OPEN: 4 path(s)\""),
+        "and the audit's count\n{put}"
+    );
+}
+
+fn running_as_uid_0() -> bool {
+    String::from_utf8_lossy(&Command::new("id").arg("-u").output().expect("id -u").stdout).trim()
+        == "0"
+}
+
+/// `argv` as uid 65534 — the gate's uid, read from
+/// infra/gate-runner/gate-runner.yaml by infra/dev/as-gate-uid.sh — in
+/// group `gid` and no other: what every builder is to the pod's
+/// root:1500 home.
+fn as_group_member_of(gid: u32, argv: &[&str]) -> Output {
+    Command::new("setpriv")
+        .args(["--reuid=65534", &format!("--regid={gid}"), "--clear-groups"])
+        .arg("--")
+        .args(argv)
+        .output()
+        .expect("setpriv")
+}
+
+/// The finding itself, reproduced and then refused: a uid in the home's
+/// group that does not own it rewrites the kube config, renames .kube
+/// aside and plants one of its own, until the pass has held them; then
+/// it can do none of that, cannot read the config, and cannot plant a
+/// kuberc (kubectl 1.34 reads $HOME/.kube/kuberc by default).
+///
+/// The pod has no CAP_CHOWN, so the fixture cannot be staged in group
+/// 1500; it keeps the group root created it with and the uid drops into
+/// THAT group — the kernel's rule is the same for any group. Root is
+/// needed to drop to another uid at all, which the gate (uid 65534) is
+/// not: there the test says NOT RUN and the mode pin above is the gate's
+/// evidence.
+#[test]
+fn a_group_member_cannot_redirect_the_dev_homes_kubectl_once_the_pass_holds_it() {
+    use std::os::unix::fs::MetadataExt;
+    if !running_as_uid_0() {
+        eprintln!(
+            "NOT RUN: dropping to another uid needs root; the mode pin above covers the gate"
+        );
+        return;
+    }
+    let root = boss_testing::scratch_dir("boss-dsr-home-rename");
+    let _guard = Scratch(root.clone());
+    let _yard = Yard::new(&root);
+    let home = dev_home(&root);
+    chmod_home(&root, 0o755);
+    chmod_home(&root.join("work"), 0o755);
+    let gid = std::fs::metadata(&home).expect("stat home").gid();
+    let s = |p: &Path| p.to_str().expect("utf8").to_string();
+    let kube = s(&home.join(".kube"));
+    let aside = s(&home.join(".kube.aside"));
+    let config = s(&home.join(".kube/config"));
+    let kuberc = s(&home.join(".kube/kuberc"));
+    let rewrite = "printf 'server: https://attacker.invalid\\n' >> \"$1\"";
+
+    for (what, argv) in [
+        (
+            "rewrite the kube config",
+            vec!["sh", "-c", rewrite, "sh", config.as_str()],
+        ),
+        (
+            "rename .kube aside",
+            vec!["mv", "-T", kube.as_str(), aside.as_str()],
+        ),
+        ("and back", vec!["mv", "-T", aside.as_str(), kube.as_str()]),
+    ] {
+        let out = as_group_member_of(gid, &argv);
+        assert!(
+            out.status.success(),
+            "control: a group member can {what} before the pass\n{}",
+            say(&out)
+        );
+    }
+
+    let out = run(&root, &[]);
+    assert!(out.status.success(), "{}", say(&out));
+
+    for (what, argv) in [
+        (
+            "rewrite the kube config",
+            vec!["sh", "-c", rewrite, "sh", config.as_str()],
+        ),
+        ("read the kube config", vec!["cat", config.as_str()]),
+        (
+            "rename .kube aside",
+            vec!["mv", "-T", kube.as_str(), aside.as_str()],
+        ),
+        ("plant a kuberc", vec!["touch", kuberc.as_str()]),
+    ] {
+        let out = as_group_member_of(gid, &argv);
+        assert!(
+            !out.status.success(),
+            "a group member could {what} after the pass held the home\n{}",
+            say(&out)
+        );
+    }
+    assert!(home.join(".kube/config").exists(), "the config stayed put");
 }
 
 #[test]
@@ -3580,4 +6056,1000 @@ fn durable_gate_index_drift_cannot_reclaim_a_live_original_checkout() {
         "an inconsistent raw locator cannot substitute a closed run for the original open owner\n{}",
         say(&out)
     );
+}
+
+/// A gate-run as `boss gate` files it now: the flat stamps, and the same
+/// source bound immutably in its submission.
+fn submitted_gate(
+    id: &str,
+    flat_worktree: &str,
+    source_worktree: &str,
+    run: &str,
+) -> serde_json::Value {
+    let source = serde_json::json!({"worktree":source_worktree,"branch":"fix/x","agent_run":run,"sha":"head"});
+    let envelope = serde_json::json!({"contract_version":1,"source":source});
+    serde_json::json!({"id":id,"worktree":flat_worktree,"branch":"fix/x","agent_run":run,"sha":"head",
+        "gate_submission":envelope,"_immutable_metadata":{"gate_submission":envelope}})
+}
+
+/// THE READ THE API ACCEPTS (backlog 7c9715b6). The jobs API's
+/// `metadata=` is a flat object of string values; from 2026-10-16 (#1206)
+/// to 2026-10-22 this pass asked it for the nested submission source,
+/// was refused 400 on every pass, and kept every unpushed tree 48h while
+/// /work sat under its floor. Both trees here landed on record — their
+/// runs closed — and both carry a submission, so both are taken; every
+/// `metadata=` the pass sends is one the server takes, the submitted
+/// gate-runs are read ONCE for the pass, and nothing says the record
+/// could not be read.
+#[test]
+fn the_gate_run_reads_are_ones_the_api_accepts_and_the_submitted_read_is_once_a_pass() {
+    let root = boss_testing::scratch_dir("boss-dsr-flat-gate-read");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let first = yard.worktree("agent-flat-one", Some("worktree-agent-flat-one"), 2);
+    let second = yard.worktree("agent-flat-two", Some("worktree-agent-flat-two"), 2);
+    write_record(
+        &root,
+        serde_json::json!({
+            "gate_runs": [
+                submitted_gate("gateone", &path_str(&first), &path_str(&first), "run0one"),
+                submitted_gate("gatetwo", &path_str(&second), &path_str(&second), "run0two"),
+            ],
+            "runs": {"run0one": "closed", "run0two": "closed"},
+        }),
+    );
+    let out = run(&root, &[("STUB_DF_WORK_GB", &under_the_work_floor())]);
+    let text = say(&out);
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("could not be read"),
+        "a read the API accepts is read\n{text}"
+    );
+    assert!(
+        !first.exists() && !second.exists(),
+        "both runs closed: both trees landed on record and are taken\n{text}"
+    );
+    let log = curl_log(&root);
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.contains("kind=gate-run") && l.contains("metadata_has=gate_submission"))
+            .count(),
+        1,
+        "the submitted gate-runs are read once a pass, not once a tree\n{log}"
+    );
+    assert!(
+        !log.contains("gate_submission%22%3A%7B"),
+        "no nested containment document is sent\n{log}"
+    );
+}
+
+/// A submission naming this tree whose FLAT stamp was moved elsewhere is
+/// a gate-run the flat read cannot see, and it may be the open run that
+/// keeps the tree. The pass fails closed on it rather than judging the
+/// tree by the gate-runs it can see — here one whose run closed.
+#[test]
+fn a_submission_whose_flat_stamp_moved_off_the_tree_fails_closed() {
+    let root = boss_testing::scratch_dir("boss-dsr-moved-stamp");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let tree = yard.worktree("agent-moved", Some("worktree-agent-moved"), 2);
+    write_record(
+        &root,
+        serde_json::json!({
+            "gate_runs": [
+                {"id": "gatedone", "worktree": path_str(&tree), "branch": "fix/x", "agent_run": "run0done"},
+                submitted_gate("gatemove", "/work/elsewhere", &path_str(&tree), "run0open"),
+            ],
+            "runs": {"run0done": "closed", "run0open": "open"},
+        }),
+    );
+    let out = run(&root, &[("STUB_DF_WORK_GB", &under_the_work_floor())]);
+    let text = say(&out);
+    assert!(
+        tree.exists(),
+        "a submission the flat read missed keeps the tree\n{text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("name it only in their submission"),
+        "and the latch names why\n{text}"
+    );
+}
+
+/// A failed read says WHAT it was answered: the latch carried only "a
+/// shape this pass cannot read" while every pass was refused 400, and
+/// the 400 sat in an evidence file nobody opened (backlog 7c9715b6).
+#[test]
+fn a_gate_read_that_fails_names_what_it_was_answered() {
+    let root = boss_testing::scratch_dir("boss-dsr-said");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let tree = yard.worktree("agent-said", Some("worktree-agent-said"), 2);
+    write_record(
+        &root,
+        serde_json::json!({
+            "gate_runs": [submitted_gate("gatesaid", &path_str(&tree), &path_str(&tree), "run0said")],
+            "runs": {"run0said": "closed"},
+        }),
+    );
+    let out = run(
+        &root,
+        &[
+            ("STUB_DF_WORK_GB", &under_the_work_floor()),
+            ("STUB_SUBMITTED_RC", "22"),
+        ],
+    );
+    let text = say(&out);
+    assert!(tree.exists(), "an unread record is no landing\n{text}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l.contains("could not be read") && l.contains("returned error: 503")),
+        "the latch carries what the read was answered\n{text}"
+    );
+    let put = run_step_put(&root, &text);
+    assert!(
+        put.contains("returned error: 503"),
+        "and so does the packet\n{put}\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// THE AGENT-ARTIFACT INVENTORY (backlog 25022367, design 195276f0): the
+// hourly pass runs the lifecycle's dry run and records its report; the
+// dry run changes nothing it reads, and one that did not happen is a
+// problem the packet names. dev-artifact-inventory_test.py holds the
+// accounting itself (dev_artifact_inventory_py.rs runs it).
+// ---------------------------------------------------------------------
+
+/// A fixture /work carrying one artifact per family the tree's policy
+/// names, each with its bytes and mtime recorded to compare afterwards.
+fn plant_artifacts(root: &Path) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
+    let work = root.join("work");
+    boss_testing::create_dir(&work.join("wt"));
+    boss_testing::create_dir(&work.join("repo"));
+    [
+        "home/.codex/scratch/coordinator-x/run-a/snapshot.json",
+        "home/.codex/sessions/2026/10/16/rollout.jsonl",
+        "home/.claude/projects/-work-boss/session.jsonl",
+    ]
+    .iter()
+    .map(|rel| {
+        let path = work.join(rel);
+        boss_testing::create_dir(path.parent().expect("a parent"));
+        boss_testing::write_file(&path, &format!("evidence of {rel}\n"));
+        touch_at(&path, 72);
+        let meta = std::fs::metadata(&path).expect("stat");
+        (
+            path.clone(),
+            std::fs::read(&path).expect("read"),
+            meta.modified().expect("mtime"),
+        )
+    })
+    .collect()
+}
+
+#[test]
+fn the_hourly_pass_records_the_artifact_dry_run_and_changes_nothing_it_read() {
+    let root = boss_testing::scratch_dir("boss-dsr-artifact-inventory");
+    let _guard = Scratch(root.clone());
+    let planted = plant_artifacts(&root);
+    let out = run(&root, &[("BOSS_ARTIFACT_INVENTORY", "on")]);
+    let text = say(&out);
+    let report_path = root
+        .join("work")
+        .join("telemetry")
+        .join("artifact-inventory")
+        .join("latest.json");
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&report_path)
+            .unwrap_or_else(|e| panic!("the pass wrote the report: {e}\n{text}")),
+    )
+    .expect("the report is JSON");
+    assert_eq!(report["mutated"], false, "{text}");
+    assert_eq!(report["candidates"], serde_json::json!([]), "{text}");
+    let families = report["families"].as_array().expect("families");
+    assert_eq!(families.len(), 3, "{report}");
+    for family in families {
+        assert_eq!(family["status"], "read", "{family}");
+        assert_eq!(family["files"], 1, "{family}");
+    }
+    for (path, bytes, mtime) in &planted {
+        assert_eq!(
+            &std::fs::read(path).expect("still there"),
+            bytes,
+            "{}",
+            path.display()
+        );
+        assert_eq!(
+            &std::fs::metadata(path)
+                .expect("stat")
+                .modified()
+                .expect("mtime"),
+            mtime,
+            "{}",
+            path.display()
+        );
+    }
+    let ring = std::fs::read_to_string(report_path.with_file_name("growth.jsonl")).expect("ring");
+    assert_eq!(ring.lines().count(), 1, "one totals line per pass\n{ring}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("artifact-inventory: dry run, inventory only"),
+        "the pass says what the dry run found\n{text}"
+    );
+    assert!(
+        !curl_log(&root).contains("artifact-inventory-failed"),
+        "a dry run that ran is no problem\n{text}"
+    );
+}
+
+#[test]
+fn an_artifact_dry_run_that_did_not_happen_is_a_problem_the_packet_names() {
+    let root = boss_testing::scratch_dir("boss-dsr-artifact-inventory-refused");
+    let _guard = Scratch(root.clone());
+    plant_artifacts(&root);
+    // A file where the report's directory should be: the dry run reads
+    // the tree and cannot write what it found.
+    let blocked = root.join("blocked");
+    boss_testing::write_file(&blocked, "not a directory");
+    let out = run(
+        &root,
+        &[
+            ("BOSS_ARTIFACT_INVENTORY", "on"),
+            (
+                "BOSS_ARTIFACT_INVENTORY_DIR",
+                blocked.join("inventory").to_str().expect("utf-8 path"),
+            ),
+        ],
+    );
+    let text = say(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unwritten dry run is loud\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .rfind(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("a pass with a problem records itself\n{log}\n{text}"));
+    let output = recorded_output(put);
+    assert!(
+        output.lines().any(|l| l
+            .starts_with("RED dev-scratch-reclaim/artifact-inventory-failed problem: ")
+            && l.contains("exited 73")
+            && l.contains("latest.json")),
+        "the packet names the failed dry run, its exit and the path it could not write\n{output}"
+    );
+}
+
+// THE COMPLETION JOIN (backlog 25022367, design 195276f0, its second
+// car): the lifecycle reads each Codex run directory's agent run from the
+// system of record, through the pass's own curl helper, signed as the
+// pass and carrying the machine token like every other read it makes.
+// An answer it cannot read is a retained owner, never a completed one;
+// the tree's policy grants no action, so the pass stays a dry run.
+#[test]
+fn the_hourly_pass_joins_a_codex_run_to_its_record_with_the_machine_token_and_moves_nothing() {
+    let root = boss_testing::scratch_dir("boss-dsr-artifact-join");
+    let _guard = Scratch(root.clone());
+    let work = root.join("work");
+    boss_testing::create_dir(&work.join("wt"));
+    boss_testing::create_dir(&work.join("repo"));
+    let snap = work.join("home/.codex/scratch/coordinator-x/run-0123abcd/snapshot.json");
+    boss_testing::create_dir(snap.parent().expect("a parent"));
+    boss_testing::write_file(&snap, &"{\"evidence\": true}\n".repeat(400));
+    touch_at(&snap, 72);
+    let before = std::fs::read(&snap).expect("read");
+    // A whole process table (pid 1 alone, holding nothing), so liveness
+    // is known and the join is reached at all.
+    let proc_root = fake_proc(&root, "pause", &[]);
+    let (tok, hdr, expect) = token_mount(&root, &format!("{FIXTURE_TOKEN}\n"));
+    // Two days on: a fixture's ctime is always now, and the settle
+    // window reads it, so the pass's clock moves instead.
+    let later = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs()
+        + 2 * 86_400)
+        .to_string();
+    let out = run(
+        &root,
+        &[
+            ("BOSS_ARTIFACT_INVENTORY", "on"),
+            ("BOSS_ARTIFACT_INVENTORY_NOW", &later),
+            ("PROC_ROOT", proc_root.to_str().expect("utf8")),
+            ("BOSS_MACHINE_TOKEN_DIR", &tok),
+            ("BOSS_MACHINE_TOKEN_HOSTS", "sor.test"),
+            ("RUNTIME_DIRECTORY", &hdr),
+            ("STUB_EXPECT_HDR", &expect),
+        ],
+    );
+    let text = say(&out);
+    let read: Vec<(String, String)> = stamps(&root)
+        .into_iter()
+        .filter(|(_, r)| r.contains("/api/jobs/0123abcd"))
+        .collect();
+    assert_eq!(
+        read.len(),
+        1,
+        "the join reads the run its directory names, once\n{read:#?}\n{text}"
+    );
+    assert_eq!(read[0].0, "stamped", "{read:#?}\n{text}");
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(work.join("telemetry/artifact-inventory/latest.json"))
+            .unwrap_or_else(|e| panic!("the pass wrote the report: {e}\n{text}")),
+    )
+    .expect("the report is JSON");
+    let unit = report["families"]
+        .as_array()
+        .expect("families")
+        .iter()
+        .flat_map(|f| f["units"].as_array().cloned().unwrap_or_default())
+        .find(|u| u["unit"] == "coordinator-x/run-0123abcd")
+        .unwrap_or_else(|| panic!("the unit is reported\n{report}"));
+    // The stub answers this read with no status code: unread, so retained.
+    assert_eq!(unit["join"]["reason"], "owner-unread", "{unit}");
+    assert_eq!(report["mode"], "dry-run", "{report}");
+    assert_eq!(report["candidates"], serde_json::json!([]), "{report}");
+    assert_eq!(std::fs::read(&snap).expect("still there"), before);
+}
+
+/// The launch refs in the fixture checkout, by run.
+fn launch_refs(yard: &Yard) -> Vec<String> {
+    git(
+        &yard.repo,
+        0,
+        &[
+            "for-each-ref",
+            "--format=%(refname:lstrip=2)",
+            "refs/boss-launch/",
+        ],
+    )
+    .lines()
+    .map(str::to_string)
+    .collect()
+}
+
+/// Backlog af54aae4 (2). `boss dispatch --launch` fetches main into
+/// refs/boss-launch/<run> and deletes it once the worktree stands on it;
+/// a dispatch killed outright mid-fetch leaves the ref — and, killed
+/// mid-update, its `.lock` — and nothing removed either. The pass
+/// removes them once the RUN is closed on record (the silence clock
+/// closes a run such a launch leaves open) and keeps an open run's. One
+/// ref is PACKED, because `git gc --auto` packs refs and a packed ref has
+/// no age to read; one lock has no ref beside it, as git leaves when it
+/// is killed taking a new one.
+#[test]
+fn a_launch_ref_whose_run_is_closed_is_removed_and_an_open_runs_is_kept() {
+    let root = boss_testing::scratch_dir("boss-dsr-launch-refs");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let head = git(&yard.repo, 0, &["rev-parse", "HEAD"]);
+    git(
+        &yard.repo,
+        0,
+        &["update-ref", "refs/boss-launch/run0packed", &head],
+    );
+    git(&yard.repo, 0, &["pack-refs", "--all"]);
+    for run in ["run0loose", "run0open"] {
+        git(
+            &yard.repo,
+            0,
+            &["update-ref", &format!("refs/boss-launch/{run}"), &head],
+        );
+    }
+    let dir = yard.repo.join(".git/refs/boss-launch");
+    assert!(
+        !dir.join("run0packed").exists(),
+        "the fixture: run0packed is packed"
+    );
+    for lock in ["run0loose.lock", "run0lock.lock"] {
+        boss_testing::write_file(&dir.join(lock), &format!("{head}\n"));
+    }
+    write_record(
+        &root,
+        serde_json::json!({
+            "runs": {"run0packed": "closed", "run0loose": "closed", "run0lock": "closed", "run0open": "open"},
+        }),
+    );
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert_eq!(
+        launch_refs(&yard),
+        ["run0open"],
+        "a closed run's launch ref goes, packed or loose; an open run's stays\n{text}"
+    );
+    for lock in ["run0loose.lock", "run0lock.lock"] {
+        assert!(
+            !dir.join(lock).exists(),
+            "{lock}: a closed run's lock goes, with or without its ref\n{text}"
+        );
+    }
+    let log = curl_log(&root);
+    for run in ["run0packed", "run0loose", "run0lock", "run0open"] {
+        assert!(
+            log.contains(&format!("/api/jobs/{run} ")),
+            "{run}: the record was asked\n{log}"
+        );
+    }
+    let put = run_step_put(&root, &text);
+    assert!(
+        put.contains("\"launch_refs_removed\":\"3\"")
+            && put.contains("\"launch_refs_kept_open\":\"1\"")
+            && put.contains("run0lock"),
+        "the packet counts and names what went, and counts what stayed\n{put}\n{text}"
+    );
+    // The deletion is git the observer knows by name: an operation it
+    // does not know turns the whole ledger UNKNOWN on every pass that
+    // removes a ref.
+    let body: serde_json::Value =
+        serde_json::from_str(put.split_once("/metadata ").expect("a body").1).expect("json");
+    let ledger: serde_json::Value = serde_json::from_str(
+        body["git_phase_ledger"]
+            .as_str()
+            .expect("phase state is recorded"),
+    )
+    .expect("the ledger is json");
+    assert_eq!(ledger["state"], "observed", "{ledger}");
+}
+
+/// A record that cannot be read keeps every launch ref — a closed run's
+/// included — and is asked once a pass, not once a ref.
+#[test]
+fn a_record_that_cannot_be_read_keeps_every_launch_ref_and_is_asked_once() {
+    let root = boss_testing::scratch_dir("boss-dsr-launch-refs-dark");
+    let _guard = Scratch(root.clone());
+    let yard = Yard::new(&root);
+    let head = git(&yard.repo, 0, &["rev-parse", "HEAD"]);
+    for run in ["run0first", "run0second"] {
+        git(
+            &yard.repo,
+            0,
+            &["update-ref", &format!("refs/boss-launch/{run}"), &head],
+        );
+    }
+    write_record(
+        &root,
+        serde_json::json!({"runs": {"run0first": "closed", "run0second": "closed"}}),
+    );
+
+    let out = run(&root, &[("STUB_RECORD_RC", "7")]);
+    let text = say(&out);
+    assert_eq!(
+        launch_refs(&yard),
+        ["run0first", "run0second"],
+        "an unread record removes nothing\n{text}"
+    );
+    let asked = curl_log(&root)
+        .lines()
+        .filter(|l| l.contains("/api/jobs/run"))
+        .count();
+    assert_eq!(asked, 1, "a dark record is asked once a pass\n{text}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("every launch ref is kept this pass"),
+        "the dark read is said out loud\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// THE DOORS' TREE IS HELD BY ITS OWNER (backlog 3db83d0d; reviewer run
+// 6d7b418b of car c93c6dfa, measured on the pod 2026-10-19 08:11Z).
+// /work/tools was drwxrwsr-x root:1500 with no sticky bit, and so were
+// /work/tools/bin and /work/tools/image-cli, with kubectl and the image
+// CLI's wrapper 0775 inside them. Every builder under as-gate-uid is
+// group 1500, and a group member may rename an entry of a group-writable
+// directory that has no sticky bit: it could move /work/tools/dev-control
+// aside and plant a store of its own (an older generation, its own
+// launcher), or overwrite kubectl outright. /work itself is 2775 too, so
+// the same rename moves /work/tools aside whole. The hourly pass is the
+// versioned owner of these modes: it runs as the uid that owns the tree,
+// takes group and other write off /work/tools, bin and image-cli and off
+// each entry directly inside them, and sets the sticky bit on /work, the
+// one change there the pod's fsGroupChangePolicy (OnRootMismatch, which
+// re-walks the whole volume when the root loses group rwx) leaves alone.
+// ---------------------------------------------------------------------
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    // mode-bits-ok: the fixture's directories and doors, given the modes the pod's fsGroup left them
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .unwrap_or_else(|e| panic!("chmod {mode:o} {}: {e}", path.display()));
+}
+
+/// The doors' tree as the pod held it on 2026-10-19: /work and
+/// /work/tools, bin and image-cli group-writable, kubectl and the image
+/// CLI's wrapper 0775, a door link in bin, and the dev-control store
+/// (2700 on the pod) recording isolation off, so its own check is quiet.
+fn doors_tree(root: &Path) -> PathBuf {
+    let work = root.join("work");
+    let tools = work.join("tools");
+    for d in ["bin", "image-cli", "dev-control"] {
+        boss_testing::create_dir(&tools.join(d));
+    }
+    boss_testing::write_exec(&tools.join("bin/kubectl"), "#!/bin/sh\n");
+    boss_testing::write_exec(&tools.join("image-cli/boss"), "#!/bin/sh\n");
+    std::os::unix::fs::symlink(work.join("repo/infra/dev/boss"), tools.join("bin/boss"))
+        .expect("door link");
+    let off = tools.join("dev-control/off.json");
+    std::fs::write(&off, "{\"state\":\"off\"}").expect("off record");
+    set_mode(&off, 0o600);
+    for (p, m) in [
+        (work.clone(), 0o775),
+        (tools.clone(), 0o775),
+        (tools.join("bin"), 0o775),
+        (tools.join("image-cli"), 0o775),
+        (tools.join("dev-control"), 0o700),
+        (tools.join("bin/kubectl"), 0o775),
+        (tools.join("image-cli/boss"), 0o775),
+    ] {
+        set_mode(&p, m);
+    }
+    tools
+}
+
+#[test]
+fn every_pass_takes_group_and_other_write_off_the_doors_tree() {
+    let root = boss_testing::scratch_dir("boss-dsr-tools-held");
+    let _guard = Scratch(root.clone());
+    let _yard = Yard::new(&root);
+    let tools = doors_tree(&root);
+    let work = root.join("work");
+    let held = [
+        tools.clone(),
+        tools.join("bin"),
+        tools.join("image-cli"),
+        tools.join("bin/kubectl"),
+        tools.join("image-cli/boss"),
+    ];
+
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert!(out.status.success(), "{text}");
+    for p in &held {
+        assert_eq!(
+            mode_of(p) & 0o022,
+            0,
+            "{} is {:o}: a group member could still replace what the doors run\n{text}",
+            p.display(),
+            mode_of(p)
+        );
+    }
+    assert_eq!(
+        mode_of(&tools.join("bin/kubectl")) & 0o755,
+        0o755,
+        "a door stays runnable\n{text}"
+    );
+    assert_eq!(
+        mode_of(&tools.join("dev-control")),
+        0o700,
+        "a private store is left as it is\n{text}"
+    );
+    let w = mode_of(&work);
+    assert_ne!(
+        w & 0o1000,
+        0,
+        "the work mount is sticky, so /work/tools cannot be renamed aside ({w:o})\n{text}"
+    );
+    assert_eq!(
+        w & 0o070,
+        0o070,
+        "the work mount keeps group rwx, or the kubelet's OnRootMismatch re-walks the volume ({w:o})\n{text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("doors' tree: held"),
+        "the pass says what it holds\n{text}"
+    );
+
+    // The kubelet re-walks the volume whenever the root mismatches, and
+    // any hand may chmod: the next pass holds the tree again and says so
+    // on its packet (forced here by a refused selector, a problem of its
+    // own that files the pass).
+    set_mode(&tools, 0o775);
+    set_mode(&tools.join("bin/kubectl"), 0o775);
+    std::fs::remove_file(tools.join("dev-control/off.json")).expect("drop the off record");
+    std::os::unix::fs::symlink("refused", tools.join("dev-control/enabled")).expect("refuse");
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the refused selector reds the pass\n{text}"
+    );
+    for p in &held {
+        assert_eq!(mode_of(p) & 0o022, 0, "{} held again\n{text}", p.display());
+    }
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .find(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the run step is completed\n{log}\n{text}"));
+    assert!(
+        put.contains("\"tools\":\"held, re-held 2 this pass\""),
+        "the packet says the tree is held and how many entries this pass re-held\n{put}\n{text}"
+    );
+}
+
+fn as_root() -> bool {
+    String::from_utf8_lossy(&Command::new("id").arg("-u").output().expect("id -u").stdout).trim()
+        == "0"
+}
+
+/// `argv` as uid 65534 — the gate's uid, read from
+/// infra/gate-runner/gate-runner.yaml by infra/dev/as-gate-uid.sh, which
+/// drops the same way — in group `gid` and no other: a member of the
+/// tree's group that does not own it, which is what every builder is to
+/// the pod's root:1500 tree.
+fn as_a_group_member(gid: u32, argv: &[&str]) -> Output {
+    Command::new("setpriv")
+        .args(["--reuid=65534", &format!("--regid={gid}"), "--clear-groups"])
+        .arg("--")
+        .args(argv)
+        .output()
+        .expect("setpriv")
+}
+
+/// The finding itself, reproduced and then refused: a uid in the tree's
+/// group that does not own it renames the dev-control store aside, moves
+/// /work/tools aside whole and plants an entry of its own, until the
+/// pass has held the tree; then it can do none of that and cannot
+/// overwrite a door, and the entry it planted is a problem on the packet.
+///
+/// The pod has no CAP_CHOWN, so the fixture cannot be staged in group
+/// 1500 as the pod's is; it keeps the group root created it with, and
+/// the uid drops into THAT group. The kernel's rule is the same for any
+/// group. Root is needed to drop to another uid at all, which the gate
+/// (uid 65534) is not: there the test says NOT RUN on stderr and the
+/// mode pin above is the gate's evidence.
+#[test]
+fn a_group_member_cannot_rename_the_dev_control_store_once_the_pass_holds_the_tree() {
+    use std::os::unix::fs::MetadataExt;
+    if !as_root() {
+        eprintln!(
+            "NOT RUN: dropping to another uid needs root; the mode pin above covers the gate"
+        );
+        return;
+    }
+    let root = boss_testing::scratch_dir("boss-dsr-tools-rename");
+    let _guard = Scratch(root.clone());
+    let _yard = Yard::new(&root);
+    let tools = doors_tree(&root);
+    let work = root.join("work");
+    set_mode(&root, 0o755);
+    for p in [&work, &tools, &tools.join("bin"), &tools.join("image-cli")] {
+        set_mode(p, 0o2775);
+    }
+    let gid = std::fs::metadata(&tools).expect("stat tools").gid();
+    let s = |p: &Path| p.to_str().expect("utf8").to_string();
+    let store = s(&tools.join("dev-control"));
+    let aside = s(&tools.join("dev-control.aside"));
+    let tools_s = s(&tools);
+    let tools_aside = s(&work.join("tools.aside"));
+    let planted = s(&tools.join("bin/planted"));
+
+    // The finding, reproduced on the unheld tree.
+    for (what, argv) in [
+        (
+            "rename the store aside",
+            vec!["mv", "-T", store.as_str(), aside.as_str()],
+        ),
+        ("and back", vec!["mv", "-T", aside.as_str(), store.as_str()]),
+        (
+            "move /work/tools aside whole",
+            vec!["mv", "-T", tools_s.as_str(), tools_aside.as_str()],
+        ),
+        (
+            "and back",
+            vec!["mv", "-T", tools_aside.as_str(), tools_s.as_str()],
+        ),
+        (
+            "plant an entry beside the doors",
+            vec!["touch", planted.as_str()],
+        ),
+    ] {
+        let out = as_a_group_member(gid, &argv);
+        assert!(
+            out.status.success(),
+            "control: a group member can {what} before the pass\n{}",
+            say(&out)
+        );
+    }
+
+    // The pass holds every mode it owns, and cannot hold the entry it
+    // does not (the sidecar has no CAP_CHOWN): a problem, by name.
+    let out = run(&root, &[]);
+    let text = say(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a foreign entry in the doors' tree reds the pass\n{text}"
+    );
+    let log = curl_log(&root);
+    let put = log
+        .lines()
+        .rfind(|l| is_run_step_merge(l))
+        .unwrap_or_else(|| panic!("the pass records itself\n{log}\n{text}"));
+    let output = recorded_output(put);
+    assert!(
+        output.lines().any(
+            |l| l.starts_with("RED dev-scratch-reclaim/tools-open problem: ")
+                && l.contains("bin/planted")
+                && l.contains("uid 65534")
+        ),
+        "the packet names the entry and its owner\n{output}"
+    );
+    assert!(
+        put.contains("\"tools\":\"OPEN"),
+        "and the tree's state says it is not held\n{put}"
+    );
+
+    let sibling = s(&tools.join("dc"));
+    let kubectl = s(&tools.join("bin/kubectl"));
+    let door = s(&tools.join("bin/boss"));
+    for (what, argv) in [
+        (
+            "rename the store aside",
+            vec!["mv", "-T", store.as_str(), aside.as_str()],
+        ),
+        (
+            "move /work/tools aside whole",
+            vec!["mv", "-T", tools_s.as_str(), tools_aside.as_str()],
+        ),
+        ("plant a sibling store", vec!["mkdir", sibling.as_str()]),
+        (
+            "overwrite kubectl",
+            vec!["sh", "-c", "printf x > \"$1\"", "sh", kubectl.as_str()],
+        ),
+        (
+            "replace a door link",
+            vec!["ln", "-sfn", "/bin/true", door.as_str()],
+        ),
+    ] {
+        let out = as_a_group_member(gid, &argv);
+        assert!(
+            !out.status.success(),
+            "a group member could {what} after the pass held the tree\n{}",
+            say(&out)
+        );
+    }
+    assert!(
+        tools.join("dev-control/off.json").exists(),
+        "the store stayed put"
+    );
+}
+
+// ---------------------------------------------------------------------
+// THE TENANT CHECKOUTS (backlog 6b274be1, 2026-10-19).
+//
+// The pod keeps a checkout of every tenant repo instances.toml names at
+// /work/<the repo's last segment> (brief.rs `tenant_checkout`), and
+// nothing kept it current: measured that day, /work/algedonic-llc sat at
+// 082d920 (2026-10-07) while the forge's main was 3306bbe (2026-10-12),
+// and a triage measured the stale copy and filed a claim the forge had
+// fixed three days before — a nomination and a builder run spent on it.
+// Its own refs/remotes/origin/main WAS current (a fetch on 10-19 moved
+// it); only HEAD lagged, which is exactly the shape the /work/boss pass
+// above repairs with no network. These pin the same pass over the
+// tenant checkouts, read off the instances file the converge reads.
+// ---------------------------------------------------------------------
+
+/// A tenant checkout at `work/<name>` with a bare forge of its own, and
+/// `behind` commits on that forge's `main` the checkout has FETCHED but
+/// not merged — refs/remotes/origin/main moved, HEAD did not: the state
+/// /work/algedonic-llc was measured in on 2026-10-19 (`main...origin/main
+/// [behind 5]`).
+fn tenant_checkout(root: &Path, name: &str, behind: usize) -> PathBuf {
+    let forge = root.join(format!("{name}.git"));
+    boss_testing::create_dir(&forge);
+    git(&forge, 0, &["init", "--bare", "-q"]);
+    let checkout = root.join("work").join(name);
+    boss_testing::create_dir(&checkout);
+    git(&checkout, 100, &["init", "-q"]);
+    boss_testing::write_file(&checkout.join("tenant.toml"), "seed\n");
+    git(&checkout, 100, &["add", "."]);
+    git(&checkout, 100, &["commit", "-q", "-m", "seed"]);
+    git(
+        &checkout,
+        100,
+        &["remote", "add", "origin", forge.to_str().expect("utf8")],
+    );
+    git(&checkout, 100, &["push", "-q", "origin", "main"]);
+    // Somebody else lands on the tenant's main, and a session's fetch
+    // brings the ref home without moving the checkout.
+    let upstream = root.join(format!("{name}-upstream"));
+    git(
+        root,
+        0,
+        &[
+            "clone",
+            "-q",
+            forge.to_str().expect("utf8"),
+            upstream.to_str().expect("utf8"),
+        ],
+    );
+    for i in 0..behind {
+        boss_testing::write_file(&upstream.join(format!("landed-{i}.txt")), "landed\n");
+        git(&upstream, 0, &["add", "."]);
+        git(
+            &upstream,
+            0,
+            &["commit", "-q", "-m", &format!("landed {i}")],
+        );
+    }
+    if behind > 0 {
+        git(&upstream, 0, &["push", "-q", "origin", "main"]);
+    }
+    git(&checkout, 0, &["fetch", "-q", "origin"]);
+    checkout
+}
+
+/// An instances file in the shape infra/cluster/instances.toml has: a
+/// tenant_repo instance, a tenant_dir one, and the commented example of
+/// the flip that file carries — which is prose, not an instance.
+fn tenant_instances(root: &Path, extra: &str) -> PathBuf {
+    let path = root.join("instances.toml");
+    boss_testing::write_file(
+        &path,
+        &format!(
+            concat!(
+                "# THE FLIP, as the real file spells it in a comment:\n",
+                "#     tenant_repo = \"acme/commented-out\"\n",
+                "#     tenant_ref = \"main\"\n",
+                "source = \"prod\"\n\n",
+                "[prod]\n",
+                "namespace = \"boss\"\n",
+                "tenant_repo = \"acme/acme-co\"\n",
+                "tenant_ref = \"main\"\n",
+                "sim = false\n\n",
+                "[playground]\n",
+                "namespace = \"boss-playground\"\n",
+                "tenant_dir = \"examples/brewery\"\n",
+                "{extra}"
+            ),
+            extra = extra
+        ),
+    );
+    path
+}
+
+fn tenant_run(root: &Path, instances: &Path) -> Output {
+    run(
+        root,
+        &[("BOSS_INSTANCES", instances.to_str().expect("utf8"))],
+    )
+}
+
+#[test]
+fn a_tenant_checkout_behind_its_fetched_ref_is_fast_forwarded_with_no_network() {
+    let root = boss_testing::scratch_dir("boss-dsr-tenant-ff");
+    let _guard = Scratch(root.clone());
+    let _yard = Yard::new(&root);
+    let tenant = tenant_checkout(&root, "acme-co", 4);
+    let target = git(&tenant, 0, &["rev-parse", "refs/remotes/origin/main"]);
+    assert_ne!(head_sha(&tenant), target, "the fixture starts behind");
+    // A second tenant instance whose checkout this pod does not hold.
+    let instances = tenant_instances(
+        &root,
+        "\n[other]\nnamespace = \"boss-other\"\ntenant_repo = \"acme/not-cloned-here\"\ntenant_ref = \"main\"\n",
+    );
+
+    let out = tenant_run(&root, &instances);
+    let text = say(&out);
+    assert_eq!(
+        head_sha(&tenant),
+        target,
+        "the tenant checkout is taken to the origin/main it already fetched\n{text}"
+    );
+    assert!(
+        out.status.success(),
+        "a tenant fast-forward is the pass working, and a tenant this pod holds \
+         no checkout of is not a problem\n{text}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&tenant.display().to_string()) && stdout.contains(&target[..8]),
+        "the pass names the tenant checkout it moved and the sha it moved it to\n{text}"
+    );
+    assert!(
+        ls_remote_calls(&root).is_empty(),
+        "no network: the sidecar holds no forge credential (b50a65ef)\n{text}"
+    );
+    assert!(
+        !stdout.contains("commented-out"),
+        "a commented line in the instances file names no checkout\n{text}"
+    );
+    assert!(
+        !curl_log(&root).contains("POST"),
+        "a routine tenant fast-forward files no packet, like the checkout's own\n{}\n{text}",
+        curl_log(&root)
+    );
+}
+
+#[test]
+fn a_tenant_checkout_ahead_of_its_ref_is_left_alone_quietly() {
+    let root = boss_testing::scratch_dir("boss-dsr-tenant-ahead");
+    let _guard = Scratch(root.clone());
+    let _yard = Yard::new(&root);
+    let tenant = tenant_checkout(&root, "acme-co", 0);
+    // A commit of its own, not yet pushed: somebody's next push, not a
+    // copy that forgot to pull.
+    boss_testing::write_file(&tenant.join("mine.txt"), "mine\n");
+    git(&tenant, 0, &["add", "."]);
+    git(&tenant, 0, &["commit", "-q", "-m", "mine"]);
+    let before = head_sha(&tenant);
+
+    let out = tenant_run(&root, &tenant_instances(&root, ""));
+    let text = say(&out);
+    assert_eq!(head_sha(&tenant), before, "never rewound\n{text}");
+    assert!(out.status.success(), "and not a problem\n{text}");
+    assert!(
+        curl_log(&root).is_empty(),
+        "and nothing is filed\n{}\n{text}",
+        curl_log(&root)
+    );
+}
+
+/// No door warns on a stale tenant copy the way door-freshness.sh warns
+/// on /work/boss, so a tenant checkout this pass cannot bring current is
+/// the silence the item measured unless the pass NAMES it: a problem on
+/// the packet, with the checkout, where it stands and why.
+#[test]
+fn a_tenant_checkout_the_pass_cannot_bring_current_is_a_named_problem() {
+    for shape in ["off-ref", "diverged", "refused"] {
+        let root = boss_testing::scratch_dir(&format!("boss-dsr-tenant-stuck-{shape}"));
+        let _guard = Scratch(root.clone());
+        let _yard = Yard::new(&root);
+        let tenant = tenant_checkout(&root, "acme-co", 1);
+        let why = match shape {
+            "off-ref" => {
+                git(&tenant, 0, &["checkout", "-q", "-b", "site/inquiry-form"]);
+                "site/inquiry-form"
+            }
+            "diverged" => {
+                boss_testing::write_file(&tenant.join("mine.txt"), "mine\n");
+                git(&tenant, 0, &["add", "."]);
+                git(&tenant, 0, &["commit", "-q", "-m", "mine"]);
+                "diverged"
+            }
+            _ => {
+                // An untracked file the incoming commit adds: git refuses
+                // rather than overwrite it.
+                boss_testing::write_file(&tenant.join("landed-0.txt"), "uncommitted\n");
+                "landed-0.txt"
+            }
+        };
+        let before = head_sha(&tenant);
+
+        let out = tenant_run(&root, &tenant_instances(&root, ""));
+        let text = say(&out);
+        assert_eq!(head_sha(&tenant), before, "{shape}: nothing moves\n{text}");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{shape}: and reds the pass\n{text}"
+        );
+        let keys = run_step_keys(&root, &text);
+        let output = keys["output"].as_str().unwrap_or("");
+        assert!(
+            output.contains("RED dev-scratch-reclaim/tenant-checkout-stuck problem: ")
+                && output.contains(&tenant.display().to_string())
+                && output.contains(why),
+            "{shape}: the packet names the problem, the checkout and why ({why}): {keys}\n{text}"
+        );
+        assert!(
+            keys["tenant_ff"].as_str().unwrap_or("").contains("acme-co"),
+            "{shape}: the tenant pass's own verdict rides the packet: {keys}\n{text}"
+        );
+    }
 }

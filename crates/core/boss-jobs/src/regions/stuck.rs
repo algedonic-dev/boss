@@ -128,20 +128,28 @@ fn stations_stuck(inputs: &RegionInputs<'_>) -> StuckPart {
         Ok(view) => view,
         Err(why) => return StuckPart::unread("marshalling", &format!("marshalling: {why}")),
     };
-    let stuck = stations
-        .iter()
-        .filter(|s| s.over_limit || (!s.members.is_empty() && s.served == Some(0)))
-        .flat_map(|s| s.members.iter().map(|m| (m.clone(), None)))
-        .collect();
-    let unknown = stations
+    // A packet at a station that served nothing is WAITING when every
+    // step that put it there waits on its named owner inside its declared
+    // bound — the region's own attention arm, read per packet — and stuck
+    // otherwise (backlog 6254e602). Over the limit, every member is stuck.
+    let mut part = StuckPart::new("marshalling");
+    for s in &stations {
+        for m in &s.members {
+            if s.over_limit {
+                part.stuck.push((m.clone(), None));
+            } else if super::marshalling::not_draining(s) {
+                match super::marshalling::member_wait(s, m, inputs.internal_protocols, inputs.now) {
+                    Ok(_) => part.waiting.push(m.clone()),
+                    Err(_) => part.stuck.push((m.clone(), None)),
+                }
+            }
+        }
+    }
+    part.unknown = stations
         .iter()
         .filter_map(super::marshalling::unread_station_flow)
         .collect();
-    StuckPart {
-        stuck,
-        unknown,
-        ..StuckPart::new("marshalling")
-    }
+    part
 }
 
 /// THE GARAGE: cars held on the dock by hand and greens held before
@@ -636,9 +644,10 @@ mod tests {
                 over_limit: over,
                 members: members.iter().map(|m| (*m).to_string()).collect(),
                 served,
-                flow_blind: None,
+                flow_unread: None,
                 previous_served: served,
                 opened: Default::default(),
+                standing: Vec::new(),
             };
         let stations = vec![
             station("design-review", &["px", aging_id.as_str()], Some(0), false),
@@ -711,6 +720,7 @@ mod tests {
             reason: "wait for the migration".into(),
             kind: crate::yard::CarHoldKind::Operator,
             release: None,
+            auto_release: None,
         }];
         status.held = vec![crate::yard::HeldGreen {
             branch: "feat/held-green".into(),

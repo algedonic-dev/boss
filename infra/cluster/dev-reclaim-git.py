@@ -12,7 +12,7 @@ import uuid
 
 MAX_RECORDS = 256
 MAX_ROW_BYTES = 4096
-OPERATIONS = frozenset(("symbolic-ref", "rev-parse", "merge-base", "rev-list", "merge", "log", "status", "diff", "cherry", "for-each-ref", "worktree"))
+OPERATIONS = frozenset(("symbolic-ref", "rev-parse", "merge-base", "rev-list", "merge", "log", "status", "diff", "cherry", "for-each-ref", "worktree", "checkout", "update-ref"))
 ACCOUNTING_KEYS = frozenset(("current", "peak", "max", "anon", "file", "kernel", "shmem"))
 DEMAND_ACCOUNTING_KEYS = ACCOUNTING_KEYS | frozenset(("slab_reclaimable", "slab_unreclaimable"))
 

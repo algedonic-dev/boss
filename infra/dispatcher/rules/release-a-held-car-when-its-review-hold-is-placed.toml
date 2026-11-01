@@ -1,0 +1,57 @@
+# A held car's reviewer verdict is asked about again when the car's
+# review hold is placed (backlog 60993cda, the follow-up to 0cfc57e6 /
+# design 393bdef6 Q1).
+#
+# WHAT HAPPENED. `release-a-held-car-on-its-reviewer-verdict` fires on
+# the verdict's own write. A verdict given BEFORE the hold it answers
+# was never asked again. Measured 2026-10-18 over the 557 cars a RELEASE
+# verdict named: 21 verdicts preceded a hold at the head they read. In
+# 4 of them the write that placed the hold also BOUND that head — the
+# auto-park green holding the car for review of what it gated, after
+# the reviewer had read a repair's head before the repair's gate
+# finished — and 3 of those 4 were released by a person on that same
+# verdict, 20 s, 98 s and 8.5 min after the hold (cars 048df940,
+# 4a19d6a9, c1c19d5e): the transport the first rule removed, put back
+# by an ordering. The other 17 placing writes bound no new head (a
+# person's hold, the conductor's red-train hold, a re-judge at the head
+# already held) and stay a person's to lift.
+#
+# THE TRIGGER IS ANY WRITE OF A CAR'S REVIEW STEP that names a reviewer
+# and a head. The step row `jobs.step.updated` carries is the
+# post-write row (`step_state_payload`), so `metadata` is the step's
+# whole metadata. `hold_sha` and `agent_run` are always strings when
+# present; `hold` is not (`true`, and `false` on old rows), so it is not
+# ordered here — `> ""` over a non-string is a type error — and the
+# handler reads it through `stranded::marked`, the one definition.
+# Every later write of the same step fires it again; a released car is
+# not held, so nothing is asked, and a refusal already recorded is not
+# written twice.
+#
+# WHAT IT DOES NOT DECIDE. The handler reads the reviewer the step names
+# and, when that run has a verdict on this car, asks the release door
+# with `{review}`, exactly as on the verdict's write; the door's judge
+# decides. No verdict yet, or one on another car, asks nothing and
+# writes nothing. The time check (review 3af8f7e2 N2) stands, with one
+# reading added: a hold whose placing write bound it to the very head
+# the verdict read is that verdict's hold. A hand hold binds no head
+# and is never lifted on an older verdict.
+#
+# IF THE EVENT IS LOST the car stays held, as before.
+[[rule]]
+name = "release-a-held-car-when-its-review-hold-is-placed"
+why = """
+A CROSS-PROTOCOL REACTOR, the second trigger of the release rule: a
+`ship-a-change` car's review-step write asks the release door about
+the `agent-run` verdict its dispatched reviewer already gave. Two
+protocols, and what fires is a judged release through the one door
+(`POST /api/jobs/{car}/release`), not a spawn, so no Workflow can
+declare it. Measured 2026-10-18 (backlog 60993cda): a verdict given
+before the green that held its car at the head it read was never
+re-asked; 4 such holds, 3 released by a person on that same verdict
+(cars 048df940, 4a19d6a9, c1c19d5e, 20 s to 8.5 min after the hold).
+"""
+version = 1
+on_event = "jobs.step.updated"
+when = 'spec_slug = "review" AND metadata.hold_sha > "" AND metadata.agent_run > ""'
+[[rule.do]]
+handler = "jobs.release_on_review"

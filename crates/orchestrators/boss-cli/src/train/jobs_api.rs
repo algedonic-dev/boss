@@ -638,40 +638,44 @@ pub(crate) const ROWS_REFUSAL_QUOTE: usize = 200;
 /// the page bigger.
 pub(crate) const PAGE_LIMIT: usize = 100;
 
-/// One explicit bound for a response before JSON materialization and
-/// for retained recovery inventory, including a union of censuses.
+/// One explicit bound for a CENSUS response before JSON materialization
+/// and for retained recovery inventory, including a union of censuses.
+/// A census only: an ordinary read (the dock, the verdict sweep) is not
+/// inventory, and a bound on it is a refusal only a code change
+/// recovers (backlog de67e500).
 pub(crate) const MAX_INVENTORY_BYTES: usize = 16 * 1024 * 1024;
 
-pub(crate) async fn bounded_api_body(
+/// Read a response body whole, refusing it unjudged past `bound` when
+/// one is given. `None` is every read but a census: the conductor's
+/// dock page of 100 open cars measured over 16MiB at the p90 car on
+/// 2026-10-17, and a bounded dock read would stop the conductor until a
+/// code change (backlog de67e500).
+pub(crate) async fn read_api_body(
     mut response: reqwest::Response,
     method: &Method,
     path: &str,
+    bound: Option<usize>,
 ) -> std::result::Result<Vec<u8>, ApiFailure> {
-    let refusal = || ApiFailure {
+    let status = response.status();
+    let refusal = |limit: usize| ApiFailure {
         kind: Failure::Malformed,
         cause: anyhow!(
-            "{method} {path}: HTTP {} exceeds response byte bound {MAX_INVENTORY_BYTES}; body unjudged",
-            response.status()
+            "{method} {path}: HTTP {status} exceeds response byte bound {limit}; body unjudged"
         ),
     };
-    if response
-        .content_length()
-        .is_some_and(|n| n > MAX_INVENTORY_BYTES as u64)
+    if let Some(limit) = bound
+        && response.content_length().is_some_and(|n| n > limit as u64)
     {
-        return Err(refusal());
+        return Err(refusal(limit));
     }
-    let status = response.status();
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|error| {
         ApiFailure::transport(error, format!("reading {method} {path} response"))
     })? {
-        if chunk.len() > MAX_INVENTORY_BYTES.saturating_sub(body.len()) {
-            return Err(ApiFailure {
-                kind: Failure::Malformed,
-                cause: anyhow!(
-                    "{method} {path}: HTTP {status} exceeds response byte bound {MAX_INVENTORY_BYTES}; body unjudged"
-                ),
-            });
+        if let Some(limit) = bound
+            && chunk.len() > limit.saturating_sub(body.len())
+        {
+            return Err(refusal(limit));
         }
         body.extend_from_slice(&chunk);
     }
@@ -894,14 +898,121 @@ pub(crate) const GATE_DEADLINE_HOURS: i64 = 3;
 /// that filed it. Read from `opened_at` alone, a packet filed four hours
 /// ago and relaunched thirty minutes ago was settled `lost` under a Job
 /// with two and a half hours left to run.
+///
+/// A RESIDENT PLACE STILL IN LINE IS NOT A GATE (backlog b56bfc29). A
+/// durable submission no launch has begun for ([`resident_in_line`])
+/// has had no Job, so no Job deadline can have passed — and its client
+/// stamps never move, because a resident place carries no client
+/// heartbeat. Resident dec70bf9 would have been settled `lost` three
+/// hours after its last stamp while it waited for a bay, under a receipt
+/// naming a Job that never existed. Its place is the supervisor's to
+/// judge; the Job's clock starts once a launch has begun.
 pub(crate) fn dead_gate_run_hours(run: &Value, now: DateTime<Utc>) -> Option<i64> {
     let verdict_step = find_step(run, "record-verdict", "Record the gate verdict");
-    if step_done(verdict_step) {
+    if step_done(verdict_step) || run.get("metadata").is_some_and(resident_in_line) {
         return None;
     }
     let (_, (_, at)) = last_sign_of_life(&metadata_map(run))?;
     let hours = (now - at).num_hours();
     (hours >= GATE_DEADLINE_HOURS).then_some(hours)
+}
+
+/// The receipt a `lost` settle by the clock writes. `jobs_seen` is how
+/// many gate Jobs the cluster read carried for the packet: with none, no
+/// Job deadline is claimed, because nothing shows a Job existed to have
+/// one (backlog b56bfc29 — the receipt that would have settled resident
+/// dec70bf9 said its Job's deadline had passed when no Job was ever
+/// created). Either way it says what was observed and nothing more.
+pub(crate) fn clock_lost_receipt(hours: i64, branch: &str, jobs_seen: usize) -> String {
+    let observed = if jobs_seen == 0 {
+        format!(
+            "NO VERDICT WAS RECORDED, AND NO GATE JOB CARRIES THIS RUN. Quiet {hours}h \
+             with no verdict, and the cluster's read of gate Jobs held none for this \
+             packet — so no Job deadline is claimed: nothing observed shows a Job existed \
+             to have one. Whether a launch never reached the cluster, or its Job was \
+             removed, is in the conductor's journal for this gate-run."
+        )
+    } else {
+        format!(
+            "NO VERDICT WAS RECORDED. Active {hours}h with none, past the gate Job's \
+             {GATE_DEADLINE_HOURS}h activeDeadlineSeconds, by which the cluster has ended \
+             any Job this run had. What was observed is only that: no verdict reached this \
+             packet in that time. Whether the runner left none, or left one in a pod or a \
+             log the conductor could not read, is in the conductor's journal for this \
+             gate-run and — for a day after the Job ended — in `kubectl logs job/<its gate \
+             Job> -c gate`."
+        )
+    };
+    format!(
+        "{observed} Settled as LOST by the conductor's reconcile: this run says nothing \
+         about {branch}, and an infrastructure death is not a consist failure. Re-gate \
+         for a real verdict."
+    )
+}
+
+/// A resident request still waiting in line: a durable submission with
+/// no protected native observation (`waiting_for_native`, the yard's
+/// reading) AND no launch begun — no `gate_launch_intent`, no guarded
+/// `gate_launch_attempt`. Either key means a send may have reached the
+/// cluster and a Job may exist, so the Job deadline is the clock again;
+/// neither means nothing was ever sent.
+fn resident_in_line(metadata: &Value) -> bool {
+    use boss_jobs::gate_reservation as model;
+    model::waiting_for_native(metadata)
+        && metadata.get(model::INTENT).is_none()
+        && metadata.get(model::ATTEMPT).is_none()
+}
+
+/// What the cluster's gate Jobs for a run say of the clock's reading:
+/// `Ok(hours)` when the run may be settled `lost`, dated from the newest
+/// of the clock and the Jobs; `Err(why)` when it must be left alone.
+///
+/// WHY (backlog d1ea4141). The clock reads the packet's stamps, and those
+/// stand in for the Job only while no Job can be seen. Gate-run 98b80bb0
+/// waited 173 minutes in the queue and its launch stamped nothing, so its
+/// newest stamp was its place in line; the reap settled it `lost` seven
+/// minutes into its Job's three hours, and the running Job's verdict had
+/// nowhere to land. `activeDeadlineSeconds` runs from the Job, so the
+/// cluster's record of the Job is the deadline's own evidence:
+///
+/// - a Job not yet finished is RUNNING — Kubernetes, not this clock, ends
+///   it, and ends it as Failed (`DeadlineExceeded`) for the recorder and
+///   the estate observer to read, however long it has run;
+/// - a Job created inside the deadline has a verdict or a pod still to
+///   be read, which the recorder does before this clock (`settle_gate_runs`);
+/// - a Job whose creation does not parse cannot be dated, and an undated
+///   Job is no evidence the deadline passed.
+///
+/// No Job leaves the clock's reading as it was: the orphan window and
+/// the estate observer cover a run that never had one.
+pub(crate) fn job_deadline(
+    clock_hours: i64,
+    jobs: &[&GateJob],
+    now: DateTime<Utc>,
+) -> Result<i64, String> {
+    if let Some(j) = jobs.iter().find(|j| j.finished.is_none()) {
+        return Err(format!("its gate Job {} is still running", j.name));
+    }
+    jobs.iter().try_fold(clock_hours, |hours, j| {
+        let created = DateTime::parse_from_rfc3339(&j.created)
+            .map_err(|_| {
+                format!(
+                    "its gate Job {} carries no readable creation time ({:?})",
+                    j.name, j.created
+                )
+            })?
+            .with_timezone(&Utc);
+        let since = (now - created).num_hours();
+        if since < GATE_DEADLINE_HOURS {
+            Err(format!(
+                "its gate Job {} was created {since}h ago, inside the {GATE_DEADLINE_HOURS}h \
+                 deadline",
+                j.name
+            ))
+        } else {
+            Ok(hours.min(since))
+        }
+    })
 }
 
 /// How long a recorded verdict is left to the settle of the write that
@@ -928,7 +1039,12 @@ pub(crate) const VERDICT_SETTLE_GRACE_MINUTES: i64 = 2;
 ///
 /// A step with no readable `completed_at` is owed the re-send: an
 /// absent stamp is not evidence of a recent write, and the re-send
-/// changes nothing a settled packet holds.
+/// changes nothing a settled packet holds. Nor is a stamp a minute or
+/// more AHEAD of `now`: `completed_at` comes off the jobs API's clock
+/// port (the sim clock on a simulated instance) and `now` off the
+/// conductor's, so such a stamp is two clocks disagreeing, and read as
+/// recent it would keep the run from ever being re-sent (backlog
+/// c98ff222). Seconds of skew truncate to zero minutes and stay recent.
 pub(crate) fn unsettled_verdict_step(run: &Value, now: DateTime<Utc>) -> Option<&str> {
     if run.get("kind").and_then(Value::as_str) != Some("gate-run")
         || run.get("status").and_then(Value::as_str) != Some("open")
@@ -944,12 +1060,238 @@ pub(crate) fn unsettled_verdict_step(run: &Value, now: DateTime<Utc>) -> Option<
         .and_then(Value::as_str)
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .is_some_and(|at| {
-            (now - at.with_timezone(&Utc)).num_minutes() < VERDICT_SETTLE_GRACE_MINUTES
+            (0..VERDICT_SETTLE_GRACE_MINUTES)
+                .contains(&(now - at.with_timezone(&Utc)).num_minutes())
         });
     if recent {
         return None;
     }
     step.get("id").and_then(Value::as_str)
+}
+
+/// The gate-run's count of settling re-sends sent so far — written on
+/// the packet before each re-send, so the next pass reads how many have
+/// already settled nothing (backlog c98ff222).
+pub(crate) const SETTLE_RESENDS: &str = "settle_resends";
+
+/// The id of the alarm filed for a gate-run its re-sends never settled,
+/// stamped on the run so a long stall files one alarm, not one a pass.
+pub(crate) const SETTLE_ALARM: &str = "settle_alarm";
+
+/// The key an unsettled-verdict alarm names its gate-run by — how an
+/// alarm already open for the run is found and adopted.
+pub(crate) const SETTLE_ALARM_RUN: &str = "unsettled_gate_run";
+
+/// How many re-sends may settle nothing before an alarm names the run.
+/// The settle runs inside the re-send's own request (17bf6f3e), so one
+/// re-send that left the packet open is already strange; three, a pass
+/// apart, is a packet no re-send will settle.
+pub(crate) const SETTLE_RESEND_ALARM_AFTER: u64 = 3;
+
+/// The run's [`SETTLE_RESENDS`]; a stamp that is not a count reads as none.
+pub(crate) fn settle_resends(run: &Value) -> u64 {
+    run.pointer(&format!("/metadata/{SETTLE_RESENDS}"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// The refusal an unsettled-verdict alarm was filed on when the run
+/// would not take its [`SETTLE_RESENDS`] write — the error, verbatim.
+pub(crate) const SETTLE_COUNT_REFUSED: &str = "settle_count_refused";
+
+/// Who closed an unsettled-verdict alarm whose run settled, as the
+/// left-behind alarm's `cleared_by` is.
+pub(crate) const SETTLE_ALARM_CLEARED_BY: &str = "conductor.unsettled-verdict-alarm";
+
+/// PURE: is an alarm owed for an unsettled run? Once [`SETTLE_RESEND_ALARM_AFTER`]
+/// re-sends have left it open — or at once when this pass's count was
+/// refused — and only while it names no alarm.
+///
+/// WHY (backlog c98ff222, from the review of car 3b58374d). The re-send
+/// ran once per pass with no count, cap or alarm: a packet the API kept
+/// refusing, or one the re-send could never settle, got one PUT and one
+/// log line forever and filed nothing — a check nobody reads.
+///
+/// `count_refused` (backlog bcaeae82). A run that refuses its count
+/// never reaches the bound, so the count alone left that case exactly
+/// as quiet as before: a journal line a pass, nothing in the record.
+/// The refusal is the fact, and it is owed an alarm the pass it is
+/// seen. Not a counter of refusals: each pass is its own `boss train
+/// reconcile` process, so a counter in memory starts at zero every
+/// time, and the run — the only durable place — is what refused.
+pub(crate) fn settle_alarm_due(run: &Value, count_refused: bool) -> bool {
+    (count_refused || settle_resends(run) >= SETTLE_RESEND_ALARM_AFTER)
+        && run
+            .pointer(&format!("/metadata/{SETTLE_ALARM}"))
+            .is_none_or(Value::is_null)
+}
+
+/// The open alarm already naming `rid`, if one is among `open` — adopted
+/// in place of a twin when the run's own stamp did not land.
+pub(crate) fn open_settle_alarm(open: &[Value], rid: &str) -> Option<String> {
+    open.iter().find_map(|j| {
+        (j.pointer(&format!("/metadata/{SETTLE_ALARM_RUN}"))
+            .and_then(Value::as_str)
+            == Some(rid))
+        .then(|| j.get("id").and_then(Value::as_str).map(str::to_string))
+        .flatten()
+    })
+}
+
+/// Every open unsettled-verdict alarm and the run it names:
+/// `(alarm id, gate-run id)`.
+pub(crate) fn settle_alarms(open: &[Value]) -> Vec<(String, String)> {
+    open.iter()
+        .filter_map(|a| {
+            let rid = a
+                .pointer(&format!("/metadata/{SETTLE_ALARM_RUN}"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())?;
+            let id = a.get("id").and_then(Value::as_str)?;
+            Some((id.to_string(), rid.to_string()))
+        })
+        .collect()
+}
+
+/// PURE: why an unsettled-verdict alarm's claim has ended, named from
+/// its run — `None` while the run is open, or when no status was read
+/// (unread is not ended).
+///
+/// THE HALF THAT WAS MISSING (backlog bcaeae82, gap 1). The alarm was
+/// filed and nothing closed it, so a stall that settled on the next
+/// re-send left a standing alarm an operator had to close by hand — the
+/// left-behind alarm's defect (7919fdcc), in this family. The run's own
+/// close is the end of the claim. When it settled is the newest step
+/// completion it carries (the outcome that closed it), else its
+/// `closed_on` date.
+pub(crate) fn settle_ended(run: &Value) -> Option<String> {
+    let status = run
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    if status == "open" {
+        return None;
+    }
+    let settled_at = run
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.get("completed_at").and_then(Value::as_str))
+        .filter_map(|t| DateTime::parse_from_rfc3339(t).ok().map(|at| (at, t)))
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, t)| t.to_string())
+        .or_else(|| {
+            run.get("closed_on")
+                .and_then(Value::as_str)
+                .map(|d| format!("{d} (its close date; no step completion read)"))
+        })
+        .unwrap_or_else(|| "(no settle time read)".to_string());
+    Some(format!(
+        "the gate-run is {status}, settled at {settled_at}, after {} settling re-send(s) \
+         counted on it",
+        settle_resends(run)
+    ))
+}
+
+/// The triage fields that CLOSE an unsettled-verdict alarm whose run
+/// settled: the `stale` terminal, through `close_alarm_stale`.
+pub(crate) fn settle_alarm_clear_writes(rid: &str, why: &str) -> Map<String, Value> {
+    let mut metadata = Map::new();
+    metadata.insert("disposition".into(), json!("stale"));
+    metadata.insert(
+        "evidence".into(),
+        json!(format!(
+            "The conductor re-read gate-run {rid} and its verdict has settled: {why}. The \
+             claim this alarm carried no longer holds; closed by machine, not by judgement. \
+             A run that stalls again files a new alarm. Backlog bcaeae82."
+        )),
+    );
+    metadata.insert("cleared_by".into(), json!(SETTLE_ALARM_CLEARED_BY));
+    metadata
+}
+
+/// PURE: the backlog-item a gate-run its re-sends never settled becomes.
+/// It names the run, its branch, the verdict it recorded and the count,
+/// because detection is not diagnosis: the reader starts at the packet,
+/// not at the conductor's journal. `count_refused` is the error the run
+/// answered its count with, when that is why the alarm is filed now
+/// (backlog bcaeae82): the count it carries is then not the re-sends
+/// sent, and the alarm says so rather than reporting a zero.
+pub(crate) fn unsettled_verdict_alarm_body(
+    run: &Value,
+    now: DateTime<Utc>,
+    owner: &str,
+    count_refused: Option<&str>,
+) -> Value {
+    let rid = run.get("id").and_then(Value::as_str).unwrap_or_default();
+    let md = metadata_map(run);
+    let branch = md
+        .get("branch")
+        .and_then(Value::as_str)
+        .unwrap_or("(no branch)");
+    let verdict = find_step(run, "record-verdict", "Record the gate verdict")
+        .and_then(|s| s.pointer("/metadata/verdict"))
+        .and_then(Value::as_str)
+        .unwrap_or("(none read)");
+    let resends = settle_resends(run);
+    let title = match count_refused {
+        None => format!(
+            "UNSETTLED GATE VERDICT: {branch} gate-run {} recorded {verdict} and is still open \
+             after {resends} settling re-sends",
+            id8(rid)
+        ),
+        Some(_) => format!(
+            "UNSETTLED GATE VERDICT: {branch} gate-run {} recorded {verdict}, is still open, \
+             and its settling re-sends cannot be counted on it",
+            id8(rid)
+        ),
+    };
+    let refused = count_refused.map_or(String::new(), |e| {
+        format!(
+            " THE COUNT ITSELF WAS REFUSED: the run answered the `{SETTLE_RESENDS}` write with \
+             \"{e}\", so the {resends} it carries is not the re-sends sent, and this alarm is \
+             filed on the refusal rather than at {SETTLE_RESEND_ALARM_AFTER} re-sends. The same \
+             refusal may keep the alarm's id off the run; each pass then adopts this alarm \
+             rather than filing a twin. Backlog bcaeae82."
+        )
+    });
+    let mut body = json!({
+        "kind": "backlog-item",
+        "status": "open",
+        "title": title,
+        "subject": {"subject_kind": "custom", "id": "bosspipeline"},
+        // The platform owner as the registry answers it, never a literal
+        // person — the same as every conductor alarm (3c23662d). No
+        // `opened_on`: the create handler stamps it (dd3624a0).
+        "owner_id": owner,
+        "priority": "standard",
+        "tags": ["pipeline", "gate"],
+        "metadata": {
+            "area": "pipeline",
+            SETTLE_ALARM_RUN: rid,
+            "branch": branch,
+            "verdict": verdict,
+            SETTLE_RESENDS: resends,
+            "last_measured_at": now.to_rfc3339(),
+            "detail": format!(
+                "Gate-run {rid} ({branch}) has its record-verdict step completed as {verdict}, \
+                 and the packet is still open after {resends} status-only re-sends of that \
+                 completion, one per reconcile pass. Each re-send asks the jobs API to run the \
+                 readiness pass and the close the recording write missed (17bf6f3e); none did, \
+                 so the verdict's outcome step never readied and the car it gates waits. The \
+                 conductor keeps re-sending and counts on the run as `{SETTLE_RESENDS}`; this \
+                 alarm is filed once per run (its id rides on the run as `{SETTLE_ALARM}`). \
+                 Read the run's steps and the jobs API's answer to the re-send in the \
+                 conductor's journal. Backlog c98ff222.{refused} It closes itself, \
+                 `stale`, once the run reads closed."
+            ),
+        },
+    });
+    if let Some(e) = count_refused {
+        body["metadata"][SETTLE_COUNT_REFUSED] = json!(e);
+    }
+    body
 }
 
 /// Whole minutes since a gate-run last said it was alive — the same
@@ -967,8 +1309,12 @@ pub(crate) fn gate_run_quiet_minutes(run: &Value, now: DateTime<Utc>) -> Option<
 /// reason to call a run older than it is. Shared by both clocks, so the
 /// orphan window and the Job deadline cannot read different lives.
 fn last_sign_of_life(md: &Map<String, Value>) -> Option<(&'static str, (String, DateTime<Utc>))> {
+    // A dotted stamp names a field inside a metadata object: the
+    // reservation row's beat (`RESERVATION_BEAT`).
     let instant = |key: &str| {
-        md.get(key)
+        let mut path = key.split('.');
+        let first = md.get(path.next()?);
+        path.fold(first, |v, k| v.and_then(|v| v.get(k)))
             .and_then(Value::as_str)
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok().map(|t| (s, t)))
             .map(|(s, t)| (s.to_string(), t.with_timezone(&Utc)))
@@ -1016,12 +1362,32 @@ const _: () = assert!(ORPHAN_GATE_RUN_MINUTES < GATE_DEADLINE_HOURS * 60 / 4);
 ///
 /// Both clocks read these: the orphan window ([`orphaned_gate_run`]) and
 /// the Job deadline ([`dead_gate_run_hours`]).
-const ALIVE_STAMPS: [&str; 4] = [
+///
+/// THE BEAT WHEREVER IT IS WRITTEN, AND THE LAUNCH (backlog d1ea4141).
+/// A waiter on the versioned reservation beats `gate_reservation.
+/// heartbeat_at`; `renew` copies it to `queue_heartbeat_at` today
+/// (since 498e6f750), and the clock reads both so that a writer of only
+/// the row is not read as silence. And `launched_at`, which `boss gate`
+/// stamps once the Job exists (and the native observation writes with
+/// the Job's own creation time), is the one stamp that dates the Job
+/// itself: until this list read it, a fresh packet that waited three
+/// hours to launch was dated from its last queue beat at best.
+const ALIVE_STAMPS: [&str; 6] = [
     "opened_at",
     crate::gate::QUEUED_AT,
     crate::gate::QUEUE_HEARTBEAT_AT,
+    RESERVATION_BEAT,
     crate::gate::LAUNCHING_AT,
+    crate::gate::LAUNCHED_AT,
 ];
+
+/// The reservation row's beat, as a dotted path into the packet's
+/// metadata. Both segments are boss-jobs' facts — `gate_reservation::KEY`
+/// and the serialised name of `Reservation::heartbeat_at` — and
+/// `the_job_deadline_reads_the_reservation_beat_and_the_launch` pins
+/// them by serialising a real `Reservation` and reading its beat back,
+/// so a rename in boss-jobs turns that test red (backlog 54a6832b).
+const RESERVATION_BEAT: &str = "gate_reservation.heartbeat_at";
 
 /// A gate-run with no verdict that nothing has held for the window —
 /// the half of an orphan the system of record can see. The other half,
@@ -1124,6 +1490,132 @@ pub(crate) fn orphan_receipt(o: &OrphanCandidate, branch: &str, namespace: &str)
         at = o.last_alive,
         mins = o.idle_minutes,
     )
+}
+
+/// What the orphan settle knows when its `withdrawn` completion returned
+/// an error, once it has read the packet back (backlog 847566e6).
+///
+/// WHY FOUR, AND NOT "PREDATES THE WORD". The settle used to log every
+/// such error as "its protocol version predates the word; settling as
+/// lost" — so a transient 5xx, a rollout gap or a write that landed and
+/// lost only its answer became a dead runner on the record with a cause
+/// nobody read. Car fix/gate-withdraw-waits-for-recorded-closure
+/// (7905cb5d) took the same inference out of the door; the read's
+/// classification here is that car's [`crate::gate::WithdrawalReadback`],
+/// not a second copy.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum WithdrawnNotRecorded {
+    /// The read shows the verdict landed after all —
+    /// [`crate::gate::WithdrawalReadback::Closed`] or `ClosurePending`.
+    /// Nothing more is owed from the settle.
+    Recorded(crate::gate::WithdrawalReadback),
+    /// The verdict landed `withdrawn`, and the version the packet is
+    /// pinned to put no `withdrawn` outcome step on it. The step is
+    /// completed, so `lost` cannot replace it; it is said, not settled.
+    MissingTerminal { version: Option<i64> },
+    /// The jobs API ANSWERED the write with a refusal, and the read shows
+    /// the verdict not recorded: the one case that falls back to `lost`,
+    /// with the refusal itself as the cause.
+    Refused { cause: String },
+    /// Neither the error nor the read says what happened — a 5xx, a
+    /// transport failure, a policy outage, a read that failed. Held for
+    /// the next pass rather than settled on a guess.
+    Unknown { cause: String },
+}
+
+/// How many reads the orphan settle makes of a gate-run whose `withdrawn`
+/// completion returned an error, and how far apart. The measured lag
+/// from a verdict landing to its `withdrawn` terminal completing was
+/// 1.39 s and 1.95 s (gate-runs 80f7d03b, 5286a359, 2026-10-17), but the
+/// settle does not wait for closure — a recorded verdict ends the read —
+/// so five reads cover a write whose answer was lost in a roll without
+/// holding a reconcile pass for the door's thirty. Shorter under test.
+pub(crate) const ORPHAN_WITHDRAW_READS: u32 = 5;
+pub(crate) const ORPHAN_WITHDRAW_READ_EVERY: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_secs(1)
+};
+
+/// PURE: the status of an answered refusal in a jobs-API error, read out
+/// of the message `api_once` builds (`<method> <path>: HTTP <status>:
+/// <body>`), the way `is_no_such_job` reads its 404 and for the reason
+/// it gives. A 4xx is an answer, except a 408 or 429 (the server did not
+/// decide) and a 403 naming a policy outage (`names_a_policy_outage`).
+pub(crate) fn answered_refusal(err: &anyhow::Error) -> Option<u16> {
+    err.chain().find_map(|c| {
+        let text = c.to_string();
+        let at = text.find("HTTP ")?;
+        let status: u16 = text.get(at + 5..at + 8)?.parse().ok()?;
+        let refusal = (400..500).contains(&status)
+            && status != 408
+            && status != 429
+            && !names_a_policy_outage(&text);
+        refusal.then_some(status)
+    })
+}
+
+/// PURE: classify a failed `withdrawn` completion from its error and the
+/// read-back that followed it. The read decides whether it landed; only
+/// when the read shows it did not does the error's kind matter.
+pub(crate) fn withdrawn_completion_failure(
+    err: &anyhow::Error,
+    read: &std::result::Result<crate::gate::WithdrawalReadback, String>,
+) -> WithdrawnNotRecorded {
+    use crate::gate::WithdrawalReadback as R;
+    match read {
+        Ok(landed @ (R::Closed | R::ClosurePending { .. })) => {
+            WithdrawnNotRecorded::Recorded(landed.clone())
+        }
+        Ok(R::MissingTerminal { version }) => {
+            WithdrawnNotRecorded::MissingTerminal { version: *version }
+        }
+        Ok(R::VerdictNotRead) if answered_refusal(err).is_some() => WithdrawnNotRecorded::Refused {
+            cause: format!("{err:#}"),
+        },
+        Ok(R::VerdictNotRead) => WithdrawnNotRecorded::Unknown {
+            cause: format!("{err:#}; the read-back does not show the verdict recorded"),
+        },
+        Err(read) => WithdrawnNotRecorded::Unknown {
+            cause: format!("{err:#}; the read-back failed too: {read}"),
+        },
+    }
+}
+
+/// PURE: the journal line for each [`WithdrawnNotRecorded`], naming its
+/// own cause.
+pub(crate) fn withdrawn_failure_line(short: &str, w: &WithdrawnNotRecorded) -> String {
+    use crate::gate::WithdrawalReadback as R;
+    let pinned = |v: &Option<i64>| match v {
+        Some(n) => format!("gate-run v{n}"),
+        None => "the gate-run version it is pinned to (the read did not say which)".into(),
+    };
+    match w {
+        WithdrawnNotRecorded::Recorded(R::ClosurePending { version }) => format!(
+            "reconcile: gate-run {short}: the `withdrawn` completion returned an error, but the \
+             read-back shows the verdict recorded and the `withdrawn` outcome step of {} not \
+             completed yet — closure PENDING, nothing more to settle",
+            pinned(version)
+        ),
+        WithdrawnNotRecorded::Recorded(_) => format!(
+            "reconcile: gate-run {short}: the `withdrawn` completion returned an error, but the \
+             read-back shows the packet closed — withdrawn"
+        ),
+        WithdrawnNotRecorded::MissingTerminal { version } => format!(
+            "reconcile: gate-run {short} recorded `withdrawn`, but {} put no `withdrawn` outcome \
+             step on this packet, so nothing on it closes on that word; the completed verdict \
+             cannot be replaced by `lost`, so it is left as written",
+            pinned(version)
+        ),
+        WithdrawnNotRecorded::Refused { cause } => format!(
+            "reconcile: gate-run {short}: the jobs API REFUSED `withdrawn` ({cause}) and the \
+             read-back shows the verdict not recorded — settling as lost"
+        ),
+        WithdrawnNotRecorded::Unknown { cause } => format!(
+            "reconcile: gate-run {short}: `withdrawn` was not confirmed ({cause}) — UNKNOWN, \
+             not refused; nothing settled, the next pass reads it again"
+        ),
+    }
 }
 
 /// The receipt a gate-run the conductor FILED and could not start is
@@ -1525,6 +2017,172 @@ mod tests {
         assert_eq!(unsettled_verdict_step(&other, now), None);
     }
 
+    /// `completed_at` is stamped off the jobs API's clock port — the sim
+    /// clock on a simulated instance — and `now` is the conductor's wall
+    /// clock (backlog c98ff222, from the review of car 3b58374d). A stamp
+    /// a minute or more AHEAD of the reader is two clocks disagreeing, not
+    /// a write still settling, and read as "recent" it kept the run from
+    /// ever being re-sent. Seconds of skew still read as recent.
+    #[test]
+    fn a_verdict_stamped_ahead_of_the_readers_clock_is_still_owed_a_settle() {
+        let now = DateTime::parse_from_rfc3339("2026-10-10T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let run = |at: &str| {
+            json!({"id": "r", "kind": "gate-run", "status": "open",
+                   "steps": [{"id": "s-v", "spec_slug": "record-verdict",
+                              "title": "Record the gate verdict", "status": "completed",
+                              "completed_at": at, "metadata": {"verdict": "green"}}]})
+        };
+        assert_eq!(
+            unsettled_verdict_step(&run("2026-10-10T18:00:00Z"), now),
+            Some("s-v"),
+            "a stamp three hours ahead is a clock disagreement, not a recent write"
+        );
+        assert_eq!(
+            unsettled_verdict_step(&run("2026-10-10T15:00:20Z"), now),
+            None,
+            "twenty seconds of skew is still inside the grace"
+        );
+    }
+
+    /// The count, the due test and the alarm a run its re-sends never
+    /// settled becomes (backlog c98ff222).
+    #[test]
+    fn an_alarm_is_due_once_after_the_resends_that_settled_nothing() {
+        let run = |md: Value| {
+            json!({"id": "run-1234abcd", "kind": "gate-run", "status": "open",
+                   "metadata": md,
+                   "steps": [{"id": "s-v", "spec_slug": "record-verdict",
+                              "title": "Record the gate verdict", "status": "completed",
+                              "metadata": {"verdict": "green"}}]})
+        };
+        assert_eq!(settle_resends(&run(json!({}))), 0);
+        assert_eq!(settle_resends(&run(json!({SETTLE_RESENDS: "two"}))), 0);
+        let below = run(json!({SETTLE_RESENDS: SETTLE_RESEND_ALARM_AFTER - 1}));
+        assert!(
+            !settle_alarm_due(&below, false),
+            "fewer re-sends than the bound"
+        );
+        let due = run(json!({"branch": "fix/stuck", SETTLE_RESENDS: SETTLE_RESEND_ALARM_AFTER}));
+        assert!(settle_alarm_due(&due, false));
+        let filed = run(json!({SETTLE_RESENDS: 9, SETTLE_ALARM: "a1"}));
+        assert!(!settle_alarm_due(&filed, false), "one alarm per run");
+        let cleared = run(json!({SETTLE_RESENDS: 9, SETTLE_ALARM: null}));
+        assert!(settle_alarm_due(&cleared, false));
+
+        let now = DateTime::parse_from_rfc3339("2026-10-10T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let body = unsettled_verdict_alarm_body(&due, now, "emp-owner", None);
+        assert_eq!(body["kind"], "backlog-item");
+        assert_eq!(body["owner_id"], "emp-owner");
+        assert_eq!(body["metadata"][SETTLE_ALARM_RUN], "run-1234abcd");
+        assert_eq!(body["metadata"][SETTLE_RESENDS], SETTLE_RESEND_ALARM_AFTER);
+        assert_eq!(body["metadata"]["verdict"], "green");
+        let title = body["title"].as_str().unwrap();
+        assert!(
+            title.contains("fix/stuck") && title.contains("run-1234"),
+            "{title}"
+        );
+        assert!(
+            body.get("opened_on").is_none(),
+            "the create handler stamps it"
+        );
+
+        // An open alarm already naming the run is adopted, never twinned.
+        let open = vec![
+            json!({"id": "other", "metadata": {SETTLE_ALARM_RUN: "run-elsewhere"}}),
+            json!({"id": "mine", "metadata": {SETTLE_ALARM_RUN: "run-1234abcd"}}),
+        ];
+        assert_eq!(
+            open_settle_alarm(&open, "run-1234abcd").as_deref(),
+            Some("mine")
+        );
+        assert_eq!(open_settle_alarm(&open, "run-none"), None);
+    }
+
+    /// A REFUSED COUNT IS ITSELF THE ALARM (backlog bcaeae82, gap 2). When
+    /// the run will not take its `settle_resends` write the count never
+    /// grows, so the bound above is never reached; the refusal is the
+    /// fact, and it is due at once — once, while the run names no alarm.
+    #[test]
+    fn a_refused_count_makes_the_alarm_due_at_once_and_says_why() {
+        let run = |md: Value| {
+            json!({"id": "run-1234abcd", "kind": "gate-run", "status": "open",
+                   "metadata": md,
+                   "steps": [{"id": "s-v", "spec_slug": "record-verdict",
+                              "title": "Record the gate verdict", "status": "completed",
+                              "metadata": {"verdict": "green"}}]})
+        };
+        let fresh = run(json!({"branch": "fix/stuck"}));
+        assert!(!settle_alarm_due(&fresh, false), "a counted first re-send");
+        assert!(settle_alarm_due(&fresh, true), "a refused count is due now");
+        let named = run(json!({SETTLE_ALARM: "a1"}));
+        assert!(!settle_alarm_due(&named, true), "still one alarm per run");
+
+        let now = DateTime::parse_from_rfc3339("2026-10-10T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let body = unsettled_verdict_alarm_body(&fresh, now, "emp-owner", Some("HTTP 409: no"));
+        assert_eq!(body["metadata"][SETTLE_ALARM_RUN], "run-1234abcd");
+        assert_eq!(body["metadata"][SETTLE_COUNT_REFUSED], "HTTP 409: no");
+        let title = body["title"].as_str().unwrap();
+        assert!(title.contains("cannot be counted"), "{title}");
+        let detail = body["metadata"]["detail"].as_str().unwrap();
+        assert!(detail.contains("HTTP 409: no"), "{detail}");
+        let counted = unsettled_verdict_alarm_body(&fresh, now, "emp-owner", None);
+        assert!(counted["metadata"].get(SETTLE_COUNT_REFUSED).is_none());
+    }
+
+    /// THE ALARM'S CLEARER (backlog bcaeae82, gap 1). An open alarm names
+    /// its run; once that run reads closed the claim no longer holds, and
+    /// the close names the count the run carries and when it settled —
+    /// the newest completion among its steps. An open run, or a run that
+    /// could not be read, keeps its alarm: unread is not ended.
+    #[test]
+    fn a_settled_run_ends_its_alarm_with_the_count_and_the_settle_time() {
+        let open = vec![
+            json!({"id": "a-other", "metadata": {"left_behind_car": "car-1"}}),
+            json!({"id": "a-1", "metadata": {SETTLE_ALARM_RUN: "run-1234abcd"}}),
+            json!({"id": "a-blank", "metadata": {SETTLE_ALARM_RUN: ""}}),
+        ];
+        assert_eq!(
+            settle_alarms(&open),
+            vec![("a-1".to_string(), "run-1234abcd".to_string())]
+        );
+        let run = |status: &str| {
+            json!({"id": "run-1234abcd", "status": status, "closed_on": "2026-10-10",
+                   "metadata": {"branch": "fix/stuck", SETTLE_RESENDS: 4},
+                   "steps": [
+                       {"status": "completed", "completed_at": "2026-10-10T14:00:00Z"},
+                       {"status": "completed", "completed_at": "2026-10-10T15:20:07Z"},
+                       {"status": "skipped", "completed_at": null}]})
+        };
+        assert_eq!(
+            settle_ended(&run("open")),
+            None,
+            "still open: the alarm stands"
+        );
+        assert_eq!(settle_ended(&json!({})), None, "no status read: unread");
+        let why = settle_ended(&run("closed")).expect("a closed run ended it");
+        assert!(
+            why.contains("closed") && why.contains("4") && why.contains("2026-10-10T15:20:07Z"),
+            "{why}"
+        );
+        let bare = json!({"id": "r", "status": "closed", "closed_on": "2026-10-11"});
+        assert!(settle_ended(&bare).unwrap().contains("2026-10-11"));
+
+        let writes = settle_alarm_clear_writes("run-1234abcd", &why);
+        assert_eq!(writes["disposition"], "stale");
+        assert_eq!(writes["cleared_by"], SETTLE_ALARM_CLEARED_BY);
+        let evidence = writes["evidence"].as_str().unwrap();
+        assert!(
+            evidence.contains("run-1234abcd") && evidence.contains("2026-10-10T15:20:07Z"),
+            "{evidence}"
+        );
+    }
+
     /// A completion is the fields through the merge door, then a PUT
     /// carrying the status and NOTHING else — the only form that
     /// survives the step PUT refusing any metadata body (e39a9d2a).
@@ -1701,6 +2359,309 @@ mod tests {
         // hours reported are counted from it.
         let old_launch = crate::gate::launching_patch(at("2026-09-24T09:40:00Z"));
         assert_eq!(dead_gate_run_hours(&run(old_launch), now), Some(3));
+    }
+
+    /// Backlog d1ea4141. Gate-run 98b80bb0 as it stood at 18:39:01Z on
+    /// 2026-10-17, when the clock settled it `lost`: filed 15:38:21,
+    /// queued 15:38:14, its top-level beat frozen at 15:38:14 for the
+    /// whole 173-minute wait, its Job created at 18:31:57. Two signs of
+    /// life the clock did not read: the waiter's beat inside the
+    /// reservation row, which a writer may stamp without the top-level
+    /// copy, and `launched_at`, the stamp `boss gate` writes once the Job
+    /// exists. Either says the Job's deadline has not begun to run out.
+    #[test]
+    fn the_job_deadline_reads_the_reservation_beat_and_the_launch() {
+        let now = at("2026-10-17T18:39:01Z");
+        let run = |extra: Value| {
+            let mut md = serde_json::json!({ "branch": "fix/a-died-runs-own-outcome-is-not-movement",
+                                             "opened_at": "2026-10-17T15:38:21.398799458+00:00",
+                                             "queued_at": "2026-10-17T15:38:14Z",
+                                             "queue_heartbeat_at": "2026-10-17T15:38:14Z" });
+            for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+                md[k.as_str()] = v;
+            }
+            serde_json::json!({
+                "id": "98b80bb0-e20b-42c8-a02a-626cb379e05a",
+                "metadata": md,
+                "steps": [{"spec_slug":"record-verdict","title":"Record the gate verdict",
+                           "status":"ready","metadata":{}}]
+            })
+        };
+        // The control, the packet exactly as it was: three hours dead.
+        assert_eq!(
+            dead_gate_run_hours(&run(serde_json::json!({})), now),
+            Some(3)
+        );
+        // The live waiter's beat, written only in the reservation row —
+        // serialised from boss-jobs' own row type, never spelled here.
+        // A literal row repeated `RESERVATION_BEAT`'s field name, so a
+        // rename of the field in boss-jobs left this green while the
+        // clock read no beat and counted the waiter dead (backlog
+        // 54a6832b; measured: `#[serde(rename = "beat_at")]` on the field
+        // kept the literal fixture green).
+        let row = boss_jobs::gate_reservation::Reservation {
+            contract_version: 1,
+            generation: uuid::Uuid::parse_str("f4ef2fcb-ba92-44e6-b3fd-74a624c3abd6").unwrap(),
+            queued_at: "2026-10-17T15:38:14Z".into(),
+            heartbeat_at: "2026-10-17T18:31:30Z".into(),
+            consumed: false,
+        };
+        let beating = serde_json::json!({ boss_jobs::gate_reservation::KEY: row });
+        assert_eq!(dead_gate_run_hours(&run(beating.clone()), now), None);
+        // And the clock dates the run FROM that beat, by the dotted path.
+        let o = orphaned_gate_run(&run(beating), at("2026-10-17T18:51:30Z"))
+            .expect("20 min past the row's beat is past the window");
+        assert_eq!(
+            (o.last_alive_key, o.last_alive.as_str(), o.idle_minutes),
+            (RESERVATION_BEAT, "2026-10-17T18:31:30Z", 20)
+        );
+        // The launch: the Job exists as of 18:31:57.
+        let launched = crate::gate::launched_patch(at("2026-10-17T18:31:57Z"));
+        assert_eq!(dead_gate_run_hours(&run(launched), now), None);
+        // And the orphan window names the stamp it dated the run from.
+        let launched = crate::gate::launched_patch(at("2026-10-17T18:00:00Z"));
+        let o = orphaned_gate_run(&run(launched), now).expect("39 min idle is past the window");
+        assert_eq!(
+            (o.last_alive_key, o.idle_minutes),
+            (crate::gate::LAUNCHED_AT, 39)
+        );
+    }
+
+    /// Backlog b56bfc29. Resident gate-run dec70bf9 as it stood at
+    /// 06:50Z on 2026-10-19: a durable submission accepted at 05:42:37Z,
+    /// waiting for a bay, its client stamps frozen at 05:41:50Z because a
+    /// resident place carries no client heartbeat. No Job had ever been
+    /// created, so no Job deadline could have passed — yet the clock read
+    /// only the stamps and would have settled it `lost` at 08:42Z with a
+    /// receipt naming a Job that never existed. Once a native Job is
+    /// observed the run is a launched gate again, and the clock is its.
+    #[test]
+    fn a_queued_resident_place_is_not_a_dead_gate() {
+        let now = at("2026-10-19T09:45:00Z");
+        let packet = "dec70bf9-5c78-4f1b-a706-7caf438ab26a";
+        let intent = serde_json::json!({
+            "contract_version": 1, "packet": packet, "namespace": "boss-dev",
+            "name": "gate-dec70bf95c784f1ba7067caf438ab26a",
+            "head": "097e370a27a0c773cf1ce015e242215ee200f8ec", "mode": "--auto",
+            "file_id": "6c5f68b5-5bfc-4ca9-8a9d-2d92872fe5ba",
+            "sha256": "deab6e4dad06ad2a73f7e08585305e8b04385142583300d985feace96e815078",
+            "size_bytes": 5537 });
+        let branch = "fix/a-gate-place-belongs-to-its-packet-by-default";
+        let sha = "097e370a27a0c773cf1ce015e242215ee200f8ec";
+        let submission = serde_json::json!({
+            "contract_version": 1, "command": "3690ab16-f07e-441a-a404-055ab4e4e8a1",
+            "submitted_by": "agent-claude-b", "supervisor": "automation:train-conductor",
+            "intent": intent, "source": { "branch": branch, "sha": sha } });
+        let md = serde_json::json!({
+            "branch": branch, "sha": sha,
+            "opened_at": "2026-10-19T05:42:33.154541701+00:00",
+            "queued_at": "2026-10-19T05:41:50Z",
+            "queue_heartbeat_at": "2026-10-19T05:41:50Z",
+            boss_jobs::gate_reservation::KEY: {
+                "contract_version": 1, "generation": "974ba91e-5160-47f6-b638-be587ce10c1e",
+                "queued_at": "2026-10-19T05:41:50Z", "heartbeat_at": "2026-10-19T05:41:50Z",
+                "consumed": false },
+            boss_jobs::gate_reservation::SUBMISSION: submission,
+            boss_jobs::metadata_immutability::KEY: {
+                boss_jobs::gate_reservation::SUBMISSION: submission } });
+        let run = |md: Value| {
+            serde_json::json!({
+                "id": packet,
+                "metadata": md,
+                "steps": [{"spec_slug":"record-verdict","title":"Record the gate verdict",
+                           "status":"ready","metadata":{}}]
+            })
+        };
+        assert!(boss_jobs::gate_reservation::waiting_for_native(&md));
+        assert_eq!(
+            dead_gate_run_hours(&run(md.clone()), now),
+            None,
+            "a resident place still waiting for a bay has no Job to have died"
+        );
+        // The control: the same stamps under legacy ownership are four
+        // hours of silence, and the clock still owns them.
+        let mut legacy = md.clone();
+        for key in [
+            boss_jobs::gate_reservation::SUBMISSION,
+            boss_jobs::metadata_immutability::KEY,
+        ] {
+            legacy.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(dead_gate_run_hours(&run(legacy), now), Some(4));
+        // Launched: the protected native observation binds the Job, and
+        // from then on the Job deadline is the clock again.
+        let observation = serde_json::json!({
+            "uid": "6f0c1e2a-0000-4000-8000-000000000001",
+            "request_sha256": intent["sha256"], "created_at": "2026-10-19T05:44:00Z" });
+        let mut launched = md;
+        launched[boss_jobs::gate_reservation::INTENT] = intent.clone();
+        launched[boss_jobs::gate_reservation::OBSERVATION] = observation.clone();
+        launched[boss_jobs::metadata_immutability::KEY][boss_jobs::gate_reservation::INTENT] =
+            intent;
+        launched[boss_jobs::metadata_immutability::KEY][boss_jobs::gate_reservation::OBSERVATION] =
+            observation;
+        assert!(boss_jobs::gate_reservation::native_observed(&launched));
+        assert_eq!(dead_gate_run_hours(&run(launched.clone()), now), Some(4));
+        // A launch begun and not yet observed may have a Job: the guarded
+        // attempt alone hands the run back to the clock.
+        let mut sending = launched;
+        for key in [
+            boss_jobs::gate_reservation::INTENT,
+            boss_jobs::gate_reservation::OBSERVATION,
+        ] {
+            sending.as_object_mut().unwrap().remove(key);
+            sending[boss_jobs::metadata_immutability::KEY]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+        }
+        sending[boss_jobs::gate_reservation::ATTEMPT] = serde_json::json!({ "state": "sent" });
+        assert!(boss_jobs::gate_reservation::waiting_for_native(&sending));
+        assert_eq!(dead_gate_run_hours(&run(sending), now), Some(4));
+    }
+
+    /// The same item's receipt half: a clock settle that found no gate
+    /// Job for the packet claims no Job deadline, and one that found a
+    /// finished Job still names the deadline that ended it.
+    #[test]
+    fn a_lost_receipt_claims_a_job_deadline_only_when_a_job_was_seen() {
+        let none = clock_lost_receipt(4, "fix/x", 0);
+        assert!(!none.contains("activeDeadlineSeconds"), "{none}");
+        assert!(none.contains("NO GATE JOB CARRIES THIS RUN"), "{none}");
+        assert!(none.contains("Quiet 4h"), "{none}");
+        let seen = clock_lost_receipt(4, "fix/x", 1);
+        assert!(
+            seen.contains(&format!(
+                "Active 4h with none, past the gate Job's {GATE_DEADLINE_HOURS}h \
+                 activeDeadlineSeconds"
+            )),
+            "{seen}"
+        );
+        for receipt in [none, seen] {
+            assert!(receipt.contains("this run says nothing about fix/x"));
+        }
+    }
+
+    fn gate_job(name: &str, created: &str, finished: bool) -> GateJob {
+        GateJob {
+            name: name.into(),
+            uid: "uid".into(),
+            packet: "98b80bb0-e20b-42c8-a02a-626cb379e05a".into(),
+            created: created.into(),
+            carrier: true,
+            judged_init: false,
+            finished: finished.then(|| Finished {
+                failed: true,
+                reason: "DeadlineExceeded".into(),
+                at: "2026-10-17T21:31:57Z".into(),
+            }),
+        }
+    }
+
+    /// Backlog d1ea4141, acceptance 2: a gate whose Job is running is
+    /// never settled `lost` on a clock dated by the queue. The Job's
+    /// `activeDeadlineSeconds` runs from the Job, so the cluster's own
+    /// record of it bounds the deadline; the packet's stamps only stand
+    /// in for it when no Job exists.
+    #[test]
+    fn a_gate_job_the_cluster_holds_bounds_the_deadline() {
+        let now = at("2026-10-17T18:39:01Z");
+        // No Job: the clock's own reading stands.
+        assert_eq!(job_deadline(3, &[], now), Ok(3));
+        // 98b80bb0's Job, created seven minutes earlier and running.
+        let running = gate_job("gate-98b80bb0", "2026-10-17T18:31:57Z", false);
+        let held = job_deadline(3, &[&running], now).unwrap_err();
+        assert!(
+            held.contains("gate-98b80bb0") && held.contains("running"),
+            "{held}"
+        );
+        // Running past its own deadline is still running: Kubernetes, not
+        // this clock, ends it, and its end is the cluster's to record.
+        let late = gate_job("gate-98b80bb0", "2026-10-17T15:00:00Z", false);
+        assert!(job_deadline(3, &[&late], now).is_err());
+        // Ended inside the deadline: the recorder reads what it left.
+        let ended = gate_job("gate-98b80bb0", "2026-10-17T18:31:57Z", true);
+        assert!(job_deadline(3, &[&ended], now).is_err());
+        // Ended, and created past the deadline: dead, dated from the Job.
+        let old = gate_job("gate-98b80bb0", "2026-10-17T14:00:00Z", true);
+        assert_eq!(job_deadline(5, &[&old], now), Ok(4));
+        // A Job whose creation cannot be read cannot be dated: held.
+        let blank = gate_job("gate-98b80bb0", "", true);
+        assert!(job_deadline(3, &[&old, &blank], now).is_err());
+    }
+
+    /// Backlog db6bdb4f (landed-review run 7dab7d38 of car b670d6b3). A
+    /// gate Job whose pod was never created — admission or quota refused
+    /// it for the whole 10800 s — ends `Failed` / `DeadlineExceeded` with
+    /// NO pod count: `failed: 0`. Read from the counts alone it was still
+    /// running, so the clock above held its run open until the Job's
+    /// 86400 s TTL deleted it, about a day late, logging "is still
+    /// running" every pass. The cluster's terminal condition is the end.
+    #[test]
+    fn a_gate_job_that_failed_before_any_pod_existed_is_finished_and_settles_on_the_clock() {
+        let now = at("2026-10-17T18:39:01Z");
+        let list = |status: Value| {
+            json!({"items": [{"metadata": {"name": "gate-podless-11111", "uid": "u",
+                "creationTimestamp": "2026-10-17T14:00:00Z",
+                "labels": {"app": "gate-runner", "boss.dev/packet": "p",
+                           "boss.dev/verdict-carrier": "pod-log"}},
+                "status": status}]})
+        };
+        let podless = gate_jobs_from_json(&list(json!({"failed": 0, "conditions": [
+            {"type": "FailureTarget", "status": "True", "reason": "DeadlineExceeded",
+             "lastTransitionTime": "2026-10-17T17:00:00Z"},
+            {"type": "Failed", "status": "True", "reason": "DeadlineExceeded",
+             "lastTransitionTime": "2026-10-17T17:00:01Z"}]})));
+        assert_eq!(
+            podless[0].finished,
+            Some(Finished {
+                failed: true,
+                reason: "DeadlineExceeded".into(),
+                at: "2026-10-17T17:00:01Z".into(),
+            }),
+            "a Job the cluster ended Failed with no pod count read as running"
+        );
+        assert_eq!(job_deadline(5, &[&podless[0]], now), Ok(4));
+        // A condition that is not True is no end, and neither is one the
+        // Job holds while a pod is still terminating: the bay's reading.
+        for live in [
+            json!({"conditions": [{"type": "Failed", "status": "False"}]}),
+            json!({"terminating": 1, "conditions": [{"type": "Failed", "status": "True"}]}),
+            json!({}),
+        ] {
+            let jobs = gate_jobs_from_json(&list(live.clone()));
+            assert_eq!(jobs[0].finished, None, "{live} read as finished");
+            assert!(job_deadline(5, &[&jobs[0]], now).is_err(), "{live}");
+        }
+    }
+
+    /// CLAUDE.md §9a: the bay ([`crate::gate::job_live`]) and the recorder
+    /// read one Job. Every Job the bay calls ended, the recorder calls
+    /// finished — the two definitions of an ended gate Job are one.
+    #[test]
+    fn every_job_the_bay_calls_ended_the_recorder_calls_finished() {
+        for status in [
+            json!({"succeeded": 1, "conditions": [{"type": "Complete", "status": "True"}]}),
+            json!({"failed": 1, "conditions": [{"type": "Failed", "status": "True"}]}),
+            json!({"conditions": [{"type": "Failed", "status": "True"}]}),
+            json!({"conditions": [{"type": "Complete", "status": "True"}]}),
+            json!({"active": 1}),
+            json!({"conditions": [{"type": "Failed", "status": "False"}]}),
+            json!({"terminating": 1, "conditions": [{"type": "Failed", "status": "True"}]}),
+            json!({}),
+        ] {
+            let job = json!({"metadata": {"name": "gate-x", "labels":
+                {"app": "gate-runner", "boss.dev/packet": "p"}}, "status": status});
+            let finished = gate_jobs_from_json(&json!({"items": [job.clone()]}))[0]
+                .finished
+                .is_some();
+            if !crate::gate::job_live(&job) {
+                assert!(
+                    finished,
+                    "the bay frees {status} but the recorder waits on it"
+                );
+            }
+        }
     }
 
     /// Gate-run 91594262 as it stood on 2026-09-24: queued at 01:26:24,

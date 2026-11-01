@@ -126,7 +126,7 @@ impl WholeTree {
     }
 
     /// Every path that stops the proof, a conflict marked as one.
-    fn files(&self) -> Vec<String> {
+    pub(crate) fn files(&self) -> Vec<String> {
         let all: BTreeSet<&String> = self.conflicted.iter().chain(&self.differing).collect();
         all.into_iter()
             .map(|f| {

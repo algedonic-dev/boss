@@ -22,7 +22,10 @@
 //! before the host holds it and keep the old one until the host has
 //! moved on (design 6805c764's shape). A value exactly one host's slots
 //! hold inserts `CredentialedCaller { principal: runner:ops, actor_id:
-//! automation:ops-runner, host: Some(<host>) }`; the host binding is then
+//! automation:ops-runner, host: Some(<host>) }` — the actor being, when
+//! x-boss-user asserts one, a PASS of that runner on that host
+//! ([`acting_id`], backlog d16c2dae), so two passes are two claimants;
+//! the host binding is then
 //! [`crate::field_writer::admits`]'s. A value two hosts hold resolves to
 //! neither — a broker fault is read as no credential, never as whichever
 //! host a directory listing reached first.
@@ -97,6 +100,53 @@ pub const WHOAMI_PATH: &str = "/api/jobs/runner-credential";
 /// that directory, and a directory past it resolves NO ONE, with a
 /// warning — never the partial read a cut in listing order would be.
 const MAX_ENTRIES: usize = 256;
+
+/// The id a request resolved to `host` acts as: the one x-boss-user
+/// asserts when it is a PASS of this runner on that host —
+/// `automation:ops-runner:<host>:<YYYYMMDDTHHMMSSZ>-<pid>`, exactly the
+/// shape infra/ops/ops-runner.sh `mint_claimant` mints and
+/// `is_runner_pass` reads, both pinned to this by tests that run them —
+/// and otherwise the account, [`ACTOR`].
+///
+/// WHY A PASS KEEPS ITS ID (backlog d16c2dae). The claim door is
+/// idempotent for its holder, so the runner signs each claim as a
+/// claimant unique to its pass, and that is what makes a passkey
+/// approval single-use: a second pass is a second claimant, refused 409.
+/// Rebinding every resolved request to the account made every pass of
+/// one host the same holder — two claims both answered 200, and the
+/// runner, which recognises only a pass of its own, read its own hold as
+/// "held by someone else", so a claimed-then-silent execute was never
+/// recorded as outcome unknown and an answer whose status PUT failed
+/// could be closed refused by the next pass. The credential still proves
+/// the account and the host — a pass naming another host, or any other
+/// shape, is the account, as before — and the pass is only the runner's
+/// own label inside them, which a holder of the credential could already
+/// act as. Any other request keeps the account: the door rebinds the id
+/// a deposit or a receiver asserts exactly as it did.
+pub fn acting_id(asserted: &str, host: &str) -> String {
+    let pass = asserted
+        .strip_prefix(ACTOR)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .and_then(|rest| rest.strip_prefix(host))
+        .and_then(|rest| rest.strip_prefix(':'));
+    match pass {
+        Some(pass) if is_pass_label(pass) => asserted.to_string(),
+        _ => ACTOR.to_string(),
+    }
+}
+
+/// `<YYYYMMDD>T<HHMMSS>Z-<pid>`: eight digits, `T`, six digits, `Z-`, and
+/// a pid of one to ten digits (a Linux pid is at most seven).
+fn is_pass_label(pass: &str) -> bool {
+    let b = pass.as_bytes();
+    let digits = |s: &[u8]| s.iter().all(u8::is_ascii_digit);
+    (18..=27).contains(&b.len())
+        && digits(&b[..8])
+        && b[8] == b'T'
+        && digits(&b[9..15])
+        && &b[15..17] == b"Z-"
+        && digits(&b[17..])
+}
 
 /// The slot directory, from the environment or its default.
 pub fn dir() -> PathBuf {
@@ -259,8 +309,16 @@ pub async fn resolve_runner_credential(
                     .and_then(|s| serde_json::from_str::<boss_policy_client::User>(s).ok()),
                 None => Some(boss_policy_client::User::anonymous()),
             };
+            //
+            // The id is the account's, unless the header asserts a pass
+            // of this runner on the host the credential resolved to
+            // ([`acting_id`], backlog d16c2dae).
+            let actor_id = user
+                .as_ref()
+                .map(|u| acting_id(&u.id, &host))
+                .unwrap_or_else(|| ACTOR.to_string());
             if let Some(mut user) = user {
-                user.id = ACTOR.to_string();
+                user.id = actor_id.clone();
                 if let Ok(encoded) = serde_json::to_string(&user)
                     && let Ok(header) = axum::http::HeaderValue::from_str(&encoded)
                 {
@@ -269,7 +327,7 @@ pub async fn resolve_runner_credential(
             }
             let caller = CredentialedCaller {
                 principal: PRINCIPAL.to_string(),
-                actor_id: ACTOR.to_string(),
+                actor_id,
                 host: Some(host),
             };
             if let Some(mode) = req
@@ -398,6 +456,130 @@ mod tests {
             boss_testing::write_file(&dir.join(name), value);
         }
         dir
+    }
+
+    /// Passes of host `forge` the door keeps, and ids it rebinds to the
+    /// account. One list, read by the door's own test AND by the pin that
+    /// runs ops-runner.sh's `is_runner_pass` over it, so the two readers
+    /// of the shape are judged on the same ids (backlog 043d15a2).
+    const KEPT_ON_FORGE: [&str; 2] = [
+        "automation:ops-runner:forge:20261018T095500Z-4242",
+        "automation:ops-runner:forge:20261018T095500Z-1234567890",
+    ];
+    const NOT_A_PASS_ON_FORGE: [&str; 21] = [
+        "",
+        ACTOR,
+        "automation:ops-runner:",
+        "automation:ops-runner:forge",
+        "automation:ops-runner:forge:",
+        "automation:ops-runner:forge:20261018T095500Z-",
+        "automation:ops-runner:forge:20261018T095500Z-12345678901",
+        "automation:ops-runner:forge:20261018T095500Z-42 ",
+        "automation:ops-runner:forge:20261018T095500Z-4242\n",
+        "automation:ops-runner:forge:20261018T095500Z-4242:x",
+        "automation:ops-runner:forge:2026101T095500Z-4242",
+        "automation:ops-runner:forge:20261018X095500Z-4242",
+        "automation:ops-runner:forge:20261018T0955000-4242",
+        "automation:ops-runner:forge:20261018T095500Z+4242",
+        "automation:ops-runner:forge:forge:20261018T095500Z-4242",
+        "automation:ops-runnerx:forge:20261018T095500Z-4242",
+        "automation:ops-runner:forg:20261018T095500Z-4242",
+        "automation:ops-runner:boss-gcp:20261018T095500Z-4242",
+        "automation:runner-credential-recv",
+        "automation:runner-credential-deposit",
+        "emp-david",
+    ];
+
+    #[test]
+    fn only_a_pass_of_the_resolved_host_keeps_its_id() {
+        for pass in KEPT_ON_FORGE {
+            assert_eq!(acting_id(pass, "forge"), pass);
+            assert_eq!(acting_id(pass, "boss-gcp"), ACTOR);
+            assert_eq!(acting_id(pass, "forg"), ACTOR);
+        }
+        for not in NOT_A_PASS_ON_FORGE {
+            assert_eq!(acting_id(not, "forge"), ACTOR, "{not:?}");
+        }
+    }
+
+    /// One shell function of ops-runner.sh, `name() {` through its closing
+    /// `}` line, with `ACTOR` and `HOST_ID` set as the runner sets them —
+    /// the text the runner executes, never a copy of it.
+    fn runner_function(name: &str, host: &str) -> String {
+        let script =
+            std::fs::read_to_string(boss_testing::repo_root().join("infra/ops/ops-runner.sh"))
+                .unwrap();
+        assert!(
+            script.contains(&format!("ACTOR=\"${{BOSS_OPS_ACTOR:-{ACTOR}}}\"")),
+            "ops-runner.sh's default account is not {ACTOR}"
+        );
+        let opener = format!("{name}() {{");
+        let body: Vec<&str> = script
+            .lines()
+            .skip_while(|l| *l != opener)
+            .take_while(|l| *l != "}")
+            .collect();
+        assert!(!body.is_empty(), "ops-runner.sh defines no {name}");
+        format!("{}\n}}\nACTOR={ACTOR}\nHOST_ID={host}\n", body.join("\n"))
+    }
+
+    /// THE PASS SHAPE LIVES THREE TIMES — `acting_id` here, and in
+    /// ops-runner.sh `mint_claimant`, which mints it, and `is_runner_pass`,
+    /// which reads a held execute as this runner's own. They cannot be one
+    /// definition (a jq test on the host, a byte check in the door), so
+    /// each script copy is pinned by RUNNING it against the door (CLAUDE.md
+    /// §9a). A runner whose own-pass test drifted from the door's would
+    /// read its own hold as someone else's, and a claimed-then-silent
+    /// execute would never be recorded as outcome unknown — the failure
+    /// backlog d16c2dae repaired, returned in silence (backlog 043d15a2:
+    /// the two already differed on the pid, `[0-9]+` against 1 to 10).
+    #[test]
+    fn the_runner_s_own_pass_test_answers_as_the_door_does() {
+        for host in ["forge", "boss-gcp"] {
+            for id in KEPT_ON_FORGE.iter().chain(NOT_A_PASS_ON_FORGE.iter()) {
+                let out = std::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(format!(
+                        "{}is_runner_pass \"$1\"\n",
+                        runner_function("is_runner_pass", host)
+                    ))
+                    .arg("is_runner_pass")
+                    .arg(id)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{id:?} on {host}: {out:?}");
+                let runner = String::from_utf8(out.stdout).unwrap();
+                let door_keeps = *id != ACTOR && acting_id(id, host) == *id;
+                assert_eq!(
+                    runner.trim_end() == "yes",
+                    door_keeps,
+                    "is_runner_pass answers {runner:?} for {id:?} on {host}, the door {}",
+                    if door_keeps { "keeps it" } else { "rebinds it" }
+                );
+            }
+        }
+    }
+
+    /// The mint half of the pin above: the script's own `mint_claimant`
+    /// must mint an id the door keeps on its host and no other.
+    #[test]
+    fn the_runner_s_minted_claimant_is_a_pass_the_door_keeps() {
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "{}mint_claimant\n",
+                runner_function("mint_claimant", "forge")
+            ))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let minted = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            minted.starts_with("automation:ops-runner:forge:"),
+            "{minted:?}"
+        );
+        assert_eq!(acting_id(&minted, "forge"), minted);
+        assert_eq!(acting_id(&minted, "boss-gcp"), ACTOR);
     }
 
     #[test]

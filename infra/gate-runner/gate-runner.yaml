@@ -141,13 +141,40 @@ metadata:
     # A verdict lost meanwhile is not gone: its receipt is in the pod log
     # for the Job's 24 h (`kubectl logs job/<gate Job> -c gate`).
     boss.dev/verdict-carrier: pod-log
+    # THE JUDGED-INIT LAYOUT (backlog 3e2c8ddc, with 82ffaff3 folded in;
+    # design b4bf8bba, both questions approved 2026-10-16). The conductor
+    # records a verdict only from a `gate` container that has ENDED, and
+    # the gate used to refresh the warm seed and empty its workspace
+    # before it ended: a green waited 638 s for its own copy on gate-run
+    # 86dd2d48 (2026-10-16), and about eight minutes of a `find -delete`
+    # in uninterruptible I/O on 4aad01a9 (2026-10-17). So `gate` is now a
+    # one-shot INIT container that ends on its verdict, and the
+    # `seed-refresh` container runs the housekeeping after it, bounded and
+    # recorded beside the verdict, never in it. This label tells the
+    # conductor which finished Jobs owe that record (`seed_maintenance`
+    # on the closed gate-run); where the gate's end is read is the pod
+    # spec's to say. It travels with GATE_LAYOUT on the gate and with the
+    # seed-refresh container, and gate_runner_manifests.rs holds all of
+    # them together.
+    #
+    # THE ROLLBACK is this label, GATE_LAYOUT, and the seed-refresh
+    # container deleted, and `gate` moved back under `containers:`. Every
+    # reader takes both layouts, and run.sh without GATE_LAYOUT refreshes
+    # in place through the same seed-refresh.sh, as before.
+    #
+    # WHAT IT DOES NOT CHANGE: the bays. A Job holds its bay until it
+    # FINISHES, helper included, so the verdict arrives earlier and the
+    # next gate does not start any sooner; admitting one while a refresh
+    # runs waits on the node-headroom proof design b4bf8bba's Q2 asks for.
+    boss.dev/gate-layout: judged-init
     boss.dev/branch: $GATE_NAME_HINT
 spec:
   backoffLimit: 0
   # 3h. Room for a lock-wait on the seed (bounded at 15 min), the
   # gate itself (measured ~35 -> ~93 min under five-way concurrency),
-  # and the post-verdict seed refresh — the verdict is reported before
-  # the refresh starts, so a refresh never delays a `--wait`.
+  # and the seed-refresh container after it (two phases, each bounded
+  # at 15 min + 30 s) — the verdict is recorded once the gate container
+  # ends, so the refresh never delays a `--wait`.
   activeDeadlineSeconds: 10800
   ttlSecondsAfterFinished: 86400
   template:
@@ -218,8 +245,10 @@ spec:
         # sat forever reporting neither succeeded nor failed and had to
         # be deleted by hand - `kubectl get job` lied about a gate that
         # had passed. A native sidecar starts before the gate, runs
-        # beside it, and the kubelet tears it down when the gate exits.
-        # Per-pod, so every concurrent gate gets its own database.
+        # beside it, and the kubelet tears it down when the pod's last
+        # regular container exits - since 3e2c8ddc the seed-refresh
+        # helper, so it outlives the gate by the housekeeping. Per-pod,
+        # so every concurrent gate gets its own database.
         - name: postgres
           # From the forge, not docker.io — the last public pull on a
           # gate's path. The pod-level imagePullSecrets (forgejo-registry)
@@ -336,7 +365,23 @@ spec:
           resources:
             requests: {cpu: 250m, memory: 3Gi}
             limits: {cpu: "2", memory: 9Gi}
-      containers:
+        # THE GATE IS A ONE-SHOT INIT CONTAINER (backlog 3e2c8ddc; design
+        # b4bf8bba - see the layout label on the Job). It starts once the
+        # postgres sidecar above has started, exactly as it did as a
+        # regular container, and ends on its verdict: the kubelet then
+        # publishes its exit and termination message under
+        # initContainerStatuses, where the conductor reads it, and starts
+        # the seed-refresh container below. NO restartPolicy here - Always
+        # would make it a sidecar the pod never waits for. A red ends
+        # nonzero, which fails the pod (restartPolicy Never) before the
+        # helper starts, so only a green ever hands its workspace on.
+        #
+        # WHAT THE SCHEDULER RESERVES IS UNCHANGED. A pod's effective
+        # request is the larger of its init phase (this container plus
+        # the sidecars started before it: 4 CPU + 250m, 8Gi + 3Gi, 40Gi
+        # ephemeral) and its regular phase (the helper plus the sidecar),
+        # so the pod holds the gate's reservation until it ends, helper
+        # included - the helper's small request releases nothing.
         - name: gate
           image: 10.20.0.15:3000/david/boss-ci:rust1.96
           # Always, not the default IfNotPresent: :rust1.96 is a mutable
@@ -360,6 +405,12 @@ spec:
             # /dev/termination-log, 4096 bytes, published by the kubelet
             # once the container has ended).
             - {name: GATE_VERDICT_CARRIER, value: pod-log}
+            # The runner's half of the layout label (see there): a carried
+            # green leaves its seed decision as one line in its workspace
+            # for the seed-refresh container and ends, rather than
+            # refreshing and emptying the workspace itself. run.sh keeps
+            # it from every process it starts, like the carrier above.
+            - {name: GATE_LAYOUT, value: judged-init}
             # The BAKED browser, not a per-run PVC download. The keystone
             # bakes chromium + its libs into boss-ci at /opt/ms-playwright;
             # pointing here lets gate.sh's web suite run the mocked
@@ -621,6 +672,65 @@ spec:
             - {name: pgdata, mountPath: /gate-pgdata, readOnly: true}
             - {name: run-script, mountPath: /repo-script}
             - {name: forge-token, mountPath: /etc/forge, readOnly: true}
+      containers:
+        # THE SEED HOUSEKEEPING, after the verdict (backlog 3e2c8ddc, with
+        # 82ffaff3; design b4bf8bba). The kubelet starts it only once the
+        # gate init container has ended 0, so it never runs beside the
+        # checks and never after a red. It runs MAIN's seed-refresh.sh from
+        # the ConfigMap - no branch file as code, no git, no request, no
+        # credential - and takes from the gate one line of a fixed shape
+        # (`refresh <40 hex>` or `skip <word>`). Under the exclusive
+        # non-blocking seed lock it refreshes the seed (staged, then
+        # renamed: never a torn one), then empties this pod's workspace,
+        # each phase bounded by the two values below (Q2: 15 min plus a
+        # 30 s grace, above the 638 s measured on 86dd2d48); a delete stuck
+        # in uninterruptible I/O can outlast any bound, and now delays the
+        # bay, not the verdict. It ALWAYS exits 0 and leaves one record
+        # line as its termination message, which the conductor writes as
+        # `seed_maintenance` on the closed gate-run: housekeeping that went
+        # wrong is stated there and is never a second verdict.
+        - name: seed-refresh
+          image: 10.20.0.15:3000/david/boss-ci:rust1.96
+          # The image the gate just ran in, already on this node (the
+          # gate pulled it with Always): IfNotPresent cannot strand the
+          # housekeeping on a registry that stopped answering mid-gate,
+          # which would hold the bay to activeDeadlineSeconds. boss-ci
+          # carries every tool the refresh used inside the gate (flock,
+          # timeout, cp, find).
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/repo-script/seed-refresh.sh", "maintain"]
+          env:
+            # The record names its Job, and the conductor refuses a record
+            # naming another - the same downward-API value the gate's
+            # trailer names. INLINE like every entry here (brief.rs and
+            # as-gate-uid.sh end a container at a block-style `- name:`).
+            - {name: NATIVE_JOB_NAME, valueFrom: {fieldRef: {fieldPath: "metadata.labels['batch.kubernetes.io/job-name']"}}}
+            # For the workspace mount's subPathExpr: this pod's own
+            # directory, the one the gate wrote.
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            - {name: GATE_SEED_MAINTENANCE_DEADLINE_SECS, value: "900"}
+            - {name: GATE_SEED_MAINTENANCE_GRACE_SECS, value: "30"}
+          # The gate's uid and group: it deletes what the gate wrote and
+          # writes the seed the next gate reads.
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsUser: 65534
+            runAsGroup: 1500
+            capabilities: {drop: ["ALL"]}
+          # A reflink copy and a delete: metadata I/O, little CPU. Small,
+          # and it hides nothing (see the scheduler note on the gate): the
+          # pod keeps the gate's reservation for its whole life. It writes
+          # nothing to its own layer, so it requests no ephemeral-storage.
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          # The seed, THIS pod's workspace, and main's scripts. Not
+          # /gate-runs (every run's workspace), not the database, not the
+          # forge token.
+          volumeMounts:
+            - {name: gate-disk, mountPath: /gate-seed, subPath: seed}
+            - {name: gate-disk, mountPath: /gate-target, subPathExpr: runs/$(POD_NAME)}
+            - {name: run-script, mountPath: /repo-script}
       volumes:
         # THE HISTORY OF THE WORKSPACE VOLUME, kept because each number
         # in it was paid for. Until 2026-09-30 the per-run workspace was

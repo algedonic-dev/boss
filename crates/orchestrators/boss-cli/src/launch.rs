@@ -493,6 +493,16 @@ async fn run_at(run: &str, scratch: &Path, harness: &str) -> Result<()> {
     if !matches!(effort, "low" | "medium" | "high" | "xhigh") {
         bail!("the requested effort is unsupported by this native adapter");
     }
+    // A bounded START's run (design e72dc7c9) owes a receipt naming its
+    // START and manifest, which this adapter cannot record: refused by
+    // name before anything is admitted, never run as if it were legacy.
+    if md.get(crate::start_inputs::RUN_KEY).is_some() {
+        bail!(
+            "native adapters do not implement the {} contract this run was admitted under; no \
+             process started",
+            boss_jobs::execution_inputs::CONTRACT
+        );
+    }
     let content = crate::tenant_publish::service_on_door(&base, "content")?;
     let brief = crate::dispatch_brief::read_at(&http, &content, &actor, &md["brief"]).await?;
     let packet_id = text(md, "packet")?;

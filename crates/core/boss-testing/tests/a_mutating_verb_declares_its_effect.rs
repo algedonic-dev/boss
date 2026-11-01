@@ -62,6 +62,63 @@ const EFFECT_UNREAD: &[&str] = &["publish-github-pr"];
 /// is also checked against its own `FAILED — ` and `REFUSED — ` lines
 /// (see the test).
 const NOT_EFFECTS: &[(&str, &str)] = &[
+    // retire-access-object (backlog 526bedf2), at the head as the entries
+    // below are: the plan-still-holds line, the capture's receipt and the
+    // delete's announcement (none of them a read-back), and the two ways
+    // the read-back refuses to vouch — the object still there, and a
+    // read-back that could not read.
+    (
+        "retire-access-object",
+        "retire-access-object: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — capturing RoleBinding boss-dev/old-runner onto request 0e0e0e0e-0000-4000-8000-0000000000aa before the delete",
+    ),
+    (
+        "retire-access-object",
+        "retire-access-object: captured RoleBinding boss-dev/old-runner (812 bytes, sha256 64897706f647cfe251a61343ad71eea50ef82e6525e7e3e767c683660c90d41d) onto request 0e0e0e0e-0000-4000-8000-0000000000aa as file 0f0f0f0f-0000-4000-8000-00000000000a, read back byte-identical",
+    ),
+    (
+        "retire-access-object",
+        "retire-access-object: deleting RoleBinding boss-dev/old-runner with preconditions.uid=6f1e9b99-0000-4000-8000-0000000000a3",
+    ),
+    (
+        "retire-access-object",
+        "retire-access-object: FAILED — the delete of RoleBinding boss-dev/old-runner was accepted and after 60s uid 6f1e9b99-0000-4000-8000-0000000000a3 is still there, present. Nothing more was done; read it with plan-an-access-object-retirement",
+    ),
+    (
+        "retire-access-object",
+        "retire-access-object: FAILED — deleted, not proven gone: the delete of RoleBinding boss-dev/old-runner was accepted and the read-back is unreadable: Error from server (Forbidden): rolebindings is forbidden",
+    ),
+    // publish-tenant (backlog 1610115d): the plan-still-holds line,
+    // printed before the publish runs.
+    (
+        "publish-tenant",
+        "publish-tenant: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — publishing david/algedonic-llc@0123456789abcdef0123456789abcdef01234567 into prod (take classes)",
+    ),
+    // retire-volume-claim (backlog f36eb7ce, design b4b1c99d), at the
+    // head as the entries below are: the plan-still-holds line, the
+    // capture's receipt and the delete's announcement (none of them a
+    // read-back), and the two ways the read-back refuses to vouch — a
+    // claim held Terminating, and a Longhorn volume that outlived its
+    // Delete reclaim after the claim and the PV went.
+    (
+        "retire-volume-claim",
+        "retire-volume-claim: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — capturing boss-dev/gate-runner-disk onto request 0e0e0e0e-0000-4000-8000-0000000000aa before the delete",
+    ),
+    (
+        "retire-volume-claim",
+        "retire-volume-claim: captured boss-dev/gate-runner-disk (2113 bytes, sha256 64897706f647cfe251a61343ad71eea50ef82e6525e7e3e767c683660c90d41d) onto request 0e0e0e0e-0000-4000-8000-0000000000aa as file 0f0f0f0f-0000-4000-8000-00000000000a, read back byte-identical",
+    ),
+    (
+        "retire-volume-claim",
+        "retire-volume-claim: deleting boss-dev/gate-runner-disk with preconditions.uid=6f1e9b99-0000-4000-8000-0000000000c1",
+    ),
+    (
+        "retire-volume-claim",
+        "retire-volume-claim: FAILED — the delete of boss-dev/gate-runner-disk was accepted and after 180s uid 6f1e9b99-0000-4000-8000-0000000000c1 is still there, being deleted since 2026-10-18T12:00:00Z, held by finalizers kubernetes.io/pvc-protection — something mounted it after the plan was rendered, and Kubernetes holds it until that consumer goes. Nothing more was done; read it with plan-a-volume-claim-retirement",
+    ),
+    (
+        "retire-volume-claim",
+        "retire-volume-claim: FAILED — PersistentVolumeClaim boss-dev/gate-runner-disk uid 6f1e9b99-0000-4000-8000-0000000000c1 is gone (read back: NotFound) and PersistentVolume pvc-11111111-1111-4111-8111-111111111111 is gone, but Longhorn volume pvc-11111111-1111-4111-8111-111111111111 is still there after 180s, present, phase unknown — its replicas are not proven released",
+    ),
     // trim-build-node (backlog 30a6bf39), at the head as the entries
     // below are: the bounds holding and the create's answer (a Job made
     // is not a trim run), and a trim that succeeded whose Job could not
@@ -469,6 +526,18 @@ const NOT_EFFECTS: &[(&str, &str)] = &[
         "node-converge",
         "node-converge: FAILED — Talos accepted the patch on w-1, and after 121s it is NOT proven to carry its declaration: the machine config reads every declared entry MATCH, and the Node was back and is NOT any more: Ready=False, kubelet lease renewTime 2026-09-30T15:00:40.000000Z. The patch stands — read it again with plan-a-node-converge w-1 0123456789abcdef0123456789abcdef01234567",
     ),
+    // The narrowed patch (backlog 9cf1673d, built for 67e98635): its
+    // plan-still-holds line, and the read-back's refusal when an entry
+    // the patch did not carry moved — every applied entry MATCH, which a
+    // read of the applied entries alone would call done.
+    (
+        "node-converge",
+        "node-converge: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — applying infra/cluster/talos/patches/w-1.yaml at 0123456789abcdef0123456789abcdef01234567, narrowed to its 2 entries ABSENT live, to w-1 (10.20.0.14)",
+    ),
+    (
+        "node-converge",
+        "node-converge: FAILED — Talos accepted the patch on w-1, and after 121s it is NOT proven to carry its declaration: every entry the patch applied reads MATCH, and declared entries it did not carry read differently than before the apply: machine.files[/var/local/gate-seed/.declared-by-talos]. The patch stands — read it again with plan-a-node-converge w-1 0123456789abcdef0123456789abcdef01234567",
+    ),
     // move-volume-replica (backlog ab39a34e), above set-volume-replicas'
     // so neither shares the other's line: the plan-still-holds line, the
     // raise Longhorn accepted, the new replica healthy before the old one
@@ -542,6 +611,79 @@ const NOT_EFFECTS: &[(&str, &str)] = &[
     (
         "retire-volume-replica",
         "retire-volume-replica: FAILED — the retirement of pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab is NOT proven after 181s: pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-ae04deab gone, spec.numberOfReplicas 3, robustness degraded, healthy on cp-1, cp-2, cp-3, replicas pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-03f4dac5, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-1269eb6e, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-7c1934ba (planned to remain: pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-03f4dac5, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-1269eb6e, pvc-93e11a6e-6999-41a8-9df3-622f36b7ff56-r-7c1934ba); not healthy: none. Read the volume again with plan-a-volume-replica-retirement",
+    ),
+    // add-longhorn-disk (backlog 493a02b6), at the tail so it shares no
+    // line with any entry above: the plan-still-holds line, Longhorn's
+    // acceptance of the patch (what a verb reading kubectl's exit code
+    // alone would call success), and the read-back's refusal of a disk
+    // Longhorn does not read Ready.
+    (
+        "add-longhorn-disk",
+        "add-longhorn-disk: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — adding Longhorn disk u-longhorn at /var/mnt/longhorn to w-2",
+    ),
+    (
+        "add-longhorn-disk",
+        "add-longhorn-disk: Longhorn accepted disk u-longhorn on w-2 — reading it back (up to 300s: the disk's spec, every other disk unchanged, and Longhorn's Ready and Schedulable for u-longhorn)",
+    ),
+    (
+        "add-longhorn-disk",
+        "add-longhorn-disk: FAILED — Longhorn accepted disk u-longhorn on w-2, and after 301s it is NOT proven: Longhorn reads u-longhorn Ready=False (DiskFilesystemChanged disk u-longhorn has a different file system than the one recorded) and Schedulable=False (DiskFilesystemChanged). The disk stands, and Longhorn schedules nothing to a disk it does not read Ready — read it with node-disk-usage w-2",
+    ),
+    // remove-longhorn-disk (backlog b791c5b4), the add's inverse, below
+    // it at the tail: the plan-still-holds line, the scheduling patch's
+    // acceptance, the second read finding a replica placed in the window,
+    // the removal's acceptance (what a verb reading kubectl's exit code
+    // alone would call success), and the read-back's refusal.
+    (
+        "remove-longhorn-disk",
+        "remove-longhorn-disk: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — removing Longhorn disk u-longhorn at /var/mnt/longhorn from w-2",
+    ),
+    (
+        "remove-longhorn-disk",
+        "remove-longhorn-disk: disk u-longhorn on w-2 is unschedulable — reading what is on it again after 15s, before the removal",
+    ),
+    (
+        "remove-longhorn-disk",
+        "remove-longhorn-disk: FAILED — Longhorn disk u-longhorn at /var/mnt/longhorn on w-2 now holds: replica pvc-77-r-late of volume pvc-77 (diskID 0b0b0b0b-1111-4222-8333-444455556666, diskPath /var/mnt/longhorn). It stays in spec.disks with allowScheduling false, so Longhorn places nothing new there, and nothing was removed — move what is on it, then plan again",
+    ),
+    (
+        "remove-longhorn-disk",
+        "remove-longhorn-disk: Longhorn accepted the removal of disk u-longhorn from w-2 — reading it back (up to 180s: gone from spec.disks and from Longhorn's diskStatus, every other disk unchanged)",
+    ),
+    (
+        "remove-longhorn-disk",
+        "remove-longhorn-disk: FAILED — Longhorn accepted the removal of disk u-longhorn from w-2, and after 181s it is NOT proven: Longhorn still reports status for u-longhorn — read it with node-disk-usage w-2",
+    ),
+    // reregister-longhorn-disk (backlog 36d2c484), the family's third
+    // pair, below the removal at the tail: the plan-still-holds line, the
+    // scheduling patch's acceptance, the removal's acceptance, a stale
+    // status Longhorn never dropped (the record re-added as it was), the
+    // re-add's acceptance (what a verb reading kubectl's exit code alone
+    // would call success), and the read-back's refusal of a record
+    // Longhorn still reads DiskFilesystemChanged.
+    (
+        "reregister-longhorn-disk",
+        "reregister-longhorn-disk: plan 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef still holds — re-registering Longhorn disk default-disk-080400000000 at /var/lib/longhorn on w-2 (recorded diskUUID 6e6e6e6e-1111-4222-8333-444455556666, on the disk 0b0b0b0b-1111-4222-8333-444455556666)",
+    ),
+    (
+        "reregister-longhorn-disk",
+        "reregister-longhorn-disk: record default-disk-080400000000 on w-2 is unschedulable — reading what names it again after 15s, before the removal",
+    ),
+    (
+        "reregister-longhorn-disk",
+        "reregister-longhorn-disk: Longhorn accepted the removal of record default-disk-080400000000 from w-2 — waiting up to 300s for Longhorn to drop its status for default-disk-080400000000 before the record is added back",
+    ),
+    (
+        "reregister-longhorn-disk",
+        "reregister-longhorn-disk: FAILED — Longhorn accepted the removal of record default-disk-080400000000 from w-2, and after 300s it still read: Longhorn still reports status for default-disk-080400000000 (diskUUID 6e6e6e6e-1111-4222-8333-444455556666). The record was added back all the same, so w-2 reads as it did before this run — the re-registration is NOT proven; read it with node-disk-usage w-2",
+    ),
+    (
+        "reregister-longhorn-disk",
+        "reregister-longhorn-disk: Longhorn accepted record default-disk-080400000000 back on w-2 at /var/lib/longhorn — reading it back (up to 300s: the disks as planned, and Longhorn's Ready, Schedulable and diskUUID for default-disk-080400000000)",
+    ),
+    (
+        "reregister-longhorn-disk",
+        "reregister-longhorn-disk: FAILED — Longhorn accepted record default-disk-080400000000 back on w-2, and after 301s it is NOT proven: Longhorn reads default-disk-080400000000 Ready=False (DiskFilesystemChanged record diskUUID does not match the one on the disk) and Schedulable=False (DiskNotReady). The record stands — read it with node-disk-usage w-2",
     ),
 ];
 

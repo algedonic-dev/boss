@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{ClockMode, SimClockParams};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+const ACTIVATION_UNCERTAINTY: &str =
+    "clock activation is bounded by producer capture and audit insertion";
+const INITIAL_UNCERTAINTY: &str = "initial original clock coverage is missing";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClockMappingFact {
     pub schema_version: u32,
     pub revision: String,
@@ -21,7 +25,7 @@ pub struct ClockMappingFact {
     pub complete_group: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClockSpan {
     pub since: DateTime<Utc>,
     pub until: DateTime<Utc>,
@@ -31,7 +35,7 @@ pub struct ClockSpan {
     pub params: Option<SimClockParams>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnknownClockSpan {
     pub since: DateTime<Utc>,
     pub until: DateTime<Utc>,
@@ -42,6 +46,18 @@ pub struct UnknownClockSpan {
 pub struct ClockTimeline {
     pub known: Vec<ClockSpan>,
     pub unknown: Vec<UnknownClockSpan>,
+    /// Already-collected native originals, not inferred from the reduced
+    /// known/unknown spans. Missing on old checkpoints means no witness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcome_originals: Option<OutcomeOriginals>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OutcomeOriginals {
+    facts: Vec<ClockMappingFact>,
+    native_head: Option<String>,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
 }
 
 impl ClockMappingFact {
@@ -128,6 +144,7 @@ impl ClockTimeline {
                     until,
                     reason: "original clock order, wall instants or bounds are invalid".into(),
                 }],
+                outcome_originals: None,
             };
         }
         let mut known = Vec::new();
@@ -136,8 +153,7 @@ impl ClockTimeline {
             barriers.push(UnknownClockSpan {
                 since: fact.captured_at,
                 until: fact.audit_created_at,
-                reason: "clock activation is bounded by producer capture and audit insertion"
-                    .into(),
+                reason: ACTIVATION_UNCERTAINTY.into(),
             });
             let next = facts.get(index + 1);
             let end = next.map_or(until, |f| f.captured_at).min(until);
@@ -206,9 +222,7 @@ impl ClockTimeline {
                 .iter()
                 .rev()
                 .find(|s| s.since <= bounds[0] && bounds[0] < s.until)
-                .map_or("initial original clock coverage is missing", |s| {
-                    s.reason.as_str()
-                });
+                .map_or(INITIAL_UNCERTAINTY, |s| s.reason.as_str());
             if let Some(last) = unknown.last_mut()
                 && last.until == bounds[0]
                 && last.reason == reason
@@ -222,7 +236,173 @@ impl ClockTimeline {
                 });
             }
         }
-        Self { known, unknown }
+        Self {
+            known,
+            unknown,
+            outcome_originals: Some(OutcomeOriginals {
+                facts: facts.to_vec(),
+                native_head: native_head.map(str::to_string),
+                since,
+                until,
+            }),
+        }
+    }
+
+    fn wall_outcome_originals(&self) -> Result<&OutcomeOriginals, String> {
+        let original = self
+            .outcome_originals
+            .as_ref()
+            .ok_or("original clock candidate roster unavailable")?;
+        let first = original
+            .facts
+            .first()
+            .ok_or("original clock candidate roster is empty")?;
+        let last = original
+            .facts
+            .last()
+            .ok_or("original clock candidate roster is empty")?;
+        let unique: std::collections::BTreeSet<_> =
+            original.facts.iter().map(|f| &f.revision).collect();
+        if original.since >= original.until
+            || unique.len() != original.facts.len()
+            || first.previous_revision.is_some()
+            || original.native_head.as_deref() != Some(last.revision.as_str())
+            || original.facts.iter().any(|f| {
+                f.refusal().is_some()
+                    || f.mode != Some(ClockMode::Wall)
+                    || f.params.is_some()
+                    || f.seq <= 0
+                    || f.revision.is_empty()
+                    || f.captured_at > f.audit_created_at
+                    || f.audit_created_at > original.until
+            })
+            || original.facts.windows(2).any(|p| {
+                p[1].previous_revision.as_deref() != Some(p[0].revision.as_str())
+                    || p[1].seq <= p[0].seq
+                    || p[1].captured_at < p[0].audit_created_at
+            })
+        {
+            return Err(
+                "complete nonoverlapping original WALL candidate roster unavailable".into(),
+            );
+        }
+        // This restricted roster has disjoint activation intervals. Validate
+        // its exact reduced spans in one pass, not by re-running the general
+        // timeline builder for each packet/partition.
+        let mut known = Vec::new();
+        let mut unknown: Vec<UnknownClockSpan> = Vec::new();
+        let mut gap = |since: DateTime<Utc>, until: DateTime<Utc>, reason: &str| {
+            let since = since.max(original.since);
+            let until = until.min(original.until);
+            if since < until {
+                if let Some(last) = unknown.last_mut()
+                    && last.until == since
+                    && last.reason == reason
+                {
+                    last.until = until;
+                } else {
+                    unknown.push(UnknownClockSpan {
+                        since,
+                        until,
+                        reason: reason.into(),
+                    });
+                }
+            }
+        };
+        gap(original.since, first.captured_at, INITIAL_UNCERTAINTY);
+        for (index, fact) in original.facts.iter().enumerate() {
+            gap(
+                fact.captured_at,
+                fact.audit_created_at,
+                ACTIVATION_UNCERTAINTY,
+            );
+            let since = fact.audit_created_at.max(original.since);
+            let until = original
+                .facts
+                .get(index + 1)
+                .map_or(original.until, |f| f.captured_at)
+                .min(original.until);
+            if since < until {
+                let (Some(epoch), Some(mode)) = (&fact.epoch, fact.mode) else {
+                    return Err("original candidate mode/epoch unavailable".into());
+                };
+                known.push(ClockSpan {
+                    since,
+                    until,
+                    revision: fact.revision.clone(),
+                    epoch: epoch.clone(),
+                    mode,
+                    params: fact.params,
+                });
+            }
+        }
+        if known != self.known || unknown != self.unknown {
+            return Err("clock spans differ from their conserved original roster".into());
+        }
+        Ok(original)
+    }
+
+    /// Bounds on candidate dates for an outcome proof, NEVER known activation
+    /// or date_at coverage (design16fad Q1/Q2). The first conservative component
+    /// accepts only a complete original WALL chain; all other formulas refuse.
+    pub fn outcome_date_bounds(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        audit_cutoff: i64,
+    ) -> Result<(NaiveDate, NaiveDate), String> {
+        let original = self.wall_outcome_originals()?;
+        let first = original
+            .facts
+            .first()
+            .ok_or("original initial model unavailable")?;
+        if since >= until
+            || since < original.since.max(first.audit_created_at)
+            || until > original.until
+            || original.facts.iter().any(|f| f.seq > audit_cutoff)
+        {
+            return Err("outcome partition is outside its original clock/audit cut".into());
+        }
+        let last = until
+            .checked_sub_signed(chrono::Duration::microseconds(1))
+            .ok_or("outcome partition exceeds supported time")?;
+        if last < since {
+            return Err("outcome partition is below original microsecond precision".into());
+        }
+        // Evaluate the shared original formula, without inserting this
+        // candidate into known coverage or selecting an activation instant.
+        let (Some(epoch), Some(mode)) = (&first.epoch, first.mode) else {
+            return Err("original candidate mode/epoch unavailable".into());
+        };
+        let candidate = ClockSpan {
+            since,
+            until,
+            revision: first.revision.clone(),
+            epoch: epoch.clone(),
+            mode,
+            params: first.params,
+        };
+        Ok((candidate.date_at(since)?, candidate.date_at(last)?))
+    }
+
+    /// Fingerprint only the conserved prefix when comparing checkpoints. Later
+    /// complete originals must not rewrite an already witnessed prefix merely
+    /// by changing the current native-head pointer. This is not a new head.
+    pub fn outcome_evidence_prefix(
+        &self,
+        until: DateTime<Utc>,
+    ) -> Option<(bool, Vec<ClockMappingFact>)> {
+        self.outcome_originals.as_ref().map(|original| {
+            (
+                self.wall_outcome_originals().is_ok(),
+                original
+                    .facts
+                    .iter()
+                    .filter(|f| f.captured_at < until)
+                    .cloned()
+                    .collect(),
+            )
+        })
     }
 
     pub fn date_at(&self, wall: DateTime<Utc>) -> Result<NaiveDate, String> {

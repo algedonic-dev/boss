@@ -1,7 +1,7 @@
 import { expect, test, type Page } from './_test';
-import { installSmokeMocks, YARD_BORDERS, YARD_REGIONS } from './_smokeMocks';
+import { installSmokeMocks, YARD_BORDERS, YARD_REGIONS, YARD_ROUTES, isPageWrite } from './_smokeMocks';
 import { TERRITORIES } from '../../src/it/yard/world';
-import { BORDERS } from '../fixtures/yard';
+import { BORDERS, ROUTES, routesPayload } from '../fixtures/yard';
 
 const wait = {
   packet: 'synthetic-packet', owner: 'agent-reviewer', condition_owner: 'world',
@@ -13,6 +13,10 @@ const wait = {
 
 async function mocks(page: Page, state: 'attention' | 'troubled') {
   await installSmokeMocks(page);
+  await page.route(YARD_ROUTES, route => route.fulfill({ json: routesPayload([
+    ...ROUTES,
+    { from: 'dock', to: 'track', declared: false, sources: [{ source: 'observed', moves: 1, last_at: '2026-10-15T13:00:00Z' }] },
+  ]) }));
   await page.route(YARD_REGIONS, route => route.fulfill({ json: {
     now: '2026-10-15T13:00:00Z', window_hours: 24,
     regions: TERRITORIES.map(({ name }) => ({ name, count: 1, trend: {},
@@ -47,14 +51,14 @@ test('opening the inline crossing shows its recorded owner and next check withou
   await mocks(page, 'attention');
   const writes: string[] = [];
   page.on('request', request => {
-    if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method()) && new URL(request.url()).pathname.startsWith('/api/')) writes.push(request.url());
+    if (isPageWrite(request.method(), new URL(request.url()).pathname)) writes.push(request.url());
   });
   await page.goto('/it');
-  await expect(page.locator('.crossing[data-crossing="dock→track"]')).toBeVisible();
+  await expect(page.locator('[data-section-link="dock→track"]')).toHaveAttribute('href', '/it?at=dock-%3Etrack');
   // Surface-open telemetry belongs to navigation; measure the crossing action.
   writes.length = 0;
-  await page.locator('.crossing[data-crossing="dock→track"]').click();
-  const crossing = page.locator('.crossing-panel');
+  await page.locator('[data-section-link="dock→track"]').press('Enter');
+  const crossing = page.locator('[data-map-panel]');
   await expect(crossing).toContainText(wait.owner);
   await expect(crossing).toContainText(wait.next_check_at);
   expect(writes).toEqual([]);

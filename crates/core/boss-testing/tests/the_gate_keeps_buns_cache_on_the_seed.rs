@@ -26,9 +26,21 @@
 //! measured by run 797f3b9b) that nothing reclaims — harmless in a
 //! per-run HOME, unbounded on the seed. The sweep takes entries whose
 //! CTIME is older than the gate Job can live, and the tests below hold
-//! that age to the Job's deadline, show it removes only stale entries,
-//! and show a directory with an old mtime and a fresh ctime — what
-//! RENAME_EXCHANGE leaves while another install may read it — is kept.
+//! that age an hour past the Job's deadline, show it removes only stale
+//! entries and never .tmp itself, show a directory with an old mtime and
+//! a fresh ctime — what RENAME_EXCHANGE leaves on ext4 while another
+//! install may read it (xfs stamps the mtime too) — is kept, and show it
+//! counts what it removed rather than what it matched (review 40731bb5,
+//! N1/N2/N4).
+//!
+//! AND IT REFUSES A PLANTED ROOT (backlog 822223ec, review 40731bb5 N5).
+//! Gates run branch code as the gate uid with /gate-seed writable, so a
+//! branch can leave a symlink or a file where a cache root should be. A
+//! live link redirected the next gate's cache and its sweep; a dangling
+//! one, or a file, killed every later gate at `mkdir -p` ("File exists",
+//! rc 1) — both measured against origin/main@e2ee2f8f on a scratch seed.
+//! The block now replaces anything but a real directory, loudly, and
+//! never follows it.
 
 use boss_testing::repo_root;
 use std::path::Path;
@@ -190,23 +202,71 @@ fn gate_deadline_seconds() -> u64 {
         .unwrap_or_else(|e| panic!("activeDeadlineSeconds `{value}` is not a number: {e}"))
 }
 
+/// The gate pod's terminationGracePeriodSeconds — how long its processes
+/// may still run after the deadline kill — read from its manifest, or
+/// Kubernetes' default of 30 s when the manifest declares none.
+fn gate_kill_grace_seconds() -> u64 {
+    let path = repo_root().join("infra/gate-runner/gate-runner.yaml");
+    let yaml =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    yaml.lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("terminationGracePeriodSeconds:"))
+        .map(|v| {
+            v.trim().parse().unwrap_or_else(|e| {
+                panic!(
+                    "terminationGracePeriodSeconds `{}` is not a number: {e}",
+                    v.trim()
+                )
+            })
+        })
+        .unwrap_or(30)
+}
+
+/// The margin the sweep's age keeps past the Job's deadline.
+const SWEEP_MARGIN_SECONDS: u64 = 3600;
+
 /// NO LIVE INSTALL CAN OWN WHAT THE SWEEP REMOVES. A .tmp entry may be
 /// an extract in progress, or a directory RENAME_EXCHANGE swapped out
 /// while another install still copies from it — and a gate's install
-/// lives no longer than its Job. So the sweep's age must exceed the
-/// Job's deadline: two facts in two files, held apart here so neither
-/// moves alone (a deadline raised past four hours would let a sweep
-/// delete under a running gate).
+/// lives no longer than its Job, plus the grace its pod is given to die.
+/// So the sweep's age must sit a full hour past the Job's deadline, and
+/// the hour must cover that grace: facts in two files, held apart here
+/// so neither moves alone (a deadline raised past three hours would let
+/// a sweep delete under a running gate).
+///
+/// TIGHTENED (review 40731bb5, N4): this asked only `age * 60 >
+/// deadline`, so a 181-minute age passed — sixty seconds past the
+/// deadline, thirty past the kill's grace, and no margin for anything
+/// else. The hour is the margin run.sh states for its 240.
+fn sweep_age_is_safe(minutes: u64, deadline: u64, grace: u64) -> bool {
+    minutes * 60 >= deadline + SWEEP_MARGIN_SECONDS && grace < SWEEP_MARGIN_SECONDS
+}
+
 #[test]
 fn the_sweep_waits_longer_than_any_gate_can_run() {
     let minutes = sweep_minutes(&block());
     let deadline = gate_deadline_seconds();
+    let grace = gate_kill_grace_seconds();
     assert!(
-        minutes * 60 > deadline,
+        sweep_age_is_safe(minutes, deadline, grace),
         "the bun .tmp sweep removes entries older than {minutes} min, but a gate \
-         may run {deadline} s (gate-runner.yaml activeDeadlineSeconds) — a sweep \
-         could delete a directory a live install is still copying out of"
+         may run {deadline} s (gate-runner.yaml activeDeadlineSeconds) and its pod \
+         {grace} s more to die; the sweep must wait a full hour past the deadline, \
+         and that hour must cover the grace — or a sweep could delete a directory \
+         a live install is still copying out of"
     );
+}
+
+/// The control for the predicate above: the 181-minute age the old pin
+/// passed fails it, the block's own 240 passes it, and a kill grace the
+/// hour does not cover fails it — so the pin cannot be loosened back to
+/// `> deadline` unnoticed.
+#[test]
+fn a_sweep_a_minute_past_the_deadline_is_too_young() {
+    assert!(!sweep_age_is_safe(181, 10800, 30));
+    assert!(sweep_age_is_safe(240, 10800, 30));
+    assert!(!sweep_age_is_safe(240, 10800, 3600));
 }
 
 /// THE SWEEP REMOVES ONLY STALE .tmp ENTRIES. bun's .tmp under the
@@ -217,10 +277,19 @@ fn the_sweep_waits_longer_than_any_gate_can_run() {
 /// waiting: they are created, the test sleeps past a threshold of six
 /// seconds, and the block runs with its `-cmin +N` rewritten to that
 /// threshold (`+0.1` minutes; GNU find takes a fraction). The fresh
-/// entries are made by the script's own prelude, milliseconds before the
-/// sweep, and one of them has a two-day-old MTIME, as a directory swapped
-/// out by RENAME_EXCHANGE does. The block runs once AS WRITTEN first: at
-/// its real age nothing that young is touched.
+/// entries are made fresh by the script's own prelude, milliseconds
+/// before the sweep, and one of them is given a two-day-old MTIME, as a
+/// directory swapped out by RENAME_EXCHANGE has on ext4 (xfs, the gate
+/// volume, stamps its mtime as well — review 40731bb5, N1 — so this is
+/// the case where -mmin and -cmin disagree). The block runs once AS
+/// WRITTEN first: at its real age nothing that young is touched.
+///
+/// .TMP ITSELF IS OLD AND MUST SURVIVE (review 40731bb5, N4: dropping
+/// `-mindepth 1` passed every pin). The fresh entries are CREATED
+/// before the wait and only TOUCHED after it — a touch stamps the
+/// entry's ctime and leaves its parent's alone — so .tmp's own ctime is
+/// as old as the stale entries', and a sweep that reached depth 0 would
+/// remove .tmp and every fresh entry in it.
 #[test]
 fn the_sweep_removes_only_stale_tmp_entries() {
     let dir = boss_testing::scratch_dir("gate-bun-cache-sweep");
@@ -236,12 +305,22 @@ fn the_sweep_removes_only_stale_tmp_entries() {
     boss_testing::write_file(&old_dir.join("dist/index.js"), "old\n");
     let old_gyp = tmp.join(".node-gyp-old");
     boss_testing::create_dir(&old_gyp);
+    // Made now, made fresh after the wait by a touch (see above).
+    let fresh_dir = tmp.join("extract-in-progress");
+    boss_testing::create_dir(&fresh_dir);
+    let fresh_file = tmp.join("fresh-manifest.tmp");
+    boss_testing::write_file(&fresh_file, "");
+    // Just swapped out by RENAME_EXCHANGE: its mtime is the old copy's
+    // (two days here), its ctime is now. An -mmin sweep would take it
+    // while another install may still be copying out of it.
+    let swapped = tmp.join("just-swapped-out");
+    boss_testing::create_dir(&swapped);
 
     // AS WRITTEN (240 minutes): seconds-old entries all survive.
     let (code, stdout, stderr) = run_block(&seed, "", "", &dir);
     assert_eq!(code, 0, "the block failed:\n{stdout}\n{stderr}");
     assert!(
-        old_dir.is_dir() && old_gyp.is_dir() && package.is_dir(),
+        old_dir.is_dir() && old_gyp.is_dir() && package.is_dir() && swapped.is_dir(),
         "the sweep as written removed entries seconds old — a live install could \
          own them; stdout:\n{stdout}"
     );
@@ -256,16 +335,9 @@ fn the_sweep_removes_only_stale_tmp_entries() {
     let minutes = sweep_minutes(&as_written);
     let aged = as_written.replacen(&format!("-cmin +{minutes}"), "-cmin +0.1", 1);
     assert_ne!(aged, as_written, "could not rewrite the sweep's age");
-    let fresh_dir = tmp.join("extract-in-progress");
-    let fresh_file = tmp.join("fresh-manifest.tmp");
-    // Just swapped out by RENAME_EXCHANGE: its mtime is the old copy's
-    // (two days here), its ctime is now. An -mmin sweep would take it
-    // while another install may still be copying out of it.
-    let swapped = tmp.join("just-swapped-out");
     let prelude = format!(
-        "mkdir -p '{}' '{}' && : > '{}' && touch -d '2 days ago' '{}'",
+        "touch '{}' '{}' && touch -d '2 days ago' '{}'",
         fresh_dir.display(),
-        swapped.display(),
         fresh_file.display(),
         swapped.display()
     );
@@ -275,6 +347,11 @@ fn the_sweep_removes_only_stale_tmp_entries() {
     assert!(
         !old_dir.exists() && !old_gyp.exists(),
         "the stale .tmp entries survived the sweep; stdout:\n{stdout}"
+    );
+    assert!(
+        tmp.is_dir(),
+        "the sweep removed .tmp itself — its ctime is old, so a sweep without \
+         `-mindepth 1` takes it and every fresh entry inside; stdout:\n{stdout}"
     );
     assert!(
         fresh_dir.is_dir() && fresh_file.is_file(),
@@ -295,6 +372,156 @@ fn the_sweep_removes_only_stale_tmp_entries() {
     assert!(
         stdout.contains("(swept 2 stale .tmp entries)"),
         "the log must count what the sweep removed; stdout:\n{stdout}"
+    );
+}
+
+/// The block with its sweep rewritten to take EVERY .tmp entry it can
+/// reach (`-cmin -60`: changed within the hour), so a test can ask what
+/// the sweep reaches without waiting for anything to age.
+fn sweeping_everything() -> String {
+    let as_written = block();
+    let minutes = sweep_minutes(&as_written);
+    let all = as_written.replacen(&format!("-cmin +{minutes}"), "-cmin -60", 1);
+    assert_ne!(all, as_written, "could not rewrite the sweep's age");
+    all
+}
+
+/// True when `path` is a real directory — not a link to one.
+fn real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
+}
+
+/// A PLANTED LINK AT A CACHE ROOT IS REPLACED, NEVER FOLLOWED (backlog
+/// 822223ec, N5). Two shapes, both measured against origin/main on a
+/// scratch seed before this test existed: a DANGLING link at the cargo
+/// root made the block die at `mkdir -p` ("File exists", rc 1) — every
+/// later gate, until a human removed it — and a LIVE link at bun's root
+/// sent the gate's cache and its .tmp sweep into the directory it named,
+/// whose stale entry the sweep then removed. Here the sweep is set to
+/// take everything it reaches, so the decoy's entry survives only if
+/// the block never went through the link.
+#[test]
+fn a_planted_link_at_a_cache_root_is_replaced_and_never_followed() {
+    let dir = boss_testing::scratch_dir("gate-cache-root-linked");
+    let seed = dir.join("seed");
+    boss_testing::create_dir(&seed);
+    let decoy = dir.join("decoy");
+    let victim = decoy.join(".tmp/victim");
+    boss_testing::create_dir(&victim);
+    std::os::unix::fs::symlink(dir.join("nowhere"), seed.join("cargo")).expect("plant cargo link");
+    std::os::unix::fs::symlink(&decoy, seed.join("bun-install-cache")).expect("plant bun link");
+
+    let (code, stdout, stderr) = run_text(&sweeping_everything(), &seed, "", "", &dir);
+    assert_eq!(
+        code, 0,
+        "a planted link at a cache root killed the block — every later gate \
+         would die here:\n{stdout}\n{stderr}"
+    );
+    for root in ["cargo", "bun-install-cache"] {
+        let path = seed.join(root);
+        assert!(
+            real_dir(&path),
+            "{} is still not a real directory after the block; stdout:\n{stdout}",
+            path.display()
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l.starts_with("gate-runner: REFUSED ")
+                    && l.contains(&*path.to_string_lossy())
+                    && l.contains("symbolic link")),
+            "the block replaced {} without saying so on the log; stdout:\n{stdout}",
+            path.display()
+        );
+    }
+    assert!(
+        victim.is_dir(),
+        "the sweep went through the planted link and removed an entry in the \
+         directory it named; stdout:\n{stdout}"
+    );
+}
+
+/// A PLANTED FILE IS REPLACED TOO, AND SO IS A PLANTED .tmp. A regular
+/// file at the cargo root failed `mkdir -p` the same way a dangling link
+/// did; a link at bun's `.tmp` — the directory the sweep reads and bun
+/// unpacks into — would send both somewhere else.
+#[test]
+fn a_planted_file_at_a_cache_root_or_its_tmp_is_replaced() {
+    let dir = boss_testing::scratch_dir("gate-cache-root-filed");
+    let seed = dir.join("seed");
+    let cache = seed.join("bun-install-cache");
+    boss_testing::create_dir(&cache);
+    boss_testing::write_file(&seed.join("cargo"), "planted\n");
+    let decoy = dir.join("decoy");
+    let victim = decoy.join("victim");
+    boss_testing::create_dir(&victim);
+    std::os::unix::fs::symlink(&decoy, cache.join(".tmp")).expect("plant .tmp link");
+
+    let (code, stdout, stderr) = run_text(&sweeping_everything(), &seed, "", "", &dir);
+    assert_eq!(
+        code, 0,
+        "a planted file at a cache root killed the block:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        real_dir(&seed.join("cargo")) && real_dir(&cache.join(".tmp")),
+        "the planted cargo file or .tmp link is still in place; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("REFUSED {}/cargo", seed.display()))
+            && stdout.contains("regular file"),
+        "the replaced cargo file is not named on the log; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("REFUSED {}/.tmp", cache.display())),
+        "the replaced .tmp link is not named on the log; stdout:\n{stdout}"
+    );
+    assert!(
+        victim.is_dir(),
+        "the sweep went through the planted .tmp link; stdout:\n{stdout}"
+    );
+}
+
+/// THE SWEEP COUNTS WHAT IT REMOVED, AND KEEPS WHY IT COULD NOT (review
+/// 40731bb5, N2). It counted find's `-print` ahead of `-exec rm` with
+/// stderr discarded, so an entry rm refused was logged as swept and
+/// stayed, silently. Every gate is uid 65534 today, so a real refusal
+/// cannot be staged here (this pod's tests may run as root, which rm
+/// never refuses): an `rm` on PATH refuses the one entry instead, as
+/// rm reports a permission it lacks.
+#[test]
+fn the_sweep_counts_removals_and_keeps_the_error() {
+    let dir = boss_testing::scratch_dir("gate-bun-cache-stuck");
+    let seed = dir.join("seed");
+    let tmp = seed.join("bun-install-cache/.tmp");
+    let gone = tmp.join("removable");
+    let stuck = tmp.join("stuck-entry");
+    boss_testing::create_dir(&gone);
+    boss_testing::create_dir(&stuck);
+    let bin = dir.join("bin");
+    boss_testing::create_dir(&bin);
+    // Like rm refused one operand: removes the rest, names the one, exits 1.
+    boss_testing::write_exec(
+        &bin.join("rm"),
+        "#!/bin/bash\nkeep=(); rc=0\nfor a in \"$@\"; do case \"$a\" in *stuck-entry*) \
+         echo \"rm: cannot remove '$a': Permission denied\" >&2; rc=1;; \
+         *) keep+=(\"$a\");; esac; done\n/bin/rm \"${keep[@]}\" || rc=1\nexit $rc\n",
+    );
+    let prelude = format!("PATH='{}':\"$PATH\"", bin.display());
+
+    let (code, stdout, stderr) = run_text(&sweeping_everything(), &seed, &prelude, "", &dir);
+    assert_eq!(code, 0, "a refused rm failed the gate:\n{stdout}\n{stderr}");
+    assert!(
+        !gone.exists() && stuck.is_dir(),
+        "the shim did not stage one removal and one refusal; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(swept 1 stale .tmp entries, 1 could not be removed"),
+        "the log must count the removal and the refusal apart, not report the \
+         refused entry as swept; stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("stuck-entry") && stderr.contains("Permission denied"),
+        "rm's own error was discarded; stderr:\n{stderr}"
     );
 }
 
@@ -320,7 +547,9 @@ fn without_the_seed_both_caches_fall_back_to_the_workspace() {
     );
     assert_eq!(value(&stdout, "CARGO_HOME"), "/gate-target/cargo");
     assert!(
-        value(&stdout, "MKDIR").contains(cache),
+        stdout
+            .lines()
+            .any(|l| l.starts_with("MKDIR=") && l.contains(cache)),
         "the fallback must still create bun's cache directory; stdout:\n{stdout}"
     );
     assert!(

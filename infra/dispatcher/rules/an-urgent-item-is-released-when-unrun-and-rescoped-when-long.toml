@@ -1,0 +1,68 @@
+# An urgent item nothing is executing is released; one that runs for
+# days without converging asks for a finish line (backlog 9788e22d).
+#
+# THE CASE. Measured 2026-10-18 (agent-claude, at David's prompt "it
+# has taken weeks now to actually fix these urgent issues"): of 263
+# urgent items delivered in 45 days the median took 0.32 days and the
+# p90 3.6, but four open ones were 12 to 23 days old. Three had run
+# many builder runs and landed several cars each without closing
+# (2710c8fc ~89 runs and 7 cars, b3071bf4 ~46 runs and 5 landed,
+# e1943ef0 ~28 runs and 2 landed) — nothing checkable said when they
+# were done. One (d4c0cd2d) sat claimed twelve days with no car and no
+# run.
+#
+# WHY NEITHER NEIGHBOUR COVERED IT, AND STILL SHOULD NOT.
+#   - `agent-held-real-work-is-watched-hourly` leaves `backlog-item`
+#     undeclared on purpose: ~200 standard builds are days old, and an
+#     alarm per build is the flat list shouted. Its handler alarms on a
+#     step's wait, and an urgent build whose car is waiting on its train
+#     waits honestly — 13 of the 16 runless urgent claims measured on
+#     2026-10-18 had a run that ended `gated`, its car in flight. So the
+#     scope here is PRIORITY, and the condition is not the wait.
+#   - `an-abandoned-step-is-reclaimed-when-its-run-died` frees a step
+#     only when the run named on it was recorded `died`. A claim that
+#     never had a run is left alone there, and so is one whose run ended
+#     `refused` (the hand that wrote it is present). d4c0cd2d's last run
+#     ended `refused` at 12:19Z on 2026-10-18 and its step was still
+#     claimed at 17:53Z.
+#
+# THE ARGS ARE THE DECLARATION, as registry data:
+#   - priorities: `urgent,emergency`. Nothing else is read — a standard
+#     item is never released and never alarmed, and the handler's test
+#     holds this shipped row to exactly these two.
+#   - release_after_hours, 6: an agent-claimed `build` with no open
+#     agent-run and no car in flight (open, not landed), and nothing on
+#     the item, its runs or its cars moved for six hours, goes back to
+#     `ready` and nobody's, its stale `agent_run` edge cleared and the
+#     evidence under `released_unrun`. Six matches the death rule's
+#     total (four of silence, two more to reclaim); a died run's own
+#     close is movement here, so that rule frees its step first.
+#   - rescope_after_days, 3, and rescope_runs_over, 10: an item open
+#     past three days (the measured p90 was 3.6) that has landed a car,
+#     or carried more than ten runs, files ONE urgent alarm asking for
+#     `finish_line` metadata instead of another run. Once per item, ever,
+#     and never for an item that already states one.
+#
+# HOURLY: the release bound is hours, and a daily read would let a dead
+# claim sit up to a day past it — the handler refuses a firing with no
+# `_at` for that reason.
+[[rule]]
+name = "an-urgent-item-is-released-when-unrun-and-rescoped-when-long"
+why = """
+A TIMER over a THRESHOLD, the standing exemption: both conditions are
+things that did NOT happen — no run opened for a claimed urgent build,
+no item closed after days of runs and landed cars — and no event says
+either. A Workflow definition can say who a step is for and what it
+requires at done; it cannot notice that nobody is doing it, or that
+doing it keeps not finishing it. Measured 2026-10-18 (backlog
+9788e22d): four urgent items 12 to 23 days old, three of them across
+28 to 89 runs and 2 to 7 landed cars, one claimed twelve days with no
+run. It adds no routing beyond the release, which returns a claimed
+step to the state a claim takes it from, and the alarm refuses and
+dispatches nothing.
+"""
+version = 1
+schedule = { cadence = "hourly", anchor_date = "2026-10-18" }
+[[rule.do]]
+handler = "jobs.urgent_item_watch"
+args = { priorities = "\"urgent,emergency\"", release_after_hours = "6", rescope_after_days = "3", rescope_runs_over = "10" }

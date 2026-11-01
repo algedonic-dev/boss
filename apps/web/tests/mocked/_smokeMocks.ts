@@ -263,8 +263,11 @@ export const JOBS_ASSIGNMENTS = /\/api\/jobs\/assignments(\?|$)/;
 export const JOBS_KINDS = /\/api\/jobs\/kinds$/;
 export const YARD_STATUS = /\/api\/yard\/status$/;
 export const YARD_REGIONS = /\/api\/yard\/regions(\?|$)/;
+export const YARD_FLOW = /\/api\/yard\/flow(\?|$)/;
 export const YARD_BORDERS = /\/api\/yard\/borders(\?|$)/;
 export const YARD_ROUTES = /\/api\/yard\/routes(\?|$)/;
+export const YARD_MOVES = /\/api\/yard\/moves(\?|$)/;
+export const YARD_MOVES_STREAM = /\/api\/yard\/moves\/stream(\?|$)/;
 export const WORKFLOW_DETAIL = /\/api\/workflows\/[^/]+$/;
 export const DISPATCHER_RULES = /\/api\/dispatcher\/rules$/;
 export const GATEWAY_PERF = /\/api\/gateway\/perf$/;
@@ -525,7 +528,7 @@ export const AUDIT_STATS = {
   ],
 } as const;
 export const OBJECT_ENDPOINTS: ReadonlyArray<RegExp> = [
-  JOBS_LIVE, JOBS_SUMMARY, JOBS_ASSIGNMENTS, YARD_STATUS, YARD_REGIONS, YARD_BORDERS, YARD_ROUTES, WORKFLOW_DETAIL, DISPATCHER_RULES, GATEWAY_PERF,
+  JOBS_LIVE, JOBS_SUMMARY, JOBS_ASSIGNMENTS, YARD_STATUS, YARD_REGIONS, YARD_FLOW, YARD_BORDERS, YARD_ROUTES, YARD_MOVES, YARD_MOVES_STREAM, WORKFLOW_DETAIL, DISPATCHER_RULES, GATEWAY_PERF,
   MARKETING_ASSET_DETAIL, VIEW_RESULTS, VIEW_SOURCES, SHIPMENT_DETAIL, EMPLOYEE_DETAIL, EVENTS_STATS, RISK_SCORES, EVENTS_STREAM,
   COMMERCE_SUMMARY, AP_AGING, LEDGER_STATEMENTS, ASSETS_SUMMARY,
   STATIONS_LOAD, STATIONS_FLOW, QUEUE_AGE, DESIGN_STATION_QUEUES,
@@ -637,6 +640,7 @@ export async function installApiFloor(page: Page): Promise<void> {
   // crawl walks every door. Under the `[]` catch-all the page would
   // render a failure line (a list where the map is due is a malformed
   // read), which is right for an outage and wrong for the empty leg.
+  await page.route(YARD_FLOW, (r) => json(r, { state: 'ready', as_of: '2026-09-03T12:00:00Z', window_hours: 24, why: null }));
   await page.route(YARD_REGIONS, (r) =>
     json(r, {
       window_hours: 24,
@@ -668,6 +672,13 @@ export async function installApiFloor(page: Page): Promise<void> {
   // exactly what this read serves, so the empty leg answers the shared
   // fixture's — the live shape of 2026-09-26 — rather than a failed read.
   await page.route(YARD_ROUTES, (r) => json(r, routesPayload()));
+  // Live motion is the default after graduation. Its empty leg has a
+  // real baseline, not the catch-all's malformed bare array.
+  await page.route(YARD_MOVES, (r) => json(r, { moves: [], latest_seq: 0 }));
+  await page.route(YARD_MOVES_STREAM, (r) => r.fulfill({
+    contentType: 'text/event-stream',
+    body: 'retry: 3600000\nevent: resync\ndata: {"frame":"resync","seq":0,"reason":"empty fixture baseline"}\n\n',
+  }));
 
   // The other object reads, empty; the detail reads, absent.
   await page.route(DISPATCHER_RULES, (r) => json(r, { rules: [], handler_emits: {}, system_edges: [] }));

@@ -1,0 +1,12 @@
+{
+  "about": "MUTATING — terminate only the one selected oldest eligible original client session in a fresh fixed-database plan approved by David's passkey, preserving all deferred sessions. Re-render the complete plan before signaling; recheck database lifetime and complete cluster-wide Pod/node ownership and Pod CIDR eligibility. Fixed SQL rechecks PID, backend_start, query_start, client_addr, client_port, database, server lifetime, client backend type, active state and 15-minute age. Native calls and each subprocess are strictly bounded; evidence publication has an independent one-call budget. Print attempted/confirmed identities and unknown effect before upload, even if publication fails. Read back original session absence; signaling or Job exit alone is not proof. No manual SQL, free target, configuration change, grants, new credentials, cancel-by-name or promise of latency recovery. Pod census and PostgreSQL signaling are separate resources, not an atomic IP lease.",
+  "hosts": ["forge"],
+  "requires_approval": true,
+  "plan_verb": "plan-orphaned-client-backends",
+  "approvers": ["emp-david"],
+  "argv": ["infra/forge/orphan-backends.sh", "{1}"],
+  "params": [{"name": "plan_sha256", "pattern": "^[0-9a-f]{64}$"}],
+  "capture": "separate-streams",
+  "timeout": 190,
+  "effect": "^orphan-backends: approved original client sessions absent — effect read back$"
+}

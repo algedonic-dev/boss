@@ -255,6 +255,89 @@ fn queued_for(run: &Value, now: chrono::DateTime<chrono::Utc>) -> String {
         .unwrap_or_default()
 }
 
+/// THE QUEUED FOR A SLOT LANE LISTS GATE-RUN PACKETS, NOT PROCESSES
+/// (backlog e1943ef0). It used to read "N place(s) held by a live
+/// process" and list only places a `--wait` loop was still beating for,
+/// while packet-owned requests sat in a second RESIDENT lane — so the
+/// queue's own surface said the place belonged to a process, the defect
+/// the item names. Since delivery policy v10 every new `boss gate` is a
+/// packet the conductor's supervisor launches, and a waiter is only a
+/// reader any process can re-attach. One lane, one line per packet, in
+/// the line's own order: the yard's positions (`boss_jobs::yard::
+/// queued_gates`, the one definition both kinds already share), a run the
+/// yard did not place last. A legacy place still in line (the drain after
+/// the cutover) says so on its line; one nobody beats any more is not in
+/// line at all — it is the ABANDONED lane's, as before. A packet-owned
+/// request whose position the yard could not state says that, never
+/// a guessed number.
+fn queued_lane(
+    waiting: &[&Value],
+    in_line: &[String],
+    yard: Option<&[boss_jobs::yard::QueuedGate]>,
+    trains: &[Value],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let id = |g: &Value| {
+        g.get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let durable = |g: &Value| {
+        g.get("metadata")
+            .is_some_and(boss_jobs::gate_reservation::durable_presence)
+    };
+    let mut rows: Vec<(&Value, Option<&boss_jobs::yard::QueuedGate>)> = waiting
+        .iter()
+        .copied()
+        .filter(|g| durable(g) || in_line.contains(&id(g)))
+        .map(|g| {
+            let packet = id(g);
+            (
+                g,
+                yard.and_then(|line| line.iter().find(|q| q.packet_id == packet)),
+            )
+        })
+        .collect();
+    let placed = |q: Option<&boss_jobs::yard::QueuedGate>| {
+        q.map(|q| q.position).filter(|position| *position > 0)
+    };
+    rows.sort_by_key(|(g, q)| {
+        (
+            placed(*q).unwrap_or(i32::MAX),
+            in_line
+                .iter()
+                .position(|held| *held == id(g))
+                .unwrap_or(usize::MAX),
+        )
+    });
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![format!(
+        "\n  QUEUED FOR A SLOT — {} gate-run packet(s), in line order; a waiter only reads: \
+         re-attach any of them with `boss gate <packet> --wait`",
+        rows.len()
+    )];
+    for (g, q) in rows {
+        let place = placed(q).map_or_else(|| "#?".to_string(), |p| format!("#{p}"));
+        let owner = match (durable(g), placed(q)) {
+            (true, Some(_)) => "",
+            (true, None) => {
+                " — position UNKNOWN: its original acceptance receipt or source is unreadable"
+            }
+            (false, _) => " — legacy place: its --wait process holds it until it launches",
+        };
+        out.push(format!(
+            "    {place}  {}  packet {}{}{owner}",
+            queued_lane_line(g, trains),
+            id(g),
+            queued_for(g, now)
+        ));
+    }
+    out
+}
+
 /// Branches whose base has fallen behind `origin/main`. Each pair is
 /// (branch, exit code of `git merge-base --is-ancestor origin/main
 /// origin/<branch>`), read through the ONE definition of that code
@@ -314,7 +397,7 @@ fn residue_cars<'a>(
 /// `boss_jobs::car::is_parked` — the predicate `boss park`, the auto-park
 /// handler and the conductor's own dock count already share — plus the
 /// `status=open` filter that predicate deliberately leaves to its callers.
-/// "Is there a hold" is `boss_jobs::stranded::hold_reason`, where `null`,
+/// "Is there a hold" is `boss_jobs::stranded::marked`, where `null`,
 /// `false` and `""` are NO marker: a released hold boards again, and a
 /// `truthy`/`is_some` reading of it would strand the car here forever.
 /// Read off the car packets orient has already fetched — no second read.
@@ -328,22 +411,28 @@ fn residue_cars<'a>(
 fn held_dock_cars(cars: &[Value]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = cars
         .iter()
-        .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
-        .filter(|c| boss_jobs::car::is_parked(c))
-        .filter_map(|c| {
-            let hold = boss_jobs::car::find_step(c, "review", boss_jobs::car::REVIEW)
-                .and_then(|review| review.get("metadata"))
-                .and_then(boss_jobs::stranded::hold_reason);
-            let reason = hold.or_else(|| {
-                c.get("metadata")
-                    .and_then(boss_jobs::dock_red::regate_red)
-                    .map(|r| r.reason())
-            })?;
-            Some((md_str(c, "branch").to_string(), reason))
-        })
+        .filter_map(|c| Some((md_str(c, "branch").to_string(), dock_hold(c)?)))
         .collect();
     out.sort();
     out
+}
+
+/// Why one car is held on the dock, or `None` when it is not on the dock
+/// or nothing holds it — the reading [`held_dock_cars`] lists and
+/// [`carried_items`] names an item's car by (backlog e7f3ed8c), one
+/// predicate for both.
+fn dock_hold(c: &Value) -> Option<String> {
+    if c.get("status").and_then(Value::as_str) != Some("open") || !boss_jobs::car::is_parked(c) {
+        return None;
+    }
+    boss_jobs::car::find_step(c, "review", boss_jobs::car::REVIEW)
+        .and_then(|review| review.get("metadata"))
+        .and_then(|metadata| boss_jobs::stranded::marked(metadata, "hold"))
+        .or_else(|| {
+            c.get("metadata")
+                .and_then(boss_jobs::dock_red::regate_red)
+                .map(|r| r.reason())
+        })
 }
 
 /// How many consecutive boardings must have refused a car before this
@@ -1081,8 +1170,10 @@ fn owed_landed_review(car: &Value) -> Option<&Value> {
 
 /// The command that dispatches a car's owed review — the packet-
 /// addressed form, because the step is nominated to the agent the
-/// moment it is ready, and `boss dispatch --next` takes only steps
-/// nobody holds (`dispatch::waiting_step`).
+/// moment it is ready, and `boss dispatch --next` takes only the
+/// caller's own nominations and steps nobody holds
+/// (`dispatch::nominated_step`, `dispatch::waiting_step`), so whoever is
+/// told to do the review is told the packet.
 fn landed_review_dispatch(id8: &str) -> String {
     format!(
         "boss dispatch {id8} --step {}",
@@ -1343,8 +1434,15 @@ pub(crate) fn carried_items(cars: &[Value]) -> std::collections::BTreeMap<String
                 format!("LANDED (car {branch}), proven, awaiting its landed review ({d})"),
             );
         } else {
+            // A car held on the dock says so, with the reason: it cannot
+            // board until an operator releases it, and "IN FLIGHT ... at
+            // Open for review" read alike for that car and one about to
+            // board (backlog e7f3ed8c).
             out.entry(item.to_string())
-                .or_insert_with(|| format!("IN FLIGHT (car {branch} at {step})"));
+                .or_insert_with(|| match dock_hold(c) {
+                    Some(why) => format!("HELD at the dock (car {branch}): {}", clipped(&why)),
+                    None => format!("IN FLIGHT (car {branch} at {step})"),
+                });
         }
     }
     out
@@ -1507,7 +1605,8 @@ fn my_work_hint(workflow: &str, slug: &str) -> Option<String> {
 
 /// The MY WORK listing lines: rows deduplicated by step id (one step
 /// answers once however many identities it was read under), grouped
-/// by workflow, groups and rows both oldest first, each group headed
+/// by workflow, groups and rows both urgent first then oldest first
+/// (`top_board::priority_rank`), each group headed
 /// by its count and closed by one hint line. Pure so the shape is
 /// testable; the caller prints the section heading from the count.
 ///
@@ -1546,11 +1645,15 @@ pub(crate) fn my_work_lines(
         .collect();
     // Unknown ages sort last: an older server's row is still listed,
     // never mistaken for today's.
-    // A stalled claim leads (backlog e2519eca item 2): the queue says it
-    // is in hand and nobody is on it, which is the first thing to move.
+    // Urgent leads age (2026-10-18): the drain order `dispatch --next`
+    // and NEEDS YOU keep, so an actor working this list by hand takes
+    // the oldest URGENT item before an older standard one. Within a
+    // rank a stalled claim leads (backlog e2519eca item 2): the queue
+    // says it is in hand and nobody is on it, the first thing to move.
     keyed.sort_by_key(|(opened, r)| {
         (
             carried_by(r).is_some(),
+            crate::top_board::priority_rank(r),
             !crate::top_board::stalled(r),
             opened.is_none(),
             *opened,
@@ -1560,7 +1663,8 @@ pub(crate) fn my_work_lines(
                 .to_string(),
         )
     });
-    // Groups in order of their oldest row.
+    // Groups in order of their first row under the key above — the
+    // highest-ranked, not the oldest (backlog 4ace31d6).
     let mut groups: Vec<(&str, Vec<(Option<chrono::NaiveDate>, &Value)>)> = Vec::new();
     for (opened, r) in keyed {
         let kind = r.get("workflow").and_then(Value::as_str).unwrap_or("?");
@@ -1624,11 +1728,20 @@ pub(crate) fn my_work_lines(
             if !slugs.contains(&slug) {
                 slugs.push(slug);
             }
-            // Whether anyone is on a claim, in OUTRANKS' words (backlog
-            // e2519eca item 2) — the server's one predicate, one formatter.
+            // A rank other than standard is named before the title, the
+            // word the sort above ranked it by (2026-10-18).
+            let priority = match crate::top_board::priority_rank(r) {
+                2 => String::new(),
+                _ => format!(
+                    "{} ",
+                    r.get("priority").and_then(Value::as_str).unwrap_or("")
+                ),
+            };
             out.push(format!(
-                "      {id8} {kind} {slug} {} {}",
+                "      {id8} {kind} {slug} {priority}{} {}",
                 title.trim_end(),
+                // Whether anyone is on a claim, in OUTRANKS' words (backlog
+                // e2519eca item 2) — the server's one predicate, one formatter.
                 crate::top_board::with_run(&age, r)
             ));
         }
@@ -1785,16 +1898,20 @@ pub(crate) fn my_work_section(
         .filter_map(|r| r.pointer("/step/id").and_then(Value::as_str))
         .collect::<BTreeSet<_>>()
         .len();
+    // Says the order `my_work_lines` keeps (backlog 4ace31d6): rows group
+    // by kind, and the sort key leads each group, so "first" and "last"
+    // hold inside a rank and a kind, never across the whole list — an
+    // unclaimed urgent step prints above a stalled standard claim.
     let tail = [
-        (stalled, "STALLED: claimed, nobody on it, listed first"),
-        (held, "already carried by a car, listed last"),
+        (stalled, "STALLED: claimed, nobody on it, first in its rank"),
+        (held, "already carried by a car, last in its kind"),
     ]
     .iter()
     .filter(|(n, _)| *n > 0)
     .map(|(n, what)| format!("; {n} {what}"))
     .collect::<String>();
     let mut out = vec![format!(
-        "  MY WORK — {count} ready/active step(s) for {who} — yours to move, oldest first{tail}"
+        "  MY WORK — {count} ready/active step(s) for {who} — yours to move, grouped by kind, each urgent first, then oldest{tail}"
     )];
     out.extend(overdue);
     out.extend(lines);
@@ -2250,6 +2367,15 @@ pub async fn run(all: bool) -> Result<()> {
         println!("{line}");
     }
 
+    // SESSIONS — every open work-session and the working window its
+    // packet carries (backlog 37e3295c): on 2026-10-19 both factory
+    // sessions wound down on an hour said in chat, and neither could
+    // read the other's end. The conductor reads the other session's
+    // window here, from the record.
+    for line in crate::session_window::section(&http).await {
+        println!("{line}");
+    }
+
     // THE DOOR — the dev pod's ssh door as the record last judged it,
     // from the forge's observation of it (backlog e6406701; incident
     // 55d001b0: both doors dark ~36h and a person found it). Beside
@@ -2298,12 +2424,28 @@ pub async fn run(all: bool) -> Result<()> {
             api(
                 &http,
                 reqwest::Method::GET,
-                "/api/jobs/assignments?for=me&limit=1000",
+                &crate::top_board::for_me_path(),
                 None,
             )
             .await,
         )),
         None => None,
+    };
+    // Every car, read ONCE and HERE, before the board (backlog e7f3ed8c):
+    // OUTRANKS and NEEDS YOU print a claim a car carries as that car, in
+    // MY WORK's words, rather than as STALLED — on 2026-10-10 most urgent
+    // items the board called stalled had a car held at the dock. Read as
+    // a result so the board still prints when the read fails, and says
+    // so; the lanes below that need the cars take the error then.
+    let cars_read = crate::sor_client::all_cars(&http).await;
+    let carried = match &cars_read {
+        Ok(cars) => carried_items(cars),
+        Err(e) => {
+            println!(
+                "\n  (cars unread: {e:#} — a STALLED claim on the board may be one a car carries)"
+            );
+            BTreeMap::new()
+        }
     };
     let board_now = boss_clock_client::wall_now();
     let unread_map = |what: &str| match &regions {
@@ -2313,7 +2455,7 @@ pub async fn run(all: bool) -> Result<()> {
     println!();
     match &regions {
         Ok(Some(map)) => {
-            for line in crate::top_board::outranks_lines(map) {
+            for line in crate::top_board::outranks_lines(map, &carried) {
                 println!("{line}");
             }
         }
@@ -2321,7 +2463,7 @@ pub async fn run(all: bool) -> Result<()> {
     }
     match &for_me {
         Some(read) => {
-            for line in crate::top_board::needs_you_lines(read) {
+            for line in crate::top_board::needs_you_lines(read, &carried) {
                 println!("{line}");
             }
         }
@@ -2445,52 +2587,15 @@ pub async fn run(all: bool) -> Result<()> {
     let now = boss_clock_client::wall_now();
     let in_line = queue_order(&gating, now, crate::gate::QUEUE_PLACE_TTL_SECS);
     let abandoned = abandoned_places(&gating, now, crate::gate::QUEUE_PLACE_TTL_SECS);
-    if !waiting.is_empty() {
-        println!(
-            "\n  QUEUED FOR A SLOT — {} place(s) held by a live process",
-            in_line.len()
-        );
-        for g in waiting.iter().filter(|g| {
-            let id = g.get("id").and_then(Value::as_str).unwrap_or_default();
-            in_line.iter().any(|held| held == id)
-        }) {
-            println!("    {}{}", queued_lane_line(g, &trains), queued_for(g, now));
-        }
-    }
-    let resident: Vec<_> = gating
-        .iter()
-        .filter(|g| {
-            g.get("metadata")
-                .is_some_and(boss_jobs::gate_reservation::waiting_for_native)
-        })
-        .collect();
-    if !resident.is_empty() {
-        println!(
-            "\n  RESIDENT GATE QUEUE — {} request(s); no client heartbeat expiry",
-            resident.len()
-        );
-        for g in resident {
-            let id = g.get("id").and_then(Value::as_str).unwrap_or_default();
-            let row = bays
-                .as_ref()
-                .ok()
-                .and_then(|b| b.queued.iter().find(|q| q.packet_id == id));
-            match row {
-                Some(q) if q.position > 0 => println!(
-                    "    {}  {}  #{}; original acceptance {}; waiting {}s",
-                    q.branch,
-                    id,
-                    q.position,
-                    q.queued_at,
-                    q.waiting_seconds
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| "unknown".into())
-                ),
-                _ => println!(
-                    "    {id}  position and acceptance time UNKNOWN; original receipt or source is unreadable"
-                ),
-            }
-        }
+    // ONE lane of packets (backlog e1943ef0): see `queued_lane`.
+    for line in queued_lane(
+        &waiting,
+        &in_line,
+        bays.as_ref().ok().map(|b| b.queued.as_slice()),
+        &trains,
+        now,
+    ) {
+        println!("{line}");
     }
     // Which of them main already holds — asked only when there is a
     // strand, after the same quiet fetch of main `boss gate`'s landed
@@ -2517,11 +2622,12 @@ pub async fn run(all: bool) -> Result<()> {
     // dock's held and troubled lanes and the stranded cross-ref all read
     // this list, and one bare `limit=800` page would have dropped the
     // oldest landed cars out of all four silently once the yard passed
-    // 800. Read HERE, before the abandoned lines, because a place whose
-    // head a car already carries green is withdrawn rather than recovered
-    // — the twin-car guard's own question, asked through its own function
-    // (backlog b1c82a82).
-    let cars = crate::sor_client::all_cars(&http).await?;
+    // 800. Needed by HERE, before the abandoned lines, because a place
+    // whose head a car already carries green is withdrawn rather than
+    // recovered — the twin-car guard's own question, asked through its
+    // own function (backlog b1c82a82). Read once above the top board
+    // (backlog e7f3ed8c); a failed read stops the verb here, as it did.
+    let cars = cars_read?;
     let vouched: BTreeMap<String, crate::gate::Vouch> = abandoned
         .iter()
         .filter_map(|p| {
@@ -2913,6 +3019,15 @@ pub async fn run(all: bool) -> Result<()> {
         // an empty section would read as "nothing is yours".
         Some(Err(why)) => println!("  MY WORK — unread: {why}"),
         _ => {
+            // A cut queue is named above the list it cut (backlog
+            // 09074ada): MY WORK's count is the rows read, not the queue.
+            if let Some(why) = for_me
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(crate::top_board::for_me_cut)
+            {
+                println!("  (MY WORK is CUT: {why} — the list below is not your whole queue)");
+            }
             for line in
                 my_work_section(identities.as_deref(), &my_rows, &cars, &overdue_alarms, now)
             {
@@ -3351,6 +3466,102 @@ mod tests {
             "fix/a-dark-registry-does-not-widen-what-a-host-runs  since 2026-09-14T20:02:00Z",
             "a queued car's line is its branch and its stamp, as before"
         );
+    }
+
+    /// THE QUEUED FOR A SLOT LANE LISTS GATE-RUN PACKETS (backlog
+    /// e1943ef0, the item's second check). Observed verbatim on
+    /// bcb6d8a18 at 2026-10-19T03:49Z: "QUEUED FOR A SLOT — 1 place(s)
+    /// held by a live process", with packet-owned requests in a second
+    /// lane. One lane now: every packet in the yard's order, packet-owned
+    /// ones plain, a legacy place still beaten marked as the drain, a dead
+    /// legacy place left to the ABANDONED lane, an unplaced request said
+    /// to be unplaced — and no line about a process holding anything.
+    #[test]
+    fn the_queued_lane_lists_gate_run_packets_in_the_lines_order() {
+        use boss_jobs::yard::QueuedGate;
+        use serde_json::json;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-19T05:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        const HELD: &str = "11111111-1111-4111-8111-111111111111";
+        const DEAD: &str = "22222222-2222-4222-8222-222222222222";
+        const RESIDENT: &str = "33333333-3333-4333-8333-333333333333";
+        const UNPLACED: &str = "44444444-4444-4444-8444-444444444444";
+        let legacy_held = json!({"id": HELD, "metadata": {
+            "branch": "fix/legacy-held", "queued_at": "2026-10-19T04:40:00Z"}});
+        let legacy_dead = json!({"id": DEAD, "metadata": {
+            "branch": "fix/legacy-dead", "queued_at": "2026-10-19T04:00:00Z"}});
+        let resident = json!({"id": RESIDENT, "metadata": {
+            "branch": "fix/resident", "queued_at": "2026-10-19T04:50:00Z",
+            "gate_submission": {"contract_version": 1}}});
+        let unplaced = json!({"id": UNPLACED, "metadata": {
+            "branch": "fix/unplaced", "queued_at": "2026-10-19T04:55:00Z",
+            "gate_submission": {}}});
+        let place = |packet: &str, branch: &str, position: i32| QueuedGate {
+            branch: branch.into(),
+            packet_id: packet.into(),
+            next_owner: None,
+            queued_at: String::new(),
+            position,
+            waiting_seconds: None,
+            estimated_wait_seconds: None,
+            train: None,
+        };
+        let yard = vec![
+            place(HELD, "fix/legacy-held", 1),
+            place(RESIDENT, "fix/resident", 2),
+            place(UNPLACED, "fix/unplaced", 0),
+        ];
+        let lines = super::queued_lane(
+            &[&legacy_dead, &unplaced, &resident, &legacy_held],
+            &[HELD.to_string()],
+            Some(&yard),
+            &[],
+            now,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "\n  QUEUED FOR A SLOT — 3 gate-run packet(s), in line order; a waiter only \
+                 reads: re-attach any of them with `boss gate <packet> --wait`"
+                    .to_string(),
+                format!(
+                    "    #1  fix/legacy-held  since 2026-10-19T04:40:00Z  packet {HELD}  \
+                     (waiting 20m) — legacy place: its --wait process holds it until it launches"
+                ),
+                format!(
+                    "    #2  fix/resident  since 2026-10-19T04:50:00Z  packet {RESIDENT}  \
+                     (waiting 10m)"
+                ),
+                format!(
+                    "    #?  fix/unplaced  since 2026-10-19T04:55:00Z  packet {UNPLACED}  \
+                     (waiting 5m) — position UNKNOWN: its original acceptance receipt or \
+                     source is unreadable"
+                ),
+            ]
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("live process")),
+            "no line says a process holds the place"
+        );
+        // An unread yard still lists every packet, oldest legacy place
+        // first, and states no position it cannot read.
+        let unread = super::queued_lane(
+            &[&resident, &legacy_held],
+            &[HELD.to_string()],
+            None,
+            &[],
+            now,
+        );
+        assert_eq!(unread.len(), 3);
+        assert!(
+            unread[1].starts_with("    #?  fix/legacy-held"),
+            "{unread:?}"
+        );
+        assert!(unread[2].starts_with("    #?  fix/resident"), "{unread:?}");
+        // Nothing in line: no lane at all (a dead legacy place is the
+        // ABANDONED lane's).
+        assert!(super::queued_lane(&[&legacy_dead], &[], Some(&yard), &[], now).is_empty());
     }
 
     /// The IN TRANSIT fetch is capped at ten trains; a train gate whose
@@ -3838,7 +4049,7 @@ mod tests {
     /// the one read that was meant to un-blind the session. It is named
     /// from the car packets orient has already fetched — no second read,
     /// and the predicate is the shared one (`car::is_parked`) plus the
-    /// shared marker reading (`stranded::hold_reason`).
+    /// shared marker reading (`stranded::marked`).
     #[test]
     fn a_held_car_is_named_with_its_reason() {
         let cars = vec![
@@ -3856,6 +4067,52 @@ mod tests {
                 "fix/held".to_string(),
                 "waiting on an operator action".to_string()
             )]
+        );
+    }
+
+    #[test]
+    fn malformed_review_gate_envelope_does_not_hide_the_dock_brake() {
+        for poison in [json!({}), json!(null)] {
+            let mut held = car("fix/held", "open", "ready", json!({"hold":"David only"}));
+            assert_eq!(dock_hold(&held).as_deref(), Some("David only"));
+            let review = held["steps"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|s| s["spec_slug"] == "review")
+                .unwrap();
+            review["metadata"]["gate_submission"] = poison;
+            assert_eq!(dock_hold(&held).as_deref(), Some("David only"));
+        }
+    }
+
+    /// A HELD CAR CARRIES ITS ITEM AS HELD, WITH ITS REASON (backlog
+    /// e7f3ed8c). Every section that prints a claim reads this clause —
+    /// MY WORK, and since that item OUTRANKS and NEEDS YOU — and "IN
+    /// FLIGHT ... at Open for review" read alike for a car about to board
+    /// and one that cannot board until an operator releases it: the
+    /// reason is the dock's own reading (`held_dock_cars`), not a second.
+    #[test]
+    fn a_held_car_carries_its_item_as_held_with_its_reason() {
+        let held_item = "1e50e66b-0000-4000-8000-000000000000";
+        let free_item = "75198b15-0000-4000-8000-000000000000";
+        let mut held = car(
+            "fix/held",
+            "open",
+            "ready",
+            json!({ "hold": "awaiting an adversarial review" }),
+        );
+        held["metadata"]["backlog_item"] = json!(held_item);
+        let mut free = car("fix/free", "open", "ready", json!({}));
+        free["metadata"]["backlog_item"] = json!(free_item);
+        let carried = carried_items(&[held, free]);
+        assert_eq!(
+            carried[held_item],
+            "HELD at the dock (car fix/held): awaiting an adversarial review"
+        );
+        assert_eq!(
+            carried[free_item],
+            "IN FLIGHT (car fix/free at Open for review)"
         );
     }
 
@@ -4208,7 +4465,7 @@ mod tests {
 
     /// THE TRAP. `hold: false` is a RELEASED hold, and a `truthy`/`is_some`
     /// reading of the marker would hold the car in this list forever. The
-    /// marker semantics live once, in `stranded::hold_reason`; a
+    /// marker semantics live once, in `stranded::marked`; a
     /// hold/no-hold test alone passes with that bug.
     #[test]
     fn a_released_hold_is_not_a_held_car() {
@@ -4916,6 +5173,84 @@ mod tests {
     // computed: `boss_jobs::me`'s tests. This verb reads `for.ids` off
     // the answer (`top_board::for_ids`) rather than keep a second copy.
 
+    /// URGENT LEADS AGE. On 2026-10-18 the second session drained a
+    /// standard queue while the five oldest urgent items sat, because
+    /// this list read age and kind but never priority — the order
+    /// `dispatch --next` and NEEDS YOU already keep. An urgent row opened
+    /// later leads a standard row opened earlier, inside its kind and
+    /// across kinds, and says it is urgent.
+    #[test]
+    fn my_work_leads_with_urgent_before_older_standard_work() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-18T04:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let with_priority = |mut row: Value, p: &str| {
+            row["priority"] = json!(p);
+            row
+        };
+        let rows = vec![
+            asg(
+                "aaaa0001-0000-4000-8000-000000000000",
+                "maintenance-sweep",
+                "inspect",
+                "An old sweep",
+                "2026-09-01",
+                "s-sweep",
+            ),
+            asg(
+                "aaaa0002-0000-4000-8000-000000000000",
+                "backlog-item",
+                "build",
+                "An old build",
+                "2026-09-02",
+                "s-old",
+            ),
+            with_priority(
+                asg(
+                    "aaaa0003-0000-4000-8000-000000000000",
+                    "backlog-item",
+                    "build",
+                    "A newer build",
+                    "2026-10-15",
+                    "s-urgent",
+                ),
+                "urgent",
+            ),
+        ];
+        let lines = my_work_lines(&rows, &carried_items(&[]), now);
+        let all = lines.join("\n");
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle:?}:\n{all}"))
+        };
+        assert_eq!(
+            at("backlog-item —"),
+            0,
+            "the kind holding urgent work leads:\n{all}"
+        );
+        assert!(
+            at("A newer build") < at("An old build"),
+            "urgent leads age inside its kind:\n{all}"
+        );
+        assert!(
+            at("An old build") < at("An old sweep"),
+            "groups after the urgent one keep age order:\n{all}"
+        );
+        // No title carries a rank word (backlog 4ace31d6): the label is
+        // asserted where the row format puts it, between slug and title,
+        // so a row that lost its label cannot pass on its own title.
+        assert!(
+            lines[at("A newer build")].contains(" build urgent A newer build "),
+            "an urgent row says so, before its title:\n{all}"
+        );
+        assert!(
+            lines[at("An old build")].contains(" build An old build "),
+            "a standard row carries no priority word:\n{all}"
+        );
+    }
+
     #[test]
     fn my_work_groups_by_kind_oldest_first_with_one_hint_per_group() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-09-18T12:00:00Z")
@@ -5068,8 +5403,9 @@ mod tests {
         let section = my_work_section(Some(&ids), &rows, &cars, &[], now);
         assert_eq!(
             section[0],
-            "  MY WORK — 4 ready/active step(s) for agent-claude — yours to move, oldest first; \
-             1 STALLED: claimed, nobody on it, listed first; 1 already carried by a car, listed last"
+            "  MY WORK — 4 ready/active step(s) for agent-claude — yours to move, grouped by kind, \
+             each urgent first, then oldest; 1 STALLED: claimed, nobody on it, first in its rank; \
+             1 already carried by a car, last in its kind"
         );
         assert_eq!(
             section[1],
@@ -5255,7 +5591,8 @@ mod tests {
         assert!(
             section.starts_with(
                 "  MY WORK — 3 ready/active step(s) for claude@algedonic.dev — \
-                 yours to move, oldest first; 2 already carried by a car, listed last"
+                 yours to move, grouped by kind, each urgent first, then oldest; \
+                 2 already carried by a car, last in its kind"
             ),
             "{section}"
         );

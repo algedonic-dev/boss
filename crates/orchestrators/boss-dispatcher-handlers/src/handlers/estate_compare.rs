@@ -276,22 +276,92 @@ const DISK_TIGHT_FLOOR_PCT: i64 = 35;
 /// that stops the pipeline, and no longer permanently.
 const DISK_TIGHT_HEADROOM_CEILING_GB: i64 = 200;
 
+/// Longhorn's `storage-minimal-available-percentage`: a disk with less
+/// than this share of its maximum available takes no new replica.
+/// Longhorn's default, live on this cluster (every Longhorn verb reads
+/// it live, `infra/lib/longhorn-ledger.sh`; their fixtures carry 25).
+///
+/// WHY A CLUSTER NODE'S FLOOR ANSWERS TO IT (backlog 67e98635). Every
+/// Talos node's Longhorn default disk is `/var/lib/longhorn` on EPHEMERAL
+/// — the kubelet's nodefs, the very filesystem `disk_gb`/`disk_free_gb`
+/// describe (node-disk-usage read Longhorn's `available` and nodefs'
+/// both as 231.2 GiB on w-1). At 2026-10-19 14:50Z w-1 crossed 25% of
+/// 928.9 GiB and every new dev-build worker volume provisioned and never
+/// got a replica, while the floor above, capped at 200 GB, stayed clean:
+/// on a disk of 727 GB and more the headroom ceiling sits UNDER
+/// Longhorn's refusal, and an alarm that arrives after the pipeline stops
+/// is the failure the 35% raise was made to prevent. So on the cluster
+/// scope the floor is at least Longhorn's plus
+/// [`LONGHORN_FLOOR_MARGIN_PCT`]. A host has no Longhorn disk, and its
+/// floor is unchanged.
+const LONGHORN_MINIMAL_AVAILABLE_PCT: i64 = 25;
+
+/// How far above Longhorn's floor the alarm stands: within 10% of it is
+/// `disk_tight` — 23 GB of warning on w-1, inside the three consecutive
+/// readings the raiser wants at the rate images arrive (one ~0.9 GiB
+/// boss-ci per train), and far from permanently true once the kubelet's
+/// image GC (50/40 on every worker since 67e98635) holds the disk at
+/// half full.
+///
+/// The dev pod's /scratch reclaim must act ABOVE a cluster node's whole
+/// `disk_tight` floor, not at Longhorn's: its rule is the
+/// `SCRATCH_RECLAIM_*` keys in `infra/build-floor.env`, pinned above
+/// `disk_floor_gb(total).max(longhorn_alarm_gb(total))` at every disk
+/// size from 100 GB to 10 TB by boss-testing's
+/// `the_scratch_reclaim_floor_sits_above_the_estates_disk_tight_floor`
+/// (backlog 4cc39798), which reads this pair and the three
+/// `DISK_TIGHT_*` constants above out of this file — raise any of the
+/// five past the reclaim's rule and that test names the disk.
+const LONGHORN_FLOOR_MARGIN_PCT: i64 = 10;
+
+/// Longhorn's own floor for a disk of `total_gb`, rounded UP as every
+/// floor here is (free is whole GB, so `free < 232.25` is `free < 233`).
+fn longhorn_floor_gb(total_gb: i64) -> i64 {
+    (total_gb * LONGHORN_MINIMAL_AVAILABLE_PCT + 99) / 100
+}
+
+/// Longhorn's floor plus its margin, rounded up.
+fn longhorn_alarm_gb(total_gb: i64) -> i64 {
+    (total_gb * LONGHORN_MINIMAL_AVAILABLE_PCT * (100 + LONGHORN_FLOOR_MARGIN_PCT) + 9_999) / 10_000
+}
+
+/// Which surface a disk reading came from — what decides whether a
+/// Longhorn disk shares its filesystem.
+#[derive(Clone, Copy, PartialEq)]
+enum DiskScope {
+    /// `observe-host.sh`: a host's root filesystem; no Longhorn disk.
+    Host,
+    /// The kubernetes-nodes observation: a Talos node's nodefs, where
+    /// Longhorn's default disk lives.
+    ClusterNode,
+}
+
 /// The floor applied to one observed node — ONE definition, read by
 /// both scopes (CLAUDE.md §9a: the floor is a fact, and a fact that
 /// lives twice drifts). `None` when the node is fine OR when it carries
 /// no usable pair of numbers; an unmeasured node is not a clean one, and
 /// [`compare`] records that separately as `disk_unmeasured`.
-fn disk_tight_finding(node: &Json) -> Option<Json> {
+fn disk_tight_finding(node: &Json, scope: DiskScope) -> Option<Json> {
     let id = node.get("id").and_then(Json::as_str)?;
     let free = node.get("disk_free_gb").and_then(Json::as_i64)?;
     let total = node.get("disk_gb").and_then(Json::as_i64)?;
-    let floor = disk_floor_gb(total);
+    let floor = match scope {
+        DiskScope::Host => disk_floor_gb(total),
+        DiskScope::ClusterNode => disk_floor_gb(total).max(longhorn_alarm_gb(total)),
+    };
     // The finding carries the floor it crossed (e4ec8150): the
     // comparison holds that number when it decides, and an alarm that
     // says `free_gb: 192` without it sends the reader to re-derive the
-    // rule from this file — the reduce-before-storing class.
-    (total > 0 && free < floor)
-        .then(|| json!({ "id": id, "free_gb": free, "disk_gb": total, "floor_gb": floor }))
+    // rule from this file — the reduce-before-storing class. A cluster
+    // node's carries Longhorn's own floor too, the number the refusal
+    // that stops volumes is made at (67e98635).
+    (total > 0 && free < floor).then(|| {
+        let mut finding = json!({ "id": id, "free_gb": free, "disk_gb": total, "floor_gb": floor });
+        if scope == DiskScope::ClusterNode {
+            finding["longhorn_floor_gb"] = json!(longhorn_floor_gb(total));
+        }
+        finding
+    })
 }
 
 /// The effective floor for a disk of `total_gb`, in whole GB: free
@@ -340,7 +410,7 @@ pub(crate) fn compare_host(declared: &[Json], observation: &Json) -> Json {
         if node.get("ready").and_then(Json::as_bool) == Some(false) {
             not_ready.push(json!(id));
         }
-        if let Some(finding) = disk_tight_finding(node) {
+        if let Some(finding) = disk_tight_finding(node, DiskScope::Host) {
             disk_tight.push(finding);
         }
         let dec = declared
@@ -727,7 +797,7 @@ pub(crate) fn compare(declared: &[Json], observation: &Json) -> Json {
         // host scope uses, and for the same reason: a machine nobody
         // declared is still a machine that can fill, and w-1 (the node
         // that compiles this repository) was undeclared for five days.
-        if let Some(finding) = disk_tight_finding(node) {
+        if let Some(finding) = disk_tight_finding(node, DiskScope::ClusterNode) {
             disk_tight.push(finding);
         } else if node.get("disk_free_gb").and_then(Json::as_i64).is_none()
             || node.get("disk_gb").and_then(Json::as_i64).is_none()
@@ -1178,9 +1248,8 @@ fn gib(bytes: i64) -> f64 {
 /// `blind:disk_tight/<ns>/<claim>` for a volume unread as long.
 ///
 /// The finding names the claim, its namespace, the Longhorn volume
-/// behind it and the act that relieves it. No ops verb expands a claim
-/// yet, and the remedy says so rather than naming one that does not
-/// exist. The alarm quotes the entry cut at 400 characters, so the
+/// behind it and the existing read-only plan followed by the approved
+/// expansion. The alarm quotes the entry cut at 400 characters, so the
 /// entry stays short enough to arrive whole.
 ///
 /// The reading rides the comparison whole and judged (`volumes`, each
@@ -1197,6 +1266,9 @@ pub(crate) fn compare_volumes(observation: &Json) -> Json {
     let mut disk_unmeasured: Vec<Json> = Vec::new();
     let mut evaluated: Vec<Json> = Vec::new();
     let mut volumes: Vec<Json> = Vec::new();
+    let mut scheduled_failed: Vec<Json> = Vec::new();
+    let mut scheduled_evaluated: Vec<Json> = Vec::new();
+    let mut scheduled_unmeasured: Vec<Json> = Vec::new();
 
     for v in &observed {
         let Some(id) = v.get("id").and_then(Json::as_str) else {
@@ -1207,6 +1279,23 @@ pub(crate) fn compare_volumes(observation: &Json) -> Json {
             v.get("free_bytes").and_then(Json::as_i64),
         );
         let mut row = (*v).clone();
+        if let Some(attempt) = v.get("scheduled_job")
+            && let Some(producer) = attempt
+                .get("id")
+                .and_then(Json::as_str)
+                .filter(|id| !id.is_empty())
+        {
+            match attempt.get("state").and_then(Json::as_str) {
+                Some("failed") => {
+                    scheduled_failed.push(attempt.clone());
+                    scheduled_evaluated.push(json!(producer));
+                }
+                Some("succeeded") => scheduled_evaluated.push(json!(producer)),
+                Some("unread") => scheduled_unmeasured.push(attempt.clone()),
+                // Pending and unread do not clear a prior failure.
+                _ => {}
+            }
+        }
         match figures {
             (Some(capacity), Some(free)) if capacity > 0 && free >= 0 => {
                 let floor = volume_floor_bytes(capacity);
@@ -1224,8 +1313,8 @@ pub(crate) fn compare_volumes(observation: &Json) -> Json {
                         "capacity_gib": gib(capacity),
                         "floor_gib": gib(floor),
                         "remedy": format!(
-                            "expand {claim} in {ns}: raise spec.resources.requests.storage \
-                             (Longhorn grows it online); no ops verb expands a claim yet"
+                            "plan-an-instance-volume-expansion {ns} {claim} <size>, \
+                             then approve expand-instance-volume to grow the claim"
                         ),
                     }));
                 }
@@ -1260,13 +1349,18 @@ pub(crate) fn compare_volumes(observation: &Json) -> Json {
                 "volumes": observed.len(),
                 "disk_tight": disk_tight.len(),
                 "disk_unmeasured": disk_unmeasured.len(),
+                "scheduled_job_failed": scheduled_failed.len(),
+                "scheduled_job_unmeasured": scheduled_unmeasured.len(),
             },
             "findings": {
                 "disk_tight": disk_tight,
                 "disk_unmeasured": disk_unmeasured,
+                "scheduled_job_failed": scheduled_failed,
+                "scheduled_job_unmeasured": scheduled_unmeasured,
             },
             EVALUATED: {
                 "disk_tight": evaluated,
+                "scheduled_job_failed": scheduled_evaluated,
             },
             "volumes": volumes,
         }),
@@ -1733,15 +1827,19 @@ mod tests {
             // comparison in this file is strict `<`, so "exactly at the
             // floor" is never a finding — the same reading as exactly 16
             // GiB free and exactly 35% free, both of which are clean.
+            // On a 700 GB disk, where the ceiling still rules on both
+            // scopes: on a cluster node of 727 GB and more the Longhorn
+            // clause rules instead (67e98635,
+            // `a_longhorn_disk_near_its_scheduling_floor_is_disk_tight`).
             (
                 DISK_TIGHT_HEADROOM_CEILING_GB,
-                929,
+                700,
                 0,
                 "exactly at the ceiling",
             ),
             (
                 DISK_TIGHT_HEADROOM_CEILING_GB - 1,
-                929,
+                700,
                 1,
                 "one GB under the ceiling",
             ),
@@ -1771,12 +1869,14 @@ mod tests {
         let dec = vec![json!({"id":"h","role":"talos-worker","retired":false})];
         let dec_host = vec![json!({"id":"h","role":"forge"})];
         for (free, total, floor, why) in [
-            // The e1fea3b2 reading: the headroom ceiling rules.
+            // The headroom ceiling rules — on 700 GB, because on w-1's 929
+            // (the e1fea3b2 reading, 192 free) a cluster node's floor is
+            // now the Longhorn clause's (67e98635), tested below.
             (
                 192,
-                929,
+                700,
                 DISK_TIGHT_HEADROOM_CEILING_GB,
-                "w-1, ceiling rules",
+                "a 700 GB disk, ceiling rules",
             ),
             // 35% of 228 is 79.8 GB; free is whole GB, so `free < 79.8`
             // is `free < 80` and the floor is stated as 80 — the same
@@ -1796,6 +1896,56 @@ mod tests {
                 assert_eq!(finding["floor_gb"], floor, "{scope} scope: {why}");
             }
         }
+    }
+
+    #[test]
+    fn a_longhorn_disk_near_its_scheduling_floor_is_disk_tight() {
+        // backlog 67e98635, the 14:56Z census of 2026-10-19 (ops-request
+        // c4331d4a, node-disk-usage w-1): nodefs 928.9 GiB, 231.2
+        // available — and Longhorn's default disk is /var/lib/longhorn on
+        // that same filesystem (its `available` read 231.2 too). Longhorn
+        // places no replica on a disk under 25% available, 232.2 GiB here,
+        // so every new worker volume provisioned and never attached. The
+        // floor above (max 16, min(35%, 200)) said 200 and stayed clean.
+        let declared = vec![json!({"id":"w-1","role":"talos-worker","retired":false})];
+        let census = compare(&declared, &cluster_obs("w-1", 929, Some(231)));
+        assert_eq!(census["counts"]["disk_tight"], 1, "{census}");
+        let finding = &census["findings"]["disk_tight"][0];
+        assert_eq!(finding["id"], "w-1");
+        assert_eq!(finding["free_gb"], 231);
+        // Named: the floor it crossed is Longhorn's plus 10%, and the
+        // finding carries Longhorn's own floor beside it.
+        assert_eq!(
+            finding["longhorn_floor_gb"], 233,
+            "ceil(25% of 929): {finding}"
+        );
+        assert_eq!(
+            finding["floor_gb"], 256,
+            "ceil(110% of 25% of 929): {finding}"
+        );
+        // Strict `<` at the margin, as every floor in this file.
+        for (free, want) in [(256, 0), (255, 1), (390, 0)] {
+            let out = compare(&declared, &cluster_obs("w-1", 929, Some(free)));
+            assert_eq!(
+                out["counts"]["disk_tight"], want,
+                "w-1 at {free} free: {out}"
+            );
+        }
+        // A host has no Longhorn disk: the forge's floor is unchanged.
+        let dec_host = vec![json!({"id":"h","role":"forge"})];
+        let host = compare_host(&dec_host, &host_obs("h", 231, 929));
+        assert_eq!(host["counts"]["disk_tight"], 0, "{host}");
+        // A small cluster disk: 35% already sits above Longhorn's margin,
+        // and still rules (w-2, 110 GB: 39 against 31).
+        let small = compare(&declared, &cluster_obs("w-1", 110, Some(35)));
+        assert_eq!(
+            small["findings"]["disk_tight"][0]["floor_gb"], 39,
+            "{small}"
+        );
+        assert_eq!(
+            small["findings"]["disk_tight"][0]["longhorn_floor_gb"], 28,
+            "{small}"
+        );
     }
 
     #[test]
@@ -3062,6 +3212,39 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_producer_failure_is_independent_of_live_disk_figures() {
+        let mut row = volume("boss", "boss-backups", "pvc-backup", 20.0, 10.0);
+        row["scheduled_job"] = json!({"id":"boss/boss-pg-backup", "state":"failed", "job_uid":"failed-uid", "cronjob_uid":"cron-uid", "reason":"BackoffLimitExceeded"});
+        let body = compare_volumes(&volumes_observation(vec![row.clone()]));
+        assert_eq!(
+            body["findings"]["scheduled_job_failed"][0]["job_uid"], "failed-uid",
+            "{body}"
+        );
+        assert_eq!(body["counts"]["disk_tight"], 0);
+        for state in ["pending", "unread"] {
+            row["scheduled_job"]["state"] = json!(state);
+            let body = compare_volumes(&volumes_observation(vec![row.clone()]));
+            assert_eq!(
+                body["evaluated"]["scheduled_job_failed"],
+                json!([]),
+                "{body}"
+            );
+            if state == "unread" {
+                assert_eq!(
+                    body["findings"]["scheduled_job_unmeasured"][0]["id"], "boss/boss-pg-backup",
+                    "{body}"
+                );
+            }
+        }
+        row["scheduled_job"]["state"] = json!("succeeded");
+        let body = compare_volumes(&volumes_observation(vec![row]));
+        assert_eq!(
+            body["evaluated"]["scheduled_job_failed"],
+            json!(["boss/boss-pg-backup"])
+        );
+    }
+
+    #[test]
     fn pvc_capacity_intent_compares_request_not_filesystem_and_keeps_namespaces_distinct() {
         // 40 GiB since ops-request b018a106 (2026-10-07): the first growth
         // of this claim by BOSS's own verb, and the approve step David's
@@ -3188,7 +3371,9 @@ mod tests {
         assert!(
             pg["remedy"]
                 .as_str()
-                .is_some_and(|r| r.contains("expand") && r.contains("requests.storage")),
+                .is_some_and(|r| r.contains("plan-an-instance-volume-expansion")
+                    && r.contains("pgdata-postgres-0")
+                    && !r.contains("no ops verb")),
             "the finding names the act that relieves it: {pg}"
         );
         assert!(

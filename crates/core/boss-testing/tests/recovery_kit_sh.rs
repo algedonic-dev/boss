@@ -20,7 +20,7 @@
 //! `kubectl` and `talosctl` for the host and the cluster. On the writing
 //! side `ssh` execs what it is handed (or, for a forced-command key, what
 //! the forced command would), `sudo` runs only the installed reader's
-//! path — mapped to the tree's reader, so a writer that named anything
+//! path — mapped to an artifact made by the real installer, so a writer that named anything
 //! else fails — `gpg` is the identity cipher, and `udisksctl`/`sync`
 //! record the re-mount the read-back must come after.
 //!
@@ -378,7 +378,9 @@ fn case(name: &str, o: Opts) -> Case {
             "#!/usr/bin/env bash\n[ \"$1\" = -n ] && shift\n\
              [ \"$1\" = {READER} ] || {{ echo \"sudo: $1 is not granted\" >&2; exit 1; }}\n\
              shift\nexec bash {r} \"$@\"\n",
-            r = repo_root().join(READER_SRC).display()
+            r = dir
+                .join("reader-install/libexec/recovery-kit-read")
+                .display()
         ),
     );
     write_exec(
@@ -414,6 +416,12 @@ fn case(name: &str, o: Opts) -> Case {
     write_file(
         &dir.join("sor.env"),
         "BOSS_FORGE_HOST=192.0.2.15\nBOSS_JOBS_URL=http://127.0.0.1:9\n",
+    );
+    let installed = install(&dir.join("reader-install"), true, "kitwriter");
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
     );
     Case {
         log: dir.join("log/recovery-kit.log"),
@@ -462,6 +470,10 @@ fn env_for(c: &Case) -> Vec<(String, String)> {
         ("BOSS_RECOVERY_KIT_UID".into(), uid()),
         ("BOSS_RECOVERY_KIT_LOG".into(), c.log.display().to_string()),
         (
+            "BOSS_MACHINE_TOKEN_DIR".into(),
+            c.dir.join("machine-token").display().to_string(),
+        ),
+        (
             "BOSS_OPS_DIR".into(),
             c.dir.join("ops").display().to_string(),
         ),
@@ -484,16 +496,21 @@ fn env_for(c: &Case) -> Vec<(String, String)> {
 
 fn command(c: &Case, script: &str, args: &[&str], extra: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("bash");
-    cmd.arg(repo_root().join(script))
-        .args(args)
-        .current_dir(repo_root())
-        .stdin(Stdio::null());
+    cmd.arg(if script == READER_SRC {
+        c.dir.join("reader-install/libexec/recovery-kit-read")
+    } else {
+        repo_root().join(script)
+    })
+    .args(args)
+    .current_dir(repo_root())
+    .stdin(Stdio::null());
     cmd.env_remove("OPS_REQUEST_ID")
         .env_remove("BOSS_RUN_SUMMARY_FILE")
         .env_remove("BOSS_JOBS_URL")
         .env_remove("BOSS_KIT_SSH_KEY")
         .env_remove("BOSS_KIT_SSH_USER")
         .env_remove("BOSS_KIT_JUMP");
+    boss_testing::without_proxy(&mut cmd);
     for (k, v) in env_for(c) {
         cmd.env(k, v);
     }
@@ -542,6 +559,109 @@ fn assemble(c: &Case) -> (i32, String, String) {
 
 fn reader(c: &Case, args: &[&str]) -> Output {
     command(c, READER_SRC, args, &[])
+}
+
+#[test]
+fn written_records_through_enforcement_only_with_the_mounted_machine_token() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    for stamped in [false, true] {
+        let c = case(&format!("written-enforced-{stamped}"), Opts::default());
+        let (code, so, se) = assemble_with(&c, &[("OPS_REQUEST_ID", REQUEST)]);
+        assert_eq!(code, 0, "{so}\n{se}");
+        let manifest = read(&c.kit.join("MANIFEST.txt"));
+        let version = field(&manifest, "kit_version");
+        let hash = field(&manifest, "tar_sha256");
+        let mount = c.dir.join("machine-token");
+        create_dir(&mount);
+        if stamped {
+            write_file(&mount.join("current"), "fake-recovery-machine-token\n");
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        write_file(&c.dir.join("sor.env"), &format!("BOSS_JOBS_URL={url}\n"));
+        // Use real curl against a local enforcing endpoint, not the
+        // fixture's unconditional-success transport. No live token/API.
+        write_exec(
+            &c.bin.join("curl"),
+            "#!/bin/sh\nexec /usr/bin/curl \"$@\"\n",
+        );
+        let server = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(15);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < until =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(e) => panic!("reader sent no request: {e}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let n = socket.read(&mut buffer).unwrap();
+                assert!(n > 0, "request ended before its body");
+                request.extend_from_slice(&buffer[..n]);
+                assert!(request.len() < 65536);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8(request).unwrap();
+            let admitted = text.lines().any(|line| {
+                line.eq_ignore_ascii_case("x-boss-machine-token: fake-recovery-machine-token")
+            });
+            let status = if admitted {
+                "200 OK"
+            } else {
+                "401 Unauthorized"
+            };
+            write!(
+                socket,
+                "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+            .unwrap();
+            (admitted, text)
+        });
+        let out = reader(&c, &["--written", &version, &hash]);
+        let (admitted, request) = server.join().unwrap();
+        let (stdout, stderr) = text(&out);
+        assert_eq!(admitted, stamped, "{stdout}\n{stderr}");
+        assert_eq!(
+            out.status.code(),
+            Some(if stamped { 0 } else { 5 }),
+            "{stdout}\n{stderr}"
+        );
+        assert!(request.starts_with("PATCH /api/jobs/"));
+        if stamped {
+            assert!(request.contains("recovery_kit_written"));
+            assert!(stdout.contains("recorded on the ops-request"));
+        } else {
+            assert!(stderr.contains("401"));
+        }
+        assert!(
+            !format!("{stdout}{stderr}{}", read(&c.calls)).contains("fake-recovery-machine-token")
+        );
+    }
 }
 
 fn items(so: &str) -> Vec<&str> {
@@ -1589,6 +1709,10 @@ fn a_failed_remount_says_the_stick_is_left_unmounted_and_nothing_is_named_a_kit(
 // ---------------------------------------------------------------------------
 
 fn install(dir: &Path, visudo_ok: bool, user: &str) -> Output {
+    install_from(dir, visudo_ok, user, &repo_root().join(INSTALLER))
+}
+
+fn install_from(dir: &Path, visudo_ok: bool, user: &str, script: &Path) -> Output {
     let bin = dir.join("bin");
     create_dir(&bin);
     create_dir(&dir.join("sudoers.d"));
@@ -1607,7 +1731,7 @@ fn install(dir: &Path, visudo_ok: bool, user: &str) -> Output {
         "#!/bin/sh\n[ \"$1\" = passwd ] || exit 2\ncase \"$2\" in\n  kitwriter) echo 'kitwriter:x:1000:1000::/home/kitwriter:/bin/sh' ;;\n  root) echo 'root:x:0:0::/root:/bin/sh' ;;\n  toor) echo 'toor:x:0:0::/root:/bin/sh' ;;\n  broken) exit 1 ;;\n  *) exit 2 ;;\nesac\n",
     );
     Command::new("bash")
-        .arg(repo_root().join(INSTALLER))
+        .arg(script)
         .env("INSTALL_KIT_LIBEXEC", dir.join("libexec"))
         .env("INSTALL_KIT_SUDOERS_DIR", dir.join("sudoers.d"))
         .env("INSTALL_VISUDO", bin.join("visudo"))
@@ -1616,6 +1740,33 @@ fn install(dir: &Path, visudo_ok: bool, user: &str) -> Output {
         .env("INSTALL_KIT_OWNER", "")
         .output()
         .expect("run the installer")
+}
+
+#[test]
+fn a_missing_header_helper_refuses_installation_and_preserves_the_old_reader() {
+    let dir = scratch_dir("recovery-kit-missing-helper");
+    let tree = dir.join("tree");
+    let forge = tree.join("infra/forge");
+    create_dir(&forge);
+    let installer = forge.join("install-recovery-kit-reader.sh");
+    write_file(&installer, &read(&repo_root().join(INSTALLER)));
+    write_file(
+        &forge.join("recovery-kit-read.sh"),
+        &read(&repo_root().join(READER_SRC)),
+    );
+    let host = dir.join("host");
+    create_dir(&host.join("libexec"));
+    let old = host.join("libexec/recovery-kit-read");
+    write_file(&old, "old known reader\n");
+    let out = install_from(&host, true, "kitwriter", &installer);
+    assert!(!out.status.success());
+    assert_eq!(read(&old), "old known reader\n");
+    assert!(!host.join("sudoers.d/boss-recovery-kit").exists());
+    assert_eq!(
+        std::fs::read_dir(host.join("libexec")).unwrap().count(),
+        1,
+        "failed staging left a partial reader"
+    );
 }
 
 #[test]
@@ -1629,8 +1780,15 @@ fn the_installer_places_a_copy_outside_the_checkout_and_one_checked_sudoers_rule
     let copy = dir.join("libexec/recovery-kit-read");
     assert_eq!(
         std::fs::read(&copy).expect("the installed reader"),
-        std::fs::read(repo_root().join(READER_SRC)).expect("the tree's reader"),
-        "the installed reader is not the tree's"
+        format!(
+            "#!/bin/bash\n{}{}",
+            read(&repo_root().join("infra/lib/secret-header.sh")),
+            read(&repo_root().join(READER_SRC))
+                .strip_prefix("#!/bin/bash\n")
+                .unwrap()
+        )
+        .into_bytes(),
+        "the installed reader must contain exactly the canonical helper and reader"
     );
     assert_eq!(
         std::fs::metadata(&copy).expect("stat").permissions().mode() & 0o777,

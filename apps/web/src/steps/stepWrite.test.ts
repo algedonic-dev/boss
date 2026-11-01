@@ -314,7 +314,7 @@ describe('releaseStep — the page hands a held step back (backlog 6ef4a36b)', (
     const seen = recordAll();
     const res = await releaseStep(
       'job-1',
-      { id: 'step-9', metadata: { brief: 'kept' } },
+      { id: 'step-9', assignee_id: 'agent-claude', metadata: { brief: 'kept' } },
       WHY,
       'emp-001',
       noWait,
@@ -326,7 +326,14 @@ describe('releaseStep — the page hands a held step back (backlog 6ef4a36b)', (
         url: '/api/jobs/job-1/steps/step-9/metadata',
         body: {
           agent_run: null,
-          released: { why: WHY, by: 'emp-001', at: expect.any(String), from_run: null },
+          // `from`: the holder it was taken from (backlog ff0f0ff5).
+          released: {
+            why: WHY,
+            by: 'emp-001',
+            at: expect.any(String),
+            from_run: null,
+            from: 'agent-claude',
+          },
         },
       },
       {

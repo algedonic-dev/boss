@@ -6,6 +6,7 @@ infra/dev/control-artifact.py
 infra/dev/control-images.json
 infra/estate/estate.toml
 infra/dev/activate-control.py
+infra/dev/preflight-control.py
 infra/dev/control-tools.py
 infra/dev/control-files.txt
 infra/dev/control-contract.txt

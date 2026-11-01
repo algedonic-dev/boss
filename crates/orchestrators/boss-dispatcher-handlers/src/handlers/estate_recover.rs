@@ -1117,7 +1117,10 @@ mod tests {
                 compare_volumes(&json!({"scope": "instance-volumes", "nodes": [{
                     "id": "boss/pgdata-postgres-0", "namespace": "boss",
                     "claim": "pgdata-postgres-0", "volume": "pvc-93e11a6e",
-                    "capacity_bytes": 32_212_254_720_i64, "free_bytes": 1_073_741_824_i64}]})),
+                    "capacity_bytes": 32_212_254_720_i64, "free_bytes": 1_073_741_824_i64,
+                    "scheduled_job": {"id":"boss/boss-pg-backup", "state":"failed",
+                        "job_uid":"failed-uid", "cronjob_uid":"cron-uid",
+                        "reason":"BackoffLimitExceeded"}}]})),
             ),
             (
                 "kubernetes-nodes",

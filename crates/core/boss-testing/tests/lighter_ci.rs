@@ -57,8 +57,8 @@ fn frozen_delivery_selection_controls_image_build_and_validation_together() {
             "{name}"
         );
         assert!(
-            heavy.contains("boss-ci:${{ github.sha }}"),
-            "heavy validation keeps its per-head image"
+            heavy.contains("boss-ci:${{ needs.delivery-plan.outputs.ci_stamp }}"),
+            "heavy validation runs in the image its head's recipe names (399ee6c3)"
         );
     }
 }

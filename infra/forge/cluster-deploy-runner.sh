@@ -567,7 +567,7 @@ SOURCE_NAME=""; SOURCE_TENANT_REPO=""; SOURCE_TENANT_REF=""; SOURCE_TENANT_DIR="
 STAGE="preserve dev work volume request"
 $K get pvc boss-dev-work -n boss-dev --ignore-not-found=true -o json --request-timeout=20s \
     > "$APPLY_DIR/dev-work-claim.json"
-python3 "$REPO/infra/forge/dev-work-volume.py" --render-converge \
+python3 -B "$REPO/infra/forge/dev-work-volume.py" --render-converge \
     "$RENDER_DIR/$SOURCE_NS/boss-dev.yaml" "$APPLY_DIR/dev-work-claim.json"
 if [ -s "$APPLY_DIR/dev-work-claim.json" ]; then
     run_summary_json dev_work_claim "$(cat "$APPLY_DIR/dev-work-claim.json")"
@@ -846,9 +846,43 @@ apply_instance "$SOURCE_NS"
 KP="docker run --rm --log-driver=none --network host -v $KUBECONFIG_PATH:/kc:ro -v $REPO/infra/step-plugins:/plugins:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
 # The generated ConfigMap is piped into $KAPPLY — the `-i` kubectl
 # defined above the prod apply, where its comment records the bug.
+#
+# SERVER-SIDE, because a client-side apply caps a derived ConfigMap at
+# an annotation's size, not a ConfigMap's (backlog 73b14b64, 2026-10-21).
+# `kubectl apply` client-side writes the WHOLE object, JSON-encoded, into
+# metadata.annotations[kubectl.kubernetes.io/last-applied-configuration],
+# and the API refuses annotations over 262,144 bytes. Train #1312 took
+# the step-plugins data from 226,184 to 253,710 bytes, the escaped copy
+# crossed the limit, and every converge from 15:23Z died here with "The
+# ConfigMap "step-plugins" is invalid: metadata.annotations: Too long"
+# — in the journal only. A server-side apply stores no such annotation;
+# its own field manager (not `kubectl`, which the API server would keep
+# syncing the old annotation for) owns the keys, and --force-conflicts
+# takes them over from the client-side manager that wrote them before.
+# gate-runner-script goes the same way: it is the same derived shape,
+# ~158 KB escaped and growing with run.sh, at 60% of the same limit.
+#
+# WHAT KUBECTL SAID REACHES THE PACKET. The three failed converges
+# carried `failed_stage: configmaps` and nothing else, so the cause was
+# read off the forge journal through an ops-request. A refused apply now
+# records kubectl's own output, verbatim and named, as
+# `failed_stage_output` beside `failed_stage` (CLAUDE.md §Diagnosis: a
+# verdict must name what failed).
+apply_derived_configmap() { # <name>  — the generated ConfigMap on stdin
+    local out rc=0
+    out="$(mktemp -t cluster-deploy-configmap.XXXXXX)"
+    $KAPPLY apply --server-side --field-manager=cluster-deploy-runner --force-conflicts -f - \
+        > "$out" 2>&1 || rc=$?
+    cat "$out"
+    if [ "$rc" -ne 0 ]; then
+        run_summary_field failed_stage_output "$1 (kubectl apply exit $rc): $(cat "$out")"
+    fi
+    rm -f "$out"
+    return "$rc"
+}
 STAGE="configmaps"
 PLUGIN_ARGS=""
-for f in "$REPO"/infra/step-plugins/*.js; do
+for f in "$REPO"/infra/step-plugins/*.js "$REPO"/infra/step-plugins/*.json; do
     [ -e "$f" ] || continue
     PLUGIN_ARGS="$PLUGIN_ARGS --from-file=$(basename "$f")=/plugins/$(basename "$f")"
 done
@@ -860,7 +894,7 @@ converge_step_plugins() { # NAMESPACE
         echo "cluster-deploy-runner: converging the step-plugins ConfigMap in $ns"
         # shellcheck disable=SC2086
         $KP create configmap step-plugins -n "$ns" $PLUGIN_ARGS \
-            --dry-run=client -o yaml | $KAPPLY apply -f -
+            --dry-run=client -o yaml | apply_derived_configmap "step-plugins in $ns"
     else
         echo "cluster-deploy-runner: no bundles in infra/step-plugins — leaving the ConfigMap in $ns alone"
     fi
@@ -889,18 +923,22 @@ converge_step_plugins "$SOURCE_NS"
 # part a gate pod starts: it fetches the run.sh of the sha being gated and
 # execs it, so a run.sh car is gated by its OWN script; `run.sh` is main's
 # copy, which the bootstrap falls back to (named on the receipt) and which
-# a manifest still naming /repo-script/run.sh runs directly. The key set
-# is pinned equal to apply-script-configmap.sh's and to the manifest's
-# command by gate_runner_manifests.rs.
+# a manifest still naming /repo-script/run.sh runs directly. THREE since
+# 3e2c8ddc: `seed-refresh.sh` is the seed housekeeping both layouts run
+# and the judged-init layout's whole helper container (design b4bf8bba).
+# The key set is pinned equal to apply-script-configmap.sh's and to the
+# manifest's command by gate_runner_manifests.rs.
 KG="docker run --rm --log-driver=none --network host -v $KUBECONFIG_PATH:/kc:ro -v $REPO/infra/gate-runner:/gate:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
-if [ -f "$REPO/infra/gate-runner/run.sh" ] && [ -f "$REPO/infra/gate-runner/bootstrap.sh" ]; then
+if [ -f "$REPO/infra/gate-runner/run.sh" ] && [ -f "$REPO/infra/gate-runner/bootstrap.sh" ] \
+    && [ -f "$REPO/infra/gate-runner/seed-refresh.sh" ]; then
     echo "cluster-deploy-runner: converging the gate-runner-script ConfigMap"
     $KG create configmap gate-runner-script -n boss-dev \
         --from-file=run.sh=/gate/run.sh \
         --from-file=bootstrap.sh=/gate/bootstrap.sh \
-        --dry-run=client -o yaml | $KAPPLY apply -f -
+        --from-file=seed-refresh.sh=/gate/seed-refresh.sh \
+        --dry-run=client -o yaml | apply_derived_configmap "gate-runner-script in boss-dev"
 else
-    echo "cluster-deploy-runner: infra/gate-runner/run.sh or bootstrap.sh missing — leaving the ConfigMap alone" >&2
+    echo "cluster-deploy-runner: infra/gate-runner/run.sh, bootstrap.sh or seed-refresh.sh missing — leaving the ConfigMap alone" >&2
 fi
 
 # ONE patch, ONE revision. This used to be `set image` (main container)
@@ -937,6 +975,12 @@ echo "$HEAD" > "$STAMP_FILE"
 rm -f "$FAILED_FILE"
 echo "cluster-deploy-runner: cluster on $REGISTRY:$HEAD"
 _stage_done roll_s
+# THE TRAIN HEARS IT NOW (backlog 090720c3): the source instance serves
+# $HEAD, so say so on this run's packet before the stages below, rather
+# than in the summary its ExecStopPost delivers when the run ends. The
+# dispatcher rule complete-train-converged-on-runner-rolled converges
+# the train that merged it (cluster-deploy-lib.sh report_rolled).
+report_rolled "$REPO/infra/boss-step.sh" "$HEAD_FULL"
 # The roll is real from here; a failed verification below is a finding
 # about it, not a failed converge — the request reads converged either
 # way, and the maintenance packet carries the verification verdict.

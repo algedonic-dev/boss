@@ -65,10 +65,6 @@ const BY_DESIGN: &[(&str, &str)] = &[
         "the recorded probe's reader runs car-supplied shell on the forge and must not hold the estate token; its own reader door is backlog d26515c5",
     ),
     (
-        "infra/forge/recovery-kit-read.sh",
-        "installed root-owned outside the checkout and cannot source the reader (its own header says so)",
-    ),
-    (
         "infra/postgres/reset-to-baseline.sh",
         "an operator's tool against a local stack, not a caller of the estate",
     ),
@@ -199,7 +195,12 @@ fn every_shell_identity_sender_presents_the_machine_token() {
     );
     let missing: Vec<&str> = all
         .iter()
-        .filter(|(rel, signs, presents)| *signs && !*presents && !listed(rel))
+        .filter(|(rel, signs, presents)| {
+            *signs
+                && !*presents
+                && !listed(rel)
+                && !TOKENLESS_PROBES.iter().any(|site| site.file == rel)
+        })
         .map(|(rel, _, _)| rel.as_str())
         .collect();
     assert!(
@@ -676,6 +677,16 @@ const fn site(file: &'static str, needle: &'static str, sends: usize, why: &'sta
     }
 }
 
+/// A negative probe must reach the estate without its credential; otherwise
+/// it measures an accepted request and cannot prove the refusal it claims.
+/// One declaration feeds the file scan and the bounded per-command roster.
+const TOKENLESS_PROBES: &[Site] = &[site(
+    "infra/ops/machine-gate-refuses-tokenless.sh",
+    "\"${BOSS_JOBS_URL%/}/api/jobs?limit=1\"",
+    1,
+    "2710c8fc: the enforcing car's negative probe must present no machine token and receive401; its own fixture pins the empty header, disabled curl config, valid synthetic identity and exact status",
+)];
+
 /// Sends that do not go to a gated service port: another party's API, a
 /// download, a registry, a local stack, or a path the gate exempts.
 const NOT_THE_ESTATE: &[Site] = &[
@@ -775,6 +786,12 @@ const NOT_THE_ESTATE: &[Site] = &[
         "the kubectl download",
     ),
     site(
+        "infra/forge/netboot.sh",
+        "-o \"$tmp\" -- \"$url\"",
+        1,
+        "the Talos Image Factory download of the declared netboot kernel and initramfs (backlog ee31ab73); the estate token must never leave the estate",
+    ),
+    site(
         "infra/forge/journal-read.sh",
         "\"${BASE}/machine\"",
         1,
@@ -866,7 +883,7 @@ const NOT_THE_ESTATE: &[Site] = &[
     ),
     site(
         "infra/dev/dev-session.sh",
-        "claude) curl -fsSL https://claude.ai/install.sh | bash",
+        "claude) curl -q -fsSL https://claude.ai/install.sh | bash",
         1,
         "an agent CLI's installer",
     ),
@@ -894,7 +911,7 @@ const NOT_THE_ESTATE: &[Site] = &[
 const NOT_A_SEND: &[Site] = &[
     site(
         "infra/lib/curl-through-a-roll.sh",
-        "curl \"$@\" >&\"$write_fd\"",
+        "curl -q \"$@\" >&\"$write_fd\"",
         1,
         "the retry wrapper: it runs its caller's argv whole, and the header is judged on the caller's line",
     ),
@@ -906,7 +923,7 @@ const NOT_A_SEND: &[Site] = &[
     ),
     site(
         "infra/dev/dev-session.sh",
-        "echo \"curl -fsSL https://claude.ai/install.sh",
+        "echo \"curl -q -fsSL https://claude.ai/install.sh",
         1,
         "prose: the install command printed for a dry run",
     ),
@@ -1233,7 +1250,11 @@ fn stamps(reader: &Reader, command: &str) -> usize {
 }
 
 fn roster() -> impl Iterator<Item = &'static Site> {
-    NOT_THE_ESTATE.iter().chain(NOT_A_SEND).chain(OWED)
+    NOT_THE_ESTATE
+        .iter()
+        .chain(TOKENLESS_PROBES)
+        .chain(NOT_A_SEND)
+        .chain(OWED)
 }
 
 /// (refused lines, roster entries that excuse nothing now).
@@ -1265,10 +1286,11 @@ fn unstamped_sends(root: &Path) -> (Vec<String>, Vec<String>) {
             if stamped > 0
                 && let Some(out) = NOT_THE_ESTATE
                     .iter()
+                    .chain(TOKENLESS_PROBES)
                     .find(|s| s.file == rel && command.contains(s.needle))
             {
                 refused.push(format!(
-                    "{rel}:{n}: hands the estate token's header to a request NOT_THE_ESTATE names ({}): {shown}",
+                    "{rel}:{n}: hands the estate token's header to a request the tokenless roster names ({}): {shown}",
                     out.why
                 ));
                 continue;
@@ -1578,35 +1600,35 @@ fn an_unstamped_send_is_refused_however_it_is_spelled() {
     );
 }
 
-/// The token never rides a request the roster says leaves the estate: the
-/// header file is filled for one host, and nothing at the request checks
-/// where THIS request goes.
+/// A request the roster requires to be tokenless stays tokenless: an
+/// external request must not leak it and a negative probe must not carry it.
 #[test]
-fn a_rostered_request_out_of_the_estate_may_not_carry_the_header() {
-    let entry = &NOT_THE_ESTATE[0];
-    let root = boss_testing::scratch_dir("per-site-token-leaves");
-    std::fs::create_dir_all(root.join(entry.file).parent().unwrap()).unwrap();
-    let head = "#!/usr/bin/env bash\nmachine_token_header MT_HDR \"$BASE\" || MT_HDR=\"\"\n";
-    boss_testing::write_file(
-        &root.join(entry.file),
-        &format!(
-            "{head}curl -fsS ${{MT_HDR:+-H \"$MT_HDR\"}} \\\n    {} > \"$2\"\n",
-            entry.needle
-        ),
-    );
-    let (refused, _) = unstamped_sends(&root);
-    assert_eq!(refused.len(), 1, "{refused:#?}");
-    assert!(
-        refused[0].contains("hands the estate token's header")
-            && refused[0].starts_with(&format!("{}:3:", entry.file)),
-        "{refused:#?}"
-    );
-    // The same request without the header is the rostered one, and passes.
-    boss_testing::write_file(
-        &root.join(entry.file),
-        &format!("{head}curl -fsS {} > \"$2\"\n", entry.needle),
-    );
-    assert!(unstamped_sends(&root).0.is_empty());
+fn a_rostered_tokenless_request_may_not_carry_the_header() {
+    for entry in [&NOT_THE_ESTATE[0], &TOKENLESS_PROBES[0]] {
+        let root = boss_testing::scratch_dir("per-site-token-leaves");
+        std::fs::create_dir_all(root.join(entry.file).parent().unwrap()).unwrap();
+        let head = "#!/usr/bin/env bash\nmachine_token_header MT_HDR \"$BASE\" || MT_HDR=\"\"\n";
+        boss_testing::write_file(
+            &root.join(entry.file),
+            &format!(
+                "{head}curl -fsS ${{MT_HDR:+-H \"$MT_HDR\"}} \\\n    {} > \"$2\"\n",
+                entry.needle
+            ),
+        );
+        let (refused, _) = unstamped_sends(&root);
+        assert_eq!(refused.len(), 1, "{refused:#?}");
+        assert!(
+            refused[0].contains("hands the estate token's header")
+                && refused[0].starts_with(&format!("{}:3:", entry.file)),
+            "{refused:#?}"
+        );
+        // The same request without the header is the rostered one, and passes.
+        boss_testing::write_file(
+            &root.join(entry.file),
+            &format!("{head}curl -fsS {} > \"$2\"\n", entry.needle),
+        );
+        assert!(unstamped_sends(&root).0.is_empty());
+    }
 }
 
 /// A roster entry excuses the sends it counts and not one more, and only

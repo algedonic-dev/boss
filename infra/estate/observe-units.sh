@@ -34,7 +34,7 @@
 #      below — a hand run. Unset, the roster is derived, which is what
 #      both hosts want: see THE ROSTER IS DERIVED),
 #      OBSERVE_UNITS_INSTALLER (optional; the installer whose `rows` /
-#      `roster` modes the roster is derived from. Unset, boss-gcp's
+#      `roster` / `beyond-rows` modes the roster is derived from. Unset, boss-gcp's
 #      infra/gcp/install-units.sh; the forge's unit points it at
 #      infra/forge/install.sh, which prints its own UNITS list in the
 #      same shape — backlog c98dcf38),
@@ -196,26 +196,47 @@ $_stem
     # so the rows above never reached it: on 2026-09-22/23 it was red
     # every minute on boss-gcp while this observer posted a clean reading
     # every five, and post-mortem 3c3b202c found no estate record of it
-    # at all. Whether a host gets one is asked of the one definition,
-    # install-ops-runner.sh --in-role, under the same roles — never
-    # restated here — so a host outside the role (or under the
-    # dark-registry sentinel) does not watch a runner it never installs.
-    _runner="$_infra/ops/install-ops-runner.sh"
-    if [ ! -f "$_runner" ]; then
-        echo "observe-units: $_runner is not readable, so whether this host runs an" >&2
-        echo "    ops-request runner cannot be asked. REFUSING rather than watching less." >&2
+    # at all.
+    #
+    # AND EVERY OTHER UNIT THE INSTALLER PUTS BESIDE ITS PAIRS (backlog
+    # 2eae38d4). Asking only whether the runner's pair was installed left
+    # out what is installed WITH it: the waker, a long-running unit that
+    # starts the runner the moment a request is filed, landed on the forge
+    # on 2026-10-20 and that day's reading carried it as undeclared_units
+    # — running, and judged by nothing — so a dead waker would have shown
+    # only as ops-request queued_s drifting from ~10 s back toward ~33 s
+    # while the timer kept every request moving. The forge's network-boot
+    # daemons were the same shape, seen by nothing but the next converge.
+    # So the installer's `beyond-rows` mode names them, asking each file
+    # that installs one (install-ops-runner.sh --units, netboot.sh units)
+    # under the same roles — never restated here — so a host outside the
+    # ops-runner role, or under the dark-registry sentinel, watches no
+    # runner, and boss-gcp, whose runner starts through the root tree's
+    # launcher and so gets no waker, watches none. Empty is an answer: a
+    # host with nothing beyond its pairs. A mode that fails is not.
+    _rc=0
+    _beyond=$(BOSS_REPO_ROOT="${BOSS_REPO_ROOT:-$(cd "$_infra/.." && pwd)}" \
+        BOSS_NODE_ROLES="${BOSS_NODE_ROLES:-}" bash "$INSTALLER" beyond-rows 2>/dev/null) || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        echo "observe-units: $INSTALLER beyond-rows exited $_rc, so what this host installs" >&2
+        echo "    beside its pairs (the ops runner and its waker among them) cannot be asked." >&2
+        echo "    REFUSING rather than watching less." >&2
         return 1
     fi
-    _rc=0
-    BOSS_NODE_ROLES="${BOSS_NODE_ROLES:-}" bash "$_runner" --in-role >/dev/null 2>&1 || _rc=$?
-    case "$_rc" in
-    0) _out="$_out boss-ops-runner.timer boss-ops-runner.service" ;;
-    1) ;;
-    *)
-        echo "observe-units: $_runner --in-role exited $_rc — neither yes nor no. REFUSING." >&2
+    for _u in $_beyond; do
+        case "$_u" in
+        *[!A-Za-z0-9@._-]*) ;;
+        ?*.service | ?*.timer)
+            case " $ROSTER_EXCLUDE " in
+            *" $_u "*) ;;
+            *) _out="$_out $_u" ;;
+            esac
+            continue
+            ;;
+        esac
+        echo "observe-units: $INSTALLER beyond-rows printed '$_u', not a unit name. REFUSING." >&2
         return 1
-        ;;
-    esac
+    done
     if [ -z "$_out" ]; then
         echo "observe-units: every roles.toml row was skipped or excluded, so the" >&2
         echo "    derived roster is empty. REFUSING; nothing to watch is a config fault." >&2
@@ -420,27 +441,28 @@ echo "observing $HOST_ID units: $# watched (roles: ${BOSS_NODE_ROLES:-none}, $ro
 # observe-host.sh carries (its first scheduled firing turned a curl -o
 # write error into an UNREACHABLE lie).
 #
+# observe-lib.sh, beside this script as it is beside observe-host.sh,
+# carries two things this post shares with post_observation and must not
+# spell again (backlog f85ebd8a, N-c of review 7c5ecf57; CLAUDE.md §9a):
+# the one shell token reader, which it sources only when that is there,
+# and the time bound's rule, observe_post_bound. This post keeps its own
+# curl: it signs as the unit observer, fails the unit rather than
+# spooling, and says so on stderr.
+. "$(dirname "$0")/observe-lib.sh"
+
 # The machine token is presented, never required (design 6805c764;
-# backlog 2710c8fc): the one shell reader, sourced only when it is
-# beside this script (`.` on a missing file ends a dash script), called
-# here in the script's own shell before the `$(…)`. Anything short of a
-# header — no lib, no slot, a refused slot, a host off the estate's
-# list, a file that cannot be made — posts unstamped, as before.
+# backlog 2710c8fc): the reader is called here in the script's own shell
+# before the `$(…)`. Anything short of a header — no lib, no slot, a
+# refused slot, a host off the estate's list, a file that cannot be made
+# — posts unstamped, as before.
 MT_HDR=""
-if [ -r "$(dirname "$0")/../lib/secret-header.sh" ]; then . "$(dirname "$0")/../lib/secret-header.sh"; fi
 if command -v machine_token_header >/dev/null 2>&1; then
     machine_token_header MT_HDR "$JOBS_API" || MT_HDR=""
 fi
-# A TIME BOUND, by observe-lib.sh post_observation's variable and rule
-# (backlog df38075a, the half of F1 the first car left): this curl had
-# none, in a oneshot whose start timeout systemd leaves off, so a system
-# of record that accepts and never answers held the tick, its timer and
-# the header for as long as it liked. Curl exit 28 fails the unit like
-# any other unreachable API. Whole seconds; not a number, or 0 (curl's
-# "no bound"), is the default.
-case "${OBSERVE_POST_MAX_TIME:-}" in
-    '' | *[!0-9]* | 0*) OBSERVE_POST_MAX_TIME=60 ;;
-esac
+# A TIME BOUND (backlog df38075a, the half of F1 the first car left):
+# observe_post_bound's, in observe-lib.sh. Curl exit 28 fails the unit
+# like any other unreachable API.
+observe_post_bound
 resp=$(printf '%s' "$observation" | curl -s -w '\n%{http_code}' \
     --connect-timeout 10 --max-time "$OBSERVE_POST_MAX_TIME" \
     -X POST -H 'content-type: application/json' \

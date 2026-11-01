@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 mod attempt;
+pub(super) mod bay;
+#[cfg(test)]
+mod identity_tests;
 mod settlement;
 mod source_claim;
 mod staging;
@@ -87,9 +90,18 @@ async fn launch_legacy_on(
             "boss gate: explicit process-owned legacy transport; policy {} pinned protocol {}",
             policy["version"], row["workflow_version"]
         );
+        // The legacy transport takes the same bay as every other launch
+        // (backlog ac8d3157): it is a path to a Job, so it is no way past
+        // the bound. Its Job is named by the server, and found again by
+        // the packet label every gate Job carries.
+        let desired = client_document(doors, packet, namespace, manifest).await?;
+        let (bay, _) = bay::reserve_on(doors, namespace, packet, &desired, now).await?;
         let mut command = native_command(doors, namespace);
         command.args(["create", "-f", "-"]);
         let outcome = native_create(command, manifest.as_bytes()).await;
+        if matches!(outcome, NativeCreate::NotSpawned { .. }) {
+            bay::release_on(doors, namespace, &bay, now).await;
+        }
         let artifact = retain(
             doors,
             packet,
@@ -190,6 +202,93 @@ pub(super) async fn observe(http: &crate::machine_http::MachineClient, packet: &
         }
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     }
+}
+
+/// The resident places still waiting for a bay in `namespace`, each at
+/// its ORIGINAL ACCEPTANCE — the server receipt's instant, the one the
+/// resident supervisor orders by (backlog b56bfc29). A legacy waiter
+/// merges these into its line ([`super::mixed_line`]) so a resident
+/// place taken before its own is ahead of it, and one taken after is
+/// not; the supervisor counts legacy places against the same instant.
+/// Read from the receipt and never from the packet's client stamps,
+/// because two owners reading two instants for one place can each
+/// count the other ahead and hold a free bay between them.
+///
+/// A resident whose original acceptance cannot be read is not counted:
+/// the supervisor retains it unlaunched on the same read, so it holds
+/// no place either side would honour. Nor is one the packet itself
+/// refuses ([`off_packet`]), for the same reason (backlog 48b1b7b4). A
+/// read that fails in transit is uncounted for that one poll too; the
+/// bay taken at the create (backlog ac8d3157) still bounds every launch,
+/// so the worst it costs is one waiter taking a bay a pass early, never
+/// a bay over the bound. An UNKNOWN forge answer IS counted: the next
+/// pass may launch it.
+pub(super) async fn resident_places(
+    http: &crate::machine_http::MachineClient,
+    open: &[Value],
+    namespace: &str,
+) -> Result<Vec<(chrono::DateTime<chrono::Utc>, String)>> {
+    resident_places_on(&Doors::live(http)?, open, namespace).await
+}
+
+async fn resident_places_on(
+    http: &Doors<'_>,
+    open: &[Value],
+    namespace: &str,
+) -> Result<Vec<(chrono::DateTime<chrono::Utc>, String)>> {
+    let mut places = Vec::new();
+    for row in open {
+        let waiting = row.get("metadata").is_some_and(model::waiting_for_native);
+        let Some(packet) = row.get("id").and_then(Value::as_str).filter(|_| waiting) else {
+            continue;
+        };
+        if let Ok((submission, receipt, current)) = submission::accepted_on(http, packet).await
+            && submission.intent.namespace == namespace
+            && matches!(
+                off_packet(packet, &current, &submission.intent.head),
+                Ok(None)
+            )
+        {
+            places.push((receipt.applied_at, packet.to_owned()));
+        }
+    }
+    places.sort();
+    Ok(places)
+}
+
+/// Why the resident supervisor will not launch a request, read off the
+/// packet alone — before any forge or car read.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum OffPacket {
+    /// Closed, or its verdict already recorded ([`launch_target_refusal`]).
+    /// Never launched, and not the supervisor's to settle: a recorded
+    /// verdict cannot be withdrawn ([`withdraw_refusal`]).
+    Refused(String),
+    /// Its source names another head than its request. Both are written
+    /// once, in the one immutable submission, so this is permanent.
+    HeadDisagrees { source: Option<String> },
+}
+
+/// PURE: what the packet `current` says against launching the resident
+/// request accepted at `head`, or `None` while it says nothing.
+///
+/// ONE QUESTION, TWO READERS (backlog 48b1b7b4). The supervisor refuses
+/// on it, and a legacy waiter ([`resident_places`]) counts a resident
+/// ahead of itself only while it answers `None`. Before this the waiter
+/// counted every waiting resident whose acceptance it could read, so one
+/// the supervisor refused on every pass held a bay from legacy gates
+/// until someone withdrew it by hand. An unreadable source is an error,
+/// which the supervisor retains and the waiter does not count.
+pub(super) fn off_packet(packet: &str, current: &Value, head: &str) -> Result<Option<OffPacket>> {
+    if let Some(why) = launch_target_refusal(packet, current) {
+        return Ok(Some(OffPacket::Refused(why)));
+    }
+    let source = model::source_metadata(current.get("metadata").context("gate lost metadata")?)
+        .map_err(anyhow::Error::msg)?;
+    let sha = source.get("sha").and_then(Value::as_str);
+    Ok((sha != Some(head)).then(|| OffPacket::HeadDisagrees {
+        source: sha.map(str::to_owned),
+    }))
 }
 
 /// Immutable I/O inputs. Live wrappers resolve supported doors once;
@@ -300,6 +399,12 @@ fn contains_desired(native: &Value, desired: &Value) -> bool {
                             container.as_object_mut()?.remove(key);
                         }
                     }
+                    // Only the OBSERVED default folds: IfNotPresent for a
+                    // pinned or tagged init image (train48bbc0b3's). The
+                    // server's Always for an untagged or `:latest` one was
+                    // never observed — the init image is a tagged mirror —
+                    // so it reads as a difference (P3-1 of review 8c92f75b,
+                    // backlog cafa83a5).
                     if collection == "initContainers" {
                         let image = container["image"].as_str()?;
                         let last = image.rsplit('/').next()?;
@@ -307,17 +412,24 @@ fn contains_desired(native: &Value, desired: &Value) -> bool {
                             || last
                                 .split_once(':')
                                 .is_some_and(|(_, tag)| tag != "latest" && !tag.is_empty());
-                        let default = if immutable_or_tagged {
-                            "IfNotPresent"
-                        } else {
-                            "Always"
-                        };
-                        if container["imagePullPolicy"] == json!(default) {
+                        if immutable_or_tagged
+                            && container["imagePullPolicy"] == json!("IfNotPresent")
+                        {
                             container.as_object_mut()?.remove("imagePullPolicy");
                         }
                     }
                     if let Some(env) = container["env"].as_array_mut() {
                         for entry in env {
+                            // An EnvVar's `value` is omitempty: the server
+                            // stores `{"name":X,"value":""}` as `{"name":X}`,
+                            // one value spelled two ways. A full gate's
+                            // GATE_MODE is "", so until this line every main
+                            // and builder full gate ran while its launch read
+                            // UNKNOWN (backlog 0c77e4db). Only EMPTY folds;
+                            // a dropped non-empty value still differs.
+                            if entry.get("value") == Some(&json!("")) {
+                                entry.as_object_mut()?.remove("value");
+                            }
                             if let Some(field) = entry
                                 .pointer_mut("/valueFrom/fieldRef")
                                 .and_then(Value::as_object_mut)
@@ -373,6 +485,63 @@ struct NativeCensus {
     artifact: crate::attach::Attached,
 }
 
+/// A read of the system of record as a RECORD keeps it: which read, and
+/// the size and SHA-256 of its exact reply — never the reply itself.
+///
+/// WHY (backlog e1943ef0, measured 2026-10-19 on gate-run dec70bf9, the
+/// first durable submission since 0e7a03d7). Kept whole, the reads were
+/// copies of the system of record inside it: the source claim's reads put
+/// the builder's run and its whole parent item into the immutable
+/// submission (a 499 KB gate packet, so its guarded withdrawal event
+/// encoded to 995,839 bytes and the bus bound refused it), and the
+/// supervisor's pass report carried every list page whole (6.3 MB, which
+/// the cadence outcome door refused 413 every pass). The history of
+/// what was read is the event log's; the decision each read fed is
+/// recorded beside it (`gate_source_claim`, the report's own verdicts),
+/// and the digest says which bytes it was.
+fn read_digest(operation: &str, reply: &Value) -> Value {
+    let bytes = serde_json::to_vec(reply).unwrap_or_default();
+    json!({"operation":operation,
+        "id":reply.get("id").cloned().unwrap_or(Value::Null),
+        "total":reply.get("total").cloned().unwrap_or(Value::Null),
+        "bytes":bytes.len(),"sha256":hex::encode(Sha256::digest(&bytes))})
+}
+
+/// What every census reader decides on, per Job: identity, labels and
+/// status (`bay::job_live`, the packet label, the name/uid checks) — not
+/// the pod template, which is ~40 KB of each live gate Job. Measured
+/// 2026-10-19: boss-dev's `app=gate-runner` census, the day's finished
+/// gate Jobs included, was 5,376,991 bytes, over the file store's
+/// 2,097,152-byte upload bound, so retaining it whole failed every
+/// resident pass before admission (backlog e1943ef0, gate-run dec70bf9).
+/// The whole reply is named by its size and digest beside this.
+fn census_projection(list: &Value) -> Value {
+    let items: Vec<Value> = list
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|job| {
+                    let keep = |key: &str| {
+                        job.pointer(&format!("/metadata/{key}"))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    };
+                    json!({"apiVersion":job.get("apiVersion"),"kind":job.get("kind"),
+                        "metadata":{"name":keep("name"),"namespace":keep("namespace"),
+                            "uid":keep("uid"),"resourceVersion":keep("resourceVersion"),
+                            "creationTimestamp":keep("creationTimestamp"),
+                            "deletionTimestamp":keep("deletionTimestamp"),"labels":keep("labels")},
+                        "status":job.get("status")})
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({"apiVersion":list.get("apiVersion"),"kind":list.get("kind"),
+        "metadata":list.get("metadata"),"items":items})
+}
+
 async fn native_census_on(
     http: &Doors<'_>,
     namespace: &str,
@@ -406,22 +575,42 @@ async fn native_census_on(
             });
         }
     };
-    let artifact = retain(
-        http,
-        packet,
-        &serde_json::to_vec(&json!({"operation":"native-packet-census",
+    // The census is conserved WHOLE whenever the file store can hold it —
+    // every packet-scoped census can. Only a reply the store cannot take
+    // is retained as `census_projection` plus the whole reply's size and
+    // digest, and says so: before this, that case retained nothing and
+    // refused the pass (e1943ef0).
+    let parsed: Option<Value> = serde_json::from_slice(&output.stdout).ok();
+    let record = |stdout: Value| {
+        serde_json::to_vec(&json!({"operation":"native-packet-census",
         "namespace":namespace,"selector":selector,"packet":packet,"status":output.status.code(),
-        "stdout":output.stdout,"stderr":output.stderr}))?,
-    )
-    .await?;
+        "stdout":stdout,"stderr":output.stderr}))
+    };
+    let mut bytes = record(json!(output.stdout))?;
+    if let Some(list) = &parsed
+        && bytes.len() as u64 > crate::attach::largest_file()
+    {
+        bytes = record(json!({"whole_bytes":output.stdout.len(),
+            "whole_sha256":hex::encode(Sha256::digest(&output.stdout)),
+            "whole_not_retained":format!("the whole reply exceeds the file store's bound; {}",
+                crate::attach::limit_sentence()),
+            "projection":census_projection(list)}))?;
+    }
+    let artifact = retain(http, packet, &bytes).await?;
     if !output.status.success() {
         bail!(
             "native packet census refused: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let list: Value =
-        serde_json::from_slice(&output.stdout).context("native packet census is not JSON")?;
+    let list: Value = parsed.context("native packet census is not JSON")?;
+    census_bound(&list, namespace)?;
+    Ok(NativeCensus { list, artifact })
+}
+
+/// PURE: whether a census reply is one complete JobList of this
+/// namespace's Jobs, each named once and uid'd once.
+fn census_bound(list: &Value, namespace: &str) -> Result<()> {
     if list.get("kind").and_then(Value::as_str) != Some("JobList")
         || list.get("apiVersion").and_then(Value::as_str) != Some("batch/v1")
         || list
@@ -454,17 +643,42 @@ async fn native_census_on(
             .and_then(Value::as_str)
             .filter(|uid| !uid.is_empty())
             .context("native packet census has a uid-less Job")?;
-        if job.get("kind").and_then(Value::as_str) != Some("Job")
-            || job.pointer("/metadata/namespace").and_then(Value::as_str) != Some(namespace)
-            || !names.insert(name.to_owned())
-            || !uids.insert(uid.to_owned())
-        {
+        // An item's type is its list's: the API leaves `kind` and
+        // `apiVersion` off every item of a typed list (measured on boss-dev,
+        // 2026-10-20), so an absent one is the batch/v1 Job the JobList
+        // above already says it is. One that IS stated must agree. Demanding
+        // it refused every non-empty census for the resident supervisor's
+        // whole first hour live (backlog d561255c).
+        for (key, expected) in [("kind", "Job"), ("apiVersion", "batch/v1")] {
+            if let Some(stated) = job.get(key).filter(|stated| !stated.is_null())
+                && stated.as_str() != Some(expected)
+            {
+                bail!(
+                    "native packet census contains an unbound Job {name}: its {key} is {stated}, not {expected}; all native work remains untouched"
+                );
+            }
+        }
+        // Each refusal names the Job and the reason: the one sentence these
+        // replaced named neither, and a dead gate queue was diagnosed from
+        // the code instead of from the record (d561255c).
+        let found = job.pointer("/metadata/namespace").unwrap_or(&Value::Null);
+        if found.as_str() != Some(namespace) {
             bail!(
-                "native packet census contains an unbound or repeated Job; all native work remains untouched"
+                "native packet census contains an unbound Job {name}: its namespace is {found}, not {namespace}; all native work remains untouched"
+            );
+        }
+        if !names.insert(name.to_owned()) {
+            bail!(
+                "native packet census contains a repeated Job: the name {name} appears twice; all native work remains untouched"
+            );
+        }
+        if !uids.insert(uid.to_owned()) {
+            bail!(
+                "native packet census contains a repeated Job: {name} repeats the uid {uid}; all native work remains untouched"
             );
         }
     }
-    Ok(NativeCensus { list, artifact })
+    Ok(())
 }
 
 async fn native_jobs(http: &Doors<'_>, namespace: &str, packet: &str) -> Result<Vec<String>> {
@@ -504,12 +718,12 @@ async fn run_with_input(
     native_output(native_create(command, bytes).await)
 }
 
-async fn client_document(
+/// The native renderer's dry run of `manifest`: nothing is created.
+async fn dry_render(
     http: &Doors<'_>,
-    packet: &str,
     namespace: &str,
     manifest: &str,
-) -> Result<Value> {
+) -> Result<(std::process::Output, Option<String>)> {
     let mut command = native_command(http, namespace);
     command.args([
         "create",
@@ -520,10 +734,13 @@ async fn client_document(
         "-o",
         "json",
     ]);
-    let (output, input_error) = run_with_input(command, manifest.as_bytes())
+    run_with_input(command, manifest.as_bytes())
         .await
-        .context("rendering native Job JSON without creating it")?;
-    retain(http,packet,&serde_json::to_vec(&json!({"operation":"render-native-request","input_error":input_error,"status":output.status.code(),"stdout":output.stdout,"stderr":output.stderr}))?).await?;
+        .context("rendering native Job JSON without creating it")
+}
+
+/// The one Job a dry run returned, or why it returned none.
+fn rendered_job(output: &std::process::Output, input_error: Option<&str>) -> Result<Value> {
     if !output.status.success() || input_error.is_some() {
         bail!(
             "native dry renderer failed: {}",
@@ -535,6 +752,84 @@ async fn client_document(
         bail!("native renderer did not return one Job");
     }
     Ok(value)
+}
+
+async fn client_document(
+    http: &Doors<'_>,
+    packet: &str,
+    namespace: &str,
+    manifest: &str,
+) -> Result<Value> {
+    let (output, input_error) = dry_render(http, namespace, manifest).await?;
+    retain(http,packet,&serde_json::to_vec(&json!({"operation":"render-native-request","input_error":input_error,"status":output.status.code(),"stdout":output.stdout,"stderr":output.stderr}))?).await?;
+    rendered_job(&output, input_error.as_deref())
+}
+
+/// PURE: a dry-rendered Job made into the request a launch submits —
+/// server identity dropped, the deterministic name and the namespace set.
+/// ONE definition for the launch ([`prepare_on`]) and the train gate's
+/// unsent preview ([`preview_request_for_conductor`]), so the request the
+/// reuse comparison judges is the request a launch would make.
+fn finish_request(desired: &mut Value, name: &str, namespace: &str) -> Result<()> {
+    let metadata = desired
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+        .context("native Job has no metadata")?;
+    metadata.remove("generateName");
+    for key in [
+        "creationTimestamp",
+        "uid",
+        "resourceVersion",
+        "managedFields",
+    ] {
+        metadata.remove(key);
+    }
+    metadata.insert("name".into(), json!(name));
+    metadata.insert("namespace".into(), json!(namespace));
+    if let Some(metadata) = desired
+        .pointer_mut("/spec/template/metadata")
+        .and_then(Value::as_object_mut)
+    {
+        metadata.remove("creationTimestamp");
+    }
+    Ok(())
+}
+
+/// The exact bytes a gate-run's launch intent names, read back from the
+/// file store and checked against its sha256 and size — the car gate's
+/// side of the train-gate reuse comparison (backlog bbc13a4e).
+pub(super) async fn retained_request_for_conductor(
+    http: &crate::machine_http::MachineClient,
+    jobs: &str,
+    intent: &Value,
+) -> Result<Vec<u8>> {
+    let doors = Doors::conductor(http, jobs)?;
+    let intent: LaunchIntent =
+        serde_json::from_value(intent.clone()).context("unreadable immutable launch intent")?;
+    request_bytes(&doors, &intent).await
+}
+
+/// The request a launch of `manifest` on `head` would submit, rendered
+/// by the launch's own native path and NEVER sent, filed or retained —
+/// the train gate's side of the reuse comparison (backlog bbc13a4e).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn preview_request_for_conductor(
+    http: &crate::machine_http::MachineClient,
+    jobs: &str,
+    packet: &str,
+    namespace: &str,
+    branch: &str,
+    head: &str,
+    mode: &str,
+    manifest: &str,
+) -> Result<Vec<u8>> {
+    let doors = Doors::conductor(http, jobs)?;
+    let (_, argument) = execution_mode(mode)?;
+    let (output, input_error) = dry_render(&doors, namespace, manifest).await?;
+    let mut desired = rendered_job(&output, input_error.as_deref())?;
+    bind_execution(&mut desired, &json!({ "branch": branch }), head, &argument)?;
+    finish_request(&mut desired, &job_name(packet)?, namespace)?;
+    Ok(serde_json::to_vec(&desired)?)
 }
 
 async fn retain(http: &Doors<'_>, packet: &str, bytes: &[u8]) -> Result<crate::attach::Attached> {
@@ -627,6 +922,7 @@ async fn retained_identical(
             size_bytes: bytes.len() as u64,
             filename: text("filename")?,
             uploaded_by: text("uploaded_by")?,
+            reused: true,
         }));
     }
     Ok(None)
@@ -679,6 +975,11 @@ async fn record_native(
     intent: &LaunchIntent,
     native: &Value,
     artifact: &crate::attach::Attached,
+    // The bay this launcher took and the bound in force (backlog
+    // d777b20a), written beside `launched_at` in the same conditional
+    // write. None where the observation is recorded by a reader that took
+    // no bay — a resumed launch; it then leaves the key as it found it.
+    bay: Option<&Value>,
 ) -> Result<()> {
     let uid = native
         .pointer("/metadata/uid")
@@ -728,11 +1029,14 @@ async fn record_native(
                 "a different native UID or request was already observed; immutable identity cannot be replaced"
             );
         }
-        let command: Command = serde_json::from_value(
+        let mut command: Command = serde_json::from_value(
             json!({"contract_version":1,"idempotency_key":Uuid::new_v4(),
             "expected":{"gate_orphan_claim":{"present":false},model::INTENT:{"present":true,"value":intent},model::OBSERVATION:{"present":false},"launched_at":{"present":md.get("launched_at").is_some(),"value":md.get("launched_at").cloned().unwrap_or(Value::Null)}},
             "patch":{model::OBSERVATION:{"uid":uid,"name":intent.name,"namespace":intent.namespace,"created_at":created,"request_sha256":intent.sha256,"native_file_id":artifact.file_id,"native_sha256":artifact.sha256},"launched_at":created},"immutable_keys":[model::OBSERVATION]}),
         )?;
+        if let Some(bay) = bay {
+            command.patch.insert("gate_bay".into(), bay.clone());
+        }
         match apply_on(http, &intent.packet, &command).await {
             Ok(_) => return Ok(()),
             Err(error) if format!("{error:#}").contains("409") => continue,
@@ -797,19 +1101,66 @@ async fn existing_on(http: &Doors<'_>, namespace: &str, packet: &str) -> Result<
     {
         bail!("native retained Job differs from its immutable request");
     }
-    record_native(http, &intent, &native, &artifact).await?;
+    record_native(http, &intent, &native, &artifact, None).await?;
     consume_on(http, packet, generation).await?;
     Ok(Some(format!("job.batch/{}", intent.name)))
 }
 
 pub(super) fn execution_mode(mode: &str) -> Result<(String, String)> {
-    let argument = normalize_mode(if mode == "full" { "" } else { mode })?;
+    let argument = normalize_mode(if mode == RECORDED_FULL_MODE { "" } else { mode })?;
     let recorded = if argument.is_empty() {
-        "full".to_owned()
+        RECORDED_FULL_MODE.to_owned()
     } else {
         argument.clone()
     };
     Ok((recorded, argument))
+}
+
+/// PURE: the JSON pointer of the ONE container that runs the gate — the
+/// one declaring `GATE_BRANCH`, in EITHER list of the pod template. On the
+/// judged-init layout (backlog 3e2c8ddc; design b4bf8bba) the gate is an
+/// init container after the postgres sidecar and the one regular container
+/// is the `seed-refresh` helper, so a reader of `containers` alone finds
+/// the helper. A lone regular container that declares nothing is still
+/// taken, as before, unless an init container is named `gate`.
+pub(super) fn gate_executor(job: &Value) -> Result<String> {
+    let spec = job
+        .pointer("/spec/template/spec")
+        .context("native gate request has no containers")?;
+    let list = |collection: &str| {
+        spec.get(collection)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    };
+    let declared: Vec<String> = ["initContainers", "containers"]
+        .into_iter()
+        .flat_map(|collection| {
+            list(collection)
+                .iter()
+                .enumerate()
+                .filter(|(_, container)| {
+                    container
+                        .get("env")
+                        .and_then(Value::as_array)
+                        .is_some_and(|env| {
+                            env.iter().any(|entry| {
+                                entry.get("name").and_then(Value::as_str) == Some("GATE_BRANCH")
+                            })
+                        })
+                })
+                .map(move |(index, _)| format!("/spec/template/spec/{collection}/{index}"))
+        })
+        .collect();
+    let init_gate = list("initContainers")
+        .iter()
+        .any(|c| c.get("name").and_then(Value::as_str) == Some("gate"));
+    match (declared.as_slice(), list("containers").len()) {
+        ([one], _) => Ok(one.clone()),
+        ([], 0) => bail!("native gate request has no containers"),
+        ([], 1) if !init_gate => Ok("/spec/template/spec/containers/0".into()),
+        _ => bail!("native request does not declare one unambiguous gate executor"),
+    }
 }
 
 fn bind_execution(
@@ -818,32 +1169,10 @@ fn bind_execution(
     head: &str,
     argument: &str,
 ) -> Result<()> {
-    let containers = document
-        .pointer_mut("/spec/template/spec/containers")
-        .and_then(Value::as_array_mut)
-        .context("native gate request has no containers")?;
-    let declared: Vec<_> = containers
-        .iter()
-        .enumerate()
-        .filter_map(|(index, container)| {
-            container
-                .get("env")
-                .and_then(Value::as_array)
-                .is_some_and(|env| {
-                    env.iter().any(|entry| {
-                        entry.get("name").and_then(Value::as_str) == Some("GATE_BRANCH")
-                    })
-                })
-                .then_some(index)
-        })
-        .collect();
-    let index = match declared.as_slice() {
-        [index] => *index,
-        [] if containers.len() == 1 => 0,
-        _ => bail!("native request does not declare one unambiguous gate executor"),
-    };
-    let executor = containers[index]
-        .as_object_mut()
+    let pointer = gate_executor(document)?;
+    let executor = document
+        .pointer_mut(&pointer)
+        .and_then(Value::as_object_mut)
         .context("gate executor is not an object")?;
     let env = executor
         .entry("env")
@@ -931,28 +1260,8 @@ async fn prepare_on(
     }
     let mut desired = client_document(http, packet, namespace, manifest).await?;
     bind_execution(&mut desired, md, head, &argument)?;
-    let metadata = desired
-        .get_mut("metadata")
-        .and_then(Value::as_object_mut)
-        .context("native Job has no metadata")?;
-    metadata.remove("generateName");
-    for key in [
-        "creationTimestamp",
-        "uid",
-        "resourceVersion",
-        "managedFields",
-    ] {
-        metadata.remove(key);
-    }
     let name = job_name(packet)?;
-    metadata.insert("name".into(), json!(name));
-    metadata.insert("namespace".into(), json!(namespace));
-    if let Some(metadata) = desired
-        .pointer_mut("/spec/template/metadata")
-        .and_then(Value::as_object_mut)
-    {
-        metadata.remove("creationTimestamp");
-    }
+    finish_request(&mut desired, &name, namespace)?;
     let bytes = serde_json::to_vec(&desired)?;
     let artifact = retain(http, packet, &bytes).await?;
     let intent = LaunchIntent {
@@ -1248,15 +1557,7 @@ async fn create_on(
     {
         verify_previous_no_child(http, intent, &previous).await?;
     }
-    let signer = identity::apply(identity::signature_for(
-        &reqwest::Method::POST,
-        &format!("/api/jobs/{}/metadata/conditional", intent.packet),
-        http.caller.clone(),
-    ))?;
-    let actor = match boss_policy_client::types::automation_slug(&signer) {
-        Some(slug) => boss_core::actor::ActorId::Automation(slug.to_owned()).to_string(),
-        None => signer.parse::<boss_core::actor::ActorId>()?.to_string(),
-    };
+    let actor = submission::canonical_actor(http, &intent.packet).await?;
     if let Some(submission) = submission::require_owner_on(http, &intent.packet, md).await? {
         let mut reads = Vec::new();
         let eligible = source_claim::verify(
@@ -1282,9 +1583,29 @@ async fn create_on(
             )
         })?;
     }
-    let claim = attempt::Claim::originate(md, intent, actor)?;
-    let receipt = apply_on(http, &intent.packet, claim.command()).await?;
-    let permit = claim.confirm(&receipt)?;
+    // THE BAY, TAKEN BEFORE ANYTHING IS SENT (backlog ac8d3157). Every
+    // launcher — `boss gate`, the conductor's train and dock gates, the
+    // resident supervisor — reaches the native create only through here,
+    // so the bound holds for all of them at the one place a Job is made.
+    // Taken before the guarded attempt, so a refusal leaves no attempt to
+    // reconcile; given back on every path below that sends nothing.
+    let desired: Value =
+        serde_json::from_slice(bytes).context("native request bytes are not a Job document")?;
+    let (bay, bay_record) =
+        bay::reserve_on(http, &intent.namespace, &intent.packet, &desired, now).await?;
+    let permit = async {
+        let claim = attempt::Claim::originate(md, intent, actor)?;
+        let receipt = apply_on(http, &intent.packet, claim.command()).await?;
+        claim.confirm(&receipt)
+    }
+    .await;
+    let permit = match permit {
+        Ok(permit) => permit,
+        Err(e) => {
+            bay::release_on(http, &intent.namespace, &bay, now).await;
+            return Err(e);
+        }
+    };
     // Spending consumes this non-serializable value even when spawn
     // fails. No post-spawn error path can obtain it a second time.
     let sending = permit.spend();
@@ -1309,6 +1630,8 @@ async fn create_on(
         artifact.file_id, artifact.sha256
     );
     if matches!(outcome, NativeCreate::NotSpawned { .. }) {
+        // Proved never started: the bay goes back now, not at its grace.
+        bay::release_on(http, &intent.namespace, &bay, now).await;
         let row = read_on(http, &intent.packet).await?;
         let md = row
             .get("metadata")
@@ -1364,7 +1687,7 @@ async fn create_on(
     {
         bail!("native Job at the immutable name does not match the complete recorded request");
     }
-    record_native(http, intent, &native, &native_artifact).await?;
+    record_native(http, intent, &native, &native_artifact, Some(&bay_record)).await?;
     let _ = now;
     consume_on(
         http,
@@ -1575,6 +1898,164 @@ mod native_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A census Job as the Kubernetes API itself lists it: `metadata`,
+    /// `spec` and `status` only. Items of a typed list carry no `kind`
+    /// or `apiVersion` — those live once, on the list; `kubectl get -o
+    /// json` adds them back, the raw GET the census makes does not.
+    /// Measured 2026-10-20 on boss-dev: `kubectl get --raw
+    /// /apis/batch/v1/namespaces/boss-dev/jobs?labelSelector=app=gate-runner`
+    /// answered a JobList whose item keys were exactly these three.
+    fn listed_job(name: &str, namespace: &str, uid: &str) -> Value {
+        json!({"metadata": {"name": name, "namespace": namespace, "uid": uid,
+                            "labels": {"app": "gate-runner"}},
+               "spec": {}, "status": {}})
+    }
+
+    fn job_list(items: Vec<Value>) -> Value {
+        json!({"apiVersion": "batch/v1", "kind": "JobList",
+               "metadata": {"resourceVersion": "46352202"}, "items": items})
+    }
+
+    /// THE CENSUS READS THE API'S OWN SHAPE (backlog d561255c). Every
+    /// resident supervisor pass since policy v10 (2026-10-20 ~20:35Z)
+    /// refused "unbound or repeated Job" because the per-item kind check
+    /// demanded a `kind` the API never puts on a list item, so the first
+    /// Job of a non-empty census refused the whole pass and no submission
+    /// launched. The fixture apiserver listed its stored Jobs WITH kind,
+    /// which is why the car that added the check went green.
+    #[test]
+    fn a_job_list_as_the_api_answers_it_is_one_bound_census() {
+        let list = job_list(vec![
+            listed_job("gate-a", "boss-dev", "uid-a"),
+            listed_job("gate-b", "boss-dev", "uid-b"),
+        ]);
+        census_bound(&list, "boss-dev").unwrap();
+        // A Job that does state its type, as kubectl's rebuilt list does,
+        // still binds.
+        let mut typed = listed_job("gate-c", "boss-dev", "uid-c");
+        typed["kind"] = json!("Job");
+        typed["apiVersion"] = json!("batch/v1");
+        census_bound(&job_list(vec![typed]), "boss-dev").unwrap();
+    }
+
+    /// Each refusal NAMES the Job and why: the blanket sentence it replaced
+    /// named nothing, and that cost the d561255c diagnosis an hour of a
+    /// dead gate queue.
+    #[test]
+    fn an_unbound_or_repeated_job_is_refused_by_name_and_reason() {
+        let refusal = |items: Vec<Value>| {
+            format!(
+                "{:#}",
+                census_bound(&job_list(items), "boss-dev").unwrap_err()
+            )
+        };
+        let mut pod = listed_job("gate-a", "boss-dev", "uid-a");
+        pod["kind"] = json!("Pod");
+        let said = refusal(vec![pod]);
+        assert!(said.contains("gate-a") && said.contains("Pod"), "{said}");
+        let mut foreign = listed_job("gate-a", "boss-dev", "uid-a");
+        foreign["apiVersion"] = json!("batch/v2");
+        let said = refusal(vec![foreign]);
+        assert!(
+            said.contains("gate-a") && said.contains("batch/v2"),
+            "{said}"
+        );
+        let said = refusal(vec![listed_job("gate-a", "elsewhere", "uid-a")]);
+        assert!(
+            said.contains("gate-a") && said.contains("elsewhere") && said.contains("namespace"),
+            "{said}"
+        );
+        let said = refusal(vec![
+            listed_job("gate-a", "boss-dev", "uid-a"),
+            listed_job("gate-a", "boss-dev", "uid-b"),
+        ]);
+        assert!(said.contains("gate-a") && said.contains("name"), "{said}");
+        let said = refusal(vec![
+            listed_job("gate-a", "boss-dev", "uid-a"),
+            listed_job("gate-b", "boss-dev", "uid-a"),
+        ]);
+        assert!(
+            said.contains("gate-b") && said.contains("uid-a") && said.contains("uid"),
+            "{said}"
+        );
+        // The list itself must still be one complete batch/v1 JobList.
+        let mut untyped = job_list(vec![listed_job("gate-a", "boss-dev", "uid-a")]);
+        untyped["kind"] = json!("List");
+        assert!(census_bound(&untyped, "boss-dev").is_err());
+    }
+
+    /// THE WRITER AND THE REUSE READER AGREE ON WHAT IS PER-RUN (backlog
+    /// bbc13a4e). One dry-rendered Job, finished as a car's full launch
+    /// and as a train's `--auto` launch on another head and branch, by the
+    /// launch's own `bind_execution` and `finish_request`: the reuse
+    /// comparison finds no difference. Handed a different edit level, it
+    /// finds one. If a launch ever binds a new per-run value, this fails
+    /// rather than leaving every reuse to refuse in silence.
+    #[test]
+    fn a_car_and_a_train_launch_of_one_manifest_differ_only_in_per_run_values() {
+        use crate::train_gate_reuse::{Observed, launch_refusals, sha256_hex};
+        let rendered = |branch: &str, packet: &str, level: &str| {
+            json!({"apiVersion": "batch/v1", "kind": "Job",
+                   "metadata": {"generateName": format!("gate-{}-", branch.replace('/', "-")),
+                                "namespace": "boss-dev", "creationTimestamp": null,
+                                "labels": {"app": "gate-runner", "boss.dev/packet": packet,
+                                           "boss.dev/branch": branch.replace('/', "-")}},
+                   "spec": {"template": {"metadata": {"creationTimestamp": null},
+                            "spec": {"initContainers": [{"name": "gate", "image": "ci:1",
+                                "env": [{"name": "GATE_BRANCH", "value": branch},
+                                        {"name": "GATE_RUN_JOB_ID", "value": packet},
+                                        {"name": "GATE_MODE", "value": "$GATE_MODE"},
+                                        {"name": "BOSS_EDIT_LEVEL_ANSWER", "value": level}]}]}}}})
+        };
+        let finish = |mut doc: Value, branch: &str, packet: &str, head: &str, mode: &str| {
+            let (_, argument) = execution_mode(mode).unwrap();
+            bind_execution(&mut doc, &json!({"branch": branch}), head, &argument).unwrap();
+            finish_request(&mut doc, &job_name(packet).unwrap(), "boss-dev").unwrap();
+            serde_json::to_string(&doc).unwrap()
+        };
+        let (car_head, train_head) = ("a".repeat(40), "b".repeat(40));
+        let car_packet = "9d6b3ae3-cf1e-411e-ab6d-f2a0b7780f18";
+        let train_packet = "7f0c3a52-0d4e-4d7e-9a35-6d4f5b1e2c11";
+        let level = "{\"edit_level\":null}";
+        let car = finish(
+            rendered("fix/a", car_packet, level),
+            "fix/a",
+            car_packet,
+            &car_head,
+            RECORDED_FULL_MODE,
+        );
+        let sha = sha256_hex(car.as_bytes());
+        let judge = |train: String| {
+            launch_refusals(
+                &Observed::Known(car.clone()),
+                &Observed::Known(train),
+                Some(&sha),
+                &car_head,
+            )
+        };
+        let train = finish(
+            rendered("train/20261019-1200", train_packet, level),
+            "train/20261019-1200",
+            train_packet,
+            &train_head,
+            "--auto",
+        );
+        assert_eq!(judge(train), Vec::<String>::new());
+        let other_level = finish(
+            rendered("train/x", train_packet, "{\"edit_level\":\"data\"}"),
+            "train/x",
+            train_packet,
+            &train_head,
+            "--auto",
+        );
+        assert!(
+            judge(other_level)
+                .iter()
+                .any(|r| r.contains("launch request differs")),
+        );
+    }
+
     #[test]
     fn an_observed_gate_job_accepts_only_its_exact_server_defaults() {
         // Retained request/admitted Job from train48bbc0b3, with registry
@@ -1614,6 +2095,79 @@ mod tests {
         let mut unknown = actual;
         unknown["spec"]["template"]["spec"]["unknownAdmissionField"] = json!(true);
         assert!(!contains_desired(&unknown, &desired));
+    }
+    #[test]
+    fn an_unobserved_pull_policy_default_is_not_accepted_as_identity() {
+        // P3-1 of review 8c92f75b (backlog cafa83a5). The comparison also
+        // folded `Always` for an untagged or `:latest` init image: a real
+        // server default, but never observed — the gate's init image is
+        // a tagged mirror (`postgres:16`, pinned by
+        // the-build-pulls-only-mirrored-bases.sh) — and untested. Only the
+        // observed default folds; an unobserved one reads as a difference,
+        // which holds the launch UNKNOWN rather than binding on a guess.
+        let mut desired: Value =
+            serde_json::from_str(include_str!("reservation/fixtures/job-requested.json")).unwrap();
+        let mut actual: Value =
+            serde_json::from_str(include_str!("reservation/fixtures/job-admitted.json")).unwrap();
+        let init = "/spec/template/spec/initContainers/0";
+        assert!(
+            desired
+                .pointer(&format!("{init}/imagePullPolicy"))
+                .is_none()
+        );
+        for image in [
+            "registry.example.invalid/david/postgres",
+            "registry.example.invalid/david/postgres:latest",
+            "registry.example.invalid:3000/david/postgres",
+        ] {
+            *desired.pointer_mut(&format!("{init}/image")).unwrap() = json!(image);
+            *actual.pointer_mut(&format!("{init}/image")).unwrap() = json!(image);
+            *actual
+                .pointer_mut(&format!("{init}/imagePullPolicy"))
+                .unwrap() = json!("Always");
+            assert!(!contains_desired(&actual, &desired), "accepted {image}");
+        }
+    }
+    #[test]
+    fn a_full_gate_binds_the_job_whose_empty_mode_the_server_dropped() {
+        // Backlog 0c77e4db. A full gate's request carries
+        // `{"name":"GATE_MODE","value":""}` (`execution_mode` maps full to
+        // the empty argument), and the API server stores that entry as
+        // `{"name":"GATE_MODE"}`: an EnvVar's value is omitempty, so "" and
+        // absent are one value. Every main full gate and builder full gate
+        // since the immutable-name launch read as UNKNOWN while it ran
+        // (gate-runs 135d9645, 1c6bc729, d89246c6). The real
+        // requested/admitted pair, in the shape those live Jobs had.
+        let mut desired: Value =
+            serde_json::from_str(include_str!("reservation/fixtures/job-requested.json")).unwrap();
+        let mut actual: Value =
+            serde_json::from_str(include_str!("reservation/fixtures/job-admitted.json")).unwrap();
+        let index = |job: &Value| {
+            job["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|entry| entry["name"] == json!("GATE_MODE"))
+                .unwrap()
+        };
+        let (d, a) = (index(&desired), index(&actual));
+        desired["spec"]["template"]["spec"]["containers"][0]["env"][d] =
+            json!({"name":"GATE_MODE","value":""});
+        actual["spec"]["template"]["spec"]["containers"][0]["env"][a] = json!({"name":"GATE_MODE"});
+        assert!(
+            contains_desired(&actual, &desired),
+            "an empty env value the server dropped is the value that was requested"
+        );
+        // Only EMPTY is equivalent to absent: a dropped non-empty value, or
+        // a different one, is still a different Job.
+        let mut requested_auto = desired.clone();
+        requested_auto["spec"]["template"]["spec"]["containers"][0]["env"][d] =
+            json!({"name":"GATE_MODE","value":"--auto"});
+        assert!(!contains_desired(&actual, &requested_auto));
+        let mut admitted_other = actual.clone();
+        admitted_other["spec"]["template"]["spec"]["containers"][0]["env"][a] =
+            json!({"name":"GATE_MODE","value":"--auto"});
+        assert!(!contains_desired(&admitted_other, &desired));
     }
     #[tokio::test]
     async fn a_hung_native_child_is_bounded_with_both_original_streams_and_no_no_child_claim() {
@@ -1707,6 +2261,92 @@ mod tests {
             first
         );
         assert!(job_name("not-a-native-packet").is_err());
+    }
+    /// A judged-init request (backlog 3e2c8ddc; design b4bf8bba): the gate
+    /// is the init container after the postgres sidecar and `seed-refresh`
+    /// the one regular container.
+    fn judged_init_request() -> Value {
+        json!({"spec":{"template":{"spec":{
+            "initContainers":[
+                {"name":"postgres","image":"forge/postgres:16",
+                 "env":[{"name":"POSTGRES_USER","value":"boss"}]},
+                {"name":"gate","image":"forge/boss-ci:gate",
+                 "env":[{"name":"GATE_BRANCH","value":"rendered"},
+                        {"name":"GATE_MODE","value":"--auto"}]}],
+            "containers":[
+                {"name":"seed-refresh","image":"forge/boss-ci:helper",
+                 "env":[{"name":"NATIVE_JOB_NAME","value":"x"}]}]}}}})
+    }
+
+    /// THE FROZEN EXECUTION BINDS INTO THE CONTAINER THAT RUNS THE GATE,
+    /// WHEREVER THE POD DECLARES IT (backlog 3e2c8ddc). The binder used to
+    /// read only the regular containers and, finding one that declares no
+    /// GATE_BRANCH, took it as the executor: on the judged-init layout that
+    /// is the seed helper, so the frozen sha went to the housekeeping and
+    /// the gate ran the branch's head unbound.
+    #[test]
+    fn the_execution_binds_into_the_gate_wherever_the_pod_declares_it() {
+        const HEAD: &str = "26b7e3081a52923879dd07cda85c2f3f74e7abdf";
+        let request = judged_init_request();
+        let mut bound = request.clone();
+        bind_execution(&mut bound, &json!({"branch":"fix/x"}), HEAD, "").unwrap();
+        let env = |doc: &Value, pointer: &str| {
+            doc.pointer(&format!("{pointer}/env"))
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|e| (e["name"].as_str().unwrap().to_string(), e["value"].clone()))
+                .collect::<Vec<_>>()
+        };
+        let gate = env(&bound, "/spec/template/spec/initContainers/1");
+        for (key, value) in [
+            ("GATE_SHA", HEAD),
+            ("GATE_MODE", ""),
+            ("GATE_BRANCH", "fix/x"),
+        ] {
+            assert!(
+                gate.contains(&(key.to_string(), json!(value))),
+                "the gate is bound {key}={value}: {gate:?}"
+            );
+        }
+        assert_eq!(
+            bound["spec"]["template"]["spec"]["containers"],
+            request["spec"]["template"]["spec"]["containers"],
+            "the seed helper is not the executor and is bound nothing"
+        );
+        assert_eq!(
+            bound["spec"]["template"]["spec"]["initContainers"][0],
+            request["spec"]["template"]["spec"]["initContainers"][0],
+            "the sidecar is bound nothing"
+        );
+        // The layout every manifest rendered before: unchanged.
+        let mut old = json!({"spec":{"template":{"spec":{
+            "initContainers":[{"name":"postgres"}],
+            "containers":[{"name":"gate","env":[{"name":"GATE_BRANCH","value":"rendered"}]}]}}}});
+        bind_execution(&mut old, &json!({"branch":"fix/x"}), HEAD, "").unwrap();
+        assert!(
+            old["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"name":"GATE_SHA","value":HEAD}))
+        );
+        // A gate declared twice has no one executor.
+        let mut twice = request.clone();
+        twice["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"GATE_BRANCH","value":"rendered"}));
+        assert!(bind_execution(&mut twice, &json!({}), HEAD, "").is_err());
+        // A lone regular container beside an init `gate` that declares no
+        // GATE_BRANCH is not taken for the gate.
+        let mut unnamed = request;
+        unnamed["spec"]["template"]["spec"]["initContainers"][1]["env"] = json!([]);
+        assert!(bind_execution(&mut unnamed, &json!({}), HEAD, "").is_err());
+        assert_eq!(
+            bay::gate_image(&judged_init_request()).unwrap(),
+            "forge/boss-ci:gate",
+            "a bay is claimed with the gate's image, not the helper's"
+        );
     }
     #[test]
     fn matching_annotation_cannot_hide_a_different_native_spec() {

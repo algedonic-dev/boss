@@ -598,6 +598,73 @@ fn a_ready_approve_step_gets_the_plan_verbs_bytes() {
     );
 }
 
+#[test]
+fn the_orphan_backend_plan_reaches_the_real_runner_approval_door() {
+    needs_tools!();
+    let f = Fixture::new("orphan-backends-plan");
+    let script = f.root.join("native-plan.py");
+    // Only the native observation/attachment ports are replaced. The shipped
+    // main renders stdout/stderr, and the real runner judges those exact bytes.
+    std::fs::write(
+        &script,
+        format!(
+            r#"import importlib.util,sys
+spec=importlib.util.spec_from_file_location('fixture', {fixture:?})
+t=importlib.util.module_from_spec(spec);spec.loader.exec_module(t)
+m=t.module;db=m.load_database_module();R=db.bounded.Recorder
+def recorder(**kw):
+    kw.pop('execute',None)
+    return R(execute=lambda argv,timeout:(0,b'attachment recorded',b'',True),**kw)
+db.bounded.Recorder=recorder
+m.load_database_module=lambda:db
+n=t.Native()
+n.value['backends']=[dict(n.value['backends'][0],pid=123+i) for i in range(6)]
+m.Native=lambda *args:n
+sys.argv=['orphan-backends.py','--plan']
+sys.exit(m.main())
+"#,
+            fixture = repo_root()
+                .join("infra/forge/tests/orphan-backends-test.py")
+                .display()
+                .to_string()
+        ),
+    )
+    .unwrap();
+    for name in [
+        "plan-orphaned-client-backends",
+        "terminate-orphaned-client-backends",
+    ] {
+        let mut spec: Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root().join(format!("infra/ops/verbs/{name}.json")))
+                .unwrap(),
+        )
+        .unwrap();
+        if name.starts_with("plan-") {
+            spec["argv"] = json!(["python3", "-B", script.display().to_string()]);
+        }
+        f.verb_file(name, spec);
+    }
+    let mut packet = job("ready", approve_meta(None), json!([]), "pending");
+    packet["metadata"]["verb"] = json!("terminate-orphaned-client-backends");
+    packet["metadata"]["args"] = json!([]);
+    f.packet(packet);
+    let (out, writes) = f.run(&[("ORPHAN_BACKENDS_KUBECTL", "fake")]);
+    let patch = writes_to(&writes, "s-approve")
+        .into_iter()
+        .find(|w| w["method"] == "PATCH")
+        .unwrap_or_else(|| panic!("real orphan plan did not reach approval: {out}\n{writes:?}"));
+    let plan = patch["body"]["plan"].as_str().unwrap();
+    assert_eq!(
+        patch["body"]["rendered_plan_sha256"],
+        sha256_hex(plan.as_bytes())
+    );
+    assert!(plan.contains("123"), "{plan}");
+    let document: Value = serde_json::from_str(plan).unwrap();
+    assert_eq!(document["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(document["deferred"].as_array().unwrap().len(), 5);
+    assert!(f.applied().is_none(), "a plan never terminates a backend");
+}
+
 /// A plan already on the approve step is the one waiting to be signed —
 /// re-rendering it would move the bytes under a reviewer.
 #[test]
@@ -1288,6 +1355,15 @@ fn the_shipped_approval_verbs_hold_the_contract_and_the_disk_verb_reaches_its_pl
             "plan-an-instance-volume-expansion",
         ),
         ("retire-ops-runner", "plan-retire-ops-runner"),
+        ("retire-volume-claim", "plan-a-volume-claim-retirement"),
+        ("add-longhorn-disk", "plan-a-longhorn-disk"),
+        ("retire-access-object", "plan-an-access-object-retirement"),
+        ("remove-longhorn-disk", "plan-a-longhorn-disk-removal"),
+        (
+            "reregister-longhorn-disk",
+            "plan-a-longhorn-disk-reregistration",
+        ),
+        ("publish-tenant", "plan-a-tenant-publish"),
     ] {
         let w = read(write);
         let p = read(plan);

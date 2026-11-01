@@ -28,6 +28,8 @@
 //! ([[boss-where-to-push-a-car]]). So main is resolved by `ls-remote`
 //! against the remote that actually receives trains.
 
+use std::path::Path;
+
 use anyhow::Result;
 
 /// How a change was found on main. Recorded because the two paths have
@@ -44,6 +46,21 @@ pub enum How {
     /// changed. This is the only signal that survives a train, and it is
     /// the one a human actually uses to answer the question.
     ContentPresent,
+}
+
+/// What `git merge-tree --write-tree main <branch>` said, read through
+/// `car_retire::whole_tree` — the proof `boss car retire` and the
+/// conductor's lost-gate relaunch already use (2b198cac, 6a39558a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WholeTree {
+    /// The merge writes main's own tree. `landed_in` names the first
+    /// commit on main's first-parent line at which it already did — the
+    /// candidate landing — when one could be singled out.
+    OnMain { landed_in: Option<String> },
+    /// The merge is not main's tree; these paths are why.
+    Differs(Vec<String>),
+    /// The check ran and could not be read. Never a no.
+    Unreadable(String),
 }
 
 /// How much of what the branch changed is already in main.
@@ -93,6 +110,19 @@ pub struct Observations {
     /// byte-identical in main (0d1310f3). Content survives that,
     /// because it asks the question a human asks: is my change there?
     pub content: Option<ContentMatch>,
+    /// Merging the branch into main in memory. `None` = not attempted
+    /// (one of the two objects is missing locally).
+    ///
+    /// CONTENT CANNOT SEE A TWIN THAT LATER CARS EDITED. When a change
+    /// lands squashed under a twin branch and later cars touch the same
+    /// files, main's copy of every file differs from the branch's, the
+    /// patch-ids differ, and ancestry is false — all three say no for a
+    /// change that is on main (29d31df7). The three-way merge does not
+    /// care: hunks main already holds merge to nothing.
+    pub whole_tree: Option<WholeTree>,
+    /// Whether merge-base..branch contains a merge commit. None means
+    /// the history read could not establish either answer.
+    pub branch_has_merges: Option<bool>,
 }
 
 /// The decision, pure.
@@ -109,15 +139,21 @@ pub struct Observations {
 ///     case, which rules 2 and 3 both get wrong: a train squashes N
 ///     cars into one commit whose patch-id matches no single car
 ///     (0d1310f3).
-///  5. No branch anywhere, nothing else conclusive -> Unknown. A
+///  5. Merging the branch into main writes main's own tree -> Unknown.
+///     A candidate landing can be named, but a no-op merge cannot prove
+///     branch work survived a revert after the merge-base (5b9ae776).
+///     Empty branches and unread history also remain Unknown.
+///  6. No branch anywhere, nothing else conclusive -> Unknown. A
 ///     deleted branch is what an ARRIVED train leaves behind; reading
 ///     it as "not merged" inverted the truth for 89 cars.
-///  6. SOME files matching -> Unknown, with the count. A sibling car
+///  7. SOME files matching -> Unknown, with the count. A sibling car
 ///     editing one of this branch's files is indistinguishable from a
 ///     partial landing, so neither is asserted.
-///  7. All three signals present and negative -> NotMerged. The only
-///     path to a definite no.
-///  8. Anything else -> Unknown, naming what was missing.
+///  8. The whole tree unread or not run -> Unknown. Without it a
+///     change under a twin cannot be told from one that never landed.
+///  9. Every signal present and negative -> NotMerged. The only path
+///     to a definite no.
+/// 10. Anything else -> Unknown, naming what was missing.
 pub fn verdict(o: &Observations) -> Verdict {
     if o.main_sha.is_none() {
         return Verdict::Unknown(
@@ -141,6 +177,45 @@ pub fn verdict(o: &Observations) -> Verdict {
         && c.matching == c.total
     {
         return Verdict::Merged(How::ContentPresent);
+    }
+    // A no-op merge is useful evidence, not proof of retained work.
+    // Main can revert content already in the merge-base while a later
+    // shared change keeps the branch diff nonempty (5b9ae776).
+    let changes_something = o.content.is_some_and(|c| c.total > 0);
+    if changes_something && matches!(o.whole_tree, Some(WholeTree::OnMain { .. })) {
+        match o.branch_has_merges {
+            Some(false) => {
+                let candidate = match &o.whole_tree {
+                    Some(WholeTree::OnMain {
+                        landed_in: Some(at),
+                    }) => format!("candidate landing {at}"),
+                    _ => "no candidate landing could be named".into(),
+                };
+                return Verdict::Unknown(format!(
+                    "merging this branch into main writes main's own tree; {candidate}. \
+                     That does not prove every change at the branch head is retained: \
+                     main may have reverted earlier work already in the merge-base. \
+                     Confirm the candidate before treating this branch as merged"
+                ));
+            }
+            Some(true) => {
+                return Verdict::Unknown(
+                    "the branch contains a merge commit after its merge-base with main. \
+                 That can hide earlier branch work when main later reverts a twin, \
+                 so the whole-tree check cannot prove this branch merged — name the \
+                 original landing directly"
+                        .into(),
+                );
+            }
+            None => {
+                return Verdict::Unknown(
+                    "could not read whether the branch contains a merge commit after its \
+                 merge-base with main; the whole-tree check cannot prove the earlier \
+                 branch work is present without that history"
+                        .into(),
+                );
+            }
+        }
     }
     if o.branch_sha.is_none() {
         return Verdict::Unknown(
@@ -168,6 +243,39 @@ pub fn verdict(o: &Observations) -> Verdict {
             c.matching, c.total
         ));
     }
+    // A DEFINITE NO NEEDS THE WHOLE TREE READ AND DIFFERING. Unread, a
+    // change that landed under a twin is indistinguishable from one that
+    // never landed — which is the wrong answer 29d31df7 recorded.
+    match &o.whole_tree {
+        Some(WholeTree::Differs(_)) => {}
+        Some(WholeTree::Unreadable(why)) => {
+            return Verdict::Unknown(format!(
+                "the whole-tree check (merging this branch into main in memory) could \
+                 not be read: {why}. A change that landed squashed under a twin is \
+                 visible only to that check, so the other signals' no is not a no"
+            ));
+        }
+        // Rule 5 declined it: the check RAN, so "was not run" would be
+        // false. What it says is that the tree proves nothing here.
+        Some(WholeTree::OnMain { .. }) if !changes_something => {
+            return Verdict::Unknown(
+                "no nonempty changed-file set was observable: the branch changes nothing \
+                 against its merge-base with main or that read was unavailable. Merging \
+                 it into main writes main's own tree whatever main holds and the \
+                 whole-tree check proves nothing. A branch that merged main and then saw \
+                 main revert its twin, or whose commits cancel out, looks exactly like \
+                 this — name the merge commit directly"
+                    .into(),
+            );
+        }
+        Some(WholeTree::OnMain { .. }) | None => {
+            return Verdict::Unknown(
+                "the whole-tree check (merging this branch into main in memory) was not \
+                 run, so a change that landed squashed under a twin cannot be ruled out"
+                    .into(),
+            );
+        }
+    }
     match (o.is_ancestor, o.unmerged_patches, o.content) {
         // A definite no now needs the content check to agree: nothing
         // the branch changed is in main.
@@ -179,7 +287,7 @@ pub fn verdict(o: &Observations) -> Verdict {
         (Some(false), Some(n), None) if n > 0 => Verdict::NotMerged,
         _ => Verdict::Unknown(
             "not enough was observable to answer: needs an ancestry check, a patch \
-             comparison, and a content comparison against main"
+             comparison, a content comparison and a whole-tree merge against main"
                 .into(),
         ),
     }
@@ -224,7 +332,8 @@ pub fn observe(clone: &str, remote: &str, branch: &str) -> Observations {
         ])
     });
 
-    let (mut is_ancestor, mut unmerged_patches, mut content) = (None, None, None);
+    let (mut is_ancestor, mut unmerged_patches, mut content, mut whole_tree, mut branch_has_merges) =
+        (None, None, None, None, None);
     if let (Some(m), Some(b)) = (&main_sha, &branch_sha) {
         // Both objects have to be present locally to compare them.
         let have = |s: &str| {
@@ -247,6 +356,8 @@ pub fn observe(clone: &str, remote: &str, branch: &str) -> Observations {
                 .map(|s| s.lines().filter(|l| l.starts_with('+')).count())
                 .or(Some(0));
             content = content_match(clone, m, b);
+            whole_tree = Some(read_whole_tree(Path::new(clone), m, b));
+            branch_has_merges = read_merge_history(clone, m, b);
         }
     }
 
@@ -256,7 +367,75 @@ pub fn observe(clone: &str, remote: &str, branch: &str) -> Observations {
         is_ancestor,
         unmerged_patches,
         content,
+        whole_tree,
+        branch_has_merges,
     }
+}
+
+// A successful empty history is a reading, unlike `sh`'s empty/error
+// conflation. Only complete, valid commit IDs establish a merge exists.
+fn merge_history_answer(success: bool, stdout: &[u8]) -> Option<bool> {
+    if !success {
+        return None;
+    }
+    let text = std::str::from_utf8(stdout).ok()?;
+    let commits: Vec<_> = text.split_whitespace().collect();
+    commits
+        .iter()
+        .all(|id| matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then_some(!commits.is_empty())
+}
+
+fn read_merge_history(clone: &str, main: &str, branch: &str) -> Option<bool> {
+    let base = sh(&["git", "-C", clone, "merge-base", main, branch])?;
+    let range = format!("{base}..{branch}");
+    let out = crate::git_auth::command()
+        .args(["-C", clone, "rev-list", "--max-count=1", "--merges", &range])
+        .output()
+        .ok()?;
+    merge_history_answer(out.status.success(), &out.stdout)
+}
+
+/// Merge `branch` into `main` in memory — `car_retire::whole_tree`, the
+/// same reading the retire verb and the conductor's relaunch make — and,
+/// when it writes main's own tree, name the landing.
+fn read_whole_tree(repo: &Path, main: &str, branch: &str) -> WholeTree {
+    match crate::car_retire::whole_tree(repo, main, branch) {
+        Ok(t) if t.on_main() => WholeTree::OnMain {
+            landed_in: landed_in(repo, main, branch),
+        },
+        Ok(t) => WholeTree::Differs(t.files()),
+        Err(e) => WholeTree::Unreadable(e),
+    }
+}
+
+/// The first commit on main's first-parent line, among those touching a
+/// file the branch changed, at which merging the branch already writes
+/// that commit's own tree — the commit that carried the twin. A name is
+/// a courtesy to the reader, not proof that all branch work is retained.
+/// Failing to single one out answers `None`, never a no.
+fn landed_in(repo: &Path, main: &str, branch: &str) -> Option<String> {
+    let repo_s = repo.to_string_lossy();
+    let base = sh(&["git", "-C", &repo_s, "merge-base", main, branch])?;
+    let changed = sh(&["git", "-C", &repo_s, "diff", "--name-only", &base, branch])?;
+    let range = format!("{base}..{main}");
+    let mut args = vec![
+        "git",
+        "-C",
+        &repo_s,
+        "log",
+        "--first-parent",
+        "--reverse",
+        "--format=%H",
+        &range,
+        "--",
+    ];
+    args.extend(changed.lines().filter(|l| !l.is_empty()));
+    let candidates = sh(&args)?;
+    let at = candidates
+        .lines()
+        .find(|c| crate::car_retire::whole_tree(repo, c, branch).is_ok_and(|t| t.on_main()))?;
+    sh(&["git", "-C", &repo_s, "log", "-1", "--format=%h %s", at])
 }
 
 /// How many of the files this branch touched does main already match?
@@ -340,6 +519,9 @@ pub fn run(branch: &str, clone: Option<String>, remote: Option<String>) -> Resul
                 "  NOT MERGED — main carries neither the commit, nor its patches, nor \
                  the content of any file it changed"
             );
+            if let Some(WholeTree::Differs(files)) = &o.whole_tree {
+                println!("  ...and merging it into main changes {}", files.join(", "));
+            }
             // THE ONE ANSWER THIS VERB MUST NOT GIVE QUIETLY.
             //
             // A definite "no" is correct only if `remote` is the trunk
@@ -381,6 +563,182 @@ pub fn run(branch: &str, clone: Option<String>, remote: Option<String>) -> Resul
 mod tests {
     use super::*;
 
+    fn w(root: &std::path::Path, rel: &str, body: &str) {
+        boss_testing::scratch::write_file(&root.join(rel), body);
+    }
+
+    fn rv_repo(name: &str) -> (std::path::PathBuf, impl Fn(&[&str]) -> String) {
+        let root = boss_testing::scratch::scratch_dir(name);
+        let at = root.clone();
+        let g = move |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&at)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        g(&["init", "-q", "-b", "main"]);
+        boss_testing::scratch::write_file(&root.join("verb.rs"), "one\ntwo\nthree\nfour\nfive\n");
+        g(&["add", "."]);
+        g(&["commit", "-qm", "base"]);
+        (root, g)
+    }
+
+    #[test]
+    fn whole_tree_revert_true_merge_is_unknown() {
+        // P1: main TRUE-merges the branch's first commit, the branch goes
+        // on, main reverts that merge, then lands the branch's second
+        // change squashed beside a sibling. ONE is not on main.
+        {
+            let (r, g) = rv_repo("rv-p1");
+            g(&["checkout", "-q", "-b", "fix/p"]);
+            w(&r, "verb.rs", "ONE\ntwo\nthree\nfour\nfive\n");
+            g(&["commit", "-qam", "branch ONE"]);
+            g(&["checkout", "-q", "main"]);
+            g(&["merge", "-q", "--no-ff", "--no-edit", "fix/p"]);
+            g(&["checkout", "-q", "fix/p"]);
+            w(&r, "verb.rs", "ONE\ntwo\nthree\nfour\nFIVE\n");
+            g(&["commit", "-qam", "branch FIVE"]);
+            g(&["checkout", "-q", "main"]);
+            g(&["revert", "-m", "1", "--no-edit", "HEAD"]);
+            w(&r, "verb.rs", "one\ntwo\nthree\nfour\nFIVE\n");
+            w(&r, "sibling.rs", "sib\n");
+            g(&["add", "."]);
+            g(&["commit", "-qm", "train FIVE plus sibling"]);
+            assert_eq!(g(&["show", "main:verb.rs"]), "one\ntwo\nthree\nfour\nFIVE");
+            assert_eq!(g(&["show", "fix/p:verb.rs"]), "ONE\ntwo\nthree\nfour\nFIVE");
+            let repo = r.to_string_lossy();
+            let observed = observe(&repo, &repo, "fix/p");
+            assert_eq!(observed.is_ancestor, Some(false), "{observed:?}");
+            assert_eq!(observed.unmerged_patches, Some(1), "{observed:?}");
+            assert_eq!(
+                observed.content,
+                Some(ContentMatch {
+                    total: 1,
+                    matching: 0
+                }),
+                "{observed:?}"
+            );
+            assert_eq!(observed.branch_has_merges, Some(false), "{observed:?}");
+            assert!(
+                matches!(observed.whole_tree, Some(WholeTree::OnMain { .. })),
+                "{observed:?}"
+            );
+            assert!(
+                matches!(verdict(&observed), Verdict::Unknown(_)),
+                "a reverted ONE is absent from main: {observed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_tree_revert_fast_forward_is_unknown() {
+        // P1b: same, main FAST-FORWARDED to the branch's first commit.
+        {
+            let (r, g) = rv_repo("rv-p1b");
+            g(&["checkout", "-q", "-b", "fix/p"]);
+            w(&r, "verb.rs", "ONE\ntwo\nthree\nfour\nfive\n");
+            g(&["commit", "-qam", "branch ONE"]);
+            g(&["checkout", "-q", "main"]);
+            g(&["merge", "-q", "--ff-only", "fix/p"]);
+            g(&["checkout", "-q", "fix/p"]);
+            w(&r, "verb.rs", "ONE\ntwo\nthree\nfour\nFIVE\n");
+            g(&["commit", "-qam", "branch FIVE"]);
+            g(&["checkout", "-q", "main"]);
+            g(&["revert", "--no-edit", "HEAD"]);
+            w(&r, "verb.rs", "one\ntwo\nthree\nfour\nFIVE\n");
+            w(&r, "sibling.rs", "sib\n");
+            g(&["add", "."]);
+            g(&["commit", "-qm", "train FIVE plus sibling"]);
+            assert_eq!(g(&["show", "main:verb.rs"]), "one\ntwo\nthree\nfour\nFIVE");
+            assert_eq!(g(&["show", "fix/p:verb.rs"]), "ONE\ntwo\nthree\nfour\nFIVE");
+            let repo = r.to_string_lossy();
+            let observed = observe(&repo, &repo, "fix/p");
+            assert_eq!(observed.is_ancestor, Some(false), "{observed:?}");
+            assert_eq!(observed.unmerged_patches, Some(1), "{observed:?}");
+            assert_eq!(
+                observed.content,
+                Some(ContentMatch {
+                    total: 1,
+                    matching: 0
+                }),
+                "{observed:?}"
+            );
+            assert_eq!(observed.branch_has_merges, Some(false), "{observed:?}");
+            assert!(
+                matches!(observed.whole_tree, Some(WholeTree::OnMain { .. })),
+                "{observed:?}"
+            );
+            assert!(
+                matches!(verdict(&observed), Verdict::Unknown(_)),
+                "a reverted ONE is absent from main: {observed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_tree_revert_rebase_dropped_twin_is_unknown() {
+        // P6: rebase drops the twin-carried commit, then main reverts the
+        // twin and lands the branch's second change in a train.
+        {
+            let (r, g) = rv_repo("rv-p6");
+            g(&["checkout", "-q", "-b", "fix/p"]);
+            w(&r, "verb.rs", "ONE\ntwo\nthree\nfour\nfive\n");
+            g(&["commit", "-qam", "branch ONE"]);
+            g(&["checkout", "-q", "main"]);
+            w(&r, "verb.rs", "ONE\ntwo\nthree\nfour\nfive\n");
+            w(&r, "sibling.rs", "sib\n");
+            g(&["add", "."]);
+            g(&["commit", "-qm", "twin ONE plus sibling"]);
+            g(&["checkout", "-q", "fix/p"]);
+            g(&["rebase", "-q", "main"]);
+            w(&r, "verb.rs", "ONE\ntwo\nthree\nfour\nFIVE\n");
+            g(&["commit", "-qam", "branch FIVE"]);
+            g(&["checkout", "-q", "main"]);
+            g(&["revert", "--no-edit", "HEAD"]);
+            w(&r, "verb.rs", "one\ntwo\nthree\nfour\nFIVE\n");
+            w(&r, "sibling2.rs", "sib2\n");
+            g(&["add", "."]);
+            g(&["commit", "-qm", "train FIVE plus sibling2"]);
+            assert_eq!(g(&["show", "main:verb.rs"]), "one\ntwo\nthree\nfour\nFIVE");
+            assert_eq!(g(&["show", "fix/p:verb.rs"]), "ONE\ntwo\nthree\nfour\nFIVE");
+            let repo = r.to_string_lossy();
+            let observed = observe(&repo, &repo, "fix/p");
+            assert_eq!(observed.is_ancestor, Some(false), "{observed:?}");
+            assert_eq!(observed.unmerged_patches, Some(1), "{observed:?}");
+            assert_eq!(
+                observed.content,
+                Some(ContentMatch {
+                    total: 1,
+                    matching: 0
+                }),
+                "{observed:?}"
+            );
+            assert_eq!(observed.branch_has_merges, Some(false), "{observed:?}");
+            assert!(
+                matches!(observed.whole_tree, Some(WholeTree::OnMain { .. })),
+                "{observed:?}"
+            );
+            assert!(
+                matches!(verdict(&observed), Verdict::Unknown(_)),
+                "a reverted ONE is absent from main: {observed:?}"
+            );
+        }
+    }
+
     fn obs() -> Observations {
         Observations {
             main_sha: Some("aaaa".into()),
@@ -391,6 +749,375 @@ mod tests {
                 total: 4,
                 matching: 0,
             }),
+            whole_tree: Some(WholeTree::Differs(vec!["a.rs".into()])),
+            branch_has_merges: Some(false),
+        }
+    }
+
+    /// THE TWIN CASE (29d31df7). The branch's change landed squashed
+    /// under a twin, and later cars edited the same files: no file
+    /// matches, the patch is unmerged, the head is no ancestor — and
+    /// merging it into main writes main's own tree. The landing is a candidate.
+    #[test]
+    fn a_change_landed_under_a_twin_names_a_candidate_without_asserting_merged() {
+        let o = Observations {
+            whole_tree: Some(WholeTree::OnMain {
+                landed_in: Some("1234abcd train: twin lands".into()),
+            }),
+            ..obs()
+        };
+        assert!(
+            matches!(verdict(&o), Verdict::Unknown(why) if why.contains("candidate landing 1234abcd train: twin lands"))
+        );
+    }
+
+    #[test]
+    fn an_unnamed_candidate_is_unknown_without_fabricating_a_landing() {
+        let o = Observations {
+            whole_tree: Some(WholeTree::OnMain { landed_in: None }),
+            ..obs()
+        };
+        assert!(matches!(verdict(&o), Verdict::Unknown(why)
+            if why.contains("no candidate landing could be named")));
+    }
+
+    /// A whole-tree check that ran and could not be read leaves a
+    /// change that may have landed under a twin unexamined, so the
+    /// other three signals saying no are not enough to say no.
+    #[test]
+    fn an_unreadable_whole_tree_is_unknown_never_a_no() {
+        let o = Observations {
+            whole_tree: Some(WholeTree::Unreadable("merge-tree errored".into())),
+            ..obs()
+        };
+        match verdict(&o) {
+            Verdict::Unknown(why) => {
+                assert!(why.contains("whole-tree"), "{why}");
+                assert!(why.contains("merge-tree errored"), "{why}");
+            }
+            v => panic!("an unread whole tree must not be decisive: {v:?}"),
+        }
+        let not_run = Observations {
+            whole_tree: None,
+            ..obs()
+        };
+        assert!(
+            matches!(verdict(&not_run), Verdict::Unknown(_)),
+            "a whole tree never read is not a no"
+        );
+    }
+
+    /// A REAL REPOSITORY, the measured shape of 29d31df7: a branch on
+    /// the old base; a twin of it squash-merged into main beside a
+    /// sibling's change, so its patch-id matches nothing; then a later
+    /// car editing another line of the same file, so main's copy no
+    /// longer equals the branch's. Before this rule `boss merged`
+    /// answered NOT MERGED here. Control: a branch whose work never
+    /// landed still reads NOT MERGED, with the file named.
+    #[test]
+    fn observe_finds_a_change_squashed_under_a_twin_and_names_the_landing() {
+        let root = boss_testing::scratch::scratch_dir("merged-twin");
+        let at = root.clone();
+        let g = move |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&at)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let w = |rel: &str, body: &str| boss_testing::scratch::write_file(&root.join(rel), body);
+        g(&["init", "-q", "-b", "main"]);
+        w("verb.rs", "one\ntwo\nthree\nfour\nfive\n");
+        g(&["add", "."]);
+        g(&["commit", "-qm", "base"]);
+
+        // The branch this verb is asked about.
+        g(&["checkout", "-q", "-b", "fix/the-change"]);
+        w("verb.rs", "ONE\ntwo\nthree\nfour\nfive\n");
+        g(&["commit", "-qam", "fix: the change"]);
+
+        // Its twin, cut from main, squashed in a train beside a sibling.
+        g(&["checkout", "-q", "-b", "twin", "main"]);
+        w("verb.rs", "ONE\ntwo\nthree\nfour\nfive\n");
+        w("sibling.rs", "a sibling car\n");
+        g(&["add", "."]);
+        g(&["commit", "-qm", "twin: the change again"]);
+        g(&["checkout", "-q", "main"]);
+        g(&["merge", "-q", "--squash", "twin"]);
+        g(&["commit", "-qm", "train: twin lands"]);
+        let landing = g(&["rev-parse", "--short", "HEAD"]);
+
+        // A later car edits the same file, on another line.
+        w("verb.rs", "ONE\ntwo\nthree\nfour\nFIVE\n");
+        g(&["commit", "-qam", "train: a later car"]);
+
+        let repo = root.to_string_lossy().to_string();
+        let o = observe(&repo, &repo, "fix/the-change");
+        assert_eq!(o.is_ancestor, Some(false), "{o:?}");
+        assert_eq!(o.unmerged_patches, Some(1), "{o:?}");
+        assert_eq!(
+            o.content,
+            Some(ContentMatch {
+                total: 1,
+                matching: 0
+            }),
+            "the shape that answered NOT MERGED: {o:?}"
+        );
+        assert!(
+            matches!(verdict(&o), Verdict::Unknown(why) if why.contains("candidate landing") && why.contains(&landing)),
+            "{o:?}"
+        );
+        match &o.whole_tree {
+            Some(WholeTree::OnMain {
+                landed_in: Some(at),
+            }) => {
+                assert!(at.starts_with(&landing), "{at}");
+                assert!(at.contains("train: twin lands"), "{at}");
+            }
+            other => panic!("the landing must be named: {other:?}"),
+        }
+
+        // Control: work that never landed is still a definite no.
+        g(&["checkout", "-q", "-b", "fix/never-landed", "main~2"]);
+        w("orphan.rs", "only here\n");
+        g(&["add", "."]);
+        g(&["commit", "-qm", "fix: nobody carried this"]);
+        g(&["checkout", "-q", "main"]);
+        let o = observe(&repo, &repo, "fix/never-landed");
+        assert_eq!(verdict(&o), Verdict::NotMerged, "{o:?}");
+        assert_eq!(
+            o.whole_tree,
+            Some(WholeTree::Differs(vec!["orphan.rs".into()])),
+            "{o:?}"
+        );
+    }
+
+    /// A BRANCH THAT CHANGES NOTHING PROVES NOTHING BY THE WHOLE TREE
+    /// (review 0de57f8d, B1). Merging a branch whose net diff against
+    /// its merge-base is empty writes main's own tree whatever main
+    /// holds, so rule 5 must not fire there — and the answer is not the
+    /// "was not run" Unknown either, because it ran.
+    #[test]
+    fn a_branch_that_changes_nothing_is_unknown_not_merged_by_the_whole_tree() {
+        let o = Observations {
+            content: None,
+            whole_tree: Some(WholeTree::OnMain { landed_in: None }),
+            ..obs()
+        };
+        match verdict(&o) {
+            Verdict::Unknown(why) => {
+                assert!(why.contains("changes nothing"), "{why}");
+                assert!(!why.contains("was not run"), "{why}");
+            }
+            v => panic!("an empty branch is not proven merged by the tree: {v:?}"),
+        }
+    }
+
+    /// The two real-repository shapes review 0de57f8d reproduced, where
+    /// the car answered MERGED and main's build answered NOT MERGED:
+    /// (a) the branch merged main after its twin landed, then main
+    /// reverted the twin — the change is NOT on main; (b) the branch's
+    /// own commits cancel out (fix, then unfix). Neither may read as
+    /// merged, and 37 forge branches carry merge commits.
+    #[test]
+    fn a_net_zero_branch_is_never_merged_by_the_whole_tree() {
+        let root = boss_testing::scratch::scratch_dir("merged-net-zero");
+        let at = root.clone();
+        let g = move |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&at)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let w = |rel: &str, body: &str| boss_testing::scratch::write_file(&root.join(rel), body);
+        g(&["init", "-q", "-b", "main"]);
+        w("verb.rs", "one\ntwo\nthree\nfour\nfive\n");
+        g(&["add", "."]);
+        g(&["commit", "-qm", "base"]);
+
+        // (b) fix, then unfix: nothing net.
+        g(&["checkout", "-q", "-b", "fix/net-zero"]);
+        w("verb.rs", "ONE\ntwo\nthree\nfour\nfive\n");
+        g(&["commit", "-qam", "fix"]);
+        w("verb.rs", "one\ntwo\nthree\nfour\nfive\n");
+        g(&["commit", "-qam", "unfix"]);
+
+        // (a) the branch, its twin landing on main, main merged into the
+        // branch, then main reverting the twin.
+        g(&["checkout", "-q", "-b", "fix/merged-in", "main"]);
+        w("verb.rs", "ONE\ntwo\nthree\nfour\nfive\n");
+        g(&["commit", "-qam", "fix: the change"]);
+        g(&["checkout", "-q", "main"]);
+        w("verb.rs", "ONE\ntwo\nthree\nfour\nfive\n");
+        w("sibling.rs", "a sibling car\n");
+        g(&["add", "."]);
+        g(&["commit", "-qm", "train: twin lands"]);
+        g(&["checkout", "-q", "fix/merged-in"]);
+        g(&["merge", "-q", "--no-edit", "main"]);
+        g(&["checkout", "-q", "main"]);
+        g(&["revert", "--no-edit", "HEAD"]);
+        assert_eq!(g(&["show", "main:verb.rs"]), "one\ntwo\nthree\nfour\nfive");
+
+        let repo = root.to_string_lossy().to_string();
+        for branch in ["fix/merged-in", "fix/net-zero"] {
+            let o = observe(&repo, &repo, branch);
+            assert_eq!(o.content, None, "{branch}: the shape that misfired: {o:?}");
+            match verdict(&o) {
+                Verdict::Unknown(why) => assert!(why.contains("changes nothing"), "{why}"),
+                v => panic!("{branch} changes nothing on main, yet read {v:?} <- {o:?}"),
+            }
+        }
+    }
+
+    /// Review b133fe14: moving the merge-base hides an earlier reverted
+    /// twin even when a later shared change makes the net diff nonempty.
+    #[test]
+    fn a_reverted_twin_before_a_branch_merge_is_not_proven_by_a_later_shared_change() {
+        let root = boss_testing::scratch::scratch_dir("merged-reverted-twin-shared");
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let w = |body: &str| boss_testing::scratch::write_file(&root.join("verb.rs"), body);
+        g(&["init", "-q", "-b", "main"]);
+        w("one\ntwo\nthree\nfour\nfive\n");
+        g(&["add", "."]);
+        g(&["commit", "-qm", "base"]);
+        g(&["checkout", "-q", "-b", "fix/probe"]);
+        w("ONE\ntwo\nthree\nfour\nfive\n");
+        g(&["commit", "-qam", "branch ONE"]);
+        g(&["checkout", "-q", "main"]);
+        w("ONE\ntwo\nthree\nfour\nfive\n");
+        boss_testing::scratch::write_file(&root.join("sibling.rs"), "twin sibling\n");
+        g(&["add", "."]);
+        g(&["commit", "-qm", "train ONE plus sibling"]);
+        g(&["checkout", "-q", "fix/probe"]);
+        g(&["merge", "-q", "--no-edit", "main"]);
+        w("ONE\ntwo\nthree\nfour\nFIVE\n");
+        g(&["commit", "-qam", "branch FIVE"]);
+        g(&["checkout", "-q", "main"]);
+        g(&["revert", "--no-edit", "HEAD"]);
+        w("one\ntwo\nthree\nfour\nFIVE\n");
+        g(&["commit", "-qam", "train FIVE elsewhere"]);
+        assert_eq!(g(&["show", "main:verb.rs"]), "one\ntwo\nthree\nfour\nFIVE");
+        assert_eq!(
+            g(&["show", "fix/probe:verb.rs"]),
+            "ONE\ntwo\nthree\nfour\nFIVE"
+        );
+        let repo = root.to_string_lossy();
+        let observed = observe(&repo, &repo, "fix/probe");
+        assert_eq!(observed.is_ancestor, Some(false), "{observed:?}");
+        assert_eq!(observed.unmerged_patches, Some(1), "{observed:?}");
+        assert_eq!(
+            observed.content,
+            Some(ContentMatch {
+                total: 1,
+                matching: 0
+            }),
+            "{observed:?}"
+        );
+        assert!(
+            matches!(observed.whole_tree, Some(WholeTree::OnMain { .. })),
+            "{observed:?}"
+        );
+        assert_eq!(observed.branch_has_merges, Some(true), "{observed:?}");
+        match verdict(&observed) {
+            Verdict::Unknown(why) => assert!(why.contains("merge commit"), "{why}"),
+            other => panic!(
+                "ONE is absent from main; a later shared change cannot prove it merged: {other:?}; {observed:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn only_a_complete_merge_history_read_can_authorize_the_whole_tree_rule() {
+        assert_eq!(merge_history_answer(true, b""), Some(false));
+        assert_eq!(merge_history_answer(true, b" \n"), Some(false));
+        assert_eq!(
+            merge_history_answer(true, b"0123456789012345678901234567890123456789\n"),
+            Some(true)
+        );
+        assert_eq!(merge_history_answer(false, b""), None);
+        assert_eq!(
+            merge_history_answer(false, b"0123456789012345678901234567890123456789\n"),
+            None
+        );
+        assert_eq!(merge_history_answer(true, b"not-a-commit\n"), None);
+        assert_eq!(merge_history_answer(true, &[0xff]), None);
+        for history in [Some(true), None] {
+            let o = Observations {
+                branch_has_merges: history,
+                whole_tree: Some(WholeTree::OnMain { landed_in: None }),
+                ..obs()
+            };
+            assert!(matches!(verdict(&o), Verdict::Unknown(why) if why.contains("merge commit")));
+            assert_eq!(
+                verdict(&Observations {
+                    is_ancestor: Some(true),
+                    ..o.clone()
+                }),
+                Verdict::Merged(How::Ancestor)
+            );
+            assert_eq!(
+                verdict(&Observations {
+                    unmerged_patches: Some(0),
+                    ..o.clone()
+                }),
+                Verdict::Merged(How::PatchesPresent)
+            );
+            assert_eq!(
+                verdict(&Observations {
+                    content: Some(ContentMatch {
+                        total: 1,
+                        matching: 1
+                    }),
+                    ..o
+                }),
+                Verdict::Merged(How::ContentPresent)
+            );
         }
     }
 

@@ -177,7 +177,7 @@ kind = "incident-review"
 ready_when = "steps.actions.done"
 title_template = "Human review of the findings"
 authority_role = "platform-admin"
-metadata_defaults = { human_only = true }
+metadata_defaults = { human_presentation = { ask = "Review what happened and the actions taken", why_person = "The people who investigated an incident cannot substitute for your independent judgment.", action = "Read the findings and record your review", after = "Your completed review closes the incident; its follow-up requests keep their own obligations.", evidence = "current-step" }, human_only = true }
 
 [[workflow.step]]
 title = "closed"

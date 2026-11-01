@@ -80,6 +80,23 @@ fn build_app_over(registry: Arc<dyn WorkflowRegistry>, jobs: Arc<InMemoryJobs>) 
             // The basic guest's shipped grant: Read on the operating
             // model, and no authoring verb (backlog 1a4a4d03).
             .allow("visitor", Action::Read, Resource::workflow(), Scope::All)
+            // A read-only observer granted the separately controlled
+            // draft read, and no authoring verb (backlog f21804d8,
+            // design 600c07d7). `observer-no-drafts` holds the same
+            // workflow Read without it.
+            .allow("observer", Action::Read, Resource::workflow(), Scope::All)
+            .allow(
+                "observer",
+                Action::Read,
+                Resource::new("workflow-draft"),
+                Scope::All,
+            )
+            .allow(
+                "observer-no-drafts",
+                Action::Read,
+                Resource::workflow(),
+                Scope::All,
+            )
             .build(),
     );
     let state = JobsApiState {
@@ -531,6 +548,119 @@ async fn discarding_a_draft_a_packet_is_pinned_to_is_refused() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
+/// Backlog 50ded63d, through the door. A candidate an experiment
+/// admitted a packet to cannot be discarded, and until this door it
+/// stayed a draft that publish would promote. The reject refuses while
+/// an OPEN experiment still splits onto it and refuses a caller without
+/// Retire on `workflow`; then it answers 204, the row reads `rejected`
+/// to the author and stays readable to a reader as the record of what
+/// ran, and publish finds nothing to promote. A second reject is 204.
+#[tokio::test]
+async fn a_candidate_that_lost_is_rejected_out_of_publishs_way() {
+    use boss_core::job::{Job, JobStatus, Priority, Subject};
+    use boss_jobs::port::JobsRepository;
+
+    let kind = "intake-trial";
+    let jobs = Arc::new(InMemoryJobs::new());
+    let registry = Arc::new(InMemoryWorkflows::for_fixture().with_packets(jobs.clone()));
+    let now = chrono::Utc::now();
+    let actor = boss_core::actor::ActorId::Human("emp-cto".into());
+    registry
+        .create_draft(draft_spec(kind), &actor, now)
+        .await
+        .unwrap();
+    registry.publish(kind, &actor, now).await.unwrap();
+    let candidate = registry
+        .create_draft(draft_spec(kind), &actor, now)
+        .await
+        .unwrap();
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+    let packet = Job::new(
+        kind,
+        Subject::new("system", "sys-1"),
+        "admitted to the candidate",
+        "emp-1",
+        Priority::Standard,
+        day,
+    )
+    .with_workflow_version(candidate.version);
+    jobs.create_job(&packet).await.unwrap();
+    let mut experiment = Job::new(
+        "protocol-experiment",
+        Subject::new("system", "sys-1"),
+        "A/B on intake-trial",
+        "emp-cto",
+        Priority::Standard,
+        day,
+    );
+    experiment.status = JobStatus::Open;
+    experiment.metadata = serde_json::json!({
+        "kind_under_test": kind,
+        "control_version": 1,
+        "candidate_version": candidate.version,
+    });
+    jobs.create_job(&experiment).await.unwrap();
+
+    let registry_dyn: Arc<dyn WorkflowRegistry> = registry.clone();
+    let app = build_app_over(registry_dyn, jobs.clone());
+    let uri = format!(
+        "/api/workflows/{kind}/versions/{}/reject",
+        candidate.version
+    );
+    let text = |resp: axum::http::Response<Body>| async move {
+        String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap()
+    };
+
+    let resp = send_json(app.clone(), "POST", &uri, &cto(), None).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let said = text(resp).await;
+    assert!(
+        said.contains(&experiment.id.to_string()),
+        "names the experiment still splitting onto it: {said}"
+    );
+
+    experiment.status = JobStatus::Closed;
+    jobs.update_job(&experiment).await.unwrap();
+
+    let resp = send_json(app.clone(), "POST", &uri, &visitor(), None).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "Retire on workflow");
+
+    let resp = send_json(app.clone(), "POST", &uri, &cto(), None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "{}",
+        text(resp).await
+    );
+    assert_eq!(
+        versions_of(app.clone(), kind, &cto()).await,
+        vec![(1, WorkflowStatus::Active), (2, WorkflowStatus::Rejected)]
+    );
+    assert_eq!(
+        versions_of(app.clone(), kind, &visitor()).await,
+        vec![(1, WorkflowStatus::Active), (2, WorkflowStatus::Rejected)],
+        "packets ran it, so a reader reads it as the record of what ran"
+    );
+
+    let publish = format!("/api/workflows/{kind}/publish");
+    let resp = send_json(app.clone(), "POST", &publish, &cto(), None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "publish never promotes a rejected row"
+    );
+    let resp = send_json(app, "POST", &uri, &cto(), None).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "idempotent");
+}
+
 fn visitor() -> User {
     User {
         id: "guest@algedonic.dev".into(),
@@ -625,6 +755,81 @@ async fn a_draft_is_read_only_by_who_may_author_it() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK, "the author reads its draft");
+}
+
+/// A DRAFT HAS A READ OF ITS OWN, AND IT AUTHORS NOTHING (backlog
+/// f21804d8, design 600c07d7, decided 2026-10-17). The movement observer
+/// captures the complete graph, and the graph reads draft workflow
+/// definitions before it filters them; until this car the only way to
+/// read a draft was an authoring verb, so qualifying that read-only
+/// observer meant granting it Create, Update or Publish on `workflow`.
+/// Read on `workflow-draft` is that read alone: the observer holding it
+/// lists and fetches the staged v2 exactly as the author does, and its
+/// edit, create and publish are refused. The same role without the grant
+/// is refused the draft — the policy leg is required, not implied by the
+/// tier or the workflow Read beside it.
+#[tokio::test]
+async fn a_draft_read_grant_reads_drafts_and_authors_nothing() {
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::for_fixture());
+    let app = build_app(registry);
+    let kind = "intake-review";
+    let body = |label: &str| {
+        let mut s = draft_spec(kind);
+        s.label = label.into();
+        Some(serde_json::to_value(s).unwrap())
+    };
+    let publish = format!("/api/workflows/{kind}/publish");
+    let put = format!("/api/workflows/{kind}");
+    let resp = send_json(app.clone(), "POST", "/api/workflows", &cto(), body("v1")).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = send_json(app.clone(), "POST", &publish, &cto(), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = send_json(app.clone(), "PUT", &put, &cto(), body("v2 staged")).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let observer = User {
+        id: "automation:yard-mover".into(),
+        role: "observer".into(),
+        access_tier: AccessTier::Auditor,
+        ..cto()
+    };
+    assert_eq!(
+        versions_of(app.clone(), kind, &observer).await,
+        vec![(1, WorkflowStatus::Active), (2, WorkflowStatus::Draft)],
+        "the draft read lists the draft"
+    );
+    let draft = format!("/api/workflows/{kind}/versions/2");
+    let resp = send_json(app.clone(), "GET", &draft, &observer, None).await;
+    assert_eq!(resp.status(), StatusCode::OK, "the draft read fetches it");
+
+    let resp = send_json(app.clone(), "PUT", &put, &observer, body("v3")).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "it cannot author");
+    let resp = send_json(app.clone(), "POST", &publish, &observer, None).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "it cannot publish");
+    let resp = send_json(app.clone(), "POST", "/api/workflows", &observer, body("x")).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "it cannot create");
+
+    let without = User {
+        role: "observer-no-drafts".into(),
+        ..observer.clone()
+    };
+    assert_eq!(
+        versions_of(app.clone(), kind, &without).await,
+        vec![(1, WorkflowStatus::Active)],
+        "workflow Read at auditor tier is not the draft read"
+    );
+    let resp = send_json(app.clone(), "GET", &draft, &without, None).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&text);
+    assert!(
+        text.contains("workflow-draft"),
+        "the refusal names the grant: {text}"
+    );
+    assert!(
+        !text.contains("v2 staged"),
+        "the refusal carries none of the draft"
+    );
 }
 
 /// THE ACTIVE READ REFUSES A PARAMETER IT DOES NOT READ (backlog

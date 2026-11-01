@@ -23,6 +23,14 @@
   } from './presence';
   import { PROCEDURE_KEY } from './procedure';
   import {
+    editableValues,
+    editedAnswers,
+    followRecord,
+    missingRecords,
+    readOnlyField,
+    recordText,
+  } from './recordFields';
+  import {
     HOLDER_LOCKED_NOTE,
     askReleaseReason,
     claimedFor,
@@ -86,16 +94,51 @@
   /// end everywhere except a bespoke plugin — which defeats inline
   /// field authoring, whose whole point is that a Workflow can state
   /// its own contract without one.
+  ///
+  /// A declared record or door-written field is SHOWN, not asked for, and
+  /// is never among these values, so no write from this page can replace
+  /// it (backlog 7ac7cd73; recordFields.ts holds the rule).
+  /// Seeded from the step as first drawn (untrack), so a re-read never
+  /// wipes a box the operator is typing in.
   let fieldValues = $state<Record<string, string>>(
-    Object.fromEntries(
-      (step.fields ?? []).map((f) => {
-        const v = step.metadata[f.name];
-        return [f.name, typeof v === 'string' ? v : ''];
-      }),
+    untrack(() => editableValues(step.fields ?? [], step.metadata)),
+  );
+  /// What the page last knew the record held for each box: the line an
+  /// edit is measured against. A gesture sends only the boxes that differ
+  /// from it (editedAnswers), never every box on screen — a page left
+  /// open re-sent the values it was drawn with on each Save, Start and
+  /// Complete, reverting any key another writer had changed since, under
+  /// the operator's name (backlog ec1e1980).
+  let fieldBaseline = $state<Record<string, string>>(
+    untrack(() => editableValues(step.fields ?? [], step.metadata)),
+  );
+  /// When the host re-reads the step, a box the operator has not touched
+  /// takes what the record now holds, so the page shows the record rather
+  /// than the value it was drawn with; a box being edited is left alone.
+  $effect(() => {
+    const live = editableValues(step.fields ?? [], step.metadata);
+    untrack(() => {
+      const next = followRecord(fieldValues, fieldBaseline, live);
+      if (next === null) return;
+      fieldValues = next.values;
+      fieldBaseline = next.baseline;
+    });
+  });
+  let readOnlyNames = $derived(
+    new Set(
+      (step.fields ?? [])
+        .filter((f) => readOnlyField(f, step.metadata[f.name]))
+        .map((f) => f.name),
     ),
   );
 
-  let missingRequired = $derived(missingOf(step.fields ?? [], fieldValues));
+  let missingRequired = $derived([
+    ...missingOf(
+      (step.fields ?? []).filter((f) => !readOnlyNames.has(f.name)),
+      fieldValues,
+    ),
+    ...missingRecords(step.fields ?? [], step.metadata),
+  ]);
   let needs = $derived(needsLine(missingRequired));
 
   /// The Workflow's step graph, read so each enum option can say which
@@ -219,7 +262,22 @@
   let assigneeDirty = $derived(
     (assigneeId || null) !== (step.assignee_id ?? null),
   );
-  let dueOnDirty = $derived((dueOn || '') !== initialDueOn);
+  /// The due date the page last knew the record held — moved by a write
+  /// that lands, so a date already saved is not re-sent by the next
+  /// gesture over a newer one (backlog ec1e1980).
+  let dueOnBaseline = $state(initialDueOn);
+  let dueOnDirty = $derived((dueOn || '') !== dueOnBaseline);
+
+  /// A write that landed: what it sent is now what the page knows the
+  /// record holds, so the next gesture does not send it again — a second
+  /// send would revert whatever another writer did in between.
+  function landed(sent: Readonly<Record<string, unknown>>): void {
+    const answers = Object.entries(sent).filter(
+      (e): e is [string, string] => typeof e[1] === 'string' && e[0] in fieldValues,
+    );
+    fieldBaseline = { ...fieldBaseline, ...Object.fromEntries(answers) };
+    if ('due_on' in sent) dueOnBaseline = typeof sent.due_on === 'string' ? sent.due_on : '';
+  }
   let dirty = $derived(assigneeDirty || dueOnDirty);
 
   let activeEmployees = $derived(
@@ -323,6 +381,7 @@
         writeError = wrote.error;
         return;
       }
+      landed(metadata);
       const done = await completeWithPresence(
         job,
         target.id,
@@ -355,12 +414,14 @@
       // cleared by OMISSION from a wholesale PUT.
       const metadata = {
         ...(dueOnDirty ? { due_on: dueOn || null } : {}),
-        // Only send fields the operator actually filled — an
-        // empty string is not an answer, and writing one would
-        // satisfy a required-field check with nothing in it.
-        ...Object.fromEntries(
-          Object.entries(fieldValues).filter(([, v]) => v.trim() !== ''),
-        ),
+        // Only the fields the operator EDITED on this page (backlog
+        // ec1e1980) — never every box it shows, which re-sent the values
+        // it was drawn with and reverted newer writes. An empty string is
+        // not an answer, and writing one would satisfy a required-field
+        // check with nothing in it. A field that has since become
+        // read-only (a door wrote a record into it after the page was
+        // drawn) is not sent either.
+        ...editedAnswers(fieldValues, fieldBaseline, readOnlyNames),
       };
       if (status === 'completed' && passkeyAsked) {
         await completeWithPasskey(metadata);
@@ -372,6 +433,7 @@
         metadata,
       };
       let res = await saveStep(jobId, step.id, body);
+      if (res.kind === 'ok') landed(metadata);
       if (res.kind === 'ok' && start) {
         res = await startStep(jobId, step.id, claimedFor(assigneeId));
       }
@@ -507,7 +569,26 @@
       {#each step.fields ?? [] as f (f.name)}
         {@const options = optionsFor(f)}
         {@const routes = routesByField.get(f.name) ?? []}
-        <label class="step-field">
+        {#if readOnlyNames.has(f.name)}
+          {@const text = recordText(step.metadata[f.name])}
+          <!-- A record, or a key a door writes: drawn as what it holds,
+               never as a box that could overwrite it (backlog 7ac7cd73). -->
+          <div class="step-field step-field-readonly" data-field={f.name}>
+            <span class="step-field-label">
+              {f.name.replace(/_/g, ' ')}{#if f.required}<span
+                  class="step-field-required"
+                  title="required">*</span
+                >{/if}
+              {#if f.writer}<span class="step-field-writer">written by {f.writer}</span>{/if}
+            </span>
+            {#if text !== null && text.trim() !== ''}
+              <pre class="step-field-record">{text}</pre>
+            {:else}
+              <span class="step-field-unwritten">not written yet</span>
+            {/if}
+          </div>
+        {:else}
+        <label class="step-field" data-field={f.name}>
           <span class="step-field-label">
             {f.name.replace(/_/g, ' ')}{#if f.required}<span
                 class="step-field-required"
@@ -540,6 +621,7 @@
             />
           {/if}
         </label>
+        {/if}
       {/each}
       <div class="step-ask-actions">
         <!-- Labelled with its effect — the route the chosen answer
@@ -711,5 +793,27 @@
   .step-field-required {
     color: var(--err);
     margin-left: 2px;
+  }
+  .step-field-writer,
+  .step-field-unwritten {
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-dim);
+  }
+  .step-field-writer {
+    margin-left: 8px;
+  }
+  .step-field-record {
+    margin: 0;
+    padding: 6px 8px;
+    max-height: 16em;
+    overflow: auto;
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: var(--font-mono);
+    background: var(--wash);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-field);
   }
 </style>

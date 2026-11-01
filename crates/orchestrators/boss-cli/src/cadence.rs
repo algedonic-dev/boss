@@ -1807,6 +1807,16 @@ pub async fn run(once: bool, dry: bool) -> Result<()> {
         runs.drain(None).await;
         return outcome.map(|_| ());
     }
+    // THE GATE-END WATCH, beside the loop (backlog 301d6c3b): a gate's
+    // verdict is recorded when its gate container ends instead of on the
+    // next train-reconcile firing, which cost a median 85 s per gate.
+    // Its own task, never a tick's: it runs for the life of this process,
+    // and nothing it does can stall a tick or fail the loop. Not in a dry
+    // run, which writes nothing, and not for `--once`, which returned
+    // above. Reconcile still records every verdict the watch misses.
+    if !dry {
+        tokio::spawn(train::watch_gate_ends());
+    }
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing the SIGTERM handler")?;
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())

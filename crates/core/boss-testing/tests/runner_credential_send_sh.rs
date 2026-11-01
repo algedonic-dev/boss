@@ -212,6 +212,11 @@ fn ssh_stub(f: &Fixture, shape: &str) {
         // The receiver as boss-gcp holds it before this tree's lands: it
         // reads its whole stdin before it says anything.
         "old-receiver" => format!("cat > \"$FIXTURE_ROOT/wire\"\necho '{old}' >&2\nexit 65\n"),
+        // The receiver this tree installs, refusing the envelope it was
+        // sent in its own words (backlog 3f7d5f23, (c)).
+        "refusing-receiver" => format!(
+            "printf '%s\\n' '{greeting}'\ncat > \"$FIXTURE_ROOT/wire\"\necho 'runner-credential-recv: refused (envelope-shape); installed credential unchanged' >&2\nexit 65\n"
+        ),
         // sshd refusing the key.
         "refused-key" => {
             "echo 'fixture@host: Permission denied (publickey).' >&2\nexit 255\n".to_string()
@@ -226,12 +231,14 @@ fn ssh_stub(f: &Fixture, shape: &str) {
 
 /// `kubectl`, answering from the fixture's files: `secret` for
 /// ops-runner-credential, `deposit-secret` for runner-deposit-key, `pin`
-/// for the known-hosts ConfigMap. A file that does not exist is NotFound.
+/// for the known-hosts ConfigMap. A file that does not exist is NotFound;
+/// beside it, `<file>.forbidden` answers Forbidden (a standing refusal)
+/// and `<file>.unreachable` a dial timeout (one a later pass may clear).
 fn kubectl_stub(f: &Fixture) -> PathBuf {
     let path = f.bin.join("kubectl");
     write_exec(
         &path,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FIXTURE_ROOT/kubectl-args\"\ncase \"$*\" in\n  *'get secret ops-runner-credential '*) f=secret ;;\n  *'get secret runner-deposit-key '*) f=deposit-secret ;;\n  *'get configmap break-glass-deposit-known-hosts '*) f=pin ;;\n  *) echo \"unexpected kubectl $*\" >&2; exit 2 ;;\nesac\n[ -f \"$FIXTURE_ROOT/$f\" ] || { echo 'Error from server (NotFound): not found' >&2; exit 1; }\ncat \"$FIXTURE_ROOT/$f\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FIXTURE_ROOT/kubectl-args\"\ncase \"$*\" in\n  *'get secret ops-runner-credential '*) f=secret ;;\n  *'get secret runner-deposit-key '*) f=deposit-secret ;;\n  *'get configmap break-glass-deposit-known-hosts '*) f=pin ;;\n  *) echo \"unexpected kubectl $*\" >&2; exit 2 ;;\nesac\n[ ! -f \"$FIXTURE_ROOT/$f.forbidden\" ] || { echo \"Error from server (Forbidden): $f is forbidden\" >&2; exit 1; }\n[ ! -f \"$FIXTURE_ROOT/$f.unreachable\" ] || { echo 'Unable to connect to the server: dial tcp: i/o timeout' >&2; exit 1; }\n[ -f \"$FIXTURE_ROOT/$f\" ] || { echo 'Error from server (NotFound): not found' >&2; exit 1; }\ncat \"$FIXTURE_ROOT/$f\"\n",
     );
     path
 }
@@ -654,6 +661,34 @@ fn a_signed_key_that_boss_gcp_refuses_is_red() {
     );
 }
 
+/// GREETED, SENT, AND REFUSED IN ITS OWN WORDS (backlog 3f7d5f23, (c);
+/// review 34f8448c of car 2c628718). The receiver checked the envelope and
+/// refused it: every pass sends the same envelope and is refused the same
+/// way until a person reads why, so the pass is RED on its own route and
+/// names the receiver's check — never a plain failure, which files nothing.
+#[test]
+fn a_receiver_that_greets_and_refuses_the_envelope_is_red() {
+    let f = fixture("runner-send-envelope-refused");
+    stage(&f, true);
+    ssh_stub(&f, "refusing-receiver");
+    let server = serve(enrollment(&f.public, "completed", "ready", None));
+    let output = send(&f, &server, &[]);
+    let requests = server.requests();
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("RED runner-credential-send/envelope-refused refused:"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("(envelope-shape)"), "{stderr}");
+    assert!(stderr.contains(JOB), "names the rotation packet: {stderr}");
+    assert!(!stderr.contains(VALUE));
+    assert!(
+        requests.iter().all(|r| r.method == "GET"),
+        "nothing is recorded as delivered: {requests:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The forge's push: the deployment that reads the transport and runs it.
 // ---------------------------------------------------------------------------
@@ -766,9 +801,10 @@ fn the_forge_push_carries_a_red_and_names_it_on_the_packet() {
 
 #[test]
 fn the_forge_push_without_its_inputs_says_which_and_sends_nothing() {
-    // No transport Secret yet: not yet, green.
+    // No transport Secret yet, and nothing waits for one: not yet, green.
+    // (A boss-gcp value waiting is the red below — backlog 3f7d5f23, (d).)
     let f = fixture("runner-push-no-key");
-    stage(&f, true);
+    stage(&f, false);
     ssh_stub(&f, "receiver");
     let server = serve(enrollment(&f.public, "completed", "ready", None));
     let summary = f.root.join("summary.json");
@@ -789,7 +825,15 @@ fn the_forge_push_without_its_inputs_says_which_and_sends_nothing() {
     let output = push(&f, &server, &summary, &[]);
     server.requests();
     assert_eq!(output.status.code(), Some(1), "{}", text(&output));
-    assert!(summary_line(&summary).starts_with("not configured:"));
+    assert_eq!(
+        judged(&summary_line(&summary)),
+        Some((
+            "runner-credential-push/host-pin".into(),
+            "not-configured".into()
+        )),
+        "{}",
+        summary_line(&summary)
+    );
     assert!(!f.root.join("ssh-args").exists());
 
     // No admin kubeconfig on the host: not ready, green, nothing read.
@@ -808,6 +852,237 @@ fn the_forge_push_without_its_inputs_says_which_and_sends_nothing() {
     server.requests();
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
     assert!(summary_line(&summary).starts_with("not ready:"));
+}
+
+/// The route and kind the converge's judge (maintenance.chore.file_reds,
+/// `red_routes`) reads off a line — `RED <route> <kind>: <error>`, route
+/// and kind each one word — or None when the line files nothing.
+fn judged(line: &str) -> Option<(String, String)> {
+    let rest = line.trim().strip_prefix("RED ")?;
+    let (route, rest) = rest.split_once(' ')?;
+    let (kind, _) = rest.split_once(':')?;
+    (!route.is_empty() && !kind.is_empty() && !kind.contains(char::is_whitespace))
+        .then(|| (route.to_string(), kind.to_string()))
+}
+
+/// The deposit-key Secret as the broker stores it, with `data` replaced.
+fn deposit_with(f: &Fixture, data: serde_json::Value) {
+    write_file(
+        &f.root.join("deposit-secret"),
+        &serde_json::json!({ "data": data }).to_string(),
+    );
+}
+
+/// EVERY STANDING FAILURE OF THE PUSH IS A LINE THE JUDGE FILES (backlog
+/// 3f7d5f23, from review 34f8448c of car 2c628718). Each of these reds
+/// forge-converge every ten minutes until a person acts, and each ended
+/// on a line that did not start `RED ` — `unreadable:`, `not
+/// configured:`, the sender's own `refused:` — so the converge closed
+/// `failed` 144 times a day and the judge, which files only RED lines,
+/// filed nothing. Each is RED now on a route of the push's own (or the
+/// sender's), one item per route while it is open; and nothing is sent.
+#[test]
+fn every_standing_failure_of_the_forge_push_is_a_red_line_the_judge_files() {
+    let pem = |f: &Fixture| b64(&std::fs::read_to_string(&f.key).unwrap());
+    type Arrange = Box<dyn Fn(&Fixture)>;
+    let cases: Vec<(&str, Arrange, &str, &str)> = vec![
+        (
+            "pin-absent",
+            Box::new(|f: &Fixture| std::fs::remove_file(f.root.join("pin")).unwrap()),
+            "runner-credential-push/host-pin",
+            "missing",
+        ),
+        (
+            "pin-forbidden",
+            Box::new(|f: &Fixture| write_file(&f.root.join("pin.forbidden"), "")),
+            "runner-credential-push/host-pin",
+            "unreadable",
+        ),
+        (
+            "pin-not-a-document",
+            Box::new(|f: &Fixture| write_file(&f.root.join("pin"), "not json")),
+            "runner-credential-push/host-pin",
+            "unreadable",
+        ),
+        (
+            "key-forbidden",
+            Box::new(|f: &Fixture| write_file(&f.root.join("deposit-secret.forbidden"), "")),
+            "runner-credential-push/deposit-key",
+            "unreadable",
+        ),
+        (
+            "key-not-a-document",
+            Box::new(|f: &Fixture| write_file(&f.root.join("deposit-secret"), "not json")),
+            "runner-credential-push/deposit-key",
+            "unreadable",
+        ),
+        (
+            "key-without-minted-for",
+            Box::new(move |f: &Fixture| {
+                deposit_with(f, serde_json::json!({"private_key": pem(f)}))
+            }),
+            "runner-credential-push/deposit-key",
+            "unreadable",
+        ),
+        (
+            "key-not-base64",
+            Box::new(|f: &Fixture| {
+                deposit_with(
+                    f,
+                    serde_json::json!({"private_key":"%%%", "minted_for": b64(ENROLLMENT)}),
+                )
+            }),
+            "runner-credential-push/deposit-key",
+            "unreadable",
+        ),
+        (
+            // The sender refuses the enrollment the key names: an id the
+            // jobs API does not answer (exit 78, a refusal, never a RED of
+            // its own) — standing until a person reads it.
+            "enrollment-unknown",
+            Box::new(move |f: &Fixture| {
+                deposit_with(
+                    f,
+                    serde_json::json!({"private_key": pem(f),
+                        "minted_for": b64("00000000-0000-4000-8000-0000000000ff")}),
+                )
+            }),
+            "runner-credential-push/sender",
+            "refused",
+        ),
+        (
+            "envelope-refused",
+            Box::new(|f: &Fixture| ssh_stub(f, "refusing-receiver")),
+            "runner-credential-send/envelope-refused",
+            "refused",
+        ),
+    ];
+    for (name, arrange, route, kind) in cases {
+        let f = fixture(&format!("runner-push-standing-{name}"));
+        stage(&f, true);
+        deploy(&f, true);
+        ssh_stub(&f, "receiver");
+        arrange(&f);
+        let server = serve(enrollment(&f.public, "completed", "ready", None));
+        let summary = f.root.join("summary.json");
+        let output = push(&f, &server, &summary, &[]);
+        server.requests();
+        assert_ne!(output.status.code(), Some(0), "{name}: {}", text(&output));
+        let line = summary_line(&summary);
+        assert_eq!(
+            judged(&line),
+            Some((route.to_string(), kind.to_string())),
+            "{name}: {line}"
+        );
+        assert!(!line.contains('\n'), "{name}: one line: {line}");
+        assert!(!line.contains(VALUE), "{name}: {line}");
+        if name != "envelope-refused" {
+            assert_eq!(wire(&f), "", "{name}: something was sent");
+        }
+    }
+}
+
+/// A cluster the forge cannot reach this tick is a red a later tick may
+/// clear: read on the converge's packet, and NOT a line the judge files —
+/// an item per passing red is the alarm nobody reads
+/// (file-backlog-items-on-forge-converge-red.toml, NO FALLBACK ROUTE).
+#[test]
+fn an_unreachable_cluster_reds_the_push_without_filing() {
+    for file in ["deposit-secret", "pin"] {
+        let f = fixture(&format!("runner-push-unreachable-{file}"));
+        stage(&f, true);
+        deploy(&f, true);
+        ssh_stub(&f, "receiver");
+        write_file(&f.root.join(format!("{file}.unreachable")), "");
+        let server = serve(enrollment(&f.public, "completed", "ready", None));
+        let summary = f.root.join("summary.json");
+        let output = push(&f, &server, &summary, &[]);
+        server.requests();
+        assert_eq!(output.status.code(), Some(1), "{file}: {}", text(&output));
+        let line = summary_line(&summary);
+        assert!(line.starts_with("failed:"), "{file}: {line}");
+        assert_eq!(judged(&line), None, "{file}: {line}");
+        assert!(line.contains("Unable to connect"), "{file}: {line}");
+    }
+}
+
+/// A DEPOSIT KEY LOST WHILE A VALUE WAITS FOR IT IS RED (backlog 3f7d5f23,
+/// (d)). The key deleted (the cluster converge then recreates it empty)
+/// or emptied read `not yet` with exit 0 whatever Secret
+/// boss/ops-runner-credential staged, so a rotation that had minted
+/// boss-gcp's next credential stalled behind a green tick. A staged
+/// boss-gcp.next is a rotation a person scoped and the broker minted,
+/// waiting on this push, and with no transport key it cannot arrive until
+/// a person prepares and enrolls one: RED. With nothing staged nothing
+/// stalls, and the key's absence stays `not yet`.
+#[test]
+fn a_deposit_key_lost_while_a_value_waits_is_red() {
+    for (name, staged, key, code) in [
+        ("deleted-staged", Some(true), None, 1),
+        ("emptied-staged", Some(true), Some(""), 1),
+        ("deleted-nothing-staged", Some(false), None, 0),
+        ("emptied-nothing-staged", Some(false), Some(""), 0),
+        ("deleted-no-runner-secret", None, None, 0),
+    ] {
+        let f = fixture(&format!("runner-push-lost-{name}"));
+        match staged {
+            Some(s) => stage(&f, s),
+            None => write_file(&f.root.join("receipt"), &receipt().to_string()),
+        }
+        deploy(&f, true);
+        match key {
+            None => std::fs::remove_file(f.root.join("deposit-secret")).unwrap(),
+            Some(k) => deposit_with(
+                &f,
+                serde_json::json!({"private_key": k, "minted_for": b64(ENROLLMENT)}),
+            ),
+        }
+        ssh_stub(&f, "receiver");
+        let server = serve(enrollment(&f.public, "completed", "ready", None));
+        let summary = f.root.join("summary.json");
+        let output = push(&f, &server, &summary, &[]);
+        server.requests();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{name}: {}",
+            text(&output)
+        );
+        let line = summary_line(&summary);
+        if code == 1 {
+            assert_eq!(
+                judged(&line),
+                Some(("runner-credential-push/deposit-key".into(), "lost".into())),
+                "{name}: {line}"
+            );
+            assert!(line.contains("boss-gcp.next"), "{name}: {line}");
+        } else {
+            assert!(line.starts_with("not yet:"), "{name}: {line}");
+        }
+        assert!(!line.contains(VALUE), "{name}: {line}");
+        assert!(!f.root.join("ssh-args").exists(), "{name}: ssh was run");
+    }
+}
+
+/// THE PUSH'S OWN RED ENDS ARE OF TWO KINDS, AND ONLY TWO: a standing one
+/// through `red` (a RED line the judge files) or one a later pass may
+/// clear, which says `failed:` and is read on the converge's packet. A
+/// `finish 1` with any other first word is the shape that filed nothing
+/// for a week (backlog 3f7d5f23) — `unreadable:`, `not configured:`.
+#[test]
+fn every_red_end_of_the_forge_push_files_or_says_it_may_clear() {
+    let body = std::fs::read_to_string(repo_root().join(PUSH)).unwrap();
+    let ends: Vec<&str> = body
+        .lines()
+        .filter_map(|l| l.split_once("finish 1 \"").map(|(_, msg)| msg))
+        .collect();
+    assert!(!ends.is_empty(), "{PUSH} has no `finish 1` end to judge");
+    for msg in ends {
+        assert!(
+            msg.starts_with("failed: ") || msg.starts_with("RED $ME/"),
+            "{PUSH}: a red end that neither files nor says it may clear: finish 1 \"{msg}"
+        );
+    }
 }
 
 /// The files the push runs, as a generation of root's tree carries them:

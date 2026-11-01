@@ -74,7 +74,7 @@ impl Tree {
             &t.dir.join("df"),
             "#!/usr/bin/env bash\n\
              echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
-             echo '/dev/fake 1 1 943718400 1% /'\n",
+             for _ in \"$@\"; do echo '/dev/fake 1 1 943718400 1% /'; done\n",
         );
         t
     }

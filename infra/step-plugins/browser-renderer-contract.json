@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "version": 1,
+  "origin": "https://boss.algedonic.dev",
+  "car": "a4f60d8b-0972-4e2c-8f2b-c229923d0cd0",
+  "source_head": "2e3449f6e1c2664c292156462487dc325a72d8b2",
+  "asset_head": "847f1911e23fb6ed9ceb2ea2c51bda79c9e67d13",
+  "asset": {"path": "/plugins/answer-question.js", "bytes": 25403, "sha256": "0246c31efba8a421640077b32fb9abeea2d507751903955493bf14be1d00017c"},
+  "suite": {"path": "/plugins/browser-renderer-cases.js", "bytes": 7730, "sha256": "ab1f4561214795804ee01018b755fa4ceca1a2cc1e8f0fda01a53e6bf93fcfbf"},
+  "cases": ["question", "decision", "contradiction", "retry", "completed", "missing"],
+  "assertions": {
+    "question": ["visible: Which maintenance window should we use?", "visible: The customer needs an evening window.", "related work link", "only declared verdict", "answer input", "completion update", "metadata merge then status-only completion", "all transport synthetic"],
+    "decision": ["visible: No answer needed", "visible: This decision is already recorded.", "no repeated decision write", "all transport synthetic"],
+    "contradiction": ["visible: Review the linked design", "real question survives contradictory flag", "all transport synthetic"],
+    "retry": ["visible: Could not load the question details.", "no answer before context read", "visible: Which maintenance window should we use?", "all transport synthetic"],
+    "completed": ["visible: Answered — answered. Tuesday evening", "completed answer read-only", "all transport synthetic"],
+    "missing": ["visible: No question has been recorded.", "no invented answer", "all transport synthetic"]
+  }
+}

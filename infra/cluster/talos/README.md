@@ -53,6 +53,12 @@ only in `~/talos-homelab/v2` on a laptop, applied by hand with
   (it reads `UNDECLARED`): a patch carrying a live entry is refused
   unless it is idempotent, and whether Talos appends mirror endpoints is
   unmeasured. The file's own header has the measurement.
+- **w-1, since 2026-10-19** — the same image-GC pair, 50/40, for the
+  same reason at nine times the size (backlog `67e98635`): 231.2 GiB
+  available of 928.9 against Longhorn's 25% floor of 232.2, imagefs
+  535.2 GiB, so every dev-build worker volume provisioned and never got
+  a replica. Declared to be applied; its other entries are live, so it
+  reaches the node as a NARROWED patch (below).
 - **every node but w-2** — `machine.registries.mirrors` for
   `10.20.0.15:3000`, the forge's registry every image in the cluster is
   pulled through.
@@ -73,6 +79,22 @@ PKI, tokens, the cluster secret, and anything else `talosctl gen
 secrets` produces **never live here**. A patch is a fragment; the
 secrets stay under `/etc/boss-ops` on the cluster-operator host
 (design `1bc4b4ed`) and in the operator's own config until then.
+
+## The image a blank node network-boots: `netboot.toml`
+
+`netboot.toml` declares ONE Talos schematic and version, with the
+sha256 of its netboot kernel and initramfs and the Image Factory's metal
+kernel args (backlog `ee31ab73`, 2026-10-19). The forge serves it ONLY to
+the NICs listed in its `netboot_macs` — every other PXE client gets no
+answer, and an empty list answers nobody, so an installed node that tries
+the network first still boots its disk (review `bcff47dd` N1, backlog
+`8cf6faf7`) — proxy-DHCP (no leases, no DNS), TFTP for iPXE,
+HTTP for the script and the pair — through `infra/forge/netboot.sh`,
+which the forge converge runs, and serves nothing that does not hash to
+this file. The node lands in maintenance mode and joins nothing; the
+config is applied by hand as before. Changing the version is an edit to
+this file, measured as its header says. The schematic is spelled there
+and nowhere else in the tree (`netboot_sh.rs` holds it to that).
 
 ## Reading a node against its declaration
 
@@ -164,7 +186,8 @@ Two things the merge will not do for you:
 So a node that already carries part of its declaration is patched with
 a fragment of ONLY what it lacks, never the whole file again — the whole
 of `w-1.yaml` re-applied would add a third copy of the seed file entry.
-The check afterwards is what proves the fragment equalled the
+`node-converge` builds that fragment itself (`check-declared.sh --absent`,
+below). The check afterwards is what proves the fragment equalled the
 declaration. For w-1's gate disk the fragment is the `UserVolumeConfig`
 document ALONE. A `UserVolumeConfig` (Talos v1.10 and later) is
 provisioned by the node's volume controller when the config lands —
@@ -210,14 +233,33 @@ it does and refuses, in order:
   summary must read "Applied configuration without a reboot" and whose
   diff must change something — so an applied plan is never run twice;
 - the same dry run with the patch applied TWICE: when it differs, the
-  patch appends (the doubling above), and it is refused if ANY entry it
-  declares, in any class, is already live;
+  patch appends (the doubling above). If ANY entry it declares, in any
+  class, is already live, the whole declaration is neither dry-run nor
+  applied: the plan NARROWS it FIRST to the entries that read ABSENT
+  live (`check-declared.sh --absent <node>`, which re-emits them from the
+  DECLARED values in canonical form; backlog `9cf1673d`, built for
+  `67e98635`), prints that patch beside the declaration, judges it as a
+  declaration of its own (read classes, its own two dry runs) and
+  applies exactly it. First, because the copy Talos's merge would append
+  can be a change it refuses outright in no-reboot mode: the first live
+  plan dry-ran w-1's whole declaration, Talos answered "this config
+  change can't be applied in immediate mode" over a second seed files
+  entry, and the narrowed patch was never built (backlog `a3b1084f`). It
+  refuses instead, before any dry run, when a declared entry DRIFTs
+  live — adding entries cannot correct a drift, and narrowing past one
+  would read back as converged with the drift still there — or when no
+  entry is absent, since the patch could then only add a second copy.
+  Only a node with every entry ABSENT has its whole declaration dry-run;
 - Talos's diff is rendered with each context line reduced to its key,
   a changed line shaped like a credential refuses the plan unprinted,
   and the check's findings appear as a verdict and a key each, never a
   live value;
 - the apply (`--mode=no-reboot`), then the live config read through
-  `check-declared.sh` until every declared entry is `MATCH`, and the
+  `check-declared.sh` until every declared entry is `MATCH` — for a
+  narrowed patch, every entry IT carries `MATCH` and every declared
+  entry it did not carry reading exactly as it did before the apply, so
+  a DOUBLED entry left as found is no failure and a patch that disturbed
+  an entry it never named is no effect — and the
   Node read until it is `Ready=True` with its kubelet lease renewed
   after the apply, and read again at the end of the bound (every
   successful run takes the whole 120 s) — the verb's effect line, or
@@ -250,21 +292,96 @@ it does and refuses, in order:
 
 Reboot, upgrade, reset and etcd membership never become verbs.
 
-**When the append rule refuses, the live entries are not the problem.**
+**When the append rule bites, the live entries are not the problem.**
 Applying a whole declaration file is not idempotent for a list Talos's
 merge cannot key, so a declaration whose entries are already live cannot
-be re-applied — w-1 today (its seed file entry DOUBLED, its mount and
-mirror live), and every control plane if Talos appends mirror
-endpoints. **Never remove a working live entry to unblock the verb:**
-the seed mount, the forge mirror and the image-GC thresholds are what
-the node runs on, and de-duplicating a DOUBLED entry by hand only
-leaves a MATCH, which is refused the same way. The remedy is a
-declaration narrowed, for that run, to the entries that read ABSENT on
-the node, or the partial patch that applies only those (a follow-up
-item).
+be re-applied — w-1 (its seed file entry DOUBLED as last read, its
+mount, mirror and gate volume live), and every control plane if Talos
+appends mirror endpoints. **Never remove a working live entry to unblock
+the verb:** the seed mount, the forge mirror and the image-GC thresholds
+are what the node runs on. The verb narrows instead: since 2026-10-19
+(backlog `9cf1673d`'s first half, built for `67e98635`, when w-1's
+image-GC pair could not reach the node and its Longhorn disk sat under
+the scheduling floor) a plan for such a node applies the entries that
+read ABSENT and nothing else. A DOUBLED entry is left as found; a verb
+that removes one copy, signed by passkey, is the half of `9cf1673d`
+still open.
 
 A plan that exits 1 saying Talos's dry run "did not read as a summary
 and a config diff" is about the output format, not the node: the
 parser reads talosctl's `Dry run summary:` / `Config diff:` shape,
 optionally opened with the node's address or name, and fails closed on
 anything else. The first live render is its measurement.
+
+## A user volume becomes Longhorn capacity: `add-longhorn-disk`
+
+A `UserVolumeConfig` applied by `node-converge` is a mounted
+filesystem at `/var/mnt/<name>` and nothing more: Longhorn knows a disk
+only when its node's `nodes.longhorn.io` object lists it under
+`spec.disks`. Until backlog `493a02b6` (2026-10-19) no door wrote that
+list, so a node maintenance window that fitted a disk ended at a
+mounted volume nothing used. The second door is the ops pair
+`plan-a-longhorn-disk <node> <volume>` and `add-longhorn-disk <node>
+<volume> <plan_sha256>` (`infra/forge/longhorn-disk.sh`), in the same
+plan-and-passkey shape. It reads the mount from the declaration here,
+never from the packet, and refuses:
+
+- a volume `patches/<node>.yaml` does not name as a `UserVolumeConfig`,
+  or a declaration `check-declared.sh --only-read-classes` refuses (the
+  `!system_disk` allowlist above);
+- a volume Talos does not read `ready` at `/var/mnt/<name>`, or one on
+  the disk `EPHEMERAL` lives on;
+- a path any PersistentVolume or pod on the node already mounts — which
+  is how w-1's gate volume (`/var/mnt/gate`, the local PV `gate-w-1` and
+  the trim pod's hostPath) is refused;
+- a path that is, is under, or holds an existing Longhorn disk.
+
+The write is one compare-and-set patch adding the disk `u-<name>`,
+untagged and schedulable, and its read-back is Longhorn's own: the disk
+`Ready` and `Schedulable` with a `diskUUID` of its own, every other disk
+unchanged. The order for a worker's second disk is: declare its
+`UserVolumeConfig` in `patches/<node>.yaml` and land it, fit the disk,
+`node-converge <node>`, then `plan-a-longhorn-disk <node> <volume>` and
+`add-longhorn-disk` under the passkey, then `node-disk-usage <node>`
+lists the new disk. No declaration here names such a volume yet: the
+door exists before the disk it is for. A node whose ONLY disk is
+replaced needs none of this door — but it may need the next pair down:
+Longhorn can keep the OLD disk's record for the reinstalled system disk
+(join-a-node `829f75a8`, 2026-10-19: a one-bay worker reinstalled on its
+larger disk, and on 2026-10-21 w-2's default disk still read
+`DiskFilesystemChanged` under the old `diskUUID`, placing nothing).
+
+The inverse is the pair `plan-a-longhorn-disk-removal <node> <volume>`
+and `remove-longhorn-disk <node> <volume> <plan_sha256>`
+(`infra/forge/remove-longhorn-disk.sh`, backlog `b791c5b4`): it takes
+`u-<name>` at `/var/mnt/<name>` back out of `spec.disks` — the disk the
+add door places and no other, so a default disk cannot be named — and
+it is the way out for a disk Longhorn never read `Ready` after the add.
+It refuses while the disk holds anything: a replica on its `diskUUID`
+or on its node and path, a scheduled replica or backing image in
+Longhorn's `diskStatus`, a nonzero `storageScheduled`, or a backing
+image file. It does not evict; move a replica off first with
+`move-volume-replica` or `retire-volume-replica`. The write makes the
+disk unschedulable, reads what is on it again, and only then removes
+it, each a compare-and-set; if a replica landed in between, the disk
+is left unschedulable and nothing is removed. Its read-back is the disk
+gone from `spec.disks` and from Longhorn's `diskStatus`, every other
+disk unchanged. The Talos volume stays mounted; un-declaring it is a
+separate change to `patches/<node>.yaml` and a `node-converge`.
+
+The third pair repairs a node's DEFAULT disk whose record drifted from
+the disk under it: `plan-a-longhorn-disk-reregistration <node>` and
+`reregister-longhorn-disk <node> <plan_sha256>`
+(`infra/forge/reregister-longhorn-disk.sh`, backlog `36d2c484`). The
+packet names only the node; the disk is the one at `/var/lib/longhorn`
+named `default-disk-<hex>`. It refuses unless Longhorn reads that disk
+`Ready=False` with reason `DiskFilesystemChanged` and the disk's own
+`longhorn-disk.cfg`, read from the node through `talosctl read`, names a
+`diskUUID` other than the record's — and, as the removal does, while
+anything names the record on either UUID. The write makes the record
+unschedulable and reads its holdings again, removes it, waits for
+Longhorn to drop the stale status, and adds the same record back
+schedulable, each a compare-and-set; Longhorn then records the UUID the
+file names. Its read-back is the disk `Ready` and `Schedulable` under
+that UUID with a `storageMaximum` above zero, every other disk
+unchanged.

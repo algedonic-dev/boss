@@ -544,8 +544,7 @@
     margin: 8px 0;
     font-size: 13px;
   }
-  .fleet-stale,
-  .fleet-note.load-failed {
+  .fleet-stale {
     color: var(--warn);
   }
   .fleet-unread {

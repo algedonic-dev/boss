@@ -343,6 +343,7 @@ mod tests {
             stdout: stdout.into(),
             stderr: stderr.into(),
             missing_tools: Vec::new(),
+            timing: None,
         }
     }
 

@@ -55,7 +55,14 @@ mod replay_tests {
                     name: "agent-original".into(),
                     options: options.clone(),
                 },
-                Duration::from_secs(5),
+                // What the client was handed is this test's subject, not
+                // the deadline. Five seconds raced a python3 stub's start
+                // against the gate's load: gate-run 624df717 (2026-10-19, a
+                // brief.rs car) went red here on "native client deadline;
+                // partial streams retained" (f10419f9), and a stub held six
+                // seconds reproduces it. A deadline that fires is judged by
+                // a client hung on purpose, never by a race.
+                Duration::from_secs(120),
             )
             .await
             .unwrap();
@@ -523,6 +530,21 @@ pub(crate) async fn launch_at(
         || building["status"] != "ready"
     {
         bail!("observer requires this newly dispatched run's exact ready actor nomination");
+    }
+    // A bounded START's run (design e72dc7c9) asks for a receipt this
+    // observer cannot record, and its schema-2 expectation would replace
+    // the one that names the START: refused by name, nothing written.
+    if before["metadata"]
+        .get(crate::start_inputs::RUN_KEY)
+        .is_some()
+        || building["metadata"][crate::dispatch_started::EXPECTATION_KEY]["schema"]
+            == boss_jobs::execution_inputs::START_SCHEMA
+    {
+        bail!(
+            "the cluster observer does not implement the {} contract this run was admitted \
+             under; refused before any expectation, claim or Job",
+            boss_jobs::execution_inputs::CONTRACT
+        );
     }
     let step = building["id"].as_str().context("building has no id")?;
     let expectation = json!({"schema":2,"minutes":15,"observer":observer,"actor":prepared.actor,

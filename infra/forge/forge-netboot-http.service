@@ -1,0 +1,40 @@
+# Network boot from the forge, the HTTP half (backlog ee31ab73): the
+# iPXE script and the ONE declared Talos kernel and initramfs, served
+# on the forge's LAN address by infra/forge/netboot-http.py — which
+# refuses to start unless each file is the sha256
+# infra/cluster/talos/netboot.toml declares, and then serves only the
+# bytes it verified. infra/forge/netboot.sh carries the design.
+#
+# Install (forge host): NOT in install.sh's UNITS — that list is timer
+# pairs, and this is a daemon. `netboot.sh ensure`, run by install.sh on
+# every converge tick, mirrors and verifies the pair, renders
+# serve.env, places a root-owned copy of the server beside it, installs
+# this file, and restarts the unit only when one of those changed.
+#
+# ATTACK SURFACE, said for the reviewer: an HTTP listener on the LAN
+# that answers three exact paths and nothing else, as a dynamic user
+# with no capabilities and a read-only view of the host.
+[Unit]
+Description=BOSS forge: network boot, the iPXE script and the declared Talos kernel and initramfs over HTTP
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/var/lib/boss/netboot/serve.env
+ExecStart=/usr/bin/python3 -I /var/lib/boss/netboot/netboot-http.py
+Restart=on-failure
+RestartSec=10
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6
+InaccessiblePaths=-/etc/boss-ops -/etc/boss
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

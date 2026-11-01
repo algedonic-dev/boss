@@ -91,6 +91,7 @@ impl World {
             "#!/usr/bin/env bash\n\
              printf '%s\\n' \"$*\" >> \"$STUB_DIR/sudo.calls\"\n\
              case \" $* \" in\n\
+             \x20 *' get jobs -n boss '*) cat \"$STUB_DIR/jobs.json\"; exit 0 ;;\n\
              \x20 *' get pvc -n '*)\n\
              \x20   ns=''; prev=''; for a in \"$@\"; do [ \"$prev\" = -n ] && [ \"$a\" != docker ] && ns=\"$a\"; prev=\"$a\"; done\n\
              \x20   if [ -f \"$STUB_DIR/pvc-$ns.json\" ]; then cat \"$STUB_DIR/pvc-$ns.json\"; exit 0; fi\n\
@@ -156,6 +157,48 @@ fn row<'a>(obs: &'a Value, id: &str) -> &'a Value {
         .as_array()
         .and_then(|a| a.iter().find(|n| n["id"] == id))
         .unwrap_or_else(|| panic!("no volume {id} in {obs}"))
+}
+
+#[test]
+fn live_backup_disk_figures_do_not_mask_a_failed_scheduled_attempt() {
+    let w = World::new("backup-live-failure");
+    let mut pvc: Value = serde_json::from_str(PVC_BOSS).unwrap();
+    pvc["items"][3]["status"]["phase"] = serde_json::json!("Bound");
+    pvc["items"][3]["spec"]["volumeName"] = serde_json::json!("pvc-backup");
+    write_file(&w.dir.join("pvc-boss.json"), &pvc.to_string());
+    let mut summary: Value = serde_json::from_str(&w1_summary()).unwrap();
+    summary["pods"][0]["volume"].as_array_mut().unwrap().push(serde_json::json!({"name":"backup","pvcRef":{"name":"boss-backups","namespace":"boss"},"capacityBytes":20*GIB,"usedBytes":GIB,"availableBytes":19*GIB}));
+    write_file(&w.dir.join("summary-w-1.json"), &summary.to_string());
+    write_file(
+        &w.dir.join("jobs.json"),
+        r#"{"metadata":{"continue":""},"items":[{"metadata":{"namespace":"boss","name":"boss-pg-backup-failed","uid":"failed-uid","creationTimestamp":"2026-10-25T09:10:00Z","ownerReferences":[{"kind":"CronJob","name":"boss-pg-backup","uid":"cron-uid","controller":true}]},"status":{"failed":1,"conditions":[{"type":"Failed","status":"True","reason":"BackoffLimitExceeded"}]}}]}"#,
+    );
+    create_dir(&w.dir.join("no-token"));
+    write_exec(
+        &w.bin.join("curl"),
+        "#!/usr/bin/env bash\nprintf '%s\\n' '{\"total\":0,\"data\":[]}'\n",
+    );
+    let empty_token = w.dir.join("no-token");
+    let out = w.run(
+        &["--print"],
+        &[
+            ("JOBS_API", "http://jobs.test"),
+            ("BOSS_MACHINE_TOKEN_DIR", empty_token.to_str().unwrap()),
+            ("BOSS_MACHINE_TOKEN_HOSTS", ""),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let obs: Value =
+        serde_json::from_str(stdout.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
+    let backup = row(&obs, "boss/boss-backups");
+    assert_eq!(backup["free_bytes"], 19 * GIB);
+    assert_eq!(backup["scheduled_job"]["state"], "failed", "{backup}");
+    assert_eq!(backup["scheduled_job"]["job_uid"], "failed-uid");
 }
 
 /// The instance namespaces as instances.toml declares them — read here

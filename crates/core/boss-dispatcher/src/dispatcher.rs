@@ -8,6 +8,9 @@ use boss_jobs::step_registry::{Completion, StepRegistry};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
+
+#[cfg(test)]
+mod matchmaking_tests;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -124,6 +127,10 @@ struct StepEventPayload {
     /// unassigned.)
     #[serde(default)]
     metadata: Option<Value>,
+    #[serde(default)]
+    spec_slug: Option<String>,
+    #[serde(default)]
+    fields: Option<Vec<boss_core::job::StepField>>,
 }
 
 /// Max assignments processed in parallel. A strictly-serial loop PUTs one
@@ -275,7 +282,7 @@ async fn handle_event(
     payload: &Value,
     partition: Partition,
 ) -> Result<()> {
-    let step: StepEventPayload =
+    let mut step: StepEventPayload =
         serde_json::from_value(payload.clone()).context("parsing step payload")?;
     let Some(status) = step.status.as_deref() else {
         return Ok(());
@@ -330,6 +337,86 @@ async fn handle_event(
             step_id, kind, "agent step — dispatcher executes, not assigned"
         );
         return Ok(());
+    }
+    // Stored projections are authoritative. Older pinned packets may
+    // instead inherit the active row's block, but only for the SAME
+    // completion fields, exactly as the claim/station/brief readers do.
+    if let Some(slug) = step.spec_slug.as_deref()
+        && step
+            .metadata
+            .as_ref()
+            .is_none_or(|m| boss_jobs::agent_spec::projected(m).is_none())
+    {
+        // The resolver's file is immutable historical model input. Reuse
+        // its typed Step API rather than editing that content address or
+        // duplicating its completion-contract rules (d3cfa247 gate repair).
+        let pinned: Vec<boss_core::job::Step> = fetch_json(
+            ctx,
+            &format!(
+                "{}/api/jobs/{job_id}/steps",
+                ctx.jobs_api_url.trim_end_matches('/')
+            ),
+        )
+        .await?;
+        let mut exact = pinned.into_iter().filter(|s| s.id.to_string() == step_id);
+        let mut pinned = exact.next().context("event's pinned step is missing")?;
+        anyhow::ensure!(exact.next().is_none(), "event's pinned step is ambiguous");
+        anyhow::ensure!(
+            pinned.job_id.to_string() == job_id,
+            "pinned step belongs to another packet"
+        );
+        anyhow::ensure!(
+            pinned.spec_slug.as_deref() == Some(slug),
+            "pinned step slug changed since event"
+        );
+        if let Some(fields) = &step.fields {
+            anyhow::ensure!(
+                boss_jobs::agent_spec::same_contract(fields, &pinned.fields),
+                "pinned completion contract changed since event"
+            );
+        }
+        // The event remains the authority for stored projections and role
+        // metadata: a later row must not replace what this event declared.
+        pinned.metadata = step.metadata.clone().unwrap_or(Value::Null);
+        let job: Value = fetch_json(
+            ctx,
+            &format!(
+                "{}/api/jobs/{job_id}",
+                ctx.jobs_api_url.trim_end_matches('/')
+            ),
+        )
+        .await?;
+        let kind = job["kind"]
+            .as_str()
+            .context("packet kind unread for agent contract")?;
+        let mut url = reqwest::Url::parse(&ctx.jobs_api_url)?;
+        url.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("jobs API URL cannot hold workflow path"))?
+            .clear()
+            .extend(["api", "workflows", kind]);
+        let response = ctx
+            .client
+            .get(url.as_str())
+            .header("x-sim-origin", sim_origin_value())
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        // Retiring a kind removes its active row, not its open packets.
+        // Only that explicit absence means no inherited agent contract;
+        // unread responses still NAK instead of guessing human eligibility.
+        let row = if response.status() == reqwest::StatusCode::NOT_FOUND {
+            None
+        } else {
+            Some(
+                response
+                    .error_for_status()
+                    .with_context(|| format!("GET {url}"))?
+                    .json::<boss_jobs::registry::WorkflowSpec>()
+                    .await
+                    .with_context(|| format!("decode {url} response"))?,
+            )
+        };
+        step.metadata = Some(boss_jobs::agent_spec::resolved(&pinned, row.as_ref()).metadata);
     }
     // CLAIMABLE: the protocol asked for a role QUEUE, not a
     // nomination. Leave the step unassigned and let any holder of its
@@ -442,6 +529,13 @@ async fn handle_event(
         .and_then(|m| m.get(boss_jobs::agent_spec::MODEL_KEY))
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty());
+    let agent_declared = step
+        .metadata
+        .as_ref()
+        .is_some_and(boss_jobs::agent_spec::agent_takes);
+    // A cached or configured agent can stop working between pick and PUT.
+    // Exclude it for this event so fallback cannot select it again (ccd7bfa1).
+    let mut unavailable = std::collections::HashSet::new();
     if step_model.is_some() {
         match capability_executor_for(
             ctx,
@@ -449,20 +543,29 @@ async fn handle_event(
             decision_shaped,
             &role_candidates,
             step_model,
+            step_id,
+            step.metadata
+                .as_ref()
+                .and_then(boss_jobs::step_release::released_from),
         )
         .await
         {
-            Ok(Some(agent)) => {
-                assign(ctx, job_id, step_id, &agent).await?;
-                debug!(
-                    job_id,
-                    step_id,
-                    agent,
-                    model = step_model.unwrap_or_default(),
-                    "dispatcher assigned the step to the agent serving its (role, model)"
-                );
-                return Ok(());
-            }
+            Ok(Some(agent)) => match assign(ctx, job_id, step_id, &agent).await? {
+                AssignmentOutcome::Assigned => {
+                    debug!(
+                        job_id,
+                        step_id,
+                        agent,
+                        model = step_model.unwrap_or_default(),
+                        "dispatcher assigned the step to the agent serving its (role, model)"
+                    );
+                    return Ok(());
+                }
+                AssignmentOutcome::Settled => return Ok(()),
+                AssignmentOutcome::Skipped => {
+                    unavailable.insert(agent);
+                }
+            },
             Ok(None) => {}
             Err(e) => {
                 debug!(job_id, step_id, error = %e, "roster read failed for the capability pick; using the env executor");
@@ -481,11 +584,54 @@ async fn handle_event(
         // Nominate the REGISTERED id, not the env spelling: the claim
         // door signs this actor by its registered id and the CAS
         // compares the two (d7fef617, `canonical_executor`).
-        let executor = canonical_executor_for(ctx, &executor).await;
-        assign(ctx, job_id, step_id, &executor).await?;
+        let executor = match canonical_executor_for(ctx, &executor).await {
+            Ok(canonical) => canonical,
+            Err(error) if agent_declared => return Err(error),
+            Err(_) => executor,
+        };
+        // An env spelling is configuration, not proof that its target is an
+        // agent. Declared agent work must never reach a person (bf47083d).
+        if agent_declared
+            && !fetch_agents(ctx).await?.iter().any(|row| {
+                row.id == executor
+                    && row
+                        .role
+                        .as_deref()
+                        .is_some_and(|role| role_candidates.contains(&role))
+                    && step_model.is_some_and(|model| row.default_model == model)
+            })
+        {
+            debug!(
+                job_id,
+                step_id,
+                executor,
+                "declared agent work stays queued; configured executor does not serve its role and model"
+            );
+            return Ok(());
+        }
+        if !unavailable.contains(&executor) {
+            match assign(ctx, job_id, step_id, &executor).await? {
+                AssignmentOutcome::Assigned => {
+                    debug!(
+                        job_id,
+                        step_id, executor, "dispatcher assigned executable step to the executor"
+                    );
+                    return Ok(());
+                }
+                AssignmentOutcome::Settled => return Ok(()),
+                AssignmentOutcome::Skipped => {
+                    unavailable.insert(executor);
+                }
+            }
+        }
+    }
+    // Exhausting the agent lanes does not change the protocol's executor.
+    // Leave the step unassigned for its role queue instead of nominating a
+    // person through the owner or general role fallback (bf47083d).
+    if agent_declared {
         debug!(
             job_id,
-            step_id, executor, "dispatcher assigned executable step to the executor"
+            step_id, "no available declared executor; leaving agent work in its role queue"
         );
         return Ok(());
     }
@@ -511,56 +657,73 @@ async fn handle_event(
             None => false,
         };
         if let Some(owner_id) = owner_assignee(decision_shaped, owner.as_deref(), owner_holds) {
-            assign(ctx, job_id, step_id, &owner_id).await?;
-            debug!(
-                job_id,
-                step_id, owner_id, "decision-shaped step assigned to its packet owner"
-            );
-            return Ok(());
+            match assign(ctx, job_id, step_id, &owner_id).await? {
+                AssignmentOutcome::Assigned => {
+                    debug!(
+                        job_id,
+                        step_id, owner_id, "decision-shaped step assigned to its packet owner"
+                    );
+                    return Ok(());
+                }
+                AssignmentOutcome::Settled => return Ok(()),
+                AssignmentOutcome::Skipped => {
+                    unavailable.insert(owner_id);
+                }
+            }
         }
     }
-    let chosen = pick_employee_with_role_fallback(
-        ctx,
-        &role_candidates,
-        step_id,
-        partition,
-        decision_shaped,
-    )
-    .await?;
-    let Some((emp_id, role_used)) = chosen else {
-        // A role IS required (role_candidates is non-empty) but no active
-        // holder was found. This is virtually always transient: at sim start
-        // the roster cache is cold — the people projection hasn't caught up
-        // with the just-seeded employees — or a new hire's row hasn't landed
-        // yet. Returning Err makes `settle` NAK, so JetStream redelivers on
-        // the backoff schedule (~98s across MAX_DELIVER attempts); once the
-        // roster warms the reassignment succeeds, and the assignee-already-set
-        // guard above keeps redelivery idempotent. A genuinely unfillable role
-        // exhausts the budget and dead-letters loudly — the correct outcome.
-        // A NON-REAL step whose only role holders are operator identities
-        // is unfillable BY DESIGN (`partition_permits`): it dead-letters
-        // loudly instead of polluting a real queue, and the exercise that
-        // filed it learns immediately.
-        // The old `Ok(())` here dropped the step on the floor: it was never
-        // assigned, so its Job never closed, silently losing work (a
-        // conservation violation). This was the brewery day-1 ap-payment-run
-        // hang — the first AP run opened before the roster was queryable.
-        anyhow::bail!(
-            "no eligible employee for step {step_id} (job {job_id}); \
+    loop {
+        let chosen = pick_employee_with_role_fallback(
+            ctx,
+            &role_candidates,
+            step_id,
+            partition,
+            decision_shaped,
+            &unavailable,
+        )
+        .await?;
+        let Some((emp_id, role_used)) = chosen else {
+            // A role IS required (role_candidates is non-empty) but no active
+            // holder was found. This is virtually always transient: at sim start
+            // the roster cache is cold — the people projection hasn't caught up
+            // with the just-seeded employees — or a new hire's row hasn't landed
+            // yet. Returning Err makes `settle` NAK, so JetStream redelivers on
+            // the backoff schedule (~98s across MAX_DELIVER attempts); once the
+            // roster warms the reassignment succeeds, and the assignee-already-set
+            // guard above keeps redelivery idempotent. A genuinely unfillable role
+            // exhausts the budget and dead-letters loudly — the correct outcome.
+            // A NON-REAL step whose only role holders are operator identities
+            // is unfillable BY DESIGN (`partition_permits`): it dead-letters
+            // loudly instead of polluting a real queue, and the exercise that
+            // filed it learns immediately.
+            // The old `Ok(())` here dropped the step on the floor: it was never
+            // assigned, so its Job never closed, silently losing work (a
+            // conservation violation). This was the brewery day-1 ap-payment-run
+            // hang — the first AP run opened before the roster was queryable.
+            anyhow::bail!(
+                "no eligible employee for step {step_id} (job {job_id}); \
              candidates={role_candidates:?} partition={partition} — \
              NAK for redelivery once the roster warms"
+            );
+        };
+        match assign(ctx, job_id, step_id, &emp_id).await? {
+            AssignmentOutcome::Skipped => {
+                unavailable.insert(emp_id);
+                continue;
+            }
+            AssignmentOutcome::Settled => return Ok(()),
+            AssignmentOutcome::Assigned => {}
+        }
+        // Per-assignment log at DEBUG, not INFO: at warp the loop assigns
+        // many steps/sec; an INFO line each contributed to the syslog flood.
+        debug!(
+            job_id, step_id, emp_id,
+            role = role_used,
+            candidates = ?role_candidates,
+            "dispatcher assigned step"
         );
-    };
-    assign(ctx, job_id, step_id, &emp_id).await?;
-    // Per-assignment log at DEBUG, not INFO: at warp the loop assigns
-    // many steps/sec; an INFO line each contributed to the syslog flood.
-    debug!(
-        job_id, step_id, emp_id,
-        role = role_used,
-        candidates = ?role_candidates,
-        "dispatcher assigned step"
-    );
-    Ok(())
+        return Ok(());
+    }
 }
 
 /// Try each candidate role in order; first one with an active
@@ -648,7 +811,9 @@ fn executor_for(
 /// Fires only for a REAL, executable step that carries `agent_model`
 /// (car 1's projection of the block onto the packet) and a role among
 /// its candidates; the agent must be active, hold that role and run
-/// that model. Lowest id wins, so the pick is deterministic. `None` is
+/// that model. When several agents do, the configured strategy chooses
+/// among them by the step id (`Spread` live: a stable hash, so the pick
+/// is deterministic per step and shared across the agents). `None` is
 /// "this pick says nothing", and the caller falls through to
 /// `executor_for` — the env's single executor. Measured 2026-09-18 on
 /// the live registry: agent-claude holds `engineering-agent`, every
@@ -676,6 +841,9 @@ fn capability_executor(
     role_candidates: &[&str],
     step_model: Option<&str>,
     roster: &[Employee],
+    strategy: AssignmentStrategy,
+    step_id: &str,
+    released_from: Option<&str>,
 ) -> Option<String> {
     if partition.fails_closed() || decision_shaped {
         return None;
@@ -684,14 +852,41 @@ fn capability_executor(
     if model.is_empty() {
         return None;
     }
-    roster
+    // WHICH of several agents serving the pair (backlog 67d4344b). This
+    // took the lowest id, which was a rule about one agent per model:
+    // once agent-claude-b registered beside agent-claude on opus-5-5,
+    // every step either could run went to agent-claude, and a step
+    // released to the pool came straight back to it. The candidates are
+    // id-sorted and chosen by the configured strategy over the step id —
+    // the same rule `pick_employee` uses across a role's holders — so a
+    // step's pick replays identically and distinct steps spread.
+    let mut agents: Vec<&str> = roster
         .iter()
         .filter(|e| e.is_agent && e.status == "active")
         .filter(|e| role_candidates.contains(&e.role.as_str()))
         .filter(|e| e.models.iter().any(|m| m == model))
         .map(|e| e.id.as_str())
-        .min()
-        .map(str::to_string)
+        .collect();
+    agents.sort_unstable();
+    agents.dedup();
+    // NOT BACK TO THE HOLDER IT WAS RELEASED FROM (backlog ff0f0ff5).
+    // The hash above reads the step id alone, so a step `boss step
+    // release` handed back to the pool was re-nominated to the agent
+    // that had just released it, every time. The release records that
+    // holder on the step (`boss_jobs::step_release`), and while another
+    // agent serves the pair it is left out; alone on the pair it is
+    // still nominated, as before.
+    if let Some(from) = released_from
+        && agents.len() > 1
+    {
+        agents.retain(|id| *id != from);
+    }
+    if agents.is_empty() {
+        return None;
+    }
+    agents
+        .get(pick_index_for(strategy, step_id, agents.len()))
+        .map(|id| id.to_string())
 }
 
 /// `capability_executor` over the SAME TTL-cached roster the role pick
@@ -703,6 +898,8 @@ async fn capability_executor_for(
     decision_shaped: bool,
     role_candidates: &[&str],
     step_model: Option<&str>,
+    step_id: &str,
+    released_from: Option<&str>,
 ) -> Result<Option<String>> {
     let mut cache = ctx.roster.lock().await;
     if roster_is_stale(&cache) {
@@ -715,6 +912,9 @@ async fn capability_executor_for(
         role_candidates,
         step_model,
         &cache.employees,
+        ctx.strategy,
+        step_id,
+        released_from,
     ))
 }
 
@@ -760,13 +960,24 @@ async fn pick_employee_with_role_fallback(
     step_id: &str,
     partition: Partition,
     decision_shaped: bool,
+    unavailable: &std::collections::HashSet<String>,
 ) -> Result<Option<(String, String)>> {
     if role_candidates.is_empty() {
-        let chosen = pick_employee(ctx, None, step_id, partition, decision_shaped).await?;
+        let chosen =
+            pick_employee(ctx, None, step_id, partition, decision_shaped, unavailable).await?;
         return Ok(chosen.map(|id| (id, String::new())));
     }
     for r in role_candidates {
-        if let Some(id) = pick_employee(ctx, Some(r), step_id, partition, decision_shaped).await? {
+        if let Some(id) = pick_employee(
+            ctx,
+            Some(r),
+            step_id,
+            partition,
+            decision_shaped,
+            unavailable,
+        )
+        .await?
+        {
             return Ok(Some((id, (*r).to_string())));
         }
     }
@@ -840,7 +1051,79 @@ async fn fetch_active_roster(ctx: &DispatcherCtx) -> Result<Vec<Employee>> {
     let people = format!("{}/api/people", ctx.people_api_url.trim_end_matches('/'));
     let employees: Vec<Employee> = fetch_json(ctx, &people).await?;
     let agents = fetch_agents(ctx).await?;
-    Ok(roster_union(employees, agents))
+    let sessions = fetch_work_sessions(ctx).await?;
+    let now = boss_clock_client::wall_now();
+    let available: std::collections::HashSet<_> = agents
+        .iter()
+        .filter(|agent| agent_has_session(agent, &sessions, now))
+        .map(|agent| agent.id.as_str())
+        .collect();
+    let mut roster = roster_union(employees, agents.clone());
+    for row in &mut roster {
+        if row.is_agent && !available.contains(row.id.as_str()) {
+            row.status = "unavailable".into();
+        }
+    }
+    Ok(roster)
+}
+
+/// An agent registry row describes capability, not a working session.
+/// Closed windows are the published quiesce contract; legacy prose marks
+/// are deliberately not interpreted as new scheduler policy.
+fn agent_has_session(
+    agent: &boss_jobs::agents::AgentRow,
+    sessions: &[Value],
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    sessions.iter().any(|session| {
+        let metadata = &session["metadata"];
+        let actor = metadata["actor"].as_str().unwrap_or_default();
+        if session["kind"] != "work-session"
+            || session["status"] != "open"
+            || !(actor == agent.id || agent.aliases.iter().any(|alias| alias == actor))
+            || metadata.get("ended_at").is_some_and(|v| !v.is_null())
+        {
+            return false;
+        }
+        match metadata.get("window") {
+            None | Some(Value::Null) => true,
+            Some(window) => match window["state"].as_str() {
+                Some("open") => true,
+                Some("until") => window["until"]
+                    .as_str()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .is_some_and(|until| until > now),
+                _ => false,
+            },
+        }
+    })
+}
+
+async fn fetch_work_sessions(ctx: &DispatcherCtx) -> Result<Vec<Value>> {
+    #[derive(Deserialize)]
+    struct Listing {
+        data: Vec<Value>,
+        total: usize,
+    }
+    let mut rows = Vec::new();
+    loop {
+        let url = format!(
+            "{}/api/jobs?kind=work-session&status=open&full=false&limit=500&offset={}",
+            ctx.jobs_api_url.trim_end_matches('/'),
+            rows.len()
+        );
+        let page: Listing = fetch_json(ctx, &url).await?;
+        let empty = page.data.is_empty();
+        rows.extend(page.data);
+        anyhow::ensure!(
+            rows.len() <= page.total,
+            "work-session listing changed while paging"
+        );
+        if rows.len() == page.total {
+            return Ok(rows);
+        }
+        anyhow::ensure!(!empty, "work-session listing ended before its total");
+    }
 }
 
 /// The registered agents, as `GET /api/agents` lists them — the one
@@ -897,28 +1180,21 @@ fn alias_map(agents: &[boss_jobs::agents::AgentRow]) -> std::collections::HashMa
 
 /// `canonical_executor` over the alias map cached beside the roster,
 /// refreshed on the roster's TTL from the same `/api/agents` listing.
-/// A registry that cannot be read leaves the env spelling as it was —
-/// the prior behaviour, and one the claim CAS now admits (the other
-/// half of d7fef617) — rather than NAKing a lane that never depended
-/// on a registry read before; the miss is logged.
-async fn canonical_executor_for(ctx: &DispatcherCtx, env_id: &str) -> String {
+/// An unread registry propagates to the caller: declared agent work must
+/// retry rather than acknowledge an unresolved alias as ineligible. The
+/// caller retains the legacy spelling only for human work.
+async fn canonical_executor_for(ctx: &DispatcherCtx, env_id: &str) -> Result<String> {
     let mut cache = ctx.roster.lock().await;
     let stale = cache
         .aliases_fetched_at
         .map(|t| t.elapsed() >= ROSTER_TTL)
         .unwrap_or(true);
     if stale {
-        match fetch_agents(ctx).await {
-            Ok(agents) => {
-                cache.aliases = alias_map(&agents);
-                cache.aliases_fetched_at = Some(std::time::Instant::now());
-            }
-            Err(e) => {
-                debug!(env_id, error = %e, "agents read failed; nominating the executor as the env spells it");
-            }
-        }
+        let agents = fetch_agents(ctx).await?;
+        cache.aliases = alias_map(&agents);
+        cache.aliases_fetched_at = Some(std::time::Instant::now());
     }
-    canonical_executor(env_id, &cache.aliases)
+    Ok(canonical_executor(env_id, &cache.aliases))
 }
 
 async fn fetch_json<T: serde::de::DeserializeOwned>(ctx: &DispatcherCtx, url: &str) -> Result<T> {
@@ -1097,13 +1373,18 @@ async fn pick_employee(
     step_id: &str,
     partition: Partition,
     decision_shaped: bool,
+    unavailable: &std::collections::HashSet<String>,
 ) -> Result<Option<String>> {
     let mut cache = ctx.roster.lock().await;
     if roster_is_stale(&cache) {
         cache.employees = fetch_active_roster(ctx).await?;
         cache.fetched_at = Some(std::time::Instant::now());
     }
-    let candidates = eligible_candidates(&cache.employees, role, partition, decision_shaped);
+    let candidates: Vec<_> =
+        eligible_candidates(&cache.employees, role, partition, decision_shaped)
+            .into_iter()
+            .filter(|employee| !unavailable.contains(&employee.id))
+            .collect();
     if candidates.is_empty() {
         // No eligible holder — preserve the None contract; never `% 0`.
         return Ok(None);
@@ -1164,7 +1445,63 @@ pub(crate) fn sim_origin_value() -> &'static str {
     }
 }
 
-async fn assign(ctx: &DispatcherCtx, job_id: &str, step_id: &str, emp_id: &str) -> Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+enum AssignmentOutcome {
+    Assigned,
+    /// A newer nomination, claim or completion already settled the event.
+    Settled,
+    /// This pick is unavailable; another lane or holder must be tried.
+    Skipped,
+}
+
+async fn assign(
+    ctx: &DispatcherCtx,
+    job_id: &str,
+    step_id: &str,
+    emp_id: &str,
+) -> Result<AssignmentOutcome> {
+    // A fresh roster already distinguishes a person from an agent. Keep
+    // that human path independent of another agents read (review N2).
+    let known_person = {
+        let cache = ctx.roster.lock().await;
+        !roster_is_stale(&cache)
+            && cache
+                .employees
+                .iter()
+                .any(|row| row.id == emp_id && !row.is_agent)
+            && !cache
+                .employees
+                .iter()
+                .any(|row| row.id == emp_id && row.is_agent)
+    };
+    // Unknown/env targets still require the registry. Agent sessions are
+    // rechecked so a closed window cannot remain eligible for the TTL.
+    let agents = if known_person {
+        Vec::new()
+    } else {
+        fetch_agents(ctx).await?
+    };
+    if let Some(agent) = agents
+        .iter()
+        .find(|agent| agent.id == emp_id || agent.aliases.iter().any(|alias| alias == emp_id))
+        && !agent_has_session(
+            agent,
+            &fetch_work_sessions(ctx).await?,
+            boss_clock_client::wall_now(),
+        )
+    {
+        debug!(
+            emp_id,
+            "agent has no open working session; leaving step queued"
+        );
+        let mut cache = ctx.roster.lock().await;
+        for employee in &mut cache.employees {
+            if employee.id == agent.id {
+                employee.status = "unavailable".into();
+            }
+        }
+        return Ok(AssignmentOutcome::Skipped);
+    }
     const MAX_ATTEMPTS: u32 = 4;
     let url = format!(
         "{}/api/jobs/{}/steps/{}",
@@ -1172,7 +1509,7 @@ async fn assign(ctx: &DispatcherCtx, job_id: &str, step_id: &str, emp_id: &str) 
         job_id,
         step_id
     );
-    let body = serde_json::json!({ "assignee_id": emp_id });
+    let body = serde_json::json!({ "assignee_id": emp_id, "automatic_assignment": true });
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -1187,7 +1524,7 @@ async fn assign(ctx: &DispatcherCtx, job_id: &str, step_id: &str, emp_id: &str) 
             .await
             .with_context(|| format!("PUT {url}"))?;
         if resp.status().is_success() {
-            return Ok(());
+            return Ok(AssignmentOutcome::Assigned);
         }
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND && attempt < MAX_ATTEMPTS {
@@ -1196,19 +1533,29 @@ async fn assign(ctx: &DispatcherCtx, job_id: &str, step_id: &str, emp_id: &str) 
             continue;
         }
         let text = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::CONFLICT
+            && serde_json::from_str::<Value>(&text)
+                .ok()
+                .is_some_and(|body| {
+                    body["code"] == boss_jobs::step_release::AUTOMATIC_ASSIGNMENT_SUPERSEDED
+                })
+        {
+            debug!(job_id, step_id, "newer nomination won; nothing to assign");
+            return Ok(AssignmentOutcome::Settled);
+        }
         if finished_before_assignment(status.as_u16(), &text) {
             debug!(
                 job_id,
                 step_id, emp_id, "step finished before its assignment arrived; nothing to hold"
             );
-            return Ok(());
+            return Ok(AssignmentOutcome::Settled);
         }
         if held_before_assignment(status.as_u16(), &text) {
             debug!(
                 job_id,
                 step_id, emp_id, "step was claimed before its assignment arrived; nothing to hold"
             );
-            return Ok(());
+            return Ok(AssignmentOutcome::Settled);
         }
         anyhow::bail!("PUT {url} returned {status}: {text}");
     }
@@ -1689,11 +2036,23 @@ mod tests {
         roster.push(agent("agent-haiku", "platform-admin", "haiku-4-5"));
         roster.push(agent("agent-eng", "engineering-agent", "opus-5[1m]"));
         let platform = ["platform-admin"];
+        // Under the legacy `LowestId` strategy; the spread across agents
+        // sharing a model is pinned by
+        // `agents_sharing_a_model_split_its_steps_between_them`.
         let pick = |partition, decision, roles: &[&str], model: Option<&str>| {
-            capability_executor(partition, decision, roles, model, &roster)
+            capability_executor(
+                partition,
+                decision,
+                roles,
+                model,
+                &roster,
+                AssignmentStrategy::LowestId,
+                "step-1",
+                None,
+            )
         };
-        // The case the rule exists for — and the lowest id wins, so the
-        // pick is deterministic across a roster of equals.
+        // The case the rule exists for — and under `LowestId` the lowest
+        // id wins, so the pick is deterministic across a roster of equals.
         assert_eq!(
             pick(Partition::Real, false, &platform, Some("opus-5[1m]")),
             Some("agent-claude".to_string())
@@ -1733,7 +2092,10 @@ mod tests {
                 false,
                 &platform,
                 Some("opus-5[1m]"),
-                &people_only
+                &people_only,
+                AssignmentStrategy::Spread,
+                "step-1",
+                None,
             ),
             None
         );
@@ -1748,9 +2110,153 @@ mod tests {
                 false,
                 &platform,
                 Some("opus-5[1m]"),
-                &retired
+                &retired,
+                AssignmentStrategy::Spread,
+                "step-1",
+                None,
             ),
             None
+        );
+    }
+
+    /// TWO AGENTS ON ONE MODEL SPLIT ITS WORK (backlog 67d4344b). The
+    /// pick took the lowest id, so when agent-claude-b registered beside
+    /// agent-claude (both `platform-admin`, both `opus-5-5`, read live
+    /// 2026-10-18) every step either could run went to agent-claude, a
+    /// step released to the pool was re-nominated to it within seconds
+    /// (car afd61aa2's review, 2026-10-17), and adding an executor added
+    /// no throughput without a hand nomination per step. Under the
+    /// configured `Spread` the pick is the same stable hash of the step
+    /// id the role pick uses: deterministic for one step, so a replay
+    /// nominates the same agent, and spread across distinct steps, so
+    /// each agent sharing the model gets a share. An agent on another
+    /// model is never among them.
+    #[test]
+    fn agents_sharing_a_model_split_its_steps_between_them() {
+        let agent = |id: &str, model: &str| super::Employee {
+            id: id.into(),
+            role: "platform-admin".into(),
+            status: "active".into(),
+            is_agent: true,
+            models: vec![model.into()],
+        };
+        let roster = vec![
+            agent("agent-claude", "opus-5-5"),
+            agent("agent-claude-b", "opus-5-5"),
+            agent("agent-codex", "gpt-6.1-sol"),
+        ];
+        let platform = ["platform-admin"];
+        let pick = |step_id: &str| {
+            capability_executor(
+                Partition::Real,
+                false,
+                &platform,
+                Some("opus-5-5"),
+                &roster,
+                AssignmentStrategy::Spread,
+                step_id,
+                None,
+            )
+        };
+        let mut hits: HashMap<String, usize> = HashMap::new();
+        for n in 0..400 {
+            let step_id = format!("00000000-0000-4000-8000-{n:012x}");
+            let first = pick(&step_id).expect("an agent runs the model");
+            assert_eq!(
+                pick(&step_id).as_deref(),
+                Some(first.as_str()),
+                "one step is always nominated to the same agent"
+            );
+            *hits.entry(first).or_default() += 1;
+        }
+        assert_eq!(
+            hits.keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["agent-claude", "agent-claude-b"].into_iter().collect(),
+            "both agents on the model get work, and the agent on another model none: {hits:?}"
+        );
+        for (agent, n) in &hits {
+            assert!(
+                (100..300).contains(n),
+                "{agent} took {n} of 400 — not a share of the model's work"
+            );
+        }
+    }
+
+    /// A STEP RELEASED TO THE POOL DOES NOT BOUNCE BACK TO ITS HOLDER
+    /// (backlog ff0f0ff5, review 7adb1d44 of car b2a077eb). `Spread`
+    /// hashes the step id alone, so before this a released step — ready,
+    /// unassigned, re-nominated on the next event — went straight back
+    /// to the agent that had just handed it back, every time. The
+    /// release now records `released.from`, and while another agent
+    /// serves the same `(role, model)` the pick leaves that one out. With
+    /// no other agent on the pair it is nominated as before: a release
+    /// is not a refusal of the only executor there is.
+    #[test]
+    fn a_released_step_is_not_renominated_to_the_agent_it_was_released_from() {
+        let agent = |id: &str, model: &str| super::Employee {
+            id: id.into(),
+            role: "platform-admin".into(),
+            status: "active".into(),
+            is_agent: true,
+            models: vec![model.into()],
+        };
+        let roster = vec![
+            agent("agent-claude", "opus-5-5"),
+            agent("agent-claude-b", "opus-5-5"),
+            agent("agent-codex", "gpt-6.1-sol"),
+        ];
+        let platform = ["platform-admin"];
+        let pick = |step_id: &str, roster: &[super::Employee], released: Option<&str>| {
+            capability_executor(
+                Partition::Real,
+                false,
+                &platform,
+                Some("opus-5-5"),
+                roster,
+                AssignmentStrategy::Spread,
+                step_id,
+                released,
+            )
+        };
+        // Both directions: a step whose Spread pick is each agent in turn.
+        for holder in ["agent-claude", "agent-claude-b"] {
+            let step_id = (0..400)
+                .map(|n| format!("00000000-0000-4000-8000-{n:012x}"))
+                .find(|s| pick(s, &roster, None).as_deref() == Some(holder))
+                .expect("Spread names each agent for some step");
+            let other = if holder == "agent-claude" {
+                "agent-claude-b"
+            } else {
+                "agent-claude"
+            };
+            assert_eq!(
+                pick(&step_id, &roster, Some(holder)).as_deref(),
+                Some(other),
+                "released from {holder}, the step goes to the other agent on the model"
+            );
+            // Released from someone who is not the hash pick: unchanged.
+            assert_eq!(
+                pick(&step_id, &roster, Some(other)).as_deref(),
+                Some(holder)
+            );
+            // Released from the ONLY agent serving the pair: still it.
+            let alone = vec![agent(holder, "opus-5-5")];
+            assert_eq!(
+                pick(&step_id, &alone, Some(holder)).as_deref(),
+                Some(holder),
+                "with no other agent on the pair the release is not a refusal"
+            );
+        }
+        // And the record is read off the step's metadata, as the event
+        // payload carries it, through the one reader.
+        let md = serde_json::json!({
+            "released": { "why": "w", "by": "agent-claude", "from": "agent-claude-b" }
+        });
+        assert_eq!(
+            boss_jobs::step_release::released_from(&md),
+            Some("agent-claude-b")
         );
     }
 
@@ -1793,7 +2299,16 @@ mod tests {
         // with the row holding the role the step is under — step 1 of
         // the retirement changes nothing here.
         assert_eq!(
-            capability_executor(Partition::Real, false, &platform, None, &roster),
+            capability_executor(
+                Partition::Real,
+                false,
+                &platform,
+                None,
+                &roster,
+                AssignmentStrategy::Spread,
+                "step-1",
+                None,
+            ),
             None
         );
         // ...and the env lane is what names the executor for it.
@@ -2213,6 +2728,277 @@ mod tests {
             "the agent's default_model is the capability the executor pick matches"
         );
         assert!(roster[0].models.is_empty(), "a person runs no model");
+    }
+
+    #[tokio::test]
+    async fn the_live_roster_does_not_offer_agents_without_an_open_working_session() {
+        use axum::{
+            Json, Router,
+            routing::{get, put},
+        };
+        let assignments = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = assignments.clone();
+        let app = Router::new()
+            .route("/api/jobs/job/steps/step", put(move || {
+                let observed = observed.clone();
+                async move {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }))
+            .route("/api/people", get(|| async { Json(serde_json::json!([
+                {"id":"emp-human","role":"platform-admin","status":"active"}
+            ])) }))
+            .route("/api/agents", get(|| async { Json(serde_json::json!({"data":[
+                {"id":"agent-absent","display_name":"Absent","default_model":"model","role":"platform-admin","department":null,"hourly_budget_usd_micros":null,"max_concurrent_runs":null,"aliases":[]},
+                {"id":"agent-working","display_name":"Working","default_model":"model","role":"platform-admin","department":null,"hourly_budget_usd_micros":null,"max_concurrent_runs":null,"aliases":[]},
+                {"id":"agent-closed","display_name":"Closed","default_model":"model","role":"platform-admin","department":null,"hourly_budget_usd_micros":null,"max_concurrent_runs":null,"aliases":[]}
+            ],"total":3})) }))
+            .route("/api/jobs", get(|| async { Json(serde_json::json!({"data":[
+                {"kind":"work-session","status":"open","metadata":{"actor":"agent-working"}},
+                {"kind":"work-session","status":"open","metadata":{"actor":"agent-closed","window":{"state":"closed"}}}
+            ],"total":2})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ctx = super::DispatcherCtx::new(base.clone(), base, AssignmentStrategy::Spread);
+        let roster = super::fetch_active_roster(&ctx).await.unwrap();
+        let ids: Vec<_> = roster
+            .iter()
+            .filter(|row| row.status == "active")
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(ids, ["emp-human", "agent-working"]);
+        // The final write is shared by capability, role and env fallback.
+        super::assign(&ctx, "job", "step", "agent-absent")
+            .await
+            .unwrap();
+        super::assign(&ctx, "job", "step", "agent-closed")
+            .await
+            .unwrap();
+        assert_eq!(assignments.load(std::sync::atomic::Ordering::SeqCst), 0);
+        super::assign(&ctx, "job", "step", "agent-working")
+            .await
+            .unwrap();
+        super::assign(&ctx, "job", "step", "emp-human")
+            .await
+            .unwrap();
+        assert_eq!(assignments.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[test]
+    fn a_session_window_and_its_registered_alias_are_availability_evidence() {
+        let agent = boss_jobs::agents::AgentRow {
+            id: "agent-test".into(),
+            display_name: "Test".into(),
+            default_model: "model".into(),
+            role: Some("platform-admin".into()),
+            department: None,
+            hourly_budget_usd_micros: None,
+            max_concurrent_runs: None,
+            aliases: vec!["test@example.invalid".into()],
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-23T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let base = serde_json::json!({"kind":"work-session","status":"open","metadata":{"actor":"test@example.invalid"}});
+        assert!(super::agent_has_session(
+            &agent,
+            std::slice::from_ref(&base),
+            now
+        ));
+        for window in [
+            serde_json::json!({"state":"closed"}),
+            serde_json::json!({"state":"until","until":"2026-10-23T13:00:00+01:00"}),
+            serde_json::json!({"state":"until","until":"unread"}),
+        ] {
+            let mut session = base.clone();
+            session["metadata"]["window"] = window;
+            assert!(!super::agent_has_session(&agent, &[session], now));
+        }
+        let mut closed = base.clone();
+        closed["status"] = serde_json::json!("closed");
+        let mut ended = base;
+        ended["metadata"]["ended_at"] = serde_json::json!("2026-10-23T11:00:00Z");
+        assert!(!super::agent_has_session(&agent, &[closed, ended], now));
+    }
+
+    #[tokio::test]
+    async fn an_unread_session_registry_cannot_enable_the_environment_fallback() {
+        use axum::{Json, Router, routing::get};
+        let app = Router::new()
+            .route("/api/agents", get(|| async { Json(serde_json::json!({"data":[
+                {"id":"agent-env","display_name":"Env","default_model":"model","role":"platform-admin","department":null,"hourly_budget_usd_micros":null,"max_concurrent_runs":null,"aliases":[]}
+            ],"total":1})) }))
+            .route("/api/jobs", get(|| async { (axum::http::StatusCode::SERVICE_UNAVAILABLE, "session registry unread") }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ctx = super::DispatcherCtx::new(base.clone(), base, AssignmentStrategy::Spread);
+        let error = super::assign(&ctx, "job", "step", "agent-env")
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("503"), "{error:#}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_cached_human_assignment_does_not_need_another_agents_registry_read() {
+        use axum::{
+            Json, Router,
+            response::IntoResponse,
+            routing::{get, put},
+        };
+        use serde_json::Value;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dark = Arc::new(AtomicBool::new(false));
+        let agent_reads = Arc::new(AtomicUsize::new(0));
+        let assignments = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (dark_api, reads_api, assigned_api) =
+            (dark.clone(), agent_reads.clone(), assignments.clone());
+        let app = Router::new()
+            .route("/api/people", get(|| async { Json(serde_json::json!([{"id":"emp-human","role":"platform-admin","status":"active"}])) }))
+            .route("/api/agents", get(move || { let dark = dark_api.clone(); let reads = reads_api.clone(); async move {
+                reads.fetch_add(1, Ordering::SeqCst);
+                if dark.load(Ordering::SeqCst) { axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response() }
+                else { Json(serde_json::json!({"data":[],"total":0})).into_response() }
+            }}))
+            .route("/api/jobs", get(|| async { Json(serde_json::json!({"data":[],"total":0})) }))
+            .route("/api/jobs/job/steps/step", put(move |Json(body): Json<Value>| { let assigned = assigned_api.clone(); async move {
+                assigned.lock().unwrap().push(body["assignee_id"].as_str().unwrap().to_owned());
+                axum::http::StatusCode::NO_CONTENT
+            }}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ctx = super::DispatcherCtx::new(base.clone(), base, AssignmentStrategy::LowestId);
+        // Warm through the real HTTP roster port, then darken only the agents API.
+        assert_eq!(
+            super::capability_executor_for(
+                &ctx,
+                Partition::Real,
+                false,
+                &["platform-admin"],
+                Some("model"),
+                "warm",
+                None
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        let before = agent_reads.load(Ordering::SeqCst);
+        dark.store(true, Ordering::SeqCst);
+        assert!(ctx.registry.get("sign-off").unwrap().decision_shaped);
+        let event = serde_json::json!({"id":"step","job_id":"job","status":"ready","kind":"sign-off","metadata":{"authority_role":"platform-admin"}});
+        super::handle_event(&ctx, "jobs.step.updated", &event, Partition::Real)
+            .await
+            .unwrap();
+        assert_eq!(*assignments.lock().unwrap(), vec!["emp-human"]);
+        assert_eq!(
+            agent_reads.load(Ordering::SeqCst),
+            before,
+            "the warm human path does not depend on a now-dark agents registry"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn an_unavailable_env_executor_leaves_the_human_role_fallback_reachable() {
+        const CHILD: &str = "CCD_ENV_FALLBACK_CHILD";
+        let Ok(mode) = std::env::var(CHILD) else {
+            // Child-owned environment: no mutation beside parallel tests.
+            for mode in [
+                "closed",
+                "open",
+                "none",
+                "superseded",
+                "stale",
+                "role-stale",
+                "agent-closed",
+                "agent-open",
+                "agent-none",
+                "agent-superseded",
+                "agent-stale",
+                "agent-role-stale",
+                "agent-person",
+                "agent-decision",
+            ] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "dispatcher::tests::an_unavailable_env_executor_leaves_the_human_role_fallback_reachable", "--nocapture"])
+                    .env(CHILD, mode)
+                    .env("BOSS_DISPATCH_EXECUTOR_ID", if mode == "agent-person" { "emp-human" } else { "agent-env" })
+                    .env("BOSS_DISPATCH_EXECUTOR_ROLES", if mode.ends_with("role-stale") { "" } else { "platform-admin" })
+                    .output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        };
+        let agent_declared = mode.starts_with("agent-");
+        let mode = mode.strip_prefix("agent-").unwrap_or(&mode);
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            use axum::{Json, Router, routing::{get, put}};
+            let assignments = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let observed = assignments.clone();
+            let no_human = mode == "none";
+            let superseded = mode == "superseded";
+            let closes_after_roster = mode == "stale" || mode == "role-stale";
+            let window = if mode == "closed" || no_human { "closed" } else { "open" };
+            let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let app = Router::new()
+                .route("/api/jobs/job/steps/step", put(move |Json(body): Json<serde_json::Value>| {
+                    let observed = observed.clone(); async move {
+                        observed.lock().unwrap().push(body["assignee_id"].as_str().unwrap().to_owned());
+                        use axum::response::IntoResponse;
+                        if superseded {
+                            (axum::http::StatusCode::CONFLICT, Json(serde_json::json!({"code":boss_jobs::step_release::AUTOMATIC_ASSIGNMENT_SUPERSEDED}))).into_response()
+                        } else { axum::http::StatusCode::NO_CONTENT.into_response() }
+                    }
+                }))
+                .route("/api/people", get(move || async move { Json(if no_human { serde_json::json!([]) } else { serde_json::json!([{"id":"emp-human","role":"platform-admin","status":"active"}]) }) }))
+                .route("/api/agents", get(|| async { Json(serde_json::json!({"data":[{"id":"agent-env","display_name":"Env","default_model":"model","role":"platform-admin","department":null,"hourly_budget_usd_micros":null,"max_concurrent_runs":null,"aliases":[]}],"total":1})) }))
+                .route("/api/jobs", get(move || { let reads=reads.clone(); async move {
+                    let read = reads.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                    let window = if closes_after_roster && read > 0 { "closed" } else { window };
+                    Json(serde_json::json!({"data":[{"kind":"work-session","status":"open","metadata":{"actor":"agent-env","window":{"state":window}}}],"total":1}))
+                } }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener,app).await.unwrap() });
+            let ctx = super::DispatcherCtx::new(base.clone(),base,AssignmentStrategy::LowestId);
+            if mode == "role-stale" {
+                assert_eq!(super::capability_executor_for(&ctx, Partition::Real, false, &["platform-admin"], Some("model"), "warm", None).await.unwrap().as_deref(), Some("agent-env"));
+            }
+            assert!(!ctx.registry.get("task").unwrap().decision_shaped);
+            let mut event = serde_json::json!({"id":"step","job_id":"job","status":"ready","kind":"task","metadata":{"authority_role":"platform-admin"}});
+            if mode == "decision" { event["kind"] = serde_json::json!("sign-off"); }
+            if mode == "stale" { event["metadata"][boss_jobs::agent_spec::MODEL_KEY] = serde_json::json!("model"); }
+            if agent_declared {
+                let spec = boss_jobs::agent_spec::AgentSpec {
+                    profile: "builder".into(), model: if mode == "person" { "unserved" } else { "model" }.into(), budget_usd: 5.0,
+                    effort: boss_jobs::agent_spec::Effort::High,
+                    executor_provenance: Default::default(),
+                };
+                for (key, value) in boss_jobs::agent_spec::projection(&spec) {
+                    event["metadata"][key] = value;
+                }
+                assert!(boss_jobs::agent_spec::agent_takes(&event["metadata"]));
+            }
+            let outcome = super::handle_event(&ctx,"jobs.step.updated",&event,Partition::Real).await;
+            if no_human && !agent_declared { assert!(format!("{:#}",outcome.unwrap_err()).contains("no eligible employee")); }
+            else { outcome.unwrap(); }
+            let expected = if no_human || (agent_declared && (mode == "closed" || closes_after_roster || mode == "decision" || mode == "person")) { vec![] } else { vec![if mode == "closed" || closes_after_roster { "emp-human".to_owned() } else { "agent-env".to_owned() }] };
+            assert_eq!(*assignments.lock().unwrap(), expected, "whole-event {mode} env path");
+            server.abort();
+        });
     }
 
     /// REAL packets are byte-for-byte unaffected: same candidates, same

@@ -21,7 +21,7 @@
 //! These pins run the bootstrap and the lifted run.sh blocks as they
 //! ship, against a local bare repository standing in for the forge.
 
-use boss_testing::{repo_root, scratch_dir, write_exec, write_file};
+use boss_testing::{repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -208,34 +208,12 @@ fn an_unreachable_branch_falls_back_to_mains_copy_and_says_so() {
     );
 }
 
-/// Run run.sh's gated-sha block in a clone of `bare`, with BRANCH moved
-/// on the forge AFTER the bootstrap resolved `gate_sha`.
+/// Run run.sh's tree block against `bare`, with BRANCH moved on the
+/// forge AFTER the bootstrap resolved `gate_sha`. (Until a531f508 this
+/// cloned main itself and ran only the gated-sha block; the block now
+/// makes its own repository, see `materialise`.)
 fn checkout(dir: &Path, bare: &Path, gate_sha: Option<&str>) -> Output {
-    let repo = dir.join("repo");
-    let _ = fs::remove_dir_all(&repo);
-    git(
-        dir,
-        &[
-            "clone",
-            "-q",
-            "--depth",
-            "50",
-            &format!("file://{}", bare.display()),
-            repo.to_str().unwrap(),
-        ],
-    );
-    let script = format!(
-        "set -euo pipefail\nfail_lost() {{ echo \"LOST: $1\"; exit 1; }}\nGATE_BRANCH={BRANCH}\nGATE_SHA={sha}\ncd {repo}\n{block}\necho \"HEAD_SHA=$HEAD_SHA\"\n",
-        sha = gate_sha.unwrap_or(""),
-        repo = repo.display(),
-        block = block("# --- gated sha (begin) ---", "# --- gated sha (end) ---"),
-    );
-    Command::new("bash")
-        .args(["-c", &script])
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("HOME", dir)
-        .output()
-        .expect("bash")
+    materialise(dir, bare, gate_sha).0
 }
 
 /// The script and the tree it gates are ONE sha: a push after the
@@ -284,6 +262,441 @@ fn run_sh_gates_the_resolved_sha_not_the_moving_head() {
         "a gated sha the forge no longer has must end the run `lost` with the reason, \
          never gate some other tree:\n{missing_out}"
     );
+}
+
+/// Run run.sh's whole tree block as it ships — from no repository at all
+/// to the gated checkout — against `bare`, with every connection the run
+/// opens to the forge traced. Returns the run, the number of those
+/// connections, and the repository it built.
+fn materialise(dir: &Path, bare: &Path, gate_sha: Option<&str>) -> (Output, usize, PathBuf) {
+    let repo = dir.join("repo");
+    let trace = dir.join("trace2.json");
+    let _ = fs::remove_dir_all(&repo);
+    let _ = fs::remove_file(&trace);
+    let script = format!(
+        "set -euo pipefail\nfail_lost() {{ echo \"LOST: $1\"; exit 1; }}\nFORGE_URL=file://{bare}\nGATE_BRANCH={BRANCH}\nGATE_SHA={sha}\n{block}\necho \"HEAD_SHA=$HEAD_SHA\"\n",
+        bare = bare.display(),
+        sha = gate_sha.unwrap_or(""),
+        block = block(
+            "# --- the gate's tree (begin) ---",
+            "# --- the gate's tree (end) ---"
+        )
+        .replace("/gate-target/repo", repo.to_str().unwrap()),
+    );
+    let out = Command::new("bash")
+        .args(["-c", &script])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", dir)
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .expect("bash");
+    // Over file:// every connection to the forge is one upload-pack the
+    // client starts — the same count as the gate's requests over http.
+    let trips = fs::read_to_string(&trace)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("\"event\":\"child_start\"") && l.contains("git-upload-pack"))
+        .count();
+    (out, trips, repo)
+}
+
+/// ONE TRIP TO THE FORGE FOR THE TREE (backlog a531f508). run.sh used to
+/// `git clone --depth 50` main and then fetch the branch again — two
+/// connections and two transfers on every gate, ~122 a day, after the
+/// bootstrap had already resolved the sha. One fetch carries main (the
+/// trunk the scoped gate diffs against) and the gated commit together.
+#[test]
+fn the_gate_fetches_its_tree_from_the_forge_once() {
+    let dir = scratch_dir("runner-one-forge-fetch");
+    let (bare, work) = forge(&dir, BRANCH_RUNNER);
+    let tip = git(&work, &["rev-parse", "HEAD"]);
+    let main = git(&work, &["rev-parse", "main"]);
+
+    let mut seen = Vec::new();
+    for (label, sha) in [("pinned", Some(tip.as_str())), ("unpinned", None)] {
+        let (out, trips, repo) = materialise(&dir, &bare, sha);
+        let said = String::from_utf8_lossy(&out.stdout).to_string();
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            out.status.success() && said.contains(&format!("HEAD_SHA={tip}")),
+            "{label}: the tree block must end on the gated commit {tip}:\n{said}{err}"
+        );
+        // The trunk is still there for `gate.sh --auto`, which derives a
+        // car's scope from its merge base with it.
+        let base = git(&repo, &["merge-base", "origin/main", "HEAD"]);
+        seen.push((label, trips, base));
+    }
+    let _ = fs::remove_dir_all(&dir);
+
+    for (label, trips, base) in seen {
+        assert_eq!(
+            trips, 1,
+            "{label}: the gate opened {trips} connections to the forge for its tree; one \
+             fetch carries main and the gated commit (a531f508)"
+        );
+        assert_eq!(base, main, "{label}: the merge base with the trunk is main");
+    }
+}
+
+/// EVERY TRIP TO THE FORGE IS ON THE RECEIPT (backlog 9f3a6107). The
+/// seed decision asks the forge whether main moved during the gate — a
+/// deliberate second fetch of main — and it used to make it AFTER the
+/// receipt was written, inside a `$(...)` that could count nothing, so
+/// `clone.fetches` said 1 on a run that had made 2. Run the tree block
+/// and then the main re-read as they ship, against the stand-in forge:
+/// the connections traced must equal `fetches` plus `seed_fetches`, on
+/// a green run with a seed (which re-reads) and a red one (which does
+/// not), and the seed decision itself fetches nothing.
+#[test]
+fn the_receipt_counts_every_forge_fetch_the_run_made() {
+    let dir = scratch_dir("runner-counts-the-seed-fetch");
+    let (bare, work) = forge(&dir, BRANCH_RUNNER);
+    let tip = git(&work, &["rev-parse", "HEAD"]);
+    let seed = dir.join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    let repo = dir.join("repo");
+    let trace = dir.join("trace2.json");
+
+    let mut seen = Vec::new();
+    for verdict in ["green", "failed"] {
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_file(&trace);
+        let script = format!(
+            "set -euo pipefail\nfail_lost() {{ echo \"LOST: $1\"; exit 1; }}\nFORGE_URL=file://{bare}\nGATE_BRANCH={BRANCH}\nGATE_SHA={tip}\nSEED={seed}\nVERDICT={verdict}\n{tree}\n{reread}\necho \"CLONE_JSON=$CLONE_JSON\"\necho \"SEED_MAIN=$SEED_MAIN\"\n",
+            bare = bare.display(),
+            seed = seed.display(),
+            tree = block(
+                "# --- the gate's tree (begin) ---",
+                "# --- the gate's tree (end) ---"
+            )
+            .replace("/gate-target/repo", repo.to_str().unwrap()),
+            reread = block(
+                "# --- main, re-read for the seed (begin) ---",
+                "# --- main, re-read for the seed (end) ---"
+            ),
+        );
+        let out = Command::new("bash")
+            .args(["-c", &script])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &dir)
+            .env("GIT_TRACE2_EVENT", &trace)
+            .output()
+            .expect("bash");
+        let said = String::from_utf8_lossy(&out.stdout).to_string();
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        let trips = fs::read_to_string(&trace)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("\"event\":\"child_start\"") && l.contains("git-upload-pack"))
+            .count();
+        assert!(out.status.success(), "{verdict}: {said}{err}");
+        let json = said
+            .lines()
+            .find_map(|l| l.strip_prefix("CLONE_JSON="))
+            .unwrap_or_else(|| panic!("{verdict}: no CLONE_JSON:\n{said}{err}"));
+        let clone: serde_json::Value =
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("{verdict}: {e}: {json}"));
+        seen.push((verdict, trips, clone, said));
+    }
+    let _ = fs::remove_dir_all(&dir);
+
+    for (verdict, trips, clone, said) in &seen {
+        let counted =
+            clone["fetches"].as_u64().unwrap_or(99) + clone["seed_fetches"].as_u64().unwrap_or(99);
+        assert_eq!(
+            *trips as u64, counted,
+            "{verdict}: the run opened {trips} connection(s) to the forge and the receipt \
+             counts {clone} — every fetch the run makes is on the receipt (9f3a6107):\n{said}"
+        );
+    }
+    assert_eq!(
+        seen[0].2["seed_fetches"], 1,
+        "a green run with a seed re-reads main: {}",
+        seen[0].2
+    );
+    assert!(seen[0].3.contains("SEED_MAIN=fetched"), "{}", seen[0].3);
+    assert_eq!(
+        seen[1].2["seed_fetches"], 0,
+        "a red run does not re-read main: {}",
+        seen[1].2
+    );
+
+    let decision = block("seed_decision() {", "SEED_DECISION=$(seed_decision)");
+    assert!(
+        !decision.contains("git fetch"),
+        "the seed decision runs inside $(...), where a fetch it makes cannot be counted; \
+         it reads SEED_MAIN instead:\n{decision}"
+    );
+}
+
+/// The re-read's bound as it ships, and the bound these pins put in its
+/// place, so a stalled forge costs a test two seconds rather than sixty.
+const REREAD_BOUND: &str = "timeout -k 5 60 git fetch";
+const REREAD_BOUND_IN_TEST: &str = "timeout -k 1 2 git fetch";
+
+/// The "main, re-read for the seed" block as it ships, with its bound
+/// shortened (a no-op if the block has none, which the stall pin catches).
+fn reread_block() -> String {
+    block(
+        "# --- main, re-read for the seed (begin) ---",
+        "# --- main, re-read for the seed (end) ---",
+    )
+    .replace(REREAD_BOUND, REREAD_BOUND_IN_TEST)
+}
+
+/// A FAILED RE-READ IS STILL A TRIP (review 1527ebca, N1). The forge is
+/// gone by the time the seed asks whether main moved: the re-read fails,
+/// the seed is not refreshed, and the receipt still counts the trip the
+/// run made, because a fetch that failed went to the forge all the same.
+#[test]
+fn a_failed_reread_of_main_is_still_counted() {
+    let dir = scratch_dir("runner-counts-a-failed-seed-fetch");
+    let (bare, work) = forge(&dir, BRANCH_RUNNER);
+    let tip = git(&work, &["rev-parse", "HEAD"]);
+    let seed = dir.join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    let repo = dir.join("repo");
+    let script = format!(
+        "set -euo pipefail\nfail_lost() {{ echo \"LOST: $1\"; exit 1; }}\nFORGE_URL=file://{bare}\nGATE_BRANCH={BRANCH}\nGATE_SHA={tip}\nSEED={seed}\nVERDICT=green\n{tree}\nrm -rf {bare}\n{reread}\necho \"CLONE_JSON=$CLONE_JSON\"\necho \"SEED_MAIN=$SEED_MAIN\"\n",
+        bare = bare.display(),
+        seed = seed.display(),
+        tree = block(
+            "# --- the gate's tree (begin) ---",
+            "# --- the gate's tree (end) ---"
+        )
+        .replace("/gate-target/repo", repo.to_str().unwrap()),
+        reread = reread_block(),
+    );
+    let out = Command::new("bash")
+        .args(["-c", &script])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", &dir)
+        .output()
+        .expect("bash");
+    let said = String::from_utf8_lossy(&out.stdout).to_string();
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(out.status.success(), "{said}{err}");
+    assert!(
+        said.contains("SEED_MAIN=fetch-failed"),
+        "the forge was gone, so the re-read failed:\n{said}{err}"
+    );
+    let json = said
+        .lines()
+        .find_map(|l| l.strip_prefix("CLONE_JSON="))
+        .unwrap_or_else(|| panic!("no CLONE_JSON:\n{said}{err}"));
+    let clone: serde_json::Value =
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {json}"));
+    assert_eq!(
+        clone["seed_fetches"], 1,
+        "a re-read that failed still went to the forge, so it is counted (9f3a6107): {clone}"
+    );
+}
+
+/// A STALLED FORGE CANNOT HOLD THE VERDICT (review 1527ebca, B2). The
+/// re-read runs BEFORE `leave_verdict`, so a fetch with no limit against
+/// a forge that accepts and never answers would keep a green gate's
+/// receipt line and termination message unwritten for as long as the
+/// stall lasts, and a container that ended meanwhile would be settled
+/// `lost`. The fetch is bounded; a fetch the bound stopped is a failed
+/// one (no refresh) and still a counted trip. The stand-in is a listener
+/// on 127.0.0.1 that accepts every connection and sends nothing.
+#[test]
+fn a_stalled_forge_cannot_hold_the_verdict() {
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let dir = scratch_dir("runner-seed-fetch-against-a-stalled-forge");
+    let seed = dir.join("seed");
+    let repo = dir.join("repo");
+    fs::create_dir_all(&seed).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let accepted_path = dir.join("accepted");
+    let stopped_path = dir.join("stopped");
+    // This adapter exercises the external timeout's failure result only after
+    // real git reaches the real stalled socket. The production 60/-k5 argv is
+    // checked here; process startup does not spend a shortened two-second clock.
+    write_exec(
+        &bin.join("timeout"),
+        r#"#!/usr/bin/env python3
+import os, pathlib, signal, subprocess, sys, time
+assert sys.argv[1:5] == ['-k', '5', '60', 'git'], sys.argv
+child = subprocess.Popen(sys.argv[4:], start_new_session=True)
+try:
+    deadline = time.monotonic() + 120
+    while not pathlib.Path(os.environ['STALL_ACCEPTED']).exists():
+        assert child.poll() is None, 'git exited before the stalled connection'
+        assert time.monotonic() < deadline, 'fixture never accepted git'
+        time.sleep(.01)
+finally:
+    os.killpg(child.pid, signal.SIGTERM)
+    try:
+        child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.wait()
+pathlib.Path(os.environ['STALL_STOPPED']).write_text(str(child.returncode))
+sys.exit(124)
+"#,
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("local addr").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let holder = {
+        let (accepted, stop) = (Arc::clone(&accepted), Arc::clone(&stop));
+        let accepted_path = accepted_path.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((conn, _)) => {
+                        accepted.fetch_add(1, Ordering::SeqCst);
+                        held.push(conn);
+                        fs::write(&accepted_path, b"accepted").unwrap();
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        })
+    };
+
+    git(&repo, &["init", "-q"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "-t",
+            "main",
+            "origin",
+            &format!("http://127.0.0.1:{port}/david/boss.git"),
+        ],
+    );
+    let script = format!(
+        "set -euo pipefail\ncd {repo}\nSEED={seed}\nVERDICT=green\nCLONE_JSON='{{\"s\":4,\"fetches\":1}}'\n{reread}\necho \"CLONE_JSON=$CLONE_JSON\"\necho \"SEED_MAIN=$SEED_MAIN\"\n",
+        repo = repo.display(),
+        seed = seed.display(),
+        reread = block(
+            "# --- main, re-read for the seed (begin) ---",
+            "# --- main, re-read for the seed (end) ---",
+        ),
+    );
+    // The absolute timeout is only a fixture cleanup guard, not the assertion
+    // that a production fetch takes fewer than fifteen scheduler seconds.
+    // No proxy: actual git must reach the accepting loopback stand-in.
+    let timeout = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|path| path.join("timeout"))
+        .find(|path| path.is_file())
+        .expect("the real outer timeout");
+    let mut cmd = Command::new(timeout);
+    let out = without_proxy(&mut cmd)
+        .args(["180", "bash", "-c", &script])
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("STALL_ACCEPTED", &accepted_path)
+        .env("STALL_STOPPED", &stopped_path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", &dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("timeout runs bash");
+    stop.store(true, Ordering::SeqCst);
+    let _ = holder.join();
+    let said = String::from_utf8_lossy(&out.stdout).to_string();
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let stopped = fs::read_to_string(&stopped_path);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        out.status.success(),
+        "the re-read against a forge that never answers had not returned \
+         (exit {:?}); it runs before leave_verdict, so the verdict waited on it:\n{said}{err}",
+        out.status.code()
+    );
+    assert!(
+        stopped.is_ok(),
+        "the timeout adapter did not join actual git: {stopped:?}"
+    );
+    assert!(
+        accepted.load(Ordering::SeqCst) >= 1,
+        "the re-read never reached the stalled stand-in, so the stall was not exercised:\n{said}{err}"
+    );
+    assert!(
+        said.contains("SEED_MAIN=fetch-failed"),
+        "a fetch the bound stopped is a failed one:\n{said}{err}"
+    );
+    let json = said
+        .lines()
+        .find_map(|l| l.strip_prefix("CLONE_JSON="))
+        .unwrap_or_else(|| panic!("no CLONE_JSON:\n{said}{err}"));
+    let clone: serde_json::Value =
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {json}"));
+    assert_eq!(
+        clone["seed_fetches"], 1,
+        "a fetch the bound stopped still went to the forge: {clone}"
+    );
+    assert!(
+        read(RUN_SH).contains(REREAD_BOUND),
+        "run.sh's re-read of main carries the bound `{REREAD_BOUND}` this pin shortens"
+    );
+}
+
+/// The single fetch is shallow from BOTH ends, so a branch whose merge
+/// base lies further than its depth — a long branch, or one cut from an
+/// old main — must still find it: without one, `gate.sh --auto` derives
+/// no scope and refuses the car as having changed nothing. The clone this
+/// replaced found the long branch's base and lost the old-base one.
+#[test]
+fn a_merge_base_beyond_the_fetch_depth_is_still_found() {
+    for (label, own, behind) in [("long branch", 60, 0), ("old base", 2, 60)] {
+        let dir = scratch_dir(&format!("runner-deep-base-{}", own + behind));
+        let (bare, work) = forge(&dir, BRANCH_RUNNER);
+        let base = git(&work, &["rev-parse", "main"]);
+        for i in 0..own {
+            write_file(&work.join("own"), &format!("{i}\n"));
+            git(&work, &["add", "-A"]);
+            git(&work, &["commit", "-q", "-m", "own"]);
+        }
+        let tip = git(&work, &["rev-parse", "HEAD"]);
+        git(&work, &["checkout", "-q", "main"]);
+        for i in 0..behind {
+            write_file(&work.join("trunk"), &format!("{i}\n"));
+            git(&work, &["add", "-A"]);
+            git(&work, &["commit", "-q", "-m", "trunk"]);
+        }
+        let b = bare.to_str().unwrap();
+        git(&work, &["push", "-q", "-f", b, "main", BRANCH]);
+
+        let (out, _, repo) = materialise(&dir, &bare, Some(&tip));
+        let said = String::from_utf8_lossy(&out.stdout).to_string();
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        let found = Command::new("git")
+            .current_dir(&repo)
+            .args(["merge-base", "origin/main", "HEAD"])
+            .output()
+            .expect("git");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            out.status.success() && said.contains(&format!("HEAD_SHA={tip}")),
+            "{label}: {said}{err}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&found.stdout).trim(),
+            base,
+            "{label}: no merge base with the trunk within the fetched depth — the scoped gate \
+             would refuse this car as changing nothing:\n{said}{err}"
+        );
+    }
 }
 
 /// run.sh knows which script it is and where it came from, and keeps
@@ -383,4 +796,21 @@ fn the_receipt_names_the_runner_that_produced_it() {
         assert_eq!(got["runner_fallback_reason"], "no branch", "{got}");
     }
     assert_eq!(readable["verdict"], "green", "{readable}");
+}
+
+/// What the tree cost is READ from the record too (a531f508): the
+/// seconds and the forge fetches the tree block measured ride the
+/// receipt, on a readable receipt and an unreadable one.
+#[test]
+fn the_receipt_carries_what_the_tree_cost() {
+    let dir = scratch_dir("runner-clone-on-the-receipt");
+    let prov = r#"CLONE_JSON='{"s":3,"fetches":1}'"#;
+    let readable = summarize(&dir, r#"{"verdict":"green","head":"c0ffee"}"#, prov);
+    let unreadable = summarize(&dir, "not json", prov);
+    let _ = fs::remove_dir_all(&dir);
+
+    for got in [&readable, &unreadable] {
+        assert_eq!(got["clone"]["s"], 3, "{got}");
+        assert_eq!(got["clone"]["fetches"], 1, "{got}");
+    }
 }

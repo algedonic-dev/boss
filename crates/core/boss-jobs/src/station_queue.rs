@@ -10,7 +10,7 @@
 //! (`http/stations.rs`) supplies the open-Job universe and renders
 //! the [`StationQueue`] envelope.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use boss_core::job::{Job, JobStatus, Priority, Step, StepStatus};
 use chrono::NaiveDate;
@@ -193,36 +193,8 @@ impl StationPredicate {
     /// bind shows an empty queue, which is visible, instead of another
     /// actor's packets, which is not.
     pub fn matches(&self, job: &Job, steps: &[Step]) -> bool {
-        if self.binds_self() {
+        if !self.job_fields_match(&job.kind, &job.status, &job.tags, &job.metadata) {
             return false;
-        }
-        if let Some(kind) = &self.kind
-            && &job.kind != kind
-        {
-            return false;
-        }
-        if let Some(status) = &self.status
-            && &job.status != status
-        {
-            return false;
-        }
-        if !self.tags_any.is_empty() && !self.tags_any.iter().any(|t| job.tags.contains(t)) {
-            return false;
-        }
-        for key in &self.metadata_present {
-            if job.metadata.get(key).is_none_or(|v| v.is_null()) {
-                return false;
-            }
-        }
-        for key in &self.metadata_absent {
-            if job.metadata.get(key).is_some_and(|v| !v.is_null()) {
-                return false;
-            }
-        }
-        for (key, want) in &self.metadata_equals {
-            if job.metadata.get(key).and_then(|v| v.as_str()) != Some(want.as_str()) {
-                return false;
-            }
         }
         if let Some(step_match) = &self.step
             && !steps.iter().any(|s| step_match.matches(s))
@@ -230,6 +202,75 @@ impl StationPredicate {
             return false;
         }
         true
+    }
+
+    /// Every clause but `step`, over the Job's own fields: whether SOME
+    /// set of steps could make this Job a member. `matches` is this AND
+    /// the step clause, so a Job failing it is a member of nothing,
+    /// whatever its steps. The membership census asks it of a frozen
+    /// terminal packet from its kind, status, tags and metadata alone
+    /// (backlog bbeff5cb), and must not carry a second copy of the
+    /// clauses to do so (CLAUDE.md §9a).
+    pub(crate) fn job_fields_match(
+        &self,
+        kind: &str,
+        status: &JobStatus,
+        tags: &[String],
+        metadata: &Value,
+    ) -> bool {
+        if self.binds_self() {
+            return false;
+        }
+        if let Some(want) = &self.kind
+            && kind != want
+        {
+            return false;
+        }
+        if let Some(want) = &self.status
+            && status != want
+        {
+            return false;
+        }
+        if !self.tags_any.is_empty() && !self.tags_any.iter().any(|t| tags.contains(t)) {
+            return false;
+        }
+        for key in &self.metadata_present {
+            if metadata.get(key).is_none_or(|v| v.is_null()) {
+                return false;
+            }
+        }
+        for key in &self.metadata_absent {
+            if metadata.get(key).is_some_and(|v| !v.is_null()) {
+                return false;
+            }
+        }
+        for (key, want) in &self.metadata_equals {
+            if metadata.get(key).and_then(|v| v.as_str()) != Some(want.as_str()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Every metadata key [`Self::matches`] reads, of the Job or of a
+    /// Step. Written beside the match so the two cannot part: a read
+    /// that carries only these keys (backlog 45b25020) answers the same
+    /// verdict as one that carries every key, and the test
+    /// `metadata_keys_are_every_key_the_match_reads` holds them equal.
+    pub fn metadata_keys(&self) -> BTreeSet<String> {
+        let step = self.step.iter().flat_map(|s| {
+            s.metadata_equals
+                .keys()
+                .chain(&s.metadata_unmarked)
+                .cloned()
+        });
+        self.metadata_present
+            .iter()
+            .chain(&self.metadata_absent)
+            .chain(self.metadata_equals.keys())
+            .cloned()
+            .chain(step)
+            .collect()
     }
 
     /// Whether evaluating this predicate needs the Job's steps at
@@ -571,6 +612,79 @@ mod tests {
     // ------------------------------------------------------------
     // Predicate matching
     // ------------------------------------------------------------
+
+    /// Backlog 45b25020: the membership read carries only the metadata
+    /// keys a predicate names. Every clause that reads metadata is set,
+    /// and for each subset of a packet's keys the verdict on the packet
+    /// cut to `metadata_keys` equals the verdict on the whole packet —
+    /// so a clause added to `matches` without its key here fails.
+    #[test]
+    fn metadata_keys_are_every_key_the_match_reads() {
+        let p = StationPredicate {
+            metadata_present: vec!["branch".into()],
+            metadata_absent: vec!["train".into()],
+            metadata_equals: BTreeMap::from([("submitted_by".into(), "alice".into())]),
+            step: Some(StepMatch {
+                metadata_equals: BTreeMap::from([("authority_role".into(), "admin".into())]),
+                metadata_unmarked: vec!["hold".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let keys = p.metadata_keys();
+        assert_eq!(
+            keys,
+            ["authority_role", "branch", "hold", "submitted_by", "train"]
+                .map(String::from)
+                .into(),
+        );
+        let cut = |m: &serde_json::Value| -> serde_json::Value {
+            m.as_object()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| keys.contains(*k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        };
+        let job_keys = [
+            ("branch", serde_json::json!("feat/a")),
+            ("train", serde_json::json!("t1")),
+            ("submitted_by", serde_json::json!("alice")),
+            ("brief", serde_json::json!("x".repeat(64))),
+        ];
+        let step_keys = [
+            ("authority_role", serde_json::json!("admin")),
+            ("hold", serde_json::json!("waiting")),
+            ("receipt", serde_json::json!({"big": true})),
+        ];
+        let mut agreed = 0;
+        for jm in 0..(1u32 << job_keys.len()) {
+            for sm in 0..(1u32 << step_keys.len()) {
+                let pick = |set: &[(&str, serde_json::Value)], mask: u32| -> serde_json::Value {
+                    set.iter()
+                        .enumerate()
+                        .filter(|(i, _)| mask & (1 << i) != 0)
+                        .map(|(_, (k, v))| (k.to_string(), v.clone()))
+                        .collect::<serde_json::Map<_, _>>()
+                        .into()
+                };
+                let mut j = job("k", Priority::Standard, 1);
+                j.metadata = pick(&job_keys, jm);
+                let mut s = step("s", StepStatus::Ready);
+                s.metadata = pick(&step_keys, sm);
+                let whole = p.matches(&j, std::slice::from_ref(&s));
+                j.metadata = cut(&j.metadata);
+                s.metadata = cut(&s.metadata);
+                assert_eq!(p.matches(&j, &[s]), whole, "job {jm:b} step {sm:b}");
+                agreed += usize::from(whole);
+            }
+        }
+        assert!(
+            agreed > 0,
+            "some combination is a member, so the check has teeth"
+        );
+    }
 
     #[test]
     fn empty_predicate_matches_everything() {

@@ -101,6 +101,8 @@ boss_testing::adapters_agree! {
         retire_is_idempotent_and_keeps_history_readable,
         a_discard_refuses_history_and_a_typo,
         a_discard_refuses_a_draft_a_packet_is_pinned_to,
+        a_draft_that_met_traffic_is_rejected_and_never_promoted,
+        a_reject_refuses_history_a_typo_and_a_draft_nothing_met,
         a_packet_is_never_admitted_onto_a_discarded_version,
         a_spent_version_number_is_never_handed_out_again,
         publish_authored_retires_the_active_and_names_its_job,
@@ -651,6 +653,147 @@ async fn a_discard_refuses_a_draft_a_packet_is_pinned_to<R: WorkflowRegistry, J:
         next.version,
         d.version + 1,
         "{adapter}: a refused discard spends nothing"
+    );
+}
+
+/// A candidate that met traffic and lost leaves the kind publishable
+/// (backlog 50ded63d). Its pinned packets forbid the discard, so before
+/// this the draft sat in the registry for good: publish would promote
+/// the loser, and `boss workflow publish` refused every later spec
+/// because a draft that was not its own existed. Rejected, the row is
+/// kept with its text — a pinned packet runs what it was admitted
+/// under — and publish no longer sees it: with nothing else drafted
+/// there is nothing to promote, and the next draft goes live over it.
+async fn a_draft_that_met_traffic_is_rejected_and_never_promoted<
+    R: WorkflowRegistry,
+    J: JobsRepository,
+>(
+    w: &World<R, J>,
+    adapter: &str,
+) {
+    let kind = "suite-rejected";
+    draft(&w.registry, viable(kind)).await;
+    publish(&w.registry, kind).await;
+    let candidate = draft(&w.registry, viable(kind)).await;
+    w.jobs
+        .create_job(&packet(kind, candidate.version))
+        .await
+        .expect("a packet the candidate admitted");
+
+    w.registry
+        .reject_draft(kind, candidate.version, &author(), instant(1))
+        .await
+        .expect("a draft that met traffic rejects");
+    assert_eq!(
+        versions(&w.registry, kind).await,
+        [(1, WorkflowStatus::Active), (2, WorkflowStatus::Rejected)],
+        "{adapter}"
+    );
+    let kept = w
+        .registry
+        .get_version(kind, candidate.version)
+        .await
+        .expect("a rejected row is history, still served");
+    assert_eq!(
+        kept.steps, candidate.steps,
+        "{adapter}: the pinned text stays"
+    );
+
+    match w.registry.publish(kind, &author(), instant(2)).await {
+        Err(WorkflowError::NotFound(_)) => {}
+        other => panic!("{adapter}: publish over a lone rejected row answered {other:?}"),
+    }
+    assert_eq!(
+        versions(&w.registry, kind).await,
+        [(1, WorkflowStatus::Active), (2, WorkflowStatus::Rejected)],
+        "{adapter}: a refused publish flips nothing"
+    );
+
+    // Idempotent: the same act again is the same state.
+    w.registry
+        .reject_draft(kind, candidate.version, &author(), instant(3))
+        .await
+        .expect("rejecting a rejected row is a no-op");
+    // History now: a discard refuses it.
+    match w
+        .registry
+        .discard_draft(kind, candidate.version, &author(), instant(3))
+        .await
+    {
+        Err(WorkflowError::Conflict(_)) => {}
+        other => panic!("{adapter}: discarding a rejected row answered {other:?}"),
+    }
+
+    let next = draft(&w.registry, viable(kind)).await;
+    assert_eq!(next.version, 3, "{adapter}: a rejected number stays spent");
+    assert_eq!(publish(&w.registry, kind).await.version, 3, "{adapter}");
+    assert_eq!(
+        versions(&w.registry, kind).await,
+        [
+            (1, WorkflowStatus::Retired),
+            (2, WorkflowStatus::Rejected),
+            (3, WorkflowStatus::Active)
+        ],
+        "{adapter}"
+    );
+}
+
+/// Rejection is for a draft that met traffic and lost, and for nothing
+/// else (backlog 50ded63d). An active or retired row is history and
+/// refuses; a typo is NotFound; a draft no packet is pinned to admitted
+/// nothing, so it refuses naming the discard that removes it rather
+/// than minting history for a protocol nothing ran.
+async fn a_reject_refuses_history_a_typo_and_a_draft_nothing_met<
+    R: WorkflowRegistry,
+    J: JobsRepository,
+>(
+    w: &World<R, J>,
+    adapter: &str,
+) {
+    let kind = "suite-reject-refusals";
+    draft(&w.registry, viable(kind)).await;
+    publish(&w.registry, kind).await;
+    draft(&w.registry, viable(kind)).await;
+    publish(&w.registry, kind).await;
+    for version in [1, 2] {
+        match w
+            .registry
+            .reject_draft(kind, version, &author(), instant(0))
+            .await
+        {
+            Err(WorkflowError::Conflict(m)) => {
+                assert!(m.contains("history"), "{adapter}: v{version}: {m}")
+            }
+            other => panic!("{adapter}: rejecting history v{version} answered {other:?}"),
+        }
+    }
+    match w
+        .registry
+        .reject_draft(kind, 9, &author(), instant(0))
+        .await
+    {
+        Err(WorkflowError::NotFound(_)) => {}
+        other => panic!("{adapter}: rejecting a typo answered {other:?}"),
+    }
+    let idle = draft(&w.registry, viable(kind)).await;
+    match w
+        .registry
+        .reject_draft(kind, idle.version, &author(), instant(0))
+        .await
+    {
+        Err(WorkflowError::Conflict(m)) => {
+            assert!(m.contains("discard"), "{adapter}: names the discard: {m}")
+        }
+        other => panic!("{adapter}: rejecting an unpinned draft answered {other:?}"),
+    }
+    assert_eq!(
+        versions(&w.registry, kind).await,
+        [
+            (1, WorkflowStatus::Retired),
+            (2, WorkflowStatus::Active),
+            (3, WorkflowStatus::Draft)
+        ],
+        "{adapter}: every refusal flips nothing"
     );
 }
 

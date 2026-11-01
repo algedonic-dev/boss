@@ -113,9 +113,10 @@ pub(crate) fn contended(phase: &Phase) -> Contended {
              No car was released and the PR is still open — re-run the cancel once \
              the run in progress finishes."
         )),
-        // A refresh abandons nothing either: the holder is a board (which
-        // runs the same dock judgement) or a reconcile, and the next
-        // refresh is two minutes away.
+        // A refresh abandons nothing either: one that waited its whole
+        // turn (`REFRESH_LOCK_WAIT`) still never ran and exits
+        // LOCK_CONTENDED_EXIT for that, but the next refresh is two
+        // minutes away and will ask again.
         Phase::Preflight | Phase::Reconcile | Phase::Board | Phase::Run | Phase::Refresh => {
             Contended::Covered
         }
@@ -151,6 +152,16 @@ pub(crate) fn contended(phase: &Phase) -> Contended {
 //     is bounded, and the cadence loop's
 //     one-in-flight-run-per-rule guard means a waiting pass cannot stack
 //     up behind itself.
+//   - REFRESH waits too, for a shorter turn (`REFRESH_LOCK_WAIT`, 60 s).
+//     It was born leaving at once (design 42279fb2) on the reading that
+//     the next window re-asks — but the next window collides the same
+//     way: the refresh fires at :00 of even minutes and the minute
+//     board at :00 of every minute, the board wins and holds 2-5 s, and
+//     nineteen refreshes in a row on a clear track ran no pass on
+//     2026-10-20 13:26-14:02Z (backlog d846e0c8). The same starvation
+//     as the reconcile's, so the same cure, bounded inside its own
+//     two-minute window. A board never waits behind it: a board that
+//     finds a refresh holding the lock leaves and re-fires a minute on.
 //   - BOARD and PREFLIGHT do not wait. A board must never queue behind a
 //     reconcile that is deploying (job 9c5871fa: 30+ minutes), and it
 //     does not need to — its firing records boarded-nothing, which
@@ -176,6 +187,14 @@ pub(crate) fn contended(phase: &Phase) -> Contended {
 /// (8eca7b2f). A pass may occupy a whole window; the per-rule in-flight
 /// guard skips that window rather than stacking another waiter.
 pub(crate) const CONDUCTOR_LOCK_WAIT: Duration = Duration::from_secs(120);
+
+/// How long the dock's refresh waits for the conductor's lock (backlog
+/// d846e0c8). Long enough to outlast the board it collides with — the
+/// minute board fires on the same wall second and holds the lock 2-5 s
+/// for its judgement — and short enough that a refresh that waited its
+/// whole turn has left long before its next two-minute window, which the
+/// tests read from the rule's own bundle.
+pub(crate) const REFRESH_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 /// How often the waiter retries. The hold it waits out is seconds long,
 /// so a one-second poll wins within a second of the lock being freed.
@@ -207,13 +226,16 @@ pub(crate) fn lock_wait_budget(phase: &Phase) -> Duration {
         // Starvable by construction: it fires on a fixed interval
         // against a board that fires more often and holds longer.
         Phase::Reconcile | Phase::Run => CONDUCTOR_LOCK_WAIT,
+        // Starvable the same way: it fires on the same wall second as
+        // the minute board, which wins and holds the lock for its
+        // judgement (backlog d846e0c8). Its turn is bounded inside its
+        // own window, and a board never waits behind it.
+        Phase::Refresh => REFRESH_LOCK_WAIT,
         // A board has its own retry one tick later, and must not queue
         // behind a long reconcile. Preflight proves nothing a running
         // conductor has not already proved. A cancel is an operator
-        // standing at the prompt, who can see the line and re-run. A
-        // refresh re-asks in two minutes and must never make a board or
-        // a reconcile queue behind the dock (design 42279fb2).
-        Phase::Preflight | Phase::Board | Phase::Refresh | Phase::Cancel { .. } => Duration::ZERO,
+        // standing at the prompt, who can see the line and re-run.
+        Phase::Preflight | Phase::Board | Phase::Cancel { .. } => Duration::ZERO,
     }
 }
 
@@ -253,6 +275,50 @@ pub(crate) fn lock_contended_line(waited: Duration) -> String {
     }
 }
 
+/// What one turn at the conductor's lock came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LockTurn {
+    /// The lock is this run's until the process ends.
+    Taken,
+    /// Still held by another run when `budget` ran out, after this long.
+    Contended(Duration),
+}
+
+/// Take the conductor's lock, waiting up to `budget` for it, polling
+/// every [`LOCK_POLL`]. A zero budget tries once. Says when it starts
+/// waiting and, if it then wins, how long it waited; the loss is the
+/// caller's to say, because what a loss MEANS is the phase's
+/// ([`contended`]). Its own function so the wait is tested against a
+/// real flock rather than read off a budget table (backlog d846e0c8).
+/// The clock is tokio's, so a test can pause it.
+pub(crate) async fn take_the_lock(lock: &File, budget: Duration) -> std::io::Result<LockTurn> {
+    let since = tokio::time::Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(()) => {
+                // Reaching a second attempt means a poll was slept, so
+                // an elapsed time of one poll or more IS a wait.
+                let waited = since.elapsed();
+                if waited >= LOCK_POLL {
+                    log(lock_acquired_line(waited));
+                }
+                return Ok(LockTurn::Taken);
+            }
+            Err(TryLockError::WouldBlock) => {
+                let waited = since.elapsed();
+                if waited >= budget {
+                    return Ok(LockTurn::Contended(waited));
+                }
+                if waited < LOCK_POLL {
+                    log(lock_waiting_line(budget));
+                }
+                tokio::time::sleep(LOCK_POLL).await;
+            }
+            Err(TryLockError::Error(e)) => return Err(e),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry
 // ---------------------------------------------------------------------------
@@ -270,57 +336,33 @@ pub async fn run(phase: Phase, dry: bool, now: DateTime<Utc>) -> Result<()> {
     // its own retry leaves at once; a starvable one waits its bounded
     // turn — see "THE CONDUCTOR'S LOCK" above.
     let budget = lock_wait_budget(&phase);
-    let since = std::time::Instant::now();
-    loop {
-        match lock.try_lock() {
-            Ok(()) => {
-                // Reaching a second attempt means a poll was slept, so
-                // an elapsed time of one poll or more IS a wait.
-                let waited = since.elapsed();
-                if waited >= LOCK_POLL {
-                    log(lock_acquired_line(waited));
+    let turn = take_the_lock(&lock, budget)
+        .await
+        .context("locking the conductor's lock file")?;
+    if let LockTurn::Contended(waited) = turn {
+        // The line every journal reader and cadence.rs's own doc comment
+        // greps for goes out first, for every phase. A phase that
+        // abandoned a request then says WHAT it abandoned.
+        log(lock_contended_line(waited));
+        match contended(&phase) {
+            Contended::Covered => {
+                if budget > Duration::ZERO {
+                    // Waited the whole budget and never ran: the firing
+                    // must not record this as rc=0.
+                    std::process::exit(LOCK_CONTENDED_EXIT);
                 }
-                break;
+                // Leaving at once finished the job: the holder is doing
+                // this very work.
+                return Ok(());
             }
-            Err(TryLockError::WouldBlock) => {
-                let waited = since.elapsed();
-                if waited >= budget {
-                    // The line every journal reader and cadence.rs's own
-                    // doc comment greps for goes out first, for every
-                    // phase. A phase that abandoned a request then says
-                    // WHAT it abandoned.
-                    log(lock_contended_line(waited));
-                    match contended(&phase) {
-                        Contended::Covered => {
-                            if budget > Duration::ZERO {
-                                // Waited the whole budget and never ran:
-                                // the firing must not record this as
-                                // rc=0.
-                                std::process::exit(LOCK_CONTENDED_EXIT);
-                            }
-                            // Leaving at once finished the job: the
-                            // holder is doing this very work.
-                            return Ok(());
-                        }
-                        // But an operator's cancel is nobody else's
-                        // work. Say what did not happen, and exit
-                        // non-zero so a script, a unit or a person
-                        // reading the output cannot mistake it for done.
-                        Contended::Abandoned(msg) => {
-                            log(&msg);
-                            // (The lock releases with the process;
-                            // destructors are moot.)
-                            std::process::exit(LOCK_CONTENDED_EXIT);
-                        }
-                    }
-                }
-                if waited < LOCK_POLL {
-                    log(lock_waiting_line(budget));
-                }
-                tokio::time::sleep(LOCK_POLL).await;
-            }
-            Err(TryLockError::Error(e)) => {
-                return Err(e).context("locking the conductor's lock file");
+            // But an operator's cancel is nobody else's work. Say what
+            // did not happen, and exit non-zero so a script, a unit or a
+            // person reading the output cannot mistake it for done.
+            Contended::Abandoned(msg) => {
+                log(&msg);
+                // (The lock releases with the process; destructors are
+                // moot.)
+                std::process::exit(LOCK_CONTENDED_EXIT);
             }
         }
     }
@@ -542,18 +584,137 @@ mod tests {
     /// holder, and exits [`LOCK_CONTENDED_EXIT`] because it never ran.
     /// D1 of design 42279fb2: the dock's refresh is its own phase. It
     /// walks the dock and nothing else — no drain, no reconcile, no
-    /// departure — and it never waits for the lock: a refresh that finds
-    /// it held leaves at once, because the next one is two minutes away
-    /// and a held lock is a board or a reconcile that must not queue
-    /// behind the dock.
+    /// departure. It waits a bounded turn for the lock (backlog
+    /// d846e0c8): leaving at once starved it behind the minute board,
+    /// which fires on the same wall second.
     #[test]
-    fn a_refresh_walks_the_dock_and_never_waits_for_the_lock() {
+    fn a_refresh_walks_the_dock_and_waits_a_bounded_turn_for_the_lock() {
         assert_eq!(
             loop_work(&Phase::Refresh),
             &[Work::Refresh, Work::GateQueue]
         );
-        assert_eq!(lock_wait_budget(&Phase::Refresh), Duration::ZERO);
+        assert_eq!(lock_wait_budget(&Phase::Refresh), REFRESH_LOCK_WAIT);
         assert_eq!(contended(&Phase::Refresh), Contended::Covered);
+    }
+
+    // ---------------------------------------------------------------
+    // The refresh waits its turn behind the board (d846e0c8).
+    // ---------------------------------------------------------------
+
+    /// The lock file the conductor takes, in this test's own scratch
+    /// directory, and a second handle on it that HOLDS it — a flock
+    /// conflicts across open file descriptions even in one process,
+    /// which is what `gate_watch`'s verdict-lock test leans on too.
+    fn a_held_conductor_lock(name: &str) -> (File, File) {
+        let path = boss_testing::scratch_dir(name).join("lock");
+        let holder = File::create(&path).unwrap();
+        holder.try_lock().unwrap();
+        let waiter = File::create(&path).unwrap();
+        (holder, waiter)
+    }
+
+    /// THE DEFECT, measured 2026-10-20 13:26-14:02Z in the conductor's
+    /// log: train-dock-refresh (wall, every 2 minutes, :00) and
+    /// train-board-on-dock-depth (every minute, :00) fire on the same
+    /// second; the board takes the lock for its 2-5 s judgement, and
+    /// nineteen refresh firings in a row on a clear track printed
+    /// "another conductor run holds the lock — leaving" and ran no pass.
+    /// A refresh that meets a board-length holder must get the lock once
+    /// the holder lets go, and well inside its own bound. The clock is
+    /// tokio's paused clock, so the four seconds cost none.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_that_finds_the_lock_held_runs_its_pass_once_a_short_holder_releases() {
+        let (holder, waiter) = a_held_conductor_lock("conductor-lock-refresh-waits");
+        // A flock belongs to the open file description, and every fork in
+        // this test binary copies the holder's descriptor into the child
+        // until it execs — the exec-handshake tests in carried_verdict.rs
+        // hold children in pre_exec on purpose. A holder released by
+        // `drop` stayed locked while such a copy lived, and the paused
+        // clock turned those real milliseconds into 22 virtual seconds of
+        // polling (a9ae095b, run ccd009fd). The copy is planted here so the
+        // release is judged with it alive: an explicit unlock releases the
+        // lock for every copy, which is what "the board lets go" means.
+        let inherited = holder.try_clone().unwrap();
+        let board_hold = Duration::from_secs(4);
+        let board = tokio::spawn(async move {
+            tokio::time::sleep(board_hold).await;
+            holder.unlock().unwrap();
+        });
+        let since = tokio::time::Instant::now();
+        let turn = take_the_lock(&waiter, lock_wait_budget(&Phase::Refresh))
+            .await
+            .unwrap();
+        let waited = since.elapsed();
+        assert_eq!(
+            turn,
+            LockTurn::Taken,
+            "the refresh runs its pass after the board"
+        );
+        assert!(
+            waited >= board_hold && waited <= board_hold + LOCK_POLL,
+            "taken within one poll of the release, not at the bound: {waited:?}"
+        );
+        board.await.unwrap();
+        drop(inherited);
+    }
+
+    /// And the bound is a bound: a holder that never lets go sends the
+    /// refresh away once REFRESH_LOCK_WAIT has passed — not before, and
+    /// not a second window later — with the line naming the wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_leaves_once_its_bound_elapses_and_says_it_waited() {
+        let (holder, waiter) = a_held_conductor_lock("conductor-lock-refresh-bound");
+        let turn = take_the_lock(&waiter, lock_wait_budget(&Phase::Refresh))
+            .await
+            .unwrap();
+        let LockTurn::Contended(waited) = turn else {
+            panic!("a lock held throughout was taken: {turn:?}");
+        };
+        assert!(
+            waited >= REFRESH_LOCK_WAIT && waited <= REFRESH_LOCK_WAIT + LOCK_POLL,
+            "left at the bound: {waited:?}"
+        );
+        assert_eq!(
+            lock_contended_line(waited),
+            format!(
+                "another conductor run holds the lock — leaving after waiting {}s",
+                REFRESH_LOCK_WAIT.as_secs()
+            )
+        );
+        drop(holder);
+    }
+
+    /// The bound fits inside the rule's own window, read from the bundle
+    /// that declares it: a refresh that waited its whole turn has left
+    /// before the next window fires, so the per-rule in-flight guard
+    /// never has to skip one on its account.
+    #[test]
+    fn the_refresh_bound_ends_before_its_next_window() {
+        let text = std::fs::read_to_string(
+            boss_testing::repo_root().join("infra/platform/cadence/train-dock-refresh.toml"),
+        )
+        .unwrap();
+        let bundle: toml::Value = toml::from_str(&text).unwrap();
+        let rule = &bundle["cadence_rule"].as_array().unwrap()[0];
+        assert_eq!(rule["verb"].as_str(), Some("refresh"));
+        let every = rule["every_minutes"].as_integer().unwrap();
+        let window = Duration::from_secs(u64::try_from(every).unwrap() * 60);
+        assert!(
+            REFRESH_LOCK_WAIT + LOCK_POLL < window,
+            "{REFRESH_LOCK_WAIT:?} must end inside the {window:?} window"
+        );
+        assert!(REFRESH_LOCK_WAIT > Duration::ZERO);
+    }
+
+    /// A free lock is taken at once, with no wait, by every phase.
+    #[tokio::test(start_paused = true)]
+    async fn a_free_lock_is_taken_at_once() {
+        let path = boss_testing::scratch_dir("conductor-lock-free").join("lock");
+        let lock = File::create(&path).unwrap();
+        assert_eq!(
+            take_the_lock(&lock, Duration::ZERO).await.unwrap(),
+            LockTurn::Taken
+        );
     }
 
     #[test]

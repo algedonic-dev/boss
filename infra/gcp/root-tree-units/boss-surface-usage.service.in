@@ -1,5 +1,4 @@
-# Dormant replacement: ca356c79 / fe6d1124. Not installed by any caller.
-# Activate only after the root fetch credential and tree handover are proven.
+# Prepared root-tree unit, installed only from an accepted generation.
 [Unit]
 Description=BOSS daily surface usage reading
 Wants=network-online.target
@@ -9,6 +8,7 @@ After=network-online.target
 Type=oneshot
 User=root
 EnvironmentFile=/etc/boss/sor.env
+Environment=BOSS_WRAP_OPEN_RETRY=3
 WorkingDirectory=/var/lib/boss/gcp-tree/current
 RuntimeDirectory=boss-surface-usage
 RuntimeDirectoryMode=0700

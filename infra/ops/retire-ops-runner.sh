@@ -104,6 +104,11 @@
 #      today's plan hashes to the signed one; a second run of an applied
 #      plan is refused, because the timer it names is no longer running.
 #
+# THE WAKER GOES WITH THE TIMER, by the unit and not by this script
+# (backlog ca6f40c2): boss-ops-runner-wake.service is PartOf= the timer,
+# so the one stop below stops it too, and it never starts a runner whose
+# timer is not active. Its files go with the runner's, at the converge.
+#
 # WHAT IT DOES NOT DO. It deletes no file — the converge removes the unit
 # files once the timer is off and the role undeclared. It never touches
 # boss-ops-runner.service, another host, or infra/gcp/uninstall-not-in-

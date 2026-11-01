@@ -190,15 +190,15 @@ jq -n -c --slurpfile claims "$WORK/claims.jsonl" --slurpfile stats "$WORK/stats.
             end
       end' >"$WORK/rows.jsonl" || { echo "observe-volumes: REFUSED — the reading did not join (jq failed)" >&2; exit 1; }
 
-# Only missing live figures consult durable evidence. Every currently
-# measured kubelet control stays intact, and non-Bound claims stay blind.
+# Declared producers are checked even with live figures: a mounted
+# failed backup is not healthy merely because its filesystem is readable.
+# A sample replaces only missing figures, never a current kubelet reading.
 sources=${BOSS_VOLUME_SAMPLE_SOURCES:-$here/mounted-volume-sources.json}
 : > "$WORK/with-samples.jsonl"
 while IFS= read -r row; do
     ns=$(printf '%s' "$row" | jq -r '.namespace')
     claim=$(printf '%s' "$row" | jq -r '.claim // empty')
-    needs=$(printf '%s' "$row" | jq -r '.phase == "Bound" and .free_bytes == null')
-    if [[ "$needs" == true ]]; then
+    if [[ -n "$claim" ]]; then
         if ! configured=$(jq -ser --arg ns "$ns" --arg claim "$claim" '
             if length == 1 then .[0] else error("not one entire source registry") end
             | if type != "array" then error("not a source registry") else . end
@@ -213,8 +213,10 @@ while IFS= read -r row; do
                 sample='{"capacity_bytes":null,"used_bytes":null,"free_bytes":null,"unread":"mounted sample reader failed"}'
             fi
             row=$(printf '%s' "$row" | jq -c --argjson sample "$sample" '
-                if $sample.free_bytes == null then .unread += ("; " + $sample.unread)
-                else del(.unread) + $sample end') || { echo 'observe-volumes: REFUSED — mounted evidence did not join' >&2; exit 1; }
+                (if .phase != "Bound" or .free_bytes != null then .
+                 elif $sample.free_bytes == null then .unread += ("; " + $sample.unread)
+                 else del(.unread) + $sample end)
+                + if $sample.scheduled_job == null then {} else {scheduled_job:$sample.scheduled_job} end') || { echo 'observe-volumes: REFUSED — mounted evidence did not join' >&2; exit 1; }
         fi
     fi
     printf '%s\n' "$row" >> "$WORK/with-samples.jsonl"

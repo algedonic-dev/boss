@@ -62,20 +62,35 @@
 #     by a negated group, a compared group, a CEL comment, a string
 #     literal and a list). Any other document kind is refused.
 #   * NO REBOOT. Both the dry run and the apply run `--mode=no-reboot`,
-#     so Talos itself refuses a change it cannot apply live; and the dry
+#     so Talos itself refuses a change it cannot apply live ("can't be
+#     applied in immediate mode", refused naming the changed lines of the
+#     diff Talos attaches, backlog 164d6ffe); and the dry
 #     run's own summary must read exactly "Applied configuration without
 #     a reboot" or the plan is refused.
 #   * NO SECOND COPY. Talos's strategic merge APPENDS a list entry it
 #     cannot key (README.md beside the patches: that is how w-1's seed
-#     file entry came to be doubled). So the dry run runs twice — once
-#     with the patch, once with it applied twice — and when the two differ
-#     the patch appends: it is then refused if ANY declared entry, in any
-#     class, is already live (MATCH, DRIFT or DOUBLED), since which part
-#     appends is not visible and applying it again could add a second
-#     copy. The live entries are working config and the refusal says to
-#     keep them: the remedy is a declaration narrowed to entries ABSENT
-#     live, or a partial patch (a follow-up), never deleting a live entry
-#     (review 9cb9af67, findings 1 and 2).
+#     file entry came to be doubled). So if any declared entry is already
+#     live, the whole declaration is NEITHER DRY-RUN NOR APPLIED: the plan
+#     NARROWS it FIRST to the entries that read ABSENT live
+#     (check-declared.sh --absent, re-emitted from the declared values in
+#     canonical form; backlog 9cf1673d, built for 67e98635, when w-1's
+#     image-GC pair could not reach the node because its seed file, mount,
+#     mirror and gate volume were live). First, because the copy Talos
+#     would append can be a change it refuses outright in no-reboot mode:
+#     the first live plan dry-ran w-1's whole declaration before narrowing,
+#     and Talos refused it over a second seed files entry, so the narrowed
+#     patch was never built (backlog a3b1084f, ops-request fa6fd412). The
+#     narrowed patch is judged as a declaration of its own — read classes,
+#     its own two dry runs, once with it and once with it applied twice —
+#     and every entry of it reads ABSENT, so it adds each once. It is
+#     refused instead, before any dry run, when a declared entry DRIFTs
+#     (adding cannot fix a drift, and narrowing past one would call the
+#     node converged) or when nothing is absent (the patch could only add
+#     a second copy). Only a node with every entry ABSENT has its whole
+#     declaration dry-run, once and twice: when the two differ the patch
+#     appends, and the plan says so. The live
+#     entries are working config and stay: nothing here deletes one, and a
+#     DOUBLED entry is left as found (review 9cb9af67, findings 1 and 2).
 #   * ONLY THE KUBELET KEYS DECLARED TODAY under extraConfig (the image-GC
 #     pair, check-declared.sh's EXTRA_CONFIG_KEYS): extraConfig passes any
 #     KubeletConfiguration key to the kubelet, anonymous auth and
@@ -116,7 +131,11 @@
 # THE EFFECT IS READ BACK, and it is the NODE, not only its config: every
 # BOSS_NODE_CONVERGE_POLL_S (default 5) up to BOSS_NODE_CONVERGE_WAIT_S
 # (default 120, inside the verb's timeout), the live machine config
-# through check-declared.sh against the declared blob, and then the Node:
+# through check-declared.sh against the declared blob — for a NARROWED
+# patch, against the patch applied, every entry MATCH, AND against the
+# whole declaration with every entry the patch did not carry reading
+# exactly as it did before the apply, so a patch that disturbed an entry
+# it never named is no effect — and then the Node:
 # Ready=True, with its kubelet lease (kube-node-lease/<node>) renewed at
 # least BOSS_NODE_CONVERGE_SETTLE_S (default 20) after the apply returned
 # — a kubelet running after the restart the change causes, not a stale
@@ -247,7 +266,14 @@ PATCH="$(cat "$WORK/decl/$NODE.yaml")"
 # run FROM the scratch directory with a relative path: the check prints
 # the declaration's path, and a mktemp name in the signed bytes would
 # make every render of one true state a different plan.
-check_declared() { (cd "$WORK" && BOSS_TALOS_PATCHES=decl bash "$CHECK" "$@"); }
+check_declared() { check_declared_in decl "$@"; }
+# check_declared_in <dir> <args…> — the same, against the declaration in
+# $WORK/<dir>: `decl` the declared blob, `narrow` the narrowed patch.
+check_declared_in() {
+    local dir="$1"
+    shift
+    (cd "$WORK" && BOSS_TALOS_PATCHES="$dir" bash "$CHECK" "$@")
+}
 
 # Every declared entry must be one the read-back can read.
 check_declared --only-read-classes "$NODE" > "$WORK/classes.out" 2> "$WORK/classes.err"
@@ -262,13 +288,14 @@ node_door
 T="$(ops_talosctl)"
 node_agree_cluster "$NODE"
 
-# read_back <tag> — the live machine config, piped straight into the
-# check against the declared blob and never written down: sets GET_RC and
-# CHECK_RC, the findings in $WORK/<tag>.out.
+# read_back <tag> [dir] — the live machine config, piped straight into the
+# check against the declared blob (or the narrowed patch, dir `narrow`)
+# and never written down: sets GET_RC and CHECK_RC, the findings in
+# $WORK/<tag>.out.
 read_back() {
     # shellcheck disable=SC2086 # T is one line the door prints to be word-split
     $T -n "$NODE_ADDRESS" get machineconfig -o yaml < /dev/null 2> "$WORK/$1.get" \
-        | check_declared "$NODE" > "$WORK/$1.out" 2> "$WORK/$1.err"
+        | check_declared_in "${2:-decl}" "$NODE" > "$WORK/$1.out" 2> "$WORK/$1.err"
     local st=("${PIPESTATUS[@]}")
     GET_RC="${st[0]}"
     CHECK_RC="${st[1]}"
@@ -289,12 +316,49 @@ dry() {
 
 # no_reboot_refusal <file> — true only when talosctl's words are Talos's
 # own refusal of a change it cannot apply live: an InvalidArgument or
-# FailedPrecondition status saying "without (a) reboot". Anything else
-# that happens to mention a reboot — a timeout while a node reboots, a
-# proxy's "rebooting" — is not that refusal, and says nothing about what
-# was applied (review 9cb9af67, finding 7).
+# FailedPrecondition status saying "without (a) reboot", or "this config
+# change can't be applied in immediate mode" — immediate mode is Talos's
+# own name for --mode=no-reboot, and those are the words it answered with
+# on 2026-10-19 (ops-request fa6fd412), which this matcher did not know,
+# so a real refusal read as a dry run that "did not answer" and exited 1
+# (backlog 164d6ffe). Anything else that happens to mention a reboot — a
+# timeout while a node reboots, a proxy's "rebooting" — is not that
+# refusal, and says nothing about what was applied (review 9cb9af67,
+# finding 7).
 no_reboot_refusal() {
-    grep -Eq 'code = (InvalidArgument|FailedPrecondition).*without (a )?reboot' "$1"
+    grep -Eq "code = (InvalidArgument|FailedPrecondition).*(without (a )?reboot|can't be applied in immediate mode)" "$1"
+}
+
+# talos_words <file> — talosctl's words up to the diff Talos attaches to
+# an immediate-mode refusal, masked, on one line. The diff's context lines
+# are live config nobody asked to see; its changed lines are named by
+# reboot_entries.
+talos_words() {
+    sed -n '/^[[:space:]]*diff:/q;p' "$1" | mask | tr '\n' ' ' | sed 's/ *$//'
+}
+
+# reboot_entries <file> — the entries Talos would not apply live: the
+# changed lines of the diff it attaches after "diff:" to an immediate-mode
+# refusal, indentation folded, masked, joined by "; ". A line whose key is
+# credential-shaped is withheld, as render_diff withholds it. Empty when
+# Talos attached no diff (its "without a reboot" wording carries none).
+reboot_entries() {
+    awk '
+        !d && /^[[:space:]]*diff:/ { d = 1; next }
+        !d { next }
+        /^(\+\+\+|---|@@) / { next }
+        /^[+-]/ {
+            v = substr($0, 2)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            gsub(/[[:space:]]+/, " ", v)
+            k = v
+            sub(/^- /, "", k)
+            if (k ~ /^[A-Za-z0-9_.\/-]+:( |$)/) { sub(/:.*$/, "", k); k = tolower(k) } else k = ""
+            if (k == "ca" || k == "crt" || k == "secret" || k ~ /key$/ \
+                || k ~ /token|secret|password|passphrase|privatekey|private_key|certificate|encryptionkey|aescbc|secretbox|bootstrap/)
+                v = "<withheld: a credential-shaped key>"
+            print substr($0, 1, 1) " " v
+        }' "$1" | mask | tr '\n' ';' | sed 's/;/; /g; s/; $//'
 }
 
 # judge_dry <n> — refuse a dry run that needs a reboot or says anything
@@ -303,7 +367,9 @@ no_reboot_refusal() {
 judge_dry() {
     if [ "$DRY_RC" -ne 0 ]; then
         if no_reboot_refusal "$WORK/dry$1.all"; then
-            node_refuse "the declaration would need a REBOOT of $NODE: Talos, asked in --mode=no-reboot, refused it ($(mask < "$WORK/dry$1.all" | tr '\n' ' ')). A reboot is never this verb — nothing was applied"
+            local entries
+            entries="$(reboot_entries "$WORK/dry$1.all")"
+            node_refuse "the declaration would need a REBOOT of $NODE: Talos, asked in --mode=no-reboot, refused it ($(talos_words "$WORK/dry$1.all")) — ${entries:+the change it would not apply live: $entries. }A reboot is never this verb — nothing was applied"
         fi
         node_fail "talosctl -n $NODE_ADDRESS patch machineconfig --dry-run did not answer ($(mask < "$WORK/dry$1.all" | tr '\n' ' ')) — a dry run applies nothing"
     fi
@@ -453,10 +519,95 @@ has_summary() {
     grep -Eq "^check-declared: $NODE: [0-9]+ match, " "$1"
 }
 
+# entries <n> — "<n> entry" or "<n> entries".
+entries() { [ "$1" -eq 1 ] && echo "1 entry" || echo "$1 entries"; }
+
+# --- the narrowed patch (backlog 9cf1673d, built for 67e98635) ------------------
+# Part of the declaration is live, and Talos's merge appends list entries
+# it cannot key, so the whole of it is neither dry-run nor applied (backlog
+# a3b1084f: Talos refuses that dry run outright when the appended copy is
+# not a no-reboot change). narrow <present> — PATCH becomes the declaration
+# narrowed to its entries ABSENT live, as check-declared.sh --absent
+# re-emits them from the DECLARED values in canonical form (a third read
+# of the node; no live value reaches it), and both dry runs are taken
+# again on it. Sets NARROWED=1, $WORK/applied.keys (the entries it
+# carries, one per line), IDEM and NARROW_WHY. <present> names the live
+# entries, for the plan.
+NARROWED=0
+narrow() {
+    local present="$1" drift st n
+    # A DRIFT is a live entry with another value. Adding entries cannot
+    # correct it, and a patch narrowed past it would read back as
+    # converged with the drift still there.
+    drift="$(grep -E '^DRIFT ' "$WORK/before.out" | awk '{ print $1 " " $2 }' | mask | tr '\n' ';')"
+    [ -z "$drift" ] \
+        || node_refuse "part of the declaration is live on $NODE, so only its entries ABSENT live could be applied (Talos's merge appends list entries it cannot key) — and a declared entry DRIFTs live: ${drift%;}. Adding entries cannot correct a drift, and applying only the entries ABSENT live would leave it drifted while the read-back called $NODE converged. Keep every live entry: they are working config. Nothing was applied"
+    mkdir -p "$WORK/narrow"
+    # shellcheck disable=SC2086 # T is one line the door prints to be word-split
+    $T -n "$NODE_ADDRESS" get machineconfig -o yaml < /dev/null 2> "$WORK/narrow.get" \
+        | check_declared --absent "$NODE" > "$WORK/narrow/$NODE.yaml" 2> "$WORK/narrow.err"
+    st=("${PIPESTATUS[@]}")
+    [ "${st[0]}" -eq 0 ] \
+        || node_fail "could not read $NODE's machine config to narrow the declaration ($(mask < "$WORK/narrow.get" | tr '\n' ' ')) — nothing was applied"
+    case "${st[1]}" in
+        0) ;;
+        4) node_refuse "every entry the declaration at $SHA declares is already live on $NODE: ${present%;} — there is nothing to converge, and applying it could only add a second copy of a list entry Talos's merge cannot key. Keep every live entry: they are working config, and deleting one to unblock this breaks the node (a DOUBLED entry is left as found). Nothing was applied" ;;
+        *) node_fail "check-declared.sh could not narrow $REL to the entries ABSENT live on $NODE (exit ${st[1]}): $(mask < "$WORK/narrow.err" | tr '\n' ' ') — nothing was applied" ;;
+    esac
+    # The narrowed patch is a declaration of its own, judged as one.
+    check_declared_in narrow --only-read-classes "$NODE" > "$WORK/narrow-classes.out" 2>&1 \
+        || node_refuse "the narrowed patch for $NODE is not one a converge may apply: $(tr '\n' ' ' < "$WORK/narrow-classes.out") — nothing was applied"
+    # Its entries are exactly the ones the first read found ABSENT, and a
+    # read of the node against it finds every one of them ABSENT.
+    grep -E '^ABSENT ' "$WORK/before.out" | awk '{ print $2 }' > "$WORK/applied.keys"
+    read_back narrow-before narrow
+    { [ "$GET_RC" -eq 0 ] && [ "$CHECK_RC" -le 1 ] && has_summary "$WORK/narrow-before.out"; } \
+        || node_fail "could not read $NODE against the narrowed patch (check-declared.sh exit $CHECK_RC): $(mask < "$WORK/narrow-before.err" | tr '\n' ' ') — nothing was applied"
+    grep -E '^(MATCH|DRIFT|ABSENT|DOUBLED) ' "$WORK/narrow-before.out" \
+        | awk '{ print ($1 == "ABSENT" ? "" : $1 " ") $2 }' > "$WORK/narrow.keys"
+    cmp -s "$WORK/applied.keys" "$WORK/narrow.keys" \
+        || node_fail "$NODE moved between two reads: the narrowed patch's entries are not the ones the plan found ABSENT ($(mask < "$WORK/narrow.keys" | tr '\n' ' ')) — nothing was applied; render the plan again"
+    n="$(wc -l < "$WORK/applied.keys" | tr -d ' ')"
+    NARROWED=1
+    PATCH="$(cat "$WORK/narrow/$NODE.yaml")"
+    NARROW_WHY="narrowed: these declared entries are already live: ${present%;} — and Talos's merge appends list entries it cannot key, so the whole declaration is neither dry-run nor applied; the patch applied is the declaration narrowed to the $(entries "$n") ABSENT live, and every live entry is kept as found"
+
+    dry 1
+    judge_dry 1
+    render_diff
+    [ $((PLUS + MINUS)) -gt 0 ] \
+        || node_refuse "Talos's dry run of the narrowed patch changes nothing on $NODE, so there is nothing to converge"
+    dry 2
+    judge_dry 2
+    if cmp -s "$WORK/dry1.summary" "$WORK/dry2.summary" && cmp -s "$WORK/dry1.diff" "$WORK/dry2.diff"; then
+        IDEM="idempotent: yes — Talos's dry run of the narrowed patch applied twice is the dry run of it applied once"
+    else
+        IDEM="idempotent: no — applied twice the narrowed patch would append again; every entry it applies reads ABSENT live, so this run adds each once"
+    fi
+}
+
+# moved_entries — the declared entries the narrowed patch did NOT carry
+# whose line in the check changed between the read before the apply and
+# $WORK/after.out: their keys, masked, one line. The lines compared are
+# the check's own (DRIFT and UNDECLARED carry live values) and stay here;
+# only the keys are said.
+moved_entries() {
+    local f
+    for f in before after; do
+        awk 'NR == FNR { skip[$0] = 1; next }
+             /^(MATCH|DRIFT|ABSENT|DOUBLED|UNDECLARED) / && !($2 in skip)' \
+            "$WORK/applied.keys" "$WORK/$f.out" | LC_ALL=C sort > "$WORK/$f.kept"
+    done
+    LC_ALL=C comm -3 "$WORK/before.kept" "$WORK/after.kept" | awk '{ print $2 }' | LC_ALL=C sort -u | mask | tr '\n' ' '
+}
+
 # --- the plan -----------------------------------------------------------------
 render() {
-    local uid idem present
+    local uid present
     read_back before
+    # Kept: a narrowed plan reads the node again, and the plan states the
+    # verdict of THIS read.
+    BEFORE_RC="$CHECK_RC"
     [ "$GET_RC" -eq 0 ] \
         || node_fail "could not read $NODE's machine config through the talosconfig door ($(mask < "$WORK/before.get" | tr '\n' ' ')) — a node nobody read has no known state, so there is no plan"
     case "$CHECK_RC" in
@@ -471,28 +622,40 @@ render() {
         *) node_fail "check-declared.sh could not read $NODE's live config (exit $CHECK_RC): $(mask < "$WORK/before.err" | tr '\n' ' ') — an effect nobody can read is not applied" ;;
     esac
 
-    dry 1
-    judge_dry 1
-    render_diff
-    [ $((PLUS + MINUS)) -gt 0 ] \
-        || node_refuse "$NODE already carries the declaration at $SHA: Talos's dry run changes nothing, so there is nothing to converge (and an applied plan is never run twice)"
-
-    # Idempotence, measured by Talos: the same patch applied twice.
-    dry 2
-    judge_dry 2
-    if cmp -s "$WORK/dry1.summary" "$WORK/dry2.summary" && cmp -s "$WORK/dry1.diff" "$WORK/dry2.diff"; then
-        idem="idempotent: yes — Talos's dry run of the patch applied twice is the dry run of it applied once"
+    # EVERY declared entry that is not ABSENT, in every class (review
+    # 9cb9af67, finding 1): any live entry could be one Talos's merge
+    # appends a second copy of.
+    present="$(grep -E '^(MATCH|DRIFT|DOUBLED) ' "$WORK/before.out" | awk '{ print $1 " " $2 }' | mask | tr '\n' ';')"
+    # NARROW FIRST (backlog a3b1084f). With any declared entry live, the
+    # whole declaration is never dry-run: Talos refuses it outright when
+    # the copy it appends is not a no-reboot change. The first live plan
+    # after 67e98635 landed (ops-request fa6fd412) dry-ran w-1's whole
+    # declaration, Talos answered "this config change can't be applied in
+    # immediate mode" over a second copy of the live seed files entry, and
+    # the plan failed before narrow() was reached. narrow() refuses a DRIFT
+    # before anything else and takes its own two dry runs of the narrowed
+    # patch. The live entries are not the fault and stay (finding 2):
+    # deleting a working mount or mirror to unblock this would break the
+    # node.
+    if [ -n "$present" ]; then
+        narrow "$present"
     else
-        # EVERY declared entry that is not ABSENT, in every class (review
-        # 9cb9af67, finding 1): which part of the patch appends is not
-        # visible from here, so any live entry could be the one doubled.
-        present="$(grep -E '^(MATCH|DRIFT|DOUBLED) ' "$WORK/before.out" | awk '{ print $1 " " $2 }' | mask | tr '\n' ';')"
-        # The live entries are not the fault and stay (finding 2): deleting
-        # a working mount or mirror to unblock this would break the node,
-        # and a de-duplicated DOUBLED entry reads MATCH and refuses the same.
-        [ -z "$present" ] \
-            || node_refuse "the patch is not idempotent on $NODE — Talos's dry run of it applied twice differs from once, because its merge appends list entries it cannot key — and these declared entries are already live: ${present%;} — so applying the whole declaration could add a second copy. Keep every live entry: they are working config, and deleting one to unblock this breaks the node (de-duplicating a DOUBLED entry leaves a MATCH, which is refused the same way). The remedy is a declaration narrowed to the entries that read ABSENT live on $NODE, or a partial patch that applies only those; nothing was applied"
-        idem="idempotent: no — applied twice it would append again (Talos's merge appends list entries it cannot key); every entry it declares reads ABSENT live, so this run adds each once"
+        # Every entry ABSENT — a fresh node: nothing live to append to, so
+        # the whole declaration is dry-run, once and twice.
+        dry 1
+        judge_dry 1
+        render_diff
+        [ $((PLUS + MINUS)) -gt 0 ] \
+            || node_refuse "$NODE already carries the declaration at $SHA: Talos's dry run changes nothing, so there is nothing to converge (and an applied plan is never run twice)"
+
+        # Idempotence, measured by Talos: the same patch applied twice.
+        dry 2
+        judge_dry 2
+        if cmp -s "$WORK/dry1.summary" "$WORK/dry2.summary" && cmp -s "$WORK/dry1.diff" "$WORK/dry2.diff"; then
+            IDEM="idempotent: yes — Talos's dry run of the patch applied twice is the dry run of it applied once"
+        else
+            IDEM="idempotent: no — applied twice it would append again (Talos's merge appends list entries it cannot key); every entry it declares reads ABSENT live, so this run adds each once"
+        fi
     fi
 
     uid="$(jq -r '.metadata.uid // "none"' "$WORK/node.json")"
@@ -502,18 +665,29 @@ render() {
     echo "estate role: $NODE_ROLE"
     echo "kubernetes node uid: $uid"
     echo "declaration: $REL at commit $SHA (blob $BLOB, the blob this checkout's HEAD carries)"
-    echo "command: talosctl -n $NODE_ADDRESS patch machineconfig --mode=no-reboot --patch=<the declaration below> — Talos applies it live and refuses it if it would need a reboot. Reboot, upgrade, reset and etcd membership are never this verb."
-    echo "read-back: talosctl -n $NODE_ADDRESS get machineconfig, through infra/cluster/talos/check-declared.sh $NODE against the declaration below, until every declared entry reads MATCH."
+    if [ "$NARROWED" -eq 1 ]; then
+        echo "command: talosctl -n $NODE_ADDRESS patch machineconfig --mode=no-reboot --patch=<the narrowed patch below> — Talos applies it live and refuses it if it would need a reboot. Reboot, upgrade, reset and etcd membership are never this verb."
+        echo "read-back: talosctl -n $NODE_ADDRESS get machineconfig, through infra/cluster/talos/check-declared.sh $NODE against the narrowed patch until every entry it carries reads MATCH, and against the declaration until every other entry reads as it does now."
+    else
+        echo "command: talosctl -n $NODE_ADDRESS patch machineconfig --mode=no-reboot --patch=<the declaration below> — Talos applies it live and refuses it if it would need a reboot. Reboot, upgrade, reset and etcd membership are never this verb."
+        echo "read-back: talosctl -n $NODE_ADDRESS get machineconfig, through infra/cluster/talos/check-declared.sh $NODE against the declaration below, until every declared entry reads MATCH."
+    fi
     echo
     echo "== the declaration ($(wc -l < "$WORK/decl/$NODE.yaml" | tr -d ' ') lines) =="
     cat "$WORK/decl/$NODE.yaml"
     echo
-    echo "== $NODE against its declaration now (check-declared.sh, exit $CHECK_RC; verdicts and keys, never live values) =="
+    echo "== $NODE against its declaration now (check-declared.sh, exit $BEFORE_RC; verdicts and keys, never live values) =="
     findings "$WORK/before.out"
+    if [ "$NARROWED" -eq 1 ]; then
+        echo
+        echo "== the patch applied: the declaration narrowed to its entries ABSENT live (check-declared.sh --absent; $(wc -l < "$WORK/narrow/$NODE.yaml" | tr -d ' ') lines) =="
+        cat "$WORK/narrow/$NODE.yaml"
+        echo "$NARROW_WHY"
+    fi
     echo
     echo "== Talos's dry run (--mode=no-reboot) =="
     cat "$WORK/dry1.summary"
-    echo "$idem"
+    echo "$IDEM"
     echo "changed lines: +$PLUS -$MINUS"
     echo
     echo "== Talos's config diff (a context line shows its key only: a machine config's values include its keys and tokens) =="
@@ -536,7 +710,11 @@ if [ "$HASH" != "$APPROVED" ]; then
 fi
 cat "$WORK/plan"
 echo
-echo "node-converge: plan $APPROVED still holds — applying $REL at $SHA to $NODE ($NODE_ADDRESS)"
+if [ "$NARROWED" -eq 1 ]; then
+    echo "node-converge: plan $APPROVED still holds — applying $REL at $SHA, narrowed to its $(entries "$(wc -l < "$WORK/applied.keys" | tr -d ' ')") ABSENT live, to $NODE ($NODE_ADDRESS)"
+else
+    echo "node-converge: plan $APPROVED still holds — applying $REL at $SHA to $NODE ($NODE_ADDRESS)"
+fi
 
 # The apply is given a minute inside its container, as the door bounds
 # every talosctl call (ops_talosctl); a dry run is given the door's default.
@@ -545,7 +723,8 @@ TA="$(BOSS_TALOS_TIMEOUT_S="${BOSS_NODE_CONVERGE_APPLY_TIMEOUT_S:-60}" ops_talos
 if ! $TA -n "$NODE_ADDRESS" patch machineconfig --mode=no-reboot "--patch=$PATCH" < /dev/null > "$WORK/apply.out" 2> "$WORK/apply.err"; then
     mask < "$WORK/apply.err" | sed 's/^/    /' >&2
     if no_reboot_refusal "$WORK/apply.err"; then
-        node_refuse "Talos refused to apply $REL to $NODE without a reboot (its words above) — nothing was applied, and a reboot is never this verb"
+        entries="$(reboot_entries "$WORK/apply.err")"
+        node_refuse "Talos refused to apply $REL to $NODE without a reboot (its words above${entries:+; the change it would not apply live: $entries}) — nothing was applied, and a reboot is never this verb"
     fi
     node_fail "talosctl -n $NODE_ADDRESS patch machineconfig failed (its words above) — this run cannot say whether $NODE took the patch; read it with plan-a-node-converge before anything else"
 fi
@@ -598,11 +777,38 @@ while :; do
     elapsed=$(($(date -u +%s) - start))
     read_back after
     good=no
+    config_ok=no
     if [ "$GET_RC" -ne 0 ]; then
         said="the machine config did not read: $(mask < "$WORK/after.get" | tr '\n' ' ' | cut -c1-300)"
+    elif [ "$NARROWED" -eq 1 ]; then
+        # A narrowed patch: the declaration may still read findings it did
+        # not carry (a DOUBLED entry is left as found), so its read must
+        # only have FINISHED; the patch applied must read every entry
+        # MATCH; and every entry it did not carry must read exactly as it
+        # did before the apply.
+        if [ "$CHECK_RC" -gt 1 ] || ! has_summary "$WORK/after.out"; then
+            said="check-declared.sh exit $CHECK_RC against the declaration: $(findings "$WORK/after.out" | tr '\n' ';' | cut -c1-600) $(mask < "$WORK/after.err" | tr '\n' ' ' | cut -c1-300)"
+        else
+            moved="$(moved_entries)"
+            read_back after-narrow narrow
+            if [ "$GET_RC" -ne 0 ]; then
+                said="the machine config did not read: $(mask < "$WORK/after-narrow.get" | tr '\n' ' ' | cut -c1-300)"
+            elif [ "$CHECK_RC" -ne 0 ] || ! has_summary "$WORK/after-narrow.out"; then
+                said="check-declared.sh exit $CHECK_RC against the patch applied: $(findings "$WORK/after-narrow.out" | tr '\n' ';' | cut -c1-600) $(mask < "$WORK/after-narrow.err" | tr '\n' ' ' | cut -c1-300)"
+            elif [ -n "$moved" ]; then
+                said="every entry the patch applied reads MATCH, and declared entries it did not carry read differently than before the apply: ${moved% }"
+            else
+                config_ok=yes
+                config_says="the machine config reads every entry the patch applied MATCH and every other declared entry as before"
+            fi
+        fi
     elif [ "$CHECK_RC" -ne 0 ] || ! has_summary "$WORK/after.out"; then
         said="check-declared.sh exit $CHECK_RC: $(findings "$WORK/after.out" | tr '\n' ';' | cut -c1-600) $(mask < "$WORK/after.err" | tr '\n' ' ' | cut -c1-300)"
     else
+        config_ok=yes
+        config_says="the machine config reads every declared entry MATCH"
+    fi
+    if [ "$config_ok" = yes ]; then
         node_live
         case "${RENEW_S:-empty}" in empty | *[!0-9]*) fresh=no ;; *) [ "$RENEW_S" -ge $((applied_at + SETTLE_S)) ] && fresh=yes || fresh=no ;; esac
         if [ "$READY" = True ] && [ "$fresh" = yes ]; then
@@ -610,15 +816,19 @@ while :; do
             seen_back=yes
             said="the Node was back (Ready=True, lease renewed $((RENEW_S - applied_at))s after the apply) and is read again at the end of the ${WAIT_S}s bound"
         elif [ "$seen_back" = yes ]; then
-            said="the machine config reads every declared entry MATCH, and the Node was back and is NOT any more: Ready=$READY, kubelet lease renewTime $RENEW"
+            said="$config_says, and the Node was back and is NOT any more: Ready=$READY, kubelet lease renewTime $RENEW"
         else
-            said="the machine config reads every declared entry MATCH, and the Node is NOT proven back: Ready=$READY, kubelet lease renewTime $RENEW (it must be at least ${SETTLE_S}s after the apply)"
+            said="$config_says, and the Node is NOT proven back: Ready=$READY, kubelet lease renewTime $RENEW (it must be at least ${SETTLE_S}s after the apply)"
         fi
     fi
     if [ "$elapsed" -ge "$WAIT_S" ]; then
         if [ "$good" = yes ]; then
             findings "$WORK/after.out"
-            echo "node-converge: $NODE reads back its declaration at $SHA — check-declared.sh $NODE exits 0 against the live machine config, every declared entry MATCH, and Node $NODE Ready=True with its kubelet lease renewed $((RENEW_S - applied_at))s after the apply (after ${elapsed}s)"
+            if [ "$NARROWED" -eq 1 ]; then
+                echo "node-converge: $NODE reads back the $(entries "$(wc -l < "$WORK/applied.keys" | tr -d ' ')") it applied of its declaration at $SHA — check-declared.sh $NODE exits 0 against the patch applied, each entry MATCH, every other declared entry reads as it did before the apply, and Node $NODE Ready=True with its kubelet lease renewed $((RENEW_S - applied_at))s after the apply (after ${elapsed}s)"
+            else
+                echo "node-converge: $NODE reads back its declaration at $SHA — check-declared.sh $NODE exits 0 against the live machine config, every declared entry MATCH, and Node $NODE Ready=True with its kubelet lease renewed $((RENEW_S - applied_at))s after the apply (after ${elapsed}s)"
+            fi
             exit 0
         fi
         node_fail "Talos accepted the patch on $NODE, and after ${elapsed}s it is NOT proven to carry its declaration: $said. The patch stands — read it again with plan-a-node-converge $NODE $SHA"

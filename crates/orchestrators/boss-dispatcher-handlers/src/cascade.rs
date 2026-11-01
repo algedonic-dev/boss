@@ -128,6 +128,10 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // writes back through the jobs API as its own actor, so the
         // only emit this handler owns is the packet it creates.
         ("jobs.run-car-probes", vec!["jobs.job.created"]),
+        (
+            "jobs.reconcile-readiness",
+            vec!["jobs.step.updated", "step.ready.*"],
+        ),
         // Auto-park (898e41b1): on a gate-run's GREEN gate-verdict step
         // it files the ship-a-change car (`jobs.job.created`), completes
         // that car's three receipt steps (`jobs.step.completed`), and —
@@ -211,6 +215,22 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
             "maintenance.chore.file_reds",
             vec!["jobs.job.created", "jobs.job.updated"],
         ),
+        // A verdict held on a chore's newest N runs files ONE
+        // backlog-item (`jobs.job.created`) and notes what it judged on
+        // the firing packet (`jobs.job.updated`), ada4d019. The run that
+        // ends the streak closes that item at its triage step, `stale`
+        // (`jobs.step.completed`), or notes on it that it recovered
+        // (`jobs.job.updated`), 3ff17da3. Every write is to a
+        // backlog-item or the chore's own note, never the chore kind's
+        // run step, so the chain ends at the operator's queue.
+        (
+            "maintenance.verdict.streak",
+            vec![
+                "jobs.job.created",
+                "jobs.job.updated",
+                "jobs.step.completed",
+            ],
+        ),
         ("jobs.subjob_resolve", vec!["jobs.step.completed"]),
         // Completes the open branch on the Job a declared edge names
         // (a merged car answering its feedback packet). The completion
@@ -231,6 +251,15 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // packet `live` (c34583cb). No rule this tree ships names it;
         // the rule is the tenant's.
         ("jobs.complete_step_matching", vec!["jobs.step.completed"]),
+        // The cluster-deploy-runner's mid-run `rolled` report completes
+        // `converged` on the train whose merge it rolled, once the
+        // running jobs API self-reports the same commit (090720c3). The
+        // completion opens the train's `arrived` outcome, whose marker
+        // rule closes it.
+        (
+            "jobs.converge_trains_on_rolled",
+            vec!["jobs.step.completed"],
+        ),
         // A clock rule completes an open step on every packet of a
         // kind that has gone silent past a bound (c87fb59b car 2: an
         // agent-run whose builder died). The completion carries the
@@ -314,12 +343,34 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // again by the durable inbox's queue READ, not by an event, so
         // the loop ends at the board.
         ("jobs.reclaim_abandoned_step", vec!["jobs.step.updated"]),
+        // The urgent-item watch (9788e22d): the same release for an
+        // urgent item's build claimed with no open run and no car in
+        // flight (`jobs.step.updated`, the merge then the status), and
+        // one rescope alarm per long item (`jobs.job.created`). It never
+        // completes the item or the alarm; nothing listens on a step
+        // update, and the alarm waits for a person.
+        (
+            "jobs.urgent_item_watch",
+            vec!["jobs.step.updated", "jobs.job.created"],
+        ),
+        // The idle-actor watch (861360bc): one alarm per agent holding
+        // a ready urgent nomination with no run open or moved inside
+        // its bound (`jobs.job.created`), plus an immutable first-wait
+        // observation. Neither fact completes the nomination it watches.
+        (
+            "jobs.idle_actor_watch",
+            vec!["jobs.job.created", boss_jobs::events::STEP_FIRST_RECORDED],
+        ),
         // A held car's reviewer verdict asks the release door
         // (0cfc57e6): a grant is the door's merge onto the car's review
         // step, a refusal the rule's `auto_release` note on the same
-        // step — both `jobs.step.updated`, on which no rule this tree
-        // ships acts for an open step. The car then boards by the
-        // conductor's read, not by an event, so the loop ends here.
+        // step — both `jobs.step.updated`. That topic wakes this same
+        // handler again through `release-a-held-car-when-its-review-
+        // hold-is-placed` (60993cda), and the loop ends on the second
+        // pass by construction: a grant leaves no hold, so nothing is
+        // asked, and a refusal finds itself already recorded and writes
+        // nothing. The car then boards by the conductor's read, not by
+        // an event.
         ("jobs.release_on_review", vec!["jobs.step.updated"]),
         ("gate.resolve", vec!["jobs.step.completed"]),
         ("packaging.allocate", vec!["jobs.step.completed"]),

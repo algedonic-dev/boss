@@ -104,17 +104,39 @@ agent = { profile = "analyst", model = "opus-5-5", budget_usd = 2, effort = "med
 # The procedure's second paragraph is backlog-item's draft-design's,
 # word for word (backlog 4f71e608, 2026-09-24) — one step, one text in
 # both kinds, pinned by the_author_decides_from_the_company_frame.rs.
-metadata_defaults = { procedure = "File the design-doc that answers this feedback: `boss design <title> --markdown-file <file> --question 'Qn|title|proposal' ... --answers <this packet>`. The verb writes the design's id here as design_id and completes this step; the founder's design-review opens on it, asking for that design at /it/design.\n\nDECIDE WHAT THE FRAME DECIDES; ASK ONLY WHAT IT CANNOT (backlog 4f71e608). A --question goes to David, and David, 2026-09-24: \"I do sort of think you are pushing too many questions to me that you could answer on your own. Remember we are building a company, run by one person plus agents, that is going to run a hosting business based on its open source release.\" That frame, he said, is the common-sense guide to our audits' gap analysis and to clearing out, then cleaning up, the demo tenant's leftover pieces. And: \"I can always provide feedback later too as our software is designed for making low cost changes.\" So every choice that frame answers — one person plus agents; a hosting business on the open-source release; our instance runs only the modules it uses and the rest stay for the example tenants; the demo tenant's leftovers cleared out, then cleaned up — is DECIDED in the markdown with its reason, and recorded on this item as `decided_<date>_<source>` once the design is filed (`boss job patch <this packet> <file.json>` with the object {\"decided_2026-09-24_1a2b3c4d\": \"<the decision> — because <the reason>\"}, the date read from `date -u +%F`, never typed, and the source the first eight characters of the design's id, which `boss design` just wrote here as design_id, copied). The source in the name is what makes the patch safe: it merges top-level keys and REPLACES one of the same name, so a key named only by its date let two decisions on one item on one day overwrite each other, the first surviving only in the event log (backlog 46b55136). Several decisions from one design ride in that one key's value, one per line, and a reader finds every decision an item carries as every metadata key that begins `decided_`. Only strategy or priority trade-offs, trust and security boundaries, credentials, money, and brand or voice may ride as a --question. With none left, file with --no-questions — a doc that records decisions rather than asking for them — and David corrects any of them later through the ordinary cheap-change path." }
+metadata_defaults = { procedure = "File the design-doc that answers this feedback: `boss design <title> --markdown-file <file> --question 'Qn|title|proposal' ... --answers <this packet>`. The verb writes the design's id here as design_id and completes this step; the founder's design-review opens on it, asking for that design on its own packet page. A design filed with --no-questions asks nothing, so the verb records this step `recorded` instead: no review opens for anyone, and the build goes ahead as the design decides (backlog ac141c99).\n\nDECIDE WHAT THE FRAME DECIDES; ASK ONLY WHAT IT CANNOT (backlog 4f71e608). A --question goes to David, and David, 2026-09-24: \"I do sort of think you are pushing too many questions to me that you could answer on your own. Remember we are building a company, run by one person plus agents, that is going to run a hosting business based on its open source release.\" That frame, he said, is the common-sense guide to our audits' gap analysis and to clearing out, then cleaning up, the demo tenant's leftover pieces. And: \"I can always provide feedback later too as our software is designed for making low cost changes.\" So every choice that frame answers — one person plus agents; a hosting business on the open-source release; our instance runs only the modules it uses and the rest stay for the example tenants; the demo tenant's leftovers cleared out, then cleaned up — is DECIDED in the markdown with its reason, and recorded on this item as `decided_<date>_<source>` once the design is filed (`boss job patch <this packet> <file.json>` with the object {\"decided_2026-09-24_1a2b3c4d\": \"<the decision> — because <the reason>\"}, the date read from `date -u +%F`, never typed, and the source the first eight characters of the design's id, which `boss design` just wrote here as design_id, copied). The source in the name is what makes the patch safe: it merges top-level keys and REPLACES one of the same name, so a key named only by its date let two decisions on one item on one day overwrite each other, the first surviving only in the event log (backlog 46b55136). Several decisions from one design ride in that one key's value, one per line, and a reader finds every decision an item carries as every metadata key that begins `decided_`. Only strategy or priority trade-offs, trust and security boundaries, credentials, money, and brand or voice may ride as a --question. With none left, file with --no-questions — a doc that records decisions rather than asking for them — and David corrects any of them later through the ordinary cheap-change path." }
 [[workflow.step.fields]]
 name = "design_id"
 field_type = "string"
 required = true
+# A DESIGN THAT ASKS NOTHING DECIDES NOTHING FOR A PERSON (backlog
+# ac141c99, David's report 2026-10-17 — measured on backlog-item
+# 25022367, whose draft is this one). `boss design --no-questions
+# --answers <this packet>` files a design that records decisions
+# rather than asking for them; design-doc skips its own review for it
+# and opens its fold at filing (5932204e), so the founder's
+# `design-review` below would ask him to decide a design that never
+# reaches a review, with nothing to decide. The verb writes `recorded`
+# here beside the id, and only onto a draft that declares it, so a
+# packet pinned to an earlier version keeps its route. `filed` names
+# the ordinary draft — a one-value type is not an enum to the
+# validator (step_registry.rs `validate_field_type`), so `recorded`
+# alone would take a misspelling in silence; the verb writes no
+# disposition for a design with questions, which is Absent and lands
+# in the same place as `filed`.
+[[workflow.step.fields]]
+name = "disposition"
+field_type = "filed|recorded"
+required = false
 
 [[workflow.step]]
 title = "design-review"
 kind = "answer-question"
-# Only once there is a design to decide — see `draft-design` above.
-ready_when = "steps.draft-design.done"
+# Only once there is a design to decide — see `draft-design` above —
+# and not when the draft is `recorded`: that design asks no question,
+# and `build` opens on its author's decisions instead. Stated
+# negatively so an ordinary draft, Absent, still opens the review.
+ready_when = "steps.draft-design.done AND NOT (steps.draft-design.metadata.disposition = \"recorded\")"
 title_template = "Decide the design"
 authority_role = "platform-admin"
 metadata_defaults = { verdict = "" }
@@ -139,7 +161,10 @@ required = true
 [[workflow.step]]
 title = "build"
 kind = "task"
-ready_when = "(steps.triage.done AND steps.triage.metadata.disposition = \"build\") OR (steps.investigate.done AND steps.investigate.metadata.disposition = \"build\") OR (steps.design-review.done AND steps.design-review.metadata.verdict = \"approved\")"
+# A draft `recorded` opens the build as an approved review does: the
+# design asked no question, so its decisions are its author's, made
+# where design-doc makes them (ac141c99, 4f71e608).
+ready_when = "(steps.triage.done AND steps.triage.metadata.disposition = \"build\") OR (steps.investigate.done AND steps.investigate.metadata.disposition = \"build\") OR (steps.design-review.done AND steps.design-review.metadata.verdict = \"approved\") OR (steps.draft-design.done AND steps.draft-design.metadata.disposition = \"recorded\")"
 title_template = "Build the change"
 authority_role = "platform-admin"
 # HOW AN AGENT RUNS IT, declared once (design c87fb59b car 1, backlog

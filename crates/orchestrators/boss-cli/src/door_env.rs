@@ -63,9 +63,35 @@ pub(crate) const DEV_CONTROL_CONTRACT: &str = include_str!(concat!(
 /// them equal. Other hosts have no store; workers never mount /work.
 const DEV_CONTROL_STORE: &str = "/work/tools/dev-control";
 
-/// Where a child of this CLI runs, read off the selector.
-#[derive(Debug)]
-enum DevChild {
+/// The kubectl the trusted session door (`infra/dev/control-tools.py`)
+/// validated, handed over by ABSOLUTE path (backlog 7ed1251a, RELEASE
+/// review f6e0c3e5 of car 77f528cc). The door used to put its
+/// generation's bin/ first on PATH so a bare `kubectl` found it; but it
+/// checks that directory's listing once, before the exec, and this
+/// process looks names up for as long as it runs, so a name planted in
+/// bin/ afterwards resolved there. Now nothing of the generation is on
+/// PATH and every kubectl this CLI spawns asks [`kubectl_program`].
+/// `the_published_door_hands_the_cli_the_kubectl_it_checked` holds the
+/// door's spelling to this one.
+pub(crate) const DOOR_KUBECTL_ENV: &str = "BOSS_DOOR_KUBECTL";
+
+/// The program every kubectl this CLI runs: the door's validated
+/// absolute path when a door named one, else `kubectl` by name, as
+/// every host without that door has always run it.
+pub(crate) fn kubectl_program() -> String {
+    kubectl_program_from(std::env::var(DOOR_KUBECTL_ENV).ok())
+}
+
+fn kubectl_program_from(door: Option<String>) -> String {
+    door.filter(|path| !path.is_empty())
+        .unwrap_or_else(|| "kubectl".to_string())
+}
+
+/// Where a child of this CLI runs, read off the selector. `boss brief`
+/// reads it too, so the pre-flight a builder is told to run is the route
+/// this door would take rather than one that exits 127 (5008a6c9).
+#[derive(Debug, Clone)]
+pub(crate) enum DevChild {
     /// No selector: isolation was never turned on here (the held state).
     Local,
     /// An activated generation: through this published launcher.
@@ -75,7 +101,7 @@ enum DevChild {
     Refuse(String),
 }
 
-fn dev_child_route(store: &Path) -> DevChild {
+pub(crate) fn dev_child_route(store: &Path) -> DevChild {
     let selector = store.join("enabled");
     match std::fs::symlink_metadata(&selector) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => DevChild::Local,
@@ -98,6 +124,22 @@ fn dev_child_route(store: &Path) -> DevChild {
             )),
         },
     }
+}
+
+/// Whether dev isolation is activated on this host — the one state in
+/// which the session's own `boss` reaches this CLI through the published
+/// door (`infra/dev/control-tools.py`), which hands on only the names it
+/// lists. `boss dispatch --from-hook` reads it to tell a dropped
+/// snapshot name from a hand-run verb's absent one (backlog c02f30c5).
+pub(crate) fn isolation_forwards() -> bool {
+    matches!(
+        dev_child_route(Path::new(DEV_CONTROL_STORE)),
+        DevChild::Forward(_)
+    )
+}
+
+pub(crate) fn dev_worker_route() -> DevChild {
+    dev_child_route(Path::new(DEV_CONTROL_STORE))
 }
 
 /// `<store>/generations/<40 lowercase hex>`, exactly what activation writes.
@@ -267,6 +309,17 @@ mod tests {
 
     const INNER: &str = "BOSS_DOOR_ENV_INNER";
 
+    /// The names the session hands its own `boss` that are NOT identity
+    /// but decide what a verb refuses or writes into a record (backlog
+    /// c02f30c5): the definitions snapshot behind dispatch's
+    /// unloaded-definitions refusal, and the attribution lines a brief
+    /// carries. The published door dropped both, so under isolation the
+    /// refusal passed every call and every brief lost its trailer.
+    const SESSION_DATA_ENV: [&str; 2] = [
+        crate::dispatch::SESSION_DEFINITIONS_ENV,
+        crate::documents::TRAILER_ENV,
+    ];
+
     /// A LIVE-LOOKING token: 43 base64url characters, the shape the
     /// broker mints. Not a real one — a test never reads or prints one.
     fn live_looking() -> String {
@@ -393,6 +446,55 @@ mod tests {
         );
     }
 
+    /// The controller strips candidate environment; the probe text must
+    /// carry its own locale pin across that real forwarding boundary (03355dfd B1).
+    #[test]
+    fn a_forwarded_probe_pins_its_own_locale_and_timezone() {
+        let root = boss_testing::scratch_dir("forwarded-probe-locale");
+        let mut observations = Vec::new();
+        for timezone in ["UTC+7", "UTC-11"] {
+            let launcher = root.join(format!("launcher-{timezone}"));
+            boss_testing::write_exec(
+                &launcher,
+                &format!(
+                    r#"#!/bin/bash
+set -eu
+printf 'CONTROLLER=%s|%s|%s\n' "${{LC_ALL:-unset}}" "${{TZ:-unset}}" "${{BOSS_MACHINE_TOKEN:-unset}}"
+[ "$1" = exec-auto ]; shift
+while [ "$1" = --worker-env ]; do
+    case "$2" in BOSS_JOBS_URL=*|BOSS_SOR_PORTS=*|BOSS_CAR_CONVERGED_AT=*|BOSS_CAR_MERGE_REF=*) ;; *) exit 90;; esac
+    shift 2
+done
+[ "$1" = -- ]; shift
+# Stand in only for the worker's isolated environment, not the forwarding code.
+exec /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=POSIX TZ='{timezone}' "$@"
+"#
+                ),
+            );
+            let probe = r#"printf 'PROBE=%s|%s|%s\n' "${LC_ALL:-unset}" "${TZ:-unset}" "${BOSS_MACHINE_TOKEN:-unset}"
+printf 'car_release.rs\ncar.rs\néclair\nZebra\n_car\n-dash\n' | sort
+date -d @0 '+DATE=%Y-%m-%d %H:%M:%S %z'
+"#;
+            let mut command = Command::new("bash");
+            command.args(["-c", &format!("{}\n{probe}", crate::prove::PRELUDE)]);
+            // These existing Command-level pins are deliberately present:
+            // forward_dev_child must still strip them from controller startup.
+            command.env("LC_ALL", "C").env("TZ", "UTC");
+            command.env("BOSS_MACHINE_TOKEN", "fixture-never-forward");
+            command.env("BOSS_JOBS_URL", "http://example.invalid:7900");
+            super::forward_dev_child(&mut command, &launcher);
+            let result = command.output().expect("forwarded probe executes");
+            assert!(result.status.success(), "{result:?}");
+            observations.push(String::from_utf8(result.stdout).expect("UTF-8 fixture"));
+        }
+        let _ = std::fs::remove_dir_all(root);
+        let expected = "CONTROLLER=unset|unset|unset\nPROBE=C|UTC|unset\n-dash\nZebra\n_car\ncar.rs\ncar_release.rs\néclair\nDATE=1970-01-01 00:00:00 +0000\n";
+        assert!(
+            observations.iter().all(|output| output == expected),
+            "the actual forwarded probe must pin its own environment, sort and date: {observations:#?}"
+        );
+    }
+
     #[test]
     fn a_dev_control_child_is_forwarded_as_data_and_never_runs_locally() {
         let root = boss_testing::scratch_dir("dev-control-child-forwarding");
@@ -475,6 +577,51 @@ mod tests {
         }
     }
 
+    /// Backlog 1fddbe13 (reviewer run 012c8dcf, 2026-10-19): the live
+    /// store is root-owned 0700, so a non-root caller (uid 65534 under
+    /// infra/dev/as-gate-uid.sh) cannot stat the selector at all. That is
+    /// a refusal, never the held state — the bash doors were blind to it,
+    /// and infra/dev/control-tools_test.py pins them; this pins the Rust
+    /// door to the same answer. The gate runs as uid 65534, where mode 0
+    /// closes the store; a privileged caller reads through mode 0, so
+    /// there the closed store cannot be built and the test says so.
+    #[test]
+    fn a_selector_the_caller_cannot_read_refuses_and_an_absent_store_does_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = boss_testing::scratch_dir("dev-control-closed");
+        let absent = root.join("no-such").join("dev-control");
+        assert!(
+            matches!(super::dev_child_route(&absent), DevChild::Local),
+            "no store at all is the held state"
+        );
+        for closed in ["store", "ancestor"] {
+            let parent = root.join(closed);
+            let store = parent.join("dev-control");
+            std::fs::create_dir_all(&store).expect("mkdir the store");
+            let shut = if closed == "store" { &store } else { &parent };
+            std::fs::set_permissions(shut, std::fs::Permissions::from_mode(0o000))
+                .expect("close the store");
+            let blind = matches!(
+                std::fs::symlink_metadata(store.join("enabled")),
+                Err(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied
+            );
+            let route = super::dev_child_route(&store);
+            // mode-bits-ok: reopens a directory for cleanup; nothing execs it.
+            std::fs::set_permissions(shut, std::fs::Permissions::from_mode(0o755))
+                .expect("reopen the store");
+            if !blind {
+                eprintln!(
+                    "privileged caller: mode 0 does not close {closed} here; the gate's uid judges it"
+                );
+                continue;
+            }
+            match route {
+                DevChild::Refuse(why) => assert!(why.contains("could not be read"), "{why}"),
+                other => panic!("a {closed} closed to this caller must refuse, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn a_refused_dev_child_exits_75_naming_the_log_and_never_runs_locally() {
         let root = boss_testing::scratch_dir("dev-control-refused-child");
@@ -497,6 +644,164 @@ mod tests {
             "{stderr}"
         );
         assert!(stderr.contains("its selector names refused"), "{stderr}");
+    }
+
+    /// Backlog 19dbaab9 (2026-10-18, the first hour of isolation ON):
+    /// with the selector set, `boss` and `boss-api` are the published
+    /// `infra/dev/control-tools.py`, which hands the CLI only the names
+    /// it lists — and it listed `BOSS_ACTOR` alone of the three this CLI
+    /// reads for its own identity. `BOSS_AGENT_RUN` never arrived, so
+    /// `boss dispatch <run> --started` refused and every gate-run named
+    /// no run; `BOSS_ACTOR_FILE` never arrived, so a session pointing it
+    /// at /dev/null signed as the shared actor file's id instead. Held
+    /// here against [`crate::harness::IDENTITY_ENV`] itself, so a fourth
+    /// identity name fails this test until the door carries it — and
+    /// the worker-bound plans carry none, because a worker signs nothing.
+    ///
+    /// Held to [`SESSION_DATA_ENV`] too (backlog c02f30c5): the two names
+    /// the session's own verbs read that are not identity, which the door
+    /// dropped the same way.
+    #[test]
+    fn the_published_door_carries_every_identity_name_the_cli_reads() {
+        let source = boss_testing::repo_root().join("infra/dev/control-tools.py");
+        let generation = boss_testing::scratch_dir("published-door-identity");
+        let data = generation.join("infra/dev");
+        boss_testing::create_dir(&data);
+        boss_testing::write_file(
+            &generation.join("artifact.json"),
+            &format!("{{\"commit\":\"{}\"}}", "a".repeat(40)),
+        );
+        for (name, body) in [
+            ("machine-token-dir", "/fake-owned-control/machine\n"),
+            ("sor-url", "http://control.invalid:7900\n"),
+            ("sor-read-url", "http://read.invalid:7900\n"),
+        ] {
+            boss_testing::write_file(&data.join(name), body);
+        }
+        let out = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                r#"
+import json, sys, types
+from pathlib import Path
+module = types.ModuleType('published_control_tools')
+exec(compile(Path(sys.argv[1]).read_bytes(), sys.argv[1], 'exec'), module.__dict__)
+inherited = {name: 'fixture-' + name for name in sys.argv[3:]}
+seen = {}
+for tool, args in [('boss', ['dispatch']), ('boss-api', ['GET', '/api/jobs']), ('wt-cargo', []), ('wt-web', []), ('dev-build', ['start']), ('boss', ['--built', 'gate'])]:
+    _, env = module.tool_plan(Path(sys.argv[2]), tool, args, dict(inherited))
+    seen[' '.join([tool, *args])] = sorted(n for n in inherited if env.get(n) == inherited[n])
+print(json.dumps(seen))
+"#,
+            ])
+            .arg(&source)
+            .arg(&generation)
+            .args(crate::harness::IDENTITY_ENV)
+            .args(SESSION_DATA_ENV)
+            .output()
+            .expect("run python3 over the published door's plan");
+        assert!(
+            out.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let seen: std::collections::BTreeMap<String, Vec<String>> =
+            serde_json::from_slice(&out.stdout).expect("the plan reads back as JSON");
+        let mut carried: Vec<String> = crate::harness::IDENTITY_ENV
+            .iter()
+            .chain(SESSION_DATA_ENV.iter())
+            .map(|n| n.to_string())
+            .collect();
+        carried.sort();
+        for session in ["boss dispatch", "boss-api GET /api/jobs"] {
+            assert_eq!(
+                seen.get(session),
+                Some(&carried),
+                "{session}: the published door must hand the CLI every identity name and \
+                 every session data name"
+            );
+        }
+        for worker in ["wt-cargo", "wt-web", "dev-build start", "boss --built gate"] {
+            assert_eq!(
+                seen.get(worker),
+                Some(&Vec::new()),
+                "{worker}: a worker-bound plan carries no identity"
+            );
+        }
+    }
+
+    /// Backlog 7ed1251a: the published door hands the trusted CLI its
+    /// validated kubectl under [`DOOR_KUBECTL_ENV`], by absolute path,
+    /// and puts nothing of the generation on PATH — so the spelling in
+    /// control-tools.py and the one this CLI reads cannot drift apart
+    /// (CLAUDE.md §9a), and no bare name the CLI runs resolves into bin/.
+    #[test]
+    fn the_published_door_hands_the_cli_the_kubectl_it_checked() {
+        let source = boss_testing::repo_root().join("infra/dev/control-tools.py");
+        let generation = boss_testing::scratch_dir("published-door-kubectl");
+        let data = generation.join("infra/dev");
+        boss_testing::create_dir(&data);
+        boss_testing::write_file(
+            &generation.join("artifact.json"),
+            &format!("{{\"commit\":\"{}\"}}", "a".repeat(40)),
+        );
+        for (name, body) in [
+            ("machine-token-dir", "/fake-owned-control/machine\n"),
+            ("sor-url", "http://control.invalid:7900\n"),
+            ("sor-read-url", "http://read.invalid:7900\n"),
+        ] {
+            boss_testing::write_file(&data.join(name), body);
+        }
+        let out = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                r#"
+import json, sys, types
+from pathlib import Path
+module = types.ModuleType('published_control_tools')
+exec(compile(Path(sys.argv[1]).read_bytes(), sys.argv[1], 'exec'), module.__dict__)
+_, env = module.tool_plan(Path(sys.argv[2]), 'boss', ['gate'], {'PATH': '/inherited/tools:/usr/bin:/bin'})
+print(json.dumps(env))
+"#,
+            ])
+            .arg(&source)
+            .arg(&generation)
+            .output()
+            .expect("run python3 over the published door's plan");
+        assert!(
+            out.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let env: std::collections::BTreeMap<String, String> =
+            serde_json::from_slice(&out.stdout).expect("the plan reads back as JSON");
+        let kubectl = generation.join("bin/kubectl");
+        assert_eq!(
+            env.get(DOOR_KUBECTL_ENV).map(String::as_str),
+            kubectl.to_str(),
+            "the door must hand the CLI its validated kubectl under the name the CLI reads"
+        );
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/usr/bin:/bin"),
+            "nothing of the generation (and nothing inherited) may be on the CLI's PATH"
+        );
+        assert_eq!(
+            kubectl_program_from(env.get(DOOR_KUBECTL_ENV).cloned()),
+            kubectl.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn a_host_without_the_door_runs_kubectl_by_name() {
+        assert_eq!(kubectl_program_from(None), "kubectl");
+        assert_eq!(kubectl_program_from(Some(String::new())), "kubectl");
+        assert_eq!(
+            kubectl_program_from(Some("/gen/bin/kubectl".into())),
+            "/gen/bin/kubectl"
+        );
     }
 
     #[test]

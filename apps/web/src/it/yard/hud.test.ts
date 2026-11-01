@@ -6,6 +6,8 @@ import {
   headerOf,
   machineHref,
   machinesBoard,
+  NEEDS_YOU_LIMIT,
+  NEEDS_YOU_URL,
   needsYouBoard,
   nextUpBoard,
   outranksBoard,
@@ -269,7 +271,7 @@ describe('NEEDS YOU — /api/jobs/assignments?for=me, the viewer and every alias
 
   it('nothing assigned is said in words, naming whom it read for', () => {
     expect(needsYouBoard(needs([]), NOW)).toEqual({
-      kind: 'empty', count: { kind: 'zero' }, words: 'Nothing needs you.', whom: 'emp-david · platform-admin',
+      kind: 'empty', count: { kind: 'zero' }, words: 'Nothing needs you.', whom: 'emp-david · platform-admin', cut: null,
     });
   });
 
@@ -278,6 +280,49 @@ describe('NEEDS YOU — /api/jobs/assignments?for=me, the viewer and every alias
     // no-selector empty list; only the `for` block says it was honoured.
     expect(() => parseNeedsYou({ data: [], total: 0 })).toThrow(/does not answer for=me/);
     expect(() => parseNeedsYou([])).toThrow();
+  });
+
+  // Backlog 97b5cf45: the server says when its answer was cut
+  // (`truncated`, with `total` counted before the cut — 09074ada), and
+  // the row counted only the rows it got, so a cut queue read as a
+  // complete, smaller one.
+  it('a cut answer counts a floor and says it was cut — never a whole, smaller queue', () => {
+    const cut = (raw: Record<string, unknown>): Remote<NeedsYou> => ({ kind: 'ready', data: parseNeedsYou({ for: FOR, ...raw }) });
+    const two = [row({}, { id: 's-1' }), row({}, { id: 's-2' })];
+    const board = needsYouBoard(cut({ data: two, total: 7, truncated: true }), NOW);
+    if (board.kind !== 'rows') throw new Error(board.kind);
+    const why = '2 of at least 7 rows read — the answer was cut at its limit';
+    expect(board.cut).toBe(why);
+    expect(board.count).toEqual({ kind: 'floor', text: '2', troubled: false, why });
+    // The flag alone is enough: a store read that came back full makes
+    // the count a floor even when the rows fit.
+    const flagged = needsYouBoard(cut({ data: two, total: 2, truncated: true }), NOW);
+    if (flagged.kind !== 'rows') throw new Error(flagged.kind);
+    expect(flagged.cut).toBe('2 rows read and the answer was cut at its limit — how many more is unknown');
+    expect(flagged.count.kind).toBe('floor');
+    // A whole answer is a plain count, and says nothing about a cut.
+    const whole = needsYouBoard(cut({ data: two, total: 2, truncated: false }), NOW);
+    if (whole.kind !== 'rows') throw new Error(whole.kind);
+    expect(whole.cut).toBeNull();
+    expect(whole.count).toEqual({ kind: 'value', text: '2', troubled: false });
+  });
+
+  it('a server older than the flag is cut when its rows fill the page, or it sends no total', () => {
+    const full = Array.from({ length: NEEDS_YOU_LIMIT }, (_, i) => row({}, { id: `s-${i}` }));
+    expect(parseNeedsYou({ data: full, total: NEEDS_YOU_LIMIT, for: FOR }).cut).toMatch(/cut at its limit/);
+    expect(parseNeedsYou({ data: [row()], for: FOR }).cut).toMatch(/cut at its limit/);
+    expect(parseNeedsYou({ data: [row()], total: 1, for: FOR }).cut).toBeNull();
+    expect(NEEDS_YOU_URL).toBe(`/api/jobs/assignments?for=me&limit=${NEEDS_YOU_LIMIT}`);
+  });
+
+  it('a cut answer with none of its read rows yours does not say nothing needs you', () => {
+    const board = needsYouBoard(
+      { kind: 'ready', data: parseNeedsYou({ data: [row({}, { assignee_id: 'agent-other' })], total: 4, truncated: true, for: FOR }) },
+      NOW,
+    );
+    if (board.kind !== 'empty') throw new Error(board.kind);
+    expect(board.words).toBe('None of the rows read needs you, but the answer was cut — more may.');
+    expect(board.count).toEqual({ kind: 'floor', text: '0', troubled: false, why: '1 of at least 4 rows read — the answer was cut at its limit' });
   });
 
   it('a failed read, and one not landed yet, are unread with the reason', () => {

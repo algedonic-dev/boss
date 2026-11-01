@@ -199,44 +199,6 @@ export function waitingBlocks(
 }
 
 // ---------------------------------------------------------------------
-// The moving block: the real crossing rate, replayed ×60.
-// ---------------------------------------------------------------------
-
-/** The replay: one real minute is one second on screen. Stated on the
- *  page, because a moving block that did not say what it replays would
- *  read as an event. */
-export const REPLAY = 60;
-export const REPLAY_TEXT = 'a moving block is the section\'s measured 24h crossing rate, replayed ×60 — not an individual packet';
-/** Slower than one departure in this many screen seconds, a section
- *  draws no train: a block that crosses twice a minute reads as a stall,
- *  and the headway already prints the rate. */
-export const MAX_PERIOD_S = 30;
-/** The shortest crossing a block makes. A section busier than one
- *  departure per MIN_TRAVEL_S runs several blocks, staggered, so the
- *  departures still keep the rate rather than a flicker standing in
- *  for it. */
-export const MIN_TRAVEL_S = 1.2;
-const MAX_TRAINS = 6;
-
-/** A section's trains: each crosses in `dur` seconds, looping, and
- *  `begins` staggers them one period apart — so ONE departure every
- *  86400 / rate / REPLAY seconds, the section's real rate. Null where
- *  nothing should move: under reduced motion, and wherever the server
- *  does not say work crosses (held, cannot tell, unread, empty). */
-export function trainsOf(
-  b: Border | undefined,
-  reduced: boolean,
-): Readonly<{ dur: number; begins: ReadonlyArray<number> }> | null {
-  if (reduced || b === undefined || b.flowing !== true) return null;
-  const rate = b.rate.current;
-  if (rate === null || rate <= 0) return null;
-  const period = 86_400 / rate / REPLAY;
-  if (period > MAX_PERIOD_S) return null;
-  const k = Math.min(MAX_TRAINS, Math.ceil(MIN_TRAVEL_S / period));
-  return { dur: k * period, begins: Array.from({ length: k }, (_, i) => (i === 0 ? 0 : -i * period)) };
-}
-
-// ---------------------------------------------------------------------
 // The alarms board.
 // ---------------------------------------------------------------------
 

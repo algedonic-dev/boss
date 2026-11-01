@@ -33,10 +33,21 @@ const HUMAN_ONLY_REFUSAL = {
   human_only: true,
 };
 
+/// Key order is not content: the gateway hashes a canonical form.
+const sameRecord = (a: Record<string, unknown>, b: Record<string, unknown>): boolean => {
+  const canon = (o: Record<string, unknown>): string =>
+    JSON.stringify(Object.keys(o).sort().map((k) => [k, o[k]]));
+  return canon(a) === canon(b);
+};
+
 type Put = { ticket: string | undefined; body: Record<string, unknown> };
 type Seen = { puts: Put[]; patches: unknown[]; begins: unknown[]; finishes: number; asked: number };
 
-async function humanOnlyTask(page: Page, humanOnly: unknown): Promise<Seen> {
+async function humanOnlyTask(
+  page: Page,
+  humanOnly: unknown,
+  seeded: Readonly<Record<string, unknown>> = {},
+): Promise<Seen & { metadata: Record<string, unknown> }> {
   await page.addInitScript(() => {
     setInterval(() => document.querySelector('bun-hmr')?.remove(), 200);
     const buf = () => new Uint8Array([1, 2, 3]).buffer;
@@ -57,7 +68,7 @@ async function humanOnlyTask(page: Page, humanOnly: unknown): Promise<Seen> {
       },
     });
   });
-  const metadata: Record<string, unknown> = { flag: 'it-map-motion' };
+  const metadata: Record<string, unknown> = { flag: 'it-map-motion', ...seeded };
   if (humanOnly !== undefined) metadata.human_only = humanOnly;
   const step = {
     id: 's1', job_id: JOB_ID, title: 'Widen the flight', kind: 'task', spec_slug: 'widen',
@@ -72,7 +83,9 @@ async function humanOnlyTask(page: Page, humanOnly: unknown): Promise<Seen> {
     priority: 'standard', simulated: false, tags: [],
     subject: { subject_kind: 'custom', id: 'it-map-motion' }, metadata: {},
   };
-  const seen: Seen = { puts: [], patches: [], begins: [], finishes: 0, asked: 0 };
+  const seen: Seen & { metadata: Record<string, unknown> } = {
+    puts: [], patches: [], begins: [], finishes: 0, asked: 0, metadata,
+  };
   const issued: string[] = [];
 
   await page.route('**/api/**', (r) => json(r, []));
@@ -89,12 +102,21 @@ async function humanOnlyTask(page: Page, humanOnly: unknown): Promise<Seen> {
   await page.route(new RegExp(`/api/jobs/${JOB_ID}$`), (r) => json(r, { ...job, steps: [step] }));
   await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/s1/metadata$`), (r) => {
     const patch = JSON.parse(r.request().postData() ?? '{}') as Record<string, unknown>;
-    seen.patches.push(patch);
+    // Another writer's merge (backlog ec1e1980) is not the page's.
+    if (!r.request().headers()['x-test-writer']) seen.patches.push(patch);
     Object.assign(step.metadata, patch);
     return json(r, step);
   });
   await page.route(/\/api\/auth\/passkey\/assert\/begin$/, (r) => {
-    seen.begins.push(JSON.parse(r.request().postData() ?? '{}'));
+    const begin = JSON.parse(r.request().postData() ?? '{}') as {
+      shown?: { title: string; metadata: Record<string, unknown> };
+    };
+    seen.begins.push(begin);
+    // The gateway's shown_mismatch: a begin whose shown step is not the
+    // step as it stands is refused, 412 (fd7090cc).
+    if (!sameRecord(begin.shown?.metadata ?? {}, step.metadata)) {
+      return json(r, { error: 'this step changed since it was shown — reload it and read it again before approving' }, 412);
+    }
     return json(r, {
       challenge_id: `chal-${seen.begins.length}`,
       publicKey: { challenge: 'AAAA', rpId: 'localhost',
@@ -182,4 +204,45 @@ test('control: a task that is not human-only completes as before, with no passke
   expect(seen.begins).toEqual([]);
   expect(seen.finishes).toBe(0);
   expect(seen.puts.filter((p) => p.body.status === 'completed').length).toBe(1);
+});
+
+// Backlog ec1e1980: the passkey path saved the same stale answers as
+// every other gesture. A page drawn with `why` already answered re-sent
+// it on Complete, reverting a newer write — and that revert is what made
+// the ceremony's stale view match the record, so the passkey then signed
+// it. Now nothing the operator did not edit is sent, and the gateway's
+// own check (shown_mismatch) refuses a ceremony over a step that changed
+// since it was shown: the newer write stands, no tap is taken, and the
+// re-read puts the record's value in the untouched box, so a second
+// Complete signs what actually stands.
+test('a passkey Complete on a page left open sends no stale answer and the newer write stands', async ({ page }) => {
+  const seen = await humanOnlyTask(page, true, { why: 'as first drawn' });
+
+  await page.goto(`/ux/jobs/${JOB_ID}`);
+  const surface = page.locator('.sg-detail');
+  await expect(surface.locator('.step-ask textarea')).toHaveValue('as first drawn');
+
+  const status = await page.evaluate(async (job) => {
+    const r = await fetch(`/api/jobs/${job}/steps/s1/metadata`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'x-test-writer': 'reviewer' },
+      body: JSON.stringify({ why: 'the reviewer\'s newer answer' }),
+    });
+    return r.status;
+  }, JOB_ID);
+  expect(status).toBe(200);
+
+  await surface.locator('.step-ask').getByRole('button', { name: 'Complete' }).click();
+
+  await expect.poll(() => seen.begins.length).toBe(1);
+  const shown = (seen.begins[0] as { shown: { metadata: Record<string, unknown> } }).shown;
+  expect(shown.metadata['why'], 'the stale view reached the gateway, which refuses it')
+    .toBe('as first drawn');
+  await expect(surface.locator('.step-ask textarea')).toHaveValue('the reviewer\'s newer answer');
+  expect(seen.patches, 'the page wrote no answer the operator did not edit').toEqual([]);
+  expect(seen.metadata['why']).toBe('the reviewer\'s newer answer');
+  // No tap was taken and no completion was honoured.
+  expect(seen.finishes).toBe(0);
+  expect(seen.puts.some((p) => p.ticket)).toBe(false);
+  await expect(surface.locator('.step-status')).not.toHaveText('completed');
 });

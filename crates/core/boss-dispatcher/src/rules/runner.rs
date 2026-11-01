@@ -840,6 +840,64 @@ handler = "rec"
         assert_eq!(calls[0].event_timestamp, Some(at));
     }
 
+    /// A delayed rule never fires at match time (backlog 84a010cb). The
+    /// authoring validator refuses a `delay`, but an ACTIVE row is loaded
+    /// by `load_active_rules` -> `Rule::from_raw`, which never calls it:
+    /// a row written before car 4c706c5d, or by any door that skips the
+    /// validator, used to match and run its handlers on the triggering
+    /// event — a seven-day follow-up admitted the same second. Until the
+    /// durable delayed-admission contract (design f1d66249) executes the
+    /// delay, the runner refuses the rule loudly and fires nothing.
+    #[tokio::test]
+    async fn handle_never_fires_a_delayed_rule_at_match_time() {
+        let toml = r#"
+[[rule]]
+name = "follow-up-after-silence"
+on_event = "jobs.job.created"
+delay = "7d"
+[[rule.do]]
+handler = "rec"
+
+[[rule]]
+name = "immediate-neighbour"
+on_event = "jobs.job.created"
+[[rule.do]]
+handler = "rec"
+"#;
+        let recorder = handler::RecordingHandler::new("rec");
+        let mut handlers = HandlerRegistry::new();
+        handlers.register(recorder.clone());
+        let runner = RulesRunner {
+            registry: Registry::from_toml(toml).unwrap(),
+            handlers,
+            helpers: Arc::new(NoHelpers),
+            dead_letters: None,
+            live: None,
+            firings: None,
+        };
+        let res = runner
+            .handle(
+                "jobs.job.created",
+                "evt-inquiry",
+                &serde_json::json!({"id": "j-1"}),
+                FIRST,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(res, boss_nats::durable::Settle::Ack),
+            "a refused delayed rule is permanent, never a retry: {}",
+            settle_name(&res)
+        );
+        // Positive control: the immediate neighbour on the same topic
+        // still fires, exactly once — and the delayed rule adds nothing.
+        assert_eq!(
+            recorder.calls().await.len(),
+            1,
+            "only the immediate rule's handler ran; the delayed one fired at match time"
+        );
+    }
+
     struct FixedHandler {
         name: &'static str,
         result: fn() -> Result<(), crate::rules::handler::HandlerError>,

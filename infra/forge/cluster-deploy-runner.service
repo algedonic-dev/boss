@@ -74,6 +74,13 @@ Environment=HOST_ID=forge
 # installed unit's spool to prove the probe account cannot make it, and
 # the_converge_runs_as_root_from_roots_tree.rs holds the two equal.
 Environment=ALERT_SPOOL=/var/lib/boss/converge/alert-spool
+# WHO ASKED FOR THIS RUN (backlog e4d51e12). The `converge` verb
+# (converge-now.sh) writes the requesting ops-request's id here and THEN
+# starts this unit, so the wrap below reads it before the runner takes
+# it, and the packet it opens names the request rather than the timer.
+# forge-defaults.sh's CONVERGE_REQUESTS — held equal by
+# a_requested_converge_names_its_request.rs.
+Environment=BOSS_WRAP_REQUESTS=/var/lib/boss/converge/requests
 # `-`: the packet is visibility, never a precondition. This is the loop
 # that deploys a fix to the SoR, so it cannot wait on the SoR — not while
 # it is dark (2026-09-05) and not while it answers 503 on a policy outage

@@ -61,6 +61,21 @@ const SITE_PATH_VALUE =
 // Each allowed site, as the exact line it is, and why it stays.
 const ALLOWED: ReadonlyArray<Readonly<{ file: string; line: string; why: string }>> = [
   {
+    file: 'browser-observation.js',
+    line: 'child.srcdoc = ${JSON.stringify(innerDocument)};',
+    why: 'only hash-bound public renderer and suite bytes execute in an opaque allow-scripts child; its opaque parent fences navigation with frame-src about: (ec6fc29a)',
+  },
+  {
+    file: 'browser-observation.js',
+    line: `frame.srcdoc = '<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + CSP + '; frame-src about:' + '"></head><body>'`,
+    why: 'the outer opaque allow-scripts frame contains only the local encoded relay and restrictive CSP; browser isolation controls exercise the separate child boundary (ec6fc29a)',
+  },
+  {
+    file: 'browser-observation.js',
+    line: "canary.src = 'data:text/html,blocked-navigation-canary';",
+    why: 'a fixed inert data document must be refused by wrapper frame-src before public bytes run; no metadata or executable content enters this URL (ec6fc29a)',
+  },
+  {
     file: 'answer-question.js',
     line: 'inner.innerHTML = renderMarkdown(ctx);',
     why: 'the bundle-local renderMarkdown escapes the whole text first and emits only its own tags, links http(s) only',
@@ -170,6 +185,23 @@ describe('step plugins draw page text as text', () => {
       '// a.href = x is how it used to read',
     ]) {
       expect(urlSinkLines('fixture.js', safe)).toEqual([]);
+    }
+  });
+
+  test('observation trust is limited to its exact sandbox and canary sites', () => {
+    for (const planted of [
+      'child.srcdoc = metadata.html;',
+      'frame.srcdoc = metadata.html;',
+      'other.srcdoc = innerDocument;',
+    ]) {
+      expect(sinkLines('browser-observation.js', planted)).toEqual([planted]);
+    }
+    for (const planted of [
+      'canary.src = metadata.url;',
+      "canary.src = 'data:text/html,' + metadata.html;",
+      "frame.src = 'https://foreign.invalid';",
+    ]) {
+      expect(urlSinkLines('browser-observation.js', planted)).toEqual([planted]);
     }
   });
 

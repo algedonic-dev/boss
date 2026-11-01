@@ -39,7 +39,9 @@ pub(super) trait Forge: Send + Sync {
     /// The branch's head sha right now, or Ok(None) when the branch is
     /// not there (404). The sweep's head guard reads this: a landed
     /// car's branch is only deletable while it still points at what
-    /// boarded.
+    /// boarded. Ok(None) is ONLY a 404: a success that names no head is
+    /// an error carrying its status and body, because the sweep reads
+    /// None after a DELETE as the branch observed gone (backlog 283e6020).
     async fn branch_head(&self, branch: &str) -> Result<Option<String>>;
     /// Cancel the still-running CI runs belonging to this train, and
     /// say how many were cancelled.
@@ -71,6 +73,28 @@ pub(crate) fn repo_path(url: &str) -> String {
     let name = segs.next().unwrap_or_default();
     let owner = segs.next().unwrap_or_default();
     format!("{owner}/{name}")
+}
+
+/// The head a SUCCESSFUL branch read names at JSON `pointer`
+/// (`/commit/id` on Forgejo, `/object/sha` on GitHub), or an error that
+/// carries `what` (the request and its status) and the whole body.
+///
+/// Backlog 283e6020: both adapters used to filter a missing, null,
+/// non-string or empty identity down to `Ok(None)` — the same answer as
+/// a 404 — and the sweep reads `None` after a DELETE as the branch
+/// observed gone. A success naming no head says nothing about where the
+/// ref stands, so it is unknown, never absent.
+pub(crate) fn head_at(body: &str, pointer: &str, what: &str) -> Result<String> {
+    let field = pointer.trim_start_matches('/').replace('/', ".");
+    let v: Value = serde_json::from_str(body)
+        .with_context(|| format!("{what}: parsing the response: {}", body.trim()))?;
+    match v.pointer(pointer).and_then(Value::as_str) {
+        Some(head) if !head.is_empty() => Ok(head.to_string()),
+        _ => bail!(
+            "{what}: a success naming no {field} — the branch's state is unknown, not absent: {}",
+            body.trim()
+        ),
+    }
 }
 
 struct GitHubForge {
@@ -154,13 +178,14 @@ impl Forge for GitHubForge {
             }
             bail!("gh api {path}: {}", stderr.trim());
         }
-        let v: Value =
-            serde_json::from_str(&stdout_str(&r)).context("parsing gh api git/ref output")?;
-        Ok(v.get("object")
-            .and_then(|o| o.get("sha"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string))
+        // Only the 404 above is absence; a success naming no head is
+        // unknown (backlog 283e6020).
+        head_at(
+            &stdout_str(&r),
+            "/object/sha",
+            &format!("gh api {path} (exit 0)"),
+        )
+        .map(Some)
     }
 
     /// GitHub keys runs by head sha, which `gh run list --commit`
@@ -215,7 +240,10 @@ impl Forge for GitHubForge {
 /// same-repo (no fork dance): the train branch pushes to the one
 /// repo, the PR head is the bare branch name, and car branches get
 /// deleted from that same repo at arrival.
-struct ForgejoForge {
+///
+/// `pub(super)` with `finish` so the conductor's sweep tests can drive
+/// the REAL adapter against a local forge (backlog 283e6020).
+pub(super) struct ForgejoForge {
     base: String,
     repo: String,
     token: String,
@@ -248,7 +276,7 @@ impl ForgejoForge {
     /// default of honouring `HTTP_PROXY`/`ALL_PROXY` would hand that token,
     /// in cleartext, to whatever proxy the conductor's environment named.
     /// A forge request goes where its URL says or not at all.
-    fn finish(
+    pub(super) fn finish(
         base: String,
         repo: String,
         token: String,
@@ -603,20 +631,16 @@ impl Forge for ForgejoForge {
             return Ok(None);
         }
         let body = resp.text().await?;
+        let what = format!(
+            "forge GET /repos/{}/branches/{branch}: HTTP {status}",
+            self.repo
+        );
         if !status.is_success() {
-            bail!(
-                "forge GET /repos/{}/branches/{branch}: HTTP {status}: {}",
-                self.repo,
-                body.trim()
-            );
+            bail!("{what}: {}", body.trim());
         }
-        let v: Value = serde_json::from_str(&body)
-            .with_context(|| format!("parsing forge branches/{branch} response"))?;
-        Ok(v.get("commit")
-            .and_then(|c| c.get("id"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string))
+        // Only the 404 above is absence; a success naming no head is
+        // unknown (backlog 283e6020).
+        head_at(&body, "/commit/id", &what).map(Some)
     }
 
     /// List the repo's recent runs, pick this train's still-active
@@ -860,6 +884,16 @@ mod tests {
     /// Accept one connection on `listener`, send its request head
     /// (lowercased) down the channel, answer 200 with an empty JSON list.
     fn answer_once(listener: std::net::TcpListener) -> std::sync::mpsc::Receiver<String> {
+        answer_once_with(listener, "200 OK", "[]")
+    }
+
+    /// `answer_once` with the status line and body the test names — the
+    /// forge's side of one real HTTP exchange with the adapter.
+    fn answer_once_with(
+        listener: std::net::TcpListener,
+        status: &'static str,
+        body: &'static str,
+    ) -> std::sync::mpsc::Receiver<String> {
         use std::io::{Read, Write};
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -875,10 +909,135 @@ mod tests {
                 }
             }
             let _ = tx.send(String::from_utf8_lossy(&head).to_lowercase());
-            let _ = sock
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n[]");
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
         });
         rx
+    }
+
+    /// What the REAL Forgejo adapter's `branch_head` answers when the
+    /// forge says `status` + `body` for `GET branches/feat/x`.
+    async fn forgejo_branch_head(
+        status: &'static str,
+        body: &'static str,
+    ) -> Result<Option<String>> {
+        let forge = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", forge.local_addr().unwrap());
+        let _saw = answer_once_with(forge, status, body);
+        ForgejoForge::finish(
+            base,
+            "david/boss".into(),
+            "t".into(),
+            reqwest::Client::builder(),
+        )
+        .unwrap()
+        .branch_head("feat/x")
+        .await
+    }
+
+    // ---- a branch read is absent only on 404 ------------------------
+
+    /// Backlog 283e6020. `branch_head`'s `Ok(None)` is the sweep's
+    /// evidence that a branch is OFF the forge: read after a DELETE it is
+    /// recorded as `deleted` and lets the train be stamped swept. Until
+    /// this car a 200 whose JSON named no usable `commit.id` collapsed
+    /// into that same `None`, so a forge answering in a shape this code
+    /// did not expect settled the sweep without anyone knowing where the
+    /// ref stood. A success that names no head is UNKNOWN, an error that
+    /// carries the status and the body; only a 404 is absence.
+    #[tokio::test]
+    async fn a_forgejo_success_naming_no_head_is_unknown_not_absent() {
+        const SHA: &str = "c8ccb133770f6507422a7d2438261213e9e897ce";
+        // The positives this must keep: a head, and a real 404.
+        assert_eq!(
+            forgejo_branch_head(
+                "200 OK",
+                r#"{"name":"feat/x","commit":{"id":"c8ccb133770f6507422a7d2438261213e9e897ce"}}"#
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some(SHA)
+        );
+        assert_eq!(
+            forgejo_branch_head("404 Not Found", r#"{"message":"branch does not exist"}"#)
+                .await
+                .unwrap(),
+            None
+        );
+        // The failures this already had: another non-2xx, and a body
+        // that is not JSON.
+        assert!(
+            forgejo_branch_head("500 Internal Server Error", "boom")
+                .await
+                .is_err()
+        );
+        assert!(forgejo_branch_head("200 OK", "<html>").await.is_err());
+        // Every malformed success: missing, null, scalar, empty identity.
+        for body in [
+            r#"{"name":"feat/x"}"#,
+            r#"{"name":"feat/x","commit":null}"#,
+            r#"{"name":"feat/x","commit":"c8ccb133"}"#,
+            r#"{"name":"feat/x","commit":{}}"#,
+            r#"{"name":"feat/x","commit":{"id":null}}"#,
+            r#"{"name":"feat/x","commit":{"id":7}}"#,
+            r#"{"name":"feat/x","commit":{"id":""}}"#,
+            r#"[]"#,
+            r#"null"#,
+        ] {
+            let got = forgejo_branch_head("200 OK", body).await;
+            let Err(e) = got else {
+                panic!("a 200 naming no head read as {got:?} for {body}");
+            };
+            let said = format!("{e:#}");
+            assert!(
+                said.contains("200") && said.contains(body) && said.contains("commit.id"),
+                "the error must carry the status, the body and the field it lacked: {said}"
+            );
+        }
+    }
+
+    /// The GitHub adapter's decode of a SUCCESSFUL `gh api git/ref/...`
+    /// (exit 0): the same rule over `object.sha`. The `gh` call itself is
+    /// a subprocess no unit test may stand in for without editing the
+    /// process's PATH under its siblings, so this pins the step that
+    /// turns its stdout into the answer.
+    #[test]
+    fn a_github_success_naming_no_head_is_unknown_not_absent() {
+        const SHA: &str = "c8ccb133770f6507422a7d2438261213e9e897ce";
+        let ok =
+            format!(r#"{{"ref":"refs/heads/feat/x","object":{{"sha":"{SHA}","type":"commit"}}}}"#);
+        assert_eq!(head_at(&ok, "/object/sha", "gh api").unwrap(), SHA);
+        assert!(head_at("not json", "/object/sha", "gh api").is_err());
+        for body in [
+            r#"{"ref":"refs/heads/feat/x"}"#,
+            r#"{"ref":"refs/heads/feat/x","object":null}"#,
+            r#"{"ref":"refs/heads/feat/x","object":"c8ccb133"}"#,
+            r#"{"ref":"refs/heads/feat/x","object":{}}"#,
+            r#"{"ref":"refs/heads/feat/x","object":{"sha":null}}"#,
+            r#"{"ref":"refs/heads/feat/x","object":{"sha":7}}"#,
+            r#"{"ref":"refs/heads/feat/x","object":{"sha":""}}"#,
+            r#"[]"#,
+        ] {
+            let got = head_at(
+                body,
+                "/object/sha",
+                "gh api repos/o/r/git/ref/heads/feat/x (exit 0)",
+            );
+            let Err(e) = got else {
+                panic!("a successful read naming no head read as {got:?} for {body}");
+            };
+            let said = format!("{e:#}");
+            assert!(
+                said.contains("exit 0") && said.contains(body) && said.contains("object.sha"),
+                "the error must carry the status, the body and the field it lacked: {said}"
+            );
+        }
     }
 
     /// What the forge and a proxy each saw of one request, `send` given

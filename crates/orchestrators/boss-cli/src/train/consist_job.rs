@@ -10,11 +10,12 @@ const WORKER: &str = include_str!("consist_worker.py");
 const JOB_TEMPLATE: &str = include_str!("../../../../../infra/consist-worker/job.json");
 const GATE_RUNNER: &str = include_str!("../../../../../infra/gate-runner/gate-runner.yaml");
 const SERVICE_ACCOUNT_ROOT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+const KUBECTL: &str = "/usr/local/bin/kubectl";
 // Held equal to the deployment by the owning source contract test. Keep
 // the controller's runtime image independent of a candidate checkout.
 pub(super) const CONTROLLER_IDENTITY: &str = "system:serviceaccount:boss-dev:boss-conductor";
 
-fn session_config(host: &str, port: &str) -> Result<Value> {
+fn session_config(host: &str, port: &str, account_root: &Path) -> Result<Value> {
     let port: u16 = port
         .parse()
         .context("cluster HTTPS port is absent or invalid")?;
@@ -47,8 +48,8 @@ fn session_config(host: &str, port: &str) -> Result<Value> {
     };
     Ok(
         json!({"apiVersion":"v1","kind":"Config","current-context":"consist-controller",
-        "clusters":[{"name":"existing-cluster","cluster":{"server":format!("https://{authority}:{port}"),"certificate-authority":format!("{SERVICE_ACCOUNT_ROOT}/ca.crt")}}],
-        "users":[{"name":"existing-session","user":{"tokenFile":format!("{SERVICE_ACCOUNT_ROOT}/token")}}],
+        "clusters":[{"name":"existing-cluster","cluster":{"server":format!("https://{authority}:{port}"),"certificate-authority":account_root.join("ca.crt")}}],
+        "users":[{"name":"existing-session","user":{"tokenFile":account_root.join("token")}}],
         "contexts":[{"name":"consist-controller","context":{"cluster":"existing-cluster","user":"existing-session","namespace":"boss-dev"}}]}),
     )
 }
@@ -61,28 +62,49 @@ fn check_session_identity(identity: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Where the controller's kubectl and its mounted session live. Production
+/// reads the pod's own mount and service env; a test hands a stand-in, so
+/// what a session journals can be measured rather than assumed (daab12f4).
+pub(super) struct Native {
+    program: std::path::PathBuf,
+    account_root: std::path::PathBuf,
+    host: String,
+    port: String,
+}
+
+impl Native {
+    fn mounted() -> Result<Self> {
+        Ok(Self {
+            program: KUBECTL.into(),
+            account_root: SERVICE_ACCOUNT_ROOT.into(),
+            host: std::env::var("KUBERNETES_SERVICE_HOST")
+                .context("cluster service host is absent; no default target")?,
+            port: std::env::var("KUBERNETES_SERVICE_PORT_HTTPS")
+                .context("cluster HTTPS port is absent; no default target")?,
+        })
+    }
+}
+
 pub(super) struct ConsistControl {
     config: tempfile::NamedTempFile,
     recording: Option<std::path::PathBuf>,
+    program: std::path::PathBuf,
 }
 
 impl ConsistControl {
     fn existing_session() -> Result<Self> {
-        Self::session(None)
+        Self::session(&Native::mounted()?, None)
     }
 
     pub(super) fn recorded_session(path: &Path) -> Result<Self> {
-        Self::session(Some(super::diagnostic_journal::private_directory(path)?))
+        let recording = super::diagnostic_journal::private_directory(path)?;
+        Self::session(&Native::mounted()?, Some(recording))
     }
 
-    fn session(recording: Option<std::path::PathBuf>) -> Result<Self> {
-        let host = std::env::var("KUBERNETES_SERVICE_HOST")
-            .context("cluster service host is absent; no default target")?;
-        let port = std::env::var("KUBERNETES_SERVICE_PORT_HTTPS")
-            .context("cluster HTTPS port is absent; no default target")?;
-        let config = session_config(&host, &port)?;
+    fn session(native: &Native, recording: Option<std::path::PathBuf>) -> Result<Self> {
+        let config = session_config(&native.host, &native.port, &native.account_root)?;
         for file in ["token", "ca.crt"] {
-            if !Path::new(SERVICE_ACCOUNT_ROOT).join(file).is_file() {
+            if !native.account_root.join(file).is_file() {
                 bail!("existing mounted ServiceAccount {file} is unavailable");
             }
         }
@@ -95,6 +117,7 @@ impl ConsistControl {
         let control = Self {
             config: file,
             recording,
+            program: native.program.clone(),
         };
         let identity = control.json(&["auth", "whoami", "-o", "json"])?;
         check_session_identity(&identity)?;
@@ -111,7 +134,7 @@ impl ConsistControl {
     }
 
     fn command(&self) -> std::process::Command {
-        let mut command = std::process::Command::new("/usr/local/bin/kubectl");
+        let mut command = std::process::Command::new(&self.program);
         command
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -271,7 +294,24 @@ pub(super) fn diagnostic_manifest(
 }
 
 pub(super) fn diagnostic_identity(path: &Path, check_capacity: bool) -> Result<String> {
-    let control = ConsistControl::recorded_session(path)?;
+    diagnostic_identity_on(path, check_capacity, Native::mounted)
+}
+
+fn diagnostic_identity_on(
+    path: &Path,
+    check_capacity: bool,
+    native: impl FnOnce() -> Result<Native>,
+) -> Result<String> {
+    // The request's journal must still be a private owned directory, but
+    // this per-pass gate is not journaled into it: every pass recorded its
+    // kubectl rows INTO the request it served, so a request open long
+    // enough spent its whole complete-read budget on elapsed time and went
+    // UNKNOWN (4096 rows on assessment 28e96fbc, 2026-10-17, backlog
+    // daab12f4). Each observation is logged in full by json(); the sessions
+    // that carry evidence (create, observe, the native census) still journal
+    // their own identity beside it.
+    super::diagnostic_journal::private_directory(path)?;
+    let control = ConsistControl::session(&native()?, None)?;
     let identity = control.json(&["auth", "whoami", "-o", "json"])?;
     check_session_identity(&identity)?;
     if check_capacity {
@@ -829,7 +869,12 @@ mod tests {
 
     #[test]
     fn the_consist_client_binds_validation_and_authentication_to_one_context() {
-        let config = session_config("kubernetes.default.svc", "443").unwrap();
+        let config = session_config(
+            "kubernetes.default.svc",
+            "443",
+            Path::new(SERVICE_ACCOUNT_ROOT),
+        )
+        .unwrap();
         assert_eq!(config["current-context"], "consist-controller");
         assert_eq!(
             config["clusters"][0]["cluster"]["server"],
@@ -856,7 +901,7 @@ mod tests {
             ("kubernetes.default.svc", "443/path"),
         ] {
             assert!(
-                session_config(host, port).is_err(),
+                session_config(host, port, Path::new(SERVICE_ACCOUNT_ROOT)).is_err(),
                 "unsafe endpoint {host}:{port}"
             );
         }
@@ -904,6 +949,7 @@ mod tests {
         let control = ConsistControl {
             config: file,
             recording: None,
+            program: KUBECTL.into(),
         };
         let command = control.command();
         assert_eq!(command.get_program(), "/usr/local/bin/kubectl");
@@ -927,6 +973,78 @@ mod tests {
             std::ffi::OsStr::new("PATH"),
             Some(std::ffi::OsStr::new("/usr/bin:/bin"))
         )));
+    }
+
+    /// A stand-in cluster session: a kubectl that answers the controller's
+    /// identity, its authority and an empty capacity census, and a mount
+    /// holding the two files a session requires. Nothing else answers.
+    fn stand_in_native(name: &str) -> Native {
+        let dir = boss_testing::scratch_dir(name);
+        let account_root = dir.join("serviceaccount");
+        std::fs::create_dir_all(&account_root).unwrap();
+        for file in ["token", "ca.crt"] {
+            std::fs::write(account_root.join(file), b"stand-in").unwrap();
+        }
+        let program = dir.join("kubectl");
+        boss_testing::write_exec(
+            &program,
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in\n*'auth whoami'*) printf '%s\\n' '{{\"status\":{{\"userInfo\":{{\"username\":\"{CONTROLLER_IDENTITY}\"}}}}}}' ;;\n*'auth can-i create jobs'*) printf 'yes\\n' ;;\n*'get jobs'*) printf '%s\\n' '{{\"items\":[]}}' ;;\n*) exit 9 ;;\nesac\n"
+            ),
+        );
+        Native {
+            program,
+            account_root,
+            host: "10.0.0.1".into(),
+            port: "443".into(),
+        }
+    }
+
+    fn journal_files(path: &Path) -> (usize, usize) {
+        let pending = path.join("pending");
+        let count = |dir: &Path| {
+            std::fs::read_dir(dir).map_or(0, |entries| {
+                entries
+                    .filter(|entry| entry.as_ref().unwrap().path().is_file())
+                    .count()
+            })
+        };
+        (count(path), count(&pending))
+    }
+
+    /// Backlog daab12f4 (measured 2026-10-17 on assessment 28e96fbc): every
+    /// pass's identity check journaled its kubectl invocations INTO the
+    /// request it served, so a request open long enough filled its own
+    /// complete-read budget from elapsed time alone and went UNKNOWN. The
+    /// per-pass gate is observed and logged, never journaled into the
+    /// request: however many passes run, the request's files do not move.
+    #[test]
+    fn a_per_pass_identity_check_spends_nothing_of_the_request_it_serves() {
+        let root = tempfile::tempdir().unwrap();
+        let journal =
+            super::super::diagnostic_journal::private_directory(&root.path().join("request"))
+                .unwrap();
+        super::super::diagnostic_journal::keep(&journal, &json!({"original":"prior evidence"}))
+            .unwrap();
+        let before = journal_files(&journal);
+        let native = || Ok(stand_in_native("per-pass-identity"));
+        for check_capacity in [false, true, false, true] {
+            assert_eq!(
+                diagnostic_identity_on(&journal, check_capacity, native).unwrap(),
+                CONTROLLER_IDENTITY
+            );
+        }
+        assert_eq!(
+            journal_files(&journal),
+            before,
+            "per-pass identity checks wrote into the served request's journal"
+        );
+        assert_eq!(
+            super::super::diagnostic_journal::originals(&journal)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     fn receipt() -> Value {

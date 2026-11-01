@@ -183,7 +183,7 @@ fn conductor_machine(h: Option<&ConductorHealth>) -> Machine {
 }
 
 /// A STATION THE SERVER CANNOT JUDGE: within its WIP limit, with flow
-/// the cube is blind to — the `(false, None)` arm below, which draws the
+/// the membership reader could not count — the `(false, None)` arm below, which draws the
 /// `?` glyph. Marshalling's header counts these ("2 stations
 /// unjudged", design 62de32ae decision 11) so that blindness is itself
 /// a number; the test
@@ -194,8 +194,8 @@ pub(super) fn unjudged(s: &StationReading) -> bool {
 }
 
 /// THE STATIONS. Each is a registry row this process evaluated, so its
-/// presence is a fact and an empty one is genuinely idle. Flow the cube
-/// is blind to is unknown, not zero: a station holding work whose
+/// presence is a fact and an empty one is genuinely idle. Flow the reader
+/// could not count is unknown, not zero: a station holding work whose
 /// movement nobody can count is exactly the case an idle glyph would
 /// lie about.
 fn station_machines(inputs: &RegionInputs<'_>) -> Vec<Machine> {
@@ -214,25 +214,44 @@ fn station_machines(inputs: &RegionInputs<'_>) -> Vec<Machine> {
             let (state, why) = match (s.over_limit, s.served) {
                 (true, _) => (
                     MachineState::Failed,
-                    s.flow_blind.map_or_else(
+                    s.flow_unread.as_deref().map_or_else(
                         || format!("{held} standing — over its WIP limit"),
-                        |blind| format!("{held} standing — over its WIP limit; {}", blind.reason()),
+                        |why| format!("{held} standing — over its WIP limit; {why}"),
                     ),
                 ),
                 (false, None) => (
                     MachineState::Unknown,
                     format!(
                         "{held} standing — {}",
-                        s.flow_blind.map_or(
-                            "the flow cube is blind to this station's predicate, so whether it moves cannot be told",
-                            crate::station_flow::FlowBlind::reason,
+                        s.flow_unread.as_deref().unwrap_or(
+                            "this station's flow was not read, so whether it moves cannot be told"
                         )
                     ),
                 ),
-                (false, Some(0)) if held > 0 => (
-                    MachineState::Failed,
-                    format!("{held} standing and nothing served in the window — not draining"),
-                ),
+                // Nothing served: judged on what stands there, by the
+                // region's own rule (backlog 6254e602) — a station whose
+                // every step waits on its named owner inside its declared
+                // bound is not a failed machine, only a quiet one.
+                (false, Some(0)) if held > 0 => match super::marshalling::station_wait(
+                    s,
+                    inputs.internal_protocols,
+                    inputs.now,
+                ) {
+                    Ok(waits) => (
+                        MachineState::Idle,
+                        format!(
+                            "{held} standing and nothing served in the window — waiting on named owners inside their declared bounds: {}",
+                            super::marshalling::waits_text(&waits)
+                        ),
+                    ),
+                    Err(why) => (
+                        MachineState::Failed,
+                        format!(
+                            "{held} standing and nothing served in the window — not draining: {}",
+                            super::marshalling::capped(&why)
+                        ),
+                    ),
+                },
                 (false, Some(n)) if n > 0 => (
                     MachineState::Running,
                     format!("{n} served in the window, {held} standing"),
@@ -736,27 +755,30 @@ mod tests {
                 over_limit: false,
                 members: vec!["a".into(), "b".into()],
                 served: None,
-                flow_blind: None,
+                flow_unread: None,
                 previous_served: None,
                 opened: Default::default(),
+                standing: Vec::new(),
             },
             StationReading {
                 name: "backlog".into(),
                 over_limit: true,
                 members: vec!["c".into()],
                 served: Some(3),
-                flow_blind: None,
+                flow_unread: None,
                 previous_served: Some(2),
                 opened: Default::default(),
+                standing: Vec::new(),
             },
             StationReading {
                 name: "quiet".into(),
                 over_limit: false,
                 members: vec![],
                 served: Some(0),
-                flow_blind: None,
+                flow_unread: None,
                 previous_served: Some(0),
                 opened: Default::default(),
+                standing: Vec::new(),
             },
         ];
         let out = regions(&inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&rows)));
@@ -776,22 +798,19 @@ mod tests {
 
     #[test]
     fn each_original_flow_refusal_survives_empty_and_over_limit_machine_readings() {
-        use crate::station_flow::FlowBlind;
         let status = empty_status();
-        for blind in [
-            FlowBlind::NoStepClause,
-            FlowBlind::StatusIsNotAWait,
-            FlowBlind::JobMetadataClause,
-            FlowBlind::JobTagsClause,
-            FlowBlind::SelfBound,
-            FlowBlind::StepAssigneeClause,
-            FlowBlind::StepMetadataBeyondRole,
+        // The membership reader's own words: a bound it refused, and an
+        // unknown span it could not count.
+        for why in [
+            "native membership starting state exceeds row bound",
+            "native membership starting state exceeds byte bound",
+            "committed original membership or registry facts await audit relay",
         ] {
             for over_limit in [false, true] {
                 let rows = [StationReading {
                     name: "refused-flow".into(),
                     over_limit,
-                    flow_blind: Some(blind),
+                    flow_unread: Some(why.into()),
                     ..Default::default()
                 }];
                 let out = regions(&inputs(&status, &[], &[], &[], &[], Some(&[]), Some(&rows)));
@@ -808,7 +827,7 @@ mod tests {
                         MachineState::Unknown
                     }
                 );
-                assert!(station.why.contains(blind.reason()), "{blind:?}");
+                assert!(station.why.contains(why), "{why:?}");
                 assert_eq!(station.why.contains("over its WIP limit"), over_limit);
             }
         }

@@ -39,7 +39,7 @@ fn recorded_gate_wait(
         Some(Ok(spec))
             if spec.kind == run.kind
                 && spec.version == run.workflow_version
-                && spec.status != crate::registry::WorkflowStatus::Draft =>
+                && spec.status.was_published() =>
         {
             spec
         }
@@ -188,6 +188,27 @@ pub(super) fn gates(inputs: &RegionInputs<'_>, w: &Windows, out: &[OutRail]) -> 
             "{active} of {capacity} bays in use, {} waiting for a slot",
             plural(g.queued.len(), "run", "runs")
         )
+    };
+    // MORE GATES THAN BAYS NAMES THE EXTRA RUN (backlog ac8d3157): the
+    // ones that started after the bays were full, latest last — the
+    // launches the bound should have refused. `at_capacity` turns the
+    // count itself into trouble; this says who to look at.
+    let bays = if capacity > 0 && active > capacity {
+        let mut by_start: Vec<&crate::yard::ActiveGate> = g.active.iter().collect();
+        by_start.sort_by_key(|a| started(a));
+        let extra: Vec<String> = by_start[capacity..]
+            .iter()
+            .map(|a| {
+                format!(
+                    "{} ({})",
+                    a.branch,
+                    &a.packet_id[..8.min(a.packet_id.len())]
+                )
+            })
+            .collect();
+        format!("{bays}, the extra: {}", extra.join(", "))
+    } else {
+        bays
     };
     let what = if under_test.is_empty() {
         bays
@@ -636,6 +657,32 @@ mod tests {
         assert_eq!(g.bound_kind, Some(BoundKind::Capacity));
         // The retired band cannot be named any more.
         assert!(bands::BANDS.iter().all(|b| b.id != "gates-at-bound"));
+    }
+
+    /// MORE GATES THAN BAYS IS TROUBLE, AND SAYS WHICH RUN IS EXTRA
+    /// (backlog ac8d3157, 0f4224bc acceptance line 5). On 2026-10-17 four
+    /// gates ran in three bays for 31 minutes and the region drew "4 of 3
+    /// bays in use" as full and moving. The extra run is the one that
+    /// started last — the launch the bound should have refused.
+    #[test]
+    fn more_gates_than_bays_is_troubled_and_names_the_extra_run() {
+        let mut status = every_bay("2026-09-19T11:20:00Z", &[]);
+        let mut extra = status.gates.active[2].clone();
+        extra.branch = "fix/the-extra-one".into();
+        extra.since = "2026-09-19T11:21:00Z".into();
+        status.gates.active.push(extra);
+        let g = read_gates(&status, &verdicts_until("2026-09-19T11:55:00Z"));
+        assert_eq!(g.state, RegionState::Troubled, "{}", g.why);
+        assert_eq!(g.band.as_ref().unwrap().id, bands::OVER_CAPACITY.id);
+        assert!(g.why.starts_with("4 of 3 bays in use"), "{}", g.why);
+        assert!(g.why.contains("the extra: fix/the-extra-one"), "{}", g.why);
+        assert!(!g.why.contains("the extra: fix/2"), "{}", g.why);
+        // At the bound the same sentence names no extra run.
+        let g = read_gates(
+            &every_bay("2026-09-19T11:20:00Z", &[]),
+            &verdicts_until("2026-09-19T11:55:00Z"),
+        );
+        assert!(!g.why.contains("the extra"), "{}", g.why);
     }
 
     /// Old admission/queue clocks do not make recently launched,

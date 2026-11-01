@@ -299,6 +299,12 @@ fn the_door_reads_metadata_only_through_a_readonly_mount() {
         .iter()
         .position(|a| *a == "alpine/k8s:1.33.3")
         .unwrap_or_else(|| panic!("the image ops_kubectl pulls, not a second one: {docker:?}"));
+    // It mounts the whole credential directory, so it keeps no container
+    // log — docker's option, before the image (backlog ff957587).
+    assert!(
+        docker[..image_at].contains(&"--log-driver=none"),
+        "no daemon log of what the door prints: {docker:?}"
+    );
     // `timeout 10` INSIDE the container: killing the host-side client
     // leaves a container running (review of 058b1ef1, M1).
     assert_eq!(

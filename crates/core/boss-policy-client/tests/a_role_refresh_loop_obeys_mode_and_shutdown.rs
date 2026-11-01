@@ -13,6 +13,32 @@ use boss_policy_client::role_reader::{
 use boss_policy_client::role_reporting::{ReportMode, ReportModeSource};
 use serde_json::json;
 
+async fn fixture_wait<T>(future: impl std::future::Future<Output = T>) -> T {
+    // This bounds fixture progress, not the service's refresh latency. A
+    // loaded gate can deschedule the producer beyond the old one-second cap.
+    tokio::time::timeout(Duration::from_secs(30), future)
+        .await
+        .expect("role refresh fixture did not reach its next event")
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "role refresh fixture did not reach its next event")]
+async fn a_missing_fixture_event_still_fails_bounded() {
+    fixture_wait(std::future::pending::<()>()).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_delayed_fixture_event_is_not_a_refresh_failure() {
+    let seen = Arc::new(tokio::sync::Notify::new());
+    let producer = seen.clone();
+    let task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        producer.notify_one();
+    });
+    fixture_wait(seen.notified()).await;
+    task.await.unwrap();
+}
+
 struct ModeWitness {
     value: ReportMode,
     seen: Arc<tokio::sync::Notify>,
@@ -69,20 +95,12 @@ async fn off_skips_refresh_and_shutdown_cancels_an_in_flight_source() {
                 )
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(1), mode_seen.notified())
-            .await
-            .unwrap();
+        fixture_wait(mode_seen.notified()).await;
         if mode.value == ReportMode::Report {
-            tokio::time::timeout(Duration::from_secs(1), entered.notified())
-                .await
-                .unwrap();
+            fixture_wait(entered.notified()).await;
         }
         stop.send(true).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        fixture_wait(task).await.unwrap().unwrap();
         assert_eq!(
             source.reads.load(Ordering::SeqCst),
             usize::from(mode.value == ReportMode::Report)
@@ -157,15 +175,9 @@ async fn shutdown_invalidates_even_a_still_fresh_snapshot() {
             )
             .await
     });
-    tokio::time::timeout(Duration::from_secs(1), entered.notified())
-        .await
-        .unwrap();
+    fixture_wait(entered.notified()).await;
     stop.send(true).unwrap();
-    tokio::time::timeout(Duration::from_secs(1), task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    fixture_wait(task).await.unwrap().unwrap();
     assert!(
         matches!(reader.role_for("agent-example").await, Err(RoleLookupError::Unavailable(reason)) if reason.contains("stopped"))
     );

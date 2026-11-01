@@ -199,10 +199,16 @@ roll_deployment() {
     local k="$1" registry="$2" head="$3" last_good="$4" failed_file="$5" ns="${6:-boss}"
     local pre_image
     pre_image=$($k get deploy boss -n "$ns" -o jsonpath='{.spec.template.spec.containers[0].image}')
+    outgoing_follow "$k" "$ns"
     _patch_boss_image "$k" "$registry:$head" "$ns"
     if $k rollout status deploy/boss -n "$ns" --timeout=420s; then
+        outgoing_last_words "$ns"
         return 0
     fi
+    # `Recreate`: the outgoing pod is gone by now whether or not HEAD
+    # came up, so what it said is complete — and a bricked head is
+    # exactly when it is wanted.
+    outgoing_last_words "$ns"
     echo "$head" > "$failed_file"
     local target
     if [ -n "$last_good" ] && [ "$last_good" != "none" ]; then
@@ -218,6 +224,97 @@ roll_deployment() {
         echo "cluster-deploy-runner: ROLLBACK OF $ns TO $target ALSO FAILED — the instance needs hands NOW" >&2
     fi
     return 1
+}
+
+# THE OUTGOING POD'S LAST WORDS (backlog d44ac67f). A `Recreate` roll
+# deletes the old pod and its log with it, and that log is the ONLY
+# place a dying process can say why it could not state its end: the
+# ERROR line `Evidence::end` writes (every attempt, how it ended, after
+# how long), the SIGTERM watcher's "did not state its end within 10s",
+# and the launcher's own "launcher SIGTERM" line, which says the signal
+# arrived at all. It cannot write any of that to the log it is failing
+# to reach, and the next process cannot know it. On 2026-10-22 the rolls
+# at 16:31Z and 17:11Z stated 2 of 21 and 0 of 21 machine-gate ends,
+# took 75 and 76 s against ~41 s for the eleven around them, and reset
+# the clean window that gates the machine token's enforce (6805c764) —
+# and the cause died with the pod, both times. This runner holds the
+# admin credential, owes nothing to the pod it rolls and is already
+# watching the roll, so it is the reader that outlives the pod.
+#
+# outgoing_follow K NAMESPACE
+#   Before the patch, while the pod still exists: follow the Running
+#   boss pod's log from now (`--since-time`, so only what it says while
+#   it is rolled) into a file under the converge's state directory, in
+#   the background, bounded by BOSS_OUTGOING_FOLLOW_S. Sets the
+#   _OUTGOING_* globals outgoing_last_words reads — a background job's
+#   pid can only be waited on by the shell that started it, so this
+#   cannot answer through a command substitution. Never fails the roll.
+outgoing_follow() {
+    local k="$1" ns="$2" dir
+    _OUTGOING_POD="" _OUTGOING_PID="" _OUTGOING_LOG="" _OUTGOING_WHY=""
+    _OUTGOING_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    _OUTGOING_POD=$($k get pods -n "$ns" -l app=boss --field-selector=status.phase=Running \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || _OUTGOING_POD=""
+    if [ -z "$_OUTGOING_POD" ]; then
+        _OUTGOING_WHY="no Running boss pod in $ns before the patch — nothing was rolled out from under, or the read was refused"
+        return 0
+    fi
+    dir="${BOSS_OUTGOING_DIR:-${CONVERGE_STATE:-/var/lib/boss/converge}/outgoing}"
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        _OUTGOING_WHY="$dir could not be created, so $_OUTGOING_POD's log was not followed"
+        _OUTGOING_POD=""
+        return 0
+    fi
+    # Kept two weeks: long enough for the next reader of a dropped roll.
+    find "$dir" -maxdepth 1 -name '*.log' -mtime +14 -delete 2>/dev/null || true
+    _OUTGOING_LOG="$dir/$ns-$(date -u +%Y%m%dT%H%M%SZ)-$_OUTGOING_POD.log"
+    # shellcheck disable=SC2086 # $k is a command line (docker run … kubectl)
+    timeout "${BOSS_OUTGOING_FOLLOW_S:-600}" $k logs -n "$ns" "pod/$_OUTGOING_POD" -c boss \
+        -f --timestamps --since-time="$_OUTGOING_SINCE" </dev/null >"$_OUTGOING_LOG" 2>&1 &
+    _OUTGOING_PID=$!
+    # Let the stream attach before the patch starts the termination.
+    sleep "${BOSS_OUTGOING_CONNECT_S:-2}"
+}
+
+# outgoing_last_words NAMESPACE
+#   After the rollout returns (the old pod is gone under `Recreate`):
+#   wait for the follower, keep its whole capture where it is, and
+#   record `outgoing_pod_<NAMESPACE>` on the run summary — the pod, the
+#   follower's exit, whether the launcher saw SIGTERM, the first and
+#   last instants it said anything, and every `gate evidence` line (up
+#   to 20, each up to 500 characters, colour codes stripped). The
+#   journal gets the same lines. Never fails the roll.
+outgoing_last_words() {
+    local ns="$1" rc=0 said
+    if [ -z "${_OUTGOING_POD:-}" ]; then
+        echo "cluster-deploy-runner: outgoing pod in $ns not followed: ${_OUTGOING_WHY:-unknown}" >&2
+        command -v run_summary_json >/dev/null 2>&1 || return 0
+        said=$(jq -nc --arg why "${_OUTGOING_WHY:-unknown}" '{followed: false, why: $why}' 2>/dev/null) || return 0
+        run_summary_json "outgoing_pod_$ns" "$said"
+        return 0
+    fi
+    wait "$_OUTGOING_PID" || rc=$?
+    said=$(jq -Rn --arg pod "$_OUTGOING_POD" --arg since "$_OUTGOING_SINCE" \
+        --arg capture "$_OUTGOING_LOG" --argjson rc "$rc" '
+        [inputs | gsub("\u001b\\[[0-9;]*m"; "")] as $l
+        | [$l[] | select(test("gate evidence"))] as $g
+        | {followed: true, pod: $pod, since: $since, follow_rc: $rc,
+           lines: ($l | length),
+           sigterm_seen: any($l[]; test("launcher SIGTERM")),
+           first_at: (($l[0] // "") | split(" ")[0]),
+           last_at: (($l[-1] // "") | split(" ")[0]),
+           gate_evidence_lines: ($g | length),
+           gate_evidence: [$g[:20][] | .[0:500]],
+           capture: $capture}' <"$_OUTGOING_LOG" 2>/dev/null) || said=""
+    if [ -z "$said" ]; then
+        echo "cluster-deploy-runner: outgoing pod $_OUTGOING_POD in $ns: its capture at $_OUTGOING_LOG could not be read back (follow rc $rc)" >&2
+        return 0
+    fi
+    echo "cluster-deploy-runner: outgoing pod $_OUTGOING_POD in $ns: $(jq -r '"follow rc \(.follow_rc), \(.lines) line(s), launcher SIGTERM seen: \(.sigterm_seen), \(.gate_evidence_lines) gate evidence line(s)"' <<<"$said"); capture kept at $_OUTGOING_LOG" >&2
+    jq -r '.gate_evidence[] | "  " + .' <<<"$said" >&2 || true
+    command -v run_summary_json >/dev/null 2>&1 || return 0
+    run_summary_json "outgoing_pod_$ns" "$said"
+    return 0
 }
 
 _patch_boss_image() {
@@ -1515,6 +1612,59 @@ take_converge_requests() {
     local inbox="$1/requests" mine="$1/requests.run"
     [ -f "$inbox" ] || return 0
     cat "$inbox" >> "$mine" && rm -f "$inbox"
+}
+
+# report_rolled STEP_SCRIPT SHA — say THAT THE ROLL HAPPENED the moment
+# it did (backlog 090720c3). Writes `rolled` (the full sha) and
+# `rolled_at` onto this run's own maintenance packet, on its still-open
+# `run` step, through boss-step.sh's metadata-only door; the dispatcher
+# rule complete-train-converged-on-runner-rolled reacts to that write
+# and converges the train that merged SHA.
+#
+# WHY NOW AND NOT AT THE END. Everything else this run knows reaches its
+# packet through the run summary, which ExecStopPost hands boss-step when
+# the WHOLE run ends — after the other instances, the verification and
+# the orphan sweep. A train waited for that, and then for the conductor's
+# next two-minute reconcile: measured 2026-10-18 over 51 trains, 72 s p50
+# and 138 s p90 of track time after the cluster already served the merge.
+#
+# BOSS_RUN_SUMMARY_FILE IS NOT HANDED OVER. boss-step reads and deletes
+# the summary it is given; mid-run that would take the run's facts so
+# far and leave ExecStopPost a summary without them. The same two keys
+# are put in the summary as well, so a write the record refused now is
+# recovered when the run ends (a later write of the same step re-fires
+# the rule; it is idempotent).
+#
+# Visibility, never a precondition (the unit's `ExecStartPre=-`, said
+# again here): the roll is real whatever the record answers, so a refused
+# write is one line and the run goes on.
+#
+# BOUNDED, because this runs inside ExecStart (review ffb8efa0, B1).
+# boss-step.sh sends through boss-api-curl.sh, which sets no --max-time
+# and re-sends a refused connect for 150 s, so a jobs API that accepts
+# the connection and never answers held the converge until
+# TimeoutStartSec=90min: the later stages never ran, the run was
+# recorded failed, and the converge carrying the fix could not start.
+# Every other mid-run read here is bounded (5, 10, 15 s). So the whole
+# write gets BOSS_REPORT_ROLLED_TIMEOUT seconds (default 20) and its
+# refused-connect window ends inside that, at a third of it; the source
+# instance has just answered its rollout, so the window is for a blip,
+# and anything the bound cuts is still carried by the summary.
+report_rolled() {
+    local step_script="$1" sha="$2" at
+    local bound="${BOSS_REPORT_ROLLED_TIMEOUT:-20}"
+    case "$bound" in '' | *[!0-9]* | 0) bound=20 ;; esac
+    at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    run_summary_field rolled "$sha"
+    run_summary_field rolled_at "$at"
+    if timeout -k 5 "$bound" env -u BOSS_RUN_SUMMARY_FILE BOSS_STEP_METADATA_ONLY=1 \
+        BOSS_API_RETRY_DEADLINE=$((bound / 3)) \
+        "$step_script" maintenance-cluster-converge run "rolled=$sha" "rolled_at=$at"; then
+        echo "cluster-deploy-runner: reported rolled=$sha at $at on this run's packet"
+    else
+        echo "cluster-deploy-runner: could not record rolled=$sha on this run's packet now (refused, or no answer within ${bound}s) — the run summary carries it to the end of the run, and the conductor's reconcile converges the train meanwhile" >&2
+    fi
+    return 0
 }
 
 # answer_converge_requests STATE KEY VALUE — PATCH {KEY: VALUE} onto the

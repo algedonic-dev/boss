@@ -50,13 +50,17 @@ use boss_dispatcher_handlers::handlers::{
     jobs_complete_step::JobsCompleteStep,
     jobs_complete_step_from_record::JobsCompleteStepFromRecord,
     jobs_complete_step_matching::JobsCompleteStepMatching,
+    jobs_converge_trains_on_rolled::JobsConvergeTrainsOnRolled,
     jobs_flight_overdue::JobsFlightOverdue,
+    jobs_idle_actor_watch::JobsIdleActorWatch,
     jobs_receipt_overdue::JobsReceiptOverdue,
     jobs_reclaim_abandoned_step::JobsReclaimAbandonedStep,
+    jobs_reconcile_readiness::JobsReconcileReadiness,
     jobs_release_on_review::JobsReleaseOnReview,
     jobs_retract_matching::JobsRetractMatching,
     jobs_run_car_probes::JobsRunCarProbes,
     jobs_subjob_resolve::JobsSubjobResolve,
+    jobs_urgent_item_watch::JobsUrgentItemWatch,
     ledger_bill_approve::LedgerBillApprove,
     ledger_keg_deposit_settle::LedgerKegDepositSettle,
     ledger_payroll_run_submit::LedgerPayrollRunSubmit,
@@ -89,6 +93,7 @@ use boss_dispatcher_handlers::handlers::{
     stripe_payouts::StripePayouts,
     sweep_empty_decisions::MaintenanceSweepInspect,
     sweep_judge_report::MaintenanceSweepJudge,
+    verdict_streak::VerdictStreak,
     webhook_notify::WebhookNotify,
 };
 use tokio::net::TcpListener;
@@ -420,6 +425,7 @@ async fn main() -> Result<()> {
             // ops-runner (28ac45ab). Inert until a rule on
             // jobs.job.closed names it.
             handlers.register(JobsRunCarProbes::new(cfg.jobs_api_url.clone()));
+            handlers.register(JobsReconcileReadiness::new(cfg.jobs_api_url.clone()));
             // The empty-decisions sweep runs itself: on the sweep's
             // Inspect checklist becoming ready, scan open packets for
             // approval decisions that recorded nothing, complete the
@@ -521,6 +527,15 @@ async fn main() -> Result<()> {
                 cfg.jobs_api_url.clone(),
                 platform_owner.clone(),
             ));
+            // A chore whose step has read the same verdict on its newest
+            // N completed runs files ONE backlog-item (ada4d019): boss-gcp's
+            // deposit-key audit reading `unverified` tick after tick was
+            // read by nothing. The count is read back from the packets;
+            // which kind, step, word and N ride the rule row.
+            handlers.register(VerdictStreak::new(
+                cfg.jobs_api_url.clone(),
+                platform_owner.clone(),
+            ));
             // A closing Job completes the open step it was authorized
             // by, on the Job its declared edge names — the merged car
             // → feedback-packet obligation (2c4ae549). Generic: which
@@ -538,6 +553,12 @@ async fn main() -> Result<()> {
             // two steps, the field and the path ride the rule row, and
             // the rule is the tenant's.
             handlers.register(JobsCompleteStepMatching::new(cfg.jobs_api_url.clone()));
+            // The cluster-deploy-runner's mid-run `rolled` report
+            // completes `converged` on the train whose merge it rolled,
+            // checked against the running jobs API's own build commit —
+            // the train no longer waits for the next two-minute
+            // reconcile, which stays the safety net (090720c3).
+            handlers.register(JobsConvergeTrainsOnRolled::new(cfg.jobs_api_url.clone()));
             // A fact that answers a machine-filed item withdraws every
             // open packet carrying its key — a redelivered or resolved
             // dead letter closes the item filed for its outbox row
@@ -587,6 +608,29 @@ async fn main() -> Result<()> {
             // step, the value that means dead, the edge key and the
             // second bound all ride the rule row.
             handlers.register(JobsReclaimAbandonedStep::new(cfg.jobs_api_url.clone()));
+            // The urgent-item watch (9788e22d): an urgent item's build
+            // claimed with no open run and no car in flight past a bound
+            // is released the same way, and an urgent item open for days
+            // with landed cars or many runs asks once for a finish line.
+            // Which priorities and every bound ride the rule row.
+            handlers.register(JobsUrgentItemWatch::new(
+                cfg.jobs_api_url.clone(),
+                platform_owner.clone(),
+            ));
+            // The ACTOR half beside it (861360bc): an agent holding a
+            // READY urgent nomination with no run open and none moved
+            // inside the bound files one alarm naming the actor, the
+            // held work, its last run and its session's last prompt.
+            // Which priorities and the minutes ride the rule row; it
+            // files and never routes.
+            handlers.register(JobsIdleActorWatch::new(
+                cfg.jobs_api_url.clone(),
+                platform_owner.clone(),
+                Arc::new(boss_people_client::ReqwestPeopleClient::new(
+                    cfg.people_api_url.clone(),
+                )),
+                Arc::new(boss_clock_client::WallClockClient),
+            ));
             // A held car's dispatched reviewer recording RELEASE asks the
             // release door as the rule (design 393bdef6 Q1, backlog
             // 0cfc57e6): the door's judge decides, and a refusal is
@@ -621,7 +665,10 @@ async fn main() -> Result<()> {
             // Both dependencies degrade to Unconfigured — the handler
             // stays registered (an UnknownHandler aborts EVERY co-fired
             // rule's dispatch) and a firing rule dead-letters naming
-            // the missing knob instead.
+            // the missing knob instead. A client that could not be BUILT
+            // degrades through Unconfigured::at_boot, which says so as an
+            // error now rather than at the first rotation (backlog
+            // 3107bfb1).
             {
                 use credential_issuer::{
                     AccessApps, CloudflareApi, CloudflareTunnels, ForgeTokenIssuer, ForgejoAdmin,
@@ -631,9 +678,9 @@ async fn main() -> Result<()> {
                     Some(root) => {
                         match ForgejoAdmin::new(cfg.broker_forge_url.clone(), root.clone()) {
                             Ok(admin) => admin,
-                            Err(e) => Arc::new(Unconfigured(format!(
+                            Err(e) => Unconfigured::at_boot(format!(
                                 "credential broker has no forge admin client: {e}"
-                            ))),
+                            )),
                         }
                     }
                     None => Arc::new(Unconfigured(
@@ -644,13 +691,16 @@ async fn main() -> Result<()> {
                 };
                 // One k8s client serves the Secret writes AND the
                 // connector restart (the same ServiceAccount, two
-                // name-scoped grants).
-                let kube = KubeSecretStore::in_cluster();
+                // name-scoped grants) — and its failure is said once,
+                // whichever of the two reaches for it.
+                let kube = KubeSecretStore::in_cluster().map_err(|e| {
+                    Unconfigured::at_boot(format!(
+                        "credential broker has no in-cluster k8s credential: {e}"
+                    ))
+                });
                 let secrets: Arc<dyn SecretStore> = match &kube {
                     Ok(s) => s.clone(),
-                    Err(e) => Arc::new(Unconfigured(format!(
-                        "credential broker has no in-cluster k8s credential: {e}"
-                    ))),
+                    Err(unconfigured) => unconfigured.clone(),
                 };
                 handlers.register(CredentialRotateForgejo::new(
                     cfg.jobs_api_url.clone(),
@@ -702,9 +752,7 @@ async fn main() -> Result<()> {
                 };
                 let workloads: Arc<dyn WorkloadRestarter> = match &kube {
                     Ok(s) => s.clone(),
-                    Err(e) => Arc::new(Unconfigured(format!(
-                        "credential broker has no in-cluster k8s credential: {e}"
-                    ))),
+                    Err(unconfigured) => unconfigured.clone(),
                 };
                 handlers.register(CredentialRotateCloudflareTunnel::new(
                     cfg.jobs_api_url.clone(),

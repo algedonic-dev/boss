@@ -301,20 +301,20 @@ test('Feedback recorded-page button follows the catalog and Back preserves Recei
   await noWrites(page);
 });
 
-test('Receiving world crossing supports Enter, Space, Escape and its close button', async ({ page }) => {
+test('Receiving section supports native keyboard navigation, close and Back', async ({ page }) => {
   await backend(page, 'user-feedback');
   await board(page, 'user-feedback');
-  const crossing = page.locator('.crossing[data-crossing="receiving→marshalling"]');
-  const panel = page.locator('.crossing-panel[data-panel="receiving→marshalling"]');
+  const crossing = page.locator('[data-section-link="receiving→marshalling"]');
+  const panel = page.locator('[data-map-panel]');
   await crossing.focus(); await crossing.press('Enter');
   await expect(panel).toBeVisible();
-  await expect(crossing).toHaveAttribute('aria-expanded', 'true');
-  await crossing.press('Escape'); await expect(panel).toHaveCount(0);
-  await crossing.press('Space'); await expect(panel).toBeVisible();
-  await crossing.press('Space'); await expect(panel).toHaveCount(0);
-  await crossing.press('Enter');
-  await panel.getByRole('button', { name: 'close the crossing', exact: true }).click();
+  await expect(panel).toHaveAttribute('data-selection', 'receiving->marshalling');
+  await panel.locator('a[data-close]').click();
   await expect(panel).toHaveCount(0);
+  await expect(page).toHaveURL(/\/it$/);
+  await page.goBack();
+  await expect(panel).toHaveAttribute('data-selection', 'receiving->marshalling');
+  await page.goBack();
   await expect(page).toHaveURL(/\/it\?at=receiving$/);
   await noWrites(page);
 });
@@ -332,27 +332,6 @@ test('Company-map keyboard link and selection-close keep native catalog navigati
   await expect(page.locator('[data-map-panel]')).toHaveCount(0);
   await page.goBack();
   await expect(page.locator('[data-map-panel]')).toHaveAttribute('data-selection', 'receiving');
-  await noWrites(page);
-});
-
-test('Receiving motion buttons change the stated compression and its checkbox restores motion', async ({ page }) => {
-  await backend(page, 'user-feedback');
-  // This is a mocked flight read, not an activation or a live write.
-  await page.route(/\/api\/flights\/mine(\?|$)/, (r) => r.fulfill({ json: { flights: ['it-map-motion'] } }));
-  await board(page, 'user-feedback');
-  const bar = page.locator('[data-motion-bar]');
-  const canvas = page.locator('canvas.motion-layer');
-  await bar.getByRole('button', { name: '×60', exact: true }).click();
-  await expect(bar.locator('[data-compression]')).toHaveText('×60 — 1 real hour = 1 min on screen');
-  await expect(bar.getByRole('button', { name: '×60', exact: true })).toHaveAttribute('aria-pressed', 'true');
-  await bar.getByRole('button', { name: '×600', exact: true }).click();
-  await expect(bar.locator('[data-compression]')).toHaveText('×600 — 1 real hour = 6 s on screen');
-  await expect(bar.getByRole('button', { name: '×60', exact: true })).toHaveAttribute('aria-pressed', 'false');
-  await bar.getByRole('checkbox', { name: 'reduced motion' }).check();
-  await expect(canvas).toHaveAttribute('data-motion', 'reduced');
-  await expect(bar).toContainText('drawn as static density');
-  await bar.getByRole('checkbox', { name: 'reduced motion' }).uncheck();
-  await expect(canvas).toHaveAttribute('data-motion', 'moving');
   await noWrites(page);
 });
 

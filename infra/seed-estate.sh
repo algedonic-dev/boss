@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # seed-estate.sh — publish the tree's estate declaration onto a running
 # BOSS stack: `boss estate declare <estate.toml>` through the estate
-# door (POST /api/estate/nodes/batch, insert-if-absent), retried while
+# door (POST /api/estate/nodes/batch), retried while
 # the stack finishes binding (backlog ee368d0c, 2026-09-18).
 #
 # Run by tenant-launch.sh's publish_tenant BEFORE the operator baseline
@@ -15,9 +15,11 @@
 # until this has run, and what it declares is infra/estate/estate.toml,
 # the one file the estate lives in.
 #
-# Idempotent + retry-safe: the door keeps a node already there and adds
-# only a role not yet on it, so an attempt that failed on an unreachable
-# service resumes cleanly. A REFUSED declaration (the file fails the
+# Idempotent + retry-safe: the door inserts new nodes, refreshes an
+# explicit disk_gb on kept nodes, and appends missing roles; other fields
+# are kept. An identical retry records no additional change, so an
+# attempt that failed on an unreachable service resumes cleanly.
+# A REFUSED declaration (the file fails the
 # loader, or the door refuses a row by name) stops at once — waiting
 # cannot change a file — and the launcher's DEGRADED loop retries on its
 # own cadence. Output is captured and printed, success or failure

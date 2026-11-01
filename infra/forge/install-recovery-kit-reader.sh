@@ -5,7 +5,8 @@
 # converge tick.
 #
 # WHAT IT INSTALLS
-#   * infra/forge/recovery-kit-read.sh -> $LIBEXEC/recovery-kit-read,
+#   * infra/lib/secret-header.sh + infra/forge/recovery-kit-read.sh
+#     -> $LIBEXEC/recovery-kit-read,
 #     root:root 0755. A COPY, outside the checkout: the account the
 #     sudoers rule names owns the checkout, and a rule pointing into it
 #     would be NOPASSWD root for whoever can edit a file there (the
@@ -87,10 +88,18 @@ IFS=: read -r entry_name _ entry_uid _ <<< "$entry"
     || fail "the kit user '$USER_NAME' is uid ${entry_uid:-unknown} — the rule would grant root to root under another name"
 
 install -d -m 0755 "$LIBEXEC" || fail "cannot create $LIBEXEC"
-install -m 0755 "$HERE/recovery-kit-read.sh" "$LIBEXEC/recovery-kit-read" || fail "cannot install the reader"
-if [ -n "$OWNER" ]; then
-    chown "$OWNER" "$LIBEXEC/recovery-kit-read" || fail "cannot make the reader $OWNER"
+reader_tmp="$(mktemp "$LIBEXEC/.recovery-kit-read.XXXXXX")" || fail "cannot stage the reader"
+# Embed the canonical helper at install time. The privileged reader stays
+# self-contained: it never sources a checkout or a caller-selected library.
+if ! { printf '#!/bin/bash\n' && cat "$REPO/infra/lib/secret-header.sh" && sed '1d' "$HERE/recovery-kit-read.sh"; } > "$reader_tmp"; then
+    rm -f -- "$reader_tmp"
+    fail "cannot assemble the reader and machine-token client"
 fi
+chmod 0755 "$reader_tmp" || { rm -f -- "$reader_tmp"; fail "cannot make the reader executable"; }
+if [ -n "$OWNER" ]; then
+    chown "$OWNER" "$reader_tmp" || { rm -f -- "$reader_tmp"; fail "cannot make the reader $OWNER"; }
+fi
+mv -f -- "$reader_tmp" "$LIBEXEC/recovery-kit-read" || { rm -f -- "$reader_tmp"; fail "cannot install the reader"; }
 
 tmp="$(mktemp "${SUDOERS_DIR}/.boss-recovery-kit.XXXXXX")" || fail "cannot stage a file in $SUDOERS_DIR"
 {

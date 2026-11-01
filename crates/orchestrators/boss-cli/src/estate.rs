@@ -9,7 +9,7 @@
 //! it belongs to the tree that converges the instance
 //! (infra/estate/estate.toml, the one file the estate's addresses live
 //! in since H10), and it reaches a database the way every other
-//! declaration does — through a door, insert-if-absent, on every pod
+//! declaration does — through a door on every pod
 //! start. This verb is that publish; the launcher runs it before the
 //! tenant (infra/seed-estate.sh), and a fresh database declares nothing
 //! until it has run.
@@ -18,8 +18,9 @@
 //! the tests read them with (`boss_jobs::estate_seed`), to `POST
 //! /api/estate/nodes/batch` signed as `automation:estate-seed` at
 //! operator tier — the door refuses any lesser caller. The outcome line
-//! says what landed: a node already there is kept as it is, a role not
-//! yet on it is added, and a second run inserts nothing.
+//! says what landed: an explicit disk capacity refreshes a kept node,
+//! other existing fields stay kept, a missing role is appended, and
+//! an identical second run changes nothing.
 
 use std::path::{Path, PathBuf};
 
@@ -40,7 +41,9 @@ pub enum Cmd {
 #[derive(clap::Subcommand)]
 pub enum EstateAction {
     /// Publish the tree's node declarations (the `[[node]]` rows of
-    /// infra/estate/estate.toml) to the estate registry, insert-if-absent.
+    /// infra/estate/estate.toml) to the estate registry. Inserts new nodes,
+    /// refreshes an explicit disk_gb on kept nodes, appends missing roles;
+    /// other fields are kept.
     Declare {
         /// The estate file (infra/estate/estate.toml).
         source: PathBuf,
@@ -96,8 +99,8 @@ pub fn declare(source: &Path, gateway: Option<&str>, dry_run: bool) -> Result<St
         .json()
         .with_context(|| format!("POST {url}: the outcome did not parse"))?;
     Ok(format!(
-        "{head}\n  received {}, inserted {}, roles inserted {} (a node already there is kept)",
-        out.received, out.inserted, out.roles_inserted
+        "{head}\n  received {}, inserted {}, disk capacity updated {}, roles inserted {} (other existing fields are kept)",
+        out.received, out.inserted, out.updated, out.roles_inserted
     ))
 }
 
@@ -144,6 +147,45 @@ pub fn dispatch(cmd: Cmd) -> Result<()> {
 mod tests {
     use super::*;
     use boss_testing::scratch::{scratch_dir, write_file};
+
+    #[test]
+    fn declare_help_names_the_kept_node_disk_refresh() {
+        use clap::CommandFactory;
+        let mut command = crate::Cli::command();
+        let help = command
+            .find_subcommand_mut("estate")
+            .unwrap()
+            .find_subcommand_mut("declare")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("refreshes") && help.contains("disk_gb"),
+            "{help}"
+        );
+        assert!(
+            help.contains("other fields") && help.contains("kept"),
+            "{help}"
+        );
+        assert!(!help.contains("insert-if-absent"), "{help}");
+    }
+
+    #[test]
+    fn a_file_with_nonpositive_disk_capacity_refuses_before_publish() {
+        let dir = scratch_dir("estate-invalid-disk");
+        let file = dir.join("estate.toml");
+        for disk in [0, -1] {
+            let input = FILE.replace(
+                "role = \"forge\"",
+                &format!("disk_gb = {disk}\nrole = \"forge\""),
+            );
+            write_file(&file, &input);
+            let why = plan(&file)
+                .expect_err("nonpositive capacity is not a declaration")
+                .to_string();
+            assert!(why.contains("forge") && why.contains("disk_gb"), "{why}");
+        }
+    }
 
     const FILE: &str = "sor_url = \"http://192.0.2.34:7900\"\n\n[[node]]\nid = \"cp-1\"\n\
                         label = \"cp-1\"\naddress = \"192.0.2.11\"\nrole = \"talos-control-plane\"\n\

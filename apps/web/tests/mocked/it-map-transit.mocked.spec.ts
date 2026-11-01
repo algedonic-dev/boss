@@ -71,12 +71,12 @@ async function mocks(page: Page, flights: ReadonlyArray<string>): Promise<void> 
   await page.route(YARD_BORDERS, (r) => json(r, borders()));
 }
 
-test('flight OFF: the world map is the map, and no transit map is drawn', async ({ page }) => {
+test('the transit map is the desktop map without any flights', async ({ page }) => {
   await mocks(page, []);
   await page.goto('/it');
-  await expect(page.locator('section.yard svg .territory')).toHaveCount(TERRITORIES.length);
-  await expect(page.locator('[data-transit]')).toHaveCount(0);
-  await expect(page.locator('[data-station]')).toHaveCount(0);
+  await expect(page.locator('section.transit[data-transit]')).toBeVisible();
+  await expect(page.locator('section.yard svg .territory')).toHaveCount(0);
+  await expect(page.locator('[data-station]')).toHaveCount(STATIONS.length);
 });
 
 test('flight ON: the same reads drawn as a transit monitor', async ({ page }) => {
@@ -110,11 +110,10 @@ test('flight ON: the same reads drawn as a transit monitor', async ({ page }) =>
   // Nothing drawn waiting where the count was not read.
   await expect(transit.locator('[data-waiting="receiving→marshalling"]')).toHaveCount(0);
 
-  // A moving block where the rate earns one (480/d is one every 3 s at ×60), none on a held section.
-  expect(await transit.locator('[data-train="shop-floor→gates"]').count()).toBeGreaterThan(0);
-  await expect(transit.locator('[data-train="shop-floor→gates"] animateMotion').first()).toHaveAttribute('dur', '3.000s');
-  await expect(transit.locator('[data-train="gates→dock"]')).toHaveCount(0);
-  await expect(transit.locator('[data-replay]')).toContainText('replayed ×60');
+  // Rates never manufacture packet movements after graduation.
+  await expect(transit.locator('[data-train]')).toHaveCount(0);
+  await expect(transit.locator('[data-live]')).toHaveCount(1);
+  await expect(transit.locator('[data-replay]')).toContainText('each dot is one packet');
 
   // No planned tenant branch — no route serves it (car R3) — and a
   // troubled station pulsing.

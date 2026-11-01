@@ -671,6 +671,13 @@ mod tests {
             // The builder's run is in the brief; it is not the
             // reviewer's to close (review 0545d1b1 item 5).
             "never the car's builder run",
+            // A LANDED review compares the proof with the claim and
+            // records which it was (backlog 490acf06): three landed
+            // reviews measured production by hand on 2026-10-19 and the
+            // number reached only their run reports.
+            "`proof_probe` against the claim",
+            "MEASURED: <the read, the number, when>",
+            "NOT OBSERVED: <why it could not be read>",
         ] {
             assert!(text.contains(phrase), "the reviewer rules say `{phrase}`");
         }

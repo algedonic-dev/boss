@@ -28,7 +28,13 @@
 #   RED forge-converge/host-check refused: <infra/lib/host-check.sh's why>
 #   RED runner-credential-send/<kind> refused: <the sender's why> — boss-gcp's
 #     runner credential push: a key that reaches a shell, a signed key
-#     boss-gcp refuses, a stale receiver (backlog 1e50e66b, review f15070d2)
+#     boss-gcp refuses, a stale receiver (backlog 1e50e66b, review f15070d2),
+#     an envelope the receiver refused in its own words (backlog 3f7d5f23)
+#   RED runner-credential-push/<route> <kind>: <the push's why> — the push's
+#     own standing failures: the host-key pin missing or unconfigured, the
+#     deposit key unreadable or lost while a boss-gcp value waits, the
+#     sender refusing its enrollment, the kubeconfig unreadable (backlog
+#     3f7d5f23, review 34f8448c of car 2c628718)
 # This rule fires when a converge packet closes `failed` and hands it to
 # that judge (maintenance.chore.file_reds): one backlog-item per route,
 # deduped while it is open, so a refusal repeated 144 times a day is ONE

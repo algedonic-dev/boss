@@ -37,6 +37,8 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import DecideModal from './DecideModal.svelte';
+  import HumanPresentation from './HumanPresentation.svelte';
+  import { humanPresentation } from './humanPresentation';
   import PasskeysPanel from './PasskeysPanel.svelte';
 
   // The session rune exposes the current user. The fetch effect
@@ -405,7 +407,11 @@
                      watch list that does not age stops being read
                      (3bc896be, design 5877860d q2). -->
                 <div class="myday-grab-row myday-verdict-row">
-                  <PacketCard card={assignmentPacket(row)} />
+                  {#if humanPresentation(row.step.metadata).kind === 'ready'}
+                    <HumanPresentation metadata={row.step.metadata} jobId={row.job_id} stepId={row.step.id} jobTitle={row.job_title} stepTitle={row.step.title} onOpen={() => (deciding = row)} />
+                  {:else}
+                    <PacketCard card={assignmentPacket(row)} />
+                  {/if}
                   {#if waited}
                     <span
                       class="myday-age myday-age-{waited.band}"
@@ -437,7 +443,11 @@
                  Enter opens the job detail. -->
             <div class="myday-jobs-list">
               {#each shown.mine as row (row.step.id)}
-                <PacketCard card={assignmentPacket(row)} />
+                {#if humanPresentation(row.step.metadata).kind === 'ready'}
+                  <HumanPresentation metadata={row.step.metadata} jobId={row.job_id} stepId={row.step.id} jobTitle={row.job_title} stepTitle={row.step.title} onOpen={() => (deciding = row)} />
+                {:else}
+                  <PacketCard card={assignmentPacket(row)} />
+                {/if}
               {/each}
             </div>
           {/if}
@@ -457,7 +467,11 @@
                 <!-- The claim hop stays a button beside the card: the
                      card is the packet, the claim is queue mechanics. -->
                 <div class="myday-grab-row">
+                  {#if humanPresentation(row.step.metadata).kind === 'ready'}
+                    <HumanPresentation metadata={row.step.metadata} jobId={row.job_id} stepId={row.step.id} jobTitle={row.job_title} stepTitle={row.step.title} />
+                  {:else}
                   <PacketCard card={assignmentPacket(row)} />
+                  {/if}
                   <button class="myday-claim-btn" onclick={() => onClaim(row)}>
                     Claim
                   </button>

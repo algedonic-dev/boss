@@ -25,6 +25,7 @@ import { TRANSIT_KEY } from '../../src/it/yard/transit-choice';
 import { TERRITORIES } from '../../src/it/yard/world';
 import { BORDERS, routesPayload } from '../fixtures/yard';
 import { YARD_BORDERS, YARD_REGIONS, YARD_ROUTES, installSmokeMocks } from './_smokeMocks';
+import { FAILURE_MARKER } from './_routes';
 
 const FLIGHTS = /\/api\/flights\/mine(\?|$)/;
 const STREAM = /\/api\/yard\/moves\/stream(\?|$)/;
@@ -102,13 +103,13 @@ async function mocks(page: Page, flights: ReadonlyArray<string>, moves: Readonly
 
 const live = (page: Page) => page.locator('section.transit [data-live]');
 
-test('flight OFF: no live layer, and the rate-replay blocks run as before', async ({ page }) => {
-  await mocks(page, ['it-map-transit'], [move(1)]);
+test('live motion is the only motion without any flights', async ({ page }) => {
+  await mocks(page, [], [move(1)]);
   await page.goto('/it');
   await expect(page.locator('section.transit[data-transit]')).toBeVisible();
-  await expect(page.locator('[data-live]')).toHaveCount(0);
-  expect(await page.locator('[data-train="shop-floor→gates"]').count()).toBeGreaterThan(0);
-  await expect(page.locator('[data-replay]')).toContainText('replayed ×60');
+  await expect(live(page).locator('[data-dot]')).toHaveCount(1);
+  await expect(page.locator('[data-train]')).toHaveCount(0);
+  await expect(page.locator('[data-replay]')).toContainText(liveText(TRANSIT_MS));
 });
 
 test('one move is one transit, then one ping — and the replay blocks are off', async ({ page }) => {
@@ -142,15 +143,32 @@ test('one move is one transit, then one ping — and the replay blocks are off',
 });
 
 test('41 moves are 40 dots and "+1" on the section', async ({ page }) => {
-  await mocks(page, LIVE, Array.from({ length: 41 }, (_, i) => move(i + 1)));
+  // Real browser time: unlike the deterministic transit-age tests this
+  // case never installs or pauses Playwright's clock. A held performance
+  // clock would turn the draw-budget reading into a synthetic zero.
+  await mocks(page, [], Array.from({ length: 41 }, (_, i) => move(i + 1)));
   await page.goto('/it');
   const g = live(page);
   await expect(g.locator('[data-dot]')).toHaveCount(40);
   await expect(g.locator('[data-motion-more="shop-floor→gates"]')).toHaveText('+1');
+  const control = await page.evaluate(() => {
+    const before = performance.now();
+    let sum = 0;
+    for (let i = 0; i < 200_000; i += 1) sum += Math.sqrt(i);
+    return { elapsed: performance.now() - before, sum };
+  });
+  expect(control.elapsed).toBeGreaterThan(0);
+  expect(Number.isFinite(control.sum)).toBe(true);
   // Forty in flight fit the draw budget, measured headless.
   await expect
     .poll(async () => Number((await g.getAttribute('data-frame-ms')) ?? 'NaN'))
     .toBeLessThan(FRAME_BUDGET_MS);
+  const frames = Number(await g.getAttribute('data-frames'));
+  const frameMs = Number(await g.getAttribute('data-frame-ms'));
+  expect(frames).toBeGreaterThan(0);
+  expect(Number.isFinite(frameMs)).toBe(true);
+  expect(frameMs).toBeGreaterThanOrEqual(0);
+  console.log(`live-motion real-clock headless fixture: dots=40 frames=${frames} smoothed-frame-ms=${frameMs} budget-ms=${FRAME_BUDGET_MS} clock-control-ms=${control.elapsed}`);
 });
 
 test('an off-ramp, an undeclared route, a hand-off and a train each draw as the record says', async ({ page }) => {
@@ -220,6 +238,49 @@ test('a feed that cannot be read is said on the map, never drawn as a quiet yard
   await expect(g).toHaveAttribute('data-feed', 'down');
   await expect(g.locator('[data-feed-down]')).toContainText('403');
   await expect(g.locator('[data-feed-down]')).toContainText('this caller may read none');
+  // The line wears the ONE failure marker (`FAILURE_MARKER`, _routes.ts)
+  // beside its own words (backlog aadbc1a3): with every sibling read
+  // healthy, the moves feed's line is the only failure on the page, so a
+  // reader that asserts on the shared name finds exactly it.
+  await expect(g.locator('[data-feed-down]')).toHaveClass(/\bload-failed\b/);
+  await expect(page.locator(FAILURE_MARKER)).toHaveCount(1);
+  await expect(page.locator(`${FAILURE_MARKER}[data-feed-down]`)).toHaveCount(1);
+});
+
+test('a live feed paints no failure marker', async ({ page }) => {
+  await mocks(page, LIVE, [move(1)]);
+  await page.goto('/it');
+  const g = live(page);
+  await expect(g).toHaveAttribute('data-feed', 'live');
+  await expect(g.locator('[data-dot]')).toHaveCount(1);
+  await expect(g.locator('[data-feed-down]')).toHaveCount(0);
+  await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
+});
+
+test('a feed that recovers takes its failure marker away', async ({ page }) => {
+  await holdClock(page, new Date(NOW));
+  await installSmokeMocks(page);
+  await page.route(FLIGHTS, (r) => json(r, { flights: LIVE }));
+  await page.route(YARD_REGIONS, (r) => json(r, regions()));
+  await page.route(YARD_BORDERS, (r) => json(r, borders()));
+  await page.route(YARD_ROUTES, (r) => json(r, routesPayload()));
+  await page.route(STREAM, (r) => r.fulfill({ status: 503, body: 'the moves record is not wired on this jobs API' }));
+  // The first read of the record refuses; the next, ten seconds on, answers.
+  let reads = 0;
+  await page.route(MOVES, (r) => {
+    reads += 1;
+    return reads === 1
+      ? r.fulfill({ status: 503, body: 'the moves record is not wired on this jobs API' })
+      : json(r, { moves: [], latest_seq: 7 });
+  });
+  await page.goto('/it');
+  const g = live(page);
+  await expect(g).toHaveAttribute('data-feed', 'down');
+  await expect(page.locator(`${FAILURE_MARKER}[data-feed-down]`)).toHaveCount(1);
+  await page.clock.runFor(10_000);
+  await expect(g).toHaveAttribute('data-feed', 'polling');
+  await expect(g.locator('[data-feed-down]')).toHaveCount(0);
+  await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);
 });
 
 // THE CROSSING TIME (David 2026-09-27: "maybe give me a few radio

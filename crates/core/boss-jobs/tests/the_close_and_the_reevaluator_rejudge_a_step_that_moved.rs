@@ -83,7 +83,7 @@ fn admin_header() -> String {
 
 /// `promotes`: work → review, where review waits on work.
 /// `closes`: finish (a declared terminal) beside other, both open at once.
-fn app() -> (axum::Router, Arc<InMemoryJobs>) {
+fn app_with_registry() -> (axum::Router, Arc<InMemoryJobs>, Arc<InMemoryWorkflows>) {
     let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds
         .seed(spec(
@@ -103,6 +103,15 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
             ],
         ))
         .expect("seed the closing kind");
+    kinds
+        .seed(spec(
+            "promotes-too",
+            vec![
+                step_spec("work", "true", None),
+                step_spec("review", "steps.work.done", None),
+            ],
+        ))
+        .unwrap();
     let jobs = Arc::new(InMemoryJobs::new());
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
@@ -113,6 +122,8 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
                 Scope::All,
             )
             .allow("platform-admin", Action::Read, Resource::job(), Scope::All)
+            .allow("audit-readonly", Action::Read, Resource::job(), Scope::All)
+            .allow("own-reader", Action::Read, Resource::job(), Scope::Self_)
             .allow(
                 "platform-admin",
                 Action::Update,
@@ -130,7 +141,7 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let state = JobsApiState {
-        kind_registry: Some(kinds as Arc<dyn WorkflowRegistry>),
+        kind_registry: Some(kinds.clone() as Arc<dyn WorkflowRegistry>),
         roster: Some(Arc::new(AdminRoster)),
         ..JobsApiState::minimal(
             jobs.clone(),
@@ -140,7 +151,12 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
             Arc::new(boss_clock_client::WallClockClient),
         )
     };
-    (router(state), jobs)
+    (router(state), jobs, kinds)
+}
+
+fn app() -> (axum::Router, Arc<InMemoryJobs>) {
+    let (app, jobs, _) = app_with_registry();
+    (app, jobs)
 }
 
 async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, String) {
@@ -222,6 +238,211 @@ fn recorded_statuses(jobs: &InMemoryJobs, step: &StepId) -> Vec<String> {
         .filter(|e| e.payload["step_id"] == step.to_string())
         .map(|e| e.payload["status"].as_str().unwrap_or("?").to_string())
         .collect()
+}
+
+#[tokio::test]
+async fn a_periodic_readiness_sweep_recovers_a_committed_write_without_its_followup() {
+    let (app, jobs) = app();
+    let id = open_job(&app, "promotes").await;
+    let mut work = step_titled(&jobs, &id, "work").await;
+    let review = step_titled(&jobs, &id, "review").await;
+    // The writer committed the row, then died before its readiness pass.
+    // No idempotent resend is made: this is the generic recovery gap.
+    work.status = StepStatus::Completed;
+    jobs.update_step(&work).await.unwrap();
+    assert_eq!(
+        jobs.get_step(&review.id).await.unwrap().unwrap().status,
+        StepStatus::Pending
+    );
+    let request = |method: &str| {
+        Request::builder()
+            .method(method)
+            .uri("/api/jobs/readiness")
+            .header("x-boss-user", admin_header())
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, body) = send(&app, request("GET")).await;
+    assert_eq!(status, StatusCode::OK, "readiness audit: {body}");
+    let audit: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(audit["complete"], true);
+    assert_eq!(audit["satisfied_pending"], 1);
+    assert_eq!(
+        jobs.get_step(&review.id).await.unwrap().unwrap().status,
+        StepStatus::Pending,
+        "audit never writes"
+    );
+    let (status, body) = send(&app, request("POST")).await;
+    assert_eq!(status, StatusCode::OK, "readiness repair: {body}");
+    assert_eq!(
+        jobs.get_step(&review.id).await.unwrap().unwrap().status,
+        StepStatus::Ready
+    );
+    assert_eq!(recorded_statuses(&jobs, &review.id), vec!["ready"]);
+    let (status, body) = send(&app, request("POST")).await;
+    assert_eq!(status, StatusCode::OK, "idempotent second pass: {body}");
+    assert_eq!(
+        recorded_statuses(&jobs, &review.id),
+        vec!["ready"],
+        "retry records no duplicate promotion"
+    );
+    let (_, body) = send(&app, request("GET")).await;
+    let audit: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(audit["satisfied_pending"], 0);
+    assert_eq!(audit["complete"], true);
+}
+
+#[tokio::test]
+async fn the_sweep_recovers_multiple_protocols_and_leaves_an_unsatisfied_guard_alone() {
+    let (app, jobs) = app();
+    let mut reviews = Vec::new();
+    for kind in ["promotes", "promotes-too"] {
+        let id = open_job(&app, kind).await;
+        let mut work = step_titled(&jobs, &id, "work").await;
+        reviews.push(step_titled(&jobs, &id, "review").await);
+        work.status = StepStatus::Completed;
+        jobs.update_step(&work).await.unwrap();
+    }
+    let waiting = open_job(&app, "promotes").await;
+    let waiting = step_titled(&jobs, &waiting, "review").await;
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/api/jobs/readiness")
+            .header("x-boss-user", admin_header())
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for review in reviews {
+        assert_eq!(
+            jobs.get_step(&review.id).await.unwrap().unwrap().status,
+            StepStatus::Ready
+        );
+        assert_eq!(recorded_statuses(&jobs, &review.id), vec!["ready"]);
+    }
+    assert_eq!(
+        jobs.get_step(&waiting.id).await.unwrap().unwrap().status,
+        StepStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn unreadable_steps_are_an_incomplete_audit_not_a_clean_zero() {
+    let (app, jobs) = app();
+    let id = open_job(&app, "promotes").await;
+    jobs.fail_steps_read(&id);
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .uri("/api/jobs/readiness")
+            .header("x-boss-user", admin_header())
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(report["complete"], false);
+    assert!(
+        report["errors"][0]
+            .as_str()
+            .unwrap()
+            .contains(&id.to_string()),
+        "{body}"
+    );
+    assert!(
+        report["errors"][0].as_str().unwrap().contains("unreadable"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_denied_audit_does_not_report_a_clean_empty_estate() {
+    let (app, _) = app();
+    for method in ["GET", "POST"] {
+        let (status, body) = send(
+            &app,
+            Request::builder()
+                .method(method)
+                .uri("/api/jobs/readiness")
+                .header(
+                    "x-boss-user",
+                    r#"{"id":"emp-untrusted","role":"guest","access_tier":"user"}"#,
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn recovery_reads_the_packets_pinned_version_not_the_latest_protocol() {
+    let (app, jobs, kinds) = app_with_registry();
+    let id = open_job(&app, "promotes").await;
+    let review = step_titled(&jobs, &id, "review").await;
+    let mut work = step_titled(&jobs, &id, "work").await;
+    work.status = StepStatus::Completed;
+    jobs.update_step(&work).await.unwrap();
+    let mut replacement = spec(
+        "promotes",
+        vec![
+            step_spec("work", "true", None),
+            step_spec("review", "false", None),
+        ],
+    );
+    replacement.version = 2;
+    kinds.seed(replacement).unwrap();
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/api/jobs/readiness")
+            .header("x-boss-user", admin_header())
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        jobs.get_step(&review.id).await.unwrap().unwrap().status,
+        StepStatus::Ready
+    );
+    assert_eq!(
+        jobs.get_job(&id).await.unwrap().unwrap().workflow_version,
+        1
+    );
+}
+
+#[tokio::test]
+async fn audit_authority_does_not_grant_repair_and_a_scoped_zero_is_not_global() {
+    let (app, _) = app();
+    for (role, global) in [("audit-readonly", true), ("own-reader", false)] {
+        let caller =
+            serde_json::json!({"id":"emp-auditor","role":role,"access_tier":"user"}).to_string();
+        let request = |method: &str| {
+            Request::builder()
+                .method(method)
+                .uri("/api/jobs/readiness")
+                .header("x-boss-user", &caller)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let (status, body) = send(&app, request("GET")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(report["global"], global);
+        let (status, body) = send(&app, request("POST")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "read authority is not write authority: {body}"
+        );
+    }
 }
 
 #[tokio::test]

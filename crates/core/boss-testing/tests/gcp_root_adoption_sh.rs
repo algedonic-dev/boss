@@ -271,7 +271,7 @@ fn the_read_only_proof_refuses_missing_tree_without_reading_credentials() {
 fn partial_preparation_keeps_units_and_complete_preparation_migrates_doors_first() {
     let dir = scratch_dir("gcp-root-install-order");
     let source = dir.join("source");
-    for name in ["gcp", "lib", "estate"] {
+    for name in ["gcp", "lib", "estate", "ml"] {
         copy_dir(
             &repo_root().join("infra").join(name),
             &source.join("infra").join(name),
@@ -287,9 +287,14 @@ fn partial_preparation_keeps_units_and_complete_preparation_migrates_doors_first
     );
     write_file(
         &source.join("infra/estate/roles.toml"),
-        "[always]\nunits = [\"boss-gcp-converge\", \"boss-codebase-metrics\", \"boss-estate-observe-host\"]\n",
+        "[always]\nunits = [\"boss-gcp-converge\", \"boss-codebase-metrics\", \"boss-estate-observe-host\", \"boss-surface-usage\", \"boss-ml-inference-batch\"]\n",
     );
     for ext in ["service", "timer"] {
+        std::fs::copy(
+            repo_root().join(format!("infra/boss-surface-usage.{ext}")),
+            source.join(format!("infra/boss-surface-usage.{ext}")),
+        )
+        .unwrap();
         std::fs::copy(
             repo_root().join(format!("infra/boss-codebase-metrics.{ext}")),
             source.join(format!("infra/boss-codebase-metrics.{ext}")),
@@ -365,4 +370,39 @@ fn partial_preparation_keeps_units_and_complete_preparation_migrates_doors_first
         "{observer}"
     );
     assert!(!observer.contains("ExecStart=/opt/boss"));
+    // The prepared root unit wins over the legacy source. Check what the
+    // installer actually wrote: a legacy-only retry fix never reaches this path.
+    let surface = std::fs::read_to_string(etc.join("boss-surface-usage.service")).unwrap();
+    assert_eq!(
+        surface,
+        std::fs::read_to_string(units.join("boss-surface-usage.service")).unwrap()
+    );
+    for unit in [
+        surface,
+        std::fs::read_to_string(source.join("infra/boss-surface-usage.service")).unwrap(),
+    ] {
+        assert_eq!(
+            unit.lines()
+                .filter(|line| line.starts_with("Environment=BOSS_WRAP_OPEN_RETRY="))
+                .collect::<Vec<_>>(),
+            ["Environment=BOSS_WRAP_OPEN_RETRY=3"],
+            "both installation paths must opt into the same bounded packet recovery: {unit}"
+        );
+    }
+    for name in ["boss-codebase-metrics", "boss-ml-inference-batch"] {
+        let installed = std::fs::read_to_string(etc.join(format!("{name}.service"))).unwrap();
+        assert_eq!(
+            installed,
+            std::fs::read_to_string(units.join(format!("{name}.service"))).unwrap(),
+            "the accepted root-tree unit must win over the legacy source: {name}"
+        );
+        assert_eq!(
+            installed
+                .lines()
+                .filter(|line| line.starts_with("Environment=BOSS_WRAP_OPEN_RETRY="))
+                .collect::<Vec<_>>(),
+            ["Environment=BOSS_WRAP_OPEN_RETRY=3"],
+            "the installed root-tree maintenance caller must opt into bounded packet recovery: {name}"
+        );
+    }
 }

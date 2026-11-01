@@ -32,12 +32,14 @@ mod census;
 mod flights;
 mod jobs;
 mod kinds;
+mod membership_observation;
 mod move_admission;
 mod move_corrections;
 mod moves;
 mod plugins;
 mod presence;
 mod queue_age;
+mod readiness;
 mod refusals;
 mod regions;
 mod release;
@@ -73,7 +75,12 @@ use yard::*;
 
 pub use jobs::{ESTATE_PAGE_CEILING, ESTATE_PAGE_DEFAULT, FAILED_VERB_KEYS};
 pub use moves::{MOVER_ACTOR, run_mover};
+#[cfg(test)]
+mod flow_gate;
+mod map_warmer;
+pub use map_warmer::{MapReadings, run_map_warmer};
 pub use presence::PresenceKey;
+pub use regions::MapReading;
 
 const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 1000;
@@ -85,6 +92,8 @@ const BULK_ASSIGNED_LIMIT: i64 = 50_000;
 /// Shared state for jobs API handlers.
 pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     pub jobs: Arc<R>,
+    /// Evidence adapters selected only by declarations on the pinned protocol.
+    pub completion_contracts: crate::completion_contract::Contracts,
     pub bus: Arc<B>,
     pub publisher: DomainPublisher,
     pub step_registry: Arc<StepRegistry>,
@@ -98,6 +107,9 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// caller wires the adapter in; endpoints respond with 503 in that
     /// case to keep the seam explicit.
     pub kind_registry: Option<Arc<dyn WorkflowRegistry>>,
+    /// Native identity aliases for reserved releases. Missing refuses aliases;
+    /// an exact named releaser remains independent of this registry.
+    pub release_actors: Option<Arc<dyn crate::agents::AgentsRegistry>>,
     /// Step UX plugin registry — authored via /api/jobs/step-plugins.
     /// Same optionality semantics as `kind_registry`.
     pub plugin_registry: Option<Arc<dyn StepPluginRegistry>>,
@@ -166,6 +178,12 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// `None` is a wiring without a database, where health reports no
     /// schema at all — absent, not `null`: nothing was tried.
     pub schema_ledger: Option<Arc<dyn crate::schema_level::SchemaLedger>>,
+    /// How long health waits for that ledger before answering `null`.
+    /// Every wiring sets [`crate::schema_level::READ_TIMEOUT`]; it is a
+    /// field only so a test whose subject is the ledger's ANSWER can
+    /// hand a backstop instead, and stop measuring the gate's database
+    /// load (f10419f9).
+    pub schema_read_timeout: std::time::Duration,
     /// The key presence tickets are verified with — the gateway's
     /// session key, read from the file it signs with (backlog 72fe3640).
     /// `None` grants presence to nothing: an `x-boss-presence` header is
@@ -190,6 +208,19 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// `GET /api/dispatcher/schedule`, read as the viewer. `None` → the
     /// scheduled rules show as unread on the board.
     pub dispatcher_schedule: Option<Arc<dyn crate::dispatcher_schedule::DispatcherSchedule>>,
+    /// THE MAP'S FLOW READING, shared between map reads for its lifetime
+    /// (backlog b852ec37): the regions and borders reads each took a
+    /// membership snapshot on every tick, 8-12 s apiece on a quiet API
+    /// and past the edge's 100 s under load. See `crate::reading_cache`.
+    pub map_flows:
+        Arc<crate::reading_cache::ReadingCache<crate::membership_replay::MapFlowReading>>,
+    pub map_readings: Arc<MapReadings>,
+    /// Durable flow generations, refreshed by an explicitly owned task.
+    /// Owns fixed native observations independently of HTTP reader lifetimes.
+    pub membership_observation_owner:
+        Arc<crate::membership_observation_service::MembershipObservationOwner>,
+    pub membership_projection:
+        Option<Arc<crate::membership_projection_service::MembershipProjectionService>>,
 }
 
 impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
@@ -227,6 +258,7 @@ impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
     ) -> Self {
         Self {
             jobs,
+            completion_contracts: Default::default(),
             bus,
             publisher,
             step_registry: Arc::new(crate::step_registry::StepRegistry::v1()),
@@ -234,6 +266,7 @@ impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
             role_guards: None,
             clock,
             kind_registry: None,
+            release_actors: None,
             plugin_registry: None,
             job_edges: None,
             stations: None,
@@ -246,11 +279,20 @@ impl<R: JobsRepository, B: EventBus> JobsApiState<R, B> {
             delivery: None,
             agent_budget: None,
             schema_ledger: None,
+            schema_read_timeout: crate::schema_level::READ_TIMEOUT,
             presence_key: None,
             yard_moves: None,
             credentials: None,
             sensors: None,
             dispatcher_schedule: None,
+            map_flows: Arc::new(crate::reading_cache::ReadingCache::new(
+                crate::reading_cache::MAP_FLOW_LIFETIME,
+            )),
+            map_readings: Arc::new(MapReadings::new()),
+            membership_observation_owner: Arc::new(
+                crate::membership_observation_service::MembershipObservationOwner::new(),
+            ),
+            membership_projection: None,
         }
     }
 }
@@ -299,6 +341,18 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
             get(list_step_write_refusals::<R, B>),
         )
         .route("/api/jobs/summary", get(jobs_summary::<R, B>))
+        .route(
+            "/api/jobs/membership-starting-state-observation",
+            get(membership_observation::observe::<R, B>),
+        )
+        .route(
+            "/api/jobs/membership-refresh-observation",
+            get(membership_observation::refresh::<R, B>),
+        )
+        .route(
+            "/api/jobs/readiness",
+            get(readiness::audit::<R, B>).post(readiness::reconcile::<R, B>),
+        )
         .route("/api/jobs/live", get(jobs_live::<R, B>))
         // Per kind: packets ever, open by version, newest terminal —
         // scoped to the caller, unlike the public window above
@@ -333,6 +387,7 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         // pass as the status above so the map, the yard and `boss
         // orient` cannot disagree.
         .route("/api/yard/regions", get(yard_regions::<R, B>))
+        .route("/api/yard/flow", get(yard_flow::<R, B>))
         // The map's RAILS (design d2154293, car 2): one row per border
         // between two regions — what crosses it and how fast, what is
         // waiting to cross with each hold's reason, and the machine that
@@ -389,6 +444,9 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         // Top-level metadata merge — the atomic alternative to the
         // GET → spread → full PUT read-modify-write. `null` removes.
         .route("/api/jobs/{id}/metadata", patch(patch_job_metadata::<R, B>))
+        // Move ONE envelope field, with a reason, on the record — the
+        // narrow alternative to a full-body PUT (backlog eb26059d).
+        .route("/api/jobs/{id}/priority", put(set_job_priority::<R, B>))
         .route(
             "/api/jobs/{id}/metadata/conditional",
             post(conditional_job_metadata::<R, B>),
@@ -515,6 +573,12 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
             "/api/jobs/{id}/steps/{step_id}/corrections",
             post(post_step_correction::<R, B>),
         )
+        // A classification of one frozen value for an executor's START —
+        // the one writer of `input_classifications` (design e72dc7c9).
+        .route(
+            "/api/jobs/{id}/input-classifications",
+            post(post_input_classification::<R, B>),
+        )
         .route(
             "/api/jobs/{id}/steps/{step_id}/claim",
             post(claim_step::<R, B>),
@@ -545,6 +609,11 @@ pub fn router_shared<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route(
             "/api/workflows/{kind}/versions/{version}",
             get(get_kind_version::<R, B>).delete(discard_kind_version::<R, B>),
+        )
+        // A draft that met traffic and lost (backlog 50ded63d).
+        .route(
+            "/api/workflows/{kind}/versions/{version}/reject",
+            post(reject_kind_version::<R, B>),
         )
         // Experiments Tier 1 (the network-experiments decision in docs/architecture-decisions.md):
         // the per-version terminal report — measurement of what
@@ -620,7 +689,7 @@ async fn health<R: JobsRepository, B: EventBus>(
     let capabilities = match state.schema_ledger.as_ref() {
         Some(ledger) => response
             .capabilities
-            .with_schema(crate::schema_level::read(ledger).await),
+            .with_schema(crate::schema_level::read_within(ledger, state.schema_read_timeout).await),
         None => response.capabilities,
     };
     Json(boss_core::startup::HealthResponse {
