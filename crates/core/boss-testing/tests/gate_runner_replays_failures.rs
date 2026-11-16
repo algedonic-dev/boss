@@ -594,6 +594,231 @@ Error: src/it/yard/yard.svelte:12:3 Type 'string' is not assignable to 'number'
     );
 }
 
+/// A lint runner's Python unittest red, as the extractor writes it and
+/// failure_facts reads it (backlog 05ddf1ca). The extractor's error-line
+/// rung writes a framing line and `| ERROR: <test> (<id>)`, and the
+/// traceback rides in `fails_excerpt`; the classifier finds that block by
+/// the quoted line and reads the exception it ends on. Both halves are
+/// spelled in two languages, so this holds them to each other: a rewording
+/// of the framing line or of the quote would otherwise send every such red
+/// back to product_defect in silence. The traceback is gate 35600cc4's
+/// shape, trimmed; the control's exception is one no signature names.
+#[test]
+fn a_unittest_error_is_read_by_the_exception_its_traceback_ends_on() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let log = |exception: &str| {
+        format!(
+            "\
+::group::gate: the-converge-watches-postgres
+......................E....................
+======================================================================
+ERROR: test_named_target (__main__.RecoveryContracts.test_named_target)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File \"/gate-target/repo/infra/forge/postgres-rollout.py\", line 409, in rendered_postgres
+    archive = subprocess.run(['git', 'archive'], capture_output=True, timeout=60)
+  File \"/usr/lib/python3.11/subprocess.py\", line 1251, in _check_timeout
+    raise TimeoutExpired(
+{exception}
+
+----------------------------------------------------------------------
+Ran 43 tests in 110.998s
+
+FAILED (errors=1)
+::endgroup::
+"
+        )
+    };
+    let mut wrong: Vec<String> = Vec::new();
+    for (exception, drives) in [
+        (
+            "subprocess.TimeoutExpired: Command '['git', 'archive']' timed out after 60 seconds",
+            true,
+        ),
+        ("KeyError: 'postgres'", false),
+    ] {
+        let got = run_extractor(
+            &red_receipt("{\"name\":\"the-converge-watches-postgres\",\"result\":\"fail\"}"),
+            &log(exception),
+        );
+        assert!(got.ok, "extractor failed: {}", got.stdout);
+        let mut receipt: Value = serde_json::from_str(&got.receipt).expect("receipt parses");
+        receipt["runtime_evidence"] = serde_json::json!({"intervals": [{
+            "from": "check-start:the-converge-watches-postgres",
+            "to": "check-finish:the-converge-watches-postgres",
+            "state": "measured",
+            "stall_usec": {"io.full": 101_000_000u64},
+            "elapsed_ns": 111_000_000_000u64,
+        }]});
+        let read = boss_jobs::failure_facts::read_failed_receipt(&receipt);
+        let read_as_the_drives = !read.stalled.is_empty() && read.defects.is_empty();
+        let read_as_the_products = read.stalled.is_empty() && !read.defects.is_empty();
+        if (drives && !read_as_the_drives) || (!drives && !read_as_the_products) {
+            wrong.push(format!(
+                "{exception}: fails {:?} read as stalled {:?}, defects {:?}",
+                got.fails(),
+                read.stalled,
+                read.defects
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// One crate's compile error, in the shape rustc prints it: the coded
+/// `error[E0308]:` line, its `-->` location, the source frame, and
+/// cargo's `could not compile` summary last. The site is red train
+/// 1042cc8a's (2026-10-19): an E0308 in boss-cli's identity_tests.rs.
+fn rustc_e0308(krate: &str, path: &str, line: u32) -> String {
+    format!(
+        "    Checking {krate} v0.1.0 (/gate/src/crates/{krate})
+error[E0308]: mismatched types
+   --> {path}:{line}:9
+    |
+{line} |         Some(\"x\"),
+    |         ^^^^^^^^^ expected `&str`, found `Option<&str>`
+    |
+    = note: expected reference `&str`
+                    found enum `Option<&'static str>`
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `{krate}` (lib test) due to 1 previous error
+"
+    )
+}
+
+#[test]
+fn compiler_causes_keep_their_own_locations() {
+    assert!(!python3_missing(), "this parser test requires python3");
+    let a = rustc_e0308("boss-a", "crates/a/src/lib.rs", 11);
+    let b = rustc_e0308("boss-b", "crates/b/src/l.rs", 2);
+    // The review's adjacency has no intervening Checking preamble:
+    // crate A's summary is immediately followed by crate B's error.
+    let b = b.split_once('\n').unwrap().1;
+    let log = format!("::group::gate: clippy\n{a}{b}::endgroup::\n");
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"clippy\",\"result\":\"fail\"}"),
+        &log,
+    );
+    assert!(got.ok, "{}", got.stdout);
+    let joined = got.fails_joined();
+    assert!(
+        !joined.contains("previous error (crates/b/src/l.rs:2:9)"),
+        "a summary borrowed the next error's location:\n{joined}"
+    );
+    assert!(
+        joined.contains("error[E0308]: mismatched types (crates/b/src/l.rs:2:9)"),
+        "{joined}"
+    );
+}
+
+#[test]
+fn compiler_causes_keep_unique_slots() {
+    assert!(!python3_missing(), "this parser test requires python3");
+    let a = rustc_e0308("boss-a", "crates/a/src/lib.rs", 11);
+    let log = format!("::group::gate: clippy\n{a}{a}::endgroup::\n");
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"clippy\",\"result\":\"fail\"}"),
+        &log,
+    );
+    assert!(got.ok, "{}", got.stdout);
+    let joined = got.fails_joined();
+    assert_eq!(
+        joined
+            .matches("error[E0308]: mismatched types (crates/a/src/lib.rs:11:9)")
+            .count(),
+        1,
+        "duplicate lib/lib-test causes spend slots:\n{joined}"
+    );
+}
+
+/// A coded rustc error is the cause; `could not compile` is cargo's
+/// summary of it. Red train 1042cc8a's alarm read `clippy: … 1 error
+/// line(s), first 1: … error: could not compile boss-cli … due to 1
+/// previous error`, and the E0308 with its file and line was only in
+/// the log tail (backlog 6e2709ab): RE_ERROR's `\b` after the optional
+/// `[E0308]` group could never match, because `]` then `:` are two
+/// non-word characters, so every coded error was dropped and the
+/// summary was the one error line left. A verdict must name what failed.
+#[test]
+fn a_compile_red_quotes_the_coded_rustc_error_and_its_location() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let path = "crates/orchestrators/boss-cli/src/gate/reservation/identity_tests.rs";
+    let log = format!(
+        "::group::gate: clippy\n{}::endgroup::\n",
+        rustc_e0308("boss-cli", path, 157)
+    );
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"clippy\",\"result\":\"fail\"}"),
+        &log,
+    );
+    let fails = got.fails().expect("fails is present");
+    let joined = fails.join("\n");
+
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let first = fails
+        .iter()
+        .find(|e| e.contains(": | "))
+        .unwrap_or_else(|| panic!("no quoted error line at all:\n{joined}"));
+    assert!(
+        first.contains(&format!("error[E0308]: mismatched types ({path}:157:9)")),
+        "the FIRST quoted line must be the coded error with its location, not cargo's \
+         summary:\n{joined}"
+    );
+}
+
+/// Ranking, not only matching: when several crates fail, cargo
+/// interleaves each crate's errors with its `could not compile` line,
+/// and PER_CHECK quotes only the first five. Three crates is six lines;
+/// in log order the third crate's real error is the one cut, and two
+/// summaries that name no cause are quoted in its place. Summaries go
+/// last, so every cause is quoted before any summary of one.
+#[test]
+fn every_crates_cause_is_quoted_before_any_could_not_compile_summary() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let mut log = String::from("::group::gate: build\n");
+    for (krate, line) in [("boss-a", 11), ("boss-b", 22), ("boss-c", 33)] {
+        log.push_str(&rustc_e0308(
+            krate,
+            &format!("crates/{krate}/src/lib.rs"),
+            line,
+        ));
+    }
+    log.push_str("::endgroup::\n");
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"build\",\"result\":\"fail\"}"),
+        &log,
+    );
+    let joined = got.fails_joined();
+
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    for loc in [
+        "crates/boss-a/src/lib.rs:11:9",
+        "crates/boss-b/src/lib.rs:22:9",
+        "crates/boss-c/src/lib.rs:33:9",
+    ] {
+        assert!(
+            joined.contains(&format!("error[E0308]: mismatched types ({loc})")),
+            "every crate's coded error must be quoted, {loc} is missing:\n{joined}"
+        );
+    }
+    let first_summary = joined.find("could not compile").unwrap_or(usize::MAX);
+    let last_cause = joined.rfind("error[E0308]").unwrap_or(0);
+    assert!(
+        last_cause < first_summary,
+        "no `could not compile` summary may be quoted ahead of a cause:\n{joined}"
+    );
+}
+
 /// THE THIRD FAILURE, one level deeper again (backlog 5708cbd5). Train
 /// #361's red gate (2026-09-14) recorded `test: the_real_run_refuses…
 /// - FAILED, with no panic line for it in this check's output` — the
@@ -781,6 +1006,218 @@ fn a_multi_line_panic_message_keeps_its_body_in_fails() {
         fails.len(),
         1,
         "still one entry per failing test:\n{fails:#?}"
+    );
+}
+
+/// A test whose EXPECTED path panics in a spawned task before its own
+/// assertion fails — the `---- … stdout ----` block copied verbatim from
+/// train gate-run 73ec4f20 (2026-11-04; the same block recurs on gate-run
+/// 07c90481), whose `fails` entry named the spawned task's deliberate
+/// `RecvError` and not the assertion at clock_tests.rs:232 that failed.
+const CARGO_LOG_SPAWNED_TASK_PANICS_FIRST: &str = "\
+::group::gate: test
+running 2118 tests
+test membership_projection_service::clock_tests::a_fold_saved_while_the_app_clock_and_the_database_clock_differ_resumes ... FAILED
+
+failures:
+
+---- membership_projection_service::clock_tests::a_fold_saved_while_the_app_clock_and_the_database_clock_differ_resumes stdout ----
+
+thread 'tokio-rt-worker' (478432) panicked at crates/core/boss-jobs/src/membership_projection_service.rs:970:32:
+called `Result::unwrap()` on an `Err` value: RecvError
+
+thread 'membership_projection_service::clock_tests::a_fold_saved_while_the_app_clock_and_the_database_clock_differ_resumes' (478334) panicked at crates/core/boss-jobs/src/membership_projection_service/clock_tests.rs:232:5:
+flight 1 must end pending, keeping its saved fold: 48-hour history: membership projection fold task: task 1401 panicked with message \"called `Result::unwrap()` on an `Err` value: RecvError\"; 24-hour history: native membership replay deadline exhausted
+
+
+failures:
+    membership_projection_service::clock_tests::a_fold_saved_while_the_app_clock_and_the_database_clock_differ_resumes
+
+test result: FAILED. 2114 passed; 1 failed; 3 ignored; 0 measured; 0 filtered out; finished in 192.00s
+
+error: test failed, to rerun pass `-p boss-jobs --lib` (exit status: 101)
+::endgroup::
+";
+
+/// THE FAILURE IS THE TEST THREAD'S PANIC, NOT THE FIRST ONE PRINTED
+/// (backlog 33728b07). libtest names each test's thread after the test,
+/// and a spawned task's panic prints into the same `---- <test> stdout
+/// ----` block, ahead of the test's own. The entry took the first panic
+/// of any thread, so the receipt — and every reader of `fails` after it:
+/// failure_facts' equipment classifier (the message after the FIRST
+/// `panicked at <loc>: `), the judged-red and drift readers (the path
+/// after it) — read the deliberate `RecvError` as the failure. The
+/// spawned panic is kept, not dropped: the entry says one came first and
+/// on which thread, and the excerpt still quotes it whole.
+#[test]
+fn a_failing_tests_entry_names_its_own_threads_panic_not_a_spawned_tasks() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let got = run_extractor(
+        &red_receipt("{\"name\":\"test\",\"result\":\"fail\"}"),
+        CARGO_LOG_SPAWNED_TASK_PANICS_FIRST,
+    );
+    assert!(got.ok, "extractor failed: {}", got.stdout);
+    let fails = got.fails().expect("fails is present");
+    assert_eq!(fails.len(), 1, "one entry per failing test:\n{fails:#?}");
+    let entry = &fails[0];
+    let (_, after) = entry
+        .split_once("panicked at ")
+        .unwrap_or_else(|| panic!("the entry is on the located rung:\n{entry}"));
+    assert!(
+        after.starts_with(
+            "crates/core/boss-jobs/src/membership_projection_service/clock_tests.rs:232:5: \
+             flight 1 must end pending"
+        ),
+        "the FIRST `panicked at` in the entry is what failure_facts, the judged-red reader and \
+         the drift reader take, so it must be the test thread's own panic — the assertion at \
+         clock_tests.rs:232 — not the spawned task's deliberate RecvError:\n{entry}"
+    );
+    assert_eq!(
+        entry.matches("panicked at ").count(),
+        1,
+        "the spawned task's panic is context, so it must not read as a second located \
+         failure:\n{entry}"
+    );
+    assert!(
+        entry.contains("'tokio-rt-worker'"),
+        "the entry says another thread panicked first, and which, so the excerpt's first \
+         panic line is not mistaken for this failure:\n{entry}"
+    );
+    let excerpt = got.excerpt_of("test");
+    assert!(
+        excerpt.contains(
+            "thread 'tokio-rt-worker' (478432) panicked at \
+             crates/core/boss-jobs/src/membership_projection_service.rs:970:32:"
+        ) && excerpt.contains("clock_tests.rs:232:5:"),
+        "the excerpt keeps both panics whole — the context is not dropped:\n{excerpt}"
+    );
+}
+
+/// One failing test `alpha` whose block holds a spawned thread's panic
+/// first, on a thread named `thread`, then alpha's own assertion.
+fn cargo_log_spawned_thread_named(thread: &str) -> String {
+    format!(
+        "::group::gate: test\n\
+         running 1 test\n\
+         test alpha ... FAILED\n\
+         \n\
+         failures:\n\
+         \n\
+         ---- alpha stdout ----\n\
+         \n\
+         thread '{thread}' (1) panicked at worker.rs:2:3:\n\
+         expected spawned panic\n\
+         \n\
+         thread 'alpha' (2) panicked at alpha.rs:4:5:\n\
+         assertion failed: real assertion\n\
+         \n\
+         \n\
+         failures:\n    alpha\n\
+         \n\
+         test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n\
+         ::endgroup::\n"
+    )
+}
+
+/// THE QUOTED CONTEXT MUST NOT CARRY A DELIMITER (review 78a9d826 R1 of
+/// car 05967eb0). The entry names the first earlier thread AHEAD of the
+/// located rung, and a Rust thread's name is the spawner's free text: one
+/// named `panicked at misleading.rs:1:1: bogus` put the FIRST `panicked
+/// at` of the entry inside the quote, so every reader that splits there
+/// read `misleading.rs:1:1` as the failure. Three cases: an ordinary
+/// worker name (the control, green before the repair too), the review's
+/// own name, and one whose fake message is an equipment phrase — where
+/// the misreading is not a wrong line but a LAUNDERING: failure_facts
+/// read `deadline exhausted` out of the thread's name, and with the
+/// check's interval stalled past the line it recorded a branch's
+/// assertion as the drive's.
+///
+/// Each case is read the way its consumers read it. failure_facts is
+/// called for real (`read_failed_receipt` over the receipt the extractor
+/// wrote, with a stall past `EQUIPMENT_IO_FULL_SECONDS` added so that a
+/// misread phrase WOULD waive it); boss-cli's `fails_entry_path` and
+/// `judged_red::located_failures` are crate-private, so their shared
+/// first step — the first whitespace word after the first `panicked at `
+/// — is taken here as they take it.
+#[test]
+fn a_thread_name_that_says_panicked_at_is_not_read_as_the_failure() {
+    if python3_missing() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let mut wrong: Vec<String> = Vec::new();
+    for thread in [
+        "ordinary-worker",
+        "panicked at misleading.rs:1:1: bogus",
+        "panicked at misleading.rs:1:1: deadline exhausted",
+    ] {
+        let got = run_extractor(
+            &red_receipt("{\"name\":\"test\",\"result\":\"fail\"}"),
+            &cargo_log_spawned_thread_named(thread),
+        );
+        assert!(got.ok, "extractor failed for {thread:?}: {}", got.stdout);
+        let fails = got.fails().expect("fails is present");
+        assert_eq!(fails.len(), 1, "one entry for alpha:\n{fails:#?}");
+        let entry = &fails[0];
+
+        let after = entry
+            .split_once("panicked at ")
+            .map(|(_, after)| after)
+            .unwrap_or("");
+        if !after.starts_with("alpha.rs:4:5: assertion failed: real assertion")
+            || after.split_whitespace().next() != Some("alpha.rs:4:5:")
+        {
+            wrong.push(format!(
+                "{thread:?}: the first `panicked at` of the entry is not alpha's own \
+                 (alpha.rs:4:5): {entry}"
+            ));
+        }
+        if entry.matches("panicked at ").count() != 1 {
+            wrong.push(format!(
+                "{thread:?}: the entry carries more than one `panicked at `: {entry}"
+            ));
+        }
+        if !entry.contains(thread.trim_start_matches("panicked at ")) {
+            wrong.push(format!(
+                "{thread:?}: the entry no longer says which thread panicked first: {entry}"
+            ));
+        }
+        let excerpt = got.excerpt_of("test");
+        if !excerpt.contains(&format!("thread '{thread}' (1) panicked at worker.rs:2:3:")) {
+            wrong.push(format!(
+                "{thread:?}: the excerpt lost the earlier panic's own line:\n{excerpt}"
+            ));
+        }
+
+        let mut receipt: Value = serde_json::from_str(&got.receipt).expect("receipt parses");
+        receipt["runtime_evidence"] = serde_json::json!({"intervals": [{
+            "from": "check-start:test",
+            "to": "check-finish:test",
+            "state": "measured",
+            "stall_usec": {"io.full": 200_000_000u64},
+            "elapsed_ns": 300_000_000_000u64,
+        }]});
+        let read = boss_jobs::failure_facts::read_failed_receipt(&receipt);
+        if !read.stalled.is_empty()
+            || !read
+                .defects
+                .iter()
+                .any(|d| d.contains("on a Rust assertion in this entry"))
+        {
+            wrong.push(format!(
+                "{thread:?}: failure_facts did not read alpha's own assertion — stalled \
+                 {:?}, defects {:?}",
+                read.stalled, read.defects
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a quoted thread name must not become the entry's located failure:\n{}",
+        wrong.join("\n")
     );
 }
 

@@ -5,6 +5,12 @@
 //! Payload carries the authenticated username and an absolute expiry.
 //! Verification is constant-time and rejects expired tokens.
 //! The session key is a random 32-byte value loaded from disk at startup.
+//!
+//! The SAME construction signs presence tickets, so the two are told apart
+//! by KEY, never by field names (backlog 19f00800): a ticket is MAC'd under
+//! a key derived from this one (`boss_core::presence::derived_key`), as is
+//! the OIDC state cookie, and a cookie stays on the root key so a deploy
+//! signs nobody out. The cross-decode tests below pin both directions.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -368,6 +374,72 @@ mod tests {
         assert_eq!(Session::decode("no-dot", KEY), Err(SessionError::Malformed));
         assert_eq!(
             Session::decode("bad_b64.bad_b64", KEY),
+            Err(SessionError::BadSignature)
+        );
+    }
+
+    /// Signs `payload` exactly the way [`Session::encode`] does, so a
+    /// test can put fields in a session cookie that no `Session` carries.
+    fn signed_as_a_session(payload: &serde_json::Value) -> String {
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap());
+        let mut mac = HmacSha256::new_from_slice(KEY).unwrap();
+        mac.update(payload_b64.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{payload_b64}.{sig_b64}")
+    }
+
+    /// THE HOSTILE CASE (backlog 19f00800, design c22f36c6 item 1). A
+    /// session cookie and a presence ticket had one wire format under one
+    /// key, so the only thing keeping a cookie from passing as a ticket
+    /// was that its JSON lacked the ticket's `s h n`. A session payload
+    /// that ALSO carries them — still a valid session, signed by the
+    /// session codec — must not decode as a ticket. Only a key that
+    /// differs by purpose can refuse it; field names cannot, and on the
+    /// old codec this verified as presence for `emp-david` on `step-1`.
+    #[test]
+    fn a_session_cookie_is_not_a_presence_ticket_even_carrying_its_fields() {
+        use boss_core::presence::{PresenceTicket, now_epoch};
+        let hostile = signed_as_a_session(&serde_json::json!({
+            "u": "david", "e": now() + 600, "i": "emp-david",
+            "s": "step-1", "h": "hash", "n": "nonce",
+        }));
+        assert!(
+            boss_core::session_claims::verify(&hostile, KEY, now()).is_ok(),
+            "the fixture is a genuine session cookie"
+        );
+        assert_eq!(
+            PresenceTicket::decode(&hostile, KEY, now_epoch()),
+            None,
+            "a session cookie decoded as a presence ticket"
+        );
+        // And the plain cookie the gateway mints, for completeness.
+        let mut ordinary = Session::new("david", 600);
+        ordinary.employee_id = Some("emp-david".into());
+        assert_eq!(
+            PresenceTicket::decode(&ordinary.encode(KEY), KEY, now_epoch()),
+            None
+        );
+    }
+
+    /// The other direction: a ticket the gateway mints under this same
+    /// key is refused as a session cookie — on its SIGNATURE, which is
+    /// the separation, and not merely on its missing `u` (the old codec
+    /// verified the MAC and refused only at the parse, `Malformed`).
+    #[test]
+    fn a_presence_ticket_is_not_a_session_cookie() {
+        use boss_core::presence::{PresenceTicket, now_epoch};
+        let ticket = PresenceTicket {
+            i: "emp-david".into(),
+            s: "step-1".into(),
+            h: "hash".into(),
+            n: "nonce".into(),
+            e: now_epoch() + 60,
+        }
+        .encode(KEY)
+        .unwrap();
+        assert!(PresenceTicket::decode(&ticket, KEY, now_epoch()).is_some());
+        assert_eq!(
+            Session::decode(&ticket, KEY),
             Err(SessionError::BadSignature)
         );
     }

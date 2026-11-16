@@ -80,7 +80,7 @@ fn dock_station_row() -> boss_jobs::StationSpec {
     let mut s = boss_jobs::StationSpec::draft(
         "loading-dock",
         "Loading dock — parked ship-a-change cars",
-        boss_jobs::StationKind::Batch,
+        boss_jobs::StationKind::Group,
         boss_jobs::station_queue::StationPredicate {
             kind: Some("ship-a-change".into()),
             status: Some(JobStatus::Open),
@@ -347,7 +347,7 @@ async fn every_border_carries_its_flow_its_queue_and_its_machine() {
     assert_eq!(arrivals["held_since"], Value::Null);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_machine_is_read_from_its_own_firing_record_and_silence_is_trouble() {
     let (app, jobs, cadence) = app();
     seed(&jobs).await;
@@ -375,7 +375,20 @@ async fn the_machine_is_read_from_its_own_firing_record_and_silence_is_trouble()
         })
         .await
         .unwrap();
-    let (_, v) = get(&app, "operator", "/api/yard/borders").await;
+    // Expire the retained paired map, then observe the background publication.
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    let v = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let (status, v) = get(&app, "operator", "/api/yard/borders").await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            if border(&v, "dock", "track")["machine"]["last_fired"] == "2026-09-19T09:00:00+00:00" {
+                break v;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the refreshed map publishes the native firing");
     let boarding = border(&v, "dock", "track");
     assert_eq!(
         boarding["machine"]["last_fired"],

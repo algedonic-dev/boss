@@ -181,15 +181,17 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
     // rebuild work even if the cascade is ever loosened.
     let conserved = std::sync::Mutex::new(std::collections::HashMap::new());
     let move_ledger = std::sync::Mutex::new(std::collections::HashMap::new());
+    let resource_ledger = std::sync::Mutex::new(std::collections::HashMap::new());
     let admission_observations = std::sync::Mutex::new(std::collections::HashMap::new());
     let conditional_pairs =
         std::sync::Mutex::new(crate::conditional_metadata::replay::Pairs::default());
     let stats = replay_projection_checked(
         pool,
         REBUILD_LOCK_KEY,
-        &["DELETE FROM yard_move_admission_observations", "DELETE FROM yard_move_corrections", "DELETE FROM station_claim_receipts", "DELETE FROM steps", "DELETE FROM jobs"],
-        "kind LIKE 'jobs.job.%' OR kind LIKE 'jobs.step.%' OR kind IN ('jobs.station.claimed', 'jobs.station.selection_evidence', 'jobs.metadata.conditionally_merged') OR kind LIKE 'jobs.yard.move.%'",
+        &["DELETE FROM yard_move_admission_observations", "DELETE FROM yard_move_corrections", "DELETE FROM station_claim_receipts", "DELETE FROM resource_stock_obligations", "DELETE FROM resource_identity_bindings", "DELETE FROM step_resource_allocations", "DELETE FROM step_resource_claims", "DELETE FROM steps", "DELETE FROM jobs"],
+        "kind LIKE 'jobs.job.%' OR kind LIKE 'jobs.step.%' OR kind IN ('jobs.pool.published', 'jobs.station.claimed', 'jobs.station.resource_refused', 'jobs.station.selection_evidence', 'jobs.metadata.conditionally_merged') OR kind LIKE 'jobs.yard.move.%'",
         async |_, events| {
+            *resource_ledger.lock().map_err(|_|"resource ledger unavailable")?=crate::flow_resources_replay::reconstruct(events)?;
             *admission_observations.lock().map_err(|_|"admission observation ledger unavailable")?=crate::move_admission::reconstruct(&events.iter().map(|e|boss_core::event::Event{id:e.event_id,timestamp:e.ts,source:"jobs".into(),kind:e.kind.clone(),payload:e.payload.clone()}).collect::<Vec<_>>())?.into_iter().collect::<std::collections::HashMap<_,_>>();
             *conditional_pairs.lock().map_err(|_|"conditional pair index unavailable")?=
                 crate::conditional_metadata::replay::Pairs::read(events)?;
@@ -204,6 +206,11 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
         },
         async |conn, ev| {
             match ev.kind.as_str() {
+                crate::flow_resources::RESERVED | crate::flow_resources::RELEASED | crate::resource_leases::IDENTITY_BOUND | crate::resource_leases::LEASE_EXPIRED | crate::resource_leases::STOCK_RETURNED => {
+                    let entry=resource_ledger.lock().map_err(|_|"resource ledger unavailable")?.get(&ev.event_id).cloned().ok_or("resource fact was not prevalidated")?;
+                    crate::flow_resources_replay::restore_flow_ledger_in_tx(&mut *conn,&entry).await?;
+                    Ok(Applied::Yes)
+                }
                 crate::move_admission::EVENT_KIND=>{
                     let observation=admission_observations.lock().map_err(|_|"admission observation ledger unavailable")?.get(&ev.event_id).cloned().ok_or("admission observation receipt missing")?;
                     sqlx::query("INSERT INTO yard_move_admission_observations(id,original_seq,diagnosis_id,body,event_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO NOTHING")
@@ -218,7 +225,7 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
                     Ok(Applied::Yes)
                 }
 
-                crate::events::STATION_CLAIMED => {
+                crate::events::STATION_CLAIMED | crate::events::STATION_RESOURCE_REFUSED => {
                     let receipt_json = if ev.payload.get("receipt_manifest").is_some() {
                         conserved.lock().map_err(|_| "selection evidence unavailable")?.get(&ev.event_id).cloned()
                     } else { ev.payload.get("receipt_json").and_then(serde_json::Value::as_str).map(str::to_owned) }
@@ -305,7 +312,7 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
                         let before=crate::postgres::get_job_on(&mut *conn,&job.id).await
                             .map_err(|error|error.to_string())?.ok_or("conditional state lacks its preceding Job")?;
                         let schema:Option<serde_json::Value>=if receipt.command.guarded_keys.is_empty() && receipt.command.immutable_keys.is_empty(){None}else{
-                            sqlx::query_scalar("SELECT metadata_schema FROM workflows WHERE kind=$1 AND version=$2 AND status <> 'draft'")
+                            sqlx::query_scalar("SELECT metadata_schema FROM workflows WHERE kind=$1 AND version=$2 AND status IN ('active','retired')")
                                 .bind(&before.kind).bind(before.workflow_version).fetch_optional(&mut *conn).await.map_err(|error|error.to_string())?
                         };
                         conditional_pairs.lock().map_err(|_|"conditional pair index unavailable")?
@@ -414,6 +421,9 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
                 // (design 4105b020); it fell to the unknown-kind arm and
                 // warned once per correction on every replay.
                 | "jobs.step.corrected"
+                // A classification's row rides its sibling JOB_UPDATED
+                // the same way (design e72dc7c9).
+                | "jobs.job.input_classified"
                 // A re-pin's rows ride its sibling JOB_UPDATED /
                 // STEP_UPDATED / STEP_CREATED (design 7cf202a9).
                 | "jobs.job.repinned" => Ok(Applied::Skipped),

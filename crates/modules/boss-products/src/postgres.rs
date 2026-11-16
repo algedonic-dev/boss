@@ -23,6 +23,78 @@ impl PgProducts {
 
 #[async_trait]
 impl ProductsRepository for PgProducts {
+    async fn append_sku_version(
+        &self,
+        row: &crate::sku::SkuVersion,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<bool, ProductsError> {
+        crate::sku::validate(row)?;
+        let payload =
+            serde_json::to_value(row).map_err(|e| ProductsError::Storage(e.to_string()))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        // The unique key arbitrates simultaneous appends. A losing
+        // statement reads again after the winner commits, distinguishing
+        // an identical redelivery from a conflicting version. No separate
+        // unchecked read decides whether this transaction may insert.
+        let inserted = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO product_sku_versions (sku, version, data, created_at) \
+             SELECT $1, $2, $3, $4 WHERE $2::BIGINT::NUMERIC = \
+             (SELECT COALESCE(MAX(version), 0)::NUMERIC + 1 FROM product_sku_versions WHERE sku = $1) \
+             ON CONFLICT (sku, version) DO NOTHING RETURNING version",
+        ).bind(&row.sku).bind(row.version).bind(&payload).bind(stamp.timestamp)
+            .fetch_optional(&mut *tx).await.map_err(|e| ProductsError::Storage(e.to_string()))?.is_some();
+        if !inserted {
+            let old = sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT data FROM product_sku_versions WHERE sku = $1 AND version = $2",
+            )
+            .bind(&row.sku)
+            .bind(row.version)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ProductsError::Storage(e.to_string()))?;
+            return if old.as_ref() == Some(&payload) {
+                Ok(false)
+            } else {
+                Err(crate::sku::conflict(row))
+            };
+        }
+        boss_subject_kinds::subjects::record_subject_in_tx(
+            &mut tx,
+            "product",
+            &row.sku,
+            Some(&row.name),
+        )
+        .await
+        .map_err(ProductsError::Storage)?;
+        let event = stamp.event(crate::events::SKU_VERSION_APPENDED, crate::sku::fact(row));
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        Ok(true)
+    }
+
+    async fn sku_versions(&self) -> Result<Vec<crate::sku::SkuVersion>, ProductsError> {
+        let rows = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT data FROM product_sku_versions ORDER BY sku COLLATE \"C\", version",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        rows.into_iter()
+            .map(|data| {
+                serde_json::from_value(data)
+                    .map_err(|e| ProductsError::Storage(format!("invalid SKU version: {e}")))
+            })
+            .collect()
+    }
+
     async fn list_products(&self, active_only: bool) -> Result<Vec<Product>, ProductsError> {
         // Byte order of SKU, as the double: the database's locale put
         // `suite-ab` before `suite-B` (backlog be459ab9, found by the

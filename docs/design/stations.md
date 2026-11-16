@@ -39,11 +39,13 @@ never a code path.
 - **Constraint stations** — membership defined by capability
   predicates: skills, authority, sign-off rights (Class-registry
   vocabulary), not by an enumerated roster.
-- **Batch stations** — the SDLC's bundling points, where packets
-  accumulate for **periodic, higher-bandwidth handling**: the loading
-  dock, the review queue, board windows. Cadence rules
-  (protocol-cadence.md — notably the `queue-depth` basis) are how
-  batch stations drain.
+- **Batch stations** — DELETED 2026-11-03 (item 0a78f8f8; factory
+  taxonomy Q1). The loading dock became an **equipment** station — it
+  names the automaton that operates it (the conductor) and its bays —
+  and the review queues that also said `batch` are group stations.
+  Cadence rules (protocol-cadence.md — notably the `queue-depth`
+  basis) still drain the dock; a cadence is the program its automaton
+  runs. See docs/design/factory-taxonomy.md M2.
 
 Visual rollup — collapsing actor stations into team/department
 groupings — is a **view-level aggregation** for clutter control, not

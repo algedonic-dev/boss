@@ -234,7 +234,7 @@
     opacity: 0.5;
   }
   :global(.prod-table .sku) {
-    font-family: ui-monospace, monospace;
+    font-family: var(--font-mono);
     font-size: 12px;
   }
 </style>

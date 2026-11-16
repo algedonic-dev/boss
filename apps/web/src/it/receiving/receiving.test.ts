@@ -14,6 +14,7 @@ import {
   laneOf,
   loadEveryPage,
   loadKind,
+  manifestSteps,
   parseJobsPage,
   provenance,
   readings,
@@ -281,7 +282,7 @@ describe('who holds a standing packet', () => {
       who: 'nobody',
       label: 'unassigned',
     });
-    expect(holderOf(row([]))).toEqual({ who: 'nobody', label: 'no ready step' });
+    expect(holderOf(row([]))).toEqual({ who: 'nobody', label: 'no ready or active step' });
   });
   test('a human on any ready step outranks the agent — the packet waits on the person', () => {
     expect(
@@ -292,6 +293,56 @@ describe('who holds a standing packet', () => {
         ]),
       ).who,
     ).toBe('human');
+  });
+  // A CLAIMED packet is held by its claimant (backlog 37f77b79, decided
+  // 2026-09-24). The holder read only ready steps, so a packet whose
+  // intake step an actor had claimed — ACTIVE, not yet completed, so
+  // still standing here — was drawn on nobody: 5 of the 7 "nobody"
+  // packets on 2026-09-24 were page-audits agent-claude was measuring.
+  const claimed = (steps: ReadonlyArray<Record<string, unknown>>): InboundRow => {
+    const r = parseJobsPage({ data: [job({ steps })], total: 1 }).rows[0];
+    if (!r) throw new Error('fixture parsed to nothing');
+    return r;
+  };
+  test('an active step is read with its claimant, beside the ready ones', () => {
+    const r = claimed([
+      { kind: 'trigger', status: 'completed', assignee_id: null },
+      { kind: 'triage', status: 'active', assignee_id: 'agent-claude' },
+    ]);
+    expect(r.ready).toEqual([]);
+    expect(r.active).toEqual([{ kind: 'triage', who: 'agent-claude', failed: null }]);
+  });
+  test('the claimant of an active step holds the packet — agent or person', () => {
+    expect(
+      holderOf(
+        claimed([
+          { kind: 'trigger', status: 'completed', assignee_id: null },
+          { kind: 'triage', status: 'active', assignee_id: 'agent-claude' },
+        ]),
+      ),
+    ).toEqual({ who: 'agent', label: 'the agent' });
+    expect(
+      holderOf(
+        claimed([
+          { kind: 'trigger', status: 'completed', assignee_id: null },
+          { kind: 'answer-question', status: 'active', assignee_id: 'emp-david' },
+        ]),
+      ),
+    ).toEqual({ who: 'human', label: 'emp-david' });
+  });
+  test('a packet with neither a ready nor an active step is on nobody, and says which', () => {
+    expect(
+      holderOf(claimed([{ kind: 'trigger', status: 'completed', assignee_id: null }])),
+    ).toEqual({ who: 'nobody', label: 'no ready or active step' });
+  });
+  test('the manifest shows the active step beside the ready ones, marked active', () => {
+    const r = claimed([
+      { kind: 'trigger', status: 'completed', assignee_id: null },
+      { kind: 'triage', status: 'active', assignee_id: 'agent-claude' },
+      { kind: 'sign-off', status: 'ready', assignee_id: 'emp-david' },
+    ]);
+    expect(manifestSteps(r)).toBe('triage (active), sign-off');
+    expect(manifestSteps(claimed([]))).toBe('—');
   });
 });
 

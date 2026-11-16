@@ -1,0 +1,29 @@
+# ---------------------------------------------------------------------------
+# vault — credentials and deposits (T2 of design 4b27a65a, backlog
+# 3f58c823; handoff section 1). Its machines are the credential and
+# token automations of infra/platform/automations/.
+#
+# A CONTAINER, NOT A QUEUE: the tagged predicate holds no packet (see
+# algedonic.toml). To change this station, bump `version`.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "vault"
+version = 1
+status = "active"
+title = "Vault — credentials and deposits"
+kind = "group"
+discipline = ["priority", "age"]
+id = "fa8b479f-1573-4153-9359-0ee123c3295c"
+parent = "9660c60f-eb47-4405-ae08-fcbb30c71e5f"
+mode = "standing"
+machines = [
+  "automation:credential-broker-stage",
+  "automation:credential-deposit",
+  "automation:machine-token-deposit",
+  "automation:machine-token-effect",
+  "automation:forge-token-audit",
+]
+
+[station.predicate]
+tags_any = ["station:vault"]

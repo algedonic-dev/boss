@@ -36,6 +36,22 @@
 # and why, or the sender's own RED line. The sender never prints a value,
 # so its stderr goes to the journal whole.
 #
+# A RED THAT STANDS IS A LINE THE JUDGE FILES (backlog 3f7d5f23, from
+# review 34f8448c of car 2c628718). forge-converge copies this line into
+# its `output` only when it starts `RED `, and the judge
+# (file-backlog-items-on-forge-converge-red.toml) files one item per route
+# from it. A pin that is absent, a deposit key the forge may not read or
+# that holds no enrollment, a key lost while a boss-gcp value waits for
+# it, a sender that refuses its enrollment: each reds every tick until a
+# person acts, and each ended `unreadable:`, `not configured:` or
+# `refused:` — 144 failed packets a day and nothing filed. Each is
+# `RED runner-credential-push/<route> <kind>: …` now (red, below). A red
+# a later pass may clear — a cluster this tick could not reach, a scratch
+# directory it could not make — says `failed:` and is read on the packet,
+# as the converge's other passing reds are; every_red_end_of_the_forge_
+# push_files_or_says_it_may_clear (runner_credential_send_sh.rs) holds
+# every `finish 1` to one of those two.
+#
 # Exit: 0 delivered, verified, nothing to do, or not yet; anything else is
 # the sender's (1 failed or RED, 78 refused), or 1 when this pass could not
 # read its own inputs — carried by forge-converge, which reds the run.
@@ -59,8 +75,23 @@ finish() {
     echo "$ME: $2"
     exit "$1"
 }
+# red ROUTE KIND WHY — a failure that stands until a person acts, in the
+# shape the judge files: route and kind are one word each.
+red() { finish 1 "RED $ME/$1 $2: $3"; }
 # The first lines of a captured stderr, as one bounded printable line.
 first_lines() { head -n 3 "$1" | tr '\n' ' ' | LC_ALL=C tr -c '[:print:]' '?' | cut -c1-300; }
+# A kubectl read that failed in $WORK/err: NotFound and Forbidden are the
+# API server's answer and stand; anything else (no answer, a container
+# that did not start) is a tick that may pass.
+k_answer() {
+    if grep -q '(NotFound)' "$WORK/err"; then
+        echo notfound
+    elif grep -q '(Forbidden)' "$WORK/err"; then
+        echo forbidden
+    else
+        echo other
+    fi
+}
 
 # --- the cluster, as the forge reaches it ------------------------------
 if [ -n "${BOSS_DEPOSIT_KUBECTL:-}" ]; then
@@ -79,7 +110,7 @@ else
     if [ ! -e "$KC" ] && [ ! -L "$KC" ]; then
         finish 0 "not ready: $KC absent — root material, placed by David (design 835c0c9c); nothing was read or sent"
     elif [ ! -r "$KC" ]; then
-        finish 1 "unreadable: $KC is present but unreadable; nothing was read or sent"
+        red kubeconfig unreadable "$KC is present but this unit cannot read it, and no later tick can until a person repairs its mode or owner; nothing was read or sent"
     fi
     KUBECTL_LINE="docker run --rm --log-driver=none --network host -v $KC:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
 fi
@@ -93,39 +124,77 @@ WORK="$(mktemp -d "$base/runner-push.XXXXXX")" || finish 1 "failed: no private s
 trap 'rm -rf "$WORK"' EXIT
 
 # --- 1. the transport key ----------------------------------------------
-if ! "${KUBECTL[@]}" -n boss get secret runner-deposit-key -o json > "$WORK/key.json" 2> "$WORK/err"; then
-    if grep -q 'NotFound' "$WORK/err"; then
-        finish 0 "not yet: Secret boss/runner-deposit-key does not exist (the cluster converge creates it empty from infra/dispatcher/rules/broker-prepares-the-runner-deposit-key.toml); nothing was sent"
+# no_key WHY — the transport key is absent or empty: `not yet` while
+# nothing waits for it, RED while a boss-gcp value does (backlog
+# 3f7d5f23, (d)). A key deleted (the cluster converge recreates it empty)
+# or emptied after enrollment read `not yet` with exit 0 whatever was
+# staged, so a rotation stalled behind a green tick. A staged
+# boss-gcp.next is a rotation a person scoped and the broker minted,
+# waiting on this push; with no key it cannot reach boss-gcp until a
+# person prepares and enrolls one, which is a red whether or not a key
+# was ever enrolled. The read is the sender's own (it reads this Secret
+# every pass), and only the slot's presence is taken from it — never a
+# value. An unreadable answer is not "nothing waits": no evidence is not
+# a pass.
+no_key() {
+    if ! "${KUBECTL[@]}" -n boss get secret ops-runner-credential -o json > "$WORK/runner.json" 2> "$WORK/err"; then
+        [ "$(k_answer)" = notfound ] \
+            && finish 0 "not yet: $1, and no Secret boss/ops-runner-credential stages anything for boss-gcp; nothing was sent"
+        finish 1 "failed: $1, and whether a boss-gcp value waits for it could not be read (Secret boss/ops-runner-credential: $(first_lines "$WORK/err")); a later pass reads it again; nothing was sent"
     fi
-    finish 1 "unreadable: Secret boss/runner-deposit-key: $(first_lines "$WORK/err")"
+    jq_doc_file "$WORK/runner.json" \
+        || finish 1 "failed: $1, and Secret boss/ops-runner-credential is not one document, so whether a boss-gcp value waits for it is unknown; nothing was sent"
+    waits=0
+    if jq -e '(.data["boss-gcp.next"] // "") | length > 0' "$WORK/runner.json" >/dev/null 2>&1; then
+        waits=1
+    fi
+    rm -f "$WORK/runner.json"
+    if [ "$waits" -eq 1 ]; then
+        red deposit-key lost "$1 while Secret boss/ops-runner-credential stages a boss-gcp.next, so that rotation cannot reach boss-gcp until a person prepares and enrolls a new runner deposit key (a prepare-a-deposit-key packet on runner-deposit-key, scoped, its enroll step signed); nothing was sent"
+    fi
+    finish 0 "not yet: $1 — the broker has not prepared one (a prepare-a-deposit-key packet on runner-deposit-key, scoped), and nothing waits for it; nothing was sent"
+}
+if ! "${KUBECTL[@]}" -n boss get secret runner-deposit-key -o json > "$WORK/key.json" 2> "$WORK/err"; then
+    case "$(k_answer)" in
+        notfound) no_key "Secret boss/runner-deposit-key does not exist (the cluster converge creates it empty from infra/dispatcher/rules/broker-prepares-the-runner-deposit-key.toml)" ;;
+        forbidden) red deposit-key unreadable "Secret boss/runner-deposit-key: $(first_lines "$WORK/err"); the forge's kubeconfig may not read it, so nothing was sent" ;;
+    esac
+    finish 1 "failed: Secret boss/runner-deposit-key could not be read: $(first_lines "$WORK/err"); a later pass reads it again; nothing was sent"
 fi
-jq_doc_file "$WORK/key.json" || finish 1 "unreadable: Secret boss/runner-deposit-key is not one document"
+jq_doc_file "$WORK/key.json" || red deposit-key unreadable "Secret boss/runner-deposit-key is not one document; nothing was sent"
 PRIVATE_B64="$(jq -r '.data.private_key // empty' "$WORK/key.json")" \
-    || finish 1 "unreadable: Secret boss/runner-deposit-key's private_key could not be read; nothing was sent"
+    || red deposit-key unreadable "Secret boss/runner-deposit-key's private_key could not be read; nothing was sent"
 FOR_B64="$(jq -r '.data.minted_for // empty' "$WORK/key.json")" \
-    || finish 1 "unreadable: Secret boss/runner-deposit-key's minted_for could not be read; nothing was sent"
+    || red deposit-key unreadable "Secret boss/runner-deposit-key's minted_for could not be read; nothing was sent"
 rm -f "$WORK/key.json"
 if [ -z "$PRIVATE_B64" ]; then
-    finish 0 "not yet: Secret boss/runner-deposit-key holds no key — the broker has not prepared one (a prepare-a-deposit-key packet on runner-deposit-key, scoped); nothing was sent"
+    no_key "Secret boss/runner-deposit-key holds no key"
 fi
 printf '%s' "$PRIVATE_B64" | base64 -d > "$WORK/key" 2>/dev/null \
-    || finish 1 "unreadable: private_key of Secret boss/runner-deposit-key is not base64; nothing was sent"
+    || red deposit-key unreadable "private_key of Secret boss/runner-deposit-key is not base64; nothing was sent"
 PRIVATE_B64=""
 FOR="$(printf '%s' "$FOR_B64" | base64 -d 2>/dev/null | tr -d '[:space:]')" \
-    || finish 1 "unreadable: minted_for of Secret boss/runner-deposit-key is not base64; nothing was sent"
+    || red deposit-key unreadable "minted_for of Secret boss/runner-deposit-key is not base64; nothing was sent"
 [[ $FOR =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
-    || finish 1 "unreadable: Secret boss/runner-deposit-key holds a key but no minted_for packet id, so its enrollment cannot be checked; nothing was sent"
+    || red deposit-key unreadable "Secret boss/runner-deposit-key holds a key but no minted_for packet id, so its enrollment cannot be checked; nothing was sent"
 
 # --- 2. the pin and the account ----------------------------------------
-"${KUBECTL[@]}" -n boss get configmap break-glass-deposit-known-hosts -o json > "$WORK/pin.json" 2> "$WORK/err" \
-    || finish 1 "unreadable: ConfigMap boss/break-glass-deposit-known-hosts, boss-gcp's pinned host key: $(first_lines "$WORK/err"); nothing was sent"
-jq_doc_file "$WORK/pin.json" || finish 1 "unreadable: ConfigMap boss/break-glass-deposit-known-hosts is not one document; nothing was sent"
+# Absent is a red (above): the pin is placed once, and a key that may
+# reach the receiver never reaches a host this pass cannot authenticate.
+if ! "${KUBECTL[@]}" -n boss get configmap break-glass-deposit-known-hosts -o json > "$WORK/pin.json" 2> "$WORK/err"; then
+    case "$(k_answer)" in
+        notfound) red host-pin missing "ConfigMap boss/break-glass-deposit-known-hosts, boss-gcp's pinned host key, does not exist, and the credential is never sent to a host this pass cannot authenticate; nothing was sent" ;;
+        forbidden) red host-pin unreadable "ConfigMap boss/break-glass-deposit-known-hosts, boss-gcp's pinned host key: $(first_lines "$WORK/err"); nothing was sent" ;;
+    esac
+    finish 1 "failed: ConfigMap boss/break-glass-deposit-known-hosts, boss-gcp's pinned host key, could not be read: $(first_lines "$WORK/err"); a later pass reads it again; nothing was sent"
+fi
+jq_doc_file "$WORK/pin.json" || red host-pin unreadable "ConfigMap boss/break-glass-deposit-known-hosts is not one document; nothing was sent"
 jq -r '.data.known_hosts // empty' "$WORK/pin.json" > "$WORK/known_hosts" 2>/dev/null \
-    || finish 1 "unreadable: known_hosts of ConfigMap boss/break-glass-deposit-known-hosts could not be read; nothing was sent"
+    || red host-pin unreadable "known_hosts of ConfigMap boss/break-glass-deposit-known-hosts could not be read; nothing was sent"
 TARGET="$(jq -r '.data.target // empty' "$WORK/pin.json" 2>/dev/null)" \
-    || finish 1 "unreadable: target of ConfigMap boss/break-glass-deposit-known-hosts could not be read; nothing was sent"
+    || red host-pin unreadable "target of ConfigMap boss/break-glass-deposit-known-hosts could not be read; nothing was sent"
 [ -s "$WORK/known_hosts" ] && [ -n "$TARGET" ] \
-    || finish 1 "not configured: ConfigMap boss/break-glass-deposit-known-hosts carries no known_hosts or no target, and the credential is never sent to a host this pass cannot authenticate; nothing was sent"
+    || red host-pin not-configured "ConfigMap boss/break-glass-deposit-known-hosts carries no known_hosts or no target, and the credential is never sent to a host this pass cannot authenticate; nothing was sent"
 
 # --- 3. the sender -----------------------------------------------------
 # When the tree last changed the receiver: the sender's bound on an older
@@ -187,6 +256,16 @@ case "$rc" in
         ;;
     75)
         finish 0 "$(tail -n 1 "$WORK/out" | sed 's/^runner-credential-send: //')"
+        ;;
+    78)
+        # A REFUSAL STANDS (backlog 3f7d5f23). The sender's 78 is a refusal
+        # of how it was invoked or of the enrollment the key names — a
+        # packet the jobs API does not answer, an enroll step whose line
+        # is not the one signed — and every pass meets it again until a
+        # person acts, so it is RED on the push's own route, in the
+        # sender's words (its red() exits 1, so a 78 never carries one).
+        said="$(tail -n 1 "$WORK/err" | LC_ALL=C tr -c '[:print:]' '?' | cut -c1-300)"
+        red sender refused "the runner credential sender refused this pass (exit 78): ${said:-it said nothing}; nothing was sent"
         ;;
     *)
         # The sender's RED line when it said one, else its last word.

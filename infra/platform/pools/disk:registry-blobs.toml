@@ -1,0 +1,15 @@
+# v2 (backlog 5ece507d): reclaimer_kind names the packet kind the
+# reclaimer's runs file, the key its last run is read by — the kind
+# infra/forge/disk-floor-sweep.service hands the maintenance wrap.
+# v3 (backlog 84f570a1): `capacity_from` says where the capacity number
+# comes from, for the console to show beside it (station-tree.md section 3).
+[[pool]]
+name = "disk:registry-blobs"
+version = 3
+status = "active"
+unit = "GiB"
+kind = "stock"
+reclaimer = "infra/forge/disk-floor-sweep.sh"
+reclaimer_kind = "maintenance-disk-floor-sweep"
+capacity = { state = "unknown" }
+capacity_from = 'Unknown until an observer publishes it: the blob disk of the forge registry; no observer writes it into this row yet. The stock is recovered by its reclaimer, infra/forge/disk-floor-sweep.sh.'

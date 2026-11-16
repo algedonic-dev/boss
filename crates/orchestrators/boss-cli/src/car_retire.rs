@@ -126,7 +126,7 @@ impl WholeTree {
     }
 
     /// Every path that stops the proof, a conflict marked as one.
-    fn files(&self) -> Vec<String> {
+    pub(crate) fn files(&self) -> Vec<String> {
         let all: BTreeSet<&String> = self.conflicted.iter().chain(&self.differing).collect();
         all.into_iter()
             .map(|f| {
@@ -682,11 +682,8 @@ fn with_differences(repo: &Path, judged: Vec<Carried>) -> Result<Vec<Carried>, S
 /// lags. The authority is the forge, read live (see `boss merged`).
 pub(crate) fn forge_main(repo: &Path) -> Result<String> {
     let line = git(repo, &["ls-remote", "origin", "refs/heads/main"]).map_err(|e| anyhow!(e))?;
-    let main = line
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| anyhow!("the forge answered no main — without it nothing can be proved"))?
-        .to_string();
+    let main = crate::receipt::exact_ref_head(&line, "refs/heads/main")
+        .ok_or_else(|| anyhow!("the forge answered no main — without it nothing can be proved"))?;
     if !have(repo, &main) {
         git(repo, &["fetch", "origin", "main"]).map_err(|e| anyhow!(e))?;
     }
@@ -700,12 +697,10 @@ pub(crate) fn forge_main(repo: &Path) -> Result<String> {
 /// branch is still there (every commit on it must be carried), else the
 /// head its receipt vouches for.
 fn twin_head(repo: &Path, twin: &Value, branch: &str) -> Result<String> {
-    let forge = git(
-        repo,
-        &["ls-remote", "origin", &format!("refs/heads/{branch}")],
-    )
-    .ok()
-    .and_then(|l| l.split_whitespace().next().map(str::to_string));
+    let reference = format!("refs/heads/{branch}");
+    let forge = git(repo, &["ls-remote", "origin", &reference])
+        .ok()
+        .and_then(|output| crate::receipt::exact_ref_head(&output, &reference));
     let head = forge
         .clone()
         .or_else(|| receipt_head(twin))
@@ -966,6 +961,56 @@ pub(crate) trait Door: Send + Sync {
         path: &str,
         body: Option<Value>,
     ) -> Result<Option<Value>>;
+
+    /// [`Door::send`] carrying the keys the write JUDGED, as it read them,
+    /// in [`boss_jobs::step_metadata_write::EXPECT_HEADER`] (backlog
+    /// cd1f68c6). A door that cannot carry them refuses and sends
+    /// nothing: a write that asked to be judged never lands unjudged.
+    async fn send_expecting(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        expect: &serde_json::Map<String, Value>,
+    ) -> Result<Option<Value>> {
+        let _ = (method, body, expect);
+        bail!("this door cannot carry the keys a write judged, so {path} was not written")
+    }
+}
+
+/// What a judged step-metadata write came to: it landed, or the review
+/// step no longer read as judged and NOTHING was written (409
+/// `step_changed`). The caller says which hold moved, in its own words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Judged {
+    Written,
+    Moved,
+}
+
+/// The step merge door, judged (backlog cd1f68c6): `body` lands on
+/// `job_id`'s step `step_id` only while that step's metadata still reads
+/// as `expect` under the write's row lock. Every client that decides a
+/// hold write on one read and sends it later writes through here —
+/// `boss rerail --finish` carrying a review hold to the refreshed head
+/// today; the strike release's lift of a red-train hold is the next.
+/// The step race is answered as [`Judged::Moved`]; every other refusal
+/// is an error, as the plain door's.
+pub(crate) async fn patch_step_metadata_expecting(
+    door: &dyn Door,
+    job_id: &str,
+    step_id: &str,
+    body: Value,
+    expect: &serde_json::Map<String, Value>,
+) -> Result<Judged> {
+    let path = format!("/api/jobs/{job_id}/steps/{step_id}/metadata");
+    match door
+        .send_expecting(reqwest::Method::PATCH, &path, Some(body), expect)
+        .await
+    {
+        Ok(_) => Ok(Judged::Written),
+        Err(e) if crate::dispatch::lost_the_step_race(&e) => Ok(Judged::Moved),
+        Err(e) => Err(e),
+    }
 }
 
 /// The operator's door: `crate::sor_client::api`, signed as the actor running
@@ -982,6 +1027,16 @@ impl Door for Http<'_> {
     ) -> Result<Option<Value>> {
         crate::sor_client::api(self.0, method, path, body).await
     }
+
+    async fn send_expecting(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        expect: &serde_json::Map<String, Value>,
+    ) -> Result<Option<Value>> {
+        crate::sor_client::api_expecting(self.0, method, path, body, expect).await
+    }
 }
 
 /// The signed wire — the same actor rule as [`Http`], at an explicit
@@ -996,6 +1051,16 @@ impl Door for crate::steps::Wire {
         body: Option<Value>,
     ) -> Result<Option<Value>> {
         self.call(method, path, body).await
+    }
+
+    async fn send_expecting(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        expect: &serde_json::Map<String, Value>,
+    ) -> Result<Option<Value>> {
+        self.call_expecting(method, path, body, expect).await
     }
 }
 
@@ -1136,7 +1201,10 @@ fn notes(c: &Value, r: &Retirement) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    pub(crate) fn head_for_exact_ref_test(branch: &str) -> anyhow::Result<String> {
+        super::twin_head(std::path::Path::new("."), &serde_json::json!({}), branch)
+    }
     use super::*;
     use serde_json::json;
 

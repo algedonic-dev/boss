@@ -63,7 +63,9 @@
 //! exactly one trigger: a red train that judged its cars owes a re-gate to
 //! the cars it released whose files meet the failure (`owed_by`) — to all
 //! of them when the red named no path — and records it on the car
-//! (`REGATE_OWED`). Only a car carrying that marker is judged here; every
+//! (`REGATE_OWED`). Only a car carrying that marker — or, since backlog
+//! 028ddab6, a GATE-STALE car, cut from a main older than main's newest
+//! change to what a gate runs (`GATE_INPUTS`, below) — is judged here; every
 //! other car whose receipt vouches for its head boards as gated. And the
 //! board never waits on a re-gate: the departure hold that waited for the
 //! dock's round is gone with the round.
@@ -169,6 +171,10 @@ pub(crate) struct BaseReading {
 /// Read a car's base out of the clone. `Ok(None)` is CURRENT — main is an
 /// ancestor of the head, so the gate already tested this tree. Every
 /// failure is an error the caller boards through, never a finding.
+/// `--no-renames`: porcelain diff detects renames, and a gate input moved
+/// out of infra/gate-runner/ then listed only its destination, classed
+/// `Unchanged` and boarded (item 38fc5084); a moved file is listed under
+/// both its paths, here and in `read_gate_change`.
 pub(crate) fn read_base(clone: &str, head: &str) -> Result<Option<BaseReading>> {
     let line = |args: &[&str]| -> Result<String> {
         let mut full = vec!["git", "-C", clone];
@@ -197,7 +203,7 @@ pub(crate) fn read_base(clone: &str, head: &str) -> Result<Option<BaseReading>> 
     }
     let base = line(&["merge-base", &main, head])?;
     let files = |to: &str| -> Result<Vec<String>> {
-        Ok(line(&["diff", "--name-only", &base, to])?
+        Ok(line(&["diff", "--no-renames", "--name-only", &base, to])?
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
@@ -210,6 +216,123 @@ pub(crate) fn read_base(clone: &str, head: &str) -> Result<Option<BaseReading>> 
         main,
         base,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// A CAR GATED ON AN OLD GATE IS GATE-STALE (backlog 028ddab6)
+//
+// A gate runs the GATED tree's own `infra/gate.sh` and `infra/lint/`
+// (infra/gate-runner/run.sh), under the runner main last converged. So a
+// green vouches for the checks the car's BASE had, not the checks main has
+// now. Measured 2026-10-20: car 3b227d91 was gated on 946d84462 (the 10-18
+// 12:53 train); train #1256 (791874d3b) then added the 'web unit' check to
+// gate.sh, which fails on that car's ci.yml; the car boarded train 7474e3e0
+// on its old green and the train's forge CI went red on what the car gate
+// never ran. Its own files were nowhere near gate.sh, so the file rule
+// above (`touched_by_main`) could not see it, and no red train owed it a
+// re-gate.
+//
+// So a second trigger sits beside `regate_owed`: a car whose head does not
+// carry main's NEWEST commit to a gate input is judged gate-stale and goes
+// through the same re-gate a car main moved into does — replayed onto main,
+// re-gated with its park intent, bounded once per main move, held on a
+// refused replay. Its cost is one `git log -1` per dock walk and one
+// `merge-base --is-ancestor` per car: the newest gate change is on main, so
+// it is an ancestor of the car's head exactly when it is an ancestor of the
+// car's base. Every way the READ fails boards the car as gated, loudly, by
+// the module's rule above.
+// ---------------------------------------------------------------------------
+
+/// What a gate runs, read off main: the gate itself, the runner that runs
+/// it, and the lints it runs first.
+pub(crate) const GATE_INPUTS: [&str; 3] = ["infra/gate.sh", "infra/gate-runner", "infra/lint"];
+
+/// Main's newest commit to a gate input, and the inputs it moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GateChange {
+    pub commit: String,
+    pub files: Vec<String>,
+}
+
+/// PURE: `git log -1 --format=%H --name-only` as a gate change — the sha,
+/// then the files. Empty output is a main that never changed a gate input.
+pub(crate) fn parse_gate_change(out: &str) -> Option<GateChange> {
+    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    let commit = lines.next()?.to_string();
+    Some(GateChange {
+        commit,
+        files: lines.map(str::to_string).collect(),
+    })
+}
+
+/// Read main's newest gate change out of the clone — once per dock walk.
+pub(crate) fn read_gate_change(clone: &str) -> Result<Option<GateChange>> {
+    let mut args = vec![
+        "git",
+        "-C",
+        clone,
+        "log",
+        "-1",
+        "--format=%H",
+        "--no-renames",
+        "--name-only",
+        "origin/main",
+        "--",
+    ];
+    args.extend(GATE_INPUTS);
+    Ok(parse_gate_change(&stdout_str(&sh(&args)?)))
+}
+
+/// Is the car at `head` gate-stale — cut from a main older than `gate`?
+/// An error when git gives no answer, which the caller boards through.
+pub(crate) fn gate_stale(clone: &str, gate: &GateChange, head: &str) -> Result<bool> {
+    let out = sh_unchecked(&[
+        "git",
+        "-C",
+        clone,
+        "merge-base",
+        "--is-ancestor",
+        &gate.commit,
+        head,
+    ])?;
+    match crate::freshness::base_from_is_ancestor_code(out.status.code()) {
+        crate::freshness::Base::Current => Ok(false),
+        crate::freshness::Base::Behind => Ok(true),
+        crate::freshness::Base::Unanswered => bail!(
+            "git merge-base --is-ancestor gave no answer for gate change {} and head {}",
+            short(&gate.commit),
+            short(head)
+        ),
+    }
+}
+
+/// PURE: the dock's judgement of a gate-stale car. It is TOUCHED by the
+/// gate inputs main moved, whatever its own files, and re-gated at most
+/// once per main move — `judge`'s bound.
+pub(crate) fn judge_gate_stale(
+    reading: Option<&BaseReading>,
+    stamp: Option<&RegateStamp>,
+    gate: &GateChange,
+) -> DockBase {
+    let Some(r) = reading else {
+        return DockBase::Current;
+    };
+    DockBase::Touched {
+        touched: gate.files.clone(),
+        launch: stamp.is_none_or(|s| s.main != r.main),
+    }
+}
+
+/// The skip reason for a gate-stale car: what moved, where, and then what
+/// the dock did about it (`then`, the re-gate's own reason).
+pub(crate) fn gate_stale_reason(gate: &GateChange, base: &str, then: &str) -> String {
+    format!(
+        "GATE-STALE: gated on {}, and main has since changed what a gate runs — {} in {}; a \
+         car rides only on a gate that ran the checks main has (backlog 028ddab6). {then}",
+        short(base),
+        sample(&gate.files, gate.files.len()),
+        short(&gate.commit),
+    )
 }
 
 /// A dock re-gate as the car records it.
@@ -320,7 +443,8 @@ impl RegateStamp {
             "touched_count": self.touched_count,
             "reds": self.reds,
             "at": at.to_rfc3339(),
-            "why": "backlog 969a1092: main moved into this car's files after its gate",
+            "why": "backlog 969a1092: main moved into this car's files after its gate (or, \
+                    028ddab6, into what a gate runs)",
         });
         // The flake relation rides only on the launch that has one.
         if !self.regate_of.is_empty() {
@@ -589,6 +713,23 @@ pub(crate) fn cleared_stamp(car: &Value) -> Option<Value> {
         obj.insert("reds".to_string(), json!(0));
     }
     Some(stamp)
+}
+
+/// PURE: is `run` — the run a parked car's `agent_run` names — a repair
+/// still BUILDING that car (backlog 5d0758dc)? An open agent-run whose
+/// `building` step is not done. A dock-red repair names itself on the car
+/// at `--started`, and its building completes when it hands the car to its
+/// own gate; the run a green parked the car with has completed its
+/// building already, so an ordinary parked car never reads as building.
+pub(crate) fn repair_building(run: &Value) -> bool {
+    run.get("kind").and_then(Value::as_str) == Some("agent-run")
+        && run.get("status").and_then(Value::as_str) == Some("open")
+        && find_step(run, "building", "building").is_some_and(|s| !step_done(Some(s)))
+}
+
+/// The skip reason for a car its repair run is building.
+pub(crate) fn repair_reason(run: &str) -> String {
+    format!("repair in progress (run {})", short(run))
 }
 
 /// The skip reason for a red whose retry is owed but could not launch
@@ -896,6 +1037,452 @@ pub(crate) fn in_flight_reason(car_id: &str, stamp: &RegateStamp, standing: &InF
             short(&stamp.main),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// A LINT-ONLY GATE CHANGE IS CLASSED, NOT RE-GATED IN FULL (backlog b245c9e7,
+// design 7c4024d8, decided 2026-10-21)
+//
+// 028ddab6 judges a car GATE-STALE whenever main's newest commit touched a
+// gate input, whatever changed, and re-gates it in full. Measured: train
+// #1296 changed ONE lint and re-gated 25 released cars (about four hours
+// of the factory's whole gate capacity); #1297 changed eight COMMENT lines
+// of gate.sh and re-gated 22; #1512 (2026-11-02) added one lint and took
+// both bays for two already-green cars while console car 3 waited. The
+// rule is right — a car rides only on a gate that ran the checks main has
+// — and what it costs is out of proportion to what changed.
+//
+// So the gate inputs main changed SINCE THE CAR'S BASE (not only the newest
+// commit) are classed, from the trees alone:
+//
+//   - a gate.sh change whose every changed line is blank or a whole-line
+//     comment, outside every heredoc body, changes nothing a gate runs:
+//     the car is not stale at all (Q3);
+//   - a change that is only lints under infra/lint/*.sh a bare tree can
+//     run — not lib/, which every lint sources, and not a lint declaring
+//     `# consist: skip` — is LINT-ONLY: the changed lints run against the
+//     car's head merged with main, and a green `lint_delta` on the car
+//     stands in for the full re-gate (Q1, Q2). The runner that writes the
+//     delta is the next car of this design; until it lands a lint-only car
+//     is re-gated in full as before, and the hold says what would answer
+//     it, so the journal counts what the delta will save;
+//   - anything else — gate.sh code, infra/lint/lib/, a consist-skip lint,
+//     the runner under infra/gate-runner/ — keeps today's full re-gate.
+//     The runner arm is deliberate: the pod runs main's run.sh from a
+//     ConfigMap whatever the car's tree holds, so backlog 30049197 asks
+//     whether such a change should stale a parked car at all. That is a
+//     one-arm change here once it is measured, not a second rule.
+//
+// ONE MORE CASE KEEPS THE FULL RE-GATE. A gate scopes its crate tests by
+// the car's own diff, and infra/lint/* implies boss-cli and boss-testing
+// (gate.sh's `path_shapes`), whose tests read the lint directory. A car
+// whose diff is scoped to either crate had those tests run on its gate, so
+// a changed lint can change what they see: it is re-gated in full.
+//
+// THE DELTA RECEIPT is `lint_delta`, a key of its own — never
+// `regate_receipt`, which vouches for a full gate of a head. It vouches for
+// the car when its `head` is the car's head, its `verdict` is green, and
+// the `main` it was merged with holds main's newest gate change. A later
+// lint change makes the car stale again and earns a new delta; main
+// changing anything else does not touch it. A red delta is a finding about
+// the car, and the car takes the full re-gate.
+// ---------------------------------------------------------------------------
+
+/// The job-metadata key a lint-only delta receipt rides on the car.
+pub(crate) const LINT_DELTA: &str = "lint_delta";
+
+/// Is `path` one of the gate inputs — the gate itself, or under the runner
+/// or the lint directory?
+pub(crate) fn is_gate_input(path: &str) -> bool {
+    GATE_INPUTS
+        .iter()
+        .any(|input| path == *input || path.starts_with(&format!("{input}/")))
+}
+
+/// What one gate input main changed since the car's base IS, read from
+/// the trees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateInputKind {
+    /// infra/gate.sh with only blank or whole-line comment lines changed,
+    /// outside every heredoc body: nothing a shell runs moved.
+    GateShComments,
+    /// infra/gate.sh with a changed line a shell runs (or a gate.sh the
+    /// base or main does not hold at all).
+    GateShCode,
+    /// A lint under infra/lint/ that main holds; `consist_skip` when its
+    /// header declares `# consist: skip`.
+    Lint { consist_skip: bool },
+    /// A lint main no longer holds: nothing to run.
+    LintGone,
+    /// infra/lint/lib/, which every lint sources.
+    LintLib,
+    /// infra/gate-runner/.
+    Runner,
+    /// A gate input of no shape above (a non-script file under infra/lint/).
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GateInput {
+    pub path: String,
+    pub kind: GateInputKind,
+}
+
+/// The dock's class of what main changed to its gate inputs since the
+/// car's base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateInputs {
+    /// Nothing a gate runs changed: the car is not stale.
+    Unchanged,
+    /// Only lints a bare tree can run changed: these, run against the car
+    /// merged with main, are the whole difference.
+    LintOnly { lints: Vec<String> },
+    /// Something else changed, named: today's full re-gate.
+    Full { because: String },
+}
+
+/// PURE: the class of main's gate-input changes. `car_reads_lints` is
+/// whether the car's own diff is scoped to a crate whose tests read
+/// infra/lint/ (`car_reads_lints`).
+pub(crate) fn classify_gate_inputs(inputs: &[GateInput], car_reads_lints: bool) -> GateInputs {
+    for input in inputs {
+        let because = match &input.kind {
+            GateInputKind::GateShCode => {
+                Some("infra/gate.sh changed a line a shell runs".to_string())
+            }
+            GateInputKind::Lint { consist_skip: true } => Some(format!(
+                "{} declares consist: skip, which a bare tree cannot answer in seconds",
+                input.path
+            )),
+            GateInputKind::LintLib => Some(format!("{} is sourced by every lint", input.path)),
+            GateInputKind::Runner => Some(format!("{} is the runner", input.path)),
+            GateInputKind::Other => Some(format!(
+                "{} is a gate input of no classed shape",
+                input.path
+            )),
+            GateInputKind::GateShComments
+            | GateInputKind::Lint {
+                consist_skip: false,
+            }
+            | GateInputKind::LintGone => None,
+        };
+        if let Some(because) = because {
+            return GateInputs::Full { because };
+        }
+    }
+    let lints: Vec<String> = inputs
+        .iter()
+        .filter(|i| {
+            i.kind
+                == GateInputKind::Lint {
+                    consist_skip: false,
+                }
+        })
+        .map(|i| i.path.clone())
+        .collect();
+    if lints.is_empty() {
+        return GateInputs::Unchanged;
+    }
+    if car_reads_lints {
+        return GateInputs::Full {
+            because: "the car's own diff is scoped to boss-cli or boss-testing, whose tests read \
+                      infra/lint/"
+                .to_string(),
+        };
+    }
+    GateInputs::LintOnly { lints }
+}
+
+/// PURE: the lines of a shell script a shell runs — every line that is
+/// not blank or a whole-line comment. A heredoc BODY is kept whole, a `#`
+/// inside one being content, not a comment. Anything that merely looks
+/// like a heredoc (`$((x << 2))`, a `<<` in a string) is read as one, which
+/// keeps the rest of the file whole and errs toward "code changed".
+pub(crate) fn effective_shell_lines(script: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut heredoc: Option<(String, bool)> = None;
+    for line in script.lines() {
+        if let Some((terminator, strip_tabs)) = &heredoc {
+            out.push(line.to_string());
+            let candidate = if *strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if candidate == terminator {
+                heredoc = None;
+            }
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        out.push(line.to_string());
+        heredoc = heredoc_opened(line);
+    }
+    out
+}
+
+/// The terminator a line opens a heredoc with, and whether `<<-` strips
+/// leading tabs from it: `<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`,
+/// `<< WORD`. A `<<<` here-string opens none.
+fn heredoc_opened(line: &str) -> Option<(String, bool)> {
+    let mut from = 0;
+    while let Some(pos) = line[from..].find("<<") {
+        let at = from + pos;
+        let rest = &line[at + 2..];
+        if rest.starts_with('<') {
+            from = at + 3;
+            continue;
+        }
+        let (rest, strip_tabs) = match rest.strip_prefix('-') {
+            Some(r) => (r, true),
+            None => (rest, false),
+        };
+        let rest = rest.trim_start();
+        let word: String = match rest.chars().next() {
+            Some(quote @ ('\'' | '"')) => rest[1..].chars().take_while(|c| *c != quote).collect(),
+            _ => rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect(),
+        };
+        if word.is_empty() {
+            from = at + 2;
+            continue;
+        }
+        return Some((word, strip_tabs));
+    }
+    None
+}
+
+/// PURE: did `before` become `after` by changing only blank and
+/// whole-line comment lines outside every heredoc body?
+pub(crate) fn comment_only_change(before: &str, after: &str) -> bool {
+    before != after && effective_shell_lines(before) == effective_shell_lines(after)
+}
+
+/// PURE: does a lint's HEADER declare `# consist: skip`? The header is the
+/// comment lines before the first line of code, the shebang skipped and
+/// blank lines passed over — gate.sh's `header_declarations`, so a lint
+/// that mentions the marker in its prose below the code is not excluded
+/// by it.
+pub(crate) fn declares_consist_skip(script: &str) -> bool {
+    for (n, line) in script.lines().enumerate() {
+        if n == 0 && line.starts_with("#!") {
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with('#') {
+            return false;
+        }
+        if line.starts_with("# consist: skip") {
+            return true;
+        }
+    }
+    false
+}
+
+/// The crates whose tests read infra/lint/ — the ones gate.sh's
+/// `path_shapes` names for a lint path.
+const LINT_READERS: [&str; 2] = ["boss-cli", "boss-testing"];
+
+/// The `path_shapes` rules of infra/gate.sh that name a lint reader, as
+/// (sed pattern, crates) — a MIRROR of that script, which the dock cannot
+/// run, held equal to it by the test `path_shapes_names_the_lint_readers_this_mirror_does`
+/// (CLAUDE.md §9a). The crate rule (`crates/<tier>/<name>/` names the
+/// crate) is the fourth shape `car_reads_lints` reads.
+pub(crate) const LINT_READER_SHAPES: [(&str, &str); 3] = [
+    ("^infra/gate\\.sh$", "boss-testing"),
+    ("^infra/lint/.*", "boss-cli boss-testing"),
+    ("^\\.forgejo/workflows/ci\\.yml$", "boss-testing"),
+];
+
+/// PURE: does one mirrored `path_shapes` pattern match `path`? The rules
+/// mirrored take two sed shapes only — `^<literal>$` and `^<literal>.*` —
+/// with `\.` the one escape, so this is equality or a prefix, not a regex
+/// engine; a rule of another shape fails the pin rather than matching here.
+fn sed_shape_matches(pattern: &str, path: &str) -> bool {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    let literal = |s: &str| s.replace("\\.", ".");
+    if let Some(prefix) = body.strip_suffix(".*") {
+        path.starts_with(&literal(prefix))
+    } else {
+        path == literal(body.strip_suffix('$').unwrap_or(body))
+    }
+}
+
+/// PURE: is the car's own diff scoped to a crate whose tests read
+/// infra/lint/ — boss-cli or boss-testing, by the crate rule or by one of
+/// `LINT_READER_SHAPES`?
+pub(crate) fn car_reads_lints(car_files: &[String]) -> bool {
+    car_files.iter().any(|f| {
+        let parts: Vec<&str> = f.split('/').collect();
+        (parts.first() == Some(&"crates") && parts.len() >= 4 && LINT_READERS.contains(&parts[2]))
+            || LINT_READER_SHAPES
+                .iter()
+                .any(|(pattern, _)| sed_shape_matches(pattern, f))
+    })
+}
+
+/// Read what main changed to its gate inputs since the car's base, classed
+/// from the trees: one `git show` per input (two for gate.sh). Every
+/// failure is an error the caller judges through as today's GATE-STALE.
+pub(crate) fn read_gate_inputs(clone: &str, reading: &BaseReading) -> Result<Vec<GateInput>> {
+    let show = |rev: &str, path: &str| -> Result<Option<String>> {
+        let out = sh_unchecked(&["git", "-C", clone, "show", &format!("{rev}:{path}")])?;
+        Ok(out.status.success().then(|| stdout_str(&out)))
+    };
+    reading
+        .main_files
+        .iter()
+        .filter(|p| is_gate_input(p))
+        .map(|path| {
+            let kind = if path == "infra/gate.sh" {
+                match (show(&reading.base, path)?, show(&reading.main, path)?) {
+                    (Some(before), Some(after)) if comment_only_change(&before, &after) => {
+                        GateInputKind::GateShComments
+                    }
+                    _ => GateInputKind::GateShCode,
+                }
+            } else if path.starts_with("infra/gate-runner/") {
+                GateInputKind::Runner
+            } else if path.starts_with("infra/lint/lib/") {
+                GateInputKind::LintLib
+            } else if let Some(name) = path.strip_prefix("infra/lint/")
+                && name.ends_with(".sh")
+                && !name.contains('/')
+            {
+                match show(&reading.main, path)? {
+                    None => GateInputKind::LintGone,
+                    Some(text) => GateInputKind::Lint {
+                        consist_skip: declares_consist_skip(&text),
+                    },
+                }
+            } else {
+                GateInputKind::Other
+            };
+            Ok(GateInput {
+                path: path.clone(),
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// A lint-only delta receipt as the car carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct LintDelta {
+    /// The car head the lints ran against (merged with `main`).
+    pub head: String,
+    /// The origin/main the head was merged with.
+    pub main: String,
+    /// Main's gate change the delta answered.
+    pub gate_change: String,
+    pub verdict: String,
+    /// The lints run, by path.
+    pub lints: Vec<String>,
+    /// The gate-run that ran them.
+    pub gate_run: String,
+}
+
+impl LintDelta {
+    /// The delta a car carries, or `None` when it carries none a reader
+    /// can key on (no `head`).
+    pub(crate) fn of(car: &Value) -> Option<Self> {
+        let d = car.pointer(&format!("/metadata/{LINT_DELTA}"))?;
+        let text = |k: &str| {
+            d.get(k)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let head = text("head");
+        if head.is_empty() {
+            return None;
+        }
+        let lints = d
+            .get("lints")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|l| l.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(LintDelta {
+            head,
+            main: text("main"),
+            gate_change: text("gate_change"),
+            verdict: text("verdict"),
+            lints,
+            gate_run: text("gate_run"),
+        })
+    }
+
+    /// PURE: does this delta vouch for the car at `head` against main's
+    /// newest gate change? `main_holds_change` is whether the delta's
+    /// `main` contains that change — an ancestry question the caller asks
+    /// git (`delta_main_holds`). `classed_lints` are the lints the change
+    /// was classed by: the delta vouches only for lints it RAN, and only
+    /// when it names the gate-run that ran them (item 38fc5084, finding 3
+    /// of car dfe15039's landed review). Whether that gate-run is a green
+    /// run for this head is the delta runner's half, when it lands.
+    pub(crate) fn vouches_for(
+        &self,
+        head: &str,
+        main_holds_change: bool,
+        classed_lints: &[String],
+    ) -> bool {
+        self.head == head
+            && self.verdict == "green"
+            && main_holds_change
+            && !self.gate_run.is_empty()
+            && classed_lints.iter().all(|l| self.lints.contains(l))
+    }
+}
+
+/// Does the main a delta was merged with hold main's newest gate change?
+/// An error when git gives no answer — which the caller reads as "does
+/// not vouch", never as a reason to board.
+pub(crate) fn delta_main_holds(clone: &str, delta: &LintDelta, gate: &GateChange) -> Result<bool> {
+    if delta.main.is_empty() {
+        return Ok(false);
+    }
+    let out = sh_unchecked(&[
+        "git",
+        "-C",
+        clone,
+        "merge-base",
+        "--is-ancestor",
+        &gate.commit,
+        &delta.main,
+    ])?;
+    match crate::freshness::base_from_is_ancestor_code(out.status.code()) {
+        crate::freshness::Base::Current => Ok(true),
+        crate::freshness::Base::Behind => Ok(false),
+        crate::freshness::Base::Unanswered => bail!(
+            "git merge-base --is-ancestor gave no answer for gate change {} and the delta's main {}",
+            short(&gate.commit),
+            short(&delta.main)
+        ),
+    }
+}
+
+/// The hold's sentence for a lint-only car that no delta vouches for yet:
+/// what changed, what would answer it, and then what the dock did about it.
+pub(crate) fn lint_only_reason(lints: &[String], then: &str) -> String {
+    format!(
+        "lint-only: what a gate runs changed since this car's base by {} lint(s) a bare tree can \
+         run ({}); a green lint_delta for this head would board it (design 7c4024d8), and until \
+         that runner lands it is re-gated in full. {then}",
+        lints.len(),
+        sample(lints, lints.len()),
+    )
 }
 
 #[cfg(test)]
@@ -1857,5 +2444,458 @@ mod tests {
         ));
         // An unreadable head is an error the caller boards through.
         assert!(read_base(c, "0000000000000000000000000000000000000000").is_err());
+    }
+
+    // -- a car gated on an old gate is gate-stale (backlog 028ddab6) -------
+
+    /// `git log -1 --format=%H --name-only` prints the sha, a blank line,
+    /// and the gate inputs that commit moved; no output is a main that has
+    /// never changed one.
+    #[test]
+    fn main_s_newest_gate_change_is_read_with_the_files_it_moved() {
+        assert_eq!(
+            parse_gate_change("791874d3b\n\ninfra/gate.sh\ninfra/lint/web-unit.sh\n"),
+            Some(GateChange {
+                commit: "791874d3b".into(),
+                files: paths(&["infra/gate.sh", "infra/lint/web-unit.sh"]),
+            })
+        );
+        assert_eq!(parse_gate_change(""), None);
+        assert_eq!(parse_gate_change("\n\n"), None);
+    }
+
+    /// A gate-stale car is held on the gate inputs main moved, whatever
+    /// its own files — car 3b227d91 changed ci.yml, which no rule of
+    /// `touched_by_main` reaches from infra/gate.sh — and the bound is the
+    /// dock's one: at most one re-gate per main move.
+    #[test]
+    fn a_gate_stale_car_is_touched_by_the_gate_change_and_bounded_per_main() {
+        let gate = GateChange {
+            commit: "791874d3b".into(),
+            files: paths(&["infra/gate.sh"]),
+        };
+        let r = BaseReading {
+            main: "m2".into(),
+            base: "946d8446".into(),
+            car_files: paths(&[".forgejo/workflows/ci.yml"]),
+            main_files: paths(&["infra/gate.sh", "docs/x.md"]),
+        };
+        assert_eq!(
+            judge(Some(&r), None),
+            DockBase::Untouched { main_changed: 2 },
+            "control: the file rule alone boards it"
+        );
+        assert_eq!(
+            judge_gate_stale(Some(&r), None, &gate),
+            DockBase::Touched {
+                touched: paths(&["infra/gate.sh"]),
+                launch: true,
+            }
+        );
+        let spent = RegateStamp::for_main("m2", &[]);
+        assert!(matches!(
+            judge_gate_stale(Some(&r), Some(&spent), &gate),
+            DockBase::Touched { launch: false, .. }
+        ));
+        let reason = gate_stale_reason(&gate, &r.base, "waiting for a gate slot");
+        for want in [
+            "GATE-STALE",
+            "946d8446",
+            "infra/gate.sh",
+            "791874d3",
+            "slot",
+        ] {
+            assert!(reason.contains(want), "{want} in {reason}");
+        }
+    }
+
+    // -- a lint-only gate change is classed, not re-gated in full (backlog
+    //    b245c9e7, design 7c4024d8) -----------------------------------------
+
+    fn input(path: &str, kind: GateInputKind) -> GateInput {
+        GateInput {
+            path: path.into(),
+            kind,
+        }
+    }
+
+    /// The class follows the shapes: comment lines and a lint main dropped
+    /// change nothing a gate runs; lints a bare tree can run are lint-only
+    /// unless the car's own diff reads them; gate.sh code, a consist-skip
+    /// lint, lib/, the runner and an unclassed file each force the full
+    /// re-gate and are named.
+    #[test]
+    fn gate_input_changes_are_classed_from_their_shapes() {
+        use GateInputKind::*;
+        assert_eq!(classify_gate_inputs(&[], false), GateInputs::Unchanged);
+        assert_eq!(
+            classify_gate_inputs(&[input("infra/gate.sh", GateShComments)], false),
+            GateInputs::Unchanged
+        );
+        assert_eq!(
+            classify_gate_inputs(&[input("infra/lint/gone.sh", LintGone)], false),
+            GateInputs::Unchanged,
+            "a lint main no longer holds runs nowhere"
+        );
+        let lint = || {
+            input(
+                "infra/lint/a.sh",
+                Lint {
+                    consist_skip: false,
+                },
+            )
+        };
+        assert_eq!(
+            classify_gate_inputs(&[input("infra/gate.sh", GateShComments), lint()], false),
+            GateInputs::LintOnly {
+                lints: paths(&["infra/lint/a.sh"])
+            }
+        );
+        assert!(
+            matches!(
+                classify_gate_inputs(&[lint()], true),
+                GateInputs::Full { .. }
+            ),
+            "a car whose diff reads the lints keeps the full re-gate"
+        );
+        for (path, kind) in [
+            ("infra/gate.sh", GateShCode),
+            ("infra/lint/live.sh", Lint { consist_skip: true }),
+            ("infra/lint/lib/scanned.sh", LintLib),
+            ("infra/gate-runner/run.sh", Runner),
+            ("infra/lint/README.md", Other),
+        ] {
+            let got = classify_gate_inputs(&[lint(), input(path, kind)], false);
+            assert!(
+                matches!(got, GateInputs::Full { ref because } if because.contains(path)),
+                "{path}: {got:?}"
+            );
+        }
+    }
+
+    /// Q3 as decided: blank and whole-line comment lines outside a heredoc
+    /// body are not something a shell runs; a `#` line inside a heredoc,
+    /// a trailing comment and a changed word of code all are.
+    #[test]
+    fn a_shell_scripts_effective_lines_skip_comments_and_blanks_but_keep_heredoc_bodies() {
+        let before = "#!/usr/bin/env bash\n# the gate\nset -eu\n\nrun_checks # inline\ncat <<'EOF'\n# inside a heredoc\nbody\nEOF\n";
+        let after = "#!/usr/bin/env bash\n# the gate, reworded\n\n   # a new comment\nset -eu\nrun_checks # inline\ncat <<'EOF'\n# inside a heredoc\nbody\nEOF\n";
+        assert!(comment_only_change(before, after));
+        assert!(
+            !comment_only_change(before, before),
+            "no change is not a comment-only change"
+        );
+        let heredoc = after.replace("# inside a heredoc", "# inside a heredoc, edited");
+        assert!(
+            !comment_only_change(after, &heredoc),
+            "a # line inside a heredoc body is content"
+        );
+        let trailing = after.replace("run_checks # inline", "run_checks # inline, reworded");
+        assert!(
+            !comment_only_change(after, &trailing),
+            "a trailing comment is not a whole-line comment"
+        );
+        let code = after.replace("set -eu", "set -euo pipefail");
+        assert!(!comment_only_change(after, &code));
+        let tabbed = "cat <<-END\n\tbody\n\tEND\n# after\n";
+        assert_eq!(
+            effective_shell_lines(tabbed),
+            vec!["cat <<-END", "\tbody", "\tEND"],
+            "<<- strips leading tabs from the terminator"
+        );
+        assert_eq!(
+            effective_shell_lines("x=$(cat <<<\"$y\")\n# c\n"),
+            vec!["x=$(cat <<<\"$y\")"],
+            "a here-string opens no heredoc"
+        );
+    }
+
+    /// gate.sh's `header_declarations`: the header is the comment lines
+    /// before the first line of code, shebang skipped, blank lines passed.
+    #[test]
+    fn a_lint_declares_consist_skip_only_in_its_header() {
+        assert!(declares_consist_skip(
+            "#!/usr/bin/env bash\n# consist: skip — psql against a live database\nexit 0\n"
+        ));
+        assert!(declares_consist_skip(
+            "#!/usr/bin/env bash\n\n# a lint\n# consist: skip — needs the workspace built\nset -eu\n"
+        ));
+        assert!(!declares_consist_skip(
+            "#!/usr/bin/env bash\nset -eu\n# consist: skip — below the first line of code, so prose\n"
+        ));
+        assert!(!declares_consist_skip(
+            "#!/usr/bin/env bash\n# a plain lint\nexit 0\n"
+        ));
+        assert!(!declares_consist_skip(""));
+    }
+
+    #[test]
+    fn a_car_reads_the_lints_when_its_diff_is_scoped_to_a_lint_reading_crate() {
+        for f in [
+            "crates/core/boss-testing/tests/a_pin.rs",
+            "crates/orchestrators/boss-cli/src/train/conductor.rs",
+            "infra/gate.sh",
+            "infra/lint/a-new-lint.sh",
+            ".forgejo/workflows/ci.yml",
+        ] {
+            assert!(car_reads_lints(&paths(&[f])), "{f}");
+        }
+        for f in [
+            "docs/x.md",
+            "crates/modules/boss-people/src/lib.rs",
+            "infra/forge/postgres-rollout.py",
+            "infra/platform/workflows/x.toml",
+            "apps/web/src/it/yard/regions.ts",
+            "crates/core/boss-testing-client/src/lib.rs",
+        ] {
+            assert!(!car_reads_lints(&paths(&[f])), "{f}");
+        }
+        assert!(!car_reads_lints(&[]));
+        // The two sed shapes the mirror reads, and nothing looser.
+        assert!(sed_shape_matches(r"^infra/gate\.sh$", "infra/gate.sh"));
+        assert!(!sed_shape_matches(r"^infra/gate\.sh$", "infra/gateXsh"));
+        assert!(!sed_shape_matches(r"^infra/gate\.sh$", "infra/gate.sh.bak"));
+        assert!(sed_shape_matches(r"^infra/lint/.*", "infra/lint/lib/x.sh"));
+        assert!(!sed_shape_matches(
+            r"^infra/lint/.*",
+            "docs/infra/lint/x.sh"
+        ));
+    }
+
+    /// CLAUDE.md §9a: `LINT_READER_SHAPES` mirrors the `path_shapes` rules
+    /// of infra/gate.sh that name boss-cli or boss-testing, because the
+    /// dock cannot run that script. Read gate.sh's own function and hold
+    /// the two equal, naming the rule that drifted.
+    #[test]
+    fn path_shapes_names_the_lint_readers_this_mirror_does() {
+        let gate = std::fs::read_to_string(boss_testing::repo_root().join("infra/gate.sh"))
+            .expect("infra/gate.sh");
+        let body = gate
+            .split("\npath_shapes() {")
+            .nth(1)
+            .expect("path_shapes() in gate.sh")
+            .split("\n}")
+            .next()
+            .expect("its body");
+        let mut named: Vec<(String, String)> = Vec::new();
+        let mut crate_rule = false;
+        for raw in body.lines() {
+            let line = raw.trim().trim_end_matches('\\').trim();
+            let Some(rule) = line
+                .strip_prefix("sed -n -e 's|")
+                .or_else(|| line.strip_prefix("-e 's|"))
+            else {
+                continue;
+            };
+            let Some(rule) = rule.strip_suffix("|p'") else {
+                continue;
+            };
+            let (pattern, crates) = rule.split_once('|').expect("pattern|crates");
+            if pattern == r"^crates/[^/]*/\([^/]*\)/.*" && crates == r"\1" {
+                crate_rule = true;
+                continue;
+            }
+            if crates.split(' ').any(|c| LINT_READERS.contains(&c)) {
+                named.push((pattern.to_string(), crates.to_string()));
+            }
+        }
+        assert!(
+            crate_rule,
+            "gate.sh path_shapes no longer maps crates/<tier>/<name>/ to the crate itself; \
+             car_reads_lints reads that shape"
+        );
+        let mirror: Vec<(String, String)> = LINT_READER_SHAPES
+            .iter()
+            .map(|(p, c)| (p.to_string(), c.to_string()))
+            .collect();
+        assert_eq!(
+            named, mirror,
+            "gate.sh path_shapes and dock_regate::LINT_READER_SHAPES disagree on which rules \
+             name a lint reader"
+        );
+        for (pattern, _) in &mirror {
+            let sample = match pattern.as_str() {
+                r"^infra/gate\.sh$" => "infra/gate.sh",
+                r"^infra/lint/.*" => "infra/lint/any.sh",
+                r"^\.forgejo/workflows/ci\.yml$" => ".forgejo/workflows/ci.yml",
+                other => panic!(
+                    "a new lint-reader rule in gate.sh, {other}: teach car_reads_lints and this \
+                     test its sample"
+                ),
+            };
+            assert!(car_reads_lints(&paths(&[sample])), "{sample}");
+        }
+    }
+
+    #[test]
+    fn a_lint_delta_vouches_only_for_its_head_green_on_a_main_holding_the_change() {
+        let car = json!({"id": "c", "metadata": {"branch": "feat/x", LINT_DELTA: {
+            "head": "h1", "main": "m1", "gate_change": "g1", "verdict": "green",
+            "lints": [{"name": "infra/lint/a.sh", "sha256": "s", "exit": 0}],
+            "gate_run": "r1", "at": "2026-11-02T12:00:00Z"}}});
+        let d = LintDelta::of(&car).expect("a delta");
+        assert_eq!(d.lints, paths(&["infra/lint/a.sh"]));
+        let classed = paths(&["infra/lint/a.sh"]);
+        assert!(d.vouches_for("h1", true, &classed));
+        assert!(!d.vouches_for("h2", true, &classed), "another head");
+        assert!(
+            !d.vouches_for("h1", false, &classed),
+            "a main that does not hold the gate change"
+        );
+        let red = json!({"id": "c", "metadata": {LINT_DELTA: {"head": "h1", "main": "m1", "verdict": "failed"}}});
+        assert!(
+            !LintDelta::of(&red)
+                .expect("a delta")
+                .vouches_for("h1", true, &classed),
+            "a red delta is a finding about the car"
+        );
+        assert_eq!(LintDelta::of(&json!({"id": "c", "metadata": {}})), None);
+        assert_eq!(
+            LintDelta::of(&json!({"id": "c", "metadata": {LINT_DELTA: {"verdict": "green"}}})),
+            None,
+            "no head, nothing to key on"
+        );
+    }
+
+    /// Finding 3 of the landed review of car dfe15039 (item 38fc5084): a
+    /// delta vouches for a lint-only change only when the lints it RAN
+    /// cover the lints the change was classed by, and a gate-run is named.
+    /// A delta that ran one lint says nothing about another, and any
+    /// writer with the merge authority could put a `lint_delta` on a car,
+    /// so the dock checks what it can check.
+    #[test]
+    fn a_lint_delta_vouches_only_for_the_lints_it_ran() {
+        let car = json!({"id": "c", "metadata": {"branch": "feat/x", LINT_DELTA: {
+            "head": "h1", "main": "m1", "gate_change": "g1", "verdict": "green",
+            "lints": [{"name": "infra/lint/a.sh", "sha256": "s", "exit": 0},
+                      {"name": "infra/lint/b.sh", "sha256": "s", "exit": 0}],
+            "gate_run": "r1", "at": "2026-11-02T12:00:00Z"}}});
+        let d = LintDelta::of(&car).expect("a delta");
+        assert!(d.vouches_for("h1", true, &paths(&["infra/lint/a.sh"])));
+        assert!(d.vouches_for("h1", true, &paths(&["infra/lint/b.sh", "infra/lint/a.sh"])));
+        assert!(
+            !d.vouches_for("h1", true, &paths(&["infra/lint/c.sh"])),
+            "a lint the delta never ran"
+        );
+        assert!(
+            !d.vouches_for("h1", true, &paths(&["infra/lint/a.sh", "infra/lint/c.sh"])),
+            "one of the classed lints the delta never ran"
+        );
+        let unrun = json!({"id": "c", "metadata": {LINT_DELTA: {
+            "head": "h1", "main": "m1", "verdict": "green",
+            "lints": [{"name": "infra/lint/a.sh", "sha256": "s", "exit": 0}]}}});
+        assert!(
+            !LintDelta::of(&unrun).expect("a delta").vouches_for(
+                "h1",
+                true,
+                &paths(&["infra/lint/a.sh"])
+            ),
+            "a delta naming no gate-run ran nowhere the record can read"
+        );
+    }
+
+    /// Finding 2 of the same review: porcelain `git diff --name-only`
+    /// detects renames, so a gate input MOVED out of infra/gate-runner/
+    /// listed only its destination and the car classed `Unchanged`. The
+    /// reader says `--no-renames`: a moved file is listed under both its
+    /// paths, and so is main's newest gate change.
+    #[test]
+    fn a_moved_gate_input_is_listed_under_both_its_paths() {
+        let (_g, clone) = super::super::test_support::clone_fixture("dock-regate-rename");
+        let c = clone.to_str().expect("utf8");
+        let git = |args: &[&str]| super::super::test_support::git_ok(&clone, args);
+        // The helper lives under the runner at the car's base.
+        std::fs::create_dir_all(clone.join("infra/gate-runner")).expect("mkdir");
+        boss_testing::write_exec(
+            &clone.join("infra/gate-runner/helper.sh"),
+            "#!/usr/bin/env bash\necho helper\n",
+        );
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "the runner's helper"]);
+        git(&["push", "-q", "origin", "main"]);
+        git(&["checkout", "-q", "-b", "feat/car"]);
+        std::fs::create_dir_all(clone.join("docs")).expect("mkdir");
+        std::fs::write(clone.join("docs/car.md"), "car").expect("w");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "car"]);
+        let car_head = super::super::test_support::rev(&clone, "feat/car");
+        git(&["checkout", "-q", "main"]);
+        // Main moves the helper out of the runner, byte for byte.
+        std::fs::create_dir_all(clone.join("infra/tools")).expect("mkdir");
+        git(&["mv", "infra/gate-runner/helper.sh", "infra/tools/helper.sh"]);
+        git(&["commit", "-qm", "move the helper"]);
+        git(&["push", "-q", "origin", "main"]);
+        git(&["fetch", "-q", "origin"]);
+        let r = read_base(c, &car_head)
+            .expect("reads")
+            .expect("behind main now");
+        assert_eq!(
+            r.main_files,
+            paths(&["infra/gate-runner/helper.sh", "infra/tools/helper.sh"]),
+            "a moved file is listed under its old path and its new one"
+        );
+        // The gate change is read under the gate inputs' pathspec, so it
+        // names the moved input by its OLD path — the one under
+        // infra/gate-runner/ — which is exactly what a rename hid: with
+        // rename detection the commit listed only the destination, outside
+        // every input, and main read as never having changed one.
+        let gate = read_gate_change(c)
+            .expect("reads")
+            .expect("moving a gate input out of the inputs is a gate change");
+        assert_eq!(gate.files, paths(&["infra/gate-runner/helper.sh"]));
+    }
+
+    #[test]
+    fn a_gate_input_is_the_gate_the_runner_or_a_lint() {
+        for p in [
+            "infra/gate.sh",
+            "infra/gate-runner/run.sh",
+            "infra/lint/a.sh",
+            "infra/lint/lib/x.sh",
+        ] {
+            assert!(is_gate_input(p), "{p}");
+        }
+        for p in [
+            "infra/gate.sh.bak",
+            "infra/gate-runner.yaml",
+            "infra/lintx/a.sh",
+            "docs/infra/lint/a.sh",
+        ] {
+            assert!(!is_gate_input(p), "{p}");
+        }
+        let reason = lint_only_reason(&paths(&["infra/lint/a.sh"]), "waiting for a gate slot");
+        for want in ["lint-only", "infra/lint/a.sh", "lint_delta", "slot"] {
+            assert!(reason.contains(want), "{want} in {reason}");
+        }
+    }
+
+    /// Backlog 5d0758dc: only an OPEN agent-run whose `building` step is
+    /// not done is a repair still building. The measured car named
+    /// 504b4863 until its repair took it — a run whose building had
+    /// completed the evening before — and that run holds nothing.
+    #[test]
+    fn a_repair_is_building_only_while_its_run_and_its_building_are_open() {
+        let run = |kind: &str, status: &str, building: &str| {
+            json!({"id": "2a9293b8-54ed-49da-bda9-1c45e729eaa2", "kind": kind, "status": status,
+                   "steps": [{"spec_slug": "briefed", "status": "completed"},
+                             {"spec_slug": "building", "status": building}]})
+        };
+        for building in ["pending", "ready", "active"] {
+            assert!(
+                repair_building(&run("agent-run", "open", building)),
+                "{building}"
+            );
+        }
+        assert!(!repair_building(&run("agent-run", "open", "completed")));
+        assert!(!repair_building(&run("agent-run", "open", "skipped")));
+        assert!(!repair_building(&run("agent-run", "closed", "active")));
+        assert!(!repair_building(&run("gate-run", "open", "active")));
+        assert!(!repair_building(
+            &json!({"kind": "agent-run", "status": "open"})
+        ));
+        assert_eq!(
+            repair_reason("2a9293b8-54ed-49da-bda9-1c45e729eaa2"),
+            "repair in progress (run 2a9293b8)"
+        );
     }
 }

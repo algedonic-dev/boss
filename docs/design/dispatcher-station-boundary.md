@@ -41,7 +41,11 @@ Named here so the boundary is measured against the tree, not against
 intent. Each is a packet of ordinary size; neither is licensed by
 appearing in this doc.
 
-1. **The assign strategy is dispatcher code.**
+1. **The assign strategy was dispatcher code — RETIRED 2026-11-11**
+   (backlog e1eaf72b). The matchmaker below was deleted rather than
+   moved to data: a ready step now stands at its station unassigned
+   and an executor pulls it (`boss dispatch --next`), so there is no
+   assign policy left to hold. As measured before that:
    `crates/core/boss-dispatcher/src/dispatcher.rs` —
    `pick_employee_with_role_fallback` (and `pick_employee` under it)
    hardcodes the matchmaking policy: candidate roles are tried in

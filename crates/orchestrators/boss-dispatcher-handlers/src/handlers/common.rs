@@ -603,13 +603,39 @@ pub(crate) async fn jobs_where(
     filter: &str,
     rule_name: &str,
 ) -> Result<Vec<Value>, HandlerError> {
+    walk_jobs(client, jobs_base, filter, true, rule_name).await
+}
+
+/// The same paged walk with every listed step SLIM — no step
+/// `metadata` or `fields` — for a caller that reads only the packet's
+/// own keys and its steps' status, assignee and stamps. The open
+/// backlog was 672 packets on 2026-10-18, and 200 of them weighed
+/// 3.6 MB whole (9b473d4a); `jobs.urgent_item_watch` reads all of them
+/// hourly to find the few urgent ones, and reads a step's metadata only
+/// off the one packet it is about to write (backlog 9788e22d).
+pub(crate) async fn jobs_where_slim(
+    client: &boss_core::machine_token::Client,
+    jobs_base: &str,
+    filter: &str,
+    rule_name: &str,
+) -> Result<Vec<Value>, HandlerError> {
+    walk_jobs(client, jobs_base, filter, false, rule_name).await
+}
+
+async fn walk_jobs(
+    client: &boss_core::machine_token::Client,
+    jobs_base: &str,
+    filter: &str,
+    full: bool,
+    rule_name: &str,
+) -> Result<Vec<Value>, HandlerError> {
     const PAGE: usize = 500;
     let mut rows: Vec<Value> = Vec::new();
     loop {
         let body = get_json(
             client,
             &format!(
-                "{}/api/jobs?{filter}&full=true&limit={PAGE}&offset={}",
+                "{}/api/jobs?{filter}&full={full}&limit={PAGE}&offset={}",
                 jobs_base.trim_end_matches('/'),
                 rows.len()
             ),
@@ -645,12 +671,57 @@ pub(crate) async fn write_json(
     body: &Value,
     rule_name: &str,
 ) -> Result<(), HandlerError> {
+    send_json(client, method, url, body, rule_name, None)
+        .await
+        .map(|_| ())
+}
+
+/// What a judged write came to: it landed, or the step no longer read as
+/// judged and NOTHING was written (409 `step_changed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Judged {
+    Written,
+    Moved,
+}
+
+/// [`write_json`] carrying the keys the write JUDGED, as it read them, in
+/// `boss_jobs::step_metadata_write::EXPECT_HEADER` (backlog cd1f68c6):
+/// the step merge door lands it only on a row that still reads so. The
+/// step race is answered as [`Judged::Moved`] for the caller to say in
+/// its own words; every other answer maps as [`write_json`]'s.
+pub(crate) async fn write_json_expecting(
+    client: &boss_core::machine_token::Client,
+    method: reqwest::Method,
+    url: &str,
+    body: &Value,
+    expect: &serde_json::Map<String, Value>,
+    rule_name: &str,
+) -> Result<Judged, HandlerError> {
+    send_json(client, method, url, body, rule_name, Some(expect)).await
+}
+
+async fn send_json(
+    client: &boss_core::machine_token::Client,
+    method: reqwest::Method,
+    url: &str,
+    body: &Value,
+    rule_name: &str,
+    expect: Option<&serde_json::Map<String, Value>>,
+) -> Result<Judged, HandlerError> {
     let verb = method.to_string();
-    let resp = client
+    let request = client
         .request(method, url)
         .header("content-type", "application/json")
         .header("x-boss-user", dispatcher_actor_header(rule_name))
-        .header("x-sim-origin", sim_origin_value())
+        .header("x-sim-origin", sim_origin_value());
+    let request = match expect {
+        Some(expect) => request.header(
+            boss_jobs::step_metadata_write::EXPECT_HEADER,
+            boss_jobs::step_metadata_write::expectation_header(expect),
+        ),
+        None => request,
+    };
+    let resp = request
         .json(body)
         .send()
         .await
@@ -658,13 +729,22 @@ pub(crate) async fn write_json(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        // Only a judged write reads the race as an answer: an unjudged
+        // one keeps the retryable refusal it always was.
+        if expect.is_some()
+            && status == reqwest::StatusCode::CONFLICT
+            && serde_json::from_str::<Value>(&text)
+                .is_ok_and(|b| boss_jobs::step_metadata_write::is_step_race(&b))
+        {
+            return Ok(Judged::Moved);
+        }
         return Err(if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
             HandlerError::Permanent(format!("{verb} {url} returned {status}: {text}"))
         } else {
             HandlerError::Downstream(format!("{verb} {url} returned {status}: {text}"))
         });
     }
-    Ok(())
+    Ok(Judged::Written)
 }
 
 /// The writes that complete step `sid` on packet `jid` carrying
@@ -725,6 +805,31 @@ pub(crate) async fn complete_step(
     rule_name: &str,
 ) -> Result<(), HandlerError> {
     for (method, path, body) in step_completion_writes(jid, sid, fields) {
+        write_json(client, method, &format!("{base}{path}"), &body, rule_name).await?;
+    }
+    Ok(())
+}
+
+/// [`complete_step`] for a step the handler READ (`step`, whose id is
+/// `sid`): the status PUT names the resource claim the step held as
+/// read, so completing a claimed step frees its slot (backlog 7b5195ea,
+/// [`boss_jobs::flow_resources::exiting`]). A run's `building` holds a
+/// robots-pool claim since agent-run v11, and the landings that end it
+/// sent a bare status the PUT refuses.
+pub(crate) async fn complete_read_step(
+    client: &boss_core::machine_token::Client,
+    base: &str,
+    jid: &str,
+    sid: &str,
+    step: &Value,
+    fields: serde_json::Map<String, Value>,
+    rule_name: &str,
+) -> Result<(), HandlerError> {
+    for (method, path, body) in step_completion_writes(jid, sid, fields) {
+        let body = match method {
+            reqwest::Method::PUT => boss_jobs::flow_resources::exiting(step, body),
+            _ => body,
+        };
         write_json(client, method, &format!("{base}{path}"), &body, rule_name).await?;
     }
     Ok(())
@@ -1350,6 +1455,8 @@ mod lane_pin {
     /// The `mod tests` truncation is what keeps fixtures out — a test
     /// packet standing in for what the jobs API lists back is not a
     /// filing, and there are five of those.
+    // crate pin — it counts this crate's own filing sites, so a car that
+    // adds one learns it in `infra/gate.sh --lint` (backlog e2d091f7)
     #[test]
     fn every_backlog_item_this_crate_files_stamps_an_input_lane() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers");
@@ -1425,9 +1532,27 @@ mod lane_pin {
         // reaches its owner, stamped `PipelineFailure` by the fallback;
         // twenty-one since `machine.gate.asked.alarm` (backlog d653e090),
         // an ask from a caller nobody expects read off the machine gate's
-        // durable window, stamped `Telemetry` like the two beside it.
+        // durable window, stamped `Telemetry` like the two beside it;
+        // twenty-two since `maintenance.verdict.streak` (backlog
+        // ada4d019), a chore verdict held on N consecutive runs — boss-gcp's
+        // deposit-key audit reading unverified — stamped `Telemetry`, a
+        // reading integrated over time like the estate alarms;
+        // twenty-three since `jobs.urgent_item_watch` (backlog 9788e22d),
+        // an urgent item past its age bound with landed cars or many runs
+        // asked for a finish line, stamped `Telemetry` — a reading of the
+        // record, like the agent-step overdue alarm beside it;
+        // twenty-four since `jobs.idle_actor_watch` (backlog 861360bc),
+        // an actor holding ready urgent nominations with no run for its
+        // bound, stamped `Telemetry` — a reading of the record, like the
+        // urgent-item watch beside it; twenty-five since
+        // `jobs.silent_session_watch` (backlog 628dc540), an actor holding
+        // claimed work whose open session has had no write of its own for
+        // its bound, stamped `Telemetry` like the idle-actor watch;
+        // twenty-six since `jobs.unheld_review_watch` (backlog f0e604dc),
+        // a station whose ready reviews nobody holds passed their pinned
+        // bound, stamped `Telemetry` like the agent-step overdue alarm.
         assert_eq!(
-            filings, 21,
+            filings, 26,
             "the number of machine filing sites changed. That is fine — but check the new \
              one stamps a lane, then update this count, which exists so a filing that \
              DISAPPEARS from the scan (a renamed key, a reshaped body) cannot read as \

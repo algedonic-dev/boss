@@ -144,22 +144,54 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "messages HTTP API listening");
 
-    let app = boss_core::machine_gate::mount(
+    let process_shutdown = boss_core::gate_evidence::ShutdownGuard::hold();
+    let (timing, latency_worker) = boss_core::request_latency::Timing::start(
+        Arc::new(boss_jobs::sensors::request_latency::PgLatency::new(
+            pool.clone(),
+        )),
+        "messages".into(),
+        boss_core::startup::build_commit()
+            .unwrap_or("unavailable")
+            .to_string(),
+        Arc::new(boss_clock_client::wall_now),
+        boss_messages::http::latency_classify,
+    );
+    let app = boss_core::machine_gate::mount_with_request_latency(
         app,
         "messages",
         &["/api/messages/health"],
         Some(boss_events::outbox::PgOutboxRecorder::shared(&pool)),
+        timing,
     );
-    boss_policy_client::role_service::serve_with_refresh(
-        listener,
-        app,
-        roles,
-        source,
-        mode,
-        boss_policy_client::role_service::REFRESH_CADENCE,
-        boss_policy_client::role_service::shutdown_signal(),
-    )
-    .await?;
+    let (stop_http, stopped) = tokio::sync::oneshot::channel();
+    let mut serve_task = tokio::spawn(async move {
+        boss_policy_client::role_service::serve_with_refresh(
+            listener,
+            app,
+            roles,
+            source,
+            mode,
+            boss_policy_client::role_service::REFRESH_CADENCE,
+            async move {
+                let _ = stopped.await;
+            },
+        )
+        .await
+    });
+    let served = tokio::select! {
+        result = &mut serve_task => result,
+        () = process_shutdown.requested() => {
+            let _ = stop_http.send(());
+            serve_task.await
+        }
+    };
+    if matches!(&served, Ok(Ok(()))) {
+        latency_worker.shutdown().await;
+    } else {
+        latency_worker.shutdown_incomplete().await;
+    }
+    process_shutdown.finish().await;
+    served.context("joining messages HTTP/role owner")??;
     Ok(())
 }
 

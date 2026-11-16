@@ -64,12 +64,22 @@ async fn serve(state: &AppState, req: Request, base: &Path) -> Response {
     // require authentication, because the SPA code inside handles
     // the auth redirect flow. If we redirect asset requests to
     // auth, the browser gets a CORS error and can't load at all.
+    //
+    // A browser NAVIGATING to a page goes to sign-in with the page as
+    // `?next=` (backlog 7d70cad6, David 2026-11-16): the bare 401 here
+    // left a deep link opened after the 24 h session lapsed — or after
+    // an Access re-authentication reloaded it — on "authentication
+    // required", with `/` as the only way on. Anything else (a fetch,
+    // a machine) keeps the status.
     let path = req.uri().path();
     let is_static_asset = has_file_extension(path);
     if !is_static_asset
         && !is_public_path(path)
         && !has_valid_session(req.headers(), &state.session_key)
     {
+        if crate::proxy::is_document_navigation(req.method(), req.headers()) {
+            return crate::proxy::login_redirect(req.uri());
+        }
         return unauthorized();
     }
 
@@ -329,50 +339,7 @@ async fn flights_for(state: &AppState, viewer: HeaderValue) -> Option<String> {
         "{}/api/flights/mine",
         crate::proxy::JOBS.upstream_url().trim_end_matches('/')
     );
-    let resp = flights_request(&state.machine, url, viewer)
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        tracing::warn!(
-            status = %resp.status(),
-            "flights read answered non-2xx; the page carries no flights, so every code is off"
-        );
-        return None;
-    }
-    flights_body(&resp.json::<serde_json::Value>().await.ok()?)
-}
-
-/// The flights read, unsent — pure, so what goes on the wire is pinned
-/// without a socket. It carries the viewer the role-header layer signed,
-/// on the gateway's machine client, which stamps the token and follows
-/// no redirect by type: it is a read the gateway makes for that session,
-/// and it sent no token at all until review S2 of design 6805c764 car 2.
-/// It took any `&reqwest::Client` and stamped by hand until the review
-/// of 39949355 — redirect-free only because the proxy client it was
-/// handed happened to be built so.
-fn flights_request(
-    client: &boss_gateway::machine_client::MachineClient,
-    url: String,
-    viewer: HeaderValue,
-) -> reqwest::RequestBuilder {
-    client
-        .get(url)
-        .header("x-boss-user", viewer)
-        .timeout(std::time::Duration::from_secs(2))
-}
-
-/// The page's copy of a flights answer: exactly `{"flights": [codes]}`,
-/// rebuilt from the codes so nothing else the upstream says rides onto
-/// the document. Anything else is `None`.
-pub(crate) fn flights_body(answer: &serde_json::Value) -> Option<String> {
-    let codes: Vec<&str> = answer
-        .get("flights")?
-        .as_array()?
-        .iter()
-        .map(serde_json::Value::as_str)
-        .collect::<Option<_>>()?;
-    serde_json::to_string(&serde_json::json!({ "flights": codes })).ok()
+    boss_gateway::flights_inline::read_for(&state.machine, url, viewer).await
 }
 
 fn inline_global(html: &str, global: &str, json: &str) -> String {
@@ -428,41 +395,6 @@ mod tests {
     }
 
     #[test]
-    fn the_flights_read_carries_the_viewer_and_the_machine_token() {
-        // Review S2 of design 6805c764 car 2: this read sent the viewer
-        // and no token, so a jobs port in enforce would refuse it and
-        // every page would render with every flight off.
-        use boss_core::machine_token::{HEADER, Source};
-        use boss_gateway::machine_client::MachineClient;
-        let client = |token: Option<&str>| {
-            MachineClient::build_with_source(
-                reqwest::Client::builder(),
-                std::sync::Arc::new(Source::fixed(token.map(String::from))),
-            )
-            .unwrap()
-        };
-        let viewer = HeaderValue::from_static(r#"{"id":"emp-1"}"#);
-        let req = super::flights_request(
-            &client(Some("estate-token")),
-            "http://127.0.0.1:9/api/flights/mine".into(),
-            viewer.clone(),
-        )
-        .build()
-        .unwrap();
-        assert_eq!(req.headers().get(HEADER).unwrap(), "estate-token");
-        assert_eq!(req.headers().get("x-boss-user").unwrap(), &viewer);
-        // Nothing mounted: nothing sent, the deploy-order safety.
-        let bare = super::flights_request(
-            &client(None),
-            "http://127.0.0.1:9/api/flights/mine".into(),
-            viewer,
-        )
-        .build()
-        .unwrap();
-        assert!(bare.headers().get(HEADER).is_none());
-    }
-
-    #[test]
     fn the_flights_ride_the_document_beside_the_manifest() {
         let html = "<html><head></head><body><script type=\"module\" src=\"/m.js\"></script></body></html>";
         let out = super::inline_flights(html, r#"{"flights":["it-map-motion"]}"#);
@@ -475,25 +407,6 @@ mod tests {
         );
         assert!(script < out.find("type=\"module\"").unwrap());
         assert!(out.contains(r#"["it-map-motion"]"#), "{out}");
-    }
-
-    /// The page carries codes and nothing else; a malformed answer
-    /// carries nothing, which the SPA reads as every code off.
-    #[test]
-    fn only_a_list_of_codes_reaches_the_page() {
-        let ok = serde_json::json!({"flights": ["a", "b"], "audience": {"secret": 1}});
-        assert_eq!(
-            super::flights_body(&ok).as_deref(),
-            Some(r#"{"flights":["a","b"]}"#)
-        );
-        for bad in [
-            serde_json::json!({}),
-            serde_json::json!({"flights": "a"}),
-            serde_json::json!({"flights": ["a", 1]}),
-            serde_json::json!(["a"]),
-        ] {
-            assert_eq!(super::flights_body(&bad), None, "{bad}");
-        }
     }
 
     use super::*;
@@ -908,5 +821,51 @@ mod traversal_tests {
         let (status, _, body) = get(&dist, "/", false).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("the spa"));
+    }
+
+    /// A browser NAVIGATING to a page without a session.
+    async fn navigate(dist: &Path, path: &str) -> (StatusCode, HeaderMap, String) {
+        let req = Request::builder()
+            .uri(path)
+            .header(header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8")
+            .body(Body::empty())
+            .unwrap();
+        let resp = serve(&state(), req, dist).await;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// Backlog 7d70cad6 (David, 2026-11-16): a deep link opened without
+    /// a session — a lapsed 24 h session, a link from a message — got a
+    /// bare "authentication required", and the only way on was to load
+    /// / by hand and find the page again. A browser now goes to sign-in
+    /// with the page, query included, as `?next=`. A fetch keeps its
+    /// 401, so a caller reading status still reads one.
+    #[tokio::test]
+    async fn a_signed_out_navigation_goes_to_sign_in_with_the_page_as_next() {
+        let (_, dist) = fixture("deep-link");
+        let (status, headers, body) = navigate(&dist, "/ux/jobs/abc?tab=steps").await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+        assert_eq!(
+            headers[header::LOCATION],
+            "/login?next=/ux/jobs/abc%3Ftab%3Dsteps"
+        );
+        assert!(!body.contains("the spa"), "no page before sign-in: {body}");
+
+        // The sign-in page and the root are public: never redirected,
+        // so there is no loop through /login.
+        for public in ["/login", "/login?next=%2Fme", "/"] {
+            let (status, _, body) = navigate(&dist, public).await;
+            assert_eq!(status, StatusCode::OK, "{public}: {body}");
+        }
+        // An asset is never redirected — a script tag cannot follow it.
+        let (status, _, _) = navigate(&dist, "/chunk-abc123.js").await;
+        assert_eq!(status, StatusCode::OK);
+        // A fetch (no text/html in Accept) still reads a status.
+        let (status, headers, _) = get(&dist, "/ux/jobs/abc", false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(headers.get(header::LOCATION).is_none());
     }
 }

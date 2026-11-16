@@ -12,7 +12,7 @@
   import { rowLink } from '@boss/web-kit/ui/RowLink';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import { shortId } from '../data/ids';
-  import { subjectLabel, subjectPath } from './types';
+  import { subjectLabel, subjectPath, type Subject } from './types';
   import { parseListedEnvelope, type LifecycleListedJob } from './listedEnvelope';
   import { liveSteps, openAge } from './lifecycle';
   import { listGroups, groupKindQuery } from './listGroups';
@@ -24,11 +24,10 @@
   import { kindsForDepartment } from './newJobKinds';
   import { ACCOUNTS_LIST_URL } from '../accounts/api';
   import { jobsFilterSearch, searchWithoutNewJob } from './filterQuery';
-  import { parseCompanyDepartments } from '../it/yard/company-map';
   import { fetchRemote, type Remote } from '../data/remote';
   import type { Department } from '@boss/web-kit/nav';
   import { departmentJobsPath } from '../shell/nav-catalog';
-  import { rowDepartment } from './department';
+  import { parseDepartments, rowDepartment } from './department';
 
   let userId = $derived(
     session.value.kind === 'ready' ? session.value.user.id : '',
@@ -105,7 +104,7 @@
   const departmentRows = $derived(departmentRead.kind === 'ready' ? departmentRead.data : null);
   async function readDepartments(): Promise<void> {
     departmentRead = { kind: 'loading' };
-    departmentRead = await fetchRemote('/api/departments', parseCompanyDepartments);
+    departmentRead = await fetchRemote('/api/departments', parseDepartments);
   }
   onMount(() => { void readDepartments(); });
   let status = $state(initialStatus);
@@ -559,19 +558,15 @@
     }
   });
 
-  // Build the Subject payload. The Custom variant carries
-  // {custom_kind, ref_id}; every other variant uses the plain
-  // {id} plus its tag.
-  function buildSubject(): Record<string, unknown> | null {
+  // Build the Subject payload: {subject_kind, id} for every kind, as
+  // boss_core::job::Subject is. `custom` used to be sent as
+  // {custom_kind, ref_id}, a shape with no `id` that the jobs API
+  // refuses 422, so this form could file no custom-subject Job
+  // (backlog a8844a57). Typed as Subject so a literal of another shape
+  // is a type error here, not a refusal at the API.
+  function buildSubject(): Subject | null {
     if (!formSubjectKind || !formSubjectId.trim()) return null;
-    const id = formSubjectId.trim();
-    if (formSubjectKind === 'asset') {
-      return { subject_kind: 'asset', id };
-    }
-    if (formSubjectKind === 'custom') {
-      return { subject_kind: 'custom', custom_kind: 'custom', ref_id: id };
-    }
-    return { subject_kind: formSubjectKind, id };
+    return { subject_kind: formSubjectKind, id: formSubjectId.trim() };
   }
 
   async function submitNewJob(e: Event) {

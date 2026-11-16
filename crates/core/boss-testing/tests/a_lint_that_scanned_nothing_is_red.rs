@@ -113,6 +113,10 @@ const NOT_SCANNERS: &[(&str, &str)] = &[
         "self-test of the converge's rollback against a planted bricked head",
     ),
     (
+        "the-converge-watches-postgres",
+        "self-test of PostgreSQL rollout and recovery against planted converge and API fixtures",
+    ),
+    (
         "the-executor-never-waits-on-its-visibility",
         "self-test of the chore wrapper against an unreachable API",
     ),

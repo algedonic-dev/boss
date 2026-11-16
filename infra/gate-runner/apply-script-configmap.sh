@@ -32,13 +32,18 @@
 # this by hand is a repair, and --check is its everyday use. SINCE
 # e3100bc8 the ConfigMap holds TWO keys — `bootstrap.sh`, which fetches
 # and execs the run.sh of the sha being gated, and `run.sh`, main's copy
-# it falls back to — and --check compares both. The key set is pinned
-# equal to the converge's by gate_runner_manifests.rs.
+# it falls back to — and --check compares both. SINCE 3e2c8ddc a THIRD,
+# `seed-refresh.sh`: the seed housekeeping both layouts run, and the whole
+# of the judged-init layout's helper container (design b4bf8bba). The key
+# set is pinned equal to the converge's by gate_runner_manifests.rs.
+# A fourth key, forge-repository, is derived from the estate (8456a6cc)
+# and compared too: script equality alone cannot prove the fetch target.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 SCRIPT=infra/gate-runner/run.sh
 BOOTSTRAP=infra/gate-runner/bootstrap.sh
+SEED_REFRESH=infra/gate-runner/seed-refresh.sh
 NAME=gate-runner-script
 
 CHECK=0
@@ -48,23 +53,36 @@ if [ "${1:-}" = "--check" ]; then
 fi
 NAMESPACE="${1:-boss-dev}"
 
-for f in "$SCRIPT" "$BOOTSTRAP"; do
+for f in "$SCRIPT" "$BOOTSTRAP" "$SEED_REFRESH"; do
     [ -f "$f" ] || { echo "apply-script-configmap: $f not found" >&2; exit 1; }
 done
+
+GATE_FORGE_REPOSITORY=$(python3 -B infra/gate-runner/forge-repository.py infra/estate/estate.toml)
 
 rendered=$(kubectl -n "$NAMESPACE" create configmap "$NAME" \
     --from-file="run.sh=$SCRIPT" \
     --from-file="bootstrap.sh=$BOOTSTRAP" \
+    --from-file="seed-refresh.sh=$SEED_REFRESH" \
+    --from-literal="forge-repository=$GATE_FORGE_REPOSITORY" \
     --dry-run=client -o yaml)
 
 if [ "$CHECK" = "1" ]; then
+    # One observation: a converge between four separate reads must not
+    # let bodies and repository values from different objects pass.
+    if ! live_configmap=$(kubectl -n "$NAMESPACE" get configmap "$NAME" -o json); then
+        echo "apply-script-configmap: could not read $NAME in $NAMESPACE; nothing was compared" >&2
+        exit 1
+    fi
+    configmap_value() {
+        python3 -c 'import json, sys; print((json.load(sys.stdin).get("data") or {}).get(sys.argv[1], ""))' "$1"
+    }
     # Compare each SCRIPT BODY, not the rendered YAML: the rendered form
     # carries metadata (creationTimestamp, resourceVersion) that differs
     # every time and would report drift on an identical script.
     drift=0
-    for pair in "run.sh=$SCRIPT" "bootstrap.sh=$BOOTSTRAP"; do
+    for pair in "run.sh=$SCRIPT" "bootstrap.sh=$BOOTSTRAP" "seed-refresh.sh=$SEED_REFRESH"; do
         key=${pair%%=*} file=${pair#*=}
-        live=$(kubectl -n "$NAMESPACE" get configmap "$NAME" -o jsonpath="{.data.${key//./\\.}}" 2>/dev/null || true)
+        live=$(printf '%s' "$live_configmap" | configmap_value "$key")
         if [ -z "$live" ]; then
             echo "apply-script-configmap: ConfigMap $NAME in $NAMESPACE has no key $key." >&2
             echo "    A gate whose command names that key would fail to start rather than" >&2
@@ -82,6 +100,13 @@ if [ "$CHECK" = "1" ]; then
         diff <(printf '%s' "$live") "$file" >&2 || true
         drift=1
     done
+    live_repository=$(printf '%s' "$live_configmap" | configmap_value forge-repository)
+    if [ "$live_repository" != "$GATE_FORGE_REPOSITORY" ]; then
+        echo "apply-script-configmap: DRIFT — $NAME key forge-repository does not match the estate declaration." >&2
+        drift=1
+    else
+        echo "apply-script-configmap: $NAME key forge-repository matches the estate declaration"
+    fi
     if [ "$drift" = "1" ]; then
         echo "    Fix with: $0 $NAMESPACE (the converge also rewrites it on every train)" >&2
         exit 1
@@ -90,4 +115,4 @@ if [ "$CHECK" = "1" ]; then
 fi
 
 printf '%s\n' "$rendered" | kubectl apply -f -
-echo "apply-script-configmap: $NAME in $NAMESPACE now matches $SCRIPT and $BOOTSTRAP"
+echo "apply-script-configmap: $NAME in $NAMESPACE now matches the scripts and the estate repository"

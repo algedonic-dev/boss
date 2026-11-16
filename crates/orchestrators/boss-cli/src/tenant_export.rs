@@ -803,14 +803,19 @@ pub fn render(snap: &Snapshot, dir: &Path) -> Result<Vec<Rendered>> {
                     "id",
                     "display_name",
                     "default_model",
+                    "model_class",
                     "aliases",
                     "role",
                     "department",
                     "hourly_budget_usd_micros",
                     "max_concurrent_runs",
+                    "stations",
                 ],
             );
             drop_if(&mut row, "aliases", &json!([]));
+            // An unseated row exports no `stations` key, which a publish
+            // reads as "keep", never as "unseat" (design 506e0a1c car 1).
+            drop_if(&mut row, "stations", &json!([]));
             row
         })
         .collect();
@@ -1168,8 +1173,9 @@ mod tests {
             ],
             agents: vec![
                 json!({"id": "agent-claude", "display_name": "Claude", "default_model": "opus-5[1m]",
-                                "role": null, "department": null, "hourly_budget_usd_micros": null,
-                                "max_concurrent_runs": null, "aliases": ["claude@acme.example"]}),
+                                "model_class": "opus", "role": null, "department": null, "hourly_budget_usd_micros": null,
+                                "max_concurrent_runs": null, "aliases": ["claude@acme.example"],
+                                "stations": ["landed-review", "design-review"]}),
             ],
             workflows: vec![json!({
                 "kind": "handle-a-request", "version": 1, "status": "active",
@@ -1333,6 +1339,14 @@ mod tests {
         let agents = boss_jobs::agents::load_agents_toml(&dir.join("seeds/agents.toml")).unwrap();
         assert_eq!(agents[0].aliases, ["claude@acme.example"]);
         assert_eq!(agents[0].role, None);
+        // The model class a robot's row records is declared data, so it
+        // is exported as declared (T2d, backlog 06d8988b).
+        assert_eq!(agents[0].model_class.as_deref(), Some("opus"));
+        // So are its seats, in the order served (design 506e0a1c car 1).
+        assert_eq!(
+            agents[0].stations.as_deref(),
+            Some(&["landed-review".to_string(), "design-review".to_string()][..])
+        );
         let sensors =
             boss_jobs::sensors::load_sensors_toml(&dir.join("seeds/sensors.toml")).unwrap();
         assert_eq!(sensors[0].opens, "handle-a-request");

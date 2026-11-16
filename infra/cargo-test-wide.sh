@@ -39,16 +39,44 @@
 #   * A list that names nothing, or a build that did not finish, is a
 #     FAILED run, never an empty pass — no evidence is not a pass.
 #
-# THE WIDTH. BOSS_TEST_BINARIES_WIDE when set; otherwise a quarter of
-# CARGO_BUILD_JOBS (which infra/gate-runner/run.sh sets from the
-# container's CGROUP CPU quota — the one measured CPU fact, not read
-# twice), between 1 and 4; and 1 — cargo's own serial order — wherever
-# CARGO_BUILD_JOBS is unset (the public mirror's runner, a hand run).
-# Four, at most: four binaries x RUST_TEST_THREADS=2 is 8 test threads,
-# a quarter of w-1's 32 cores beside three other gates, inside the gate
-# container's 20-CPU limit; and the Postgres sidecar keeps its default
-# max_connections of 100 (gate-runner.yaml), where one DB-backed binary
-# holds two tests' pools (5 each) plus its reaper's 8 drops at worst.
+# THE WIDTH. BOSS_TEST_BINARIES_WIDE when set; otherwise the least of
+# three bounds, and 1 — cargo's own serial order — wherever
+# CARGO_BUILD_JOBS is unset (the public mirror's runner, a hand run):
+#   * HALF of CARGO_BUILD_JOBS (which infra/gate-runner/run.sh sets from
+#     the container's CGROUP CPU quota — the one measured CPU fact, not
+#     read twice): each binary runs RUST_TEST_THREADS=2, so half the
+#     quota in binaries is the quota in test threads.
+#   * max_width, 4 — the gate drive's bound, not the CPU's. Backlog
+#     62435ba1 read 44 width-4 receipts (2026-11-02: `test` 1118-1998 s
+#     on about 4.5 of 20 cores) as width-bound and raised the cap to 8.
+#     The one FULL gate at 8 (gate 62826a81, red) disproved it: against
+#     a width-4 gate over the same 1216 binaries, wall 1336 s vs 1244 s,
+#     own_time_sum 10082 s vs 4850 s, the test phase's io.some pressure
+#     418 s vs 3.6 s, and a budgeted 2 s statement (boss-jobs
+#     claims_console_history) expired. Eight binaries doubled each one's
+#     time on the gate volume and bought no wall time. THE WAY UP is this
+#     one constant, raised after the sustained-write gate drive is fitted
+#     (design 121f44a1 Q1) and proven by one FULL gate's receipt; the
+#     connection budget below already follows it.
+#   * THE SIDECAR'S CONNECTION BUDGET: max_connections / clients_per_binary.
+#     Every DB-backed binary holds up to clients_per_binary connections
+#     against the one Postgres the suites share — two tests' pools of 5
+#     plus the reaper's 8 drops (boss-testing's test_db.rs); the worst
+#     three measured 15-16 each (gate_runner_manifests.rs, 2026-09-24).
+#     max_connections is read FROM THE SERVER (`SHOW max_connections`
+#     over BOSS_TEST_POSTGRES_ADMIN_URL, the URL every TestDb uses),
+#     because the manifest that sets it is live only after it converges
+#     (e3100bc8): a car gated before that runs the width its server
+#     admits, and the summary's `connection_budget` says so. Unreadable
+#     — no URL, no psql, no answer, not a number — it is ASSUMED to be
+#     Postgres's default of 100, the narrower width, never the wider.
+#     gate-runner.yaml sets 100 (4 x 18 = 72 fits), and
+#     gate_runner_manifests.rs holds that number to at least
+#     max_width x clients_per_binary, so raising the cap without the
+#     sidecar fails a pin rather than a gate.
+#   The summary's `width_bound` names the bound that set the width:
+#   `explicit`, `serial` (no CARGO_BUILD_JOBS), `build_jobs`,
+#   `max_width` or `connections` — the first of them that is lowest.
 #
 # Exit: 0 every binary and the doctests passed; 101 any failed (cargo's
 # own code); 2 usage or a missing listing.
@@ -85,13 +113,43 @@ if [ ! -s "$listing" ]; then
     exit 2
 fi
 
+# The three bounds, each on a line of its own: gate_runner_manifests.rs
+# reads max_width and clients_per_binary from here to hold the sidecar's
+# max_connections to their product.
+max_width=4
+clients_per_binary=18
+assumed_max_connections=100
+
+# `SHOW max_connections` from the server the tests will use, or nothing.
+server_max_connections() {
+    [ -n "${BOSS_TEST_POSTGRES_ADMIN_URL:-}" ] || return 1
+    command -v psql >/dev/null 2>&1 || return 1
+    local answer
+    answer=$(PGCONNECT_TIMEOUT=5 psql "$BOSS_TEST_POSTGRES_ADMIN_URL" -X -tAc 'SHOW max_connections' 2>/dev/null) || return 1
+    case ${answer:-empty} in empty|*[!0-9]*) return 1 ;; esac
+    [ "$answer" -ge 1 ] || return 1
+    printf '%s\n' "$answer"
+}
+
 width=${BOSS_TEST_BINARIES_WIDE:-}
-if [ -z "$width" ]; then
+if max_connections=$(server_max_connections); then
+    budget_source=server
+else
+    max_connections=$assumed_max_connections
+    budget_source=assumed
+fi
+by_connections=$((max_connections / clients_per_binary))
+if [ -n "$width" ]; then
+    width_bound=explicit
+else
     case ${CARGO_BUILD_JOBS:-empty} in
-        empty|*[!0-9]*) width=1 ;;
-        *) width=$((CARGO_BUILD_JOBS / 4)) ;;
+        empty|*[!0-9]*) width=1 width_bound=serial ;;
+        *) width=$((CARGO_BUILD_JOBS / 2)) width_bound=build_jobs ;;
     esac
-    [ "$width" -le 4 ] || width=4
+    if [ "$width_bound" != serial ]; then
+        [ "$width" -le "$max_width" ] || width=$max_width width_bound=max_width
+        [ "$width" -le "$by_connections" ] || width=$by_connections width_bound=connections
+    fi
 fi
 case ${width:-empty} in empty|*[!0-9]*) echo "$0: BOSS_TEST_BINARIES_WIDE must be a whole number, got '$width'" >&2; exit 2 ;; esac
 [ "$width" -ge 1 ] || width=1
@@ -100,7 +158,23 @@ case ${width:-empty} in empty|*[!0-9]*) echo "$0: BOSS_TEST_BINARIES_WIDE must b
 # version, source. The package's name and version are read off cargo's
 # package id, in both of its spellings (`name ver (source)` before cargo
 # 1.77, `source#name@ver` or `source#ver` after).
-rows=$(jq -r '
+weights="$(cd "$(dirname "$0")" && pwd)/gate-runner/test-binary-weights.json"
+. "$(dirname "$0")/lib/jq.sh"
+if ! jq_doc_file "$weights" || ! jq -e '
+    .version == 1
+    and (.kind_defaults | type == "object")
+    and (.kind_defaults | [.bin, .lib, .test, .group]
+         | all(.[]; type == "number" and . > 0 and (isinfinite | not) and (isnan | not)))
+    and (.targets | type == "object")
+    and (.targets | all(to_entries[];
+        (.key | test("^[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$"))
+        and (.value.seconds | type == "number" and . > 0 and (isinfinite | not) and (isnan | not))
+        and (.value.basis | type == "string" and length > 0)))
+    ' "$weights" >/dev/null; then
+    echo "$0: unreadable or invalid scheduling weights at $weights — no test binary ran" >&2
+    exit 2
+fi
+if ! rows=$(jq -r --slurpfile weights "$weights" '
     select(.reason == "compiler-artifact" and .profile.test == true and .executable != null)
     | .package_id as $id
     | (if ($id | test("^[^ ]+ [^ ]+ \\(")) then ($id | split(" ") | [.[0], .[1]])
@@ -108,20 +182,28 @@ rows=$(jq -r '
          | if ($p[1] | contains("@")) then ($p[1] | split("@"))
            else [($p[0] | split("/") | last), $p[1]] end
        end) as $pkg
-    | [.target.kind[0], .target.name, .executable, .manifest_path, $pkg[0], $pkg[1], .target.src_path]
-    | @tsv' "$listing" | sort -t$'\t' -k3,3 -u | sort -t$'\t' -k1,1 -k5,5 -k2,2)
-# Ordered by kind first — `bin` and `lib` sort ahead of `test` — so each
-# crate's unit-test harness, which usually holds most of its tests and
-# is its longest binary (boss-cli's: 2142 tests, 126 s on 2026-10-09),
-# starts early instead of last, where it would be the run's tail.
+    | [.target.kind[0], .target.name, .executable, .manifest_path, $pkg[0], $pkg[1], .target.src_path] as $fields
+    | (if (.target.src_path | test("(^|/)tests/groups/")) then "group" else .target.kind[0] end) as $scheduling_kind
+    | ($weights[0].targets[($pkg[0] + ":" + .target.name)].seconds
+       // $weights[0].kind_defaults[$scheduling_kind]
+       // $weights[0].kind_defaults.test) as $weight
+    | [$weight, $fields[], $scheduling_kind] | @tsv' "$listing" \
+    | sort -t$'\t' -k4,4 -u | sort -t$'\t' -k1,1nr -k2,2 -k6,6 -k3,3 | cut -f2-); then
+    echo "$0: cargo's target list could not be scheduled — no test binary ran" >&2
+    exit 2
+fi
+# Largest numeric measured/declared weight first; names only break ties.
+# Versioned data records each measurement/estimate's basis. Unknown targets
+# use the declared kind fallback, not a fabricated measured duration.
 # Doctests run when a library under test declares them; cargo refuses
 # `--doc` over a selection with no library at all.
 has_doc=$(jq -n -r 'first(inputs | select(.reason == "compiler-artifact" and .profile.test == true and .target.doctest == true) | .target.name) // empty' "$listing")
 
-kinds=() names=() exes=() dirs=() pkgs=() vers=() srcs=()
-while IFS=$'\t' read -r k t e m p v s; do
+kinds=() names=() exes=() dirs=() pkgs=() vers=() srcs=() scheduling_kinds=()
+while IFS=$'\t' read -r k t e m p v s scheduling_kind; do
     [ -n "$e" ] || continue
     kinds+=("$k") names+=("$t") exes+=("$e") dirs+=("$(dirname "$m")") pkgs+=("$p") vers+=("$v") srcs+=("$s")
+    scheduling_kinds+=("$scheduling_kind")
 done <<< "$rows"
 n=${#exes[@]}
 if [ "$n" -eq 0 ] && [ -z "$has_doc" ]; then
@@ -170,7 +252,7 @@ job() { # <job> <cargo test argv…>
         } 2>/dev/null
         rc=$?
     fi
-    printf '%s %s\n' "$rc" $(( $(now_ms) - t0 )) > "$logs/$i.status.part" && mv "$logs/$i.status.part" "$logs/$i.status" \
+    printf '%s %s %s\n' "$rc" $(( $(now_ms) - t0 )) "$t0" > "$logs/$i.status.part" && mv "$logs/$i.status.part" "$logs/$i.status" \
         || echo "$0: job $i ended with exit status $rc, but its status could not be recorded in $logs" >&2
 }
 
@@ -194,19 +276,27 @@ selector() { # <index into the binary arrays>
     esac
 }
 
-failed=() took=()
+failed=() took=() group_times=() finish_times=()
 sum_ms=0
 declare -A lost=()
 report() { # <job> <cargo test argv…>
-    local i=$1 rc ms how
+    local i=$1 rc ms start_ms how target
     shift
     if [ -n "${lost[$i]:-}" ]; then
-        rc=125 ms=0 how="(no exit status: ${lost[$i]})"
+        rc=125 ms=0 start_ms="" how="(no exit status: ${lost[$i]})"
     else
-        read -r rc ms < "$logs/$i.status"
+        read -r rc ms start_ms < "$logs/$i.status"
         how=$(ended "$rc")
     fi
     sum_ms=$((sum_ms + ms))
+    target=doctests
+    [ "$i" -eq 0 ] || target="${pkgs[$((i - 1))]}:${names[$((i - 1))]}"
+    if [ -n "$start_ms" ]; then
+        finish_times+=("$((start_ms + ms)) $((start_ms - t_run)) $ms $target")
+    fi
+    if [ "$i" -ne 0 ] && [ "${scheduling_kinds[$((i - 1))]}" = group ]; then
+        if [ -n "$start_ms" ]; then group_times+=("$ms $target"); else group_times+=("-1 $target"); fi
+    fi
     if [ "$i" -eq 0 ]; then
         echo "   Doc-tests ($* --doc)"
         cat "$logs/0.log" 2>/dev/null || echo "(its output, $logs/0.log, is gone)"
@@ -227,7 +317,7 @@ report() { # <job> <cargo test argv…>
 first=1
 [ -n "$has_doc" ] && first=0
 total=$(( n + 1 - first ))
-echo "cargo-test-wide: ${n} test binaries$([ "$first" -eq 0 ] && echo ' and the doctests'), ${width} at a time (RUST_TEST_THREADS=${RUST_TEST_THREADS:-unset} each)"
+echo "cargo-test-wide: ${n} test binaries$([ "$first" -eq 0 ] && echo ' and the doctests'), ${width} at a time (RUST_TEST_THREADS=${RUST_TEST_THREADS:-unset} each; CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-unset} allows $(( ${CARGO_BUILD_JOBS:-0} / 2 )), max_connections=${max_connections} ${budget_source} allows ${by_connections}, cap ${max_width}; set by ${width_bound})"
 t_run=$(now_ms)
 next=$first
 running=0
@@ -274,9 +364,14 @@ echo "cargo-test-wide: ${total} job(s) ${width} at a time in $((wall_ms / 1000))
 echo "cargo-test-wide: slowest: $(printf '%s\n' "$slowest" | awk '{ printf "%s%s %.0fs", (NR > 1 ? ", " : ""), $2, $1 / 1000 }')"
 slow_json=$(printf '%s\n' "$slowest" | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ") | {target: .[1], seconds: ((.[0] | tonumber) / 1000 | . * 10 | round / 10)})')
 fail_json=$(printf '%s\n' "${failed[@]+"${failed[@]}"}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-printf '{"width":%s,"rust_test_threads":"%s","binaries":%s,"doctests":%s,"wall_s":%s,"own_time_sum_s":%s,"failed":%s,"slowest":%s}\n' \
-    "$width" "${RUST_TEST_THREADS:-}" "$n" "$([ "$first" -eq 0 ] && echo true || echo false)" \
-    "$((wall_ms / 1000))" "$((sum_ms / 1000))" "$fail_json" "$slow_json" > "$state/summary.json"
+group_json=$(printf '%s\n' "${group_times[@]+"${group_times[@]}"}" | sort -k2,2 | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ") | {target: .[1], seconds: (if .[0] == "-1" then null else (.[0] | tonumber) / 1000 | . * 10 | round / 10 end)})')
+# Completion order comes from each job's own start and elapsed receipt,
+# not the parent's traversal order. Start is relative to this test phase.
+tail_json=$(printf '%s\n' "${finish_times[@]+"${finish_times[@]}"}" | sort -k1,1nr -k4,4 | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ") | {target: .[3], started_at_s: ((.[1] | tonumber) / 1000), seconds: ((.[2] | tonumber) / 1000 | . * 10 | round / 10)}) | .[0] // null')
+printf '{"width":%s,"width_bound":"%s","rust_test_threads":"%s","binaries":%s,"doctests":%s,"wall_s":%s,"own_time_sum_s":%s,"failed":%s,"slowest":%s,"groups":%s,"tail":%s,"connection_budget":{"max_connections":%s,"source":"%s","clients_per_binary":%s}}\n' \
+    "$width" "$width_bound" "${RUST_TEST_THREADS:-}" "$n" "$([ "$first" -eq 0 ] && echo true || echo false)" \
+    "$((wall_ms / 1000))" "$((sum_ms / 1000))" "$fail_json" "$slow_json" "$group_json" "$tail_json" \
+    "$max_connections" "$budget_source" "$clients_per_binary" > "$state/summary.json"
 if [ "${#failed[@]}" -gt 0 ]; then
     echo ""
     echo "failures (rerun each with cargo test <selector>):"

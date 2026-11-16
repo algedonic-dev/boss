@@ -1,0 +1,22 @@
+-- 20261109215500-an-agent-is-seated-at-stations.sql — design 506e0a1c
+-- car 1 (backlog 1a74c2bc; David approved 2026-11-09).
+--
+-- An executor is SEATED at stations, several and ordered: it pulls from
+-- its first station with admissible work, so Claude B can serve
+-- landed-review first and build second (resolution `seats`). Which
+-- executor served which station lived in a coordinator's judgment and
+-- nowhere the product read. This column is where it is declared — data
+-- on the agents registry row, not a new table — and a station's
+-- who-pool is the executors whose row names it.
+--
+-- ORDERED: a TEXT[] keeps the order written; position 1 is served first.
+-- NOT NULL DEFAULT '{}': a row registered before it is seated nowhere,
+-- which is what it was — no backfill, since a seat is a decision and
+-- nothing in the row says what it would be.
+--
+-- NO FOREIGN KEY. Stations are versioned (`stations` keys on name AND
+-- version) and a seat is good only while its station is ACTIVE, which a
+-- key cannot say; the agents batch door (`POST /api/agents/batch`)
+-- refuses a seat at a station the registry does not hold active, by
+-- agent and station, and records `agent.declared` / `agent.updated`.
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS stations TEXT[] NOT NULL DEFAULT '{}';

@@ -102,14 +102,18 @@ async fn every_bundled_policy_is_publishable_at_its_declared_version() {
         Some(true),
         "the reviewed activation must publish enabled lighter channels"
     );
+    // v12 (item 0a78f8f8): the gate capacity is no longer policy — it
+    // is the `gates` station's bays — so the row carries none. The
+    // queued packet still belongs to the resident supervisor, not to a
+    // waiter (v10).
     assert_eq!(
         (
             served.version,
             served.ci_host_floor_gb,
-            served.gate_max_concurrent,
-            served.consist_budget_secs
+            served.consist_budget_secs,
+            served.gate_queue_owner.as_str()
         ),
-        (9, 40, 3, 120),
+        (12, 40, 120, "resident"),
         "the row the conductor reads is the row the bundle declares"
     );
 }
@@ -133,7 +137,6 @@ consist_files_named = 6
 skip_reason_file_budget = 96
 blip_cause_budget = 80
 ci_host_floor_gb = 40
-gate_max_concurrent = 3
 ";
     let err =
         parse_delivery_policies(retired, "x.toml").expect_err("a retired declaration is refused");
@@ -160,6 +163,18 @@ gate_max_concurrent = 3
     )
     .expect_err("a column the table does not have is refused");
     assert!(err.to_string().contains("consist_excluded_lints"), "{err}");
+
+    // And the one item 0a78f8f8 dropped: the gate capacity lives on the
+    // `gates` station's bays, so a policy still declaring it is refused.
+    let err = parse_delivery_policies(
+        &format!(
+            "{}gate_max_concurrent = 2\n",
+            retired.replace("retired", "active")
+        ),
+        "x.toml",
+    )
+    .expect_err("the dropped gate capacity is refused");
+    assert!(err.to_string().contains("gate_max_concurrent"), "{err}");
 
     // Every column is required: the table has no default for a budget,
     // and a file that leaves one out would be a row the seed cannot

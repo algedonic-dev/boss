@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# maintenance — Operations' maintenance stage (design c0ae096f section 2,
+# car 1, backlog 599fec3e; David, 2026-11-10): the home of the
+# `maintenance-*` protocol family, about thirty rows. Its address is
+# /algedonic/operations/maintenance, derived from `parent` and stored
+# nowhere.
+#
+# ONE STATION FOR THE FAMILY: a child station per maintenance family is
+# added only when its allocation differs. The rows name it as their owner
+# in car 2 of the design, not here; the two ledger rows are Finance's.
+#
+# A CONTAINER, NOT A QUEUE: the tagged predicate holds no packet (see
+# algedonic.toml). It allocates nothing, as Operations allocates nothing
+# yet (operations.toml). It names no line, so it draws Operations'.
+# To change this station, bump `version`; `id` never changes.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "maintenance"
+version = 1
+status = "active"
+title = "Maintenance — the estate's maintenance protocols"
+kind = "group"
+discipline = ["priority", "age"]
+id = "2062468c-f621-4ac1-aa1e-8c3b6df56bf3"
+parent = "9660c60f-eb47-4405-ae08-fcbb30c71e5f"
+mode = "standing"
+
+[station.predicate]
+tags_any = ["station:maintenance"]

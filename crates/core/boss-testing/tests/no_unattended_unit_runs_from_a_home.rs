@@ -75,6 +75,11 @@ const GENERATED_FROM_A_HOME: &[(&str, &str, &str, &str)] = &[];
 
 /// Units that run as an account other than root, the account, and why.
 const RUNS_AS_AN_ACCOUNT: &[(&str, &str, &str)] = &[
+    (
+        "infra/gcp/proton-bridge.service",
+        "boss-bridge",
+        "67e08c6a: dedicated non-login system account for the pinned Bridge and private persistent keychain; executes root-owned immutable control/package bytes under /opt/boss-bridge, never a person's writable checkout",
+    ),
     // The forge's cluster-deploy-runner and disk-floor-sweep left this
     // roster with backlog 683d7fe9's second car: root, from root's tree.
     (
@@ -572,6 +577,11 @@ fn a_generated_start_line_on_a_home_is_on_the_roster() {
 /// Forge verbs whose working tree defaults to the tree they run from on
 /// purpose: (script, variable, why root's tree is the right one).
 const WORKS_ON_ROOTS_TREE: &[(&str, &str, &str)] = &[
+    (
+        "infra/forge/delete-orphan-object.sh",
+        "TREE",
+        "derives what root may delete from the tree's FILES, so it reads only a generation of root's tree and proves it against root's store; the checkout is a tree its owner can edit under root (backlog 1dde630c)",
+    ),
     (
         "infra/forge/retire-example-reference-rows.sh",
         "TREE",

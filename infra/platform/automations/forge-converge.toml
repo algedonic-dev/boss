@@ -9,3 +9,5 @@
 id = "automation:forge-converge"
 role = "audit-readonly"
 description = 'The forge host converge reading which roles the estate registry gives its node (infra/forge/forge-converge.sh, through infra/estate/node-roles.sh). Reads only.'
+# Host station: deploy (backlog 6ecb5480, station-tree.md section 6).
+station = "57b72e1f-490e-443a-9a9f-870a9977c9fb"

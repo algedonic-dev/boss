@@ -101,7 +101,7 @@ fi
 # silenced: silence is what let four migrations accumulate unapplied.
 
 echo "==> [1/5] converging per-module schema (migrate.sh, manifest order)"
-if ! "$REPO/infra/postgres/migrate.sh"; then
+if ! "$REPO/infra/postgres/migrate.sh" --phase boot; then
     {
         echo
         echo "!! SCHEMA CONVERGE FAILED — boss-init is exiting nonzero."

@@ -140,10 +140,15 @@
   }
 
   // active = the published, live version → ok; retired → muted;
-  // draft → warn (an unpublished draft is attention, and must read
-  // differently from both the live and the retired rows).
+  // rejected → muted (a lost candidate is settled history, backlog
+  // 50ded63d); draft → warn (an unpublished draft is attention, and
+  // must read differently from both the live and the retired rows).
   function statusTone(status: WorkflowSpec['status']): 'ok' | 'warn' | 'muted' {
-    return status === 'active' ? 'ok' : status === 'retired' ? 'muted' : 'warn';
+    return status === 'active'
+      ? 'ok'
+      : status === 'retired' || status === 'rejected'
+        ? 'muted'
+        : 'warn';
   }
 
   // ------- Diff helpers -------

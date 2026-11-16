@@ -47,10 +47,17 @@ const SIDEBAR_PATHS: ReadonlyArray<string> = [
   ]),
 ];
 
+// Catalog paths describe parameters, not literal department codes or ids.
+// Exercise every parameterised entry with the same valid segment; accepting
+// the placeholder itself would loosen the production router's input contract.
+function routeExample(path: string): string {
+  return path.replace(/:[A-Za-z][A-Za-z0-9_]*/g, 'example');
+}
+
 describe('sidebar-router consistency', () => {
   for (const path of SIDEBAR_PATHS) {
     it(`sidebar path "${path}" resolves to a non-catch-all route`, () => {
-      const route = parseRoute(path);
+      const route = parseRoute(routeExample(path));
       // The catch-all returns { kind: 'notFound' }; any *labeled*
       // sidebar item should resolve to its own route.
       expect(
@@ -61,6 +68,14 @@ describe('sidebar-router consistency', () => {
       ).not.toBe('notFound');
     });
   }
+
+  it('materialises every parameter without hiding an unmatched route', () => {
+    expect(routeExample('/unregistered/:code/child/:id')).toBe('/unregistered/example/child/example');
+    expect(parseRoute(routeExample('/unregistered/:code/child/:id'))).toEqual({
+      kind: 'notFound', path: '/unregistered/example/child/example',
+    });
+    expect(parseRoute('/it/floor/:code')).toEqual({ kind: 'notFound', path: '/it/floor/:code' });
+  });
 
   it('the catch-all itself still works: an unknown path is notFound, naming it', () => {
     // Two segments: one bare segment is a department's address since car

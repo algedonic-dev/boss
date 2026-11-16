@@ -166,7 +166,6 @@ const SECTION_FOR_KIND: Readonly<Record<Route['kind'], string>> = {
   login: 'me',
   stepFocus: 'me',
   home: 'me',
-  companyMap: 'company-map',
   // The kind half only: `sectionForRoute` answers by the path's
   // department, the way it answers a yard floor by its region.
   notFound: 'me',
@@ -249,6 +248,11 @@ const SECTION_FOR_KIND: Readonly<Record<Route['kind'], string>> = {
   // were pages with rows of their own until car N3 made each one a
   // selection's panel.
   systemYard: 'system-yard',
+  // The station tree floor (T7, backlog 94a9dad4) is the map's next
+  // drawing, beside it until it retires the old one.
+  systemTree: 'system-yard',
+  // The station page (design c4854fd4 E2) is a station of that floor, opened.
+  systemStation: 'system-yard',
   systemEstate: 'system-estate',
   incidents: 'system-incidents',
   systemKb: 'system-kb',

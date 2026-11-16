@@ -88,6 +88,10 @@ export type StepField = {
   name: string;
   field_type: string;
   required?: boolean;
+  /// The one credential principal the step doors admit for this key
+  /// (`StepField::writer`, design f623e425); absent when any caller the
+  /// policy admits may write it. A surface offers no input for it.
+  writer?: string;
 };
 
 export type Step = {
@@ -227,7 +231,9 @@ export function subjectLabel(s: Subject): string {
 export function subjectPath(s: Subject): string {
   // The canonical /ux/… spelling, as entityHref writes it. These were
   // the router's unprefixed legacy paths, which resolve only because
-  // the router strips /ux "defensively" (backlog d0b93b80).
+  // the router strips /ux "defensively" (backlog d0b93b80). A page that
+  // has moved to its station's address is spelled there (Finance's,
+  // backlog c7ef4728).
   const id = encodeURIComponent(s.id ?? '');
   switch (s.subject_kind) {
     case 'asset':
@@ -235,11 +241,11 @@ export function subjectPath(s: Subject): string {
     case 'account':
       return `/ux/accounts/${id}`;
     case 'purchase_order':
-      return `/ux/purchase-orders/${id}`;
+      return `/finance/purchase-orders/${id}`;
     case 'employee':
       return `/ux/people/${id}`;
     case 'vendor':
-      return `/ux/vendors/${id}`;
+      return `/finance/vendors/${id}`;
     default:
       return `/ux/jobs?subject_id=${id}`;
   }

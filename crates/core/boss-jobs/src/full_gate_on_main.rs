@@ -116,8 +116,17 @@ fn id(run: &Value) -> &str {
     run.get("id").and_then(Value::as_str).unwrap_or_default()
 }
 
-fn sha(run: &Value) -> &str {
+/// A gate-run's sha, read through the resident submission's view, the
+/// same way [`is_main_gate`] reads its mark. It is empty when the run names
+/// none. This is the one reader: the conductor's `gate_main_in_full` used to
+/// read raw `/metadata/sha`, a second reader of the same fact (backlog
+/// 9905c188).
+pub fn gate_sha(run: &Value) -> &str {
     text(md(run), "sha").unwrap_or_default()
+}
+
+fn sha(run: &Value) -> &str {
+    gate_sha(run)
 }
 
 fn short(sha: &str) -> &str {
@@ -200,7 +209,7 @@ fn main_gates(runs: &[Value]) -> Vec<&Value> {
 pub struct Bays {
     /// Gate Jobs running now, whoever filed them.
     pub live: usize,
-    /// The bound in force (`gate_max_concurrent`).
+    /// The bound in force (the `gates` station's `bays`).
     pub max: usize,
     /// Car gate-runs waiting for a slot.
     pub queued: usize,
@@ -766,6 +775,20 @@ mod tests {
             "metadata": {"branch": "main", "sha": sha, MARK: true},
             "steps": steps,
         })
+    }
+
+    /// The one public reader of a main gate-run's sha answers what the run
+    /// was filed with, and empty (never a guess) when the run names none
+    /// or its metadata is missing (backlog 9905c188).
+    #[test]
+    fn the_gate_sha_reader_answers_the_filed_sha_and_empty_when_there_is_none() {
+        assert_eq!(gate_sha(&gate("g1", MAIN, 0, None, None)), MAIN);
+        assert_eq!(gate_sha(&gate("g2", "  ", 0, None, None)), "");
+        assert_eq!(gate_sha(&json!({"id": "g3"})), "");
+        assert_eq!(
+            gate_sha(&json!({"id": "g4", "metadata": {"branch": "main"}})),
+            ""
+        );
     }
 
     fn red(id: &str, sha: &str, min: i64, checks: &[&str]) -> Value {

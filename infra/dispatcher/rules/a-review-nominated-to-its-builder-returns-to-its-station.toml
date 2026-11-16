@@ -1,0 +1,43 @@
+# A review step nominated to its own car's builder goes back to its
+# station's queue the moment the nomination lands (backlog c9cbf382, the
+# rest of eb86a174).
+#
+# THIS FILE IS THE EVENT HALF of
+# `a-stranded-review-nomination-returns-to-its-station`. That rule
+# sweeps the open ship-a-change cars every fifteen minutes, so a hand's
+# `boss step nominate` naming the car's builder stood up to fifteen
+# minutes where no other reviewer's pull could reach it. The nominate
+# verb merges its `nomination_requested` record and then puts the
+# assignee, and the put emits `step.assigned.<kind>` naming the step and
+# its packet — so this twin answers the builder half on that marker. One
+# handler serves both: it reads the one step fresh, judges it as the
+# sweep does, and returns it only when its holder built the car. It
+# NEVER applies the unclaimed-past-bound half: a nomination is never
+# past the bound at the instant it is made, so the bound is the sweep's
+# alone, and the handler refuses this rule by name if it declares one.
+#
+# The `when` is only a filter: the marker's payload carries the step's
+# metadata, so an assignment of any step that is not a review never
+# reads a packet. It names the same profile as the `profile` arg (held
+# equal by the handler's shipped-rule test).
+[[rule]]
+name = "a-review-nominated-to-its-builder-returns-to-its-station"
+why = """
+A CROSS-PROTOCOL REACTOR, the standing exemption: the condition is an
+assignment that names the car's own builder on its review, and a
+nomination is a step PUT that the claim door never judges — a Workflow
+`on` consequence cannot read who built the car (its `built_by`, or its
+builder run's `building` holder) at the moment an assignee is written.
+Measured 2026-11-15 (backlog eb86a174): 40 of 47 stranded reviews were
+named to the agent that built the car. Its clock twin returns those on
+a fifteen-minute tick; this answers the same builder half at the
+assignment itself. It adds no routing beyond the return to `ready` and
+nobody's at the step's own station; it nominates nobody and claims
+nothing.
+"""
+version = 1
+on_event = "step.assigned.*"
+when = 'metadata.agent_profile = "reviewer"'
+[[rule.do]]
+handler = "jobs.return_stranded_review"
+args = { kind = "\"ship-a-change\"", profile = "\"reviewer\"" }

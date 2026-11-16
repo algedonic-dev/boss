@@ -5,3 +5,5 @@
 id = "automation:boss-step"
 role = "platform-admin"
 description = 'Closes a step on the open packet of a named workflow, the step door the maintenance units use (infra/boss-step.sh).'
+# Host station: estate (backlog 6ecb5480, station-tree.md section 6).
+station = "134464a5-0b56-4386-86cb-d354c7448fdf"

@@ -13,6 +13,7 @@
 
 import { appNow, appToday } from '@boss/web-kit/sim-clock';
 import { saveStep } from '../steps/stepWrite';
+import type { Subject } from '../jobs/types';
 
 export type SimLogger = (msg: string) => void;
 
@@ -61,9 +62,13 @@ async function overlayStep(
   if (r.kind === 'failed') throw new Error(r.error);
 }
 
+/// `subject` is a Subject, the one shape boss_core::job::Subject takes,
+/// so a literal of another shape is a type error here. Typed as a bare
+/// record it let two flows send {custom_kind, ref_id}, which the jobs
+/// API refuses 422 for want of `id` (backlog a8844a57).
 async function createJob(params: {
   kind: string;
-  subject: Record<string, unknown>;
+  subject: Subject;
   title: string;
 }): Promise<string> {
   const jobId = crypto.randomUUID();
@@ -286,7 +291,7 @@ export async function triggerAnomaly(log: SimLogger): Promise<void> {
 
   const jobId = await createJob({
     kind: 'vendor-incident',
-    subject: { subject_kind: 'custom', custom_kind: 'incident', ref_id: refId },
+    subject: { subject_kind: 'custom', id: refId },
     title: '[sim] Malt supplier — 2-week delivery delay',
   });
   log(`Incident Job ${jobId.slice(0, 8)}… created`);
@@ -299,7 +304,7 @@ export async function runHire(log: SimLogger): Promise<void> {
 
   const jobId = await createJob({
     kind: 'hiring',
-    subject: { subject_kind: 'custom', custom_kind: 'hiring', ref_id: refId },
+    subject: { subject_kind: 'custom', id: refId },
     title: '[sim] Hire a cellar tech',
   });
   log(`Hiring Job ${jobId.slice(0, 8)}… created`);

@@ -20,10 +20,7 @@ const yardOf = (over: Partial<YardState> = {}): YardState => ({
   dockStation: {
     source: 'station',
     discipline: ['priority', 'age'],
-    wipLimit: null,
-    overLimit: false,
     total: 0,
-    upstream: null,
   },
   arrivals: [],
   cancelled: [],

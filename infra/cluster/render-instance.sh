@@ -384,6 +384,42 @@ load_source() {
 
 re_escape() { printf '%s' "$1" | sed -e 's,[][\.*^$/|],\\&,g'; }
 
+# Placement belongs to the instance row. A required node never becomes a
+# preference when its worker, taints or volume topology cannot satisfy it.
+stack_placement() { # <file> <namespace>
+    local file="$1" ns="$2" section node role found=""
+    if ! grep -qF '# stack-placement: begin' "$file"; then cat "$file"; return; fi
+    for section in $(sections); do
+        [ "$(param "$section" namespace)" = "$ns" ] || continue
+        [ -z "$found" ] || refuse "ambiguous stack placement for namespace $ns"
+        found="$section"
+    done
+    # The unregistered positional form keeps its pre-placement contract:
+    # control-plane selector and cp-2 exclusion, without the newly added
+    # per-instance required node. It does not publish an instance row.
+    if [ -z "$found" ]; then
+        awk '
+            /# stack-placement: begin/ { inside=1 }
+            inside && /operator: In, values: \["cp-3"\]/ { next }
+            { print }
+            /# stack-placement: end/ { inside=0 }
+        ' "$file"
+        return
+    fi
+    node=$(param "$found" stack_node); role=$(param "$found" stack_control_plane)
+    [[ "$node" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] && [ "$node" != cp-1 ] \
+        || refuse "instance [$found] must declare a required stack_node other than cp-1"
+    case "$role" in true|false) ;; *) refuse "instance [$found] must declare stack_control_plane true or false" ;; esac
+    awk -v node="$node" -v role="$role" '
+        /# stack-placement: begin/ { inside=1 }
+        inside && role == "false" && /^      nodeSelector:$/ { next }
+        inside && role == "false" && /^        node-role.kubernetes.io\/control-plane:/ { next }
+        inside && /operator: In, values: \["cp-3"\]/ { sub(/values: \["cp-3"\]/, "values: [\"" node "\"]") }
+        { print }
+        /# stack-placement: end/ { inside=0 }
+    ' "$file"
+}
+
 # --- one file, rendered --------------------------------------------------
 render_file() { # <src file> <ns> <tenant> <sim> <hostname> <guest> <site>
     local f="$1" ns="$2" tenant="$3" sim="$4" host="$5" guest="$6" site="$7"
@@ -397,7 +433,7 @@ render_file() { # <src file> <ns> <tenant> <sim> <hostname> <guest> <site>
     fi
     # `${pins[@]+"${pins[@]}"}`: an empty array is unbound under set -u
     # on the bash this may run under (4.x on a host, 5.x on the pod).
-    sed -E \
+    stack_placement "$f" "$ns" | sed -E \
         -e "s|^([[:space:]]*)namespace: ${ns_re}\$|\1namespace: ${ns}|" \
         -e "/^kind: Namespace\$/,/^  name: /s|^  name: ${ns_re}\$|  name: ${ns}|" \
         -e "s|\.${ns_re}\.svc\.cluster\.local|.${ns}.svc.cluster.local|g" \
@@ -406,8 +442,7 @@ render_file() { # <src file> <ns> <tenant> <sim> <hostname> <guest> <site>
         -e "s|(BOSS_GUEST_ACCESS, value: )\"$(guest_value "$SRC_GUEST")\"|\1\"$(guest_value "$guest")\"|" \
         -e "s|(BOSS_SITE_HOST, value: )\"$(re_escape "$SRC_SITE")\"|\1\"${site}\"|" \
         -e "s|${host_re}|${host}|g" \
-        ${pins[@]+"${pins[@]}"} \
-        "$f"
+        ${pins[@]+"${pins[@]}"}
 }
 
 # --- one instance, into a directory or a stream ---------------------------
@@ -469,7 +504,10 @@ case "${1:-}" in
         # nothing is rendered: the render stage is where the converge
         # first reads this file, and a refusal after the first instance's
         # directory exists would read as a partial render.
-        for s in $(sections); do shares_with_ns "$s" > /dev/null; tenant_of "$s" > /dev/null; guest_of "$s" > /dev/null; site_of "$s" > /dev/null; done
+        for s in $(sections); do
+            shares_with_ns "$s" > /dev/null; tenant_of "$s" > /dev/null; guest_of "$s" > /dev/null; site_of "$s" > /dev/null
+            stack_placement "$DIR/boss.yaml" "$(param "$s" namespace)" > /dev/null
+        done
         seen_ns=""
         for s in $(sections); do
             ns=$(param "$s" namespace); tenant=$(tenant_of "$s"); sim=$(param "$s" sim); host=$(param "$s" hostname); guest=$(guest_of "$s"); site=$(site_of "$s")

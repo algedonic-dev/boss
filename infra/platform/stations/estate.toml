@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# estate — the hosts, observed and kept (T2 of design 4b27a65a, backlog
+# 3f58c823; handoff section 1, the sensors region). Its machines are the
+# observers and sweeps the proposal names that have an automation row in
+# infra/platform/automations/.
+#
+# A CONTAINER, NOT A QUEUE: the tagged predicate holds no packet (see
+# algedonic.toml). Its observer footprint is not measured, so it
+# allocates nothing. To change this station, bump `version`.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "estate"
+version = 1
+status = "active"
+title = "Estate — the hosts, observed and kept"
+kind = "group"
+discipline = ["priority", "age"]
+id = "134464a5-0b56-4386-86cb-d354c7448fdf"
+parent = "9660c60f-eb47-4405-ae08-fcbb30c71e5f"
+mode = "standing"
+machines = [
+  "automation:estate-observer",
+  "automation:estate-observer-host",
+  "automation:estate-observer-units",
+  "automation:cluster-watchdog",
+  "automation:disk-floor-sweep",
+  "automation:dev-scratch-reclaim",
+  "automation:conservation-sweep",
+  "automation:maintenance-timer",
+  "automation:prune-registry-versions",
+]
+
+[station.predicate]
+tags_any = ["station:estate"]

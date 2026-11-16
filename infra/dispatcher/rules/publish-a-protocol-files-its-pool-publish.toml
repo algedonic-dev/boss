@@ -1,0 +1,37 @@
+# publish-a-protocol's POOL road (backlog f399458f ask 2, David
+# 2026-11-08: "we should be able to make these registry changes via a
+# different protocol than the code changes"). When a pool packet's
+# `publish-pool` step becomes READY — the owner signed `approve` with a
+# passkey and the decision was `approved` — spawn an ops-request for
+# host=boss-gcp verb=publish-pool with the ONE arg the verb takes, the
+# pool's name, and the packet's id as `metadata.for_protocol_publish`.
+#
+# The same shape as publish-a-protocol-files-its-machine-publish, one
+# rule per door: the edge is the whole door, because
+# infra/gcp/publish-pool.sh publishes only a row it reads back, through
+# this key, as signed for exactly those bytes over exactly that live
+# version (infra/lib/signed-publish.jq). Routed on the step's
+# `metadata.ops_verb` marker; Absent on every other task step, so the
+# shared topic never dead-letters. Pinned by
+# crates/core/boss-dispatcher/tests/publish_a_protocol_rules.rs.
+[[rule]]
+name = "publish-a-protocol-files-its-pool-publish"
+why = """
+A CROSS-PROTOCOL REACTOR spanning three protocols — publish-a-protocol
+-> ops-request -> a verb on the boss-gcp host — which no single
+Workflow `on` consequence can express: the packet's protocol cannot
+name a host verb, and the request's cannot know which packet asked.
+The `publish-pool` step becoming ready means the owner signed one pool
+row's publish with a passkey; the publish then runs by automaton
+through the checked sequence `boss pool publish` already is (the
+seed's loader, the door's lint, the moved-lineage refusal, the
+read-back). It widens no authority beyond the signature: the verb
+publishes only the bytes the packet signed, once. Measured 2026-11-08
+(backlog f399458f): raising robots:opus from 4 to 6 rode a code car, a
+gate and a train because a pool row had no road but the seed.
+"""
+on_event = "step.ready.task"
+when = 'metadata.ops_verb = "publish-pool"'
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"ops-request\"", subject_kind = "\"custom\"", subject = "\"boss-gcp\"", title = "\"publish a pool row on boss-gcp — its owner signed the publish\"", "metadata.host" = "\"boss-gcp\"", "metadata.verb" = "\"publish-pool\"", "metadata.args" = "[metadata.pool]", "metadata.for_protocol_publish" = "job_id" }

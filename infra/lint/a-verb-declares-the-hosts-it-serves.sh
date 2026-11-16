@@ -119,6 +119,9 @@ if not node_ids:
 # authorization (the-controls-are-bounded-verbs.sh checks for "David"),
 # and this table says which verbs went through it.
 GCP_MUTATING_ADMITTED = {
+    # David's support track and A170353 explicitly authorize local-only capture;
+    # child67e08c6a is held for adversarial credentials/converge review.
+    "capture-bridge-credential": "David 2026-10-31, support track / 67e08c6a",
     # design 9e3e093f, decided by David 2026-09-11 ("Go ahead and retire
     # it quickly ... part of our tech debt payoff"); backlog d5941ef3
     # car 2. Bounded to infra/gcp/second-stack-units.txt, capture before
@@ -133,6 +136,14 @@ GCP_MUTATING_ADMITTED = {
     # as the first verb that writes the workflow registry from a host,
     # the way run-car-probe was flagged as the first to run builder text.
     "publish-workflow": "David 2026-09-11, 8f4e9cc0 / backlog 3ce95b85 — flagged for review",
+    # backlog f399458f ask 2, David 2026-11-08 ("we should be able to
+    # make these registry changes via a different protocol than the code
+    # changes"). The second verb that writes a registry from a host: one
+    # resource pool row, only for a publish-a-protocol packet the owner
+    # signed with a passkey (infra/lib/signed-publish.jq, the program
+    # publish-workflow runs), from the packet's own signed bytes. Rides a
+    # held car, flagged for review the same way.
+    "publish-pool": "David 2026-11-08, backlog f399458f — runs only for a passkey-signed publish-a-protocol packet; flagged for review",
     # design 9e3e093f, decided by David 2026-09-11 — its accepted
     # proposal names this path: "an uninstall path for units the role
     # does not name ... through the ops-runner door as a bounded verb";

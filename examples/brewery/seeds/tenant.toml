@@ -184,6 +184,7 @@ qa          = true   # QA & Compliance hub — already brewery-themed
 exec        = true
 hr          = true
 parts       = true   # Brewery uses parts as ingredients + packaging
+products    = true   # Its finished-goods catalog is independent of parts
 warehouse   = true   # Inventory tracking
 shop        = true   # Direct-to-consumer brewery storefront at /shop
 

@@ -9,3 +9,5 @@
 id = "automation:discover-admission-source"
 role = "audit-readonly"
 description = 'The discover-admission-source ops verb reading the estate nodes (infra/forge/discover-admission-source.sh). Reads only.'
+# Host station: estate (backlog 6ecb5480, station-tree.md section 6).
+station = "134464a5-0b56-4386-86cb-d354c7448fdf"

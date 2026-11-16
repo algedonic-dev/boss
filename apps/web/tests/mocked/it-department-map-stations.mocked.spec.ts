@@ -20,9 +20,11 @@
 //  - the feedback board (/it/design/feedback) is receiving's, and the
 //    backlog board (/it/design/backlog) receiving's and marshalling's;
 //  - Operate lost its Receiving Yard, Marshalling Yard, Yard status and
-//    Conductor tabs, and Design its Feedback and Backlog tabs;
-//  - the map is PINNED at the top ("pinned at the top, always visible"),
-//    so the panel scrolls beneath it.
+//    Conductor tabs, and Design its Feedback and Backlog tabs.
+//
+// The map these panels sat under, its plant strip and the sentence that
+// named where each board went retired with the transit map (R3, backlog
+// 23a4b4d7); the panels and their boards stay.
 //
 // The board tests that were pinned on the floor pages (it-region-map,
 // retired with them) are carried here, opened as selections. What those
@@ -180,14 +182,6 @@ test.describe('the pages the Department Map replaced', () => {
     await expect(page.locator('nav.it-tabs a')).toHaveText(['Reviews', 'Experiments']);
   });
 
-  test('the map says where each retired board lives now, so a reader who knew the tab finds it', async ({ page }) => {
-    await mocks(page);
-    await page.goto('/it');
-    const header = page.locator('.exec-header').first();
-    await expect(header).toContainText('Feedback and the IT backlog are in the Receiving station');
-    await expect(header).toContainText('the Crew Board in the Shop floor');
-    await expect(header).toContainText('yard status and the conductor');
-  });
 });
 
 // ---------------------------------------------------------------------
@@ -285,72 +279,6 @@ test.describe('each retired page’s content is in its station’s panel', () =>
 });
 
 // ---------------------------------------------------------------------
-// The map, pinned
-// ---------------------------------------------------------------------
-
-test.describe('the map scrolls normally even in a tall desktop window', () => {
-  // A window with room for it (MapPage.svelte PIN_QUERY: 900px tall).
-  test.use({ viewport: { width: 1440, height: 1000 } });
-
-  test('scrolling the panel moves the map off the screen', async ({ page }) => {
-    await mocks(page);
-    await page.goto('/it?at=track');
-    const pin = page.locator('[data-map-pin]');
-    await expect(pin).toHaveAttribute('data-map-pin', 'scrolls');
-    expect(await pin.evaluate((el) => getComputedStyle(el).position)).toBe('static');
-    await expect(board(page, 'conductor')).toBeVisible();
-
-    // Down to the foot of the page: the map holds under the 44px bar.
-    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
-    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
-    const box = (await pin.boundingBox())!;
-    expect(box.y + box.height).toBeLessThanOrEqual(44);
-    // The panel's head has gone up under it; the map is what is on top.
-    expect(await page.evaluate(() => document.documentElement.style.scrollPaddingTop)).toBe('');
-  });
-
-  test('a selection reveals the panel in normal document flow', async ({ page }) => {
-    await mocks(page);
-    await page.goto('/it?at=dock');
-    await expect(page.locator('[data-map-pin]')).toHaveAttribute('data-map-pin', 'scrolls');
-    const pin = (await page.locator('[data-map-pin]').boundingBox())!;
-    const panel = (await page.locator(PANEL).boundingBox())!;
-    expect(panel.y).toBeGreaterThanOrEqual(pin.y + pin.height - 1);
-    expect(panel.y).toBeLessThan(pin.y + pin.height + 40);
-  });
-
-  test('the map never reserves document scroll padding', async ({ page }) => {
-    await mocks(page);
-    await page.goto('/it?at=dock');
-    const padding = () => page.evaluate(() => document.documentElement.style.scrollPaddingTop);
-    // The map's height as the layout rounds it (clientHeight), against the
-    // box's fractional one: within a pixel.
-    await expect.poll(padding).toBe('');
-    await page.goto('/it/estate');
-    await expect(page.getByRole('heading', { level: 1 })).toHaveText('The estate');
-    await expect.poll(padding).toBe('');
-  });
-});
-
-test.describe('where a pinned map would leave the panel no room, it scrolls with the page', () => {
-  test('a laptop-height window (1280×800)', async ({ page }) => {
-    await mocks(page);
-    await page.goto('/it?at=track');
-    const pin = page.locator('[data-map-pin]');
-    await expect(pin).toHaveAttribute('data-map-pin', 'scrolls');
-    expect(await pin.evaluate((el) => getComputedStyle(el).position)).toBe('static');
-    expect(await page.evaluate(() => document.documentElement.style.scrollPaddingTop)).toBe('');
-  });
-
-  test('a phone', async ({ page }) => {
-    await page.setViewportSize({ width: 390, height: 1000 });
-    await mocks(page);
-    await page.goto('/it?at=track');
-    await expect(page.locator('[data-map-pin]')).toHaveAttribute('data-map-pin', 'scrolls');
-  });
-});
-
-// ---------------------------------------------------------------------
 // The floors' boards, carried from the retired floor pages
 // ---------------------------------------------------------------------
 
@@ -390,7 +318,7 @@ test.describe('what the floor pages held, in the panel', () => {
           { station: 'q.platform-admin.task', kind: 'constraint', depth: 297, also_elsewhere: 213 },
           { station: 'a.platform-admin.opus-5-1m', kind: 'constraint', depth: 213, also_elsewhere: 213 },
           { station: 'q.platform-admin.sign-off', kind: 'constraint', depth: 6, also_elsewhere: 0 },
-          { station: 'loading-dock', kind: 'batch', depth: 1, also_elsewhere: 0 },
+          { station: 'loading-dock', kind: 'equipment', depth: 1, also_elsewhere: 0 },
         ],
         distinct_packets: 303,
       }));
@@ -411,7 +339,7 @@ test.describe('what the floor pages held, in the panel', () => {
       exact: true, waiting_days: 20 - i,
     });
     await page.route(/\/api\/stations\/load$/, (r) =>
-      json(r, { data: [{ station: 'q.platform-admin.task', kind: 'constraint', depth: 30, wip_limit: 24, over_limit: true, oldest_age_days: 3 }] }));
+      json(r, { data: [{ station: 'q.platform-admin.task', kind: 'constraint', depth: 30, oldest_age_days: 3 }] }));
     await page.route(/\/api\/stations\/flow/, (r) =>
       json(r, { window_hours: 24, as_of: '2026-09-19T05:00:00Z', data: [{ station: 'q.platform-admin.task', basis: 'step-events', arrived: 9, served: 4, net: 5 }] }));
     await page.route(/\/api\/jobs\/queue-age$/, (r) =>
@@ -435,49 +363,4 @@ test.describe('what the floor pages held, in the panel', () => {
     await expect(page.locator(`${PANEL} .my-root`)).not.toContainText('Every watched station is clear.');
   });
 
-  // The live shape of the shop floor (2026-09-24): every open session is
-  // the SAME actor. The region map keyed its platforms by actor and threw
-  // each_key_duplicate, leaving the page on "Reading the regions…"
-  // (backlog 846ab934). The region map is gone; the station's panel draws
-  // the Crew Board over the same reads, and must stand on that shape.
-  test('the shop floor’s panel stands two sessions of one actor, and draws its Crew Board', async ({ page }) => {
-    await mocks(page);
-    const session = (id: string, started: string) => ({
-      id, kind: 'work-session', title: 'a session', status: 'open',
-      metadata: { actor: 'claude@algedonic.dev', host: 'boss-dev', started_at: started, last_active_at: started, prompt_count: 3 },
-    });
-    await page.route(/\/api\/jobs\?kind=work-session/, (r) =>
-      json(r, { total: 2, data: [
-        session('87b3cf48-f17b-4126-98b4-7673a3c3576b', '2026-09-24T03:00:00Z'),
-        session('7bb6e37d-d168-40b8-9675-70a42229a2bb', '2026-09-24T04:00:00Z'),
-      ] }));
-    await page.goto('/it?at=shop-floor');
-    await expect(page.getByText('Reading the regions…')).toHaveCount(0);
-    await expect(page.locator(`${PANEL} .crew-root`)).toBeVisible();
-    await expect(page.locator(`${PANEL} .crew-section`).first()).toHaveText('00 — THE BUILDER PIPELINE');
-    await expect(page.locator(`${PANEL}`)).not.toContainText('cannot be drawn');
-  });
-
-  // THE PLANT (design 62de32ae, decision 11): the host runners stand along
-  // the map's edge with their names and states written.
-  test('the map draws its plant along the edge, each machine with its name and state', async ({ page }) => {
-    await mocks(page);
-    await page.route(YARD_REGIONS, (r) =>
-      json(r, {
-        ...REGIONS,
-        plant: [
-          { id: 'runner:host:forge', name: 'forge runner', state: 'idle', why: 'last df answered exit 0' },
-          { id: 'runner:host:boss-gcp', name: 'boss-gcp runner', state: 'failed', why: 'the last converge request was refused' },
-        ],
-      }));
-    await page.goto('/it');
-    const plant = page.locator('section[aria-label="the plant — machinery serving every region"]');
-    await expect(plant).toHaveCount(1);
-    await expect(plant).toContainText('Plant · serves every region');
-    const glyphs = plant.locator('.glyph');
-    await expect(glyphs).toHaveCount(2);
-    await expect(glyphs.first()).toHaveAttribute('data-machine', 'runner:host:boss-gcp');
-    await expect(glyphs.first()).toContainText('boss-gcp runner · failed');
-    await expect(plant.locator('[data-machine="runner:host:forge"]')).toContainText('forge runner · idle');
-  });
 });

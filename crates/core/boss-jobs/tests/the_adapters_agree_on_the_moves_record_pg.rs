@@ -664,6 +664,19 @@ async fn a_row_from_a_superseded_mover_is_held_but_not_crossed<L: Logged>(l: &L,
         )],
         "{adapter}: the current mover's row alone, with its own instant"
     );
+    // One definition of an active row (backlog 3976779c): the moves
+    // read's conservation agrees with the band and conserves raw.
+    assert_eq!(
+        m.correction_conservation(at(0, 0)).await.unwrap(),
+        boss_jobs::moves::History {
+            raw: 3,
+            active: 1,
+            superseded: 0,
+            unknown: 0,
+            superseded_mover: 2,
+        },
+        "{adapter}: the other movers' rows are their own count"
+    );
 
     let back = m.since(0, 10).await.unwrap();
     assert!(increasing(&back), "{adapter}");

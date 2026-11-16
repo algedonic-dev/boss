@@ -1,5 +1,7 @@
 <script lang="ts">
-  // /it/incidents — the IT incidents surface.
+  // /it/operate — the IT incidents surface (it was /it/incidents until
+  // the Operate row took the path; the catalog id is still
+  // `system-incidents`).
   //
   // David: "Do we have a good surface for IT to view post mortems more
   // durably? I think we probably need a new 'Incidents' page that is
@@ -16,7 +18,9 @@
   //   * Post-mortem archive — every closed packet rendered as a
   //     readable document, newest first, each with the terminal it
   //     ended on. This is the "for posterity" half: the packet's
-  //     metadata IS the post-mortem, and the renderer is
+  //     metadata and what each of its steps recorded ARE the
+  //     post-mortem — since incident v3 every forcing-question answer
+  //     is step metadata (backlog 434b6e0d) — and the renderer is
   //     semi-structured (postMortemDoc.ts) because packets have
   //     carried different shapes.
   //
@@ -31,6 +35,7 @@
   import { fetchEvery, wholeOrThrow } from '../../data/paginated';
   import { workflowSurfaces, type WorkflowSpec } from '../../workflows/workflowTypes';
   import {
+    bodyParts,
     closedOutcome,
     holderOf,
     incidentAt,
@@ -38,6 +43,8 @@
     postMortemSections,
     severityOf,
     startedAt,
+    stepFindings,
+    type DocSection,
     type IncidentJob,
   } from './postMortemDoc';
   import {
@@ -163,10 +170,30 @@
   const HEADER_KEYS = ['incident_at', 'incident_date', 'outcome'] as const;
 </script>
 
+<!-- One labelled finding. The body is pre-wrap prose, so it is written on
+     one line: whitespace here would render. A packet ref in a field that
+     names packets is a link into it (bodyParts). -->
+{#snippet docSection(section: DocSection)}
+  <section class="inc-section">
+    <h4 class="inc-section-label">{section.label}</h4>
+    <p class="inc-section-body">{#each bodyParts(section.key, section.body) as part, i (i)}{#if part.ref}<a class="inc-ref" href={href(`/jobs/${part.ref}`)}>{part.text}</a>{:else}{part.text}{/if}{/each}</p>
+  </section>
+{/snippet}
+
 <PageHeader
   title="Incidents"
   subtitle="Respond to active incidents, and read the post-mortems for posterity. Every incident is an incident packet — this page is the lens over that queue."
 />
+<!-- The way to RAISE one: the generic new-job form, seeded with the
+     incident protocol (gap 6 of page-audit 9b9849f5, backlog f703dfb7).
+     Decided 2026-09-24 as one link and never a bespoke form, because a
+     work type files through its registry row. It names `incident` and
+     not every kind the surface reads: raising one means the one incident
+     protocol. Outside the load states on purpose, since a queue that
+     cannot be read is exactly when an incident needs raising. A literal
+     site-relative path, the shape linkSinks.test.ts accepts unwrapped,
+     as EmployeePage's and AccountPage's new-job links are. -->
+<p class="inc-raise"><a class="inc-raise-link" href={href('/ux/jobs?new=1&kind=incident')}>Raise an incident →</a></p>
 
 {#if load.kind === 'loading'}
   <p class="inc-msg">Loading incidents…</p>
@@ -250,6 +277,8 @@
       </p>
     {:else}
       {#each archive as j (j.id)}
+        {@const sections = postMortemSections(j.metadata, HEADER_KEYS)}
+        {@const found = stepFindings(j.steps)}
         <article class="inc-doc">
           <header class="inc-doc-head">
             <h3 class="inc-doc-title">{j.title}</h3>
@@ -264,14 +293,27 @@
               <a class="inc-open" href={href(`/jobs/${j.id}`)}>packet →</a>
             </div>
           </header>
-          {#each postMortemSections(j.metadata, HEADER_KEYS) as section (section.key)}
-            <section class="inc-section">
-              <h4 class="inc-section-label">{section.label}</h4>
-              <p class="inc-section-body">{section.body}</p>
-            </section>
-          {:else}
-            <p class="inc-empty">This packet closed without recorded findings.</p>
+          {#each sections as section (section.key)}
+            {@render docSection(section)}
           {/each}
+          <!-- What each step found, in workflow order — where incident v3
+               keeps every forcing-question answer (backlog 434b6e0d). -->
+          {#if found.length > 0}
+            <h4 class="inc-steps-title">What each step found</h4>
+            {#each found as f (f.step.id)}
+              <section class="inc-step">
+                <h5 class="inc-step-title">
+                  {f.step.title}{#if f.step.assignee_id}<span class="inc-by"> · {f.step.assignee_id}</span>{/if}
+                </h5>
+                {#each f.sections as section (section.key)}
+                  {@render docSection(section)}
+                {/each}
+              </section>
+            {/each}
+          {/if}
+          {#if sections.length === 0 && found.length === 0}
+            <p class="inc-empty">This packet closed without recorded findings.</p>
+          {/if}
         </article>
       {/each}
     {/if}
@@ -328,6 +370,14 @@
   }
   .inc-btn:hover {
     border-color: var(--signal);
+    color: var(--signal);
+  }
+
+  .inc-raise {
+    margin: 0 0 var(--s4);
+    font-size: 13px;
+  }
+  .inc-raise-link {
     color: var(--signal);
   }
 
@@ -483,5 +533,28 @@
     line-height: 1.6;
     white-space: pre-wrap;
     word-break: break-word;
+  }
+  .inc-steps-title {
+    margin: var(--s4) 0 var(--s2);
+    padding-top: var(--s2);
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .inc-step {
+    border-left: 3px solid var(--border);
+    padding: 0 0 0 var(--s3);
+    margin: 0 0 var(--s3);
+  }
+  .inc-step-title {
+    margin: 0 0 var(--s2);
+    font-size: 13px;
+  }
+  .inc-by {
+    font-weight: 400;
+    font-size: 11px;
+    color: var(--static);
+  }
+  .inc-ref {
+    font-family: var(--font-mono);
   }
 </style>

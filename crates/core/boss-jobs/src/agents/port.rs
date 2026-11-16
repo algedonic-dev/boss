@@ -165,6 +165,26 @@ pub trait AgentsRegistry: Send + Sync {
         rows: &[AutomationActor],
         stamp: &EventStamp,
     ) -> Result<AutomationsSeedOutcome, AgentsError>;
+
+    /// Stage the login door's count — one
+    /// [`super::door::UNRESOLVED_LOGIN`] event, built by the door — on
+    /// the transactional outbox, in a transaction of its own. The count
+    /// IS the fact: the door changes no row, so there is no domain write
+    /// for it to join, and the request's own write commits in the
+    /// handler's transaction after it. Until 2026-11-10 the door
+    /// published it straight to the bus, so on a dark bus the count was
+    /// logged and DROPPED (backlog 2e45840a, design ad9519bc part d);
+    /// staged here, the relay delivers it when the bus returns.
+    ///
+    /// A registry that stages no facts (the tests' hand-rolled doubles)
+    /// answers `Err`, and the door logs that at ERROR: it never answers
+    /// `Ok` for a count it did not keep.
+    async fn count_unresolved_login(&self, event: &Event) -> Result<(), AgentsError> {
+        Err(AgentsError::Storage(format!(
+            "this agents registry stages no facts; {} {} was not counted",
+            event.kind, event.id
+        )))
+    }
 }
 
 /// Complete rows observed while the actual owner writer guard remains held.

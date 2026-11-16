@@ -668,7 +668,7 @@ fn a_converge_started_by_a_request_reports_its_outcome_on_that_request() {
             .unwrap()
     };
     let out = lib(
-        "take_converge_requests \"$1\"; answer_converge_requests \"$1\" converge_failed 'build (exit 1)'",
+        "take_converge_requests \"$1\" \"$1/requests\"; answer_converge_requests \"$1\" converge_failed 'build (exit 1)'",
     );
     assert!(out.status.success(), "{}", text(&out));
     let calls = std::fs::read_to_string(&log).unwrap();
@@ -683,8 +683,9 @@ fn a_converge_started_by_a_request_reports_its_outcome_on_that_request() {
     // A stray line that is not a job id never reaches a URL.
     write_file(&inbox, "../../etc\n");
     let _ = std::fs::remove_file(&log);
-    let out =
-        lib("take_converge_requests \"$1\"; answer_converge_requests \"$1\" converged abc1234");
+    let out = lib(
+        "take_converge_requests \"$1\" \"$1/requests\"; answer_converge_requests \"$1\" converged abc1234",
+    );
     assert!(out.status.success(), "{}", text(&out));
     assert!(
         !std::fs::read_to_string(&log)

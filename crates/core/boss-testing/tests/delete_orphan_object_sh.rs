@@ -1,5 +1,6 @@
 //! `infra/forge/delete-orphan-object.sh` is RUN, not read — against a
-//! stubbed `kubectl` and a fixture tree that is a real git repository,
+//! stubbed `kubectl` and a fixture tree in root's tree's own shape (a
+//! bare store and a generation exported from it, `export_generation`),
 //! so every verdict below is one the script actually reached.
 //!
 //! WHY THE VERB EXISTS (backlog a139d5bb, filed urgent 2026-09-10). The
@@ -22,7 +23,8 @@
 //! other answer is a refusal that says which test refused.
 //!
 //! What each case below pins, in the order the script applies them:
-//! the param shape, a committed manifest tree, the derivation's verdict
+//! the param shape, a declaration set that is a verified generation of
+//! root's tree (backlog 1dde630c), the derivation's verdict
 //! (declared / out of scope / not live / controller-owned / unreadable),
 //! the verb's own kind floor, and the capture-before-delete. Plus the
 //! allowlist's own validation, exercised THROUGH `ops-runner.sh` with
@@ -40,40 +42,6 @@ fn has(tool: &str) -> bool {
         .args(["-c", &format!("command -v {tool} >/dev/null 2>&1")])
         .status()
         .is_ok_and(|s| s.success())
-}
-
-/// `id <args>` as a trimmed string. The test reads its own account the
-/// same way the script under test reads the tree's.
-fn id_out(args: &[&str]) -> String {
-    let out = Command::new("id").args(args).output().expect("id runs");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-/// A real account on this box that is NOT the account running the test.
-///
-/// `as_owner` in the script runs the command directly when `id -un`
-/// equals the owner, so the owner-dropping branch is only REACHABLE with
-/// an owner the caller is not. A literal name makes that premise a
-/// property of whoever runs the suite: this test was written with
-/// `"nobody"` hardcoded under a gate that still ran as root, and the
-/// moment the gate pod moved to uid 65534 — which IS `nobody` in the
-/// base image — the drop correctly stopped happening and the test failed
-/// on branches that touched nothing. So the name is MEASURED, not
-/// spelled: the first candidate that resolves through `id -u` (the
-/// script refuses an owner with no passwd entry) and is not the caller.
-/// `nobody` stays first so a root run is unchanged.
-fn an_owner_other_than_the_caller() -> Option<String> {
-    let me = id_out(&["-un"]);
-    ["nobody", "daemon", "bin", "sys", "mail", "root"]
-        .into_iter()
-        .find(|candidate| {
-            *candidate != me
-                && Command::new("id")
-                    .args(["-u", candidate])
-                    .output()
-                    .is_ok_and(|o| o.status.success())
-        })
-        .map(str::to_string)
 }
 
 /// A scratch root PER PROCESS, not per case name. A fixed
@@ -123,11 +91,90 @@ fn doc(kind: &str, ns: &str, name: &str) -> String {
     }
 }
 
-/// The fixture tree: a real git repository laid out like the repo, with
-/// enough manifests to clear the derivation's "the scrape broke" floors
-/// (at least 10 files, at least 20 declared objects).
-fn fixture_tree(root: &Path) -> PathBuf {
-    let tree = root.join("tree");
+/// `git <args>` in `dir`, its trimmed stdout — failing by name.
+fn git_out(dir: &Path, args: &[&str], env: &[(&str, &Path)]) -> String {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(dir);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .unwrap_or_else(|e| panic!("chmod {mode:o} {}: {e}", path.display()));
+}
+
+/// ROOT'S TREE, in the shape `infra/forge/root-tree.sh` keeps it
+/// (backlog 1dde630c): the checkout `work`'s HEAD fetched into the bare
+/// store `rt/repo.git`, exported whole as `rt/gen/<sha>` — read-tree and
+/// checkout-index, the export's own two commands — and stamped with
+/// `.boss-tree-sha`. Returns the generation, which is what the verb is
+/// pointed at. Each directory is 0755, as root-tree.sh's umask makes them,
+/// so the run's own umask cannot decide a write-permission verdict.
+fn export_generation(work: &Path) -> PathBuf {
+    let rt = work.parent().unwrap().join("rt");
+    let store = rt.join("repo.git");
+    if !store.exists() {
+        std::fs::create_dir_all(&rt).unwrap();
+        git(&rt, &["init", "-q", "--bare", "repo.git"]);
+    }
+    git(
+        work,
+        &[
+            "push",
+            "-q",
+            store.to_str().unwrap(),
+            "HEAD:refs/boss/accepted",
+        ],
+    );
+    let sha = git_out(work, &["rev-parse", "HEAD"], &[]);
+    let generation = rt.join("gen").join(&sha);
+    std::fs::create_dir_all(&generation).unwrap();
+    let index = rt.join(format!(".{sha}.idx"));
+    let git_dir = format!("--git-dir={}", store.display());
+    let work_tree = format!("--work-tree={}", generation.display());
+    for args in [
+        vec![
+            git_dir.as_str(),
+            work_tree.as_str(),
+            "read-tree",
+            sha.as_str(),
+        ],
+        vec![
+            git_dir.as_str(),
+            work_tree.as_str(),
+            "checkout-index",
+            "-a",
+            "-f",
+        ],
+    ] {
+        git_out(&rt, &args, &[("GIT_INDEX_FILE", &index)]);
+    }
+    std::fs::remove_file(&index).unwrap();
+    write_file(&generation.join(".boss-tree-sha"), &format!("{sha}\n"));
+    for d in [&rt, &rt.join("gen"), &generation, &store] {
+        chmod(d, 0o755);
+    }
+    generation
+}
+
+/// The checkout the fixture commits in: a real git repository laid out
+/// like the repo, with enough manifests to clear the derivation's "the
+/// scrape broke" floors (at least 10 files, at least 20 declared
+/// objects). The verb never reads it — it reads the generation
+/// `export_generation` makes of it.
+fn fixture_checkout(root: &Path) -> PathBuf {
+    let tree = root.join("work");
     let dir = tree.join("infra/cluster/manifests");
     std::fs::create_dir_all(&dir)
         .unwrap_or_else(|e| panic!("fixture manifests dir {}: {e}", dir.display()));
@@ -372,6 +419,9 @@ fn declared_live() -> Vec<(&'static str, &'static str, &'static str, &'static st
 
 struct Case {
     root: PathBuf,
+    /// The checkout the fixture commits in — never what the verb reads.
+    work: PathBuf,
+    /// The generation of root's tree exported from `work`'s HEAD.
     tree: PathBuf,
     kubectl: PathBuf,
     live: PathBuf,
@@ -383,7 +433,8 @@ impl Case {
     /// the declared set plus `extra`.
     fn new(name: &str, extra: &[(&str, &str, &str, &str)]) -> Self {
         let root = scratch(name);
-        let tree = fixture_tree(&root);
+        let work = fixture_checkout(&root);
+        let tree = export_generation(&work);
         let kubectl = stub_kubectl(&root);
         let mut rows = declared_live();
         rows.extend_from_slice(extra);
@@ -392,11 +443,23 @@ impl Case {
         std::fs::write(&deleted, "").unwrap();
         Case {
             root,
+            work,
             tree,
             kubectl,
             live,
             deleted,
         }
+    }
+
+    /// Commit what the case wrote into `work`, and export that commit as
+    /// the generation the verb reads — the way main reaches root's tree.
+    fn commit(&mut self, message: &str) {
+        git(&self.work, &["add", "-A"]);
+        git(
+            &self.work,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", message],
+        );
+        self.tree = export_generation(&self.work);
     }
 
     fn run(&self, args: &[&str]) -> (i32, String) {
@@ -420,8 +483,7 @@ impl Case {
             .env("BOSS_CLUSTER_TREE", &self.tree)
             .env("STUB_LIVE", &self.live)
             .env("STUB_DELETED", &self.deleted)
-            .env("STUB_FORBID", self.root.join("forbid"))
-            .env("STUB_RUNUSER_LOG", self.runuser_log());
+            .env("STUB_FORBID", self.root.join("forbid"));
         for (k, v) in extra {
             cmd.env(k, v);
         }
@@ -439,36 +501,6 @@ impl Case {
     fn deletions(&self) -> String {
         std::fs::read_to_string(&self.deleted).unwrap_or_default()
     }
-
-    fn runuser_log(&self) -> PathBuf {
-        self.root.join("runuser.log")
-    }
-
-    /// A `runuser` on PATH that RECORDS the privilege drop and then runs
-    /// the command as whoever is running the test. Standing in for the
-    /// real one is what makes the owner-dropping branch reachable from a
-    /// single account — the branch that, untested, shipped a verb that
-    /// refused on every real invocation.
-    fn stub_runuser(&self) -> PathBuf {
-        let bin = self.root.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let path = bin.join("runuser");
-        write_exec(
-            &path,
-            "#!/bin/bash\n\
-             printf '%s\\n' \"$*\" >> \"$STUB_RUNUSER_LOG\"\n\
-             # `runuser -u <user> -- <cmd...>`: record who, then run the rest.\n\
-             [ \"${1:-}\" = \"-u\" ] || { echo \"stub runuser: unexpected form: $*\" >&2; exit 64; }\n\
-             shift 2\n\
-             [ \"${1:-}\" = \"--\" ] && shift\n\
-             exec \"$@\"\n",
-        );
-        path
-    }
-
-    fn runuser_calls(&self) -> String {
-        std::fs::read_to_string(self.runuser_log()).unwrap_or_default()
-    }
 }
 
 fn contains_all(text: &str, needles: &[&str], what: &str) {
@@ -478,6 +510,231 @@ fn contains_all(text: &str, needles: &[&str], what: &str) {
             "{what}: output does not name {n:?}:\n{text}"
         );
     }
+}
+
+/// Run the actual readers from the proved generation, not the test checkout.
+/// Otherwise importlib's bytecode writes miss the tree whose cleanliness is
+/// being judged, and a first dry-run silently consumes that generation.
+fn self_contained_generation(case: &mut Case) {
+    for relative in [
+        "infra/forge/delete-orphan-object.sh",
+        "infra/cluster/undeclared-objects.sh",
+        "infra/dev/dev-declaration.py",
+        "infra/dev/dev-build.py",
+        "infra/forge/isolation-fixture-declaration.py",
+        "infra/forge/isolation-fixture.py",
+    ] {
+        let target = case.work.join(relative);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(repo_root().join(relative), target).unwrap();
+    }
+    case.commit("include the actual generation programs and declaration readers");
+}
+
+fn run_from_generation(case: &Case, relative: &str, args: &[&str]) -> (i32, String) {
+    let out = Command::new("bash")
+        .arg(case.tree.join(relative))
+        .args(args)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("BOSS_KUBECTL", &case.kubectl)
+        .env("STUB_LIVE", &case.live)
+        .env("STUB_DELETED", &case.deleted)
+        .env("STUB_FORBID", case.root.join("forbid"))
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// Exercise the flags actually selected by every shell entry into these
+/// importlib programs, including the pure validator and converge renderer.
+fn generation_python_entries() -> Vec<(String, Vec<String>, String)> {
+    let mut entries = Vec::new();
+    for shell in std::fs::read_dir(repo_root().join("infra/forge")).unwrap() {
+        let shell = shell.unwrap().path();
+        if shell.extension().and_then(|ext| ext.to_str()) != Some("sh") {
+            continue;
+        }
+        for line in std::fs::read_to_string(&shell).unwrap().lines() {
+            let words: Vec<_> = line.split_whitespace().collect();
+            if words.first() != Some(&"python3") {
+                continue;
+            }
+            for program in ["isolation-fixture-host.py", "dev-work-volume.py"] {
+                if let Some(index) = words.iter().position(|word| word.contains(program)) {
+                    entries.push((
+                        shell.file_name().unwrap().to_string_lossy().into_owned(),
+                        words[1..index]
+                            .iter()
+                            .map(|word| (*word).to_owned())
+                            .collect(),
+                        program.to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+    entries.sort();
+    entries
+}
+
+#[test]
+fn every_root_generation_python_entry_keeps_later_root_verbs_usable() {
+    let mut case = Case::new(
+        "all-python-entries",
+        &[("ConfigMap", "boss", "orphan-x", "")],
+    );
+    self_contained_generation(&mut case);
+    for program in [
+        "isolation-fixture-host.py",
+        "isolation-fixture-port.py",
+        "dev-work-volume.py",
+        "dev-work-evidence.py",
+    ] {
+        let relative = format!("infra/forge/{program}");
+        std::fs::copy(repo_root().join(&relative), case.work.join(relative)).unwrap();
+    }
+    case.commit("include real Python adapters in the verified generation");
+    let entries = generation_python_entries();
+    assert!(
+        entries.len() >= 4,
+        "validator, host, volume and converge entries must run"
+    );
+    for (shell, flags, program) in entries {
+        let mut command = Command::new("python3");
+        command
+            .args(&flags)
+            .arg(case.tree.join("infra/forge").join(&program));
+        if program == "isolation-fixture-host.py" {
+            command.args([
+                "validate",
+                "observe",
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+            ]);
+        } else {
+            // The fixed false native port refuses before any observation/effect,
+            // but after the real evidence carrier has been imported.
+            command.args(["--plan", "50Gi"]);
+        }
+        command
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("BOSS_DEV_WORK_KUBECTL", "false");
+        if program == "isolation-fixture-host.py" {
+            // -I ignores this environment setting: the entry needs -B.
+            command.env("PYTHONDONTWRITEBYTECODE", "1");
+        }
+        let output = command.output().unwrap();
+        println!(
+            "{shell} {flags:?} {program}: {:?}\n{}{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if program == "isolation-fixture-host.py" {
+            assert!(output.status.success(), "pure validator must execute");
+        } else {
+            assert!(!output.status.success(), "unread native port must refuse");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("REFUSED"));
+        }
+        let dry_run = run_from_generation(
+            &case,
+            "infra/forge/delete-orphan-object.sh",
+            &["ConfigMap/boss/orphan-x", "--dry-run"],
+        );
+        assert_eq!(
+            dry_run.0, 0,
+            "{shell} {flags:?} polluted the proved generation: {}",
+            dry_run.1
+        );
+        assert!(!case.tree.join("infra/forge/__pycache__").exists());
+        assert!(case.deletions().is_empty(), "fixtures must never delete");
+    }
+}
+
+#[test]
+fn root_generation_python_entry_class_explicitly_disables_bytecode() {
+    // Environment suppression alone is ineffective under Python isolation (-I).
+    // Read every shell invocation of the importing programs, rather than pinning
+    // four line numbers and silently missing a new entry into the same class.
+    let entries = generation_python_entries();
+    assert!(entries.len() >= 4);
+    for (shell, flags, program) in entries {
+        assert!(
+            flags.iter().any(|flag| flag == "-B"),
+            "{shell}: {program} must disable generation writes explicitly; flags={flags:?}"
+        );
+    }
+}
+
+#[test]
+fn root_generation_dry_run_can_run_twice_without_polluting_it() {
+    let mut case = Case::new(
+        "self-contained-twice",
+        &[("ConfigMap", "boss", "orphan-x", "")],
+    );
+    self_contained_generation(&mut case);
+    let args = ["ConfigMap/boss/orphan-x", "--dry-run"];
+    let first = run_from_generation(&case, "infra/forge/delete-orphan-object.sh", &args);
+    let second = run_from_generation(&case, "infra/forge/delete-orphan-object.sh", &args);
+    println!("first generation run: {first:?}\nsecond generation run: {second:?}");
+    assert_eq!(first.0, 0, "first generation run: {}", first.1);
+    assert_eq!(second.0, 0, "second generation run: {}", second.1);
+    for directory in ["infra/dev/__pycache__", "infra/forge/__pycache__"] {
+        assert!(
+            !case.tree.join(directory).exists(),
+            "reader wrote {directory}"
+        );
+    }
+    assert!(case.deletions().is_empty(), "dry-runs must not delete");
+}
+
+#[test]
+fn root_generation_other_declaration_callers_keep_the_delete_verb_usable() {
+    let mut case = Case::new(
+        "self-contained-declaration",
+        &[("ConfigMap", "boss", "orphan-x", "")],
+    );
+    self_contained_generation(&mut case);
+    let declared = run_from_generation(
+        &case,
+        "infra/cluster/undeclared-objects.sh",
+        &["--declared"],
+    );
+    let delete = run_from_generation(
+        &case,
+        "infra/forge/delete-orphan-object.sh",
+        &["ConfigMap/boss/orphan-x", "--dry-run"],
+    );
+    println!("direct declaration: {declared:?}\nsubsequent dry-run: {delete:?}");
+    assert_eq!(declared.0, 0, "direct declaration: {}", declared.1);
+    assert_eq!(delete.0, 0, "subsequent dry-run: {}", delete.1);
+    assert!(
+        case.deletions().is_empty(),
+        "declaration and dry-run must not delete"
+    );
+}
+
+#[test]
+fn root_generation_refusal_indents_every_unrecorded_path() {
+    let case = Case::new("two-unrecorded-paths", &[]);
+    write_file(&case.tree.join("a-cache.pyc"), "unrecorded");
+    write_file(&case.tree.join("b-cache.pyc"), "unrecorded");
+    let (status, output) = case.run(&["ConfigMap/boss/orphan-x", "--dry-run"]);
+    assert_eq!(status, 2, "{output}");
+    contains_all(
+        &output,
+        &["\n    a-cache.pyc\n", "\n    b-cache.pyc\n"],
+        "unrecorded paths",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +764,16 @@ fn deletes_the_one_object_the_tree_proves_undeclared() {
             "is gone from `boss` (read back: NotFound)",
         ],
         "the orphan case",
+    );
+    // The commit the authority came from is the generation's own.
+    let sha = c.tree.file_name().unwrap().to_string_lossy().to_string();
+    contains_all(
+        &out,
+        &[&format!(
+            "undeclared by infra/cluster/manifests at {}",
+            &sha[..12]
+        )],
+        "the orphan case's commit",
     );
 }
 
@@ -613,6 +880,32 @@ fn refuses_an_object_the_tree_declares() {
     );
 }
 
+const RENDERER_REL: &str = "infra/estate/render-dev-door-config.sh";
+
+/// The shipped renderer's text and the ConfigMap name its one
+/// `RENDERS="ConfigMap/<name>"` line declares — read, not typed here.
+fn shipped_renderer() -> (String, String) {
+    let renderer = std::fs::read_to_string(repo_root().join(RENDERER_REL)).expect("the renderer");
+    let name = renderer
+        .lines()
+        .find_map(|l| l.strip_prefix("RENDERS=\"ConfigMap/"))
+        .and_then(|l| l.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{RENDERER_REL} names no `RENDERS=\"ConfigMap/<name>\"`"))
+        .to_string();
+    (renderer, name)
+}
+
+/// One instance, `prod` in namespace `boss`, and the renderer beside it:
+/// together they exempt the object the converge renders per instance.
+fn write_instance_and_renderer(tree: &Path, renderer_body: &str) {
+    write_file(
+        &tree.join("infra/cluster/instances.toml"),
+        "source = \"prod\"\n\n[prod]\nnamespace = \"boss\"\ntenant_dir = \"examples/brewery\"\nsim = false\nhostname = \"h.example\"\nguest = false\n",
+    );
+    std::fs::create_dir_all(tree.join("infra/estate")).unwrap();
+    write_file(&tree.join(RENDERER_REL), renderer_body);
+}
+
 /// THE OBJECT THE CONVERGE RENDERS PER INSTANCE IS NOT DELETABLE (backlog
 /// cb0c9937). `ConfigMap/<instance ns>/boss-instance-config` is generated
 /// by infra/estate/render-dev-door-config.sh and mounted by the boss pod;
@@ -627,42 +920,19 @@ fn refuses_an_object_the_tree_declares() {
 /// CANNOT ANSWER, never "no exemption".
 #[test]
 fn refuses_the_object_the_converge_renders_per_instance() {
-    const RENDERER_REL: &str = "infra/estate/render-dev-door-config.sh";
-    let renderer = std::fs::read_to_string(repo_root().join(RENDERER_REL)).expect("the renderer");
-    // The name, read off the shipped renderer's own line — not typed here.
-    let name = renderer
-        .lines()
-        .find_map(|l| l.strip_prefix("RENDERS=\"ConfigMap/"))
-        .and_then(|l| l.strip_suffix('"'))
-        .unwrap_or_else(|| panic!("{RENDERER_REL} names no `RENDERS=\"ConfigMap/<name>\"`"))
-        .to_string();
+    let (renderer, name) = shipped_renderer();
     let target = format!("ConfigMap/boss/{name}");
 
     let build = |case: &str, renderer_body: &str| {
-        let c = Case::new(
+        let mut c = Case::new(
             case,
             &[
                 ("ConfigMap", "boss", &name, ""),
                 ("ConfigMap", "boss", "hand-made", ""),
             ],
         );
-        write_file(
-            &c.tree.join("infra/cluster/instances.toml"),
-            "source = \"prod\"\n\n[prod]\nnamespace = \"boss\"\ntenant_dir = \"examples/brewery\"\nsim = false\nhostname = \"h.example\"\nguest = false\n",
-        );
-        std::fs::create_dir_all(c.tree.join("infra/estate")).unwrap();
-        write_file(&c.tree.join(RENDERER_REL), renderer_body);
-        git(&c.tree, &["add", "-A"]);
-        git(
-            &c.tree,
-            &[
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-qm",
-                "the renderer",
-            ],
-        );
+        write_instance_and_renderer(&c.work, renderer_body);
+        c.commit("the renderer");
         c
     };
 
@@ -840,23 +1110,6 @@ fn refuses_when_a_manifest_cannot_be_parsed() {
     );
 }
 
-/// The declaration set the verb derives its authority from must be
-/// COMMITTED content. An uncommitted edit under the manifests directory
-/// — a rename in progress, a local experiment — means the tree that
-/// proves the object undeclared is not the tree anyone reviewed.
-#[test]
-fn refuses_an_uncommitted_manifest_tree() {
-    let c = Case::new("dirty", &[("Service", "boss", "boss-docs-internal", "")]);
-    std::fs::remove_file(c.tree.join("infra/cluster/manifests/boss-front.yaml")).unwrap();
-    let (rc, out) = c.run(&["Service/boss/boss-docs-internal"]);
-    assert_ne!(
-        rc, 0,
-        "the verb derived authority from an uncommitted tree:\n{out}"
-    );
-    assert_eq!(c.deletions(), "", "something was deleted:\n{out}");
-    contains_all(&out, &["boss-front.yaml"], "the dirty-tree case");
-}
-
 /// The verb's own floor, narrower than the derivation's scope: a kind
 /// whose deletion destroys bytes or credentials stays a human step even
 /// when the tree proves the object undeclared.
@@ -918,126 +1171,240 @@ fn refuses_a_malformed_argument() {
 }
 
 // ---------------------------------------------------------------------------
-// THE GIT READS RUN AS THE CHECKOUT'S OWNER.
+// THE DECLARATION SET IS A VERIFIED GENERATION OF ROOT'S TREE.
 // ---------------------------------------------------------------------------
-// THE DEFECT (ops-request c9877f75, measured on the forge 2026-09-10). The
-// first live run through the audited door refused: "/home/david/boss is
-// not a git checkout, so the declaration set is not reviewable content."
-// It is a checkout — forge-converge.sh fetches into it every tick. What
-// failed is `git` run AS ROOT in a david-owned clone: since 2.35.2 git
-// refuses to read across an ownership boundary ("dubious ownership"), and
-// the ops-runner executes every verb as root. The bound was right and the
-// refusal was safe; it was also unsatisfiable.
+// THE DEFECT (backlog 1dde630c, review a8b752d4 N6). The verb runs as root.
+// Its declaration set used to be a CHECKOUT — on the forge the one the
+// runner hands its verbs, BOSS_OPS_CHECKOUT=/home/david/boss, which its
+// owner can edit — and its only check that the set was reviewed content
+// was `git status` over infra/cluster/manifests. The derivation reads more
+// than the manifests: instances.toml and the renderer's RENDERS line (the
+// per-instance exemption), infra/gate-runner/*.yaml, the consist worker's
+// job.json, the dev and isolation declarations. Any of those could be
+// edited uncommitted, or replaced by a symlink root then followed, and
+// change what root would delete.
 //
-// All sixteen cases above passed while that was true, because a test
-// creates its fixture as the user running it, so owner == caller and the
-// drop is never taken. That is the hole these three close.
-//
-// The pattern is infra/gcp/boss-gcp-converge.sh's `as_owner` — the same
-// hazard, already solved and already lint-enforced there
-// (infra/lint/boss-gcp-converges-itself.sh §2b), with the probe runner's
-// non-login `runuser -u <user> --` + explicit HOME for the invocation,
-// because these are reads that need no credential helper and a login
-// shell's profile output would land in a captured `rev-parse`.
+// Root's own tree (infra/forge/root-tree.sh) is the answer that already
+// exists: a root-owned export of a commit main named, beside root's own
+// store. The verb now reads ONLY such a generation, and proves it is still
+// that commit, byte for byte, against the store before deriving anything.
+// The privilege drop to the checkout's owner went with the checkout: root's
+// git in root's store needs none.
 
-/// With an owner that is not the caller, every git read is issued through
-/// `runuser`, and the run still reaches its verdict.
-///
-/// The owner is MEASURED, not spelled — see `an_owner_other_than_the_caller`.
-/// Naming it `nobody` made this case pass only while the gate ran as root,
-/// and it failed for two branches that touched nothing the night the gate
-/// pod moved to uid 65534 — `nobody` itself — because the drop it asserts
-/// had correctly stopped being the thing the script does.
-#[test]
-fn the_git_reads_drop_to_the_checkouts_owner() {
-    let Some(owner) = an_owner_other_than_the_caller() else {
-        eprintln!(
-            "SKIPPING the_git_reads_drop_to_the_checkouts_owner AND ASSERTING NOTHING: \
-             this box has no resolvable account other than the caller ({} / uid {}), \
-             so the owner-drop branch cannot be reached — the privilege drop is \
-             UNCOVERED on this run",
-            id_out(&["-un"]),
-            id_out(&["-u"])
-        );
-        return;
-    };
-    let c = Case::new(
-        "owner-drop",
-        &[("Service", "boss", "boss-docs-internal", "")],
-    );
-    c.stub_runuser();
-    let (rc, out) = c.run_env(
-        &["Service/boss/boss-docs-internal", "--dry-run"],
-        &[("BOSS_CLUSTER_TREE_OWNER", owner.clone())],
-    );
-    assert_eq!(
-        rc, 0,
-        "the verb refused when the tree belongs to someone else ({owner}):\n{out}"
-    );
-    assert_eq!(c.deletions(), "", "--dry-run deleted something:\n{out}");
-    let calls = c.runuser_calls();
-    assert!(
-        !calls.is_empty(),
-        "no git read went through runuser — it ran as the caller ({}, owner {owner}), \
-         which is the defect:\n{out}",
-        id_out(&["-un"])
-    );
-    let dropped_to = format!("-u {owner}");
-    for needle in [dropped_to.as_str(), "rev-parse", "status --porcelain"] {
-        assert!(
-            calls.contains(needle),
-            "the dropped commands do not include {needle:?}:\n{calls}"
-        );
+/// `delete-orphan-object.sh` as the ops runner starts it, unrun, so a case
+/// can change the environment it is started with.
+impl Case {
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new("bash");
+        cmd.arg(repo_root().join("infra/forge/delete-orphan-object.sh"))
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("BOSS_KUBECTL", &self.kubectl)
+            .env("BOSS_CLUSTER_TREE", &self.tree)
+            .env("STUB_LIVE", &self.live)
+            .env("STUB_DELETED", &self.deleted);
+        cmd
     }
-    // And nothing ran git as the caller: every git invocation the script
-    // makes is inside a dropped command.
-    assert_eq!(
-        calls.matches("git -C").count(),
-        3,
-        "expected the three git reads (rev-parse --git-dir, status, rev-parse HEAD):\n{calls}"
-    );
 }
 
-/// When the caller already owns the checkout there is nothing to drop,
-/// and the script must not reach for `runuser` — the forge's converge
-/// skips it the same way, which is how a lint can drive the loop at all.
+fn exit_and_text(mut cmd: Command) -> (i32, String) {
+    let out = cmd.output().expect("delete-orphan-object.sh runs");
+    (
+        out.status.code().unwrap_or(-1),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// THE PACKET'S OWN CASE. On the forge the runner starts this verb with
+/// BOSS_CLUSTER_TREE unset and BOSS_OPS_CHECKOUT naming the owner's
+/// checkout. There, an UNCOMMITTED edit to instances.toml — moving the
+/// one instance out of `boss` — drops the exemption for the ConfigMap the
+/// converge renders into `boss` and mounts, and the manifests directory is
+/// still clean. Until this car the verb took that checkout, found nothing
+/// dirty where it looked, and deleted the live mount. It takes no checkout
+/// now: the tree it reads is the one it was started from, and that must
+/// be a generation of root's tree.
 #[test]
-fn it_does_not_drop_when_the_caller_owns_the_tree() {
-    let c = Case::new(
-        "owner-is-caller",
-        &[("Service", "boss", "boss-docs-internal", "")],
+fn the_checkout_the_runner_hands_its_verbs_is_not_a_declaration_set() {
+    let (renderer, name) = shipped_renderer();
+    let mut c = Case::new("handed-checkout", &[("ConfigMap", "boss", &name, "")]);
+    write_instance_and_renderer(&c.work, &renderer);
+    c.commit("the renderer");
+    write_file(
+        &c.work.join("infra/cluster/instances.toml"),
+        "source = \"prod\"\n\n[prod]\nnamespace = \"boss-dev\"\ntenant_dir = \"examples/brewery\"\nsim = false\nhostname = \"h.example\"\nguest = false\n",
     );
-    c.stub_runuser();
-    let (rc, out) = c.run(&["Service/boss/boss-docs-internal", "--dry-run"]);
-    assert_eq!(rc, 0, "the verb refused on a tree the caller owns:\n{out}");
+    let target = format!("ConfigMap/boss/{name}");
+    let mut cmd = c.command(&[&target]);
+    cmd.env_remove("BOSS_CLUSTER_TREE")
+        .env("BOSS_OPS_CHECKOUT", &c.work);
+    let (rc, out) = exit_and_text(cmd);
     assert_eq!(
-        c.runuser_calls(),
+        c.deletions(),
         "",
-        "the script dropped privilege it did not need:\n{out}"
+        "the verb deleted the rendered ConfigMap on the strength of an uncommitted edit in the checkout it was handed:\n{out}"
+    );
+    assert_eq!(rc, 2, "{out}");
+    contains_all(
+        &out,
+        &["REFUSED", "not a generation of root's tree"],
+        "the handed checkout",
     );
 }
 
-/// `stat -c %U` prints `UNKNOWN` when no passwd entry exists for the
-/// owning uid. Proceeding would run git as the caller again — the exact
-/// bug — so the verb refuses and names what it could not resolve.
+/// A checkout is not root's tree even when it is clean and committed: its
+/// owner can edit it between this check and the derivation's read.
 #[test]
-fn refuses_an_owner_it_cannot_resolve() {
+fn refuses_a_tree_that_is_not_a_generation_of_roots_tree() {
     let c = Case::new(
-        "owner-unknown",
+        "not-a-generation",
         &[("Service", "boss", "boss-docs-internal", "")],
     );
-    c.stub_runuser();
-    for owner in ["UNKNOWN", "nosuchuser-zzz"] {
-        let (rc, out) = c.run_env(
-            &["Service/boss/boss-docs-internal", "--dry-run"],
-            &[("BOSS_CLUSTER_TREE_OWNER", owner.into())],
+    let mut cmd = c.command(&["Service/boss/boss-docs-internal", "--dry-run"]);
+    cmd.env("BOSS_CLUSTER_TREE", &c.work);
+    let (rc, out) = exit_and_text(cmd);
+    assert_eq!(
+        rc, 2,
+        "the verb read a checkout as its declaration set:\n{out}"
+    );
+    contains_all(
+        &out,
+        &["REFUSED", "not a generation of root's tree"],
+        "the checkout",
+    );
+    assert_eq!(c.deletions(), "", "{out}");
+}
+
+/// A generation says which commit it is, and that commit is in the store
+/// beside it — or nothing about the tree can be proved.
+#[test]
+fn refuses_a_generation_that_cannot_be_proved_against_the_store() {
+    // `.boss-tree-sha` naming another commit.
+    let c = Case::new(
+        "stamp-differs",
+        &[("Service", "boss", "boss-docs-internal", "")],
+    );
+    write_file(
+        &c.tree.join(".boss-tree-sha"),
+        &format!("{}\n", "0".repeat(40)),
+    );
+    let (rc, out) = c.run(&["Service/boss/boss-docs-internal", "--dry-run"]);
+    assert_eq!(rc, 2, "{out}");
+    contains_all(
+        &out,
+        &["REFUSED", ".boss-tree-sha"],
+        "a stamp naming another commit",
+    );
+
+    // A generation named, and stamped, for a commit the store does not hold.
+    let mut c = Case::new(
+        "not-in-store",
+        &[("Service", "boss", "boss-docs-internal", "")],
+    );
+    let fake = "1".repeat(40);
+    let moved = c.tree.parent().unwrap().join(&fake);
+    std::fs::rename(&c.tree, &moved).unwrap();
+    c.tree = moved;
+    write_file(&c.tree.join(".boss-tree-sha"), &format!("{fake}\n"));
+    let (rc, out) = c.run(&["Service/boss/boss-docs-internal", "--dry-run"]);
+    assert_eq!(rc, 2, "{out}");
+    contains_all(
+        &out,
+        &["REFUSED", "does not hold", &fake[..12]],
+        "a commit the store lacks",
+    );
+    assert_eq!(c.deletions(), "", "{out}");
+}
+
+/// THE GENERATION IS ITS COMMIT, OR IT IS NOT READ. Each tamper below is a
+/// change root's tree never makes — it exports whole and never writes a
+/// generation again — and each is refused naming the path, before the
+/// derivation reads a byte. The packet's own file, instances.toml, is the
+/// first: edited in the generation, it drops the rendered ConfigMap's
+/// exemption exactly as it did in the checkout. Every other tamper asks
+/// for `hand-made`, a genuine orphan the untampered tree deletes, so a
+/// tamper that went unnoticed shows as a deletion, not as some other
+/// refusal.
+#[test]
+fn refuses_a_generation_that_differs_from_its_commit() {
+    let (renderer, name) = shipped_renderer();
+    let rendered = format!("ConfigMap/boss/{name}");
+    let orphan = "ConfigMap/boss/hand-made".to_string();
+    type Tamper = fn(&Path, &Path);
+    let tampers: [(&str, &str, &String, Tamper); 5] = [
+        (
+            "edited",
+            "infra/cluster/instances.toml",
+            &rendered,
+            |tree, _| {
+                write_file(
+                    &tree.join("infra/cluster/instances.toml"),
+                    "source = \"prod\"\n\n[prod]\nnamespace = \"boss-dev\"\ntenant_dir = \"examples/brewery\"\nsim = false\nhostname = \"h.example\"\nguest = false\n",
+                )
+            },
+        ),
+        (
+            "deleted",
+            "infra/cluster/manifests/boss-front.yaml",
+            &orphan,
+            |tree, _| {
+                std::fs::remove_file(tree.join("infra/cluster/manifests/boss-front.yaml")).unwrap()
+            },
+        ),
+        (
+            "added",
+            "infra/gate-runner/extra.yaml",
+            &orphan,
+            |tree, _| {
+                // The derivation reads every yaml here as declared; git
+                // tracks no empty directory, so the export has none.
+                std::fs::create_dir_all(tree.join("infra/gate-runner")).unwrap();
+                write_file(&tree.join("infra/gate-runner/extra.yaml"), "{}\n")
+            },
+        ),
+        (
+            "symlinked",
+            "infra/cluster/manifests/boss-front.yaml",
+            &orphan,
+            |tree, root| {
+                let manifest = tree.join("infra/cluster/manifests/boss-front.yaml");
+                let outside = root.join("outside.yaml");
+                std::fs::copy(&manifest, &outside).unwrap();
+                std::fs::remove_file(&manifest).unwrap();
+                std::os::unix::fs::symlink(&outside, &manifest).unwrap();
+            },
+        ),
+        (
+            "group-writable",
+            "writable by its group",
+            &orphan,
+            |tree, _| chmod(tree, 0o775),
+        ),
+    ];
+    for (how, names, target, tamper) in tampers {
+        let mut c = Case::new(
+            &format!("tampered-{how}"),
+            &[
+                ("ConfigMap", "boss", &name, ""),
+                ("ConfigMap", "boss", "hand-made", ""),
+            ],
         );
-        assert_ne!(
-            rc, 0,
-            "the verb proceeded with an unresolvable owner {owner:?}:\n{out}"
+        write_instance_and_renderer(&c.work, &renderer);
+        c.commit("the renderer");
+        tamper(&c.tree, &c.root);
+        let (rc, out) = c.run(&[target]);
+        assert_eq!(
+            c.deletions(),
+            "",
+            "{how}: the verb deleted on the strength of a generation that is not its commit:\n{out}"
         );
-        assert_eq!(c.deletions(), "", "something was deleted:\n{out}");
-        contains_all(&out, &[owner, "owner"], &format!("the {owner:?} case"));
+        assert_eq!(rc, 2, "{how}: {out}");
+        contains_all(&out, &["REFUSED", names], how);
     }
 }
 

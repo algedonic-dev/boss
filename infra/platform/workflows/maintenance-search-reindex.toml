@@ -6,7 +6,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Rebuilds the global search projection. It has no incremental form - events are capped per Subject, so an append cannot be correct - and outside boss-rebuild-all nothing refreshed it."
-metadata = { department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
+metadata = { owner = "9660c60f-eb47-4405-ae08-fcbb30c71e5f", department = "it", owner_role = "platform-admin", list_group = { code = "machine", label = "Machine activity" } }
 
 [[workflow.step]]
 title = "scheduled"

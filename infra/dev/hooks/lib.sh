@@ -8,7 +8,9 @@
 #
 #   SessionStart      session-start.sh   files the work-session packet
 #   UserPromptSubmit  prompt-submit.sh   heartbeat: last_active_at,
-#                                        prompt_count — NEVER the prompt
+#                                        prompt_count — NEVER the prompt;
+#                                        then prints the packet's working
+#                                        window (boss session window)
 #   PreToolUse Agent  agent-start.sh     boss dispatch <session> --from-hook
 #   PostToolUse Agent agent-stop.sh      boss dispatch <run> --report
 #   SessionEnd        session-end.sh     completes `active` (ended = clean)

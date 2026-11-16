@@ -75,7 +75,7 @@ pub fn model() -> String {
         h.update(part.as_bytes());
     }
     format!(
-        "registered-agent-handoff-v2:{}",
+        "registered-agent-handoff-v3:{}",
         h.finalize()
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -188,7 +188,10 @@ pub fn diagnose(id: uuid::Uuid, original: Recorded, inputs: Inputs) -> Result<Di
         .inputs
         .workflows
         .iter()
-        .any(|w| w.created_at > m.at || w.status == crate::registry::WorkflowStatus::Draft)
+        // v3 (backlog f9cbf891): "never published" is `was_published`, the
+        // question every other door asks, so a rejected version reads as the
+        // draft it was. v2 read `== Draft` alone and passed a rejected one.
+        .any(|w| w.created_at > m.at || !w.status.was_published())
     {
         out.why = "pinned protocol was not available at the original cause".into();
         return Ok(out);

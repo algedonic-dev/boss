@@ -12,7 +12,7 @@
 //!
 //! Unlike `boss-views-catchup` this is a FULL rebuild, not an
 //! incremental one, and that is a property of the index rather than a
-//! shortcut: events are capped per Subject via `ROW_NUMBER`, so "the
+//! shortcut: events are capped at 50 per Subject, so "the
 //! most recent 50 events for this Subject" changes as new events
 //! arrive and there is no watermark that makes an append correct. A
 //! periodic TRUNCATE-and-replay is the honest interim. The rebuild

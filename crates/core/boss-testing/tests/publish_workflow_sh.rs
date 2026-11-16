@@ -271,7 +271,7 @@ esac
 # (HTTP code via -w when asked); STUB_REGISTRY_DOWN answers nothing.
 [ -n "${STUB_CURL_LOG:-}" ] && printf 'curl %s\n' "$*" >> "$STUB_CURL_LOG"
 [ -n "${STUB_REGISTRY_DOWN:-}" ] && { echo "curl: (7) Failed to connect" >&2; exit 7; }
-out=""; code=0
+out=""; code=0; url=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift ;;
@@ -279,11 +279,21 @@ while [ $# -gt 0 ]; do
     # A header FILE: what it holds is kept, so a test can see what was
     # presented without the value ever being in an argv.
     -H) case "$2" in @*) [ -n "${STUB_CURL_LOG:-}" ] && cat "${2#@}" >> "$STUB_CURL_LOG.headers" ;; esac; shift ;;
+    http*) url="$1" ;;
   esac
   shift
 done
-if [ -n "$out" ]; then cp "$STUB_LIVE" "$out"; else cat "$STUB_LIVE"; fi
-[ "$code" = 1 ] && printf '200'
+# A JOB read (the held-kind door reads the request and its packet) is
+# served from STUB_JOBS/<id>.json, and answers 404 when there is none;
+# every other read is the live row.
+src="$STUB_LIVE"; status=200
+case "$url" in
+  */api/jobs/*)
+    src="${STUB_JOBS:-/nonexistent}/${url##*/api/jobs/}.json"
+    [ -f "$src" ] || { src=/dev/null; status=404; } ;;
+esac
+if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
+[ "$code" = 1 ] && printf '%s' "$status"
 exit 0
 "#,
         );
@@ -443,6 +453,15 @@ fn a_live_row_equal_to_the_tree_is_nothing_to_publish() {
     write_file(&c.live, &live_row(2, REV2_DESC, REV2_STEPS));
     let (rc, out) = c.run(&[KIND]);
     assert_eq!(rc, 5, "{out}");
+    let sha = Command::new("sha256sum")
+        .arg(c.repo.join(format!("infra/platform/workflows/{KIND}.toml")))
+        .output()
+        .expect("sha256sum runs");
+    let sha = String::from_utf8_lossy(&sha.stdout)[..64].to_string();
+    assert!(
+        out.contains(&format!("EQUAL: {KIND} v2; spec sha256 {sha}")),
+        "{out}"
+    );
     contains_all(
         &out,
         &["nothing to publish", "v2", "already"],
@@ -600,14 +619,19 @@ fn a_live_row_the_tree_once_said_is_republished_and_confirmed() {
         calls[0].contains("--dry-run"),
         "the first boss call is the lint: {calls:?}"
     );
+    // The file handed over is the run's one copy of the tree's file
+    // (review R1 of car 214ae147), never the mutable checkout path.
     let kind_file = c.repo.join(format!("infra/platform/workflows/{KIND}.toml"));
-    assert_eq!(
-        calls[1],
-        format!(
-            "workflow publish {KIND} {} actor=automation:ops-runner",
-            kind_file.display()
-        ),
-        "the publish names the kind, the tree's file, and signs as the runner's automation"
+    let handed = calls[1]
+        .strip_prefix(&format!("workflow publish {KIND} "))
+        .and_then(|rest| rest.strip_suffix(" actor=automation:ops-runner"))
+        .unwrap_or_else(|| {
+            panic!("the publish names the kind and signs as the runner's automation: {calls:?}")
+        });
+    assert!(
+        handed.ends_with(&format!("/infra/platform/workflows/{KIND}.toml"))
+            && handed != kind_file.display().to_string(),
+        "the publish hands the run's copy of the tree's file: {calls:?}"
     );
 }
 
@@ -685,6 +709,414 @@ fn a_held_kind_is_refused_in_real_mode_and_under_force_tree_and_check_says_held(
     contains_all(&out, &["HELD:", "nothing to publish"], "held and equal");
 }
 
+// ---------------------------------------------------------------------------
+// The deliberate door is a packet (design b1f319bc, David 2026-11-05).
+// ---------------------------------------------------------------------------
+
+/// The request the harness hands every run (OPS_REQUEST_ID).
+const REQUEST: &str = "aaaaaaaa-0000-4000-8000-000000000000";
+const PACKET: &str = "b1f319bc-0000-4000-8000-0000000000aa";
+const APPROVE_TITLE: &str = "Approve publishing maintenance-widget over live v1";
+
+fn kind_file_sha(c: &Case) -> String {
+    let out = Command::new("sha256sum")
+        .arg(c.repo.join(format!("infra/platform/workflows/{KIND}.toml")))
+        .output()
+        .expect("sha256sum runs");
+    String::from_utf8_lossy(&out.stdout)[..64].to_string()
+}
+
+/// Stamp `approve` (step 0) as the gateway would: a sign-off bound to
+/// `step_shape_hash` of its CURRENT title and metadata.
+fn stamp(packet: &mut serde_json::Value, who: &str, assurance: &str) {
+    let approve = packet["steps"][0].clone();
+    let shape = boss_core::job::step_shape_hash(
+        approve["title"].as_str().expect("approve has a title"),
+        &approve["metadata"],
+    );
+    packet["steps"][0]["sign_offs"] = serde_json::json!([{
+        "authority_id": who, "role": "platform-admin",
+        "stamped_at": "2026-11-05T16:00:00.000000Z", "shape_hash": shape,
+        "assurance": assurance, "presence_nonce": "fixture-nonce",
+    }]);
+}
+
+/// A publish-a-protocol packet as the jobs API serves it, signed by
+/// David with a passkey over exactly this kind's file at live v1.
+fn signed_packet(c: &Case) -> serde_json::Value {
+    let mut p = serde_json::json!({
+        "id": PACKET, "kind": "publish-a-protocol", "status": "open",
+        "metadata": {"protocol_kind": KIND},
+        "steps": [
+            {"id": "00000000-0000-4000-8000-0000000000a1", "spec_slug": "approve",
+             "title": APPROVE_TITLE, "status": "completed",
+             "assurance_required": "presence", "sign_offs_required": ["platform-admin"],
+             "sign_offs": [],
+             "metadata": {
+                 "human_only": true, "authority_role": "platform-admin", "decision": "approved",
+                 "protocol_kind": KIND,
+                 "spec_path": format!("infra/platform/workflows/{KIND}.toml"),
+                 "spec_sha256": kind_file_sha(c), "live_version": "1", "tree_sha": c.rev2,
+                 "dry_run": "boss workflow: maintenance-widget lints clean (4 steps)",
+                 "diff": "description: the tree adds a sentence; steps: the tree adds `failed`",
+             }},
+            {"id": "00000000-0000-4000-8000-0000000000a2", "spec_slug": "publish",
+             "status": "ready",
+             "metadata": {"ops_verb": "publish-workflow", "protocol_kind": KIND}},
+        ],
+    });
+    stamp(&mut p, "emp-david", "presence");
+    p
+}
+
+fn request_naming(packet: Option<&str>) -> serde_json::Value {
+    let mut md =
+        serde_json::json!({"host": "boss-gcp", "verb": "publish-workflow", "args": [KIND]});
+    if let Some(p) = packet {
+        md["for_protocol_publish"] = serde_json::json!(p);
+    }
+    serde_json::json!({"id": REQUEST, "kind": "ops-request", "status": "open", "metadata": md})
+}
+
+/// Plant the request and the packet where the stub curl serves job
+/// reads from, and hand back the env that points it there.
+fn plant_jobs(
+    c: &Case,
+    request: Option<&serde_json::Value>,
+    packet: &serde_json::Value,
+) -> Vec<(&'static str, String)> {
+    let dir = c.root.join("jobs");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    if let Some(r) = request {
+        write_file(&dir.join(format!("{REQUEST}.json")), &r.to_string());
+    }
+    write_file(&dir.join(format!("{PACKET}.json")), &packet.to_string());
+    vec![("STUB_JOBS", dir.display().to_string())]
+}
+
+/// THE DOOR (design b1f319bc Q held-kind: "the packet IS the deliberate
+/// door"). A held kind whose request names a publish-a-protocol packet
+/// its owner signed with a passkey over exactly this file, at exactly
+/// this live version, is published ONCE through the checked sequence —
+/// the lint, the publish, the read-back — and says what lifted the hold.
+/// --force-tree never does, signed or not.
+#[test]
+fn a_held_kind_is_published_through_the_packet_its_owner_signed() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("held-signed");
+    hold_file(&c, &format!("{KIND}.toml"), HOLD);
+    let env = plant_jobs(&c, Some(&request_naming(Some(PACKET))), &signed_packet(&c));
+
+    let (rc, out) = c.run_env(&[KIND, "--force-tree"], &env);
+    assert_eq!(
+        rc, 9,
+        "--force-tree never forces a hold, signed or not: {out}"
+    );
+    assert!(c.boss_calls().is_empty(), "{:?}", c.boss_calls());
+
+    let (rc, out) = c.run_env(&[KIND], &env);
+    assert_eq!(rc, 0, "{out}");
+    contains_all(
+        &out,
+        &[
+            "HELD (declared in infra/platform/workflow-holds/maintenance-widget.toml), and lifted for this one publish by publish-a-protocol b1f319bc-0000-4000-8000-0000000000aa",
+            "signed with a passkey by emp-david",
+            "against live v1",
+            // The line complete-protocol-publish-on-publish-workflow-
+            // answered reads (its pattern is pinned against the same
+            // phrase in boss-dispatcher's publish_a_protocol_rules.rs).
+            "publish-workflow: maintenance-widget v1 -> v2 live at http://sor.invalid — confirmed by reading the active row back and comparing it to infra/platform/workflows/maintenance-widget.toml (equal)",
+        ],
+        "the signed publish",
+    );
+    assert_eq!(c.publishes().len(), 1, "{:?}", c.boss_calls());
+}
+
+/// Every way a packet can fail to be a signature of THIS publish
+/// refuses 9, names the check, and reaches neither the lint nor the
+/// publish — the hold stands. Each mutation but the tamper re-stamps
+/// the step, so the refusal is the named check and not the shape.
+#[test]
+fn a_held_kind_is_refused_when_its_packet_does_not_sign_this_publish() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("held-unsigned");
+    hold_file(&c, &format!("{KIND}.toml"), HOLD);
+    type Mutate = fn(&mut serde_json::Value);
+    fn restamp(p: &mut serde_json::Value) {
+        stamp(p, "emp-david", "presence");
+    }
+    let cases: Vec<(&str, Option<serde_json::Value>, Mutate, &str)> = vec![
+        (
+            "no link",
+            Some(request_naming(None)),
+            |_| {},
+            "names no publish-a-protocol packet",
+        ),
+        ("no request", None, |_| {}, "could not be read"),
+        (
+            "a session stamp",
+            Some(request_naming(Some(PACKET))),
+            |p| stamp(p, "emp-david", "session"),
+            "not presence: no passkey signed it",
+        ),
+        (
+            "edited after signing",
+            Some(request_naming(Some(PACKET))),
+            |p| p["steps"][0]["metadata"]["diff"] = serde_json::json!("something else"),
+            "what is on the step is not what was signed",
+        ),
+        (
+            "a stranger signed",
+            Some(request_naming(Some(PACKET))),
+            |p| stamp(p, "emp-mallory", "presence"),
+            "not among the approvers infra/ops/verbs/publish-workflow.json names",
+        ),
+        (
+            "rejected",
+            Some(request_naming(Some(PACKET))),
+            |p| {
+                p["steps"][0]["metadata"]["decision"] = serde_json::json!("rejected");
+                restamp(p);
+            },
+            "not \"approved\"",
+        ),
+        (
+            "other bytes",
+            Some(request_naming(Some(PACKET))),
+            |p| {
+                p["steps"][0]["metadata"]["spec_sha256"] = serde_json::json!("0".repeat(64));
+                restamp(p);
+            },
+            "these are not the bytes that were signed",
+        ),
+        (
+            "another kind",
+            Some(request_naming(Some(PACKET))),
+            |p| p["metadata"]["protocol_kind"] = serde_json::json!("ops-request"),
+            "asks to publish ops-request, not maintenance-widget",
+        ),
+        (
+            "already spent",
+            Some(request_naming(Some(PACKET))),
+            |p| p["steps"][1]["status"] = serde_json::json!("completed"),
+            "a signature is spent on one publish",
+        ),
+        (
+            "closed",
+            Some(request_naming(Some(PACKET))),
+            |p| p["status"] = serde_json::json!("closed"),
+            "is closed, not open",
+        ),
+        (
+            "not signed yet",
+            Some(request_naming(Some(PACKET))),
+            |p| p["steps"][0]["status"] = serde_json::json!("ready"),
+            "a ready publish step is a flag, not a signature",
+        ),
+        (
+            "live moved",
+            Some(request_naming(Some(PACKET))),
+            |p| {
+                p["steps"][0]["metadata"]["live_version"] = serde_json::json!("7");
+                restamp(p);
+            },
+            "signed a diff against live v7, and live is v1 now",
+        ),
+    ];
+    for (name, request, mutate, says) in cases {
+        let mut packet = signed_packet(&c);
+        mutate(&mut packet);
+        let env = plant_jobs(&c, request.as_ref(), &packet);
+        let (rc, out) = c.run_env(&[KIND], &env);
+        assert_eq!(rc, 9, "{name}: {out}");
+        contains_all(
+            &out,
+            &[
+                "REFUSED",
+                "'maintenance-widget' is HELD out of every unattended publish",
+                says,
+                "nothing published",
+            ],
+            name,
+        );
+        assert!(
+            c.boss_calls().is_empty(),
+            "{name}: a refused signature reached the CLI: {:?}",
+            c.boss_calls()
+        );
+    }
+}
+
+/// The stub `boss` with one act added to its lint: `hook`, run inside
+/// the `--dry-run` branch before it answers — the moment a converge
+/// can move the checkout while the CLI is working.
+fn hook_the_lint(c: &Case, hook: &str) {
+    let original = std::fs::read_to_string(c.bin.join("boss")).unwrap();
+    let hooked = original.replace(
+        "echo \"boss workflow: $3 lints clean (4 steps)\"; exit 0 ;;",
+        &format!("{hook}; echo \"boss workflow: $3 lints clean (4 steps)\"; exit 0 ;;"),
+    );
+    assert_ne!(hooked, original, "the lint branch of the stub moved");
+    write_exec(&c.bin.join("boss"), &hooked);
+}
+
+/// THE SIGNED BYTES ARE READ ONCE (review R1 of car 214ae147, Codex run
+/// 753b6bd7, its fixture). The signature was checked against a hash of
+/// the CHECKOUT's file, and the lint, the publish and the read-back each
+/// read that mutable path again, so a file that moved during the lint
+/// was published under the old signature (signed 7708bbb7, published
+/// 4da8ebc8, read back "equal" to the new bytes). Every reader now
+/// takes one private copy, hashed once; here the bytes handed to the
+/// lint change under it, and the run stops before the publish with
+/// nothing written.
+#[test]
+fn bytes_that_change_under_the_lint_are_never_published() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("signed-race");
+    hold_file(&c, &format!("{KIND}.toml"), HOLD);
+    let p = signed_packet(&c);
+    let replacement = REV2_KIND_FILE.replace(REV2_DESC, "UNAPPROVED CONVERGED ROW");
+    assert_ne!(replacement, REV2_KIND_FILE);
+    write_file(&c.root.join("next.toml"), &replacement);
+    write_file(
+        &c.root.join("next-live.json"),
+        &live_row(2, "UNAPPROVED CONVERGED ROW", REV2_STEPS),
+    );
+    hook_the_lint(
+        &c,
+        "cp \"$REVIEW_NEXT\" \"$4\"; cp \"$REVIEW_NEXT_LIVE\" \"$STUB_LIVE_AFTER\"",
+    );
+    let mut env = plant_jobs(&c, Some(&request_naming(Some(PACKET))), &p);
+    env.push((
+        "REVIEW_NEXT",
+        c.root.join("next.toml").display().to_string(),
+    ));
+    env.push((
+        "REVIEW_NEXT_LIVE",
+        c.root.join("next-live.json").display().to_string(),
+    ));
+    let (rc, out) = c.run_env(&[KIND], &env);
+    assert!(
+        c.publishes().is_empty(),
+        "bytes that moved after the signature was checked were published: {out}"
+    );
+    assert_eq!(rc, 75, "{out}");
+    contains_all(
+        &out,
+        &["not the bytes in hand", "nothing published"],
+        "the refusal",
+    );
+}
+
+/// The same race in the shape it takes on boss-gcp: the CHECKOUT moves
+/// (a converge pulls a newer edit) while the CLI lints. The approval is
+/// for the bytes read at the start, so those — the run's own copy — are
+/// what is linted, published and read back equal; the checkout's new
+/// bytes are the next packet's business. Before the copy, the publish
+/// sent the new file and its read-back failed (exit 7) AFTER writing.
+#[test]
+fn a_checkout_that_moves_during_the_lint_publishes_the_signed_bytes() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("checkout-moves");
+    hold_file(&c, &format!("{KIND}.toml"), HOLD);
+    let p = signed_packet(&c);
+    let signed = kind_file_sha(&c);
+    let kind_file = c.repo.join(format!("infra/platform/workflows/{KIND}.toml"));
+    write_file(
+        &c.root.join("next.toml"),
+        &REV2_KIND_FILE.replace(REV2_DESC, "UNAPPROVED CONVERGED ROW"),
+    );
+    hook_the_lint(&c, "cp \"$REVIEW_NEXT\" \"$REVIEW_CHECKOUT_FILE\"");
+    let mut env = plant_jobs(&c, Some(&request_naming(Some(PACKET))), &p);
+    env.push((
+        "REVIEW_NEXT",
+        c.root.join("next.toml").display().to_string(),
+    ));
+    env.push(("REVIEW_CHECKOUT_FILE", kind_file.display().to_string()));
+    let (rc, out) = c.run_env(&[KIND], &env);
+    assert_ne!(kind_file_sha(&c), signed, "the hook moved the checkout");
+    assert_eq!(rc, 0, "{out}");
+    let published = c.publishes();
+    assert_eq!(published.len(), 1, "{:?}", c.boss_calls());
+    assert!(
+        !published[0].contains(&kind_file.display().to_string()),
+        "the publish read the mutable checkout path, not the run's copy: {published:?}"
+    );
+    contains_all(
+        &out,
+        &[
+            &format!("sha256 {signed}"),
+            "maintenance-widget v1 -> v2 live",
+            "(equal)",
+        ],
+        "the signed bytes, published and read back",
+    );
+}
+
+/// The copy lives outside the checkout, so the CLI's tenant lookup —
+/// the nearest ancestor holding `tenant.toml` or `seeds/tenant.toml`
+/// (boss-cli tenant.rs `manifest_of`) — walks the TEMP directory's
+/// ancestry instead. A manifest planted there (a shared /tmp) would
+/// publish a platform row as that tenant's, and the read-back compare
+/// leaves the loader-stamped owning_team out. Refused, before the CLI.
+#[test]
+fn a_tenant_manifest_above_the_runs_copy_is_refused() {
+    if !ready() {
+        return;
+    }
+    let c = Case::new("tmp-manifest");
+    let tmpdir = c.root.join("tmpdir");
+    std::fs::create_dir_all(&tmpdir).unwrap();
+    write_file(
+        &tmpdir.join("tenant.toml"),
+        "[meta]\ntenant_id = \"planted\"\n",
+    );
+    let (rc, out) = c.run_env(&[KIND], &[("TMPDIR", tmpdir.display().to_string())]);
+    assert_eq!(rc, 78, "{out}");
+    assert!(c.boss_calls().is_empty(), "{:?}", c.boss_calls());
+    contains_all(&out, &["tenant.toml", "nothing published"], "the refusal");
+}
+
+/// §9a: the two manifest names the refusal above looks for are the CLI's
+/// own (`manifest_of`). A name the CLI learns and the script does not is
+/// a planted manifest the script cannot see.
+#[test]
+fn the_tenant_manifest_names_are_the_clis() {
+    let tenant_rs =
+        std::fs::read_to_string(repo_root().join("crates/orchestrators/boss-cli/src/tenant.rs"))
+            .unwrap();
+    let body = tenant_rs
+        .split("pub fn manifest_of(")
+        .nth(1)
+        .expect("boss-cli tenant.rs defines manifest_of");
+    let list = &body[body.find('[').unwrap() + 1..body.find(']').unwrap()];
+    let cli: Vec<&str> = list
+        .split(',')
+        .map(|s| s.trim().trim_matches('"'))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let script = std::fs::read_to_string(repo_root().join(SCRIPT)).unwrap();
+    let line = script
+        .lines()
+        .find(|l| l.starts_with("TENANT_MANIFESTS=\""))
+        .expect("publish-workflow.sh declares TENANT_MANIFESTS");
+    let ours: Vec<&str> = line
+        .trim_start_matches("TENANT_MANIFESTS=\"")
+        .trim_end_matches('"')
+        .split_whitespace()
+        .collect();
+    assert_eq!(ours, cli, "publish-workflow.sh's TENANT_MANIFESTS");
+}
+
 /// FAIL CLOSED, here too: holds that cannot be read refuse EVERY mode
 /// (78), naming the file, before the CLI or the registry is touched.
 #[test]
@@ -722,11 +1154,12 @@ fn holds_that_cannot_be_read_refuse_every_mode_of_the_one_kind_verb() {
     assert!(c.boss_calls().is_empty(), "{:?}", c.boss_calls());
 }
 
-/// The default and its release: a row that declares a field `writer` is
-/// held with no file at all (9), and a `released` file hands it back —
-/// then it publishes exactly as an unheld row does.
+/// No default hold (backlog a4b57aca): a row that declares a field
+/// `writer` was held with no file at all until that car, and a
+/// `released` file handed it back. Whether its publish needs a person is
+/// the server's passkey rule now, so it publishes exactly as any row does.
 #[test]
-fn a_row_declaring_a_writer_is_refused_by_default_and_published_once_released() {
+fn a_row_declaring_a_writer_is_not_held_by_default() {
     if !ready() {
         return;
     }
@@ -743,20 +1176,6 @@ fn a_row_declaring_a_writer_is_refused_by_default_and_published_once_released() 
     write_file(
         &c.repo.join(format!("infra/platform/workflows/{KIND}.toml")),
         &with_writer,
-    );
-    let (rc, out) = c.run(&[KIND]);
-    assert_eq!(rc, 9, "{out}");
-    contains_all(
-        &out,
-        &["by default: step run field result declares writer signer"],
-        "the default hold names what it read",
-    );
-    assert!(c.boss_calls().is_empty(), "{:?}", c.boss_calls());
-
-    hold_file(
-        &c,
-        &format!("{KIND}.toml"),
-        "drift_publish = \"released\"\nwhy = 'Published by hand and the positive control passed; later edits may ride the machine roads.'\n",
     );
     // What the stub registry holds after the publish. Left as the plain
     // rev2 row — no writer — the read-back is NOT CONFIRMED (7): the
@@ -787,7 +1206,7 @@ fn a_row_declaring_a_writer_is_refused_by_default_and_published_once_released() 
     std::fs::remove_file(&c.boss_log).unwrap();
     let (rc, out) = c.run(&[KIND]);
     assert_eq!(rc, 0, "{out}");
-    contains_all(&out, &["v1 -> v2", "confirmed"], "the released row");
+    contains_all(&out, &["v1 -> v2", "confirmed"], "the writer row");
     assert_eq!(c.publishes().len(), 1, "{:?}", c.boss_calls());
 }
 
@@ -795,7 +1214,7 @@ fn a_row_declaring_a_writer_is_refused_by_default_and_published_once_released() 
 /// an explicit hold refuses both ordinary and force-tree modes before
 /// any publish: a rollback must rehold before its deliberate publication.
 #[test]
-fn the_shipped_evidence_row_is_held_and_only_an_explicit_release_reaches_drift() {
+fn the_shipped_evidence_row_is_held_and_only_a_lifted_hold_reaches_drift() {
     if !ready() {
         return;
     }
@@ -822,11 +1241,14 @@ fn the_shipped_evidence_row_is_held_and_only_an_explicit_release_reaches_drift()
         "protected evidence publication is owed",
     );
     assert!(c.boss_calls().is_empty());
-    hold_file(
-        &c,
-        "ops-request.toml",
-        "drift_publish = 'released'\nwhy = 'Synthetic deliberate publication and controls; exercise the release mechanism only.'\n",
-    );
+    // Lifting the hold is deleting its file (no `released` state since
+    // backlog a4b57aca).
+    std::fs::remove_file(
+        c.repo
+            .join("infra/platform/workflow-holds")
+            .join("ops-request.toml"),
+    )
+    .unwrap();
     let (rc, out) = c.run(&["ops-request", "--check"]);
     assert_eq!(rc, 6, "{out}");
     assert!(
@@ -1137,13 +1559,8 @@ fn a_live_row_that_lost_a_writer_an_executor_an_assurance_or_a_sign_off_reads_as
         &c.repo.join(format!("infra/platform/workflows/{KIND}.toml")),
         &refusal_row_file(),
     );
-    // A row declaring a writer or an executor is held by default; this
-    // case is about the comparison, so the kind is released.
-    hold_file(
-        &c,
-        &format!("{KIND}.toml"),
-        "drift_publish = \"released\"\nwhy = 'Published by hand; the comparison is what is under test.'\n",
-    );
+    // No default hold since backlog a4b57aca: a row declaring a writer
+    // or an executor is not held, so the comparison is reached directly.
 
     // Control: the live row carrying all four is the tree's row.
     write_file(
@@ -1216,11 +1633,6 @@ fn a_changed_writer_and_a_key_only_the_live_row_states_are_both_named() {
     write_file(
         &c.repo.join(format!("infra/platform/workflows/{KIND}.toml")),
         &refusal_row_file(),
-    );
-    hold_file(
-        &c,
-        &format!("{KIND}.toml"),
-        "drift_publish = \"released\"\nwhy = 'Published by hand; the comparison is what is under test.'\n",
     );
     write_file(
         &c.live,
@@ -1596,4 +2008,10 @@ fn the_verb_file_has_the_reviewed_shape() {
     );
     assert_eq!(params[1]["optional"], true);
     assert!(v["timeout"].as_u64().unwrap_or(0) >= 120);
+    // WHO MAY SIGN A HELD PUBLISH (design b1f319bc): a named list read by
+    // the script, never a role — and not `requires_approval`: the
+    // passkey is on the publish-a-protocol packet, not on this request,
+    // so a request that names none still runs every non-held kind.
+    assert_eq!(v["approvers"], serde_json::json!(["emp-david"]));
+    assert!(v.get("requires_approval").is_none(), "{v}");
 }

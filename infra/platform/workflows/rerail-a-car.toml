@@ -49,7 +49,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "A car the conductor left behind on a merge conflict three trains running, filed by the machine for a builder to repair: rerail it onto current main, resolve the hunk so both sides' intent survives, re-gate, and carry the green onto the car - or refuse, naming the hunk, so a person decides. Closes itself as overtaken when the car closes first."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "filed"
@@ -75,6 +75,7 @@ fields = [
   { name = "evidence", field_type = "string", required = true },
 ]
 [workflow.step.metadata_defaults]
+at = "0409a62b-1022-4b1a-8507-a1522171d71b"
 procedure = '''
 This packet names a car (`car`), its branch (`branch`) and the conflict the conductor recorded (`skip_reason`). The car has been left behind on that merge conflict three trains running, and the conductor rebased it onto the consist before each refusal, so what is left is a hunk `git rebase` could not resolve.
 

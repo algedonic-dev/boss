@@ -4,7 +4,7 @@
 #
 # An interactive ssh login used to exec straight into the one durable
 # tmux session, `dev` — the Remote Control / drain session the boot
-# starts running /work/dev-claude.sh. It now offers five sessions:
+# starts running /work/dev-claude.sh. It now offers six sessions:
 #
 #   1) Claude + Claude Code   tmux `dev`     /work/dev-claude.sh
 #   2) GPT + Codex            tmux `codex`   codex
@@ -12,6 +12,12 @@
 #   4) Shell                  tmux `shell`   bash -l
 #   5) Claude B + Claude Code tmux `claude-b` claude, own login home
 #      ($HOME/.claude-b), signing as claude-b@algedonic.dev
+#   6) GPT + Codex, factory   tmux `codex-factory`
+#      infra/dev/factory-loop.sh: the same codex identity, the CLI's
+#      non-interactive mode run one turn at a time and relaunched on a
+#      model limit (backlog 628dc540). Option 2 stays the interactive
+#      TUI; the two never start beside each other, because two CLIs
+#      signing as one agent would race for one queue.
 #
 # Each JOINS its session when it runs and CREATES it when it does not
 # (`tmux new-session -A`). Enter, or no answer within the timeout, is 1,
@@ -52,9 +58,43 @@
 # BOSS_DEV_ROOT stands in for /work, BOSS_DEV_SESSION_TIMEOUT for the
 # 10 s, and BOSS_DEV_SESSION_ASSUME_TTY=1 for a terminal: the test
 # harness's seams, unset on the pod.
+#
+# `--detached 6` (backlog ccd985ef, decided 2026-10-29) starts option 6
+# — the factory loop, with its session name, identity and command
+# exactly as the menu's 6 has them, through the one `start_factory`
+# below — in a DETACHED session, prints `<session> <pane pid>`, and
+# exits. It shows no menu, needs no terminal, never joins (a running
+# loop or TUI is refused), and never offers an install. Its caller is
+# infra/dev/agent-pane.sh, for `boss factory
+# restart`: the conductor starting a factory that is not running at all,
+# so a stall is not left waiting for David at the console.
+#
+# `--detached 2` and `--detached 5` (backlog 2a2d11b2, David
+# 2026-11-10) start the interactive Codex and Claude B the same way, and
+# for the same reason: after the pod rolled at ~01:40Z that night both
+# waited for an interactive login, and seven of Claude B's packets and
+# one of Codex's sat stranded behind them until David typed. Each goes
+# through the menu's own definition (`start_codex`, `start_claude_b`
+# below) and so through join()'s identity check, config placing and
+# Claude B's login-home preparation; detached, a running session is
+# refused, never joined, and the codex TUI is never started beside the
+# factory loop. Its caller is `boss session start <codex|claude-b>`,
+# which records what it saw and did on that agent's work-session.
+# Option 1 (`dev`, the drain the boot owns), 3 and 4 stay menu-only.
 
 root=${BOSS_DEV_ROOT:-/work}
 timeout=${BOSS_DEV_SESSION_TIMEOUT:-10}
+
+detached=''
+if [ "${1:-}" = --detached ]; then
+  case ${2:-} in
+    2 | 5 | 6) detached=$2 ;;
+    *)
+      echo "dev-session: --detached takes only 2, 5 or 6 (the codex TUI, Claude B, the factory loop), not '${2:-}' - nothing started" >&2
+      exit 64
+      ;;
+  esac
+fi
 
 # The session environment, as the pod's .bashrc and dev-claude.sh set it.
 export HOME=$root/home
@@ -67,7 +107,7 @@ cd "$root/boss" || true
 # dev-session.sh exactly — the .profile execs this only for interactive
 # tty logins outside tmux, and a shell inside any session (the `shell`
 # session's own login bash included) must never be offered it again.
-if [ -n "${TMUX:-}" ] || { [ ! -t 0 ] && [ "${BOSS_DEV_SESSION_ASSUME_TTY:-}" != 1 ]; }; then
+if [ -z "$detached" ] && { [ -n "${TMUX:-}" ] || { [ ! -t 0 ] && [ "${BOSS_DEV_SESSION_ASSUME_TTY:-}" != 1 ]; }; }; then
   exec tmux new-session -A -s dev
 fi
 
@@ -98,14 +138,19 @@ status() { if running "$1"; then echo running; else echo 'not running'; fi; }
 cli_of() {
   case $1 in
     dev | claude-b) echo claude ;;
-    codex) echo codex ;;
+    codex | codex-factory) echo codex ;;
     gemini) echo gemini ;;
   esac
 }
 
+# -q FIRST on the installer's curl (backlog 2b1bf9b4): this menu runs as
+# root with HOME=/work/home, which group 1500 may create a .curlrc in,
+# and what that curl fetches is piped into bash as root. Only as curl's
+# first argument does -q skip the curlrc; the_doors_read_no_curlrc.rs
+# holds every curl under infra/dev to it.
 install_hint() {
   case $1 in
-    claude) echo "curl -fsSL https://claude.ai/install.sh | HOME=$HOME bash" ;;
+    claude) echo "curl -q -fsSL https://claude.ai/install.sh | HOME=$HOME bash" ;;
     codex) echo "npm i -g --prefix $HOME/.local @openai/codex" ;;
     gemini) echo "npm i -g --prefix $HOME/.local @google/gemini-cli" ;;
   esac
@@ -113,7 +158,7 @@ install_hint() {
 
 run_install() {
   case $1 in
-    claude) curl -fsSL https://claude.ai/install.sh | bash ;;
+    claude) curl -q -fsSL https://claude.ai/install.sh | bash ;;
     codex) npm i -g --prefix "$HOME/.local" @openai/codex ;;
     gemini) npm i -g --prefix "$HOME/.local" @google/gemini-cli ;;
   esac
@@ -245,15 +290,23 @@ join() {
   shift
   local -a flags=() cmd=("$@")
   if running "$name"; then
+    if [ -n "$detached" ]; then
+      echo "dev-session: tmux \`$name\` is already running - --detached never joins, nothing started"
+      return 1
+    fi
     mode=unsigned
   else
     cli=$(cli_of "$name")
     if [ -n "$cli" ] && ! command -v "$cli" >/dev/null 2>&1; then
+      if [ -n "$detached" ]; then
+        echo "dev-session: $cli is not installed on this pod - nothing started. Install it with: $(install_hint "$cli")"
+        return 1
+      fi
       offer_install "$cli" || return 1
     fi
   fi
   case $name in
-    codex)
+    codex | codex-factory)
       agent_identity codex@algedonic.dev 'Codex (engineering)' "$mode"
       [ "$mode" = check ] && place_config infra/dev/cli/codex-config.toml .codex/config.toml
       ;;
@@ -267,8 +320,50 @@ join() {
       [ "$mode" = check ] && place_config infra/dev/cli/gemini-settings.json .gemini/settings.json
       ;;
   esac
+  if [ -n "$detached" ]; then
+    exec tmux new-session -d -P -F '#{session_name} #{pane_pid}' -s "$name" -c "$root/boss" "${flags[@]}" "${cmd[@]}"
+  fi
   exec tmux new-session -A -s "$name" -c "$root/boss" "${flags[@]}" "${cmd[@]}"
 }
+
+# The interactive codex TUI and the factory loop sign as ONE agent, so
+# neither is CREATED while the other runs: two CLIs on one identity race
+# for one queue (backlog 628dc540). Joining a running one is unchanged.
+# Returns 1, back to the menu, when the other holds the identity.
+join_codex() {
+  local name=$1 other=$2
+  shift 2
+  if ! running "$name" && running "$other"; then
+    echo "tmux \`$other\` is running and signs as the same codex agent - quit it before starting \`$name\`."
+    return 1
+  fi
+  join "$name" "$@"
+}
+
+# Option 6, the factory loop: defined ONCE, read by the menu and by
+# `--detached 6` (backlog ccd985ef), so the conductor's restart and
+# David's login start the same thing.
+start_factory() {
+  join_codex codex-factory codex "$root/boss/infra/dev/factory-loop.sh"
+}
+
+# Options 2 and 5, likewise defined once for the menu and `--detached`
+# (backlog 2a2d11b2).
+start_codex() {
+  join_codex codex codex-factory codex
+}
+
+start_claude_b() {
+  join claude-b claude
+}
+
+# Each start execs tmux on success, so a return is a refusal.
+case $detached in
+  2) start_codex ;;
+  5) start_claude_b ;;
+  6) start_factory ;;
+esac
+[ -z "$detached" ] || exit 1
 
 join_dev() {
   if [ -x "$root/dev-claude.sh" ]; then
@@ -287,6 +382,7 @@ while :; do
   printf '  3) %-22s %-8s %s\n' 'Gemini + Code Assist' gemini "$(status gemini)"
   printf '  4) %-22s %-8s %s\n' 'Shell' shell "$(status shell)"
   printf '  5) %-22s %-8s %s\n' 'Claude B + Claude Code' claude-b "$(status claude-b)"
+  printf '  6) %-22s %-8s %s\n' 'GPT + Codex, factory' codex-factory "$(status codex-factory)"
   printf '> '
   choice=''
   if ! read -r -t "$timeout" choice && [ -z "$choice" ]; then
@@ -294,10 +390,11 @@ while :; do
   fi
   case $choice in
     '' | 1) join_dev ;;
-    2) join codex codex ;;
+    2) start_codex ;;
     3) join gemini gemini ;;
     4) join shell bash -l ;;
-    5) join claude-b claude ;;
+    5) start_claude_b ;;
+    6) start_factory ;;
     *) echo "no option '$choice'" ;;
   esac
 done

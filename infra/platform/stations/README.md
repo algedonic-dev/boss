@@ -1,10 +1,19 @@
 # Platform station bundle — stations as DATA, not migrations
 
 One file per station: `<name>.toml` holds exactly one `[[station]]`
-whose `name` is the file name, carrying every column of the `stations`
-row (`116-stations.sql` and the columns later migrations added:
-`terminal_window_days`, `upstream`, `lens`). **Adding a station is
+whose `name` is the file name, declaring the fields of `StationSpec`.
+The loader refuses `upstream`: a station's walk upstream is its parent
+station's page, derived from the tree (backlog a1c0a0ff). It also refuses
+the `department` label, retired with the department floor (backlog
+aa82eb11). `station-rows-name-served-routes.test.ts`
+holds every route a row names to one the router serves. **Adding a station is
 dropping a file in.** Changing one is bumping its `version`.
+
+Retiring a declaration field also requires a new version. The live-effect
+guard compares the authored row with the system of record before the new
+reader runs, so omitting the department label publishes a new version
+without it. Previous versions and their audit facts remain intact. The
+stored compatibility column is retained for older builds.
 
 Since 2026-09-18 (backlog 393d3234, consolidation H4) this directory
 is where a platform station is DECLARED. Before it, seven migrations
@@ -45,3 +54,12 @@ through the same viability gate an API publish passes and refuses a
 file named for a station it does not hold, a status other than
 `active`, and a version below 1. `created_at` is not declared here: it
 is stamped by the seed's clock when the row is written.
+
+**`line`** names the Design token a station's card rail draws
+(`line = "it"` draws `--map-line-it` in `apps/web/src/styles.css`). The
+root and each station directly under it declare one; every station
+below draws the nearest line up its parents, so a child declares none.
+`every_top_level_station_names_a_line_the_stylesheet_declares`
+(`crates/core/boss-jobs/tests/station_tree.rs`) refuses a top-level row
+with no line, or one naming a token the stylesheet does not declare
+(design c4854fd4, backlog 85cb2103).

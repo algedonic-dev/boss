@@ -67,7 +67,7 @@ import { FAILURE_MARKER } from './_routes';
 import { YARD_BORDERS, YARD_REGIONS, installSmokeMocks } from './_smokeMocks';
 import { parseRoute } from '../../src/router';
 import { ROUTE_CATALOG } from '../../src/shell/nav-catalog';
-import { TERRITORIES } from '../../src/it/yard/world';
+import { REGION_NAMES } from '../../src/it/yard/regions';
 import { regionHref } from '../../src/it/yard/regions';
 
 // The marshalling station's selection on the Department Map — where the
@@ -95,7 +95,7 @@ const trend = { metric: 'served', unit: 'per day', current: 54, previous: 19, sa
 const REGIONS = {
   window_hours: 24,
   now: '2026-09-25T05:00:00Z',
-  regions: TERRITORIES.map(({ name }) =>
+  regions: REGION_NAMES.map((name) =>
     name === 'marshalling'
       ? { name, count: 303, unit: 'packets at stations', state: 'attention', why: '303 packets standing at 3 stations', trend,
           places: [{ name: 'q.platform-admin.task', count: 297 }, { name: 'a.platform-admin.opus-5-1m', count: 213 }, { name: 'q.platform-admin.sign-off', count: 6 }, { name: 'q.platform-admin.checklist', count: 0 }] }
@@ -151,14 +151,14 @@ const BORDERS = {
 /// stands in the task queue.
 const LOAD = {
   data: [
-    { station: 'q.platform-admin.task', kind: 'constraint', depth: 297, wip_limit: 24, over_limit: true, oldest_age_days: 6, capability_roles: ['platform-admin'], also_elsewhere: 213 },
-    { station: 'a.platform-admin.opus-5-1m', kind: 'constraint', depth: 213, wip_limit: null, over_limit: false, oldest_age_days: 5, capability_roles: ['platform-admin'], also_elsewhere: 213 },
-    { station: 'q.platform-admin.sign-off', kind: 'constraint', depth: 6, wip_limit: null, over_limit: false, oldest_age_days: 2, capability_roles: ['platform-admin'], also_elsewhere: 0 },
+    { station: 'q.platform-admin.task', kind: 'constraint', depth: 297, oldest_age_days: 6, also_elsewhere: 213 },
+    { station: 'a.platform-admin.opus-5-1m', kind: 'constraint', depth: 213, oldest_age_days: 5, also_elsewhere: 213 },
+    { station: 'q.platform-admin.sign-off', kind: 'constraint', depth: 6, oldest_age_days: 2, also_elsewhere: 0 },
     // The one station here whose predicate names a Workflow kind — the
     // live registry's shape, where the constraint queues span kinds and
     // name none (c7c5c1de).
-    { station: 'loading-dock', kind: 'batch', workflow_kind: 'ship-a-change', depth: 1, wip_limit: 24, over_limit: false, oldest_age_days: null, capability_roles: null, also_elsewhere: 0 },
-    { station: 'q.platform-admin.checklist', kind: 'constraint', depth: 0, wip_limit: null, over_limit: false, oldest_age_days: null, capability_roles: ['platform-admin'], also_elsewhere: 0 },
+    { station: 'loading-dock', kind: 'equipment', workflow_kind: 'ship-a-change', depth: 1, oldest_age_days: null, also_elsewhere: 0 },
+    { station: 'q.platform-admin.checklist', kind: 'constraint', depth: 0, oldest_age_days: null, also_elsewhere: 0 },
   ],
   total: 5,
   distinct_packets: 304,
@@ -252,36 +252,12 @@ test.describe('the marshalling station — the selection, and the words it says'
     // The board's own page header is dropped: the station's panel heads it.
     await expect(page.getByRole('heading', { name: 'Marshalling Yard' })).toHaveCount(0);
 
-    // The station's head, off the regions read.
+    // The station's head; its reading cells (figure, verdict, rate)
+    // retired with the transit map (R3, backlog 23a4b4d7).
     const p = panel(page);
     await expect(p.locator('.panel-title')).toHaveText('Marshalling');
-    await expect(p.locator('[data-figure]')).toHaveText('303 packets at stations');
-    await expect(p).toHaveAttribute('data-state', 'attention');
-    await expect(p.locator('[data-field="verdict"]')).toContainText('303 packets standing at 3 stations');
+    await expect(p.locator('[data-field]')).toHaveCount(0);
     await expect(p.locator('[data-contents="marshalling"] .my-root')).toBeVisible();
-    // The map's own line under it.
-    await expect(page.locator('.yard-flow')).toContainText('window 24h against the 24h before · read ');
-  });
-
-  test("the station's rails, in then out, are its panel's rate — gap 5 (c4c77ddd) is FIXED on main", async ({ page }) => {
-    await install(page);
-    await mountPage(page, PATH, TITLE);
-    const rate = panel(page).locator('[data-field="rate"] li');
-    await expect(rate.first()).toContainText('in from receiving');
-    await expect(rate.last()).toContainText('out to shop floor');
-  });
-
-  // Gap 6 (4142d821) was fixed by the thirds rows' stuck-and-waiting
-  // cell; those rows were REMOVED by the top board (design ea906603, Q5,
-  // David 2026-09-27: "I haven't been looking at those numbers"), so
-  // what stands above the region now is the board's four rows.
-  test('the HUD frame stands above the region with the top board’s four rows — the thirds rows are removed (ea906603 Q5)', async ({ page }) => {
-    await install(page);
-    await mountPage(page, PATH, TITLE);
-    const hud = page.locator('section[data-hud][aria-label="The whole system"]');
-    await expect(hud.locator('.hud-title')).toHaveText('The whole system');
-    await expect(hud.locator('.hud-label')).toHaveText(['Outranks regular order', 'Needs you', 'Next up', 'Machines']);
-    await expect(hud.locator('[data-third]')).toHaveCount(0);
   });
 
   test('the board reads its sections, headers, rows and footnote verbatim', async ({ page }) => {
@@ -307,7 +283,7 @@ test.describe('the marshalling station — the selection, and the words it says'
     const rows = sidingRows(page);
     await expect(rows).toHaveCount(3);
     await expect(rows.nth(0).locator('td')).toHaveText([
-      'q.platform-admin.task', '297 / 24', '6 d', '—', '—', '—', '—', '—',
+      'q.platform-admin.task', '297', '6 d', '—', '—', '—', '—', '—',
       `297 waiting; rate not counted — ${TASK_BLIND}.`,
     ]);
     await expect(rows.nth(1).locator('td')).toHaveText([
@@ -341,39 +317,37 @@ test.describe('the marshalling station — the selection, and the words it says'
     ]);
     await expect(b.locator('.my-clear')).toHaveText('q.platform-admin.checklist');
     await expect(b.locator('.my-footnote')).toHaveText(
-      'Depth and the oldest packet\'s age come from /api/stations/load; arrivals and departures from /api/stations/flow, counted over the window from conserved original packet state and original transaction groups, on the audit insertion clock. Retention uses the original business-clock mapping. Departures include cancellation, reassignment and retention expiry; served counts completed work. A legacy step-events answer counts distinct Steps and is labelled per station; it is a different unit. "Oldest" is the oldest member packet\'s age since it opened, which over-reports time in this queue; the per-obligation wait below it is the step-level figure. Nothing on this page is estimated: a queue whose rate could not be counted says so.',
+      'Depth and the oldest packet\'s age come from /api/stations/load; arrivals and departures from /api/stations/flow, counted over the window from each step\'s own stamps: an arrival is a step that became ready at the station, a departure a step completed there, and what departed is what it served. A legacy step-events answer counts distinct Steps and is labelled per station; it is a different unit. "Oldest" is the oldest member packet\'s age since it opened, which over-reports time in this queue; the per-obligation wait below it is the step-level figure. Nothing on this page is estimated: a queue whose rate could not be counted says so.',
     );
     await expect(failures(page)).toHaveCount(0);
   });
 
-  test('packet crossings show departures separately from completed-work service', async ({ page }) => {
+  test('step stamps are a counted rate: what departed is what was served (design 7b8ed079)', async ({ page }) => {
     await install(page, {
       flow: (r) => json(r, {
         window_hours: 24, as_of: AS_OF_24,
-        data: [{ station: 'q.platform-admin.sign-off', basis: 'packet-membership-v1',
-          arrived: 3, departed: 2, served: 0, unknown: [], departure_causes: { cancellation: 2 } }],
+        data: [{ station: 'q.platform-admin.sign-off', basis: 'step-window-v1',
+          arrived: 3, departed: 2, served: 2, net: 1, unavailable_reason: null }],
       }),
     });
     await mountPage(page, PATH, TITLE);
     const row = sidingRows(page).filter({ has: page.locator('.my-station', { hasText: 'q.platform-admin.sign-off' }) });
     await expect(row.locator('td')).toHaveText([
-      'q.platform-admin.sign-off packet crossings', '6', '2 d', '3', '2', '0', '+1', 'not draining',
-      '6 waiting; 3 arrived, 2 departed, 0 served in the last 24h. No completed-work service was recorded; departures can have other causes.',
+      'q.platform-admin.sign-off step stamps', '6', '2 d', '3', '2', '2', '+1', '72 h',
+      '3 arrived, 2 served: growing by 1 a 24h window — 72h to clear at that rate.',
     ]);
     await expect(board(page).locator('.my-constraint-why')).toHaveText(
-      '6 waiting, 3 arrived, 2 departed and 0 served in the last 24h. No completed-work service rate was recorded.',
+      '6 waiting against 2 served in the last 24h: 72h to clear at the rate it is actually being worked, longer than any other counted queue.',
     );
-    await expect(row).not.toContainText('Nothing left');
   });
 
-  test('packet counts accompanied by unknown original coverage never paint a measured rate', async ({ page }) => {
-    const reason = 'original Step creation missing';
+  test('a step-window row whose read failed never paints a measured rate', async ({ page }) => {
+    const reason = 'the step-window read failed: storage unavailable';
     await install(page, {
       flow: (r) => json(r, {
         window_hours: 24, as_of: AS_OF_24,
-        data: [{ station: 'q.platform-admin.sign-off', basis: 'packet-membership-v1',
-          arrived: 3, departed: 2, served: 1,
-          unknown: [{ since: '2026-09-24T05:00:00Z', until: AS_OF_24, reason }],
+        data: [{ station: 'q.platform-admin.sign-off', basis: 'unavailable',
+          arrived: null, departed: null, served: null, net: null,
           unavailable_reason: reason }],
       }),
     });
@@ -601,24 +575,6 @@ test.describe('the marshalling station — every control', () => {
     await expect(waitsTable(page).getByRole('link', { name: 'Teach the dock to breathe' })).toBeVisible();
   });
 
-  test("the HUD's machine link selects the machine's region on the Department Map", async ({ page }) => {
-    // A selection since car N1 of design e765b3fc — here, the station
-    // already selected, so the panel stays where it is.
-    await install(page);
-    await mountPage(page, PATH, TITLE);
-    const link = page.locator('section[data-hud] .hud-listed a');
-    await expect(link).toHaveCount(1);
-    await expect(link).toHaveText('failed · marshalling · sign-off station');
-    await expect(link).toHaveAttribute('href', regionHref('marshalling'));
-    await expect(link).toHaveAttribute('title', 'over its bound');
-    await link.click();
-    await expect(page).toHaveURL(/\/it\?at=marshalling$/);
-    await expect(page.getByRole('heading', { level: 1 })).toHaveText('Department Map');
-    await expect(page.locator('section[data-map-panel]')).toHaveAttribute('data-selection', 'marshalling');
-    await page.goBack();
-    await expect(page).toHaveURL(AT_PATH);
-  });
-
   test('each window button re-reads the board over its window, says it is pressed, and judges in its hours', async ({ page }) => {
     const counts = await install(page);
     await mountPage(page, PATH, TITLE);
@@ -718,7 +674,9 @@ test.describe('the marshalling station — every control', () => {
     for (const label of ['3 d', '7 d', '24 h']) {
       await board(page).locator('.my-controls button', { hasText: label }).click();
     }
-    await expect.poll(() => counts.load).toBe(4);
+    // The board's first read and one per window pressed, and the tree
+    // floor's own one read of the load (R3, backlog 23a4b4d7).
+    await expect.poll(() => counts.load).toBe(5);
     await panel(page).locator('a[data-close]').click();
     await expect(page).toHaveURL(/\/it$/);
     expect(writes).toEqual([]);
@@ -818,24 +776,16 @@ test.describe('the marshalling station — the empty leg and every failure line'
     await expect(sidingRows(page)).toHaveCount(3);
   });
 
-  test('a failed regions read leaves the station board unknown, preserving the HUD failure', async ({ page }) => {
+  test('a failed regions read leaves the station board unknown, and the alarms board says the read failed', async ({ page }) => {
     await install(page, { regions: (r) => json(r, 'down', 500) });
     await mountPage(page, PATH, TITLE);
-    await expect(page.locator('.yard-empty.load-failed').first()).toHaveText('The regions cannot be read — /api/yard/regions: HTTP 500');
-    await expect(page.locator('section[data-hud] .hud-age')).toHaveText(/^read failed \d\d:\d\dZ · no good read yet$/);
-    // The station's panel opens on its name, its readings said unread
-    // (car N3) — the floor page it replaced drew its board regardless.
-    await expect(panel(page)).toHaveAttribute('data-state', 'unknown');
-    await expect(panel(page)).toContainText('Its readings come with the regions read, which failed');
+    await expect(page.locator('[data-alarms-failed]')).toContainText('/api/yard/regions: HTTP 500');
+    // The station's panel still opens and its board reads its own
+    // endpoints (car N3); only its membership, from the regions read, is
+    // said to be unknown.
+    await expect(panel(page)).toBeVisible();
     await expect(board(page).locator('.load-failed')).toContainText('The marshalling station membership is unknown: /api/yard/regions: HTTP 500');
     await expect(board(page).locator('.my-constraint')).toHaveCount(0);
-  });
-
-  test('a failed borders read is said, and the panel says its rails are unread', async ({ page }) => {
-    await install(page, { borders: (r) => json(r, 'down', 500) });
-    await mountPage(page, PATH, TITLE);
-    await expect(page.locator('.yard-empty.load-failed')).toHaveText('The borders cannot be read — /api/yard/borders: HTTP 500');
-    await expect(board(page).locator('.my-constraint-name')).toHaveText('q.platform-admin.sign-off');
   });
 
   test('a failed station load is said on the board, never as a clear yard', async ({ page }) => {

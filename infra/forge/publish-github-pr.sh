@@ -754,7 +754,7 @@ if [ "${1:-}" = "--measure" ]; then
     #    open one is the one.
     #    Every read in this script carries the machine token as its
     #    writes do (backlog 44b2087e): four of them did not.
-    if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
+    if ! curl -q -fsS -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} \
             "$BASE/api/jobs?kind=publish-to-github&status=open&limit=20" > "$workdir/jobs" 2>"$workdir/err"; then
         fail "jobs API unreachable at $BASE — $(cat "$workdir/err")"
@@ -779,8 +779,8 @@ if [ "${1:-}" = "--measure" ]; then
     mirror_head=$(g rev-parse refs/remotes/mirror/main)
     ahead=$(g rev-list --count refs/remotes/mirror/main..refs/remotes/forge/main)
     behind=$(g rev-list --count refs/remotes/forge/main..refs/remotes/mirror/main)
-    g diff --name-only refs/remotes/mirror/main refs/remotes/forge/main > "$workdir/changed"
-    g diff --name-only --diff-filter=A refs/remotes/mirror/main refs/remotes/forge/main > "$workdir/new-files"
+    g diff --no-renames --name-only refs/remotes/mirror/main refs/remotes/forge/main > "$workdir/changed"
+    g diff --no-renames --name-only --diff-filter=A refs/remotes/mirror/main refs/remotes/forge/main > "$workdir/new-files"
     files=$(grep -c . "$workdir/changed" || true)
     new_count=$(grep -c . "$workdir/new-files" || true)
     # The newly-public files a reviewer is asked to look at by name:
@@ -854,7 +854,7 @@ if [ "${1:-}" = "--measure" ]; then
             measured_at: $ts, measured_by: "publish-github-pr --measure"},
          drift_refreshed_at: $ts}' > "$workdir/refresh" \
         || fail "the refresh could not be rendered as JSON"
-    if ! curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+    if ! curl -q -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} \
             --data-binary @"$workdir/refresh" \
             "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err"; then
@@ -869,7 +869,7 @@ if [ "${1:-}" = "--measure" ]; then
     # non-zero, so a daily rule reported FAILED on runs that had done
     # their work (ops-request 9340fd6e). A permanently-red check is one
     # nobody reads; a silently-vacuous one is worse.
-    if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
+    if ! curl -q -fsS -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} \
             "$BASE/api/jobs/$job_id" > "$workdir/readback" 2>"$workdir/err"; then
         fail "the refresh for ${job_id:0:8} was accepted but the packet could not be read back — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
@@ -909,7 +909,7 @@ take_publish_lock refuse BOSS_PUBLISH_LOCK_WAIT
 # 1. The packet. One mirror, one open publish packet (149's guard), and
 #    the step this run is for — open-pr for a publish, merge for --merge —
 #    must be ready or active: a rule fired on readiness.
-if ! curl -fsS -H "x-boss-user: $BOSS_USER" \
+if ! curl -q -fsS -H "x-boss-user: $BOSS_USER" \
         ${MT_HDR:+-H "$MT_HDR"} \
         "$BASE/api/jobs?kind=publish-to-github&status=open&limit=20&full=true" > "$workdir/jobs" 2> "$workdir/err"; then
     fail "jobs API unreachable at $BASE — $(cat "$workdir/err")"
@@ -925,7 +925,7 @@ SETTLE_CONTAINED=0
 if [ "$MODE" = merge ]; then
     [[ ${OPS_REQUEST_ID:-} =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
         || refuse "OPS_REQUEST_ID ('${OPS_REQUEST_ID:0:40}') names no ops-request, so which publish this merge was filed for cannot be read; nothing was merged"
-    curl -fsS -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} \
+    curl -q -fsS -H "x-boss-user: $BOSS_USER" ${MT_HDR:+-H "$MT_HDR"} \
             "$BASE/api/jobs/$OPS_REQUEST_ID" > "$workdir/request" 2> "$workdir/err" \
         || fail "reading request ${OPS_REQUEST_ID:0:8} from $BASE failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); nothing was merged"
     for_publish=$(jq -r '(if type == "object" and has("data") then .data else . end)
@@ -1432,7 +1432,7 @@ if [ "$MODE" = merge ]; then
     #     answer here gates a push the git side re-checks (the push below
     #     is a plain fast-forward to this exact sha).
     gh_public() {
-        curl -fsS --connect-timeout 10 --max-time 30 -H "accept: application/vnd.github+json" "$GITHUB_API/repos/$MIRROR_SLUG/$1" > "$2" 2>"$workdir/err"
+        curl -q -fsS --connect-timeout 10 --max-time 30 -H "accept: application/vnd.github+json" "$GITHUB_API/repos/$MIRROR_SLUG/$1" > "$2" 2>"$workdir/err"
     }
     gh_public "pulls/$pr_n" "$workdir/pull" \
         || fail "GitHub did not answer for $pr_url — $(head -c 300 "$workdir/err" | tr '\n' ' '); nothing was merged"
@@ -1680,7 +1680,7 @@ if [ "$MODE" = merge ]; then
         '{pr_state: {pr_url: $url, number, state, merged: (.merged == true), merged_at, closed_at,
                      read_at: $ts, read_by: "publish-github-pr --merge"}}' "$workdir/pull-after" > "$workdir/pr-state" \
         || fail "main carries $snapshot and $pr_url is merged, but its state could not be rendered for ${job_id:0:8}"
-    curl -fsS --max-time "$SOR_WRITE_MAX_S" -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+    curl -q -fsS --max-time "$SOR_WRITE_MAX_S" -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} --data-binary @"$workdir/pr-state" \
             "$BASE/api/jobs/$job_id/metadata" > /dev/null 2>"$workdir/err" \
         || fail "main carries $snapshot and $pr_url is merged, but writing pr_state onto ${job_id:0:8} failed — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
@@ -1706,11 +1706,11 @@ if [ "$MODE" = merge ]; then
                original_open_pr_receipt: $original_open_pr.original_open_pr_receipt} else {} end)' \
         > "$workdir/payload"
     printf '%s\n' '{"status":"completed"}' > "$workdir/done"
-    curl -fsS --max-time "$SOR_WRITE_MAX_S" -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+    curl -q -fsS --max-time "$SOR_WRITE_MAX_S" -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} --data-binary @"$workdir/payload" \
             "$BASE/api/jobs/$job_id/steps/$step_id/metadata" > /dev/null 2>"$workdir/err" \
         || fail "main carries $snapshot and $pr_url is merged, but recording it on merge (${job_id:0:8}) failed — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
-    curl -fsS --max-time "$SOR_WRITE_MAX_S" -X PUT -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+    curl -q -fsS --max-time "$SOR_WRITE_MAX_S" -X PUT -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} --data-binary @"$workdir/done" \
             "$BASE/api/jobs/$job_id/steps/$step_id" > /dev/null 2>"$workdir/err" \
         || fail "main carries $snapshot and $pr_url is merged and recorded on merge, but completing merge on ${job_id:0:8} failed — $(head -c 300 "$workdir/err" | tr '\n' ' ')"
@@ -1939,7 +1939,7 @@ fi
 # but this one's, as {job, url, owner, branch, source}. A limit is not a
 # filter — a PR or branch only an unread packet recorded is KEPT, and
 # the run says how many packets it did not read.
-curl -fsS -H "x-boss-user: $BOSS_USER" \
+curl -q -fsS -H "x-boss-user: $BOSS_USER" \
         ${MT_HDR:+-H "$MT_HDR"} \
         "$BASE/api/jobs?kind=publish-to-github&limit=60&full=true" > "$workdir/published" 2>"$workdir/err" \
     || fail "jobs API unreachable at $BASE while reading which packets recorded which PRs — $(cat "$workdir/err"); the PR is open at $pr_url, nothing older was closed and nothing pruned; open-pr on ${job_id:0:8} stays ready"
@@ -2004,7 +2004,7 @@ while IFS= read -r row; do
     jq -n --arg old "$old_url" --arg new "$pr_url" --arg job "$job_id" --arg ts "$ts" \
         '{pr_superseded: {pr_url: $old, by_pr_url: $new, by_packet: $job, at: $ts,
                           by: "publish-github-pr"}}' > "$workdir/sup"
-    curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+    curl -q -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} \
             --data-binary @"$workdir/sup" \
             "$BASE/api/jobs/$old_job/metadata" > /dev/null 2>"$workdir/err" \
@@ -2036,7 +2036,7 @@ while IFS= read -r row; do
          superseded_by: $job,
          supersession_translation: "\($url) (\($head)) was closed on GitHub by publish-github-pr at \($ts) as superseded by \($new), which publish \($job) opened from forge commit \($src). That commit contains \($old_src), the commit \($url) published, so \($new) carries every change \($url) carried."}' \
         "$workdir/closed" > "$workdir/pr-state"
-    curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+    curl -q -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
             ${MT_HDR:+-H "$MT_HDR"} \
             --data-binary @"$workdir/pr-state" \
             "$BASE/api/jobs/$old_job/metadata" > /dev/null 2>"$workdir/err" \
@@ -2225,13 +2225,13 @@ jq -n -c --arg url "$pr_url" --arg snap "$snapshot" \
      pruned_branches: ($pruned | lines), prune_kept: ($kept | lines)}' \
     > "$workdir/payload"
 printf '%s\n' '{"status":"completed"}' > "$workdir/done"
-if ! curl -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+if ! curl -q -fsS -X PATCH -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
         ${MT_HDR:+-H "$MT_HDR"} \
         --data-binary @"$workdir/payload" \
         "$BASE/api/jobs/$job_id/steps/$step_id/metadata" > /dev/null 2>"$workdir/err"; then
     fail "the PR is open at $pr_url but recording it on open-pr (${job_id:0:8}) failed — $(head -c 300 "$workdir/err" | tr '\n' ' '); record pr_url on the step by hand"
 fi
-if ! curl -fsS -X PUT -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
+if ! curl -q -fsS -X PUT -H "content-type: application/json" -H "x-boss-user: $BOSS_USER" \
         ${MT_HDR:+-H "$MT_HDR"} \
         --data-binary @"$workdir/done" \
         "$BASE/api/jobs/$job_id/steps/$step_id" > /dev/null 2>"$workdir/err"; then

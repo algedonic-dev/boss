@@ -5,3 +5,5 @@
 id = "automation:train-conductor"
 role = "platform-admin"
 description = 'The delivery pipeline conductor: boards cars, opens trains, reconciles them to merge and converge (boss train verbs, in-cluster).'
+# Host station: loading-dock (backlog 6ecb5480, station-tree.md section 6).
+station = "22b829b6-30d0-42b4-acf4-85617326aa89"

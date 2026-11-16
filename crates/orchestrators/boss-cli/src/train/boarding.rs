@@ -199,6 +199,53 @@ pub(crate) fn next_left_behind_count(car: &Value) -> u64 {
         .saturating_add(1)
 }
 
+/// The car's own history of the departures that left it behind, oldest
+/// first: `[{train, reason, at, n}]` (backlog d528c059). The streak above
+/// ends on a re-park and counts only the dock's holds; this is never
+/// cleared and takes every reason — a merged car's whole wait, one read.
+/// Until it existed the history lived only on the trains, keyed by an
+/// 8-character prefix: measured 2026-10-15, merged cars left behind 13-20
+/// times, re-gated cars waiting a median 149 min dock-to-merge against
+/// 42, and each car's story needed all 780 trains of the month.
+pub(crate) const LEFT_BEHIND_HISTORY: &str = "left_behind_history";
+
+/// How many entries a car keeps. The ordinal `n` is not bounded, so the
+/// newest entry still states the car's total once the oldest have gone —
+/// and a dropped entry is a copy: its train keeps it in `left_behind`.
+pub(crate) const LEFT_BEHIND_HISTORY_KEEP: usize = 50;
+
+/// One car on a train's `left_behind` list. It names the car IN FULL
+/// beside the short id every reader already draws, so the departure can
+/// find the car to append to — and so can anyone reading the train.
+pub(crate) fn left_behind_entry(jid: &str, reason: &str) -> Value {
+    json!({"car_id": jid, "car_id_short": id8(jid), "reason": reason})
+}
+
+/// PURE: the car's history with one more departure appended — the value
+/// to write as [`LEFT_BEHIND_HISTORY`]. A stored value that is not a list
+/// reads as none, as a streak count that is not a number does.
+pub(crate) fn left_behind_history_write(
+    car: &Value,
+    train: &str,
+    reason: &str,
+    at: DateTime<Utc>,
+) -> Value {
+    let mut rows = car
+        .pointer(&format!("/metadata/{LEFT_BEHIND_HISTORY}"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let n = rows
+        .last()
+        .and_then(|r| r.get("n"))
+        .and_then(Value::as_u64)
+        .unwrap_or(rows.len() as u64)
+        .saturating_add(1);
+    rows.push(json!({"train": train, "reason": reason, "at": at.to_rfc3339(), "n": n}));
+    let drop = rows.len().saturating_sub(LEFT_BEHIND_HISTORY_KEEP);
+    Value::Array(rows.split_off(drop))
+}
+
 /// PURE: is an alarm owed for a car left behind `skips` trains in a row?
 /// Once per streak — not when the car already names one.
 pub(crate) fn left_behind_alarm_due(car: &Value, skips: u64) -> bool {
@@ -1106,6 +1153,57 @@ mod repetition_tests {
             let car = json!({"metadata": {LEFT_BEHIND_TRAINS: stamp}});
             assert_eq!(next_left_behind_count(&car), 1);
         }
+    }
+
+    /// Backlog d528c059: the car keeps its OWN history of the departures
+    /// that left it — train, reason, time and an ordinal — so one car's
+    /// past is one read rather than every train's `left_behind`. The
+    /// entry the train keeps names the car in full, which is how the
+    /// departure finds the car to write.
+    #[test]
+    fn a_left_behind_car_keeps_every_departure_in_order() {
+        let entry = left_behind_entry("0123456789abcdef", "branch feat/a is on neither remote");
+        assert_eq!(entry["car_id"], "0123456789abcdef");
+        assert_eq!(entry["car_id_short"], "01234567");
+        assert_eq!(entry["reason"], "branch feat/a is on neither remote");
+
+        let at = DateTime::parse_from_rfc3339("2026-10-18T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let first = left_behind_history_write(&json!({"metadata": {}}), "train-1", "why 1", at);
+        assert_eq!(
+            first,
+            json!([{"train": "train-1", "reason": "why 1",
+                    "at": "2026-10-18T12:00:00+00:00", "n": 1}])
+        );
+        let car = json!({"metadata": {LEFT_BEHIND_HISTORY: first}});
+        let second = left_behind_history_write(&car, "train-2", "why 2", at);
+        assert_eq!(second.as_array().map(Vec::len), Some(2));
+        assert_eq!(second[0]["train"], "train-1", "the earlier entry is kept");
+        assert_eq!(second[1]["train"], "train-2");
+        assert_eq!(second[1]["n"], 2);
+
+        // A re-park does not end it: unlike the streak, the history is
+        // the car's whole past. Its length is bounded; the ordinal is not,
+        // so the newest entry's `n` is the car's total even once the
+        // oldest entries have gone (each still on its own train).
+        let full: Vec<Value> = (1..=LEFT_BEHIND_HISTORY_KEEP as u64)
+            .map(|n| json!({"train": format!("t{n}"), "reason": "r", "at": "a", "n": n}))
+            .collect();
+        let car = json!({"metadata": {LEFT_BEHIND_HISTORY: full}});
+        let capped = left_behind_history_write(&car, "t-next", "r", at);
+        let rows = capped.as_array().cloned().unwrap_or_default();
+        assert_eq!(rows.len(), LEFT_BEHIND_HISTORY_KEEP);
+        assert_eq!(rows[0]["train"], "t2", "the oldest entry gives way");
+        assert_eq!(
+            rows[LEFT_BEHIND_HISTORY_KEEP - 1]["n"],
+            LEFT_BEHIND_HISTORY_KEEP as u64 + 1
+        );
+
+        // A history that is not a list reads as none, as a count that is
+        // not a number does.
+        let junk = json!({"metadata": {LEFT_BEHIND_HISTORY: "lots"}});
+        assert_eq!(left_behind_history_write(&junk, "t", "r", at)[0]["n"], 1);
     }
 
     /// The re-review of car 5eb1967e, C: a car assembly refused was not

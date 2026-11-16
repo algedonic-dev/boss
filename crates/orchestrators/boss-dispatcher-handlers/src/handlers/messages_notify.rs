@@ -90,7 +90,13 @@ impl MessagesNotify {
         recipient: &str,
         rule_name: &str,
     ) -> Result<bool, HandlerError> {
-        if recipient.starts_with("automation:") {
+        // An automaton by the one mapping (backlog 8e8d0b1a): the
+        // automation: ids, the legacy bare rule: id and the platform. A
+        // robot is never guessed here; the registry below decides it.
+        if recipient
+            .parse::<boss_core::actor::ActorId>()
+            .is_ok_and(|a| a.executor_kind() == boss_core::actor::ExecutorKind::Automaton)
+        {
             return Ok(true);
         }
         let url = format!("{}/api/agents", self.jobs_base.trim_end_matches('/'));

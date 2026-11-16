@@ -466,7 +466,7 @@
     border-radius: 999px;
     padding: 2px 4px 2px 10px;
     color: var(--signal);
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono);
     font-size: 0.72rem;
   }
   .dx-chip-x {

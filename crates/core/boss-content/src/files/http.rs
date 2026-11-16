@@ -1,7 +1,9 @@
 //! HTTP surface for file references.
 //!
 //! Lives behind boss-content-api. Routes:
-//! - POST   /api/files            — multipart upload
+//! - POST   /api/files            — multipart upload (201 a new row; 200
+//!   the live row this target already holds for the identical bytes,
+//!   verified — `reuse_presented`, backlog e5490f2e)
 //! - GET    /api/files            — list for a (target_kind, target_id)
 //! - GET    /api/files/{id}       — download bytes
 //! - DELETE /api/files/{id}       — soft-delete (event + row, bytes
@@ -294,7 +296,7 @@ async fn upload(
     let object_key = format!("sha256/{sha}");
     let size_bytes = bytes.len() as i64;
 
-    if let Err(e) = state.storage.put(&object_key, bytes, &mt).await {
+    if let Err(e) = state.storage.put(&object_key, bytes.clone(), &mt).await {
         return err(e);
     }
 
@@ -319,16 +321,91 @@ async fn upload(
 
     match state.repo.insert(draft.clone(), &stamp).await {
         Ok(row) => (StatusCode::CREATED, Json(row)).into_response(),
+        // The table holds one row per (bucket, object_key). This caller
+        // presented the bytes and the door hashed them itself, so if the
+        // row it collided with is a live attachment on the very target
+        // it just passed Update for, it already holds that attachment:
+        // answer the row instead of a conflict (backlog e5490f2e).
+        Err(FileError::DuplicateObject(_)) => reuse_presented(&state, &user, &draft).await,
         Err(e) => {
-            // Row insert failed after bytes wrote — this is the
-            // duplicate-object-key case (concurrent upload of the
-            // same sha) or a transient repo error. Either way the
-            // bytes are dedup-safe (same content => same key) so we
-            // do NOT delete the object on this failure path; another
-            // live ref might be using it. Just surface the error.
+            // Row insert failed after bytes wrote — a transient repo
+            // error. The bytes are dedup-safe (same content => same
+            // key) so we do NOT delete the object on this failure path;
+            // another live ref might be using it. Just surface the error.
             err(e)
         }
     }
+}
+
+/// The answer to an upload whose bytes the store already holds as a row:
+/// that row, 200 rather than 201, when the caller holds it already — else
+/// the conflict, naming nothing but the digest the caller computed.
+///
+/// WHY (backlog e5490f2e, measured 2026-10-15). A second supported
+/// dispatch of the same 1,010,152-byte brief to the same packet failed
+/// before run admission at POST /api/files -> 409 <digest>: the table is
+/// UNIQUE (bucket, object_key) and the door answered an identical upload
+/// as a conflict, so a retry, or a dispatch whose first response was
+/// lost, could never be admitted. A digest in a 409 is not a receipt, so
+/// the callers could not safely make one of it.
+///
+/// THE BOUNDARY. A reuse is a reference to content the caller ALREADY
+/// HOLDS: it presented every byte, which this door hashed itself — the
+/// `_finalize` path, which takes a caller's hash at face value, never
+/// reaches here. And it is answered only when the row is
+///   - live (a detached row's download answers 410),
+///   - on the SAME target this upload named and passed Update for — a row
+///     elsewhere is under a scope this request's policy check never saw,
+///     so neither its id nor its metadata is answered,
+///   - of the presented size and digest, in this deployment's bucket,
+///   - readable by this caller (Read on the target, as a download asks),
+///   - and served back by storage as bytes that re-hash to the row.
+///
+/// It writes nothing and emits nothing — no state changed — so the row
+/// keeps its original `uploaded_by` and its one `content.file.attached`
+/// event: the record says who attached it, and when, once.
+async fn reuse_presented(
+    state: &FilesApiState,
+    user: &boss_policy_client::User,
+    presented: &FileRefDraft,
+) -> Response {
+    let no_reuse = || {
+        (
+            StatusCode::CONFLICT,
+            format!(
+                "duplicate object_key for sha256 {}: these bytes are already held by an \
+                 attachment this upload may not reuse — a reuse answers only a live attachment \
+                 on the target named, whose stored bytes verify",
+                presented.sha256
+            ),
+        )
+            .into_response()
+    };
+    let rows = match state.repo.list_for_sha256(&presented.sha256).await {
+        Ok(rows) => rows,
+        Err(e) => return err(e),
+    };
+    let Some(row) = rows.into_iter().find(|r| {
+        r.deleted_at.is_none()
+            && r.bucket == presented.bucket
+            && r.object_key == presented.object_key
+            && r.target == presented.target
+            && r.sha256 == presented.sha256
+            && r.size_bytes == presented.size_bytes
+    }) else {
+        return no_reuse();
+    };
+    if let Err(resp) = check_policy(state, user, Access::Read, &row.target).await {
+        return resp;
+    }
+    match state.storage.get(&row.object_key).await {
+        Ok(stored)
+            if stored.len() as i64 == row.size_bytes
+                && hex::encode(Sha256::digest(&stored)) == row.sha256 => {}
+        Ok(_) | Err(FileError::NotFound(_)) => return no_reuse(),
+        Err(e) => return err(e),
+    }
+    (StatusCode::OK, Json(row)).into_response()
 }
 
 async fn download(
@@ -786,5 +863,317 @@ mod tests {
     #[test]
     fn the_declared_limit_is_the_two_mebibytes_the_door_already_enforced() {
         assert_eq!(UPLOAD_BODY_LIMIT_BYTES, 2_097_152);
+    }
+
+    // ---- Reuse of a verified identical attachment (backlog e5490f2e) ----
+    //
+    // Measured 2026-10-15: a second supported dispatch of the same
+    // 1,010,152-byte brief to the same packet failed BEFORE run admission
+    // at POST /api/files -> 409 <digest>, because the table holds one row
+    // per (bucket, object_key) and the door answered the second identical
+    // upload as a conflict. The tests below hold the door to the boundary
+    // the fix keeps: a reuse is answered only to a caller who PRESENTED
+    // the identical bytes, to the same target it may update and read,
+    // and only after the stored bytes re-hash to the row.
+
+    use boss_policy_client::{Action, Decision, Predicate, Resource, Scope, User};
+
+    fn user_header(id: &str) -> String {
+        format!(r#"{{"id":"{id}","role":"platform-admin","access_tier":"operator"}}"#)
+    }
+
+    fn upload_body(target_id: &str, filename: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"target_kind\"\r\n\r\njob\r\n\
+             --{BOUNDARY}\r\nContent-Disposition: form-data; name=\"target_id\"\r\n\r\n{target_id}\r\n\
+             --{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+             Content-Type: text/plain\r\n\r\n"
+        )
+        .into_bytes();
+        out.extend_from_slice(bytes);
+        out.extend(format!("\r\n--{BOUNDARY}--\r\n").into_bytes());
+        out
+    }
+
+    struct Store {
+        repo: Arc<InMemoryFileRepository>,
+        storage: Arc<dyn FileStorage>,
+        app: Router,
+    }
+
+    fn store_with(storage: Arc<dyn FileStorage>, policy: Arc<dyn PolicyClient>) -> Store {
+        let repo = Arc::new(InMemoryFileRepository::new());
+        let app = router(FilesApiState {
+            repo: repo.clone(),
+            storage: storage.clone(),
+            publisher: None,
+            policy,
+            bucket: "test".into(),
+            #[cfg(feature = "postgres")]
+            pool: None,
+            clock: Arc::new(boss_clock_client::WallClockClient),
+        });
+        Store { repo, storage, app }
+    }
+
+    fn store() -> Store {
+        store_with(
+            Arc::new(InMemoryFileStorage::new()),
+            Arc::new(boss_policy_client::PermissivePolicyClient),
+        )
+    }
+
+    async fn send(app: &Router, req: Request<Body>) -> (StatusCode, String) {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn upload_as(
+        app: &Router,
+        actor: &str,
+        target_id: &str,
+        filename: &str,
+        bytes: &[u8],
+    ) -> (StatusCode, String) {
+        let req = Request::post("/api/files")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .header("x-boss-user", user_header(actor))
+            .body(Body::from(upload_body(target_id, filename, bytes)))
+            .unwrap();
+        send(app, req).await
+    }
+
+    fn row_of(body: &str) -> FileRef {
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("not a row ({e}): {body}"))
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    const BRIEF: &[u8] = b"the complete dispatch brief, byte for byte\r\n\0";
+
+    /// The measured case: the same bytes to the same packet a second
+    /// time — a retried dispatch, or one whose first response was lost.
+    /// The second answer is the FIRST row, 200 rather than 201, with the
+    /// first uploader still on it: a reuse writes nothing, so nothing in
+    /// the record is re-attributed to the second caller.
+    #[tokio::test]
+    async fn an_identical_upload_to_the_same_target_answers_the_live_row_it_already_has() {
+        let s = store();
+        let (first, body) = upload_as(&s.app, "agent-first", "job-1", "a.txt", BRIEF).await;
+        assert_eq!(first, StatusCode::CREATED, "{body}");
+        let original = row_of(&body);
+
+        let (again, body) = upload_as(&s.app, "agent-second", "job-1", "b.txt", BRIEF).await;
+        assert_eq!(again, StatusCode::OK, "a verified reuse, not a 409: {body}");
+        let reused = row_of(&body);
+        assert_eq!(reused, original, "the same row, attribution included");
+        assert_eq!(reused.uploaded_by, "agent-first");
+
+        let rows = s.repo.list_for_sha256(&digest(BRIEF)).await.unwrap();
+        assert_eq!(rows.len(), 1, "one durable row");
+    }
+
+    /// The same bytes to ANOTHER target are not a reuse: the row the
+    /// store holds is attached somewhere the caller did not name, and
+    /// answering it would hand them a reference (and its metadata) under
+    /// a scope their policy check never saw. Still the conflict, and the
+    /// body names nothing but the digest the caller computed itself.
+    #[tokio::test]
+    async fn identical_bytes_to_another_target_get_no_reuse_and_learn_no_row() {
+        let s = store();
+        let (_, body) = upload_as(&s.app, "agent-a", "job-tenant-a", "a.txt", BRIEF).await;
+        let original = row_of(&body);
+        let (status, body) = upload_as(&s.app, "agent-b", "job-tenant-b", "a.txt", BRIEF).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(!body.contains(&original.id.to_string()), "{body}");
+        assert!(
+            !body.contains("job-tenant-a") && !body.contains("agent-a"),
+            "{body}"
+        );
+        let b = ResourceRef {
+            kind: ResourceKind::Job,
+            id: "job-tenant-b".into(),
+        };
+        assert!(s.repo.list_for(&b).await.unwrap().is_empty());
+    }
+
+    /// `_finalize` takes the caller's sha256 at face value — it presents
+    /// a HASH, never the bytes. A hash is not possession, so it earns no
+    /// reuse even on the very target the original sits on, and the
+    /// answer carries no row.
+    #[tokio::test]
+    async fn a_hash_alone_through_finalize_gets_no_reuse() {
+        let s = store();
+        let (_, body) = upload_as(&s.app, "agent-a", "job-1", "a.txt", BRIEF).await;
+        let original = row_of(&body);
+        for target in ["job-1", "job-other"] {
+            let finalize = serde_json::json!({
+                "file_id": Uuid::new_v4(),
+                "target_kind": "job",
+                "target_id": target,
+                "sha256": digest(BRIEF),
+                "size_bytes": BRIEF.len(),
+                "mime": "text/plain",
+                "filename": "claimed.txt",
+            });
+            let req = Request::post("/api/files/_finalize")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-boss-user", user_header("agent-hash-only"))
+                .body(Body::from(finalize.to_string()))
+                .unwrap();
+            let (status, body) = send(&s.app, req).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{target}: {body}");
+            assert!(!body.contains(&original.id.to_string()), "{body}");
+        }
+        assert_eq!(
+            s.repo.list_for_sha256(&digest(BRIEF)).await.unwrap().len(),
+            1
+        );
+    }
+
+    /// A detached attachment is not live: answering it would hand back a
+    /// reference whose download answers 410.
+    #[tokio::test]
+    async fn a_detached_attachment_is_not_reused() {
+        let s = store();
+        let (_, body) = upload_as(&s.app, "agent-a", "job-1", "a.txt", BRIEF).await;
+        let original = row_of(&body);
+        let del = Request::delete(format!("/api/files/{}", original.id))
+            .header("x-boss-user", user_header("agent-a"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&s.app, del).await.0, StatusCode::NO_CONTENT);
+        let (status, body) = upload_as(&s.app, "agent-a", "job-1", "a.txt", BRIEF).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(!body.contains(&original.id.to_string()), "{body}");
+    }
+
+    /// Allows every Update and denies every Read: a caller who may attach
+    /// to a target but not read it.
+    struct WriteOnly;
+
+    #[async_trait::async_trait]
+    impl PolicyClient for WriteOnly {
+        async fn check(
+            &self,
+            _user: &User,
+            action: Action,
+            _resource: Resource,
+        ) -> Result<Decision, boss_policy_client::PolicyClientError> {
+            Ok(match action {
+                Action::Read => Decision::Deny {
+                    reason: "write-only test caller".into(),
+                },
+                _ => Decision::Allow { scope: Scope::All },
+            })
+        }
+
+        async fn scope_predicate(
+            &self,
+            _user: &User,
+            _resource: Resource,
+        ) -> Result<Predicate, boss_policy_client::PolicyClientError> {
+            Ok(Predicate::None)
+        }
+    }
+
+    /// A reuse hands the caller a reference it will READ, so it asks Read
+    /// on the row's target, as a download would — a caller who may only
+    /// write gets the refusal, never the row.
+    #[tokio::test]
+    async fn a_reuse_asks_read_on_the_target_and_a_denial_answers_no_row() {
+        let s = store_with(Arc::new(InMemoryFileStorage::new()), Arc::new(WriteOnly));
+        let (first, body) = upload_as(&s.app, "agent-a", "job-1", "a.txt", BRIEF).await;
+        assert_eq!(first, StatusCode::CREATED, "{body}");
+        let original = row_of(&body);
+        let (status, body) = upload_as(&s.app, "agent-a", "job-1", "a.txt", BRIEF).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(!body.contains(&original.id.to_string()), "{body}");
+    }
+
+    /// Concurrent identical uploads to one target: one row is created and
+    /// every other caller is answered that same row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_identical_uploads_answer_one_durable_row() {
+        let s = store();
+        let calls = (0..8).map(|i| {
+            let app = s.app.clone();
+            tokio::spawn(async move {
+                upload_as(&app, &format!("agent-{i}"), "job-1", "a.txt", BRIEF).await
+            })
+        });
+        let mut created = 0;
+        let mut ids = std::collections::BTreeSet::new();
+        for call in calls.collect::<Vec<_>>() {
+            let (status, body) = call.await.unwrap();
+            match status {
+                StatusCode::CREATED => created += 1,
+                StatusCode::OK => {}
+                other => panic!("{other}: {body}"),
+            }
+            ids.insert(row_of(&body).id);
+        }
+        assert_eq!(created, 1);
+        assert_eq!(ids.len(), 1, "every caller holds the one row");
+        assert_eq!(
+            s.repo.list_for_sha256(&digest(BRIEF)).await.unwrap().len(),
+            1
+        );
+    }
+
+    /// Bytes the store serves that no longer hash to the row: the row is
+    /// a claim, and a claim the bytes contradict is not reused.
+    struct Tampered(InMemoryFileStorage);
+
+    #[async_trait::async_trait]
+    impl FileStorage for Tampered {
+        async fn put(&self, key: &str, bytes: Bytes, mime: &str) -> Result<(), FileError> {
+            self.0.put(key, bytes, mime).await
+        }
+        async fn get(&self, _key: &str) -> Result<Bytes, FileError> {
+            Ok(Bytes::from_static(b"other bytes"))
+        }
+        async fn delete(&self, key: &str) -> Result<(), FileError> {
+            self.0.delete(key).await
+        }
+        async fn sign_get_url(&self, key: &str, ttl: Duration) -> Result<String, FileError> {
+            self.0.sign_get_url(key, ttl).await
+        }
+        async fn sign_put_url(
+            &self,
+            key: &str,
+            mime: &str,
+            ttl: Duration,
+        ) -> Result<String, FileError> {
+            self.0.sign_put_url(key, mime, ttl).await
+        }
+        async fn head(&self, key: &str) -> Result<u64, FileError> {
+            self.0.head(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stored_object_that_does_not_re_hash_to_its_row_is_not_reused() {
+        let s = store_with(
+            Arc::new(Tampered(InMemoryFileStorage::new())),
+            Arc::new(boss_policy_client::PermissivePolicyClient),
+        );
+        let (first, body) = upload_as(&s.app, "agent-a", "job-1", "a.txt", BRIEF).await;
+        assert_eq!(first, StatusCode::CREATED, "{body}");
+        let original = row_of(&body);
+        let (status, body) = upload_as(&s.app, "agent-a", "job-1", "a.txt", BRIEF).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(!body.contains(&original.id.to_string()), "{body}");
+        assert!(s.storage.head(&original.object_key).await.is_ok());
     }
 }

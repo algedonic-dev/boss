@@ -133,8 +133,8 @@ test.describe('/ux/exec — the executive overview', () => {
     await expect(page.locator('section.exec-card')).toHaveCount(5);
     const links: ReadonlyArray<readonly [string, string, string]> = [
       ['Waiting on you', 'Open My Day →', '/ux/me'],
-      ['Revenue mix', 'Open income statement →', '/ux/finance?tab=income-statement'],
-      ['Cash & receivables', 'Open balance sheet →', '/ux/finance?tab=balance-sheet'],
+      ['Revenue mix', 'Open income statement →', '/finance?tab=income-statement'],
+      ['Cash & receivables', 'Open balance sheet →', '/finance?tab=balance-sheet'],
       ['Active jobs', 'View all jobs →', '/ux/jobs'],
       ['Executive work', 'Open the Executive department →', departmentJobsPath('executive')],
     ];

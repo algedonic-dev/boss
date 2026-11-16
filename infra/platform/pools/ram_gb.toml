@@ -1,0 +1,10 @@
+# v2 (backlog 84f570a1): `capacity_from` says where the capacity number
+# comes from, for the console to show beside it (station-tree.md section 3).
+[[pool]]
+name = "ram_gb"
+version = 2
+status = "active"
+unit = "GiB"
+kind = "flow"
+capacity = { state = "unknown" }
+capacity_from = 'Unknown, and not a constraint: one memory pool summed across boxes is a HUD number (station-tree.md section 3); the memory of a box rides on its estate node row (infra/estate/estate.toml memory_gb), beside its host:<node> pool.'

@@ -9,8 +9,9 @@
 //! Properties pinned:
 //! - the door is operator machinery: a guest and a user-tier session
 //!   are refused and nothing lands;
-//! - a declaration lands insert-if-absent and `GET /api/estate/nodes`
-//!   then reads it, roles sorted;
+//! - a declaration inserts new nodes, refreshes an explicit disk_gb on
+//!   kept nodes, and appends missing roles; other fields are kept and
+//!   `GET /api/estate/nodes` reads the result, roles sorted;
 //! - a second publish inserts nothing, records nothing;
 //! - a role added to the file lands on a node already there (the
 //!   forge gained `cluster-operator` after its row existed) and leaves
@@ -119,7 +120,7 @@ async fn a_declaration_lands_and_the_estate_read_serves_it() {
     assert_eq!(status, StatusCode::OK, "{text}");
     assert_eq!(
         body,
-        json!({ "received": 2, "inserted": 2, "roles_inserted": 1 })
+        json!({ "received": 2, "inserted": 2, "updated": 0, "roles_inserted": 1 })
     );
 
     let (_, body, _) = send(&app, "GET", "/api/estate/nodes", None, Some(launcher())).await;
@@ -160,7 +161,7 @@ async fn a_declaration_lands_and_the_estate_read_serves_it() {
     .await;
     assert_eq!(
         body,
-        json!({ "received": 2, "inserted": 0, "roles_inserted": 0 })
+        json!({ "received": 2, "inserted": 0, "updated": 0, "roles_inserted": 0 })
     );
     assert_eq!(
         jobs.recorded_events()
@@ -199,7 +200,7 @@ async fn a_role_added_later_lands_on_a_kept_node_and_the_fact_says_so() {
     .await;
     assert_eq!(
         body,
-        json!({ "received": 2, "inserted": 0, "roles_inserted": 1 })
+        json!({ "received": 2, "inserted": 0, "updated": 0, "roles_inserted": 1 })
     );
     let (_, body, _) = send(&app, "GET", "/api/estate/nodes", None, Some(launcher())).await;
     let forge = body["data"]
@@ -288,4 +289,98 @@ async fn the_declaration_door_is_operator_machinery() {
     assert!(jobs.list_estate_nodes().await.unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn explicit_disk_refresh_is_counted_readable_and_idempotent() {
+    let (app, jobs) = app();
+    send(
+        &app,
+        "POST",
+        "/api/estate/nodes/batch",
+        Some(declaration()),
+        Some(launcher()),
+    )
+    .await;
+    let mut later = declaration();
+    later["nodes"][1]["disk_gb"] = json!(929);
+    later["nodes"][1]["notes"] = json!("request notes are not an update");
+    for expected in [1, 0] {
+        let (status, body, text) = send(
+            &app,
+            "POST",
+            "/api/estate/nodes/batch",
+            Some(later.clone()),
+            Some(launcher()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(
+            body,
+            json!({"received":2,"inserted":0,"updated":expected,"roles_inserted":0})
+        );
+    }
+    let (_, body, _) = send(&app, "GET", "/api/estate/nodes", None, Some(launcher())).await;
+    let forge = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "forge")
+        .unwrap();
+    assert_eq!(forge["disk_gb"], 929);
+    assert_eq!(forge["notes"], "the pipeline host");
+    let facts = jobs.recorded_events();
+    assert_eq!(
+        facts.iter().filter(|e| e.kind == "node.declared").count(),
+        3
+    );
+    assert_eq!(
+        facts.last().unwrap().payload["landed"],
+        json!({"node":false,"roles":[],"disk_gb":{"before":228,"after":929}})
+    );
+}
+
 use boss_jobs::port::JobsRepository;
+
+#[tokio::test]
+async fn nonpositive_disk_refuses_the_whole_http_batch() {
+    for disk in [0, -1] {
+        let (app, jobs) = app();
+        let mut batch = declaration();
+        batch["nodes"][1]["disk_gb"] = json!(disk);
+        let (status, _, text) = send(
+            &app,
+            "POST",
+            "/api/estate/nodes/batch",
+            Some(batch),
+            Some(launcher()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text}");
+        assert!(text.contains("forge") && text.contains("disk_gb"), "{text}");
+        assert!(jobs.list_estate_nodes().await.unwrap().is_empty());
+        assert!(jobs.recorded_events().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn duplicate_identity_refuses_the_whole_http_batch() {
+    let (app, jobs) = app();
+    let mut batch = declaration();
+    let mut conflicting = batch["nodes"][0].clone();
+    conflicting["disk_gb"] = json!(929);
+    batch["nodes"].as_array_mut().unwrap().push(conflicting);
+    let (status, _, text) = send(
+        &app,
+        "POST",
+        "/api/estate/nodes/batch",
+        Some(batch),
+        Some(launcher()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        text.contains("cp-1") && text.contains("declared twice"),
+        "{text}"
+    );
+    assert!(jobs.list_estate_nodes().await.unwrap().is_empty());
+    assert!(jobs.recorded_events().is_empty());
+}

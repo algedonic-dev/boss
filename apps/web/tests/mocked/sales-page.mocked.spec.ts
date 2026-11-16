@@ -750,9 +750,11 @@ test.describe('/ux/sales — the new-Job form', () => {
     expect(seen.writes[0]!.postDataJSON()).toMatchObject({
       kind: 'receive-a-sponsorship', title: 'Zed sponsors a keg',
     });
-    // A custom subject is sent as the Custom variant, {custom_kind, ref_id}.
+    // A custom subject is {subject_kind, id}, as boss_core::job::Subject
+    // is; the {custom_kind, ref_id} this pinned until backlog a8844a57
+    // is refused 422 by the jobs API for want of `id`.
     expect(seen.writes[0]!.postDataJSON().subject).toEqual({
-      subject_kind: 'custom', custom_kind: 'custom', ref_id: 'sponsor-zed',
+      subject_kind: 'custom', id: 'sponsor-zed',
     });
     // The failure is the form's, not the list's.
     await expect(page.locator(FAILURE_MARKER)).toHaveCount(0);

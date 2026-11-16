@@ -90,7 +90,7 @@
     // every Subject can at least answer "what work is about me".
     const direct: Record<string, string> = {
       account: `/ux/accounts/${id}`,
-      vendor: `/ux/vendors/${id}`,
+      vendor: `/finance/vendors/${id}`,
       employee: `/ux/people/${id}`,
       product: `/ux/products/${id}`,
       asset: `/ux/assets/${id}`,

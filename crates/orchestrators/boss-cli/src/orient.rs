@@ -255,6 +255,113 @@ fn queued_for(run: &Value, now: chrono::DateTime<chrono::Utc>) -> String {
         .unwrap_or_default()
 }
 
+/// Why the resident supervisor keeps this run in line, as the supervisor
+/// wrote it on the packet (backlog 9f510bcf): on 2026-11-08 four gates
+/// waited 1.7-2.7 h behind a free bay while this lane printed only how
+/// long. Empty when the packet carries no reason.
+fn retained_for(run: &Value) -> String {
+    let Some(retained) = run
+        .get("metadata")
+        .and_then(|m| m.get(crate::gate::QUEUE_RETAINED))
+    else {
+        return String::new();
+    };
+    match retained.get("reason").and_then(Value::as_str) {
+        Some(reason) if !reason.is_empty() => format!(
+            " — RETAINED since {}: {reason}",
+            retained
+                .get("since")
+                .and_then(Value::as_str)
+                .unwrap_or("an unrecorded time")
+        ),
+        _ => String::new(),
+    }
+}
+
+/// THE QUEUED FOR A SLOT LANE LISTS GATE-RUN PACKETS, NOT PROCESSES
+/// (backlog e1943ef0). It used to read "N place(s) held by a live
+/// process" and list only places a `--wait` loop was still beating for,
+/// while packet-owned requests sat in a second RESIDENT lane — so the
+/// queue's own surface said the place belonged to a process, the defect
+/// the item names. Since delivery policy v10 every new `boss gate` is a
+/// packet the conductor's supervisor launches, and a waiter is only a
+/// reader any process can re-attach. One lane, one line per packet, in
+/// the line's own order: the yard's positions (`boss_jobs::yard::
+/// queued_gates`, the one definition both kinds already share), a run the
+/// yard did not place last. A legacy place still in line (the drain after
+/// the cutover) says so on its line; one nobody beats any more is not in
+/// line at all — it is the ABANDONED lane's, as before. A packet-owned
+/// request whose position the yard could not state says that, never
+/// a guessed number.
+fn queued_lane(
+    waiting: &[&Value],
+    in_line: &[String],
+    yard: Option<&[boss_jobs::yard::QueuedGate]>,
+    trains: &[Value],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let id = |g: &Value| {
+        g.get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let durable = |g: &Value| {
+        g.get("metadata")
+            .is_some_and(boss_jobs::gate_reservation::durable_presence)
+    };
+    let mut rows: Vec<(&Value, Option<&boss_jobs::yard::QueuedGate>)> = waiting
+        .iter()
+        .copied()
+        .filter(|g| durable(g) || in_line.contains(&id(g)))
+        .map(|g| {
+            let packet = id(g);
+            (
+                g,
+                yard.and_then(|line| line.iter().find(|q| q.packet_id == packet)),
+            )
+        })
+        .collect();
+    let placed = |q: Option<&boss_jobs::yard::QueuedGate>| {
+        q.map(|q| q.position).filter(|position| *position > 0)
+    };
+    rows.sort_by_key(|(g, q)| {
+        (
+            placed(*q).unwrap_or(i32::MAX),
+            in_line
+                .iter()
+                .position(|held| *held == id(g))
+                .unwrap_or(usize::MAX),
+        )
+    });
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![format!(
+        "\n  QUEUED FOR A SLOT — {} gate-run packet(s), in line order; a waiter only reads: \
+         re-attach any of them with `boss gate <packet> --wait`",
+        rows.len()
+    )];
+    for (g, q) in rows {
+        let place = placed(q).map_or_else(|| "#?".to_string(), |p| format!("#{p}"));
+        let owner = match (durable(g), placed(q)) {
+            (true, Some(_)) => "",
+            (true, None) => {
+                " — position UNKNOWN: its original acceptance receipt or source is unreadable"
+            }
+            (false, _) => " — legacy place: its --wait process holds it until it launches",
+        };
+        out.push(format!(
+            "    {place}  {}  packet {}{}{owner}{}",
+            queued_lane_line(g, trains),
+            id(g),
+            queued_for(g, now),
+            retained_for(g)
+        ));
+    }
+    out
+}
+
 /// Branches whose base has fallen behind `origin/main`. Each pair is
 /// (branch, exit code of `git merge-base --is-ancestor origin/main
 /// origin/<branch>`), read through the ONE definition of that code
@@ -314,7 +421,7 @@ fn residue_cars<'a>(
 /// `boss_jobs::car::is_parked` — the predicate `boss park`, the auto-park
 /// handler and the conductor's own dock count already share — plus the
 /// `status=open` filter that predicate deliberately leaves to its callers.
-/// "Is there a hold" is `boss_jobs::stranded::hold_reason`, where `null`,
+/// "Is there a hold" is `boss_jobs::stranded::marked`, where `null`,
 /// `false` and `""` are NO marker: a released hold boards again, and a
 /// `truthy`/`is_some` reading of it would strand the car here forever.
 /// Read off the car packets orient has already fetched — no second read.
@@ -328,22 +435,28 @@ fn residue_cars<'a>(
 fn held_dock_cars(cars: &[Value]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = cars
         .iter()
-        .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
-        .filter(|c| boss_jobs::car::is_parked(c))
-        .filter_map(|c| {
-            let hold = boss_jobs::car::find_step(c, "review", boss_jobs::car::REVIEW)
-                .and_then(|review| review.get("metadata"))
-                .and_then(boss_jobs::stranded::hold_reason);
-            let reason = hold.or_else(|| {
-                c.get("metadata")
-                    .and_then(boss_jobs::dock_red::regate_red)
-                    .map(|r| r.reason())
-            })?;
-            Some((md_str(c, "branch").to_string(), reason))
-        })
+        .filter_map(|c| Some((md_str(c, "branch").to_string(), dock_hold(c)?)))
         .collect();
     out.sort();
     out
+}
+
+/// Why one car is held on the dock, or `None` when it is not on the dock
+/// or nothing holds it — the reading [`held_dock_cars`] lists and
+/// [`carried_items`] names an item's car by (backlog e7f3ed8c), one
+/// predicate for both.
+fn dock_hold(c: &Value) -> Option<String> {
+    if c.get("status").and_then(Value::as_str) != Some("open") || !boss_jobs::car::is_parked(c) {
+        return None;
+    }
+    boss_jobs::car::find_step(c, "review", boss_jobs::car::REVIEW)
+        .and_then(|review| review.get("metadata"))
+        .and_then(|metadata| boss_jobs::stranded::marked(metadata, "hold"))
+        .or_else(|| {
+            c.get("metadata")
+                .and_then(boss_jobs::dock_red::regate_red)
+                .map(|r| r.reason())
+        })
 }
 
 /// How many consecutive boardings must have refused a car before this
@@ -1080,9 +1193,10 @@ fn owed_landed_review(car: &Value) -> Option<&Value> {
 }
 
 /// The command that dispatches a car's owed review — the packet-
-/// addressed form, because the step is nominated to the agent the
-/// moment it is ready, and `boss dispatch --next` takes only steps
-/// nobody holds (`dispatch::waiting_step`).
+/// addressed form, because `boss dispatch --next` takes the first step
+/// in its station's order that is nobody's or the caller's
+/// (`dispatch::waiting_step`), and an owed review may stand anywhere in
+/// that order, so whoever is told to do the review is told the packet.
 fn landed_review_dispatch(id8: &str) -> String {
     format!(
         "boss dispatch {id8} --step {}",
@@ -1343,8 +1457,15 @@ pub(crate) fn carried_items(cars: &[Value]) -> std::collections::BTreeMap<String
                 format!("LANDED (car {branch}), proven, awaiting its landed review ({d})"),
             );
         } else {
+            // A car held on the dock says so, with the reason: it cannot
+            // board until an operator releases it, and "IN FLIGHT ... at
+            // Open for review" read alike for that car and one about to
+            // board (backlog e7f3ed8c).
             out.entry(item.to_string())
-                .or_insert_with(|| format!("IN FLIGHT (car {branch} at {step})"));
+                .or_insert_with(|| match dock_hold(c) {
+                    Some(why) => format!("HELD at the dock (car {branch}): {}", clipped(&why)),
+                    None => format!("IN FLIGHT (car {branch} at {step})"),
+                });
         }
     }
     out
@@ -1472,6 +1593,37 @@ pub(crate) fn half_done_rerail(
 // aliases itself until then — the same rule in two places, which the
 // page's NEEDS YOU row would have made three.
 
+/// The `for=me` rows that are the caller's (design 6e42c6de car 1): a
+/// step handed to one of its `ids`, or one nobody holds whose audience
+/// is a role in `roles`. MY WORK is this filter on open steps' audience
+/// and assignee — not a station read. The answer also carries steps the
+/// caller's role reaches that another actor already holds (nine under
+/// agent-claude-b in agent-claude's answer, 2026-11-10), and those are
+/// that actor's to move, not the caller's.
+pub(crate) fn callers_steps(rows: &[Value], ids: &[String], roles: &[String]) -> Vec<Value> {
+    rows.iter()
+        .filter(|r| {
+            let step = r.get("step");
+            match step
+                .and_then(|s| s.get("assignee_id"))
+                .and_then(Value::as_str)
+            {
+                Some(holder) => ids.iter().any(|id| id == holder),
+                None => step
+                    .and_then(|s| {
+                        s.pointer(&format!(
+                            "/metadata/{}",
+                            boss_jobs::audience::AUTHORITY_ROLE_KEY
+                        ))
+                    })
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| roles.iter().any(|held| held == role)),
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 /// How many characters of a title a MY WORK line shows.
 pub(crate) const MY_WORK_TITLE_CHARS: usize = 60;
 
@@ -1507,7 +1659,8 @@ fn my_work_hint(workflow: &str, slug: &str) -> Option<String> {
 
 /// The MY WORK listing lines: rows deduplicated by step id (one step
 /// answers once however many identities it was read under), grouped
-/// by workflow, groups and rows both oldest first, each group headed
+/// by workflow, groups and rows both urgent first then oldest first
+/// (`top_board::priority_rank`), each group headed
 /// by its count and closed by one hint line. Pure so the shape is
 /// testable; the caller prints the section heading from the count.
 ///
@@ -1546,11 +1699,15 @@ pub(crate) fn my_work_lines(
         .collect();
     // Unknown ages sort last: an older server's row is still listed,
     // never mistaken for today's.
-    // A stalled claim leads (backlog e2519eca item 2): the queue says it
-    // is in hand and nobody is on it, which is the first thing to move.
+    // Urgent leads age (2026-10-18): the drain order `dispatch --next`
+    // and NEEDS YOU keep, so an actor working this list by hand takes
+    // the oldest URGENT item before an older standard one. Within a
+    // rank a stalled claim leads (backlog e2519eca item 2): the queue
+    // says it is in hand and nobody is on it, the first thing to move.
     keyed.sort_by_key(|(opened, r)| {
         (
             carried_by(r).is_some(),
+            crate::top_board::priority_rank(r),
             !crate::top_board::stalled(r),
             opened.is_none(),
             *opened,
@@ -1560,7 +1717,8 @@ pub(crate) fn my_work_lines(
                 .to_string(),
         )
     });
-    // Groups in order of their oldest row.
+    // Groups in order of their first row under the key above — the
+    // highest-ranked, not the oldest (backlog 4ace31d6).
     let mut groups: Vec<(&str, Vec<(Option<chrono::NaiveDate>, &Value)>)> = Vec::new();
     for (opened, r) in keyed {
         let kind = r.get("workflow").and_then(Value::as_str).unwrap_or("?");
@@ -1624,11 +1782,20 @@ pub(crate) fn my_work_lines(
             if !slugs.contains(&slug) {
                 slugs.push(slug);
             }
-            // Whether anyone is on a claim, in OUTRANKS' words (backlog
-            // e2519eca item 2) — the server's one predicate, one formatter.
+            // A rank other than standard is named before the title, the
+            // word the sort above ranked it by (2026-10-18).
+            let priority = match crate::top_board::priority_rank(r) {
+                2 => String::new(),
+                _ => format!(
+                    "{} ",
+                    r.get("priority").and_then(Value::as_str).unwrap_or("")
+                ),
+            };
             out.push(format!(
-                "      {id8} {kind} {slug} {} {}",
+                "      {id8} {kind} {slug} {priority}{} {}",
                 title.trim_end(),
+                // Whether anyone is on a claim, in OUTRANKS' words (backlog
+                // e2519eca item 2) — the server's one predicate, one formatter.
                 crate::top_board::with_run(&age, r)
             ));
         }
@@ -1785,19 +1952,97 @@ pub(crate) fn my_work_section(
         .filter_map(|r| r.pointer("/step/id").and_then(Value::as_str))
         .collect::<BTreeSet<_>>()
         .len();
+    // Says the order `my_work_lines` keeps (backlog 4ace31d6): rows group
+    // by kind, and the sort key leads each group, so "first" and "last"
+    // hold inside a rank and a kind, never across the whole list — an
+    // unclaimed urgent step prints above a stalled standard claim.
     let tail = [
-        (stalled, "STALLED: claimed, nobody on it, listed first"),
-        (held, "already carried by a car, listed last"),
+        (stalled, "STALLED: claimed, nobody on it, first in its rank"),
+        (held, "already carried by a car, last in its kind"),
     ]
     .iter()
     .filter(|(n, _)| *n > 0)
     .map(|(n, what)| format!("; {n} {what}"))
     .collect::<String>();
     let mut out = vec![format!(
-        "  MY WORK — {count} ready/active step(s) for {who} — yours to move, oldest first{tail}"
+        "  MY WORK — {count} ready/active step(s) for {who} — yours to move, grouped by kind, each urgent first, then oldest{tail}"
     )];
     out.extend(overdue);
     out.extend(lines);
+    out
+}
+
+/// The server owns the binding decision and every number. This renders its
+/// typed read; it never joins current rows or aggregates a second answer.
+pub(crate) fn claims_lines(map: &Value) -> Vec<String> {
+    let reading: boss_jobs::claims_console::ClaimsReading =
+        match serde_json::from_value(map.clone()) {
+            Ok(reading) => reading,
+            Err(error) => {
+                return vec![format!(
+                    "  CLAIMS — unavailable: invalid server reading: {error}"
+                )];
+            }
+        };
+    let known = |n: Option<i64>| n.map(|n| n.to_string()).unwrap_or_else(|| "UNKNOWN".into());
+    let mut out = vec![format!(
+        "  CLAIMS — as of{} · projection{} · audit{} · ordinal distance{} · retained{}h · window{}h",
+        reading.as_of,
+        reading.projection.through,
+        known(reading.projection.observed_audit_head),
+        known(reading.projection.sequence_distance),
+        reading.retention_hours,
+        reading.window_hours
+    )];
+    if let Some(at) = reading.projection.source_unavailable_at {
+        out.push(format!(
+            "  CLAIMS source unavailable at{at}; historical basis only"
+        ));
+    }
+    for unknown in &reading.projection.unknown_kinds {
+        out.push(format!(
+            "  CLAIMS ATTENTION — unknown resource kind {} · first sequence{} · count{}",
+            unknown.kind, unknown.first_seq, unknown.count
+        ));
+    }
+    let count = |key: &str| {
+        map.get(key)
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "UNKNOWN".into())
+    };
+    out.push(format!(
+        "  ROOT FALLBACK — {} open claims · {} without recorded resolution",
+        count("root_fallback_claims"),
+        count("station_resolution_unrecorded_claims"),
+    ));
+    let Some(binding) = &reading.binding else {
+        out.push("  BINDING — none recorded by the server".into());
+        return out;
+    };
+    let Some(pool) = reading.pools.iter().find(|pool| &pool.pool_key == binding) else {
+        return vec!["  CLAIMS — unavailable: server binding has no pool basis".into()];
+    };
+    let capacity = match pool.pool.as_ref().map(|p| &p.capacity) {
+        Some(boss_jobs::pools::PoolCapacity::Configured { amount }) => amount.to_string(),
+        Some(boss_jobs::pools::PoolCapacity::Unknown {}) => "UNKNOWN (unconfigured)".into(),
+        None => "UNKNOWN (declaration unavailable)".into(),
+    };
+    let state = match pool.state {
+        boss_jobs::regions::RegionState::Clear => "CLEAR",
+        boss_jobs::regions::RegionState::Full => "FULL",
+        boss_jobs::regions::RegionState::Attention => "ATTENTION",
+        boss_jobs::regions::RegionState::Troubled => "TROUBLED",
+    };
+    out.push(format!(
+        "  BINDING — {} · {} failed/{}h · {state} [{}] · {} reserved / {} declared capacity",
+        binding,
+        pool.failed_reservations,
+        reading.window_hours,
+        pool.band.as_deref().unwrap_or("no band stated"),
+        pool.reserved,
+        capacity
+    ));
     out
 }
 
@@ -2000,8 +2245,15 @@ pub(crate) fn third_lines(map: &Value) -> Vec<String> {
         None => out.push("  MACHINES — unavailable: the server sends no machine count".to_string()),
         Some(m) => {
             let n = |k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0);
+            // A reading that stopped refreshing is counted as STALE, apart
+            // from the unjudged (backlog 4db21aaf); the server sends the
+            // count only when it is non-zero.
+            let stale = match n("stale") {
+                0 => String::new(),
+                stale => format!(" · {stale} stale"),
+            };
             out.push(format!(
-                "  MACHINES — {} failed · {} unjudged of {} ({} running, {} idle)",
+                "  MACHINES — {} failed · {} unjudged{stale} of {} ({} running, {} idle)",
                 n("failed"),
                 n("unknown"),
                 n("total"),
@@ -2209,10 +2461,124 @@ async fn main_proven_line(
     fgm::proven_line(&runs, total, main, since, now)
 }
 
+fn unowned_worker_lines(inventory: &Value) -> Vec<String> {
+    let mut lines =
+        vec!["\nDEV WORKERS WITHOUT RUNS (controller records; native liveness UNKNOWN)".into()];
+    let Some(workers) = inventory
+        .get("unowned_workers")
+        .and_then(Value::as_array)
+        .filter(|_| {
+            inventory
+                .get("unowned_inventory_version")
+                .and_then(Value::as_u64)
+                == Some(1)
+        })
+    else {
+        lines.push(
+            "  UNKNOWN — published controller does not expose unmatched-worker inventory".into(),
+        );
+        return lines;
+    };
+    if workers.is_empty() {
+        lines.push(
+            "  no unmatched controller records in this page; no physical-capacity claim".into(),
+        );
+    }
+    for worker in workers {
+        let name = worker
+            .get("session")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN");
+        if let Some(error) = worker.get("error").and_then(Value::as_str) {
+            lines.push(format!(
+                "  {name} UNKNOWN — {error}; no retirement authority"
+            ));
+        } else {
+            let local = worker
+                .get("local_root")
+                .and_then(Value::as_str)
+                .unwrap_or("UNKNOWN");
+            let uid = worker
+                .pointer("/native/job_uid")
+                .and_then(Value::as_str)
+                .unwrap_or("UNKNOWN");
+            let door = worker
+                .get("retire_door")
+                .and_then(Value::as_str)
+                .unwrap_or("UNKNOWN");
+            lines.push(format!(
+                "  {name} checkout={local} JobUID={uid}; native liveness UNKNOWN"
+            ));
+            match worker.get("retirement_requested").and_then(Value::as_bool) {
+                Some(true) => lines.push(
+                    "    retirement requested; physical collection UNKNOWN; no repeated stop needed"
+                        .into(),
+                ),
+                Some(false) => lines.push(format!(
+                    "    retirement not requested; explicit identity-fenced retirement: {door}; never an automatic stop"
+                )),
+                None => lines.push(
+                    "    retirement state UNKNOWN; no retirement authority".into(),
+                ),
+            }
+        }
+    }
+    if inventory
+        .get("unowned_inventory_truncated")
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        lines.push(
+            "  unmatched inventory incomplete — more records may remain; capacity UNKNOWN".into(),
+        );
+        if let Some(cursor) = inventory.get("unowned_next").and_then(Value::as_str) {
+            lines.push(format!("    next page: /work/tools/dev-control/dev-build owned-runs --unowned-after {cursor}"));
+        }
+    }
+    lines
+}
+
+fn unowned_worker_section() -> Vec<String> {
+    let controller = match crate::door_env::dev_worker_route() {
+        crate::door_env::DevChild::Local => {
+            return vec![
+                "DEV WORKERS WITHOUT RUNS UNKNOWN — dev controller is not activated here".into(),
+            ];
+        }
+        crate::door_env::DevChild::Refuse(why) => {
+            return vec![format!("DEV WORKERS WITHOUT RUNS UNKNOWN — {why}")];
+        }
+        crate::door_env::DevChild::Forward(path) => path,
+    };
+    // Fixed published metadata verb, never candidate code or exec-auto.
+    let result = crate::door_env::published_controller(&controller)
+        .arg("owned-runs")
+        .output();
+    match result {
+        Ok(out) if out.status.success() => match serde_json::from_slice(&out.stdout) {
+            Ok(inventory) => unowned_worker_lines(&inventory),
+            Err(error) => vec![format!(
+                "DEV WORKERS WITHOUT RUNS UNKNOWN — invalid controller inventory: {error}"
+            )],
+        },
+        Ok(out) => vec![format!(
+            "DEV WORKERS WITHOUT RUNS UNKNOWN — controller exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        )],
+        Err(error) => vec![format!(
+            "DEV WORKERS WITHOUT RUNS UNKNOWN — controller unread: {error}"
+        )],
+    }
+}
+
 pub async fn run(all: bool) -> Result<()> {
     let http = crate::sor_client::machine_client()?;
 
     println!("boss orient — the approach, before you build");
+    for line in unowned_worker_section() {
+        println!("{line}");
+    }
     println!(
         "  jobs api  {}",
         std::env::var("BOSS_JOBS_URL").unwrap_or_default()
@@ -2247,6 +2613,15 @@ pub async fn run(all: bool) -> Result<()> {
     // the memory index for the same reason: it is about what this
     // session is handed, and it prints before any lane can fail.
     for line in crate::reporting_to::section(&http).await {
+        println!("{line}");
+    }
+
+    // SESSIONS — every open work-session and the working window its
+    // packet carries (backlog 37e3295c): on 2026-10-19 both factory
+    // sessions wound down on an hour said in chat, and neither could
+    // read the other's end. The conductor reads the other session's
+    // window here, from the record.
+    for line in crate::session_window::section(&http).await {
         println!("{line}");
     }
 
@@ -2286,6 +2661,18 @@ pub async fn run(all: bool) -> Result<()> {
         Err(e) => println!("  REGIONS — unavailable: {e}"),
     }
 
+    // D6 has one server-computed binding answer, including its actual basis.
+    println!();
+    match api(&http, reqwest::Method::GET, "/api/claims", None).await {
+        Ok(Some(reading)) => {
+            for line in claims_lines(&reading) {
+                println!("{line}");
+            }
+        }
+        Ok(None) => println!("  CLAIMS — unavailable: the read answered nothing"),
+        Err(error) => println!("  CLAIMS — unavailable: {error}"),
+    }
+
     // THE TOP BOARD (backlog 74569e94, design ea906603): what outranks
     // regular order and what happens next, off the same regions payload
     // the page's top board reads, and what needs the actor running this
@@ -2298,12 +2685,28 @@ pub async fn run(all: bool) -> Result<()> {
             api(
                 &http,
                 reqwest::Method::GET,
-                "/api/jobs/assignments?for=me&limit=1000",
+                &crate::top_board::for_me_path(),
                 None,
             )
             .await,
         )),
         None => None,
+    };
+    // Every car, read ONCE and HERE, before the board (backlog e7f3ed8c):
+    // OUTRANKS and NEEDS YOU print a claim a car carries as that car, in
+    // MY WORK's words, rather than as STALLED — on 2026-10-10 most urgent
+    // items the board called stalled had a car held at the dock. Read as
+    // a result so the board still prints when the read fails, and says
+    // so; the lanes below that need the cars take the error then.
+    let cars_read = crate::sor_client::all_cars(&http).await;
+    let carried = match &cars_read {
+        Ok(cars) => carried_items(cars),
+        Err(e) => {
+            println!(
+                "\n  (cars unread: {e:#} — a STALLED claim on the board may be one a car carries)"
+            );
+            BTreeMap::new()
+        }
     };
     let board_now = boss_clock_client::wall_now();
     let unread_map = |what: &str| match &regions {
@@ -2313,7 +2716,7 @@ pub async fn run(all: bool) -> Result<()> {
     println!();
     match &regions {
         Ok(Some(map)) => {
-            for line in crate::top_board::outranks_lines(map) {
+            for line in crate::top_board::outranks_lines(map, &carried) {
                 println!("{line}");
             }
         }
@@ -2321,7 +2724,7 @@ pub async fn run(all: bool) -> Result<()> {
     }
     match &for_me {
         Some(read) => {
-            for line in crate::top_board::needs_you_lines(read) {
+            for line in crate::top_board::needs_you_lines(read, &carried) {
                 println!("{line}");
             }
         }
@@ -2430,6 +2833,17 @@ pub async fn run(all: bool) -> Result<()> {
         }
     };
     println!("\n  GATING — {} run(s)", running.len());
+    // THE GATES HOLD, first in the lane (backlog 95401d82): whether the
+    // automata may launch at all is the first thing the lane answers.
+    let hold = api(&http, reqwest::Method::GET, &crate::gate_hold::path(), None)
+        .await
+        .and_then(rows)
+        .map(|r| crate::gate_hold::standing(&r))
+        .map_err(|e| format!("{e:#}"));
+    println!(
+        "{}",
+        crate::gate_hold::orient_line(&hold, boss_clock_client::wall_now())
+    );
     for g in &running {
         let id = g.get("id").and_then(Value::as_str).unwrap_or_default();
         println!("    {}{}", gating_line(g, &trains), gate_times(id, &bays));
@@ -2445,52 +2859,15 @@ pub async fn run(all: bool) -> Result<()> {
     let now = boss_clock_client::wall_now();
     let in_line = queue_order(&gating, now, crate::gate::QUEUE_PLACE_TTL_SECS);
     let abandoned = abandoned_places(&gating, now, crate::gate::QUEUE_PLACE_TTL_SECS);
-    if !waiting.is_empty() {
-        println!(
-            "\n  QUEUED FOR A SLOT — {} place(s) held by a live process",
-            in_line.len()
-        );
-        for g in waiting.iter().filter(|g| {
-            let id = g.get("id").and_then(Value::as_str).unwrap_or_default();
-            in_line.iter().any(|held| held == id)
-        }) {
-            println!("    {}{}", queued_lane_line(g, &trains), queued_for(g, now));
-        }
-    }
-    let resident: Vec<_> = gating
-        .iter()
-        .filter(|g| {
-            g.get("metadata")
-                .is_some_and(boss_jobs::gate_reservation::waiting_for_native)
-        })
-        .collect();
-    if !resident.is_empty() {
-        println!(
-            "\n  RESIDENT GATE QUEUE — {} request(s); no client heartbeat expiry",
-            resident.len()
-        );
-        for g in resident {
-            let id = g.get("id").and_then(Value::as_str).unwrap_or_default();
-            let row = bays
-                .as_ref()
-                .ok()
-                .and_then(|b| b.queued.iter().find(|q| q.packet_id == id));
-            match row {
-                Some(q) if q.position > 0 => println!(
-                    "    {}  {}  #{}; original acceptance {}; waiting {}s",
-                    q.branch,
-                    id,
-                    q.position,
-                    q.queued_at,
-                    q.waiting_seconds
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| "unknown".into())
-                ),
-                _ => println!(
-                    "    {id}  position and acceptance time UNKNOWN; original receipt or source is unreadable"
-                ),
-            }
-        }
+    // ONE lane of packets (backlog e1943ef0): see `queued_lane`.
+    for line in queued_lane(
+        &waiting,
+        &in_line,
+        bays.as_ref().ok().map(|b| b.queued.as_slice()),
+        &trains,
+        now,
+    ) {
+        println!("{line}");
     }
     // Which of them main already holds — asked only when there is a
     // strand, after the same quiet fetch of main `boss gate`'s landed
@@ -2517,11 +2894,12 @@ pub async fn run(all: bool) -> Result<()> {
     // dock's held and troubled lanes and the stranded cross-ref all read
     // this list, and one bare `limit=800` page would have dropped the
     // oldest landed cars out of all four silently once the yard passed
-    // 800. Read HERE, before the abandoned lines, because a place whose
-    // head a car already carries green is withdrawn rather than recovered
-    // — the twin-car guard's own question, asked through its own function
-    // (backlog b1c82a82).
-    let cars = crate::sor_client::all_cars(&http).await?;
+    // 800. Needed by HERE, before the abandoned lines, because a place
+    // whose head a car already carries green is withdrawn rather than
+    // recovered — the twin-car guard's own question, asked through its
+    // own function (backlog b1c82a82). Read once above the top board
+    // (backlog e7f3ed8c); a failed read stops the verb here, as it did.
+    let cars = cars_read?;
     let vouched: BTreeMap<String, crate::gate::Vouch> = abandoned
         .iter()
         .filter_map(|p| {
@@ -2716,15 +3094,29 @@ pub async fn run(all: bool) -> Result<()> {
                     println!("    {b}");
                 }
             }
+            // UNPUSHED WORK (backlog aa4452ff): the third cross-ref, and
+            // the one no packet or forge head starts from — commits in an
+            // agent worktree that reached neither, judged against the same
+            // forge heads and claimed set as ORPHANS above.
+            for line in
+                crate::unpushed::section(&forge_heads, &claimed, boss_clock_client::wall_now(), all)
+            {
+                println!("{line}");
+            }
         }
+        // The forge heads are what UNPUSHED WORK is judged against too, so
+        // the skip names it: a section that vanishes silently reads as a
+        // section with nothing to say.
         Ok(out) => println!(
-            "\n  ORPHANS — skipped: git ls-remote failed ({})",
+            "\n  ORPHANS, RESIDUE, UNPUSHED WORK — skipped: git ls-remote failed ({})",
             String::from_utf8_lossy(&out.stderr)
                 .lines()
                 .next()
                 .unwrap_or("no stderr")
         ),
-        Err(e) => println!("\n  ORPHANS — skipped: could not run git ({e})"),
+        Err(e) => {
+            println!("\n  ORPHANS, RESIDUE, UNPUSHED WORK — skipped: could not run git ({e})")
+        }
     }
 
     // The dock.
@@ -2863,23 +3255,23 @@ pub async fn run(all: bool) -> Result<()> {
     // here and the rest of the approach still prints (identity's
     // read/write split); a read that failed says so and prints nothing
     // in its place.
-    let (identities, my_rows): (Option<Vec<String>>, Vec<Value>) = match &for_me {
-        Some(Ok(body)) => (
-            Some(crate::top_board::for_ids(body)),
-            body.get("data")
+    let (identities, read_rows, my_rows): (Option<Vec<String>>, usize, Vec<Value>) = match &for_me {
+        Some(Ok(body)) => {
+            let ids = crate::top_board::for_ids(body);
+            let rows = body
+                .get("data")
                 .and_then(Value::as_array)
                 .cloned()
-                .unwrap_or_default(),
-        ),
-        _ => (None, Vec::new()),
+                .unwrap_or_default();
+            let mine = callers_steps(&rows, &ids, &crate::top_board::for_roles(body));
+            (Some(ids), rows.len(), mine)
+        }
+        _ => (None, 0, Vec::new()),
     };
     // The read's ceiling is the jobs API's page bound; a queue that
     // fills it is SAID to be a floor (a limit is not a filter).
-    if my_rows.len() >= 1000 {
-        println!(
-            "  (MY WORK: read {} rows, the page bound — the queue may be longer)",
-            my_rows.len()
-        );
+    if read_rows >= 1000 {
+        println!("  (MY WORK: read {read_rows} rows, the page bound — the queue may be longer)");
     }
     // The open overdue-real-work alarms (078ddcb0), which MY WORK leads
     // with. Read whenever an identity is, and narrowed on the key the
@@ -2913,6 +3305,15 @@ pub async fn run(all: bool) -> Result<()> {
         // an empty section would read as "nothing is yours".
         Some(Err(why)) => println!("  MY WORK — unread: {why}"),
         _ => {
+            // A cut queue is named above the list it cut (backlog
+            // 09074ada): MY WORK's count is the rows read, not the queue.
+            if let Some(why) = for_me
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(crate::top_board::for_me_cut)
+            {
+                println!("  (MY WORK is CUT: {why} — the list below is not your whole queue)");
+            }
             for line in
                 my_work_section(identities.as_deref(), &my_rows, &cars, &overdue_alarms, now)
             {
@@ -3047,20 +3448,10 @@ pub async fn run(all: bool) -> Result<()> {
         Err(e) => println!("\n  LANDED REVIEWS — unread: {e:#}"),
     }
 
-    // The task queue, as a number.
-    let tasks = api(
-        &http,
-        reqwest::Method::GET,
-        "/api/stations/q.platform-admin.task/queue",
-        None,
-    )
-    .await?;
-    let task_total = tasks
-        .as_ref()
-        .and_then(|d| d.get("total"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    println!("\n  TASK QUEUE — {task_total} open item(s)");
+    // No TASK QUEUE line (design 6e42c6de car 1). It printed the size of
+    // `q.platform-admin.task`, a role's view of the company's open task
+    // steps — the role half of MY WORK's filter above, counted a second
+    // way, and a generated-family station read this design retires.
 
     // The checklist this verb exists to make cheap — the load-bearing
     // lines of CLAUDE.md §Engineering Session Startup.
@@ -3079,6 +3470,88 @@ pub async fn run(all: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claims_console_orientation_reads_full_root_fallback_counts() {
+        let payload = serde_json::json!({"projection":{"generation":1,"through":8,"observed_audit_head":8,"source_observed_at":null,"sequence_distance":0,"source_unavailable_at":null,"unknown_kinds":[]},"as_of":8,"as_of_at":"2026-11-01T00:00:00Z","retained_from":"2026-10-25T00:00:00Z","retention_hours":168,"window_hours":24,"claims":[],"waiting_on":[],"pools":[],"binding":null,"truncated":true,"root_fallback_claims":2,"station_resolution_unrecorded_claims":3});
+        let text = super::claims_lines(&payload).join("\n");
+        assert!(text.contains("ROOT FALLBACK — 2 open claims"), "{text}");
+        assert!(text.contains("3 without recorded resolution"), "{text}");
+        let mut old = payload;
+        old.as_object_mut().unwrap().remove("root_fallback_claims");
+        let text = super::claims_lines(&old).join("\n");
+        assert!(text.contains("ROOT FALLBACK — UNKNOWN"), "{text}");
+    }
+
+    #[test]
+    fn claims_console_orientation_names_unknown_kinds_even_without_a_binding() {
+        let payload = serde_json::json!({"projection":{"generation":1,"through":8,"observed_audit_head":8,"source_observed_at":null,"sequence_distance":0,"source_unavailable_at":null,"unknown_kinds":[{"kind":"jobs.stock.obligated","first_seq":6,"count":2}]},"as_of":8,"as_of_at":"2026-11-01T00:00:00Z","retained_from":"2026-10-25T00:00:00Z","retention_hours":168,"window_hours":24,"claims":[],"waiting_on":[],"pools":[],"binding":null});
+        let text = super::claims_lines(&payload).join("\n");
+        for expected in [
+            "jobs.stock.obligated",
+            "first sequence6",
+            "count2",
+            "ATTENTION",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+    }
+    #[test]
+    fn claims_console_orientation_uses_the_server_binding_without_client_aggregation() {
+        let mut pool = serde_json::json!({"pool_key":"vcpu","pool":{"name":"vcpu","version":1,"status":"active","unit":"vCPU","kind":"flow","capacity":{"state":"unknown"},"created_at":"2026-11-01T00:00:00Z"},"reserved":"0","failed_reservations":7,"releases":0,"state":"attention","band":"capacity-unknown"});
+        let first = pool.clone();
+        pool["pool_key"] = serde_json::json!("ram_gb");
+        pool["pool"]["name"] = serde_json::json!("ram_gb");
+        pool["failed_reservations"] = serde_json::json!(999);
+        let payload = serde_json::json!({"projection":{"generation":0,"through":42,"observed_audit_head":45,"source_observed_at":"2026-11-01T00:00:00Z","sequence_distance":3,"source_unavailable_at":null},"as_of":42,"as_of_at":"2026-11-01T00:00:00Z","retained_from":"2026-10-25T00:00:00Z","retention_hours":168,"window_hours":24,"claims":[],"waiting_on":[],"pools":[first,pool],"binding":"vcpu"});
+        let text = super::claims_lines(&payload).join("\n");
+        for expected in ["vcpu", "7 failed", "UNKNOWN", "as of42", "168h", "24h"] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(
+            !text.contains("999"),
+            "the verb renders binding; it never recomputes it from other pools"
+        );
+    }
+    #[test]
+    fn claims_console_orientation_never_turns_an_unread_basis_into_a_zero() {
+        let text = super::claims_lines(&serde_json::json!({})).join("\n");
+        assert!(text.contains("unavailable"));
+        assert!(!text.contains("0 failed"));
+    }
+    #[test]
+    fn unmatched_retirement_state_is_visible_and_does_not_offer_another_stop() {
+        let shown = super::unowned_worker_lines(&serde_json::json!({
+            "unowned_inventory_version":1,"unowned_inventory_truncated":false,
+            "unowned_workers":[{"session":"dev-build-1234567890abcdef","local_root":"/work/boss",
+                "native":{"job_uid":"exact-job-uid"},"retirement_requested":true,
+                "retire_door":"DO-NOT-OFFER-STOP"}]
+        }))
+        .join("\n");
+        assert!(shown.contains("retirement requested"), "{shown}");
+        assert!(shown.contains("physical collection UNKNOWN"), "{shown}");
+        assert!(!shown.contains("DO-NOT-OFFER-STOP"), "{shown}");
+    }
+
+    #[test]
+    fn unmatched_workers_are_named_without_claiming_liveness_or_silent_absence() {
+        let missing = super::unowned_worker_lines(&serde_json::json!({"runs":[]})).join("\n");
+        assert!(missing.contains("UNKNOWN"));
+        assert!(!missing.contains("no unmatched"));
+        let shown = super::unowned_worker_lines(&serde_json::json!({
+            "unowned_inventory_version":1,"unowned_inventory_truncated":false,
+            "unowned_workers":[{"session":"dev-build-1234567890abcdef","local_root":"/work/boss",
+                "native":{"job_uid":"exact-job-uid"},"retirement_requested":false,
+                "retire_door":"dev-build stop-unowned dev-build-1234567890abcdef --job-uid exact-job-uid"},
+                {"session":"dev-build-fedcba0987654321","error":"native identity unread"}]
+        })).join("\n");
+        assert!(
+            shown.contains("dev-build-1234567890abcdef checkout=/work/boss JobUID=exact-job-uid")
+        );
+        assert!(shown.contains("stop-unowned"));
+        assert!(shown.contains("native liveness UNKNOWN"));
+        assert!(shown.contains("native identity unread; no retirement authority"));
+    }
+
     /// `IN TRANSIT` printed `at: In transit — cluster converged` while
     /// that step was READY (train 8b365d83, 2026-09-22), and was read as
     /// "the cluster has converged" mid-incident (648a68a9). The line
@@ -3350,6 +3823,140 @@ mod tests {
             super::queued_lane_line(&queued_car, &trains),
             "fix/a-dark-registry-does-not-widen-what-a-host-runs  since 2026-09-14T20:02:00Z",
             "a queued car's line is its branch and its stamp, as before"
+        );
+    }
+
+    /// THE QUEUED FOR A SLOT LANE LISTS GATE-RUN PACKETS (backlog
+    /// e1943ef0, the item's second check). Observed verbatim on
+    /// bcb6d8a18 at 2026-10-19T03:49Z: "QUEUED FOR A SLOT — 1 place(s)
+    /// held by a live process", with packet-owned requests in a second
+    /// lane. One lane now: every packet in the yard's order, packet-owned
+    /// ones plain, a legacy place still beaten marked as the drain, a dead
+    /// legacy place left to the ABANDONED lane, an unplaced request said
+    /// to be unplaced — and no line about a process holding anything.
+    #[test]
+    fn the_queued_lane_lists_gate_run_packets_in_the_lines_order() {
+        use boss_jobs::yard::QueuedGate;
+        use serde_json::json;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-19T05:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        const HELD: &str = "11111111-1111-4111-8111-111111111111";
+        const DEAD: &str = "22222222-2222-4222-8222-222222222222";
+        const RESIDENT: &str = "33333333-3333-4333-8333-333333333333";
+        const UNPLACED: &str = "44444444-4444-4444-8444-444444444444";
+        let legacy_held = json!({"id": HELD, "metadata": {
+            "branch": "fix/legacy-held", "queued_at": "2026-10-19T04:40:00Z"}});
+        let legacy_dead = json!({"id": DEAD, "metadata": {
+            "branch": "fix/legacy-dead", "queued_at": "2026-10-19T04:00:00Z"}});
+        let resident = json!({"id": RESIDENT, "metadata": {
+            "branch": "fix/resident", "queued_at": "2026-10-19T04:50:00Z",
+            "gate_submission": {"contract_version": 1}}});
+        let unplaced = json!({"id": UNPLACED, "metadata": {
+            "branch": "fix/unplaced", "queued_at": "2026-10-19T04:55:00Z",
+            "gate_submission": {}}});
+        let place = |packet: &str, branch: &str, position: i32| QueuedGate {
+            branch: branch.into(),
+            packet_id: packet.into(),
+            next_owner: None,
+            queued_at: String::new(),
+            position,
+            waiting_seconds: None,
+            estimated_wait_seconds: None,
+            train: None,
+        };
+        let yard = vec![
+            place(HELD, "fix/legacy-held", 1),
+            place(RESIDENT, "fix/resident", 2),
+            place(UNPLACED, "fix/unplaced", 0),
+        ];
+        let lines = super::queued_lane(
+            &[&legacy_dead, &unplaced, &resident, &legacy_held],
+            &[HELD.to_string()],
+            Some(&yard),
+            &[],
+            now,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "\n  QUEUED FOR A SLOT — 3 gate-run packet(s), in line order; a waiter only \
+                 reads: re-attach any of them with `boss gate <packet> --wait`"
+                    .to_string(),
+                format!(
+                    "    #1  fix/legacy-held  since 2026-10-19T04:40:00Z  packet {HELD}  \
+                     (waiting 20m) — legacy place: its --wait process holds it until it launches"
+                ),
+                format!(
+                    "    #2  fix/resident  since 2026-10-19T04:50:00Z  packet {RESIDENT}  \
+                     (waiting 10m)"
+                ),
+                format!(
+                    "    #?  fix/unplaced  since 2026-10-19T04:55:00Z  packet {UNPLACED}  \
+                     (waiting 5m) — position UNKNOWN: its original acceptance receipt or \
+                     source is unreadable"
+                ),
+            ]
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("live process")),
+            "no line says a process holds the place"
+        );
+        // An unread yard still lists every packet, oldest legacy place
+        // first, and states no position it cannot read.
+        let unread = super::queued_lane(
+            &[&resident, &legacy_held],
+            &[HELD.to_string()],
+            None,
+            &[],
+            now,
+        );
+        assert_eq!(unread.len(), 3);
+        assert!(
+            unread[1].starts_with("    #?  fix/legacy-held"),
+            "{unread:?}"
+        );
+        assert!(unread[2].starts_with("    #?  fix/resident"), "{unread:?}");
+        // Nothing in line: no lane at all (a dead legacy place is the
+        // ABANDONED lane's).
+        assert!(super::queued_lane(&[&legacy_dead], &[], Some(&yard), &[], now).is_empty());
+    }
+
+    /// Backlog 9f510bcf: a queued run the resident supervisor keeps in
+    /// line says why, beside the wait, in the supervisor's own words off
+    /// the packet; a run carrying no reason prints as before.
+    #[test]
+    fn a_queued_run_the_supervisor_retains_names_its_reason_beside_the_wait() {
+        use boss_jobs::yard::QueuedGate;
+        use serde_json::json;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-08T02:40:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        const RETAINED: &str = "55555555-5555-4555-8555-555555555555";
+        let run = json!({"id": RETAINED, "metadata": {
+            "branch": "fix/older-run", "queued_at": "2026-11-08T00:00:00Z",
+            "gate_submission": {"contract_version": 1},
+            crate::gate::QUEUE_RETAINED: {
+                "reason": "original parent step no longer links this source run",
+                "since": "2026-11-08T00:01:00Z"}}});
+        let yard = vec![QueuedGate {
+            branch: "fix/older-run".into(),
+            packet_id: RETAINED.into(),
+            next_owner: None,
+            queued_at: String::new(),
+            position: 1,
+            waiting_seconds: None,
+            estimated_wait_seconds: None,
+            train: None,
+        }];
+        let lines = super::queued_lane(&[&run], &[], Some(&yard), &[], now);
+        assert_eq!(
+            lines[1],
+            format!(
+                "    #1  fix/older-run  since 2026-11-08T00:00:00Z  packet {RETAINED}  \
+                 (waiting 2h) — RETAINED since 2026-11-08T00:01:00Z: original parent \
+                 step no longer links this source run"
+            )
         );
     }
 
@@ -3838,7 +4445,7 @@ mod tests {
     /// the one read that was meant to un-blind the session. It is named
     /// from the car packets orient has already fetched — no second read,
     /// and the predicate is the shared one (`car::is_parked`) plus the
-    /// shared marker reading (`stranded::hold_reason`).
+    /// shared marker reading (`stranded::marked`).
     #[test]
     fn a_held_car_is_named_with_its_reason() {
         let cars = vec![
@@ -3856,6 +4463,52 @@ mod tests {
                 "fix/held".to_string(),
                 "waiting on an operator action".to_string()
             )]
+        );
+    }
+
+    #[test]
+    fn malformed_review_gate_envelope_does_not_hide_the_dock_brake() {
+        for poison in [json!({}), json!(null)] {
+            let mut held = car("fix/held", "open", "ready", json!({"hold":"David only"}));
+            assert_eq!(dock_hold(&held).as_deref(), Some("David only"));
+            let review = held["steps"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|s| s["spec_slug"] == "review")
+                .unwrap();
+            review["metadata"]["gate_submission"] = poison;
+            assert_eq!(dock_hold(&held).as_deref(), Some("David only"));
+        }
+    }
+
+    /// A HELD CAR CARRIES ITS ITEM AS HELD, WITH ITS REASON (backlog
+    /// e7f3ed8c). Every section that prints a claim reads this clause —
+    /// MY WORK, and since that item OUTRANKS and NEEDS YOU — and "IN
+    /// FLIGHT ... at Open for review" read alike for a car about to board
+    /// and one that cannot board until an operator releases it: the
+    /// reason is the dock's own reading (`held_dock_cars`), not a second.
+    #[test]
+    fn a_held_car_carries_its_item_as_held_with_its_reason() {
+        let held_item = "1e50e66b-0000-4000-8000-000000000000";
+        let free_item = "75198b15-0000-4000-8000-000000000000";
+        let mut held = car(
+            "fix/held",
+            "open",
+            "ready",
+            json!({ "hold": "awaiting an adversarial review" }),
+        );
+        held["metadata"]["backlog_item"] = json!(held_item);
+        let mut free = car("fix/free", "open", "ready", json!({}));
+        free["metadata"]["backlog_item"] = json!(free_item);
+        let carried = carried_items(&[held, free]);
+        assert_eq!(
+            carried[held_item],
+            "HELD at the dock (car fix/held): awaiting an adversarial review"
+        );
+        assert_eq!(
+            carried[free_item],
+            "IN FLIGHT (car fix/free at Open for review)"
         );
     }
 
@@ -4208,7 +4861,7 @@ mod tests {
 
     /// THE TRAP. `hold: false` is a RELEASED hold, and a `truthy`/`is_some`
     /// reading of the marker would hold the car in this list forever. The
-    /// marker semantics live once, in `stranded::hold_reason`; a
+    /// marker semantics live once, in `stranded::marked`; a
     /// hold/no-hold test alone passes with that bug.
     #[test]
     fn a_released_hold_is_not_a_held_car() {
@@ -4916,6 +5569,131 @@ mod tests {
     // computed: `boss_jobs::me`'s tests. This verb reads `for.ids` off
     // the answer (`top_board::for_ids`) rather than keep a second copy.
 
+    /// MY WORK IS A FILTER ON AUDIENCE AND ASSIGNEE (design 6e42c6de car
+    /// 1). The `for=me` answer also carries steps the caller's ROLE
+    /// reaches that another actor already holds — measured 2026-11-10,
+    /// nine steps active under agent-claude-b in agent-claude's answer,
+    /// printed as "yours to move". A step is the caller's when it is
+    /// handed to one of its ids, or nobody holds it and its audience is
+    /// a role the caller holds; nothing else is.
+    #[test]
+    fn my_work_keeps_only_the_steps_that_are_the_callers() {
+        let row = |step: &str, holder: Option<&str>, role: Option<&str>| {
+            let mut r = asg(
+                "j-1",
+                "backlog-item",
+                "build",
+                "A build",
+                "2026-11-10",
+                step,
+            );
+            r["step"]["assignee_id"] = json!(holder);
+            r["step"]["metadata"] = json!({ "authority_role": role });
+            r
+        };
+        let rows = vec![
+            row(
+                "by-alias",
+                Some("claude@algedonic.dev"),
+                Some("platform-admin"),
+            ),
+            row("by-id", Some("agent-claude"), None),
+            row("theirs", Some("agent-claude-b"), Some("platform-admin")),
+            row("unheld-my-role", None, Some("platform-admin")),
+            row("unheld-other-role", None, Some("bookkeeper")),
+            row("unheld-no-audience", None, None),
+        ];
+        let ids = vec![
+            "agent-claude".to_string(),
+            "claude@algedonic.dev".to_string(),
+        ];
+        let roles = vec!["platform-admin".to_string()];
+        let kept: Vec<String> = callers_steps(&rows, &ids, &roles)
+            .iter()
+            .filter_map(|r| r.pointer("/step/id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(kept, ["by-alias", "by-id", "unheld-my-role"]);
+    }
+
+    /// URGENT LEADS AGE. On 2026-10-18 the second session drained a
+    /// standard queue while the five oldest urgent items sat, because
+    /// this list read age and kind but never priority — the order
+    /// `dispatch --next` and NEEDS YOU already keep. An urgent row opened
+    /// later leads a standard row opened earlier, inside its kind and
+    /// across kinds, and says it is urgent.
+    #[test]
+    fn my_work_leads_with_urgent_before_older_standard_work() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-18T04:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let with_priority = |mut row: Value, p: &str| {
+            row["priority"] = json!(p);
+            row
+        };
+        let rows = vec![
+            asg(
+                "aaaa0001-0000-4000-8000-000000000000",
+                "maintenance-sweep",
+                "inspect",
+                "An old sweep",
+                "2026-09-01",
+                "s-sweep",
+            ),
+            asg(
+                "aaaa0002-0000-4000-8000-000000000000",
+                "backlog-item",
+                "build",
+                "An old build",
+                "2026-09-02",
+                "s-old",
+            ),
+            with_priority(
+                asg(
+                    "aaaa0003-0000-4000-8000-000000000000",
+                    "backlog-item",
+                    "build",
+                    "A newer build",
+                    "2026-10-15",
+                    "s-urgent",
+                ),
+                "urgent",
+            ),
+        ];
+        let lines = my_work_lines(&rows, &carried_items(&[]), now);
+        let all = lines.join("\n");
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle:?}:\n{all}"))
+        };
+        assert_eq!(
+            at("backlog-item —"),
+            0,
+            "the kind holding urgent work leads:\n{all}"
+        );
+        assert!(
+            at("A newer build") < at("An old build"),
+            "urgent leads age inside its kind:\n{all}"
+        );
+        assert!(
+            at("An old build") < at("An old sweep"),
+            "groups after the urgent one keep age order:\n{all}"
+        );
+        // No title carries a rank word (backlog 4ace31d6): the label is
+        // asserted where the row format puts it, between slug and title,
+        // so a row that lost its label cannot pass on its own title.
+        assert!(
+            lines[at("A newer build")].contains(" build urgent A newer build "),
+            "an urgent row says so, before its title:\n{all}"
+        );
+        assert!(
+            lines[at("An old build")].contains(" build An old build "),
+            "a standard row carries no priority word:\n{all}"
+        );
+    }
+
     #[test]
     fn my_work_groups_by_kind_oldest_first_with_one_hint_per_group() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-09-18T12:00:00Z")
@@ -5068,8 +5846,9 @@ mod tests {
         let section = my_work_section(Some(&ids), &rows, &cars, &[], now);
         assert_eq!(
             section[0],
-            "  MY WORK — 4 ready/active step(s) for agent-claude — yours to move, oldest first; \
-             1 STALLED: claimed, nobody on it, listed first; 1 already carried by a car, listed last"
+            "  MY WORK — 4 ready/active step(s) for agent-claude — yours to move, grouped by kind, \
+             each urgent first, then oldest; 1 STALLED: claimed, nobody on it, first in its rank; \
+             1 already carried by a car, last in its kind"
         );
         assert_eq!(
             section[1],
@@ -5255,7 +6034,8 @@ mod tests {
         assert!(
             section.starts_with(
                 "  MY WORK — 3 ready/active step(s) for claude@algedonic.dev — \
-                 yours to move, oldest first; 2 already carried by a car, listed last"
+                 yours to move, grouped by kind, each urgent first, then oldest; \
+                 2 already carried by a car, last in its kind"
             ),
             "{section}"
         );
@@ -5635,6 +6415,44 @@ mod tests {
         let older = third_lines(&serde_json::json!({ "window_hours": 24, "regions": [] }));
         assert_eq!(older.len(), 1);
         assert!(older[0].contains("unavailable"), "{}", older[0]);
+    }
+
+    /// Backlog 4db21aaf: a station whose membership projection went
+    /// stale is counted STALE in the header and printed STALE with the
+    /// generation it stopped at, never folded into the unjudged.
+    #[test]
+    fn the_machine_cell_counts_and_prints_a_stale_station_as_stale() {
+        let map = serde_json::json!({
+            "window_hours": 24,
+            "regions": [],
+            "thirds": [
+                {
+                    "third": "queue-management", "regions": ["marshalling"],
+                    "balance": { "unit": "inbound packets", "in": 1.0, "out": 1.0, "net": 0.0,
+                                 "in_count": 1, "out_count": 1, "in_means": "", "out_means": "" },
+                    "stuck": { "third": "queue-management", "stuck": 0, "waiting": 0,
+                               "unknown": [], "oldest_hours": null, "regions": [] }
+                }
+            ],
+            "machines": { "running": 5, "idle": 6, "failed": 0, "unknown": 0, "stale": 1,
+                          "total": 12,
+                          "failed_or_unknown": [
+                              { "region": "marshalling", "id": "station:gates", "name": "gates",
+                                "state": "stale",
+                                "why": "1 standing — stale since 2026-10-30T16:58:57Z: membership projection is stale" } ] }
+        });
+        let lines = third_lines(&map);
+        assert_eq!(
+            lines[2],
+            "  MACHINES — 0 failed · 0 unjudged · 1 stale of 12 (5 running, 6 idle)"
+        );
+        assert!(
+            lines[3].starts_with("    STALE")
+                && lines[3].contains("gates")
+                && lines[3].contains("stale since 2026-10-30T16:58:57Z"),
+            "{}",
+            lines[3]
+        );
     }
 
     /// AN ACTOR-WORKED BORDER MUST NOT READ AS A DEAD RULE.

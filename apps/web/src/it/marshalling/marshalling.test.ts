@@ -25,41 +25,29 @@ const LOAD = {
       station: 'q.platform-admin.task',
       kind: 'constraint',
       depth: 41,
-      wip_limit: null,
-      over_limit: false,
       oldest_opened_on: '2026-08-22',
       oldest_age_days: 17,
-      capability_roles: ['platform-admin'],
     },
     {
       station: 'q.bookkeeper.bill-approval',
       kind: 'constraint',
       depth: 6,
-      wip_limit: null,
-      over_limit: false,
       oldest_opened_on: '2026-09-07',
       oldest_age_days: 2,
-      capability_roles: ['bookkeeper'],
     },
     {
       station: 'loading-dock',
-      kind: 'batch',
+      kind: 'equipment',
       depth: 3,
-      wip_limit: 24,
-      over_limit: false,
       oldest_opened_on: '2026-09-08',
       oldest_age_days: 1,
-      capability_roles: null,
     },
     {
       station: 'q.cto.sign-off',
       kind: 'constraint',
       depth: 0,
-      wip_limit: null,
-      over_limit: false,
       oldest_opened_on: null,
       oldest_age_days: null,
-      capability_roles: ['cto'],
     },
   ],
   total: 4,
@@ -87,7 +75,7 @@ const FLOW = {
     },
     {
       station: 'loading-dock',
-      kind: 'batch',
+      kind: 'equipment',
       basis: 'unavailable',
       arrived: null,
       served: null,
@@ -114,19 +102,21 @@ function sidings(): ReadonlyArray<Siding> {
   return joinSidings(parseStationLoad(LOAD), parseStationFlow(FLOW));
 }
 
-describe('original packet membership flow', () => {
-  const packet = { station: 'loading-dock', basis: 'packet-membership-v1', arrived: 3, departed: 2, served: 0, unknown: [] };
-  test('packet departures determine net without manufacturing service', () => {
-    const flow = parseStationFlow({ data: [packet], window_hours: 24 });
-    expect(flow.rows[0]?.basis).toBe('packet-membership-v1');
+// The server's default basis since design 7b8ed079 car 1: each station
+// counted over its steps' ready and completion stamps.
+describe('step-window flow', () => {
+  const counted = { station: 'loading-dock', basis: 'step-window-v1', arrived: 3, departed: 2, served: 2, net: 1 };
+  test('a counted row is a measured rate: arrived, departed and served, net from the departures', () => {
+    const flow = parseStationFlow({ data: [counted], window_hours: 24 });
+    expect(flow.rows[0]?.basis).toBe('step-window-v1');
     const siding = joinSidings(parseStationLoad(LOAD), flow).find((s) => s.station === 'loading-dock')!;
-    expect(siding.flow).toMatchObject({ kind: 'counted', arrived: 3, departed: 2, served: 0, net: 1 });
-    expect(whyNotMoving(siding, 24)).toContain('2 departed');
+    expect(siding.flow).toMatchObject({ kind: 'counted', basis: 'step-window-v1', arrived: 3, departed: 2, served: 2, net: 1 });
+    expect(whyNotMoving(siding, 24)).toContain('3 arrived, 2 served');
     expect(whyNotMoving(siding, 24)).not.toContain('Nothing left');
   });
-  test('invalid counts, missing departures and unknown intervals cannot become counted flow', () => {
-    for (const invalid of [{ departed: undefined }, { arrived: -1 }, { served: 0.5 }, { unknown: [{ reason: 'original state missing' }] }, { basis: 'future-basis' }]) {
-      const flow = parseStationFlow({ data: [{ ...packet, ...invalid }] });
+  test('invalid counts, missing departures and the retired replay basis cannot become counted flow', () => {
+    for (const invalid of [{ departed: undefined }, { arrived: -1 }, { served: 0.5 }, { basis: 'packet-membership-v1' }, { basis: 'future-basis' }]) {
+      const flow = parseStationFlow({ data: [{ ...counted, ...invalid }] });
       const siding = joinSidings(parseStationLoad(LOAD), flow).find((s) => s.station === 'loading-dock')!;
       expect(siding.flow.kind).toBe('unavailable');
     }
@@ -152,18 +142,20 @@ describe('parseStationLoad / parseStationFlow', () => {
   test('a row carries the Workflow kind its station holds apart from the station kind, and null when it names none (c7c5c1de)', () => {
     const rows = parseStationLoad({
       data: [
-        { station: 'loading-dock', kind: 'batch', workflow_kind: 'ship-a-change', depth: 1 },
+        { station: 'loading-dock', kind: 'equipment', workflow_kind: 'ship-a-change', depth: 1 },
         { station: 'q.platform-admin.task', kind: 'constraint', workflow_kind: null, depth: 2 },
-        { station: 'older-server', kind: 'batch', depth: 0 },
+        { station: 'older-server', kind: 'equipment', depth: 0 },
       ],
     });
     expect(rows.map((r) => [r.kind, r.workflowKind])).toEqual([
-      ['batch', 'ship-a-change'],
+      ['equipment', 'ship-a-change'],
       ['constraint', null],
-      ['batch', null],
+      ['equipment', null],
     ]);
     const joined = joinSidings(rows, { rows: [], windowHours: 24, asOf: null });
     expect(joined.find((s) => s.station === 'loading-dock')?.workflowKind).toBe('ship-a-change');
+    expect(rows[0]).not.toHaveProperty('capabilityRoles');
+    expect(joined[0]).not.toHaveProperty('capabilityRoles');
   });
 
   test('a well-formed envelope with no rows is the only empty', () => {
@@ -191,7 +183,7 @@ const OVERLAPPING = {
     { station: 'q.platform-admin.task', kind: 'constraint', depth: 297, also_elsewhere: 213 },
     { station: 'a.platform-admin.opus-5-1m', kind: 'constraint', depth: 213, also_elsewhere: 213 },
     { station: 'q.platform-admin.sign-off', kind: 'constraint', depth: 6, also_elsewhere: 0 },
-    { station: 'loading-dock', kind: 'batch', depth: 1, also_elsewhere: 0 },
+    { station: 'loading-dock', kind: 'equipment', depth: 1, also_elsewhere: 0 },
     { station: 'q.cto.sign-off', kind: 'constraint', depth: 0, also_elsewhere: 0 },
   ],
   total: 5,

@@ -1,0 +1,12 @@
+{
+  "about": "READ-ONLY fixed Talos reading at one registry-pinned node: services or one fixed service status; bounded dmesg; six fixed /proc files; kubelet/etcd/machined logs with server-side tail 200. Fixed etcd-members, etcd-status and etcd-alarms require a control-plane registry role agreeing with the actual Kubernetes Node role/address. Etcd output is a single-node observation with completeness and health UNKNOWN; empty alarm output is not zero alarms. Warning stderr, withheld or clipped etcd rows refuse clean completion while preserving safe partial output. Talos formats database sizes approximately; this is not exact-byte, quota, fsync or commit-latency evidence. No actions, arbitrary paths, host files, configuration or secrets. Each child channel is limited during collection to 262144 bytes, then at most 200 safe lines; truncation, withholding and failures are explicit. dmesg has no numeric server tail in Talos v1.13.8, so it is finite and locally bounded. Container-side timeout20s and owned collector25s; image preparation120s plus registry15s. Output excludes credential-like lines, PEM blocks, hardware serial labels and long opaque values. Raw unsafe bytes are not published. A failed or incomplete read is not healthy. Backlogs ff99932e and partial 803e10ed.",
+  "hosts": ["forge"],
+  "capture": "separate-streams",
+  "argv": ["infra/forge/talos-node-health.sh", "{1}", "{2}", "{3}"],
+  "params": [
+    {"name": "node", "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"},
+    {"name": "reading", "one_of": ["services", "service", "dmesg", "pressure-memory", "pressure-io", "pressure-cpu", "meminfo", "uptime", "loadavg", "logs", "etcd-members", "etcd-status", "etcd-alarms"]},
+    {"name": "service", "one_of": ["machined", "kubelet", "etcd", "containerd", "apid", "trustd"], "optional": true}
+  ],
+  "timeout": 180
+}

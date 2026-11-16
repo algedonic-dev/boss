@@ -71,6 +71,21 @@ class Readback(unittest.TestCase):
         return calls
     def test_good_remote_copy(self):
         self.run_check(b'-- PostgreSQL database dump\nCREATE TABLE audit_log ();\n-- PostgreSQL database dump complete\n--\n\n')
+    def test_the_restore_drill_keeps_exactly_the_verified_bytes(self):
+        # drill-gcs-restore (backlog 156eb6e5) restores what this check
+        # verified, so the sink receives the same pinned bytes the digest,
+        # gzip -t and the trailer reader saw — never a second download.
+        body = b'-- PostgreSQL database dump\nCREATE TABLE audit_log ();\n-- PostgreSQL database dump complete\n--\n\n'
+        blob = gzip.compress(body)
+        data = obj('boss-20261002-091000.sql.gz', '2026-10-02T09:10:00Z', size=len(blob))
+        def read(request, timeout):
+            if 'alt=media' in request.full_url: return io.BytesIO(blob)
+            return io.BytesIO(json.dumps(dict(kind='storage#objects', items=[data])).encode())
+        sink = io.BytesIO()
+        with patch.object(m, 'urlopen', read), tempfile.TemporaryDirectory() as work:
+            receipt = m.verify('test-bucket', 'fake-token', work, None, sink)
+        self.assertEqual(sink.getvalue(), blob)
+        self.assertEqual(receipt['sha256'], hashlib.sha256(blob).hexdigest())
     def test_current_pg16_restrict_footer(self):
         self.run_check(b'-- PostgreSQL database dump\n\\restrict TestKey123\nCREATE TABLE audit_log ();\n-- PostgreSQL database dump complete\n--\n\n\\unrestrict TestKey123\n\n')
         for ending in [b'\\unrestrict WrongKey', b'\\unrestrict TestKey123\nCREATE TABLE missing ();']:

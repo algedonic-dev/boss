@@ -25,7 +25,7 @@ fn context() -> (SelectionContext, boss_core::publisher::EventStamp, Step) {
     let station = StationSpec::draft(
         "fixture",
         "Fixture",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate::default(),
         stamp.timestamp,
     );
@@ -53,6 +53,7 @@ fn context() -> (SelectionContext, boss_core::publisher::EventStamp, Step) {
         station,
         scope: JobScope::All,
         active_workflows: workflows,
+        tree_selection: None,
         validated_job: job,
         validated_step: step.clone(),
     };
@@ -156,6 +157,7 @@ fn replay(events: &[boss_core::event::Event]) -> Vec<boss_events::replay::Replay
         .iter()
         .enumerate()
         .map(|(index, event)| boss_events::replay::ReplayEvent {
+            raw_payload: None,
             audit_id: index as i64,
             event_id: event.id,
             kind: event.kind.clone(),
@@ -241,7 +243,7 @@ fn actual_memory_definition_guards_copy_rows_in_native_byte_order() {
         let mut row = StationSpec::draft(
             &name,
             "Fixture",
-            StationKind::Batch,
+            StationKind::Group,
             StationPredicate::default(),
             now,
         );

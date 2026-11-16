@@ -98,6 +98,32 @@ authenticated service identity equals the resolver's
 `RoleRecord.actor_id`. Without that, an agent narrowed to its own role
 regains `platform-admin` by signing as `rule:x`.
 
+## A recorded read tier (2026-10-18)
+
+A role is not an access tier. `access_tier = "auditor"` on a row is the
+one tier a row may RECORD (backlog f21804d8, design 600c07d7, decided
+2026-10-17): the existing read-only machinery tier, which the operator
+doors' reads admit and their writes refuse. There is no `operator`
+value, the column's CHECK and the loader both refuse any other word, and
+no row in this directory carries one — the column is a mechanism, and
+recording a tier is an owner's act with its own review.
+
+Its one reader is `boss_jobs::agents::automations::recorded_reader`
+(and `resolve_recorded_reader` / `reresolve_recorded_reader` over the
+registry port). It answers only an EXACT `automation:<slug>` row that
+records a tier — never a family member through `signs_for`, never an id
+a caller asserts in a header, never a tier inferred from `role` — and it
+makes a caller of the row's own role, so every policy grant a read asks
+is still asked of that role. Re-resolving refuses a row whose role or
+tier changed, or which is gone, since the first answer.
+
+The seed treats the field like the others: inserted with a fresh row
+(and carried on its `automation.declared` fact), never stamped over a
+held row and never revoked by a bundle that omits it — the report line
+names `access_tier` when they differ. There is no door yet that records
+or revokes a tier on a held row; that is owed before any observer is
+qualified through one.
+
 ## Adding one
 
 When a new automation starts writing, `boss automations unregistered`

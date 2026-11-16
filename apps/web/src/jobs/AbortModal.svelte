@@ -204,7 +204,7 @@
     padding: 18px 24px 22px;
   }
   .am-terminal { margin: 0 0 6px; font-size: 13px; color: var(--text); }
-  .am-slug { font-family: monospace; font-size: 12px; color: var(--text-dim); }
+  .am-slug { font-family: var(--font-mono); font-size: 12px; color: var(--text-dim); }
   .am-choice {
     border: 1px solid var(--hairline);
     border-radius: var(--radius);

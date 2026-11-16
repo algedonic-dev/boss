@@ -77,7 +77,7 @@ test('dispatcher trigger filter inherits Enamel and adds its chip', async ({ pag
 
 test('monthly-close month inherits Enamel and retains the draft month', async ({ page }) => {
   await installSmokeMocks(page);
-  await mountPage(page, '/ux/finance');
+  await mountPage(page, '/finance');
   await page.getByRole('button', { name: 'Monthly close package', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'Monthly close package' });
   const month = dialog.getByLabel('Month');

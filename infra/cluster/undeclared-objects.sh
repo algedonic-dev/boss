@@ -162,6 +162,12 @@
 
 set -uo pipefail
 
+# A declaration read also runs from a proved, immutable root generation.
+# importlib otherwise writes its readers' __pycache__ into that generation,
+# so a dry-run or another caller makes the next delete fail its byte proof
+# (1dde630c). Keep this on the shared derivation, including direct callers.
+export PYTHONDONTWRITEBYTECODE=1
+
 ME="undeclared-objects"
 say() { echo "$ME: $*" >&2; }
 
@@ -561,6 +567,52 @@ for f in ${OTHER_MANIFESTS+"${OTHER_MANIFESTS[@]}"}; do
     objects_in_file "$f" >> "$declared_all" || exit "$CANNOT_ANSWER"
 done
 
+# THE GATE'S BAY CLAIMS, DECLARED BY THE CODE THAT MAKES THEM (backlog
+# 7b3b1263). Since car ac8d3157 (2026-10-18) a launcher takes a gate bay
+# by creating a suspended, podless Job `gate-bay-<i>` in the gate's own
+# namespace before the gate Job exists, and no one deletes it — the next
+# launcher retakes it by a UID-matched delete. No manifest holds it and
+# nothing owns it, so from that night every dev-pod pre-flight read
+# `Job/gate-bay-0..2 (ns boss-dev)` as undeclared, three builders in forty
+# minutes each judging the check by hand: the permanently-red check
+# nobody reads (CLAUDE.md §Diagnosis).
+#
+# The claim's label and name are read off $BAY_SOURCE_REL — its
+# `CLAIM_APP` and `CLAIM_PREFIX` lines, as TEXT, like the renderer's
+# RENDERS line above and for the same reason (never run what root reads
+# out of $TREE) — and its kind and namespace off the gate template's, the
+# Job it reserves for: `claim_document` is handed the gate's namespace.
+# The match is the label AND the name `<prefix><index>`, the only names
+# the code makes, so a Job copying the label alone is still a finding. A
+# reservation source whose two lines cannot be read is CANNOT ANSWER, not
+# a tree without claims: the live bays would read as undeclared and,
+# through `delete-orphan-object`, deletable from under a running gate.
+BAY_SOURCE_REL="crates/orchestrators/boss-cli/src/gate/reservation/bay.rs"
+GATE_TEMPLATE_REL="infra/gate-runner/gate-runner.yaml"
+BAY_PREFIX=""
+bay_const() { # NAME — the one `pub(crate) const NAME: &str = "..."` line's value
+    LC_ALL=C awk -v k="$1" '
+        index($0, "pub(crate) const " k ": &str = \"") == 1 {
+            n++; v = $0; sub(/^[^"]*"/, "", v)
+            if (sub(/";[[:space:]]*$/, "", v) != 1 || v !~ /^[a-z0-9][a-z0-9-]*$/) bad = 1
+        }
+        END { if (n == 1 && !bad) print v }
+    ' "$TREE/$BAY_SOURCE_REL"
+}
+if [ -f "$TREE/$BAY_SOURCE_REL" ]; then
+    bay_app=$(bay_const CLAIM_APP)
+    BAY_PREFIX=$(bay_const CLAIM_PREFIX)
+    if [ -z "$bay_app" ] || [ -z "$BAY_PREFIX" ]; then
+        cannot_answer \
+            "cannot read the gate bay claim from $BAY_SOURCE_REL — it must carry exactly one" \
+            "  pub(crate) const CLAIM_APP: &str = \"<label>\"; and one CLAIM_PREFIX line of that shape." \
+            "  Refusing to answer without them: every live bay would read as undeclared, and deletable."
+    fi
+    bay_templates=$(LC_ALL=C awk -F'\t' -v f="$GATE_TEMPLATE_REL" -v app="$bay_app" -v src="$BAY_SOURCE_REL" \
+        '$4 == f { print $1 "\t" $2 "\tapp=" app "\t" src }' "$TMP/templates" | LC_ALL=C sort -u)
+    [ -z "$bay_templates" ] || printf '%s\n' "$bay_templates" >> "$TMP/templates"
+fi
+
 declared_count=$(grep -c . "$declared_converged" || true)
 if [ "$declared_count" -lt 20 ]; then
     cannot_answer \
@@ -748,6 +800,11 @@ template_names() { # kind ns
             fi
             names=$(python3 "$FIXTURE_READER" --names \
                 "$TMP/isolation-fixtures.json" 2> "$TMP/get.err") || return 1
+        elif [ "$file" = "$BAY_SOURCE_REL" ]; then
+            # The label AND the bay name: `<prefix><index>` is all it makes.
+            names=$(live_selected_names "$1" "$2" "$sel") || return 1
+            names=$(printf '%s\n' "$names" | LC_ALL=C awk -v p="$BAY_PREFIX" \
+                'index($0, p) == 1 && substr($0, length(p) + 1) ~ /^[0-9]+$/')
         else
             names=$(live_selected_names "$1" "$2" "$sel") || return 1
         fi

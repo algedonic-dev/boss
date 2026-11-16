@@ -101,6 +101,24 @@ fn a_relative_directory_is_refused() {
     assert!(out.contains("must be absolute"), "must say why: {out}");
 }
 
+#[test]
+fn enabling_sharing_names_the_worktree_roster_for_existing_targets() {
+    let (_g, root) = scratch("reclaim-advice");
+    let (ok, out) = run(
+        &root.join("cargo"),
+        &["--on", root.join("shared").to_str().unwrap()],
+    );
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("git worktree list --porcelain"),
+        "discover the actual worktrees: {out}"
+    );
+    assert!(
+        !out.contains("du -sh */target"),
+        "a cwd glob misses sibling worktrees: {out}"
+    );
+}
+
 /// Never edit a setting this script did not write.
 #[test]
 fn a_foreign_target_dir_setting_is_left_alone() {

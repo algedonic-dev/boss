@@ -1,0 +1,8 @@
+{
+  "hosts": ["forge"],
+  "params": [],
+  "argv": ["infra/forge/read-volume-replica-history.sh"],
+  "capture": "separate-streams",
+  "timeout": 310,
+  "about": "Read-only Longhorn v1.11.3 Volume, Replica, Engine and retained core/v1 Event inventories. UID-bound native Events and latest failure/recovery/rebuild fields; missing or expired history is UNKNOWN, never inferred zero or trigger. No trim, volume attach/detach, mutation or setting changes. Same bounded inventory transport: 20s/128KiB per call, 150s/8MiB/128 calls total, 64 pages/4096 rows per list; collection and complete ordered raw attachments bounded to 180s. Timeout310 also allows the existing ops image's bounded120s first pull."
+}

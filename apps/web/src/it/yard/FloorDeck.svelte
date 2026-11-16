@@ -45,13 +45,11 @@
     canOfferCancel,
     cancelRequestBody,
     disciplineLabel,
-    dockUpstream,
     readYard,
     splitAtDeparture,
     trainGateLabel,
     trainGateTroubled,
     troubleLabel,
-    wipAdvisory,
     type CancelRequest,
     type Eta,
     type EtaPhase,
@@ -429,11 +427,6 @@
     packetLoading = false;
   }
 
-  // The dock's walk upstream, when its registry row declares one.
-  // Nothing station-specific lives here: the row says where upstream
-  // is, so a station that names a different queue tomorrow moves this
-  // button with it, and one that names none renders nothing.
-  const upstream = $derived(yard ? dockUpstream(yard.dockStation) : null);
   // The departure line is the merge (0bba59f7): pre-merge trains are
   // yard work where red is status, post-merge is transit where green
   // holds by construction.
@@ -929,11 +922,9 @@
           <h2 class="yard-panel-h">Entity · loading dock</h2>
           <!-- The dock is a station rendered (stations.md): when the
                registry served, the header carries the station's own
-               facts — the ordering discipline (Q2) and the advisory
-               WIP verdict (Q3: warn, don't enforce). The walk upstream
-               (David, feedback 3ccb79f5) sits beside them: a queue that
-               isn't filling is diagnosed upstream. Navigation, not
-               content. -->
+               ordering discipline. The walk upstream is the station
+               page's, derived from the tree (design deba3000), not a
+               button here. -->
           {#if yard.dockStation.source !== 'station'}
             <!-- NO READING. The dock's membership is the loading-dock
                  row's to state — the predicate plus the hold clause —
@@ -951,13 +942,7 @@
           {:else}
             <div class="yard-entity-title">{yard.dock.length} car{yard.dock.length === 1 ? '' : 's'} parked</div>
             <div class="yard-entity-sub yard-dock-facts">
-              {#if upstream}
-                <button type="button" class="yard-upstream" title={upstream.title} onclick={() => navigate(upstream.href)}>{upstream.label}</button>
-              {/if}
               <span class="yard-discipline" title="queue discipline">{disciplineLabel(yard.dockStation.discipline)}</span>
-              {#if wipAdvisory(yard.dockStation)}
-                <span class="yard-wip" title="over the station's advisory WIP limit">{wipAdvisory(yard.dockStation)}</span>
-              {/if}
             </div>
           {/if}
           <dl class="yard-kv">
@@ -1735,32 +1720,8 @@
   }
   .yard-section::after { content: ''; flex: 1; border-top: 1px solid var(--hairline); }
   .yard-n { color: var(--static); }
-  /* Station facts in the dock's header: discipline stays quiet
-     (static grey, same mono caps), the WIP advisory wears --warn —
-     the one state color, present only when the queue exceeds its
-     declared bandwidth. */
+  /* Station discipline in the dock's header stays quiet. */
   .yard-discipline { font-family: var(--font-mono); font-size: 11px; color: var(--static); letter-spacing: var(--ls-nav); text-transform: uppercase; }
-  .yard-wip { font-family: var(--font-mono); font-size: 11px; color: var(--warn); border: 1px solid var(--warn);
-    padding: 1px 7px; letter-spacing: 0.1em; }
-  /* The walk upstream: the chip grammar exactly (mono caps, hairline,
-     radius 0, --static) — an instrument, not a call to action. It
-     brightens to --signal on hover and focus. */
-  .yard-upstream {
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
-    color: var(--static);
-    background: transparent;
-    border: 1px solid var(--hairline);
-    border-radius: 0;
-    padding: 2px 8px;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: color 120ms ease, border-color 120ms ease;
-  }
-  .yard-upstream:hover, .yard-upstream:focus-visible {
-    color: var(--signal); border-color: var(--signal);
-  }
   .yard-board { width: 100%; border-collapse: collapse; background: var(--card);
     border: 1px solid var(--hairline); font-size: 14px; }
   .yard-board th { font-family: var(--font-mono); font-size: 11px;
@@ -2012,6 +1973,5 @@
   @media (max-width: 1000px) { .yard-deck { grid-template-columns: 1fr; } }
   @media (prefers-reduced-motion: reduce) {
     .yard-dot, .yard-lamp-dot { animation: none; }
-    .yard-upstream { transition: none; }
   }
 </style>

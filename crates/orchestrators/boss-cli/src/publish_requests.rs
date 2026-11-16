@@ -230,18 +230,12 @@ fn stdout_of(out: &std::process::Output) -> String {
 /// What the forge holds for this branch, live — never a tracking ref,
 /// which can be stale (`boss publish` learned this: verify by effect).
 fn ls_remote_branch(clone: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
-    let out = git_in(
-        clone,
-        &["ls-remote", remote, &format!("refs/heads/{branch}")],
-    )?;
+    let reference = format!("refs/heads/{branch}");
+    let out = git_in(clone, &["ls-remote", remote, &reference])?;
     if !out.status.success() {
         bail!("git ls-remote {remote} failed: {}", stderr_of(&out));
     }
-    Ok(stdout_of(&out)
-        .split_whitespace()
-        .next()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string))
+    Ok(crate::receipt::exact_ref_head(&stdout_of(&out), &reference))
 }
 
 /// The git half of one packet, given a decoded bundle on disk. Pure of
@@ -547,7 +541,10 @@ pub(crate) async fn run(clone: &str, remote: &str, dry: bool, now: DateTime<Utc>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    pub(crate) fn head_for_exact_ref_test(branch: &str) -> anyhow::Result<Option<String>> {
+        super::ls_remote_branch(std::path::Path::new("."), "origin", branch)
+    }
     use super::*;
 
     // -----------------------------------------------------------------

@@ -28,6 +28,7 @@ pub mod car_release;
 pub mod car_retire;
 pub mod car_unland;
 pub mod channels;
+pub mod claims_console;
 pub mod conditional_metadata;
 pub mod corrections;
 pub mod credential_executor;
@@ -43,17 +44,31 @@ pub mod dock_red;
 pub mod escalation;
 pub mod estate_seed;
 pub mod events;
+pub mod execution_inputs;
 pub mod executor_attestation;
 pub mod experiments;
+pub mod failure_facts;
 pub mod field_writer;
 pub mod first_record;
+// The fold fixtures' one budget and stall (backlog ebbf38c6).
+#[cfg(any(test, feature = "test-support"))]
+mod fixture_budget;
 pub mod flake;
 pub mod flights;
+pub mod flow_resources;
+mod flow_resources_memory;
+#[cfg(feature = "postgres")]
+mod flow_resources_pg;
+#[cfg(feature = "postgres")]
+mod flow_resources_replay;
+pub mod fulfils;
 pub mod full_gate_on_main;
+pub mod gate_handoff;
 pub mod gate_queue_observation;
 pub mod gate_reservation;
 pub mod http;
 pub mod human_only;
+pub mod human_presentation;
 pub mod in_memory;
 pub mod job_edges;
 pub mod job_outcome;
@@ -63,9 +78,6 @@ pub mod landing;
 pub mod list_every;
 pub mod lost_gate;
 pub mod me;
-#[cfg(feature = "postgres")]
-mod membership_history_pg;
-pub mod membership_replay;
 pub mod memory_selection_store;
 pub mod metadata_containment;
 pub mod metadata_immutability;
@@ -80,17 +92,24 @@ pub mod native_selection_store;
 pub mod next_up;
 pub mod open_authority;
 pub mod opened_by;
+pub mod ops_verbs;
 pub mod origin;
 pub mod orphan_steps;
 pub mod outranks;
 pub mod owned_wait_queue;
+pub mod packet_budget;
+pub mod pick;
 pub mod plugin_version_repair;
 pub mod policy_glue;
+pub mod pools;
 pub mod port;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod priority;
 pub mod probe;
 pub mod protocol_conversion;
+pub mod publish_passkey;
+pub mod reading_cache;
 #[cfg(feature = "postgres")]
 pub mod rebuild;
 pub mod records_before_claim;
@@ -98,8 +117,16 @@ pub mod refusals;
 pub mod region_states;
 pub mod regions;
 pub mod registry;
+pub mod registry_export;
+pub mod release_window;
 pub mod repin;
+mod resource_history;
+pub mod resource_leases;
+#[cfg(feature = "postgres")]
+mod resource_leases_pg;
+pub mod resources;
 pub mod routes;
+pub mod routes_every_stand;
 pub mod runner_credential;
 pub mod scheduling;
 pub mod schema_level;
@@ -114,11 +141,16 @@ pub mod station_quarantine;
 pub mod station_queue;
 pub mod station_reach;
 pub mod station_seed;
+pub mod station_tree;
+pub mod station_window;
 pub mod stations;
+pub mod step_executor;
 pub mod step_metadata_write;
+pub mod step_release;
 pub mod stranded;
 pub mod thirds;
 pub mod trust;
+pub mod worker_teardown;
 pub mod workflow_lint;
 pub mod workflow_quarantine;
 pub mod workflow_seed;
@@ -135,6 +167,7 @@ pub mod sensors;
 pub mod step_plugin_seed;
 pub mod step_plugins;
 pub mod step_registry;
+pub mod step_wait;
 pub mod subject_existence;
 pub mod surface_opens;
 pub mod tenant_publishes;
@@ -155,8 +188,8 @@ pub use station_queue::{DisciplineKey, StationPredicate, StationQueue, evaluate_
 #[cfg(feature = "postgres")]
 pub use stations::PgStations;
 pub use stations::{
-    InMemoryStations, StationCapability, StationError, StationKind, StationLens, StationRegistry,
-    StationSpec, StationUpstream,
+    InMemoryStations, StationCapability, StationError, StationKind, StationLens, StationMode,
+    StationRegistry, StationSpec,
 };
 #[cfg(feature = "postgres")]
 pub use step_plugins::PgStepPlugins;
@@ -164,3 +197,9 @@ pub use step_plugins::{InMemoryStepPlugins, StepPluginError, StepPluginRegistry,
 pub mod conditional_completion;
 
 pub mod state_receipt;
+
+pub mod browser_qualification;
+pub mod completion_contract;
+
+pub mod browser_qualification_adapter;
+pub mod item_awaits_its_car;

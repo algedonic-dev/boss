@@ -277,7 +277,7 @@ pub(crate) async fn judge_car(
     let diff = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["diff", "--name-only", base, tip, "--"])
+        .args(["diff", "--no-renames", "--name-only", base, tip, "--"])
         .args([CADENCE_BUNDLE, STATIONS_BUNDLE, STEP_PLUGINS_BUNDLE])
         .output();
     let changed: Vec<String> = match diff {

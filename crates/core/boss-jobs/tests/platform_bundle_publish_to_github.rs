@@ -622,3 +622,81 @@ fn publish_to_github_v12_a_refused_merge_closes_the_packet_so_the_next_publish_r
         Some("merge-refused")
     );
 }
+
+/// v14 (backlog adddf958, found 2026-09-25 on f4dd3df3 by analyst run
+/// 701ccb98). The measure step's field list lives twice: in the row, and
+/// in the `record` map of the dispatcher rule
+/// publish-measure-lands-the-drift-reading, which completes the step by
+/// copying `drift_refresh` into it. The rule and the procedure both
+/// wrote `newly_public_files` while the row declared no such field, so
+/// `boss step complete` refused it by name. CLAUDE.md §9a: a fact that
+/// lives twice gets an equality test, so every key the rule records must
+/// be a declared measure field.
+///
+/// And `newly_public` names ONE count: the rule copies it from
+/// `drift_refresh.newly_public_sensitive` (the review list's length),
+/// while `drift_refresh.newly_public` is the total of every added file
+/// (271 against 5 that day). The procedure must say which, so a reader
+/// comparing the two meets a named difference, not a disagreement.
+#[test]
+fn publish_to_github_v14_measure_declares_every_field_the_rule_records() {
+    let wf = bundled("publish-to-github");
+    let measure = wf
+        .steps
+        .iter()
+        .find(|s| s.title == "measure")
+        .expect("publish-to-github has a `measure` step");
+
+    let rule_file = boss_testing::repo_root()
+        .join("infra/dispatcher/rules/publish-measure-lands-the-drift-reading.toml");
+    let rule: toml::Value = toml::from_str(
+        &std::fs::read_to_string(&rule_file).expect("the measure-landing rule is authored"),
+    )
+    .expect("the rule file parses");
+    let action = &rule["rule"][0]["do"][0];
+    assert_eq!(
+        action["handler"].as_str(),
+        Some("jobs.complete_step_from_record")
+    );
+    assert_eq!(action["args"]["step"].as_str(), Some("\"measure\""));
+    // `record` is an expression string: a JSON string literal whose
+    // content is the JSON map of step field -> drift_refresh pointer.
+    let literal = action["args"]["record"]
+        .as_str()
+        .expect("record is an expression string");
+    let inner: String =
+        serde_json::from_str(literal).expect("record is a quoted JSON string literal");
+    let record: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&inner).expect("record holds a JSON object");
+    assert!(!record.is_empty(), "the rule records at least one field");
+
+    for field in record.keys() {
+        assert!(
+            measure.fields.iter().any(|f| &f.name == field),
+            "the rule records `{field}` onto measure, but the row does not declare it, \
+             so a completion carrying it is refused by name (adddf958)"
+        );
+    }
+    let files = measure
+        .fields
+        .iter()
+        .find(|f| f.name == "newly_public_files")
+        .expect("measure declares newly_public_files");
+    assert!(
+        !files.required,
+        "newly_public_files changes what a completion MAY record, not what it must carry"
+    );
+
+    assert_eq!(
+        record.get("newly_public"),
+        Some(&serde_json::json!("/drift_refresh/newly_public_sensitive")),
+        "the rule copies the SENSITIVE count into newly_public"
+    );
+    let procedure = measure.metadata_defaults["procedure"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        procedure.contains("newly_public_sensitive"),
+        "measure's procedure must name which count newly_public is: {procedure}"
+    );
+}

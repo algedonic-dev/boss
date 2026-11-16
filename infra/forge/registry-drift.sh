@@ -242,7 +242,7 @@ echo "$NAME: protocols read at $BOSS_JOBS_URL, rules at ${BOSS_DISPATCHER_URL:-<
 api() {
     local method=$1 path=$2 out=$3 body=${4:-} code send=()
     [ -z "$body" ] || send=(-H 'content-type: application/json' --data-binary "@$body")
-    code=$(curl -sS -m 20 -X "$method" -o "$out" -w '%{http_code}' \
+    code=$(curl -q -sS -m 20 -X "$method" -o "$out" -w '%{http_code}' \
         -H "x-boss-user: $WRITER" ${MT_HDR:+-H "$MT_HDR"} ${send[@]+"${send[@]}"} \
         "$BOSS_JOBS_URL$path" 2>>"$work/curl.err") || true
     printf '%s' "${code:-000}"

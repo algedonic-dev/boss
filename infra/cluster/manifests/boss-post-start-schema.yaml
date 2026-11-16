@@ -1,0 +1,71 @@
+# 78625ebd: optional indexes owe a supervised retry, not an init barrier.
+# The chore selector pins this image to each instance's deployed build.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: boss-post-start-schema
+  namespace: boss
+  labels:
+    boss-chore: "true"
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 60
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      # 278s open + 606s act + 21s precheck leaves 295s for report/attachment.
+      activeDeadlineSeconds: 1200
+      template:
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1500
+            runAsGroup: 1500
+            seccompProfile: {type: RuntimeDefault}
+          volumes:
+            - name: machine-token
+              secret: {secretName: boss-machine-token, optional: true, defaultMode: 0444}
+          containers:
+            - name: chore
+              image: 10.20.0.15:3000/david/boss:latest
+              command: ["/bin/bash", "-ec"]
+              args:
+                - |
+                  rc=0
+                  precheck=$(mktemp)
+                  trap 'rm -f -- "$precheck"' EXIT
+                  python3 -B /opt/boss/infra/postgres/post-start-bound.py --pending >"$precheck" 2>&1 || rc=$?
+                  if [ "$rc" -eq 0 ]; then
+                      cat -- "$precheck"
+                      exit 0
+                  fi
+                  exec 3<"$precheck"
+                  rm -f -- "$precheck"
+                  /usr/local/bin/boss-chore.sh maintenance-post-start-schema "Post-start schema indexes" -- python3 -B /opt/boss/infra/postgres/post-start-bound.py --apply-after-precheck "$rc"
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: {drop: ["ALL"]}
+              resources:
+                requests: {cpu: 50m, memory: 64Mi}
+                limits: {memory: 256Mi}
+              volumeMounts:
+                - {name: machine-token, mountPath: /etc/boss/machine-token, readOnly: true}
+              env:
+                - {name: PGHOST, value: postgres}
+                - {name: PGUSER, value: boss}
+                - name: PGPASSWORD
+                  valueFrom: {secretKeyRef: {name: boss-secrets, key: postgres-password}}
+                - name: DATABASE_URL
+                  valueFrom: {secretKeyRef: {name: boss-secrets, key: database-url}}
+                - name: BOSS_JOBS_URL
+                  value: http://boss-jobs-internal.boss.svc.cluster.local:7900
+                - {name: BOSS_WRAP_OPEN_RETRY, value: "3"}
+                # Fixed 600s execution + 5s TERM + 1s KILL/reap cleanup.
+                - {name: BOSS_ACT_BOUND_S, value: "606"}
+                - {name: BOSS_CHORE_FULL_OUTPUT, value: "1"}
+                - {name: BOSS_MACHINE_TOKEN_HOSTS, value: ".boss.svc.cluster.local"}

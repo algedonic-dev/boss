@@ -146,7 +146,8 @@ case "${1:---status}" in
         mkdir -p "$dir"
         echo "dev-shared-target: ON — every cargo build on this machine now uses $dir"
         echo "  Existing per-worktree target/ dirs are NOT removed; they are simply no longer written to."
-        echo "  Reclaim them with:  du -sh */target | sort -hr"
+        echo "  Find the actual worktrees with: git worktree list --porcelain"
+        echo "  Inspect each listed worktree's target/ with du -sh before reclaiming an idle build directory."
         echo "  One build at a time: cargo locks a target dir exclusively, so concurrent gates serialize."
         ;;
     --off)

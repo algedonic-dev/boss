@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use boss_jobs::http::{JobsApiState, router_shared, run_mover};
+use boss_jobs::http::{JobsApiState, router_shared, run_map_warmer, run_mover};
+
+#[path = "boss_jobs_api/database_diagnostics.rs"]
+mod database_diagnostics;
 use boss_jobs::jobs_config::JobsApiConfig;
 use boss_jobs::port::JobsRepository;
 use boss_nats::NatsEventBus;
@@ -143,9 +146,15 @@ async fn main() -> Result<()> {
     // Postgres, or refuse: the in-memory serving branch is deleted (below).
     if let Some(ref pg_url) = cfg.postgres_url {
         info!("using Postgres jobs storage");
+        // Named, so a slow request's moment can tell this pool's backends
+        // from every other client of the database (d9b39685).
+        let options = pg_url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .with_context(|| "parsing the Postgres URL")?
+            .application_name("boss-jobs");
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(20)
-            .connect(pg_url)
+            .connect_with(options)
             .await
             .with_context(|| "connecting to Postgres")?;
         // Subject existence validator: one indexed lookup against the
@@ -168,6 +177,9 @@ async fn main() -> Result<()> {
             pool.clone(),
         )));
         info!("audit_log persistence enabled");
+        // Serve native selection from this pool; its actor/alias/policy
+        // locks conflict with the actual writers through receipt COMMIT.
+        // Credential identity and mode retain the bounded ingress lifetime.
         // Pass the URLs alongside the pool so the demo-loop
         // restart-epoch endpoint can spawn boss-rebuild-all against the
         // same DB, and purge the JetStream delivery buffer on the same
@@ -365,6 +377,7 @@ async fn run_server<R: JobsRepository + 'static>(
     // and reads its window back from this pool's audit_log (e0bdba74).
     role_pool: &sqlx::PgPool,
 ) -> Result<()> {
+    let process_shutdown = boss_core::gate_evidence::ShutdownGuard::hold();
     // Start axum HTTP server.
     let step_registry = Arc::new(boss_jobs::step_registry::StepRegistry::v1());
     info!(
@@ -466,9 +479,52 @@ async fn run_server<R: JobsRepository + 'static>(
     // dispatcher port, overridable the way the people URL is.
     let dispatcher_url =
         std::env::var("BOSS_DISPATCHER_URL").unwrap_or_else(|_| boss_ports::url("dispatcher"));
+    let mut completion_contracts = boss_jobs::completion_contract::Contracts::new();
+    if let Some(workflows) = &kind_registry {
+        let files = Arc::new(
+            boss_jobs::browser_qualification_adapter::HttpObservationFiles::new(
+                std::env::var("BOSS_CONTENT_URL").unwrap_or_else(|_| boss_ports::url("content")),
+            )?,
+        );
+        for (name, accepting) in [
+            ("attended-browser-qualify-v1", false),
+            ("attended-browser-accept-v1", true),
+        ] {
+            completion_contracts.insert(
+                name.into(),
+                Arc::new(
+                    boss_jobs::browser_qualification_adapter::BrowserQualification {
+                        jobs: jobs.clone(),
+                        workflows: workflows.clone(),
+                        agents: agents.clone(),
+                        files: files.clone(),
+                        accepting,
+                    },
+                ) as Arc<dyn boss_jobs::completion_contract::CompletionContract>,
+            );
+        }
+    }
+    let claims_history: Arc<dyn boss_jobs::claims_console::ClaimsHistory> = Arc::new(
+        boss_jobs::claims_console::PgClaimsHistory::new(role_pool.clone()),
+    );
+    let claims_history_clock: Arc<dyn boss_clock_client::ClockClient> =
+        Arc::new(boss_clock_client::WallClockClient);
+    let claims_projection_task = tokio::spawn(boss_jobs::claims_console::source::run(
+        claims_history.clone(),
+        role_pool.clone(),
+        claims_history_clock.clone(),
+        cancel_rx.clone(),
+    ));
     let state = JobsApiState {
+        claims_history: Some(claims_history),
+        claims_history_clock,
+        completion_contracts,
+        release_actors: Some(agents.clone()),
         job_edges,
-        stations,
+        stations: stations.clone(),
+        // The live pools door (`/api/pools`, backlog f399458f): the same
+        // registry the seed publishes into and the claim door reads.
+        pools: Some(Arc::new(boss_jobs::pools::PgPools::new(role_pool.clone()))),
         jobs,
         bus,
         publisher,
@@ -481,6 +537,11 @@ async fn run_server<R: JobsRepository + 'static>(
         subject_existence,
         roster,
         clock: clock.clone(),
+        // The passkey rule of a workflow publish reads the admission edges
+        // off the dispatcher's LIVE rule registry (backlog a4b57aca).
+        publish_rules: Some(Arc::new(
+            boss_jobs::department::rules::ReqwestDispatcherRules::new(dispatcher_url.clone()),
+        )),
         // The yard-status read-model reads these registries directly (the
         // /api/cadence and /api/delivery doors are operator-only, so the
         // browser cannot). Clone the Arc — the same repos back both the
@@ -493,11 +554,12 @@ async fn run_server<R: JobsRepository + 'static>(
         // every claim is admitted as before.
         dispatcher_firings,
         schema_ledger,
+        schema_read_timeout: boss_jobs::schema_level::READ_TIMEOUT,
         // Presence tickets verify HERE, with the gateway's own key read
         // from the file the gateway signs with (backlog 72fe3640): this
         // door is reachable without the gateway, so a header it did not
         // check is a header anyone with the machine token could write.
-        presence_key: Some(Arc::new(boss_jobs::http::PresenceKey::from_env())),
+        presence_key: Some(Arc::new(boss_jobs::http::PresenceKey::from_env().await)),
         agent_budget: agent_runs.as_ref().map(|log| {
             Arc::new(boss_jobs::agent_budget::BudgetDoor {
                 agents: agents.clone(),
@@ -510,6 +572,7 @@ async fn run_server<R: JobsRepository + 'static>(
         // schedule read as the viewer.
         credentials: credentials.clone(),
         sensors: sensors.clone(),
+        map_readings: Arc::new(boss_jobs::http::MapReadings::new()),
         dispatcher_schedule: Some(Arc::new(
             boss_jobs::dispatcher_schedule::ReqwestDispatcherSchedule::new(dispatcher_url.clone()),
         )),
@@ -526,6 +589,8 @@ async fn run_server<R: JobsRepository + 'static>(
     // audit log's head once a second (design e765b3fc §3). It stops when
     // the server does.
     tokio::spawn(run_mover(state.clone(), cancel_rx.clone()));
+    tokio::spawn(run_map_warmer(state.clone(), cancel_rx.clone()));
+    info!("yard map warmer started for authorized default and active readers");
     info!("yard mover started: /api/yard/moves and /api/yard/moves/stream");
     let scheduling_role_guards = state.role_guards.clone();
     let mut app = router_shared(state);
@@ -593,6 +658,24 @@ async fn run_server<R: JobsRepository + 'static>(
             boss_jobs::tenant_publishes::http::TenantPublishesApiState { repo },
         ));
     }
+    // The recorder and the slow-moment observer get two connections of
+    // their own, so a queue on the serving pool is observed, never joined:
+    // 14 of 51 recorder failures in one pod hour were its 1 s bound expiring
+    // on that pool (d9b39685). Lazy, so boot never waits on it.
+    let telemetry_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(2))
+        .connect_lazy_with(
+            (*role_pool.connect_options())
+                .clone()
+                .application_name("boss-jobs-telemetry"),
+        );
+    let request_latency = Arc::new(boss_jobs::sensors::request_latency::PgLatency::new(
+        telemetry_pool.clone(),
+    ));
+    app = app.merge(boss_jobs::sensors::request_latency::router(
+        request_latency.clone(),
+    ));
     if let Some(repo) = sensors {
         info!("sensors mounted at /api/sensors (+ /batch, /<id>/readings, /<id>/polled, /sweep)");
         app = app.merge(boss_jobs::sensors::http::router(
@@ -624,6 +707,14 @@ async fn run_server<R: JobsRepository + 'static>(
             // registry this service serves — the list an employee's is
             // validated against too (backlog c87e3d6d).
             departments: departments.clone(),
+            // An agent's model class is the <class> of an active
+            // robots:<class> pool in this database's registry
+            // (factory taxonomy T2d, backlog 06d8988b).
+            pools: Some(Arc::new(boss_jobs::pools::PgPools::new(role_pool.clone()))),
+            // An agent's seats name active stations of the registry
+            // this service serves at /api/stations (design 506e0a1c
+            // car 1, backlog 1a74c2bc).
+            stations,
         },
     ));
     // The departments the departments registry holds (the table, not
@@ -682,10 +773,7 @@ async fn run_server<R: JobsRepository + 'static>(
         boss_jobs::agents::LoginDoor::new(agents, door_publisher)
             .judging_rows_by_the_mounted_word(),
     );
-    let app = app.layer(axum::middleware::from_fn_with_state(
-        door,
-        boss_jobs::agents::resolve_login,
-    ));
+    let app = database_diagnostics::mount_with_login(app, role_pool.clone(), door);
     info!("login door mounted: agent logins resolve through actor_aliases (window open)");
     // The credential door (design f623e425 Q1, option A; backlog
     // 6c9183de): a runner that PRESENTS its host's credential is known to
@@ -717,8 +805,6 @@ async fn run_server<R: JobsRepository + 'static>(
     // (infra/forge/cluster-watchdog.sh) makes without a token. What it
     // would refuse is stated on the log through the outbox (design
     // 21946380).
-    let app =
-        boss_core::machine_gate::mount(app, "jobs", &["/api/jobs/health"], Some(gate_recorder));
     let http_addr: SocketAddr = http_bind
         .parse()
         .with_context(|| format!("invalid http_bind `{http_bind}`"))?;
@@ -726,6 +812,29 @@ async fn run_server<R: JobsRepository + 'static>(
         .await
         .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
     info!(addr = %http_addr, "jobs HTTP API listening");
+
+    let (timing, latency_worker) = boss_core::request_latency::Timing::start_observed(
+        request_latency,
+        "jobs".into(),
+        boss_core::startup::build_commit()
+            .unwrap_or("unavailable")
+            .to_string(),
+        Arc::new(boss_clock_client::wall_now),
+        boss_jobs::sensors::request_latency::classify,
+        Some(Arc::new(
+            boss_jobs::sensors::request_latency::PgSlowObserver::new(
+                role_pool.clone(),
+                telemetry_pool,
+            ),
+        )),
+    );
+    let app = boss_core::machine_gate::mount_with_request_latency(
+        app,
+        "jobs",
+        &["/api/jobs/health"],
+        Some(gate_recorder),
+        timing,
+    );
 
     let role_refresh = tokio::spawn(roles.run_refresh_loop(
         role_source,
@@ -739,30 +848,33 @@ async fn run_server<R: JobsRepository + 'static>(
         let shutdown = async move {
             let _ = http_rx.changed().await;
         };
-        if let Err(e) = axum::serve(listener, app)
+        let served = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown)
-            .await
-        {
+            .await;
+        if let Err(e) = &served {
             error!(error = %e, "HTTP server exited with error");
         }
+        served
     });
 
-    let interrupt = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!(%error, "jobs interrupt signal unavailable");
-            std::future::pending::<()>().await;
-        }
-    };
-    // Gate evidence owns process termination; this path owns interrupts.
-    interrupt.await;
+    process_shutdown.requested().await;
     info!("shutdown signal received");
     let _ = cancel_tx.send(true);
     role_refresh
         .await
         .context("joining jobs actor-role refresh")??;
 
-    let _ = http_task.await;
+    let http_result = http_task.await;
+    if matches!(&http_result, Ok(Ok(()))) {
+        latency_worker.shutdown().await;
+    } else {
+        latency_worker.shutdown_incomplete().await;
+    }
+    claims_projection_task
+        .await
+        .context("joining owned claims history updater")?;
     info!("boss-jobs-api shut down cleanly");
+    process_shutdown.finish().await;
     Ok(())
 }
 

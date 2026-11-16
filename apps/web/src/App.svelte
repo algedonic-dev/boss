@@ -9,7 +9,7 @@
   import { href, notFoundBack, parseRoute, type Route } from './router';
   import NotFound from '@boss/web-kit/ui/NotFound.svelte';
   import { JOBS_DEFAULT_STATUS } from './jobs/filterQuery';
-  import { goToLogin } from '@boss/web-kit/session/deadSession';
+  import { guardFetch } from '@boss/web-kit/session/deadSession';
   import { loadSession } from '@boss/web-kit/session/session.svelte';
   import { loadManifest, manifest, reflectTenantOnDocument } from '@boss/web-kit/session/manifest.svelte';
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
@@ -64,7 +64,9 @@
   import DispatcherRuleEditPage from './dispatcher/DispatcherRuleEditPage.svelte';
   import SubjectsClassesPage from './it/subjects/SubjectsClassesPage.svelte';
   import MapPage from './it/yard/MapPage.svelte';
-  import CompanyMap from './it/yard/CompanyMap.svelte';
+  import TreeFloor from './it/tree/TreeFloor.svelte';
+  import StationPage from './it/tree/StationPage.svelte';
+  import { DEFAULT_DEPTH } from './it/tree/station-tree';
   import EstatePage from './it/estate/EstatePage.svelte';
   import FleetPage from './it/monitoring/FleetPage.svelte';
   import ItTabs from './it/ItTabs.svelte';
@@ -169,42 +171,31 @@
   // ("reload to log in") described a loop, not a way in. Data reads
   // and writes still redirect — that is the interceptor's real job.
   //
-  // Still only /api/* here: a non-API 401 belongs to the call that
-  // made it, which knows whether the status means a dead session
+  // Still only /api/* for a 401: a non-API 401 belongs to the call
+  // that made it, which knows whether the status means a dead session
   // (a step-plugin bundle) or something else. Those callers reach
   // `goToLogin` directly — web-kit's session/deadSession.ts holds the
   // target, the ?next= encoding and the on-/login guard ONCE, so this
-  // interceptor, steps/pluginHost.ts and WriteGate's sign-in link
-  // cannot drift (§9a).
-  {
-    const isIdentityProbe = (url: string): boolean =>
-      url.startsWith('/api/session') || url.startsWith('/api/auth/');
-    const _origFetch = window.fetch;
-    window.fetch = (async (
-      input: RequestInfo | URL,
-      init?: RequestInit,
-    ): Promise<Response> => {
-      const resp = await _origFetch(input, init);
-      if (resp.status === 401) {
-        const url = typeof input === 'string'
-          ? input
-          : input instanceof URL ? input.href : input.url;
-        if (url.startsWith('/api/') && !isIdentityProbe(url)) {
-          goToLogin();
-        }
-      }
-      return resp;
-    }) as typeof window.fetch;
-  }
+  // guard, steps/pluginHost.ts and WriteGate's sign-in link cannot
+  // drift (§9a).
+  //
+  // The guard ALSO answers Cloudflare Access expiring at the edge
+  // (backlog 7d70cad6, David 2026-11-16): a lapsed Access session
+  // makes a read THROW, not 401, and the page used to render that as
+  // its error with the root page as the only way back. The guard
+  // reloads this page instead, so Access signs him in and returns him
+  // here. The decision and its tests live in deadSession.ts.
+  window.fetch = guardFetch(window.fetch);
 
   onMount(() => {
     loadSession();
     loadManifest();
     // THE VIEWER'S FLIGHTS (design c4c2a607). The gateway inlines them
     // into index.html, so a page it served already knows; a page it did
-    // not (the dev server, a gateway whose flights read failed) asks the
-    // same endpoint once. A failed read leaves every flight off.
-    if (flights.on === null) void loadFlights();
+    // not (the dev server, a gateway whose flights read failed) retries
+    // the same endpoint. Unknown stays OFF until an answer is readable.
+    const flightsRead = new AbortController();
+    if (flights.on === null) void loadFlights(flightsRead.signal);
     loadStepTypeRegistry();
     loadClasses('employee');
     loadDepartments();
@@ -212,7 +203,10 @@
       parsed = parseRoute(window.location.pathname, window.location.search);
     };
     window.addEventListener('popstate', onPop);
-    return () => window.removeEventListener('popstate', onPop);
+    return () => {
+      flightsRead.abort();
+      window.removeEventListener('popstate', onPop);
+    };
   });
 
   // Which sidebar section highlights. The route->section map lives in
@@ -408,7 +402,7 @@
     {:else if route.kind === 'support'}
       <SupportPage />
     {:else if route.kind === 'finance'}
-      <!-- Keyed on the route, so a navigation to /ux/finance?… while the
+      <!-- Keyed on the route, so a navigation to /finance?… while the
            page is up (the sidebar's Finance link, a ledger-entry link)
            mounts what the link names; the page's own tab clicks
            replaceState and never re-parse the route (2ab44d55). -->
@@ -444,15 +438,20 @@
     {:else if route.kind === 'systemDesign'}
       <ItTabs group="design" active="/it/design" />
       <DesignReviewPage />
-    {:else if route.kind === 'companyMap'}
-      <CompanyMap />
     {:else if route.kind === 'systemYard'}
+      {#if flights.on === null}
+        <p role="status" data-flights-unread data-retrying={flights.retrying}>Flights unread, retrying</p>
+      {/if}
       <!-- THE DEPARTMENT MAP (design e765b3fc): the map on top and the
            selection's panel below it. A selection is a query on this one
            route, so the map is mounted once and never torn down by a
            click — the floor pages that were a second route here retired
            with car N3, their content in the panels. -->
-      <MapPage at={route.at} overview={route.overview === true} detail={route.detail === true} />
+      <MapPage at={route.at} />
+    {:else if route.kind === 'systemTree'}
+      <TreeFloor under={route.under ?? null} depth={route.depth ?? DEFAULT_DEPTH} />
+    {:else if route.kind === 'systemStation'}
+      <StationPage station={route.station} />
     {:else if route.kind === 'systemEstate'}
       <EstatePage />
     {:else if route.kind === 'systemFleet'}

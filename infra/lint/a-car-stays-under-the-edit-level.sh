@@ -136,8 +136,8 @@ car_paths() {
         skip "no trunk ref to diff against (tried $(trunk_candidates)) — set BOSS_TRUNK_REF"
     fi
     mb=$(resolve_merge_base "$LINT" "$trunk") || return $?
-    committed=$(git_answer "$LINT" 0 diff --name-only "$mb" HEAD) || return $?
-    dirty=$(git_answer "$LINT" 0 diff --name-only HEAD) || return $?
+    committed=$(git_answer "$LINT" 0 diff --no-renames --name-only "$mb" HEAD) || return $?
+    dirty=$(git_answer "$LINT" 0 diff --no-renames --name-only HEAD) || return $?
     untracked=$(git_answer "$LINT" 0 ls-files --others --exclude-standard) || return $?
     printf '%s\n%s\n%s\n' "$committed" "$dirty" "$untracked" | awk 'NF && !seen[$0]++'
 }
@@ -172,7 +172,7 @@ if [ -n "${BOSS_EDIT_LEVEL_ANSWER:-}" ]; then
 else
     echo "$LINT: no edit level was handed in (BOSS_EDIT_LEVEL_ANSWER is unset — a pre-flight, a hand run, or a launcher from before backlog 934ccad1) — reading $URL"
     command -v curl >/dev/null 2>&1 || skip "curl is not on this box"
-    code=$(lint_sor_read "$LINT" "the jobs API" "$URL" "$body")
+    code=$(lint_sor_read "$LINT" "the jobs API" "$URL" "$body" BOSS_JOBS_URL)
     ANSWERED="$URL"
 fi
 case "$code" in

@@ -175,8 +175,7 @@
       <table class="atlas-stations">
         <thead>
           <tr>
-            <th>Station</th><th>Discipline</th><th>Depth</th><th>Unreachable</th><th>Oldest</th><th
-            ></th>
+            <th>Station</th><th>Discipline</th><th>Depth</th><th>Unreachable</th><th>Oldest</th>
           </tr>
         </thead>
         <tbody>
@@ -194,7 +193,6 @@
                 >{n.unreachable == null ? '—' : n.unreachable}</td
               >
               <td>{n.oldestAgeDays == null ? '—' : `${n.oldestAgeDays}d`}</td>
-              <td>{n.overLimit ? 'over limit' : ''}</td>
             </tr>
           {/each}
         </tbody>

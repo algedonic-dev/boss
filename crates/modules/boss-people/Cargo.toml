@@ -21,7 +21,7 @@ required-features = ["postgres"]
 
 [features]
 default = []
-postgres = ["dep:sqlx", "boss-events/postgres", "dep:boss-subject-kinds"]
+postgres = ["dep:sqlx", "boss-events/postgres", "dep:boss-subject-kinds", "boss-jobs/postgres"]
 
 [dependencies]
 boss-subject-kinds = { path = "../../core/boss-subject-kinds", features = ["postgres"], optional = true }
@@ -55,6 +55,9 @@ boss-calendar-client = { path = "../../core/boss-calendar-client" }
 boss-events = { path = "../../core/boss-events" }
 boss-assets-client = { path = "../boss-assets-client" }
 boss-nats = { path = "../../core/boss-nats" }
+# The roster pools' owner (backlog a6cb448a): `roster_refresh` publishes
+# this service's snapshot through `boss_jobs::pools::refresh_roster`.
+boss-jobs = { path = "../../core/boss-jobs" }
 [dev-dependencies]
 tower = { workspace = true }
 boss-people-client = { path = "../boss-people-client" }
@@ -125,4 +128,12 @@ required-features = ["postgres"]
 # is the postgres build, so its pin is declared with it.
 [[test]]
 name = "the_people_binary_mounts_coverage_for_every_mutation"
+required-features = ["postgres"]
+
+[[test]]
+name = "roster_capacity_snapshot"
+required-features = ["postgres"]
+
+[[test]]
+name = "roster_capacity_publication"
 required-features = ["postgres"]

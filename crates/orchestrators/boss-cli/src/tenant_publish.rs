@@ -2570,11 +2570,13 @@ terminal = { outcome = "sponsored" }
                         json!({
                             "id": a["id"], "display_name": a["display_name"],
                             "default_model": a["default_model"],
+                            "model_class": a.get("model_class").cloned().unwrap_or(Value::Null),
                             "role": a.get("role").cloned().unwrap_or(Value::Null),
                             "department": a.get("department").cloned().unwrap_or(Value::Null),
                             "hourly_budget_usd_micros": a.get("hourly_budget_usd_micros").cloned().unwrap_or(Value::Null),
                             "max_concurrent_runs": a.get("max_concurrent_runs").cloned().unwrap_or(Value::Null),
                             "aliases": aliases,
+                            "stations": a.get("stations").cloned().unwrap_or_else(|| json!([])),
                         })
                     })
                     .collect();

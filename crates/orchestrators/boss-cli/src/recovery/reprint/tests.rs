@@ -852,7 +852,22 @@ fn the_signed_keys_are_the_print_steps_filer_fields() {
         .filter(|f| f.filled_by == boss_core::job::FilledBy::Filer)
         .map(|f| f.name.as_str())
         .collect();
-    assert_eq!(filer, SIGNED.iter().copied().collect::<BTreeSet<_>>());
+    let mut attached: Map<String, Value> = SIGNED
+        .iter()
+        .map(|key| ((*key).into(), json!("fixture")))
+        .collect();
+    attached.insert("pdf_file_ref".into(), json!("fixture-file"));
+    let written = signed_keys(&attached);
+    assert_eq!(
+        filer,
+        written.keys().map(String::as_str).collect::<BTreeSet<_>>()
+    );
+    let pdf = print
+        .fields
+        .iter()
+        .find(|f| f.name == "pdf_file_ref")
+        .unwrap();
+    assert!(!pdf.required, "the attachment does not exist at admission");
     for key in SIGNED {
         assert_eq!(
             print.metadata_defaults.get(key).and_then(Value::as_str),

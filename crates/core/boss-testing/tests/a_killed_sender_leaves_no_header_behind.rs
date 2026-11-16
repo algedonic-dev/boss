@@ -27,12 +27,16 @@
 //!     sender's and stands; the unit walk follows a sender run as a child
 //!     and reads `RuntimeDirectory=` only from `[Service]`, reset and all;
 //!     the unit observer's own POST carries the same bound; and the forge
-//!     converge closes the reader's directory before it replaces its trap.
+//!     converge closes the reader's directory before it replaces its trap;
+//!   * since review 7c5ecf57 (N-a, N-c; backlog f85ebd8a): a header dated
+//!     ahead of the clock waits rather than going, and the post's bound
+//!     is one rule in observe-lib.sh that both posts call.
 //!
 //! tree-wide pin — it walks every unit file under infra/, which no
 //! changed-file map attributes to this crate: a unit added anywhere that
 //! names a RuntimeDirectory another unit holds must turn it red.
 
+use boss_testing::path_stub::PathStub;
 use boss_testing::{create_dir, repo_root, scratch_dir, without_proxy, write_exec, write_file};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -62,31 +66,40 @@ const UNITS: [(&str, &str); 6] = [
     ("infra/estate/boss-estate-observe-units.service", "root"),
 ];
 
+/// The request every sender here makes, in the argv its curl is handed:
+/// the call [`Fixture::spawn_until_in_flight`] has the stub hold.
+const HELD_CALL: &str = "/api/jobs";
+
 struct Fixture {
     root: PathBuf,
-    bin: PathBuf,
+    stubs: PathStub,
     tmp: PathBuf,
 }
 
 impl Fixture {
     fn new(tag: &str) -> Fixture {
         let root = scratch_dir(&format!("killed-sender-{tag}"));
-        let bin = root.join("bin");
+        let stubs = PathStub::new(&root);
         let tmp = root.join("tmp");
-        create_dir(&bin);
         create_dir(&tmp);
         // curl: for a `-H @file`, record the path and the text exactly as
-        // curl would read them; say it started; with STUB_HANG, wait to be
-        // released (30 s at most, so a failed test leaves no process); then
-        // say whether the header could STILL be read, and answer as the
-        // real one does under `-w '\n%{http_code}'`. The second read is
-        // written aside and renamed into place, so `header-after.txt`
-        // appears only whole: a test whose sender was killed has no exit
-        // to wait on and polls for the name (backlog ec131700).
-        write_exec(
-            &bin.join("curl"),
-            "#!/bin/sh\n\
-             hdr=\n\
+        // curl would read them; say it started; for the call PathStub
+        // decides is never answered (`STUB_HANG`, set by
+        // spawn_until_in_flight), wait to be released (30 s at most, so a
+        // failed test leaves no process); then say whether the header
+        // could STILL be read, and answer as the real one does under
+        // `-w '\n%{http_code}'`. The second read is written aside and
+        // renamed into place, so `header-after.txt` appears only whole: a
+        // test whose sender was killed has no exit to wait on and polls
+        // for the name (backlog ec131700).
+        //
+        // Not `stub_hang`: that never answers and needs a bound around it,
+        // and this held call must answer once released — the live-sender
+        // tests wait on the first sender's exit 0. The DECISION is
+        // PathStub's; what a held call does stays here (backlog b4ffc59a).
+        stubs.stub(
+            "curl",
+            "hdr=\n\
              prev=\n\
              for a in \"$@\"; do\n\
                  if [ \"$prev\" = -H ]; then case \"$a\" in @*) hdr=${a#@} ;; esac; fi\n\
@@ -98,7 +111,7 @@ impl Fixture {
              fi\n\
              printf '%s\\n' \"$PPID\" > \"$STUB_DIR/curl-parent-pid\"\n\
              : > \"$STUB_DIR/started\"\n\
-             if [ -n \"${STUB_HANG:-}\" ]; then\n\
+             if stub_never_answered \"$@\"; then\n\
                  n=0\n\
                  while [ ! -e \"$STUB_DIR/release\" ] && [ \"$n\" -lt 300 ]; do sleep 0.1; n=$((n + 1)); done\n\
                  if [ -n \"$hdr\" ]; then\n\
@@ -108,27 +121,23 @@ impl Fixture {
              fi\n\
              printf '\\n200'\n",
         );
-        Fixture { root, bin, tmp }
+        Fixture { root, stubs, tmp }
+    }
+
+    fn bin(&self) -> &Path {
+        self.stubs.bin()
     }
 
     fn command(&self, program: &Path) -> Command {
         let mut cmd = Command::new(program);
         without_proxy(&mut cmd);
+        self.stubs.wire(&mut cmd);
         cmd.current_dir(&self.root)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    self.bin.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
             .env("STUB_DIR", &self.root)
             .env("TMPDIR", &self.tmp)
             .env("SECRET", SECRET)
             .env("HOME", &self.root)
             .env_remove("RUNTIME_DIRECTORY")
-            .env_remove("STUB_HANG")
             .env_remove("BOSS_MACHINE_TOKEN_HOSTS")
             .env_remove("BOSS_MACHINE_TOKEN")
             .env_remove("BOSS_ACTOR_FILE")
@@ -179,7 +188,7 @@ impl Fixture {
         let out = std::fs::File::create(self.root.join(format!("{tag}.out"))).expect("out file");
         let err = std::fs::File::create(self.root.join(format!("{tag}.err"))).expect("err file");
         let child = cmd
-            .env("STUB_HANG", "1")
+            .env("STUB_HANG", HELD_CALL)
             .stdout(out)
             .stderr(err)
             .spawn()
@@ -223,7 +232,7 @@ impl Fixture {
             .find(|p| p.is_file())
             .expect("a cat on the runner's PATH");
         write_exec(
-            &self.bin.join("cat"),
+            &self.bin().join("cat"),
             &format!("#!/bin/sh\nsleep 1\nexec {} \"$@\"\n", real.display()),
         );
     }
@@ -591,6 +600,50 @@ fn the_sweep_removes_only_what_it_can_show_is_dead() {
     }
 }
 
+/// CLOCK SKEW POSTPONES, IT NEVER HASTENS (backlog f85ebd8a, N-a of
+/// review 7c5ecf57). Age is read off THIS host's clock against the mtimes
+/// a run left, so a dead run's directory written while the clock stood
+/// ahead — a clock stepped back since, or another container's on a
+/// shared volume — reads as young until the clock has passed its newest
+/// file by a day. The sweep's comment now says so; this holds that it is
+/// a postponement and not a removal, beside the control that the same
+/// unplaced, dead directory dated two days BACK does go.
+#[test]
+fn a_header_dated_ahead_of_the_clock_waits_rather_than_going() {
+    for shell in ["bash", "dash"] {
+        let f = Fixture::new(&format!("skew-{shell}"));
+        let ahead = plant(&f.tmp, "ahead", None);
+        let mut paths = vec![ahead.join("TOKEN_HDR"), ahead.clone()];
+        paths.sort();
+        for p in &paths {
+            let ok = Command::new("touch")
+                .args(["-h", "-d", "2 days"])
+                .arg(p)
+                .status()
+                .expect("run touch")
+                .success();
+            assert!(ok, "touch -d on {}", p.display());
+        }
+        let behind = plant(&f.tmp, "behind", None);
+        age_by_two_days(&behind);
+
+        let out = f
+            .lib_driver(shell, "sweeper", SEND)
+            .output()
+            .expect("run the sweeper");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{shell}: {err}");
+        assert!(
+            !behind.exists() && err.contains("removed 1 header directory"),
+            "{shell}: the control — the same dead, unplaced directory two days old goes: {err}"
+        );
+        assert!(
+            ahead.exists(),
+            "{shell}: one dated two days ahead of the clock waits for it: {err}"
+        );
+    }
+}
+
 /// THE MEASURED CASE. `boss-api` killed while curl waits on the system of
 /// record: nothing under the temp directory holds the token, at the
 /// moment of the request or after the kill, and the header still reached
@@ -705,7 +758,8 @@ fn killing_the_sender_and_descendants_leaves_no_response_spool() {
 fn the_real_curl_sends_the_header_it_reads_from_the_descriptor() {
     use std::io::{Read, Write};
     let f = Fixture::new("door-real-curl");
-    std::fs::remove_file(f.bin.join("curl")).expect("drop the stub: this test runs the real curl");
+    std::fs::remove_file(f.bin().join("curl"))
+        .expect("drop the stub: this test runs the real curl");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let server = std::thread::spawn(move || {
@@ -1448,6 +1502,74 @@ const SYSTEMCTL: &str = "#!/bin/sh\n\
     esac\n\
     exit 0\n";
 
+/// THE RULE IS SPELLED ONCE (backlog f85ebd8a, N-c of review 7c5ecf57).
+/// The test below holds the two posts to the same BEHAVIOUR; this holds
+/// them to one DEFINITION. Until this car the bound's rule was written out
+/// twice — in observe-lib.sh `post_observation` and again before the unit
+/// observer's own curl — pinned equal by behaviour and not collapsed
+/// (CLAUDE.md §9a: collapse if you can). It lives in observe-lib.sh's
+/// `observe_post_bound`, which both posts call: a second spelling under
+/// infra/, or a unit observer that stops calling it, turns this red.
+#[test]
+fn the_posts_bound_rule_is_spelled_once() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    files_ending(&root.join("infra"), ".sh", &mut files);
+    files.sort();
+    let spelled: Vec<String> = files
+        .iter()
+        .flat_map(|p| {
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .into_owned();
+            live_lines(p)
+                .into_iter()
+                .filter(|l| {
+                    l.contains("case \"${OBSERVE_POST_MAX_TIME")
+                        || l.contains(" OBSERVE_POST_MAX_TIME=")
+                        || l.starts_with("OBSERVE_POST_MAX_TIME=")
+                })
+                .map(move |l| format!("{rel}: {l}"))
+        })
+        .collect();
+    assert_eq!(
+        spelled.len(),
+        2,
+        "the bound's rule is one `case` and one default, both in {OBSERVE_LIB}: {spelled:#?}"
+    );
+    assert!(
+        spelled.iter().all(|l| l.starts_with(OBSERVE_LIB)),
+        "the bound's rule is spelled outside {OBSERVE_LIB}: {spelled:#?}"
+    );
+
+    let lib = live_lines(&root.join(OBSERVE_LIB));
+    assert!(
+        lib.iter().any(|l| l.starts_with("observe_post_bound()")),
+        "{OBSERVE_LIB} defines observe_post_bound"
+    );
+    for (rel, lines) in [
+        (OBSERVE_LIB, lib.clone()),
+        (OBSERVE_UNITS, live_lines(&root.join(OBSERVE_UNITS))),
+    ] {
+        let call = lines.iter().position(|l| l == "observe_post_bound");
+        let curl = lines
+            .iter()
+            .position(|l| l.contains("--max-time \"$OBSERVE_POST_MAX_TIME\""));
+        assert!(
+            matches!((call, curl), (Some(c), Some(u)) if c < u),
+            "{rel}: calls observe_post_bound ({call:?}) before the curl that reads the bound ({curl:?})"
+        );
+    }
+    assert!(
+        live_lines(&root.join(OBSERVE_UNITS))
+            .iter()
+            .any(|l| l == ". \"$(dirname \"$0\")/observe-lib.sh\""),
+        "{OBSERVE_UNITS} sources {OBSERVE_LIB} from beside itself, as observe-host.sh does"
+    );
+}
+
 /// The bound a unit actually runs with: a whole number of seconds, small
 /// against the fifteen-minute cadence, and a value that is not a number
 /// falls back to it rather than reaching curl.
@@ -1464,7 +1586,7 @@ fn the_posts_default_bound_is_a_number_and_a_bad_override_does_not_reach_curl() 
     for (i, (given, want)) in rows.into_iter().enumerate() {
         let f = Fixture::new(&format!("bound-argv-{i}"));
         write_exec(
-            &f.bin.join("curl"),
+            &f.bin().join("curl"),
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$STUB_DIR/argv.txt\"\nprintf '\\n202'\n",
         );
         let driver = f.root.join("observe.sh");
@@ -1506,8 +1628,8 @@ fn the_posts_default_bound_is_a_number_and_a_bad_override_does_not_reach_curl() 
 
         // The unit observer reads the same variable by the same rule.
         let _ = std::fs::remove_file(f.root.join("argv.txt"));
-        write_exec(&f.bin.join("systemctl"), SYSTEMCTL);
-        write_exec(&f.bin.join("journalctl"), "#!/bin/sh\nexit 0\n");
+        write_exec(&f.bin().join("systemctl"), SYSTEMCTL);
+        write_exec(&f.bin().join("journalctl"), "#!/bin/sh\nexit 0\n");
         let mut cmd = f.command(Path::new("sh"));
         cmd.arg(repo_root().join(OBSERVE_UNITS))
             .env("JOBS_API", "http://sor.test:7900")

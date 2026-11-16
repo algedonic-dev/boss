@@ -7,8 +7,10 @@
 // shape hash), navigator.credentials.get (the passkey signs exactly
 // that binding), finish (the gateway verifies and issues a two-minute
 // single-step ticket), and retries the sign-off with the ticket in
-// `x-presence-ticket` — which the gateway swaps for the trusted
-// header. No fallback path exists on purpose (Q3): if the actor has
+// `x-presence-ticket`. The gateway verifies that ticket and forwards
+// the SAME signed ticket to the jobs API in `x-boss-presence`, and the
+// jobs API verifies it again before granting (backlogs 72fe3640,
+// 19f00800). No fallback path exists on purpose (Q3): if the actor has
 // no passkey or declines the prompt, the step waits. The begin names
 // the step as this page rendered it, and the gateway refuses one that
 // has changed since (fd7090cc). That guards an honest page from a swap

@@ -224,19 +224,23 @@ pub(crate) async fn run(branch: &str, remote: &str, dry: bool) -> Result<()> {
     }
 
     // Verify by effect. The push said it worked; ask the forge.
+    let reference = format!("refs/heads/{branch}");
+    let command = format!("cd {} && git ls-remote origin '{reference}'", clone.path);
     let ls = std::process::Command::new("ssh")
-        .args([
-            &clone.host,
-            &format!("cd {} && git ls-remote origin '{branch}'", clone.path),
-        ])
+        .args([&clone.host, &command])
         .output()
         .map_err(|e| anyhow::anyhow!("could not ssh to {}: {e}", clone.host))?;
-    let on_forge = String::from_utf8_lossy(&ls.stdout)
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().next())
-        .unwrap_or("")
-        .to_string();
+    let lookup =
+        crate::receipt::read_lookup(&format!("ssh {} {command}", clone.host), &reference, Ok(ls));
+    if !lookup.readable {
+        bail!(
+            "could not verify {branch}: {}",
+            lookup
+                .said
+                .unwrap_or_else(|| "forge read unavailable".into())
+        );
+    }
+    let on_forge = lookup.head.unwrap_or_default();
     verify(&head, &on_forge, branch)?;
 
     println!(
@@ -253,6 +257,97 @@ pub(crate) async fn run(branch: &str, remote: &str, dry: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_ref_publish_ignores_tail_matches_and_refuses_failed_reads() {
+        let mut failures = Vec::new();
+        for failed in [false, true] {
+            let fixture = crate::receipt::tests::TailMatchFixture::new("publish-exact-ref");
+            let conductor = fixture.dir.join("conductor.git");
+            let local = fixture.dir.join("publisher");
+            fixture.git(&["init", "--bare", "-q", conductor.to_str().unwrap()]);
+            fixture.git(&[
+                "-C",
+                conductor.to_str().unwrap(),
+                "remote",
+                "add",
+                "origin",
+                fixture.dir.to_str().unwrap(),
+            ]);
+            fixture.git(&[
+                "clone",
+                "-q",
+                fixture.dir.to_str().unwrap(),
+                local.to_str().unwrap(),
+            ]);
+            fixture.git(&[
+                "-C",
+                local.to_str().unwrap(),
+                "checkout",
+                "-q",
+                "-b",
+                "b",
+                "origin/b",
+            ]);
+            fixture.git(&[
+                "-C",
+                local.to_str().unwrap(),
+                "remote",
+                "add",
+                "conductor",
+                &format!("ssh://fixture-host{}", conductor.display()),
+            ]);
+            let bin = fixture.dir.join("ssh-bin");
+            boss_testing::create_dir(&bin);
+            boss_testing::write_exec(
+                &bin.join("ssh"),
+                r#"#!/bin/bash
+for last do :; done
+printf '%s\n' "$last" >> "$BOSS_EXACT_SSH_LOG"
+if [[ "$last" == *'git ls-remote '* ]] && [ "$BOSS_EXACT_LOOKUP_FAIL" = 1 ]; then
+    printf '%s\trefs/heads/b\n' "$BOSS_EXACT_REF_HEAD"
+    echo 'fixture remote disconnected after data' >&2
+    exit 128
+fi
+case "$last" in
+    'git-receive-pack '*|'cd '*) exec /bin/bash -c "$last" ;;
+    *) echo "unexpected fixture SSH command: $last" >&2; exit 64 ;;
+esac
+"#,
+            );
+            let log = fixture.dir.join("ssh.log");
+            let out = fixture.child(
+                if failed {
+                    "publish-failed-read"
+                } else {
+                    "publish"
+                },
+                |command| {
+                    command
+                        .current_dir(&local)
+                        .env(
+                            "PATH",
+                            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+                        )
+                        .env_remove("GIT_SSH_COMMAND")
+                        .env_remove("GIT_SSH")
+                        .env("GIT_SSH_VARIANT", "ssh")
+                        .env("BOSS_EXACT_SSH_LOG", &log)
+                        .env("BOSS_EXACT_LOOKUP_FAIL", if failed { "1" } else { "0" });
+                },
+            );
+            let trace = std::fs::read_to_string(&log).unwrap_or_default();
+            if !out.status.success() || !trace.contains("git ls-remote origin 'refs/heads/b'") {
+                failures.push(format!(
+                    "failed-read={failed}: native child exit {:?}\n{}{}\nSSH commands:\n{trace}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 
     #[test]
     fn an_ssh_remote_splits_into_host_and_path() {

@@ -94,7 +94,7 @@ check_against() {
     local base="$1" head="${2:-HEAD}" violations=0 status file
     local mb diff_out
     mb=$(resolve_merge_base "$LINT" "$base" "$head") || exit $?
-    diff_out=$(git_answer "$LINT" 0 diff --name-status "$mb" "$head" -- "$SCHEMA_DIR") || exit $?
+    diff_out=$(git_answer "$LINT" 0 diff --no-renames --name-status "$mb" "$head" -- "$SCHEMA_DIR") || exit $?
 
     while read -r status file; do
         [ -z "${file:-}" ] && continue

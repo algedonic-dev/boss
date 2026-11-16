@@ -1,0 +1,28 @@
+{
+  "about": "READ-ONLY: renders what `suspend-a-chore` WOULD do to one cluster chore's spec.suspend, and does nothing (infra/forge/chore-suspend.sh --plan <namespace> <cronjob> <true|false>; backlog d28c0051). It runs every bound the write runs — the CronJob is one this checkout's infra/cluster/manifests declare in that namespace, as the converge renders them for every instance (render-instance.sh --all), declared with the label boss-chore=true; the live object carries that label and a boolean spec.suspend; the converge does not itself write the chore's spec (boss-break-glass-deposit is refused by name, because the deposit configuration replaces its whole /spec on every train and would undo a suspension in silence); and the value differs from the one that stands — and then prints the plan: the CronJob and the file that declares it, spec.suspend before and after, the schedule, startingDeadlineSeconds and concurrencyPolicy, the one compare-and-set patch, the read-back, and a note (a suspension stops the next runs only, and the converge leaves it standing until a resume; a resume with no starting deadline starts the most recent missed run at once). The chore's last schedule time and the Jobs it is running now ride stderr, not the signed bytes, because they move with every run; its sha256 is printed on stderr as `plan-sha256:`, and that hash is what David's passkey signs (design 17835005 q1). Every live read goes through the forge's ops_kubectl door; a read that could not look is CANNOT ANSWER (exit 1), never a plan. Any refusal renders no plan.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/chore-suspend.sh",
+    "--plan",
+    "{1}",
+    "{2}",
+    "{3}"
+  ],
+  "params": [
+    {
+      "name": "namespace",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "cronjob",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,50}[a-z0-9])?$"
+    },
+    {
+      "name": "suspend",
+      "pattern": "^(true|false)$"
+    }
+  ],
+  "timeout": 120
+}

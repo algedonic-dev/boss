@@ -1,0 +1,23 @@
+{
+  "about": "READ-ONLY: renders what rebuild-a-failed-replica WOULD do, with no write (infra/forge/rebuild-a-failed-replica.sh --plan <volume> <replica>; backlog 776bcb59). Every write bound is applied: one attached pvc-<uuid> Longhorn volume served by exactly one running engine, and one of ITS named replicas; N replicas with declared count N, N at least 3, none deleting; every other replica healthy as Longhorn counts it AND RW in the engine's replicaModeMap, on N-1 distinct nodes; the named replica the sole copy that is not RW (WO, ERR or absent from the map) and not healthy; no rebuild in progress on the engine; robustness degraded; and the named copy stalled — the latest of its engine transition time and its failedAt, lastFailedAt and lastHealthyAt at least BOSS_REBUILD_STALL_S (default 3600) old. The declared count is never changed. The signed plan states the volume and engine uids, the count, the named replica's uid, node, disk, mode and history marks, every replica's uid, and the five steps; no clock reading is in the bytes. sha256 rides stderr as plan-sha256 and David's passkey signs those bytes. Reads use the forge ops_kubectl door; an unreadable answer exits 1, and a refusal exits 78 without a plan. Timeout 300 covers the default 120 s image pull plus the three bounded reads.",
+  "hosts": [
+    "forge"
+  ],
+  "argv": [
+    "infra/forge/rebuild-a-failed-replica.sh",
+    "--plan",
+    "{1}",
+    "{2}"
+  ],
+  "params": [
+    {
+      "name": "volume",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    {
+      "name": "replica",
+      "pattern": "^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-r-[0-9a-f]{8}$"
+    }
+  ],
+  "timeout": 300
+}

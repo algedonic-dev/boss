@@ -230,12 +230,12 @@
           <tr style="border-bottom:1px solid var(--border)">
             <td style={tdBase}>
               <span
-                style={`font-size:11px; font-family:monospace; font-weight:600; color:var(--on-band); background:${methodBg}; padding:2px 6px; border-radius:3px`}
+                style={`font-size:11px; font-family:var(--font-mono); font-weight:600; color:var(--on-band); background:${methodBg}; padding:2px 6px; border-radius:3px`}
               >
                 {row.method}
               </span>
             </td>
-            <td style={`${tdBase}; font-family:monospace; font-size:13px`}>{row.path}</td>
+            <td style={`${tdBase}; font-family:var(--font-mono); font-size:13px`}>{row.path}</td>
             <td style={`${tdBase}; text-align:right; font-variant-numeric:tabular-nums`}>
               {row.count.toLocaleString()}
             </td>

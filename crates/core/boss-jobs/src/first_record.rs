@@ -84,7 +84,7 @@ impl FirstRecord {
 }
 
 pub(crate) fn valid_key(key: &str) -> bool {
-    !key.trim().is_empty() && key.len() <= 256
+    !key.trim().is_empty() && key.len() <= 256 && key != crate::flow_resources::TOKEN_KEY
 }
 
 pub(crate) fn preserve<'a>(

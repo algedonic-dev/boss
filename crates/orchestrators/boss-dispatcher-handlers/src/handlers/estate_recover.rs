@@ -1117,7 +1117,10 @@ mod tests {
                 compare_volumes(&json!({"scope": "instance-volumes", "nodes": [{
                     "id": "boss/pgdata-postgres-0", "namespace": "boss",
                     "claim": "pgdata-postgres-0", "volume": "pvc-93e11a6e",
-                    "capacity_bytes": 32_212_254_720_i64, "free_bytes": 1_073_741_824_i64}]})),
+                    "capacity_bytes": 32_212_254_720_i64, "free_bytes": 1_073_741_824_i64,
+                    "scheduled_job": {"id":"boss/boss-pg-backup", "state":"failed",
+                        "job_uid":"failed-uid", "cronjob_uid":"cron-uid",
+                        "reason":"BackoffLimitExceeded"}}]})),
             ),
             (
                 "kubernetes-nodes",
@@ -1126,10 +1129,12 @@ mod tests {
                         json!({"id": "cp-2", "role": "talos-worker"}),
                         json!({"id": "w-2", "role": "talos-worker"}),
                     ],
-                    &json!({"scope": "kubernetes-nodes",
+                    &json!({"scope": "kubernetes-nodes", "observed_at":"2026-10-30T14:00:00Z",
                         "nodes": [{"id": "cp-2", "ready": false, "disk_gb": 929, "disk_free_gb": 10}],
                         "dispatcher": {"dead_letters": 5, "dead_letters_unrecorded": 2,
-                                       "last_unrecorded_dead_letter_unix": 0}}),
+                                       "last_unrecorded_dead_letter_unix": 1793368800,
+                                       "rules_consumer_lag":{"status":"observed","observed_at_unix":1793368800,
+                                           "pending":1001,"ack_pending":12}}}),
                 ),
             ),
             (

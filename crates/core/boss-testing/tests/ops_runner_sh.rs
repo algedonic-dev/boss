@@ -382,8 +382,13 @@ macro_rules! needs_jq {
 /// tree (so the code under test is this tree's, never a stale copy), and
 /// nothing else. A script written there exists in no other checkout.
 fn runner_checkout(root: &Path) -> PathBuf {
+    runner_checkout_at(root.join("checkout"))
+}
+
+/// `runner_checkout`, at a directory of the case's choosing — a
+/// generation of a root-tree-shaped fixture, say.
+fn runner_checkout_at(checkout: PathBuf) -> PathBuf {
     use std::os::unix::fs::symlink;
-    let checkout = root.join("checkout");
     std::fs::create_dir_all(checkout.join("infra/ops")).unwrap();
     for linked in [
         "infra/ops/ops-runner.sh",
@@ -487,6 +492,79 @@ fn a_relative_argv0_resolves_against_the_runners_own_checkout() {
             f.display()
         );
     }
+}
+
+/// ONE PASS RUNS ONE GENERATION (backlog 1dde630c, review a8b752d4 N2).
+/// On the forge the runner starts as
+/// `/var/lib/boss/tree/current/infra/ops/ops-runner.sh`, and `current`
+/// is a link root-tree.sh moves with one rename whenever main moves. The
+/// runner used to name its checkout through that link on every use —
+/// `$(dirname "$0")`, a logical `pwd` — so a pass that loaded its
+/// allowlist and libraries from one generation could exec a verb's
+/// script from the next: a plan read under one commit, executed under
+/// another. It now resolves its own directory ONCE, physically, before
+/// anything else, and every path of the pass is derived from that.
+///
+/// The fixture is the forge's shape: `tree/gen/A` and `tree/gen/B`, each
+/// a runner checkout whose probe prints its own generation, `tree/current`
+/// -> `gen/A`, and a `curl` that moves `current` to `gen/B` on its first
+/// call — after the pass has started, before the verb runs.
+#[test]
+fn a_pass_runs_the_generation_it_started_in_when_current_moves_mid_pass() {
+    needs_jq!();
+    use std::os::unix::fs::symlink;
+    let root = scratch("one-generation-per-pass");
+    stub_sor(&root);
+    let tree = root.join("tree");
+    for g in ["A", "B"] {
+        let generation = runner_checkout_at(tree.join("gen").join(g));
+        write_exec(
+            &generation.join("infra/ops/which-generation.sh"),
+            &format!("#!/bin/sh\necho 'which-generation: ran generation {g}'\n"),
+        );
+    }
+    let current = tree.join("current");
+    symlink("gen/A", &current).unwrap();
+    // The stub SoR, behind a curl that moves `current` first, once.
+    let bin = root.join("bin");
+    std::fs::rename(bin.join("curl"), bin.join("curl-sor")).unwrap();
+    write_exec(
+        &bin.join("curl"),
+        &format!(
+            "#!/bin/sh\n\
+             if [ ! -e '{flipped}' ]; then : > '{flipped}'; ln -sfn gen/B '{current}'; fi\n\
+             exec '{sor}' \"$@\"\n",
+            flipped = root.join("flipped").display(),
+            current = current.display(),
+            sor = bin.join("curl-sor").display(),
+        ),
+    );
+    let verbs = verbs_dir(
+        &root,
+        &[(
+            "probe",
+            r#"{"about": "prints the generation its script came from", "hosts": ["forge"],
+                "argv": ["infra/ops/which-generation.sh"], "params": []}"#,
+        )],
+    );
+    packet(&root, "probe", "[]");
+    let (out, payload) = run_from(&current, &root, &verbs, &[]);
+    let md = payload.unwrap_or_else(|| panic!("no step completed: {out}"));
+    assert!(
+        root.join("flipped").exists(),
+        "the fixture never moved current, so it tested nothing: {md} / {out}"
+    );
+    assert_eq!(
+        std::fs::read_link(&current).unwrap(),
+        PathBuf::from("gen/B"),
+        "current was not moved to gen/B mid-pass: {out}"
+    );
+    assert_eq!(md["disposition"], "answered", "{md} / {out}");
+    let output = md["output"].as_str().unwrap_or("");
+    assert!(
+        output.contains("which-generation: ran generation A"),
+        "the pass started in generation A and executed a verb out of another one: {md} / {out}"
+    );
 }
 
 /// The allowed literal reaches the verb: `publish-github-pr --check` is
@@ -3145,6 +3223,51 @@ fn effect_fixture(case: &str, body: &str, spec_extra: &str) -> (PathBuf, PathBuf
 
 const EFFECT_RE: &str =
     r#","effect":"^acts: (deleted [0-9]+, re-listed [0-9]+ left|dry run: would delete [0-9]+)$""#;
+
+#[test]
+fn the_runner_records_what_it_executed_not_a_request_supplied_envelope() {
+    assert!(has("jq"));
+    for argument in ["original-identity", "--check"] {
+        let root = scratch(&format!("executed-envelope-{argument}"));
+        stub_sor(&root);
+        let script = root.join("read.sh");
+        write_exec(&script, "#!/bin/sh\nprintf '%s\\n' \"$1\"\n");
+        let spec = serde_json::json!({
+            "about":"READ-ONLY fixture", "hosts":["forge"],
+            "argv":[script.to_str().unwrap(), "{1}"],
+            "params":[{"name":"identity", "pattern":"^[a-z-]+$"}],
+            "capture":"separate-streams"
+        });
+        let verbs = verbs_dir(&root, &[("identity-read", &spec.to_string())]);
+        packet(
+            &root,
+            "identity-read",
+            &serde_json::json!([argument]).to_string(),
+        );
+        let path = root.join("jobs.json");
+        let mut job: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        job["data"][0]["metadata"]["executed"] = serde_json::json!({"verb":"forged"});
+        std::fs::write(path, job.to_string()).unwrap();
+        let (out, payload) = run(&root, &verbs, &[]);
+        let md = payload.unwrap_or_else(|| panic!("no receipt: {out}"));
+        assert_eq!(md["exit_code"], "0", "{md}");
+        let hash = Command::new("sha256sum")
+            .arg(verbs.join("identity-read.json"))
+            .output()
+            .unwrap();
+        assert!(hash.status.success());
+        let hash = String::from_utf8(hash.stdout).unwrap();
+        assert_eq!(
+            md["executed"],
+            serde_json::json!({
+                "verb":"identity-read", "host":"forge",
+                "verb_file_sha256":hash.split_whitespace().next().unwrap(),
+                "argv":[script.to_str().unwrap(), argument]
+            })
+        );
+    }
+}
 
 /// Structured reads keep bytes apart; stderr is evidence, never JSON input.
 #[test]

@@ -117,6 +117,19 @@ impl Resource {
     pub fn workflow() -> Self {
         Self::new("workflow")
     }
+    /// Reading an unpublished draft — a workflow or station version
+    /// never published — WITHOUT any authoring verb (backlog f21804d8,
+    /// design 600c07d7, decided 2026-10-17). Until then a draft was read
+    /// only by who may author one, so a read-only observer that captures
+    /// the complete graph could qualify only by being granted Create,
+    /// Update or Publish on `workflow`. Deliberately not a shipped
+    /// resource: the read-only roles (the auditor's, which an audit-opted
+    /// guest also carries) would inherit it, and a draft is an author's
+    /// workspace. The deploy superuser holds it in `default_rules`; an
+    /// install grants a named observer role as a policy row.
+    pub fn workflow_draft() -> Self {
+        Self::new("workflow-draft")
+    }
     /// Raw audit-log rows, wherever they are surfaced as results —
     /// global search, a View over `events`, any future reader.
     ///
@@ -201,6 +214,16 @@ impl Resource {
     /// role inherits it; the deploy superuser holds it in `default_rules`.
     pub fn dispatcher_rule() -> Self {
         Self::new("dispatcher-rule")
+    }
+
+    /// The resource-pool registry's live door (backlog f399458f): read a
+    /// lineage, publish a version, retire the active one. A pool amount
+    /// is how much work the factory admits at once, so by default it is
+    /// the deploy superuser's, held in `default_rules`. Not shipped: the
+    /// host pools name the estate's machines, which the read-only roles
+    /// are granted by name (`estate`), never by inheritance.
+    pub fn pool() -> Self {
+        Self::new("pool")
     }
 
     /// Writing the SubjectKind registry — today its one write, a kind's

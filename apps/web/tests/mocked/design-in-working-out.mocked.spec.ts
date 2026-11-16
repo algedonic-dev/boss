@@ -39,8 +39,7 @@ const fold = (id: string, status: string, metadata: Record<string, unknown> = {}
   ({ id, kind: 'task', spec_slug: 'fold', status, metadata });
 
 const IN = {
-  station: 'design-review', kind: 'batch', discipline: ['priority', 'age'], over_limit: false,
-  total: 2,
+  station: 'design-review', kind: 'group', discipline: ['priority', 'age'], total: 2,
   lens: { title: 'Design review', panels: ['queue', 'decided'], with_steps: true },
   data: [D('in-saved', 'A half-answered design', 'open'), D('in-fresh', 'An untouched design', 'open')],
   steps: {
@@ -50,8 +49,7 @@ const IN = {
 };
 
 const DECIDED = {
-  station: 'design-decided', kind: 'batch', discipline: ['recency'], over_limit: false,
-  terminal_window_days: 7, total: 2,
+  station: 'design-decided', kind: 'group', discipline: ['recency'], terminal_window_days: 7, total: 2,
   lens: { title: 'Decided designs', with_steps: true },
   data: [
     D('w-fold', 'A design being folded', 'open'),

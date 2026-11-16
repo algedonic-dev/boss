@@ -48,6 +48,24 @@ impl Checkout {
     pub(crate) fn is_shared(&self) -> bool {
         self.git_dir == self.common_dir && self.linked > 0
     }
+
+    /// The top of the main checkout this one belongs to — itself when it
+    /// IS the main checkout, else the tree whose `.git` is the common
+    /// dir (on the dev pod `/work/boss`, from any builder's worktree).
+    /// A common dir not named `.git` has no work tree of its own to
+    /// name, so the answer stays this checkout's own top (backlog
+    /// 6d2e2653: the held brief names main's door by this path).
+    pub(crate) fn main_toplevel(&self) -> PathBuf {
+        match self.common_dir.parent() {
+            Some(main)
+                if self.git_dir != self.common_dir
+                    && self.common_dir.file_name() == Some(".git".as_ref()) =>
+            {
+                main.to_path_buf()
+            }
+            _ => self.toplevel.clone(),
+        }
+    }
 }
 
 /// The checkout `dir` is in, as git reports it — `None` when git cannot
@@ -225,5 +243,18 @@ mod tests {
         assert!(refusal("boss gate", Some(RUN), Some(&own)).is_none());
         assert!(refusal("boss gate", Some(RUN), Some(&shared)).is_some());
         assert!(read(&root).is_none(), "not a repository refuses nothing");
+
+        // THE MAIN CHECKOUT, from anywhere in the family (backlog
+        // 6d2e2653): the held brief names main's door by this path, so a
+        // worktree must answer the checkout it hangs off, not itself.
+        let canon = |p: &Path| p.canonicalize().expect("the path exists");
+        for from in [&main, &sub, &wt] {
+            assert_eq!(
+                canon(&read(from).expect("git reads it").main_toplevel()),
+                canon(&main),
+                "from {}",
+                from.display()
+            );
+        }
     }
 }

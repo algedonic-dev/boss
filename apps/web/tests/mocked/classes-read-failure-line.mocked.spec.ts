@@ -88,7 +88,7 @@ const CASES: ReadonlyArray<Case> = [
     what: 'account tiers', fallback: TIERS },
   { reader: "AccountPage's TierChip", path: `${ROUTE_CATALOG.accounts.path}/${ACCOUNT_ID}`, subjectKind: 'account',
     what: 'account tiers', fallback: TIERS, setup: accountPage },
-  { reader: "InvoicePage's TierChip", path: '/ux/finance/inv-tiers', subjectKind: 'account',
+  { reader: "InvoicePage's TierChip", path: '/finance/invoices/inv-tiers', subjectKind: 'account',
     what: 'account tiers', fallback: TIERS, setup: invoicePage },
   { reader: "SupportPage's TierChip (Account Health)", path: ROUTE_CATALOG.support.path, subjectKind: 'account',
     what: 'account tiers', fallback: TIERS,

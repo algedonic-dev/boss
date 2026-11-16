@@ -831,7 +831,10 @@ async fn batch_append_inserts_all_and_projects_per_serial() {
         ),
     ];
 
-    let stats = assets.batch_append(events).await.unwrap();
+    let stats = assets
+        .batch_record(events, chrono::Utc::now())
+        .await
+        .unwrap();
     assert_eq!(stats.inserted, 5);
     assert_eq!(stats.duplicates, 0);
 
@@ -886,29 +889,32 @@ async fn batch_append_skips_duplicates_silently() {
         .unwrap();
 
     let stats = assets
-        .batch_append(vec![
-            // Already inserted — should be a duplicate.
-            evt(
-                "dup-1",
-                "SN-DUP",
-                1,
-                AssetEventKind::Received {
-                    sku: Some(TEST_SKU.into()),
-                    source: IntakeSource::new("oem-new"),
-                    oem_serial: None,
-                },
-            ),
-            // New — should be inserted.
-            evt(
-                "dup-2",
-                "SN-DUP",
-                5,
-                AssetEventKind::Installed {
-                    holder_kind: "account".into(),
-                    holder_id: "account-X".into(),
-                },
-            ),
-        ])
+        .batch_record(
+            vec![
+                // Already inserted — should be a duplicate.
+                evt(
+                    "dup-1",
+                    "SN-DUP",
+                    1,
+                    AssetEventKind::Received {
+                        sku: Some(TEST_SKU.into()),
+                        source: IntakeSource::new("oem-new"),
+                        oem_serial: None,
+                    },
+                ),
+                // New — should be inserted.
+                evt(
+                    "dup-2",
+                    "SN-DUP",
+                    5,
+                    AssetEventKind::Installed {
+                        holder_kind: "account".into(),
+                        holder_id: "account-X".into(),
+                    },
+                ),
+            ],
+            chrono::Utc::now(),
+        )
         .await
         .unwrap();
     assert_eq!(stats.inserted, 1);

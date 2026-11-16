@@ -527,28 +527,34 @@ mod pg {
             }))
         }
 
-        /// `DISTINCT ON (rule_name)` walks the recency index
-        /// (`rule_name, fired_at DESC`) and keeps each rule's first row —
-        /// one row per rule, however many firings the month holds; a tie
-        /// at one instant goes to [`NEWEST_FIRST`]'s second key. The
-        /// outer sort is the rule name in BYTE order (`COLLATE "C"`),
-        /// the double's map order — the locale's put `suite-ab` before
-        /// `suite-a-z` (backlog be459ab9) — and it sorts the one row per
-        /// rule, so the index still serves the scan.
+        /// Seek the next rule, then its newest firing, instead of scanning and
+        /// reducing the retained history. At production scale DISTINCT ON chose
+        /// a parallel table sort despite the matching partial index (7e12792b).
+        /// Each seek matches that index's rule/time/byte-order keys and fixed
+        /// fired predicate. SQL uses the index's default rule collation; only
+        /// the bounded one-row-per-rule answer is ordered in Rust byte order.
         async fn last_firings(&self) -> Result<Vec<RuleLastFiring>, DispatcherFiringsError> {
             let sql = format!(
-                "SELECT rule_name, fired_on, fired_at FROM ( \
-                   SELECT DISTINCT ON (rule_name) rule_name, fired_on, fired_at \
-                   FROM dispatcher_firings WHERE outcome = $1 \
-                   ORDER BY rule_name, {NEWEST_FIRST} \
-                 ) newest ORDER BY rule_name COLLATE \"C\""
+                "WITH RECURSIVE newest AS ( \
+                   (SELECT rule_name, fired_on, fired_at FROM dispatcher_firings \
+                    WHERE outcome = $1 AND outcome = '{OUTCOME_FIRED}' \
+                    ORDER BY rule_name, {NEWEST_FIRST} LIMIT 1) \
+                   UNION ALL \
+                   SELECT next.* FROM newest previous CROSS JOIN LATERAL ( \
+                     SELECT rule_name, fired_on, fired_at FROM dispatcher_firings \
+                     WHERE rule_name > previous.rule_name \
+                       AND outcome = $1 AND outcome = '{OUTCOME_FIRED}' \
+                     ORDER BY rule_name, {NEWEST_FIRST} LIMIT 1 \
+                   ) next \
+                 ) SELECT rule_name, fired_on, fired_at FROM newest"
             );
             let rows = sqlx::query(&sql)
                 .bind(OUTCOME_FIRED)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(storage)?;
-            rows.into_iter()
+            let mut newest = rows
+                .into_iter()
                 .map(|r| {
                     Ok(RuleLastFiring {
                         rule: r.try_get("rule_name").map_err(storage)?,
@@ -556,7 +562,9 @@ mod pg {
                         fired_at: r.try_get("fired_at").map_err(storage)?,
                     })
                 })
-                .collect()
+                .collect::<Result<Vec<_>, DispatcherFiringsError>>()?;
+            newest.sort_by(|a, b| a.rule.cmp(&b.rule));
+            Ok(newest)
         }
 
         async fn unrouted_dead_letters(

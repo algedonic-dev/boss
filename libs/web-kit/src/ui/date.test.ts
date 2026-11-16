@@ -1,7 +1,7 @@
 // Unit tests for the shared date formatters. Run via `bun test`.
 
 import { describe, expect, test } from 'bun:test';
-import { formatDate, formatDateTime, formatRelative } from './date';
+import { formatDate, formatDateTime, formatLocalAndUtc, formatRelative, localAndUtcText } from './date';
 
 describe('formatDate', () => {
   test('YYYY-MM-DD renders as en-US short form', () => {
@@ -78,5 +78,40 @@ describe('formatRelative', () => {
 
   test('bare YYYY-MM-DD dates work too', () => {
     expect(formatRelative('2026-08-19', now)).toBe('3d');
+  });
+});
+
+describe('formatLocalAndUtc', () => {
+  // David, user-feedback 0b1fd59f (2026-11-08): "We need to show UTC
+  // in addition to local time since the factory runs on UTC." Design
+  // b03ef2d4: `17:42 PT · 01:42Z`, the UTC half secondary ink, so the
+  // two halves come back apart and the surface inks them.
+  const PT = { timeZone: 'America/Los_Angeles' } as const;
+
+  test('an instant reads in the local zone and in UTC, side by side', () => {
+    expect(formatLocalAndUtc('2026-11-12T01:42:00Z', PT)).toEqual({ local: '17:42 PT', utc: '01:42Z' });
+    expect(localAndUtcText({ local: '17:42 PT', utc: '01:42Z' })).toBe('17:42 PT · 01:42Z');
+  });
+
+  test('seconds when the surface asks for them', () => {
+    expect(formatLocalAndUtc('2026-11-08T12:11:48Z', { ...PT, seconds: true })).toEqual({ local: '04:11:48 PT', utc: '12:11:48Z' });
+  });
+
+  test("the date, when asked, is each half's own calendar day", () => {
+    // 00:00Z on the 6th is the evening of the 5th in Pacific time.
+    expect(formatLocalAndUtc('2026-11-06T00:00:00Z', { ...PT, date: true })).toEqual({ local: 'Nov 5 16:00 PT', utc: 'Nov 6 00:00Z' });
+  });
+
+  test('midnight is 00, never 24', () => {
+    expect(formatLocalAndUtc('2026-08-22T07:05:00Z', PT)).toEqual({ local: '00:05 PT', utc: '07:05Z' });
+  });
+
+  test('an offset stamp is the same instant', () => {
+    expect(formatLocalAndUtc('2026-11-11T17:42:00-08:00', PT)).toEqual({ local: '17:42 PT', utc: '01:42Z' });
+  });
+
+  test('a stamp that is not a time is null, never an invented one', () => {
+    expect(formatLocalAndUtc('soon', PT)).toBeNull();
+    expect(formatLocalAndUtc('', PT)).toBeNull();
   });
 });

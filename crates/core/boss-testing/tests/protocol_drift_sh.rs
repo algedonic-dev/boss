@@ -37,14 +37,32 @@ const JOB_ID: &str = "0123456789abcdef";
 /// argument; here it means the lint produced no report to file.
 const CANNOT_ANSWER: i32 = 3;
 
+/// What a loaded gate bay may add to a call the stub ANSWERS. It rides
+/// on the open-packet read of every `packet-*` mode, the call the wrap
+/// bounds with BOSS_WRAP_MAX_TIME; longer than the 1 s that bound once
+/// was (backlog 39f5bf22).
+const ANSWER_STALL: Duration = Duration::from_millis(1500);
+
+/// What one answered stub call may take on a loaded gate bay, and so the
+/// BOSS_WRAP_MAX_TIME the prepared unit runs under. No stub mode leaves a
+/// call unanswered (a lost ack closes the socket), so the bound only
+/// keeps a wedged run finite and costs no test its wait.
+const FIXTURE_BUDGET: Duration = Duration::from_secs(10);
+const _: () = assert!(ANSWER_STALL.as_millis() < FIXTURE_BUDGET.as_millis());
+
 const STUB: &str = r#"
-import http.server, json, sys, socket
+import http.server, json, os, sys, socket, time
 log, started, registry, mode = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+answer_stall = float(os.environ["ANSWER_STALL_SECS"])
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.bind(("127.0.0.1", 0))
 port = sock.getsockname()[1]
 OPEN = {"data": [{"id": "0123456789abcdef", "kind": "maintenance-protocol-drift", "status": "open", "created_at": "2026-09-15T05:20:35Z", "metadata": {}}], "total": 1}
+if mode.startswith("packet-"):
+    OPEN = {"data": [], "total": 0}
 class H(http.server.BaseHTTPRequestHandler):
+    packet_reads = 0
+    packet_posts = 0
     def log_message(self, *a): pass
     def _reply(self, code, body=b"{}"):
         self.send_response(code); self.send_header("content-type", "application/json")
@@ -59,10 +77,36 @@ class H(http.server.BaseHTTPRequestHandler):
                 self._reply(503, b'{"error":"upstream unavailable"}')
             else:
                 self._reply(200, open(registry, "rb").read())
+        elif self.path.startswith("/api/jobs/"):
+            found = next((j for j in OPEN["data"] if j["id"] == self.path.rsplit("/", 1)[-1]), None)
+            self._reply(200 if found else 404, json.dumps(found or {}).encode())
         elif self.path.startswith("/api/jobs"):
-            self._reply(200, json.dumps(OPEN).encode())
+            type(self).packet_reads += 1
+            if mode.startswith("packet-"):
+                time.sleep(answer_stall)
+            if mode == "packet-permanent" or (mode == "packet-read-recover" and type(self).packet_reads == 1):
+                self._reply(503)
+            else:
+                self._reply(200, json.dumps(OPEN).encode())
         else:
             self._reply(404, b'{"error":"no such route"}')
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("content-length", "0")))
+        sent = json.loads(body)
+        type(self).packet_posts += 1
+        with open(log, "ab") as f:
+            f.write(b"POST " + self.path.encode() + b"\n" + json.dumps(sent, separators=(",", ":")).encode() + b"\n")
+        if mode == "packet-post-recover" and type(self).packet_posts == 1:
+            self._reply(503)
+            return
+        key = sent.get("id", "0123456789abcdef")
+        OPEN["data"].append(dict(sent, id=key))
+        OPEN["total"] = len(OPEN["data"])
+        if mode == "packet-lost-ack":
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+            return
+        self._reply(201, json.dumps({"id": key}).encode())
     def do_PATCH(self):
         n = int(self.headers.get("content-length", "0"))
         body = self.rfile.read(n)
@@ -251,6 +295,7 @@ fn start_stub(case: &str, mode: &str) -> Stub {
         .arg(&started)
         .arg(&registry)
         .arg(mode)
+        .env("ANSWER_STALL_SECS", ANSWER_STALL.as_secs_f64().to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -284,6 +329,153 @@ fn run_with(stub: &Stub, cmd: &str, env: &[(&str, &str)]) -> (Option<i32>, Strin
 
 fn has_python3() -> bool {
     Command::new("python3").arg("--version").output().is_ok()
+}
+
+// Use the prepared unit's actual programs and environment. The fixture
+// replaces only the privileged root-tree launcher and the remote API.
+fn prepared_unit_lifecycle(stub: &Stub) -> std::process::Output {
+    let root = repo_root();
+    let unit = std::fs::read_to_string(
+        root.join("infra/gcp/root-tree-units/boss-protocol-drift.service.in"),
+    )
+    .unwrap();
+    let program = |key: &str| {
+        let value = unit
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .unwrap()
+            .strip_prefix("/var/lib/boss/gcp-tree/current/infra/gcp/root-tree.sh run ")
+            .unwrap();
+        let (path, args) = value.split_once(' ').unwrap();
+        format!("bash '{}' {args}\n", root.join(path).display())
+    };
+    let launch = stub.log.with_extension("unit.sh");
+    boss_testing::write_file(
+        &launch,
+        &(program("ExecStartPre=-") + &program("ExecStart=")),
+    );
+    let home = stub.log.with_extension("home");
+    boss_testing::create_dir(&home);
+    let mut command = Command::new("bash");
+    command
+        .arg(&launch)
+        .current_dir(&root)
+        .env("BOSS_JOBS_URL", format!("http://127.0.0.1:{}", stub.port))
+        .env("BOSS_WRAP_MAX_TIME", FIXTURE_BUDGET.as_secs().to_string())
+        .env("BOSS_API_RETRY_DEADLINE", "0")
+        .env("BOSS_WRAP_OPEN_RETRY_WAIT", "0")
+        .env("INVOCATION_ID", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .env("HOST_ID", "fixture")
+        .env("HOME", home)
+        .env_remove("KUBERNETES_SERVICE_HOST")
+        .env_remove("BOSS_NODE_ID")
+        .env_remove("BOSS_WRAP_OPEN_RETRY");
+    for setting in unit
+        .lines()
+        .filter_map(|line| line.strip_prefix("Environment="))
+    {
+        let (key, value) = setting.split_once('=').unwrap();
+        command.env(key, value);
+    }
+    without_proxy(&mut command).output().unwrap()
+}
+
+#[test]
+fn the_prepared_protocol_unit_recovers_admission_and_files_the_actual_comparison() {
+    for mode in [
+        "packet-post-recover",
+        "packet-read-recover",
+        "packet-lost-ack",
+    ] {
+        let stub = start_stub(mode, mode);
+        let out = prepared_unit_lifecycle(&stub);
+        let calls = stub.log();
+        assert!(
+            out.status.success(),
+            "{mode}: actual prepared unit lost its comparison:\n{}\n{calls}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let posts: Vec<_> = calls
+            .lines()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|pair| pair[0] == "POST /api/jobs")
+            .map(|pair| serde_json::from_str::<serde_json::Value>(pair[1]).unwrap())
+            .collect();
+        assert_eq!(
+            posts.len(),
+            if mode == "packet-post-recover" { 2 } else { 1 }
+        );
+        assert!(posts.iter().all(|body| body == &posts[0]), "{calls}");
+        assert_eq!(posts[0]["kind"], "maintenance-protocol-drift");
+        assert_eq!(posts[0]["metadata"]["chore"], "maintenance-protocol-drift");
+        assert_eq!(
+            posts[0]["metadata"]["unit_invocation_id"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        if mode != "packet-read-recover" {
+            let id = posts[0]["id"].as_str().unwrap();
+            assert_eq!(id.len(), 36);
+            let posted = calls.find("POST /api/jobs\n").unwrap();
+            let readback = calls.find(&format!("GET /api/jobs/{id} token=")).unwrap();
+            assert!(posted < readback, "{calls}");
+            if mode == "packet-post-recover" {
+                assert!(
+                    readback < calls.rfind("POST /api/jobs\n").unwrap(),
+                    "{calls}"
+                );
+            }
+            assert!(
+                calls.contains(&format!("GET /api/jobs/{id} token=")),
+                "{calls}"
+            );
+        }
+        let patches = stub.patches();
+        assert_eq!(patches.len(), 1, "{calls}");
+        assert_eq!(
+            patches[0].1["drift"]["unauthored"],
+            serde_json::json!([LIVE_ONLY_KIND])
+        );
+        assert_eq!(patches[0].1["measured"]["lint_exit"], 1);
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.starts_with("GET /api/workflows "))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn the_prepared_protocol_unit_exhausts_admission_without_a_false_filed_measurement() {
+    let stub = start_stub("packet-permanent", "packet-permanent");
+    let out = prepared_unit_lifecycle(&stub);
+    let calls = stub.log();
+    assert!(!out.status.success());
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("GET /api/jobs?"))
+            .count(),
+        4
+    );
+    assert!(!calls.contains("POST /api/jobs"));
+    assert!(stub.patches().is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("UNRECORDED RUN") && err.contains("NOT filed"),
+        "{err}"
+    );
+    assert!(
+        err.contains("\"measured\"") && err.contains("\"drift\""),
+        "{err}"
+    );
+    let ledger = stub
+        .log
+        .with_extension("home")
+        .join(".boss-maintenance-unrecorded/maintenance-protocol-drift@fixture.jsonl");
+    assert_eq!(std::fs::read_to_string(ledger).unwrap().lines().count(), 1);
 }
 
 /// EVERY REQUEST OF A RUN CARRIES THE MACHINE TOKEN, THE LINT'S READ TOO

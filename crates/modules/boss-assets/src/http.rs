@@ -11,7 +11,6 @@ use boss_catalog_client::CatalogClient;
 use boss_classes_client::ClassesClient;
 use boss_core::port::EventBus;
 use boss_core::primitives::ClassRef;
-use boss_core::publisher::DomainPublisher;
 use boss_inventory_client::InventoryClient;
 
 use boss_people_client::{PeopleClient, PeopleClientError};
@@ -20,7 +19,6 @@ use boss_policy_client::{CurrentUser, PolicyClient, controls};
 use serde::{Deserialize, Serialize};
 
 use crate::asset_insights::build_asset_insights;
-use crate::bridge::asset_event_to_core;
 use crate::port::{AssetsError, AssetsRepository};
 use crate::sse::SseHub;
 use crate::types::{AssetCurrentState, AssetEvent, AssetEventKind, AssetId};
@@ -70,7 +68,6 @@ pub struct InsightsClients {
 pub struct AssetsApiState<R: AssetsRepository, B: EventBus> {
     pub assets: Arc<R>,
     pub bus: Arc<B>,
-    pub publisher: DomainPublisher,
     pub people_client: Arc<dyn PeopleClient>,
     /// Optional Class registry for asset-event taxonomy validation.
     /// When configured, every ingested event has its taxonomy field(s)
@@ -530,16 +527,18 @@ async fn post_event<R: AssetsRepository + 'static, B: EventBus + 'static>(
     {
         return resp;
     }
-    if let Err(e) = state.assets.append(event.clone()).await {
-        return (refusal_status(&e), e.to_string()).into_response();
-    }
     // The record stamp is wall time — sim time is retired from the
     // record (David, 2026-08-22, packet a7a4cae5). The AssetEvent's
     // `ts` stays in the payload as the business date, which is where
     // the sim timeline lives.
     let event_time = boss_clock_client::wall_now();
-    let core_event = asset_event_to_core(&event, event_time);
-    state.publisher.publish(core_event).await;
+    // The asset and its fact commit in one transaction; the relay
+    // carries the fact to the bus. Until 2026-11-10 this appended and
+    // then published straight to the bus, so a dark bus logged ERROR
+    // and dropped the fact (backlog 2e45840a, design ad9519bc part d).
+    if let Err(e) = state.assets.record(event, event_time).await {
+        return (refusal_status(&e), e.to_string()).into_response();
+    }
     (StatusCode::CREATED, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
@@ -557,7 +556,7 @@ async fn batch_events<R: AssetsRepository + 'static, B: EventBus + 'static>(
         return resp;
     }
     // Class-registry gate, per event, before any persistence. The
-    // batch is all-or-nothing (`batch_append`), so one unregistered
+    // batch is all-or-nothing (`batch_record`), so one unregistered
     // taxonomy code rejects the whole batch — there is no unvalidated
     // ingest path. Permissive when no registry is wired (test path).
     for event in &events {
@@ -568,8 +567,11 @@ async fn batch_events<R: AssetsRepository + 'static, B: EventBus + 'static>(
     if let Err(resp) = validate_actor_ids(state.people_client.as_ref(), &events).await {
         return resp;
     }
-    let to_publish: Vec<AssetEvent> = events.clone();
-    let stats = match state.assets.batch_append(events).await {
+    // One wall-clock record stamp for the whole batch (see
+    // post_event); the client's per-event `ts` stays payload data. Each
+    // stored event's fact is staged in the batch's own transaction.
+    let event_time = boss_clock_client::wall_now();
+    let stats = match state.assets.batch_record(events, event_time).await {
         Ok(s) => s,
         Err(e) => {
             return (
@@ -579,14 +581,6 @@ async fn batch_events<R: AssetsRepository + 'static, B: EventBus + 'static>(
                 .into_response();
         }
     };
-    // One wall-clock record stamp for the whole batch (see
-    // post_event); the client's per-event `ts` stays payload data.
-    let event_time = boss_clock_client::wall_now();
-    let core_events: Vec<_> = to_publish
-        .iter()
-        .map(|e| asset_event_to_core(e, event_time))
-        .collect();
-    state.publisher.publish_batch(core_events).await;
     let inserted = stats.inserted;
     let duplicates = stats.duplicates;
     (
@@ -643,13 +637,9 @@ mod tests {
         policy: Arc<dyn PolicyClient>,
     ) -> (Router, Arc<InMemoryAssets>) {
         let assets = Arc::new(InMemoryAssets::new());
-        let bus = RecordingEventBus::new();
-        let publisher =
-            DomainPublisher::new(bus.clone() as Arc<dyn boss_core::port::EventBus>, "assets");
         let state = AssetsApiState {
             assets: assets.clone(),
-            bus,
-            publisher,
+            bus: RecordingEventBus::new(),
             people_client,
             classes_client,
             hub: SseHub::new(),

@@ -1,0 +1,35 @@
+{
+  "verdict": "failed",
+  "head": "fixture",
+  "checks": [
+    {
+      "name": "tail-quoted",
+      "result": "fail",
+      "seconds": 111
+    },
+    {
+      "name": "cause-quoted",
+      "result": "fail",
+      "seconds": 111
+    },
+    {
+      "name": "cause-quoted-inline",
+      "result": "fail",
+      "seconds": 111
+    }
+  ],
+  "fails_excerpt": {
+    "tail-quoted": "E\n======================================================================\nERROR: setUpClass (__main__.Review)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/workspace/source/fx-89ad/tailquote.py\", line 22, in setUpClass\n    raise AssertionError(\"review child exited %d; last lines:\\n%s\" % (child.returncode, tail))\nAssertionError: review child exited 1; last lines:\nValueError: the first reading was wrong\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"<string>\", line 8, in <module>\n  File \"<string>\", line 7, in timeout_last\n  File \"/usr/lib/python3.11/subprocess.py\", line 550, in run\n    stdout, stderr = process.communicate(input, timeout=timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1207, in communicate\n    stdout, stderr = self._communicate(input, endtime, timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 2085, in _communicate\n    self.wait(timeout=self._remaining_time(endtime))\n  File \"/usr/lib/python3.11/subprocess.py\", line 1262, in wait\n    return self._wait(timeout=timeout)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1989, in _wait\n    raise TimeoutExpired(self.args, timeout)\nsubprocess.TimeoutExpired: Command '['/usr/bin/python3', '-c', 'import time; time.sleep(30)']' timed out after 0.4999911109916866 seconds\n\n----------------------------------------------------------------------\nRan 0 tests in 0.527s\n\nFAILED (errors=1)",
+    "cause-quoted": "E\n======================================================================\nERROR: setUpClass (__main__.Review)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/workspace/source/fx-89ad/causequote.py\", line 24, in setUpClass\n    raise AssertionError(\"review child exited %d; it said:\\n%s\" % (child.returncode, said))\nAssertionError: review child exited 1; it said:\nValueError: the first reading was wrong\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"<string>\", line 7, in <module>\n  File \"<string>\", line 5, in <module>\n  File \"/usr/lib/python3.11/subprocess.py\", line 550, in run\n    stdout, stderr = process.communicate(input, timeout=timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1207, in communicate\n    stdout, stderr = self._communicate(input, endtime, timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 2085, in _communicate\n    self.wait(timeout=self._remaining_time(endtime))\n  File \"/usr/lib/python3.11/subprocess.py\", line 1262, in wait\n    return self._wait(timeout=timeout)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1989, in _wait\n    raise TimeoutExpired(self.args, timeout)\nsubprocess.TimeoutExpired: Command '['/usr/bin/python3', '-c', 'import time; time.sleep(30)']' timed out after 0.4999918100074865 seconds\n\n----------------------------------------------------------------------\nRan 0 tests in 0.522s\n\nFAILED (errors=1)",
+    "cause-quoted-inline": "E\n======================================================================\nERROR: setUpClass (__main__.Review)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/workspace/source/fx-89ad/causeinline.py\", line 22, in setUpClass\n    raise AssertionError(child.stderr.rstrip())\nAssertionError: ValueError: the first reading was wrong\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"<string>\", line 7, in <module>\n  File \"<string>\", line 5, in <module>\n  File \"/usr/lib/python3.11/subprocess.py\", line 550, in run\n    stdout, stderr = process.communicate(input, timeout=timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1207, in communicate\n    stdout, stderr = self._communicate(input, endtime, timeout)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 2085, in _communicate\n    self.wait(timeout=self._remaining_time(endtime))\n  File \"/usr/lib/python3.11/subprocess.py\", line 1262, in wait\n    return self._wait(timeout=timeout)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.11/subprocess.py\", line 1989, in _wait\n    raise TimeoutExpired(self.args, timeout)\nsubprocess.TimeoutExpired: Command '['/usr/bin/python3', '-c', 'import time; time.sleep(30)']' timed out after 0.4999910200131126 seconds\n\n----------------------------------------------------------------------\nRan 0 tests in 0.521s\n\nFAILED (errors=1)"
+  },
+  "fails_context": {},
+  "fails": [
+    "tail-quoted: no cargo test failure in this check's output; 1 error line(s), first 1:",
+    "tail-quoted: | ERROR: setUpClass (__main__.Review)",
+    "cause-quoted: no cargo test failure in this check's output; 1 error line(s), first 1:",
+    "cause-quoted: | ERROR: setUpClass (__main__.Review)",
+    "cause-quoted-inline: no cargo test failure in this check's output; 1 error line(s), first 1:",
+    "cause-quoted-inline: | ERROR: setUpClass (__main__.Review)"
+  ]
+}

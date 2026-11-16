@@ -84,8 +84,8 @@ test.describe('/it/registry/agents', () => {
     await expect(facts).toContainText('engineering-agent');
     await expect(facts).toContainText('opus-5[1m]');
     await expect(facts).toContainText('$40.00 an hour');
-    // NULL in the registry is not a zero.
-    await expect(facts.locator('dt:has-text("Concurrent runs") + dd')).toHaveText('not declared');
+    // The row's retired run cap is not drawn as a limit (backlog 3e927996).
+    await expect(facts.locator('dt:has-text("Concurrent runs")')).toHaveCount(0);
     // Two steps under the id, one under the login: three.
     await expect(facts.locator('dt:has-text("Open steps held") + dd')).toHaveText('3');
     await expect(facts.locator('dt:has-text("Effort in these runs") + dd')).toHaveText('high ×1');

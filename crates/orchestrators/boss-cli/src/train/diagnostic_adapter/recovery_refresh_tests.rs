@@ -521,6 +521,7 @@ async fn oversized_optional_recovery_keeps_ordinary_gate_recording_alive() {
             packet: gate.id.to_string(),
             created: "2026-10-16T00:00:00Z".into(),
             carrier: true,
+            judged_init: false,
             finished: Some(Finished {
                 failed: false,
                 reason: "Complete".into(),

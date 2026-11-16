@@ -1368,6 +1368,23 @@ required_roles = []
   required = false
   description = "The machine receipt as a JSON string (head, verdict, mode, fails). Absent on `lost`, where the environment died before one was written."
 
+  # THE TWO FAILURE FACTS (item c02fc3b3; docs/design/factory-taxonomy.md
+  # M4). New-optional, the one always-safe bundle edit
+  # (infra/lint/steptype-bundle-ratchet.sh), so nothing in flight tightens.
+  # Declared `object` so a fact written as anything else is refused at the
+  # write rather than second-guessed by every reader.
+  [[step_type.fields]]
+  name = "equipment_fault"
+  field_type = "object"
+  required = false
+  description = "The equipment failed: {kind: refused|lost|stall-deadline|unjudged, checks, io_full_s, wall_s, why}. Written by the verdict recorder from the receipt (boss_jobs::failure_facts): a refusal and a lost run always; a red with no readable verdict (an unreadable receipt, an error with no fails, or a receipt naming no failing check at all) always, as `unjudged`; a failed run when a failure entry matched a declared equipment signature inside a check whose io.full stall crossed the line. Absent on a green. An equipment fault is not a product defect (CLAUDE.md §Diagnosis)."
+
+  [[step_type.fields]]
+  name = "product_defect"
+  field_type = "object"
+  required = false
+  description = "The product failed: {checks, entries, why}. Written by the verdict recorder from the receipt (boss_jobs::failure_facts) for any failure entry that is not the equipment's — an assertion, an unsigned or unpanicked message, an entry under the stall line or without a measured interval — and for a failure list cut at the receipt's bound. A red holding both kinds records both, and the product defect governs the strike. Absent on a green, a refusal, a lost run and an unjudged red — never written for a red that judged nothing. A gate-run recorded before 2026-11-04 carries neither fact: unrecorded, not clean."
+
 [[step_type]]
 kind = "credential-rotation"
 label = "Credential rotation scope"

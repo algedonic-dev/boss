@@ -1,0 +1,7 @@
+# gate-run's record-verdict step names its executor as equipment, the
+# gates (design ccfe87ff pass item 2, backlog 364b27a3). A TIMING hold
+# (backlog a4b57aca kept these when it retired the default holds): the row
+# must wait for what it names to read back live.
+drift_publish = "held"
+lifts = 'backlog 364b27a3 (design ccfe87ff pass item 2): once GET /api/stations reads back gates, converge and probe-shed as equipment with their automata and bays, the deliberate publish of this row, then a car that deletes this file.'
+why = '''The record-verdict step declares executor equipment:gates, so a claim on it clears only for automation:gate-runner with a free bay at gates. The gates row is live; this row is held with the two others the same car changes (pr-train, ship-a-change) so the three equipment declarations go live together, at one deliberate publish, after the stations they name read back live. The publish endpoint judges only an executor's shape, and an unattended drift publish after a converge would not wait for that read.'''

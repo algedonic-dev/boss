@@ -93,14 +93,17 @@ async fn cap_the_agent(db: &TestDb, hourly_budget_usd_micros: Option<i64>) {
     PgAgents::new(db.pool.clone())
         .publish(
             &[AgentInput {
+                factory_rotation: Some(true),
                 id: AGENT.into(),
                 display_name: "Claude (engineering)".into(),
                 default_model: "opus-5".into(),
+                model_class: None,
                 aliases: vec!["claude@algedonic.dev".into()],
                 role: None,
                 department: None,
                 hourly_budget_usd_micros,
                 max_concurrent_runs: None,
+                stations: None,
             }],
             PublishMode::Take,
             &EventStamp::new("jobs", ActorId::Automation("test".into())),

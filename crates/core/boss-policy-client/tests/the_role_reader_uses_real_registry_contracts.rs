@@ -16,7 +16,10 @@ async fn registry(
     people: serde_json::Value,
 ) -> (String, Arc<Mutex<Vec<(String, Option<String>)>>>) {
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let mut app = Router::new();
+    let mut app = Router::new().route(
+        "/fixture-ready",
+        get(|| async { axum::http::StatusCode::NO_CONTENT }),
+    );
     for (path, body) in [
         ("/api/agents", agents),
         ("/api/agents/automations", automations),
@@ -42,9 +45,64 @@ async fn registry(
         );
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = start_registry(listener, app).await;
+    (base, seen)
+}
+
+async fn start_registry(listener: tokio::net::TcpListener, app: Router) -> String {
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (base, seen)
+    // Binding reserves the socket; only a completed HTTP response proves the
+    // spawned server has actually run before a registry fetch spends its budget.
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
+        .get(format!("{base}/fixture-ready"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    base
+}
+
+#[tokio::test]
+async fn fixture_startup_waits_for_an_actual_http_response() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = Router::new().route(
+        "/fixture-ready",
+        get({
+            let entered = entered.clone();
+            let release = release.clone();
+            move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut startup = tokio::spawn(start_registry(listener, app));
+    tokio::select! {
+        result = &mut startup => panic!("fixture returned before an HTTP readiness response: {result:?}"),
+        () = entered.notified() => {},
+        () = tokio::time::sleep(Duration::from_secs(10)) => panic!("fixture never requested readiness"),
+    }
+    assert!(
+        !startup.is_finished(),
+        "accepting a connection is not a completed readiness response"
+    );
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), startup)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 fn empty() -> serde_json::Value {
@@ -63,7 +121,7 @@ async fn a_complete_authenticated_fetch_is_reused_for_many_request_time_lookups(
         base.clone(),
         base,
         User::service("people"),
-        Duration::from_secs(2),
+        Duration::from_secs(10),
         Arc::new(Source::fixed(None)),
     )
     .unwrap();
@@ -123,7 +181,7 @@ async fn unavailable_malformed_oversized_and_timed_out_reads_are_unknown_not_abs
             Arc::new(Source::fixed(None)),
         )
         .unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(2), reader.role_for("actor"))
+        let result = tokio::time::timeout(Duration::from_secs(10), reader.role_for("actor"))
             .await
             .unwrap();
         assert!(
@@ -156,7 +214,7 @@ async fn complete_absence_inactive_people_and_cross_registry_ambiguity_are_disti
             base.clone(),
             base,
             User::service("classes"),
-            Duration::from_secs(2),
+            Duration::from_secs(10),
             Arc::new(Source::fixed(None)),
         )
         .unwrap();
@@ -184,7 +242,7 @@ async fn a_people_row_without_status_is_unknown_not_unregistered() {
         base.clone(),
         base,
         User::service("classes"),
-        Duration::from_secs(2),
+        Duration::from_secs(10),
         Arc::new(Source::fixed(None)),
     )
     .unwrap();
@@ -230,7 +288,7 @@ async fn canonical_agent_alias_automation_and_person_are_read_without_inference(
         base.clone(),
         base,
         User::service("classes"),
-        Duration::from_secs(2),
+        Duration::from_secs(10),
         Arc::new(Source::fixed(None)),
     )
     .unwrap();
@@ -285,7 +343,7 @@ async fn null_is_registered_but_missing_role_truncated_and_ambiguous_answers_are
             base.clone(),
             base,
             User::service("classes"),
-            Duration::from_secs(2),
+            Duration::from_secs(10),
             Arc::new(Source::fixed(None)),
         )
         .unwrap();

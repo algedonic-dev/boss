@@ -40,6 +40,7 @@ pub fn router<R: ProductsRepository + 'static>(state: ProductsApiState<R>) -> Ro
     let shared = Arc::new(state);
     Router::new()
         .route("/api/products/health", get(health))
+        .route("/api/products/catalog/versions", get(sku_versions::<R>))
         .route(
             "/api/products",
             get(list_products::<R>).post(upsert_product::<R>),
@@ -60,6 +61,15 @@ pub fn router<R: ProductsRepository + 'static>(state: ProductsApiState<R>) -> Ro
 
 async fn health() -> Response {
     Json(serde_json::json!({"status": "ok"})).into_response()
+}
+
+async fn sku_versions<R: ProductsRepository + 'static>(
+    State(state): State<Arc<ProductsApiState<R>>>,
+) -> Response {
+    match state.products.sku_versions().await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(error) => error_response(error),
+    }
 }
 
 #[derive(Deserialize, Default)]

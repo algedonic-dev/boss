@@ -30,7 +30,7 @@ set -euo pipefail
 
 # shellcheck source=infra/forge/forge-defaults.sh
 . "$(dirname "$0")/forge-defaults.sh"
-INBOX="$CONVERGE_STATE/requests"
+INBOX="$CONVERGE_REQUESTS"
 
 if [ -n "${OPS_REQUEST_ID:-}" ]; then
     case "$OPS_REQUEST_ID" in

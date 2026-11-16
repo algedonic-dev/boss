@@ -28,11 +28,21 @@
 # the credential rides `git -c`, not a ~/.gitconfig.
 #
 # Required env: GATE_BRANCH. Optional: FORGE_URL, GATE_BOOT_DIR.
+# The repository default is derived estate data in the script ConfigMap.
 # Hands run.sh: GATE_SHA, GATE_RUNNER_SOURCE (branch | main-fallback),
 # GATE_RUNNER_SHA256, GATE_RUNNER_FALLBACK_REASON (fallback only).
 set -uo pipefail
 
-FORGE_URL="${FORGE_URL:-http://10.20.0.15:3000/david/boss.git}"
+# --- forge repository (begin) ---
+if [ -z "${FORGE_URL:-}" ]; then
+    FORGE_URL=$(cat "${GATE_FORGE_REPOSITORY_FILE:-/repo-script/forge-repository}") \
+        || { echo 'gate-bootstrap: cannot read the declared forge repository from the script ConfigMap' >&2; exit 78; }
+    [ -n "$FORGE_URL" ] \
+        || { echo 'gate-bootstrap: the declared forge repository is empty' >&2; exit 78; }
+fi
+# The branch's run.sh lives in BOOT_DIR, not beside the ConfigMap data.
+export FORGE_URL
+# --- forge repository (end) ---
 BOOT_DIR="${GATE_BOOT_DIR:-${TMPDIR:-/tmp}/gate-boot}"
 # main's copy: the ConfigMap's run.sh key, mounted beside this file.
 FALLBACK="$(dirname "${BASH_SOURCE[0]}")/run.sh"

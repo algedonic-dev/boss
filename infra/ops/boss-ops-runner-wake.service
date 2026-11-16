@@ -1,0 +1,59 @@
+# The ops-request runner's waker (backlog ca6f40c2): starts
+# boss-ops-runner.service the moment a request for this host is filed,
+# instead of at the timer's next tick. infra/ops/ops-runner-wake.sh says
+# what it reads and why its one act cannot widen what runs.
+#
+# INSTALLED BY infra/ops/install-ops-runner.sh beside the runner, BYTE-
+# IDENTICAL, with a drop-in <host>.conf naming this host and running the
+# waker from the runner's own tree — only where the runner runs from its
+# tree directly (not under a tree helper, whose shared lock a process
+# that never exits would hold). No HOST_ID default, as with the runner:
+# with no drop-in the script refuses with 78 and the unit stays red.
+#
+# NEVER ENABLED ON ITS OWN, so no [Install]: boss-ops-runner.timer
+# Wants= it, and it is PartOf= the timer. The timer brings it up (at boot,
+# and on each converge's `enable --now`); whatever stops the timer —
+# retire-ops-runner's one act — stops it with it. The timer stays the net
+# and owes this unit nothing.
+[Unit]
+Description=BOSS ops: wake the ops-request runner when a request for this host is filed
+Wants=network-online.target
+After=network-online.target
+PartOf=boss-ops-runner.timer
+# A dark record is the script's backoff, never a restart: it reconnects
+# inside one process, and the lifetime exits once an hour. So five starts
+# in ten minutes is a unit dying before or outside the script (a missing
+# ExecStart, a killed process), and systemd stops there, failed, rather
+# than restarting every 5 s with nothing readable (backlog 0e9a446a). The
+# timer is the net meanwhile, and owes this nothing.
+StartLimitIntervalSec=10min
+StartLimitBurst=5
+
+[Service]
+# The system of record, from the file every unit reads (backlog 5222163e)
+# — OPTIONALLY, so a host whose converge has not rendered it reaches the
+# script, which refuses ONCE with 78 naming the file and the converge that
+# writes it. A hard EnvironmentFile= failed the unit before the script
+# ran, with no 78 for RestartPreventExitStatus to see, and so restarted it
+# every 5 s forever (backlog 0e9a446a). The script has no fallback
+# address: a missing file is still a refusal, never a guess.
+EnvironmentFile=-/etc/boss/sor.env
+Type=simple
+# Every host's drop-in REPLACES this line with the waker from its own
+# tree; the path below is only what a host whose checkout is /opt/boss
+# would get.
+ExecStart=/opt/boss/infra/ops/ops-runner-wake.sh
+# Exits 0 hourly to pick up the current tree, and on any death; never
+# after a configuration refusal (78), which should stay red.
+Restart=always
+RestartSec=5
+RestartPreventExitStatus=78
+# It presents the estate machine token on its read, so the token's
+# header file lives in $RUNTIME_DIRECTORY — tmpfs, 0700, removed by
+# systemd when the unit stops, a kill included (backlog df38075a, the
+# runner's own shape). It reads one stream and runs one systemctl verb:
+# it needs nothing setuid, and dumps no core holding what it read.
+RuntimeDirectory=boss-ops-runner-wake
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+LimitCORE=0

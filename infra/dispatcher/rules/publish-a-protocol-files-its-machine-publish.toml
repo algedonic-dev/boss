@@ -1,0 +1,46 @@
+# publish-a-protocol's machine step (design b1f319bc, backlog 7955a488).
+# When the packet's `publish` step becomes READY — the owner signed
+# `approve` with a passkey and the decision was `approved` — spawn an
+# ops-request for host=boss-gcp verb=publish-workflow with the ONE arg
+# the verb takes, the kind, and the packet's id as
+# `metadata.for_protocol_publish`.
+#
+# THAT EDGE IS THE WHOLE DOOR. infra/gcp/publish-workflow.sh refuses a
+# held kind (exit 9) unless the request it answers names, through this
+# key, a publish-a-protocol packet it reads back as signed for exactly
+# the file and the live version in front of it. The kind rides as an
+# arg because the verb's argv contract is pattern-checked args, never
+# packet text; the packet is read by the script, from the record, and
+# never trusted from the request (a hand-filed request naming a signed
+# packet can publish only the bytes that packet signed, once).
+#
+# Routed on the STEP's metadata marker, not its slug: `step.ready.*`
+# payloads carry the step's metadata_defaults (rendered at
+# materialization, so `protocol_kind` is the kind itself) and do not
+# hoist spec_slug. `metadata.ops_verb` is Absent on every other task
+# step, and Absent is UNEQUAL to the literal — false, not
+# PredicateFailed — so the shared topic never dead-letters. Pinned by
+# crates/core/boss-dispatcher/tests/publish_a_protocol_rules.rs.
+[[rule]]
+name = "publish-a-protocol-files-its-machine-publish"
+why = """
+A CROSS-PROTOCOL REACTOR spanning three protocols — publish-a-protocol
+-> ops-request -> a verb on the boss-gcp host — which no single
+Workflow `on` consequence can express: the packet's protocol cannot
+name a host verb, and the request's cannot know which packet asked.
+The `publish` step becoming ready means the owner signed one publish
+with a passkey; the publish then runs by machine through the checked
+sequence that already exists (publish-workflow.sh: the lint, the
+dry-run, the publish, the read-back). It widens no authority: a held
+kind is published only when the script reads this packet back as
+signed by a named approver over the exact file, and every other kind
+was publishable by that verb already. Measured 2026-11-05 (backlog
+7955a488): three publishes waiting on the platform owner lived in a
+handoff note with no packet, and the held kind's only door was a
+terminal command.
+"""
+on_event = "step.ready.task"
+when = 'metadata.ops_verb = "publish-workflow"'
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"ops-request\"", subject_kind = "\"custom\"", subject = "\"boss-gcp\"", title = "\"publish a protocol on boss-gcp — its owner signed the publish\"", "metadata.host" = "\"boss-gcp\"", "metadata.verb" = "\"publish-workflow\"", "metadata.args" = "[metadata.protocol_kind]", "metadata.for_protocol_publish" = "job_id" }

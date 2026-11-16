@@ -198,6 +198,36 @@
 #      its procedure says the machine measures first; the analyst block
 #      stays, for every reading the rule declines.
 #
+# v14 (backlog adddf958, found 2026-09-25 on f4dd3df3's measure by
+# analyst run 701ccb98). Two of this row's words disagreed with what the
+# step could record:
+#
+#  21. `measure` DECLARES `newly_public_files` (an array). Its procedure
+#      asked for the list, the review step reads it, and the rule
+#      publish-measure-lands-the-drift-reading already copies it from
+#      `drift_refresh`, but the row declared no such field, so `boss step
+#      complete` refused it by name and an agent's list could ride only
+#      in an items label. Not required: this changes what a completion
+#      may record, not what it must carry.
+#  22. `newly_public` says WHICH count. It is the newly public files
+#      under docs/runbooks/ or infra/cluster|caddy|forge/ — the length of
+#      that review list — which prep-github-publish.sh --json writes as
+#      `newly_public` and `drift_refresh` writes as
+#      `newly_public_sensitive`. `drift_refresh`'s own `newly_public`
+#      counts EVERY added file: a different number under the same name
+#      (measured that day: 271 against 5). The rule already copies the
+#      sensitive count; the procedure now says so, so a reader comparing
+#      the reading with the step meets a naming difference, named. The
+#      two scripts' JSON keys are not renamed here.
+#
+#  Station-tree words (backlog 53abeb8d): `metadata.owner` names the
+#  owning station, engineering. `metadata.department` stays beside it
+#  because a live reader still reads it — the department join,
+#  boss_jobs::department::kinds_declaring, which the department jobs
+#  listing (`GET /api/jobs?department=it`) and the department readiness
+#  view narrow to; removing it would drop this protocol's packets from
+#  IT's view until that join reads the owner.
+#
 # Cadence: the daily `publish-to-github-daily` rule (129/149) spawns one
 # packet per day, guarded to one open packet per mirror; most days land
 # on `nothing-to-publish`, which is the measurement that the mirror is
@@ -218,7 +248,7 @@ category = "platform"
 subject_kinds = ["custom"]
 owning_team = "platform"
 description = "Measure what a push to the public GitHub mirror would publish, prove it carries no credential material, and put the newly-public surface in front of a human before any of it leaves the network. Runs daily; most days it will find nothing and close on the nothing-to-publish terminal, which is the measurement that says the mirror is current. On approval the forge opens the pull request by machine (the publish-github-pr ops verb, as the algedonic-dev GitHub App), reads its checks back, and — once every check main requires is green — the App fast-forwards main to exactly the approved commit (merge-publish-pr). Nobody merges main by hand."
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it", owner_role = "platform-admin" }
 
 [[workflow.step]]
 title = "opened"
@@ -236,7 +266,7 @@ authority_role = "platform-admin"
 # (7) An agent's step now: the analyst block judge-checks carries.
 # (20) Landed by machine first; the agent measures what the rule declines.
 agent = { profile = "analyst", model = "opus-5-5", budget_usd = 2, effort = "medium" }
-metadata_defaults = { human_only = false, completed_from = "drift_refresh, by the dispatcher rule publish-measure-lands-the-drift-reading", procedure = "THE MACHINE MEASURES FIRST. The daily `publish-github-pr --measure` writes `drift_refresh` onto this packet in this step's own field names, and the dispatcher rule publish-measure-lands-the-drift-reading completes this step from it, copied field for field, after putting its two shas on the approve step — as soon as a reading lands that is CLEAN, carries an empty `blocking`, was taken after this packet opened, and holds every field. If this step is still open for you, one of those did not hold (read `drift_refresh` to see which: a FAILED scan, foreign mirror content, a stale or partial reading), and the measurement is yours.\n\nRE-MEASURE; DO NOT TRANSCRIBE a reading the machine declined: `has_drift` = false closes this packet nothing-to-publish, so the value recorded here must be the instrument's own. From the dev pod: `git fetch origin`, then `infra/prep-github-publish.sh --json` (SOURCE_REF defaults to origin/main, the tree the forge publishes; the mirror is read through a read-only anonymous remote named `github`, and when that remote is missing the script refuses and prints the `git remote add` that configures it).\n\nRecord the script's JSON as this step's fields, copied, never retyped from memory: `commits_ahead`, `files_changed`, `secrets_scan` (clean or FAILED, as the script said), `newly_public` (its count), `has_drift` (its own true or false, never inferred), and the two shas that name what was measured — `source_sha` (the commit whose drift was counted) and `scanned_sha` (the commit whose tree the secrets scan read; the string none when nothing was scanned). Record its `newly_public_files` list on this step too, as `newly_public_files`: the review step reads each file it names.\n\nTHEN PUT THE SAME TWO SHAS ON THE APPROVE STEP, before you complete this one: PATCH /api/jobs/{id}/steps/{the approve step's id}/metadata with `source_sha` and `scanned_sha`, the same values, copied from the same JSON. David's passkey signs the approve step's own keys, so this is what makes his approval an approval of THIS tree; the forge publishes exactly that commit and refuses an approval that names none, or names one this step did not record.\n\nEXIT 2 means a ref did not resolve and NOTHING was measured: complete nothing, and say why on this packet (PATCH /api/jobs/{id}/metadata). EXIT 1 is a BLOCKING finding (a secrets hit, or mirror content the source lacks): record the numbers anyway, with the script's `blocking` text as `blocking` on this step, so the review and David's approve both see it — the script prints the lint's own report of which file hit on stderr; quote it in `blocking`. A tree whose scan FAILED is never published by machine, approved or not." }
+metadata_defaults = { human_only = false, completed_from = "drift_refresh, by the dispatcher rule publish-measure-lands-the-drift-reading", procedure = "THE MACHINE MEASURES FIRST. The daily `publish-github-pr --measure` writes `drift_refresh` onto this packet in this step's own field names, and the dispatcher rule publish-measure-lands-the-drift-reading completes this step from it, copied field for field, after putting its two shas on the approve step — as soon as a reading lands that is CLEAN, carries an empty `blocking`, was taken after this packet opened, and holds every field. If this step is still open for you, one of those did not hold (read `drift_refresh` to see which: a FAILED scan, foreign mirror content, a stale or partial reading), and the measurement is yours.\n\nRE-MEASURE; DO NOT TRANSCRIBE a reading the machine declined: `has_drift` = false closes this packet nothing-to-publish, so the value recorded here must be the instrument's own. From the dev pod: `git fetch origin`, then `infra/prep-github-publish.sh --json` (SOURCE_REF defaults to origin/main, the tree the forge publishes; the mirror is read through a read-only anonymous remote named `github`, and when that remote is missing the script refuses and prints the `git remote add` that configures it).\n\nRecord the script's JSON as this step's fields, copied, never retyped from memory: `commits_ahead`, `files_changed`, `secrets_scan` (clean or FAILED, as the script said), `newly_public` (its count of newly public files under docs/runbooks/ or infra/cluster|caddy|forge/ — the review list's length; in `drift_refresh` that count is `newly_public_sensitive`, and `drift_refresh`'s own `newly_public` is the total of every added file, a different number, never this field), `has_drift` (its own true or false, never inferred), and the two shas that name what was measured — `source_sha` (the commit whose drift was counted) and `scanned_sha` (the commit whose tree the secrets scan read; the string none when nothing was scanned). Record its `newly_public_files` list on this step too, as `newly_public_files`: the review step reads each file it names.\n\nTHEN PUT THE SAME TWO SHAS ON THE APPROVE STEP, before you complete this one: PATCH /api/jobs/{id}/steps/{the approve step's id}/metadata with `source_sha` and `scanned_sha`, the same values, copied from the same JSON. David's passkey signs the approve step's own keys, so this is what makes his approval an approval of THIS tree; the forge publishes exactly that commit and refuses an approval that names none, or names one this step did not record.\n\nEXIT 2 means a ref did not resolve and NOTHING was measured: complete nothing, and say why on this packet (PATCH /api/jobs/{id}/metadata). EXIT 1 is a BLOCKING finding (a secrets hit, or mirror content the source lacks): record the numbers anyway, with the script's `blocking` text as `blocking` on this step, so the review and David's approve both see it — the script prints the lint's own report of which file hit on stderr; quote it in `blocking`. A tree whose scan FAILED is never published by machine, approved or not." }
 [[workflow.step.fields]]
 name = "commits_ahead"
 field_type = "string"
@@ -253,6 +283,12 @@ required = true
 name = "newly_public"
 field_type = "string"
 required = true
+# (21) The review list itself, which the procedure asks for and the
+# review step reads: declared so a completion may carry it (adddf958).
+[[workflow.step.fields]]
+name = "newly_public_files"
+field_type = "array"
+required = false
 [[workflow.step.fields]]
 name = "has_drift"
 field_type = "true|false"
@@ -321,7 +357,7 @@ title_template = "Approve publishing to the public mirror"
 authority_role = "platform-admin"
 assurance_required = "presence"
 sign_offs_required = ["platform-admin"]
-metadata_defaults = { human_only = true, procedure = "YOUR PASSKEY SIGNS THIS STEP'S OWN KEYS, and two of them name the tree: `source_sha` is the commit the measurement counted and the review read, and `scanned_sha` the commit whose tree the secrets scan passed. They must be the same sha. The forge publishes exactly that commit's tree — not whatever forge main has become since — and refuses an approval without a passkey, one whose two shas differ, one naming a tree the measure step did not record, and one whose scan did not come back clean.\n\nRead the review step's `newly_public_review` first; it is written so you can decide without opening anything else. If either sha is missing, do not approve: the measurement did not put them here, and the forge would refuse the publish anyway. Reject, or request changes, when the review says do not publish." }
+metadata_defaults = { human_presentation = { ask = "Decide whether this exact tree may be published publicly", why_person = "Your passkey must authorize the reviewed source tree and its clean secrets scan.", action = "Read the review and approve, reject, or request changes", after = "Approval allows publication of that exact tree only. Missing or unequal source and scanned identities are a reason not to approve.", evidence = "current-step" }, human_only = true, procedure = "YOUR PASSKEY SIGNS THIS STEP'S OWN KEYS, and two of them name the tree: `source_sha` is the commit the measurement counted and the review read, and `scanned_sha` the commit whose tree the secrets scan passed. They must be the same sha. The forge publishes exactly that commit's tree — not whatever forge main has become since — and refuses an approval without a passkey, one whose two shas differ, one naming a tree the measure step did not record, and one whose scan did not come back clean.\n\nRead the review step's `newly_public_review` first; it is written so you can decide without opening anything else. If either sha is missing, do not approve: the measurement did not put them here, and the forge would refuse the publish anyway. Reject, or request changes, when the review says do not publish." }
 [[workflow.step.fields]]
 name = "decision"
 field_type = "pending|approved|rejected|changes-requested"

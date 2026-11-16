@@ -21,7 +21,16 @@ CRED=ops-runner-credential-boss-gcp
 # check is an answer — never a byte of the envelope, which jq diagnostics
 # and an echoed field could carry, so no caller passes one through.
 refuse() { echo "runner-credential-recv: refused ($1); installed credential unchanged" >&2; exit 65; }
-fail() { echo "runner-credential-recv: failed${1:+ ($1)}; delivery not acknowledged" >&2; exit 1; }
+# EVERY FAILURE NAMES ITS CHECK TOO, AND SAYS WHETHER THE CREDENTIAL WAS
+# REPLACED (backlog e317cbe2, from review 9bbf4e03 of car b970a8fd).
+# Eleven `fail` calls were bare, and every failure after the rename
+# below — the directory sync, the read-back, the presentation, the door,
+# the owner's acknowledgment — leaves the delivered credential installed
+# and unacknowledged, which no line said: three of them named no cause
+# either. INSTALLED flips at the rename, the one act that replaces the
+# file; runner_credential_recv_sh.rs holds every call to a word of its own.
+INSTALLED='installed credential unchanged'
+fail() { echo "runner-credential-recv: failed ($1); $INSTALLED; delivery not acknowledged" >&2; exit 1; }
 # http_status — CODE as the digits curl wrote, or `none` when no answer
 # came, for a reason word.
 http_status() { local c="${CODE//[!0-9]/}"; printf '%s' "${c:-none}"; }
@@ -40,13 +49,13 @@ GREETING='runner-credential-recv: boss-gcp: ready for one envelope'
 refuse_empty() { echo 'runner-credential-recv: refused an empty envelope; installed credential unchanged' >&2; exit 65; }
 [ "$#" -eq 0 ] || refuse arguments
 umask 077
-WORK="$(mktemp -d)" || fail
+WORK="$(mktemp -d)" || fail workdir
 TMP=""
 cleanup() { rm -rf "$WORK"; [ -z "$TMP" ] || rm -f "$TMP"; }
 trap cleanup EXIT
-printf '%s\n' "$GREETING" || fail
-head -c 8193 > "$WORK/input" || refuse unread
-BYTES="$(stat -c %s "$WORK/input")" || refuse unread
+printf '%s\n' "$GREETING" || fail greeting-unwritten
+head -c 8193 > "$WORK/input" || refuse input-unread
+BYTES="$(stat -c %s "$WORK/input")" || refuse input-size-unread
 [ "$BYTES" -gt 0 ] || refuse_empty
 [ "$BYTES" -le 8192 ] || refuse oversize
 # One document and one occurrence of every scalar path. Ordinary jq object
@@ -54,7 +63,7 @@ BYTES="$(stat -c %s "$WORK/input")" || refuse unread
 jq -s -e 'length == 1' "$WORK/input" >/dev/null 2>&1 || refuse not-one-document
 jq -n --stream -e 'reduce inputs as $row ([]; if ($row | length) == 2 then . + [$row[0]] else . end) | group_by(.) | all(length == 1)' "$WORK/input" >/dev/null 2>&1 || refuse duplicate-key
 # jq diagnostics can quote the credential, so all parsing failures are silent.
-jq_doc_file "$WORK/input" || refuse not-one-document
+jq_doc_file "$WORK/input" || refuse envelope-not-a-document
 jq -e '
   def uuid: type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
   type == "object" and (keys == ["attempt","credential_id","host","job_id","secret_uid","value","version"])
@@ -64,9 +73,9 @@ jq -e '
   and (.secret_uid | uuid)
   and (.value | type == "string" and length >= 32 and length <= 4096 and test("^[A-Za-z0-9_-]+$"))
 ' "$WORK/input" >/dev/null 2>&1 || refuse envelope-shape
-CUR="$(jq -r .value "$WORK/input" 2>/dev/null)" || refuse envelope-unread
-NEXT_FOR="$(jq -r .job_id "$WORK/input" 2>/dev/null)" || refuse envelope-unread
-BOUND="$(jq -c 'del(.value,.host,.version)' "$WORK/input" 2>/dev/null)" || refuse envelope-unread
+CUR="$(jq -r .value "$WORK/input" 2>/dev/null)" || refuse envelope-value-unread
+NEXT_FOR="$(jq -r .job_id "$WORK/input" 2>/dev/null)" || refuse envelope-job-unread
+BOUND="$(jq -c 'del(.value,.host,.version)' "$WORK/input" 2>/dev/null)" || refuse envelope-binding-unread
 . "$INFRA/lib/sor.sh"
 [ -n "${BOSS_JOBS_URL:-}" ] || refuse no-jobs-url
 . "$INFRA/lib/secret-header.sh"
@@ -100,12 +109,18 @@ BODY="$WORK/body"
 # `job` `read`, count 2, first 2026-10-10T19:45:54Z, last 19:56:24Z —
 # forge converges ec127c89 and f02e5a33. The forge's deposit
 # (infra/forge/runner-credential-deposit.sh) always signed, and its
-# rotation (c896cb12) closed. Same row, same role: its
-# infra/platform/automations/runner-credential-deposit.toml is the runner
-# deposit's attribution on its consuming host, and platform-admin is the
-# role automation:ops-runner's own row records, so an enforcing role
-# guard reads no mismatch.
-BOSS_USER='{"id":"automation:runner-credential-deposit","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
+# rotation (c896cb12) closed. The role is platform-admin, the one
+# automation:ops-runner's own row records, so an enforcing role guard
+# reads no mismatch; the tier is operator because the delivery owner
+# (record_delivery, crates/core/boss-jobs/src/credentials/http.rs)
+# refuses any other. The id is this receiver's OWN row,
+# infra/platform/automations/runner-credential-recv.toml (backlog
+# e317cbe2, from review 9bbf4e03 of car b970a8fd): it signed as
+# automation:runner-credential-deposit until 2026-10-18, a row that
+# describes the forge's deposit script and not this one. The door
+# rebinds the id on every request it resolves, so this one reaches the
+# record only on a request it did not.
+BOSS_USER='{"id":"automation:runner-credential-recv","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
 HDRS=(-H "x-boss-user: $BOSS_USER")
 machine_token_header MT_HDR "$BOSS_JOBS_URL" || fail machine-token-header
 [ -z "$MT_HDR" ] || HDRS+=(-H "$MT_HDR")
@@ -165,16 +180,17 @@ PKT_STEP="$(jq -er --arg c "$CRED" '
 [ ! -L "$DEST" ] || refuse destination-symlink
 DIR="$(dirname "$DEST")"
 [ -d "$DIR" ] || refuse destination-directory-absent
-TMP="$(mktemp "$DIR/.runner-recv.XXXXXX")" || fail
-printf '%s' "$CUR" > "$TMP" || fail
-chmod 600 "$TMP" || fail
-if [ "$(id -u)" -eq 0 ]; then chown 0:0 "$TMP" || fail; fi
-sync -- "$TMP" || fail
-mv -fT "$TMP" "$DEST" || fail
+TMP="$(mktemp "$DIR/.runner-recv.XXXXXX")" || fail staging-file
+printf '%s' "$CUR" > "$TMP" || fail staging-write
+chmod 600 "$TMP" || fail staging-mode
+if [ "$(id -u)" -eq 0 ]; then chown 0:0 "$TMP" || fail staging-owner; fi
+sync -- "$TMP" || fail staging-sync
+mv -fT "$TMP" "$DEST" || fail install-rename
 TMP=""
-sync -- "$DIR" || fail
+INSTALLED='the delivered credential IS installed'
+sync -- "$DIR" || fail install-directory-sync
 # Acknowledgment proves the installed bytes, not merely the transport input.
-CUR="$(cat "$DEST" 2>/dev/null)" || fail
+CUR="$(cat "$DEST" 2>/dev/null)" || fail installed-unread
 present "$CUR" || fail installed-not-presented
 resolve_bound || fail "installed-$DOOR"
 last8() { printf '%s' "${1: -8}"; }
@@ -187,6 +203,6 @@ runner_delivery_ack "$CRED" "$HOST" "$NEXT_FOR" "$CUR" "$DEST" "$DELIVERY_CONTEX
 [ "$rc" -eq 0 ] || fail "$DELIVERY_STATE"
 # The sender retains the owner's original record, not an English success
 # sentence. The presented value is not a field of this value-free response.
-[[ $DELIVERY_RECEIPT != *"$CUR"* ]] || fail
+[[ $DELIVERY_RECEIPT != *"$CUR"* ]] || fail receipt-carries-the-value
 jq -nc --argjson binding "$BOUND" --argjson receipt "$DELIVERY_RECEIPT" \
     '$binding + {version:1,host:"boss-gcp",recorded:true,original_delivery_receipt:$receipt}'

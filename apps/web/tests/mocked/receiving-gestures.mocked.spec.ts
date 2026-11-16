@@ -24,7 +24,7 @@ type FixtureStep = { id: string; title: string; spec_slug: string; kind: string;
 const packet = (kind: string, suffix = 'one') => ({
   id: `fixture-${kind}-${suffix}`, kind, title: `Synthetic ${kind} ${suffix}`, status: 'open',
   priority: 'standard', opened_on: '2026-01-01',
-  metadata: { message: `Synthetic ${kind} ${suffix}`, route: ROUTE_CATALOG['company-map'].path },
+  metadata: { message: `Synthetic ${kind} ${suffix}`, route: ROUTE_CATALOG.manual.path },
   steps: [
     { id: `fixture-${suffix}-opened`, title: 'opened', spec_slug: 'opened', kind: 'trigger', status: 'completed', fields: [], metadata: {} },
     { id: `fixture-${suffix}-triage`, title: 'triage', spec_slug: 'triage', kind: 'task', status: 'ready',
@@ -294,65 +294,26 @@ for (const kind of KINDS) {
 test('Feedback recorded-page button follows the catalog and Back preserves Receiving', async ({ page }) => {
   await backend(page, 'user-feedback');
   const panel = await board(page, 'user-feedback');
-  await panel.getByRole('button', { name: ROUTE_CATALOG['company-map'].path, exact: true }).click();
-  await expect(page).toHaveURL(new RegExp(`${ROUTE_CATALOG['company-map'].path}$`));
+  await panel.getByRole('button', { name: ROUTE_CATALOG.manual.path, exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`${ROUTE_CATALOG.manual.path}$`));
   await page.goBack();
   await expect(panel.locator('article')).toContainText('Synthetic user-feedback one');
   await noWrites(page);
 });
 
-test('Receiving world crossing supports Enter, Space, Escape and its close button', async ({ page }) => {
+test('Company station tree keyboard link and selection-close keep native navigation and Back', async ({ page }) => {
   await backend(page, 'user-feedback');
   await board(page, 'user-feedback');
-  const crossing = page.locator('.crossing[data-crossing="receiving→marshalling"]');
-  const panel = page.locator('.crossing-panel[data-panel="receiving→marshalling"]');
-  await crossing.focus(); await crossing.press('Enter');
-  await expect(panel).toBeVisible();
-  await expect(crossing).toHaveAttribute('aria-expanded', 'true');
-  await crossing.press('Escape'); await expect(panel).toHaveCount(0);
-  await crossing.press('Space'); await expect(panel).toBeVisible();
-  await crossing.press('Space'); await expect(panel).toHaveCount(0);
-  await crossing.press('Enter');
-  await panel.getByRole('button', { name: 'close the crossing', exact: true }).click();
-  await expect(panel).toHaveCount(0);
-  await expect(page).toHaveURL(/\/it\?at=receiving$/);
-  await noWrites(page);
-});
-
-test('Company-map keyboard link and selection-close keep native catalog navigation and Back', async ({ page }) => {
-  await backend(page, 'user-feedback');
-  await board(page, 'user-feedback');
-  const company = page.getByRole('link', { name: 'Company System Map', exact: true });
-  await expect(company).toHaveAttribute('href', ROUTE_CATALOG['company-map'].path);
+  const company = page.getByRole('link', { name: 'Company station tree', exact: true });
+  await expect(company).toHaveAttribute('href', '/it/tree');
   await company.press('Enter');
-  await expect(page).toHaveURL(new RegExp(`${ROUTE_CATALOG['company-map'].path}$`));
+  await expect(page).toHaveURL(/\/it\/tree$/);
   await page.goBack();
   await page.getByRole('link', { name: 'close the receiving selection', exact: true }).click();
   await expect(page).toHaveURL(/\/it$/);
   await expect(page.locator('[data-map-panel]')).toHaveCount(0);
   await page.goBack();
   await expect(page.locator('[data-map-panel]')).toHaveAttribute('data-selection', 'receiving');
-  await noWrites(page);
-});
-
-test('Receiving motion buttons change the stated compression and its checkbox restores motion', async ({ page }) => {
-  await backend(page, 'user-feedback');
-  // This is a mocked flight read, not an activation or a live write.
-  await page.route(/\/api\/flights\/mine(\?|$)/, (r) => r.fulfill({ json: { flights: ['it-map-motion'] } }));
-  await board(page, 'user-feedback');
-  const bar = page.locator('[data-motion-bar]');
-  const canvas = page.locator('canvas.motion-layer');
-  await bar.getByRole('button', { name: '×60', exact: true }).click();
-  await expect(bar.locator('[data-compression]')).toHaveText('×60 — 1 real hour = 1 min on screen');
-  await expect(bar.getByRole('button', { name: '×60', exact: true })).toHaveAttribute('aria-pressed', 'true');
-  await bar.getByRole('button', { name: '×600', exact: true }).click();
-  await expect(bar.locator('[data-compression]')).toHaveText('×600 — 1 real hour = 6 s on screen');
-  await expect(bar.getByRole('button', { name: '×60', exact: true })).toHaveAttribute('aria-pressed', 'false');
-  await bar.getByRole('checkbox', { name: 'reduced motion' }).check();
-  await expect(canvas).toHaveAttribute('data-motion', 'reduced');
-  await expect(bar).toContainText('drawn as static density');
-  await bar.getByRole('checkbox', { name: 'reduced motion' }).uncheck();
-  await expect(canvas).toHaveAttribute('data-motion', 'moving');
   await noWrites(page);
 });
 
@@ -367,32 +328,5 @@ test('Feedback short card retains its complete multi-line report in the condense
   await expect(card.locator('.fb-more')).toHaveText('more…');
   await card.dblclick();
   await expect(page.getByRole('dialog').locator('.pm-message')).toHaveText(full);
-  await noWrites(page);
-});
-
-test('Receiving transit key opens and its complete timing choice persists without a protocol write', async ({ page }) => {
-  await backend(page, 'user-feedback');
-  await page.route(/\/api\/flights\/mine(\?|$)/, (r) => r.fulfill({ json: { flights: ['it-map-transit', 'it-map-live'] } }));
-  await page.route('**/api/yard/moves/stream', (r) => r.fulfill({
-    contentType: 'text/event-stream',
-    body: 'retry: 3600000\nevent: resync\ndata: {"seq":0,"reason":"synthetic baseline"}\n\n',
-  }));
-  await page.route(/\/api\/yard\/moves\?/, (r) => r.fulfill({ json: { moves: [], latest_seq: 0 } }));
-  await board(page, 'user-feedback');
-  const key = page.locator('section.transit details.map-key');
-  await expect(key).toHaveAttribute('open', '');
-  await key.locator('summary').click();
-  await expect(key).not.toHaveAttribute('open', '');
-  await key.locator('summary').press('Enter');
-  await expect(key).toHaveAttribute('open', '');
-  const choice = key.locator('[data-transit-choice]');
-  for (const seconds of [6, 15, 30, 60]) {
-    await choice.getByRole('radio', { name: `${seconds} s`, exact: true }).check();
-    await expect(choice).toHaveAttribute('data-transit-choice', String(seconds * 1000));
-    await expect(key.locator('[data-replay]')).toHaveText(`each dot is one packet that moved at the time on its label; the crossing is shown over ${seconds} s`);
-  }
-  await page.reload();
-  await expect(page.locator('[data-transit-choice]')).toHaveAttribute('data-transit-choice', '60000');
-  await expect(page.locator('[data-transit-choice] input[value="60000"]')).toBeChecked();
   await noWrites(page);
 });

@@ -61,10 +61,6 @@
 
 1	apps/web/src/hr/HrPage.svelte
 
-1	apps/web/src/it/crew/CrewBoardPage.svelte
-
-3	apps/web/src/it/crew/crew.ts
-
 1	apps/web/src/it/marshalling/marshalling.ts
 
 2	apps/web/src/it/monitoring/AtlasPage.svelte
@@ -147,11 +143,7 @@
 
 1	crates/core/boss-dispatcher/src/config.rs
 
-19	crates/core/boss-dispatcher/src/dispatcher.rs
-
 1	crates/core/boss-dispatcher/src/http.rs
-
-1	crates/core/boss-dispatcher/src/lib.rs
 
 1	crates/core/boss-dispatcher/src/liveness.rs
 
@@ -184,8 +176,6 @@
 2	crates/core/boss-jobs/src/http/jobs.rs
 
 3	crates/core/boss-jobs/src/http/sim_clock.rs
-
-1	crates/core/boss-jobs/src/http/stations.rs
 
 1	crates/core/boss-jobs/src/http/steps.rs
 
@@ -409,7 +399,7 @@
 
 1	infra/cluster/export-log-copy.sh
 
-6	infra/cluster/manifests/boss.yaml
+5	infra/cluster/manifests/boss.yaml
 
 1	infra/platform/workflows/learning.toml
 

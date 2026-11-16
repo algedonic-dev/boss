@@ -34,9 +34,10 @@ use boss_policy_client::CurrentUser;
 
 use crate::trust::{can_read, is_trusted};
 
+use super::by_protocol::{ProtocolReading, summarize_by_protocol};
 use super::port::{AgentRunError, AgentRunLog};
 use super::profile::{ProfileRollup, RunProfile, WorkProfile, rollup};
-use super::types::{AgentRunView, NewAgentRun, RunFilter, RunSummary, summarize};
+use super::types::{AgentRun, AgentRunView, NewAgentRun, RunFilter, RunSummary, summarize};
 
 pub struct AgentRunsApiState {
     pub log: Arc<dyn AgentRunLog>,
@@ -119,12 +120,32 @@ pub struct RecordResponse {
 /// filter it was taken over, so a reader can tell what the number
 /// covers. A summary that did not say what it summed is a number
 /// someone has to go re-derive.
+///
+/// `protocols` is the same set read by the protocol each run's packet
+/// runs under and by the step it named (backlog 05bf580b, design
+/// 091e8034 car 1) — direct spend at recorded prices, with the runs no
+/// protocol can claim in explicit buckets. `workflow_kind`, when the
+/// caller named one, scoped BOTH: the summary and the reading cover
+/// only runs on packets of that kind.
 #[derive(Debug, Serialize)]
 pub struct CostResponse {
     pub summary: RunSummary,
     pub job_id: Option<Uuid>,
     pub branch: Option<String>,
     pub since: Option<DateTime<Utc>>,
+    pub workflow_kind: Option<String>,
+    pub protocols: ProtocolReading,
+}
+
+/// The cost read's own scope, beside [`RunQuery`]: the protocol to read.
+/// Its own extractor rather than a `RunQuery` field, because the
+/// listing shares `RunQuery` and cannot honour it — a key one route
+/// ignored would answer that route's whole set, the defect this read
+/// was filed against (an unmatched `workflow_kind` answered every run).
+#[derive(Debug, Default, Deserialize)]
+pub struct ProtocolScope {
+    #[serde(default)]
+    pub workflow_kind: Option<String>,
 }
 
 async fn list_runs(
@@ -198,24 +219,64 @@ async fn cost(
     State(state): State<Arc<AgentRunsApiState>>,
     CurrentUser(user): CurrentUser,
     Query(q): Query<RunQuery>,
+    Query(scope): Query<ProtocolScope>,
 ) -> Response {
     if !can_read(&user) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if scope
+        .workflow_kind
+        .as_deref()
+        .is_some_and(|k| k.trim().is_empty())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "workflow_kind is blank — name a workflow kind, or leave the key out to read every protocol",
+        )
+            .into_response();
     }
     let job_id = q.job_id;
     let branch = q.branch.clone();
     let since = q.since;
     let filter: RunFilter = q.into();
-    match state.log.list_runs(&filter).await {
-        Ok(runs) => Json(CostResponse {
-            summary: summarize(&runs),
-            job_id,
-            branch,
-            since,
-        })
-        .into_response(),
-        Err(e) => err_response(e),
-    }
+    let runs = match state.log.list_runs(&filter).await {
+        Ok(runs) => runs,
+        Err(e) => return err_response(e),
+    };
+    // Every packet the set names, read once. A failed read fails the
+    // answer: an empty map would put every run in `unknown_job`.
+    let job_ids: Vec<Uuid> = runs
+        .iter()
+        .filter_map(|r| r.run.job_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let kinds = match state.log.job_kinds(&job_ids).await {
+        Ok(kinds) => kinds,
+        Err(e) => return err_response(e),
+    };
+    let runs: Vec<AgentRun> = match scope.workflow_kind.as_deref() {
+        Some(kind) => runs
+            .into_iter()
+            .filter(|r| {
+                r.run
+                    .job_id
+                    .and_then(|id| kinds.get(&id))
+                    .map(String::as_str)
+                    == Some(kind)
+            })
+            .collect(),
+        None => runs,
+    };
+    Json(CostResponse {
+        summary: summarize(&runs),
+        job_id,
+        branch,
+        since,
+        workflow_kind: scope.workflow_kind,
+        protocols: summarize_by_protocol(&runs, &kinds),
+    })
+    .into_response()
 }
 
 /// `GET /api/agent-runs/profiles?since=…[&until=…]` — the window's work
@@ -818,7 +879,6 @@ mod tests {
             "opus-5[1m]",
             boss_core::agent::AgentCaps {
                 hourly_budget_usd_micros: Some(0),
-                max_concurrent_runs: None,
             },
         );
         let app = router(AgentRunsApiState { log: Arc::new(log) });
@@ -1060,6 +1120,194 @@ mod tests {
         assert_eq!(
             cost["summary"]["runs"], past_the_page,
             "the roll-up counts every run, not a page of them"
+        );
+    }
+
+    // -- the per-protocol reading (backlog 05bf580b, design 091e8034) --
+
+    const BACKLOG: Uuid = Uuid::from_u128(0x05bf_580b_0000_4000_8000_0000_0000_0011);
+    const DESIGN: Uuid = Uuid::from_u128(0x05bf_580b_0000_4000_8000_0000_0000_0012);
+    const GONE: Uuid = Uuid::from_u128(0x05bf_580b_0000_4000_8000_0000_0000_0013);
+
+    /// A run of the fixture's shape on packet `job` at `step`.
+    fn on(id: &str, job: Option<Uuid>, step: Option<&str>) -> NewAgentRun {
+        NewAgentRun {
+            run_id: id.into(),
+            job_id: job,
+            detail: match step {
+                Some(s) => serde_json::json!({ "step": s }),
+                None => serde_json::json!({}),
+            },
+            ..a_run()
+        }
+    }
+
+    fn two_protocols() -> InMemoryAgentRuns {
+        InMemoryAgentRuns::new(card())
+            .with_job_kind(BACKLOG, "backlog-item")
+            .with_job_kind(DESIGN, "design-doc")
+    }
+
+    async fn read_cost(
+        log: InMemoryAgentRuns,
+        runs: &[NewAgentRun],
+        path: &str,
+    ) -> (StatusCode, String) {
+        for run in runs {
+            log.record_run(run, &ActorId::Automation("platform".into()))
+                .await
+                .expect("records");
+        }
+        let resp = router(AgentRunsApiState { log: Arc::new(log) })
+            .oneshot(
+                Request::get(path)
+                    .header(
+                        "x-boss-user",
+                        header("platform-admin", AccessTier::Operator),
+                    )
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("the router answers");
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn json(body: &str) -> serde_json::Value {
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+    }
+
+    fn protocol<'a>(cost: &'a serde_json::Value, kind: &str) -> &'a serde_json::Value {
+        cost["protocols"]["by_protocol"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["workflow_kind"] == kind))
+            .unwrap_or_else(|| panic!("no bucket for {kind}: {cost}"))
+    }
+
+    fn step_runs(protocol: &serde_json::Value, slug: &str) -> serde_json::Value {
+        protocol["by_step"]
+            .as_array()
+            .and_then(|ss| ss.iter().find(|s| s["key"] == slug))
+            .map(|s| s["runs"].clone())
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// The reading the efficiency signal asked for: spend by the
+    /// protocol each run's packet runs under, and by the step it named,
+    /// with the runs no protocol can claim in buckets of their own.
+    #[tokio::test]
+    async fn the_cost_read_groups_spend_by_protocol_and_step() {
+        let runs = [
+            on("b1", Some(BACKLOG), Some("build")),
+            on("b2", Some(BACKLOG), Some("build")),
+            on("b3", Some(BACKLOG), Some("triage")),
+            on("b4", Some(BACKLOG), None),
+            on("d1", Some(DESIGN), Some("review")),
+            on("loose", None, Some("build")),
+            on("gone", Some(GONE), Some("build")),
+        ];
+        let (status, body) = read_cost(two_protocols(), &runs, "/api/agent-runs/cost").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let cost = json(&body);
+
+        let backlog = protocol(&cost, "backlog-item");
+        assert_eq!(backlog["spend"]["runs"], 4);
+        assert_eq!(step_runs(backlog, "build"), 2);
+        assert_eq!(step_runs(backlog, "triage"), 1);
+        assert_eq!(backlog["no_step"]["runs"], 1);
+        assert!(
+            backlog["spend"]["usd_micros"].is_u64(),
+            "recorded prices sum: {backlog}"
+        );
+        assert_eq!(step_runs(protocol(&cost, "design-doc"), "review"), 1);
+        assert_eq!(cost["protocols"]["no_job"]["runs"], 1);
+        assert_eq!(cost["protocols"]["unknown_job"]["runs"], 1);
+        assert_eq!(cost["summary"]["runs"], 7, "the whole set, as before");
+        assert!(cost["workflow_kind"].is_null(), "unscoped, and says so");
+    }
+
+    /// The defect the design measured: `?workflow_kind=` matched nothing
+    /// and was ignored, so an unmatched kind answered every run. It now
+    /// scopes the summary and the reading alike, says what it scoped,
+    /// and a kind no packet runs under answers zero.
+    #[tokio::test]
+    async fn workflow_kind_scopes_the_read_and_an_unmatched_kind_answers_nothing() {
+        let runs = [
+            on("b1", Some(BACKLOG), Some("build")),
+            on("d1", Some(DESIGN), Some("review")),
+            on("loose", None, Some("build")),
+        ];
+        let (status, body) = read_cost(
+            two_protocols(),
+            &runs,
+            "/api/agent-runs/cost?workflow_kind=backlog-item",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let cost = json(&body);
+        assert_eq!(cost["workflow_kind"], "backlog-item");
+        assert_eq!(cost["summary"]["runs"], 1);
+        assert_eq!(
+            cost["protocols"]["by_protocol"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(protocol(&cost, "backlog-item")["spend"]["runs"], 1);
+        assert_eq!(cost["protocols"]["no_job"]["runs"], 0);
+
+        let (status, body) = read_cost(
+            two_protocols(),
+            &runs,
+            "/api/agent-runs/cost?workflow_kind=no-such-protocol",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            json(&body)["summary"]["runs"],
+            0,
+            "an unmatched kind is not ignored"
+        );
+
+        let (status, _) = read_cost(
+            two_protocols(),
+            &runs,
+            "/api/agent-runs/cost?workflow_kind=%20",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a blank kind names nothing"
+        );
+    }
+
+    /// A failed jobs read is a failed answer, not an empty map that
+    /// would read as every run unattributed.
+    #[tokio::test]
+    async fn a_failed_jobs_read_fails_the_cost_read() {
+        let runs = [on("b1", Some(BACKLOG), Some("build"))];
+        let log = two_protocols().with_unreadable_jobs();
+        let (status, body) = read_cost(log, &runs, "/api/agent-runs/cost").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    }
+
+    /// The reading covers the whole window, not a listing page of it.
+    #[tokio::test]
+    async fn the_protocol_reading_counts_runs_beyond_a_listing_page() {
+        let past_the_page = LISTING_PAGE + 1;
+        let runs: Vec<NewAgentRun> = (0..past_the_page)
+            .map(|i| NewAgentRun {
+                finished_at: a_run().finished_at + Duration::seconds(i),
+                ..on(&format!("run-{i:03}"), Some(BACKLOG), Some("build"))
+            })
+            .collect();
+        let (status, body) = read_cost(two_protocols(), &runs, "/api/agent-runs/cost").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let cost = json(&body);
+        assert_eq!(
+            protocol(&cost, "backlog-item")["spend"]["runs"],
+            past_the_page
         );
     }
 }

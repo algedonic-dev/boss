@@ -81,7 +81,7 @@ A change shipped to our own instance behind a flight: turned on for an audience 
 The packet IS the flight - its job metadata carries the declaration under `flight` (code, hypothesis, signal, audience, owner, observe_days), and its state is what its completed steps declare: turn-on is on for the audience, widen is on for everyone, pull is off for good. GET /api/flights/mine answers, for the viewer, the codes that are on; a code it does not list is off.
 
 An agent may file, ship, turn on, record the reading, extend once and pull at any time. Widening to everyone and deciding are a person's (human_only) while one person runs the company: David, 2026-09-24."""
-metadata = { department = "it", owner_role = "platform-admin" }
+metadata = { owner = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5", department = "it", owner_role = "platform-admin" }
 metadata_schema = { type = "object", required = ["flight"], properties = { flight = { type = "object", required = ["code", "hypothesis", "signal", "audience", "owner", "observe_days"], properties = { code = { type = "string", description = "Kebab-case; the token source names in flightOn('<code>'). Unique among open flights." }, hypothesis = { type = "string" }, signal = { type = "string", description = "The reading that decides, stated before it is taken." }, audience = { type = "object", description = "{actors: [ids], roles: [codes]} - who sees the flight once it is turned on." }, owner = { type = "string" }, observe_days = { type = "number", description = "The declared observe period, in days." } } } } }
 
 [[workflow.step]]
@@ -132,7 +132,7 @@ kind = "task"
 ready_when = "steps.observe.done"
 title_template = "Widen {subject.id} to everyone"
 authority_role = "platform-admin"
-metadata_defaults = { flight_state = "on-for-all", human_only = true, procedure = "Optional. Completing this step turns the flight on for EVERYONE on this instance. It is a person's sign-off while one person runs the company (David, 2026-09-24); leave it when the audience already is everyone who matters." }
+metadata_defaults = { human_presentation = { ask = "Decide whether this trial should reach everyone", why_person = "Expanding a trial to everyone requires a person's authorization.", action = "Review the trial and authorize expansion", after = "Completing this optional action turns the trial on for everyone on this instance.", evidence = "current-step" }, flight_state = "on-for-all", human_only = true, procedure = "Optional. Completing this step turns the flight on for EVERYONE on this instance. It is a person's sign-off while one person runs the company (David, 2026-09-24); leave it when the audience already is everyone who matters." }
 fields = [
   { name = "why", field_type = "string", required = true },
 ]
@@ -179,7 +179,7 @@ kind = "task"
 ready_when = "steps.observe.done OR steps.widen.done OR steps.reobserve.done"
 title_template = "Decide {subject.id}: promote or pull"
 authority_role = "platform-admin"
-metadata_defaults = { human_only = true, procedure = "Read the hypothesis, the signal and the reading (and the extension's, if there was one), then decide. `promote` keeps the new path: the cleanup car deletes the flag and the old path. `pull` keeps the old path: the cleanup car deletes the flag and the new one. `decision` says why, against the signal stated at filing." }
+metadata_defaults = { human_presentation = { ask = "Decide whether to keep or withdraw this trial", why_person = "A person must judge the recorded results against the original hypothesis.", action = "Review results and record your decision", after = "An agent removes the unused code path in a separately proved change.", evidence = "current-step" }, human_only = true, procedure = "Read the hypothesis, the signal and the reading (and the extension's, if there was one), then decide. `promote` keeps the new path: the cleanup car deletes the flag and the old path. `pull` keeps the old path: the cleanup car deletes the flag and the new one. `decision` says why, against the signal stated at filing." }
 fields = [
   { name = "verdict", field_type = "promote|pull", required = true },
   { name = "decision", field_type = "string", required = true },

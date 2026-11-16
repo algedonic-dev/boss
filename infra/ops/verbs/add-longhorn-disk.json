@@ -1,0 +1,33 @@
+{
+  "about": "MUTATING — add ONE node's declared Talos user volume to Longhorn as a disk (infra/forge/longhorn-disk.sh <node> <volume> <plan_sha256>) through the forge's ops_kubectl door (the admin kubeconfig David placed, infra/estate/ops-credentials.sh). Filed as backlog 493a02b6 on 2026-10-19, when David was about to fit a third 1 TB disk to w-2 (one more disk for a one-disk machine) and every door stopped one step short of capacity: node-converge applies a UserVolumeConfig, which Talos mounts at /var/mnt/<name>, and nothing then declared that mount as a Longhorn disk. AUTHORISED PER RUN BY DAVID'S PASSKEY in design 17835005's shape, as set-volume-replicas and node-converge are: it declares requires_approval with the read-only plan-a-longhorn-disk (this script's --plan) as its plan_verb, so the runner renders the plan onto the request's approve step, runs this only after a passkey on the approvers list signs those bytes, and hands the script sha256 of the SIGNED plan; the script re-renders and patches nothing unless today's plan hashes to it. The node's disks before are in the bytes, so a second run of an applied plan is refused: at most once. THE BOUND IS THE SCRIPT'S, NEVER A PARAM: a registry node whose role is talos-worker, with the cluster agreeing on its address and carrying no control-plane label (refused before any door opens, as every mutating node verb but node-converge is); a user volume the node's declaration in the tree names, which passes check-declared.sh --only-read-classes (canonical, and a diskSelector carrying exactly one !system_disk); Talos's volumestatus u-<volume> ready at /var/mnt/<volume> on a disk that is not the one EPHEMERAL lives on; no PersistentVolume and no pod on the node using that path (w-1's gate volume is refused by its local PV gate-w-1 and the trim pod's hostPath); and no Longhorn disk on the node with that name or a path equal to, under or over the mount — or nothing is done (exit 78). The packet never names a path: the mount is derived from the volume's name, as Talos derives it. THE WRITE is one kubectl patch --type=json that TESTS spec.disks is still exactly the map the plan read and ADDS spec.disks/u-<volume> = {path /var/mnt/<volume>, allowScheduling true, evictionRequested false, storageReserved 0, tags [], diskType filesystem} — a compare-and-set; nothing is moved or deleted. The disk is UNTAGGED, so Longhorn may place a replica of any volume on it, production included, by its own rules; no node's allowScheduling changes, and the plan says so for the passkey to read. THE EFFECT IS READ BACK: every 10 s for up to 300 s, the Longhorn node; only when spec.disks/u-<volume> reads the planned path, every other disk's spec reads as the plan did, and Longhorn's own status for the new disk reads Ready=True and Schedulable=True with a diskUUID no other disk on the node carries and a storageMaximum above zero is the effect line printed, and otherwise the run exits 1 saying the disk is NOT proven with Longhorn's own reason (a mountpoint left on EPHEMERAL by a volume that failed to mount reads not Ready, and Longhorn schedules nothing there). Timeout 720: the plan's reads again (up to ~300 s with a first image pull), the patch (20 s), and the script's own 300 s read-back, which gives its verdict before the runner's kill.",
+  "hosts": [
+    "forge"
+  ],
+  "requires_approval": true,
+  "plan_verb": "plan-a-longhorn-disk",
+  "approvers": [
+    "emp-david"
+  ],
+  "argv": [
+    "infra/forge/longhorn-disk.sh",
+    "{1}",
+    "{2}",
+    "{3}"
+  ],
+  "params": [
+    {
+      "name": "node",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    {
+      "name": "volume",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"
+    },
+    {
+      "name": "plan_sha256",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  ],
+  "timeout": 720,
+  "effect": "^add-longhorn-disk: [a-z0-9-]+ has Longhorn disk u-[a-z0-9-]+ at /var/mnt/[a-z0-9-]+ — read back: Ready=True, Schedulable=True, diskUUID [0-9a-f-]+, storageMaximum [0-9]+ bytes, and its [0-9]+ other disk\\(s\\) unchanged \\(after [0-9]+s\\)$"
+}

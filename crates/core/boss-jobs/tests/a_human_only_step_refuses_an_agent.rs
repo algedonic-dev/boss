@@ -159,10 +159,27 @@ fn decide_spec() -> WorkflowSpec {
 }
 
 fn app() -> (Router, Arc<InMemoryJobs>) {
+    app_with_design_review_declaration(None)
+}
+
+fn app_with_design_review_declaration(human_only: Option<bool>) -> (Router, Arc<InMemoryJobs>) {
     let kinds = Arc::new(InMemoryWorkflows::for_fixture());
     kinds.seed(rotation_spec()).unwrap();
     kinds.seed(review_spec()).unwrap();
     kinds.seed(decide_spec()).unwrap();
+    let mut design = boss_jobs::registry::seedable_platform_workflows()
+        .into_iter()
+        .find(|row| row.kind == "design-doc")
+        .unwrap();
+    if let Some(human_only) = human_only {
+        design
+            .steps
+            .iter_mut()
+            .find(|step| step.title == "review")
+            .unwrap()
+            .metadata_defaults["human_only"] = serde_json::json!(human_only);
+    }
+    kinds.seed(design).unwrap();
     let jobs = Arc::new(InMemoryJobs::new());
     let mut policy = FakePolicyClient::builder();
     for role in ["system", "platform-admin"] {
@@ -907,6 +924,119 @@ async fn an_agent_still_writes_context_for_the_person() {
     )
     .await;
     assert!(status.is_success(), "{status} {text}");
+}
+
+/// The real design plugin sends a metadata merge followed by a bare
+/// status PUT. Its ordinary person review does not request a passkey.
+#[tokio::test]
+async fn cef51d_person_completes_bundled_design_review_with_the_plugin_call() {
+    let plugin = std::fs::read_to_string(
+        boss_testing::repo_root().join("infra/step-plugins/review-design.js"),
+    )
+    .unwrap();
+    let status_call = plugin
+        .split("async function putStatus(status) {")
+        .nth(1)
+        .unwrap()
+        .split("async function save(autoComplete)")
+        .next()
+        .unwrap();
+    assert!(status_call.contains("method: 'PUT'"));
+    assert!(status_call.contains("`/api/jobs/${jobId}/steps/${step.id}`"));
+    assert!(status_call.contains("body: JSON.stringify({ status })"));
+    assert!(!status_call.contains("x-presence-ticket"));
+    assert!(plugin.contains("await putStatus('completed');"));
+    let (app, jobs) = app();
+    let job = file(
+        &app,
+        &jobs,
+        "design-doc",
+        serde_json::json!({
+            "title":"Fixture design", "markdown":"The proposal",
+            "questions":[{"anchor":"Q1","title":"Choose","proposal":"Keep"}]
+        }),
+    )
+    .await;
+    let review = step_by_slug(&jobs, &job, "review").await;
+    let person = user(DAVID, "platform-admin");
+    let (status, _, text) = patch_metadata(
+        &app,
+        &review,
+        &person,
+        serde_json::json!({"resolutions":[{"anchor":"Q1","decision":"Keep"}]}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "plugin metadata merge: {text}"
+    );
+    let (status, _, text) = put_step(
+        &app,
+        &review,
+        &person,
+        serde_json::json!({"status":"completed"}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "plugin bare status PUT: {text}"
+    );
+    assert_eq!(
+        jobs.get_step(&review.id).await.unwrap().unwrap().status,
+        boss_core::job::StepStatus::Completed
+    );
+}
+
+/// The real design schema with an explicit human-only declaration:
+/// keep its guard control even though A140921 removes that declaration
+/// from the bundled row until its surface can supply presence.
+#[tokio::test]
+async fn cef51d_declared_human_design_mirror_keeps_the_persons_resolutions_reserved() {
+    let (app, jobs) = app_with_design_review_declaration(Some(true));
+    let questions = serde_json::json!([{"anchor":"Q1","title":"Choose","proposal":"Keep"}]);
+    let job = file(
+        &app,
+        &jobs,
+        "design-doc",
+        serde_json::json!({
+            "title":"Fixture design", "markdown":"The proposal", "questions":questions
+        }),
+    )
+    .await;
+    let review = step_by_slug(&jobs, &job, "review").await;
+    assert!(boss_jobs::human_only::declared(&review.metadata));
+    let mirror = serde_json::json!({
+        "title":"Fixture design", "markdown":"The proposal", "questions":questions,
+        "doc_path":"docs/design/fixture.md", "resolutions":[]
+    });
+    let agent = user("agent-codex", "platform-admin");
+    let (status, _, text) = patch_metadata(&app, &review, &agent, mirror.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "actual design mirror: {text}"
+    );
+    let (status, _, text) = patch_metadata(
+        &app,
+        &review,
+        &user(DAVID, "platform-admin"),
+        serde_json::json!({"resolutions":[{"anchor":"Q1","decision":"Keep"}]}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "person's resolution: {text}"
+    );
+    let before = jobs.get_step(&review.id).await.unwrap().unwrap();
+    let (status, body, text) = patch_metadata(&app, &review, &agent, mirror).await;
+    assert_write_refused(status, &body, &text, &review, "agent-codex", "resolutions");
+    assert_eq!(
+        jobs.get_step(&review.id).await.unwrap().unwrap().metadata,
+        before.metadata
+    );
 }
 
 /// The person writes their own record, and once it is written an agent

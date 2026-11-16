@@ -30,6 +30,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
+use boss_jobs::agents::{AgentsRegistry, AutomationActor, InMemoryAgents};
 use boss_jobs::http::{JobsApiState, router};
 use boss_jobs::station_queue::StationPredicate;
 use boss_jobs::{
@@ -69,7 +70,7 @@ fn viable_draft(name: &str) -> StationSpec {
     StationSpec::draft(
         name,
         "Authored at run time",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("car-kind".into()),
             ..Default::default()
@@ -96,7 +97,21 @@ fn unviable_draft(name: &str) -> StationSpec {
 }
 
 fn app() -> (axum::Router, Arc<InMemoryStations>) {
-    let stations = Arc::new(InMemoryStations::new());
+    let (app, stations, _, _) = app_with_registries();
+    (app, stations)
+}
+
+/// The app, with the automations registry the publish door reads an
+/// equipment station's automaton against (backlog d0cf2cdc) handed back,
+/// so a test can declare the rows it holds. Empty until a test does.
+fn app_with_registries() -> (
+    axum::Router,
+    Arc<InMemoryStations>,
+    Arc<InMemoryJobs>,
+    Arc<InMemoryAgents>,
+) {
+    let agents = Arc::new(InMemoryAgents::new());
+    let stations = Arc::new(InMemoryStations::new().with_automations(agents.clone()));
     let jobs = Arc::new(InMemoryJobs::new());
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
@@ -116,14 +131,14 @@ fn app() -> (axum::Router, Arc<InMemoryStations>) {
         stations: Some(stations.clone() as Arc<dyn StationRegistry>),
         kind_registry: None::<Arc<dyn WorkflowRegistry>>,
         ..JobsApiState::minimal(
-            jobs,
+            jobs.clone(),
             bus,
             DomainPublisher::new(bus_dyn, "jobs"),
             policy,
             Arc::new(boss_clock_client::WallClockClient),
         )
     };
-    (router(state), stations)
+    (router(state), stations, jobs, agents)
 }
 
 async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -161,6 +176,30 @@ fn get(path: &str, role: &str) -> Request<Body> {
 }
 
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_retired_department_floor_routes_are_absent() {
+    let (app, _) = app();
+    let (status, _) = send(&app, get("/api/stations", "ceo")).await;
+    assert_eq!(status, StatusCode::OK, "the station registry still serves");
+    for path in ["/api/floor", "/api/floor/finance"] {
+        let (status, _) = send(&app, get(path, "ceo")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "retired route: {path}");
+    }
+}
+
+#[test]
+fn a_historical_station_department_label_is_not_written_back() {
+    let mut input = serde_json::to_value(viable_draft("old-department")).unwrap();
+    input["department"] = serde_json::json!("it");
+    let spec: StationSpec = serde_json::from_value(input).unwrap();
+    assert!(
+        serde_json::to_value(spec)
+            .unwrap()
+            .get("department")
+            .is_none()
+    );
+}
 
 #[tokio::test]
 async fn a_station_authored_at_run_time_serves_its_queue_without_a_deploy() {
@@ -263,6 +302,187 @@ async fn the_dry_run_and_the_publish_refusal_report_the_same_problems() {
         dry, refused,
         "the dry run and the refusal must be the same body"
     );
+}
+
+/// Codex R1 P2 on car 3eb6ecca (backlog 1bb8c479): the live authoring
+/// door. A draft naming one edge twice may be SAVED — drafts are work in
+/// progress — but the dry run reports it and publish refuses it 422,
+/// naming the repeated target, so the floor never serves it.
+#[tokio::test]
+async fn publish_refuses_a_draft_naming_one_edge_twice_and_the_dry_run_agrees() {
+    let (app, stations) = app();
+    // The target is live, so the repeat is the only problem: an edge to
+    // no active station is a refusal of its own (backlog 5b80b9f4).
+    let mut dock = viable_draft("loading-dock");
+    dock.status = boss_jobs::registry::WorkflowStatus::Active;
+    stations.seed(dock).unwrap();
+    let mut twice = viable_draft("desk");
+    twice.edges = vec!["loading-dock".into(), "loading-dock".into()];
+
+    let (status, dry) = send(&app, post("/api/stations/_validate", "ceo", Some(&twice))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dry["ok"], false, "{dry}");
+
+    let (status, _) = send(&app, post("/api/stations", "ceo", Some(&twice))).await;
+    assert_eq!(status, StatusCode::CREATED, "a draft may be saved unviable");
+    let (status, refused) = send(&app, post("/api/stations/desk/publish", "ceo", None)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    let problems = refused["problems"].as_array().unwrap();
+    assert_eq!(problems.len(), 1, "{refused}");
+    assert_eq!(problems[0]["field"], "edges");
+    assert!(
+        problems[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`loading-dock`"),
+        "the refusal names the repeated target: {}",
+        problems[0]["message"]
+    );
+    assert_eq!(dry, refused, "the dry run and the refusal are one body");
+}
+
+/// Backlog 5b80b9f4: the live door asks the seed's question. An edge
+/// must name a station some ACTIVE row declares; the seed refused any
+/// other before it published a row, while this door ran only the
+/// row-alone lint, so a hand-authored row could route packets to a
+/// station that does not exist. Publish now refuses it 422, naming the
+/// station and the edge, and writes nothing; the dry run says the same;
+/// and once the target is live the same draft publishes as before.
+#[tokio::test]
+async fn publish_refuses_an_edge_to_no_active_station_naming_both_and_writes_nothing() {
+    let (app, stations) = app();
+    let mut lost = viable_draft("desk");
+    lost.edges = vec!["nowhere".into()];
+
+    let (status, dry) = send(&app, post("/api/stations/_validate", "ceo", Some(&lost))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dry["ok"], false, "the dry run names it too: {dry}");
+
+    let (status, _) = send(&app, post("/api/stations", "ceo", Some(&lost))).await;
+    assert_eq!(status, StatusCode::CREATED, "a draft may name any edge");
+    let (status, refused) = send(&app, post("/api/stations/desk/publish", "ceo", None)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    let problems = refused["problems"].as_array().unwrap();
+    assert_eq!(problems.len(), 1, "{refused}");
+    assert_eq!(problems[0]["field"], "edges");
+    let message = problems[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("[desk]") && message.contains("`nowhere`"),
+        "the refusal names the station and the edge: {message}"
+    );
+    assert_eq!(dry, refused, "the dry run and the refusal are one body");
+
+    // Nothing written: the draft is still a draft and nothing serves.
+    let versions = stations.list_versions("desk").await.unwrap();
+    assert_eq!(
+        versions.iter().map(|r| r.status).collect::<Vec<_>>(),
+        vec![boss_jobs::registry::WorkflowStatus::Draft]
+    );
+    let (_, listed) = send(&app, get("/api/stations", "ceo")).await;
+    assert_eq!(listed["total"], 0, "{listed}");
+
+    // A valid edge publishes as before.
+    let mut target = viable_draft("nowhere");
+    target.status = boss_jobs::registry::WorkflowStatus::Active;
+    stations.seed(target).unwrap();
+    let (status, published) = send(&app, post("/api/stations/desk/publish", "ceo", None)).await;
+    assert_eq!(status, StatusCode::OK, "{published}");
+    assert_eq!(published["edges"], serde_json::json!(["nowhere"]));
+}
+
+/// An equipment station named for `automaton`, with one bay.
+fn equipment_draft(name: &str, automaton: &str) -> StationSpec {
+    StationSpec {
+        automaton: Some(automaton.into()),
+        bays: Some(1),
+        ..StationSpec::draft(
+            name,
+            "Operated by an automaton",
+            StationKind::Equipment,
+            StationPredicate {
+                kind: Some("car-kind".into()),
+                ..Default::default()
+            },
+            now(),
+        )
+    }
+}
+
+/// Backlog d0cf2cdc: the automaton an equipment station names decides
+/// which actor may operate its bays, so the door asks the question the
+/// bundle test asked of the tree alone — is it a REGISTERED automation,
+/// a row of the automations registry? The lint checked only that it
+/// parsed, so a row published here could name `automation:anything`.
+/// Publish now refuses it 422, naming the field and the automaton, and
+/// writes nothing; the dry run says the same; and a registered one
+/// publishes as before.
+#[tokio::test]
+async fn publish_refuses_an_equipment_automaton_that_is_not_a_registered_automation() {
+    let (app, stations, _, agents) = app_with_registries();
+    let actor = boss_core::actor::ActorId::Automation("platform-workflow-seed".into());
+    agents
+        .declare_automations(
+            &[AutomationActor {
+                id: "automation:gate-runner".into(),
+                role: "platform-admin".into(),
+                description: "Runs the gates".into(),
+                signs_for: None,
+                access_tier: None,
+                station: None,
+            }],
+            &boss_core::publisher::EventStamp::new("jobs", actor),
+        )
+        .await
+        .expect("declare the one registered automation");
+
+    // Spelled as an automation id, so the row-alone lint passes it: only
+    // the registry can say nothing answers to it.
+    let stray = equipment_draft("kettle", "automation:anything");
+    let (status, dry) = send(&app, post("/api/stations/_validate", "ceo", Some(&stray))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dry["ok"], false, "the dry run names it too: {dry}");
+
+    let (status, _) = send(&app, post("/api/stations", "ceo", Some(&stray))).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a draft may name any automaton"
+    );
+    let (status, refused) = send(&app, post("/api/stations/kettle/publish", "ceo", None)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    let problems = refused["problems"].as_array().unwrap();
+    assert_eq!(problems.len(), 1, "{refused}");
+    assert_eq!(problems[0]["field"], "automaton");
+    let message = problems[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("[kettle]") && message.contains("`automation:anything`"),
+        "the refusal names the station and the automaton: {message}"
+    );
+    assert_eq!(dry, refused, "the dry run and the refusal are one body");
+
+    // Nothing written: the draft is still a draft and nothing serves.
+    let versions = stations.list_versions("kettle").await.unwrap();
+    assert_eq!(
+        versions.iter().map(|r| r.status).collect::<Vec<_>>(),
+        vec![boss_jobs::registry::WorkflowStatus::Draft]
+    );
+    let (_, listed) = send(&app, get("/api/stations", "ceo")).await;
+    assert_eq!(listed["total"], 0, "{listed}");
+
+    // A registered automaton dry-runs clean and publishes.
+    let registered = equipment_draft("kettle", "automation:gate-runner");
+    let (status, dry) = send(
+        &app,
+        post("/api/stations/_validate", "ceo", Some(&registered)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dry["ok"], true, "{dry}");
+    let (status, _) = send(&app, post("/api/stations", "ceo", Some(&registered))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, published) = send(&app, post("/api/stations/kettle/publish", "ceo", None)).await;
+    assert_eq!(status, StatusCode::OK, "{published}");
+    assert_eq!(published["automaton"], "automation:gate-runner");
 }
 
 #[tokio::test]

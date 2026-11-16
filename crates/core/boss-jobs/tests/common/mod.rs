@@ -41,7 +41,7 @@ pub fn viable(name: &str) -> StationSpec {
     StationSpec::draft(
         name,
         "A real queue",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("ship-a-change".into()),
             status: Some(JobStatus::Open),

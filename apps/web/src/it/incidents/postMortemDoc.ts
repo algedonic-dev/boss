@@ -2,10 +2,12 @@
 // incident becomes once it closes. Written for incident-post-mortem,
 // folded into `incident` with it on 2026-09-24 (backlog 59d15039).
 //
-// A post-mortem's findings live in free-form Job metadata, and the
-// shape has already drifted between the live packets (incident_at /
-// summary / mitigations_shipped / open_questions / evidence on the
-// newest; ask / declared_by / incident_date / outcome on the oldest).
+// A post-mortem's findings live in free-form metadata — the Job's on
+// the older packets, each step's since incident v3 (`stepFindings`
+// below) — and the shape has already drifted between the live packets
+// (incident_at / summary / mitigations_shipped / open_questions /
+// evidence on the newest job-metadata packet; ask / declared_by /
+// incident_date / outcome on the oldest).
 // Hardcoding the newest shape would silently drop the older packets'
 // content, and dumping raw JSON is the unusable rendering the two
 // feedback packets complained about. So the contract is
@@ -22,7 +24,10 @@
 // A near-copy of `sectionsFor` lives in
 // infra/step-plugins/incident-review.js: plugins are standalone JS
 // bundles by design (no imports from the SPA), so the ordering is
-// deliberately duplicated there. Change one, change both.
+// deliberately duplicated there. postMortemDoc.pin.test.ts reads the
+// plugin's source and fails, naming the entry, when its KNOWN_LABELS,
+// READING_ORDER or PLUMBING drifts from the tables here (backlog
+// 3b9544e1) — which is why those three are exported.
 
 import type { Job, Step } from '../../jobs/types';
 
@@ -31,7 +36,7 @@ export type DocSection = Readonly<{ key: string; label: string; body: string }>;
 /// Curated labels for the keys the platform knows. Both spellings of
 /// "when" map to the same label — the packets drifted before the
 /// surface existed.
-const KNOWN_LABELS: Readonly<Record<string, string>> = {
+export const KNOWN_LABELS: Readonly<Record<string, string>> = {
   incident_at: 'When it happened',
   incident_date: 'When it happened',
   summary: 'Summary',
@@ -45,7 +50,7 @@ const KNOWN_LABELS: Readonly<Record<string, string>> = {
 /// `mitigations*` key family occupies — the family is matched by
 /// prefix so `mitigations_shipped`, `mitigation_next`, etc. are all
 /// first-class without a registry of every spelling.
-const READING_ORDER: ReadonlyArray<string> = [
+export const READING_ORDER: ReadonlyArray<string> = [
   'incident_at',
   'incident_date',
   'summary',
@@ -114,6 +119,66 @@ export function postMortemSections(
         ? []
         : [{ key, label: KNOWN_LABELS[key] ?? humanizeKey(key), body }];
     });
+}
+
+// ---------------------------------------------------------------------
+// What each step found (backlog 434b6e0d, gap 1 of page-audit
+// 9b9849f5). In incident v3 every forcing-question answer is STEP
+// metadata, so an archive reading the job's alone rendered the first
+// closed v3 packet (a65ba21e: 7 job keys, 23 step finding keys) with
+// none of its findings. The review surface already reads them this way
+// — infra/step-plugins/incident-review.js `findings()` — and the
+// archive is the same document kept for posterity.
+// ---------------------------------------------------------------------
+
+/// Keys a step carries that are not findings: authority gating, trigger
+/// bookkeeping, agent hand-off records, and the protocol's own
+/// declarations on the review and terminal steps. The same set as
+/// `PLUMBING` in infra/step-plugins/incident-review.js, held equal to it
+/// by postMortemDoc.pin.test.ts (backlog 3b9544e1).
+export const PLUMBING: ReadonlyArray<string> = [
+  'authority_role',
+  'trigger_kind',
+  'trigger_name',
+  'agent_requested_at',
+  'agent_requested_by',
+  'human_only',
+  'outcome_kind',
+];
+
+export type StepFindings = Readonly<{ step: Step; sections: ReadonlyArray<DocSection> }>;
+
+/// The terminal steps in workflow order, each with its findings as
+/// sections labelled by field. A step that recorded only plumbing found
+/// nothing and is left out, as the review surface leaves it out.
+export function stepFindings(steps: ReadonlyArray<Step> | undefined): ReadonlyArray<StepFindings> {
+  return [...(steps ?? [])]
+    .filter((s) => s.status === 'completed' || s.status === 'skipped')
+    .sort((a, b) => a.sort_order - b.sort_order)
+    .map((step) => ({ step, sections: postMortemSections(step.metadata ?? {}, PLUMBING) }))
+    .filter((f) => f.sections.length > 0);
+}
+
+export type BodyPart = Readonly<{ text: string; ref: string | null }>;
+
+/// A packet id as the record writes one: a full uuid, or the eight
+/// leading characters every surface prints, which the jobs API resolves
+/// (cd7b0054). The word boundaries keep a 40-character commit sha from
+/// reading as a short id. ONE capture group, so `split` keeps each ref
+/// at an odd index between the prose around it.
+const PACKET_REF = /\b([0-9a-f]{8}(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?)\b/i;
+
+/// Split a section body into prose and packet refs, so a ref renders as
+/// a link into its packet. Only a field whose name says it holds packets
+/// (`action_packets`, `follow_up_packets`) is read for refs: an 8-hex
+/// word elsewhere may be a commit, and a commit linked as a packet is a
+/// click that dead-ends. The parts spell the body back exactly.
+export function bodyParts(key: string, body: string): ReadonlyArray<BodyPart> {
+  if (!key.includes('packet')) return [{ text: body, ref: null }];
+  return body
+    .split(PACKET_REF)
+    .map((text, i) => ({ text, ref: i % 2 === 1 ? text : null }))
+    .filter((p) => p.text !== '');
 }
 
 /// When the incident happened, whichever spelling the packet carries.

@@ -15,7 +15,7 @@ use super::types::{
 };
 
 const SENSOR_COLUMNS: &str = "id, source, credential, every_minutes, opens_kind, subject_kind, selector, \
-                              enabled, tenant_id, published_at, last_polled_at, cursor_at";
+                              enabled, tenant_id, published_at, last_polled_at, cursor_at, refused";
 
 pub struct PgSensors {
     pool: PgPool,
@@ -45,6 +45,12 @@ fn sensor_of(row: &sqlx::postgres::PgRow) -> Result<SensorRow, SensorsError> {
         published_at: row.try_get("published_at").map_err(storage)?,
         last_polled_at: row.try_get("last_polled_at").map_err(storage)?,
         cursor_at: row.try_get("cursor_at").map_err(storage)?,
+        refused: row
+            .try_get::<Option<serde_json::Value>, _>("refused")
+            .map_err(storage)?
+            .map(super::types::PollRefusals::from_stored_json)
+            .transpose()
+            .map_err(|e| SensorsError::Storage(format!("invalid poll refusal witness: {e}")))?,
     })
 }
 
@@ -238,22 +244,34 @@ impl Sensors for PgSensors {
     }
 
     async fn mark_polled(&self, sensor_id: &str, stamp: &PollStamp) -> Result<(), SensorsError> {
-        let n = sqlx::query(
-            "UPDATE sensors SET last_polled_at = $2, \
-             cursor_at = GREATEST(cursor_at, $3) \
-             WHERE id = $1",
-        )
-        .bind(sensor_id)
-        .bind(stamp.polled_at)
-        .bind(stamp.cursor_at)
-        .execute(&self.pool)
-        .await
-        .map_err(storage)?
-        .rows_affected();
-        if n == 0 {
-            return Err(SensorsError::UnknownSensor(sensor_id.to_string()));
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = async {
+            let row = sqlx::query(&format!("SELECT {SENSOR_COLUMNS} FROM sensors WHERE id=$1 FOR UPDATE"))
+                .bind(sensor_id).fetch_optional(&mut *tx).await.map_err(storage)?
+                .ok_or_else(|| SensorsError::UnknownSensor(sensor_id.to_string()))?;
+            let held = sensor_of(&row)?;
+            let refused = super::types::merge_poll_refusals(held.refused.as_ref(), stamp.refused.as_ref(), held.cursor_at, stamp.cursor_at)
+                .map_err(SensorsError::BadRequest)?;
+            let json = refused.as_ref().map(super::types::PollRefusals::to_stored_json).transpose()
+                .map_err(|e| SensorsError::Storage(format!("encoding poll refusal witness: {e}")))?;
+            sqlx::query("UPDATE sensors SET last_polled_at=$2,cursor_at=GREATEST(cursor_at,$3),refused=$4 WHERE id=$1")
+                .bind(sensor_id).bind(stamp.polled_at).bind(stamp.cursor_at).bind(json)
+                .execute(&mut *tx).await.map_err(storage)?;
+            Ok::<_, SensorsError>(())
+        }.await;
+        match result {
+            Ok(()) => tx.commit().await.map_err(|e| {
+                SensorsError::Storage(format!(
+                    "poll mark COMMIT acknowledgement unavailable; effect uncertain: {e}"
+                ))
+            }),
+            Err(original) => match tx.rollback().await {
+                Ok(()) => Err(original),
+                Err(rollback) => Err(SensorsError::Storage(format!(
+                    "{original}; rollback acknowledgement unavailable: {rollback}"
+                ))),
+            },
         }
-        Ok(())
     }
 
     async fn sweep(&self, before: DateTime<Utc>) -> Result<u64, SensorsError> {

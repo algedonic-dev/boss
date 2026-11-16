@@ -65,24 +65,22 @@ async fn serve(session_key: &[u8], req: Request, base: &Path) -> Response {
         return StatusCode::BAD_REQUEST.into_response();
     };
 
-    // Only serve .js files. MIME sniffers treat untyped downloads as
-    // text/plain; being explicit avoids browsers refusing a module.
-    let is_js = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("js"))
-        .unwrap_or(false);
-    if !is_js {
+    // Bundles and their public JSON contracts share the same path and
+    // session boundary. Other extensions remain unavailable.
+    let extension = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let content_type = if extension.eq_ignore_ascii_case("js") {
+        "application/javascript; charset=utf-8"
+    } else if extension.eq_ignore_ascii_case("json") {
+        "application/json"
+    } else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
 
     match read_inside(base, &file_path).await {
         Ok(bytes) => {
             let mut resp = (StatusCode::OK, bytes).into_response();
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/javascript; charset=utf-8"),
-            );
+            resp.headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
             // Short cache — plugin bundles are versioned by content
             // hash at publish time; cache-bust on edit via the
             // filename, not this header.
@@ -221,5 +219,31 @@ mod traversal_tests {
         }
         let (status, _, _) = get(&dir, "/plugins/gone.js", true).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_json_sidecar_is_served_whole_with_the_same_session_boundary() {
+        let (root, dir) = fixture("json-sidecar");
+        let bytes = br#"{"schema":1,"sha256":"original"}"#;
+        std::fs::write(dir.join("contract.json"), bytes).unwrap();
+        let (status, headers, body) = get(&dir, "/plugins/contract.json", true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+        assert_eq!(body.as_bytes(), bytes);
+        let (status, _, _) = get(&dir, "/plugins/contract.json", false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        std::fs::write(root.join("private.json"), b"private original").unwrap();
+        std::os::unix::fs::symlink(root.join("private.json"), dir.join("link.json")).unwrap();
+        std::fs::write(dir.join("README.md"), b"private documentation").unwrap();
+        for path in [
+            "/plugins/link.json",
+            "/plugins/../private.json",
+            "/plugins/%2e%2e/private.json",
+            "/plugins/README.md",
+        ] {
+            let (status, _, body) = get(&dir, path, true).await;
+            assert_ne!(status, StatusCode::OK, "{path}");
+            assert!(!body.contains("private"), "{path}: {body}");
+        }
     }
 }

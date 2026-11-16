@@ -19,13 +19,17 @@
 //! variables, one removed five, three kept their own eight-entry list. A
 //! list that lives seven times is the §9a shape (CLAUDE.md); this is the
 //! one copy,
-//! and `every_test_strips_the_proxy_through_the_one_helper.rs` refuses a
-//! hand-written `env_remove` of any of these names anywhere else.
+//! and `every_test_strips_the_proxy_through_the_one_helper.rs` refuses
+//! any of these names quoted on a code line anywhere else, outside the
+//! files it names as setting a proxy on purpose (backlog 9a12c070).
 
 use std::process::Command;
 
-/// Every variable curl, Python's urllib or reqwest reads a proxy from, in
-/// both spellings, and the two that exempt a host from one.
+/// Every variable curl, Python's urllib or reqwest reads a proxy from for
+/// http and https URLs, in both spellings, and the two that exempt a host
+/// from one. Not every proxy curl can read: it also takes a
+/// `<scheme>_proxy` for its other protocols and `proxy=` from a curlrc,
+/// and neither reaches an http(s) sender (review ea6cbc2f, finding 3).
 pub const PROXY_VARS: [&str; 8] = [
     "http_proxy",
     "HTTP_PROXY",

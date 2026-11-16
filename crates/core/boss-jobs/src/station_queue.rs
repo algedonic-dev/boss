@@ -10,7 +10,7 @@
 //! (`http/stations.rs`) supplies the open-Job universe and renders
 //! the [`StationQueue`] envelope.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use boss_core::job::{Job, JobStatus, Priority, Step, StepStatus};
 use chrono::NaiveDate;
@@ -193,36 +193,8 @@ impl StationPredicate {
     /// bind shows an empty queue, which is visible, instead of another
     /// actor's packets, which is not.
     pub fn matches(&self, job: &Job, steps: &[Step]) -> bool {
-        if self.binds_self() {
+        if !self.job_fields_match(&job.kind, &job.status, &job.tags, &job.metadata) {
             return false;
-        }
-        if let Some(kind) = &self.kind
-            && &job.kind != kind
-        {
-            return false;
-        }
-        if let Some(status) = &self.status
-            && &job.status != status
-        {
-            return false;
-        }
-        if !self.tags_any.is_empty() && !self.tags_any.iter().any(|t| job.tags.contains(t)) {
-            return false;
-        }
-        for key in &self.metadata_present {
-            if job.metadata.get(key).is_none_or(|v| v.is_null()) {
-                return false;
-            }
-        }
-        for key in &self.metadata_absent {
-            if job.metadata.get(key).is_some_and(|v| !v.is_null()) {
-                return false;
-            }
-        }
-        for (key, want) in &self.metadata_equals {
-            if job.metadata.get(key).and_then(|v| v.as_str()) != Some(want.as_str()) {
-                return false;
-            }
         }
         if let Some(step_match) = &self.step
             && !steps.iter().any(|s| step_match.matches(s))
@@ -230,6 +202,75 @@ impl StationPredicate {
             return false;
         }
         true
+    }
+
+    /// Every clause but `step`, over the Job's own fields: whether SOME
+    /// set of steps could make this Job a member. `matches` is this AND
+    /// the step clause, so a Job failing it is a member of nothing,
+    /// whatever its steps. The membership census asks it of a frozen
+    /// terminal packet from its kind, status, tags and metadata alone
+    /// (backlog bbeff5cb), and must not carry a second copy of the
+    /// clauses to do so (CLAUDE.md §9a).
+    pub(crate) fn job_fields_match(
+        &self,
+        kind: &str,
+        status: &JobStatus,
+        tags: &[String],
+        metadata: &Value,
+    ) -> bool {
+        if self.binds_self() {
+            return false;
+        }
+        if let Some(want) = &self.kind
+            && kind != want
+        {
+            return false;
+        }
+        if let Some(want) = &self.status
+            && status != want
+        {
+            return false;
+        }
+        if !self.tags_any.is_empty() && !self.tags_any.iter().any(|t| tags.contains(t)) {
+            return false;
+        }
+        for key in &self.metadata_present {
+            if metadata.get(key).is_none_or(|v| v.is_null()) {
+                return false;
+            }
+        }
+        for key in &self.metadata_absent {
+            if metadata.get(key).is_some_and(|v| !v.is_null()) {
+                return false;
+            }
+        }
+        for (key, want) in &self.metadata_equals {
+            if metadata.get(key).and_then(|v| v.as_str()) != Some(want.as_str()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Every metadata key [`Self::matches`] reads, of the Job or of a
+    /// Step. Written beside the match so the two cannot part: a read
+    /// that carries only these keys (backlog 45b25020) answers the same
+    /// verdict as one that carries every key, and the test
+    /// `metadata_keys_are_every_key_the_match_reads` holds them equal.
+    pub fn metadata_keys(&self) -> BTreeSet<String> {
+        let step = self.step.iter().flat_map(|s| {
+            s.metadata_equals
+                .keys()
+                .chain(&s.metadata_unmarked)
+                .cloned()
+        });
+        self.metadata_present
+            .iter()
+            .chain(&self.metadata_absent)
+            .chain(self.metadata_equals.keys())
+            .cloned()
+            .chain(step)
+            .collect()
     }
 
     /// Whether evaluating this predicate needs the Job's steps at
@@ -427,23 +468,13 @@ pub struct StationQueue {
     pub station: String,
     pub kind: crate::stations::StationKind,
     pub discipline: Vec<DisciplineKey>,
-    pub wip_limit: Option<i32>,
-    /// Advisory (Q3): true when the queue holds more packets than
-    /// `wip_limit`. Never enforced here — lenses warn, telemetry
-    /// reads it.
-    pub over_limit: bool,
     /// Echoed for the same reason `discipline` is: a reader who finds
     /// a closed packet in a queue should be able to see, from the
     /// envelope, that the station declared it would hold departed
     /// packets this long.
     pub terminal_window_days: Option<u32>,
-    /// The station's declared upstream, echoed for the same reason
-    /// `discipline` is: a lens that already holds the queue can render
-    /// the walk-upstream affordance without a second call to the
-    /// registry. `None` = the row declares none, and no button renders.
-    pub upstream: Option<crate::stations::StationUpstream>,
     /// The page context for a surface that renders this station whole,
-    /// echoed for the same reason `upstream` is: the call that fetched
+    /// echoed for the same reason `discipline` is: the call that fetched
     /// the packets already answered "what page is this", so the page
     /// draws itself from one response instead of a queue read plus a
     /// registry read. `None` = no surface claims this station.
@@ -460,6 +491,58 @@ pub struct StationQueue {
     /// every other lens serialises an empty object and is unaffected.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub steps: BTreeMap<String, Vec<Step>>,
+}
+
+/// A tree queue holds current work at its own address or below it
+/// (5a2556fe). Active work takes precedence over ready successors. A
+/// step with no explicit placement stays with its protocol's owner;
+/// a declared hand-off belongs to the child packet, not this queue.
+pub fn addressed_here(
+    inside: &BTreeSet<String>,
+    protocol: &crate::registry::WorkflowSpec,
+    steps: &[Step],
+) -> bool {
+    let active = steps.iter().any(|s| s.status == StepStatus::Active);
+    steps
+        .iter()
+        .filter(|s| {
+            s.status
+                == if active {
+                    StepStatus::Active
+                } else {
+                    StepStatus::Ready
+                }
+        })
+        .any(|step| {
+            let defaults = protocol
+                .steps
+                .iter()
+                .find(|s| Some(s.title.as_str()) == step.spec_slug.as_deref())
+                .map(|s| &s.metadata_defaults);
+            let field = |key: &str| {
+                step.metadata
+                    .get(key)
+                    .or_else(|| defaults.and_then(|d| d.get(key)))
+            };
+            // Presence is deliberate: a malformed declaration must not
+            // fall through to the owner and invent a different address.
+            if let Some(at) = field("at") {
+                return at.as_str().is_some_and(|s| inside.contains(s));
+            }
+            if field("fulfilled_by").is_some() {
+                return false;
+            }
+            if let Some(executor) = field("executor")
+                .and_then(Value::as_str)
+                .and_then(|s| s.strip_prefix("equipment:"))
+            {
+                return inside.contains(executor);
+            }
+            if let Some(station) = field("audience").and_then(|a| a.get("station")) {
+                return station.as_str().is_some_and(|s| inside.contains(s));
+            }
+            crate::station_tree::protocol_owner(protocol).is_some_and(|s| inside.contains(s))
+        })
 }
 
 /// Evaluate a station over a packet universe: keep what is inside the
@@ -506,12 +589,7 @@ pub fn evaluate_station(
         station: spec.name.clone(),
         kind: spec.kind,
         discipline,
-        wip_limit: spec.wip_limit,
-        over_limit: spec
-            .wip_limit
-            .is_some_and(|limit| members.len() as i64 > i64::from(limit)),
         terminal_window_days: spec.terminal_window_days,
-        upstream: spec.upstream.clone(),
         lens: spec.lens.clone(),
         total: members.len(),
         steps,
@@ -571,6 +649,79 @@ mod tests {
     // ------------------------------------------------------------
     // Predicate matching
     // ------------------------------------------------------------
+
+    /// Backlog 45b25020: the membership read carries only the metadata
+    /// keys a predicate names. Every clause that reads metadata is set,
+    /// and for each subset of a packet's keys the verdict on the packet
+    /// cut to `metadata_keys` equals the verdict on the whole packet —
+    /// so a clause added to `matches` without its key here fails.
+    #[test]
+    fn metadata_keys_are_every_key_the_match_reads() {
+        let p = StationPredicate {
+            metadata_present: vec!["branch".into()],
+            metadata_absent: vec!["train".into()],
+            metadata_equals: BTreeMap::from([("submitted_by".into(), "alice".into())]),
+            step: Some(StepMatch {
+                metadata_equals: BTreeMap::from([("authority_role".into(), "admin".into())]),
+                metadata_unmarked: vec!["hold".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let keys = p.metadata_keys();
+        assert_eq!(
+            keys,
+            ["authority_role", "branch", "hold", "submitted_by", "train"]
+                .map(String::from)
+                .into(),
+        );
+        let cut = |m: &serde_json::Value| -> serde_json::Value {
+            m.as_object()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| keys.contains(*k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        };
+        let job_keys = [
+            ("branch", serde_json::json!("feat/a")),
+            ("train", serde_json::json!("t1")),
+            ("submitted_by", serde_json::json!("alice")),
+            ("brief", serde_json::json!("x".repeat(64))),
+        ];
+        let step_keys = [
+            ("authority_role", serde_json::json!("admin")),
+            ("hold", serde_json::json!("waiting")),
+            ("receipt", serde_json::json!({"big": true})),
+        ];
+        let mut agreed = 0;
+        for jm in 0..(1u32 << job_keys.len()) {
+            for sm in 0..(1u32 << step_keys.len()) {
+                let pick = |set: &[(&str, serde_json::Value)], mask: u32| -> serde_json::Value {
+                    set.iter()
+                        .enumerate()
+                        .filter(|(i, _)| mask & (1 << i) != 0)
+                        .map(|(_, (k, v))| (k.to_string(), v.clone()))
+                        .collect::<serde_json::Map<_, _>>()
+                        .into()
+                };
+                let mut j = job("k", Priority::Standard, 1);
+                j.metadata = pick(&job_keys, jm);
+                let mut s = step("s", StepStatus::Ready);
+                s.metadata = pick(&step_keys, sm);
+                let whole = p.matches(&j, std::slice::from_ref(&s));
+                j.metadata = cut(&j.metadata);
+                s.metadata = cut(&s.metadata);
+                assert_eq!(p.matches(&j, &[s]), whole, "job {jm:b} step {sm:b}");
+                agreed += usize::from(whole);
+            }
+        }
+        assert!(
+            agreed > 0,
+            "some combination is a member, so the check has teeth"
+        );
+    }
 
     #[test]
     fn empty_predicate_matches_everything() {
@@ -951,24 +1102,22 @@ mod tests {
     // Envelope
     // ------------------------------------------------------------
 
-    fn dock_spec(wip_limit: Option<i32>) -> StationSpec {
-        let mut s = StationSpec::draft(
+    fn dock_spec() -> StationSpec {
+        StationSpec::draft(
             "loading-dock",
             "Loading dock",
-            StationKind::Batch,
+            StationKind::Group,
             StationPredicate {
                 kind: Some("ship-a-change".into()),
                 ..Default::default()
             },
             Utc::now(),
-        );
-        s.wip_limit = wip_limit;
-        s
+        )
     }
 
     #[test]
     fn evaluate_filters_orders_and_reports_the_discipline() {
-        let spec = dock_spec(None);
+        let spec = dock_spec();
         let packets = vec![
             (job("ship-a-change", Priority::Standard, 3), vec![]),
             (job("pr-train", Priority::Emergency, 1), vec![]),
@@ -979,58 +1128,25 @@ mod tests {
         assert_eq!(q.total, 2, "the pr-train packet is not a member");
         assert_eq!(q.data[0].priority, Priority::Urgent);
         assert_eq!(q.discipline, default_discipline());
-        assert!(!q.over_limit, "no wip_limit declared -> never over");
     }
 
+    /// The envelope no longer echoes an upstream: the walk upstream is
+    /// the parent station's page, derived from the tree by the page that
+    /// draws it (design deba3000), and every row's declared one read
+    /// null by the time it was retired (backlog d2cb38af).
     #[test]
-    fn wip_limit_is_advisory_over_limit_flag() {
-        let spec = dock_spec(Some(1));
-        let packets = vec![
-            (job("ship-a-change", Priority::Standard, 1), vec![]),
-            (job("ship-a-change", Priority::Standard, 2), vec![]),
-        ];
-        let q = evaluate_station(&spec, packets, day(20));
-        assert_eq!(q.total, 2, "advisory: nothing is dropped");
-        assert!(q.over_limit);
-
-        let under = evaluate_station(
-            &dock_spec(Some(5)),
-            vec![(job("ship-a-change", Priority::Standard, 1), vec![])],
-            day(20),
-        );
-        assert!(!under.over_limit);
+    fn the_envelope_carries_no_upstream() {
+        let q = evaluate_station(&dock_spec(), vec![], day(20));
+        let wire = serde_json::to_value(&q).unwrap();
+        assert!(wire.get("upstream").is_none(), "{wire}");
     }
 
-    /// The envelope carries the station's upstream pointer for the
-    /// same reason it carries `discipline` and `wip_limit`: any lens
-    /// that already reads the queue can render the walk-upstream
-    /// affordance without a second call to the registry.
-    #[test]
-    fn the_envelope_carries_the_declared_upstream() {
-        let mut spec = dock_spec(None);
-        spec.upstream = Some(crate::stations::StationUpstream {
-            label: "FEEDBACK".into(),
-            href: "/system/feedback".into(),
-        });
-        let q = evaluate_station(&spec, vec![], day(20));
-        let up = q.upstream.expect("declared, so present");
-        assert_eq!(up.label, "FEEDBACK");
-        assert_eq!(up.href, "/system/feedback");
-    }
-
-    #[test]
-    fn a_station_with_no_upstream_says_so_rather_than_guessing() {
-        let q = evaluate_station(&dock_spec(None), vec![], day(20));
-        assert_eq!(q.upstream, None, "no pointer declared, no button");
-    }
-
-    /// Same contract as `upstream`, one level up: a surface that
-    /// renders a whole page for a station gets its page context from
-    /// the same envelope that carried the packets, so the page is one
-    /// call and its identity is registry data.
+    /// A surface that renders a whole page for a station gets its page
+    /// context from the same envelope that carried the packets, so the
+    /// page is one call and its identity is registry data.
     #[test]
     fn the_envelope_carries_the_declared_lens() {
-        let mut spec = dock_spec(None);
+        let mut spec = dock_spec();
         spec.lens = Some(crate::stations::StationLens {
             eyebrow: Some("System Model · Design review".into()),
             title: "Design review".into(),
@@ -1050,7 +1166,7 @@ mod tests {
     /// them turns two calls into one.
     #[test]
     fn a_lens_that_asks_for_steps_gets_them_for_members_only() {
-        let mut spec = dock_spec(None);
+        let mut spec = dock_spec();
         spec.lens = Some(crate::stations::StationLens {
             eyebrow: None,
             title: "My watchlist".into(),
@@ -1086,7 +1202,7 @@ mod tests {
     fn a_lens_that_does_not_ask_gets_no_steps() {
         // The default, and the reason it is a default: one list_steps
         // per member is real cost, and most lenses render from the Job.
-        let mut spec = dock_spec(None);
+        let mut spec = dock_spec();
         spec.lens = Some(crate::stations::StationLens {
             eyebrow: None,
             title: "Loading dock".into(),
@@ -1110,7 +1226,7 @@ mod tests {
     fn a_station_with_no_lens_says_so_rather_than_guessing() {
         // A queue nobody renders a page for must not have a page
         // invented for it from its `title`.
-        let q = evaluate_station(&dock_spec(None), vec![], day(20));
+        let q = evaluate_station(&dock_spec(), vec![], day(20));
         assert_eq!(q.lens, None, "no lens declared, no page context");
     }
 

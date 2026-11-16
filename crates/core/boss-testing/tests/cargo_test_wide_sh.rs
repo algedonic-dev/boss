@@ -178,12 +178,69 @@ impl Fixture {
                 listing = dir.join("listing.json").display(),
             ),
         );
+        // A psql that stands in for the sidecar's: `SHOW max_connections`
+        // answers FAKE_MAX_CONNECTIONS, and with none set it fails the
+        // way an unreachable server does. It records the URL it was given.
+        let tools = dir.join("tools");
+        create_dir(&tools);
+        write_exec(
+            &tools.join("psql"),
+            &format!(
+                "#!/usr/bin/env bash\n\
+                 printf '%s\\n' \"$*\" >> '{marks}/psql-argv'\n\
+                 [ -n \"${{FAKE_MAX_CONNECTIONS:-}}\" ] || {{ echo 'psql: connection refused' >&2; exit 2; }}\n\
+                 echo \"$FAKE_MAX_CONNECTIONS\"\n",
+                marks = marks.display(),
+            ),
+        );
+        let script = dir.join(SCRIPT);
+        create_dir(script.parent().unwrap());
+        write_file(
+            &script,
+            &fs::read_to_string(repo_root().join(SCRIPT)).unwrap(),
+        );
+        let weights = "infra/gate-runner/test-binary-weights.json";
+        if let Ok(bytes) = fs::read_to_string(repo_root().join(weights)) {
+            create_dir(dir.join(weights).parent().unwrap());
+            write_file(&dir.join(weights), &bytes);
+        }
+        let helper = "infra/lib/jq.sh";
+        create_dir(dir.join(helper).parent().unwrap());
+        write_file(
+            &dir.join(helper),
+            &fs::read_to_string(repo_root().join(helper)).unwrap(),
+        );
         Fixture {
             state: dir.join("state"),
             dir,
             marks,
             cargo,
         }
+    }
+
+    /// Set the width cap in THIS fixture's copy of the script, so the
+    /// derivation is tested against a cap the test chooses rather than
+    /// the production constant (which gate_runner_manifests.rs pins, with
+    /// the measurement that set it).
+    fn with_max_width(self, cap: u64) -> Fixture {
+        let script = self.dir.join(SCRIPT);
+        let text = fs::read_to_string(&script).unwrap();
+        let lines: Vec<String> = text
+            .lines()
+            .map(|l| {
+                if l.starts_with("max_width=") {
+                    format!("max_width={cap}")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        assert!(
+            lines.iter().any(|l| *l == format!("max_width={cap}")),
+            "{SCRIPT} declares `max_width=<n>` on a line of its own"
+        );
+        write_file(&script, &(lines.join("\n") + "\n"));
+        self
     }
 
     fn run(&self, mode: &str, env: &[(&str, &str)]) -> Output {
@@ -227,14 +284,24 @@ impl Fixture {
 
     fn command(&self, mode: &str, env: &[(&str, &str)]) -> Command {
         let mut cmd = Command::new("bash");
-        cmd.arg(repo_root().join(SCRIPT))
+        cmd.arg(self.dir.join(SCRIPT))
             .arg(mode)
             .arg(&self.state)
             .arg(&self.cargo)
             .args(["test", "-p", "alpha", "--all-features", "--no-fail-fast"])
             .current_dir(&self.dir)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.dir.join("tools").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .env_remove("CARGO_BUILD_JOBS")
             .env_remove("BOSS_TEST_BINARIES_WIDE")
+            .env_remove("BOSS_TEST_POSTGRES_ADMIN_URL")
+            .env_remove("FAKE_MAX_CONNECTIONS")
             .env_remove("CARGO_MANIFEST_DIR")
             .env_remove("CARGO_PKG_NAME");
         for (k, v) in env {
@@ -298,6 +365,128 @@ fn canon(p: &Path) -> String {
         .unwrap_or_else(|_| p.to_path_buf())
         .display()
         .to_string()
+}
+
+fn group_sources(f: &Fixture, names: &[&str]) {
+    let path = f.dir.join("listing.json");
+    let listing = fs::read_to_string(&path).unwrap();
+    let rows: Vec<String> = listing
+        .lines()
+        .map(|line| {
+            let mut row: Value = serde_json::from_str(line).unwrap();
+            if names.contains(&row["target"]["name"].as_str().unwrap_or("")) {
+                let source = PathBuf::from(row["manifest_path"].as_str().unwrap())
+                    .parent()
+                    .unwrap()
+                    .join("tests/groups/area.rs");
+                row["target"]["src_path"] = json!(source);
+            }
+            row.to_string()
+        })
+        .collect();
+    write_file(&path, &(rows.join("\n") + "\n"));
+}
+
+#[test]
+fn source_defined_groups_use_the_declared_default_without_changing_cargo_kind() {
+    let f = Fixture::new(
+        "wide-source-group",
+        &[
+            bin("ordinary", "alpha", 0),
+            bin("unnamed", "alpha", 101),
+            bin("measured", "alpha", 0),
+        ],
+        false,
+        0,
+    );
+    group_sources(&f, &["unnamed"]);
+    write_file(
+        &f.dir.join("infra/gate-runner/test-binary-weights.json"),
+        r#"{"version":1,"kind_defaults":{"bin":1,"lib":1,"test":1,"group":300},"targets":{"alpha:measured":{"seconds":600,"basis":"fixture measurement"}}}"#,
+    );
+    let out = f.build_and_run(&[("BOSS_TEST_BINARIES_WIDE", "1")]);
+    assert_eq!(out.status.code(), Some(101), "{}", text(&out));
+    let seen = f.seen();
+    let names: Vec<&str> = seen.iter().map(|row| row[0].as_str()).collect();
+    assert_eq!(names, ["measured", "unnamed", "ordinary"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("-p alpha --test unnamed"));
+}
+
+#[test]
+fn receipt_keeps_every_group_time_and_the_actual_last_finisher() {
+    let f = Fixture::new(
+        "wide-all-group-times",
+        &[
+            Bin {
+                first: "for job in 2 3 4 5 6 7; do for i in $(seq 1 1000); do [ ! -f '{state}/logs/'\"$job\"'.status' ] || break; sleep 0.01; done; test -f '{state}/logs/'\"$job\"'.status' || exit 97; done",
+                ..bin("a_last", "alpha", 0)
+            },
+            bin("b", "alpha", 0),
+            bin("c", "alpha", 0),
+            bin("d", "alpha", 0),
+            bin("e", "alpha", 0),
+            bin("f", "alpha", 0),
+            bin("g", "alpha", 0),
+        ],
+        false,
+        0,
+    );
+    group_sources(&f, &["a_last", "b", "c", "d", "e", "f", "g"]);
+    // The first causally waits for every peer's recorded
+    // completion, independent of wall-clock speed or reporting order.
+    let built = f.run("build", &[]);
+    assert!(built.status.success(), "{}", text(&built));
+    let out = f.run("run", &[("BOSS_TEST_BINARIES_WIDE", "8")]);
+    assert!(out.status.success(), "{}", text(&out));
+    let summary = f.summary();
+    assert_eq!(summary["slowest"].as_array().unwrap().len(), 5);
+    assert_eq!(summary["tail"]["target"], "alpha:a_last");
+    assert!(
+        summary["tail"]["started_at_s"].as_f64().unwrap() < 60.0,
+        "start is relative to this test phase, not an epoch"
+    );
+    assert!(summary["tail"]["seconds"].as_f64().unwrap() >= 0.0);
+    let groups = summary["groups"]
+        .as_array()
+        .expect("all group timings retained");
+    assert_eq!(groups.len(), 7);
+    let names: BTreeSet<&str> = groups
+        .iter()
+        .map(|g| {
+            assert!(g["seconds"].as_f64().unwrap() >= 0.0);
+            g["target"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "alpha:a_last",
+            "alpha:b",
+            "alpha:c",
+            "alpha:d",
+            "alpha:e",
+            "alpha:f",
+            "alpha:g"
+        ]
+        .into_iter()
+        .collect()
+    );
+    let gate = fs::read_to_string(repo_root().join("infra/gate.sh")).unwrap();
+    let function = gate
+        .split("test_binaries_json() {")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    let out = Command::new("bash").arg("-c").arg(format!(
+        "ran_name() {{ printf '%s' \"$1\"; }}; RAN=(test); TEST_WIDE_STATE='{}'; test_binaries_json() {{{function}\n}}; test_binaries_json", f.state.display())).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        summary,
+        "the actual receipt consumer preserves every group and tail field"
+    );
 }
 
 /// A binary started by the runner sees what it saw under `cargo test`:
@@ -405,40 +594,167 @@ fn binaries_run_concurrently_up_to_the_width_and_never_wider() {
     );
 }
 
-/// Without an explicit width it is a quarter of CARGO_BUILD_JOBS (which
-/// the gate-runner sets from the cgroup quota), at most four, and ONE —
-/// cargo's own serial order — where CARGO_BUILD_JOBS is unset.
+/// Without an explicit width it is HALF of CARGO_BUILD_JOBS (which the
+/// gate-runner sets from the cgroup quota; each binary runs
+/// RUST_TEST_THREADS=2, so half the quota in binaries is the quota in
+/// test threads), at most `max_width`, and ONE — cargo's own serial
+/// order — where CARGO_BUILD_JOBS is unset (backlog 62435ba1; it was a
+/// quarter, at most four). The cap here is the FIXTURE's, 8, so every
+/// bound can be seen to bind; the production cap is 4 and is pinned,
+/// with the gate-drive measurement that kept it there, by
+/// gate_runner_manifests.rs.
+///
+/// THE SIDECAR'S CONNECTION BUDGET BOUNDS IT TOO. Every DB-backed binary
+/// holds up to `clients_per_binary` clients against one Postgres (two
+/// tests' pools of 5 plus the reaper's 8 drops; the worst three measured
+/// 15-16 each, gate_runner_manifests.rs), so the width is also at most
+/// `max_connections / clients_per_binary`, with `max_connections` read
+/// from the server itself (`SHOW max_connections` over
+/// BOSS_TEST_POSTGRES_ADMIN_URL) — the one place the number is true. A
+/// gate launched from a manifest that has not converged yet runs the
+/// width ITS server admits, not the width the branch hoped for
+/// (e3100bc8), and the receipt's `connection_budget` says which. With no
+/// URL, no psql, or a server that does not answer, the budget is ASSUMED
+/// to be Postgres's default of 100 — the narrower width, never the wider
+/// — and `source` says `assumed`. The summary's `width_bound` names the
+/// bound that set the width, so a receipt says WHY it ran that wide.
 #[test]
-fn the_width_follows_the_build_jobs_and_is_serial_without_them() {
-    for (jobs, want) in [
-        (None, 1),
-        (Some("2"), 1),
-        (Some("8"), 2),
-        (Some("20"), 4),
-        (Some("32"), 4),
+fn the_width_is_half_the_build_jobs_within_the_connection_budget() {
+    const URL: &str = "postgres://fixture:5432/postgres";
+    for (jobs, max_connections, want, bound) in [
+        (None, Some("200"), 1, "serial"),
+        (Some("2"), Some("200"), 1, "build_jobs"),
+        (Some("8"), Some("200"), 4, "build_jobs"),
+        (Some("20"), Some("200"), 8, "max_width"),
+        (Some("32"), Some("200"), 8, "max_width"),
+        (Some("20"), Some("400"), 8, "max_width"),
+        // 100 / 18 = 5: the budget, not the cap, bounds a 20-core gate
+        // whose sidecar runs Postgres's default under a cap of 8.
+        (Some("20"), Some("100"), 5, "connections"),
+        (Some("20"), Some("36"), 2, "connections"),
+        (Some("20"), Some("17"), 1, "connections"),
     ] {
         let f = Fixture::new(
             "cargo-test-wide-default",
             &[bin("only", "alpha", 0)],
             false,
             0,
-        );
-        let env: Vec<(&str, &str)> = jobs
-            .map(|j| vec![("CARGO_BUILD_JOBS", j)])
-            .unwrap_or_default();
+        )
+        .with_max_width(8);
+        let mut env: Vec<(&str, &str)> = vec![("BOSS_TEST_POSTGRES_ADMIN_URL", URL)];
+        env.extend(jobs.map(|j| ("CARGO_BUILD_JOBS", j)));
+        env.extend(max_connections.map(|m| ("FAKE_MAX_CONNECTIONS", m)));
         let out = f.build_and_run(&env);
         assert!(out.status.success(), "{}", text(&out));
-        assert_eq!(f.summary()["width"], want, "CARGO_BUILD_JOBS={jobs:?}");
+        let s = f.summary();
+        assert_eq!(
+            s["width"], want,
+            "CARGO_BUILD_JOBS={jobs:?} max_connections={max_connections:?}: {s}"
+        );
+        assert_eq!(
+            s["width_bound"], bound,
+            "CARGO_BUILD_JOBS={jobs:?} max_connections={max_connections:?}: {s}"
+        );
+        assert_eq!(
+            s["connection_budget"],
+            json!({"max_connections": max_connections.unwrap().parse::<u64>().unwrap(),
+                   "source": "server", "clients_per_binary": 18}),
+            "{s}"
+        );
+        let asked = fs::read_to_string(f.marks.join("psql-argv")).unwrap_or_default();
+        assert!(
+            asked.contains(URL) && asked.contains("max_connections"),
+            "the width was sized without asking the server at the admin URL: {asked:?}"
+        );
     }
+
+    // No answer from the server, no URL at all: the budget is assumed to
+    // be the default 100, and the run says so rather than widening.
+    for (label, env) in [
+        (
+            "the server does not answer",
+            vec![
+                ("CARGO_BUILD_JOBS", "20"),
+                ("BOSS_TEST_POSTGRES_ADMIN_URL", URL),
+            ],
+        ),
+        (
+            "no admin URL is set",
+            vec![("CARGO_BUILD_JOBS", "20"), ("FAKE_MAX_CONNECTIONS", "200")],
+        ),
+        (
+            "the server answers nonsense",
+            vec![
+                ("CARGO_BUILD_JOBS", "20"),
+                ("BOSS_TEST_POSTGRES_ADMIN_URL", URL),
+                ("FAKE_MAX_CONNECTIONS", "lots"),
+            ],
+        ),
+    ] {
+        let f = Fixture::new(
+            "cargo-test-wide-assumed",
+            &[bin("only", "alpha", 0)],
+            false,
+            0,
+        )
+        .with_max_width(8);
+        let out = f.build_and_run(&env);
+        assert!(out.status.success(), "{label}: {}", text(&out));
+        let s = f.summary();
+        assert_eq!(s["width"], 5, "{label}: {s}");
+        assert_eq!(s["width_bound"], "connections", "{label}: {s}");
+        assert_eq!(
+            s["connection_budget"],
+            json!({"max_connections": 100, "source": "assumed", "clients_per_binary": 18}),
+            "{label}: {s}"
+        );
+        assert!(
+            text(&out).contains("assumed"),
+            "{label}: the run must say the budget was assumed:\n{}",
+            text(&out)
+        );
+    }
+
     let f = Fixture::new(
         "cargo-test-wide-override",
         &[bin("only", "alpha", 0)],
         false,
         0,
     );
-    let out = f.build_and_run(&[("CARGO_BUILD_JOBS", "20"), ("BOSS_TEST_BINARIES_WIDE", "7")]);
+    let out = f.build_and_run(&[
+        ("CARGO_BUILD_JOBS", "20"),
+        ("BOSS_TEST_POSTGRES_ADMIN_URL", URL),
+        ("FAKE_MAX_CONNECTIONS", "100"),
+        ("BOSS_TEST_BINARIES_WIDE", "7"),
+    ]);
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(f.summary()["width"], 7, "an explicit width wins");
+    let s = f.summary();
+    assert_eq!(
+        s["width"], 7,
+        "an explicit width wins, over the budget too: it is the operator's say"
+    );
+    assert_eq!(s["width_bound"], "explicit", "{s}");
+
+    // The production script, its cap untouched: a 20-core gate on a
+    // sidecar that admits 100 runs exactly the cap, and says so.
+    let f = Fixture::new(
+        "cargo-test-wide-production-cap",
+        &[bin("only", "alpha", 0)],
+        false,
+        0,
+    );
+    let out = f.build_and_run(&[
+        ("CARGO_BUILD_JOBS", "20"),
+        ("BOSS_TEST_POSTGRES_ADMIN_URL", URL),
+        ("FAKE_MAX_CONNECTIONS", "100"),
+    ]);
+    assert!(out.status.success(), "{}", text(&out));
+    let s = f.summary();
+    assert_eq!(
+        (s["width"].clone(), s["width_bound"].clone()),
+        (json!(4), json!("max_width")),
+        "the gate runs the production cap of 4 (gate_runner_manifests.rs pins why): {s}"
+    );
 }
 
 /// `--no-fail-fast`, kept (backlog 3bef4198): a failing binary fails the
@@ -658,4 +974,57 @@ fn the_gate_tests_in_two_halves_and_its_receipt_carries_the_run() {
             .any(|l| l.trim() == "\"test_binaries\": $(test_binaries_json),"),
         "the receipt carries test_binaries"
     );
+}
+
+#[test]
+fn longest_declared_binary_runs_first_without_an_elapsed_time_oracle() {
+    let f = Fixture::new(
+        "wide-longest-first",
+        &[
+            bin("a_short", "alpha", 0),
+            bin("z_long", "alpha", 0),
+            bin("m_middle", "alpha", 0),
+        ],
+        false,
+        0,
+    );
+    let path = f.dir.join("infra/gate-runner/test-binary-weights.json");
+    create_dir(path.parent().unwrap());
+    write_file(&path, &json!({"version":1,"kind_defaults":{"bin":1,"lib":1,"test":1,"group":300},"targets":{"alpha:a_short":{"seconds":1,"basis":"fixture-declared"},"alpha:z_long":{"seconds":30,"basis":"fixture-declared"},"alpha:m_middle":{"seconds":10,"basis":"fixture-declared"}}}).to_string());
+    let out = f.build_and_run(&[("BOSS_TEST_BINARIES_WIDE", "1")]);
+    assert!(out.status.success(), "{}", text(&out));
+    let seen: Vec<_> = f.seen().iter().map(|r| r[0].clone()).collect();
+    assert_eq!(
+        seen,
+        ["z_long", "m_middle", "a_short"],
+        "numeric weights order every binary exactly once"
+    );
+}
+
+#[test]
+fn an_unreadable_weight_contract_refuses_before_running_a_binary() {
+    for (i, document) in ["{}", "", " \n "].into_iter().enumerate() {
+        let f = Fixture::new(
+            &format!("wide-invalid-weights-{i}"),
+            &[bin("a_short", "alpha", 0)],
+            false,
+            0,
+        );
+        let path = f.dir.join("infra/gate-runner/test-binary-weights.json");
+        create_dir(path.parent().unwrap());
+        write_file(&path, document);
+        let built = f.run("build", &[]);
+        assert!(built.status.success(), "{}", text(&built));
+        let out = f.run("run", &[]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "input {document:?}: {}",
+            text(&out)
+        );
+        assert!(
+            f.seen().is_empty(),
+            "invalid scheduling data never becomes an empty or partial pass"
+        );
+    }
 }

@@ -313,6 +313,54 @@ impl Harness {
 }
 
 #[test]
+fn a_guard_with_no_declarations_refuses_before_any_write_even_with_an_override() {
+    let h = Harness::new("no-declarations");
+    write_exec(
+        &h.script,
+        &read(&h.script).replace("host_seam HC_SEAM /real/default\n", ""),
+    );
+    for override_node in [None, Some("forge")] {
+        let mut command = h.cmd("forge");
+        if let Some(node) = override_node {
+            command.env("BOSS_FIRST_INSTALL_AS", node);
+        }
+        let output = command.output().unwrap();
+        let said = text(&output);
+        assert_eq!(output.status.code(), Some(78), "{said}");
+        assert!(said.contains("harness:"), "{said}");
+        assert!(said.contains("no host declarations"), "{said}");
+        assert!(!h.out.exists(), "a guard with no declarations cannot write");
+        assert!(h.summary_field().starts_with("REFUSED:"), "{said}");
+    }
+}
+
+#[test]
+fn a_redirected_path_or_absent_command_still_declares_a_guarded_seam() {
+    for (name, declaration) in [
+        (
+            "path-declaration",
+            "host_path harness \"$HC_SEAM\" /real/default",
+        ),
+        ("absent-command-declaration", "host_command \"$HC_SEAM\""),
+    ] {
+        let h = Harness::new(name);
+        write_exec(
+            &h.script,
+            &read(&h.script).replace("host_seam HC_SEAM /real/default", declaration),
+        );
+        let output = h
+            .cmd("forge")
+            .env("HC_SEAM", h.dir.join("absent"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+        assert_eq!(text(&output), "verdict=\n");
+        assert!(h.out.exists());
+        assert_eq!(h.summary_field(), "");
+    }
+}
+
+#[test]
 fn a_real_seam_on_another_machine_is_refused_on_one_line_before_the_first_write() {
     let h = Harness::new("refused");
     for seam in [None, Some("/real/default")] {
@@ -1375,6 +1423,7 @@ const GATED: &[(&str, &str)] = &[
     ("forge/forge-converge.sh", "forge"),
     ("forge/root-tree.sh", "forge"),
     ("forge/probe-account.sh", "forge"),
+    ("forge/netboot.sh", "forge"),
     ("forge/machine-token-deposit.sh", "forge"),
     ("forge/probe-reader-deposit.sh", "forge"),
     ("forge/registry-token-deposit.sh", "forge"),

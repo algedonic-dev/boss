@@ -152,7 +152,7 @@ SLUG=$(git remote get-url "$REMOTE" 2>/dev/null \
 # here is a real git error and must surface, not read as "current".
 AHEAD=$(git rev-list --count "$TARGET".."$SOURCE_SHA") || refuse "git rev-list $TARGET..$SOURCE failed"
 BEHIND=$(git rev-list --count "$SOURCE_SHA".."$TARGET") || refuse "git rev-list $SOURCE..$TARGET failed"
-FILES=$(git diff --name-only "$TARGET" "$SOURCE_SHA" | wc -l | tr -d ' ')
+FILES=$(git diff --no-renames --name-only "$TARGET" "$SOURCE_SHA" | wc -l | tr -d ' ')
 
 say "  commits ahead : $AHEAD"
 say "  commits behind: $BEHIND"
@@ -268,7 +268,7 @@ say "  scanned       : $SCANNED_SHA (the tree of $SOURCE, from git, not the work
 # they describe how to reach and recover the live system, which is a
 # different kind of disclosure from source code.
 # ---------------------------------------------------------------------
-NEW_FILES=$(git diff --name-only --diff-filter=A "$TARGET" "$SOURCE_SHA" 2>/dev/null)
+NEW_FILES=$(git diff --no-renames --name-only --diff-filter=A "$TARGET" "$SOURCE_SHA" 2>/dev/null)
 NEW_COUNT=$(printf '%s' "$NEW_FILES" | grep -c . || true)
 SENSITIVE=$(printf '%s\n' "$NEW_FILES" | grep -E '^(docs/runbooks/|infra/(cluster|caddy|forge)/)' || true)
 SENS_COUNT=$(printf '%s' "$SENSITIVE" | grep -c . || true)

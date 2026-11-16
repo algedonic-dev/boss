@@ -1,0 +1,27 @@
+# ---------------------------------------------------------------------------
+# forge — the repo as a product (T2 of design 4b27a65a, backlog
+# 3f58c823; handoff section 1 and its question "Who owns the forge box?":
+# Operations keeps host:forge, Engineering owns this station). The forge
+# CI station (forge-ci.toml) stands in it; Forgejo and the registry are
+# services on the box with no automation row of their own, so the one
+# machine named is the CI runner.
+#
+# A CONTAINER, NOT A QUEUE: the tagged predicate holds no packet (see
+# algedonic.toml). Its footprint on host:forge is not measured, so it
+# allocates nothing. To change this station, bump `version`.
+# ---------------------------------------------------------------------------
+
+[[station]]
+name = "forge"
+version = 1
+status = "active"
+title = "Forge — the repository, the registry and CI"
+kind = "group"
+discipline = ["priority", "age"]
+id = "b8f8a23b-f8da-428f-8df2-731be4ae597a"
+parent = "4c5ddf6c-b8ed-4776-98d9-2f99553317c5"
+mode = "standing"
+machines = ["automation:forge-actions-runner"]
+
+[station.predicate]
+tags_any = ["station:forge"]

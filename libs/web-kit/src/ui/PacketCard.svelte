@@ -124,10 +124,6 @@
   .packet:hover {
     border-color: var(--pk);
   }
-  .packet:focus-visible {
-    outline: 1px solid var(--pk);
-    outline-offset: 2px;
-  }
   .packet.sim {
     border-style: dashed;
     border-left-style: solid;

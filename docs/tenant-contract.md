@@ -11,6 +11,11 @@ David on 2026-09-16 (backlog `fcc1d57b`): *"someone downloading BOSS
 to adapt it wants a more natural home for their adaption"* than a
 patch to our examples.
 
+Declare the SKU catalog with `[modules] products = true`,
+independently of `parts`. A tenant that uses finished goods enables
+both; the brewery example does so. Missing module keys remain off.
+SKU kinds are Class codes owned by the tenant, not product constants.
+
 Three verbs make the contract usable:
 
 - `boss tenant init <name> [--into <dir>]` writes a new tenant
@@ -131,7 +136,7 @@ stating plainly:
 | `seeds/business_calendars.json` | no | POST /api/calendar/business-calendars/batch as `Vec<boss_core::calendar::BusinessCalendar>` (the brewery engine's prepare and `boss tenant publish`; insert-if-absent by code, a held code that differs is named, `--take calendars` replaces it wholesale — design e187198f); the dispatcher's timing triggers and the sim resolve business days from it | JSON array of {code, name, weekend: [0..6 Mon=0], closed: [YYYY-MM-DD]} | yes |
 | `seeds/credentials.toml` | no | POST /api/credentials/batch (boss-jobs, insert-if-absent by id; one `credential.declared` fact per inserted row) — sent by `boss tenant publish` BEFORE the sensors, because a sensor names a credential by id; the broker's rotation handlers and the forge-token audit read the rows it lands. KNOWLEDGE only: where a value lives and who reads it — the value stays in the deployment's Secret, and a key the shape does not name is refused (backlog ee368d0c: until 2026-09-18 these rows were seeded by migrations, so every install carried one operator's credential ids) | `[[credential]]` rows: id, kind (`forgejo-access-token`, `stripe-restricted-key`, ...), issuer, principal, scopes? (as the issuer spells them; empty = unverified), storage_location (a Secret ns/name/key or a file path — never a value), consumers? = [{kind, location}], rotation_policy? (on-demand | scheduled), notes? — the `credentials` table's declarable columns; validated by `boss_jobs::credentials::load_credentials_toml` | yes |
 | `seeds/sensors.toml` | no | POST /api/sensors/batch (boss-jobs, insert-if-absent by id) — sent by `boss tenant publish` as the tenant's declarations; the dispatcher's `sensor.poll` handler reads the registry every 5 minutes and polls each due sensor (design 14c9b2ad); a push-only source is never due — the gateway's site surface records one `www-visits` reading per page view through POST /api/sensors/{id}/readings (backlog 0b5c5081) | `[[sensor]]` rows: id, source (`stripe` for succeeded charges and `stripe-payouts` for paid payouts, both polled on the same credential; `site` push-only), credential (a `credentials` registry id; none on a push-only source), every_minutes (none on a push-only source), opens (the workflow kind one reading opens), subject_kind, enabled? — validated by `boss_jobs::sensors::load_sensors_toml`. Cross-file: `opens` must name a workflow this tenant declares or the platform ships, and `credential` a row `seeds/credentials.toml` declares — a dangling reference passes every file-local check and opens nothing (backlog b8d8c928) | yes |
-| `seeds/agents.toml` | no | POST /api/agents/batch (boss-jobs) — sent by `boss tenant publish` BEFORE the Workflows (a step's audience may name an agent); a row the registry lacks is inserted, a row it holds is kept and the publish line names the declared fields that differ, an alias the tenant does not declare is kept — the instance is the truth; `--take agents` applies the whole declaration and names each change from → to (design e187198f); the jobs API's login door resolves each alias to the id (design 6fda05ae; backlog f56155f0) | `[[agent]]` rows: id (`agent-<slug>`), display_name, default_model (a rate-card model, e.g. `opus-5[1m]`), aliases? (the logins that sign as it), role? (a Class code under (employee, role)) and department? (a departments-registry code, backlog c87e3d6d), checked at the batch door like an employee's — a role audience resolves to every holder, agents included; backlog ab192a9f), hourly_budget_usd_micros?, max_concurrent_runs? — the `agents` table's columns and nothing else; validated by `boss_jobs::agents::load_agents_toml` | yes |
+| `seeds/agents.toml` | no | POST /api/agents/batch (boss-jobs) — sent by `boss tenant publish` BEFORE the Workflows (a step's audience may name an agent); a row the registry lacks is inserted, a row it holds is kept and the publish line names the declared fields that differ, an alias the tenant does not declare is kept — the instance is the truth; `--take agents` applies the whole declaration and names each change from → to (design e187198f); the jobs API's login door resolves each alias to the id (design 6fda05ae; backlog f56155f0) | `[[agent]]` rows: id (`agent-<slug>`), display_name, default_model (a rate-card model, e.g. `opus-5[1m]`), model_class? (the <class> of an active `robots:<class>` pool, checked at the batch door — what a `model:<class>` step admits a robot by; never derived from default_model, backlog 06d8988b), aliases? (the logins that sign as it), role? (a Class code under (employee, role)) and department? (a departments-registry code, backlog c87e3d6d), checked at the batch door like an employee's — a role audience resolves to every holder, agents included; backlog ab192a9f), hourly_budget_usd_micros?, max_concurrent_runs? (stored; bounds nothing since backlog 3e927996, a robot is bounded by its robots:<class> pool), stations? (the stations the executor is seated at, in the order it serves them — each an active station, checked at the batch door; omitted keeps the held seats, `[]` unseats; design 506e0a1c) — the `agents` table's columns and nothing else; validated by `boss_jobs::agents::load_agents_toml` | yes |
 | `seeds/posting_rules.toml` | no | POST /api/ledger/posting-rules/batch (boss-ledger, insert-if-absent by fact_kind + version, source = tenant:<id>) — sent by `boss tenant publish` AFTER the Workflows; the posting path evaluates a fact by the newest registry rule for its kind and by the code rules otherwise (backlog a40541cb) | `[[posting_rule]]` rows: fact_kind, version? (1), basis (cash|accrual), lines = [{account_code, side (debit|credit), amount_path (a JSON pointer into the fact payload, integer cents), memo?}] — the debit pointers and the credit pointers must be the same multiset (balanced for every fact); validated by `boss_ledger::posting_rules::load_posting_rules_toml` | yes |
 | `seeds/fact_projection_rules.toml` | no | POST /api/ledger/fact-projection-rules/batch (boss-ledger, insert-if-absent by event_kind + when) — sent by `boss tenant publish` after the posting rules; the ledger's facts rebuild projects every matching audit_log event into a financial_fact (backlog a40541cb) | `[[projection]]` rows: event_kind (an audit_log kind whose family the platform event stream ingests — `boss_nats::durable::stream_subjects`; a rule on any other family would fire never live, so it is refused naming the family, backlog 94f20e76), when? (a table of {"/pointer" = value}, every pointer equal for the rule to fire), fact_kind, source_table, source_id_path, happened_on_path?, created_by_path? — the `gl_fact_projection_rules` columns; validated by `boss_ledger::posting_rules::load_projection_rules_toml` | yes |
 | `seeds/locations.toml` | no | POST /api/locations/batch, one boss-locations `http::LocationInput` per row (insert-if-absent by id) — sent by `boss tenant publish` BEFORE the roster, because an `employees.json` `location` is a foreign key into the registry (backlog 1ec8312a; until 2026-09-17 nothing read this file) | `[[location]]` rows: id, name, kind, timezone (+ parent_id, latitude, longitude, address, account_id, metadata) — the `locations` table's columns | yes |
@@ -678,22 +683,31 @@ from another protocol's record is exactly what a workflow cannot say.
 """
 version = 1
 on_event = "jobs.job.closed"
-when = 'kind = "maintenance-cluster-converge"'
+when = "kind = \"maintenance-cluster-converge\""
 [[rule.do]]
 handler = "jobs.complete_step_matching"
-args = { kind = '"publish-the-landing-page"', step = '"live"', match_step = '"publish"', match_field = '"site_hash"', event_path = '"steps.run.site.hash"', evidence_key = '"converge"', "done_metadata.converged_by" = "id" }
+args = { kind = "\"publish-the-landing-page\"", step = "\"live\"", match_step = "\"publish\"", match_field = "\"site_hash\"", event_path = "\"steps.run.site.hash\"", done_metadata = '"{\"served_by\": \"converge {event.id}\"}"', evidence_key = "\"converge\"" }
 ```
 
-`jobs.complete_step_matching` is being built by a sibling car: it
-finds the open `publish-the-landing-page` packet whose `publish`
-step's `site_hash` equals the closed converge's `steps.run.site.hash`,
-completes its `live` step, and writes the converge's identity under
-`evidence.converge` in the step's done metadata (the arg names above
-are that handler's; read its file under `infra/dispatcher/rules/` or
-its doc once it lands). Until that car lands and the CLI is rebuilt,
-`check` reports this rule INVALID by handler name — which is the honest
-answer — and the contract's own test fixture proves the mechanics with
-`messages.notify`, a handler every build has.
+`jobs.complete_step_matching` (the handler in
+`crates/orchestrators/boss-dispatcher-handlers/src/handlers/jobs_complete_step_matching.rs`)
+finds the open packet of `kind` whose `match_step` step's
+`match_field` equals the value at `event_path` in the triggering
+event. In this example that is the `publish-the-landing-page` packet
+whose `publish` step's `site_hash` equals the closed converge's
+`steps.run.site.hash`. The handler then completes that packet's `step`
+(here `live`). It reads exactly these arguments:
+
+- `kind`, `step`, `match_field` and `event_path` are required.
+- `match_step` is optional; without it, `match_field` is read from the candidate packet's own metadata.
+- `evidence_key` is optional and names the done-metadata key that receives the triggering event's id (here `converge`; the default is `matched_from`).
+- `done_metadata` is a template for the rest of the done metadata. It may name the event's scalars as `{event.<key>}`, the matched value as `{value}`, and the packet being completed as `{candidate.<path>}`.
+
+A placeholder may also sit inside `event_path`. The blog post's live
+rule reads `steps.run.site.pages./blog-{candidate.steps.draft.slug}.html`,
+so each post is matched against the page that carries its own slug.
+`check` validates the handler by name. What the placeholders mean at
+runtime is pinned by that handler's own tests.
 
 ## What `check` found on the first real tenant
 

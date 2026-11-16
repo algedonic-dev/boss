@@ -1,4 +1,4 @@
-// /ux/finance — every read's failure line carries the failure marker,
+// /finance — every read's failure line carries the failure marker,
 // and no failed read wears an empty state (backlog 1a2b67c9, page
 // audit 3f964c57 gap 12, measured against origin/main 642c0171).
 //
@@ -21,7 +21,7 @@ import { mountPage } from './_helpers';
 import { installSmokeMocks } from './_smokeMocks';
 import { FAILURE_MARKER } from './_routes';
 
-const PATH = '/ux/finance';
+const PATH = '/finance';
 
 const json = (r: Route, body: unknown, status = 200): Promise<void> =>
   r.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });

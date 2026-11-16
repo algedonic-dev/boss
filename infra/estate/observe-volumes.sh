@@ -125,6 +125,7 @@ for ns in $namespaces; do
             volume: (.spec.volumeName // null),
             storage_class: (.spec.storageClassName // null),
             requested: (.spec.resources.requests.storage // null),
+            pvc_capacity: (.status.capacity.storage // null),
             phase: (.status.phase // null) }' "$WORK/pvc.json" >>"$WORK/claims.jsonl"
     else
         why="the claims of $ns could not be listed through $(ops_kubeconfig): $(oneline "$WORK/pvc.err")"
@@ -177,7 +178,8 @@ jq -n -c --slurpfile claims "$WORK/claims.jsonl" --slurpfile stats "$WORK/stats.
                              and (.capacity | type) == "number" and (.available | type) == "number") ]
          | first) as $s
         | { id: $id, namespace: $c.ns, claim: $c.claim, volume: $c.volume,
-            storage_class: $c.storage_class, requested: $c.requested, phase: $c.phase }
+            storage_class: $c.storage_class, requested: $c.requested, phase: $c.phase,
+            pvc_capacity: $c.pvc_capacity }
           + if $c.phase != "Bound" then
               { capacity_bytes: null, used_bytes: null, free_bytes: null,
                 unread: ("the claim is " + ($c.phase // "of no phase") + ", not Bound, so no filesystem stands behind it") }
@@ -190,15 +192,15 @@ jq -n -c --slurpfile claims "$WORK/claims.jsonl" --slurpfile stats "$WORK/stats.
             end
       end' >"$WORK/rows.jsonl" || { echo "observe-volumes: REFUSED — the reading did not join (jq failed)" >&2; exit 1; }
 
-# Only missing live figures consult durable evidence. Every currently
-# measured kubelet control stays intact, and non-Bound claims stay blind.
+# Declared producers are checked even with live figures: a mounted
+# failed backup is not healthy merely because its filesystem is readable.
+# A sample replaces only missing figures, never a current kubelet reading.
 sources=${BOSS_VOLUME_SAMPLE_SOURCES:-$here/mounted-volume-sources.json}
 : > "$WORK/with-samples.jsonl"
 while IFS= read -r row; do
     ns=$(printf '%s' "$row" | jq -r '.namespace')
     claim=$(printf '%s' "$row" | jq -r '.claim // empty')
-    needs=$(printf '%s' "$row" | jq -r '.phase == "Bound" and .free_bytes == null')
-    if [[ "$needs" == true ]]; then
+    if [[ -n "$claim" ]]; then
         if ! configured=$(jq -ser --arg ns "$ns" --arg claim "$claim" '
             if length == 1 then .[0] else error("not one entire source registry") end
             | if type != "array" then error("not a source registry") else . end
@@ -213,13 +215,31 @@ while IFS= read -r row; do
                 sample='{"capacity_bytes":null,"used_bytes":null,"free_bytes":null,"unread":"mounted sample reader failed"}'
             fi
             row=$(printf '%s' "$row" | jq -c --argjson sample "$sample" '
-                if $sample.free_bytes == null then .unread += ("; " + $sample.unread)
-                else del(.unread) + $sample end') || { echo 'observe-volumes: REFUSED — mounted evidence did not join' >&2; exit 1; }
+                (if .phase != "Bound" or .free_bytes != null then .
+                 elif $sample.free_bytes == null then .unread += ("; " + $sample.unread)
+                 else del(.unread) + $sample end)
+                + if $sample.scheduled_job == null then {} else {scheduled_job:$sample.scheduled_job} end') || { echo 'observe-volumes: REFUSED — mounted evidence did not join' >&2; exit 1; }
         fi
     fi
     printf '%s\n' "$row" >> "$WORK/with-samples.jsonl"
 done < "$WORK/rows.jsonl"
 mv "$WORK/with-samples.jsonl" "$WORK/rows.jsonl"
+
+# Same rendered declaration roster as converge and the expansion plan.
+# PVC status is independent of mounted statfs; an offline filesystem
+# must not hide that its claim has outgrown the checked-in declaration.
+if bash "$here/../cluster/render-instance.sh" --all "$WORK/standalone-manifests" > "$WORK/standalone-render.out" 2> "$WORK/standalone.err" \
+    && python3 -B "$here/../forge/standalone-pvc.py" "$WORK/standalone-manifests" \
+        --enrich "$WORK/rows.jsonl" > "$WORK/standalone-rows.json" 2>> "$WORK/standalone.err" \
+    && jq -c '.[]' "$WORK/standalone-rows.json" > "$WORK/enriched-rows.jsonl"; then
+    mv "$WORK/enriched-rows.jsonl" "$WORK/rows.jsonl"
+else
+    echo 'observe-volumes: standalone declarations unread; filesystem observations are retained separately' >&2
+    cat "$WORK/standalone.err" >&2
+    jq -c --rawfile why "$WORK/standalone.err" '. + {standalone_declaration_unread:$why}' \
+        "$WORK/rows.jsonl" > "$WORK/enriched-rows.jsonl" || exit 1
+    mv "$WORK/enriched-rows.jsonl" "$WORK/rows.jsonl"
+fi
 
 jq -r 'if .free_bytes == null then "no volume reading for \(.id): \(.unread)"
        else "  \(.id) (\(.volume // "no volume")): \((.capacity_bytes / 1073741824 * 10 | round) / 10)G, free \((.free_bytes / 1073741824 * 10 | round) / 10)G"

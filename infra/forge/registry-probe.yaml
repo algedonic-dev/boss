@@ -1,0 +1,81 @@
+# registry-probe.yaml — the one-shot Job the ops verb `registry-probe`
+# applies to prove ONE worker pulls from the forge registry
+# (infra/forge/registry-probe.sh <node>; backlog 01927489).
+#
+# WHY A FILE. join-a-node's `verify-registry` step asks for `image_pulled`.
+# w-2's join (829f75a8) answered it with a Job David wrote and applied by
+# hand (w2-registry-probe: a nodeSelector and imagePullPolicy Always), and
+# that Job is in no tree. This is it, declared: the verb fills in exactly
+# two words — the node ($REGISTRY_PROBE_NODE, one DNS label the estate
+# registry and the cluster both bound) and the registry
+# ($BOSS_FORGE_REGISTRY_HOST, from /etc/boss/sor.env, so no address is
+# spelled here) — and applies it through the forge's ops_kubectl door.
+#
+# WHAT IT PROVES. imagePullPolicy Always makes the kubelet ask the registry
+# for the image whatever the node already holds, and the image is named by
+# DIGEST (the mirrored kubectl image boss-estate-observe pins), so the
+# imageID the kubelet reports can be held to it: a pod that ran this
+# container on the node is a node whose containerd reached the forge
+# registry through its declared mirror and got exactly these bytes. The
+# container only prints where it ran; it mounts nothing, holds no token,
+# and runs as nobody.
+#
+# LIFECYCLE. A FIXED name, so the API server refuses a second probe while
+# one stands. One attempt, a bounded deadline, and the tree's one-hour
+# floor on finished history (every_job_bounds_its_finished_history.rs) as
+# the backstop; the verb itself prints the pod's whole log and then deletes
+# the Job by its uid, reading the name back gone.
+#
+# NOT under infra/cluster/manifests: the converge applies that directory,
+# and this Job runs only when a packet asks.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: registry-probe
+  namespace: boss-dev
+  labels:
+    app: registry-probe
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 180
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels: {app: registry-probe}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      imagePullSecrets:
+        - {name: forgejo-registry}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: kubernetes.io/hostname, operator: In, values: ["$REGISTRY_PROBE_NODE"]}
+                  - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: probe
+          image: $BOSS_FORGE_REGISTRY_HOST/david/alpine-k8s:1.33.3@sha256:cdeda0da2cd6896023cc5f96505bc94a699a989dff2bfc3e2008ab92eab1e93a
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          env:
+            - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              os=$(. /etc/os-release 2>/dev/null && printf '%s' "$PRETTY_NAME")
+              printf 'registry-probe: ran on node %s, pod %s, as uid %s: %s\n' "$NODE_NAME" "$POD_NAME" "$(id -u)" "${os:-an unread OS}"

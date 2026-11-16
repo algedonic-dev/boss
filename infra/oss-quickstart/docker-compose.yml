@@ -164,11 +164,6 @@ services:
       # collections fire and AR balloons. Real-tenant deployments drop both.
       BOSS_EVENT_WEBHOOK_URL: http://127.0.0.1:7099/callback
       BOSS_SIM_CALLBACK_BIND: 127.0.0.1:7099
-      # Step-assignment distribution strategy named as data (default spread:
-      # hash-spread each ready step across its role's active holders;
-      # deterministic). `lowest-id` is the legacy single-holder behavior.
-      # Unknown value → dispatcher warns + falls back to spread.
-      BOSS_DISPATCH_STRATEGY: spread
       # Rule registry the dispatcher's side-effect runner consumes — the
       # consumer that system-completes markers + fires produce / invoice-issue
       # / gate-resolve so multi-step Jobs advance to close. The dispatcher

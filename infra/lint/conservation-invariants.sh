@@ -212,7 +212,7 @@ LEDGER_READER='{"id":"automation:conservation-sweep","role":"audit-readonly","ac
 . "$(dirname "${BASH_SOURCE[0]}")/../lib/secret-header.sh" || exit 3
 bs_response=''
 if machine_token_header LEDGER_MACHINE_HEADER "$LEDGER_BASE"; then
-    bs_response=$(curl -sS --fail ${LEDGER_MACHINE_HEADER:+-H "$LEDGER_MACHINE_HEADER"} -H "x-boss-user: $LEDGER_READER" "$LEDGER_BASE/api/ledger/balance-sheet" 2>&1) || {
+    bs_response=$(curl -q -sS --fail ${LEDGER_MACHINE_HEADER:+-H "$LEDGER_MACHINE_HEADER"} -H "x-boss-user: $LEDGER_READER" "$LEDGER_BASE/api/ledger/balance-sheet" 2>&1) || {
         echo "[ERROR] S. Balance-sheet endpoint — fetch failed:"
         echo "$bs_response" | sed 's/^/    /'
         violations=$((violations + 1))

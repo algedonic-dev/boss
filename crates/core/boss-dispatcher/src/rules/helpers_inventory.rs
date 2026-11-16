@@ -51,7 +51,7 @@ impl InventoryHelpers {
             .client
             .get(url)
             .header("x-boss-user", SYSTEM_USER_HEADER)
-            .header("x-sim-origin", crate::dispatcher::sim_origin_value())
+            .header("x-sim-origin", crate::next_hop::sim_origin_value())
             .send();
         let resp = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(req))
             .map_err(|e| EvalError::HelperFailed {

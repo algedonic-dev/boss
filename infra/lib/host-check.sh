@@ -15,7 +15,9 @@
 #
 # THE RULE. A gated script names each place it would touch this
 # machine's own system — one line per seam, below — and then calls
-# host_check with the estate node it installs. Three outcomes:
+# host_check with the estate node it installs. A caller declaring nothing
+# is a defect, refused even on the intended host (backlog 65265243).
+# Otherwise there are three outcomes:
 #
 #   nothing real   every seam is redirected, so the run can only write
 #                  where its caller pointed it: a test. Proceeds, and no
@@ -70,6 +72,7 @@
 
 _host_check_infra="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 host_real=()
+host_declared=()
 HOST_CHECK_VERDICT=""
 
 # host_seam NAME [REAL_DEFAULT] — the environment seam NAME redirects a
@@ -81,6 +84,7 @@ HOST_CHECK_VERDICT=""
 # (CLAUDE.md §9a — converge_hold_sh.rs refused the hold's, which is how
 # this rule was found).
 host_seam() {
+    host_declared+=("$1")
     local v="${!1:-}"
     if [ -z "$v" ] || { [ "$#" -ge 2 ] && [ "$v" = "$2" ]; }; then
         host_real+=("$1")
@@ -90,6 +94,7 @@ host_seam() {
 # host_path LABEL VALUE REAL_DEFAULT — the same judgement for a value
 # that arrived another way (an argument, a derived path).
 host_path() {
+    host_declared+=("$1")
     [ "$2" != "$3" ] || host_real+=("$1")
 }
 
@@ -98,6 +103,7 @@ host_path() {
 # resolves into a system directory; a test puts its stub first on PATH,
 # and a machine that has no such command cannot run it.
 host_command() {
+    host_declared+=("$1")
     local at
     at="$(command -v -- "$1" 2>/dev/null)" || return 0
     case "$at" in
@@ -144,6 +150,17 @@ host_addresses_declared() { # <estate file> <node id>
 host_check() {
     local node="$1" me="$2" estate held declared a real
     HOST_CHECK_VERDICT=""
+    if [ "${#host_declared[@]}" -eq 0 ]; then
+        HOST_CHECK_VERDICT="REFUSED: no host declarations; the caller must name what it guards"
+        echo "$me: $HOST_CHECK_VERDICT; nothing was written." >&2
+        if declare -F run_summary_field >/dev/null; then
+            run_summary_field host_check "$HOST_CHECK_VERDICT"
+            if [ -n "${HOST_CHECK_RED_ROUTE:-}" ]; then
+                run_summary_field output "RED $HOST_CHECK_RED_ROUTE refused: ${HOST_CHECK_VERDICT#REFUSED: }"
+            fi
+        fi
+        exit 78
+    fi
     if [ "${#host_real[@]}" -eq 0 ]; then
         return 0
     fi

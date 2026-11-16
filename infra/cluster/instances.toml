@@ -181,6 +181,9 @@ source = "prod"
 # was held (063dba4e). The public example lives on as the playground.
 [prod]
 namespace = "boss"
+# Required placement, not preference. The 12Gi limit remains UNMEASURED.
+stack_node = "cp-3"
+stack_control_plane = true
 tenant_repo = "david/algedonic-llc"
 tenant_ref = "main"
 sim = false
@@ -197,6 +200,9 @@ guest = false
 
 [playground]
 namespace = "boss-playground"
+# No control-plane fallback if this worker or its storage is unavailable.
+stack_node = "w-1"
+stack_control_plane = false
 tenant_dir = "examples/brewery"
 sim = true
 hostname = "playground.algedonic.dev"

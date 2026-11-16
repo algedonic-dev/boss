@@ -151,6 +151,14 @@ fn a_row_with_every_key_stated() -> WorkflowSpec {
         sign_offs_required: vec!["platform-admin".into()],
         assurance_required: Some(Assurance::Presence),
         duration_hours: Some(3.0),
+        resources: Some(boss_jobs::resources::ResourceBill {
+            model: Some("fable".into()),
+            vcpu: Some(8.into()),
+            ram_gb: Some(32.into()),
+            disk_gb: Some(70.into()),
+            host: None,
+            workerless_profiles: vec!["analyst".into()],
+        }),
         labor_hours: Some(1.0),
         wall_clock_hours: Some(2.0),
         fields: vec![field],
@@ -364,6 +372,39 @@ fn every_key_a_row_can_carry_is_compared_or_excluded_by_name() {
         wrong.is_empty(),
         "{COMPARE} neither compares nor excludes by name:\n{}",
         wrong.join("\n")
+    );
+}
+
+#[test]
+fn resource_integer_authoring_compares_to_exact_string_wire_without_a_float_path() {
+    let root = scratch_dir("workflow-resource-exact-wire");
+    let row = serde_json::to_value(a_row_with_every_key_stated()).unwrap();
+    let live = root.join("live.json");
+    write_file(&live, &row.to_string());
+    let authored = as_kind_file(&row);
+    assert!(authored.contains("vcpu = \"8\""));
+    let file = root.join("resources.toml");
+    write_file(&file, &authored.replace("vcpu = \"8\"", "vcpu = 8"));
+    let (rc, out) = compare(&file, &live, "every-key");
+    assert_eq!(rc, 0, "integer authoring must render to string wire: {out}");
+    let mut numeric_live = row.clone();
+    numeric_live["steps"][0]["resources"]["vcpu"] = json!(8);
+    write_file(&live, &numeric_live.to_string());
+    let (rc, out) = compare(&file, &live, "every-key");
+    assert_eq!(
+        rc, 1,
+        "old numeric API wire must remain visible as drift: {out}"
+    );
+    write_file(&live, &row.to_string());
+    write_file(&file, &authored.replace("vcpu = \"8\"", "vcpu = 0.1"));
+    let (rc, out) = compare(&file, &live, "every-key");
+    assert_eq!(
+        rc, 3,
+        "float authoring is unreadable rather than rounded/equal: {out}"
+    );
+    assert!(
+        out.contains("resources.toml") && out.contains("resources.vcpu") && out.contains("quoted"),
+        "{out}"
     );
 }
 

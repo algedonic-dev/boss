@@ -1,0 +1,43 @@
+# A landed edit of a HELD workflow bundle file files its publish-a-
+# protocol packet (design b1f319bc Q when-filed, decided by David
+# 2026-11-05; backlog 7955a488).
+#
+# The moment is the one check-publish-drift-on-boss-gcp-converge-moved
+# already reads: boss-gcp's converge moved its checkout, so a train
+# that landed is now the tree the publishing host holds. That rule asks
+# `publish-drift --check`, which publishes nothing and lists a held kind
+# whose tree is ahead as `held` — and until this rule, that listing was
+# where the obligation ended. This one files `publish-drift
+# --file-held` beside it: the verb asks every HELD kind
+# `publish-workflow.sh <kind> --check` and, for each whose tree is ahead
+# of live, files one publish-a-protocol packet carrying the kind, the
+# file, its sha256, the live version, the tree commit, the rendered
+# diff and the dry-run lint receipt — the bytes the owner's passkey
+# signs. It dedups on the exact spec (kind + sha256) over every such
+# packet ever filed, so a declined spec is never asked again, and a
+# newer edit supersedes the older open packet for the kind.
+#
+# A kind that is NOT held needs no person and gets no packet: the drift
+# publish carries it. The filing is per kind and the event is one per
+# converge, which is why the fan-out is the verb's and not a rule's:
+# jobs.spawn files one packet, and no event carries which bundle file a
+# train changed. Pinned by
+# crates/core/boss-dispatcher/tests/publish_a_protocol_rules.rs.
+[[rule]]
+name = "file-protocol-publishes-on-boss-gcp-converge-moved"
+why = """
+A CROSS-PROTOCOL REACTOR spanning maintenance-boss-gcp-converge ->
+ops-request -> a verb on the boss-gcp host, which no single Workflow
+`on` consequence can express: the converge's protocol cannot name a
+host verb, and the request's cannot know which converge asked. It is
+the filing half of design b1f319bc: a held kind's landed edit is an
+obligation on its owner, and on 2026-11-05 three such publishes lived
+only in a handoff note because nothing filed them. It widens no
+authority — the verb it files writes packets that ask a passkey, and
+publishes nothing; the publish runs only after the owner signs.
+"""
+on_event = "step.done.task"
+when = 'workflow_kind = "maintenance-boss-gcp-converge" AND spec_slug = "run" AND metadata.result = "ok" AND metadata.converge_from != metadata.converge_sha'
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"ops-request\"", subject_kind = "\"custom\"", subject = "\"boss-gcp\"", title = "\"publish-drift --file-held on boss-gcp — its checkout moved\"", "metadata.host" = "\"boss-gcp\"", "metadata.verb" = "\"publish-drift\"", "metadata.args" = "[\"--file-held\"]", "metadata.for_converge" = "job_id" }

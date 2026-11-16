@@ -129,14 +129,14 @@ mod tests {
         DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::days(20_000)
     }
 
-    fn spec(name: &str, version: i32, gate_max_concurrent: i32) -> DeliveryPolicySpec {
+    fn spec(name: &str, version: i32, stall_hours: i32) -> DeliveryPolicySpec {
         DeliveryPolicySpec {
             status: WorkflowStatus::Active,
             row: DeliveryPolicyRow {
                 name: name.into(),
                 version,
                 max_red_trains: 2,
-                stall_hours: 6,
+                stall_hours,
                 consist_budget_secs: 60,
                 consist_output_budget: 1200,
                 consist_files_named: 6,
@@ -144,7 +144,6 @@ mod tests {
                 blip_cause_budget: 80,
                 ci_host_floor_gb: 40,
                 gate_queue_owner: crate::delivery::legacy_gate_queue_owner(),
-                gate_max_concurrent,
                 channels: serde_json::Value::Null,
             },
             created_at: now(),
@@ -179,7 +178,7 @@ mod tests {
             .await
             .expect("active")
             .expect("served");
-        assert_eq!((served.version, served.gate_max_concurrent), (2, 3));
+        assert_eq!((served.version, served.stall_hours), (2, 3));
         assert!(
             report
                 .to_string()
@@ -213,7 +212,7 @@ mod tests {
         let DeliveryPolicySeedError::Refused { rows: refusals, .. } = err else {
             panic!("expected a refusal");
         };
-        assert_eq!(refusals[0].fields, vec!["gate_max_concurrent"]);
+        assert_eq!(refusals[0].fields, vec!["stall_hours"]);
         assert!(
             text.contains("infra/platform/delivery-policy/<name>.toml"),
             "the refusal names the file to bump: {text}"
@@ -224,7 +223,7 @@ mod tests {
                 .await
                 .expect("active")
                 .expect("served")
-                .gate_max_concurrent,
+                .stall_hours,
             3,
             "a refused seed writes nothing"
         );

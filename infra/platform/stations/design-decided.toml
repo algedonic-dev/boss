@@ -26,14 +26,27 @@
 #
 # Declared here only — no migration ever seeded it (migrations declare
 # schema only since 2026-09-18). To change this station, bump `version`.
+#
+# Version 3 (item 0a78f8f8, factory taxonomy M2, 2026-11-03): kind
+# batch -> group, bumped from the LIVE newest (v2). The batch kind is
+# deleted; the readers of this board are a set of actors, so the row is
+# a generic station. Nothing else changed.
+#
+# Version 4 (T2 of design 4b27a65a, backlog 3f58c823; bumped from the
+# LIVE newest, v3): the station stands in the tree — its stable `id`, its
+# `parent` /algedonic/executive (proposal section 6), its mode. Nothing
+# else changed.
 # ---------------------------------------------------------------------------
 
 [[station]]
 name = "design-decided"
-version = 1
+version = 5
+id = "ebbae18b-5bee-468e-8be7-53aa54a91e87"
+parent = "5f922a2a-31f5-4f07-acf1-41dc140687a4"
+mode = "standing"
 status = "active"
 title = "Decided designs — folding and settled"
-kind = "batch"
+kind = "group"
 discipline = ["recency"]
 terminal_window_days = 7
 

@@ -293,8 +293,8 @@ export const EXEC_LINKS: Readonly<{
   jobs: CardLink;
   waiting: CardLink;
 }> = {
-  revenue: { to: '/ux/finance?tab=income-statement', label: 'Open income statement →' },
-  balance: { to: '/ux/finance?tab=balance-sheet', label: 'Open balance sheet →' },
+  revenue: { to: '/finance?tab=income-statement', label: 'Open income statement →' },
+  balance: { to: '/finance?tab=balance-sheet', label: 'Open balance sheet →' },
   jobs: { to: '/ux/jobs', label: 'View all jobs →' },
   waiting: { to: '/ux/me', label: 'Open My Day →' },
 };

@@ -43,8 +43,7 @@ async function mocks(page: Page) {
   await page.route(/\/api\/jobs\/live$/, (r) => json(r, { counts: {}, open_total: 0, recent: [], sim_clock: {} }));
   await page.route(/\/api\/jobs\/assignments/, (r) => json(r, { mine: [], group: [], data: [] }));
   await page.route(/\/api\/stations\/my-watchlist\/queue/, (r) => json(r, {
-    station: 'my-watchlist', kind: 'actor', discipline: ['recency'], over_limit: false,
-    terminal_window_days: 14, total: DATA.length, data: DATA, steps: STEPS,
+    station: 'my-watchlist', kind: 'actor', discipline: ['recency'], terminal_window_days: 14, total: DATA.length, data: DATA, steps: STEPS,
     lens: { title: 'My watchlist', subtitle: 'What you sent, and where it got to', with_steps: true },
   }));
 }
@@ -79,8 +78,7 @@ test('an envelope without steps falls back to the list rather than blanking', as
   await mocks(page);
   // A deployment whose registry predates 139: no `steps` key at all.
   await page.route(/\/api\/stations\/my-watchlist\/queue/, (r) => json(r, {
-    station: 'my-watchlist', kind: 'actor', discipline: ['recency'], over_limit: false,
-    terminal_window_days: 14, total: DATA.length, data: DATA,
+    station: 'my-watchlist', kind: 'actor', discipline: ['recency'], terminal_window_days: 14, total: DATA.length, data: DATA,
   }));
   await page.goto('/');
 

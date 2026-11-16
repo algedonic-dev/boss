@@ -680,7 +680,7 @@ finish() {
 call() {
     local rc=0
     : >"$WORK/out"
-    CODE="$("$CURL" -sS -m 20 -o "$WORK/out" -w '%{http_code}' -H "@$AUTH" -X "$1" "$2" 2>"$WORK/err")" || rc=$?
+    CODE="$("$CURL" -q -sS -m 20 -o "$WORK/out" -w '%{http_code}' -H "@$AUTH" -X "$1" "$2" 2>"$WORK/err")" || rc=$?
     if [ "$rc" -ne 0 ]; then
         CURL_WORDS="curl exit $rc: $(tr '\n' ' ' <"$WORK/err")"
         return 1

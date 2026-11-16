@@ -5,3 +5,5 @@
 id = "automation:cluster-deploy-runner"
 role = "platform-admin"
 description = 'The forge cluster converge: deploys a merged build and records the converge (infra/forge/cluster-deploy-lib.sh).'
+# Host station: deploy (backlog 6ecb5480, station-tree.md section 6).
+station = "57b72e1f-490e-443a-9a9f-870a9977c9fb"

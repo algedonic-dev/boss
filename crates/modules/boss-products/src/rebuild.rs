@@ -38,6 +38,7 @@ pub struct RebuildReport {
     pub events_skipped: u64,
     pub products_upserted: u64,
     pub inventory_rows_upserted: u64,
+    pub sku_versions_appended: u64,
 }
 
 /// Drop every row in `products` + `finished_product_inventory` and
@@ -52,12 +53,30 @@ pub async fn rebuild_products(pool: &PgPool) -> Result<RebuildReport, RebuildErr
         pool,
         REBUILD_LOCK_KEY,
         &[
+            "DELETE FROM product_sku_versions",
             "DELETE FROM finished_product_inventory",
             "DELETE FROM products",
         ],
         "kind LIKE 'products.%'",
         async |conn, ev| {
             match ev.kind.as_str() {
+                crate::events::SKU_VERSION_APPENDED => {
+                    let row: crate::sku::SkuVersion = serde_json::from_value(ev.payload["data"].clone())
+                        .map_err(|e| format!("invalid SKU event {}: {e}", ev.audit_id))?;
+                    if ev.payload["sku"].as_str() != Some(row.sku.as_str())
+                        || ev.payload["version"].as_i64() != Some(row.version)
+                    {
+                        return Err(format!("SKU event {} identity disagrees with its row", ev.audit_id));
+                    }
+                    if ev.payload["name"].as_str() != Some(row.name.as_str()) {
+                        return Err(format!("SKU event {} label disagrees with its row", ev.audit_id));
+                    }
+                    crate::sku::validate(&row).map_err(|e| e.to_string())?;
+                    restore_sku_version(&mut *conn, &row, ev.ts).await
+                        .map_err(|e| e.to_string())?;
+                    report.sku_versions_appended += 1;
+                    Ok(Applied::Yes)
+                }
                 "products.product.upserted" => {
                     let product: Product = match serde_json::from_value(ev.payload.clone()) {
                         Ok(p) => p,
@@ -102,6 +121,53 @@ pub async fn rebuild_products(pool: &PgPool) -> Result<RebuildReport, RebuildErr
     report.events_processed = stats.processed;
     report.events_skipped = stats.skipped;
     Ok(report)
+}
+
+async fn restore_sku_version(
+    conn: &mut sqlx::PgConnection,
+    row: &crate::sku::SkuVersion,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Result<(), RebuildError> {
+    let payload = serde_json::to_value(row).map_err(|e| RebuildError::Storage(e.to_string()))?;
+    // Never turn two conflicting facts into last-write-wins history.
+    // An identical duplicate is harmless; a missing predecessor is not.
+    let old = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT data FROM product_sku_versions WHERE sku = $1 AND version = $2",
+    )
+    .bind(&row.sku)
+    .bind(row.version)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| RebuildError::Storage(e.to_string()))?;
+    if let Some(old) = old {
+        return if old == payload {
+            Ok(())
+        } else {
+            Err(RebuildError::Storage(format!(
+                "conflicting SKU fact for {} version {}",
+                row.sku, row.version
+            )))
+        };
+    }
+    let inserted = sqlx::query(
+        "INSERT INTO product_sku_versions (sku, version, data, created_at) \
+         SELECT $1, $2, $3, $4 WHERE $2::BIGINT::NUMERIC = \
+         (SELECT COALESCE(MAX(version), 0)::NUMERIC + 1 FROM product_sku_versions WHERE sku = $1)",
+    )
+    .bind(&row.sku)
+    .bind(row.version)
+    .bind(payload)
+    .bind(timestamp)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| RebuildError::Storage(e.to_string()))?;
+    if inserted.rows_affected() != 1 {
+        return Err(RebuildError::Storage(format!(
+            "SKU history gap for {} version {}",
+            row.sku, row.version
+        )));
+    }
+    Ok(())
 }
 
 async fn upsert_product(

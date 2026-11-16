@@ -28,7 +28,7 @@
 //! refused when the row declares neither; a fold on a doc whose review
 //! is not done is refused naming the anchors still open. The one key
 //! no row declares is `hold`: it is a MARKER, read by
-//! `boss_jobs::stranded::hold_reason` on the car's review step, and
+//! `boss_jobs::stranded::marked` on the car's review step, and
 //! written here in exactly that shape — a non-blank string to hold,
 //! the key removed to release.
 //!
@@ -175,7 +175,9 @@ pub enum Cmd {
     /// red trains instead: the diagnosis must name, by full id, the
     /// gate-run of a failed train the car rode (RED gate, or checked
     /// GREEN gate with completed failing Forge CI); `red_trains` is cleared and the look
-    /// is appended to the car's `strike_releases` (backlog c96aac11).
+    /// is appended to the car's `strike_releases` (backlog c96aac11). A
+    /// one-car train that carried the car's own gate-run by reuse is named
+    /// beside that gate-run (backlog cb2268d3).
     Release {
         /// The car: its branch, or 8+ characters of its id.
         car: String,
@@ -332,6 +334,64 @@ pub enum StepAction {
         #[arg(long)]
         why: String,
     },
+    /// Hand READY steps named to one agent back to their station's queue, unassigned.
+    ///
+    /// A NOMINATION IS NOT A CLAIM. Until backlog e1eaf72b (train #1713,
+    /// 2026-11-12) the dispatcher's matchmaker named every ready agent
+    /// step to one executor, and ~1078 ready backlog-item steps still
+    /// stand at a name. David, 2026-11-11: "Work is supposed to sit at
+    /// the admission queue of a station now, not at a name." `boss step
+    /// release` hands back a step somebody HOLDS and refuses a ready one,
+    /// so this is the door for a name nobody claimed (backlog b42b4a8c).
+    /// Which executor takes the step next is the station's — resolved
+    /// from the tree at the claim door (design 305cf4ce) — not this verb's.
+    ///
+    /// The cohort is the READY steps named to `--holder` (any spelling the
+    /// agents registry ties to it) on the open packets of `--kind`, or on
+    /// one `--packet`, narrowed by `--step`. A step is REFUSED when it is
+    /// claimed (`boss step release` is its door) or names a run still
+    /// open (an executor dispatched to it and not yet arrived). Each
+    /// unnamed step records `released` {why, by, at, from, from_run}
+    /// through the merge door, loses its name through an assignee-only
+    /// PUT, and is read back. After the pass the cohort is read once
+    /// more, and a step named again fails the verb: that is a dispatcher
+    /// still nominating, which e1eaf72b retired.
+    ///
+    /// THE OPERATOR IS THE GUARD, as for `release`: run --dry-run first.
+    Unname(UnnameArgs),
+}
+
+/// `boss step unname`'s cohort and reason (backlog b42b4a8c).
+#[derive(clap::Args, Debug, Clone)]
+pub struct UnnameArgs {
+    /// The packet kind whose open packets are read (`backlog-item`,
+    /// `ship-a-change`, ...). Required unless `--packet` names one.
+    #[arg(long, required_unless_present = "packet")]
+    pub kind: Option<String>,
+    /// Only steps with this slug (`build`, `triage`).
+    #[arg(long)]
+    pub step: Option<String>,
+    /// The agent the steps are named to — an id or any alias the agents
+    /// registry holds. Required: a pass never takes every holder, and a
+    /// person (no agents-registry row) is refused, because a person's
+    /// nomination is a person's to hand back.
+    #[arg(long)]
+    pub holder: String,
+    /// One packet: 8+ characters of its id, or the full uuid.
+    #[arg(long)]
+    pub packet: Option<String>,
+    /// Why the names are taken off. Recorded verbatim under `released`
+    /// on every step. SINGLE-quote it: inside double quotes a backticked
+    /// word is run by the shell and lands as a hole (backlog 2376b89e).
+    #[arg(long)]
+    pub why: String,
+    /// Print the cohort by (kind, step, holder) and how each step would
+    /// be judged; write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Take at most this many cohort steps in this pass.
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 pub async fn dispatch(cmd: Cmd) -> Result<()> {
@@ -463,7 +523,8 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
                 None,
                 Some(path.as_path()),
             )?;
-            crate::strike_release::release_struck(&wire, &car, &diagnosis).await
+            crate::strike_release::release_struck(&wire, &car, &diagnosis, &Releaser::from_env())
+                .await
         }
         Cmd::Step { action } => match action {
             StepAction::Complete {
@@ -483,6 +544,17 @@ pub async fn dispatch(cmd: Cmd) -> Result<()> {
             } => nominate_step(&wire, &packet, &step, &assignee, &why).await,
             StepAction::Release { packet, step, why } => {
                 release_step(&wire, &packet, &step, &why).await
+            }
+            StepAction::Unname(args) => {
+                let done = unname_steps(&wire, &args).await?;
+                print_unnamed(&args, &done);
+                if !done.failed.is_empty() {
+                    bail!(
+                        "{} step(s) did not read back unnamed — the pass stopped",
+                        done.failed.len()
+                    );
+                }
+                Ok(())
             }
         },
     }
@@ -895,7 +967,7 @@ pub(crate) fn holdable(car: &Value) -> Result<&Value, String> {
 }
 
 /// The merge-door body that puts the hold on — the marker in the one
-/// shape `stranded::hold_reason` reads (a non-blank string), over the
+/// shape `stranded::marked` reads (a non-blank string), over the
 /// review step whose metadata is `review_md`. The `hold` key, plus a
 /// `hold_sha` deleted when a release already lifted the hold it names,
 /// so this hold does not read as judged at that head (backlog 6c463c66,
@@ -906,7 +978,7 @@ pub(crate) fn hold_patch(review_md: &Value, reason: &str) -> Value {
 }
 
 /// The merge-door body that takes the hold OFF — the key DELETED (an
-/// explicit null deletes at the merge door), not falsed. `hold_reason`
+/// explicit null deletes at the merge door), not falsed. `marked`
 /// reads `false`/`""` as released too, but a released car that still
 /// carries the key reads as "held then released" to every eye that is
 /// not that function.
@@ -957,6 +1029,56 @@ pub(crate) struct Wire {
 }
 
 impl Wire {
+    /// A post-collection hold cannot change a train's assembled consist.
+    /// Read the original open trains, not a car's possibly stale train hint.
+    /// An unread or incomplete census is not permission to claim protection.
+    pub(crate) async fn refuse_collected_car(&self, car: &Value, action: &str) -> Result<()> {
+        let car_id = car
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .context("the car has no id")?;
+        let trains = crate::train::list_original_attempts(|offset| async move {
+            self.call(
+                reqwest::Method::GET,
+                &format!("/api/jobs?kind=pr-train&status=open&full=true&limit=100&offset={offset}"),
+                None,
+            )
+            .await
+        })
+        .await?;
+        for train in trains {
+            if train.get("kind").and_then(Value::as_str) != Some("pr-train") {
+                bail!("the open-train census returned a different packet kind");
+            }
+            match train.get("status").and_then(Value::as_str) {
+                Some("open") => {}
+                Some("closed" | "cancelled") => continue,
+                _ => bail!("the open-train census returned an unreadable status"),
+            }
+            let Some(boarded) = train.pointer("/metadata/boarded_jobs") else {
+                continue;
+            };
+            let boarded = boarded
+                .as_array()
+                .context("an open train has unreadable boarded_jobs")?;
+            if boarded.iter().any(|id| !id.is_string()) {
+                bail!("an open train has unreadable boarded car identities");
+            }
+            if boarded.iter().any(|id| id.as_str() == Some(car_id)) {
+                let train_id = train
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .context("the collecting train has no id")?;
+                bail!(
+                    "{action} refused: car {car_id} is already collected by open train {train_id}; \
+                    its assembled consist cannot be held or claimed for pre-boarding review here"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// The live one: the system of record `BOSS_JOBS_URL` names and the
     /// actor `BOSS_ACTOR` (or the actor file) names.
     pub(crate) fn live() -> Result<Self> {
@@ -985,6 +1107,31 @@ impl Wire {
         let signature = identity::signature_for(&method, path, self.caller.clone());
         crate::sor_client::api_at_signed(&self.http, &self.base, method, path, payload, signature)
             .await
+    }
+
+    /// [`Self::call`] carrying the keys this write judged, which the
+    /// step merge door lands only on a row that still reads so (backlog
+    /// cd1f68c6). Reached through
+    /// [`crate::car_retire::patch_step_metadata_expecting`].
+    pub(crate) async fn call_expecting(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        payload: Option<Value>,
+        expect: &serde_json::Map<String, Value>,
+    ) -> Result<Option<Value>> {
+        let signature = identity::signature_for(&method, path, self.caller.clone());
+        let judged = crate::sor_client::expectation_value(expect)?;
+        crate::sor_client::api_at_signed_with(
+            &self.http,
+            &self.base,
+            method,
+            path,
+            payload,
+            signature,
+            &[(boss_jobs::step_metadata_write::EXPECT_HEADER, judged)],
+        )
+        .await
     }
 
     /// Read an original record without turning an outage or policy refusal
@@ -1070,7 +1217,7 @@ impl Wire {
     /// id. Open only: every step these verbs write to is open, and the
     /// `--of` original a duplicate names is almost always open too — a
     /// closed one takes its full uuid, which the refusal says.
-    async fn resolve(&self, given: &str, kind: Option<&str>) -> Result<Value> {
+    pub(crate) async fn resolve(&self, given: &str, kind: Option<&str>) -> Result<Value> {
         let id = if crate::job::looks_like_uuid(given) {
             given.to_string()
         } else {
@@ -1168,17 +1315,23 @@ impl Wire {
     /// — each verb judges the row's contract BEFORE the first write
     /// ([`contract_check`]), so the refusal it can see is not sent.
     /// An empty `writes` sends no merge at all.
+    ///
+    /// `step` is the step as the verb read it: a step holding a resource
+    /// claim exits only on a status PUT naming that claim (backlog
+    /// 7b5195ea, [`boss_jobs::flow_resources::exiting`]).
     async fn complete_step(
         &self,
         job_id: &str,
-        step_id: &str,
+        step: &Value,
         writes: &Map<String, Value>,
     ) -> Result<()> {
+        let step_id = step_id(step)?;
         if !writes.is_empty() {
             self.patch_step_metadata(job_id, step_id, Value::Object(writes.clone()))
                 .await?;
         }
-        self.put_step(job_id, step_id, completed_status()).await
+        let body = boss_jobs::flow_resources::exiting(step, completed_status());
+        self.put_step(job_id, step_id, body).await
     }
 }
 
@@ -1357,7 +1510,7 @@ pub(crate) async fn triage_with(
             .await
             .context("writing the trust-boundary mark onto the packet")?;
     }
-    wire.complete_step(jid, sid, &writes).await?;
+    wire.complete_step(jid, step, &writes).await?;
 
     let after = wire.packet(jid).await?;
     confirm_completed(step_after(&after, sid)?, &writes)?;
@@ -1468,7 +1621,7 @@ pub(crate) async fn fold(
         fold_writes(step, change, folded_into).map_err(|e| anyhow!("{}: {e}", short(&packet)))?;
     let jid = crate::envelope::job_id(&packet).context("the packet has no id")?;
     let sid = step_id(step)?;
-    wire.complete_step(jid, sid, &writes).await?;
+    wire.complete_step(jid, step, &writes).await?;
 
     let after = wire.packet(jid).await?;
     confirm_completed(step_after(&after, sid)?, &writes)?;
@@ -1484,7 +1637,7 @@ pub(crate) async fn fold(
 /// `Some(reason)` holds, `None` releases — one path, because both are
 /// the same one-key write to the review step's merge door (the key set,
 /// or nulled to delete it), and the read-back checks the key the same
-/// way the readers do (`stranded::hold_reason`). The verb goes through
+/// way the readers do (`stranded::marked`). The verb goes through
 /// [`hold_reserved`] since `--releaser` (backlog 0cfc57e6), so this
 /// shorthand is the tests' alone.
 #[cfg(test)]
@@ -1498,8 +1651,8 @@ pub(crate) async fn hold(wire: &Wire, car: &str, reason: Option<&str>) -> Result
 /// backlog b7b02024 car 3), and a bare release records what it lifted,
 /// who signed it, the run if one is exported, and whether the shell was
 /// an agent's, under
-/// `review_verdict::BARE_RELEASE` (review 5aa91689 N2). A hold is never
-/// refused — putting a brake on is open to anyone.
+/// `review_verdict::BARE_RELEASE` (review 5aa91689 N2). Placing a hold
+/// is open; transferring an existing reservation is its owner's act.
 pub(crate) async fn hold_as(
     wire: &Wire,
     car: &str,
@@ -1520,6 +1673,135 @@ pub(crate) async fn hold_reserved(
     reserved_for: Option<&str>,
 ) -> Result<()> {
     hold_inner(wire, car, Some(reason), reserved_for, &Releaser::default()).await
+}
+
+/// May the wire's caller, in the shell `releaser` describes, lift
+/// `packet`'s hold with no review? The bare release's refusals, in its
+/// order: a pinned FORMAL executor requirement, the car's own builder
+/// run (`review_verdict::may_release`), and a release reserved for
+/// someone else (`car_release::may_release_as`). `Ok` is the actor the
+/// release is signed as. ONE DOOR FOR EVERY BARE LIFT: `boss release`
+/// asks it, and so does the strike release before it lifts the red-train
+/// hold its strike placed (backlog 79129752), so the two cannot disagree
+/// about who may take a hold off.
+pub(crate) async fn may_lift_bare<'w>(
+    wire: &'w Wire,
+    packet: &Value,
+    releaser: &Releaser,
+) -> Result<&'w str> {
+    if crate::review_verdict::pinned_executor_requirement(wire, packet).await?
+        == boss_jobs::executor_attestation::ExecutorProvenanceRequirement::Verified
+    {
+        bail!(
+            "boss release: the pinned FORMAL executor requirement needs an authenticated reviewer receipt; a bare release cannot erase it"
+        );
+    }
+    crate::review_verdict::may_release(packet, releaser.run()).map_err(|why| anyhow!("{why}"))?;
+    let by = wire
+        .caller_id()
+        .context("an unnamed release is refused before it is sent")?;
+    boss_jobs::car_release::may_release_as(wire, packet, by)
+        .await
+        .map_err(|why| anyhow!("{why}"))?;
+    Ok(by)
+}
+
+/// After a strike release cleared `car`'s strikes (`car` is the read-back
+/// of that write), lift the red-train hold its strike placed on the
+/// review step, through that step's merge door, and say in one line what
+/// became of the step's hold (backlog 79129752). The decision is
+/// `boss_jobs::car::hold_lifted_by_strike_release`'s, the authority
+/// [`may_lift_bare`]'s; a hold either keeps stays where it is, and the
+/// line says why, because "it boards at the next tick" over a live hold
+/// is the silence car 775feba5 sat in. The lift records what it lifted
+/// under `review_verdict::BARE_RELEASE`, marked as the strike release's.
+pub(crate) async fn lift_struck_hold(
+    wire: &Wire,
+    car: &Value,
+    cleared_trains: &[String],
+    releaser: &Releaser,
+) -> Result<String> {
+    let boards = "it boards at the next tick";
+    let Ok(review) = holdable(car) else {
+        return Ok(boards.into());
+    };
+    let review_md = review.get("metadata").unwrap_or(&Value::Null);
+    let Some(held) = boss_jobs::stranded::marked(review_md, "hold") else {
+        return Ok(boards.into());
+    };
+    let remaining = crate::strike_release::red_trains(car);
+    let Some(mut body) =
+        boss_jobs::car::hold_lifted_by_strike_release(review_md, cleared_trains, remaining)
+    else {
+        return Ok(format!(
+            "its review step still holds it, and that hold is not this look's to lift: {held}"
+        ));
+    };
+    let by = match may_lift_bare(wire, car, releaser).await {
+        Ok(by) => by,
+        Err(why) => {
+            return Ok(format!(
+                "its review step's red-train hold stays, as a bare release would leave it: {why}"
+            ));
+        }
+    };
+    let jid = crate::envelope::job_id(car).context("the car has no id")?;
+    let sid = step_id(review)?;
+    // THE HOLD AS JUDGED, READ AGAIN AFTER THE AUTHORITY AWAIT (review
+    // 5d605949 R1). The decider judged `car`; `may_lift_bare` then went
+    // to the network, and a hold, a head or a reservation written in
+    // that await is not the hold judged. Measured in review: a head-bound
+    // review hold installed there was erased and its `hold_sha` left
+    // beside no hold. The wire merge door takes no precondition (the
+    // adapter's compare-under-lock is internal to the review release
+    // door), so the lift is sent only while the raw keys every
+    // hold-clearing write is fenced on still read as judged, and the
+    // decider still answers the lift on the fresh read. This NARROWS the
+    // window to one round trip before the server's own read of the row;
+    // a wire precondition is what would close it.
+    let fresh = wire.packet(jid).await?;
+    let standing = step_after(&fresh, sid)?
+        .get("metadata")
+        .unwrap_or(&Value::Null);
+    if boss_jobs::car_release::release_write_expectation(&fresh)
+        != boss_jobs::car_release::release_write_expectation(car)
+        || boss_jobs::car::hold_lifted_by_strike_release(
+            standing,
+            cleared_trains,
+            crate::strike_release::red_trains(&fresh),
+        )
+        .is_none()
+    {
+        let now = boss_jobs::stranded::marked(standing, "hold");
+        let at = standing
+            .get(boss_jobs::car::HOLD_SHA)
+            .and_then(Value::as_str)
+            .map(|sha| format!(" at {sha}"))
+            .unwrap_or_default();
+        return Ok(format!(
+            "its review step's hold changed while this look judged it, so the lift is refused and \
+             the step keeps what it reads now: {}{at} (the hold judged was: {held})",
+            now.as_deref().unwrap_or("no hold")
+        ));
+    }
+    let at = crate::sor_client::stamp(boss_clock_client::wall_now());
+    let mut record = crate::review_verdict::bare_release_record(&held, by, &at, releaser);
+    record["strike_release"] = json!(true);
+    body[crate::review_verdict::BARE_RELEASE] = record;
+    wire.patch_step_metadata(jid, sid, body).await?;
+    let after = wire.packet(jid).await?;
+    let now = step_after(&after, sid)?
+        .get("metadata")
+        .unwrap_or(&Value::Null);
+    if let Some(still) = boss_jobs::stranded::marked(now, "hold") {
+        bail!(
+            "the strikes are cleared, and the API answered the hold's lift, but the review step \
+             still reads as held: {still:?}"
+        );
+    }
+    Ok(format!(
+        "the red-train hold its strike placed is lifted with it (was: {held}); {boards}"
+    ))
 }
 
 async fn hold_inner(
@@ -1546,17 +1828,32 @@ async fn hold_inner(
         );
     }
     let packet = wire.car(car).await?;
+    if reason.is_some() {
+        wire.refuse_collected_car(&packet, "boss hold").await?;
+    }
     let review = holdable(&packet).map_err(|e| anyhow!("{e}"))?;
     let branch = packet
         .pointer("/metadata/branch")
         .and_then(Value::as_str)
         .unwrap_or("?");
     let review_md = review.get("metadata").unwrap_or(&Value::Null);
-    let already = boss_jobs::stranded::hold_reason(review_md);
+    let already = boss_jobs::stranded::marked(review_md, "hold");
     let patch = match reason {
         Some(r) => {
             let mut body = hold_patch(review_md, r);
             if let Some(who) = reserved_for {
+                if already.is_some()
+                    && review_md
+                        .get(boss_jobs::car::RELEASER)
+                        .is_some_and(|current| current != &json!(who.trim()))
+                {
+                    let by = wire
+                        .caller_id()
+                        .context("an unnamed reservation transfer is refused before it is sent")?;
+                    boss_jobs::car_release::may_release_as(wire, &packet, by)
+                        .await
+                        .map_err(|why| anyhow!("{why}"))?;
+                }
                 body[boss_jobs::car::RELEASER] = json!(who.trim());
             }
             body
@@ -1587,18 +1884,7 @@ async fn hold_inner(
                 );
                 return Ok(());
             }
-            if crate::review_verdict::pinned_executor_requirement(wire, &packet).await?
-                == boss_jobs::executor_attestation::ExecutorProvenanceRequirement::Verified
-            {
-                bail!(
-                    "boss release: the pinned FORMAL executor requirement needs an authenticated reviewer receipt; a bare release cannot erase it"
-                );
-            }
-            crate::review_verdict::may_release(&packet, releaser.run())
-                .map_err(|why| anyhow!("{why}"))?;
-            let by = wire
-                .caller_id()
-                .context("an unnamed release is refused before it is sent")?;
+            let by = may_lift_bare(wire, &packet, releaser).await?;
             let at = crate::sor_client::stamp(boss_clock_client::wall_now());
             let mut body = release_patch_body();
             body[crate::review_verdict::BARE_RELEASE] = crate::review_verdict::bare_release_record(
@@ -1615,10 +1901,11 @@ async fn hold_inner(
     wire.patch_step_metadata(jid, sid, patch).await?;
 
     let after = wire.packet(jid).await?;
-    let now = boss_jobs::stranded::hold_reason(
+    let now = boss_jobs::stranded::marked(
         step_after(&after, sid)?
             .get("metadata")
             .unwrap_or(&Value::Null),
+        "hold",
     );
     if let Some(who) = reserved_for.map(str::trim) {
         let read = boss_jobs::car_release::reserved_for(&after);
@@ -1628,6 +1915,13 @@ async fn hold_inner(
                  not {who:?} — the reservation did not take"
             );
         }
+    }
+    if reason.is_some() {
+        wire.refuse_collected_car(&after, "boss hold")
+            .await
+            .context(
+            "the hold was written; cannot confirm dock protection from the post-write train census",
+            )?;
     }
     match (reason, now) {
         (Some(r), Some(held)) if held == r.trim() => println!(
@@ -2072,7 +2366,7 @@ pub(crate) async fn complete(
         .map_err(|e| anyhow!("{} `{slug}`: {e}", short(&packet)))?;
     let jid = crate::envelope::job_id(&packet).context("the packet has no id")?;
     let sid = step_id(step)?;
-    wire.complete_step(jid, sid, &writes).await?;
+    wire.complete_step(jid, step, &writes).await?;
 
     let after = wire.packet(jid).await?;
     confirm_completed(step_after(&after, sid)?, &writes)?;
@@ -2118,7 +2412,9 @@ pub(crate) async fn complete(
 /// Where a hand-release's evidence lands on the freed step —
 /// deliberately not the clock rule's `reclaimed` (see the section
 /// header): a reader must be able to tell which one freed the step.
-pub(crate) const RELEASED_KEY: &str = "released";
+/// Core's constant since backlog ff0f0ff5, because the dispatcher now
+/// reads it too (`boss_jobs::step_release`): one spelling, two readers.
+pub(crate) const RELEASED_KEY: &str = boss_jobs::step_release::KEY;
 
 /// The status a claim moves a step from, and the one it moves back to
 /// — the pair `claim_step`'s CAS uses, so a release is a restoration
@@ -2170,6 +2466,11 @@ pub(crate) fn release_patch(step: &Value, why: &str, by: Option<&str>, at: &str)
         .pointer(&format!("/metadata/{}", boss_jobs::agent_runs::EDGE_KEY))
         .cloned()
         .unwrap_or(Value::Null);
+    // The holder it is taken FROM, which the dispatcher's capability
+    // pick leaves out while another agent serves the step's pair — else
+    // its hash of the step id re-nominates the step straight back to
+    // that holder (backlog ff0f0ff5).
+    let from = step.get("assignee_id").cloned().unwrap_or(Value::Null);
     let mut body = Map::new();
     body.insert(boss_jobs::agent_runs::EDGE_KEY.to_string(), Value::Null);
     body.insert(
@@ -2178,7 +2479,8 @@ pub(crate) fn release_patch(step: &Value, why: &str, by: Option<&str>, at: &str)
             "why": why.trim(),
             "by": by.map(|b| json!(b)).unwrap_or(Value::Null),
             "at": at,
-            "from_run": from_run,
+            boss_jobs::step_release::FROM_RUN: from_run,
+            boss_jobs::step_release::FROM: from,
         }),
     );
     Value::Object(body)
@@ -2260,7 +2562,15 @@ pub(crate) async fn release_step(
         &boss_clock_client::wall_now().to_rfc3339(),
     );
     wire.patch_step_metadata(jid, sid, patch).await?;
-    wire.put_step(jid, sid, release_status()).await?;
+    // A claimed step is freed only by a PUT naming its claim (backlog
+    // 7b5195ea); the clear above writes no claim key, so the id read
+    // with the step is still the one it holds.
+    wire.put_step(
+        jid,
+        sid,
+        boss_jobs::flow_resources::exiting(step, release_status()),
+    )
+    .await?;
 
     let after = wire.packet(jid).await?;
     confirm_released(step_after(&after, sid)?, why).map_err(|e| anyhow!("{e}"))?;
@@ -2273,6 +2583,379 @@ pub(crate) async fn release_step(
         standing(&after)
     );
     Ok(())
+}
+
+// ----------------------------------------------------------------------
+// `boss step unname` — a READY nomination handed back to its station
+// (backlog b42b4a8c).
+//
+// THE NAMES OUTLIVED THEIR WRITER. The matchmaker named ~1078 ready
+// backlog-item steps (measured 2026-11-12 15:0xZ by b42b4a8c's triage)
+// and was deleted by e1eaf72b; nothing re-names them, and nothing takes
+// the names off either: `release` refuses a ready step, correctly — it
+// hands back a step somebody HOLDS. A name on a ready step is the claim
+// door's `handed_to_actor` grant (`station_claim.rs`), so it decides who
+// may take the step; this verb removes that grant and leaves the
+// station's role rule alone to decide (design 305cf4ce).
+//
+// SAME RECORD AS A RELEASE. `release_patch` and `confirm_released`
+// write and judge the step exactly as `boss step release` does — one
+// `released` object, the run edge nulled — so the dispatcher's
+// `released.from` reader and every page read one shape.
+// ----------------------------------------------------------------------
+
+/// What one `boss step unname` pass found and did. `unnamed` is what a
+/// dry run WOULD unname; `failed` is a write that did not read back,
+/// which stops the pass.
+#[derive(Debug, Default)]
+pub(crate) struct Unnamed {
+    /// Every cohort step by (packet kind, step slug, holder spelling).
+    pub(crate) cohort: std::collections::BTreeMap<(String, String, String), usize>,
+    pub(crate) unnamed: Vec<String>,
+    pub(crate) refused: Vec<String>,
+    pub(crate) skipped: Vec<String>,
+    pub(crate) failed: Vec<String>,
+    pub(crate) dry_run: bool,
+}
+
+/// One cohort step's judgement, before any write.
+#[derive(Debug, PartialEq, Eq)]
+enum UnnameVerdict {
+    Unname,
+    Refuse(String),
+    Skip(String),
+}
+
+/// Is `step` this pass's: named to one of `names`, of slug `slug` when
+/// one is given, and not terminal — a completed step keeps the name of
+/// whoever did it, and that is history, not a nomination.
+fn in_unname_cohort(step: &Value, names: &[String], slug: Option<&str>) -> bool {
+    let named = step
+        .get("assignee_id")
+        .and_then(Value::as_str)
+        .is_some_and(|who| names.iter().any(|n| n == who));
+    let slug_ok = slug.is_none_or(|s| step.get("spec_slug").and_then(Value::as_str) == Some(s));
+    named && slug_ok && !matches!(status_of(step), "completed" | "skipped")
+}
+
+/// PURE: the judgement, given the run the step names as it was read —
+/// `None` for no edge, else its id and its packet status (or why that
+/// could not be read).
+fn judge_unname(step: &Value, run: Option<(&str, Result<String, String>)>) -> UnnameVerdict {
+    match status_of(step) {
+        WAITING_STATUS => {}
+        CLAIMED_STATUS => {
+            return UnnameVerdict::Refuse(
+                "is claimed — handing back a step somebody HOLDS is `boss step release`'s, \
+                 on a reading of its run"
+                    .into(),
+            );
+        }
+        other => return UnnameVerdict::Skip(format!("is {other}, not ready")),
+    }
+    match run {
+        None => UnnameVerdict::Unname,
+        Some((_, Ok(status))) if matches!(status.as_str(), "closed" | "cancelled") => {
+            UnnameVerdict::Unname
+        }
+        Some((id, Ok(status))) => UnnameVerdict::Refuse(format!(
+            "names run {id}, which reads {status} — an executor was dispatched to it and has \
+             not claimed it yet, and only a closed run is no executor"
+        )),
+        Some((id, Err(why))) => UnnameVerdict::Refuse(format!(
+            "names run {id}, which could not be read ({why}) — an unread run is not a dead one"
+        )),
+    }
+}
+
+/// The step-metadata keys each write is judged on (the merge door and
+/// the PUT both read [`boss_jobs::step_metadata_write::EXPECT_HEADER`],
+/// cd1f68c6): the run edge and the release record as the verb last read
+/// or wrote them, and no resource claim. A dispatch that stamps a run, or
+/// a pool claim, between the read and the write moves one of them, and
+/// the write is refused as the step race instead of landing over it.
+fn unname_expectation(edge: Value, released: Value) -> Map<String, Value> {
+    let mut expect = Map::new();
+    expect.insert(boss_jobs::agent_runs::EDGE_KEY.to_string(), edge);
+    expect.insert(RELEASED_KEY.to_string(), released);
+    expect.insert(
+        boss_jobs::flow_resources::TOKEN_KEY.to_string(),
+        Value::Null,
+    );
+    expect
+}
+
+/// The name write: the ASSIGNEE only, never `release_status`'s
+/// `status: ready`. The step is already ready, so the status is no
+/// change — and a bare claim moves status and holder and no metadata
+/// (6ec22d71), so no expectation can see one landing between the read
+/// and this PUT. Sent with `status: ready` it would put that claim back
+/// to ready in silence; sent without, a raced claim reads back `active`
+/// and [`confirm_released`] names it.
+fn unname_status() -> Value {
+    json!({ "assignee_id": Value::Null })
+}
+
+/// Every spelling the agents registry ties to `holder`. A holder it does
+/// not hold is a person (or nobody), and a registry that cannot be read
+/// whole is no evidence either way — both refused before the cohort is.
+async fn holder_spellings(wire: &Wire, holder: &str) -> Result<Vec<String>> {
+    let agents = wire
+        .call(reqwest::Method::GET, "/api/agents", None)
+        .await
+        .context("reading the agents registry, which says who is an agent")?
+        .context("the agents registry read back empty")?;
+    let rows = agents
+        .get("data")
+        .and_then(Value::as_array)
+        .context("the agents registry answered no rows")?;
+    if let Some(total) = agents.get("total").and_then(Value::as_u64)
+        && total != rows.len() as u64
+    {
+        bail!(
+            "the agents registry answered {} of {total} rows — an incomplete roster cannot \
+             say who is an agent",
+            rows.len()
+        );
+    }
+    crate::factory::spellings(&agents, holder.trim()).ok_or_else(|| {
+        anyhow!(
+            "{holder:?} is not in the agents registry — a person's nomination is a person's \
+             to hand back, not this verb's"
+        )
+    })
+}
+
+/// The packets a pass reads: one `--packet`, or every open one of
+/// `--kind` (slim rows: id, kind, and each step's slug, status, holder).
+async fn unname_rows(wire: &Wire, args: &UnnameArgs) -> Result<Vec<Value>> {
+    match (&args.packet, &args.kind) {
+        (Some(p), kind) => Ok(vec![wire.resolve(p, kind.as_deref()).await?]),
+        (None, Some(kind)) => wire.open_rows(Some(kind)).await,
+        (None, None) => bail!("name a packet kind (--kind) or one packet (--packet)"),
+    }
+}
+
+/// PURE: the steps among `touched` that read back ready and NAMED again
+/// — a dispatcher still nominating, which e1eaf72b retired.
+pub(crate) fn named_again(rows: &[Value], touched: &[String]) -> Vec<String> {
+    rows.iter()
+        .flat_map(|p| {
+            crate::envelope::steps(p).into_iter().filter_map(move |s| {
+                let id = s.get("id").and_then(Value::as_str)?;
+                let who = s.get("assignee_id").and_then(Value::as_str)?;
+                (touched.iter().any(|t| t == id) && status_of(s) == WAITING_STATUS).then(|| {
+                    format!(
+                        "{} `{}` named to {who}",
+                        short(p),
+                        s.get("spec_slug").and_then(Value::as_str).unwrap_or("?")
+                    )
+                })
+            })
+        })
+        .collect()
+}
+
+/// One step's two writes and its read-back. `Ok(false)` is the step race
+/// lost at the merge — nothing landed.
+async fn unname_one(wire: &Wire, jid: &str, step: &Value, why: &str) -> Result<bool> {
+    let sid = step_id(step)?;
+    let read = |k: &str| {
+        step.pointer(&format!("/metadata/{k}"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let patch = release_patch(
+        step,
+        why,
+        wire.caller_id(),
+        &boss_clock_client::wall_now().to_rfc3339(),
+    );
+    let released = patch.get(RELEASED_KEY).cloned().unwrap_or(Value::Null);
+    let merged = wire
+        .call_expecting(
+            reqwest::Method::PATCH,
+            &format!("/api/jobs/{jid}/steps/{sid}/metadata"),
+            Some(patch),
+            &unname_expectation(read(boss_jobs::agent_runs::EDGE_KEY), read(RELEASED_KEY)),
+        )
+        .await;
+    match merged {
+        Ok(_) => {}
+        Err(e) if crate::dispatch::lost_the_step_race(&e) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    wire.call_expecting(
+        reqwest::Method::PUT,
+        &format!("/api/jobs/{jid}/steps/{sid}"),
+        Some(unname_status()),
+        &unname_expectation(Value::Null, released),
+    )
+    .await
+    .context("the release record landed, and the name write after it did not")?;
+    let after = wire.packet(jid).await?;
+    confirm_released(step_after(&after, sid)?, why).map_err(|e| anyhow!("{e}"))?;
+    Ok(true)
+}
+
+/// `boss step unname`: judge every cohort step on a fresh read, write
+/// the ones judged free, read each back, then read the cohort once more.
+pub(crate) async fn unname_steps(wire: &Wire, args: &UnnameArgs) -> Result<Unnamed> {
+    let why = args.why.trim();
+    if why.is_empty() {
+        bail!(
+            "--why is blank — the reason is the whole artifact this verb leaves on each step, \
+             and a name that vanished with nothing behind it reads like a lost claim"
+        );
+    }
+    let names = holder_spellings(wire, &args.holder).await?;
+    let slug = args.step.as_deref();
+    let rows = unname_rows(wire, args).await?;
+    let mut done = Unnamed {
+        dry_run: args.dry_run,
+        ..Unnamed::default()
+    };
+    let mut picked: Vec<(String, String)> = Vec::new();
+    for packet in &rows {
+        let Some(jid) = crate::envelope::job_id(packet) else {
+            continue;
+        };
+        for step in crate::envelope::steps(packet) {
+            if !in_unname_cohort(step, &names, slug) {
+                continue;
+            }
+            let key = (
+                kind_of(packet).to_string(),
+                step.get("spec_slug")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string(),
+                holder(step),
+            );
+            *done.cohort.entry(key).or_default() += 1;
+            picked.push((jid.to_string(), step_id(step)?.to_string()));
+        }
+    }
+    picked.sort();
+    picked.truncate(args.limit.unwrap_or(usize::MAX));
+
+    let mut touched = Vec::new();
+    for (jid, sid) in &picked {
+        // Judged on a FRESH read, never on the listing: the listing is
+        // slim (no metadata, so no run edge) and may be minutes old by
+        // the thousandth step.
+        let packet = wire.packet(jid).await?;
+        let step = step_after(&packet, sid)?;
+        let label = format!(
+            "{} `{}`",
+            short(&packet),
+            step.get("spec_slug").and_then(Value::as_str).unwrap_or("?")
+        );
+        if !in_unname_cohort(step, &names, slug) {
+            done.skipped.push(format!(
+                "{label} left the cohort since it was listed ({}, held by {})",
+                status_of(step),
+                holder(step)
+            ));
+            continue;
+        }
+        let edge = step
+            .pointer(&format!("/metadata/{}", boss_jobs::agent_runs::EDGE_KEY))
+            .and_then(Value::as_str);
+        // A packet's `status` is the same key `status_of` reads off a
+        // step: the run's open, or its closed.
+        let run = match edge {
+            None => None,
+            Some(id) => Some((
+                id,
+                wire.packet(id)
+                    .await
+                    .map(|p| status_of(&p).to_string())
+                    .map_err(|e| format!("{e:#}")),
+            )),
+        };
+        match judge_unname(step, run) {
+            UnnameVerdict::Skip(w) => done.skipped.push(format!("{label} {w}")),
+            UnnameVerdict::Refuse(w) => done.refused.push(format!("{label} {w}")),
+            UnnameVerdict::Unname if args.dry_run => done.unnamed.push(label),
+            UnnameVerdict::Unname => match unname_one(wire, jid, step, why).await {
+                Ok(true) => {
+                    done.unnamed.push(label);
+                    touched.push(sid.clone());
+                }
+                Ok(false) => done.refused.push(format!(
+                    "{label} moved between the read and the write — nothing landed over it; \
+                     read it again"
+                )),
+                Err(e) => {
+                    // A write that does not read back stops the pass: a
+                    // bulk write failing the same way a thousand times
+                    // is one fault recorded a thousand times.
+                    done.failed.push(format!("{label}: {e:#}"));
+                    break;
+                }
+            },
+        }
+    }
+
+    // THE READ-BACK GUARD, once per pass. The matchmaker that wrote
+    // these names is deleted on main (e1eaf72b, train #1713); a step
+    // named again within the pass is the evidence it still runs here.
+    if !touched.is_empty() {
+        let after = unname_rows(wire, args).await?;
+        done.failed
+            .extend(named_again(&after, &touched).into_iter().map(|line| {
+                format!(
+                    "{line} again after this pass unnamed it — a dispatcher still nominates \
+                     (the matchmaker e1eaf72b retired); read the dispatcher's build before \
+                     another pass"
+                )
+            }));
+    }
+    Ok(done)
+}
+
+fn print_unnamed(args: &UnnameArgs, done: &Unnamed) {
+    let scope = match (&args.packet, &args.kind) {
+        (Some(p), _) => format!("packet {p}"),
+        (None, Some(k)) => format!("open {k} packets"),
+        (None, None) => "nothing".to_string(),
+    };
+    let step = args
+        .step
+        .as_deref()
+        .map(|s| format!(", step `{s}`"))
+        .unwrap_or_default();
+    let dry = if done.dry_run {
+        " — DRY RUN, nothing written"
+    } else {
+        ""
+    };
+    println!(
+        "boss step unname: steps named to {} on {scope}{step}{dry}",
+        args.holder.trim()
+    );
+    println!("  cohort (kind, step, holder: steps):");
+    for ((kind, slug, who), n) in &done.cohort {
+        println!("    {kind:<16} {slug:<16} {who:<24} {n}");
+    }
+    let verb = if done.dry_run {
+        "would unname"
+    } else {
+        "unnamed"
+    };
+    println!("  {verb}: {}", done.unnamed.len());
+    for (word, lines) in [
+        ("refused", &done.refused),
+        ("skipped", &done.skipped),
+        ("FAILED", &done.failed),
+    ] {
+        println!("  {word}: {}", lines.len());
+        for line in lines {
+            println!("    - {line}");
+        }
+    }
+    println!("  why: {}", args.why.trim());
 }
 
 /// Assignment uses the existing server ownership boundary. The annotation is
@@ -2801,7 +3484,7 @@ mod tests {
         })
     }
 
-    /// The marker in the shape every reader reads (`stranded::hold_reason`
+    /// The marker in the shape every reader reads (`stranded::marked`
     /// — the conductor's `parked_ready`, the loading-dock row's
     /// `metadata_unmarked`, the yard's held lane, `boss orient`): a
     /// non-blank string on the REVIEW step. The patch is that ONE key,
@@ -2812,7 +3495,7 @@ mod tests {
         let md = hold_patch(&Value::Null, " waiting on a kubectl delete ");
         assert_eq!(md, json!({ "hold": "waiting on a kubectl delete" }));
         assert_eq!(
-            boss_jobs::stranded::hold_reason(&md).as_deref(),
+            boss_jobs::stranded::marked(&md, "hold").as_deref(),
             Some("waiting on a kubectl delete"),
             "the one reader the conductor uses must read it back"
         );
@@ -2828,7 +3511,7 @@ mod tests {
     }
 
     /// Released = the KEY REMOVED: an explicit null, which the merge
-    /// door deletes. `hold: false` reads as released to `hold_reason`
+    /// door deletes. `hold: false` reads as released to `marked`
     /// but as "held, then released" to every other eye.
     #[test]
     fn a_release_deletes_the_key_rather_than_falsing_it() {
@@ -2868,12 +3551,28 @@ mod tests {
         base: String,
     }
 
+    struct StubProtocol {
+        definition: Value,
+        originals: Mutex<Vec<boss_jobs::first_record::FirstRecord>>,
+    }
+
+    fn source_review_run(id: &str) -> Value {
+        json!({"id":id,"kind":"agent-run","status":"open","metadata":{},"steps":[{
+            "id":uuid::Uuid::new_v4(),"job_id":id,"spec_slug":"building",
+            "title":"Building","status":"active","metadata":{}
+        }]})
+    }
+
     async fn stub(packets: Vec<Value>) -> Stub {
         stub_with_protocol(packets, json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review"}]})).await
     }
 
     async fn stub_with_protocol(packets: Vec<Value>, protocol: Value) -> Stub {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let protocol = StubProtocol {
+            definition: protocol,
+            originals: Mutex::new(Vec::new()),
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let store = Arc::new(Mutex::new(packets));
@@ -2936,20 +3635,109 @@ mod tests {
     fn route(
         store: &Mutex<Vec<Value>>,
         puts: &Mutex<Vec<(String, Value)>>,
-        protocol: &Value,
+        protocol: &StubProtocol,
         dropping: bool,
         method: &str,
         target: &str,
         body: &str,
     ) -> (&'static str, String) {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        if method == "GET" && path == "/api/agents" {
+            return match protocol.definition.get("release_actor_rows").and_then(Value::as_array) {
+                Some(rows) => ("200 OK",json!({"data":rows,"total":protocol.definition.get("release_actor_total").cloned().unwrap_or_else(||json!(rows.len()))}).to_string()),
+                None => ("503 Service Unavailable","agents registry unavailable".into()),
+            };
+        }
         if method == "GET" && path == "/api/workflows/ship-a-change/versions/7" {
-            return ("200 OK", protocol.to_string());
+            // A WRITER BETWEEN THE JUDGEMENT AND THE WRITE (review
+            // 5d605949 R1): `concurrent_review_md` lands on the review
+            // step while the bare-release authority reads the pinned
+            // protocol, which is after a lift has judged the hold and
+            // before it writes.
+            if let Some(over) = protocol
+                .definition
+                .get("concurrent_review_md")
+                .and_then(Value::as_object)
+            {
+                let mut rows = store.lock().unwrap();
+                for step in rows
+                    .iter_mut()
+                    .filter_map(|p| p["steps"].as_array_mut())
+                    .flatten()
+                    .filter(|s| s["id"] == "s-review")
+                {
+                    for (k, v) in over {
+                        step["metadata"][k] = v.clone();
+                    }
+                }
+            }
+            return ("200 OK", protocol.definition.to_string());
+        }
+        // This wire fixture retains originals independently of mutable packet
+        // metadata, just as the real release door's reader does.
+        let parts: Vec<_> = path.trim_start_matches("/api/jobs/").split('/').collect();
+        if let [job, "steps", step, "records", key] = parts.as_slice()
+            && method == "GET"
+        {
+            return match protocol.originals.lock().unwrap().iter().find(|r| {
+                r.job_id.to_string() == *job && r.step_id.to_string() == *step && r.key == *key
+            }) {
+                Some(record) => ("200 OK", serde_json::to_string(record).unwrap()),
+                None => ("404 Not Found", "no original record".into()),
+            };
+        }
+        if let [job, "steps", step, "metadata", "records"] = parts.as_slice()
+            && method == "POST"
+        {
+            use boss_jobs::first_record::{FirstRecord, FirstRecordResult};
+            let sent: Value = serde_json::from_str(body).unwrap();
+            let key = sent["key"].as_str().unwrap();
+            let mut packets = store.lock().unwrap();
+            let Some(building) = packets
+                .iter_mut()
+                .find(|p| p["id"] == *job)
+                .and_then(|p| p["steps"].as_array_mut())
+                .and_then(|steps| steps.iter_mut().find(|s| s["id"] == *step))
+            else {
+                return ("404 Not Found", "no such job step".into());
+            };
+            let mut originals = protocol.originals.lock().unwrap();
+            let result = if let Some(original) = originals.iter().find(|r| {
+                r.job_id.to_string() == *job && r.step_id.to_string() == *step && r.key == key
+            }) {
+                if original.matches(&sent["value"]) {
+                    FirstRecordResult::Replayed(original.clone())
+                } else {
+                    FirstRecordResult::Conflict {
+                        job_id: original.job_id,
+                        step_id: original.step_id,
+                        key: key.into(),
+                    }
+                }
+            } else {
+                assert_eq!(sent["expected_absence"], true);
+                let stamp = boss_core::publisher::EventStamp::new(
+                    "jobs",
+                    boss_core::actor::ActorId::Automation("fixture".into()),
+                );
+                let record = FirstRecord::new(
+                    serde_json::from_value(json!(job)).unwrap(),
+                    serde_json::from_value(json!(step)).unwrap(),
+                    key,
+                    &sent["value"],
+                    &stamp,
+                    uuid::Uuid::new_v4(),
+                );
+                building["metadata"][key] = sent["value"].clone();
+                originals.push(record.clone());
+                FirstRecordResult::Recorded(record)
+            };
+            return ("200 OK", serde_json::to_string(&result).unwrap());
         }
         // THE RELEASE DOOR (`http/release.rs`, backlog ed8e5c85), faked
         // the way this stub fakes every door: the RULE is the real one,
         // `boss_jobs::car_release::judge`, asked with this stub's protocol
-        // and no first records, and the write goes through the merge
+        // and original records, and the write goes through the merge
         // door below. The authenticated caller is this stub's one caller,
         // `named()`.
         if method == "POST"
@@ -2977,7 +3765,7 @@ mod tests {
                 .find(|p| p["id"] == ask.review.trim())
                 .cloned()
                 .unwrap_or_else(|| json!({"id": ask.review.trim(), "kind": "missing"}));
-            struct Reader(Value);
+            struct Reader(Value, Vec<boss_jobs::first_record::FirstRecord>);
             #[async_trait::async_trait]
             impl boss_jobs::car_release::ExecutorRecordReader for Reader {
                 async fn protocol_version(&self, _: &str, _: i64) -> Result<Option<Value>> {
@@ -2985,14 +3773,25 @@ mod tests {
                 }
                 async fn executor_original(
                     &self,
-                    _: uuid::Uuid,
-                    _: uuid::Uuid,
-                    _: &str,
+                    job: uuid::Uuid,
+                    step: uuid::Uuid,
+                    key: &str,
                 ) -> Result<Option<boss_jobs::first_record::FirstRecord>> {
-                    Ok(None)
+                    Ok(self
+                        .1
+                        .iter()
+                        .find(|r| {
+                            r.job_id.to_string() == job.to_string()
+                                && r.step_id.to_string() == step.to_string()
+                                && r.key == key
+                        })
+                        .cloned())
                 }
             }
-            let reader = Reader(protocol.clone());
+            let reader = Reader(
+                protocol.definition.clone(),
+                protocol.originals.lock().unwrap().clone(),
+            );
             let judged = boss_jobs::car_release::judge(
                 &reader,
                 &car,
@@ -3106,6 +3905,22 @@ mod tests {
                 {
                     return ("409 Conflict", r#"{"error":"step is terminal"}"#.into());
                 }
+                // THE RESOURCE EXIT (http/steps.rs, backlog 7b5195ea): a
+                // claimed Active step leaves Active only on a body naming
+                // the claim it holds, refused in the server's own words.
+                use boss_jobs::flow_resources::{EXIT_CLAIM_KEY, EXIT_REFUSAL, TOKEN_KEY};
+                let leaves = sent.get("status").is_some_and(|s| *s != step["status"])
+                    || sent
+                        .get("assignee_id")
+                        .is_some_and(|a| *a != step["assignee_id"]);
+                if step["status"] == "active" && step["metadata"].get(TOKEN_KEY).is_some() && leaves
+                {
+                    let named = sent.get(EXIT_CLAIM_KEY).and_then(Value::as_str);
+                    let held = boss_jobs::flow_resources::held_claim_id(&step["metadata"]);
+                    if !(named.is_some() && named == held) {
+                        return ("409 Conflict", EXIT_REFUSAL.into());
+                    }
+                }
                 if let Some(obj) = sent.as_object() {
                     for (k, v) in obj {
                         step[k] = v.clone();
@@ -3188,6 +4003,131 @@ mod tests {
             id: "claude@algedonic.dev".into(),
             source: identity::Source::Env,
         })
+    }
+
+    #[tokio::test]
+    async fn a_bare_release_refuses_every_other_actor_before_writing() {
+        for actor in [
+            "agent-codex",
+            "automation:rule:release-a-held-car-on-its-reviewer-verdict",
+        ] {
+            let s = stub(vec![car(
+                "ready",
+                json!({"hold":"David decides", "releaser":"emp-david"}),
+            )])
+            .await;
+            let wire = Wire::at(
+                s.base.clone(),
+                Some(identity::Caller {
+                    id: actor.into(),
+                    source: identity::Source::Env,
+                }),
+            )
+            .unwrap();
+            let before = s.packets.lock().unwrap().clone();
+            let why = hold(&wire, "fix/held", None)
+                .await
+                .expect_err("bare release must honor the same reservation");
+            assert!(why.to_string().contains("emp-david"), "{why}");
+            assert!(s.puts.lock().unwrap().is_empty(), "no metadata write");
+            assert_eq!(*s.packets.lock().unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bare_release_allows_only_exact_or_registered_alias_identity() {
+        let owner = json!({"id":"agent-owner","aliases":["owner@login.example"]});
+        let cases = [
+            ("emp-david", "emp-david", None, true),
+            (
+                "agent-owner",
+                "owner@login.example",
+                Some(json!([owner.clone()])),
+                true,
+            ),
+            (
+                "owner@login.example",
+                "agent-owner",
+                Some(json!([owner.clone()])),
+                false,
+            ),
+            (
+                "emp-david",
+                "agent-codex",
+                Some(json!([{"id":"agent-codex","aliases":["emp-david"]}])),
+                false,
+            ),
+            (
+                "agent-owner",
+                "other@login.example",
+                Some(json!([owner.clone(),{"id":"agent-other","aliases":["other@login.example"]}])),
+                false,
+            ),
+            ("agent-owner", "owner@login.example", None, false),
+            (
+                "agent-owner",
+                "owner@login.example",
+                Some(json!([owner,{"id":"agent-other","aliases":["owner@login.example"]}])),
+                false,
+            ),
+        ];
+        for (reserved, actor, rows, allowed) in cases {
+            let mut protocol = json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review"}]});
+            if let Some(rows) = rows {
+                protocol["release_actor_rows"] = rows;
+            }
+            let s = stub_with_protocol(
+                vec![car(
+                    "ready",
+                    json!({"hold":"owner decides","releaser":reserved}),
+                )],
+                protocol,
+            )
+            .await;
+            let wire = Wire::at(
+                s.base.clone(),
+                Some(identity::Caller {
+                    id: actor.into(),
+                    source: identity::Source::Env,
+                }),
+            )
+            .unwrap();
+            let before = s.packets.lock().unwrap().clone();
+            let answer = hold(&wire, "fix/held", None).await;
+            assert_eq!(answer.is_ok(), allowed, "{reserved}, {actor}: {answer:?}");
+            if allowed {
+                assert_eq!(s.puts.lock().unwrap().len(), 1);
+            } else {
+                assert!(s.puts.lock().unwrap().is_empty());
+                assert_eq!(*s.packets.lock().unwrap(), before);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bare_release_refuses_an_incomplete_alias_snapshot() {
+        let protocol = json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review"}],
+            "release_actor_rows":[{"id":"agent-owner","aliases":["owner@login.example"]}],"release_actor_total":2});
+        let s = stub_with_protocol(
+            vec![car(
+                "ready",
+                json!({"hold":"owner decides","releaser":"agent-owner"}),
+            )],
+            protocol,
+        )
+        .await;
+        let wire = Wire::at(
+            s.base.clone(),
+            Some(identity::Caller {
+                id: "owner@login.example".into(),
+                source: identity::Source::Env,
+            }),
+        )
+        .unwrap();
+        hold(&wire, "fix/held", None)
+            .await
+            .expect_err("partial native aliases cannot grant");
+        assert!(s.puts.lock().unwrap().is_empty());
     }
 
     /// The whole verb, end to end: resolves an 8-char prefix among the
@@ -3653,24 +4593,29 @@ mod tests {
     /// — and the review step reads back held, then not.
     #[tokio::test]
     async fn review_then_release_records_the_verdict_and_the_head_it_read() {
-        use crate::review_verdict::{record, release};
+        use crate::review_verdict::{ReviewSourceRepo, record_in, release};
         const RUN: &str = "5eed5eed-0000-4000-8000-000000000000";
         const BUILDER: &str = "b0b0b0b0-0000-4000-8000-000000000000";
-        const H1: &str = "1111111111111111111111111111111111111111";
-        const H2: &str = "2222222222222222222222222222222222222222";
-        const MAIN: &str = "3333333333333333333333333333333333333333";
+        let source = ReviewSourceRepo::new();
+        let (h1, h2, main) = (
+            source.head.as_str(),
+            source.moved.as_str(),
+            source.main.as_str(),
+        );
         let mut held = car(
             "ready",
-            json!({ "hold": "area policy", boss_jobs::car::HOLD_SHA: H1 }),
+            json!({ "hold": "area policy", boss_jobs::car::HOLD_SHA: h1 }),
         );
         held["metadata"]["agent_run"] = json!(BUILDER);
-        let reviewer = json!({"id": RUN, "kind": "agent-run", "status": "open", "metadata": {}});
+        let reviewer = source_review_run(RUN);
         let builder = json!({"id": BUILDER, "kind": "agent-run", "status": "open", "metadata": {}});
         let s = stub(vec![held, reviewer, builder]).await;
         let wire = Wire::at(s.base.clone(), named()).unwrap();
-        let forge = |head: &'static str| {
+        let forge = |head: &str| {
+            let head = head.to_string();
+            let main = main.to_string();
             move |r: &str| -> Result<String> {
-                Ok(if r == "refs/heads/main" { MAIN } else { head }.to_string())
+                Ok(if r == "refs/heads/main" { &main } else { &head }.to_string())
             }
         };
 
@@ -3681,15 +4626,23 @@ mod tests {
             (Some(BUILDER), "release", "built car"),
             (Some(RUN), "lgtm", "one of release | changes"),
         ] {
-            let err = record(&wire, "fix/held", verdict, "", run, forge(H1))
-                .await
-                .expect_err(want);
+            let err = record_in(
+                source.path(),
+                &wire,
+                "fix/held",
+                verdict,
+                "",
+                run,
+                forge(h1),
+            )
+            .await
+            .expect_err(want);
             assert!(err.to_string().contains(want), "{want} in {err}");
         }
         assert!(s.puts.lock().unwrap().is_empty());
 
         // A release with no review recorded yet is refused.
-        let err = release(&wire, "fix/held", RUN, &Releaser::default(), forge(H1))
+        let err = release(&wire, "fix/held", RUN, &Releaser::default(), forge(h1))
             .await
             .expect_err("no verdict yet");
         assert!(
@@ -3697,41 +4650,48 @@ mod tests {
             "{err}"
         );
 
-        record(
+        record_in(
+            source.path(),
             &wire,
             "fix/held",
             "release",
             "no findings",
             Some(RUN),
-            forge(H1),
+            forge(h1),
         )
         .await
         .expect("the reviewer records RELEASE at H1");
         // The head moved to H2 after the review: no release of H2.
-        let err = release(&wire, "fix/held", RUN, &Releaser::default(), forge(H2))
+        let err = release(&wire, "fix/held", RUN, &Releaser::default(), forge(h2))
             .await
             .expect_err("reviewed H1, head is H2");
-        assert!(err.to_string().contains("reviewed 11111111"), "{err}");
         assert!(
-            boss_jobs::stranded::hold_reason(&s.packets.lock().unwrap()[0]["steps"][1]["metadata"])
-                .is_some(),
+            err.to_string().contains(&format!("reviewed {}", &h1[..8])),
+            "{err}"
+        );
+        assert!(
+            boss_jobs::stranded::marked(
+                &s.packets.lock().unwrap()[0]["steps"][1]["metadata"],
+                "hold"
+            )
+            .is_some(),
             "a refused release leaves the hold on"
         );
 
-        release(&wire, "fix/held", RUN, &Releaser::default(), forge(H1))
+        release(&wire, "fix/held", RUN, &Releaser::default(), forge(h1))
             .await
             .expect("released on the verdict at the head it read");
         let md = s.packets.lock().unwrap()[0]["steps"][1]["metadata"].clone();
         assert!(md.get("hold").is_none(), "{md}");
         let rec = &md[boss_jobs::car::RELEASE];
-        assert_eq!(rec["sha"], json!(H1));
+        assert_eq!(rec["sha"], json!(h1));
         assert_eq!(rec["review"], json!(RUN));
         assert_eq!(rec["verdict"], json!("release"));
         assert_eq!(rec["by"], json!("claude@algedonic.dev"));
-        assert_eq!(rec["main_sha"], json!(MAIN));
+        assert_eq!(rec["main_sha"], json!(main));
         assert_eq!(
             md[boss_jobs::car::HOLD_SHA],
-            json!(H1),
+            json!(h1),
             "the judged head stays"
         );
     }
@@ -3743,25 +4703,30 @@ mod tests {
     /// releases, and the record names the run that did.
     #[tokio::test]
     async fn the_run_that_gated_a_held_car_releases_it_by_neither_form() {
-        use crate::review_verdict::{record, release};
+        use crate::review_verdict::{ReviewSourceRepo, record_in, release};
         const RUN: &str = "5eed5eed-0000-4000-8000-000000000000";
         const BUILDER: &str = "b0b0b0b0-0000-4000-8000-000000000000";
-        const H1: &str = "1111111111111111111111111111111111111111";
+        let source = ReviewSourceRepo::new();
         let mut held = car(
             "ready",
-            json!({ "hold": "area policy", boss_jobs::car::HOLD_SHA: H1 }),
+            json!({ "hold": "area policy", boss_jobs::car::HOLD_SHA: source.head }),
         );
         held["metadata"]["agent_run"] = json!(BUILDER);
-        let reviewer = json!({"id": RUN, "kind": "agent-run", "status": "open", "metadata": {}});
+        let reviewer = source_review_run(RUN);
         let s = stub(vec![held, reviewer]).await;
         let wire = Wire::at(s.base.clone(), named()).unwrap();
-        const MAIN: &str = "3333333333333333333333333333333333333333";
-        let forge = |r: &str| -> Result<String> {
-            Ok(if r == "refs/heads/main" { MAIN } else { H1 }.to_string())
-        };
-        record(&wire, "fix/held", "release", "", Some(RUN), forge)
-            .await
-            .expect("the reviewer records RELEASE at H1");
+        let forge = |r: &str| source.forge(r);
+        record_in(
+            source.path(),
+            &wire,
+            "fix/held",
+            "release",
+            "",
+            Some(RUN),
+            forge,
+        )
+        .await
+        .expect("the reviewer records RELEASE at H1");
         let writes = s.puts.lock().unwrap().len();
 
         let builder = Releaser {
@@ -3779,8 +4744,11 @@ mod tests {
         assert!(err.to_string().contains("REFUSED"), "{err}");
         assert_eq!(s.puts.lock().unwrap().len(), writes, "nothing written");
         assert!(
-            boss_jobs::stranded::hold_reason(&s.packets.lock().unwrap()[0]["steps"][1]["metadata"])
-                .is_some(),
+            boss_jobs::stranded::marked(
+                &s.packets.lock().unwrap()[0]["steps"][1]["metadata"],
+                "hold"
+            )
+            .is_some(),
             "a refused release leaves the hold on"
         );
 
@@ -3808,20 +4776,28 @@ mod tests {
     /// `release`, which the conductor reads as a review's release.
     #[tokio::test]
     async fn every_release_records_the_run_and_the_shell_that_gave_it() {
-        use crate::review_verdict::{BARE_RELEASE, record, release};
+        use crate::review_verdict::{BARE_RELEASE, ReviewSourceRepo, record_in, release};
         const RUN: &str = "5eed5eed-0000-4000-8000-000000000000";
-        const H1: &str = "1111111111111111111111111111111111111111";
+        let source = ReviewSourceRepo::new();
         let held = car(
             "ready",
-            json!({ "hold": "area policy", boss_jobs::car::HOLD_SHA: H1 }),
+            json!({ "hold": "area policy", boss_jobs::car::HOLD_SHA: source.head }),
         );
-        let reviewer = json!({"id": RUN, "kind": "agent-run", "status": "open", "metadata": {}});
+        let reviewer = source_review_run(RUN);
         let s = stub(vec![held, reviewer]).await;
         let wire = Wire::at(s.base.clone(), named()).unwrap();
-        let forge = |_: &str| -> Result<String> { Ok(H1.to_string()) };
-        record(&wire, "fix/held", "release", "", Some(RUN), forge)
-            .await
-            .expect("the reviewer records RELEASE at H1");
+        let forge = |r: &str| source.forge(r);
+        record_in(
+            source.path(),
+            &wire,
+            "fix/held",
+            "release",
+            "",
+            Some(RUN),
+            forge,
+        )
+        .await
+        .expect("the reviewer records RELEASE at H1");
         let other = Releaser {
             run: Some(RUN.into()),
             agent_shell: true,
@@ -3888,7 +4864,7 @@ mod tests {
         }
         let review = json!({ "metadata": after });
         assert_eq!(
-            boss_jobs::stranded::hold_reason(&review["metadata"]).as_deref(),
+            boss_jobs::stranded::marked(&review["metadata"], "hold").as_deref(),
             Some("held for the restart")
         );
         assert_eq!(bare_release_note(&review), "it boards at the next tick");
@@ -3976,21 +4952,50 @@ mod tests {
             named(),
         )
         .unwrap();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_accepted = accepted.clone();
+        let request_heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let server_heads = request_heads.clone();
         let server = tokio::spawn(async move {
             loop {
-                let Ok((socket, _)) = listener.accept().await else {
+                let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
+                server_accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Damage the response only AFTER the client sent its request.
+                // An accept-and-drop has not established that boundary, and a
+                // three-second wall clock also measures fixture scheduling.
+                let request = crate::sor_client::stub::read_request(&mut socket).await;
+                server_heads.lock().unwrap().push(request);
                 drop(socket);
             }
         });
+        // Hang bound only: request provenance, error classification and the
+        // actual attempt count below are the assertions, not query latency.
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(120),
             wire.immutable_record(job, step, "missing"),
         )
         .await
-        .expect("a reset is a transport error, not a connect retry");
-        assert!(result.is_err(), "network failure cannot mean absent");
+        .expect("the local transport-damage fixture must finish");
+        let error = result.expect_err("network failure cannot mean absent");
+        assert!(
+            error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|error| !error.is_connect()),
+            "the fixture must fail after connection, not at admission: {error:#}"
+        );
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a post-request disconnect must not resend the GET"
+        );
+        assert!(
+            request_heads.lock().unwrap()[0].starts_with(&format!(
+                "GET /api/jobs/{job}/steps/{step}/records/missing HTTP/1.1\r\n"
+            )),
+            "the fixture must consume the actual GET before closing the connection"
+        );
         server.abort();
     }
 
@@ -4045,6 +5050,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reholding_cannot_transfer_an_existing_persons_reservation() {
+        let s = stub(vec![car(
+            "ready",
+            json!({"hold":"David only","releaser":"emp-david"}),
+        )])
+        .await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        assert!(
+            hold_reserved(&wire, "fix/held", "David only", Some("agent-codex"))
+                .await
+                .is_err(),
+            "a hold must judge the old reservation before replacing it"
+        );
+        assert!(
+            s.puts.lock().unwrap().is_empty(),
+            "no reservation write before refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_review_gate_envelope_does_not_skip_rehold_authority_before_writing() {
+        for poison in [None, Some(json!({})), Some(json!(null))] {
+            let mut md = json!({"hold":"David only","releaser":"emp-david"});
+            if let Some(poison) = poison {
+                md["gate_submission"] = poison;
+            }
+            let s = stub(vec![car("ready", md)]).await;
+            let wire = Wire::at(s.base.clone(), named()).unwrap();
+            assert!(
+                hold_reserved(&wire, "fix/held", "David only", Some("agent-codex"))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                s.puts.lock().unwrap().is_empty(),
+                "raw reservation authority must refuse before a write"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_review_gate_envelope_does_not_falsely_fail_a_held_readback() {
+        for poison in [None, Some(json!({})), Some(json!(null))] {
+            let mut md = json!({"hold":"David only","releaser":"emp-david"});
+            if let Some(poison) = poison {
+                md["gate_submission"] = poison;
+            }
+            let s = stub(vec![car("ready", md)]).await;
+            let wire = Wire::at(s.base.clone(), named()).unwrap();
+            hold(&wire, "fix/held", Some("David only"))
+                .await
+                .expect("the raw held marker reads back as held");
+            assert_eq!(s.puts.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn reholding_preserves_directional_unique_alias_and_exact_owner_authority() {
+        let owner = json!({"id":"agent-owner","aliases":["owner@login.example"]});
+        for (reserved, actor, rows, allowed) in [
+            ("emp-david", "emp-david", None, true),
+            (
+                "emp-david",
+                "agent-codex",
+                Some(json!([{"id":"agent-codex","aliases":["emp-david"]}])),
+                false,
+            ),
+            (
+                "agent-owner",
+                "owner@login.example",
+                Some(json!([owner.clone()])),
+                true,
+            ),
+            (
+                "owner@login.example",
+                "agent-owner",
+                Some(json!([owner.clone()])),
+                false,
+            ),
+            (
+                "agent-owner",
+                "owner@login.example",
+                Some(json!([owner,{"id":"agent-other","aliases":["owner@login.example"]}])),
+                false,
+            ),
+        ] {
+            let mut protocol = json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review"}]});
+            if let Some(rows) = rows {
+                protocol["release_actor_rows"] = rows;
+            }
+            let s = stub_with_protocol(
+                vec![car(
+                    "ready",
+                    json!({"hold":"owner only","releaser":reserved}),
+                )],
+                protocol,
+            )
+            .await;
+            let wire = Wire::at(
+                s.base.clone(),
+                Some(identity::Caller {
+                    id: actor.into(),
+                    source: identity::Source::Env,
+                }),
+            )
+            .unwrap();
+            let answer = hold_reserved(&wire, "fix/held", "owner only", Some("agent-next")).await;
+            assert_eq!(answer.is_ok(), allowed, "{reserved}/{actor}: {answer:?}");
+            assert_eq!(s.puts.lock().unwrap().len(), usize::from(allowed));
+        }
+    }
+
+    #[tokio::test]
     async fn hold_then_release_write_the_marker_on_the_review_step() {
         let s = stub(vec![car(
             "ready",
@@ -4065,8 +5183,11 @@ mod tests {
             assert_eq!(puts[0].1, json!({ "hold": "waiting on a kubectl delete" }));
         }
         assert_eq!(
-            boss_jobs::stranded::hold_reason(&s.packets.lock().unwrap()[0]["steps"][1]["metadata"])
-                .as_deref(),
+            boss_jobs::stranded::marked(
+                &s.packets.lock().unwrap()[0]["steps"][1]["metadata"],
+                "hold"
+            )
+            .as_deref(),
             Some("waiting on a kubectl delete")
         );
         hold(&wire, "c6bd173e", None).await.expect("releases");
@@ -4095,6 +5216,60 @@ mod tests {
             .await
             .expect("nothing to release");
         assert_eq!(s.puts.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_hold_refuses_a_car_collected_by_an_open_train_without_writing() {
+        let held = car("ready", json!({}));
+        let train_id = "01234567-1234-4234-8234-012345678901";
+        let train = json!({"id":train_id,"kind":"pr-train","status":"open",
+            "metadata":{"boarded_jobs":[held["id"].clone()]}});
+        let s = stub(vec![held, train]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let error = hold(&wire, "fix/held", Some("review before boarding"))
+            .await
+            .expect_err("a hold cannot brake an already collected car");
+        assert!(format!("{error:#}").contains(train_id), "{error:#}");
+        assert!(s.puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_or_cancelled_train_history_does_not_refuse_a_docked_hold() {
+        for status in ["closed", "cancelled"] {
+            let held = car("ready", json!({}));
+            let train = json!({"id":"01234567-1234-4234-8234-012345678901",
+                "kind":"pr-train","status":status,"metadata":{"boarded_jobs":[held["id"].clone()]}});
+            let s = stub(vec![held, train]).await;
+            hold(
+                &Wire::at(s.base.clone(), named()).unwrap(),
+                "fix/held",
+                Some("review"),
+            )
+            .await
+            .expect("historical train does not collect a current car");
+            assert_eq!(s.puts.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unread_collecting_train_cannot_authorise_a_hold() {
+        for (status, boarded) in [
+            (Value::Null, json!([])),
+            (json!("open"), Value::Null),
+            (json!("open"), json!([42])),
+        ] {
+            let train = json!({"id":"01234567-1234-4234-8234-012345678901",
+                "kind":"pr-train","status":status,"metadata":{"boarded_jobs":boarded}});
+            let s = stub(vec![car("ready", json!({})), train]).await;
+            hold(
+                &Wire::at(s.base.clone(), named()).unwrap(),
+                "fix/held",
+                Some("review"),
+            )
+            .await
+            .expect_err("unread train is not a clear consist");
+            assert!(s.puts.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
@@ -4138,6 +5313,11 @@ mod tests {
     const OTHER_TRAIN: &str = "7a1b2c3d-0000-4000-8000-000000000004";
     const OTHER_RUN: &str = "9f8e7d6c-0000-4000-8000-000000000005";
     const HELD: &str = "held after 2 red trains — needs a look before it boards again";
+
+    /// The strike release, given from a shell that is no run.
+    async fn struck_release(wire: &Wire, given: &str, diagnosis: &str) -> Result<()> {
+        crate::strike_release::release_struck(wire, given, diagnosis, &Releaser::default()).await
+    }
 
     /// A car the conductor holds after two red trains: no review marker,
     /// `red_trains` at the compiled max, the hold's own skip note.
@@ -4207,7 +5387,7 @@ mod tests {
         let diagnosis = format!(
             "Forge CI web failed ownership checks; gate {gate_id} was GREEN. Repaired source is independently reviewed; this is the exact train the car rode."
         );
-        crate::strike_release::release_struck(&wire, &car_id, &diagnosis)
+        struck_release(&wire, &car_id, &diagnosis)
             .await
             .expect("approved combined failing train evidence");
         let puts = s.puts.lock().unwrap();
@@ -4343,12 +5523,108 @@ mod tests {
             *record.pointer_mut(&path).unwrap() = value;
             let s = stub(vec![car.clone(), t, g]).await;
             let wire = Wire::at(s.base.clone(), named()).unwrap();
-            crate::strike_release::release_struck(&wire, &car_id, &gate_id)
+            struck_release(&wire, &car_id, &gate_id)
                 .await
                 .expect_err(&format!("refuse {which} {path}"));
             assert!(s.puts.lock().unwrap().is_empty(), "{which} {path} wrote");
             assert_eq!(s.packets.lock().unwrap()[0]["metadata"]["red_trains"], 2);
         }
+    }
+
+    /// THE REUSED CAR GATE (backlog cb2268d3). A one-car train that binds
+    /// `train_gate_run` to its car's own green (`train_gate_reuse`,
+    /// decision `reused`) files no train gate, so the gate-run its verdict
+    /// rests on carries no `train` mark, and the verb refused it as "gates
+    /// no train" — no strike-release path for that train at all. The same
+    /// native records, reshaped that way: named alone it is still a car's
+    /// gate and refused; named beside the train that binds it, it is that
+    /// train's gate, judged by the same checked GREEN-plus-failing-CI rule
+    /// (921c62af). A train that does not bind it does not make it one.
+    #[tokio::test]
+    async fn a_one_car_trains_reused_car_gate_counts_when_the_diagnosis_names_the_train() {
+        let car: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/strike-recovery/car.json"))
+                .unwrap();
+        let mut train: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/strike-recovery/train.json"))
+                .unwrap();
+        let mut gate: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/strike-recovery/gate.json"))
+                .unwrap();
+        let car_id = car["id"].as_str().unwrap().to_owned();
+        let gate_id = gate["id"].as_str().unwrap().to_owned();
+        let train_id = train["id"].as_str().unwrap().to_owned();
+        // The car's own gate-run: no train marks.
+        let marks = gate["metadata"].as_object_mut().unwrap();
+        marks.remove("train");
+        marks.remove("train_gate");
+        // The bind's stamp, as `train_gate_reuse::assess` writes it.
+        train["metadata"]["train_gate_reuse"] = json!({
+            "decision": "reused", "mode": "exact",
+            "source": { "gate_run": gate_id, "mode": "full" },
+        });
+        let ci_index = train["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|s| s["spec_slug"] == "ci")
+            .unwrap();
+        let both = format!(
+            "Forge CI web failed on the other car's test; train {train_id} carried this car's \
+             own green gate-run {gate_id} by reuse."
+        );
+
+        // Named alone, it is a car's gate: refused, nothing written.
+        let s = stub(vec![car.clone(), train.clone(), gate.clone()]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let err = struck_release(&wire, &car_id, &gate_id)
+            .await
+            .expect_err("a car's gate named alone");
+        assert!(format!("{err:#}").contains("gates no train"), "{err:#}");
+        assert!(s.puts.lock().unwrap().is_empty());
+
+        // A train that does not bind it — a shadow stamp, a stamp from
+        // another run, a verdict resting on another run, no stamp — and
+        // the reused train whose CI was green: each refused, nothing written.
+        let cases = [
+            (
+                "/metadata/train_gate_reuse/decision".to_owned(),
+                json!("would reuse"),
+            ),
+            (
+                "/metadata/train_gate_reuse/source/gate_run".to_owned(),
+                json!(OTHER_RUN),
+            ),
+            ("/metadata/train_gate_run".to_owned(), json!(OTHER_RUN)),
+            ("/metadata/train_gate_reuse".to_owned(), Value::Null),
+            (
+                format!("/steps/{ci_index}/metadata/forge_result"),
+                json!("green"),
+            ),
+        ];
+        for (path, value) in cases {
+            let mut t = train.clone();
+            *t.pointer_mut(&path).unwrap() = value;
+            let s = stub(vec![car.clone(), t, gate.clone()]).await;
+            let wire = Wire::at(s.base.clone(), named()).unwrap();
+            struck_release(&wire, &car_id, &both)
+                .await
+                .expect_err(&format!("refuse {path}"));
+            assert!(s.puts.lock().unwrap().is_empty(), "{path} wrote");
+        }
+
+        // Bound, and named beside its train: the strike clears on the
+        // gate-run, which is the id the look records.
+        let s = stub(vec![car, train, gate]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        struck_release(&wire, &car_id, &both)
+            .await
+            .expect("the reused gate of the train the car rode");
+        assert_eq!(s.puts.lock().unwrap().len(), 1);
+        let after = s.packets.lock().unwrap()[0].clone();
+        assert!(after["metadata"].get("red_trains").is_none(), "{after}");
+        let looks = after["metadata"]["strike_releases"].as_array().unwrap();
+        assert_eq!(looks.last().unwrap()["gate_runs"], json!([gate_id]));
     }
 
     /// The verb end to end: the diagnosis names the red gate-run the car
@@ -4363,7 +5639,7 @@ mod tests {
             "Both reds were car dcdc6c64's combined-tree stub gap, not this car: gate-run \
              {RED_RUN} failed only on its test. Also read {OTHER_RUN}, a train this car was not on."
         );
-        crate::strike_release::release_struck(&wire, "fix/held", &diagnosis)
+        struck_release(&wire, "fix/held", &diagnosis)
             .await
             .expect("released");
         {
@@ -4404,7 +5680,7 @@ mod tests {
 
         // Struck again later, looked at again: the list grows.
         s.packets.lock().unwrap()[0]["metadata"]["red_trains"] = json!(2);
-        crate::strike_release::release_struck(&wire, "c6bd173e", &diagnosis)
+        struck_release(&wire, "c6bd173e", &diagnosis)
             .await
             .expect("released again");
         let car = s.packets.lock().unwrap()[0].clone();
@@ -4418,7 +5694,7 @@ mod tests {
     async fn a_diagnosis_naming_no_red_gate_run_the_car_rode_is_refused_before_any_write() {
         let s = stub(the_yard()).await;
         let wire = Wire::at(s.base.clone(), named()).unwrap();
-        let err = crate::strike_release::release_struck(
+        let err = struck_release(
             &wire,
             "fix/held",
             "looked at it, it is fine (dcdc6c64 was the cause)",
@@ -4432,7 +5708,7 @@ mod tests {
             "green {GREEN_RUN}; not its train {OTHER_RUN}; the car itself {STRUCK_CAR}; \
              nothing at {missing}"
         );
-        let err = crate::strike_release::release_struck(&wire, "fix/held", &text)
+        let err = struck_release(&wire, "fix/held", &text)
             .await
             .expect_err("nothing qualifies");
         let err = err.to_string();
@@ -4462,7 +5738,7 @@ mod tests {
     async fn a_car_with_no_strikes_has_nothing_for_a_diagnosis_to_clear() {
         let s = stub(vec![car("ready", json!({}))]).await;
         let wire = Wire::at(s.base.clone(), named()).unwrap();
-        let err = crate::strike_release::release_struck(&wire, "fix/held", RED_RUN)
+        let err = struck_release(&wire, "fix/held", RED_RUN)
             .await
             .expect_err("no strikes");
         assert!(
@@ -4489,6 +5765,222 @@ mod tests {
             "{err}"
         );
         assert!(s.puts.lock().unwrap().is_empty());
+    }
+
+    // -- the red-train hold a strike release clears (backlog 79129752) --
+    //
+    // Car 775feba5, 2026-11-05, read back from the system of record: train
+    // 9b5c1889's gate 3082de78 went red at 06:17Z with the car the only
+    // one aboard, on two tests it does not touch. The conductor struck it
+    // (`red_trains` 1) and held its review step with the judged-red hold
+    // below, verbatim, bound to no head. At 07:47Z `boss release
+    // --diagnosis-file` named that gate-run, cleared the strike and
+    // appended the look, and the review step kept the hold, so the car
+    // never reached the dock.
+
+    const T9B5C1889: &str = "9b5c1889-f729-4fda-8546-8802806ec539";
+    const G3082DE78: &str = "3082de78-7834-4467-8d54-aaeb5cd52011";
+    const HOLD_775FEBA5: &str = "held by the conductor: train 9b5c1889 was judged red (test) as the \
+        only car aboard — first failing line: test: every_converge_tick_observes_the_site::the_page_\
+        phase_stops_at_the_observation_deadline_and_says_so - panicked at crates/core/boss-testing/\
+        tests/groups/../every_converge_tick_observes_the_site.rs:741:5: the record names the \
+        deadline a… — rebuild it on current main, re-gate, then `boss release` it (a2d4d842, \
+        b4a95f47)";
+
+    /// Car 775feba5's review step as it stood after the conductor's hold,
+    /// with `extra` merged over it.
+    fn review_md_775feba5(extra: Value) -> Value {
+        let mut md = json!({
+            "hold": HOLD_775FEBA5,
+            "authority_role": "platform-admin",
+            "agent_executor_provenance": "advisory",
+            "agent_profile": "reviewer",
+        });
+        for (k, v) in extra.as_object().into_iter().flatten() {
+            md[k] = v.clone();
+        }
+        md
+    }
+
+    /// The yard of 775feba5's sequence: the struck, held car (its builder
+    /// run stamped), the red train that carried it alone, its red gate.
+    fn yard_775feba5(review_md: Value) -> Vec<Value> {
+        let mut car = car("ready", review_md);
+        car["metadata"]["red_trains"] = json!(1);
+        car["metadata"]["agent_run"] = json!("57ea38f6-ae5d-4c59-9380-4364c247c074");
+        vec![
+            car,
+            a_train(T9B5C1889, &[STRUCK_CAR]),
+            train_gate_run(G3082DE78, T9B5C1889, "failed"),
+        ]
+    }
+
+    fn diagnosis_775feba5() -> String {
+        format!(
+            "Red train 9b5c1889, gate-run {G3082DE78}: the train carried one car, 775feba5, and \
+             failed on two tests the car does not touch. The strike is not the car's."
+        )
+    }
+
+    /// THE DEFECT, replayed: the look that clears the LAST strike lifts
+    /// the judged-red hold for the train it cleared, through the review
+    /// step's merge door, and records what it lifted the way a bare
+    /// release does. Every other key on the step stays.
+    #[tokio::test]
+    async fn a_strike_release_lifts_the_red_train_hold_for_the_train_it_cleared() {
+        let s = stub(yard_775feba5(review_md_775feba5(json!({})))).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        struck_release(&wire, "fix/held", &diagnosis_775feba5())
+            .await
+            .expect("released");
+        let car = s.packets.lock().unwrap()[0].clone();
+        assert!(car["metadata"].get("red_trains").is_none(), "{car}");
+        let md = &car["steps"][1]["metadata"];
+        assert_eq!(
+            boss_jobs::stranded::marked(md, "hold"),
+            None,
+            "the red-train hold for train 9b5c1889 is lifted with its strike: {md}"
+        );
+        let lifted = &md[crate::review_verdict::BARE_RELEASE];
+        assert_eq!(lifted["hold"], json!(HOLD_775FEBA5), "{md}");
+        assert_eq!(lifted["by"], json!("claude@algedonic.dev"), "{md}");
+        assert_eq!(lifted["strike_release"], json!(true), "{md}");
+        assert_eq!(md["authority_role"], json!("platform-admin"), "{md}");
+        assert_eq!(md["agent_profile"], json!("reviewer"), "{md}");
+        let puts = s.puts.lock().unwrap();
+        assert_eq!(puts.len(), 2, "the strike, then the hold: {puts:?}");
+        assert_eq!(puts[0].0, format!("/{STRUCK_CAR}/metadata"));
+        assert_eq!(puts[1].0, format!("/{STRUCK_CAR}/steps/s-review/metadata"));
+    }
+
+    /// KEPT: a hold that is not the judged-red hold for a train this look
+    /// cleared is not the look's to lift. The strike still clears; the
+    /// review step is never written.
+    #[tokio::test]
+    async fn a_strike_release_leaves_every_other_hold_where_it_is() {
+        let other_train = HOLD_775FEBA5.replace("9b5c1889", "0badc0de");
+        for (extra, what) in [
+            (json!({ "hold": "held for the restart" }), "a hand hold"),
+            (
+                json!({ "hold": "conductor re-judge at 29943365", "hold_sha": "29943365" }),
+                "a review hold",
+            ),
+            (
+                json!({ "hold_sha": "e76ef0f9" }),
+                "the judged-red text bound to a head",
+            ),
+            (json!({ "hold": other_train }), "another train's red"),
+            (
+                json!({ "releaser": "emp-david" }),
+                "a release reserved for a person",
+            ),
+        ] {
+            let review_md = review_md_775feba5(extra);
+            let s = stub(yard_775feba5(review_md.clone())).await;
+            let wire = Wire::at(s.base.clone(), named()).unwrap();
+            struck_release(&wire, "fix/held", &diagnosis_775feba5())
+                .await
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let car = s.packets.lock().unwrap()[0].clone();
+            assert!(car["metadata"].get("red_trains").is_none(), "{what}: {car}");
+            assert_eq!(car["steps"][1]["metadata"], review_md, "{what}");
+            assert_eq!(s.puts.lock().unwrap().len(), 1, "{what}: the strike alone");
+        }
+    }
+
+    /// A HOLD WRITTEN WHILE THE LOOK WAS JUDGING STAYS (review 5d605949
+    /// R1). The lift judged the old unbound judged-red hold, then awaited
+    /// the bare-release authority; a hold, a head or a reservation
+    /// written in that await is not the hold it judged, so it is never
+    /// cleared: the review step reads exactly as that writer left it and
+    /// only the strike's own write is sent. Before the repair the lift
+    /// sent `hold: null` over a head-bound review hold and left its
+    /// `hold_sha` standing beside no hold.
+    #[tokio::test]
+    async fn a_hold_written_while_the_look_judged_it_is_never_lifted() {
+        for (over, what) in [
+            (
+                json!({ "hold": "conductor re-judge at new-head", "hold_sha": "new-head" }),
+                "a review hold bound to a new head",
+            ),
+            (
+                json!({ "hold_sha": "new-head" }),
+                "the same text, now bound to a head",
+            ),
+            (
+                json!({ "releaser": "emp-david" }),
+                "a release reserved for a person",
+            ),
+            (
+                json!({ "hold": "held for the restart" }),
+                "a hand hold over the red-train hold",
+            ),
+        ] {
+            let protocol = json!({"kind":"ship-a-change","version":7,"status":"active",
+                "steps":[{"title":"review"}],"concurrent_review_md": over.clone()});
+            let s =
+                stub_with_protocol(yard_775feba5(review_md_775feba5(json!({}))), protocol).await;
+            let wire = Wire::at(s.base.clone(), named()).unwrap();
+            struck_release(&wire, "fix/held", &diagnosis_775feba5())
+                .await
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let car = s.packets.lock().unwrap()[0].clone();
+            assert!(car["metadata"].get("red_trains").is_none(), "{what}: {car}");
+            let mut expected = review_md_775feba5(json!({}));
+            for (k, v) in over.as_object().unwrap() {
+                expected[k] = v.clone();
+            }
+            assert_eq!(car["steps"][1]["metadata"], expected, "{what}");
+            let puts = s.puts.lock().unwrap();
+            assert_eq!(puts.len(), 1, "{what}: the strike alone: {puts:?}");
+        }
+
+        // And the line names the hold that stands, not the one judged.
+        let protocol = json!({"kind":"ship-a-change","version":7,"status":"active",
+            "steps":[{"title":"review"}],"concurrent_review_md":
+            { "hold": "conductor re-judge at new-head", "hold_sha": "new-head" }});
+        let mut yard = yard_775feba5(review_md_775feba5(json!({})));
+        yard[0]["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("red_trains");
+        let car = yard[0].clone();
+        let s = stub_with_protocol(yard, protocol).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let line = lift_struck_hold(&wire, &car, &[T9B5C1889.into()], &Releaser::default())
+            .await
+            .expect("a hold that moved is a line, not an error");
+        assert!(
+            line.contains("changed") && line.contains("conductor re-judge at new-head"),
+            "{line}"
+        );
+        assert!(s.puts.lock().unwrap().is_empty(), "nothing is written");
+    }
+
+    /// BOTH RELEASE PATHS AGREE about who may lift the hold
+    /// (`may_lift_bare`): the car's own builder run, which a bare release
+    /// refuses (backlog b7b02024 car 3), clears the strikes on a look but
+    /// does not lift the hold either way.
+    #[tokio::test]
+    async fn the_builder_run_lifts_the_red_train_hold_by_neither_release() {
+        let builder = Releaser {
+            run: Some("57ea38f6-ae5d-4c59-9380-4364c247c074".into()),
+            agent_shell: true,
+        };
+        let review_md = review_md_775feba5(json!({}));
+        let s = stub(yard_775feba5(review_md.clone())).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        crate::strike_release::release_struck(&wire, "fix/held", &diagnosis_775feba5(), &builder)
+            .await
+            .expect("the strike clears on the look");
+        let car = s.packets.lock().unwrap()[0].clone();
+        assert!(car["metadata"].get("red_trains").is_none(), "{car}");
+        assert_eq!(car["steps"][1]["metadata"], review_md);
+        let err = hold_as(&wire, "fix/held", None, &builder)
+            .await
+            .expect_err("the bare release refuses the builder run too");
+        assert!(err.to_string().contains("the run that built"), "{err}");
+        assert_eq!(s.puts.lock().unwrap().len(), 1, "the strike alone");
     }
 
     // ------------------------------------------------------------------
@@ -4956,6 +6448,19 @@ mod tests {
         assert_eq!(body[RELEASED_KEY]["from_run"], json!(HELD_RUN));
         assert_eq!(body[RELEASED_KEY]["by"], json!("emp-david"));
         assert_eq!(body[RELEASED_KEY]["at"], json!("2026-09-22T06:00:00Z"));
+        // The holder it was taken FROM — not `by`, the verb's caller —
+        // which the dispatcher's capability pick reads so the step does
+        // not hash straight back to it (backlog ff0f0ff5).
+        assert_eq!(
+            body[RELEASED_KEY][boss_jobs::step_release::FROM],
+            json!("agent-claude")
+        );
+        let md = json!({ RELEASED_KEY: body[RELEASED_KEY].clone() });
+        assert_eq!(
+            boss_jobs::step_release::released_from(&md),
+            Some("agent-claude"),
+            "the one reader the dispatcher uses reads what this verb writes"
+        );
         // A step with NO edge — the population this packet measured —
         // releases the same way, and the record says the edge was
         // missing rather than leaving the reader to wonder.
@@ -5320,6 +6825,528 @@ mod tests {
             .expect_err("nobody holds it");
         assert!(err.to_string().contains("nothing to release"), "{err}");
         assert!(s.puts.lock().unwrap().is_empty(), "nothing was written");
+    }
+
+    // ------------------------------------------------------------------
+    // A claimed step exits by naming its claim (backlog 7b5195ea)
+    // ------------------------------------------------------------------
+
+    const CLAIM: &str = "5b0f3c1e-8f2a-4f0e-9a51-3d2c1b0a9f8e";
+
+    /// `claimed` holding a robots-pool claim, as agent-run v11's
+    /// `building` holds one from its claim on.
+    fn with_claim(mut step: Value, id: Value) -> Value {
+        step["metadata"][boss_jobs::flow_resources::TOKEN_KEY] =
+            json!({ "id": id, "lease_until": "2026-11-08T08:00:00Z" });
+        step
+    }
+
+    /// The status PUT each verb sent: the last write the stub saw.
+    fn status_put(s: &Stub) -> Value {
+        s.puts
+            .lock()
+            .unwrap()
+            .iter()
+            .rfind(|(path, _)| !path.ends_with("/metadata"))
+            .map(|(_, body)| body.clone())
+            .expect("a status PUT was sent")
+    }
+
+    /// THE DEADLOCK OF 2026-11-08: four finished runs could not end
+    /// their `building` because neither verb named the claim, and the
+    /// stub refuses that exit exactly as the server does. Each verb now
+    /// reads the id off the step it already fetched and sends it.
+    #[tokio::test]
+    async fn complete_and_release_name_the_claim_the_step_holds() {
+        let held = with_claim(claimed("active", Some(HELD_RUN)), json!(CLAIM));
+        let s = stub(vec![held_packet(held.clone())]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        complete(&wire, "bd93d2be", "build", &[])
+            .await
+            .expect("the claimed step completes");
+        assert_eq!(
+            status_put(&s),
+            json!({ "status": "completed", boss_jobs::flow_resources::EXIT_CLAIM_KEY: CLAIM })
+        );
+
+        let s = stub(vec![held_packet(held)]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        release_step(&wire, "bd93d2be", "build", "the run died (7b5195ea)")
+            .await
+            .expect("the claimed step is released");
+        assert_eq!(
+            status_put(&s),
+            json!({ "status": "ready", "assignee_id": null,
+                    boss_jobs::flow_resources::EXIT_CLAIM_KEY: CLAIM })
+        );
+    }
+
+    /// A step that holds no claim sends no claim — the body is what it
+    /// always was.
+    #[tokio::test]
+    async fn a_step_holding_no_claim_sends_none() {
+        let s = stub(vec![held_packet(claimed("active", Some(HELD_RUN)))]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        complete(&wire, "bd93d2be", "build", &[])
+            .await
+            .expect("completes");
+        assert_eq!(status_put(&s), json!({ "status": "completed" }));
+
+        let s = stub(vec![held_packet(claimed("active", Some(HELD_RUN)))]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        release_step(&wire, "bd93d2be", "build", "a reason")
+            .await
+            .expect("released");
+        assert_eq!(
+            status_put(&s),
+            json!({ "status": "ready", "assignee_id": null })
+        );
+    }
+
+    /// A claim the verb cannot name (its id is not a string) is still
+    /// refused by the server, and the refusal reaches the operator
+    /// WHOLE — where the id lives and that the lease is the only other
+    /// release — not a status code to go and re-derive.
+    #[tokio::test]
+    async fn a_refused_exit_is_printed_whole() {
+        let unnamed = with_claim(claimed("active", Some(HELD_RUN)), json!(7));
+        let s = stub(vec![held_packet(unnamed)]).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let err = complete(&wire, "bd93d2be", "build", &[])
+            .await
+            .expect_err("no claim id to name");
+        assert!(
+            format!("{err:#}").contains(boss_jobs::flow_resources::EXIT_REFUSAL),
+            "{err:#}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `boss step unname` — a READY nomination handed back to its
+    // station's admission queue (backlog b42b4a8c).
+    // ------------------------------------------------------------------
+
+    const JOB_A: &str = "a1a1a1a1-0000-4000-8000-000000000001";
+    const JOB_B: &str = "b2b2b2b2-0000-4000-8000-000000000002";
+    const STEP_A: &str = "a1a1a1a1-5555-4000-8000-000000000011";
+    const STEP_B: &str = "b2b2b2b2-5555-4000-8000-000000000022";
+    const LIVE_RUN: &str = "c3c3c3c3-0000-4000-8000-000000000003";
+    const UNNAME_WHY: &str =
+        "work sits at its station's admission queue, not at a name (e1eaf72b, b42b4a8c)";
+
+    /// The agents registry as `/api/agents` answers it: the stub serves
+    /// these rows off its protocol definition.
+    fn with_agents() -> Value {
+        json!({"kind":"ship-a-change","version":7,"status":"active","steps":[{"title":"review"}],
+               "release_actor_rows":[
+                   {"id":"agent-claude","aliases":["claude@algedonic.dev"]},
+                   {"id":"agent-codex","aliases":["codex@algedonic.dev"]}]})
+    }
+
+    /// One open backlog-item whose `slug` step stands `status`, named to
+    /// `holder`, with or without a run edge — the shape the matchmaker
+    /// left ~1078 of them in (b42b4a8c's triage, 2026-11-12).
+    fn nominated(
+        job: &str,
+        step: &str,
+        slug: &str,
+        status: &str,
+        holder: &str,
+        edge: Option<&str>,
+    ) -> Value {
+        let mut md = Map::new();
+        md.insert("agent_model".into(), json!("opus-5-5"));
+        md.insert("authority_role".into(), json!("platform-admin"));
+        if let Some(run) = edge {
+            md.insert(boss_jobs::agent_runs::EDGE_KEY.into(), json!(run));
+        }
+        json!({
+            "id": job, "kind": "backlog-item", "status": "open", "title": "an item",
+            "metadata": {},
+            "steps": [
+                { "id": format!("{job}-filed"), "spec_slug": "filed", "status": "completed",
+                  "assignee_id": holder, "metadata": {} },
+                { "id": step, "spec_slug": slug, "kind": "task", "status": status,
+                  "assignee_id": holder, "metadata": Value::Object(md) },
+            ],
+        })
+    }
+
+    fn unname_args(holder: &str) -> UnnameArgs {
+        UnnameArgs {
+            kind: Some("backlog-item".into()),
+            step: None,
+            holder: holder.into(),
+            packet: None,
+            why: UNNAME_WHY.into(),
+            dry_run: false,
+            limit: None,
+        }
+    }
+
+    fn step_of(s: &Stub, job: &str, step: &str) -> Value {
+        s.packets
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == job)
+            .and_then(|p| p["steps"].as_array())
+            .and_then(|steps| steps.iter().find(|x| x["id"] == step))
+            .cloned()
+            .expect("the fixture holds the step")
+    }
+
+    /// THE WHOLE VERB against the stub: a ready step named to the holder
+    /// goes back to its station — one merge, one assignee-only PUT — and
+    /// reads back unassigned, still ready, with the reason and the holder
+    /// it was taken FROM on the record.
+    #[tokio::test]
+    async fn a_ready_nominated_step_is_unnamed_and_reads_back() {
+        let s = stub_with_protocol(
+            vec![nominated(
+                JOB_A,
+                STEP_A,
+                "build",
+                "ready",
+                "agent-claude",
+                None,
+            )],
+            with_agents(),
+        )
+        .await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let done = unname_steps(&wire, &unname_args("agent-claude"))
+            .await
+            .expect("unnamed");
+        assert_eq!(done.unnamed.len(), 1, "{done:?}");
+        assert!(
+            done.refused.is_empty() && done.skipped.is_empty(),
+            "{done:?}"
+        );
+        assert_eq!(
+            done.cohort.get(&(
+                "backlog-item".to_string(),
+                "build".to_string(),
+                "agent-claude".to_string()
+            )),
+            Some(&1),
+            "the completed `filed` step is history, not cohort: {done:?}"
+        );
+
+        let puts = s.puts.lock().unwrap().clone();
+        assert_eq!(puts.len(), 2, "one merge, one PUT: {puts:?}");
+        assert!(
+            puts[0].0.ends_with("/metadata"),
+            "the merge first: {puts:?}"
+        );
+        assert_eq!(
+            puts[1].1,
+            json!({ "assignee_id": null }),
+            "the PUT names no status: a ready step is already where it goes"
+        );
+
+        let step = step_of(&s, JOB_A, STEP_A);
+        assert_eq!(step["status"], json!("ready"));
+        assert_eq!(step["assignee_id"], Value::Null);
+        assert_eq!(step["metadata"][RELEASED_KEY]["why"], json!(UNNAME_WHY));
+        assert_eq!(
+            step["metadata"][RELEASED_KEY][boss_jobs::step_release::FROM],
+            json!("agent-claude")
+        );
+        assert_eq!(
+            step["metadata"][RELEASED_KEY]["by"],
+            json!("claude@algedonic.dev")
+        );
+        assert_eq!(
+            step["metadata"]["agent_model"],
+            json!("opus-5-5"),
+            "the agent block rides through for the next executor: {step}"
+        );
+    }
+
+    /// A CLAIMED step is not a nomination: somebody holds it, and
+    /// handing it back is `boss step release`'s, on the operator's
+    /// reading of the run. Refused, named, and nothing written.
+    #[tokio::test]
+    async fn an_active_step_is_refused_as_release_s_job() {
+        let s = stub_with_protocol(
+            vec![nominated(
+                JOB_A,
+                STEP_A,
+                "build",
+                "active",
+                "agent-claude",
+                Some(HELD_RUN),
+            )],
+            with_agents(),
+        )
+        .await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let done = unname_steps(&wire, &unname_args("agent-claude"))
+            .await
+            .expect("a pass that refuses a step still answers");
+        assert!(done.unnamed.is_empty(), "{done:?}");
+        assert_eq!(done.refused.len(), 1, "{done:?}");
+        assert!(done.refused[0].contains("boss step release"), "{done:?}");
+        assert!(s.puts.lock().unwrap().is_empty(), "nothing was written");
+        assert_eq!(step_of(&s, JOB_A, STEP_A)["status"], json!("active"));
+    }
+
+    /// The holder is the cohort. Another holder's ready step is not
+    /// this pass's — named by an alias, the holder is still the one
+    /// agent the registry ties every spelling to.
+    #[tokio::test]
+    async fn a_step_named_to_another_holder_is_left_alone() {
+        let s = stub_with_protocol(
+            vec![
+                nominated(JOB_A, STEP_A, "build", "ready", "agent-claude", None),
+                nominated(JOB_B, STEP_B, "build", "ready", "agent-codex", None),
+            ],
+            with_agents(),
+        )
+        .await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let done = unname_steps(&wire, &unname_args("claude@algedonic.dev"))
+            .await
+            .expect("unnamed");
+        assert_eq!(done.unnamed.len(), 1, "{done:?}");
+        assert!(
+            s.puts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(p, _)| p.contains(JOB_A)),
+            "only the holder's packet was written"
+        );
+        let other = step_of(&s, JOB_B, STEP_B);
+        assert_eq!(other["assignee_id"], json!("agent-codex"));
+        assert!(other["metadata"].get(RELEASED_KEY).is_none(), "{other}");
+    }
+
+    /// A ready step naming an OPEN run was dispatched and not yet
+    /// claimed: an executor is on its way to it. Refused, naming the
+    /// run. A run that has closed is no executor at all — that step is
+    /// unnamed, and the dead edge goes with it as `from_run`.
+    #[tokio::test]
+    async fn a_live_run_edge_is_refused_and_a_dead_one_is_cleared() {
+        let run = |status: &str| {
+            json!({ "id": LIVE_RUN, "kind": "agent-run", "status": status,
+                    "metadata": {}, "steps": [] })
+        };
+        let s = stub_with_protocol(
+            vec![
+                nominated(
+                    JOB_A,
+                    STEP_A,
+                    "build",
+                    "ready",
+                    "agent-claude",
+                    Some(LIVE_RUN),
+                ),
+                run("open"),
+            ],
+            with_agents(),
+        )
+        .await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let done = unname_steps(&wire, &unname_args("agent-claude"))
+            .await
+            .expect("answers");
+        assert!(done.unnamed.is_empty(), "{done:?}");
+        assert_eq!(done.refused.len(), 1, "{done:?}");
+        assert!(
+            done.refused[0].contains(LIVE_RUN),
+            "names the run: {done:?}"
+        );
+        assert!(s.puts.lock().unwrap().is_empty(), "nothing was written");
+
+        let s = stub_with_protocol(
+            vec![
+                nominated(
+                    JOB_A,
+                    STEP_A,
+                    "build",
+                    "ready",
+                    "agent-claude",
+                    Some(LIVE_RUN),
+                ),
+                run("closed"),
+            ],
+            with_agents(),
+        )
+        .await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let done = unname_steps(&wire, &unname_args("agent-claude"))
+            .await
+            .expect("unnamed");
+        assert_eq!(done.unnamed.len(), 1, "{done:?}");
+        let step = step_of(&s, JOB_A, STEP_A);
+        assert!(
+            step["metadata"]
+                .get(boss_jobs::agent_runs::EDGE_KEY)
+                .is_none(),
+            "{step}"
+        );
+        assert_eq!(
+            step["metadata"][RELEASED_KEY][boss_jobs::step_release::FROM_RUN],
+            json!(LIVE_RUN)
+        );
+    }
+
+    /// --dry-run judges exactly as the pass would and writes NOTHING —
+    /// by cohort, and by one packet.
+    #[tokio::test]
+    async fn a_dry_run_writes_nothing() {
+        let fixture = vec![nominated(
+            JOB_A,
+            STEP_A,
+            "build",
+            "ready",
+            "agent-claude",
+            None,
+        )];
+        let s = stub_with_protocol(fixture.clone(), with_agents()).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let mut args = unname_args("agent-claude");
+        args.dry_run = true;
+        let done = unname_steps(&wire, &args).await.expect("dry run");
+        assert_eq!(done.unnamed.len(), 1, "would unname one: {done:?}");
+        assert!(done.dry_run);
+        args.kind = None;
+        args.packet = Some(JOB_A.into());
+        let one = unname_steps(&wire, &args)
+            .await
+            .expect("dry run, one packet");
+        assert_eq!(one.unnamed.len(), 1, "{one:?}");
+        assert!(s.puts.lock().unwrap().is_empty(), "nothing was written");
+        assert_eq!(*s.packets.lock().unwrap(), fixture);
+    }
+
+    /// REFUSED BEFORE ANY READ OF THE COHORT: a blank reason, a holder
+    /// the agents registry does not hold (a person's nomination is a
+    /// person's to hand back), and a registry that cannot be read.
+    #[tokio::test]
+    async fn a_blank_reason_a_person_and_a_dark_registry_are_refused_before_writing() {
+        let fixture = || {
+            vec![nominated(
+                JOB_A,
+                STEP_A,
+                "build",
+                "ready",
+                "emp-david",
+                None,
+            )]
+        };
+        let s = stub_with_protocol(fixture(), with_agents()).await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let mut blank = unname_args("agent-claude");
+        blank.why = "  ".into();
+        let err = unname_steps(&wire, &blank).await.expect_err("blank");
+        assert!(err.to_string().contains("--why is blank"), "{err}");
+        let err = unname_steps(&wire, &unname_args("emp-david"))
+            .await
+            .expect_err("a person");
+        assert!(err.to_string().contains("agents registry"), "{err}");
+        assert!(s.puts.lock().unwrap().is_empty());
+
+        let dark = stub(fixture()).await;
+        let wire = Wire::at(dark.base.clone(), named()).unwrap();
+        assert!(
+            unname_steps(&wire, &unname_args("agent-claude"))
+                .await
+                .is_err(),
+            "no registry is no evidence the holder is an agent"
+        );
+        assert!(dark.puts.lock().unwrap().is_empty());
+    }
+
+    /// --limit bounds a pass: of two named steps, one is taken.
+    #[tokio::test]
+    async fn a_limit_bounds_the_pass() {
+        let s = stub_with_protocol(
+            vec![
+                nominated(JOB_A, STEP_A, "build", "ready", "agent-claude", None),
+                nominated(JOB_B, STEP_B, "triage", "ready", "agent-claude", None),
+            ],
+            with_agents(),
+        )
+        .await;
+        let wire = Wire::at(s.base.clone(), named()).unwrap();
+        let mut args = unname_args("agent-claude");
+        args.limit = Some(1);
+        let done = unname_steps(&wire, &args).await.expect("unnamed");
+        assert_eq!(done.unnamed.len(), 1, "{done:?}");
+        assert_eq!(s.puts.lock().unwrap().len(), 2, "one step's two writes");
+        args.limit = None;
+        args.step = Some("triage".into());
+        args.dry_run = true;
+        let left = unname_steps(&wire, &args).await.expect("dry run");
+        assert_eq!(left.unnamed.len(), 1, "--step narrows: {left:?}");
+    }
+
+    /// THE READ-BACK GUARD: a step this pass unnamed that reads back
+    /// named again is a dispatcher still nominating — the matchmaker
+    /// e1eaf72b retired — and is reported, not passed.
+    #[test]
+    fn a_step_named_again_after_the_pass_is_found() {
+        let rows = [
+            nominated(JOB_A, STEP_A, "build", "ready", "agent-codex", None),
+            nominated(JOB_B, STEP_B, "build", "ready", "agent-claude", None),
+        ];
+        let mut free = rows[1].clone();
+        free["steps"][1]["assignee_id"] = Value::Null;
+        let touched = vec![STEP_A.to_string(), STEP_B.to_string()];
+        assert_eq!(
+            named_again(&[rows[0].clone(), free], &touched),
+            vec![format!(
+                "{} `build` named to agent-codex",
+                crate::train::id8(JOB_A)
+            )]
+        );
+        assert!(named_again(&rows[1..], &[]).is_empty());
+    }
+
+    /// The verb's shape on the command line: --holder is required (never
+    /// every holder), and a pass names a packet kind or one packet.
+    #[test]
+    fn unname_takes_a_holder_and_a_kind_or_a_packet() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(subcommand)]
+            action: StepAction,
+        }
+        let ok = [
+            "t",
+            "unname",
+            "--holder",
+            "agent-claude",
+            "--kind",
+            "backlog-item",
+            "--why",
+            "w",
+        ];
+        assert!(T::try_parse_from(ok).is_ok());
+        let one = [
+            "t",
+            "unname",
+            "--holder",
+            "agent-claude",
+            "--packet",
+            "a1a1a1a1",
+            "--why",
+            "w",
+        ];
+        assert!(T::try_parse_from(one).is_ok());
+        let no_holder = ["t", "unname", "--kind", "backlog-item", "--why", "w"];
+        assert!(T::try_parse_from(no_holder).is_err(), "no holder");
+        let no_cohort = ["t", "unname", "--holder", "agent-claude", "--why", "w"];
+        assert!(
+            T::try_parse_from(no_cohort).is_err(),
+            "no kind and no packet"
+        );
+        let no_why = ["t", "unname", "--holder", "agent-claude", "--kind", "k"];
+        assert!(T::try_parse_from(no_why).is_err(), "no reason");
     }
 }
 

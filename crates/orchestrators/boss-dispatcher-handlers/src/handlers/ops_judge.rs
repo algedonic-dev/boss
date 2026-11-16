@@ -499,7 +499,16 @@ fn approver_decline(job: &serde_json::Value) -> Option<ApproverDecline> {
         .get("completed_by")
         .and_then(|v| v.as_str())
         .map(str::trim)
-        .filter(|b| !b.is_empty() && !b.starts_with("automation:"))?;
+        .filter(|b| {
+            // A person's act: a NAMED signer (a blank id parses as a bare
+            // Human, so the name is checked first), then the one
+            // executor-kind mapping, never an id prefix (backlog
+            // 8e8d0b1a) - an agent, a legacy rule or an unresolved login
+            // is no approver.
+            !b.is_empty()
+                && b.parse::<boss_core::actor::ActorId>()
+                    .is_ok_and(|a| a.executor_kind() == boss_core::actor::ExecutorKind::Human)
+        })?;
     let decision = meta_str(approve, "decision").filter(|d| DECLINING_DECISIONS.contains(d))?;
     Some(ApproverDecline {
         by: by.to_string(),
@@ -1909,6 +1918,26 @@ mod tests {
                 failed.contains("no step records why"),
                 "{decision:?}: {failed}"
             );
+        }
+    }
+
+    /// A DECLINE NOBODY SIGNED IS NO PERSON'S DECISION (Codex review of
+    /// 8e8d0b1a, 2026-11-08). A blank id parses as a bare Human id, so the
+    /// executor-kind mapping alone let `completed_by = ""` read as a
+    /// person's signed decline and quieted the alarm. A signer must be
+    /// named before its kind is asked.
+    #[tokio::test]
+    async fn a_decline_with_a_blank_signer_is_still_an_alarm() {
+        for signer in ["", "   "] {
+            let mut job = declined("rejected");
+            job["steps"][1]["completed_by"] = json!(signer);
+            let (base, writes) = mock_jobs(vec![job]).await;
+            judge(base)
+                .invoke(&watch_args(), &refused_ctx())
+                .await
+                .unwrap();
+            let w = writes.lock().unwrap().clone();
+            assert_eq!(alarms(&w).len(), 1, "{signer:?}: {w:?}");
         }
     }
 

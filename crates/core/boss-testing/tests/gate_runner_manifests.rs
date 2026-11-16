@@ -42,6 +42,132 @@ const DEV: &str = "infra/cluster/manifests/boss-dev.yaml";
 const APPLY: &str = "infra/gate-runner/apply-script-configmap.sh";
 const CONFIGMAP: &str = "gate-runner-script";
 
+/// Run the actual input block, without cloning or touching a cluster.
+#[test]
+fn both_runner_defaults_read_the_delivered_repository_and_refuse_missing_data() {
+    let dir = boss_testing::scratch::scratch_dir("runner-repository-default");
+    let data = dir.join("forge-repository");
+    let script = dir.join("repository.sh");
+    let url = "file:///fixture/declared.git";
+    for path in ["infra/gate-runner/run.sh", "infra/gate-runner/bootstrap.sh"] {
+        let text = read(path);
+        let block = text
+            .split_once("# --- forge repository (begin) ---\n")
+            .unwrap()
+            .1
+            .split_once("# --- forge repository (end) ---")
+            .unwrap()
+            .0;
+        let child = if path.ends_with("bootstrap.sh") {
+            "bash -c 'test \"$FORGE_URL\" = \"$EXPECTED_URL\"'\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            &script,
+            format!("set -euo pipefail\n{block}\nprintf '%s' \"$FORGE_URL\"\n{child}"),
+        )
+        .unwrap();
+        let run = || {
+            let mut command = std::process::Command::new("bash");
+            command
+                .arg(&script)
+                .env_remove("FORGE_URL")
+                .env("GATE_FORGE_REPOSITORY_FILE", &data)
+                .env("EXPECTED_URL", url);
+            command.output().unwrap()
+        };
+        std::fs::write(&data, format!("{url}\n")).unwrap();
+        let out = run();
+        assert!(
+            out.status.success(),
+            "{path}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), url);
+        std::fs::remove_file(&data).unwrap();
+        let out = run();
+        assert_eq!(out.status.code(), Some(78), "{path}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("declared forge repository"));
+        std::fs::write(&data, "").unwrap();
+        assert_eq!(
+            run().status.code(),
+            Some(78),
+            "{path}: empty data is refused"
+        );
+    }
+}
+
+#[test]
+fn the_configmap_check_detects_repository_drift_even_when_scripts_match() {
+    let root = repo_root();
+    let dir = boss_testing::scratch::scratch_dir("runner-repository-drift");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let tool = bin.join("kubectl");
+    boss_testing::write_exec(
+        &tool,
+        r#"#!/usr/bin/env bash
+set -eu
+case "$*" in
+  *' create configmap '*) printf 'kind: ConfigMap\n';;
+  *' get configmap '*)
+    printf 'get\n' >> "$READ_COUNT"
+    python3 -c 'import json, os, pathlib
+root = pathlib.Path(os.environ["SOURCE_ROOT"]) / "infra/gate-runner"
+data = {key: (root / key).read_text() for key in ("run.sh", "bootstrap.sh", "seed-refresh.sh")}
+data["forge-repository"] = pathlib.Path(os.environ["REPOSITORY_DATA"]).read_text().rstrip("\n")
+print(json.dumps({"data": data}))';;
+  *) echo 'unexpected kubectl effect' >&2; exit 2;;
+esac
+"#,
+    );
+    let data = dir.join("repository");
+    let reads = dir.join("reads");
+    let expected = std::process::Command::new("python3")
+        .arg("-B")
+        .arg(root.join("infra/gate-runner/forge-repository.py"))
+        .arg(root.join("infra/estate/estate.toml"))
+        .output()
+        .unwrap();
+    assert!(expected.status.success());
+    std::fs::write(&data, expected.stdout).unwrap();
+    let check = || {
+        std::process::Command::new("bash")
+            .arg(root.join(APPLY))
+            .arg("--check")
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("SOURCE_ROOT", &root)
+            .env("REPOSITORY_DATA", &data)
+            .env("READ_COUNT", &reads)
+            .output()
+            .unwrap()
+    };
+    let matched = check();
+    assert!(
+        matched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&matched.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&reads).unwrap().lines().count(),
+        1,
+        "scripts and repository are compared from one observed ConfigMap"
+    );
+    std::fs::write(&data, "file:///fixture/wrong.git\n").unwrap();
+    let drift = check();
+    assert_eq!(drift.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&drift.stderr).contains("key forge-repository does not match"));
+    assert_eq!(std::fs::read_to_string(&reads).unwrap().lines().count(), 2);
+}
+
 /// The per-pod workspace is the whole reason concurrent gates are safe.
 /// Since backlog 52ea56ac it is the pod's OWN directory of the gate
 /// claim rather than an emptyDir (it must share the seed's filesystem
@@ -110,6 +236,10 @@ fn configmap_keys(text: &str, only_from: Option<&str>) -> std::collections::BTre
                 _ => Some(key.to_string()),
             }
         })
+        .chain(text.split("--from-literal=").skip(1).filter_map(|rest| {
+            let arg = rest.split_whitespace().next()?.trim_matches('"');
+            Some(arg.split_once('=')?.0.to_string())
+        }))
         .collect()
 }
 
@@ -125,29 +255,46 @@ fn the_converge_and_the_hand_verb_build_the_same_script_keys() {
         Some("/gate/"),
     );
     let apply = configmap_keys(&read(APPLY), None);
-    let want: std::collections::BTreeSet<String> = ["bootstrap.sh", "run.sh"]
-        .iter()
-        .map(|k| k.to_string())
-        .collect();
+    let want: std::collections::BTreeSet<String> = [
+        "bootstrap.sh",
+        "run.sh",
+        "seed-refresh.sh",
+        "forge-repository",
+    ]
+    .iter()
+    .map(|k| k.to_string())
+    .collect();
     assert_eq!(
         converge, want,
-        "the converge must write both the bootstrap and main's run.sh into {CONFIGMAP}"
+        "the converge must write the bootstrap, main's run.sh and the seed housekeeping \
+         (backlog 3e2c8ddc) into {CONFIGMAP}"
     );
     assert_eq!(
         apply, converge,
         "{APPLY} and the converge build {CONFIGMAP} with different keys — its --check would \
          answer for an object the converge never writes"
     );
+    // EVERY command the manifest runs from the ConfigMap: since 3e2c8ddc
+    // the gate's run.sh AND the seed-refresh container's seed-refresh.sh.
     let manifest = read(SHARED);
-    let execs = manifest
-        .split("/repo-script/")
-        .nth(1)
-        .and_then(|rest| rest.split('"').next())
-        .expect("the manifest's command runs a script from /repo-script");
-    assert!(
-        converge.contains(execs),
-        "{SHARED} execs /repo-script/{execs}, a key the converge does not write ({converge:?})"
+    let execs: Vec<&str> = manifest
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("command:"))
+        .filter_map(|l| l.split("/repo-script/").nth(1))
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert_eq!(
+        execs,
+        ["run.sh", "seed-refresh.sh"],
+        "the manifest's commands run the gate's script and the helper's from /repo-script"
     );
+    for key in execs {
+        assert!(
+            converge.contains(key),
+            "{SHARED} execs /repo-script/{key}, a key the converge does not write ({converge:?})"
+        );
+    }
     assert!(
         read("infra/gate-runner/bootstrap.sh").contains("/run.sh"),
         "the bootstrap's fallback is the ConfigMap's run.sh key"
@@ -226,6 +373,191 @@ fn pod_containers(text: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// The pod spec's containers as (section, name), in order: which list
+/// each is declared in is the whole of the judged-init layout.
+fn pod_sections(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut section = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if indent == 6 && trimmed.ends_with(':') {
+            section = trimmed.trim_end_matches(':').to_string();
+            continue;
+        }
+        if indent == 8
+            && matches!(section.as_str(), "containers" | "initContainers")
+            && let Some(name) = trimmed.strip_prefix("- name: ")
+        {
+            out.push((section.clone(), name.trim().to_string()));
+        }
+    }
+    out
+}
+
+/// The non-comment lines of a block, trimmed.
+fn code_lines(block: &str) -> Vec<&str> {
+    block
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
+/// THE GATE IS JUDGED IN AN INIT CONTAINER AND THE SEED IS REFRESHED
+/// AFTER IT (backlog 3e2c8ddc, with 82ffaff3; design b4bf8bba, both
+/// questions approved 2026-10-16). The conductor records a verdict only
+/// from a `gate` container that has ENDED, and the gate used to refresh
+/// the warm seed and empty its workspace before ending: a green waited
+/// 638 s for its own copy on gate-run 86dd2d48 and about eight minutes of
+/// `find -delete` in uninterruptible I/O on 4aad01a9. Car 39ee7932 taught
+/// every reader the layout; this pins the manifest that runs it.
+///
+/// FOUR FACTS TRAVEL TOGETHER, and each one alone is a defect: the Job's
+/// layout label (which finished Jobs owe a housekeeping record), the
+/// gate's GATE_LAYOUT (run.sh hands off instead of refreshing), `gate`
+/// as an init container (it ends on its verdict), and the `seed-refresh`
+/// container after it (someone takes the handoff). A handoff nobody takes
+/// leaves a workspace for the hour-idle sweep and the seed cold; a label
+/// without the helper owes a record nothing writes.
+#[test]
+fn the_gate_is_judged_in_an_init_container_and_the_seed_refreshed_after_it() {
+    let text = read(SHARED);
+    let job = text
+        .split("\n---")
+        .find(|d| d.contains("kind: Job"))
+        .expect("the runner manifest carries a Job");
+    // The label, on the Job's OWN metadata (the reader selects on Jobs),
+    // spelled as the conductor's reader spells it (§9a).
+    let reader = read("crates/orchestrators/boss-cli/src/train/carried_verdict.rs");
+    for constant in [
+        "LAYOUT_LABEL: &str = \"boss.dev/gate-layout\";",
+        "LAYOUT_JUDGED_INIT: &str = \"judged-init\";",
+    ] {
+        assert!(
+            reader.contains(constant),
+            "the conductor's reader no longer declares {constant}"
+        );
+    }
+    let job_metadata = job
+        .split("\nspec:")
+        .next()
+        .expect("the Job has metadata before its spec");
+    assert!(
+        code_lines(job_metadata).contains(&"boss.dev/gate-layout: judged-init"),
+        "{SHARED}: the Job must carry `boss.dev/gate-layout: judged-init` on its own \
+         metadata — the conductor owes a finished Job's housekeeping record only on it"
+    );
+
+    assert_eq!(
+        pod_sections(&text),
+        [
+            ("initContainers", "postgres"),
+            ("initContainers", "gate"),
+            ("containers", "seed-refresh"),
+        ]
+        .map(|(s, n)| (s.to_string(), n.to_string())),
+        "{SHARED}: the judged-init layout is postgres (the native sidecar), then `gate` as \
+         a one-shot init container, then `seed-refresh` as the only regular container. A \
+         regular container beside the gate would run DURING the checks, and a second one \
+         after it would be a second thing the pod waits on"
+    );
+    let containers = pod_containers(&text);
+    let block = |name: &str| {
+        containers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| b.clone())
+            .unwrap_or_else(|| panic!("{SHARED} has no container {name}"))
+    };
+    let (gate, helper) = (block("gate"), block("seed-refresh"));
+    let gate_code = code_lines(&gate);
+    let helper_code = code_lines(&helper);
+
+    // The gate: a ONE-SHOT init container. `restartPolicy: Always` would
+    // make it a sidecar the kubelet never waits for, and the helper would
+    // start beside the checks.
+    assert!(
+        !gate_code.iter().any(|l| l.starts_with("restartPolicy:")),
+        "{SHARED}: the gate must not declare a restartPolicy — Always makes it a sidecar"
+    );
+    for line in [
+        "- {name: GATE_LAYOUT, value: judged-init}",
+        "- {name: GATE_VERDICT_CARRIER, value: pod-log}",
+        "command: [\"bash\", \"/repo-script/run.sh\"]",
+    ] {
+        assert!(
+            gate_code.contains(&line),
+            "{SHARED}: the gate container must declare `{line}` — run.sh hands its seed to \
+             the helper only when it is the carried runner AND told this layout"
+        );
+    }
+
+    // The helper: main's script, nothing of the branch's, no credential.
+    for line in [
+        "command: [\"bash\", \"/repo-script/seed-refresh.sh\", \"maintain\"]",
+        "- {name: NATIVE_JOB_NAME, valueFrom: {fieldRef: {fieldPath: \"metadata.labels['batch.kubernetes.io/job-name']\"}}}",
+        "- {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}",
+        "- {name: GATE_SEED_MAINTENANCE_DEADLINE_SECS, value: \"900\"}",
+        "- {name: GATE_SEED_MAINTENANCE_GRACE_SECS, value: \"30\"}",
+        "imagePullPolicy: IfNotPresent",
+    ] {
+        assert!(
+            helper_code.contains(&line),
+            "{SHARED}: the seed-refresh container must declare `{line}`"
+        );
+    }
+    let image = |code: &[&str]| {
+        code.iter()
+            .find_map(|l| l.strip_prefix("image: "))
+            .map(str::to_string)
+    };
+    assert_eq!(
+        image(&helper_code),
+        image(&gate_code),
+        "the helper runs in the image the gate just ran in: its tools (flock, timeout, cp) \
+         are the ones the old layout's refresh used, and IfNotPresent finds it on the node"
+    );
+    let mounts: Vec<&str> = helper_code
+        .iter()
+        .copied()
+        .filter(|l| l.contains("mountPath:"))
+        .collect();
+    assert_eq!(
+        mounts,
+        [
+            "- {name: gate-disk, mountPath: /gate-seed, subPath: seed}",
+            "- {name: gate-disk, mountPath: /gate-target, subPathExpr: runs/$(POD_NAME)}",
+            "- {name: run-script, mountPath: /repo-script}",
+        ],
+        "{SHARED}: the helper mounts the seed, THIS pod's workspace and main's scripts — \
+         never /gate-runs (every run's workspace), the database or the forge token"
+    );
+    for absent in [
+        "forge-token",
+        "GATE_VERDICT_CARRIER",
+        "GATE_LAYOUT",
+        "/gate-runs",
+    ] {
+        assert!(
+            !helper_code.iter().any(|l| l.contains(absent)),
+            "{SHARED}: the seed-refresh container must not name {absent}"
+        );
+    }
+    let ids = |code: &[&str]| {
+        code.iter()
+            .filter(|l| l.starts_with("runAsUser:") || l.starts_with("runAsGroup:"))
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(&helper_code),
+        ids(&gate_code),
+        "the helper deletes what the gate wrote and writes the seed the next gate reads: \
+         the same uid and gid"
+    );
 }
 
 /// THE GATE MUST MEET THE RESTRICTED PROFILE, NOT WARN ABOUT IT.
@@ -375,4 +707,99 @@ fn a_test_database_skips_durability_it_cannot_use() {
             );
         }
     }
+}
+
+/// One of infra/cargo-test-wide.sh's width constants, read from the
+/// script where it is declared on a line of its own — never retyped here.
+fn cargo_test_wide_constant(name: &str) -> u64 {
+    read("infra/cargo-test-wide.sh")
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{name}=")).map(str::to_string))
+        .unwrap_or_else(|| {
+            panic!("infra/cargo-test-wide.sh declares `{name}=<n>` on a line of its own")
+        })
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("{name} in infra/cargo-test-wide.sh is a number: {e}"))
+}
+
+/// THE GATE RUNS FOUR TEST BINARIES AT A TIME UNTIL ITS DRIVE IS REPLACED
+/// (backlog 62435ba1). The car that built the width derivation raised the
+/// cap to 8 on 44 width-4 receipts that read as width-bound. The one FULL
+/// gate at 8 (gate 62826a81, red at b094f85a) was bound by the gate drive
+/// instead: against a width-4 gate over the same 1216 binaries, wall
+/// 1336 s vs 1244 s, own_time_sum 10082 s vs 4850 s, test-phase io.some
+/// 418 s vs 3.6 s, and a budgeted 2 s statement in boss-jobs
+/// claims_console_history expired. So the derivation landed and the cap
+/// stayed at 4.
+///
+/// This pin is the one place that number is asserted, so raising it is a
+/// deliberate edit here: after the sustained-write gate drive is fitted
+/// (design 121f44a1 Q1), with one FULL gate's receipt at the new width as
+/// its evidence. The sidecar must then admit the product, which the next
+/// test holds.
+#[test]
+fn the_gate_runs_four_test_binaries_until_its_drive_is_replaced() {
+    let max_width = cargo_test_wide_constant("max_width");
+    assert_eq!(
+        max_width, 4,
+        "infra/cargo-test-wide.sh caps the test width at {max_width}; it is 4 until the \
+         sustained-write gate drive is fitted (design 121f44a1 Q1) and a FULL gate proves \
+         the wider width — at 8, gate 62826a81 doubled every binary's time on the gate \
+         volume (own_time_sum 10082 s vs 4850 s) and bought no wall time"
+    );
+}
+
+/// THE SIDECAR ADMITS EVERY CLIENT THE WIDEST TEST RUN CAN OPEN (backlog
+/// 62435ba1). infra/cargo-test-wide.sh runs up to `max_width` test
+/// binaries at once and each DB-backed binary holds up to
+/// `clients_per_binary` connections (two tests' pools of 5 plus the
+/// reaper's 8 drops; the worst three measured 15-16 each, above), so the
+/// gate's Postgres must admit at least their product — or the width the
+/// script derives from `SHOW max_connections` never reaches the cap, and
+/// the binaries that do run race each other for the last connections
+/// ("too many clients already", 124 of 225 binary runs on 2026-09-24).
+///
+/// Two files hold the fact — the script's constants and the manifest's
+/// `-c max_connections=` — so this test holds the RELATION between them
+/// (CLAUDE.md 9a), whatever the cap is: the manifest's number is read
+/// from the SHARED runner, the script's from the script, never retyped
+/// here. The dev pod's sidecar (DEV) keeps Postgres's default: builders
+/// there run tests through wt-cargo, one binary at a time, and changing
+/// that manifest rolls the operator's session (afaa90a3) for nothing.
+#[test]
+fn the_gate_postgres_admits_every_client_the_widest_run_opens() {
+    let max_width = cargo_test_wide_constant("max_width");
+    let clients_per_binary = cargo_test_wide_constant("clients_per_binary");
+    assert!(
+        clients_per_binary >= 16,
+        "the per-binary client count is {clients_per_binary}; the worst three binaries \
+         measured 15-16 each alone (2026-09-24), so a smaller count overstates the budget"
+    );
+    let text = read(SHARED);
+    let (_, pg) = pod_containers(&text)
+        .into_iter()
+        .find(|(n, _)| n == "postgres")
+        .unwrap_or_else(|| panic!("{SHARED} has no container named postgres"));
+    let admitted: u64 = pg
+        .split("\"-c\", \"max_connections=")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| {
+            panic!(
+                "{SHARED}: the postgres sidecar's args carry no `\"-c\", \"max_connections=<n>\"`; \
+                 Postgres's default of 100 admits {} binaries of {clients_per_binary} clients, \
+                 under the {max_width} the runner may start",
+                100 / clients_per_binary
+            )
+        })
+        .parse()
+        .expect("max_connections is a number");
+    assert!(
+        admitted >= max_width * clients_per_binary,
+        "{SHARED} admits {admitted} connections; {max_width} binaries x {clients_per_binary} \
+         clients is {}, and a sidecar under that leaves the last binaries to start racing \
+         for connections the first ones hold",
+        max_width * clients_per_binary
+    );
 }

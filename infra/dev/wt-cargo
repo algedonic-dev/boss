@@ -2,10 +2,19 @@
 # Dev isolation (b3071bf4): with a selector, candidate code runs only in
 # the worker; a selector naming no activated generation REFUSES (design
 # a68fc42a D1), never runs it here beside the token.
+# A caller the store is closed to (root-owned 0700; uid 65534 under
+# infra/dev/as-gate-uid.sh) cannot see the selector either way, so that
+# is a refusal too, never the held state (backlog 1fddbe13; the reasoning
+# is in infra/dev/run-while-held.sh).
 dev_control=/work/tools/dev-control
+seen=$dev_control
+until [[ -e $seen || -L $seen ]]; do seen=${seen%/*}; seen=${seen:-/}; done
 if [[ -e $dev_control/enabled || -L $dev_control/enabled ]]; then
     [[ "$(/usr/bin/readlink -- "$dev_control/enabled")" =~ ^"$dev_control"/generations/[0-9a-f]{40}$ ]] && exec "$dev_control/wt-cargo" "$@"
     echo "wt-cargo: REFUSED — dev isolation is on and its selector $dev_control/enabled names no activated generation, so candidate code does not run beside this container's credentials (design a68fc42a D1). Why: $dev_control/activation.log. boss-api and boss without --built still run." >&2
+    exit 75
+elif [[ ! -d $seen || ! -x $seen ]]; then
+    echo "wt-cargo: REFUSED — this caller (uid $EUID) cannot read the dev isolation store $dev_control ($seen is closed to it), so it cannot tell whether isolation is on, and candidate code does not run beside this container's credentials (design a68fc42a D1). Run it as the store's owner." >&2
     exit 75
 fi
 # wt-cargo — run cargo in a WORKTREE with its own target dir, seeded by
@@ -32,9 +41,11 @@ fi
 #        wt-cargo suite <crate>         (the whole suite, in chunks that
 #                                        fit a tool call; run it until it
 #                                        exits 0 — wt-cargo-suite.sh)
-# The seed is /scratch/target (kept warm by the shim's boss-cli build);
-# the per-worktree dir is /scratch/target-<worktree-basename>. Both roots
-# are overridable (WT_SEED, WT_TARGET_ROOT) so the test never touches
+# The seed is the SHARED checkout's own target — the dir wt_target_dir
+# names for the main checkout this worktree hangs off, /scratch/
+# target-boss on the pod, kept warm by the operator's builds there; the
+# per-worktree dir is /scratch/target-<worktree-basename>. Both are
+# overridable (WT_SEED, WT_TARGET_ROOT) so the test never touches
 # /scratch; the defaults are the pod's.
 set -euo pipefail
 here=$(dirname "$(readlink -f "$0")")
@@ -84,7 +95,6 @@ if [ -n "${agent_run//[[:space:]]/}" ]; then
     fi
 fi
 name=$(basename "$root")
-seed=${WT_SEED:-/scratch/target}
 # THE NAME IS READ, NOT TYPED (backlog 955c99b6, 2026-09-22). gate.sh
 # now checks into this same dir rather than the shared one, so the
 # spelling lives once — in the helper beside this script — and the two
@@ -92,6 +102,18 @@ seed=${WT_SEED:-/scratch/target}
 # shellcheck source=wt-target-dir.sh
 . "$here/wt-target-dir.sh" || { echo "wt-cargo: $here/wt-target-dir.sh could not be read — the per-worktree target dir has no name to read; refusing to build into a shared one" >&2; exit 2; }
 dir=$(wt_target_dir "${WT_TARGET_ROOT:-/scratch}" "$root")
+
+# THE SEED IS READ THE SAME WAY (backlog b6bbe177, 2026-10-20). It was
+# a typed /scratch/target, and on the pod nothing had written that dir
+# for weeks: the shared checkout builds through this door too, into
+# the dir the helper names for it, /scratch/target-boss (4.6 GB). So
+# every builder and reviewer target started cold — minutes and 8-18 GB
+# a run, ~30 runs that night. The seed is now the helper's answer for
+# the main checkout this worktree hangs off (the parent of git's common
+# dir), so the warm dir and the seed cannot be two names again. In the
+# main checkout itself that is its own dir, which needs no seed.
+common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=$root/.git
+seed=${WT_SEED:-$(wt_target_dir "${WT_TARGET_ROOT:-/scratch}" "$(dirname "$common")")}
 
 # THE BUILD HOLDS ITS TARGET (backlog 94cd0c23, 0c18deed, 2026-09-27).
 # A green gate frees the run's target (boss-cli scratch_target.rs), and
@@ -145,8 +167,8 @@ if [ ! -d "$dir" ]; then
         # printed value=1 (run c51f125b, 2026-09-26). A backdate that
         # fails is a seed that cannot be trusted: it is cleared and the
         # target starts cold, exactly like a failed copy. The hazard is
-        # latent while /scratch/target is absent and arms the moment a
-        # pass re-builds the seed after worktrees exist (da1d903f).
+        # live, not latent (da1d903f): the seed is the shared checkout's
+        # own target (b6bbe177), rebuilt there while worktrees exist.
         tmp=$dir.seeding
         rm -rf "$tmp"
         start=$(date +%s)
@@ -182,9 +204,9 @@ export CARGO_TARGET_DIR="$dir"
 # what keeps this pod alive. Above the floor it is one df and silent.
 #
 # The pass is handed THIS door's scratch root and the SEED as the
-# primary: the pod's CARGO_TARGET_DIR (the seed) was just re-pointed at
-# this worktree's dir above, and handed through, the pass would read
-# the warm seed as a sibling it may take. This worktree's own target is
+# primary: CARGO_TARGET_DIR was just re-pointed at this worktree's dir
+# above, and handed through, the pass would read the warm seed — the
+# shared checkout's target — as a sibling it may take. This worktree's own target is
 # touched first, because the pass takes idle targets oldest first and a
 # builder that read code for half an hour holds an idle one — it must
 # not be taken the moment before it builds. A failed pass is named and

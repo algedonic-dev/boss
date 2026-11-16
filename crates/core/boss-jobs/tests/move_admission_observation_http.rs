@@ -205,10 +205,13 @@ async fn observation_replay_conserves_the_whole_record_and_refuses_tampering() {
 
 #[test]
 fn the_existing_diagnosis_model_fingerprint_is_unchanged() {
-    // Exact deployed v2 model retained by native diagnosis159d37ac; this reader must not change it.
+    // The deployed model this reader must not change. v2 (retained by native
+    // diagnosis 159d37ac) advanced to v3 when the diagnosis began reading a
+    // rejected version as never published (backlog f9cbf891); a v2 receipt
+    // is still replayed whole below, never re-run.
     assert_eq!(
         boss_jobs::move_diagnosis::model(),
-        "registered-agent-handoff-v2:da0c4a6ddef6fa9120bf8bc663c5d37bb13c1437d2106425d7cb28848a2c5bdf"
+        "registered-agent-handoff-v3:f37435b887121bfea4806304d68f2f7e0817fd288a13f2338622dc3a0d7183a6"
     );
 }
 

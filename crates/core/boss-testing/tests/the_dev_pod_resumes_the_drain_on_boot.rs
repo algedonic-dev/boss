@@ -408,6 +408,73 @@ fn the_drain_prompt_names_its_verbs_and_cannot_be_read_as_a_flag() {
     }
 }
 
+/// The drain keeps its state on packets, never in agent memory (backlog
+/// 38db9ebe, 2026-10-18). Until this car the prompt told a cold session
+/// to read MEMORY.md and its READ FIRST overnight entry, to take its
+/// owed post-land acts from that entry, and to append a line to it on
+/// every wake — the session-state class the decision record deletes
+/// outright ("Agent memory and the record", design a5368918), and the
+/// opposite of David's 2026-10-09 rule that handoff state lives on the
+/// item packets and the work-session packet. A memory file is
+/// unversioned, outside the log and mutable in place; the next session
+/// inherits it only if it happens to load the same file. So the prompt
+/// names no memory at all, and names the packet doors instead: the
+/// work-session list it reads the last handoff from, the `handoff_`
+/// keys, and the metadata merge door it writes them through.
+#[test]
+fn the_drain_keeps_its_state_on_packets_not_in_memory() {
+    let p = drain_prompt();
+    let memory: Vec<&str> = p
+        .lines()
+        .filter(|l| l.to_lowercase().contains("memory"))
+        .collect();
+    assert!(
+        memory.is_empty(),
+        "drain.md reads or writes agent memory; session state lives on packets:\n{}",
+        memory.join("\n")
+    );
+    for needle in [
+        "kind=work-session",
+        "handoff_",
+        "PATCH /api/jobs/",
+        "/metadata",
+    ] {
+        assert!(
+            p.contains(needle),
+            "drain.md no longer names `{needle}`: the packet door its state goes through"
+        );
+    }
+}
+
+/// A CAPACITY REFUSAL IS A QUEUE, NOT A STOP (backlog a3bb1743, measured
+/// 2026-11-16 03:31Z). Section 7 said "never bypass or retry around a
+/// refusal" with no line between the claim door's 409 "resource claim
+/// refused" (pool exhausted, the step queued in its line) and a policy or
+/// permission refusal, and the factory read the first as the second for
+/// hours while slots stood free. The section names the difference and the
+/// act: other ready work now, the claim again on the next wake.
+#[test]
+fn the_drain_names_a_capacity_refusal_a_queue_not_a_stop() {
+    let raw = drain_prompt();
+    let p = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let never = p
+        .split_once("## 7. Never")
+        .map(|(_, rest)| rest.split("## ").next().unwrap_or(rest))
+        .expect("drain.md has its Never section");
+    for needle in [
+        "resource claim refused",
+        "a capacity refusal is a queue",
+        "other ready work",
+        "next wake",
+    ] {
+        assert!(
+            never.contains(needle),
+            "section 7 must carry `{needle}`: a capacity refusal is a queue, not a refusal to \
+             file and stop on:\n{never}"
+        );
+    }
+}
+
 /// The drain's post-land acts name `boss workflow publish` for a row a
 /// car changed — and the hand publish is the ONE door a hold does not
 /// bind (infra/platform/workflow-holds/README.md). A session resuming
@@ -446,4 +513,46 @@ fn the_drain_never_publishes_a_held_kind() {
         1,
         "a second place naming the publish needs the same exception"
     );
+}
+
+/// The prompt drifted from the tree it drives (backlog abd1c796,
+/// measured 2026-11-09 on origin/main 6c9f2d0cd). Last edited
+/// 2026-10-18, it still said a row declaring a `writer` or an
+/// `executor` is held "by default because" of it — a default a4b57aca
+/// retired, so a cold session would hold kinds nothing holds. It never
+/// named the shared checkout's renewal door under dev isolation, it
+/// ordered work oldest-first against the urgent-first door (90bff1f3),
+/// and it capped builders at 5 where David set 8 on 2026-11-09. Each
+/// claim is pinned to the words a resuming session acts on.
+#[test]
+fn the_drain_follows_the_tree_it_drives() {
+    let p = drain_prompt();
+    let at = p
+        .find("boss workflow publish")
+        .expect("drain.md names the publish among its post-land acts");
+    let publish = p[at..].split("\n\n").next().unwrap();
+    assert!(
+        !publish.contains("by default because"),
+        "drain.md still holds writer/executor rows by default, which a4b57aca retired:\n{publish}"
+    );
+    assert!(
+        publish.contains("a4b57aca"),
+        "the publish paragraph names the item that retired the default hold:\n{publish}"
+    );
+    for needle in ["renew-checkout", "boss dispatch --next"] {
+        assert!(p.contains(needle), "drain.md no longer names `{needle}`");
+    }
+    let force = p
+        .lines()
+        .find(|l| l.contains("--force-standard"))
+        .expect("drain.md names `--force-standard`, the urgent-first door's escape");
+    assert!(
+        force.contains("Never pass"),
+        "`--force-standard` is named only to forbid it:\n{force}"
+    );
+    assert!(
+        p.contains("up to 8 builder") && p.contains("The cap is 8"),
+        "the builder cap is 8 (David, 2026-11-09)"
+    );
+    assert!(!p.contains("at most 5 builder"), "the old cap of 5 is gone");
 }

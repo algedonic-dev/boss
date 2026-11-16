@@ -16,8 +16,9 @@ import {
   type Region,
   type Trend,
 } from './regions';
+import { scaled } from '../../dev-load';
 import { parseRoute } from '../../router';
-import { territoryOf } from './world';
+import { readSources } from '../../source-scan';
 
 // The IT system map (design 0524fc95, car 2): the region cards read
 // from ONE endpoint, /api/yard/regions (car 1), each a door to its
@@ -185,7 +186,7 @@ describe('the names are the server\'s, in map order', () => {
 // The region's floor page that the detail linked to (`floorHref`) retired
 // with car N3: the panel carries the floor itself.
 describe('regionHref — every region the server serves is a selection on the Department Map', () => {
-  it('each name opens /it?at=<name>, the router reads it as that selection, and the map has its territory', () => {
+  it('each name opens /it?at=<name>, and the router reads it as that selection', () => {
     const { names } = serverRegions();
     expect(names).toContain('publish');
     for (const name of names) {
@@ -193,8 +194,6 @@ describe('regionHref — every region the server serves is a selection on the De
       expect(href, name).toBe(`/it?at=${name}`);
       const url = new URL(href, 'http://boss.test');
       expect(parseRoute(url.pathname, url.search), name).toEqual({ kind: 'systemYard', at: name });
-      const territory: string | undefined = territoryOf(name)?.name;
-      expect(territory, name).toBe(name);
     }
   });
 
@@ -204,16 +203,19 @@ describe('regionHref — every region the server serves is a selection on the De
     expect(regionHref('')).toBe('/it');
   });
 
-  it('is the only place a region link is built — no surface under src/ spells /it/yard/${…} or ?at=${…} itself', () => {
+  // Every file under src/ is read, so the reads go out side by side and
+  // the scan owns a budget just under the test's: one read after another,
+  // this ran 183 s on a stalled gate drive and failed naming nothing
+  // (backlog 3f421243, src/source-scan.ts).
+  it('is the only place a region link is built — no surface under src/ spells /it/yard/${…} or ?at=${…} itself', async () => {
     const root = join(import.meta.dir, '..', '..');
-    const spelled = [...new Bun.Glob('**/*.{ts,svelte}').scanSync(root)]
-      .filter((f) => !f.endsWith('.test.ts') && f !== join('it', 'yard', 'regions.ts'))
-      .filter((f) => {
-        const src = readFileSync(join(root, f), 'utf8');
-        return src.includes('/it/yard/${') || src.includes('?at=${');
-      });
+    const paths = [...new Bun.Glob('**/*.{ts,svelte}').scanSync(root)]
+      .filter((f) => !f.endsWith('.test.ts') && f !== join('it', 'yard', 'regions.ts'));
+    const spelled = (await readSources(root, paths, scaled(25_000)))
+      .filter(({ text }) => text.includes('/it/yard/${') || text.includes('?at=${'))
+      .map(({ path }) => path);
     expect(spelled).toEqual([]);
-  });
+  }, scaled(30_000));
 });
 
 describe('floorSelection — the yard panel a floor route opens on', () => {
@@ -238,6 +240,44 @@ describe('countText — what is here, against its bound when it has one', () => 
     expect(countText(region({ count: 1, bound: 3 }))).toBe('1 / 3');
     expect(countText(region({ count: 0, bound: 1 }))).toBe('0 / 1');
     expect(countText(region({ count: null, bound: 3 }))).toBe('no reading');
+  });
+});
+
+// Backlog d43c0be2 (folding in 19227ca8 part 1): the gates region carries
+// two figures beside its bays — `waiting`, the line (357fe1da), and
+// `judged`, a train whose own gate has spoken (bce67f09) — and count +
+// waiting + judged is what the partition places there. The card drew only
+// the bays, so a full line and a judged train both read as an empty gate.
+describe('the gates card draws the line and the judged beside the bays (d43c0be2)', () => {
+  const gates = (over: Record<string, unknown>) => ({
+    ...PAYLOAD,
+    regions: [{ ...PAYLOAD.regions[1], unit: 'bays in use', bound_kind: 'capacity', ...over }],
+  });
+
+  it('parses both figures the server sends, and reads an absent one as absent — never 0', () => {
+    const r = parseRegions(gates({ count: 0, waiting: 2, judged: 1 })).regions[0]!;
+    expect(r.waiting).toBe(2);
+    expect(r.judged).toBe(1);
+    const old = parseRegions(gates({ count: 0 })).regions[0]!;
+    expect(old.waiting).toBeUndefined();
+    expect(old.judged).toBeUndefined();
+  });
+
+  it('a train judged at the gates is drawn, not read as an empty gate', () => {
+    // Measured shape: "0 bays in use, 1 waiting" — the train whose gate
+    // had spoken — until bce67f09 gave it its own figure.
+    const r = parseRegions(gates({ count: 0, bound: 3, judged: 1 })).regions[0]!;
+    expect(countText(r)).toBe('0 / 3 bays in use · 1 judged');
+  });
+
+  it('the line stands beside full bays and is never summed into them', () => {
+    const r = parseRegions(gates({ count: 3, bound: 3, waiting: 2, judged: 1 })).regions[0]!;
+    expect(countText(r)).toBe('3 / 3 bays in use · 2 waiting · 1 judged');
+  });
+
+  it('a region with neither figure reads exactly as before', () => {
+    expect(countText(parseRegions(gates({ count: 1, bound: 3 })).regions[0]!)).toBe('1 / 3 bays in use');
+    expect(countText(parseRegions(gates({ count: null, waiting: 2 })).regions[0]!)).toBe('no reading');
   });
 });
 

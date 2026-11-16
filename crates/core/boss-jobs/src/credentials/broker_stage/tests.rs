@@ -287,6 +287,116 @@ fn only_rs256_is_read_and_before_any_key() {
     );
 }
 
+/// RFC 7515 §4.1.11: `crit` lists header extensions a recipient MUST
+/// understand or refuse the token, and this door understands none. So a
+/// token carrying the parameter, in any shape, is refused, never verified
+/// as though the header were not there (review of 25fff647, F8; backlog
+/// 3ecb415b). It is a header fact, so it is judged before any key is
+/// read, like the algorithm. A ServiceAccount token carries no `crit`.
+#[test]
+fn a_critical_header_extension_is_refused_before_any_key() {
+    for crit in [
+        json!(["b64"]),
+        json!(["exp"]),
+        json!([]),
+        json!("b64"),
+        Value::Null,
+    ] {
+        let token = cluster().sign_with(&json!({"alg":"RS256","kid":KID,"crit":crit}), &claims());
+        // `Dark` would answer KeysUnavailable: the header is judged first.
+        assert_eq!(
+            verify(&token, &terms(), &Dark, NOW),
+            Err(Refusal::Critical),
+            "{crit}"
+        );
+        // Signed by the trusted key and otherwise perfect, still refused.
+        assert_eq!(
+            verify(&token, &terms(), &keys(), NOW),
+            Err(Refusal::Critical),
+            "{crit}"
+        );
+    }
+}
+
+/// `typ` is optional (RFC 7519 §5.1) and a ServiceAccount token omits it;
+/// when present it must say JWT — `JWT` or `application/jwt`, which RFC
+/// 7515 §4.1.9 makes the same media type, in any case. Any other type is
+/// another kind of token and is refused before any key is read (review of
+/// 25fff647, F8; backlog 3ecb415b).
+#[test]
+fn a_header_type_other_than_jwt_is_refused_and_an_absent_one_verifies() {
+    for header in [
+        json!({"alg":"RS256","kid":KID}),
+        json!({"alg":"RS256","kid":KID,"typ":"JWT"}),
+        json!({"alg":"RS256","kid":KID,"typ":"jwt"}),
+        json!({"alg":"RS256","kid":KID,"typ":"application/jwt"}),
+    ] {
+        let token = cluster().sign_with(&header, &claims());
+        assert!(verify(&token, &terms(), &keys(), NOW).is_ok(), "{header}");
+    }
+    for typ in [
+        json!("at+jwt"),
+        json!("application/at+jwt"),
+        json!("JOSE"),
+        json!("JWE"),
+        json!(""),
+        json!(1),
+        json!(["JWT"]),
+        Value::Null,
+    ] {
+        let token = cluster().sign_with(&json!({"alg":"RS256","kid":KID,"typ":typ}), &claims());
+        assert_eq!(
+            verify(&token, &terms(), &Dark, NOW),
+            Err(Refusal::Type),
+            "{typ}"
+        );
+        assert_eq!(
+            verify(&token, &terms(), &keys(), NOW),
+            Err(Refusal::Type),
+            "{typ}"
+        );
+    }
+}
+
+/// `nbf` is FLOORED at `iat` (6e28ed42; review of 25fff647, F5): a token
+/// that says it was usable before it was issued is judged from its issue,
+/// so a not-before in the past cannot rescue a token issued in the
+/// future. `a_token_from_the_future_is_not_valid_yet` moves the two
+/// together and so never told the floor from the not-before.
+#[test]
+fn a_not_before_earlier_than_the_issue_is_judged_from_the_issue() {
+    // Issued two minutes from now, "usable" since a minute ago.
+    assert_eq!(
+        judged(&with(
+            json!({"iat": NOW + 120, "nbf": NOW - 60, "exp": NOW + 720})
+        )),
+        Err(Refusal::NotYetValid)
+    );
+    // No not-before at all: the issue is the floor.
+    let mut absent = with(json!({"iat": NOW + 120, "exp": NOW + 720}));
+    absent.as_object_mut().unwrap().remove("nbf");
+    assert_eq!(judged(&absent), Err(Refusal::NotYetValid));
+    // A not-before after the issue still holds on its own.
+    assert_eq!(
+        judged(&with(
+            json!({"iat": NOW - 60, "nbf": NOW + 120, "exp": NOW + 540})
+        )),
+        Err(Refusal::NotYetValid)
+    );
+    // Within the leeway the floor is not the future.
+    assert!(
+        judged(&with(
+            json!({"iat": NOW + 5, "nbf": NOW - 60, "exp": NOW + 605})
+        ))
+        .is_ok()
+    );
+    // A not-before that is not a number is malformed, never ignored.
+    assert_eq!(
+        judged(&with(json!({"nbf": "soon"}))),
+        Err(Refusal::Malformed)
+    );
+}
+
 #[test]
 fn unavailable_or_weak_keys_refuse() {
     let token = cluster().sign(&claims());
@@ -336,6 +446,8 @@ fn no_refusal_carries_a_byte_of_the_token() {
         Refusal::MultiplePresented,
         Refusal::Malformed,
         Refusal::Algorithm,
+        Refusal::Critical,
+        Refusal::Type,
         Refusal::KeysUnavailable,
         Refusal::UnknownKey,
         Refusal::WeakKey,
@@ -387,6 +499,59 @@ fn the_key_set_file_is_read_whole_or_refused() {
     assert!(
         KeySetFile(dir.clone()).trusted().is_err(),
         "a directory is not a key set"
+    );
+}
+
+/// Two more of F5's unpinned guards (review of 25fff647; backlog
+/// 3ecb415b). The key filter: a REAL RSA key published for another
+/// algorithm or for encryption is not this door's, so a token naming it
+/// meets UnknownKey — the fixture above uses a malformed `enc` key, which
+/// the parse drops whether or not the filter runs. And the size bound: a
+/// key set past it is refused whole, however well-formed, and one at it
+/// is still read.
+#[test]
+fn a_key_set_past_its_bound_is_refused_and_a_key_for_another_use_is_left_out() {
+    let dir = boss_testing::scratch_dir("broker-stage-key-set-bounds");
+    let path = dir.join("jwks.json");
+    let source = KeySetFile(path.clone());
+    let mut rs512 = cluster().jwk("rs512-1");
+    rs512["alg"] = json!("RS512");
+    let mut enc = cluster().jwk("enc-2");
+    enc["use"] = json!("enc");
+    let mut defaults = cluster().jwk("no-alg-no-use");
+    let fields = defaults.as_object_mut().unwrap();
+    fields.remove("alg");
+    fields.remove("use");
+    let set = json!({"keys":[cluster().jwk(KID), rs512, enc, defaults]}).to_string();
+    std::fs::write(&path, &set).unwrap();
+    let mut kids: Vec<String> = source
+        .trusted()
+        .expect("a key set")
+        .into_iter()
+        .map(|k| k.kid)
+        .collect();
+    kids.sort();
+    // A key that states neither is the issuer's default and is trusted.
+    assert_eq!(kids, [KID, "no-alg-no-use"]);
+    for kid in ["rs512-1", "enc-2"] {
+        let token = cluster().sign_with(&json!({"alg":"RS256","kid":kid}), &claims());
+        assert_eq!(
+            verify(&token, &terms(), &source, NOW),
+            Err(Refusal::UnknownKey),
+            "{kid}"
+        );
+    }
+
+    let bound = usize::try_from(MAX_KEY_SET_BYTES).unwrap();
+    let at = format!("{set}{}", " ".repeat(bound - set.len()));
+    std::fs::write(&path, &at).unwrap();
+    assert!(source.trusted().is_ok(), "a key set at its bound is read");
+    std::fs::write(&path, format!("{at} ")).unwrap();
+    let why = source.trusted().err().expect("one byte past the bound");
+    assert!(why.contains("within bounds"), "{why}");
+    assert_eq!(
+        verify(&cluster().sign(&claims()), &terms(), &source, NOW),
+        Err(Refusal::KeysUnavailable)
     );
 }
 

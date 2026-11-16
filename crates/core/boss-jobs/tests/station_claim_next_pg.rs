@@ -13,8 +13,195 @@ use tower::ServiceExt;
 
 const ACTOR: &str = boss_jobs::runner_credential::ACTOR;
 
+async fn resource_fixture(
+    capacity: serde_json::Value,
+    duration_hours: Option<f64>,
+) -> (
+    boss_testing::TestDb,
+    PgJobs,
+    SelectionContext,
+    NativeSelectionStore,
+    boss_core::publisher::EventStamp,
+) {
+    use boss_jobs::pools::PoolRegistry;
+    let (db, repo, mut context, store) = fixture().await;
+    let stamp = boss_core::publisher::EventStamp::new(
+        "jobs",
+        boss_core::actor::ActorId::automation("ops-runner"),
+    );
+    let spec:boss_jobs::registry::WorkflowSpec=serde_json::from_value(serde_json::json!({
+        "kind":"claim-fixture","label":"Flow fixture","category":"test","version":1,"status":"active","subject_kinds":["custom"],"owning_team":"platform","created_at":stamp.timestamp,
+        "steps":[{"title":"start","kind":"trigger","ready_when":"true"},{"title":"work","kind":"task","ready_when":"steps.start.done","duration_hours":duration_hours,"resources":{"vcpu":"1"}},{"title":"done","kind":"outcome","ready_when":"steps.work.done","terminal":{"outcome":"done"}}]})).unwrap();
+    let workflows = PgWorkflows::for_fixture(db.pool.clone());
+    workflows
+        .publish_authored(
+            spec,
+            boss_core::job::JobId::new(),
+            stamp.actor(),
+            stamp.timestamp,
+        )
+        .await
+        .unwrap();
+    let pools = boss_jobs::pools::PgPools::new(db.pool.clone());
+    pools.publish_declared(serde_json::from_value(serde_json::json!({"name":"vcpu","version":1,"status":"active","unit":"vCPU","kind":"flow","capacity":capacity,"created_at":stamp.timestamp})).unwrap(),stamp.actor(),stamp.timestamp).await.unwrap();
+    context.active_workflows = workflows
+        .list_active(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|w| (w.kind.clone(), w))
+        .collect();
+    context.native_authority = None;
+    (db, repo, context, store, stamp)
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn counted_native_pg_runs_conserve_bindings_and_require_read_scope_before_commit() {
+async fn native_station_resource_refusal_is_an_original_receipt_not_a_claim_and_rebuilds() {
+    let (db, repo, mut context, store, stamp) =
+        resource_fixture(serde_json::json!({"state":"unknown"}), None).await;
+    context.native_authority = Some(prepared(&repo, context.request_id).await);
+    let SelectionResult::Refused { receipt } = repo
+        .claim_station_head_at(&context, ACTOR, &[], &stamp, &[])
+        .await
+        .unwrap()
+    else {
+        panic!("resource refusal must not be called claimed/replayed")
+    };
+    assert_eq!(receipt["outcome"], "resource-refused");
+    assert_eq!(receipt["refusal"]["reason"], "capacity-unknown");
+    assert!(receipt.get("claimed_step").is_none());
+    let step = repo
+        .get_step(&context.validated_step.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(step.status, StepStatus::Ready);
+    assert!(step.assignee_id.is_none());
+    let claimed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM event_outbox WHERE kind='jobs.station.claimed'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(claimed, 0);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM step_resource_claims")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    let bus: Arc<dyn boss_core::port::EventBus> = boss_testing::RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(&db.pool, &bus, 500)
+        .await
+        .unwrap();
+    boss_jobs::rebuild_jobs_and_steps(&db.pool).await.unwrap();
+    let restarted = PgJobs::for_native_selection(store);
+    assert_eq!(
+        restarted
+            .station_claim_receipt(context.request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .json(),
+        receipt.json()
+    );
+    context.native_authority = Some(prepared(&restarted, context.request_id).await);
+    let SelectionResult::Replayed(original) = restarted
+        .claim_station_head_at(&context, ACTOR, &[], &stamp, &[])
+        .await
+        .unwrap()
+    else {
+        panic!("original refusal must replay")
+    };
+    assert_eq!(original.json(), receipt.json());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resource_task_without_a_resolved_duration_refuses_before_inserting_the_header() {
+    let (db, repo, mut context, _, stamp) =
+        resource_fixture(serde_json::json!({"state":"configured","amount":"1"}), None).await;
+    context.native_authority = Some(prepared(&repo, context.request_id).await);
+    let SelectionResult::Refused { receipt } = repo
+        .claim_station_head_at(&context, ACTOR, &[], &stamp, &[])
+        .await
+        .unwrap()
+    else {
+        panic!("an unknown duration cannot acquire a resource lease")
+    };
+    assert_eq!(receipt["refusal"]["reason"], "duration-unknown");
+    let headers: i64 = sqlx::query_scalar("SELECT count(*) FROM step_resource_claims")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(headers, 0);
+    let step = repo
+        .get_step(&context.validated_step.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(step.status, StepStatus::Ready);
+    assert!(step.assignee_id.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_resource_statements_spend_the_same_original_budget_after_a_real_lock_wait() {
+    // A resource-bearing task needs an authored duration before 2b can
+    // acquire its lease. The unknown-duration case above must refuse before
+    // the header; this case must reach the real writer and spend one budget.
+    let (db, repo, mut context, _, stamp) = resource_fixture(
+        serde_json::json!({"state":"configured","amount":"1"}),
+        Some(1.0),
+    )
+    .await;
+    sqlx::raw_sql("CREATE TABLE resource_budget_samples(stage TEXT PRIMARY KEY,timeout_ms BIGINT NOT NULL,observed_at TIMESTAMPTZ NOT NULL); CREATE FUNCTION capture_resource_budget() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO resource_budget_samples VALUES(TG_ARGV[0],(SELECT setting::bigint FROM pg_settings WHERE name='statement_timeout'),clock_timestamp()); IF TG_ARGV[0]='header' THEN PERFORM pg_advisory_xact_lock(21761,5192); END IF; RETURN NULL; END $$; CREATE TRIGGER resource_header_budget AFTER INSERT ON step_resource_claims FOR EACH STATEMENT EXECUTE FUNCTION capture_resource_budget('header'); CREATE TRIGGER resource_allocation_budget BEFORE DELETE ON step_resource_allocations FOR EACH STATEMENT EXECUTE FUNCTION capture_resource_budget('allocation');").execute(&db.pool).await.unwrap();
+    let mut held = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(21761,5192)")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    // Authenticate this request once, after fixture setup, and never renew
+    // it while it executes. It runs under the answer fixture's budget: the
+    // subject is that later SQL receives less of ONE absolute budget, which
+    // holds for any length, and a stalled drive must not decide the claim.
+    context.native_authority = Some(prepared(&repo, context.request_id).await);
+    let selection = repo.claim_station_head_at(&context, ACTOR, &[], &stamp, &[]);
+    let release = async {
+        tokio::time::timeout(std::time::Duration::from_secs(1),async {
+            loop {
+                let waiting:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND classid=21761 AND objid=5192 AND NOT granted)").fetch_one(&db.pool).await.unwrap();
+                if waiting{break}
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("observe the actual native writer blocked at the resource header");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        held.rollback().await.unwrap();
+    };
+    let (result, ()) = tokio::join!(selection, release);
+    assert!(matches!(result.unwrap(), SelectionResult::Claimed { .. }));
+    let samples: Vec<(String, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT stage,timeout_ms,observed_at FROM resource_budget_samples ORDER BY stage",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    eprintln!(
+        "actual native resource statement budget samples={samples:?}; advisory wait observed before release"
+    );
+    let header = samples.iter().find(|row| row.0 == "header").unwrap().1;
+    let allocation = samples.iter().find(|row| row.0 == "allocation").unwrap().1;
+    assert!(
+        header > 0 && allocation > 0 && allocation < header,
+        "the later resource SQL must receive less of the SAME absolute budget, not its stale inherited timeout: {samples:?}"
+    );
+}
+
+/// A PRIVATE OPEN RUN NEVER REACHES A NATIVE PG RECEIPT (backlog 3e927996).
+/// This test pinned the per-actor run cap's copied counter rows: their job
+/// bindings under All, and a refusal before commit under Self where a
+/// counted row was outside the reader's scope. The cap is retired — a robot
+/// is bounded by its `robots:<model>` pool alone — so nothing is counted or
+/// copied: under the narrow Self scope the claim is admitted and the private
+/// run's identity appears nowhere in the receipt.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_private_open_run_never_reaches_a_native_pg_receipt() {
     let (db, repo, mut context, _) = fixture().await;
     let stamp = boss_core::publisher::EventStamp::new(
         "jobs",
@@ -23,13 +210,16 @@ async fn counted_native_pg_runs_conserve_bindings_and_require_read_scope_before_
     boss_jobs::agents::AgentsRegistry::publish(
         &boss_jobs::agents::PgAgents::new(db.pool.clone()),
         &[boss_jobs::agents::AgentInput {
+            factory_rotation: Some(true),
             id: "agent-pg".into(),
             display_name: "PG fixture".into(),
             default_model: "opus-5[1m]".into(),
+            model_class: None,
             role: Some("worker".into()),
             department: None,
             hourly_budget_usd_micros: None,
             max_concurrent_runs: Some(3),
+            stations: None,
             aliases: vec![ACTOR.into()],
         }],
         boss_core::publish::PublishMode::InsertIfAbsent,
@@ -69,76 +259,84 @@ async fn counted_native_pg_runs_conserve_bindings_and_require_read_scope_before_
         .unwrap();
     let policy = boss_policy_client::postgres::PgPolicy::new(db.pool.clone());
     let read = boss_policy_client::controls::READ_JOB;
-    for scope in [
-        boss_policy_client::Scope::Self_,
-        boss_policy_client::Scope::All,
-    ] {
-        boss_policy_client::PolicyRepository::upsert_rule(
-            &policy,
-            &boss_policy_client::PolicyRule {
-                id: boss_policy_client::types::rule_id("worker", &read.resource(), read.action()),
-                role: "worker".into(),
-                action: read.action(),
-                resource: read.resource(),
-                scope: scope.clone(),
-                active: true,
-            },
-            "counter-scope-regression",
-        )
-        .await
-        .unwrap();
-        context.scope = if scope == boss_policy_client::Scope::All {
-            JobScope::All
-        } else {
-            JobScope::OwnerIs(ACTOR.into())
-        };
-        context.native_authority = Some(prepared(&repo, context.request_id).await);
-        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM event_outbox")
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-        let result = repo
-            .claim_station_head_at(&context, ACTOR, &[], &stamp, &[])
-            .await;
-        if scope != boss_policy_client::Scope::All {
-            assert!(
-                matches!(
-                    result,
-                    Err(boss_jobs::port::JobsError::SelectionConflict(_))
-                ),
-                "private counted row must refuse before commit"
-            );
-            assert_eq!(
-                repo.get_step(&context.validated_step.id)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                context.validated_step
-            );
-            assert!(
-                repo.station_claim_receipt(context.request_id)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-            let after: i64 = sqlx::query_scalar("SELECT count(*) FROM event_outbox")
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-            assert_eq!(before, after);
-        } else {
-            let SelectionResult::Claimed { receipt, .. } = result.unwrap() else {
-                panic!("fresh claim")
-            };
-            let row = &receipt["owner_consumption"]["concurrency"]["runs"][0];
-            assert_eq!(row["id"], serde_json::json!(private.id));
-            assert_eq!(row["owner_id"], serde_json::json!(private.owner_id));
-            assert_eq!(row["subject"], serde_json::json!(private.subject));
-        }
-    }
+    boss_policy_client::PolicyRepository::upsert_rule(
+        &policy,
+        &boss_policy_client::PolicyRule {
+            id: boss_policy_client::types::rule_id("worker", &read.resource(), read.action()),
+            role: "worker".into(),
+            action: read.action(),
+            resource: read.resource(),
+            scope: boss_policy_client::Scope::Self_,
+            active: true,
+        },
+        "counter-scope-regression",
+    )
+    .await
+    .unwrap();
+    context.scope = JobScope::OwnerIs(ACTOR.into());
+    assert!(!context.scope.admits(&private));
+    context.native_authority = Some(prepared(&repo, context.request_id).await);
+    let result = repo
+        .claim_station_head_at(&context, ACTOR, &[], &stamp, &[])
+        .await;
+    let SelectionResult::Claimed { receipt, .. } =
+        result.expect("no run is counted, so no out-of-scope row can refuse the claim")
+    else {
+        panic!("fresh claim")
+    };
+    assert!(
+        receipt.pointer("/owner_consumption/concurrency").is_none(),
+        "no concurrency reading is copied: {}",
+        receipt.json()
+    );
+    assert!(
+        !receipt.json().contains(&private.id.to_string()),
+        "the private run's identity reached the receipt"
+    );
 }
 
+/// The ingress a test that judges an ANSWER runs under: the one the
+/// credential door admitted, having already lost [`MEASURED_STALL`], under
+/// [`FIXTURE_BUDGET`]. Whatever the gate's drive does, such a test answers
+/// for the selection, never the drive (backlog d7e5b016). A test whose
+/// subject is the deadline takes [`admitted_ingress`] and production's.
 async fn ingress() -> boss_jobs::station_claim::AuthenticatedSelectionIngress {
+    as_a_fixture(admitted_ingress().await)
+}
+
+/// The io.full stall gate-run 7563df44 recorded in its test phase (334 s
+/// of 1572 s, node w-1) when this file's HTTP retry test answered 409
+/// "selection ingress deadline expired during preparation": a stalled
+/// drive, not a selection. An ingress that reports it has already spent
+/// this much states the stall instead of waiting for one (backlog d7e5b016).
+const MEASURED_STALL: std::time::Duration = std::time::Duration::from_secs(334);
+/// An answer fixture's pre-commit budget: three times the measured stall.
+/// It bounds a hung fixture and claims nothing about production; the
+/// production budget's refusal of a request that outlasted it is pinned by
+/// an_http_selection_that_outlasts_the_production_budget_is_refused here
+/// and by native_selection_store's
+/// the_production_budget_refuses_a_preparation_that_lost_the_measured_stall.
+const FIXTURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1002);
+
+fn as_a_fixture(
+    admitted: boss_jobs::station_claim::AuthenticatedSelectionIngress,
+) -> boss_jobs::station_claim::AuthenticatedSelectionIngress {
+    admitted
+        .with_time_already_spent(MEASURED_STALL)
+        .with_budget(FIXTURE_BUDGET)
+}
+
+/// The same admitted request with production's budget, having lost the
+/// measured stall: what the gate's drive made of the HTTP retry test.
+fn after_the_measured_stall(
+    admitted: boss_jobs::station_claim::AuthenticatedSelectionIngress,
+) -> boss_jobs::station_claim::AuthenticatedSelectionIngress {
+    admitted.with_time_already_spent(MEASURED_STALL)
+}
+
+/// The ingress the credential door admits, under the production
+/// `SELECTION_PRE_COMMIT_BUDGET` and with no time stated as spent.
+async fn admitted_ingress() -> boss_jobs::station_claim::AuthenticatedSelectionIngress {
     let dir = boss_testing::scratch_dir("station-pg-authenticated-ingress");
     boss_testing::write_file(&dir.join("forge.current"), "station-pg-fixture-key");
     let captured = Arc::new(std::sync::Mutex::new(None));
@@ -204,11 +402,30 @@ async fn fixture() -> (
     SelectionContext,
     NativeSelectionStore,
 ) {
-    let (db, repo, context, native, _) = fixture_with_ingress_time().await;
+    let (db, repo, context, native, _) = fixture_admitted(as_a_fixture).await;
     (db, repo, context, native)
 }
 
+/// The fixture whose prepared request carries production's budget: for the
+/// tests whose subject is the ingress deadline itself.
 async fn fixture_with_ingress_time() -> (
+    boss_testing::TestDb,
+    PgJobs,
+    SelectionContext,
+    NativeSelectionStore,
+    std::time::Instant,
+) {
+    fixture_admitted(|admitted| admitted).await
+}
+
+/// What a test makes of the ingress the credential door admitted.
+type Admit = fn(
+    boss_jobs::station_claim::AuthenticatedSelectionIngress,
+) -> boss_jobs::station_claim::AuthenticatedSelectionIngress;
+
+async fn fixture_admitted(
+    admit: Admit,
+) -> (
     boss_testing::TestDb,
     PgJobs,
     SelectionContext,
@@ -229,6 +446,8 @@ async fn fixture_with_ingress_time() -> (
             role: "worker".into(),
             description: "authenticated integration fixture".into(),
             signs_for: None,
+            access_tier: None,
+            station: None,
         }],
         &owner_stamp,
     )
@@ -301,7 +520,7 @@ async fn fixture_with_ingress_time() -> (
     let mut station = StationSpec::draft(
         "claim-fixture",
         "Fixture",
-        StationKind::Batch,
+        StationKind::Group,
         StationPredicate {
             kind: Some("claim-fixture".into()),
             step: Some(StepMatch {
@@ -338,7 +557,7 @@ async fn fixture_with_ingress_time() -> (
         .map(|workflow| (workflow.kind.clone(), workflow))
         .collect();
     let request_id = uuid::Uuid::new_v4();
-    let ingress = ingress().await;
+    let ingress = admit(admitted_ingress().await);
     let ingress_started = ingress.started();
     let context = SelectionContext {
         native_authority: Some(Arc::new(
@@ -354,6 +573,7 @@ async fn fixture_with_ingress_time() -> (
         station,
         scope: JobScope::default(),
         active_workflows,
+        tree_selection: None,
         validated_job: job.clone(),
         validated_step: step.clone(),
     };
@@ -653,9 +873,32 @@ async fn original_receipt_replay_requires_current_read_scope_for_every_copied_jo
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn selection_commits_the_owned_step_and_replays_the_same_server_receipt() {
-    let (db, repo, context, store) = fixture().await;
+    struct ResumeClock;
+    impl Drop for ResumeClock {
+        fn drop(&mut self) {
+            tokio::time::resume();
+        }
+    }
+    tokio::time::pause();
+    let _clock = ResumeClock;
+    // Real PostgreSQL I/O must not make Tokio auto-advance to the request's
+    // timer. This companion is a scoped future, not a task that can escape.
+    tokio::select! {
+        () = selection_receipt_answer_under_controlled_clock() => {},
+        () = async { loop { tokio::task::yield_now().await; } } => unreachable!(),
+    }
+}
+
+async fn selection_receipt_answer_under_controlled_clock() {
+    let (db, repo, context, store, ingress_started) = fixture_with_ingress_time().await;
+    // Ingress stores std::Instant; enforcement converts that origin to Tokio's
+    // clock. Align once after setup, then let this answer test own elapsed time.
+    let logical_ingress = tokio::time::Instant::from_std(ingress_started);
+    tokio::time::advance(logical_ingress.saturating_duration_since(tokio::time::Instant::now()))
+        .await;
+    assert_eq!(tokio::time::Instant::now(), logical_ingress);
     let step = context.validated_step.clone();
     let stamp = boss_core::publisher::EventStamp::new(
         "jobs",
@@ -788,6 +1031,13 @@ async fn selection_commits_the_owned_step_and_replays_the_same_server_receipt() 
         serde_json::to_vec(&original).unwrap(),
         serde_json::to_vec(&receipt).unwrap()
     );
+    // A controlled host gap reproduces the old ingress being spent by later
+    // receipt assertions (09145add); this is not a performance upper bound.
+    std::thread::sleep(
+        boss_jobs::station_claim::SELECTION_PRE_COMMIT_BUDGET
+            + std::time::Duration::from_millis(25),
+    );
+    assert!(ingress_started.elapsed() >= boss_jobs::station_claim::SELECTION_PRE_COMMIT_BUDGET);
     let repeated = restarted
         .claim_station_head_at(&context, ACTOR, &[], &stamp, &[])
         .await
@@ -814,6 +1064,33 @@ async fn selection_commits_the_owned_step_and_replays_the_same_server_receipt() 
             .await,
         Err(boss_jobs::port::JobsError::SelectionConflict(_))
     ));
+    assert_eq!(tokio::time::Instant::now(), logical_ingress);
+    tokio::time::advance(
+        boss_jobs::station_claim::SELECTION_PRE_COMMIT_BUDGET + std::time::Duration::from_millis(2),
+    )
+    .await;
+    assert!(matches!(
+        restarted
+            .claim_station_head_at(&context, ACTOR, &[], &stamp, &[])
+            .await,
+        Err(boss_jobs::port::JobsError::SelectionConflict(message))
+            if message == "selection ingress deadline expired before commit dispatch"
+    ));
+    // A new authenticated request may replay the same idempotency UUID. The
+    // expired request above must never receive this new request's lifetime.
+    let fresh_context = SelectionContext {
+        native_authority: Some(prepared(&restarted, context.request_id).await),
+        ..context.clone()
+    };
+    let SelectionResult::Replayed(fresh_copy) = restarted
+        .claim_station_head_at(&fresh_context, ACTOR, &[], &stamp, &[])
+        .await
+        .unwrap()
+    else {
+        panic!("fresh ingress must copy the original receipt")
+    };
+    assert_eq!(fresh_context.request_id, context.request_id);
+    assert_eq!(fresh_copy.json().as_bytes(), receipt.json().as_bytes());
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_claim_receipts")
         .fetch_one(&db.pool)
         .await
@@ -927,17 +1204,11 @@ async fn competing_distinct_requests_cannot_both_acquire_the_prepared_head() {
     assert_eq!((receipts, events), (1, 1));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn http_retries_copy_the_exact_postgres_receipt_bytes() {
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-    };
+/// The jobs router behind the credential door and the machine gate, with
+/// `admit` applied, inside the door, to the ingress it resolved: the HTTP
+/// tests judge the same door under the budget and stall they name.
+fn http_app(db: &boss_testing::TestDb, repo: PgJobs, admit: Admit) -> axum::Router {
     use boss_policy_client::{Action, FakePolicyClient, Resource, Scope};
-    use http_body_util::BodyExt;
-    use std::sync::Arc;
-    use tower::ServiceExt;
-    let (db, repo, context, _) = fixture().await;
     let bus = boss_testing::RecordingEventBus::new();
     let event_bus: Arc<dyn boss_core::port::EventBus> = bus.clone();
     let state = boss_jobs::http::JobsApiState {
@@ -962,8 +1233,19 @@ async fn http_retries_copy_the_exact_postgres_receipt_bytes() {
     };
     let keys = boss_testing::scratch_dir("station-pg-http-ingress");
     boss_testing::write_file(&keys.join("forge.current"), "station-pg-fixture-key");
-    let app = boss_jobs::runner_credential::mount(boss_jobs::http::router(state), keys);
-    let app = boss_core::machine_gate::gated(
+    let app = boss_jobs::http::router(state).layer(axum::middleware::from_fn(
+        move |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
+            if let Some(ingress) = request
+                .extensions_mut()
+                .remove::<boss_jobs::station_claim::AuthenticatedSelectionIngress>(
+            ) {
+                request.extensions_mut().insert(admit(ingress));
+            }
+            next.run(request).await
+        },
+    ));
+    let app = boss_jobs::runner_credential::mount(app, keys);
+    boss_core::machine_gate::gated(
         app,
         Arc::new(boss_core::machine_gate::MachineGate::new(
             "jobs",
@@ -973,7 +1255,15 @@ async fn http_retries_copy_the_exact_postgres_receipt_bytes() {
                 Default::default(),
             ),
         )),
-    );
+    )
+}
+
+/// One `claim-next` for `request_id`, as the fixture's credentialed worker.
+async fn claim_next(
+    app: &axum::Router,
+    request_id: uuid::Uuid,
+) -> (axum::http::StatusCode, axum::body::Bytes) {
+    use http_body_util::BodyExt;
     let user = serde_json::to_string(&boss_policy_client::types::User {
         id: "emp-worker".into(),
         role: "ceo".into(),
@@ -983,27 +1273,41 @@ async fn http_retries_copy_the_exact_postgres_receipt_bytes() {
         department: Some("it".into()),
     })
     .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/api/stations/claim-fixture/claim-next")
+                .header("content-type", "application/json")
+                .header("x-boss-user", &user)
+                .header(
+                    boss_jobs::runner_credential::HEADER,
+                    "station-pg-fixture-key",
+                )
+                .body(axum::body::Body::from(
+                    serde_json::json!({"request_id": request_id}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    (
+        status,
+        response.into_body().collect().await.unwrap().to_bytes(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_retries_copy_the_exact_postgres_receipt_bytes() {
+    use axum::http::StatusCode;
+    let (db, repo, context, _) = fixture().await;
+    // Each request reaches the handler having lost the stall gate-run
+    // 7563df44 measured, under the answer fixture's budget: the bytes it
+    // copies are the selection's, whatever the drive does (d7e5b016).
+    let app = http_app(&db, repo, as_a_fixture);
     let mut copies = Vec::new();
     for _ in 0..2 {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::post("/api/stations/claim-fixture/claim-next")
-                    .header("content-type", "application/json")
-                    .header("x-boss-user", &user)
-                    .header(
-                        boss_jobs::runner_credential::HEADER,
-                        "station-pg-fixture-key",
-                    )
-                    .body(Body::from(
-                        serde_json::json!({"request_id": context.request_id}).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let (status, body) = claim_next(&app, context.request_id).await;
         assert_eq!(
             status,
             StatusCode::CREATED,
@@ -1020,6 +1324,33 @@ async fn http_retries_copy_the_exact_postgres_receipt_bytes() {
             .unwrap();
     assert_eq!(copies[0], copies[1]);
     assert_eq!(copies[0].as_ref(), stored.as_bytes());
+}
+
+/// The production budget still refuses the request the retry test above
+/// now states: the same door, the same stall, production's five seconds.
+/// Stated at ingress, the stall is refused by the first deadline reader
+/// (the native read), before any preparation read; the gate's "during
+/// preparation" spelling is the same deadline landing mid-preparation,
+/// pinned in native_selection_store (backlog d7e5b016).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_http_selection_that_outlasts_the_production_budget_is_refused() {
+    let (db, repo, context, _) = fixture().await;
+    let before = selection_effects(&db.pool).await;
+    let app = http_app(&db, repo, after_the_measured_stall);
+    let (status, body) = claim_next(&app, context.request_id).await;
+    assert_eq!(
+        (status, String::from_utf8_lossy(&body).into_owned()),
+        (
+            axum::http::StatusCode::CONFLICT,
+            "station selection refused: selection ingress deadline expired before commit dispatch"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        selection_effects(&db.pool).await,
+        before,
+        "a refused selection claims nothing, writes no receipt and emits nothing"
+    );
 }
 
 async fn wait_for_table_waiter(db: &boss_testing::TestDb, mode: &str) {
@@ -1140,6 +1471,55 @@ async fn audit_rebuild_recovers_the_owned_step_and_exact_selection_receipt() {
             .await
             .unwrap(),
         Some(receipt)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claims_history_reads_the_actual_station_producer_group_and_replays_it() {
+    use boss_jobs::claims_console::{ClaimsHistory, PgClaimsHistory};
+    let (db, repo, context, _) = fixture().await;
+    let stamp = boss_core::publisher::EventStamp::new(
+        "jobs",
+        boss_core::actor::ActorId::automation("ops-runner"),
+    );
+    let SelectionResult::Claimed { step, .. } = repo
+        .claim_station_head_at(&context, ACTOR, &[], &stamp, &[])
+        .await
+        .unwrap()
+    else {
+        panic!("fresh native request must acquire its step")
+    };
+    let bus: std::sync::Arc<dyn boss_core::port::EventBus> = boss_testing::RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(&db.pool, &bus, 500)
+        .await
+        .unwrap();
+    // A fold fixture, not production's 2 s: this judges what the history
+    // folds, and a loaded gate's drive is not that (backlog ebbf38c6).
+    let history = PgClaimsHistory::for_fold_fixture(db.pool.clone());
+    while !boss_jobs::claims_console::source::advance_native_once(&history, &db.pool, 1024)
+        .await
+        .unwrap()
+    {}
+    let before = history.read(None, 24, chrono::Utc::now()).await.unwrap();
+    let wire = serde_json::to_value(&before).unwrap();
+    let claim = wire["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|claim| claim["step_id"] == step.id.to_string())
+        .unwrap();
+    assert_eq!(claim["station"], "claim-fixture");
+    assert_eq!(claim["station_unavailable"], serde_json::Value::Null);
+    boss_jobs::claims_console::source::rebuild_native_with(&history, &db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        history
+            .read(None, 24, chrono::Utc::now())
+            .await
+            .unwrap()
+            .claims,
+        before.claims
     );
 }
 

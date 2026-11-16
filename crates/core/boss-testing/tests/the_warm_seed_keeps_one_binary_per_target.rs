@@ -8,26 +8,27 @@
 //! measured by the kubelet at full size, so the train gate for #424 was
 //! evicted at "Usage of EmptyDir volume gate-workspace exceeds the
 //! limit 160Gi" two minutes in, before any check ran, and settled LOST.
-//! `prune_seed_binaries` in infra/gate-runner/run.sh drops every
-//! executable but the newest per stem from the STAGED copy, before the
-//! rename; libraries and unhashed files are untouched.
+//! `prune_seed_binaries` in infra/gate-runner/seed-refresh.sh (run.sh's
+//! until backlog 3e2c8ddc moved the refresh into the helper both layouts
+//! call) drops every executable but the newest per stem from the STAGED
+//! copy, before the rename; libraries and unhashed files are untouched.
 
 use boss_testing::{repo_root, scratch_dir, write_exec};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-const RUN_SH: &str = "infra/gate-runner/run.sh";
+const SEED_REFRESH_SH: &str = "infra/gate-runner/seed-refresh.sh";
 
-fn run_sh() -> String {
-    fs::read_to_string(repo_root().join(RUN_SH)).unwrap()
+fn seed_refresh_sh() -> String {
+    fs::read_to_string(repo_root().join(SEED_REFRESH_SH)).unwrap()
 }
 
-/// Extract the function from run.sh and run it on `deps`; returns stdout.
+/// Extract the function from seed-refresh.sh and run it on `deps`; returns stdout.
 fn prune(deps: &Path) -> String {
     let script = format!(
         "eval \"$(sed -n '/^prune_seed_binaries()/,/^}}/p' {})\"; KEPT=''; prune_seed_binaries {}",
-        repo_root().join(RUN_SH).display(),
+        repo_root().join(SEED_REFRESH_SH).display(),
         deps.display()
     );
     let out = Command::new("bash").arg("-c").arg(script).output().unwrap();
@@ -109,9 +110,9 @@ fn a_missing_deps_dir_prunes_nothing_and_says_so() {
 /// rename — a torn prune can only touch target.partial.
 #[test]
 fn the_refresh_prunes_the_staged_copy_before_the_rename() {
-    let sh = run_sh();
+    let sh = seed_refresh_sh();
     let cp = sh
-        .find("cp -a --reflink=auto /gate-target/target \"$SEED/target.partial\"")
+        .find("cp -a --reflink=auto \"$WS/target\" \"$SEED/target.partial\"")
         .unwrap();
     let prune = sh
         .find("prune_seed_binaries \"$SEED/target.partial/debug/deps\"")
